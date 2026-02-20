@@ -29,6 +29,9 @@ Step-by-step instructions for specific tasks:
 - [Protect Tags with Immutability](how-to/protect-tags-immutability.md)
 - [Configure Webhook Authorization](how-to/configure-webhook-authorization.md)
 
+### Events
+- [Configure Event Webhooks](how-to/configure-event-webhooks.md)
+
 ### Operations
 - [Run Storage Maintenance](how-to/run-storage-maintenance.md)
 - [Enable the Web UI](how-to/enable-web-ui.md)
@@ -43,6 +46,7 @@ Detailed technical reference:
 - [CEL Expressions Reference](reference/cel-expressions.md) - Policy language reference
 - [API Endpoints Reference](reference/api-endpoints.md) - OCI and extension APIs
 - [Web UI Reference](reference/ui.md) - Web interface
+- [Event Webhooks Reference](reference/event-webhooks.md) - Event webhook configuration and payloads
 - [Metrics Reference](reference/metrics.md) - Prometheus metrics
 
 ## Understanding Angos

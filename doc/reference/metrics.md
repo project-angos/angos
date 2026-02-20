@@ -184,6 +184,49 @@ rate(webhook_authorization_duration_seconds_bucket{le="1"}[5m])
 
 ---
 
+## Event Webhook Metrics
+
+### event_webhook_deliveries_total
+
+Total event webhook delivery attempts.
+
+| Type    | Labels                       |
+|---------|------------------------------|
+| Counter | `webhook`, `event`, `result` |
+
+**Labels:**
+- `webhook`: Webhook name from configuration
+- `event`: Event type (e.g., `manifest.push`)
+- `result`: `success` or `error`
+
+**Example:**
+```promql
+# Delivery rate by webhook and result
+sum by (webhook, result) (rate(event_webhook_deliveries_total[5m]))
+
+# Error rate for a specific webhook
+rate(event_webhook_deliveries_total{webhook="audit", result="error"}[5m])
+```
+
+### event_webhook_delivery_duration_seconds
+
+Event webhook delivery duration.
+
+| Type      | Labels             |
+|-----------|--------------------|
+| Histogram | `webhook`, `event` |
+
+**Example:**
+```promql
+# P95 delivery latency
+histogram_quantile(0.95, rate(event_webhook_delivery_duration_seconds_bucket[5m]))
+
+# Delivery latency by webhook
+histogram_quantile(0.95, sum by (webhook, le) (rate(event_webhook_delivery_duration_seconds_bucket[5m])))
+```
+
+---
+
 ## Example Prometheus Configuration
 
 ```yaml
@@ -230,7 +273,7 @@ sum(rate(auth_attempts_total[5m]))
 sum by (method) (rate(auth_attempts_total[5m]))
 ```
 
-### Webhooks
+### Authorization Webhooks
 
 ```promql
 # Webhook cache hit rate
@@ -240,6 +283,20 @@ sum(rate(webhook_authorization_requests_total[5m]))
 # Webhook error rate (denials)
 100 * sum(rate(webhook_authorization_requests_total{result=~".*deny"}[5m])) /
 sum(rate(webhook_authorization_requests_total[5m]))
+```
+
+### Event Webhooks
+
+```promql
+# Event webhook delivery rate
+sum by (webhook, result) (rate(event_webhook_deliveries_total[5m]))
+
+# Event webhook error rate
+100 * sum(rate(event_webhook_deliveries_total{result="error"}[5m])) /
+sum(rate(event_webhook_deliveries_total[5m]))
+
+# Event webhook P95 latency
+histogram_quantile(0.95, sum by (webhook, le) (rate(event_webhook_delivery_duration_seconds_bucket[5m])))
 ```
 
 ---
