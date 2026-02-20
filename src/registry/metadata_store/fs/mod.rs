@@ -2,8 +2,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use futures_util::stream::{self, StreamExt};
 use serde::Deserialize;
-use tracing::{debug, info, instrument};
+use tracing::{debug, info, instrument, warn};
 
 use crate::oci::{Descriptor, Digest, Manifest};
 use crate::registry::metadata_store::link_kind::LinkKind;
@@ -147,23 +148,53 @@ impl MetadataStore for Backend {
             path_builder::manifest_referrers_dir(namespace, digest)
         );
         let all_manifest = self.store.list_dir(&path).await?;
-        let mut referrers = Vec::new();
 
-        for manifest_digest in all_manifest {
-            let manifest_digest = Digest::Sha256(manifest_digest.into());
-            let blob_path = path_builder::blob_path(&manifest_digest);
+        let digest_entries: Vec<(Digest, String)> = all_manifest
+            .into_iter()
+            .map(|entry| {
+                let manifest_digest = Digest::Sha256(entry.into());
+                let blob_path = path_builder::blob_path(&manifest_digest);
+                (manifest_digest, blob_path)
+            })
+            .collect();
 
-            let manifest = self.store.read(&blob_path).await?;
-            let manifest_len = manifest.len();
+        let results: Vec<Option<Descriptor>> = stream::iter(digest_entries)
+            .map(|(manifest_digest, blob_path)| {
+                let store = &self.store;
+                let artifact_type = artifact_type.as_ref();
+                async move {
+                    match store.read(&blob_path).await {
+                        Ok(data) => {
+                            let manifest_len = data.len();
+                            match Manifest::from_slice(&data) {
+                                Ok(manifest) => manifest.to_descriptor(
+                                    artifact_type,
+                                    manifest_digest,
+                                    manifest_len as u64,
+                                ),
+                                Err(e) => {
+                                    warn!("Failed to parse manifest at {blob_path}: {e}");
+                                    None
+                                }
+                            }
+                        }
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                            warn!("Referrer blob not found at {blob_path}, skipping");
+                            None
+                        }
+                        Err(e) => {
+                            warn!("Failed to read referrer blob at {blob_path}: {e}");
+                            None
+                        }
+                    }
+                }
+            })
+            .buffer_unordered(10)
+            .collect()
+            .await;
 
-            let manifest = Manifest::from_slice(&manifest)?;
-            if let Some(descriptor) =
-                manifest.to_descriptor(artifact_type.as_ref(), manifest_digest, manifest_len as u64)
-            {
-                referrers.push(descriptor);
-            }
-        }
-
+        let mut referrers: Vec<Descriptor> = results.into_iter().flatten().collect();
+        referrers.sort_by(|a, b| a.digest.cmp(&b.digest));
         Ok(referrers)
     }
 

@@ -865,4 +865,274 @@ mod tests {
             .await;
         }
     }
+
+    pub async fn test_datastore_list_referrers_parallel_correctness(
+        b: Arc<dyn BlobStore>,
+        m: Arc<dyn MetadataStore + Send + Sync>,
+    ) {
+        let namespace = &Namespace::new("test-referrers-parallel").unwrap();
+        let subject_digest = b.create_blob(b"subject manifest content").await.unwrap();
+        let subject_link = LinkKind::Digest(subject_digest.clone());
+        create_link(&m, namespace, &subject_link, &subject_digest).await;
+
+        let mut referrer_digests = Vec::new();
+        for i in 0..5 {
+            let referrer_content = format!(
+                r#"{{
+                    "schemaVersion": 2,
+                    "mediaType": "application/vnd.oci.image.manifest.v1+json",
+                    "subject": {{
+                        "mediaType": "application/vnd.oci.image.manifest.v1+json",
+                        "digest": "{subject_digest}",
+                        "size": 123
+                    }},
+                    "artifactType": "application/vnd.example.test-artifact",
+                    "config": {{
+                        "mediaType": "application/vnd.oci.image.config.v1+json",
+                        "digest": "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+                        "size": 7023
+                    }},
+                    "layers": [],
+                    "annotations": {{ "index": "{i}" }}
+                }}"#
+            );
+
+            let referrer_digest = b.create_blob(referrer_content.as_bytes()).await.unwrap();
+            let digest_link = LinkKind::Digest(referrer_digest.clone());
+            create_link(&m, namespace, &digest_link, &referrer_digest).await;
+
+            let referrer_link = LinkKind::Referrer(subject_digest.clone(), referrer_digest.clone());
+            create_link(&m, namespace, &referrer_link, &referrer_digest).await;
+
+            referrer_digests.push(referrer_digest);
+        }
+
+        let descriptors = m
+            .list_referrers(namespace, &subject_digest, None)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            descriptors.len(),
+            5,
+            "Expected 5 referrer descriptors but got {}",
+            descriptors.len()
+        );
+
+        for pair in descriptors.windows(2) {
+            assert!(
+                pair[0].digest.to_string() <= pair[1].digest.to_string(),
+                "Descriptors should be sorted by digest: {} should come before {}",
+                pair[0].digest,
+                pair[1].digest
+            );
+        }
+    }
+
+    pub async fn test_datastore_list_referrers_with_artifact_type_filter(
+        b: Arc<dyn BlobStore>,
+        m: Arc<dyn MetadataStore + Send + Sync>,
+    ) {
+        let namespace = &Namespace::new("test-referrers-filter").unwrap();
+        let subject_digest = b
+            .create_blob(b"subject manifest for filter test")
+            .await
+            .unwrap();
+        let subject_link = LinkKind::Digest(subject_digest.clone());
+        create_link(&m, namespace, &subject_link, &subject_digest).await;
+
+        for i in 0..3 {
+            let referrer_content = format!(
+                r#"{{
+                    "schemaVersion": 2,
+                    "mediaType": "application/vnd.oci.image.manifest.v1+json",
+                    "subject": {{
+                        "mediaType": "application/vnd.oci.image.manifest.v1+json",
+                        "digest": "{subject_digest}",
+                        "size": 123
+                    }},
+                    "artifactType": "application/vnd.example.sbom",
+                    "config": {{
+                        "mediaType": "application/vnd.oci.image.config.v1+json",
+                        "digest": "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+                        "size": 7023
+                    }},
+                    "layers": [],
+                    "annotations": {{ "sbom-index": "{i}" }}
+                }}"#
+            );
+
+            let referrer_digest = b.create_blob(referrer_content.as_bytes()).await.unwrap();
+            let digest_link = LinkKind::Digest(referrer_digest.clone());
+            create_link(&m, namespace, &digest_link, &referrer_digest).await;
+
+            let referrer_link = LinkKind::Referrer(subject_digest.clone(), referrer_digest.clone());
+            create_link(&m, namespace, &referrer_link, &referrer_digest).await;
+        }
+
+        for i in 0..2 {
+            let referrer_content = format!(
+                r#"{{
+                    "schemaVersion": 2,
+                    "mediaType": "application/vnd.oci.image.manifest.v1+json",
+                    "subject": {{
+                        "mediaType": "application/vnd.oci.image.manifest.v1+json",
+                        "digest": "{subject_digest}",
+                        "size": 123
+                    }},
+                    "artifactType": "application/vnd.example.signature",
+                    "config": {{
+                        "mediaType": "application/vnd.oci.image.config.v1+json",
+                        "digest": "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+                        "size": 7023
+                    }},
+                    "layers": [],
+                    "annotations": {{ "sig-index": "{i}" }}
+                }}"#
+            );
+
+            let referrer_digest = b.create_blob(referrer_content.as_bytes()).await.unwrap();
+            let digest_link = LinkKind::Digest(referrer_digest.clone());
+            create_link(&m, namespace, &digest_link, &referrer_digest).await;
+
+            let referrer_link = LinkKind::Referrer(subject_digest.clone(), referrer_digest.clone());
+            create_link(&m, namespace, &referrer_link, &referrer_digest).await;
+        }
+
+        let descriptors = m
+            .list_referrers(
+                namespace,
+                &subject_digest,
+                Some("application/vnd.example.sbom".to_string()),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            descriptors.len(),
+            3,
+            "Expected 3 SBOM referrer descriptors but got {}",
+            descriptors.len()
+        );
+
+        for desc in &descriptors {
+            assert_eq!(
+                desc.artifact_type.as_deref(),
+                Some("application/vnd.example.sbom"),
+                "All filtered descriptors should have SBOM artifact type"
+            );
+        }
+    }
+
+    pub async fn test_datastore_list_referrers_deterministic_order(
+        b: Arc<dyn BlobStore>,
+        m: Arc<dyn MetadataStore + Send + Sync>,
+    ) {
+        let namespace = &Namespace::new("test-referrers-order").unwrap();
+        let subject_digest = b
+            .create_blob(b"subject manifest for order test")
+            .await
+            .unwrap();
+        let subject_link = LinkKind::Digest(subject_digest.clone());
+        create_link(&m, namespace, &subject_link, &subject_digest).await;
+
+        for i in 0..10 {
+            let referrer_content = format!(
+                r#"{{
+                    "schemaVersion": 2,
+                    "mediaType": "application/vnd.oci.image.manifest.v1+json",
+                    "subject": {{
+                        "mediaType": "application/vnd.oci.image.manifest.v1+json",
+                        "digest": "{subject_digest}",
+                        "size": 123
+                    }},
+                    "artifactType": "application/vnd.example.test-artifact",
+                    "config": {{
+                        "mediaType": "application/vnd.oci.image.config.v1+json",
+                        "digest": "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+                        "size": 7023
+                    }},
+                    "layers": [],
+                    "annotations": {{ "order-index": "{i}" }}
+                }}"#
+            );
+
+            let referrer_digest = b.create_blob(referrer_content.as_bytes()).await.unwrap();
+            let digest_link = LinkKind::Digest(referrer_digest.clone());
+            create_link(&m, namespace, &digest_link, &referrer_digest).await;
+
+            let referrer_link = LinkKind::Referrer(subject_digest.clone(), referrer_digest.clone());
+            create_link(&m, namespace, &referrer_link, &referrer_digest).await;
+        }
+
+        let result1 = m
+            .list_referrers(namespace, &subject_digest, None)
+            .await
+            .unwrap();
+        let result2 = m
+            .list_referrers(namespace, &subject_digest, None)
+            .await
+            .unwrap();
+        let result3 = m
+            .list_referrers(namespace, &subject_digest, None)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            result1.len(),
+            10,
+            "Expected 10 referrer descriptors but got {}",
+            result1.len()
+        );
+        assert_eq!(
+            result1, result2,
+            "First and second list_referrers calls should return identical results"
+        );
+        assert_eq!(
+            result2, result3,
+            "Second and third list_referrers calls should return identical results"
+        );
+
+        for pair in result1.windows(2) {
+            assert!(
+                pair[0].digest.to_string() <= pair[1].digest.to_string(),
+                "Descriptors should be sorted by digest: {} should come before {}",
+                pair[0].digest,
+                pair[1].digest
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_list_referrers_parallel_correctness() {
+        for test_case in backends() {
+            test_datastore_list_referrers_parallel_correctness(
+                test_case.blob_store(),
+                test_case.metadata_store(),
+            )
+            .await;
+        }
+    }
+
+    #[tokio::test]
+    async fn test_list_referrers_with_artifact_type_filter() {
+        for test_case in backends() {
+            test_datastore_list_referrers_with_artifact_type_filter(
+                test_case.blob_store(),
+                test_case.metadata_store(),
+            )
+            .await;
+        }
+    }
+
+    #[tokio::test]
+    async fn test_list_referrers_deterministic_order() {
+        for test_case in backends() {
+            test_datastore_list_referrers_deterministic_order(
+                test_case.blob_store(),
+                test_case.metadata_store(),
+            )
+            .await;
+        }
+    }
 }

@@ -2,8 +2,9 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use futures_util::stream::{self, StreamExt};
 use serde::Deserialize;
-use tracing::{debug, info, instrument};
+use tracing::{debug, info, instrument, warn};
 
 use crate::oci::{Descriptor, Digest, Manifest};
 use crate::registry::metadata_store::link_kind::LinkKind;
@@ -137,34 +138,55 @@ impl MetadataStore for Backend {
                 .list_objects(&referrers_dir, 100, continuation_token)
                 .await?;
 
-            for key in objects {
-                // The key is a relative path like "sha256/<digest>/link"
-                let parts: Vec<&str> = key.split('/').collect();
-                if parts.len() < 2 || parts[0] != "sha256" {
-                    continue;
-                }
-
-                let manifest_digest = Digest::Sha256(parts[1].into());
-                let blob_path = path_builder::blob_path(&manifest_digest);
-
-                let manifest = match self.store.read(&blob_path).await {
-                    Ok(data) => data,
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                        return Err(Error::ReferenceNotFound);
+            let digest_entries: Vec<(Digest, String)> = objects
+                .iter()
+                .filter_map(|key| {
+                    let parts: Vec<&str> = key.split('/').collect();
+                    if parts.len() < 2 || parts[0] != "sha256" {
+                        return None;
                     }
-                    Err(e) => return Err(e.into()),
-                };
-                let manifest_len = manifest.len();
+                    let manifest_digest = Digest::Sha256(parts[1].into());
+                    let blob_path = path_builder::blob_path(&manifest_digest);
+                    Some((manifest_digest, blob_path))
+                })
+                .collect();
 
-                let manifest = Manifest::from_slice(&manifest)?;
-                if let Some(descriptor) = manifest.to_descriptor(
-                    artifact_type.as_ref(),
-                    manifest_digest,
-                    manifest_len as u64,
-                ) {
-                    referrers.push(descriptor);
-                }
-            }
+            let results: Vec<Option<Descriptor>> = stream::iter(digest_entries)
+                .map(|(manifest_digest, blob_path)| {
+                    let store = &self.store;
+                    let artifact_type = artifact_type.as_ref();
+                    async move {
+                        match store.read(&blob_path).await {
+                            Ok(data) => {
+                                let manifest_len = data.len();
+                                match Manifest::from_slice(&data) {
+                                    Ok(manifest) => manifest.to_descriptor(
+                                        artifact_type,
+                                        manifest_digest,
+                                        manifest_len as u64,
+                                    ),
+                                    Err(e) => {
+                                        warn!("Failed to parse manifest at {blob_path}: {e}");
+                                        None
+                                    }
+                                }
+                            }
+                            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                                warn!("Referrer blob not found at {blob_path}, skipping");
+                                None
+                            }
+                            Err(e) => {
+                                warn!("Failed to read referrer blob at {blob_path}: {e}");
+                                None
+                            }
+                        }
+                    }
+                })
+                .buffer_unordered(10)
+                .collect()
+                .await;
+
+            referrers.extend(results.into_iter().flatten());
 
             continuation_token = next_token;
             if continuation_token.is_none() {
@@ -172,6 +194,7 @@ impl MetadataStore for Backend {
             }
         }
 
+        referrers.sort_by(|a, b| a.digest.cmp(&b.digest));
         Ok(referrers)
     }
 
