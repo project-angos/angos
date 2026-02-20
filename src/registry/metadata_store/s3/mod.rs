@@ -86,43 +86,10 @@ impl MetadataStore for Backend {
     ) -> Result<(Vec<String>, Option<String>), Error> {
         debug!("Fetching {n} namespace(s) with continuation token: {last:?}");
 
-        // List all objects under the repository directory
         let repo_dir = path_builder::repository_dir();
-
         let mut namespaces = Vec::new();
-        let mut continuation_token = None;
-
-        // List all objects recursively to find all namespaces
-        loop {
-            let (objects, next_token) = self
-                .store
-                .list_objects(repo_dir, 1000, continuation_token)
-                .await?;
-
-            for key in objects {
-                // The path is relative to v2/repositories, like:
-                // namespace/_manifests/... or
-                // namespace/nested/_manifests/...
-
-                // Look for special directories that indicate a namespace
-                for marker in &["/_manifests/", "/_layers/", "/_uploads/", "/_config/"] {
-                    if let Some(idx) = key.find(marker) {
-                        let namespace = key[..idx].to_string();
-                        if !namespaces.contains(&namespace) {
-                            namespaces.push(namespace);
-                        }
-                        break; // Found a namespace, no need to check other markers
-                    }
-                }
-            }
-
-            continuation_token = next_token;
-            if continuation_token.is_none() {
-                break;
-            }
-        }
-
-        // Sort namespaces for consistent pagination
+        self.collect_namespaces(repo_dir, "", &mut namespaces)
+            .await?;
         namespaces.sort();
 
         Ok(pagination::paginate_sorted(&namespaces, n, last.as_deref()))
@@ -528,6 +495,43 @@ fn is_tracked_link(link: &LinkKind) -> bool {
 }
 
 impl Backend {
+    async fn collect_namespaces(
+        &self,
+        path: &str,
+        prefix: &str,
+        namespaces: &mut Vec<String>,
+    ) -> Result<(), Error> {
+        let mut continuation_token = None;
+        loop {
+            let (prefixes, _, next_token) = self
+                .store
+                .list_prefixes(path, "/", 1000, continuation_token)
+                .await?;
+
+            for entry in &prefixes {
+                if entry.starts_with('_') {
+                    if entry == "_manifests" {
+                        let namespace = prefix.strip_suffix('/').unwrap_or(prefix);
+                        if !namespace.is_empty() {
+                            namespaces.push(namespace.to_string());
+                        }
+                    }
+                    continue;
+                }
+
+                let child_path = format!("{path}/{entry}");
+                let child_prefix = format!("{prefix}{entry}/");
+                Box::pin(self.collect_namespaces(&child_path, &child_prefix, namespaces)).await?;
+            }
+
+            continuation_token = next_token;
+            if continuation_token.is_none() {
+                break;
+            }
+        }
+        Ok(())
+    }
+
     async fn read_link_reference(
         &self,
         namespace: &str,

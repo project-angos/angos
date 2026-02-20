@@ -490,6 +490,155 @@ mod tests {
         }
     }
 
+    pub async fn test_datastore_list_namespaces_deduplication(
+        b: Arc<dyn BlobStore>,
+        m: Arc<dyn MetadataStore + Send + Sync>,
+    ) {
+        let namespace = "dedup-repo";
+        let digest = b.create_blob(b"dedup test content").await.unwrap();
+
+        // Create multiple link types within the same namespace
+        let tag_link = LinkKind::Tag("latest".to_string());
+        let digest_link = LinkKind::Digest(digest.clone());
+        let layer_link = LinkKind::Layer(digest.clone());
+        let config_link = LinkKind::Config(digest.clone());
+
+        create_link(&m, namespace, &tag_link, &digest).await;
+        create_link(&m, namespace, &digest_link, &digest).await;
+        create_link(&m, namespace, &layer_link, &digest).await;
+        create_link(&m, namespace, &config_link, &digest).await;
+
+        // The namespace should appear exactly once despite having multiple object types
+        let (namespaces, _) = m.list_namespaces(10, None).await.unwrap();
+        let count = namespaces.iter().filter(|n| *n == namespace).count();
+        assert_eq!(
+            count, 1,
+            "Namespace '{namespace}' should appear exactly once but appeared {count} times"
+        );
+    }
+
+    pub async fn test_datastore_list_namespaces_many_namespaces_pagination(
+        b: Arc<dyn BlobStore>,
+        m: Arc<dyn MetadataStore + Send + Sync>,
+    ) {
+        let digest = b.create_blob(b"pagination test content").await.unwrap();
+
+        let namespace_names: Vec<String> = (0..10).map(|i| format!("ns-{i:02}")).collect();
+
+        for ns in &namespace_names {
+            let tag_link = LinkKind::Tag("latest".to_string());
+            create_link(&m, ns, &tag_link, &digest).await;
+        }
+
+        // Paginate with page size 3, collecting all results
+        let mut all_namespaces = Vec::new();
+        let mut token: Option<String> = None;
+        let mut page_count = 0;
+
+        loop {
+            let (page, next_token) = m.list_namespaces(3, token).await.unwrap();
+            assert!(
+                !page.is_empty(),
+                "Page {page_count} should not be empty while paginating"
+            );
+            assert!(
+                page.len() <= 3,
+                "Page {page_count} returned {} items, expected at most 3",
+                page.len()
+            );
+            all_namespaces.extend(page);
+            page_count += 1;
+            match next_token {
+                Some(t) => token = Some(t),
+                None => break,
+            }
+        }
+
+        assert_eq!(
+            all_namespaces, namespace_names,
+            "All namespaces should be returned in sorted order across pages"
+        );
+        assert_eq!(
+            page_count, 4,
+            "Expected 4 pages (3+3+3+1) but got {page_count}"
+        );
+    }
+
+    pub async fn test_datastore_list_namespaces_single_item_pages(
+        b: Arc<dyn BlobStore>,
+        m: Arc<dyn MetadataStore + Send + Sync>,
+    ) {
+        let digest = b.create_blob(b"single page test content").await.unwrap();
+
+        let namespace_names: Vec<String> = (0..5).map(|i| format!("single-{i:02}")).collect();
+
+        for ns in &namespace_names {
+            let tag_link = LinkKind::Tag("v1".to_string());
+            create_link(&m, ns, &tag_link, &digest).await;
+        }
+
+        // Paginate with page size 1
+        let mut all_namespaces = Vec::new();
+        let mut token: Option<String> = None;
+
+        for (i, expected_name) in namespace_names.iter().enumerate() {
+            let (page, next_token) = m.list_namespaces(1, token).await.unwrap();
+            assert_eq!(
+                page.len(),
+                1,
+                "Page {i} should have exactly 1 item but had {}",
+                page.len()
+            );
+            assert_eq!(
+                page[0], *expected_name,
+                "Page {i} should contain '{expected_name}' but contained '{}'",
+                page[0]
+            );
+            all_namespaces.extend(page);
+            token = next_token;
+        }
+
+        // After exhausting all items, token should be None
+        assert!(
+            token.is_none(),
+            "Token should be None after all namespaces are consumed"
+        );
+        assert_eq!(all_namespaces, namespace_names);
+    }
+
+    #[tokio::test]
+    async fn test_list_namespaces_deduplication() {
+        for test_case in backends() {
+            test_datastore_list_namespaces_deduplication(
+                test_case.blob_store(),
+                test_case.metadata_store(),
+            )
+            .await;
+        }
+    }
+
+    #[tokio::test]
+    async fn test_list_namespaces_many_namespaces_pagination() {
+        for test_case in backends() {
+            test_datastore_list_namespaces_many_namespaces_pagination(
+                test_case.blob_store(),
+                test_case.metadata_store(),
+            )
+            .await;
+        }
+    }
+
+    #[tokio::test]
+    async fn test_list_namespaces_single_item_pages() {
+        for test_case in backends() {
+            test_datastore_list_namespaces_single_item_pages(
+                test_case.blob_store(),
+                test_case.metadata_store(),
+            )
+            .await;
+        }
+    }
+
     pub async fn test_update_links(b: Arc<dyn BlobStore>, m: Arc<dyn MetadataStore + Send + Sync>) {
         let namespace = &Namespace::new("test-update-links").unwrap();
         let digest1 = b.create_blob(b"content1").await.unwrap();
