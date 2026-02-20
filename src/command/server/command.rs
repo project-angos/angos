@@ -153,6 +153,14 @@ impl Command {
         Ok(())
     }
 
+    #[cfg(test)]
+    pub fn insecure_listener(&self) -> &InsecureListener {
+        match &self.listener {
+            ServiceListener::Insecure(listener) => listener,
+            ServiceListener::Secure(_) => panic!("Expected insecure listener"),
+        }
+    }
+
     pub async fn run(&self) -> Result<(), Error> {
         match &self.listener {
             ServiceListener::Insecure(listener) => listener.serve().await?,
@@ -585,5 +593,392 @@ mod tests {
         assert!(result.is_ok());
         let repos = result.unwrap();
         assert_eq!(repos.len(), 2);
+    }
+
+    fn create_config_with_webhook(url: &str) -> Configuration {
+        let toml = format!(
+            r#"
+            [blob_store.fs]
+            root_dir = "/tmp/test-blobs"
+
+            [metadata_store.fs]
+            root_dir = "/tmp/test-metadata"
+
+            [cache.memory]
+
+            [server]
+            bind_address = "127.0.0.1"
+            port = 8080
+
+            [global]
+            update_pull_time = false
+            max_concurrent_cache_jobs = 10
+
+            [event_webhook.test_hook]
+            url = "{url}"
+            policy = "optional"
+            events = ["manifest.push"]
+        "#
+        );
+
+        toml::from_str(&toml).unwrap()
+    }
+
+    fn create_config_with_two_webhooks(url_a: &str, url_b: &str) -> Configuration {
+        let toml = format!(
+            r#"
+            [blob_store.fs]
+            root_dir = "/tmp/test-blobs"
+
+            [metadata_store.fs]
+            root_dir = "/tmp/test-metadata"
+
+            [cache.memory]
+
+            [server]
+            bind_address = "127.0.0.1"
+            port = 8080
+
+            [global]
+            update_pull_time = false
+            max_concurrent_cache_jobs = 10
+
+            [event_webhook.hook_a]
+            url = "{url_a}"
+            policy = "optional"
+            events = ["manifest.push"]
+
+            [event_webhook.hook_b]
+            url = "{url_b}"
+            policy = "optional"
+            events = ["manifest.push"]
+        "#
+        );
+
+        toml::from_str(&toml).unwrap()
+    }
+
+    fn create_test_event() -> crate::event_webhook::event::Event {
+        use chrono::Utc;
+        use uuid::Uuid;
+
+        use crate::event_webhook::event::{Event, EventKind};
+
+        Event {
+            id: Uuid::new_v4(),
+            timestamp: Utc::now(),
+            kind: EventKind::ManifestPush,
+            namespace: "test/repo".to_string(),
+            digest: Some("sha256:abc123".to_string()),
+            reference: Some("sha256:abc123".to_string()),
+            tag: None,
+            actor: None,
+            repository: "test-repo".to_string(),
+        }
+    }
+
+    #[test]
+    fn test_hot_reload_adds_webhook_via_command() {
+        let config = create_minimal_config();
+        let command = Command::new(&config).unwrap();
+
+        assert!(
+            command
+                .insecure_listener()
+                .current_context()
+                .event_dispatcher()
+                .is_none()
+        );
+
+        let new_config = create_config_with_webhook("https://example.com/webhook");
+        command.notify_config_change(&new_config).unwrap();
+
+        assert!(
+            command
+                .insecure_listener()
+                .current_context()
+                .event_dispatcher()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn test_hot_reload_removes_webhook_via_command() {
+        let config = create_config_with_webhook("https://example.com/webhook");
+        let command = Command::new(&config).unwrap();
+
+        assert!(
+            command
+                .insecure_listener()
+                .current_context()
+                .event_dispatcher()
+                .is_some()
+        );
+
+        let new_config = create_minimal_config();
+        command.notify_config_change(&new_config).unwrap();
+
+        assert!(
+            command
+                .insecure_listener()
+                .current_context()
+                .event_dispatcher()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_hot_reload_changes_webhook_url_via_command() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server_a = MockServer::start().await;
+        let server_b = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/webhook"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server_a)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/webhook"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server_b)
+            .await;
+
+        let config_a = create_config_with_webhook(&format!("{}/webhook", server_a.uri()));
+        let command = Command::new(&config_a).unwrap();
+
+        let config_b = create_config_with_webhook(&format!("{}/webhook", server_b.uri()));
+        command.notify_config_change(&config_b).unwrap();
+
+        let context = command.insecure_listener().current_context();
+        context.dispatch_event(&create_test_event()).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_hot_reload_adds_second_webhook() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server_a = MockServer::start().await;
+        let server_b = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server_a)
+            .await;
+
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server_b)
+            .await;
+
+        let config_one = create_config_with_webhook(&server_a.uri());
+        let command = Command::new(&config_one).unwrap();
+
+        let config_two = create_config_with_two_webhooks(&server_a.uri(), &server_b.uri());
+        command.notify_config_change(&config_two).unwrap();
+
+        let context = command.insecure_listener().current_context();
+        context.dispatch_event(&create_test_event()).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_hot_reload_removes_one_of_two_webhooks() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server_a = MockServer::start().await;
+        let server_b = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server_a)
+            .await;
+
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server_b)
+            .await;
+
+        let config_two = create_config_with_two_webhooks(&server_a.uri(), &server_b.uri());
+        let command = Command::new(&config_two).unwrap();
+
+        let config_one = create_config_with_webhook(&server_a.uri());
+        command.notify_config_change(&config_one).unwrap();
+
+        let context = command.insecure_listener().current_context();
+        context.dispatch_event(&create_test_event()).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_hot_reload_inflight_old_dispatcher_still_works() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server_old = MockServer::start().await;
+        let server_new = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server_old)
+            .await;
+
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server_new)
+            .await;
+
+        let config_old = create_config_with_webhook(&server_old.uri());
+        let command = Command::new(&config_old).unwrap();
+
+        let old_context = Arc::clone(&command.insecure_listener().current_context());
+
+        let config_new = create_config_with_webhook(&server_new.uri());
+        command.notify_config_change(&config_new).unwrap();
+
+        old_context
+            .dispatch_event(&create_test_event())
+            .await
+            .unwrap();
+
+        let new_context = command.insecure_listener().current_context();
+        new_context
+            .dispatch_event(&create_test_event())
+            .await
+            .unwrap();
+    }
+
+    fn create_invalid_cache_config_with_webhook(url: &str) -> Configuration {
+        let toml = format!(
+            r#"
+            [blob_store.fs]
+            root_dir = "/tmp/test-blobs"
+
+            [metadata_store.fs]
+            root_dir = "/tmp/test-metadata"
+
+            [cache.redis]
+            url = "redis://invalid:99999"
+            key_prefix = "test:"
+
+            [server]
+            bind_address = "127.0.0.1"
+            port = 8080
+
+            [global]
+            update_pull_time = false
+            max_concurrent_cache_jobs = 10
+
+            [event_webhook.test_hook]
+            url = "{url}"
+            policy = "optional"
+            events = ["manifest.push"]
+        "#
+        );
+
+        toml::from_str(&toml).unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_failed_reload_preserves_old_context() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let valid_config = create_config_with_webhook(&server.uri());
+        let command = Command::new(&valid_config).unwrap();
+
+        assert!(
+            command
+                .insecure_listener()
+                .current_context()
+                .event_dispatcher()
+                .is_some()
+        );
+
+        let invalid_config = create_invalid_cache_config_with_webhook("https://other.example.com");
+        let result = command.notify_config_change(&invalid_config);
+        assert!(result.is_err());
+
+        assert!(
+            command
+                .insecure_listener()
+                .current_context()
+                .event_dispatcher()
+                .is_some()
+        );
+
+        let context = command.insecure_listener().current_context();
+        context.dispatch_event(&create_test_event()).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_valid_reload_works_after_failed_reload() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server_a = MockServer::start().await;
+        let server_b = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server_a)
+            .await;
+
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server_b)
+            .await;
+
+        let config_a = create_config_with_webhook(&server_a.uri());
+        let command = Command::new(&config_a).unwrap();
+
+        let invalid_config = create_invalid_cache_config_with_webhook("https://bad.example.com");
+        let result = command.notify_config_change(&invalid_config);
+        assert!(result.is_err());
+
+        let config_b = create_config_with_webhook(&server_b.uri());
+        command.notify_config_change(&config_b).unwrap();
+
+        let context = command.insecure_listener().current_context();
+        context.dispatch_event(&create_test_event()).await.unwrap();
+    }
+
+    #[test]
+    fn test_config_notifier_trait_handles_reload_error_gracefully() {
+        let valid_config = create_minimal_config();
+        let command = Command::new(&valid_config).unwrap();
+
+        let invalid_config = create_invalid_cache_config_with_webhook("https://example.com");
+
+        ConfigNotifier::notify_config_change(&command, &invalid_config);
+
+        assert!(
+            command
+                .insecure_listener()
+                .current_context()
+                .event_dispatcher()
+                .is_none()
+        );
     }
 }

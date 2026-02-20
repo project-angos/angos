@@ -74,6 +74,11 @@ impl InsecureListener {
         self.context.store(Arc::new(context));
     }
 
+    #[cfg(test)]
+    pub fn current_context(&self) -> arc_swap::Guard<Arc<ServerContext>> {
+        self.context.load()
+    }
+
     pub async fn serve(&self) -> Result<(), Error> {
         info!("Listening on {} (non-TLS)", self.binding_address);
         let listener = build_listener(self.binding_address).await?;
@@ -100,10 +105,19 @@ impl InsecureListener {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
     use std::net::Ipv6Addr;
+
+    use chrono::Utc;
+    use uuid::Uuid;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     use super::*;
     use crate::command::server::server_context::tests::create_test_server_context;
+    use crate::configuration::Configuration;
+    use crate::event_webhook::event::{Event, EventKind};
+    use crate::registry::{Registry, RegistryConfig};
 
     #[test]
     fn test_config_default_values() {
@@ -250,5 +264,315 @@ mod tests {
             let context = create_test_server_context();
             listener.notify_config_change(context);
         }
+    }
+
+    fn create_config_with_webhook(webhook_url: &str) -> Configuration {
+        let toml = format!(
+            r#"
+            [blob_store.fs]
+            root_dir = "/tmp/test-blobs"
+
+            [metadata_store.fs]
+            root_dir = "/tmp/test-metadata"
+
+            [cache.memory]
+
+            [server]
+            bind_address = "127.0.0.1"
+            port = 8080
+
+            [global]
+            update_pull_time = false
+            max_concurrent_cache_jobs = 10
+
+            [event_webhook.test_hook]
+            url = "{webhook_url}"
+            policy = "optional"
+            events = ["manifest.push"]
+        "#
+        );
+
+        toml::from_str(&toml).unwrap()
+    }
+
+    fn create_server_context_from_config(config: &Configuration) -> ServerContext {
+        let blob_store = config.blob_store.to_backend().unwrap();
+        let metadata_store = config.resolve_metadata_config().to_backend().unwrap();
+        let repositories = Arc::new(HashMap::new());
+
+        let registry_config = RegistryConfig::new()
+            .update_pull_time(false)
+            .enable_redirect(true)
+            .concurrent_cache_jobs(10)
+            .global_immutable_tags(false)
+            .global_immutable_tags_exclusions(Vec::new());
+
+        let registry =
+            Registry::new(blob_store, metadata_store, repositories, registry_config).unwrap();
+
+        ServerContext::new(config, registry).unwrap()
+    }
+
+    fn create_test_event() -> Event {
+        Event {
+            id: Uuid::new_v4(),
+            timestamp: Utc::now(),
+            kind: EventKind::ManifestPush,
+            namespace: "test/repo".to_string(),
+            digest: Some("sha256:abc123".to_string()),
+            reference: Some("sha256:abc123".to_string()),
+            tag: None,
+            actor: None,
+            repository: "test-repo".to_string(),
+        }
+    }
+
+    #[test]
+    fn test_hot_reload_updates_webhook_config() {
+        let listener_config = Config::default();
+        let context_without_webhooks = create_test_server_context();
+        let listener = InsecureListener::new(&listener_config, context_without_webhooks);
+
+        assert!(listener.current_context().event_dispatcher().is_none());
+
+        let config_with_webhook = create_config_with_webhook("https://example.com/webhook");
+        let context_with_webhooks = create_server_context_from_config(&config_with_webhook);
+        listener.notify_config_change(context_with_webhooks);
+
+        assert!(listener.current_context().event_dispatcher().is_some());
+    }
+
+    #[test]
+    fn test_hot_reload_removes_webhooks() {
+        let listener_config = Config::default();
+        let config_with_webhook = create_config_with_webhook("https://example.com/webhook");
+        let context_with_webhooks = create_server_context_from_config(&config_with_webhook);
+        let listener = InsecureListener::new(&listener_config, context_with_webhooks);
+
+        assert!(listener.current_context().event_dispatcher().is_some());
+
+        let context_without_webhooks = create_test_server_context();
+        listener.notify_config_change(context_without_webhooks);
+
+        assert!(listener.current_context().event_dispatcher().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_hot_reload_changes_webhook_url() {
+        let server_a = MockServer::start().await;
+        let server_b = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/webhook"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server_a)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/webhook"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server_b)
+            .await;
+
+        let listener_config = Config::default();
+        let config_a = create_config_with_webhook(&format!("{}/webhook", server_a.uri()));
+        let context_a = create_server_context_from_config(&config_a);
+        let listener = InsecureListener::new(&listener_config, context_a);
+
+        let config_b = create_config_with_webhook(&format!("{}/webhook", server_b.uri()));
+        let context_b = create_server_context_from_config(&config_b);
+        listener.notify_config_change(context_b);
+
+        let current_context = listener.current_context();
+        let event = create_test_event();
+        current_context.dispatch_event(&event).await.unwrap();
+    }
+
+    fn create_config_with_two_webhooks(url_a: &str, url_b: &str) -> Configuration {
+        let toml = format!(
+            r#"
+            [blob_store.fs]
+            root_dir = "/tmp/test-blobs"
+
+            [metadata_store.fs]
+            root_dir = "/tmp/test-metadata"
+
+            [cache.memory]
+
+            [server]
+            bind_address = "127.0.0.1"
+            port = 8080
+
+            [global]
+            update_pull_time = false
+            max_concurrent_cache_jobs = 10
+
+            [event_webhook.hook_a]
+            url = "{url_a}"
+            policy = "optional"
+            events = ["manifest.push"]
+
+            [event_webhook.hook_b]
+            url = "{url_b}"
+            policy = "optional"
+            events = ["manifest.push"]
+        "#
+        );
+
+        toml::from_str(&toml).unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_hot_reload_adds_second_webhook() {
+        let server_a = MockServer::start().await;
+        let server_b = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server_a)
+            .await;
+
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server_b)
+            .await;
+
+        let listener_config = Config::default();
+        let config_one = create_config_with_webhook(&server_a.uri());
+        let context_one = create_server_context_from_config(&config_one);
+        let listener = InsecureListener::new(&listener_config, context_one);
+
+        let config_two = create_config_with_two_webhooks(&server_a.uri(), &server_b.uri());
+        let context_two = create_server_context_from_config(&config_two);
+        listener.notify_config_change(context_two);
+
+        let context = listener.current_context();
+        context.dispatch_event(&create_test_event()).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_hot_reload_removes_one_of_two_webhooks() {
+        let server_a = MockServer::start().await;
+        let server_b = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server_a)
+            .await;
+
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server_b)
+            .await;
+
+        let listener_config = Config::default();
+        let config_two = create_config_with_two_webhooks(&server_a.uri(), &server_b.uri());
+        let context_two = create_server_context_from_config(&config_two);
+        let listener = InsecureListener::new(&listener_config, context_two);
+
+        let config_one = create_config_with_webhook(&server_b.uri());
+        let context_one = create_server_context_from_config(&config_one);
+        listener.notify_config_change(context_one);
+
+        let context = listener.current_context();
+        context.dispatch_event(&create_test_event()).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_hot_reload_in_flight_delivery_not_disrupted() {
+        let server_old = MockServer::start().await;
+        let server_new = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server_old)
+            .await;
+
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server_new)
+            .await;
+
+        let listener_config = Config::default();
+        let config_old = create_config_with_webhook(&server_old.uri());
+        let context_old = create_server_context_from_config(&config_old);
+        let listener = InsecureListener::new(&listener_config, context_old);
+
+        let old_context = Arc::clone(&listener.current_context());
+
+        let config_new = create_config_with_webhook(&server_new.uri());
+        let context_new = create_server_context_from_config(&config_new);
+        listener.notify_config_change(context_new);
+
+        old_context
+            .dispatch_event(&create_test_event())
+            .await
+            .unwrap();
+    }
+
+    #[test]
+    fn test_hot_reload_invalid_webhook_config_preserves_old_context() {
+        let listener_config = Config::default();
+        let config_valid = create_config_with_webhook("https://example.com/webhook");
+        let context_valid = create_server_context_from_config(&config_valid);
+        let listener = InsecureListener::new(&listener_config, context_valid);
+
+        assert!(listener.current_context().event_dispatcher().is_some());
+
+        let invalid_toml = r#"
+            [blob_store.fs]
+            root_dir = "/tmp/test-blobs"
+
+            [metadata_store.fs]
+            root_dir = "/tmp/test-metadata"
+
+            [cache.redis]
+            url = "redis://invalid:99999"
+            key_prefix = "test:"
+
+            [server]
+            bind_address = "127.0.0.1"
+            port = 8080
+
+            [global]
+            update_pull_time = false
+            max_concurrent_cache_jobs = 10
+
+            [event_webhook.test_hook]
+            url = "https://example.com/new-webhook"
+            policy = "optional"
+            events = ["manifest.push"]
+        "#;
+
+        let invalid_config: Configuration = toml::from_str(invalid_toml).unwrap();
+        let blob_store = invalid_config.blob_store.to_backend().unwrap();
+        let metadata_store = invalid_config
+            .resolve_metadata_config()
+            .to_backend()
+            .unwrap();
+        let repositories = Arc::new(HashMap::new());
+
+        let registry_config = RegistryConfig::new()
+            .update_pull_time(false)
+            .enable_redirect(true)
+            .concurrent_cache_jobs(10)
+            .global_immutable_tags(false)
+            .global_immutable_tags_exclusions(Vec::new());
+
+        let registry =
+            Registry::new(blob_store, metadata_store, repositories, registry_config).unwrap();
+
+        let result = ServerContext::new(&invalid_config, registry);
+        assert!(result.is_err());
+
+        assert!(listener.current_context().event_dispatcher().is_some());
     }
 }
