@@ -1346,4 +1346,304 @@ mod tests {
             .await;
         }
     }
+
+    pub async fn test_datastore_tracked_create_with_referrer(
+        b: Arc<dyn BlobStore>,
+        m: Arc<dyn MetadataStore + Send + Sync>,
+    ) {
+        let namespace = &Namespace::new("tracked-create-referrer-ns").unwrap();
+
+        let digest_layer = b.create_blob(b"layer content").await.unwrap();
+        let digest_manifest = b.create_blob(b"manifest content").await.unwrap();
+
+        let mut tx = m.begin_transaction(namespace);
+        tx.create_link_with_referrer(
+            &LinkKind::Layer(digest_layer.clone()),
+            &digest_layer,
+            &digest_manifest,
+        );
+        tx.commit().await.unwrap();
+
+        let metadata = m
+            .read_link(namespace, &LinkKind::Layer(digest_layer.clone()), false)
+            .await
+            .unwrap();
+        assert_eq!(
+            metadata.target, digest_layer,
+            "Link target should be the layer digest"
+        );
+        assert!(
+            metadata.referenced_by.contains(&digest_manifest),
+            "referenced_by should contain the manifest digest"
+        );
+
+        let blob_index = m.read_blob_index(&digest_layer).await.unwrap();
+        let links = blob_index
+            .namespace
+            .get(namespace.as_ref())
+            .expect("Blob index should have an entry for the namespace");
+        assert!(
+            links.contains(&LinkKind::Layer(digest_layer.clone())),
+            "Blob index should contain the Layer link"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_tracked_create_with_referrer() {
+        for test_case in backends() {
+            test_datastore_tracked_create_with_referrer(
+                test_case.blob_store(),
+                test_case.metadata_store(),
+            )
+            .await;
+        }
+    }
+
+    pub async fn test_datastore_tracked_delete_with_referrer(
+        b: Arc<dyn BlobStore>,
+        m: Arc<dyn MetadataStore + Send + Sync>,
+    ) {
+        let namespace = &Namespace::new("tracked-delete-referrer-ns").unwrap();
+
+        let layer_digest = b.create_blob(b"layer for delete test").await.unwrap();
+        let first_manifest_digest = b.create_blob(b"manifest a content").await.unwrap();
+        let second_manifest_digest = b.create_blob(b"manifest b content").await.unwrap();
+
+        let mut tx = m.begin_transaction(namespace);
+        tx.create_link_with_referrer(
+            &LinkKind::Layer(layer_digest.clone()),
+            &layer_digest,
+            &first_manifest_digest,
+        );
+        tx.commit().await.unwrap();
+
+        let mut tx = m.begin_transaction(namespace);
+        tx.create_link_with_referrer(
+            &LinkKind::Layer(layer_digest.clone()),
+            &layer_digest,
+            &second_manifest_digest,
+        );
+        tx.commit().await.unwrap();
+
+        let metadata = m
+            .read_link(namespace, &LinkKind::Layer(layer_digest.clone()), false)
+            .await
+            .unwrap();
+        assert!(
+            metadata.referenced_by.contains(&first_manifest_digest),
+            "referenced_by should contain first manifest after both creates"
+        );
+        assert!(
+            metadata.referenced_by.contains(&second_manifest_digest),
+            "referenced_by should contain second manifest after both creates"
+        );
+
+        let mut tx = m.begin_transaction(namespace);
+        tx.delete_link_with_referrer(
+            &LinkKind::Layer(layer_digest.clone()),
+            &first_manifest_digest,
+        );
+        tx.commit().await.unwrap();
+
+        let metadata = m
+            .read_link(namespace, &LinkKind::Layer(layer_digest.clone()), false)
+            .await
+            .unwrap();
+        assert!(
+            !metadata.referenced_by.contains(&first_manifest_digest),
+            "referenced_by should not contain first manifest after deletion"
+        );
+        assert!(
+            metadata.referenced_by.contains(&second_manifest_digest),
+            "referenced_by should still contain second manifest"
+        );
+
+        let blob_index = m.read_blob_index(&layer_digest).await.unwrap();
+        let links = blob_index
+            .namespace
+            .get(namespace.as_ref())
+            .expect("Blob index should still have an entry for the namespace");
+        assert!(
+            links.contains(&LinkKind::Layer(layer_digest.clone())),
+            "Blob index should still contain the Layer link"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_tracked_delete_with_referrer() {
+        for test_case in backends() {
+            test_datastore_tracked_delete_with_referrer(
+                test_case.blob_store(),
+                test_case.metadata_store(),
+            )
+            .await;
+        }
+    }
+
+    pub async fn test_datastore_tracked_delete_removes_when_no_referrers(
+        b: Arc<dyn BlobStore>,
+        m: Arc<dyn MetadataStore + Send + Sync>,
+    ) {
+        let namespace = &Namespace::new("tracked-delete-no-referrers-ns").unwrap();
+
+        let layer_digest = b.create_blob(b"layer for removal test").await.unwrap();
+        let manifest_digest = b.create_blob(b"manifest for removal test").await.unwrap();
+
+        let mut tx = m.begin_transaction(namespace);
+        tx.create_link_with_referrer(
+            &LinkKind::Layer(layer_digest.clone()),
+            &layer_digest,
+            &manifest_digest,
+        );
+        tx.commit().await.unwrap();
+
+        let mut tx = m.begin_transaction(namespace);
+        tx.delete_link_with_referrer(&LinkKind::Layer(layer_digest.clone()), &manifest_digest);
+        tx.commit().await.unwrap();
+
+        let err = m
+            .read_link(namespace, &LinkKind::Layer(layer_digest.clone()), false)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                crate::registry::metadata_store::Error::ReferenceNotFound
+            ),
+            "Link should not exist after all referrers removed, got: {err:?}"
+        );
+
+        let layer_link = LinkKind::Layer(layer_digest.clone());
+        match m.read_blob_index(&layer_digest).await {
+            Ok(index) => {
+                let links = index.namespace.get(namespace.as_ref());
+                assert!(
+                    links.is_none_or(|s| !s.contains(&layer_link)),
+                    "Blob index should not contain the Layer link after removal"
+                );
+            }
+            Err(crate::registry::metadata_store::Error::ReferenceNotFound) => {}
+            Err(e) => panic!("Unexpected error reading blob index: {e:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_tracked_delete_removes_when_no_referrers() {
+        for test_case in backends() {
+            test_datastore_tracked_delete_removes_when_no_referrers(
+                test_case.blob_store(),
+                test_case.metadata_store(),
+            )
+            .await;
+        }
+    }
+
+    pub async fn test_datastore_mixed_tracked_untracked_operations(
+        b: Arc<dyn BlobStore>,
+        m: Arc<dyn MetadataStore + Send + Sync>,
+    ) {
+        let namespace = &Namespace::new("mixed-tracked-untracked-ns").unwrap();
+
+        let tag_digest = b.create_blob(b"tag content").await.unwrap();
+        let layer_digest = b.create_blob(b"layer content mixed").await.unwrap();
+        let digest_link_digest = b.create_blob(b"digest link content").await.unwrap();
+        let manifest_digest = b.create_blob(b"manifest content mixed").await.unwrap();
+
+        let mut tx = m.begin_transaction(namespace);
+        tx.create_link(&LinkKind::Tag("v1".into()), &tag_digest);
+        tx.create_link_with_referrer(
+            &LinkKind::Layer(layer_digest.clone()),
+            &layer_digest,
+            &manifest_digest,
+        );
+        tx.create_link(
+            &LinkKind::Digest(digest_link_digest.clone()),
+            &digest_link_digest,
+        );
+        tx.commit().await.unwrap();
+
+        let tag_meta = m
+            .read_link(namespace, &LinkKind::Tag("v1".into()), false)
+            .await
+            .unwrap();
+        assert_eq!(
+            tag_meta.target, tag_digest,
+            "Tag v1 should target tag_digest"
+        );
+        assert!(
+            tag_meta.referenced_by.is_empty(),
+            "Tag link should have empty referenced_by"
+        );
+
+        let layer_meta = m
+            .read_link(namespace, &LinkKind::Layer(layer_digest.clone()), false)
+            .await
+            .unwrap();
+        assert_eq!(
+            layer_meta.target, layer_digest,
+            "Layer link should target layer_digest"
+        );
+        assert!(
+            layer_meta.referenced_by.contains(&manifest_digest),
+            "Layer link referenced_by should contain manifest_digest"
+        );
+
+        let digest_meta = m
+            .read_link(
+                namespace,
+                &LinkKind::Digest(digest_link_digest.clone()),
+                false,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            digest_meta.target, digest_link_digest,
+            "Digest link should target digest_link_digest"
+        );
+        assert!(
+            digest_meta.referenced_by.is_empty(),
+            "Digest link should have empty referenced_by"
+        );
+
+        let tag_index = m.read_blob_index(&tag_digest).await.unwrap();
+        let tag_links = tag_index
+            .namespace
+            .get(namespace.as_ref())
+            .expect("Blob index for tag_digest should have namespace entry");
+        assert!(
+            tag_links.contains(&LinkKind::Tag("v1".into())),
+            "Blob index for tag_digest should contain Tag(v1)"
+        );
+
+        let layer_index = m.read_blob_index(&layer_digest).await.unwrap();
+        let layer_links = layer_index
+            .namespace
+            .get(namespace.as_ref())
+            .expect("Blob index for layer_digest should have namespace entry");
+        assert!(
+            layer_links.contains(&LinkKind::Layer(layer_digest.clone())),
+            "Blob index for layer_digest should contain the Layer link"
+        );
+
+        let digest_index = m.read_blob_index(&digest_link_digest).await.unwrap();
+        let digest_links = digest_index
+            .namespace
+            .get(namespace.as_ref())
+            .expect("Blob index for digest_link_digest should have namespace entry");
+        assert!(
+            digest_links.contains(&LinkKind::Digest(digest_link_digest.clone())),
+            "Blob index for digest_link_digest should contain the Digest link"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_mixed_tracked_untracked_operations() {
+        for test_case in backends() {
+            test_datastore_mixed_tracked_untracked_operations(
+                test_case.blob_store(),
+                test_case.metadata_store(),
+            )
+            .await;
+        }
+    }
 }

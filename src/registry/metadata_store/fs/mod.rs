@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -328,6 +329,8 @@ impl MetadataStore for Backend {
         }
 
         loop {
+            let mut link_cache: HashMap<LinkKind, LinkMetadata> = HashMap::new();
+
             let prelock_results = join_all(operations.iter().map(|op| async move {
                 match op {
                     LinkOperation::Create {
@@ -383,20 +386,22 @@ impl MetadataStore for Backend {
 
             let validation_results =
                 join_all(creates.iter().map(|(link, _, expected_old, _)| async move {
-                    let current = self
-                        .read_link_reference(namespace, link)
-                        .await
-                        .ok()
-                        .map(|m| m.target);
-                    (current, expected_old.clone())
+                    let current = self.read_link_reference(namespace, link).await.ok();
+                    let current_target = current.as_ref().map(|m| m.target.clone());
+                    (link.clone(), current, current_target, expected_old.clone())
                 }))
                 .await;
 
             if validation_results
                 .iter()
-                .any(|(current, expected)| *current != *expected)
+                .any(|(_, _, current_target, expected)| *current_target != *expected)
             {
                 continue;
+            }
+            for (link, metadata, _, _) in validation_results {
+                if let Some(m) = metadata {
+                    link_cache.insert(link, m);
+                }
             }
 
             let delete_results =
@@ -411,6 +416,7 @@ impl MetadataStore for Backend {
             for (link, target, referrer, result) in delete_results {
                 match result {
                     Ok(metadata) if metadata.target == target => {
+                        link_cache.insert(link.clone(), metadata);
                         valid_deletes.push((link, target, referrer));
                     }
                     Ok(_) => {
@@ -432,10 +438,9 @@ impl MetadataStore for Backend {
                 let is_tracked = is_tracked_link(link);
 
                 if is_tracked && referrer.is_some() {
-                    let mut metadata = self
-                        .read_link_reference(namespace, link)
-                        .await
-                        .unwrap_or_else(|_| LinkMetadata::from_digest(target.clone()));
+                    let mut metadata = link_cache
+                        .remove(link)
+                        .unwrap_or_else(|| LinkMetadata::from_digest(target.clone()));
 
                     if let Some(manifest_digest) = referrer {
                         metadata.add_referrer(manifest_digest.clone());
@@ -493,7 +498,7 @@ impl MetadataStore for Backend {
                 let is_tracked = is_tracked_link(link);
 
                 if is_tracked && referrer.is_some() {
-                    if let Ok(mut metadata) = self.read_link_reference(namespace, link).await {
+                    if let Some(mut metadata) = link_cache.remove(link) {
                         if let Some(manifest_digest) = referrer {
                             metadata.remove_referrer(manifest_digest);
                         }
