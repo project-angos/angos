@@ -1193,8 +1193,7 @@ mod tests {
         // All 10 reads should complete quickly since writes are deferred
         assert!(
             elapsed < std::time::Duration::from_secs(1),
-            "10 deferred reads should complete in under 1 second, took {:?}",
-            elapsed
+            "10 deferred reads should complete in under 1 second, took {elapsed:?}"
         );
 
         // Explicitly flush pending access time writes
@@ -1357,8 +1356,7 @@ mod tests {
 
         assert!(
             elapsed < std::time::Duration::from_secs(2),
-            "50 concurrent deferred reads should complete within 2 seconds, took {:?}",
-            elapsed
+            "50 concurrent deferred reads should complete within 2 seconds, took {elapsed:?}"
         );
     }
 }
