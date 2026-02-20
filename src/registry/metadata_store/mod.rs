@@ -783,4 +783,86 @@ mod tests {
             test_update_links(test_case.blob_store(), test_case.metadata_store()).await;
         }
     }
+
+    pub async fn test_datastore_read_link_access_time_update(
+        b: Arc<dyn BlobStore>,
+        m: Arc<dyn MetadataStore + Send + Sync>,
+    ) {
+        let namespace = &Namespace::new("test-access-time").unwrap();
+        let digest = b.create_blob(b"access time test content").await.unwrap();
+
+        let tag_link = LinkKind::Tag("latest".to_string());
+        create_link(&m, namespace, &tag_link, &digest).await;
+
+        // Read with update_access_time=true should set accessed_at
+        let meta = m.read_link(namespace, &tag_link, true).await.unwrap();
+        assert!(
+            meta.accessed_at.is_some(),
+            "accessed_at should be set after read with update_access_time=true"
+        );
+        let accessed_at = meta.accessed_at.unwrap();
+        assert!(
+            Utc::now().signed_duration_since(accessed_at) < Duration::seconds(2),
+            "accessed_at should be within 2 seconds of now"
+        );
+
+        // Read with update_access_time=false should still see the persisted accessed_at
+        let meta_readonly = m.read_link(namespace, &tag_link, false).await.unwrap();
+        assert!(
+            meta_readonly.accessed_at.is_some(),
+            "accessed_at should still be persisted after read-only read"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_read_link_access_time_update() {
+        for test_case in backends() {
+            test_datastore_read_link_access_time_update(
+                test_case.blob_store(),
+                test_case.metadata_store(),
+            )
+            .await;
+        }
+    }
+
+    pub async fn test_datastore_read_link_concurrent_readonly(
+        b: Arc<dyn BlobStore>,
+        m: Arc<dyn MetadataStore + Send + Sync>,
+    ) {
+        let namespace = &Namespace::new("test-concurrent-read").unwrap();
+        let digest = b
+            .create_blob(b"concurrent read test content")
+            .await
+            .unwrap();
+
+        let tag_link = LinkKind::Tag("latest".to_string());
+        create_link(&m, namespace, &tag_link, &digest).await;
+
+        let mut handles = Vec::new();
+        for _ in 0..20 {
+            let m = m.clone();
+            let ns = namespace.to_string();
+            let link = tag_link.clone();
+            handles.push(tokio::spawn(
+                async move { m.read_link(&ns, &link, false).await },
+            ));
+        }
+
+        let results: Vec<_> = futures_util::future::join_all(handles).await;
+        for result in results {
+            let meta = result.unwrap().unwrap();
+            assert_eq!(meta.target, digest);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_read_link_concurrent_readonly() {
+        for test_case in backends() {
+            test_datastore_read_link_concurrent_readonly(
+                test_case.blob_store(),
+                test_case.metadata_store(),
+            )
+            .await;
+        }
+    }
 }
