@@ -102,29 +102,21 @@ impl MetadataStore for Backend {
         n: u16,
         last: Option<String>,
     ) -> Result<(Vec<String>, Option<String>), Error> {
-        debug!(
-            "Listing {n} tag(s) for namespace '{namespace}' starting with continuation_token '{last:?}'"
-        );
+        debug!("Listing {n} tag(s) for namespace '{namespace}' starting with last '{last:?}'");
         let tags_dir = path_builder::manifest_tags_dir(namespace);
 
-        let mut all_tags = Vec::new();
-        let mut continuation_token = None;
+        let (tags, _, next_token) = self
+            .store
+            .list_prefixes(&tags_dir, "/", i32::from(n), None, last)
+            .await?;
 
-        loop {
-            let (prefixes, _, next_token) = self
-                .store
-                .list_prefixes(&tags_dir, "/", 1000, continuation_token)
-                .await?;
+        let continuation = if next_token.is_some() {
+            tags.last().cloned()
+        } else {
+            None
+        };
 
-            all_tags.extend(prefixes);
-
-            continuation_token = next_token;
-            if continuation_token.is_none() {
-                break;
-            }
-        }
-
-        Ok(pagination::paginate_sorted(&all_tags, n, last.as_deref()))
+        Ok((tags, continuation))
     }
 
     #[instrument(skip(self))]
@@ -204,7 +196,7 @@ impl MetadataStore for Backend {
 
         let (prefixes, _, next_last) = self
             .store
-            .list_prefixes(&revisions_dir, "/", i32::from(n), continuation_token)
+            .list_prefixes(&revisions_dir, "/", i32::from(n), continuation_token, None)
             .await?;
 
         let mut revisions = Vec::new();
@@ -223,7 +215,7 @@ impl MetadataStore for Backend {
         loop {
             let (prefixes, _, next_token) = self
                 .store
-                .list_prefixes(&revisions_dir, "/", 1000, continuation_token)
+                .list_prefixes(&revisions_dir, "/", 1000, continuation_token, None)
                 .await?;
 
             count += prefixes.len();
@@ -505,7 +497,7 @@ impl Backend {
         loop {
             let (prefixes, _, next_token) = self
                 .store
-                .list_prefixes(path, "/", 1000, continuation_token)
+                .list_prefixes(path, "/", 1000, continuation_token, None)
                 .await?;
 
             for entry in &prefixes {

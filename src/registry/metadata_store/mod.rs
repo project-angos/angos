@@ -639,6 +639,117 @@ mod tests {
         }
     }
 
+    pub async fn test_datastore_list_tags_many_tags_pagination(
+        b: Arc<dyn BlobStore>,
+        m: Arc<dyn MetadataStore + Send + Sync>,
+    ) {
+        let namespace = &Namespace::new("test-repo-name").unwrap();
+        let digest = b.create_blob(b"content").await.unwrap();
+
+        let tag_names: Vec<String> = (0..10).map(|i| format!("tag-{i:02}")).collect();
+
+        for tag in &tag_names {
+            create_link(&m, namespace, &LinkKind::Tag(tag.clone()), &digest).await;
+        }
+
+        // Paginate with page size 3, collecting all results
+        let mut all_tags = Vec::new();
+        let mut token: Option<String> = None;
+        let mut page_count = 0;
+
+        loop {
+            let (page, next_token) = m.list_tags(namespace, 3, token).await.unwrap();
+            assert!(
+                !page.is_empty(),
+                "Page {page_count} should not be empty while paginating"
+            );
+            assert!(
+                page.len() <= 3,
+                "Page {page_count} returned {} items, expected at most 3",
+                page.len()
+            );
+            all_tags.extend(page);
+            page_count += 1;
+            match next_token {
+                Some(t) => token = Some(t),
+                None => break,
+            }
+        }
+
+        assert_eq!(
+            all_tags, tag_names,
+            "All tags should be returned in sorted order across pages"
+        );
+        assert_eq!(
+            page_count, 4,
+            "Expected 4 pages (3+3+3+1) but got {page_count}"
+        );
+    }
+
+    pub async fn test_datastore_list_tags_single_item_pages(
+        b: Arc<dyn BlobStore>,
+        m: Arc<dyn MetadataStore + Send + Sync>,
+    ) {
+        let namespace = &Namespace::new("test-repo-name").unwrap();
+        let digest = b.create_blob(b"content").await.unwrap();
+
+        let tag_names: Vec<String> = (0..5).map(|i| format!("single-tag-{i:02}")).collect();
+
+        for tag in &tag_names {
+            create_link(&m, namespace, &LinkKind::Tag(tag.clone()), &digest).await;
+        }
+
+        // Paginate with page size 1
+        let mut all_tags = Vec::new();
+        let mut token: Option<String> = None;
+
+        for (i, expected_name) in tag_names.iter().enumerate() {
+            let (page, next_token) = m.list_tags(namespace, 1, token).await.unwrap();
+            assert_eq!(
+                page.len(),
+                1,
+                "Page {i} should have exactly 1 item but had {}",
+                page.len()
+            );
+            assert_eq!(
+                page[0], *expected_name,
+                "Page {i} should contain '{expected_name}' but contained '{}'",
+                page[0]
+            );
+            all_tags.extend(page);
+            token = next_token;
+        }
+
+        // After exhausting all items, token should be None
+        assert!(
+            token.is_none(),
+            "Token should be None after all tags are consumed"
+        );
+        assert_eq!(all_tags, tag_names);
+    }
+
+    #[tokio::test]
+    async fn test_list_tags_many_tags_pagination() {
+        for test_case in backends() {
+            test_datastore_list_tags_many_tags_pagination(
+                test_case.blob_store(),
+                test_case.metadata_store(),
+            )
+            .await;
+        }
+    }
+
+    #[tokio::test]
+    async fn test_list_tags_single_item_pages() {
+        for test_case in backends() {
+            test_datastore_list_tags_single_item_pages(
+                test_case.blob_store(),
+                test_case.metadata_store(),
+            )
+            .await;
+        }
+    }
+
     pub async fn test_update_links(b: Arc<dyn BlobStore>, m: Arc<dyn MetadataStore + Send + Sync>) {
         let namespace = &Namespace::new("test-update-links").unwrap();
         let digest1 = b.create_blob(b"content1").await.unwrap();
