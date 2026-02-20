@@ -166,6 +166,8 @@ pub trait MetadataStore: Send + Sync {
         namespace: &str,
         operations: &[LinkOperation],
     ) -> Result<(), Error>;
+
+    async fn flush_access_times(&self) {}
 }
 
 #[cfg(test)]

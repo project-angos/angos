@@ -103,6 +103,7 @@ impl ServerContext {
     }
 
     pub async fn shutdown_with_timeout(&self, timeout: std::time::Duration) {
+        self.registry.flush_pending_writes().await;
         if let Some(dispatcher) = &self.event_dispatcher {
             dispatcher.shutdown_with_timeout(timeout).await;
         }
@@ -994,6 +995,141 @@ pub mod tests {
             requests.len(),
             0,
             "No async deliveries should occur after ServerContext::shutdown()"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_shutdown_flushes_pending_access_times() {
+        // This test verifies that shutdown_with_timeout() flushes buffered access time
+        // writes from the S3 metadata backend before returning.
+        //
+        // When access_time_debounce_secs > 0, the S3 backend defers access time writes
+        // to a background loop. On shutdown, those pending writes would be lost unless
+        // shutdown_with_timeout() explicitly triggers a flush.
+        //
+        // Requires MinIO on http://127.0.0.1:9000 (run: docker-compose up -d)
+        use std::str::FromStr;
+        use std::sync::Arc;
+
+        use crate::oci::Digest;
+        use crate::registry::RegistryConfig;
+        use crate::registry::blob_store;
+        use crate::registry::metadata_store::link_kind::LinkKind;
+        use crate::registry::metadata_store::s3::{Backend as S3MetadataBackend, BackendConfig};
+        use crate::registry::metadata_store::{LinkOperation, MetadataStore};
+
+        let unique_prefix = format!("test-shutdown-flush-{}", Uuid::new_v4());
+        let namespace = format!("{unique_prefix}/myimage");
+
+        // Build an S3 metadata backend with a very long debounce (3600s) so the
+        // background flush loop will NOT fire during the test. Only an explicit
+        // flush triggered by shutdown should persist the access time.
+        let s3_config = BackendConfig {
+            access_key_id: "root".to_string(),
+            secret_key: "roottoor".to_string(),
+            endpoint: "http://127.0.0.1:9000".to_string(),
+            bucket: "registry".to_string(),
+            region: "region".to_string(),
+            key_prefix: unique_prefix.clone(),
+            redis: None,
+            link_cache_ttl: 0, // disable link cache so reads go to S3
+            access_time_debounce_secs: 3600,
+        };
+
+        let metadata_backend = S3MetadataBackend::new(&s3_config).unwrap();
+        let metadata_store: Arc<dyn MetadataStore + Send + Sync> = Arc::new(metadata_backend);
+
+        // Build a FS blob store (blobs aren't exercised in this test)
+        let blob_store_config =
+            blob_store::BlobStorageConfig::FS(crate::registry::data_store::fs::BackendConfig {
+                root_dir: "/tmp/test-blobs-shutdown-flush".to_string(),
+                ..Default::default()
+            });
+        let blob_store = blob_store_config.to_backend().unwrap();
+
+        let registry_config = RegistryConfig::new()
+            .update_pull_time(false)
+            .enable_redirect(false)
+            .concurrent_cache_jobs(4)
+            .global_immutable_tags(false)
+            .global_immutable_tags_exclusions(Vec::new());
+
+        let repositories = Arc::new(HashMap::new());
+        let registry = crate::registry::Registry::new(
+            blob_store,
+            metadata_store.clone(),
+            repositories,
+            registry_config,
+        )
+        .unwrap();
+
+        // Write a tag link so there is something to read
+        let digest = Digest::from_str(
+            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        )
+        .unwrap();
+        let tag = LinkKind::Tag("v1.0.0".to_string());
+        let ops = vec![LinkOperation::Create {
+            link: tag.clone(),
+            target: digest.clone(),
+            referrer: None,
+        }];
+        metadata_store.update_links(&namespace, &ops).await.unwrap();
+
+        // Read with update_access_time=true — this buffers the write in AccessTimeWriter
+        // but does NOT write to S3 immediately because debounce=3600s.
+        metadata_store
+            .read_link(&namespace, &tag, true)
+            .await
+            .unwrap();
+
+        // Verify the access time was NOT written yet (debounce is active):
+        // read with update_access_time=false goes to S3 directly (cache is disabled).
+        let before = metadata_store
+            .read_link(&namespace, &tag, false)
+            .await
+            .unwrap();
+        assert!(
+            before.accessed_at.is_none(),
+            "accessed_at should not be written yet (debounce is 3600s)"
+        );
+
+        // Build a minimal config for ServerContext (we pass our registry directly)
+        let toml = r#"
+            [blob_store.fs]
+            root_dir = "/tmp/test-blobs-shutdown-flush"
+
+            [metadata_store.fs]
+            root_dir = "/tmp/test-metadata-shutdown-flush"
+
+            [cache.memory]
+
+            [server]
+            bind_address = "0.0.0.0"
+            port = 8000
+
+            [global]
+            update_pull_time = false
+            max_concurrent_cache_jobs = 10
+        "#;
+        let config: crate::configuration::Configuration = toml::from_str(toml).unwrap();
+        let context = ServerContext::new(&config, registry).unwrap();
+
+        // shutdown_with_timeout() must flush pending access times before returning.
+        // Currently it only drains the event dispatcher — it does NOT flush the metadata store.
+        // The implementation must call registry.flush_pending_writes() (which doesn't exist yet).
+        context.shutdown_with_timeout(Duration::from_secs(10)).await;
+
+        // After shutdown, the access time must have been persisted to S3.
+        // Reading with update_access_time=false bypasses the AccessTimeWriter buffer
+        // and goes directly to S3 (cache is disabled), so we see the true persisted state.
+        let after = metadata_store
+            .read_link(&namespace, &tag, false)
+            .await
+            .unwrap();
+        assert!(
+            after.accessed_at.is_some(),
+            "shutdown_with_timeout() must flush pending access times to S3"
         );
     }
 

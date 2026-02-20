@@ -730,6 +730,10 @@ impl MetadataStore for Backend {
             return Ok(());
         }
     }
+
+    async fn flush_access_times(&self) {
+        Backend::flush_access_times(self).await;
+    }
 }
 
 fn is_tracked_link(link: &LinkKind) -> bool {
