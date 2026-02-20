@@ -8,7 +8,7 @@ use tracing::{debug, warn};
 
 mod config;
 mod error;
-mod memory;
+pub mod memory;
 mod redis;
 
 pub use config::Config;

@@ -170,7 +170,7 @@ pub trait MetadataStore: Send + Sync {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
     use std::sync::Arc;
 
     use chrono::{Duration, Utc};
@@ -1744,7 +1744,7 @@ mod tests {
             Ok(index) => {
                 let links = index.namespace.get(namespace.as_ref());
                 assert!(
-                    links.is_none_or(|s| s.is_empty()),
+                    links.is_none_or(HashSet::is_empty),
                     "Blob index should have no entries for the namespace after deletion"
                 );
             }

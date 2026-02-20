@@ -8,6 +8,7 @@ use futures_util::stream::{self, StreamExt};
 use serde::Deserialize;
 use tracing::{debug, info, instrument, warn};
 
+use crate::cache::{Cache, CacheExt};
 use crate::oci::{Descriptor, Digest, Manifest};
 use crate::registry::metadata_store::link_kind::LinkKind;
 use crate::registry::metadata_store::lock::{self, LockBackend, MemoryBackend};
@@ -28,6 +29,12 @@ pub struct BackendConfig {
     pub key_prefix: String,
     #[serde(default)]
     pub redis: Option<LockConfig>,
+    #[serde(default = "default_link_cache_ttl")]
+    pub link_cache_ttl: u64,
+}
+
+fn default_link_cache_ttl() -> u64 {
+    30
 }
 
 impl From<BackendConfig> for data_store::s3::BackendConfig {
@@ -48,6 +55,8 @@ impl From<BackendConfig> for data_store::s3::BackendConfig {
 pub struct Backend {
     pub store: data_store::s3::Backend,
     lock: Arc<dyn LockBackend<Guard = Box<dyn Send>> + Send + Sync>,
+    cache: Option<Arc<dyn Cache>>,
+    link_cache_ttl: u64,
 }
 
 impl Backend {
@@ -75,7 +84,56 @@ impl Backend {
                 Arc::new(MemoryBackend::new())
             };
 
-        Ok(Self { store, lock })
+        Ok(Self {
+            store,
+            lock,
+            cache: None,
+            link_cache_ttl: config.link_cache_ttl,
+        })
+    }
+
+    pub fn with_cache(mut self, cache: Arc<dyn Cache>) -> Self {
+        self.cache = Some(cache);
+        self
+    }
+
+    fn cache_key(namespace: &str, link: &LinkKind) -> String {
+        format!("link:{namespace}:{link}")
+    }
+
+    async fn cache_get(&self, namespace: &str, link: &LinkKind) -> Option<LinkMetadata> {
+        if self.link_cache_ttl == 0 {
+            return None;
+        }
+        let cache = self.cache.as_ref()?;
+        cache
+            .retrieve::<LinkMetadata>(&Self::cache_key(namespace, link))
+            .await
+            .ok()
+            .flatten()
+    }
+
+    async fn cache_put(&self, namespace: &str, link: &LinkKind, metadata: &LinkMetadata) {
+        if self.link_cache_ttl == 0 {
+            return;
+        }
+        if let Some(cache) = &self.cache {
+            let _ = cache
+                .store(
+                    &Self::cache_key(namespace, link),
+                    metadata,
+                    self.link_cache_ttl,
+                )
+                .await;
+        }
+    }
+
+    async fn cache_invalidate(&self, namespace: &str, link: &LinkKind) {
+        if let Some(cache) = &self.cache {
+            let _ = cache
+                .store_value(&Self::cache_key(namespace, link), "", 0)
+                .await;
+        }
     }
 }
 
@@ -325,9 +383,15 @@ impl MetadataStore for Backend {
             let link_data = self.read_link_reference(namespace, link).await?.accessed();
             self.write_link_reference(namespace, link, &link_data)
                 .await?;
+            self.cache_put(namespace, link, &link_data).await;
             Ok(link_data)
         } else {
-            self.read_link_reference(namespace, link).await
+            if let Some(cached) = self.cache_get(namespace, link).await {
+                return Ok(cached);
+            }
+            let link_data = self.read_link_reference(namespace, link).await?;
+            self.cache_put(namespace, link, &link_data).await;
+            Ok(link_data)
         }
     }
 
@@ -569,6 +633,13 @@ impl MetadataStore for Backend {
                 }
             }
 
+            for (link, _, _, _) in &creates {
+                self.cache_invalidate(namespace, link).await;
+            }
+            for (link, _, _) in &valid_deletes {
+                self.cache_invalidate(namespace, link).await;
+            }
+
             return Ok(());
         }
     }
@@ -650,5 +721,290 @@ impl Backend {
         let link_path = path_builder::link_path(link, namespace);
         self.store.delete(&link_path).await?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::str::FromStr;
+
+    use super::*;
+    use crate::cache;
+    use crate::cache::CacheExt;
+    use crate::registry::metadata_store::{LinkOperation, MetadataStore};
+
+    fn test_config() -> BackendConfig {
+        BackendConfig {
+            access_key_id: "root".to_string(),
+            secret_key: "roottoor".to_string(),
+            endpoint: "http://127.0.0.1:9000".to_string(),
+            region: "region".to_string(),
+            bucket: "registry".to_string(),
+            key_prefix: format!("test-cache-{}", uuid::Uuid::new_v4()),
+            redis: None,
+            link_cache_ttl: 30,
+        }
+    }
+
+    fn test_backend_with_cache(config: &BackendConfig) -> (Backend, Arc<dyn cache::Cache>) {
+        let cache: Arc<dyn cache::Cache> = Arc::new(cache::memory::Backend::new());
+        let backend = Backend::new(config).unwrap().with_cache(cache.clone());
+        (backend, cache)
+    }
+
+    #[tokio::test]
+    async fn test_read_link_cache_hit_skips_s3() {
+        let config = test_config();
+        let (backend, _cache) = test_backend_with_cache(&config);
+        let namespace = "cache-hit-ns";
+        let digest = Digest::from_str(
+            "sha256:a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2",
+        )
+        .unwrap();
+        let tag = LinkKind::Tag("latest".into());
+
+        // Create link via update_links
+        let ops = vec![LinkOperation::Create {
+            link: tag.clone(),
+            target: digest.clone(),
+            referrer: None,
+        }];
+        backend.update_links(namespace, &ops).await.unwrap();
+
+        // First read populates cache
+        let meta = backend.read_link(namespace, &tag, false).await.unwrap();
+        assert_eq!(meta.target, digest);
+
+        // Delete the S3 object directly
+        let link_path = path_builder::link_path(&tag, namespace);
+        backend.store.delete(&link_path).await.unwrap();
+
+        // Second read should succeed from cache
+        let meta = backend.read_link(namespace, &tag, false).await.unwrap();
+        assert_eq!(meta.target, digest);
+    }
+
+    #[tokio::test]
+    async fn test_read_link_cache_miss_fetches_from_s3() {
+        let config = test_config();
+        let (backend, cache) = test_backend_with_cache(&config);
+        let namespace = "cache-miss-ns";
+        let digest = Digest::from_str(
+            "sha256:b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3",
+        )
+        .unwrap();
+        let tag = LinkKind::Tag("latest".into());
+
+        // Create link via update_links
+        let ops = vec![LinkOperation::Create {
+            link: tag.clone(),
+            target: digest.clone(),
+            referrer: None,
+        }];
+        backend.update_links(namespace, &ops).await.unwrap();
+
+        // First read should return correct data from S3
+        let meta = backend.read_link(namespace, &tag, false).await.unwrap();
+        assert_eq!(meta.target, digest);
+
+        // Verify cache was populated
+        let cache_key = format!("link:{namespace}:{tag}");
+        let cached: Option<LinkMetadata> = cache.retrieve(&cache_key).await.unwrap();
+        assert!(cached.is_some(), "Cache should be populated after read");
+        assert_eq!(cached.unwrap().target, digest);
+    }
+
+    #[tokio::test]
+    async fn test_read_link_cache_expired_refetches() {
+        let mut config = test_config();
+        config.link_cache_ttl = 1;
+        let (backend, _cache) = test_backend_with_cache(&config);
+        let namespace = "cache-expired-ns";
+        let digest_a = Digest::from_str(
+            "sha256:c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4",
+        )
+        .unwrap();
+        let digest_b = Digest::from_str(
+            "sha256:d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5",
+        )
+        .unwrap();
+        let tag = LinkKind::Tag("latest".into());
+
+        // Create link pointing to digest_a
+        let ops = vec![LinkOperation::Create {
+            link: tag.clone(),
+            target: digest_a.clone(),
+            referrer: None,
+        }];
+        backend.update_links(namespace, &ops).await.unwrap();
+
+        // Read to populate cache
+        let meta = backend.read_link(namespace, &tag, false).await.unwrap();
+        assert_eq!(meta.target, digest_a);
+
+        // Wait for cache to expire
+        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+
+        // Write new data directly to S3 (bypassing cache invalidation)
+        let new_metadata = LinkMetadata::from_digest(digest_b.clone());
+        backend
+            .write_link_reference(namespace, &tag, &new_metadata)
+            .await
+            .unwrap();
+
+        // Read again should get new digest (cache expired)
+        let meta = backend.read_link(namespace, &tag, false).await.unwrap();
+        assert_eq!(meta.target, digest_b);
+    }
+
+    #[tokio::test]
+    async fn test_update_links_invalidates_cache() {
+        let config = test_config();
+        let (backend, _cache) = test_backend_with_cache(&config);
+        let namespace = "cache-invalidate-ns";
+        let digest_a = Digest::from_str(
+            "sha256:e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6",
+        )
+        .unwrap();
+        let digest_b = Digest::from_str(
+            "sha256:f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1",
+        )
+        .unwrap();
+        let tag = LinkKind::Tag("latest".into());
+
+        // Create tag pointing to digest_a
+        let ops = vec![LinkOperation::Create {
+            link: tag.clone(),
+            target: digest_a.clone(),
+            referrer: None,
+        }];
+        backend.update_links(namespace, &ops).await.unwrap();
+
+        // Read to populate cache
+        let meta = backend.read_link(namespace, &tag, false).await.unwrap();
+        assert_eq!(meta.target, digest_a);
+
+        // Update tag to point to digest_b via update_links
+        let ops = vec![LinkOperation::Create {
+            link: tag.clone(),
+            target: digest_b.clone(),
+            referrer: None,
+        }];
+        backend.update_links(namespace, &ops).await.unwrap();
+
+        // Read should return digest_b (cache was invalidated by update_links)
+        let meta = backend.read_link(namespace, &tag, false).await.unwrap();
+        assert_eq!(meta.target, digest_b);
+    }
+
+    #[tokio::test]
+    async fn test_read_link_with_access_time_update_populates_cache() {
+        let config = test_config();
+        let (backend, _cache) = test_backend_with_cache(&config);
+        let namespace = "cache-access-time-ns";
+        let digest = Digest::from_str(
+            "sha256:a1a2a3a4a5a6a7a8a1a2a3a4a5a6a7a8a1a2a3a4a5a6a7a8a1a2a3a4a5a6a7a8",
+        )
+        .unwrap();
+        let tag = LinkKind::Tag("latest".into());
+
+        // Create link
+        let ops = vec![LinkOperation::Create {
+            link: tag.clone(),
+            target: digest.clone(),
+            referrer: None,
+        }];
+        backend.update_links(namespace, &ops).await.unwrap();
+
+        // Read with access time update
+        let meta = backend.read_link(namespace, &tag, true).await.unwrap();
+        assert_eq!(meta.target, digest);
+        assert!(
+            meta.accessed_at.is_some(),
+            "accessed_at should be set after read with update_access_time=true"
+        );
+
+        // Subsequent read without access time update should return cached value with accessed_at
+        let meta = backend.read_link(namespace, &tag, false).await.unwrap();
+        assert_eq!(meta.target, digest);
+        assert!(
+            meta.accessed_at.is_some(),
+            "accessed_at should be present in cached value"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cache_disabled_when_ttl_zero() {
+        let mut config = test_config();
+        config.link_cache_ttl = 0;
+        let (backend, _cache) = test_backend_with_cache(&config);
+        let namespace = "cache-disabled-ns";
+        let digest = Digest::from_str(
+            "sha256:b1b2b3b4b5b6b7b8b1b2b3b4b5b6b7b8b1b2b3b4b5b6b7b8b1b2b3b4b5b6b7b8",
+        )
+        .unwrap();
+        let tag = LinkKind::Tag("latest".into());
+
+        // Create link
+        let ops = vec![LinkOperation::Create {
+            link: tag.clone(),
+            target: digest.clone(),
+            referrer: None,
+        }];
+        backend.update_links(namespace, &ops).await.unwrap();
+
+        // Read once
+        let meta = backend.read_link(namespace, &tag, false).await.unwrap();
+        assert_eq!(meta.target, digest);
+
+        // Delete S3 object directly
+        let link_path = path_builder::link_path(&tag, namespace);
+        backend.store.delete(&link_path).await.unwrap();
+
+        // Read again should fail (no caching when ttl is 0)
+        let result = backend.read_link(namespace, &tag, false).await;
+        assert!(
+            matches!(result, Err(Error::ReferenceNotFound)),
+            "Should get ReferenceNotFound when cache is disabled and S3 object is deleted"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cache_keys_are_namespace_scoped() {
+        let config = test_config();
+        let (backend, _cache) = test_backend_with_cache(&config);
+        let namespace_a = "cache-scope-ns-a";
+        let namespace_b = "cache-scope-ns-b";
+        let digest_a = Digest::from_str(
+            "sha256:c1c2c3c4c5c6c7c8c1c2c3c4c5c6c7c8c1c2c3c4c5c6c7c8c1c2c3c4c5c6c7c8",
+        )
+        .unwrap();
+        let digest_b = Digest::from_str(
+            "sha256:d1d2d3d4d5d6d7d8d1d2d3d4d5d6d7d8d1d2d3d4d5d6d7d8d1d2d3d4d5d6d7d8",
+        )
+        .unwrap();
+        let tag = LinkKind::Tag("latest".into());
+
+        // Create same tag in two namespaces pointing to different digests
+        let ops_a = vec![LinkOperation::Create {
+            link: tag.clone(),
+            target: digest_a.clone(),
+            referrer: None,
+        }];
+        backend.update_links(namespace_a, &ops_a).await.unwrap();
+
+        let ops_b = vec![LinkOperation::Create {
+            link: tag.clone(),
+            target: digest_b.clone(),
+            referrer: None,
+        }];
+        backend.update_links(namespace_b, &ops_b).await.unwrap();
+
+        // Read both - each should return its own digest
+        let meta_a = backend.read_link(namespace_a, &tag, false).await.unwrap();
+        let meta_b = backend.read_link(namespace_b, &tag, false).await.unwrap();
+
+        assert_eq!(meta_a.target, digest_a);
+        assert_eq!(meta_b.target, digest_b);
     }
 }

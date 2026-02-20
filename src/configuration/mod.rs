@@ -242,6 +242,7 @@ impl Configuration {
                         secret_key: config.secret_key.clone(),
                         key_prefix: config.key_prefix.clone(),
                         redis: None,
+                        link_cache_ttl: 30,
                     })
                 }
             },

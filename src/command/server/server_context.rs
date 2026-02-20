@@ -156,7 +156,7 @@ pub mod tests {
     pub fn create_test_server_context() -> ServerContext {
         let config = create_test_config();
         let blob_store = config.blob_store.to_backend().unwrap();
-        let metadata_store = config.resolve_metadata_config().to_backend().unwrap();
+        let metadata_store = config.resolve_metadata_config().to_backend(None).unwrap();
         let repositories = Arc::new(HashMap::new());
 
         let registry_config = RegistryConfig::new()
@@ -196,7 +196,7 @@ pub mod tests {
 
     fn create_test_registry(config: &Configuration) -> Registry {
         let blob_store = config.blob_store.to_backend().unwrap();
-        let metadata_store = config.resolve_metadata_config().to_backend().unwrap();
+        let metadata_store = config.resolve_metadata_config().to_backend(None).unwrap();
         let auth_cache = config.cache.to_backend().unwrap();
 
         let mut repositories_map = HashMap::new();
@@ -1022,7 +1022,7 @@ pub mod tests {
         let config: Configuration = toml::from_str(toml).unwrap();
 
         let blob_store = config.blob_store.to_backend().unwrap();
-        let metadata_store = config.resolve_metadata_config().to_backend().unwrap();
+        let metadata_store = config.resolve_metadata_config().to_backend(None).unwrap();
         let repositories = Arc::new(HashMap::new());
 
         let registry_config = RegistryConfig::new()

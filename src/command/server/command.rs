@@ -44,8 +44,14 @@ fn build_blob_store(config: &blob_store::BlobStorageConfig) -> Result<Arc<dyn Bl
     Ok(blob_store)
 }
 
-fn build_metadata_store(config: &Configuration) -> Result<Arc<dyn MetadataStore>, Error> {
-    match config.resolve_metadata_config().to_backend() {
+fn build_metadata_store(
+    config: &Configuration,
+    cache: &Arc<dyn Cache>,
+) -> Result<Arc<dyn MetadataStore>, Error> {
+    match config
+        .resolve_metadata_config()
+        .to_backend(Some(cache.clone()))
+    {
         Ok(store) => Ok(store),
         Err(err) => {
             let msg = format!("Failed to initialize metadata store: {err}");
@@ -93,8 +99,8 @@ fn build_repositories(
 
 fn build_registry(config: &Configuration) -> Result<Registry, Error> {
     let blob_store = build_blob_store(&config.blob_store)?;
-    let metadata_store = build_metadata_store(config)?;
     let auth_cache = build_auth_cache(&config.cache)?;
+    let metadata_store = build_metadata_store(config, &auth_cache)?;
     let repositories = build_repositories(&config.repository, &auth_cache)?;
 
     let registry_config = RegistryConfig::new()
@@ -257,7 +263,8 @@ mod tests {
     #[test]
     fn test_build_metadata_store_filesystem_success() {
         let config = create_minimal_config();
-        let result = build_metadata_store(&config);
+        let auth_cache = build_auth_cache(&config.cache).unwrap();
+        let result = build_metadata_store(&config, &auth_cache);
 
         assert!(result.is_ok());
     }
@@ -283,7 +290,8 @@ mod tests {
         "#;
 
         let config: Configuration = toml::from_str(toml).unwrap();
-        let result = build_metadata_store(&config);
+        let auth_cache = build_auth_cache(&config.cache).unwrap();
+        let result = build_metadata_store(&config, &auth_cache);
 
         assert!(result.is_ok());
     }
@@ -549,8 +557,8 @@ mod tests {
         let config = create_config_with_repository();
 
         let blob_store = build_blob_store(&config.blob_store).unwrap();
-        let metadata_store = build_metadata_store(&config).unwrap();
         let auth_cache = build_auth_cache(&config.cache).unwrap();
+        let metadata_store = build_metadata_store(&config, &auth_cache).unwrap();
         let repositories = build_repositories(&config.repository, &auth_cache).unwrap();
 
         let registry_config = RegistryConfig::new()
