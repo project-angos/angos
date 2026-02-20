@@ -3,6 +3,7 @@ use std::fmt;
 use hyper::StatusCode;
 use serde_json::json;
 
+use crate::configuration;
 use crate::registry;
 
 #[derive(Debug, PartialEq)]
@@ -117,6 +118,16 @@ impl From<registry::Error> for Error {
                 code: "INTERNAL_SERVER_ERROR".to_string(),
                 msg: Some(msg),
             },
+        }
+    }
+}
+
+impl From<configuration::Error> for Error {
+    fn from(error: configuration::Error) -> Self {
+        match error {
+            configuration::Error::Initialization(msg)
+            | configuration::Error::InvalidFormat(msg)
+            | configuration::Error::NotReadable(msg) => Error::Internal(msg),
         }
     }
 }
@@ -593,6 +604,16 @@ mod tests {
         for (expected_status, error) in test_cases {
             assert_eq!(error.status_code(), expected_status);
         }
+    }
+
+    #[test]
+    fn test_from_configuration_error_initialization() {
+        use crate::configuration;
+
+        let config_error = configuration::Error::Initialization("webhook failed".to_string());
+        let error: Error = config_error.into();
+
+        assert_eq!(error, Error::Internal("webhook failed".to_string()));
     }
 
     #[test]

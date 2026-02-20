@@ -3,6 +3,7 @@ use std::fmt::Debug;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use chrono::Utc;
 use http_body_util::Full;
 use hyper::body::{Bytes, Incoming};
 use hyper::header::{CONTENT_RANGE, CONTENT_TYPE, RANGE, WWW_AUTHENTICATE};
@@ -22,7 +23,8 @@ use crate::command::server::error::Error;
 use crate::command::server::request_ext::{HeaderExt, IntoAsyncRead};
 use crate::command::server::response_body::ResponseBody;
 use crate::command::server::{ServerContext, router, ui};
-use crate::identity::Route;
+use crate::event_webhook::event::{Event, EventActor, EventKind};
+use crate::identity::{ClientIdentity, Route};
 use crate::metrics_provider::{IN_FLIGHT_REQUESTS, METRICS_PROVIDER};
 use crate::oci::{Digest, Namespace, Reference};
 
@@ -145,8 +147,8 @@ async fn router(
     let (parts, incoming) = req.into_parts();
     let route = router::parse(&parts.method, &parts.uri);
 
-    authenticate_and_authorize(&context, &route, &parts).await?;
-    dispatch_route(&context, route, &parts, incoming).await
+    let identity = authenticate_and_authorize(&context, &route, &parts).await?;
+    dispatch_route(&context, route, &parts, incoming, &identity).await
 }
 
 #[instrument(skip(context, parts))]
@@ -154,18 +156,20 @@ async fn authenticate_and_authorize(
     context: &ServerContext,
     route: &Route<'_>,
     parts: &hyper::http::request::Parts,
-) -> Result<(), Error> {
+) -> Result<ClientIdentity, Error> {
     let remote_address = parts.extensions.get::<std::net::SocketAddr>().copied();
     let identity = context.authenticate_request(parts, remote_address).await?;
-    context.authorize_request(route, &identity, parts).await
+    context.authorize_request(route, &identity, parts).await?;
+    Ok(identity)
 }
 
-#[instrument(skip(context, parts, incoming))]
+#[instrument(skip(context, parts, incoming, identity))]
 async fn dispatch_route<'a>(
     context: &'a ServerContext,
     route: Route<'a>,
     parts: &'a hyper::http::request::Parts,
     incoming: Incoming,
+    identity: &ClientIdentity,
 ) -> Result<Response<ResponseBody>, Error> {
     match route {
         Route::UiAsset { path } if context.enable_ui => ui::serve_asset(path),
@@ -173,58 +177,66 @@ async fn dispatch_route<'a>(
         Route::Unknown | Route::UiAsset { .. } | Route::UiConfig => handle_unknown_route(parts),
         Route::ApiVersion => Ok(context.registry.handle_get_api_version().await?),
         Route::StartUpload { namespace, digest } => {
-            handle_start_upload(context, &namespace, digest).await
+            handle_start_upload(context, &namespace, digest, identity).await
         }
-        Route::GetUpload { namespace, uuid } => handle_get_upload(context, &namespace, uuid).await,
+        Route::GetUpload { namespace, uuid } => {
+            handle_get_upload(context, &namespace, uuid, identity).await
+        }
         Route::PatchUpload { namespace, uuid } => {
-            handle_patch_upload(context, parts, incoming, &namespace, uuid).await
+            handle_patch_upload(context, parts, incoming, &namespace, uuid, identity).await
         }
         Route::PutUpload {
             namespace,
             uuid,
             digest,
-        } => handle_put_upload(context, incoming, &namespace, uuid, digest).await,
+        } => handle_put_upload(context, incoming, &namespace, uuid, digest, identity).await,
         Route::DeleteUpload { namespace, uuid } => {
-            handle_delete_upload(context, &namespace, uuid).await
+            handle_delete_upload(context, &namespace, uuid, identity).await
         }
         Route::GetBlob { namespace, digest } => {
-            handle_get_blob(context, parts, &namespace, digest).await
+            handle_get_blob(context, parts, &namespace, digest, identity).await
         }
         Route::HeadBlob { namespace, digest } => {
-            handle_head_blob(context, parts, &namespace, digest).await
+            handle_head_blob(context, parts, &namespace, digest, identity).await
         }
         Route::DeleteBlob { namespace, digest } => {
-            handle_delete_blob(context, &namespace, digest).await
+            handle_delete_blob(context, &namespace, digest, identity).await
         }
         Route::GetManifest {
             namespace,
             reference,
-        } => handle_get_manifest(context, parts, &namespace, reference).await,
+        } => handle_get_manifest(context, parts, &namespace, reference, identity).await,
         Route::HeadManifest {
             namespace,
             reference,
-        } => handle_head_manifest(context, parts, &namespace, reference).await,
+        } => handle_head_manifest(context, parts, &namespace, reference, identity).await,
         Route::PutManifest {
             namespace,
             reference,
-        } => handle_put_manifest(context, parts, incoming, &namespace, reference).await,
+        } => handle_put_manifest(context, parts, incoming, &namespace, reference, identity).await,
         Route::DeleteManifest {
             namespace,
             reference,
-        } => handle_delete_manifest(context, &namespace, reference).await,
+        } => handle_delete_manifest(context, &namespace, reference, identity).await,
         Route::GetReferrer {
             namespace,
             digest,
             artifact_type,
-        } => handle_get_referrer(context, &namespace, digest, artifact_type).await,
-        Route::ListCatalog { n, last } => handle_list_catalog(context, n, last).await,
+        } => handle_get_referrer(context, &namespace, digest, artifact_type, identity).await,
+        Route::ListCatalog { n, last } => handle_list_catalog(context, n, last, identity).await,
         Route::ListTags { namespace, n, last } => {
-            handle_list_tags(context, &namespace, n, last).await
+            handle_list_tags(context, &namespace, n, last, identity).await
         }
-        Route::ListRevisions { namespace } => handle_list_revisions(context, &namespace).await,
-        Route::ListUploads { namespace } => handle_list_uploads(context, &namespace).await,
-        Route::ListRepositories => handle_list_repositories(context).await,
-        Route::ListNamespaces { repository } => handle_list_namespaces(context, repository).await,
+        Route::ListRevisions { namespace } => {
+            handle_list_revisions(context, &namespace, identity).await
+        }
+        Route::ListUploads { namespace } => {
+            handle_list_uploads(context, &namespace, identity).await
+        }
+        Route::ListRepositories => handle_list_repositories(context, identity).await,
+        Route::ListNamespaces { repository } => {
+            handle_list_namespaces(context, repository, identity).await
+        }
         Route::Healthz => handle_healthz(),
         Route::Metrics => handle_metrics(),
     }
@@ -242,10 +254,19 @@ fn handle_unknown_route(
     }
 }
 
+fn repository_name_for(context: &ServerContext, namespace: &Namespace) -> String {
+    context
+        .registry
+        .get_repository_for_namespace(namespace)
+        .map(|r| r.name.clone())
+        .unwrap_or_default()
+}
+
 async fn handle_start_upload(
     context: &ServerContext,
     namespace: &Namespace,
     digest: Option<Digest>,
+    _identity: &ClientIdentity,
 ) -> Result<Response<ResponseBody>, Error> {
     Ok(context
         .registry
@@ -257,6 +278,7 @@ async fn handle_get_upload(
     context: &ServerContext,
     namespace: &Namespace,
     uuid: Uuid,
+    _identity: &ClientIdentity,
 ) -> Result<Response<ResponseBody>, Error> {
     Ok(context.registry.handle_get_upload(namespace, uuid).await?)
 }
@@ -267,6 +289,7 @@ async fn handle_patch_upload(
     incoming: Incoming,
     namespace: &Namespace,
     uuid: Uuid,
+    _identity: &ClientIdentity,
 ) -> Result<Response<ResponseBody>, Error> {
     let start_offset = parts.range(CONTENT_RANGE)?.map(|(start, _)| start);
     let body_stream = incoming.into_async_read();
@@ -283,19 +306,36 @@ async fn handle_put_upload(
     namespace: &Namespace,
     uuid: Uuid,
     digest: Digest,
+    identity: &ClientIdentity,
 ) -> Result<Response<ResponseBody>, Error> {
     let body_stream = incoming.into_async_read();
 
-    Ok(context
+    let response = context
         .registry
         .handle_put_upload(namespace, uuid, &digest, body_stream)
-        .await?)
+        .await?;
+
+    let event = Event {
+        id: Uuid::new_v4(),
+        timestamp: Utc::now(),
+        kind: EventKind::BlobPush,
+        namespace: namespace.to_string(),
+        digest: Some(digest.to_string()),
+        reference: None,
+        tag: None,
+        actor: Some(EventActor::from(identity.clone())),
+        repository: repository_name_for(context, namespace),
+    };
+    context.dispatch_event(&event).await?;
+
+    Ok(response)
 }
 
 async fn handle_delete_upload(
     context: &ServerContext,
     namespace: &Namespace,
     uuid: Uuid,
+    _identity: &ClientIdentity,
 ) -> Result<Response<ResponseBody>, Error> {
     Ok(context
         .registry
@@ -308,6 +348,7 @@ async fn handle_get_blob(
     parts: &hyper::http::request::Parts,
     namespace: &Namespace,
     digest: Digest,
+    _identity: &ClientIdentity,
 ) -> Result<Response<ResponseBody>, Error> {
     let mime_types = parts.accepted_content_types();
     let range = parts.range(RANGE)?;
@@ -323,6 +364,7 @@ async fn handle_head_blob(
     parts: &hyper::http::request::Parts,
     namespace: &Namespace,
     digest: Digest,
+    _identity: &ClientIdentity,
 ) -> Result<Response<ResponseBody>, Error> {
     let mime_types = parts.accepted_content_types();
 
@@ -336,6 +378,7 @@ async fn handle_delete_blob(
     context: &ServerContext,
     namespace: &Namespace,
     digest: Digest,
+    _identity: &ClientIdentity,
 ) -> Result<Response<ResponseBody>, Error> {
     Ok(context
         .registry
@@ -348,6 +391,7 @@ async fn handle_get_manifest(
     parts: &hyper::http::request::Parts,
     namespace: &Namespace,
     reference: Reference,
+    _identity: &ClientIdentity,
 ) -> Result<Response<ResponseBody>, Error> {
     let mime_types = parts.accepted_content_types();
     let is_tag_immutable = match &reference {
@@ -366,6 +410,7 @@ async fn handle_head_manifest(
     parts: &hyper::http::request::Parts,
     namespace: &Namespace,
     reference: Reference,
+    _identity: &ClientIdentity,
 ) -> Result<Response<ResponseBody>, Error> {
     let mime_types = parts.accepted_content_types();
     let is_tag_immutable = match &reference {
@@ -385,6 +430,7 @@ async fn handle_put_manifest(
     incoming: Incoming,
     namespace: &Namespace,
     reference: Reference,
+    identity: &ClientIdentity,
 ) -> Result<Response<ResponseBody>, Error> {
     let mime_type = parts.get_header(CONTENT_TYPE).ok_or(Error::BadRequest(
         "No Content-Type header provided".to_string(),
@@ -392,21 +438,99 @@ async fn handle_put_manifest(
 
     let body_stream = incoming.into_async_read();
 
-    Ok(context
+    let response = context
         .registry
-        .handle_put_manifest(namespace, reference, mime_type, body_stream)
-        .await?)
+        .handle_put_manifest(namespace, reference.clone(), mime_type, body_stream)
+        .await?;
+
+    let digest = response
+        .headers()
+        .get("Docker-Content-Digest")
+        .and_then(|v| v.to_str().ok())
+        .map(ToString::to_string);
+
+    let repository = repository_name_for(context, namespace);
+    let actor = Some(EventActor::from(identity.clone()));
+
+    let manifest_event = Event {
+        id: Uuid::new_v4(),
+        timestamp: Utc::now(),
+        kind: EventKind::ManifestPush,
+        namespace: namespace.to_string(),
+        digest: digest.clone(),
+        reference: Some(reference.to_string()),
+        tag: None,
+        actor: actor.clone(),
+        repository: repository.clone(),
+    };
+    context.dispatch_event(&manifest_event).await?;
+
+    if let Reference::Tag(tag) = &reference {
+        let tag_event = Event {
+            id: Uuid::new_v4(),
+            timestamp: Utc::now(),
+            kind: EventKind::TagCreate,
+            namespace: namespace.to_string(),
+            digest,
+            reference: Some(reference.to_string()),
+            tag: Some(tag.clone()),
+            actor,
+            repository,
+        };
+        context.dispatch_event(&tag_event).await?;
+    }
+
+    Ok(response)
 }
 
 async fn handle_delete_manifest(
     context: &ServerContext,
     namespace: &Namespace,
     reference: Reference,
+    identity: &ClientIdentity,
 ) -> Result<Response<ResponseBody>, Error> {
-    Ok(context
+    let response = context
         .registry
-        .handle_delete_manifest(namespace, reference)
-        .await?)
+        .handle_delete_manifest(namespace, reference.clone())
+        .await?;
+
+    let repository = repository_name_for(context, namespace);
+    let actor = Some(EventActor::from(identity.clone()));
+
+    let digest = match &reference {
+        Reference::Digest(d) => Some(d.to_string()),
+        Reference::Tag(_) => None,
+    };
+
+    let delete_event = Event {
+        id: Uuid::new_v4(),
+        timestamp: Utc::now(),
+        kind: EventKind::ManifestDelete,
+        namespace: namespace.to_string(),
+        digest: digest.clone(),
+        reference: Some(reference.to_string()),
+        tag: None,
+        actor: actor.clone(),
+        repository: repository.clone(),
+    };
+    context.dispatch_event(&delete_event).await?;
+
+    if let Reference::Tag(tag) = &reference {
+        let tag_event = Event {
+            id: Uuid::new_v4(),
+            timestamp: Utc::now(),
+            kind: EventKind::TagDelete,
+            namespace: namespace.to_string(),
+            digest,
+            reference: Some(reference.to_string()),
+            tag: Some(tag.clone()),
+            actor,
+            repository,
+        };
+        context.dispatch_event(&tag_event).await?;
+    }
+
+    Ok(response)
 }
 
 async fn handle_get_referrer(
@@ -414,6 +538,7 @@ async fn handle_get_referrer(
     namespace: &Namespace,
     digest: Digest,
     artifact_type: Option<String>,
+    _identity: &ClientIdentity,
 ) -> Result<Response<ResponseBody>, Error> {
     Ok(context
         .registry
@@ -425,6 +550,7 @@ async fn handle_list_catalog(
     context: &ServerContext,
     n: Option<u16>,
     last: Option<String>,
+    _identity: &ClientIdentity,
 ) -> Result<Response<ResponseBody>, Error> {
     Ok(context.registry.handle_list_catalog(n, last).await?)
 }
@@ -434,6 +560,7 @@ async fn handle_list_tags(
     namespace: &Namespace,
     n: Option<u16>,
     last: Option<String>,
+    _identity: &ClientIdentity,
 ) -> Result<Response<ResponseBody>, Error> {
     Ok(context
         .registry
@@ -444,6 +571,7 @@ async fn handle_list_tags(
 async fn handle_list_revisions(
     context: &ServerContext,
     namespace: &Namespace,
+    _identity: &ClientIdentity,
 ) -> Result<Response<ResponseBody>, Error> {
     Ok(context.registry.handle_list_revisions(namespace).await?)
 }
@@ -451,12 +579,14 @@ async fn handle_list_revisions(
 async fn handle_list_uploads(
     context: &ServerContext,
     namespace: &Namespace,
+    _identity: &ClientIdentity,
 ) -> Result<Response<ResponseBody>, Error> {
     Ok(context.registry.handle_list_uploads(namespace).await?)
 }
 
 async fn handle_list_repositories(
     context: &ServerContext,
+    _identity: &ClientIdentity,
 ) -> Result<Response<ResponseBody>, Error> {
     Ok(context.registry.handle_list_repositories().await?)
 }
@@ -464,6 +594,7 @@ async fn handle_list_repositories(
 async fn handle_list_namespaces(
     context: &ServerContext,
     repository: &str,
+    _identity: &ClientIdentity,
 ) -> Result<Response<ResponseBody>, Error> {
     Ok(context.registry.handle_list_namespaces(repository).await?)
 }
@@ -542,8 +673,13 @@ pub fn error_to_response(error: &Error, request_id: Option<&String>) -> Response
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use super::*;
+    use crate::configuration::Configuration;
+    use crate::identity::ClientIdentity;
     use crate::registry;
+    use crate::registry::{Registry, RegistryConfig};
 
     #[test]
     fn test_error_to_response_unauthorized_with_request_id() {
@@ -921,5 +1057,135 @@ mod tests {
         let error2 = Error::BadRequest("Bad input".to_string());
         let response2 = error_to_response(&error2, request_id.as_ref());
         assert_eq!(response2.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_authenticate_and_authorize_returns_client_identity() {
+        let toml = r#"
+            [blob_store.fs]
+            root_dir = "/tmp/test-blobs"
+
+            [metadata_store.fs]
+            root_dir = "/tmp/test-metadata"
+
+            [cache.memory]
+
+            [server]
+            bind_address = "127.0.0.1"
+            port = 8080
+
+            [global]
+            update_pull_time = false
+            max_concurrent_cache_jobs = 10
+
+            [global.access_policy]
+            default_allow = true
+            rules = []
+        "#;
+
+        let config: Configuration = toml::from_str(toml).unwrap();
+        let blob_store = config.blob_store.to_backend().unwrap();
+        let metadata_store = config.resolve_metadata_config().to_backend().unwrap();
+        let repositories = Arc::new(HashMap::new());
+        let registry_config = RegistryConfig::new()
+            .update_pull_time(false)
+            .enable_redirect(true)
+            .concurrent_cache_jobs(10)
+            .global_immutable_tags(false)
+            .global_immutable_tags_exclusions(Vec::new());
+        let registry =
+            Registry::new(blob_store, metadata_store, repositories, registry_config).unwrap();
+        let context = ServerContext::new(&config, registry).unwrap();
+
+        let request = Request::builder().uri("/v2/").body(()).unwrap();
+        let (parts, ()) = request.into_parts();
+        let route = Route::ApiVersion;
+
+        let result = authenticate_and_authorize(&context, &route, &parts).await;
+
+        let identity: ClientIdentity = result.unwrap();
+        assert!(identity.username.is_none());
+    }
+
+    fn create_test_context_with_allow_policy() -> ServerContext {
+        use std::collections::HashMap;
+
+        use crate::configuration::Configuration;
+        use crate::registry::{Registry, RegistryConfig};
+
+        let toml = r#"
+            [blob_store.fs]
+            root_dir = "/tmp/test-blobs"
+
+            [metadata_store.fs]
+            root_dir = "/tmp/test-metadata"
+
+            [cache.memory]
+
+            [server]
+            bind_address = "127.0.0.1"
+            port = 8080
+
+            [global]
+            update_pull_time = false
+            max_concurrent_cache_jobs = 10
+
+            [global.access_policy]
+            default_allow = true
+            rules = []
+        "#;
+
+        let config: Configuration = toml::from_str(toml).unwrap();
+        let blob_store = config.blob_store.to_backend().unwrap();
+        let metadata_store = config.resolve_metadata_config().to_backend().unwrap();
+        let repositories = Arc::new(HashMap::new());
+        let registry_config = RegistryConfig::new()
+            .update_pull_time(false)
+            .enable_redirect(true)
+            .concurrent_cache_jobs(10)
+            .global_immutable_tags(false)
+            .global_immutable_tags_exclusions(Vec::new());
+        let registry =
+            Registry::new(blob_store, metadata_store, repositories, registry_config).unwrap();
+        ServerContext::new(&config, registry).unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_handle_list_repositories_accepts_identity() {
+        use crate::identity::ClientIdentity;
+
+        let context = create_test_context_with_allow_policy();
+        let identity = ClientIdentity::default();
+
+        let result = handle_list_repositories(&context, &identity).await;
+
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_handle_list_catalog_accepts_identity() {
+        use crate::identity::ClientIdentity;
+
+        let context = create_test_context_with_allow_policy();
+        let identity = ClientIdentity::default();
+
+        let result = handle_list_catalog(&context, None, None, &identity).await;
+
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_handle_delete_blob_accepts_identity() {
+        use crate::identity::ClientIdentity;
+
+        let context = create_test_context_with_allow_policy();
+        let identity = ClientIdentity::default();
+        let namespace = Namespace::new("test/repo").unwrap();
+        let digest: Digest =
+            "sha256:abababababababababababababababababababababababababababababababab"
+                .parse()
+                .unwrap();
+
+        let _result = handle_delete_blob(&context, &namespace, digest, &identity).await;
     }
 }

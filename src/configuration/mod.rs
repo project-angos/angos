@@ -12,6 +12,7 @@ pub use error::Error;
 use crate::cache;
 use crate::command::server::auth::authenticator;
 use crate::command::server::listeners::{insecure, tls};
+use crate::event_webhook::config::EventWebhookConfig;
 use crate::policy::{AccessPolicyConfig, RetentionPolicyConfig};
 use crate::registry::{blob_store, metadata_store, repository};
 
@@ -32,6 +33,8 @@ pub struct Configuration {
     pub auth: authenticator::AuthConfig,
     #[serde(default)]
     pub repository: HashMap<String, repository::Config>, // hashmap of namespace <-> repository_config
+    #[serde(default)]
+    pub event_webhook: HashMap<String, EventWebhookConfig>,
     #[serde(default)]
     pub observability: Option<ObservabilityConfig>,
 }
@@ -62,6 +65,8 @@ pub struct GlobalConfig {
     #[serde(default)]
     pub immutable_tags_exclusions: Vec<String>,
     pub authorization_webhook: Option<String>,
+    #[serde(default)]
+    pub event_webhooks: Vec<String>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -99,6 +104,7 @@ impl Default for GlobalConfig {
             immutable_tags: false,
             immutable_tags_exclusions: Vec::new(),
             authorization_webhook: None,
+            event_webhooks: Vec::new(),
         }
     }
 }
@@ -182,6 +188,33 @@ impl Configuration {
                     "Webhook '{webhook_name}' not found (referenced in '{repository}' repository)"
                 );
                 return Err(Error::InvalidFormat(msg));
+            }
+        }
+
+        let event_webhook_names = self.event_webhook.keys().collect::<HashSet<_>>();
+
+        for (name, config) in &self.event_webhook {
+            config.validate().map_err(|e| {
+                let msg = format!("Invalid event webhook '{name}': {e}");
+                Error::InvalidFormat(msg)
+            })?;
+        }
+
+        for name in &self.global.event_webhooks {
+            if !event_webhook_names.contains(name) {
+                let msg = format!("Event webhook '{name}' not found (referenced globally)");
+                return Err(Error::InvalidFormat(msg));
+            }
+        }
+
+        for (repository, config) in &self.repository {
+            for name in &config.event_webhooks {
+                if !event_webhook_names.contains(name) {
+                    let msg = format!(
+                        "Event webhook '{name}' not found (referenced in '{repository}' repository)"
+                    );
+                    return Err(Error::InvalidFormat(msg));
+                }
             }
         }
 
@@ -1152,6 +1185,152 @@ mod tests {
         match result {
             Err(Error::InvalidFormat(msg)) => {
                 assert!(msg.contains("Webhook 'missing-webhook' not found"));
+            }
+            _ => panic!("Expected InvalidFormat error"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_event_webhook_config_parses() {
+        let config = r#"
+        [server]
+        bind_address = "0.0.0.0"
+
+        [event_webhook.notify]
+        url = "https://example.com/events"
+        policy = "required"
+        events = ["manifest.push", "tag.create"]
+
+        [event_webhook.audit]
+        url = "https://audit.example.com/hook"
+        policy = "async"
+        token = "my-secret"
+        timeout_ms = 10000
+        max_retries = 3
+        events = ["manifest.push", "manifest.delete", "blob.push", "tag.create", "tag.delete"]
+        repository_filter = ["^production/.*"]
+        "#;
+
+        let config = Configuration::load_from_str(config).unwrap();
+        assert_eq!(config.event_webhook.len(), 2);
+        assert!(config.event_webhook.contains_key("notify"));
+        assert!(config.event_webhook.contains_key("audit"));
+    }
+
+    #[tokio::test]
+    async fn test_event_webhook_backward_compatible() {
+        let config = r#"
+        [server]
+        bind_address = "0.0.0.0"
+        "#;
+
+        let config = Configuration::load_from_str(config).unwrap();
+        assert!(config.event_webhook.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_global_event_webhooks_references() {
+        let config = r#"
+        [server]
+        bind_address = "0.0.0.0"
+
+        [global]
+        event_webhooks = ["notify"]
+
+        [event_webhook.notify]
+        url = "https://example.com/events"
+        policy = "optional"
+        events = ["manifest.push"]
+        "#;
+
+        let config = Configuration::load_from_str(config).unwrap();
+        assert_eq!(config.global.event_webhooks.len(), 1);
+        assert_eq!(config.global.event_webhooks[0], "notify");
+    }
+
+    #[tokio::test]
+    async fn test_repository_event_webhooks_references() {
+        let config = r#"
+        [server]
+        bind_address = "0.0.0.0"
+
+        [event_webhook.notify]
+        url = "https://example.com/events"
+        policy = "required"
+        events = ["manifest.push"]
+
+        [repository.myapp]
+        event_webhooks = ["notify"]
+        "#;
+
+        let config = Configuration::load_from_str(config).unwrap();
+        assert_eq!(config.repository["myapp"].event_webhooks.len(), 1);
+        assert_eq!(config.repository["myapp"].event_webhooks[0], "notify");
+    }
+
+    #[tokio::test]
+    async fn test_event_webhook_nonexistent_global_reference_fails() {
+        let config = r#"
+        [server]
+        bind_address = "0.0.0.0"
+
+        [global]
+        event_webhooks = ["nonexistent"]
+        "#;
+
+        let result = Configuration::load_from_str(config);
+        assert!(result.is_err());
+        match result {
+            Err(Error::InvalidFormat(msg)) => {
+                assert!(msg.contains("nonexistent"));
+            }
+            _ => panic!("Expected InvalidFormat error"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_event_webhook_nonexistent_repository_reference_fails() {
+        let config = r#"
+        [server]
+        bind_address = "0.0.0.0"
+
+        [event_webhook.notify]
+        url = "https://example.com/events"
+        policy = "optional"
+        events = ["manifest.push"]
+
+        [repository.myapp]
+        event_webhooks = ["missing-hook"]
+        "#;
+
+        let result = Configuration::load_from_str(config);
+        assert!(result.is_err());
+        match result {
+            Err(Error::InvalidFormat(msg)) => {
+                assert!(msg.contains("missing-hook"));
+                assert!(msg.contains("myapp"));
+            }
+            _ => panic!("Expected InvalidFormat error"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_event_webhook_invalid_config_fails_validation() {
+        let config = r#"
+        [server]
+        bind_address = "0.0.0.0"
+
+        [event_webhook.bad]
+        url = "ht!tp://::invalid"
+        policy = "required"
+        events = ["manifest.push"]
+        "#;
+
+        let result = Configuration::load_from_str(config);
+        assert!(result.is_err());
+        match result {
+            Err(Error::InvalidFormat(msg)) => {
+                assert!(msg.contains("bad"));
             }
             _ => panic!("Expected InvalidFormat error"),
         }

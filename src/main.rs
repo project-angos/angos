@@ -2,6 +2,7 @@
 #![warn(clippy::pedantic)]
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use argh::FromArgs;
 use opentelemetry::trace::TracerProvider as _;
@@ -9,7 +10,7 @@ use opentelemetry::{KeyValue, global};
 use opentelemetry_otlp::{SpanExporter, WithExportConfig};
 use opentelemetry_sdk::Resource;
 use opentelemetry_sdk::trace::{RandomIdGenerator, Sampler, SdkTracerProvider};
-use tracing::error;
+use tracing::{error, info};
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt};
 
@@ -20,6 +21,7 @@ use crate::watcher::ConfigWatcher;
 mod cache;
 mod command;
 mod configuration;
+mod event_webhook;
 mod identity;
 mod metrics_provider;
 mod oci;
@@ -154,5 +156,35 @@ async fn run_server(options: GlobalArguments, config: Configuration) -> Result<(
         std::process::exit(1);
     };
 
+    let shutdown_server = Arc::clone(&server);
+    tokio::spawn(async move {
+        shutdown_signal().await;
+        info!("Shutdown signal received, draining in-flight webhook deliveries");
+        shutdown_server
+            .shutdown_with_timeout(Duration::from_secs(30))
+            .await;
+        info!("Graceful shutdown complete");
+        std::process::exit(0);
+    });
+
     server.run().await
+}
+
+async fn shutdown_signal() {
+    let ctrl_c = tokio::signal::ctrl_c();
+
+    #[cfg(unix)]
+    {
+        let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("failed to register SIGTERM handler");
+        tokio::select! {
+            _ = ctrl_c => {}
+            _ = sigterm.recv() => {}
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        ctrl_c.await.expect("failed to listen for Ctrl+C");
+    }
 }

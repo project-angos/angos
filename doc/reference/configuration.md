@@ -54,6 +54,7 @@ When omitted, the server runs without TLS (insecure).
 | `immutable_tags`            | bool     | `false`  | Global immutable tags default               |
 | `immutable_tags_exclusions` | [string] | `[]`     | Regex patterns for mutable tags             |
 | `authorization_webhook`     | string   | -        | Name of webhook for authorization           |
+| `event_webhooks`            | [string] | `[]`     | Event webhook names for all repositories    |
 
 ### Global Access Policy (`global.access_policy`)
 
@@ -200,6 +201,7 @@ Required for multi-replica deployments.
 | `immutable_tags`            | bool     | inherits | Override global immutable tags  |
 | `immutable_tags_exclusions` | [string] | inherits | Override global exclusions      |
 | `authorization_webhook`     | string   | inherits | Webhook name (empty to disable) |
+| `event_webhooks`            | [string] | inherits | Event webhook names              |
 
 ### Upstream (`repository."<namespace>".upstream`)
 
@@ -222,6 +224,29 @@ Same as `global.access_policy`.
 ### Retention Policy (`repository."<namespace>".retention_policy`)
 
 Same as `global.retention_policy`.
+
+---
+
+## Event Webhooks (`event_webhook.<name>`)
+
+HTTP POST notifications for registry operations. See [Event Webhooks Reference](event-webhooks.md) for full details.
+
+| Option              | Type     | Default  | Description                                      |
+|---------------------|----------|----------|--------------------------------------------------|
+| `url`               | string   | required | HTTP/HTTPS endpoint URL                          |
+| `policy`            | string   | required | Delivery policy: `required`, `optional`, `async` |
+| `events`            | [string] | required | Event types to deliver (at least one)            |
+| `token`             | string   | -        | Bearer token and HMAC signing secret             |
+| `timeout_ms`        | u64      | `5000`   | HTTP request timeout in milliseconds             |
+| `max_retries`       | u32      | `0`      | Maximum retry attempts after initial failure     |
+| `repository_filter` | [string] | -        | Regex patterns to match repository names         |
+
+Webhooks are enabled by referencing their names:
+
+| Location                   | Option           | Type     | Description                        |
+|----------------------------|------------------|----------|------------------------------------|
+| `global`                   | `event_webhooks` | [string] | Webhook names for all repositories |
+| `repository."<namespace>"` | `event_webhooks` | [string] | Webhook names for this repository  |
 
 ---
 
