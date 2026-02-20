@@ -306,9 +306,8 @@ impl MetadataStore for Backend {
         link: &LinkKind,
         update_access_time: bool,
     ) -> Result<LinkMetadata, Error> {
-        let _guard = self.lock.acquire(&[link.to_string()]).await?;
-
         if update_access_time {
+            let _guard = self.lock.acquire(&[link.to_string()]).await?;
             let link_data = self.read_link_reference(namespace, link).await?.accessed();
             self.write_link_reference(namespace, link, &link_data)
                 .await?;

@@ -1,3 +1,4 @@
+use futures_util::StreamExt;
 use hyper::header::{CONTENT_LENGTH, CONTENT_TYPE, LOCATION};
 use hyper::{Response, StatusCode};
 use tokio::io::{AsyncRead, AsyncReadExt};
@@ -333,28 +334,48 @@ impl Registry {
             Reference::Digest(digest) => {
                 tx.delete_link(&LinkKind::Digest(digest.clone()));
 
-                // Find all tags pointing to this digest
+                // Collect all tags
+                let mut all_tags = Vec::new();
                 let mut marker = None;
                 loop {
                     let (tags, next_marker) = self
                         .metadata_store
                         .list_tags(namespace, 100, marker)
                         .await?;
-                    for tag in tags {
-                        let tag_link = LinkKind::Tag(tag.clone());
-                        if let Ok(metadata) = self
-                            .metadata_store
-                            .read_link(namespace, &tag_link, false)
-                            .await
-                            && &metadata.target == digest
-                        {
-                            tx.delete_link(&tag_link);
-                        }
-                    }
+                    all_tags.extend(tags);
                     if next_marker.is_none() {
                         break;
                     }
                     marker = next_marker;
+                }
+
+                // Read all tag links concurrently to find ones pointing to this digest
+                let matching_tags: Vec<_> = futures_util::stream::iter(all_tags)
+                    .map(|tag| {
+                        let tag_link = LinkKind::Tag(tag);
+                        async {
+                            let result = self
+                                .metadata_store
+                                .read_link(namespace, &tag_link, false)
+                                .await;
+                            (tag_link, result)
+                        }
+                    })
+                    .buffer_unordered(20)
+                    .filter_map(|(tag_link, result)| async {
+                        if let Ok(metadata) = result
+                            && &metadata.target == digest
+                        {
+                            Some(tag_link)
+                        } else {
+                            None
+                        }
+                    })
+                    .collect()
+                    .await;
+
+                for tag_link in matching_tags {
+                    tx.delete_link(&tag_link);
                 }
 
                 // Delete all links created during put_manifest
@@ -1106,5 +1127,300 @@ mod tests {
     async fn test_pull_through_cache_optimization_fs() {
         let mut t = FSRegistryTestCase::new();
         test_pull_through_cache_optimization_impl(&mut t).await;
+    }
+
+    #[tokio::test]
+    async fn test_delete_manifest_by_digest_removes_multiple_tags() {
+        for test_case in backends() {
+            let registry = test_case.registry();
+            let namespace = &Namespace::new("test-repo/delete-multi-tags").unwrap();
+            let (content, media_type) = create_test_manifest();
+
+            let response = registry
+                .put_manifest(
+                    namespace,
+                    &Reference::Tag("latest".to_string()),
+                    Some(&media_type),
+                    &content,
+                )
+                .await
+                .unwrap();
+
+            registry
+                .put_manifest(
+                    namespace,
+                    &Reference::Tag("v1.0".to_string()),
+                    Some(&media_type),
+                    &content,
+                )
+                .await
+                .unwrap();
+
+            registry
+                .delete_manifest(namespace, &Reference::Digest(response.digest.clone()))
+                .await
+                .unwrap();
+
+            let repository = registry.get_repository_for_namespace(namespace).unwrap();
+
+            assert!(
+                registry
+                    .get_manifest(
+                        repository,
+                        slice::from_ref(&media_type),
+                        namespace,
+                        Reference::Tag("latest".to_string()),
+                        false,
+                    )
+                    .await
+                    .is_err()
+            );
+
+            assert!(
+                registry
+                    .get_manifest(
+                        repository,
+                        slice::from_ref(&media_type),
+                        namespace,
+                        Reference::Tag("v1.0".to_string()),
+                        false,
+                    )
+                    .await
+                    .is_err()
+            );
+
+            assert!(
+                registry
+                    .get_manifest(
+                        repository,
+                        slice::from_ref(&media_type),
+                        namespace,
+                        Reference::Digest(response.digest.clone()),
+                        false,
+                    )
+                    .await
+                    .is_err()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_delete_manifest_by_digest_preserves_unrelated_tags() {
+        for test_case in backends() {
+            let registry = test_case.registry();
+            let namespace = &Namespace::new("test-repo/delete-preserve").unwrap();
+            let (content_a, media_type_a) = create_test_manifest();
+            let (content_b, media_type_b) = create_test_manifest_with_subject();
+
+            let response_a = registry
+                .put_manifest(
+                    namespace,
+                    &Reference::Tag("v1.0".to_string()),
+                    Some(&media_type_a),
+                    &content_a,
+                )
+                .await
+                .unwrap();
+
+            registry
+                .put_manifest(
+                    namespace,
+                    &Reference::Tag("v1.1".to_string()),
+                    Some(&media_type_a),
+                    &content_a,
+                )
+                .await
+                .unwrap();
+
+            let response_b = registry
+                .put_manifest(
+                    namespace,
+                    &Reference::Tag("v2.0".to_string()),
+                    Some(&media_type_b),
+                    &content_b,
+                )
+                .await
+                .unwrap();
+
+            registry
+                .delete_manifest(namespace, &Reference::Digest(response_a.digest.clone()))
+                .await
+                .unwrap();
+
+            let repository = registry.get_repository_for_namespace(namespace).unwrap();
+
+            assert!(
+                registry
+                    .get_manifest(
+                        repository,
+                        slice::from_ref(&media_type_a),
+                        namespace,
+                        Reference::Tag("v1.0".to_string()),
+                        false,
+                    )
+                    .await
+                    .is_err()
+            );
+
+            assert!(
+                registry
+                    .get_manifest(
+                        repository,
+                        slice::from_ref(&media_type_a),
+                        namespace,
+                        Reference::Tag("v1.1".to_string()),
+                        false,
+                    )
+                    .await
+                    .is_err()
+            );
+
+            let manifest_b = registry
+                .get_manifest(
+                    repository,
+                    slice::from_ref(&media_type_b),
+                    namespace,
+                    Reference::Tag("v2.0".to_string()),
+                    false,
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(manifest_b.digest, response_b.digest);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_delete_manifest_with_many_tags() {
+        for test_case in backends() {
+            let registry = test_case.registry();
+            let namespace = &Namespace::new("test-repo/delete-many-tags").unwrap();
+            let (content_a, media_type_a) = create_test_manifest();
+            let (content_b, media_type_b) = create_test_manifest_with_subject();
+
+            let response_a = registry
+                .put_manifest(
+                    namespace,
+                    &Reference::Tag("tag-0".to_string()),
+                    Some(&media_type_a),
+                    &content_a,
+                )
+                .await
+                .unwrap();
+
+            for i in 1..20 {
+                registry
+                    .put_manifest(
+                        namespace,
+                        &Reference::Tag(format!("tag-{i}")),
+                        Some(&media_type_a),
+                        &content_a,
+                    )
+                    .await
+                    .unwrap();
+            }
+
+            for i in 0..20 {
+                registry
+                    .put_manifest(
+                        namespace,
+                        &Reference::Tag(format!("other-{i}")),
+                        Some(&media_type_b),
+                        &content_b,
+                    )
+                    .await
+                    .unwrap();
+            }
+
+            registry
+                .delete_manifest(namespace, &Reference::Digest(response_a.digest.clone()))
+                .await
+                .unwrap();
+
+            let repository = registry.get_repository_for_namespace(namespace).unwrap();
+
+            for i in 0..20 {
+                assert!(
+                    registry
+                        .get_manifest(
+                            repository,
+                            slice::from_ref(&media_type_a),
+                            namespace,
+                            Reference::Tag(format!("tag-{i}")),
+                            false,
+                        )
+                        .await
+                        .is_err(),
+                    "tag-{i} should have been deleted"
+                );
+            }
+
+            for i in 0..20 {
+                assert!(
+                    registry
+                        .get_manifest(
+                            repository,
+                            slice::from_ref(&media_type_b),
+                            namespace,
+                            Reference::Tag(format!("other-{i}")),
+                            false,
+                        )
+                        .await
+                        .is_ok(),
+                    "other-{i} should still exist"
+                );
+            }
+
+            let (tags, _) = registry
+                .metadata_store
+                .list_tags(namespace, 100, None)
+                .await
+                .unwrap();
+            assert_eq!(tags.len(), 20, "expected exactly 20 remaining tags");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_delete_manifest_no_tags_by_digest() {
+        for test_case in backends() {
+            let registry = test_case.registry();
+            let namespace = &Namespace::new("test-repo/delete-no-tags").unwrap();
+            let (content, media_type) = create_test_manifest();
+
+            let response = registry
+                .put_manifest(
+                    namespace,
+                    &Reference::Tag("temp".to_string()),
+                    Some(&media_type),
+                    &content,
+                )
+                .await
+                .unwrap();
+
+            registry
+                .delete_manifest(namespace, &Reference::Tag("temp".to_string()))
+                .await
+                .unwrap();
+
+            registry
+                .delete_manifest(namespace, &Reference::Digest(response.digest.clone()))
+                .await
+                .unwrap();
+
+            let repository = registry.get_repository_for_namespace(namespace).unwrap();
+
+            assert!(
+                registry
+                    .get_manifest(
+                        repository,
+                        slice::from_ref(&media_type),
+                        namespace,
+                        Reference::Digest(response.digest.clone()),
+                        false,
+                    )
+                    .await
+                    .is_err()
+            );
+        }
     }
 }
