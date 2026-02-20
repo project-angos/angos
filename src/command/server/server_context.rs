@@ -101,11 +101,18 @@ impl ServerContext {
         }
         Ok(())
     }
+
+    pub async fn shutdown_with_timeout(&self, timeout: std::time::Duration) {
+        if let Some(dispatcher) = &self.event_dispatcher {
+            dispatcher.shutdown_with_timeout(timeout).await;
+        }
+    }
 }
 
 #[cfg(test)]
 pub mod tests {
     use std::collections::HashMap;
+    use std::time::Duration;
 
     use argon2::password_hash::SaltString;
     use argon2::password_hash::rand_core::OsRng;
@@ -842,6 +849,152 @@ pub mod tests {
 
         let result = context.dispatch_event(&event).await;
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_server_context_shutdown_with_no_dispatcher() {
+        // A context without webhooks should be able to shut down without panic
+        let config = create_minimal_config();
+        let registry = create_test_registry(&config);
+        let context = ServerContext::new(&config, registry).unwrap();
+
+        assert!(context.event_dispatcher().is_none());
+        // shutdown() must exist and complete successfully even with no dispatcher
+        context.shutdown_with_timeout(Duration::from_secs(10)).await;
+    }
+
+    #[tokio::test]
+    async fn test_server_context_shutdown_drains_in_flight_async_delivery() {
+        let mock_server = MockServer::start().await;
+
+        // Slow webhook: takes 500ms — simulates an in-flight delivery at shutdown time
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_millis(500)))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let toml = format!(
+            r#"
+            [blob_store.fs]
+            root_dir = "/tmp/test"
+
+            [metadata_store.fs]
+            root_dir = "/tmp/test"
+
+            [cache.memory]
+
+            [server]
+            bind_address = "0.0.0.0"
+            port = 8000
+
+            [global]
+            update_pull_time = false
+            max_concurrent_cache_jobs = 10
+
+            [event_webhook.slow_hook]
+            url = "{}/webhook"
+            policy = "async"
+            events = ["manifest.push"]
+        "#,
+            mock_server.uri()
+        );
+
+        let config: Configuration = toml::from_str(&toml).unwrap();
+        let registry = create_test_registry(&config);
+        let context = ServerContext::new(&config, registry).unwrap();
+
+        let event = Event {
+            id: Uuid::new_v4(),
+            timestamp: Utc::now(),
+            kind: EventKind::ManifestPush,
+            namespace: "test/repo".to_string(),
+            digest: Some("sha256:abc123".to_string()),
+            reference: Some("sha256:abc123".to_string()),
+            tag: None,
+            actor: None,
+            repository: "test-repo".to_string(),
+        };
+
+        context.dispatch_event(&event).await.unwrap();
+
+        // shutdown() must block until the in-flight delivery completes
+        context.shutdown_with_timeout(Duration::from_secs(10)).await;
+
+        let requests = mock_server.received_requests().await.unwrap();
+        assert_eq!(
+            requests.len(),
+            1,
+            "ServerContext::shutdown() must drain in-flight async deliveries"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_server_context_shutdown_rejects_new_async_dispatches() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&mock_server)
+            .await;
+
+        let toml = format!(
+            r#"
+            [blob_store.fs]
+            root_dir = "/tmp/test"
+
+            [metadata_store.fs]
+            root_dir = "/tmp/test"
+
+            [cache.memory]
+
+            [server]
+            bind_address = "0.0.0.0"
+            port = 8000
+
+            [global]
+            update_pull_time = false
+            max_concurrent_cache_jobs = 10
+
+            [event_webhook.async_hook]
+            url = "{}"
+            policy = "async"
+            events = ["manifest.push"]
+        "#,
+            mock_server.uri()
+        );
+
+        let config: Configuration = toml::from_str(&toml).unwrap();
+        let registry = create_test_registry(&config);
+        let context = ServerContext::new(&config, registry).unwrap();
+
+        // Shut down first, then try to dispatch
+        context.shutdown_with_timeout(Duration::from_secs(10)).await;
+
+        let event = Event {
+            id: Uuid::new_v4(),
+            timestamp: Utc::now(),
+            kind: EventKind::ManifestPush,
+            namespace: "test/repo".to_string(),
+            digest: Some("sha256:abc123".to_string()),
+            reference: Some("sha256:abc123".to_string()),
+            tag: None,
+            actor: None,
+            repository: "test-repo".to_string(),
+        };
+
+        let _ = context.dispatch_event(&event).await;
+
+        // Give any rogue background task time to fire
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let requests = mock_server.received_requests().await.unwrap();
+        assert_eq!(
+            requests.len(),
+            0,
+            "No async deliveries should occur after ServerContext::shutdown()"
+        );
     }
 
     #[test]

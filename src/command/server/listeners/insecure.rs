@@ -74,6 +74,10 @@ impl InsecureListener {
         self.context.store(Arc::new(context));
     }
 
+    pub async fn shutdown_with_timeout(&self, timeout: Duration) {
+        self.context.load().shutdown_with_timeout(timeout).await;
+    }
+
     #[cfg(test)]
     pub fn current_context(&self) -> arc_swap::Guard<Arc<ServerContext>> {
         self.context.load()

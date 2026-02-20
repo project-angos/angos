@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use argh::FromArgs;
 use tracing::error;
@@ -158,6 +159,13 @@ impl Command {
         match &self.listener {
             ServiceListener::Insecure(listener) => listener,
             ServiceListener::Secure(_) => panic!("Expected insecure listener"),
+        }
+    }
+
+    pub async fn shutdown_with_timeout(&self, timeout: Duration) {
+        match &self.listener {
+            ServiceListener::Insecure(listener) => listener.shutdown_with_timeout(timeout).await,
+            ServiceListener::Secure(listener) => listener.shutdown_with_timeout(timeout).await,
         }
     }
 
@@ -979,6 +987,51 @@ mod tests {
                 .current_context()
                 .event_dispatcher()
                 .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_command_shutdown_with_no_dispatcher() {
+        // Command with no webhooks should shut down cleanly
+        let config = create_minimal_config();
+        let command = Command::new(&config).unwrap();
+
+        // shutdown() must exist on Command and complete without panic
+        command.shutdown_with_timeout(Duration::from_secs(10)).await;
+    }
+
+    #[tokio::test]
+    async fn test_command_shutdown_drains_in_flight_async_delivery() {
+        use std::time::Duration;
+
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+
+        // Slow webhook: takes 400ms to respond
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_millis(400)))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let config = create_config_with_webhook(&server.uri());
+        let command = Command::new(&config).unwrap();
+
+        // Dispatch an async event through the current context
+        let context = command.insecure_listener().current_context();
+        context.dispatch_event(&create_test_event()).await.unwrap();
+        drop(context);
+
+        // Command::shutdown() must drain the in-flight delivery before returning
+        command.shutdown_with_timeout(Duration::from_secs(10)).await;
+
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(
+            requests.len(),
+            1,
+            "Command::shutdown() must drain in-flight async webhook deliveries"
         );
     }
 }
