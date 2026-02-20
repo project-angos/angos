@@ -3,6 +3,7 @@ use std::fmt::Debug;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use chrono::Utc;
 use http_body_util::Full;
 use hyper::body::{Bytes, Incoming};
 use hyper::header::{CONTENT_RANGE, CONTENT_TYPE, RANGE, WWW_AUTHENTICATE};
@@ -22,6 +23,7 @@ use crate::command::server::error::Error;
 use crate::command::server::request_ext::{HeaderExt, IntoAsyncRead};
 use crate::command::server::response_body::ResponseBody;
 use crate::command::server::{ServerContext, router, ui};
+use crate::event_webhook::event::{Event, EventActor, EventKind};
 use crate::identity::{ClientIdentity, Route};
 use crate::metrics_provider::{IN_FLIGHT_REQUESTS, METRICS_PROVIDER};
 use crate::oci::{Digest, Namespace, Reference};
@@ -252,6 +254,14 @@ fn handle_unknown_route(
     }
 }
 
+fn repository_name_for(context: &ServerContext, namespace: &Namespace) -> String {
+    context
+        .registry
+        .get_repository_for_namespace(namespace)
+        .map(|r| r.name.clone())
+        .unwrap_or_default()
+}
+
 async fn handle_start_upload(
     context: &ServerContext,
     namespace: &Namespace,
@@ -296,14 +306,29 @@ async fn handle_put_upload(
     namespace: &Namespace,
     uuid: Uuid,
     digest: Digest,
-    _identity: &ClientIdentity,
+    identity: &ClientIdentity,
 ) -> Result<Response<ResponseBody>, Error> {
     let body_stream = incoming.into_async_read();
 
-    Ok(context
+    let response = context
         .registry
         .handle_put_upload(namespace, uuid, &digest, body_stream)
-        .await?)
+        .await?;
+
+    let event = Event {
+        id: Uuid::new_v4(),
+        timestamp: Utc::now(),
+        kind: EventKind::BlobPush,
+        namespace: namespace.to_string(),
+        digest: Some(digest.to_string()),
+        reference: None,
+        tag: None,
+        actor: Some(EventActor::from(identity.clone())),
+        repository: repository_name_for(context, namespace),
+    };
+    context.dispatch_event(&event).await?;
+
+    Ok(response)
 }
 
 async fn handle_delete_upload(
@@ -405,7 +430,7 @@ async fn handle_put_manifest(
     incoming: Incoming,
     namespace: &Namespace,
     reference: Reference,
-    _identity: &ClientIdentity,
+    identity: &ClientIdentity,
 ) -> Result<Response<ResponseBody>, Error> {
     let mime_type = parts.get_header(CONTENT_TYPE).ok_or(Error::BadRequest(
         "No Content-Type header provided".to_string(),
@@ -413,22 +438,99 @@ async fn handle_put_manifest(
 
     let body_stream = incoming.into_async_read();
 
-    Ok(context
+    let response = context
         .registry
-        .handle_put_manifest(namespace, reference, mime_type, body_stream)
-        .await?)
+        .handle_put_manifest(namespace, reference.clone(), mime_type, body_stream)
+        .await?;
+
+    let digest = response
+        .headers()
+        .get("Docker-Content-Digest")
+        .and_then(|v| v.to_str().ok())
+        .map(ToString::to_string);
+
+    let repository = repository_name_for(context, namespace);
+    let actor = Some(EventActor::from(identity.clone()));
+
+    let manifest_event = Event {
+        id: Uuid::new_v4(),
+        timestamp: Utc::now(),
+        kind: EventKind::ManifestPush,
+        namespace: namespace.to_string(),
+        digest: digest.clone(),
+        reference: Some(reference.to_string()),
+        tag: None,
+        actor: actor.clone(),
+        repository: repository.clone(),
+    };
+    context.dispatch_event(&manifest_event).await?;
+
+    if let Reference::Tag(tag) = &reference {
+        let tag_event = Event {
+            id: Uuid::new_v4(),
+            timestamp: Utc::now(),
+            kind: EventKind::TagCreate,
+            namespace: namespace.to_string(),
+            digest,
+            reference: Some(reference.to_string()),
+            tag: Some(tag.clone()),
+            actor,
+            repository,
+        };
+        context.dispatch_event(&tag_event).await?;
+    }
+
+    Ok(response)
 }
 
 async fn handle_delete_manifest(
     context: &ServerContext,
     namespace: &Namespace,
     reference: Reference,
-    _identity: &ClientIdentity,
+    identity: &ClientIdentity,
 ) -> Result<Response<ResponseBody>, Error> {
-    Ok(context
+    let response = context
         .registry
-        .handle_delete_manifest(namespace, reference)
-        .await?)
+        .handle_delete_manifest(namespace, reference.clone())
+        .await?;
+
+    let repository = repository_name_for(context, namespace);
+    let actor = Some(EventActor::from(identity.clone()));
+
+    let digest = match &reference {
+        Reference::Digest(d) => Some(d.to_string()),
+        Reference::Tag(_) => None,
+    };
+
+    let delete_event = Event {
+        id: Uuid::new_v4(),
+        timestamp: Utc::now(),
+        kind: EventKind::ManifestDelete,
+        namespace: namespace.to_string(),
+        digest: digest.clone(),
+        reference: Some(reference.to_string()),
+        tag: None,
+        actor: actor.clone(),
+        repository: repository.clone(),
+    };
+    context.dispatch_event(&delete_event).await?;
+
+    if let Reference::Tag(tag) = &reference {
+        let tag_event = Event {
+            id: Uuid::new_v4(),
+            timestamp: Utc::now(),
+            kind: EventKind::TagDelete,
+            namespace: namespace.to_string(),
+            digest,
+            reference: Some(reference.to_string()),
+            tag: Some(tag.clone()),
+            actor,
+            repository,
+        };
+        context.dispatch_event(&tag_event).await?;
+    }
+
+    Ok(response)
 }
 
 async fn handle_get_referrer(
