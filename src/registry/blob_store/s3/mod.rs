@@ -155,7 +155,7 @@ impl BlobStore for Backend {
 
         let (prefixes, _, next_continuation_token) = self
             .store
-            .list_prefixes(&uploads_dir, "/", i32::from(n), continuation_token)
+            .list_prefixes(&uploads_dir, "/", i32::from(n), continuation_token, None)
             .await?;
 
         Ok((prefixes, next_continuation_token))

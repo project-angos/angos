@@ -332,6 +332,21 @@ multipart_copy_jobs = 4
 - **VPC Endpoint**: Reduce costs and latency
 - **Part Size**: Larger parts = fewer requests, more memory
 
+### S3 Metadata Optimizations
+
+When using S3 for metadata, Angos includes two optimizations to reduce round-trips:
+
+**Link cache** — A read-through cache for link metadata (tags, layer links). Populated on read, invalidated on write. Configurable TTL (default 30 s, `link_cache_ttl = 0` to disable). Shares the same cache backend (in-memory or Redis) as authentication tokens.
+
+**Deferred access time updates** — Instead of a synchronous lock-read-write-unlock cycle on every manifest pull, access time updates are buffered in memory and flushed periodically. Configurable interval (default 60 s, `access_time_debounce_secs = 0` to disable). This reduces the critical path per pull from 4 S3 operations to 1.
+
+```toml
+[metadata_store.s3]
+# ... S3 connection options
+link_cache_ttl = 30               # seconds (0 to disable)
+access_time_debounce_secs = 60    # seconds (0 to disable)
+```
+
 ### Caching
 
 Token and key caching reduces external requests:

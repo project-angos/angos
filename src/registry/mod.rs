@@ -123,6 +123,10 @@ impl Registry {
         Ok(res)
     }
 
+    pub async fn flush_pending_writes(&self) {
+        self.metadata_store.flush_access_times().await;
+    }
+
     #[instrument]
     pub fn get_repository_for_namespace(
         &self,

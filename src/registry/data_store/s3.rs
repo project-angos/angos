@@ -227,12 +227,15 @@ impl Backend {
         delimiter: &str,
         max_keys: i32,
         continuation_token: Option<String>,
+        start_after: Option<String>,
     ) -> Result<(Vec<String>, Vec<String>, Option<String>), IoError> {
         let mut full_prefix = self.full_key(path);
         // Ensure prefix ends with / if not empty to list items inside the directory
         if !full_prefix.is_empty() && !full_prefix.ends_with('/') {
             full_prefix.push('/');
         }
+
+        let full_start_after = start_after.map(|s| format!("{full_prefix}{s}{delimiter}"));
 
         let res = self
             .s3_client
@@ -242,6 +245,7 @@ impl Backend {
             .delimiter(delimiter)
             .max_keys(max_keys)
             .set_continuation_token(continuation_token)
+            .set_start_after(full_start_after)
             .send()
             .await
             .map_err(|e| IoError::other(e.to_string()))?;

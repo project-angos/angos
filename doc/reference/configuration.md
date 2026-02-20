@@ -128,7 +128,14 @@ Optional. Defaults to same backend as blob store.
 
 ### S3 (`metadata_store.s3`)
 
-Same options as `blob_store.s3`.
+Same connection options as `blob_store.s3`, plus:
+
+| Option                      | Type | Default | Description                                                                 |
+|-----------------------------|------|---------|-----------------------------------------------------------------------------|
+| `link_cache_ttl`            | u64  | `30`    | Read-through cache TTL for link metadata, in seconds (0 to disable)         |
+| `access_time_debounce_secs` | u64  | `60`    | Buffer access time writes and flush periodically, in seconds (0 to disable) |
+
+The link cache reduces S3 round-trips for repeated tag/layer reads. The access time debounce batches `last_pulled_at` timestamp writes in memory and flushes them periodically, reducing the critical-path operations per manifest pull from 4 (lock, read, write, unlock) to 1 (read).
 
 ### Distributed Locking (`metadata_store.*.redis`)
 

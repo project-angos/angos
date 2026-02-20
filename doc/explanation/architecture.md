@@ -254,6 +254,13 @@ Embedded policy engine for:
 - No external dependencies
 - Rich expression language
 
+### Event Webhooks
+
+Notify external systems on registry operations:
+- Three delivery policies: `required` (blocks response), `optional` (best-effort), `async` (fire-and-forget)
+- Scoped to specific repositories with regex filters
+- HMAC-signed payloads when a token is configured
+
 ### Multiple OIDC Providers
 
 Support for any number of identity providers:

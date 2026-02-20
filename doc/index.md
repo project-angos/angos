@@ -68,6 +68,7 @@ Conceptual explanations and architecture:
 - **Immutable tags**: Protect releases from overwrites
 - **mTLS support**: Client certificate authentication
 - **OIDC authentication**: GitHub Actions, Google, Okta, and more
+- **Event webhooks**: Notify external systems with required, optional, or async delivery
 - **Online garbage collection**: Clean up without downtime
 - **Web UI**: Browse and manage images visually
 

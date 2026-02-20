@@ -125,6 +125,8 @@ impl S3RegistryTestCase {
             bucket: "registry".to_string(),
             key_prefix: key_prefix.clone(),
             redis: None,
+            link_cache_ttl: 0,
+            access_time_debounce_secs: 0,
         })
         .unwrap();
         let metadata_store = Arc::new(metadata_store);
