@@ -46,6 +46,21 @@ root_dir = "./data-angos"
 #operation_timeout_secs = 900
 #operation_attempt_timeout_secs = 300
 
+# Optional: Explicit metadata store configuration
+# When omitted, the metadata store is auto-configured from the blob store settings.
+# Use this section to override S3 metadata store tuning or point metadata at a different bucket.
+#[metadata_store.s3]
+#bucket = "<bucket>"
+#region = "<zone/region>"
+#endpoint = "https://<s3-compatible-endpoint>"
+#access_key_id = "<key-id>"
+#secret_key = "<secret-key>"
+#link_cache_ttl = 30               # seconds; read-through cache TTL for link metadata (0 to disable)
+#access_time_debounce_secs = 60    # seconds; buffer access time writes and flush periodically (0 to disable)
+#[metadata_store.s3.redis]
+#url = "redis://localhost:6379"
+#ttl = 30
+
 [observability.tracing]
 endpoint = "http://127.0.0.1:4317"
 sampling_rate = 1.0
@@ -64,6 +79,38 @@ password = "$argon2id$v=19$m=16,t=2,p=1$MTIzNDU2Nzg$lurg6dYCXXrJP3zaFwu35w" # te
 # provider = "generic"
 # issuer = "https://auth.example.com"
 # discovery_url = "https://auth.example.com/.well-known/openid-configuration"
+
+# Event webhooks -- notify external systems on registry operations
+# Define webhooks with [event_webhook.<name>], then reference them in global or repository config.
+
+# Audit log -- must succeed before client gets a response
+#[event_webhook.audit]
+#url = "https://audit.example.com/events"
+#policy = "required"
+#token = "audit-secret"
+#events = ["manifest.push", "manifest.delete"]
+#timeout_ms = 3000
+#max_retries = 2
+
+# Slack notifications -- best effort
+#[event_webhook.slack]
+#url = "https://hooks.slack.com/services/T.../B.../xxx"
+#policy = "optional"
+#events = ["manifest.push", "tag.create"]
+#timeout_ms = 3000
+
+# Analytics -- fire and forget
+#[event_webhook.analytics]
+#url = "https://analytics.internal/ingest"
+#policy = "async"
+#events = ["manifest.push", "manifest.delete", "blob.push", "tag.create", "tag.delete"]
+
+# Scope a webhook to specific repositories with regex patterns
+#[event_webhook.production-only]
+#url = "https://hooks.example.com/production"
+#policy = "required"
+#events = ["manifest.push"]
+#repository_filter = ["^production/.*"]
 
 [repository."nginx"]
 
