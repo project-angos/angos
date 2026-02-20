@@ -27,6 +27,8 @@ pub struct Config {
     #[serde(default)]
     pub immutable_tags_exclusions: Vec<String>,
     pub authorization_webhook: Option<String>,
+    #[serde(default)]
+    pub event_webhooks: Vec<String>,
 }
 
 pub struct Repository {
