@@ -1,11 +1,13 @@
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures_util::future::join_all;
 use futures_util::stream::{self, StreamExt};
 use serde::Deserialize;
+use tokio::sync::Mutex;
 use tracing::{debug, info, instrument, warn};
 
 use crate::cache::{Cache, CacheExt};
@@ -31,10 +33,16 @@ pub struct BackendConfig {
     pub redis: Option<LockConfig>,
     #[serde(default = "default_link_cache_ttl")]
     pub link_cache_ttl: u64,
+    #[serde(default = "default_access_time_debounce")]
+    pub access_time_debounce_secs: u64,
 }
 
 fn default_link_cache_ttl() -> u64 {
     30
+}
+
+fn default_access_time_debounce() -> u64 {
+    60
 }
 
 impl From<BackendConfig> for data_store::s3::BackendConfig {
@@ -52,11 +60,58 @@ impl From<BackendConfig> for data_store::s3::BackendConfig {
 }
 
 #[derive(Clone)]
+struct AccessTimeWriter {
+    pending: Arc<Mutex<HashMap<String, (String, LinkKind)>>>,
+}
+
+impl AccessTimeWriter {
+    fn new() -> Self {
+        Self {
+            pending: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    async fn record(&self, namespace: &str, link: &LinkKind) {
+        let key = format!("{namespace}:{link}");
+        self.pending
+            .lock()
+            .await
+            .insert(key, (namespace.to_string(), link.clone()));
+    }
+
+    async fn flush(&self, backend: &Backend) {
+        let entries: Vec<(String, LinkKind)> = {
+            let mut pending = self.pending.lock().await;
+            pending.drain().map(|(_, v)| v).collect()
+        };
+
+        for (namespace, link) in entries {
+            if let Err(e) = Self::flush_one(backend, &namespace, &link).await {
+                warn!("Failed to flush access time for {namespace}:{link}: {e}");
+            }
+        }
+    }
+
+    async fn flush_one(backend: &Backend, namespace: &str, link: &LinkKind) -> Result<(), Error> {
+        let _guard = backend.lock.acquire(&[link.to_string()]).await?;
+        let link_data = backend
+            .read_link_reference(namespace, link)
+            .await?
+            .accessed();
+        backend
+            .write_link_reference(namespace, link, &link_data)
+            .await?;
+        Ok(())
+    }
+}
+
+#[derive(Clone)]
 pub struct Backend {
     pub store: data_store::s3::Backend,
     lock: Arc<dyn LockBackend<Guard = Box<dyn Send>> + Send + Sync>,
     cache: Option<Arc<dyn Cache>>,
     link_cache_ttl: u64,
+    access_time_writer: Option<AccessTimeWriter>,
 }
 
 impl Backend {
@@ -84,12 +139,38 @@ impl Backend {
                 Arc::new(MemoryBackend::new())
             };
 
-        Ok(Self {
+        let access_time_writer = if config.access_time_debounce_secs > 0 {
+            Some(AccessTimeWriter::new())
+        } else {
+            None
+        };
+
+        let backend = Self {
             store,
             lock,
             cache: None,
             link_cache_ttl: config.link_cache_ttl,
-        })
+            access_time_writer,
+        };
+
+        if config.access_time_debounce_secs > 0 {
+            let flush_backend = backend.clone();
+            let interval = Duration::from_secs(config.access_time_debounce_secs);
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(interval).await;
+                    flush_backend.flush_access_times().await;
+                }
+            });
+        }
+
+        Ok(backend)
+    }
+
+    pub async fn flush_access_times(&self) {
+        if let Some(writer) = &self.access_time_writer {
+            writer.flush(self).await;
+        }
     }
 
     pub fn with_cache(mut self, cache: Arc<dyn Cache>) -> Self {
@@ -379,12 +460,18 @@ impl MetadataStore for Backend {
         update_access_time: bool,
     ) -> Result<LinkMetadata, Error> {
         if update_access_time {
-            let _guard = self.lock.acquire(&[link.to_string()]).await?;
-            let link_data = self.read_link_reference(namespace, link).await?.accessed();
-            self.write_link_reference(namespace, link, &link_data)
-                .await?;
-            self.cache_put(namespace, link, &link_data).await;
-            Ok(link_data)
+            if let Some(writer) = &self.access_time_writer {
+                let link_data = self.read_link_reference(namespace, link).await?;
+                writer.record(namespace, link).await;
+                Ok(link_data)
+            } else {
+                let _guard = self.lock.acquire(&[link.to_string()]).await?;
+                let link_data = self.read_link_reference(namespace, link).await?.accessed();
+                self.write_link_reference(namespace, link, &link_data)
+                    .await?;
+                self.cache_put(namespace, link, &link_data).await;
+                Ok(link_data)
+            }
         } else {
             if let Some(cached) = self.cache_get(namespace, link).await {
                 return Ok(cached);
@@ -743,6 +830,7 @@ mod tests {
             key_prefix: format!("test-cache-{}", uuid::Uuid::new_v4()),
             redis: None,
             link_cache_ttl: 30,
+            access_time_debounce_secs: 0,
         }
     }
 
@@ -1006,5 +1094,271 @@ mod tests {
 
         assert_eq!(meta_a.target, digest_a);
         assert_eq!(meta_b.target, digest_b);
+    }
+
+    fn test_backend_with_debounce(config: &BackendConfig, debounce_secs: u64) -> Backend {
+        let mut cfg = config.clone();
+        cfg.access_time_debounce_secs = debounce_secs;
+        Backend::new(&cfg).unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_deferred_access_time_returns_data_immediately() {
+        let config = test_config();
+        let backend = test_backend_with_debounce(&config, 60);
+        let namespace = "deferred-test-1";
+        let digest = Digest::from_str(
+            "sha256:da01a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6",
+        )
+        .unwrap();
+        let tag = LinkKind::Tag("deferred-v1".into());
+
+        let ops = vec![LinkOperation::Create {
+            link: tag.clone(),
+            target: digest.clone(),
+            referrer: None,
+        }];
+        backend.update_links(namespace, &ops).await.unwrap();
+
+        // Read with access time update; debounce=60s means write is deferred
+        let meta = backend.read_link(namespace, &tag, true).await.unwrap();
+        assert_eq!(meta.target, digest);
+
+        // Read directly from S3 to verify the access time was NOT written synchronously
+        let raw = backend.read_link_reference(namespace, &tag).await.unwrap();
+        assert!(
+            raw.accessed_at.is_none(),
+            "accessed_at should still be None in S3 because the write was deferred"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_deferred_access_time_writes_eventually() {
+        let config = test_config();
+        let backend = test_backend_with_debounce(&config, 1);
+        let namespace = "deferred-test-2";
+        let digest = Digest::from_str(
+            "sha256:da02b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1",
+        )
+        .unwrap();
+        let tag = LinkKind::Tag("deferred-v2".into());
+
+        let ops = vec![LinkOperation::Create {
+            link: tag.clone(),
+            target: digest.clone(),
+            referrer: None,
+        }];
+        backend.update_links(namespace, &ops).await.unwrap();
+
+        // Trigger deferred access time update
+        backend.read_link(namespace, &tag, true).await.unwrap();
+
+        // Wait for the background flush (debounce = 1s, wait 1.5s)
+        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+
+        // Read directly from S3: accessed_at should now be set
+        let raw = backend.read_link_reference(namespace, &tag).await.unwrap();
+        assert!(
+            raw.accessed_at.is_some(),
+            "accessed_at should be set in S3 after background flush"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_deferred_access_time_coalesces_writes() {
+        let config = test_config();
+        let backend = test_backend_with_debounce(&config, 2);
+        let namespace = "deferred-test-3";
+        let digest = Digest::from_str(
+            "sha256:da03c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2",
+        )
+        .unwrap();
+        let tag = LinkKind::Tag("deferred-v3".into());
+
+        let ops = vec![LinkOperation::Create {
+            link: tag.clone(),
+            target: digest.clone(),
+            referrer: None,
+        }];
+        backend.update_links(namespace, &ops).await.unwrap();
+
+        // Call read_link with update_access_time 10 times rapidly
+        let start = std::time::Instant::now();
+        for _ in 0..10 {
+            let meta = backend.read_link(namespace, &tag, true).await.unwrap();
+            assert_eq!(meta.target, digest);
+        }
+        let elapsed = start.elapsed();
+
+        // All 10 reads should complete quickly since writes are deferred
+        assert!(
+            elapsed < std::time::Duration::from_secs(1),
+            "10 deferred reads should complete in under 1 second, took {:?}",
+            elapsed
+        );
+
+        // Explicitly flush pending access time writes
+        backend.flush_access_times().await;
+
+        // Verify access_at is set in S3
+        let raw = backend.read_link_reference(namespace, &tag).await.unwrap();
+        assert!(
+            raw.accessed_at.is_some(),
+            "accessed_at should be set after flush"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_deferred_access_time_different_links_independent() {
+        let config = test_config();
+        let backend = test_backend_with_debounce(&config, 60);
+        let namespace = "deferred-test-4";
+        let digest1 = Digest::from_str(
+            "sha256:da04d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3",
+        )
+        .unwrap();
+        let digest2 = Digest::from_str(
+            "sha256:da04e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4",
+        )
+        .unwrap();
+        let tag1 = LinkKind::Tag("tag1".into());
+        let tag2 = LinkKind::Tag("tag2".into());
+
+        let ops = vec![
+            LinkOperation::Create {
+                link: tag1.clone(),
+                target: digest1.clone(),
+                referrer: None,
+            },
+            LinkOperation::Create {
+                link: tag2.clone(),
+                target: digest2.clone(),
+                referrer: None,
+            },
+        ];
+        backend.update_links(namespace, &ops).await.unwrap();
+
+        // Read both with access time update
+        backend.read_link(namespace, &tag1, true).await.unwrap();
+        backend.read_link(namespace, &tag2, true).await.unwrap();
+
+        // Flush all pending writes
+        backend.flush_access_times().await;
+
+        // Both should have independent accessed_at values
+        let raw1 = backend.read_link_reference(namespace, &tag1).await.unwrap();
+        let raw2 = backend.read_link_reference(namespace, &tag2).await.unwrap();
+        assert!(
+            raw1.accessed_at.is_some(),
+            "tag1 accessed_at should be set after flush"
+        );
+        assert!(
+            raw2.accessed_at.is_some(),
+            "tag2 accessed_at should be set after flush"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_deferred_access_time_flush_on_explicit_call() {
+        let config = test_config();
+        let backend = test_backend_with_debounce(&config, 60);
+        let namespace = "deferred-test-5";
+        let digest = Digest::from_str(
+            "sha256:da05f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5",
+        )
+        .unwrap();
+        let tag = LinkKind::Tag("deferred-v5".into());
+
+        let ops = vec![LinkOperation::Create {
+            link: tag.clone(),
+            target: digest.clone(),
+            referrer: None,
+        }];
+        backend.update_links(namespace, &ops).await.unwrap();
+
+        // Read with access time update (deferred, won't auto-flush for 60s)
+        backend.read_link(namespace, &tag, true).await.unwrap();
+
+        // Explicitly flush
+        backend.flush_access_times().await;
+
+        // Verify S3 has the updated accessed_at
+        let raw = backend.read_link_reference(namespace, &tag).await.unwrap();
+        assert!(
+            raw.accessed_at.is_some(),
+            "accessed_at should be set in S3 after explicit flush"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_deferred_access_time_zero_debounce_writes_synchronously() {
+        let config = test_config();
+        let backend = test_backend_with_debounce(&config, 0);
+        let namespace = "deferred-test-6";
+        let digest = Digest::from_str(
+            "sha256:da06a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6",
+        )
+        .unwrap();
+        let tag = LinkKind::Tag("deferred-v6".into());
+
+        let ops = vec![LinkOperation::Create {
+            link: tag.clone(),
+            target: digest.clone(),
+            referrer: None,
+        }];
+        backend.update_links(namespace, &ops).await.unwrap();
+
+        // Read with access time update; debounce=0 means synchronous write
+        backend.read_link(namespace, &tag, true).await.unwrap();
+
+        // Immediately read directly from S3 without any flush
+        let raw = backend.read_link_reference(namespace, &tag).await.unwrap();
+        assert!(
+            raw.accessed_at.is_some(),
+            "accessed_at should be set immediately when debounce is 0 (synchronous mode)"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_deferred_access_time_does_not_block_read_path() {
+        let config = test_config();
+        let backend = test_backend_with_debounce(&config, 60);
+        let namespace = "deferred-test-7";
+        let digest = Digest::from_str(
+            "sha256:da07b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1",
+        )
+        .unwrap();
+        let tag = LinkKind::Tag("deferred-v7".into());
+
+        let ops = vec![LinkOperation::Create {
+            link: tag.clone(),
+            target: digest.clone(),
+            referrer: None,
+        }];
+        backend.update_links(namespace, &ops).await.unwrap();
+
+        // Spawn 50 concurrent read_link calls with update_access_time=true
+        let start = std::time::Instant::now();
+        let mut handles = Vec::new();
+        for _ in 0..50 {
+            let backend = backend.clone();
+            let tag = tag.clone();
+            let digest = digest.clone();
+            let handle = tokio::spawn(async move {
+                let meta = backend.read_link(namespace, &tag, true).await.unwrap();
+                assert_eq!(meta.target, digest);
+            });
+            handles.push(handle);
+        }
+        for handle in handles {
+            handle.await.unwrap();
+        }
+        let elapsed = start.elapsed();
+
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "50 concurrent deferred reads should complete within 2 seconds, took {:?}",
+            elapsed
+        );
     }
 }

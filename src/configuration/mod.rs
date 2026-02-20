@@ -243,6 +243,7 @@ impl Configuration {
                         key_prefix: config.key_prefix.clone(),
                         redis: None,
                         link_cache_ttl: 30,
+                        access_time_debounce_secs: 60,
                     })
                 }
             },
