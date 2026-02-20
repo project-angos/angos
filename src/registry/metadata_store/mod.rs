@@ -1135,4 +1135,215 @@ mod tests {
             .await;
         }
     }
+
+    pub async fn test_datastore_parallel_multiple_creates(
+        b: Arc<dyn BlobStore>,
+        m: Arc<dyn MetadataStore + Send + Sync>,
+    ) {
+        let namespace = &Namespace::new("parallel-creates-ns").unwrap();
+
+        let mut digests = Vec::new();
+        for i in 0..5 {
+            let digest = b
+                .create_blob(format!("content-{i}").as_bytes())
+                .await
+                .unwrap();
+            digests.push(digest);
+        }
+
+        let mut tx = m.begin_transaction(namespace);
+        for (i, digest) in digests.iter().enumerate() {
+            tx.create_link(&LinkKind::Tag(format!("t{}", i + 1)), digest);
+        }
+        tx.commit().await.unwrap();
+
+        for (i, digest) in digests.iter().enumerate() {
+            let tag = format!("t{}", i + 1);
+            let meta = m
+                .read_link(namespace, &LinkKind::Tag(tag.clone()), false)
+                .await
+                .unwrap();
+            assert_eq!(
+                meta.target, *digest,
+                "Tag {tag} should point to the correct digest"
+            );
+
+            let blob_index = m.read_blob_index(digest).await.unwrap();
+            let links = blob_index.namespace.get(namespace.as_ref());
+            assert!(
+                links.is_some(),
+                "Blob index for digest {digest} should have an entry for namespace {namespace}"
+            );
+            assert!(
+                links.unwrap().contains(&LinkKind::Tag(tag.clone())),
+                "Blob index for digest {digest} should contain Tag({tag})"
+            );
+        }
+
+        let (tags, _) = m.list_tags(namespace, 10, None).await.unwrap();
+        assert_eq!(tags.len(), 5, "Should have 5 tags but got {}", tags.len());
+        for i in 0..5 {
+            let tag = format!("t{}", i + 1);
+            assert!(tags.contains(&tag), "Tags list should contain {tag}");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_parallel_multiple_creates() {
+        for test_case in backends() {
+            test_datastore_parallel_multiple_creates(
+                test_case.blob_store(),
+                test_case.metadata_store(),
+            )
+            .await;
+        }
+    }
+
+    pub async fn test_datastore_parallel_mixed_create_delete(
+        b: Arc<dyn BlobStore>,
+        m: Arc<dyn MetadataStore + Send + Sync>,
+    ) {
+        let namespace = &Namespace::new("parallel-mixed-ns").unwrap();
+
+        let digest_a = b.create_blob(b"content-a").await.unwrap();
+        let digest_b = b.create_blob(b"content-b").await.unwrap();
+        let digest_c = b.create_blob(b"content-c").await.unwrap();
+
+        create_link(&m, namespace, &LinkKind::Tag("v1".to_string()), &digest_a).await;
+        create_link(&m, namespace, &LinkKind::Tag("v2".to_string()), &digest_b).await;
+
+        let mut tx = m.begin_transaction(namespace);
+        tx.delete_link(&LinkKind::Tag("v1".to_string()));
+        tx.create_link(&LinkKind::Tag("v3".to_string()), &digest_c);
+        tx.commit().await.unwrap();
+
+        let err = m
+            .read_link(namespace, &LinkKind::Tag("v1".to_string()), false)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                crate::registry::metadata_store::Error::ReferenceNotFound
+            ),
+            "Tag v1 should not exist after deletion but got error: {err:?}"
+        );
+
+        let meta_v2 = m
+            .read_link(namespace, &LinkKind::Tag("v2".to_string()), false)
+            .await
+            .unwrap();
+        assert_eq!(
+            meta_v2.target, digest_b,
+            "Tag v2 should still point to digest_b"
+        );
+
+        let meta_v3 = m
+            .read_link(namespace, &LinkKind::Tag("v3".to_string()), false)
+            .await
+            .unwrap();
+        assert_eq!(meta_v3.target, digest_c, "Tag v3 should point to digest_c");
+
+        let tag_v1 = LinkKind::Tag("v1".to_string());
+        match m.read_blob_index(&digest_a).await {
+            Ok(index_a) => {
+                let links_a = index_a.namespace.get(namespace.as_ref());
+                assert!(
+                    links_a.is_none_or(|s| !s.contains(&tag_v1)),
+                    "Blob index for digest_a should not contain Tag(v1) after deletion"
+                );
+            }
+            Err(crate::registry::metadata_store::Error::ReferenceNotFound) => {}
+            Err(e) => panic!("Unexpected error reading blob index for digest_a: {e:?}"),
+        }
+
+        let index_c = m.read_blob_index(&digest_c).await.unwrap();
+        let links_c = index_c
+            .namespace
+            .get(namespace.as_ref())
+            .expect("Blob index for digest_c should have an entry for namespace");
+        assert!(
+            links_c.contains(&LinkKind::Tag("v3".to_string())),
+            "Blob index for digest_c should contain Tag(v3)"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_parallel_mixed_create_delete() {
+        for test_case in backends() {
+            test_datastore_parallel_mixed_create_delete(
+                test_case.blob_store(),
+                test_case.metadata_store(),
+            )
+            .await;
+        }
+    }
+
+    pub async fn test_datastore_parallel_blob_index_correctness(
+        b: Arc<dyn BlobStore>,
+        m: Arc<dyn MetadataStore + Send + Sync>,
+    ) {
+        let namespace = &Namespace::new("parallel-blob-index-ns").unwrap();
+
+        let mut digests = Vec::new();
+        for i in 0..4 {
+            let digest = b
+                .create_blob(format!("content-{i}").as_bytes())
+                .await
+                .unwrap();
+            digests.push(digest);
+        }
+
+        let mut tx = m.begin_transaction(namespace);
+        for (i, digest) in digests.iter().enumerate() {
+            tx.create_link(&LinkKind::Tag(format!("tag-{i}")), digest);
+        }
+        tx.commit().await.unwrap();
+
+        for (i, digest) in digests.iter().enumerate() {
+            let expected_tag = LinkKind::Tag(format!("tag-{i}"));
+            let blob_index = m.read_blob_index(digest).await.unwrap();
+
+            let links = blob_index
+                .namespace
+                .get(namespace.as_ref())
+                .unwrap_or_else(|| {
+                    panic!(
+                        "Blob index for digest {digest} should have an entry for namespace {namespace}"
+                    )
+                });
+
+            assert!(
+                links.contains(&expected_tag),
+                "Blob index for digest {digest} should contain tag-{i}"
+            );
+
+            for (j, other_digest) in digests.iter().enumerate() {
+                if j != i {
+                    let other_tag = LinkKind::Tag(format!("tag-{j}"));
+                    assert!(
+                        !links.contains(&other_tag),
+                        "Blob index for digest {digest} (tag-{i}) should NOT contain tag-{j}"
+                    );
+                    let other_index = m.read_blob_index(other_digest).await.unwrap();
+                    let other_links = other_index.namespace.get(namespace.as_ref());
+                    assert!(
+                        other_links.is_some_and(|s| !s.contains(&expected_tag)),
+                        "Blob index for digest {other_digest} (tag-{j}) should NOT contain tag-{i}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_parallel_blob_index_correctness() {
+        for test_case in backends() {
+            test_datastore_parallel_blob_index_correctness(
+                test_case.blob_store(),
+                test_case.metadata_store(),
+            )
+            .await;
+        }
+    }
 }
