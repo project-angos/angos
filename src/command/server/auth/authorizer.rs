@@ -177,9 +177,9 @@ impl Authorizer {
                     }
                 }
 
-                if repository.is_pull_through() && route.is_write() {
+                if repository.is_pull_through() && route.is_push() {
                     let msg =
-                        "Write operations are not supported on pull-through cache repositories"
+                        "Push operations are not supported on pull-through cache repositories"
                             .to_string();
                     return Err(Error::Unauthorized(msg));
                 }
@@ -651,5 +651,175 @@ mod tests {
     fn test_log_denial() {
         let identity = ClientIdentity::new(None);
         log_denial("test reason", &identity);
+    }
+
+    fn create_pull_through_config() -> Configuration {
+        let toml = r#"
+            [blob_store.fs]
+            root_dir = "/tmp/test"
+
+            [metadata_store.fs]
+            root_dir = "/tmp/test"
+
+            [cache.memory]
+
+            [server]
+            bind_address = "0.0.0.0"
+            port = 8000
+
+            [global]
+            update_pull_time = false
+            max_concurrent_cache_jobs = 10
+
+            [global.access_policy]
+            default_allow = true
+
+            [repository."docker-io"]
+
+            [[repository."docker-io".upstream]]
+            url = "https://registry-1.docker.io"
+        "#;
+
+        toml::from_str(toml).unwrap()
+    }
+
+    fn create_pull_through_registry(config: &Configuration) -> Registry {
+        use std::collections::HashMap;
+        use std::sync::Arc;
+
+        use crate::registry::{RegistryConfig, Repository};
+
+        let blob_store = config.blob_store.to_backend().unwrap();
+        let metadata_store = config.resolve_metadata_config().to_backend(None).unwrap();
+        let auth_cache = config.cache.to_backend().unwrap();
+
+        let mut repositories_map = HashMap::new();
+        for (name, repo_config) in &config.repository {
+            let repo = Repository::new(name, repo_config, &auth_cache).unwrap();
+            repositories_map.insert(name.clone(), repo);
+        }
+        let repositories = Arc::new(repositories_map);
+
+        let registry_config = RegistryConfig::new()
+            .update_pull_time(config.global.update_pull_time)
+            .enable_redirect(config.global.enable_redirect)
+            .concurrent_cache_jobs(config.global.max_concurrent_cache_jobs)
+            .global_immutable_tags(config.global.immutable_tags)
+            .global_immutable_tags_exclusions(config.global.immutable_tags_exclusions.clone());
+
+        Registry::new(blob_store, metadata_store, repositories, registry_config).unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_pull_through_repo_allows_delete_manifest() {
+        use std::str::FromStr;
+
+        use crate::oci::{Namespace, Reference};
+
+        let config = create_pull_through_config();
+        let cache = cache::Config::Memory.to_backend().unwrap();
+        let authorizer = Authorizer::new(&config, &cache).unwrap();
+        let registry = create_pull_through_registry(&config);
+
+        let namespace = Namespace::new("docker-io/library/nginx").unwrap();
+        let reference = Reference::from_str("latest").unwrap();
+        let route = Route::DeleteManifest {
+            namespace,
+            reference,
+        };
+        let identity = ClientIdentity::new(None);
+        let (parts, ()) = hyper::Request::builder()
+            .uri("/v2/")
+            .body(())
+            .unwrap()
+            .into_parts();
+
+        let result = authorizer
+            .authorize_request(&route, &identity, &parts, &registry)
+            .await;
+
+        assert!(
+            result.is_ok(),
+            "DeleteManifest should be allowed on pull-through cache repositories, got: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_pull_through_repo_allows_delete_blob() {
+        use std::str::FromStr;
+
+        use crate::oci::{Digest, Namespace};
+
+        let config = create_pull_through_config();
+        let cache = cache::Config::Memory.to_backend().unwrap();
+        let authorizer = Authorizer::new(&config, &cache).unwrap();
+        let registry = create_pull_through_registry(&config);
+
+        let namespace = Namespace::new("docker-io/library/nginx").unwrap();
+        let digest = Digest::from_str(
+            "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        )
+        .unwrap();
+        let route = Route::DeleteBlob { namespace, digest };
+        let identity = ClientIdentity::new(None);
+        let (parts, ()) = hyper::Request::builder()
+            .uri("/v2/")
+            .body(())
+            .unwrap()
+            .into_parts();
+
+        let result = authorizer
+            .authorize_request(&route, &identity, &parts, &registry)
+            .await;
+
+        assert!(
+            result.is_ok(),
+            "DeleteBlob should be allowed on pull-through cache repositories, got: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_pull_through_repo_blocks_push_operations() {
+        use std::str::FromStr;
+
+        use crate::oci::{Namespace, Reference};
+
+        let config = create_pull_through_config();
+        let cache = cache::Config::Memory.to_backend().unwrap();
+        let authorizer = Authorizer::new(&config, &cache).unwrap();
+        let registry = create_pull_through_registry(&config);
+
+        let identity = ClientIdentity::new(None);
+        let (parts, ()) = hyper::Request::builder()
+            .uri("/v2/")
+            .body(())
+            .unwrap()
+            .into_parts();
+
+        let namespace = Namespace::new("docker-io/library/nginx").unwrap();
+        let reference = Reference::from_str("latest").unwrap();
+        let put_manifest_route = Route::PutManifest {
+            namespace: namespace.clone(),
+            reference,
+        };
+        let result = authorizer
+            .authorize_request(&put_manifest_route, &identity, &parts, &registry)
+            .await;
+        assert!(
+            result.is_err(),
+            "PutManifest should be blocked on pull-through cache repositories"
+        );
+
+        let start_upload_route = Route::StartUpload {
+            namespace,
+            digest: None,
+        };
+        let result = authorizer
+            .authorize_request(&start_upload_route, &identity, &parts, &registry)
+            .await;
+        assert!(
+            result.is_err(),
+            "StartUpload should be blocked on pull-through cache repositories"
+        );
     }
 }
