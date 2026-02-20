@@ -431,8 +431,10 @@ impl MetadataStore for Backend {
                 continue;
             }
 
+            let mut pending_blob_ops: HashMap<Digest, Vec<BlobIndexOperation>> = HashMap::new();
+
             // Tracked creates: sequential (read-modify-write with blob index)
-            // Non-tracked creates: sequential blob index updates, then parallel link writes
+            // Non-tracked creates: accumulate blob index ops, then parallel link writes
             let mut non_tracked_create_writes: Vec<(LinkKind, LinkMetadata)> = Vec::new();
             for (link, target, old_target, referrer) in &creates {
                 let is_tracked = is_tracked_link(link);
@@ -447,32 +449,26 @@ impl MetadataStore for Backend {
                     }
 
                     if old_target.is_none() {
-                        self.update_blob_index(
-                            namespace,
-                            target,
-                            BlobIndexOperation::Insert(link.clone()),
-                        )
-                        .await?;
+                        pending_blob_ops
+                            .entry(target.clone())
+                            .or_default()
+                            .push(BlobIndexOperation::Insert(link.clone()));
                     }
 
                     self.write_link_reference(namespace, link, &metadata)
                         .await?;
                 } else {
-                    self.update_blob_index(
-                        namespace,
-                        target,
-                        BlobIndexOperation::Insert(link.clone()),
-                    )
-                    .await?;
+                    pending_blob_ops
+                        .entry(target.clone())
+                        .or_default()
+                        .push(BlobIndexOperation::Insert(link.clone()));
                     if let Some(old) = old_target
                         && *old != *target
                     {
-                        self.update_blob_index(
-                            namespace,
-                            old,
-                            BlobIndexOperation::Remove(link.clone()),
-                        )
-                        .await?;
+                        pending_blob_ops
+                            .entry(old.clone())
+                            .or_default()
+                            .push(BlobIndexOperation::Remove(link.clone()));
                     }
 
                     non_tracked_create_writes
@@ -491,8 +487,7 @@ impl MetadataStore for Backend {
             .collect::<Result<Vec<_>, _>>()?;
 
             // Tracked deletes: sequential (read-modify-write with blob index)
-            // Non-tracked deletes: parallel link deletes, then sequential blob index updates
-            let mut non_tracked_delete_blob_updates: Vec<(LinkKind, Digest)> = Vec::new();
+            // Non-tracked deletes: parallel link deletes, then accumulate blob index ops
             let mut non_tracked_delete_links: Vec<LinkKind> = Vec::new();
             for (link, target, referrer) in &valid_deletes {
                 let is_tracked = is_tracked_link(link);
@@ -508,17 +503,18 @@ impl MetadataStore for Backend {
                                 .await?;
                         } else {
                             self.delete_link_reference(namespace, link).await?;
-                            self.update_blob_index(
-                                namespace,
-                                target,
-                                BlobIndexOperation::Remove(link.clone()),
-                            )
-                            .await?;
+                            pending_blob_ops
+                                .entry(target.clone())
+                                .or_default()
+                                .push(BlobIndexOperation::Remove(link.clone()));
                         }
                     }
                 } else {
                     non_tracked_delete_links.push(link.clone());
-                    non_tracked_delete_blob_updates.push((link.clone(), target.clone()));
+                    pending_blob_ops
+                        .entry(target.clone())
+                        .or_default()
+                        .push(BlobIndexOperation::Remove(link.clone()));
                 }
             }
             join_all(
@@ -529,9 +525,37 @@ impl MetadataStore for Backend {
             .await
             .into_iter()
             .collect::<Result<Vec<_>, _>>()?;
-            for (link, target) in &non_tracked_delete_blob_updates {
-                self.update_blob_index(namespace, target, BlobIndexOperation::Remove(link.clone()))
-                    .await?;
+
+            for (digest, ops) in &pending_blob_ops {
+                let path = path_builder::blob_index_path(digest);
+                let mut blob_index =
+                    match self.store.read_to_string(&path).await.map_err(Error::from) {
+                        Ok(content) => serde_json::from_str::<BlobIndex>(&content)?,
+                        Err(Error::ReferenceNotFound) => BlobIndex::default(),
+                        Err(e) => Err(e)?,
+                    };
+                let mut ns_links = blob_index.namespace.remove(namespace).unwrap_or_default();
+                for op in ops {
+                    match op {
+                        BlobIndexOperation::Insert(link) => {
+                            ns_links.insert(link.clone());
+                        }
+                        BlobIndexOperation::Remove(link) => {
+                            ns_links.remove(link);
+                        }
+                    }
+                }
+                if !ns_links.is_empty() {
+                    blob_index.namespace.insert(namespace.to_string(), ns_links);
+                }
+                if blob_index.namespace.is_empty() {
+                    let container = path_builder::blob_container_dir(digest);
+                    self.store.delete_dir(&container).await?;
+                    let _ = self.store.delete_empty_parent_dirs(&container).await;
+                } else {
+                    let content = serde_json::to_string(&blob_index)?;
+                    self.store.write(&path, content.as_bytes()).await?;
+                }
             }
 
             return Ok(());

@@ -1646,4 +1646,228 @@ mod tests {
             .await;
         }
     }
+
+    pub async fn test_datastore_batch_deduplicates_same_digest_operations(
+        b: Arc<dyn BlobStore>,
+        m: Arc<dyn MetadataStore + Send + Sync>,
+    ) {
+        let namespace = &Namespace::new("batch-dedup-ns").unwrap();
+        let digest = b.create_blob(b"dedup content").await.unwrap();
+
+        let tag_link = LinkKind::Tag("latest".to_string());
+        let digest_link = LinkKind::Digest(digest.clone());
+
+        let mut tx = m.begin_transaction(namespace);
+        tx.create_link(&tag_link, &digest);
+        tx.create_link(&digest_link, &digest);
+        tx.commit().await.unwrap();
+
+        let blob_index = m.read_blob_index(&digest).await.unwrap();
+        let links = blob_index
+            .namespace
+            .get(namespace.as_ref())
+            .expect("Blob index should have an entry for the namespace");
+        assert!(
+            links.contains(&tag_link),
+            "Blob index should contain Tag(latest)"
+        );
+        assert!(
+            links.contains(&digest_link),
+            "Blob index should contain Digest link"
+        );
+        assert_eq!(links.len(), 2, "Blob index should have exactly 2 entries");
+    }
+
+    #[tokio::test]
+    async fn test_batch_deduplicates_same_digest_operations() {
+        for test_case in backends() {
+            test_datastore_batch_deduplicates_same_digest_operations(
+                test_case.blob_store(),
+                test_case.metadata_store(),
+            )
+            .await;
+        }
+    }
+
+    pub async fn test_datastore_batch_handles_mixed_insert_remove_same_digest(
+        b: Arc<dyn BlobStore>,
+        m: Arc<dyn MetadataStore + Send + Sync>,
+    ) {
+        let namespace = &Namespace::new("batch-mixed-ns").unwrap();
+        let digest = b.create_blob(b"mixed content").await.unwrap();
+
+        let tag_v1 = LinkKind::Tag("v1".to_string());
+        create_link(&m, namespace, &tag_v1, &digest).await;
+
+        let tag_v2 = LinkKind::Tag("v2".to_string());
+        let mut tx = m.begin_transaction(namespace);
+        tx.delete_link(&tag_v1);
+        tx.create_link(&tag_v2, &digest);
+        tx.commit().await.unwrap();
+
+        let blob_index = m.read_blob_index(&digest).await.unwrap();
+        let links = blob_index
+            .namespace
+            .get(namespace.as_ref())
+            .expect("Blob index should have an entry for the namespace");
+        assert!(links.contains(&tag_v2), "Blob index should contain Tag(v2)");
+        assert!(
+            !links.contains(&tag_v1),
+            "Blob index should not contain Tag(v1)"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_batch_handles_mixed_insert_remove_same_digest() {
+        for test_case in backends() {
+            test_datastore_batch_handles_mixed_insert_remove_same_digest(
+                test_case.blob_store(),
+                test_case.metadata_store(),
+            )
+            .await;
+        }
+    }
+
+    pub async fn test_datastore_batch_deletes_empty_blob_container(
+        b: Arc<dyn BlobStore>,
+        m: Arc<dyn MetadataStore + Send + Sync>,
+    ) {
+        let namespace = &Namespace::new("batch-empty-container-ns").unwrap();
+        let digest = b.create_blob(b"ephemeral content").await.unwrap();
+
+        let tag_link = LinkKind::Tag("v1".to_string());
+        create_link(&m, namespace, &tag_link, &digest).await;
+
+        delete_link(&m, namespace, &tag_link).await;
+
+        match m.read_blob_index(&digest).await {
+            Ok(index) => {
+                let links = index.namespace.get(namespace.as_ref());
+                assert!(
+                    links.is_none_or(|s| s.is_empty()),
+                    "Blob index should have no entries for the namespace after deletion"
+                );
+            }
+            Err(crate::registry::metadata_store::Error::ReferenceNotFound) => {}
+            Err(e) => panic!("Unexpected error reading blob index: {e:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_batch_deletes_empty_blob_container() {
+        for test_case in backends() {
+            test_datastore_batch_deletes_empty_blob_container(
+                test_case.blob_store(),
+                test_case.metadata_store(),
+            )
+            .await;
+        }
+    }
+
+    pub async fn test_datastore_batch_multiple_unique_digests(
+        b: Arc<dyn BlobStore>,
+        m: Arc<dyn MetadataStore + Send + Sync>,
+    ) {
+        let namespace = &Namespace::new("batch-multi-digest-ns").unwrap();
+        let layer1_digest = b.create_blob(b"layer1 data").await.unwrap();
+        let layer2_digest = b.create_blob(b"layer2 data").await.unwrap();
+        let layer3_digest = b.create_blob(b"layer3 data").await.unwrap();
+        let config_digest = b.create_blob(b"config data").await.unwrap();
+
+        let layer1_link = LinkKind::Layer(layer1_digest.clone());
+        let layer2_link = LinkKind::Layer(layer2_digest.clone());
+        let layer3_link = LinkKind::Layer(layer3_digest.clone());
+        let config_link = LinkKind::Config(config_digest.clone());
+
+        let mut tx = m.begin_transaction(namespace);
+        tx.create_link(&layer1_link, &layer1_digest);
+        tx.create_link(&layer2_link, &layer2_digest);
+        tx.create_link(&layer3_link, &layer3_digest);
+        tx.create_link(&config_link, &config_digest);
+        tx.commit().await.unwrap();
+
+        for (digest, link) in [
+            (&layer1_digest, &layer1_link),
+            (&layer2_digest, &layer2_link),
+            (&layer3_digest, &layer3_link),
+            (&config_digest, &config_link),
+        ] {
+            let blob_index = m.read_blob_index(digest).await.unwrap();
+            let links = blob_index
+                .namespace
+                .get(namespace.as_ref())
+                .expect("Blob index should have an entry for the namespace");
+            assert_eq!(
+                links.len(),
+                1,
+                "Each blob index should have exactly 1 entry"
+            );
+            assert!(
+                links.contains(link),
+                "Blob index should contain the expected link"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_batch_multiple_unique_digests() {
+        for test_case in backends() {
+            test_datastore_batch_multiple_unique_digests(
+                test_case.blob_store(),
+                test_case.metadata_store(),
+            )
+            .await;
+        }
+    }
+
+    pub async fn test_datastore_batch_preserves_existing_blob_index_entries(
+        b: Arc<dyn BlobStore>,
+        m: Arc<dyn MetadataStore + Send + Sync>,
+    ) {
+        let other_ns = &Namespace::new("other-ns").unwrap();
+        let my_ns = &Namespace::new("my-ns").unwrap();
+        let digest = b.create_blob(b"shared content").await.unwrap();
+
+        let other_tag = LinkKind::Tag("stable".to_string());
+        create_link(&m, other_ns, &other_tag, &digest).await;
+
+        let blob_index = m.read_blob_index(&digest).await.unwrap();
+        assert!(
+            blob_index.namespace.contains_key(other_ns.as_ref()),
+            "Blob index should have entry for other-ns"
+        );
+
+        let my_tag = LinkKind::Tag("latest".to_string());
+        create_link(&m, my_ns, &my_tag, &digest).await;
+
+        let blob_index = m.read_blob_index(&digest).await.unwrap();
+        let other_links = blob_index
+            .namespace
+            .get(other_ns.as_ref())
+            .expect("Blob index should still have entry for other-ns");
+        assert!(
+            other_links.contains(&other_tag),
+            "other-ns should still contain Tag(stable)"
+        );
+
+        let my_links = blob_index
+            .namespace
+            .get(my_ns.as_ref())
+            .expect("Blob index should have entry for my-ns");
+        assert!(
+            my_links.contains(&my_tag),
+            "my-ns should contain Tag(latest)"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_batch_preserves_existing_blob_index_entries() {
+        for test_case in backends() {
+            test_datastore_batch_preserves_existing_blob_index_entries(
+                test_case.blob_store(),
+                test_case.metadata_store(),
+            )
+            .await;
+        }
+    }
 }
