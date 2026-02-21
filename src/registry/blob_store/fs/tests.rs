@@ -1,6 +1,7 @@
 use tokio::fs;
 
 use crate::registry::blob_store::tests::{
+    test_build_blob_reader_returns_size, test_build_blob_reader_with_offset_returns_full_size,
     test_datastore_blob_operations, test_datastore_list_blobs, test_datastore_list_uploads,
     test_datastore_upload_operations,
 };
@@ -77,4 +78,16 @@ async fn test_blob_operations() {
 async fn test_upload_operations() {
     let t = FSRegistryTestCase::new();
     test_datastore_upload_operations(t.blob_store()).await;
+}
+
+#[tokio::test]
+async fn test_blob_reader_returns_size() {
+    let t = FSRegistryTestCase::new();
+    test_build_blob_reader_returns_size(t.blob_store()).await;
+}
+
+#[tokio::test]
+async fn test_blob_reader_with_offset_returns_full_size() {
+    let t = FSRegistryTestCase::new();
+    test_build_blob_reader_with_offset_returns_full_size(t.blob_store()).await;
 }

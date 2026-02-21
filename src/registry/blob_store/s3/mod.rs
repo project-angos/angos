@@ -412,7 +412,7 @@ impl BlobStore for Backend {
         &self,
         digest: &Digest,
         start_offset: Option<u64>,
-    ) -> Result<BoxedReader, Error> {
+    ) -> Result<(BoxedReader, u64), Error> {
         let path = path_builder::blob_path(digest);
         let res = self
             .store
@@ -426,7 +426,14 @@ impl BlobStore for Backend {
                 }
             })?;
 
-        Ok(Box::new(res.body.into_async_read()))
+        let remaining: u64 = res
+            .content_length
+            .unwrap_or_default()
+            .try_into()
+            .unwrap_or(0);
+        let total_size = remaining + start_offset.unwrap_or(0);
+
+        Ok((Box::new(res.body.into_async_read()), total_size))
     }
 
     #[instrument(skip(self))]

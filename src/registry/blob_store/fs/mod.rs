@@ -268,7 +268,7 @@ impl BlobStore for Backend {
         &self,
         digest: &Digest,
         start_offset: Option<u64>,
-    ) -> Result<BoxedReader, Error> {
+    ) -> Result<(BoxedReader, u64), Error> {
         let path = path_builder::blob_path(digest);
         let mut file = match self.store.open_file(&path).await {
             Ok(file) => file,
@@ -276,11 +276,13 @@ impl BlobStore for Backend {
             Err(e) => return Err(e.into()),
         };
 
+        let size = file.metadata().await?.len();
+
         if let Some(offset) = start_offset {
             file.seek(SeekFrom::Start(offset)).await?;
         }
 
-        Ok(Box::new(file))
+        Ok((Box::new(file), size))
     }
 
     #[instrument(skip(self))]

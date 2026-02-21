@@ -144,7 +144,7 @@ impl Registry {
             .read_link(namespace, &blob_link, self.update_pull_time)
             .await?;
 
-        let mut reader = self
+        let (mut reader, _) = self
             .blob_store
             .build_blob_reader(&link.target, None)
             .await

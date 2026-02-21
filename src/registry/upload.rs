@@ -685,9 +685,6 @@ mod tests {
         }
     }
 
-    // Tests gated behind pending_refactor feature — will fail to compile until the
-    // BlobStore trait is updated to return (Digest, u64) from write_upload and
-    // gains a get_upload_size method.
     #[tokio::test]
     async fn test_write_upload_returns_digest_and_size() {
         for test_case in backends() {

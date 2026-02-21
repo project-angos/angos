@@ -144,23 +144,20 @@ impl Registry {
         digest: &Digest,
         range: Option<(u64, Option<u64>)>,
     ) -> Result<GetBlobResponse<BoxedReader>, Error> {
-        let total_length = self.blob_store.get_blob_size(digest).await?;
+        let start = range.map(|(start, _)| start);
 
-        let start = if let Some((start, _)) = range {
-            if start > total_length {
-                warn!("Range start does not match content length");
-                return Err(Error::RangeNotSatisfiable);
-            }
-            Some(start)
-        } else {
-            None
-        };
-
-        let reader = match self.blob_store.build_blob_reader(digest, start).await {
-            Ok(reader) => reader,
+        let (reader, total_length) = match self.blob_store.build_blob_reader(digest, start).await {
+            Ok(result) => result,
             Err(blob_store::Error::BlobNotFound) => return Ok(GetBlobResponse::Empty),
             Err(err) => Err(err)?,
         };
+
+        if let Some((start, _)) = range
+            && start > total_length
+        {
+            warn!("Range start does not match content length");
+            return Err(Error::RangeNotSatisfiable);
+        }
 
         match range {
             Some((0, None)) | None => Ok(GetBlobResponse::Reader(reader, total_length)),
@@ -600,6 +597,75 @@ mod tests {
                 let mut buf = Vec::new();
                 reader.read_to_end(&mut buf).await.unwrap();
                 assert_eq!(buf, content);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_get_local_blob_returns_correct_size() {
+        for test_case in backends() {
+            let registry = test_case.registry();
+            let namespace = &Namespace::new("test-repo").unwrap();
+            let content = b"regression test blob content";
+
+            let (digest, _) = create_test_blob(registry, namespace, content).await;
+
+            // Full read: verify Reader variant returns correct total_length
+            let response = registry.get_local_blob(&digest, None).await.unwrap();
+            match response {
+                GetBlobResponse::Reader(mut reader, total_length) => {
+                    assert_eq!(total_length, content.len() as u64);
+                    let mut buf = Vec::new();
+                    reader.read_to_end(&mut buf).await.unwrap();
+                    assert_eq!(buf, content);
+                }
+                _ => panic!("Expected Reader response for full read"),
+            }
+
+            // Ranged read: verify RangedReader returns correct total_length
+            let range = Some((5, Some(15)));
+            let response = registry.get_local_blob(&digest, range).await.unwrap();
+            match response {
+                GetBlobResponse::RangedReader(mut reader, (start, end), total_length) => {
+                    assert_eq!(start, 5);
+                    assert_eq!(end, 15);
+                    assert_eq!(total_length, content.len() as u64);
+                    let mut buf = Vec::new();
+                    reader.read_to_end(&mut buf).await.unwrap();
+                    assert_eq!(buf, &content[5..=15]);
+                }
+                _ => panic!("Expected RangedReader response for ranged read"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_head_blob_independent_of_get() {
+        for test_case in backends() {
+            let registry = test_case.registry();
+            let namespace = &Namespace::new("test-repo").unwrap();
+            let content = b"head blob independence test";
+
+            let (digest, repository) = create_test_blob(registry, namespace, content).await;
+
+            // head_blob should return correct size via get_blob_size
+            let head_response = registry
+                .head_blob(&repository, &[], namespace, &digest)
+                .await
+                .unwrap();
+            assert_eq!(head_response.digest, digest);
+            assert_eq!(head_response.size, content.len() as u64);
+
+            // get_blob should also work and return the same size
+            let get_response = registry
+                .get_blob(&repository, &[], namespace, &digest, None)
+                .await
+                .unwrap();
+            match get_response {
+                GetBlobResponse::Reader(_, total_length) => {
+                    assert_eq!(total_length, head_response.size);
+                }
+                _ => panic!("Expected Reader response"),
             }
         }
     }

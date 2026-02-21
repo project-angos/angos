@@ -67,7 +67,7 @@ pub trait BlobStore: Send + Sync {
         &self,
         digest: &Digest,
         start_offset: Option<u64>,
-    ) -> Result<BoxedReader, Error>;
+    ) -> Result<(BoxedReader, u64), Error>;
 
     async fn get_blob_url(&self, digest: &Digest) -> Result<Option<String>, Error>;
 
@@ -211,12 +211,47 @@ mod tests {
         assert_eq!(size, test_content.len() as u64);
 
         // Test blob reader
-        let mut reader = store.build_blob_reader(&digest, None).await.unwrap();
+        let (mut reader, _) = store.build_blob_reader(&digest, None).await.unwrap();
         let mut buffer = Vec::new();
         tokio::io::AsyncReadExt::read_to_end(&mut reader, &mut buffer)
             .await
             .unwrap();
         assert_eq!(buffer, test_content);
+    }
+
+    pub async fn test_build_blob_reader_returns_size(store: &impl BlobStore) {
+        use tokio::io::AsyncReadExt;
+
+        let test_content = b"blob reader size test content";
+        let digest = store.create_blob(test_content).await.unwrap();
+
+        let (mut reader, size) = store.build_blob_reader(&digest, None).await.unwrap();
+        assert_eq!(size, test_content.len() as u64);
+
+        let mut buffer = Vec::new();
+        reader.read_to_end(&mut buffer).await.unwrap();
+        assert_eq!(buffer, test_content);
+    }
+
+    #[allow(clippy::cast_possible_truncation)]
+    pub async fn test_build_blob_reader_with_offset_returns_full_size(store: &impl BlobStore) {
+        use tokio::io::AsyncReadExt;
+
+        let test_content = b"offset blob reader content here";
+        let digest = store.create_blob(test_content).await.unwrap();
+        let offset = 10u64;
+
+        let (mut reader, size) = store
+            .build_blob_reader(&digest, Some(offset))
+            .await
+            .unwrap();
+
+        // Should return the TOTAL blob size, not remaining size
+        assert_eq!(size, test_content.len() as u64);
+
+        let mut buffer = Vec::new();
+        reader.read_to_end(&mut buffer).await.unwrap();
+        assert_eq!(buffer, &test_content[offset as usize..]);
     }
 
     pub async fn test_datastore_upload_operations(store: &impl BlobStore) {
