@@ -21,7 +21,7 @@ name = "My Registry"
 | Option    | Type   | Default             | Description                           |
 |-----------|--------|---------------------|---------------------------------------|
 | `enabled` | bool   | `false`             | Enable the web interface              |
-| `name`    | string | `"angos"` | Registry name displayed in the header |
+| `name`    | string | `"Angos"` | Registry name displayed in the header |
 
 ---
 

@@ -336,7 +336,7 @@ multipart_copy_jobs = 4
 
 When using S3 for metadata, Angos includes two optimizations to reduce round-trips:
 
-**Link cache** — A read-through cache for link metadata (tags, layer links). Populated on read, invalidated on write. Configurable TTL (default 30 s, `link_cache_ttl = 0` to disable). Shares the same cache backend (in-memory or Redis) as authentication tokens.
+**Link cache** — A read-through cache for link metadata (tags, layer links). Populated on both read and write, invalidated on delete. Configurable TTL (default 30 s, `link_cache_ttl = 0` to disable). Shares the same cache backend (in-memory or Redis) as authentication tokens.
 
 **Deferred access time updates** — Instead of a synchronous lock-read-write-unlock cycle on every manifest pull, access time updates are buffered in memory and flushed periodically. Configurable interval (default 60 s, `access_time_debounce_secs = 0` to disable). This reduces the critical path per pull from 4 S3 operations to 1.
 

@@ -230,7 +230,7 @@ List blob uploads in progress.
 ### Health Check
 
 ```
-GET /health
+GET /healthz
 ```
 
 Returns `200 OK` if the service is healthy.
@@ -278,7 +278,7 @@ Returns UI configuration.
 
 ## Authentication
 
-All endpoints (except `/health`) require authentication when access policies are configured.
+All endpoints (except `/healthz`) require authentication when access policies are configured.
 
 ### Methods
 
