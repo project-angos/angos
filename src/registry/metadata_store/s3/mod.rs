@@ -599,8 +599,7 @@ impl MetadataStore for Backend {
 
             let mut pending_blob_ops: HashMap<Digest, Vec<BlobIndexOperation>> = HashMap::new();
 
-            // Tracked creates: sequential (read-modify-write with blob index)
-            // Non-tracked creates: accumulate blob index ops, then parallel link writes
+            let mut tracked_create_writes: Vec<(LinkKind, LinkMetadata)> = Vec::new();
             let mut non_tracked_create_writes: Vec<(LinkKind, LinkMetadata)> = Vec::new();
             for (link, target, old_target, referrer) in &creates {
                 let is_tracked = is_tracked_link(link);
@@ -621,8 +620,7 @@ impl MetadataStore for Backend {
                             .push(BlobIndexOperation::Insert(link.clone()));
                     }
 
-                    self.write_link_reference(namespace, link, &metadata)
-                        .await?;
+                    tracked_create_writes.push((link.clone(), metadata));
                 } else {
                     pending_blob_ops
                         .entry(target.clone())
@@ -642,8 +640,9 @@ impl MetadataStore for Backend {
                 }
             }
             join_all(
-                non_tracked_create_writes
+                tracked_create_writes
                     .iter()
+                    .chain(non_tracked_create_writes.iter())
                     .map(|(link, metadata)| async move {
                         self.write_link_reference(namespace, link, metadata).await
                     }),
@@ -652,8 +651,8 @@ impl MetadataStore for Backend {
             .into_iter()
             .collect::<Result<Vec<_>, _>>()?;
 
-            // Tracked deletes: sequential (read-modify-write with blob index)
-            // Non-tracked deletes: parallel link deletes, then accumulate blob index ops
+            let mut tracked_delete_writes: Vec<(LinkKind, LinkMetadata)> = Vec::new();
+            let mut tracked_delete_removes: Vec<LinkKind> = Vec::new();
             let mut non_tracked_delete_links: Vec<LinkKind> = Vec::new();
             for (link, target, referrer) in &valid_deletes {
                 let is_tracked = is_tracked_link(link);
@@ -665,10 +664,9 @@ impl MetadataStore for Backend {
                         }
 
                         if metadata.has_references() {
-                            self.write_link_reference(namespace, link, &metadata)
-                                .await?;
+                            tracked_delete_writes.push((link.clone(), metadata));
                         } else {
-                            self.delete_link_reference(namespace, link).await?;
+                            tracked_delete_removes.push(link.clone());
                             pending_blob_ops
                                 .entry(target.clone())
                                 .or_default()
@@ -684,20 +682,40 @@ impl MetadataStore for Backend {
                 }
             }
             join_all(
-                non_tracked_delete_links
+                tracked_delete_writes
                     .iter()
-                    .map(|link| async move { self.delete_link_reference(namespace, link).await }),
+                    .map(|(link, metadata)| {
+                        let fut: std::pin::Pin<
+                            Box<dyn std::future::Future<Output = Result<(), Error>> + Send + '_>,
+                        > = Box::pin(self.write_link_reference(namespace, link, metadata));
+                        fut
+                    })
+                    .chain(
+                        tracked_delete_removes
+                            .iter()
+                            .chain(non_tracked_delete_links.iter())
+                            .map(|link| {
+                                let fut: std::pin::Pin<
+                                    Box<
+                                        dyn std::future::Future<Output = Result<(), Error>>
+                                            + Send
+                                            + '_,
+                                    >,
+                                > = Box::pin(self.delete_link_reference(namespace, link));
+                                fut
+                            }),
+                    ),
             )
             .await
             .into_iter()
             .collect::<Result<Vec<_>, _>>()?;
 
-            for (digest, ops) in &pending_blob_ops {
+            join_all(pending_blob_ops.iter().map(|(digest, ops)| async move {
                 let path = path_builder::blob_index_path(digest);
                 let mut blob_index = match self.store.read(&path).await {
                     Ok(data) => serde_json::from_slice::<BlobIndex>(&data)?,
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => BlobIndex::default(),
-                    Err(e) => return Err(e.into()),
+                    Err(e) => return Err(Error::from(e)),
                 };
                 let mut ns_links = blob_index.namespace.remove(namespace).unwrap_or_default();
                 for op in ops {
@@ -720,7 +738,11 @@ impl MetadataStore for Backend {
                     let content = Bytes::from(serde_json::to_vec(&blob_index)?);
                     self.store.put_object(&path, content).await?;
                 }
-            }
+                Ok(())
+            }))
+            .await
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()?;
 
             for (link, _, _, _) in &creates {
                 self.cache_invalidate(namespace, link).await;
@@ -1477,5 +1499,263 @@ mod tests {
             raw2.accessed_at.is_some(),
             "tag2 accessed_at should be set despite another entry failing"
         );
+    }
+
+    #[tokio::test]
+    async fn test_blob_index_updates_multiple_digests() {
+        let config = test_config();
+        let backend = Backend::new(&config).unwrap();
+        let namespace = "blob-index-multi-digest-test";
+
+        let digests: Vec<Digest> = (0..5)
+            .map(|i| {
+                Digest::from_str(&format!(
+                    "sha256:a{i}a0000000000000000000000000000000000000000000000000000000000000"
+                ))
+                .unwrap()
+            })
+            .collect();
+
+        let ops: Vec<LinkOperation> = digests
+            .iter()
+            .enumerate()
+            .map(|(i, digest)| LinkOperation::Create {
+                link: LinkKind::Tag(format!("tag-bim-{i}")),
+                target: digest.clone(),
+                referrer: None,
+            })
+            .collect();
+
+        backend.update_links(namespace, &ops).await.unwrap();
+
+        for (i, digest) in digests.iter().enumerate() {
+            let path = path_builder::blob_index_path(digest);
+            let data = backend.store.read(&path).await.unwrap();
+            let blob_index: BlobIndex = serde_json::from_slice(&data).unwrap();
+            let ns_links = blob_index.namespace.get(namespace).unwrap();
+            let expected_link = LinkKind::Tag(format!("tag-bim-{i}"));
+            assert!(
+                ns_links.contains(&expected_link),
+                "Blob index for digest {digest} should contain {expected_link}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_tracked_link_creates_with_referrers() {
+        let config = test_config();
+        let backend = Backend::new(&config).unwrap();
+        let namespace = "tracked-creates-referrer-test";
+
+        let referrer_digest = Digest::from_str(
+            "sha256:aa00000000000000000000000000000000000000000000000000000000000001",
+        )
+        .unwrap();
+
+        let layer_digests: Vec<Digest> = (0..3)
+            .map(|i| {
+                Digest::from_str(&format!(
+                    "sha256:b{i}b0000000000000000000000000000000000000000000000000000000000000"
+                ))
+                .unwrap()
+            })
+            .collect();
+
+        let config_digest = Digest::from_str(
+            "sha256:bb00000000000000000000000000000000000000000000000000000000000001",
+        )
+        .unwrap();
+
+        let mut ops: Vec<LinkOperation> = layer_digests
+            .iter()
+            .map(|d| LinkOperation::Create {
+                link: LinkKind::Layer(d.clone()),
+                target: d.clone(),
+                referrer: Some(referrer_digest.clone()),
+            })
+            .collect();
+
+        ops.push(LinkOperation::Create {
+            link: LinkKind::Config(config_digest.clone()),
+            target: config_digest.clone(),
+            referrer: Some(referrer_digest.clone()),
+        });
+
+        backend.update_links(namespace, &ops).await.unwrap();
+
+        for layer_digest in &layer_digests {
+            let link = LinkKind::Layer(layer_digest.clone());
+            let meta = backend.read_link_reference(namespace, &link).await.unwrap();
+            assert_eq!(meta.target, *layer_digest);
+            assert!(
+                meta.referenced_by.contains(&referrer_digest),
+                "Layer link {link} should have referrer {referrer_digest}"
+            );
+        }
+
+        let config_link = LinkKind::Config(config_digest.clone());
+        let meta = backend
+            .read_link_reference(namespace, &config_link)
+            .await
+            .unwrap();
+        assert_eq!(meta.target, config_digest);
+        assert!(
+            meta.referenced_by.contains(&referrer_digest),
+            "Config link should have referrer {referrer_digest}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_tracked_link_deletes_with_referrers() {
+        let config = test_config();
+        let backend = Backend::new(&config).unwrap();
+        let namespace = "tracked-deletes-referrer-test";
+
+        let referrer_digest = Digest::from_str(
+            "sha256:cc00000000000000000000000000000000000000000000000000000000000001",
+        )
+        .unwrap();
+
+        let layer_digests: Vec<Digest> = (0..3)
+            .map(|i| {
+                Digest::from_str(&format!(
+                    "sha256:c{i}c0000000000000000000000000000000000000000000000000000000000000"
+                ))
+                .unwrap()
+            })
+            .collect();
+
+        // Create tracked links with referrers
+        let create_ops: Vec<LinkOperation> = layer_digests
+            .iter()
+            .map(|d| LinkOperation::Create {
+                link: LinkKind::Layer(d.clone()),
+                target: d.clone(),
+                referrer: Some(referrer_digest.clone()),
+            })
+            .collect();
+        backend.update_links(namespace, &create_ops).await.unwrap();
+
+        // Verify they exist
+        for d in &layer_digests {
+            let link = LinkKind::Layer(d.clone());
+            let meta = backend.read_link_reference(namespace, &link).await.unwrap();
+            assert_eq!(meta.target, *d);
+        }
+
+        // Delete all tracked links with referrer
+        let delete_ops: Vec<LinkOperation> = layer_digests
+            .iter()
+            .map(|d| LinkOperation::Delete {
+                link: LinkKind::Layer(d.clone()),
+                referrer: Some(referrer_digest.clone()),
+            })
+            .collect();
+        backend.update_links(namespace, &delete_ops).await.unwrap();
+
+        // Verify links are deleted and blob indices cleaned up
+        for d in &layer_digests {
+            let link = LinkKind::Layer(d.clone());
+            let result = backend.read_link_reference(namespace, &link).await;
+            assert!(
+                matches!(result, Err(Error::ReferenceNotFound)),
+                "Tracked link {link} should be deleted"
+            );
+
+            let path = path_builder::blob_index_path(d);
+            let result = backend.store.read(&path).await;
+            assert!(
+                result.is_err(),
+                "Blob index for {d} should be removed after all links deleted"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_mixed_creates_and_deletes_across_digests() {
+        let config = test_config();
+        let backend = Backend::new(&config).unwrap();
+        let namespace = "mixed-ops-across-digests-test";
+
+        let digest_keep = Digest::from_str(
+            "sha256:dd00000000000000000000000000000000000000000000000000000000000001",
+        )
+        .unwrap();
+        let digest_remove = Digest::from_str(
+            "sha256:dd00000000000000000000000000000000000000000000000000000000000002",
+        )
+        .unwrap();
+        let digest_add = Digest::from_str(
+            "sha256:dd00000000000000000000000000000000000000000000000000000000000003",
+        )
+        .unwrap();
+
+        // Setup: create tags for digest_keep and digest_remove
+        let setup_ops = vec![
+            LinkOperation::Create {
+                link: LinkKind::Tag("keep-tag".into()),
+                target: digest_keep.clone(),
+                referrer: None,
+            },
+            LinkOperation::Create {
+                link: LinkKind::Tag("remove-tag".into()),
+                target: digest_remove.clone(),
+                referrer: None,
+            },
+        ];
+        backend.update_links(namespace, &setup_ops).await.unwrap();
+
+        // Mixed operation: delete remove-tag, add new-tag pointing to digest_add
+        let mixed_ops = vec![
+            LinkOperation::Delete {
+                link: LinkKind::Tag("remove-tag".into()),
+                referrer: None,
+            },
+            LinkOperation::Create {
+                link: LinkKind::Tag("new-tag".into()),
+                target: digest_add.clone(),
+                referrer: None,
+            },
+        ];
+        backend.update_links(namespace, &mixed_ops).await.unwrap();
+
+        // Verify: keep-tag still exists
+        let keep_path = path_builder::blob_index_path(&digest_keep);
+        let keep_data = backend.store.read(&keep_path).await.unwrap();
+        let keep_index: BlobIndex = serde_json::from_slice(&keep_data).unwrap();
+        let keep_links = keep_index.namespace.get(namespace).unwrap();
+        assert!(keep_links.contains(&LinkKind::Tag("keep-tag".into())));
+
+        // Verify: remove-tag blob index no longer has it
+        let remove_path = path_builder::blob_index_path(&digest_remove);
+        let remove_result = backend.store.read(&remove_path).await;
+        if let Ok(data) = remove_result {
+            let idx: BlobIndex = serde_json::from_slice(&data).unwrap();
+            let links = idx.namespace.get(namespace);
+            assert!(
+                links.is_none() || !links.unwrap().contains(&LinkKind::Tag("remove-tag".into())),
+                "remove-tag should not be in blob index after delete"
+            );
+        }
+
+        // Verify: new-tag exists in digest_add's blob index
+        let add_path = path_builder::blob_index_path(&digest_add);
+        let add_data = backend.store.read(&add_path).await.unwrap();
+        let add_index: BlobIndex = serde_json::from_slice(&add_data).unwrap();
+        let add_links = add_index.namespace.get(namespace).unwrap();
+        assert!(add_links.contains(&LinkKind::Tag("new-tag".into())));
+
+        // Verify: remove-tag link itself is gone
+        let result = backend
+            .read_link_reference(namespace, &LinkKind::Tag("remove-tag".into()))
+            .await;
+        assert!(matches!(result, Err(Error::ReferenceNotFound)));
+
+        // Verify: new-tag link exists and points to digest_add
+        let new_meta = backend
+            .read_link_reference(namespace, &LinkKind::Tag("new-tag".into()))
+            .await
+            .unwrap();
+        assert_eq!(new_meta.target, digest_add);
     }
 }
