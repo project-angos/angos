@@ -744,8 +744,11 @@ impl MetadataStore for Backend {
             .into_iter()
             .collect::<Result<Vec<_>, _>>()?;
 
-            for (link, _, _, _) in &creates {
-                self.cache_invalidate(namespace, link).await;
+            for (link, metadata) in tracked_create_writes
+                .iter()
+                .chain(non_tracked_create_writes.iter())
+            {
+                self.cache_put(namespace, link, metadata).await;
             }
             for (link, _, _) in &valid_deletes {
                 self.cache_invalidate(namespace, link).await;
@@ -974,7 +977,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_update_links_invalidates_cache() {
+    async fn test_update_links_populates_cache_on_overwrite() {
         let config = test_config();
         let (backend, _cache) = test_backend_with_cache(&config);
         let namespace = "cache-invalidate-ns";
@@ -1000,7 +1003,7 @@ mod tests {
         let meta = backend.read_link(namespace, &tag, false).await.unwrap();
         assert_eq!(meta.target, digest_a);
 
-        // Update tag to point to digest_b via update_links
+        // Overwrite tag to point to digest_b via update_links
         let ops = vec![LinkOperation::Create {
             link: tag.clone(),
             target: digest_b.clone(),
@@ -1008,9 +1011,79 @@ mod tests {
         }];
         backend.update_links(namespace, &ops).await.unwrap();
 
-        // Read should return digest_b (cache was invalidated by update_links)
+        // Delete the S3 object to prove the read comes from cache
+        let link_path = path_builder::link_path(&tag, namespace);
+        backend.store.delete(&link_path).await.unwrap();
+
+        // Read should return digest_b from cache (populated by update_links)
         let meta = backend.read_link(namespace, &tag, false).await.unwrap();
         assert_eq!(meta.target, digest_b);
+    }
+
+    #[tokio::test]
+    async fn test_update_links_populates_cache_on_create() {
+        let config = test_config();
+        let (backend, _cache) = test_backend_with_cache(&config);
+        let namespace = "cache-populate-create-ns";
+        let digest = Digest::from_str(
+            "sha256:a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
+        )
+        .unwrap();
+        let tag = LinkKind::Tag("v1".into());
+
+        // Create a new tag via update_links
+        let ops = vec![LinkOperation::Create {
+            link: tag.clone(),
+            target: digest.clone(),
+            referrer: None,
+        }];
+        backend.update_links(namespace, &ops).await.unwrap();
+
+        // Delete the S3 object to prove the read comes from cache
+        let link_path = path_builder::link_path(&tag, namespace);
+        backend.store.delete(&link_path).await.unwrap();
+
+        // Read should succeed from cache (populated by update_links, not just invalidated)
+        let meta = backend.read_link(namespace, &tag, false).await.unwrap();
+        assert_eq!(meta.target, digest);
+    }
+
+    #[tokio::test]
+    async fn test_update_links_invalidates_cache_on_delete() {
+        let config = test_config();
+        let (backend, _cache) = test_backend_with_cache(&config);
+        let namespace = "cache-invalidate-delete-ns";
+        let digest = Digest::from_str(
+            "sha256:b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2",
+        )
+        .unwrap();
+        let tag = LinkKind::Tag("to-delete".into());
+
+        // Create a tag
+        let ops = vec![LinkOperation::Create {
+            link: tag.clone(),
+            target: digest.clone(),
+            referrer: None,
+        }];
+        backend.update_links(namespace, &ops).await.unwrap();
+
+        // Read to populate cache
+        let meta = backend.read_link(namespace, &tag, false).await.unwrap();
+        assert_eq!(meta.target, digest);
+
+        // Delete the tag via update_links
+        let ops = vec![LinkOperation::Delete {
+            link: tag.clone(),
+            referrer: None,
+        }];
+        backend.update_links(namespace, &ops).await.unwrap();
+
+        // Read should return ReferenceNotFound (cache was invalidated, not stale)
+        let result = backend.read_link(namespace, &tag, false).await;
+        assert!(
+            matches!(result, Err(Error::ReferenceNotFound)),
+            "Should get ReferenceNotFound after deleting a tag via update_links"
+        );
     }
 
     #[tokio::test]
