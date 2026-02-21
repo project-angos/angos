@@ -144,6 +144,25 @@ impl Registry {
             .read_link(namespace, &blob_link, self.update_pull_time)
             .await?;
 
+        if let Some(media_type) = link.media_type {
+            let size = self
+                .blob_store
+                .get_blob_size(&link.target)
+                .await
+                .map_err(|error| {
+                    error!("Failed to get blob size: {error}");
+                    Error::ManifestUnknown
+                })?;
+
+            return Ok(HeadManifestResponse {
+                media_type: Some(media_type),
+                digest: link.target,
+                size: usize::try_from(size).unwrap_or(usize::MAX),
+            });
+        }
+
+        // Backward compatibility: links created before media_type was stored require
+        // a full blob read. Remove this fallback once all links have been re-pushed.
         let (mut reader, _) = self
             .blob_store
             .build_blob_reader(&link.target, None)
@@ -275,10 +294,25 @@ impl Registry {
 
         let mut tx = self.metadata_store.begin_transaction(namespace);
 
-        tx.create_link(&LinkKind::Digest(digest.clone()), &digest);
+        let effective_media_type = content_type
+            .cloned()
+            .or_else(|| manifest.media_type.clone());
+
+        // Backward compatibility: fall back to create_link without media_type when
+        // content type is unknown. Once all clients send Content-Type, simplify to
+        // always use create_link_with_media_type.
+        if let Some(ref mt) = effective_media_type {
+            tx.create_link_with_media_type(&LinkKind::Digest(digest.clone()), &digest, mt);
+        } else {
+            tx.create_link(&LinkKind::Digest(digest.clone()), &digest);
+        }
 
         if let Reference::Tag(tag) = reference {
-            tx.create_link(&LinkKind::Tag(tag.clone()), &digest);
+            if let Some(ref mt) = effective_media_type {
+                tx.create_link_with_media_type(&LinkKind::Tag(tag.clone()), &digest, mt);
+            } else {
+                tx.create_link(&LinkKind::Tag(tag.clone()), &digest);
+            }
         }
 
         if let Some(subject) = &manifest.subject {
@@ -457,6 +491,25 @@ impl Registry {
     ) -> Result<Response<ResponseBody>, Error> {
         let repository = self.get_repository_for_namespace(namespace)?;
 
+        if self.enable_redirect
+            && let Ok(link) = {
+                let blob_link: LinkKind = reference.clone().into();
+                self.metadata_store
+                    .read_link(namespace, &blob_link, self.update_pull_time)
+                    .await
+            }
+            && let Some(media_type) = link.media_type
+            && let Ok(Some(presigned_url)) = self.blob_store.get_blob_url(&link.target).await
+        {
+            return Response::builder()
+                .status(StatusCode::TEMPORARY_REDIRECT)
+                .header(LOCATION, presigned_url)
+                .header(DOCKER_CONTENT_DIGEST, link.target.to_string())
+                .header(CONTENT_TYPE, media_type)
+                .body(ResponseBody::empty())
+                .map_err(Into::into);
+        }
+
         let manifest = self
             .get_manifest(
                 repository,
@@ -467,6 +520,9 @@ impl Registry {
             )
             .await?;
 
+        // Backward compatibility: when the optimized redirect path above fails (link
+        // lacks media_type), fall back to reading the full blob via get_manifest then
+        // redirecting. Remove this block once all links have been re-pushed.
         if self.enable_redirect
             && let Ok(Some(presigned_url)) = self.blob_store.get_blob_url(&manifest.digest).await
         {
@@ -1381,6 +1437,148 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_put_manifest_stores_media_type() {
+        for test_case in backends() {
+            let registry = test_case.registry();
+            let namespace = &Namespace::new("test-repo/media-type-store").unwrap();
+            let tag = "latest";
+            let (content, media_type) = create_test_manifest();
+
+            let response = registry
+                .put_manifest(
+                    namespace,
+                    &Reference::Tag(tag.to_string()),
+                    Some(&media_type),
+                    &content,
+                )
+                .await
+                .unwrap();
+
+            let digest_link = LinkKind::Digest(response.digest.clone());
+            let link_meta = registry
+                .metadata_store
+                .read_link(namespace, &digest_link, false)
+                .await
+                .unwrap();
+            assert_eq!(
+                link_meta.media_type,
+                Some(media_type.clone()),
+                "Digest link should have media_type stored"
+            );
+
+            let tag_link = LinkKind::Tag(tag.to_string());
+            let tag_meta = registry
+                .metadata_store
+                .read_link(namespace, &tag_link, false)
+                .await
+                .unwrap();
+            assert_eq!(
+                tag_meta.media_type,
+                Some(media_type),
+                "Tag link should have media_type stored"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_head_manifest_returns_correct_media_type() {
+        for test_case in backends() {
+            let registry = test_case.registry();
+            let namespace = &Namespace::new("test-repo/head-media-type").unwrap();
+            let (content, media_type) = create_test_manifest();
+
+            let put_response = registry
+                .put_manifest(
+                    namespace,
+                    &Reference::Tag("latest".to_string()),
+                    Some(&media_type),
+                    &content,
+                )
+                .await
+                .unwrap();
+
+            let repository = registry.get_repository_for_namespace(namespace).unwrap();
+
+            let head = registry
+                .head_manifest(
+                    repository,
+                    slice::from_ref(&media_type),
+                    namespace,
+                    Reference::Tag("latest".to_string()),
+                    false,
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(head.media_type, Some(media_type.clone()));
+            assert_eq!(head.digest, put_response.digest);
+            assert_eq!(head.size, content.len());
+
+            let head_by_digest = registry
+                .head_manifest(
+                    repository,
+                    slice::from_ref(&media_type),
+                    namespace,
+                    Reference::Digest(put_response.digest.clone()),
+                    false,
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(head_by_digest.media_type, Some(media_type));
+            assert_eq!(head_by_digest.digest, put_response.digest);
+            assert_eq!(head_by_digest.size, content.len());
+        }
+    }
+
+    #[tokio::test]
+    async fn test_head_manifest_fallback_without_media_type() {
+        for test_case in backends() {
+            let registry = test_case.registry();
+            let namespace = &Namespace::new("test-repo/head-fallback").unwrap();
+            let (content, media_type) = create_test_manifest();
+
+            let digest = registry.blob_store.create_blob(&content).await.unwrap();
+
+            let mut tx = registry.metadata_store.begin_transaction(namespace);
+            tx.create_link(&LinkKind::Digest(digest.clone()), &digest);
+            tx.create_link(&LinkKind::Tag("latest".to_string()), &digest);
+            tx.commit().await.unwrap();
+
+            let link_meta = registry
+                .metadata_store
+                .read_link(namespace, &LinkKind::Digest(digest.clone()), false)
+                .await
+                .unwrap();
+            assert_eq!(
+                link_meta.media_type, None,
+                "Link created without media_type should have None"
+            );
+
+            let repository = registry.get_repository_for_namespace(namespace).unwrap();
+
+            let head = registry
+                .head_manifest(
+                    repository,
+                    slice::from_ref(&media_type),
+                    namespace,
+                    Reference::Tag("latest".to_string()),
+                    false,
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(
+                head.media_type,
+                Some(media_type),
+                "HEAD should fall back to reading blob when media_type not in link"
+            );
+            assert_eq!(head.digest, digest);
+            assert_eq!(head.size, content.len());
+        }
+    }
+
+    #[tokio::test]
     async fn test_delete_manifest_no_tags_by_digest() {
         for test_case in backends() {
             let registry = test_case.registry();
@@ -1421,6 +1619,264 @@ mod tests {
                     .await
                     .is_err()
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_put_manifest_stores_media_type_in_links() {
+        for test_case in backends() {
+            let registry = test_case.registry();
+            let namespace = &Namespace::new("test-repo/media-type-links").unwrap();
+            let (content, media_type) = create_test_manifest();
+
+            let response = registry
+                .put_manifest(
+                    namespace,
+                    &Reference::Tag("latest".to_string()),
+                    Some(&media_type),
+                    &content,
+                )
+                .await
+                .unwrap();
+
+            let digest_link = registry
+                .metadata_store
+                .read_link(namespace, &LinkKind::Digest(response.digest.clone()), false)
+                .await
+                .unwrap();
+            assert_eq!(
+                digest_link.media_type,
+                Some(media_type.clone()),
+                "Digest link should have media_type stored"
+            );
+
+            let tag_link = registry
+                .metadata_store
+                .read_link(namespace, &LinkKind::Tag("latest".to_string()), false)
+                .await
+                .unwrap();
+            assert_eq!(
+                tag_link.media_type,
+                Some(media_type.clone()),
+                "Tag link should have media_type stored"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_head_local_manifest_uses_metadata_media_type() {
+        for test_case in backends() {
+            let registry = test_case.registry();
+            let namespace = &Namespace::new("test-repo/head-optimized").unwrap();
+            let (content, media_type) = create_test_manifest();
+
+            let response = registry
+                .put_manifest(
+                    namespace,
+                    &Reference::Tag("v1.0".to_string()),
+                    Some(&media_type),
+                    &content,
+                )
+                .await
+                .unwrap();
+
+            let head = registry
+                .head_manifest(
+                    registry.get_repository_for_namespace(namespace).unwrap(),
+                    slice::from_ref(&media_type),
+                    namespace,
+                    Reference::Tag("v1.0".to_string()),
+                    false,
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(head.media_type, Some(media_type.clone()));
+            assert_eq!(head.digest, response.digest);
+            assert_eq!(head.size, content.len());
+
+            let head = registry
+                .head_manifest(
+                    registry.get_repository_for_namespace(namespace).unwrap(),
+                    slice::from_ref(&media_type),
+                    namespace,
+                    Reference::Digest(response.digest.clone()),
+                    false,
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(head.media_type, Some(media_type.clone()));
+            assert_eq!(head.digest, response.digest);
+            assert_eq!(head.size, content.len());
+        }
+    }
+
+    #[tokio::test]
+    async fn test_put_manifest_without_content_type_stores_manifest_media_type() {
+        for test_case in backends() {
+            let registry = test_case.registry();
+            let namespace = &Namespace::new("test-repo/no-content-type").unwrap();
+            let (content, _media_type) = create_test_manifest();
+
+            let response = registry
+                .put_manifest(
+                    namespace,
+                    &Reference::Tag("latest".to_string()),
+                    None,
+                    &content,
+                )
+                .await
+                .unwrap();
+
+            let digest_link = registry
+                .metadata_store
+                .read_link(namespace, &LinkKind::Digest(response.digest.clone()), false)
+                .await
+                .unwrap();
+
+            assert_eq!(
+                digest_link.media_type,
+                Some("application/vnd.docker.distribution.manifest.v2+json".to_string()),
+                "Digest link should have media_type from manifest body"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_handle_get_manifest_redirect_includes_content_type() {
+        for test_case in backends() {
+            let registry = test_case.registry();
+            let namespace = &Namespace::new("test-repo/redirect-ct").unwrap();
+            let (content, media_type) = create_test_manifest();
+
+            registry
+                .put_manifest(
+                    namespace,
+                    &Reference::Tag("latest".to_string()),
+                    Some(&media_type),
+                    &content,
+                )
+                .await
+                .unwrap();
+
+            let response = registry
+                .handle_get_manifest(
+                    namespace,
+                    Reference::Tag("latest".to_string()),
+                    slice::from_ref(&media_type),
+                    false,
+                )
+                .await
+                .unwrap();
+
+            if response.status() == StatusCode::TEMPORARY_REDIRECT {
+                assert!(
+                    response.headers().contains_key(LOCATION),
+                    "Redirect response should have Location header"
+                );
+                assert_eq!(
+                    response
+                        .headers()
+                        .get(CONTENT_TYPE)
+                        .map(|v| v.to_str().unwrap()),
+                    Some(media_type.as_str()),
+                    "Redirect response should include Content-Type from stored media_type"
+                );
+                assert!(
+                    response.headers().contains_key(DOCKER_CONTENT_DIGEST),
+                    "Redirect response should have Docker-Content-Digest header"
+                );
+            } else {
+                assert_eq!(response.status(), StatusCode::OK);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_handle_get_manifest_redirect_fallback_without_media_type() {
+        for test_case in backends() {
+            let registry = test_case.registry();
+            let namespace = &Namespace::new("test-repo/redirect-fallback").unwrap();
+            let (content, media_type) = create_test_manifest();
+
+            let digest = registry.blob_store.create_blob(&content).await.unwrap();
+
+            let mut tx = registry.metadata_store.begin_transaction(namespace);
+            tx.create_link(&LinkKind::Digest(digest.clone()), &digest);
+            tx.create_link(&LinkKind::Tag("latest".to_string()), &digest);
+            tx.commit().await.unwrap();
+
+            let response = registry
+                .handle_get_manifest(
+                    namespace,
+                    Reference::Tag("latest".to_string()),
+                    slice::from_ref(&media_type),
+                    false,
+                )
+                .await
+                .unwrap();
+
+            if response.status() == StatusCode::TEMPORARY_REDIRECT {
+                assert!(
+                    response.headers().contains_key(LOCATION),
+                    "Redirect should have Location header"
+                );
+                assert_eq!(
+                    response
+                        .headers()
+                        .get(CONTENT_TYPE)
+                        .map(|v| v.to_str().unwrap()),
+                    Some(media_type.as_str()),
+                    "Redirect should still include Content-Type via fallback"
+                );
+            } else {
+                assert_eq!(response.status(), StatusCode::OK);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_handle_get_manifest_no_redirect_returns_body() {
+        for test_case in backends() {
+            let registry = test_case.registry();
+            let namespace = &Namespace::new("test-repo/no-redirect").unwrap();
+            let (content, media_type) = create_test_manifest();
+
+            registry
+                .put_manifest(
+                    namespace,
+                    &Reference::Tag("latest".to_string()),
+                    Some(&media_type),
+                    &content,
+                )
+                .await
+                .unwrap();
+
+            let response = registry
+                .handle_get_manifest(
+                    namespace,
+                    Reference::Tag("latest".to_string()),
+                    slice::from_ref(&media_type),
+                    false,
+                )
+                .await
+                .unwrap();
+
+            if response.status() == StatusCode::OK {
+                assert_eq!(
+                    response
+                        .headers()
+                        .get(CONTENT_TYPE)
+                        .map(|v| v.to_str().unwrap()),
+                    Some(media_type.as_str()),
+                    "GET response should include Content-Type header"
+                );
+                assert!(
+                    response.headers().contains_key(DOCKER_CONTENT_DIGEST),
+                    "GET response should include Docker-Content-Digest header"
+                );
+            }
         }
     }
 }

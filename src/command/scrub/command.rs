@@ -7,8 +7,8 @@ use tracing::{error, info};
 use crate::cache;
 use crate::cache::Cache;
 use crate::command::scrub::check::{
-    BlobChecker, LinkReferencesChecker, ManifestChecker, MultipartChecker, RetentionChecker,
-    TagChecker, UploadChecker,
+    BlobChecker, LinkReferencesChecker, ManifestChecker, MediaTypeChecker, MultipartChecker,
+    RetentionChecker, TagChecker, UploadChecker,
 };
 use crate::command::scrub::error::Error;
 use crate::configuration::Configuration;
@@ -49,6 +49,9 @@ pub struct Options {
     #[argh(switch, short = 'l')]
     /// fix links format inconsistencies
     pub links: bool,
+    #[argh(switch, short = 'M')]
+    /// backfill missing `media_type` on manifest links
+    pub media_types: bool,
 }
 
 pub struct Command {
@@ -60,6 +63,7 @@ pub struct Command {
     blob_checker: Option<BlobChecker>,
     multipart_checker: Option<MultipartChecker>,
     link_references_checker: Option<LinkReferencesChecker>,
+    media_type_checker: Option<MediaTypeChecker>,
 }
 
 fn build_blob_store(config: &blob_store::BlobStorageConfig) -> Result<Arc<dyn BlobStore>, Error> {
@@ -214,6 +218,16 @@ impl Command {
 
         let link_references_checker = if options.links {
             Some(LinkReferencesChecker::new(
+                blob_store.clone(),
+                metadata_store.clone(),
+                options.dry_run,
+            ))
+        } else {
+            None
+        };
+
+        let media_type_checker = if options.media_types {
+            Some(MediaTypeChecker::new(
                 blob_store,
                 metadata_store.clone(),
                 options.dry_run,
@@ -235,6 +249,7 @@ impl Command {
             blob_checker,
             multipart_checker,
             link_references_checker,
+            media_type_checker,
         })
     }
 
@@ -275,6 +290,10 @@ impl Command {
 
                 if let Some(link_references_checker) = &self.link_references_checker {
                     let _ = link_references_checker.check_namespace(&namespace).await;
+                }
+
+                if let Some(media_type_checker) = &self.media_type_checker {
+                    let _ = media_type_checker.check_namespace(&namespace).await;
                 }
             }
 
@@ -383,6 +402,7 @@ mod tests {
             blobs: true,
             retention: true,
             links: false,
+            media_types: false,
         };
 
         let command = Command::new(&options, &config);
@@ -396,6 +416,7 @@ mod tests {
         assert!(cmd.retention_enforcer.is_some());
         assert!(cmd.multipart_checker.is_none());
         assert!(cmd.link_references_checker.is_none());
+        assert!(cmd.media_type_checker.is_none());
     }
 
     #[tokio::test]
@@ -439,6 +460,7 @@ mod tests {
             blobs: false,
             retention: false,
             links: false,
+            media_types: false,
         };
 
         let command = Command::new(&options, &config).unwrap();

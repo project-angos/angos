@@ -39,6 +39,7 @@ pub(crate) enum LinkOperation {
         link: LinkKind,
         target: Digest,
         referrer: Option<Digest>,
+        media_type: Option<String>,
     },
     Delete {
         link: LinkKind,
@@ -58,6 +59,7 @@ impl Transaction {
             link: link.clone(),
             target: target.clone(),
             referrer: None,
+            media_type: None,
         });
     }
 
@@ -71,6 +73,21 @@ impl Transaction {
             link: link.clone(),
             target: target.clone(),
             referrer: Some(referrer.clone()),
+            media_type: None,
+        });
+    }
+
+    pub fn create_link_with_media_type(
+        &mut self,
+        link: &LinkKind,
+        target: &Digest,
+        media_type: &str,
+    ) {
+        self.operations.push(LinkOperation::Create {
+            link: link.clone(),
+            target: target.clone(),
+            referrer: None,
+            media_type: Some(media_type.to_string()),
         });
     }
 
@@ -180,7 +197,7 @@ mod tests {
     use crate::oci::{Descriptor, Digest, Namespace};
     use crate::registry::blob_store::BlobStore;
     use crate::registry::metadata_store::link_kind::LinkKind;
-    use crate::registry::metadata_store::{MetadataStore, MetadataStoreExt};
+    use crate::registry::metadata_store::{LinkMetadata, MetadataStore, MetadataStoreExt};
     use crate::registry::tests::backends;
 
     async fn create_link(
@@ -1871,5 +1888,74 @@ mod tests {
             )
             .await;
         }
+    }
+
+    async fn create_link_with_media_type(
+        m: &Arc<dyn MetadataStore + Send + Sync>,
+        namespace: &str,
+        link: &LinkKind,
+        digest: &Digest,
+        media_type: &str,
+    ) {
+        let mut tx = m.begin_transaction(namespace);
+        tx.create_link_with_media_type(link, digest, media_type);
+        tx.commit().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_link_metadata_media_type() {
+        for test_case in backends() {
+            let b = test_case.blob_store();
+            let m = test_case.metadata_store();
+            let namespace = "media-type-test";
+            let digest = b.create_blob(b"test content").await.unwrap();
+
+            let media_type = "application/vnd.docker.distribution.manifest.v2+json";
+
+            create_link_with_media_type(
+                &m,
+                namespace,
+                &LinkKind::Digest(digest.clone()),
+                &digest,
+                media_type,
+            )
+            .await;
+
+            let link = m
+                .read_link(namespace, &LinkKind::Digest(digest.clone()), false)
+                .await
+                .unwrap();
+            assert_eq!(link.media_type, Some(media_type.to_string()));
+            assert_eq!(link.target, digest);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_link_without_media_type_has_none() {
+        for test_case in backends() {
+            let b = test_case.blob_store();
+            let m = test_case.metadata_store();
+            let namespace = "no-media-type-test";
+            let digest = b.create_blob(b"test content 2").await.unwrap();
+
+            create_link(&m, namespace, &LinkKind::Tag("latest".to_string()), &digest).await;
+
+            let link = m
+                .read_link(namespace, &LinkKind::Tag("latest".to_string()), false)
+                .await
+                .unwrap();
+            assert_eq!(link.media_type, None);
+            assert_eq!(link.target, digest);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_link_metadata_backward_compat_no_media_type() {
+        let json = format!(
+            r#"{{"target":"sha256:{}","created_at":"2024-01-01T00:00:00Z"}}"#,
+            "a".repeat(64)
+        );
+        let metadata = LinkMetadata::from_bytes(json.into_bytes()).unwrap();
+        assert_eq!(metadata.media_type, None);
     }
 }

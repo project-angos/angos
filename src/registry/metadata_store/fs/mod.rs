@@ -337,6 +337,7 @@ impl MetadataStore for Backend {
                         link,
                         target,
                         referrer,
+                        media_type,
                     } => {
                         let old_target = self
                             .read_link_reference(namespace, link)
@@ -345,7 +346,13 @@ impl MetadataStore for Backend {
                             .map(|m| m.target);
                         (
                             op,
-                            Some((link.clone(), target.clone(), old_target, referrer.clone())),
+                            Some((
+                                link.clone(),
+                                target.clone(),
+                                old_target,
+                                referrer.clone(),
+                                media_type.clone(),
+                            )),
                             None,
                         )
                     }
@@ -358,17 +365,23 @@ impl MetadataStore for Backend {
             .await;
 
             let mut lock_keys: Vec<String> = Vec::new();
-            let mut creates: Vec<(LinkKind, Digest, Option<Digest>, Option<Digest>)> = Vec::new();
+            let mut creates: Vec<(
+                LinkKind,
+                Digest,
+                Option<Digest>,
+                Option<Digest>,
+                Option<String>,
+            )> = Vec::new();
             let mut deletes: Vec<(LinkKind, Digest, Option<Digest>)> = Vec::new();
 
             for (_, create_data, delete_data) in prelock_results {
-                if let Some((link, target, old_target, referrer)) = create_data {
+                if let Some((link, target, old_target, referrer, media_type)) = create_data {
                     lock_keys.push(link.to_string());
                     lock_keys.push(format!("blob:{target}"));
                     if let Some(ref old) = old_target {
                         lock_keys.push(format!("blob:{old}"));
                     }
-                    creates.push((link, target, old_target, referrer));
+                    creates.push((link, target, old_target, referrer, media_type));
                 } else if let Some((link, Some(meta), referrer)) = delete_data {
                     lock_keys.push(link.to_string());
                     lock_keys.push(format!("blob:{}", meta.target));
@@ -384,13 +397,14 @@ impl MetadataStore for Backend {
             lock_keys.dedup();
             let _guard = self.lock.acquire(&lock_keys).await?;
 
-            let validation_results =
-                join_all(creates.iter().map(|(link, _, expected_old, _)| async move {
+            let validation_results = join_all(creates.iter().map(
+                |(link, _, expected_old, _, _)| async move {
                     let current = self.read_link_reference(namespace, link).await.ok();
                     let current_target = current.as_ref().map(|m| m.target.clone());
                     (link.clone(), current, current_target, expected_old.clone())
-                }))
-                .await;
+                },
+            ))
+            .await;
 
             if validation_results
                 .iter()
@@ -436,13 +450,14 @@ impl MetadataStore for Backend {
             // Tracked creates: sequential (read-modify-write with blob index)
             // Non-tracked creates: accumulate blob index ops, then parallel link writes
             let mut non_tracked_create_writes: Vec<(LinkKind, LinkMetadata)> = Vec::new();
-            for (link, target, old_target, referrer) in &creates {
+            for (link, target, old_target, referrer, media_type) in &creates {
                 let is_tracked = is_tracked_link(link);
 
                 if is_tracked && referrer.is_some() {
-                    let mut metadata = link_cache
-                        .remove(link)
-                        .unwrap_or_else(|| LinkMetadata::from_digest(target.clone()));
+                    let mut metadata = link_cache.remove(link).unwrap_or_else(|| {
+                        LinkMetadata::from_digest(target.clone())
+                            .with_media_type(media_type.clone())
+                    });
 
                     if let Some(manifest_digest) = referrer {
                         metadata.add_referrer(manifest_digest.clone());
@@ -471,8 +486,11 @@ impl MetadataStore for Backend {
                             .push(BlobIndexOperation::Remove(link.clone()));
                     }
 
-                    non_tracked_create_writes
-                        .push((link.clone(), LinkMetadata::from_digest(target.clone())));
+                    non_tracked_create_writes.push((
+                        link.clone(),
+                        LinkMetadata::from_digest(target.clone())
+                            .with_media_type(media_type.clone()),
+                    ));
                 }
             }
             join_all(
