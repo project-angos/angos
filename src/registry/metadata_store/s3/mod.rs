@@ -302,10 +302,14 @@ impl MetadataStore for Backend {
                             self.read_link_reference(namespace, &referrer_link).await
                             && let Some(desc) = metadata.descriptor
                         {
-                            return match artifact_type {
-                                Some(at) if desc.artifact_type.as_ref() != Some(at) => None,
-                                _ => Some(desc),
-                            };
+                            match artifact_type {
+                                Some(at) if desc.artifact_type.as_ref() == Some(at) => {
+                                    return Some(desc);
+                                }
+                                None => return Some(desc),
+                                Some(_) if desc.artifact_type.is_none() => {}
+                                Some(_) => return None,
+                            }
                         }
 
                         let blob_path = path_builder::blob_path(&manifest_digest);

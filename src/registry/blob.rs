@@ -12,7 +12,7 @@ use crate::oci::{Digest, Namespace};
 use crate::registry::blob_store::{BlobStore, BoxedReader};
 use crate::registry::metadata_store::MetadataStoreExt;
 use crate::registry::metadata_store::link_kind::LinkKind;
-use crate::registry::{Error, Registry, Repository, blob_store, task_queue};
+use crate::registry::{Error, Registry, Repository, task_queue};
 
 pub const DOCKER_CONTENT_DIGEST: &str = "Docker-Content-Digest";
 
@@ -20,7 +20,6 @@ pub enum GetBlobResponse<R>
 where
     R: AsyncRead + Send + Unpin,
 {
-    Empty,
     Reader(R, u64),
     RangedReader(R, (u64, u64), u64),
 }
@@ -146,11 +145,7 @@ impl Registry {
     ) -> Result<GetBlobResponse<BoxedReader>, Error> {
         let start = range.map(|(start, _)| start);
 
-        let (reader, total_length) = match self.blob_store.build_blob_reader(digest, start).await {
-            Ok(result) => result,
-            Err(blob_store::Error::BlobNotFound) => return Ok(GetBlobResponse::Empty),
-            Err(err) => Err(err)?,
-        };
+        let (reader, total_length) = self.blob_store.build_blob_reader(digest, start).await?;
 
         if let Some((start, _)) = range
             && start > total_length
@@ -271,11 +266,6 @@ impl Registry {
                 .header(ACCEPT_RANGES, "bytes")
                 .header(CONTENT_LENGTH, total_length)
                 .body(ResponseBody::streaming(stream))?,
-            GetBlobResponse::Empty => Response::builder()
-                .status(StatusCode::OK)
-                .header(ACCEPT_RANGES, "bytes")
-                .header(CONTENT_LENGTH, 0)
-                .body(ResponseBody::empty())?,
         };
 
         Ok(res)
@@ -335,7 +325,7 @@ mod tests {
                     reader.read_to_end(&mut buf).await.unwrap();
                     assert_eq!(buf, content);
                 }
-                _ => panic!("Expected Reader response"),
+                GetBlobResponse::RangedReader(..) => panic!("Expected Reader response"),
             }
         }
     }
@@ -364,7 +354,7 @@ mod tests {
                     reader.read_to_end(&mut buf).await.unwrap();
                     assert_eq!(buf, &content[5..=10]);
                 }
-                _ => panic!("Expected RangedReader response"),
+                GetBlobResponse::Reader(..) => panic!("Expected RangedReader response"),
             }
         }
     }
@@ -619,7 +609,9 @@ mod tests {
                     reader.read_to_end(&mut buf).await.unwrap();
                     assert_eq!(buf, content);
                 }
-                _ => panic!("Expected Reader response for full read"),
+                GetBlobResponse::RangedReader(..) => {
+                    panic!("Expected Reader response for full read")
+                }
             }
 
             // Ranged read: verify RangedReader returns correct total_length
@@ -634,7 +626,9 @@ mod tests {
                     reader.read_to_end(&mut buf).await.unwrap();
                     assert_eq!(buf, &content[5..=15]);
                 }
-                _ => panic!("Expected RangedReader response for ranged read"),
+                GetBlobResponse::Reader(..) => {
+                    panic!("Expected RangedReader response for ranged read")
+                }
             }
         }
     }
@@ -665,7 +659,7 @@ mod tests {
                 GetBlobResponse::Reader(_, total_length) => {
                     assert_eq!(total_length, head_response.size);
                 }
-                _ => panic!("Expected Reader response"),
+                GetBlobResponse::RangedReader(..) => panic!("Expected Reader response"),
             }
         }
     }
