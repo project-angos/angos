@@ -38,7 +38,9 @@ pub trait BlobStore: Send + Sync {
         uuid: &str,
         stream: Box<dyn AsyncRead + Unpin + Send + Sync>,
         append: bool,
-    ) -> Result<(), Error>;
+    ) -> Result<(Digest, u64), Error>;
+
+    async fn get_upload_size(&self, namespace: &str, uuid: &str) -> Result<u64, Error>;
 
     async fn read_upload_summary(
         &self,

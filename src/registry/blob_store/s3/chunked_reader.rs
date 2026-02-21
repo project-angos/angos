@@ -1,5 +1,6 @@
 use tokio::io::{AsyncRead, AsyncReadExt, Take};
 
+use crate::oci::Digest;
 use crate::registry::blob_store::hashing_reader::HashingReader;
 
 /// Splits an `AsyncRead` into fixed-size chunks (last may be smaller).
@@ -33,5 +34,9 @@ impl<R: AsyncRead + Unpin> ChunkedReader<R> {
 impl<R: AsyncRead + Unpin> ChunkedReader<HashingReader<R>> {
     pub fn serialized_state(&self) -> Vec<u8> {
         self.inner.serialized_state()
+    }
+
+    pub fn digest(&self) -> Digest {
+        self.inner.digest()
     }
 }

@@ -181,7 +181,7 @@ impl BlobStore for Backend {
         uuid: &str,
         stream: Box<dyn AsyncRead + Unpin + Send + Sync>,
         append: bool,
-    ) -> Result<(), Error> {
+    ) -> Result<(Digest, u64), Error> {
         let upload_path = path_builder::upload_path(name, uuid);
 
         let upload_id = if append {
@@ -210,6 +210,7 @@ impl BlobStore for Backend {
         let reader = HashingReader::with_hasher(reader, hasher);
         let mut reader = ChunkedReader::new(reader, self.multipart_part_size as u64);
 
+        let mut total_size = uploaded_size;
         while let Some(mut chunk_reader) = reader.next_chunk() {
             let mut chunk = Vec::with_capacity(self.multipart_part_size);
             chunk_reader.read_to_end(&mut chunk).await?;
@@ -221,11 +222,13 @@ impl BlobStore for Backend {
                 reader.mark_finished();
                 self.store_staged_chunk(name, uuid, chunk, uploaded_size)
                     .await?;
+                total_size = uploaded_size + chunk_len;
             } else {
                 self.store
                     .upload_part(&upload_path, &upload_id, uploaded_parts, chunk)
                     .await?;
                 uploaded_parts += 1;
+                total_size = uploaded_size + chunk_len;
             }
 
             self.save_hasher(
@@ -241,7 +244,28 @@ impl BlobStore for Backend {
             }
         }
 
-        Ok(())
+        let digest = reader.digest();
+        Ok((digest, total_size))
+    }
+
+    #[instrument(skip(self))]
+    async fn get_upload_size(&self, name: &str, uuid: &str) -> Result<u64, Error> {
+        let key = path_builder::upload_path(name, uuid);
+
+        let mut size = 0u64;
+        if let Some(upload_id) = self.store.search_multipart_upload_id(&key).await? {
+            #[allow(clippy::cast_sign_loss)]
+            for (_, _, part_size) in self.store.list_parts(&key, &upload_id).await? {
+                size += part_size as u64;
+            }
+        }
+
+        let staged_path = path_builder::upload_staged_container_path(name, uuid, size);
+        if let Ok(staged_size) = self.store.object_size(&staged_path).await {
+            size += staged_size;
+        }
+
+        Ok(size)
     }
 
     #[instrument(skip(self))]
