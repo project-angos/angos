@@ -281,7 +281,7 @@ impl MetadataStore for Backend {
                 .list_objects(&referrers_dir, 100, continuation_token)
                 .await?;
 
-            let digest_entries: Vec<(Digest, String)> = objects
+            let digest_entries: Vec<(Digest, LinkKind)> = objects
                 .iter()
                 .filter_map(|key| {
                     let parts: Vec<&str> = key.split('/').collect();
@@ -289,17 +289,27 @@ impl MetadataStore for Backend {
                         return None;
                     }
                     let manifest_digest = Digest::Sha256(parts[1].into());
-                    let blob_path = path_builder::blob_path(&manifest_digest);
-                    Some((manifest_digest, blob_path))
+                    let referrer_link = LinkKind::Referrer(digest.clone(), manifest_digest.clone());
+                    Some((manifest_digest, referrer_link))
                 })
                 .collect();
 
             let results: Vec<Option<Descriptor>> = stream::iter(digest_entries)
-                .map(|(manifest_digest, blob_path)| {
-                    let store = &self.store;
+                .map(|(manifest_digest, referrer_link)| {
                     let artifact_type = artifact_type.as_ref();
                     async move {
-                        match store.read(&blob_path).await {
+                        if let Ok(metadata) =
+                            self.read_link_reference(namespace, &referrer_link).await
+                            && let Some(desc) = metadata.descriptor
+                        {
+                            return match artifact_type {
+                                Some(at) if desc.artifact_type.as_ref() != Some(at) => None,
+                                _ => Some(desc),
+                            };
+                        }
+
+                        let blob_path = path_builder::blob_path(&manifest_digest);
+                        match self.store.read(&blob_path).await {
                             Ok(data) => {
                                 let manifest_len = data.len();
                                 match Manifest::from_slice(&data) {
@@ -510,6 +520,7 @@ impl MetadataStore for Backend {
                         target,
                         referrer,
                         media_type,
+                        descriptor,
                     } => {
                         let old_target = self
                             .read_link_reference(namespace, link)
@@ -524,6 +535,7 @@ impl MetadataStore for Backend {
                                 old_target,
                                 referrer.clone(),
                                 media_type.clone(),
+                                descriptor.as_ref().clone(),
                             )),
                             None,
                         )
@@ -543,17 +555,20 @@ impl MetadataStore for Backend {
                 Option<Digest>,
                 Option<Digest>,
                 Option<String>,
+                Option<Descriptor>,
             )> = Vec::new();
             let mut deletes: Vec<(LinkKind, Digest, Option<Digest>)> = Vec::new();
 
             for (_, create_data, delete_data) in prelock_results {
-                if let Some((link, target, old_target, referrer, media_type)) = create_data {
+                if let Some((link, target, old_target, referrer, media_type, descriptor)) =
+                    create_data
+                {
                     lock_keys.push(link.to_string());
                     lock_keys.push(format!("blob:{target}"));
                     if let Some(ref old) = old_target {
                         lock_keys.push(format!("blob:{old}"));
                     }
-                    creates.push((link, target, old_target, referrer, media_type));
+                    creates.push((link, target, old_target, referrer, media_type, descriptor));
                 } else if let Some((link, Some(meta), referrer)) = delete_data {
                     lock_keys.push(link.to_string());
                     lock_keys.push(format!("blob:{}", meta.target));
@@ -570,7 +585,7 @@ impl MetadataStore for Backend {
             let _guard = self.lock.acquire(&lock_keys).await?;
 
             let validation_results = join_all(creates.iter().map(
-                |(link, _, expected_old, _, _)| async move {
+                |(link, _, expected_old, _, _, _)| async move {
                     let current = self.read_link_reference(namespace, link).await.ok();
                     let current_target = current.as_ref().map(|m| m.target.clone());
                     (link.clone(), current, current_target, expected_old.clone())
@@ -621,7 +636,7 @@ impl MetadataStore for Backend {
 
             let mut tracked_create_writes: Vec<(LinkKind, LinkMetadata)> = Vec::new();
             let mut non_tracked_create_writes: Vec<(LinkKind, LinkMetadata)> = Vec::new();
-            for (link, target, old_target, referrer, media_type) in &creates {
+            for (link, target, old_target, referrer, media_type, descriptor) in &creates {
                 let is_tracked = is_tracked_link(link);
 
                 if is_tracked && referrer.is_some() {
@@ -659,7 +674,8 @@ impl MetadataStore for Backend {
                     non_tracked_create_writes.push((
                         link.clone(),
                         LinkMetadata::from_digest(target.clone())
-                            .with_media_type(media_type.clone()),
+                            .with_media_type(media_type.clone())
+                            .with_descriptor((*descriptor).clone()),
                     ));
                 }
             }
@@ -912,6 +928,7 @@ mod tests {
             target: digest.clone(),
             referrer: None,
             media_type: None,
+            descriptor: Box::new(None),
         }];
         backend.update_links(namespace, &ops).await.unwrap();
 
@@ -945,6 +962,7 @@ mod tests {
             target: digest.clone(),
             referrer: None,
             media_type: None,
+            descriptor: Box::new(None),
         }];
         backend.update_links(namespace, &ops).await.unwrap();
 
@@ -981,6 +999,7 @@ mod tests {
             target: digest_a.clone(),
             referrer: None,
             media_type: None,
+            descriptor: Box::new(None),
         }];
         backend.update_links(namespace, &ops).await.unwrap();
 
@@ -1024,6 +1043,7 @@ mod tests {
             target: digest_a.clone(),
             referrer: None,
             media_type: None,
+            descriptor: Box::new(None),
         }];
         backend.update_links(namespace, &ops).await.unwrap();
 
@@ -1037,6 +1057,7 @@ mod tests {
             target: digest_b.clone(),
             referrer: None,
             media_type: None,
+            descriptor: Box::new(None),
         }];
         backend.update_links(namespace, &ops).await.unwrap();
 
@@ -1066,6 +1087,7 @@ mod tests {
             target: digest.clone(),
             referrer: None,
             media_type: None,
+            descriptor: Box::new(None),
         }];
         backend.update_links(namespace, &ops).await.unwrap();
 
@@ -1095,6 +1117,7 @@ mod tests {
             target: digest.clone(),
             referrer: None,
             media_type: None,
+            descriptor: Box::new(None),
         }];
         backend.update_links(namespace, &ops).await.unwrap();
 
@@ -1134,6 +1157,7 @@ mod tests {
             target: digest.clone(),
             referrer: None,
             media_type: None,
+            descriptor: Box::new(None),
         }];
         backend.update_links(namespace, &ops).await.unwrap();
 
@@ -1172,6 +1196,7 @@ mod tests {
             target: digest.clone(),
             referrer: None,
             media_type: None,
+            descriptor: Box::new(None),
         }];
         backend.update_links(namespace, &ops).await.unwrap();
 
@@ -1213,6 +1238,7 @@ mod tests {
             target: digest_a.clone(),
             referrer: None,
             media_type: None,
+            descriptor: Box::new(None),
         }];
         backend.update_links(namespace_a, &ops_a).await.unwrap();
 
@@ -1221,6 +1247,7 @@ mod tests {
             target: digest_b.clone(),
             referrer: None,
             media_type: None,
+            descriptor: Box::new(None),
         }];
         backend.update_links(namespace_b, &ops_b).await.unwrap();
 
@@ -1254,6 +1281,7 @@ mod tests {
             target: digest.clone(),
             referrer: None,
             media_type: None,
+            descriptor: Box::new(None),
         }];
         backend.update_links(namespace, &ops).await.unwrap();
 
@@ -1285,6 +1313,7 @@ mod tests {
             target: digest.clone(),
             referrer: None,
             media_type: None,
+            descriptor: Box::new(None),
         }];
         backend.update_links(namespace, &ops).await.unwrap();
 
@@ -1318,6 +1347,7 @@ mod tests {
             target: digest.clone(),
             referrer: None,
             media_type: None,
+            descriptor: Box::new(None),
         }];
         backend.update_links(namespace, &ops).await.unwrap();
 
@@ -1368,12 +1398,14 @@ mod tests {
                 target: digest1.clone(),
                 referrer: None,
                 media_type: None,
+                descriptor: Box::new(None),
             },
             LinkOperation::Create {
                 link: tag2.clone(),
                 target: digest2.clone(),
                 referrer: None,
                 media_type: None,
+                descriptor: Box::new(None),
             },
         ];
         backend.update_links(namespace, &ops).await.unwrap();
@@ -1414,6 +1446,7 @@ mod tests {
             target: digest.clone(),
             referrer: None,
             media_type: None,
+            descriptor: Box::new(None),
         }];
         backend.update_links(namespace, &ops).await.unwrap();
 
@@ -1447,6 +1480,7 @@ mod tests {
             target: digest.clone(),
             referrer: None,
             media_type: None,
+            descriptor: Box::new(None),
         }];
         backend.update_links(namespace, &ops).await.unwrap();
 
@@ -1477,6 +1511,7 @@ mod tests {
             target: digest.clone(),
             referrer: None,
             media_type: None,
+            descriptor: Box::new(None),
         }];
         backend.update_links(namespace, &ops).await.unwrap();
 
@@ -1522,6 +1557,7 @@ mod tests {
                 target: digest,
                 referrer: None,
                 media_type: None,
+                descriptor: Box::new(None),
             }];
             backend.update_links(namespace, &ops).await.unwrap();
             tags.push(tag);
@@ -1581,12 +1617,14 @@ mod tests {
                 target: digest1,
                 referrer: None,
                 media_type: None,
+                descriptor: Box::new(None),
             },
             LinkOperation::Create {
                 link: tag2.clone(),
                 target: digest2,
                 referrer: None,
                 media_type: None,
+                descriptor: Box::new(None),
             },
         ];
         backend.update_links(namespace, &ops).await.unwrap();
@@ -1643,6 +1681,7 @@ mod tests {
                 target: digest.clone(),
                 referrer: None,
                 media_type: None,
+                descriptor: Box::new(None),
             })
             .collect();
 
@@ -1693,6 +1732,7 @@ mod tests {
                 target: d.clone(),
                 referrer: Some(referrer_digest.clone()),
                 media_type: None,
+                descriptor: Box::new(None),
             })
             .collect();
 
@@ -1701,6 +1741,7 @@ mod tests {
             target: config_digest.clone(),
             referrer: Some(referrer_digest.clone()),
             media_type: None,
+            descriptor: Box::new(None),
         });
 
         backend.update_links(namespace, &ops).await.unwrap();
@@ -1755,6 +1796,7 @@ mod tests {
                 target: d.clone(),
                 referrer: Some(referrer_digest.clone()),
                 media_type: None,
+                descriptor: Box::new(None),
             })
             .collect();
         backend.update_links(namespace, &create_ops).await.unwrap();
@@ -1820,12 +1862,14 @@ mod tests {
                 target: digest_keep.clone(),
                 referrer: None,
                 media_type: None,
+                descriptor: Box::new(None),
             },
             LinkOperation::Create {
                 link: LinkKind::Tag("remove-tag".into()),
                 target: digest_remove.clone(),
                 referrer: None,
                 media_type: None,
+                descriptor: Box::new(None),
             },
         ];
         backend.update_links(namespace, &setup_ops).await.unwrap();
@@ -1841,6 +1885,7 @@ mod tests {
                 target: digest_add.clone(),
                 referrer: None,
                 media_type: None,
+                descriptor: Box::new(None),
             },
         ];
         backend.update_links(namespace, &mixed_ops).await.unwrap();
@@ -1905,6 +1950,7 @@ mod tests {
             target: digest.clone(),
             referrer: None,
             media_type: None,
+            descriptor: Box::new(None),
         }];
         backend.update_links(namespace, &ops).await.unwrap();
 

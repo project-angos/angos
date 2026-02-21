@@ -40,6 +40,7 @@ pub(crate) enum LinkOperation {
         target: Digest,
         referrer: Option<Digest>,
         media_type: Option<String>,
+        descriptor: Box<Option<Descriptor>>,
     },
     Delete {
         link: LinkKind,
@@ -60,6 +61,7 @@ impl Transaction {
             target: target.clone(),
             referrer: None,
             media_type: None,
+            descriptor: Box::new(None),
         });
     }
 
@@ -74,6 +76,7 @@ impl Transaction {
             target: target.clone(),
             referrer: Some(referrer.clone()),
             media_type: None,
+            descriptor: Box::new(None),
         });
     }
 
@@ -88,6 +91,22 @@ impl Transaction {
             target: target.clone(),
             referrer: None,
             media_type: Some(media_type.to_string()),
+            descriptor: Box::new(None),
+        });
+    }
+
+    pub fn create_link_with_descriptor(
+        &mut self,
+        link: &LinkKind,
+        target: &Digest,
+        descriptor: Descriptor,
+    ) {
+        self.operations.push(LinkOperation::Create {
+            link: link.clone(),
+            target: target.clone(),
+            referrer: None,
+            media_type: None,
+            descriptor: Box::new(Some(descriptor)),
         });
     }
 
@@ -1946,6 +1965,87 @@ mod tests {
                 .unwrap();
             assert_eq!(link.media_type, None);
             assert_eq!(link.target, digest);
+        }
+    }
+
+    pub async fn test_datastore_list_referrers_with_stored_descriptor(
+        b: Arc<dyn BlobStore>,
+        m: Arc<dyn MetadataStore + Send + Sync>,
+    ) {
+        let namespace = &Namespace::new("test-stored-descriptor").unwrap();
+
+        // Create a base manifest blob that the referrers will reference
+        let base_digest = b.create_blob(b"base manifest content").await.unwrap();
+        let base_link = LinkKind::Digest(base_digest.clone());
+        create_link(&m, namespace, &base_link, &base_digest).await;
+
+        // Build a Descriptor for the referrer WITHOUT creating the referrer blob.
+        // If the optimization works, list_referrers should return this descriptor
+        // directly from the stored metadata, without needing the blob in the blob store.
+        let referrer_digest: Digest =
+            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                .parse()
+                .unwrap();
+
+        let descriptor = Descriptor {
+            media_type: "application/vnd.oci.image.manifest.v1+json".to_string(),
+            digest: referrer_digest.clone(),
+            size: 1234,
+            annotations: HashMap::new(),
+            artifact_type: Some("application/vnd.example.test-artifact".to_string()),
+            platform: None,
+        };
+
+        // Create the referrer link with a stored descriptor (method does not exist yet)
+        let referrer_link = LinkKind::Referrer(base_digest.clone(), referrer_digest.clone());
+        let mut tx = m.begin_transaction(namespace);
+        tx.create_link_with_descriptor(&referrer_link, &referrer_digest, descriptor.clone());
+        tx.commit().await.unwrap();
+
+        // list_referrers should return the stored descriptor without reading a blob
+        let referrers = m
+            .list_referrers(namespace, &base_digest, None)
+            .await
+            .unwrap();
+
+        assert_eq!(referrers.len(), 1, "Expected 1 referrer descriptor");
+        assert_eq!(referrers[0], descriptor);
+
+        // Test artifact_type filtering with matching type
+        let filtered = m
+            .list_referrers(
+                namespace,
+                &base_digest,
+                Some("application/vnd.example.test-artifact".to_string()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(filtered.len(), 1, "Should match artifact type filter");
+        assert_eq!(filtered[0], descriptor);
+
+        // Test artifact_type filtering with non-matching type
+        let non_matching = m
+            .list_referrers(
+                namespace,
+                &base_digest,
+                Some("application/vnd.non-existent".to_string()),
+            )
+            .await
+            .unwrap();
+        assert!(
+            non_matching.is_empty(),
+            "Should return empty for non-matching artifact type"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_list_referrers_with_stored_descriptor() {
+        for test_case in backends() {
+            test_datastore_list_referrers_with_stored_descriptor(
+                test_case.blob_store(),
+                test_case.metadata_store(),
+            )
+            .await;
         }
     }
 

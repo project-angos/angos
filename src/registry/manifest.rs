@@ -316,10 +316,14 @@ impl Registry {
         }
 
         if let Some(subject) = &manifest.subject {
-            tx.create_link(
-                &LinkKind::Referrer(subject.digest.clone(), digest.clone()),
-                &digest,
-            );
+            let referrer_link = LinkKind::Referrer(subject.digest.clone(), digest.clone());
+            if let Some(descriptor) =
+                manifest.to_descriptor(None, digest.clone(), body.len() as u64)
+            {
+                tx.create_link_with_descriptor(&referrer_link, &digest, descriptor);
+            } else {
+                tx.create_link(&referrer_link, &digest);
+            }
         }
 
         if let Some(config) = manifest.config {
