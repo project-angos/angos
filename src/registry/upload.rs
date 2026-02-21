@@ -1,7 +1,7 @@
 use hyper::header::{CONTENT_LENGTH, LOCATION, RANGE};
 use hyper::{Response, StatusCode};
 use tokio::io::AsyncRead;
-use tracing::{error, instrument, warn};
+use tracing::{instrument, warn};
 use uuid::Uuid;
 
 use crate::command::server::response_body::ResponseBody;
@@ -51,9 +51,9 @@ impl Registry {
     {
         let session_id = session_id.to_string();
         if let Some(start_offset) = start_offset {
-            let (_, size, _) = self
+            let size = self
                 .blob_store
-                .read_upload_summary(namespace, &session_id)
+                .get_upload_size(namespace, &session_id)
                 .await?;
 
             if start_offset != size {
@@ -61,18 +61,10 @@ impl Registry {
             }
         }
 
-        self.blob_store
+        let (_, size) = self
+            .blob_store
             .write_upload(namespace, &session_id, Box::new(stream), true)
             .await?;
-
-        let (_, size, _) = self
-            .blob_store
-            .read_upload_summary(namespace, &session_id)
-            .await
-            .map_err(|error| {
-                error!("Error reading uploaded file: {error}");
-                error
-            })?;
 
         if size < 1 {
             return Ok(0);
@@ -96,21 +88,17 @@ impl Registry {
 
         let append = match self
             .blob_store
-            .read_upload_summary(namespace, &session_id)
+            .get_upload_size(namespace, &session_id)
             .await
         {
-            Ok((_, size, _)) => size > 0,
+            Ok(size) => size > 0,
             Err(blob_store::Error::UploadNotFound) => false,
             Err(e) => return Err(e.into()),
         };
 
-        self.blob_store
-            .write_upload(namespace, &session_id, Box::new(stream), append)
-            .await?;
-
-        let (upload_digest, _, _) = self
+        let (upload_digest, _) = self
             .blob_store
-            .read_upload_summary(namespace, &session_id)
+            .write_upload(namespace, &session_id, Box::new(stream), append)
             .await?;
 
         if &upload_digest != digest {
@@ -629,6 +617,145 @@ mod tests {
                     .await
                     .is_err()
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_patch_upload_offset_validation_still_works() {
+        for test_case in backends() {
+            let registry = test_case.registry();
+            let namespace = &Namespace::new("test-repo").unwrap();
+            let session_id = Uuid::new_v4();
+
+            registry
+                .blob_store
+                .create_upload(namespace, &session_id.to_string())
+                .await
+                .unwrap();
+
+            let stream = Cursor::new(b"some data".to_vec());
+            registry
+                .patch_upload(namespace, session_id, None, stream)
+                .await
+                .unwrap();
+
+            // Provide a wrong start_offset (0 instead of 9) — should fail
+            let stream = Cursor::new(b"more data".to_vec());
+            let result = registry
+                .patch_upload(namespace, session_id, Some(0), stream)
+                .await;
+
+            assert_eq!(result, Err(Error::RangeNotSatisfiable));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_complete_upload_digest_mismatch_still_rejected() {
+        use std::str::FromStr;
+
+        for test_case in backends() {
+            let registry = test_case.registry();
+            let namespace = &Namespace::new("test-repo").unwrap();
+            let session_id = Uuid::new_v4();
+
+            registry
+                .blob_store
+                .create_upload(namespace, &session_id.to_string())
+                .await
+                .unwrap();
+
+            let stream = Cursor::new(b"test content".to_vec());
+            registry
+                .patch_upload(namespace, session_id, None, stream)
+                .await
+                .unwrap();
+
+            // Use a valid but wrong digest
+            let wrong_digest = crate::oci::Digest::from_str(
+                "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+            )
+            .unwrap();
+
+            let empty_stream = Cursor::new(Vec::new());
+            let result = registry
+                .complete_upload(namespace, session_id, &wrong_digest, empty_stream)
+                .await;
+
+            assert_eq!(result, Err(Error::DigestInvalid));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_write_upload_returns_digest_and_size() {
+        for test_case in backends() {
+            let registry = test_case.registry();
+            let namespace = &Namespace::new("test-repo").unwrap();
+            let session_id = Uuid::new_v4();
+            let content = b"hello world upload";
+
+            registry
+                .blob_store
+                .create_upload(namespace, &session_id.to_string())
+                .await
+                .unwrap();
+
+            let stream: Box<dyn tokio::io::AsyncRead + Unpin + Send + Sync> =
+                Box::new(Cursor::new(content.to_vec()));
+            let (digest, size) = registry
+                .blob_store
+                .write_upload(namespace, &session_id.to_string(), stream, false)
+                .await
+                .unwrap();
+
+            assert_eq!(size, content.len() as u64);
+
+            let (expected_digest, expected_size, _) = registry
+                .blob_store
+                .read_upload_summary(namespace, &session_id.to_string())
+                .await
+                .unwrap();
+
+            assert_eq!(digest, expected_digest);
+            assert_eq!(size, expected_size);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_get_upload_size() {
+        for test_case in backends() {
+            let registry = test_case.registry();
+            let namespace = &Namespace::new("test-repo").unwrap();
+            let session_id = Uuid::new_v4();
+            let content = b"size check content";
+
+            registry
+                .blob_store
+                .create_upload(namespace, &session_id.to_string())
+                .await
+                .unwrap();
+
+            // Size should be 0 for a fresh upload
+            let size = registry
+                .blob_store
+                .get_upload_size(namespace, &session_id.to_string())
+                .await
+                .unwrap();
+            assert_eq!(size, 0);
+
+            let stream: Box<dyn tokio::io::AsyncRead + Unpin + Send + Sync> =
+                Box::new(Cursor::new(content.to_vec()));
+            registry
+                .blob_store
+                .write_upload(namespace, &session_id.to_string(), stream, false)
+                .await
+                .unwrap();
+
+            let size = registry
+                .blob_store
+                .get_upload_size(namespace, &session_id.to_string())
+                .await
+                .unwrap();
+            assert_eq!(size, content.len() as u64);
         }
     }
 

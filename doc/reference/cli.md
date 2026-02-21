@@ -83,6 +83,7 @@ The scrub command performs storage maintenance and integrity checks. You must sp
 | `--blobs`                 | `-b`   | Check for blob inconsistencies and corruption                              |
 | `--retention`             | `-r`   | Enforce retention policies                                                 |
 | `--links`                 | `-l`   | Fix links format inconsistencies (migration/repair)                        |
+| `--media-types`           | `-M`   | Backfill missing `media_type` on manifest links                            |
 
 **Examples:**
 

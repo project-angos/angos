@@ -36,6 +36,7 @@ The `scrub` command performs various maintenance operations. Each check must be 
 | `-u, --uploads <duration>`    | Remove incomplete uploads older than duration           |
 | `-p, --multipart <duration>`  | Cleanup orphan S3 multipart uploads older than duration |
 | `-l, --links`                 | Fix links format inconsistencies                        |
+| `-M, --media-types`           | Backfill missing `media_type` on manifest links         |
 | `-d, --dry-run`               | Preview changes without applying them                   |
 
 ---
@@ -284,6 +285,20 @@ S3 multipart uploads that were started but never completed can accumulate and co
 - Have no corresponding upload container in the registry metadata
 
 This is S3-specific and has no effect on filesystem storage backends.
+
+### Backfill Media Types
+
+The `--media-types` flag reads each manifest blob and writes its `media_type` into the link metadata. This enables optimizations that avoid full blob reads on HEAD requests and redirect paths. Run this once after upgrading to populate existing links:
+
+```bash
+# Preview what would be backfilled
+./angos -c config.toml scrub -M -d
+
+# Backfill media types on all manifest links
+./angos -c config.toml scrub -M
+```
+
+This is idempotent and safe to run multiple times.
 
 ### Fix Links Format
 

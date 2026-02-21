@@ -3,7 +3,7 @@ use std::collections::HashSet;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::oci::Digest;
+use crate::oci::{Descriptor, Digest};
 use crate::registry::metadata_store::Error;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -13,6 +13,10 @@ pub struct LinkMetadata {
     pub accessed_at: Option<DateTime<Utc>>,
     #[serde(default, skip_serializing_if = "HashSet::is_empty")]
     pub referenced_by: HashSet<Digest>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub media_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub descriptor: Option<Descriptor>,
 }
 
 impl LinkMetadata {
@@ -22,6 +26,8 @@ impl LinkMetadata {
             created_at: Some(Utc::now()),
             accessed_at: None,
             referenced_by: HashSet::new(),
+            media_type: None,
+            descriptor: None,
         }
     }
 
@@ -53,8 +59,20 @@ impl LinkMetadata {
                 created_at: Some(Utc::now()),
                 accessed_at: None,
                 referenced_by: HashSet::new(),
+                media_type: None,
+                descriptor: None,
             })
         }
+    }
+
+    pub fn with_media_type(mut self, media_type: Option<String>) -> Self {
+        self.media_type = media_type;
+        self
+    }
+
+    pub fn with_descriptor(mut self, descriptor: Option<Descriptor>) -> Self {
+        self.descriptor = descriptor;
+        self
     }
 
     pub fn accessed(mut self) -> Self {

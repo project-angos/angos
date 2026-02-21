@@ -273,7 +273,7 @@ Webhooks are enabled by referencing their names:
 | Option    | Type   | Default   | Description                |
 |-----------|--------|-----------|----------------------------|
 | `enabled` | bool   | `false`   | Enable web interface       |
-| `name`    | string | `"angos"` | Registry name in UI header |
+| `name`    | string | `"Angos"` | Registry name in UI header |
 
 ---
 

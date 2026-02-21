@@ -5,6 +5,7 @@ use std::task::{Context, Poll};
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncRead, ReadBuf};
 
+use crate::oci;
 use crate::registry::blob_store::sha256_ext::Sha256Ext;
 
 pub struct HashingReader<R> {
@@ -19,6 +20,10 @@ impl<R> HashingReader<R> {
 
     pub fn serialized_state(&self) -> Vec<u8> {
         self.hasher.serialized_state()
+    }
+
+    pub fn digest(&self) -> oci::Digest {
+        self.hasher.clone().digest()
     }
 }
 

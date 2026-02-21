@@ -1073,6 +1073,8 @@ pub mod tests {
             link: tag.clone(),
             target: digest.clone(),
             referrer: None,
+            media_type: None,
+            descriptor: Box::new(None),
         }];
         metadata_store.update_links(&namespace, &ops).await.unwrap();
 

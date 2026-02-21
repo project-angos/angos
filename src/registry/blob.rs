@@ -12,7 +12,7 @@ use crate::oci::{Digest, Namespace};
 use crate::registry::blob_store::{BlobStore, BoxedReader};
 use crate::registry::metadata_store::MetadataStoreExt;
 use crate::registry::metadata_store::link_kind::LinkKind;
-use crate::registry::{Error, Registry, Repository, blob_store, task_queue};
+use crate::registry::{Error, Registry, Repository, task_queue};
 
 pub const DOCKER_CONTENT_DIGEST: &str = "Docker-Content-Digest";
 
@@ -20,7 +20,6 @@ pub enum GetBlobResponse<R>
 where
     R: AsyncRead + Send + Unpin,
 {
-    Empty,
     Reader(R, u64),
     RangedReader(R, (u64, u64), u64),
 }
@@ -144,23 +143,16 @@ impl Registry {
         digest: &Digest,
         range: Option<(u64, Option<u64>)>,
     ) -> Result<GetBlobResponse<BoxedReader>, Error> {
-        let total_length = self.blob_store.get_blob_size(digest).await?;
+        let start = range.map(|(start, _)| start);
 
-        let start = if let Some((start, _)) = range {
-            if start > total_length {
-                warn!("Range start does not match content length");
-                return Err(Error::RangeNotSatisfiable);
-            }
-            Some(start)
-        } else {
-            None
-        };
+        let (reader, total_length) = self.blob_store.build_blob_reader(digest, start).await?;
 
-        let reader = match self.blob_store.build_blob_reader(digest, start).await {
-            Ok(reader) => reader,
-            Err(blob_store::Error::BlobNotFound) => return Ok(GetBlobResponse::Empty),
-            Err(err) => Err(err)?,
-        };
+        if let Some((start, _)) = range
+            && start > total_length
+        {
+            warn!("Range start does not match content length");
+            return Err(Error::RangeNotSatisfiable);
+        }
 
         match range {
             Some((0, None)) | None => Ok(GetBlobResponse::Reader(reader, total_length)),
@@ -274,11 +266,6 @@ impl Registry {
                 .header(ACCEPT_RANGES, "bytes")
                 .header(CONTENT_LENGTH, total_length)
                 .body(ResponseBody::streaming(stream))?,
-            GetBlobResponse::Empty => Response::builder()
-                .status(StatusCode::OK)
-                .header(ACCEPT_RANGES, "bytes")
-                .header(CONTENT_LENGTH, 0)
-                .body(ResponseBody::empty())?,
         };
 
         Ok(res)
@@ -338,7 +325,7 @@ mod tests {
                     reader.read_to_end(&mut buf).await.unwrap();
                     assert_eq!(buf, content);
                 }
-                _ => panic!("Expected Reader response"),
+                GetBlobResponse::RangedReader(..) => panic!("Expected Reader response"),
             }
         }
     }
@@ -367,7 +354,7 @@ mod tests {
                     reader.read_to_end(&mut buf).await.unwrap();
                     assert_eq!(buf, &content[5..=10]);
                 }
-                _ => panic!("Expected RangedReader response"),
+                GetBlobResponse::Reader(..) => panic!("Expected RangedReader response"),
             }
         }
     }
@@ -600,6 +587,79 @@ mod tests {
                 let mut buf = Vec::new();
                 reader.read_to_end(&mut buf).await.unwrap();
                 assert_eq!(buf, content);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_get_local_blob_returns_correct_size() {
+        for test_case in backends() {
+            let registry = test_case.registry();
+            let namespace = &Namespace::new("test-repo").unwrap();
+            let content = b"regression test blob content";
+
+            let (digest, _) = create_test_blob(registry, namespace, content).await;
+
+            // Full read: verify Reader variant returns correct total_length
+            let response = registry.get_local_blob(&digest, None).await.unwrap();
+            match response {
+                GetBlobResponse::Reader(mut reader, total_length) => {
+                    assert_eq!(total_length, content.len() as u64);
+                    let mut buf = Vec::new();
+                    reader.read_to_end(&mut buf).await.unwrap();
+                    assert_eq!(buf, content);
+                }
+                GetBlobResponse::RangedReader(..) => {
+                    panic!("Expected Reader response for full read")
+                }
+            }
+
+            // Ranged read: verify RangedReader returns correct total_length
+            let range = Some((5, Some(15)));
+            let response = registry.get_local_blob(&digest, range).await.unwrap();
+            match response {
+                GetBlobResponse::RangedReader(mut reader, (start, end), total_length) => {
+                    assert_eq!(start, 5);
+                    assert_eq!(end, 15);
+                    assert_eq!(total_length, content.len() as u64);
+                    let mut buf = Vec::new();
+                    reader.read_to_end(&mut buf).await.unwrap();
+                    assert_eq!(buf, &content[5..=15]);
+                }
+                GetBlobResponse::Reader(..) => {
+                    panic!("Expected RangedReader response for ranged read")
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_head_blob_independent_of_get() {
+        for test_case in backends() {
+            let registry = test_case.registry();
+            let namespace = &Namespace::new("test-repo").unwrap();
+            let content = b"head blob independence test";
+
+            let (digest, repository) = create_test_blob(registry, namespace, content).await;
+
+            // head_blob should return correct size via get_blob_size
+            let head_response = registry
+                .head_blob(&repository, &[], namespace, &digest)
+                .await
+                .unwrap();
+            assert_eq!(head_response.digest, digest);
+            assert_eq!(head_response.size, content.len() as u64);
+
+            // get_blob should also work and return the same size
+            let get_response = registry
+                .get_blob(&repository, &[], namespace, &digest, None)
+                .await
+                .unwrap();
+            match get_response {
+                GetBlobResponse::Reader(_, total_length) => {
+                    assert_eq!(total_length, head_response.size);
+                }
+                GetBlobResponse::RangedReader(..) => panic!("Expected Reader response"),
             }
         }
     }

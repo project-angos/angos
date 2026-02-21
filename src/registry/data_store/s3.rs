@@ -5,7 +5,7 @@ use aws_sdk_s3::config::retry::RetryConfig;
 use aws_sdk_s3::config::{BehaviorVersion, Credentials, Region, timeout::TimeoutConfig};
 use aws_sdk_s3::operation::get_object::GetObjectOutput;
 use aws_sdk_s3::primitives::ByteStream;
-use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
+use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart, Delete, ObjectIdentifier};
 use aws_sdk_s3::{Client as S3Client, Config as S3Config};
 use bytes::Bytes;
 use bytesize::ByteSize;
@@ -173,15 +173,38 @@ impl Backend {
                 .await
                 .map_err(|e| IoError::other(e.to_string()))?;
 
-            for object in res.contents.unwrap_or_default() {
-                if let Some(key) = object.key {
-                    self.s3_client
-                        .delete_object()
-                        .bucket(&self.bucket)
-                        .key(&key)
-                        .send()
-                        .await
-                        .map_err(|e| IoError::other(e.to_string()))?;
+            let keys: Vec<ObjectIdentifier> = res
+                .contents
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(|obj| obj.key.map(|k| ObjectIdentifier::builder().key(k).build()))
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| IoError::other(e.to_string()))?;
+
+            if !keys.is_empty() {
+                let delete = Delete::builder()
+                    .set_objects(Some(keys))
+                    .build()
+                    .map_err(|e| IoError::other(e.to_string()))?;
+
+                let result = self
+                    .s3_client
+                    .delete_objects()
+                    .bucket(&self.bucket)
+                    .delete(delete)
+                    .send()
+                    .await
+                    .map_err(|e| IoError::other(e.to_string()))?;
+
+                if let Some(errors) = result.errors
+                    && !errors.is_empty()
+                {
+                    let msg = errors
+                        .iter()
+                        .filter_map(|e| e.message())
+                        .collect::<Vec<_>>()
+                        .join("; ");
+                    return Err(IoError::other(format!("batch delete errors: {msg}")));
                 }
             }
 

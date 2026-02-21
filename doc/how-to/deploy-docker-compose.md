@@ -128,7 +128,7 @@ services:
     command: ["-c", "/config/config.toml", "server"]
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "curl", "-f", "-k", "https://localhost:5000/health"]
+      test: ["CMD", "curl", "-f", "-k", "https://localhost:5000/healthz"]
       interval: 30s
       timeout: 10s
       retries: 3

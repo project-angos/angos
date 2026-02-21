@@ -1,6 +1,7 @@
 mod blob;
 mod link_references;
 mod manifest;
+mod media_type;
 mod multipart;
 mod retention;
 mod tag;
@@ -11,6 +12,7 @@ use std::sync::Arc;
 pub use blob::BlobChecker;
 pub use link_references::LinkReferencesChecker;
 pub use manifest::ManifestChecker;
+pub use media_type::MediaTypeChecker;
 pub use multipart::MultipartChecker;
 pub use retention::RetentionChecker;
 pub use tag::TagChecker;

@@ -142,7 +142,7 @@ impl BlobStore for Backend {
         uuid: &str,
         stream: Box<dyn AsyncRead + Unpin + Send + Sync>,
         append: bool,
-    ) -> Result<(), Error> {
+    ) -> Result<(Digest, u64), Error> {
         let upload_size = if append {
             let path = path_builder::upload_path(name, uuid);
             self.file_size_or_err(&path, Error::UploadNotFound).await?
@@ -169,16 +169,19 @@ impl BlobStore for Backend {
         let mut reader = HashingReader::with_hasher(stream, hasher);
 
         let written = tokio::io::copy(&mut reader, &mut file).await?;
+        let total_size = upload_size + written;
+        let digest = reader.digest();
 
-        self.save_hasher(
-            name,
-            uuid,
-            upload_size + written,
-            &reader.serialized_state(),
-        )
-        .await?;
+        self.save_hasher(name, uuid, total_size, &reader.serialized_state())
+            .await?;
 
-        Ok(())
+        Ok((digest, total_size))
+    }
+
+    #[instrument(skip(self))]
+    async fn get_upload_size(&self, name: &str, uuid: &str) -> Result<u64, Error> {
+        let path = path_builder::upload_path(name, uuid);
+        self.file_size_or_err(&path, Error::UploadNotFound).await
     }
 
     #[instrument(skip(self))]
@@ -265,7 +268,7 @@ impl BlobStore for Backend {
         &self,
         digest: &Digest,
         start_offset: Option<u64>,
-    ) -> Result<BoxedReader, Error> {
+    ) -> Result<(BoxedReader, u64), Error> {
         let path = path_builder::blob_path(digest);
         let mut file = match self.store.open_file(&path).await {
             Ok(file) => file,
@@ -273,11 +276,13 @@ impl BlobStore for Backend {
             Err(e) => return Err(e.into()),
         };
 
+        let size = file.metadata().await?.len();
+
         if let Some(offset) = start_offset {
             file.seek(SeekFrom::Start(offset)).await?;
         }
 
-        Ok(Box::new(file))
+        Ok((Box::new(file), size))
     }
 
     #[instrument(skip(self))]
