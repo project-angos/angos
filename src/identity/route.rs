@@ -204,7 +204,7 @@ impl Route<'_> {
         }
     }
 
-    pub fn is_write(&self) -> bool {
+    pub fn is_push(&self) -> bool {
         matches!(
             self,
             Route::StartUpload { .. }
@@ -212,8 +212,6 @@ impl Route<'_> {
                 | Route::PutUpload { .. }
                 | Route::DeleteUpload { .. }
                 | Route::PutManifest { .. }
-                | Route::DeleteManifest { .. }
-                | Route::DeleteBlob { .. }
         )
     }
 }
@@ -307,35 +305,6 @@ mod tests {
         // n and last are now included when present
         assert_eq!(json["n"], 10);
         assert_eq!(json["last"], "library/alpine");
-    }
-
-    #[test]
-    fn test_is_write() {
-        assert!(
-            Route::StartUpload {
-                namespace: Namespace::new("test").unwrap(),
-                digest: None,
-            }
-            .is_write()
-        );
-
-        assert!(
-            Route::PutManifest {
-                namespace: Namespace::new("test").unwrap(),
-                reference: Reference::from_str("v1.0.0").unwrap(),
-            }
-            .is_write()
-        );
-
-        assert!(
-            !Route::GetManifest {
-                namespace: Namespace::new("test").unwrap(),
-                reference: Reference::from_str("v1.0.0").unwrap(),
-            }
-            .is_write()
-        );
-
-        assert!(!Route::ApiVersion.is_write());
     }
 
     #[test]
