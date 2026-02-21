@@ -3,12 +3,13 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use hyper::http::request::Parts;
 use tracing::{debug, instrument};
-use x509_parser::certificate::X509Certificate;
-use x509_parser::prelude::FromDer;
+use x509_parser::{certificate::X509Certificate, prelude::FromDer};
 
 use super::{AuthMiddleware, AuthResult};
-use crate::command::server::error::Error;
-use crate::identity::{ClientCertificate, ClientIdentity};
+use crate::{
+    command::server::error::Error,
+    identity::{ClientCertificate, ClientIdentity},
+};
 
 /// Extension type for passing peer certificate data from TLS layer
 #[derive(Clone)]

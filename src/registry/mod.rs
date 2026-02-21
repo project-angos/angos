@@ -1,6 +1,4 @@
-use std::collections::HashMap;
-use std::fmt::Debug;
-use std::sync::Arc;
+use std::{collections::HashMap, fmt::Debug, sync::Arc};
 
 use tracing::instrument;
 
@@ -26,12 +24,12 @@ pub use error::Error;
 pub use manifest::parse_manifest_digests;
 pub use repository::Repository;
 
-use crate::cache;
-use crate::oci::Namespace;
 pub use crate::policy::AccessPolicy;
-use crate::registry::blob_store::BlobStore;
-use crate::registry::metadata_store::MetadataStore;
-use crate::registry::task_queue::TaskQueue;
+use crate::{
+    cache,
+    oci::Namespace,
+    registry::{blob_store::BlobStore, metadata_store::MetadataStore, task_queue::TaskQueue},
+};
 
 pub struct RegistryConfig {
     pub update_pull_time: bool,
@@ -146,11 +144,12 @@ impl Registry {
 #[cfg(test)]
 pub mod test_utils {
     use super::*;
-    use crate::configuration::GlobalConfig;
-    use crate::oci::Digest;
-    use crate::policy::{AccessPolicyConfig, RetentionPolicyConfig};
-    use crate::registry::metadata_store::MetadataStoreExt;
-    use crate::registry::metadata_store::link_kind::LinkKind;
+    use crate::{
+        configuration::GlobalConfig,
+        oci::Digest,
+        policy::{AccessPolicyConfig, RetentionPolicyConfig},
+        registry::metadata_store::{MetadataStoreExt, link_kind::LinkKind},
+    };
 
     pub fn create_test_repositories() -> Arc<HashMap<String, Repository>> {
         let token_cache = cache::Config::default().to_backend().unwrap();

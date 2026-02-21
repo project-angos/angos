@@ -19,9 +19,10 @@ use cel_interpreter::{Context, Program, Value};
 use serde::Deserialize;
 use tracing::{debug, warn};
 
-use crate::identity::{ClientIdentity, Route};
-use crate::registry::Error;
-use crate::registry::cel;
+use crate::{
+    identity::{ClientIdentity, Route},
+    registry::{Error, cel},
+};
 
 /// Configuration for access control policies.
 #[derive(Clone, Debug, Default, Deserialize)]

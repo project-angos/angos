@@ -1,7 +1,6 @@
 use tokio::io::{AsyncRead, AsyncReadExt, Take};
 
-use crate::oci::Digest;
-use crate::registry::blob_store::hashing_reader::HashingReader;
+use crate::{oci::Digest, registry::blob_store::hashing_reader::HashingReader};
 
 /// Splits an `AsyncRead` into fixed-size chunks (last may be smaller).
 pub struct ChunkedReader<R> {

@@ -1,11 +1,9 @@
 use bytes::Bytes;
 use http_body_util::Full;
-use hyper::header::CONTENT_TYPE;
-use hyper::{Response, StatusCode};
+use hyper::{Response, StatusCode, header::CONTENT_TYPE};
 use rust_embed::Embed;
 
-use super::error::Error;
-use super::response_body::ResponseBody;
+use super::{error::Error, response_body::ResponseBody};
 
 #[derive(Embed)]
 #[folder = "ui/build"]

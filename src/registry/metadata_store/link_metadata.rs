@@ -3,8 +3,10 @@ use std::collections::HashSet;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::oci::{Descriptor, Digest};
-use crate::registry::metadata_store::Error;
+use crate::{
+    oci::{Descriptor, Digest},
+    registry::metadata_store::Error,
+};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LinkMetadata {

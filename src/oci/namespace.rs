@@ -1,8 +1,10 @@
-use std::borrow::Borrow;
-use std::fmt::{Display, Formatter};
-use std::ops::Deref;
-use std::str::FromStr;
-use std::sync::LazyLock;
+use std::{
+    borrow::Borrow,
+    fmt::{Display, Formatter},
+    ops::Deref,
+    str::FromStr,
+    sync::LazyLock,
+};
 
 use regex::Regex;
 use serde::{Deserialize, Serialize};

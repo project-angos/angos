@@ -1,13 +1,17 @@
 use std::fmt::Debug;
 
-use hyper::header::{CONTENT_TYPE, LINK};
-use hyper::{Response, StatusCode};
+use hyper::{
+    Response, StatusCode,
+    header::{CONTENT_TYPE, LINK},
+};
 use serde::Serialize;
 use tracing::instrument;
 
-use crate::command::server::response_body::ResponseBody;
-use crate::oci::{Descriptor, Digest, Namespace, ReferrerList};
-use crate::registry::{Error, Registry};
+use crate::{
+    command::server::response_body::ResponseBody,
+    oci::{Descriptor, Digest, Namespace, ReferrerList},
+    registry::{Error, Registry},
+};
 
 pub const OCI_FILTERS_APPLIED: &str = "OCI-Filters-Applied";
 
@@ -161,12 +165,14 @@ mod tests {
     use tokio_util::io::StreamReader;
 
     use super::*;
-    use crate::oci::Namespace;
-    use crate::oci::Reference;
-    use crate::registry::metadata_store::MetadataStoreExt;
-    use crate::registry::metadata_store::link_kind::LinkKind;
-    use crate::registry::test_utils::create_test_blob;
-    use crate::registry::tests::backends;
+    use crate::{
+        oci::{Namespace, Reference},
+        registry::{
+            metadata_store::{MetadataStoreExt, link_kind::LinkKind},
+            test_utils::create_test_blob,
+            tests::backends,
+        },
+    };
 
     #[tokio::test]
     async fn test_get_referrers() {

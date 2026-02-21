@@ -1,9 +1,7 @@
-use std::any::Any;
-use std::fmt::Debug;
+use std::{any::Any, fmt::Debug};
 
 use async_trait::async_trait;
-use serde::Serialize;
-use serde::de::DeserializeOwned;
+use serde::{Serialize, de::DeserializeOwned};
 use tracing::{debug, warn};
 
 mod config;

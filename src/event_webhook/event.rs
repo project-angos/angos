@@ -60,8 +60,10 @@ mod tests {
     use chrono::Utc;
     use uuid::Uuid;
 
-    use crate::event_webhook::event::{Event, EventActor, EventKind};
-    use crate::identity::ClientIdentity;
+    use crate::{
+        event_webhook::event::{Event, EventActor, EventKind},
+        identity::ClientIdentity,
+    };
 
     #[test]
     fn serialize_event_kind_manifest_push() {

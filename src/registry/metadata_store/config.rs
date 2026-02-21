@@ -2,9 +2,13 @@ use std::sync::Arc;
 
 use serde::Deserialize;
 
-use crate::cache::Cache;
-use crate::registry::metadata_store;
-use crate::registry::metadata_store::{Error, MetadataStore};
+use crate::{
+    cache::Cache,
+    registry::{
+        metadata_store,
+        metadata_store::{Error, MetadataStore},
+    },
+};
 
 #[derive(Clone, Debug, Deserialize, PartialEq)]
 #[allow(clippy::large_enum_variant)]

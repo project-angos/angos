@@ -1,15 +1,15 @@
 use std::collections::HashMap;
 
 use chrono::{DateTime, Utc};
-use hyper::header::CONTENT_TYPE;
-use hyper::{Response, StatusCode};
+use hyper::{Response, StatusCode, header::CONTENT_TYPE};
 use serde::Serialize;
 use tracing::instrument;
 
-use crate::command::server::response_body::ResponseBody;
-use crate::oci::{Digest, Manifest, Namespace, Platform as OciPlatform};
-use crate::registry::metadata_store::link_kind::LinkKind;
-use crate::registry::{Error, Registry};
+use crate::{
+    command::server::response_body::ResponseBody,
+    oci::{Digest, Manifest, Namespace, Platform as OciPlatform},
+    registry::{Error, Registry, metadata_store::link_kind::LinkKind},
+};
 
 impl Registry {
     #[instrument(skip(self))]

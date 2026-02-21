@@ -2,8 +2,7 @@ use hyper::Uri;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 
-use crate::configuration::Error;
-use crate::event_webhook::event::EventKind;
+use crate::{configuration::Error, event_webhook::event::EventKind};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -62,8 +61,10 @@ impl EventWebhookConfig {
 
 #[cfg(test)]
 mod tests {
-    use crate::event_webhook::config::{DeliveryPolicy, EventWebhookConfig};
-    use crate::event_webhook::event::EventKind;
+    use crate::event_webhook::{
+        config::{DeliveryPolicy, EventWebhookConfig},
+        event::EventKind,
+    };
 
     #[test]
     fn serialize_delivery_policy_required() {

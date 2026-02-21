@@ -1,8 +1,7 @@
 use async_trait::async_trait;
 use hyper::http::request::Parts;
 
-use crate::command::server::Error;
-use crate::identity::ClientIdentity;
+use crate::{command::server::Error, identity::ClientIdentity};
 
 /// Result of authentication attempt
 #[derive(Debug)]

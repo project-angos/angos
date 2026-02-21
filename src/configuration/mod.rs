@@ -1,6 +1,8 @@
-use std::collections::{HashMap, HashSet};
-use std::fs;
-use std::path::Path;
+use std::{
+    collections::{HashMap, HashSet},
+    fs,
+    path::Path,
+};
 
 use serde::Deserialize;
 use tracing::info;
@@ -9,12 +11,16 @@ mod error;
 
 pub use error::Error;
 
-use crate::cache;
-use crate::command::server::auth::authenticator;
-use crate::command::server::listeners::{insecure, tls};
-use crate::event_webhook::config::EventWebhookConfig;
-use crate::policy::{AccessPolicyConfig, RetentionPolicyConfig};
-use crate::registry::{blob_store, metadata_store, repository};
+use crate::{
+    cache,
+    command::server::{
+        auth::authenticator,
+        listeners::{insecure, tls},
+    },
+    event_webhook::config::EventWebhookConfig,
+    policy::{AccessPolicyConfig, RetentionPolicyConfig},
+    registry::{blob_store, metadata_store, repository},
+};
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct Configuration {
@@ -256,8 +262,7 @@ mod tests {
     use std::path::PathBuf;
 
     use super::*;
-    use crate::command::server::auth::oidc;
-    use crate::registry::data_store;
+    use crate::{command::server::auth::oidc, registry::data_store};
 
     #[tokio::test]
     async fn test_load_minimal_config() {

@@ -3,29 +3,27 @@ mod tests;
 
 mod bearer_token;
 
-use std::fs;
-use std::io;
-use std::sync::Arc;
-use std::time::Duration;
+use std::{fs, io, sync::Arc, time::Duration};
 
-use base64::Engine;
-use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+use base64::{Engine, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use bearer_token::BearerToken;
 use futures_util::TryStreamExt;
-use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE, WWW_AUTHENTICATE};
-use reqwest::redirect::Policy;
-use reqwest::{Certificate, Client, Identity, Method, Response, StatusCode};
+use reqwest::{
+    Certificate, Client, Identity, Method, Response, StatusCode,
+    header::{ACCEPT, AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE, WWW_AUTHENTICATE},
+    redirect::Policy,
+};
 use serde::Deserialize;
-use tokio::io::AsyncReadExt;
-use tokio::sync::RwLock;
+use tokio::{io::AsyncReadExt, sync::RwLock};
 use tokio_util::io::StreamReader;
 use tracing::{info, warn};
 
-use crate::cache::Cache;
-use crate::oci::{Digest, Reference};
-use crate::registry::Error;
-use crate::registry::blob_store::BoxedReader;
-use crate::secret::Secret;
+use crate::{
+    cache::Cache,
+    oci::{Digest, Reference},
+    registry::{Error, blob_store::BoxedReader},
+    secret::Secret,
+};
 
 pub const DOCKER_CONTENT_DIGEST: &str = "Docker-Content-Digest";
 

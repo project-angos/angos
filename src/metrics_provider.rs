@@ -1,10 +1,7 @@
-use std::sync::LazyLock;
-use std::sync::atomic::AtomicU64;
+use std::sync::{LazyLock, atomic::AtomicU64};
 
 use prometheus::{
     Encoder, HistogramVec, IntCounterVec, IntGauge, Registry as PrometheusRegistry, TextEncoder,
-};
-use prometheus::{
     register_histogram_vec_with_registry, register_int_counter_vec_with_registry,
     register_int_gauge_with_registry,
 };

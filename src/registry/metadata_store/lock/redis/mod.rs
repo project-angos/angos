@@ -1,19 +1,14 @@
 #[cfg(test)]
 mod tests;
 
-use std::fmt::Debug;
-use std::sync::Arc;
-use std::time::Duration;
+use std::{fmt::Debug, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use redis::Client;
-use tokio::sync::Notify;
-use tokio::task::JoinHandle;
-use tokio::time::sleep;
+use tokio::{sync::Notify, task::JoinHandle, time::sleep};
 use tracing::debug;
 
-use crate::registry::metadata_store::Error;
-use crate::registry::metadata_store::lock::LockBackend;
+use crate::registry::metadata_store::{Error, lock::LockBackend};
 
 const ACQUIRE_SCRIPT: &str = r"
 for i, key in ipairs(KEYS) do

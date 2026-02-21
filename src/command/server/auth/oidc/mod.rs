@@ -1,8 +1,7 @@
 pub mod jwk;
 pub mod provider;
 
-use std::sync::Arc;
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use hyper::http::request::Parts;
@@ -13,11 +12,15 @@ use serde::Deserialize;
 use tracing::debug;
 
 use super::{AuthMiddleware, AuthResult};
-use crate::cache::Cache;
-use crate::command::server::auth::oidc::provider::{generic, github};
-use crate::command::server::error::Error;
-use crate::command::server::request_ext::HeaderExt;
-use crate::identity::{ClientIdentity, OidcClaims};
+use crate::{
+    cache::Cache,
+    command::server::{
+        auth::oidc::provider::{generic, github},
+        error::Error,
+        request_ext::HeaderExt,
+    },
+    identity::{ClientIdentity, OidcClaims},
+};
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(tag = "provider", rename_all = "lowercase")]
@@ -131,17 +134,16 @@ impl AuthMiddleware for OidcValidator {
 mod tests {
     use std::net::SocketAddr;
 
-    use base64::Engine;
-    use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
-    use hyper::Request;
-    use hyper::header::AUTHORIZATION;
+    use base64::{Engine, engine::general_purpose::STANDARD as BASE64_STANDARD};
+    use hyper::{Request, header::AUTHORIZATION};
     use serde_json::json;
-    use wiremock::matchers::{method, path};
-    use wiremock::{Mock, MockServer, ResponseTemplate};
+    use wiremock::{
+        Mock, MockServer, ResponseTemplate,
+        matchers::{method, path},
+    };
 
     use super::*;
-    use crate::cache;
-    use crate::identity::ClientIdentity;
+    use crate::{cache, identity::ClientIdentity};
 
     fn build_config(mock_server: &MockServer) -> Config {
         Config::Generic(generic::ProviderConfig {
@@ -296,8 +298,7 @@ mod tests {
     }
 
     pub fn rsa_public_key_to_jwk(public_key_pem: &str) -> serde_json::Value {
-        use base64::Engine;
-        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 
         let public_key_pem = public_key_pem
             .replace("-----BEGIN PUBLIC KEY-----", "")

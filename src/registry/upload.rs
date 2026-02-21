@@ -1,12 +1,16 @@
-use hyper::header::{CONTENT_LENGTH, LOCATION, RANGE};
-use hyper::{Response, StatusCode};
+use hyper::{
+    Response, StatusCode,
+    header::{CONTENT_LENGTH, LOCATION, RANGE},
+};
 use tokio::io::AsyncRead;
 use tracing::{instrument, warn};
 use uuid::Uuid;
 
-use crate::command::server::response_body::ResponseBody;
-use crate::oci::{Digest, Namespace};
-use crate::registry::{Error, Registry, blob_store};
+use crate::{
+    command::server::response_body::ResponseBody,
+    oci::{Digest, Namespace},
+    registry::{Error, Registry, blob_store},
+};
 
 pub const DOCKER_UPLOAD_UUID: &str = "Docker-Upload-UUID";
 pub const DOCKER_CONTENT_DIGEST: &str = "Docker-Content-Digest";
@@ -261,10 +265,14 @@ mod tests {
     use uuid::Uuid;
 
     use super::*;
-    use crate::command::server::request_ext::HeaderExt;
-    use crate::oci::Namespace;
-    use crate::registry::path_builder;
-    use crate::registry::tests::{FSRegistryTestCase, backends};
+    use crate::{
+        command::server::request_ext::HeaderExt,
+        oci::Namespace,
+        registry::{
+            path_builder,
+            tests::{FSRegistryTestCase, backends},
+        },
+    };
 
     #[tokio::test]
     async fn test_start_upload() {

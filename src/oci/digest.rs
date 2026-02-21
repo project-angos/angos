@@ -1,6 +1,8 @@
-use std::fmt;
-use std::fmt::{Display, Formatter};
-use std::str::FromStr;
+use std::{
+    fmt,
+    fmt::{Display, Formatter},
+    str::FromStr,
+};
 
 use serde::{Deserialize, Serialize};
 

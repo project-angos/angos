@@ -19,10 +19,13 @@ pub use tag::TagChecker;
 use tracing::{debug, info};
 pub use upload::UploadChecker;
 
-use crate::oci::Digest;
-use crate::registry::Error;
-use crate::registry::metadata_store::link_kind::LinkKind;
-use crate::registry::metadata_store::{MetadataStore, MetadataStoreExt};
+use crate::{
+    oci::Digest,
+    registry::{
+        Error,
+        metadata_store::{MetadataStore, MetadataStoreExt, link_kind::LinkKind},
+    },
+};
 
 pub async fn ensure_link(
     metadata_store: &Arc<dyn MetadataStore + Send + Sync>,

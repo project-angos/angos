@@ -1,8 +1,6 @@
-use sha2::digest::crypto_common::hazmat::SerializableState;
-use sha2::{Digest, Sha256};
+use sha2::{Digest, Sha256, digest::crypto_common::hazmat::SerializableState};
 
-use crate::oci;
-use crate::registry::blob_store::Error;
+use crate::{oci, registry::blob_store::Error};
 
 pub trait Sha256Ext {
     fn serialized_state(&self) -> Vec<u8>;

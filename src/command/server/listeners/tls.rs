@@ -1,22 +1,24 @@
-use std::net::{IpAddr, SocketAddr};
-use std::path::PathBuf;
-use std::sync::Arc;
-use std::time::Duration;
+use std::{
+    net::{IpAddr, SocketAddr},
+    path::PathBuf,
+    sync::Arc,
+    time::Duration,
+};
 
 use arc_swap::ArcSwap;
 use hyper_util::rt::TokioIo;
-use rustls::RootCertStore;
-use rustls::server::WebPkiClientVerifier;
-use rustls_pki_types::pem::PemObject;
-use rustls_pki_types::{CertificateDer, PrivateKeyDer};
+use rustls::{RootCertStore, server::WebPkiClientVerifier};
+use rustls_pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
 use serde::Deserialize;
 use tokio_rustls::TlsAcceptor;
 use tracing::{debug, info};
 
-use crate::command::server::ServerContext;
-use crate::command::server::error::Error;
-use crate::command::server::listeners::{accept, build_listener};
-use crate::command::server::serve_request;
+use crate::command::server::{
+    ServerContext,
+    error::Error,
+    listeners::{accept, build_listener},
+    serve_request,
+};
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct Config {
@@ -217,9 +219,7 @@ impl TlsListener {
 
 #[cfg(test)]
 pub mod tests {
-    use std::io::Write;
-    use std::net::Ipv6Addr;
-    use std::sync::Once;
+    use std::{io::Write, net::Ipv6Addr, sync::Once};
 
     use tempfile::NamedTempFile;
 

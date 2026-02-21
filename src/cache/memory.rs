@@ -1,11 +1,14 @@
-use std::collections::HashMap;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::Duration;
+use std::{
+    collections::HashMap,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+    time::Duration,
+};
 
 use async_trait::async_trait;
-use tokio::sync::RwLock;
-use tokio::time::Instant;
+use tokio::{sync::RwLock, time::Instant};
 use tracing::info;
 
 use crate::cache::{Cache, Error};

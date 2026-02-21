@@ -1,18 +1,23 @@
 use std::sync::Arc;
 
-use hyper::header::{ACCEPT_RANGES, CONTENT_LENGTH, CONTENT_RANGE};
-use hyper::{Response, StatusCode};
-use tokio::io::AsyncRead;
-use tokio::io::AsyncReadExt;
+use hyper::{
+    Response, StatusCode,
+    header::{ACCEPT_RANGES, CONTENT_LENGTH, CONTENT_RANGE},
+};
+use tokio::io::{AsyncRead, AsyncReadExt};
 use tracing::{debug, info, instrument, warn};
 use uuid::Uuid;
 
-use crate::command::server::response_body::ResponseBody;
-use crate::oci::{Digest, Namespace};
-use crate::registry::blob_store::{BlobStore, BoxedReader};
-use crate::registry::metadata_store::MetadataStoreExt;
-use crate::registry::metadata_store::link_kind::LinkKind;
-use crate::registry::{Error, Registry, Repository, task_queue};
+use crate::{
+    command::server::response_body::ResponseBody,
+    oci::{Digest, Namespace},
+    registry::{
+        Error, Registry, Repository,
+        blob_store::{BlobStore, BoxedReader},
+        metadata_store::{MetadataStoreExt, link_kind::LinkKind},
+        task_queue,
+    },
+};
 
 pub const DOCKER_CONTENT_DIGEST: &str = "Docker-Content-Digest";
 
@@ -282,10 +287,11 @@ mod tests {
     use tokio_util::io::StreamReader;
 
     use super::*;
-    use crate::command::server::request_ext::HeaderExt;
-    use crate::oci::Namespace;
-    use crate::registry::test_utils::create_test_blob;
-    use crate::registry::tests::backends;
+    use crate::{
+        command::server::request_ext::HeaderExt,
+        oci::Namespace,
+        registry::{test_utils::create_test_blob, tests::backends},
+    };
 
     #[tokio::test]
     async fn test_head_blob() {

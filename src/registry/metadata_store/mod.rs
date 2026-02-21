@@ -1,7 +1,9 @@
 mod error;
 
-use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 
 use async_trait::async_trait;
 pub use error::Error;
@@ -208,16 +210,21 @@ pub trait MetadataStore: Send + Sync {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::{HashMap, HashSet};
-    use std::sync::Arc;
+    use std::{
+        collections::{HashMap, HashSet},
+        sync::Arc,
+    };
 
     use chrono::{Duration, Utc};
 
-    use crate::oci::{Descriptor, Digest, Namespace};
-    use crate::registry::blob_store::BlobStore;
-    use crate::registry::metadata_store::link_kind::LinkKind;
-    use crate::registry::metadata_store::{LinkMetadata, MetadataStore, MetadataStoreExt};
-    use crate::registry::tests::backends;
+    use crate::{
+        oci::{Descriptor, Digest, Namespace},
+        registry::{
+            blob_store::BlobStore,
+            metadata_store::{LinkMetadata, MetadataStore, MetadataStoreExt, link_kind::LinkKind},
+            tests::backends,
+        },
+    };
 
     async fn create_link(
         m: &Arc<dyn MetadataStore + Send + Sync>,

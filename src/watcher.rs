@@ -1,13 +1,17 @@
-use std::collections::HashSet;
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::{
+    collections::HashSet,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use notify::{Event, EventKind, RecursiveMode, Watcher};
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 
-use crate::command::server::listeners::tls::ServerTlsConfig;
-use crate::configuration::{Configuration, Error, ServerConfig};
+use crate::{
+    command::server::listeners::tls::ServerTlsConfig,
+    configuration::{Configuration, Error, ServerConfig},
+};
 
 pub trait ConfigNotifier: Send + Sync {
     fn notify_config_change(&self, config: &Configuration);
@@ -168,10 +172,7 @@ async fn watch_config_loop(
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
-    use std::io::Write;
-    use std::sync::Mutex;
-    use std::time::Duration;
+    use std::{fs, io::Write, sync::Mutex, time::Duration};
 
     use tempfile::TempDir;
 

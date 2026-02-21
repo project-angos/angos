@@ -2,11 +2,14 @@ use std::sync::Arc;
 
 use tracing::{debug, error, info};
 
-use crate::oci::Digest;
-use crate::registry::Error;
-use crate::registry::blob_store::BlobStore;
-use crate::registry::metadata_store::link_kind::LinkKind;
-use crate::registry::metadata_store::{self, BlobIndexOperation, MetadataStore};
+use crate::{
+    oci::Digest,
+    registry::{
+        Error,
+        blob_store::BlobStore,
+        metadata_store::{self, BlobIndexOperation, MetadataStore, link_kind::LinkKind},
+    },
+};
 
 pub struct BlobChecker {
     blob_store: Arc<dyn BlobStore + Send + Sync>,
@@ -120,10 +123,10 @@ mod tests {
     use std::str::FromStr;
 
     use super::*;
-    use crate::oci::Digest;
-    use crate::registry::metadata_store::BlobIndexOperation;
-    use crate::registry::test_utils;
-    use crate::registry::tests::backends;
+    use crate::{
+        oci::Digest,
+        registry::{metadata_store::BlobIndexOperation, test_utils, tests::backends},
+    };
 
     #[tokio::test]
     async fn test_cleanup_orphan_blobs_removes_invalid_index_entries() {

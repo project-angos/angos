@@ -1,5 +1,4 @@
-use crate::registry::metadata_store::lock::redis::LockConfig;
-use crate::registry::metadata_store::lock::{LockBackend, RedisBackend};
+use crate::registry::metadata_store::lock::{LockBackend, RedisBackend, redis::LockConfig};
 
 #[tokio::test]
 async fn test_acquire_lock() {

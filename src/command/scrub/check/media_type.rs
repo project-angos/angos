@@ -2,11 +2,14 @@ use std::sync::Arc;
 
 use tracing::{debug, error, info};
 
-use crate::oci::Manifest;
-use crate::registry::Error;
-use crate::registry::blob_store::BlobStore;
-use crate::registry::metadata_store::link_kind::LinkKind;
-use crate::registry::metadata_store::{MetadataStore, MetadataStoreExt};
+use crate::{
+    oci::Manifest,
+    registry::{
+        Error,
+        blob_store::BlobStore,
+        metadata_store::{MetadataStore, MetadataStoreExt, link_kind::LinkKind},
+    },
+};
 
 pub struct MediaTypeChecker {
     blob_store: Arc<dyn BlobStore + Send + Sync>,

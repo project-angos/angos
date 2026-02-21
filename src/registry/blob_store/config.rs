@@ -3,8 +3,10 @@ use std::sync::Arc;
 use serde::Deserialize;
 use tracing::warn;
 
-use crate::registry::blob_store::{BlobStore, Error, MultipartCleanup, fs, s3};
-use crate::registry::data_store;
+use crate::registry::{
+    blob_store::{BlobStore, Error, MultipartCleanup, fs, s3},
+    data_store,
+};
 
 #[derive(Clone, Debug, Deserialize, PartialEq)]
 #[allow(clippy::large_enum_variant)]

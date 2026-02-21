@@ -1,21 +1,26 @@
-use std::collections::HashMap;
-use std::sync::Arc;
-use std::time::Duration;
+use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use argh::FromArgs;
 use tracing::error;
 
-use super::ServerContext;
-use super::listeners::insecure::InsecureListener;
-use super::listeners::tls::{ServerTlsConfig, TlsListener};
-use crate::cache;
-use crate::cache::Cache;
-use crate::command::server::error::Error;
-use crate::configuration::{Configuration, ServerConfig};
-use crate::registry::blob_store::BlobStore;
-use crate::registry::metadata_store::MetadataStore;
-use crate::registry::{Registry, RegistryConfig, Repository, blob_store, repository};
-use crate::watcher::ConfigNotifier;
+use super::{
+    ServerContext,
+    listeners::{
+        insecure::InsecureListener,
+        tls::{ServerTlsConfig, TlsListener},
+    },
+};
+use crate::{
+    cache,
+    cache::Cache,
+    command::server::error::Error,
+    configuration::{Configuration, ServerConfig},
+    registry::{
+        Registry, RegistryConfig, Repository, blob_store, blob_store::BlobStore,
+        metadata_store::MetadataStore, repository,
+    },
+    watcher::ConfigNotifier,
+};
 
 pub enum ServiceListener {
     Insecure(InsecureListener),
@@ -745,8 +750,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_hot_reload_changes_webhook_url_via_command() {
-        use wiremock::matchers::{method, path};
-        use wiremock::{Mock, MockServer, ResponseTemplate};
+        use wiremock::{
+            Mock, MockServer, ResponseTemplate,
+            matchers::{method, path},
+        };
 
         let server_a = MockServer::start().await;
         let server_b = MockServer::start().await;
@@ -777,8 +784,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_hot_reload_adds_second_webhook() {
-        use wiremock::matchers::method;
-        use wiremock::{Mock, MockServer, ResponseTemplate};
+        use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};
 
         let server_a = MockServer::start().await;
         let server_b = MockServer::start().await;
@@ -807,8 +813,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_hot_reload_removes_one_of_two_webhooks() {
-        use wiremock::matchers::method;
-        use wiremock::{Mock, MockServer, ResponseTemplate};
+        use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};
 
         let server_a = MockServer::start().await;
         let server_b = MockServer::start().await;
@@ -837,8 +842,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_hot_reload_inflight_old_dispatcher_still_works() {
-        use wiremock::matchers::method;
-        use wiremock::{Mock, MockServer, ResponseTemplate};
+        use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};
 
         let server_old = MockServer::start().await;
         let server_new = MockServer::start().await;
@@ -908,8 +912,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_failed_reload_preserves_old_context() {
-        use wiremock::matchers::method;
-        use wiremock::{Mock, MockServer, ResponseTemplate};
+        use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};
 
         let server = MockServer::start().await;
 
@@ -948,8 +951,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_valid_reload_works_after_failed_reload() {
-        use wiremock::matchers::method;
-        use wiremock::{Mock, MockServer, ResponseTemplate};
+        use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};
 
         let server_a = MockServer::start().await;
         let server_b = MockServer::start().await;
@@ -1012,8 +1014,7 @@ mod tests {
     async fn test_command_shutdown_drains_in_flight_async_delivery() {
         use std::time::Duration;
 
-        use wiremock::matchers::method;
-        use wiremock::{Mock, MockServer, ResponseTemplate};
+        use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};
 
         let server = MockServer::start().await;
 

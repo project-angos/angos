@@ -2,8 +2,10 @@ use std::sync::Arc;
 
 use serde::Deserialize;
 
-use crate::cache;
-use crate::cache::{Cache, Error};
+use crate::{
+    cache,
+    cache::{Cache, Error},
+};
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq)]
 pub enum Config {

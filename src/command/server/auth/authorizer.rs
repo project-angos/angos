@@ -1,17 +1,17 @@
-use std::collections::HashMap;
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
 use hyper::http::request::Parts;
 use regex::Regex;
 use tracing::{debug, error, info, instrument};
 
-use crate::cache::Cache;
-use crate::command::server::auth::webhook::WebhookAuthorizer;
-use crate::command::server::error::Error;
-use crate::configuration::Configuration;
-use crate::identity::{ClientIdentity, Route};
-use crate::oci::Reference;
-use crate::registry::{AccessPolicy, Registry};
+use crate::{
+    cache::Cache,
+    command::server::{auth::webhook::WebhookAuthorizer, error::Error},
+    configuration::Configuration,
+    identity::{ClientIdentity, Route},
+    oci::Reference,
+    registry::{AccessPolicy, Registry},
+};
 
 const ACCESS_DENIED: &str = "Access denied";
 
@@ -242,8 +242,7 @@ fn log_denial(reason: &str, identity: &ClientIdentity) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cache;
-    use crate::configuration::Configuration;
+    use crate::{cache, configuration::Configuration};
 
     fn create_minimal_config() -> Configuration {
         let toml = r#"
@@ -684,8 +683,7 @@ mod tests {
     }
 
     fn create_pull_through_registry(config: &Configuration) -> Registry {
-        use std::collections::HashMap;
-        use std::sync::Arc;
+        use std::{collections::HashMap, sync::Arc};
 
         use crate::registry::{RegistryConfig, Repository};
 

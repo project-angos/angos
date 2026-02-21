@@ -3,17 +3,17 @@ mod tests;
 
 use std::collections::HashMap;
 
-use argon2::password_hash::PasswordHashString;
-use argon2::{Argon2, PasswordVerifier};
+use argon2::{Argon2, PasswordVerifier, password_hash::PasswordHashString};
 use async_trait::async_trait;
 use hyper::http::request::Parts;
 use serde::Deserialize;
 use tracing::{debug, instrument, warn};
 
 use super::{AuthMiddleware, AuthResult};
-use crate::command::server::error::Error;
-use crate::command::server::request_ext::HeaderExt;
-use crate::identity::ClientIdentity;
+use crate::{
+    command::server::{error::Error, request_ext::HeaderExt},
+    identity::ClientIdentity,
+};
 
 #[derive(Clone, Debug, Default, Deserialize)]
 pub struct Config {

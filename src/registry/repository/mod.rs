@@ -3,11 +3,12 @@ use std::sync::Arc;
 use serde::Deserialize;
 use tracing::instrument;
 
-use crate::cache::Cache;
-use crate::oci::{Digest, Reference};
-use crate::policy::{AccessPolicyConfig, RetentionPolicy, RetentionPolicyConfig};
-use crate::registry::Error;
-use crate::registry::blob_store::BoxedReader;
+use crate::{
+    cache::Cache,
+    oci::{Digest, Reference},
+    policy::{AccessPolicyConfig, RetentionPolicy, RetentionPolicyConfig},
+    registry::{Error, blob_store::BoxedReader},
+};
 
 mod registry_client;
 
@@ -134,8 +135,10 @@ impl Repository {
 
 #[cfg(test)]
 mod tests {
-    use wiremock::matchers::{method, path};
-    use wiremock::{Mock, MockServer, ResponseTemplate};
+    use wiremock::{
+        Mock, MockServer, ResponseTemplate,
+        matchers::{method, path},
+    };
 
     use super::*;
     use crate::cache;

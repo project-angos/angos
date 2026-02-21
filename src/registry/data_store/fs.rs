@@ -1,5 +1,7 @@
-use std::io::{ErrorKind, Write};
-use std::path::PathBuf;
+use std::{
+    io::{ErrorKind, Write},
+    path::PathBuf,
+};
 
 use serde::Deserialize;
 use tokio::fs;

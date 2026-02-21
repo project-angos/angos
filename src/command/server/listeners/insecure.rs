@@ -1,16 +1,20 @@
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::sync::Arc;
-use std::time::Duration;
+use std::{
+    net::{IpAddr, Ipv4Addr, SocketAddr},
+    sync::Arc,
+    time::Duration,
+};
 
 use arc_swap::ArcSwap;
 use hyper_util::rt::TokioIo;
 use serde::Deserialize;
 use tracing::{debug, info};
 
-use crate::command::server::ServerContext;
-use crate::command::server::error::Error;
-use crate::command::server::listeners::{accept, build_listener};
-use crate::command::server::serve_request;
+use crate::command::server::{
+    ServerContext,
+    error::Error,
+    listeners::{accept, build_listener},
+    serve_request,
+};
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct Config {
@@ -109,19 +113,22 @@ impl InsecureListener {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
-    use std::net::Ipv6Addr;
+    use std::{collections::HashMap, net::Ipv6Addr};
 
     use chrono::Utc;
     use uuid::Uuid;
-    use wiremock::matchers::{method, path};
-    use wiremock::{Mock, MockServer, ResponseTemplate};
+    use wiremock::{
+        Mock, MockServer, ResponseTemplate,
+        matchers::{method, path},
+    };
 
     use super::*;
-    use crate::command::server::server_context::tests::create_test_server_context;
-    use crate::configuration::Configuration;
-    use crate::event_webhook::event::{Event, EventKind};
-    use crate::registry::{Registry, RegistryConfig};
+    use crate::{
+        command::server::server_context::tests::create_test_server_context,
+        configuration::Configuration,
+        event_webhook::event::{Event, EventKind},
+        registry::{Registry, RegistryConfig},
+    };
 
     #[test]
     fn test_config_default_values() {

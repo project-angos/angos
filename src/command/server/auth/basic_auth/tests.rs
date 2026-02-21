@@ -1,15 +1,17 @@
 use std::collections::HashMap;
 
 use argon2::{Argon2, PasswordVerifier};
-use base64::Engine;
-use base64::prelude::BASE64_STANDARD;
-use hyper::Request;
-use hyper::http::request::Parts;
+use base64::{Engine, prelude::BASE64_STANDARD};
+use hyper::{Request, http::request::Parts};
 use serde::Deserialize;
 
-use crate::command::server::auth::basic_auth::{Config, build_users};
-use crate::command::server::auth::{AuthMiddleware, AuthResult, BasicAuthValidator};
-use crate::identity::ClientIdentity;
+use crate::{
+    command::server::auth::{
+        AuthMiddleware, AuthResult, BasicAuthValidator,
+        basic_auth::{Config, build_users},
+    },
+    identity::ClientIdentity,
+};
 
 #[derive(Deserialize)]
 struct TestConfig {

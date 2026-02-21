@@ -1,19 +1,17 @@
-use std::collections::HashMap;
-use std::net::SocketAddr;
-use std::sync::Arc;
+use std::{collections::HashMap, net::SocketAddr, sync::Arc};
 
 use hyper::http::request::Parts;
 use serde::Deserialize;
 use tracing::{debug, instrument, warn};
 
-use super::oidc::OidcValidator;
-use super::webhook;
-use super::{AuthMiddleware, AuthResult, BasicAuthValidator, MtlsValidator, basic_auth, oidc};
-use crate::cache::Cache;
-use crate::command::server::error::Error;
-use crate::configuration::Configuration;
-use crate::identity::ClientIdentity;
-use crate::metrics_provider::AUTH_ATTEMPTS;
+use super::{
+    AuthMiddleware, AuthResult, BasicAuthValidator, MtlsValidator, basic_auth, oidc,
+    oidc::OidcValidator, webhook,
+};
+use crate::{
+    cache::Cache, command::server::error::Error, configuration::Configuration,
+    identity::ClientIdentity, metrics_provider::AUTH_ATTEMPTS,
+};
 
 #[derive(Clone, Debug, Default, Deserialize)]
 pub struct AuthConfig {
@@ -148,17 +146,15 @@ impl Authenticator {
 
 #[cfg(test)]
 mod tests {
-    use argon2::password_hash::SaltString;
-    use argon2::password_hash::rand_core::OsRng;
-    use argon2::{Algorithm, Argon2, Params, PasswordHasher, Version};
-    use base64::Engine;
-    use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
-    use hyper::Request;
-    use hyper::header::AUTHORIZATION;
+    use argon2::{
+        Algorithm, Argon2, Params, PasswordHasher, Version,
+        password_hash::{SaltString, rand_core::OsRng},
+    };
+    use base64::{Engine, engine::general_purpose::STANDARD as BASE64_STANDARD};
+    use hyper::{Request, header::AUTHORIZATION};
 
     use super::*;
-    use crate::cache;
-    use crate::configuration::Configuration;
+    use crate::{cache, configuration::Configuration};
 
     fn create_minimal_config() -> Configuration {
         let toml = r#"

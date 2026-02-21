@@ -1,27 +1,30 @@
-use std::fs;
-use std::path::PathBuf;
-use std::str::FromStr;
+use std::{fs, path::PathBuf, str::FromStr};
 
-use hyper::http::request::Builder;
-use hyper::{HeaderMap, Method};
-use wiremock::matchers::{header, method};
-use wiremock::{Mock, MockServer, ResponseTemplate};
-
-use crate::cache;
-use crate::command::server::Error;
-use crate::command::server::auth::webhook::{
-    Config, WebhookAuth, WebhookAuthorizer, build_header_name, build_header_value, build_headers,
-    load_certificate_bundle, load_file, load_identity, set_forwarded_for_header,
-    set_forwarded_headers, set_forwarded_host_header, set_forwarded_method_header,
-    set_forwarded_proto_header, set_forwarded_uri_header, set_registry_action_header,
-    set_registry_certificate_cn_header, set_registry_certificate_o_header,
-    set_registry_digest_header, set_registry_identity_id_header, set_registry_namespace_header,
-    set_registry_reference_header, set_registry_username_header,
+use hyper::{HeaderMap, Method, http::request::Builder};
+use wiremock::{
+    Mock, MockServer, ResponseTemplate,
+    matchers::{header, method},
 };
-use crate::identity::{ClientIdentity, Route};
-use crate::oci::Namespace;
-use crate::oci::{Digest, Reference};
-use crate::secret::Secret;
+
+use crate::{
+    cache,
+    command::server::{
+        Error,
+        auth::webhook::{
+            Config, WebhookAuth, WebhookAuthorizer, build_header_name, build_header_value,
+            build_headers, load_certificate_bundle, load_file, load_identity,
+            set_forwarded_for_header, set_forwarded_headers, set_forwarded_host_header,
+            set_forwarded_method_header, set_forwarded_proto_header, set_forwarded_uri_header,
+            set_registry_action_header, set_registry_certificate_cn_header,
+            set_registry_certificate_o_header, set_registry_digest_header,
+            set_registry_identity_id_header, set_registry_namespace_header,
+            set_registry_reference_header, set_registry_username_header,
+        },
+    },
+    identity::{ClientIdentity, Route},
+    oci::{Digest, Namespace, Reference},
+    secret::Secret,
+};
 
 static TEST_BUNDLE: &str = r"-----BEGIN CERTIFICATE-----
 MIIDgjCCAmqgAwIBAgIUFCYlDkKrxnJCnCtYXKvA9BaXnfowDQYJKoZIhvcNAQEL

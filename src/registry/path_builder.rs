@@ -1,5 +1,4 @@
-use crate::oci::Digest;
-use crate::registry::metadata_store::link_kind::LinkKind;
+use crate::{oci::Digest, registry::metadata_store::link_kind::LinkKind};
 
 const BLOBS_ROOT: &str = "v2/blobs";
 const REPOS_ROOT: &str = "v2/repositories";

@@ -1,9 +1,10 @@
 mod error;
 
 use argh::FromArgs;
-use argon2::password_hash::SaltString;
-use argon2::password_hash::rand_core::OsRng;
-use argon2::{Algorithm, Argon2, Params, PasswordHasher, Version};
+use argon2::{
+    Algorithm, Argon2, Params, PasswordHasher, Version,
+    password_hash::{SaltString, rand_core::OsRng},
+};
 use zeroize::Zeroizing;
 
 #[derive(FromArgs, PartialEq, Debug)]

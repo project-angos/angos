@@ -3,13 +3,16 @@ use std::sync::Arc;
 use hyper::http::request::Parts;
 use tracing::instrument;
 
-use crate::command::server::auth::{Authenticator, Authorizer};
-use crate::command::server::error::Error;
-use crate::configuration::Configuration;
-use crate::event_webhook::dispatcher::EventDispatcher;
-use crate::event_webhook::event::Event;
-use crate::identity::{ClientIdentity, Route};
-use crate::registry::Registry;
+use crate::{
+    command::server::{
+        auth::{Authenticator, Authorizer},
+        error::Error,
+    },
+    configuration::Configuration,
+    event_webhook::{dispatcher::EventDispatcher, event::Event},
+    identity::{ClientIdentity, Route},
+    registry::Registry,
+};
 
 pub struct ServerContext {
     authenticator: Arc<Authenticator>,
@@ -112,25 +115,28 @@ impl ServerContext {
 
 #[cfg(test)]
 pub mod tests {
-    use std::collections::HashMap;
-    use std::time::Duration;
+    use std::{collections::HashMap, time::Duration};
 
-    use argon2::password_hash::SaltString;
-    use argon2::password_hash::rand_core::OsRng;
-    use argon2::{Algorithm, Argon2, Params, PasswordHasher, Version};
+    use argon2::{
+        Algorithm, Argon2, Params, PasswordHasher, Version,
+        password_hash::{SaltString, rand_core::OsRng},
+    };
     use base64::Engine;
     use chrono::Utc;
     use hyper::Request;
     use uuid::Uuid;
-    use wiremock::matchers::method;
-    use wiremock::{Mock, MockServer, ResponseTemplate};
+    use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};
 
     use super::*;
-    use crate::configuration::Configuration;
-    use crate::event_webhook::dispatcher::EventDispatcher;
-    use crate::event_webhook::event::{Event, EventKind};
-    use crate::oci::{Namespace, Reference};
-    use crate::registry::{RegistryConfig, Repository};
+    use crate::{
+        configuration::Configuration,
+        event_webhook::{
+            dispatcher::EventDispatcher,
+            event::{Event, EventKind},
+        },
+        oci::{Namespace, Reference},
+        registry::{RegistryConfig, Repository},
+    };
 
     fn create_test_config() -> Configuration {
         let toml = r#"
@@ -1008,15 +1014,19 @@ pub mod tests {
         // shutdown_with_timeout() explicitly triggers a flush.
         //
         // Requires MinIO on http://127.0.0.1:9000 (run: docker-compose up -d)
-        use std::str::FromStr;
-        use std::sync::Arc;
+        use std::{str::FromStr, sync::Arc};
 
-        use crate::oci::Digest;
-        use crate::registry::RegistryConfig;
-        use crate::registry::blob_store;
-        use crate::registry::metadata_store::link_kind::LinkKind;
-        use crate::registry::metadata_store::s3::{Backend as S3MetadataBackend, BackendConfig};
-        use crate::registry::metadata_store::{LinkOperation, MetadataStore};
+        use crate::{
+            oci::Digest,
+            registry::{
+                RegistryConfig, blob_store,
+                metadata_store::{
+                    LinkOperation, MetadataStore,
+                    link_kind::LinkKind,
+                    s3::{Backend as S3MetadataBackend, BackendConfig},
+                },
+            },
+        };
 
         let unique_prefix = format!("test-shutdown-flush-{}", Uuid::new_v4());
         let namespace = format!("{unique_prefix}/myimage");

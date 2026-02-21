@@ -1,27 +1,29 @@
 #[cfg(test)]
 mod tests;
 
-use std::path::PathBuf;
-use std::str::FromStr;
-use std::sync::Arc;
-use std::sync::LazyLock;
-use std::time::Duration;
+use std::{
+    path::PathBuf,
+    str::FromStr,
+    sync::{Arc, LazyLock},
+    time::Duration,
+};
 
-use hyper::Uri;
-use hyper::header::{HeaderName, HeaderValue};
-use hyper::http::HeaderMap;
-use hyper::http::request::Parts;
+use hyper::{
+    Uri,
+    header::{HeaderName, HeaderValue},
+    http::{HeaderMap, request::Parts},
+};
 use prometheus::{HistogramVec, IntCounterVec, register_histogram_vec, register_int_counter_vec};
-use reqwest::header::AUTHORIZATION;
-use reqwest::redirect::Policy;
-use reqwest::{Certificate, Client, Identity};
+use reqwest::{Certificate, Client, Identity, header::AUTHORIZATION, redirect::Policy};
 use serde::Deserialize;
 use tracing::warn;
 
-use crate::cache::{Cache, CacheExt};
-use crate::command::server::error::Error;
-use crate::identity::{ClientIdentity, Route};
-use crate::secret::Secret;
+use crate::{
+    cache::{Cache, CacheExt},
+    command::server::error::Error,
+    identity::{ClientIdentity, Route},
+    secret::Secret,
+};
 
 static WEBHOOK_REQUESTS: LazyLock<IntCounterVec> = LazyLock::new(|| {
     register_int_counter_vec!(

@@ -1,7 +1,6 @@
 use std::fmt;
 
-use crate::oci;
-use crate::registry::data_store;
+use crate::{oci, registry::data_store};
 
 #[derive(Debug, PartialEq)]
 pub enum Error {

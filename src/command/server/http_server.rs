@@ -1,32 +1,43 @@
-use std::convert::Infallible;
-use std::fmt::Debug;
-use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::{
+    convert::Infallible,
+    fmt::Debug,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use chrono::Utc;
 use http_body_util::Full;
-use hyper::body::{Bytes, Incoming};
-use hyper::header::{CONTENT_RANGE, CONTENT_TYPE, RANGE, WWW_AUTHENTICATE};
-use hyper::server::conn::http1;
-use hyper::service::service_fn;
-use hyper::{Method, Request, Response, StatusCode};
+use hyper::{
+    Method, Request, Response, StatusCode,
+    body::{Bytes, Incoming},
+    header::{CONTENT_RANGE, CONTENT_TYPE, RANGE, WWW_AUTHENTICATE},
+    server::conn::http1,
+    service::service_fn,
+};
 use hyper_util::rt::TokioIo;
 use opentelemetry::trace::TraceContextExt;
-use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::pin;
+use tokio::{
+    io::{AsyncRead, AsyncWrite},
+    pin,
+};
 use tracing::{Span, debug, error, info, instrument};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 use uuid::Uuid;
 
-use crate::command::server::auth::PeerCertificate;
-use crate::command::server::error::Error;
-use crate::command::server::request_ext::{HeaderExt, IntoAsyncRead};
-use crate::command::server::response_body::ResponseBody;
-use crate::command::server::{ServerContext, router, ui};
-use crate::event_webhook::event::{Event, EventActor, EventKind};
-use crate::identity::{ClientIdentity, Route};
-use crate::metrics_provider::{IN_FLIGHT_REQUESTS, METRICS_PROVIDER};
-use crate::oci::{Digest, Namespace, Reference};
+use crate::{
+    command::server::{
+        ServerContext,
+        auth::PeerCertificate,
+        error::Error,
+        request_ext::{HeaderExt, IntoAsyncRead},
+        response_body::ResponseBody,
+        router, ui,
+    },
+    event_webhook::event::{Event, EventActor, EventKind},
+    identity::{ClientIdentity, Route},
+    metrics_provider::{IN_FLIGHT_REQUESTS, METRICS_PROVIDER},
+    oci::{Digest, Namespace, Reference},
+};
 
 pub async fn serve_request<S>(
     stream: TokioIo<S>,
@@ -676,10 +687,12 @@ mod tests {
     use std::collections::HashMap;
 
     use super::*;
-    use crate::configuration::Configuration;
-    use crate::identity::ClientIdentity;
-    use crate::registry;
-    use crate::registry::{Registry, RegistryConfig};
+    use crate::{
+        configuration::Configuration,
+        identity::ClientIdentity,
+        registry,
+        registry::{Registry, RegistryConfig},
+    };
 
     #[test]
     fn test_error_to_response_unauthorized_with_request_id() {
@@ -1110,8 +1123,10 @@ mod tests {
     fn create_test_context_with_allow_policy() -> ServerContext {
         use std::collections::HashMap;
 
-        use crate::configuration::Configuration;
-        use crate::registry::{Registry, RegistryConfig};
+        use crate::{
+            configuration::Configuration,
+            registry::{Registry, RegistryConfig},
+        };
 
         let toml = r#"
             [blob_store.fs]

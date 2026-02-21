@@ -3,8 +3,7 @@ use std::sync::Arc;
 use chrono::{Duration, Utc};
 use tracing::{debug, error, info};
 
-use crate::registry::Error;
-use crate::registry::blob_store::BlobStore;
+use crate::registry::{Error, blob_store::BlobStore};
 
 pub struct UploadChecker {
     blob_store: Arc<dyn BlobStore + Send + Sync>,

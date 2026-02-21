@@ -1,18 +1,15 @@
-use std::fmt::Debug;
-use std::num::TryFromIntError;
-use std::string::FromUtf8Error;
-use std::{fmt, io};
+use std::{fmt, fmt::Debug, io, num::TryFromIntError, string::FromUtf8Error};
 
-use aws_sdk_s3::config::http::HttpResponse;
-use aws_sdk_s3::error::SdkError;
-use aws_sdk_s3::operation::get_object::GetObjectError;
-use aws_sdk_s3::operation::head_object::HeadObjectError;
-use aws_sdk_s3::primitives::ByteStreamError;
+use aws_sdk_s3::{
+    config::http::HttpResponse,
+    error::SdkError,
+    operation::{get_object::GetObjectError, head_object::HeadObjectError},
+    primitives::ByteStreamError,
+};
 use sha2::digest::crypto_common::hazmat::DeserializeStateError;
 use tracing::error;
 
-use crate::oci;
-use crate::registry::data_store;
+use crate::{oci, registry::data_store};
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Error {
@@ -135,11 +132,13 @@ impl From<oci::Error> for Error {
 
 #[cfg(test)]
 mod tests {
-    use aws_sdk_s3::error::SdkError;
-    use aws_sdk_s3::operation::get_object::GetObjectError;
-    use aws_sdk_s3::operation::head_object::HeadObjectError;
-    use aws_sdk_s3::operation::put_object::PutObjectError;
-    use aws_sdk_s3::primitives::ByteStreamError;
+    use aws_sdk_s3::{
+        error::SdkError,
+        operation::{
+            get_object::GetObjectError, head_object::HeadObjectError, put_object::PutObjectError,
+        },
+        primitives::ByteStreamError,
+    };
     use sha2::digest::crypto_common::hazmat::DeserializeStateError;
 
     use super::*;

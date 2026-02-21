@@ -1,24 +1,29 @@
-use std::collections::HashMap;
-use std::sync::Arc;
-use std::time::Duration;
+use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use futures_util::future::join_all;
-use futures_util::stream::{self, StreamExt};
+use futures_util::{
+    future::join_all,
+    stream::{self, StreamExt},
+};
 use serde::Deserialize;
 use tokio::sync::Mutex;
 use tracing::{debug, info, instrument, warn};
 
-use crate::cache::{Cache, CacheExt};
-use crate::oci::{Descriptor, Digest, Manifest};
-use crate::registry::metadata_store::link_kind::LinkKind;
-use crate::registry::metadata_store::lock::{self, LockBackend, MemoryBackend};
-use crate::registry::metadata_store::{BlobIndex, Error};
-use crate::registry::metadata_store::{
-    BlobIndexOperation, LinkMetadata, LinkOperation, LockConfig, MetadataStore,
+use crate::{
+    cache::{Cache, CacheExt},
+    oci::{Descriptor, Digest, Manifest},
+    registry::{
+        data_store,
+        metadata_store::{
+            BlobIndex, BlobIndexOperation, Error, LinkMetadata, LinkOperation, LockConfig,
+            MetadataStore,
+            link_kind::LinkKind,
+            lock::{self, LockBackend, MemoryBackend},
+        },
+        pagination, path_builder,
+    },
 };
-use crate::registry::{data_store, pagination, path_builder};
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq)]
 pub struct BackendConfig {
@@ -891,9 +896,11 @@ mod tests {
     use std::str::FromStr;
 
     use super::*;
-    use crate::cache;
-    use crate::cache::CacheExt;
-    use crate::registry::metadata_store::{LinkOperation, MetadataStore};
+    use crate::{
+        cache,
+        cache::CacheExt,
+        registry::metadata_store::{LinkOperation, MetadataStore},
+    };
 
     fn test_config() -> BackendConfig {
         BackendConfig {

@@ -1,7 +1,9 @@
-use std::fmt;
-use std::fmt::{Display, Formatter};
-use std::str::FromStr;
-use std::sync::LazyLock;
+use std::{
+    fmt,
+    fmt::{Display, Formatter},
+    str::FromStr,
+    sync::LazyLock,
+};
 
 use regex::Regex;
 use serde::{Deserialize, Serialize};

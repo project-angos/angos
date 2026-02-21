@@ -1,6 +1,4 @@
-use std::env;
-use std::path::Path;
-use std::process::Command;
+use std::{env, path::Path, process::Command};
 
 fn main() {
     let manifest_dir = env::var("CARGO_MANIFEST_DIR").unwrap();

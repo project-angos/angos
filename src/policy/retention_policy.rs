@@ -27,8 +27,7 @@ use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use tracing::debug;
 
-use crate::configuration::Error;
-use crate::registry::cel;
+use crate::{configuration::Error, registry::cel};
 
 /// Configuration for retention policies.
 #[derive(Clone, Debug, Default, Deserialize)]

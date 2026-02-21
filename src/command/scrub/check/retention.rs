@@ -1,17 +1,19 @@
-use std::collections::HashMap;
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
 use futures_util::future::join_all;
 use tracing::{debug, info};
 
-use crate::oci::Digest;
-use crate::policy::{ManifestImage, RetentionPolicy};
-use crate::registry::Error;
-use crate::registry::blob_store::BlobStore;
-use crate::registry::metadata_store::link_kind::LinkKind;
-use crate::registry::metadata_store::{LinkMetadata, MetadataStore, MetadataStoreExt};
-use crate::registry::parse_manifest_digests;
-use crate::registry::repository::Repository;
+use crate::{
+    oci::Digest,
+    policy::{ManifestImage, RetentionPolicy},
+    registry::{
+        Error,
+        blob_store::BlobStore,
+        metadata_store::{LinkMetadata, MetadataStore, MetadataStoreExt, link_kind::LinkKind},
+        parse_manifest_digests,
+        repository::Repository,
+    },
+};
 
 struct TagWithMetadata {
     name: String,
@@ -393,9 +395,10 @@ impl RetentionChecker {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::policy::{RetentionPolicy, RetentionPolicyConfig};
-    use crate::registry::test_utils;
-    use crate::registry::tests::backends;
+    use crate::{
+        policy::{RetentionPolicy, RetentionPolicyConfig},
+        registry::{test_utils, tests::backends},
+    };
 
     const TEST_MANIFEST: &[u8] = br#"{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{"mediaType":"application/vnd.oci.image.config.v1+json","digest":"sha256:0000000000000000000000000000000000000000000000000000000000000000","size":0},"layers":[]}"#;
 

@@ -3,8 +3,7 @@ use std::fmt;
 use hyper::StatusCode;
 use serde_json::json;
 
-use crate::configuration;
-use crate::registry;
+use crate::{configuration, registry};
 
 #[derive(Debug, PartialEq)]
 pub enum Error {

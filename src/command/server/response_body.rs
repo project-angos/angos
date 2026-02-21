@@ -1,6 +1,8 @@
-use std::io;
-use std::pin::Pin;
-use std::task::{Context, Poll};
+use std::{
+    io,
+    pin::Pin,
+    task::{Context, Poll},
+};
 
 use futures_util::{Stream, StreamExt};
 use http_body_util::{Full, StreamBody};

@@ -1,20 +1,26 @@
-use std::collections::HashMap;
-use std::sync::Arc;
-use std::sync::LazyLock;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::{
+    collections::HashMap,
+    sync::{
+        Arc, LazyLock,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Duration,
+};
 
 use prometheus::{HistogramVec, IntCounterVec, register_histogram_vec, register_int_counter_vec};
 use regex::Regex;
 use reqwest::Client;
 use sha2::{Digest, Sha256};
-use tokio::sync::Mutex;
-use tokio::task::JoinSet;
+use tokio::{sync::Mutex, task::JoinSet};
 use tracing::warn;
 
-use crate::configuration::Error;
-use crate::event_webhook::config::{DeliveryPolicy, EventWebhookConfig};
-use crate::event_webhook::event::{Event, EventKind};
+use crate::{
+    configuration::Error,
+    event_webhook::{
+        config::{DeliveryPolicy, EventWebhookConfig},
+        event::{Event, EventKind},
+    },
+};
 
 static DELIVERY_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
     register_int_counter_vec!(
@@ -299,18 +305,21 @@ impl EventDispatcher {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
-    use std::time::Duration;
+    use std::{collections::HashMap, time::Duration};
 
     use chrono::Utc;
     use prometheus::proto::MetricType;
     use uuid::Uuid;
-    use wiremock::matchers::{body_json, header, method};
-    use wiremock::{Mock, MockServer, ResponseTemplate};
+    use wiremock::{
+        Mock, MockServer, ResponseTemplate,
+        matchers::{body_json, header, method},
+    };
 
     use super::{EventDispatcher, compute_signature, matches_event};
-    use crate::event_webhook::config::{DeliveryPolicy, EventWebhookConfig};
-    use crate::event_webhook::event::{Event, EventKind};
+    use crate::event_webhook::{
+        config::{DeliveryPolicy, EventWebhookConfig},
+        event::{Event, EventKind},
+    };
 
     fn create_test_event() -> Event {
         Event {

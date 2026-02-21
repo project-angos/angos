@@ -1,8 +1,4 @@
-use std::collections::HashSet;
-use std::fmt;
-use std::future::Future;
-use std::sync::Arc;
-use std::thread;
+use std::{collections::HashSet, fmt, future::Future, sync::Arc, thread};
 
 use parking_lot::Mutex;
 use tokio::runtime::{self, Handle};

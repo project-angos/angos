@@ -2,12 +2,16 @@ use std::sync::Arc;
 
 use tracing::{debug, error};
 
-use crate::command::scrub::check::ensure_link;
-use crate::oci::Digest;
-use crate::registry::blob_store::BlobStore;
-use crate::registry::metadata_store::MetadataStore;
-use crate::registry::metadata_store::link_kind::LinkKind;
-use crate::registry::{Error, parse_manifest_digests};
+use crate::{
+    command::scrub::check::ensure_link,
+    oci::Digest,
+    registry::{
+        Error,
+        blob_store::BlobStore,
+        metadata_store::{MetadataStore, link_kind::LinkKind},
+        parse_manifest_digests,
+    },
+};
 
 pub struct ManifestChecker {
     blob_store: Arc<dyn BlobStore + Send + Sync>,
@@ -108,9 +112,7 @@ impl ManifestChecker {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::registry::metadata_store::MetadataStoreExt;
-    use crate::registry::test_utils;
-    use crate::registry::tests::backends;
+    use crate::registry::{metadata_store::MetadataStoreExt, test_utils, tests::backends};
 
     #[tokio::test]
     async fn test_scrub_revisions_validates_manifest_links() {

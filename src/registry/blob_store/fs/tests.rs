@@ -1,11 +1,13 @@
 use tokio::fs;
 
-use crate::registry::blob_store::tests::{
-    test_build_blob_reader_returns_size, test_build_blob_reader_with_offset_returns_full_size,
-    test_datastore_blob_operations, test_datastore_list_blobs, test_datastore_list_uploads,
-    test_datastore_upload_operations,
+use crate::registry::{
+    blob_store::tests::{
+        test_build_blob_reader_returns_size, test_build_blob_reader_with_offset_returns_full_size,
+        test_datastore_blob_operations, test_datastore_list_blobs, test_datastore_list_uploads,
+        test_datastore_upload_operations,
+    },
+    tests::FSRegistryTestCase,
 };
-use crate::registry::tests::FSRegistryTestCase;
 
 #[tokio::test]
 async fn test_write_and_read_file() {

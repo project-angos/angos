@@ -1,12 +1,15 @@
-use std::io::{Error as IoError, ErrorKind};
-use std::time::Duration;
+use std::{
+    io::{Error as IoError, ErrorKind},
+    time::Duration,
+};
 
-use aws_sdk_s3::config::retry::RetryConfig;
-use aws_sdk_s3::config::{BehaviorVersion, Credentials, Region, timeout::TimeoutConfig};
-use aws_sdk_s3::operation::get_object::GetObjectOutput;
-use aws_sdk_s3::primitives::ByteStream;
-use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart, Delete, ObjectIdentifier};
-use aws_sdk_s3::{Client as S3Client, Config as S3Config};
+use aws_sdk_s3::{
+    Client as S3Client, Config as S3Config,
+    config::{BehaviorVersion, Credentials, Region, retry::RetryConfig, timeout::TimeoutConfig},
+    operation::get_object::GetObjectOutput,
+    primitives::ByteStream,
+    types::{CompletedMultipartUpload, CompletedPart, Delete, ObjectIdentifier},
+};
 use bytes::Bytes;
 use bytesize::ByteSize;
 use chrono::{DateTime, Utc};

@@ -3,9 +3,10 @@ use std::collections::HashMap;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
-use crate::command::server::auth::oidc::OidcProvider;
-use crate::command::server::auth::oidc::provider::generic;
-use crate::command::server::error::Error;
+use crate::command::server::{
+    auth::oidc::{OidcProvider, provider::generic},
+    error::Error,
+};
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ProviderConfig {

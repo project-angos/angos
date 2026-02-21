@@ -92,8 +92,7 @@ mod tests {
     use uuid::Uuid;
 
     use super::*;
-    use crate::oci::Namespace;
-    use crate::registry::blob_store::sha256_ext::Sha256Ext;
+    use crate::{oci::Namespace, registry::blob_store::sha256_ext::Sha256Ext};
 
     pub async fn test_datastore_list_uploads(store: &impl BlobStore) {
         let namespace = &Namespace::new("test-repo").unwrap();

@@ -2,10 +2,13 @@ use std::sync::Arc;
 
 use tracing::{debug, error};
 
-use crate::command::scrub::check::ensure_link;
-use crate::registry::Error;
-use crate::registry::metadata_store::MetadataStore;
-use crate::registry::metadata_store::link_kind::LinkKind;
+use crate::{
+    command::scrub::check::ensure_link,
+    registry::{
+        Error,
+        metadata_store::{MetadataStore, link_kind::LinkKind},
+    },
+};
 
 pub struct TagChecker {
     metadata_store: Arc<dyn MetadataStore + Send + Sync>,
@@ -67,9 +70,7 @@ impl TagChecker {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::registry::metadata_store::MetadataStoreExt;
-    use crate::registry::test_utils;
-    use crate::registry::tests::backends;
+    use crate::registry::{metadata_store::MetadataStoreExt, test_utils, tests::backends};
 
     #[tokio::test]
     async fn test_scrub_tags_creates_missing_digest_links() {
