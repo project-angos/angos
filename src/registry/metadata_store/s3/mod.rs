@@ -85,11 +85,13 @@ impl AccessTimeWriter {
             pending.drain().map(|(_, v)| v).collect()
         };
 
-        for (namespace, link) in entries {
-            if let Err(e) = Self::flush_one(backend, &namespace, &link).await {
-                warn!("Failed to flush access time for {namespace}:{link}: {e}");
-            }
-        }
+        stream::iter(entries)
+            .for_each_concurrent(10, |(namespace, link)| async move {
+                if let Err(e) = Self::flush_one(backend, &namespace, &link).await {
+                    warn!("Failed to flush access time for {namespace}:{link}: {e}");
+                }
+            })
+            .await;
     }
 
     async fn flush_one(backend: &Backend, namespace: &str, link: &LinkKind) -> Result<(), Error> {
@@ -1361,6 +1363,119 @@ mod tests {
         assert!(
             elapsed < std::time::Duration::from_secs(2),
             "50 concurrent deferred reads should complete within 2 seconds, took {elapsed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_flush_processes_entries_concurrently() {
+        let config = test_config();
+        let backend = test_backend_with_debounce(&config, 60);
+        let namespace = "deferred-test-concurrent";
+        let entry_count = 20;
+
+        // Create 20 independent tags
+        let mut tags = Vec::new();
+        for i in 0..entry_count {
+            let digest = Digest::from_str(&format!("sha256:{:0>64}", format!("cc{i:02}"))).unwrap();
+            let tag = LinkKind::Tag(format!("concurrent-{i}"));
+
+            let ops = vec![LinkOperation::Create {
+                link: tag.clone(),
+                target: digest,
+                referrer: None,
+            }];
+            backend.update_links(namespace, &ops).await.unwrap();
+            tags.push(tag);
+        }
+
+        // Record access times for all 20 tags (deferred)
+        for tag in &tags {
+            backend.read_link(namespace, tag, true).await.unwrap();
+        }
+
+        // Flush and measure time; concurrent flush should be significantly
+        // faster than sequential because each flush_one involves lock + read + write
+        let start = std::time::Instant::now();
+        backend.flush_access_times().await;
+        let elapsed = start.elapsed();
+
+        // Verify all 20 tags have their access times flushed
+        for tag in &tags {
+            let raw = backend.read_link_reference(namespace, tag).await.unwrap();
+            assert!(
+                raw.accessed_at.is_some(),
+                "accessed_at should be set for {tag} after concurrent flush"
+            );
+        }
+
+        // With 20 entries and concurrent processing (limit ~10), the flush
+        // should complete in roughly 2 batches worth of time. Sequential
+        // processing of 20 entries would take much longer. This is a soft
+        // assertion to validate concurrency is happening.
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "Flushing 20 entries concurrently should complete within 5 seconds, took {elapsed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_flush_errors_do_not_prevent_other_entries() {
+        let config = test_config();
+        let backend = test_backend_with_debounce(&config, 60);
+        let namespace = "deferred-test-error-isolation";
+
+        // Create two valid tags
+        let digest1 = Digest::from_str(
+            "sha256:ee01a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6",
+        )
+        .unwrap();
+        let digest2 = Digest::from_str(
+            "sha256:ee02b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1",
+        )
+        .unwrap();
+        let tag1 = LinkKind::Tag("error-iso-1".into());
+        let tag2 = LinkKind::Tag("error-iso-2".into());
+
+        let ops = vec![
+            LinkOperation::Create {
+                link: tag1.clone(),
+                target: digest1,
+                referrer: None,
+            },
+            LinkOperation::Create {
+                link: tag2.clone(),
+                target: digest2,
+                referrer: None,
+            },
+        ];
+        backend.update_links(namespace, &ops).await.unwrap();
+
+        // Record access times for both
+        backend.read_link(namespace, &tag1, true).await.unwrap();
+        backend.read_link(namespace, &tag2, true).await.unwrap();
+
+        // Also record a bogus entry that will fail during flush
+        // (non-existent namespace/tag combo)
+        backend
+            .access_time_writer
+            .as_ref()
+            .unwrap()
+            .record("nonexistent-namespace", &LinkKind::Tag("bogus".into()))
+            .await;
+
+        // Flush should succeed for the valid entries despite the bogus one failing
+        backend.flush_access_times().await;
+
+        // Both valid entries should have their access times set
+        let raw1 = backend.read_link_reference(namespace, &tag1).await.unwrap();
+        let raw2 = backend.read_link_reference(namespace, &tag2).await.unwrap();
+        assert!(
+            raw1.accessed_at.is_some(),
+            "tag1 accessed_at should be set despite another entry failing"
+        );
+        assert!(
+            raw2.accessed_at.is_some(),
+            "tag2 accessed_at should be set despite another entry failing"
         );
     }
 }
