@@ -463,7 +463,13 @@ impl MetadataStore for Backend {
     ) -> Result<LinkMetadata, Error> {
         if update_access_time {
             if let Some(writer) = &self.access_time_writer {
-                let link_data = self.read_link_reference(namespace, link).await?;
+                let link_data = if let Some(cached) = self.cache_get(namespace, link).await {
+                    cached
+                } else {
+                    let data = self.read_link_reference(namespace, link).await?;
+                    self.cache_put(namespace, link, &data).await;
+                    data
+                };
                 writer.record(namespace, link).await;
                 Ok(link_data)
             } else {
@@ -1830,5 +1836,48 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(new_meta.target, digest_add);
+    }
+
+    #[tokio::test]
+    async fn test_read_link_with_access_time_debounce_uses_cache() {
+        let config = test_config();
+        let mut cfg = config.clone();
+        cfg.access_time_debounce_secs = 60;
+        let cache: Arc<dyn cache::Cache> = Arc::new(cache::memory::Backend::new());
+        let backend = Backend::new(&cfg).unwrap().with_cache(cache.clone());
+        let namespace = "cache-debounce-hit-ns";
+        let digest = Digest::from_str(
+            "sha256:db01a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6",
+        )
+        .unwrap();
+        let tag = LinkKind::Tag("debounce-cached".into());
+
+        // Create link via update_links (populates cache)
+        let ops = vec![LinkOperation::Create {
+            link: tag.clone(),
+            target: digest.clone(),
+            referrer: None,
+        }];
+        backend.update_links(namespace, &ops).await.unwrap();
+
+        // First read with access time update (debounce path)
+        let meta = backend.read_link(namespace, &tag, true).await.unwrap();
+        assert_eq!(meta.target, digest);
+
+        // Delete the S3 object to prove the next read must come from cache
+        let link_path = path_builder::link_path(&tag, namespace);
+        backend.store.delete(&link_path).await.unwrap();
+
+        // Second read with access time update should succeed from cache
+        let meta = backend.read_link(namespace, &tag, true).await.unwrap();
+        assert_eq!(meta.target, digest);
+
+        // Verify writer.record() was still called on cache hit
+        let writer = backend.access_time_writer.as_ref().unwrap();
+        let pending = writer.pending.lock().await;
+        assert!(
+            !pending.is_empty(),
+            "writer.record() should have been called even on cache hit"
+        );
     }
 }
