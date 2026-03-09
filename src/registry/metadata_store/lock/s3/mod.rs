@@ -16,11 +16,17 @@ use futures_util::future::join_all;
 use serde::{Deserialize, Deserializer, Serialize};
 use tracing::{debug, warn};
 
-use crate::registry::{
-    data_store,
-    metadata_store::{
-        Error,
-        lock::{LockBackend, LockGuard},
+use crate::{
+    metrics_provider::{
+        LOCK_ACQUISITION_DURATION, LOCK_ACQUISITIONS, LOCK_INVALIDATIONS, LOCK_RECOVERIES,
+        LOCK_RETRIES,
+    },
+    registry::{
+        data_store,
+        metadata_store::{
+            Error,
+            lock::{LockBackend, LockGuard},
+        },
     },
 };
 
@@ -288,17 +294,31 @@ impl S3LockBackend {
     async fn try_recover_stale_lock(&self, lock_path: &str) -> RecoveryOutcome {
         let (data, etag, last_modified) = match self.store.read_with_metadata(lock_path).await {
             Ok(result) => result,
-            Err(e) if e.kind() == ErrorKind::NotFound => return RecoveryOutcome::Retry,
-            Err(e) => return RecoveryOutcome::Error(e.to_string()),
+            Err(e) if e.kind() == ErrorKind::NotFound => {
+                LOCK_RECOVERIES
+                    .with_label_values(&["s3", "not_stale"])
+                    .inc();
+                return RecoveryOutcome::Retry;
+            }
+            Err(e) => {
+                LOCK_RECOVERIES.with_label_values(&["s3", "error"]).inc();
+                return RecoveryOutcome::Error(e.to_string());
+            }
         };
 
         let payload: S3LockPayload = match serde_json::from_slice(&data) {
             Ok(p) => p,
-            Err(e) => return RecoveryOutcome::Error(format!("corrupt lock payload: {e}")),
+            Err(e) => {
+                LOCK_RECOVERIES.with_label_values(&["s3", "error"]).inc();
+                return RecoveryOutcome::Error(format!("corrupt lock payload: {e}"));
+            }
         };
 
         let last_modified = last_modified.unwrap_or(payload.refreshed_at);
         if !payload.is_expired(last_modified) {
+            LOCK_RECOVERIES
+                .with_label_values(&["s3", "not_stale"])
+                .inc();
             return RecoveryOutcome::NotStale;
         }
 
@@ -310,6 +330,7 @@ impl S3LockBackend {
         );
 
         let Some(etag) = etag else {
+            LOCK_RECOVERIES.with_label_values(&["s3", "error"]).inc();
             return RecoveryOutcome::Error("lock object missing ETag".to_string());
         };
 
@@ -318,9 +339,18 @@ impl S3LockBackend {
             .put_object_if_match(lock_path, &etag, self.make_payload())
             .await
         {
-            Ok(()) => RecoveryOutcome::Acquired,
-            Err(data_store::Error::PreconditionFailed) => RecoveryOutcome::Failed,
-            Err(e) => RecoveryOutcome::Error(e.to_string()),
+            Ok(()) => {
+                LOCK_RECOVERIES.with_label_values(&["s3", "acquired"]).inc();
+                RecoveryOutcome::Acquired
+            }
+            Err(data_store::Error::PreconditionFailed) => {
+                LOCK_RECOVERIES.with_label_values(&["s3", "failed"]).inc();
+                RecoveryOutcome::Failed
+            }
+            Err(e) => {
+                LOCK_RECOVERIES.with_label_values(&["s3", "error"]).inc();
+                RecoveryOutcome::Error(e.to_string())
+            }
         }
     }
 
@@ -364,72 +394,23 @@ impl S3LockBackend {
                         max_hold_secs,
                         "Lock held beyond maximum duration, invalidating"
                     );
+                    LOCK_INVALIDATIONS
+                        .with_label_values(&["s3", "max_hold"])
+                        .inc();
                     valid.store(false, Ordering::Release);
                     return;
                 }
 
                 let mut tick_had_failure = false;
-
                 for path in &paths {
-                    let etag = match store.read_with_etag(path).await {
-                        Ok((data, etag)) => {
-                            if let Ok(existing) = serde_json::from_slice::<S3LockPayload>(&data)
-                                && existing.instance_id != instance_id
-                            {
-                                warn!(
-                                    path,
-                                    expected = instance_id,
-                                    found = existing.instance_id,
-                                    "Lock ownership lost, stopping heartbeat"
-                                );
-                                valid.store(false, Ordering::Release);
-                                return;
-                            }
-                            etag
-                        }
-                        Err(e) if e.kind() == ErrorKind::NotFound => {
-                            warn!(path, "Lock file disappeared, stopping heartbeat");
+                    match heartbeat_tick_path(&store, path, &instance_id, ttl_secs).await {
+                        HeartbeatPathResult::Ok => {}
+                        HeartbeatPathResult::Invalidate(reason) => {
+                            LOCK_INVALIDATIONS.with_label_values(&["s3", reason]).inc();
                             valid.store(false, Ordering::Release);
                             return;
                         }
-                        Err(e) => {
-                            warn!(path, error = %e, "Failed to read lock for heartbeat");
-                            tick_had_failure = true;
-                            continue;
-                        }
-                    };
-
-                    let Some(etag) = etag else {
-                        warn!(
-                            path,
-                            "Lock ETag unavailable, cannot safely refresh heartbeat, invalidating lock"
-                        );
-                        valid.store(false, Ordering::Release);
-                        return;
-                    };
-
-                    let payload = S3LockPayload {
-                        instance_id: instance_id.clone(),
-                        refreshed_at: Utc::now(),
-                        ttl_secs,
-                    };
-                    let data = serde_json::to_vec(&payload)
-                        .expect("lock payload serialization cannot fail");
-
-                    match store.put_object_if_match(path, &etag, data).await {
-                        Ok(()) => {
-                            debug!(path, "Refreshed S3 lock heartbeat");
-                        }
-                        Err(data_store::Error::PreconditionFailed) => {
-                            warn!(
-                                path,
-                                "Lock ETag changed, ownership lost, stopping heartbeat"
-                            );
-                            valid.store(false, Ordering::Release);
-                            return;
-                        }
-                        Err(e) => {
-                            warn!(path, error = %e, "Failed to refresh S3 lock heartbeat");
+                        HeartbeatPathResult::Failure => {
                             tick_had_failure = true;
                         }
                     }
@@ -442,6 +423,9 @@ impl S3LockBackend {
                             consecutive_failures,
                             "Too many consecutive heartbeat tick failures, invalidating lock"
                         );
+                        LOCK_INVALIDATIONS
+                            .with_label_values(&["s3", "heartbeat_failure"])
+                            .inc();
                         valid.store(false, Ordering::Release);
                         return;
                     }
@@ -450,6 +434,77 @@ impl S3LockBackend {
                 }
             }
         })
+    }
+}
+
+enum HeartbeatPathResult {
+    Ok,
+    Invalidate(&'static str),
+    Failure,
+}
+
+async fn heartbeat_tick_path(
+    store: &data_store::s3::Backend,
+    path: &str,
+    instance_id: &str,
+    ttl_secs: u64,
+) -> HeartbeatPathResult {
+    let etag = match store.read_with_etag(path).await {
+        Ok((data, etag)) => {
+            if let Ok(existing) = serde_json::from_slice::<S3LockPayload>(&data)
+                && existing.instance_id != instance_id
+            {
+                warn!(
+                    path,
+                    expected = instance_id,
+                    found = existing.instance_id,
+                    "Lock ownership lost, stopping heartbeat"
+                );
+                return HeartbeatPathResult::Invalidate("ownership_lost");
+            }
+            etag
+        }
+        Err(e) if e.kind() == ErrorKind::NotFound => {
+            warn!(path, "Lock file disappeared, stopping heartbeat");
+            return HeartbeatPathResult::Invalidate("file_disappeared");
+        }
+        Err(e) => {
+            warn!(path, error = %e, "Failed to read lock for heartbeat");
+            return HeartbeatPathResult::Failure;
+        }
+    };
+
+    let Some(etag) = etag else {
+        warn!(
+            path,
+            "Lock ETag unavailable, cannot safely refresh heartbeat, invalidating lock"
+        );
+        return HeartbeatPathResult::Invalidate("etag_unavailable");
+    };
+
+    let payload = S3LockPayload {
+        instance_id: instance_id.to_owned(),
+        refreshed_at: Utc::now(),
+        ttl_secs,
+    };
+    let data = serde_json::to_vec(&payload).expect("lock payload serialization cannot fail");
+
+    match store.put_object_if_match(path, &etag, data).await {
+        Ok(()) => {
+            debug!(path, "Refreshed S3 lock heartbeat");
+            HeartbeatPathResult::Ok
+        }
+        Err(data_store::Error::PreconditionFailed) => {
+            warn!(
+                path,
+                "Lock ETag changed, ownership lost, stopping heartbeat"
+            );
+            HeartbeatPathResult::Invalidate("ownership_lost")
+        }
+        Err(e) => {
+            warn!(path, error = %e, "Failed to refresh S3 lock heartbeat");
+            HeartbeatPathResult::Failure
+        }
     }
 }
 
@@ -480,12 +535,101 @@ impl S3LockBackend {
     }
 }
 
+enum AcquireRoundOutcome {
+    AllAcquired,
+    HardError(Error),
+    RecoveryError {
+        msg: String,
+        to_release: Vec<String>,
+    },
+    Retry {
+        acquired: Vec<String>,
+        recovered: Vec<String>,
+    },
+}
+
+impl S3LockBackend {
+    async fn try_acquire_round(&self, lock_paths: &[String]) -> AcquireRoundOutcome {
+        // Parallel PUTs with overlapping key sets across instances can cause
+        // repeated rollbacks (practical livelock). Sorted key order prevents
+        // circular wait in sequential protocols but does not prevent collision
+        // in a parallel-issue protocol. The retry budget (`max_retries`) bounds
+        // total attempts. Randomized jitter (simple_jitter) desynchronises
+        // retrying instances to break collision patterns.
+        let futs: Vec<_> = lock_paths
+            .iter()
+            .enumerate()
+            .map(|(i, path)| {
+                let path = path.clone();
+                async move { (i, self.try_acquire_key(&path).await) }
+            })
+            .collect();
+        let results: Vec<(usize, Result<bool, Error>)> = join_all(futs).await;
+
+        let mut acquired_paths = Vec::new();
+        let mut failed_indices = Vec::new();
+        let mut hard_error: Option<Error> = None;
+
+        for (i, result) in &results {
+            match result {
+                Ok(true) => acquired_paths.push(lock_paths[*i].clone()),
+                Ok(false) => failed_indices.push(*i),
+                Err(e) => {
+                    hard_error = Some(Error::StorageBackend(format!("S3 lock error: {e}")));
+                    break;
+                }
+            }
+        }
+
+        if let Some(e) = hard_error {
+            self.release_paths(&acquired_paths).await;
+            return AcquireRoundOutcome::HardError(e);
+        }
+
+        if failed_indices.is_empty() {
+            return AcquireRoundOutcome::AllAcquired;
+        }
+
+        let recovery_futs: Vec<_> = failed_indices
+            .iter()
+            .map(|&i| {
+                let path = lock_paths[i].clone();
+                async move { (i, self.try_recover_stale_lock(&path).await) }
+            })
+            .collect();
+
+        let mut recovered_paths = Vec::new();
+        for (i, outcome) in join_all(recovery_futs).await {
+            match outcome {
+                RecoveryOutcome::Acquired => recovered_paths.push(lock_paths[i].clone()),
+                RecoveryOutcome::Error(msg) => {
+                    let mut to_release = acquired_paths;
+                    to_release.extend(recovered_paths);
+                    return AcquireRoundOutcome::RecoveryError { msg, to_release };
+                }
+                RecoveryOutcome::Failed | RecoveryOutcome::NotStale | RecoveryOutcome::Retry => {}
+            }
+        }
+
+        if recovered_paths.len() + acquired_paths.len() == lock_paths.len() {
+            return AcquireRoundOutcome::AllAcquired;
+        }
+
+        AcquireRoundOutcome::Retry {
+            acquired: acquired_paths,
+            recovered: recovered_paths,
+        }
+    }
+}
+
 #[async_trait]
 impl LockBackend for S3LockBackend {
     async fn acquire(&self, keys: &[String]) -> Result<LockGuard, Error> {
         if keys.is_empty() {
             return Ok(LockGuard::with_async_release(|| Box::pin(async {})));
         }
+
+        let start = std::time::Instant::now();
 
         let mut lock_paths: Vec<String> = keys.iter().map(|k| Self::lock_path(k)).collect();
         lock_paths.sort();
@@ -494,100 +638,60 @@ impl LockBackend for S3LockBackend {
         let mut retries = self.max_retries;
 
         loop {
-            let results: Vec<(usize, Result<bool, Error>)> = {
-                let futs: Vec<_> = lock_paths
-                    .iter()
-                    .enumerate()
-                    .map(|(i, path)| {
-                        let path = path.clone();
-                        async move { (i, self.try_acquire_key(&path).await) }
-                    })
-                    .collect();
-                // Parallel PUTs with overlapping key sets across instances can cause
-                // repeated rollbacks (practical livelock). Sorted key order prevents
-                // circular wait in sequential protocols but does not prevent collision
-                // in a parallel-issue protocol. The retry budget (`max_retries`) bounds
-                // total attempts. Randomized jitter (simple_jitter) desynchronises
-                // retrying instances to break collision patterns.
-                join_all(futs).await
-            };
-
-            let mut acquired_paths = Vec::new();
-            let mut failed = false;
-            let mut hard_error: Option<Error> = None;
-
-            for (i, result) in &results {
-                match result {
-                    Ok(true) => acquired_paths.push(lock_paths[*i].clone()),
-                    Ok(false) => failed = true,
-                    Err(e) => {
-                        hard_error = Some(Error::StorageBackend(format!("S3 lock error: {e}")));
-                        failed = true;
-                    }
+            match self.try_acquire_round(&lock_paths).await {
+                AcquireRoundOutcome::AllAcquired => {
+                    LOCK_ACQUISITION_DURATION
+                        .with_label_values(&["s3"])
+                        .observe(start.elapsed().as_secs_f64() * 1000.0);
+                    LOCK_ACQUISITIONS
+                        .with_label_values(&["s3", "success"])
+                        .inc();
+                    return Ok(self.make_guard(lock_paths));
                 }
-            }
-
-            if !failed {
-                return Ok(self.make_guard(lock_paths));
-            }
-
-            if let Some(e) = hard_error {
-                self.release_paths(&acquired_paths).await;
-                return Err(e);
-            }
-
-            let recovery_futs: Vec<_> = results
-                .iter()
-                .filter(|(_, result)| matches!(result, Ok(false)))
-                .map(|(i, _)| {
-                    let path = lock_paths[*i].clone();
-                    async move { (i, self.try_recover_stale_lock(&path).await) }
-                })
-                .collect();
-
-            let recovery_results = join_all(recovery_futs).await;
-
-            let mut recovered_paths = Vec::new();
-            for (i, outcome) in recovery_results {
-                match outcome {
-                    RecoveryOutcome::Acquired => {
-                        recovered_paths.push(lock_paths[*i].clone());
+                AcquireRoundOutcome::HardError(e) => {
+                    LOCK_ACQUISITION_DURATION
+                        .with_label_values(&["s3"])
+                        .observe(start.elapsed().as_secs_f64() * 1000.0);
+                    LOCK_ACQUISITIONS.with_label_values(&["s3", "error"]).inc();
+                    return Err(e);
+                }
+                AcquireRoundOutcome::RecoveryError { msg, to_release } => {
+                    self.release_paths(&to_release).await;
+                    LOCK_ACQUISITION_DURATION
+                        .with_label_values(&["s3"])
+                        .observe(start.elapsed().as_secs_f64() * 1000.0);
+                    LOCK_ACQUISITIONS.with_label_values(&["s3", "error"]).inc();
+                    return Err(Error::StorageBackend(format!(
+                        "S3 lock recovery error: {msg}"
+                    )));
+                }
+                AcquireRoundOutcome::Retry {
+                    acquired,
+                    recovered,
+                } => {
+                    self.release_paths(&acquired).await;
+                    if !recovered.is_empty() {
+                        self.release_paths(&recovered).await;
                     }
-                    RecoveryOutcome::Error(msg) => {
-                        self.release_paths(&acquired_paths).await;
-                        if !recovered_paths.is_empty() {
-                            self.release_paths(&recovered_paths).await;
-                        }
-                        return Err(Error::StorageBackend(format!(
-                            "S3 lock recovery error: {msg}"
+                    if retries == 0 {
+                        LOCK_ACQUISITION_DURATION
+                            .with_label_values(&["s3"])
+                            .observe(start.elapsed().as_secs_f64() * 1000.0);
+                        LOCK_ACQUISITIONS
+                            .with_label_values(&["s3", "timeout"])
+                            .inc();
+                        return Err(Error::Lock(format!(
+                            "Failed to acquire S3 locks after {} attempts for keys: {:?}",
+                            self.max_retries, keys
                         )));
                     }
-                    RecoveryOutcome::Failed
-                    | RecoveryOutcome::NotStale
-                    | RecoveryOutcome::Retry => {}
+                    retries -= 1;
+                    let attempt = self.max_retries - retries;
+                    LOCK_RETRIES.with_label_values(&["s3"]).inc();
+                    debug!(retries_left = retries, "S3 lock busy, retrying...");
+                    tokio::time::sleep(self.jittered_delay(attempt)).await;
                 }
             }
-
-            if recovered_paths.len() + acquired_paths.len() == lock_paths.len() {
-                return Ok(self.make_guard(lock_paths));
-            }
-
-            self.release_paths(&acquired_paths).await;
-            if !recovered_paths.is_empty() {
-                self.release_paths(&recovered_paths).await;
-            }
-
-            if retries == 0 {
-                return Err(Error::Lock(format!(
-                    "Failed to acquire S3 locks after {} attempts for keys: {:?}",
-                    self.max_retries, keys
-                )));
-            }
-
-            retries -= 1;
-            let attempt = self.max_retries - retries;
-            debug!(retries_left = retries, "S3 lock busy, retrying...");
-            tokio::time::sleep(self.jittered_delay(attempt)).await;
         }
     }
 }

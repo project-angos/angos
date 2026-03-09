@@ -309,6 +309,22 @@ Lock is held during:
 - Blob link creation
 - Upload completion
 
+### Monitoring Lock Operations
+
+Lock operations emit Prometheus metrics for observability. Key metrics to monitor:
+
+- `lock_acquisition_duration_ms` — Histogram of lock acquisition times (e.g., p99 > 500ms indicates S3 latency degradation)
+- `lock_retries_total` — Counter of lock acquisition retries (e.g., rising rate indicates lock contention)
+- `lock_invalidations_total{reason="heartbeat_failure"}` — Stale heartbeat failures (e.g., indicates S3 connectivity issues)
+- `lock_recoveries_total` — Counter of stale lock recovery attempts (e.g., indicates crashed instances)
+
+For multi-instance deployments, alert on:
+- **High `lock_retries_total` rate**: Rising retry rate during normal operation suggests lock contention and may indicate insufficient `max_retries` or `retry_delay_ms` tuning.
+- **`lock_invalidations_total{reason="heartbeat_failure"}`**: Heartbeat failures suggest network issues between the registry and S3. Consider checking S3 connectivity, network quality, and lock timeout settings.
+- **High `lock_acquisition_duration_ms` p99**: Persistent p99 latency > expected S3 latency may indicate saturation or regional latency issues.
+
+See the [configuration reference](../reference/configuration.md#prometheus-metrics) for the full metrics list.
+
 ---
 
 ## Multi-Instance Consistency

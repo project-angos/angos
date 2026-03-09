@@ -340,6 +340,27 @@ Webhooks are enabled by referencing their names:
 | `endpoint`      | string | required | OpenTelemetry endpoint    |
 | `sampling_rate` | f64    | required | Sampling rate (0.0 - 1.0) |
 
+### Prometheus Metrics
+
+Angos emits Prometheus metrics on the `/metrics` endpoint. The following metrics are available for lock operations:
+
+**Lock Metrics:**
+
+| Metric | Type | Labels | Description |
+|--------|------|--------|-------------|
+| `lock_acquisition_duration_ms` | Histogram | `backend` | Lock acquisition duration in milliseconds |
+| `lock_acquisitions_total` | Counter | `backend`, `result` | Total lock acquisition attempts |
+| `lock_retries_total` | Counter | `backend` | Total lock acquisition retries |
+| `lock_invalidations_total` | Counter | `backend`, `reason` | Total lock invalidations |
+| `lock_recoveries_total` | Counter | `backend`, `result` | Total stale lock recovery attempts |
+
+**Label Values:**
+
+- `backend`: `s3`, `redis`, `memory`
+- `result` (acquisitions): `success`, `timeout`, `error`
+- `result` (recoveries): `acquired`, `not_stale`, `failed`, `error`
+- `reason` (invalidations): `ownership_lost`, `max_hold`, `heartbeat_failure`, `etag_unavailable`, `file_disappeared`
+
 ---
 
 ## Web UI (`ui`)

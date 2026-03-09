@@ -8,9 +8,12 @@ use redis::Client;
 use tokio::{sync::Notify, task::JoinHandle, time::sleep};
 use tracing::debug;
 
-use crate::registry::metadata_store::{
-    Error,
-    lock::{LockBackend, LockGuard},
+use crate::{
+    metrics_provider::{LOCK_ACQUISITION_DURATION, LOCK_ACQUISITIONS, LOCK_RETRIES},
+    registry::metadata_store::{
+        Error,
+        lock::{LockBackend, LockGuard},
+    },
 };
 
 const ACQUIRE_SCRIPT: &str = r"
@@ -127,6 +130,8 @@ impl LockBackend for RedisBackend {
             })));
         }
 
+        let start = std::time::Instant::now();
+
         let lock_keys: Vec<String> = keys
             .iter()
             .map(|k| format!("{}{}", self.key_prefix, k))
@@ -135,14 +140,33 @@ impl LockBackend for RedisBackend {
         let retry_delay = Duration::from_millis(self.retry_delay_ms);
 
         loop {
-            let mut conn = self.client.get_multiplexed_async_connection().await?;
+            let mut conn = self
+                .client
+                .get_multiplexed_async_connection()
+                .await
+                .inspect_err(|_| {
+                    LOCK_ACQUISITION_DURATION
+                        .with_label_values(&["redis"])
+                        .observe(start.elapsed().as_secs_f64() * 1000.0);
+                    LOCK_ACQUISITIONS
+                        .with_label_values(&["redis", "error"])
+                        .inc();
+                })?;
 
             let acquired: i32 = redis::Script::new(ACQUIRE_SCRIPT)
                 .key(&lock_keys)
                 .arg(1)
                 .arg(self.ttl)
                 .invoke_async(&mut conn)
-                .await?;
+                .await
+                .inspect_err(|_| {
+                    LOCK_ACQUISITION_DURATION
+                        .with_label_values(&["redis"])
+                        .observe(start.elapsed().as_secs_f64() * 1000.0);
+                    LOCK_ACQUISITIONS
+                        .with_label_values(&["redis", "error"])
+                        .inc();
+                })?;
 
             if acquired == 1 {
                 let stop_notify = Arc::new(Notify::new());
@@ -173,6 +197,13 @@ impl LockBackend for RedisBackend {
                     }
                 });
 
+                LOCK_ACQUISITION_DURATION
+                    .with_label_values(&["redis"])
+                    .observe(start.elapsed().as_secs_f64() * 1000.0);
+                LOCK_ACQUISITIONS
+                    .with_label_values(&["redis", "success"])
+                    .inc();
+
                 return Ok(LockGuard::sync(Box::new(RedisGuard {
                     refresh_handle,
                     stop_notify,
@@ -182,12 +213,19 @@ impl LockBackend for RedisBackend {
             }
 
             if retries == 0 {
+                LOCK_ACQUISITION_DURATION
+                    .with_label_values(&["redis"])
+                    .observe(start.elapsed().as_secs_f64() * 1000.0);
+                LOCK_ACQUISITIONS
+                    .with_label_values(&["redis", "timeout"])
+                    .inc();
                 return Err(Error::Lock(format!(
                     "Failed to acquire locks for keys: {keys:?}"
                 )));
             }
 
             retries -= 1;
+            LOCK_RETRIES.with_label_values(&["redis"]).inc();
             debug!("Lock busy, retrying... ({} attempts left)", retries);
             tokio::time::sleep(retry_delay).await;
         }

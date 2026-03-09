@@ -13,9 +13,12 @@ use std::{
 use async_trait::async_trait;
 use tokio::sync::{Mutex, OwnedMutexGuard};
 
-use crate::registry::metadata_store::{
-    Error,
-    lock::{LockBackend, LockGuard},
+use crate::{
+    metrics_provider::{LOCK_ACQUISITION_DURATION, LOCK_ACQUISITIONS},
+    registry::metadata_store::{
+        Error,
+        lock::{LockBackend, LockGuard},
+    },
 };
 
 pub struct MemoryGuard {
@@ -47,6 +50,7 @@ impl MemoryBackend {
 #[async_trait]
 impl LockBackend for MemoryBackend {
     async fn acquire(&self, keys: &[String]) -> Result<LockGuard, Error> {
+        let start = std::time::Instant::now();
         let count = self.counter.fetch_add(1, Ordering::Relaxed);
 
         let mut sorted_keys: Vec<&String> = keys.iter().collect();
@@ -83,6 +87,13 @@ impl LockBackend for MemoryBackend {
         for mutex in mutexes {
             guards.push(mutex.lock_owned().await);
         }
+
+        LOCK_ACQUISITION_DURATION
+            .with_label_values(&["memory"])
+            .observe(start.elapsed().as_secs_f64() * 1000.0);
+        LOCK_ACQUISITIONS
+            .with_label_values(&["memory", "success"])
+            .inc();
 
         Ok(LockGuard::sync(Box::new(MemoryGuard { _guards: guards })))
     }
