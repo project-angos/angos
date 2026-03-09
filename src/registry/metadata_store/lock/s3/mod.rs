@@ -401,9 +401,16 @@ impl S3LockBackend {
                     return;
                 }
 
+                let results: Vec<HeartbeatPathResult> = join_all(
+                    paths
+                        .iter()
+                        .map(|path| heartbeat_tick_path(&store, path, &instance_id, ttl_secs)),
+                )
+                .await;
+
                 let mut tick_had_failure = false;
-                for path in &paths {
-                    match heartbeat_tick_path(&store, path, &instance_id, ttl_secs).await {
+                for result in results {
+                    match result {
                         HeartbeatPathResult::Ok => {}
                         HeartbeatPathResult::Invalidate(reason) => {
                             LOCK_INVALIDATIONS.with_label_values(&["s3", reason]).inc();
