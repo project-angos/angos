@@ -1,4 +1,11 @@
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Duration,
+};
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -179,6 +186,16 @@ impl AccessTimeWriter {
     }
 }
 
+struct FlushHandle {
+    shutdown: Arc<AtomicBool>,
+}
+
+impl Drop for FlushHandle {
+    fn drop(&mut self) {
+        self.shutdown.store(true, Ordering::Release);
+    }
+}
+
 #[derive(Clone)]
 pub struct Backend {
     pub store: data_store::s3::Backend,
@@ -186,6 +203,9 @@ pub struct Backend {
     cache: Option<Arc<dyn Cache>>,
     link_cache_ttl: u64,
     access_time_writer: Option<AccessTimeWriter>,
+    // Held for Drop side-effect: signals the flush task to exit when the last Backend is dropped.
+    #[allow(dead_code)]
+    flush_handle: Option<Arc<FlushHandle>>,
 }
 
 const MAX_UPDATE_RETRIES: u32 = 10;
@@ -229,24 +249,43 @@ impl Backend {
             None
         };
 
+        let flush_handle = if config.access_time_debounce_secs > 0 {
+            let shutdown = Arc::new(AtomicBool::new(false));
+            let shutdown_flag = shutdown.clone();
+            let interval = Duration::from_secs(config.access_time_debounce_secs);
+
+            let flush_backend = Self {
+                store: store.clone(),
+                lock: lock.clone(),
+                cache: None,
+                link_cache_ttl: config.link_cache_ttl,
+                access_time_writer: access_time_writer.clone(),
+                flush_handle: None,
+            };
+
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(interval).await;
+                    if shutdown_flag.load(Ordering::Acquire) {
+                        return;
+                    }
+                    flush_backend.flush_access_times().await;
+                }
+            });
+
+            Some(Arc::new(FlushHandle { shutdown }))
+        } else {
+            None
+        };
+
         let backend = Self {
             store,
             lock,
             cache: None,
             link_cache_ttl: config.link_cache_ttl,
             access_time_writer,
+            flush_handle,
         };
-
-        if config.access_time_debounce_secs > 0 {
-            let flush_backend = backend.clone();
-            let interval = Duration::from_secs(config.access_time_debounce_secs);
-            tokio::spawn(async move {
-                loop {
-                    tokio::time::sleep(interval).await;
-                    flush_backend.flush_access_times().await;
-                }
-            });
-        }
 
         Ok(backend)
     }
