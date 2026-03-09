@@ -139,7 +139,7 @@ async fn test_stale_lock_recovery() {
     let backend = S3LockBackend::new(
         store,
         &S3LockConfig {
-            ttl_secs: 3,
+            ttl_secs: 9,
             max_retries: 0,
             retry_delay_ms: 1,
             max_hold_secs: 300,
@@ -244,7 +244,7 @@ async fn test_heartbeat_invalidates_guard_on_ownership_loss() {
     let backend = S3LockBackend::new(
         store.clone(),
         &S3LockConfig {
-            ttl_secs: 3,
+            ttl_secs: 9,
             max_retries: 0,
             retry_delay_ms: 1,
             max_hold_secs: 300,
@@ -274,7 +274,8 @@ async fn test_heartbeat_invalidates_guard_on_ownership_loss() {
         .await
         .expect("Failed to overwrite lock");
 
-    tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+    // Heartbeat interval is ttl/3 = 3s; sleep 4s to ensure at least one tick fires
+    tokio::time::sleep(tokio::time::Duration::from_secs(4)).await;
 
     assert!(
         !guard.is_valid(),
@@ -321,7 +322,7 @@ async fn test_release_skips_delete_when_ownership_lost() {
     let backend = S3LockBackend::new(
         store.clone(),
         &S3LockConfig {
-            ttl_secs: 3,
+            ttl_secs: 9,
             max_retries: 0,
             retry_delay_ms: 1,
             max_hold_secs: 300,
@@ -346,7 +347,8 @@ async fn test_release_skips_delete_when_ownership_lost() {
         .await
         .expect("Failed to overwrite lock");
 
-    tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+    // Heartbeat interval is ttl/3 = 3s; sleep 4s to ensure at least one tick fires
+    tokio::time::sleep(tokio::time::Duration::from_secs(4)).await;
     assert!(
         !guard.is_valid(),
         "Guard should be invalid after ownership loss"

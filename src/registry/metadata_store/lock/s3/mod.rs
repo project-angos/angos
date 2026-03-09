@@ -35,9 +35,9 @@ const MAX_LOCK_TTL_SECS: u64 = 3600;
 
 fn deserialize_ttl_secs<'de, D: Deserializer<'de>>(deserializer: D) -> Result<u64, D::Error> {
     let value = u64::deserialize(deserializer)?;
-    if value < 3 {
+    if value < 9 {
         return Err(serde::de::Error::custom(
-            "ttl_secs must be at least 3 (heartbeat runs at ttl/3)",
+            "ttl_secs must be at least 9 (heartbeat runs at ttl/3)",
         ));
     }
     Ok(value)
@@ -164,8 +164,8 @@ pub struct S3LockBackend {
 
 impl S3LockBackend {
     pub fn new(store: Arc<data_store::s3::Backend>, config: &S3LockConfig) -> Result<Self, Error> {
-        if config.ttl_secs < 3 {
-            return Err(Error::InvalidData("ttl_secs must be at least 3".into()));
+        if config.ttl_secs < 9 {
+            return Err(Error::InvalidData("ttl_secs must be at least 9".into()));
         }
         if config.retry_delay_ms < 1 {
             return Err(Error::InvalidData(
