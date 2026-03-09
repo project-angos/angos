@@ -243,6 +243,17 @@ impl Backend {
             }
         };
 
+        if config.access_time_debounce_secs == 0
+            && matches!(config.lock_strategy, LockStrategy::S3(_))
+        {
+            warn!(
+                "access_time_debounce_secs is 0 with S3 lock strategy; \
+                 every manifest pull will acquire an S3 lock for access time updates, \
+                 which adds significant latency and S3 API cost at scale. \
+                 Consider setting access_time_debounce_secs to 60 or higher."
+            );
+        }
+
         let access_time_writer = if config.access_time_debounce_secs > 0 {
             Some(AccessTimeWriter::new())
         } else {

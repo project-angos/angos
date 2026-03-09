@@ -399,6 +399,8 @@ Access time updates (`last_pulled_at`) are buffered in memory and flushed to S3 
 - If an instance crashes before flushing, those buffered updates are lost.
 - Multiple instances may overwrite each other's access times (last writer wins).
 
+> **S3 Lock Performance:** When using S3 lock strategy, setting `access_time_debounce_secs = 0` disables buffering and causes every manifest pull to perform a lock-acquire → read → write → release cycle. This is particularly expensive with S3 locking and should be avoided in production. Use the default debounce value (60s or higher) for S3-locked deployments.
+
 For retention policies that use `last_pulled_at`, set thresholds in **days rather than minutes** to account for this imprecision. For example:
 
 ```toml
