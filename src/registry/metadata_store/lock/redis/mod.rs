@@ -8,7 +8,10 @@ use redis::Client;
 use tokio::{sync::Notify, task::JoinHandle, time::sleep};
 use tracing::debug;
 
-use crate::registry::metadata_store::{Error, lock::LockBackend};
+use crate::registry::metadata_store::{
+    Error,
+    lock::{LockBackend, LockGuard},
+};
 
 const ACQUIRE_SCRIPT: &str = r"
 for i, key in ipairs(KEYS) do
@@ -114,16 +117,14 @@ impl Drop for RedisGuard {
 
 #[async_trait]
 impl LockBackend for RedisBackend {
-    type Guard = Box<dyn Send>;
-
-    async fn acquire(&self, keys: &[String]) -> Result<Self::Guard, Error> {
+    async fn acquire(&self, keys: &[String]) -> Result<LockGuard, Error> {
         if keys.is_empty() {
-            return Ok(Box::new(RedisGuard {
+            return Ok(LockGuard::sync(Box::new(RedisGuard {
                 refresh_handle: tokio::spawn(async {}),
                 stop_notify: Arc::new(Notify::new()),
                 client: self.client.clone(),
                 keys: Vec::new(),
-            }));
+            })));
         }
 
         let lock_keys: Vec<String> = keys
@@ -172,12 +173,12 @@ impl LockBackend for RedisBackend {
                     }
                 });
 
-                return Ok(Box::new(RedisGuard {
+                return Ok(LockGuard::sync(Box::new(RedisGuard {
                     refresh_handle,
                     stop_notify,
                     client: self.client.clone(),
                     keys: lock_keys,
-                }));
+                })));
             }
 
             if retries == 0 {

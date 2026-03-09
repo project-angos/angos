@@ -1041,7 +1041,7 @@ pub mod tests {
             bucket: "registry".to_string(),
             region: "region".to_string(),
             key_prefix: unique_prefix.clone(),
-            redis: None,
+            lock_strategy: crate::registry::metadata_store::LockStrategy::Memory,
             link_cache_ttl: 0, // disable link cache so reads go to S3
             access_time_debounce_secs: 3600,
         };

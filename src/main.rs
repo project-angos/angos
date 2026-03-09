@@ -150,6 +150,12 @@ async fn run_scrub(options: scrub::Options, config: Configuration) -> Result<(),
 }
 
 async fn run_server(options: GlobalArguments, config: Configuration) -> Result<(), server::Error> {
+    config
+        .resolve_metadata_config()
+        .probe()
+        .await
+        .map_err(|e| server::Error::Initialization(e.to_string()))?;
+
     let server = Arc::new(server::Command::new(&config)?);
 
     let Ok(_watcher) = ConfigWatcher::new(&options.config, server.clone()) else {

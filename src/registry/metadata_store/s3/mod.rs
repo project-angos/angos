@@ -17,7 +17,7 @@ use crate::{
         data_store,
         metadata_store::{
             BlobIndex, BlobIndexOperation, Error, LinkMetadata, LinkOperation, LockConfig,
-            MetadataStore,
+            LockStrategy, MetadataStore,
             link_kind::LinkKind,
             lock::{self, LockBackend, MemoryBackend},
         },
@@ -25,21 +25,75 @@ use crate::{
     },
 };
 
-#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct BackendConfig {
     pub access_key_id: String,
     pub secret_key: String,
     pub endpoint: String,
     pub bucket: String,
     pub region: String,
-    #[serde(default)]
     pub key_prefix: String,
-    #[serde(default)]
-    pub redis: Option<LockConfig>,
-    #[serde(default = "default_link_cache_ttl")]
+    pub lock_strategy: LockStrategy,
     pub link_cache_ttl: u64,
-    #[serde(default = "default_access_time_debounce")]
     pub access_time_debounce_secs: u64,
+}
+
+impl Default for BackendConfig {
+    fn default() -> Self {
+        Self {
+            access_key_id: String::new(),
+            secret_key: String::new(),
+            endpoint: String::new(),
+            bucket: String::new(),
+            region: String::new(),
+            key_prefix: String::new(),
+            lock_strategy: LockStrategy::Memory,
+            link_cache_ttl: default_link_cache_ttl(),
+            access_time_debounce_secs: default_access_time_debounce(),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for BackendConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct Raw {
+            access_key_id: String,
+            secret_key: String,
+            endpoint: String,
+            bucket: String,
+            region: String,
+            #[serde(default)]
+            key_prefix: String,
+            #[serde(default)]
+            redis: Option<LockConfig>,
+            #[serde(default)]
+            lock_strategy: Option<LockStrategy>,
+            #[serde(default = "default_link_cache_ttl")]
+            link_cache_ttl: u64,
+            #[serde(default = "default_access_time_debounce")]
+            access_time_debounce_secs: u64,
+        }
+
+        let raw = Raw::deserialize(deserializer)?;
+
+        let lock_strategy = lock::resolve_lock_strategy(raw.lock_strategy, raw.redis, true)?;
+
+        Ok(BackendConfig {
+            access_key_id: raw.access_key_id,
+            secret_key: raw.secret_key,
+            endpoint: raw.endpoint,
+            bucket: raw.bucket,
+            region: raw.region,
+            key_prefix: raw.key_prefix,
+            lock_strategy,
+            link_cache_ttl: raw.link_cache_ttl,
+            access_time_debounce_secs: raw.access_time_debounce_secs,
+        })
+    }
 }
 
 fn default_link_cache_ttl() -> u64 {
@@ -100,7 +154,7 @@ impl AccessTimeWriter {
     }
 
     async fn flush_one(backend: &Backend, namespace: &str, link: &LinkKind) -> Result<(), Error> {
-        let _guard = backend.lock.acquire(&[link.to_string()]).await?;
+        let guard = backend.lock.acquire(&[link.to_string()]).await?;
         let link_data = backend
             .read_link_reference(namespace, link)
             .await?
@@ -108,6 +162,7 @@ impl AccessTimeWriter {
         backend
             .write_link_reference(namespace, link, &link_data)
             .await?;
+        guard.release().await;
         Ok(())
     }
 }
@@ -115,7 +170,7 @@ impl AccessTimeWriter {
 #[derive(Clone)]
 pub struct Backend {
     pub store: data_store::s3::Backend,
-    lock: Arc<dyn LockBackend<Guard = Box<dyn Send>> + Send + Sync>,
+    lock: Arc<dyn LockBackend + Send + Sync>,
     cache: Option<Arc<dyn Cache>>,
     link_cache_ttl: u64,
     access_time_writer: Option<AccessTimeWriter>,
@@ -134,17 +189,28 @@ impl Backend {
             ..Default::default()
         })?;
 
-        let lock: Arc<dyn LockBackend<Guard = Box<dyn Send>> + Send + Sync> =
-            if let Some(redis_config) = &config.redis {
+        let lock: Arc<dyn LockBackend + Send + Sync> = match &config.lock_strategy {
+            LockStrategy::Redis(redis_config) => {
                 info!("Using Redis lock store for S3 metadata-store");
                 let backend = lock::RedisBackend::new(redis_config).map_err(|e| {
                     Error::Lock(format!("Failed to initialize Redis lock store: {e}"))
                 })?;
                 Arc::new(backend)
-            } else {
+            }
+            LockStrategy::S3(s3_lock_config) => {
+                info!("Using S3 lock store for S3 metadata-store");
+                let lock_store = Arc::new(store.clone());
+                Arc::new(
+                    lock::S3LockBackend::new(lock_store, s3_lock_config).map_err(|e| {
+                        Error::Lock(format!("Failed to initialize S3 lock store: {e}"))
+                    })?,
+                )
+            }
+            LockStrategy::Memory => {
                 info!("Using in-memory lock store for S3 metadata-store");
                 Arc::new(MemoryBackend::new())
-            };
+            }
+        };
 
         let access_time_writer = if config.access_time_debounce_secs > 0 {
             Some(AccessTimeWriter::new())
@@ -172,6 +238,100 @@ impl Backend {
         }
 
         Ok(backend)
+    }
+
+    pub async fn probe_conditional_write_support(
+        store: &data_store::s3::Backend,
+    ) -> Result<(), Error> {
+        let probe_key = format!("_angos_probe_{}", uuid::Uuid::new_v4());
+        let content: &[u8] = b"probe";
+
+        // Step 1: PUT the probe object
+        if let Err(e) = store.put_object(&probe_key, content).await {
+            let _ = store.delete(&probe_key).await;
+            return Err(Error::Lock(format!(
+                "S3 conditional write probe failed to create probe object: {e}"
+            )));
+        }
+
+        // Step 2: PUT again with If-None-Match: * — expect 412 PreconditionFailed
+        let if_none_match_result = store.put_object_if_not_exists(&probe_key, content).await;
+
+        // Step 3: Test If-Match — read current ETag, update should succeed
+        let if_match_result = match store.read_with_etag(&probe_key).await {
+            Ok((_, Some(etag))) => {
+                let update_result = store
+                    .put_object_if_match(&probe_key, &etag, b"updated".to_vec())
+                    .await;
+                let bogus_result = store
+                    .put_object_if_match(&probe_key, "\"bogus\"", b"fail".to_vec())
+                    .await;
+                Some((update_result, bogus_result))
+            }
+            Ok((_, None)) => {
+                let _ = store.delete(&probe_key).await;
+                return Err(Error::Lock(
+                    "S3 conditional write probe: ETag not returned, \
+                     If-Match support cannot be verified"
+                        .to_string(),
+                ));
+            }
+            Err(e) => {
+                let _ = store.delete(&probe_key).await;
+                return Err(Error::Lock(format!(
+                    "S3 conditional write probe failed to read probe object for If-Match test: {e}"
+                )));
+            }
+        };
+
+        // Step 4: Clean up probe object regardless of outcome
+        let _ = store.delete(&probe_key).await;
+
+        // Step 5: Evaluate If-None-Match result
+        match if_none_match_result {
+            Err(data_store::Error::PreconditionFailed) => {}
+            Ok(()) => {
+                return Err(Error::Lock(
+                    "S3 backend does not support If-None-Match: * conditional writes, \
+                     required for lock_strategy = s3. Use lock_strategy = redis or \
+                     lock_strategy = memory instead."
+                        .to_string(),
+                ));
+            }
+            Err(e) => {
+                return Err(Error::Lock(format!(
+                    "S3 conditional write probe (If-None-Match) failed: {e}"
+                )));
+            }
+        }
+
+        // Step 6: Evaluate If-Match results
+        if let Some((update_result, bogus_result)) = if_match_result {
+            if let Err(e) = update_result {
+                return Err(Error::Lock(format!(
+                    "S3 backend does not support If-Match conditional writes (update failed): {e}"
+                )));
+            }
+            match bogus_result {
+                Err(data_store::Error::PreconditionFailed) => {}
+                Ok(()) => {
+                    return Err(Error::Lock(
+                        "S3 backend does not enforce If-Match: bogus ETag was accepted, \
+                         required for lock heartbeat. Use lock_strategy = redis or \
+                         lock_strategy = memory instead."
+                            .to_string(),
+                    ));
+                }
+                Err(e) => {
+                    return Err(Error::Lock(format!(
+                        "S3 conditional write probe (If-Match bogus) failed unexpectedly: {e}"
+                    )));
+                }
+            }
+        }
+
+        info!("S3 conditional write probe passed (If-None-Match and If-Match supported)");
+        Ok(())
     }
 
     pub async fn flush_access_times(&self) {
@@ -492,11 +652,12 @@ impl MetadataStore for Backend {
                 writer.record(namespace, link).await;
                 Ok(link_data)
             } else {
-                let _guard = self.lock.acquire(&[link.to_string()]).await?;
+                let guard = self.lock.acquire(&[link.to_string()]).await?;
                 let link_data = self.read_link_reference(namespace, link).await?.accessed();
                 self.write_link_reference(namespace, link, &link_data)
                     .await?;
                 self.cache_put(namespace, link, &link_data).await;
+                guard.release().await;
                 Ok(link_data)
             }
         } else {
@@ -591,7 +752,7 @@ impl MetadataStore for Backend {
 
             lock_keys.sort();
             lock_keys.dedup();
-            let _guard = self.lock.acquire(&lock_keys).await?;
+            let guard = self.lock.acquire(&lock_keys).await?;
 
             let validation_results = join_all(creates.iter().map(
                 |(link, _, expected_old, _, _, _)| async move {
@@ -606,12 +767,18 @@ impl MetadataStore for Backend {
                 .iter()
                 .any(|(_, _, current_target, expected)| *current_target != *expected)
             {
+                guard.release().await;
                 continue;
             }
             for (link, metadata, _, _) in validation_results {
                 if let Some(m) = metadata {
                     link_cache.insert(link, m);
                 }
+            }
+
+            if !guard.is_valid() {
+                guard.release().await;
+                return Err(Error::Lock("lock invalidated during operation".into()));
             }
 
             let delete_results =
@@ -638,6 +805,7 @@ impl MetadataStore for Backend {
                 }
             }
             if needs_retry {
+                guard.release().await;
                 continue;
             }
 
@@ -688,6 +856,11 @@ impl MetadataStore for Backend {
                     ));
                 }
             }
+            if !guard.is_valid() {
+                guard.release().await;
+                return Err(Error::Lock("lock invalidated during operation".into()));
+            }
+
             join_all(
                 tracked_create_writes
                     .iter()
@@ -730,6 +903,11 @@ impl MetadataStore for Backend {
                         .push(BlobIndexOperation::Remove(link.clone()));
                 }
             }
+            if !guard.is_valid() {
+                guard.release().await;
+                return Err(Error::Lock("lock invalidated during operation".into()));
+            }
+
             join_all(
                 tracked_delete_writes
                     .iter()
@@ -758,6 +936,11 @@ impl MetadataStore for Backend {
             .await
             .into_iter()
             .collect::<Result<Vec<_>, _>>()?;
+
+            if !guard.is_valid() {
+                guard.release().await;
+                return Err(Error::Lock("lock invalidated during operation".into()));
+            }
 
             join_all(pending_blob_ops.iter().map(|(digest, ops)| async move {
                 let path = path_builder::blob_index_path(digest);
@@ -793,6 +976,11 @@ impl MetadataStore for Backend {
             .into_iter()
             .collect::<Result<Vec<_>, _>>()?;
 
+            if !guard.is_valid() {
+                guard.release().await;
+                return Err(Error::Lock("lock invalidated during operation".into()));
+            }
+
             for (link, metadata) in tracked_create_writes
                 .iter()
                 .chain(non_tracked_create_writes.iter())
@@ -803,6 +991,7 @@ impl MetadataStore for Backend {
                 self.cache_invalidate(namespace, link).await;
             }
 
+            guard.release().await;
             return Ok(());
         }
     }
@@ -910,7 +1099,7 @@ mod tests {
             region: "region".to_string(),
             bucket: "registry".to_string(),
             key_prefix: format!("test-cache-{}", uuid::Uuid::new_v4()),
-            redis: None,
+            lock_strategy: LockStrategy::Memory,
             link_cache_ttl: 30,
             access_time_debounce_secs: 0,
         }
@@ -1983,6 +2172,27 @@ mod tests {
         assert!(
             !pending.is_empty(),
             "writer.record() should have been called even on cache hit"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_probe_conditional_write_support() {
+        let config = test_config();
+        let store = data_store::s3::Backend::new(&data_store::s3::BackendConfig {
+            access_key_id: config.access_key_id.clone(),
+            secret_key: config.secret_key.clone(),
+            endpoint: config.endpoint.clone(),
+            bucket: config.bucket.clone(),
+            region: config.region.clone(),
+            key_prefix: config.key_prefix.clone(),
+            ..Default::default()
+        })
+        .unwrap();
+
+        let result = Backend::probe_conditional_write_support(&store).await;
+        assert!(
+            result.is_ok(),
+            "Probe should pass on MinIO (supports If-None-Match): {result:?}"
         );
     }
 }

@@ -13,7 +13,10 @@ use std::{
 use async_trait::async_trait;
 use tokio::sync::{Mutex, OwnedMutexGuard};
 
-use crate::registry::metadata_store::{Error, lock::LockBackend};
+use crate::registry::metadata_store::{
+    Error,
+    lock::{LockBackend, LockGuard},
+};
 
 pub struct MemoryGuard {
     _guards: Vec<OwnedMutexGuard<()>>,
@@ -43,18 +46,20 @@ impl MemoryBackend {
 
 #[async_trait]
 impl LockBackend for MemoryBackend {
-    type Guard = Box<dyn Send>;
-
-    async fn acquire(&self, keys: &[String]) -> Result<Self::Guard, Error> {
+    async fn acquire(&self, keys: &[String]) -> Result<LockGuard, Error> {
         let count = self.counter.fetch_add(1, Ordering::Relaxed);
+
+        let mut sorted_keys: Vec<&String> = keys.iter().collect();
+        sorted_keys.sort();
+        sorted_keys.dedup();
 
         let mut locks = self.locks.lock().await;
         if count.is_multiple_of(10000) {
             locks.retain(|_, weak| weak.upgrade().is_some());
         }
 
-        let mut mutexes = Vec::with_capacity(keys.len());
-        for key in keys {
+        let mut mutexes = Vec::with_capacity(sorted_keys.len());
+        for key in sorted_keys {
             let mutex = if let Some(weak) = locks.get(key) {
                 if let Some(lock) = weak.upgrade() {
                     lock
@@ -79,6 +84,6 @@ impl LockBackend for MemoryBackend {
             guards.push(mutex.lock_owned().await);
         }
 
-        Ok(Box::new(MemoryGuard { _guards: guards }))
+        Ok(LockGuard::sync(Box::new(MemoryGuard { _guards: guards })))
     }
 }

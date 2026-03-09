@@ -234,8 +234,8 @@ impl Configuration {
                 blob_store::BlobStorageConfig::FS(config) => {
                     metadata_store::MetadataStoreConfig::FS(metadata_store::fs::BackendConfig {
                         root_dir: config.root_dir.clone(),
-                        redis: None,
                         sync_to_disk: config.sync_to_disk,
+                        ..Default::default()
                     })
                 }
                 blob_store::BlobStorageConfig::S3(config) => {
@@ -247,9 +247,7 @@ impl Configuration {
                         access_key_id: config.access_key_id.clone(),
                         secret_key: config.secret_key.clone(),
                         key_prefix: config.key_prefix.clone(),
-                        redis: None,
-                        link_cache_ttl: 30,
-                        access_time_debounce_secs: 60,
+                        ..Default::default()
                     })
                 }
             },
@@ -509,7 +507,10 @@ mod tests {
             metadata_store::MetadataStoreConfig::FS(fs_config) => {
                 assert_eq!(fs_config.root_dir, "/data/blobs");
                 assert!(fs_config.sync_to_disk);
-                assert!(fs_config.redis.is_none());
+                assert_eq!(
+                    fs_config.lock_strategy,
+                    metadata_store::LockStrategy::Memory
+                );
             }
             metadata_store::MetadataStoreConfig::S3(_) => {
                 panic!("Expected FS metadata store config")
@@ -543,7 +544,10 @@ mod tests {
                 assert_eq!(s3_config.access_key_id, "key123");
                 assert_eq!(s3_config.secret_key, "secret456");
                 assert_eq!(s3_config.key_prefix, "prefix/");
-                assert!(s3_config.redis.is_none());
+                assert_eq!(
+                    s3_config.lock_strategy,
+                    metadata_store::LockStrategy::Memory
+                );
             }
             metadata_store::MetadataStoreConfig::FS(_) => {
                 panic!("Expected S3 metadata store config")
@@ -885,8 +889,13 @@ mod tests {
         match metadata_config {
             metadata_store::MetadataStoreConfig::S3(s3_config) => {
                 assert_eq!(s3_config.bucket, "metadata-bucket");
-                assert!(s3_config.redis.is_some());
-                assert_eq!(s3_config.redis.unwrap().url, "redis://localhost:6379");
+                match &s3_config.lock_strategy {
+                    metadata_store::LockStrategy::Redis(lock_config) => {
+                        assert_eq!(lock_config.url, "redis://localhost:6379");
+                        assert_eq!(lock_config.ttl, 30);
+                    }
+                    other => panic!("Expected Redis lock strategy, got {other:?}"),
+                }
             }
             metadata_store::MetadataStoreConfig::FS(_) => {
                 panic!("Expected S3 metadata store config")
@@ -914,8 +923,13 @@ mod tests {
         match metadata_config {
             metadata_store::MetadataStoreConfig::FS(fs_config) => {
                 assert_eq!(fs_config.root_dir, "/data/metadata");
-                assert!(fs_config.redis.is_some());
-                assert_eq!(fs_config.redis.unwrap().url, "redis://localhost:6379");
+                match &fs_config.lock_strategy {
+                    metadata_store::LockStrategy::Redis(lock_config) => {
+                        assert_eq!(lock_config.url, "redis://localhost:6379");
+                        assert_eq!(lock_config.ttl, 30);
+                    }
+                    other => panic!("Expected Redis lock strategy, got {other:?}"),
+                }
             }
             metadata_store::MetadataStoreConfig::S3(_) => {
                 panic!("Expected FS metadata store config")
@@ -1341,5 +1355,197 @@ mod tests {
             }
             _ => panic!("Expected InvalidFormat error"),
         }
+    }
+
+    #[tokio::test]
+    async fn test_metadata_store_s3_lock_strategy_s3_defaults() {
+        let config = r#"
+        [server]
+        bind_address = "0.0.0.0"
+
+        [blob_store.s3]
+        bucket = "blob-bucket"
+        region = "us-east-1"
+        endpoint = "https://s3.amazonaws.com"
+        access_key_id = "blob-key"
+        secret_key = "blob-secret"
+
+        [metadata_store.s3]
+        bucket = "metadata-bucket"
+        region = "us-east-1"
+        endpoint = "https://s3.amazonaws.com"
+        access_key_id = "key"
+        secret_key = "secret"
+
+        [metadata_store.s3.lock_strategy.s3]
+        "#;
+
+        let config = Configuration::load_from_str(config).unwrap();
+        let metadata_config = config.resolve_metadata_config();
+
+        match metadata_config {
+            metadata_store::MetadataStoreConfig::S3(s3_config) => {
+                assert_eq!(s3_config.bucket, "metadata-bucket");
+                match &s3_config.lock_strategy {
+                    metadata_store::LockStrategy::S3(lock_config) => {
+                        assert_eq!(lock_config.ttl_secs, 30);
+                        assert_eq!(lock_config.max_retries, 100);
+                        assert_eq!(lock_config.retry_delay_ms, 50);
+                    }
+                    other => panic!("Expected S3 lock strategy, got {other:?}"),
+                }
+            }
+            metadata_store::MetadataStoreConfig::FS(_) => {
+                panic!("Expected S3 metadata store config")
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_metadata_store_s3_lock_strategy_s3_custom_values() {
+        let config = r#"
+        [server]
+        bind_address = "0.0.0.0"
+
+        [blob_store.s3]
+        bucket = "blob-bucket"
+        region = "us-east-1"
+        endpoint = "https://s3.amazonaws.com"
+        access_key_id = "blob-key"
+        secret_key = "blob-secret"
+
+        [metadata_store.s3]
+        bucket = "metadata-bucket"
+        region = "us-east-1"
+        endpoint = "https://s3.amazonaws.com"
+        access_key_id = "key"
+        secret_key = "secret"
+
+        [metadata_store.s3.lock_strategy.s3]
+        ttl_secs = 60
+        max_retries = 50
+        retry_delay_ms = 100
+        "#;
+
+        let config = Configuration::load_from_str(config).unwrap();
+        let metadata_config = config.resolve_metadata_config();
+
+        match metadata_config {
+            metadata_store::MetadataStoreConfig::S3(s3_config) => match &s3_config.lock_strategy {
+                metadata_store::LockStrategy::S3(lock_config) => {
+                    assert_eq!(lock_config.ttl_secs, 60);
+                    assert_eq!(lock_config.max_retries, 50);
+                    assert_eq!(lock_config.retry_delay_ms, 100);
+                }
+                other => panic!("Expected S3 lock strategy, got {other:?}"),
+            },
+            metadata_store::MetadataStoreConfig::FS(_) => {
+                panic!("Expected S3 metadata store config")
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_metadata_store_s3_lock_strategy_memory() {
+        let config = r#"
+        [server]
+        bind_address = "0.0.0.0"
+
+        [blob_store.s3]
+        bucket = "blob-bucket"
+        region = "us-east-1"
+        endpoint = "https://s3.amazonaws.com"
+        access_key_id = "blob-key"
+        secret_key = "blob-secret"
+
+        [metadata_store.s3]
+        bucket = "metadata-bucket"
+        region = "us-east-1"
+        endpoint = "https://s3.amazonaws.com"
+        access_key_id = "key"
+        secret_key = "secret"
+        lock_strategy = "memory"
+        "#;
+
+        let config = Configuration::load_from_str(config).unwrap();
+        let metadata_config = config.resolve_metadata_config();
+
+        match metadata_config {
+            metadata_store::MetadataStoreConfig::S3(s3_config) => {
+                assert!(
+                    matches!(
+                        s3_config.lock_strategy,
+                        metadata_store::LockStrategy::Memory
+                    ),
+                    "Expected Memory lock strategy, got {:?}",
+                    s3_config.lock_strategy
+                );
+            }
+            metadata_store::MetadataStoreConfig::FS(_) => {
+                panic!("Expected S3 metadata store config")
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_metadata_store_s3_both_redis_and_lock_strategy_fails() {
+        let config = r#"
+        [server]
+        bind_address = "0.0.0.0"
+
+        [blob_store.s3]
+        bucket = "blob-bucket"
+        region = "us-east-1"
+        endpoint = "https://s3.amazonaws.com"
+        access_key_id = "blob-key"
+        secret_key = "blob-secret"
+
+        [metadata_store.s3]
+        bucket = "metadata-bucket"
+        region = "us-east-1"
+        endpoint = "https://s3.amazonaws.com"
+        access_key_id = "key"
+        secret_key = "secret"
+        lock_strategy = "memory"
+
+        [metadata_store.s3.redis]
+        url = "redis://localhost:6379"
+        ttl = 30
+        "#;
+
+        let result = Configuration::load_from_str(config);
+        assert!(
+            result.is_err(),
+            "Expected error when both redis and lock_strategy are set"
+        );
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("lock_strategy") && err_msg.contains("redis"),
+            "Error should mention both 'lock_strategy' and 'redis', got: {err_msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_metadata_store_fs_lock_strategy_s3_fails() {
+        let config = r#"
+        [server]
+        bind_address = "0.0.0.0"
+
+        [metadata_store.fs]
+        root_dir = "/data/metadata"
+
+        [metadata_store.fs.lock_strategy.s3]
+        "#;
+
+        let result = Configuration::load_from_str(config);
+        assert!(
+            result.is_err(),
+            "Expected error when S3 lock strategy is used with FS metadata store"
+        );
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("S3 lock strategy") || err_msg.contains("filesystem"),
+            "Error should explain S3 lock strategy is unsupported for FS store, got: {err_msg}"
+        );
     }
 }

@@ -6,6 +6,7 @@ use std::{
 use aws_sdk_s3::{
     Client as S3Client, Config as S3Config,
     config::{BehaviorVersion, Credentials, Region, retry::RetryConfig, timeout::TimeoutConfig},
+    error::ProvideErrorMetadata,
     operation::get_object::GetObjectOutput,
     primitives::ByteStream,
     types::{CompletedMultipartUpload, CompletedPart, Delete, ObjectIdentifier},
@@ -55,11 +56,29 @@ impl Default for BackendConfig {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct Backend {
     s3_client: S3Client,
     bucket: String,
     key_prefix: String,
+}
+
+const S3_ERROR_PRECONDITION_FAILED: &str = "PreconditionFailed";
+const S3_ERROR_CONDITIONAL_REQUEST_CONFLICT: &str = "ConditionalRequestConflict";
+
+fn is_conditional_write_conflict(error: &(impl ProvideErrorMetadata + std::fmt::Display)) -> bool {
+    let code = error.code().unwrap_or_default();
+    code == S3_ERROR_PRECONDITION_FAILED || code == S3_ERROR_CONDITIONAL_REQUEST_CONFLICT
+}
+
+fn classify_conditional_put_error(
+    error: &(impl ProvideErrorMetadata + std::fmt::Display),
+) -> Error {
+    if is_conditional_write_conflict(error) {
+        Error::PreconditionFailed
+    } else {
+        Error::Io(error.to_string())
+    }
 }
 
 impl Backend {
@@ -119,6 +138,19 @@ impl Backend {
     }
 
     pub async fn read(&self, path: &str) -> Result<Vec<u8>, IoError> {
+        let (body, _) = self.read_with_etag(path).await?;
+        Ok(body)
+    }
+
+    pub async fn read_with_etag(&self, path: &str) -> Result<(Vec<u8>, Option<String>), IoError> {
+        let (body, etag, _) = self.read_with_metadata(path).await?;
+        Ok((body, etag))
+    }
+
+    pub async fn read_with_metadata(
+        &self,
+        path: &str,
+    ) -> Result<(Vec<u8>, Option<String>, Option<DateTime<Utc>>), IoError> {
         let key = self.full_key(path);
 
         let result = self
@@ -137,13 +169,22 @@ impl Backend {
                 }
             })?;
 
+        let etag = result
+            .e_tag
+            .as_deref()
+            .map(|t| t.trim_matches('"').to_string());
+
+        let last_modified = result
+            .last_modified
+            .and_then(|lm| DateTime::from_timestamp(lm.secs(), lm.subsec_nanos()));
+
         let body = result
             .body
             .collect()
             .await
             .map_err(|e| IoError::other(e.to_string()))?;
 
-        Ok(body.into_bytes().to_vec())
+        Ok((body.into_bytes().to_vec(), etag, last_modified))
     }
 
     pub async fn delete(&self, path: &str) -> Result<(), IoError> {
@@ -371,6 +412,53 @@ impl Backend {
                 IoError::other(service_error.to_string())
             }
         })
+    }
+
+    pub async fn put_object_if_not_exists(
+        &self,
+        path: &str,
+        data: impl Into<Bytes>,
+    ) -> Result<(), Error> {
+        let key = self.full_key(path);
+
+        let result = self
+            .s3_client
+            .put_object()
+            .bucket(&self.bucket)
+            .key(&key)
+            .if_none_match("*")
+            .body(ByteStream::from(data.into()))
+            .send()
+            .await;
+
+        match result {
+            Ok(_) => Ok(()),
+            Err(e) => Err(classify_conditional_put_error(&e.into_service_error())),
+        }
+    }
+
+    pub async fn put_object_if_match(
+        &self,
+        path: &str,
+        etag: &str,
+        data: impl Into<Bytes>,
+    ) -> Result<(), Error> {
+        let key = self.full_key(path);
+
+        let result = self
+            .s3_client
+            .put_object()
+            .bucket(&self.bucket)
+            .key(&key)
+            .if_match(etag)
+            .body(ByteStream::from(data.into()))
+            .send()
+            .await;
+
+        match result {
+            Ok(_) => Ok(()),
+            Err(e) => Err(classify_conditional_put_error(&e.into_service_error())),
+        }
     }
 
     pub async fn put_object(&self, path: &str, data: impl Into<Bytes>) -> Result<(), IoError> {

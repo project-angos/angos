@@ -20,7 +20,7 @@ pub mod s3;
 
 pub use config::MetadataStoreConfig;
 pub use link_metadata::LinkMetadata;
-pub use lock::redis::LockConfig;
+pub use lock::{LockStrategy, redis::LockConfig};
 
 use crate::registry::metadata_store::link_kind::LinkKind;
 

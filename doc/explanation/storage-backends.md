@@ -46,8 +46,10 @@ sequenceDiagram
         Registry->>Lock: Acquire lock
         alt Single instance
             Lock->>Lock: In-memory lock
-        else Multi-replica
+        else Multi-replica (Redis)
             Lock->>Redis: Distributed lock
+        else Multi-replica (S3)
+            Lock->>S3: Conditional write lock
         end
     end
 
@@ -178,7 +180,7 @@ operation_attempt_timeout_secs = 300
 - Higher latency than local disk
 - Network dependency
 - Potential egress costs
-- Requires Redis for locking
+- Requires distributed locking configuration for multi-replica
 
 ### Compatible Services
 
@@ -196,7 +198,30 @@ operation_attempt_timeout_secs = 300
 
 For multiple registry instances, you need:
 1. **Shared storage**: S3 or shared filesystem
-2. **Distributed locking**: Redis
+2. **Distributed locking**: Redis or S3
+
+### With S3 Locking (Simplest)
+
+Uses S3 conditional writes (`If-None-Match: *`) for locking — no extra infrastructure required. The S3 provider must support conditional writes; Angos verifies this at startup.
+
+```toml
+[blob_store.s3]
+bucket = "registry-data"
+# ... S3 config
+
+[metadata_store.s3]
+bucket = "registry-data"
+# ... S3 config
+```
+
+To customize lock behavior:
+
+```toml
+[metadata_store.s3.lock_strategy.s3]
+ttl_secs = 30          # Lock expiry (default: 30)
+max_retries = 100      # Acquisition attempts (default: 100)
+retry_delay_ms = 50    # Delay between retries (default: 50)
+```
 
 ### With S3 + Redis
 
@@ -209,7 +234,7 @@ bucket = "registry-data"
 bucket = "registry-data"
 # ... S3 config
 
-[metadata_store.s3.redis]
+[metadata_store.s3.lock_strategy.redis]
 url = "redis://redis:6379"
 ttl = 10
 key_prefix = "registry-locks"
@@ -227,7 +252,7 @@ root_dir = "/mnt/nfs/registry"
 [metadata_store.fs]
 root_dir = "/mnt/nfs/registry"
 
-[metadata_store.fs.redis]
+[metadata_store.fs.lock_strategy.redis]
 url = "redis://redis:6379"
 ttl = 10
 
@@ -247,10 +272,10 @@ url = "redis://redis:6379"
 
 ### Redis Locking
 
-Required for multi-replica:
+Suitable for multi-replica with any storage backend:
 
 ```toml
-[metadata_store.fs.redis]
+[metadata_store.fs.lock_strategy.redis]
 url = "redis://redis:6379"
 ttl = 10                    # Lock timeout in seconds
 key_prefix = "locks"        # Optional prefix
@@ -258,10 +283,111 @@ max_retries = 100           # Retry attempts
 retry_delay_ms = 10         # Delay between retries
 ```
 
+**Legacy form:** The `[metadata_store.*.redis]` table (e.g., `[metadata_store.fs.redis]`) is still accepted for backward compatibility and is equivalent to `[metadata_store.*.lock_strategy.redis]`. New configurations should use the `lock_strategy` form.
+
+### S3 Locking
+
+Available only when using S3 for metadata (not supported with filesystem metadata stores). Uses conditional writes (`If-None-Match: *`) to implement distributed locks directly in the S3 bucket, eliminating the need for Redis. Stale locks are automatically recovered after TTL expiry.
+
+```toml
+[metadata_store.s3.lock_strategy.s3]
+ttl_secs = 30               # Lock expiry in seconds (minimum: 3)
+max_retries = 100           # Acquisition retry attempts
+retry_delay_ms = 50         # Delay between retries (minimum: 1)
+```
+
+The heartbeat interval is automatically calculated as `ttl_secs / 3`. For example, with the default `ttl_secs = 30`, heartbeats occur every 10 seconds. The minimum `ttl_secs` value is 3 seconds, resulting in a minimum heartbeat interval of 1 second.
+
+:::note
+The S3 provider must support conditional writes. Angos probes for this capability at startup and fails fast if it is not available.
+:::
+
 Lock is held during:
 - Manifest writes (tag updates)
 - Blob link creation
 - Upload completion
+
+---
+
+## Multi-Instance Consistency
+
+When multiple Angos instances share an S3 metadata backend, locking guarantees write safety but caching introduces read consistency trade-offs. This section covers what to expect and how to tune for your requirements.
+
+### Cache Modes
+
+By default, Angos caches link metadata (tags, layer links) in memory. Each instance maintains its own cache, so a write on instance A is not visible to instance B until the cache entry expires or is evicted. The `link_cache_ttl` setting (default 30 s) controls how long stale entries persist.
+
+**Option 1: Redis cache (recommended for multi-instance)**
+
+A shared Redis cache eliminates cross-instance staleness. When instance A writes a tag, instance B sees the updated cache entry immediately because both share the same Redis-backed store.
+
+```toml
+[blob_store.s3]
+bucket = "my-registry"
+endpoint = "https://s3.amazonaws.com"
+region = "us-east-1"
+
+[metadata_store.s3]
+bucket = "my-registry"
+endpoint = "https://s3.amazonaws.com"
+region = "us-east-1"
+
+[metadata_store.s3.lock_strategy.s3]
+
+[cache.redis]
+url = "redis://redis:6379"
+```
+
+**Option 2: Reduced TTL (no Redis required)**
+
+If adding Redis is not practical, reduce `link_cache_ttl` to shrink the staleness window. A lower TTL increases S3 read traffic but keeps all infrastructure in S3.
+
+```toml
+[blob_store.s3]
+bucket = "my-registry"
+endpoint = "https://s3.amazonaws.com"
+region = "us-east-1"
+
+[metadata_store.s3]
+bucket = "my-registry"
+endpoint = "https://s3.amazonaws.com"
+region = "us-east-1"
+link_cache_ttl = 5  # 5 seconds instead of 30
+
+[metadata_store.s3.lock_strategy.s3]
+```
+
+Setting `link_cache_ttl = 0` disables the cache entirely and always reads from S3.
+
+### S3 Lock Recovery
+
+S3 locks use a TTL (default 30 seconds, minimum 3 seconds) with automatic heartbeat renewal at `ttl_secs / 3` intervals. Under normal operation the holder renews the lock before it expires. If an instance crashes while holding a lock, other instances must wait for the full TTL to elapse before the lock is recovered. You can tune this trade-off:
+
+- **Lower `ttl_secs`** (e.g., 15): faster recovery after a crash, but more frequent heartbeat writes (at 5 s intervals).
+- **Higher `ttl_secs`** (e.g., 60): fewer heartbeat writes (at 20 s intervals), but longer recovery time.
+
+```toml
+[metadata_store.s3.lock_strategy.s3]
+ttl_secs = 15          # Faster crash recovery
+max_retries = 100
+retry_delay_ms = 50
+```
+
+### Access Times and Retention Policies
+
+Access time updates (`last_pulled_at`) are buffered in memory and flushed to S3 every `access_time_debounce_secs` seconds (default 60). In a multi-instance deployment, each instance maintains its own buffer. This means:
+
+- Access times may lag behind actual pulls by up to `access_time_debounce_secs`.
+- If an instance crashes before flushing, those buffered updates are lost.
+- Multiple instances may overwrite each other's access times (last writer wins).
+
+For retention policies that use `last_pulled_at`, set thresholds in **days rather than minutes** to account for this imprecision. For example:
+
+```toml
+# Safe: 30-day threshold tolerates access time imprecision
+[global.retention_policy]
+rules = ["manifest.last_pulled_at < now() - days(30)"]
+```
 
 ---
 
@@ -387,13 +513,14 @@ Without Redis, cache is in-memory per-instance.
 
 ## Decision Matrix
 
-| Requirement        | Filesystem    | S3 |
-|--------------------|---------------|----|
-| Single instance    | ✅             | ✅ |
-| Multiple instances | ❌ (needs NFS) | ✅ |
-| High availability  | ❌             | ✅ |
-| Low latency        | ✅             | ❌ |
-| Simple setup       | ✅             | ❌ |
-| Cost (small scale) | ✅             | ❌ |
-| Cost (large scale) | ❌             | ✅ |
-| Unlimited storage  | ❌             | ✅ |
+| Requirement        | Filesystem     | S3              |
+|--------------------|----------------|-----------------|
+| Single instance    | ✅             | ✅               |
+| Multiple instances | ❌ (needs NFS) | ✅               |
+| High availability  | ❌             | ✅               |
+| Low latency        | ✅             | ❌               |
+| Native locking     | ✅ (in-memory) | ✅ (S3 or Redis) |
+| Simple setup       | ✅             | ❌               |
+| Cost (small scale) | ✅             | ❌               |
+| Cost (large scale) | ❌             | ✅               |
+| Unlimited storage  | ❌             | ✅               |

@@ -29,6 +29,7 @@ impl From<data_store::Error> for Error {
     fn from(err: data_store::Error) -> Self {
         match err {
             data_store::Error::NotFound(_) => Error::ReferenceNotFound,
+            data_store::Error::PreconditionFailed => Error::Lock("Precondition failed".to_string()),
             _ => Error::DataStore(err),
         }
     }

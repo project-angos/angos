@@ -1,0 +1,33 @@
+[server]
+bind_address = "0.0.0.0"
+port = 8000
+
+[global]
+# 307 temporary redirections are not defined in the OCI spec, so zb don't (seems to) support 307 it.
+enable_redirect = false
+
+[blob_store.s3]
+# Test credentials for local MinIO instance
+access_key_id = "root"
+secret_key = "roottoor"
+endpoint = "http://127.0.0.1:9000"
+bucket = "registry"
+region = "region"
+multipart_copy_threshold = "5GiB"
+multipart_copy_chunk_size = "100MiB"
+multipart_copy_jobs = 10
+
+[metadata_store.s3]
+# Test credentials for local MinIO instance
+access_key_id = "root"
+secret_key = "roottoor"
+endpoint = "http://127.0.0.1:9000"
+bucket = "registry"
+region = "region"
+
+[metadata_store.s3.lock_strategy.s3]
+
+[global.access_policy]
+default_allow = true
+
+[repository."conformance"]

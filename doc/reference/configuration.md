@@ -17,6 +17,7 @@ Most configuration changes take effect immediately without restart. The followin
 - `observability.tracing.sampling_rate`
 - Enabling or disabling TLS
 - Changing storage backend type (filesystem ↔ S3)
+- Changing lock strategy
 
 TLS certificate files are also automatically reloaded when they change.
 
@@ -119,27 +120,93 @@ Choose one: `blob_store.fs` or `blob_store.s3`.
 
 Optional. Defaults to same backend as blob store.
 
+### Lock Strategy Compatibility
+
+The following table shows which lock strategies are supported with each metadata store backend:
+
+| Lock Strategy | S3 metadata store | FS metadata store |
+|---------------|-------------------|-------------------|
+| memory        | Yes               | Yes               |
+| redis         | Yes               | Yes               |
+| s3            | Yes               | No                |
+
 ### Filesystem (`metadata_store.fs`)
 
-| Option         | Type   | Default  | Description                                     |
-|----------------|--------|----------|-------------------------------------------------|
-| `root_dir`     | string | -        | Directory for metadata (defaults to blob store) |
-| `sync_to_disk` | bool   | `false`  | Force fsync after writes                        |
+| Option         | Type         | Default    | Description                                     |
+|----------------|--------------|------------|-----------------------------------------------|
+| `root_dir`     | string       | -          | Directory for metadata (defaults to blob store) |
+| `sync_to_disk` | bool         | `false`    | Force fsync after writes                        |
+| `lock_strategy` | string/table | `"memory"` | Lock backend: `"memory"` (string), or `[lock_strategy.redis]` (table form). S3 locking not supported. |
+
+> **Note:** The S3 lock strategy is not supported for filesystem metadata stores. Use `"memory"` for single-instance deployments or `[lock_strategy.redis]` for multi-replica deployments.
 
 ### S3 (`metadata_store.s3`)
 
 Same connection options as `blob_store.s3`, plus:
 
-| Option                      | Type | Default | Description                                                                 |
-|-----------------------------|------|---------|-----------------------------------------------------------------------------|
-| `link_cache_ttl`            | u64  | `30`    | Read-through cache TTL for link metadata, in seconds (0 to disable)         |
-| `access_time_debounce_secs` | u64  | `60`    | Buffer access time writes and flush periodically, in seconds (0 to disable) |
+| Option                      | Type         | Default    | Description                                                                 |
+|-----------------------------|--------------|------------|-----------------------------------------------------------------------------|
+| `link_cache_ttl`            | u64          | `30`       | Read-through cache TTL for link metadata, in seconds (0 to disable)         |
+| `access_time_debounce_secs` | u64          | `60`       | Buffer access time writes and flush periodically, in seconds (0 to disable) |
+| `lock_strategy`             | string/table | `"memory"` | Lock backend: `"memory"` (string), or `[lock_strategy.s3]`/`[lock_strategy.redis]` (table form, see below) |
 
 The link cache reduces S3 round-trips for repeated tag/layer reads. The access time debounce batches `last_pulled_at` timestamp writes in memory and flushes them periodically, reducing the critical-path operations per manifest pull from 4 (lock, read, write, unlock) to 1 (read).
 
-### Distributed Locking (`metadata_store.*.redis`)
+### Distributed Locking
 
-Required for multi-replica deployments.
+Multi-replica deployments require a distributed lock backend. The `lock_strategy` field on the metadata store selects the backend. Three options are available:
+
+**Lock Strategy Compatibility Matrix:**
+
+| Lock Strategy | S3 metadata | FS metadata |
+|---|---|---|
+| memory | Yes | Yes |
+| redis | Yes | Yes |
+| s3 | Yes | No |
+
+**Memory** (default) — in-process locks, suitable for single-instance deployments only:
+
+```toml
+[metadata_store.s3]
+lock_strategy = "memory"
+```
+
+**S3** — uses S3 conditional writes (`If-None-Match: *`) for distributed locking without extra infrastructure. The S3 provider must support conditional writes; angos verifies this at startup:
+
+```toml
+# With defaults (empty table body; all fields use defaults)
+[metadata_store.s3.lock_strategy.s3]
+
+# With custom settings
+[metadata_store.s3.lock_strategy.s3]
+ttl_secs = 30
+max_retries = 100
+retry_delay_ms = 50
+```
+
+> **Note:** The bare-string form `lock_strategy = "s3"` is not supported; use the table form `[metadata_store.s3.lock_strategy.s3]` to accept defaults or override individual fields.
+
+| Option           | Type | Default | Description                  |
+|------------------|------|---------|------------------------------|
+| `ttl_secs`       | u64  | `30`    | Lock TTL in seconds (minimum: 3). Heartbeat renews at intervals of `ttl_secs / 3` |
+| `max_retries`    | u32  | `100`   | Max lock acquisition retries |
+| `retry_delay_ms` | u64  | `50`    | Delay between retries (minimum: 1) |
+
+**Heartbeat Mechanism:**
+
+The S3 lock implementation uses a heartbeat to keep locks alive. Once acquired, a background task automatically renews the lock at regular intervals of `ttl_secs / 3`. For example, with the default `ttl_secs = 30`, the heartbeat runs every 10 seconds. This allows the lock to remain valid beyond the initial TTL as long as the lock-holder remains alive. If a lock-holder crashes, other instances must wait for the full `ttl_secs` duration before the lock becomes available for recovery.
+
+> **Contention note:** Under high concurrency with overlapping lock sets, instances may experience repeated rollbacks during lock acquisition. Increasing `max_retries` or reducing instance count mitigates this. Randomized jitter on retry delays desynchronises retrying instances.
+
+> **Clock synchronisation:** The lock implementation uses S3's server-side timestamps for expiry checks, so lock correctness does not depend on synchronised instance clocks. Registry instances should still maintain synchronised clocks (NTP) for logging and other operational reasons.
+
+**Redis** — distributed locking via Redis, suitable for multi-instance deployments:
+
+```toml
+[metadata_store.s3.lock_strategy.redis]
+url = "redis://localhost:6379"
+ttl = 10
+```
 
 | Option           | Type   | Default  | Description                  |
 |------------------|--------|----------|------------------------------|
@@ -148,6 +215,8 @@ Required for multi-replica deployments.
 | `key_prefix`     | string | -        | Prefix for lock keys         |
 | `max_retries`    | u32    | `100`    | Max lock acquisition retries |
 | `retry_delay_ms` | u64    | `10`     | Delay between retries        |
+
+> **Legacy form:** The `[metadata_store.*.redis]` table (e.g., `[metadata_store.s3.redis]`) is still accepted for backward compatibility and is equivalent to `[metadata_store.*.lock_strategy.redis]`. New configurations should use the `lock_strategy` form. Both forms cannot be set simultaneously.
 
 ---
 
@@ -311,7 +380,7 @@ root_dir = "/var/registry/blobs"
 [metadata_store.fs]
 root_dir = "/var/registry/metadata"
 
-[metadata_store.fs.redis]
+[metadata_store.fs.lock_strategy.redis]
 url = "redis://localhost:6379"
 ttl = 10
 
@@ -336,4 +405,39 @@ url = "https://registry-1.docker.io"
 [ui]
 enabled = true
 name = "My Registry"
+```
+
+### S3-Only Multi-Instance Deployment
+
+This example uses S3 for both blob and metadata storage with S3-based distributed locking, eliminating the need for Redis:
+
+```toml
+[server]
+bind_address = "0.0.0.0"
+port = 5000
+
+[global]
+update_pull_time = true
+
+[blob_store.s3]
+# Example credentials - replace for production
+access_key_id = "minioadmin"
+secret_key = "minioadmin"
+endpoint = "https://s3.example.com"
+bucket = "registry"
+region = "us-east-1"
+
+[metadata_store.s3]
+# Example credentials - replace for production
+access_key_id = "minioadmin"
+secret_key = "minioadmin"
+endpoint = "https://s3.example.com"
+bucket = "registry-metadata"
+region = "us-east-1"
+
+[metadata_store.s3.lock_strategy.s3]
+
+[auth.identity.admin]
+username = "admin"
+password = "$argon2id$v=19$m=19456,t=2,p=1$..."
 ```

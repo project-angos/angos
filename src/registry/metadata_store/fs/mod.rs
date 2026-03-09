@@ -14,7 +14,7 @@ use crate::{
         data_store,
         metadata_store::{
             BlobIndex, BlobIndexOperation, Error, LinkMetadata, LinkOperation, LockConfig,
-            MetadataStore,
+            LockStrategy, MetadataStore,
             link_kind::LinkKind,
             lock::{self, LockBackend, MemoryBackend},
         },
@@ -22,13 +22,49 @@ use crate::{
     },
 };
 
-#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct BackendConfig {
     pub root_dir: String,
-    #[serde(default)]
-    pub redis: Option<LockConfig>,
-    #[serde(default)]
+    pub lock_strategy: LockStrategy,
     pub sync_to_disk: bool,
+}
+
+impl Default for BackendConfig {
+    fn default() -> Self {
+        Self {
+            root_dir: String::new(),
+            lock_strategy: LockStrategy::Memory,
+            sync_to_disk: false,
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for BackendConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct Raw {
+            root_dir: String,
+            #[serde(default)]
+            redis: Option<LockConfig>,
+            #[serde(default)]
+            lock_strategy: Option<LockStrategy>,
+            #[serde(default)]
+            sync_to_disk: bool,
+        }
+
+        let raw = Raw::deserialize(deserializer)?;
+
+        let lock_strategy = lock::resolve_lock_strategy(raw.lock_strategy, raw.redis, false)?;
+
+        Ok(BackendConfig {
+            root_dir: raw.root_dir,
+            lock_strategy,
+            sync_to_disk: raw.sync_to_disk,
+        })
+    }
 }
 
 impl From<BackendConfig> for data_store::fs::BackendConfig {
@@ -43,7 +79,7 @@ impl From<BackendConfig> for data_store::fs::BackendConfig {
 #[derive(Clone)]
 pub struct Backend {
     store: data_store::fs::Backend,
-    lock: Arc<dyn LockBackend<Guard = Box<dyn Send>> + Send + Sync>,
+    lock: Arc<dyn LockBackend + Send + Sync>,
 }
 
 impl Backend {
@@ -54,17 +90,24 @@ impl Backend {
             sync_to_disk: config.sync_to_disk,
         });
 
-        let lock: Arc<dyn LockBackend<Guard = Box<dyn Send>> + Send + Sync> =
-            if let Some(redis_config) = &config.redis {
+        let lock: Arc<dyn LockBackend + Send + Sync> = match &config.lock_strategy {
+            LockStrategy::Redis(redis_config) => {
                 info!("Using Redis lock store for filesystem metadata-store");
                 let backend = lock::RedisBackend::new(redis_config).map_err(|e| {
                     Error::Lock(format!("Failed to initialize Redis lock store: {e}"))
                 })?;
                 Arc::new(backend)
-            } else {
+            }
+            LockStrategy::S3(_) => {
+                return Err(Error::Lock(
+                    "S3 lock strategy is not supported for filesystem metadata store".to_string(),
+                ));
+            }
+            LockStrategy::Memory => {
                 info!("Using in-memory lock store for filesystem metadata-store");
                 Arc::new(MemoryBackend::new())
-            };
+            }
+        };
 
         Ok(Self { store, lock })
     }
@@ -324,10 +367,11 @@ impl MetadataStore for Backend {
         update_access_time: bool,
     ) -> Result<LinkMetadata, Error> {
         if update_access_time {
-            let _guard = self.lock.acquire(&[link.to_string()]).await?;
+            let guard = self.lock.acquire(&[link.to_string()]).await?;
             let link_data = self.read_link_reference(namespace, link).await?.accessed();
             self.write_link_reference(namespace, link, &link_data)
                 .await?;
+            guard.release().await;
             Ok(link_data)
         } else {
             self.read_link_reference(namespace, link).await
@@ -416,7 +460,7 @@ impl MetadataStore for Backend {
 
             lock_keys.sort();
             lock_keys.dedup();
-            let _guard = self.lock.acquire(&lock_keys).await?;
+            let guard = self.lock.acquire(&lock_keys).await?;
 
             let validation_results = join_all(creates.iter().map(
                 |(link, _, expected_old, _, _, _)| async move {
@@ -431,12 +475,18 @@ impl MetadataStore for Backend {
                 .iter()
                 .any(|(_, _, current_target, expected)| *current_target != *expected)
             {
+                guard.release().await;
                 continue;
             }
             for (link, metadata, _, _) in validation_results {
                 if let Some(m) = metadata {
                     link_cache.insert(link, m);
                 }
+            }
+
+            if !guard.is_valid() {
+                guard.release().await;
+                return Err(Error::Lock("lock invalidated during operation".into()));
             }
 
             let delete_results =
@@ -463,6 +513,7 @@ impl MetadataStore for Backend {
                 }
             }
             if needs_retry {
+                guard.release().await;
                 continue;
             }
 
@@ -515,6 +566,11 @@ impl MetadataStore for Backend {
                     ));
                 }
             }
+            if !guard.is_valid() {
+                guard.release().await;
+                return Err(Error::Lock("lock invalidated during operation".into()));
+            }
+
             join_all(
                 non_tracked_create_writes
                     .iter()
@@ -557,6 +613,11 @@ impl MetadataStore for Backend {
                         .push(BlobIndexOperation::Remove(link.clone()));
                 }
             }
+            if !guard.is_valid() {
+                guard.release().await;
+                return Err(Error::Lock("lock invalidated during operation".into()));
+            }
+
             join_all(
                 non_tracked_delete_links
                     .iter()
@@ -565,6 +626,11 @@ impl MetadataStore for Backend {
             .await
             .into_iter()
             .collect::<Result<Vec<_>, _>>()?;
+
+            if !guard.is_valid() {
+                guard.release().await;
+                return Err(Error::Lock("lock invalidated during operation".into()));
+            }
 
             for (digest, ops) in &pending_blob_ops {
                 let path = path_builder::blob_index_path(digest);
@@ -598,6 +664,12 @@ impl MetadataStore for Backend {
                 }
             }
 
+            if !guard.is_valid() {
+                guard.release().await;
+                return Err(Error::Lock("lock invalidated during operation".into()));
+            }
+
+            guard.release().await;
             return Ok(());
         }
     }

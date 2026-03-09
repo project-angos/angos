@@ -187,6 +187,7 @@ Built on Tokio with configurable parallelism:
 Distributed locking for multi-replica deployments:
 - In-memory locks for single instance
 - Redis locks for multiple instances
+- S3 locks for multiple instances using conditional writes (no extra infrastructure needed)
 
 ---
 
