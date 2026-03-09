@@ -188,6 +188,8 @@ pub struct Backend {
     access_time_writer: Option<AccessTimeWriter>,
 }
 
+const MAX_UPDATE_RETRIES: u32 = 10;
+
 impl Backend {
     pub fn new(config: &BackendConfig) -> Result<Self, Error> {
         info!("Using S3 metadata-store backend");
@@ -689,6 +691,7 @@ impl MetadataStore for Backend {
             return Ok(());
         }
 
+        let mut update_retries = MAX_UPDATE_RETRIES;
         loop {
             let mut link_cache: HashMap<LinkKind, LinkMetadata> = HashMap::new();
 
@@ -777,6 +780,13 @@ impl MetadataStore for Backend {
                 .any(|(_, _, current_target, expected)| *current_target != *expected)
             {
                 guard.release().await;
+                if update_retries == 0 {
+                    return Err(Error::Lock(
+                        "update_links exceeded maximum retries due to concurrent modifications"
+                            .into(),
+                    ));
+                }
+                update_retries -= 1;
                 continue;
             }
             for (link, metadata, _, _) in validation_results {
@@ -815,6 +825,13 @@ impl MetadataStore for Backend {
             }
             if needs_retry {
                 guard.release().await;
+                if update_retries == 0 {
+                    return Err(Error::Lock(
+                        "update_links exceeded maximum retries due to concurrent modifications"
+                            .into(),
+                    ));
+                }
+                update_retries -= 1;
                 continue;
             }
 
