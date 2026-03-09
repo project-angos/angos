@@ -218,6 +218,67 @@ jobs:
           docker logs minio-server
           docker stop minio-server
 
+  conformance-s3-lock:
+    runs-on: ubuntu-latest
+    needs: build-conformance
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download test artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: conformance-tools
+
+      - name: Load container image
+        run: |
+          docker load -i conformance-image.tar
+          chmod +x conformance.test zb
+
+      - name: Run conformance test & zot benchmark (s3 backend with s3 lock, no cache)
+        run: |
+          mkdir -p ./conformance/minio-data/registry
+          docker run --rm -d \
+            -v ./conformance/minio-data:/data \
+            -e MINIO_ROOT_USER=root \
+            -e MINIO_ROOT_PASSWORD=roottoor \
+            -e MINIO_VOLUMES=/data \
+            --network host \
+            --name minio-server \
+            quay.io/minio/minio \
+            minio server /data
+
+          while ! nc -z localhost 9000; do
+            echo "Waiting for minio to start..."
+            sleep 1;
+          done
+
+          docker run --rm -d \
+            -v ./conformance/config-s3-lock.toml:/config.toml \
+            --network host \
+            --name conformance-s3-lock-backend \
+            ${CONFORMANCE_IMAGE_NAME} \
+            server
+
+          for i in {1..10}; do
+            if nc -z -w 3 127.0.0.1 8000; then
+              break
+            fi
+            sleep 1
+          done
+          if [ $i -eq 10 ]; then
+            echo "angos did not start within 10 seconds"
+            exit 1
+          fi
+
+          source ./conformance/conformance-variables
+          ./conformance.test
+
+          time ./zb -c 5 -r conformance -n 100 http://localhost:8000
+          docker logs conformance-s3-lock-backend
+          docker stop conformance-s3-lock-backend
+          docker logs minio-server
+          docker stop minio-server
+
   build-binary:
     strategy:
       fail-fast: false
@@ -378,6 +439,7 @@ jobs:
       - rust-test
       - conformance-fs
       - conformance-s3
+      - conformance-s3-lock
     if: startsWith(github.ref, 'refs/tags/v')
     steps:
       - uses: actions/checkout@v4
