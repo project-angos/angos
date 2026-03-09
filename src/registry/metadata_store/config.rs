@@ -22,22 +22,16 @@ pub enum MetadataStoreConfig {
 impl MetadataStoreConfig {
     pub async fn probe(&self) -> Result<(), Error> {
         match self {
-            MetadataStoreConfig::S3(config)
-                if matches!(config.lock_strategy, LockStrategy::S3(_)) =>
-            {
-                let store = data_store::s3::Backend::new(&data_store::s3::BackendConfig {
-                    access_key_id: config.access_key_id.clone(),
-                    secret_key: config.secret_key.clone(),
-                    endpoint: config.endpoint.clone(),
-                    bucket: config.bucket.clone(),
-                    region: config.region.clone(),
-                    key_prefix: config.key_prefix.clone(),
-                    ..Default::default()
-                })
-                .map_err(|e| Error::StorageBackend(e.to_string()))?;
-                metadata_store::s3::Backend::probe_conditional_write_support(&store).await
-            }
-            _ => Ok(()),
+            MetadataStoreConfig::S3(config) => match &config.lock_strategy {
+                LockStrategy::S3(lock_config) => {
+                    let store =
+                        data_store::s3::Backend::new(&config.to_lock_store_config(lock_config))
+                            .map_err(|e| Error::StorageBackend(e.to_string()))?;
+                    metadata_store::s3::Backend::probe_conditional_write_support(&store).await
+                }
+                _ => Ok(()),
+            },
+            MetadataStoreConfig::FS(_) => Ok(()),
         }
     }
 

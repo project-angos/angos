@@ -75,6 +75,12 @@ pub struct S3LockConfig {
         deserialize_with = "deserialize_max_hold_secs"
     )]
     pub max_hold_secs: u64,
+    #[serde(default = "S3LockConfig::default_operation_timeout_secs")]
+    pub operation_timeout_secs: u64,
+    #[serde(default = "S3LockConfig::default_operation_attempt_timeout_secs")]
+    pub operation_attempt_timeout_secs: u64,
+    #[serde(default = "S3LockConfig::default_max_attempts")]
+    pub max_attempts: u32,
 }
 
 impl S3LockConfig {
@@ -93,6 +99,18 @@ impl S3LockConfig {
     fn default_max_hold_secs() -> u64 {
         300
     }
+
+    fn default_operation_timeout_secs() -> u64 {
+        30
+    }
+
+    fn default_operation_attempt_timeout_secs() -> u64 {
+        10
+    }
+
+    fn default_max_attempts() -> u32 {
+        3
+    }
 }
 
 impl Default for S3LockConfig {
@@ -102,6 +120,9 @@ impl Default for S3LockConfig {
             max_retries: Self::default_max_retries(),
             retry_delay_ms: Self::default_retry_delay_ms(),
             max_hold_secs: Self::default_max_hold_secs(),
+            operation_timeout_secs: Self::default_operation_timeout_secs(),
+            operation_attempt_timeout_secs: Self::default_operation_attempt_timeout_secs(),
+            max_attempts: Self::default_max_attempts(),
         }
     }
 }

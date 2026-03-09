@@ -26,6 +26,7 @@ fn test_backend(store: Arc<data_store::s3::Backend>) -> S3LockBackend {
             max_retries: 0,
             retry_delay_ms: 5,
             max_hold_secs: 300,
+            ..Default::default()
         },
     )
     .unwrap()
@@ -142,6 +143,7 @@ async fn test_stale_lock_recovery() {
             max_retries: 0,
             retry_delay_ms: 1,
             max_hold_secs: 300,
+            ..Default::default()
         },
     )
     .unwrap();
@@ -209,6 +211,7 @@ async fn test_heartbeat_refreshes_lock() {
             max_retries: 0,
             retry_delay_ms: 1,
             max_hold_secs: 300,
+            ..Default::default()
         },
     )
     .unwrap();
@@ -245,6 +248,7 @@ async fn test_heartbeat_invalidates_guard_on_ownership_loss() {
             max_retries: 0,
             retry_delay_ms: 1,
             max_hold_secs: 300,
+            ..Default::default()
         },
     )
     .unwrap();
@@ -321,6 +325,7 @@ async fn test_release_skips_delete_when_ownership_lost() {
             max_retries: 0,
             retry_delay_ms: 1,
             max_hold_secs: 300,
+            ..Default::default()
         },
     )
     .unwrap();

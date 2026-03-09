@@ -104,16 +104,28 @@ fn default_access_time_debounce() -> u64 {
     60
 }
 
-impl From<BackendConfig> for data_store::s3::BackendConfig {
-    fn from(config: BackendConfig) -> Self {
-        Self {
-            access_key_id: config.access_key_id,
-            secret_key: config.secret_key,
-            endpoint: config.endpoint,
-            bucket: config.bucket,
-            region: config.region,
-            key_prefix: config.key_prefix,
+impl BackendConfig {
+    pub fn to_data_store_config(&self) -> data_store::s3::BackendConfig {
+        data_store::s3::BackendConfig {
+            access_key_id: self.access_key_id.clone(),
+            secret_key: self.secret_key.clone(),
+            endpoint: self.endpoint.clone(),
+            bucket: self.bucket.clone(),
+            region: self.region.clone(),
+            key_prefix: self.key_prefix.clone(),
             ..Default::default()
+        }
+    }
+
+    pub fn to_lock_store_config(
+        &self,
+        lock_config: &lock::s3::S3LockConfig,
+    ) -> data_store::s3::BackendConfig {
+        data_store::s3::BackendConfig {
+            operation_timeout_secs: lock_config.operation_timeout_secs,
+            operation_attempt_timeout_secs: lock_config.operation_attempt_timeout_secs,
+            max_attempts: lock_config.max_attempts,
+            ..self.to_data_store_config()
         }
     }
 }
@@ -179,15 +191,7 @@ pub struct Backend {
 impl Backend {
     pub fn new(config: &BackendConfig) -> Result<Self, Error> {
         info!("Using S3 metadata-store backend");
-        let store = data_store::s3::Backend::new(&data_store::s3::BackendConfig {
-            access_key_id: config.access_key_id.clone(),
-            secret_key: config.secret_key.clone(),
-            endpoint: config.endpoint.clone(),
-            bucket: config.bucket.clone(),
-            region: config.region.clone(),
-            key_prefix: config.key_prefix.clone(),
-            ..Default::default()
-        })?;
+        let store = data_store::s3::Backend::new(&config.to_data_store_config())?;
 
         let lock: Arc<dyn LockBackend + Send + Sync> = match &config.lock_strategy {
             LockStrategy::Redis(redis_config) => {
@@ -199,7 +203,12 @@ impl Backend {
             }
             LockStrategy::S3(s3_lock_config) => {
                 info!("Using S3 lock store for S3 metadata-store");
-                let lock_store = Arc::new(store.clone());
+                let lock_store = Arc::new(
+                    data_store::s3::Backend::new(&config.to_lock_store_config(s3_lock_config))
+                        .map_err(|e| {
+                            Error::Lock(format!("Failed to initialize S3 lock store: {e}"))
+                        })?,
+                );
                 Arc::new(
                     lock::S3LockBackend::new(lock_store, s3_lock_config).map_err(|e| {
                         Error::Lock(format!("Failed to initialize S3 lock store: {e}"))

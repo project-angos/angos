@@ -289,6 +289,8 @@ retry_delay_ms = 10         # Delay between retries
 
 Available only when using S3 for metadata (not supported with filesystem metadata stores). Uses conditional writes (`If-None-Match: *`) to implement distributed locks directly in the S3 bucket, eliminating the need for Redis. Stale locks are automatically recovered after TTL expiry.
 
+Lock operations use a dedicated S3 client with independent timeout configuration, separate from the metadata store's main S3 client. This allows tuning lock behavior independently — lock operations should fail fast rather than blocking for minutes, which is important in high-latency S3 scenarios.
+
 ```toml
 [metadata_store.s3.lock_strategy.s3]
 ttl_secs = 30               # Lock expiry in seconds (minimum: 3)
