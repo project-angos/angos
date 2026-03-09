@@ -418,7 +418,7 @@ impl Backend {
         &self,
         path: &str,
         data: impl Into<Bytes>,
-    ) -> Result<(), Error> {
+    ) -> Result<Option<String>, Error> {
         let key = self.full_key(path);
 
         let result = self
@@ -432,7 +432,10 @@ impl Backend {
             .await;
 
         match result {
-            Ok(_) => Ok(()),
+            Ok(output) => {
+                let etag = output.e_tag().map(|t| t.trim_matches('"').to_string());
+                Ok(etag)
+            }
             Err(e) => Err(classify_conditional_put_error(&e.into_service_error())),
         }
     }
@@ -442,7 +445,7 @@ impl Backend {
         path: &str,
         etag: &str,
         data: impl Into<Bytes>,
-    ) -> Result<(), Error> {
+    ) -> Result<Option<String>, Error> {
         let key = self.full_key(path);
 
         let result = self
@@ -456,7 +459,10 @@ impl Backend {
             .await;
 
         match result {
-            Ok(_) => Ok(()),
+            Ok(output) => {
+                let etag = output.e_tag().map(|t| t.trim_matches('"').to_string());
+                Ok(etag)
+            }
             Err(e) => Err(classify_conditional_put_error(&e.into_service_error())),
         }
     }

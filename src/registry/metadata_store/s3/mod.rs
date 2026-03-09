@@ -299,7 +299,7 @@ impl Backend {
         // Step 5: Evaluate If-None-Match result
         match if_none_match_result {
             Err(data_store::Error::PreconditionFailed) => {}
-            Ok(()) => {
+            Ok(_) => {
                 return Err(Error::Lock(
                     "S3 backend does not support If-None-Match: * conditional writes, \
                      required for lock_strategy = s3. Use lock_strategy = redis or \
@@ -323,7 +323,7 @@ impl Backend {
             }
             match bogus_result {
                 Err(data_store::Error::PreconditionFailed) => {}
-                Ok(()) => {
+                Ok(_) => {
                     return Err(Error::Lock(
                         "S3 backend does not enforce If-Match: bogus ETag was accepted, \
                          required for lock heartbeat. Use lock_strategy = redis or \

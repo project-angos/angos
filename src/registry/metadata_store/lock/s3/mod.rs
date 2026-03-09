@@ -2,6 +2,7 @@
 mod tests;
 
 use std::{
+    collections::HashMap,
     io::ErrorKind,
     sync::{
         Arc,
@@ -198,18 +199,24 @@ impl S3LockBackend {
         Duration::from_millis(total_ms)
     }
 
-    fn make_payload(&self) -> Vec<u8> {
+    fn make_payload(&self) -> Result<Vec<u8>, Error> {
         let payload = S3LockPayload {
             instance_id: self.instance_id.clone(),
             refreshed_at: Utc::now(),
             ttl_secs: self.ttl_secs,
         };
-        serde_json::to_vec(&payload).expect("lock payload serialization cannot fail")
+        serde_json::to_vec(&payload)
+            .map_err(|e| Error::InvalidData(format!("lock payload serialization failed: {e}")))
     }
 
-    fn make_guard(&self, lock_paths: Vec<String>) -> LockGuard {
+    fn make_guard(
+        &self,
+        lock_paths: Vec<String>,
+        initial_etags: HashMap<String, String>,
+    ) -> LockGuard {
         let valid = Arc::new(AtomicBool::new(true));
-        let heartbeat_handle = self.spawn_heartbeat(lock_paths.clone(), valid.clone());
+        let heartbeat_handle =
+            self.spawn_heartbeat(lock_paths.clone(), valid.clone(), initial_etags);
         let store = self.store.clone();
         let instance_id = self.instance_id.clone();
         let valid_for_release = valid.clone();
@@ -278,15 +285,15 @@ impl S3LockBackend {
         )
     }
 
-    async fn try_acquire_key(&self, lock_path: &str) -> Result<bool, Error> {
-        let payload = self.make_payload();
+    async fn try_acquire_key(&self, lock_path: &str) -> Result<Option<String>, Error> {
+        let payload = self.make_payload()?;
         match self
             .store
             .put_object_if_not_exists(lock_path, payload)
             .await
         {
-            Ok(()) => Ok(true),
-            Err(data_store::Error::PreconditionFailed) => Ok(false),
+            Ok(etag) => Ok(etag),
+            Err(data_store::Error::PreconditionFailed) => Ok(None),
             Err(e) => Err(Error::StorageBackend(e.to_string())),
         }
     }
@@ -334,14 +341,22 @@ impl S3LockBackend {
             return RecoveryOutcome::Error("lock object missing ETag".to_string());
         };
 
+        let payload = match self.make_payload() {
+            Ok(p) => p,
+            Err(e) => {
+                LOCK_RECOVERIES.with_label_values(&["s3", "error"]).inc();
+                return RecoveryOutcome::Error(e.to_string());
+            }
+        };
+
         match self
             .store
-            .put_object_if_match(lock_path, &etag, self.make_payload())
+            .put_object_if_match(lock_path, &etag, payload)
             .await
         {
-            Ok(()) => {
+            Ok(new_etag) => {
                 LOCK_RECOVERIES.with_label_values(&["s3", "acquired"]).inc();
-                RecoveryOutcome::Acquired
+                RecoveryOutcome::Acquired(new_etag)
             }
             Err(data_store::Error::PreconditionFailed) => {
                 LOCK_RECOVERIES.with_label_values(&["s3", "failed"]).inc();
@@ -370,6 +385,7 @@ impl S3LockBackend {
         &self,
         paths: Vec<String>,
         valid: Arc<AtomicBool>,
+        initial_etags: HashMap<String, String>,
     ) -> tokio::task::JoinHandle<()> {
         let store = self.store.clone();
         let instance_id = self.instance_id.clone();
@@ -385,6 +401,7 @@ impl S3LockBackend {
             interval_timer.tick().await; // consume immediate first tick
 
             let mut consecutive_failures: u32 = 0;
+            let mut etag_cache: HashMap<String, String> = initial_etags;
 
             loop {
                 interval_timer.tick().await;
@@ -401,23 +418,42 @@ impl S3LockBackend {
                     return;
                 }
 
-                let results: Vec<HeartbeatPathResult> = join_all(
-                    paths
-                        .iter()
-                        .map(|path| heartbeat_tick_path(&store, path, &instance_id, ttl_secs)),
-                )
-                .await;
+                let results: Vec<(String, HeartbeatPathResult)> =
+                    join_all(paths.iter().map(|path| {
+                        let cached_etag = etag_cache.get(path).cloned();
+                        let store = store.clone();
+                        let instance_id = instance_id.clone();
+                        async move {
+                            let result = heartbeat_tick_path(
+                                &store,
+                                path,
+                                &instance_id,
+                                ttl_secs,
+                                cached_etag,
+                            )
+                            .await;
+                            (path.clone(), result)
+                        }
+                    }))
+                    .await;
 
                 let mut tick_had_failure = false;
-                for result in results {
+                for (path, result) in results {
                     match result {
-                        HeartbeatPathResult::Ok => {}
+                        HeartbeatPathResult::Ok(new_etag) => {
+                            if let Some(etag) = new_etag {
+                                etag_cache.insert(path, etag);
+                            } else {
+                                etag_cache.remove(&path);
+                            }
+                        }
                         HeartbeatPathResult::Invalidate(reason) => {
                             LOCK_INVALIDATIONS.with_label_values(&["s3", reason]).inc();
                             valid.store(false, Ordering::Release);
                             return;
                         }
                         HeartbeatPathResult::Failure => {
+                            etag_cache.remove(&path);
                             tick_had_failure = true;
                         }
                     }
@@ -445,7 +481,7 @@ impl S3LockBackend {
 }
 
 enum HeartbeatPathResult {
-    Ok,
+    Ok(Option<String>),
     Invalidate(&'static str),
     Failure,
 }
@@ -455,10 +491,47 @@ async fn heartbeat_tick_path(
     path: &str,
     instance_id: &str,
     ttl_secs: u64,
+    cached_etag: Option<String>,
 ) -> HeartbeatPathResult {
+    let make_payload_bytes = || -> Result<Vec<u8>, String> {
+        let payload = S3LockPayload {
+            instance_id: instance_id.to_owned(),
+            refreshed_at: Utc::now(),
+            ttl_secs,
+        };
+        serde_json::to_vec(&payload).map_err(|e| format!("lock payload serialization failed: {e}"))
+    };
+
+    if let Some(etag) = cached_etag {
+        let payload = match make_payload_bytes() {
+            Ok(p) => p,
+            Err(e) => {
+                warn!(path, error = %e, "Failed to serialize lock payload");
+                return HeartbeatPathResult::Failure;
+            }
+        };
+        match store.put_object_if_match(path, &etag, payload).await {
+            Ok(new_etag) => {
+                debug!(path, "Refreshed S3 lock heartbeat");
+                return HeartbeatPathResult::Ok(new_etag);
+            }
+            Err(data_store::Error::PreconditionFailed) => {
+                warn!(
+                    path,
+                    "Lock ETag changed, ownership lost, stopping heartbeat"
+                );
+                return HeartbeatPathResult::Invalidate("ownership_lost");
+            }
+            Err(e) => {
+                warn!(path, error = %e, "Failed to refresh S3 lock heartbeat");
+                return HeartbeatPathResult::Failure;
+            }
+        }
+    }
+
     let etag = match store.read_with_etag(path).await {
-        Ok((data, etag)) => {
-            if let Ok(existing) = serde_json::from_slice::<S3LockPayload>(&data)
+        Ok((body, etag)) => {
+            if let Ok(existing) = serde_json::from_slice::<S3LockPayload>(&body)
                 && existing.instance_id != instance_id
             {
                 warn!(
@@ -489,17 +562,18 @@ async fn heartbeat_tick_path(
         return HeartbeatPathResult::Invalidate("etag_unavailable");
     };
 
-    let payload = S3LockPayload {
-        instance_id: instance_id.to_owned(),
-        refreshed_at: Utc::now(),
-        ttl_secs,
+    let payload = match make_payload_bytes() {
+        Ok(p) => p,
+        Err(e) => {
+            warn!(path, error = %e, "Failed to serialize lock payload");
+            return HeartbeatPathResult::Failure;
+        }
     };
-    let data = serde_json::to_vec(&payload).expect("lock payload serialization cannot fail");
 
-    match store.put_object_if_match(path, &etag, data).await {
-        Ok(()) => {
+    match store.put_object_if_match(path, &etag, payload).await {
+        Ok(new_etag) => {
             debug!(path, "Refreshed S3 lock heartbeat");
-            HeartbeatPathResult::Ok
+            HeartbeatPathResult::Ok(new_etag)
         }
         Err(data_store::Error::PreconditionFailed) => {
             warn!(
@@ -517,7 +591,7 @@ async fn heartbeat_tick_path(
 
 #[cfg_attr(test, derive(Debug))]
 enum RecoveryOutcome {
-    Acquired,
+    Acquired(Option<String>),
     NotStale,
     Retry,
     Failed,
@@ -543,7 +617,7 @@ impl S3LockBackend {
 }
 
 enum AcquireRoundOutcome {
-    AllAcquired,
+    AllAcquired(HashMap<String, String>),
     HardError(Error),
     RecoveryError {
         msg: String,
@@ -571,16 +645,21 @@ impl S3LockBackend {
                 async move { (i, self.try_acquire_key(&path).await) }
             })
             .collect();
-        let results: Vec<(usize, Result<bool, Error>)> = join_all(futs).await;
+        let results: Vec<(usize, Result<Option<String>, Error>)> = join_all(futs).await;
 
+        let mut acquired_etags: HashMap<String, String> = HashMap::new();
         let mut acquired_paths = Vec::new();
         let mut failed_indices = Vec::new();
         let mut hard_error: Option<Error> = None;
 
         for (i, result) in &results {
             match result {
-                Ok(true) => acquired_paths.push(lock_paths[*i].clone()),
-                Ok(false) => failed_indices.push(*i),
+                Ok(Some(etag)) => {
+                    let path = lock_paths[*i].clone();
+                    acquired_etags.insert(path.clone(), etag.clone());
+                    acquired_paths.push(path);
+                }
+                Ok(None) => failed_indices.push(*i),
                 Err(e) => {
                     hard_error = Some(Error::StorageBackend(format!("S3 lock error: {e}")));
                     break;
@@ -594,7 +673,7 @@ impl S3LockBackend {
         }
 
         if failed_indices.is_empty() {
-            return AcquireRoundOutcome::AllAcquired;
+            return AcquireRoundOutcome::AllAcquired(acquired_etags);
         }
 
         let recovery_futs: Vec<_> = failed_indices
@@ -608,7 +687,13 @@ impl S3LockBackend {
         let mut recovered_paths = Vec::new();
         for (i, outcome) in join_all(recovery_futs).await {
             match outcome {
-                RecoveryOutcome::Acquired => recovered_paths.push(lock_paths[i].clone()),
+                RecoveryOutcome::Acquired(new_etag) => {
+                    let path = lock_paths[i].clone();
+                    if let Some(etag) = new_etag {
+                        acquired_etags.insert(path.clone(), etag);
+                    }
+                    recovered_paths.push(path);
+                }
                 RecoveryOutcome::Error(msg) => {
                     let mut to_release = acquired_paths;
                     to_release.extend(recovered_paths);
@@ -619,7 +704,7 @@ impl S3LockBackend {
         }
 
         if recovered_paths.len() + acquired_paths.len() == lock_paths.len() {
-            return AcquireRoundOutcome::AllAcquired;
+            return AcquireRoundOutcome::AllAcquired(acquired_etags);
         }
 
         AcquireRoundOutcome::Retry {
@@ -646,14 +731,14 @@ impl LockBackend for S3LockBackend {
 
         loop {
             match self.try_acquire_round(&lock_paths).await {
-                AcquireRoundOutcome::AllAcquired => {
+                AcquireRoundOutcome::AllAcquired(etags) => {
                     LOCK_ACQUISITION_DURATION
                         .with_label_values(&["s3"])
                         .observe(start.elapsed().as_secs_f64() * 1000.0);
                     LOCK_ACQUISITIONS
                         .with_label_values(&["s3", "success"])
                         .inc();
-                    return Ok(self.make_guard(lock_paths));
+                    return Ok(self.make_guard(lock_paths, etags));
                 }
                 AcquireRoundOutcome::HardError(e) => {
                     LOCK_ACQUISITION_DURATION
