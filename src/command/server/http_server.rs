@@ -249,6 +249,7 @@ async fn dispatch_route<'a>(
             handle_list_namespaces(context, repository, identity).await
         }
         Route::Healthz => handle_healthz(),
+        Route::Readyz => handle_readyz(context).await,
         Route::Metrics => handle_metrics(),
     }
 }
@@ -638,6 +639,26 @@ fn handle_healthz() -> Result<Response<ResponseBody>, Error> {
             let msg = format!("Failed to build healthz response: {e}");
             Err(Error::Internal(msg))
         }
+    }
+}
+
+async fn handle_readyz(context: &ServerContext) -> Result<Response<ResponseBody>, Error> {
+    match context.registry.check_ready().await {
+        Ok(()) => Response::builder()
+            .status(StatusCode::OK)
+            .header(CONTENT_TYPE, "application/json")
+            .body(ResponseBody::Fixed(Full::new(Bytes::from(
+                r#"{"status":"ready"}"#,
+            ))))
+            .map_err(|e| Error::Internal(format!("Failed to build readyz response: {e}"))),
+        Err(e) => Response::builder()
+            .status(StatusCode::SERVICE_UNAVAILABLE)
+            .header(CONTENT_TYPE, "application/json")
+            .body(ResponseBody::Fixed(Full::new(Bytes::from(format!(
+                r#"{{"status":"not_ready","error":"{}"}}"#,
+                e.to_string().replace('"', "\\\"")
+            )))))
+            .map_err(|e| Error::Internal(format!("Failed to build readyz response: {e}"))),
     }
 }
 

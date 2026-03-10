@@ -26,6 +26,7 @@ pub enum Route<'a> {
     #[serde(rename = "ui-config")]
     UiConfig,
     Healthz,
+    Readyz,
     Metrics,
     #[serde(rename = "get-api-version")]
     ApiVersion,
@@ -182,6 +183,7 @@ impl Route<'_> {
             Route::UiConfig => "ui-config",
             Route::ApiVersion => "get-api-version",
             Route::Healthz => "healthz",
+            Route::Readyz => "readyz",
             Route::Metrics => "metrics",
             Route::ListCatalog { .. } => "list-catalog",
             Route::ListTags { .. } => "list-tags",
@@ -405,6 +407,7 @@ mod tests {
         let test_cases = vec![
             (Route::ApiVersion, "get-api-version"),
             (Route::Healthz, "healthz"),
+            (Route::Readyz, "readyz"),
             (Route::Metrics, "metrics"),
             (
                 Route::ListCatalog {

@@ -19,6 +19,7 @@ pub fn parse<'a>(method: &Method, uri: &'a Uri) -> Route<'a> {
 
     match path {
         "/healthz" if method == Method::GET => return Route::Healthz,
+        "/readyz" if method == Method::GET => return Route::Readyz,
         "/metrics" if method == Method::GET => return Route::Metrics,
         "/_ui/config" if method == Method::GET => return Route::UiConfig,
         "/v2" | "/v2/" if method == Method::GET => return Route::ApiVersion,

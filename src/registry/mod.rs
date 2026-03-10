@@ -125,6 +125,14 @@ impl Registry {
         self.metadata_store.flush_access_times().await;
     }
 
+    pub async fn check_ready(&self) -> Result<(), Error> {
+        self.metadata_store
+            .list_namespaces(1, None)
+            .await
+            .map(|_| ())
+            .map_err(|e| Error::Internal(format!("storage backend not ready: {e}")))
+    }
+
     #[instrument]
     pub fn get_repository_for_namespace(
         &self,
