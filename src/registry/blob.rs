@@ -293,6 +293,10 @@ impl Registry {
     ) -> Result<Response<ResponseBody>, Error> {
         let repository = self.get_repository_for_namespace(namespace)?;
 
+        if !repository.is_pull_through() {
+            self.check_blob_namespace_access(namespace, digest).await?;
+        }
+
         if range.is_none()
             && self.enable_redirect
             && let Ok(Some(presigned_url)) = self.blob_store.get_blob_url(digest).await

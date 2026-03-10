@@ -970,18 +970,127 @@ fn is_tracked_link(link: &LinkKind) -> bool {
 }
 
 impl Backend {
-    /// CAS-optimized write path: reads each link once under the lock (no pre-lock
-    /// reads), then releases the lock before CAS blob index updates. Eliminates
-    /// the redundant pre-lock read round trip that the non-CAS path requires for
-    /// blob digest lock key computation.
+    /// CAS-optimized write path with lock-free fast path for new links.
+    ///
+    /// Phase 1: For creates that produce fresh metadata (non-tracked, or tracked
+    /// without referrer), tries `If-None-Match: *` to atomically create the link
+    /// without a distributed lock. This avoids locking entirely for the common
+    /// case of fresh pushes where most links are new.
+    ///
+    /// Phase 2: For operations that need a lock (deletes, tracked creates with
+    /// referrer merging, creates where the link already existed), acquires the
+    /// lock and uses the standard read-modify-write flow.
+    ///
+    /// Phase 3: CAS blob index updates (always lock-free with conditional writes).
     #[allow(clippy::too_many_lines)]
     async fn update_links_cas(
         &self,
         namespace: &str,
         operations: &[LinkOperation],
     ) -> Result<(), Error> {
-        // Compute lock keys directly from operations — CAS blob index updates
-        // don't need blob:{digest} lock keys since they use ETag concurrency.
+        // Phase 1: Optimistic lock-free creation for eligible creates.
+        // Creates that produce fresh metadata (no referrer merge) can use
+        // If-None-Match:* to atomically create the link without locking.
+        let mut lockfree_blob_ops: HashMap<Digest, Vec<BlobIndexOperation>> = HashMap::new();
+        let mut lockfree_cache_puts: Vec<(LinkKind, LinkMetadata)> = Vec::new();
+        let mut locked_ops: Vec<LinkOperation> = Vec::new();
+        let mut any_creates = false;
+
+        let mut optimistic: Vec<(LinkOperation, LinkKind, Digest, LinkMetadata)> = Vec::new();
+
+        for op in operations {
+            match op {
+                LinkOperation::Create {
+                    link,
+                    target,
+                    referrer,
+                    media_type,
+                    descriptor,
+                } if !is_tracked_link(link) || referrer.is_none() => {
+                    any_creates = true;
+                    let metadata = LinkMetadata::from_digest(target.clone())
+                        .with_media_type(media_type.clone())
+                        .with_descriptor(descriptor.as_ref().clone());
+                    optimistic.push((op.clone(), link.clone(), target.clone(), metadata));
+                }
+                LinkOperation::Create { .. } => {
+                    any_creates = true;
+                    locked_ops.push(op.clone());
+                }
+                LinkOperation::Delete { .. } => {
+                    locked_ops.push(op.clone());
+                }
+            }
+        }
+
+        if !optimistic.is_empty() {
+            let results = join_all(optimistic.iter().map(|(_, link, _, metadata)| {
+                self.write_link_if_not_exists(namespace, link, metadata)
+            }))
+            .await;
+
+            for ((op, link, target, metadata), result) in optimistic.into_iter().zip(results) {
+                match result {
+                    Ok(true) => {
+                        lockfree_blob_ops
+                            .entry(target)
+                            .or_default()
+                            .push(BlobIndexOperation::Insert(link.clone()));
+                        lockfree_cache_puts.push((link, metadata));
+                    }
+                    Ok(false) => {
+                        locked_ops.push(op);
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+        }
+
+        // Phase 2: Locked path for remaining operations.
+        let locked_blob_ops = self
+            .execute_locked_cas_updates(namespace, &locked_ops)
+            .await?;
+
+        // Merge blob index operations from both paths.
+        let mut pending_blob_ops = lockfree_blob_ops;
+        for (digest, ops) in locked_blob_ops {
+            pending_blob_ops.entry(digest).or_default().extend(ops);
+        }
+
+        // Cache updates for lock-free writes.
+        for (link, metadata) in &lockfree_cache_puts {
+            self.cache_put(namespace, link, metadata).await;
+        }
+
+        // Phase 3: CAS blob index updates — ETags handle concurrency.
+        join_all(
+            pending_blob_ops
+                .iter()
+                .map(|(digest, ops)| self.update_blob_index_cas(namespace, digest, ops)),
+        )
+        .await
+        .into_iter()
+        .collect::<Result<Vec<_>, _>>()?;
+
+        if any_creates && let Err(e) = self.register_namespace(namespace).await {
+            warn!(namespace, error = %e, "Failed to register namespace");
+        }
+
+        Ok(())
+    }
+
+    /// Executes link operations under a distributed lock, returning pending
+    /// blob index operations for CAS updates after the lock is released.
+    #[allow(clippy::too_many_lines)]
+    async fn execute_locked_cas_updates(
+        &self,
+        namespace: &str,
+        operations: &[LinkOperation],
+    ) -> Result<HashMap<Digest, Vec<BlobIndexOperation>>, Error> {
+        if operations.is_empty() {
+            return Ok(HashMap::new());
+        }
+
         let mut lock_keys: Vec<String> = operations
             .iter()
             .map(|op| {
@@ -996,7 +1105,6 @@ impl Backend {
 
         let guard = self.lock.acquire(&lock_keys).await?;
 
-        // Single read per operation under the lock — no pre-lock reads needed.
         let read_results = join_all(operations.iter().map(|op| async move {
             let link = match op {
                 LinkOperation::Create { link, .. } | LinkOperation::Delete { link, .. } => link,
@@ -1043,7 +1151,7 @@ impl Backend {
 
         if creates.is_empty() && deletes.is_empty() {
             guard.release().await;
-            return Ok(());
+            return Ok(HashMap::new());
         }
 
         if !guard.is_valid() {
@@ -1110,25 +1218,9 @@ impl Backend {
             self.cache_invalidate(namespace, link).await;
         }
 
-        // Release lock before CAS blob index updates — ETags handle concurrency.
         guard.release().await;
 
-        join_all(
-            pending_blob_ops
-                .iter()
-                .map(|(digest, ops)| self.update_blob_index_cas(namespace, digest, ops)),
-        )
-        .await
-        .into_iter()
-        .collect::<Result<Vec<_>, _>>()?;
-
-        if !creates.is_empty()
-            && let Err(e) = self.register_namespace(namespace).await
-        {
-            warn!(namespace, error = %e, "Failed to register namespace");
-        }
-
-        Ok(())
+        Ok(pending_blob_ops)
     }
 
     /// Non-CAS write path: pre-lock reads to compute blob digest lock keys,
@@ -1829,6 +1921,28 @@ impl Backend {
             .put_object(&link_path, serialized_link_data)
             .await?;
         Ok(())
+    }
+
+    /// Atomically creates a link only if it does not already exist, using
+    /// S3 conditional `If-None-Match: *`. Returns `true` if the link was
+    /// created, `false` if it already existed (precondition failed).
+    async fn write_link_if_not_exists(
+        &self,
+        namespace: &str,
+        link: &LinkKind,
+        metadata: &LinkMetadata,
+    ) -> Result<bool, Error> {
+        let link_path = path_builder::link_path(link, namespace);
+        let serialized = Bytes::from(serde_json::to_vec(metadata)?);
+        match self
+            .store
+            .put_object_if_not_exists(&link_path, serialized)
+            .await
+        {
+            Ok(_) => Ok(true),
+            Err(data_store::Error::PreconditionFailed) => Ok(false),
+            Err(e) => Err(Error::StorageBackend(e.to_string())),
+        }
     }
 
     async fn delete_link_reference(&self, namespace: &str, link: &LinkKind) -> Result<(), Error> {
