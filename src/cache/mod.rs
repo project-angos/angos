@@ -20,6 +20,9 @@ pub trait Cache: Any + Debug + Send + Sync {
 
     /// Retrieve a value from the cache
     async fn retrieve_value(&self, key: &str) -> Result<Option<String>, Error>;
+
+    /// Remove a value from the cache immediately
+    async fn delete_value(&self, key: &str) -> Result<(), Error>;
 }
 
 /// Extension trait providing JSON serialization for cache operations
@@ -155,6 +158,12 @@ mod tests {
                 return Err(Error::Backend(error.clone()));
             }
             Ok(storage.data.clone())
+        }
+
+        async fn delete_value(&self, _key: &str) -> Result<(), Error> {
+            let mut storage = self.storage.lock().unwrap();
+            storage.data = None;
+            Ok(())
         }
     }
 

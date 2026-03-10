@@ -1,5 +1,9 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, hash_map::RandomState},
+    future::Future,
+    hash::{BuildHasher, Hasher},
+    io::ErrorKind,
+    pin::Pin,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -173,7 +177,10 @@ impl AccessTimeWriter {
     }
 
     async fn flush_one(backend: &Backend, namespace: &str, link: &LinkKind) -> Result<(), Error> {
-        let guard = backend.lock.acquire(&[link.to_string()]).await?;
+        let guard = backend
+            .lock
+            .acquire(&[format!("{namespace}:{link}")])
+            .await?;
         let link_data = backend
             .read_link_reference(namespace, link)
             .await?
@@ -301,6 +308,7 @@ impl Backend {
                 loop {
                     tokio::time::sleep(interval).await;
                     if shutdown_flag.load(Ordering::Acquire) {
+                        flush_backend.flush_access_times().await;
                         return;
                     }
                     flush_backend.flush_access_times().await;
@@ -464,9 +472,7 @@ impl Backend {
 
     async fn cache_invalidate(&self, namespace: &str, link: &LinkKind) {
         if let Some(cache) = &self.cache {
-            let _ = cache
-                .store_value(&Self::cache_key(namespace, link), "", 0)
-                .await;
+            let _ = cache.delete_value(&Self::cache_key(namespace, link)).await;
         }
     }
 
@@ -482,31 +488,42 @@ impl Backend {
         digest: &Digest,
         operations: &[BlobIndexOperation],
     ) -> Result<(), Error> {
-        let path = path_builder::blob_index_path(digest);
+        let shard_path = path_builder::blob_index_shard_path(digest, namespace);
 
         for attempt in 0..MAX_BLOB_INDEX_CAS_RETRIES {
-            let (mut blob_index, etag) = match self.store.read_with_etag(&path).await {
-                Ok((data, etag)) => (serde_json::from_slice::<BlobIndex>(&data)?, etag),
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => (BlobIndex::default(), None),
+            let (mut links, etag) = match self.store.read_with_etag(&shard_path).await {
+                Ok((data, etag)) => (
+                    serde_json::from_slice::<HashSet<LinkKind>>(&data).unwrap_or_default(),
+                    etag,
+                ),
+                Err(e) if e.kind() == ErrorKind::NotFound => (HashSet::new(), None),
                 Err(e) => return Err(Error::from(e)),
             };
 
-            apply_blob_index_ops(&mut blob_index, namespace, operations);
+            for op in operations {
+                match op {
+                    BlobIndexOperation::Insert(link) => {
+                        links.insert(link.clone());
+                    }
+                    BlobIndexOperation::Remove(link) => {
+                        links.remove(link);
+                    }
+                }
+            }
 
-            // Write the (possibly empty) index back with CAS. An empty index is written
-            // rather than deleted to avoid a race where a concurrent writer creates a new
-            // entry between our read and a non-conditional delete. The scrub command
-            // handles cleanup of empty blob containers.
-            let content = Bytes::from(serde_json::to_vec(&blob_index)?);
+            // Write the shard back with CAS. Empty shards are written rather than
+            // deleted to avoid a race where a concurrent writer creates a new entry
+            // between our read and a non-conditional delete. Scrub handles cleanup.
+            let content = Bytes::from(serde_json::to_vec(&links)?);
 
             let write_result = if let Some(ref etag) = etag {
                 self.store
-                    .put_object_if_match(&path, etag, content)
+                    .put_object_if_match(&shard_path, etag, content)
                     .await
                     .map(|_| ())
             } else {
                 self.store
-                    .put_object_if_not_exists(&path, content)
+                    .put_object_if_not_exists(&shard_path, content)
                     .await
                     .map(|_| ())
             };
@@ -516,19 +533,16 @@ impl Backend {
                 Err(data_store::Error::PreconditionFailed) => {
                     debug!(
                         digest = %digest,
+                        namespace,
                         attempt,
-                        "Blob index CAS conflict, retrying"
+                        "Blob index shard CAS conflict, retrying"
                     );
                     let jitter_ms = {
-                        use std::hash::{BuildHasher, Hasher};
                         let max = 50u64.saturating_mul(1u64 << attempt.min(4));
                         if max == 0 {
                             0
                         } else {
-                            std::collections::hash_map::RandomState::new()
-                                .build_hasher()
-                                .finish()
-                                % max
+                            RandomState::new().build_hasher().finish() % max
                         }
                     };
                     tokio::time::sleep(Duration::from_millis(jitter_ms)).await;
@@ -541,8 +555,7 @@ impl Backend {
             %digest,
             namespace,
             attempts = MAX_BLOB_INDEX_CAS_RETRIES,
-            "Blob index CAS retries exhausted; blob index may be incomplete for this namespace. \
-             A scrub run can reconcile the blob index."
+            "Blob index shard CAS retries exhausted"
         );
         Err(Error::Lock(format!(
             "blob index CAS retries exhausted for digest {digest} after {MAX_BLOB_INDEX_CAS_RETRIES} attempts"
@@ -668,7 +681,7 @@ impl MetadataStore for Backend {
                                     }
                                 }
                             }
-                            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                            Err(e) if e.kind() == ErrorKind::NotFound => {
                                 warn!("Referrer blob not found at {blob_path}, skipping");
                                 None
                             }
@@ -750,18 +763,97 @@ impl MetadataStore for Backend {
 
     #[instrument(skip(self))]
     async fn read_blob_index(&self, digest: &Digest) -> Result<BlobIndex, Error> {
-        let path = path_builder::blob_index_path(digest);
+        // Try sharded format first (refs/{namespace}.json per namespace)
+        let refs_dir = path_builder::blob_index_refs_dir(digest);
+        let mut index = BlobIndex::default();
+        let mut found_shards = false;
+        let mut continuation_token = None;
 
-        let data = match self.store.read(&path).await {
+        loop {
+            let (_, objects, next_token) = self
+                .store
+                .list_prefixes(&refs_dir, "/", 1000, continuation_token, None)
+                .await?;
+
+            if !objects.is_empty() {
+                found_shards = true;
+            }
+
+            let shard_results: Vec<Result<Option<(String, HashSet<LinkKind>)>, Error>> =
+                stream::iter(objects.into_iter().map(|obj| {
+                    let shard_path = format!("{refs_dir}/{obj}");
+                    async move {
+                        match self.store.read(&shard_path).await {
+                            Ok(data) => {
+                                if let Ok(links) =
+                                    serde_json::from_slice::<HashSet<LinkKind>>(&data)
+                                {
+                                    let namespace = obj
+                                        .strip_suffix(".json")
+                                        .unwrap_or(&obj)
+                                        .replace("%2F", "/")
+                                        .replace("%25", "%");
+                                    if !links.is_empty() {
+                                        return Ok(Some((namespace, links)));
+                                    }
+                                }
+                                Ok(None)
+                            }
+                            Err(e) if e.kind() == ErrorKind::NotFound => Ok(None),
+                            Err(e) => Err(Error::from(e)),
+                        }
+                    }
+                }))
+                .buffer_unordered(10)
+                .collect()
+                .await;
+
+            for result in shard_results {
+                if let Some((namespace, links)) = result? {
+                    index.namespace.insert(namespace, links);
+                }
+            }
+
+            continuation_token = next_token;
+            if continuation_token.is_none() {
+                break;
+            }
+        }
+
+        if found_shards {
+            if index.namespace.is_empty() {
+                return Err(Error::ReferenceNotFound);
+            }
+            return Ok(index);
+        }
+
+        // XXX: remove legacy index.json fallback and migration below for v2.0.0
+        let legacy_path = path_builder::blob_index_path(digest);
+        let data = match self.store.read(&legacy_path).await {
             Ok(data) => data,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            Err(e) if e.kind() == ErrorKind::NotFound => {
                 return Err(Error::ReferenceNotFound);
             }
             Err(e) => return Err(e.into()),
         };
-        let index = serde_json::from_slice(&data)?;
+        let blob_index: BlobIndex = serde_json::from_slice(&data).map_err(Error::from)?;
 
-        Ok(index)
+        // Migrate: write shards, then delete legacy file
+        for (namespace, links) in &blob_index.namespace {
+            let ops: Vec<BlobIndexOperation> = links
+                .iter()
+                .map(|link| BlobIndexOperation::Insert(link.clone()))
+                .collect();
+            self.update_blob_index_shard(namespace, digest, &ops)
+                .await?;
+        }
+        self.store.delete(&legacy_path).await?;
+        info!(
+            "Migrated legacy blob index for '{digest}' ({} namespaces)",
+            blob_index.namespace.len()
+        );
+
+        Ok(blob_index)
     }
 
     #[instrument(skip(self))]
@@ -777,26 +869,8 @@ impl MetadataStore for Backend {
                 .await;
         }
 
-        // Fallback: unconditional read-modify-write (caller must hold a lock).
-        let path = path_builder::blob_index_path(digest);
-
-        let mut reference_index = match self.store.read(&path).await {
-            Ok(data) => serde_json::from_slice::<BlobIndex>(&data)?,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => BlobIndex::default(),
-            Err(e) => return Err(e.into()),
-        };
-
-        apply_blob_index_ops(&mut reference_index, namespace, &[operation]);
-
-        if reference_index.namespace.is_empty() {
-            let container = path_builder::blob_container_dir(digest);
-            self.store.delete_prefix(&container).await?;
-        } else {
-            let content = Bytes::from(serde_json::to_vec(&reference_index)?);
-            self.store.put_object(&path, content).await?;
-        }
-
-        Ok(())
+        self.update_blob_index_shard(namespace, digest, &[operation])
+            .await
     }
 
     #[instrument(skip(self))]
@@ -818,7 +892,7 @@ impl MetadataStore for Backend {
                 writer.record(namespace, link).await;
                 Ok(link_data)
             } else {
-                let guard = self.lock.acquire(&[link.to_string()]).await?;
+                let guard = self.lock.acquire(&[format!("{namespace}:{link}")]).await?;
                 let link_data = self.read_link_reference(namespace, link).await?.accessed();
                 if !guard.is_valid() {
                     return Err(Error::Lock(
@@ -910,7 +984,7 @@ impl MetadataStore for Backend {
                 if let Some((link, target, old_target, referrer, media_type, descriptor)) =
                     create_data
                 {
-                    lock_keys.push(link.to_string());
+                    lock_keys.push(format!("{namespace}:{link}"));
                     if !use_cas {
                         lock_keys.push(format!("blob:{target}"));
                         if let Some(ref old) = old_target {
@@ -919,7 +993,7 @@ impl MetadataStore for Backend {
                     }
                     creates.push((link, target, old_target, referrer, media_type, descriptor));
                 } else if let Some((link, Some(meta), referrer)) = delete_data {
-                    lock_keys.push(link.to_string());
+                    lock_keys.push(format!("{namespace}:{link}"));
                     if !use_cas {
                         lock_keys.push(format!("blob:{}", meta.target));
                     }
@@ -1015,6 +1089,7 @@ impl MetadataStore for Backend {
                     let mut metadata = link_cache.remove(link).unwrap_or_else(|| {
                         LinkMetadata::from_digest(target.clone())
                             .with_media_type(media_type.clone())
+                            .with_descriptor((*descriptor).clone())
                     });
 
                     if let Some(manifest_digest) = referrer {
@@ -1107,9 +1182,8 @@ impl MetadataStore for Backend {
                 tracked_delete_writes
                     .iter()
                     .map(|(link, metadata)| {
-                        let fut: std::pin::Pin<
-                            Box<dyn std::future::Future<Output = Result<(), Error>> + Send + '_>,
-                        > = Box::pin(self.write_link_reference(namespace, link, metadata));
+                        let fut: Pin<Box<dyn Future<Output = Result<(), Error>> + Send + '_>> =
+                            Box::pin(self.write_link_reference(namespace, link, metadata));
                         fut
                     })
                     .chain(
@@ -1117,12 +1191,8 @@ impl MetadataStore for Backend {
                             .iter()
                             .chain(non_tracked_delete_links.iter())
                             .map(|link| {
-                                let fut: std::pin::Pin<
-                                    Box<
-                                        dyn std::future::Future<Output = Result<(), Error>>
-                                            + Send
-                                            + '_,
-                                    >,
+                                let fut: Pin<
+                                    Box<dyn Future<Output = Result<(), Error>> + Send + '_>,
                                 > = Box::pin(self.delete_link_reference(namespace, link));
                                 fut
                             }),
@@ -1165,25 +1235,13 @@ impl MetadataStore for Backend {
                 .into_iter()
                 .collect::<Result<Vec<_>, _>>()?;
             } else {
-                // Without conditional write support, blob index updates run under the
-                // lock (blob:{digest} keys are included in lock_keys above).
-                join_all(pending_blob_ops.iter().map(|(digest, ops)| async move {
-                    let path = path_builder::blob_index_path(digest);
-                    let mut blob_index = match self.store.read(&path).await {
-                        Ok(data) => serde_json::from_slice::<BlobIndex>(&data)?,
-                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => BlobIndex::default(),
-                        Err(e) => return Err(Error::from(e)),
-                    };
-                    apply_blob_index_ops(&mut blob_index, namespace, ops);
-                    if blob_index.namespace.is_empty() {
-                        let container = path_builder::blob_container_dir(digest);
-                        self.store.delete_prefix(&container).await?;
-                    } else {
-                        let content = Bytes::from(serde_json::to_vec(&blob_index)?);
-                        self.store.put_object(&path, content).await?;
-                    }
-                    Ok(())
-                }))
+                // Without conditional write support, blob index shard updates run
+                // under the lock (blob:{digest} keys are included in lock_keys above).
+                join_all(
+                    pending_blob_ops
+                        .iter()
+                        .map(|(digest, ops)| self.update_blob_index_shard(namespace, digest, ops)),
+                )
                 .await
                 .into_iter()
                 .collect::<Result<Vec<_>, _>>()?;
@@ -1211,27 +1269,6 @@ impl MetadataStore for Backend {
     }
 }
 
-fn apply_blob_index_ops(
-    blob_index: &mut BlobIndex,
-    namespace: &str,
-    operations: &[BlobIndexOperation],
-) {
-    let mut ns_links = blob_index.namespace.remove(namespace).unwrap_or_default();
-    for op in operations {
-        match op {
-            BlobIndexOperation::Insert(link) => {
-                ns_links.insert(link.clone());
-            }
-            BlobIndexOperation::Remove(link) => {
-                ns_links.remove(link);
-            }
-        }
-    }
-    if !ns_links.is_empty() {
-        blob_index.namespace.insert(namespace.to_string(), ns_links);
-    }
-}
-
 fn is_tracked_link(link: &LinkKind) -> bool {
     matches!(
         link,
@@ -1240,6 +1277,41 @@ fn is_tracked_link(link: &LinkKind) -> bool {
 }
 
 impl Backend {
+    /// Unconditional read-modify-write on a namespace shard (caller must hold lock).
+    async fn update_blob_index_shard(
+        &self,
+        namespace: &str,
+        digest: &Digest,
+        operations: &[BlobIndexOperation],
+    ) -> Result<(), Error> {
+        let shard_path = path_builder::blob_index_shard_path(digest, namespace);
+        let mut links: HashSet<LinkKind> = match self.store.read(&shard_path).await {
+            Ok(data) => serde_json::from_slice(&data).unwrap_or_default(),
+            Err(e) if e.kind() == ErrorKind::NotFound => HashSet::new(),
+            Err(e) => return Err(e.into()),
+        };
+
+        for operation in operations {
+            match operation {
+                BlobIndexOperation::Insert(link) => {
+                    links.insert(link.clone());
+                }
+                BlobIndexOperation::Remove(link) => {
+                    links.remove(link);
+                }
+            }
+        }
+
+        if links.is_empty() {
+            self.store.delete(&shard_path).await?;
+        } else {
+            let content = Bytes::from(serde_json::to_vec(&links)?);
+            self.store.put_object(&shard_path, content).await?;
+        }
+
+        Ok(())
+    }
+
     async fn read_namespace_registry(&self) -> Result<Option<NamespaceRegistry>, Error> {
         let path = path_builder::namespace_registry_path();
         match self.store.read(&path).await {
@@ -1250,7 +1322,7 @@ impl Backend {
                     Ok(None)
                 }
             },
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) if e.kind() == ErrorKind::NotFound => Ok(None),
             Err(e) => Err(Error::from(e)),
         }
     }
@@ -1268,7 +1340,31 @@ impl Backend {
         let path = path_builder::namespace_registry_path();
 
         if self.supports_conditional_writes {
-            self.store.put_object(&path, content).await?;
+            // Use CAS to avoid stomping concurrent register_namespace_cas writes.
+            // Read current ETag (if any), then write with If-Match / If-None-Match.
+            let etag = match self.store.read_with_etag(&path).await {
+                Ok((_, etag)) => etag,
+                Err(e) if e.kind() == ErrorKind::NotFound => None,
+                Err(e) => return Err(Error::from(e)),
+            };
+            let write_result = if let Some(ref etag) = etag {
+                self.store
+                    .put_object_if_match(&path, etag, content)
+                    .await
+                    .map(|_| ())
+            } else {
+                self.store
+                    .put_object_if_not_exists(&path, content)
+                    .await
+                    .map(|_| ())
+            };
+            match write_result {
+                Ok(()) => {}
+                Err(data_store::Error::PreconditionFailed) => {
+                    debug!("Namespace registry rebuild lost CAS race; concurrent write wins");
+                }
+                Err(e) => return Err(Error::StorageBackend(e.to_string())),
+            }
         } else {
             let lock_key = "namespace_registry".to_string();
             let guard = self.lock.acquire(&[lock_key]).await?;
@@ -1297,7 +1393,7 @@ impl Backend {
 
         let mut registry = match self.store.read(&path).await {
             Ok(data) => serde_json::from_slice::<NamespaceRegistry>(&data).unwrap_or_default(),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => NamespaceRegistry::default(),
+            Err(e) if e.kind() == ErrorKind::NotFound => NamespaceRegistry::default(),
             Err(e) => {
                 guard.release().await;
                 return Err(Error::from(e));
@@ -1331,28 +1427,17 @@ impl Backend {
                     // Corrupt JSON: keep the ETag so we can overwrite with CAS
                     Err(_) => (NamespaceRegistry::default(), etag),
                 },
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                    (NamespaceRegistry::default(), None)
-                }
+                Err(e) if e.kind() == ErrorKind::NotFound => (NamespaceRegistry::default(), None),
                 Err(e) => return Err(Error::from(e)),
             };
 
-            if registry
-                .namespaces
-                .binary_search(&namespace.to_string())
-                .is_ok()
-            {
+            let Err(pos) = registry.namespaces.binary_search(&namespace.to_string()) else {
                 self.known_namespaces
                     .lock()
                     .await
                     .insert(namespace.to_string());
                 return Ok(());
-            }
-
-            let pos = registry
-                .namespaces
-                .binary_search(&namespace.to_string())
-                .unwrap_err();
+            };
             registry.namespaces.insert(pos, namespace.to_string());
 
             let content = Bytes::from(serde_json::to_vec(&registry)?);
@@ -1382,15 +1467,11 @@ impl Backend {
                         attempt, "Namespace registry CAS conflict, retrying"
                     );
                     let jitter_ms = {
-                        use std::hash::{BuildHasher, Hasher};
                         let max = 50u64.saturating_mul(1u64 << attempt.min(4));
                         if max == 0 {
                             0
                         } else {
-                            std::collections::hash_map::RandomState::new()
-                                .build_hasher()
-                                .finish()
-                                % max
+                            RandomState::new().build_hasher().finish() % max
                         }
                     };
                     tokio::time::sleep(Duration::from_millis(jitter_ms)).await;
@@ -1451,7 +1532,7 @@ impl Backend {
         let link_path = path_builder::link_path(link, namespace);
         match self.store.read(&link_path).await {
             Ok(data) => LinkMetadata::from_bytes(data),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(Error::ReferenceNotFound),
+            Err(e) if e.kind() == ErrorKind::NotFound => Err(Error::ReferenceNotFound),
             Err(e) => Err(e.into()),
         }
     }
@@ -1479,7 +1560,7 @@ impl Backend {
 
 #[cfg(test)]
 mod tests {
-    use std::str::FromStr;
+    use std::{str::FromStr, time::Instant};
 
     use super::*;
     use crate::{
@@ -1605,7 +1686,7 @@ mod tests {
         assert_eq!(meta.target, digest_a);
 
         // Wait for cache to expire
-        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+        tokio::time::sleep(Duration::from_millis(1100)).await;
 
         // Write new data directly to S3 (bypassing cache invalidation)
         let new_metadata = LinkMetadata::from_digest(digest_b.clone());
@@ -1918,7 +1999,7 @@ mod tests {
         backend.read_link(namespace, &tag, true).await.unwrap();
 
         // Wait for the background flush (debounce = 1s, wait 1.5s)
-        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+        tokio::time::sleep(Duration::from_millis(1500)).await;
 
         // Read directly from S3: accessed_at should now be set
         let raw = backend.read_link_reference(namespace, &tag).await.unwrap();
@@ -1949,7 +2030,7 @@ mod tests {
         backend.update_links(namespace, &ops).await.unwrap();
 
         // Call read_link with update_access_time 10 times rapidly
-        let start = std::time::Instant::now();
+        let start = Instant::now();
         for _ in 0..10 {
             let meta = backend.read_link(namespace, &tag, true).await.unwrap();
             assert_eq!(meta.target, digest);
@@ -1958,7 +2039,7 @@ mod tests {
 
         // All 10 reads should complete quickly since writes are deferred
         assert!(
-            elapsed < std::time::Duration::from_secs(1),
+            elapsed < Duration::from_secs(1),
             "10 deferred reads should complete in under 1 second, took {elapsed:?}"
         );
 
@@ -2113,7 +2194,7 @@ mod tests {
         backend.update_links(namespace, &ops).await.unwrap();
 
         // Spawn 50 concurrent read_link calls with update_access_time=true
-        let start = std::time::Instant::now();
+        let start = Instant::now();
         let mut handles = Vec::new();
         for _ in 0..50 {
             let backend = backend.clone();
@@ -2131,7 +2212,7 @@ mod tests {
         let elapsed = start.elapsed();
 
         assert!(
-            elapsed < std::time::Duration::from_secs(2),
+            elapsed < Duration::from_secs(2),
             "50 concurrent deferred reads should complete within 2 seconds, took {elapsed:?}"
         );
     }
@@ -2167,7 +2248,7 @@ mod tests {
 
         // Flush and measure time; concurrent flush should be significantly
         // faster than sequential because each flush_one involves lock + read + write
-        let start = std::time::Instant::now();
+        let start = Instant::now();
         backend.flush_access_times().await;
         let elapsed = start.elapsed();
 
@@ -2185,7 +2266,7 @@ mod tests {
         // processing of 20 entries would take much longer. This is a soft
         // assertion to validate concurrency is happening.
         assert!(
-            elapsed < std::time::Duration::from_secs(5),
+            elapsed < Duration::from_secs(5),
             "Flushing 20 entries concurrently should complete within 5 seconds, took {elapsed:?}"
         );
     }

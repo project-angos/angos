@@ -46,6 +46,13 @@ impl Cache for Backend {
         let value: Option<String> = conn.get(key).await?;
         Ok(value)
     }
+
+    async fn delete_value(&self, key: &str) -> Result<(), Error> {
+        let mut conn = self.get_connection().await?;
+        let key = format!("{}{key}", self.key_prefix);
+        let () = conn.del(key).await?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]

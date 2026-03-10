@@ -33,6 +33,17 @@ pub fn blob_index_path(digest: &Digest) -> String {
     format!("{}/index.json", blob_dir(digest))
 }
 
+pub fn blob_index_refs_dir(digest: &Digest) -> String {
+    format!("{}/refs", blob_dir(digest))
+}
+
+pub fn blob_index_shard_path(digest: &Digest, namespace: &str) -> String {
+    // Encode namespace as a safe filename: percent-encode '/' and '%' to avoid
+    // ambiguity (namespaces can contain underscores, so '/' -> '_' is lossy).
+    let safe_ns = namespace.replace('%', "%25").replace('/', "%2F");
+    format!("{}/refs/{safe_ns}.json", blob_dir(digest))
+}
+
 pub fn blob_container_dir(digest: &Digest) -> String {
     blob_dir(digest)
 }
