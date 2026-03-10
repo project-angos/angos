@@ -203,12 +203,17 @@ pub struct Backend {
     cache: Option<Arc<dyn Cache>>,
     link_cache_ttl: u64,
     access_time_writer: Option<AccessTimeWriter>,
+    /// Whether the S3 backend supports conditional writes (If-Match / If-None-Match).
+    /// When true, blob index updates use lock-free CAS. When false, they are protected
+    /// by the distributed lock alongside link updates.
+    supports_conditional_writes: bool,
     // Held for Drop side-effect: signals the flush task to exit when the last Backend is dropped.
     #[allow(dead_code)]
     flush_handle: Option<Arc<FlushHandle>>,
 }
 
 const MAX_UPDATE_RETRIES: u32 = 10;
+const MAX_BLOB_INDEX_CAS_RETRIES: u32 = 20;
 
 impl Backend {
     pub fn new(config: &BackendConfig) -> Result<Self, Error> {
@@ -243,6 +248,11 @@ impl Backend {
             }
         };
 
+        // S3 lock strategy probes conditional write support at startup, so if
+        // we're using S3 locks we know conditionals work. For other lock strategies
+        // the S3 backend may not support them (e.g. older S3-compatible stores).
+        let supports_conditional_writes = matches!(config.lock_strategy, LockStrategy::S3(_));
+
         if config.access_time_debounce_secs == 0
             && matches!(config.lock_strategy, LockStrategy::S3(_))
         {
@@ -271,6 +281,7 @@ impl Backend {
                 cache: None,
                 link_cache_ttl: config.link_cache_ttl,
                 access_time_writer: access_time_writer.clone(),
+                supports_conditional_writes,
                 flush_handle: None,
             };
 
@@ -295,6 +306,7 @@ impl Backend {
             cache: None,
             link_cache_ttl: config.link_cache_ttl,
             access_time_writer,
+            supports_conditional_writes,
             flush_handle,
         };
 
@@ -443,6 +455,85 @@ impl Backend {
                 .store_value(&Self::cache_key(namespace, link), "", 0)
                 .await;
         }
+    }
+
+    /// Applies a batch of blob index operations for a single digest using optimistic
+    /// concurrency (CAS). Reads the current blob index with its `ETag`, applies all
+    /// operations, and writes back with `If-Match`. Retries on `ETag` conflict.
+    ///
+    /// For new blob indexes (not-found), uses `If-None-Match: *` to create atomically,
+    /// falling back to CAS if another writer created the index concurrently.
+    async fn update_blob_index_cas(
+        &self,
+        namespace: &str,
+        digest: &Digest,
+        operations: &[BlobIndexOperation],
+    ) -> Result<(), Error> {
+        let path = path_builder::blob_index_path(digest);
+
+        for attempt in 0..MAX_BLOB_INDEX_CAS_RETRIES {
+            let (mut blob_index, etag) = match self.store.read_with_etag(&path).await {
+                Ok((data, etag)) => (serde_json::from_slice::<BlobIndex>(&data)?, etag),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => (BlobIndex::default(), None),
+                Err(e) => return Err(Error::from(e)),
+            };
+
+            apply_blob_index_ops(&mut blob_index, namespace, operations);
+
+            // Write the (possibly empty) index back with CAS. An empty index is written
+            // rather than deleted to avoid a race where a concurrent writer creates a new
+            // entry between our read and a non-conditional delete. The scrub command
+            // handles cleanup of empty blob containers.
+            let content = Bytes::from(serde_json::to_vec(&blob_index)?);
+
+            let write_result = if let Some(ref etag) = etag {
+                self.store
+                    .put_object_if_match(&path, etag, content)
+                    .await
+                    .map(|_| ())
+            } else {
+                self.store
+                    .put_object_if_not_exists(&path, content)
+                    .await
+                    .map(|_| ())
+            };
+
+            match write_result {
+                Ok(()) => return Ok(()),
+                Err(data_store::Error::PreconditionFailed) => {
+                    debug!(
+                        digest = %digest,
+                        attempt,
+                        "Blob index CAS conflict, retrying"
+                    );
+                    let jitter_ms = {
+                        use std::hash::{BuildHasher, Hasher};
+                        let max = 50u64.saturating_mul(1u64 << attempt.min(4));
+                        if max == 0 {
+                            0
+                        } else {
+                            std::collections::hash_map::RandomState::new()
+                                .build_hasher()
+                                .finish()
+                                % max
+                        }
+                    };
+                    tokio::time::sleep(Duration::from_millis(jitter_ms)).await;
+                }
+                Err(e) => return Err(Error::StorageBackend(e.to_string())),
+            }
+        }
+
+        warn!(
+            %digest,
+            namespace,
+            attempts = MAX_BLOB_INDEX_CAS_RETRIES,
+            "Blob index CAS retries exhausted; blob index may be incomplete for this namespace. \
+             A scrub run can reconcile the blob index."
+        );
+        Err(Error::Lock(format!(
+            "blob index CAS retries exhausted for digest {digest} after {MAX_BLOB_INDEX_CAS_RETRIES} attempts"
+        )))
     }
 }
 
@@ -657,6 +748,13 @@ impl MetadataStore for Backend {
         digest: &Digest,
         operation: BlobIndexOperation,
     ) -> Result<(), Error> {
+        if self.supports_conditional_writes {
+            return self
+                .update_blob_index_cas(namespace, digest, &[operation])
+                .await;
+        }
+
+        // Fallback: unconditional read-modify-write (caller must hold a lock).
         let path = path_builder::blob_index_path(digest);
 
         let mut reference_index = match self.store.read(&path).await {
@@ -665,27 +763,11 @@ impl MetadataStore for Backend {
             Err(e) => return Err(e.into()),
         };
 
-        let mut index = reference_index
-            .namespace
-            .remove(namespace)
-            .unwrap_or_default();
-        match operation {
-            BlobIndexOperation::Insert(link) => {
-                index.insert(link);
-            }
-            BlobIndexOperation::Remove(link) => {
-                index.remove(&link);
-            }
-        }
-        if !index.is_empty() {
-            reference_index
-                .namespace
-                .insert(namespace.to_string(), index);
-        }
+        apply_blob_index_ops(&mut reference_index, namespace, &[operation]);
 
         if reference_index.namespace.is_empty() {
-            let path = path_builder::blob_container_dir(digest);
-            self.store.delete_prefix(&path).await?;
+            let container = path_builder::blob_container_dir(digest);
+            self.store.delete_prefix(&container).await?;
         } else {
             let content = Bytes::from(serde_json::to_vec(&reference_index)?);
             self.store.put_object(&path, content).await?;
@@ -780,9 +862,11 @@ impl MetadataStore for Backend {
             }))
             .await;
 
-            // Lock keys include both link names and `blob:{digest}` for every target digest.
-            // This ensures blob index updates (which perform read-modify-write on per-digest
-            // index files) are serialized across concurrent update_links calls.
+            // When the S3 backend supports conditional writes, blob index updates use
+            // lock-free CAS (ETag-based compare-and-swap) and only link names are locked.
+            // Otherwise, `blob:{digest}` keys are included to serialize blob index
+            // read-modify-write cycles across concurrent callers.
+            let use_cas = self.supports_conditional_writes;
             let mut lock_keys: Vec<String> = Vec::new();
             let mut creates: Vec<(
                 LinkKind,
@@ -799,14 +883,18 @@ impl MetadataStore for Backend {
                     create_data
                 {
                     lock_keys.push(link.to_string());
-                    lock_keys.push(format!("blob:{target}"));
-                    if let Some(ref old) = old_target {
-                        lock_keys.push(format!("blob:{old}"));
+                    if !use_cas {
+                        lock_keys.push(format!("blob:{target}"));
+                        if let Some(ref old) = old_target {
+                            lock_keys.push(format!("blob:{old}"));
+                        }
                     }
                     creates.push((link, target, old_target, referrer, media_type, descriptor));
                 } else if let Some((link, Some(meta), referrer)) = delete_data {
                     lock_keys.push(link.to_string());
-                    lock_keys.push(format!("blob:{}", meta.target));
+                    if !use_cas {
+                        lock_keys.push(format!("blob:{}", meta.target));
+                    }
                     deletes.push((link, meta.target, referrer));
                 }
             }
@@ -1021,49 +1109,6 @@ impl MetadataStore for Backend {
                 return Err(Error::Lock("lock invalidated during operation".into()));
             }
 
-            // SAFETY: Blob index updates for different digests are independent (each digest
-            // has its own S3 key). Updates for the same digest within this call are grouped
-            // by the pending_blob_ops HashMap. Cross-call updates to the same digest are
-            // serialized by the `blob:{digest}` lock key acquired above.
-            join_all(pending_blob_ops.iter().map(|(digest, ops)| async move {
-                let path = path_builder::blob_index_path(digest);
-                let mut blob_index = match self.store.read(&path).await {
-                    Ok(data) => serde_json::from_slice::<BlobIndex>(&data)?,
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => BlobIndex::default(),
-                    Err(e) => return Err(Error::from(e)),
-                };
-                let mut ns_links = blob_index.namespace.remove(namespace).unwrap_or_default();
-                for op in ops {
-                    match op {
-                        BlobIndexOperation::Insert(link) => {
-                            ns_links.insert(link.clone());
-                        }
-                        BlobIndexOperation::Remove(link) => {
-                            ns_links.remove(link);
-                        }
-                    }
-                }
-                if !ns_links.is_empty() {
-                    blob_index.namespace.insert(namespace.to_string(), ns_links);
-                }
-                if blob_index.namespace.is_empty() {
-                    let container = path_builder::blob_container_dir(digest);
-                    self.store.delete_prefix(&container).await?;
-                } else {
-                    let content = Bytes::from(serde_json::to_vec(&blob_index)?);
-                    self.store.put_object(&path, content).await?;
-                }
-                Ok(())
-            }))
-            .await
-            .into_iter()
-            .collect::<Result<Vec<_>, _>>()?;
-
-            if !guard.is_valid() {
-                guard.release().await;
-                return Err(Error::Lock("lock invalidated during operation".into()));
-            }
-
             for (link, metadata) in tracked_create_writes
                 .iter()
                 .chain(non_tracked_create_writes.iter())
@@ -1074,13 +1119,82 @@ impl MetadataStore for Backend {
                 self.cache_invalidate(namespace, link).await;
             }
 
-            guard.release().await;
+            if use_cas {
+                // Release the lock before blob index updates — CAS handles
+                // concurrency via ETags without requiring lock coordination.
+                guard.release().await;
+
+                // Blob index updates use optimistic concurrency (CAS via ETags) and
+                // run outside the lock. Each digest has its own S3 key, so updates to
+                // different digests are independent and can run in parallel. Concurrent
+                // updates from other callers are resolved by CAS retry.
+                join_all(
+                    pending_blob_ops
+                        .iter()
+                        .map(|(digest, ops)| self.update_blob_index_cas(namespace, digest, ops)),
+                )
+                .await
+                .into_iter()
+                .collect::<Result<Vec<_>, _>>()?;
+            } else {
+                // Without conditional write support, blob index updates run under the
+                // lock (blob:{digest} keys are included in lock_keys above).
+                join_all(pending_blob_ops.iter().map(|(digest, ops)| async move {
+                    let path = path_builder::blob_index_path(digest);
+                    let mut blob_index = match self.store.read(&path).await {
+                        Ok(data) => serde_json::from_slice::<BlobIndex>(&data)?,
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => BlobIndex::default(),
+                        Err(e) => return Err(Error::from(e)),
+                    };
+                    apply_blob_index_ops(&mut blob_index, namespace, ops);
+                    if blob_index.namespace.is_empty() {
+                        let container = path_builder::blob_container_dir(digest);
+                        self.store.delete_prefix(&container).await?;
+                    } else {
+                        let content = Bytes::from(serde_json::to_vec(&blob_index)?);
+                        self.store.put_object(&path, content).await?;
+                    }
+                    Ok(())
+                }))
+                .await
+                .into_iter()
+                .collect::<Result<Vec<_>, _>>()?;
+
+                if !guard.is_valid() {
+                    guard.release().await;
+                    return Err(Error::Lock("lock invalidated during operation".into()));
+                }
+
+                guard.release().await;
+            }
+
             return Ok(());
         }
     }
 
     async fn flush_access_times(&self) {
         Backend::flush_access_times(self).await;
+    }
+}
+
+fn apply_blob_index_ops(
+    blob_index: &mut BlobIndex,
+    namespace: &str,
+    operations: &[BlobIndexOperation],
+) {
+    let mut ns_links = blob_index.namespace.remove(namespace).unwrap_or_default();
+    for op in operations {
+        match op {
+            BlobIndexOperation::Insert(link) => {
+                ns_links.insert(link.clone());
+            }
+            BlobIndexOperation::Remove(link) => {
+                ns_links.remove(link);
+            }
+        }
+    }
+    if !ns_links.is_empty() {
+        blob_index.namespace.insert(namespace.to_string(), ns_links);
     }
 }
 
