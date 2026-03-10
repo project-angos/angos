@@ -108,15 +108,15 @@ impl S3LockConfig {
     }
 
     fn default_operation_timeout_secs() -> u64 {
-        30
+        15
     }
 
     fn default_operation_attempt_timeout_secs() -> u64 {
-        10
+        4
     }
 
     fn default_max_attempts() -> u32 {
-        3
+        2
     }
 }
 
@@ -181,6 +181,21 @@ impl S3LockBackend {
             return Err(Error::InvalidData(
                 "max_hold_secs must be >= ttl_secs".into(),
             ));
+        }
+        let heartbeat_interval = config.ttl_secs / 3;
+        let worst_case_attempt =
+            config.operation_attempt_timeout_secs * u64::from(config.max_attempts);
+        if worst_case_attempt >= heartbeat_interval {
+            warn!(
+                operation_attempt_timeout_secs = config.operation_attempt_timeout_secs,
+                max_attempts = config.max_attempts,
+                heartbeat_interval_secs = heartbeat_interval,
+                worst_case_secs = worst_case_attempt,
+                "Lock S3 client worst-case timeout ({worst_case_attempt}s) >= heartbeat interval \
+                 ({heartbeat_interval}s). A stuck S3 request could consume an entire heartbeat \
+                 tick, reducing the safety margin before TTL expiry. Consider reducing \
+                 operation_attempt_timeout_secs or max_attempts."
+            );
         }
         Ok(Self {
             store,
@@ -433,15 +448,29 @@ impl S3LockBackend {
                         let cached_etag = etag_cache.get(path).cloned();
                         let store = store.clone();
                         let instance_id = instance_id.clone();
+                        let tick_deadline = interval;
                         async move {
-                            let result = heartbeat_tick_path(
-                                &store,
-                                path,
-                                &instance_id,
-                                ttl_secs,
-                                cached_etag,
+                            // Cap each tick to the heartbeat interval. The slow path
+                            // (no cached ETag) issues two sequential SDK calls that
+                            // could each consume the full operation timeout, exceeding
+                            // the heartbeat interval and risking TTL expiry.
+                            let result = if let Ok(result) = tokio::time::timeout(
+                                tick_deadline,
+                                heartbeat_tick_path(
+                                    &store,
+                                    path,
+                                    &instance_id,
+                                    ttl_secs,
+                                    cached_etag,
+                                ),
                             )
-                            .await;
+                            .await
+                            {
+                                result
+                            } else {
+                                warn!(path, "Heartbeat tick timed out");
+                                HeartbeatPathResult::Failure
+                            };
                             (path.clone(), result)
                         }
                     }))

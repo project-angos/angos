@@ -190,14 +190,15 @@ retry_delay_ms = 50
 
 | Option                          | Type | Default | Description                  |
 |---------------------------------|------|---------|------------------------------|
-| `ttl_secs`                      | u64  | `30`    | Lock TTL in seconds (minimum: 3). Heartbeat renews at intervals of `ttl_secs / 3` |
+| `ttl_secs`                      | u64  | `30`    | Lock TTL in seconds (minimum: 9). Heartbeat renews at intervals of `ttl_secs / 3` |
 | `max_retries`                   | u32  | `100`   | Max lock acquisition retries |
 | `retry_delay_ms`                | u64  | `50`    | Delay between retries (minimum: 1) |
-| `operation_timeout_secs`        | u64  | `30`    | Total timeout for lock S3 operations |
-| `operation_attempt_timeout_secs`| u64  | `10`    | Per-attempt timeout for lock S3 operations |
-| `max_attempts`                  | u32  | `3`     | Maximum retry attempts for lock S3 operations |
+| `max_hold_secs`                 | u64  | `300`   | Maximum lock hold duration in seconds (minimum: 10, must be >= `ttl_secs`). Guard is invalidated if held beyond this duration |
+| `operation_timeout_secs`        | u64  | `15`    | Total timeout for lock S3 operations |
+| `operation_attempt_timeout_secs`| u64  | `4`     | Per-attempt timeout for lock S3 operations |
+| `max_attempts`                  | u32  | `2`     | Maximum retry attempts for lock S3 operations |
 
-> **Lock operation timeouts:** Lock operations use their own S3 client with significantly tighter timeouts than blob/metadata operations. This is intentional: lock operations are small JSON payloads and should fail fast rather than blocking for minutes on a stuck request. The defaults (`operation_timeout_secs = 30`, `operation_attempt_timeout_secs = 10`, `max_attempts = 3`) are tuned for lock-like behavior. For high-latency S3 scenarios, increase these values to match your network latency, but keep them much lower than the metadata store's main S3 client timeouts (default 900s/300s).
+> **Lock operation timeouts:** Lock operations use their own S3 client with significantly tighter timeouts than blob/metadata operations. This is intentional: lock operations are small JSON payloads and should fail fast rather than blocking for minutes on a stuck request. The defaults (`operation_timeout_secs = 15`, `operation_attempt_timeout_secs = 4`, `max_attempts = 2`) ensure that a single stuck request cannot consume an entire heartbeat interval (10s with default TTL). Each heartbeat tick is also capped to the heartbeat interval to prevent the slow path (two sequential SDK calls) from exceeding it. A startup warning is emitted if `operation_attempt_timeout_secs × max_attempts >= ttl_secs / 3`. For high-latency S3 scenarios, increase these values but keep `attempt_timeout × max_attempts` below the heartbeat interval.
 
 **Heartbeat Mechanism:**
 
