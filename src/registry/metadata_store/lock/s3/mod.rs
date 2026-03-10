@@ -28,6 +28,7 @@ use crate::{
             Error,
             lock::{LockBackend, LockGuard},
         },
+        path_builder,
     },
 };
 
@@ -208,7 +209,8 @@ impl S3LockBackend {
     }
 
     fn lock_path(key: &str) -> String {
-        format!("_locks/{key}")
+        let shard = path_builder::shard_key(key);
+        format!("_locks/{shard}/{key}")
     }
 
     fn jittered_delay(&self, attempt: u32) -> Duration {

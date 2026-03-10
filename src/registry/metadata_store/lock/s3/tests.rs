@@ -135,7 +135,7 @@ async fn test_stale_lock_recovery() {
     };
     let data = serde_json::to_vec(&stale_payload).unwrap();
     store
-        .put_object("_locks/stale_key", data)
+        .put_object(&S3LockBackend::lock_path("stale_key"), data)
         .await
         .expect("Failed to write stale lock");
 
@@ -172,14 +172,14 @@ async fn test_non_stale_lock_not_recovered() {
     };
     let data = serde_json::to_vec(&fresh_payload).unwrap();
     store
-        .put_object("_locks/fresh_key", data)
+        .put_object(&S3LockBackend::lock_path("fresh_key"), data)
         .await
         .expect("Failed to write fresh lock");
 
     let attempt = backend.acquire(&["fresh_key".to_string()]).await;
     assert!(attempt.is_err(), "Should not recover a non-stale lock");
 
-    let _ = store.delete("_locks/fresh_key").await;
+    let _ = store.delete(&S3LockBackend::lock_path("fresh_key")).await;
 }
 
 #[test]
@@ -232,7 +232,7 @@ async fn test_heartbeat_refreshes_lock() {
 
     // Lock file should still exist (heartbeat refreshed it)
     let data = store
-        .read("_locks/hb_test")
+        .read(&S3LockBackend::lock_path("hb_test"))
         .await
         .expect("Lock file should still exist after heartbeat refresh");
     assert!(!data.is_empty(), "Lock payload should not be empty");
@@ -276,7 +276,7 @@ async fn test_heartbeat_invalidates_guard_on_ownership_loss() {
     };
     let data = serde_json::to_vec(&stolen_payload).unwrap();
     store
-        .put_object("_locks/test_key", data)
+        .put_object(&S3LockBackend::lock_path("test_key"), data)
         .await
         .expect("Failed to overwrite lock");
 
@@ -303,7 +303,7 @@ async fn test_explicit_release_deletes_lock() {
 
     guard.release().await;
 
-    let result = store.read("_locks/test_key").await;
+    let result = store.read(&S3LockBackend::lock_path("test_key")).await;
     assert_eq!(
         result.unwrap_err().kind(),
         ErrorKind::NotFound,
@@ -349,7 +349,7 @@ async fn test_release_skips_delete_when_ownership_lost() {
     };
     let data = serde_json::to_vec(&stolen_payload).unwrap();
     store
-        .put_object("_locks/owned_key", data)
+        .put_object(&S3LockBackend::lock_path("owned_key"), data)
         .await
         .expect("Failed to overwrite lock");
 
@@ -363,7 +363,7 @@ async fn test_release_skips_delete_when_ownership_lost() {
     guard.release().await;
 
     let data = store
-        .read("_locks/owned_key")
+        .read(&S3LockBackend::lock_path("owned_key"))
         .await
         .expect("Thief's lock should still exist after release");
     let payload: S3LockPayload = serde_json::from_slice(&data).unwrap();
@@ -372,7 +372,7 @@ async fn test_release_skips_delete_when_ownership_lost() {
         "Thief's lock should not have been deleted"
     );
 
-    let _ = store.delete("_locks/owned_key").await;
+    let _ = store.delete(&S3LockBackend::lock_path("owned_key")).await;
 }
 
 /// Spawns N tasks that race for the same lock key with retries enabled.
@@ -510,5 +510,38 @@ async fn test_concurrent_contention_overlapping_keys() {
         max_observed.load(Ordering::SeqCst),
         1,
         "At most 1 task should hold the lock at any time"
+    );
+}
+
+#[test]
+fn test_lock_path_shards_across_prefixes() {
+    let path = S3LockBackend::lock_path("my_key");
+    assert!(path.starts_with("_locks/"));
+    assert!(path.ends_with("/my_key"));
+
+    // Shard is a 2-char hex prefix between _locks/ and /key
+    let parts: Vec<&str> = path.splitn(3, '/').collect();
+    assert_eq!(parts.len(), 3);
+    assert_eq!(parts[0], "_locks");
+    assert_eq!(parts[1].len(), 2);
+    assert!(parts[1].chars().all(|c| c.is_ascii_hexdigit()));
+    assert_eq!(parts[2], "my_key");
+
+    // Same key always maps to same shard
+    assert_eq!(
+        S3LockBackend::lock_path("my_key"),
+        S3LockBackend::lock_path("my_key")
+    );
+
+    // Different keys can map to different shards
+    let paths: std::collections::HashSet<String> = (0..100)
+        .map(|i| {
+            let p = S3LockBackend::lock_path(&format!("key_{i}"));
+            p.split('/').nth(1).unwrap().to_string()
+        })
+        .collect();
+    assert!(
+        paths.len() > 1,
+        "Expected multiple shard prefixes across 100 keys, got {paths:?}"
     );
 }

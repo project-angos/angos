@@ -31,10 +31,14 @@ pub fn namespace_registry_shard_path(namespace: &str) -> String {
 }
 
 #[allow(clippy::cast_possible_truncation)]
-pub fn namespace_shard_key(namespace: &str) -> String {
+pub fn shard_key(value: &str) -> String {
     let mut hasher = DefaultHasher::new();
-    namespace.hash(&mut hasher);
+    value.hash(&mut hasher);
     format!("{:02x}", hasher.finish() as u8)
+}
+
+pub fn namespace_shard_key(namespace: &str) -> String {
+    shard_key(namespace)
 }
 
 fn blob_dir(digest: &Digest) -> String {
@@ -304,9 +308,11 @@ mod tests {
 
         let path = namespace_registry_shard_path("my-repo");
         assert!(path.starts_with("_registry/ns/"));
-        assert!(std::path::Path::new(&path)
-            .extension()
-            .is_some_and(|ext| ext.eq_ignore_ascii_case("json")));
+        assert!(
+            std::path::Path::new(&path)
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("json"))
+        );
 
         // Same namespace always maps to the same shard
         assert_eq!(
