@@ -293,12 +293,12 @@ Lock operations use a dedicated S3 client with independent timeout configuration
 
 ```toml
 [metadata_store.s3.lock_strategy.s3]
-ttl_secs = 30               # Lock expiry in seconds (minimum: 3)
+ttl_secs = 30               # Lock expiry in seconds (minimum: 9)
 max_retries = 100           # Acquisition retry attempts
 retry_delay_ms = 50         # Delay between retries (minimum: 1)
 ```
 
-The heartbeat interval is automatically calculated as `ttl_secs / 3`. For example, with the default `ttl_secs = 30`, heartbeats occur every 10 seconds. The minimum `ttl_secs` value is 3 seconds, resulting in a minimum heartbeat interval of 1 second.
+The heartbeat interval is automatically calculated as `ttl_secs / 3`. For example, with the default `ttl_secs = 30`, heartbeats occur every 10 seconds. The minimum `ttl_secs` value is 9 seconds, resulting in a minimum heartbeat interval of 3 seconds.
 
 :::note
 The S3 provider must support conditional writes. Angos probes for this capability at startup and fails fast if it is not available.
@@ -480,7 +480,7 @@ multipart_copy_jobs = 4
 
 ### S3 Metadata Optimizations
 
-When using S3 for metadata, Angos includes two optimizations to reduce round-trips:
+When using S3 for metadata, Angos includes several optimizations to reduce round-trips and improve scalability:
 
 **Link cache** — A read-through cache for link metadata (tags, layer links). Populated on both read and write, invalidated on delete. Configurable TTL (default 30 s, `link_cache_ttl = 0` to disable). Shares the same cache backend (in-memory or Redis) as authentication tokens.
 
@@ -492,6 +492,72 @@ When using S3 for metadata, Angos includes two optimizations to reduce round-tri
 link_cache_ttl = 30               # seconds (0 to disable)
 access_time_debounce_secs = 60    # seconds (0 to disable)
 ```
+
+#### Blob Index Sharding
+
+Blob indexes track which namespaces reference each blob and are critical for garbage collection. Rather than storing a single `index.json` per blob (which becomes a contention point under concurrent access), Angos uses a **sharded approach**:
+
+Each blob's index is stored as multiple per-namespace files at:
+
+```
+v2/blobs/{algorithm}/{hash_prefix}/{hash}/refs/{namespace}.json
+```
+
+For example, a blob referenced by namespaces `myapp` and `team/backend` stores:
+
+```
+v2/blobs/sha256/ab/cdef.../refs/myapp.json
+v2/blobs/sha256/ab/cdef.../refs/team%2Fbackend.json
+```
+
+The namespace is percent-encoded in the filename (`/` → `%2F`, `%` → `%25`) to avoid ambiguity.
+
+**Benefits:**
+
+- **Reduced contention** — Multiple namespaces can update their blob references concurrently without serializing on a single file.
+- **Faster updates** — Each shard is small, making updates quicker.
+- **Scalability** — Performance doesn't degrade as the number of namespaces grows.
+
+#### Namespace Registry
+
+Listing all namespaces requires discovering all repositories and their nested namespaces. Without optimization, this is an O(n) tree walk across S3, which scales poorly.
+
+Angos maintains an index at:
+
+```
+_registry/namespaces.json
+```
+
+This file contains a simple JSON list:
+
+```json
+{
+  "namespaces": ["myapp", "team/backend", "team/frontend"]
+}
+```
+
+The registry is:
+
+- **Built on first use** — If missing, Angos performs an S3 tree walk to discover all namespaces and writes the registry file.
+- **Updated incrementally** — New namespaces are appended to the registry as they are created.
+- **Protected by locking** — Concurrent writes use distributed locking (S3 conditional writes or a lock key) to prevent corruption.
+
+**Benefits:**
+
+- **O(1) list performance** — Instead of O(n) tree walk, `list_namespaces` becomes a single file read.
+- **No background jobs** — The registry is built on demand, not via a separate garbage collector or background process.
+
+#### Legacy Blob Index Migration
+
+Angos deployed before version v1.1.0 used a single `index.json` file per blob. This is automatically migrated to the sharded format on first read with no manual intervention:
+
+1. Registry reads blob metadata and finds no sharded index files
+2. Falls back to reading the legacy `v2/blobs/{algorithm}/{hash_prefix}/{hash}/index.json`
+3. Writes each namespace's references to its own shard file
+4. Deletes the legacy `index.json`
+5. Subsequent reads use the sharded format
+
+The migration is transparent and happens exactly once per blob. You can verify migration progress by monitoring S3 operations or checking logs for "Migrated legacy blob index" messages.
 
 ### Caching
 

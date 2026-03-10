@@ -300,6 +300,23 @@ The `--media-types` flag reads each manifest blob and writes its `media_type` in
 
 This is idempotent and safe to run multiple times.
 
+### Automatic Blob Index Migration
+
+When the S3 backend reads blob metadata, it automatically migrates legacy single-file blob indexes (`index.json`) to the per-namespace shard format (`refs/{namespace}.json`). This migration is:
+
+- **Transparent** - Requires no operator action
+- **Idempotent** - Safe to run multiple times
+- **Crash-safe** - Shard files are written before the legacy file is deleted
+
+The `scrub --blobs` command triggers this migration as part of its normal blob iteration, making it an effective way to batch-migrate all legacy indexes:
+
+```bash
+# Migrate all legacy blob indexes to the new shard format
+./angos -c config.toml scrub --blobs
+```
+
+Running this once after upgrading will convert any remaining legacy `index.json` files to the sharded format automatically.
+
 ### Fix Links Format
 
 The `--links` flag repairs link format inconsistencies. Use this when:
