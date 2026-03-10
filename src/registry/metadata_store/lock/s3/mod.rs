@@ -220,6 +220,11 @@ impl S3LockBackend {
         let store = self.store.clone();
         let instance_id = self.instance_id.clone();
         let valid_for_release = valid.clone();
+        // Release performs a best-effort ownership check before deleting lock objects.
+        // S3 does not support conditional DELETE, so there is a narrow TOCTOU window
+        // between the ownership read and the delete where another instance could have
+        // recovered the lock. The worst case is a transient lock disappearance — the
+        // new owner's next heartbeat will re-create the lock object.
         LockGuard::with_async_release_and_heartbeat(
             move || {
                 Box::pin(async move {
@@ -712,6 +717,48 @@ impl S3LockBackend {
             recovered: recovered_paths,
         }
     }
+
+    async fn try_acquire_sequential(&self, lock_paths: &[String]) -> AcquireRoundOutcome {
+        let mut acquired_etags: HashMap<String, String> = HashMap::new();
+        let mut acquired_paths: Vec<String> = Vec::new();
+
+        for path in lock_paths {
+            match self.try_acquire_key(path).await {
+                Ok(Some(etag)) => {
+                    acquired_etags.insert(path.clone(), etag);
+                    acquired_paths.push(path.clone());
+                }
+                Ok(None) => match self.try_recover_stale_lock(path).await {
+                    RecoveryOutcome::Acquired(new_etag) => {
+                        if let Some(etag) = new_etag {
+                            acquired_etags.insert(path.clone(), etag);
+                        }
+                        acquired_paths.push(path.clone());
+                    }
+                    RecoveryOutcome::Error(msg) => {
+                        self.release_paths(&acquired_paths).await;
+                        return AcquireRoundOutcome::RecoveryError {
+                            msg,
+                            to_release: Vec::new(),
+                        };
+                    }
+                    _ => {
+                        self.release_paths(&acquired_paths).await;
+                        return AcquireRoundOutcome::Retry {
+                            acquired: Vec::new(),
+                            recovered: Vec::new(),
+                        };
+                    }
+                },
+                Err(e) => {
+                    self.release_paths(&acquired_paths).await;
+                    return AcquireRoundOutcome::HardError(e);
+                }
+            }
+        }
+
+        AcquireRoundOutcome::AllAcquired(acquired_etags)
+    }
 }
 
 #[async_trait]
@@ -728,9 +775,15 @@ impl LockBackend for S3LockBackend {
         lock_paths.dedup();
 
         let mut retries = self.max_retries;
+        let mut use_sequential = false;
 
         loop {
-            match self.try_acquire_round(&lock_paths).await {
+            let round_result = if use_sequential {
+                self.try_acquire_sequential(&lock_paths).await
+            } else {
+                self.try_acquire_round(&lock_paths).await
+            };
+            match round_result {
                 AcquireRoundOutcome::AllAcquired(etags) => {
                     LOCK_ACQUISITION_DURATION
                         .with_label_values(&["s3"])
@@ -779,6 +832,7 @@ impl LockBackend for S3LockBackend {
                     }
                     retries -= 1;
                     let attempt = self.max_retries - retries;
+                    use_sequential = true;
                     LOCK_RETRIES.with_label_values(&["s3"]).inc();
                     debug!(retries_left = retries, "S3 lock busy, retrying...");
                     tokio::time::sleep(self.jittered_delay(attempt)).await;

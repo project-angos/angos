@@ -16,6 +16,7 @@ use crate::{
     },
 };
 
+// ARGV[1] = instance_id, ARGV[2] = ttl
 const ACQUIRE_SCRIPT: &str = r"
 for i, key in ipairs(KEYS) do
     if redis.call('EXISTS', key) == 1 then
@@ -28,16 +29,22 @@ end
 return 1
 ";
 
+// ARGV[1] = instance_id
 const RELEASE_SCRIPT: &str = r"
 for i, key in ipairs(KEYS) do
-    redis.call('DEL', key)
+    if redis.call('GET', key) == ARGV[1] then
+        redis.call('DEL', key)
+    end
 end
 return 1
 ";
 
+// ARGV[1] = ttl, ARGV[2] = instance_id
 const REFRESH_SCRIPT: &str = r"
 for i, key in ipairs(KEYS) do
-    redis.call('EXPIRE', key, ARGV[1])
+    if redis.call('GET', key) == ARGV[2] then
+        redis.call('EXPIRE', key, ARGV[1])
+    end
 end
 return 1
 ";
@@ -79,6 +86,7 @@ impl Default for LockConfig {
 #[derive(Debug, Clone)]
 pub struct RedisBackend {
     client: Arc<Client>,
+    instance_id: String,
     ttl: usize,
     key_prefix: String,
     max_retries: u32,
@@ -90,11 +98,42 @@ impl RedisBackend {
         let client = Arc::new(Client::open(config.url.clone())?);
         Ok(RedisBackend {
             client,
+            instance_id: uuid::Uuid::new_v4().to_string(),
             ttl: config.ttl,
             key_prefix: config.key_prefix.clone(),
             max_retries: config.max_retries,
             retry_delay_ms: config.retry_delay_ms,
         })
+    }
+
+    fn spawn_refresh_task(&self, keys: Vec<String>) -> (JoinHandle<()>, Arc<Notify>) {
+        let client = self.client.clone();
+        let ttl = self.ttl;
+        let instance_id = self.instance_id.clone();
+        let refresh_interval = Duration::from_secs((ttl / 2) as u64);
+        let stop_notify = Arc::new(Notify::new());
+        let stop_notify_clone = stop_notify.clone();
+
+        let handle = tokio::spawn(async move {
+            let Ok(mut conn) = client.get_multiplexed_async_connection().await else {
+                return;
+            };
+            loop {
+                tokio::select! {
+                    () = sleep(refresh_interval) => {
+                        let _: redis::RedisResult<i32> = redis::Script::new(REFRESH_SCRIPT)
+                            .key(&keys)
+                            .arg(ttl)
+                            .arg(&instance_id)
+                            .invoke_async(&mut conn)
+                            .await;
+                    }
+                    () = stop_notify_clone.notified() => break,
+                }
+            }
+        });
+
+        (handle, stop_notify)
     }
 }
 
@@ -103,6 +142,7 @@ pub struct RedisGuard {
     stop_notify: Arc<Notify>,
     client: Arc<Client>,
     keys: Vec<String>,
+    instance_id: String,
 }
 
 impl Drop for RedisGuard {
@@ -113,6 +153,7 @@ impl Drop for RedisGuard {
         if let Ok(mut conn) = self.client.get_connection() {
             let _: redis::RedisResult<i32> = redis::Script::new(RELEASE_SCRIPT)
                 .key(&self.keys)
+                .arg(&self.instance_id)
                 .invoke(&mut conn);
         }
     }
@@ -127,6 +168,7 @@ impl LockBackend for RedisBackend {
                 stop_notify: Arc::new(Notify::new()),
                 client: self.client.clone(),
                 keys: Vec::new(),
+                instance_id: self.instance_id.clone(),
             })));
         }
 
@@ -155,7 +197,7 @@ impl LockBackend for RedisBackend {
 
             let acquired: i32 = redis::Script::new(ACQUIRE_SCRIPT)
                 .key(&lock_keys)
-                .arg(1)
+                .arg(&self.instance_id)
                 .arg(self.ttl)
                 .invoke_async(&mut conn)
                 .await
@@ -169,33 +211,7 @@ impl LockBackend for RedisBackend {
                 })?;
 
             if acquired == 1 {
-                let stop_notify = Arc::new(Notify::new());
-                let client = self.client.clone();
-                let keys_for_refresh = lock_keys.clone();
-                let ttl = self.ttl;
-                let refresh_interval = Duration::from_secs((ttl / 2) as u64);
-                let stop_notify_clone = stop_notify.clone();
-
-                let refresh_handle = tokio::spawn(async move {
-                    let Ok(mut conn) = client.get_multiplexed_async_connection().await else {
-                        return;
-                    };
-
-                    loop {
-                        tokio::select! {
-                            () = sleep(refresh_interval) => {
-                                let _: redis::RedisResult<i32> = redis::Script::new(REFRESH_SCRIPT)
-                                    .key(&keys_for_refresh)
-                                    .arg(ttl)
-                                    .invoke_async(&mut conn)
-                                    .await;
-                            }
-                            () = stop_notify_clone.notified() => {
-                                break;
-                            }
-                        }
-                    }
-                });
+                let (refresh_handle, stop_notify) = self.spawn_refresh_task(lock_keys.clone());
 
                 LOCK_ACQUISITION_DURATION
                     .with_label_values(&["redis"])
@@ -209,6 +225,7 @@ impl LockBackend for RedisBackend {
                     stop_notify,
                     client: self.client.clone(),
                     keys: lock_keys,
+                    instance_id: self.instance_id.clone(),
                 })));
             }
 

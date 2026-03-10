@@ -429,6 +429,9 @@ impl MetadataStore for Backend {
             }))
             .await;
 
+            // Lock keys include both link names and `blob:{digest}` for every target digest.
+            // This ensures blob index updates (which perform read-modify-write on per-digest
+            // index files) are serialized across concurrent update_links calls.
             let mut lock_keys: Vec<String> = Vec::new();
             let mut creates: Vec<(
                 LinkKind,
@@ -649,6 +652,10 @@ impl MetadataStore for Backend {
                 return Err(Error::Lock("lock invalidated during operation".into()));
             }
 
+            // Blob index updates for different digests are independent (each digest has its
+            // own file). Updates for the same digest within this call are grouped by the
+            // pending_blob_ops HashMap. Cross-call updates to the same digest are serialized
+            // by the `blob:{digest}` lock key acquired above.
             for (digest, ops) in &pending_blob_ops {
                 let path = path_builder::blob_index_path(digest);
                 let mut blob_index =
