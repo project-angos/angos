@@ -2,6 +2,7 @@ use crate::{oci::Digest, registry::metadata_store::link_kind::LinkKind};
 
 const BLOBS_ROOT: &str = "v2/blobs";
 const REPOS_ROOT: &str = "v2/repositories";
+const REGISTRY_ROOT: &str = "_registry";
 
 pub fn blobs_root_dir() -> &'static str {
     BLOBS_ROOT
@@ -9,6 +10,10 @@ pub fn blobs_root_dir() -> &'static str {
 
 pub fn repository_dir() -> &'static str {
     REPOS_ROOT
+}
+
+pub fn namespace_registry_path() -> String {
+    format!("{REGISTRY_ROOT}/namespaces.json")
 }
 
 fn blob_dir(digest: &Digest) -> String {

@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -13,7 +13,7 @@ use futures_util::{
     future::join_all,
     stream::{self, StreamExt},
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 use tracing::{debug, info, instrument, warn};
 
@@ -201,6 +201,11 @@ impl Drop for FlushHandle {
     }
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct NamespaceRegistry {
+    namespaces: Vec<String>,
+}
+
 #[derive(Clone)]
 pub struct Backend {
     pub store: data_store::s3::Backend,
@@ -212,6 +217,7 @@ pub struct Backend {
     /// When true, blob index updates use lock-free CAS. When false, they are protected
     /// by the distributed lock alongside link updates.
     supports_conditional_writes: bool,
+    known_namespaces: Arc<Mutex<HashSet<String>>>,
     // Held for Drop side-effect: signals the flush task to exit when the last Backend is dropped.
     #[allow(dead_code)]
     flush_handle: Option<Arc<FlushHandle>>,
@@ -287,6 +293,7 @@ impl Backend {
                 link_cache_ttl: config.link_cache_ttl,
                 access_time_writer: access_time_writer.clone(),
                 supports_conditional_writes,
+                known_namespaces: Arc::new(Mutex::new(HashSet::new())),
                 flush_handle: None,
             };
 
@@ -312,6 +319,7 @@ impl Backend {
             link_cache_ttl: config.link_cache_ttl,
             access_time_writer,
             supports_conditional_writes,
+            known_namespaces: Arc::new(Mutex::new(HashSet::new())),
             flush_handle,
         };
 
@@ -552,11 +560,21 @@ impl MetadataStore for Backend {
     ) -> Result<(Vec<String>, Option<String>), Error> {
         debug!("Fetching {n} namespace(s) with continuation token: {last:?}");
 
-        let repo_dir = path_builder::repository_dir();
-        let mut namespaces = Vec::new();
-        self.collect_namespaces(repo_dir, "", &mut namespaces)
-            .await?;
-        namespaces.sort();
+        let namespaces = if let Some(registry) = self.read_namespace_registry().await? {
+            registry.namespaces
+        } else {
+            info!("Namespace registry not found, rebuilding from S3 tree walk");
+            self.rebuild_namespace_registry().await?;
+            self.read_namespace_registry()
+                .await?
+                .map(|r| r.namespaces)
+                .unwrap_or_default()
+        };
+
+        {
+            let mut cache = self.known_namespaces.lock().await;
+            cache.extend(namespaces.iter().cloned());
+        }
 
         Ok(pagination::paginate_sorted(&namespaces, n, last.as_deref()))
     }
@@ -1178,6 +1196,12 @@ impl MetadataStore for Backend {
                 guard.release().await;
             }
 
+            if !creates.is_empty()
+                && let Err(e) = self.register_namespace(namespace).await
+            {
+                warn!(namespace, error = %e, "Failed to register namespace");
+            }
+
             return Ok(());
         }
     }
@@ -1216,6 +1240,172 @@ fn is_tracked_link(link: &LinkKind) -> bool {
 }
 
 impl Backend {
+    async fn read_namespace_registry(&self) -> Result<Option<NamespaceRegistry>, Error> {
+        let path = path_builder::namespace_registry_path();
+        match self.store.read(&path).await {
+            Ok(data) => match serde_json::from_slice(&data) {
+                Ok(registry) => Ok(Some(registry)),
+                Err(e) => {
+                    warn!("Corrupt namespace registry, will rebuild: {e}");
+                    Ok(None)
+                }
+            },
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(Error::from(e)),
+        }
+    }
+
+    pub async fn rebuild_namespace_registry(&self) -> Result<(), Error> {
+        let repo_dir = path_builder::repository_dir();
+        let mut namespaces = Vec::new();
+        self.collect_namespaces(repo_dir, "", &mut namespaces)
+            .await?;
+        namespaces.sort();
+        namespaces.dedup();
+
+        let registry = NamespaceRegistry { namespaces };
+        let content = Bytes::from(serde_json::to_vec(&registry)?);
+        let path = path_builder::namespace_registry_path();
+
+        if self.supports_conditional_writes {
+            self.store.put_object(&path, content).await?;
+        } else {
+            let lock_key = "namespace_registry".to_string();
+            let guard = self.lock.acquire(&[lock_key]).await?;
+            self.store.put_object(&path, content).await?;
+            guard.release().await;
+        }
+        Ok(())
+    }
+
+    async fn register_namespace(&self, namespace: &str) -> Result<(), Error> {
+        if self.known_namespaces.lock().await.contains(namespace) {
+            return Ok(());
+        }
+
+        if self.supports_conditional_writes {
+            self.register_namespace_cas(namespace).await
+        } else {
+            self.register_namespace_unconditional(namespace).await
+        }
+    }
+
+    async fn register_namespace_unconditional(&self, namespace: &str) -> Result<(), Error> {
+        let path = path_builder::namespace_registry_path();
+        let lock_key = "namespace_registry".to_string();
+        let guard = self.lock.acquire(&[lock_key]).await?;
+
+        let mut registry = match self.store.read(&path).await {
+            Ok(data) => serde_json::from_slice::<NamespaceRegistry>(&data).unwrap_or_default(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => NamespaceRegistry::default(),
+            Err(e) => {
+                guard.release().await;
+                return Err(Error::from(e));
+            }
+        };
+
+        if let Err(pos) = registry.namespaces.binary_search(&namespace.to_string()) {
+            registry.namespaces.insert(pos, namespace.to_string());
+            let content = Bytes::from(serde_json::to_vec(&registry)?);
+            if let Err(e) = self.store.put_object(&path, content).await {
+                guard.release().await;
+                return Err(e.into());
+            }
+        }
+
+        guard.release().await;
+        self.known_namespaces
+            .lock()
+            .await
+            .insert(namespace.to_string());
+        Ok(())
+    }
+
+    async fn register_namespace_cas(&self, namespace: &str) -> Result<(), Error> {
+        let path = path_builder::namespace_registry_path();
+
+        for attempt in 0..MAX_BLOB_INDEX_CAS_RETRIES {
+            let (mut registry, etag) = match self.store.read_with_etag(&path).await {
+                Ok((data, etag)) => match serde_json::from_slice::<NamespaceRegistry>(&data) {
+                    Ok(r) => (r, etag),
+                    // Corrupt JSON: keep the ETag so we can overwrite with CAS
+                    Err(_) => (NamespaceRegistry::default(), etag),
+                },
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    (NamespaceRegistry::default(), None)
+                }
+                Err(e) => return Err(Error::from(e)),
+            };
+
+            if registry
+                .namespaces
+                .binary_search(&namespace.to_string())
+                .is_ok()
+            {
+                self.known_namespaces
+                    .lock()
+                    .await
+                    .insert(namespace.to_string());
+                return Ok(());
+            }
+
+            let pos = registry
+                .namespaces
+                .binary_search(&namespace.to_string())
+                .unwrap_err();
+            registry.namespaces.insert(pos, namespace.to_string());
+
+            let content = Bytes::from(serde_json::to_vec(&registry)?);
+            let write_result = if let Some(ref etag) = etag {
+                self.store
+                    .put_object_if_match(&path, etag, content)
+                    .await
+                    .map(|_| ())
+            } else {
+                self.store
+                    .put_object_if_not_exists(&path, content)
+                    .await
+                    .map(|_| ())
+            };
+
+            match write_result {
+                Ok(()) => {
+                    self.known_namespaces
+                        .lock()
+                        .await
+                        .insert(namespace.to_string());
+                    return Ok(());
+                }
+                Err(data_store::Error::PreconditionFailed) => {
+                    debug!(
+                        namespace,
+                        attempt, "Namespace registry CAS conflict, retrying"
+                    );
+                    let jitter_ms = {
+                        use std::hash::{BuildHasher, Hasher};
+                        let max = 50u64.saturating_mul(1u64 << attempt.min(4));
+                        if max == 0 {
+                            0
+                        } else {
+                            std::collections::hash_map::RandomState::new()
+                                .build_hasher()
+                                .finish()
+                                % max
+                        }
+                    };
+                    tokio::time::sleep(Duration::from_millis(jitter_ms)).await;
+                }
+                Err(e) => return Err(Error::StorageBackend(e.to_string())),
+            }
+        }
+
+        warn!(
+            namespace,
+            "Namespace registry CAS retries exhausted; namespace will appear after scrub reconciles"
+        );
+        Ok(())
+    }
+
     async fn collect_namespaces(
         &self,
         path: &str,
