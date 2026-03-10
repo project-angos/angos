@@ -214,9 +214,9 @@ impl S3LockBackend {
     fn jittered_delay(&self, attempt: u32) -> Duration {
         let max_delay_ms: u64 = 1000;
         let base_ms = self.retry_delay_ms.saturating_mul(1u64 << attempt.min(6));
-        let jitter = simple_jitter(base_ms.min(max_delay_ms) / 2);
-        let total_ms = base_ms.saturating_add(jitter).min(max_delay_ms);
-        Duration::from_millis(total_ms)
+        let capped_ms = base_ms.min(max_delay_ms);
+        let jitter = simple_jitter(capped_ms / 2);
+        Duration::from_millis(capped_ms.saturating_add(jitter))
     }
 
     fn make_payload(&self) -> Result<Vec<u8>, Error> {
@@ -671,11 +671,11 @@ enum AcquireRoundOutcome {
 impl S3LockBackend {
     async fn try_acquire_round(&self, lock_paths: &[String]) -> AcquireRoundOutcome {
         // Parallel PUTs with overlapping key sets across instances can cause
-        // repeated rollbacks (practical livelock). Sorted key order prevents
-        // circular wait in sequential protocols but does not prevent collision
-        // in a parallel-issue protocol. The retry budget (`max_retries`) bounds
-        // total attempts. Randomized jitter (simple_jitter) desynchronises
-        // retrying instances to break collision patterns.
+        // repeated rollbacks. This parallel round is used only for the first
+        // attempt (optimistic fast path). On any failure, `acquire` switches
+        // to `try_acquire_sequential` which acquires keys one-by-one in sorted
+        // order, eliminating circular wait and preventing livelock. Randomized
+        // jitter on retry delays desynchronises retrying instances.
         let futs: Vec<_> = lock_paths
             .iter()
             .enumerate()

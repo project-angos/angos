@@ -204,7 +204,7 @@ retry_delay_ms = 50
 
 The S3 lock implementation uses a heartbeat to keep locks alive. Once acquired, a background task automatically renews the lock at regular intervals of `ttl_secs / 3`. For example, with the default `ttl_secs = 30`, the heartbeat runs every 10 seconds. This allows the lock to remain valid beyond the initial TTL as long as the lock-holder remains alive. If a lock-holder crashes, other instances must wait for the full `ttl_secs` duration before the lock becomes available for recovery.
 
-> **Contention note:** Under high concurrency with overlapping lock sets, instances may experience repeated rollbacks during lock acquisition. Increasing `max_retries` or reducing instance count mitigates this. Randomized jitter on retry delays desynchronises retrying instances.
+> **Contention note:** The first lock acquisition attempt uses parallel PUTs for low latency. If any key is contended, the system falls back to sequential sorted acquisition for all subsequent retries, which eliminates circular wait and prevents livelock. When CAS blob index updates are active (S3 lock strategy), blob digest keys are excluded from locking, avoiding cross-namespace contention on shared layers. Randomized jitter on retry delays desynchronises retrying instances.
 
 > **Clock synchronisation:** The lock implementation uses S3's server-side timestamps for expiry checks, so lock correctness does not depend on synchronised instance clocks. Registry instances should still maintain synchronised clocks (NTP) for logging and other operational reasons.
 
