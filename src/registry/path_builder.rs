@@ -1,3 +1,8 @@
+use std::{
+    collections::hash_map::DefaultHasher,
+    hash::{Hash, Hasher},
+};
+
 use crate::{oci::Digest, registry::metadata_store::link_kind::LinkKind};
 
 const BLOBS_ROOT: &str = "v2/blobs";
@@ -14,6 +19,22 @@ pub fn repository_dir() -> &'static str {
 
 pub fn namespace_registry_path() -> String {
     format!("{REGISTRY_ROOT}/namespaces.json")
+}
+
+pub fn namespace_registry_shard_dir() -> String {
+    format!("{REGISTRY_ROOT}/ns")
+}
+
+pub fn namespace_registry_shard_path(namespace: &str) -> String {
+    let shard = namespace_shard_key(namespace);
+    format!("{REGISTRY_ROOT}/ns/{shard}.json")
+}
+
+#[allow(clippy::cast_possible_truncation)]
+pub fn namespace_shard_key(namespace: &str) -> String {
+    let mut hasher = DefaultHasher::new();
+    namespace.hash(&mut hasher);
+    format!("{:02x}", hasher.finish() as u8)
 }
 
 fn blob_dir(digest: &Digest) -> String {
@@ -275,5 +296,27 @@ mod tests {
             link_container_path(&manifest_link, "ns"),
             "v2/repositories/ns/_manifests/index/sha256/index123/sha256/child456"
         );
+    }
+
+    #[test]
+    fn test_namespace_registry_shard_paths() {
+        assert_eq!(namespace_registry_shard_dir(), "_registry/ns");
+
+        let path = namespace_registry_shard_path("my-repo");
+        assert!(path.starts_with("_registry/ns/"));
+        assert!(std::path::Path::new(&path)
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("json")));
+
+        // Same namespace always maps to the same shard
+        assert_eq!(
+            namespace_registry_shard_path("my-repo"),
+            namespace_registry_shard_path("my-repo")
+        );
+
+        // Shard key is a 2-char hex string
+        let key = namespace_shard_key("my-repo");
+        assert_eq!(key.len(), 2);
+        assert!(key.chars().all(|c| c.is_ascii_hexdigit()));
     }
 }
