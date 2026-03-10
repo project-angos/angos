@@ -2436,9 +2436,7 @@ mod tests {
         backend.update_links(namespace, &ops).await.unwrap();
 
         for (i, digest) in digests.iter().enumerate() {
-            let path = path_builder::blob_index_path(digest);
-            let data = backend.store.read(&path).await.unwrap();
-            let blob_index: BlobIndex = serde_json::from_slice(&data).unwrap();
+            let blob_index = backend.read_blob_index(digest).await.unwrap();
             let ns_links = blob_index.namespace.get(namespace).unwrap();
             let expected_link = LinkKind::Tag(format!("tag-bim-{i}"));
             assert!(
@@ -2575,10 +2573,9 @@ mod tests {
                 "Tracked link {link} should be deleted"
             );
 
-            let path = path_builder::blob_index_path(d);
-            let result = backend.store.read(&path).await;
+            let result = backend.read_blob_index(d).await;
             assert!(
-                result.is_err(),
+                matches!(result, Err(Error::ReferenceNotFound)),
                 "Blob index for {d} should be removed after all links deleted"
             );
         }
@@ -2639,28 +2636,26 @@ mod tests {
         backend.update_links(namespace, &mixed_ops).await.unwrap();
 
         // Verify: keep-tag still exists
-        let keep_path = path_builder::blob_index_path(&digest_keep);
-        let keep_data = backend.store.read(&keep_path).await.unwrap();
-        let keep_index: BlobIndex = serde_json::from_slice(&keep_data).unwrap();
+        let keep_index = backend.read_blob_index(&digest_keep).await.unwrap();
         let keep_links = keep_index.namespace.get(namespace).unwrap();
         assert!(keep_links.contains(&LinkKind::Tag("keep-tag".into())));
 
         // Verify: remove-tag blob index no longer has it
-        let remove_path = path_builder::blob_index_path(&digest_remove);
-        let remove_result = backend.store.read(&remove_path).await;
-        if let Ok(data) = remove_result {
-            let idx: BlobIndex = serde_json::from_slice(&data).unwrap();
-            let links = idx.namespace.get(namespace);
-            assert!(
-                links.is_none() || !links.unwrap().contains(&LinkKind::Tag("remove-tag".into())),
-                "remove-tag should not be in blob index after delete"
-            );
+        match backend.read_blob_index(&digest_remove).await {
+            Ok(idx) => {
+                let links = idx.namespace.get(namespace);
+                assert!(
+                    links.is_none()
+                        || !links.unwrap().contains(&LinkKind::Tag("remove-tag".into())),
+                    "remove-tag should not be in blob index after delete"
+                );
+            }
+            Err(Error::ReferenceNotFound) => {}
+            Err(e) => panic!("Unexpected error reading blob index: {e}"),
         }
 
         // Verify: new-tag exists in digest_add's blob index
-        let add_path = path_builder::blob_index_path(&digest_add);
-        let add_data = backend.store.read(&add_path).await.unwrap();
-        let add_index: BlobIndex = serde_json::from_slice(&add_data).unwrap();
+        let add_index = backend.read_blob_index(&digest_add).await.unwrap();
         let add_links = add_index.namespace.get(namespace).unwrap();
         assert!(add_links.contains(&LinkKind::Tag("new-tag".into())));
 
