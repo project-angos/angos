@@ -1,5 +1,9 @@
 use std::{
     io::{Error as IoError, ErrorKind},
+    sync::{
+        Arc,
+        atomic::{AtomicU32, AtomicU64, Ordering},
+    },
     time::Duration,
 };
 
@@ -15,8 +19,67 @@ use bytes::Bytes;
 use bytesize::ByteSize;
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
+use tracing::warn;
 
 use crate::registry::data_store::Error;
+
+const CIRCUIT_BREAKER_THRESHOLD: u32 = 5;
+const CIRCUIT_BREAKER_COOLDOWN_SECS: u64 = 10;
+
+#[derive(Clone, Debug)]
+struct CircuitBreaker {
+    consecutive_failures: Arc<AtomicU32>,
+    opened_at_epoch_secs: Arc<AtomicU64>,
+}
+
+impl CircuitBreaker {
+    fn new() -> Self {
+        Self {
+            consecutive_failures: Arc::new(AtomicU32::new(0)),
+            opened_at_epoch_secs: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    fn check(&self) -> Result<(), IoError> {
+        let failures = self.consecutive_failures.load(Ordering::Acquire);
+        if failures < CIRCUIT_BREAKER_THRESHOLD {
+            return Ok(());
+        }
+        let opened_at = self.opened_at_epoch_secs.load(Ordering::Acquire);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        if now.saturating_sub(opened_at) >= CIRCUIT_BREAKER_COOLDOWN_SECS {
+            // Half-open: allow one probe request through
+            return Ok(());
+        }
+        Err(IoError::other(format!(
+            "S3 circuit breaker open: {failures} consecutive failures, \
+             cooling down for {CIRCUIT_BREAKER_COOLDOWN_SECS}s"
+        )))
+    }
+
+    fn record_success(&self) {
+        self.consecutive_failures.store(0, Ordering::Release);
+    }
+
+    fn record_failure(&self) {
+        let prev = self.consecutive_failures.fetch_add(1, Ordering::AcqRel);
+        if prev + 1 == CIRCUIT_BREAKER_THRESHOLD {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            self.opened_at_epoch_secs.store(now, Ordering::Release);
+            warn!(
+                threshold = CIRCUIT_BREAKER_THRESHOLD,
+                cooldown_secs = CIRCUIT_BREAKER_COOLDOWN_SECS,
+                "S3 circuit breaker opened after {CIRCUIT_BREAKER_THRESHOLD} consecutive failures"
+            );
+        }
+    }
+}
 
 #[derive(Clone, Debug, Deserialize, PartialEq)]
 #[serde(default)]
@@ -61,6 +124,7 @@ pub struct Backend {
     s3_client: S3Client,
     bucket: String,
     key_prefix: String,
+    circuit_breaker: CircuitBreaker,
 }
 
 const S3_ERROR_PRECONDITION_FAILED: &str = "PreconditionFailed";
@@ -126,7 +190,31 @@ impl Backend {
             s3_client,
             bucket: config.bucket.clone(),
             key_prefix: config.key_prefix.clone(),
+            circuit_breaker: CircuitBreaker::new(),
         })
+    }
+
+    fn check_circuit_breaker(&self) -> Result<(), IoError> {
+        self.circuit_breaker.check()
+    }
+
+    fn record_io_result<T>(&self, result: &Result<T, IoError>) {
+        match result {
+            Ok(_) => self.circuit_breaker.record_success(),
+            Err(e) if e.kind() == ErrorKind::NotFound => {
+                self.circuit_breaker.record_success();
+            }
+            Err(_) => self.circuit_breaker.record_failure(),
+        }
+    }
+
+    fn record_data_result<T>(&self, result: &Result<T, Error>) {
+        match result {
+            Ok(_) | Err(Error::PreconditionFailed | Error::NotFound(_)) => {
+                self.circuit_breaker.record_success();
+            }
+            Err(_) => self.circuit_breaker.record_failure(),
+        }
     }
 
     fn full_key(&self, path: &str) -> String {
@@ -151,6 +239,7 @@ impl Backend {
         &self,
         path: &str,
     ) -> Result<(Vec<u8>, Option<String>, Option<DateTime<Utc>>), IoError> {
+        self.check_circuit_breaker()?;
         let key = self.full_key(path);
 
         let result = self
@@ -167,7 +256,9 @@ impl Backend {
                 } else {
                     IoError::other(service_error.to_string())
                 }
-            })?;
+            });
+        self.record_io_result(&result);
+        let result = result?;
 
         let etag = result
             .e_tag
@@ -188,17 +279,20 @@ impl Backend {
     }
 
     pub async fn delete(&self, path: &str) -> Result<(), IoError> {
+        self.check_circuit_breaker()?;
         let key = self.full_key(path);
 
-        self.s3_client
+        let result = self
+            .s3_client
             .delete_object()
             .bucket(&self.bucket)
             .key(&key)
             .send()
             .await
-            .map_err(|e| IoError::other(e.to_string()))?;
-
-        Ok(())
+            .map_err(|e| IoError::other(e.to_string()))
+            .map(|_| ());
+        self.record_io_result(&result);
+        result
     }
 
     pub async fn delete_prefix(&self, prefix: &str) -> Result<(), IoError> {
@@ -263,6 +357,7 @@ impl Backend {
     }
 
     pub async fn object_size(&self, path: &str) -> Result<u64, IoError> {
+        self.check_circuit_breaker()?;
         let key = self.full_key(path);
 
         let result = self
@@ -279,7 +374,9 @@ impl Backend {
                 } else {
                     IoError::other(service_error.to_string())
                 }
-            })?;
+            });
+        self.record_io_result(&result);
+        let result = result?;
 
         Ok(result
             .content_length
@@ -296,6 +393,7 @@ impl Backend {
         continuation_token: Option<String>,
         start_after: Option<String>,
     ) -> Result<(Vec<String>, Vec<String>, Option<String>), IoError> {
+        self.check_circuit_breaker()?;
         let mut full_prefix = self.full_key(path);
         // Ensure prefix ends with / if not empty to list items inside the directory
         if !full_prefix.is_empty() && !full_prefix.ends_with('/') {
@@ -304,7 +402,7 @@ impl Backend {
 
         let full_start_after = start_after.map(|s| format!("{full_prefix}{s}{delimiter}"));
 
-        let res = self
+        let result = self
             .s3_client
             .list_objects_v2()
             .bucket(&self.bucket)
@@ -315,7 +413,9 @@ impl Backend {
             .set_start_after(full_start_after)
             .send()
             .await
-            .map_err(|e| IoError::other(e.to_string()))?;
+            .map_err(|e| IoError::other(e.to_string()));
+        self.record_io_result(&result);
+        let res = result?;
 
         let mut prefixes = Vec::new();
         for prefix in res.common_prefixes.unwrap_or_default() {
@@ -397,6 +497,7 @@ impl Backend {
         path: &str,
         offset: Option<u64>,
     ) -> Result<GetObjectOutput, IoError> {
+        self.check_circuit_breaker()?;
         let key = self.full_key(path);
         let mut req = self.s3_client.get_object().bucket(&self.bucket).key(&key);
 
@@ -404,14 +505,16 @@ impl Backend {
             req = req.range(format!("bytes={offset}-"));
         }
 
-        req.send().await.map_err(|e| {
+        let result = req.send().await.map_err(|e| {
             let service_error = e.into_service_error();
             if service_error.is_no_such_key() {
                 IoError::new(ErrorKind::NotFound, "object not found")
             } else {
                 IoError::other(service_error.to_string())
             }
-        })
+        });
+        self.record_io_result(&result);
+        result
     }
 
     pub async fn put_object_if_not_exists(
@@ -419,6 +522,8 @@ impl Backend {
         path: &str,
         data: impl Into<Bytes>,
     ) -> Result<Option<String>, Error> {
+        self.check_circuit_breaker()
+            .map_err(|e| Error::Io(e.to_string()))?;
         let key = self.full_key(path);
 
         let result = self
@@ -431,13 +536,15 @@ impl Backend {
             .send()
             .await;
 
-        match result {
+        let mapped = match result {
             Ok(output) => {
                 let etag = output.e_tag().map(|t| t.trim_matches('"').to_string());
                 Ok(etag)
             }
             Err(e) => Err(classify_conditional_put_error(&e.into_service_error())),
-        }
+        };
+        self.record_data_result(&mapped);
+        mapped
     }
 
     pub async fn put_object_if_match(
@@ -446,6 +553,8 @@ impl Backend {
         etag: &str,
         data: impl Into<Bytes>,
     ) -> Result<Option<String>, Error> {
+        self.check_circuit_breaker()
+            .map_err(|e| Error::Io(e.to_string()))?;
         let key = self.full_key(path);
 
         let result = self
@@ -458,28 +567,33 @@ impl Backend {
             .send()
             .await;
 
-        match result {
+        let mapped = match result {
             Ok(output) => {
                 let etag = output.e_tag().map(|t| t.trim_matches('"').to_string());
                 Ok(etag)
             }
             Err(e) => Err(classify_conditional_put_error(&e.into_service_error())),
-        }
+        };
+        self.record_data_result(&mapped);
+        mapped
     }
 
     pub async fn put_object(&self, path: &str, data: impl Into<Bytes>) -> Result<(), IoError> {
+        self.check_circuit_breaker()?;
         let key = self.full_key(path);
 
-        self.s3_client
+        let result = self
+            .s3_client
             .put_object()
             .bucket(&self.bucket)
             .key(&key)
             .body(ByteStream::from(data.into()))
             .send()
             .await
-            .map_err(|e| IoError::other(e.to_string()))?;
-
-        Ok(())
+            .map_err(|e| IoError::other(e.to_string()))
+            .map(|_| ());
+        self.record_io_result(&result);
+        result
     }
 
     pub async fn copy_object(&self, source: &str, destination: &str) -> Result<(), IoError> {
