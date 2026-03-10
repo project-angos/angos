@@ -1,4 +1,10 @@
-use std::{io::ErrorKind, sync::Arc};
+use std::{
+    io::ErrorKind,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+};
 
 use chrono::Utc;
 
@@ -367,4 +373,142 @@ async fn test_release_skips_delete_when_ownership_lost() {
     );
 
     let _ = store.delete("_locks/owned_key").await;
+}
+
+/// Spawns N tasks that race for the same lock key with retries enabled.
+/// Verifies mutual exclusion (at most 1 holder at any time) and that all
+/// tasks eventually succeed (no starvation from retry exhaustion).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_concurrent_contention_single_key() {
+    let store = test_store("s3lock_contention_");
+    let num_tasks: usize = 5;
+    let iterations_per_task: usize = 3;
+    let concurrent_holders = Arc::new(AtomicUsize::new(0));
+    let max_observed = Arc::new(AtomicUsize::new(0));
+
+    let mut handles = Vec::new();
+    for task_id in 0..num_tasks {
+        let store = store.clone();
+        let concurrent_holders = concurrent_holders.clone();
+        let max_observed = max_observed.clone();
+        handles.push(tokio::spawn(async move {
+            let backend = S3LockBackend::new(
+                store,
+                &S3LockConfig {
+                    ttl_secs: 9,
+                    max_retries: 50,
+                    retry_delay_ms: 10,
+                    max_hold_secs: 300,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+            for iter in 0..iterations_per_task {
+                let guard = backend
+                    .acquire(&["contended_key".to_string()])
+                    .await
+                    .unwrap_or_else(|e| {
+                        panic!("Task {task_id} iter {iter} failed to acquire: {e}")
+                    });
+
+                let prev = concurrent_holders.fetch_add(1, Ordering::SeqCst);
+                max_observed.fetch_max(prev + 1, Ordering::SeqCst);
+                assert_eq!(
+                    prev,
+                    0,
+                    "Task {task_id} iter {iter}: mutual exclusion violated ({} concurrent holders)",
+                    prev + 1
+                );
+
+                // Simulate brief work under lock
+                tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+
+                concurrent_holders.fetch_sub(1, Ordering::SeqCst);
+                guard.release().await;
+            }
+        }));
+    }
+
+    let results = futures_util::future::join_all(handles).await;
+    for (i, result) in results.into_iter().enumerate() {
+        result.unwrap_or_else(|e| panic!("Task {i} panicked: {e}"));
+    }
+
+    assert_eq!(
+        max_observed.load(Ordering::SeqCst),
+        1,
+        "At most 1 task should hold the lock at any time"
+    );
+}
+
+/// Three tasks acquire overlapping multi-key lock sets, exercising the
+/// parallel-to-sequential fallback that prevents livelock. Key sets:
+///   Task A: [k1, k2]
+///   Task B: [k2, k3]
+///   Task C: [k1, k3]
+/// Each pair shares exactly one key, maximising contention. All tasks
+/// must eventually succeed — starvation would indicate a livelock.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_concurrent_contention_overlapping_keys() {
+    let store = test_store("s3lock_overlap_");
+    let concurrent_holders = Arc::new(AtomicUsize::new(0));
+    let max_observed = Arc::new(AtomicUsize::new(0));
+
+    let key_sets: Vec<Vec<String>> = vec![
+        vec!["k1".to_string(), "k2".to_string()],
+        vec!["k2".to_string(), "k3".to_string()],
+        vec!["k1".to_string(), "k3".to_string()],
+    ];
+
+    let mut handles = Vec::new();
+    for (task_id, keys) in key_sets.into_iter().enumerate() {
+        let store = store.clone();
+        let concurrent_holders = concurrent_holders.clone();
+        let max_observed = max_observed.clone();
+        handles.push(tokio::spawn(async move {
+            let backend = S3LockBackend::new(
+                store,
+                &S3LockConfig {
+                    ttl_secs: 9,
+                    max_retries: 50,
+                    retry_delay_ms: 10,
+                    max_hold_secs: 300,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+            for iter in 0..2 {
+                let guard = backend.acquire(&keys).await.unwrap_or_else(|e| {
+                    panic!("Task {task_id} iter {iter} failed to acquire: {e}")
+                });
+
+                let prev = concurrent_holders.fetch_add(1, Ordering::SeqCst);
+                max_observed.fetch_max(prev + 1, Ordering::SeqCst);
+                assert_eq!(
+                    prev,
+                    0,
+                    "Task {task_id} iter {iter}: mutual exclusion violated ({} concurrent holders)",
+                    prev + 1
+                );
+
+                tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+
+                concurrent_holders.fetch_sub(1, Ordering::SeqCst);
+                guard.release().await;
+            }
+        }));
+    }
+
+    let results = futures_util::future::join_all(handles).await;
+    for (i, result) in results.into_iter().enumerate() {
+        result.unwrap_or_else(|e| panic!("Task {i} panicked: {e}"));
+    }
+
+    assert_eq!(
+        max_observed.load(Ordering::SeqCst),
+        1,
+        "At most 1 task should hold the lock at any time"
+    );
 }
