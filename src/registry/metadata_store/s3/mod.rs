@@ -36,6 +36,31 @@ use crate::{
     },
 };
 
+/// A single create operation tuple.
+type CreateOp = (
+    LinkKind,
+    Digest,
+    Option<Digest>,
+    Option<Digest>,
+    Option<String>,
+    Option<Descriptor>,
+);
+
+/// Return type of `build_create_ops`.
+type CreateOpsResult = (
+    HashMap<Digest, Vec<BlobIndexOperation>>,
+    Vec<(LinkKind, LinkMetadata)>,
+    Vec<(LinkKind, LinkMetadata)>,
+);
+
+/// Return type of `build_delete_ops`.
+type DeleteOpsResult = (
+    HashMap<Digest, Vec<BlobIndexOperation>>,
+    Vec<(LinkKind, LinkMetadata)>,
+    Vec<LinkKind>,
+    Vec<LinkKind>,
+);
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct BackendConfig {
     pub access_key_id: String,
@@ -925,6 +950,196 @@ impl MetadataStore for Backend {
             return Ok(());
         }
 
+        if self.supports_conditional_writes {
+            self.update_links_cas(namespace, operations).await
+        } else {
+            self.update_links_locked(namespace, operations).await
+        }
+    }
+
+    async fn flush_access_times(&self) {
+        Backend::flush_access_times(self).await;
+    }
+}
+
+fn is_tracked_link(link: &LinkKind) -> bool {
+    matches!(
+        link,
+        LinkKind::Layer(_) | LinkKind::Config(_) | LinkKind::Manifest(_, _)
+    )
+}
+
+impl Backend {
+    /// CAS-optimized write path: reads each link once under the lock (no pre-lock
+    /// reads), then releases the lock before CAS blob index updates. Eliminates
+    /// the redundant pre-lock read round trip that the non-CAS path requires for
+    /// blob digest lock key computation.
+    #[allow(clippy::too_many_lines)]
+    async fn update_links_cas(
+        &self,
+        namespace: &str,
+        operations: &[LinkOperation],
+    ) -> Result<(), Error> {
+        // Compute lock keys directly from operations — CAS blob index updates
+        // don't need blob:{digest} lock keys since they use ETag concurrency.
+        let mut lock_keys: Vec<String> = operations
+            .iter()
+            .map(|op| {
+                let link = match op {
+                    LinkOperation::Create { link, .. } | LinkOperation::Delete { link, .. } => link,
+                };
+                format!("{namespace}:{link}")
+            })
+            .collect();
+        lock_keys.sort();
+        lock_keys.dedup();
+
+        let guard = self.lock.acquire(&lock_keys).await?;
+
+        // Single read per operation under the lock — no pre-lock reads needed.
+        let read_results = join_all(operations.iter().map(|op| async move {
+            let link = match op {
+                LinkOperation::Create { link, .. } | LinkOperation::Delete { link, .. } => link,
+            };
+            let metadata = self.read_link_reference(namespace, link).await.ok();
+            (op, metadata)
+        }))
+        .await;
+
+        let mut link_cache: HashMap<LinkKind, LinkMetadata> = HashMap::new();
+        let mut creates: Vec<CreateOp> = Vec::new();
+        let mut deletes: Vec<(LinkKind, Digest, Option<Digest>)> = Vec::new();
+
+        for (op, metadata) in &read_results {
+            match op {
+                LinkOperation::Create {
+                    link,
+                    target,
+                    referrer,
+                    media_type,
+                    descriptor,
+                } => {
+                    let old_target = metadata.as_ref().map(|m| m.target.clone());
+                    if let Some(m) = metadata {
+                        link_cache.insert(link.clone(), m.clone());
+                    }
+                    creates.push((
+                        link.clone(),
+                        target.clone(),
+                        old_target,
+                        referrer.clone(),
+                        media_type.clone(),
+                        descriptor.as_ref().clone(),
+                    ));
+                }
+                LinkOperation::Delete { link, referrer } => {
+                    if let Some(m) = metadata {
+                        link_cache.insert(link.clone(), m.clone());
+                        deletes.push((link.clone(), m.target.clone(), referrer.clone()));
+                    }
+                }
+            }
+        }
+
+        if creates.is_empty() && deletes.is_empty() {
+            guard.release().await;
+            return Ok(());
+        }
+
+        if !guard.is_valid() {
+            guard.release().await;
+            return Err(Error::Lock("lock invalidated during operation".into()));
+        }
+
+        let (pending_blob_ops, tracked_create_writes, non_tracked_create_writes) =
+            Self::build_create_ops(&creates, &mut link_cache);
+
+        join_all(
+            tracked_create_writes
+                .iter()
+                .chain(non_tracked_create_writes.iter())
+                .map(|(link, metadata)| async move {
+                    self.write_link_reference(namespace, link, metadata).await
+                }),
+        )
+        .await
+        .into_iter()
+        .collect::<Result<Vec<_>, _>>()?;
+
+        let (
+            pending_blob_ops,
+            tracked_delete_writes,
+            tracked_delete_removes,
+            non_tracked_delete_links,
+        ) = Self::build_delete_ops(&deletes, &mut link_cache, pending_blob_ops);
+
+        join_all(
+            tracked_delete_writes
+                .iter()
+                .map(|(link, metadata)| {
+                    let fut: Pin<Box<dyn Future<Output = Result<(), Error>> + Send + '_>> =
+                        Box::pin(self.write_link_reference(namespace, link, metadata));
+                    fut
+                })
+                .chain(
+                    tracked_delete_removes
+                        .iter()
+                        .chain(non_tracked_delete_links.iter())
+                        .map(|link| {
+                            let fut: Pin<Box<dyn Future<Output = Result<(), Error>> + Send + '_>> =
+                                Box::pin(self.delete_link_reference(namespace, link));
+                            fut
+                        }),
+                ),
+        )
+        .await
+        .into_iter()
+        .collect::<Result<Vec<_>, _>>()?;
+
+        for (link, metadata) in tracked_create_writes
+            .iter()
+            .chain(non_tracked_create_writes.iter())
+            .chain(tracked_delete_writes.iter())
+        {
+            self.cache_put(namespace, link, metadata).await;
+        }
+        for link in tracked_delete_removes
+            .iter()
+            .chain(non_tracked_delete_links.iter())
+        {
+            self.cache_invalidate(namespace, link).await;
+        }
+
+        // Release lock before CAS blob index updates — ETags handle concurrency.
+        guard.release().await;
+
+        join_all(
+            pending_blob_ops
+                .iter()
+                .map(|(digest, ops)| self.update_blob_index_cas(namespace, digest, ops)),
+        )
+        .await
+        .into_iter()
+        .collect::<Result<Vec<_>, _>>()?;
+
+        if !creates.is_empty()
+            && let Err(e) = self.register_namespace(namespace).await
+        {
+            warn!(namespace, error = %e, "Failed to register namespace");
+        }
+
+        Ok(())
+    }
+
+    /// Non-CAS write path: pre-lock reads to compute blob digest lock keys,
+    /// then validates under the lock with re-reads. Retries on concurrent
+    /// modification to ensure lock key coverage.
+    #[allow(clippy::too_many_lines)]
+    async fn update_links_locked(
+        &self,
+        namespace: &str,
+        operations: &[LinkOperation],
+    ) -> Result<(), Error> {
         let mut update_retries = MAX_UPDATE_RETRIES;
         loop {
             let mut link_cache: HashMap<LinkKind, LinkMetadata> = HashMap::new();
@@ -964,20 +1179,8 @@ impl MetadataStore for Backend {
             }))
             .await;
 
-            // When the S3 backend supports conditional writes, blob index updates use
-            // lock-free CAS (ETag-based compare-and-swap) and only link names are locked.
-            // Otherwise, `blob:{digest}` keys are included to serialize blob index
-            // read-modify-write cycles across concurrent callers.
-            let use_cas = self.supports_conditional_writes;
             let mut lock_keys: Vec<String> = Vec::new();
-            let mut creates: Vec<(
-                LinkKind,
-                Digest,
-                Option<Digest>,
-                Option<Digest>,
-                Option<String>,
-                Option<Descriptor>,
-            )> = Vec::new();
+            let mut creates: Vec<CreateOp> = Vec::new();
             let mut deletes: Vec<(LinkKind, Digest, Option<Digest>)> = Vec::new();
 
             for (_, create_data, delete_data) in prelock_results {
@@ -985,18 +1188,14 @@ impl MetadataStore for Backend {
                     create_data
                 {
                     lock_keys.push(format!("{namespace}:{link}"));
-                    if !use_cas {
-                        lock_keys.push(format!("blob:{target}"));
-                        if let Some(ref old) = old_target {
-                            lock_keys.push(format!("blob:{old}"));
-                        }
+                    lock_keys.push(format!("blob:{target}"));
+                    if let Some(ref old) = old_target {
+                        lock_keys.push(format!("blob:{old}"));
                     }
                     creates.push((link, target, old_target, referrer, media_type, descriptor));
                 } else if let Some((link, Some(meta), referrer)) = delete_data {
                     lock_keys.push(format!("{namespace}:{link}"));
-                    if !use_cas {
-                        lock_keys.push(format!("blob:{}", meta.target));
-                    }
+                    lock_keys.push(format!("blob:{}", meta.target));
                     deletes.push((link, meta.target, referrer));
                 }
             }
@@ -1078,54 +1277,9 @@ impl MetadataStore for Backend {
                 continue;
             }
 
-            let mut pending_blob_ops: HashMap<Digest, Vec<BlobIndexOperation>> = HashMap::new();
+            let (pending_blob_ops, tracked_create_writes, non_tracked_create_writes) =
+                Self::build_create_ops(&creates, &mut link_cache);
 
-            let mut tracked_create_writes: Vec<(LinkKind, LinkMetadata)> = Vec::new();
-            let mut non_tracked_create_writes: Vec<(LinkKind, LinkMetadata)> = Vec::new();
-            for (link, target, old_target, referrer, media_type, descriptor) in &creates {
-                let is_tracked = is_tracked_link(link);
-
-                if is_tracked && referrer.is_some() {
-                    let mut metadata = link_cache.remove(link).unwrap_or_else(|| {
-                        LinkMetadata::from_digest(target.clone())
-                            .with_media_type(media_type.clone())
-                            .with_descriptor((*descriptor).clone())
-                    });
-
-                    if let Some(manifest_digest) = referrer {
-                        metadata.add_referrer(manifest_digest.clone());
-                    }
-
-                    if old_target.is_none() {
-                        pending_blob_ops
-                            .entry(target.clone())
-                            .or_default()
-                            .push(BlobIndexOperation::Insert(link.clone()));
-                    }
-
-                    tracked_create_writes.push((link.clone(), metadata));
-                } else {
-                    pending_blob_ops
-                        .entry(target.clone())
-                        .or_default()
-                        .push(BlobIndexOperation::Insert(link.clone()));
-                    if let Some(old) = old_target
-                        && *old != *target
-                    {
-                        pending_blob_ops
-                            .entry(old.clone())
-                            .or_default()
-                            .push(BlobIndexOperation::Remove(link.clone()));
-                    }
-
-                    non_tracked_create_writes.push((
-                        link.clone(),
-                        LinkMetadata::from_digest(target.clone())
-                            .with_media_type(media_type.clone())
-                            .with_descriptor((*descriptor).clone()),
-                    ));
-                }
-            }
             if !guard.is_valid() {
                 guard.release().await;
                 return Err(Error::Lock("lock invalidated during operation".into()));
@@ -1143,36 +1297,13 @@ impl MetadataStore for Backend {
             .into_iter()
             .collect::<Result<Vec<_>, _>>()?;
 
-            let mut tracked_delete_writes: Vec<(LinkKind, LinkMetadata)> = Vec::new();
-            let mut tracked_delete_removes: Vec<LinkKind> = Vec::new();
-            let mut non_tracked_delete_links: Vec<LinkKind> = Vec::new();
-            for (link, target, referrer) in &valid_deletes {
-                let is_tracked = is_tracked_link(link);
+            let (
+                pending_blob_ops,
+                tracked_delete_writes,
+                tracked_delete_removes,
+                non_tracked_delete_links,
+            ) = Self::build_delete_ops(&valid_deletes, &mut link_cache, pending_blob_ops);
 
-                if is_tracked && referrer.is_some() {
-                    if let Some(mut metadata) = link_cache.remove(link) {
-                        if let Some(manifest_digest) = referrer {
-                            metadata.remove_referrer(manifest_digest);
-                        }
-
-                        if metadata.has_references() {
-                            tracked_delete_writes.push((link.clone(), metadata));
-                        } else {
-                            tracked_delete_removes.push(link.clone());
-                            pending_blob_ops
-                                .entry(target.clone())
-                                .or_default()
-                                .push(BlobIndexOperation::Remove(link.clone()));
-                        }
-                    }
-                } else {
-                    non_tracked_delete_links.push(link.clone());
-                    pending_blob_ops
-                        .entry(target.clone())
-                        .or_default()
-                        .push(BlobIndexOperation::Remove(link.clone()));
-                }
-            }
             if !guard.is_valid() {
                 guard.release().await;
                 return Err(Error::Lock("lock invalidated during operation".into()));
@@ -1210,49 +1341,34 @@ impl MetadataStore for Backend {
             for (link, metadata) in tracked_create_writes
                 .iter()
                 .chain(non_tracked_create_writes.iter())
+                .chain(tracked_delete_writes.iter())
             {
                 self.cache_put(namespace, link, metadata).await;
             }
-            for (link, _, _) in &valid_deletes {
+            for link in tracked_delete_removes
+                .iter()
+                .chain(non_tracked_delete_links.iter())
+            {
                 self.cache_invalidate(namespace, link).await;
             }
 
-            if use_cas {
-                // Release the lock before blob index updates — CAS handles
-                // concurrency via ETags without requiring lock coordination.
+            // Blob index shard updates run under the lock (blob:{digest} keys
+            // are included in lock_keys above).
+            join_all(
+                pending_blob_ops
+                    .iter()
+                    .map(|(digest, ops)| self.update_blob_index_shard(namespace, digest, ops)),
+            )
+            .await
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()?;
+
+            if !guard.is_valid() {
                 guard.release().await;
-
-                // Blob index updates use optimistic concurrency (CAS via ETags) and
-                // run outside the lock. Each digest has its own S3 key, so updates to
-                // different digests are independent and can run in parallel. Concurrent
-                // updates from other callers are resolved by CAS retry.
-                join_all(
-                    pending_blob_ops
-                        .iter()
-                        .map(|(digest, ops)| self.update_blob_index_cas(namespace, digest, ops)),
-                )
-                .await
-                .into_iter()
-                .collect::<Result<Vec<_>, _>>()?;
-            } else {
-                // Without conditional write support, blob index shard updates run
-                // under the lock (blob:{digest} keys are included in lock_keys above).
-                join_all(
-                    pending_blob_ops
-                        .iter()
-                        .map(|(digest, ops)| self.update_blob_index_shard(namespace, digest, ops)),
-                )
-                .await
-                .into_iter()
-                .collect::<Result<Vec<_>, _>>()?;
-
-                if !guard.is_valid() {
-                    guard.release().await;
-                    return Err(Error::Lock("lock invalidated during operation".into()));
-                }
-
-                guard.release().await;
+                return Err(Error::Lock("lock invalidated during operation".into()));
             }
+
+            guard.release().await;
 
             if !creates.is_empty()
                 && let Err(e) = self.register_namespace(namespace).await
@@ -1264,19 +1380,113 @@ impl MetadataStore for Backend {
         }
     }
 
-    async fn flush_access_times(&self) {
-        Backend::flush_access_times(self).await;
+    /// Builds blob index operations and link writes for create operations.
+    fn build_create_ops(
+        creates: &[CreateOp],
+        link_cache: &mut HashMap<LinkKind, LinkMetadata>,
+    ) -> CreateOpsResult {
+        let mut pending_blob_ops: HashMap<Digest, Vec<BlobIndexOperation>> = HashMap::new();
+        let mut tracked_create_writes: Vec<(LinkKind, LinkMetadata)> = Vec::new();
+        let mut non_tracked_create_writes: Vec<(LinkKind, LinkMetadata)> = Vec::new();
+
+        for (link, target, old_target, referrer, media_type, descriptor) in creates {
+            let is_tracked = is_tracked_link(link);
+
+            if is_tracked && referrer.is_some() {
+                let mut metadata = link_cache.remove(link).unwrap_or_else(|| {
+                    LinkMetadata::from_digest(target.clone())
+                        .with_media_type(media_type.clone())
+                        .with_descriptor(descriptor.clone())
+                });
+
+                if let Some(manifest_digest) = referrer {
+                    metadata.add_referrer(manifest_digest.clone());
+                }
+
+                if old_target.is_none() {
+                    pending_blob_ops
+                        .entry(target.clone())
+                        .or_default()
+                        .push(BlobIndexOperation::Insert(link.clone()));
+                }
+
+                tracked_create_writes.push((link.clone(), metadata));
+            } else {
+                pending_blob_ops
+                    .entry(target.clone())
+                    .or_default()
+                    .push(BlobIndexOperation::Insert(link.clone()));
+                if let Some(old) = old_target
+                    && *old != *target
+                {
+                    pending_blob_ops
+                        .entry(old.clone())
+                        .or_default()
+                        .push(BlobIndexOperation::Remove(link.clone()));
+                }
+
+                non_tracked_create_writes.push((
+                    link.clone(),
+                    LinkMetadata::from_digest(target.clone())
+                        .with_media_type(media_type.clone())
+                        .with_descriptor(descriptor.clone()),
+                ));
+            }
+        }
+
+        (
+            pending_blob_ops,
+            tracked_create_writes,
+            non_tracked_create_writes,
+        )
     }
-}
 
-fn is_tracked_link(link: &LinkKind) -> bool {
-    matches!(
-        link,
-        LinkKind::Layer(_) | LinkKind::Config(_) | LinkKind::Manifest(_, _)
-    )
-}
+    /// Builds blob index operations and link writes/deletes for delete operations.
+    fn build_delete_ops(
+        deletes: &[(LinkKind, Digest, Option<Digest>)],
+        link_cache: &mut HashMap<LinkKind, LinkMetadata>,
+        mut pending_blob_ops: HashMap<Digest, Vec<BlobIndexOperation>>,
+    ) -> DeleteOpsResult {
+        let mut tracked_delete_writes: Vec<(LinkKind, LinkMetadata)> = Vec::new();
+        let mut tracked_delete_removes: Vec<LinkKind> = Vec::new();
+        let mut non_tracked_delete_links: Vec<LinkKind> = Vec::new();
 
-impl Backend {
+        for (link, target, referrer) in deletes {
+            let is_tracked = is_tracked_link(link);
+
+            if is_tracked && referrer.is_some() {
+                if let Some(mut metadata) = link_cache.remove(link) {
+                    if let Some(manifest_digest) = referrer {
+                        metadata.remove_referrer(manifest_digest);
+                    }
+
+                    if metadata.has_references() {
+                        tracked_delete_writes.push((link.clone(), metadata));
+                    } else {
+                        tracked_delete_removes.push(link.clone());
+                        pending_blob_ops
+                            .entry(target.clone())
+                            .or_default()
+                            .push(BlobIndexOperation::Remove(link.clone()));
+                    }
+                }
+            } else {
+                non_tracked_delete_links.push(link.clone());
+                pending_blob_ops
+                    .entry(target.clone())
+                    .or_default()
+                    .push(BlobIndexOperation::Remove(link.clone()));
+            }
+        }
+
+        (
+            pending_blob_ops,
+            tracked_delete_writes,
+            tracked_delete_removes,
+            non_tracked_delete_links,
+        )
+    }
+
     /// Unconditional read-modify-write on a namespace shard (caller must hold lock).
     async fn update_blob_index_shard(
         &self,

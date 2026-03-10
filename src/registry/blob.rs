@@ -49,7 +49,10 @@ impl Registry {
                 }
             }
             Err(metadata_store::Error::ReferenceNotFound) => Ok(()),
-            Err(_) => Err(Error::BlobUnknown),
+            Err(e) => {
+                warn!("Failed to read blob index for {digest}: {e}");
+                Err(Error::Internal(format!("storage error: {e}")))
+            }
         }
     }
 
@@ -290,10 +293,6 @@ impl Registry {
     ) -> Result<Response<ResponseBody>, Error> {
         let repository = self.get_repository_for_namespace(namespace)?;
 
-        if !repository.is_pull_through() {
-            self.check_blob_namespace_access(namespace, digest).await?;
-        }
-
         if range.is_none()
             && self.enable_redirect
             && let Ok(Some(presigned_url)) = self.blob_store.get_blob_url(digest).await
@@ -312,7 +311,6 @@ impl Registry {
         {
             GetBlobResponse::RangedReader(reader, (start, end), total_length) => {
                 let length = end - start + 1;
-                let stream = reader.take(length);
                 let range = format!("bytes {start}-{end}/{total_length}");
 
                 Response::builder()
@@ -321,7 +319,7 @@ impl Registry {
                     .header(ACCEPT_RANGES, "bytes")
                     .header(CONTENT_LENGTH, length.to_string())
                     .header(CONTENT_RANGE, range)
-                    .body(ResponseBody::streaming(stream))?
+                    .body(ResponseBody::streaming(reader))?
             }
             GetBlobResponse::Reader(stream, total_length) => Response::builder()
                 .status(StatusCode::OK)
