@@ -371,6 +371,11 @@ impl MetadataStore for Backend {
         if update_access_time {
             let guard = self.lock.acquire(&[link.to_string()]).await?;
             let link_data = self.read_link_reference(namespace, link).await?.accessed();
+            if !guard.is_valid() {
+                return Err(Error::Lock(
+                    "lock invalidated during access time update".into(),
+                ));
+            }
             self.write_link_reference(namespace, link, &link_data)
                 .await?;
             guard.release().await;

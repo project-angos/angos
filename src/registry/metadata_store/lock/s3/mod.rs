@@ -172,6 +172,11 @@ impl S3LockBackend {
                 "retry_delay_ms must be at least 1".into(),
             ));
         }
+        if config.ttl_secs > MAX_LOCK_TTL_SECS {
+            return Err(Error::InvalidData(format!(
+                "ttl_secs must be at most {MAX_LOCK_TTL_SECS}"
+            )));
+        }
         if config.max_hold_secs < config.ttl_secs {
             return Err(Error::InvalidData(
                 "max_hold_secs must be >= ttl_secs".into(),

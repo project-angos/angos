@@ -178,6 +178,11 @@ impl AccessTimeWriter {
             .read_link_reference(namespace, link)
             .await?
             .accessed();
+        if !guard.is_valid() {
+            return Err(Error::Lock(
+                "lock invalidated during access time flush".into(),
+            ));
+        }
         backend
             .write_link_reference(namespace, link, &link_data)
             .await?;
@@ -797,6 +802,11 @@ impl MetadataStore for Backend {
             } else {
                 let guard = self.lock.acquire(&[link.to_string()]).await?;
                 let link_data = self.read_link_reference(namespace, link).await?.accessed();
+                if !guard.is_valid() {
+                    return Err(Error::Lock(
+                        "lock invalidated during access time update".into(),
+                    ));
+                }
                 self.write_link_reference(namespace, link, &link_data)
                     .await?;
                 self.cache_put(namespace, link, &link_data).await;
