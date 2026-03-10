@@ -205,13 +205,13 @@ pub mod test_utils {
         // Create a test blob
         let digest = registry.blob_store.create_blob(content).await.unwrap();
 
-        // Create a tag to ensure the namespace exists
         let tag_link = LinkKind::Tag("latest".to_string());
+        let layer_link = LinkKind::Layer(digest.clone());
         let mut tx = registry.metadata_store.begin_transaction(namespace);
         tx.create_link(&tag_link, &digest);
+        tx.create_link(&layer_link, &digest);
         tx.commit().await.unwrap();
 
-        // Verify the blob index is updated
         let blob_index = registry
             .metadata_store
             .read_blob_index(&digest)
@@ -219,7 +219,7 @@ pub mod test_utils {
             .unwrap();
         assert!(blob_index.namespace.contains_key(namespace));
         let namespace_links = blob_index.namespace.get(namespace).unwrap();
-        assert!(namespace_links.contains(&tag_link));
+        assert!(namespace_links.contains(&layer_link));
 
         // Create a non-pull-through repository
         let cache = cache::Config::Memory.to_backend().unwrap();
