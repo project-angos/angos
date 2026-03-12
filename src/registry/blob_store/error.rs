@@ -6,7 +6,7 @@ use aws_sdk_s3::{
     operation::{get_object::GetObjectError, head_object::HeadObjectError},
     primitives::ByteStreamError,
 };
-use sha2::digest::crypto_common::hazmat::DeserializeStateError;
+use sha2::digest::common::hazmat::DeserializeStateError;
 use tracing::error;
 
 use crate::{oci, registry::data_store};
@@ -139,7 +139,7 @@ mod tests {
         },
         primitives::ByteStreamError,
     };
-    use sha2::digest::crypto_common::hazmat::DeserializeStateError;
+    use sha2::digest::common::hazmat::DeserializeStateError;
 
     use super::*;
 
