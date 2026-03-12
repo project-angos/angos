@@ -149,8 +149,57 @@ Same connection options as `blob_store.s3`, plus:
 | `link_cache_ttl`            | u64          | `30`       | Read-through cache TTL for link metadata, in seconds (0 to disable)         |
 | `access_time_debounce_secs` | u64          | `60`       | Buffer access time writes and flush periodically, in seconds (0 to disable) |
 | `lock_strategy`             | string/table | `"memory"` | Lock backend: `"memory"` (string), or `[lock_strategy.s3]`/`[lock_strategy.redis]` (table form, see below) |
+| `capabilities`              | table        | -          | Optional S3 conditional operation capabilities; see below                    |
 
 The link cache reduces S3 round-trips for repeated tag/layer reads. The access time debounce batches `last_pulled_at` timestamp writes in memory and flushes them periodically, reducing the critical-path operations per manifest pull from 4 (lock, read, write, unlock) to 1 (read).
+
+#### Conditional Capabilities (`metadata_store.s3.capabilities`)
+
+When using S3 as the metadata store, you can declare which conditional write operations your S3-compatible provider supports. This avoids a startup probe and allows optimization of certain operations.
+
+| Option              | Type | Default | Description                                                                                                 |
+|---------------------|------|---------|-------------------------------------------------------------------------------------------------------------|
+| `put_if_none_match` | bool | -       | S3 supports `PutObject` with `If-None-Match: *` (create-only, reject if object exists)                     |
+| `put_if_match`      | bool | -       | S3 supports `PutObject` with `If-Match: <etag>` (update-only, reject if ETag mismatch)                     |
+| `delete_if_match`   | bool | -       | S3 supports `DeleteObject` with `If-Match: <etag>` (conditional delete, reject if ETag mismatch)          |
+
+**Probe behavior:**
+- When `capabilities` table is explicitly configured, the startup probe is skipped entirely. Provide accurate values matching your S3 provider's capabilities.
+- When `capabilities` is omitted:
+  - If `lock_strategy = "s3"`, a startup probe automatically tests each capability and populates the status.
+  - For other lock strategies, capabilities default to all `false` (no probing occurs).
+
+**Example with explicit capabilities (AWS S3):**
+```toml
+[metadata_store.s3.capabilities]
+put_if_none_match = true
+put_if_match = true
+delete_if_match = true
+```
+
+**Example with explicit capabilities (minimal, memory locking):**
+```toml
+[metadata_store.s3]
+lock_strategy = "memory"
+
+[metadata_store.s3.capabilities]
+put_if_none_match = false
+put_if_match = false
+delete_if_match = false
+```
+
+**Example with auto-probe (S3 locking):**
+```toml
+[metadata_store.s3]
+# No capabilities field — probe runs at startup for S3 lock strategy
+[metadata_store.s3.lock_strategy.s3]
+ttl_secs = 30
+```
+
+**Performance impact:**
+- When `put_if_match` is available, access time writes use optimized compare-and-swap (CAS) instead of distributed lock operations, reducing S3 API calls per manifest pull.
+- When `delete_if_match` is available, S3 lock release is atomic and race-condition-free.
+- Both features require both `put_if_none_match` and `put_if_match` to be `true` for full CAS support.
 
 > **Warning:** Setting `access_time_debounce_secs = 0` with S3 lock strategy causes every manifest pull to perform a full lock-acquire → read → write → release cycle via S3 API. At scale with many concurrent pulls, this adds significant latency and S3 API costs. Keep the default value of 60 or higher for S3-locked deployments, or disable access time tracking entirely if not needed for retention policies.
 

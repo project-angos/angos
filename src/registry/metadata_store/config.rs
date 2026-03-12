@@ -6,7 +6,7 @@ use crate::{
     cache::Cache,
     registry::{
         data_store, metadata_store,
-        metadata_store::{Error, LockStrategy, MetadataStore},
+        metadata_store::{ConditionalCapabilities, Error, LockStrategy, MetadataStore},
     },
 };
 
@@ -20,22 +20,32 @@ pub enum MetadataStoreConfig {
 }
 
 impl MetadataStoreConfig {
-    pub async fn probe(&self) -> Result<(), Error> {
+    pub async fn probe(&self) -> Result<Option<ConditionalCapabilities>, Error> {
         match self {
             MetadataStoreConfig::S3(config) => match &config.lock_strategy {
                 LockStrategy::S3(lock_config) => {
                     let store =
                         data_store::s3::Backend::new(&config.to_lock_store_config(lock_config))
                             .map_err(|e| Error::StorageBackend(e.to_string()))?;
-                    metadata_store::s3::Backend::probe_conditional_write_support(&store).await
+                    let caps =
+                        metadata_store::s3::Backend::probe_conditional_capabilities(&store).await?;
+                    if !caps.supports_cas() {
+                        return Err(Error::Lock(format!(
+                            "S3 lock strategy requires If-None-Match and If-Match support, \
+                             but probe found: If-None-Match={}, If-Match={}. \
+                             Use lock_strategy = redis or lock_strategy = memory instead.",
+                            caps.put_if_none_match, caps.put_if_match
+                        )));
+                    }
+                    Ok(Some(caps))
                 }
-                _ => Ok(()),
+                _ => Ok(None),
             },
-            MetadataStoreConfig::FS(_) => Ok(()),
+            MetadataStoreConfig::FS(_) => Ok(None),
         }
     }
 
-    pub fn to_backend(
+    pub async fn to_backend(
         &self,
         cache: Option<Arc<dyn Cache>>,
     ) -> Result<Arc<dyn MetadataStore + Send + Sync>, Error> {
@@ -44,7 +54,23 @@ impl MetadataStoreConfig {
                 Ok(Arc::new(metadata_store::fs::Backend::new(config)?))
             }
             MetadataStoreConfig::S3(config) => {
-                let backend = metadata_store::s3::Backend::new(config)?;
+                let conditional = match &config.capabilities {
+                    Some(caps) => {
+                        if matches!(config.lock_strategy, LockStrategy::S3(_))
+                            && !caps.supports_cas()
+                        {
+                            return Err(Error::Lock(format!(
+                                "S3 lock strategy requires If-None-Match and If-Match support, \
+                                 but config declares: put_if_none_match={}, put_if_match={}. \
+                                 Use lock_strategy = redis or lock_strategy = memory instead.",
+                                caps.put_if_none_match, caps.put_if_match
+                            )));
+                        }
+                        Some(caps.clone())
+                    }
+                    None => self.probe().await?,
+                };
+                let backend = metadata_store::s3::Backend::new(config, conditional)?;
                 let backend = match cache {
                     Some(c) => backend.with_cache(c),
                     None => backend,
@@ -71,6 +97,7 @@ mod tests {
             lock_strategy: LockStrategy::S3(S3LockConfig::default()),
             link_cache_ttl: 30,
             access_time_debounce_secs: 0,
+            capabilities: None,
         })
     }
 
@@ -82,6 +109,14 @@ mod tests {
             result.is_ok(),
             "Probe should pass for S3 lock strategy on MinIO: {result:?}"
         );
+        let caps = result.unwrap();
+        assert!(
+            caps.is_some(),
+            "S3 lock strategy should return capabilities"
+        );
+        let caps = caps.unwrap();
+        assert!(caps.put_if_none_match, "MinIO should support If-None-Match");
+        assert!(caps.put_if_match, "MinIO should support If-Match");
     }
 
     #[tokio::test]
@@ -96,11 +131,16 @@ mod tests {
             lock_strategy: LockStrategy::Memory,
             link_cache_ttl: 30,
             access_time_debounce_secs: 0,
+            capabilities: None,
         });
         let result = config.probe().await;
         assert!(
             result.is_ok(),
             "Probe should be no-op for Memory lock strategy"
+        );
+        assert!(
+            result.unwrap().is_none(),
+            "Memory lock strategy should return no capabilities"
         );
     }
 
@@ -113,5 +153,9 @@ mod tests {
         });
         let result = config.probe().await;
         assert!(result.is_ok(), "Probe should be no-op for FS config");
+        assert!(
+            result.unwrap().is_none(),
+            "FS config should return no capabilities"
+        );
     }
 }

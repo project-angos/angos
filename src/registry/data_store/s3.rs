@@ -578,6 +578,32 @@ impl Backend {
         mapped
     }
 
+    pub async fn delete_if_match(&self, path: &str, etag: &str) -> Result<(), Error> {
+        self.check_circuit_breaker()
+            .map_err(|e| Error::Io(e.to_string()))?;
+        let key = self.full_key(path);
+
+        let result = self
+            .s3_client
+            .delete_object()
+            .bucket(&self.bucket)
+            .key(&key)
+            .if_match(etag)
+            .send()
+            .await
+            .map(|_| ())
+            .map_err(|e| {
+                let service_err = e.into_service_error();
+                if is_conditional_write_conflict(&service_err) {
+                    Error::PreconditionFailed
+                } else {
+                    Error::Io(service_err.to_string())
+                }
+            });
+        self.record_data_result(&result);
+        result
+    }
+
     pub async fn put_object(&self, path: &str, data: impl Into<Bytes>) -> Result<(), IoError> {
         self.check_circuit_breaker()?;
         let key = self.full_key(path);

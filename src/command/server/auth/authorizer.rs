@@ -682,13 +682,17 @@ mod tests {
         toml::from_str(toml).unwrap()
     }
 
-    fn create_pull_through_registry(config: &Configuration) -> Registry {
+    async fn create_pull_through_registry(config: &Configuration) -> Registry {
         use std::{collections::HashMap, sync::Arc};
 
         use crate::registry::{RegistryConfig, Repository};
 
         let blob_store = config.blob_store.to_backend().unwrap();
-        let metadata_store = config.resolve_metadata_config().to_backend(None).unwrap();
+        let metadata_store = config
+            .resolve_metadata_config()
+            .to_backend(None)
+            .await
+            .unwrap();
         let auth_cache = config.cache.to_backend().unwrap();
 
         let mut repositories_map = HashMap::new();
@@ -717,7 +721,7 @@ mod tests {
         let config = create_pull_through_config();
         let cache = cache::Config::Memory.to_backend().unwrap();
         let authorizer = Authorizer::new(&config, &cache).unwrap();
-        let registry = create_pull_through_registry(&config);
+        let registry = create_pull_through_registry(&config).await;
 
         let namespace = Namespace::new("docker-io/library/nginx").unwrap();
         let reference = Reference::from_str("latest").unwrap();
@@ -751,7 +755,7 @@ mod tests {
         let config = create_pull_through_config();
         let cache = cache::Config::Memory.to_backend().unwrap();
         let authorizer = Authorizer::new(&config, &cache).unwrap();
-        let registry = create_pull_through_registry(&config);
+        let registry = create_pull_through_registry(&config).await;
 
         let namespace = Namespace::new("docker-io/library/nginx").unwrap();
         let digest = Digest::from_str(
@@ -785,7 +789,7 @@ mod tests {
         let config = create_pull_through_config();
         let cache = cache::Config::Memory.to_backend().unwrap();
         let authorizer = Authorizer::new(&config, &cache).unwrap();
-        let registry = create_pull_through_registry(&config);
+        let registry = create_pull_through_registry(&config).await;
 
         let identity = ClientIdentity::new(None);
         let (parts, ()) = hyper::Request::builder()

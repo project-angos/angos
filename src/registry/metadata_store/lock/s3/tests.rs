@@ -36,6 +36,7 @@ fn test_backend(store: Arc<data_store::s3::Backend>) -> S3LockBackend {
             max_hold_secs: 300,
             ..Default::default()
         },
+        false,
     )
     .unwrap()
 }
@@ -153,6 +154,7 @@ async fn test_stale_lock_recovery() {
             max_hold_secs: 300,
             ..Default::default()
         },
+        false,
     )
     .unwrap();
     let guard = backend
@@ -221,6 +223,7 @@ async fn test_heartbeat_refreshes_lock() {
             max_hold_secs: 300,
             ..Default::default()
         },
+        false,
     )
     .unwrap();
 
@@ -258,6 +261,7 @@ async fn test_heartbeat_invalidates_guard_on_ownership_loss() {
             max_hold_secs: 300,
             ..Default::default()
         },
+        false,
     )
     .unwrap();
 
@@ -336,6 +340,7 @@ async fn test_release_skips_delete_when_ownership_lost() {
             max_hold_secs: 300,
             ..Default::default()
         },
+        false,
     )
     .unwrap();
 
@@ -403,6 +408,7 @@ async fn test_concurrent_contention_single_key() {
                     max_hold_secs: 300,
                     ..Default::default()
                 },
+                false,
             )
             .unwrap();
 
@@ -478,6 +484,7 @@ async fn test_concurrent_contention_overlapping_keys() {
                     max_hold_secs: 300,
                     ..Default::default()
                 },
+                false,
             )
             .unwrap();
 
@@ -513,6 +520,107 @@ async fn test_concurrent_contention_overlapping_keys() {
         1,
         "At most 1 task should hold the lock at any time"
     );
+}
+
+#[tokio::test]
+async fn test_lock_release_with_conditional_delete() {
+    let store = test_store("s3lock_cond_del_");
+    let backend = S3LockBackend::new(
+        store.clone(),
+        &S3LockConfig {
+            ttl_secs: 30,
+            max_retries: 0,
+            retry_delay_ms: 5,
+            max_hold_secs: 300,
+            ..Default::default()
+        },
+        true,
+    )
+    .unwrap();
+
+    let guard = backend
+        .acquire(&["cond_del_key".to_string()])
+        .await
+        .expect("Failed to acquire lock");
+
+    let lock_path = S3LockBackend::lock_path("cond_del_key");
+    store
+        .read(&lock_path)
+        .await
+        .expect("Lock object should exist after acquire");
+
+    guard.release().await;
+
+    let result = store.read(&lock_path).await;
+    assert_eq!(
+        result.unwrap_err().kind(),
+        ErrorKind::NotFound,
+        "Lock object should be deleted after conditional release"
+    );
+}
+
+/// Verifies that when another instance takes over a lock key before the original holder
+/// releases, the release does not delete the new owner's lock object.
+///
+/// This models the TOCTOU race that `supports_conditional_delete` is designed to guard
+/// against: instance A holds the lock, instance B force-writes a new lock payload
+/// (simulating lock recovery), and then A attempts to release. Because A's release logic
+/// reads the current payload and finds a foreign `instance_id`, it skips the delete and
+/// leaves B's object intact.
+#[tokio::test]
+async fn test_lock_release_conditional_delete_preserves_recovered_lock() {
+    let store = test_store("s3lock_cond_preserve_");
+    let backend_a = S3LockBackend::new(
+        store.clone(),
+        &S3LockConfig {
+            ttl_secs: 30,
+            max_retries: 0,
+            retry_delay_ms: 5,
+            max_hold_secs: 300,
+            ..Default::default()
+        },
+        true,
+    )
+    .unwrap();
+
+    let guard_a = backend_a
+        .acquire(&["contested_key".to_string()])
+        .await
+        .expect("Instance A failed to acquire lock");
+
+    let lock_path = S3LockBackend::lock_path("contested_key");
+
+    // Simulate instance B recovering and taking over the lock by unconditionally
+    // overwriting the lock object with B's own payload. This changes both the
+    // ETag and the instance_id stored in the lock file.
+    let instance_b_id = "instance-b-recovered";
+    let payload_b = S3LockPayload {
+        instance_id: instance_b_id.to_string(),
+        refreshed_at: Utc::now(),
+        ttl_secs: 30,
+    };
+    let data_b = serde_json::to_vec(&payload_b).unwrap();
+    store
+        .put_object(&lock_path, data_b)
+        .await
+        .expect("Instance B failed to overwrite lock");
+
+    // Instance A releases: its closure reads the current lock payload, finds B's
+    // instance_id, recognises that ownership has changed, and skips the delete.
+    guard_a.release().await;
+
+    // B's lock object must still exist — A must not have deleted it.
+    let surviving = store
+        .read(&lock_path)
+        .await
+        .expect("Instance B's lock should still exist after A's release");
+    let surviving_payload: S3LockPayload = serde_json::from_slice(&surviving).unwrap();
+    assert_eq!(
+        surviving_payload.instance_id, instance_b_id,
+        "Instance B's lock should not have been deleted by instance A's release"
+    );
+
+    let _ = store.delete(&lock_path).await;
 }
 
 #[test]

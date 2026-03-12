@@ -161,10 +161,15 @@ pub struct S3LockBackend {
     max_hold_secs: u64,
     max_retries: u32,
     retry_delay_ms: u64,
+    supports_conditional_delete: bool,
 }
 
 impl S3LockBackend {
-    pub fn new(store: Arc<data_store::s3::Backend>, config: &S3LockConfig) -> Result<Self, Error> {
+    pub fn new(
+        store: Arc<data_store::s3::Backend>,
+        config: &S3LockConfig,
+        supports_conditional_delete: bool,
+    ) -> Result<Self, Error> {
         if config.ttl_secs < 9 {
             return Err(Error::InvalidData("ttl_secs must be at least 9".into()));
         }
@@ -205,6 +210,7 @@ impl S3LockBackend {
             max_hold_secs: config.max_hold_secs,
             max_retries: config.max_retries,
             retry_delay_ms: config.retry_delay_ms,
+            supports_conditional_delete,
         })
     }
 
@@ -242,11 +248,11 @@ impl S3LockBackend {
         let store = self.store.clone();
         let instance_id = self.instance_id.clone();
         let valid_for_release = valid.clone();
-        // Release performs a best-effort ownership check before deleting lock objects.
-        // S3 does not support conditional DELETE, so there is a narrow TOCTOU window
-        // between the ownership read and the delete where another instance could have
-        // recovered the lock. The worst case is a transient lock disappearance — the
-        // new owner's next heartbeat will re-create the lock object.
+        let supports_conditional_delete = self.supports_conditional_delete;
+        // When conditional DELETE is available, lock release uses delete_if_match to
+        // atomically verify ownership via ETag. When not available, there is a narrow
+        // TOCTOU window between the ownership read and the delete — see
+        // ConditionalCapabilities.delete_if_match.
         LockGuard::with_async_release_and_heartbeat(
             move || {
                 Box::pin(async move {
@@ -262,10 +268,45 @@ impl S3LockBackend {
                             let instance_id = instance_id.clone();
                             async move {
                                 match store.read_with_etag(&path).await {
-                                    Ok((data, _)) => {
+                                    Ok((data, etag)) => {
                                         match serde_json::from_slice::<S3LockPayload>(&data) {
                                             Ok(payload) if payload.instance_id == instance_id => {
-                                                if let Err(e) = store.delete(&path).await {
+                                                if supports_conditional_delete {
+                                                    if let Some(etag) = etag {
+                                                        match store
+                                                            .delete_if_match(&path, &etag)
+                                                            .await
+                                                        {
+                                                            Ok(()) => {}
+                                                            Err(
+                                                                data_store::Error::PreconditionFailed,
+                                                            ) => {
+                                                                debug!(
+                                                                    path,
+                                                                    "Lock ETag changed during \
+                                                                     release, another instance \
+                                                                     owns it"
+                                                                );
+                                                            }
+                                                            Err(e) => {
+                                                                warn!(
+                                                                    path,
+                                                                    error = %e,
+                                                                    "Failed to delete lock on \
+                                                                     release"
+                                                                );
+                                                            }
+                                                        }
+                                                    } else if let Err(e) =
+                                                        store.delete(&path).await
+                                                    {
+                                                        warn!(
+                                                            path,
+                                                            error = %e,
+                                                            "Failed to delete lock on release"
+                                                        );
+                                                    }
+                                                } else if let Err(e) = store.delete(&path).await {
                                                     warn!(
                                                         path,
                                                         error = %e,

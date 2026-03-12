@@ -1,5 +1,4 @@
 use sha2::{Digest, Sha256, digest::crypto_common::hazmat::SerializableState};
-
 use crate::{oci, registry::blob_store::Error};
 
 pub trait Sha256Ext {

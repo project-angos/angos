@@ -24,6 +24,8 @@ use tracing::{Span, debug, error, info, instrument};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 use uuid::Uuid;
 
+use serde::Serialize;
+
 use crate::{
     command::server::{
         ServerContext,
@@ -37,6 +39,7 @@ use crate::{
     identity::{ClientIdentity, Route},
     metrics_provider::{IN_FLIGHT_REQUESTS, METRICS_PROVIDER},
     oci::{Digest, Namespace, Reference},
+    registry::metadata_store::ConditionalCapabilities,
 };
 
 pub async fn serve_request<S>(
@@ -249,7 +252,7 @@ async fn dispatch_route<'a>(
             handle_list_namespaces(context, repository, identity).await
         }
         Route::Healthz => handle_healthz(),
-        Route::Readyz => handle_readyz(context).await,
+        Route::Readyz => handle_readyz(context, parts).await,
         Route::Metrics => handle_metrics(),
     }
 }
@@ -642,23 +645,55 @@ fn handle_healthz() -> Result<Response<ResponseBody>, Error> {
     }
 }
 
-async fn handle_readyz(context: &ServerContext) -> Result<Response<ResponseBody>, Error> {
+async fn handle_readyz(
+    context: &ServerContext,
+    parts: &hyper::http::request::Parts,
+) -> Result<Response<ResponseBody>, Error> {
+    #[derive(Serialize)]
+    struct ReadyResponse<'a> {
+        status: &'a str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        conditional: Option<&'a ConditionalCapabilities>,
+    }
+
+    #[derive(Serialize)]
+    struct NotReadyResponse {
+        status: &'static str,
+        error: String,
+    }
+
+    let verbose = parts
+        .uri
+        .query()
+        .is_some_and(|q| q.contains("verbose=true"));
+
     match context.registry.check_ready().await {
-        Ok(()) => Response::builder()
-            .status(StatusCode::OK)
-            .header(CONTENT_TYPE, "application/json")
-            .body(ResponseBody::Fixed(Full::new(Bytes::from(
-                r#"{"status":"ready"}"#,
-            ))))
-            .map_err(|e| Error::Internal(format!("Failed to build readyz response: {e}"))),
-        Err(e) => Response::builder()
-            .status(StatusCode::SERVICE_UNAVAILABLE)
-            .header(CONTENT_TYPE, "application/json")
-            .body(ResponseBody::Fixed(Full::new(Bytes::from(format!(
-                r#"{{"status":"not_ready","error":"{}"}}"#,
-                e.to_string().replace('"', "\\\"")
-            )))))
-            .map_err(|e| Error::Internal(format!("Failed to build readyz response: {e}"))),
+        Ok(conditional) => {
+            let payload = ReadyResponse {
+                status: "ready",
+                conditional: if verbose { conditional.as_ref() } else { None },
+            };
+            let body = serde_json::to_string(&payload)
+                .map_err(|e| Error::Internal(format!("Failed to serialize readyz response: {e}")))?;
+            Response::builder()
+                .status(StatusCode::OK)
+                .header(CONTENT_TYPE, "application/json")
+                .body(ResponseBody::Fixed(Full::new(Bytes::from(body))))
+                .map_err(|e| Error::Internal(format!("Failed to build readyz response: {e}")))
+        }
+        Err(e) => {
+            let payload = NotReadyResponse {
+                status: "not_ready",
+                error: e.to_string(),
+            };
+            let body = serde_json::to_string(&payload)
+                .map_err(|e| Error::Internal(format!("Failed to serialize readyz response: {e}")))?;
+            Response::builder()
+                .status(StatusCode::SERVICE_UNAVAILABLE)
+                .header(CONTENT_TYPE, "application/json")
+                .body(ResponseBody::Fixed(Full::new(Bytes::from(body))))
+                .map_err(|e| Error::Internal(format!("Failed to build readyz response: {e}")))
+        }
     }
 }
 
@@ -1119,7 +1154,11 @@ mod tests {
 
         let config: Configuration = toml::from_str(toml).unwrap();
         let blob_store = config.blob_store.to_backend().unwrap();
-        let metadata_store = config.resolve_metadata_config().to_backend(None).unwrap();
+        let metadata_store = config
+            .resolve_metadata_config()
+            .to_backend(None)
+            .await
+            .unwrap();
         let repositories = Arc::new(HashMap::new());
         let registry_config = RegistryConfig::new()
             .update_pull_time(false)
@@ -1141,7 +1180,7 @@ mod tests {
         assert!(identity.username.is_none());
     }
 
-    fn create_test_context_with_allow_policy() -> ServerContext {
+    async fn create_test_context_with_allow_policy() -> ServerContext {
         use std::collections::HashMap;
 
         use crate::{
@@ -1173,7 +1212,11 @@ mod tests {
 
         let config: Configuration = toml::from_str(toml).unwrap();
         let blob_store = config.blob_store.to_backend().unwrap();
-        let metadata_store = config.resolve_metadata_config().to_backend(None).unwrap();
+        let metadata_store = config
+            .resolve_metadata_config()
+            .to_backend(None)
+            .await
+            .unwrap();
         let repositories = Arc::new(HashMap::new());
         let registry_config = RegistryConfig::new()
             .update_pull_time(false)
@@ -1190,7 +1233,7 @@ mod tests {
     async fn test_handle_list_repositories_accepts_identity() {
         use crate::identity::ClientIdentity;
 
-        let context = create_test_context_with_allow_policy();
+        let context = create_test_context_with_allow_policy().await;
         let identity = ClientIdentity::default();
 
         let result = handle_list_repositories(&context, &identity).await;
@@ -1202,7 +1245,7 @@ mod tests {
     async fn test_handle_list_catalog_accepts_identity() {
         use crate::identity::ClientIdentity;
 
-        let context = create_test_context_with_allow_policy();
+        let context = create_test_context_with_allow_policy().await;
         let identity = ClientIdentity::default();
 
         let result = handle_list_catalog(&context, None, None, &identity).await;
@@ -1214,7 +1257,7 @@ mod tests {
     async fn test_handle_delete_blob_accepts_identity() {
         use crate::identity::ClientIdentity;
 
-        let context = create_test_context_with_allow_policy();
+        let context = create_test_context_with_allow_policy().await;
         let identity = ClientIdentity::default();
         let namespace = Namespace::new("test/repo").unwrap();
         let digest: Digest =

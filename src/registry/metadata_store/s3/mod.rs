@@ -27,8 +27,8 @@ use crate::{
     registry::{
         data_store,
         metadata_store::{
-            BlobIndex, BlobIndexOperation, Error, LinkMetadata, LinkOperation, LockConfig,
-            LockStrategy, MetadataStore,
+            BlobIndex, BlobIndexOperation, ConditionalCapabilities, Error, LinkMetadata,
+            LinkOperation, LockConfig, LockStrategy, MetadataStore,
             link_kind::LinkKind,
             lock::{self, LockBackend, MemoryBackend},
         },
@@ -72,6 +72,20 @@ pub struct BackendConfig {
     pub lock_strategy: LockStrategy,
     pub link_cache_ttl: u64,
     pub access_time_debounce_secs: u64,
+    /// Explicitly declare which conditional S3 operations the provider supports.
+    /// Each boolean flag corresponds to a distinct HTTP conditional header:
+    /// - `put_if_none_match`: PutObject with If-None-Match: * (create-only)
+    /// - `put_if_match`: PutObject with If-Match: <etag> (update-only, enables CAS optimizations)
+    /// - `delete_if_match`: DeleteObject with If-Match: <etag> (atomic lock release)
+    ///
+    /// When set, the startup probe is skipped entirely and your declared values are used.
+    /// When absent, the probe runs automatically if `lock_strategy = "s3"` to auto-detect
+    /// capabilities (and capabilities default to all-false for other lock strategies).
+    ///
+    /// Set explicitly to avoid startup latency from probing, or to handle S3-compatible
+    /// providers where probe results may be inaccurate. Both `put_if_none_match` and
+    /// `put_if_match` must be true for compare-and-swap (CAS) operations to be used.
+    pub capabilities: Option<ConditionalCapabilities>,
 }
 
 impl Default for BackendConfig {
@@ -86,6 +100,7 @@ impl Default for BackendConfig {
             lock_strategy: LockStrategy::Memory,
             link_cache_ttl: default_link_cache_ttl(),
             access_time_debounce_secs: default_access_time_debounce(),
+            capabilities: None,
         }
     }
 }
@@ -112,6 +127,8 @@ impl<'de> Deserialize<'de> for BackendConfig {
             link_cache_ttl: u64,
             #[serde(default = "default_access_time_debounce")]
             access_time_debounce_secs: u64,
+            #[serde(default)]
+            capabilities: Option<ConditionalCapabilities>,
         }
 
         let raw = Raw::deserialize(deserializer)?;
@@ -128,6 +145,7 @@ impl<'de> Deserialize<'de> for BackendConfig {
             lock_strategy,
             link_cache_ttl: raw.link_cache_ttl,
             access_time_debounce_secs: raw.access_time_debounce_secs,
+            capabilities: raw.capabilities,
         })
     }
 }
@@ -202,6 +220,10 @@ impl AccessTimeWriter {
     }
 
     async fn flush_one(backend: &Backend, namespace: &str, link: &LinkKind) -> Result<(), Error> {
+        if backend.conditional.put_if_match {
+            backend.update_access_time_cas(namespace, link).await?;
+            return Ok(());
+        }
         let guard = backend
             .lock
             .acquire(&[format!("{namespace}:{link}")])
@@ -245,10 +267,10 @@ pub struct Backend {
     cache: Option<Arc<dyn Cache>>,
     link_cache_ttl: u64,
     access_time_writer: Option<AccessTimeWriter>,
-    /// Whether the S3 backend supports conditional writes (If-Match / If-None-Match).
-    /// When true, blob index updates use lock-free CAS. When false, they are protected
-    /// by the distributed lock alongside link updates.
-    supports_conditional_writes: bool,
+    /// Per-operation conditional capabilities probed at startup.
+    /// Controls whether CAS paths are used for blob index, link updates, namespace
+    /// registry writes, and access-time updates.
+    conditional: ConditionalCapabilities,
     known_namespaces: Arc<Mutex<HashSet<String>>>,
     // Held for Drop side-effect: signals the flush task to exit when the last Backend is dropped.
     #[allow(dead_code)]
@@ -257,11 +279,33 @@ pub struct Backend {
 
 const MAX_UPDATE_RETRIES: u32 = 10;
 const MAX_BLOB_INDEX_CAS_RETRIES: u32 = 20;
+const MAX_ACCESS_TIME_CAS_RETRIES: u32 = 3;
 
 impl Backend {
-    pub fn new(config: &BackendConfig) -> Result<Self, Error> {
+    /// Create a new S3 metadata-store backend.
+    ///
+    /// `conditional` overrides the capabilities used for lock backend construction and CAS
+    /// write paths. Pass `None` to use defaults (all capabilities assumed present for S3 lock
+    /// strategy, none for other strategies). Pass `Some(caps)` with the result of
+    /// `probe_conditional_capabilities` to use the actual probed values.
+    pub fn new(
+        config: &BackendConfig,
+        conditional: Option<ConditionalCapabilities>,
+    ) -> Result<Self, Error> {
         info!("Using S3 metadata-store backend");
         let store = data_store::s3::Backend::new(&config.to_data_store_config())?;
+
+        let conditional = conditional.unwrap_or_else(|| {
+            if matches!(config.lock_strategy, LockStrategy::S3(_)) {
+                ConditionalCapabilities {
+                    put_if_none_match: true,
+                    put_if_match: true,
+                    delete_if_match: true,
+                }
+            } else {
+                ConditionalCapabilities::default()
+            }
+        });
 
         let lock: Arc<dyn LockBackend + Send + Sync> = match &config.lock_strategy {
             LockStrategy::Redis(redis_config) => {
@@ -280,9 +324,12 @@ impl Backend {
                         })?,
                 );
                 Arc::new(
-                    lock::S3LockBackend::new(lock_store, s3_lock_config).map_err(|e| {
-                        Error::Lock(format!("Failed to initialize S3 lock store: {e}"))
-                    })?,
+                    lock::S3LockBackend::new(
+                        lock_store,
+                        s3_lock_config,
+                        conditional.delete_if_match,
+                    )
+                    .map_err(|e| Error::Lock(format!("Failed to initialize S3 lock store: {e}")))?,
                 )
             }
             LockStrategy::Memory => {
@@ -291,18 +338,13 @@ impl Backend {
             }
         };
 
-        // S3 lock strategy probes conditional write support at startup, so if
-        // we're using S3 locks we know conditionals work. For other lock strategies
-        // the S3 backend may not support them (e.g. older S3-compatible stores).
-        let supports_conditional_writes = matches!(config.lock_strategy, LockStrategy::S3(_));
-
         if config.access_time_debounce_secs == 0
             && matches!(config.lock_strategy, LockStrategy::S3(_))
         {
             warn!(
                 "access_time_debounce_secs is 0 with S3 lock strategy; \
-                 every manifest pull will acquire an S3 lock for access time updates, \
-                 which adds significant latency and S3 API cost at scale. \
+                 every manifest pull will trigger a synchronous access time update \
+                 (CAS loop, with lock fallback), adding S3 API latency. \
                  Consider setting access_time_debounce_secs to 60 or higher."
             );
         }
@@ -324,7 +366,7 @@ impl Backend {
                 cache: None,
                 link_cache_ttl: config.link_cache_ttl,
                 access_time_writer: access_time_writer.clone(),
-                supports_conditional_writes,
+                conditional: conditional.clone(),
                 known_namespaces: Arc::new(Mutex::new(HashSet::new())),
                 flush_handle: None,
             };
@@ -351,7 +393,7 @@ impl Backend {
             cache: None,
             link_cache_ttl: config.link_cache_ttl,
             access_time_writer,
-            supports_conditional_writes,
+            conditional,
             known_namespaces: Arc::new(Mutex::new(HashSet::new())),
             flush_handle,
         };
@@ -359,98 +401,111 @@ impl Backend {
         Ok(backend)
     }
 
-    pub async fn probe_conditional_write_support(
+    /// Probe each conditional S3 operation independently.
+    ///
+    /// Tests `PutObject If-None-Match: *`, `PutObject If-Match: <etag>`, and
+    /// `DeleteObject If-Match: <etag>` in sequence. Each probe is self-validating:
+    /// bogus-ETag attempts verify that the provider actually enforces the condition.
+    ///
+    /// Returns the probed capabilities. The caller is responsible for failing startup
+    /// if any required capability is absent.
+    pub async fn probe_conditional_capabilities(
         store: &data_store::s3::Backend,
-    ) -> Result<(), Error> {
+    ) -> Result<ConditionalCapabilities, Error> {
         let probe_key = format!("_angos_probe_{}", uuid::Uuid::new_v4());
         let content: &[u8] = b"probe";
 
-        // Step 1: PUT the probe object
-        if let Err(e) = store.put_object(&probe_key, content).await {
-            let _ = store.delete(&probe_key).await;
-            return Err(Error::Lock(format!(
-                "S3 conditional write probe failed to create probe object: {e}"
-            )));
-        }
+        store.put_object(&probe_key, content).await.map_err(|e| {
+            Error::Lock(format!(
+                "conditional capability probe: failed to create probe object: {e}"
+            ))
+        })?;
 
-        // Step 2: PUT again with If-None-Match: * — expect 412 PreconditionFailed
-        let if_none_match_result = store.put_object_if_not_exists(&probe_key, content).await;
-
-        // Step 3: Test If-Match — read current ETag, update should succeed
-        let if_match_result = match store.read_with_etag(&probe_key).await {
-            Ok((_, Some(etag))) => {
-                let update_result = store
-                    .put_object_if_match(&probe_key, &etag, b"updated".to_vec())
-                    .await;
-                let bogus_result = store
-                    .put_object_if_match(&probe_key, "\"bogus\"", b"fail".to_vec())
-                    .await;
-                Some((update_result, bogus_result))
-            }
-            Ok((_, None)) => {
-                let _ = store.delete(&probe_key).await;
-                return Err(Error::Lock(
-                    "S3 conditional write probe: ETag not returned, \
-                     If-Match support cannot be verified"
-                        .to_string(),
-                ));
+        // Test If-None-Match: * — expect 412 because the object already exists.
+        let put_if_none_match = match store.put_object_if_not_exists(&probe_key, content).await {
+            Err(data_store::Error::PreconditionFailed) => true,
+            Ok(_) => {
+                warn!(
+                    "conditional probe: If-None-Match: * was accepted on existing key; provider does not enforce it"
+                );
+                false
             }
             Err(e) => {
-                let _ = store.delete(&probe_key).await;
-                return Err(Error::Lock(format!(
-                    "S3 conditional write probe failed to read probe object for If-Match test: {e}"
-                )));
+                warn!("conditional probe: If-None-Match error: {e}");
+                false
             }
         };
 
-        // Step 4: Clean up probe object regardless of outcome
-        let _ = store.delete(&probe_key).await;
-
-        // Step 5: Evaluate If-None-Match result
-        match if_none_match_result {
-            Err(data_store::Error::PreconditionFailed) => {}
-            Ok(_) => {
-                return Err(Error::Lock(
-                    "S3 backend does not support If-None-Match: * conditional writes, \
-                     required for lock_strategy = s3. Use lock_strategy = redis or \
-                     lock_strategy = memory instead."
-                        .to_string(),
-                ));
+        // Test If-Match: <etag> — correct ETag must succeed; bogus ETag must fail.
+        let put_if_match = match store.read_with_etag(&probe_key).await {
+            Ok((_, Some(etag))) => {
+                let correct = store
+                    .put_object_if_match(&probe_key, &etag, b"updated".to_vec())
+                    .await
+                    .is_ok();
+                let bogus_rejected = matches!(
+                    store
+                        .put_object_if_match(&probe_key, "\"bogus\"", b"fail".to_vec())
+                        .await,
+                    Err(data_store::Error::PreconditionFailed)
+                );
+                correct && bogus_rejected
+            }
+            Ok((_, None)) => {
+                warn!("conditional probe: ETag not returned; If-Match support cannot be verified");
+                false
             }
             Err(e) => {
-                return Err(Error::Lock(format!(
-                    "S3 conditional write probe (If-None-Match) failed: {e}"
-                )));
+                warn!("conditional probe: failed to read probe object for If-Match test: {e}");
+                false
             }
-        }
+        };
 
-        // Step 6: Evaluate If-Match results
-        if let Some((update_result, bogus_result)) = if_match_result {
-            if let Err(e) = update_result {
-                return Err(Error::Lock(format!(
-                    "S3 backend does not support If-Match conditional writes (update failed): {e}"
-                )));
+        // Test DeleteObject If-Match: <etag> — bogus ETag must fail; correct ETag must succeed.
+        // Re-read the current ETag after the put_if_match update may have changed it.
+        let delete_if_match = match store.read_with_etag(&probe_key).await {
+            Ok((_, Some(etag))) => {
+                // Bogus-ETag attempt first: if the provider ignores the condition and deletes
+                // the object, the correct-ETag attempt below will hit NotFound and correct=false.
+                let bogus_rejected = matches!(
+                    store.delete_if_match(&probe_key, "\"bogus\"").await,
+                    Err(data_store::Error::PreconditionFailed)
+                );
+                let correct = store.delete_if_match(&probe_key, &etag).await.is_ok();
+                bogus_rejected && correct
             }
-            match bogus_result {
-                Err(data_store::Error::PreconditionFailed) => {}
-                Ok(_) => {
-                    return Err(Error::Lock(
-                        "S3 backend does not enforce If-Match: bogus ETag was accepted, \
-                         required for lock heartbeat. Use lock_strategy = redis or \
-                         lock_strategy = memory instead."
-                            .to_string(),
-                    ));
-                }
-                Err(e) => {
-                    return Err(Error::Lock(format!(
-                        "S3 conditional write probe (If-Match bogus) failed unexpectedly: {e}"
-                    )));
-                }
+            Ok((_, None)) => {
+                warn!(
+                    "conditional probe: ETag not returned; DeleteObject If-Match support cannot be verified"
+                );
+                false
             }
-        }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+            Err(e) => {
+                warn!(
+                    "conditional probe: failed to read probe object for delete_if_match test: {e}"
+                );
+                false
+            }
+        };
 
-        info!("S3 conditional write probe passed (If-None-Match and If-Match supported)");
-        Ok(())
+        // Cleanup — may already have been deleted by the delete_if_match test.
+        let _ = store.delete(&probe_key).await;
+
+        let capabilities = ConditionalCapabilities {
+            put_if_none_match,
+            put_if_match,
+            delete_if_match,
+        };
+
+        info!(
+            if_none_match = capabilities.put_if_none_match,
+            if_match = capabilities.put_if_match,
+            delete_if_match = capabilities.delete_if_match,
+            "S3 conditional capability probe complete"
+        );
+
+        Ok(capabilities)
     }
 
     pub async fn flush_access_times(&self) {
@@ -590,6 +645,10 @@ impl Backend {
 
 #[async_trait]
 impl MetadataStore for Backend {
+    fn conditional_capabilities(&self) -> Option<ConditionalCapabilities> {
+        Some(self.conditional.clone())
+    }
+
     #[instrument(skip(self))]
     async fn list_namespaces(
         &self,
@@ -888,7 +947,7 @@ impl MetadataStore for Backend {
         digest: &Digest,
         operation: BlobIndexOperation,
     ) -> Result<(), Error> {
-        if self.supports_conditional_writes {
+        if self.conditional.supports_cas() {
             return self
                 .update_blob_index_cas(namespace, digest, &[operation])
                 .await;
@@ -915,6 +974,10 @@ impl MetadataStore for Backend {
                     data
                 };
                 writer.record(namespace, link).await;
+                Ok(link_data)
+            } else if self.conditional.put_if_match {
+                let link_data = self.update_access_time_cas(namespace, link).await?;
+                self.cache_put(namespace, link, &link_data).await;
                 Ok(link_data)
             } else {
                 let guard = self.lock.acquire(&[format!("{namespace}:{link}")]).await?;
@@ -950,7 +1013,7 @@ impl MetadataStore for Backend {
             return Ok(());
         }
 
-        if self.supports_conditional_writes {
+        if self.conditional.supports_cas() {
             self.update_links_cas(namespace, operations).await
         } else {
             self.update_links_locked(namespace, operations).await
@@ -1708,7 +1771,7 @@ impl Backend {
                 path_builder::namespace_registry_shard_dir()
             );
 
-            if self.supports_conditional_writes {
+            if self.conditional.supports_cas() {
                 let etag = match self.store.read_with_etag(&path).await {
                     Ok((_, etag)) => etag,
                     Err(e) if e.kind() == ErrorKind::NotFound => None,
@@ -1751,7 +1814,7 @@ impl Backend {
             return Ok(());
         }
 
-        if self.supports_conditional_writes {
+        if self.conditional.supports_cas() {
             self.register_namespace_cas(namespace).await
         } else {
             self.register_namespace_unconditional(namespace).await
@@ -1896,6 +1959,49 @@ impl Backend {
         Ok(())
     }
 
+    async fn update_access_time_cas(
+        &self,
+        namespace: &str,
+        link: &LinkKind,
+    ) -> Result<LinkMetadata, Error> {
+        let link_path = path_builder::link_path(link, namespace);
+
+        for _ in 0..MAX_ACCESS_TIME_CAS_RETRIES {
+            let (data, etag) = match self.store.read_with_etag(&link_path).await {
+                Ok((data, etag)) => (data, etag),
+                Err(e) if e.kind() == ErrorKind::NotFound => return Err(Error::ReferenceNotFound),
+                Err(e) => return Err(e.into()),
+            };
+            let link_data = LinkMetadata::from_bytes(data)?.accessed();
+            let Some(etag) = etag else {
+                break;
+            };
+            let serialized = Bytes::from(serde_json::to_vec(&link_data)?);
+            match self
+                .store
+                .put_object_if_match(&link_path, &etag, serialized)
+                .await
+            {
+                Ok(_) => return Ok(link_data),
+                Err(data_store::Error::PreconditionFailed) => continue,
+                Err(e) => return Err(Error::StorageBackend(e.to_string())),
+            }
+        }
+
+        // CAS exhausted or no ETag — fall back to lock-protected path
+        let guard = self.lock.acquire(&[format!("{namespace}:{link}")]).await?;
+        let link_data = self.read_link_reference(namespace, link).await?.accessed();
+        if !guard.is_valid() {
+            return Err(Error::Lock(
+                "lock invalidated during access time update".into(),
+            ));
+        }
+        self.write_link_reference(namespace, link, &link_data)
+            .await?;
+        guard.release().await;
+        Ok(link_data)
+    }
+
     async fn read_link_reference(
         &self,
         namespace: &str,
@@ -1974,12 +2080,15 @@ mod tests {
             lock_strategy: LockStrategy::Memory,
             link_cache_ttl: 30,
             access_time_debounce_secs: 0,
+            capabilities: None,
         }
     }
 
     fn test_backend_with_cache(config: &BackendConfig) -> (Backend, Arc<dyn cache::Cache>) {
         let cache: Arc<dyn cache::Cache> = Arc::new(cache::memory::Backend::new());
-        let backend = Backend::new(config).unwrap().with_cache(cache.clone());
+        let backend = Backend::new(config, None)
+            .unwrap()
+            .with_cache(cache.clone());
         (backend, cache)
     }
 
@@ -2334,7 +2443,7 @@ mod tests {
     fn test_backend_with_debounce(config: &BackendConfig, debounce_secs: u64) -> Backend {
         let mut cfg = config.clone();
         cfg.access_time_debounce_secs = debounce_secs;
-        Backend::new(&cfg).unwrap()
+        Backend::new(&cfg, None).unwrap()
     }
 
     #[tokio::test]
@@ -2733,7 +2842,7 @@ mod tests {
     #[tokio::test]
     async fn test_blob_index_updates_multiple_digests() {
         let config = test_config();
-        let backend = Backend::new(&config).unwrap();
+        let backend = Backend::new(&config, None).unwrap();
         let namespace = "blob-index-multi-digest-test";
 
         let digests: Vec<Digest> = (0..5)
@@ -2773,7 +2882,7 @@ mod tests {
     #[tokio::test]
     async fn test_tracked_link_creates_with_referrers() {
         let config = test_config();
-        let backend = Backend::new(&config).unwrap();
+        let backend = Backend::new(&config, None).unwrap();
         let namespace = "tracked-creates-referrer-test";
 
         let referrer_digest = Digest::from_str(
@@ -2841,7 +2950,7 @@ mod tests {
     #[tokio::test]
     async fn test_tracked_link_deletes_with_referrers() {
         let config = test_config();
-        let backend = Backend::new(&config).unwrap();
+        let backend = Backend::new(&config, None).unwrap();
         let namespace = "tracked-deletes-referrer-test";
 
         let referrer_digest = Digest::from_str(
@@ -2908,7 +3017,7 @@ mod tests {
     #[tokio::test]
     async fn test_mixed_creates_and_deletes_across_digests() {
         let config = test_config();
-        let backend = Backend::new(&config).unwrap();
+        let backend = Backend::new(&config, None).unwrap();
         let namespace = "mixed-ops-across-digests-test";
 
         let digest_keep = Digest::from_str(
@@ -3003,7 +3112,7 @@ mod tests {
         let mut cfg = config.clone();
         cfg.access_time_debounce_secs = 60;
         let cache: Arc<dyn cache::Cache> = Arc::new(cache::memory::Backend::new());
-        let backend = Backend::new(&cfg).unwrap().with_cache(cache.clone());
+        let backend = Backend::new(&cfg, None).unwrap().with_cache(cache.clone());
         let namespace = "cache-debounce-hit-ns";
         let digest = Digest::from_str(
             "sha256:db01a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6",
@@ -3043,7 +3152,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_probe_conditional_write_support() {
+    async fn test_probe_conditional_capabilities() {
         let config = test_config();
         let store = data_store::s3::Backend::new(&data_store::s3::BackendConfig {
             access_key_id: config.access_key_id.clone(),
@@ -3056,10 +3165,16 @@ mod tests {
         })
         .unwrap();
 
-        let result = Backend::probe_conditional_write_support(&store).await;
+        let result = Backend::probe_conditional_capabilities(&store).await;
+        assert!(result.is_ok(), "Probe should pass on MinIO: {result:?}");
+        let caps = result.unwrap();
+        assert!(caps.put_if_none_match, "MinIO should support If-None-Match");
+        assert!(caps.put_if_match, "MinIO should support If-Match");
+        // MinIO does not enforce If-Match on DeleteObject (returns 200 regardless of ETag),
+        // so delete_if_match is expected to be false.
         assert!(
-            result.is_ok(),
-            "Probe should pass on MinIO (supports If-None-Match): {result:?}"
+            !caps.delete_if_match,
+            "MinIO does not support conditional delete (ignores If-Match on DeleteObject)"
         );
     }
 }
