@@ -154,8 +154,12 @@ jobs:
           ./conformance.test
 
           time ./zb -c 5 -r conformance -n 100 http://localhost:8000
-          docker logs conformance-fs-backend
-          docker stop conformance-fs-backend
+
+      - name: Dump registry logs (filesystem backend)
+        if: always()
+        run: |
+          docker logs conformance-fs-backend || true
+          docker stop conformance-fs-backend || true
 
   conformance-s3:
     runs-on: ubuntu-latest
@@ -213,10 +217,14 @@ jobs:
           ./conformance.test
 
           time ./zb -c 5 -r conformance -n 100 http://localhost:8000
-          docker logs conformance-s3-backend
-          docker stop conformance-s3-backend
-          docker logs minio-server
-          docker stop minio-server
+
+      - name: Dump registry logs (s3 backend)
+        if: always()
+        run: |
+          docker logs conformance-s3-backend || true
+          docker stop conformance-s3-backend || true
+          docker logs minio-server || true
+          docker stop minio-server || true
 
   conformance-s3-lock:
     runs-on: ubuntu-latest
@@ -274,10 +282,14 @@ jobs:
           ./conformance.test
 
           time ./zb -c 5 -r conformance -n 100 http://localhost:8000
-          docker logs conformance-s3-lock-backend
-          docker stop conformance-s3-lock-backend
-          docker logs minio-server
-          docker stop minio-server
+
+      - name: Dump registry logs (s3 backend with s3 lock)
+        if: always()
+        run: |
+          docker logs conformance-s3-lock-backend || true
+          docker stop conformance-s3-lock-backend || true
+          docker logs minio-server || true
+          docker stop minio-server || true
 
   build-binary:
     strategy:
