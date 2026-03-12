@@ -33,7 +33,7 @@ use crate::registry::metadata_store::link_kind::LinkKind;
 pub struct ConditionalCapabilities {
     /// `PutObject` with `If-None-Match: *` — create-only, reject if object exists.
     pub put_if_none_match: bool,
-    /// `PutObject` with `If-Match: <etag>` — update-only, reject if ETag mismatch.
+    /// `PutObject` with `If-Match: <etag>` — update-only, reject if `ETag` mismatch.
     pub put_if_match: bool,
     /// `DeleteObject` with `If-Match: <etag>` — conditional delete.
     pub delete_if_match: bool,

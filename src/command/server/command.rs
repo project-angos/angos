@@ -64,8 +64,8 @@ async fn build_metadata_store(
 ) -> Result<Arc<dyn MetadataStore>, Error> {
     let mut metadata_config = config.resolve_metadata_config();
 
-    if let MetadataStoreConfig::S3(ref mut backend_config) = metadata_config {
-        if backend_config.capabilities.is_none() {
+    if let MetadataStoreConfig::S3(ref mut backend_config) = metadata_config
+        && backend_config.capabilities.is_none() {
             let guard = cached_capabilities
                 .lock()
                 .expect("capabilities mutex poisoned");
@@ -73,7 +73,6 @@ async fn build_metadata_store(
                 backend_config.capabilities = guard.clone();
             }
         }
-    }
 
     match metadata_config.to_backend(Some(cache.clone())).await {
         Ok(store) => {

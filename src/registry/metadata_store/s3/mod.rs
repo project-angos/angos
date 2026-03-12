@@ -74,9 +74,9 @@ pub struct BackendConfig {
     pub access_time_debounce_secs: u64,
     /// Explicitly declare which conditional S3 operations the provider supports.
     /// Each boolean flag corresponds to a distinct HTTP conditional header:
-    /// - `put_if_none_match`: PutObject with If-None-Match: * (create-only)
-    /// - `put_if_match`: PutObject with If-Match: <etag> (update-only, enables CAS optimizations)
-    /// - `delete_if_match`: DeleteObject with If-Match: <etag> (atomic lock release)
+    /// - `put_if_none_match`: `PutObject` with If-None-Match: * (create-only)
+    /// - `put_if_match`: `PutObject` with If-Match: <etag> (update-only, enables CAS optimizations)
+    /// - `delete_if_match`: `DeleteObject` with If-Match: <etag> (atomic lock release)
     ///
     /// When set, the startup probe is skipped entirely and your declared values are used.
     /// When absent, the probe runs automatically if `lock_strategy = "s3"` to auto-detect
