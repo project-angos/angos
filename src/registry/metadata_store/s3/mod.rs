@@ -1025,13 +1025,6 @@ impl MetadataStore for Backend {
     }
 }
 
-fn is_tracked_link(link: &LinkKind) -> bool {
-    matches!(
-        link,
-        LinkKind::Layer(_) | LinkKind::Config(_) | LinkKind::Manifest(_, _)
-    )
-}
-
 impl Backend {
     /// CAS-optimized write path with lock-free fast path for new links.
     ///
@@ -1069,7 +1062,7 @@ impl Backend {
                     referrer,
                     media_type,
                     descriptor,
-                } if !is_tracked_link(link) || referrer.is_none() => {
+                } if !link.is_tracked() || referrer.is_none() => {
                     any_creates = true;
                     let metadata = LinkMetadata::from_digest(target.clone())
                         .with_media_type(media_type.clone())
@@ -1545,7 +1538,7 @@ impl Backend {
         let mut non_tracked_create_writes: Vec<(LinkKind, LinkMetadata)> = Vec::new();
 
         for (link, target, old_target, referrer, media_type, descriptor) in creates {
-            let is_tracked = is_tracked_link(link);
+            let is_tracked = link.is_tracked();
 
             if is_tracked && referrer.is_some() {
                 let mut metadata = link_cache.remove(link).unwrap_or_else(|| {
@@ -1607,7 +1600,7 @@ impl Backend {
         let mut non_tracked_delete_links: Vec<LinkKind> = Vec::new();
 
         for (link, target, referrer) in deletes {
-            let is_tracked = is_tracked_link(link);
+            let is_tracked = link.is_tracked();
 
             if is_tracked && referrer.is_some() {
                 if let Some(mut metadata) = link_cache.remove(link) {

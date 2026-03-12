@@ -14,6 +14,15 @@ pub enum LinkKind {
     Manifest(Digest, Digest),
 }
 
+impl LinkKind {
+    pub fn is_tracked(&self) -> bool {
+        matches!(
+            self,
+            LinkKind::Layer(_) | LinkKind::Config(_) | LinkKind::Manifest(_, _)
+        )
+    }
+}
+
 impl Display for LinkKind {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {

@@ -548,7 +548,7 @@ impl MetadataStore for Backend {
             // Non-tracked creates: accumulate blob index ops, then parallel link writes
             let mut non_tracked_create_writes: Vec<(LinkKind, LinkMetadata)> = Vec::new();
             for (link, target, old_target, referrer, media_type, descriptor) in &creates {
-                let is_tracked = is_tracked_link(link);
+                let is_tracked = link.is_tracked();
 
                 if is_tracked && referrer.is_some() {
                     let mut metadata = link_cache.remove(link).unwrap_or_else(|| {
@@ -611,7 +611,7 @@ impl MetadataStore for Backend {
             // Non-tracked deletes: parallel link deletes, then accumulate blob index ops
             let mut non_tracked_delete_links: Vec<LinkKind> = Vec::new();
             for (link, target, referrer) in &valid_deletes {
-                let is_tracked = is_tracked_link(link);
+                let is_tracked = link.is_tracked();
 
                 if is_tracked && referrer.is_some() {
                     if let Some(mut metadata) = link_cache.remove(link) {
@@ -702,13 +702,6 @@ impl MetadataStore for Backend {
             return Ok(());
         }
     }
-}
-
-fn is_tracked_link(link: &LinkKind) -> bool {
-    matches!(
-        link,
-        LinkKind::Layer(_) | LinkKind::Config(_) | LinkKind::Manifest(_, _)
-    )
 }
 
 impl Backend {
