@@ -5,7 +5,7 @@ use std::{
     collections::HashMap,
     io::ErrorKind,
     sync::{
-        Arc,
+        Arc, RwLock,
         atomic::{AtomicBool, Ordering},
     },
     time::Duration,
@@ -243,16 +243,13 @@ impl S3LockBackend {
         initial_etags: HashMap<String, String>,
     ) -> LockGuard {
         let valid = Arc::new(AtomicBool::new(true));
+        let etag_cache = Arc::new(RwLock::new(initial_etags));
         let heartbeat_handle =
-            self.spawn_heartbeat(lock_paths.clone(), valid.clone(), initial_etags);
+            self.spawn_heartbeat(lock_paths.clone(), valid.clone(), etag_cache.clone());
         let store = self.store.clone();
         let instance_id = self.instance_id.clone();
         let valid_for_release = valid.clone();
         let supports_conditional_delete = self.supports_conditional_delete;
-        // When conditional DELETE is available, lock release uses delete_if_match to
-        // atomically verify ownership via ETag. When not available, there is a narrow
-        // TOCTOU window between the ownership read and the delete — see
-        // ConditionalCapabilities.delete_if_match.
         LockGuard::with_async_release_and_heartbeat(
             move || {
                 Box::pin(async move {
@@ -260,89 +257,20 @@ impl S3LockBackend {
                         debug!("Lock ownership lost, skipping delete on release");
                         return;
                     }
+                    // Read cached ETags outside the futures so the RwLock guard is not
+                    // held across any await point.
                     let futs: Vec<_> = lock_paths
                         .iter()
                         .map(|path| {
-                            let store = store.clone();
-                            let path = path.clone();
-                            let instance_id = instance_id.clone();
-                            async move {
-                                match store.read_with_etag(&path).await {
-                                    Ok((data, etag)) => {
-                                        match serde_json::from_slice::<S3LockPayload>(&data) {
-                                            Ok(payload) if payload.instance_id == instance_id => {
-                                                if supports_conditional_delete {
-                                                    if let Some(etag) = etag {
-                                                        match store
-                                                            .delete_if_match(&path, &etag)
-                                                            .await
-                                                        {
-                                                            Ok(()) => {}
-                                                            Err(
-                                                                data_store::Error::PreconditionFailed,
-                                                            ) => {
-                                                                debug!(
-                                                                    path,
-                                                                    "Lock ETag changed during \
-                                                                     release, another instance \
-                                                                     owns it"
-                                                                );
-                                                            }
-                                                            Err(e) => {
-                                                                warn!(
-                                                                    path,
-                                                                    error = %e,
-                                                                    "Failed to delete lock on \
-                                                                     release"
-                                                                );
-                                                            }
-                                                        }
-                                                    } else if let Err(e) =
-                                                        store.delete(&path).await
-                                                    {
-                                                        warn!(
-                                                            path,
-                                                            error = %e,
-                                                            "Failed to delete lock on release"
-                                                        );
-                                                    }
-                                                } else if let Err(e) = store.delete(&path).await {
-                                                    warn!(
-                                                        path,
-                                                        error = %e,
-                                                        "Failed to delete lock on release"
-                                                    );
-                                                }
-                                            }
-                                            Ok(payload) => {
-                                                debug!(
-                                                    path,
-                                                    expected = instance_id,
-                                                    found = payload.instance_id,
-                                                    "Lock ownership changed, skipping delete"
-                                                );
-                                            }
-                                            Err(e) => {
-                                                warn!(
-                                                    path,
-                                                    error = %e,
-                                                    "Failed to deserialize lock payload on release, skipping delete"
-                                                );
-                                            }
-                                        }
-                                    }
-                                    Err(e) if e.kind() == ErrorKind::NotFound => {
-                                        debug!(path, "Lock already deleted");
-                                    }
-                                    Err(e) => {
-                                        warn!(
-                                            path,
-                                            error = %e,
-                                            "Failed to read lock for ownership check on release, skipping delete"
-                                        );
-                                    }
-                                }
-                            }
+                            let cached_etag =
+                                etag_cache.read().unwrap().get(path).cloned();
+                            release_lock_path(
+                                store.clone(),
+                                path.clone(),
+                                instance_id.clone(),
+                                cached_etag,
+                                supports_conditional_delete,
+                            )
                         })
                         .collect();
                     join_all(futs).await;
@@ -453,7 +381,7 @@ impl S3LockBackend {
         &self,
         paths: Vec<String>,
         valid: Arc<AtomicBool>,
-        initial_etags: HashMap<String, String>,
+        etag_cache: Arc<RwLock<HashMap<String, String>>>,
     ) -> tokio::task::JoinHandle<()> {
         let store = self.store.clone();
         let instance_id = self.instance_id.clone();
@@ -469,7 +397,6 @@ impl S3LockBackend {
             interval_timer.tick().await; // consume immediate first tick
 
             let mut consecutive_failures: u32 = 0;
-            let mut etag_cache: HashMap<String, String> = initial_etags;
 
             loop {
                 interval_timer.tick().await;
@@ -488,7 +415,7 @@ impl S3LockBackend {
 
                 let results: Vec<(String, HeartbeatPathResult)> =
                     join_all(paths.iter().map(|path| {
-                        let cached_etag = etag_cache.get(path).cloned();
+                        let cached_etag = etag_cache.read().unwrap().get(path).cloned();
                         let store = store.clone();
                         let instance_id = instance_id.clone();
                         let tick_deadline = interval;
@@ -523,10 +450,11 @@ impl S3LockBackend {
                 for (path, result) in results {
                     match result {
                         HeartbeatPathResult::Ok(new_etag) => {
+                            let mut cache = etag_cache.write().unwrap();
                             if let Some(etag) = new_etag {
-                                etag_cache.insert(path, etag);
+                                cache.insert(path, etag);
                             } else {
-                                etag_cache.remove(&path);
+                                cache.remove(&path);
                             }
                         }
                         HeartbeatPathResult::Invalidate(reason) => {
@@ -535,7 +463,7 @@ impl S3LockBackend {
                             return;
                         }
                         HeartbeatPathResult::Failure => {
-                            etag_cache.remove(&path);
+                            etag_cache.write().unwrap().remove(&path);
                             tick_had_failure = true;
                         }
                     }
@@ -667,6 +595,75 @@ async fn heartbeat_tick_path(
         Err(e) => {
             warn!(path, error = %e, "Failed to refresh S3 lock heartbeat");
             HeartbeatPathResult::Failure
+        }
+    }
+}
+
+async fn release_lock_path(
+    store: Arc<data_store::s3::Backend>,
+    path: String,
+    instance_id: String,
+    cached_etag: Option<String>,
+    supports_conditional_delete: bool,
+) {
+    // Fast path: use the heartbeat's cached ETag for an atomic conditional delete
+    // without a preceding GET. A stale ETag (i.e. another instance took over) returns
+    // PreconditionFailed and leaves the new owner's lock intact.
+    if supports_conditional_delete && let Some(etag) = cached_etag {
+        match store.delete_if_match(&path, &etag).await {
+            Ok(()) => {}
+            Err(data_store::Error::PreconditionFailed) => {
+                debug!(path, "Lock ETag changed during release, another instance owns it");
+            }
+            Err(e) => warn!(path, error = %e, "Failed to delete lock on release"),
+        }
+        return;
+    }
+    // Slow path: no cached ETag — verify ownership via GET then delete. Covers the
+    // case where no heartbeat tick has run yet and the non-conditional-delete fallback.
+    match store.read_with_etag(&path).await {
+        Ok((data, etag)) => match serde_json::from_slice::<S3LockPayload>(&data) {
+            Ok(payload) if payload.instance_id == instance_id => {
+                if supports_conditional_delete && let Some(etag) = etag {
+                    match store.delete_if_match(&path, &etag).await {
+                        Ok(()) => {}
+                        Err(data_store::Error::PreconditionFailed) => {
+                            debug!(
+                                path,
+                                "Lock ETag changed during release, another instance owns it"
+                            );
+                        }
+                        Err(e) => warn!(path, error = %e, "Failed to delete lock on release"),
+                    }
+                } else if let Err(e) = store.delete(&path).await {
+                    warn!(path, error = %e, "Failed to delete lock on release");
+                }
+            }
+            Ok(payload) => {
+                debug!(
+                    path,
+                    expected = instance_id,
+                    found = payload.instance_id,
+                    "Lock ownership changed, skipping delete"
+                );
+            }
+            Err(e) => {
+                warn!(
+                    path,
+                    error = %e,
+                    "Failed to deserialize lock payload on release, skipping delete"
+                );
+            }
+        },
+        Err(e) if e.kind() == ErrorKind::NotFound => {
+            debug!(path, "Lock already deleted");
+        }
+        Err(e) => {
+            warn!(
+                path,
+                error = %e,
+                "Failed to read lock for ownership check on release, skipping delete"
+            );
         }
     }
 }

@@ -1983,7 +1983,8 @@ impl Backend {
                 .await
             {
                 Ok(_) => return Ok(link_data),
-                Err(data_store::Error::PreconditionFailed) => continue,
+                Err(data_store::Error::PreconditionFailed) => {}
+
                 Err(e) => return Err(Error::StorageBackend(e.to_string())),
             }
         }

@@ -65,14 +65,15 @@ async fn build_metadata_store(
     let mut metadata_config = config.resolve_metadata_config();
 
     if let MetadataStoreConfig::S3(ref mut backend_config) = metadata_config
-        && backend_config.capabilities.is_none() {
-            let guard = cached_capabilities
-                .lock()
-                .expect("capabilities mutex poisoned");
-            if guard.is_some() {
-                backend_config.capabilities = guard.clone();
-            }
+        && backend_config.capabilities.is_none()
+    {
+        let guard = cached_capabilities
+            .lock()
+            .expect("capabilities mutex poisoned");
+        if guard.is_some() {
+            backend_config.capabilities.clone_from(&guard);
         }
+    }
 
     match metadata_config.to_backend(Some(cache.clone())).await {
         Ok(store) => {

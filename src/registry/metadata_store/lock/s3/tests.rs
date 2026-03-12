@@ -562,11 +562,16 @@ async fn test_lock_release_with_conditional_delete() {
 /// Verifies that when another instance takes over a lock key before the original holder
 /// releases, the release does not delete the new owner's lock object.
 ///
-/// This models the TOCTOU race that `supports_conditional_delete` is designed to guard
-/// against: instance A holds the lock, instance B force-writes a new lock payload
-/// (simulating lock recovery), and then A attempts to release. Because A's release logic
-/// reads the current payload and finds a foreign `instance_id`, it skips the delete and
-/// leaves B's object intact.
+/// Instance A holds the lock. Instance B force-writes a new lock payload (simulating lock
+/// recovery). A then releases. Because `supports_conditional_delete` is false, A falls
+/// back to the slow path: it GETs the current payload, finds B's `instance_id`, and skips
+/// the delete. B's object is left intact.
+///
+/// The complementary fast path (when `supports_conditional_delete` is true on a backend
+/// that properly enforces it) is guaranteed by the `delete_if_match` `ETag` check:
+/// A's cached `ETag` is stale after B's write, so the conditional delete returns
+/// `PreconditionFailed` and B's lock is preserved. `MinIO` does not enforce
+/// `If-Match` on `DeleteObject`, so that path cannot be tested here.
 #[tokio::test]
 async fn test_lock_release_conditional_delete_preserves_recovered_lock() {
     let store = test_store("s3lock_cond_preserve_");
@@ -579,7 +584,7 @@ async fn test_lock_release_conditional_delete_preserves_recovered_lock() {
             max_hold_secs: 300,
             ..Default::default()
         },
-        true,
+        false,
     )
     .unwrap();
 
