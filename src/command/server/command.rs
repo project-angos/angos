@@ -66,7 +66,9 @@ async fn build_metadata_store(
 
     if let MetadataStoreConfig::S3(ref mut backend_config) = metadata_config {
         if backend_config.capabilities.is_none() {
-            let guard = cached_capabilities.lock().expect("capabilities mutex poisoned");
+            let guard = cached_capabilities
+                .lock()
+                .expect("capabilities mutex poisoned");
             if guard.is_some() {
                 backend_config.capabilities = guard.clone();
             }
@@ -75,7 +77,9 @@ async fn build_metadata_store(
 
     match metadata_config.to_backend(Some(cache.clone())).await {
         Ok(store) => {
-            let mut guard = cached_capabilities.lock().expect("capabilities mutex poisoned");
+            let mut guard = cached_capabilities
+                .lock()
+                .expect("capabilities mutex poisoned");
             *guard = store.conditional_capabilities();
             Ok(store)
         }
@@ -555,7 +559,9 @@ mod tests {
             panic!("Expected insecure config")
         };
 
-        let registry = build_registry(&config, &Arc::new(Mutex::new(None))).await.unwrap();
+        let registry = build_registry(&config, &Arc::new(Mutex::new(None)))
+            .await
+            .unwrap();
         let context = ServerContext::new(&config, registry).unwrap();
 
         let insecure_listener = InsecureListener::new(insecure_config, context);
@@ -592,7 +598,10 @@ mod tests {
 
         let blob_store = build_blob_store(&config.blob_store).unwrap();
         let auth_cache = build_auth_cache(&config.cache).unwrap();
-        let metadata_store = build_metadata_store(&config, &auth_cache, &Arc::new(Mutex::new(None))).await.unwrap();
+        let metadata_store =
+            build_metadata_store(&config, &auth_cache, &Arc::new(Mutex::new(None)))
+                .await
+                .unwrap();
         let repositories = build_repositories(&config.repository, &auth_cache).unwrap();
 
         let registry_config = RegistryConfig::new()

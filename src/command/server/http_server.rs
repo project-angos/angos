@@ -16,6 +16,7 @@ use hyper::{
 };
 use hyper_util::rt::TokioIo;
 use opentelemetry::trace::TraceContextExt;
+use serde::Serialize;
 use tokio::{
     io::{AsyncRead, AsyncWrite},
     pin,
@@ -23,8 +24,6 @@ use tokio::{
 use tracing::{Span, debug, error, info, instrument};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 use uuid::Uuid;
-
-use serde::Serialize;
 
 use crate::{
     command::server::{
@@ -673,8 +672,9 @@ async fn handle_readyz(
                 status: "ready",
                 conditional: if verbose { conditional.as_ref() } else { None },
             };
-            let body = serde_json::to_string(&payload)
-                .map_err(|e| Error::Internal(format!("Failed to serialize readyz response: {e}")))?;
+            let body = serde_json::to_string(&payload).map_err(|e| {
+                Error::Internal(format!("Failed to serialize readyz response: {e}"))
+            })?;
             Response::builder()
                 .status(StatusCode::OK)
                 .header(CONTENT_TYPE, "application/json")
@@ -686,8 +686,9 @@ async fn handle_readyz(
                 status: "not_ready",
                 error: e.to_string(),
             };
-            let body = serde_json::to_string(&payload)
-                .map_err(|e| Error::Internal(format!("Failed to serialize readyz response: {e}")))?;
+            let body = serde_json::to_string(&payload).map_err(|e| {
+                Error::Internal(format!("Failed to serialize readyz response: {e}"))
+            })?;
             Response::builder()
                 .status(StatusCode::SERVICE_UNAVAILABLE)
                 .header(CONTENT_TYPE, "application/json")
