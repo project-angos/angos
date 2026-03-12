@@ -262,8 +262,7 @@ impl S3LockBackend {
                     let futs: Vec<_> = lock_paths
                         .iter()
                         .map(|path| {
-                            let cached_etag =
-                                etag_cache.read().unwrap().get(path).cloned();
+                            let cached_etag = etag_cache.read().unwrap().get(path).cloned();
                             release_lock_path(
                                 store.clone(),
                                 path.clone(),
@@ -613,7 +612,10 @@ async fn release_lock_path(
         match store.delete_if_match(&path, &etag).await {
             Ok(()) => {}
             Err(data_store::Error::PreconditionFailed) => {
-                debug!(path, "Lock ETag changed during release, another instance owns it");
+                debug!(
+                    path,
+                    "Lock ETag changed during release, another instance owns it"
+                );
             }
             Err(e) => warn!(path, error = %e, "Failed to delete lock on release"),
         }
