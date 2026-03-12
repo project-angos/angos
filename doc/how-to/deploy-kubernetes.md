@@ -127,13 +127,13 @@ spec:
               mountPath: /data
           livenessProbe:
             httpGet:
-              path: /health
+              path: /healthz
               port: 5000
             initialDelaySeconds: 5
             periodSeconds: 10
           readinessProbe:
             httpGet:
-              path: /health
+              path: /readyz
               port: 5000
             initialDelaySeconds: 5
             periodSeconds: 5
@@ -361,7 +361,7 @@ spec:
 ### Update Configuration
 
 ```toml
-[metadata_store.s3.redis]
+[metadata_store.s3.lock_strategy.redis]
 url = "redis://redis:6379"
 ttl = 10
 

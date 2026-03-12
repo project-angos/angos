@@ -278,5 +278,34 @@ RUST_LOG=angos::registry::access_policy=debug \
 
 ## Reference
 
+### Available Actions
+
+| Action              | Description                          |
+|---------------------|--------------------------------------|
+| `healthz`           | Health check endpoint                |
+| `readyz`            | Readiness check endpoint             |
+| `metrics`           | Prometheus metrics endpoint          |
+| `get-api-version`   | API version check                    |
+| `start-upload`      | Start blob upload                    |
+| `get-upload`        | Get upload status                    |
+| `update-upload`     | Continue chunked upload              |
+| `complete-upload`   | Complete upload                      |
+| `cancel-upload`     | Cancel upload                        |
+| `get-blob`          | Download blob                        |
+| `delete-blob`       | Delete blob                          |
+| `get-manifest`      | Pull manifest                        |
+| `put-manifest`      | Push manifest                        |
+| `delete-manifest`   | Delete manifest                      |
+| `get-referrers`     | Get referrers                        |
+| `list-catalog`      | List repositories (OCI catalog)      |
+| `list-tags`         | List tags                            |
+| `list-repositories` | Extension: list configured repos     |
+| `list-namespaces`   | Extension: list namespaces in a repo |
+| `list-revisions`    | Extension: list manifest revisions   |
+| `list-uploads`      | Extension: list uploads in progress  |
+| `ui-asset`          | UI static assets                     |
+| `ui-config`         | UI configuration                     |
+| `unknown`           | Unrecognized request                 |
+
 - [CEL Expressions Reference](../reference/cel-expressions.md) - All variables and functions
 - [Configuration Reference](../reference/configuration.md) - Policy configuration options
