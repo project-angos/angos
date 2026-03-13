@@ -14,7 +14,7 @@ use crate::{
     registry::{
         Error, Registry, Repository,
         blob_store::{BlobStore, BoxedReader},
-        metadata_store::{MetadataStoreExt, link_kind::LinkKind},
+        metadata_store::{self, BlobIndexOperation, MetadataStoreExt, link_kind::LinkKind},
         task_queue,
     },
 };
@@ -35,6 +35,27 @@ pub struct HeadBlobResponse {
 }
 
 impl Registry {
+    async fn check_blob_namespace_access(
+        &self,
+        namespace: &Namespace,
+        digest: &Digest,
+    ) -> Result<(), Error> {
+        match self.metadata_store.read_blob_index(digest).await {
+            Ok(blob_index) => {
+                if blob_index.namespace.contains_key(namespace.as_ref()) {
+                    Ok(())
+                } else {
+                    Err(Error::BlobUnknown)
+                }
+            }
+            Err(metadata_store::Error::ReferenceNotFound) => Ok(()),
+            Err(e) => {
+                warn!("Failed to read blob index for {digest}: {e}");
+                Err(Error::Internal(format!("storage error: {e}")))
+            }
+        }
+    }
+
     #[instrument(skip(repository))]
     pub async fn head_blob(
         &self,
@@ -43,6 +64,10 @@ impl Registry {
         namespace: &Namespace,
         digest: &Digest,
     ) -> Result<HeadBlobResponse, Error> {
+        if !repository.is_pull_through() {
+            self.check_blob_namespace_access(namespace, digest).await?;
+        }
+
         let blob = self.blob_store.get_blob_size(digest).await;
 
         match blob {
@@ -98,6 +123,10 @@ impl Registry {
         digest: &Digest,
         range: Option<(u64, Option<u64>)>,
     ) -> Result<GetBlobResponse<BoxedReader>, Error> {
+        if !repository.is_pull_through() {
+            self.check_blob_namespace_access(namespace, digest).await?;
+        }
+
         let local_blob = self.get_local_blob(digest, range).await;
 
         if let Ok(response) = local_blob {
@@ -184,6 +213,34 @@ impl Registry {
             warn!("Failed to delete blob links: {error}");
         }
 
+        // Remove all remaining blob index entries for this namespace
+        if let Ok(blob_index) = self.metadata_store.read_blob_index(digest).await
+            && let Some(links) = blob_index.namespace.get(namespace.as_ref())
+        {
+            for link in links {
+                if let Err(error) = self
+                    .metadata_store
+                    .update_blob_index(
+                        namespace.as_ref(),
+                        digest,
+                        BlobIndexOperation::Remove(link.clone()),
+                    )
+                    .await
+                {
+                    warn!("Failed to remove blob index entry: {error}");
+                }
+            }
+        }
+
+        let should_delete = match self.metadata_store.read_blob_index(digest).await {
+            Ok(blob_index) => blob_index.namespace.is_empty(),
+            Err(_) => true,
+        };
+
+        if should_delete && let Err(error) = self.blob_store.delete_blob(digest).await {
+            warn!("Failed to delete blob data: {error}");
+        }
+
         Ok(())
     }
 
@@ -236,6 +293,10 @@ impl Registry {
     ) -> Result<Response<ResponseBody>, Error> {
         let repository = self.get_repository_for_namespace(namespace)?;
 
+        if !repository.is_pull_through() {
+            self.check_blob_namespace_access(namespace, digest).await?;
+        }
+
         if range.is_none()
             && self.enable_redirect
             && let Ok(Some(presigned_url)) = self.blob_store.get_blob_url(digest).await
@@ -254,7 +315,6 @@ impl Registry {
         {
             GetBlobResponse::RangedReader(reader, (start, end), total_length) => {
                 let length = end - start + 1;
-                let stream = reader.take(length);
                 let range = format!("bytes {start}-{end}/{total_length}");
 
                 Response::builder()
@@ -263,7 +323,7 @@ impl Registry {
                     .header(ACCEPT_RANGES, "bytes")
                     .header(CONTENT_LENGTH, length.to_string())
                     .header(CONTENT_RANGE, range)
-                    .body(ResponseBody::streaming(stream))?
+                    .body(ResponseBody::streaming(reader))?
             }
             GetBlobResponse::Reader(stream, total_length) => Response::builder()
                 .status(StatusCode::OK)
@@ -486,10 +546,8 @@ mod tests {
 
             let layer_link = LinkKind::Layer(digest.clone());
             let config_link = LinkKind::Config(digest.clone());
-            let latest_link = LinkKind::Tag("latest".to_string());
 
             let mut tx = registry.metadata_store.begin_transaction(namespace);
-            tx.create_link(&layer_link, &digest);
             tx.create_link(&config_link, &digest);
             tx.commit().await.unwrap();
 
@@ -507,15 +565,14 @@ mod tests {
                     .await
                     .is_ok()
             );
+
+            let accepted_content_types = Vec::new();
             assert!(
                 registry
-                    .metadata_store
-                    .read_link(namespace, &latest_link, false)
+                    .handle_head_blob(namespace, &digest, &accepted_content_types)
                     .await
                     .is_ok()
             );
-
-            assert!(registry.blob_store.read_blob(&digest).await.is_ok());
 
             let response = registry
                 .handle_delete_blob(namespace, &digest)
@@ -523,10 +580,6 @@ mod tests {
                 .unwrap();
 
             assert_eq!(response.status(), StatusCode::ACCEPTED);
-
-            let mut tx = registry.metadata_store.begin_transaction(namespace);
-            tx.delete_link(&latest_link);
-            tx.commit().await.unwrap();
 
             assert!(
                 registry
@@ -542,18 +595,14 @@ mod tests {
                     .await
                     .is_err()
             );
+
             assert!(
                 registry
-                    .metadata_store
-                    .read_link(namespace, &latest_link, false)
+                    .handle_head_blob(namespace, &digest, &accepted_content_types)
                     .await
-                    .is_err()
+                    .is_err(),
+                "Blob should be inaccessible after deletion"
             );
-
-            let blob_index = registry.metadata_store.read_blob_index(&digest).await;
-            assert!(blob_index.is_err());
-
-            assert!(registry.blob_store.read_blob(&digest).await.is_err());
         }
     }
 

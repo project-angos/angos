@@ -79,8 +79,8 @@ fn build_blob_store(config: &blob_store::BlobStorageConfig) -> Result<Arc<dyn Bl
     Ok(blob_store)
 }
 
-fn build_metadata_store(config: &Configuration) -> Result<Arc<dyn MetadataStore>, Error> {
-    match config.resolve_metadata_config().to_backend(None) {
+async fn build_metadata_store(config: &Configuration) -> Result<Arc<dyn MetadataStore>, Error> {
+    match config.resolve_metadata_config().to_backend(None).await {
         Ok(store) => Ok(store),
         Err(err) => {
             let msg = format!("Failed to initialize metadata store: {err}");
@@ -143,9 +143,9 @@ fn build_global_retention_policy(
 }
 
 impl Command {
-    pub fn new(options: &Options, config: &Configuration) -> Result<Self, Error> {
+    pub async fn new(options: &Options, config: &Configuration) -> Result<Self, Error> {
         let blob_store = build_blob_store(&config.blob_store)?;
-        let metadata_store = build_metadata_store(config)?;
+        let metadata_store = build_metadata_store(config).await?;
         let auth_cache = build_auth_cache(&config.cache)?;
         let repositories = build_repositories(&config.repository, &auth_cache)?;
 
@@ -409,7 +409,7 @@ mod tests {
             media_types: false,
         };
 
-        let command = Command::new(&options, &config);
+        let command = Command::new(&options, &config).await;
 
         assert!(command.is_ok());
         let cmd = command.unwrap();
@@ -467,7 +467,7 @@ mod tests {
             media_types: false,
         };
 
-        let command = Command::new(&options, &config).unwrap();
+        let command = Command::new(&options, &config).await.unwrap();
         let result = command.run().await;
 
         assert!(result.is_ok());

@@ -160,10 +160,14 @@ pub mod tests {
         toml::from_str(toml).unwrap()
     }
 
-    pub fn create_test_server_context() -> ServerContext {
+    pub async fn create_test_server_context() -> ServerContext {
         let config = create_test_config();
         let blob_store = config.blob_store.to_backend().unwrap();
-        let metadata_store = config.resolve_metadata_config().to_backend(None).unwrap();
+        let metadata_store = config
+            .resolve_metadata_config()
+            .to_backend(None)
+            .await
+            .unwrap();
         let repositories = Arc::new(HashMap::new());
 
         let registry_config = RegistryConfig::new()
@@ -201,9 +205,13 @@ pub mod tests {
         toml::from_str(toml).unwrap()
     }
 
-    fn create_test_registry(config: &Configuration) -> Registry {
+    async fn create_test_registry(config: &Configuration) -> Registry {
         let blob_store = config.blob_store.to_backend().unwrap();
-        let metadata_store = config.resolve_metadata_config().to_backend(None).unwrap();
+        let metadata_store = config
+            .resolve_metadata_config()
+            .to_backend(None)
+            .await
+            .unwrap();
         let auth_cache = config.cache.to_backend().unwrap();
 
         let mut repositories_map = HashMap::new();
@@ -223,18 +231,18 @@ pub mod tests {
         Registry::new(blob_store, metadata_store, repositories, registry_config).unwrap()
     }
 
-    #[test]
-    fn test_server_context_new_minimal() {
+    #[tokio::test]
+    async fn test_server_context_new_minimal() {
         let config = create_minimal_config();
-        let registry = create_test_registry(&config);
+        let registry = create_test_registry(&config).await;
 
         let context = ServerContext::new(&config, registry);
 
         assert!(context.is_ok());
     }
 
-    #[test]
-    fn test_server_context_new_with_basic_auth() {
+    #[tokio::test]
+    async fn test_server_context_new_with_basic_auth() {
         let salt = SaltString::generate(OsRng);
         let argon_config = Params::default();
         let argon = Argon2::new(Algorithm::Argon2id, Version::V0x13, argon_config);
@@ -265,15 +273,15 @@ pub mod tests {
         );
 
         let config: Configuration = toml::from_str(&toml).unwrap();
-        let registry = create_test_registry(&config);
+        let registry = create_test_registry(&config).await;
 
         let context = ServerContext::new(&config, registry);
 
         assert!(context.is_ok());
     }
 
-    #[test]
-    fn test_server_context_new_with_global_immutable_tags() {
+    #[tokio::test]
+    async fn test_server_context_new_with_global_immutable_tags() {
         let toml = r#"
             [blob_store.fs]
             root_dir = "/tmp/test"
@@ -295,7 +303,7 @@ pub mod tests {
         "#;
 
         let config: Configuration = toml::from_str(toml).unwrap();
-        let registry = create_test_registry(&config);
+        let registry = create_test_registry(&config).await;
 
         let context = ServerContext::new(&config, registry);
 
@@ -305,7 +313,7 @@ pub mod tests {
     #[tokio::test]
     async fn test_authenticate_request_no_credentials() {
         let config = create_minimal_config();
-        let registry = create_test_registry(&config);
+        let registry = create_test_registry(&config).await;
         let context = ServerContext::new(&config, registry).unwrap();
 
         let request = Request::builder().body(()).unwrap();
@@ -350,7 +358,7 @@ pub mod tests {
         );
 
         let config: Configuration = toml::from_str(&toml).unwrap();
-        let registry = create_test_registry(&config);
+        let registry = create_test_registry(&config).await;
         let context = ServerContext::new(&config, registry).unwrap();
 
         let auth_header = format!(
@@ -374,7 +382,7 @@ pub mod tests {
     #[tokio::test]
     async fn test_authenticate_request_with_x_forwarded_for() {
         let config = create_minimal_config();
-        let registry = create_test_registry(&config);
+        let registry = create_test_registry(&config).await;
         let context = ServerContext::new(&config, registry).unwrap();
 
         let request = Request::builder()
@@ -393,7 +401,7 @@ pub mod tests {
     #[tokio::test]
     async fn test_authenticate_request_with_x_forwarded_for_single_ip() {
         let config = create_minimal_config();
-        let registry = create_test_registry(&config);
+        let registry = create_test_registry(&config).await;
         let context = ServerContext::new(&config, registry).unwrap();
 
         let request = Request::builder()
@@ -412,7 +420,7 @@ pub mod tests {
     #[tokio::test]
     async fn test_authenticate_request_with_x_forwarded_for_whitespace() {
         let config = create_minimal_config();
-        let registry = create_test_registry(&config);
+        let registry = create_test_registry(&config).await;
         let context = ServerContext::new(&config, registry).unwrap();
 
         let request = Request::builder()
@@ -431,7 +439,7 @@ pub mod tests {
     #[tokio::test]
     async fn test_authenticate_request_with_x_real_ip() {
         let config = create_minimal_config();
-        let registry = create_test_registry(&config);
+        let registry = create_test_registry(&config).await;
         let context = ServerContext::new(&config, registry).unwrap();
 
         let request = Request::builder()
@@ -450,7 +458,7 @@ pub mod tests {
     #[tokio::test]
     async fn test_authenticate_request_x_forwarded_for_takes_precedence() {
         let config = create_minimal_config();
-        let registry = create_test_registry(&config);
+        let registry = create_test_registry(&config).await;
         let context = ServerContext::new(&config, registry).unwrap();
 
         let request = Request::builder()
@@ -470,7 +478,7 @@ pub mod tests {
     #[tokio::test]
     async fn test_authenticate_request_with_remote_address() {
         let config = create_minimal_config();
-        let registry = create_test_registry(&config);
+        let registry = create_test_registry(&config).await;
         let context = ServerContext::new(&config, registry).unwrap();
 
         let request = Request::builder().body(()).unwrap();
@@ -489,7 +497,7 @@ pub mod tests {
     #[tokio::test]
     async fn test_authenticate_request_x_forwarded_for_overrides_remote_address() {
         let config = create_minimal_config();
-        let registry = create_test_registry(&config);
+        let registry = create_test_registry(&config).await;
         let context = ServerContext::new(&config, registry).unwrap();
 
         let request = Request::builder()
@@ -540,7 +548,7 @@ pub mod tests {
         "#;
 
         let config: Configuration = toml::from_str(toml).unwrap();
-        let registry = create_test_registry(&config);
+        let registry = create_test_registry(&config).await;
         let context = ServerContext::new(&config, registry).unwrap();
 
         let route = Route::GetManifest {
@@ -556,8 +564,8 @@ pub mod tests {
         assert!(result.is_ok());
     }
 
-    #[test]
-    fn test_is_tag_immutable_with_global_setting() {
+    #[tokio::test]
+    async fn test_is_tag_immutable_with_global_setting() {
         let toml = r#"
             [blob_store.fs]
             root_dir = "/tmp/test"
@@ -578,14 +586,14 @@ pub mod tests {
         "#;
 
         let config: Configuration = toml::from_str(toml).unwrap();
-        let registry = create_test_registry(&config);
+        let registry = create_test_registry(&config).await;
         let context = ServerContext::new(&config, registry).unwrap();
 
         assert!(context.is_tag_immutable("test/repo", "v1.0.0"));
     }
 
-    #[test]
-    fn test_is_tag_immutable_with_exclusions() {
+    #[tokio::test]
+    async fn test_is_tag_immutable_with_exclusions() {
         let toml = r#"
             [blob_store.fs]
             root_dir = "/tmp/test"
@@ -607,7 +615,7 @@ pub mod tests {
         "#;
 
         let config: Configuration = toml::from_str(toml).unwrap();
-        let registry = create_test_registry(&config);
+        let registry = create_test_registry(&config).await;
         let context = ServerContext::new(&config, registry).unwrap();
 
         assert!(!context.is_tag_immutable("test/repo", "latest"));
@@ -615,8 +623,8 @@ pub mod tests {
         assert!(context.is_tag_immutable("test/repo", "v1.0.0"));
     }
 
-    #[test]
-    fn test_is_tag_immutable_with_repository_override() {
+    #[tokio::test]
+    async fn test_is_tag_immutable_with_repository_override() {
         let toml = r#"
             [blob_store.fs]
             root_dir = "/tmp/test"
@@ -642,7 +650,7 @@ pub mod tests {
         "#;
 
         let config: Configuration = toml::from_str(toml).unwrap();
-        let registry = create_test_registry(&config);
+        let registry = create_test_registry(&config).await;
         let context = ServerContext::new(&config, registry).unwrap();
 
         assert!(context.is_tag_immutable("myrepo", "v1.0.0"));
@@ -650,8 +658,8 @@ pub mod tests {
         assert!(!context.is_tag_immutable("other/repo", "v1.0.0"));
     }
 
-    #[test]
-    fn test_server_context_new_with_event_webhooks() {
+    #[tokio::test]
+    async fn test_server_context_new_with_event_webhooks() {
         let toml = r#"
             [blob_store.fs]
             root_dir = "/tmp/test"
@@ -676,23 +684,23 @@ pub mod tests {
         "#;
 
         let config: Configuration = toml::from_str(toml).unwrap();
-        let registry = create_test_registry(&config);
+        let registry = create_test_registry(&config).await;
         let context = ServerContext::new(&config, registry).unwrap();
 
         assert!(context.event_dispatcher().is_some());
     }
 
-    #[test]
-    fn test_server_context_new_without_event_webhooks() {
+    #[tokio::test]
+    async fn test_server_context_new_without_event_webhooks() {
         let config = create_minimal_config();
-        let registry = create_test_registry(&config);
+        let registry = create_test_registry(&config).await;
         let context = ServerContext::new(&config, registry).unwrap();
 
         assert!(context.event_dispatcher().is_none());
     }
 
-    #[test]
-    fn test_server_context_event_dispatcher_is_arc_cloneable() {
+    #[tokio::test]
+    async fn test_server_context_event_dispatcher_is_arc_cloneable() {
         let toml = r#"
             [blob_store.fs]
             root_dir = "/tmp/test"
@@ -717,7 +725,7 @@ pub mod tests {
         "#;
 
         let config: Configuration = toml::from_str(toml).unwrap();
-        let registry = create_test_registry(&config);
+        let registry = create_test_registry(&config).await;
         let context = ServerContext::new(&config, registry).unwrap();
 
         let dispatcher: Arc<EventDispatcher> = context.event_dispatcher().unwrap();
@@ -728,7 +736,7 @@ pub mod tests {
     #[tokio::test]
     async fn test_dispatch_event_with_no_dispatcher() {
         let config = create_minimal_config();
-        let registry = create_test_registry(&config);
+        let registry = create_test_registry(&config).await;
         let context = ServerContext::new(&config, registry).unwrap();
 
         let event = Event {
@@ -784,7 +792,7 @@ pub mod tests {
         );
 
         let config: Configuration = toml::from_str(&toml).unwrap();
-        let registry = create_test_registry(&config);
+        let registry = create_test_registry(&config).await;
         let context = ServerContext::new(&config, registry).unwrap();
 
         let event = Event {
@@ -839,7 +847,7 @@ pub mod tests {
         );
 
         let config: Configuration = toml::from_str(&toml).unwrap();
-        let registry = create_test_registry(&config);
+        let registry = create_test_registry(&config).await;
         let context = ServerContext::new(&config, registry).unwrap();
 
         let event = Event {
@@ -862,7 +870,7 @@ pub mod tests {
     async fn test_server_context_shutdown_with_no_dispatcher() {
         // A context without webhooks should be able to shut down without panic
         let config = create_minimal_config();
-        let registry = create_test_registry(&config);
+        let registry = create_test_registry(&config).await;
         let context = ServerContext::new(&config, registry).unwrap();
 
         assert!(context.event_dispatcher().is_none());
@@ -908,7 +916,7 @@ pub mod tests {
         );
 
         let config: Configuration = toml::from_str(&toml).unwrap();
-        let registry = create_test_registry(&config);
+        let registry = create_test_registry(&config).await;
         let context = ServerContext::new(&config, registry).unwrap();
 
         let event = Event {
@@ -973,7 +981,7 @@ pub mod tests {
         );
 
         let config: Configuration = toml::from_str(&toml).unwrap();
-        let registry = create_test_registry(&config);
+        let registry = create_test_registry(&config).await;
         let context = ServerContext::new(&config, registry).unwrap();
 
         // Shut down first, then try to dispatch
@@ -1041,12 +1049,13 @@ pub mod tests {
             bucket: "registry".to_string(),
             region: "region".to_string(),
             key_prefix: unique_prefix.clone(),
-            redis: None,
+            lock_strategy: crate::registry::metadata_store::LockStrategy::Memory,
             link_cache_ttl: 0, // disable link cache so reads go to S3
             access_time_debounce_secs: 3600,
+            capabilities: None,
         };
 
-        let metadata_backend = S3MetadataBackend::new(&s3_config).unwrap();
+        let metadata_backend = S3MetadataBackend::new(&s3_config, None).unwrap();
         let metadata_store: Arc<dyn MetadataStore + Send + Sync> = Arc::new(metadata_backend);
 
         // Build a FS blob store (blobs aren't exercised in this test)
@@ -1145,8 +1154,8 @@ pub mod tests {
         );
     }
 
-    #[test]
-    fn test_server_context_new_invalid_cache_config() {
+    #[tokio::test]
+    async fn test_server_context_new_invalid_cache_config() {
         let toml = r#"
             [blob_store.fs]
             root_dir = "/tmp/test"
@@ -1170,7 +1179,11 @@ pub mod tests {
         let config: Configuration = toml::from_str(toml).unwrap();
 
         let blob_store = config.blob_store.to_backend().unwrap();
-        let metadata_store = config.resolve_metadata_config().to_backend(None).unwrap();
+        let metadata_store = config
+            .resolve_metadata_config()
+            .to_backend(None)
+            .await
+            .unwrap();
         let repositories = Arc::new(HashMap::new());
 
         let registry_config = RegistryConfig::new()

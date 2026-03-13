@@ -21,6 +21,56 @@ pub static AUTH_ATTEMPTS: LazyLock<IntCounterVec> = LazyLock::new(|| {
     .expect("Failed to register auth_attempts metric")
 });
 
+pub static LOCK_ACQUISITION_DURATION: LazyLock<HistogramVec> = LazyLock::new(|| {
+    register_histogram_vec_with_registry!(
+        "lock_acquisition_duration_ms",
+        "Lock acquisition duration in milliseconds",
+        &["backend"],
+        &METRICS_PROVIDER.registry
+    )
+    .expect("Failed to register lock_acquisition_duration_ms metric")
+});
+
+pub static LOCK_ACQUISITIONS: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    register_int_counter_vec_with_registry!(
+        "lock_acquisitions_total",
+        "Total lock acquisition attempts",
+        &["backend", "result"],
+        &METRICS_PROVIDER.registry
+    )
+    .expect("Failed to register lock_acquisitions_total metric")
+});
+
+pub static LOCK_RETRIES: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    register_int_counter_vec_with_registry!(
+        "lock_retries_total",
+        "Total lock acquisition retries",
+        &["backend"],
+        &METRICS_PROVIDER.registry
+    )
+    .expect("Failed to register lock_retries_total metric")
+});
+
+pub static LOCK_INVALIDATIONS: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    register_int_counter_vec_with_registry!(
+        "lock_invalidations_total",
+        "Total lock invalidations",
+        &["backend", "reason"],
+        &METRICS_PROVIDER.registry
+    )
+    .expect("Failed to register lock_invalidations_total metric")
+});
+
+pub static LOCK_RECOVERIES: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    register_int_counter_vec_with_registry!(
+        "lock_recoveries_total",
+        "Total stale lock recovery attempts",
+        &["backend", "result"],
+        &METRICS_PROVIDER.registry
+    )
+    .expect("Failed to register lock_recoveries_total metric")
+});
+
 pub static METRICS_PROVIDER: LazyLock<MetricsProvider> = LazyLock::new(|| {
     MetricsProvider::new()
         .unwrap_or_else(|error| panic!("Unable to create metrics provider: {error}"))

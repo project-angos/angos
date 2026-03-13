@@ -1,6 +1,11 @@
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
 use argh::FromArgs;
+use async_trait::async_trait;
 use tracing::error;
 
 use super::{
@@ -16,8 +21,10 @@ use crate::{
     command::server::error::Error,
     configuration::{Configuration, ServerConfig},
     registry::{
-        Registry, RegistryConfig, Repository, blob_store, blob_store::BlobStore,
-        metadata_store::MetadataStore, repository,
+        Registry, RegistryConfig, Repository, blob_store,
+        blob_store::BlobStore,
+        metadata_store::{ConditionalCapabilities, MetadataStore, MetadataStoreConfig},
+        repository,
     },
     watcher::ConfigNotifier,
 };
@@ -37,6 +44,7 @@ pub struct Options {}
 
 pub struct Command {
     listener: ServiceListener,
+    cached_capabilities: Arc<Mutex<Option<ConditionalCapabilities>>>,
 }
 
 // TODO: deduplicate!
@@ -49,15 +57,32 @@ fn build_blob_store(config: &blob_store::BlobStorageConfig) -> Result<Arc<dyn Bl
     Ok(blob_store)
 }
 
-fn build_metadata_store(
+async fn build_metadata_store(
     config: &Configuration,
     cache: &Arc<dyn Cache>,
+    cached_capabilities: &Arc<Mutex<Option<ConditionalCapabilities>>>,
 ) -> Result<Arc<dyn MetadataStore>, Error> {
-    match config
-        .resolve_metadata_config()
-        .to_backend(Some(cache.clone()))
+    let mut metadata_config = config.resolve_metadata_config();
+
+    if let MetadataStoreConfig::S3(ref mut backend_config) = metadata_config
+        && backend_config.capabilities.is_none()
     {
-        Ok(store) => Ok(store),
+        let guard = cached_capabilities
+            .lock()
+            .expect("capabilities mutex poisoned");
+        if guard.is_some() {
+            backend_config.capabilities.clone_from(&guard);
+        }
+    }
+
+    match metadata_config.to_backend(Some(cache.clone())).await {
+        Ok(store) => {
+            let mut guard = cached_capabilities
+                .lock()
+                .expect("capabilities mutex poisoned");
+            *guard = store.conditional_capabilities();
+            Ok(store)
+        }
         Err(err) => {
             let msg = format!("Failed to initialize metadata store: {err}");
             Err(Error::Initialization(msg))
@@ -102,10 +127,13 @@ fn build_repositories(
     Ok(Arc::new(repositories))
 }
 
-fn build_registry(config: &Configuration) -> Result<Registry, Error> {
+async fn build_registry(
+    config: &Configuration,
+    cached_capabilities: &Arc<Mutex<Option<ConditionalCapabilities>>>,
+) -> Result<Registry, Error> {
     let blob_store = build_blob_store(&config.blob_store)?;
     let auth_cache = build_auth_cache(&config.cache)?;
-    let metadata_store = build_metadata_store(config, &auth_cache)?;
+    let metadata_store = build_metadata_store(config, &auth_cache, cached_capabilities).await?;
     let repositories = build_repositories(&config.repository, &auth_cache)?;
 
     let registry_config = RegistryConfig::new()
@@ -125,9 +153,10 @@ fn build_registry(config: &Configuration) -> Result<Registry, Error> {
 }
 
 impl Command {
-    pub fn new(config: &Configuration) -> Result<Command, Error> {
+    pub async fn new(config: &Configuration) -> Result<Command, Error> {
         // TODO: non-overlapping configuration subset (?) for each of those helpers
-        let registry = build_registry(config)?;
+        let cached_capabilities = Arc::new(Mutex::new(None));
+        let registry = build_registry(config, &cached_capabilities).await?;
         let context = ServerContext::new(config, registry)?;
 
         let listener = match &config.server {
@@ -139,11 +168,14 @@ impl Command {
             }
         };
 
-        Ok(Command { listener })
+        Ok(Command {
+            listener,
+            cached_capabilities,
+        })
     }
 
-    pub fn notify_config_change(&self, config: &Configuration) -> Result<(), Error> {
-        let registry = build_registry(config)?;
+    pub async fn notify_config_change(&self, config: &Configuration) -> Result<(), Error> {
+        let registry = build_registry(config, &self.cached_capabilities).await?;
         let context = ServerContext::new(config, registry)?;
 
         match (&self.listener, &config.server) {
@@ -190,9 +222,10 @@ impl Command {
     }
 }
 
+#[async_trait]
 impl ConfigNotifier for Command {
-    fn notify_config_change(&self, config: &Configuration) {
-        if let Err(e) = self.notify_config_change(config) {
+    async fn notify_config_change(&self, config: &Configuration) {
+        if let Err(e) = self.notify_config_change(config).await {
             error!("Failed to apply configuration: {e}");
         }
     }
@@ -265,17 +298,17 @@ mod tests {
         assert!(result.is_ok());
     }
 
-    #[test]
-    fn test_build_metadata_store_filesystem_success() {
+    #[tokio::test]
+    async fn test_build_metadata_store_filesystem_success() {
         let config = create_minimal_config();
         let auth_cache = build_auth_cache(&config.cache).unwrap();
-        let result = build_metadata_store(&config, &auth_cache);
+        let result = build_metadata_store(&config, &auth_cache, &Arc::new(Mutex::new(None))).await;
 
         assert!(result.is_ok());
     }
 
-    #[test]
-    fn test_build_metadata_store_with_explicit_config() {
+    #[tokio::test]
+    async fn test_build_metadata_store_with_explicit_config() {
         let toml = r#"
             [blob_store.fs]
             root_dir = "/tmp/test-blobs"
@@ -296,7 +329,7 @@ mod tests {
 
         let config: Configuration = toml::from_str(toml).unwrap();
         let auth_cache = build_auth_cache(&config.cache).unwrap();
-        let result = build_metadata_store(&config, &auth_cache);
+        let result = build_metadata_store(&config, &auth_cache, &Arc::new(Mutex::new(None))).await;
 
         assert!(result.is_ok());
     }
@@ -433,24 +466,24 @@ mod tests {
         assert!(repos.contains_key("repo3"));
     }
 
-    #[test]
-    fn test_build_registry_minimal_config() {
+    #[tokio::test]
+    async fn test_build_registry_minimal_config() {
         let config = create_minimal_config();
-        let result = build_registry(&config);
+        let result = build_registry(&config, &Arc::new(Mutex::new(None))).await;
 
         assert!(result.is_ok());
     }
 
-    #[test]
-    fn test_build_registry_with_repositories() {
+    #[tokio::test]
+    async fn test_build_registry_with_repositories() {
         let config = create_config_with_repository();
-        let result = build_registry(&config);
+        let result = build_registry(&config, &Arc::new(Mutex::new(None))).await;
 
         assert!(result.is_ok());
     }
 
-    #[test]
-    fn test_build_registry_with_update_pull_time() {
+    #[tokio::test]
+    async fn test_build_registry_with_update_pull_time() {
         let toml = r#"
             [blob_store.fs]
             root_dir = "/tmp/test-blobs"
@@ -470,15 +503,15 @@ mod tests {
         "#;
 
         let config: Configuration = toml::from_str(toml).unwrap();
-        let result = build_registry(&config);
+        let result = build_registry(&config, &Arc::new(Mutex::new(None))).await;
 
         assert!(result.is_ok());
     }
 
-    #[test]
-    fn test_command_new_insecure_listener() {
+    #[tokio::test]
+    async fn test_command_new_insecure_listener() {
         let config = create_minimal_config();
-        let result = Command::new(&config);
+        let result = Command::new(&config).await;
 
         assert!(result.is_ok());
         let command = result.unwrap();
@@ -489,29 +522,29 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_command_new_with_repositories() {
+    #[tokio::test]
+    async fn test_command_new_with_repositories() {
         let config = create_config_with_repository();
-        let result = Command::new(&config);
+        let result = Command::new(&config).await;
 
         assert!(result.is_ok());
     }
 
-    #[test]
-    fn test_command_notify_config_change_insecure() {
+    #[tokio::test]
+    async fn test_command_notify_config_change_insecure() {
         let config = create_minimal_config();
-        let command = Command::new(&config).unwrap();
+        let command = Command::new(&config).await.unwrap();
 
         let new_config = create_minimal_config();
-        let result = command.notify_config_change(&new_config);
+        let result = command.notify_config_change(&new_config).await;
 
         assert!(result.is_ok());
     }
 
-    #[test]
-    fn test_command_notify_tls_config_change_with_insecure_listener() {
+    #[tokio::test]
+    async fn test_command_notify_tls_config_change_with_insecure_listener() {
         let config = create_minimal_config();
-        let command = Command::new(&config).unwrap();
+        let command = Command::new(&config).await.unwrap();
 
         let (tls_config, _temp_files) = build_config(false);
         let result = command.notify_tls_config_change(&tls_config);
@@ -519,14 +552,16 @@ mod tests {
         assert!(result.is_ok());
     }
 
-    #[test]
-    fn test_service_listener_enum_variants() {
+    #[tokio::test]
+    async fn test_service_listener_enum_variants() {
         let config = create_minimal_config();
         let ServerConfig::Insecure(insecure_config) = &config.server else {
             panic!("Expected insecure config")
         };
 
-        let registry = build_registry(&config).unwrap();
+        let registry = build_registry(&config, &Arc::new(Mutex::new(None)))
+            .await
+            .unwrap();
         let context = ServerContext::new(&config, registry).unwrap();
 
         let insecure_listener = InsecureListener::new(insecure_config, context);
@@ -557,13 +592,16 @@ mod tests {
         assert!(repos.get("delta").is_none());
     }
 
-    #[test]
-    fn test_build_registry_components_integration() {
+    #[tokio::test]
+    async fn test_build_registry_components_integration() {
         let config = create_config_with_repository();
 
         let blob_store = build_blob_store(&config.blob_store).unwrap();
         let auth_cache = build_auth_cache(&config.cache).unwrap();
-        let metadata_store = build_metadata_store(&config, &auth_cache).unwrap();
+        let metadata_store =
+            build_metadata_store(&config, &auth_cache, &Arc::new(Mutex::new(None)))
+                .await
+                .unwrap();
         let repositories = build_repositories(&config.repository, &auth_cache).unwrap();
 
         let registry_config = RegistryConfig::new()
@@ -578,10 +616,10 @@ mod tests {
         assert!(registry.is_ok());
     }
 
-    #[test]
-    fn test_command_new_validates_configuration() {
+    #[tokio::test]
+    async fn test_command_new_validates_configuration() {
         let config = create_minimal_config();
-        let result = Command::new(&config);
+        let result = Command::new(&config).await;
 
         assert!(result.is_ok());
     }
@@ -698,10 +736,10 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_hot_reload_adds_webhook_via_command() {
+    #[tokio::test]
+    async fn test_hot_reload_adds_webhook_via_command() {
         let config = create_minimal_config();
-        let command = Command::new(&config).unwrap();
+        let command = Command::new(&config).await.unwrap();
 
         assert!(
             command
@@ -712,7 +750,7 @@ mod tests {
         );
 
         let new_config = create_config_with_webhook("https://example.com/webhook");
-        command.notify_config_change(&new_config).unwrap();
+        command.notify_config_change(&new_config).await.unwrap();
 
         assert!(
             command
@@ -723,10 +761,10 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_hot_reload_removes_webhook_via_command() {
+    #[tokio::test]
+    async fn test_hot_reload_removes_webhook_via_command() {
         let config = create_config_with_webhook("https://example.com/webhook");
-        let command = Command::new(&config).unwrap();
+        let command = Command::new(&config).await.unwrap();
 
         assert!(
             command
@@ -737,7 +775,7 @@ mod tests {
         );
 
         let new_config = create_minimal_config();
-        command.notify_config_change(&new_config).unwrap();
+        command.notify_config_change(&new_config).await.unwrap();
 
         assert!(
             command
@@ -773,10 +811,10 @@ mod tests {
             .await;
 
         let config_a = create_config_with_webhook(&format!("{}/webhook", server_a.uri()));
-        let command = Command::new(&config_a).unwrap();
+        let command = Command::new(&config_a).await.unwrap();
 
         let config_b = create_config_with_webhook(&format!("{}/webhook", server_b.uri()));
-        command.notify_config_change(&config_b).unwrap();
+        command.notify_config_change(&config_b).await.unwrap();
 
         let context = command.insecure_listener().current_context();
         context.dispatch_event(&create_test_event()).await.unwrap();
@@ -802,10 +840,10 @@ mod tests {
             .await;
 
         let config_one = create_config_with_webhook(&server_a.uri());
-        let command = Command::new(&config_one).unwrap();
+        let command = Command::new(&config_one).await.unwrap();
 
         let config_two = create_config_with_two_webhooks(&server_a.uri(), &server_b.uri());
-        command.notify_config_change(&config_two).unwrap();
+        command.notify_config_change(&config_two).await.unwrap();
 
         let context = command.insecure_listener().current_context();
         context.dispatch_event(&create_test_event()).await.unwrap();
@@ -831,10 +869,10 @@ mod tests {
             .await;
 
         let config_two = create_config_with_two_webhooks(&server_a.uri(), &server_b.uri());
-        let command = Command::new(&config_two).unwrap();
+        let command = Command::new(&config_two).await.unwrap();
 
         let config_one = create_config_with_webhook(&server_a.uri());
-        command.notify_config_change(&config_one).unwrap();
+        command.notify_config_change(&config_one).await.unwrap();
 
         let context = command.insecure_listener().current_context();
         context.dispatch_event(&create_test_event()).await.unwrap();
@@ -860,12 +898,12 @@ mod tests {
             .await;
 
         let config_old = create_config_with_webhook(&server_old.uri());
-        let command = Command::new(&config_old).unwrap();
+        let command = Command::new(&config_old).await.unwrap();
 
         let old_context = Arc::clone(&command.insecure_listener().current_context());
 
         let config_new = create_config_with_webhook(&server_new.uri());
-        command.notify_config_change(&config_new).unwrap();
+        command.notify_config_change(&config_new).await.unwrap();
 
         old_context
             .dispatch_event(&create_test_event())
@@ -923,7 +961,7 @@ mod tests {
             .await;
 
         let valid_config = create_config_with_webhook(&server.uri());
-        let command = Command::new(&valid_config).unwrap();
+        let command = Command::new(&valid_config).await.unwrap();
 
         assert!(
             command
@@ -934,7 +972,7 @@ mod tests {
         );
 
         let invalid_config = create_invalid_cache_config_with_webhook("https://other.example.com");
-        let result = command.notify_config_change(&invalid_config);
+        let result = command.notify_config_change(&invalid_config).await;
         assert!(result.is_err());
 
         assert!(
@@ -969,27 +1007,27 @@ mod tests {
             .await;
 
         let config_a = create_config_with_webhook(&server_a.uri());
-        let command = Command::new(&config_a).unwrap();
+        let command = Command::new(&config_a).await.unwrap();
 
         let invalid_config = create_invalid_cache_config_with_webhook("https://bad.example.com");
-        let result = command.notify_config_change(&invalid_config);
+        let result = command.notify_config_change(&invalid_config).await;
         assert!(result.is_err());
 
         let config_b = create_config_with_webhook(&server_b.uri());
-        command.notify_config_change(&config_b).unwrap();
+        command.notify_config_change(&config_b).await.unwrap();
 
         let context = command.insecure_listener().current_context();
         context.dispatch_event(&create_test_event()).await.unwrap();
     }
 
-    #[test]
-    fn test_config_notifier_trait_handles_reload_error_gracefully() {
+    #[tokio::test]
+    async fn test_config_notifier_trait_handles_reload_error_gracefully() {
         let valid_config = create_minimal_config();
-        let command = Command::new(&valid_config).unwrap();
+        let command = Command::new(&valid_config).await.unwrap();
 
         let invalid_config = create_invalid_cache_config_with_webhook("https://example.com");
 
-        ConfigNotifier::notify_config_change(&command, &invalid_config);
+        ConfigNotifier::notify_config_change(&command, &invalid_config).await;
 
         assert!(
             command
@@ -1004,7 +1042,7 @@ mod tests {
     async fn test_command_shutdown_with_no_dispatcher() {
         // Command with no webhooks should shut down cleanly
         let config = create_minimal_config();
-        let command = Command::new(&config).unwrap();
+        let command = Command::new(&config).await.unwrap();
 
         // shutdown() must exist on Command and complete without panic
         command.shutdown_with_timeout(Duration::from_secs(10)).await;
@@ -1026,7 +1064,7 @@ mod tests {
             .await;
 
         let config = create_config_with_webhook(&server.uri());
-        let command = Command::new(&config).unwrap();
+        let command = Command::new(&config).await.unwrap();
 
         // Dispatch an async event through the current context
         let context = command.insecure_listener().current_context();

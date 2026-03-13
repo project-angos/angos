@@ -71,6 +71,12 @@ impl Cache for Backend {
 
         Ok(None)
     }
+
+    async fn delete_value(&self, key: &str) -> Result<(), Error> {
+        let mut store = self.store.write().await;
+        store.remove(key);
+        Ok(())
+    }
 }
 
 #[cfg(test)]

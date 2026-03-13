@@ -17,6 +17,7 @@ Most configuration changes take effect immediately without restart. The followin
 - `observability.tracing.sampling_rate`
 - Enabling or disabling TLS
 - Changing storage backend type (filesystem ↔ S3)
+- Changing lock strategy
 
 TLS certificate files are also automatically reloaded when they change.
 
@@ -119,27 +120,150 @@ Choose one: `blob_store.fs` or `blob_store.s3`.
 
 Optional. Defaults to same backend as blob store.
 
+### Lock Strategy Compatibility
+
+The following table shows which lock strategies are supported with each metadata store backend:
+
+| Lock Strategy | S3 metadata store | FS metadata store |
+|---------------|-------------------|-------------------|
+| memory        | Yes               | Yes               |
+| redis         | Yes               | Yes               |
+| s3            | Yes               | No                |
+
 ### Filesystem (`metadata_store.fs`)
 
-| Option         | Type   | Default  | Description                                     |
-|----------------|--------|----------|-------------------------------------------------|
-| `root_dir`     | string | -        | Directory for metadata (defaults to blob store) |
-| `sync_to_disk` | bool   | `false`  | Force fsync after writes                        |
+| Option         | Type         | Default    | Description                                     |
+|----------------|--------------|------------|-----------------------------------------------|
+| `root_dir`     | string       | -          | Directory for metadata (defaults to blob store) |
+| `sync_to_disk` | bool         | `false`    | Force fsync after writes                        |
+| `lock_strategy` | string/table | `"memory"` | Lock backend: `"memory"` (string), or `[lock_strategy.redis]` (table form). S3 locking not supported. |
+
+> **Note:** The S3 lock strategy is not supported for filesystem metadata stores. Use `"memory"` for single-instance deployments or `[lock_strategy.redis]` for multi-replica deployments.
 
 ### S3 (`metadata_store.s3`)
 
 Same connection options as `blob_store.s3`, plus:
 
-| Option                      | Type | Default | Description                                                                 |
-|-----------------------------|------|---------|-----------------------------------------------------------------------------|
-| `link_cache_ttl`            | u64  | `30`    | Read-through cache TTL for link metadata, in seconds (0 to disable)         |
-| `access_time_debounce_secs` | u64  | `60`    | Buffer access time writes and flush periodically, in seconds (0 to disable) |
+| Option                      | Type         | Default    | Description                                                                 |
+|-----------------------------|--------------|------------|-----------------------------------------------------------------------------|
+| `link_cache_ttl`            | u64          | `30`       | Read-through cache TTL for link metadata, in seconds (0 to disable)         |
+| `access_time_debounce_secs` | u64          | `60`       | Buffer access time writes and flush periodically, in seconds (0 to disable) |
+| `lock_strategy`             | string/table | `"memory"` | Lock backend: `"memory"` (string), or `[lock_strategy.s3]`/`[lock_strategy.redis]` (table form, see below) |
+| `capabilities`              | table        | -          | Optional S3 conditional operation capabilities; see below                    |
 
 The link cache reduces S3 round-trips for repeated tag/layer reads. The access time debounce batches `last_pulled_at` timestamp writes in memory and flushes them periodically, reducing the critical-path operations per manifest pull from 4 (lock, read, write, unlock) to 1 (read).
 
-### Distributed Locking (`metadata_store.*.redis`)
+#### Conditional Capabilities (`metadata_store.s3.capabilities`)
 
-Required for multi-replica deployments.
+When using S3 as the metadata store, you can declare which conditional write operations your S3-compatible provider supports. This avoids a startup probe and allows optimization of certain operations.
+
+| Option              | Type | Default | Description                                                                                                 |
+|---------------------|------|---------|-------------------------------------------------------------------------------------------------------------|
+| `put_if_none_match` | bool | -       | S3 supports `PutObject` with `If-None-Match: *` (create-only, reject if object exists)                     |
+| `put_if_match`      | bool | -       | S3 supports `PutObject` with `If-Match: <etag>` (update-only, reject if ETag mismatch)                     |
+| `delete_if_match`   | bool | -       | S3 supports `DeleteObject` with `If-Match: <etag>` (conditional delete, reject if ETag mismatch)          |
+
+**Probe behavior:**
+- When `capabilities` table is explicitly configured, the startup probe is skipped entirely. Provide accurate values matching your S3 provider's capabilities.
+- When `capabilities` is omitted:
+  - If `lock_strategy = "s3"`, a startup probe automatically tests each capability and populates the status.
+  - For other lock strategies, capabilities default to all `false` (no probing occurs).
+
+**Example with explicit capabilities (AWS S3):**
+```toml
+[metadata_store.s3.capabilities]
+put_if_none_match = true
+put_if_match = true
+delete_if_match = true
+```
+
+**Example with explicit capabilities (minimal, memory locking):**
+```toml
+[metadata_store.s3]
+lock_strategy = "memory"
+
+[metadata_store.s3.capabilities]
+put_if_none_match = false
+put_if_match = false
+delete_if_match = false
+```
+
+**Example with auto-probe (S3 locking):**
+```toml
+[metadata_store.s3]
+# No capabilities field — probe runs at startup for S3 lock strategy
+[metadata_store.s3.lock_strategy.s3]
+ttl_secs = 30
+```
+
+**Performance impact:**
+- When `put_if_match` is available, access time writes use optimized compare-and-swap (CAS) instead of distributed lock operations, reducing S3 API calls per manifest pull.
+- When `delete_if_match` is available, S3 lock release is atomic and race-condition-free.
+- Both features require both `put_if_none_match` and `put_if_match` to be `true` for full CAS support.
+
+> **Warning:** Setting `access_time_debounce_secs = 0` with S3 lock strategy causes every manifest pull to perform a full lock-acquire → read → write → release cycle via S3 API. At scale with many concurrent pulls, this adds significant latency and S3 API costs. Keep the default value of 60 or higher for S3-locked deployments, or disable access time tracking entirely if not needed for retention policies.
+
+### Distributed Locking
+
+Multi-replica deployments require a distributed lock backend. The `lock_strategy` field on the metadata store selects the backend. Three options are available:
+
+**Lock Strategy Compatibility Matrix:**
+
+| Lock Strategy | S3 metadata | FS metadata |
+|---|---|---|
+| memory | Yes | Yes |
+| redis | Yes | Yes |
+| s3 | Yes | No |
+
+**Memory** (default) — in-process locks, suitable for single-instance deployments only:
+
+```toml
+[metadata_store.s3]
+lock_strategy = "memory"
+```
+
+**S3** — uses S3 conditional writes (`If-None-Match: *`) for distributed locking without extra infrastructure. The S3 provider must support conditional writes; angos verifies this at startup:
+
+```toml
+# With defaults (empty table body; all fields use defaults)
+[metadata_store.s3.lock_strategy.s3]
+
+# With custom settings
+[metadata_store.s3.lock_strategy.s3]
+ttl_secs = 30
+max_retries = 100
+retry_delay_ms = 50
+```
+
+> **Note:** The bare-string form `lock_strategy = "s3"` is not supported; use the table form `[metadata_store.s3.lock_strategy.s3]` to accept defaults or override individual fields.
+
+| Option                          | Type | Default | Description                  |
+|---------------------------------|------|---------|------------------------------|
+| `ttl_secs`                      | u64  | `30`    | Lock TTL in seconds (minimum: 9). Heartbeat renews at intervals of `ttl_secs / 3` |
+| `max_retries`                   | u32  | `100`   | Max lock acquisition retries |
+| `retry_delay_ms`                | u64  | `50`    | Delay between retries (minimum: 1) |
+| `max_hold_secs`                 | u64  | `300`   | Maximum lock hold duration in seconds (minimum: 10, must be >= `ttl_secs`). Guard is invalidated if held beyond this duration |
+| `operation_timeout_secs`        | u64  | `15`    | Total timeout for lock S3 operations |
+| `operation_attempt_timeout_secs`| u64  | `4`     | Per-attempt timeout for lock S3 operations |
+| `max_attempts`                  | u32  | `2`     | Maximum retry attempts for lock S3 operations |
+
+> **Lock operation timeouts:** Lock operations use their own S3 client with significantly tighter timeouts than blob/metadata operations. This is intentional: lock operations are small JSON payloads and should fail fast rather than blocking for minutes on a stuck request. The defaults (`operation_timeout_secs = 15`, `operation_attempt_timeout_secs = 4`, `max_attempts = 2`) ensure that a single stuck request cannot consume an entire heartbeat interval (10s with default TTL). Each heartbeat tick is also capped to the heartbeat interval to prevent the slow path (two sequential SDK calls) from exceeding it. A startup warning is emitted if `operation_attempt_timeout_secs × max_attempts >= ttl_secs / 3`. For high-latency S3 scenarios, increase these values but keep `attempt_timeout × max_attempts` below the heartbeat interval.
+
+**Heartbeat Mechanism:**
+
+The S3 lock implementation uses a heartbeat to keep locks alive. Once acquired, a background task automatically renews the lock at regular intervals of `ttl_secs / 3`. For example, with the default `ttl_secs = 30`, the heartbeat runs every 10 seconds. This allows the lock to remain valid beyond the initial TTL as long as the lock-holder remains alive. If a lock-holder crashes, other instances must wait for the full `ttl_secs` duration before the lock becomes available for recovery.
+
+> **Contention note:** The first lock acquisition attempt uses parallel PUTs for low latency. If any key is contended, the system falls back to sequential sorted acquisition for all subsequent retries, which eliminates circular wait and prevents livelock. When CAS blob index updates are active (S3 lock strategy), blob digest keys are excluded from locking, avoiding cross-namespace contention on shared layers. Randomized jitter on retry delays desynchronises retrying instances.
+
+> **Clock synchronisation:** The lock implementation uses S3's server-side timestamps for expiry checks, so lock correctness does not depend on synchronised instance clocks. Registry instances should still maintain synchronised clocks (NTP) for logging and other operational reasons.
+
+**Redis** — distributed locking via Redis, suitable for multi-instance deployments:
+
+```toml
+[metadata_store.s3.lock_strategy.redis]
+url = "redis://localhost:6379"
+ttl = 10
+```
 
 | Option           | Type   | Default  | Description                  |
 |------------------|--------|----------|------------------------------|
@@ -148,6 +272,8 @@ Required for multi-replica deployments.
 | `key_prefix`     | string | -        | Prefix for lock keys         |
 | `max_retries`    | u32    | `100`    | Max lock acquisition retries |
 | `retry_delay_ms` | u64    | `10`     | Delay between retries        |
+
+> **Legacy form:** The `[metadata_store.*.redis]` table (e.g., `[metadata_store.s3.redis]`) is still accepted for backward compatibility and is equivalent to `[metadata_store.*.lock_strategy.redis]`. New configurations should use the `lock_strategy` form. Both forms cannot be set simultaneously.
 
 ---
 
@@ -266,6 +392,27 @@ Webhooks are enabled by referencing their names:
 | `endpoint`      | string | required | OpenTelemetry endpoint    |
 | `sampling_rate` | f64    | required | Sampling rate (0.0 - 1.0) |
 
+### Prometheus Metrics
+
+Angos emits Prometheus metrics on the `/metrics` endpoint. The following metrics are available for lock operations:
+
+**Lock Metrics:**
+
+| Metric | Type | Labels | Description |
+|--------|------|--------|-------------|
+| `lock_acquisition_duration_ms` | Histogram | `backend` | Lock acquisition duration in milliseconds |
+| `lock_acquisitions_total` | Counter | `backend`, `result` | Total lock acquisition attempts |
+| `lock_retries_total` | Counter | `backend` | Total lock acquisition retries |
+| `lock_invalidations_total` | Counter | `backend`, `reason` | Total lock invalidations |
+| `lock_recoveries_total` | Counter | `backend`, `result` | Total stale lock recovery attempts |
+
+**Label Values:**
+
+- `backend`: `s3`, `redis`, `memory`
+- `result` (acquisitions): `success`, `timeout`, `error`
+- `result` (recoveries): `acquired`, `not_stale`, `failed`, `error`
+- `reason` (invalidations): `ownership_lost`, `max_hold`, `heartbeat_failure`, `etag_unavailable`, `file_disappeared`
+
 ---
 
 ## Web UI (`ui`)
@@ -311,7 +458,7 @@ root_dir = "/var/registry/blobs"
 [metadata_store.fs]
 root_dir = "/var/registry/metadata"
 
-[metadata_store.fs.redis]
+[metadata_store.fs.lock_strategy.redis]
 url = "redis://localhost:6379"
 ttl = 10
 
@@ -336,4 +483,39 @@ url = "https://registry-1.docker.io"
 [ui]
 enabled = true
 name = "My Registry"
+```
+
+### S3-Only Multi-Instance Deployment
+
+This example uses S3 for both blob and metadata storage with S3-based distributed locking, eliminating the need for Redis:
+
+```toml
+[server]
+bind_address = "0.0.0.0"
+port = 5000
+
+[global]
+update_pull_time = true
+
+[blob_store.s3]
+# Example credentials - replace for production
+access_key_id = "minioadmin"
+secret_key = "minioadmin"
+endpoint = "https://s3.example.com"
+bucket = "registry"
+region = "us-east-1"
+
+[metadata_store.s3]
+# Example credentials - replace for production
+access_key_id = "minioadmin"
+secret_key = "minioadmin"
+endpoint = "https://s3.example.com"
+bucket = "registry-metadata"
+region = "us-east-1"
+
+[metadata_store.s3.lock_strategy.s3]
+
+[auth.identity.admin]
+username = "admin"
+password = "$argon2id$v=19$m=19456,t=2,p=1$..."
 ```

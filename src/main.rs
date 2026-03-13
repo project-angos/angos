@@ -145,12 +145,12 @@ async fn run_command(cli_args: GlobalArguments, config: Configuration) {
 }
 
 async fn run_scrub(options: scrub::Options, config: Configuration) -> Result<(), scrub::Error> {
-    let scrub = scrub::Command::new(&options, &config)?;
+    let scrub = scrub::Command::new(&options, &config).await?;
     scrub.run().await
 }
 
 async fn run_server(options: GlobalArguments, config: Configuration) -> Result<(), server::Error> {
-    let server = Arc::new(server::Command::new(&config)?);
+    let server = Arc::new(server::Command::new(&config).await?);
 
     let Ok(_watcher) = ConfigWatcher::new(&options.config, server.clone()) else {
         error!("Failed to start configuration watcher");

@@ -488,8 +488,8 @@ PpGhlTQXVV6Evtahtp+cRw==
         }
     }
 
-    #[test]
-    fn test_tls_listener_new() {
+    #[tokio::test]
+    async fn test_tls_listener_new() {
         init_crypto_provider();
 
         let (tls, _temp_files) = build_config(false);
@@ -502,7 +502,7 @@ PpGhlTQXVV6Evtahtp+cRw==
             tls,
         };
 
-        let context = create_test_server_context();
+        let context = create_test_server_context().await;
         let result = TlsListener::new(&config, context);
 
         assert!(result.is_ok());
@@ -513,8 +513,8 @@ PpGhlTQXVV6Evtahtp+cRw==
         );
     }
 
-    #[test]
-    fn test_tls_listener_new_with_ipv6() {
+    #[tokio::test]
+    async fn test_tls_listener_new_with_ipv6() {
         init_crypto_provider();
         let (tls, _temp_files) = build_config(false);
 
@@ -526,7 +526,7 @@ PpGhlTQXVV6Evtahtp+cRw==
             tls,
         };
 
-        let context = create_test_server_context();
+        let context = create_test_server_context().await;
         let result = TlsListener::new(&config, context);
 
         assert!(result.is_ok());
@@ -538,8 +538,8 @@ PpGhlTQXVV6Evtahtp+cRw==
         assert_eq!(listener.binding_address.port(), 9443);
     }
 
-    #[test]
-    fn test_tls_listener_new_with_invalid_certs() {
+    #[tokio::test]
+    async fn test_tls_listener_new_with_invalid_certs() {
         init_crypto_provider();
         let cert_file = create_temp_cert_file("invalid");
         let key_file = create_temp_cert_file("invalid");
@@ -556,14 +556,14 @@ PpGhlTQXVV6Evtahtp+cRw==
             tls,
         };
 
-        let context = create_test_server_context();
+        let context = create_test_server_context().await;
         let result = TlsListener::new(&config, context);
 
         assert!(result.is_err());
     }
 
-    #[test]
-    fn test_tls_listener_notify_config_change() {
+    #[tokio::test]
+    async fn test_tls_listener_notify_config_change() {
         init_crypto_provider();
         let (tls, _temp_files) = build_config(false);
 
@@ -575,17 +575,17 @@ PpGhlTQXVV6Evtahtp+cRw==
             tls,
         };
 
-        let context1 = create_test_server_context();
+        let context1 = create_test_server_context().await;
         let listener = TlsListener::new(&config, context1).unwrap();
 
-        let context2 = create_test_server_context();
+        let context2 = create_test_server_context().await;
         let result = listener.notify_config_change(&config, context2);
 
         assert!(result.is_ok());
     }
 
-    #[test]
-    fn test_tls_listener_notify_tls_config_change() {
+    #[tokio::test]
+    async fn test_tls_listener_notify_tls_config_change() {
         init_crypto_provider();
         let (tls, _temp_files) = build_config(false);
 
@@ -597,7 +597,7 @@ PpGhlTQXVV6Evtahtp+cRw==
             tls,
         };
 
-        let context = create_test_server_context();
+        let context = create_test_server_context().await;
         let listener = TlsListener::new(&config, context).unwrap();
 
         let (tls, _temp_files) = build_config(false);
@@ -606,8 +606,8 @@ PpGhlTQXVV6Evtahtp+cRw==
         assert!(result.is_ok());
     }
 
-    #[test]
-    fn test_tls_listener_notify_tls_config_change_with_invalid_certs() {
+    #[tokio::test]
+    async fn test_tls_listener_notify_tls_config_change_with_invalid_certs() {
         init_crypto_provider();
 
         let (tls, _temp_files) = build_config(false);
@@ -619,7 +619,7 @@ PpGhlTQXVV6Evtahtp+cRw==
             tls,
         };
 
-        let context = create_test_server_context();
+        let context = create_test_server_context().await;
         let listener = TlsListener::new(&config, context).unwrap();
 
         let (mut tls_config, _tmp_files) = build_config(true);

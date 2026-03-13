@@ -251,10 +251,10 @@ sudo chown -R $(id -u):$(id -g) /data/registry
 
 **Cause**: Concurrent operations on same resource.
 
-**Solutions**:
-1. For multi-replica, configure Redis locking:
+**Solutions for Redis locking**:
+1. Configure Redis locking (use `lock_strategy.redis` form):
    ```toml
-   [metadata_store.fs.redis]
+   [metadata_store.fs.lock_strategy.redis]
    url = "redis://localhost:6379"
    ttl = 10
    max_retries = 100
@@ -262,6 +262,24 @@ sudo chown -R $(id -u):$(id -g) /data/registry
 
 2. Increase retry settings
 3. Check for stuck processes
+
+**Solutions for S3 locking**:
+1. Stale locks under the `_locks/` prefix are automatically recovered after TTL expiry
+2. If operations take longer than the TTL, increase `ttl_secs` (minimum: 9):
+   ```toml
+   [metadata_store.s3.lock_strategy.s3]
+   ttl_secs = 60
+   ```
+   The heartbeat interval is automatically set to `ttl_secs / 3`, so this example will heartbeat every 20 seconds.
+
+3. For high contention, increase `max_retries` and `retry_delay_ms`:
+   ```toml
+   [metadata_store.s3.lock_strategy.s3]
+   max_retries = 200
+   retry_delay_ms = 100
+   ```
+
+4. If the startup probe fails, your S3 provider may not support conditional writes — fall back to Redis locking instead. S3 locking is only supported when using S3 for metadata storage; it cannot be used with filesystem metadata stores.
 
 ---
 

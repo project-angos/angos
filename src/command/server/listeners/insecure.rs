@@ -186,8 +186,8 @@ mod tests {
         assert_eq!(config.port, 8443);
     }
 
-    #[test]
-    fn test_insecure_listener_new() {
+    #[tokio::test]
+    async fn test_insecure_listener_new() {
         let config = Config {
             bind_address: "127.0.0.1".parse().unwrap(),
             port: 8080,
@@ -195,7 +195,7 @@ mod tests {
             query_timeout_grace_period: 30,
         };
 
-        let context = create_test_server_context();
+        let context = create_test_server_context().await;
         let listener = InsecureListener::new(&config, context);
 
         assert_eq!(
@@ -204,8 +204,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_insecure_listener_new_with_ipv6() {
+    #[tokio::test]
+    async fn test_insecure_listener_new_with_ipv6() {
         let config = Config {
             bind_address: "::1".parse().unwrap(),
             port: 9000,
@@ -213,7 +213,7 @@ mod tests {
             query_timeout_grace_period: 60,
         };
 
-        let context = create_test_server_context();
+        let context = create_test_server_context().await;
         let listener = InsecureListener::new(&config, context);
 
         assert_eq!(
@@ -223,18 +223,18 @@ mod tests {
         assert_eq!(listener.binding_address.port(), 9000);
     }
 
-    #[test]
-    fn test_insecure_listener_notify_config_change() {
+    #[tokio::test]
+    async fn test_insecure_listener_notify_config_change() {
         let config = Config::default();
-        let context1 = create_test_server_context();
+        let context1 = create_test_server_context().await;
         let listener = InsecureListener::new(&config, context1);
 
-        let context2 = create_test_server_context();
+        let context2 = create_test_server_context().await;
         listener.notify_config_change(context2);
     }
 
-    #[test]
-    fn test_insecure_listener_timeouts_initialization() {
+    #[tokio::test]
+    async fn test_insecure_listener_timeouts_initialization() {
         let config = Config {
             bind_address: "127.0.0.1".parse().unwrap(),
             port: 8080,
@@ -242,7 +242,7 @@ mod tests {
             query_timeout_grace_period: 100,
         };
 
-        let context = create_test_server_context();
+        let context = create_test_server_context().await;
         let listener = InsecureListener::new(&config, context);
 
         let timeouts = listener.timeouts.load();
@@ -250,8 +250,8 @@ mod tests {
         assert_eq!(timeouts[1], Duration::from_secs(100));
     }
 
-    #[test]
-    fn test_insecure_listener_with_zero_port() {
+    #[tokio::test]
+    async fn test_insecure_listener_with_zero_port() {
         let config = Config {
             bind_address: "127.0.0.1".parse().unwrap(),
             port: 0,
@@ -259,20 +259,20 @@ mod tests {
             query_timeout_grace_period: 60,
         };
 
-        let context = create_test_server_context();
+        let context = create_test_server_context().await;
         let listener = InsecureListener::new(&config, context);
 
         assert_eq!(listener.binding_address.port(), 0);
     }
 
-    #[test]
-    fn test_insecure_listener_multiple_config_changes() {
+    #[tokio::test]
+    async fn test_insecure_listener_multiple_config_changes() {
         let config = Config::default();
-        let context1 = create_test_server_context();
+        let context1 = create_test_server_context().await;
         let listener = InsecureListener::new(&config, context1);
 
         for _ in 0..5 {
-            let context = create_test_server_context();
+            let context = create_test_server_context().await;
             listener.notify_config_change(context);
         }
     }
@@ -306,9 +306,13 @@ mod tests {
         toml::from_str(&toml).unwrap()
     }
 
-    fn create_server_context_from_config(config: &Configuration) -> ServerContext {
+    async fn create_server_context_from_config(config: &Configuration) -> ServerContext {
         let blob_store = config.blob_store.to_backend().unwrap();
-        let metadata_store = config.resolve_metadata_config().to_backend(None).unwrap();
+        let metadata_store = config
+            .resolve_metadata_config()
+            .to_backend(None)
+            .await
+            .unwrap();
         let repositories = Arc::new(HashMap::new());
 
         let registry_config = RegistryConfig::new()
@@ -338,31 +342,31 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_hot_reload_updates_webhook_config() {
+    #[tokio::test]
+    async fn test_hot_reload_updates_webhook_config() {
         let listener_config = Config::default();
-        let context_without_webhooks = create_test_server_context();
+        let context_without_webhooks = create_test_server_context().await;
         let listener = InsecureListener::new(&listener_config, context_without_webhooks);
 
         assert!(listener.current_context().event_dispatcher().is_none());
 
         let config_with_webhook = create_config_with_webhook("https://example.com/webhook");
-        let context_with_webhooks = create_server_context_from_config(&config_with_webhook);
+        let context_with_webhooks = create_server_context_from_config(&config_with_webhook).await;
         listener.notify_config_change(context_with_webhooks);
 
         assert!(listener.current_context().event_dispatcher().is_some());
     }
 
-    #[test]
-    fn test_hot_reload_removes_webhooks() {
+    #[tokio::test]
+    async fn test_hot_reload_removes_webhooks() {
         let listener_config = Config::default();
         let config_with_webhook = create_config_with_webhook("https://example.com/webhook");
-        let context_with_webhooks = create_server_context_from_config(&config_with_webhook);
+        let context_with_webhooks = create_server_context_from_config(&config_with_webhook).await;
         let listener = InsecureListener::new(&listener_config, context_with_webhooks);
 
         assert!(listener.current_context().event_dispatcher().is_some());
 
-        let context_without_webhooks = create_test_server_context();
+        let context_without_webhooks = create_test_server_context().await;
         listener.notify_config_change(context_without_webhooks);
 
         assert!(listener.current_context().event_dispatcher().is_none());
@@ -389,11 +393,11 @@ mod tests {
 
         let listener_config = Config::default();
         let config_a = create_config_with_webhook(&format!("{}/webhook", server_a.uri()));
-        let context_a = create_server_context_from_config(&config_a);
+        let context_a = create_server_context_from_config(&config_a).await;
         let listener = InsecureListener::new(&listener_config, context_a);
 
         let config_b = create_config_with_webhook(&format!("{}/webhook", server_b.uri()));
-        let context_b = create_server_context_from_config(&config_b);
+        let context_b = create_server_context_from_config(&config_b).await;
         listener.notify_config_change(context_b);
 
         let current_context = listener.current_context();
@@ -454,11 +458,11 @@ mod tests {
 
         let listener_config = Config::default();
         let config_one = create_config_with_webhook(&server_a.uri());
-        let context_one = create_server_context_from_config(&config_one);
+        let context_one = create_server_context_from_config(&config_one).await;
         let listener = InsecureListener::new(&listener_config, context_one);
 
         let config_two = create_config_with_two_webhooks(&server_a.uri(), &server_b.uri());
-        let context_two = create_server_context_from_config(&config_two);
+        let context_two = create_server_context_from_config(&config_two).await;
         listener.notify_config_change(context_two);
 
         let context = listener.current_context();
@@ -484,11 +488,11 @@ mod tests {
 
         let listener_config = Config::default();
         let config_two = create_config_with_two_webhooks(&server_a.uri(), &server_b.uri());
-        let context_two = create_server_context_from_config(&config_two);
+        let context_two = create_server_context_from_config(&config_two).await;
         let listener = InsecureListener::new(&listener_config, context_two);
 
         let config_one = create_config_with_webhook(&server_b.uri());
-        let context_one = create_server_context_from_config(&config_one);
+        let context_one = create_server_context_from_config(&config_one).await;
         listener.notify_config_change(context_one);
 
         let context = listener.current_context();
@@ -514,13 +518,13 @@ mod tests {
 
         let listener_config = Config::default();
         let config_old = create_config_with_webhook(&server_old.uri());
-        let context_old = create_server_context_from_config(&config_old);
+        let context_old = create_server_context_from_config(&config_old).await;
         let listener = InsecureListener::new(&listener_config, context_old);
 
         let old_context = Arc::clone(&listener.current_context());
 
         let config_new = create_config_with_webhook(&server_new.uri());
-        let context_new = create_server_context_from_config(&config_new);
+        let context_new = create_server_context_from_config(&config_new).await;
         listener.notify_config_change(context_new);
 
         old_context
@@ -529,11 +533,11 @@ mod tests {
             .unwrap();
     }
 
-    #[test]
-    fn test_hot_reload_invalid_webhook_config_preserves_old_context() {
+    #[tokio::test]
+    async fn test_hot_reload_invalid_webhook_config_preserves_old_context() {
         let listener_config = Config::default();
         let config_valid = create_config_with_webhook("https://example.com/webhook");
-        let context_valid = create_server_context_from_config(&config_valid);
+        let context_valid = create_server_context_from_config(&config_valid).await;
         let listener = InsecureListener::new(&listener_config, context_valid);
 
         assert!(listener.current_context().event_dispatcher().is_some());
@@ -568,6 +572,7 @@ mod tests {
         let metadata_store = invalid_config
             .resolve_metadata_config()
             .to_backend(None)
+            .await
             .unwrap();
         let repositories = Arc::new(HashMap::new());
 

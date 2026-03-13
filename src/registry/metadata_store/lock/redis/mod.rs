@@ -8,8 +8,15 @@ use redis::Client;
 use tokio::{sync::Notify, task::JoinHandle, time::sleep};
 use tracing::debug;
 
-use crate::registry::metadata_store::{Error, lock::LockBackend};
+use crate::{
+    metrics_provider::{LOCK_ACQUISITION_DURATION, LOCK_ACQUISITIONS, LOCK_RETRIES},
+    registry::metadata_store::{
+        Error,
+        lock::{LockBackend, LockGuard},
+    },
+};
 
+// ARGV[1] = instance_id, ARGV[2] = ttl
 const ACQUIRE_SCRIPT: &str = r"
 for i, key in ipairs(KEYS) do
     if redis.call('EXISTS', key) == 1 then
@@ -22,16 +29,22 @@ end
 return 1
 ";
 
+// ARGV[1] = instance_id
 const RELEASE_SCRIPT: &str = r"
 for i, key in ipairs(KEYS) do
-    redis.call('DEL', key)
+    if redis.call('GET', key) == ARGV[1] then
+        redis.call('DEL', key)
+    end
 end
 return 1
 ";
 
+// ARGV[1] = ttl, ARGV[2] = instance_id
 const REFRESH_SCRIPT: &str = r"
 for i, key in ipairs(KEYS) do
-    redis.call('EXPIRE', key, ARGV[1])
+    if redis.call('GET', key) == ARGV[2] then
+        redis.call('EXPIRE', key, ARGV[1])
+    end
 end
 return 1
 ";
@@ -73,6 +86,7 @@ impl Default for LockConfig {
 #[derive(Debug, Clone)]
 pub struct RedisBackend {
     client: Arc<Client>,
+    instance_id: String,
     ttl: usize,
     key_prefix: String,
     max_retries: u32,
@@ -84,11 +98,42 @@ impl RedisBackend {
         let client = Arc::new(Client::open(config.url.clone())?);
         Ok(RedisBackend {
             client,
+            instance_id: uuid::Uuid::new_v4().to_string(),
             ttl: config.ttl,
             key_prefix: config.key_prefix.clone(),
             max_retries: config.max_retries,
             retry_delay_ms: config.retry_delay_ms,
         })
+    }
+
+    fn spawn_refresh_task(&self, keys: Vec<String>) -> (JoinHandle<()>, Arc<Notify>) {
+        let client = self.client.clone();
+        let ttl = self.ttl;
+        let instance_id = self.instance_id.clone();
+        let refresh_interval = Duration::from_secs((ttl / 2) as u64);
+        let stop_notify = Arc::new(Notify::new());
+        let stop_notify_clone = stop_notify.clone();
+
+        let handle = tokio::spawn(async move {
+            let Ok(mut conn) = client.get_multiplexed_async_connection().await else {
+                return;
+            };
+            loop {
+                tokio::select! {
+                    () = sleep(refresh_interval) => {
+                        let _: redis::RedisResult<i32> = redis::Script::new(REFRESH_SCRIPT)
+                            .key(&keys)
+                            .arg(ttl)
+                            .arg(&instance_id)
+                            .invoke_async(&mut conn)
+                            .await;
+                    }
+                    () = stop_notify_clone.notified() => break,
+                }
+            }
+        });
+
+        (handle, stop_notify)
     }
 }
 
@@ -97,6 +142,7 @@ pub struct RedisGuard {
     stop_notify: Arc<Notify>,
     client: Arc<Client>,
     keys: Vec<String>,
+    instance_id: String,
 }
 
 impl Drop for RedisGuard {
@@ -107,6 +153,7 @@ impl Drop for RedisGuard {
         if let Ok(mut conn) = self.client.get_connection() {
             let _: redis::RedisResult<i32> = redis::Script::new(RELEASE_SCRIPT)
                 .key(&self.keys)
+                .arg(&self.instance_id)
                 .invoke(&mut conn);
         }
     }
@@ -114,17 +161,18 @@ impl Drop for RedisGuard {
 
 #[async_trait]
 impl LockBackend for RedisBackend {
-    type Guard = Box<dyn Send>;
-
-    async fn acquire(&self, keys: &[String]) -> Result<Self::Guard, Error> {
+    async fn acquire(&self, keys: &[String]) -> Result<LockGuard, Error> {
         if keys.is_empty() {
-            return Ok(Box::new(RedisGuard {
+            return Ok(LockGuard::sync(Box::new(RedisGuard {
                 refresh_handle: tokio::spawn(async {}),
                 stop_notify: Arc::new(Notify::new()),
                 client: self.client.clone(),
                 keys: Vec::new(),
-            }));
+                instance_id: self.instance_id.clone(),
+            })));
         }
+
+        let start = std::time::Instant::now();
 
         let lock_keys: Vec<String> = keys
             .iter()
@@ -134,59 +182,67 @@ impl LockBackend for RedisBackend {
         let retry_delay = Duration::from_millis(self.retry_delay_ms);
 
         loop {
-            let mut conn = self.client.get_multiplexed_async_connection().await?;
+            let mut conn = self
+                .client
+                .get_multiplexed_async_connection()
+                .await
+                .inspect_err(|_| {
+                    LOCK_ACQUISITION_DURATION
+                        .with_label_values(&["redis"])
+                        .observe(start.elapsed().as_secs_f64() * 1000.0);
+                    LOCK_ACQUISITIONS
+                        .with_label_values(&["redis", "error"])
+                        .inc();
+                })?;
 
             let acquired: i32 = redis::Script::new(ACQUIRE_SCRIPT)
                 .key(&lock_keys)
-                .arg(1)
+                .arg(&self.instance_id)
                 .arg(self.ttl)
                 .invoke_async(&mut conn)
-                .await?;
+                .await
+                .inspect_err(|_| {
+                    LOCK_ACQUISITION_DURATION
+                        .with_label_values(&["redis"])
+                        .observe(start.elapsed().as_secs_f64() * 1000.0);
+                    LOCK_ACQUISITIONS
+                        .with_label_values(&["redis", "error"])
+                        .inc();
+                })?;
 
             if acquired == 1 {
-                let stop_notify = Arc::new(Notify::new());
-                let client = self.client.clone();
-                let keys_for_refresh = lock_keys.clone();
-                let ttl = self.ttl;
-                let refresh_interval = Duration::from_secs((ttl / 2) as u64);
-                let stop_notify_clone = stop_notify.clone();
+                let (refresh_handle, stop_notify) = self.spawn_refresh_task(lock_keys.clone());
 
-                let refresh_handle = tokio::spawn(async move {
-                    let Ok(mut conn) = client.get_multiplexed_async_connection().await else {
-                        return;
-                    };
+                LOCK_ACQUISITION_DURATION
+                    .with_label_values(&["redis"])
+                    .observe(start.elapsed().as_secs_f64() * 1000.0);
+                LOCK_ACQUISITIONS
+                    .with_label_values(&["redis", "success"])
+                    .inc();
 
-                    loop {
-                        tokio::select! {
-                            () = sleep(refresh_interval) => {
-                                let _: redis::RedisResult<i32> = redis::Script::new(REFRESH_SCRIPT)
-                                    .key(&keys_for_refresh)
-                                    .arg(ttl)
-                                    .invoke_async(&mut conn)
-                                    .await;
-                            }
-                            () = stop_notify_clone.notified() => {
-                                break;
-                            }
-                        }
-                    }
-                });
-
-                return Ok(Box::new(RedisGuard {
+                return Ok(LockGuard::sync(Box::new(RedisGuard {
                     refresh_handle,
                     stop_notify,
                     client: self.client.clone(),
                     keys: lock_keys,
-                }));
+                    instance_id: self.instance_id.clone(),
+                })));
             }
 
             if retries == 0 {
+                LOCK_ACQUISITION_DURATION
+                    .with_label_values(&["redis"])
+                    .observe(start.elapsed().as_secs_f64() * 1000.0);
+                LOCK_ACQUISITIONS
+                    .with_label_values(&["redis", "timeout"])
+                    .inc();
                 return Err(Error::Lock(format!(
                     "Failed to acquire locks for keys: {keys:?}"
                 )));
             }
 
             retries -= 1;
+            LOCK_RETRIES.with_label_values(&["redis"]).inc();
             debug!("Lock busy, retrying... ({} attempts left)", retries);
             tokio::time::sleep(retry_delay).await;
         }

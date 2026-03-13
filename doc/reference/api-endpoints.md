@@ -227,13 +227,56 @@ List blob uploads in progress.
 
 ## Health and Metrics
 
-### Health Check
+### Health Check (Liveness)
 
 ```
 GET /healthz
 ```
 
-Returns `200 OK` if the service is healthy.
+Returns `200 OK` if the service is running. Use this for Kubernetes liveness probes to detect hung processes.
+
+### Readiness Check
+
+```
+GET /readyz
+```
+
+Returns `200 OK` if the storage backend is healthy and ready to handle requests. Checks accessibility of the blob store, metadata store, and lock backend.
+
+Use this for Kubernetes readiness probes to detect when a replica is unable to serve traffic.
+
+**Success Response:**
+```json
+{"status":"ready"}
+```
+
+Add `?verbose=true` to the query string to include conditional operation capabilities (S3 metadata store only):
+
+```
+GET /readyz?verbose=true
+```
+
+**Verbose Success Response (S3 metadata store):**
+```json
+{
+  "status": "ready",
+  "conditional": {
+    "put_if_none_match": true,
+    "put_if_match": true,
+    "delete_if_match": true
+  }
+}
+```
+
+**Verbose Success Response (filesystem metadata store):**
+```json
+{"status":"ready"}
+```
+
+**Service Unavailable Response (503):**
+```json
+{"status":"not_ready","error":"storage backend not ready: ..."}
+```
 
 ### Prometheus Metrics
 
@@ -278,7 +321,7 @@ Returns UI configuration.
 
 ## Authentication
 
-All endpoints (except `/healthz`) require authentication when access policies are configured.
+All endpoints (except `/healthz` and `/readyz`) require authentication when access policies are configured.
 
 ### Methods
 

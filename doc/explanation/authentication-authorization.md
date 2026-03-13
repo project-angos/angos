@@ -143,7 +143,7 @@ sequenceDiagram
     Policy-->>Registry: Allow/Deny
 
     opt Webhook configured
-        Registry->>Webhook: GET /authorize
+        Registry->>Webhook: POST <configured webhook URL>
         Webhook-->>Registry: 2xx (allow) or other (deny)
     end
 
@@ -257,7 +257,7 @@ sequenceDiagram
     participant Registry
     participant Webhook
 
-    Registry->>Webhook: GET /authorize
+    Registry->>Webhook: POST <configured webhook URL>
     Note right of Webhook: Headers contain request context
     Webhook-->>Registry: 200 OK (allow)
     Webhook-->>Registry: 403 Forbidden (deny)

@@ -224,13 +224,62 @@ root_dir = "/data"
 [metadata_store.fs]
 root_dir = "/data"
 
-[metadata_store.fs.redis]
+[metadata_store.fs.lock_strategy.redis]
 url = "redis://redis:6379"
 ttl = 10
 
 [cache.redis]
 url = "redis://redis:6379"
 ```
+
+---
+
+## With S3 Locking for Multi-Replica
+
+If your S3 provider supports conditional writes, you can run multiple replicas without Redis by using S3-based locking.
+
+### docker-compose.yml
+
+```yaml
+version: '3.8'
+
+services:
+  registry:
+    image: ghcr.io/project-angos/angos:latest
+    ports:
+      - "5000:5000"
+    volumes:
+      - ./config:/config:ro
+    command: ["-c", "/config/config.toml", "server"]
+    restart: unless-stopped
+    deploy:
+      replicas: 2
+```
+
+### Configuration
+
+```toml
+[server]
+bind_address = "0.0.0.0"
+port = 5000
+
+[blob_store.s3]
+bucket = "my-registry"
+endpoint = "https://s3.amazonaws.com"
+region = "us-east-1"
+
+[metadata_store.s3]
+bucket = "my-registry"
+endpoint = "https://s3.amazonaws.com"
+region = "us-east-1"
+
+[metadata_store.s3.lock_strategy.s3]
+ttl_secs = 30
+max_retries = 100
+retry_delay_ms = 50
+```
+
+At startup, Angos probes the S3 provider to verify conditional write support. If the probe fails, check that your provider supports `If-None-Match` headers or fall back to the Redis-based setup above.
 
 ---
 

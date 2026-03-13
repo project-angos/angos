@@ -6,6 +6,7 @@ pub enum Error {
     Io(String),
     Serialization(String),
     NotFound(String),
+    PreconditionFailed,
 }
 
 impl fmt::Display for Error {
@@ -15,6 +16,7 @@ impl fmt::Display for Error {
             Error::Io(e) => write!(f, "IO error: {e}"),
             Error::Serialization(e) => write!(f, "Serialization error: {e}"),
             Error::NotFound(e) => write!(f, "Not found: {e}"),
+            Error::PreconditionFailed => write!(f, "Precondition failed"),
         }
     }
 }
@@ -60,6 +62,10 @@ mod tests {
         assert_eq!(
             format!("{}", Error::NotFound("file.txt".to_string())),
             "Not found: file.txt"
+        );
+        assert_eq!(
+            format!("{}", Error::PreconditionFailed),
+            "Precondition failed"
         );
     }
 

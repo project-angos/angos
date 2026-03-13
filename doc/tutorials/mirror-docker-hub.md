@@ -111,7 +111,7 @@ curl http://localhost:5000/v2/docker-io/library/nginx/tags/list
 You should see:
 
 ```json
-{"name":"docker-io/library/nginx","tags":["1.29.0"]}
+{"name":"docker-io/library/nginx","tags":["1.25.0"]}
 ```
 
 ## Complete Configuration

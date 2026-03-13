@@ -4,6 +4,7 @@ use std::{
     sync::Arc,
 };
 
+use async_trait::async_trait;
 use notify::{Event, EventKind, RecursiveMode, Watcher};
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
@@ -13,8 +14,9 @@ use crate::{
     configuration::{Configuration, Error, ServerConfig},
 };
 
+#[async_trait]
 pub trait ConfigNotifier: Send + Sync {
-    fn notify_config_change(&self, config: &Configuration);
+    async fn notify_config_change(&self, config: &Configuration);
     fn notify_tls_config_change(&self, tls: &ServerTlsConfig);
 }
 
@@ -145,7 +147,7 @@ async fn watch_config_loop(
                 info!("Configuration change detected, reloading");
                 match Configuration::load(&config_path) {
                     Ok(ref cfg) => {
-                        notifier.notify_config_change(cfg);
+                        notifier.notify_config_change(cfg).await;
                         info!("Configuration reloaded");
                     }
                     Err(e) => warn!("Failed to reload configuration: {e}"),
@@ -220,8 +222,9 @@ server_private_key = "{key_path}"
         }
     }
 
+    #[async_trait]
     impl ConfigNotifier for TestNotifier {
-        fn notify_config_change(&self, config: &Configuration) {
+        async fn notify_config_change(&self, config: &Configuration) {
             self.config_changes.lock().unwrap().push(config.clone());
         }
 

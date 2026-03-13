@@ -20,9 +20,31 @@ pub mod s3;
 
 pub use config::MetadataStoreConfig;
 pub use link_metadata::LinkMetadata;
-pub use lock::redis::LockConfig;
+pub use lock::{LockStrategy, redis::LockConfig};
 
 use crate::registry::metadata_store::link_kind::LinkKind;
+
+/// Granular S3 conditional operation capabilities.
+///
+/// Each field corresponds to a distinct HTTP conditional header that the S3-compatible
+/// provider may or may not support. Configure these explicitly in `[metadata_store.s3.capabilities]`
+/// to skip the startup probe, or omit to auto-detect when using `lock_strategy = "s3"`.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct ConditionalCapabilities {
+    /// `PutObject` with `If-None-Match: *` — create-only, reject if object exists.
+    pub put_if_none_match: bool,
+    /// `PutObject` with `If-Match: <etag>` — update-only, reject if `ETag` mismatch.
+    pub put_if_match: bool,
+    /// `DeleteObject` with `If-Match: <etag>` — conditional delete.
+    pub delete_if_match: bool,
+}
+
+impl ConditionalCapabilities {
+    /// Both conditional put operations are needed for CAS read-modify-write loops.
+    pub fn supports_cas(&self) -> bool {
+        self.put_if_none_match && self.put_if_match
+    }
+}
 
 #[derive(Default, Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct BlobIndex {
@@ -206,6 +228,10 @@ pub trait MetadataStore: Send + Sync {
     ) -> Result<(), Error>;
 
     async fn flush_access_times(&self) {}
+
+    fn conditional_capabilities(&self) -> Option<ConditionalCapabilities> {
+        None
+    }
 }
 
 #[cfg(test)]

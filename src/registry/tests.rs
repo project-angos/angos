@@ -43,7 +43,7 @@ impl FSRegistryTestCase {
         let metadata_store = metadata_store::fs::Backend::new(&metadata_store::fs::BackendConfig {
             root_dir: path,
             sync_to_disk: false,
-            redis: None,
+            lock_strategy: metadata_store::LockStrategy::Memory,
         })
         .unwrap();
         let metadata_store = Arc::new(metadata_store);
@@ -114,17 +114,21 @@ impl S3RegistryTestCase {
         .unwrap();
         let blob_store = Arc::new(blob_store);
 
-        let metadata_store = metadata_store::s3::Backend::new(&metadata_store::s3::BackendConfig {
-            access_key_id: "root".to_string(),
-            secret_key: "roottoor".to_string(),
-            endpoint: "http://127.0.0.1:9000".to_string(),
-            region: "region".to_string(),
-            bucket: "registry".to_string(),
-            key_prefix: key_prefix.clone(),
-            redis: None,
-            link_cache_ttl: 0,
-            access_time_debounce_secs: 0,
-        })
+        let metadata_store = metadata_store::s3::Backend::new(
+            &metadata_store::s3::BackendConfig {
+                access_key_id: "root".to_string(),
+                secret_key: "roottoor".to_string(),
+                endpoint: "http://127.0.0.1:9000".to_string(),
+                region: "region".to_string(),
+                bucket: "registry".to_string(),
+                key_prefix: key_prefix.clone(),
+                lock_strategy: metadata_store::LockStrategy::Memory,
+                link_cache_ttl: 0,
+                access_time_debounce_secs: 0,
+                capabilities: None,
+            },
+            None,
+        )
         .unwrap();
         let metadata_store = Arc::new(metadata_store);
 
