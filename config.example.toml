@@ -57,7 +57,15 @@ root_dir = "./data-angos"
 #secret_key = "<secret-key>"
 #link_cache_ttl = 30               # seconds; read-through cache TTL for link metadata (0 to disable)
 #access_time_debounce_secs = 60    # seconds; buffer access time writes and flush periodically (0 to disable)
-#[metadata_store.s3.redis]
+#
+# Optional: Explicitly declare S3 conditional operation capabilities to avoid startup probe
+# When omitted with lock_strategy = "s3", capabilities are auto-detected at startup.
+#[metadata_store.s3.capabilities]
+#put_if_none_match = true          # PutObject with If-None-Match: * (create-only)
+#put_if_match = true               # PutObject with If-Match: <etag> (update-only, enables CAS optimizations)
+#delete_if_match = true            # DeleteObject with If-Match: <etag> (atomic lock release)
+#
+#[metadata_store.s3.lock_strategy.redis]
 #url = "redis://localhost:6379"
 #ttl = 30
 

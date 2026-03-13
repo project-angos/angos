@@ -76,6 +76,7 @@ See the [Quickstart Tutorial](doc/tutorials/quickstart.md) for a complete walkth
 - [Configure Retention Policies](doc/how-to/configure-retention-policies.md)
 - [Enable the Web UI](doc/how-to/enable-web-ui.md)
 - [Troubleshoot Common Issues](doc/how-to/troubleshoot-common-issues.md)
+- [Upgrade Angos](doc/how-to/upgrade.md)
 
 ### Reference
 
@@ -92,6 +93,28 @@ See the [Quickstart Tutorial](doc/tutorials/quickstart.md) for a complete walkth
 - [Authentication and Authorization](doc/explanation/authentication-authorization.md)
 - [Pull-Through Caching](doc/explanation/pull-through-caching.md)
 - [Security Model](doc/explanation/security-model.md)
+
+## Upgrading
+
+### 1.0.x → 1.1.0: Redis lock configuration key renamed
+
+The Redis lock configuration key has moved. The old form is still accepted but deprecated and will be removed in a future release.
+
+```toml
+# Before
+[metadata_store.s3.redis]
+url = "redis://localhost:6379"
+
+# After
+[metadata_store.s3.lock_strategy.redis]
+url = "redis://localhost:6379"
+```
+
+### New features (non-breaking)
+
+**S3-native locking** — multi-replica S3 deployments no longer require Redis. Use `[metadata_store.s3.lock_strategy.s3]` to enable locking backed by S3 conditional writes instead.
+
+**Capabilities declaration** — add a `[metadata_store.s3.capabilities]` table to declare which conditional S3 operations your bucket supports (`put_if_none_match`, `put_if_match`, `delete_if_match`). When present, Angos skips the startup probe that would otherwise detect these capabilities automatically.
 
 ## Usage
 
@@ -115,7 +138,8 @@ Commands:
 
 In addition to the standard OCI Distribution endpoints:
 
-- `/health`: Health check endpoint
+- `/healthz`: Liveness health check endpoint
+- `/readyz`: Readiness health check endpoint
 - `/metrics`: Prometheus metrics endpoint
 
 ## References
