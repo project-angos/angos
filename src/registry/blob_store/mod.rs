@@ -9,6 +9,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, Duration, Utc};
 pub use config::BlobStorageConfig;
 pub use error::Error;
+use serde::{Deserialize, Serialize};
 use tokio::io::AsyncRead;
 
 use crate::oci::Digest;
@@ -21,7 +22,7 @@ pub type BoxedReader = Box<dyn AsyncRead + Unpin + Send + Sync>;
 /// [`BlobStore::write_upload`] to avoid redundant S3 round-trips.
 /// The `size` field is the only value callers outside the blob-store module
 /// need to inspect; the remaining fields are consumed by `write_upload`.
-#[derive(Debug)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct UploadState {
     pub size: u64,
     /// Multipart upload ID; `None` for backends that do not use multipart uploads.

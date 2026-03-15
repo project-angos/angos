@@ -23,7 +23,7 @@ use tokio::{
 use tracing::{debug, info, instrument};
 
 use crate::{
-    cache::Cache,
+    cache::{Cache, CacheExt},
     oci::Digest,
     registry::{
         blob_store::{
@@ -101,6 +101,40 @@ impl Backend {
     async fn evict_upload_id(&self, path: &str) {
         if let Some(cache) = &self.cache {
             let _ = cache.delete_value(&Self::upload_id_cache_key(path)).await;
+        }
+    }
+
+    // ---- Upload state cache helpers ----
+
+    fn upload_state_cache_key(namespace: &str, uuid: &str) -> String {
+        format!("upload_state:{namespace}:{uuid}")
+    }
+
+    async fn cache_upload_state(&self, namespace: &str, uuid: &str, state: &UploadState) {
+        if let Some(cache) = &self.cache {
+            let key = Self::upload_state_cache_key(namespace, uuid);
+            let _ = cache.store(&key, state, 3600).await;
+        }
+    }
+
+    async fn retrieve_cached_upload_state(
+        &self,
+        namespace: &str,
+        uuid: &str,
+    ) -> Option<UploadState> {
+        if let Some(cache) = &self.cache {
+            let key = Self::upload_state_cache_key(namespace, uuid);
+            if let Ok(Some(state)) = cache.retrieve::<UploadState>(&key).await {
+                return Some(state);
+            }
+        }
+        None
+    }
+
+    async fn evict_upload_state(&self, namespace: &str, uuid: &str) {
+        if let Some(cache) = &self.cache {
+            let key = Self::upload_state_cache_key(namespace, uuid);
+            let _ = cache.delete_value(&key).await;
         }
     }
 
@@ -250,6 +284,10 @@ impl Backend {
 
     #[instrument(skip(self))]
     async fn get_upload_state_uniform(&self, name: &str, uuid: &str) -> Result<UploadState, Error> {
+        if let Some(cached) = self.retrieve_cached_upload_state(name, uuid).await {
+            return Ok(cached);
+        }
+
         let key = path_builder::upload_path(name, uuid);
 
         let (multipart_upload_id, parts) =
@@ -271,12 +309,14 @@ impl Backend {
             size += staged_size;
         }
 
-        Ok(UploadState {
+        let state = UploadState {
             size,
             multipart_upload_id,
             parts,
             pending_size: 0,
-        })
+        };
+        self.cache_upload_state(name, uuid, &state).await;
+        Ok(state)
     }
 
     #[instrument(skip(self))]
@@ -313,7 +353,11 @@ impl Backend {
             return Err(Error::UploadNotFound);
         };
 
-        let part_list = self.store.list_parts(&key, &upload_id).await?;
+        let part_list = if let Some(cached) = self.retrieve_cached_upload_state(name, uuid).await {
+            cached.parts
+        } else {
+            self.store.list_parts(&key, &upload_id).await?
+        };
         let mut size = part_list
             .iter()
             .map(|(_, _, s)| u64::try_from(*s).unwrap_or(0))
@@ -355,6 +399,7 @@ impl Backend {
             .await?;
 
         self.evict_upload_id(&key).await;
+        self.evict_upload_state(name, uuid).await;
 
         let blob_path = path_builder::blob_path(&digest);
         self.store.copy_object(&key, &blob_path).await?;
@@ -382,6 +427,20 @@ impl Backend {
                 s.parts,
                 uploaded,
                 s.pending_size,
+            ));
+        }
+        if let Some(cached) = self
+            .retrieve_cached_upload_state(name, uuid)
+            .await
+            .filter(|s| s.multipart_upload_id.is_some())
+        {
+            #[allow(clippy::cast_sign_loss)]
+            let uploaded: u64 = cached.parts.iter().map(|(_, _, sz)| *sz as u64).sum();
+            return Ok((
+                cached.multipart_upload_id.unwrap(),
+                cached.parts,
+                uploaded,
+                cached.pending_size,
             ));
         }
         let id = if let Some(id) = self.get_or_search_upload_id(&upload_path).await? {
@@ -521,6 +580,10 @@ impl Backend {
         name: &str,
         uuid: &str,
     ) -> Result<UploadState, Error> {
+        if let Some(cached) = self.retrieve_cached_upload_state(name, uuid).await {
+            return Ok(cached);
+        }
+
         let upload_path = path_builder::upload_path(name, uuid);
 
         let (multipart_upload_id, parts) =
@@ -537,12 +600,14 @@ impl Backend {
         let pending_path = path_builder::upload_patch_pending_path(name, uuid);
         let pending_size = self.store.object_size(&pending_path).await.unwrap_or(0);
 
-        Ok(UploadState {
+        let state = UploadState {
             size: uploaded + pending_size,
             multipart_upload_id,
             parts,
             pending_size,
-        })
+        };
+        self.cache_upload_state(name, uuid, &state).await;
+        Ok(state)
     }
 
     #[instrument(skip(self))]
@@ -579,7 +644,11 @@ impl Backend {
             .await?
             .ok_or(Error::UploadNotFound)?;
 
-        let part_list = self.store.list_parts(&upload_path, &upload_id).await?;
+        let part_list = if let Some(cached) = self.retrieve_cached_upload_state(name, uuid).await {
+            cached.parts
+        } else {
+            self.store.list_parts(&upload_path, &upload_id).await?
+        };
         #[allow(clippy::cast_sign_loss)]
         let mut uploaded_size: u64 = part_list.iter().map(|(_, _, size)| *size as u64).sum();
 
@@ -626,6 +695,7 @@ impl Backend {
             .await?;
 
         self.evict_upload_id(&upload_path).await;
+        self.evict_upload_state(name, uuid).await;
 
         let blob_path = path_builder::blob_path(&digest);
         self.store.copy_object(&upload_path, &blob_path).await?;
@@ -776,6 +846,7 @@ impl BlobStore for Backend {
     async fn delete_upload(&self, name: &str, uuid: &str) -> Result<(), Error> {
         let upload_path = path_builder::upload_path(name, uuid);
         self.evict_upload_id(&upload_path).await;
+        self.evict_upload_state(name, uuid).await;
         self.store.abort_pending_uploads(&upload_path).await?;
 
         let upload_path = path_builder::upload_container_path(name, uuid);
