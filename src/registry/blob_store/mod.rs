@@ -37,6 +37,7 @@ pub trait BlobStore: Send + Sync {
         namespace: &str,
         uuid: &str,
         stream: Box<dyn AsyncRead + Unpin + Send + Sync>,
+        content_length: u64,
         append: bool,
     ) -> Result<(Digest, u64), Error>;
 
@@ -103,7 +104,7 @@ mod tests {
 
             let content = format!("Content for upload {id}").into_bytes();
             store
-                .write_upload(namespace, id, Box::new(Cursor::new(content)), false)
+                .write_upload(namespace, id, Box::new(Cursor::new(content)), 0, false)
                 .await
                 .unwrap();
         }
@@ -271,6 +272,7 @@ mod tests {
                 namespace,
                 &uuid,
                 Box::new(Cursor::new(test_content.to_vec())),
+                test_content.len() as u64,
                 false,
             )
             .await

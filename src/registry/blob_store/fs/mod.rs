@@ -147,6 +147,7 @@ impl BlobStore for Backend {
         name: &str,
         uuid: &str,
         stream: Box<dyn AsyncRead + Unpin + Send + Sync>,
+        _content_length: u64,
         append: bool,
     ) -> Result<(Digest, u64), Error> {
         let upload_size = if append {

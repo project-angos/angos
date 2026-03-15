@@ -74,7 +74,13 @@ async fn test_multipart_upload_digest() {
     for chunk in &chunks {
         expected.update(chunk);
         store
-            .write_upload("ns", &uuid, Box::new(Cursor::new(chunk.clone())), true)
+            .write_upload(
+                "ns",
+                &uuid,
+                Box::new(Cursor::new(chunk.clone())),
+                chunk.len() as u64,
+                true,
+            )
             .await
             .unwrap();
     }
@@ -93,7 +99,13 @@ async fn test_delete_prefix_removes_all_objects() {
 
     let data = vec![0xAB; 1024];
     store
-        .write_upload("ns", &uuid, Box::new(Cursor::new(data)), true)
+        .write_upload(
+            "ns",
+            &uuid,
+            Box::new(Cursor::new(data.clone())),
+            data.len() as u64,
+            true,
+        )
         .await
         .unwrap();
 
@@ -140,7 +152,13 @@ async fn test_delete_upload_cleans_all_artifacts() {
 
     let data = vec![0xCD; 2048];
     store
-        .write_upload("ns", &uuid, Box::new(Cursor::new(data)), true)
+        .write_upload(
+            "ns",
+            &uuid,
+            Box::new(Cursor::new(data.clone())),
+            data.len() as u64,
+            true,
+        )
         .await
         .unwrap();
 
@@ -178,7 +196,13 @@ async fn test_complete_upload_cleans_upload_container() {
 
     let data = vec![0xEF; 4096];
     store
-        .write_upload("ns", &uuid, Box::new(Cursor::new(data)), true)
+        .write_upload(
+            "ns",
+            &uuid,
+            Box::new(Cursor::new(data.clone())),
+            data.len() as u64,
+            true,
+        )
         .await
         .unwrap();
 

@@ -94,6 +94,7 @@ pub struct BackendConfig {
     pub multipart_copy_chunk_size: ByteSize,
     pub multipart_copy_jobs: usize,
     pub multipart_part_size: ByteSize,
+    pub multipart_uniform_parts: bool,
     pub operation_timeout_secs: u64,
     pub operation_attempt_timeout_secs: u64,
     pub max_attempts: u32,
@@ -112,6 +113,7 @@ impl Default for BackendConfig {
             multipart_copy_chunk_size: ByteSize::mb(100),
             multipart_copy_jobs: 4,
             multipart_part_size: ByteSize::mib(50),
+            multipart_uniform_parts: false,
             operation_timeout_secs: 900,
             operation_attempt_timeout_secs: 300,
             max_attempts: 3,
@@ -611,6 +613,51 @@ impl Backend {
             .bucket(&self.bucket)
             .key(&key)
             .body(ByteStream::from(data.into()))
+            .send()
+            .await
+            .map_err(|e| IoError::other(e.to_string()))
+            .map(|_| ());
+        self.record_io_result(&result);
+        result
+    }
+
+    pub async fn upload_part_streaming(
+        &self,
+        path: &str,
+        upload_id: &str,
+        part_number: i32,
+        content_length: u64,
+        body: ByteStream,
+    ) -> Result<String, IoError> {
+        let key = self.full_key(path);
+        let content_length =
+            i64::try_from(content_length).map_err(|e| IoError::other(e.to_string()))?;
+
+        let res = self
+            .s3_client
+            .upload_part()
+            .bucket(&self.bucket)
+            .key(&key)
+            .upload_id(upload_id)
+            .part_number(part_number)
+            .content_length(content_length)
+            .body(body)
+            .send()
+            .await
+            .map_err(|e| IoError::other(e.to_string()))?;
+
+        Ok(res.e_tag.unwrap_or_default())
+    }
+
+    pub async fn delete_object(&self, path: &str) -> Result<(), IoError> {
+        self.check_circuit_breaker()?;
+        let key = self.full_key(path);
+
+        let result = self
+            .s3_client
+            .delete_object()
+            .bucket(&self.bucket)
+            .key(&key)
             .send()
             .await
             .map_err(|e| IoError::other(e.to_string()))

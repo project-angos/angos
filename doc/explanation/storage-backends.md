@@ -411,9 +411,13 @@ rules = ["manifest.last_pulled_at < now() - days(30)"]
 
 ---
 
-## Multipart Uploads (S3)
+## Blob Upload Modes (S3)
 
-Large blobs use multipart uploads:
+The registry supports two modes for uploading blobs to S3. By default, it uses the **non-uniform upload mode**, which is faster and works with most S3 providers. If your S3 provider requires uniform part sizes, switch to **uniform upload mode**.
+
+### Non-Uniform Upload Mode (Default)
+
+This is the recommended mode for most deployments. Each OCI `PATCH` request streams directly to S3:
 
 ```mermaid
 sequenceDiagram
@@ -421,27 +425,19 @@ sequenceDiagram
     participant Registry
     participant S3
 
-    Client->>Registry: Upload large blob
-
+    Client->>Registry: PATCH (chunk 1)
     Registry->>S3: InitiateMultipartUpload
     S3-->>Registry: Upload ID
+    Registry->>S3: UploadPart (streaming, chunk 1)
+    S3-->>Registry: ETag
 
-    Registry->>Registry: Split blob into parts
+    Client->>Registry: PATCH (chunk 2)
+    Registry->>S3: UploadPart (streaming, chunk 2)
+    S3-->>Registry: ETag
 
-    par Upload parts concurrently
-        Registry->>S3: UploadPart (Part 1)
-        S3-->>Registry: ETag 1
-    and
-        Registry->>S3: UploadPart (Part 2)
-        S3-->>Registry: ETag 2
-    and
-        Registry->>S3: UploadPart (Part N)
-        S3-->>Registry: ETag N
-    end
-
-    Registry->>S3: CompleteMultipartUpload (ETags)
-    S3-->>Registry: Success
-
+    Client->>Registry: PUT (complete upload)
+    Registry->>S3: CompleteMultipartUpload
+    S3-->>Registry: Final blob
     Registry-->>Client: 201 Created
 ```
 
@@ -449,16 +445,67 @@ Configuration:
 
 ```toml
 [blob_store.s3]
-# Minimum part size (parts are at least this large)
+multipart_uniform_parts = false  # Default
+```
+
+Each `PATCH` streams directly into the multipart upload as an `UploadPart` — no intermediate objects, no assembly phase. Parts are uploaded with their known `Content-Length` from the HTTP request header and flow frame-by-frame from the client to S3 without buffering. Small `PATCH` requests (< 5 MiB) are accumulated in a pending buffer until they reach the S3 minimum part size.
+
+**Memory usage:** ~8 KiB per `PATCH` (a single streaming read frame). Small `PATCH` requests use up to 5 MiB for the pending buffer. Total memory is essentially constant regardless of blob size.
+
+### Uniform Upload Mode
+
+If your S3 provider strictly enforces uniform non-final part sizes and rejects uploads with variable part sizes, enable uniform mode:
+
+```mermaid
+sequenceDiagram
+    participant Client
+    participant Registry
+    participant S3
+
+    Client->>Registry: PATCH (chunk 1)
+    Registry->>S3: InitiateMultipartUpload
+    S3-->>Registry: Upload ID
+    Registry->>S3: UploadPart (exact multipart_part_size)
+    S3-->>Registry: Part 1
+
+    Client->>Registry: PATCH (chunk 2)
+    Registry->>S3: UploadPart (exact multipart_part_size)
+    S3-->>Registry: Part 2
+
+    Client->>Registry: PUT (complete upload)
+    Registry->>S3: UploadPart (final part, may be smaller)
+    S3-->>Registry: Final part
+    Registry->>S3: CompleteMultipartUpload
+    S3-->>Registry: Final blob
+    Registry-->>Client: 201 Created
+```
+
+Configuration:
+
+```toml
+[blob_store.s3]
+multipart_uniform_parts = true
+multipart_part_size = "50MiB"
+```
+
+In this mode, a long-lived multipart upload is maintained across all `PATCH` requests. Each non-final part is exactly `multipart_part_size` bytes, and the final part may be smaller.
+
+**Memory usage:** up to `multipart_part_size` (default 50 MiB) per active upload, as each part is fully buffered in memory before being sent to S3.
+
+### Related Configuration
+
+```toml
+[blob_store.s3]
+# Part size (multipart assembly threshold)
 multipart_part_size = "50MiB"
 
 # Blobs larger than this use multipart copy
 multipart_copy_threshold = "5GB"
 
-# Size of each copy chunk
+# Size of each copy chunk (when copying existing blobs)
 multipart_copy_chunk_size = "100MB"
 
-# Concurrent copy operations
+# Concurrent copy operations (when copying existing blobs)
 multipart_copy_jobs = 4
 ```
 

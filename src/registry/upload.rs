@@ -48,6 +48,7 @@ impl Registry {
         namespace: &Namespace,
         session_id: Uuid,
         start_offset: Option<u64>,
+        content_length: u64,
         stream: S,
     ) -> Result<u64, Error>
     where
@@ -67,7 +68,13 @@ impl Registry {
 
         let (_, size) = self
             .blob_store
-            .write_upload(namespace, &session_id, Box::new(stream), true)
+            .write_upload(
+                namespace,
+                &session_id,
+                Box::new(stream),
+                content_length,
+                true,
+            )
             .await?;
 
         if size < 1 {
@@ -83,6 +90,7 @@ impl Registry {
         namespace: &Namespace,
         session_id: Uuid,
         digest: &Digest,
+        content_length: u64,
         stream: S,
     ) -> Result<(), Error>
     where
@@ -102,7 +110,13 @@ impl Registry {
 
         let (upload_digest, _) = self
             .blob_store
-            .write_upload(namespace, &session_id, Box::new(stream), append)
+            .write_upload(
+                namespace,
+                &session_id,
+                Box::new(stream),
+                content_length,
+                append,
+            )
             .await?;
 
         if &upload_digest != digest {
@@ -199,13 +213,14 @@ impl Registry {
         namespace: &Namespace,
         uuid: Uuid,
         start_offset: Option<u64>,
+        content_length: u64,
         body_stream: S,
     ) -> Result<Response<ResponseBody>, Error>
     where
         S: AsyncRead + Unpin + Send + Sync + 'static,
     {
         let range_max = self
-            .patch_upload(namespace, uuid, start_offset, body_stream)
+            .patch_upload(namespace, uuid, start_offset, content_length, body_stream)
             .await?;
 
         let res = Response::builder()
@@ -225,12 +240,13 @@ impl Registry {
         namespace: &Namespace,
         uuid: Uuid,
         digest: &Digest,
+        content_length: u64,
         body_reader: S,
     ) -> Result<Response<ResponseBody>, Error>
     where
         S: AsyncRead + Unpin + Send + Sync + 'static,
     {
-        self.complete_upload(namespace, uuid, digest, body_reader)
+        self.complete_upload(namespace, uuid, digest, content_length, body_reader)
             .await?;
 
         let res = Response::builder()
@@ -320,7 +336,7 @@ mod tests {
 
             let stream = Cursor::new(content);
             let bytes_written = registry
-                .patch_upload(namespace, session_id, None, stream)
+                .patch_upload(namespace, session_id, None, content.len() as u64, stream)
                 .await
                 .unwrap();
             assert_eq!(bytes_written, (content.len() - 1) as u64);
@@ -328,7 +344,13 @@ mod tests {
             let additional_content = b" additional";
             let stream = Cursor::new(additional_content);
             let bytes_written = registry
-                .patch_upload(namespace, session_id, Some(content.len() as u64), stream)
+                .patch_upload(
+                    namespace,
+                    session_id,
+                    Some(content.len() as u64),
+                    additional_content.len() as u64,
+                    stream,
+                )
                 .await
                 .unwrap();
             assert_eq!(
@@ -361,7 +383,7 @@ mod tests {
 
             let stream = Cursor::new(content);
             registry
-                .patch_upload(namespace, session_id, None, stream)
+                .patch_upload(namespace, session_id, None, content.len() as u64, stream)
                 .await
                 .unwrap();
 
@@ -373,7 +395,7 @@ mod tests {
 
             let empty_stream = Cursor::new(Vec::new());
             registry
-                .complete_upload(namespace, session_id, &upload_digest, empty_stream)
+                .complete_upload(namespace, session_id, &upload_digest, 0, empty_stream)
                 .await
                 .unwrap();
 
@@ -437,7 +459,7 @@ mod tests {
 
             let stream = Cursor::new(content);
             registry
-                .patch_upload(namespace, session_id, None, stream)
+                .patch_upload(namespace, session_id, None, content.len() as u64, stream)
                 .await
                 .unwrap();
 
@@ -531,7 +553,7 @@ mod tests {
                 .unwrap();
 
             let response = registry
-                .handle_patch_upload(namespace, uuid, Some(0), Cursor::new(Vec::new()))
+                .handle_patch_upload(namespace, uuid, Some(0), 0, Cursor::new(Vec::new()))
                 .await
                 .unwrap();
 
@@ -564,7 +586,7 @@ mod tests {
 
             let stream = Cursor::new(content.to_vec());
             registry
-                .patch_upload(namespace, uuid, None, stream)
+                .patch_upload(namespace, uuid, None, content.len() as u64, stream)
                 .await
                 .unwrap();
 
@@ -577,7 +599,7 @@ mod tests {
             let body_stream = Cursor::new(Vec::new());
 
             let response = registry
-                .handle_put_upload(namespace, uuid, &digest, body_stream)
+                .handle_put_upload(namespace, uuid, &digest, 0, body_stream)
                 .await
                 .unwrap();
 
@@ -643,14 +665,14 @@ mod tests {
 
             let stream = Cursor::new(b"some data".to_vec());
             registry
-                .patch_upload(namespace, session_id, None, stream)
+                .patch_upload(namespace, session_id, None, 9, stream)
                 .await
                 .unwrap();
 
             // Provide a wrong start_offset (0 instead of 9) — should fail
             let stream = Cursor::new(b"more data".to_vec());
             let result = registry
-                .patch_upload(namespace, session_id, Some(0), stream)
+                .patch_upload(namespace, session_id, Some(0), 9, stream)
                 .await;
 
             assert_eq!(result, Err(Error::RangeNotSatisfiable));
@@ -674,7 +696,7 @@ mod tests {
 
             let stream = Cursor::new(b"test content".to_vec());
             registry
-                .patch_upload(namespace, session_id, None, stream)
+                .patch_upload(namespace, session_id, None, 12, stream)
                 .await
                 .unwrap();
 
@@ -686,7 +708,7 @@ mod tests {
 
             let empty_stream = Cursor::new(Vec::new());
             let result = registry
-                .complete_upload(namespace, session_id, &wrong_digest, empty_stream)
+                .complete_upload(namespace, session_id, &wrong_digest, 0, empty_stream)
                 .await;
 
             assert_eq!(result, Err(Error::DigestInvalid));
@@ -711,7 +733,13 @@ mod tests {
                 Box::new(Cursor::new(content.to_vec()));
             let (digest, size) = registry
                 .blob_store
-                .write_upload(namespace, &session_id.to_string(), stream, false)
+                .write_upload(
+                    namespace,
+                    &session_id.to_string(),
+                    stream,
+                    content.len() as u64,
+                    false,
+                )
                 .await
                 .unwrap();
 
@@ -754,7 +782,13 @@ mod tests {
                 Box::new(Cursor::new(content.to_vec()));
             registry
                 .blob_store
-                .write_upload(namespace, &session_id.to_string(), stream, false)
+                .write_upload(
+                    namespace,
+                    &session_id.to_string(),
+                    stream,
+                    content.len() as u64,
+                    false,
+                )
                 .await
                 .unwrap();
 
@@ -783,7 +817,7 @@ mod tests {
 
         let stream = Cursor::new(content);
         registry
-            .patch_upload(namespace, session_id, None, stream)
+            .patch_upload(namespace, session_id, None, content.len() as u64, stream)
             .await
             .unwrap();
 
@@ -806,7 +840,7 @@ mod tests {
 
         let empty_stream = Cursor::new(Vec::new());
         let result = registry
-            .complete_upload(namespace, session_id, &upload_digest, empty_stream)
+            .complete_upload(namespace, session_id, &upload_digest, 0, empty_stream)
             .await;
 
         assert!(
