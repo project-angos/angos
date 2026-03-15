@@ -25,8 +25,8 @@ use crate::{
     oci::Digest,
     registry::{
         blob_store::{
-            BlobStore, BoxedReader, Error, MultipartCleanup, hashing_reader::HashingReader,
-            sha256_ext::Sha256Ext,
+            BlobStore, BoxedReader, Error, MultipartCleanup, UploadState,
+            hashing_reader::HashingReader, sha256_ext::Sha256Ext,
         },
         data_store, pagination, path_builder,
     },
@@ -121,20 +121,30 @@ impl Backend {
         uuid: &str,
         stream: Box<dyn AsyncRead + Unpin + Send + Sync>,
         append: bool,
+        state: Option<UploadState>,
     ) -> Result<(Digest, u64), Error> {
         let upload_path = path_builder::upload_path(name, uuid);
 
-        let upload_id = if append {
-            match self.store.search_multipart_upload_id(&upload_path).await? {
-                Some(id) => id,
-                None => self.store.create_multipart_upload(&upload_path).await?,
+        let (upload_id, part_list) = if append {
+            match state {
+                Some(s) if s.multipart_upload_id.is_some() => {
+                    (s.multipart_upload_id.unwrap(), s.parts)
+                }
+                _ => {
+                    let id = match self.store.search_multipart_upload_id(&upload_path).await? {
+                        Some(id) => id,
+                        None => self.store.create_multipart_upload(&upload_path).await?,
+                    };
+                    let parts = self.store.list_parts(&upload_path, &id).await?;
+                    (id, parts)
+                }
             }
         } else {
             self.store.abort_pending_uploads(&upload_path).await?;
-            self.store.create_multipart_upload(&upload_path).await?
+            let id = self.store.create_multipart_upload(&upload_path).await?;
+            (id, Vec::new())
         };
 
-        let part_list = self.store.list_parts(&upload_path, &upload_id).await?;
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         let mut uploaded_size: u64 = part_list.iter().map(|(_, _, size)| *size as u64).sum();
         #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
@@ -192,23 +202,34 @@ impl Backend {
     }
 
     #[instrument(skip(self))]
-    async fn get_upload_size_uniform(&self, name: &str, uuid: &str) -> Result<u64, Error> {
+    async fn get_upload_state_uniform(&self, name: &str, uuid: &str) -> Result<UploadState, Error> {
         let key = path_builder::upload_path(name, uuid);
 
-        let mut size = 0u64;
-        if let Some(upload_id) = self.store.search_multipart_upload_id(&key).await? {
-            #[allow(clippy::cast_sign_loss)]
-            for (_, _, part_size) in self.store.list_parts(&key, &upload_id).await? {
-                size += part_size as u64;
-            }
-        }
+        let (multipart_upload_id, parts) =
+            if let Some(upload_id) = self.store.search_multipart_upload_id(&key).await? {
+                let parts = self.store.list_parts(&key, &upload_id).await?;
+                (Some(upload_id), parts)
+            } else {
+                (None, Vec::new())
+            };
+
+        #[allow(clippy::cast_sign_loss)]
+        let mut size: u64 = parts
+            .iter()
+            .map(|(_, _, part_size)| *part_size as u64)
+            .sum();
 
         let staged_path = path_builder::upload_staged_container_path(name, uuid, size);
         if let Ok(staged_size) = self.store.object_size(&staged_path).await {
             size += staged_size;
         }
 
-        Ok(size)
+        Ok(UploadState {
+            size,
+            multipart_upload_id,
+            parts,
+            pending_size: 0,
+        })
     }
 
     #[instrument(skip(self))]
@@ -217,20 +238,8 @@ impl Backend {
         name: &str,
         uuid: &str,
     ) -> Result<(Digest, u64, DateTime<Utc>), Error> {
-        let key = path_builder::upload_path(name, uuid);
-
-        let mut size = 0u64;
-        if let Some(upload_id) = self.store.search_multipart_upload_id(&key).await? {
-            #[allow(clippy::cast_sign_loss)]
-            for (_, _, part_size) in self.store.list_parts(&key, &upload_id).await? {
-                size += part_size as u64;
-            }
-        }
-
-        let staged_path = path_builder::upload_staged_container_path(name, uuid, size);
-        if let Ok(staged_size) = self.store.object_size(&staged_path).await {
-            size += staged_size;
-        }
+        let state = self.get_upload_state_uniform(name, uuid).await?;
+        let size = state.size;
 
         let digest = self.load_hasher(name, uuid, size).await?.digest();
 
@@ -309,6 +318,35 @@ impl Backend {
 
     // ---- Non-uniform mode write/complete/size/summary ----
 
+    async fn resolve_nonuniform_state(
+        &self,
+        name: &str,
+        uuid: &str,
+        state: Option<UploadState>,
+    ) -> Result<(String, Vec<(i32, String, i64)>, u64, u64), Error> {
+        let upload_path = path_builder::upload_path(name, uuid);
+        if let Some(s) = state.filter(|s| s.multipart_upload_id.is_some()) {
+            #[allow(clippy::cast_sign_loss)]
+            let uploaded: u64 = s.parts.iter().map(|(_, _, sz)| *sz as u64).sum();
+            return Ok((
+                s.multipart_upload_id.unwrap(),
+                s.parts,
+                uploaded,
+                s.pending_size,
+            ));
+        }
+        let id = match self.store.search_multipart_upload_id(&upload_path).await? {
+            Some(id) => id,
+            None => self.store.create_multipart_upload(&upload_path).await?,
+        };
+        let parts = self.store.list_parts(&upload_path, &id).await?;
+        #[allow(clippy::cast_sign_loss)]
+        let uploaded: u64 = parts.iter().map(|(_, _, sz)| *sz as u64).sum();
+        let pending_path = path_builder::upload_patch_pending_path(name, uuid);
+        let pending = self.store.object_size(&pending_path).await.unwrap_or(0);
+        Ok((id, parts, uploaded, pending))
+    }
+
     #[instrument(skip(self, stream))]
     async fn write_upload_nonuniform(
         &self,
@@ -316,21 +354,17 @@ impl Backend {
         uuid: &str,
         stream: Box<dyn AsyncRead + Unpin + Send + Sync>,
         content_length: u64,
+        state: Option<UploadState>,
     ) -> Result<(Digest, u64), Error> {
         let upload_path = path_builder::upload_path(name, uuid);
-        let upload_id = match self.store.search_multipart_upload_id(&upload_path).await? {
-            Some(id) => id,
-            None => self.store.create_multipart_upload(&upload_path).await?,
-        };
 
-        let part_list = self.store.list_parts(&upload_path, &upload_id).await?;
-        #[allow(clippy::cast_sign_loss)]
-        let uploaded_size: u64 = part_list.iter().map(|(_, _, size)| *size as u64).sum();
+        let (upload_id, part_list, uploaded_size, pending_size) =
+            self.resolve_nonuniform_state(name, uuid, state).await?;
+
         #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
         let next_part_number = (part_list.len() + 1) as i32;
 
         let pending_path = path_builder::upload_patch_pending_path(name, uuid);
-        let pending_size = self.store.object_size(&pending_path).await.unwrap_or(0);
         let available = pending_size + content_length;
 
         if available >= MIN_PART_SIZE {
@@ -430,18 +464,33 @@ impl Backend {
     }
 
     #[instrument(skip(self))]
-    async fn get_upload_size_nonuniform(&self, name: &str, uuid: &str) -> Result<u64, Error> {
+    async fn get_upload_state_nonuniform(
+        &self,
+        name: &str,
+        uuid: &str,
+    ) -> Result<UploadState, Error> {
         let upload_path = path_builder::upload_path(name, uuid);
-        let mut size = 0u64;
-        if let Some(upload_id) = self.store.search_multipart_upload_id(&upload_path).await? {
-            #[allow(clippy::cast_sign_loss)]
-            for (_, _, part_size) in self.store.list_parts(&upload_path, &upload_id).await? {
-                size += part_size as u64;
-            }
-        }
+
+        let (multipart_upload_id, parts) =
+            if let Some(upload_id) = self.store.search_multipart_upload_id(&upload_path).await? {
+                let parts = self.store.list_parts(&upload_path, &upload_id).await?;
+                (Some(upload_id), parts)
+            } else {
+                (None, Vec::new())
+            };
+
+        #[allow(clippy::cast_sign_loss)]
+        let uploaded: u64 = parts.iter().map(|(_, _, sz)| *sz as u64).sum();
+
         let pending_path = path_builder::upload_patch_pending_path(name, uuid);
-        let pending = self.store.object_size(&pending_path).await.unwrap_or(0);
-        Ok(size + pending)
+        let pending_size = self.store.object_size(&pending_path).await.unwrap_or(0);
+
+        Ok(UploadState {
+            size: uploaded + pending_size,
+            multipart_upload_id,
+            parts,
+            pending_size,
+        })
     }
 
     #[instrument(skip(self))]
@@ -450,19 +499,10 @@ impl Backend {
         name: &str,
         uuid: &str,
     ) -> Result<(Digest, u64, DateTime<Utc>), Error> {
-        let upload_path = path_builder::upload_path(name, uuid);
-        let mut size = 0u64;
-        if let Some(upload_id) = self.store.search_multipart_upload_id(&upload_path).await? {
-            #[allow(clippy::cast_sign_loss)]
-            for (_, _, part_size) in self.store.list_parts(&upload_path, &upload_id).await? {
-                size += part_size as u64;
-            }
-        }
-        let pending_path = path_builder::upload_patch_pending_path(name, uuid);
-        let pending = self.store.object_size(&pending_path).await.unwrap_or(0);
-        let total_size = size + pending;
+        let state = self.get_upload_state_nonuniform(name, uuid).await?;
+        let size = state.size;
 
-        let digest = self.load_hasher(name, uuid, total_size).await?.digest();
+        let digest = self.load_hasher(name, uuid, size).await?.digest();
 
         let date_path = path_builder::upload_start_date_path(name, uuid);
         let date_bytes = self.store.get_object_body(&date_path, None).await?;
@@ -471,7 +511,7 @@ impl Backend {
             .unwrap_or_else(|_| Utc::now().fixed_offset())
             .with_timezone(&Utc);
 
-        Ok((digest, total_size, start_date))
+        Ok((digest, size, start_date))
     }
 
     #[instrument(skip(self))]
@@ -632,21 +672,23 @@ impl BlobStore for Backend {
         stream: Box<dyn AsyncRead + Unpin + Send + Sync>,
         content_length: u64,
         append: bool,
+        state: Option<UploadState>,
     ) -> Result<(Digest, u64), Error> {
         if self.uniform_parts {
-            self.write_upload_uniform(name, uuid, stream, append).await
+            self.write_upload_uniform(name, uuid, stream, append, state)
+                .await
         } else {
-            self.write_upload_nonuniform(name, uuid, stream, content_length)
+            self.write_upload_nonuniform(name, uuid, stream, content_length, state)
                 .await
         }
     }
 
     #[instrument(skip(self))]
-    async fn get_upload_size(&self, name: &str, uuid: &str) -> Result<u64, Error> {
+    async fn get_upload_state(&self, name: &str, uuid: &str) -> Result<UploadState, Error> {
         if self.uniform_parts {
-            self.get_upload_size_uniform(name, uuid).await
+            self.get_upload_state_uniform(name, uuid).await
         } else {
-            self.get_upload_size_nonuniform(name, uuid).await
+            self.get_upload_state_nonuniform(name, uuid).await
         }
     }
 

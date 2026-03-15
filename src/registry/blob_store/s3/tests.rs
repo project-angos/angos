@@ -80,6 +80,7 @@ async fn test_multipart_upload_digest() {
                 Box::new(Cursor::new(chunk.clone())),
                 chunk.len() as u64,
                 true,
+                None,
             )
             .await
             .unwrap();
@@ -105,6 +106,7 @@ async fn test_delete_prefix_removes_all_objects() {
             Box::new(Cursor::new(data.clone())),
             data.len() as u64,
             true,
+            None,
         )
         .await
         .unwrap();
@@ -158,6 +160,7 @@ async fn test_delete_upload_cleans_all_artifacts() {
             Box::new(Cursor::new(data.clone())),
             data.len() as u64,
             true,
+            None,
         )
         .await
         .unwrap();
@@ -202,6 +205,7 @@ async fn test_complete_upload_cleans_upload_container() {
             Box::new(Cursor::new(data.clone())),
             data.len() as u64,
             true,
+            None,
         )
         .await
         .unwrap();

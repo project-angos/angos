@@ -55,15 +55,16 @@ impl Registry {
         S: AsyncRead + Unpin + Send + Sync + 'static,
     {
         let session_id = session_id.to_string();
-        if let Some(start_offset) = start_offset {
-            let size = self
-                .blob_store
-                .get_upload_size(namespace, &session_id)
-                .await?;
 
-            if start_offset != size {
-                return Err(Error::RangeNotSatisfiable);
-            }
+        let state = self
+            .blob_store
+            .get_upload_state(namespace, &session_id)
+            .await?;
+
+        if let Some(offset) = start_offset
+            && offset != state.size
+        {
+            return Err(Error::RangeNotSatisfiable);
         }
 
         let (_, size) = self
@@ -74,6 +75,7 @@ impl Registry {
                 Box::new(stream),
                 content_length,
                 true,
+                Some(state),
             )
             .await?;
 
@@ -98,15 +100,16 @@ impl Registry {
     {
         let session_id = session_id.to_string();
 
-        let append = match self
+        let state = match self
             .blob_store
-            .get_upload_size(namespace, &session_id)
+            .get_upload_state(namespace, &session_id)
             .await
         {
-            Ok(size) => size > 0,
-            Err(blob_store::Error::UploadNotFound) => false,
+            Ok(state) => Some(state),
+            Err(blob_store::Error::UploadNotFound) => None,
             Err(e) => return Err(e.into()),
         };
+        let append = state.as_ref().is_some_and(|s| s.size > 0);
 
         let (upload_digest, _) = self
             .blob_store
@@ -116,6 +119,7 @@ impl Registry {
                 Box::new(stream),
                 content_length,
                 append,
+                state,
             )
             .await?;
 
@@ -739,6 +743,7 @@ mod tests {
                     stream,
                     content.len() as u64,
                     false,
+                    None,
                 )
                 .await
                 .unwrap();
@@ -757,7 +762,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_get_upload_size() {
+    async fn test_get_upload_state() {
         for test_case in backends() {
             let registry = test_case.registry();
             let namespace = &Namespace::new("test-repo").unwrap();
@@ -770,13 +775,12 @@ mod tests {
                 .await
                 .unwrap();
 
-            // Size should be 0 for a fresh upload
-            let size = registry
+            let state = registry
                 .blob_store
-                .get_upload_size(namespace, &session_id.to_string())
+                .get_upload_state(namespace, &session_id.to_string())
                 .await
                 .unwrap();
-            assert_eq!(size, 0);
+            assert_eq!(state.size, 0);
 
             let stream: Box<dyn tokio::io::AsyncRead + Unpin + Send + Sync> =
                 Box::new(Cursor::new(content.to_vec()));
@@ -788,16 +792,17 @@ mod tests {
                     stream,
                     content.len() as u64,
                     false,
+                    None,
                 )
                 .await
                 .unwrap();
 
-            let size = registry
+            let state = registry
                 .blob_store
-                .get_upload_size(namespace, &session_id.to_string())
+                .get_upload_state(namespace, &session_id.to_string())
                 .await
                 .unwrap();
-            assert_eq!(size, content.len() as u64);
+            assert_eq!(state.size, content.len() as u64);
         }
     }
 
