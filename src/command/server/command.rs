@@ -48,8 +48,11 @@ pub struct Command {
 }
 
 // TODO: deduplicate!
-fn build_blob_store(config: &blob_store::BlobStorageConfig) -> Result<Arc<dyn BlobStore>, Error> {
-    let Ok(blob_store) = config.to_backend() else {
+fn build_blob_store(
+    config: &blob_store::BlobStorageConfig,
+    cache: &Arc<dyn Cache>,
+) -> Result<Arc<dyn BlobStore>, Error> {
+    let Ok(blob_store) = config.to_backend(Some(cache.clone())) else {
         let msg = "Failed to initialize blob store".to_string();
         return Err(Error::Initialization(msg));
     };
@@ -131,8 +134,8 @@ async fn build_registry(
     config: &Configuration,
     cached_capabilities: &Arc<Mutex<Option<ConditionalCapabilities>>>,
 ) -> Result<Registry, Error> {
-    let blob_store = build_blob_store(&config.blob_store)?;
     let auth_cache = build_auth_cache(&config.cache)?;
+    let blob_store = build_blob_store(&config.blob_store, &auth_cache)?;
     let metadata_store = build_metadata_store(config, &auth_cache, cached_capabilities).await?;
     let repositories = build_repositories(&config.repository, &auth_cache)?;
 
@@ -293,7 +296,8 @@ mod tests {
     #[test]
     fn test_build_blob_store_filesystem_success() {
         let config = create_minimal_config();
-        let result = build_blob_store(&config.blob_store);
+        let auth_cache = build_auth_cache(&config.cache).unwrap();
+        let result = build_blob_store(&config.blob_store, &auth_cache);
 
         assert!(result.is_ok());
     }
@@ -596,8 +600,8 @@ mod tests {
     async fn test_build_registry_components_integration() {
         let config = create_config_with_repository();
 
-        let blob_store = build_blob_store(&config.blob_store).unwrap();
         let auth_cache = build_auth_cache(&config.cache).unwrap();
+        let blob_store = build_blob_store(&config.blob_store, &auth_cache).unwrap();
         let metadata_store =
             build_metadata_store(&config, &auth_cache, &Arc::new(Mutex::new(None)))
                 .await

@@ -6,6 +6,7 @@ pub mod tests;
 use std::{
     fmt::{Debug, Formatter},
     io::Cursor,
+    sync::Arc,
 };
 
 use async_trait::async_trait;
@@ -22,6 +23,7 @@ use tokio::{
 use tracing::{debug, info, instrument};
 
 use crate::{
+    cache::Cache,
     oci::Digest,
     registry::{
         blob_store::{
@@ -40,6 +42,7 @@ pub struct Backend {
     pub store: data_store::s3::Backend,
     multipart_part_size: usize,
     uniform_parts: bool,
+    cache: Option<Arc<dyn Cache>>,
 }
 
 impl Debug for Backend {
@@ -59,7 +62,46 @@ impl Backend {
             store,
             multipart_part_size,
             uniform_parts: config.multipart_uniform_parts,
+            cache: None,
         })
+    }
+
+    pub fn with_cache(mut self, cache: Arc<dyn Cache>) -> Self {
+        self.cache = Some(cache);
+        self
+    }
+
+    // ---- Multipart upload ID cache helpers ----
+
+    fn upload_id_cache_key(path: &str) -> String {
+        format!("upload_id:{path}")
+    }
+
+    async fn get_or_search_upload_id(&self, path: &str) -> Result<Option<String>, Error> {
+        if let Some(cache) = &self.cache
+            && let Ok(Some(id)) = cache.retrieve_value(&Self::upload_id_cache_key(path)).await
+        {
+            return Ok(Some(id));
+        }
+        let id = self.store.search_multipart_upload_id(path).await?;
+        if let Some(ref upload_id) = id {
+            self.cache_upload_id(path, upload_id).await;
+        }
+        Ok(id)
+    }
+
+    async fn cache_upload_id(&self, path: &str, upload_id: &str) {
+        if let Some(cache) = &self.cache {
+            let _ = cache
+                .store_value(&Self::upload_id_cache_key(path), upload_id, 3600)
+                .await;
+        }
+    }
+
+    async fn evict_upload_id(&self, path: &str) {
+        if let Some(cache) = &self.cache {
+            let _ = cache.delete_value(&Self::upload_id_cache_key(path)).await;
+        }
     }
 
     // ---- Uniform mode helpers ----
@@ -131,17 +173,22 @@ impl Backend {
                     (s.multipart_upload_id.unwrap(), s.parts)
                 }
                 _ => {
-                    let id = match self.store.search_multipart_upload_id(&upload_path).await? {
-                        Some(id) => id,
-                        None => self.store.create_multipart_upload(&upload_path).await?,
+                    let id = if let Some(id) = self.get_or_search_upload_id(&upload_path).await? {
+                        id
+                    } else {
+                        let id = self.store.create_multipart_upload(&upload_path).await?;
+                        self.cache_upload_id(&upload_path, &id).await;
+                        id
                     };
                     let parts = self.store.list_parts(&upload_path, &id).await?;
                     (id, parts)
                 }
             }
         } else {
+            self.evict_upload_id(&upload_path).await;
             self.store.abort_pending_uploads(&upload_path).await?;
             let id = self.store.create_multipart_upload(&upload_path).await?;
+            self.cache_upload_id(&upload_path, &id).await;
             (id, Vec::new())
         };
 
@@ -206,7 +253,7 @@ impl Backend {
         let key = path_builder::upload_path(name, uuid);
 
         let (multipart_upload_id, parts) =
-            if let Some(upload_id) = self.store.search_multipart_upload_id(&key).await? {
+            if let Some(upload_id) = self.get_or_search_upload_id(&key).await? {
                 let parts = self.store.list_parts(&key, &upload_id).await?;
                 (Some(upload_id), parts)
             } else {
@@ -262,7 +309,7 @@ impl Backend {
     ) -> Result<Digest, Error> {
         let key = path_builder::upload_path(name, uuid);
 
-        let Ok(Some(upload_id)) = self.store.search_multipart_upload_id(&key).await else {
+        let Ok(Some(upload_id)) = self.get_or_search_upload_id(&key).await else {
             return Err(Error::UploadNotFound);
         };
 
@@ -307,6 +354,8 @@ impl Backend {
             .complete_multipart_upload(&key, &upload_id, parts)
             .await?;
 
+        self.evict_upload_id(&key).await;
+
         let blob_path = path_builder::blob_path(&digest);
         self.store.copy_object(&key, &blob_path).await?;
 
@@ -335,9 +384,12 @@ impl Backend {
                 s.pending_size,
             ));
         }
-        let id = match self.store.search_multipart_upload_id(&upload_path).await? {
-            Some(id) => id,
-            None => self.store.create_multipart_upload(&upload_path).await?,
+        let id = if let Some(id) = self.get_or_search_upload_id(&upload_path).await? {
+            id
+        } else {
+            let id = self.store.create_multipart_upload(&upload_path).await?;
+            self.cache_upload_id(&upload_path, &id).await;
+            id
         };
         let parts = self.store.list_parts(&upload_path, &id).await?;
         #[allow(clippy::cast_sign_loss)]
@@ -472,7 +524,7 @@ impl Backend {
         let upload_path = path_builder::upload_path(name, uuid);
 
         let (multipart_upload_id, parts) =
-            if let Some(upload_id) = self.store.search_multipart_upload_id(&upload_path).await? {
+            if let Some(upload_id) = self.get_or_search_upload_id(&upload_path).await? {
                 let parts = self.store.list_parts(&upload_path, &upload_id).await?;
                 (Some(upload_id), parts)
             } else {
@@ -523,8 +575,7 @@ impl Backend {
     ) -> Result<Digest, Error> {
         let upload_path = path_builder::upload_path(name, uuid);
         let upload_id = self
-            .store
-            .search_multipart_upload_id(&upload_path)
+            .get_or_search_upload_id(&upload_path)
             .await?
             .ok_or(Error::UploadNotFound)?;
 
@@ -573,6 +624,8 @@ impl Backend {
         self.store
             .complete_multipart_upload(&upload_path, &upload_id, parts)
             .await?;
+
+        self.evict_upload_id(&upload_path).await;
 
         let blob_path = path_builder::blob_path(&digest);
         self.store.copy_object(&upload_path, &blob_path).await?;
@@ -722,6 +775,7 @@ impl BlobStore for Backend {
     #[instrument(skip(self))]
     async fn delete_upload(&self, name: &str, uuid: &str) -> Result<(), Error> {
         let upload_path = path_builder::upload_path(name, uuid);
+        self.evict_upload_id(&upload_path).await;
         self.store.abort_pending_uploads(&upload_path).await?;
 
         let upload_path = path_builder::upload_container_path(name, uuid);

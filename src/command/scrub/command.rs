@@ -71,7 +71,7 @@ pub struct Command {
 }
 
 fn build_blob_store(config: &blob_store::BlobStorageConfig) -> Result<Arc<dyn BlobStore>, Error> {
-    let Ok(blob_store) = config.to_backend() else {
+    let Ok(blob_store) = config.to_backend(None) else {
         let msg = "Failed to initialize blob store".to_string();
         return Err(Error::Initialization(msg));
     };
