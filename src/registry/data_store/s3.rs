@@ -260,10 +260,7 @@ impl Backend {
         self.record_io_result(&result);
         let result = result?;
 
-        let etag = result
-            .e_tag
-            .as_deref()
-            .map(|t| t.trim_matches('"').to_string());
+        let etag = result.e_tag;
 
         let last_modified = result
             .last_modified
@@ -538,7 +535,7 @@ impl Backend {
 
         let mapped = match result {
             Ok(output) => {
-                let etag = output.e_tag().map(|t| t.trim_matches('"').to_string());
+                let etag = output.e_tag().map(ToString::to_string);
                 Ok(etag)
             }
             Err(e) => Err(classify_conditional_put_error(&e.into_service_error())),
@@ -569,7 +566,7 @@ impl Backend {
 
         let mapped = match result {
             Ok(output) => {
-                let etag = output.e_tag().map(|t| t.trim_matches('"').to_string());
+                let etag = output.e_tag().map(ToString::to_string);
                 Ok(etag)
             }
             Err(e) => Err(classify_conditional_put_error(&e.into_service_error())),
