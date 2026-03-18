@@ -985,14 +985,14 @@ impl MetadataStore for Backend {
                 writer.record(namespace, link).await;
                 Ok(link_data)
             } else if self.conditional.put_if_match {
-                let link_data =
-                    self.read_and_spawn_access_time_update(namespace, link).await?;
+                let link_data = self
+                    .read_and_spawn_access_time_update(namespace, link)
+                    .await?;
                 self.cache_put(namespace, link, &link_data).await;
                 Ok(link_data)
             } else {
                 let guard = self.lock.acquire(&[format!("{namespace}:{link}")]).await?;
-                let link_data =
-                    self.read_link_reference(namespace, link).await?.accessed();
+                let link_data = self.read_link_reference(namespace, link).await?.accessed();
                 if !guard.is_valid() {
                     return Err(Error::Lock(
                         "lock invalidated during access time update".into(),
