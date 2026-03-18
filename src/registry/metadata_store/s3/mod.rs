@@ -221,7 +221,17 @@ impl AccessTimeWriter {
 
     async fn flush_one(backend: &Backend, namespace: &str, link: &LinkKind) -> Result<(), Error> {
         if backend.conditional.put_if_match {
-            backend.update_access_time_cas(namespace, link).await?;
+            let link_path = path_builder::link_path(link, namespace);
+            let (data, etag) = backend.store.read_with_etag(&link_path).await?;
+            let link_data = LinkMetadata::from_bytes(data)?.accessed();
+            if let Some(etag) = etag {
+                let content = serde_json::to_vec(&link_data)
+                    .map_err(|e| Error::InvalidData(e.to_string()))?;
+                backend
+                    .store
+                    .put_object_if_match(&link_path, &etag, content)
+                    .await?;
+            }
             return Ok(());
         }
         let guard = backend
@@ -279,7 +289,6 @@ pub struct Backend {
 
 const MAX_UPDATE_RETRIES: u32 = 10;
 const MAX_BLOB_INDEX_CAS_RETRIES: u32 = 20;
-const MAX_ACCESS_TIME_CAS_RETRIES: u32 = 3;
 
 impl Backend {
     /// Create a new S3 metadata-store backend.
@@ -976,12 +985,14 @@ impl MetadataStore for Backend {
                 writer.record(namespace, link).await;
                 Ok(link_data)
             } else if self.conditional.put_if_match {
-                let link_data = self.update_access_time_cas(namespace, link).await?;
+                let link_data =
+                    self.read_and_spawn_access_time_update(namespace, link).await?;
                 self.cache_put(namespace, link, &link_data).await;
                 Ok(link_data)
             } else {
                 let guard = self.lock.acquire(&[format!("{namespace}:{link}")]).await?;
-                let link_data = self.read_link_reference(namespace, link).await?.accessed();
+                let link_data =
+                    self.read_link_reference(namespace, link).await?.accessed();
                 if !guard.is_valid() {
                     return Err(Error::Lock(
                         "lock invalidated during access time update".into(),
@@ -1026,29 +1037,18 @@ impl MetadataStore for Backend {
 }
 
 impl Backend {
-    /// CAS-optimized write path with lock-free fast path for new links.
+    /// CAS-optimized write path.
     ///
-    /// Phase 1: For creates that produce fresh metadata (non-tracked, or tracked
-    /// without referrer), tries `If-None-Match: *` to atomically create the link
-    /// without a distributed lock. This avoids locking entirely for the common
-    /// case of fresh pushes where most links are new.
+    /// Phase 1: All creates attempt lock-free `If-None-Match: *`.
     ///
-    /// Phase 2: For operations that need a lock (deletes, tracked creates with
-    /// referrer merging, creates where the link already existed), acquires the
-    /// lock and uses the standard read-modify-write flow.
+    /// Phase 2: Locked read-modify-write for creates that lost the race and deletes.
     ///
-    /// Phase 3: CAS blob index updates (always lock-free with conditional writes).
-    #[allow(clippy::too_many_lines)]
+    /// Phase 3: CAS blob index writes for new or re-targeted links.
     async fn update_links_cas(
         &self,
         namespace: &str,
         operations: &[LinkOperation],
     ) -> Result<(), Error> {
-        // Phase 1: Optimistic lock-free creation for eligible creates.
-        // Creates that produce fresh metadata (no referrer merge) can use
-        // If-None-Match:* to atomically create the link without locking.
-        let mut lockfree_blob_ops: HashMap<Digest, Vec<BlobIndexOperation>> = HashMap::new();
-        let mut lockfree_cache_puts: Vec<(LinkKind, LinkMetadata)> = Vec::new();
         let mut locked_ops: Vec<LinkOperation> = Vec::new();
         let mut any_creates = false;
 
@@ -1062,16 +1062,15 @@ impl Backend {
                     referrer,
                     media_type,
                     descriptor,
-                } if !link.is_tracked() || referrer.is_none() => {
+                } => {
                     any_creates = true;
-                    let metadata = LinkMetadata::from_digest(target.clone())
+                    let mut metadata = LinkMetadata::from_digest(target.clone())
                         .with_media_type(media_type.clone())
                         .with_descriptor(descriptor.as_ref().clone());
+                    if let Some(r) = referrer {
+                        metadata.add_referrer(r.clone());
+                    }
                     optimistic.push((op.clone(), link.clone(), target.clone(), metadata));
-                }
-                LinkOperation::Create { .. } => {
-                    any_creates = true;
-                    locked_ops.push(op.clone());
                 }
                 LinkOperation::Delete { .. } => {
                     locked_ops.push(op.clone());
@@ -1079,26 +1078,26 @@ impl Backend {
             }
         }
 
-        if !optimistic.is_empty() {
-            let results = join_all(optimistic.iter().map(|(_, link, _, metadata)| {
-                self.write_link_if_not_exists(namespace, link, metadata)
-            }))
-            .await;
+        // Phase 1: All creates attempt lock-free If-None-Match: *
+        let link_results = join_all(optimistic.iter().map(|(_, link, _, metadata)| {
+            self.write_link_if_not_exists(namespace, link, metadata)
+        }))
+        .await;
 
-            for ((op, link, target, metadata), result) in optimistic.into_iter().zip(results) {
-                match result {
-                    Ok(true) => {
-                        lockfree_blob_ops
-                            .entry(target)
-                            .or_default()
-                            .push(BlobIndexOperation::Insert(link.clone()));
-                        lockfree_cache_puts.push((link, metadata));
-                    }
-                    Ok(false) => {
-                        locked_ops.push(op);
-                    }
-                    Err(e) => return Err(e),
+        let mut lockfree_blob_ops: HashMap<Digest, Vec<BlobIndexOperation>> = HashMap::new();
+        for ((op, link, target, metadata), result) in optimistic.into_iter().zip(link_results) {
+            match result {
+                Ok(true) => {
+                    lockfree_blob_ops
+                        .entry(target)
+                        .or_default()
+                        .push(BlobIndexOperation::Insert(link.clone()));
+                    self.cache_put(namespace, &link, &metadata).await;
                 }
+                Ok(false) => {
+                    locked_ops.push(op);
+                }
+                Err(e) => return Err(e),
             }
         }
 
@@ -1113,12 +1112,7 @@ impl Backend {
             pending_blob_ops.entry(digest).or_default().extend(ops);
         }
 
-        // Cache updates for lock-free writes.
-        for (link, metadata) in &lockfree_cache_puts {
-            self.cache_put(namespace, link, metadata).await;
-        }
-
-        // Phase 3: CAS blob index updates — ETags handle concurrency.
+        // Phase 3: CAS blob index writes.
         join_all(
             pending_blob_ops
                 .iter()
@@ -1560,17 +1554,19 @@ impl Backend {
 
                 tracked_create_writes.push((link.clone(), metadata));
             } else {
-                pending_blob_ops
-                    .entry(target.clone())
-                    .or_default()
-                    .push(BlobIndexOperation::Insert(link.clone()));
-                if let Some(old) = old_target
-                    && *old != *target
-                {
+                if old_target.as_ref() != Some(target) {
                     pending_blob_ops
-                        .entry(old.clone())
+                        .entry(target.clone())
                         .or_default()
-                        .push(BlobIndexOperation::Remove(link.clone()));
+                        .push(BlobIndexOperation::Insert(link.clone()));
+                    if let Some(old) = old_target
+                        && *old != *target
+                    {
+                        pending_blob_ops
+                            .entry(old.clone())
+                            .or_default()
+                            .push(BlobIndexOperation::Remove(link.clone()));
+                    }
                 }
 
                 non_tracked_create_writes.push((
@@ -1952,47 +1948,40 @@ impl Backend {
         Ok(())
     }
 
-    async fn update_access_time_cas(
+    /// Reads the link with its `ETag`, then spawns the access time write as a
+    /// background task so the caller doesn't block on the CAS round-trip.
+    ///
+    /// The spawned write is best-effort: under concurrent pulls the `ETag` may
+    /// become stale and the CAS will silently fail. This is acceptable because
+    /// access times are advisory — a missed update simply means the timestamp
+    /// lags by one pull interval. Requires a CAS-capable backend (`put_if_match`).
+    async fn read_and_spawn_access_time_update(
         &self,
         namespace: &str,
         link: &LinkKind,
     ) -> Result<LinkMetadata, Error> {
         let link_path = path_builder::link_path(link, namespace);
 
-        for _ in 0..MAX_ACCESS_TIME_CAS_RETRIES {
-            let (data, etag) = match self.store.read_with_etag(&link_path).await {
-                Ok((data, etag)) => (data, etag),
-                Err(e) if e.kind() == ErrorKind::NotFound => return Err(Error::ReferenceNotFound),
-                Err(e) => return Err(e.into()),
-            };
-            let link_data = LinkMetadata::from_bytes(data)?.accessed();
-            let Some(etag) = etag else {
-                break;
-            };
-            let serialized = Bytes::from(serde_json::to_vec(&link_data)?);
-            match self
-                .store
-                .put_object_if_match(&link_path, &etag, serialized)
-                .await
-            {
-                Ok(_) => return Ok(link_data),
-                Err(data_store::Error::PreconditionFailed) => {}
+        let (data, etag) = match self.store.read_with_etag(&link_path).await {
+            Ok(result) => result,
+            Err(e) if e.kind() == ErrorKind::NotFound => return Err(Error::ReferenceNotFound),
+            Err(e) => return Err(e.into()),
+        };
+        let link_data = LinkMetadata::from_bytes(data)?;
 
-                Err(e) => return Err(Error::StorageBackend(e.to_string())),
-            }
+        if let Some(etag) = etag {
+            let store = self.store.clone();
+            let updated = link_data.clone().accessed();
+            let path = link_path;
+            tokio::spawn(async move {
+                let serialized = match serde_json::to_vec(&updated) {
+                    Ok(v) => Bytes::from(v),
+                    Err(_) => return,
+                };
+                let _ = store.put_object_if_match(&path, &etag, serialized).await;
+            });
         }
 
-        // CAS exhausted or no ETag — fall back to lock-protected path
-        let guard = self.lock.acquire(&[format!("{namespace}:{link}")]).await?;
-        let link_data = self.read_link_reference(namespace, link).await?.accessed();
-        if !guard.is_valid() {
-            return Err(Error::Lock(
-                "lock invalidated during access time update".into(),
-            ));
-        }
-        self.write_link_reference(namespace, link, &link_data)
-            .await?;
-        guard.release().await;
         Ok(link_data)
     }
 
