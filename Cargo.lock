@@ -42,6 +42,7 @@ dependencies = [
  "chrono",
  "futures-util",
  "hex",
+ "http-body 1.0.1",
  "http-body-util",
  "humantime",
  "hyper 1.8.1",

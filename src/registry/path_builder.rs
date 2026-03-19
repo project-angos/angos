@@ -102,6 +102,10 @@ pub fn upload_start_date_path(namespace: &str, uuid: &str) -> String {
     format!("{REPOS_ROOT}/{namespace}/_uploads/{uuid}/startedat")
 }
 
+pub fn upload_patch_pending_path(namespace: &str, uuid: &str) -> String {
+    format!("{REPOS_ROOT}/{namespace}/_uploads/{uuid}/patches/pending")
+}
+
 pub fn manifest_revisions_link_root_dir(namespace: &str, algorithm: &str) -> String {
     format!("{REPOS_ROOT}/{namespace}/_manifests/revisions/{algorithm}")
 }
