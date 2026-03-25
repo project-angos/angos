@@ -9,11 +9,29 @@ use async_trait::async_trait;
 use chrono::{DateTime, Duration, Utc};
 pub use config::BlobStorageConfig;
 pub use error::Error;
+use serde::{Deserialize, Serialize};
 use tokio::io::AsyncRead;
 
 use crate::oci::Digest;
 
 pub type BoxedReader = Box<dyn AsyncRead + Unpin + Send + Sync>;
+
+/// Precomputed state for an in-progress upload session.
+///
+/// Returned by [`BlobStore::get_upload_state`] and accepted by
+/// [`BlobStore::write_upload`] to avoid redundant S3 round-trips.
+/// The `size` field is the only value callers outside the blob-store module
+/// need to inspect; the remaining fields are consumed by `write_upload`.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct UploadState {
+    pub size: u64,
+    /// Multipart upload ID; `None` for backends that do not use multipart uploads.
+    pub multipart_upload_id: Option<String>,
+    /// Parts already uploaded: `(part_number, e_tag, size_bytes)`.
+    pub parts: Vec<(i32, String, i64)>,
+    /// Bytes buffered in the pending object (non-uniform S3 mode only).
+    pub pending_size: u64,
+}
 
 #[async_trait]
 pub trait BlobStore: Send + Sync {
@@ -37,10 +55,16 @@ pub trait BlobStore: Send + Sync {
         namespace: &str,
         uuid: &str,
         stream: Box<dyn AsyncRead + Unpin + Send + Sync>,
+        content_length: u64,
         append: bool,
+        state: Option<UploadState>,
     ) -> Result<(Digest, u64), Error>;
 
-    async fn get_upload_size(&self, namespace: &str, uuid: &str) -> Result<u64, Error>;
+    /// Returns the precomputed state for an upload session.
+    ///
+    /// Callers that subsequently invoke [`BlobStore::write_upload`] should pass
+    /// the returned `UploadState` through to avoid redundant storage queries.
+    async fn get_upload_state(&self, namespace: &str, uuid: &str) -> Result<UploadState, Error>;
 
     async fn read_upload_summary(
         &self,
@@ -103,7 +127,14 @@ mod tests {
 
             let content = format!("Content for upload {id}").into_bytes();
             store
-                .write_upload(namespace, id, Box::new(Cursor::new(content)), false)
+                .write_upload(
+                    namespace,
+                    id,
+                    Box::new(Cursor::new(content)),
+                    0,
+                    false,
+                    None,
+                )
                 .await
                 .unwrap();
         }
@@ -271,7 +302,9 @@ mod tests {
                 namespace,
                 &uuid,
                 Box::new(Cursor::new(test_content.to_vec())),
+                test_content.len() as u64,
                 false,
+                None,
             )
             .await
             .unwrap();

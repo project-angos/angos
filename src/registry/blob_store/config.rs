@@ -3,9 +3,12 @@ use std::sync::Arc;
 use serde::Deserialize;
 use tracing::warn;
 
-use crate::registry::{
-    blob_store::{BlobStore, Error, MultipartCleanup, fs, s3},
-    data_store,
+use crate::{
+    cache::Cache,
+    registry::{
+        blob_store::{BlobStore, Error, MultipartCleanup, fs, s3},
+        data_store,
+    },
 };
 
 #[derive(Clone, Debug, Deserialize, PartialEq)]
@@ -24,10 +27,16 @@ impl Default for BlobStorageConfig {
 }
 
 impl BlobStorageConfig {
-    pub fn to_backend(&self) -> Result<Arc<dyn BlobStore>, Error> {
+    pub fn to_backend(&self, cache: Option<Arc<dyn Cache>>) -> Result<Arc<dyn BlobStore>, Error> {
         match self {
             BlobStorageConfig::FS(config) => Ok(Arc::new(fs::Backend::new(config))),
-            BlobStorageConfig::S3(config) => Ok(Arc::new(s3::Backend::new(config)?)),
+            BlobStorageConfig::S3(config) => {
+                let mut backend = s3::Backend::new(config)?;
+                if let Some(cache) = cache {
+                    backend = backend.with_cache(cache);
+                }
+                Ok(Arc::new(backend))
+            }
         }
     }
 

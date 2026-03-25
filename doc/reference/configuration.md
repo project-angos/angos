@@ -110,9 +110,36 @@ Choose one: `blob_store.fs` or `blob_store.s3`.
 | `multipart_copy_threshold`       | string | `"5GB"`   | Threshold for multipart copy       |
 | `multipart_copy_chunk_size`      | string | `"100MB"` | Chunk size for multipart copy      |
 | `multipart_copy_jobs`            | usize  | `4`       | Max concurrent multipart copy jobs |
+| `multipart_uniform_parts`        | bool   | `false`   | Use uniform multipart upload mode  |
 | `max_attempts`                   | u32    | `3`       | Retry attempts for S3 operations   |
 | `operation_timeout_secs`         | u64    | `900`     | Total operation timeout            |
 | `operation_attempt_timeout_secs` | u64    | `300`     | Per-attempt timeout                |
+
+#### S3 Blob Upload Modes
+
+The registry supports two modes for uploading blobs to S3, controlled by `multipart_uniform_parts`:
+
+**Non-uniform mode (default, `multipart_uniform_parts = false`)**
+
+Each OCI `PATCH` request streams directly into a long-lived S3 multipart upload as an `UploadPart` with known `Content-Length`. Parts are uploaded directly — no intermediate objects or assembly phase. When the client completes the upload with a `PUT` request, the multipart upload is finalized and the blob is copied to its content-addressed path. This mode works with most S3-compatible providers.
+
+Memory usage per upload: ~8 KiB during each `PATCH` (a single streaming read frame). No data is buffered in memory beyond the current frame.
+
+**Uniform mode (`multipart_uniform_parts = true`)**
+
+A long-lived S3 multipart upload is maintained across all `PATCH` requests. Each committed part is exactly `multipart_part_size` bytes (except the last). The S3 protocol only requires non-final parts to be ≥ 5 MiB; uniform sizing is an additional constraint imposed by some S3 storage providers. Use this mode only if your provider rejects uploads with variable part sizes.
+
+Memory usage per upload: up to `multipart_part_size` (default 50 MiB) per active upload, as each part is buffered in memory before being sent to S3.
+
+```toml
+# Most S3 providers (AWS S3, MinIO, Exoscale, etc.)
+[blob_store.s3]
+multipart_uniform_parts = false  # Default
+
+# Strict S3 providers (if non-uniform mode fails)
+[blob_store.s3]
+multipart_uniform_parts = true
+```
 
 ---
 

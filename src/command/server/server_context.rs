@@ -162,7 +162,7 @@ pub mod tests {
 
     pub async fn create_test_server_context() -> ServerContext {
         let config = create_test_config();
-        let blob_store = config.blob_store.to_backend().unwrap();
+        let blob_store = config.blob_store.to_backend(None).unwrap();
         let metadata_store = config
             .resolve_metadata_config()
             .to_backend(None)
@@ -206,7 +206,7 @@ pub mod tests {
     }
 
     async fn create_test_registry(config: &Configuration) -> Registry {
-        let blob_store = config.blob_store.to_backend().unwrap();
+        let blob_store = config.blob_store.to_backend(None).unwrap();
         let metadata_store = config
             .resolve_metadata_config()
             .to_backend(None)
@@ -1064,7 +1064,7 @@ pub mod tests {
                 root_dir: "/tmp/test-blobs-shutdown-flush".to_string(),
                 ..Default::default()
             });
-        let blob_store = blob_store_config.to_backend().unwrap();
+        let blob_store = blob_store_config.to_backend(None).unwrap();
 
         let registry_config = RegistryConfig::new()
             .update_pull_time(false)
@@ -1178,7 +1178,7 @@ pub mod tests {
 
         let config: Configuration = toml::from_str(toml).unwrap();
 
-        let blob_store = config.blob_store.to_backend().unwrap();
+        let blob_store = config.blob_store.to_backend(None).unwrap();
         let metadata_store = config
             .resolve_metadata_config()
             .to_backend(None)

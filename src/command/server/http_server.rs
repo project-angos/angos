@@ -10,7 +10,8 @@ use http_body_util::Full;
 use hyper::{
     Method, Request, Response, StatusCode,
     body::{Bytes, Incoming},
-    header::{CONTENT_RANGE, CONTENT_TYPE, RANGE, WWW_AUTHENTICATE},
+    header::{CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, RANGE, WWW_AUTHENTICATE},
+    http::request::Parts,
     server::conn::http1,
     service::service_fn,
 };
@@ -168,7 +169,7 @@ async fn router(
 async fn authenticate_and_authorize(
     context: &ServerContext,
     route: &Route<'_>,
-    parts: &hyper::http::request::Parts,
+    parts: &Parts,
 ) -> Result<ClientIdentity, Error> {
     let remote_address = parts.extensions.get::<std::net::SocketAddr>().copied();
     let identity = context.authenticate_request(parts, remote_address).await?;
@@ -180,7 +181,7 @@ async fn authenticate_and_authorize(
 async fn dispatch_route<'a>(
     context: &'a ServerContext,
     route: Route<'a>,
-    parts: &'a hyper::http::request::Parts,
+    parts: &'a Parts,
     incoming: Incoming,
     identity: &ClientIdentity,
 ) -> Result<Response<ResponseBody>, Error> {
@@ -202,7 +203,7 @@ async fn dispatch_route<'a>(
             namespace,
             uuid,
             digest,
-        } => handle_put_upload(context, incoming, &namespace, uuid, digest, identity).await,
+        } => handle_put_upload(context, parts, incoming, &namespace, uuid, digest, identity).await,
         Route::DeleteUpload { namespace, uuid } => {
             handle_delete_upload(context, &namespace, uuid, identity).await
         }
@@ -256,9 +257,7 @@ async fn dispatch_route<'a>(
     }
 }
 
-fn handle_unknown_route(
-    parts: &hyper::http::request::Parts,
-) -> Result<Response<ResponseBody>, Error> {
+fn handle_unknown_route(parts: &Parts) -> Result<Response<ResponseBody>, Error> {
     if [Method::GET, Method::HEAD].contains(&parts.method) {
         let msg = format!("unknown route: {} {}", parts.method, parts.uri);
         Err(Error::NotFound(msg))
@@ -299,34 +298,47 @@ async fn handle_get_upload(
 
 async fn handle_patch_upload(
     context: &ServerContext,
-    parts: &hyper::http::request::Parts,
+    parts: &Parts,
     incoming: Incoming,
     namespace: &Namespace,
     uuid: Uuid,
     _identity: &ClientIdentity,
 ) -> Result<Response<ResponseBody>, Error> {
     let start_offset = parts.range(CONTENT_RANGE)?.map(|(start, _)| start);
+    let content_length: u64 = parts
+        .headers
+        .get(CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
     let body_stream = incoming.into_async_read();
 
     Ok(context
         .registry
-        .handle_patch_upload(namespace, uuid, start_offset, body_stream)
+        .handle_patch_upload(namespace, uuid, start_offset, content_length, body_stream)
         .await?)
 }
 
 async fn handle_put_upload(
     context: &ServerContext,
+    parts: &Parts,
     incoming: Incoming,
     namespace: &Namespace,
     uuid: Uuid,
     digest: Digest,
     identity: &ClientIdentity,
 ) -> Result<Response<ResponseBody>, Error> {
+    let content_length: u64 = parts
+        .headers
+        .get(CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
     let body_stream = incoming.into_async_read();
 
     let response = context
         .registry
-        .handle_put_upload(namespace, uuid, &digest, body_stream)
+        .handle_put_upload(namespace, uuid, &digest, content_length, body_stream)
         .await?;
 
     let event = Event {
@@ -359,7 +371,7 @@ async fn handle_delete_upload(
 
 async fn handle_get_blob(
     context: &ServerContext,
-    parts: &hyper::http::request::Parts,
+    parts: &Parts,
     namespace: &Namespace,
     digest: Digest,
     _identity: &ClientIdentity,
@@ -375,7 +387,7 @@ async fn handle_get_blob(
 
 async fn handle_head_blob(
     context: &ServerContext,
-    parts: &hyper::http::request::Parts,
+    parts: &Parts,
     namespace: &Namespace,
     digest: Digest,
     _identity: &ClientIdentity,
@@ -402,7 +414,7 @@ async fn handle_delete_blob(
 
 async fn handle_get_manifest(
     context: &ServerContext,
-    parts: &hyper::http::request::Parts,
+    parts: &Parts,
     namespace: &Namespace,
     reference: Reference,
     _identity: &ClientIdentity,
@@ -421,7 +433,7 @@ async fn handle_get_manifest(
 
 async fn handle_head_manifest(
     context: &ServerContext,
-    parts: &hyper::http::request::Parts,
+    parts: &Parts,
     namespace: &Namespace,
     reference: Reference,
     _identity: &ClientIdentity,
@@ -440,7 +452,7 @@ async fn handle_head_manifest(
 
 async fn handle_put_manifest(
     context: &ServerContext,
-    parts: &hyper::http::request::Parts,
+    parts: &Parts,
     incoming: Incoming,
     namespace: &Namespace,
     reference: Reference,
@@ -646,7 +658,7 @@ fn handle_healthz() -> Result<Response<ResponseBody>, Error> {
 
 async fn handle_readyz(
     context: &ServerContext,
-    parts: &hyper::http::request::Parts,
+    parts: &Parts,
 ) -> Result<Response<ResponseBody>, Error> {
     #[derive(Serialize)]
     struct ReadyResponse<'a> {
@@ -1154,7 +1166,7 @@ mod tests {
         "#;
 
         let config: Configuration = toml::from_str(toml).unwrap();
-        let blob_store = config.blob_store.to_backend().unwrap();
+        let blob_store = config.blob_store.to_backend(None).unwrap();
         let metadata_store = config
             .resolve_metadata_config()
             .to_backend(None)
@@ -1212,7 +1224,7 @@ mod tests {
         "#;
 
         let config: Configuration = toml::from_str(toml).unwrap();
-        let blob_store = config.blob_store.to_backend().unwrap();
+        let blob_store = config.blob_store.to_backend(None).unwrap();
         let metadata_store = config
             .resolve_metadata_config()
             .to_backend(None)

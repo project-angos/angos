@@ -18,7 +18,8 @@ use crate::{
     oci::Digest,
     registry::{
         blob_store::{
-            BlobStore, BoxedReader, Error, hashing_reader::HashingReader, sha256_ext::Sha256Ext,
+            BlobStore, BoxedReader, Error, UploadState, hashing_reader::HashingReader,
+            sha256_ext::Sha256Ext,
         },
         data_store, pagination, path_builder,
     },
@@ -147,11 +148,17 @@ impl BlobStore for Backend {
         name: &str,
         uuid: &str,
         stream: Box<dyn AsyncRead + Unpin + Send + Sync>,
+        _content_length: u64,
         append: bool,
+        state: Option<UploadState>,
     ) -> Result<(Digest, u64), Error> {
         let upload_size = if append {
-            let path = path_builder::upload_path(name, uuid);
-            self.file_size_or_err(&path, Error::UploadNotFound).await?
+            if let Some(s) = state {
+                s.size
+            } else {
+                let path = path_builder::upload_path(name, uuid);
+                self.file_size_or_err(&path, Error::UploadNotFound).await?
+            }
         } else {
             0
         };
@@ -185,9 +192,15 @@ impl BlobStore for Backend {
     }
 
     #[instrument(skip(self))]
-    async fn get_upload_size(&self, name: &str, uuid: &str) -> Result<u64, Error> {
+    async fn get_upload_state(&self, name: &str, uuid: &str) -> Result<UploadState, Error> {
         let path = path_builder::upload_path(name, uuid);
-        self.file_size_or_err(&path, Error::UploadNotFound).await
+        let size = self.file_size_or_err(&path, Error::UploadNotFound).await?;
+        Ok(UploadState {
+            size,
+            multipart_upload_id: None,
+            parts: Vec::new(),
+            pending_size: 0,
+        })
     }
 
     #[instrument(skip(self))]
