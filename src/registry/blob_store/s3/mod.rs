@@ -797,13 +797,17 @@ impl BlobStore for Backend {
         append: bool,
         state: Option<UploadState>,
     ) -> Result<(Digest, u64), Error> {
-        if self.uniform_parts {
+        let result = if self.uniform_parts {
             self.write_upload_uniform(name, uuid, stream, append, state)
                 .await
         } else {
             self.write_upload_nonuniform(name, uuid, stream, content_length, state)
                 .await
+        };
+        if result.is_ok() {
+            self.evict_upload_state(name, uuid).await;
         }
+        result
     }
 
     #[instrument(skip(self))]
