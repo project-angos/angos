@@ -257,7 +257,7 @@ impl Registry {
         })?;
 
         Ok(GetManifestResponse {
-            media_type: manifest.media_type,
+            media_type: link.media_type.or(manifest.media_type),
             digest: link.target,
             content,
         })
