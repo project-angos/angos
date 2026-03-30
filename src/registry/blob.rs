@@ -100,7 +100,7 @@ impl Registry {
         storage_engine.create_upload(namespace, &session_id).await?;
 
         storage_engine
-            .write_upload(namespace, &session_id, Box::new(stream), false)
+            .write_upload(namespace, &session_id, Box::new(stream), 0, false, None)
             .await?;
 
         if let Err(error) = storage_engine

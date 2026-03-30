@@ -21,6 +21,7 @@ cel-interpreter = "0.10"
 chrono = { version = "0.4", features = ["serde"] }
 futures-util = { version = "0.3", default-features = false }
 hex = "0.4"
+http-body = "1"
 http-body-util = "0.1"
 humantime = "2.3"
 hyper = { version = "1.8" , features = ["full"]}
