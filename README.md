@@ -37,7 +37,7 @@ A fully OCI-compliant and Docker-compatible container registry.
 cat > config.toml << 'EOF'
 [server]
 bind_address = "0.0.0.0"
-port = 5000
+port = 8000
 
 [blob_store.fs]
 root_dir = "./registry-data"
@@ -52,8 +52,8 @@ EOF
 ./angos -c config.toml server
 
 # Push an image
-docker tag alpine:latest localhost:5000/test/alpine:latest
-docker push localhost:5000/test/alpine:latest
+docker tag alpine:latest localhost:8000/test/alpine:latest
+docker push localhost:8000/test/alpine:latest
 ```
 
 See the [Quickstart Tutorial](doc/tutorials/quickstart.md) for a complete walkthrough.

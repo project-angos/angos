@@ -47,7 +47,7 @@ Create a file named `config.toml`:
 ```toml
 [server]
 bind_address = "0.0.0.0"
-port = 5000
+port = 8000
 
 [blob_store.fs]
 root_dir = "./registry-data"
@@ -59,7 +59,7 @@ default_allow = true
 ```
 
 This configures the registry to:
-- Listen on all interfaces on port 5000
+- Listen on all interfaces on port 8000 (the default port)
 - Store images in the `./registry-data` directory
 - Allow unauthenticated access (for testing only)
 - Create a repository named `test` for pushing images
@@ -72,7 +72,7 @@ This configures the registry to:
 
 You should see output indicating the server is running:
 ```
-Listening on 0.0.0.0:5000 (non-TLS)
+Listening on 0.0.0.0:8000 (non-TLS)
 ```
 
 ## Step 4: Configure Docker for Insecure Registry
@@ -83,7 +83,7 @@ Edit or create `/etc/docker/daemon.json`:
 
 ```json
 {
-  "insecure-registries": ["localhost:5000"]
+  "insecure-registries": ["localhost:8000"]
 }
 ```
 
@@ -105,13 +105,13 @@ In a new terminal, tag an existing image for your registry:
 
 ```bash
 docker pull alpine:latest
-docker tag alpine:latest localhost:5000/test/alpine:latest
+docker tag alpine:latest localhost:8000/test/alpine:latest
 ```
 
 Push the image to your registry:
 
 ```bash
-docker push localhost:5000/test/alpine:latest
+docker push localhost:8000/test/alpine:latest
 ```
 
 ## Step 6: Pull the Image Back
@@ -119,8 +119,8 @@ docker push localhost:5000/test/alpine:latest
 Verify the image is stored by pulling it:
 
 ```bash
-docker rmi localhost:5000/test/alpine:latest
-docker pull localhost:5000/test/alpine:latest
+docker rmi localhost:8000/test/alpine:latest
+docker pull localhost:8000/test/alpine:latest
 ```
 
 You've successfully pushed and pulled an image from your own container registry.

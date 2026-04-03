@@ -40,12 +40,12 @@ Useful modules:
 **Solutions**:
 1. Check credentials are correct:
    ```bash
-   curl -u user:password http://localhost:5000/v2/
+   curl -u user:password http://localhost:8000/v2/
    ```
 
 2. For OIDC, verify token is valid:
    ```bash
-   curl -H "Authorization: Bearer $TOKEN" http://localhost:5000/v2/
+   curl -H "Authorization: Bearer $TOKEN" http://localhost:8000/v2/
    ```
 
 3. Check access policy allows the action:
@@ -119,7 +119,7 @@ Useful modules:
 **Solutions**:
 1. Verify the tag/digest exists:
    ```bash
-   curl http://localhost:5000/v2/namespace/image/tags/list
+   curl http://localhost:8000/v2/namespace/image/tags/list
    ```
 
 2. For pull-through cache, check upstream connectivity
@@ -219,6 +219,8 @@ Useful modules:
 
 ### Filesystem Permissions
 
+**Applies only to filesystem storage (`[blob_store.fs]` or `[metadata_store.fs]`).** For S3 backends, check IAM permissions and bucket policies instead.
+
 **Symptoms**: Permission denied errors.
 
 **Solutions**:
@@ -252,15 +254,14 @@ sudo chown -R $(id -u):$(id -g) /data/registry
 **Cause**: Concurrent operations on same resource.
 
 **Solutions for Redis locking**:
-1. Configure Redis locking (use `lock_strategy.redis` form):
+1. Configure Redis locking:
    ```toml
    [metadata_store.fs.lock_strategy.redis]
    url = "redis://localhost:6379"
    ttl = 10
-   max_retries = 100
    ```
 
-2. Increase retry settings
+2. Increase TTL if operations take longer
 3. Check for stuck processes
 
 **Solutions for S3 locking**:

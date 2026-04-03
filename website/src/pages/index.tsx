@@ -120,7 +120,7 @@ chmod +x angos-linux-amd64
 # Configure
 cat > config.toml << 'EOF'
 [server]
-port = 5000
+port = 8000
 
 [blob_store.fs]
 root_dir = "./data"

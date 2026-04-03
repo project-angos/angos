@@ -166,6 +166,10 @@ sequenceDiagram
     Registry-->>Client: Blob data
 ```
 
+> **Note:** On a blob cache miss, Angos fetches the blob twice from the upstream registry: once to stream directly to the client, and once to store in the cache.
+> This doubles upstream bandwidth usage for uncached blobs.
+> For rate-limited upstreams (e.g., Docker Hub), consider pre-warming your cache during off-peak hours.
+
 ---
 
 ## Streaming Architecture

@@ -6,13 +6,14 @@ title: "Deploy on Kubernetes"
 
 # Deploy on Kubernetes
 
-Deploy Angos on Kubernetes using Kustomize or raw manifests.
+Deploy Angos on Kubernetes as a stateless service. Angos requires only configuration and storage, the binary itself is stateless.
 
 ## Prerequisites
 
 - Kubernetes cluster
 - `kubectl` configured
-- Persistent storage (PVC or S3)
+- S3-compatible storage (AWS S3, MinIO, etc.) for production deployments
+- Optional: Redis for distributed locking and caching in multi-replica deployments
 - Optional: Ingress controller for external access
 
 ---
@@ -41,7 +42,9 @@ kubectl apply -k contrib/kubernetes/kustomize/overlays/tls-traefik
 
 ---
 
-## Manual Deployment
+## Recommended Deployment (S3 + Stateless)
+
+This is the production-ready pattern: stateless Deployment + S3 storage backend.
 
 ### Step 1: Create Namespace
 
@@ -53,48 +56,47 @@ metadata:
   name: registry
 ```
 
-### Step 2: Create ConfigMap
+### Step 2: Create Secret with Configuration
 
-```yaml
-# configmap.yaml
-apiVersion: v1
-kind: ConfigMap
-metadata:
-  name: registry-config
-  namespace: registry
-data:
-  config.toml: |
-    [server]
-    bind_address = "0.0.0.0"
-    port = 5000
+The configuration file contains S3 credentials. Since ConfigMaps are not encrypted at rest, store it as a Kubernetes Secret instead. Consider enabling [encryption at rest](https://kubernetes.io/docs/tasks/administer-cluster/encrypt-data/) for Secrets in your cluster.
 
-    [blob_store.fs]
-    root_dir = "/data"
+```toml
+# config.toml
+[server]
+bind_address = "0.0.0.0"
+port = 8000
 
-    [ui]
-    enabled = true
-    name = "My Registry"
+[blob_store.s3]
+bucket = "my-registry-bucket"
+endpoint = "https://s3.amazonaws.com"
+region = "us-east-1"
+access_key_id = "YOUR_ACCESS_KEY"
+secret_key = "YOUR_SECRET_KEY"
+
+[metadata_store.s3]
+bucket = "my-registry-bucket"
+endpoint = "https://s3.amazonaws.com"
+region = "us-east-1"
+access_key_id = "YOUR_ACCESS_KEY"
+secret_key = "YOUR_SECRET_KEY"
+link_cache_ttl = 30
+access_time_debounce_secs = 60
+
+[metadata_store.s3.lock_strategy.s3]
+ttl_secs = 30
+
+[ui]
+enabled = true
+name = "My Registry"
 ```
 
-### Step 3: Create PersistentVolumeClaim
-
-```yaml
-# pvc.yaml
-apiVersion: v1
-kind: PersistentVolumeClaim
-metadata:
-  name: registry-data
-  namespace: registry
-spec:
-  accessModes:
-    - ReadWriteOnce
-  resources:
-    requests:
-      storage: 100Gi
-  storageClassName: standard  # Adjust for your cluster
+```bash
+kubectl create secret generic registry-config \
+  --namespace registry \
+  --from-file=config.toml=config.toml
 ```
 
-### Step 4: Create Deployment
+### Step 3: Create stateless Deployment
 
 ```yaml
 # deployment.yaml
@@ -104,7 +106,7 @@ metadata:
   name: registry
   namespace: registry
 spec:
-  replicas: 1
+  replicas: 3
   selector:
     matchLabels:
       app: registry
@@ -118,23 +120,21 @@ spec:
           image: ghcr.io/project-angos/angos:latest
           args: ["-c", "/config/config.toml", "server"]
           ports:
-            - containerPort: 5000
+            - containerPort: 8000
           volumeMounts:
             - name: config
               mountPath: /config
               readOnly: true
-            - name: data
-              mountPath: /data
           livenessProbe:
             httpGet:
               path: /healthz
-              port: 5000
+              port: 8000
             initialDelaySeconds: 5
             periodSeconds: 10
           readinessProbe:
             httpGet:
               path: /readyz
-              port: 5000
+              port: 8000
             initialDelaySeconds: 5
             periodSeconds: 5
           resources:
@@ -146,14 +146,11 @@ spec:
               memory: 512Mi
       volumes:
         - name: config
-          configMap:
-            name: registry-config
-        - name: data
-          persistentVolumeClaim:
-            claimName: registry-data
+          secret:
+            secretName: registry-config
 ```
 
-### Step 5: Create Service
+### Step 4: Create Service
 
 ```yaml
 # service.yaml
@@ -166,11 +163,11 @@ spec:
   selector:
     app: registry
   ports:
-    - port: 5000
-      targetPort: 5000
+    - port: 8000
+      targetPort: 8000
 ```
 
-### Step 6: Create Ingress
+### Step 5: Create Ingress
 
 ```yaml
 # ingress.yaml
@@ -197,15 +194,16 @@ spec:
               service:
                 name: registry
                 port:
-                  number: 5000
+                  number: 8000
 ```
 
-### Step 7: Apply Manifests
+### Step 6: Apply Manifests
 
 ```bash
 kubectl apply -f namespace.yaml
-kubectl apply -f configmap.yaml
-kubectl apply -f pvc.yaml
+kubectl create secret generic registry-config \
+  --namespace registry \
+  --from-file=config.toml=config.toml
 kubectl apply -f deployment.yaml
 kubectl apply -f service.yaml
 kubectl apply -f ingress.yaml
@@ -213,113 +211,9 @@ kubectl apply -f ingress.yaml
 
 ---
 
-## With S3 Backend
+## With Redis for Locking and Caching
 
-For multi-replica deployments, use S3 storage.
-
-### Create Secret
-
-```bash
-kubectl create secret generic registry-s3 \
-  --namespace registry \
-  --from-literal=access-key-id=YOUR_ACCESS_KEY \
-  --from-literal=secret-access-key=YOUR_SECRET_KEY
-```
-
-### Create ConfigMap Template
-
-Create a ConfigMap with placeholders that will be substituted:
-
-```yaml
-# configmap-template.yaml
-apiVersion: v1
-kind: ConfigMap
-metadata:
-  name: registry-config-template
-  namespace: registry
-data:
-  config.toml.template: |
-    [server]
-    bind_address = "0.0.0.0"
-    port = 5000
-
-    [blob_store.s3]
-    access_key_id = "${S3_ACCESS_KEY_ID}"
-    secret_key = "${S3_SECRET_ACCESS_KEY}"
-    endpoint = "https://s3.amazonaws.com"
-    bucket = "my-registry-bucket"
-    region = "us-east-1"
-
-    [ui]
-    enabled = true
-```
-
-### Update Deployment with Init Container
-
-Use an init container to substitute environment variables into the config:
-
-```yaml
-# deployment.yaml
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: registry
-  namespace: registry
-spec:
-  replicas: 1
-  selector:
-    matchLabels:
-      app: registry
-  template:
-    metadata:
-      labels:
-        app: registry
-    spec:
-      initContainers:
-        - name: config-init
-          image: busybox:1.36
-          command: ['sh', '-c', 'envsubst < /template/config.toml.template > /config/config.toml']
-          env:
-            - name: S3_ACCESS_KEY_ID
-              valueFrom:
-                secretKeyRef:
-                  name: registry-s3
-                  key: access-key-id
-            - name: S3_SECRET_ACCESS_KEY
-              valueFrom:
-                secretKeyRef:
-                  name: registry-s3
-                  key: secret-access-key
-          volumeMounts:
-            - name: config-template
-              mountPath: /template
-            - name: config
-              mountPath: /config
-      containers:
-        - name: registry
-          image: ghcr.io/project-angos/angos:latest
-          args: ["-c", "/config/config.toml", "server"]
-          ports:
-            - containerPort: 5000
-          volumeMounts:
-            - name: config
-              mountPath: /config
-            - name: data
-              mountPath: /data
-      volumes:
-        - name: config-template
-          configMap:
-            name: registry-config-template
-        - name: config
-          emptyDir: {}
-        - name: data
-          persistentVolumeClaim:
-            claimName: registry-data
-```
-
----
-
-## With Redis for Locking
+For improved performance in multi-replica deployments, add Redis for distributed locking and token caching.
 
 ### Deploy Redis
 
@@ -360,6 +254,8 @@ spec:
 
 ### Update Configuration
 
+Add Redis to `config.toml`:
+
 ```toml
 [metadata_store.s3.lock_strategy.redis]
 url = "redis://redis:6379"
@@ -371,11 +267,11 @@ url = "redis://redis:6379"
 
 ---
 
-## Scheduled Storage Maintenance
+## Scheduled Storage Maintenance (CronJob)
 
-### CronJob
+Run periodic maintenance to enforce retention policies and verify storage integrity.
 
-Run periodic maintenance to check storage integrity and enforce retention policies:
+**Important:** With S3 storage, the scrub job only needs the config volume, no data storage volume is required.
 
 ```yaml
 apiVersion: batch/v1
@@ -392,20 +288,15 @@ spec:
           containers:
             - name: scrub
               image: ghcr.io/project-angos/angos:latest
-              args: ["-c", "/config/config.toml", "scrub", "-t", "-m", "-b", "-r"]
+              args: ["-c", "/config/config.toml", "scrub", "--tags", "--manifests", "--blobs", "--retention"]
               volumeMounts:
                 - name: config
                   mountPath: /config
                   readOnly: true
-                - name: data
-                  mountPath: /data
           volumes:
             - name: config
-              configMap:
-                name: registry-config
-            - name: data
-              persistentVolumeClaim:
-                claimName: registry-data
+              secret:
+                secretName: registry-config
           restartPolicy: OnFailure
 ```
 
@@ -421,11 +312,58 @@ kubectl get pods -n registry
 kubectl logs -n registry -l app=registry -f
 
 # Port forward for testing
-kubectl port-forward -n registry svc/registry 5000:5000
+kubectl port-forward -n registry svc/registry 8000:8000
 
 # Test
-curl http://localhost:5000/v2/
+curl http://localhost:8000/v2/
 ```
+
+---
+
+## Backup and Disaster Recovery
+
+### With S3 Storage (Recommended)
+
+Angos is stateless—only configuration and S3 bucket data need protection.
+
+**Protect the S3 Bucket:**
+
+1. **Enable versioning:**
+   ```bash
+   aws s3api put-bucket-versioning \
+     --bucket my-registry-bucket \
+     --versioning-configuration Status=Enabled
+   ```
+
+2. **Enable cross-region replication:**
+   ```bash
+   aws s3api put-bucket-replication \
+     --bucket my-registry-bucket \
+     --replication-configuration file://replication.json
+   ```
+
+3. **Enable MFA delete protection** (requires root access):
+   ```bash
+   aws s3api put-bucket-versioning \
+     --bucket my-registry-bucket \
+     --versioning-configuration Status=Enabled,MFADelete=Enabled
+   ```
+
+**Backup Configuration:**
+
+Store `config.toml` and TLS certificates in version control or a separate secure location:
+
+```bash
+# Backup current config and secrets
+kubectl get secret -n registry registry-config -o yaml > config-backup.yaml
+kubectl get secret -n registry registry-tls -o yaml > tls-backup.yaml
+```
+
+**Recovery Plan:**
+
+- **Bucket loss:** Restore from cross-region replication or versioning
+- **Configuration loss:** Reapply from version control or backup files
+- **Complete failure:** Redeploy Deployment manifests, reapply Secrets, data is intact in S3
 
 ---
 
@@ -437,10 +375,13 @@ kubectl describe pod -n registry -l app=registry
 kubectl logs -n registry -l app=registry
 ```
 
-**PVC not binding:**
+**S3 connection errors:**
 ```bash
-kubectl get pvc -n registry
-kubectl describe pvc -n registry registry-data
+# Verify S3 credentials
+aws s3 ls s3://my-registry-bucket --region us-east-1
+
+# Check access key permissions
+aws iam get-user
 ```
 
 **Ingress not working:**
@@ -449,8 +390,11 @@ kubectl describe ingress -n registry registry
 kubectl get events -n registry
 ```
 
+---
+
 ## Next Steps
 
 - [Configure mTLS](configure-mtls.md) with TLS passthrough
 - [Configure GitHub Actions OIDC](configure-github-actions-oidc.md) for CI/CD
 - [Set Up Access Control](set-up-access-control.md) for policy-based authorization
+- [Storage Maintenance](run-storage-maintenance.md) for retention policies and cleanup

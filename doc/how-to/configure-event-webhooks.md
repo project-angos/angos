@@ -13,39 +13,6 @@ Notify external systems when registry events occur -- manifest pushes, blob uplo
 - Angos running
 - External HTTP/HTTPS endpoint to receive events
 
-## How Event Webhooks Work
-
-1. Client performs a mutating operation (push, delete, tag)
-2. Registry builds an event payload with operation details
-3. Registry delivers the event to matching webhook endpoints
-4. Delivery behavior depends on the configured policy
-
-```mermaid
-sequenceDiagram
-    participant C as Client
-    participant R as Registry
-    participant W as Webhook Endpoint
-
-    C->>R: Push manifest
-    R->>R: Store manifest
-    R->>W: POST event payload
-    alt required policy
-        W-->>R: 200 OK
-        R-->>C: 201 Created
-    else required + failure
-        W-->>R: 500 Error
-        R-->>C: 500 Error
-    else optional policy
-        W-->>R: 500 Error
-        R-->>C: 201 Created (logged)
-    else async policy
-        R-->>C: 201 Created (immediate)
-        W-->>R: 200 OK (later)
-    end
-```
-
----
-
 ## Basic Configuration
 
 ### Define a Webhook

@@ -8,13 +8,17 @@ title: "Deploy with Docker Compose"
 
 Deploy Angos using Docker Compose with persistent storage and TLS.
 
+**Note:** This guide uses filesystem storage for simplicity. For production multi-host deployments, use S3 storage instead (see the "With S3 Locking for Multi-Replica" section below).
+
 ## Prerequisites
 
 - Docker with the Compose plugin installed
 - A domain name (for TLS) or self-signed certificates
 - Optional: Docker Hub credentials for pull-through cache
 
-## Basic Deployment
+## Basic Deployment (Development/Testing)
+
+**This basic deployment uses filesystem storage and is suitable for development and testing only.** For production, see the sections below on S3 and multi-replica setups.
 
 ### Step 1: Create Configuration
 
@@ -30,7 +34,7 @@ Create `config/config.toml`:
 ```toml
 [server]
 bind_address = "0.0.0.0"
-port = 5000
+port = 8000
 
 [blob_store.fs]
 root_dir = "/data"
@@ -49,7 +53,7 @@ services:
   registry:
     image: ghcr.io/project-angos/angos:latest
     ports:
-      - "5000:5000"
+      - "8000:8000"
     volumes:
       - ./config:/config:ro
       - ./data:/data
@@ -66,7 +70,7 @@ docker compose up -d
 ### Step 4: Verify
 
 ```bash
-curl http://localhost:5000/v2/
+curl http://localhost:8000/v2/
 ```
 
 ---
@@ -94,7 +98,7 @@ Update `config/config.toml`:
 ```toml
 [server]
 bind_address = "0.0.0.0"
-port = 5000
+port = 8000
 
 [server.tls]
 server_certificate_bundle = "/certs/server.crt"
@@ -120,7 +124,7 @@ services:
   registry:
     image: ghcr.io/project-angos/angos:latest
     ports:
-      - "443:5000"
+      - "443:8000"
     volumes:
       - ./config:/config:ro
       - ./data:/data
@@ -128,7 +132,8 @@ services:
     command: ["-c", "/config/config.toml", "server"]
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "curl", "-f", "-k", "https://localhost:5000/healthz"]
+      # /healthz returns 200 when the registry is ready to serve requests
+      test: ["CMD", "curl", "-f", "-k", "https://localhost:8000/healthz"]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -143,7 +148,7 @@ services:
 ```toml
 [server]
 bind_address = "0.0.0.0"
-port = 5000
+port = 8000
 
 [server.tls]
 server_certificate_bundle = "/certs/server.crt"
@@ -190,7 +195,7 @@ services:
   registry:
     image: ghcr.io/project-angos/angos:latest
     ports:
-      - "5000:5000"
+      - "8000:8000"
     volumes:
       - ./config:/config:ro
       - ./data:/data
@@ -216,7 +221,7 @@ volumes:
 ```toml
 [server]
 bind_address = "0.0.0.0"
-port = 5000
+port = 8000
 
 [blob_store.fs]
 root_dir = "/data"
@@ -247,7 +252,7 @@ services:
   registry:
     image: ghcr.io/project-angos/angos:latest
     ports:
-      - "5000:5000"
+      - "8000:8000"
     volumes:
       - ./config:/config:ro
     command: ["-c", "/config/config.toml", "server"]
@@ -261,7 +266,7 @@ services:
 ```toml
 [server]
 bind_address = "0.0.0.0"
-port = 5000
+port = 8000
 
 [blob_store.s3]
 bucket = "my-registry"
@@ -285,41 +290,37 @@ At startup, Angos probes the S3 provider to verify conditional write support. If
 
 ## Scheduled Storage Maintenance
 
-Add a maintenance service to docker-compose.yml:
-
-```yaml
-services:
-  # ... registry service ...
-
-  maintenance:
-    image: ghcr.io/project-angos/angos:latest
-    volumes:
-      - ./config:/config:ro
-      - ./data:/data
-    command: ["-c", "/config/config.toml", "scrub", "-t", "-m", "-b", "-r"]
-    profiles:
-      - maintenance
-
-  # Better use a systemd.timer approach
-  maintenance-cron:
-    image: ghcr.io/project-angos/angos:latest
-    volumes:
-      - ./config:/config:ro
-      - ./data:/data
-    entrypoint: /bin/sh
-    command: |
-      -c 'while true; do
-        sleep 86400
-        /angos -c /config/config.toml scrub -t -m -b -r
-      done'
-    restart: unless-stopped
-```
-
-Run manual maintenance:
+For scheduled maintenance (scrub), use your system's cron scheduler or a dedicated cron container:
 
 ```bash
-docker compose --profile maintenance run --rm maintenance
+# Run manual maintenance with Docker Compose
+docker compose run --rm registry /angos -c /config/config.toml scrub --tags --manifests --blobs --retention
 ```
+
+**Cron scheduling approaches:**
+
+1. **System cron (recommended):**
+   ```bash
+   # Add to crontab -e: run scrub daily at 3 AM
+   0 3 * * * cd /path/to/registry && docker compose run --rm registry /angos -c /config/config.toml scrub --tags --manifests --blobs --retention
+   ```
+
+2. **Docker container cron (ofelia):**
+   Add to docker-compose.yml:
+   ```yaml
+   services:
+     ofelia:
+       image: mcuadros/ofelia:latest
+       volumes:
+         - /var/run/docker.sock:/var/run/docker.sock
+       command: daemon --docker
+
+     # Add to registry service:
+     # labels:
+     #   ofelia.enabled: "true"
+     #   ofelia.job-exec.registry-scrub.schedule: "@daily"
+     #   ofelia.job-exec.registry-scrub.command: "/angos -c /config/config.toml scrub --tags --manifests --blobs --retention"
+   ```
 
 ---
 
@@ -334,11 +335,11 @@ docker compose logs -f registry
 
 # Test push
 docker pull alpine:latest
-docker tag alpine:latest localhost:5000/test/alpine:latest
-docker push localhost:5000/test/alpine:latest
+docker tag alpine:latest localhost:8000/test/alpine:latest
+docker push localhost:8000/test/alpine:latest
 
 # Test pull-through cache
-docker pull localhost:5000/library/nginx:latest
+docker pull localhost:8000/library/nginx:latest
 ```
 
 ---

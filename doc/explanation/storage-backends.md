@@ -119,9 +119,9 @@ root_dir = "/var/registry/data"  # Can be same as blob store
 - Cost-effective for small deployments
 
 **Disadvantages:**
-- Limited to single node (without shared filesystem)
-- Scaling requires shared storage (NFS, EFS)
-- No built-in redundancy
+- Single-instance only: no multi-replica support without a shared storage
+- No built-in redundancy or high availability
+- Shared filesystem (NFS, EFS) not recommended for production (see below)
 
 ### Durability Options
 
@@ -131,8 +131,8 @@ root_dir = "/data"
 sync_to_disk = true  # fsync after writes
 ```
 
-- `sync_to_disk = false`: Faster, relies on OS buffering
-- `sync_to_disk = true`: Slower, guaranteed durability
+- `sync_to_disk = true`: Every write is flushed to disk with `fsync()`, guaranteeing durability at the cost of higher write latency.
+- `sync_to_disk = false` (default): Relies on OS page cache for better performance. Acceptable when the underlying storage already provides durability guarantees (e.g., battery-backed RAID, ZFS, cloud block storage with replication). Without such guarantees, data may be lost on crash or power failure.
 
 ---
 
@@ -243,23 +243,6 @@ key_prefix = "registry-locks"
 url = "redis://redis:6379"
 ```
 
-### With Shared Filesystem + Redis
-
-```toml
-[blob_store.fs]
-root_dir = "/mnt/nfs/registry"
-
-[metadata_store.fs]
-root_dir = "/mnt/nfs/registry"
-
-[metadata_store.fs.lock_strategy.redis]
-url = "redis://redis:6379"
-ttl = 10
-
-[cache.redis]
-url = "redis://redis:6379"
-```
-
 ---
 
 ## Locking Behavior
@@ -302,7 +285,30 @@ The heartbeat interval is automatically calculated as `ttl_secs / 3`. For exampl
 
 :::note
 The S3 provider must support conditional writes. Angos probes for this capability at startup and fails fast if it is not available.
+Known providers that support conditional writes: AWS S3, MinIO, Exoscale SOS.
 :::
+
+If your S3 provider does not support conditional writes, use Redis locking instead:
+
+```toml
+[metadata_store.s3.lock_strategy.redis]
+url = "redis://redis:6379"
+ttl = 10
+key_prefix = "registry-locks"
+```
+
+---
+
+### Shared Filesystem (Not Recommended)
+
+**Not recommended for production.** Shared filesystems (NFS, EFS) introduce operational complexity that defeats Angos's stateless design:
+
+- **Lock handling**: Distributed locking on shared filesystems is complex and error-prone
+- **Performance tuning**: NFS requires careful tuning of cache coherency and lock protocols
+- **Recovery**: Handling stale locks and crashed instances is difficult without explicit consensus mechanisms
+- **Scaling issues**: Lock contention worsens as replicas increase
+
+**For multi-replica deployments, use S3 instead.** S3 provides distributed locking natively (via conditional writes) with no additional infrastructure, better operational clarity, and superior scalability.
 
 Lock is held during:
 - Manifest writes (tag updates)
@@ -325,89 +331,6 @@ For multi-instance deployments, alert on:
 
 See the [configuration reference](../reference/configuration.md#prometheus-metrics) for the full metrics list.
 
----
-
-## Multi-Instance Consistency
-
-When multiple Angos instances share an S3 metadata backend, locking guarantees write safety but caching introduces read consistency trade-offs. This section covers what to expect and how to tune for your requirements.
-
-### Cache Modes
-
-By default, Angos caches link metadata (tags, layer links) in memory. Each instance maintains its own cache, so a write on instance A is not visible to instance B until the cache entry expires or is evicted. The `link_cache_ttl` setting (default 30 s) controls how long stale entries persist.
-
-**Option 1: Redis cache (recommended for multi-instance)**
-
-A shared Redis cache eliminates cross-instance staleness. When instance A writes a tag, instance B sees the updated cache entry immediately because both share the same Redis-backed store.
-
-```toml
-[blob_store.s3]
-bucket = "my-registry"
-endpoint = "https://s3.amazonaws.com"
-region = "us-east-1"
-
-[metadata_store.s3]
-bucket = "my-registry"
-endpoint = "https://s3.amazonaws.com"
-region = "us-east-1"
-
-[metadata_store.s3.lock_strategy.s3]
-
-[cache.redis]
-url = "redis://redis:6379"
-```
-
-**Option 2: Reduced TTL (no Redis required)**
-
-If adding Redis is not practical, reduce `link_cache_ttl` to shrink the staleness window. A lower TTL increases S3 read traffic but keeps all infrastructure in S3.
-
-```toml
-[blob_store.s3]
-bucket = "my-registry"
-endpoint = "https://s3.amazonaws.com"
-region = "us-east-1"
-
-[metadata_store.s3]
-bucket = "my-registry"
-endpoint = "https://s3.amazonaws.com"
-region = "us-east-1"
-link_cache_ttl = 5  # 5 seconds instead of 30
-
-[metadata_store.s3.lock_strategy.s3]
-```
-
-Setting `link_cache_ttl = 0` disables the cache entirely and always reads from S3.
-
-### S3 Lock Recovery
-
-S3 locks use a TTL (default 30 seconds, minimum 3 seconds) with automatic heartbeat renewal at `ttl_secs / 3` intervals. Under normal operation the holder renews the lock before it expires. If an instance crashes while holding a lock, other instances must wait for the full TTL to elapse before the lock is recovered. You can tune this trade-off:
-
-- **Lower `ttl_secs`** (e.g., 15): faster recovery after a crash, but more frequent heartbeat writes (at 5 s intervals).
-- **Higher `ttl_secs`** (e.g., 60): fewer heartbeat writes (at 20 s intervals), but longer recovery time.
-
-```toml
-[metadata_store.s3.lock_strategy.s3]
-ttl_secs = 15          # Faster crash recovery
-max_retries = 100
-retry_delay_ms = 50
-```
-
-### Access Times and Retention Policies
-
-Access time updates (`last_pulled_at`) are buffered in memory and flushed to S3 every `access_time_debounce_secs` seconds (default 60). In a multi-instance deployment, each instance maintains its own buffer. This means:
-
-- Access times may lag behind actual pulls by up to `access_time_debounce_secs`.
-- If an instance crashes before flushing, those buffered updates are lost.
-- Multiple instances may overwrite each other's access times (last writer wins).
-
-> **S3 Lock Performance:** When using S3 lock strategy, setting `access_time_debounce_secs = 0` disables buffering and causes every manifest pull to perform a lock-acquire → read → write → release cycle. This is particularly expensive with S3 locking and should be avoided in production. Use the default debounce value (60s or higher) for S3-locked deployments.
-
-For retention policies that use `last_pulled_at`, set thresholds in **days rather than minutes** to account for this imprecision. For example:
-
-```toml
-# Safe: 30-day threshold tolerates access time imprecision
-[global.retention_policy]
-rules = ["manifest.last_pulled_at < now() - days(30)"]
-```
 
 ---
 
@@ -521,9 +444,22 @@ multipart_copy_jobs = 4
 
 ### S3
 
+**Connectivity:**
 - **Region**: Minimize latency with nearby region
-- **VPC Endpoint**: Reduce costs and latency
-- **Part Size**: Larger parts = fewer requests, more memory
+- **VPC Endpoint**: Reduce costs and latency by avoiding internet gateway
+
+**Multipart Upload:**
+- **Part size** (`multipart_part_size`, default 50 MiB): Larger parts reduce requests but consume more memory. Each active multipart upload buffers up to this size in memory.
+- **Uniform parts** (`multipart_uniform_parts`, default false): Set to `true` only if your S3 provider strictly requires uniform non-final part sizes.
+
+**Timeout Configuration:**
+- **`operation_timeout_secs`** (default 900s): Total time allowed for the entire operation (e.g., upload or copy)
+- **`operation_attempt_timeout_secs`** (default 300s): Timeout per individual HTTP request attempt
+- Set `operation_attempt_timeout_secs` high enough to tolerate your worst-case S3 latency, but not so high that failed requests block indefinitely
+
+**Retry Strategy:**
+- **`max_attempts`** (default 3): Number of times to retry a failed request
+- Increase for unreliable networks, decrease if timeouts are common
 
 ### S3 Metadata Optimizations
 
@@ -531,7 +467,9 @@ When using S3 for metadata, Angos includes several optimizations to reduce round
 
 **Link cache** — A read-through cache for link metadata (tags, layer links). Populated on both read and write, invalidated on delete. Configurable TTL (default 30 s, `link_cache_ttl = 0` to disable). Shares the same cache backend (in-memory or Redis) as authentication tokens.
 
-**Deferred access time updates** — Instead of a synchronous lock-read-write-unlock cycle on every manifest pull, access time updates are buffered in memory and flushed periodically. Configurable interval (default 60 s, `access_time_debounce_secs = 0` to disable). This reduces the critical path per pull from 4 S3 operations to 1.
+In single-instance deployments, in-memory cache is sufficient. In multi-instance deployments, each instance maintains its own in-memory cache, so a write on instance A is not visible to instance B until the TTL expires. For consistency, use a shared Redis cache: when instance A writes a tag, all instances see the updated entry immediately.
+
+**Deferred access time updates** — Instead of a synchronous lock-read-write-unlock cycle on every manifest pull, access time updates are buffered in memory and flushed periodically. Configurable interval (default 60 s, `access_time_debounce_secs = 0` to disable). This reduces the critical path per pull from 4 S3 operations to 1. In multi-instance deployments, each instance maintains its own buffer, so access times may lag behind actual pulls and can be overwritten by concurrent instances (last writer wins).
 
 ```toml
 [metadata_store.s3]
@@ -539,6 +477,16 @@ When using S3 for metadata, Angos includes several optimizations to reduce round
 link_cache_ttl = 30               # seconds (0 to disable)
 access_time_debounce_secs = 60    # seconds (0 to disable)
 ```
+
+For retention policies that use `last_pulled_at`, set thresholds in **days rather than minutes** to account for buffering lag:
+
+```toml
+# Safe: 30-day threshold tolerates access time imprecision
+[global.retention_policy]
+rules = ["manifest.last_pulled_at < now() - days(30)"]
+```
+
+When using S3 locking, **never set `access_time_debounce_secs = 0`** in production. This disables buffering and causes every manifest pull to acquire and release a lock, which is expensive. Use the default 60 seconds or higher.
 
 #### Blob Index Sharding
 
@@ -649,7 +597,7 @@ Without Redis, cache is in-memory per-instance.
 | Requirement        | Filesystem     | S3              |
 |--------------------|----------------|-----------------|
 | Single instance    | ✅             | ✅               |
-| Multiple instances | ❌ (needs NFS) | ✅               |
+| Multiple instances | ❌              | ✅               |
 | High availability  | ❌             | ✅               |
 | Low latency        | ✅             | ❌               |
 | Native locking     | ✅ (in-memory) | ✅ (S3 or Redis) |

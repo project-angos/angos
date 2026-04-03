@@ -242,13 +242,13 @@ rules = [
 
 ```bash
 # Without auth
-curl http://localhost:5000/v2/
+curl http://localhost:8000/v2/
 
 # With basic auth
-curl -u admin:password http://localhost:5000/v2/
+curl -u admin:password http://localhost:8000/v2/
 
 # With bearer token
-curl -H "Authorization: Bearer $TOKEN" http://localhost:5000/v2/
+curl -H "Authorization: Bearer $TOKEN" http://localhost:8000/v2/
 ```
 
 ### Debug Logging

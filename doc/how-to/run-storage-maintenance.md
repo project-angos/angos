@@ -48,7 +48,7 @@ The `scrub` command performs various maintenance operations. Each check must be 
 See what would be deleted without making changes:
 
 ```bash
-./angos -c config.toml scrub -d -t -m -b -r
+./angos -c config.toml scrub --dry-run --tags --manifests --blobs --retention
 ```
 
 ### Run Full Cleanup
@@ -56,7 +56,7 @@ See what would be deleted without making changes:
 Run all checks (tags, manifests, blobs, and retention policies):
 
 ```bash
-./angos -c config.toml scrub -t -m -b -r
+./angos -c config.toml scrub --tags --manifests --blobs --retention
 ```
 
 ### Selective Cleanup
@@ -80,7 +80,7 @@ Run only specific checks:
 ### With Logging
 
 ```bash
-RUST_LOG=info ./angos -c config.toml scrub -t -m -b -r
+RUST_LOG=info ./angos -c config.toml scrub --tags --manifests --blobs --retention
 ```
 
 ---
@@ -91,10 +91,10 @@ RUST_LOG=info ./angos -c config.toml scrub -t -m -b -r
 
 ```bash
 # Daily at 3 AM - full cleanup
-0 3 * * * /usr/bin/angos -c /etc/registry/config.toml scrub -t -m -b -r >> /var/log/registry-scrub.log 2>&1
+0 3 * * * /usr/bin/angos -c /etc/registry/config.toml scrub --tags --manifests --blobs --retention >> /var/log/registry-scrub.log 2>&1
 
 # Weekly on Sunday at 2 AM
-0 2 * * 0 /usr/bin/angos -c /etc/registry/config.toml scrub -t -m -b -r
+0 2 * * 0 /usr/bin/angos -c /etc/registry/config.toml scrub --tags --manifests --blobs --retention
 ```
 
 ### Systemd Timer
@@ -107,7 +107,7 @@ Description=Registry Storage Maintenance
 
 [Service]
 Type=oneshot
-ExecStart=/usr/bin/angos -c /etc/registry/config.toml scrub -t -m -b -r
+ExecStart=/usr/bin/angos -c /etc/registry/config.toml scrub --tags --manifests --blobs --retention
 Environment=RUST_LOG=info
 ```
 
@@ -151,7 +151,7 @@ spec:
           containers:
             - name: scrub
               image: ghcr.io/project-angos/angos:latest
-              args: ["-c", "/config/config.toml", "scrub", "-t", "-m", "-b", "-r"]
+              args: ["-c", "/config/config.toml", "scrub", "--tags", "--manifests", "--blobs", "--retention"]
               env:
                 - name: RUST_LOG
                   value: info
@@ -159,15 +159,10 @@ spec:
                 - name: config
                   mountPath: /config
                   readOnly: true
-                - name: data
-                  mountPath: /data
           volumes:
             - name: config
-              configMap:
-                name: registry-config
-            - name: data
-              persistentVolumeClaim:
-                claimName: registry-data
+              secret:
+                secretName: registry-config
           restartPolicy: OnFailure
 ```
 
@@ -177,7 +172,7 @@ spec:
 services:
   scrub:
     image: ghcr.io/project-angos/angos:latest
-    command: ["-c", "/config/config.toml", "scrub", "-t", "-m", "-b", "-r"]
+    command: ["-c", "/config/config.toml", "scrub", "--tags", "--manifests", "--blobs", "--retention"]
     volumes:
       - ./config:/config:ro
       - ./data:/data
@@ -244,7 +239,7 @@ aws s3 ls s3://my-bucket --summarize --recursive
 Count manifests:
 
 ```bash
-curl http://localhost:5000/v2/_ext/_repositories | jq
+curl http://localhost:8000/v2/_ext/_repositories | jq
 ```
 
 ---
@@ -257,7 +252,7 @@ curl http://localhost:5000/v2/_ext/_repositories | jq
 - Verify manifests aren't protected
 - Use dry-run with debug logging:
   ```bash
-  RUST_LOG=debug ./angos scrub --dry-run
+  RUST_LOG=debug ./angos -c config.toml scrub --dry-run --tags --manifests --blobs --retention
   ```
 
 ### Storage Not Reduced
@@ -292,10 +287,10 @@ The `--media-types` flag reads each manifest blob and writes its `media_type` in
 
 ```bash
 # Preview what would be backfilled
-./angos -c config.toml scrub -M -d
+./angos -c config.toml scrub --media-types --dry-run
 
 # Backfill media types on all manifest links
-./angos -c config.toml scrub -M
+./angos -c config.toml scrub --media-types
 ```
 
 This is idempotent and safe to run multiple times.
@@ -326,10 +321,10 @@ The `--links` flag repairs link format inconsistencies. Use this when:
 
 ```bash
 # Preview what would be fixed
-./angos -c config.toml scrub -l -d
+./angos -c config.toml scrub --links --dry-run
 
 # Fix links format for all links
-./angos -c config.toml scrub -l
+./angos -c config.toml scrub --links
 ```
 
 This is idempotent and safe to run multiple times.

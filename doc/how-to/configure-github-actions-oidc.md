@@ -169,7 +169,7 @@ rules = [
 ```toml
 [server]
 bind_address = "0.0.0.0"
-port = 5000
+port = 8000
 
 [server.tls]
 server_certificate_bundle = "/tls/server.crt"

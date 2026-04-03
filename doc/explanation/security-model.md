@@ -92,17 +92,21 @@ Between registry and upstream registries:
 
 ## Fail-Closed Design
 
-Angos defaults to deny:
+Angos implements fail-closed authorization for critical security decisions:
 
-| Scenario | Behavior |
-|----------|----------|
-| No policies defined | Access denied |
-| Webhook timeout | Access denied |
-| Webhook error | Access denied |
-| Invalid mTLS certificate | TLS handshake fails |
-| Invalid OIDC token | Rejected immediately |
-| Invalid Basic Auth password | Anonymous identity |
-| CEL evaluation error | Rule skipped, evaluation continues |
+| Scenario                            | Behavior                           |
+|-------------------------------------|------------------------------------|
+| No policies defined                 | Access denied (fail-closed)        |
+| No authentication provided          | Proceeds as anonymous identity     |
+| Webhook timeout (`required` policy) | Access denied (fail-closed)        |
+| Webhook timeout (`optional` policy) | Access continues (best-effort)     |
+| Webhook not configured              | Not evaluated, access continues    |
+| Invalid mTLS certificate            | TLS handshake fails                |
+| Invalid OIDC token                  | 401 Unauthorized (fail-closed)     |
+| Invalid Basic Auth password         | Proceeds as anonymous identity     |
+| CEL evaluation error                | Rule skipped, evaluation continues |
+
+**Important:** Without authentication, requests proceed with an anonymous identity. Without access policies, the default behavior is to deny access (`default_allow = false`). To allow anonymous reads, you must explicitly configure access policies with appropriate rules.
 
 ### Policy Defaults
 

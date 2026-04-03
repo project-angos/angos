@@ -30,7 +30,7 @@ use crate::{
 )]
 pub struct Options {
     #[argh(switch, short = 'd')]
-    /// display only, no axtual changes applied
+    /// display only, no actual changes applied
     pub dry_run: bool,
     #[argh(option, short = 'u')]
     /// check for obsolete uploads with specified timeout

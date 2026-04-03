@@ -233,7 +233,7 @@ histogram_quantile(0.95, sum by (webhook, le) (rate(event_webhook_delivery_durat
 scrape_configs:
   - job_name: 'angos'
     static_configs:
-      - targets: ['registry:5000']
+      - targets: ['registry:8000']
     metrics_path: /metrics
     scheme: http  # or https
 ```
