@@ -119,7 +119,13 @@ sequenceDiagram
     HTTP-->>Client: 200 OK + manifest
 ```
 
-With S3 storage, blob requests redirect to pre-signed URLs to avoid proxying data through the registry.
+With S3 storage, blob and manifest GET requests redirect to pre-signed URLs by default, avoiding proxying data through the registry.
+This can be disabled with `enable_redirect = false` in `[global]`, in which case the registry proxies all responses.
+
+**When redirects are enabled** (`enable_redirect = true`, the default):
+- Clients must have direct network access to the S3 endpoint
+- Pre-signed URLs expire — very slow downloads may fail
+- S3 bucket policies must allow access from client IP ranges
 
 ---
 

@@ -12,15 +12,6 @@ Configure immutable tags to prevent overwrites and ensure deployment reproducibi
 
 - Angos running
 
-## Why Immutable Tags?
-
-Immutable tags ensure that a tag always points to the same image:
-- Prevents accidental overwrites
-- Guarantees reproducible deployments
-- Required for security compliance in many organizations
-
----
-
 ## Basic Configuration
 
 ### Enable Globally
@@ -177,23 +168,23 @@ unknown: Tag 'v1.0.0' is immutable and cannot be overwritten
 
 ```bash
 # First push succeeds
-docker tag alpine:latest localhost:5000/test/image:v1.0
-docker push localhost:5000/test/image:v1.0
+docker tag alpine:latest localhost:8000/test/image:v1.0
+docker push localhost:8000/test/image:v1.0
 
 # Second push with different content fails
-docker tag busybox:latest localhost:5000/test/image:v1.0
-docker push localhost:5000/test/image:v1.0
+docker tag busybox:latest localhost:8000/test/image:v1.0
+docker push localhost:8000/test/image:v1.0
 # Error: Tag 'v1.0' is immutable and cannot be overwritten
 
 # Excluded tags can be overwritten
-docker push localhost:5000/test/image:latest  # Succeeds
-docker push localhost:5000/test/image:latest  # Succeeds again
+docker push localhost:8000/test/image:latest  # Succeeds
+docker push localhost:8000/test/image:latest  # Succeeds again
 ```
 
 ### Check Current Configuration
 
 ```bash
-curl http://localhost:5000/v2/_ext/_repositories | jq
+curl http://localhost:8000/v2/_ext/_repositories | jq
 ```
 
 Response includes `immutable_tags: true/false` per repository.

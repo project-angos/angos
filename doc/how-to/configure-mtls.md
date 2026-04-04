@@ -35,7 +35,7 @@ Add TLS configuration to `config.toml`:
 ```toml
 [server]
 bind_address = "0.0.0.0"
-port = 5000
+port = 8000
 
 [server.tls]
 server_certificate_bundle = "/tls/server-certificate.pem"
@@ -165,7 +165,7 @@ Test with curl:
 ```bash
 curl --cert client.pem --key client-key.pem \
   --cacert ca.pem \
-  https://registry.example.com:5000/v2/
+  https://registry.example.com:8000/v2/
 ```
 
 Test with Docker:

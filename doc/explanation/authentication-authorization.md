@@ -208,6 +208,17 @@ identity = {
 
 ---
 
+## CEL Rule Evaluation
+
+**Rule evaluation:** Rules are evaluated disjunctively (OR'd). The meaning depends on the mode:
+
+- **`default_allow = false`** (default-deny): rules act as **allow** rules — access is granted if ANY rule returns true.
+- **`default_allow = true`** (default-allow): rules act as **deny** rules — access is denied if ANY rule returns true.
+
+Do not mix allow and deny logic in the same rules array — since rules are OR'd, a single matching rule determines the outcome.
+
+---
+
 ## Common Patterns
 
 ### Require Authentication

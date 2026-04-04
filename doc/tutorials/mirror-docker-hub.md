@@ -28,7 +28,7 @@ Create a `config.toml` with an upstream configuration:
 ```toml
 [server]
 bind_address = "0.0.0.0"
-port = 5000
+port = 8000
 
 [blob_store.fs]
 root_dir = "./registry-data"
@@ -44,7 +44,7 @@ The `docker-io` repository mirrors all Docker Hub images.
 
 ## Step 2: Add Authentication (Optional but Recommended)
 
-Docker Hub has rate limits for anonymous users. Add credentials to avoid hitting limits:
+Docker Hub has rate limits for anonymous users. Update your existing `[[repository."docker-io".upstream]]` block with credentials to avoid hitting limits:
 
 ```toml
 [[repository."docker-io".upstream]]
@@ -82,7 +82,7 @@ This means:
 Configure Docker to use your registry as a mirror, or pull directly:
 
 ```bash
-docker pull localhost:5000/docker-io/library/nginx:1.25.0
+docker pull localhost:8000/docker-io/library/nginx:1.25.0
 ```
 
 The first pull fetches from Docker Hub and caches locally. Watch the registry logs to see the upstream fetch.
@@ -92,20 +92,20 @@ The first pull fetches from Docker Hub and caches locally. Watch the registry lo
 Pull the same image again:
 
 ```bash
-docker rmi localhost:5000/docker-io/library/nginx:1.25.0
-docker pull localhost:5000/docker-io/library/nginx:1.25.0
+docker rmi localhost:8000/docker-io/library/nginx:1.25.0
+docker pull localhost:8000/docker-io/library/nginx:1.25.0
 ```
 
 The second pull should be faster as it's served from local cache without contacting Docker Hub.
 
 ## Step 7: Check Cache Contents
 
-If you have the Web UI enabled, browse to `http://localhost:5000` to see cached images.
+If you have the Web UI enabled, browse to `http://localhost:8000` to see cached images. To enable the Web UI, see [Enable the Web UI](../how-to/enable-web-ui.md).
 
 Or use the API:
 
 ```bash
-curl http://localhost:5000/v2/docker-io/library/nginx/tags/list
+curl http://localhost:8000/v2/docker-io/library/nginx/tags/list
 ```
 
 You should see:
@@ -116,18 +116,26 @@ You should see:
 
 ## Complete Configuration
 
-Here's a production-ready configuration with multiple upstreams:
+Here's a production-ready configuration with S3 backend and multiple upstreams:
 
 ```toml
 [server]
 bind_address = "0.0.0.0"
-port = 5000
+port = 8000
 
 [global]
 max_concurrent_cache_jobs = 8
 
-[blob_store.fs]
-root_dir = "/var/registry/data"
+[blob_store.s3]
+bucket = "angos-mirror"
+region = "us-east-1"
+endpoint = "https://s3.amazonaws.com"
+access_key_id = "YOUR_ACCESS_KEY"
+secret_key = "YOUR_SECRET_KEY"
+# For S3-compatible providers (MinIO, Exoscale SOS, etc.), set endpoint accordingly
+
+[global.access_policy]
+default_allow = true
 
 # Docker Hub official images
 [repository."docker-io"]
@@ -147,6 +155,8 @@ immutable_tags_exclusions = ["^latest$", "^main$", "^develop$"]
 [[repository."ghcr.io".upstream]]
 url = "https://ghcr.io"
 ```
+
+Note: Filesystem storage (`[blob_store.fs]`) is suitable for quick testing only. Production deployments should use S3 or S3-compatible object storage.
 
 ## How Caching Works
 

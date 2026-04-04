@@ -43,7 +43,7 @@ Update your `config.toml` to add a user identity:
 ```toml
 [server]
 bind_address = "0.0.0.0"
-port = 5000
+port = 8000
 
 [blob_store.fs]
 root_dir = "./registry-data"
@@ -72,7 +72,7 @@ Your complete `config.toml` should now look like:
 ```toml
 [server]
 bind_address = "0.0.0.0"
-port = 5000
+port = 8000
 
 [blob_store.fs]
 root_dir = "./registry-data"
@@ -98,7 +98,7 @@ Edit or create `/etc/docker/daemon.json`:
 
 ```json
 {
-  "insecure-registries": ["localhost:5000"]
+  "insecure-registries": ["localhost:8000"]
 }
 ```
 
@@ -123,8 +123,8 @@ sudo systemctl restart docker
 Try to push without authentication:
 
 ```bash
-docker tag alpine:latest localhost:5000/test/alpine:latest
-docker push localhost:5000/test/alpine:latest
+docker tag alpine:latest localhost:8000/test/alpine:latest
+docker push localhost:8000/test/alpine:latest
 ```
 
 You should see an authentication error:
@@ -137,13 +137,13 @@ unauthorized: Access denied
 Login with your credentials:
 
 ```bash
-docker login localhost:5000 -u alice
+docker login localhost:8000 -u alice
 ```
 
 Enter your password when prompted. Now push the image:
 
 ```bash
-docker push localhost:5000/test/alpine:latest
+docker push localhost:8000/test/alpine:latest
 ```
 
 The push should succeed.
@@ -154,10 +154,10 @@ You can also verify using curl:
 
 ```bash
 # Without auth (should fail)
-curl http://localhost:5000/v2/
+curl http://localhost:8000/v2/
 
 # With auth (should succeed)
-curl -u alice:yourpassword http://localhost:5000/v2/
+curl -u alice:yourpassword http://localhost:8000/v2/
 ```
 
 ## Understanding the Policy

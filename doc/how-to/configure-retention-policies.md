@@ -109,7 +109,7 @@ rules = [
 
 ### Combined Rules
 
-A manifest is kept if **any** rule matches:
+A manifest is **KEPT** if **ANY** rule matches (rules are OR'd):
 
 ```toml
 rules = [
@@ -129,6 +129,10 @@ rules = [
   'top_pulled(10)'
 ]
 ```
+
+**Rule Functions:**
+- `top_pushed(n)` - Keep the n most recently pushed manifests
+- `top_pulled(n)` - Keep the n most recently pulled manifests
 
 ---
 
@@ -194,7 +198,7 @@ Result: Production images kept for 365 days, others for 7 days.
 
 ## Enforcing Retention Policies
 
-Retention policies are enforced by the `scrub` command with the `-r` flag:
+Retention policies are enforced by the `scrub` command with the `--retention` flag:
 
 ```bash
 # Preview what would be deleted
@@ -227,6 +231,14 @@ spec:
             - name: scrub
               image: ghcr.io/project-angos/angos:latest
               args: ["-c", "/config/config.toml", "scrub", "--retention"]
+              volumeMounts:
+                - name: config
+                  mountPath: /config
+                  readOnly: true
+          volumes:
+            - name: config
+              secret:
+                secretName: registry-config
           restartPolicy: OnFailure
 ```
 
@@ -243,7 +255,7 @@ RUST_LOG=info ./angos scrub --retention --dry-run
 ### List Current Manifests
 
 ```bash
-curl http://localhost:5000/v2/_ext/myrepo/myimage/_revisions | jq
+curl http://localhost:8000/v2/_ext/myrepo/myimage/_revisions | jq
 ```
 
 ---

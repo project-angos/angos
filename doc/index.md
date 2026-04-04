@@ -35,6 +35,7 @@ Step-by-step instructions for specific tasks:
 ### Operations
 - [Run Storage Maintenance](how-to/run-storage-maintenance.md)
 - [Enable the Web UI](how-to/enable-web-ui.md)
+- [Upgrade](how-to/upgrade.md)
 - [Troubleshoot Common Issues](how-to/troubleshoot-common-issues.md)
 
 ## Reference
@@ -54,7 +55,7 @@ Detailed technical reference:
 Conceptual explanations and architecture:
 
 - [Architecture Overview](explanation/architecture.md) - System design and components
-- [Storage Backends](explanation/storage-backends.md) - Filesystem vs S3
+- [Storage Backends](explanation/storage-backends.md) - S3 and filesystem storage options
 - [Authentication and Authorization](explanation/authentication-authorization.md) - Security model
 - [Pull-Through Caching](explanation/pull-through-caching.md) - How caching works
 - [Security Model](explanation/security-model.md) - Trust boundaries and best practices

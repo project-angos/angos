@@ -6,8 +6,6 @@ title: "Enable Web UI"
 
 # Enable the Web UI
 
-Set up the built-in web interface for browsing and managing container images.
-
 ## Prerequisites
 
 - Angos running
@@ -39,7 +37,7 @@ name = "My Container Registry"
 
 ### Access the UI
 
-Open `http://localhost:5000/` in your browser.
+Open `http://localhost:8000/` in your browser.
 
 ---
 
@@ -167,7 +165,7 @@ Expand annotations with the `[+]` button. Well-known keys are displayed with fri
 ### Check UI is Enabled
 
 ```bash
-curl http://localhost:5000/_ui/config
+curl http://localhost:8000/_ui/config
 ```
 
 Returns:
@@ -179,7 +177,7 @@ Returns:
 
 ```bash
 # With authentication
-curl -u admin:password http://localhost:5000/
+curl -u admin:password http://localhost:8000/
 ```
 
 ---

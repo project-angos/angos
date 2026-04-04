@@ -51,7 +51,7 @@ When omitted, the server runs without TLS (insecure).
 | `max_concurrent_requests`   | usize    | `64`     | Tokio worker threads (see Performance Tuning) |
 | `max_concurrent_cache_jobs` | usize    | `4`      | Maximum concurrent cache jobs               |
 | `update_pull_time`          | bool     | `false`  | Track pull times for retention policies     |
-| `enable_redirect`           | bool     | `true`   | Allow HTTP 307 redirects for blob downloads |
+| `enable_redirect`           | bool     | `true`   | Allow HTTP 307 redirects for blob and manifest downloads |
 | `immutable_tags`            | bool     | `false`  | Global immutable tags default               |
 | `immutable_tags_exclusions` | [string] | `[]`     | Regex patterns for mutable tags             |
 | `authorization_webhook`     | string   | -        | Name of webhook for authorization           |
@@ -468,7 +468,7 @@ Registry operations are likely I/O-bound (network transfers, storage I/O), so mo
 ```toml
 [server]
 bind_address = "0.0.0.0"
-port = 5000
+port = 8000
 
 [server.tls]
 server_certificate_bundle = "/tls/server.crt"
@@ -519,7 +519,7 @@ This example uses S3 for both blob and metadata storage with S3-based distribute
 ```toml
 [server]
 bind_address = "0.0.0.0"
-port = 5000
+port = 8000
 
 [global]
 update_pull_time = true
