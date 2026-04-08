@@ -508,7 +508,10 @@ impl Registry {
                     .await
             }
             && let Some(media_type) = link.media_type
-            && let Ok(Some(presigned_url)) = self.blob_store.get_blob_url(&link.target).await
+            && let Ok(Some(presigned_url)) = self
+                .blob_store
+                .get_blob_url(&link.target, Some(media_type.as_str()))
+                .await
         {
             return Response::builder()
                 .status(StatusCode::TEMPORARY_REDIRECT)
@@ -533,7 +536,10 @@ impl Registry {
         // lacks media_type), fall back to reading the full blob via get_manifest then
         // redirecting. Remove this block once all links have been re-pushed.
         if self.enable_redirect
-            && let Ok(Some(presigned_url)) = self.blob_store.get_blob_url(&manifest.digest).await
+            && let Ok(Some(presigned_url)) = self
+                .blob_store
+                .get_blob_url(&manifest.digest, manifest.media_type.as_deref())
+                .await
         {
             let mut builder = Response::builder()
                 .status(StatusCode::TEMPORARY_REDIRECT)

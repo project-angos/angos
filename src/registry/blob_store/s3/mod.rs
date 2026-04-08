@@ -918,11 +918,15 @@ impl BlobStore for Backend {
     }
 
     #[instrument(skip(self))]
-    async fn get_blob_url(&self, digest: &Digest) -> Result<Option<String>, Error> {
+    async fn get_blob_url(
+        &self,
+        digest: &Digest,
+        content_type: Option<&str>,
+    ) -> Result<Option<String>, Error> {
         let path = path_builder::blob_path(digest);
         let url = self
             .store
-            .generate_presigned_url(&path, std::time::Duration::from_secs(1800))
+            .generate_presigned_url(&path, std::time::Duration::from_secs(1800), content_type)
             .await?;
         Ok(Some(url))
     }
