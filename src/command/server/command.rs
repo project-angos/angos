@@ -141,7 +141,8 @@ async fn build_registry(
 
     let registry_config = RegistryConfig::new()
         .update_pull_time(config.global.update_pull_time)
-        .enable_redirect(config.global.enable_redirect)
+        .enable_blob_redirect(config.global.resolved_enable_blob_redirect())
+        .enable_manifest_redirect(config.global.resolved_enable_manifest_redirect())
         .concurrent_cache_jobs(config.global.max_concurrent_cache_jobs)
         .global_immutable_tags(config.global.immutable_tags)
         .global_immutable_tags_exclusions(config.global.immutable_tags_exclusions.clone());
@@ -610,7 +611,8 @@ mod tests {
 
         let registry_config = RegistryConfig::new()
             .update_pull_time(config.global.update_pull_time)
-            .enable_redirect(config.global.enable_redirect)
+            .enable_blob_redirect(config.global.resolved_enable_blob_redirect())
+            .enable_manifest_redirect(config.global.resolved_enable_manifest_redirect())
             .concurrent_cache_jobs(config.global.max_concurrent_cache_jobs)
             .global_immutable_tags(config.global.immutable_tags)
             .global_immutable_tags_exclusions(config.global.immutable_tags_exclusions.clone());

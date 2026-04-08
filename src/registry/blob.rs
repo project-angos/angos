@@ -298,8 +298,8 @@ impl Registry {
         }
 
         if range.is_none()
-            && self.enable_redirect
-            && let Ok(Some(presigned_url)) = self.blob_store.get_blob_url(digest).await
+            && self.enable_blob_redirect
+            && let Ok(Some(presigned_url)) = self.blob_store.get_blob_url(digest, None).await
         {
             return Response::builder()
                 .status(StatusCode::TEMPORARY_REDIRECT)

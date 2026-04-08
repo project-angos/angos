@@ -305,7 +305,7 @@ impl BlobStore for Backend {
     }
 
     #[instrument(skip(self))]
-    async fn get_blob_url(&self, _digest: &Digest) -> Result<Option<String>, Error> {
+    async fn get_blob_url(&self, _: &Digest, _: Option<&str>) -> Result<Option<String>, Error> {
         Ok(None)
     }
 

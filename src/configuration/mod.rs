@@ -5,7 +5,7 @@ use std::{
 };
 
 use serde::Deserialize;
-use tracing::info;
+use tracing::{info, warn};
 
 mod error;
 
@@ -60,8 +60,12 @@ pub struct GlobalConfig {
     pub max_concurrent_cache_jobs: usize,
     #[serde(default = "GlobalConfig::default_update_pull_time")]
     pub update_pull_time: bool,
-    #[serde(default = "GlobalConfig::default_enable_redirect")]
-    pub enable_redirect: bool,
+    #[serde(default)]
+    pub enable_redirect: Option<bool>,
+    #[serde(default)]
+    pub enable_blob_redirect: Option<bool>,
+    #[serde(default)]
+    pub enable_manifest_redirect: Option<bool>,
     #[serde(default)]
     pub access_policy: AccessPolicyConfig,
     #[serde(default)]
@@ -104,7 +108,9 @@ impl Default for GlobalConfig {
             max_concurrent_requests: GlobalConfig::default_max_concurrent_requests(),
             max_concurrent_cache_jobs: GlobalConfig::default_max_concurrent_cache_jobs(),
             update_pull_time: GlobalConfig::default_update_pull_time(),
-            enable_redirect: GlobalConfig::default_enable_redirect(),
+            enable_redirect: None,
+            enable_blob_redirect: None,
+            enable_manifest_redirect: None,
             access_policy: AccessPolicyConfig::default(),
             retention_policy: RetentionPolicyConfig::default(),
             immutable_tags: false,
@@ -128,8 +134,16 @@ impl GlobalConfig {
         false
     }
 
-    fn default_enable_redirect() -> bool {
-        true
+    pub fn resolved_enable_blob_redirect(&self) -> bool {
+        self.enable_blob_redirect
+            .or(self.enable_redirect)
+            .unwrap_or(true)
+    }
+
+    pub fn resolved_enable_manifest_redirect(&self) -> bool {
+        self.enable_manifest_redirect
+            .or(self.enable_redirect)
+            .unwrap_or(true)
     }
 }
 
@@ -166,6 +180,15 @@ impl Configuration {
 
         config.validate()?;
         Ok(config)
+    }
+
+    pub fn log_deprecations(&self) {
+        if self.global.enable_redirect.is_some() {
+            warn!(
+                "'global.enable_redirect' is deprecated; use \
+                 'global.enable_blob_redirect' and 'global.enable_manifest_redirect' instead"
+            );
+        }
     }
 
     pub fn validate(&self) -> Result<(), Error> {
@@ -1547,5 +1570,54 @@ mod tests {
             err_msg.contains("S3 lock strategy") || err_msg.contains("filesystem"),
             "Error should explain S3 lock strategy is unsupported for FS store, got: {err_msg}"
         );
+    }
+
+    #[test]
+    fn test_redirect_resolver_only_enable_redirect_true() {
+        let config = GlobalConfig {
+            enable_redirect: Some(true),
+            ..GlobalConfig::default()
+        };
+        assert!(config.resolved_enable_blob_redirect());
+        assert!(config.resolved_enable_manifest_redirect());
+    }
+
+    #[test]
+    fn test_redirect_resolver_only_enable_redirect_false() {
+        let config = GlobalConfig {
+            enable_redirect: Some(false),
+            ..GlobalConfig::default()
+        };
+        assert!(!config.resolved_enable_blob_redirect());
+        assert!(!config.resolved_enable_manifest_redirect());
+    }
+
+    #[test]
+    fn test_redirect_resolver_both_new_fields_set() {
+        let config = GlobalConfig {
+            enable_blob_redirect: Some(true),
+            enable_manifest_redirect: Some(false),
+            ..GlobalConfig::default()
+        };
+        assert!(config.resolved_enable_blob_redirect());
+        assert!(!config.resolved_enable_manifest_redirect());
+    }
+
+    #[test]
+    fn test_redirect_resolver_new_wins_over_old() {
+        let config = GlobalConfig {
+            enable_redirect: Some(false),
+            enable_blob_redirect: Some(true),
+            ..GlobalConfig::default()
+        };
+        assert!(config.resolved_enable_blob_redirect());
+        assert!(!config.resolved_enable_manifest_redirect());
+    }
+
+    #[test]
+    fn test_redirect_resolver_nothing_set_defaults_true() {
+        let config = GlobalConfig::default();
+        assert!(config.resolved_enable_blob_redirect());
+        assert!(config.resolved_enable_manifest_redirect());
     }
 }

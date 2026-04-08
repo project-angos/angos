@@ -500,7 +500,7 @@ impl Registry {
     ) -> Result<Response<ResponseBody>, Error> {
         let repository = self.get_repository_for_namespace(namespace)?;
 
-        if self.enable_redirect
+        if self.enable_manifest_redirect
             && let Ok(link) = {
                 let blob_link: LinkKind = reference.clone().into();
                 self.metadata_store
@@ -508,7 +508,10 @@ impl Registry {
                     .await
             }
             && let Some(media_type) = link.media_type
-            && let Ok(Some(presigned_url)) = self.blob_store.get_blob_url(&link.target).await
+            && let Ok(Some(presigned_url)) = self
+                .blob_store
+                .get_blob_url(&link.target, Some(media_type.as_str()))
+                .await
         {
             return Response::builder()
                 .status(StatusCode::TEMPORARY_REDIRECT)
@@ -532,8 +535,11 @@ impl Registry {
         // Backward compatibility: when the optimized redirect path above fails (link
         // lacks media_type), fall back to reading the full blob via get_manifest then
         // redirecting. Remove this block once all links have been re-pushed.
-        if self.enable_redirect
-            && let Ok(Some(presigned_url)) = self.blob_store.get_blob_url(&manifest.digest).await
+        if self.enable_manifest_redirect
+            && let Ok(Some(presigned_url)) = self
+                .blob_store
+                .get_blob_url(&manifest.digest, manifest.media_type.as_deref())
+                .await
         {
             let mut builder = Response::builder()
                 .status(StatusCode::TEMPORARY_REDIRECT)

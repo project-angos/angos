@@ -122,6 +122,8 @@ async fn run_command(cli_args: GlobalArguments, config: Configuration) {
         std::process::exit(1);
     }
 
+    config.log_deprecations();
+
     match cli_args.subcommand {
         SubCommand::Argon(_) => {
             if let Err(err) = argon::Command::run() {

@@ -93,7 +93,11 @@ pub trait BlobStore: Send + Sync {
         start_offset: Option<u64>,
     ) -> Result<(BoxedReader, u64), Error>;
 
-    async fn get_blob_url(&self, digest: &Digest) -> Result<Option<String>, Error>;
+    async fn get_blob_url(
+        &self,
+        digest: &Digest,
+        content_type: Option<&str>,
+    ) -> Result<Option<String>, Error>;
 
     async fn delete_blob(&self, digest: &Digest) -> Result<(), Error>;
 }

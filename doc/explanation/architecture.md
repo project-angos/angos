@@ -120,9 +120,9 @@ sequenceDiagram
 ```
 
 With S3 storage, blob and manifest GET requests redirect to pre-signed URLs by default, avoiding proxying data through the registry.
-This can be disabled with `enable_redirect = false` in `[global]`, in which case the registry proxies all responses.
+This can be disabled per object kind with `enable_blob_redirect = false` and/or `enable_manifest_redirect = false` in `[global]`, in which case the registry proxies the corresponding responses.
 
-**When redirects are enabled** (`enable_redirect = true`, the default):
+**When redirects are enabled** (both flags default to `true`):
 - Clients must have direct network access to the S3 endpoint
 - Pre-signed URLs expire — very slow downloads may fail
 - S3 bucket policies must allow access from client IP ranges

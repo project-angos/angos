@@ -172,7 +172,8 @@ pub mod tests {
 
         let registry_config = RegistryConfig::new()
             .update_pull_time(false)
-            .enable_redirect(true)
+            .enable_blob_redirect(true)
+            .enable_manifest_redirect(true)
             .concurrent_cache_jobs(10)
             .global_immutable_tags(false)
             .global_immutable_tags_exclusions(Vec::new());
@@ -223,7 +224,8 @@ pub mod tests {
 
         let registry_config = RegistryConfig::new()
             .update_pull_time(config.global.update_pull_time)
-            .enable_redirect(config.global.enable_redirect)
+            .enable_blob_redirect(config.global.resolved_enable_blob_redirect())
+            .enable_manifest_redirect(config.global.resolved_enable_manifest_redirect())
             .concurrent_cache_jobs(config.global.max_concurrent_cache_jobs)
             .global_immutable_tags(config.global.immutable_tags)
             .global_immutable_tags_exclusions(config.global.immutable_tags_exclusions.clone());
@@ -1068,7 +1070,8 @@ pub mod tests {
 
         let registry_config = RegistryConfig::new()
             .update_pull_time(false)
-            .enable_redirect(false)
+            .enable_blob_redirect(false)
+            .enable_manifest_redirect(false)
             .concurrent_cache_jobs(4)
             .global_immutable_tags(false)
             .global_immutable_tags_exclusions(Vec::new());
@@ -1188,7 +1191,8 @@ pub mod tests {
 
         let registry_config = RegistryConfig::new()
             .update_pull_time(config.global.update_pull_time)
-            .enable_redirect(config.global.enable_redirect)
+            .enable_blob_redirect(config.global.resolved_enable_blob_redirect())
+            .enable_manifest_redirect(config.global.resolved_enable_manifest_redirect())
             .concurrent_cache_jobs(config.global.max_concurrent_cache_jobs)
             .global_immutable_tags(config.global.immutable_tags)
             .global_immutable_tags_exclusions(config.global.immutable_tags_exclusions.clone());
