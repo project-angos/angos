@@ -103,3 +103,42 @@ delete_if_match = true
 ```
 
 See [Conditional Capabilities](../reference/configuration.md#conditional-capabilities-metadata_stores3capabilities) in the configuration reference for details on when to use this and which providers support each capability.
+
+---
+
+## 1.1.x → Next
+
+### Redirect Configuration Split
+
+#### What Changed
+
+`global.enable_redirect` has been deprecated and replaced by two separate flags:
+
+- `global.enable_blob_redirect` — controls HTTP 307 redirects for blob (layer/config) downloads.
+- `global.enable_manifest_redirect` — controls HTTP 307 redirects for manifest downloads.
+
+Both default to `true`, preserving historical behavior. The old `enable_redirect` field is still accepted as a fallback for both new flags and will emit a deprecation warning at startup.
+
+Additionally, presigned manifest URLs now include a `response-content-type` query parameter so that S3 serves the correct OCI/Docker media type after a redirect, rather than `binary/octet-stream`. This fixes `podman pull` and `skopeo copy` failures against Angos deployments with S3-backed storage and redirects enabled.
+
+#### Migration
+
+**If you had `enable_redirect = false` as a workaround for Podman/Skopeo manifest parsing errors**, you can now enable redirects:
+
+```toml
+[global]
+enable_blob_redirect = true
+enable_manifest_redirect = true
+```
+
+Or simply remove the `enable_redirect = false` line, since the default for both new flags is `true`.
+
+**If you want to keep redirects disabled**:
+
+```toml
+[global]
+enable_blob_redirect = false
+enable_manifest_redirect = false
+```
+
+**If you want to keep using `enable_redirect`**, no immediate action is required. The field continues to work as a fallback but will print a warning at startup. Update to the new fields at your convenience.

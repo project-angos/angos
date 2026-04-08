@@ -4,7 +4,8 @@ port = 8000
 
 [global]
 # 307 temporary redirections are not defined in the OCI spec, so zb don't (seems to) support 307 it.
-enable_redirect = false
+enable_blob_redirect = false
+enable_manifest_redirect = false
 
 [blob_store.s3]
 access_key_id = "root"

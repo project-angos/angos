@@ -51,7 +51,9 @@ When omitted, the server runs without TLS (insecure).
 | `max_concurrent_requests`   | usize    | `64`     | Tokio worker threads (see Performance Tuning) |
 | `max_concurrent_cache_jobs` | usize    | `4`      | Maximum concurrent cache jobs               |
 | `update_pull_time`          | bool     | `false`  | Track pull times for retention policies     |
-| `enable_redirect`           | bool     | `true`   | Allow HTTP 307 redirects for blob and manifest downloads |
+| `enable_redirect`           | bool     | —        | **Deprecated.** Fallback for both fields below when unset. |
+| `enable_blob_redirect`      | bool     | `true`   | Allow HTTP 307 redirects for blob downloads. |
+| `enable_manifest_redirect`  | bool     | `true`   | Allow HTTP 307 redirects for manifest downloads. Manifest bodies served via `response-content-type` to preserve the media type across redirects. |
 | `immutable_tags`            | bool     | `false`  | Global immutable tags default               |
 | `immutable_tags_exclusions` | [string] | `[]`     | Regex patterns for mutable tags             |
 | `authorization_webhook`     | string   | -        | Name of webhook for authorization           |

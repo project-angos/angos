@@ -317,7 +317,8 @@ mod tests {
 
         let registry_config = RegistryConfig::new()
             .update_pull_time(false)
-            .enable_redirect(true)
+            .enable_blob_redirect(true)
+            .enable_manifest_redirect(true)
             .concurrent_cache_jobs(10)
             .global_immutable_tags(false)
             .global_immutable_tags_exclusions(Vec::new());
@@ -578,7 +579,8 @@ mod tests {
 
         let registry_config = RegistryConfig::new()
             .update_pull_time(false)
-            .enable_redirect(true)
+            .enable_blob_redirect(true)
+            .enable_manifest_redirect(true)
             .concurrent_cache_jobs(10)
             .global_immutable_tags(false)
             .global_immutable_tags_exclusions(Vec::new());

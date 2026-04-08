@@ -31,9 +31,11 @@ use crate::{
     registry::{blob_store::BlobStore, metadata_store::MetadataStore, task_queue::TaskQueue},
 };
 
+#[allow(clippy::struct_excessive_bools)]
 pub struct RegistryConfig {
     pub update_pull_time: bool,
-    pub enable_redirect: bool,
+    pub enable_blob_redirect: bool,
+    pub enable_manifest_redirect: bool,
     pub concurrent_cache_jobs: usize,
     pub global_immutable_tags: bool,
     pub global_immutable_tags_exclusions: Vec<String>,
@@ -43,7 +45,8 @@ impl Default for RegistryConfig {
     fn default() -> Self {
         Self {
             update_pull_time: false,
-            enable_redirect: true,
+            enable_blob_redirect: true,
+            enable_manifest_redirect: true,
             concurrent_cache_jobs: 4,
             global_immutable_tags: false,
             global_immutable_tags_exclusions: Vec::new(),
@@ -61,8 +64,13 @@ impl RegistryConfig {
         self
     }
 
-    pub fn enable_redirect(mut self, enabled: bool) -> Self {
-        self.enable_redirect = enabled;
+    pub fn enable_blob_redirect(mut self, enabled: bool) -> Self {
+        self.enable_blob_redirect = enabled;
+        self
+    }
+
+    pub fn enable_manifest_redirect(mut self, enabled: bool) -> Self {
+        self.enable_manifest_redirect = enabled;
         self
     }
 
@@ -82,11 +90,13 @@ impl RegistryConfig {
     }
 }
 
+#[allow(clippy::struct_excessive_bools)]
 pub struct Registry {
     blob_store: Arc<dyn BlobStore + Send + Sync>,
     metadata_store: Arc<dyn MetadataStore + Send + Sync>,
     repositories: Arc<HashMap<String, Repository>>,
-    enable_redirect: bool,
+    enable_blob_redirect: bool,
+    enable_manifest_redirect: bool,
     update_pull_time: bool,
     task_queue: TaskQueue,
     global_immutable_tags: bool,
@@ -109,7 +119,8 @@ impl Registry {
     ) -> Result<Self, Error> {
         let res = Self {
             update_pull_time: config.update_pull_time,
-            enable_redirect: config.enable_redirect,
+            enable_blob_redirect: config.enable_blob_redirect,
+            enable_manifest_redirect: config.enable_manifest_redirect,
             blob_store,
             metadata_store,
             repositories,
@@ -191,7 +202,8 @@ pub mod test_utils {
 
         let config = RegistryConfig::new()
             .update_pull_time(global.update_pull_time)
-            .enable_redirect(global.enable_redirect)
+            .enable_blob_redirect(global.resolved_enable_blob_redirect())
+            .enable_manifest_redirect(global.resolved_enable_manifest_redirect())
             .concurrent_cache_jobs(global.max_concurrent_cache_jobs)
             .global_immutable_tags(global.immutable_tags)
             .global_immutable_tags_exclusions(global.immutable_tags_exclusions.clone());
