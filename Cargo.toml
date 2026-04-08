@@ -13,7 +13,7 @@ arc-swap = "1.9"
 argh = "0.1"
 argon2 = "0.5"
 async-trait = "0.1"
-aws-sdk-s3 = { version = "1.128" }
+aws-sdk-s3 = { version = "1.129" }
 base64 = "0.22"
 bytes = "1.11"
 bytesize = { version = "2.3", features = ["serde"] }
@@ -29,12 +29,12 @@ hyper-util = { version = "0.1", features = ["tokio", "server-graceful"] }
 jsonwebtoken = { version = "10.3", features = ["aws_lc_rs"] }
 mime_guess = "2.0"
 notify = "8.2"
-parking_lot = "0.12"
 opentelemetry = "0.31"
 opentelemetry_sdk = { version = "0.31", features = ["rt-tokio", "metrics"] }
 opentelemetry-otlp = { version = "0.31" , features = ["grpc-tonic"]}
+parking_lot = "0.12"
 prometheus = "0.14"
-redis = { version = "1.1", features = ["tokio-comp"] }
+redis = { version = "1.2", features = ["tokio-comp"] }
 regex = "1.12"
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "stream", "json"] }
 rpassword = "7.4"
