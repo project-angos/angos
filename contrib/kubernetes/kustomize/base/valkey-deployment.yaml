@@ -5,16 +5,16 @@ metadata:
   name: valkey-deployment
   namespace: angos
   labels:
-    app: valkey
+    app.kubernetes.io/name: valkey
 spec:
   replicas: 1
   selector:
     matchLabels:
-      app: valkey
+      app.kubernetes.io/name: valkey
   template:
     metadata:
       labels:
-        app: valkey
+        app.kubernetes.io/name: valkey
     spec:
       containers:
       - name: valkey
