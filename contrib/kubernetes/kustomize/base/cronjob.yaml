@@ -4,12 +4,17 @@ apiVersion: batch/v1
 metadata:
   name: scrub
   namespace: angos
+  labels:
+    app.kubernetes.io/name: angos-scrub
 spec:
   schedule: "*/5 * * * *"
   concurrencyPolicy: Forbid
   jobTemplate:
     spec:
       template:
+        metadata:
+          labels:
+            app.kubernetes.io/name: angos-scrub
         spec:
           restartPolicy: Never
           containers:
