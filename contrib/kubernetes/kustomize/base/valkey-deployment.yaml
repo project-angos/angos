@@ -5,19 +5,29 @@ metadata:
   name: valkey-deployment
   namespace: angos
   labels:
-    app: valkey
+    app.kubernetes.io/name: valkey
 spec:
   replicas: 1
   selector:
     matchLabels:
-      app: valkey
+      app.kubernetes.io/name: valkey
   template:
     metadata:
       labels:
-        app: valkey
+        app.kubernetes.io/name: valkey
     spec:
       containers:
       - name: valkey
         image: valkey/valkey:8.0.2
         ports:
         - containerPort: 6379
+        securityContext:
+          runAsUser: 1000
+          runAsGroup: 1000
+          fsGroup: 1000
+          runAsNonRoot: true
+          seccompProfile:
+            type: RuntimeDefault
+      securityContext:
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
