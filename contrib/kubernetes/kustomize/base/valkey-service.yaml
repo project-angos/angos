@@ -5,10 +5,10 @@ metadata:
   name: valkey
   namespace: angos
   labels:
-    app: valkey
+    app.kubernetes.io/name: valkey
 spec:
   selector:
-    app: valkey
+    app.kubernetes.io/name: valkey
   ports:
     - protocol: TCP
       port: 6379
