@@ -500,7 +500,22 @@ impl Registry {
     ) -> Result<Response<ResponseBody>, Error> {
         let repository = self.get_repository_for_namespace(namespace)?;
 
+        // The redirect fast-path serves the cached manifest link directly,
+        // bypassing `get_manifest` and its upstream revalidation. That is
+        // only safe when the cached target is authoritative:
+        //   * the repository is not a pull-through cache (we own the data),
+        //   * the reference is a digest (content-addressable, immutable),
+        //   * or the tag has been declared immutable via configuration.
+        // For mutable tags on a pull-through cache we must fall through to
+        // `get_manifest`, which HEADs the upstream and refreshes the cache
+        // when the tag has moved; otherwise clients would be pinned forever
+        // to the digest captured on the first pull.
+        let redirect_is_authoritative = !repository.is_pull_through()
+            || matches!(reference, Reference::Digest(_))
+            || is_tag_immutable;
+
         if self.enable_manifest_redirect
+            && redirect_is_authoritative
             && let Ok(link) = {
                 let blob_link: LinkKind = reference.clone().into();
                 self.metadata_store
