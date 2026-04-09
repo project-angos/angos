@@ -297,8 +297,15 @@ impl Registry {
             self.check_blob_namespace_access(namespace, digest).await?;
         }
 
+        // For pull-through repositories the blob index is populated when the
+        // manifest is cached, but the layer/config blobs themselves are only
+        // fetched on their first GET. Verify the blob is actually present in
+        // the local store before issuing a redirect; otherwise the client
+        // would follow the 307 to a missing object and see a 404.
         if range.is_none()
             && self.enable_blob_redirect
+            && (!repository.is_pull_through()
+                || self.blob_store.get_blob_size(digest).await.is_ok())
             && let Ok(Some(presigned_url)) = self.blob_store.get_blob_url(digest, None).await
         {
             return Response::builder()
