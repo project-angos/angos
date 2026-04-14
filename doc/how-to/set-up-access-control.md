@@ -70,13 +70,19 @@ rules = [
 [global.access_policy]
 default_allow = false
 rules = [
-  # Anyone can read
-  "request.action.startsWith('get-') || request.action == 'list-tags'",
+  # Anyone can pull images (anonymous read)
+  "request.action in ['get-manifest', 'get-blob', 'list-tags']",
 
   # Only admin can write
   "identity.username == 'admin'"
 ]
 ```
+
+:::warning
+Do not use `request.action.startsWith('get-')` for anonymous access. This would also allow
+`get-api-version` without authentication, which causes Docker to skip sending credentials on
+all subsequent requests — even pushes. Always list only the specific read actions you need.
+:::
 
 ### IP-Based Access
 
@@ -214,7 +220,7 @@ rules = [
 [repository."public".access_policy]
 default_allow = false
 rules = [
-  "request.action.startsWith('get-') || request.action == 'list-tags'"
+  "request.action in ['get-manifest', 'get-blob', 'list-tags']"
 ]
 
 # Development: team access

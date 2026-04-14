@@ -182,8 +182,8 @@ identity.oidc != null &&
 identity.oidc != null &&
   identity.oidc.claims['actor'] in ['alice', 'bob', 'dependabot[bot]']
 
-// Allow read operations for everyone
-request.action.startsWith('get-')
+// Allow pull operations for everyone (anonymous read)
+request.action in ['get-manifest', 'get-blob']
 
 // Restrict delete to admins
 identity.username == 'admin' && request.action == 'delete-manifest'
@@ -236,10 +236,15 @@ rules = [
 [repository."public".access_policy]
 default_allow = false
 rules = [
-  "request.action.startsWith('get-') || request.action == 'list-tags'",
+  "request.action in ['get-manifest', 'get-blob', 'list-tags']",
   "identity.username == 'admin'"
 ]
 ```
+
+:::warning
+Avoid `request.action.startsWith('get-')` for anonymous access — it includes `get-api-version`,
+which causes Docker clients to skip authentication entirely. List specific actions instead.
+:::
 
 ### Combined Retention Rules
 
