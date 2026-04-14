@@ -249,13 +249,18 @@ rules = [
 
 ```toml
 rules = [
-  # Anyone can read
-  "request.action.startsWith('get-')",
+  # Anyone can pull images
+  "request.action in ['get-manifest', 'get-blob']",
 
   # Only deployers can write
   "identity.username == 'deployer'"
 ]
 ```
+
+:::warning
+Do not use `request.action.startsWith('get-')` for anonymous access. This includes
+`get-api-version`, which causes Docker to skip sending credentials on all requests.
+:::
 
 ---
 
