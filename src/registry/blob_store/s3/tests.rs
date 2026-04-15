@@ -168,7 +168,7 @@ async fn test_delete_upload_cleans_all_artifacts() {
     let container_prefix = path_builder::upload_container_path("ns", &uuid);
     let (objects_before, _) = store
         .store
-        .list_objects(&container_prefix, 1000, None)
+        .list_objects(&container_prefix, 1000, None, None)
         .await
         .unwrap();
     assert!(
@@ -180,7 +180,7 @@ async fn test_delete_upload_cleans_all_artifacts() {
 
     let (objects_after, _) = store
         .store
-        .list_objects(&container_prefix, 1000, None)
+        .list_objects(&container_prefix, 1000, None, None)
         .await
         .unwrap();
     assert!(
@@ -222,7 +222,7 @@ async fn test_complete_upload_cleans_upload_container() {
     let container_prefix = path_builder::upload_container_path("ns", &uuid);
     let (objects_after, _) = store
         .store
-        .list_objects(&container_prefix, 1000, None)
+        .list_objects(&container_prefix, 1000, None, None)
         .await
         .unwrap();
     assert!(

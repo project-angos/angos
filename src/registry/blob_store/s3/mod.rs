@@ -19,6 +19,7 @@ use sha2::{Digest as ShaDigestTrait, Sha256};
 use tokio::{
     io::{AsyncRead, AsyncReadExt},
     sync::mpsc,
+    try_join,
 };
 use tracing::{debug, info, instrument};
 
@@ -30,12 +31,22 @@ use crate::{
             BlobStore, BoxedReader, Error, MultipartCleanup, UploadState,
             hashing_reader::HashingReader, sha256_ext::Sha256Ext,
         },
-        data_store, pagination, path_builder,
+        data_store, path_builder,
     },
 };
 
 const MIN_PART_SIZE: u64 = 5 * 1024 * 1024;
 const FRAME_SIZE: usize = 256 * 1024;
+
+// Channel depth for streaming bytes from the hashing reader to the S3 multipart upload
+// task in non-uniform mode. Bounds the per-upload memory footprint:
+//   peak in-flight bytes per concurrent upload
+//     = UPLOAD_CHANNEL_DEPTH * FRAME_SIZE          // frames queued in the channel
+//     + multipart_part_size                        // the BytesMut buffer being filled
+// With the defaults (32 * 256 KiB + 50 MiB) this is ~58 MiB per concurrent upload.
+// Raising this constant proportionally raises peak resident memory under concurrent load,
+// so do not bump it without revisiting the operator-facing memory budget.
+const UPLOAD_CHANNEL_DEPTH: usize = 32;
 
 #[derive(Clone)]
 pub struct Backend {
@@ -328,10 +339,16 @@ impl Backend {
         let state = self.get_upload_state_uniform(name, uuid).await?;
         let size = state.size;
 
-        let digest = self.load_hasher(name, uuid, size).await?.digest();
-
         let date_path = path_builder::upload_start_date_path(name, uuid);
-        let date_bytes = self.store.get_object_body(&date_path, None).await?;
+        let (hasher, date_bytes) = try_join!(self.load_hasher(name, uuid, size), async {
+            self.store
+                .get_object_body(&date_path, None)
+                .await
+                .map_err(Error::from)
+        })?;
+
+        let digest = hasher.digest();
+
         let date_str = String::from_utf8_lossy(&date_bytes);
         let start_date = DateTime::parse_from_rfc3339(&date_str)
             .unwrap_or_else(|_| Utc::now().fixed_offset())
@@ -450,11 +467,18 @@ impl Backend {
             self.cache_upload_id(&upload_path, &id).await;
             id
         };
-        let parts = self.store.list_parts(&upload_path, &id).await?;
+        let pending_path = path_builder::upload_patch_pending_path(name, uuid);
+        let (parts, pending) = try_join!(
+            async {
+                self.store
+                    .list_parts(&upload_path, &id)
+                    .await
+                    .map_err(Error::from)
+            },
+            async { Ok::<u64, Error>(self.store.object_size(&pending_path).await.unwrap_or(0)) }
+        )?;
         #[allow(clippy::cast_sign_loss)]
         let uploaded: u64 = parts.iter().map(|(_, _, sz)| *sz as u64).sum();
-        let pending_path = path_builder::upload_patch_pending_path(name, uuid);
-        let pending = self.store.object_size(&pending_path).await.unwrap_or(0);
         Ok((id, parts, uploaded, pending))
     }
 
@@ -498,7 +522,7 @@ impl Backend {
 
             let mut hashing_reader = HashingReader::with_hasher(combined, hasher);
 
-            let (tx, rx) = mpsc::channel::<Bytes>(32);
+            let (tx, rx) = mpsc::channel::<Bytes>(UPLOAD_CHANNEL_DEPTH);
             let body = ByteStream::from_body_1_x(ChannelBody { rx });
 
             let store = self.store.clone();
@@ -585,20 +609,29 @@ impl Backend {
         }
 
         let upload_path = path_builder::upload_path(name, uuid);
+        let pending_path = path_builder::upload_patch_pending_path(name, uuid);
 
-        let (multipart_upload_id, parts) =
+        let (multipart_upload_id, parts, pending_size) =
             if let Some(upload_id) = self.get_or_search_upload_id(&upload_path).await? {
-                let parts = self.store.list_parts(&upload_path, &upload_id).await?;
-                (Some(upload_id), parts)
+                let (parts, pending_size) = try_join!(
+                    async {
+                        self.store
+                            .list_parts(&upload_path, &upload_id)
+                            .await
+                            .map_err(Error::from)
+                    },
+                    async {
+                        Ok::<u64, Error>(self.store.object_size(&pending_path).await.unwrap_or(0))
+                    }
+                )?;
+                (Some(upload_id), parts, pending_size)
             } else {
-                (None, Vec::new())
+                let pending_size = self.store.object_size(&pending_path).await.unwrap_or(0);
+                (None, Vec::new(), pending_size)
             };
 
         #[allow(clippy::cast_sign_loss)]
         let uploaded: u64 = parts.iter().map(|(_, _, sz)| *sz as u64).sum();
-
-        let pending_path = path_builder::upload_patch_pending_path(name, uuid);
-        let pending_size = self.store.object_size(&pending_path).await.unwrap_or(0);
 
         let state = UploadState {
             size: uploaded + pending_size,
@@ -619,10 +652,16 @@ impl Backend {
         let state = self.get_upload_state_nonuniform(name, uuid).await?;
         let size = state.size;
 
-        let digest = self.load_hasher(name, uuid, size).await?.digest();
-
         let date_path = path_builder::upload_start_date_path(name, uuid);
-        let date_bytes = self.store.get_object_body(&date_path, None).await?;
+        let (hasher, date_bytes) = try_join!(self.load_hasher(name, uuid, size), async {
+            self.store
+                .get_object_body(&date_path, None)
+                .await
+                .map_err(Error::from)
+        })?;
+
+        let digest = hasher.digest();
+
         let date_str = String::from_utf8_lossy(&date_bytes);
         let start_date = DateTime::parse_from_rfc3339(&date_str)
             .unwrap_or_else(|_| Utc::now().fixed_offset())
@@ -644,11 +683,26 @@ impl Backend {
             .await?
             .ok_or(Error::UploadNotFound)?;
 
-        let part_list = if let Some(cached) = self.retrieve_cached_upload_state(name, uuid).await {
-            cached.parts
-        } else {
-            self.store.list_parts(&upload_path, &upload_id).await?
-        };
+        let pending_path = path_builder::upload_patch_pending_path(name, uuid);
+
+        let (part_list, pending_size) =
+            if let Some(cached) = self.retrieve_cached_upload_state(name, uuid).await {
+                let pending_size = self.store.object_size(&pending_path).await.unwrap_or(0);
+                (cached.parts, pending_size)
+            } else {
+                try_join!(
+                    async {
+                        self.store
+                            .list_parts(&upload_path, &upload_id)
+                            .await
+                            .map_err(Error::from)
+                    },
+                    async {
+                        Ok::<u64, Error>(self.store.object_size(&pending_path).await.unwrap_or(0))
+                    }
+                )?
+            };
+
         #[allow(clippy::cast_sign_loss)]
         let mut uploaded_size: u64 = part_list.iter().map(|(_, _, size)| *size as u64).sum();
 
@@ -661,22 +715,28 @@ impl Backend {
                     .build()
             })
             .collect();
-
-        let pending_path = path_builder::upload_patch_pending_path(name, uuid);
-        let pending_size = self.store.object_size(&pending_path).await.unwrap_or(0);
         if pending_size > 0 {
-            let pending_data = self.store.get_object_body(&pending_path, None).await?;
             #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
             let next_part = (parts.len() + 1) as i32;
-            let e_tag = self
-                .store
-                .upload_part(
-                    &upload_path,
-                    &upload_id,
-                    next_part,
-                    Bytes::from(pending_data),
-                )
-                .await?;
+            // S3 multipart rules: every part except the final one must be >= 5 MiB. Use
+            // server-side copy for large pending segments to avoid a GET+PUT round-trip;
+            // fall back to GET+upload_part when the pending tail is the mandatory
+            // sub-5 MiB final part.
+            let e_tag = if pending_size >= MIN_PART_SIZE {
+                self.store
+                    .upload_part_copy(&pending_path, &upload_path, &upload_id, next_part, None)
+                    .await?
+            } else {
+                let pending_data = self.store.get_object_body(&pending_path, None).await?;
+                self.store
+                    .upload_part(
+                        &upload_path,
+                        &upload_id,
+                        next_part,
+                        Bytes::from(pending_data),
+                    )
+                    .await?
+            };
             parts.push(
                 aws_sdk_s3::types::CompletedPart::builder()
                     .part_number(next_part)
@@ -720,14 +780,39 @@ impl BlobStore for Backend {
         let path = path_builder::blobs_root_dir();
         let blob_prefix = format!("{path}/{algorithm}/");
 
-        let mut all_blobs = Vec::new();
-        let mut list_continuation_token = None;
+        // Convert the previous continuation token (a sha256:<hash> digest) into an S3
+        // start_after key that lexicographically follows every sub-key for that blob
+        // (data, index.json, refs/...). Within the blob's directory all keys begin with
+        // `<hash>/`; appending '0' (0x30) is greater than '/' (0x2F), so the synthesised
+        // marker skips the entire blob without enumerating its sub-keys.
+        let mut start_after = continuation_token
+            .as_deref()
+            .and_then(|token| token.strip_prefix("sha256:"))
+            .and_then(|hash| hash.get(..2).map(|prefix| format!("{prefix}/{hash}0")));
 
-        loop {
+        let target = n as usize;
+        let mut blobs: Vec<Digest> = Vec::with_capacity(target);
+        let mut list_continuation_token: Option<String> = None;
+
+        // S3 returns keys in lexicographic order. Each blob contributes a few sub-keys
+        // (data, index.json, refs/<ns>.json) so request more keys than blobs to reduce
+        // round-trips while keeping the per-page memory bounded.
+        let max_keys = i32::try_from(target.saturating_mul(4).clamp(1, 1000)).unwrap_or(1000);
+
+        while blobs.len() < target {
             let (objects, next_token) = self
                 .store
-                .list_objects(&blob_prefix, 1000, list_continuation_token)
+                .list_objects(
+                    &blob_prefix,
+                    max_keys,
+                    list_continuation_token.take(),
+                    start_after.take(),
+                )
                 .await?;
+
+            if objects.is_empty() {
+                break;
+            }
 
             for key in objects {
                 if !key.ends_with("/data") {
@@ -737,21 +822,26 @@ impl BlobStore for Backend {
                 let key_without_data = &key[..key.len() - 5];
                 if let Some(slash_pos) = key_without_data.rfind('/') {
                     let digest = &key_without_data[slash_pos + 1..];
-                    all_blobs.push(Digest::Sha256(digest.into()));
+                    blobs.push(Digest::Sha256(digest.into()));
+                    if blobs.len() >= target {
+                        break;
+                    }
                 }
             }
 
-            list_continuation_token = next_token;
-            if list_continuation_token.is_none() {
+            if next_token.is_none() {
                 break;
             }
+            list_continuation_token = next_token;
         }
 
-        Ok(pagination::paginate_sorted(
-            &all_blobs,
-            n,
-            continuation_token.as_deref(),
-        ))
+        let next_continuation = if blobs.len() >= target {
+            blobs.last().map(ToString::to_string)
+        } else {
+            None
+        };
+
+        Ok((blobs, next_continuation))
     }
 
     #[instrument(skip(self))]
@@ -825,10 +915,12 @@ impl BlobStore for Backend {
         name: &str,
         uuid: &str,
     ) -> Result<(Digest, u64, DateTime<Utc>), Error> {
+        // Box::pin to avoid embedding the large generated future of the inner branches
+        // (try_join! state) directly in this trait method's future.
         if self.uniform_parts {
-            self.read_upload_summary_uniform(name, uuid).await
+            Box::pin(self.read_upload_summary_uniform(name, uuid)).await
         } else {
-            self.read_upload_summary_nonuniform(name, uuid).await
+            Box::pin(self.read_upload_summary_nonuniform(name, uuid)).await
         }
     }
 

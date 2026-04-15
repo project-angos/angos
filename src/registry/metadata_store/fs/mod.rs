@@ -712,7 +712,7 @@ impl Backend {
     ) -> Result<LinkMetadata, Error> {
         let link_path = path_builder::link_path(link, namespace);
         let data = self.store.read(&link_path).await?;
-        LinkMetadata::from_bytes(data)
+        LinkMetadata::from_slice(&data)
     }
 
     async fn write_link_reference(

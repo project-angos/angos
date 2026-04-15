@@ -45,16 +45,16 @@ impl LinkMetadata {
         !self.referenced_by.is_empty()
     }
 
-    pub fn from_bytes(s: Vec<u8>) -> Result<Self, Error> {
+    pub fn from_slice(data: &[u8]) -> Result<Self, Error> {
         // Try to deserialize the data as LinkMetadata, if it fails, it means
         // the link is a simple string (probably coming from "distribution" implementation).
-        if let Ok(metadata) = serde_json::from_slice(&s) {
+        if let Ok(metadata) = serde_json::from_slice(data) {
             Ok(metadata)
         } else {
             // If the link is not a valid LinkMetadata, we create a new one
-            let target = String::from_utf8(s).map_err(|e| Error::InvalidData(e.to_string()))?;
             let target =
-                Digest::try_from(target.as_str()).map_err(|e| Error::InvalidData(e.to_string()))?;
+                std::str::from_utf8(data).map_err(|e| Error::InvalidData(e.to_string()))?;
+            let target = Digest::try_from(target).map_err(|e| Error::InvalidData(e.to_string()))?;
 
             Ok(LinkMetadata {
                 target,

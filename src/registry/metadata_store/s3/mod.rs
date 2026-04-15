@@ -222,8 +222,8 @@ impl AccessTimeWriter {
     async fn flush_one(backend: &Backend, namespace: &str, link: &LinkKind) -> Result<(), Error> {
         if backend.conditional.put_if_match {
             let link_path = path_builder::link_path(link, namespace);
-            let (data, etag) = backend.store.read_with_etag(&link_path).await?;
-            let link_data = LinkMetadata::from_bytes(data)?.accessed();
+            let (data, etag) = backend.store.read_bytes_with_etag(&link_path).await?;
+            let link_data = LinkMetadata::from_slice(&data)?.accessed();
             if let Some(etag) = etag {
                 let content = serde_json::to_vec(&link_data)
                     .map_err(|e| Error::InvalidData(e.to_string()))?;
@@ -580,7 +580,7 @@ impl Backend {
         let shard_path = path_builder::blob_index_shard_path(digest, namespace);
 
         for attempt in 0..MAX_BLOB_INDEX_CAS_RETRIES {
-            let (mut links, etag) = match self.store.read_with_etag(&shard_path).await {
+            let (mut links, etag) = match self.store.read_bytes_with_etag(&shard_path).await {
                 Ok((data, etag)) => (
                     serde_json::from_slice::<HashSet<LinkKind>>(&data).unwrap_or_default(),
                     etag,
@@ -719,13 +719,19 @@ impl MetadataStore for Backend {
         let referrers_dir = path_builder::manifest_referrers_dir(namespace, digest);
 
         let mut referrers = Vec::new();
-        let mut continuation_token = None;
+
+        let mut current = self
+            .store
+            .list_objects(&referrers_dir, 100, None, None)
+            .await?;
 
         loop {
-            let (objects, next_token) = self
-                .store
-                .list_objects(&referrers_dir, 100, continuation_token)
-                .await?;
+            let (objects, next_token) = current;
+
+            let next_list_fut = next_token.map(|token| {
+                self.store
+                    .list_objects(&referrers_dir, 100, Some(token), None)
+            });
 
             let digest_entries: Vec<(Digest, LinkKind)> = objects
                 .iter()
@@ -740,7 +746,7 @@ impl MetadataStore for Backend {
                 })
                 .collect();
 
-            let results: Vec<Option<Descriptor>> = stream::iter(digest_entries)
+            let process_fut = stream::iter(digest_entries)
                 .map(|(manifest_digest, referrer_link)| {
                     let artifact_type = artifact_type.as_ref();
                     async move {
@@ -786,14 +792,21 @@ impl MetadataStore for Backend {
                     }
                 })
                 .buffer_unordered(10)
-                .collect()
-                .await;
+                .collect::<Vec<Option<Descriptor>>>();
+
+            let (results, next_page) = match next_list_fut {
+                Some(next_fut) => {
+                    let (results, next) = tokio::join!(process_fut, next_fut);
+                    (results, Some(next?))
+                }
+                None => (process_fut.await, None),
+            };
 
             referrers.extend(results.into_iter().flatten());
 
-            continuation_token = next_token;
-            if continuation_token.is_none() {
-                break;
+            match next_page {
+                Some(page) => current = page,
+                None => break,
             }
         }
 
@@ -804,7 +817,10 @@ impl MetadataStore for Backend {
     async fn has_referrers(&self, namespace: &str, subject: &Digest) -> Result<bool, Error> {
         let referrers_dir = path_builder::manifest_referrers_dir(namespace, subject);
 
-        let (objects, _) = self.store.list_objects(&referrers_dir, 1, None).await?;
+        let (objects, _) = self
+            .store
+            .list_objects(&referrers_dir, 1, None, None)
+            .await?;
 
         Ok(!objects.is_empty())
     }
@@ -860,46 +876,57 @@ impl MetadataStore for Backend {
         let refs_dir = path_builder::blob_index_refs_dir(digest);
         let mut index = BlobIndex::default();
         let mut found_shards = false;
-        let mut continuation_token = None;
+
+        // Issue the first listing eagerly; subsequent listings are launched concurrently
+        // with shard processing so the list RTT no longer serialises with shard reads.
+        let mut current = self
+            .store
+            .list_prefixes(&refs_dir, "/", 1000, None, None)
+            .await?;
 
         loop {
-            let (_, objects, next_token) = self
-                .store
-                .list_prefixes(&refs_dir, "/", 1000, continuation_token, None)
-                .await?;
-
+            let (_, objects, next_token) = current;
             if !objects.is_empty() {
                 found_shards = true;
             }
 
-            let shard_results: Vec<Result<Option<(String, HashSet<LinkKind>)>, Error>> =
-                stream::iter(objects.into_iter().map(|obj| {
-                    let shard_path = format!("{refs_dir}/{obj}");
-                    async move {
-                        match self.store.read(&shard_path).await {
-                            Ok(data) => {
-                                if let Ok(links) =
-                                    serde_json::from_slice::<HashSet<LinkKind>>(&data)
-                                {
-                                    let namespace = obj
-                                        .strip_suffix(".json")
-                                        .unwrap_or(&obj)
-                                        .replace("%2F", "/")
-                                        .replace("%25", "%");
-                                    if !links.is_empty() {
-                                        return Ok(Some((namespace, links)));
-                                    }
+            let next_list_fut = next_token.map(|token| {
+                self.store
+                    .list_prefixes(&refs_dir, "/", 1000, Some(token), None)
+            });
+
+            let process_fut = stream::iter(objects.into_iter().map(|obj| {
+                let shard_path = format!("{refs_dir}/{obj}");
+                async move {
+                    match self.store.read_bytes(&shard_path).await {
+                        Ok(data) => {
+                            if let Ok(links) = serde_json::from_slice::<HashSet<LinkKind>>(&data) {
+                                let namespace = obj
+                                    .strip_suffix(".json")
+                                    .unwrap_or(&obj)
+                                    .replace("%2F", "/")
+                                    .replace("%25", "%");
+                                if !links.is_empty() {
+                                    return Ok(Some((namespace, links)));
                                 }
-                                Ok(None)
                             }
-                            Err(e) if e.kind() == ErrorKind::NotFound => Ok(None),
-                            Err(e) => Err(Error::from(e)),
+                            Ok(None)
                         }
+                        Err(e) if e.kind() == ErrorKind::NotFound => Ok(None),
+                        Err(e) => Err(Error::from(e)),
                     }
-                }))
-                .buffer_unordered(10)
-                .collect()
-                .await;
+                }
+            }))
+            .buffer_unordered(10)
+            .collect::<Vec<Result<Option<(String, HashSet<LinkKind>)>, Error>>>();
+
+            let (shard_results, next_page) = match next_list_fut {
+                Some(next_fut) => {
+                    let (results, next) = tokio::join!(process_fut, next_fut);
+                    (results, Some(next?))
+                }
+                None => (process_fut.await, None),
+            };
 
             for result in shard_results {
                 if let Some((namespace, links)) = result? {
@@ -907,9 +934,9 @@ impl MetadataStore for Backend {
                 }
             }
 
-            continuation_token = next_token;
-            if continuation_token.is_none() {
-                break;
+            match next_page {
+                Some(page) => current = page,
+                None => break,
             }
         }
 
@@ -1671,50 +1698,61 @@ impl Backend {
         let shard_dir = path_builder::namespace_registry_shard_dir();
         let mut all_namespaces = Vec::new();
         let mut found_shards = false;
-        let mut continuation_token = None;
+
+        let mut current = self
+            .store
+            .list_prefixes(&shard_dir, "/", 1000, None, None)
+            .await?;
 
         loop {
-            let (_, objects, next_token) = self
-                .store
-                .list_prefixes(&shard_dir, "/", 1000, continuation_token, None)
-                .await?;
-
+            let (_, objects, next_token) = current;
             if !objects.is_empty() {
                 found_shards = true;
             }
 
-            let shard_results: Vec<Result<Vec<String>, Error>> =
-                stream::iter(objects.into_iter().map(|obj| {
-                    let shard_path = format!("{shard_dir}/{obj}");
-                    async move {
-                        match self.store.read(&shard_path).await {
-                            Ok(data) => match serde_json::from_slice::<NamespaceRegistry>(&data) {
-                                Ok(registry) => Ok(registry.namespaces),
-                                Err(_) => Ok(Vec::new()),
-                            },
-                            Err(e) if e.kind() == ErrorKind::NotFound => Ok(Vec::new()),
-                            Err(e) => Err(Error::from(e)),
-                        }
+            let next_list_fut = next_token.map(|token| {
+                self.store
+                    .list_prefixes(&shard_dir, "/", 1000, Some(token), None)
+            });
+
+            let process_fut = stream::iter(objects.into_iter().map(|obj| {
+                let shard_path = format!("{shard_dir}/{obj}");
+                async move {
+                    match self.store.read_bytes(&shard_path).await {
+                        Ok(data) => match serde_json::from_slice::<NamespaceRegistry>(&data) {
+                            Ok(registry) => Ok(registry.namespaces),
+                            Err(_) => Ok(Vec::new()),
+                        },
+                        Err(e) if e.kind() == ErrorKind::NotFound => Ok(Vec::new()),
+                        Err(e) => Err(Error::from(e)),
                     }
-                }))
-                .buffer_unordered(10)
-                .collect()
-                .await;
+                }
+            }))
+            .buffer_unordered(10)
+            .collect::<Vec<Result<Vec<String>, Error>>>();
+
+            let (shard_results, next_page) = match next_list_fut {
+                Some(next_fut) => {
+                    let (results, next) = tokio::join!(process_fut, next_fut);
+                    (results, Some(next?))
+                }
+                None => (process_fut.await, None),
+            };
 
             for result in shard_results {
                 all_namespaces.extend(result?);
             }
 
-            continuation_token = next_token;
-            if continuation_token.is_none() {
-                break;
+            match next_page {
+                Some(page) => current = page,
+                None => break,
             }
         }
 
         if !found_shards {
             // Fall back to legacy single-file format for backward compatibility
             let path = path_builder::namespace_registry_path();
-            return match self.store.read(&path).await {
+            return match self.store.read_bytes(&path).await {
                 Ok(data) => match serde_json::from_slice(&data) {
                     Ok(registry) => Ok(Some(registry)),
                     Err(e) => {
@@ -1761,7 +1799,7 @@ impl Backend {
             );
 
             if self.conditional.supports_cas() {
-                let etag = match self.store.read_with_etag(&path).await {
+                let etag = match self.store.read_bytes_with_etag(&path).await {
                     Ok((_, etag)) => etag,
                     Err(e) if e.kind() == ErrorKind::NotFound => None,
                     Err(e) => return Err(Error::from(e)),
@@ -1846,7 +1884,7 @@ impl Backend {
         let path = path_builder::namespace_registry_shard_path(namespace);
 
         for attempt in 0..MAX_BLOB_INDEX_CAS_RETRIES {
-            let (mut registry, etag) = match self.store.read_with_etag(&path).await {
+            let (mut registry, etag) = match self.store.read_bytes_with_etag(&path).await {
                 Ok((data, etag)) => match serde_json::from_slice::<NamespaceRegistry>(&data) {
                     Ok(r) => (r, etag),
                     Err(_) => (NamespaceRegistry::default(), etag),
@@ -1962,12 +2000,12 @@ impl Backend {
     ) -> Result<LinkMetadata, Error> {
         let link_path = path_builder::link_path(link, namespace);
 
-        let (data, etag) = match self.store.read_with_etag(&link_path).await {
+        let (data, etag) = match self.store.read_bytes_with_etag(&link_path).await {
             Ok(result) => result,
             Err(e) if e.kind() == ErrorKind::NotFound => return Err(Error::ReferenceNotFound),
             Err(e) => return Err(e.into()),
         };
-        let link_data = LinkMetadata::from_bytes(data)?;
+        let link_data = LinkMetadata::from_slice(&data)?;
 
         if let Some(etag) = etag {
             let store = self.store.clone();
@@ -1991,8 +2029,8 @@ impl Backend {
         link: &LinkKind,
     ) -> Result<LinkMetadata, Error> {
         let link_path = path_builder::link_path(link, namespace);
-        match self.store.read(&link_path).await {
-            Ok(data) => LinkMetadata::from_bytes(data),
+        match self.store.read_bytes(&link_path).await {
+            Ok(data) => LinkMetadata::from_slice(&data),
             Err(e) if e.kind() == ErrorKind::NotFound => Err(Error::ReferenceNotFound),
             Err(e) => Err(e.into()),
         }

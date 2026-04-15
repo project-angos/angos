@@ -241,6 +241,14 @@ impl Backend {
         &self,
         path: &str,
     ) -> Result<(Vec<u8>, Option<String>, Option<DateTime<Utc>>), IoError> {
+        let (body, etag, last_modified) = self.read_bytes_with_metadata(path).await?;
+        Ok((body.to_vec(), etag, last_modified))
+    }
+
+    pub async fn read_bytes_with_metadata(
+        &self,
+        path: &str,
+    ) -> Result<(Bytes, Option<String>, Option<DateTime<Utc>>), IoError> {
         self.check_circuit_breaker()?;
         let key = self.full_key(path);
 
@@ -274,7 +282,20 @@ impl Backend {
             .await
             .map_err(|e| IoError::other(e.to_string()))?;
 
-        Ok((body.into_bytes().to_vec(), etag, last_modified))
+        Ok((body.into_bytes(), etag, last_modified))
+    }
+
+    pub async fn read_bytes_with_etag(
+        &self,
+        path: &str,
+    ) -> Result<(Bytes, Option<String>), IoError> {
+        let (body, etag, _) = self.read_bytes_with_metadata(path).await?;
+        Ok((body, etag))
+    }
+
+    pub async fn read_bytes(&self, path: &str) -> Result<Bytes, IoError> {
+        let (body, _, _) = self.read_bytes_with_metadata(path).await?;
+        Ok(body)
     }
 
     pub async fn delete(&self, path: &str) -> Result<(), IoError> {
@@ -452,12 +473,15 @@ impl Backend {
         path: &str,
         max_keys: i32,
         continuation_token: Option<String>,
+        start_after: Option<String>,
     ) -> Result<(Vec<String>, Option<String>), IoError> {
         let mut full_prefix = self.full_key(path);
         // Ensure prefix ends with / if not empty to list items inside the directory
         if !full_prefix.is_empty() && !full_prefix.ends_with('/') {
             full_prefix.push('/');
         }
+
+        let full_start_after = start_after.map(|s| format!("{full_prefix}{s}"));
 
         let res = self
             .s3_client
@@ -466,6 +490,7 @@ impl Backend {
             .prefix(&full_prefix)
             .max_keys(max_keys)
             .set_continuation_token(continuation_token)
+            .set_start_after(full_start_after)
             .send()
             .await
             .map_err(|e| IoError::other(e.to_string()))?;
@@ -887,13 +912,22 @@ impl Backend {
         path: &str,
         offset: Option<u64>,
     ) -> Result<Vec<u8>, IoError> {
+        let body = self.get_object_bytes(path, offset).await?;
+        Ok(body.to_vec())
+    }
+
+    pub async fn get_object_bytes(
+        &self,
+        path: &str,
+        offset: Option<u64>,
+    ) -> Result<Bytes, IoError> {
         let res = self.get_object(path, offset).await?;
         let body = res
             .body
             .collect()
             .await
             .map_err(|e| IoError::other(e.to_string()))?;
-        Ok(body.to_vec())
+        Ok(body.into_bytes())
     }
 
     pub async fn abort_pending_uploads(&self, path: &str) -> Result<(), IoError> {

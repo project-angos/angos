@@ -2088,7 +2088,7 @@ mod tests {
             r#"{{"target":"sha256:{}","created_at":"2024-01-01T00:00:00Z"}}"#,
             "a".repeat(64)
         );
-        let metadata = LinkMetadata::from_bytes(json.into_bytes()).unwrap();
+        let metadata = LinkMetadata::from_slice(json.as_bytes()).unwrap();
         assert_eq!(metadata.media_type, None);
     }
 }
