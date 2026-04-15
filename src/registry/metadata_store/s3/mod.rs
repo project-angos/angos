@@ -5,7 +5,7 @@ use std::{
     io::ErrorKind,
     pin::Pin,
     sync::{
-        Arc,
+        Arc, Mutex as StdMutex,
         atomic::{AtomicBool, Ordering},
     },
     time::Duration,
@@ -18,7 +18,7 @@ use futures_util::{
     stream::{self, StreamExt},
 };
 use serde::{Deserialize, Serialize};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, oneshot};
 use tracing::{debug, info, instrument, warn};
 
 use crate::{
@@ -270,6 +270,18 @@ struct NamespaceRegistry {
     namespaces: Vec<String>,
 }
 
+/// Queued batch of blob-index operations waiting for the in-flight holder to
+/// fold them into a subsequent CAS cycle.
+struct QueuedBatch {
+    ops: Vec<BlobIndexOperation>,
+    completion: oneshot::Sender<Result<(), Error>>,
+}
+
+#[derive(Default)]
+struct InflightCasEntry {
+    queued: Vec<QueuedBatch>,
+}
+
 #[derive(Clone)]
 pub struct Backend {
     pub store: data_store::s3::Backend,
@@ -282,6 +294,13 @@ pub struct Backend {
     /// registry writes, and access-time updates.
     conditional: ConditionalCapabilities,
     known_namespaces: Arc<Mutex<HashSet<String>>>,
+    /// Coalesces concurrent `update_blob_index_cas` callers that target the same
+    /// shard path. Under heavy fan-out (many workers pushing the same base layer)
+    /// only one holder runs the CAS retry loop; the rest queue their ops and the
+    /// holder applies them in a batched second CAS, collapsing up to `N × retries`
+    /// shard GETs down to a handful. The lock is never held across an await so a
+    /// `std::sync::Mutex` is enough and lets the drop guard clean up synchronously.
+    inflight_cas: Arc<StdMutex<HashMap<String, InflightCasEntry>>>,
     // Held for Drop side-effect: signals the flush task to exit when the last Backend is dropped.
     #[allow(dead_code)]
     flush_handle: Option<Arc<FlushHandle>>,
@@ -381,6 +400,7 @@ impl Backend {
                 access_time_writer: access_time_writer.clone(),
                 conditional: conditional.clone(),
                 known_namespaces: Arc::new(Mutex::new(HashSet::new())),
+                inflight_cas: Arc::new(StdMutex::new(HashMap::new())),
                 flush_handle: None,
             };
 
@@ -408,6 +428,7 @@ impl Backend {
             access_time_writer,
             conditional,
             known_namespaces: Arc::new(Mutex::new(HashSet::new())),
+            inflight_cas: Arc::new(StdMutex::new(HashMap::new())),
             flush_handle,
         };
 
@@ -617,11 +638,14 @@ impl Backend {
     }
 
     /// Applies a batch of blob index operations for a single digest using optimistic
-    /// concurrency (CAS). Reads the current blob index with its `ETag`, applies all
-    /// operations, and writes back with `If-Match`. Retries on `ETag` conflict.
+    /// concurrency (CAS).
     ///
-    /// For new blob indexes (not-found), uses `If-None-Match: *` to create atomically,
-    /// falling back to CAS if another writer created the index concurrently.
+    /// Concurrent callers targeting the same shard path coalesce: the first to
+    /// arrive becomes the holder and runs the CAS loop for its own ops; every
+    /// other caller appends its ops onto the in-flight entry and waits for the
+    /// holder to fold them into a single subsequent batched CAS. This collapses
+    /// the worst case of `N writers × MAX_BLOB_INDEX_CAS_RETRIES` shard GETs
+    /// into O(1) GETs per coalesced wave.
     async fn update_blob_index_cas(
         &self,
         namespace: &str,
@@ -630,8 +654,94 @@ impl Backend {
     ) -> Result<(), Error> {
         let shard_path = path_builder::blob_index_shard_path(digest, namespace);
 
+        // Fast path: join an in-flight holder if one already exists. The guard
+        // is dropped at the end of the block so `rx.await` below never holds a
+        // non-`Send` `MutexGuard` across an await point.
+        let wait_rx = {
+            let mut inflight = lock_inflight(&self.inflight_cas);
+            if let Some(entry) = inflight.get_mut(&shard_path) {
+                let (tx, rx) = oneshot::channel();
+                entry.queued.push(QueuedBatch {
+                    ops: operations.to_vec(),
+                    completion: tx,
+                });
+                Some(rx)
+            } else {
+                inflight.insert(shard_path.clone(), InflightCasEntry::default());
+                None
+            }
+        };
+
+        if let Some(rx) = wait_rx {
+            return rx.await.unwrap_or_else(|_| {
+                Err(Error::Lock(
+                    "blob index CAS holder exited without delivering result".into(),
+                ))
+            });
+        }
+
+        // Any non-normal exit from here on (cancellation, panic) must remove the
+        // in-flight entry so a subsequent caller can become the next holder.
+        // Waiters queued behind this guard get their oneshot senders dropped and
+        // observe `RecvError` -> `Err(Lock(...))`, which callers can retry.
+        let _guard = InflightHolderGuard::new(self.inflight_cas.clone(), shard_path.clone());
+
+        // Holder path: run CAS for caller's ops, then drain and batch-apply any
+        // ops queued while we were busy.
+        let own_result = self
+            .run_blob_index_cas_cycle(namespace, digest, &shard_path, operations)
+            .await;
+
+        loop {
+            let drained = {
+                let mut inflight = lock_inflight(&self.inflight_cas);
+                let entry = inflight
+                    .get_mut(&shard_path)
+                    .expect("in-flight entry owned by holder");
+                let drained: Vec<QueuedBatch> = std::mem::take(&mut entry.queued);
+                if drained.is_empty() {
+                    // Remove under the lock so no waiter can slip in between
+                    // "queue empty" and "entry removed" and get orphaned.
+                    inflight.remove(&shard_path);
+                }
+                drained
+            };
+
+            if drained.is_empty() {
+                break;
+            }
+
+            let mut batch_ops: Vec<BlobIndexOperation> = Vec::new();
+            let mut senders: Vec<oneshot::Sender<Result<(), Error>>> =
+                Vec::with_capacity(drained.len());
+            for QueuedBatch { ops, completion } in drained {
+                batch_ops.extend(ops);
+                senders.push(completion);
+            }
+
+            let batch_result = self
+                .run_blob_index_cas_cycle(namespace, digest, &shard_path, &batch_ops)
+                .await;
+
+            for tx in senders {
+                let _ = tx.send(clone_metadata_error(&batch_result));
+            }
+        }
+
+        own_result
+    }
+
+    /// Runs one compare-and-swap cycle for a blob-index shard, retrying up to
+    /// `MAX_BLOB_INDEX_CAS_RETRIES` times on `ETag` conflicts.
+    async fn run_blob_index_cas_cycle(
+        &self,
+        namespace: &str,
+        digest: &Digest,
+        shard_path: &str,
+        operations: &[BlobIndexOperation],
+    ) -> Result<(), Error> {
         for attempt in 0..MAX_BLOB_INDEX_CAS_RETRIES {
-            let (mut links, etag) = match self.store.read_bytes_with_etag(&shard_path).await {
+            let (mut links, etag) = match self.store.read_bytes_with_etag(shard_path).await {
                 Ok((data, etag)) => (
                     serde_json::from_slice::<HashSet<LinkKind>>(&data).unwrap_or_default(),
                     etag,
@@ -658,12 +768,12 @@ impl Backend {
 
             let write_result = if let Some(ref etag) = etag {
                 self.store
-                    .put_object_if_match(&shard_path, etag, content)
+                    .put_object_if_match(shard_path, etag, content)
                     .await
                     .map(|_| ())
             } else {
                 self.store
-                    .put_object_if_not_exists(&shard_path, content)
+                    .put_object_if_not_exists(shard_path, content)
                     .await
                     .map(|_| ())
             };
@@ -703,6 +813,56 @@ impl Backend {
         Err(Error::Lock(format!(
             "blob index CAS retries exhausted for digest {digest} after {MAX_BLOB_INDEX_CAS_RETRIES} attempts"
         )))
+    }
+}
+
+/// `Error` is not `Clone`, but waiting callers need to observe the holder's
+/// outcome. Mirror enough information to preserve the semantic variant for
+/// common cases; collapse the rest through the storage-backend message.
+fn clone_metadata_error(result: &Result<(), Error>) -> Result<(), Error> {
+    match result {
+        Ok(()) => Ok(()),
+        Err(Error::ReferenceNotFound) => Err(Error::ReferenceNotFound),
+        Err(Error::Lock(msg)) => Err(Error::Lock(msg.clone())),
+        Err(Error::InvalidData(msg)) => Err(Error::InvalidData(msg.clone())),
+        Err(e) => Err(Error::StorageBackend(e.to_string())),
+    }
+}
+
+/// Acquires the in-flight CAS map. The lock is never held across an await, so
+/// poisoning can only happen if a caller panics while mutating the map —
+/// extremely unlikely for simple `HashMap`/`Vec` ops. Recover the inner data in
+/// that case rather than propagating the poison so one bad caller cannot wedge
+/// the backend.
+fn lock_inflight(
+    map: &Arc<StdMutex<HashMap<String, InflightCasEntry>>>,
+) -> std::sync::MutexGuard<'_, HashMap<String, InflightCasEntry>> {
+    map.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// RAII guard that removes the holder's in-flight entry on drop.
+///
+/// On a normal completion path, the holder's drain loop removes the entry
+/// atomically while holding the lock; the guard's drop is then a no-op.
+/// On cancellation or panic, this guard guarantees the entry is torn down so
+/// subsequent callers can become the next holder. Any waiters still queued
+/// behind a cancelled holder get their `oneshot` senders dropped alongside the
+/// entry and observe `RecvError`, which the waiter path maps to `Err(Lock)`.
+struct InflightHolderGuard {
+    map: Arc<StdMutex<HashMap<String, InflightCasEntry>>>,
+    shard_path: String,
+}
+
+impl InflightHolderGuard {
+    fn new(map: Arc<StdMutex<HashMap<String, InflightCasEntry>>>, shard_path: String) -> Self {
+        Self { map, shard_path }
+    }
+}
+
+impl Drop for InflightHolderGuard {
+    fn drop(&mut self) {
+        lock_inflight(&self.map).remove(&self.shard_path);
     }
 }
 
@@ -3062,6 +3222,69 @@ mod tests {
             assert!(
                 ns_links.contains(&expected_link),
                 "Blob index for digest {digest} should contain {expected_link}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_update_blob_index_cas_coalesces_concurrent_writers() {
+        // Force the CAS path by declaring full conditional capabilities; MinIO
+        // supports both If-None-Match and If-Match in our test env.
+        let config = test_config();
+        let caps = ConditionalCapabilities {
+            put_if_none_match: true,
+            put_if_match: true,
+            delete_if_match: true,
+        };
+        let backend = Arc::new(Backend::new(&config, Some(caps)).unwrap());
+        let namespace = "cas-coalescing-ns";
+        let digest = Digest::from_str(
+            "sha256:ca5ca5ca5ca5ca5ca5ca5ca5ca5ca5ca5ca5ca5ca5ca5ca5ca5ca5ca5ca5ca5c",
+        )
+        .unwrap();
+
+        let writers = 10usize;
+        let mut handles = Vec::with_capacity(writers);
+        for i in 0..writers {
+            let backend = backend.clone();
+            let digest = digest.clone();
+            let link_digest = Digest::from_str(&format!(
+                "sha256:{i:02x}00000000000000000000000000000000000000000000000000000000000000"
+            ))
+            .unwrap();
+            handles.push(tokio::spawn(async move {
+                backend
+                    .update_blob_index(
+                        namespace,
+                        &digest,
+                        BlobIndexOperation::Insert(LinkKind::Layer(link_digest)),
+                    )
+                    .await
+            }));
+        }
+
+        for handle in handles {
+            handle.await.unwrap().unwrap();
+        }
+
+        // In-flight map must be drained once all writers complete.
+        assert!(lock_inflight(&backend.inflight_cas).is_empty());
+
+        // Every inserted link must be present: coalescing must not drop any op.
+        let index = backend.read_blob_index(&digest).await.unwrap();
+        let ns_links = index
+            .namespace
+            .get(namespace)
+            .expect("namespace shard exists");
+        assert_eq!(ns_links.len(), writers);
+        for i in 0..writers {
+            let link_digest = Digest::from_str(&format!(
+                "sha256:{i:02x}00000000000000000000000000000000000000000000000000000000000000"
+            ))
+            .unwrap();
+            assert!(
+                ns_links.contains(&LinkKind::Layer(link_digest)),
+                "missing link for writer {i}"
             );
         }
     }
