@@ -147,6 +147,81 @@ fn classify_conditional_put_error(
     }
 }
 
+/// A single `list_objects_v2` page used by the pipelined `delete_prefix` loop.
+struct DeletePage {
+    keys: Vec<ObjectIdentifier>,
+    next_token: Option<String>,
+}
+
+async fn list_page(
+    client: &S3Client,
+    bucket: &str,
+    prefix: &str,
+    continuation_token: Option<String>,
+) -> Result<DeletePage, IoError> {
+    let res = client
+        .list_objects_v2()
+        .bucket(bucket)
+        .prefix(prefix)
+        .max_keys(1000)
+        .set_continuation_token(continuation_token)
+        .send()
+        .await
+        .map_err(|e| IoError::other(e.to_string()))?;
+
+    let keys: Vec<ObjectIdentifier> = res
+        .contents
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|obj| obj.key.map(|k| ObjectIdentifier::builder().key(k).build()))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| IoError::other(e.to_string()))?;
+
+    let next_token = if res.is_truncated.unwrap_or(false) {
+        res.next_continuation_token
+    } else {
+        None
+    };
+
+    Ok(DeletePage { keys, next_token })
+}
+
+async fn delete_page(
+    client: &S3Client,
+    bucket: &str,
+    keys: Vec<ObjectIdentifier>,
+) -> Result<(), IoError> {
+    if keys.is_empty() {
+        return Ok(());
+    }
+
+    let delete = Delete::builder()
+        .set_objects(Some(keys))
+        .build()
+        .map_err(|e| IoError::other(e.to_string()))?;
+
+    let result = client
+        .delete_objects()
+        .bucket(bucket)
+        .delete(delete)
+        .send()
+        .await
+        .map_err(|e| IoError::other(e.to_string()))?;
+
+    if let Some(errors) = result.errors
+        && !errors.is_empty()
+    {
+        let msg = errors
+            .iter()
+            .filter_map(|e| e.message())
+            .collect::<Vec<_>>()
+            .join("; ");
+        return Err(IoError::other(format!("batch delete errors: {msg}")));
+    }
+
+    Ok(())
+}
+
 impl Backend {
     pub fn new(config: &BackendConfig) -> Result<Self, Error> {
         if config.multipart_part_size < ByteSize::mib(5) {
@@ -317,59 +392,37 @@ impl Backend {
 
     pub async fn delete_prefix(&self, prefix: &str) -> Result<(), IoError> {
         let full_prefix = self.full_key(prefix);
-        let mut continuation_token = None;
+
+        // One-deep lookahead: we always keep at most two pages in flight —
+        // the current page being deleted, and the next page being listed.
+        // That caps memory at ~2 × 1000 `ObjectIdentifier`s and halves the
+        // serial round-trips on multi-page deletes. The per-page futures are
+        // `Box::pin`ned so the outer future doesn't grow with every call
+        // site (they currently carry ~10 KB of S3 SDK state each).
+        let mut current = list_page(&self.s3_client, &self.bucket, &full_prefix, None).await?;
 
         loop {
-            let res = self
-                .s3_client
-                .list_objects_v2()
-                .bucket(&self.bucket)
-                .prefix(&full_prefix)
-                .max_keys(1000)
-                .set_continuation_token(continuation_token)
-                .send()
-                .await
-                .map_err(|e| IoError::other(e.to_string()))?;
+            let DeletePage { keys, next_token } = current;
 
-            let keys: Vec<ObjectIdentifier> = res
-                .contents
-                .unwrap_or_default()
-                .into_iter()
-                .filter_map(|obj| obj.key.map(|k| ObjectIdentifier::builder().key(k).build()))
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|e| IoError::other(e.to_string()))?;
-
-            if !keys.is_empty() {
-                let delete = Delete::builder()
-                    .set_objects(Some(keys))
-                    .build()
-                    .map_err(|e| IoError::other(e.to_string()))?;
-
-                let result = self
-                    .s3_client
-                    .delete_objects()
-                    .bucket(&self.bucket)
-                    .delete(delete)
-                    .send()
-                    .await
-                    .map_err(|e| IoError::other(e.to_string()))?;
-
-                if let Some(errors) = result.errors
-                    && !errors.is_empty()
-                {
-                    let msg = errors
-                        .iter()
-                        .filter_map(|e| e.message())
-                        .collect::<Vec<_>>()
-                        .join("; ");
-                    return Err(IoError::other(format!("batch delete errors: {msg}")));
-                }
-            }
-
-            if res.is_truncated.unwrap_or(false) {
-                continuation_token = res.next_continuation_token;
+            let delete_fut = Box::pin(delete_page(&self.s3_client, &self.bucket, keys));
+            let next_page = if let Some(token) = next_token {
+                let next_fut = Box::pin(list_page(
+                    &self.s3_client,
+                    &self.bucket,
+                    &full_prefix,
+                    Some(token),
+                ));
+                let (delete_res, next_res) = tokio::join!(delete_fut, next_fut);
+                delete_res?;
+                Some(next_res?)
             } else {
-                break;
+                delete_fut.await?;
+                None
+            };
+
+            match next_page {
+                Some(page) => current = page,
+                None => break,
             }
         }
 
@@ -1115,5 +1168,45 @@ mod tests {
         if let Err(err) = result {
             assert!(err.to_string().contains("error") || err.to_string().contains("refused"));
         }
+    }
+
+    #[tokio::test]
+    async fn test_delete_prefix_spans_multiple_list_pages() {
+        // MinIO's `list_objects_v2` caps at 1000 keys per page, so seeding
+        // 1100 keys forces at least two list pages. The pipelined loop must
+        // handle the continuation token correctly and delete every key.
+        let config = test_config(|c| {
+            c.access_key_id = "root".to_string();
+            c.secret_key = "roottoor".to_string();
+            c.bucket = "registry".to_string();
+            c.key_prefix = format!("test-delete-prefix-{}", uuid::Uuid::new_v4());
+        });
+        let backend = Backend::new(&config).unwrap();
+
+        let prefix = "batch";
+        let seed_count = 1100usize;
+        let keys: Vec<String> = (0..seed_count)
+            .map(|i| format!("{prefix}/obj-{i:05}"))
+            .collect();
+        let writes = keys
+            .iter()
+            .map(|key| backend.put_object(key, Bytes::from_static(b"x")));
+        for result in futures_util::future::join_all(writes).await {
+            result.unwrap();
+        }
+
+        backend.delete_prefix(prefix).await.unwrap();
+
+        // After delete, listing returns no objects under the prefix.
+        let leftover = backend
+            .s3_client
+            .list_objects_v2()
+            .bucket(&backend.bucket)
+            .prefix(backend.full_key(prefix))
+            .max_keys(1)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(leftover.key_count.unwrap_or(0), 0);
     }
 }
