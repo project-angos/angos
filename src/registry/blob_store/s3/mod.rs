@@ -799,7 +799,12 @@ impl BlobStore for Backend {
         // round-trips while keeping the per-page memory bounded.
         let max_keys = i32::try_from(target.saturating_mul(4).clamp(1, 1000)).unwrap_or(1000);
 
-        while blobs.len() < target {
+        // `has_more` tracks whether we saw at least one `/data` key *after*
+        // filling `target`. A continuation token is only returned when we
+        // actually have another blob to hand out on the next call.
+        let mut has_more = false;
+
+        'pages: while !has_more {
             let (objects, next_token) = self
                 .store
                 .list_objects(
@@ -820,12 +825,18 @@ impl BlobStore for Backend {
                 }
 
                 let key_without_data = &key[..key.len() - 5];
-                if let Some(slash_pos) = key_without_data.rfind('/') {
-                    let digest = &key_without_data[slash_pos + 1..];
+                let Some(slash_pos) = key_without_data.rfind('/') else {
+                    continue;
+                };
+                let digest = &key_without_data[slash_pos + 1..];
+
+                if blobs.len() < target {
                     blobs.push(Digest::Sha256(digest.into()));
-                    if blobs.len() >= target {
-                        break;
-                    }
+                } else {
+                    // One extra `/data` key past the target — there is at least
+                    // one more blob, so emit a continuation token.
+                    has_more = true;
+                    break 'pages;
                 }
             }
 
@@ -835,7 +846,7 @@ impl BlobStore for Backend {
             list_continuation_token = next_token;
         }
 
-        let next_continuation = if blobs.len() >= target {
+        let next_continuation = if has_more {
             blobs.last().map(ToString::to_string)
         } else {
             None
