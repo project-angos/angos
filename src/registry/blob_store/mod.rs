@@ -6,6 +6,7 @@ pub mod s3;
 mod sha256_ext;
 
 use async_trait::async_trait;
+use bytes::Bytes;
 use chrono::{DateTime, Duration, Utc};
 pub use config::BlobStorageConfig;
 pub use error::Error;
@@ -83,7 +84,7 @@ pub trait BlobStore: Send + Sync {
 
     async fn create_blob(&self, content: &[u8]) -> Result<Digest, Error>;
 
-    async fn read_blob(&self, digest: &Digest) -> Result<Vec<u8>, Error>;
+    async fn read_blob(&self, digest: &Digest) -> Result<Bytes, Error>;
 
     async fn get_blob_size(&self, digest: &Digest) -> Result<u64, Error>;
 
@@ -239,7 +240,7 @@ mod tests {
         let digest = store.create_blob(test_content).await.unwrap();
 
         let retrieved_content = store.read_blob(&digest).await.unwrap();
-        assert_eq!(retrieved_content, test_content);
+        assert_eq!(retrieved_content.as_ref(), test_content);
 
         let size = store.get_blob_size(&digest).await.unwrap();
         assert_eq!(size, test_content.len() as u64);
@@ -322,7 +323,7 @@ mod tests {
         assert_eq!(final_digest, digest);
 
         let blob_content = store.read_blob(&final_digest).await.unwrap();
-        assert_eq!(blob_content, test_content);
+        assert_eq!(blob_content.as_ref(), test_content);
 
         // Test upload not found after completion
         let upload_result = store.read_upload_summary(namespace, &uuid).await;

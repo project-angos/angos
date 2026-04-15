@@ -965,9 +965,9 @@ impl BlobStore for Backend {
     }
 
     #[instrument(skip(self))]
-    async fn read_blob(&self, digest: &Digest) -> Result<Vec<u8>, Error> {
+    async fn read_blob(&self, digest: &Digest) -> Result<Bytes, Error> {
         let path = path_builder::blob_path(digest);
-        Ok(self.store.get_object_body(&path, None).await?)
+        Ok(self.store.get_object_bytes(&path, None).await?)
     }
 
     #[instrument(skip(self))]

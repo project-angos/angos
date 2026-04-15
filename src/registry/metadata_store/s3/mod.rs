@@ -819,14 +819,14 @@ impl MetadataStore for Backend {
                         }
 
                         let blob_path = path_builder::blob_path(&manifest_digest);
-                        match self.store.read(&blob_path).await {
+                        match self.store.read_bytes(&blob_path).await {
                             Ok(data) => {
-                                let manifest_len = data.len();
+                                let manifest_len = data.len() as u64;
                                 match Manifest::from_slice(&data) {
                                     Ok(manifest) => manifest.to_descriptor(
                                         artifact_type,
                                         manifest_digest,
-                                        manifest_len as u64,
+                                        manifest_len,
                                     ),
                                     Err(e) => {
                                         warn!("Failed to parse manifest at {blob_path}: {e}");

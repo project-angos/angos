@@ -404,7 +404,7 @@ mod tests {
                 .unwrap();
 
             let stored_content = registry.blob_store.read_blob(&upload_digest).await.unwrap();
-            assert_eq!(stored_content, content);
+            assert_eq!(stored_content.as_ref(), content);
         }
     }
 
@@ -620,7 +620,7 @@ mod tests {
             );
 
             let stored_content = registry.blob_store.read_blob(&digest).await.unwrap();
-            assert_eq!(stored_content, content);
+            assert_eq!(stored_content.as_ref(), content);
         }
     }
 

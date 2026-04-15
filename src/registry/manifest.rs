@@ -1,3 +1,4 @@
+use bytes::Bytes;
 use futures_util::StreamExt;
 use hyper::{
     Response, StatusCode,
@@ -21,7 +22,7 @@ pub const DOCKER_CONTENT_DIGEST: &str = "Docker-Content-Digest";
 pub struct GetManifestResponse {
     pub media_type: Option<String>,
     pub digest: Digest,
-    pub content: Vec<u8>,
+    pub content: Bytes,
 }
 
 pub struct HeadManifestResponse {
@@ -235,7 +236,7 @@ impl Registry {
         Ok(GetManifestResponse {
             media_type,
             digest,
-            content,
+            content: Bytes::from(content),
         })
     }
 

@@ -23,9 +23,8 @@ impl ResponseBody {
         ResponseBody::Empty
     }
 
-    pub fn fixed(data: Vec<u8>) -> Self {
-        let data = Bytes::from(data);
-        ResponseBody::Fixed(Full::new(data))
+    pub fn fixed(data: impl Into<Bytes>) -> Self {
+        ResponseBody::Fixed(Full::new(data.into()))
     }
 
     pub fn streaming<R>(reader: R) -> Self

@@ -9,6 +9,7 @@ use std::{
 };
 
 use async_trait::async_trait;
+use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use sha2::{Digest as Sha256Digest, Sha256};
 use tokio::io::{AsyncRead, AsyncSeekExt};
@@ -271,9 +272,9 @@ impl BlobStore for Backend {
     }
 
     #[instrument(skip(self))]
-    async fn read_blob(&self, digest: &Digest) -> Result<Vec<u8>, Error> {
+    async fn read_blob(&self, digest: &Digest) -> Result<Bytes, Error> {
         let path = path_builder::blob_path(digest);
-        Ok(self.store.read(&path).await?)
+        Ok(Bytes::from(self.store.read(&path).await?))
     }
 
     #[instrument(skip(self))]

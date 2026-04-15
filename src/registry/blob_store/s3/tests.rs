@@ -133,7 +133,7 @@ async fn test_delete_blob_removes_all_data() {
 
     let read_result = store.read_blob(&digest).await;
     assert!(read_result.is_ok(), "Blob should exist after creation");
-    assert_eq!(read_result.unwrap(), content);
+    assert_eq!(read_result.unwrap().as_ref(), content);
 
     store.delete_blob(&digest).await.unwrap();
 
