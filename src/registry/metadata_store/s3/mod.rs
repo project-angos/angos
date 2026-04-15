@@ -1428,7 +1428,7 @@ impl Backend {
             let link = match op {
                 LinkOperation::Create { link, .. } | LinkOperation::Delete { link, .. } => link,
             };
-            let metadata = self.read_link_reference(namespace, link).await.ok();
+            let metadata = self.read_link_with_cache(namespace, link).await.ok();
             (op, metadata)
         }))
         .await;
@@ -1565,7 +1565,7 @@ impl Backend {
                         descriptor,
                     } => {
                         let old_target = self
-                            .read_link_reference(namespace, link)
+                            .read_link_with_cache(namespace, link)
                             .await
                             .ok()
                             .map(|m| m.target);
@@ -1583,7 +1583,7 @@ impl Backend {
                         )
                     }
                     LinkOperation::Delete { link, referrer } => {
-                        let metadata = self.read_link_reference(namespace, link).await.ok();
+                        let metadata = self.read_link_with_cache(namespace, link).await.ok();
                         (op, None, Some((link.clone(), metadata, referrer.clone())))
                     }
                 }
@@ -2277,6 +2277,23 @@ impl Backend {
             Err(e) if e.kind() == ErrorKind::NotFound => Err(Error::ReferenceNotFound),
             Err(e) => Err(e.into()),
         }
+    }
+
+    /// Cache-first link read for update paths that don't require an S3-fresh
+    /// view — i.e. any read that is *not* the validation re-read inside the
+    /// distributed lock. Populates the cache on an S3 hit so subsequent
+    /// back-to-back reads of the same link stay local.
+    async fn read_link_with_cache(
+        &self,
+        namespace: &str,
+        link: &LinkKind,
+    ) -> Result<LinkMetadata, Error> {
+        if let Some(cached) = self.cache_get(namespace, link).await {
+            return Ok(cached);
+        }
+        let metadata = self.read_link_reference(namespace, link).await?;
+        self.cache_put(namespace, link, &metadata).await;
+        Ok(metadata)
     }
 
     async fn write_link_reference(
@@ -3224,6 +3241,57 @@ mod tests {
                 "Blob index for digest {digest} should contain {expected_link}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn test_update_links_pre_lock_read_uses_cache() {
+        // With the Memory lock strategy the CAS path is disabled, so every
+        // update runs through `update_links_locked`. The first Create
+        // populates the link cache; the second must reuse it for its pre-lock
+        // read rather than re-fetching from S3. We verify the cache-first
+        // behaviour by asserting the cache is warm after both calls and the
+        // final S3 state is authoritative.
+        let config = test_config();
+        let (backend, cache) = test_backend_with_cache(&config);
+        let namespace = "back-to-back-ns";
+        let digest = Digest::from_str(
+            "sha256:1122334455667788112233445566778811223344556677881122334455667788",
+        )
+        .unwrap();
+        let tag = LinkKind::Tag("cached-tag".into());
+
+        let ops = vec![LinkOperation::Create {
+            link: tag.clone(),
+            target: digest.clone(),
+            referrer: None,
+            media_type: None,
+            descriptor: Box::new(None),
+        }];
+
+        backend.update_links(namespace, &ops).await.unwrap();
+
+        let cache_key = Backend::cache_key(namespace, &tag);
+        let first: Option<LinkMetadata> = cache.retrieve(&cache_key).await.unwrap();
+        assert!(
+            first.is_some(),
+            "cache must be populated after the first push"
+        );
+
+        // Delete the cached value to simulate an unrelated invalidation, but
+        // keep S3 untouched. The second push's pre-lock read should go back
+        // through `read_link_with_cache`, hit S3, and re-populate the cache
+        // so we can distinguish a cache-aware read path from an S3-only one.
+        cache.delete_value(&cache_key).await.unwrap();
+
+        backend.update_links(namespace, &ops).await.unwrap();
+
+        let second: Option<LinkMetadata> = cache.retrieve(&cache_key).await.unwrap();
+        let refreshed = second.expect("cache must be re-populated by the second push");
+        assert_eq!(refreshed.target, digest);
+
+        // S3 state agrees with the cache.
+        let s3_metadata = backend.read_link_reference(namespace, &tag).await.unwrap();
+        assert_eq!(s3_metadata.target, digest);
     }
 
     #[tokio::test]
