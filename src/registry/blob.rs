@@ -14,7 +14,7 @@ use crate::{
     registry::{
         Error, Registry, Repository,
         blob_store::{BlobStore, BoxedReader},
-        metadata_store::{self, BlobIndexOperation, MetadataStoreExt, link_kind::LinkKind},
+        metadata_store::{BlobIndexOperation, MetadataStoreExt, link_kind::LinkKind},
         task_queue,
     },
 };
@@ -40,17 +40,15 @@ impl Registry {
         namespace: &Namespace,
         digest: &Digest,
     ) -> Result<(), Error> {
-        match self.metadata_store.read_blob_index(digest).await {
-            Ok(blob_index) => {
-                if blob_index.namespace.contains_key(namespace.as_ref()) {
-                    Ok(())
-                } else {
-                    Err(Error::BlobUnknown)
-                }
-            }
-            Err(metadata_store::Error::ReferenceNotFound) => Ok(()),
+        match self
+            .metadata_store
+            .has_blob_in_namespace(namespace.as_ref(), digest)
+            .await
+        {
+            Ok(true) => Ok(()),
+            Ok(false) => Err(Error::BlobUnknown),
             Err(e) => {
-                warn!("Failed to read blob index for {digest}: {e}");
+                warn!("Failed to check blob index for {digest}: {e}");
                 Err(Error::Internal(format!("storage error: {e}")))
             }
         }

@@ -289,6 +289,10 @@ pub struct Backend {
 
 const MAX_UPDATE_RETRIES: u32 = 10;
 const MAX_BLOB_INDEX_CAS_RETRIES: u32 = 20;
+/// Upper bound on the TTL used when caching negative blob-index membership results.
+/// Kept short so a freshly-pushed layer becomes visible quickly in readers that
+/// previously 404-ed the digest; positive hits still use `link_cache_ttl` in full.
+const MEMBERSHIP_NEGATIVE_TTL: u64 = 5;
 
 impl Backend {
     /// Create a new S3 metadata-store backend.
@@ -565,6 +569,53 @@ impl Backend {
         }
     }
 
+    fn membership_cache_key(namespace: &str, digest: &Digest) -> String {
+        format!("blobidx:{digest}:{namespace}")
+    }
+
+    async fn membership_cache_get(&self, namespace: &str, digest: &Digest) -> Option<bool> {
+        if self.link_cache_ttl == 0 {
+            return None;
+        }
+        let cache = self.cache.as_ref()?;
+        cache
+            .retrieve::<bool>(&Self::membership_cache_key(namespace, digest))
+            .await
+            .ok()
+            .flatten()
+    }
+
+    async fn membership_cache_put(&self, namespace: &str, digest: &Digest, present: bool) {
+        if self.link_cache_ttl == 0 {
+            return;
+        }
+        let Some(cache) = &self.cache else {
+            return;
+        };
+        // Short TTL on negative hits guards against 404 poisoning while a concurrent
+        // writer is still racing to publish its blob-index shard.
+        let ttl = if present {
+            self.link_cache_ttl
+        } else {
+            MEMBERSHIP_NEGATIVE_TTL.min(self.link_cache_ttl)
+        };
+        let _ = cache
+            .store(
+                &Self::membership_cache_key(namespace, digest),
+                &present,
+                ttl,
+            )
+            .await;
+    }
+
+    async fn membership_cache_invalidate(&self, namespace: &str, digest: &Digest) {
+        if let Some(cache) = &self.cache {
+            let _ = cache
+                .delete_value(&Self::membership_cache_key(namespace, digest))
+                .await;
+        }
+    }
+
     /// Applies a batch of blob index operations for a single digest using optimistic
     /// concurrency (CAS). Reads the current blob index with its `ETag`, applies all
     /// operations, and writes back with `If-Match`. Retries on `ETag` conflict.
@@ -618,7 +669,10 @@ impl Backend {
             };
 
             match write_result {
-                Ok(()) => return Ok(()),
+                Ok(()) => {
+                    self.membership_cache_invalidate(namespace, digest).await;
+                    return Ok(());
+                }
                 Err(data_store::Error::PreconditionFailed) => {
                     debug!(
                         digest = %digest,
@@ -974,6 +1028,34 @@ impl MetadataStore for Backend {
         );
 
         Ok(blob_index)
+    }
+
+    #[instrument(skip(self))]
+    async fn has_blob_in_namespace(&self, namespace: &str, digest: &Digest) -> Result<bool, Error> {
+        if let Some(hit) = self.membership_cache_get(namespace, digest).await {
+            return Ok(hit);
+        }
+
+        let shard_path = path_builder::blob_index_shard_path(digest, namespace);
+        let present = match self.store.read_bytes(&shard_path).await {
+            Ok(data) => serde_json::from_slice::<HashSet<LinkKind>>(&data)
+                .map(|links| !links.is_empty())
+                .unwrap_or(false),
+            Err(e) if e.kind() == ErrorKind::NotFound => {
+                // Fall back to the full blob-index read: it handles the legacy
+                // `index.json` format and migrates it on first touch. The fast
+                // shard path picks up post-migration on subsequent calls.
+                match self.read_blob_index(digest).await {
+                    Ok(index) => index.namespace.contains_key(namespace),
+                    Err(Error::ReferenceNotFound) => false,
+                    Err(e) => return Err(e),
+                }
+            }
+            Err(e) => return Err(Error::from(e)),
+        };
+
+        self.membership_cache_put(namespace, digest, present).await;
+        Ok(present)
     }
 
     #[instrument(skip(self))]
@@ -1690,6 +1772,7 @@ impl Backend {
             self.store.put_object(&shard_path, content).await?;
         }
 
+        self.membership_cache_invalidate(namespace, digest).await;
         Ok(())
     }
 
@@ -2415,6 +2498,89 @@ mod tests {
         assert!(
             matches!(result, Err(Error::ReferenceNotFound)),
             "Should get ReferenceNotFound when cache is disabled and S3 object is deleted"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_has_blob_in_namespace_cache_hit_skips_s3() {
+        let config = test_config();
+        let (backend, _cache) = test_backend_with_cache(&config);
+        let namespace = "membership-hit-ns";
+        let digest = Digest::from_str(
+            "sha256:ba0bba0bba0bba0bba0bba0bba0bba0bba0bba0bba0bba0bba0bba0bba0bba0b",
+        )
+        .unwrap();
+        let link = LinkKind::Layer(digest.clone());
+
+        backend
+            .update_blob_index(namespace, &digest, BlobIndexOperation::Insert(link))
+            .await
+            .unwrap();
+
+        // First call populates the membership cache from S3.
+        assert!(
+            backend
+                .has_blob_in_namespace(namespace, &digest)
+                .await
+                .unwrap()
+        );
+
+        // Deleting the shard directly would normally flip membership to false,
+        // but a cache hit must short-circuit before the S3 read.
+        let shard_path = path_builder::blob_index_shard_path(&digest, namespace);
+        backend.store.delete(&shard_path).await.unwrap();
+
+        assert!(
+            backend
+                .has_blob_in_namespace(namespace, &digest)
+                .await
+                .unwrap(),
+            "second call must be served from cache"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_has_blob_in_namespace_invalidated_on_update() {
+        let config = test_config();
+        let (backend, _cache) = test_backend_with_cache(&config);
+        let namespace = "membership-invalidate-ns";
+        let digest = Digest::from_str(
+            "sha256:ba11ba11ba11ba11ba11ba11ba11ba11ba11ba11ba11ba11ba11ba11ba11ba11",
+        )
+        .unwrap();
+        let link = LinkKind::Layer(digest.clone());
+
+        assert!(
+            !backend
+                .has_blob_in_namespace(namespace, &digest)
+                .await
+                .unwrap()
+        );
+
+        backend
+            .update_blob_index(namespace, &digest, BlobIndexOperation::Insert(link.clone()))
+            .await
+            .unwrap();
+
+        assert!(
+            backend
+                .has_blob_in_namespace(namespace, &digest)
+                .await
+                .unwrap(),
+            "cache entry must be invalidated after Insert"
+        );
+
+        backend
+            .update_blob_index(namespace, &digest, BlobIndexOperation::Remove(link))
+            .await
+            .unwrap();
+
+        assert!(
+            !backend
+                .has_blob_in_namespace(namespace, &digest)
+                .await
+                .unwrap(),
+            "cache entry must be invalidated after Remove"
         );
     }
 
