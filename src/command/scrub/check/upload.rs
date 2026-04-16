@@ -3,7 +3,7 @@ use std::sync::Arc;
 use chrono::{Duration, Utc};
 use tracing::{debug, error, info};
 
-use crate::registry::{Error, blob_store::BlobStore};
+use crate::registry::{Error, blob_store::BlobStore, pagination::for_each_page};
 
 pub struct UploadChecker {
     blob_store: Arc<dyn BlobStore + Send + Sync>,
@@ -27,24 +27,23 @@ impl UploadChecker {
     pub async fn check_namespace(&self, namespace: &str) -> Result<(), Error> {
         debug!("Checking uploads from namespace '{namespace}'");
 
-        let mut marker = None;
-        loop {
-            let (uploads, next_marker) =
-                self.blob_store.list_uploads(namespace, 100, marker).await?;
-
-            for uuid in &uploads {
-                if let Err(e) = self.check_upload(namespace, uuid).await {
-                    error!("Failed to check upload from '{namespace}' ('{uuid}'): {e}");
+        for_each_page(
+            |marker| async move {
+                self.blob_store
+                    .list_uploads(namespace, 100, marker)
+                    .await
+                    .map_err(Error::from)
+            },
+            |uploads| async move {
+                for uuid in &uploads {
+                    if let Err(e) = self.check_upload(namespace, uuid).await {
+                        error!("Failed to check upload from '{namespace}' ('{uuid}'): {e}");
+                    }
                 }
-            }
-
-            if next_marker.is_none() {
-                break;
-            }
-            marker = next_marker;
-        }
-
-        Ok(())
+                Ok(())
+            },
+        )
+        .await
     }
 
     async fn check_upload(&self, namespace: &str, uuid: &str) -> Result<(), Error> {

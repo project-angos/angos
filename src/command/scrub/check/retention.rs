@@ -10,6 +10,7 @@ use crate::{
         Error,
         blob_store::BlobStore,
         metadata_store::{LinkMetadata, MetadataStore, MetadataStoreExt, link_kind::LinkKind},
+        pagination::collect_all_pages,
         parse_manifest_digests,
         repository::Repository,
     },
@@ -48,7 +49,13 @@ impl RetentionChecker {
     pub async fn check_namespace(&self, namespace: &str) -> Result<(), Error> {
         debug!("Checking retention policies on '{namespace}'");
 
-        let tag_names = self.fetch_all_tag_names(namespace).await?;
+        let tag_names = collect_all_pages(|marker| async move {
+            self.metadata_store
+                .list_tags(namespace, 1000, marker)
+                .await
+                .map_err(Error::from)
+        })
+        .await?;
         let tag_metadata = self.fetch_tag_metadata(namespace, &tag_names).await?;
         let (last_pushed, last_pulled) = Self::build_sorted_rankings(&tag_metadata);
 
@@ -57,26 +64,6 @@ impl RetentionChecker {
 
         self.delete_orphan_manifests(namespace, &last_pushed, &last_pulled)
             .await
-    }
-
-    async fn fetch_all_tag_names(&self, namespace: &str) -> Result<Vec<String>, Error> {
-        let mut tag_names = Vec::new();
-        let mut marker = None;
-
-        loop {
-            let (tags, next_marker) = self
-                .metadata_store
-                .list_tags(namespace, 1000, marker)
-                .await?;
-            tag_names.extend(tags);
-
-            if next_marker.is_none() {
-                break;
-            }
-            marker = next_marker;
-        }
-
-        Ok(tag_names)
     }
 
     async fn fetch_tag_metadata(
@@ -266,60 +253,56 @@ impl RetentionChecker {
         last_pushed: &[String],
         last_pulled: &[String],
     ) -> Result<(), Error> {
-        let mut marker = None;
-        loop {
-            let (revisions, next_marker) = self
-                .metadata_store
+        let revisions = collect_all_pages(|marker| async move {
+            self.metadata_store
                 .list_revisions(namespace, 100, marker)
-                .await?;
+                .await
+                .map_err(Error::from)
+        })
+        .await?;
 
-            for digest in &revisions {
-                if self.is_protected(namespace, digest).await? {
-                    debug!("Skipping protected manifest '{namespace}@{digest}'");
-                    continue;
-                }
-
-                if self.has_tags(namespace, digest).await? {
-                    continue;
-                }
-
-                let Ok(metadata) = self
-                    .metadata_store
-                    .read_link(namespace, &LinkKind::Digest(digest.clone()), false)
-                    .await
-                else {
-                    continue;
-                };
-
-                let manifest = ManifestImage {
-                    tag: None,
-                    pushed_at: metadata
-                        .created_at
-                        .map(|t| t.timestamp())
-                        .unwrap_or_default(),
-                    last_pulled_at: metadata
-                        .accessed_at
-                        .map(|t| t.timestamp())
-                        .unwrap_or_default(),
-                };
-
-                let label = format!("{namespace}@{digest}");
-                if !self.evaluate_retention_policies(
-                    namespace,
-                    &label,
-                    &manifest,
-                    last_pushed,
-                    last_pulled,
-                )? {
-                    self.delete_manifest(namespace, digest).await?;
-                }
+        for digest in &revisions {
+            if self.is_protected(namespace, digest).await? {
+                debug!("Skipping protected manifest '{namespace}@{digest}'");
+                continue;
             }
 
-            if next_marker.is_none() {
-                break;
+            if self.has_tags(namespace, digest).await? {
+                continue;
             }
-            marker = next_marker;
+
+            let Ok(metadata) = self
+                .metadata_store
+                .read_link(namespace, &LinkKind::Digest(digest.clone()), false)
+                .await
+            else {
+                continue;
+            };
+
+            let manifest = ManifestImage {
+                tag: None,
+                pushed_at: metadata
+                    .created_at
+                    .map(|t| t.timestamp())
+                    .unwrap_or_default(),
+                last_pulled_at: metadata
+                    .accessed_at
+                    .map(|t| t.timestamp())
+                    .unwrap_or_default(),
+            };
+
+            let label = format!("{namespace}@{digest}");
+            if !self.evaluate_retention_policies(
+                namespace,
+                &label,
+                &manifest,
+                last_pushed,
+                last_pulled,
+            )? {
+                self.delete_manifest(namespace, digest).await?;
+            }
         }
+
         Ok(())
     }
 

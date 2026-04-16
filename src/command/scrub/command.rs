@@ -17,7 +17,8 @@ use crate::{
     configuration::Configuration,
     policy::{RetentionPolicy, RetentionPolicyConfig},
     registry::{
-        Repository, blob_store, blob_store::BlobStore, metadata_store::MetadataStore, repository,
+        Repository, blob_store, blob_store::BlobStore, metadata_store::MetadataStore,
+        pagination::collect_all_pages, repository,
     },
 };
 
@@ -266,46 +267,38 @@ impl Command {
     }
 
     async fn scrub_metadata(&self) -> Result<(), Error> {
-        let mut marker = None;
-        loop {
-            let Ok((namespaces, next_marker)) =
-                self.metadata_store.list_namespaces(100, marker).await
-            else {
-                error!("Failed to read catalog");
-                return Err(Error::Execution("Failed to read catalog".to_string()));
-            };
+        let namespaces =
+            collect_all_pages(|marker| self.metadata_store.list_namespaces(100, marker))
+                .await
+                .map_err(|_| {
+                    error!("Failed to read catalog");
+                    Error::Execution("Failed to read catalog".to_string())
+                })?;
 
-            for namespace in namespaces {
-                if let Some(retention_enforcer) = &self.retention_enforcer {
-                    let _ = retention_enforcer.check_namespace(&namespace).await;
-                }
-
-                if let Some(uploads_checker) = &self.upload_checker {
-                    let _ = uploads_checker.check_namespace(&namespace).await;
-                }
-
-                if let Some(tags_checker) = &self.tags_checker {
-                    let _ = tags_checker.check_namespace(&namespace).await;
-                }
-
-                if let Some(revisions_checker) = &self.revisions {
-                    let _ = revisions_checker.check_namespace(&namespace).await;
-                }
-
-                if let Some(link_references_checker) = &self.link_references_checker {
-                    let _ = link_references_checker.check_namespace(&namespace).await;
-                }
-
-                if let Some(media_type_checker) = &self.media_type_checker {
-                    let _ = media_type_checker.check_namespace(&namespace).await;
-                }
+        for namespace in namespaces {
+            if let Some(retention_enforcer) = &self.retention_enforcer {
+                let _ = retention_enforcer.check_namespace(&namespace).await;
             }
 
-            if next_marker.is_none() {
-                break;
+            if let Some(uploads_checker) = &self.upload_checker {
+                let _ = uploads_checker.check_namespace(&namespace).await;
             }
 
-            marker = next_marker;
+            if let Some(tags_checker) = &self.tags_checker {
+                let _ = tags_checker.check_namespace(&namespace).await;
+            }
+
+            if let Some(revisions_checker) = &self.revisions {
+                let _ = revisions_checker.check_namespace(&namespace).await;
+            }
+
+            if let Some(link_references_checker) = &self.link_references_checker {
+                let _ = link_references_checker.check_namespace(&namespace).await;
+            }
+
+            if let Some(media_type_checker) = &self.media_type_checker {
+                let _ = media_type_checker.check_namespace(&namespace).await;
+            }
         }
 
         Ok(())

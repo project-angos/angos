@@ -7,6 +7,7 @@ use crate::{
     registry::{
         Error,
         metadata_store::{MetadataStore, link_kind::LinkKind},
+        pagination::for_each_page,
     },
 };
 
@@ -26,26 +27,23 @@ impl TagChecker {
     pub async fn check_namespace(&self, namespace: &str) -> Result<(), Error> {
         debug!("Checking tags inconsistencies from namespace '{namespace}'");
 
-        let mut marker = None;
-        loop {
-            let (tags, next_marker) = self
-                .metadata_store
-                .list_tags(namespace, 100, marker)
-                .await?;
-
-            for tag in &tags {
-                if let Err(e) = self.repair_tag_digest_link(namespace, tag).await {
-                    error!("Failed to check tag from '{namespace}' (tag '{tag}'): {e}");
+        for_each_page(
+            |marker| async move {
+                self.metadata_store
+                    .list_tags(namespace, 100, marker)
+                    .await
+                    .map_err(Error::from)
+            },
+            |tags| async move {
+                for tag in &tags {
+                    if let Err(e) = self.repair_tag_digest_link(namespace, tag).await {
+                        error!("Failed to check tag from '{namespace}' (tag '{tag}'): {e}");
+                    }
                 }
-            }
-
-            if next_marker.is_none() {
-                break;
-            }
-            marker = next_marker;
-        }
-
-        Ok(())
+                Ok(())
+            },
+        )
+        .await
     }
 
     async fn repair_tag_digest_link(&self, namespace: &str, tag: &str) -> Result<(), Error> {

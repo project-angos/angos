@@ -8,7 +8,9 @@ use tracing::instrument;
 use crate::{
     command::server::response_body::ResponseBody,
     oci::{Digest, Manifest, Namespace, Platform as OciPlatform},
-    registry::{Error, Registry, metadata_store::link_kind::LinkKind},
+    registry::{
+        Error, Registry, metadata_store::link_kind::LinkKind, pagination::collect_all_pages,
+    },
 };
 
 impl Registry {
@@ -78,7 +80,7 @@ impl Registry {
 
         for name_str in namespace_names {
             let name = Namespace::new(&name_str).map_err(|_| Error::NameInvalid)?;
-            let manifest_count = self.count_manifests(&name).await?;
+            let manifest_count = self.metadata_store.count_manifests(&name).await?;
             let upload_count = self.count_uploads(&name).await?;
             namespaces.push(NamespaceInfo {
                 name: name_str,
@@ -169,7 +171,13 @@ impl Registry {
             manifests: Vec<ManifestEntry>,
         }
 
-        let all_revisions = self.collect_all_revisions(namespace).await?;
+        let all_revisions = collect_all_pages(|token| async move {
+            self.metadata_store
+                .list_revisions(namespace, 1000, token)
+                .await
+                .map_err(Error::from)
+        })
+        .await?;
         let digest_to_tags = self.build_digest_to_tags_map(namespace).await?;
 
         let mut child_to_parents: HashMap<Digest, Vec<(Digest, Option<Platform>)>> = HashMap::new();
@@ -302,31 +310,25 @@ impl Registry {
             uploads: Vec<UploadEntry>,
         }
 
+        let uuids = collect_all_pages(|token| async move {
+            self.blob_store
+                .list_uploads(namespace, 1000, token)
+                .await
+                .map_err(Error::from)
+        })
+        .await?;
+
         let mut all_uploads = Vec::new();
-        let mut continuation_token = None;
-
-        loop {
-            let (uploads, next_token) = self
-                .blob_store
-                .list_uploads(namespace, 1000, continuation_token)
-                .await?;
-
-            for uuid in uploads {
-                if let Ok((_, size, started_at)) =
-                    self.blob_store.read_upload_summary(namespace, &uuid).await
-                {
-                    all_uploads.push(UploadEntry {
-                        uuid,
-                        size,
-                        started_at,
-                    });
-                }
+        for uuid in uuids {
+            if let Ok((_, size, started_at)) =
+                self.blob_store.read_upload_summary(namespace, &uuid).await
+            {
+                all_uploads.push(UploadEntry {
+                    uuid,
+                    size,
+                    started_at,
+                });
             }
-
-            if next_token.is_none() {
-                break;
-            }
-            continuation_token = next_token;
         }
 
         let response = UploadsResponse {
@@ -363,67 +365,28 @@ impl Registry {
         }
     }
 
-    async fn count_manifests(&self, namespace: &Namespace) -> Result<usize, Error> {
-        Ok(self.metadata_store.count_manifests(namespace).await?)
-    }
-
     async fn count_uploads(&self, namespace: &Namespace) -> Result<usize, Error> {
-        let mut count = 0;
-        let mut continuation_token = None;
-
-        loop {
-            let (uploads, next_token) = self
-                .blob_store
-                .list_uploads(namespace, 1000, continuation_token)
-                .await?;
-
-            count += uploads.len();
-
-            if next_token.is_none() {
-                break;
-            }
-            continuation_token = next_token;
-        }
-
-        Ok(count)
-    }
-
-    async fn collect_all_revisions(&self, namespace: &Namespace) -> Result<Vec<Digest>, Error> {
-        let mut all_revisions = Vec::new();
-        let mut continuation_token = None;
-
-        loop {
-            let (revisions, next_token) = self
-                .metadata_store
-                .list_revisions(namespace, 1000, continuation_token)
-                .await?;
-
-            all_revisions.extend(revisions);
-
-            if next_token.is_none() {
-                break;
-            }
-            continuation_token = next_token;
-        }
-
-        Ok(all_revisions)
+        let uploads = collect_all_pages(|token| async move {
+            self.blob_store
+                .list_uploads(namespace, 1000, token)
+                .await
+                .map_err(Error::from)
+        })
+        .await?;
+        Ok(uploads.len())
     }
 
     async fn build_digest_to_tags_map(
         &self,
         namespace: &Namespace,
     ) -> Result<HashMap<Digest, Vec<String>>, Error> {
-        let mut all_tags = Vec::new();
-        let mut last: Option<String> = None;
-
-        loop {
-            let (tags, next_last) = self.metadata_store.list_tags(namespace, 1000, last).await?;
-            all_tags.extend(tags);
-            if next_last.is_none() {
-                break;
-            }
-            last = next_last;
-        }
+        let all_tags = collect_all_pages(|last| async move {
+            self.metadata_store
+                .list_tags(namespace, 1000, last)
+                .await
+                .map_err(Error::from)
+        })
+        .await?;
 
         let mut digest_to_tags: HashMap<Digest, Vec<String>> = HashMap::new();
 
@@ -446,26 +409,18 @@ impl Registry {
             return Err(Error::NameUnknown);
         }
 
-        let mut matching_namespaces = Vec::new();
-        let mut continuation_token = None;
+        let all_namespaces = collect_all_pages(|token| async move {
+            self.metadata_store
+                .list_namespaces(1000, token)
+                .await
+                .map_err(Error::from)
+        })
+        .await?;
 
-        loop {
-            let (namespaces, next_token) = self
-                .metadata_store
-                .list_namespaces(1000, continuation_token)
-                .await?;
-
-            for ns in namespaces {
-                if ns == repository || ns.starts_with(&format!("{repository}/")) {
-                    matching_namespaces.push(ns);
-                }
-            }
-
-            if next_token.is_none() {
-                break;
-            }
-            continuation_token = next_token;
-        }
+        let mut matching_namespaces: Vec<String> = all_namespaces
+            .into_iter()
+            .filter(|ns| ns == repository || ns.starts_with(&format!("{repository}/")))
+            .collect();
 
         matching_namespaces.sort_unstable();
         Ok(matching_namespaces)

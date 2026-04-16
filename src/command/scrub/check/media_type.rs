@@ -8,6 +8,7 @@ use crate::{
         Error,
         blob_store::BlobStore,
         metadata_store::{MetadataStore, MetadataStoreExt, link_kind::LinkKind},
+        pagination::collect_all_pages,
     },
 };
 
@@ -33,52 +34,34 @@ impl MediaTypeChecker {
     pub async fn check_namespace(&self, namespace: &str) -> Result<(), Error> {
         debug!("Checking media_type field for namespace '{namespace}'");
 
-        let mut marker = None;
-        loop {
-            let (revisions, next_marker) = self
-                .metadata_store
-                .list_revisions(namespace, 100, marker)
+        let revisions =
+            collect_all_pages(|marker| self.metadata_store.list_revisions(namespace, 100, marker))
                 .await?;
 
-            for revision in &revisions {
-                let link = LinkKind::Digest(revision.clone());
-                if let Err(e) = self
-                    .backfill_link(namespace, &link, &format!("revision {revision}"))
-                    .await
-                {
-                    error!(
-                        "Failed to backfill media_type for '{namespace}' (revision '{revision}'): {e}"
-                    );
-                }
+        for revision in &revisions {
+            let link = LinkKind::Digest(revision.clone());
+            if let Err(e) = self
+                .backfill_link(namespace, &link, &format!("revision {revision}"))
+                .await
+            {
+                error!(
+                    "Failed to backfill media_type for '{namespace}' (revision '{revision}'): {e}"
+                );
             }
-
-            if next_marker.is_none() {
-                break;
-            }
-            marker = next_marker;
         }
 
-        let mut marker = None;
-        loop {
-            let (tags, next_marker) = self
-                .metadata_store
-                .list_tags(namespace, 100, marker)
+        let tags =
+            collect_all_pages(|marker| self.metadata_store.list_tags(namespace, 100, marker))
                 .await?;
 
-            for tag in &tags {
-                let link = LinkKind::Tag(tag.clone());
-                if let Err(e) = self
-                    .backfill_link(namespace, &link, &format!("tag '{tag}'"))
-                    .await
-                {
-                    error!("Failed to backfill media_type for '{namespace}' (tag '{tag}'): {e}");
-                }
+        for tag in &tags {
+            let link = LinkKind::Tag(tag.clone());
+            if let Err(e) = self
+                .backfill_link(namespace, &link, &format!("tag '{tag}'"))
+                .await
+            {
+                error!("Failed to backfill media_type for '{namespace}' (tag '{tag}'): {e}");
             }
-
-            if next_marker.is_none() {
-                break;
-            }
-            marker = next_marker;
         }
 
         Ok(())

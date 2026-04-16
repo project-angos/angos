@@ -8,6 +8,7 @@ use crate::{
         Error,
         blob_store::BlobStore,
         metadata_store::{self, BlobIndexOperation, MetadataStore, link_kind::LinkKind},
+        pagination::for_each_page,
     },
 };
 
@@ -33,23 +34,23 @@ impl BlobChecker {
     pub async fn check_all(&self) -> Result<(), Error> {
         debug!("Checking blobs");
 
-        let mut marker = None;
-        loop {
-            let (blobs, next_marker) = self.blob_store.list_blobs(100, marker).await?;
-
-            for blob in &blobs {
-                if let Err(e) = self.check_blob(blob).await {
-                    error!("Failed to process blob index for {blob}: {e}");
+        for_each_page(
+            |marker| async move {
+                self.blob_store
+                    .list_blobs(100, marker)
+                    .await
+                    .map_err(Error::from)
+            },
+            |blobs| async move {
+                for blob in &blobs {
+                    if let Err(e) = self.check_blob(blob).await {
+                        error!("Failed to process blob index for {blob}: {e}");
+                    }
                 }
-            }
-
-            if next_marker.is_none() {
-                break;
-            }
-            marker = next_marker;
-        }
-
-        Ok(())
+                Ok(())
+            },
+        )
+        .await
     }
 
     async fn check_blob(&self, blob: &Digest) -> Result<(), Error> {
