@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use futures_util::stream::{self, StreamExt};
 use tracing::{debug, error, info};
 
 use crate::{
@@ -10,6 +11,9 @@ use crate::{
         metadata_store::{self, BlobIndexOperation, MetadataStore, link_kind::LinkKind},
     },
 };
+
+const BLOB_CHECK_CONCURRENCY: usize = 8;
+const LINK_PROBE_CONCURRENCY: usize = 10;
 
 pub struct BlobChecker {
     blob_store: Arc<dyn BlobStore + Send + Sync>,
@@ -37,11 +41,13 @@ impl BlobChecker {
         loop {
             let (blobs, next_marker) = self.blob_store.list_blobs(100, marker).await?;
 
-            for blob in &blobs {
-                if let Err(e) = self.check_blob(blob).await {
-                    error!("Failed to process blob index for {blob}: {e}");
-                }
-            }
+            stream::iter(blobs)
+                .for_each_concurrent(BLOB_CHECK_CONCURRENCY, |blob| async move {
+                    if let Err(e) = self.check_blob(&blob).await {
+                        error!("Failed to process blob index for {blob}: {e}");
+                    }
+                })
+                .await;
 
             if next_marker.is_none() {
                 break;
@@ -68,19 +74,25 @@ impl BlobChecker {
         }
 
         for (namespace, references) in blob_index.namespace {
-            for link in references {
-                if self
-                    .metadata_store
-                    .read_link(&namespace, &link, false)
-                    .await
-                    .is_err()
-                    && let Err(err) = self.remove_invalid_link(&namespace, blob, &link).await
-                {
-                    error!(
-                        "Failed to remove invalid link '{link}' from blob index '{namespace}/{blob}': {err}"
-                    );
-                }
-            }
+            stream::iter(references)
+                .for_each_concurrent(LINK_PROBE_CONCURRENCY, |link| {
+                    let namespace = &namespace;
+                    async move {
+                        if self
+                            .metadata_store
+                            .read_link(namespace, &link, false)
+                            .await
+                            .is_err()
+                            && let Err(err) =
+                                self.remove_invalid_link(namespace, blob, &link).await
+                        {
+                            error!(
+                                "Failed to remove invalid link '{link}' from blob index '{namespace}/{blob}': {err}"
+                            );
+                        }
+                    }
+                })
+                .await;
         }
 
         Ok(())
