@@ -95,31 +95,31 @@ impl Registry {
         reference: Reference,
         is_tag_immutable: bool,
     ) -> Result<HeadManifestResponse, Error> {
-        let manifest = self.head_local_manifest(namespace, &reference).await;
+        let local = self.head_local_manifest(namespace, &reference).await;
+
         if !repository.is_pull_through() {
-            return manifest.map_err(|_| {
+            return local.map_err(|_| {
                 error!("Failed to head local manifest: {namespace}:{reference}");
                 Error::ManifestUnknown
             });
         }
 
-        if let Ok(manifest) = manifest {
-            if let Reference::Tag(_tag) = &reference {
-                if is_tag_immutable {
-                    return Ok(manifest);
-                }
-                let (_, digest, _) = repository
-                    .head_manifest(accepted_types, namespace, &reference)
+        if let Ok(manifest) = local {
+            let needs_upstream_pull = matches!(&reference, Reference::Tag(_))
+                && !is_tag_immutable
+                && !repository
+                    .is_upstream_digest_match(
+                        accepted_types,
+                        namespace,
+                        &reference,
+                        &manifest.digest,
+                    )
                     .await?;
-                if digest == manifest.digest {
-                    return Ok(manifest);
-                }
-            } else {
+
+            if !needs_upstream_pull {
                 return Ok(manifest);
             }
         }
-
-        // pull from upstream
 
         let res = self
             .get_manifest(
@@ -199,31 +199,31 @@ impl Registry {
         reference: Reference,
         is_tag_immutable: bool,
     ) -> Result<GetManifestResponse, Error> {
-        let manifest = self.get_local_manifest(namespace, &reference).await;
+        let local = self.get_local_manifest(namespace, &reference).await;
+
         if !repository.is_pull_through() {
-            return manifest.map_err(|_| {
+            return local.map_err(|_| {
                 error!("Failed to get local manifest: {namespace}:{reference}");
                 Error::ManifestUnknown
             });
         }
 
-        if let Ok(manifest) = manifest {
-            if let Reference::Tag(_tag) = &reference {
-                if is_tag_immutable {
-                    return Ok(manifest);
-                }
-                let (_, digest, _) = repository
-                    .head_manifest(accepted_types, namespace, &reference)
+        if let Ok(manifest) = local {
+            let needs_upstream_pull = matches!(&reference, Reference::Tag(_))
+                && !is_tag_immutable
+                && !repository
+                    .is_upstream_digest_match(
+                        accepted_types,
+                        namespace,
+                        &reference,
+                        &manifest.digest,
+                    )
                     .await?;
-                if digest == manifest.digest {
-                    return Ok(manifest);
-                }
-            } else {
+
+            if !needs_upstream_pull {
                 return Ok(manifest);
             }
         }
-
-        // pull from upstream
 
         let (media_type, digest, content) = repository
             .get_manifest(accepted_types, namespace, &reference)

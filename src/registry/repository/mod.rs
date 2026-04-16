@@ -5,7 +5,7 @@ use tracing::instrument;
 
 use crate::{
     cache::Cache,
-    oci::{Digest, Reference},
+    oci::{Digest, Namespace, Reference},
     policy::{AccessPolicyConfig, RetentionPolicy, RetentionPolicyConfig},
     registry::{Error, blob_store::BoxedReader},
 };
@@ -60,6 +60,20 @@ impl Repository {
 
     pub fn is_pull_through(&self) -> bool {
         !self.upstreams.is_empty()
+    }
+
+    /// Checks whether the upstream still has the same digest for the given tag.
+    pub async fn is_upstream_digest_match(
+        &self,
+        accepted_types: &[String],
+        namespace: &Namespace,
+        reference: &Reference,
+        local_digest: &Digest,
+    ) -> Result<bool, Error> {
+        let (_, upstream_digest, _) = self
+            .head_manifest(accepted_types, namespace, reference)
+            .await?;
+        Ok(upstream_digest == *local_digest)
     }
 
     #[instrument(skip(self))]
