@@ -36,7 +36,7 @@ use crate::{
     },
     event_webhook::event::{Event, EventActor, EventKind},
     identity::{ClientIdentity, Route},
-    metrics_provider::{IN_FLIGHT_REQUESTS, METRICS_PROVIDER},
+    metrics_provider::{InFlightGuard, METRICS_PROVIDER},
     oci::{Digest, Namespace, Reference},
     registry::metadata_store::ConditionalCapabilities,
 };
@@ -63,11 +63,7 @@ pub async fn serve_request<S>(
     );
     pin!(conn);
 
-    IN_FLIGHT_REQUESTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    METRICS_PROVIDER.metric_http_request_in_flight.set(
-        i64::try_from(IN_FLIGHT_REQUESTS.load(std::sync::atomic::Ordering::Relaxed))
-            .unwrap_or(i64::MAX),
-    );
+    let _in_flight_guard = InFlightGuard::new();
 
     for (iter, sleep_duration) in timeouts.iter().enumerate() {
         debug!("iter = {iter} sleep_duration = {sleep_duration:?}");
@@ -90,12 +86,6 @@ pub async fn serve_request<S>(
             }
         }
     }
-
-    IN_FLIGHT_REQUESTS.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-    METRICS_PROVIDER.metric_http_request_in_flight.set(
-        i64::try_from(IN_FLIGHT_REQUESTS.load(std::sync::atomic::Ordering::Relaxed))
-            .unwrap_or(i64::MAX),
-    );
 }
 
 #[instrument(skip(context, request))]

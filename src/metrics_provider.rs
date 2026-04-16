@@ -76,6 +76,30 @@ pub static METRICS_PROVIDER: LazyLock<MetricsProvider> = LazyLock::new(|| {
         .unwrap_or_else(|error| panic!("Unable to create metrics provider: {error}"))
 });
 
+pub struct InFlightGuard;
+
+impl InFlightGuard {
+    pub fn new() -> Self {
+        IN_FLIGHT_REQUESTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Self::update_gauge();
+        Self
+    }
+
+    fn update_gauge() {
+        METRICS_PROVIDER.metric_http_request_in_flight.set(
+            i64::try_from(IN_FLIGHT_REQUESTS.load(std::sync::atomic::Ordering::Relaxed))
+                .unwrap_or(i64::MAX),
+        );
+    }
+}
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        IN_FLIGHT_REQUESTS.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        Self::update_gauge();
+    }
+}
+
 pub struct MetricsProvider {
     registry: PrometheusRegistry,
     pub metric_http_request_total: IntCounterVec,
