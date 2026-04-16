@@ -209,8 +209,8 @@ impl Command {
         };
 
         let multipart_checker = if let Some(multipart_timeout) = options.multipart {
-            let multipart_timeout =
-                Duration::from_std(multipart_timeout.into()).expect("Upload timeout must be valid");
+            let multipart_timeout = Duration::from_std(multipart_timeout.into())
+                .expect("Multipart timeout must be valid");
 
             config
                 .blob_store

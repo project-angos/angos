@@ -1,7 +1,4 @@
-use std::{
-    collections::hash_map::DefaultHasher,
-    hash::{Hash, Hasher},
-};
+use sha2::{Digest as Sha2Digest, Sha256};
 
 use crate::{oci::Digest, registry::metadata_store::link_kind::LinkKind};
 
@@ -30,11 +27,12 @@ pub fn namespace_registry_shard_path(namespace: &str) -> String {
     format!("{REGISTRY_ROOT}/ns/{shard}.json")
 }
 
-#[allow(clippy::cast_possible_truncation)]
+// SHA-256 is used here (not DefaultHasher) because DefaultHasher is explicitly not
+// guaranteed to be stable across Rust versions. Changing the hash algorithm after
+// deployment would remap existing data to different shard paths, corrupting storage.
 pub fn shard_key(value: &str) -> String {
-    let mut hasher = DefaultHasher::new();
-    value.hash(&mut hasher);
-    format!("{:02x}", hasher.finish() as u8)
+    let hash = Sha256::digest(value.as_bytes());
+    format!("{:02x}", hash[0])
 }
 
 pub fn namespace_shard_key(namespace: &str) -> String {

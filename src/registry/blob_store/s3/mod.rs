@@ -202,21 +202,23 @@ impl Backend {
         let upload_path = path_builder::upload_path(name, uuid);
 
         let (upload_id, part_list) = if append {
-            match state {
-                Some(s) if s.multipart_upload_id.is_some() => {
-                    (s.multipart_upload_id.unwrap(), s.parts)
-                }
-                _ => {
-                    let id = if let Some(id) = self.get_or_search_upload_id(&upload_path).await? {
-                        id
-                    } else {
-                        let id = self.store.create_multipart_upload(&upload_path).await?;
-                        self.cache_upload_id(&upload_path, &id).await;
-                        id
-                    };
-                    let parts = self.store.list_parts(&upload_path, &id).await?;
-                    (id, parts)
-                }
+            if let Some(UploadState {
+                multipart_upload_id: Some(id),
+                parts,
+                ..
+            }) = state
+            {
+                (id, parts)
+            } else {
+                let id = if let Some(id) = self.get_or_search_upload_id(&upload_path).await? {
+                    id
+                } else {
+                    let id = self.store.create_multipart_upload(&upload_path).await?;
+                    self.cache_upload_id(&upload_path, &id).await;
+                    id
+                };
+                let parts = self.store.list_parts(&upload_path, &id).await?;
+                (id, parts)
             }
         } else {
             self.evict_upload_id(&upload_path).await;
@@ -419,29 +421,27 @@ impl Backend {
         state: Option<UploadState>,
     ) -> Result<(String, Vec<(i32, String, i64)>, u64, u64), Error> {
         let upload_path = path_builder::upload_path(name, uuid);
-        if let Some(s) = state.filter(|s| s.multipart_upload_id.is_some()) {
-            #[allow(clippy::cast_sign_loss)]
-            let uploaded: u64 = s.parts.iter().map(|(_, _, sz)| *sz as u64).sum();
-            return Ok((
-                s.multipart_upload_id.unwrap(),
-                s.parts,
-                uploaded,
-                s.pending_size,
-            ));
-        }
-        if let Some(cached) = self
-            .retrieve_cached_upload_state(name, uuid)
-            .await
-            .filter(|s| s.multipart_upload_id.is_some())
+        if let Some(UploadState {
+            multipart_upload_id: Some(id),
+            parts,
+            pending_size,
+            ..
+        }) = state
         {
             #[allow(clippy::cast_sign_loss)]
-            let uploaded: u64 = cached.parts.iter().map(|(_, _, sz)| *sz as u64).sum();
-            return Ok((
-                cached.multipart_upload_id.unwrap(),
-                cached.parts,
-                uploaded,
-                cached.pending_size,
-            ));
+            let uploaded: u64 = parts.iter().map(|(_, _, sz)| *sz as u64).sum();
+            return Ok((id, parts, uploaded, pending_size));
+        }
+        if let Some(UploadState {
+            multipart_upload_id: Some(id),
+            parts,
+            pending_size,
+            ..
+        }) = self.retrieve_cached_upload_state(name, uuid).await
+        {
+            #[allow(clippy::cast_sign_loss)]
+            let uploaded: u64 = parts.iter().map(|(_, _, sz)| *sz as u64).sum();
+            return Ok((id, parts, uploaded, pending_size));
         }
         let id = if let Some(id) = self.get_or_search_upload_id(&upload_path).await? {
             id

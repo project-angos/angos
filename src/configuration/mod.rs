@@ -172,11 +172,8 @@ impl Configuration {
     }
 
     pub fn load_from_str(slice: &str) -> Result<Self, Error> {
-        let config: Configuration = toml::from_str(slice).map_err(|e| {
-            println!("Configuration file format error:");
-            println!("{e}");
-            Error::NotReadable(e.to_string())
-        })?;
+        let config: Configuration =
+            toml::from_str(slice).map_err(|e| Error::NotReadable(e.to_string()))?;
 
         config.validate()?;
         Ok(config)

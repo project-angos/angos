@@ -1,7 +1,6 @@
 use std::fmt;
 
 use redis::RedisError;
-use tracing::warn;
 
 #[derive(Debug, PartialEq)]
 pub enum Error {
@@ -19,8 +18,7 @@ impl fmt::Display for Error {
 
 impl From<RedisError> for Error {
     fn from(error: RedisError) -> Self {
-        warn!("Redis backend error: {error}");
-        Error::Backend("Backend error".to_string())
+        Error::Backend(error.to_string())
     }
 }
 
@@ -43,6 +41,7 @@ mod tests {
     fn test_from_redis_error() {
         let error = RedisError::from((redis::ErrorKind::Io, "IO error occurred"));
         let error: Error = error.into();
-        assert_eq!(error, Error::Backend("Backend error".to_string()));
+        assert!(matches!(error, Error::Backend(_)));
+        assert!(format!("{error}").contains("IO error occurred"));
     }
 }
