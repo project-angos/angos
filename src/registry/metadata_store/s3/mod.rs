@@ -311,6 +311,9 @@ const MAX_BLOB_INDEX_CAS_RETRIES: u32 = 20;
 /// Bounded concurrency for parallel shard writes during namespace registry
 /// rebuild. Each in-flight shard holds one small JSON payload.
 const REGISTRY_REBUILD_CONCURRENCY: usize = 8;
+/// Bounded concurrency for parallel namespace subtree walks during cold-start
+/// registry rebuild. Each in-flight subtree holds one page of 1000 prefixes.
+const NAMESPACE_WALK_CONCURRENCY: usize = 8;
 /// Upper bound on the TTL used when caching negative blob-index membership results.
 /// Kept short so a freshly-pushed layer becomes visible quickly in readers that
 /// previously 404-ed the digest; positive hits still use `link_cache_ttl` in full.
@@ -1990,9 +1993,8 @@ impl Backend {
     }
 
     pub async fn rebuild_namespace_registry(&self) -> Result<(), Error> {
-        let repo_dir = path_builder::repository_dir();
-        let mut namespaces = Vec::new();
-        self.collect_namespaces(repo_dir, "", &mut namespaces)
+        let mut namespaces = self
+            .collect_namespaces(path_builder::repository_dir().to_string(), String::new())
             .await?;
         namespaces.sort();
         namespaces.dedup();
@@ -2177,41 +2179,55 @@ impl Backend {
         Ok(())
     }
 
-    async fn collect_namespaces(
+    fn collect_namespaces(
         &self,
-        path: &str,
-        prefix: &str,
-        namespaces: &mut Vec<String>,
-    ) -> Result<(), Error> {
-        let mut continuation_token = None;
-        loop {
-            let (prefixes, _, next_token) = self
-                .store
-                .list_prefixes(path, "/", 1000, continuation_token, None)
-                .await?;
+        path: String,
+        prefix: String,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<String>, Error>> + Send + '_>> {
+        Box::pin(async move {
+            let mut result = Vec::new();
+            let mut continuation_token = None;
 
-            for entry in &prefixes {
-                if entry.starts_with('_') {
-                    if entry == "_manifests" {
-                        let namespace = prefix.strip_suffix('/').unwrap_or(prefix);
-                        if !namespace.is_empty() {
-                            namespaces.push(namespace.to_string());
+            loop {
+                let (prefixes, _, next_token) = self
+                    .store
+                    .list_prefixes(&path, "/", 1000, continuation_token, None)
+                    .await?;
+
+                let mut children = Vec::new();
+                for entry in &prefixes {
+                    if entry.starts_with('_') {
+                        if entry == "_manifests" {
+                            let namespace = prefix.strip_suffix('/').unwrap_or(&prefix);
+                            if !namespace.is_empty() {
+                                result.push(namespace.to_string());
+                            }
                         }
+                        continue;
                     }
-                    continue;
+                    children.push((format!("{path}/{entry}"), format!("{prefix}{entry}/")));
                 }
 
-                let child_path = format!("{path}/{entry}");
-                let child_prefix = format!("{prefix}{entry}/");
-                Box::pin(self.collect_namespaces(&child_path, &child_prefix, namespaces)).await?;
+                let subtree_results: Vec<Result<Vec<String>, Error>> = stream::iter(children)
+                    .map(|(child_path, child_prefix)| {
+                        self.collect_namespaces(child_path, child_prefix)
+                    })
+                    .buffer_unordered(NAMESPACE_WALK_CONCURRENCY)
+                    .collect()
+                    .await;
+
+                for subtree in subtree_results {
+                    result.extend(subtree?);
+                }
+
+                continuation_token = next_token;
+                if continuation_token.is_none() {
+                    break;
+                }
             }
 
-            continuation_token = next_token;
-            if continuation_token.is_none() {
-                break;
-            }
-        }
-        Ok(())
+            Ok(result)
+        })
     }
 
     /// Reads the link with its `ETag`, then spawns the access time write as a
