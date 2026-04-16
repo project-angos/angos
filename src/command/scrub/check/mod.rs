@@ -1,4 +1,5 @@
 mod blob;
+mod descriptor;
 mod link_references;
 mod manifest;
 mod media_type;
@@ -10,6 +11,7 @@ mod upload;
 use std::sync::Arc;
 
 pub use blob::BlobChecker;
+pub use descriptor::DescriptorChecker;
 pub use link_references::LinkReferencesChecker;
 pub use manifest::ManifestChecker;
 pub use media_type::MediaTypeChecker;

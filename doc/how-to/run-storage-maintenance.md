@@ -37,6 +37,7 @@ The `scrub` command performs various maintenance operations. Each check must be 
 | `-p, --multipart <duration>`  | Cleanup orphan S3 multipart uploads older than duration |
 | `-l, --links`                 | Fix links format inconsistencies                        |
 | `-M, --media-types`           | Backfill missing `media_type` on manifest links         |
+| `-D, --descriptors`           | Backfill missing `descriptor` on referrer links         |
 | `-d, --dry-run`               | Preview changes without applying them                   |
 
 ---
@@ -294,6 +295,24 @@ The `--media-types` flag reads each manifest blob and writes its `media_type` in
 ```
 
 This is idempotent and safe to run multiple times.
+
+### Backfill Referrer Descriptors
+
+The `--descriptors` flag persists the OCI `descriptor` onto referrer links that were written before descriptor tracking was added. Without this metadata, `list_referrers` falls back to a full manifest GET for every legacy referrer link on each call. After backfilling, the descriptor is read directly from the link metadata and the manifest GET is skipped.
+
+```bash
+# Preview what would be backfilled
+./angos -c config.toml scrub --descriptors --dry-run
+
+# Backfill descriptors on all referrer links
+./angos -c config.toml scrub --descriptors
+```
+
+This is idempotent and safe to run multiple times. Combine with `--media-types` for a full one-shot metadata backfill after an upgrade:
+
+```bash
+./angos -c config.toml scrub --media-types --descriptors
+```
 
 ### Automatic Blob Index Migration
 

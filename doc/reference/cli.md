@@ -84,6 +84,7 @@ The scrub command performs storage maintenance and integrity checks. You must sp
 | `--retention`             | `-r`   | Enforce retention policies                                                 |
 | `--links`                 | `-l`   | Fix links format inconsistencies (migration/repair)                        |
 | `--media-types`           | `-M`   | Backfill missing `media_type` on manifest links                            |
+| `--descriptors`           | `-D`   | Backfill missing `descriptor` on referrer links                            |
 
 **Examples:**
 

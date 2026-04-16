@@ -9,8 +9,8 @@ use crate::{
     cache::Cache,
     command::scrub::{
         check::{
-            BlobChecker, LinkReferencesChecker, ManifestChecker, MediaTypeChecker,
-            MultipartChecker, RetentionChecker, TagChecker, UploadChecker,
+            BlobChecker, DescriptorChecker, LinkReferencesChecker, ManifestChecker,
+            MediaTypeChecker, MultipartChecker, RetentionChecker, TagChecker, UploadChecker,
         },
         error::Error,
     },
@@ -56,6 +56,9 @@ pub struct Options {
     #[argh(switch, short = 'M')]
     /// backfill missing `media_type` on manifest links
     pub media_types: bool,
+    #[argh(switch, short = 'D')]
+    /// backfill missing `descriptor` on referrer links
+    pub descriptors: bool,
 }
 
 pub struct Command {
@@ -68,6 +71,7 @@ pub struct Command {
     multipart_checker: Option<MultipartChecker>,
     link_references_checker: Option<LinkReferencesChecker>,
     media_type_checker: Option<MediaTypeChecker>,
+    descriptor_checker: Option<DescriptorChecker>,
 }
 
 fn build_blob_store(config: &blob_store::BlobStorageConfig) -> Result<Arc<dyn BlobStore>, Error> {
@@ -143,6 +147,7 @@ fn build_global_retention_policy(
 }
 
 impl Command {
+    #[allow(clippy::too_many_lines)]
     pub async fn new(options: &Options, config: &Configuration) -> Result<Self, Error> {
         let blob_store = build_blob_store(&config.blob_store)?;
         let metadata_store = build_metadata_store(config).await?;
@@ -240,6 +245,15 @@ impl Command {
             None
         };
 
+        let descriptor_checker = if options.descriptors {
+            Some(DescriptorChecker::new(
+                metadata_store.clone(),
+                options.dry_run,
+            ))
+        } else {
+            None
+        };
+
         if options.dry_run {
             info!("Dry-run mode: no changes will be made to the storage");
         }
@@ -254,6 +268,7 @@ impl Command {
             multipart_checker,
             link_references_checker,
             media_type_checker,
+            descriptor_checker,
         })
     }
 
@@ -298,6 +313,10 @@ impl Command {
 
                 if let Some(media_type_checker) = &self.media_type_checker {
                     let _ = media_type_checker.check_namespace(&namespace).await;
+                }
+
+                if let Some(descriptor_checker) = &self.descriptor_checker {
+                    let _ = descriptor_checker.check_namespace(&namespace).await;
                 }
             }
 
@@ -407,6 +426,7 @@ mod tests {
             retention: true,
             links: false,
             media_types: false,
+            descriptors: false,
         };
 
         let command = Command::new(&options, &config).await;
@@ -421,6 +441,7 @@ mod tests {
         assert!(cmd.multipart_checker.is_none());
         assert!(cmd.link_references_checker.is_none());
         assert!(cmd.media_type_checker.is_none());
+        assert!(cmd.descriptor_checker.is_none());
     }
 
     #[tokio::test]
@@ -465,6 +486,7 @@ mod tests {
             retention: false,
             links: false,
             media_types: false,
+            descriptors: false,
         };
 
         let command = Command::new(&options, &config).await.unwrap();
