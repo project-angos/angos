@@ -21,11 +21,9 @@ use tracing::{info, warn};
 use crate::{
     cache::Cache,
     oci::{Digest, Reference},
-    registry::{Error, blob_store::BoxedReader},
+    registry::{DOCKER_CONTENT_DIGEST, Error, blob_store::BoxedReader},
     secret::Secret,
 };
-
-pub const DOCKER_CONTENT_DIGEST: &str = "Docker-Content-Digest";
 
 fn parse_header<T: std::str::FromStr>(
     response: &Response,
@@ -231,7 +229,7 @@ impl RegistryClient {
         }
 
         let media_type = parse_header(&response, CONTENT_TYPE).ok();
-        let digest = parse_header(&response, crate::registry::manifest::DOCKER_CONTENT_DIGEST)?;
+        let digest = parse_header(&response, DOCKER_CONTENT_DIGEST)?;
 
         let mut content = Vec::new();
         let stream = response.bytes_stream().map_err(io::Error::other);

@@ -9,11 +9,8 @@ use uuid::Uuid;
 use crate::{
     command::server::response_body::ResponseBody,
     oci::{Digest, Namespace},
-    registry::{Error, Registry, blob_store},
+    registry::{DOCKER_CONTENT_DIGEST, DOCKER_UPLOAD_UUID, Error, Registry, blob_store},
 };
-
-pub const DOCKER_UPLOAD_UUID: &str = "Docker-Upload-UUID";
-pub const DOCKER_CONTENT_DIGEST: &str = "Docker-Content-Digest";
 
 pub enum StartUploadResponse {
     ExistingBlob(Digest),

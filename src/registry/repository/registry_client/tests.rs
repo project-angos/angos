@@ -7,6 +7,7 @@ use super::*;
 use crate::{
     cache,
     oci::{Digest, Namespace, Reference},
+    registry::DOCKER_CONTENT_DIGEST,
     secret::Secret,
 };
 

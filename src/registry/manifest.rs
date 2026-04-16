@@ -10,13 +10,10 @@ use crate::{
     command::server::response_body::ResponseBody,
     oci::{Digest, Manifest, Namespace, Reference},
     registry::{
-        Error, Registry, Repository,
+        DOCKER_CONTENT_DIGEST, Error, OCI_SUBJECT, Registry, Repository,
         metadata_store::{MetadataStoreExt, link_kind::LinkKind},
     },
 };
-
-pub const OCI_SUBJECT: &str = "OCI-Subject";
-pub const DOCKER_CONTENT_DIGEST: &str = "Docker-Content-Digest";
 
 pub struct GetManifestResponse {
     pub media_type: Option<String>,
