@@ -300,18 +300,35 @@ impl Registry {
         // fetched on their first GET. Verify the blob is actually present in
         // the local store before issuing a redirect; otherwise the client
         // would follow the 307 to a missing object and see a 404.
-        if range.is_none()
-            && self.enable_blob_redirect
-            && (!repository.is_pull_through()
-                || self.blob_store.get_blob_size(digest).await.is_ok())
-            && let Ok(Some(presigned_url)) = self.blob_store.get_blob_url(digest, None).await
-        {
-            return Response::builder()
-                .status(StatusCode::TEMPORARY_REDIRECT)
-                .header(hyper::header::LOCATION, presigned_url)
-                .header(DOCKER_CONTENT_DIGEST, digest.to_string())
-                .body(ResponseBody::empty())
-                .map_err(Into::into);
+        //
+        // The existence probe and the presign are independent, so race them
+        // instead of running serially. `try_join!` short-circuits the first
+        // error, which naturally falls through to the streaming path below.
+        if range.is_none() && self.enable_blob_redirect {
+            let presigned_url = if repository.is_pull_through() {
+                match tokio::try_join!(
+                    self.blob_store.get_blob_size(digest),
+                    self.blob_store.get_blob_url(digest, None),
+                ) {
+                    Ok((_, Some(url))) => Some(url),
+                    _ => None,
+                }
+            } else {
+                self.blob_store
+                    .get_blob_url(digest, None)
+                    .await
+                    .ok()
+                    .flatten()
+            };
+
+            if let Some(url) = presigned_url {
+                return Response::builder()
+                    .status(StatusCode::TEMPORARY_REDIRECT)
+                    .header(hyper::header::LOCATION, url)
+                    .header(DOCKER_CONTENT_DIGEST, digest.to_string())
+                    .body(ResponseBody::empty())
+                    .map_err(Into::into);
+            }
         }
 
         let res = match self
