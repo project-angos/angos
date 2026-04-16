@@ -4,9 +4,10 @@ mod chunked_reader;
 pub mod tests;
 
 use std::{
-    fmt::{Debug, Formatter},
-    io::Cursor,
+    fmt::{self, Debug, Formatter},
+    io::{self, Cursor},
     sync::Arc,
+    time::Duration as StdDuration,
 };
 
 use async_trait::async_trait;
@@ -46,7 +47,7 @@ pub struct Backend {
 }
 
 impl Debug for Backend {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         f.debug_struct("Backend").finish()
     }
 }
@@ -163,7 +164,7 @@ impl Backend {
         let key = path_builder::upload_staged_container_path(namespace, upload_id, offset);
         match self.store.get_object_body(&key, None).await {
             Ok(data) => Ok(data),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Vec::new()),
             Err(e) => Err(e.into()),
         }
     }
@@ -859,7 +860,7 @@ impl BlobStore for Backend {
         let path = path_builder::blob_path(digest);
         match self.store.object_size(&path).await {
             Ok(size) => Ok(size),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(Error::BlobNotFound),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Err(Error::BlobNotFound),
             Err(e) => Err(e.into()),
         }
     }
@@ -876,7 +877,7 @@ impl BlobStore for Backend {
             .get_object(&path, start_offset)
             .await
             .map_err(|e| {
-                if e.kind() == std::io::ErrorKind::NotFound {
+                if e.kind() == io::ErrorKind::NotFound {
                     Error::BlobNotFound
                 } else {
                     e.into()
@@ -902,7 +903,7 @@ impl BlobStore for Backend {
         let path = path_builder::blob_path(digest);
         let url = self
             .store
-            .generate_presigned_url(&path, std::time::Duration::from_secs(1800), content_type)
+            .generate_presigned_url(&path, StdDuration::from_secs(1800), content_type)
             .await?;
         Ok(Some(url))
     }

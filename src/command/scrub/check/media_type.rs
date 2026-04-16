@@ -3,7 +3,7 @@ use std::sync::Arc;
 use tracing::{debug, error, info};
 
 use crate::{
-    oci::Manifest,
+    oci::{Digest, Manifest},
     registry::{
         Error,
         blob_store::BlobStore,
@@ -104,7 +104,7 @@ impl MediaTypeChecker {
         Ok(())
     }
 
-    async fn read_media_type(&self, digest: &crate::oci::Digest) -> Result<Option<String>, Error> {
+    async fn read_media_type(&self, digest: &Digest) -> Result<Option<String>, Error> {
         let content = self.blob_store.read_blob(digest).await?;
         let manifest: Manifest = serde_json::from_slice(&content).unwrap_or_default();
         Ok(manifest.media_type)
