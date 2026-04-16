@@ -35,6 +35,7 @@ dependencies = [
  "argon2",
  "async-trait",
  "aws-sdk-s3",
+ "aws-smithy-http-client",
  "base64",
  "bytes",
  "bytesize",
