@@ -46,7 +46,10 @@ pub fn parse_manifest_digests(
     body: &[u8],
     content_type: Option<&String>,
 ) -> Result<ParsedManifestDigests, Error> {
-    let manifest: Manifest = serde_json::from_slice(body).unwrap_or_default();
+    let manifest: Manifest = serde_json::from_slice(body).map_err(|e| {
+        warn!("Failed to deserialize manifest: {e}");
+        Error::ManifestInvalid(format!("invalid manifest JSON: {e}"))
+    })?;
 
     if content_type.is_some()
         && manifest.media_type.is_some()
@@ -271,7 +274,10 @@ impl Registry {
         content_type: Option<&String>,
         body: &[u8],
     ) -> Result<PutManifestResponse, Error> {
-        let manifest: Manifest = serde_json::from_slice(body).unwrap_or_default();
+        let manifest: Manifest = serde_json::from_slice(body).map_err(|e| {
+            warn!("Failed to deserialize manifest: {e}");
+            Error::ManifestInvalid(format!("invalid manifest JSON: {e}"))
+        })?;
 
         if content_type.is_some()
             && manifest.media_type.is_some()
