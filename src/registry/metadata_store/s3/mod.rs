@@ -1,7 +1,6 @@
 use std::{
-    collections::{HashMap, HashSet, hash_map::RandomState},
+    collections::{HashMap, HashSet},
     future::Future,
-    hash::{BuildHasher, Hasher},
     io::ErrorKind,
     pin::Pin,
     sync::{
@@ -31,6 +30,7 @@ use crate::{
             LinkOperation, LockConfig, LockStrategy, MetadataStore,
             link_kind::LinkKind,
             lock::{self, LockBackend, MemoryBackend},
+            simple_jitter,
         },
         pagination, path_builder,
     },
@@ -626,15 +626,8 @@ impl Backend {
                         attempt,
                         "Blob index shard CAS conflict, retrying"
                     );
-                    let jitter_ms = {
-                        let max = 50u64.saturating_mul(1u64 << attempt.min(4));
-                        if max == 0 {
-                            0
-                        } else {
-                            RandomState::new().build_hasher().finish() % max
-                        }
-                    };
-                    tokio::time::sleep(Duration::from_millis(jitter_ms)).await;
+                    let max_ms = 50u64.saturating_mul(1u64 << attempt.min(4));
+                    tokio::time::sleep(Duration::from_millis(simple_jitter(max_ms))).await;
                 }
                 Err(e) => return Err(Error::StorageBackend(e.to_string())),
             }
@@ -1845,15 +1838,8 @@ impl Backend {
                         namespace,
                         attempt, "Namespace registry shard CAS conflict, retrying"
                     );
-                    let jitter_ms = {
-                        let max = 50u64.saturating_mul(1u64 << attempt.min(4));
-                        if max == 0 {
-                            0
-                        } else {
-                            RandomState::new().build_hasher().finish() % max
-                        }
-                    };
-                    tokio::time::sleep(Duration::from_millis(jitter_ms)).await;
+                    let max_ms = 50u64.saturating_mul(1u64 << attempt.min(4));
+                    tokio::time::sleep(Duration::from_millis(simple_jitter(max_ms))).await;
                 }
                 Err(e) => return Err(Error::StorageBackend(e.to_string())),
             }
