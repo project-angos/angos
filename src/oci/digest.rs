@@ -58,8 +58,7 @@ impl TryFrom<&str> for Digest {
             ))
         })?;
 
-        // Only sha256 is supported at the moment
-        if algorithm.to_lowercase() != "sha256" {
+        if algorithm != "sha256" {
             return Err(Error::InvalidFormat(format!(
                 "Unsupported digest algorithm '{algorithm}'"
             )));
@@ -73,7 +72,7 @@ impl TryFrom<&str> for Digest {
         //
         // REF:
         // - https://github.com/opencontainers/image-spec/blob/v1.0.1/descriptor.md#sha-256
-        if hash.len() != 64 || !hash.chars().all(|c| c.is_ascii_hexdigit()) {
+        if hash.len() != 64 || !hash.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
             return Err(Error::InvalidFormat(format!(
                 "Invalid sha256 hash '{hash}'"
             )));
@@ -123,6 +122,36 @@ mod tests {
     #[test]
     fn test_parse_invalid() {
         assert!(Digest::from_str("sha256:invalid").is_err());
+    }
+
+    #[test]
+    fn test_reject_uppercase_algorithm() {
+        assert!(Digest::from_str(&format!("SHA256:{VALID_HASH}")).is_err());
+    }
+
+    #[test]
+    fn test_reject_mixed_case_algorithm() {
+        assert!(Digest::from_str(&format!("Sha256:{VALID_HASH}")).is_err());
+    }
+
+    #[test]
+    fn test_reject_uppercase_hex() {
+        assert!(
+            Digest::from_str(
+                "sha256:0123456789ABCDEF0123456789abcdef0123456789abcdef0123456789abcdef"
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn test_reject_mixed_case_hex() {
+        assert!(
+            Digest::from_str(
+                "sha256:0123456789aBcDeF0123456789abcdef0123456789abcdef0123456789abcdef"
+            )
+            .is_err()
+        );
     }
 
     #[test]
