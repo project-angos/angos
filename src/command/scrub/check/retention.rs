@@ -273,12 +273,13 @@ impl RetentionChecker {
             |(revisions, next_marker)| (
                 async {
                     for digest in &revisions {
-                        if self.is_protected(namespace, digest).await? {
+                        let (protected, tagged) =
+                            self.check_revision_disposition(namespace, digest).await?;
+                        if protected {
                             debug!("Skipping protected manifest '{namespace}@{digest}'");
                             continue;
                         }
-
-                        if self.has_tags(namespace, digest).await? {
+                        if tagged {
                             continue;
                         }
 
@@ -321,37 +322,38 @@ impl RetentionChecker {
         )
     }
 
-    async fn is_protected(&self, namespace: &str, digest: &Digest) -> Result<bool, Error> {
-        // Index child manifests are protected
+    /// Reads the blob index once and checks both protection and tag presence,
+    /// avoiding the doubled `read_blob_index` that `is_protected` + `has_tags`
+    /// would issue.
+    async fn check_revision_disposition(
+        &self,
+        namespace: &str,
+        digest: &Digest,
+    ) -> Result<(bool, bool), Error> {
+        let mut is_manifest_child = false;
+        let mut has_tag = false;
+
         if let Ok(blob_index) = self.metadata_store.read_blob_index(digest).await
             && let Some(refs) = blob_index.namespace.get(namespace)
         {
             for link in refs {
-                if matches!(link, LinkKind::Manifest(_, _)) {
-                    return Ok(true);
+                match link {
+                    LinkKind::Manifest(_, _) => is_manifest_child = true,
+                    LinkKind::Tag(_) => has_tag = true,
+                    _ => {}
                 }
             }
         }
 
-        // Referrer subjects are protected
+        if is_manifest_child {
+            return Ok((true, has_tag));
+        }
+
         if self.metadata_store.has_referrers(namespace, digest).await? {
-            return Ok(true);
+            return Ok((true, has_tag));
         }
 
-        Ok(false)
-    }
-
-    async fn has_tags(&self, namespace: &str, digest: &Digest) -> Result<bool, Error> {
-        if let Ok(blob_index) = self.metadata_store.read_blob_index(digest).await
-            && let Some(refs) = blob_index.namespace.get(namespace)
-        {
-            for link in refs {
-                if matches!(link, LinkKind::Tag(_)) {
-                    return Ok(true);
-                }
-            }
-        }
-        Ok(false)
+        Ok((false, has_tag))
     }
 
     async fn delete_manifest(&self, namespace: &str, digest: &Digest) -> Result<(), Error> {
