@@ -55,6 +55,42 @@ pub struct Event {
     pub repository: String,
 }
 
+impl Event {
+    pub fn new(kind: EventKind, namespace: String, repository: String) -> Self {
+        Self {
+            id: Uuid::new_v4(),
+            timestamp: Utc::now(),
+            kind,
+            namespace,
+            repository,
+            digest: None,
+            reference: None,
+            tag: None,
+            actor: None,
+        }
+    }
+
+    pub fn digest(mut self, digest: Option<String>) -> Self {
+        self.digest = digest;
+        self
+    }
+
+    pub fn reference(mut self, reference: Option<String>) -> Self {
+        self.reference = reference;
+        self
+    }
+
+    pub fn tag(mut self, tag: Option<String>) -> Self {
+        self.tag = tag;
+        self
+    }
+
+    pub fn actor(mut self, actor: Option<EventActor>) -> Self {
+        self.actor = actor;
+        self
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use chrono::Utc;

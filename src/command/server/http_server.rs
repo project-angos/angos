@@ -5,7 +5,6 @@ use std::{
     time::{Duration, Instant},
 };
 
-use chrono::Utc;
 use http_body_util::Full;
 use hyper::{
     Method, Request, Response, StatusCode,
@@ -341,17 +340,13 @@ async fn handle_put_upload(
         .handle_put_upload(namespace, uuid, &digest, content_length, body_stream)
         .await?;
 
-    let event = Event {
-        id: Uuid::new_v4(),
-        timestamp: Utc::now(),
-        kind: EventKind::BlobPush,
-        namespace: namespace.to_string(),
-        digest: Some(digest.to_string()),
-        reference: None,
-        tag: None,
-        actor: Some(EventActor::from(identity.clone())),
-        repository: repository_name_for(context, namespace),
-    };
+    let event = Event::new(
+        EventKind::BlobPush,
+        namespace.to_string(),
+        repository_name_for(context, namespace),
+    )
+    .digest(Some(digest.to_string()))
+    .actor(Some(EventActor::from(identity.clone())));
     context.dispatch_event(&event).await?;
 
     Ok(response)
@@ -472,31 +467,22 @@ async fn handle_put_manifest(
     let repository = repository_name_for(context, namespace);
     let actor = Some(EventActor::from(identity.clone()));
 
-    let manifest_event = Event {
-        id: Uuid::new_v4(),
-        timestamp: Utc::now(),
-        kind: EventKind::ManifestPush,
-        namespace: namespace.to_string(),
-        digest: digest.clone(),
-        reference: Some(reference.to_string()),
-        tag: None,
-        actor: actor.clone(),
-        repository: repository.clone(),
-    };
+    let manifest_event = Event::new(
+        EventKind::ManifestPush,
+        namespace.to_string(),
+        repository.clone(),
+    )
+    .digest(digest.clone())
+    .reference(Some(reference.to_string()))
+    .actor(actor.clone());
     context.dispatch_event(&manifest_event).await?;
 
     if let Reference::Tag(tag) = &reference {
-        let tag_event = Event {
-            id: Uuid::new_v4(),
-            timestamp: Utc::now(),
-            kind: EventKind::TagCreate,
-            namespace: namespace.to_string(),
-            digest,
-            reference: Some(reference.to_string()),
-            tag: Some(tag.clone()),
-            actor,
-            repository,
-        };
+        let tag_event = Event::new(EventKind::TagCreate, namespace.to_string(), repository)
+            .digest(digest)
+            .reference(Some(reference.to_string()))
+            .tag(Some(tag.clone()))
+            .actor(actor);
         context.dispatch_event(&tag_event).await?;
     }
 
@@ -522,31 +508,22 @@ async fn handle_delete_manifest(
         Reference::Tag(_) => None,
     };
 
-    let delete_event = Event {
-        id: Uuid::new_v4(),
-        timestamp: Utc::now(),
-        kind: EventKind::ManifestDelete,
-        namespace: namespace.to_string(),
-        digest: digest.clone(),
-        reference: Some(reference.to_string()),
-        tag: None,
-        actor: actor.clone(),
-        repository: repository.clone(),
-    };
+    let delete_event = Event::new(
+        EventKind::ManifestDelete,
+        namespace.to_string(),
+        repository.clone(),
+    )
+    .digest(digest.clone())
+    .reference(Some(reference.to_string()))
+    .actor(actor.clone());
     context.dispatch_event(&delete_event).await?;
 
     if let Reference::Tag(tag) = &reference {
-        let tag_event = Event {
-            id: Uuid::new_v4(),
-            timestamp: Utc::now(),
-            kind: EventKind::TagDelete,
-            namespace: namespace.to_string(),
-            digest,
-            reference: Some(reference.to_string()),
-            tag: Some(tag.clone()),
-            actor,
-            repository,
-        };
+        let tag_event = Event::new(EventKind::TagDelete, namespace.to_string(), repository)
+            .digest(digest)
+            .reference(Some(reference.to_string()))
+            .tag(Some(tag.clone()))
+            .actor(actor);
         context.dispatch_event(&tag_event).await?;
     }
 
