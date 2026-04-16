@@ -2,6 +2,7 @@ use futures_util::StreamExt;
 use hyper::{
     Response, StatusCode,
     header::{CONTENT_LENGTH, CONTENT_TYPE, LOCATION},
+    http::response,
 };
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tracing::{error, instrument, warn};
@@ -14,6 +15,16 @@ use crate::{
         metadata_store::{MetadataStoreExt, link_kind::LinkKind},
     },
 };
+
+fn manifest_response_builder(digest: &Digest, media_type: Option<&str>) -> response::Builder {
+    let mut builder = Response::builder()
+        .status(StatusCode::OK)
+        .header(DOCKER_CONTENT_DIGEST, digest.to_string());
+    if let Some(media_type) = media_type {
+        builder = builder.header(CONTENT_TYPE, media_type);
+    }
+    builder
+}
 
 pub struct GetManifestResponse {
     pub media_type: Option<String>,
@@ -472,20 +483,9 @@ impl Registry {
             )
             .await?;
 
-        let res = if let Some(media_type) = manifest.media_type {
-            Response::builder()
-                .status(StatusCode::OK)
-                .header(CONTENT_TYPE, media_type)
-                .header(DOCKER_CONTENT_DIGEST, manifest.digest.to_string())
-                .header(CONTENT_LENGTH, manifest.size)
-                .body(ResponseBody::empty())?
-        } else {
-            Response::builder()
-                .status(StatusCode::OK)
-                .header(DOCKER_CONTENT_DIGEST, manifest.digest.to_string())
-                .header(CONTENT_LENGTH, manifest.size)
-                .body(ResponseBody::empty())?
-        };
+        let res = manifest_response_builder(&manifest.digest, manifest.media_type.as_deref())
+            .header(CONTENT_LENGTH, manifest.size)
+            .body(ResponseBody::empty())?;
 
         Ok(res)
     }
@@ -568,18 +568,8 @@ impl Registry {
             return builder.body(ResponseBody::empty()).map_err(Into::into);
         }
 
-        let res = if let Some(content_type) = manifest.media_type {
-            Response::builder()
-                .status(StatusCode::OK)
-                .header(CONTENT_TYPE, content_type)
-                .header(DOCKER_CONTENT_DIGEST, manifest.digest.to_string())
-                .body(ResponseBody::fixed(manifest.content))?
-        } else {
-            Response::builder()
-                .status(StatusCode::OK)
-                .header(DOCKER_CONTENT_DIGEST, manifest.digest.to_string())
-                .body(ResponseBody::fixed(manifest.content))?
-        };
+        let res = manifest_response_builder(&manifest.digest, manifest.media_type.as_deref())
+            .body(ResponseBody::fixed(manifest.content))?;
 
         Ok(res)
     }
