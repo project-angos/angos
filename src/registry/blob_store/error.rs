@@ -7,7 +7,6 @@ use aws_sdk_s3::{
     primitives::ByteStreamError,
 };
 use sha2::digest::common::hazmat::DeserializeStateError;
-use tracing::error;
 
 use crate::{oci, registry::data_store};
 
@@ -72,7 +71,6 @@ impl From<io::Error> for Error {
         if e.kind() == io::ErrorKind::NotFound {
             Error::ReferenceNotFound
         } else {
-            error!("IO error: {e:?}");
             Error::StorageBackend(e.to_string())
         }
     }
@@ -80,7 +78,6 @@ impl From<io::Error> for Error {
 
 impl From<TryFromIntError> for Error {
     fn from(e: TryFromIntError) -> Self {
-        error!("TryFromIntError: {e:?}");
         Error::InvalidFormat(e.to_string())
     }
 }
@@ -89,14 +86,12 @@ impl From<TryFromIntError> for Error {
 
 impl From<HeadObjectError> for Error {
     fn from(e: HeadObjectError) -> Self {
-        error!("HeadObjectError: {e:?}");
         Error::StorageBackend(format!("HeadObjectError: {e:?}"))
     }
 }
 
 impl From<GetObjectError> for Error {
     fn from(e: GetObjectError) -> Self {
-        error!("GetObjectError: {e:?}");
         Error::StorageBackend(format!("GetObjectError: {e:?}"))
     }
 }
@@ -106,14 +101,12 @@ where
     T: Debug,
 {
     fn from(e: SdkError<T, HttpResponse>) -> Self {
-        error!("SdkError: {e:?}");
         Error::StorageBackend(format!("SdkError: {e:?}"))
     }
 }
 
 impl From<ByteStreamError> for Error {
     fn from(e: ByteStreamError) -> Self {
-        error!("ByteStreamError: {e:?}");
         Error::StorageBackend(format!("ByteStreamError: {e:?}"))
     }
 }

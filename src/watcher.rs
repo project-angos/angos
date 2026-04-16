@@ -95,11 +95,13 @@ async fn watch_config_loop(
             .collect();
 
         let tx_clone = tx.clone();
-        let mut watcher = notify::recommended_watcher(move |res: Result<Event, notify::Error>| {
-            if let Ok(event) = res {
-                let _ = tx_clone.blocking_send(event);
-            }
-        })?;
+        let mut watcher =
+            notify::recommended_watcher(move |res: Result<Event, notify::Error>| match res {
+                Ok(event) => {
+                    let _ = tx_clone.blocking_send(event);
+                }
+                Err(e) => warn!("File system watcher error: {e}"),
+            })?;
 
         watcher.watch(&config_dir, RecursiveMode::NonRecursive)?;
         for dir in &tls_dirs {

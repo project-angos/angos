@@ -191,8 +191,12 @@ impl TlsListener {
             let tls_stream = tls_acceptor.accept(tcp).await;
             drop(tls_acceptor);
 
-            let Ok(tls) = tls_stream else {
-                continue;
+            let tls = match tls_stream {
+                Ok(tls) => tls,
+                Err(e) => {
+                    debug!("TLS handshake failed from {remote_address}: {e}");
+                    continue;
+                }
             };
 
             let (_, session) = tls.get_ref();
