@@ -41,7 +41,11 @@ impl MediaTypeChecker {
                 .await?;
 
             for revision in &revisions {
-                if let Err(e) = self.backfill_revision(namespace, revision).await {
+                let link = LinkKind::Digest(revision.clone());
+                if let Err(e) = self
+                    .backfill_link(namespace, &link, &format!("revision {revision}"))
+                    .await
+                {
                     error!(
                         "Failed to backfill media_type for '{namespace}' (revision '{revision}'): {e}"
                     );
@@ -62,7 +66,11 @@ impl MediaTypeChecker {
                 .await?;
 
             for tag in &tags {
-                if let Err(e) = self.backfill_tag(namespace, tag).await {
+                let link = LinkKind::Tag(tag.clone());
+                if let Err(e) = self
+                    .backfill_link(namespace, &link, &format!("tag '{tag}'"))
+                    .await
+                {
                     error!("Failed to backfill media_type for '{namespace}' (tag '{tag}'): {e}");
                 }
             }
@@ -76,73 +84,38 @@ impl MediaTypeChecker {
         Ok(())
     }
 
-    async fn backfill_revision(
+    async fn backfill_link(
         &self,
         namespace: &str,
-        revision: &crate::oci::Digest,
+        link: &LinkKind,
+        display_name: &str,
     ) -> Result<(), Error> {
-        let link = LinkKind::Digest(revision.clone());
         let metadata = self
             .metadata_store
-            .read_link(namespace, &link, false)
+            .read_link(namespace, link, false)
             .await?;
 
         if metadata.media_type.is_some() {
-            debug!("Revision {revision} already has media_type, skipping");
-            return Ok(());
-        }
-
-        let media_type = self.read_media_type(revision).await?;
-        let Some(media_type) = media_type else {
-            debug!("Revision {revision} has no media_type in manifest, skipping");
-            return Ok(());
-        };
-
-        if self.dry_run {
-            info!(
-                "DRY RUN: would set media_type '{media_type}' on revision {revision} in namespace '{namespace}'"
-            );
-            return Ok(());
-        }
-
-        info!(
-            "Setting media_type '{media_type}' on revision {revision} in namespace '{namespace}'"
-        );
-        let mut tx = self.metadata_store.begin_transaction(namespace);
-        tx.create_link_with_media_type(&link, &metadata.target, &media_type);
-        tx.commit().await?;
-
-        Ok(())
-    }
-
-    async fn backfill_tag(&self, namespace: &str, tag: &str) -> Result<(), Error> {
-        let link = LinkKind::Tag(tag.to_string());
-        let metadata = self
-            .metadata_store
-            .read_link(namespace, &link, false)
-            .await?;
-
-        if metadata.media_type.is_some() {
-            debug!("Tag '{tag}' already has media_type, skipping");
+            debug!("{display_name} already has media_type, skipping");
             return Ok(());
         }
 
         let media_type = self.read_media_type(&metadata.target).await?;
         let Some(media_type) = media_type else {
-            debug!("Tag '{tag}' target has no media_type in manifest, skipping");
+            debug!("{display_name} has no media_type in manifest, skipping");
             return Ok(());
         };
 
         if self.dry_run {
             info!(
-                "DRY RUN: would set media_type '{media_type}' on tag '{tag}' in namespace '{namespace}'"
+                "DRY RUN: would set media_type '{media_type}' on {display_name} in namespace '{namespace}'"
             );
             return Ok(());
         }
 
-        info!("Setting media_type '{media_type}' on tag '{tag}' in namespace '{namespace}'");
+        info!("Setting media_type '{media_type}' on {display_name} in namespace '{namespace}'");
         let mut tx = self.metadata_store.begin_transaction(namespace);
-        tx.create_link_with_media_type(&link, &metadata.target, &media_type);
+        tx.create_link_with_media_type(link, &metadata.target, &media_type);
         tx.commit().await?;
 
         Ok(())
