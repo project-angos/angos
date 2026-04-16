@@ -133,6 +133,23 @@ async fn send_with_retries(
     Err(last_err.unwrap_or_else(|| "unknown error".to_string()))
 }
 
+async fn send_and_record(
+    client: &Client,
+    url: &str,
+    token: Option<&str>,
+    body: &[u8],
+    event_kind_header: &str,
+    max_retries: u32,
+    webhook_name: &str,
+) -> Result<(), String> {
+    let result = send_with_retries(client, url, token, body, event_kind_header, max_retries).await;
+    let result_label = if result.is_ok() { "success" } else { "error" };
+    DELIVERY_TOTAL
+        .with_label_values(&[webhook_name, event_kind_header, result_label])
+        .inc();
+    result
+}
+
 impl EventDispatcher {
     pub fn new(webhooks: HashMap<String, EventWebhookConfig>) -> Result<Self, Error> {
         let mut endpoints = HashMap::new();
@@ -213,57 +230,46 @@ impl EventDispatcher {
                     let in_flight = Arc::clone(&self.in_flight);
                     let mut in_flight_guard = in_flight.lock().await;
                     in_flight_guard.spawn(async move {
-                        let result = send_with_retries(
+                        if let Err(e) = send_and_record(
                             &client,
                             &url,
                             token.as_deref(),
                             &body,
                             &event_kind_header,
                             max_retries,
+                            &name,
                         )
-                        .await;
-                        let result_label = if result.is_ok() { "success" } else { "error" };
-                        DELIVERY_TOTAL
-                            .with_label_values(&[name.as_str(), &event_kind_header, result_label])
-                            .inc();
-                        if let Err(e) = result {
+                        .await
+                        {
                             warn!("Async webhook '{name}' failed: {e}");
                         }
                     });
                 }
                 DeliveryPolicy::Required => {
-                    let result = send_with_retries(
+                    send_and_record(
                         &endpoint.client,
                         &endpoint.config.url,
                         endpoint.config.token.as_deref(),
                         &body,
                         &event_kind_header,
                         endpoint.config.max_retries,
+                        name,
                     )
-                    .await;
-                    let result_label = if result.is_ok() { "success" } else { "error" };
-                    DELIVERY_TOTAL
-                        .with_label_values(&[name.as_str(), &event_kind_header, result_label])
-                        .inc();
-                    result.map_err(|e| {
-                        Error::Initialization(format!("Webhook '{name}' failed: {e}"))
-                    })?;
+                    .await
+                    .map_err(|e| Error::Initialization(format!("Webhook '{name}' failed: {e}")))?;
                 }
                 DeliveryPolicy::Optional => {
-                    let result = send_with_retries(
+                    if let Err(e) = send_and_record(
                         &endpoint.client,
                         &endpoint.config.url,
                         endpoint.config.token.as_deref(),
                         &body,
                         &event_kind_header,
                         endpoint.config.max_retries,
+                        name,
                     )
-                    .await;
-                    let result_label = if result.is_ok() { "success" } else { "error" };
-                    DELIVERY_TOTAL
-                        .with_label_values(&[name.as_str(), &event_kind_header, result_label])
-                        .inc();
-                    if let Err(e) = result {
+                    .await
+                    {
                         warn!("Optional webhook '{name}' failed: {e}");
                     }
                 }
