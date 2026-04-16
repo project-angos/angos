@@ -123,27 +123,29 @@ impl RetentionPolicy {
         context.add_function("hours", |h: i64| h * 3600);
         context.add_function("minutes", |m: i64| m * 60);
 
-        let tag_for_pushed = manifest.tag.clone();
-        let pushed_list: Vec<String> = last_pushed.to_vec();
-        context.add_function("top_pushed", move |count: i64| {
-            let Some(ref tag) = tag_for_pushed else {
-                return false;
-            };
-            let limit = usize::try_from(count.max(0)).unwrap_or(usize::MAX);
-            pushed_list.iter().take(limit).any(|t| t == tag)
-        });
-
-        let tag_for_pulled = manifest.tag.clone();
-        let pulled_list: Vec<String> = last_pulled.to_vec();
-        context.add_function("top_pulled", move |count: i64| {
-            let Some(ref tag) = tag_for_pulled else {
-                return false;
-            };
-            let limit = usize::try_from(count.max(0)).unwrap_or(usize::MAX);
-            pulled_list.iter().take(limit).any(|t| t == tag)
-        });
+        context.add_function(
+            "top_pushed",
+            Self::build_top_fn(manifest.tag.clone(), last_pushed.to_vec()),
+        );
+        context.add_function(
+            "top_pulled",
+            Self::build_top_fn(manifest.tag.clone(), last_pulled.to_vec()),
+        );
 
         Ok(context)
+    }
+
+    fn build_top_fn(
+        tag: Option<String>,
+        list: Vec<String>,
+    ) -> impl Fn(i64) -> bool + Send + Sync {
+        move |count: i64| {
+            let Some(ref tag) = tag else {
+                return false;
+            };
+            let limit = usize::try_from(count.max(0)).unwrap_or(usize::MAX);
+            list.iter().take(limit).any(|t| t == tag)
+        }
     }
 }
 
