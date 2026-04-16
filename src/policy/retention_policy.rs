@@ -135,10 +135,7 @@ impl RetentionPolicy {
         Ok(context)
     }
 
-    fn build_top_fn(
-        tag: Option<String>,
-        list: Vec<String>,
-    ) -> impl Fn(i64) -> bool + Send + Sync {
+    fn build_top_fn(tag: Option<String>, list: Vec<String>) -> impl Fn(i64) -> bool + Send + Sync {
         move |count: i64| {
             let Some(ref tag) = tag else {
                 return false;
