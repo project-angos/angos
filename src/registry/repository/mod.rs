@@ -78,7 +78,7 @@ impl Repository {
             }
         }
 
-        Err(Error::ManifestUnknown)
+        Err(Error::BlobUnknown)
     }
 
     #[instrument(skip(self))]
@@ -95,7 +95,7 @@ impl Repository {
             }
         }
 
-        Err(Error::ManifestUnknown)
+        Err(Error::BlobUnknown)
     }
 
     #[instrument(skip(self))]
@@ -594,7 +594,7 @@ mod tests {
 
         let result = repo.head_blob(&[], "local/repo", &digest).await;
         assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), Error::ManifestUnknown));
+        assert!(matches!(result.unwrap_err(), Error::BlobUnknown));
     }
 
     #[tokio::test]
@@ -736,8 +736,8 @@ mod tests {
         let result = repo.get_blob(&[], "local/repo", &digest).await;
         assert!(result.is_err());
         match result {
-            Err(Error::ManifestUnknown) => (),
-            _ => panic!("Expected Error::ManifestUnknown"),
+            Err(Error::BlobUnknown) => (),
+            _ => panic!("Expected Error::BlobUnknown"),
         }
     }
 }
