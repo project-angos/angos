@@ -7,10 +7,11 @@ use std::{
     time::Duration,
 };
 
+use hmac::{Hmac, KeyInit, Mac};
 use prometheus::{HistogramVec, IntCounterVec, register_histogram_vec, register_int_counter_vec};
 use regex::Regex;
 use reqwest::Client;
-use sha2::{Digest, Sha256};
+use sha2::Sha256;
 use tokio::{sync::Mutex, task::JoinSet};
 use tracing::warn;
 
@@ -40,39 +41,11 @@ static DELIVERY_DURATION: LazyLock<HistogramVec> = LazyLock::new(|| {
     .unwrap()
 });
 
-const BLOCK_SIZE: usize = 64;
-
 pub fn compute_signature(secret: &str, body: &[u8]) -> String {
-    let key = secret.as_bytes();
-
-    let normalized_key = if key.len() > BLOCK_SIZE {
-        let hash = Sha256::digest(key);
-        let mut padded = [0u8; BLOCK_SIZE];
-        padded[..hash.len()].copy_from_slice(&hash);
-        padded
-    } else {
-        let mut padded = [0u8; BLOCK_SIZE];
-        padded[..key.len()].copy_from_slice(key);
-        padded
-    };
-
-    let mut ipad = [0x36u8; BLOCK_SIZE];
-    let mut opad = [0x5cu8; BLOCK_SIZE];
-    for i in 0..BLOCK_SIZE {
-        ipad[i] ^= normalized_key[i];
-        opad[i] ^= normalized_key[i];
-    }
-
-    let mut inner_hasher = Sha256::new();
-    inner_hasher.update(ipad);
-    inner_hasher.update(body);
-    let inner_hash = inner_hasher.finalize();
-
-    let mut outer_hasher = Sha256::new();
-    outer_hasher.update(opad);
-    outer_hasher.update(inner_hash);
-
-    hex::encode(outer_hasher.finalize())
+    let mut mac =
+        Hmac::<Sha256>::new_from_slice(secret.as_bytes()).expect("HMAC accepts keys of any length");
+    mac.update(body);
+    hex::encode(mac.finalize().into_bytes())
 }
 
 pub fn matches_event(
