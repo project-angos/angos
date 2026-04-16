@@ -33,17 +33,19 @@ impl Backend {
         let now = Instant::now();
         store.retain(|_, &mut (_, expiry)| expiry > now);
     }
+
+    async fn maybe_cleanup(&self) {
+        let count = self.counter.fetch_add(1, Ordering::Relaxed);
+        if count.is_multiple_of(1000) {
+            self.cleanup_expired().await;
+        }
+    }
 }
 
 #[async_trait]
 impl Cache for Backend {
     async fn store_value(&self, key: &str, value: &str, expires_in: u64) -> Result<(), Error> {
-        let count = self.counter.fetch_add(1, Ordering::Relaxed);
-
-        if count.is_multiple_of(1000) {
-            self.cleanup_expired().await;
-        }
-
+        self.maybe_cleanup().await;
         let mut store = self.store.write().await;
         store.insert(
             key.to_string(),
@@ -56,12 +58,7 @@ impl Cache for Backend {
     }
 
     async fn retrieve_value(&self, key: &str) -> Result<Option<String>, Error> {
-        let count = self.counter.fetch_add(1, Ordering::Relaxed);
-
-        if count.is_multiple_of(1000) {
-            self.cleanup_expired().await;
-        }
-
+        self.maybe_cleanup().await;
         let store = self.store.read().await;
         if let Some((value, expiry)) = store.get(key)
             && *expiry > Instant::now()
