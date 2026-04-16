@@ -937,95 +937,86 @@ impl MetadataStore for Backend {
 
         let mut referrers = Vec::new();
 
-        let mut current = self
-            .store
-            .list_objects(&referrers_dir, 100, None, None)
-            .await?;
-
-        loop {
-            let (objects, next_token) = current;
-
-            let next_list_fut = next_token.map(|token| {
-                self.store
-                    .list_objects(&referrers_dir, 100, Some(token), None)
-            });
-
-            let digest_entries: Vec<(Digest, LinkKind)> = objects
-                .iter()
-                .filter_map(|key| {
-                    let parts: Vec<&str> = key.split('/').collect();
-                    if parts.len() < 2 || parts[0] != "sha256" {
-                        return None;
-                    }
-                    let manifest_digest = Digest::Sha256(parts[1].into());
-                    let referrer_link = LinkKind::Referrer(digest.clone(), manifest_digest.clone());
-                    Some((manifest_digest, referrer_link))
-                })
-                .collect();
-
-            let process_fut = stream::iter(digest_entries)
-                .map(|(manifest_digest, referrer_link)| {
-                    let artifact_type = artifact_type.as_ref();
-                    async move {
-                        if let Ok(metadata) =
-                            self.read_link_reference(namespace, &referrer_link).await
-                            && let Some(desc) = metadata.descriptor
-                        {
-                            match artifact_type {
-                                Some(at) if desc.artifact_type.as_ref() == Some(at) => {
-                                    return Some(desc);
-                                }
-                                None => return Some(desc),
-                                Some(_) if desc.artifact_type.is_none() => {}
-                                Some(_) => return None,
+        pagination::pipeline_pages!(
+            self.store
+                .list_objects(&referrers_dir, 100, None, None)
+                .await?,
+            |(objects, next_token)| (
+                async {
+                    let digest_entries: Vec<(Digest, LinkKind)> = objects
+                        .iter()
+                        .filter_map(|key| {
+                            let parts: Vec<&str> = key.split('/').collect();
+                            if parts.len() < 2 || parts[0] != "sha256" {
+                                return None;
                             }
-                        }
+                            let manifest_digest = Digest::Sha256(parts[1].into());
+                            let referrer_link =
+                                LinkKind::Referrer(digest.clone(), manifest_digest.clone());
+                            Some((manifest_digest, referrer_link))
+                        })
+                        .collect();
 
-                        let blob_path = path_builder::blob_path(&manifest_digest);
-                        match self.store.read_bytes(&blob_path).await {
-                            Ok(data) => {
-                                let manifest_len = data.len() as u64;
-                                match Manifest::from_slice(&data) {
-                                    Ok(manifest) => manifest.to_descriptor(
-                                        artifact_type,
-                                        manifest_digest,
-                                        manifest_len,
-                                    ),
+                    let results: Vec<Option<Descriptor>> = stream::iter(digest_entries)
+                        .map(|(manifest_digest, referrer_link)| {
+                            let artifact_type = artifact_type.as_ref();
+                            async move {
+                                if let Ok(metadata) =
+                                    self.read_link_reference(namespace, &referrer_link).await
+                                    && let Some(desc) = metadata.descriptor
+                                {
+                                    match artifact_type {
+                                        Some(at) if desc.artifact_type.as_ref() == Some(at) => {
+                                            return Some(desc);
+                                        }
+                                        None => return Some(desc),
+                                        Some(_) if desc.artifact_type.is_none() => {}
+                                        Some(_) => return None,
+                                    }
+                                }
+
+                                let blob_path = path_builder::blob_path(&manifest_digest);
+                                match self.store.read_bytes(&blob_path).await {
+                                    Ok(data) => {
+                                        let manifest_len = data.len() as u64;
+                                        match Manifest::from_slice(&data) {
+                                            Ok(manifest) => manifest.to_descriptor(
+                                                artifact_type,
+                                                manifest_digest,
+                                                manifest_len,
+                                            ),
+                                            Err(e) => {
+                                                warn!(
+                                                    "Failed to parse manifest at {blob_path}: {e}"
+                                                );
+                                                None
+                                            }
+                                        }
+                                    }
+                                    Err(e) if e.kind() == ErrorKind::NotFound => {
+                                        warn!("Referrer blob not found at {blob_path}, skipping");
+                                        None
+                                    }
                                     Err(e) => {
-                                        warn!("Failed to parse manifest at {blob_path}: {e}");
+                                        warn!("Failed to read referrer blob at {blob_path}: {e}");
                                         None
                                     }
                                 }
                             }
-                            Err(e) if e.kind() == ErrorKind::NotFound => {
-                                warn!("Referrer blob not found at {blob_path}, skipping");
-                                None
-                            }
-                            Err(e) => {
-                                warn!("Failed to read referrer blob at {blob_path}: {e}");
-                                None
-                            }
-                        }
-                    }
-                })
-                .buffer_unordered(10)
-                .collect::<Vec<Option<Descriptor>>>();
+                        })
+                        .buffer_unordered(10)
+                        .collect()
+                        .await;
 
-            let (results, next_page) = match next_list_fut {
-                Some(next_fut) => {
-                    let (results, next) = tokio::join!(process_fut, next_fut);
-                    (results, Some(next?))
-                }
-                None => (process_fut.await, None),
-            };
-
-            referrers.extend(results.into_iter().flatten());
-
-            match next_page {
-                Some(page) => current = page,
-                None => break,
-            }
-        }
+                    referrers.extend(results.into_iter().flatten());
+                    Ok::<(), Error>(())
+                },
+                next_token.map(|token| {
+                    self.store
+                        .list_objects(&referrers_dir, 100, Some(token), None)
+                }),
+            )
+        )?;
 
         referrers.sort_by(|a, b| a.digest.cmp(&b.digest));
         Ok(referrers)
@@ -1069,20 +1060,22 @@ impl MetadataStore for Backend {
     async fn count_manifests(&self, namespace: &str) -> Result<usize, Error> {
         let revisions_dir = path_builder::manifest_revisions_link_root_dir(namespace, "sha256");
         let mut count = 0;
-        let mut continuation_token = None;
 
-        loop {
-            let (prefixes, _, next_token) = self
-                .store
-                .list_prefixes(&revisions_dir, "/", 1000, continuation_token, None)
-                .await?;
-
-            count += prefixes.len();
-            continuation_token = next_token;
-            if continuation_token.is_none() {
-                break;
-            }
-        }
+        pagination::pipeline_pages!(
+            self.store
+                .list_prefixes(&revisions_dir, "/", 1000, None, None)
+                .await?,
+            |(prefixes, _, next_token)| (
+                async {
+                    count += prefixes.len();
+                    Ok::<(), Error>(())
+                },
+                next_token.map(|token| {
+                    self.store
+                        .list_prefixes(&revisions_dir, "/", 1000, Some(token), None)
+                }),
+            )
+        )?;
 
         Ok(count)
     }
@@ -1094,68 +1087,56 @@ impl MetadataStore for Backend {
         let mut index = BlobIndex::default();
         let mut found_shards = false;
 
-        // Issue the first listing eagerly; subsequent listings are launched concurrently
-        // with shard processing so the list RTT no longer serialises with shard reads.
-        let mut current = self
-            .store
-            .list_prefixes(&refs_dir, "/", 1000, None, None)
-            .await?;
-
-        loop {
-            let (_, objects, next_token) = current;
-            if !objects.is_empty() {
-                found_shards = true;
-            }
-
-            let next_list_fut = next_token.map(|token| {
-                self.store
-                    .list_prefixes(&refs_dir, "/", 1000, Some(token), None)
-            });
-
-            let process_fut = stream::iter(objects.into_iter().map(|obj| {
-                let shard_path = format!("{refs_dir}/{obj}");
-                async move {
-                    match self.store.read_bytes(&shard_path).await {
-                        Ok(data) => {
-                            if let Ok(links) = serde_json::from_slice::<HashSet<LinkKind>>(&data) {
-                                let namespace = obj
-                                    .strip_suffix(".json")
-                                    .unwrap_or(&obj)
-                                    .replace("%2F", "/")
-                                    .replace("%25", "%");
-                                if !links.is_empty() {
-                                    return Ok(Some((namespace, links)));
+        pagination::pipeline_pages!(
+            self.store
+                .list_prefixes(&refs_dir, "/", 1000, None, None)
+                .await?,
+            |(_, objects, next_token)| (
+                async {
+                    if !objects.is_empty() {
+                        found_shards = true;
+                    }
+                    let results: Vec<Result<Option<(String, HashSet<LinkKind>)>, Error>> =
+                        stream::iter(objects.into_iter().map(|obj| {
+                            let shard_path = format!("{refs_dir}/{obj}");
+                            async move {
+                                match self.store.read_bytes(&shard_path).await {
+                                    Ok(data) => {
+                                        if let Ok(links) =
+                                            serde_json::from_slice::<HashSet<LinkKind>>(&data)
+                                        {
+                                            let namespace = obj
+                                                .strip_suffix(".json")
+                                                .unwrap_or(&obj)
+                                                .replace("%2F", "/")
+                                                .replace("%25", "%");
+                                            if !links.is_empty() {
+                                                return Ok(Some((namespace, links)));
+                                            }
+                                        }
+                                        Ok(None)
+                                    }
+                                    Err(e) if e.kind() == ErrorKind::NotFound => Ok(None),
+                                    Err(e) => Err(Error::from(e)),
                                 }
                             }
-                            Ok(None)
+                        }))
+                        .buffer_unordered(10)
+                        .collect()
+                        .await;
+                    for result in results {
+                        if let Some((namespace, links)) = result? {
+                            index.namespace.insert(namespace, links);
                         }
-                        Err(e) if e.kind() == ErrorKind::NotFound => Ok(None),
-                        Err(e) => Err(Error::from(e)),
                     }
-                }
-            }))
-            .buffer_unordered(10)
-            .collect::<Vec<Result<Option<(String, HashSet<LinkKind>)>, Error>>>();
-
-            let (shard_results, next_page) = match next_list_fut {
-                Some(next_fut) => {
-                    let (results, next) = tokio::join!(process_fut, next_fut);
-                    (results, Some(next?))
-                }
-                None => (process_fut.await, None),
-            };
-
-            for result in shard_results {
-                if let Some((namespace, links)) = result? {
-                    index.namespace.insert(namespace, links);
-                }
-            }
-
-            match next_page {
-                Some(page) => current = page,
-                None => break,
-            }
-        }
+                    Ok::<(), Error>(())
+                },
+                next_token.map(|token| {
+                    self.store
+                        .list_prefixes(&refs_dir, "/", 1000, Some(token), None)
+                }),
+            )
+        )?;
 
         if found_shards {
             if index.namespace.is_empty() {
@@ -1945,55 +1926,45 @@ impl Backend {
         let mut all_namespaces = Vec::new();
         let mut found_shards = false;
 
-        let mut current = self
-            .store
-            .list_prefixes(&shard_dir, "/", 1000, None, None)
-            .await?;
-
-        loop {
-            let (_, objects, next_token) = current;
-            if !objects.is_empty() {
-                found_shards = true;
-            }
-
-            let next_list_fut = next_token.map(|token| {
-                self.store
-                    .list_prefixes(&shard_dir, "/", 1000, Some(token), None)
-            });
-
-            let process_fut = stream::iter(objects.into_iter().map(|obj| {
-                let shard_path = format!("{shard_dir}/{obj}");
-                async move {
-                    match self.store.read_bytes(&shard_path).await {
-                        Ok(data) => match serde_json::from_slice::<NamespaceRegistry>(&data) {
-                            Ok(registry) => Ok(registry.namespaces),
-                            Err(_) => Ok(Vec::new()),
-                        },
-                        Err(e) if e.kind() == ErrorKind::NotFound => Ok(Vec::new()),
-                        Err(e) => Err(Error::from(e)),
+        pagination::pipeline_pages!(
+            self.store
+                .list_prefixes(&shard_dir, "/", 1000, None, None)
+                .await?,
+            |(_, objects, next_token)| (
+                async {
+                    if !objects.is_empty() {
+                        found_shards = true;
                     }
-                }
-            }))
-            .buffer_unordered(10)
-            .collect::<Vec<Result<Vec<String>, Error>>>();
-
-            let (shard_results, next_page) = match next_list_fut {
-                Some(next_fut) => {
-                    let (results, next) = tokio::join!(process_fut, next_fut);
-                    (results, Some(next?))
-                }
-                None => (process_fut.await, None),
-            };
-
-            for result in shard_results {
-                all_namespaces.extend(result?);
-            }
-
-            match next_page {
-                Some(page) => current = page,
-                None => break,
-            }
-        }
+                    let results: Vec<Result<Vec<String>, Error>> =
+                        stream::iter(objects.into_iter().map(|obj| {
+                            let shard_path = format!("{shard_dir}/{obj}");
+                            async move {
+                                match self.store.read_bytes(&shard_path).await {
+                                    Ok(data) => {
+                                        match serde_json::from_slice::<NamespaceRegistry>(&data) {
+                                            Ok(registry) => Ok(registry.namespaces),
+                                            Err(_) => Ok(Vec::new()),
+                                        }
+                                    }
+                                    Err(e) if e.kind() == ErrorKind::NotFound => Ok(Vec::new()),
+                                    Err(e) => Err(Error::from(e)),
+                                }
+                            }
+                        }))
+                        .buffer_unordered(10)
+                        .collect()
+                        .await;
+                    for result in results {
+                        all_namespaces.extend(result?);
+                    }
+                    Ok::<(), Error>(())
+                },
+                next_token.map(|token| {
+                    self.store
+                        .list_prefixes(&shard_dir, "/", 1000, Some(token), None)
+                }),
+            )
+        )?;
 
         if !found_shards {
             // Fall back to legacy single-file format for backward compatibility

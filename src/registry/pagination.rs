@@ -1,3 +1,49 @@
+/// One-deep lookahead over paginated results.
+///
+/// Fetches the next page concurrently with processing the current one via
+/// `tokio::join!`, hiding the LIST round-trip behind per-page work.
+///
+/// `$first` is the already-awaited first page. On each iteration the page is
+/// destructured by `$page`, which must produce two expressions: a *process*
+/// future (`Result<(), E>`) and an optional *next-page* future
+/// (`Option<impl Future<Output = Result<Page, E>>>`).
+///
+/// ```ignore
+/// pipeline_pages!(
+///     store.list(1000, None).await?,
+///     |(items, next_token)| (
+///         async { /* process items */ Ok::<(), Error>(()) },
+///         next_token.map(|t| store.list(1000, Some(t))),
+///     )
+/// )?;
+/// ```
+macro_rules! pipeline_pages {
+    ($first:expr, |$page:pat_param| ($process:expr, $next:expr $(,)?)) => {
+        '__pipeline: {
+            let mut __current = $first;
+            loop {
+                let $page = __current;
+                let __next_fut = $next;
+                let __process_fut = $process;
+                if let Some(__next_fut) = __next_fut {
+                    let (__process_res, __next_res) = tokio::join!(__process_fut, __next_fut);
+                    if let Err(__e) = __process_res {
+                        break '__pipeline Err(__e.into());
+                    }
+                    match __next_res {
+                        Ok(__page) => __current = __page,
+                        Err(__e) => break '__pipeline Err(__e.into()),
+                    }
+                } else {
+                    break '__pipeline __process_fut.await;
+                }
+            }
+        }
+    };
+}
+
+pub use pipeline_pages;
+
 pub fn paginate<T: Clone + ToString>(
     items: &[T],
     n: u16,
