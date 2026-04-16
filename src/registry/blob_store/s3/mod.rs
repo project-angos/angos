@@ -322,27 +322,6 @@ impl Backend {
     }
 
     #[instrument(skip(self))]
-    async fn read_upload_summary_uniform(
-        &self,
-        name: &str,
-        uuid: &str,
-    ) -> Result<(Digest, u64, DateTime<Utc>), Error> {
-        let state = self.get_upload_state_uniform(name, uuid).await?;
-        let size = state.size;
-
-        let digest = self.load_hasher(name, uuid, size).await?.digest();
-
-        let date_path = path_builder::upload_start_date_path(name, uuid);
-        let date_bytes = self.store.get_object_body(&date_path, None).await?;
-        let date_str = String::from_utf8_lossy(&date_bytes);
-        let start_date = DateTime::parse_from_rfc3339(&date_str)
-            .unwrap_or_else(|_| Utc::now().fixed_offset())
-            .with_timezone(&Utc);
-
-        Ok((digest, size, start_date))
-    }
-
-    #[instrument(skip(self))]
     async fn complete_upload_uniform(
         &self,
         name: &str,
@@ -611,27 +590,6 @@ impl Backend {
     }
 
     #[instrument(skip(self))]
-    async fn read_upload_summary_nonuniform(
-        &self,
-        name: &str,
-        uuid: &str,
-    ) -> Result<(Digest, u64, DateTime<Utc>), Error> {
-        let state = self.get_upload_state_nonuniform(name, uuid).await?;
-        let size = state.size;
-
-        let digest = self.load_hasher(name, uuid, size).await?.digest();
-
-        let date_path = path_builder::upload_start_date_path(name, uuid);
-        let date_bytes = self.store.get_object_body(&date_path, None).await?;
-        let date_str = String::from_utf8_lossy(&date_bytes);
-        let start_date = DateTime::parse_from_rfc3339(&date_str)
-            .unwrap_or_else(|_| Utc::now().fixed_offset())
-            .with_timezone(&Utc);
-
-        Ok((digest, size, start_date))
-    }
-
-    #[instrument(skip(self))]
     async fn complete_upload_nonuniform(
         &self,
         name: &str,
@@ -704,6 +662,23 @@ impl Backend {
         self.store.delete_prefix(&container).await?;
 
         Ok(digest)
+    }
+
+    async fn build_upload_summary(
+        &self,
+        name: &str,
+        uuid: &str,
+        state: &UploadState,
+    ) -> Result<(Digest, u64, DateTime<Utc>), Error> {
+        let size = state.size;
+        let digest = self.load_hasher(name, uuid, size).await?.digest();
+        let date_path = path_builder::upload_start_date_path(name, uuid);
+        let date_bytes = self.store.get_object_body(&date_path, None).await?;
+        let date_str = String::from_utf8_lossy(&date_bytes);
+        let start_date = DateTime::parse_from_rfc3339(&date_str)
+            .unwrap_or_else(|_| Utc::now().fixed_offset())
+            .with_timezone(&Utc);
+        Ok((digest, size, start_date))
     }
 }
 
@@ -825,11 +800,12 @@ impl BlobStore for Backend {
         name: &str,
         uuid: &str,
     ) -> Result<(Digest, u64, DateTime<Utc>), Error> {
-        if self.uniform_parts {
-            self.read_upload_summary_uniform(name, uuid).await
+        let state = if self.uniform_parts {
+            self.get_upload_state_uniform(name, uuid).await?
         } else {
-            self.read_upload_summary_nonuniform(name, uuid).await
-        }
+            self.get_upload_state_nonuniform(name, uuid).await?
+        };
+        self.build_upload_summary(name, uuid, &state).await
     }
 
     #[instrument(skip(self))]
