@@ -98,6 +98,7 @@ pub struct BackendConfig {
     pub operation_timeout_secs: u64,
     pub operation_attempt_timeout_secs: u64,
     pub max_attempts: u32,
+    pub pool_idle_timeout_secs: u64,
 }
 
 impl Default for BackendConfig {
@@ -117,6 +118,7 @@ impl Default for BackendConfig {
             operation_timeout_secs: 900,
             operation_attempt_timeout_secs: 300,
             max_attempts: 3,
+            pool_idle_timeout_secs: 90,
         }
     }
 }
@@ -251,6 +253,18 @@ impl Backend {
 
         let retry = RetryConfig::standard().with_max_attempts(config.max_attempts);
 
+        let builder = aws_smithy_http_client::Builder::new()
+            .pool_idle_timeout(Duration::from_secs(config.pool_idle_timeout_secs));
+        let http_client = if config.endpoint.starts_with("https://") {
+            builder
+                .tls_provider(aws_smithy_http_client::tls::Provider::Rustls(
+                    aws_smithy_http_client::tls::rustls_provider::CryptoMode::AwsLc,
+                ))
+                .build_https()
+        } else {
+            builder.build_http()
+        };
+
         let client_config = S3Config::builder()
             .behavior_version(BehaviorVersion::latest())
             .region(Region::new(config.region.clone()))
@@ -258,6 +272,7 @@ impl Backend {
             .credentials_provider(credentials)
             .timeout_config(timeout)
             .retry_config(retry)
+            .http_client(http_client)
             .force_path_style(true)
             .build();
 
@@ -1087,6 +1102,14 @@ mod tests {
         assert_eq!(config.operation_timeout_secs, 900);
         assert_eq!(config.operation_attempt_timeout_secs, 300);
         assert_eq!(config.max_attempts, 3);
+        assert_eq!(config.pool_idle_timeout_secs, 90);
+    }
+
+    #[test]
+    fn test_pool_idle_timeout_override() {
+        let config = test_config(|c| c.pool_idle_timeout_secs = 30);
+        let result = Backend::new(&config);
+        assert!(result.is_ok());
     }
 
     #[test]
