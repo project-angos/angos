@@ -420,14 +420,11 @@ async fn handle_get_manifest(
     _identity: &ClientIdentity,
 ) -> Result<Response<ResponseBody>, Error> {
     let mime_types = parts.accepted_content_types();
-    let is_tag_immutable = match &reference {
-        Reference::Tag(tag) => context.is_tag_immutable(namespace, tag.as_str()),
-        Reference::Digest(_) => false,
-    };
+    let is_immutable = context.is_reference_immutable(namespace, &reference);
 
     Ok(context
         .registry
-        .handle_get_manifest(namespace, reference, &mime_types, is_tag_immutable)
+        .handle_get_manifest(namespace, reference, &mime_types, is_immutable)
         .await?)
 }
 
@@ -439,14 +436,11 @@ async fn handle_head_manifest(
     _identity: &ClientIdentity,
 ) -> Result<Response<ResponseBody>, Error> {
     let mime_types = parts.accepted_content_types();
-    let is_tag_immutable = match &reference {
-        Reference::Tag(tag) => context.is_tag_immutable(namespace, tag.as_str()),
-        Reference::Digest(_) => false,
-    };
+    let is_immutable = context.is_reference_immutable(namespace, &reference);
 
     Ok(context
         .registry
-        .handle_head_manifest(namespace, reference, &mime_types, is_tag_immutable)
+        .handle_head_manifest(namespace, reference, &mime_types, is_immutable)
         .await?)
 }
 
