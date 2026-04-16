@@ -39,15 +39,10 @@ pub struct ParsedManifestDigests {
     pub manifests: Vec<Digest>,
 }
 
-pub fn parse_manifest_digests(
-    body: &[u8],
+fn validate_media_type_match(
+    manifest: &Manifest,
     content_type: Option<&String>,
-) -> Result<ParsedManifestDigests, Error> {
-    let manifest: Manifest = serde_json::from_slice(body).map_err(|e| {
-        warn!("Failed to deserialize manifest: {e}");
-        Error::ManifestInvalid(format!("invalid manifest JSON: {e}"))
-    })?;
-
+) -> Result<(), Error> {
     if content_type.is_some()
         && manifest.media_type.is_some()
         && manifest.media_type.as_ref() != content_type
@@ -60,6 +55,19 @@ pub fn parse_manifest_digests(
             "Expected manifest media type mismatch".to_string(),
         ));
     }
+    Ok(())
+}
+
+pub fn parse_manifest_digests(
+    body: &[u8],
+    content_type: Option<&String>,
+) -> Result<ParsedManifestDigests, Error> {
+    let manifest: Manifest = serde_json::from_slice(body).map_err(|e| {
+        warn!("Failed to deserialize manifest: {e}");
+        Error::ManifestInvalid(format!("invalid manifest JSON: {e}"))
+    })?;
+
+    validate_media_type_match(&manifest, content_type)?;
 
     let subject = manifest.subject.map(|subject| subject.digest);
 
@@ -276,18 +284,7 @@ impl Registry {
             Error::ManifestInvalid(format!("invalid manifest JSON: {e}"))
         })?;
 
-        if content_type.is_some()
-            && manifest.media_type.is_some()
-            && manifest.media_type.as_ref() != content_type
-        {
-            warn!(
-                "Manifest media type mismatch: {content_type:?} (expected) != {:?} (found)",
-                manifest.media_type
-            );
-            return Err(Error::ManifestInvalid(
-                "Expected manifest media type mismatch".to_string(),
-            ));
-        }
+        validate_media_type_match(&manifest, content_type)?;
 
         let digest = self.blob_store.create_blob(body).await?;
 
