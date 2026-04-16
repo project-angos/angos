@@ -354,7 +354,7 @@ mod tests {
 
         let mut file = backend.create_file("new.txt").await.unwrap();
         file.write_all(b"new content").await.unwrap();
-        drop(file);
+        file.shutdown().await.unwrap();
 
         let content = backend.read("new.txt").await.unwrap();
         assert_eq!(content, b"new content");
@@ -373,7 +373,7 @@ mod tests {
 
         let mut file = backend.open_file_append("test.txt").await.unwrap();
         file.write_all(b" appended").await.unwrap();
-        drop(file);
+        file.shutdown().await.unwrap();
 
         let content = backend.read("test.txt").await.unwrap();
         assert_eq!(content, b"initial appended");

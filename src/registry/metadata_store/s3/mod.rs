@@ -1188,9 +1188,9 @@ impl MetadataStore for Backend {
                 // Fall back to the full blob-index read: it handles the legacy
                 // `index.json` format and migrates it on first touch. The fast
                 // shard path picks up post-migration on subsequent calls.
+                // ReferenceNotFound propagates to the caller unchanged.
                 match self.read_blob_index(digest).await {
                     Ok(index) => index.namespace.contains_key(namespace),
-                    Err(Error::ReferenceNotFound) => false,
                     Err(e) => return Err(e),
                 }
             }
@@ -2724,12 +2724,11 @@ mod tests {
         .unwrap();
         let link = LinkKind::Layer(digest.clone());
 
-        assert!(
-            !backend
-                .has_blob_in_namespace(namespace, &digest)
-                .await
-                .unwrap()
-        );
+        // No blob index exists yet — ReferenceNotFound.
+        assert!(matches!(
+            backend.has_blob_in_namespace(namespace, &digest).await,
+            Err(Error::ReferenceNotFound)
+        ));
 
         backend
             .update_blob_index(namespace, &digest, BlobIndexOperation::Insert(link.clone()))
@@ -2749,11 +2748,13 @@ mod tests {
             .await
             .unwrap();
 
+        // After removing the last link the shard is deleted (non-CAS path),
+        // so there is no index at all — ReferenceNotFound again.
         assert!(
-            !backend
-                .has_blob_in_namespace(namespace, &digest)
-                .await
-                .unwrap(),
+            matches!(
+                backend.has_blob_in_namespace(namespace, &digest).await,
+                Err(Error::ReferenceNotFound)
+            ),
             "cache entry must be invalidated after Remove"
         );
     }

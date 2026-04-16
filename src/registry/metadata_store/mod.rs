@@ -207,18 +207,19 @@ pub trait MetadataStore: Send + Sync {
 
     async fn read_blob_index(&self, digest: &Digest) -> Result<BlobIndex, Error>;
 
-    /// Returns true when `digest` has at least one link recorded in `namespace`'s
-    /// blob-index shard.
+    /// Returns true when `digest` has at least one link recorded in
+    /// `namespace`'s blob-index shard.
     ///
-    /// The default implementation reads the full blob index; backends are expected
-    /// to override with a cheaper, cache-friendly lookup since this is called on
-    /// every non-pull-through blob HEAD/GET.
+    /// Returns `Err(ReferenceNotFound)` when no blob-index exists at all
+    /// (freshly uploaded blob not yet linked by a manifest). Callers that
+    /// need to allow access in that case should handle the error explicitly.
+    ///
+    /// The default implementation reads the full blob index; backends are
+    /// expected to override with a cheaper, cache-friendly lookup since this
+    /// is called on every non-pull-through blob HEAD/GET.
     async fn has_blob_in_namespace(&self, namespace: &str, digest: &Digest) -> Result<bool, Error> {
-        match self.read_blob_index(digest).await {
-            Ok(index) => Ok(index.namespace.contains_key(namespace)),
-            Err(Error::ReferenceNotFound) => Ok(false),
-            Err(e) => Err(e),
-        }
+        let index = self.read_blob_index(digest).await?;
+        Ok(index.namespace.contains_key(namespace))
     }
 
     async fn update_blob_index(
