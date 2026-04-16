@@ -890,11 +890,7 @@ impl MetadataStore for Backend {
             registry.namespaces
         } else {
             info!("Namespace registry not found, rebuilding from S3 tree walk");
-            self.rebuild_namespace_registry().await?;
-            self.read_namespace_registry()
-                .await?
-                .map(|r| r.namespaces)
-                .unwrap_or_default()
+            self.rebuild_namespace_registry().await?
         };
 
         {
@@ -1992,7 +1988,7 @@ impl Backend {
         }))
     }
 
-    pub async fn rebuild_namespace_registry(&self) -> Result<(), Error> {
+    pub async fn rebuild_namespace_registry(&self) -> Result<Vec<String>, Error> {
         let mut namespaces = self
             .collect_namespaces(path_builder::repository_dir().to_string(), String::new())
             .await?;
@@ -2063,7 +2059,7 @@ impl Backend {
             result?;
         }
 
-        Ok(())
+        Ok(namespaces)
     }
 
     async fn register_namespace(&self, namespace: &str) -> Result<(), Error> {

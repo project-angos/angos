@@ -42,7 +42,7 @@ macro_rules! pipeline_pages {
     };
 }
 
-pub use pipeline_pages;
+pub(crate) use pipeline_pages;
 
 pub fn paginate<T: Clone + ToString>(
     items: &[T],
