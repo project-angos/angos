@@ -423,10 +423,11 @@ impl Backend {
         self.evict_upload_state(name, uuid).await;
 
         let blob_path = path_builder::blob_path(&digest);
-        self.store.copy_object(&key, &blob_path).await?;
-
-        let key = path_builder::upload_container_path(name, uuid);
-        self.store.delete_prefix(&key).await?;
+        let container = path_builder::upload_container_path(name, uuid);
+        try_join!(
+            Box::pin(self.store.copy_object(&key, &blob_path)),
+            Box::pin(self.store.delete_prefix(&container)),
+        )?;
 
         Ok(digest)
     }
@@ -762,10 +763,11 @@ impl Backend {
         self.evict_upload_state(name, uuid).await;
 
         let blob_path = path_builder::blob_path(&digest);
-        self.store.copy_object(&upload_path, &blob_path).await?;
-
         let container = path_builder::upload_container_path(name, uuid);
-        self.store.delete_prefix(&container).await?;
+        try_join!(
+            Box::pin(self.store.copy_object(&upload_path, &blob_path)),
+            Box::pin(self.store.delete_prefix(&container)),
+        )?;
 
         Ok(digest)
     }
