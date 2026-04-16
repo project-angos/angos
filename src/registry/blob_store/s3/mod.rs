@@ -15,6 +15,7 @@ use bytes::{Bytes, BytesMut};
 use channel_body::ChannelBody;
 use chrono::{DateTime, Duration, Utc};
 use chunked_reader::ChunkedReader;
+use futures_util::stream::{self, StreamExt};
 use sha2::{Digest as ShaDigestTrait, Sha256};
 use tokio::{
     io::{AsyncRead, AsyncReadExt},
@@ -37,6 +38,9 @@ use crate::{
 
 const MIN_PART_SIZE: u64 = 5 * 1024 * 1024;
 const FRAME_SIZE: usize = 256 * 1024;
+/// Bounded concurrency for orphan multipart upload probes during scrub. Each
+/// in-flight future holds one upload tuple and issues a HEAD + optional abort.
+const ORPHAN_CLEANUP_CONCURRENCY: usize = 20;
 
 // Channel depth for streaming bytes from the hashing reader to the S3 multipart upload
 // task in non-uniform mode. Bounds the per-upload memory footprint:
@@ -1068,27 +1072,35 @@ impl MultipartCleanup for Backend {
                 .list_multipart_uploads(None, key_marker.as_deref(), upload_id_marker.as_deref())
                 .await?;
 
-            for (key, upload_id, initiated) in uploads {
-                if now.signed_duration_since(initiated) < timeout {
-                    continue;
-                }
+            let results: Vec<Result<usize, Error>> = stream::iter(uploads)
+                .map(|(key, upload_id, initiated)| async move {
+                    if now.signed_duration_since(initiated) < timeout {
+                        return Ok(0);
+                    }
 
-                let Some((namespace, uuid)) = parse_upload_key(&key) else {
-                    continue;
-                };
+                    let Some((namespace, uuid)) = parse_upload_key(&key) else {
+                        return Ok(0);
+                    };
 
-                let startedat_path = path_builder::upload_start_date_path(&namespace, &uuid);
-                if self.store.object_size(&startedat_path).await.is_ok() {
-                    continue;
-                }
+                    let startedat_path = path_builder::upload_start_date_path(&namespace, &uuid);
+                    if self.store.object_size(&startedat_path).await.is_ok() {
+                        return Ok(0);
+                    }
 
-                if dry_run {
-                    info!("DRY RUN: would abort orphan multipart upload {key}");
-                } else {
-                    info!("Aborting orphan multipart upload {key}");
-                    self.store.abort_multipart_upload(&key, &upload_id).await?;
-                }
-                count += 1;
+                    if dry_run {
+                        info!("DRY RUN: would abort orphan multipart upload {key}");
+                    } else {
+                        info!("Aborting orphan multipart upload {key}");
+                        self.store.abort_multipart_upload(&key, &upload_id).await?;
+                    }
+                    Ok(1)
+                })
+                .buffer_unordered(ORPHAN_CLEANUP_CONCURRENCY)
+                .collect()
+                .await;
+
+            for result in results {
+                count += result?;
             }
 
             if next_key.is_none() {
