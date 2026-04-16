@@ -308,6 +308,9 @@ pub struct Backend {
 
 const MAX_UPDATE_RETRIES: u32 = 10;
 const MAX_BLOB_INDEX_CAS_RETRIES: u32 = 20;
+/// Bounded concurrency for parallel shard writes during namespace registry
+/// rebuild. Each in-flight shard holds one small JSON payload.
+const REGISTRY_REBUILD_CONCURRENCY: usize = 8;
 /// Upper bound on the TTL used when caching negative blob-index membership results.
 /// Kept short so a freshly-pushed layer becomes visible quickly in readers that
 /// previously 404-ed the digest; positive hits still use `link_cache_ttl` in full.
@@ -2030,50 +2033,61 @@ impl Backend {
             shards.entry(key).or_default().push(ns.clone());
         }
 
-        // Write each shard
-        for (shard_key, shard_namespaces) in &shards {
-            let registry = NamespaceRegistry {
-                namespaces: shard_namespaces.clone(),
-            };
-            let content = Bytes::from(serde_json::to_vec(&registry)?);
-            let path = format!(
-                "{}/{shard_key}.json",
-                path_builder::namespace_registry_shard_dir()
-            );
+        // Write shards concurrently with bounded parallelism.
+        let shard_dir = path_builder::namespace_registry_shard_dir();
+        let results: Vec<Result<(), Error>> = stream::iter(shards)
+            .map(|(shard_key, shard_namespaces)| {
+                let shard_dir = &shard_dir;
+                async move {
+                    let registry = NamespaceRegistry {
+                        namespaces: shard_namespaces,
+                    };
+                    let content = Bytes::from(serde_json::to_vec(&registry)?);
+                    let path = format!("{shard_dir}/{shard_key}.json");
 
-            if self.conditional.supports_cas() {
-                let etag = match self.store.read_bytes_with_etag(&path).await {
-                    Ok((_, etag)) => etag,
-                    Err(e) if e.kind() == ErrorKind::NotFound => None,
-                    Err(e) => return Err(Error::from(e)),
-                };
-                let write_result = if let Some(ref etag) = etag {
-                    self.store
-                        .put_object_if_match(&path, etag, content)
-                        .await
-                        .map(|_| ())
-                } else {
-                    self.store
-                        .put_object_if_not_exists(&path, content)
-                        .await
-                        .map(|_| ())
-                };
-                match write_result {
-                    Ok(()) => {}
-                    Err(data_store::Error::PreconditionFailed) => {
-                        debug!(
-                            shard_key,
-                            "Namespace registry shard rebuild lost CAS race; concurrent write wins"
-                        );
+                    if self.conditional.supports_cas() {
+                        let etag = match self.store.read_bytes_with_etag(&path).await {
+                            Ok((_, etag)) => etag,
+                            Err(e) if e.kind() == ErrorKind::NotFound => None,
+                            Err(e) => return Err(Error::from(e)),
+                        };
+                        let write_result = if let Some(ref etag) = etag {
+                            self.store
+                                .put_object_if_match(&path, etag, content)
+                                .await
+                                .map(|_| ())
+                        } else {
+                            self.store
+                                .put_object_if_not_exists(&path, content)
+                                .await
+                                .map(|_| ())
+                        };
+                        match write_result {
+                            Ok(()) => {}
+                            Err(data_store::Error::PreconditionFailed) => {
+                                debug!(
+                                    shard_key,
+                                    "Namespace registry shard rebuild lost CAS race; concurrent write wins"
+                                );
+                            }
+                            Err(e) => return Err(Error::StorageBackend(e.to_string())),
+                        }
+                    } else {
+                        let lock_key = format!("namespace_registry_shard_{shard_key}");
+                        let guard = self.lock.acquire(&[lock_key]).await?;
+                        self.store.put_object(&path, content).await?;
+                        guard.release().await;
                     }
-                    Err(e) => return Err(Error::StorageBackend(e.to_string())),
+
+                    Ok(())
                 }
-            } else {
-                let lock_key = format!("namespace_registry_shard_{shard_key}");
-                let guard = self.lock.acquire(&[lock_key]).await?;
-                self.store.put_object(&path, content).await?;
-                guard.release().await;
-            }
+            })
+            .buffer_unordered(REGISTRY_REBUILD_CONCURRENCY)
+            .collect()
+            .await;
+
+        for result in results {
+            result?;
         }
 
         Ok(())
