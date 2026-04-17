@@ -20,6 +20,8 @@ use crate::{
 };
 
 mod cache;
+mod cel;
+mod circuit_breaker;
 mod command;
 mod configuration;
 mod event_webhook;

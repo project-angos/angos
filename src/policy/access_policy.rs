@@ -19,9 +19,10 @@ use cel_interpreter::{Context, Program, Value};
 use serde::Deserialize;
 use tracing::{debug, warn};
 
+use super::Error;
 use crate::{
+    cel,
     identity::{ClientIdentity, Route},
-    registry::{Error, cel},
 };
 
 /// Configuration for access control policies.
@@ -103,8 +104,12 @@ impl AccessPolicy {
         identity: &'a ClientIdentity,
     ) -> Result<Context<'a>, Error> {
         let mut context = Context::default();
-        context.add_variable("request", request)?;
-        context.add_variable("identity", identity)?;
+        context
+            .add_variable("request", request)
+            .map_err(|e| Error::Initialization(e.to_string()))?;
+        context
+            .add_variable("identity", identity)
+            .map_err(|e| Error::Initialization(e.to_string()))?;
         Ok(context)
     }
 }

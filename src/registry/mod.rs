@@ -4,7 +4,6 @@ use tracing::instrument;
 
 pub mod blob;
 pub mod blob_store;
-pub mod cel;
 pub mod content_discovery;
 pub mod data_store;
 mod error;

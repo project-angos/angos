@@ -8,7 +8,7 @@ use hyper::{header::InvalidHeaderValue, http::uri::InvalidUri};
 use tracing::{debug, warn};
 
 use crate::{
-    configuration, oci,
+    configuration, oci, policy,
     registry::{blob_store, cache, metadata_store, task_queue},
 };
 
@@ -57,6 +57,13 @@ impl From<configuration::Error> for Error {
     fn from(error: configuration::Error) -> Self {
         warn!("Configuration error: {error}");
         Error::Internal("Configuration error during operations".to_string())
+    }
+}
+
+impl From<policy::Error> for Error {
+    fn from(error: policy::Error) -> Self {
+        warn!("Policy error: {error}");
+        Error::Initialization(error.to_string())
     }
 }
 

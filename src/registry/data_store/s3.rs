@@ -1,9 +1,5 @@
 use std::{
     io::{Error as IoError, ErrorKind},
-    sync::{
-        Arc,
-        atomic::{AtomicU32, AtomicU64, Ordering},
-    },
     time::Duration,
 };
 
@@ -19,67 +15,8 @@ use bytes::Bytes;
 use bytesize::ByteSize;
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
-use tracing::warn;
 
-use crate::registry::data_store::Error;
-
-const CIRCUIT_BREAKER_THRESHOLD: u32 = 5;
-const CIRCUIT_BREAKER_COOLDOWN_SECS: u64 = 10;
-
-#[derive(Clone, Debug)]
-struct CircuitBreaker {
-    consecutive_failures: Arc<AtomicU32>,
-    opened_at_epoch_secs: Arc<AtomicU64>,
-}
-
-impl CircuitBreaker {
-    fn new() -> Self {
-        Self {
-            consecutive_failures: Arc::new(AtomicU32::new(0)),
-            opened_at_epoch_secs: Arc::new(AtomicU64::new(0)),
-        }
-    }
-
-    fn check(&self) -> Result<(), IoError> {
-        let failures = self.consecutive_failures.load(Ordering::Acquire);
-        if failures < CIRCUIT_BREAKER_THRESHOLD {
-            return Ok(());
-        }
-        let opened_at = self.opened_at_epoch_secs.load(Ordering::Acquire);
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        if now.saturating_sub(opened_at) >= CIRCUIT_BREAKER_COOLDOWN_SECS {
-            // Half-open: allow one probe request through
-            return Ok(());
-        }
-        Err(IoError::other(format!(
-            "S3 circuit breaker open: {failures} consecutive failures, \
-             cooling down for {CIRCUIT_BREAKER_COOLDOWN_SECS}s"
-        )))
-    }
-
-    fn record_success(&self) {
-        self.consecutive_failures.store(0, Ordering::Release);
-    }
-
-    fn record_failure(&self) {
-        let prev = self.consecutive_failures.fetch_add(1, Ordering::AcqRel);
-        if prev + 1 == CIRCUIT_BREAKER_THRESHOLD {
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs();
-            self.opened_at_epoch_secs.store(now, Ordering::Release);
-            warn!(
-                threshold = CIRCUIT_BREAKER_THRESHOLD,
-                cooldown_secs = CIRCUIT_BREAKER_COOLDOWN_SECS,
-                "S3 circuit breaker opened after {CIRCUIT_BREAKER_THRESHOLD} consecutive failures"
-            );
-        }
-    }
-}
+use crate::{circuit_breaker::CircuitBreaker, registry::data_store::Error};
 
 #[derive(Clone, Debug, Deserialize, PartialEq)]
 #[serde(default)]

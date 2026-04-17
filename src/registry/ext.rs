@@ -13,32 +13,125 @@ use crate::{
     },
 };
 
+#[derive(Serialize, Debug)]
+struct RepositoryInfo {
+    name: String,
+    namespace_count: usize,
+    pull_through_cache: bool,
+    immutable_tags: bool,
+}
+
+#[derive(Serialize, Debug)]
+struct RepositoriesResponse {
+    repositories: Vec<RepositoryInfo>,
+}
+
+#[derive(Serialize, Debug)]
+struct NamespaceInfo {
+    name: String,
+    manifest_count: usize,
+    upload_count: usize,
+}
+
+#[derive(Serialize, Debug)]
+struct NamespacesResponse {
+    repository: String,
+    namespaces: Vec<NamespaceInfo>,
+    pull_through_cache: bool,
+    upstream_urls: Vec<String>,
+    immutable_tags: bool,
+    immutable_tags_exclusions: Vec<String>,
+}
+
+#[derive(Serialize, Debug, Clone)]
+struct Platform {
+    os: String,
+    architecture: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    variant: Option<String>,
+}
+
+impl From<OciPlatform> for Platform {
+    fn from(p: OciPlatform) -> Self {
+        Platform {
+            os: p.os,
+            architecture: p.architecture,
+            variant: p.variant,
+        }
+    }
+}
+
+#[derive(Serialize, Debug, Clone)]
+struct ParentRef {
+    digest: String,
+    tags: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    platform: Option<Platform>,
+}
+
+#[derive(Serialize, Debug, Clone)]
+#[serde(rename_all = "camelCase")]
+struct ReferrerInfo {
+    digest: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    artifact_type: Option<String>,
+    #[serde(skip_serializing_if = "HashMap::is_empty")]
+    annotations: HashMap<String, String>,
+}
+
+#[derive(Serialize, Debug)]
+struct ManifestEntry {
+    digest: String,
+    tags: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    parents: Vec<ParentRef>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    referrers: Vec<ReferrerInfo>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pushed_at: Option<DateTime<Utc>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_pulled_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Serialize, Debug)]
+struct RevisionsResponse<'a> {
+    name: &'a str,
+    manifests: Vec<ManifestEntry>,
+}
+
+#[derive(Serialize, Debug)]
+struct UploadEntry {
+    uuid: String,
+    size: u64,
+    started_at: DateTime<Utc>,
+}
+
+#[derive(Serialize, Debug)]
+struct UploadsResponse<'a> {
+    name: &'a str,
+    uploads: Vec<UploadEntry>,
+}
+
+struct RepositoryConfig {
+    pull_through_cache: bool,
+    upstream_urls: Vec<String>,
+    immutable_tags: bool,
+    immutable_tags_exclusions: Vec<String>,
+}
+
 impl Registry {
     #[instrument(skip(self))]
     pub async fn handle_list_repositories(&self) -> Result<Response<ResponseBody>, Error> {
-        #[derive(Serialize, Debug)]
-        struct RepositoryInfo {
-            name: String,
-            namespace_count: usize,
-            pull_through_cache: bool,
-            immutable_tags: bool,
-        }
-
-        #[derive(Serialize, Debug)]
-        struct RepositoriesResponse {
-            repositories: Vec<RepositoryInfo>,
-        }
-
         let mut repositories = Vec::with_capacity(self.repositories.len());
 
         for name in self.repositories.keys() {
             let namespaces = self.list_repository_namespaces(name).await?;
-            let (is_pull_through, _, immutable_tags, _) = self.get_repository_config(name);
+            let config = self.get_repository_config(name);
             repositories.push(RepositoryInfo {
                 name: name.clone(),
                 namespace_count: namespaces.len(),
-                pull_through_cache: is_pull_through,
-                immutable_tags,
+                pull_through_cache: config.pull_through_cache,
+                immutable_tags: config.immutable_tags,
             });
         }
 
@@ -58,23 +151,6 @@ impl Registry {
         &self,
         repository: &str,
     ) -> Result<Response<ResponseBody>, Error> {
-        #[derive(Serialize, Debug)]
-        struct NamespaceInfo {
-            name: String,
-            manifest_count: usize,
-            upload_count: usize,
-        }
-
-        #[derive(Serialize, Debug)]
-        struct NamespacesResponse {
-            repository: String,
-            namespaces: Vec<NamespaceInfo>,
-            pull_through_cache: bool,
-            upstream_urls: Vec<String>,
-            immutable_tags: bool,
-            immutable_tags_exclusions: Vec<String>,
-        }
-
         let namespace_names = self.list_repository_namespaces(repository).await?;
         let mut namespaces = Vec::with_capacity(namespace_names.len());
 
@@ -89,16 +165,15 @@ impl Registry {
             });
         }
 
-        let (is_pull_through, upstream_urls, immutable_tags, immutable_tags_exclusions) =
-            self.get_repository_config(repository);
+        let config = self.get_repository_config(repository);
 
         let response = NamespacesResponse {
             repository: repository.to_string(),
             namespaces,
-            pull_through_cache: is_pull_through,
-            upstream_urls,
-            immutable_tags,
-            immutable_tags_exclusions,
+            pull_through_cache: config.pull_through_cache,
+            upstream_urls: config.upstream_urls,
+            immutable_tags: config.immutable_tags,
+            immutable_tags_exclusions: config.immutable_tags_exclusions,
         };
 
         let body = serde_json::to_string(&response)?;
@@ -110,67 +185,10 @@ impl Registry {
     }
 
     #[instrument(skip(self))]
-    #[allow(clippy::too_many_lines)]
     pub async fn handle_list_revisions(
         &self,
         namespace: &Namespace,
     ) -> Result<Response<ResponseBody>, Error> {
-        #[derive(Serialize, Debug, Clone)]
-        struct Platform {
-            os: String,
-            architecture: String,
-            #[serde(skip_serializing_if = "Option::is_none")]
-            variant: Option<String>,
-        }
-
-        impl From<OciPlatform> for Platform {
-            fn from(p: OciPlatform) -> Self {
-                Platform {
-                    os: p.os,
-                    architecture: p.architecture,
-                    variant: p.variant,
-                }
-            }
-        }
-
-        #[derive(Serialize, Debug, Clone)]
-        struct ParentRef {
-            digest: String,
-            tags: Vec<String>,
-            #[serde(skip_serializing_if = "Option::is_none")]
-            platform: Option<Platform>,
-        }
-
-        #[derive(Serialize, Debug, Clone)]
-        #[serde(rename_all = "camelCase")]
-        struct ReferrerInfo {
-            digest: String,
-            #[serde(skip_serializing_if = "Option::is_none")]
-            artifact_type: Option<String>,
-            #[serde(skip_serializing_if = "HashMap::is_empty")]
-            annotations: HashMap<String, String>,
-        }
-
-        #[derive(Serialize, Debug)]
-        struct ManifestEntry {
-            digest: String,
-            tags: Vec<String>,
-            #[serde(skip_serializing_if = "Vec::is_empty")]
-            parents: Vec<ParentRef>,
-            #[serde(skip_serializing_if = "Vec::is_empty")]
-            referrers: Vec<ReferrerInfo>,
-            #[serde(skip_serializing_if = "Option::is_none")]
-            pushed_at: Option<DateTime<Utc>>,
-            #[serde(skip_serializing_if = "Option::is_none")]
-            last_pulled_at: Option<DateTime<Utc>>,
-        }
-
-        #[derive(Serialize, Debug)]
-        struct RevisionsResponse<'a> {
-            name: &'a str,
-            manifests: Vec<ManifestEntry>,
-        }
-
         let all_revisions = collect_all_pages(|token| async move {
             self.metadata_store
                 .list_revisions(namespace, 1000, token)
@@ -179,57 +197,169 @@ impl Registry {
         })
         .await?;
         let digest_to_tags = self.build_digest_to_tags_map(namespace).await?;
+        let (child_to_parents, docker_referrers) =
+            self.build_parent_and_referrer_maps(&all_revisions).await;
+        let manifests = self
+            .build_manifest_entries(
+                namespace,
+                all_revisions,
+                &digest_to_tags,
+                child_to_parents,
+                docker_referrers,
+            )
+            .await;
 
+        let response = RevisionsResponse {
+            name: namespace,
+            manifests,
+        };
+
+        let body = serde_json::to_string(&response)?;
+
+        Ok(Response::builder()
+            .status(StatusCode::OK)
+            .header(CONTENT_TYPE, "application/json")
+            .body(ResponseBody::fixed(body.into_bytes()))?)
+    }
+
+    #[instrument(skip(self))]
+    pub async fn handle_list_uploads(
+        &self,
+        namespace: &Namespace,
+    ) -> Result<Response<ResponseBody>, Error> {
+        let uuids = collect_all_pages(|token| async move {
+            self.blob_store
+                .list_uploads(namespace, 1000, token)
+                .await
+                .map_err(Error::from)
+        })
+        .await?;
+
+        let mut all_uploads = Vec::new();
+        for uuid in uuids {
+            if let Ok((_, size, started_at)) =
+                self.blob_store.read_upload_summary(namespace, &uuid).await
+            {
+                all_uploads.push(UploadEntry {
+                    uuid,
+                    size,
+                    started_at,
+                });
+            }
+        }
+
+        let response = UploadsResponse {
+            name: namespace,
+            uploads: all_uploads,
+        };
+
+        let body = serde_json::to_string(&response)?;
+
+        Ok(Response::builder()
+            .status(StatusCode::OK)
+            .header(CONTENT_TYPE, "application/json")
+            .body(ResponseBody::fixed(body.into_bytes()))?)
+    }
+
+    fn get_repository_config(&self, name: &str) -> RepositoryConfig {
+        if let Some(repo) = self.repositories.get(name) {
+            let upstream_urls: Vec<String> = repo.upstreams.iter().map(|u| u.url.clone()).collect();
+            let pull_through_cache = !upstream_urls.is_empty();
+            let immutable_tags = repo.immutable_tags || self.global_immutable_tags;
+            let immutable_tags_exclusions = if repo.immutable_tags_exclusions.is_empty() {
+                self.global_immutable_tags_exclusions.clone()
+            } else {
+                repo.immutable_tags_exclusions.clone()
+            };
+            RepositoryConfig {
+                pull_through_cache,
+                upstream_urls,
+                immutable_tags,
+                immutable_tags_exclusions,
+            }
+        } else {
+            RepositoryConfig {
+                pull_through_cache: false,
+                upstream_urls: Vec::new(),
+                immutable_tags: self.global_immutable_tags,
+                immutable_tags_exclusions: self.global_immutable_tags_exclusions.clone(),
+            }
+        }
+    }
+
+    async fn build_parent_and_referrer_maps(
+        &self,
+        all_revisions: &[Digest],
+    ) -> (
+        HashMap<Digest, Vec<(Digest, Option<Platform>)>>,
+        HashMap<Digest, Vec<ReferrerInfo>>,
+    ) {
         let mut child_to_parents: HashMap<Digest, Vec<(Digest, Option<Platform>)>> = HashMap::new();
         let mut docker_referrers: HashMap<Digest, Vec<ReferrerInfo>> = HashMap::new();
 
-        for digest in &all_revisions {
-            if let Ok(blob_data) = self.blob_store.read_blob(digest).await
-                && let Ok(manifest) = Manifest::from_slice(&blob_data)
-            {
-                for child_descriptor in &manifest.manifests {
-                    if let Some(subject_digest_str) = child_descriptor
-                        .annotations
-                        .get("vnd.docker.reference.digest")
-                    {
-                        if let Ok(subject_digest) = subject_digest_str.parse::<Digest>() {
-                            let mut annotations = child_descriptor.annotations.clone();
-                            if let Ok(child_blob) =
-                                self.blob_store.read_blob(&child_descriptor.digest).await
-                                && let Ok(child_manifest) = Manifest::from_slice(&child_blob)
-                            {
-                                for layer in &child_manifest.layers {
-                                    if let Some(predicate_type) =
-                                        layer.annotations.get("in-toto.io/predicate-type")
-                                    {
-                                        annotations.insert(
-                                            "in-toto.io/predicate-type".to_string(),
-                                            predicate_type.clone(),
-                                        );
-                                        break;
-                                    }
+        for digest in all_revisions {
+            let Ok(blob_data) = self.blob_store.read_blob(digest).await else {
+                continue;
+            };
+            let Ok(manifest) = Manifest::from_slice(&blob_data) else {
+                continue;
+            };
+
+            for child_descriptor in &manifest.manifests {
+                if let Some(subject_digest_str) = child_descriptor
+                    .annotations
+                    .get("vnd.docker.reference.digest")
+                {
+                    if let Ok(subject_digest) = subject_digest_str.parse::<Digest>() {
+                        let mut annotations = child_descriptor.annotations.clone();
+                        if let Ok(child_blob) =
+                            self.blob_store.read_blob(&child_descriptor.digest).await
+                            && let Ok(child_manifest) = Manifest::from_slice(&child_blob)
+                        {
+                            for layer in &child_manifest.layers {
+                                if let Some(predicate_type) =
+                                    layer.annotations.get("in-toto.io/predicate-type")
+                                {
+                                    annotations.insert(
+                                        "in-toto.io/predicate-type".to_string(),
+                                        predicate_type.clone(),
+                                    );
+                                    break;
                                 }
                             }
-                            docker_referrers.entry(subject_digest).or_default().push(
-                                ReferrerInfo {
-                                    digest: child_descriptor.digest.to_string(),
-                                    artifact_type: child_descriptor.artifact_type.clone(),
-                                    annotations,
-                                },
-                            );
                         }
-                    } else {
-                        let platform = child_descriptor.platform.clone().map(Platform::from);
-                        child_to_parents
-                            .entry(child_descriptor.digest.clone())
+                        docker_referrers
+                            .entry(subject_digest)
                             .or_default()
-                            .push((digest.clone(), platform));
+                            .push(ReferrerInfo {
+                                digest: child_descriptor.digest.to_string(),
+                                artifact_type: child_descriptor.artifact_type.clone(),
+                                annotations,
+                            });
                     }
+                } else {
+                    let platform = child_descriptor.platform.clone().map(Platform::from);
+                    child_to_parents
+                        .entry(child_descriptor.digest.clone())
+                        .or_default()
+                        .push((digest.clone(), platform));
                 }
             }
         }
 
+        (child_to_parents, docker_referrers)
+    }
+
+    async fn build_manifest_entries(
+        &self,
+        namespace: &Namespace,
+        all_revisions: Vec<Digest>,
+        digest_to_tags: &HashMap<Digest, Vec<String>>,
+        child_to_parents: HashMap<Digest, Vec<(Digest, Option<Platform>)>>,
+        mut docker_referrers: HashMap<Digest, Vec<ReferrerInfo>>,
+    ) -> Vec<ManifestEntry> {
         let mut manifests: Vec<ManifestEntry> = Vec::with_capacity(all_revisions.len());
+
         for digest in all_revisions {
             let tags = digest_to_tags.get(&digest).cloned().unwrap_or_default();
             let parents = child_to_parents
@@ -279,90 +409,7 @@ impl Registry {
             });
         }
 
-        let response = RevisionsResponse {
-            name: namespace,
-            manifests,
-        };
-
-        let body = serde_json::to_string(&response)?;
-
-        Ok(Response::builder()
-            .status(StatusCode::OK)
-            .header(CONTENT_TYPE, "application/json")
-            .body(ResponseBody::fixed(body.into_bytes()))?)
-    }
-
-    #[instrument(skip(self))]
-    pub async fn handle_list_uploads(
-        &self,
-        namespace: &Namespace,
-    ) -> Result<Response<ResponseBody>, Error> {
-        #[derive(Serialize, Debug)]
-        struct UploadEntry {
-            uuid: String,
-            size: u64,
-            started_at: DateTime<Utc>,
-        }
-
-        #[derive(Serialize, Debug)]
-        struct UploadsResponse<'a> {
-            name: &'a str,
-            uploads: Vec<UploadEntry>,
-        }
-
-        let uuids = collect_all_pages(|token| async move {
-            self.blob_store
-                .list_uploads(namespace, 1000, token)
-                .await
-                .map_err(Error::from)
-        })
-        .await?;
-
-        let mut all_uploads = Vec::new();
-        for uuid in uuids {
-            if let Ok((_, size, started_at)) =
-                self.blob_store.read_upload_summary(namespace, &uuid).await
-            {
-                all_uploads.push(UploadEntry {
-                    uuid,
-                    size,
-                    started_at,
-                });
-            }
-        }
-
-        let response = UploadsResponse {
-            name: namespace,
-            uploads: all_uploads,
-        };
-
-        let body = serde_json::to_string(&response)?;
-
-        Ok(Response::builder()
-            .status(StatusCode::OK)
-            .header(CONTENT_TYPE, "application/json")
-            .body(ResponseBody::fixed(body.into_bytes()))?)
-    }
-
-    fn get_repository_config(&self, name: &str) -> (bool, Vec<String>, bool, Vec<String>) {
-        if let Some(repo) = self.repositories.get(name) {
-            let upstream_urls: Vec<String> = repo.upstreams.iter().map(|u| u.url.clone()).collect();
-            let is_pull_through = !upstream_urls.is_empty();
-            let immutable_tags = repo.immutable_tags || self.global_immutable_tags;
-            let exclusions = if repo.immutable_tags_exclusions.is_empty() {
-                self.global_immutable_tags_exclusions.clone()
-            } else {
-                repo.immutable_tags_exclusions.clone()
-            };
-            (is_pull_through, upstream_urls, immutable_tags, exclusions)
-        } else {
-            (
-                false,
-                Vec::new(),
-                self.global_immutable_tags,
-                self.global_immutable_tags_exclusions.clone(),
-            )
-        }
+        manifests
     }
 
     async fn count_uploads(&self, namespace: &Namespace) -> Result<usize, Error> {
