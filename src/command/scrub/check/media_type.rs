@@ -1,8 +1,10 @@
 use std::sync::Arc;
 
+use async_trait::async_trait;
 use tracing::{debug, error, info};
 
 use crate::{
+    command::scrub::check::NamespaceChecker,
     oci::{Digest, Manifest},
     registry::{
         Error,
@@ -29,42 +31,6 @@ impl MediaTypeChecker {
             metadata_store,
             dry_run,
         }
-    }
-
-    pub async fn check_namespace(&self, namespace: &str) -> Result<(), Error> {
-        debug!("Checking media_type field for namespace '{namespace}'");
-
-        let revisions =
-            collect_all_pages(|marker| self.metadata_store.list_revisions(namespace, 100, marker))
-                .await?;
-
-        for revision in &revisions {
-            let link = LinkKind::Digest(revision.clone());
-            if let Err(e) = self
-                .backfill_link(namespace, &link, &format!("revision {revision}"))
-                .await
-            {
-                error!(
-                    "Failed to backfill media_type for '{namespace}' (revision '{revision}'): {e}"
-                );
-            }
-        }
-
-        let tags =
-            collect_all_pages(|marker| self.metadata_store.list_tags(namespace, 100, marker))
-                .await?;
-
-        for tag in &tags {
-            let link = LinkKind::Tag(tag.clone());
-            if let Err(e) = self
-                .backfill_link(namespace, &link, &format!("tag '{tag}'"))
-                .await
-            {
-                error!("Failed to backfill media_type for '{namespace}' (tag '{tag}'): {e}");
-            }
-        }
-
-        Ok(())
     }
 
     async fn backfill_link(
@@ -108,6 +74,45 @@ impl MediaTypeChecker {
         let content = self.blob_store.read_blob(digest).await?;
         let manifest: Manifest = serde_json::from_slice(&content).unwrap_or_default();
         Ok(manifest.media_type)
+    }
+}
+
+#[async_trait]
+impl NamespaceChecker for MediaTypeChecker {
+    async fn check_namespace(&self, namespace: &str) -> Result<(), Error> {
+        debug!("Checking media_type field for namespace '{namespace}'");
+
+        let revisions =
+            collect_all_pages(|marker| self.metadata_store.list_revisions(namespace, 100, marker))
+                .await?;
+
+        for revision in &revisions {
+            let link = LinkKind::Digest(revision.clone());
+            if let Err(e) = self
+                .backfill_link(namespace, &link, &format!("revision {revision}"))
+                .await
+            {
+                error!(
+                    "Failed to backfill media_type for '{namespace}' (revision '{revision}'): {e}"
+                );
+            }
+        }
+
+        let tags =
+            collect_all_pages(|marker| self.metadata_store.list_tags(namespace, 100, marker))
+                .await?;
+
+        for tag in &tags {
+            let link = LinkKind::Tag(tag.clone());
+            if let Err(e) = self
+                .backfill_link(namespace, &link, &format!("tag '{tag}'"))
+                .await
+            {
+                error!("Failed to backfill media_type for '{namespace}' (tag '{tag}'): {e}");
+            }
+        }
+
+        Ok(())
     }
 }
 

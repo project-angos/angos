@@ -1,9 +1,11 @@
 use std::{collections::HashMap, sync::Arc};
 
+use async_trait::async_trait;
 use futures_util::future::join_all;
 use tracing::{debug, info};
 
 use crate::{
+    command::scrub::check::NamespaceChecker,
     oci::Digest,
     policy::{ManifestImage, RetentionPolicy},
     registry::{
@@ -45,8 +47,11 @@ impl RetentionChecker {
             dry_run,
         }
     }
+}
 
-    pub async fn check_namespace(&self, namespace: &str) -> Result<(), Error> {
+#[async_trait]
+impl NamespaceChecker for RetentionChecker {
+    async fn check_namespace(&self, namespace: &str) -> Result<(), Error> {
         debug!("Checking retention policies on '{namespace}'");
 
         let tag_names = collect_all_pages(|marker| async move {
@@ -65,7 +70,9 @@ impl RetentionChecker {
         self.delete_orphan_manifests(namespace, &last_pushed, &last_pulled)
             .await
     }
+}
 
+impl RetentionChecker {
     async fn fetch_tag_metadata(
         &self,
         namespace: &str,

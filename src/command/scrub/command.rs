@@ -10,7 +10,7 @@ use crate::{
     command::scrub::{
         check::{
             BlobChecker, LinkReferencesChecker, ManifestChecker, MediaTypeChecker,
-            MultipartChecker, RetentionChecker, TagChecker, UploadChecker,
+            MultipartChecker, NamespaceChecker, RetentionChecker, TagChecker, UploadChecker,
         },
         error::Error,
     },
@@ -61,14 +61,9 @@ pub struct Options {
 
 pub struct Command {
     metadata_store: Arc<dyn MetadataStore + Send + Sync>,
-    retention_enforcer: Option<RetentionChecker>,
-    upload_checker: Option<UploadChecker>,
-    tags_checker: Option<TagChecker>,
-    revisions: Option<ManifestChecker>,
+    namespace_checkers: Vec<Box<dyn NamespaceChecker>>,
     blob_checker: Option<BlobChecker>,
     multipart_checker: Option<MultipartChecker>,
-    link_references_checker: Option<LinkReferencesChecker>,
-    media_type_checker: Option<MediaTypeChecker>,
 }
 
 fn build_blob_store(config: &blob_store::BlobStorageConfig) -> Result<Arc<dyn BlobStore>, Error> {
@@ -150,22 +145,22 @@ impl Command {
         let auth_cache = build_auth_cache(&config.cache)?;
         let repositories = build_repositories(&config.repository, &auth_cache)?;
 
-        let retention_enforcer = if options.retention {
+        let mut namespace_checkers: Vec<Box<dyn NamespaceChecker>> = Vec::new();
+
+        if options.retention {
             let global_retention_policy =
                 build_global_retention_policy(&config.global.retention_policy)?;
 
-            Some(RetentionChecker::new(
+            namespace_checkers.push(Box::new(RetentionChecker::new(
                 blob_store.clone(),
                 metadata_store.clone(),
                 repositories.clone(),
-                global_retention_policy.clone(),
+                global_retention_policy,
                 options.dry_run,
-            ))
-        } else {
-            None
-        };
+            )));
+        }
 
-        let upload_checker = if let Some(upload_timeout) = options.uploads {
+        if let Some(upload_timeout) = options.uploads {
             let upload_timeout =
                 Duration::from_std(upload_timeout.into()).expect("Upload timeout must be valid");
 
@@ -174,34 +169,47 @@ impl Command {
                 upload_timeout.num_seconds()
             );
 
-            Some(UploadChecker::new(
+            namespace_checkers.push(Box::new(UploadChecker::new(
                 blob_store.clone(),
                 upload_timeout,
                 options.dry_run,
-            ))
-        } else {
-            None
-        };
+            )));
+        }
 
-        let tags_checker = if options.tags {
-            Some(TagChecker::new(metadata_store.clone(), options.dry_run))
-        } else {
-            None
-        };
+        if options.tags {
+            namespace_checkers.push(Box::new(TagChecker::new(
+                metadata_store.clone(),
+                options.dry_run,
+            )));
+        }
 
-        let revisions = if options.manifests {
-            Some(ManifestChecker::new(
+        if options.manifests {
+            namespace_checkers.push(Box::new(ManifestChecker::new(
                 blob_store.clone(),
                 metadata_store.clone(),
                 options.dry_run,
-            ))
-        } else {
-            None
-        };
+            )));
+        }
+
+        if options.links {
+            namespace_checkers.push(Box::new(LinkReferencesChecker::new(
+                blob_store.clone(),
+                metadata_store.clone(),
+                options.dry_run,
+            )));
+        }
+
+        if options.media_types {
+            namespace_checkers.push(Box::new(MediaTypeChecker::new(
+                blob_store.clone(),
+                metadata_store.clone(),
+                options.dry_run,
+            )));
+        }
 
         let blob_checker = if options.blobs {
             Some(BlobChecker::new(
-                blob_store.clone(),
+                blob_store,
                 metadata_store.clone(),
                 options.dry_run,
             ))
@@ -221,40 +229,15 @@ impl Command {
             None
         };
 
-        let link_references_checker = if options.links {
-            Some(LinkReferencesChecker::new(
-                blob_store.clone(),
-                metadata_store.clone(),
-                options.dry_run,
-            ))
-        } else {
-            None
-        };
-
-        let media_type_checker = if options.media_types {
-            Some(MediaTypeChecker::new(
-                blob_store,
-                metadata_store.clone(),
-                options.dry_run,
-            ))
-        } else {
-            None
-        };
-
         if options.dry_run {
             info!("Dry-run mode: no changes will be made to the storage");
         }
 
         Ok(Self {
             metadata_store,
-            retention_enforcer,
-            upload_checker,
-            tags_checker,
-            revisions,
+            namespace_checkers,
             blob_checker,
             multipart_checker,
-            link_references_checker,
-            media_type_checker,
         })
     }
 
@@ -276,28 +259,8 @@ impl Command {
                 })?;
 
         for namespace in namespaces {
-            if let Some(retention_enforcer) = &self.retention_enforcer {
-                let _ = retention_enforcer.check_namespace(&namespace).await;
-            }
-
-            if let Some(uploads_checker) = &self.upload_checker {
-                let _ = uploads_checker.check_namespace(&namespace).await;
-            }
-
-            if let Some(tags_checker) = &self.tags_checker {
-                let _ = tags_checker.check_namespace(&namespace).await;
-            }
-
-            if let Some(revisions_checker) = &self.revisions {
-                let _ = revisions_checker.check_namespace(&namespace).await;
-            }
-
-            if let Some(link_references_checker) = &self.link_references_checker {
-                let _ = link_references_checker.check_namespace(&namespace).await;
-            }
-
-            if let Some(media_type_checker) = &self.media_type_checker {
-                let _ = media_type_checker.check_namespace(&namespace).await;
+            for checker in &self.namespace_checkers {
+                let _ = checker.check_namespace(&namespace).await;
             }
         }
 
@@ -406,14 +369,10 @@ mod tests {
 
         assert!(command.is_ok());
         let cmd = command.unwrap();
-        assert!(cmd.upload_checker.is_some());
-        assert!(cmd.tags_checker.is_some());
-        assert!(cmd.revisions.is_some());
+        // retention, uploads, tags, manifests = 4 namespace checkers
+        assert_eq!(cmd.namespace_checkers.len(), 4);
         assert!(cmd.blob_checker.is_some());
-        assert!(cmd.retention_enforcer.is_some());
         assert!(cmd.multipart_checker.is_none());
-        assert!(cmd.link_references_checker.is_none());
-        assert!(cmd.media_type_checker.is_none());
     }
 
     #[tokio::test]

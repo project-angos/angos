@@ -1,9 +1,10 @@
 use std::sync::Arc;
 
+use async_trait::async_trait;
 use tracing::{debug, error};
 
 use crate::{
-    command::scrub::check::ensure_link,
+    command::scrub::check::{NamespaceChecker, ensure_link},
     registry::{
         Error,
         metadata_store::{MetadataStore, link_kind::LinkKind},
@@ -24,7 +25,28 @@ impl TagChecker {
         }
     }
 
-    pub async fn check_namespace(&self, namespace: &str) -> Result<(), Error> {
+    async fn repair_tag_digest_link(&self, namespace: &str, tag: &str) -> Result<(), Error> {
+        debug!("Checking digest link for tag '{namespace}:{tag}'");
+        let tag_metadata = self
+            .metadata_store
+            .read_link(namespace, &LinkKind::Tag(tag.to_string()), false)
+            .await?;
+
+        let digest_link = LinkKind::Digest(tag_metadata.target.clone());
+        ensure_link(
+            &self.metadata_store,
+            namespace,
+            &digest_link,
+            &tag_metadata.target,
+            self.dry_run,
+        )
+        .await
+    }
+}
+
+#[async_trait]
+impl NamespaceChecker for TagChecker {
+    async fn check_namespace(&self, namespace: &str) -> Result<(), Error> {
         debug!("Checking tags inconsistencies from namespace '{namespace}'");
 
         for_each_page(
@@ -42,24 +64,6 @@ impl TagChecker {
                 }
                 Ok(())
             },
-        )
-        .await
-    }
-
-    async fn repair_tag_digest_link(&self, namespace: &str, tag: &str) -> Result<(), Error> {
-        debug!("Checking digest link for tag '{namespace}:{tag}'");
-        let tag_metadata = self
-            .metadata_store
-            .read_link(namespace, &LinkKind::Tag(tag.to_string()), false)
-            .await?;
-
-        let digest_link = LinkKind::Digest(tag_metadata.target.clone());
-        ensure_link(
-            &self.metadata_store,
-            namespace,
-            &digest_link,
-            &tag_metadata.target,
-            self.dry_run,
         )
         .await
     }
