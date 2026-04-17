@@ -16,6 +16,8 @@ impl fmt::Display for Error {
     }
 }
 
+impl std::error::Error for Error {}
+
 impl From<RedisError> for Error {
     fn from(error: RedisError) -> Self {
         Error::Backend(error.to_string())

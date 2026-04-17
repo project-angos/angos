@@ -1,17 +1,19 @@
-use std::fmt::Display;
+use std::fmt;
 
 #[derive(Debug, PartialEq)]
 pub enum Error {
     InvalidFormat(String),
 }
 
-impl Display for Error {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Display for Error {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Error::InvalidFormat(s) => write!(f, "Invalid format: {s}"),
         }
     }
 }
+
+impl std::error::Error for Error {}
 
 impl From<serde_json::Error> for Error {
     fn from(e: serde_json::Error) -> Self {

@@ -17,6 +17,8 @@ impl fmt::Display for Error {
     }
 }
 
+impl std::error::Error for Error {}
+
 impl From<notify::Error> for Error {
     fn from(err: notify::Error) -> Self {
         let msg = format!("Watcher error: {err}");
