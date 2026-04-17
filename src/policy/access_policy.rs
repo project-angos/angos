@@ -20,8 +20,9 @@ use serde::Deserialize;
 use tracing::{debug, warn};
 
 use crate::{
+    cel,
     identity::{ClientIdentity, Route},
-    registry::{Error, cel},
+    registry::Error,
 };
 
 /// Configuration for access control policies.
