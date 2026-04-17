@@ -59,8 +59,8 @@ impl RetentionChecker {
         let tag_metadata = self.fetch_tag_metadata(namespace, &tag_names).await?;
         let (last_pushed, last_pulled) = Self::build_sorted_rankings(&tag_metadata);
 
-        self.delete_eligible_tags(namespace, &tag_metadata, &last_pushed, &last_pulled)
-            .await?;
+        let tags = self.get_deletable_tags(namespace, &tag_metadata, &last_pushed, &last_pulled);
+        self.delete_tags(namespace, &tags).await?;
 
         self.delete_orphan_manifests(namespace, &last_pushed, &last_pulled)
             .await
@@ -133,36 +133,37 @@ impl RetentionChecker {
         (last_pushed, last_pulled)
     }
 
-    async fn delete_eligible_tags(
+    fn get_deletable_tags<'a>(
         &self,
         namespace: &str,
-        tags: &[TagWithMetadata],
+        tags: &'a [TagWithMetadata],
         last_pushed: &[String],
         last_pulled: &[String],
-    ) -> Result<(), Error> {
-        let tags_to_delete: Vec<&str> = tags
-            .iter()
+    ) -> Vec<&'a str> {
+        tags.iter()
             .filter(|tag| {
                 !self
                     .should_retain_tag(namespace, tag, last_pushed, last_pulled)
                     .unwrap_or(true)
             })
             .map(|tag| tag.name.as_str())
-            .collect();
+            .collect()
+    }
 
+    async fn delete_tags(&self, namespace: &str, tags_to_delete: &[&str]) -> Result<(), Error> {
         if tags_to_delete.is_empty() {
             return Ok(());
         }
 
         if self.dry_run {
-            for tag in &tags_to_delete {
+            for tag in tags_to_delete {
                 info!("DRY RUN: would delete tag '{namespace}:{tag}' (policy)");
             }
             return Ok(());
         }
 
         let mut tx = self.metadata_store.begin_transaction(namespace);
-        for tag in &tags_to_delete {
+        for tag in tags_to_delete {
             info!("Deleting tag '{namespace}:{tag}' (policy)");
             tx.delete_link(&LinkKind::Tag((*tag).to_string()));
         }
