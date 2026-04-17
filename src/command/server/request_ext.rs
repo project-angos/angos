@@ -78,7 +78,7 @@ pub trait HeaderExt {
         let authorization = self.get_header(AUTHORIZATION)?;
         authorization
             .strip_prefix(BEARER_PREFIX)
-            .map(std::string::ToString::to_string)
+            .map(str::to_string)
     }
 
     fn basic_auth(&self) -> Option<(String, String)> {

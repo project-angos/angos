@@ -9,6 +9,7 @@ use crate::{
         Error,
         blob_store::BlobStore,
         metadata_store::{MetadataStore, link_kind::LinkKind},
+        pagination::for_each_page,
         parse_manifest_digests,
     },
 };
@@ -35,26 +36,25 @@ impl ManifestChecker {
     pub async fn check_namespace(&self, namespace: &str) -> Result<(), Error> {
         debug!("Checking manifest inconsistencies from namespace '{namespace}'");
 
-        let mut marker = None;
-        loop {
-            let (revisions, next_marker) = self
-                .metadata_store
-                .list_revisions(namespace, 100, marker)
-                .await?;
-
-            for revision in &revisions {
-                if let Err(e) = self.repair_manifest_links(namespace, revision).await {
-                    error!("Failed to check tag from '{namespace}' (revision '{revision}'): {e}");
+        for_each_page(
+            |marker| async move {
+                self.metadata_store
+                    .list_revisions(namespace, 100, marker)
+                    .await
+                    .map_err(Error::from)
+            },
+            |revisions| async move {
+                for revision in &revisions {
+                    if let Err(e) = self.repair_manifest_links(namespace, revision).await {
+                        error!(
+                            "Failed to check tag from '{namespace}' (revision '{revision}'): {e}"
+                        );
+                    }
                 }
-            }
-
-            if next_marker.is_none() {
-                break;
-            }
-            marker = next_marker;
-        }
-
-        Ok(())
+                Ok(())
+            },
+        )
+        .await
     }
 
     async fn repair_manifest_links(&self, namespace: &str, revision: &Digest) -> Result<(), Error> {

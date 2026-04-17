@@ -1,7 +1,6 @@
 use std::{
-    collections::{HashMap, HashSet, hash_map::RandomState},
+    collections::{HashMap, HashSet},
     future::Future,
-    hash::{BuildHasher, Hasher},
     io::ErrorKind,
     pin::Pin,
     sync::{
@@ -31,6 +30,7 @@ use crate::{
             LinkOperation, LockConfig, LockStrategy, MetadataStore,
             link_kind::LinkKind,
             lock::{self, LockBackend, MemoryBackend},
+            simple_jitter,
         },
         pagination, path_builder,
     },
@@ -626,15 +626,8 @@ impl Backend {
                         attempt,
                         "Blob index shard CAS conflict, retrying"
                     );
-                    let jitter_ms = {
-                        let max = 50u64.saturating_mul(1u64 << attempt.min(4));
-                        if max == 0 {
-                            0
-                        } else {
-                            RandomState::new().build_hasher().finish() % max
-                        }
-                    };
-                    tokio::time::sleep(Duration::from_millis(jitter_ms)).await;
+                    let max_ms = 50u64.saturating_mul(1u64 << attempt.min(4));
+                    tokio::time::sleep(Duration::from_millis(simple_jitter(max_ms))).await;
                 }
                 Err(e) => return Err(Error::StorageBackend(e.to_string())),
             }
@@ -1131,7 +1124,6 @@ impl Backend {
 
     /// Executes link operations under a distributed lock, returning pending
     /// blob index operations for CAS updates after the lock is released.
-    #[allow(clippy::too_many_lines)]
     async fn execute_locked_cas_updates(
         &self,
         namespace: &str,
@@ -1209,64 +1201,9 @@ impl Backend {
             return Err(Error::Lock("lock invalidated during operation".into()));
         }
 
-        let (pending_blob_ops, tracked_create_writes, non_tracked_create_writes) =
-            Self::build_create_ops(&creates, &mut link_cache);
-
-        join_all(
-            tracked_create_writes
-                .iter()
-                .chain(non_tracked_create_writes.iter())
-                .map(|(link, metadata)| async move {
-                    self.write_link_reference(namespace, link, metadata).await
-                }),
-        )
-        .await
-        .into_iter()
-        .collect::<Result<Vec<_>, _>>()?;
-
-        let (
-            pending_blob_ops,
-            tracked_delete_writes,
-            tracked_delete_removes,
-            non_tracked_delete_links,
-        ) = Self::build_delete_ops(&deletes, &mut link_cache, pending_blob_ops);
-
-        join_all(
-            tracked_delete_writes
-                .iter()
-                .map(|(link, metadata)| {
-                    let fut: Pin<Box<dyn Future<Output = Result<(), Error>> + Send + '_>> =
-                        Box::pin(self.write_link_reference(namespace, link, metadata));
-                    fut
-                })
-                .chain(
-                    tracked_delete_removes
-                        .iter()
-                        .chain(non_tracked_delete_links.iter())
-                        .map(|link| {
-                            let fut: Pin<Box<dyn Future<Output = Result<(), Error>> + Send + '_>> =
-                                Box::pin(self.delete_link_reference(namespace, link));
-                            fut
-                        }),
-                ),
-        )
-        .await
-        .into_iter()
-        .collect::<Result<Vec<_>, _>>()?;
-
-        for (link, metadata) in tracked_create_writes
-            .iter()
-            .chain(non_tracked_create_writes.iter())
-            .chain(tracked_delete_writes.iter())
-        {
-            self.cache_put(namespace, link, metadata).await;
-        }
-        for link in tracked_delete_removes
-            .iter()
-            .chain(non_tracked_delete_links.iter())
-        {
-            self.cache_invalidate(namespace, link).await;
-        }
+        let pending_blob_ops = self
+            .apply_link_operations(namespace, &creates, &deletes, &mut link_cache)
+            .await?;
 
         guard.release().await;
 
@@ -1419,79 +1356,18 @@ impl Backend {
                 continue;
             }
 
-            let (pending_blob_ops, tracked_create_writes, non_tracked_create_writes) =
-                Self::build_create_ops(&creates, &mut link_cache);
-
             if !guard.is_valid() {
                 guard.release().await;
                 return Err(Error::Lock("lock invalidated during operation".into()));
             }
 
-            join_all(
-                tracked_create_writes
-                    .iter()
-                    .chain(non_tracked_create_writes.iter())
-                    .map(|(link, metadata)| async move {
-                        self.write_link_reference(namespace, link, metadata).await
-                    }),
-            )
-            .await
-            .into_iter()
-            .collect::<Result<Vec<_>, _>>()?;
-
-            let (
-                pending_blob_ops,
-                tracked_delete_writes,
-                tracked_delete_removes,
-                non_tracked_delete_links,
-            ) = Self::build_delete_ops(&valid_deletes, &mut link_cache, pending_blob_ops);
+            let pending_blob_ops = self
+                .apply_link_operations(namespace, &creates, &valid_deletes, &mut link_cache)
+                .await?;
 
             if !guard.is_valid() {
                 guard.release().await;
                 return Err(Error::Lock("lock invalidated during operation".into()));
-            }
-
-            join_all(
-                tracked_delete_writes
-                    .iter()
-                    .map(|(link, metadata)| {
-                        let fut: Pin<Box<dyn Future<Output = Result<(), Error>> + Send + '_>> =
-                            Box::pin(self.write_link_reference(namespace, link, metadata));
-                        fut
-                    })
-                    .chain(
-                        tracked_delete_removes
-                            .iter()
-                            .chain(non_tracked_delete_links.iter())
-                            .map(|link| {
-                                let fut: Pin<
-                                    Box<dyn Future<Output = Result<(), Error>> + Send + '_>,
-                                > = Box::pin(self.delete_link_reference(namespace, link));
-                                fut
-                            }),
-                    ),
-            )
-            .await
-            .into_iter()
-            .collect::<Result<Vec<_>, _>>()?;
-
-            if !guard.is_valid() {
-                guard.release().await;
-                return Err(Error::Lock("lock invalidated during operation".into()));
-            }
-
-            for (link, metadata) in tracked_create_writes
-                .iter()
-                .chain(non_tracked_create_writes.iter())
-                .chain(tracked_delete_writes.iter())
-            {
-                self.cache_put(namespace, link, metadata).await;
-            }
-            for link in tracked_delete_removes
-                .iter()
-                .chain(non_tracked_delete_links.iter())
-            {
-                self.cache_invalidate(namespace, link).await;
             }
 
             // Blob index shard updates run under the lock (blob:{digest} keys
@@ -1520,6 +1396,78 @@ impl Backend {
 
             return Ok(());
         }
+    }
+
+    /// Executes the write+delete+cache-update sequence for a set of create and
+    /// delete link operations, returning the accumulated pending blob index
+    /// operations for the caller to apply.
+    async fn apply_link_operations(
+        &self,
+        namespace: &str,
+        creates: &[CreateOp],
+        deletes: &[(LinkKind, Digest, Option<Digest>)],
+        link_cache: &mut HashMap<LinkKind, LinkMetadata>,
+    ) -> Result<HashMap<Digest, Vec<BlobIndexOperation>>, Error> {
+        let (pending_blob_ops, tracked_create_writes, non_tracked_create_writes) =
+            Self::build_create_ops(creates, link_cache);
+
+        join_all(
+            tracked_create_writes
+                .iter()
+                .chain(non_tracked_create_writes.iter())
+                .map(|(link, metadata)| async move {
+                    self.write_link_reference(namespace, link, metadata).await
+                }),
+        )
+        .await
+        .into_iter()
+        .collect::<Result<Vec<_>, _>>()?;
+
+        let (
+            pending_blob_ops,
+            tracked_delete_writes,
+            tracked_delete_removes,
+            non_tracked_delete_links,
+        ) = Self::build_delete_ops(deletes, link_cache, pending_blob_ops);
+
+        join_all(
+            tracked_delete_writes
+                .iter()
+                .map(|(link, metadata)| {
+                    let fut: Pin<Box<dyn Future<Output = Result<(), Error>> + Send + '_>> =
+                        Box::pin(self.write_link_reference(namespace, link, metadata));
+                    fut
+                })
+                .chain(
+                    tracked_delete_removes
+                        .iter()
+                        .chain(non_tracked_delete_links.iter())
+                        .map(|link| {
+                            let fut: Pin<Box<dyn Future<Output = Result<(), Error>> + Send + '_>> =
+                                Box::pin(self.delete_link_reference(namespace, link));
+                            fut
+                        }),
+                ),
+        )
+        .await
+        .into_iter()
+        .collect::<Result<Vec<_>, _>>()?;
+
+        for (link, metadata) in tracked_create_writes
+            .iter()
+            .chain(non_tracked_create_writes.iter())
+            .chain(tracked_delete_writes.iter())
+        {
+            self.cache_put(namespace, link, metadata).await;
+        }
+        for link in tracked_delete_removes
+            .iter()
+            .chain(non_tracked_delete_links.iter())
+        {
+            self.cache_invalidate(namespace, link).await;
+        }
+
+        Ok(pending_blob_ops)
     }
 
     /// Builds blob index operations and link writes for create operations.
@@ -1890,15 +1838,8 @@ impl Backend {
                         namespace,
                         attempt, "Namespace registry shard CAS conflict, retrying"
                     );
-                    let jitter_ms = {
-                        let max = 50u64.saturating_mul(1u64 << attempt.min(4));
-                        if max == 0 {
-                            0
-                        } else {
-                            RandomState::new().build_hasher().finish() % max
-                        }
-                    };
-                    tokio::time::sleep(Duration::from_millis(jitter_ms)).await;
+                    let max_ms = 50u64.saturating_mul(1u64 << attempt.min(4));
+                    tokio::time::sleep(Duration::from_millis(simple_jitter(max_ms))).await;
                 }
                 Err(e) => return Err(Error::StorageBackend(e.to_string())),
             }

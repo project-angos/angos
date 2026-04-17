@@ -24,6 +24,10 @@ pub use error::Error;
 pub use manifest::parse_manifest_digests;
 pub use repository::Repository;
 
+pub const DOCKER_CONTENT_DIGEST: &str = "Docker-Content-Digest";
+pub const DOCKER_UPLOAD_UUID: &str = "Docker-Upload-UUID";
+pub const OCI_SUBJECT: &str = "OCI-Subject";
+
 pub use crate::policy::AccessPolicy;
 use crate::{
     cache,

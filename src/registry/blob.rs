@@ -12,14 +12,12 @@ use crate::{
     command::server::response_body::ResponseBody,
     oci::{Digest, Namespace},
     registry::{
-        Error, Registry, Repository,
+        DOCKER_CONTENT_DIGEST, Error, Registry, Repository,
         blob_store::{BlobStore, BoxedReader},
         metadata_store::{self, BlobIndexOperation, MetadataStoreExt, link_kind::LinkKind},
         task_queue,
     },
 };
-
-pub const DOCKER_CONTENT_DIGEST: &str = "Docker-Content-Digest";
 
 pub enum GetBlobResponse<R>
 where

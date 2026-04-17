@@ -5,7 +5,6 @@ use std::{
     time::{Duration, Instant},
 };
 
-use chrono::Utc;
 use http_body_util::Full;
 use hyper::{
     Method, Request, Response, StatusCode,
@@ -37,7 +36,7 @@ use crate::{
     },
     event_webhook::event::{Event, EventActor, EventKind},
     identity::{ClientIdentity, Route},
-    metrics_provider::{IN_FLIGHT_REQUESTS, METRICS_PROVIDER},
+    metrics_provider::{InFlightGuard, METRICS_PROVIDER},
     oci::{Digest, Namespace, Reference},
     registry::metadata_store::ConditionalCapabilities,
 };
@@ -64,11 +63,7 @@ pub async fn serve_request<S>(
     );
     pin!(conn);
 
-    IN_FLIGHT_REQUESTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    METRICS_PROVIDER.metric_http_request_in_flight.set(
-        i64::try_from(IN_FLIGHT_REQUESTS.load(std::sync::atomic::Ordering::Relaxed))
-            .unwrap_or(i64::MAX),
-    );
+    let _in_flight_guard = InFlightGuard::new();
 
     for (iter, sleep_duration) in timeouts.iter().enumerate() {
         debug!("iter = {iter} sleep_duration = {sleep_duration:?}");
@@ -91,12 +86,6 @@ pub async fn serve_request<S>(
             }
         }
     }
-
-    IN_FLIGHT_REQUESTS.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-    METRICS_PROVIDER.metric_http_request_in_flight.set(
-        i64::try_from(IN_FLIGHT_REQUESTS.load(std::sync::atomic::Ordering::Relaxed))
-            .unwrap_or(i64::MAX),
-    );
 }
 
 #[instrument(skip(context, request))]
@@ -341,17 +330,13 @@ async fn handle_put_upload(
         .handle_put_upload(namespace, uuid, &digest, content_length, body_stream)
         .await?;
 
-    let event = Event {
-        id: Uuid::new_v4(),
-        timestamp: Utc::now(),
-        kind: EventKind::BlobPush,
-        namespace: namespace.to_string(),
-        digest: Some(digest.to_string()),
-        reference: None,
-        tag: None,
-        actor: Some(EventActor::from(identity.clone())),
-        repository: repository_name_for(context, namespace),
-    };
+    let event = Event::new(
+        EventKind::BlobPush,
+        namespace.to_string(),
+        repository_name_for(context, namespace),
+    )
+    .digest(Some(digest.to_string()))
+    .actor(Some(EventActor::from(identity.clone())));
     context.dispatch_event(&event).await?;
 
     Ok(response)
@@ -420,14 +405,11 @@ async fn handle_get_manifest(
     _identity: &ClientIdentity,
 ) -> Result<Response<ResponseBody>, Error> {
     let mime_types = parts.accepted_content_types();
-    let is_tag_immutable = match &reference {
-        Reference::Tag(tag) => context.is_tag_immutable(namespace, tag.as_str()),
-        Reference::Digest(_) => false,
-    };
+    let is_immutable = context.is_reference_immutable(namespace, &reference);
 
     Ok(context
         .registry
-        .handle_get_manifest(namespace, reference, &mime_types, is_tag_immutable)
+        .handle_get_manifest(namespace, reference, &mime_types, is_immutable)
         .await?)
 }
 
@@ -439,14 +421,11 @@ async fn handle_head_manifest(
     _identity: &ClientIdentity,
 ) -> Result<Response<ResponseBody>, Error> {
     let mime_types = parts.accepted_content_types();
-    let is_tag_immutable = match &reference {
-        Reference::Tag(tag) => context.is_tag_immutable(namespace, tag.as_str()),
-        Reference::Digest(_) => false,
-    };
+    let is_immutable = context.is_reference_immutable(namespace, &reference);
 
     Ok(context
         .registry
-        .handle_head_manifest(namespace, reference, &mime_types, is_tag_immutable)
+        .handle_head_manifest(namespace, reference, &mime_types, is_immutable)
         .await?)
 }
 
@@ -478,31 +457,22 @@ async fn handle_put_manifest(
     let repository = repository_name_for(context, namespace);
     let actor = Some(EventActor::from(identity.clone()));
 
-    let manifest_event = Event {
-        id: Uuid::new_v4(),
-        timestamp: Utc::now(),
-        kind: EventKind::ManifestPush,
-        namespace: namespace.to_string(),
-        digest: digest.clone(),
-        reference: Some(reference.to_string()),
-        tag: None,
-        actor: actor.clone(),
-        repository: repository.clone(),
-    };
+    let manifest_event = Event::new(
+        EventKind::ManifestPush,
+        namespace.to_string(),
+        repository.clone(),
+    )
+    .digest(digest.clone())
+    .reference(Some(reference.to_string()))
+    .actor(actor.clone());
     context.dispatch_event(&manifest_event).await?;
 
     if let Reference::Tag(tag) = &reference {
-        let tag_event = Event {
-            id: Uuid::new_v4(),
-            timestamp: Utc::now(),
-            kind: EventKind::TagCreate,
-            namespace: namespace.to_string(),
-            digest,
-            reference: Some(reference.to_string()),
-            tag: Some(tag.clone()),
-            actor,
-            repository,
-        };
+        let tag_event = Event::new(EventKind::TagCreate, namespace.to_string(), repository)
+            .digest(digest)
+            .reference(Some(reference.to_string()))
+            .tag(Some(tag.clone()))
+            .actor(actor);
         context.dispatch_event(&tag_event).await?;
     }
 
@@ -528,31 +498,22 @@ async fn handle_delete_manifest(
         Reference::Tag(_) => None,
     };
 
-    let delete_event = Event {
-        id: Uuid::new_v4(),
-        timestamp: Utc::now(),
-        kind: EventKind::ManifestDelete,
-        namespace: namespace.to_string(),
-        digest: digest.clone(),
-        reference: Some(reference.to_string()),
-        tag: None,
-        actor: actor.clone(),
-        repository: repository.clone(),
-    };
+    let delete_event = Event::new(
+        EventKind::ManifestDelete,
+        namespace.to_string(),
+        repository.clone(),
+    )
+    .digest(digest.clone())
+    .reference(Some(reference.to_string()))
+    .actor(actor.clone());
     context.dispatch_event(&delete_event).await?;
 
     if let Reference::Tag(tag) = &reference {
-        let tag_event = Event {
-            id: Uuid::new_v4(),
-            timestamp: Utc::now(),
-            kind: EventKind::TagDelete,
-            namespace: namespace.to_string(),
-            digest,
-            reference: Some(reference.to_string()),
-            tag: Some(tag.clone()),
-            actor,
-            repository,
-        };
+        let tag_event = Event::new(EventKind::TagDelete, namespace.to_string(), repository)
+            .digest(digest)
+            .reference(Some(reference.to_string()))
+            .tag(Some(tag.clone()))
+            .actor(actor);
         context.dispatch_event(&tag_event).await?;
     }
 

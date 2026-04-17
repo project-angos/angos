@@ -4,9 +4,10 @@ mod chunked_reader;
 pub mod tests;
 
 use std::{
-    fmt::{Debug, Formatter},
-    io::Cursor,
+    fmt::{self, Debug, Formatter},
+    io::{self, Cursor},
     sync::Arc,
+    time::Duration as StdDuration,
 };
 
 use async_trait::async_trait;
@@ -46,7 +47,7 @@ pub struct Backend {
 }
 
 impl Debug for Backend {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         f.debug_struct("Backend").finish()
     }
 }
@@ -163,7 +164,7 @@ impl Backend {
         let key = path_builder::upload_staged_container_path(namespace, upload_id, offset);
         match self.store.get_object_body(&key, None).await {
             Ok(data) => Ok(data),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Vec::new()),
             Err(e) => Err(e.into()),
         }
     }
@@ -319,27 +320,6 @@ impl Backend {
         };
         self.cache_upload_state(name, uuid, &state).await;
         Ok(state)
-    }
-
-    #[instrument(skip(self))]
-    async fn read_upload_summary_uniform(
-        &self,
-        name: &str,
-        uuid: &str,
-    ) -> Result<(Digest, u64, DateTime<Utc>), Error> {
-        let state = self.get_upload_state_uniform(name, uuid).await?;
-        let size = state.size;
-
-        let digest = self.load_hasher(name, uuid, size).await?.digest();
-
-        let date_path = path_builder::upload_start_date_path(name, uuid);
-        let date_bytes = self.store.get_object_body(&date_path, None).await?;
-        let date_str = String::from_utf8_lossy(&date_bytes);
-        let start_date = DateTime::parse_from_rfc3339(&date_str)
-            .unwrap_or_else(|_| Utc::now().fixed_offset())
-            .with_timezone(&Utc);
-
-        Ok((digest, size, start_date))
     }
 
     #[instrument(skip(self))]
@@ -611,27 +591,6 @@ impl Backend {
     }
 
     #[instrument(skip(self))]
-    async fn read_upload_summary_nonuniform(
-        &self,
-        name: &str,
-        uuid: &str,
-    ) -> Result<(Digest, u64, DateTime<Utc>), Error> {
-        let state = self.get_upload_state_nonuniform(name, uuid).await?;
-        let size = state.size;
-
-        let digest = self.load_hasher(name, uuid, size).await?.digest();
-
-        let date_path = path_builder::upload_start_date_path(name, uuid);
-        let date_bytes = self.store.get_object_body(&date_path, None).await?;
-        let date_str = String::from_utf8_lossy(&date_bytes);
-        let start_date = DateTime::parse_from_rfc3339(&date_str)
-            .unwrap_or_else(|_| Utc::now().fixed_offset())
-            .with_timezone(&Utc);
-
-        Ok((digest, size, start_date))
-    }
-
-    #[instrument(skip(self))]
     async fn complete_upload_nonuniform(
         &self,
         name: &str,
@@ -704,6 +663,23 @@ impl Backend {
         self.store.delete_prefix(&container).await?;
 
         Ok(digest)
+    }
+
+    async fn build_upload_summary(
+        &self,
+        name: &str,
+        uuid: &str,
+        state: &UploadState,
+    ) -> Result<(Digest, u64, DateTime<Utc>), Error> {
+        let size = state.size;
+        let digest = self.load_hasher(name, uuid, size).await?.digest();
+        let date_path = path_builder::upload_start_date_path(name, uuid);
+        let date_bytes = self.store.get_object_body(&date_path, None).await?;
+        let date_str = String::from_utf8_lossy(&date_bytes);
+        let start_date = DateTime::parse_from_rfc3339(&date_str)
+            .unwrap_or_else(|_| Utc::now().fixed_offset())
+            .with_timezone(&Utc);
+        Ok((digest, size, start_date))
     }
 }
 
@@ -825,11 +801,12 @@ impl BlobStore for Backend {
         name: &str,
         uuid: &str,
     ) -> Result<(Digest, u64, DateTime<Utc>), Error> {
-        if self.uniform_parts {
-            self.read_upload_summary_uniform(name, uuid).await
+        let state = if self.uniform_parts {
+            self.get_upload_state_uniform(name, uuid).await?
         } else {
-            self.read_upload_summary_nonuniform(name, uuid).await
-        }
+            self.get_upload_state_nonuniform(name, uuid).await?
+        };
+        self.build_upload_summary(name, uuid, &state).await
     }
 
     #[instrument(skip(self))]
@@ -883,7 +860,7 @@ impl BlobStore for Backend {
         let path = path_builder::blob_path(digest);
         match self.store.object_size(&path).await {
             Ok(size) => Ok(size),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(Error::BlobNotFound),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Err(Error::BlobNotFound),
             Err(e) => Err(e.into()),
         }
     }
@@ -900,7 +877,7 @@ impl BlobStore for Backend {
             .get_object(&path, start_offset)
             .await
             .map_err(|e| {
-                if e.kind() == std::io::ErrorKind::NotFound {
+                if e.kind() == io::ErrorKind::NotFound {
                     Error::BlobNotFound
                 } else {
                     e.into()
@@ -926,7 +903,7 @@ impl BlobStore for Backend {
         let path = path_builder::blob_path(digest);
         let url = self
             .store
-            .generate_presigned_url(&path, std::time::Duration::from_secs(1800), content_type)
+            .generate_presigned_url(&path, StdDuration::from_secs(1800), content_type)
             .await?;
         Ok(Some(url))
     }

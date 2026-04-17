@@ -315,47 +315,35 @@ impl MetadataStore for Backend {
         digest: &Digest,
         operation: BlobIndexOperation,
     ) -> Result<(), Error> {
-        debug!("Ensuring container directory for digest: {digest}");
-
-        debug!("Updating reference count for digest: {digest}");
         let path = path_builder::blob_index_path(digest);
 
-        let mut reference_index = match self.store.read_to_string(&path).await.map_err(Error::from)
-        {
+        let mut blob_index = match self.store.read_to_string(&path).await.map_err(Error::from) {
             Ok(content) => serde_json::from_str::<BlobIndex>(&content)?,
             Err(Error::ReferenceNotFound) => BlobIndex::default(),
             Err(e) => Err(e)?,
         };
 
-        debug!("Updating reference index");
-        let mut index = reference_index
-            .namespace
-            .remove(namespace)
-            .unwrap_or_default();
+        let mut ns_links = blob_index.namespace.remove(namespace).unwrap_or_default();
         match operation {
             BlobIndexOperation::Insert(link) => {
-                index.insert(link);
+                ns_links.insert(link);
             }
             BlobIndexOperation::Remove(link) => {
-                index.remove(&link);
+                ns_links.remove(&link);
             }
         }
-        if !index.is_empty() {
-            reference_index
-                .namespace
-                .insert(namespace.to_string(), index);
+        if !ns_links.is_empty() {
+            blob_index.namespace.insert(namespace.to_string(), ns_links);
         }
 
-        if reference_index.namespace.is_empty() {
+        if blob_index.namespace.is_empty() {
             debug!("Deleting no longer referenced Blob: {digest}");
-            let path = path_builder::blob_container_dir(digest);
-            self.store.delete_dir(&path).await?;
-            let _ = self.store.delete_empty_parent_dirs(&path).await;
+            let container = path_builder::blob_container_dir(digest);
+            self.store.delete_dir(&container).await?;
+            let _ = self.store.delete_empty_parent_dirs(&container).await;
         } else {
-            debug!("Writing reference count to path: {path}");
-            let content = serde_json::to_string(&reference_index)?;
+            let content = serde_json::to_string(&blob_index)?;
             self.store.write(&path, content.as_bytes()).await?;
-            debug!("Reference index for {digest} updated");
         }
 
         Ok(())
@@ -662,34 +650,9 @@ impl MetadataStore for Backend {
             // pending_blob_ops HashMap. Cross-call updates to the same digest are serialized
             // by the `blob:{digest}` lock key acquired above.
             for (digest, ops) in &pending_blob_ops {
-                let path = path_builder::blob_index_path(digest);
-                let mut blob_index =
-                    match self.store.read_to_string(&path).await.map_err(Error::from) {
-                        Ok(content) => serde_json::from_str::<BlobIndex>(&content)?,
-                        Err(Error::ReferenceNotFound) => BlobIndex::default(),
-                        Err(e) => Err(e)?,
-                    };
-                let mut ns_links = blob_index.namespace.remove(namespace).unwrap_or_default();
                 for op in ops {
-                    match op {
-                        BlobIndexOperation::Insert(link) => {
-                            ns_links.insert(link.clone());
-                        }
-                        BlobIndexOperation::Remove(link) => {
-                            ns_links.remove(link);
-                        }
-                    }
-                }
-                if !ns_links.is_empty() {
-                    blob_index.namespace.insert(namespace.to_string(), ns_links);
-                }
-                if blob_index.namespace.is_empty() {
-                    let container = path_builder::blob_container_dir(digest);
-                    self.store.delete_dir(&container).await?;
-                    let _ = self.store.delete_empty_parent_dirs(&container).await;
-                } else {
-                    let content = serde_json::to_string(&blob_index)?;
-                    self.store.write(&path, content.as_bytes()).await?;
+                    self.update_blob_index(namespace, digest, op.clone())
+                        .await?;
                 }
             }
 

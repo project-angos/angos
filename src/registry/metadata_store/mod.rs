@@ -1,7 +1,8 @@
 mod error;
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, hash_map::RandomState},
+    hash::{BuildHasher, Hasher},
     sync::Arc,
 };
 
@@ -23,6 +24,13 @@ pub use link_metadata::LinkMetadata;
 pub use lock::{LockStrategy, redis::LockConfig};
 
 use crate::registry::metadata_store::link_kind::LinkKind;
+
+pub fn simple_jitter(max_ms: u64) -> u64 {
+    if max_ms == 0 {
+        return 0;
+    }
+    RandomState::new().build_hasher().finish() % max_ms
+}
 
 /// Granular S3 conditional operation capabilities.
 ///

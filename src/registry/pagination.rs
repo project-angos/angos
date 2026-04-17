@@ -1,3 +1,51 @@
+/// Iterates through all pages from a paginated source, calling `process` for each page of items.
+///
+/// `fetch` receives the current continuation token and returns the next page plus an optional
+/// next token. When the token is `None`, iteration stops.
+pub async fn for_each_page<T, E, Fetch, FetchFut, Process, ProcessFut>(
+    mut fetch: Fetch,
+    mut process: Process,
+) -> Result<(), E>
+where
+    Fetch: FnMut(Option<String>) -> FetchFut,
+    FetchFut: std::future::Future<Output = Result<(Vec<T>, Option<String>), E>>,
+    Process: FnMut(Vec<T>) -> ProcessFut,
+    ProcessFut: std::future::Future<Output = Result<(), E>>,
+{
+    let mut marker = None;
+    loop {
+        let (items, next_marker) = fetch(marker).await?;
+        process(items).await?;
+        if next_marker.is_none() {
+            break;
+        }
+        marker = next_marker;
+    }
+    Ok(())
+}
+
+/// Collects all items from a paginated source into a single `Vec`.
+///
+/// `fetch` receives the current continuation token and returns the next page plus an optional
+/// next token. When the token is `None`, iteration stops.
+pub async fn collect_all_pages<T, E, Fetch, FetchFut>(mut fetch: Fetch) -> Result<Vec<T>, E>
+where
+    Fetch: FnMut(Option<String>) -> FetchFut,
+    FetchFut: std::future::Future<Output = Result<(Vec<T>, Option<String>), E>>,
+{
+    let mut all = Vec::new();
+    let mut marker = None;
+    loop {
+        let (items, next_marker) = fetch(marker).await?;
+        all.extend(items);
+        if next_marker.is_none() {
+            break;
+        }
+        marker = next_marker;
+    }
+    Ok(all)
+}
+
 pub fn paginate<T: Clone + ToString>(
     items: &[T],
     n: u16,

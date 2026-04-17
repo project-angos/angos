@@ -2,6 +2,7 @@ use futures_util::StreamExt;
 use hyper::{
     Response, StatusCode,
     header::{CONTENT_LENGTH, CONTENT_TYPE, LOCATION},
+    http::response,
 };
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tracing::{error, instrument, warn};
@@ -10,13 +11,20 @@ use crate::{
     command::server::response_body::ResponseBody,
     oci::{Digest, Manifest, Namespace, Reference},
     registry::{
-        Error, Registry, Repository,
+        DOCKER_CONTENT_DIGEST, Error, OCI_SUBJECT, Registry, Repository,
         metadata_store::{MetadataStoreExt, link_kind::LinkKind},
     },
 };
 
-pub const OCI_SUBJECT: &str = "OCI-Subject";
-pub const DOCKER_CONTENT_DIGEST: &str = "Docker-Content-Digest";
+fn manifest_response_builder(digest: &Digest, media_type: Option<&str>) -> response::Builder {
+    let mut builder = Response::builder()
+        .status(StatusCode::OK)
+        .header(DOCKER_CONTENT_DIGEST, digest.to_string());
+    if let Some(media_type) = media_type {
+        builder = builder.header(CONTENT_TYPE, media_type);
+    }
+    builder
+}
 
 pub struct GetManifestResponse {
     pub media_type: Option<String>,
@@ -42,15 +50,10 @@ pub struct ParsedManifestDigests {
     pub manifests: Vec<Digest>,
 }
 
-pub fn parse_manifest_digests(
-    body: &[u8],
+fn validate_media_type_match(
+    manifest: &Manifest,
     content_type: Option<&String>,
-) -> Result<ParsedManifestDigests, Error> {
-    let manifest: Manifest = serde_json::from_slice(body).map_err(|e| {
-        warn!("Failed to deserialize manifest: {e}");
-        Error::ManifestInvalid(format!("invalid manifest JSON: {e}"))
-    })?;
-
+) -> Result<(), Error> {
     if content_type.is_some()
         && manifest.media_type.is_some()
         && manifest.media_type.as_ref() != content_type
@@ -63,6 +66,19 @@ pub fn parse_manifest_digests(
             "Expected manifest media type mismatch".to_string(),
         ));
     }
+    Ok(())
+}
+
+pub fn parse_manifest_digests(
+    body: &[u8],
+    content_type: Option<&String>,
+) -> Result<ParsedManifestDigests, Error> {
+    let manifest: Manifest = serde_json::from_slice(body).map_err(|e| {
+        warn!("Failed to deserialize manifest: {e}");
+        Error::ManifestInvalid(format!("invalid manifest JSON: {e}"))
+    })?;
+
+    validate_media_type_match(&manifest, content_type)?;
 
     let subject = manifest.subject.map(|subject| subject.digest);
 
@@ -98,31 +114,31 @@ impl Registry {
         reference: Reference,
         is_tag_immutable: bool,
     ) -> Result<HeadManifestResponse, Error> {
-        let manifest = self.head_local_manifest(namespace, &reference).await;
+        let local = self.head_local_manifest(namespace, &reference).await;
+
         if !repository.is_pull_through() {
-            return manifest.map_err(|_| {
+            return local.map_err(|_| {
                 error!("Failed to head local manifest: {namespace}:{reference}");
                 Error::ManifestUnknown
             });
         }
 
-        if let Ok(manifest) = manifest {
-            if let Reference::Tag(_tag) = &reference {
-                if is_tag_immutable {
-                    return Ok(manifest);
-                }
-                let (_, digest, _) = repository
-                    .head_manifest(accepted_types, namespace, &reference)
+        if let Ok(manifest) = local {
+            let needs_upstream_pull = matches!(&reference, Reference::Tag(_))
+                && !is_tag_immutable
+                && !repository
+                    .is_upstream_digest_match(
+                        accepted_types,
+                        namespace,
+                        &reference,
+                        &manifest.digest,
+                    )
                     .await?;
-                if digest == manifest.digest {
-                    return Ok(manifest);
-                }
-            } else {
+
+            if !needs_upstream_pull {
                 return Ok(manifest);
             }
         }
-
-        // pull from upstream
 
         let res = self
             .get_manifest(
@@ -202,31 +218,31 @@ impl Registry {
         reference: Reference,
         is_tag_immutable: bool,
     ) -> Result<GetManifestResponse, Error> {
-        let manifest = self.get_local_manifest(namespace, &reference).await;
+        let local = self.get_local_manifest(namespace, &reference).await;
+
         if !repository.is_pull_through() {
-            return manifest.map_err(|_| {
+            return local.map_err(|_| {
                 error!("Failed to get local manifest: {namespace}:{reference}");
                 Error::ManifestUnknown
             });
         }
 
-        if let Ok(manifest) = manifest {
-            if let Reference::Tag(_tag) = &reference {
-                if is_tag_immutable {
-                    return Ok(manifest);
-                }
-                let (_, digest, _) = repository
-                    .head_manifest(accepted_types, namespace, &reference)
+        if let Ok(manifest) = local {
+            let needs_upstream_pull = matches!(&reference, Reference::Tag(_))
+                && !is_tag_immutable
+                && !repository
+                    .is_upstream_digest_match(
+                        accepted_types,
+                        namespace,
+                        &reference,
+                        &manifest.digest,
+                    )
                     .await?;
-                if digest == manifest.digest {
-                    return Ok(manifest);
-                }
-            } else {
+
+            if !needs_upstream_pull {
                 return Ok(manifest);
             }
         }
-
-        // pull from upstream
 
         let (media_type, digest, content) = repository
             .get_manifest(accepted_types, namespace, &reference)
@@ -279,18 +295,7 @@ impl Registry {
             Error::ManifestInvalid(format!("invalid manifest JSON: {e}"))
         })?;
 
-        if content_type.is_some()
-            && manifest.media_type.is_some()
-            && manifest.media_type.as_ref() != content_type
-        {
-            warn!(
-                "Manifest media type mismatch: {content_type:?} (expected) != {:?} (found)",
-                manifest.media_type
-            );
-            return Err(Error::ManifestInvalid(
-                "Expected manifest media type mismatch".to_string(),
-            ));
-        }
+        validate_media_type_match(&manifest, content_type)?;
 
         let digest = self.blob_store.create_blob(body).await?;
 
@@ -478,20 +483,9 @@ impl Registry {
             )
             .await?;
 
-        let res = if let Some(media_type) = manifest.media_type {
-            Response::builder()
-                .status(StatusCode::OK)
-                .header(CONTENT_TYPE, media_type)
-                .header(DOCKER_CONTENT_DIGEST, manifest.digest.to_string())
-                .header(CONTENT_LENGTH, manifest.size)
-                .body(ResponseBody::empty())?
-        } else {
-            Response::builder()
-                .status(StatusCode::OK)
-                .header(DOCKER_CONTENT_DIGEST, manifest.digest.to_string())
-                .header(CONTENT_LENGTH, manifest.size)
-                .body(ResponseBody::empty())?
-        };
+        let res = manifest_response_builder(&manifest.digest, manifest.media_type.as_deref())
+            .header(CONTENT_LENGTH, manifest.size)
+            .body(ResponseBody::empty())?;
 
         Ok(res)
     }
@@ -574,18 +568,8 @@ impl Registry {
             return builder.body(ResponseBody::empty()).map_err(Into::into);
         }
 
-        let res = if let Some(content_type) = manifest.media_type {
-            Response::builder()
-                .status(StatusCode::OK)
-                .header(CONTENT_TYPE, content_type)
-                .header(DOCKER_CONTENT_DIGEST, manifest.digest.to_string())
-                .body(ResponseBody::fixed(manifest.content))?
-        } else {
-            Response::builder()
-                .status(StatusCode::OK)
-                .header(DOCKER_CONTENT_DIGEST, manifest.digest.to_string())
-                .body(ResponseBody::fixed(manifest.content))?
-        };
+        let res = manifest_response_builder(&manifest.digest, manifest.media_type.as_deref())
+            .body(ResponseBody::fixed(manifest.content))?;
 
         Ok(res)
     }

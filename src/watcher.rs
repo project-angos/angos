@@ -1,5 +1,6 @@
 use std::{
     collections::HashSet,
+    fs,
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -77,9 +78,8 @@ async fn watch_config_loop(
         _ => PathBuf::from("."),
     };
     let canonical_config_path =
-        std::fs::canonicalize(&config_path).unwrap_or_else(|_| config_path.clone());
-    let canonical_config_dir =
-        std::fs::canonicalize(&config_dir).unwrap_or_else(|_| config_dir.clone());
+        fs::canonicalize(&config_path).unwrap_or_else(|_| config_path.clone());
+    let canonical_config_dir = fs::canonicalize(&config_dir).unwrap_or_else(|_| config_dir.clone());
 
     loop {
         let tls_dirs = match Configuration::load(&config_path) {
@@ -91,7 +91,7 @@ async fn watch_config_loop(
         };
         let canonical_tls_dirs: HashSet<PathBuf> = tls_dirs
             .iter()
-            .map(|d| std::fs::canonicalize(d).unwrap_or_else(|_| d.clone()))
+            .map(|d| fs::canonicalize(d).unwrap_or_else(|_| d.clone()))
             .collect();
 
         let tx_clone = tx.clone();

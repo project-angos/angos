@@ -5,7 +5,7 @@ use tracing::instrument;
 
 use crate::{
     cache::Cache,
-    oci::{Digest, Reference},
+    oci::{Digest, Namespace, Reference},
     policy::{AccessPolicyConfig, RetentionPolicy, RetentionPolicyConfig},
     registry::{Error, blob_store::BoxedReader},
 };
@@ -40,6 +40,17 @@ pub struct Repository {
     pub immutable_tags_exclusions: Vec<String>,
 }
 
+macro_rules! try_upstreams {
+    ($self:expr, $fallback:expr, |$upstream:ident| $body:expr) => {{
+        for $upstream in &$self.upstreams {
+            if let Ok(result) = $body {
+                return Ok(result);
+            }
+        }
+        Err($fallback)
+    }};
+}
+
 impl Repository {
     pub fn new(name: &str, config: &Config, cache: &Arc<dyn Cache>) -> Result<Self, Error> {
         let mut upstreams = Vec::new();
@@ -62,6 +73,20 @@ impl Repository {
         !self.upstreams.is_empty()
     }
 
+    /// Checks whether the upstream still has the same digest for the given tag.
+    pub async fn is_upstream_digest_match(
+        &self,
+        accepted_types: &[String],
+        namespace: &Namespace,
+        reference: &Reference,
+        local_digest: &Digest,
+    ) -> Result<bool, Error> {
+        let (_, upstream_digest, _) = self
+            .head_manifest(accepted_types, namespace, reference)
+            .await?;
+        Ok(upstream_digest == *local_digest)
+    }
+
     #[instrument(skip(self))]
     pub async fn head_blob(
         &self,
@@ -69,16 +94,10 @@ impl Repository {
         namespace: &str,
         digest: &Digest,
     ) -> Result<(Digest, u64), Error> {
-        for upstream in &self.upstreams {
+        try_upstreams!(self, Error::BlobUnknown, |upstream| {
             let location = upstream.get_blob_path(&self.name, namespace, digest);
-            let response = upstream.head_blob(accepted_types, &location).await;
-
-            if response.is_ok() {
-                return response;
-            }
-        }
-
-        Err(Error::BlobUnknown)
+            upstream.head_blob(accepted_types, &location).await
+        })
     }
 
     #[instrument(skip(self))]
@@ -88,14 +107,10 @@ impl Repository {
         namespace: &str,
         digest: &Digest,
     ) -> Result<(u64, BoxedReader), Error> {
-        for upstream in &self.upstreams {
+        try_upstreams!(self, Error::BlobUnknown, |upstream| {
             let location = upstream.get_blob_path(&self.name, namespace, digest);
-            if let Ok(response) = upstream.get_blob(accepted_types, &location).await {
-                return Ok(response);
-            }
-        }
-
-        Err(Error::BlobUnknown)
+            upstream.get_blob(accepted_types, &location).await
+        })
     }
 
     #[instrument(skip(self))]
@@ -105,14 +120,10 @@ impl Repository {
         namespace: &str,
         reference: &Reference,
     ) -> Result<(Option<String>, Digest, u64), Error> {
-        for upstream in &self.upstreams {
+        try_upstreams!(self, Error::ManifestUnknown, |upstream| {
             let location = upstream.get_manifest_path(&self.name, namespace, reference);
-            if let Ok(response) = upstream.head_manifest(accepted_types, &location).await {
-                return Ok(response);
-            }
-        }
-
-        Err(Error::ManifestUnknown)
+            upstream.head_manifest(accepted_types, &location).await
+        })
     }
 
     #[instrument(skip(self))]
@@ -122,14 +133,10 @@ impl Repository {
         namespace: &str,
         reference: &Reference,
     ) -> Result<(Option<String>, Digest, Vec<u8>), Error> {
-        for upstream in &self.upstreams {
+        try_upstreams!(self, Error::ManifestUnknown, |upstream| {
             let location = upstream.get_manifest_path(&self.name, namespace, reference);
-            if let Ok(response) = upstream.get_manifest(accepted_types, &location).await {
-                return Ok(response);
-            }
-        }
-
-        Err(Error::ManifestUnknown)
+            upstream.get_manifest(accepted_types, &location).await
+        })
     }
 }
 

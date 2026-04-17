@@ -27,6 +27,7 @@ use crate::{
         metadata_store::{
             Error,
             lock::{LockBackend, LockGuard},
+            simple_jitter,
         },
         path_builder,
     },
@@ -677,17 +678,6 @@ enum RecoveryOutcome {
     Retry,
     Failed,
     Error(String),
-}
-
-fn simple_jitter(max_ms: u64) -> u64 {
-    use std::hash::{BuildHasher, Hasher};
-    if max_ms == 0 {
-        return 0;
-    }
-    std::collections::hash_map::RandomState::new()
-        .build_hasher()
-        .finish()
-        % max_ms
 }
 
 #[cfg(test)]
