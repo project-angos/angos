@@ -9,10 +9,7 @@ impl Backend {
         format!("upload_id:{path}")
     }
 
-    pub async fn get_or_search_upload_id(
-        &self,
-        path: &str,
-    ) -> Result<Option<String>, Error> {
+    pub async fn get_or_search_upload_id(&self, path: &str) -> Result<Option<String>, Error> {
         if let Some(cache) = &self.cache
             && let Ok(Some(id)) = cache.retrieve_value(&Self::upload_id_cache_key(path)).await
         {
@@ -43,12 +40,7 @@ impl Backend {
         format!("upload_state:{namespace}:{uuid}")
     }
 
-    pub async fn cache_upload_state(
-        &self,
-        namespace: &str,
-        uuid: &str,
-        state: &UploadState,
-    ) {
+    pub async fn cache_upload_state(&self, namespace: &str, uuid: &str, state: &UploadState) {
         if let Some(cache) = &self.cache {
             let key = Self::upload_state_cache_key(namespace, uuid);
             let _ = cache.store(&key, state, 3600).await;

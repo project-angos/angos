@@ -57,12 +57,7 @@ impl Backend {
         Ok(())
     }
 
-    pub async fn load_hasher(
-        &self,
-        name: &str,
-        uuid: &str,
-        offset: u64,
-    ) -> Result<Sha256, Error> {
+    pub async fn load_hasher(&self, name: &str, uuid: &str, offset: u64) -> Result<Sha256, Error> {
         let hash_state_path = path_builder::upload_hash_context_path(name, uuid, "sha256", offset);
         let state = self.store.get_object_body(&hash_state_path, None).await?;
         Sha256::from_state(&state)
