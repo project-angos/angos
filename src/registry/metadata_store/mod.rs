@@ -68,8 +68,23 @@ pub enum BlobIndexOperation {
     Remove(LinkKind),
 }
 
+pub struct ResolvedCreate {
+    pub link: LinkKind,
+    pub target: Digest,
+    pub old_target: Option<Digest>,
+    pub referrer: Option<Digest>,
+    pub media_type: Option<String>,
+    pub descriptor: Option<Descriptor>,
+}
+
+pub struct ResolvedDelete {
+    pub link: LinkKind,
+    pub target: Digest,
+    pub referrer: Option<Digest>,
+}
+
 #[derive(Debug, Clone)]
-pub(crate) enum LinkOperation {
+pub enum LinkOperation {
     Create {
         link: LinkKind,
         target: Digest,

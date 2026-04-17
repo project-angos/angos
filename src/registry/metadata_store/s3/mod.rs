@@ -28,7 +28,7 @@ use crate::{
         data_store,
         metadata_store::{
             BlobIndex, BlobIndexOperation, ConditionalCapabilities, Error, LinkMetadata,
-            LinkOperation, LockStrategy, MetadataStore,
+            LinkOperation, LockStrategy, MetadataStore, ResolvedCreate, ResolvedDelete,
             link_kind::LinkKind,
             lock::{self, LockBackend, MemoryBackend},
             simple_jitter,
@@ -42,16 +42,6 @@ mod config;
 
 #[cfg(test)]
 mod tests;
-
-/// A single create operation tuple.
-type CreateOp = (
-    LinkKind,
-    Digest,
-    Option<Digest>,
-    Option<Digest>,
-    Option<String>,
-    Option<Descriptor>,
-);
 
 /// Return type of `build_create_ops`.
 type CreateOpsResult = (
@@ -960,8 +950,8 @@ impl Backend {
         .await;
 
         let mut link_cache: HashMap<LinkKind, LinkMetadata> = HashMap::new();
-        let mut creates: Vec<CreateOp> = Vec::new();
-        let mut deletes: Vec<(LinkKind, Digest, Option<Digest>)> = Vec::new();
+        let mut creates: Vec<ResolvedCreate> = Vec::new();
+        let mut deletes: Vec<ResolvedDelete> = Vec::new();
 
         for (op, metadata) in &read_results {
             match op {
@@ -976,19 +966,23 @@ impl Backend {
                     if let Some(m) = metadata {
                         link_cache.insert(link.clone(), m.clone());
                     }
-                    creates.push((
-                        link.clone(),
-                        target.clone(),
+                    creates.push(ResolvedCreate {
+                        link: link.clone(),
+                        target: target.clone(),
                         old_target,
-                        referrer.clone(),
-                        media_type.clone(),
-                        descriptor.as_ref().clone(),
-                    ));
+                        referrer: referrer.clone(),
+                        media_type: media_type.clone(),
+                        descriptor: descriptor.as_ref().clone(),
+                    });
                 }
                 LinkOperation::Delete { link, referrer } => {
                     if let Some(m) = metadata {
                         link_cache.insert(link.clone(), m.clone());
-                        deletes.push((link.clone(), m.target.clone(), referrer.clone()));
+                        deletes.push(ResolvedDelete {
+                            link: link.clone(),
+                            target: m.target.clone(),
+                            referrer: referrer.clone(),
+                        });
                     }
                 }
             }
@@ -1042,14 +1036,14 @@ impl Backend {
                             .map(|m| m.target);
                         (
                             op,
-                            Some((
-                                link.clone(),
-                                target.clone(),
+                            Some(ResolvedCreate {
+                                link: link.clone(),
+                                target: target.clone(),
                                 old_target,
-                                referrer.clone(),
-                                media_type.clone(),
-                                descriptor.as_ref().clone(),
-                            )),
+                                referrer: referrer.clone(),
+                                media_type: media_type.clone(),
+                                descriptor: descriptor.as_ref().clone(),
+                            }),
                             None,
                         )
                     }
@@ -1062,23 +1056,25 @@ impl Backend {
             .await;
 
             let mut lock_keys: Vec<String> = Vec::new();
-            let mut creates: Vec<CreateOp> = Vec::new();
-            let mut deletes: Vec<(LinkKind, Digest, Option<Digest>)> = Vec::new();
+            let mut creates: Vec<ResolvedCreate> = Vec::new();
+            let mut deletes: Vec<ResolvedDelete> = Vec::new();
 
             for (_, create_data, delete_data) in prelock_results {
-                if let Some((link, target, old_target, referrer, media_type, descriptor)) =
-                    create_data
-                {
-                    lock_keys.push(format!("{namespace}:{link}"));
-                    lock_keys.push(format!("blob:{target}"));
-                    if let Some(ref old) = old_target {
+                if let Some(op) = create_data {
+                    lock_keys.push(format!("{namespace}:{}", op.link));
+                    lock_keys.push(format!("blob:{}", op.target));
+                    if let Some(ref old) = op.old_target {
                         lock_keys.push(format!("blob:{old}"));
                     }
-                    creates.push((link, target, old_target, referrer, media_type, descriptor));
+                    creates.push(op);
                 } else if let Some((link, Some(meta), referrer)) = delete_data {
                     lock_keys.push(format!("{namespace}:{link}"));
                     lock_keys.push(format!("blob:{}", meta.target));
-                    deletes.push((link, meta.target, referrer));
+                    deletes.push(ResolvedDelete {
+                        link,
+                        target: meta.target,
+                        referrer,
+                    });
                 }
             }
 
@@ -1090,13 +1086,16 @@ impl Backend {
             lock_keys.dedup();
             let guard = self.lock.acquire(&lock_keys).await?;
 
-            let validation_results = join_all(creates.iter().map(
-                |(link, _, expected_old, _, _, _)| async move {
-                    let current = self.read_link_reference(namespace, link).await.ok();
-                    let current_target = current.as_ref().map(|m| m.target.clone());
-                    (link.clone(), current, current_target, expected_old.clone())
-                },
-            ))
+            let validation_results = join_all(creates.iter().map(|op| async move {
+                let current = self.read_link_reference(namespace, &op.link).await.ok();
+                let current_target = current.as_ref().map(|m| m.target.clone());
+                (
+                    op.link.clone(),
+                    current,
+                    current_target,
+                    op.old_target.clone(),
+                )
+            }))
             .await;
 
             if validation_results
@@ -1124,20 +1123,19 @@ impl Backend {
                 return Err(Error::Lock("lock invalidated during operation".into()));
             }
 
-            let delete_results =
-                join_all(deletes.iter().map(|(link, target, referrer)| async move {
-                    let result = self.read_link_reference(namespace, link).await;
-                    (link.clone(), target.clone(), referrer.clone(), result)
-                }))
-                .await;
+            let delete_results = join_all(deletes.into_iter().map(|op| async move {
+                let result = self.read_link_reference(namespace, &op.link).await;
+                (op, result)
+            }))
+            .await;
 
-            let mut valid_deletes = Vec::new();
+            let mut valid_deletes: Vec<ResolvedDelete> = Vec::new();
             let mut needs_retry = false;
-            for (link, target, referrer, result) in delete_results {
+            for (op, result) in delete_results {
                 match result {
-                    Ok(metadata) if metadata.target == target => {
-                        link_cache.insert(link.clone(), metadata);
-                        valid_deletes.push((link, target, referrer));
+                    Ok(metadata) if metadata.target == op.target => {
+                        link_cache.insert(op.link.clone(), metadata);
+                        valid_deletes.push(op);
                     }
                     Ok(_) => {
                         needs_retry = true;
@@ -1207,8 +1205,8 @@ impl Backend {
     async fn apply_link_operations(
         &self,
         namespace: &str,
-        creates: &[CreateOp],
-        deletes: &[(LinkKind, Digest, Option<Digest>)],
+        creates: &[ResolvedCreate],
+        deletes: &[ResolvedDelete],
         link_cache: &mut HashMap<LinkKind, LinkMetadata>,
     ) -> Result<HashMap<Digest, Vec<BlobIndexOperation>>, Error> {
         let (pending_blob_ops, tracked_create_writes, non_tracked_create_writes) =
@@ -1275,56 +1273,56 @@ impl Backend {
 
     /// Builds blob index operations and link writes for create operations.
     fn build_create_ops(
-        creates: &[CreateOp],
+        creates: &[ResolvedCreate],
         link_cache: &mut HashMap<LinkKind, LinkMetadata>,
     ) -> CreateOpsResult {
         let mut pending_blob_ops: HashMap<Digest, Vec<BlobIndexOperation>> = HashMap::new();
         let mut tracked_create_writes: Vec<(LinkKind, LinkMetadata)> = Vec::new();
         let mut non_tracked_create_writes: Vec<(LinkKind, LinkMetadata)> = Vec::new();
 
-        for (link, target, old_target, referrer, media_type, descriptor) in creates {
-            let is_tracked = link.is_tracked();
+        for op in creates {
+            let is_tracked = op.link.is_tracked();
 
-            if is_tracked && referrer.is_some() {
-                let mut metadata = link_cache.remove(link).unwrap_or_else(|| {
-                    LinkMetadata::from_digest(target.clone())
-                        .with_media_type(media_type.clone())
-                        .with_descriptor(descriptor.clone())
+            if is_tracked && op.referrer.is_some() {
+                let mut metadata = link_cache.remove(&op.link).unwrap_or_else(|| {
+                    LinkMetadata::from_digest(op.target.clone())
+                        .with_media_type(op.media_type.clone())
+                        .with_descriptor(op.descriptor.clone())
                 });
 
-                if let Some(manifest_digest) = referrer {
+                if let Some(manifest_digest) = &op.referrer {
                     metadata.add_referrer(manifest_digest.clone());
                 }
 
-                if old_target.is_none() {
+                if op.old_target.is_none() {
                     pending_blob_ops
-                        .entry(target.clone())
+                        .entry(op.target.clone())
                         .or_default()
-                        .push(BlobIndexOperation::Insert(link.clone()));
+                        .push(BlobIndexOperation::Insert(op.link.clone()));
                 }
 
-                tracked_create_writes.push((link.clone(), metadata));
+                tracked_create_writes.push((op.link.clone(), metadata));
             } else {
-                if old_target.as_ref() != Some(target) {
+                if op.old_target.as_ref() != Some(&op.target) {
                     pending_blob_ops
-                        .entry(target.clone())
+                        .entry(op.target.clone())
                         .or_default()
-                        .push(BlobIndexOperation::Insert(link.clone()));
-                    if let Some(old) = old_target
-                        && *old != *target
+                        .push(BlobIndexOperation::Insert(op.link.clone()));
+                    if let Some(old) = &op.old_target
+                        && *old != op.target
                     {
                         pending_blob_ops
                             .entry(old.clone())
                             .or_default()
-                            .push(BlobIndexOperation::Remove(link.clone()));
+                            .push(BlobIndexOperation::Remove(op.link.clone()));
                     }
                 }
 
                 non_tracked_create_writes.push((
-                    link.clone(),
-                    LinkMetadata::from_digest(target.clone())
-                        .with_media_type(media_type.clone())
-                        .with_descriptor(descriptor.clone()),
+                    op.link.clone(),
+                    LinkMetadata::from_digest(op.target.clone())
+                        .with_media_type(op.media_type.clone())
+                        .with_descriptor(op.descriptor.clone()),
                 ));
             }
         }
@@ -1338,7 +1336,7 @@ impl Backend {
 
     /// Builds blob index operations and link writes/deletes for delete operations.
     fn build_delete_ops(
-        deletes: &[(LinkKind, Digest, Option<Digest>)],
+        deletes: &[ResolvedDelete],
         link_cache: &mut HashMap<LinkKind, LinkMetadata>,
         mut pending_blob_ops: HashMap<Digest, Vec<BlobIndexOperation>>,
     ) -> DeleteOpsResult {
@@ -1346,31 +1344,31 @@ impl Backend {
         let mut tracked_delete_removes: Vec<LinkKind> = Vec::new();
         let mut non_tracked_delete_links: Vec<LinkKind> = Vec::new();
 
-        for (link, target, referrer) in deletes {
-            let is_tracked = link.is_tracked();
+        for op in deletes {
+            let is_tracked = op.link.is_tracked();
 
-            if is_tracked && referrer.is_some() {
-                if let Some(mut metadata) = link_cache.remove(link) {
-                    if let Some(manifest_digest) = referrer {
+            if is_tracked && op.referrer.is_some() {
+                if let Some(mut metadata) = link_cache.remove(&op.link) {
+                    if let Some(manifest_digest) = &op.referrer {
                         metadata.remove_referrer(manifest_digest);
                     }
 
                     if metadata.has_references() {
-                        tracked_delete_writes.push((link.clone(), metadata));
+                        tracked_delete_writes.push((op.link.clone(), metadata));
                     } else {
-                        tracked_delete_removes.push(link.clone());
+                        tracked_delete_removes.push(op.link.clone());
                         pending_blob_ops
-                            .entry(target.clone())
+                            .entry(op.target.clone())
                             .or_default()
-                            .push(BlobIndexOperation::Remove(link.clone()));
+                            .push(BlobIndexOperation::Remove(op.link.clone()));
                     }
                 }
             } else {
-                non_tracked_delete_links.push(link.clone());
+                non_tracked_delete_links.push(op.link.clone());
                 pending_blob_ops
-                    .entry(target.clone())
+                    .entry(op.target.clone())
                     .or_default()
-                    .push(BlobIndexOperation::Remove(link.clone()));
+                    .push(BlobIndexOperation::Remove(op.link.clone()));
             }
         }
 
