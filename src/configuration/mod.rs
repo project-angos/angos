@@ -164,13 +164,8 @@ pub struct TracingConfig {
 
 impl Configuration {
     pub fn load<P: AsRef<Path>>(path: P) -> Result<Self, Error> {
-        let config = match fs::read_to_string(path) {
-            Ok(config) => Ok(config),
-            Err(err) => Err(Error::NotReadable(format!(
-                "Unable to read configuration file: {err}"
-            ))),
-        }?;
-
+        let config = fs::read_to_string(path)
+            .map_err(|e| Error::NotReadable(format!("Unable to read configuration file: {e}")))?;
         Self::load_from_str(&config)
     }
 

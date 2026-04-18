@@ -6,7 +6,7 @@ use argon2::{
 };
 use base64::Engine;
 use chrono::Utc;
-use hyper::Request;
+use hyper::{Request, header::HeaderMap};
 use uuid::Uuid;
 use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};
 
@@ -1071,4 +1071,67 @@ async fn test_server_context_new_invalid_cache_config() {
     } else {
         panic!("Expected Initialization error");
     }
+}
+
+#[test]
+fn test_resolve_client_ip_single_ip() {
+    let mut headers = HeaderMap::new();
+    headers.insert("X-Forwarded-For", "192.168.1.100".parse().unwrap());
+    assert_eq!(
+        resolve_client_ip(&headers),
+        Some("192.168.1.100".to_string())
+    );
+}
+
+#[test]
+fn test_resolve_client_ip_comma_separated() {
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        "X-Forwarded-For",
+        "192.168.1.100, 10.0.0.1".parse().unwrap(),
+    );
+    assert_eq!(
+        resolve_client_ip(&headers),
+        Some("192.168.1.100".to_string())
+    );
+}
+
+#[test]
+fn test_resolve_client_ip_whitespace() {
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        "X-Forwarded-For",
+        "  192.168.1.100  , 10.0.0.1".parse().unwrap(),
+    );
+    assert_eq!(
+        resolve_client_ip(&headers),
+        Some("192.168.1.100".to_string())
+    );
+}
+
+#[test]
+fn test_resolve_client_ip_missing_header() {
+    let headers = HeaderMap::new();
+    assert_eq!(resolve_client_ip(&headers), None);
+}
+
+#[test]
+fn test_resolve_client_ip_x_real_ip_fallback() {
+    let mut headers = HeaderMap::new();
+    headers.insert("X-Real-IP", "192.168.1.200".parse().unwrap());
+    assert_eq!(
+        resolve_client_ip(&headers),
+        Some("192.168.1.200".to_string())
+    );
+}
+
+#[test]
+fn test_resolve_client_ip_x_forwarded_for_takes_precedence() {
+    let mut headers = HeaderMap::new();
+    headers.insert("X-Forwarded-For", "192.168.1.100".parse().unwrap());
+    headers.insert("X-Real-IP", "192.168.1.200".parse().unwrap());
+    assert_eq!(
+        resolve_client_ip(&headers),
+        Some("192.168.1.100".to_string())
+    );
 }

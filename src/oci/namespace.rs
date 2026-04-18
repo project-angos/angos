@@ -237,4 +237,94 @@ mod tests {
         assert_eq!(ns, s);
         assert_eq!(s, ns);
     }
+
+    #[test]
+    fn test_valid_single_char_letter() {
+        let ns = Namespace::new("a").unwrap();
+        assert_eq!(ns.as_ref(), "a");
+    }
+
+    #[test]
+    fn test_valid_single_char_digit() {
+        let ns = Namespace::new("0").unwrap();
+        assert_eq!(ns.as_ref(), "0");
+    }
+
+    #[test]
+    fn test_invalid_single_char_uppercase() {
+        assert!(Namespace::new("A").is_err());
+    }
+
+    #[test]
+    fn test_valid_long_namespace() {
+        let long = "a".repeat(10_000);
+        assert!(Namespace::new(long).is_ok());
+    }
+
+    #[test]
+    fn test_invalid_space() {
+        assert!(Namespace::new("hello world").is_err());
+    }
+
+    #[test]
+    fn test_invalid_at_symbol() {
+        assert!(Namespace::new("user@host").is_err());
+    }
+
+    #[test]
+    fn test_invalid_hash_symbol() {
+        assert!(Namespace::new("repo#1").is_err());
+    }
+
+    #[test]
+    fn test_invalid_leading_slash() {
+        assert!(Namespace::new("/repo").is_err());
+    }
+
+    #[test]
+    fn test_invalid_trailing_slash() {
+        assert!(Namespace::new("repo/").is_err());
+    }
+
+    #[test]
+    fn test_invalid_triple_slash() {
+        assert!(Namespace::new("a///b").is_err());
+    }
+
+    #[test]
+    fn test_invalid_unicode_accented() {
+        assert!(Namespace::new("café").is_err());
+    }
+
+    #[test]
+    fn test_invalid_unicode_cjk() {
+        assert!(Namespace::new("日本").is_err());
+    }
+
+    #[test]
+    fn test_try_from_str_ref() {
+        let ns = Namespace::try_from("valid-repo").unwrap();
+        assert_eq!(ns.as_ref(), "valid-repo");
+        assert!(Namespace::try_from("INVALID").is_err());
+    }
+
+    #[test]
+    fn test_try_from_string() {
+        let ns = Namespace::try_from("valid-repo".to_string()).unwrap();
+        assert_eq!(ns.as_ref(), "valid-repo");
+        assert!(Namespace::try_from("INVALID".to_string()).is_err());
+    }
+
+    #[test]
+    fn test_invalid_trailing_separator() {
+        assert!(Namespace::new("repo-").is_err());
+        assert!(Namespace::new("app.").is_err());
+    }
+
+    #[test]
+    fn test_invalid_segment_starts_with_separator() {
+        assert!(Namespace::new("a/-b").is_err());
+        assert!(Namespace::new("a/_b").is_err());
+        assert!(Namespace::new("a/.b").is_err());
+    }
 }

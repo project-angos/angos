@@ -47,7 +47,6 @@ pub struct Command {
     cached_capabilities: Arc<Mutex<Option<ConditionalCapabilities>>>,
 }
 
-// TODO: deduplicate!
 fn build_blob_store(
     config: &blob_store::BlobStorageConfig,
     cache: &Arc<dyn Cache>,
@@ -158,7 +157,6 @@ async fn build_registry(
 
 impl Command {
     pub async fn new(config: &Configuration) -> Result<Command, Error> {
-        // TODO: non-overlapping configuration subset (?) for each of those helpers
         let cached_capabilities = Arc::new(Mutex::new(None));
         let registry = build_registry(config, &cached_capabilities).await?;
         let context = ServerContext::new(config, registry)?;

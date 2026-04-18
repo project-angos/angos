@@ -284,7 +284,7 @@ impl MetadataStore for Backend {
         n: u16,
         continuation_token: Option<String>,
     ) -> Result<(Vec<Digest>, Option<String>), Error> {
-        let path = path_builder::manifest_revisions_link_root_dir(namespace, "sha256"); // HACK: hardcoded sha256
+        let path = path_builder::manifest_revisions_link_root_dir(namespace, "sha256");
 
         let all_revisions = self.store.list_dir(&path).await?;
         let mut revisions = Vec::new();

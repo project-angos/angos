@@ -225,6 +225,336 @@ mod tests {
     use super::*;
     use crate::oci::Digest;
 
+    const SHA256_EMPTY: &str =
+        "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+
+    fn ns() -> Namespace {
+        Namespace::new("test").unwrap()
+    }
+
+    fn digest() -> Digest {
+        Digest::from_str(SHA256_EMPTY).unwrap()
+    }
+
+    fn reference() -> Reference {
+        Reference::from_str("v1.0.0").unwrap()
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn test_is_push_all_variants() {
+        let cases: &[(Route<'_>, bool)] = &[
+            (Route::UiAsset { path: "/" }, false),
+            (Route::UiConfig, false),
+            (Route::Healthz, false),
+            (Route::Readyz, false),
+            (Route::Metrics, false),
+            (Route::ApiVersion, false),
+            (
+                Route::ListCatalog {
+                    n: None,
+                    last: None,
+                },
+                false,
+            ),
+            (
+                Route::ListTags {
+                    namespace: ns(),
+                    n: None,
+                    last: None,
+                },
+                false,
+            ),
+            (
+                Route::StartUpload {
+                    namespace: ns(),
+                    digest: None,
+                },
+                true,
+            ),
+            (
+                Route::GetUpload {
+                    namespace: ns(),
+                    uuid: Uuid::nil(),
+                },
+                false,
+            ),
+            (
+                Route::PatchUpload {
+                    namespace: ns(),
+                    uuid: Uuid::nil(),
+                },
+                true,
+            ),
+            (
+                Route::PutUpload {
+                    namespace: ns(),
+                    digest: digest(),
+                    uuid: Uuid::nil(),
+                },
+                true,
+            ),
+            (
+                Route::DeleteUpload {
+                    namespace: ns(),
+                    uuid: Uuid::nil(),
+                },
+                true,
+            ),
+            (
+                Route::GetBlob {
+                    namespace: ns(),
+                    digest: digest(),
+                },
+                false,
+            ),
+            (
+                Route::HeadBlob {
+                    namespace: ns(),
+                    digest: digest(),
+                },
+                false,
+            ),
+            (
+                Route::DeleteBlob {
+                    namespace: ns(),
+                    digest: digest(),
+                },
+                false,
+            ),
+            (
+                Route::GetManifest {
+                    namespace: ns(),
+                    reference: reference(),
+                },
+                false,
+            ),
+            (
+                Route::HeadManifest {
+                    namespace: ns(),
+                    reference: reference(),
+                },
+                false,
+            ),
+            (
+                Route::PutManifest {
+                    namespace: ns(),
+                    reference: reference(),
+                },
+                true,
+            ),
+            (
+                Route::DeleteManifest {
+                    namespace: ns(),
+                    reference: reference(),
+                },
+                false,
+            ),
+            (
+                Route::GetReferrer {
+                    namespace: ns(),
+                    digest: digest(),
+                    artifact_type: None,
+                },
+                false,
+            ),
+            (Route::ListRevisions { namespace: ns() }, false),
+            (Route::ListUploads { namespace: ns() }, false),
+            (Route::ListRepositories, false),
+            (Route::ListNamespaces { repository: "test" }, false),
+            (Route::Unknown, false),
+        ];
+
+        for (route, expected) in cases {
+            // The exhaustive match below is the compile-time enforcement mechanism.
+            // If a new variant is added without updating this test, it will not compile.
+            let expected_from_match = match route {
+                Route::StartUpload { .. }
+                | Route::PatchUpload { .. }
+                | Route::PutUpload { .. }
+                | Route::DeleteUpload { .. }
+                | Route::PutManifest { .. } => true,
+                Route::UiAsset { .. }
+                | Route::UiConfig
+                | Route::Healthz
+                | Route::Readyz
+                | Route::Metrics
+                | Route::ApiVersion
+                | Route::ListCatalog { .. }
+                | Route::ListTags { .. }
+                | Route::GetUpload { .. }
+                | Route::GetBlob { .. }
+                | Route::HeadBlob { .. }
+                | Route::DeleteBlob { .. }
+                | Route::GetManifest { .. }
+                | Route::HeadManifest { .. }
+                | Route::DeleteManifest { .. }
+                | Route::GetReferrer { .. }
+                | Route::ListRevisions { .. }
+                | Route::ListUploads { .. }
+                | Route::ListRepositories
+                | Route::ListNamespaces { .. }
+                | Route::Unknown => false,
+            };
+            assert_eq!(
+                expected_from_match, *expected,
+                "expected_from_match disagrees with table for {route:?}"
+            );
+            assert_eq!(route.is_push(), *expected, "is_push() wrong for {route:?}");
+        }
+    }
+
+    #[test]
+    fn test_get_digest_with_digest() {
+        let d = digest();
+
+        let route = Route::GetBlob {
+            namespace: ns(),
+            digest: d.clone(),
+        };
+        assert_eq!(route.get_digest(), Some(&d));
+
+        let route = Route::HeadBlob {
+            namespace: ns(),
+            digest: d.clone(),
+        };
+        assert_eq!(route.get_digest(), Some(&d));
+
+        let route = Route::DeleteBlob {
+            namespace: ns(),
+            digest: d.clone(),
+        };
+        assert_eq!(route.get_digest(), Some(&d));
+
+        let route = Route::GetReferrer {
+            namespace: ns(),
+            digest: d.clone(),
+            artifact_type: None,
+        };
+        assert_eq!(route.get_digest(), Some(&d));
+
+        let route = Route::PutUpload {
+            namespace: ns(),
+            digest: d.clone(),
+            uuid: Uuid::nil(),
+        };
+        assert_eq!(route.get_digest(), Some(&d));
+
+        let route = Route::StartUpload {
+            namespace: ns(),
+            digest: Some(d.clone()),
+        };
+        assert_eq!(route.get_digest(), Some(&d));
+    }
+
+    #[test]
+    fn test_get_digest_without_digest() {
+        let route = Route::StartUpload {
+            namespace: ns(),
+            digest: None,
+        };
+        assert_eq!(route.get_digest(), None);
+
+        assert_eq!(Route::ApiVersion.get_digest(), None);
+        assert_eq!(
+            Route::ListCatalog {
+                n: None,
+                last: None
+            }
+            .get_digest(),
+            None
+        );
+        assert_eq!(
+            Route::ListTags {
+                namespace: ns(),
+                n: None,
+                last: None
+            }
+            .get_digest(),
+            None
+        );
+        assert_eq!(
+            Route::GetManifest {
+                namespace: ns(),
+                reference: reference()
+            }
+            .get_digest(),
+            None
+        );
+        assert_eq!(Route::Unknown.get_digest(), None);
+    }
+
+    #[test]
+    fn test_get_reference_with_reference() {
+        let r = reference();
+
+        let route = Route::GetManifest {
+            namespace: ns(),
+            reference: r.clone(),
+        };
+        assert_eq!(
+            route.get_reference().map(Reference::as_str),
+            Some(r.as_str())
+        );
+
+        let route = Route::HeadManifest {
+            namespace: ns(),
+            reference: r.clone(),
+        };
+        assert_eq!(
+            route.get_reference().map(Reference::as_str),
+            Some(r.as_str())
+        );
+
+        let route = Route::PutManifest {
+            namespace: ns(),
+            reference: r.clone(),
+        };
+        assert_eq!(
+            route.get_reference().map(Reference::as_str),
+            Some(r.as_str())
+        );
+
+        let route = Route::DeleteManifest {
+            namespace: ns(),
+            reference: r.clone(),
+        };
+        assert_eq!(
+            route.get_reference().map(Reference::as_str),
+            Some(r.as_str())
+        );
+    }
+
+    #[test]
+    fn test_get_reference_without_reference() {
+        assert!(Route::ApiVersion.get_reference().is_none());
+        assert!(
+            Route::ListCatalog {
+                n: None,
+                last: None
+            }
+            .get_reference()
+            .is_none()
+        );
+        assert!(
+            Route::GetBlob {
+                namespace: ns(),
+                digest: digest()
+            }
+            .get_reference()
+            .is_none()
+        );
+        assert!(
+            Route::StartUpload {
+                namespace: ns(),
+                digest: None
+            }
+            .get_reference()
+            .is_none()
+        );
+        assert!(Route::Unknown.get_reference().is_none());
+    }
+
     #[test]
     fn test_serialization_compatibility() {
         // Test that the serialized format is consistent with the old ClientRequest
@@ -405,6 +735,8 @@ mod tests {
     fn test_all_actions_have_correct_names() {
         // Verify all action names match the expected format from ClientRequest
         let test_cases = vec![
+            (Route::UiAsset { path: "/" }, "ui-asset"),
+            (Route::UiConfig, "ui-config"),
             (Route::ApiVersion, "get-api-version"),
             (Route::Healthz, "healthz"),
             (Route::Readyz, "readyz"),
@@ -418,7 +750,7 @@ mod tests {
             ),
             (
                 Route::ListTags {
-                    namespace: Namespace::new("test").unwrap(),
+                    namespace: ns(),
                     n: None,
                     last: None,
                 },
@@ -426,117 +758,141 @@ mod tests {
             ),
             (
                 Route::StartUpload {
-                    namespace: Namespace::new("test").unwrap(),
+                    namespace: ns(),
                     digest: None,
                 },
                 "start-upload",
             ),
             (
                 Route::GetUpload {
-                    namespace: Namespace::new("test").unwrap(),
+                    namespace: ns(),
                     uuid: Uuid::nil(),
                 },
                 "get-upload",
             ),
             (
                 Route::PatchUpload {
-                    namespace: Namespace::new("test").unwrap(),
+                    namespace: ns(),
                     uuid: Uuid::nil(),
                 },
                 "update-upload",
             ),
             (
                 Route::PutUpload {
-                    namespace: Namespace::new("test").unwrap(),
+                    namespace: ns(),
                     uuid: Uuid::nil(),
-                    digest: Digest::from_str(
-                        "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-                    )
-                    .unwrap(),
+                    digest: digest(),
                 },
                 "complete-upload",
             ),
             (
                 Route::DeleteUpload {
-                    namespace: Namespace::new("test").unwrap(),
+                    namespace: ns(),
                     uuid: Uuid::nil(),
                 },
                 "cancel-upload",
             ),
             (
                 Route::GetBlob {
-                    namespace: Namespace::new("test").unwrap(),
-                    digest: Digest::from_str(
-                        "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-                    )
-                    .unwrap(),
+                    namespace: ns(),
+                    digest: digest(),
                 },
                 "get-blob",
             ),
             (
                 Route::HeadBlob {
-                    namespace: Namespace::new("test").unwrap(),
-                    digest: Digest::from_str(
-                        "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-                    )
-                    .unwrap(),
+                    namespace: ns(),
+                    digest: digest(),
                 },
                 "get-blob",
             ),
             (
                 Route::DeleteBlob {
-                    namespace: Namespace::new("test").unwrap(),
-                    digest: Digest::from_str(
-                        "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-                    )
-                    .unwrap(),
+                    namespace: ns(),
+                    digest: digest(),
                 },
                 "delete-blob",
             ),
             (
                 Route::GetManifest {
-                    namespace: Namespace::new("test").unwrap(),
-                    reference: Reference::from_str("v1.0.0").unwrap(),
+                    namespace: ns(),
+                    reference: reference(),
                 },
                 "get-manifest",
             ),
             (
                 Route::HeadManifest {
-                    namespace: Namespace::new("test").unwrap(),
-                    reference: Reference::from_str("v1.0.0").unwrap(),
+                    namespace: ns(),
+                    reference: reference(),
                 },
                 "get-manifest",
             ),
             (
                 Route::PutManifest {
-                    namespace: Namespace::new("test").unwrap(),
-                    reference: Reference::from_str("v1.0.0").unwrap(),
+                    namespace: ns(),
+                    reference: reference(),
                 },
                 "put-manifest",
             ),
             (
                 Route::DeleteManifest {
-                    namespace: Namespace::new("test").unwrap(),
-                    reference: Reference::from_str("v1.0.0").unwrap(),
+                    namespace: ns(),
+                    reference: reference(),
                 },
                 "delete-manifest",
             ),
             (
                 Route::GetReferrer {
-                    namespace: Namespace::new("test").unwrap(),
-                    digest: Digest::from_str(
-                        "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-                    )
-                    .unwrap(),
+                    namespace: ns(),
+                    digest: digest(),
                     artifact_type: None,
                 },
                 "get-referrers",
+            ),
+            (Route::ListRevisions { namespace: ns() }, "list-revisions"),
+            (Route::ListUploads { namespace: ns() }, "list-uploads"),
+            (Route::ListRepositories, "list-repositories"),
+            (
+                Route::ListNamespaces { repository: "test" },
+                "list-namespaces",
             ),
             (Route::Unknown, "unknown"),
         ];
 
         for (route, expected_action) in test_cases {
             let json = serde_json::to_value(&route).unwrap();
+            // The exhaustive match below is the compile-time enforcement mechanism.
+            // If a new variant is added without updating this test, it will not compile.
+            let expected_from_match: &str = match &route {
+                Route::UiAsset { .. } => "ui-asset",
+                Route::UiConfig => "ui-config",
+                Route::ApiVersion => "get-api-version",
+                Route::Healthz => "healthz",
+                Route::Readyz => "readyz",
+                Route::Metrics => "metrics",
+                Route::ListCatalog { .. } => "list-catalog",
+                Route::ListTags { .. } => "list-tags",
+                Route::StartUpload { .. } => "start-upload",
+                Route::GetUpload { .. } => "get-upload",
+                Route::PatchUpload { .. } => "update-upload",
+                Route::PutUpload { .. } => "complete-upload",
+                Route::DeleteUpload { .. } => "cancel-upload",
+                Route::GetBlob { .. } | Route::HeadBlob { .. } => "get-blob",
+                Route::DeleteBlob { .. } => "delete-blob",
+                Route::GetManifest { .. } | Route::HeadManifest { .. } => "get-manifest",
+                Route::PutManifest { .. } => "put-manifest",
+                Route::DeleteManifest { .. } => "delete-manifest",
+                Route::GetReferrer { .. } => "get-referrers",
+                Route::ListRevisions { .. } => "list-revisions",
+                Route::ListUploads { .. } => "list-uploads",
+                Route::ListRepositories => "list-repositories",
+                Route::ListNamespaces { .. } => "list-namespaces",
+                Route::Unknown => "unknown",
+            };
+            assert_eq!(
+                expected_from_match, expected_action,
+                "Action mismatch for {route:?}",
+            );
             assert_eq!(
                 json["action"], expected_action,
                 "Action mismatch for {route:?}",

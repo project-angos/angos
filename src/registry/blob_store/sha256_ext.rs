@@ -36,8 +36,8 @@ mod tests {
 
     use super::*;
 
-    #[tokio::test]
-    async fn test_hash_serialization() {
+    #[test]
+    fn test_hash_serialization() {
         let mut empty_state = Sha256::new();
         empty_state.update(b"hello world");
         let empty_state = empty_state.serialized_state();

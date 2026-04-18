@@ -3,8 +3,8 @@ use std::path::PathBuf;
 use super::*;
 use crate::{command::server::auth::oidc, registry::data_store};
 
-#[tokio::test]
-async fn test_load_minimal_config() {
+#[test]
+fn test_load_minimal_config() {
     let config = r#"
     [server]
     bind_address = "0.0.0.0"
@@ -34,8 +34,8 @@ async fn test_load_minimal_config() {
     assert!(config.observability.is_none());
 }
 
-#[tokio::test]
-async fn test_storage_field_backward_compatibility() {
+#[test]
+fn test_storage_field_backward_compatibility() {
     // Test that old 'storage' field is supported for backward compatibility
     let config = r#"
     [server]
@@ -58,8 +58,8 @@ async fn test_storage_field_backward_compatibility() {
     assert_eq!(config.metadata_store, None);
 }
 
-#[tokio::test]
-async fn test_tls_config_detection() {
+#[test]
+fn test_tls_config_detection() {
     let config = r#"
     [server]
     bind_address = "0.0.0.0"
@@ -89,8 +89,8 @@ async fn test_tls_config_detection() {
     }
 }
 
-#[tokio::test]
-async fn test_metadata_store_explicit_config_not_overridden() {
+#[test]
+fn test_metadata_store_explicit_config_not_overridden() {
     // When metadata store is explicitly configured, it should not be overridden
     let config = r#"
     [server]
@@ -118,8 +118,8 @@ async fn test_metadata_store_explicit_config_not_overridden() {
     }
 }
 
-#[tokio::test]
-async fn test_auth_section() {
+#[test]
+fn test_auth_section() {
     let config = r#"
     [server]
     bind_address = "0.0.0.0"
@@ -155,8 +155,8 @@ fn test_global_config_default() {
     assert!(config.authorization_webhook.is_none());
 }
 
-#[tokio::test]
-async fn test_global_config_custom_values() {
+#[test]
+fn test_global_config_custom_values() {
     let config = r#"
     [server]
     bind_address = "0.0.0.0"
@@ -188,8 +188,8 @@ async fn test_global_config_custom_values() {
     );
 }
 
-#[tokio::test]
-async fn test_ui_enabled_config() {
+#[test]
+fn test_ui_enabled_config() {
     let config = r#"
     [server]
     bind_address = "0.0.0.0"
@@ -202,8 +202,8 @@ async fn test_ui_enabled_config() {
     assert!(config.ui.enabled);
 }
 
-#[tokio::test]
-async fn test_ui_enabled_default_false() {
+#[test]
+fn test_ui_enabled_default_false() {
     let config = r#"
     [server]
     bind_address = "0.0.0.0"
@@ -214,8 +214,8 @@ async fn test_ui_enabled_default_false() {
     assert_eq!(config.ui.name, "Angos");
 }
 
-#[tokio::test]
-async fn test_ui_custom_name() {
+#[test]
+fn test_ui_custom_name() {
     let config = r#"
     [server]
     bind_address = "0.0.0.0"
@@ -230,8 +230,8 @@ async fn test_ui_custom_name() {
     assert_eq!(config.ui.name, "my-registry");
 }
 
-#[tokio::test]
-async fn test_resolve_metadata_config_from_fs_blob_store() {
+#[test]
+fn test_resolve_metadata_config_from_fs_blob_store() {
     let config = r#"
     [server]
     bind_address = "0.0.0.0"
@@ -259,8 +259,8 @@ async fn test_resolve_metadata_config_from_fs_blob_store() {
     }
 }
 
-#[tokio::test]
-async fn test_resolve_metadata_config_from_s3_blob_store() {
+#[test]
+fn test_resolve_metadata_config_from_s3_blob_store() {
     let config = r#"
     [server]
     bind_address = "0.0.0.0"
@@ -296,8 +296,8 @@ async fn test_resolve_metadata_config_from_s3_blob_store() {
     }
 }
 
-#[tokio::test]
-async fn test_repository_config() {
+#[test]
+fn test_repository_config() {
     let config = r#"
     [server]
     bind_address = "0.0.0.0"
@@ -317,8 +317,8 @@ async fn test_repository_config() {
     );
 }
 
-#[tokio::test]
-async fn test_observability_config() {
+#[test]
+fn test_observability_config() {
     let config = r#"
     [server]
     bind_address = "0.0.0.0"
@@ -337,8 +337,8 @@ async fn test_observability_config() {
     assert!((tracing.sampling_rate - 0.1).abs() < f64::EPSILON);
 }
 
-#[tokio::test]
-async fn test_cache_config_memory() {
+#[test]
+fn test_cache_config_memory() {
     let config = r#"
     [server]
     bind_address = "0.0.0.0"
@@ -351,8 +351,8 @@ async fn test_cache_config_memory() {
     assert!(matches!(config.cache, cache::Config::Memory));
 }
 
-#[tokio::test]
-async fn test_cache_config_redis() {
+#[test]
+fn test_cache_config_redis() {
     let config = r#"
     [server]
     bind_address = "0.0.0.0"
@@ -371,8 +371,8 @@ async fn test_cache_config_redis() {
     }
 }
 
-#[tokio::test]
-async fn test_cache_store_backward_compatibility() {
+#[test]
+fn test_cache_store_backward_compatibility() {
     let config = r#"
     [server]
     bind_address = "0.0.0.0"
@@ -391,8 +391,8 @@ async fn test_cache_store_backward_compatibility() {
     }
 }
 
-#[tokio::test]
-async fn test_invalid_toml_format() {
+#[test]
+fn test_invalid_toml_format() {
     let config = r#"
     [server
     bind_address = "0.0.0.0"
@@ -406,8 +406,8 @@ async fn test_invalid_toml_format() {
     }
 }
 
-#[tokio::test]
-async fn test_validate_webhook_referenced_globally() {
+#[test]
+fn test_validate_webhook_referenced_globally() {
     let config = r#"
     [server]
     bind_address = "0.0.0.0"
@@ -424,8 +424,8 @@ async fn test_validate_webhook_referenced_globally() {
     assert!(result.is_ok());
 }
 
-#[tokio::test]
-async fn test_validate_webhook_missing_global_reference() {
+#[test]
+fn test_validate_webhook_missing_global_reference() {
     let config = r#"
     [server]
     bind_address = "0.0.0.0"
@@ -445,8 +445,8 @@ async fn test_validate_webhook_missing_global_reference() {
     }
 }
 
-#[tokio::test]
-async fn test_validate_webhook_referenced_in_repository() {
+#[test]
+fn test_validate_webhook_referenced_in_repository() {
     let config = r#"
     [server]
     bind_address = "0.0.0.0"
@@ -463,8 +463,8 @@ async fn test_validate_webhook_referenced_in_repository() {
     assert!(result.is_ok());
 }
 
-#[tokio::test]
-async fn test_validate_webhook_missing_repository_reference() {
+#[test]
+fn test_validate_webhook_missing_repository_reference() {
     let config = r#"
     [server]
     bind_address = "0.0.0.0"
@@ -484,8 +484,8 @@ async fn test_validate_webhook_missing_repository_reference() {
     }
 }
 
-#[tokio::test]
-async fn test_validate_webhook_empty_string_in_repository() {
+#[test]
+fn test_validate_webhook_empty_string_in_repository() {
     let config = r#"
     [server]
     bind_address = "0.0.0.0"
@@ -498,8 +498,8 @@ async fn test_validate_webhook_empty_string_in_repository() {
     assert!(result.is_ok());
 }
 
-#[tokio::test]
-async fn test_validate_invalid_webhook_config() {
+#[test]
+fn test_validate_invalid_webhook_config() {
     let config = r#"
     [server]
     bind_address = "0.0.0.0"
@@ -519,8 +519,8 @@ async fn test_validate_invalid_webhook_config() {
     }
 }
 
-#[tokio::test]
-async fn test_tls_config_with_client_ca() {
+#[test]
+fn test_tls_config_with_client_ca() {
     let config = r#"
     [server]
     bind_address = "0.0.0.0"
@@ -552,8 +552,8 @@ async fn test_tls_config_with_client_ca() {
     }
 }
 
-#[tokio::test]
-async fn test_insecure_config_with_custom_port() {
+#[test]
+fn test_insecure_config_with_custom_port() {
     let config = r#"
     [server]
     bind_address = "127.0.0.1"
@@ -574,8 +574,8 @@ async fn test_insecure_config_with_custom_port() {
     }
 }
 
-#[tokio::test]
-async fn test_multiple_repositories() {
+#[test]
+fn test_multiple_repositories() {
     let config = r#"
     [server]
     bind_address = "0.0.0.0"
@@ -599,8 +599,8 @@ async fn test_multiple_repositories() {
     assert_eq!(config.repository["app3"].immutable_tags_exclusions.len(), 2);
 }
 
-#[tokio::test]
-async fn test_metadata_store_s3_with_redis() {
+#[test]
+fn test_metadata_store_s3_with_redis() {
     let config = r#"
     [server]
     bind_address = "0.0.0.0"
@@ -644,8 +644,8 @@ async fn test_metadata_store_s3_with_redis() {
     }
 }
 
-#[tokio::test]
-async fn test_metadata_store_fs_with_redis() {
+#[test]
+fn test_metadata_store_fs_with_redis() {
     let config = r#"
     [server]
     bind_address = "0.0.0.0"
@@ -678,8 +678,8 @@ async fn test_metadata_store_fs_with_redis() {
     }
 }
 
-#[tokio::test]
-async fn test_ipv6_bind_address() {
+#[test]
+fn test_ipv6_bind_address() {
     let config = r#"
     [server]
     bind_address = "::1"
@@ -694,8 +694,8 @@ async fn test_ipv6_bind_address() {
     }
 }
 
-#[tokio::test]
-async fn test_access_policy_in_global_config() {
+#[test]
+fn test_access_policy_in_global_config() {
     let config = r#"
     [server]
     bind_address = "0.0.0.0"
@@ -709,8 +709,8 @@ async fn test_access_policy_in_global_config() {
     assert_eq!(config.global.access_policy.rules.len(), 1);
 }
 
-#[tokio::test]
-async fn test_retention_policy_in_global_config() {
+#[test]
+fn test_retention_policy_in_global_config() {
     let config = r#"
     [server]
     bind_address = "0.0.0.0"
@@ -723,8 +723,8 @@ async fn test_retention_policy_in_global_config() {
     assert_eq!(config.global.retention_policy.rules.len(), 1);
 }
 
-#[tokio::test]
-async fn test_resolve_metadata_config_preserves_explicit_s3_config() {
+#[test]
+fn test_resolve_metadata_config_preserves_explicit_s3_config() {
     let config = r#"
     [server]
     bind_address = "0.0.0.0"
@@ -759,8 +759,8 @@ async fn test_resolve_metadata_config_preserves_explicit_s3_config() {
     }
 }
 
-#[tokio::test]
-async fn test_multiple_webhooks() {
+#[test]
+fn test_multiple_webhooks() {
     let config = r#"
     [server]
     bind_address = "0.0.0.0"
@@ -785,8 +785,8 @@ async fn test_multiple_webhooks() {
     assert!(config.auth.webhook.contains_key("webhook3"));
 }
 
-#[tokio::test]
-async fn test_validate_multiple_repositories_with_webhooks() {
+#[test]
+fn test_validate_multiple_repositories_with_webhooks() {
     let config = r#"
     [server]
     bind_address = "0.0.0.0"
@@ -810,8 +810,8 @@ async fn test_validate_multiple_repositories_with_webhooks() {
     assert!(result.is_ok());
 }
 
-#[tokio::test]
-async fn test_load_from_file() {
+#[test]
+fn test_load_from_file() {
     use std::io::Write;
 
     use tempfile::NamedTempFile;
@@ -847,8 +847,8 @@ async fn test_load_from_file() {
     }
 }
 
-#[tokio::test]
-async fn test_load_from_nonexistent_file() {
+#[test]
+fn test_load_from_nonexistent_file() {
     let result = Configuration::load("/nonexistent/path/to/config.toml");
     assert!(result.is_err());
 
@@ -860,8 +860,8 @@ async fn test_load_from_nonexistent_file() {
     }
 }
 
-#[tokio::test]
-async fn test_load_from_file_with_invalid_content() {
+#[test]
+fn test_load_from_file_with_invalid_content() {
     use std::io::Write;
 
     use tempfile::NamedTempFile;
@@ -884,8 +884,8 @@ async fn test_load_from_file_with_invalid_content() {
     }
 }
 
-#[tokio::test]
-async fn test_load_from_file_with_tls_config() {
+#[test]
+fn test_load_from_file_with_tls_config() {
     use std::io::Write;
 
     use tempfile::NamedTempFile;
@@ -923,8 +923,8 @@ async fn test_load_from_file_with_tls_config() {
     }
 }
 
-#[tokio::test]
-async fn test_load_from_file_with_validation_error() {
+#[test]
+fn test_load_from_file_with_validation_error() {
     use std::io::Write;
 
     use tempfile::NamedTempFile;
@@ -952,8 +952,8 @@ async fn test_load_from_file_with_validation_error() {
     }
 }
 
-#[tokio::test]
-async fn test_event_webhook_config_parses() {
+#[test]
+fn test_event_webhook_config_parses() {
     let config = r#"
     [server]
     bind_address = "0.0.0.0"
@@ -979,8 +979,8 @@ async fn test_event_webhook_config_parses() {
     assert!(config.event_webhook.contains_key("audit"));
 }
 
-#[tokio::test]
-async fn test_event_webhook_backward_compatible() {
+#[test]
+fn test_event_webhook_backward_compatible() {
     let config = r#"
     [server]
     bind_address = "0.0.0.0"
@@ -990,8 +990,8 @@ async fn test_event_webhook_backward_compatible() {
     assert!(config.event_webhook.is_empty());
 }
 
-#[tokio::test]
-async fn test_global_event_webhooks_references() {
+#[test]
+fn test_global_event_webhooks_references() {
     let config = r#"
     [server]
     bind_address = "0.0.0.0"
@@ -1010,8 +1010,8 @@ async fn test_global_event_webhooks_references() {
     assert_eq!(config.global.event_webhooks[0], "notify");
 }
 
-#[tokio::test]
-async fn test_repository_event_webhooks_references() {
+#[test]
+fn test_repository_event_webhooks_references() {
     let config = r#"
     [server]
     bind_address = "0.0.0.0"
@@ -1030,8 +1030,8 @@ async fn test_repository_event_webhooks_references() {
     assert_eq!(config.repository["myapp"].event_webhooks[0], "notify");
 }
 
-#[tokio::test]
-async fn test_event_webhook_nonexistent_global_reference_fails() {
+#[test]
+fn test_event_webhook_nonexistent_global_reference_fails() {
     let config = r#"
     [server]
     bind_address = "0.0.0.0"
@@ -1050,8 +1050,8 @@ async fn test_event_webhook_nonexistent_global_reference_fails() {
     }
 }
 
-#[tokio::test]
-async fn test_event_webhook_nonexistent_repository_reference_fails() {
+#[test]
+fn test_event_webhook_nonexistent_repository_reference_fails() {
     let config = r#"
     [server]
     bind_address = "0.0.0.0"
@@ -1076,8 +1076,8 @@ async fn test_event_webhook_nonexistent_repository_reference_fails() {
     }
 }
 
-#[tokio::test]
-async fn test_event_webhook_invalid_config_fails_validation() {
+#[test]
+fn test_event_webhook_invalid_config_fails_validation() {
     let config = r#"
     [server]
     bind_address = "0.0.0.0"
@@ -1098,8 +1098,8 @@ async fn test_event_webhook_invalid_config_fails_validation() {
     }
 }
 
-#[tokio::test]
-async fn test_metadata_store_s3_lock_strategy_s3_defaults() {
+#[test]
+fn test_metadata_store_s3_lock_strategy_s3_defaults() {
     let config = r#"
     [server]
     bind_address = "0.0.0.0"
@@ -1142,8 +1142,8 @@ async fn test_metadata_store_s3_lock_strategy_s3_defaults() {
     }
 }
 
-#[tokio::test]
-async fn test_metadata_store_s3_lock_strategy_s3_custom_values() {
+#[test]
+fn test_metadata_store_s3_lock_strategy_s3_custom_values() {
     let config = r#"
     [server]
     bind_address = "0.0.0.0"
@@ -1186,8 +1186,8 @@ async fn test_metadata_store_s3_lock_strategy_s3_custom_values() {
     }
 }
 
-#[tokio::test]
-async fn test_metadata_store_s3_lock_strategy_memory() {
+#[test]
+fn test_metadata_store_s3_lock_strategy_memory() {
     let config = r#"
     [server]
     bind_address = "0.0.0.0"
@@ -1228,8 +1228,8 @@ async fn test_metadata_store_s3_lock_strategy_memory() {
     }
 }
 
-#[tokio::test]
-async fn test_metadata_store_s3_both_redis_and_lock_strategy_fails() {
+#[test]
+fn test_metadata_store_s3_both_redis_and_lock_strategy_fails() {
     let config = r#"
     [server]
     bind_address = "0.0.0.0"
@@ -1266,8 +1266,8 @@ async fn test_metadata_store_s3_both_redis_and_lock_strategy_fails() {
     );
 }
 
-#[tokio::test]
-async fn test_metadata_store_fs_lock_strategy_s3_fails() {
+#[test]
+fn test_metadata_store_fs_lock_strategy_s3_fails() {
     let config = r#"
     [server]
     bind_address = "0.0.0.0"

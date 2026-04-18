@@ -9,7 +9,6 @@ use crate::{configuration, registry};
 pub enum Error {
     Initialization(String),
     Execution(String),
-    // mappable to classical HTTP responses
     Unauthorized(String),
     BadRequest(String),
     Conflict(String),

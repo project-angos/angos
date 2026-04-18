@@ -150,8 +150,8 @@ mod tests {
     use super::*;
     use crate::cache;
 
-    #[tokio::test]
-    async fn test_is_pull_through_empty() {
+    #[test]
+    fn test_is_pull_through_empty() {
         let cache = cache::Config::Memory.to_backend().unwrap();
         let config = Config::default();
         let repo = Repository::new("test", &config, &cache).unwrap();

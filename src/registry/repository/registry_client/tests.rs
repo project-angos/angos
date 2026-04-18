@@ -31,8 +31,8 @@ fn test_get_upstream_namespace_no_prefix_match() {
     assert_eq!(result, "bar/baz");
 }
 
-#[tokio::test]
-async fn test_get_manifest_path() {
+#[test]
+fn test_get_manifest_path() {
     let config = RegistryClientConfig {
         url: "https://example.com".to_string(),
         max_redirect: 5,
@@ -54,8 +54,8 @@ async fn test_get_manifest_path() {
     assert_eq!(path, "https://example.com/v2/repo/manifests/latest");
 }
 
-#[tokio::test]
-async fn test_get_blob_path() {
+#[test]
+fn test_get_blob_path() {
     let config = RegistryClientConfig {
         url: "https://example.com".to_string(),
         max_redirect: 5,
@@ -82,8 +82,8 @@ async fn test_get_blob_path() {
     );
 }
 
-#[tokio::test]
-async fn test_new_with_username_only() {
+#[test]
+fn test_new_with_username_only() {
     let config = RegistryClientConfig {
         url: "https://example.com".to_string(),
         max_redirect: 5,
@@ -99,8 +99,8 @@ async fn test_new_with_username_only() {
     assert!(client.basic_auth.is_none());
 }
 
-#[tokio::test]
-async fn test_new_with_password_only() {
+#[test]
+fn test_new_with_password_only() {
     let config = RegistryClientConfig {
         url: "https://example.com".to_string(),
         max_redirect: 5,
@@ -116,8 +116,8 @@ async fn test_new_with_password_only() {
     assert!(client.basic_auth.is_none());
 }
 
-#[tokio::test]
-async fn test_new_with_both_credentials() {
+#[test]
+fn test_new_with_both_credentials() {
     let config = RegistryClientConfig {
         url: "https://example.com".to_string(),
         max_redirect: 5,

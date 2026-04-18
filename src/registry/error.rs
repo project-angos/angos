@@ -123,8 +123,6 @@ impl From<hyper::http::Error> for Error {
     }
 }
 
-// XXX: at least repository_upstream is using this error type
-// usage should be reviewed and replaced by more specific errors
 impl From<serde_json::Error> for Error {
     fn from(error: serde_json::Error) -> Self {
         debug!("Serde JSON error: {error}");

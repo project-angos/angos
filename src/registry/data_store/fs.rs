@@ -170,8 +170,8 @@ mod tests {
 
     use super::*;
 
-    #[tokio::test]
-    async fn test_new() {
+    #[test]
+    fn test_new() {
         let config = BackendConfig {
             root_dir: "/test/path".to_string(),
             sync_to_disk: true,

@@ -483,33 +483,30 @@ async fn create_test_context_with_allow_policy() -> ServerContext {
 }
 
 #[tokio::test]
-async fn test_handle_list_repositories_accepts_identity() {
+async fn test_handle_list_repositories() {
     let context = create_test_context_with_allow_policy().await;
-    let identity = ClientIdentity::default();
 
-    let result = handle_list_repositories(&context, &identity).await;
+    let result = handle_list_repositories(&context).await;
 
     assert!(result.is_ok());
 }
 
 #[tokio::test]
-async fn test_handle_list_catalog_accepts_identity() {
+async fn test_handle_list_catalog() {
     let context = create_test_context_with_allow_policy().await;
-    let identity = ClientIdentity::default();
 
-    let result = handle_list_catalog(&context, None, None, &identity).await;
+    let result = handle_list_catalog(&context, None, None).await;
 
     assert!(result.is_ok());
 }
 
 #[tokio::test]
-async fn test_handle_delete_blob_accepts_identity() {
+async fn test_handle_delete_blob() {
     let context = create_test_context_with_allow_policy().await;
-    let identity = ClientIdentity::default();
     let namespace = Namespace::new("test/repo").unwrap();
     let digest: Digest = "sha256:abababababababababababababababababababababababababababababababab"
         .parse()
         .unwrap();
 
-    let _result = handle_delete_blob(&context, &namespace, digest, &identity).await;
+    let _result = handle_delete_blob(&context, &namespace, digest).await;
 }

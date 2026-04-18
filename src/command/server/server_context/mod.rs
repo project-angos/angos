@@ -69,17 +69,9 @@ impl ServerContext {
             .authenticator
             .authenticate_request(parts, remote_address)
             .await?;
-        if let Some(forwarded_for) = parts.headers.get("X-Forwarded-For")
-            && let Ok(forwarded_str) = forwarded_for.to_str()
-            && let Some(first_ip) = forwarded_str.split(',').next()
-        {
-            identity.client_ip = Some(first_ip.trim().to_string());
-        } else if let Some(real_ip) = parts.headers.get("X-Real-IP")
-            && let Ok(ip_str) = real_ip.to_str()
-        {
-            identity.client_ip = Some(ip_str.to_string());
+        if let Some(client_ip) = resolve_client_ip(&parts.headers) {
+            identity.client_ip = Some(client_ip);
         }
-
         Ok(identity)
     }
 
@@ -119,6 +111,21 @@ impl ServerContext {
             dispatcher.shutdown_with_timeout(timeout).await;
         }
     }
+}
+
+fn resolve_client_ip(headers: &hyper::header::HeaderMap) -> Option<String> {
+    if let Some(forwarded_for) = headers.get("X-Forwarded-For")
+        && let Ok(forwarded_str) = forwarded_for.to_str()
+        && let Some(first_ip) = forwarded_str.split(',').next()
+    {
+        return Some(first_ip.trim().to_string());
+    }
+    if let Some(real_ip) = headers.get("X-Real-IP")
+        && let Ok(ip_str) = real_ip.to_str()
+    {
+        return Some(ip_str.trim().to_string());
+    }
+    None
 }
 
 #[cfg(test)]
