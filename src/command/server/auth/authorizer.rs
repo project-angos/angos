@@ -9,7 +9,7 @@ use crate::{
     command::server::{auth::webhook::WebhookAuthorizer, error::Error},
     configuration::Configuration,
     identity::{ClientIdentity, Route},
-    oci::Reference,
+    oci::{Namespace, Reference},
     registry::{AccessPolicy, Registry},
 };
 
@@ -124,66 +124,8 @@ impl Authorizer {
         }
 
         if let Some(namespace) = route.get_namespace() {
-            if let Ok(repository) = registry.get_repository_for_namespace(namespace) {
-                debug!(
-                    "Evaluating repository access policy for namespace: {namespace} ({})",
-                    repository.name
-                );
-
-                let auth_repo = self.repositories.get(&repository.name).ok_or_else(|| {
-                    Error::Execution(format!(
-                        "Repository '{}' not found in authorizer",
-                        repository.name
-                    ))
-                })?;
-
-                if let Some(ref access_policy) = auth_repo.access_policy
-                    && access_policy.evaluate(route, identity) != Ok(true)
-                {
-                    log_denial(
-                        &format!("repository '{}' policy", repository.name),
-                        identity,
-                    );
-                    return Err(Error::Unauthorized(ACCESS_DENIED.to_string()));
-                }
-
-                if let Route::PutManifest {
-                    reference: Reference::Tag(tag),
-                    ..
-                } = route
-                    && !self.is_tag_mutable(auth_repo, tag)
-                {
-                    let msg = format!("Tag '{tag}' is immutable and cannot be overwritten");
-                    return Err(Error::Conflict(msg));
-                }
-
-                let webhook_name = auth_repo
-                    .authorization_webhook
-                    .as_ref()
-                    .filter(|name| !name.is_empty())
-                    .or(self.global_authorization_webhook.as_ref());
-
-                if let Some(webhook_name) = webhook_name {
-                    debug!("Evaluating webhook authorization: {}", webhook_name);
-
-                    let webhook = self.webhooks.get(webhook_name).ok_or_else(|| {
-                        Error::Execution(format!("Webhook '{webhook_name}' not found"))
-                    })?;
-
-                    let allowed = webhook.authorize(route, identity, request).await?;
-                    if !allowed {
-                        log_denial(&format!("webhook '{webhook_name}'"), identity);
-                        return Err(Error::Unauthorized(ACCESS_DENIED.to_string()));
-                    }
-                }
-
-                if repository.is_pull_through() && route.is_push() {
-                    let msg =
-                        "Push operations are not supported on pull-through cache repositories"
-                            .to_string();
-                    return Err(Error::Unauthorized(msg));
-                }
-            }
+            self.authorize_namespace_request(namespace, route, identity, request, registry)
+                .await?;
         } else if let Some(webhook_name) = &self.global_authorization_webhook {
             debug!("Evaluating global webhook authorization: {}", webhook_name);
 
@@ -197,6 +139,80 @@ impl Authorizer {
                 log_denial(&format!("global webhook '{webhook_name}'"), identity);
                 return Err(Error::Unauthorized(ACCESS_DENIED.to_string()));
             }
+        }
+
+        Ok(())
+    }
+
+    async fn authorize_namespace_request(
+        &self,
+        namespace: &Namespace,
+        route: &Route<'_>,
+        identity: &ClientIdentity,
+        request: &Parts,
+        registry: &Registry,
+    ) -> Result<(), Error> {
+        let Ok(repository) = registry.get_repository_for_namespace(namespace) else {
+            return Ok(());
+        };
+
+        debug!(
+            "Evaluating repository access policy for namespace: {namespace} ({})",
+            repository.name
+        );
+
+        let auth_repo = self.repositories.get(&repository.name).ok_or_else(|| {
+            Error::Execution(format!(
+                "Repository '{}' not found in authorizer",
+                repository.name
+            ))
+        })?;
+
+        if let Some(ref access_policy) = auth_repo.access_policy
+            && access_policy.evaluate(route, identity) != Ok(true)
+        {
+            log_denial(
+                &format!("repository '{}' policy", repository.name),
+                identity,
+            );
+            return Err(Error::Unauthorized(ACCESS_DENIED.to_string()));
+        }
+
+        if let Route::PutManifest {
+            reference: Reference::Tag(tag),
+            ..
+        } = route
+            && !self.is_tag_mutable(auth_repo, tag)
+        {
+            let msg = format!("Tag '{tag}' is immutable and cannot be overwritten");
+            return Err(Error::Conflict(msg));
+        }
+
+        let webhook_name = auth_repo
+            .authorization_webhook
+            .as_ref()
+            .filter(|name| !name.is_empty())
+            .or(self.global_authorization_webhook.as_ref());
+
+        if let Some(webhook_name) = webhook_name {
+            debug!("Evaluating webhook authorization: {}", webhook_name);
+
+            let webhook = self
+                .webhooks
+                .get(webhook_name)
+                .ok_or_else(|| Error::Execution(format!("Webhook '{webhook_name}' not found")))?;
+
+            let allowed = webhook.authorize(route, identity, request).await?;
+            if !allowed {
+                log_denial(&format!("webhook '{webhook_name}'"), identity);
+                return Err(Error::Unauthorized(ACCESS_DENIED.to_string()));
+            }
+        }
+
+        if repository.is_pull_through() && route.is_push() {
+            return Err(Error::Unauthorized(
+                "Push operations are not supported on pull-through cache repositories".to_string(),
+            ));
         }
 
         Ok(())
