@@ -337,7 +337,7 @@ async fn test_uniform_multi_part_upload() {
     assert_eq!(digest, expected.digest());
 }
 
-/// Uniform-mode complete_upload removes all staging artifacts from the upload container
+/// Uniform-mode `complete_upload` removes all staging artifacts from the upload container
 #[tokio::test]
 async fn test_uniform_complete_cleans_artifacts() {
     let t = UniformTestCase::new();
@@ -373,7 +373,7 @@ async fn test_uniform_complete_cleans_artifacts() {
     );
 }
 
-/// Uniform-mode round-trip: uploaded bytes are faithfully preserved through read_blob
+/// Uniform-mode round-trip: uploaded bytes are faithfully preserved through `read_blob`
 #[tokio::test]
 async fn test_uniform_round_trip_integrity() {
     let t = UniformTestCase::new();
