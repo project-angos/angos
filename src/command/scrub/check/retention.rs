@@ -31,6 +31,20 @@ pub struct RetentionChecker {
     dry_run: bool,
 }
 
+async fn fetch_single_tag_metadata(
+    metadata_store: Arc<dyn MetadataStore + Send + Sync>,
+    namespace: String,
+    tag_name: String,
+) -> Result<TagWithMetadata, Error> {
+    let metadata = metadata_store
+        .read_link(&namespace, &LinkKind::Tag(tag_name.clone()), false)
+        .await?;
+    Ok(TagWithMetadata {
+        name: tag_name,
+        metadata,
+    })
+}
+
 impl RetentionChecker {
     pub fn new(
         blob_store: Arc<dyn BlobStore + Send + Sync>,
@@ -93,23 +107,16 @@ impl RetentionChecker {
         namespace: &str,
         tag_names: &[String],
     ) -> Result<Vec<TagWithMetadata>, Error> {
-        let futures = tag_names.iter().map(|tag| {
-            let namespace = namespace.to_string();
-            let tag_name = tag.clone();
-            let metadata_store = self.metadata_store.clone();
-            async move {
-                let metadata = metadata_store
-                    .read_link(&namespace, &LinkKind::Tag(tag_name.clone()), false)
-                    .await?;
-                Ok::<TagWithMetadata, Error>(TagWithMetadata {
-                    name: tag_name,
-                    metadata,
-                })
-            }
-        });
-
-        let results = join_all(futures).await;
-        results.into_iter().collect()
+        join_all(tag_names.iter().map(|tag| {
+            fetch_single_tag_metadata(
+                self.metadata_store.clone(),
+                namespace.to_string(),
+                tag.clone(),
+            )
+        }))
+        .await
+        .into_iter()
+        .collect()
     }
 
     fn build_sorted_rankings(tags: &[TagWithMetadata]) -> (Vec<String>, Vec<String>) {
