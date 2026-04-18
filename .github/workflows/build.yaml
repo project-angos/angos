@@ -99,7 +99,7 @@ jobs:
 
       - name: Download zot benchmark
         run: |
-          curl -L -o zb https://github.com/project-zot/zot/releases/download/v2.1.10/zb-linux-amd64
+          curl -L -o zb https://github.com/project-zot/zot/releases/download/v2.1.15/zb-linux-amd64
           chmod +x zb
 
       - name: Build the container
