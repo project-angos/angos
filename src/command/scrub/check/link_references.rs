@@ -66,6 +66,41 @@ impl LinkReferencesChecker {
         Ok(())
     }
 
+    async fn needs_referrer_update(
+        &self,
+        namespace: &str,
+        link: &LinkKind,
+        referrer: &Digest,
+    ) -> Result<bool, Error> {
+        match self.metadata_store.read_link(namespace, link, false).await {
+            Ok(metadata) if metadata.referenced_by.contains(referrer) => Ok(false),
+            Ok(_) => Ok(true),
+            Err(metadata_store::Error::ReferenceNotFound) => Ok(false),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    async fn add_referrer(
+        &self,
+        namespace: &str,
+        link: &LinkKind,
+        target: &Digest,
+        referrer: &Digest,
+    ) -> Result<(), Error> {
+        if self.dry_run {
+            info!(
+                "DRY RUN: would add referrer {referrer} to link {link} in namespace '{namespace}'"
+            );
+            return Ok(());
+        }
+
+        info!("Adding referrer {referrer} to link {link} in namespace '{namespace}'");
+        let mut tx = self.metadata_store.begin_transaction(namespace);
+        tx.create_link(link, target).with_referrer(referrer).add();
+        tx.commit().await?;
+        Ok(())
+    }
+
     async fn ensure_referenced_by(
         &self,
         namespace: &str,
@@ -73,31 +108,12 @@ impl LinkReferencesChecker {
         target: &Digest,
         referrer: &Digest,
     ) -> Result<(), Error> {
-        match self.metadata_store.read_link(namespace, link, false).await {
-            Ok(metadata) => {
-                if metadata.referenced_by.contains(referrer) {
-                    debug!("Link {link} already has referrer {referrer}");
-                    return Ok(());
-                }
-
-                if self.dry_run {
-                    info!(
-                        "DRY RUN: would add referrer {referrer} to link {link} in namespace '{namespace}'"
-                    );
-                    return Ok(());
-                }
-
-                info!("Adding referrer {referrer} to link {link} in namespace '{namespace}'");
-                let mut tx = self.metadata_store.begin_transaction(namespace);
-                tx.create_link(link, target).with_referrer(referrer).add();
-                tx.commit().await?;
-            }
-            Err(metadata_store::Error::ReferenceNotFound) => {
-                debug!("Link {link} not found, skipping");
-            }
-            Err(e) => return Err(e.into()),
+        if self
+            .needs_referrer_update(namespace, link, referrer)
+            .await?
+        {
+            self.add_referrer(namespace, link, target, referrer).await?;
         }
-
         Ok(())
     }
 }
