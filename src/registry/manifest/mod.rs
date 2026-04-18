@@ -314,20 +314,22 @@ impl Registry {
             .cloned()
             .or_else(|| manifest.media_type.clone());
 
-        // Backward compatibility: fall back to create_link without media_type when
-        // content type is unknown. Once all clients send Content-Type, simplify to
-        // always use create_link_with_media_type.
         if let Some(ref mt) = effective_media_type {
-            tx.create_link_with_media_type(&LinkKind::Digest(digest.clone()), &digest, mt);
+            tx.create_link(&LinkKind::Digest(digest.clone()), &digest)
+                .with_media_type(mt)
+                .add();
         } else {
-            tx.create_link(&LinkKind::Digest(digest.clone()), &digest);
+            tx.create_link(&LinkKind::Digest(digest.clone()), &digest)
+                .add();
         }
 
         if let Reference::Tag(tag) = reference {
             if let Some(ref mt) = effective_media_type {
-                tx.create_link_with_media_type(&LinkKind::Tag(tag.clone()), &digest, mt);
+                tx.create_link(&LinkKind::Tag(tag.clone()), &digest)
+                    .with_media_type(mt)
+                    .add();
             } else {
-                tx.create_link(&LinkKind::Tag(tag.clone()), &digest);
+                tx.create_link(&LinkKind::Tag(tag.clone()), &digest).add();
             }
         }
 
@@ -336,34 +338,33 @@ impl Registry {
             if let Some(descriptor) =
                 manifest.to_descriptor(None, digest.clone(), body.len() as u64)
             {
-                tx.create_link_with_descriptor(&referrer_link, &digest, descriptor);
+                tx.create_link(&referrer_link, &digest)
+                    .with_descriptor(descriptor)
+                    .add();
             } else {
-                tx.create_link(&referrer_link, &digest);
+                tx.create_link(&referrer_link, &digest).add();
             }
         }
 
         if let Some(config) = manifest.config {
-            tx.create_link_with_referrer(
-                &LinkKind::Config(config.digest.clone()),
-                &config.digest,
-                &digest,
-            );
+            tx.create_link(&LinkKind::Config(config.digest.clone()), &config.digest)
+                .with_referrer(&digest)
+                .add();
         }
 
         for layer in manifest.layers {
-            tx.create_link_with_referrer(
-                &LinkKind::Layer(layer.digest.clone()),
-                &layer.digest,
-                &digest,
-            );
+            tx.create_link(&LinkKind::Layer(layer.digest.clone()), &layer.digest)
+                .with_referrer(&digest)
+                .add();
         }
 
         for child in manifest.manifests {
-            tx.create_link_with_referrer(
+            tx.create_link(
                 &LinkKind::Manifest(digest.clone(), child.digest.clone()),
                 &child.digest,
-                &digest,
-            );
+            )
+            .with_referrer(&digest)
+            .add();
         }
 
         tx.commit().await?;

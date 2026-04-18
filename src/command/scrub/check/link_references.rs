@@ -89,7 +89,7 @@ impl LinkReferencesChecker {
 
                 info!("Adding referrer {referrer} to link {link} in namespace '{namespace}'");
                 let mut tx = self.metadata_store.begin_transaction(namespace);
-                tx.create_link_with_referrer(link, target, referrer);
+                tx.create_link(link, target).with_referrer(referrer).add();
                 tx.commit().await?;
             }
             Err(metadata_store::Error::ReferenceNotFound) => {
@@ -173,9 +173,12 @@ mod tests {
                 .unwrap();
 
             let mut tx = metadata_store.begin_transaction(namespace);
-            tx.create_link(&LinkKind::Digest(manifest_digest.clone()), &manifest_digest);
-            tx.create_link(&LinkKind::Config(config_digest.clone()), &config_digest);
-            tx.create_link(&LinkKind::Layer(layer_digest.clone()), &layer_digest);
+            tx.create_link(&LinkKind::Digest(manifest_digest.clone()), &manifest_digest)
+                .add();
+            tx.create_link(&LinkKind::Config(config_digest.clone()), &config_digest)
+                .add();
+            tx.create_link(&LinkKind::Layer(layer_digest.clone()), &layer_digest)
+                .add();
             tx.commit().await.unwrap();
 
             let config_link_before = metadata_store

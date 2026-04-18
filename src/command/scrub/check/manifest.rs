@@ -157,7 +157,8 @@ mod tests {
                 .unwrap();
 
             let mut tx = metadata_store.begin_transaction(namespace);
-            tx.create_link(&LinkKind::Digest(manifest_digest.clone()), &manifest_digest);
+            tx.create_link(&LinkKind::Digest(manifest_digest.clone()), &manifest_digest)
+                .add();
             tx.commit().await.unwrap();
 
             let scrubber = ManifestChecker::new(blob_store.clone(), metadata_store.clone(), false);

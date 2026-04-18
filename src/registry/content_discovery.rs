@@ -188,7 +188,7 @@ mod tests {
             let test_digest = registry.blob_store.create_blob(test_content).await.unwrap();
             let tag_link = LinkKind::Tag("latest".to_string());
             let mut tx = registry.metadata_store.begin_transaction(namespace);
-            tx.create_link(&tag_link, &test_digest);
+            tx.create_link(&tag_link, &test_digest).add();
             tx.commit().await.unwrap();
 
             let referrers = registry
@@ -238,7 +238,8 @@ mod tests {
             let tags = ["latest", "v1.0", "v2.0"];
             let mut tx = registry.metadata_store.begin_transaction(namespace);
             for tag in tags {
-                tx.create_link(&LinkKind::Tag(tag.to_string()), &test_digest);
+                tx.create_link(&LinkKind::Tag(tag.to_string()), &test_digest)
+                    .add();
             }
             tx.commit().await.unwrap();
 
@@ -331,7 +332,8 @@ mod tests {
                 referrer_manifest_digest.clone(),
             );
             let mut tx = registry.metadata_store.begin_transaction(namespace);
-            tx.create_link(&referrer_link, &referrer_manifest_digest);
+            tx.create_link(&referrer_link, &referrer_manifest_digest)
+                .add();
             tx.commit().await.unwrap();
 
             let response = registry
@@ -365,7 +367,7 @@ mod tests {
                 let (digest, _) = create_test_blob(registry, namespace, content).await;
                 let tag_link = LinkKind::Tag("latest".to_string());
                 let mut tx = registry.metadata_store.begin_transaction(namespace);
-                tx.create_link(&tag_link, &digest);
+                tx.create_link(&tag_link, &digest).add();
                 tx.commit().await.unwrap();
             }
 
@@ -415,7 +417,8 @@ mod tests {
             let tags = ["v1", "v2", "latest"];
             let mut tx = registry.metadata_store.begin_transaction(namespace);
             for tag in tags {
-                tx.create_link(&LinkKind::Tag(tag.to_string()), &digest);
+                tx.create_link(&LinkKind::Tag(tag.to_string()), &digest)
+                    .add();
             }
             tx.commit().await.unwrap();
 

@@ -68,7 +68,7 @@ async fn recreate_link(
 
     info!("Recreating invalid link from namespace '{namespace}': {link}' -> '{target}'");
     let mut tx = metadata_store.begin_transaction(namespace);
-    tx.create_link(link, target);
+    tx.create_link(link, target).add();
     tx.commit().await?;
     Ok(())
 }

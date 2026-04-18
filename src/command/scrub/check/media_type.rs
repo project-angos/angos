@@ -64,7 +64,9 @@ impl MediaTypeChecker {
 
         info!("Setting media_type '{media_type}' on {display_name} in namespace '{namespace}'");
         let mut tx = self.metadata_store.begin_transaction(namespace);
-        tx.create_link_with_media_type(link, &metadata.target, &media_type);
+        tx.create_link(link, &metadata.target)
+            .with_media_type(&media_type)
+            .add();
         tx.commit().await?;
 
         Ok(())
@@ -163,8 +165,10 @@ mod tests {
 
             // Create digest and tag links WITHOUT media_type
             let mut tx = metadata_store.begin_transaction(namespace);
-            tx.create_link(&LinkKind::Digest(manifest_digest.clone()), &manifest_digest);
-            tx.create_link(&LinkKind::Tag("latest".to_string()), &manifest_digest);
+            tx.create_link(&LinkKind::Digest(manifest_digest.clone()), &manifest_digest)
+                .add();
+            tx.create_link(&LinkKind::Tag("latest".to_string()), &manifest_digest)
+                .add();
             tx.commit().await.unwrap();
 
             // Verify media_type is None before check
@@ -246,16 +250,12 @@ mod tests {
 
             // Create links WITH media_type already set
             let mut tx = metadata_store.begin_transaction(namespace);
-            tx.create_link_with_media_type(
-                &LinkKind::Digest(manifest_digest.clone()),
-                &manifest_digest,
-                media_type,
-            );
-            tx.create_link_with_media_type(
-                &LinkKind::Tag("latest".to_string()),
-                &manifest_digest,
-                media_type,
-            );
+            tx.create_link(&LinkKind::Digest(manifest_digest.clone()), &manifest_digest)
+                .with_media_type(media_type)
+                .add();
+            tx.create_link(&LinkKind::Tag("latest".to_string()), &manifest_digest)
+                .with_media_type(media_type)
+                .add();
             tx.commit().await.unwrap();
 
             // Run checker - should be a no-op
@@ -308,8 +308,10 @@ mod tests {
 
             // Create links WITHOUT media_type
             let mut tx = metadata_store.begin_transaction(namespace);
-            tx.create_link(&LinkKind::Digest(manifest_digest.clone()), &manifest_digest);
-            tx.create_link(&LinkKind::Tag("latest".to_string()), &manifest_digest);
+            tx.create_link(&LinkKind::Digest(manifest_digest.clone()), &manifest_digest)
+                .add();
+            tx.create_link(&LinkKind::Tag("latest".to_string()), &manifest_digest)
+                .add();
             tx.commit().await.unwrap();
 
             // Run checker with dry_run = true

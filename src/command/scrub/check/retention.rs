@@ -407,7 +407,8 @@ mod tests {
                 test_utils::create_test_blob(registry, namespace, b"test manifest").await;
 
             let mut tx = metadata_store.begin_transaction(namespace);
-            tx.create_link(&LinkKind::Tag("v1.0.0".to_string()), &blob_digest);
+            tx.create_link(&LinkKind::Tag("v1.0.0".to_string()), &blob_digest)
+                .add();
             tx.commit().await.unwrap();
 
             let retention_config = RetentionPolicyConfig {
@@ -450,7 +451,8 @@ mod tests {
                 test_utils::create_test_blob(registry, namespace, b"test manifest").await;
 
             let mut tx = metadata_store.begin_transaction(namespace);
-            tx.create_link(&LinkKind::Tag("any-tag".to_string()), &blob_digest);
+            tx.create_link(&LinkKind::Tag("any-tag".to_string()), &blob_digest)
+                .add();
             tx.commit().await.unwrap();
 
             let repositories = test_utils::create_test_repositories();
@@ -485,7 +487,8 @@ mod tests {
             let digest = blob_store.create_blob(TEST_MANIFEST).await.unwrap();
 
             let mut tx = metadata_store.begin_transaction(namespace);
-            tx.create_link(&LinkKind::Digest(digest.clone()), &digest);
+            tx.create_link(&LinkKind::Digest(digest.clone()), &digest)
+                .add();
             tx.commit().await.unwrap();
 
             let policy = Arc::new(
@@ -525,7 +528,8 @@ mod tests {
             let digest = blob_store.create_blob(TEST_MANIFEST).await.unwrap();
 
             let mut tx = metadata_store.begin_transaction(namespace);
-            tx.create_link(&LinkKind::Digest(digest.clone()), &digest);
+            tx.create_link(&LinkKind::Digest(digest.clone()), &digest)
+                .add();
             tx.commit().await.unwrap();
 
             RetentionChecker::new(
@@ -559,13 +563,17 @@ mod tests {
             let index_digest = blob_store.create_blob(TEST_INDEX).await.unwrap();
 
             let mut tx = metadata_store.begin_transaction(namespace);
-            tx.create_link(&LinkKind::Digest(child_digest.clone()), &child_digest);
-            tx.create_link(&LinkKind::Digest(index_digest.clone()), &index_digest);
-            tx.create_link(&LinkKind::Tag("latest".to_string()), &index_digest);
+            tx.create_link(&LinkKind::Digest(child_digest.clone()), &child_digest)
+                .add();
+            tx.create_link(&LinkKind::Digest(index_digest.clone()), &index_digest)
+                .add();
+            tx.create_link(&LinkKind::Tag("latest".to_string()), &index_digest)
+                .add();
             tx.create_link(
                 &LinkKind::Manifest(index_digest.clone(), child_digest.clone()),
                 &child_digest,
-            );
+            )
+            .add();
             tx.commit().await.unwrap();
 
             let policy = Arc::new(

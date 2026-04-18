@@ -104,60 +104,59 @@ pub struct Transaction {
     operations: Vec<LinkOperation>,
 }
 
+/// Builder for a single `Create` link operation within a [`Transaction`].
+///
+/// Obtain one via [`Transaction::create_link`] and finalize it by calling [`add`](Self::add).
+pub struct CreateLinkBuilder<'a> {
+    tx: &'a mut Transaction,
+    link: LinkKind,
+    target: Digest,
+    referrer: Option<Digest>,
+    media_type: Option<String>,
+    descriptor: Option<Descriptor>,
+}
+
+impl CreateLinkBuilder<'_> {
+    /// Associates a referrer digest with this link.
+    pub fn with_referrer(mut self, referrer: &Digest) -> Self {
+        self.referrer = Some(referrer.clone());
+        self
+    }
+
+    /// Associates a media type with this link.
+    pub fn with_media_type(mut self, media_type: &str) -> Self {
+        self.media_type = Some(media_type.to_string());
+        self
+    }
+
+    /// Associates an OCI descriptor with this link.
+    pub fn with_descriptor(mut self, descriptor: Descriptor) -> Self {
+        self.descriptor = Some(descriptor);
+        self
+    }
+
+    /// Appends the operation to the enclosing transaction.
+    pub fn add(self) {
+        self.tx.operations.push(LinkOperation::Create {
+            link: self.link,
+            target: self.target,
+            referrer: self.referrer,
+            media_type: self.media_type,
+            descriptor: Box::new(self.descriptor),
+        });
+    }
+}
+
 impl Transaction {
-    pub fn create_link(&mut self, link: &LinkKind, target: &Digest) {
-        self.operations.push(LinkOperation::Create {
+    pub fn create_link(&mut self, link: &LinkKind, target: &Digest) -> CreateLinkBuilder<'_> {
+        CreateLinkBuilder {
+            tx: self,
             link: link.clone(),
             target: target.clone(),
             referrer: None,
             media_type: None,
-            descriptor: Box::new(None),
-        });
-    }
-
-    pub fn create_link_with_referrer(
-        &mut self,
-        link: &LinkKind,
-        target: &Digest,
-        referrer: &Digest,
-    ) {
-        self.operations.push(LinkOperation::Create {
-            link: link.clone(),
-            target: target.clone(),
-            referrer: Some(referrer.clone()),
-            media_type: None,
-            descriptor: Box::new(None),
-        });
-    }
-
-    pub fn create_link_with_media_type(
-        &mut self,
-        link: &LinkKind,
-        target: &Digest,
-        media_type: &str,
-    ) {
-        self.operations.push(LinkOperation::Create {
-            link: link.clone(),
-            target: target.clone(),
-            referrer: None,
-            media_type: Some(media_type.to_string()),
-            descriptor: Box::new(None),
-        });
-    }
-
-    pub fn create_link_with_descriptor(
-        &mut self,
-        link: &LinkKind,
-        target: &Digest,
-        descriptor: Descriptor,
-    ) {
-        self.operations.push(LinkOperation::Create {
-            link: link.clone(),
-            target: target.clone(),
-            referrer: None,
-            media_type: None,
-            descriptor: Box::new(Some(descriptor)),
-        });
+            descriptor: None,
+        }
     }
 
     pub fn delete_link(&mut self, link: &LinkKind) {

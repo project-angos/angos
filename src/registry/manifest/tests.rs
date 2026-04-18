@@ -924,8 +924,10 @@ async fn test_head_manifest_fallback_without_media_type() {
         let digest = registry.blob_store.create_blob(&content).await.unwrap();
 
         let mut tx = registry.metadata_store.begin_transaction(namespace);
-        tx.create_link(&LinkKind::Digest(digest.clone()), &digest);
-        tx.create_link(&LinkKind::Tag("latest".to_string()), &digest);
+        tx.create_link(&LinkKind::Digest(digest.clone()), &digest)
+            .add();
+        tx.create_link(&LinkKind::Tag("latest".to_string()), &digest)
+            .add();
         tx.commit().await.unwrap();
 
         let link_meta = registry
@@ -1186,8 +1188,10 @@ async fn test_handle_get_manifest_redirect_fallback_without_media_type() {
         let digest = registry.blob_store.create_blob(&content).await.unwrap();
 
         let mut tx = registry.metadata_store.begin_transaction(namespace);
-        tx.create_link(&LinkKind::Digest(digest.clone()), &digest);
-        tx.create_link(&LinkKind::Tag("latest".to_string()), &digest);
+        tx.create_link(&LinkKind::Digest(digest.clone()), &digest)
+            .add();
+        tx.create_link(&LinkKind::Tag("latest".to_string()), &digest)
+            .add();
         tx.commit().await.unwrap();
 
         let response = registry

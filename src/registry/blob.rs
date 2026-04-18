@@ -443,8 +443,8 @@ mod tests {
             let config_link = LinkKind::Config(digest.clone());
 
             let mut tx = registry.metadata_store.begin_transaction(namespace);
-            tx.create_link(&layer_link, &digest);
-            tx.create_link(&config_link, &digest);
+            tx.create_link(&layer_link, &digest).add();
+            tx.create_link(&config_link, &digest).add();
             tx.commit().await.unwrap();
 
             assert!(
@@ -553,7 +553,7 @@ mod tests {
             let config_link = LinkKind::Config(digest.clone());
 
             let mut tx = registry.metadata_store.begin_transaction(namespace);
-            tx.create_link(&config_link, &digest);
+            tx.create_link(&config_link, &digest).add();
             tx.commit().await.unwrap();
 
             assert!(

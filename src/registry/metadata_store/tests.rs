@@ -23,7 +23,7 @@ async fn create_link(
     digest: &Digest,
 ) {
     let mut tx = m.begin_transaction(namespace);
-    tx.create_link(link, digest);
+    tx.create_link(link, digest).add();
     tx.commit().await.unwrap();
 }
 
@@ -588,8 +588,8 @@ pub async fn test_update_links(b: Arc<dyn BlobStore>, m: Arc<dyn MetadataStore +
     let tag2 = LinkKind::Tag("v2".to_string());
 
     let mut tx = m.begin_transaction(namespace);
-    tx.create_link(&tag1, &digest1);
-    tx.create_link(&tag2, &digest2);
+    tx.create_link(&tag1, &digest1).add();
+    tx.create_link(&tag2, &digest2).add();
     tx.commit().await.unwrap();
 
     let meta1 = m.read_link(namespace, &tag1, false).await.unwrap();
@@ -982,7 +982,8 @@ pub async fn test_datastore_parallel_multiple_creates(
 
     let mut tx = m.begin_transaction(namespace);
     for (i, digest) in digests.iter().enumerate() {
-        tx.create_link(&LinkKind::Tag(format!("t{}", i + 1)), digest);
+        tx.create_link(&LinkKind::Tag(format!("t{}", i + 1)), digest)
+            .add();
     }
     tx.commit().await.unwrap();
 
@@ -1043,7 +1044,8 @@ pub async fn test_datastore_parallel_mixed_create_delete(
 
     let mut tx = m.begin_transaction(namespace);
     tx.delete_link(&LinkKind::Tag("v1".to_string()));
-    tx.create_link(&LinkKind::Tag("v3".to_string()), &digest_c);
+    tx.create_link(&LinkKind::Tag("v3".to_string()), &digest_c)
+        .add();
     tx.commit().await.unwrap();
 
     let err = m
@@ -1122,7 +1124,8 @@ pub async fn test_datastore_parallel_blob_index_correctness(
 
     let mut tx = m.begin_transaction(namespace);
     for (i, digest) in digests.iter().enumerate() {
-        tx.create_link(&LinkKind::Tag(format!("tag-{i}")), digest);
+        tx.create_link(&LinkKind::Tag(format!("tag-{i}")), digest)
+            .add();
     }
     tx.commit().await.unwrap();
 
@@ -1183,11 +1186,9 @@ pub async fn test_datastore_tracked_create_with_referrer(
     let digest_manifest = b.create_blob(b"manifest content").await.unwrap();
 
     let mut tx = m.begin_transaction(namespace);
-    tx.create_link_with_referrer(
-        &LinkKind::Layer(digest_layer.clone()),
-        &digest_layer,
-        &digest_manifest,
-    );
+    tx.create_link(&LinkKind::Layer(digest_layer.clone()), &digest_layer)
+        .with_referrer(&digest_manifest)
+        .add();
     tx.commit().await.unwrap();
 
     let metadata = m
@@ -1236,19 +1237,15 @@ pub async fn test_datastore_tracked_delete_with_referrer(
     let second_manifest_digest = b.create_blob(b"manifest b content").await.unwrap();
 
     let mut tx = m.begin_transaction(namespace);
-    tx.create_link_with_referrer(
-        &LinkKind::Layer(layer_digest.clone()),
-        &layer_digest,
-        &first_manifest_digest,
-    );
+    tx.create_link(&LinkKind::Layer(layer_digest.clone()), &layer_digest)
+        .with_referrer(&first_manifest_digest)
+        .add();
     tx.commit().await.unwrap();
 
     let mut tx = m.begin_transaction(namespace);
-    tx.create_link_with_referrer(
-        &LinkKind::Layer(layer_digest.clone()),
-        &layer_digest,
-        &second_manifest_digest,
-    );
+    tx.create_link(&LinkKind::Layer(layer_digest.clone()), &layer_digest)
+        .with_referrer(&second_manifest_digest)
+        .add();
     tx.commit().await.unwrap();
 
     let metadata = m
@@ -1316,11 +1313,9 @@ pub async fn test_datastore_tracked_delete_removes_when_no_referrers(
     let manifest_digest = b.create_blob(b"manifest for removal test").await.unwrap();
 
     let mut tx = m.begin_transaction(namespace);
-    tx.create_link_with_referrer(
-        &LinkKind::Layer(layer_digest.clone()),
-        &layer_digest,
-        &manifest_digest,
-    );
+    tx.create_link(&LinkKind::Layer(layer_digest.clone()), &layer_digest)
+        .with_referrer(&manifest_digest)
+        .add();
     tx.commit().await.unwrap();
 
     let mut tx = m.begin_transaction(namespace);
@@ -1373,16 +1368,16 @@ pub async fn test_datastore_mixed_tracked_untracked_operations(
     let manifest_digest = b.create_blob(b"manifest content mixed").await.unwrap();
 
     let mut tx = m.begin_transaction(namespace);
-    tx.create_link(&LinkKind::Tag("v1".into()), &tag_digest);
-    tx.create_link_with_referrer(
-        &LinkKind::Layer(layer_digest.clone()),
-        &layer_digest,
-        &manifest_digest,
-    );
+    tx.create_link(&LinkKind::Tag("v1".into()), &tag_digest)
+        .add();
+    tx.create_link(&LinkKind::Layer(layer_digest.clone()), &layer_digest)
+        .with_referrer(&manifest_digest)
+        .add();
     tx.create_link(
         &LinkKind::Digest(digest_link_digest.clone()),
         &digest_link_digest,
-    );
+    )
+    .add();
     tx.commit().await.unwrap();
 
     let tag_meta = m
@@ -1481,8 +1476,8 @@ pub async fn test_datastore_batch_deduplicates_same_digest_operations(
     let digest_link = LinkKind::Digest(digest.clone());
 
     let mut tx = m.begin_transaction(namespace);
-    tx.create_link(&tag_link, &digest);
-    tx.create_link(&digest_link, &digest);
+    tx.create_link(&tag_link, &digest).add();
+    tx.create_link(&digest_link, &digest).add();
     tx.commit().await.unwrap();
 
     let blob_index = m.read_blob_index(&digest).await.unwrap();
@@ -1525,7 +1520,7 @@ pub async fn test_datastore_batch_handles_mixed_insert_remove_same_digest(
     let tag_v2 = LinkKind::Tag("v2".to_string());
     let mut tx = m.begin_transaction(namespace);
     tx.delete_link(&tag_v1);
-    tx.create_link(&tag_v2, &digest);
+    tx.create_link(&tag_v2, &digest).add();
     tx.commit().await.unwrap();
 
     let blob_index = m.read_blob_index(&digest).await.unwrap();
@@ -1603,10 +1598,10 @@ pub async fn test_datastore_batch_multiple_unique_digests(
     let config_link = LinkKind::Config(config_digest.clone());
 
     let mut tx = m.begin_transaction(namespace);
-    tx.create_link(&layer1_link, &layer1_digest);
-    tx.create_link(&layer2_link, &layer2_digest);
-    tx.create_link(&layer3_link, &layer3_digest);
-    tx.create_link(&config_link, &config_digest);
+    tx.create_link(&layer1_link, &layer1_digest).add();
+    tx.create_link(&layer2_link, &layer2_digest).add();
+    tx.create_link(&layer3_link, &layer3_digest).add();
+    tx.create_link(&config_link, &config_digest).add();
     tx.commit().await.unwrap();
 
     for (digest, link) in [
@@ -1702,7 +1697,9 @@ async fn create_link_with_media_type(
     media_type: &str,
 ) {
     let mut tx = m.begin_transaction(namespace);
-    tx.create_link_with_media_type(link, digest, media_type);
+    tx.create_link(link, digest)
+        .with_media_type(media_type)
+        .add();
     tx.commit().await.unwrap();
 }
 
@@ -1784,7 +1781,9 @@ pub async fn test_datastore_list_referrers_with_stored_descriptor(
     // Create the referrer link with a stored descriptor (method does not exist yet)
     let referrer_link = LinkKind::Referrer(base_digest.clone(), referrer_digest.clone());
     let mut tx = m.begin_transaction(namespace);
-    tx.create_link_with_descriptor(&referrer_link, &referrer_digest, descriptor.clone());
+    tx.create_link(&referrer_link, &referrer_digest)
+        .with_descriptor(descriptor.clone())
+        .add();
     tx.commit().await.unwrap();
 
     // list_referrers should return the stored descriptor without reading a blob
