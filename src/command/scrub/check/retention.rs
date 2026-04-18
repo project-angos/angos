@@ -270,45 +270,58 @@ impl RetentionChecker {
         .await?;
 
         for digest in &revisions {
-            if self.is_protected(namespace, digest).await? {
-                debug!("Skipping protected manifest '{namespace}@{digest}'");
-                continue;
-            }
+            self.process_orphan_revision(namespace, digest, last_pushed, last_pulled)
+                .await?;
+        }
 
-            if self.has_tags(namespace, digest).await? {
-                continue;
-            }
+        Ok(())
+    }
 
-            let Ok(metadata) = self
-                .metadata_store
-                .read_link(namespace, &LinkKind::Digest(digest.clone()), false)
-                .await
-            else {
-                continue;
-            };
+    async fn process_orphan_revision(
+        &self,
+        namespace: &str,
+        digest: &Digest,
+        last_pushed: &[String],
+        last_pulled: &[String],
+    ) -> Result<(), Error> {
+        if self.is_protected(namespace, digest).await? {
+            debug!("Skipping protected manifest '{namespace}@{digest}'");
+            return Ok(());
+        }
 
-            let manifest = ManifestImage {
-                tag: None,
-                pushed_at: metadata
-                    .created_at
-                    .map(|t| t.timestamp())
-                    .unwrap_or_default(),
-                last_pulled_at: metadata
-                    .accessed_at
-                    .map(|t| t.timestamp())
-                    .unwrap_or_default(),
-            };
+        if self.has_tags(namespace, digest).await? {
+            return Ok(());
+        }
 
-            let label = format!("{namespace}@{digest}");
-            if !self.evaluate_retention_policies(
-                namespace,
-                &label,
-                &manifest,
-                last_pushed,
-                last_pulled,
-            )? {
-                self.delete_manifest(namespace, digest).await?;
-            }
+        let Ok(metadata) = self
+            .metadata_store
+            .read_link(namespace, &LinkKind::Digest(digest.clone()), false)
+            .await
+        else {
+            return Ok(());
+        };
+
+        let manifest = ManifestImage {
+            tag: None,
+            pushed_at: metadata
+                .created_at
+                .map(|t| t.timestamp())
+                .unwrap_or_default(),
+            last_pulled_at: metadata
+                .accessed_at
+                .map(|t| t.timestamp())
+                .unwrap_or_default(),
+        };
+
+        let label = format!("{namespace}@{digest}");
+        if !self.evaluate_retention_policies(
+            namespace,
+            &label,
+            &manifest,
+            last_pushed,
+            last_pulled,
+        )? {
+            self.delete_manifest(namespace, digest).await?;
         }
 
         Ok(())
