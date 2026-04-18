@@ -33,7 +33,6 @@ mod registry;
 mod secret;
 mod watcher;
 
-// TODO: to be moved
 fn set_tracing(config: Option<ObservabilityConfig>) -> Result<(), configuration::Error> {
     if let Some(ObservabilityConfig {
         tracing: Some(tracing_config),

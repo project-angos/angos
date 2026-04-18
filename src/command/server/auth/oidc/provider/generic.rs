@@ -95,7 +95,6 @@ pub async fn validate_oidc_token(
     let header = decode_header(token)
         .map_err(|e| Error::Unauthorized(format!("Failed to decode JWT header: {e}")))?;
 
-    // XXX: rewrite that log
     debug!(
         "JWT header: alg={:?}, kid={:?}, typ={:?}",
         header.alg, header.kid, header.typ

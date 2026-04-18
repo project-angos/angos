@@ -712,7 +712,7 @@ impl MetadataStore for Backend {
             return Ok(index);
         }
 
-        // XXX: remove legacy index.json fallback and migration below for v2.0.0
+        // Legacy index.json fallback — remove after v2.0.0 migration
         let legacy_path = path_builder::blob_index_path(digest);
         let data = match self.store.read(&legacy_path).await {
             Ok(data) => data,
