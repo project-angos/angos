@@ -120,31 +120,15 @@ impl RetentionChecker {
     }
 
     fn build_sorted_rankings(tags: &[TagWithMetadata]) -> (Vec<String>, Vec<String>) {
-        let mut pushed_indices: Vec<usize> = (0..tags.len()).collect();
-        pushed_indices.sort_by(|&a, &b| {
-            tags[b]
-                .metadata
-                .created_at
-                .cmp(&tags[a].metadata.created_at)
-        });
-        let last_pushed = pushed_indices
-            .iter()
-            .map(|&i| tags[i].name.clone())
-            .collect();
-
-        let mut pulled_indices: Vec<usize> = (0..tags.len()).collect();
-        pulled_indices.sort_by(|&a, &b| {
-            tags[b]
-                .metadata
-                .accessed_at
-                .cmp(&tags[a].metadata.accessed_at)
-        });
-        let last_pulled = pulled_indices
-            .iter()
-            .map(|&i| tags[i].name.clone())
-            .collect();
-
+        let last_pushed = Self::rank_by(tags, |m| m.created_at);
+        let last_pulled = Self::rank_by(tags, |m| m.accessed_at);
         (last_pushed, last_pulled)
+    }
+
+    fn rank_by<K: Ord>(tags: &[TagWithMetadata], key: impl Fn(&LinkMetadata) -> K) -> Vec<String> {
+        let mut indices: Vec<usize> = (0..tags.len()).collect();
+        indices.sort_by(|&a, &b| key(&tags[b].metadata).cmp(&key(&tags[a].metadata)));
+        indices.iter().map(|&i| tags[i].name.clone()).collect()
     }
 
     fn get_deletable_tags<'a>(
