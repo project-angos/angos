@@ -32,8 +32,8 @@ mod tests {
     use super::*;
     use crate::cache::redis::BackendConfig;
 
-    #[tokio::test]
-    async fn test_memory_backend() {
+    #[test]
+    fn test_memory_backend() {
         let config = Config::Memory;
         let backend = config.to_backend();
 
@@ -43,8 +43,8 @@ mod tests {
         assert_eq!((*backend).type_id(), TypeId::of::<cache::memory::Backend>());
     }
 
-    #[tokio::test]
-    async fn test_redis_backend() {
+    #[test]
+    fn test_redis_backend() {
         let config = Config::Redis(BackendConfig {
             url: "redis://localhost:6379/0".to_string(),
             key_prefix: "test_cache_config".to_string(),

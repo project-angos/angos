@@ -1833,8 +1833,8 @@ async fn test_list_referrers_with_stored_descriptor() {
     }
 }
 
-#[tokio::test]
-async fn test_link_metadata_backward_compat_no_media_type() {
+#[test]
+fn test_link_metadata_backward_compat_no_media_type() {
     let json = format!(
         r#"{{"target":"sha256:{}","created_at":"2024-01-01T00:00:00Z"}}"#,
         "a".repeat(64)
