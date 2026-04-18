@@ -51,6 +51,7 @@ pub fn compute_signature(secret: &str, body: &[u8]) -> String {
     hex::encode(mac.finalize().into_bytes())
 }
 
+#[cfg(test)]
 pub fn matches_event(
     config: &EventWebhookConfig,
     event_kind: &EventKind,
@@ -71,6 +72,21 @@ pub fn matches_event(
 struct WebhookEndpoint {
     client: Client,
     config: EventWebhookConfig,
+    compiled_filters: Vec<Regex>,
+}
+
+impl WebhookEndpoint {
+    fn matches_event(&self, event_kind: &EventKind, repository: &str) -> bool {
+        if !self.config.events.contains(event_kind) {
+            return false;
+        }
+        if self.compiled_filters.is_empty() {
+            return true;
+        }
+        self.compiled_filters
+            .iter()
+            .any(|re| re.is_match(repository))
+    }
 }
 
 pub struct EventDispatcher {
@@ -167,7 +183,28 @@ impl EventDispatcher {
                     ))
                 })?;
 
-            endpoints.insert(name, WebhookEndpoint { client, config });
+            let compiled_filters = config
+                .repository_filter
+                .as_deref()
+                .unwrap_or_default()
+                .iter()
+                .filter_map(|pattern| {
+                    Regex::new(pattern)
+                        .map_err(|e| {
+                            warn!("Invalid repository_filter regex '{pattern}' for webhook '{name}': {e}");
+                        })
+                        .ok()
+                })
+                .collect();
+
+            endpoints.insert(
+                name,
+                WebhookEndpoint {
+                    client,
+                    config,
+                    compiled_filters,
+                },
+            );
         }
 
         Ok(Self {
@@ -209,7 +246,7 @@ impl EventDispatcher {
             .to_string();
 
         for (name, endpoint) in &self.endpoints {
-            if !matches_event(&endpoint.config, &event.kind, &event.repository) {
+            if !endpoint.matches_event(&event.kind, &event.repository) {
                 continue;
             }
 
