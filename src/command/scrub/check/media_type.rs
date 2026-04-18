@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 use crate::{
     command::scrub::check::NamespaceChecker,
@@ -74,8 +74,13 @@ impl MediaTypeChecker {
 
     async fn read_media_type(&self, digest: &Digest) -> Result<Option<String>, Error> {
         let content = self.blob_store.read_blob(digest).await?;
-        let manifest: Manifest = serde_json::from_slice(&content).unwrap_or_default();
-        Ok(manifest.media_type)
+        match serde_json::from_slice::<Manifest>(&content) {
+            Ok(manifest) => Ok(manifest.media_type),
+            Err(e) => {
+                warn!("Failed to deserialize manifest for {digest}: {e}");
+                Ok(None)
+            }
+        }
     }
 }
 
