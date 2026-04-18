@@ -1566,48 +1566,59 @@ impl Backend {
 
         // Write each shard
         for (shard_key, shard_namespaces) in &shards {
-            let registry = NamespaceRegistry {
-                namespaces: shard_namespaces.clone(),
-            };
-            let content = Bytes::from(serde_json::to_vec(&registry)?);
-            let path = format!(
-                "{}/{shard_key}.json",
-                path_builder::namespace_registry_shard_dir()
-            );
+            self.process_namespace_shard(shard_key, shard_namespaces)
+                .await?;
+        }
 
-            if self.conditional.supports_cas() {
-                let etag = match self.store.read_with_etag(&path).await {
-                    Ok((_, etag)) => etag,
-                    Err(e) if e.kind() == ErrorKind::NotFound => None,
-                    Err(e) => return Err(Error::from(e)),
-                };
-                let write_result = if let Some(ref etag) = etag {
-                    self.store
-                        .put_object_if_match(&path, etag, content)
-                        .await
-                        .map(|_| ())
-                } else {
-                    self.store
-                        .put_object_if_not_exists(&path, content)
-                        .await
-                        .map(|_| ())
-                };
-                match write_result {
-                    Ok(()) => {}
-                    Err(data_store::Error::PreconditionFailed) => {
-                        debug!(
-                            shard_key,
-                            "Namespace registry shard rebuild lost CAS race; concurrent write wins"
-                        );
-                    }
-                    Err(e) => return Err(Error::StorageBackend(e.to_string())),
-                }
+        Ok(())
+    }
+
+    async fn process_namespace_shard(
+        &self,
+        shard_key: &str,
+        shard_namespaces: &[String],
+    ) -> Result<(), Error> {
+        let registry = NamespaceRegistry {
+            namespaces: shard_namespaces.to_vec(),
+        };
+        let content = Bytes::from(serde_json::to_vec(&registry)?);
+        let path = format!(
+            "{}/{shard_key}.json",
+            path_builder::namespace_registry_shard_dir()
+        );
+
+        if self.conditional.supports_cas() {
+            let etag = match self.store.read_with_etag(&path).await {
+                Ok((_, etag)) => etag,
+                Err(e) if e.kind() == ErrorKind::NotFound => None,
+                Err(e) => return Err(Error::from(e)),
+            };
+            let write_result = if let Some(ref etag) = etag {
+                self.store
+                    .put_object_if_match(&path, etag, content)
+                    .await
+                    .map(|_| ())
             } else {
-                let lock_key = format!("namespace_registry_shard_{shard_key}");
-                let guard = self.lock.acquire(&[lock_key]).await?;
-                self.store.put_object(&path, content).await?;
-                guard.release().await;
+                self.store
+                    .put_object_if_not_exists(&path, content)
+                    .await
+                    .map(|_| ())
+            };
+            match write_result {
+                Ok(()) => {}
+                Err(data_store::Error::PreconditionFailed) => {
+                    debug!(
+                        shard_key,
+                        "Namespace registry shard rebuild lost CAS race; concurrent write wins"
+                    );
+                }
+                Err(e) => return Err(Error::StorageBackend(e.to_string())),
             }
+        } else {
+            let lock_key = format!("namespace_registry_shard_{shard_key}");
+            let guard = self.lock.acquire(&[lock_key]).await?;
+            self.store.put_object(&path, content).await?;
+            guard.release().await;
         }
 
         Ok(())
