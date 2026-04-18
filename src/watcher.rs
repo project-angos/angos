@@ -15,6 +15,48 @@ use crate::{
     configuration::{Configuration, Error, ServerConfig},
 };
 
+#[derive(Debug, PartialEq)]
+enum ChangeKind {
+    Config,
+    Tls,
+    Irrelevant,
+}
+
+fn classify_event(
+    event: &Event,
+    canonical_config_path: &Path,
+    canonical_config_dir: &Path,
+    canonical_tls_dirs: &HashSet<PathBuf>,
+) -> ChangeKind {
+    if !matches!(
+        event.kind,
+        EventKind::Modify(_) | EventKind::Create(_) | EventKind::Remove(_)
+    ) {
+        return ChangeKind::Irrelevant;
+    }
+
+    let is_data_symlink = |p: &PathBuf| {
+        p.file_name().is_some_and(|n| n == "..data") && p.parent() == Some(canonical_config_dir)
+    };
+    let affects_config = event
+        .paths
+        .iter()
+        .any(|p| p == canonical_config_path || is_data_symlink(p));
+    if affects_config {
+        return ChangeKind::Config;
+    }
+
+    let affects_tls = event
+        .paths
+        .iter()
+        .any(|p| p.parent().is_some_and(|d| canonical_tls_dirs.contains(d)));
+    if affects_tls {
+        return ChangeKind::Tls;
+    }
+
+    ChangeKind::Irrelevant
+}
+
 #[async_trait]
 pub trait ConfigNotifier: Send + Sync {
     async fn notify_config_change(&self, config: &Configuration);
@@ -118,54 +160,38 @@ async fn watch_config_loop(
                 return Ok(());
             };
 
-            if !matches!(
-                event.kind,
-                EventKind::Modify(_) | EventKind::Create(_) | EventKind::Remove(_)
+            match classify_event(
+                &event,
+                &canonical_config_path,
+                &canonical_config_dir,
+                &canonical_tls_dirs,
             ) {
-                continue;
-            }
-
-            let is_data_symlink = |p: &PathBuf| {
-                p.file_name().is_some_and(|n| n == "..data")
-                    && p.parent() == Some(canonical_config_dir.as_path())
-            };
-            let affects_config = event
-                .paths
-                .iter()
-                .any(|p| p == &canonical_config_path || is_data_symlink(p));
-            let affects_tls = !affects_config
-                && event
-                    .paths
-                    .iter()
-                    .any(|p| p.parent().is_some_and(|d| canonical_tls_dirs.contains(d)));
-
-            if !affects_config && !affects_tls {
-                continue;
-            }
-
-            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-
-            if affects_config {
-                info!("Configuration change detected, reloading");
-                match Configuration::load(&config_path) {
-                    Ok(ref cfg) => {
-                        notifier.notify_config_change(cfg).await;
-                        info!("Configuration reloaded");
+                ChangeKind::Irrelevant => continue,
+                ChangeKind::Config => {
+                    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+                    info!("Configuration change detected, reloading");
+                    match Configuration::load(&config_path) {
+                        Ok(ref cfg) => {
+                            notifier.notify_config_change(cfg).await;
+                            info!("Configuration reloaded");
+                        }
+                        Err(e) => warn!("Failed to reload configuration: {e}"),
                     }
-                    Err(e) => warn!("Failed to reload configuration: {e}"),
                 }
-            } else {
-                info!("TLS certificate change detected, reloading");
-                match Configuration::load(&config_path) {
-                    Ok(Configuration {
-                        server: ServerConfig::Tls(tls_config),
-                        ..
-                    }) => {
-                        notifier.notify_tls_config_change(&tls_config.tls);
-                        info!("TLS configuration reloaded");
+                ChangeKind::Tls => {
+                    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+                    info!("TLS certificate change detected, reloading");
+                    match Configuration::load(&config_path) {
+                        Ok(Configuration {
+                            server: ServerConfig::Tls(tls_config),
+                            ..
+                        }) => {
+                            notifier.notify_tls_config_change(&tls_config.tls);
+                            info!("TLS configuration reloaded");
+                        }
+                        Ok(_) => {}
+                        Err(e) => warn!("Failed to load configuration for TLS reload: {e}"),
                     }
-                    Ok(_) => {}
-                    Err(e) => warn!("Failed to load configuration for TLS reload: {e}"),
                 }
             }
 
@@ -178,9 +204,107 @@ async fn watch_config_loop(
 mod tests {
     use std::{fs, io::Write, sync::Mutex, time::Duration};
 
+    use notify::event::{AccessKind, ModifyKind};
     use tempfile::TempDir;
 
     use super::*;
+
+    fn make_event(kind: EventKind, paths: Vec<PathBuf>) -> Event {
+        Event {
+            kind,
+            paths,
+            attrs: notify::event::EventAttributes::default(),
+        }
+    }
+
+    #[test]
+    fn classify_access_event_is_irrelevant() {
+        let config_path = PathBuf::from("/etc/app/config.toml");
+        let config_dir = PathBuf::from("/etc/app");
+        let tls_dirs = HashSet::new();
+
+        let event = make_event(
+            EventKind::Access(AccessKind::Read),
+            vec![config_path.clone()],
+        );
+
+        assert_eq!(
+            classify_event(&event, &config_path, &config_dir, &tls_dirs),
+            ChangeKind::Irrelevant,
+        );
+    }
+
+    #[test]
+    fn classify_modify_on_config_path_is_config() {
+        let config_path = PathBuf::from("/etc/app/config.toml");
+        let config_dir = PathBuf::from("/etc/app");
+        let tls_dirs = HashSet::new();
+
+        let event = make_event(
+            EventKind::Modify(ModifyKind::Data(notify::event::DataChange::Content)),
+            vec![config_path.clone()],
+        );
+
+        assert_eq!(
+            classify_event(&event, &config_path, &config_dir, &tls_dirs),
+            ChangeKind::Config,
+        );
+    }
+
+    #[test]
+    fn classify_modify_on_data_symlink_in_config_dir_is_config() {
+        let config_path = PathBuf::from("/etc/app/config.toml");
+        let config_dir = PathBuf::from("/etc/app");
+        let tls_dirs = HashSet::new();
+
+        let data_symlink = config_dir.join("..data");
+        let event = make_event(
+            EventKind::Modify(ModifyKind::Data(notify::event::DataChange::Content)),
+            vec![data_symlink],
+        );
+
+        assert_eq!(
+            classify_event(&event, &config_path, &config_dir, &tls_dirs),
+            ChangeKind::Config,
+        );
+    }
+
+    #[test]
+    fn classify_modify_in_tls_dir_is_tls() {
+        let config_path = PathBuf::from("/etc/app/config.toml");
+        let config_dir = PathBuf::from("/etc/app");
+        let tls_dir = PathBuf::from("/etc/app/tls");
+        let tls_dirs: HashSet<PathBuf> = [tls_dir.clone()].into_iter().collect();
+
+        let cert = tls_dir.join("server.pem");
+        let event = make_event(
+            EventKind::Modify(ModifyKind::Data(notify::event::DataChange::Content)),
+            vec![cert],
+        );
+
+        assert_eq!(
+            classify_event(&event, &config_path, &config_dir, &tls_dirs),
+            ChangeKind::Tls,
+        );
+    }
+
+    #[test]
+    fn classify_modify_on_unrelated_path_is_irrelevant() {
+        let config_path = PathBuf::from("/etc/app/config.toml");
+        let config_dir = PathBuf::from("/etc/app");
+        let tls_dirs: HashSet<PathBuf> = [PathBuf::from("/etc/app/tls")].into_iter().collect();
+
+        let unrelated = PathBuf::from("/var/log/app.log");
+        let event = make_event(
+            EventKind::Modify(ModifyKind::Data(notify::event::DataChange::Content)),
+            vec![unrelated],
+        );
+
+        assert_eq!(
+            classify_event(&event, &config_path, &config_dir, &tls_dirs),
+            ChangeKind::Irrelevant,
+        );
+    }
 
     const MINIMAL_CONFIG: &str = r#"
 [server]

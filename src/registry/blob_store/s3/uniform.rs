@@ -102,7 +102,7 @@ impl Backend {
         };
 
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-        let mut uploaded_size: u64 = part_list.iter().map(|(_, _, size)| *size as u64).sum();
+        let mut uploaded_size: u64 = part_list.iter().map(|p| p.size as u64).sum();
         #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
         let mut uploaded_parts = (part_list.len() + 1) as i32;
 
@@ -178,10 +178,7 @@ impl Backend {
             };
 
         #[allow(clippy::cast_sign_loss)]
-        let mut size: u64 = parts
-            .iter()
-            .map(|(_, _, part_size)| *part_size as u64)
-            .sum();
+        let mut size: u64 = parts.iter().map(|p| p.size as u64).sum();
 
         let staged_path = path_builder::upload_staged_container_path(name, uuid, size);
         if let Ok(staged_size) = self.store.object_size(&staged_path).await {
@@ -218,17 +215,17 @@ impl Backend {
         };
         let mut size = part_list
             .iter()
-            .map(|(_, _, s)| u64::try_from(*s).unwrap_or(0))
+            .map(|p| u64::try_from(p.size).unwrap_or(0))
             .sum::<u64>();
 
         let source_key = path_builder::upload_staged_container_path(name, uuid, size);
 
         let mut parts = Vec::new();
-        for (part_num, e_tag, _) in part_list {
+        for part in part_list {
             parts.push(
                 CompletedPart::builder()
-                    .part_number(part_num)
-                    .e_tag(e_tag)
+                    .part_number(part.part_number)
+                    .e_tag(part.e_tag)
                     .build(),
             );
         }

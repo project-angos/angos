@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use chrono::Duration;
+use chrono::{DateTime, Duration, Utc};
 use tracing::{info, instrument};
 
 use super::Backend;
@@ -15,6 +15,36 @@ pub fn parse_upload_key(key: &str) -> Option<(String, String)> {
     Some((namespace.to_string(), uuid.to_string()))
 }
 
+impl Backend {
+    async fn check_and_abort_orphan(
+        &self,
+        key: &str,
+        upload_id: &str,
+        initiated: DateTime<Utc>,
+        now: DateTime<Utc>,
+        timeout: Duration,
+        dry_run: bool,
+    ) -> Result<bool, Error> {
+        if now.signed_duration_since(initiated) < timeout {
+            return Ok(false);
+        }
+        let Some((namespace, uuid)) = parse_upload_key(key) else {
+            return Ok(false);
+        };
+        let startedat_path = path_builder::upload_start_date_path(&namespace, &uuid);
+        if self.store.object_size(&startedat_path).await.is_ok() {
+            return Ok(false);
+        }
+        if dry_run {
+            info!("DRY RUN: would abort orphan multipart upload {key}");
+        } else {
+            info!("Aborting orphan multipart upload {key}");
+            self.store.abort_multipart_upload(key, upload_id).await?;
+        }
+        Ok(true)
+    }
+}
+
 #[async_trait]
 impl MultipartCleanup for Backend {
     #[instrument(skip(self))]
@@ -23,8 +53,6 @@ impl MultipartCleanup for Backend {
         timeout: Duration,
         dry_run: bool,
     ) -> Result<usize, Error> {
-        use chrono::Utc;
-
         let mut count = 0;
         let now = Utc::now();
         let mut key_marker: Option<String> = None;
@@ -37,26 +65,12 @@ impl MultipartCleanup for Backend {
                 .await?;
 
             for (key, upload_id, initiated) in uploads {
-                if now.signed_duration_since(initiated) < timeout {
-                    continue;
+                if self
+                    .check_and_abort_orphan(&key, &upload_id, initiated, now, timeout, dry_run)
+                    .await?
+                {
+                    count += 1;
                 }
-
-                let Some((namespace, uuid)) = parse_upload_key(&key) else {
-                    continue;
-                };
-
-                let startedat_path = path_builder::upload_start_date_path(&namespace, &uuid);
-                if self.store.object_size(&startedat_path).await.is_ok() {
-                    continue;
-                }
-
-                if dry_run {
-                    info!("DRY RUN: would abort orphan multipart upload {key}");
-                } else {
-                    info!("Aborting orphan multipart upload {key}");
-                    self.store.abort_multipart_upload(&key, &upload_id).await?;
-                }
-                count += 1;
             }
 
             if next_key.is_none() {

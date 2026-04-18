@@ -1,13 +1,16 @@
 use std::{
     net::{IpAddr, SocketAddr},
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::Arc,
     time::Duration,
 };
 
 use arc_swap::ArcSwap;
 use hyper_util::rt::TokioIo;
-use rustls::{RootCertStore, server::WebPkiClientVerifier};
+use rustls::{
+    RootCertStore,
+    server::{WebPkiClientVerifier, danger::ClientCertVerifier},
+};
 use rustls_pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
 use serde::Deserialize;
 use tokio_rustls::TlsAcceptor;
@@ -51,6 +54,33 @@ pub struct ServerTlsConfig {
     pub server_certificate_bundle: PathBuf,
     pub server_private_key: PathBuf,
     pub client_ca_bundle: Option<PathBuf>,
+}
+
+fn build_client_verifier(client_ca_bundle: &Path) -> Result<Arc<dyn ClientCertVerifier>, Error> {
+    let client_certs: Vec<CertificateDer> = CertificateDer::pem_file_iter(client_ca_bundle)
+        .map_err(|e| {
+            Error::Initialization(format!("Failed to read client certificates bundle: {e}"))
+        })?
+        .collect::<Result<_, _>>()
+        .map_err(|e| Error::Initialization(format!("Failed to build client certs: {e}")))?;
+
+    let mut client_cert_store = RootCertStore::empty();
+    for client_cert in client_certs {
+        client_cert_store.add(client_cert).map_err(|e| {
+            Error::Initialization(format!(
+                "Failed to add client CA certificate to root cert store: {e}"
+            ))
+        })?;
+    }
+
+    WebPkiClientVerifier::builder(Arc::new(client_cert_store))
+        .allow_unauthenticated()
+        .build()
+        .map_err(|e| {
+            Error::Initialization(format!(
+                "Failed to create TLS client certificate verifier: {e}"
+            ))
+        })
 }
 
 pub struct TlsListener {
@@ -111,73 +141,33 @@ impl TlsListener {
         debug!("Detected TLS configuration");
         let server_certs = CertificateDer::pem_file_iter(&tls_config.server_certificate_bundle)
             .map_err(|e| {
-                let msg = format!("Failed to read server certificates bundle: {e}");
-                Error::Initialization(msg)
+                Error::Initialization(format!("Failed to read server certificates bundle: {e}"))
             })?
             .collect::<Result<_, _>>()
-            .map_err(|e| {
-                let msg = format!("Failed to build server certs: {e}");
-                Error::Initialization(msg)
-            })?;
+            .map_err(|e| Error::Initialization(format!("Failed to build server certs: {e}")))?;
         let server_key =
             PrivateKeyDer::from_pem_file(&tls_config.server_private_key).map_err(|e| {
-                let msg = format!("Failed to read server private key: {e}");
-                Error::Initialization(msg)
+                Error::Initialization(format!("Failed to read server private key: {e}"))
             })?;
 
         let server_config = if let Some(client_ca_bundle) = tls_config.client_ca_bundle.as_ref() {
-            debug!("Client CA bundle detected (will serve with TLS client authentication)");
-            let client_certs: Vec<CertificateDer> = CertificateDer::pem_file_iter(client_ca_bundle)
-                .map_err(|e| {
-                    let msg = format!("Failed to read client certificates bundle: {e}");
-                    Error::Initialization(msg)
-                })?
-                .collect::<Result<_, _>>()
-                .map_err(|e| {
-                    let msg = format!("Failed to build client certs: {e}");
-                    Error::Initialization(msg)
-                })?;
-
-            let mut client_cert_store = RootCertStore::empty();
-            for client_cert in client_certs {
-                if let Err(err) = client_cert_store.add(client_cert) {
-                    let msg =
-                        format!("Failed to add client CA certificate to root cert store: {err}");
-                    return Err(Error::Initialization(msg));
-                }
-            }
-
-            let Ok(client_cert_verifier) =
-                WebPkiClientVerifier::builder(Arc::new(client_cert_store))
-                    .allow_unauthenticated()
-                    .build()
-            else {
-                let msg = "Failed to create TLS client certificate verifier".to_string();
-                return Err(Error::Initialization(msg));
-            };
-
+            debug!("Client CA bundle detected");
+            let client_cert_verifier = build_client_verifier(client_ca_bundle)?;
             rustls::ServerConfig::builder()
                 .with_client_cert_verifier(client_cert_verifier)
                 .with_single_cert(server_certs, server_key)
         } else {
-            debug!("No client CA bundle detected (will serve without TLS client authentication)");
-
+            debug!("No client CA bundle detected");
             rustls::ServerConfig::builder()
                 .with_no_client_auth()
                 .with_single_cert(server_certs, server_key)
         };
 
-        let server_config = match server_config {
-            Ok(cfg) => cfg,
-            Err(err) => {
-                let msg = format!("Failed to create TLS server config: {err}");
-                return Err(Error::Initialization(msg));
-            }
-        };
+        let server_config = server_config.map_err(|e| {
+            Error::Initialization(format!("Failed to create TLS server config: {e}"))
+        })?;
 
-        let server_config = Arc::new(server_config);
-        let tls_acceptor = TlsAcceptor::from(server_config);
-        Ok(tls_acceptor)
+        Ok(TlsAcceptor::from(Arc::new(server_config)))
     }
 
     pub async fn serve(&self) -> Result<(), Error> {

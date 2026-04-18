@@ -112,6 +112,20 @@ impl Registry {
         Ok::<(), Error>(())
     }
 
+    async fn cache_blob(
+        store: Arc<dyn BlobStore + Send + Sync>,
+        stream: BoxedReader,
+        namespace: Namespace,
+        digest: Digest,
+    ) -> Result<(), task_queue::Error> {
+        debug!("Fetching blob: {digest}");
+        Self::copy_blob(store, stream, &namespace, &digest)
+            .await
+            .map_err(|e| task_queue::Error::TaskExecution(e.to_string()))?;
+        info!("Caching of {digest} completed");
+        Ok(())
+    }
+
     #[instrument(skip(repository))]
     pub async fn get_blob(
         &self,
@@ -147,25 +161,19 @@ impl Registry {
         let (_, caching_stream) = repository
             .get_blob(accepted_types, namespace, digest)
             .await?;
-        let cache_namespace = namespace.clone();
 
         let task_key = format!("{namespace}/{digest}");
-        let cache_digest = digest.clone();
-        let store = self.blob_store.clone();
 
-        self.task_queue.submit(&task_key, async move {
-            let digest_string = cache_digest.to_string();
-
-            debug!("Fetching blob: {digest_string}");
-            Self::copy_blob(store, caching_stream, &cache_namespace, &cache_digest)
-                .await
-                .map_err(|e| task_queue::Error::TaskExecution(e.to_string()))?;
-
-            info!("Caching of {digest_string} completed");
-            Ok(())
-        });
+        self.task_queue.submit(
+            &task_key,
+            Self::cache_blob(
+                self.blob_store.clone(),
+                caching_stream,
+                namespace.clone(),
+                digest.clone(),
+            ),
+        );
         info!("Scheduled blob copy task '{task_key}'");
-        //
 
         Ok(GetBlobResponse::Reader(client_stream, total_length))
     }
@@ -443,8 +451,8 @@ mod tests {
             let config_link = LinkKind::Config(digest.clone());
 
             let mut tx = registry.metadata_store.begin_transaction(namespace);
-            tx.create_link(&layer_link, &digest);
-            tx.create_link(&config_link, &digest);
+            tx.create_link(&layer_link, &digest).add();
+            tx.create_link(&config_link, &digest).add();
             tx.commit().await.unwrap();
 
             assert!(
@@ -553,7 +561,7 @@ mod tests {
             let config_link = LinkKind::Config(digest.clone());
 
             let mut tx = registry.metadata_store.begin_transaction(namespace);
-            tx.create_link(&config_link, &digest);
+            tx.create_link(&config_link, &digest).add();
             tx.commit().await.unwrap();
 
             assert!(

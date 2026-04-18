@@ -51,6 +51,7 @@ pub fn compute_signature(secret: &str, body: &[u8]) -> String {
     hex::encode(mac.finalize().into_bytes())
 }
 
+#[cfg(test)]
 pub fn matches_event(
     config: &EventWebhookConfig,
     event_kind: &EventKind,
@@ -71,6 +72,21 @@ pub fn matches_event(
 struct WebhookEndpoint {
     client: Client,
     config: EventWebhookConfig,
+    compiled_filters: Vec<Regex>,
+}
+
+impl WebhookEndpoint {
+    fn matches_event(&self, event_kind: &EventKind, repository: &str) -> bool {
+        if !self.config.events.contains(event_kind) {
+            return false;
+        }
+        if self.compiled_filters.is_empty() {
+            return true;
+        }
+        self.compiled_filters
+            .iter()
+            .any(|re| re.is_match(repository))
+    }
 }
 
 pub struct EventDispatcher {
@@ -136,6 +152,30 @@ async fn send_with_retries(
     Err(last_err.unwrap_or_else(|| "unknown error".to_string()))
 }
 
+async fn deliver_async(
+    client: Client,
+    url: String,
+    token: Option<String>,
+    body: Vec<u8>,
+    event_kind_header: String,
+    max_retries: u32,
+    name: String,
+) {
+    if let Err(e) = send_and_record(
+        &client,
+        &url,
+        token.as_deref(),
+        &body,
+        &event_kind_header,
+        max_retries,
+        &name,
+    )
+    .await
+    {
+        warn!("Async webhook '{name}' failed: {e}");
+    }
+}
+
 async fn send_and_record(
     client: &Client,
     url: &str,
@@ -167,7 +207,28 @@ impl EventDispatcher {
                     ))
                 })?;
 
-            endpoints.insert(name, WebhookEndpoint { client, config });
+            let compiled_filters = config
+                .repository_filter
+                .as_deref()
+                .unwrap_or_default()
+                .iter()
+                .filter_map(|pattern| {
+                    Regex::new(pattern)
+                        .map_err(|e| {
+                            warn!("Invalid repository_filter regex '{pattern}' for webhook '{name}': {e}");
+                        })
+                        .ok()
+                })
+                .collect();
+
+            endpoints.insert(
+                name,
+                WebhookEndpoint {
+                    client,
+                    config,
+                    compiled_filters,
+                },
+            );
         }
 
         Ok(Self {
@@ -209,7 +270,7 @@ impl EventDispatcher {
             .to_string();
 
         for (name, endpoint) in &self.endpoints {
-            if !matches_event(&endpoint.config, &event.kind, &event.repository) {
+            if !endpoint.matches_event(&event.kind, &event.repository) {
                 continue;
             }
 
@@ -223,30 +284,16 @@ impl EventDispatcher {
                         warn!("Async webhook '{name}' skipped: dispatcher is shut down");
                         continue;
                     }
-                    let client = endpoint.client.clone();
-                    let url = endpoint.config.url.clone();
-                    let token = endpoint.config.token.clone();
-                    let body = body.clone();
-                    let event_kind_header = event_kind_header.clone();
-                    let name = name.clone();
-                    let max_retries = endpoint.config.max_retries;
-                    let in_flight = Arc::clone(&self.in_flight);
-                    let mut in_flight_guard = in_flight.lock().await;
-                    in_flight_guard.spawn(async move {
-                        if let Err(e) = send_and_record(
-                            &client,
-                            &url,
-                            token.as_deref(),
-                            &body,
-                            &event_kind_header,
-                            max_retries,
-                            &name,
-                        )
-                        .await
-                        {
-                            warn!("Async webhook '{name}' failed: {e}");
-                        }
-                    });
+                    let mut in_flight_guard = self.in_flight.lock().await;
+                    in_flight_guard.spawn(deliver_async(
+                        endpoint.client.clone(),
+                        endpoint.config.url.clone(),
+                        endpoint.config.token.clone(),
+                        body.clone(),
+                        event_kind_header.clone(),
+                        endpoint.config.max_retries,
+                        name.clone(),
+                    ));
                 }
                 DeliveryPolicy::Required => {
                     send_and_record(

@@ -71,76 +71,92 @@ impl Authenticator {
         let mut identity = ClientIdentity::new(remote_address);
         let mut authenticated_method = None;
 
-        match self.mtls_validator.authenticate(parts, &mut identity).await {
+        if self.try_mtls_authentication(parts, &mut identity).await {
+            authenticated_method = Some("mtls");
+        }
+
+        if self.try_oidc_authentication(parts, &mut identity).await? {
+            authenticated_method = Some("oidc");
+        } else if self.try_basic_authentication(parts, &mut identity).await? {
+            authenticated_method = Some("basic");
+        }
+
+        tracing::Span::current().record("auth_method", authenticated_method.unwrap_or("anonymous"));
+
+        Ok(identity)
+    }
+
+    /// Attempts mTLS authentication. Returns `true` if a valid certificate was extracted.
+    /// Errors are logged and suppressed — mTLS is non-fatal so other methods can follow.
+    async fn try_mtls_authentication(&self, parts: &Parts, identity: &mut ClientIdentity) -> bool {
+        match self.mtls_validator.authenticate(parts, identity).await {
             Ok(AuthResult::Authenticated) => {
                 debug!("mTLS authentication extracted certificate info");
-                if authenticated_method.is_none()
-                    && (!identity.certificate.common_names.is_empty()
-                        || !identity.certificate.organizations.is_empty())
+                if !identity.certificate.common_names.is_empty()
+                    || !identity.certificate.organizations.is_empty()
                 {
                     AUTH_ATTEMPTS.with_label_values(&["mtls", "success"]).inc();
-                    authenticated_method = Some("mtls");
+                    return true;
                 }
             }
             Ok(AuthResult::NoCredentials) => {}
             Err(e) => {
-                warn!("mTLS validation error: {}", e);
+                warn!("mTLS validation error: {e}");
                 AUTH_ATTEMPTS.with_label_values(&["mtls", "failed"]).inc();
             }
         }
+        false
+    }
 
-        let mut oidc_authenticated = false;
+    /// Tries each OIDC provider in order, returning `true` on first success.
+    /// Returns `Err` if credentials were presented but invalid.
+    async fn try_oidc_authentication(
+        &self,
+        parts: &Parts,
+        identity: &mut ClientIdentity,
+    ) -> Result<bool, Error> {
         for (provider_name, validator) in &self.oidc_validators {
-            match validator.authenticate(parts, &mut identity).await {
+            match validator.authenticate(parts, identity).await {
                 Ok(AuthResult::Authenticated) => {
-                    debug!(
-                        "OIDC authentication succeeded with provider: {}",
-                        provider_name
-                    );
+                    debug!("OIDC authentication succeeded with provider: {provider_name}");
                     AUTH_ATTEMPTS.with_label_values(&["oidc", "success"]).inc();
-                    authenticated_method = Some("oidc");
-                    oidc_authenticated = true;
-                    break;
+                    return Ok(true);
                 }
                 Ok(AuthResult::NoCredentials) => {}
                 Err(e) => {
-                    warn!(
-                        "OIDC validation failed for provider {}: {}",
-                        provider_name, e
-                    );
+                    warn!("OIDC validation failed for provider {provider_name}: {e}");
                     AUTH_ATTEMPTS.with_label_values(&["oidc", "failed"]).inc();
                     return Err(e);
                 }
             }
         }
+        Ok(false)
+    }
 
-        if !oidc_authenticated {
-            match self
-                .basic_auth_validator
-                .authenticate(parts, &mut identity)
-                .await
-            {
-                Ok(AuthResult::Authenticated) => {
-                    debug!("Basic authentication succeeded");
-                    AUTH_ATTEMPTS.with_label_values(&["basic", "success"]).inc();
-                    authenticated_method = Some("basic");
-                }
-                Ok(AuthResult::NoCredentials) => {}
-                Err(e) => {
-                    warn!("Basic auth validation failed: {}", e);
-                    AUTH_ATTEMPTS.with_label_values(&["basic", "failed"]).inc();
-                    return Err(e);
-                }
+    /// Attempts basic auth authentication, returning `true` on success.
+    /// Returns `Err` if credentials were presented but invalid.
+    async fn try_basic_authentication(
+        &self,
+        parts: &Parts,
+        identity: &mut ClientIdentity,
+    ) -> Result<bool, Error> {
+        match self
+            .basic_auth_validator
+            .authenticate(parts, identity)
+            .await
+        {
+            Ok(AuthResult::Authenticated) => {
+                debug!("Basic authentication succeeded");
+                AUTH_ATTEMPTS.with_label_values(&["basic", "success"]).inc();
+                Ok(true)
+            }
+            Ok(AuthResult::NoCredentials) => Ok(false),
+            Err(e) => {
+                warn!("Basic auth validation failed: {e}");
+                AUTH_ATTEMPTS.with_label_values(&["basic", "failed"]).inc();
+                Err(e)
             }
         }
-
-        if let Some(method) = authenticated_method {
-            tracing::Span::current().record("auth_method", method);
-        } else {
-            tracing::Span::current().record("auth_method", "anonymous");
-        }
-
-        Ok(identity)
     }
 }
 

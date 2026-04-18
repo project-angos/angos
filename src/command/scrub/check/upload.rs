@@ -1,9 +1,13 @@
 use std::sync::Arc;
 
+use async_trait::async_trait;
 use chrono::{Duration, Utc};
 use tracing::{debug, error, info};
 
-use crate::registry::{Error, blob_store::BlobStore, pagination::for_each_page};
+use crate::{
+    command::scrub::check::NamespaceChecker,
+    registry::{Error, blob_store::BlobStore, pagination::for_each_page},
+};
 
 pub struct UploadChecker {
     blob_store: Arc<dyn BlobStore + Send + Sync>,
@@ -22,28 +26,6 @@ impl UploadChecker {
             upload_timeout,
             dry_run,
         }
-    }
-
-    pub async fn check_namespace(&self, namespace: &str) -> Result<(), Error> {
-        debug!("Checking uploads from namespace '{namespace}'");
-
-        for_each_page(
-            |marker| async move {
-                self.blob_store
-                    .list_uploads(namespace, 100, marker)
-                    .await
-                    .map_err(Error::from)
-            },
-            |uploads| async move {
-                for uuid in &uploads {
-                    if let Err(e) = self.check_upload(namespace, uuid).await {
-                        error!("Failed to check upload from '{namespace}' ('{uuid}'): {e}");
-                    }
-                }
-                Ok(())
-            },
-        )
-        .await
     }
 
     async fn check_upload(&self, namespace: &str, uuid: &str) -> Result<(), Error> {
@@ -77,6 +59,31 @@ impl UploadChecker {
         let now = Utc::now();
         let duration = now.signed_duration_since(start_date);
         duration > self.upload_timeout
+    }
+}
+
+#[async_trait]
+impl NamespaceChecker for UploadChecker {
+    async fn check_namespace(&self, namespace: &str) -> Result<(), Error> {
+        debug!("Checking uploads from namespace '{namespace}'");
+
+        for_each_page(
+            |marker| async move {
+                self.blob_store
+                    .list_uploads(namespace, 100, marker)
+                    .await
+                    .map_err(Error::from)
+            },
+            |uploads| async move {
+                for uuid in &uploads {
+                    if let Err(e) = self.check_upload(namespace, uuid).await {
+                        error!("Failed to check upload from '{namespace}' ('{uuid}'): {e}");
+                    }
+                }
+                Ok(())
+            },
+        )
+        .await
     }
 }
 

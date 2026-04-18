@@ -70,21 +70,25 @@ impl BlobChecker {
 
         for (namespace, references) in blob_index.namespace {
             for link in references {
-                if self
-                    .metadata_store
-                    .read_link(&namespace, &link, false)
-                    .await
-                    .is_err()
-                    && let Err(err) = self.remove_invalid_link(&namespace, blob, &link).await
-                {
-                    error!(
-                        "Failed to remove invalid link '{link}' from blob index '{namespace}/{blob}': {err}"
-                    );
-                }
+                self.probe_and_cleanup_link(&namespace, blob, &link).await;
             }
         }
 
         Ok(())
+    }
+
+    async fn probe_and_cleanup_link(&self, namespace: &str, blob: &Digest, link: &LinkKind) {
+        if self
+            .metadata_store
+            .read_link(namespace, link, false)
+            .await
+            .is_err()
+            && let Err(err) = self.remove_invalid_link(namespace, blob, link).await
+        {
+            error!(
+                "Failed to remove invalid link '{link}' from blob index '{namespace}/{blob}': {err}"
+            );
+        }
     }
 
     async fn delete_orphan_blob(&self, blob: &Digest) -> Result<(), Error> {

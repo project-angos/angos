@@ -1,8 +1,10 @@
 use std::sync::Arc;
 
+use async_trait::async_trait;
 use tracing::{debug, error, info};
 
 use crate::{
+    command::scrub::check::NamespaceChecker,
     oci::{Digest, Manifest},
     registry::{
         Error,
@@ -29,42 +31,6 @@ impl MediaTypeChecker {
             metadata_store,
             dry_run,
         }
-    }
-
-    pub async fn check_namespace(&self, namespace: &str) -> Result<(), Error> {
-        debug!("Checking media_type field for namespace '{namespace}'");
-
-        let revisions =
-            collect_all_pages(|marker| self.metadata_store.list_revisions(namespace, 100, marker))
-                .await?;
-
-        for revision in &revisions {
-            let link = LinkKind::Digest(revision.clone());
-            if let Err(e) = self
-                .backfill_link(namespace, &link, &format!("revision {revision}"))
-                .await
-            {
-                error!(
-                    "Failed to backfill media_type for '{namespace}' (revision '{revision}'): {e}"
-                );
-            }
-        }
-
-        let tags =
-            collect_all_pages(|marker| self.metadata_store.list_tags(namespace, 100, marker))
-                .await?;
-
-        for tag in &tags {
-            let link = LinkKind::Tag(tag.clone());
-            if let Err(e) = self
-                .backfill_link(namespace, &link, &format!("tag '{tag}'"))
-                .await
-            {
-                error!("Failed to backfill media_type for '{namespace}' (tag '{tag}'): {e}");
-            }
-        }
-
-        Ok(())
     }
 
     async fn backfill_link(
@@ -98,7 +64,9 @@ impl MediaTypeChecker {
 
         info!("Setting media_type '{media_type}' on {display_name} in namespace '{namespace}'");
         let mut tx = self.metadata_store.begin_transaction(namespace);
-        tx.create_link_with_media_type(link, &metadata.target, &media_type);
+        tx.create_link(link, &metadata.target)
+            .with_media_type(&media_type)
+            .add();
         tx.commit().await?;
 
         Ok(())
@@ -108,6 +76,45 @@ impl MediaTypeChecker {
         let content = self.blob_store.read_blob(digest).await?;
         let manifest: Manifest = serde_json::from_slice(&content).unwrap_or_default();
         Ok(manifest.media_type)
+    }
+}
+
+#[async_trait]
+impl NamespaceChecker for MediaTypeChecker {
+    async fn check_namespace(&self, namespace: &str) -> Result<(), Error> {
+        debug!("Checking media_type field for namespace '{namespace}'");
+
+        let revisions =
+            collect_all_pages(|marker| self.metadata_store.list_revisions(namespace, 100, marker))
+                .await?;
+
+        for revision in &revisions {
+            let link = LinkKind::Digest(revision.clone());
+            if let Err(e) = self
+                .backfill_link(namespace, &link, &format!("revision {revision}"))
+                .await
+            {
+                error!(
+                    "Failed to backfill media_type for '{namespace}' (revision '{revision}'): {e}"
+                );
+            }
+        }
+
+        let tags =
+            collect_all_pages(|marker| self.metadata_store.list_tags(namespace, 100, marker))
+                .await?;
+
+        for tag in &tags {
+            let link = LinkKind::Tag(tag.clone());
+            if let Err(e) = self
+                .backfill_link(namespace, &link, &format!("tag '{tag}'"))
+                .await
+            {
+                error!("Failed to backfill media_type for '{namespace}' (tag '{tag}'): {e}");
+            }
+        }
+
+        Ok(())
     }
 }
 
@@ -158,8 +165,10 @@ mod tests {
 
             // Create digest and tag links WITHOUT media_type
             let mut tx = metadata_store.begin_transaction(namespace);
-            tx.create_link(&LinkKind::Digest(manifest_digest.clone()), &manifest_digest);
-            tx.create_link(&LinkKind::Tag("latest".to_string()), &manifest_digest);
+            tx.create_link(&LinkKind::Digest(manifest_digest.clone()), &manifest_digest)
+                .add();
+            tx.create_link(&LinkKind::Tag("latest".to_string()), &manifest_digest)
+                .add();
             tx.commit().await.unwrap();
 
             // Verify media_type is None before check
@@ -241,16 +250,12 @@ mod tests {
 
             // Create links WITH media_type already set
             let mut tx = metadata_store.begin_transaction(namespace);
-            tx.create_link_with_media_type(
-                &LinkKind::Digest(manifest_digest.clone()),
-                &manifest_digest,
-                media_type,
-            );
-            tx.create_link_with_media_type(
-                &LinkKind::Tag("latest".to_string()),
-                &manifest_digest,
-                media_type,
-            );
+            tx.create_link(&LinkKind::Digest(manifest_digest.clone()), &manifest_digest)
+                .with_media_type(media_type)
+                .add();
+            tx.create_link(&LinkKind::Tag("latest".to_string()), &manifest_digest)
+                .with_media_type(media_type)
+                .add();
             tx.commit().await.unwrap();
 
             // Run checker - should be a no-op
@@ -303,8 +308,10 @@ mod tests {
 
             // Create links WITHOUT media_type
             let mut tx = metadata_store.begin_transaction(namespace);
-            tx.create_link(&LinkKind::Digest(manifest_digest.clone()), &manifest_digest);
-            tx.create_link(&LinkKind::Tag("latest".to_string()), &manifest_digest);
+            tx.create_link(&LinkKind::Digest(manifest_digest.clone()), &manifest_digest)
+                .add();
+            tx.create_link(&LinkKind::Tag("latest".to_string()), &manifest_digest)
+                .add();
             tx.commit().await.unwrap();
 
             // Run checker with dry_run = true

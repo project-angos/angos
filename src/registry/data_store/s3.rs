@@ -16,7 +16,10 @@ use bytesize::ByteSize;
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
 
-use crate::{circuit_breaker::CircuitBreaker, registry::data_store::Error};
+use crate::{
+    circuit_breaker::CircuitBreaker,
+    registry::{blob_store::UploadedPart, data_store::Error},
+};
 
 #[derive(Clone, Debug, Deserialize, PartialEq)]
 #[serde(default)]
@@ -844,7 +847,7 @@ impl Backend {
         &self,
         path: &str,
         upload_id: &str,
-    ) -> Result<Vec<(i32, String, i64)>, IoError> {
+    ) -> Result<Vec<UploadedPart>, IoError> {
         let key = self.full_key(path);
         let mut parts = Vec::new();
         let mut part_number_marker = None;
@@ -870,7 +873,11 @@ impl Backend {
                 if let (Some(part_number), Some(e_tag), Some(size)) =
                     (part.part_number, part.e_tag, part.size)
                 {
-                    parts.push((part_number, e_tag, size));
+                    parts.push(UploadedPart {
+                        part_number,
+                        e_tag,
+                        size,
+                    });
                 }
             }
 

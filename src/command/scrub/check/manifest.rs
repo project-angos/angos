@@ -1,9 +1,10 @@
 use std::sync::Arc;
 
+use async_trait::async_trait;
 use tracing::{debug, error};
 
 use crate::{
-    command::scrub::check::ensure_link,
+    command::scrub::check::{NamespaceChecker, ensure_link},
     oci::Digest,
     registry::{
         Error,
@@ -31,30 +32,6 @@ impl ManifestChecker {
             metadata_store,
             dry_run,
         }
-    }
-
-    pub async fn check_namespace(&self, namespace: &str) -> Result<(), Error> {
-        debug!("Checking manifest inconsistencies from namespace '{namespace}'");
-
-        for_each_page(
-            |marker| async move {
-                self.metadata_store
-                    .list_revisions(namespace, 100, marker)
-                    .await
-                    .map_err(Error::from)
-            },
-            |revisions| async move {
-                for revision in &revisions {
-                    if let Err(e) = self.repair_manifest_links(namespace, revision).await {
-                        error!(
-                            "Failed to check tag from '{namespace}' (revision '{revision}'): {e}"
-                        );
-                    }
-                }
-                Ok(())
-            },
-        )
-        .await
     }
 
     async fn repair_manifest_links(&self, namespace: &str, revision: &Digest) -> Result<(), Error> {
@@ -109,6 +86,33 @@ impl ManifestChecker {
     }
 }
 
+#[async_trait]
+impl NamespaceChecker for ManifestChecker {
+    async fn check_namespace(&self, namespace: &str) -> Result<(), Error> {
+        debug!("Checking manifest inconsistencies from namespace '{namespace}'");
+
+        for_each_page(
+            |marker| async move {
+                self.metadata_store
+                    .list_revisions(namespace, 100, marker)
+                    .await
+                    .map_err(Error::from)
+            },
+            |revisions| async move {
+                for revision in &revisions {
+                    if let Err(e) = self.repair_manifest_links(namespace, revision).await {
+                        error!(
+                            "Failed to check tag from '{namespace}' (revision '{revision}'): {e}"
+                        );
+                    }
+                }
+                Ok(())
+            },
+        )
+        .await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -153,7 +157,8 @@ mod tests {
                 .unwrap();
 
             let mut tx = metadata_store.begin_transaction(namespace);
-            tx.create_link(&LinkKind::Digest(manifest_digest.clone()), &manifest_digest);
+            tx.create_link(&LinkKind::Digest(manifest_digest.clone()), &manifest_digest)
+                .add();
             tx.commit().await.unwrap();
 
             let scrubber = ManifestChecker::new(blob_store.clone(), metadata_store.clone(), false);

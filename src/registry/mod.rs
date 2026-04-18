@@ -225,8 +225,8 @@ pub mod test_utils {
         let tag_link = LinkKind::Tag("latest".to_string());
         let layer_link = LinkKind::Layer(digest.clone());
         let mut tx = registry.metadata_store.begin_transaction(namespace);
-        tx.create_link(&tag_link, &digest);
-        tx.create_link(&layer_link, &digest);
+        tx.create_link(&tag_link, &digest).add();
+        tx.create_link(&layer_link, &digest).add();
         tx.commit().await.unwrap();
 
         let blob_index = registry

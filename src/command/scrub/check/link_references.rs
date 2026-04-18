@@ -1,8 +1,10 @@
 use std::sync::Arc;
 
+use async_trait::async_trait;
 use tracing::{debug, error, info};
 
 use crate::{
+    command::scrub::check::NamespaceChecker,
     oci::Digest,
     registry::{
         Error,
@@ -30,30 +32,6 @@ impl LinkReferencesChecker {
             metadata_store,
             dry_run,
         }
-    }
-
-    pub async fn check_namespace(&self, namespace: &str) -> Result<(), Error> {
-        debug!("Checking referenced_by field for namespace '{namespace}'");
-
-        for_each_page(
-            |marker| async move {
-                self.metadata_store
-                    .list_revisions(namespace, 100, marker)
-                    .await
-                    .map_err(Error::from)
-            },
-            |revisions| async move {
-                for revision in &revisions {
-                    if let Err(e) = self.repair_referenced_by(namespace, revision).await {
-                        error!(
-                            "Failed to fix referenced_by for '{namespace}' (revision '{revision}'): {e}"
-                        );
-                    }
-                }
-                Ok(())
-            },
-        )
-        .await
     }
 
     async fn repair_referenced_by(&self, namespace: &str, revision: &Digest) -> Result<(), Error> {
@@ -111,7 +89,7 @@ impl LinkReferencesChecker {
 
                 info!("Adding referrer {referrer} to link {link} in namespace '{namespace}'");
                 let mut tx = self.metadata_store.begin_transaction(namespace);
-                tx.create_link_with_referrer(link, target, referrer);
+                tx.create_link(link, target).with_referrer(referrer).add();
                 tx.commit().await?;
             }
             Err(metadata_store::Error::ReferenceNotFound) => {
@@ -121,6 +99,33 @@ impl LinkReferencesChecker {
         }
 
         Ok(())
+    }
+}
+
+#[async_trait]
+impl NamespaceChecker for LinkReferencesChecker {
+    async fn check_namespace(&self, namespace: &str) -> Result<(), Error> {
+        debug!("Checking referenced_by field for namespace '{namespace}'");
+
+        for_each_page(
+            |marker| async move {
+                self.metadata_store
+                    .list_revisions(namespace, 100, marker)
+                    .await
+                    .map_err(Error::from)
+            },
+            |revisions| async move {
+                for revision in &revisions {
+                    if let Err(e) = self.repair_referenced_by(namespace, revision).await {
+                        error!(
+                            "Failed to fix referenced_by for '{namespace}' (revision '{revision}'): {e}"
+                        );
+                    }
+                }
+                Ok(())
+            },
+        )
+        .await
     }
 }
 
@@ -168,9 +173,12 @@ mod tests {
                 .unwrap();
 
             let mut tx = metadata_store.begin_transaction(namespace);
-            tx.create_link(&LinkKind::Digest(manifest_digest.clone()), &manifest_digest);
-            tx.create_link(&LinkKind::Config(config_digest.clone()), &config_digest);
-            tx.create_link(&LinkKind::Layer(layer_digest.clone()), &layer_digest);
+            tx.create_link(&LinkKind::Digest(manifest_digest.clone()), &manifest_digest)
+                .add();
+            tx.create_link(&LinkKind::Config(config_digest.clone()), &config_digest)
+                .add();
+            tx.create_link(&LinkKind::Layer(layer_digest.clone()), &layer_digest)
+                .add();
             tx.commit().await.unwrap();
 
             let config_link_before = metadata_store

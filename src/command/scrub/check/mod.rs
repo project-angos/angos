@@ -9,6 +9,7 @@ mod upload;
 
 use std::sync::Arc;
 
+use async_trait::async_trait;
 pub use blob::BlobChecker;
 pub use link_references::LinkReferencesChecker;
 pub use manifest::ManifestChecker;
@@ -26,6 +27,11 @@ use crate::{
         metadata_store::{MetadataStore, MetadataStoreExt, link_kind::LinkKind},
     },
 };
+
+#[async_trait]
+pub trait NamespaceChecker: Send + Sync {
+    async fn check_namespace(&self, namespace: &str) -> Result<(), Error>;
+}
 
 pub async fn ensure_link(
     metadata_store: &Arc<dyn MetadataStore + Send + Sync>,
@@ -62,7 +68,7 @@ async fn recreate_link(
 
     info!("Recreating invalid link from namespace '{namespace}': {link}' -> '{target}'");
     let mut tx = metadata_store.begin_transaction(namespace);
-    tx.create_link(link, target);
+    tx.create_link(link, target).add();
     tx.commit().await?;
     Ok(())
 }

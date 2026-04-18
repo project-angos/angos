@@ -3,11 +3,17 @@ mod tests;
 
 mod bearer_token;
 
-use std::{fs, io, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    fs, io,
+    sync::{Arc, LazyLock},
+    time::Duration,
+};
 
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use bearer_token::BearerToken;
 use futures_util::TryStreamExt;
+use regex::Regex;
 use reqwest::{
     Certificate, Client, Identity, Method, Response, StatusCode,
     header::{ACCEPT, AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE, WWW_AUTHENTICATE},
@@ -24,6 +30,9 @@ use crate::{
     registry::{DOCKER_CONTENT_DIGEST, Error, blob_store::BoxedReader},
     secret::Secret,
 };
+
+static BEARER_PARAM_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#"(\w+)="([^"]+)""#).unwrap());
 
 fn parse_header<T: std::str::FromStr>(
     response: &Response,
@@ -243,10 +252,9 @@ impl RegistryClient {
             .map_err(|_| Error::Unauthorized("Missing WWW-Authenticate".to_string()))?;
 
         if let Some(bearer_params) = auth_header.strip_prefix("Bearer ") {
-            let mut params = std::collections::HashMap::new();
-            let param_regex = regex::Regex::new(r#"(\w+)="([^"]+)""#).unwrap();
+            let mut params = HashMap::new();
 
-            for cap in param_regex.captures_iter(bearer_params) {
+            for cap in BEARER_PARAM_RE.captures_iter(bearer_params) {
                 params.insert(cap[1].to_string(), cap[2].to_string());
             }
 
