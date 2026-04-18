@@ -152,6 +152,30 @@ async fn send_with_retries(
     Err(last_err.unwrap_or_else(|| "unknown error".to_string()))
 }
 
+async fn deliver_async(
+    client: Client,
+    url: String,
+    token: Option<String>,
+    body: Vec<u8>,
+    event_kind_header: String,
+    max_retries: u32,
+    name: String,
+) {
+    if let Err(e) = send_and_record(
+        &client,
+        &url,
+        token.as_deref(),
+        &body,
+        &event_kind_header,
+        max_retries,
+        &name,
+    )
+    .await
+    {
+        warn!("Async webhook '{name}' failed: {e}");
+    }
+}
+
 async fn send_and_record(
     client: &Client,
     url: &str,
@@ -260,30 +284,16 @@ impl EventDispatcher {
                         warn!("Async webhook '{name}' skipped: dispatcher is shut down");
                         continue;
                     }
-                    let client = endpoint.client.clone();
-                    let url = endpoint.config.url.clone();
-                    let token = endpoint.config.token.clone();
-                    let body = body.clone();
-                    let event_kind_header = event_kind_header.clone();
-                    let name = name.clone();
-                    let max_retries = endpoint.config.max_retries;
-                    let in_flight = Arc::clone(&self.in_flight);
-                    let mut in_flight_guard = in_flight.lock().await;
-                    in_flight_guard.spawn(async move {
-                        if let Err(e) = send_and_record(
-                            &client,
-                            &url,
-                            token.as_deref(),
-                            &body,
-                            &event_kind_header,
-                            max_retries,
-                            &name,
-                        )
-                        .await
-                        {
-                            warn!("Async webhook '{name}' failed: {e}");
-                        }
-                    });
+                    let mut in_flight_guard = self.in_flight.lock().await;
+                    in_flight_guard.spawn(deliver_async(
+                        endpoint.client.clone(),
+                        endpoint.config.url.clone(),
+                        endpoint.config.token.clone(),
+                        body.clone(),
+                        event_kind_header.clone(),
+                        endpoint.config.max_retries,
+                        name.clone(),
+                    ));
                 }
                 DeliveryPolicy::Required => {
                     send_and_record(
