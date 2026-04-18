@@ -19,6 +19,22 @@ use crate::{
     },
 };
 
+struct FlushContext<'a> {
+    upload_path: &'a str,
+    upload_id: &'a str,
+    part_number: i32,
+    pending_path: &'a str,
+    pending_size: u64,
+    uploaded_size: u64,
+    available: u64,
+}
+
+struct BufferContext<'a> {
+    pending_path: &'a str,
+    uploaded_size: u64,
+    pending_size: u64,
+}
+
 impl Backend {
     pub async fn resolve_nonuniform_state(
         &self,
@@ -64,6 +80,111 @@ impl Backend {
         Ok((id, parts, uploaded, pending))
     }
 
+    async fn load_pending_bytes(&self, pending_path: &str, pending_size: u64) -> Vec<u8> {
+        if pending_size > 0 {
+            self.store
+                .get_object_body(pending_path, None)
+                .await
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        }
+    }
+
+    async fn flush_pending_as_part(
+        &self,
+        name: &str,
+        uuid: &str,
+        ctx: FlushContext<'_>,
+        pending_bytes: Vec<u8>,
+        stream: Box<dyn AsyncRead + Unpin + Send + Sync>,
+    ) -> Result<(Digest, u64), Error> {
+        let hasher = self.load_hasher(name, uuid, ctx.uploaded_size).await?;
+
+        let combined: Box<dyn AsyncRead + Unpin + Send + Sync> = if pending_bytes.is_empty() {
+            Box::new(stream)
+        } else {
+            Box::new(Cursor::new(pending_bytes).chain(stream))
+        };
+
+        let mut hashing_reader = HashingReader::with_hasher(combined, hasher);
+
+        let (tx, rx) = mpsc::channel::<Bytes>(32);
+        let body = ByteStream::from_body_1_x(ChannelBody { rx });
+
+        let store = self.store.clone();
+        let upload_path_owned = ctx.upload_path.to_string();
+        let upload_id_owned = ctx.upload_id.to_string();
+        let upload_handle = tokio::spawn(async move {
+            store
+                .upload_part_streaming(
+                    &upload_path_owned,
+                    &upload_id_owned,
+                    ctx.part_number,
+                    ctx.available,
+                    body,
+                )
+                .await
+        });
+
+        let mut buf = BytesMut::with_capacity(FRAME_SIZE);
+        loop {
+            buf.clear();
+            let n = hashing_reader.read_buf(&mut buf).await?;
+            if n == 0 {
+                break;
+            }
+            if tx.send(buf.split().freeze()).await.is_err() {
+                return Err(Error::StorageBackend(
+                    "upload task failed to receive data".to_string(),
+                ));
+            }
+        }
+        drop(tx);
+        upload_handle
+            .await
+            .map_err(|e| Error::StorageBackend(e.to_string()))??;
+
+        if ctx.pending_size > 0 {
+            self.store.delete_object(ctx.pending_path).await?;
+        }
+
+        let new_size = ctx.uploaded_size + ctx.available;
+        self.save_hasher(name, uuid, new_size, hashing_reader.serialized_state())
+            .await?;
+
+        let digest = hashing_reader.digest();
+        Ok((digest, new_size))
+    }
+
+    async fn buffer_pending(
+        &self,
+        name: &str,
+        uuid: &str,
+        ctx: BufferContext<'_>,
+        pending_bytes: Vec<u8>,
+        stream: Box<dyn AsyncRead + Unpin + Send + Sync>,
+    ) -> Result<(Digest, u64), Error> {
+        let logical_offset = ctx.uploaded_size + ctx.pending_size;
+        let hasher = self.load_hasher(name, uuid, logical_offset).await?;
+
+        let mut buf = pending_bytes;
+        let mut hashing_reader = HashingReader::with_hasher(stream, hasher);
+        hashing_reader.read_to_end(&mut buf).await?;
+
+        #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+        let new_logical = ctx.uploaded_size + buf.len() as u64;
+        self.store
+            .put_object(ctx.pending_path, Bytes::from(buf))
+            .await?;
+
+        self.save_hasher(name, uuid, new_logical, hashing_reader.serialized_state())
+            .await?;
+
+        let digest = hashing_reader.digest();
+        Ok((digest, new_logical))
+    }
+
     #[instrument(skip(self, stream))]
     pub async fn write_upload_nonuniform(
         &self,
@@ -83,100 +204,38 @@ impl Backend {
 
         let pending_path = path_builder::upload_patch_pending_path(name, uuid);
         let available = pending_size + content_length;
+        let pending_bytes = self.load_pending_bytes(&pending_path, pending_size).await;
 
         if available >= MIN_PART_SIZE {
-            let hasher = self.load_hasher(name, uuid, uploaded_size).await?;
-
-            let pending_bytes = if pending_size > 0 {
-                self.store
-                    .get_object_body(&pending_path, None)
-                    .await
-                    .unwrap_or_default()
-            } else {
-                Vec::new()
-            };
-
-            let combined: Box<dyn AsyncRead + Unpin + Send + Sync> = if pending_bytes.is_empty() {
-                Box::new(stream)
-            } else {
-                Box::new(Cursor::new(pending_bytes).chain(stream))
-            };
-
-            let mut hashing_reader = HashingReader::with_hasher(combined, hasher);
-
-            let (tx, rx) = mpsc::channel::<Bytes>(32);
-            let body = ByteStream::from_body_1_x(ChannelBody { rx });
-
-            let store = self.store.clone();
-            let upload_path_clone = upload_path.clone();
-            let upload_id_clone = upload_id.clone();
-            let upload_handle = tokio::spawn(async move {
-                store
-                    .upload_part_streaming(
-                        &upload_path_clone,
-                        &upload_id_clone,
-                        next_part_number,
-                        available,
-                        body,
-                    )
-                    .await
-            });
-
-            let mut buf = BytesMut::with_capacity(FRAME_SIZE);
-            loop {
-                buf.clear();
-                let n = hashing_reader.read_buf(&mut buf).await?;
-                if n == 0 {
-                    break;
-                }
-                if tx.send(buf.split().freeze()).await.is_err() {
-                    return Err(Error::StorageBackend(
-                        "upload task failed to receive data".to_string(),
-                    ));
-                }
-            }
-            drop(tx);
-            upload_handle
-                .await
-                .map_err(|e| Error::StorageBackend(e.to_string()))??;
-
-            if pending_size > 0 {
-                self.store.delete_object(&pending_path).await?;
-            }
-
-            let new_size = uploaded_size + available;
-            self.save_hasher(name, uuid, new_size, hashing_reader.serialized_state())
-                .await?;
-
-            let digest = hashing_reader.digest();
-            Ok((digest, new_size))
+            self.flush_pending_as_part(
+                name,
+                uuid,
+                FlushContext {
+                    upload_path: &upload_path,
+                    upload_id: &upload_id,
+                    part_number: next_part_number,
+                    pending_path: &pending_path,
+                    pending_size,
+                    uploaded_size,
+                    available,
+                },
+                pending_bytes,
+                stream,
+            )
+            .await
         } else {
-            let logical_offset = uploaded_size + pending_size;
-            let hasher = self.load_hasher(name, uuid, logical_offset).await?;
-
-            let pending_bytes = if pending_size > 0 {
-                self.store
-                    .get_object_body(&pending_path, None)
-                    .await
-                    .unwrap_or_default()
-            } else {
-                Vec::new()
-            };
-
-            let mut buf = pending_bytes;
-            let mut hashing_reader = HashingReader::with_hasher(stream, hasher);
-            hashing_reader.read_to_end(&mut buf).await?;
-
-            let new_logical = uploaded_size + buf.len() as u64;
-            self.store
-                .put_object(&pending_path, Bytes::from(buf))
-                .await?;
-
-            self.save_hasher(name, uuid, new_logical, hashing_reader.serialized_state())
-                .await?;
-
-            let digest = hashing_reader.digest();
-            Ok((digest, new_logical))
+            self.buffer_pending(
+                name,
+                uuid,
+                BufferContext {
+                    pending_path: &pending_path,
+                    uploaded_size,
+                    pending_size,
+                },
+                pending_bytes,
+                stream,
+            )
+            .await
         }
     }
 
