@@ -84,6 +84,12 @@ pub struct Backend {
 
 const MAX_UPDATE_RETRIES: u32 = 10;
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum ValidationResult {
+    Valid,
+    NeedsRetry,
+}
+
 impl Backend {
     pub fn new(config: &BackendConfig) -> Result<Self, Error> {
         info!("Using filesystem metadata-store backend");
@@ -387,99 +393,19 @@ impl MetadataStore for Backend {
         loop {
             let mut link_cache: HashMap<LinkKind, LinkMetadata> = HashMap::new();
 
-            let prelock_results = join_all(operations.iter().map(|op| async move {
-                match op {
-                    LinkOperation::Create {
-                        link,
-                        target,
-                        referrer,
-                        media_type,
-                        descriptor,
-                    } => {
-                        let old_target = self
-                            .read_link_reference(namespace, link)
-                            .await
-                            .ok()
-                            .map(|m| m.target);
-                        (
-                            op,
-                            Some((
-                                link.clone(),
-                                target.clone(),
-                                old_target,
-                                referrer.clone(),
-                                media_type.clone(),
-                                descriptor.as_ref().clone(),
-                            )),
-                            None,
-                        )
-                    }
-                    LinkOperation::Delete { link, referrer } => {
-                        let metadata = self.read_link_reference(namespace, link).await.ok();
-                        (op, None, Some((link.clone(), metadata, referrer.clone())))
-                    }
-                }
-            }))
-            .await;
-
-            // Lock keys include both link names and `blob:{digest}` for every target digest.
-            // This ensures blob index updates (which perform read-modify-write on per-digest
-            // index files) are serialized across concurrent update_links calls.
-            let mut lock_keys: Vec<String> = Vec::new();
-            let mut creates: Vec<ResolvedCreate> = Vec::new();
-            let mut deletes: Vec<ResolvedDelete> = Vec::new();
-
-            for (_, create_data, delete_data) in prelock_results {
-                if let Some((link, target, old_target, referrer, media_type, descriptor)) =
-                    create_data
-                {
-                    lock_keys.push(link.to_string());
-                    lock_keys.push(format!("blob:{target}"));
-                    if let Some(ref old) = old_target {
-                        lock_keys.push(format!("blob:{old}"));
-                    }
-                    creates.push(ResolvedCreate {
-                        link,
-                        target,
-                        old_target,
-                        referrer,
-                        media_type,
-                        descriptor,
-                    });
-                } else if let Some((link, Some(meta), referrer)) = delete_data {
-                    lock_keys.push(link.to_string());
-                    lock_keys.push(format!("blob:{}", meta.target));
-                    deletes.push(ResolvedDelete {
-                        link,
-                        target: meta.target,
-                        referrer,
-                    });
-                }
-            }
+            let (creates, deletes, lock_keys) =
+                self.prelock_resolve_operations(namespace, operations).await;
 
             if creates.is_empty() && deletes.is_empty() {
                 return Ok(());
             }
 
-            lock_keys.sort();
-            lock_keys.dedup();
             let guard = self.lock.acquire(&lock_keys).await?;
 
-            let validation_results = join_all(creates.iter().map(|op| async move {
-                let current = self.read_link_reference(namespace, &op.link).await.ok();
-                let current_target = current.as_ref().map(|m| m.target.clone());
-                (
-                    op.link.clone(),
-                    current,
-                    current_target,
-                    op.old_target.clone(),
-                )
-            }))
-            .await;
-
-            if validation_results
-                .iter()
-                .any(|(_, _, current_target, expected)| *current_target != *expected)
+            if self
+                .validate_creates_under_lock(namespace, &creates, &mut link_cache)
+                .await
+                == ValidationResult::NeedsRetry
             {
                 guard.release().await;
                 if update_retries == 0 {
@@ -491,40 +417,17 @@ impl MetadataStore for Backend {
                 update_retries -= 1;
                 continue;
             }
-            for (link, metadata, _, _) in validation_results {
-                if let Some(m) = metadata {
-                    link_cache.insert(link, m);
-                }
-            }
 
             if !guard.is_valid() {
                 guard.release().await;
                 return Err(Error::Lock("lock invalidated during operation".into()));
             }
 
-            let delete_results = join_all(deletes.into_iter().map(|op| async move {
-                let result = self.read_link_reference(namespace, &op.link).await;
-                (op, result)
-            }))
-            .await;
+            let (valid_deletes, delete_status) = self
+                .validate_deletes_under_lock(namespace, deletes, &mut link_cache)
+                .await?;
 
-            let mut valid_deletes: Vec<ResolvedDelete> = Vec::new();
-            let mut needs_retry = false;
-            for (op, result) in delete_results {
-                match result {
-                    Ok(metadata) if metadata.target == op.target => {
-                        link_cache.insert(op.link.clone(), metadata);
-                        valid_deletes.push(op);
-                    }
-                    Ok(_) => {
-                        needs_retry = true;
-                        break;
-                    }
-                    Err(Error::ReferenceNotFound) => {}
-                    Err(e) => return Err(e),
-                }
-            }
-            if needs_retry {
+            if delete_status == ValidationResult::NeedsRetry {
                 guard.release().await;
                 if update_retries == 0 {
                     return Err(Error::Lock(
@@ -534,6 +437,11 @@ impl MetadataStore for Backend {
                 }
                 update_retries -= 1;
                 continue;
+            }
+
+            if !guard.is_valid() {
+                guard.release().await;
+                return Err(Error::Lock("lock invalidated during operation".into()));
             }
 
             let mut pending_blob_ops = self
@@ -694,6 +602,161 @@ impl Backend {
         .collect::<Result<Vec<_>, _>>()?;
 
         Ok(())
+    }
+
+    /// Performs pre-lock reads for all operations and builds the resolved
+    /// creates, deletes, and sorted/deduplicated lock keys needed to proceed.
+    ///
+    /// Returns `(creates, deletes, lock_keys)`. When both `creates` and
+    /// `deletes` are empty there is nothing to do and the caller should return
+    /// early.
+    async fn prelock_resolve_operations(
+        &self,
+        namespace: &str,
+        operations: &[LinkOperation],
+    ) -> (Vec<ResolvedCreate>, Vec<ResolvedDelete>, Vec<String>) {
+        let prelock_results = join_all(operations.iter().map(|op| async move {
+            match op {
+                LinkOperation::Create {
+                    link,
+                    target,
+                    referrer,
+                    media_type,
+                    descriptor,
+                } => {
+                    let old_target = self
+                        .read_link_reference(namespace, link)
+                        .await
+                        .ok()
+                        .map(|m| m.target);
+                    (
+                        Some(ResolvedCreate {
+                            link: link.clone(),
+                            target: target.clone(),
+                            old_target,
+                            referrer: referrer.clone(),
+                            media_type: media_type.clone(),
+                            descriptor: descriptor.as_ref().clone(),
+                        }),
+                        None,
+                    )
+                }
+                LinkOperation::Delete { link, referrer } => {
+                    let metadata = self.read_link_reference(namespace, link).await.ok();
+                    (None, Some((link.clone(), metadata, referrer.clone())))
+                }
+            }
+        }))
+        .await;
+
+        // Lock keys include both link names and `blob:{digest}` for every target digest.
+        // This ensures blob index updates (which perform read-modify-write on per-digest
+        // index files) are serialized across concurrent update_links calls.
+        let mut lock_keys: Vec<String> = Vec::new();
+        let mut creates: Vec<ResolvedCreate> = Vec::new();
+        let mut deletes: Vec<ResolvedDelete> = Vec::new();
+
+        for (create_data, delete_data) in prelock_results {
+            if let Some(op) = create_data {
+                lock_keys.push(op.link.to_string());
+                lock_keys.push(format!("blob:{}", op.target));
+                if let Some(ref old) = op.old_target {
+                    lock_keys.push(format!("blob:{old}"));
+                }
+                creates.push(op);
+            } else if let Some((link, Some(meta), referrer)) = delete_data {
+                lock_keys.push(link.to_string());
+                lock_keys.push(format!("blob:{}", meta.target));
+                deletes.push(ResolvedDelete {
+                    link,
+                    target: meta.target,
+                    referrer,
+                });
+            }
+        }
+
+        lock_keys.sort();
+        lock_keys.dedup();
+        (creates, deletes, lock_keys)
+    }
+
+    /// Re-reads all create operations under the lock and checks whether any
+    /// concurrent modification has changed the link state since the pre-lock
+    /// read. Populates `link_cache` with the current metadata for each link.
+    ///
+    /// Returns `ValidationResult::NeedsRetry` when a discrepancy is detected,
+    /// `ValidationResult::Valid` otherwise.
+    async fn validate_creates_under_lock(
+        &self,
+        namespace: &str,
+        creates: &[ResolvedCreate],
+        link_cache: &mut HashMap<LinkKind, LinkMetadata>,
+    ) -> ValidationResult {
+        let validation_results = join_all(creates.iter().map(|op| async move {
+            let current = self.read_link_reference(namespace, &op.link).await.ok();
+            let current_target = current.as_ref().map(|m| m.target.clone());
+            (
+                op.link.clone(),
+                current,
+                current_target,
+                op.old_target.clone(),
+            )
+        }))
+        .await;
+
+        if validation_results
+            .iter()
+            .any(|(_, _, current_target, expected)| *current_target != *expected)
+        {
+            return ValidationResult::NeedsRetry;
+        }
+
+        for (link, metadata, _, _) in validation_results {
+            if let Some(m) = metadata {
+                link_cache.insert(link, m);
+            }
+        }
+
+        ValidationResult::Valid
+    }
+
+    /// Re-reads all delete operations under the lock and checks whether the
+    /// target digest still matches what was observed before the lock was
+    /// acquired. Populates `link_cache` with the current metadata for each
+    /// confirmed delete.
+    ///
+    /// Returns `(valid_deletes, ValidationResult::NeedsRetry)` when a
+    /// discrepancy is detected, `(valid_deletes, ValidationResult::Valid)`
+    /// otherwise. Links that are already gone (`ReferenceNotFound`) are
+    /// silently dropped rather than triggering a retry.
+    async fn validate_deletes_under_lock(
+        &self,
+        namespace: &str,
+        deletes: Vec<ResolvedDelete>,
+        link_cache: &mut HashMap<LinkKind, LinkMetadata>,
+    ) -> Result<(Vec<ResolvedDelete>, ValidationResult), Error> {
+        let delete_results = join_all(deletes.into_iter().map(|op| async move {
+            let result = self.read_link_reference(namespace, &op.link).await;
+            (op, result)
+        }))
+        .await;
+
+        let mut valid_deletes: Vec<ResolvedDelete> = Vec::new();
+        for (op, result) in delete_results {
+            match result {
+                Ok(metadata) if metadata.target == op.target => {
+                    link_cache.insert(op.link.clone(), metadata);
+                    valid_deletes.push(op);
+                }
+                Ok(_) => {
+                    return Ok((valid_deletes, ValidationResult::NeedsRetry));
+                }
+                Err(Error::ReferenceNotFound) => {}
+                Err(e) => return Err(e),
+            }
+        }
+
+        Ok((valid_deletes, ValidationResult::Valid))
     }
 
     async fn read_link_reference(
