@@ -12,7 +12,9 @@ use super::{Backend, FRAME_SIZE, MIN_PART_SIZE, channel_body::ChannelBody};
 use crate::{
     oci::Digest,
     registry::{
-        blob_store::{Error, UploadState, hashing_reader::HashingReader, sha256_ext::Sha256Ext},
+        blob_store::{
+            Error, UploadState, UploadedPart, hashing_reader::HashingReader, sha256_ext::Sha256Ext,
+        },
         path_builder,
     },
 };
@@ -23,7 +25,7 @@ impl Backend {
         name: &str,
         uuid: &str,
         state: Option<UploadState>,
-    ) -> Result<(String, Vec<(i32, String, i64)>, u64, u64), Error> {
+    ) -> Result<(String, Vec<UploadedPart>, u64, u64), Error> {
         let upload_path = path_builder::upload_path(name, uuid);
         if let Some(UploadState {
             multipart_upload_id: Some(id),
@@ -33,7 +35,7 @@ impl Backend {
         }) = state
         {
             #[allow(clippy::cast_sign_loss)]
-            let uploaded: u64 = parts.iter().map(|(_, _, sz)| *sz as u64).sum();
+            let uploaded: u64 = parts.iter().map(|p| p.size as u64).sum();
             return Ok((id, parts, uploaded, pending_size));
         }
         if let Some(UploadState {
@@ -44,7 +46,7 @@ impl Backend {
         }) = self.retrieve_cached_upload_state(name, uuid).await
         {
             #[allow(clippy::cast_sign_loss)]
-            let uploaded: u64 = parts.iter().map(|(_, _, sz)| *sz as u64).sum();
+            let uploaded: u64 = parts.iter().map(|p| p.size as u64).sum();
             return Ok((id, parts, uploaded, pending_size));
         }
         let id = if let Some(id) = self.get_or_search_upload_id(&upload_path).await? {
@@ -56,7 +58,7 @@ impl Backend {
         };
         let parts = self.store.list_parts(&upload_path, &id).await?;
         #[allow(clippy::cast_sign_loss)]
-        let uploaded: u64 = parts.iter().map(|(_, _, sz)| *sz as u64).sum();
+        let uploaded: u64 = parts.iter().map(|p| p.size as u64).sum();
         let pending_path = path_builder::upload_patch_pending_path(name, uuid);
         let pending = self.store.object_size(&pending_path).await.unwrap_or(0);
         Ok((id, parts, uploaded, pending))
@@ -199,7 +201,7 @@ impl Backend {
             };
 
         #[allow(clippy::cast_sign_loss)]
-        let uploaded: u64 = parts.iter().map(|(_, _, sz)| *sz as u64).sum();
+        let uploaded: u64 = parts.iter().map(|p| p.size as u64).sum();
 
         let pending_path = path_builder::upload_patch_pending_path(name, uuid);
         let pending_size = self.store.object_size(&pending_path).await.unwrap_or(0);
@@ -233,14 +235,14 @@ impl Backend {
             self.store.list_parts(&upload_path, &upload_id).await?
         };
         #[allow(clippy::cast_sign_loss)]
-        let mut uploaded_size: u64 = part_list.iter().map(|(_, _, size)| *size as u64).sum();
+        let mut uploaded_size: u64 = part_list.iter().map(|p| p.size as u64).sum();
 
         let mut parts: Vec<CompletedPart> = part_list
             .into_iter()
-            .map(|(part_num, e_tag, _)| {
+            .map(|p| {
                 CompletedPart::builder()
-                    .part_number(part_num)
-                    .e_tag(e_tag)
+                    .part_number(p.part_number)
+                    .e_tag(p.e_tag)
                     .build()
             })
             .collect();

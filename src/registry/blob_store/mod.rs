@@ -16,6 +16,14 @@ use crate::oci::Digest;
 
 pub type BoxedReader = Box<dyn AsyncRead + Unpin + Send + Sync>;
 
+/// A single part that has been successfully uploaded as part of a multipart upload.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct UploadedPart {
+    pub part_number: i32,
+    pub e_tag: String,
+    pub size: i64,
+}
+
 /// Precomputed state for an in-progress upload session.
 ///
 /// Returned by [`BlobStore::get_upload_state`] and accepted by
@@ -27,8 +35,8 @@ pub struct UploadState {
     pub size: u64,
     /// Multipart upload ID; `None` for backends that do not use multipart uploads.
     pub multipart_upload_id: Option<String>,
-    /// Parts already uploaded: `(part_number, e_tag, size_bytes)`.
-    pub parts: Vec<(i32, String, i64)>,
+    /// Parts already uploaded in the current multipart upload session.
+    pub parts: Vec<UploadedPart>,
     /// Bytes buffered in the pending object (non-uniform S3 mode only).
     pub pending_size: u64,
 }
