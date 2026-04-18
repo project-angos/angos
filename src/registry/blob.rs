@@ -250,8 +250,6 @@ impl Registry {
         Ok(())
     }
 
-    // API Handlers
-
     #[instrument(skip(self))]
     pub async fn handle_head_blob(
         &self,

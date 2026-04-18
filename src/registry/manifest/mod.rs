@@ -389,7 +389,6 @@ impl Registry {
             Reference::Digest(digest) => {
                 tx.delete_link(&LinkKind::Digest(digest.clone()));
 
-                // Collect all tags
                 let mut all_tags = Vec::new();
                 let mut marker = None;
                 loop {
@@ -404,7 +403,6 @@ impl Registry {
                     marker = next_marker;
                 }
 
-                // Read all tag links concurrently to find ones pointing to this digest
                 let matching_tags: Vec<_> = futures_util::stream::iter(all_tags)
                     .map(|tag| {
                         let tag_link = LinkKind::Tag(tag);
@@ -433,7 +431,6 @@ impl Registry {
                     tx.delete_link(&tag_link);
                 }
 
-                // Delete all links created during put_manifest
                 if let Ok(content) = self.blob_store.read_blob(digest).await
                     && let Ok(manifest) = Manifest::from_slice(&content)
                 {
@@ -463,7 +460,6 @@ impl Registry {
         Ok(())
     }
 
-    // API Handlers
     #[instrument(skip(self, is_tag_immutable))]
     pub async fn handle_head_manifest(
         &self,

@@ -166,7 +166,6 @@ impl Registry {
         Ok(size - 1)
     }
 
-    // API Handlers
     #[instrument(skip(self))]
     pub async fn handle_start_upload(
         &self,

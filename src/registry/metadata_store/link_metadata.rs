@@ -51,7 +51,6 @@ impl LinkMetadata {
         if let Ok(metadata) = serde_json::from_slice(&s) {
             Ok(metadata)
         } else {
-            // If the link is not a valid LinkMetadata, we create a new one
             let target = String::from_utf8(s).map_err(|e| Error::InvalidData(e.to_string()))?;
             let target =
                 Digest::try_from(target.as_str()).map_err(|e| Error::InvalidData(e.to_string()))?;

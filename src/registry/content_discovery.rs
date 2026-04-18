@@ -78,7 +78,6 @@ impl Registry {
         Ok((tags, link))
     }
 
-    // API Handlers
     #[instrument(skip(self))]
     pub async fn handle_get_referrers(
         &self,

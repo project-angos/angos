@@ -69,9 +69,6 @@ pub async fn serve_request<S>(
         debug!("iter = {iter} sleep_duration = {sleep_duration:?}");
         tokio::select! {
             res = conn.as_mut() => {
-                // Polling the connection returned a result.
-                // In this case print either the successful or error result for the connection
-                // and break out of the loop.
                 match res {
                     Ok(()) => debug!("after polling conn, no error"),
                     Err(error) =>  debug!("error serving connection: {error}"),
@@ -79,8 +76,6 @@ pub async fn serve_request<S>(
                 break;
             }
             () = tokio::time::sleep(*sleep_duration) => {
-                // tokio::time::sleep returned a result.
-                // Call graceful_shutdown on the connection and continue the loop.
                 debug!("iter = {iter} got timeout_interval, calling conn.graceful_shutdown");
                 conn.as_mut().graceful_shutdown();
             }
