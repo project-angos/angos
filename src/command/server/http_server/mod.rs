@@ -180,13 +180,11 @@ async fn dispatch_route<'a>(
         Route::Unknown | Route::UiAsset { .. } | Route::UiConfig => handle_unknown_route(parts),
         Route::ApiVersion => Ok(context.registry.handle_get_api_version().await?),
         Route::StartUpload { namespace, digest } => {
-            handle_start_upload(context, &namespace, digest, identity).await
+            handle_start_upload(context, &namespace, digest).await
         }
-        Route::GetUpload { namespace, uuid } => {
-            handle_get_upload(context, &namespace, uuid, identity).await
-        }
+        Route::GetUpload { namespace, uuid } => handle_get_upload(context, &namespace, uuid).await,
         Route::PatchUpload { namespace, uuid } => {
-            handle_patch_upload(context, parts, incoming, &namespace, uuid, identity).await
+            handle_patch_upload(context, parts, incoming, &namespace, uuid).await
         }
         Route::PutUpload {
             namespace,
@@ -194,25 +192,25 @@ async fn dispatch_route<'a>(
             digest,
         } => handle_put_upload(context, parts, incoming, &namespace, uuid, digest, identity).await,
         Route::DeleteUpload { namespace, uuid } => {
-            handle_delete_upload(context, &namespace, uuid, identity).await
+            handle_delete_upload(context, &namespace, uuid).await
         }
         Route::GetBlob { namespace, digest } => {
-            handle_get_blob(context, parts, &namespace, digest, identity).await
+            handle_get_blob(context, parts, &namespace, digest).await
         }
         Route::HeadBlob { namespace, digest } => {
-            handle_head_blob(context, parts, &namespace, digest, identity).await
+            handle_head_blob(context, parts, &namespace, digest).await
         }
         Route::DeleteBlob { namespace, digest } => {
-            handle_delete_blob(context, &namespace, digest, identity).await
+            handle_delete_blob(context, &namespace, digest).await
         }
         Route::GetManifest {
             namespace,
             reference,
-        } => handle_get_manifest(context, parts, &namespace, reference, identity).await,
+        } => handle_get_manifest(context, parts, &namespace, reference).await,
         Route::HeadManifest {
             namespace,
             reference,
-        } => handle_head_manifest(context, parts, &namespace, reference, identity).await,
+        } => handle_head_manifest(context, parts, &namespace, reference).await,
         Route::PutManifest {
             namespace,
             reference,
@@ -225,21 +223,15 @@ async fn dispatch_route<'a>(
             namespace,
             digest,
             artifact_type,
-        } => handle_get_referrer(context, &namespace, digest, artifact_type, identity).await,
-        Route::ListCatalog { n, last } => handle_list_catalog(context, n, last, identity).await,
+        } => handle_get_referrer(context, &namespace, digest, artifact_type).await,
+        Route::ListCatalog { n, last } => handle_list_catalog(context, n, last).await,
         Route::ListTags { namespace, n, last } => {
-            handle_list_tags(context, &namespace, n, last, identity).await
+            handle_list_tags(context, &namespace, n, last).await
         }
-        Route::ListRevisions { namespace } => {
-            handle_list_revisions(context, &namespace, identity).await
-        }
-        Route::ListUploads { namespace } => {
-            handle_list_uploads(context, &namespace, identity).await
-        }
-        Route::ListRepositories => handle_list_repositories(context, identity).await,
-        Route::ListNamespaces { repository } => {
-            handle_list_namespaces(context, repository, identity).await
-        }
+        Route::ListRevisions { namespace } => handle_list_revisions(context, &namespace).await,
+        Route::ListUploads { namespace } => handle_list_uploads(context, &namespace).await,
+        Route::ListRepositories => handle_list_repositories(context).await,
+        Route::ListNamespaces { repository } => handle_list_namespaces(context, repository).await,
         Route::Healthz => handle_healthz(),
         Route::Readyz => handle_readyz(context, parts).await,
         Route::Metrics => handle_metrics(),
@@ -268,7 +260,6 @@ async fn handle_start_upload(
     context: &ServerContext,
     namespace: &Namespace,
     digest: Option<Digest>,
-    _identity: &ClientIdentity,
 ) -> Result<Response<ResponseBody>, Error> {
     Ok(context
         .registry
@@ -280,7 +271,6 @@ async fn handle_get_upload(
     context: &ServerContext,
     namespace: &Namespace,
     uuid: Uuid,
-    _identity: &ClientIdentity,
 ) -> Result<Response<ResponseBody>, Error> {
     Ok(context.registry.handle_get_upload(namespace, uuid).await?)
 }
@@ -291,7 +281,6 @@ async fn handle_patch_upload(
     incoming: Incoming,
     namespace: &Namespace,
     uuid: Uuid,
-    _identity: &ClientIdentity,
 ) -> Result<Response<ResponseBody>, Error> {
     let start_offset = parts.range(CONTENT_RANGE)?.map(|(start, _)| start);
     let content_length: u64 = parts
@@ -346,7 +335,6 @@ async fn handle_delete_upload(
     context: &ServerContext,
     namespace: &Namespace,
     uuid: Uuid,
-    _identity: &ClientIdentity,
 ) -> Result<Response<ResponseBody>, Error> {
     Ok(context
         .registry
@@ -359,7 +347,6 @@ async fn handle_get_blob(
     parts: &Parts,
     namespace: &Namespace,
     digest: Digest,
-    _identity: &ClientIdentity,
 ) -> Result<Response<ResponseBody>, Error> {
     let mime_types = parts.accepted_content_types();
     let range = parts.range(RANGE)?;
@@ -375,7 +362,6 @@ async fn handle_head_blob(
     parts: &Parts,
     namespace: &Namespace,
     digest: Digest,
-    _identity: &ClientIdentity,
 ) -> Result<Response<ResponseBody>, Error> {
     let mime_types = parts.accepted_content_types();
 
@@ -389,7 +375,6 @@ async fn handle_delete_blob(
     context: &ServerContext,
     namespace: &Namespace,
     digest: Digest,
-    _identity: &ClientIdentity,
 ) -> Result<Response<ResponseBody>, Error> {
     Ok(context
         .registry
@@ -402,7 +387,6 @@ async fn handle_get_manifest(
     parts: &Parts,
     namespace: &Namespace,
     reference: Reference,
-    _identity: &ClientIdentity,
 ) -> Result<Response<ResponseBody>, Error> {
     let mime_types = parts.accepted_content_types();
     let is_immutable = context.is_reference_immutable(namespace, &reference);
@@ -418,7 +402,6 @@ async fn handle_head_manifest(
     parts: &Parts,
     namespace: &Namespace,
     reference: Reference,
-    _identity: &ClientIdentity,
 ) -> Result<Response<ResponseBody>, Error> {
     let mime_types = parts.accepted_content_types();
     let is_immutable = context.is_reference_immutable(namespace, &reference);
@@ -525,7 +508,6 @@ async fn handle_get_referrer(
     namespace: &Namespace,
     digest: Digest,
     artifact_type: Option<String>,
-    _identity: &ClientIdentity,
 ) -> Result<Response<ResponseBody>, Error> {
     Ok(context
         .registry
@@ -537,7 +519,6 @@ async fn handle_list_catalog(
     context: &ServerContext,
     n: Option<u16>,
     last: Option<String>,
-    _identity: &ClientIdentity,
 ) -> Result<Response<ResponseBody>, Error> {
     Ok(context.registry.handle_list_catalog(n, last).await?)
 }
@@ -547,7 +528,6 @@ async fn handle_list_tags(
     namespace: &Namespace,
     n: Option<u16>,
     last: Option<String>,
-    _identity: &ClientIdentity,
 ) -> Result<Response<ResponseBody>, Error> {
     Ok(context
         .registry
@@ -558,7 +538,6 @@ async fn handle_list_tags(
 async fn handle_list_revisions(
     context: &ServerContext,
     namespace: &Namespace,
-    _identity: &ClientIdentity,
 ) -> Result<Response<ResponseBody>, Error> {
     Ok(context.registry.handle_list_revisions(namespace).await?)
 }
@@ -566,14 +545,12 @@ async fn handle_list_revisions(
 async fn handle_list_uploads(
     context: &ServerContext,
     namespace: &Namespace,
-    _identity: &ClientIdentity,
 ) -> Result<Response<ResponseBody>, Error> {
     Ok(context.registry.handle_list_uploads(namespace).await?)
 }
 
 async fn handle_list_repositories(
     context: &ServerContext,
-    _identity: &ClientIdentity,
 ) -> Result<Response<ResponseBody>, Error> {
     Ok(context.registry.handle_list_repositories().await?)
 }
@@ -581,7 +558,6 @@ async fn handle_list_repositories(
 async fn handle_list_namespaces(
     context: &ServerContext,
     repository: &str,
-    _identity: &ClientIdentity,
 ) -> Result<Response<ResponseBody>, Error> {
     Ok(context.registry.handle_list_namespaces(repository).await?)
 }
