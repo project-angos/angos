@@ -61,12 +61,12 @@ async fn recreate_link(
 ) -> Result<(), Error> {
     if dry_run {
         info!(
-            "DRY RUN: would recreate invalid link from namespace '{namespace}': {link}' -> '{target}'"
+            "DRY RUN: would recreate invalid link from namespace '{namespace}': '{link}' -> '{target}'"
         );
         return Ok(());
     }
 
-    info!("Recreating invalid link from namespace '{namespace}': {link}' -> '{target}'");
+    info!("Recreating invalid link from namespace '{namespace}': '{link}' -> '{target}'");
     let mut tx = metadata_store.begin_transaction(namespace);
     tx.create_link(link, target).add();
     tx.commit().await?;
