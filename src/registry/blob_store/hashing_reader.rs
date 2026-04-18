@@ -44,3 +44,77 @@ impl<R: AsyncRead + Unpin> AsyncRead for HashingReader<R> {
         poll
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::io::Cursor;
+
+    use sha2::{Digest as ShaDigest, Sha256};
+    use tokio::io::AsyncReadExt;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn test_known_payload_produces_correct_digest() {
+        let payload = b"hello world";
+        let reader = Cursor::new(payload);
+        let mut hashing_reader = HashingReader::with_hasher(reader, Sha256::new());
+
+        let mut buf = Vec::new();
+        hashing_reader.read_to_end(&mut buf).await.unwrap();
+
+        let digest = hashing_reader.digest();
+        assert_eq!(
+            digest.to_string(),
+            "sha256:b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_multiple_small_reads_produce_same_digest() {
+        let payload = b"hello world";
+        let reader = Cursor::new(payload);
+        let mut hashing_reader = HashingReader::with_hasher(reader, Sha256::new());
+
+        let mut chunk = [0u8; 3];
+        loop {
+            let n = hashing_reader.read(&mut chunk).await.unwrap();
+            if n == 0 {
+                break;
+            }
+        }
+
+        let digest = hashing_reader.digest();
+        assert_eq!(
+            digest.to_string(),
+            "sha256:b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_empty_input_produces_correct_digest() {
+        let reader = Cursor::new(b"");
+        let mut hashing_reader = HashingReader::with_hasher(reader, Sha256::new());
+
+        let mut buf = Vec::new();
+        hashing_reader.read_to_end(&mut buf).await.unwrap();
+
+        let digest = hashing_reader.digest();
+        assert_eq!(
+            digest.to_string(),
+            "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_inner_data_passed_through_unmodified() {
+        let payload = b"hello world";
+        let reader = Cursor::new(payload);
+        let mut hashing_reader = HashingReader::with_hasher(reader, Sha256::new());
+
+        let mut buf = Vec::new();
+        hashing_reader.read_to_end(&mut buf).await.unwrap();
+
+        assert_eq!(buf, payload);
+    }
+}
