@@ -1,20 +1,82 @@
-use hyper::{
-    Response, StatusCode,
-    header::{CONTENT_LENGTH, LOCATION, RANGE},
-};
+use std::collections::HashMap;
+
+use hyper::header::{CONTENT_LENGTH, LOCATION, RANGE};
 use tokio::io::AsyncRead;
 use tracing::{instrument, warn};
 use uuid::Uuid;
 
 use crate::{
-    command::server::response_body::ResponseBody,
     oci::{Digest, Namespace},
     registry::{DOCKER_CONTENT_DIGEST, DOCKER_UPLOAD_UUID, Error, Registry, blob_store},
 };
 
 pub enum StartUploadResponse {
-    ExistingBlob(Digest),
-    Session(String, String),
+    ExistingBlob {
+        headers: HashMap<&'static str, String>,
+    },
+    Session {
+        headers: HashMap<&'static str, String>,
+    },
+}
+
+pub struct GetUploadResponse {
+    pub headers: HashMap<&'static str, String>,
+}
+
+pub struct PatchUploadResponse {
+    pub headers: HashMap<&'static str, String>,
+}
+
+pub struct CompleteUploadResponse {
+    pub headers: HashMap<&'static str, String>,
+}
+
+/// Headers for a completed-blob response (used by `StartUpload` when the digest
+/// already exists, and by `CompleteUpload` when the upload finishes).
+fn blob_location_headers(namespace: &Namespace, digest: &Digest) -> HashMap<&'static str, String> {
+    HashMap::from([
+        (LOCATION.as_str(), format!("/v2/{namespace}/blobs/{digest}")),
+        (DOCKER_CONTENT_DIGEST, digest.to_string()),
+    ])
+}
+
+fn upload_session_headers(
+    namespace: &Namespace,
+    session_uuid: &str,
+) -> HashMap<&'static str, String> {
+    HashMap::from([
+        (
+            LOCATION.as_str(),
+            format!("/v2/{namespace}/blobs/uploads/{session_uuid}"),
+        ),
+        (RANGE.as_str(), "0-0".to_string()),
+        (DOCKER_UPLOAD_UUID, session_uuid.to_string()),
+    ])
+}
+
+fn upload_status_headers(
+    namespace: &Namespace,
+    session_id: Uuid,
+    range_max: u64,
+) -> HashMap<&'static str, String> {
+    HashMap::from([
+        (
+            LOCATION.as_str(),
+            format!("/v2/{namespace}/blobs/uploads/{session_id}"),
+        ),
+        (RANGE.as_str(), format!("0-{range_max}")),
+        (DOCKER_UPLOAD_UUID, session_id.to_string()),
+    ])
+}
+
+fn patch_upload_headers(
+    namespace: &Namespace,
+    session_id: Uuid,
+    range_max: u64,
+) -> HashMap<&'static str, String> {
+    let mut headers = upload_status_headers(namespace, session_id, range_max);
+    headers.insert(CONTENT_LENGTH.as_str(), "0".to_string());
+    headers
 }
 
 impl Registry {
@@ -27,7 +89,9 @@ impl Registry {
         if let Some(digest) = digest
             && self.blob_store.get_blob_size(&digest).await.is_ok()
         {
-            return Ok(StartUploadResponse::ExistingBlob(digest));
+            return Ok(StartUploadResponse::ExistingBlob {
+                headers: blob_location_headers(namespace, &digest),
+            });
         }
 
         let session_uuid = Uuid::new_v4().to_string();
@@ -35,8 +99,9 @@ impl Registry {
             .create_upload(namespace, &session_uuid)
             .await?;
 
-        let location = format!("/v2/{namespace}/blobs/uploads/{session_uuid}");
-        Ok(StartUploadResponse::Session(location, session_uuid))
+        Ok(StartUploadResponse::Session {
+            headers: upload_session_headers(namespace, &session_uuid),
+        })
     }
 
     #[instrument(skip(stream))]
@@ -47,15 +112,15 @@ impl Registry {
         start_offset: Option<u64>,
         content_length: u64,
         stream: S,
-    ) -> Result<u64, Error>
+    ) -> Result<PatchUploadResponse, Error>
     where
         S: AsyncRead + Unpin + Send + Sync + 'static,
     {
-        let session_id = session_id.to_string();
+        let session_key = session_id.to_string();
 
         let state = self
             .blob_store
-            .get_upload_state(namespace, &session_id)
+            .get_upload_state(namespace, &session_key)
             .await?;
 
         if let Some(offset) = start_offset
@@ -68,7 +133,7 @@ impl Registry {
             .blob_store
             .write_upload(
                 namespace,
-                &session_id,
+                &session_key,
                 Box::new(stream),
                 content_length,
                 true,
@@ -76,11 +141,11 @@ impl Registry {
             )
             .await?;
 
-        if size < 1 {
-            return Ok(0);
-        }
+        let range_max = size.saturating_sub(1);
 
-        Ok(size - 1)
+        Ok(PatchUploadResponse {
+            headers: patch_upload_headers(namespace, session_id, range_max),
+        })
     }
 
     #[instrument(skip(stream))]
@@ -91,15 +156,15 @@ impl Registry {
         digest: &Digest,
         content_length: u64,
         stream: S,
-    ) -> Result<(), Error>
+    ) -> Result<CompleteUploadResponse, Error>
     where
         S: AsyncRead + Unpin + Send + Sync + 'static,
     {
-        let session_id = session_id.to_string();
+        let session_key = session_id.to_string();
 
         let state = match self
             .blob_store
-            .get_upload_state(namespace, &session_id)
+            .get_upload_state(namespace, &session_key)
             .await
         {
             Ok(state) => Some(state),
@@ -112,7 +177,7 @@ impl Registry {
             .blob_store
             .write_upload(
                 namespace,
-                &session_id,
+                &session_key,
                 Box::new(stream),
                 content_length,
                 append,
@@ -126,13 +191,15 @@ impl Registry {
         }
 
         self.blob_store
-            .complete_upload(namespace, &session_id, Some(digest))
+            .complete_upload(namespace, &session_key, Some(digest))
             .await?;
         self.blob_store
-            .delete_upload(namespace, &session_id)
+            .delete_upload(namespace, &session_key)
             .await?;
 
-        Ok(())
+        Ok(CompleteUploadResponse {
+            headers: blob_location_headers(namespace, digest),
+        })
     }
 
     #[instrument]
@@ -148,129 +215,22 @@ impl Registry {
     }
 
     #[instrument]
-    pub async fn get_upload_range_max(
+    pub async fn get_upload_status(
         &self,
         namespace: &Namespace,
         session_id: Uuid,
-    ) -> Result<u64, Error> {
+    ) -> Result<GetUploadResponse, Error> {
         let uuid = session_id.to_string();
         let (_, size, _) = self
             .blob_store
             .read_upload_summary(namespace, &uuid)
             .await?;
 
-        if size < 1 {
-            return Ok(0);
-        }
+        let range_max = size.saturating_sub(1);
 
-        Ok(size - 1)
-    }
-
-    #[instrument(skip(self))]
-    pub async fn handle_start_upload(
-        &self,
-        namespace: &Namespace,
-        digest: Option<Digest>,
-    ) -> Result<Response<ResponseBody>, Error> {
-        let res = match self.start_upload(namespace, digest).await? {
-            StartUploadResponse::ExistingBlob(digest) => Response::builder()
-                .status(StatusCode::CREATED)
-                .header(LOCATION, format!("/v2/{namespace}/blobs/{digest}"))
-                .header(DOCKER_CONTENT_DIGEST, digest.to_string())
-                .body(ResponseBody::empty())?,
-            StartUploadResponse::Session(location, session_uuid) => Response::builder()
-                .status(StatusCode::ACCEPTED)
-                .header(LOCATION, location)
-                .header(RANGE, "0-0")
-                .header(DOCKER_UPLOAD_UUID, session_uuid.clone())
-                .body(ResponseBody::empty())?,
-        };
-
-        Ok(res)
-    }
-
-    #[instrument(skip(self))]
-    pub async fn handle_get_upload(
-        &self,
-        namespace: &Namespace,
-        uuid: Uuid,
-    ) -> Result<Response<ResponseBody>, Error> {
-        let range_max = self.get_upload_range_max(namespace, uuid).await?;
-
-        let res = Response::builder()
-            .status(StatusCode::NO_CONTENT)
-            .header(LOCATION, format!("/v2/{namespace}/blobs/uploads/{uuid}"))
-            .header(RANGE, format!("0-{range_max}"))
-            .header(DOCKER_UPLOAD_UUID, uuid.to_string())
-            .body(ResponseBody::empty())?;
-
-        Ok(res)
-    }
-
-    #[instrument(skip(self, body_stream))]
-    pub async fn handle_patch_upload<S>(
-        &self,
-        namespace: &Namespace,
-        uuid: Uuid,
-        start_offset: Option<u64>,
-        content_length: u64,
-        body_stream: S,
-    ) -> Result<Response<ResponseBody>, Error>
-    where
-        S: AsyncRead + Unpin + Send + Sync + 'static,
-    {
-        let range_max = self
-            .patch_upload(namespace, uuid, start_offset, content_length, body_stream)
-            .await?;
-
-        let res = Response::builder()
-            .status(StatusCode::ACCEPTED)
-            .header(LOCATION, format!("/v2/{namespace}/blobs/uploads/{uuid}"))
-            .header(RANGE, format!("0-{range_max}"))
-            .header(CONTENT_LENGTH, 0)
-            .header(DOCKER_UPLOAD_UUID, uuid.to_string())
-            .body(ResponseBody::empty())?;
-
-        Ok(res)
-    }
-
-    #[instrument(skip(self, body_reader))]
-    pub async fn handle_put_upload<S>(
-        &self,
-        namespace: &Namespace,
-        uuid: Uuid,
-        digest: &Digest,
-        content_length: u64,
-        body_reader: S,
-    ) -> Result<Response<ResponseBody>, Error>
-    where
-        S: AsyncRead + Unpin + Send + Sync + 'static,
-    {
-        self.complete_upload(namespace, uuid, digest, content_length, body_reader)
-            .await?;
-
-        let res = Response::builder()
-            .status(StatusCode::CREATED)
-            .header(LOCATION, format!("/v2/{namespace}/blobs/{digest}"))
-            .header(DOCKER_CONTENT_DIGEST, digest.to_string())
-            .body(ResponseBody::empty())?;
-
-        Ok(res)
-    }
-
-    #[instrument(skip(self))]
-    pub async fn handle_delete_upload(
-        &self,
-        namespace: &Namespace,
-        uuid: Uuid,
-    ) -> Result<Response<ResponseBody>, Error> {
-        self.delete_upload(namespace, uuid).await?;
-
-        let res = Response::builder()
-            .status(StatusCode::NO_CONTENT)
-            .body(ResponseBody::empty())?;
-
-        Ok(res)
+        Ok(GetUploadResponse {
+            headers: upload_status_headers(namespace, session_id, range_max),
+        })
     }
 }
 
@@ -282,7 +242,6 @@ mod tests {
 
     use super::*;
     use crate::{
-        command::server::request_ext::HeaderExt,
         oci::Namespace,
         registry::{
             path_builder,
@@ -299,11 +258,14 @@ mod tests {
 
             let response = registry.start_upload(namespace, None).await.unwrap();
             match response {
-                StartUploadResponse::Session(location, session_id) => {
-                    assert!(location.starts_with(&format!("/v2/{namespace}/blobs/uploads/")));
-                    assert!(!session_id.is_empty());
+                StartUploadResponse::Session { headers } => {
+                    assert!(
+                        headers[LOCATION.as_str()]
+                            .starts_with(&format!("/v2/{namespace}/blobs/uploads/"))
+                    );
+                    assert!(!headers[DOCKER_UPLOAD_UUID].is_empty());
                 }
-                StartUploadResponse::ExistingBlob(_) => panic!("Expected Session response"),
+                StartUploadResponse::ExistingBlob { .. } => panic!("Expected Session response"),
             }
 
             let digest = registry.blob_store.create_blob(content).await.unwrap();
@@ -312,10 +274,14 @@ mod tests {
                 .await
                 .unwrap();
             match response {
-                StartUploadResponse::ExistingBlob(existing_digest) => {
-                    assert_eq!(existing_digest, digest);
+                StartUploadResponse::ExistingBlob { headers } => {
+                    assert_eq!(headers[DOCKER_CONTENT_DIGEST], digest.to_string());
+                    assert_eq!(
+                        headers[LOCATION.as_str()],
+                        format!("/v2/{namespace}/blobs/{digest}")
+                    );
                 }
-                StartUploadResponse::Session(..) => panic!("Expected ExistingBlob response"),
+                StartUploadResponse::Session { .. } => panic!("Expected Existing response"),
             }
         }
     }
@@ -335,15 +301,18 @@ mod tests {
                 .unwrap();
 
             let stream = Cursor::new(content);
-            let bytes_written = registry
+            let response = registry
                 .patch_upload(namespace, session_id, None, content.len() as u64, stream)
                 .await
                 .unwrap();
-            assert_eq!(bytes_written, (content.len() - 1) as u64);
+            assert_eq!(
+                response.headers[RANGE.as_str()],
+                format!("0-{}", content.len() - 1)
+            );
 
             let additional_content = b" additional";
             let stream = Cursor::new(additional_content);
-            let bytes_written = registry
+            let response = registry
                 .patch_upload(
                     namespace,
                     session_id,
@@ -354,8 +323,8 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(
-                bytes_written,
-                (content.len() + additional_content.len() - 1) as u64
+                response.headers[RANGE.as_str()],
+                format!("0-{}", content.len() + additional_content.len() - 1)
             );
 
             let (_, size, _) = registry
@@ -394,10 +363,15 @@ mod tests {
                 .unwrap();
 
             let empty_stream = Cursor::new(Vec::new());
-            registry
+            let response = registry
                 .complete_upload(namespace, session_id, &upload_digest, 0, empty_stream)
                 .await
                 .unwrap();
+
+            assert_eq!(
+                response.headers[DOCKER_CONTENT_DIGEST],
+                upload_digest.to_string()
+            );
 
             let stored_content = registry.blob_store.read_blob(&upload_digest).await.unwrap();
             assert_eq!(stored_content, content);
@@ -438,7 +412,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_get_upload_range_max() {
+    async fn test_get_upload_status() {
         for test_case in backends() {
             let registry = test_case.registry();
             let namespace = &Namespace::new("test-repo").unwrap();
@@ -451,11 +425,11 @@ mod tests {
                 .await
                 .unwrap();
 
-            let range_max = registry
-                .get_upload_range_max(namespace, session_id)
+            let response = registry
+                .get_upload_status(namespace, session_id)
                 .await
                 .unwrap();
-            assert_eq!(range_max, 0);
+            assert_eq!(response.headers[RANGE.as_str()], "0-0");
 
             let stream = Cursor::new(content);
             registry
@@ -463,189 +437,13 @@ mod tests {
                 .await
                 .unwrap();
 
-            let range_max = registry
-                .get_upload_range_max(namespace, session_id)
-                .await
-                .unwrap();
-            assert_eq!(range_max, (content.len() - 1) as u64);
-        }
-    }
-    #[tokio::test]
-    async fn test_handle_start_upload() {
-        use crate::command::server::request_ext::HeaderExt;
-
-        for test_case in backends() {
-            let registry = test_case.registry();
-            let namespace = &Namespace::new("test-repo").unwrap();
-
-            let response = registry.handle_start_upload(namespace, None).await.unwrap();
-
-            assert_eq!(response.status(), StatusCode::ACCEPTED);
-            let (parts, _) = response.into_parts();
-
-            let location = parts.get_header(LOCATION).unwrap();
-            assert!(location.starts_with(&format!("/v2/{namespace}/blobs/uploads/")));
-
-            let uuid = parts.get_header(DOCKER_UPLOAD_UUID).unwrap();
-            assert!(!uuid.is_empty());
-            assert_eq!(parts.get_header(RANGE), Some("0-0".to_string()));
-
-            let content = b"test content";
-            let digest = registry.blob_store.create_blob(content).await.unwrap();
-
             let response = registry
-                .handle_start_upload(namespace, Some(digest.clone()))
+                .get_upload_status(namespace, session_id)
                 .await
                 .unwrap();
-
-            assert_eq!(response.status(), StatusCode::CREATED);
-            let (parts, _) = response.into_parts();
-
             assert_eq!(
-                parts.get_header(LOCATION),
-                Some(format!("/v2/{namespace}/blobs/{digest}"))
-            );
-            assert_eq!(
-                parts.get_header(DOCKER_CONTENT_DIGEST),
-                Some(digest.to_string())
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn test_handle_get_upload() {
-        for test_case in backends() {
-            let registry = test_case.registry();
-            let namespace = &Namespace::new("test-repo").unwrap();
-            let uuid = Uuid::new_v4();
-
-            registry
-                .blob_store
-                .create_upload(namespace, &uuid.to_string())
-                .await
-                .unwrap();
-
-            let response = registry.handle_get_upload(namespace, uuid).await.unwrap();
-
-            assert_eq!(response.status(), StatusCode::NO_CONTENT);
-            let (parts, _body) = response.into_parts();
-
-            assert_eq!(
-                parts.get_header(LOCATION),
-                Some(format!("/v2/{namespace}/blobs/uploads/{uuid}"))
-            );
-            assert_eq!(parts.get_header(RANGE), Some("0-0".to_string()));
-            assert_eq!(parts.get_header(DOCKER_UPLOAD_UUID), Some(uuid.to_string()));
-        }
-    }
-
-    #[tokio::test]
-    async fn test_handle_patch_upload() {
-        for test_case in backends() {
-            let registry = test_case.registry();
-            let namespace = &Namespace::new("test-repo").unwrap();
-            let uuid = Uuid::new_v4();
-
-            registry
-                .blob_store
-                .create_upload(namespace, &uuid.to_string())
-                .await
-                .unwrap();
-
-            let response = registry
-                .handle_patch_upload(namespace, uuid, Some(0), 0, Cursor::new(Vec::new()))
-                .await
-                .unwrap();
-
-            assert_eq!(response.status(), StatusCode::ACCEPTED);
-            let (parts, _body) = response.into_parts();
-
-            assert_eq!(
-                parts.get_header(LOCATION),
-                Some(format!("/v2/{namespace}/blobs/uploads/{uuid}"))
-            );
-            assert_eq!(parts.get_header(RANGE), Some("0-0".to_string()));
-            assert_eq!(parts.get_header(CONTENT_LENGTH), Some("0".to_string()));
-            assert_eq!(parts.get_header(DOCKER_UPLOAD_UUID), Some(uuid.to_string()));
-        }
-    }
-
-    #[tokio::test]
-    async fn test_handle_put_upload() {
-        for test_case in backends() {
-            let registry = test_case.registry();
-            let namespace = &Namespace::new("test-repo").unwrap();
-            let uuid = Uuid::new_v4();
-            let content = b"test content";
-
-            registry
-                .blob_store
-                .create_upload(namespace, &uuid.to_string())
-                .await
-                .unwrap();
-
-            let stream = Cursor::new(content.to_vec());
-            registry
-                .patch_upload(namespace, uuid, None, content.len() as u64, stream)
-                .await
-                .unwrap();
-
-            let (digest, _, _) = registry
-                .blob_store
-                .read_upload_summary(namespace, &uuid.to_string())
-                .await
-                .unwrap();
-
-            let body_stream = Cursor::new(Vec::new());
-
-            let response = registry
-                .handle_put_upload(namespace, uuid, &digest, 0, body_stream)
-                .await
-                .unwrap();
-
-            assert_eq!(response.status(), StatusCode::CREATED);
-            let (parts, _body) = response.into_parts();
-
-            assert_eq!(
-                parts.get_header(LOCATION),
-                Some(format!("/v2/{namespace}/blobs/{digest}"))
-            );
-            assert_eq!(
-                parts.get_header(DOCKER_CONTENT_DIGEST),
-                Some(digest.to_string())
-            );
-
-            let stored_content = registry.blob_store.read_blob(&digest).await.unwrap();
-            assert_eq!(stored_content, content);
-        }
-    }
-
-    #[tokio::test]
-    async fn test_handle_delete_upload() {
-        for test_case in backends() {
-            let registry = test_case.registry();
-            let namespace = &Namespace::new("test-repo").unwrap();
-            let uuid = Uuid::new_v4();
-
-            registry
-                .blob_store
-                .create_upload(namespace, &uuid.to_string())
-                .await
-                .unwrap();
-
-            let response = registry
-                .handle_delete_upload(namespace, uuid)
-                .await
-                .unwrap();
-
-            assert_eq!(response.status(), StatusCode::NO_CONTENT);
-
-            assert!(
-                registry
-                    .blob_store
-                    .read_upload_summary(namespace, &uuid.to_string())
-                    .await
-                    .is_err()
+                response.headers[RANGE.as_str()],
+                format!("0-{}", content.len() - 1)
             );
         }
     }
@@ -669,13 +467,12 @@ mod tests {
                 .await
                 .unwrap();
 
-            // Provide a wrong start_offset (0 instead of 9) — should fail
             let stream = Cursor::new(b"more data".to_vec());
             let result = registry
                 .patch_upload(namespace, session_id, Some(0), 9, stream)
                 .await;
 
-            assert_eq!(result, Err(Error::RangeNotSatisfiable));
+            assert!(matches!(result, Err(Error::RangeNotSatisfiable)));
         }
     }
 
@@ -700,7 +497,6 @@ mod tests {
                 .await
                 .unwrap();
 
-            // Use a valid but wrong digest
             let wrong_digest = crate::oci::Digest::from_str(
                 "sha256:0000000000000000000000000000000000000000000000000000000000000000",
             )
@@ -711,7 +507,7 @@ mod tests {
                 .complete_upload(namespace, session_id, &wrong_digest, 0, empty_stream)
                 .await;
 
-            assert_eq!(result, Err(Error::DigestInvalid));
+            assert!(matches!(result, Err(Error::DigestInvalid)));
         }
     }
 
@@ -846,7 +642,7 @@ mod tests {
 
         assert!(
             result.is_err(),
-            "complete_upload should return error when hash state is corrupted, not silently delete data"
+            "complete_upload should return error when hash state is corrupted"
         );
 
         let upload_path = path_builder::upload_path(namespace, &session_id.to_string());

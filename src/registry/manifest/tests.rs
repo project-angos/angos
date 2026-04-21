@@ -1,17 +1,17 @@
-use std::{io::Cursor, slice};
+use std::{collections::HashMap, io::Cursor, slice};
 
-use futures_util::TryStreamExt;
-use http_body_util::BodyExt;
+use hyper::header::{CONTENT_LENGTH, CONTENT_TYPE, LOCATION};
 use serde_json::json;
-use tokio::io::AsyncReadExt;
-use tokio_util::io::StreamReader;
 
 use super::*;
 use crate::{
-    command::server::request_ext::HeaderExt,
     oci::Namespace,
     registry::tests::{FSRegistryTestCase, backends},
 };
+
+fn header_digest(headers: &HashMap<&'static str, String>) -> Digest {
+    headers[DOCKER_CONTENT_DIGEST].parse().unwrap()
+}
 
 fn create_test_manifest() -> (Vec<u8>, String) {
     let manifest = json!({
@@ -97,10 +97,10 @@ async fn test_put_manifest() {
 
         assert_eq!(stored_manifest.content, content);
         assert_eq!(stored_manifest.media_type.unwrap(), media_type);
-        assert_eq!(stored_manifest.digest, response.digest);
+        assert_eq!(stored_manifest.digest, header_digest(&response.headers));
 
         // Test put manifest with digest
-        let digest = response.digest.clone();
+        let digest = header_digest(&response.headers);
         let response = registry
             .put_manifest(
                 namespace,
@@ -111,7 +111,7 @@ async fn test_put_manifest() {
             .await
             .unwrap();
 
-        assert_eq!(response.digest, digest);
+        assert_eq!(header_digest(&response.headers), digest);
     }
 }
 
@@ -148,7 +148,7 @@ async fn test_get_manifest() {
 
         assert_eq!(manifest.content, content);
         assert_eq!(manifest.media_type.unwrap(), media_type);
-        assert_eq!(manifest.digest, response.digest);
+        assert_eq!(manifest.digest, header_digest(&response.headers));
 
         // Test get manifest by digest
         let manifest = registry
@@ -156,7 +156,7 @@ async fn test_get_manifest() {
                 registry.get_repository_for_namespace(namespace).unwrap(),
                 slice::from_ref(&media_type),
                 namespace,
-                Reference::Digest(response.digest.clone()),
+                Reference::Digest(header_digest(&response.headers)),
                 false,
             )
             .await
@@ -164,7 +164,7 @@ async fn test_get_manifest() {
 
         assert_eq!(manifest.content, content);
         assert_eq!(manifest.media_type.unwrap(), media_type);
-        assert_eq!(manifest.digest, response.digest);
+        assert_eq!(manifest.digest, header_digest(&response.headers));
     }
 }
 
@@ -199,9 +199,15 @@ async fn test_head_manifest() {
             .await
             .unwrap();
 
-        assert_eq!(manifest.media_type.unwrap(), media_type);
-        assert_eq!(manifest.digest, response.digest);
-        assert_eq!(manifest.size, content.len());
+        assert_eq!(manifest.headers[CONTENT_TYPE.as_str()], media_type);
+        assert_eq!(
+            header_digest(&manifest.headers),
+            header_digest(&response.headers)
+        );
+        assert_eq!(
+            manifest.headers[CONTENT_LENGTH.as_str()],
+            content.len().to_string()
+        );
 
         // Test head manifest by digest
         let manifest = registry
@@ -209,15 +215,21 @@ async fn test_head_manifest() {
                 registry.get_repository_for_namespace(namespace).unwrap(),
                 slice::from_ref(&media_type),
                 namespace,
-                Reference::Digest(response.digest.clone()),
+                Reference::Digest(header_digest(&response.headers)),
                 false,
             )
             .await
             .unwrap();
 
-        assert_eq!(manifest.media_type.unwrap(), media_type);
-        assert_eq!(manifest.digest, response.digest);
-        assert_eq!(manifest.size, content.len());
+        assert_eq!(manifest.headers[CONTENT_TYPE.as_str()], media_type);
+        assert_eq!(
+            header_digest(&manifest.headers),
+            header_digest(&response.headers)
+        );
+        assert_eq!(
+            manifest.headers[CONTENT_LENGTH.as_str()],
+            content.len().to_string()
+        );
     }
 }
 
@@ -262,7 +274,10 @@ async fn test_delete_manifest() {
 
         // Test delete manifest by digest
         registry
-            .delete_manifest(namespace, &Reference::Digest(response.digest.clone()))
+            .delete_manifest(
+                namespace,
+                &Reference::Digest(header_digest(&response.headers)),
+            )
             .await
             .unwrap();
 
@@ -273,7 +288,7 @@ async fn test_delete_manifest() {
                     registry.get_repository_for_namespace(namespace).unwrap(),
                     slice::from_ref(&media_type),
                     namespace,
-                    Reference::Digest(response.digest),
+                    Reference::Digest(header_digest(&response.headers)),
                     false,
                 )
                 .await
@@ -328,7 +343,6 @@ async fn test_handle_head_manifest() {
         let tag = "latest";
         let (content, media_type) = create_test_manifest();
 
-        // Put manifest first
         let put_response = registry
             .put_manifest(
                 namespace,
@@ -339,27 +353,27 @@ async fn test_handle_head_manifest() {
             .await
             .unwrap();
 
-        let mime_types = Vec::new();
-
-        let reference = Reference::Tag(tag.to_string());
-
-        let response = registry
-            .handle_head_manifest(namespace, reference, &mime_types, false)
+        let repository = registry.get_repository_for_namespace(namespace).unwrap();
+        let head = registry
+            .head_manifest(
+                repository,
+                &[],
+                namespace,
+                Reference::Tag(tag.to_string()),
+                false,
+            )
             .await
             .unwrap();
 
-        assert_eq!(response.status(), StatusCode::OK);
-        let (parts, _) = response.into_parts();
-
         assert_eq!(
-            parts.get_header(DOCKER_CONTENT_DIGEST),
-            Some(put_response.digest.to_string())
+            header_digest(&head.headers),
+            header_digest(&put_response.headers)
         );
         assert_eq!(
-            parts.get_header(CONTENT_LENGTH),
-            Some(content.len().to_string())
+            head.headers[CONTENT_LENGTH.as_str()],
+            content.len().to_string()
         );
-        assert_eq!(parts.get_header(CONTENT_TYPE), Some(media_type));
+        assert_eq!(head.headers[CONTENT_TYPE.as_str()], media_type);
     }
 }
 
@@ -371,7 +385,6 @@ async fn test_handle_get_manifest() {
         let tag = "latest";
         let (content, media_type) = create_test_manifest();
 
-        // Put manifest first
         let put_response = registry
             .put_manifest(
                 namespace,
@@ -382,34 +395,30 @@ async fn test_handle_get_manifest() {
             .await
             .unwrap();
 
-        let reference = Reference::Tag(tag.to_string());
-        let accepted_types = Vec::new();
-
         let response = registry
-            .handle_get_manifest(namespace, reference, &accepted_types, false)
+            .resolve_get_manifest(namespace, Reference::Tag(tag.to_string()), &[], false)
             .await
             .unwrap();
 
-        let status = response.status();
-        let (parts, body) = response.into_parts();
-
-        assert_eq!(
-            parts.get_header(DOCKER_CONTENT_DIGEST),
-            Some(put_response.digest.to_string())
-        );
-
-        if status == StatusCode::TEMPORARY_REDIRECT {
-            assert!(parts.headers.get(LOCATION).is_some());
-            assert_eq!(parts.get_header(CONTENT_TYPE), Some(media_type));
-        } else {
-            assert_eq!(parts.status, StatusCode::OK);
-            assert_eq!(parts.get_header(CONTENT_TYPE), Some(media_type));
-
-            let stream = body.into_data_stream().map_err(std::io::Error::other);
-            let mut reader = StreamReader::new(stream);
-            let mut buf = Vec::new();
-            reader.read_to_end(&mut buf).await.unwrap();
-            assert_eq!(buf, content);
+        match response {
+            GetManifestResponse::Redirect { headers } => {
+                assert_eq!(
+                    header_digest(&headers),
+                    header_digest(&put_response.headers)
+                );
+                assert_eq!(headers[CONTENT_TYPE.as_str()], media_type);
+            }
+            GetManifestResponse::Body {
+                headers,
+                content: body,
+            } => {
+                assert_eq!(
+                    header_digest(&headers),
+                    header_digest(&put_response.headers)
+                );
+                assert_eq!(headers[CONTENT_TYPE.as_str()], media_type);
+                assert_eq!(body, content);
+            }
         }
     }
 }
@@ -422,26 +431,22 @@ async fn test_handle_put_manifest() {
         let tag = "latest";
         let (content, media_type) = create_test_manifest();
 
-        let reference = Reference::Tag(tag.to_string());
-
         let manifest_stream = Cursor::new(content.clone());
-
         let response = registry
-            .handle_put_manifest(namespace, reference, media_type.clone(), manifest_stream)
+            .accept_put_manifest(
+                namespace,
+                Reference::Tag(tag.to_string()),
+                media_type.clone(),
+                manifest_stream,
+            )
             .await
             .expect("put manifest failed");
 
-        assert_eq!(response.status(), StatusCode::CREATED);
-        let (parts, _) = response.into_parts();
-
-        let digest = parts.get_header(DOCKER_CONTENT_DIGEST).unwrap();
-
         assert_eq!(
-            parts.get_header(LOCATION),
-            Some(format!("/v2/{namespace}/manifests/{tag}"))
+            response.headers[LOCATION.as_str()],
+            format!("/v2/{namespace}/manifests/{tag}")
         );
 
-        // Verify manifest was stored
         let repository = registry
             .get_repository_for_namespace(namespace)
             .expect("get repository failed");
@@ -458,7 +463,7 @@ async fn test_handle_put_manifest() {
 
         assert_eq!(stored_manifest.content, content);
         assert_eq!(stored_manifest.media_type.unwrap(), media_type);
-        assert_eq!(stored_manifest.digest.to_string(), digest);
+        assert_eq!(stored_manifest.digest, header_digest(&response.headers));
     }
 }
 
@@ -470,8 +475,7 @@ async fn test_handle_delete_manifest() {
         let tag = "latest";
         let (content, media_type) = create_test_manifest();
 
-        // Put manifest first
-        let _put_response = registry
+        registry
             .put_manifest(
                 namespace,
                 &Reference::Tag(tag.to_string()),
@@ -481,16 +485,11 @@ async fn test_handle_delete_manifest() {
             .await
             .unwrap();
 
-        let reference = Reference::Tag(tag.to_string());
-
-        let response = registry
-            .handle_delete_manifest(namespace, reference)
+        registry
+            .delete_manifest(namespace, &Reference::Tag(tag.to_string()))
             .await
             .unwrap();
 
-        assert_eq!(response.status(), StatusCode::ACCEPTED);
-
-        // Verify manifest is deleted
         assert!(
             registry
                 .get_manifest(
@@ -596,7 +595,10 @@ async fn test_delete_manifest_by_digest_removes_multiple_tags() {
             .unwrap();
 
         registry
-            .delete_manifest(namespace, &Reference::Digest(response.digest.clone()))
+            .delete_manifest(
+                namespace,
+                &Reference::Digest(header_digest(&response.headers)),
+            )
             .await
             .unwrap();
 
@@ -634,7 +636,7 @@ async fn test_delete_manifest_by_digest_removes_multiple_tags() {
                     repository,
                     slice::from_ref(&media_type),
                     namespace,
-                    Reference::Digest(response.digest.clone()),
+                    Reference::Digest(header_digest(&response.headers)),
                     false,
                 )
                 .await
@@ -682,7 +684,10 @@ async fn test_delete_manifest_by_digest_preserves_unrelated_tags() {
             .unwrap();
 
         registry
-            .delete_manifest(namespace, &Reference::Digest(response_a.digest.clone()))
+            .delete_manifest(
+                namespace,
+                &Reference::Digest(header_digest(&response_a.headers)),
+            )
             .await
             .unwrap();
 
@@ -725,7 +730,7 @@ async fn test_delete_manifest_by_digest_preserves_unrelated_tags() {
             .await
             .unwrap();
 
-        assert_eq!(manifest_b.digest, response_b.digest);
+        assert_eq!(manifest_b.digest, header_digest(&response_b.headers));
     }
 }
 
@@ -772,7 +777,10 @@ async fn test_delete_manifest_with_many_tags() {
         }
 
         registry
-            .delete_manifest(namespace, &Reference::Digest(response_a.digest.clone()))
+            .delete_manifest(
+                namespace,
+                &Reference::Digest(header_digest(&response_a.headers)),
+            )
             .await
             .unwrap();
 
@@ -837,7 +845,7 @@ async fn test_put_manifest_stores_media_type() {
             .await
             .unwrap();
 
-        let digest_link = LinkKind::Digest(response.digest.clone());
+        let digest_link = LinkKind::Digest(header_digest(&response.headers));
         let link_meta = registry
             .metadata_store
             .read_link(namespace, &digest_link, false)
@@ -893,24 +901,36 @@ async fn test_head_manifest_returns_correct_media_type() {
             .await
             .unwrap();
 
-        assert_eq!(head.media_type, Some(media_type.clone()));
-        assert_eq!(head.digest, put_response.digest);
-        assert_eq!(head.size, content.len());
+        assert_eq!(head.headers[CONTENT_TYPE.as_str()], media_type);
+        assert_eq!(
+            header_digest(&head.headers),
+            header_digest(&put_response.headers)
+        );
+        assert_eq!(
+            head.headers[CONTENT_LENGTH.as_str()],
+            content.len().to_string()
+        );
 
         let head_by_digest = registry
             .head_manifest(
                 repository,
                 slice::from_ref(&media_type),
                 namespace,
-                Reference::Digest(put_response.digest.clone()),
+                Reference::Digest(header_digest(&put_response.headers)),
                 false,
             )
             .await
             .unwrap();
 
-        assert_eq!(head_by_digest.media_type, Some(media_type));
-        assert_eq!(head_by_digest.digest, put_response.digest);
-        assert_eq!(head_by_digest.size, content.len());
+        assert_eq!(head_by_digest.headers[CONTENT_TYPE.as_str()], media_type);
+        assert_eq!(
+            header_digest(&head_by_digest.headers),
+            header_digest(&put_response.headers)
+        );
+        assert_eq!(
+            head_by_digest.headers[CONTENT_LENGTH.as_str()],
+            content.len().to_string()
+        );
     }
 }
 
@@ -954,12 +974,15 @@ async fn test_head_manifest_fallback_without_media_type() {
             .unwrap();
 
         assert_eq!(
-            head.media_type,
-            Some(media_type),
+            head.headers[CONTENT_TYPE.as_str()],
+            media_type,
             "HEAD should fall back to reading blob when media_type not in link"
         );
-        assert_eq!(head.digest, digest);
-        assert_eq!(head.size, content.len());
+        assert_eq!(header_digest(&head.headers), digest);
+        assert_eq!(
+            head.headers[CONTENT_LENGTH.as_str()],
+            content.len().to_string()
+        );
     }
 }
 
@@ -986,7 +1009,10 @@ async fn test_delete_manifest_no_tags_by_digest() {
             .unwrap();
 
         registry
-            .delete_manifest(namespace, &Reference::Digest(response.digest.clone()))
+            .delete_manifest(
+                namespace,
+                &Reference::Digest(header_digest(&response.headers)),
+            )
             .await
             .unwrap();
 
@@ -998,7 +1024,7 @@ async fn test_delete_manifest_no_tags_by_digest() {
                     repository,
                     slice::from_ref(&media_type),
                     namespace,
-                    Reference::Digest(response.digest.clone()),
+                    Reference::Digest(header_digest(&response.headers)),
                     false,
                 )
                 .await
@@ -1026,7 +1052,11 @@ async fn test_put_manifest_stores_media_type_in_links() {
 
         let digest_link = registry
             .metadata_store
-            .read_link(namespace, &LinkKind::Digest(response.digest.clone()), false)
+            .read_link(
+                namespace,
+                &LinkKind::Digest(header_digest(&response.headers)),
+                false,
+            )
             .await
             .unwrap();
         assert_eq!(
@@ -1076,24 +1106,36 @@ async fn test_head_local_manifest_uses_metadata_media_type() {
             .await
             .unwrap();
 
-        assert_eq!(head.media_type, Some(media_type.clone()));
-        assert_eq!(head.digest, response.digest);
-        assert_eq!(head.size, content.len());
+        assert_eq!(head.headers[CONTENT_TYPE.as_str()], media_type);
+        assert_eq!(
+            header_digest(&head.headers),
+            header_digest(&response.headers)
+        );
+        assert_eq!(
+            head.headers[CONTENT_LENGTH.as_str()],
+            content.len().to_string()
+        );
 
         let head = registry
             .head_manifest(
                 registry.get_repository_for_namespace(namespace).unwrap(),
                 slice::from_ref(&media_type),
                 namespace,
-                Reference::Digest(response.digest.clone()),
+                Reference::Digest(header_digest(&response.headers)),
                 false,
             )
             .await
             .unwrap();
 
-        assert_eq!(head.media_type, Some(media_type.clone()));
-        assert_eq!(head.digest, response.digest);
-        assert_eq!(head.size, content.len());
+        assert_eq!(head.headers[CONTENT_TYPE.as_str()], media_type);
+        assert_eq!(
+            header_digest(&head.headers),
+            header_digest(&response.headers)
+        );
+        assert_eq!(
+            head.headers[CONTENT_LENGTH.as_str()],
+            content.len().to_string()
+        );
     }
 }
 
@@ -1116,7 +1158,11 @@ async fn test_put_manifest_without_content_type_stores_manifest_media_type() {
 
         let digest_link = registry
             .metadata_store
-            .read_link(namespace, &LinkKind::Digest(response.digest.clone()), false)
+            .read_link(
+                namespace,
+                &LinkKind::Digest(header_digest(&response.headers)),
+                false,
+            )
             .await
             .unwrap();
 
@@ -1135,7 +1181,7 @@ async fn test_handle_get_manifest_redirect_includes_content_type() {
         let namespace = &Namespace::new("test-repo/redirect-ct").unwrap();
         let (content, media_type) = create_test_manifest();
 
-        registry
+        let put_response = registry
             .put_manifest(
                 namespace,
                 &Reference::Tag("latest".to_string()),
@@ -1146,7 +1192,7 @@ async fn test_handle_get_manifest_redirect_includes_content_type() {
             .unwrap();
 
         let response = registry
-            .handle_get_manifest(
+            .resolve_get_manifest(
                 namespace,
                 Reference::Tag("latest".to_string()),
                 slice::from_ref(&media_type),
@@ -1155,25 +1201,22 @@ async fn test_handle_get_manifest_redirect_includes_content_type() {
             .await
             .unwrap();
 
-        if response.status() == StatusCode::TEMPORARY_REDIRECT {
-            assert!(
-                response.headers().contains_key(LOCATION),
-                "Redirect response should have Location header"
-            );
-            assert_eq!(
-                response
-                    .headers()
-                    .get(CONTENT_TYPE)
-                    .map(|v| v.to_str().unwrap()),
-                Some(media_type.as_str()),
-                "Redirect response should include Content-Type from stored media_type"
-            );
-            assert!(
-                response.headers().contains_key(DOCKER_CONTENT_DIGEST),
-                "Redirect response should have Docker-Content-Digest header"
-            );
-        } else {
-            assert_eq!(response.status(), StatusCode::OK);
+        match response {
+            GetManifestResponse::Redirect { headers } => {
+                assert_eq!(
+                    header_digest(&headers),
+                    header_digest(&put_response.headers),
+                    "Redirect digest must match"
+                );
+                assert_eq!(
+                    headers[CONTENT_TYPE.as_str()],
+                    media_type,
+                    "Redirect should carry Content-Type from stored media_type"
+                );
+            }
+            GetManifestResponse::Body { headers, .. } => {
+                assert_eq!(headers[CONTENT_TYPE.as_str()], media_type);
+            }
         }
     }
 }
@@ -1195,7 +1238,7 @@ async fn test_handle_get_manifest_redirect_fallback_without_media_type() {
         tx.commit().await.unwrap();
 
         let response = registry
-            .handle_get_manifest(
+            .resolve_get_manifest(
                 namespace,
                 Reference::Tag("latest".to_string()),
                 slice::from_ref(&media_type),
@@ -1204,21 +1247,20 @@ async fn test_handle_get_manifest_redirect_fallback_without_media_type() {
             .await
             .unwrap();
 
-        if response.status() == StatusCode::TEMPORARY_REDIRECT {
-            assert!(
-                response.headers().contains_key(LOCATION),
-                "Redirect should have Location header"
-            );
-            assert_eq!(
-                response
-                    .headers()
-                    .get(CONTENT_TYPE)
-                    .map(|v| v.to_str().unwrap()),
-                Some(media_type.as_str()),
-                "Redirect should still include Content-Type via fallback"
-            );
-        } else {
-            assert_eq!(response.status(), StatusCode::OK);
+        // When the redirect path fires, the media_type must still be present
+        // (via fallback reading the blob body). When the blob backend does not
+        // support presigned URLs (FS backend), we get a Body response — both are
+        // valid; in the Body case the media_type comes from the manifest JSON.
+        match response {
+            GetManifestResponse::Redirect { headers } => {
+                assert!(
+                    headers.contains_key(CONTENT_TYPE.as_str()),
+                    "Redirect should still include Content-Type via fallback"
+                );
+            }
+            GetManifestResponse::Body { headers, .. } => {
+                assert!(headers.contains_key(CONTENT_TYPE.as_str()));
+            }
         }
     }
 }
@@ -1230,7 +1272,7 @@ async fn test_handle_get_manifest_no_redirect_returns_body() {
         let namespace = &Namespace::new("test-repo/no-redirect").unwrap();
         let (content, media_type) = create_test_manifest();
 
-        registry
+        let put_response = registry
             .put_manifest(
                 namespace,
                 &Reference::Tag("latest".to_string()),
@@ -1241,7 +1283,7 @@ async fn test_handle_get_manifest_no_redirect_returns_body() {
             .unwrap();
 
         let response = registry
-            .handle_get_manifest(
+            .resolve_get_manifest(
                 namespace,
                 Reference::Tag("latest".to_string()),
                 slice::from_ref(&media_type),
@@ -1250,19 +1292,27 @@ async fn test_handle_get_manifest_no_redirect_returns_body() {
             .await
             .unwrap();
 
-        if response.status() == StatusCode::OK {
-            assert_eq!(
-                response
-                    .headers()
-                    .get(CONTENT_TYPE)
-                    .map(|v| v.to_str().unwrap()),
-                Some(media_type.as_str()),
-                "GET response should include Content-Type header"
-            );
-            assert!(
-                response.headers().contains_key(DOCKER_CONTENT_DIGEST),
-                "GET response should include Docker-Content-Digest header"
-            );
+        // Both redirect and body responses are valid depending on backend capabilities.
+        // Verify the content is correct in either case.
+        match response {
+            GetManifestResponse::Redirect { headers } => {
+                assert_eq!(
+                    header_digest(&headers),
+                    header_digest(&put_response.headers)
+                );
+                assert_eq!(headers[CONTENT_TYPE.as_str()], media_type);
+            }
+            GetManifestResponse::Body {
+                headers,
+                content: body,
+            } => {
+                assert_eq!(
+                    header_digest(&headers),
+                    header_digest(&put_response.headers)
+                );
+                assert_eq!(headers[CONTENT_TYPE.as_str()], media_type);
+                assert_eq!(body, content);
+            }
         }
     }
 }

@@ -2,6 +2,7 @@ mod command;
 
 pub mod auth;
 mod error;
+pub mod handlers;
 pub mod http_server;
 pub mod listeners;
 pub mod request_ext;

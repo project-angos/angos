@@ -1,42 +1,36 @@
-use std::fmt::Debug;
+use std::collections::HashMap;
 
-use hyper::{
-    Response, StatusCode,
-    header::{CONTENT_TYPE, LINK},
-};
+use hyper::header::{CONTENT_TYPE, LINK};
 use serde::Serialize;
 use tracing::instrument;
 
 use crate::{
-    command::server::response_body::ResponseBody,
     oci::{Descriptor, Digest, Namespace, ReferrerList},
-    registry::{Error, Registry},
+    registry::{Error, JsonResponse, Registry},
 };
 
-pub const OCI_FILTERS_APPLIED: &str = "OCI-Filters-Applied";
+const OCI_FILTERS_APPLIED: &str = "OCI-Filters-Applied";
+const OCI_INDEX_MEDIA_TYPE: &str = "application/vnd.oci.image.index.v1+json";
+const APPLICATION_JSON: &str = "application/json";
 
-fn paginated_response(
-    body: ResponseBody,
-    link: Option<&str>,
-) -> Result<Response<ResponseBody>, Error> {
-    let res = match link {
-        Some(link) => Response::builder()
-            .status(StatusCode::OK)
-            .header(CONTENT_TYPE, "application/json")
-            .header(LINK, format!("<{link}>; rel=\"next\""))
-            .body(body)?,
-        None => Response::builder()
-            .status(StatusCode::OK)
-            .header(CONTENT_TYPE, "application/json")
-            .body(body)?,
-    };
+fn referrers_headers(artifact_type_filtered: bool) -> HashMap<&'static str, String> {
+    let mut headers = HashMap::from([(CONTENT_TYPE.as_str(), OCI_INDEX_MEDIA_TYPE.to_string())]);
+    if artifact_type_filtered {
+        headers.insert(OCI_FILTERS_APPLIED, "artifactType".to_string());
+    }
+    headers
+}
 
-    Ok(res)
+fn paginated_json_headers(link: Option<&str>) -> HashMap<&'static str, String> {
+    let mut headers = HashMap::from([(CONTENT_TYPE.as_str(), APPLICATION_JSON.to_string())]);
+    if let Some(link) = link {
+        headers.insert(LINK.as_str(), format!("<{link}>; rel=\"next\""));
+    }
+    headers
 }
 
 impl Registry {
-    #[instrument]
-    pub async fn get_referrers(
+    pub(crate) async fn list_referrers(
         &self,
         namespace: &Namespace,
         digest: &Digest,
@@ -48,8 +42,7 @@ impl Registry {
             .await?)
     }
 
-    #[instrument]
-    pub async fn list_catalog(
+    pub(crate) async fn list_catalog_entries(
         &self,
         n: Option<u16>,
         last: Option<String>,
@@ -62,8 +55,7 @@ impl Registry {
         Ok((namespaces, link))
     }
 
-    #[instrument]
-    pub async fn list_tags(
+    pub(crate) async fn list_tag_entries(
         &self,
         namespace: &Namespace,
         n: Option<u16>,
@@ -78,92 +70,74 @@ impl Registry {
         Ok((tags, link))
     }
 
-    #[instrument(skip(self))]
-    pub async fn handle_get_referrers(
+    #[instrument]
+    pub async fn get_referrers(
         &self,
         namespace: &Namespace,
         digest: &Digest,
         artifact_type: Option<String>,
-    ) -> Result<Response<ResponseBody>, Error> {
-        let query_supplied_artifact_type = artifact_type.is_some();
-
-        let manifests = self.get_referrers(namespace, digest, artifact_type).await?;
-
+    ) -> Result<JsonResponse, Error> {
+        let filtered = artifact_type.is_some();
+        let manifests = self
+            .list_referrers(namespace, digest, artifact_type)
+            .await?;
         let referrer_list = ReferrerList {
             manifests,
             ..ReferrerList::default()
         };
-        let referrer_list = serde_json::to_string(&referrer_list)?.into_bytes();
 
-        let res = if query_supplied_artifact_type {
-            Response::builder()
-                .status(StatusCode::OK)
-                .header(CONTENT_TYPE, "application/vnd.oci.image.index.v1+json")
-                .header(OCI_FILTERS_APPLIED, "artifactType")
-                .body(ResponseBody::fixed(referrer_list))?
-        } else {
-            Response::builder()
-                .status(StatusCode::OK)
-                .header(CONTENT_TYPE, "application/vnd.oci.image.index.v1+json")
-                .body(ResponseBody::fixed(referrer_list))?
-        };
-
-        Ok(res)
+        Ok(JsonResponse {
+            headers: referrers_headers(filtered),
+            body: serde_json::to_vec(&referrer_list)?,
+        })
     }
 
-    #[instrument(skip(self))]
-    pub async fn handle_list_catalog(
+    #[instrument]
+    pub async fn list_catalog(
         &self,
         n: Option<u16>,
         last: Option<String>,
-    ) -> Result<Response<ResponseBody>, Error> {
-        #[derive(Serialize, Debug)]
-        struct CatalogResponse {
+    ) -> Result<JsonResponse, Error> {
+        #[derive(Serialize)]
+        struct CatalogBody {
             repositories: Vec<String>,
         }
 
-        let (repositories, link) = self.list_catalog(n, last).await?;
+        let (repositories, link) = self.list_catalog_entries(n, last).await?;
 
-        let catalog = CatalogResponse { repositories };
-        let catalog = serde_json::to_string(&catalog)?;
-
-        paginated_response(ResponseBody::fixed(catalog.into_bytes()), link.as_deref())
+        Ok(JsonResponse {
+            headers: paginated_json_headers(link.as_deref()),
+            body: serde_json::to_vec(&CatalogBody { repositories })?,
+        })
     }
 
-    #[instrument(skip(self))]
-    pub async fn handle_list_tags(
+    #[instrument]
+    pub async fn list_tags(
         &self,
         namespace: &Namespace,
         n: Option<u16>,
         last: Option<String>,
-    ) -> Result<Response<ResponseBody>, Error> {
-        #[derive(Serialize, Debug)]
-        struct TagsResponse<'a> {
+    ) -> Result<JsonResponse, Error> {
+        #[derive(Serialize)]
+        struct TagsBody<'a> {
             name: &'a str,
             tags: Vec<String>,
         }
 
-        let (tags, link) = self.list_tags(namespace, n, last).await?;
+        let (tags, link) = self.list_tag_entries(namespace, n, last).await?;
 
-        let tag_list = TagsResponse {
-            name: namespace,
-            tags,
-        };
-        let tag_list = serde_json::to_string(&tag_list)?;
-        paginated_response(ResponseBody::fixed(tag_list.into_bytes()), link.as_deref())
+        Ok(JsonResponse {
+            headers: paginated_json_headers(link.as_deref()),
+            body: serde_json::to_vec(&TagsBody {
+                name: namespace.as_ref(),
+                tags,
+            })?,
+        })
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::str::FromStr;
-
-    use futures_util::TryStreamExt;
-    use http_body_util::BodyExt;
-    use tokio::io::AsyncReadExt;
-    use tokio_util::io::StreamReader;
-
-    use super::*;
     use crate::{
         oci::{Namespace, Reference},
         registry::{
@@ -174,14 +148,13 @@ mod tests {
     };
 
     #[tokio::test]
-    async fn test_get_referrers() {
+    async fn test_list_referrers() {
         for test_case in backends() {
             let registry = test_case.registry();
             let namespace = &Namespace::new("test-repo").unwrap();
-            let digest = Digest::from_str(
-                "sha256:1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
-            )
-            .unwrap();
+            let digest = "sha256:1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef"
+                .parse()
+                .unwrap();
 
             let test_content = b"test content";
             let test_digest = registry.blob_store.create_blob(test_content).await.unwrap();
@@ -191,13 +164,13 @@ mod tests {
             tx.commit().await.unwrap();
 
             let referrers = registry
-                .get_referrers(namespace, &digest, None)
+                .list_referrers(namespace, &digest, None)
                 .await
                 .unwrap();
             assert!(referrers.is_empty());
 
             let referrers = registry
-                .get_referrers(namespace, &digest, Some("test-type".to_string()))
+                .list_referrers(namespace, &digest, Some("test-type".to_string()))
                 .await
                 .unwrap();
             assert!(referrers.is_empty());
@@ -205,20 +178,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_list_catalog() {
+    async fn test_list_catalog_entries() {
         for test_case in backends() {
             let registry = test_case.registry();
 
-            let (namespaces, token) = registry.list_catalog(None, None).await.unwrap();
+            let (namespaces, token) = registry.list_catalog_entries(None, None).await.unwrap();
             assert!(namespaces.is_empty());
             assert!(token.is_none());
 
-            let (namespaces, token) = registry.list_catalog(Some(10), None).await.unwrap();
+            let (namespaces, token) = registry.list_catalog_entries(Some(10), None).await.unwrap();
             assert!(namespaces.is_empty());
             assert!(token.is_none());
 
             let (namespaces, token) = registry
-                .list_catalog(Some(10), Some("test".to_string()))
+                .list_catalog_entries(Some(10), Some("test".to_string()))
                 .await
                 .unwrap();
             assert!(namespaces.is_empty());
@@ -227,7 +200,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_list_tags() {
+    async fn test_list_tag_entries() {
         for test_case in backends() {
             let registry = test_case.registry();
             let namespace = &Namespace::new("test-repo").unwrap();
@@ -242,34 +215,43 @@ mod tests {
             }
             tx.commit().await.unwrap();
 
-            let (tags, token) = registry.list_tags(namespace, None, None).await.unwrap();
+            let (tags, token) = registry
+                .list_tag_entries(namespace, None, None)
+                .await
+                .unwrap();
             assert_eq!(tags.len(), 3);
             assert!(tags.contains(&"latest".to_string()));
             assert!(tags.contains(&"v1.0".to_string()));
             assert!(tags.contains(&"v2.0".to_string()));
             assert!(token.is_none());
 
-            let (page1, token1) = registry.list_tags(namespace, Some(2), None).await.unwrap();
+            let (page1, token1) = registry
+                .list_tag_entries(namespace, Some(2), None)
+                .await
+                .unwrap();
             assert_eq!(page1.len(), 2);
             assert!(token1.is_some());
 
             let last_tag = token1.unwrap().split("last=").nth(1).unwrap().to_string();
 
             let (page2, token2) = registry
-                .list_tags(namespace, Some(2), Some(last_tag))
+                .list_tag_entries(namespace, Some(2), Some(last_tag))
                 .await
                 .unwrap();
             assert_eq!(page2.len(), 1);
             assert!(token2.is_none());
 
-            let (page1, token1) = registry.list_tags(namespace, Some(1), None).await.unwrap();
+            let (page1, token1) = registry
+                .list_tag_entries(namespace, Some(1), None)
+                .await
+                .unwrap();
             assert_eq!(page1.len(), 1);
             assert!(token1.is_some());
 
             let last_tag = token1.unwrap().split("last=").nth(1).unwrap().to_string();
 
             let (page2, token2) = registry
-                .list_tags(namespace, Some(1), Some(last_tag))
+                .list_tag_entries(namespace, Some(1), Some(last_tag))
                 .await
                 .unwrap();
             assert_eq!(page2.len(), 1);
@@ -278,14 +260,14 @@ mod tests {
             let last_tag = token2.unwrap().split("last=").nth(1).unwrap().to_string();
 
             let (page3, token3) = registry
-                .list_tags(namespace, Some(1), Some(last_tag))
+                .list_tag_entries(namespace, Some(1), Some(last_tag))
                 .await
                 .unwrap();
             assert_eq!(page3.len(), 1);
             assert!(token3.is_none());
 
             let (tags, token) = registry
-                .list_tags(namespace, Some(10), Some("latest".to_string()))
+                .list_tag_entries(namespace, Some(10), Some("latest".to_string()))
                 .await
                 .unwrap();
             assert_eq!(tags.len(), 2);
@@ -294,7 +276,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_handle_get_referrers() {
+    async fn test_list_referrers_with_manifest() {
         for test_case in backends() {
             let registry = test_case.registry();
             let namespace = &Namespace::new("test-repo").unwrap();
@@ -335,136 +317,13 @@ mod tests {
                 .add();
             tx.commit().await.unwrap();
 
-            let response = registry
-                .handle_get_referrers(namespace, &base_manifest_digest, None)
+            let referrers = registry
+                .list_referrers(namespace, &base_manifest_digest, None)
                 .await
                 .unwrap();
 
-            assert_eq!(response.status(), StatusCode::OK);
-            let stream = response.into_data_stream().map_err(std::io::Error::other);
-            let mut reader = StreamReader::new(stream);
-            let mut buf = Vec::new();
-            reader.read_to_end(&mut buf).await.unwrap();
-            let referrers: serde_json::Value = serde_json::from_slice(&buf).unwrap();
-            let manifests = referrers["manifests"].as_array().unwrap();
-            assert_eq!(manifests.len(), 1);
-            assert_eq!(
-                manifests[0]["digest"].as_str().unwrap(),
-                referrer_manifest_digest.to_string()
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn test_handle_list_catalog() {
-        for test_case in backends() {
-            let registry = test_case.registry();
-            let namespaces = ["repo1", "repo2", "repo3"];
-            let content = b"test content";
-
-            for namespace in &namespaces {
-                let (digest, _) = create_test_blob(registry, namespace, content).await;
-                let tag_link = LinkKind::Tag("latest".to_string());
-                let mut tx = registry.metadata_store.begin_transaction(namespace);
-                tx.create_link(&tag_link, &digest).add();
-                tx.commit().await.unwrap();
-            }
-
-            let response = registry.handle_list_catalog(None, None).await.unwrap();
-
-            assert_eq!(response.status(), StatusCode::OK);
-            let has_link = response.headers().get("Link").is_some();
-            let stream = response.into_data_stream().map_err(std::io::Error::other);
-            let mut reader = StreamReader::new(stream);
-            let mut buf = Vec::new();
-            reader.read_to_end(&mut buf).await.unwrap();
-            let catalog: serde_json::Value = serde_json::from_slice(&buf).unwrap();
-            let repositories = catalog["repositories"].as_array().unwrap();
-            assert_eq!(repositories.len(), namespaces.len());
-            for namespace in &namespaces {
-                assert!(
-                    repositories
-                        .iter()
-                        .any(|r| r.as_str().unwrap() == *namespace)
-                );
-            }
-            assert!(!has_link);
-
-            let response = registry.handle_list_catalog(Some(2), None).await.unwrap();
-
-            assert_eq!(response.status(), StatusCode::OK);
-            let has_link = response.headers().get("Link").is_some();
-            let stream = response.into_data_stream().map_err(std::io::Error::other);
-            let mut reader = StreamReader::new(stream);
-            let mut buf = Vec::new();
-            reader.read_to_end(&mut buf).await.unwrap();
-            let catalog: serde_json::Value = serde_json::from_slice(&buf).unwrap();
-            let repositories = catalog["repositories"].as_array().unwrap();
-            assert_eq!(repositories.len(), 2);
-            assert!(has_link);
-        }
-    }
-
-    #[tokio::test]
-    async fn test_handle_list_tags() {
-        for test_case in backends() {
-            let registry = test_case.registry();
-            let namespace = &Namespace::new("test-repo").unwrap();
-            let content = b"test content";
-            let (digest, _) = create_test_blob(registry, namespace, content).await;
-
-            let tags = ["v1", "v2", "latest"];
-            let mut tx = registry.metadata_store.begin_transaction(namespace);
-            for tag in tags {
-                tx.create_link(&LinkKind::Tag(tag.to_string()), &digest)
-                    .add();
-            }
-            tx.commit().await.unwrap();
-
-            let response = registry
-                .handle_list_tags(namespace, None, None)
-                .await
-                .unwrap();
-
-            assert_eq!(response.status(), StatusCode::OK);
-            let has_link = response.headers().get("Link").is_some();
-            let stream = response.into_data_stream().map_err(std::io::Error::other);
-            let mut reader = StreamReader::new(stream);
-            let mut buf = Vec::new();
-            reader.read_to_end(&mut buf).await.unwrap();
-
-            let tag_list: serde_json::Value = serde_json::from_slice(&buf).unwrap();
-
-            let name = tag_list["name"].as_str().unwrap();
-            let returned_tags = tag_list["tags"].as_array().unwrap();
-
-            assert_eq!(name, namespace);
-            assert_eq!(returned_tags.len(), tags.len());
-
-            for tag in &tags {
-                assert!(returned_tags.iter().any(|t| t.as_str().unwrap() == *tag));
-            }
-            assert!(!has_link);
-
-            let response = registry
-                .handle_list_tags(namespace, Some(2), None)
-                .await
-                .unwrap();
-
-            assert_eq!(response.status(), StatusCode::OK);
-            let has_link = response.headers().get("Link").is_some();
-            let stream = response.into_data_stream().map_err(std::io::Error::other);
-            let mut reader = StreamReader::new(stream);
-            let mut buf = Vec::new();
-            reader.read_to_end(&mut buf).await.unwrap();
-            let tag_list: serde_json::Value = serde_json::from_slice(&buf).unwrap();
-
-            let name = tag_list["name"].as_str().unwrap();
-            let tags = tag_list["tags"].as_array().unwrap();
-
-            assert_eq!(name, namespace);
-            assert_eq!(tags.len(), 2);
-            assert!(has_link);
+            assert_eq!(referrers.len(), 1);
+            assert_eq!(referrers[0].digest, referrer_manifest_digest);
         }
     }
 }

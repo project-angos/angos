@@ -2,6 +2,10 @@ use std::collections::HashMap;
 
 use super::*;
 use crate::{
+    command::server::handlers::{
+        blob::handle_delete_blob, content_discovery::handle_list_catalog,
+        ext::handle_list_repositories,
+    },
     configuration::Configuration,
     identity::ClientIdentity,
     registry,
@@ -508,5 +512,5 @@ async fn test_handle_delete_blob() {
         .parse()
         .unwrap();
 
-    let _result = handle_delete_blob(&context, &namespace, digest).await;
+    let _result = handle_delete_blob(&context, &namespace, &digest).await;
 }
