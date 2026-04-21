@@ -30,6 +30,7 @@ use crate::{
         ServerContext,
         auth::PeerCertificate,
         error::Error,
+        handlers,
         request_ext::{HeaderExt, IntoAsyncRead},
         response_body::ResponseBody,
         router, ui,
@@ -93,16 +94,7 @@ async fn handle_request(
     let path = request.uri().path().to_owned();
     let route_action = router::parse(request.method(), request.uri()).action_name();
 
-    let trace_id = {
-        let context = Span::current().context();
-        let span = context.span();
-        let span_context = span.span_context();
-        if span_context.is_valid() {
-            Some(span_context.trace_id().to_string())
-        } else {
-            None
-        }
-    };
+    let trace_id = trace_id_of(&Span::current());
 
     let response = match router(Arc::clone(&context), request).await {
         Ok(response) => response,
@@ -135,6 +127,21 @@ async fn handle_request(
     }
 
     Ok(response)
+}
+
+/// Extracts the `OpenTelemetry` trace ID from the given tracing span.
+///
+/// Returns `None` if the span has no `OpenTelemetry` bridge context (e.g. the
+/// span is disabled, or no `OpenTelemetry` layer is registered with the subscriber).
+fn trace_id_of(span: &Span) -> Option<String> {
+    let context = span.context();
+    let otel_span = context.span();
+    let span_context = otel_span.span_context();
+    if span_context.is_valid() {
+        Some(span_context.trace_id().to_string())
+    } else {
+        None
+    }
 }
 
 #[instrument(skip(context, req))]
@@ -173,11 +180,13 @@ async fn dispatch_route<'a>(
         Route::UiAsset { path } if context.enable_ui => ui::serve_asset(path),
         Route::UiConfig if context.enable_ui => handle_ui_config(context),
         Route::Unknown | Route::UiAsset { .. } | Route::UiConfig => handle_unknown_route(parts),
-        Route::ApiVersion => Ok(context.registry.handle_get_api_version().await?),
+        Route::ApiVersion => Ok(handlers::version::handle_get_api_version()?),
         Route::StartUpload { namespace, digest } => {
-            handle_start_upload(context, &namespace, digest).await
+            handlers::upload::handle_start_upload(context, &namespace, digest).await
         }
-        Route::GetUpload { namespace, uuid } => handle_get_upload(context, &namespace, uuid).await,
+        Route::GetUpload { namespace, uuid } => {
+            handlers::upload::handle_get_upload(context, &namespace, uuid).await
+        }
         Route::PatchUpload { namespace, uuid } => {
             handle_patch_upload(context, parts, incoming, &namespace, uuid).await
         }
@@ -187,7 +196,7 @@ async fn dispatch_route<'a>(
             digest,
         } => handle_put_upload(context, parts, incoming, &namespace, uuid, digest, identity).await,
         Route::DeleteUpload { namespace, uuid } => {
-            handle_delete_upload(context, &namespace, uuid).await
+            handlers::upload::handle_delete_upload(context, &namespace, uuid).await
         }
         Route::GetBlob { namespace, digest } => {
             handle_get_blob(context, parts, &namespace, digest).await
@@ -196,7 +205,7 @@ async fn dispatch_route<'a>(
             handle_head_blob(context, parts, &namespace, digest).await
         }
         Route::DeleteBlob { namespace, digest } => {
-            handle_delete_blob(context, &namespace, digest).await
+            handlers::blob::handle_delete_blob(context, &namespace, &digest).await
         }
         Route::GetManifest {
             namespace,
@@ -218,15 +227,31 @@ async fn dispatch_route<'a>(
             namespace,
             digest,
             artifact_type,
-        } => handle_get_referrer(context, &namespace, digest, artifact_type).await,
-        Route::ListCatalog { n, last } => handle_list_catalog(context, n, last).await,
-        Route::ListTags { namespace, n, last } => {
-            handle_list_tags(context, &namespace, n, last).await
+        } => {
+            handlers::content_discovery::handle_get_referrers(
+                context,
+                &namespace,
+                &digest,
+                artifact_type,
+            )
+            .await
         }
-        Route::ListRevisions { namespace } => handle_list_revisions(context, &namespace).await,
-        Route::ListUploads { namespace } => handle_list_uploads(context, &namespace).await,
-        Route::ListRepositories => handle_list_repositories(context).await,
-        Route::ListNamespaces { repository } => handle_list_namespaces(context, repository).await,
+        Route::ListCatalog { n, last } => {
+            handlers::content_discovery::handle_list_catalog(context, n, last).await
+        }
+        Route::ListTags { namespace, n, last } => {
+            handlers::content_discovery::handle_list_tags(context, &namespace, n, last).await
+        }
+        Route::ListRevisions { namespace } => {
+            handlers::ext::handle_list_revisions(context, &namespace).await
+        }
+        Route::ListUploads { namespace } => {
+            handlers::ext::handle_list_uploads(context, &namespace).await
+        }
+        Route::ListRepositories => handlers::ext::handle_list_repositories(context).await,
+        Route::ListNamespaces { repository } => {
+            handlers::ext::handle_list_namespaces(context, repository).await
+        }
         Route::Healthz => handle_healthz(),
         Route::Readyz => handle_readyz(context, parts).await,
         Route::Metrics => handle_metrics(),
@@ -251,25 +276,6 @@ fn repository_name_for(context: &ServerContext, namespace: &Namespace) -> String
         .unwrap_or_default()
 }
 
-async fn handle_start_upload(
-    context: &ServerContext,
-    namespace: &Namespace,
-    digest: Option<Digest>,
-) -> Result<Response<ResponseBody>, Error> {
-    Ok(context
-        .registry
-        .handle_start_upload(namespace, digest)
-        .await?)
-}
-
-async fn handle_get_upload(
-    context: &ServerContext,
-    namespace: &Namespace,
-    uuid: Uuid,
-) -> Result<Response<ResponseBody>, Error> {
-    Ok(context.registry.handle_get_upload(namespace, uuid).await?)
-}
-
 async fn handle_patch_upload(
     context: &ServerContext,
     parts: &Parts,
@@ -286,10 +292,15 @@ async fn handle_patch_upload(
         .unwrap_or(0);
     let body_stream = incoming.into_async_read();
 
-    Ok(context
-        .registry
-        .handle_patch_upload(namespace, uuid, start_offset, content_length, body_stream)
-        .await?)
+    handlers::upload::handle_patch_upload(
+        context,
+        namespace,
+        uuid,
+        start_offset,
+        content_length,
+        body_stream,
+    )
+    .await
 }
 
 async fn handle_put_upload(
@@ -309,10 +320,15 @@ async fn handle_put_upload(
         .unwrap_or(0);
     let body_stream = incoming.into_async_read();
 
-    let response = context
-        .registry
-        .handle_put_upload(namespace, uuid, &digest, content_length, body_stream)
-        .await?;
+    let response = handlers::upload::handle_put_upload(
+        context,
+        namespace,
+        uuid,
+        &digest,
+        content_length,
+        body_stream,
+    )
+    .await?;
 
     let event = Event::new(
         EventKind::BlobPush,
@@ -326,17 +342,6 @@ async fn handle_put_upload(
     Ok(response)
 }
 
-async fn handle_delete_upload(
-    context: &ServerContext,
-    namespace: &Namespace,
-    uuid: Uuid,
-) -> Result<Response<ResponseBody>, Error> {
-    Ok(context
-        .registry
-        .handle_delete_upload(namespace, uuid)
-        .await?)
-}
-
 async fn handle_get_blob(
     context: &ServerContext,
     parts: &Parts,
@@ -346,10 +351,7 @@ async fn handle_get_blob(
     let mime_types = parts.accepted_content_types();
     let range = parts.range(RANGE)?;
 
-    Ok(context
-        .registry
-        .handle_get_blob(namespace, &digest, &mime_types, range)
-        .await?)
+    handlers::blob::handle_get_blob(context, namespace, &digest, &mime_types, range).await
 }
 
 async fn handle_head_blob(
@@ -360,21 +362,7 @@ async fn handle_head_blob(
 ) -> Result<Response<ResponseBody>, Error> {
     let mime_types = parts.accepted_content_types();
 
-    Ok(context
-        .registry
-        .handle_head_blob(namespace, &digest, &mime_types)
-        .await?)
-}
-
-async fn handle_delete_blob(
-    context: &ServerContext,
-    namespace: &Namespace,
-    digest: Digest,
-) -> Result<Response<ResponseBody>, Error> {
-    Ok(context
-        .registry
-        .handle_delete_blob(namespace, &digest)
-        .await?)
+    handlers::blob::handle_head_blob(context, namespace, &digest, &mime_types).await
 }
 
 async fn handle_get_manifest(
@@ -386,10 +374,14 @@ async fn handle_get_manifest(
     let mime_types = parts.accepted_content_types();
     let is_immutable = context.is_reference_immutable(namespace, &reference);
 
-    Ok(context
-        .registry
-        .handle_get_manifest(namespace, reference, &mime_types, is_immutable)
-        .await?)
+    handlers::manifest::handle_get_manifest(
+        context,
+        namespace,
+        reference,
+        &mime_types,
+        is_immutable,
+    )
+    .await
 }
 
 async fn handle_head_manifest(
@@ -401,10 +393,14 @@ async fn handle_head_manifest(
     let mime_types = parts.accepted_content_types();
     let is_immutable = context.is_reference_immutable(namespace, &reference);
 
-    Ok(context
-        .registry
-        .handle_head_manifest(namespace, reference, &mime_types, is_immutable)
-        .await?)
+    handlers::manifest::handle_head_manifest(
+        context,
+        namespace,
+        reference,
+        &mime_types,
+        is_immutable,
+    )
+    .await
 }
 
 async fn handle_put_manifest(
@@ -421,10 +417,14 @@ async fn handle_put_manifest(
 
     let body_stream = incoming.into_async_read();
 
-    let response = context
-        .registry
-        .handle_put_manifest(namespace, reference.clone(), mime_type, body_stream)
-        .await?;
+    let response = handlers::manifest::handle_put_manifest(
+        context,
+        namespace,
+        reference.clone(),
+        mime_type,
+        body_stream,
+    )
+    .await?;
 
     let digest = response
         .headers()
@@ -463,10 +463,8 @@ async fn handle_delete_manifest(
     reference: Reference,
     identity: &ClientIdentity,
 ) -> Result<Response<ResponseBody>, Error> {
-    let response = context
-        .registry
-        .handle_delete_manifest(namespace, reference.clone())
-        .await?;
+    let response =
+        handlers::manifest::handle_delete_manifest(context, namespace, reference.clone()).await?;
 
     let repository = repository_name_for(context, namespace);
     let actor = Some(EventActor::from(identity.clone()));
@@ -498,94 +496,25 @@ async fn handle_delete_manifest(
     Ok(response)
 }
 
-async fn handle_get_referrer(
-    context: &ServerContext,
-    namespace: &Namespace,
-    digest: Digest,
-    artifact_type: Option<String>,
-) -> Result<Response<ResponseBody>, Error> {
-    Ok(context
-        .registry
-        .handle_get_referrers(namespace, &digest, artifact_type)
-        .await?)
-}
-
-async fn handle_list_catalog(
-    context: &ServerContext,
-    n: Option<u16>,
-    last: Option<String>,
-) -> Result<Response<ResponseBody>, Error> {
-    Ok(context.registry.handle_list_catalog(n, last).await?)
-}
-
-async fn handle_list_tags(
-    context: &ServerContext,
-    namespace: &Namespace,
-    n: Option<u16>,
-    last: Option<String>,
-) -> Result<Response<ResponseBody>, Error> {
-    Ok(context
-        .registry
-        .handle_list_tags(namespace, n, last)
-        .await?)
-}
-
-async fn handle_list_revisions(
-    context: &ServerContext,
-    namespace: &Namespace,
-) -> Result<Response<ResponseBody>, Error> {
-    Ok(context.registry.handle_list_revisions(namespace).await?)
-}
-
-async fn handle_list_uploads(
-    context: &ServerContext,
-    namespace: &Namespace,
-) -> Result<Response<ResponseBody>, Error> {
-    Ok(context.registry.handle_list_uploads(namespace).await?)
-}
-
-async fn handle_list_repositories(
-    context: &ServerContext,
-) -> Result<Response<ResponseBody>, Error> {
-    Ok(context.registry.handle_list_repositories().await?)
-}
-
-async fn handle_list_namespaces(
-    context: &ServerContext,
-    repository: &str,
-) -> Result<Response<ResponseBody>, Error> {
-    Ok(context.registry.handle_list_namespaces(repository).await?)
-}
-
 fn handle_ui_config(context: &ServerContext) -> Result<Response<ResponseBody>, Error> {
     let config = serde_json::json!({
         "name": context.ui_name
     });
-    let body = serde_json::to_string(&config)
-        .map_err(|e| Error::Internal(format!("Failed to serialize UI config: {e}")))?;
+    let body = serde_json::to_string(&config)?;
 
-    Response::builder()
+    Ok(Response::builder()
         .status(StatusCode::OK)
         .header(CONTENT_TYPE, "application/json")
-        .body(ResponseBody::Fixed(Full::new(Bytes::from(body))))
-        .map_err(|e| Error::Internal(format!("Failed to build UI config response: {e}")))
+        .body(ResponseBody::Fixed(Full::new(Bytes::from(body))))?)
 }
 
 fn handle_healthz() -> Result<Response<ResponseBody>, Error> {
-    let response = Response::builder()
+    Ok(Response::builder()
         .status(StatusCode::OK)
         .header(CONTENT_TYPE, "application/json")
         .body(ResponseBody::Fixed(Full::new(Bytes::from(
             r#"{"status":"ok"}"#,
-        ))));
-
-    match response {
-        Ok(resp) => Ok(resp),
-        Err(e) => {
-            let msg = format!("Failed to build healthz response: {e}");
-            Err(Error::Internal(msg))
-        }
-    }
+        ))))?)
 }
 
 async fn handle_readyz(
@@ -616,46 +545,33 @@ async fn handle_readyz(
                 status: "ready",
                 conditional: if verbose { conditional.as_ref() } else { None },
             };
-            let body = serde_json::to_string(&payload).map_err(|e| {
-                Error::Internal(format!("Failed to serialize readyz response: {e}"))
-            })?;
-            Response::builder()
+            let body = serde_json::to_string(&payload)?;
+            Ok(Response::builder()
                 .status(StatusCode::OK)
                 .header(CONTENT_TYPE, "application/json")
-                .body(ResponseBody::Fixed(Full::new(Bytes::from(body))))
-                .map_err(|e| Error::Internal(format!("Failed to build readyz response: {e}")))
+                .body(ResponseBody::Fixed(Full::new(Bytes::from(body))))?)
         }
         Err(e) => {
             let payload = NotReadyResponse {
                 status: "not_ready",
                 error: e.to_string(),
             };
-            let body = serde_json::to_string(&payload).map_err(|e| {
-                Error::Internal(format!("Failed to serialize readyz response: {e}"))
-            })?;
-            Response::builder()
+            let body = serde_json::to_string(&payload)?;
+            Ok(Response::builder()
                 .status(StatusCode::SERVICE_UNAVAILABLE)
                 .header(CONTENT_TYPE, "application/json")
-                .body(ResponseBody::Fixed(Full::new(Bytes::from(body))))
-                .map_err(|e| Error::Internal(format!("Failed to build readyz response: {e}")))
+                .body(ResponseBody::Fixed(Full::new(Bytes::from(body))))?)
         }
     }
 }
 
 fn handle_metrics() -> Result<Response<ResponseBody>, Error> {
     let (content_type, metrics) = METRICS_PROVIDER.gather()?;
-    let response = Response::builder()
+
+    Ok(Response::builder()
         .status(StatusCode::OK)
         .header(CONTENT_TYPE, content_type)
-        .body(ResponseBody::Fixed(Full::new(Bytes::from(metrics))));
-
-    match response {
-        Ok(resp) => Ok(resp),
-        Err(e) => {
-            let msg = format!("Failed to build metrics response: {e}");
-            Err(Error::Internal(msg))
-        }
-    }
+        .body(ResponseBody::Fixed(Full::new(Bytes::from(metrics))))?)
 }
 
 pub fn error_to_response(error: &Error, request_id: Option<&String>) -> Response<ResponseBody> {

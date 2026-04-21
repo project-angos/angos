@@ -1,14 +1,11 @@
+use std::collections::HashMap;
+
 use futures_util::StreamExt;
-use hyper::{
-    Response, StatusCode,
-    header::{CONTENT_LENGTH, CONTENT_TYPE, LOCATION},
-    http::response,
-};
+use hyper::header::{CONTENT_LENGTH, CONTENT_TYPE, LOCATION};
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tracing::{error, instrument, warn};
 
 use crate::{
-    command::server::response_body::ResponseBody,
     oci::{Digest, Manifest, Namespace, Reference},
     registry::{
         DOCKER_CONTENT_DIGEST, Error, OCI_SUBJECT, Registry, Repository,
@@ -16,31 +13,90 @@ use crate::{
     },
 };
 
-fn manifest_response_builder(digest: &Digest, media_type: Option<&str>) -> response::Builder {
-    let mut builder = Response::builder()
-        .status(StatusCode::OK)
-        .header(DOCKER_CONTENT_DIGEST, digest.to_string());
-    if let Some(media_type) = media_type {
-        builder = builder.header(CONTENT_TYPE, media_type);
-    }
-    builder
+pub(crate) struct ManifestMeta {
+    pub media_type: Option<String>,
+    pub digest: Digest,
+    pub size: u64,
 }
 
-pub struct GetManifestResponse {
+pub(crate) struct ManifestBody {
     pub media_type: Option<String>,
     pub digest: Digest,
     pub content: Vec<u8>,
 }
 
+pub enum GetManifestResponse {
+    Redirect {
+        headers: HashMap<&'static str, String>,
+    },
+    Body {
+        headers: HashMap<&'static str, String>,
+        content: Vec<u8>,
+    },
+}
+
 pub struct HeadManifestResponse {
-    pub media_type: Option<String>,
-    pub digest: Digest,
-    pub size: usize,
+    pub headers: HashMap<&'static str, String>,
 }
 
 pub struct PutManifestResponse {
-    pub digest: Digest,
-    pub subject: Option<Digest>,
+    pub headers: HashMap<&'static str, String>,
+}
+
+fn head_manifest_headers(meta: &ManifestMeta) -> HashMap<&'static str, String> {
+    let mut headers = HashMap::from([
+        (DOCKER_CONTENT_DIGEST, meta.digest.to_string()),
+        (CONTENT_LENGTH.as_str(), meta.size.to_string()),
+    ]);
+    if let Some(media_type) = meta.media_type.clone() {
+        headers.insert(CONTENT_TYPE.as_str(), media_type);
+    }
+    headers
+}
+
+fn get_manifest_body_headers(
+    media_type: Option<&str>,
+    digest: &Digest,
+) -> HashMap<&'static str, String> {
+    let mut headers = HashMap::from([(DOCKER_CONTENT_DIGEST, digest.to_string())]);
+    if let Some(media_type) = media_type {
+        headers.insert(CONTENT_TYPE.as_str(), media_type.to_string());
+    }
+    headers
+}
+
+fn get_manifest_redirect_headers(
+    url: String,
+    digest: &Digest,
+    media_type: Option<String>,
+) -> HashMap<&'static str, String> {
+    let mut headers = HashMap::from([
+        (LOCATION.as_str(), url),
+        (DOCKER_CONTENT_DIGEST, digest.to_string()),
+    ]);
+    if let Some(media_type) = media_type {
+        headers.insert(CONTENT_TYPE.as_str(), media_type);
+    }
+    headers
+}
+
+fn put_manifest_headers(
+    namespace: &Namespace,
+    reference: &Reference,
+    digest: &Digest,
+    subject: Option<&Digest>,
+) -> HashMap<&'static str, String> {
+    let mut headers = HashMap::from([
+        (
+            LOCATION.as_str(),
+            format!("/v2/{namespace}/manifests/{reference}"),
+        ),
+        (DOCKER_CONTENT_DIGEST, digest.to_string()),
+    ]);
+    if let Some(subject) = subject {
+        headers.insert(OCI_SUBJECT, subject.to_string());
+    }
+    headers
 }
 
 pub struct ParsedManifestDigests {
@@ -117,30 +173,31 @@ impl Registry {
         let local = self.head_local_manifest(namespace, &reference).await;
 
         if !repository.is_pull_through() {
-            return local.map_err(|_| {
-                error!("Failed to head local manifest: {namespace}:{reference}");
-                Error::ManifestUnknown
-            });
+            return local
+                .map(|meta| HeadManifestResponse {
+                    headers: head_manifest_headers(&meta),
+                })
+                .map_err(|_| {
+                    error!("Failed to head local manifest: {namespace}:{reference}");
+                    Error::ManifestUnknown
+                });
         }
 
-        if let Ok(manifest) = local {
+        if let Ok(meta) = local {
             let needs_upstream_pull = matches!(&reference, Reference::Tag(_))
                 && !is_tag_immutable
                 && !repository
-                    .is_upstream_digest_match(
-                        accepted_types,
-                        namespace,
-                        &reference,
-                        &manifest.digest,
-                    )
+                    .is_upstream_digest_match(accepted_types, namespace, &reference, &meta.digest)
                     .await?;
 
             if !needs_upstream_pull {
-                return Ok(manifest);
+                return Ok(HeadManifestResponse {
+                    headers: head_manifest_headers(&meta),
+                });
             }
         }
 
-        let res = self
+        let body = self
             .get_manifest(
                 repository,
                 accepted_types,
@@ -151,9 +208,11 @@ impl Registry {
             .await?;
 
         Ok(HeadManifestResponse {
-            media_type: res.media_type,
-            digest: res.digest,
-            size: res.content.len(),
+            headers: head_manifest_headers(&ManifestMeta {
+                media_type: body.media_type,
+                digest: body.digest,
+                size: body.content.len() as u64,
+            }),
         })
     }
 
@@ -161,7 +220,7 @@ impl Registry {
         &self,
         namespace: &Namespace,
         reference: &Reference,
-    ) -> Result<HeadManifestResponse, Error> {
+    ) -> Result<ManifestMeta, Error> {
         let blob_link = reference.clone().into();
         let link = self
             .metadata_store
@@ -178,10 +237,10 @@ impl Registry {
                     Error::ManifestUnknown
                 })?;
 
-            return Ok(HeadManifestResponse {
+            return Ok(ManifestMeta {
                 media_type: Some(media_type),
                 digest: link.target,
-                size: usize::try_from(size).unwrap_or(usize::MAX),
+                size,
             });
         }
 
@@ -200,12 +259,11 @@ impl Registry {
         reader.read_to_end(&mut manifest_content).await?;
 
         let manifest = serde_json::from_slice::<Manifest>(&manifest_content)?;
-        let size = manifest_content.len();
 
-        Ok(HeadManifestResponse {
+        Ok(ManifestMeta {
             media_type: manifest.media_type,
             digest: link.target,
-            size,
+            size: manifest_content.len() as u64,
         })
     }
 
@@ -217,7 +275,7 @@ impl Registry {
         namespace: &Namespace,
         reference: Reference,
         is_tag_immutable: bool,
-    ) -> Result<GetManifestResponse, Error> {
+    ) -> Result<ManifestBody, Error> {
         let local = self.get_local_manifest(namespace, &reference).await;
 
         if !repository.is_pull_through() {
@@ -251,7 +309,7 @@ impl Registry {
         self.put_manifest(namespace, &reference, media_type.as_ref(), &content)
             .await?;
 
-        Ok(GetManifestResponse {
+        Ok(ManifestBody {
             media_type,
             digest,
             content,
@@ -262,7 +320,7 @@ impl Registry {
         &self,
         namespace: &Namespace,
         reference: &Reference,
-    ) -> Result<GetManifestResponse, Error> {
+    ) -> Result<ManifestBody, Error> {
         let blob_link = reference.clone().into();
         let link = self
             .metadata_store
@@ -275,7 +333,7 @@ impl Registry {
             Error::ManifestInvalid("Failed to deserialize manifest".to_string())
         })?;
 
-        Ok(GetManifestResponse {
+        Ok(ManifestBody {
             media_type: link.media_type.or(manifest.media_type),
             digest: link.target,
             content,
@@ -369,9 +427,11 @@ impl Registry {
 
         tx.commit().await?;
 
-        let subject = manifest.subject.map(|s| s.digest.clone());
+        let subject = manifest.subject.map(|s| s.digest);
 
-        Ok(PutManifestResponse { digest, subject })
+        Ok(PutManifestResponse {
+            headers: put_manifest_headers(namespace, reference, &digest, subject.as_ref()),
+        })
     }
 
     #[instrument]
@@ -460,53 +520,22 @@ impl Registry {
         Ok(())
     }
 
+    /// Resolves a manifest GET request to either a presigned redirect URL or the manifest body.
+    ///
+    /// The redirect fast-path is safe only when the cached target is authoritative:
+    /// the repository is not a pull-through cache, the reference is a digest, or the
+    /// tag has been declared immutable. For mutable tags on a pull-through cache we
+    /// fall through to `get_manifest` to refresh if upstream has moved.
     #[instrument(skip(self, is_tag_immutable))]
-    pub async fn handle_head_manifest(
+    pub async fn resolve_get_manifest(
         &self,
         namespace: &Namespace,
         reference: Reference,
         mime_types: &[String],
         is_tag_immutable: bool,
-    ) -> Result<Response<ResponseBody>, Error> {
+    ) -> Result<GetManifestResponse, Error> {
         let repository = self.get_repository_for_namespace(namespace)?;
 
-        let manifest = self
-            .head_manifest(
-                repository,
-                mime_types,
-                namespace,
-                reference,
-                is_tag_immutable,
-            )
-            .await?;
-
-        let res = manifest_response_builder(&manifest.digest, manifest.media_type.as_deref())
-            .header(CONTENT_LENGTH, manifest.size)
-            .body(ResponseBody::empty())?;
-
-        Ok(res)
-    }
-
-    #[instrument(skip(self, is_tag_immutable))]
-    pub async fn handle_get_manifest(
-        &self,
-        namespace: &Namespace,
-        reference: Reference,
-        mime_types: &[String],
-        is_tag_immutable: bool,
-    ) -> Result<Response<ResponseBody>, Error> {
-        let repository = self.get_repository_for_namespace(namespace)?;
-
-        // The redirect fast-path serves the cached manifest link directly,
-        // bypassing `get_manifest` and its upstream revalidation. That is
-        // only safe when the cached target is authoritative:
-        //   * the repository is not a pull-through cache (we own the data),
-        //   * the reference is a digest (content-addressable, immutable),
-        //   * or the tag has been declared immutable via configuration.
-        // For mutable tags on a pull-through cache we must fall through to
-        // `get_manifest`, which HEADs the upstream and refreshes the cache
-        // when the tag has moved; otherwise clients would be pinned forever
-        // to the digest captured on the first pull.
         let redirect_is_authoritative = !repository.is_pull_through()
             || matches!(reference, Reference::Digest(_))
             || is_tag_immutable;
@@ -525,13 +554,13 @@ impl Registry {
                 .get_blob_url(&link.target, Some(media_type.as_str()))
                 .await
         {
-            return Response::builder()
-                .status(StatusCode::TEMPORARY_REDIRECT)
-                .header(LOCATION, presigned_url)
-                .header(DOCKER_CONTENT_DIGEST, link.target.to_string())
-                .header(CONTENT_TYPE, media_type)
-                .body(ResponseBody::empty())
-                .map_err(Into::into);
+            return Ok(GetManifestResponse::Redirect {
+                headers: get_manifest_redirect_headers(
+                    presigned_url,
+                    &link.target,
+                    Some(media_type),
+                ),
+            });
         }
 
         let manifest = self
@@ -545,40 +574,38 @@ impl Registry {
             .await?;
 
         // Backward compatibility: when the optimized redirect path above fails (link
-        // lacks media_type), fall back to reading the full blob via get_manifest then
-        // redirecting. Remove this block once all links have been re-pushed.
+        // lacks media_type), fall back to redirecting after reading the full blob.
+        // Remove this block once all links have been re-pushed.
         if self.enable_manifest_redirect
             && let Ok(Some(presigned_url)) = self
                 .blob_store
                 .get_blob_url(&manifest.digest, manifest.media_type.as_deref())
                 .await
         {
-            let mut builder = Response::builder()
-                .status(StatusCode::TEMPORARY_REDIRECT)
-                .header(LOCATION, presigned_url)
-                .header(DOCKER_CONTENT_DIGEST, manifest.digest.to_string());
-
-            if let Some(content_type) = manifest.media_type {
-                builder = builder.header(CONTENT_TYPE, content_type);
-            }
-
-            return builder.body(ResponseBody::empty()).map_err(Into::into);
+            return Ok(GetManifestResponse::Redirect {
+                headers: get_manifest_redirect_headers(
+                    presigned_url,
+                    &manifest.digest,
+                    manifest.media_type,
+                ),
+            });
         }
 
-        let res = manifest_response_builder(&manifest.digest, manifest.media_type.as_deref())
-            .body(ResponseBody::fixed(manifest.content))?;
-
-        Ok(res)
+        Ok(GetManifestResponse::Body {
+            headers: get_manifest_body_headers(manifest.media_type.as_deref(), &manifest.digest),
+            content: manifest.content,
+        })
     }
 
+    /// Reads the body stream, calls `put_manifest`, and returns the domain response.
     #[instrument(skip(self, body_stream))]
-    pub async fn handle_put_manifest<S>(
+    pub async fn accept_put_manifest<S>(
         &self,
         namespace: &Namespace,
         reference: Reference,
         mime_type: String,
         mut body_stream: S,
-    ) -> Result<Response<ResponseBody>, Error>
+    ) -> Result<PutManifestResponse, Error>
     where
         S: AsyncRead + Unpin + Send,
     {
@@ -592,42 +619,8 @@ impl Registry {
             })?;
         let request_body = request_body.into_bytes();
 
-        let location = format!("/v2/{namespace}/manifests/{reference}");
-
-        let manifest = self
-            .put_manifest(namespace, &reference, Some(&mime_type), &request_body)
-            .await?;
-
-        let res = match manifest.subject {
-            Some(subject) => Response::builder()
-                .status(StatusCode::CREATED)
-                .header(LOCATION, location)
-                .header(DOCKER_CONTENT_DIGEST, manifest.digest.to_string())
-                .header(OCI_SUBJECT, subject.to_string())
-                .body(ResponseBody::empty())?,
-            None => Response::builder()
-                .status(StatusCode::CREATED)
-                .header(LOCATION, location)
-                .header(DOCKER_CONTENT_DIGEST, manifest.digest.to_string())
-                .body(ResponseBody::empty())?,
-        };
-
-        Ok(res)
-    }
-
-    #[instrument(skip(self))]
-    pub async fn handle_delete_manifest(
-        &self,
-        namespace: &Namespace,
-        reference: Reference,
-    ) -> Result<Response<ResponseBody>, Error> {
-        self.delete_manifest(namespace, &reference).await?;
-
-        let res = Response::builder()
-            .status(StatusCode::ACCEPTED)
-            .body(ResponseBody::empty())?;
-
-        Ok(res)
+        self.put_manifest(namespace, &reference, Some(&mime_type), &request_body)
+            .await
     }
 }
 

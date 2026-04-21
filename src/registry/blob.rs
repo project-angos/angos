@@ -1,15 +1,11 @@
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
-use hyper::{
-    Response, StatusCode,
-    header::{ACCEPT_RANGES, CONTENT_LENGTH, CONTENT_RANGE},
-};
+use hyper::header::{ACCEPT_RANGES, CONTENT_LENGTH, CONTENT_RANGE, LOCATION};
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tracing::{debug, info, instrument, warn};
 use uuid::Uuid;
 
 use crate::{
-    command::server::response_body::ResponseBody,
     oci::{Digest, Namespace},
     registry::{
         DOCKER_CONTENT_DIGEST, Error, Registry, Repository,
@@ -19,17 +15,62 @@ use crate::{
     },
 };
 
-pub enum GetBlobResponse<R>
-where
-    R: AsyncRead + Send + Unpin,
-{
-    Reader(R, u64),
-    RangedReader(R, (u64, u64), u64),
+pub enum GetBlobResponse {
+    Redirect {
+        headers: HashMap<&'static str, String>,
+    },
+    Reader {
+        headers: HashMap<&'static str, String>,
+        body: BoxedReader,
+    },
+    RangedReader {
+        headers: HashMap<&'static str, String>,
+        body: BoxedReader,
+    },
 }
 
 pub struct HeadBlobResponse {
-    pub digest: Digest,
-    pub size: u64,
+    pub headers: HashMap<&'static str, String>,
+}
+
+fn head_blob_headers(digest: &Digest, size: u64) -> HashMap<&'static str, String> {
+    HashMap::from([
+        (DOCKER_CONTENT_DIGEST, digest.to_string()),
+        (CONTENT_LENGTH.as_str(), size.to_string()),
+    ])
+}
+
+fn get_blob_headers(digest: &Digest, total_length: u64) -> HashMap<&'static str, String> {
+    HashMap::from([
+        (DOCKER_CONTENT_DIGEST, digest.to_string()),
+        (ACCEPT_RANGES.as_str(), "bytes".to_string()),
+        (CONTENT_LENGTH.as_str(), total_length.to_string()),
+    ])
+}
+
+fn get_blob_range_headers(
+    digest: &Digest,
+    start: u64,
+    end: u64,
+    total_length: u64,
+) -> HashMap<&'static str, String> {
+    let length = end - start + 1;
+    HashMap::from([
+        (DOCKER_CONTENT_DIGEST, digest.to_string()),
+        (ACCEPT_RANGES.as_str(), "bytes".to_string()),
+        (CONTENT_LENGTH.as_str(), length.to_string()),
+        (
+            CONTENT_RANGE.as_str(),
+            format!("bytes {start}-{end}/{total_length}"),
+        ),
+    ])
+}
+
+fn get_blob_redirect_headers(url: String, digest: &Digest) -> HashMap<&'static str, String> {
+    HashMap::from([
+        (LOCATION.as_str(), url),
+        (DOCKER_CONTENT_DIGEST, digest.to_string()),
+    ])
 }
 
 impl Registry {
@@ -70,14 +111,15 @@ impl Registry {
 
         match blob {
             Ok(size) => Ok(HeadBlobResponse {
-                digest: digest.clone(),
-                size,
+                headers: head_blob_headers(digest, size),
             }),
             Err(_) if repository.is_pull_through() => {
                 let (digest, size) = repository
                     .head_blob(accepted_types, namespace, digest)
                     .await?;
-                Ok(HeadBlobResponse { digest, size })
+                Ok(HeadBlobResponse {
+                    headers: head_blob_headers(&digest, size),
+                })
             }
             Err(e) => {
                 warn!("Blob with digest {digest} not found: {e}");
@@ -134,7 +176,7 @@ impl Registry {
         namespace: &Namespace,
         digest: &Digest,
         range: Option<(u64, Option<u64>)>,
-    ) -> Result<GetBlobResponse<BoxedReader>, Error> {
+    ) -> Result<GetBlobResponse, Error> {
         if !repository.is_pull_through() {
             self.check_blob_namespace_access(namespace, digest).await?;
         }
@@ -153,7 +195,6 @@ impl Registry {
             return Err(Error::RangeNotSatisfiable);
         }
 
-        // Proxying stream
         let (total_length, client_stream) = repository
             .get_blob(accepted_types, namespace, digest)
             .await?;
@@ -175,14 +216,17 @@ impl Registry {
         );
         info!("Scheduled blob copy task '{task_key}'");
 
-        Ok(GetBlobResponse::Reader(client_stream, total_length))
+        Ok(GetBlobResponse::Reader {
+            headers: get_blob_headers(digest, total_length),
+            body: client_stream,
+        })
     }
 
     async fn get_local_blob(
         &self,
         digest: &Digest,
         range: Option<(u64, Option<u64>)>,
-    ) -> Result<GetBlobResponse<BoxedReader>, Error> {
+    ) -> Result<GetBlobResponse, Error> {
         let start = range.map(|(start, _)| start);
 
         let (reader, total_length) = self.blob_store.build_blob_reader(digest, start).await?;
@@ -195,16 +239,18 @@ impl Registry {
         }
 
         match range {
-            Some((0, None)) | None => Ok(GetBlobResponse::Reader(reader, total_length)),
+            Some((0, None)) | None => Ok(GetBlobResponse::Reader {
+                headers: get_blob_headers(digest, total_length),
+                body: reader,
+            }),
             Some((start, end)) => {
                 let end = end.unwrap_or(total_length - 1);
                 let reader = Box::new(reader.take(end - start + 1));
 
-                Ok(GetBlobResponse::RangedReader(
-                    reader,
-                    (start, end),
-                    total_length,
-                ))
+                Ok(GetBlobResponse::RangedReader {
+                    headers: get_blob_range_headers(digest, start, end, total_length),
+                    body: reader,
+                })
             }
         }
     }
@@ -219,7 +265,6 @@ impl Registry {
             warn!("Failed to delete blob links: {error}");
         }
 
-        // Remove all remaining blob index entries for this namespace
         if let Ok(blob_index) = self.metadata_store.read_blob_index(digest).await
             && let Some(links) = blob_index.namespace.get(namespace.as_ref())
         {
@@ -250,51 +295,18 @@ impl Registry {
         Ok(())
     }
 
+    /// Resolves a blob GET request to either a presigned redirect URL or a stream.
+    ///
+    /// The redirect fast-path is only taken when `enable_blob_redirect` is set, the
+    /// range is absent, and the blob is locally available (for pull-through repos).
     #[instrument(skip(self))]
-    pub async fn handle_head_blob(
-        &self,
-        namespace: &Namespace,
-        digest: &Digest,
-        mime_types: &[String],
-    ) -> Result<Response<ResponseBody>, Error> {
-        let repository = self.get_repository_for_namespace(namespace)?;
-
-        let blob = self
-            .head_blob(repository, mime_types, namespace, digest)
-            .await?;
-
-        let res = Response::builder()
-            .status(StatusCode::OK)
-            .header(DOCKER_CONTENT_DIGEST, blob.digest.to_string())
-            .header(CONTENT_LENGTH, blob.size.to_string())
-            .body(ResponseBody::empty())?;
-
-        Ok(res)
-    }
-
-    #[instrument(skip(self))]
-    pub async fn handle_delete_blob(
-        &self,
-        namespace: &Namespace,
-        digest: &Digest,
-    ) -> Result<Response<ResponseBody>, Error> {
-        self.delete_blob(namespace, digest).await?;
-
-        let res = Response::builder()
-            .status(StatusCode::ACCEPTED)
-            .body(ResponseBody::empty())?;
-
-        Ok(res)
-    }
-
-    #[instrument(skip(self))]
-    pub async fn handle_get_blob(
+    pub async fn resolve_get_blob(
         &self,
         namespace: &Namespace,
         digest: &Digest,
         mime_types: &[String],
         range: Option<(u64, Option<u64>)>,
-    ) -> Result<Response<ResponseBody>, Error> {
+    ) -> Result<GetBlobResponse, Error> {
         let repository = self.get_repository_for_namespace(namespace)?;
 
         if !repository.is_pull_through() {
@@ -312,39 +324,13 @@ impl Registry {
                 || self.blob_store.get_blob_size(digest).await.is_ok())
             && let Ok(Some(presigned_url)) = self.blob_store.get_blob_url(digest, None).await
         {
-            return Response::builder()
-                .status(StatusCode::TEMPORARY_REDIRECT)
-                .header(hyper::header::LOCATION, presigned_url)
-                .header(DOCKER_CONTENT_DIGEST, digest.to_string())
-                .body(ResponseBody::empty())
-                .map_err(Into::into);
+            return Ok(GetBlobResponse::Redirect {
+                headers: get_blob_redirect_headers(presigned_url, digest),
+            });
         }
 
-        let res = match self
-            .get_blob(repository, mime_types, namespace, digest, range)
-            .await?
-        {
-            GetBlobResponse::RangedReader(reader, (start, end), total_length) => {
-                let length = end - start + 1;
-                let range = format!("bytes {start}-{end}/{total_length}");
-
-                Response::builder()
-                    .status(StatusCode::PARTIAL_CONTENT)
-                    .header(DOCKER_CONTENT_DIGEST, digest.to_string())
-                    .header(ACCEPT_RANGES, "bytes")
-                    .header(CONTENT_LENGTH, length.to_string())
-                    .header(CONTENT_RANGE, range)
-                    .body(ResponseBody::streaming(reader))?
-            }
-            GetBlobResponse::Reader(stream, total_length) => Response::builder()
-                .status(StatusCode::OK)
-                .header(DOCKER_CONTENT_DIGEST, digest.to_string())
-                .header(ACCEPT_RANGES, "bytes")
-                .header(CONTENT_LENGTH, total_length)
-                .body(ResponseBody::streaming(stream))?,
-        };
-
-        Ok(res)
+        self.get_blob(repository, mime_types, namespace, digest, range)
+            .await
     }
 }
 
@@ -352,16 +338,13 @@ impl Registry {
 mod tests {
     use std::io::Cursor;
 
-    use futures_util::TryStreamExt;
-    use http_body_util::BodyExt;
+    use hyper::header::{ACCEPT_RANGES, CONTENT_LENGTH, CONTENT_RANGE, LOCATION};
     use tokio::io::AsyncReadExt;
-    use tokio_util::io::StreamReader;
 
     use super::*;
     use crate::{
-        command::server::request_ext::HeaderExt,
         oci::Namespace,
-        registry::{test_utils::create_test_blob, tests::backends},
+        registry::{DOCKER_CONTENT_DIGEST, test_utils::create_test_blob, tests::backends},
     };
 
     #[tokio::test]
@@ -377,8 +360,11 @@ mod tests {
                 .await
                 .unwrap();
 
-            assert_eq!(response.digest, digest);
-            assert_eq!(response.size, content.len() as u64);
+            assert_eq!(response.headers[DOCKER_CONTENT_DIGEST], digest.to_string());
+            assert_eq!(
+                response.headers[CONTENT_LENGTH.as_str()],
+                content.len().to_string()
+            );
         }
     }
 
@@ -396,13 +382,16 @@ mod tests {
                 .unwrap();
 
             match response {
-                GetBlobResponse::Reader(mut reader, size) => {
-                    assert_eq!(size, content.len() as u64);
+                GetBlobResponse::Reader { headers, mut body } => {
+                    assert_eq!(headers[CONTENT_LENGTH.as_str()], content.len().to_string());
+                    assert_eq!(headers[ACCEPT_RANGES.as_str()], "bytes");
+                    assert_eq!(headers[DOCKER_CONTENT_DIGEST], digest.to_string());
                     let mut buf = Vec::new();
-                    reader.read_to_end(&mut buf).await.unwrap();
+                    body.read_to_end(&mut buf).await.unwrap();
                     assert_eq!(buf, content);
                 }
-                GetBlobResponse::RangedReader(..) => panic!("Expected Reader response"),
+                GetBlobResponse::RangedReader { .. } => panic!("Expected Reader response"),
+                GetBlobResponse::Redirect { .. } => panic!("unexpected redirect from get_blob"),
             }
         }
     }
@@ -422,16 +411,20 @@ mod tests {
                 .unwrap();
 
             match response {
-                GetBlobResponse::RangedReader(mut reader, (start, end), total_size) => {
-                    assert_eq!(start, 5);
-                    assert_eq!(end, 10);
-                    assert_eq!(total_size, content.len() as u64);
+                GetBlobResponse::RangedReader { headers, mut body } => {
+                    assert_eq!(
+                        headers[CONTENT_RANGE.as_str()],
+                        format!("bytes 5-10/{}", content.len())
+                    );
+                    assert_eq!(headers[CONTENT_LENGTH.as_str()], "6");
+                    assert_eq!(headers[DOCKER_CONTENT_DIGEST], digest.to_string());
 
                     let mut buf = Vec::new();
-                    reader.read_to_end(&mut buf).await.unwrap();
+                    body.read_to_end(&mut buf).await.unwrap();
                     assert_eq!(buf, &content[5..=10]);
                 }
-                GetBlobResponse::Reader(..) => panic!("Expected RangedReader response"),
+                GetBlobResponse::Reader { .. } => panic!("Expected RangedReader response"),
+                GetBlobResponse::Redirect { .. } => panic!("unexpected redirect from get_blob"),
             }
         }
     }
@@ -519,145 +512,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_handle_head_blob() {
-        for test_case in backends() {
-            let registry = test_case.registry();
-            let namespace = &Namespace::new("test-repo").unwrap();
-            let content = b"test blob content";
-            let (digest, _) = create_test_blob(registry, namespace, content).await;
-
-            let accepted_content_types = Vec::new();
-
-            let response = registry
-                .handle_head_blob(namespace, &digest, &accepted_content_types)
-                .await
-                .unwrap();
-
-            let (parts, _) = response.into_parts();
-
-            assert_eq!(parts.status, StatusCode::OK);
-            assert_eq!(
-                parts.get_header(DOCKER_CONTENT_DIGEST),
-                Some(digest.to_string())
-            );
-            assert_eq!(
-                parts.get_header(CONTENT_LENGTH),
-                Some(content.len().to_string())
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn test_handle_delete_blob() {
-        for test_case in backends() {
-            let registry = test_case.registry();
-            let namespace = &Namespace::new("test-repo").unwrap();
-            let content = b"test blob content";
-            let (digest, _) = create_test_blob(registry, namespace, content).await;
-
-            let layer_link = LinkKind::Layer(digest.clone());
-            let config_link = LinkKind::Config(digest.clone());
-
-            let mut tx = registry.metadata_store.begin_transaction(namespace);
-            tx.create_link(&config_link, &digest).add();
-            tx.commit().await.unwrap();
-
-            assert!(
-                registry
-                    .metadata_store
-                    .read_link(namespace, &layer_link, false)
-                    .await
-                    .is_ok()
-            );
-            assert!(
-                registry
-                    .metadata_store
-                    .read_link(namespace, &config_link, false)
-                    .await
-                    .is_ok()
-            );
-
-            let accepted_content_types = Vec::new();
-            assert!(
-                registry
-                    .handle_head_blob(namespace, &digest, &accepted_content_types)
-                    .await
-                    .is_ok()
-            );
-
-            let response = registry
-                .handle_delete_blob(namespace, &digest)
-                .await
-                .unwrap();
-
-            assert_eq!(response.status(), StatusCode::ACCEPTED);
-
-            assert!(
-                registry
-                    .metadata_store
-                    .read_link(namespace, &layer_link, false)
-                    .await
-                    .is_err()
-            );
-            assert!(
-                registry
-                    .metadata_store
-                    .read_link(namespace, &config_link, false)
-                    .await
-                    .is_err()
-            );
-
-            assert!(
-                registry
-                    .handle_head_blob(namespace, &digest, &accepted_content_types)
-                    .await
-                    .is_err(),
-                "Blob should be inaccessible after deletion"
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn test_handle_get_blob() {
-        for test_case in backends() {
-            let registry = test_case.registry();
-            let namespace = &Namespace::new("test-repo").unwrap();
-            let content = b"test blob content";
-            let (digest, _) = create_test_blob(registry, namespace, content).await;
-
-            let accepted_content_types = Vec::new();
-
-            let response = registry
-                .handle_get_blob(namespace, &digest, &accepted_content_types, None)
-                .await
-                .unwrap();
-            let status = response.status();
-            let (parts, body) = response.into_parts();
-
-            assert_eq!(
-                parts.get_header(DOCKER_CONTENT_DIGEST),
-                Some(digest.to_string())
-            );
-
-            if status == StatusCode::TEMPORARY_REDIRECT {
-                assert!(parts.headers.get(hyper::header::LOCATION).is_some());
-            } else {
-                assert_eq!(parts.status, StatusCode::OK);
-                assert_eq!(
-                    parts.get_header(CONTENT_LENGTH),
-                    Some(content.len().to_string())
-                );
-
-                let stream = body.into_data_stream().map_err(std::io::Error::other);
-                let mut reader = StreamReader::new(stream);
-                let mut buf = Vec::new();
-                reader.read_to_end(&mut buf).await.unwrap();
-                assert_eq!(buf, content);
-            }
-        }
-    }
-
-    #[tokio::test]
     async fn test_get_local_blob_returns_correct_size() {
         for test_case in backends() {
             let registry = test_case.registry();
@@ -666,34 +520,40 @@ mod tests {
 
             let (digest, _) = create_test_blob(registry, namespace, content).await;
 
-            // Full read: verify Reader variant returns correct total_length
             let response = registry.get_local_blob(&digest, None).await.unwrap();
             match response {
-                GetBlobResponse::Reader(mut reader, total_length) => {
-                    assert_eq!(total_length, content.len() as u64);
+                GetBlobResponse::Reader { headers, mut body } => {
+                    assert_eq!(headers[CONTENT_LENGTH.as_str()], content.len().to_string());
                     let mut buf = Vec::new();
-                    reader.read_to_end(&mut buf).await.unwrap();
+                    body.read_to_end(&mut buf).await.unwrap();
                     assert_eq!(buf, content);
                 }
-                GetBlobResponse::RangedReader(..) => {
+                GetBlobResponse::RangedReader { .. } => {
                     panic!("Expected Reader response for full read")
+                }
+                GetBlobResponse::Redirect { .. } => {
+                    panic!("unexpected redirect from get_local_blob")
                 }
             }
 
-            // Ranged read: verify RangedReader returns correct total_length
             let range = Some((5, Some(15)));
             let response = registry.get_local_blob(&digest, range).await.unwrap();
             match response {
-                GetBlobResponse::RangedReader(mut reader, (start, end), total_length) => {
-                    assert_eq!(start, 5);
-                    assert_eq!(end, 15);
-                    assert_eq!(total_length, content.len() as u64);
+                GetBlobResponse::RangedReader { headers, mut body } => {
+                    assert_eq!(
+                        headers[CONTENT_RANGE.as_str()],
+                        format!("bytes 5-15/{}", content.len())
+                    );
+                    assert_eq!(headers[CONTENT_LENGTH.as_str()], "11");
                     let mut buf = Vec::new();
-                    reader.read_to_end(&mut buf).await.unwrap();
+                    body.read_to_end(&mut buf).await.unwrap();
                     assert_eq!(buf, &content[5..=15]);
                 }
-                GetBlobResponse::Reader(..) => {
+                GetBlobResponse::Reader { .. } => {
                     panic!("Expected RangedReader response for ranged read")
+                }
+                GetBlobResponse::Redirect { .. } => {
+                    panic!("unexpected redirect from get_local_blob")
                 }
             }
         }
@@ -708,62 +568,78 @@ mod tests {
 
             let (digest, repository) = create_test_blob(registry, namespace, content).await;
 
-            // head_blob should return correct size via get_blob_size
             let head_response = registry
                 .head_blob(&repository, &[], namespace, &digest)
                 .await
                 .unwrap();
-            assert_eq!(head_response.digest, digest);
-            assert_eq!(head_response.size, content.len() as u64);
+            assert_eq!(
+                head_response.headers[DOCKER_CONTENT_DIGEST],
+                digest.to_string()
+            );
+            assert_eq!(
+                head_response.headers[CONTENT_LENGTH.as_str()],
+                content.len().to_string()
+            );
 
-            // get_blob should also work and return the same size
             let get_response = registry
                 .get_blob(&repository, &[], namespace, &digest, None)
                 .await
                 .unwrap();
             match get_response {
-                GetBlobResponse::Reader(_, total_length) => {
-                    assert_eq!(total_length, head_response.size);
+                GetBlobResponse::Reader { headers, .. } => {
+                    assert_eq!(
+                        headers[CONTENT_LENGTH.as_str()],
+                        head_response.headers[CONTENT_LENGTH.as_str()]
+                    );
                 }
-                GetBlobResponse::RangedReader(..) => panic!("Expected Reader response"),
+                GetBlobResponse::RangedReader { .. } => panic!("Expected Reader response"),
+                GetBlobResponse::Redirect { .. } => panic!("unexpected redirect from get_blob"),
             }
         }
     }
 
-    #[tokio::test]
-    async fn test_handle_get_blob_with_range() {
-        for test_case in backends() {
-            let registry = test_case.registry();
-            let namespace = &Namespace::new("test-repo").unwrap();
-            let content = b"test blob content";
-            let (digest, _) = create_test_blob(registry, namespace, content).await;
-
-            let accepted_content_types = Vec::new();
-            let range = Some((5, Some(10)));
-
-            let response = registry
-                .handle_get_blob(namespace, &digest, &accepted_content_types, range)
-                .await
+    #[test]
+    fn test_head_blob_headers_contains_required_fields() {
+        let digest: Digest =
+            "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+                .parse()
                 .unwrap();
+        let headers = head_blob_headers(&digest, 42);
+        assert_eq!(headers[DOCKER_CONTENT_DIGEST], digest.to_string());
+        assert_eq!(headers[CONTENT_LENGTH.as_str()], "42");
+    }
 
-            assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
-            let (parts, body) = response.into_parts();
+    #[test]
+    fn test_get_blob_headers_includes_accept_ranges() {
+        let digest: Digest =
+            "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+                .parse()
+                .unwrap();
+        let headers = get_blob_headers(&digest, 1024);
+        assert_eq!(headers[DOCKER_CONTENT_DIGEST], digest.to_string());
+        assert_eq!(headers[ACCEPT_RANGES.as_str()], "bytes");
+        assert_eq!(headers[CONTENT_LENGTH.as_str()], "1024");
+    }
 
-            assert_eq!(
-                parts.get_header(DOCKER_CONTENT_DIGEST),
-                Some(digest.to_string())
-            );
-            assert_eq!(parts.get_header(CONTENT_LENGTH), Some("6".to_string()));
-            assert_eq!(
-                parts.get_header(CONTENT_RANGE),
-                Some(format!("bytes 5-10/{}", content.len()))
-            );
+    #[test]
+    fn test_get_blob_range_headers_computes_content_length() {
+        let digest: Digest =
+            "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+                .parse()
+                .unwrap();
+        let headers = get_blob_range_headers(&digest, 5, 10, 100);
+        assert_eq!(headers[CONTENT_LENGTH.as_str()], "6");
+        assert_eq!(headers[CONTENT_RANGE.as_str()], "bytes 5-10/100");
+    }
 
-            let stream = body.into_data_stream().map_err(std::io::Error::other);
-            let mut reader = StreamReader::new(stream);
-            let mut buf = Vec::new();
-            reader.read_to_end(&mut buf).await.unwrap();
-            assert_eq!(buf, &content[5..=10]);
-        }
+    #[test]
+    fn test_get_blob_redirect_headers_carries_location_and_digest() {
+        let digest: Digest =
+            "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+                .parse()
+                .unwrap();
+        let headers = get_blob_redirect_headers("https://cdn/blob".to_string(), &digest);
+        assert_eq!(headers[LOCATION.as_str()], "https://cdn/blob");
+        assert_eq!(headers[DOCKER_CONTENT_DIGEST], digest.to_string());
     }
 }

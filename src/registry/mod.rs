@@ -17,15 +17,27 @@ pub mod task_queue;
 #[cfg(test)]
 pub mod tests;
 pub mod upload;
-mod version;
+pub mod version;
 
+pub use blob::GetBlobResponse;
 pub use error::Error;
-pub use manifest::parse_manifest_digests;
+pub use manifest::{GetManifestResponse, parse_manifest_digests};
 pub use repository::Repository;
+pub use upload::StartUploadResponse;
 
 pub const DOCKER_CONTENT_DIGEST: &str = "Docker-Content-Digest";
 pub const DOCKER_UPLOAD_UUID: &str = "Docker-Upload-UUID";
 pub const OCI_SUBJECT: &str = "OCI-Subject";
+
+/// Response for endpoints whose body is a JSON (or JSON-flavoured) payload.
+///
+/// The registry is the sole authority on both the headers (Content-Type,
+/// Link, OCI-Filters-Applied, ...) and the serialized body bytes. Handlers
+/// attach the headers verbatim and pass the body through.
+pub struct JsonResponse {
+    pub headers: HashMap<&'static str, String>,
+    pub body: Vec<u8>,
+}
 
 pub use crate::policy::AccessPolicy;
 use crate::{

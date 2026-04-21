@@ -130,6 +130,18 @@ impl From<configuration::Error> for Error {
     }
 }
 
+impl From<hyper::http::Error> for Error {
+    fn from(error: hyper::http::Error) -> Self {
+        Error::Internal(format!("failed to build HTTP response: {error}"))
+    }
+}
+
+impl From<serde_json::Error> for Error {
+    fn from(error: serde_json::Error) -> Self {
+        Error::Internal(format!("failed to serialize response body: {error}"))
+    }
+}
+
 impl Error {
     pub fn status_code(&self) -> StatusCode {
         match self {

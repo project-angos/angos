@@ -1,17 +1,23 @@
 use std::collections::HashMap;
 
 use chrono::{DateTime, Utc};
-use hyper::{Response, StatusCode, header::CONTENT_TYPE};
+use hyper::header::CONTENT_TYPE;
 use serde::Serialize;
 use tracing::instrument;
 
 use crate::{
-    command::server::response_body::ResponseBody,
     oci::{Digest, Manifest, Namespace, Platform as OciPlatform},
     registry::{
-        Error, Registry, metadata_store::link_kind::LinkKind, pagination::collect_all_pages,
+        Error, JsonResponse, Registry, metadata_store::link_kind::LinkKind,
+        pagination::collect_all_pages,
     },
 };
+
+const APPLICATION_JSON: &str = "application/json";
+
+fn json_headers() -> HashMap<&'static str, String> {
+    HashMap::from([(CONTENT_TYPE.as_str(), APPLICATION_JSON.to_string())])
+}
 
 #[derive(Serialize, Debug)]
 struct RepositoryInfo {
@@ -22,7 +28,7 @@ struct RepositoryInfo {
 }
 
 #[derive(Serialize, Debug)]
-struct RepositoriesResponse {
+struct RepositoriesBody {
     repositories: Vec<RepositoryInfo>,
 }
 
@@ -34,7 +40,7 @@ struct NamespaceInfo {
 }
 
 #[derive(Serialize, Debug)]
-struct NamespacesResponse {
+struct NamespacesBody {
     repository: String,
     namespaces: Vec<NamespaceInfo>,
     pull_through_cache: bool,
@@ -94,8 +100,8 @@ struct ManifestEntry {
 }
 
 #[derive(Serialize, Debug)]
-struct RevisionsResponse<'a> {
-    name: &'a str,
+struct RevisionsBody {
+    name: String,
     manifests: Vec<ManifestEntry>,
 }
 
@@ -107,8 +113,8 @@ struct UploadEntry {
 }
 
 #[derive(Serialize, Debug)]
-struct UploadsResponse<'a> {
-    name: &'a str,
+struct UploadsBody {
+    name: String,
     uploads: Vec<UploadEntry>,
 }
 
@@ -121,7 +127,7 @@ struct RepositoryConfig {
 
 impl Registry {
     #[instrument(skip(self))]
-    pub async fn handle_list_repositories(&self) -> Result<Response<ResponseBody>, Error> {
+    pub async fn get_repositories_info(&self) -> Result<JsonResponse, Error> {
         let mut repositories = Vec::with_capacity(self.repositories.len());
 
         for name in self.repositories.keys() {
@@ -137,20 +143,14 @@ impl Registry {
 
         repositories.sort_by(|a, b| a.name.cmp(&b.name));
 
-        let response = RepositoriesResponse { repositories };
-        let body = serde_json::to_string(&response)?;
-
-        Ok(Response::builder()
-            .status(StatusCode::OK)
-            .header(CONTENT_TYPE, "application/json")
-            .body(ResponseBody::fixed(body.into_bytes()))?)
+        Ok(JsonResponse {
+            headers: json_headers(),
+            body: serde_json::to_vec(&RepositoriesBody { repositories })?,
+        })
     }
 
     #[instrument(skip(self))]
-    pub async fn handle_list_namespaces(
-        &self,
-        repository: &str,
-    ) -> Result<Response<ResponseBody>, Error> {
+    pub async fn get_namespaces_info(&self, repository: &str) -> Result<JsonResponse, Error> {
         let namespace_names = self.list_repository_namespaces(repository).await?;
         let mut namespaces = Vec::with_capacity(namespace_names.len());
 
@@ -167,28 +167,21 @@ impl Registry {
 
         let config = self.get_repository_config(repository);
 
-        let response = NamespacesResponse {
-            repository: repository.to_string(),
-            namespaces,
-            pull_through_cache: config.pull_through_cache,
-            upstream_urls: config.upstream_urls,
-            immutable_tags: config.immutable_tags,
-            immutable_tags_exclusions: config.immutable_tags_exclusions,
-        };
-
-        let body = serde_json::to_string(&response)?;
-
-        Ok(Response::builder()
-            .status(StatusCode::OK)
-            .header(CONTENT_TYPE, "application/json")
-            .body(ResponseBody::fixed(body.into_bytes()))?)
+        Ok(JsonResponse {
+            headers: json_headers(),
+            body: serde_json::to_vec(&NamespacesBody {
+                repository: repository.to_string(),
+                namespaces,
+                pull_through_cache: config.pull_through_cache,
+                upstream_urls: config.upstream_urls,
+                immutable_tags: config.immutable_tags,
+                immutable_tags_exclusions: config.immutable_tags_exclusions,
+            })?,
+        })
     }
 
     #[instrument(skip(self))]
-    pub async fn handle_list_revisions(
-        &self,
-        namespace: &Namespace,
-    ) -> Result<Response<ResponseBody>, Error> {
+    pub async fn get_revisions_info(&self, namespace: &Namespace) -> Result<JsonResponse, Error> {
         let all_revisions = collect_all_pages(|token| async move {
             self.metadata_store
                 .list_revisions(namespace, 1000, token)
@@ -209,24 +202,17 @@ impl Registry {
             )
             .await;
 
-        let response = RevisionsResponse {
-            name: namespace,
-            manifests,
-        };
-
-        let body = serde_json::to_string(&response)?;
-
-        Ok(Response::builder()
-            .status(StatusCode::OK)
-            .header(CONTENT_TYPE, "application/json")
-            .body(ResponseBody::fixed(body.into_bytes()))?)
+        Ok(JsonResponse {
+            headers: json_headers(),
+            body: serde_json::to_vec(&RevisionsBody {
+                name: namespace.to_string(),
+                manifests,
+            })?,
+        })
     }
 
     #[instrument(skip(self))]
-    pub async fn handle_list_uploads(
-        &self,
-        namespace: &Namespace,
-    ) -> Result<Response<ResponseBody>, Error> {
+    pub async fn get_uploads_info(&self, namespace: &Namespace) -> Result<JsonResponse, Error> {
         let uuids = collect_all_pages(|token| async move {
             self.blob_store
                 .list_uploads(namespace, 1000, token)
@@ -248,17 +234,13 @@ impl Registry {
             }
         }
 
-        let response = UploadsResponse {
-            name: namespace,
-            uploads: all_uploads,
-        };
-
-        let body = serde_json::to_string(&response)?;
-
-        Ok(Response::builder()
-            .status(StatusCode::OK)
-            .header(CONTENT_TYPE, "application/json")
-            .body(ResponseBody::fixed(body.into_bytes()))?)
+        Ok(JsonResponse {
+            headers: json_headers(),
+            body: serde_json::to_vec(&UploadsBody {
+                name: namespace.to_string(),
+                uploads: all_uploads,
+            })?,
+        })
     }
 
     fn get_repository_config(&self, name: &str) -> RepositoryConfig {
@@ -382,7 +364,7 @@ impl Registry {
             let mut referrers: Vec<ReferrerInfo> =
                 docker_referrers.remove(&digest).unwrap_or_default();
 
-            if let Ok(oci_referrers) = self.get_referrers(namespace, &digest, None).await {
+            if let Ok(oci_referrers) = self.list_referrers(namespace, &digest, None).await {
                 for descriptor in oci_referrers {
                     referrers.push(ReferrerInfo {
                         digest: descriptor.digest.to_string(),
