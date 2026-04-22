@@ -378,8 +378,7 @@ impl Registry {
                 .metadata_store
                 .read_link(namespace, &LinkKind::Digest(digest.clone()), false)
                 .await
-                .map(|m| (m.created_at, m.accessed_at))
-                .unwrap_or((None, None));
+                .map_or((None, None), |m| (m.created_at, m.accessed_at));
 
             manifests.push(ManifestEntry {
                 digest: digest.to_string(),
