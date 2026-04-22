@@ -84,6 +84,15 @@ impl ManifestChecker {
 
         Ok(())
     }
+
+    async fn process_page(&self, namespace: &str, revisions: Vec<Digest>) -> Result<(), Error> {
+        for revision in &revisions {
+            if let Err(e) = self.repair_manifest_links(namespace, revision).await {
+                error!("Failed to check tag from '{namespace}' (revision '{revision}'): {e}");
+            }
+        }
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -98,16 +107,7 @@ impl NamespaceChecker for ManifestChecker {
                     .await
                     .map_err(Error::from)
             },
-            |revisions| async move {
-                for revision in &revisions {
-                    if let Err(e) = self.repair_manifest_links(namespace, revision).await {
-                        error!(
-                            "Failed to check tag from '{namespace}' (revision '{revision}'): {e}"
-                        );
-                    }
-                }
-                Ok(())
-            },
+            |revisions| self.process_page(namespace, revisions),
         )
         .await
     }

@@ -60,6 +60,15 @@ impl UploadChecker {
         let duration = now.signed_duration_since(start_date);
         duration > self.upload_timeout
     }
+
+    async fn process_page(&self, namespace: &str, uploads: Vec<String>) -> Result<(), Error> {
+        for uuid in &uploads {
+            if let Err(e) = self.check_upload(namespace, uuid).await {
+                error!("Failed to check upload from '{namespace}' ('{uuid}'): {e}");
+            }
+        }
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -74,14 +83,7 @@ impl NamespaceChecker for UploadChecker {
                     .await
                     .map_err(Error::from)
             },
-            |uploads| async move {
-                for uuid in &uploads {
-                    if let Err(e) = self.check_upload(namespace, uuid).await {
-                        error!("Failed to check upload from '{namespace}' ('{uuid}'): {e}");
-                    }
-                }
-                Ok(())
-            },
+            |uploads| self.process_page(namespace, uploads),
         )
         .await
     }
