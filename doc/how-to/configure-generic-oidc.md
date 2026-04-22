@@ -216,7 +216,7 @@ curl -H "Authorization: Bearer $TOKEN" \
 Enable debug logging to see token validation:
 
 ```bash
-RUST_LOG=angos::command::server::auth=debug ./angos server
+RUST_LOG=angos::auth=debug ./angos server
 ```
 
 You should see:

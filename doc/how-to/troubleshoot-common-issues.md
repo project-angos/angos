@@ -17,7 +17,7 @@ Enable detailed logging to diagnose issues:
 RUST_LOG=debug ./angos server
 
 # Specific modules
-RUST_LOG=info,angos::command::server::auth=debug ./angos server
+RUST_LOG=info,angos::auth=debug ./angos server
 
 # Multiple modules
 RUST_LOG=info,angos::configuration=debug,angos::cache=debug ./angos server
@@ -25,7 +25,7 @@ RUST_LOG=info,angos::configuration=debug,angos::cache=debug ./angos server
 
 Useful modules:
 - `angos::configuration` - Config loading/watching
-- `angos::command::server::auth` - Authentication
+- `angos::auth` - Authentication
 - `angos::cache` - Pull-through cache
 - `angos::registry::access_policy` - Policy evaluation
 
