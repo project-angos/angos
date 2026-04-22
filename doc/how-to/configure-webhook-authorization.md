@@ -314,7 +314,7 @@ histogram_quantile(0.95, rate(webhook_authorization_duration_seconds_bucket[5m])
 
 **Debug logging:**
 ```bash
-RUST_LOG=angos::command::server::auth::webhook=debug \
+RUST_LOG=angos::auth::webhook=debug \
   ./angos server
 ```
 

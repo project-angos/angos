@@ -288,7 +288,7 @@ impl BlobStore for Backend {
         let path = path_builder::blob_path(digest);
         let url = self
             .store
-            .generate_presigned_url(&path, StdDuration::from_secs(1800), content_type)
+            .generate_presigned_url(&path, StdDuration::from_mins(30), content_type)
             .await?;
         Ok(Some(url))
     }

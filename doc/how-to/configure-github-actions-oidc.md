@@ -262,7 +262,7 @@ jobs:
 Check the registry logs for authentication details:
 
 ```bash
-RUST_LOG=angos::command::server::auth=debug ./angos server
+RUST_LOG=angos::auth=debug ./angos server
 ```
 
 You should see:

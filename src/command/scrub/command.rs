@@ -138,6 +138,103 @@ fn build_global_retention_policy(
     }
 }
 
+fn build_namespace_checkers(
+    options: &Options,
+    config: &Configuration,
+    blob_store: &Arc<dyn BlobStore>,
+    metadata_store: &Arc<dyn MetadataStore>,
+    repositories: &Arc<HashMap<String, Repository>>,
+) -> Result<Vec<Box<dyn NamespaceChecker>>, Error> {
+    let mut checkers: Vec<Box<dyn NamespaceChecker>> = Vec::new();
+
+    if options.retention {
+        let global_retention_policy =
+            build_global_retention_policy(&config.global.retention_policy)?;
+        checkers.push(Box::new(RetentionChecker::new(
+            blob_store.clone(),
+            metadata_store.clone(),
+            repositories.clone(),
+            global_retention_policy,
+            options.dry_run,
+        )));
+    }
+
+    if let Some(upload_timeout) = options.uploads {
+        let upload_timeout =
+            Duration::from_std(upload_timeout.into()).expect("Upload timeout must be valid");
+        info!(
+            "Upload timeout set to {} second(s)",
+            upload_timeout.num_seconds()
+        );
+        checkers.push(Box::new(UploadChecker::new(
+            blob_store.clone(),
+            upload_timeout,
+            options.dry_run,
+        )));
+    }
+
+    if options.tags {
+        checkers.push(Box::new(TagChecker::new(
+            metadata_store.clone(),
+            options.dry_run,
+        )));
+    }
+
+    if options.manifests {
+        checkers.push(Box::new(ManifestChecker::new(
+            blob_store.clone(),
+            metadata_store.clone(),
+            options.dry_run,
+        )));
+    }
+
+    if options.links {
+        checkers.push(Box::new(LinkReferencesChecker::new(
+            blob_store.clone(),
+            metadata_store.clone(),
+            options.dry_run,
+        )));
+    }
+
+    if options.media_types {
+        checkers.push(Box::new(MediaTypeChecker::new(
+            blob_store.clone(),
+            metadata_store.clone(),
+            options.dry_run,
+        )));
+    }
+
+    Ok(checkers)
+}
+
+fn build_blob_checker(
+    options: &Options,
+    blob_store: &Arc<dyn BlobStore>,
+    metadata_store: &Arc<dyn MetadataStore>,
+) -> Option<BlobChecker> {
+    if options.blobs {
+        Some(BlobChecker::new(
+            blob_store.clone(),
+            metadata_store.clone(),
+            options.dry_run,
+        ))
+    } else {
+        None
+    }
+}
+
+fn build_multipart_checker(
+    options: &Options,
+    blob_store_config: &blob_store::BlobStorageConfig,
+) -> Option<MultipartChecker> {
+    let multipart_timeout = options.multipart?;
+    let multipart_timeout =
+        Duration::from_std(multipart_timeout.into()).expect("Multipart timeout must be valid");
+    blob_store_config
+        .to_multipart_cleanup()
+        .map(|cleanup| MultipartChecker::new(cleanup, multipart_timeout, options.dry_run))
+}
+
 impl Command {
     pub async fn new(options: &Options, config: &Configuration) -> Result<Self, Error> {
         let blob_store = build_blob_store(&config.blob_store)?;
@@ -145,89 +242,10 @@ impl Command {
         let auth_cache = build_auth_cache(&config.cache)?;
         let repositories = build_repositories(&config.repository, &auth_cache)?;
 
-        let mut namespace_checkers: Vec<Box<dyn NamespaceChecker>> = Vec::new();
-
-        if options.retention {
-            let global_retention_policy =
-                build_global_retention_policy(&config.global.retention_policy)?;
-
-            namespace_checkers.push(Box::new(RetentionChecker::new(
-                blob_store.clone(),
-                metadata_store.clone(),
-                repositories.clone(),
-                global_retention_policy,
-                options.dry_run,
-            )));
-        }
-
-        if let Some(upload_timeout) = options.uploads {
-            let upload_timeout =
-                Duration::from_std(upload_timeout.into()).expect("Upload timeout must be valid");
-
-            info!(
-                "Upload timeout set to {} second(s)",
-                upload_timeout.num_seconds()
-            );
-
-            namespace_checkers.push(Box::new(UploadChecker::new(
-                blob_store.clone(),
-                upload_timeout,
-                options.dry_run,
-            )));
-        }
-
-        if options.tags {
-            namespace_checkers.push(Box::new(TagChecker::new(
-                metadata_store.clone(),
-                options.dry_run,
-            )));
-        }
-
-        if options.manifests {
-            namespace_checkers.push(Box::new(ManifestChecker::new(
-                blob_store.clone(),
-                metadata_store.clone(),
-                options.dry_run,
-            )));
-        }
-
-        if options.links {
-            namespace_checkers.push(Box::new(LinkReferencesChecker::new(
-                blob_store.clone(),
-                metadata_store.clone(),
-                options.dry_run,
-            )));
-        }
-
-        if options.media_types {
-            namespace_checkers.push(Box::new(MediaTypeChecker::new(
-                blob_store.clone(),
-                metadata_store.clone(),
-                options.dry_run,
-            )));
-        }
-
-        let blob_checker = if options.blobs {
-            Some(BlobChecker::new(
-                blob_store,
-                metadata_store.clone(),
-                options.dry_run,
-            ))
-        } else {
-            None
-        };
-
-        let multipart_checker = if let Some(multipart_timeout) = options.multipart {
-            let multipart_timeout = Duration::from_std(multipart_timeout.into())
-                .expect("Multipart timeout must be valid");
-
-            config
-                .blob_store
-                .to_multipart_cleanup()
-                .map(|cleanup| MultipartChecker::new(cleanup, multipart_timeout, options.dry_run))
-        } else {
-            None
-        };
+        let namespace_checkers =
+            build_namespace_checkers(options, config, &blob_store, &metadata_store, &repositories)?;
+        let blob_checker = build_blob_checker(options, &blob_store, &metadata_store);
+        let multipart_checker = build_multipart_checker(options, &config.blob_store);
 
         if options.dry_run {
             info!("Dry-run mode: no changes will be made to the storage");

@@ -77,7 +77,7 @@ impl RegistryClient {
     pub fn new(config: &RegistryClientConfig, cache: Arc<dyn Cache>) -> Result<Self, Error> {
         let mut client_builder = Client::builder()
             .redirect(Policy::limited(config.max_redirect as usize))
-            .timeout(Duration::from_secs(300));
+            .timeout(Duration::from_mins(5));
 
         if let Some(ca_bundle) = &config.server_ca_bundle {
             let cert_pem = fs::read(ca_bundle)

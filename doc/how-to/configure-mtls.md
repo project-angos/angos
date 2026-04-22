@@ -240,7 +240,7 @@ rules = [
 
 **Debug logging:**
 ```bash
-RUST_LOG=angos::command::server::auth=debug ./angos server
+RUST_LOG=angos::auth=debug ./angos server
 ```
 
 ## Next Steps

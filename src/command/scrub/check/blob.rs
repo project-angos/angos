@@ -41,16 +41,18 @@ impl BlobChecker {
                     .await
                     .map_err(Error::from)
             },
-            |blobs| async move {
-                for blob in &blobs {
-                    if let Err(e) = self.check_blob(blob).await {
-                        error!("Failed to process blob index for {blob}: {e}");
-                    }
-                }
-                Ok(())
-            },
+            |blobs| self.process_page(blobs),
         )
         .await
+    }
+
+    async fn process_page(&self, blobs: Vec<Digest>) -> Result<(), Error> {
+        for blob in &blobs {
+            if let Err(e) = self.check_blob(blob).await {
+                error!("Failed to process blob index for {blob}: {e}");
+            }
+        }
+        Ok(())
     }
 
     async fn check_blob(&self, blob: &Digest) -> Result<(), Error> {

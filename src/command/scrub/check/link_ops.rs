@@ -1,0 +1,51 @@
+use std::sync::Arc;
+
+use tracing::{debug, info};
+
+use crate::{
+    oci::Digest,
+    registry::{
+        Error,
+        metadata_store::{MetadataStore, MetadataStoreExt, link_kind::LinkKind},
+    },
+};
+
+pub async fn ensure_link(
+    metadata_store: &Arc<dyn MetadataStore + Send + Sync>,
+    namespace: &str,
+    link: &LinkKind,
+    expected_target: &Digest,
+    dry_run: bool,
+) -> Result<(), Error> {
+    match metadata_store.read_link(namespace, link, false).await {
+        Ok(metadata) if &metadata.target == expected_target => {
+            debug!("Link {link} -> {expected_target} is valid");
+            Ok(())
+        }
+        _ => {
+            debug!("Missing or invalid link: {link} -> {expected_target}");
+            recreate_link(metadata_store, namespace, link, expected_target, dry_run).await
+        }
+    }
+}
+
+async fn recreate_link(
+    metadata_store: &Arc<dyn MetadataStore + Send + Sync>,
+    namespace: &str,
+    link: &LinkKind,
+    target: &Digest,
+    dry_run: bool,
+) -> Result<(), Error> {
+    if dry_run {
+        info!(
+            "DRY RUN: would recreate invalid link from namespace '{namespace}': '{link}' -> '{target}'"
+        );
+        return Ok(());
+    }
+
+    info!("Recreating invalid link from namespace '{namespace}': '{link}' -> '{target}'");
+    let mut tx = metadata_store.begin_transaction(namespace);
+    tx.create_link(link, target).add();
+    tx.commit().await?;
+    Ok(())
+}

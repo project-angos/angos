@@ -42,6 +42,15 @@ impl TagChecker {
         )
         .await
     }
+
+    async fn process_page(&self, namespace: &str, tags: Vec<String>) -> Result<(), Error> {
+        for tag in &tags {
+            if let Err(e) = self.repair_tag_digest_link(namespace, tag).await {
+                error!("Failed to check tag from '{namespace}' (tag '{tag}'): {e}");
+            }
+        }
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -56,14 +65,7 @@ impl NamespaceChecker for TagChecker {
                     .await
                     .map_err(Error::from)
             },
-            |tags| async move {
-                for tag in &tags {
-                    if let Err(e) = self.repair_tag_digest_link(namespace, tag).await {
-                        error!("Failed to check tag from '{namespace}' (tag '{tag}'): {e}");
-                    }
-                }
-                Ok(())
-            },
+            |tags| self.process_page(namespace, tags),
         )
         .await
     }

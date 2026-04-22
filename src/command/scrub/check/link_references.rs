@@ -116,6 +116,17 @@ impl LinkReferencesChecker {
         }
         Ok(())
     }
+
+    async fn process_page(&self, namespace: &str, revisions: Vec<Digest>) -> Result<(), Error> {
+        for revision in &revisions {
+            if let Err(e) = self.repair_referenced_by(namespace, revision).await {
+                error!(
+                    "Failed to fix referenced_by for '{namespace}' (revision '{revision}'): {e}"
+                );
+            }
+        }
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -130,16 +141,7 @@ impl NamespaceChecker for LinkReferencesChecker {
                     .await
                     .map_err(Error::from)
             },
-            |revisions| async move {
-                for revision in &revisions {
-                    if let Err(e) = self.repair_referenced_by(namespace, revision).await {
-                        error!(
-                            "Failed to fix referenced_by for '{namespace}' (revision '{revision}'): {e}"
-                        );
-                    }
-                }
-                Ok(())
-            },
+            |revisions| self.process_page(namespace, revisions),
         )
         .await
     }
