@@ -1,10 +1,10 @@
 use serde::Deserialize;
 
-use crate::command::server::listeners::{insecure, tls};
+use crate::configuration::listeners::{insecure::InsecureListenerConfig, tls::TlsListenerConfig};
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(untagged)]
 pub enum ServerConfig {
-    Tls(tls::Config),
-    Insecure(insecure::Config),
+    Tls(TlsListenerConfig),
+    Insecure(InsecureListenerConfig),
 }

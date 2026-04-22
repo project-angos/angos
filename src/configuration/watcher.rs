@@ -11,7 +11,7 @@ use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 
 use super::{Configuration, Error, ServerConfig};
-use crate::command::server::listeners::tls::ServerTlsConfig;
+use crate::configuration::listeners::tls::ServerTlsConfig;
 
 #[derive(Debug, PartialEq)]
 enum ChangeKind {

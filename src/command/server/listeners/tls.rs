@@ -1,9 +1,4 @@
-use std::{
-    net::{IpAddr, SocketAddr},
-    path::{Path, PathBuf},
-    sync::Arc,
-    time::Duration,
-};
+use std::{net::SocketAddr, path::Path, sync::Arc, time::Duration};
 
 use arc_swap::ArcSwap;
 use hyper_util::rt::TokioIo;
@@ -12,7 +7,6 @@ use rustls::{
     server::{WebPkiClientVerifier, danger::ClientCertVerifier},
 };
 use rustls_pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
-use serde::Deserialize;
 use tokio_rustls::TlsAcceptor;
 use tracing::{debug, info};
 
@@ -22,39 +16,7 @@ use crate::command::server::{
     listeners::{accept, build_listener},
     serve_request,
 };
-
-#[derive(Clone, Debug, Deserialize)]
-pub struct Config {
-    pub bind_address: IpAddr,
-    #[serde(default = "Config::default_port")]
-    pub port: u16,
-    #[serde(default = "Config::default_query_timeout")]
-    pub query_timeout: u64,
-    #[serde(default = "Config::default_query_timeout_grace_period")]
-    pub query_timeout_grace_period: u64,
-    pub tls: ServerTlsConfig,
-}
-
-impl Config {
-    fn default_port() -> u16 {
-        8000
-    }
-
-    fn default_query_timeout() -> u64 {
-        3600
-    }
-
-    fn default_query_timeout_grace_period() -> u64 {
-        60
-    }
-}
-
-#[derive(Clone, Debug, Deserialize)]
-pub struct ServerTlsConfig {
-    pub server_certificate_bundle: PathBuf,
-    pub server_private_key: PathBuf,
-    pub client_ca_bundle: Option<PathBuf>,
-}
+pub use crate::configuration::listeners::tls::{ServerTlsConfig, TlsListenerConfig};
 
 fn build_client_verifier(client_ca_bundle: &Path) -> Result<Arc<dyn ClientCertVerifier>, Error> {
     let client_certs: Vec<CertificateDer> = CertificateDer::pem_file_iter(client_ca_bundle)
@@ -91,7 +53,7 @@ pub struct TlsListener {
 }
 
 impl TlsListener {
-    pub fn new(config: &Config, context: ServerContext) -> Result<Self, Error> {
+    pub fn new(config: &TlsListenerConfig, context: ServerContext) -> Result<Self, Error> {
         let binding_address = SocketAddr::new(config.bind_address, config.port);
         let tls_acceptor = ArcSwap::from_pointee(Self::build_tls_acceptor(&config.tls)?);
         let timeouts = [
@@ -113,7 +75,7 @@ impl TlsListener {
 
     pub fn notify_config_change(
         &self,
-        config: &Config,
+        config: &TlsListenerConfig,
         context: ServerContext,
     ) -> Result<(), Error> {
         let acceptor = Arc::new(Self::build_tls_acceptor(&config.tls)?);
@@ -213,7 +175,12 @@ impl TlsListener {
 
 #[cfg(test)]
 pub mod tests {
-    use std::{io::Write, net::Ipv6Addr, sync::Once};
+    use std::{
+        io::Write,
+        net::{IpAddr, Ipv6Addr},
+        path::PathBuf,
+        sync::Once,
+    };
 
     use tempfile::NamedTempFile;
 
@@ -332,7 +299,7 @@ PpGhlTQXVV6Evtahtp+cRw==
             key_file.path().display()
         );
 
-        let config: Config = toml::from_str(&toml).unwrap();
+        let config: TlsListenerConfig = toml::from_str(&toml).unwrap();
 
         assert_eq!(config.port, 8000);
         assert_eq!(config.query_timeout, 3600);
@@ -358,7 +325,7 @@ PpGhlTQXVV6Evtahtp+cRw==
             key_file.path().display()
         );
 
-        let config: Config = toml::from_str(&toml).unwrap();
+        let config: TlsListenerConfig = toml::from_str(&toml).unwrap();
 
         assert_eq!(config.port, 9000);
         assert_eq!(config.query_timeout, 7200);
@@ -386,7 +353,7 @@ PpGhlTQXVV6Evtahtp+cRw==
             key_file.path().display()
         );
 
-        let config: Config = toml::from_str(&toml).unwrap();
+        let config: TlsListenerConfig = toml::from_str(&toml).unwrap();
 
         assert_eq!(config.bind_address, IpAddr::from(Ipv6Addr::LOCALHOST));
         assert_eq!(config.port, 8443);
@@ -488,7 +455,7 @@ PpGhlTQXVV6Evtahtp+cRw==
 
         let (tls, _temp_files) = build_config(false);
 
-        let config = Config {
+        let config = TlsListenerConfig {
             bind_address: "127.0.0.1".parse().unwrap(),
             port: 8443,
             query_timeout: 3600,
@@ -512,7 +479,7 @@ PpGhlTQXVV6Evtahtp+cRw==
         init_crypto_provider();
         let (tls, _temp_files) = build_config(false);
 
-        let config = Config {
+        let config = TlsListenerConfig {
             bind_address: "::1".parse().unwrap(),
             port: 9443,
             query_timeout: 3600,
@@ -542,7 +509,7 @@ PpGhlTQXVV6Evtahtp+cRw==
         tls.server_certificate_bundle = cert_file.path().to_path_buf();
         tls.server_private_key = key_file.path().to_path_buf();
 
-        let config = Config {
+        let config = TlsListenerConfig {
             bind_address: "127.0.0.1".parse().unwrap(),
             port: 8443,
             query_timeout: 3600,
@@ -561,7 +528,7 @@ PpGhlTQXVV6Evtahtp+cRw==
         init_crypto_provider();
         let (tls, _temp_files) = build_config(false);
 
-        let config = Config {
+        let config = TlsListenerConfig {
             bind_address: "127.0.0.1".parse().unwrap(),
             port: 8443,
             query_timeout: 3600,
@@ -583,7 +550,7 @@ PpGhlTQXVV6Evtahtp+cRw==
         init_crypto_provider();
         let (tls, _temp_files) = build_config(false);
 
-        let config = Config {
+        let config = TlsListenerConfig {
             bind_address: "127.0.0.1".parse().unwrap(),
             port: 8443,
             query_timeout: 3600,
@@ -605,7 +572,7 @@ PpGhlTQXVV6Evtahtp+cRw==
         init_crypto_provider();
 
         let (tls, _temp_files) = build_config(false);
-        let config = Config {
+        let config = TlsListenerConfig {
             bind_address: "127.0.0.1".parse().unwrap(),
             port: 8443,
             query_timeout: 3600,

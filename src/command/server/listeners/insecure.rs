@@ -1,12 +1,7 @@
-use std::{
-    net::{IpAddr, Ipv4Addr, SocketAddr},
-    sync::Arc,
-    time::Duration,
-};
+use std::{net::SocketAddr, sync::Arc, time::Duration};
 
 use arc_swap::ArcSwap;
 use hyper_util::rt::TokioIo;
-use serde::Deserialize;
 use tracing::{debug, info};
 
 use crate::command::server::{
@@ -15,42 +10,7 @@ use crate::command::server::{
     listeners::{accept, build_listener},
     serve_request,
 };
-
-#[derive(Clone, Debug, Deserialize)]
-pub struct Config {
-    pub bind_address: IpAddr,
-    #[serde(default = "Config::default_port")]
-    pub port: u16,
-    #[serde(default = "Config::default_query_timeout")]
-    pub query_timeout: u64,
-    #[serde(default = "Config::default_query_timeout_grace_period")]
-    pub query_timeout_grace_period: u64,
-}
-
-impl Config {
-    fn default_port() -> u16 {
-        8000
-    }
-
-    fn default_query_timeout() -> u64 {
-        3600
-    }
-
-    fn default_query_timeout_grace_period() -> u64 {
-        60
-    }
-}
-
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            bind_address: IpAddr::from(Ipv4Addr::from([0; 4])),
-            port: Self::default_port(),
-            query_timeout: Self::default_query_timeout(),
-            query_timeout_grace_period: Self::default_query_timeout_grace_period(),
-        }
-    }
-}
+pub use crate::configuration::listeners::insecure::InsecureListenerConfig;
 
 pub struct InsecureListener {
     binding_address: SocketAddr,
@@ -59,7 +19,7 @@ pub struct InsecureListener {
 }
 
 impl InsecureListener {
-    pub fn new(server_config: &Config, context: ServerContext) -> Self {
+    pub fn new(server_config: &InsecureListenerConfig, context: ServerContext) -> Self {
         let binding_address = SocketAddr::new(server_config.bind_address, server_config.port);
 
         let timeouts = [
@@ -113,7 +73,10 @@ impl InsecureListener {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashMap, net::Ipv6Addr};
+    use std::{
+        collections::HashMap,
+        net::{IpAddr, Ipv4Addr, Ipv6Addr},
+    };
 
     use chrono::Utc;
     use uuid::Uuid;
@@ -132,7 +95,7 @@ mod tests {
 
     #[test]
     fn test_config_default_values() {
-        let config = Config::default();
+        let config = InsecureListenerConfig::default();
 
         assert_eq!(config.port, 8000);
         assert_eq!(config.query_timeout, 3600);
@@ -149,7 +112,7 @@ mod tests {
             query_timeout_grace_period = 120
         "#;
 
-        let config: Config = toml::from_str(toml).unwrap();
+        let config: InsecureListenerConfig = toml::from_str(toml).unwrap();
 
         assert_eq!(config.port, 9000);
         assert_eq!(config.query_timeout, 7200);
@@ -166,7 +129,7 @@ mod tests {
             bind_address = "10.0.0.1"
         "#;
 
-        let config: Config = toml::from_str(toml).unwrap();
+        let config: InsecureListenerConfig = toml::from_str(toml).unwrap();
 
         assert_eq!(config.port, 8000);
         assert_eq!(config.query_timeout, 3600);
@@ -180,7 +143,7 @@ mod tests {
             port = 8443
         "#;
 
-        let config: Config = toml::from_str(toml).unwrap();
+        let config: InsecureListenerConfig = toml::from_str(toml).unwrap();
 
         assert_eq!(config.bind_address, IpAddr::from(Ipv6Addr::LOCALHOST));
         assert_eq!(config.port, 8443);
@@ -188,7 +151,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_insecure_listener_new() {
-        let config = Config {
+        let config = InsecureListenerConfig {
             bind_address: "127.0.0.1".parse().unwrap(),
             port: 8080,
             query_timeout: 1800,
@@ -206,7 +169,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_insecure_listener_new_with_ipv6() {
-        let config = Config {
+        let config = InsecureListenerConfig {
             bind_address: "::1".parse().unwrap(),
             port: 9000,
             query_timeout: 3600,
@@ -225,7 +188,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_insecure_listener_notify_config_change() {
-        let config = Config::default();
+        let config = InsecureListenerConfig::default();
         let context1 = create_test_server_context().await;
         let listener = InsecureListener::new(&config, context1);
 
@@ -235,7 +198,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_insecure_listener_timeouts_initialization() {
-        let config = Config {
+        let config = InsecureListenerConfig {
             bind_address: "127.0.0.1".parse().unwrap(),
             port: 8080,
             query_timeout: 5000,
@@ -252,7 +215,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_insecure_listener_with_zero_port() {
-        let config = Config {
+        let config = InsecureListenerConfig {
             bind_address: "127.0.0.1".parse().unwrap(),
             port: 0,
             query_timeout: 3600,
@@ -267,7 +230,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_insecure_listener_multiple_config_changes() {
-        let config = Config::default();
+        let config = InsecureListenerConfig::default();
         let context1 = create_test_server_context().await;
         let listener = InsecureListener::new(&config, context1);
 
@@ -345,7 +308,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_hot_reload_updates_webhook_config() {
-        let listener_config = Config::default();
+        let listener_config = InsecureListenerConfig::default();
         let context_without_webhooks = create_test_server_context().await;
         let listener = InsecureListener::new(&listener_config, context_without_webhooks);
 
@@ -360,7 +323,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_hot_reload_removes_webhooks() {
-        let listener_config = Config::default();
+        let listener_config = InsecureListenerConfig::default();
         let config_with_webhook = create_config_with_webhook("https://example.com/webhook");
         let context_with_webhooks = create_server_context_from_config(&config_with_webhook).await;
         let listener = InsecureListener::new(&listener_config, context_with_webhooks);
@@ -392,7 +355,7 @@ mod tests {
             .mount(&server_b)
             .await;
 
-        let listener_config = Config::default();
+        let listener_config = InsecureListenerConfig::default();
         let config_a = create_config_with_webhook(&format!("{}/webhook", server_a.uri()));
         let context_a = create_server_context_from_config(&config_a).await;
         let listener = InsecureListener::new(&listener_config, context_a);
@@ -457,7 +420,7 @@ mod tests {
             .mount(&server_b)
             .await;
 
-        let listener_config = Config::default();
+        let listener_config = InsecureListenerConfig::default();
         let config_one = create_config_with_webhook(&server_a.uri());
         let context_one = create_server_context_from_config(&config_one).await;
         let listener = InsecureListener::new(&listener_config, context_one);
@@ -487,7 +450,7 @@ mod tests {
             .mount(&server_b)
             .await;
 
-        let listener_config = Config::default();
+        let listener_config = InsecureListenerConfig::default();
         let config_two = create_config_with_two_webhooks(&server_a.uri(), &server_b.uri());
         let context_two = create_server_context_from_config(&config_two).await;
         let listener = InsecureListener::new(&listener_config, context_two);
@@ -517,7 +480,7 @@ mod tests {
             .mount(&server_new)
             .await;
 
-        let listener_config = Config::default();
+        let listener_config = InsecureListenerConfig::default();
         let config_old = create_config_with_webhook(&server_old.uri());
         let context_old = create_server_context_from_config(&config_old).await;
         let listener = InsecureListener::new(&listener_config, context_old);
@@ -536,7 +499,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_hot_reload_invalid_webhook_config_preserves_old_context() {
-        let listener_config = Config::default();
+        let listener_config = InsecureListenerConfig::default();
         let config_valid = create_config_with_webhook("https://example.com/webhook");
         let context_valid = create_server_context_from_config(&config_valid).await;
         let listener = InsecureListener::new(&listener_config, context_valid);
