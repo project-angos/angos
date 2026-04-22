@@ -19,11 +19,8 @@ use cel_interpreter::{Context, Program, Value};
 use serde::Deserialize;
 use tracing::{debug, warn};
 
-use super::Error;
-use crate::{
-    cel,
-    identity::{Action, ClientIdentity},
-};
+use super::{Error, cel};
+use crate::identity::{Action, ClientIdentity};
 
 /// Configuration for access control policies.
 #[derive(Clone, Debug, Default, Deserialize)]
