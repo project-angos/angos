@@ -99,6 +99,17 @@ async fn send_and_record(
     result
 }
 
+fn serialize_event(event: &Event) -> Result<(Vec<u8>, String), Error> {
+    let body = serde_json::to_vec(event)
+        .map_err(|e| Error::Initialization(format!("Failed to serialize event: {e}")))?;
+    let event_kind_header = serde_json::to_value(&event.kind)
+        .map_err(|e| Error::Initialization(format!("Failed to serialize event kind: {e}")))?
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    Ok((body, event_kind_header))
+}
+
 impl EventDispatcher {
     pub fn new(webhooks: HashMap<String, EventWebhookConfig>) -> Result<Self, Error> {
         let mut endpoints = HashMap::new();
@@ -156,15 +167,79 @@ impl EventDispatcher {
         while in_flight.join_next().await.is_some() {}
     }
 
-    pub async fn dispatch(&self, event: &Event) -> Result<(), Error> {
-        let body = serde_json::to_vec(event)
-            .map_err(|e| Error::Initialization(format!("Failed to serialize event: {e}")))?;
+    async fn spawn_async_delivery(
+        &self,
+        name: &str,
+        endpoint: &WebhookEndpoint,
+        body: &[u8],
+        event_kind_header: &str,
+    ) -> bool {
+        if self.shutdown.load(Ordering::SeqCst) {
+            warn!("Async webhook '{name}' skipped: dispatcher is shut down");
+            return false;
+        }
+        let mut in_flight_guard = self.in_flight.lock().await;
+        in_flight_guard.spawn(deliver_async(
+            endpoint.client.clone(),
+            endpoint.config.url.clone(),
+            endpoint.config.token.clone(),
+            body.to_vec(),
+            event_kind_header.to_string(),
+            endpoint.config.max_retries,
+            name.to_string(),
+        ));
+        true
+    }
 
-        let event_kind_header = serde_json::to_value(&event.kind)
-            .map_err(|e| Error::Initialization(format!("Failed to serialize event kind: {e}")))?
-            .as_str()
-            .unwrap_or_default()
-            .to_string();
+    async fn deliver_for_endpoint(
+        &self,
+        name: &str,
+        endpoint: &WebhookEndpoint,
+        body: &[u8],
+        event_kind_header: &str,
+    ) -> Result<bool, Error> {
+        match endpoint.config.policy {
+            DeliveryPolicy::Async => {
+                let spawned = self
+                    .spawn_async_delivery(name, endpoint, body, event_kind_header)
+                    .await;
+                Ok(spawned)
+            }
+            DeliveryPolicy::Required => {
+                send_and_record(
+                    &endpoint.client,
+                    &endpoint.config.url,
+                    endpoint.config.token.as_deref(),
+                    body,
+                    event_kind_header,
+                    endpoint.config.max_retries,
+                    name,
+                )
+                .await
+                .map_err(|e| Error::Initialization(format!("Webhook '{name}' failed: {e}")))?;
+                Ok(true)
+            }
+            DeliveryPolicy::Optional => {
+                if let Err(e) = send_and_record(
+                    &endpoint.client,
+                    &endpoint.config.url,
+                    endpoint.config.token.as_deref(),
+                    body,
+                    event_kind_header,
+                    endpoint.config.max_retries,
+                    name,
+                )
+                .await
+                {
+                    warn!("Optional webhook '{name}' failed: {e}");
+                }
+                Ok(true)
+            }
+        }
+    }
+
+    pub async fn dispatch(&self, event: &Event) -> Result<(), Error> {
+        let (body, event_kind_header) = serialize_event(event)?;
 
         for (name, endpoint) in &self.endpoints {
             if !endpoint.matches_event(&event.kind, &event.repository) {
@@ -175,51 +250,11 @@ impl EventDispatcher {
                 .with_label_values(&[name.as_str(), event_kind_header.as_str()])
                 .start_timer();
 
-            match endpoint.config.policy {
-                DeliveryPolicy::Async => {
-                    if self.shutdown.load(Ordering::SeqCst) {
-                        warn!("Async webhook '{name}' skipped: dispatcher is shut down");
-                        continue;
-                    }
-                    let mut in_flight_guard = self.in_flight.lock().await;
-                    in_flight_guard.spawn(deliver_async(
-                        endpoint.client.clone(),
-                        endpoint.config.url.clone(),
-                        endpoint.config.token.clone(),
-                        body.clone(),
-                        event_kind_header.clone(),
-                        endpoint.config.max_retries,
-                        name.clone(),
-                    ));
-                }
-                DeliveryPolicy::Required => {
-                    send_and_record(
-                        &endpoint.client,
-                        &endpoint.config.url,
-                        endpoint.config.token.as_deref(),
-                        &body,
-                        &event_kind_header,
-                        endpoint.config.max_retries,
-                        name,
-                    )
-                    .await
-                    .map_err(|e| Error::Initialization(format!("Webhook '{name}' failed: {e}")))?;
-                }
-                DeliveryPolicy::Optional => {
-                    if let Err(e) = send_and_record(
-                        &endpoint.client,
-                        &endpoint.config.url,
-                        endpoint.config.token.as_deref(),
-                        &body,
-                        &event_kind_header,
-                        endpoint.config.max_retries,
-                        name,
-                    )
-                    .await
-                    {
-                        warn!("Optional webhook '{name}' failed: {e}");
-                    }
-                }
+            if !self
+                .deliver_for_endpoint(name, endpoint, &body, &event_kind_header)
+                .await?
+            {
+                continue;
             }
 
             timer.observe_duration();
