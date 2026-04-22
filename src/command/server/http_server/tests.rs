@@ -435,7 +435,7 @@ async fn test_authenticate_and_authorize_returns_client_identity() {
 
     let request = Request::builder().uri("/v2/").body(()).unwrap();
     let (parts, ()) = request.into_parts();
-    let route = Route::ApiVersion;
+    let route = Action::ApiVersion;
 
     let result = authenticate_and_authorize(&context, &route, &parts).await;
 

@@ -10,7 +10,7 @@ use crate::{
     },
     configuration::Configuration,
     event_webhook::{dispatcher::EventDispatcher, event::Event},
-    identity::{ClientIdentity, Route},
+    identity::{Action, ClientIdentity},
     oci::{Namespace, Reference},
     registry::Registry,
 };
@@ -78,7 +78,7 @@ impl ServerContext {
     #[instrument(skip(self, request))]
     pub async fn authorize_request(
         &self,
-        route: &Route<'_>,
+        route: &Action,
         identity: &ClientIdentity,
         request: &Parts,
     ) -> Result<(), Error> {

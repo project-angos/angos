@@ -437,7 +437,7 @@ async fn test_authorize_request_with_global_policy() {
     let registry = create_test_registry(&config).await;
     let context = ServerContext::new(&config, registry).unwrap();
 
-    let route = Route::GetManifest {
+    let route = Action::GetManifest {
         namespace: Namespace::new("test/repo").unwrap(),
         reference: Reference::Tag("latest".to_string()),
     };

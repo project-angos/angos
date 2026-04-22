@@ -5,7 +5,7 @@ use serde::{Deserialize, de::DeserializeOwned};
 use uuid::Uuid;
 
 use crate::{
-    identity::Route,
+    identity::Action,
     oci::{Digest, Namespace, Reference},
 };
 
@@ -13,16 +13,20 @@ fn parse_query<T: DeserializeOwned + Default>(params: &str) -> T {
     serde_urlencoded::from_str(params).unwrap_or_default()
 }
 
-pub fn parse<'a>(method: &Method, uri: &'a Uri) -> Route<'a> {
+/// Parses the HTTP method and URI into a registry `Action`.
+///
+/// Returns `None` for paths that do not match any known route. Callers should
+/// return 404 for `None` without running authentication or authorization.
+pub fn parse(method: &Method, uri: &Uri) -> Option<Action> {
     let path = uri.path();
     let params = uri.query();
 
     match path {
-        "/healthz" if method == Method::GET => return Route::Healthz,
-        "/readyz" if method == Method::GET => return Route::Readyz,
-        "/metrics" if method == Method::GET => return Route::Metrics,
-        "/_ui/config" if method == Method::GET => return Route::UiConfig,
-        "/v2" | "/v2/" if method == Method::GET => return Route::ApiVersion,
+        "/healthz" if method == Method::GET => return Some(Action::Healthz),
+        "/readyz" if method == Method::GET => return Some(Action::Readyz),
+        "/metrics" if method == Method::GET => return Some(Action::Metrics),
+        "/_ui/config" if method == Method::GET => return Some(Action::UiConfig),
+        "/v2" | "/v2/" if method == Method::GET => return Some(Action::ApiVersion),
         "/v2/_catalog" if method == Method::GET => {
             let (n, last) = if let Some(p) = params.map(parse_query::<PaginationQuery>) {
                 (p.n, p.last)
@@ -30,48 +34,28 @@ pub fn parse<'a>(method: &Method, uri: &'a Uri) -> Route<'a> {
                 (None, None)
             };
 
-            return Route::ListCatalog { n, last };
+            return Some(Action::ListCatalog { n, last });
         }
         _ => {}
     }
 
     if let Some(api_path) = path.strip_prefix("/v2/") {
-        if let Some(route) = try_parse_extension(method, api_path) {
-            return route;
-        }
-
-        if let Some(route) = try_parse_uploads(method, api_path, params) {
-            return route;
-        }
-
-        if let Some(route) = try_parse_upload(method, api_path, params) {
-            return route;
-        }
-
-        if let Some(route) = try_find_blobs(method, api_path) {
-            return route;
-        }
-
-        if let Some(route) = try_find_manifests(method, api_path) {
-            return route;
-        }
-
-        if let Some(route) = try_find_referrers(method, api_path, params) {
-            return route;
-        }
-
-        if let Some(route) = try_find_tags(method, api_path, params) {
-            return route;
-        }
-
-        return Route::Unknown;
+        return try_parse_extension(method, api_path)
+            .or_else(|| try_parse_uploads(method, api_path, params))
+            .or_else(|| try_parse_upload(method, api_path, params))
+            .or_else(|| try_find_blobs(method, api_path))
+            .or_else(|| try_find_manifests(method, api_path))
+            .or_else(|| try_find_referrers(method, api_path, params))
+            .or_else(|| try_find_tags(method, api_path, params));
     }
 
     if method == Method::GET || method == Method::HEAD {
-        return Route::UiAsset { path };
+        return Some(Action::UiAsset {
+            path: path.to_string(),
+        });
     }
 
-    Route::Unknown
+    None
 }
 
 #[derive(Deserialize, Default)]
@@ -97,7 +81,7 @@ struct PaginationQuery {
     last: Option<String>,
 }
 
-fn try_parse_extension<'a>(method: &Method, path: &'a str) -> Option<Route<'a>> {
+fn try_parse_extension(method: &Method, path: &str) -> Option<Action> {
     if *method != Method::GET {
         return None;
     }
@@ -105,31 +89,29 @@ fn try_parse_extension<'a>(method: &Method, path: &'a str) -> Option<Route<'a>> 
     let path = path.strip_prefix("_ext/")?;
 
     if path == "_repositories" {
-        return Some(Route::ListRepositories);
+        return Some(Action::ListRepositories);
     }
 
     if let Some(repository) = path.strip_suffix("/_namespaces") {
-        return Some(Route::ListNamespaces { repository });
+        return Some(Action::ListNamespaces {
+            repository: repository.to_string(),
+        });
     }
 
     if let Some(namespace_str) = path.strip_suffix("/_revisions") {
         let namespace = Namespace::new(namespace_str).ok()?;
-        return Some(Route::ListRevisions { namespace });
+        return Some(Action::ListRevisions { namespace });
     }
 
     if let Some(namespace_str) = path.strip_suffix("/_uploads") {
         let namespace = Namespace::new(namespace_str).ok()?;
-        return Some(Route::ListUploads { namespace });
+        return Some(Action::ListUploads { namespace });
     }
 
     None
 }
 
-fn try_parse_uploads<'a>(
-    method: &Method,
-    path: &'a str,
-    params: Option<&'a str>,
-) -> Option<Route<'a>> {
+fn try_parse_uploads(method: &Method, path: &str, params: Option<&str>) -> Option<Action> {
     let suffixes = ["/blobs/uploads", "/blobs/uploads/"];
 
     for suffix in suffixes {
@@ -141,18 +123,14 @@ fn try_parse_uploads<'a>(
                 .map(parse_query::<DigestQuery>)
                 .and_then(|r| r.to_digest());
 
-            return Some(Route::StartUpload { namespace, digest });
+            return Some(Action::StartUpload { namespace, digest });
         }
     }
 
     None
 }
 
-fn try_parse_upload<'a>(
-    method: &Method,
-    path: &'a str,
-    params: Option<&'a str>,
-) -> Option<Route<'a>> {
+fn try_parse_upload(method: &Method, path: &str, params: Option<&str>) -> Option<Action> {
     if let Some(upload_position) = path.rfind("/blobs/uploads/") {
         let namespace_str = &path[..upload_position];
         let namespace = Namespace::new(namespace_str).ok()?;
@@ -161,21 +139,21 @@ fn try_parse_upload<'a>(
         let uuid = Uuid::from_str(uuid).ok()?;
 
         match *method {
-            Method::GET => return Some(Route::GetUpload { namespace, uuid }),
-            Method::PATCH => return Some(Route::PatchUpload { namespace, uuid }),
+            Method::GET => return Some(Action::GetUpload { namespace, uuid }),
+            Method::PATCH => return Some(Action::PatchUpload { namespace, uuid }),
             Method::PUT => {
                 if let Some(digest) = params
                     .map(parse_query::<DigestQuery>)
                     .and_then(|r| r.to_digest())
                 {
-                    return Some(Route::PutUpload {
+                    return Some(Action::PutUpload {
                         namespace,
                         uuid,
                         digest,
                     });
                 }
             }
-            Method::DELETE => return Some(Route::DeleteUpload { namespace, uuid }),
+            Method::DELETE => return Some(Action::DeleteUpload { namespace, uuid }),
             _ => {}
         }
     }
@@ -183,7 +161,7 @@ fn try_parse_upload<'a>(
     None
 }
 
-fn try_find_blobs<'a>(method: &Method, path: &'a str) -> Option<Route<'a>> {
+fn try_find_blobs(method: &Method, path: &str) -> Option<Action> {
     if let Some(blob_position) = path.rfind("/blobs/") {
         let namespace_str = &path[..blob_position];
         let namespace = Namespace::new(namespace_str).ok()?;
@@ -192,9 +170,9 @@ fn try_find_blobs<'a>(method: &Method, path: &'a str) -> Option<Route<'a>> {
         let digest = Digest::from_str(digest).ok()?;
 
         match *method {
-            Method::GET => return Some(Route::GetBlob { namespace, digest }),
-            Method::HEAD => return Some(Route::HeadBlob { namespace, digest }),
-            Method::DELETE => return Some(Route::DeleteBlob { namespace, digest }),
+            Method::GET => return Some(Action::GetBlob { namespace, digest }),
+            Method::HEAD => return Some(Action::HeadBlob { namespace, digest }),
+            Method::DELETE => return Some(Action::DeleteBlob { namespace, digest }),
             _ => {}
         }
     }
@@ -202,7 +180,7 @@ fn try_find_blobs<'a>(method: &Method, path: &'a str) -> Option<Route<'a>> {
     None
 }
 
-fn try_find_manifests<'a>(method: &Method, path: &'a str) -> Option<Route<'a>> {
+fn try_find_manifests(method: &Method, path: &str) -> Option<Action> {
     if let Some(manifest_position) = path.rfind("/manifests/") {
         let namespace_str = &path[..manifest_position];
         let namespace = Namespace::new(namespace_str).ok()?;
@@ -212,25 +190,25 @@ fn try_find_manifests<'a>(method: &Method, path: &'a str) -> Option<Route<'a>> {
 
         match *method {
             Method::GET => {
-                return Some(Route::GetManifest {
+                return Some(Action::GetManifest {
                     namespace,
                     reference,
                 });
             }
             Method::HEAD => {
-                return Some(Route::HeadManifest {
+                return Some(Action::HeadManifest {
                     namespace,
                     reference,
                 });
             }
             Method::PUT => {
-                return Some(Route::PutManifest {
+                return Some(Action::PutManifest {
                     namespace,
                     reference,
                 });
             }
             Method::DELETE => {
-                return Some(Route::DeleteManifest {
+                return Some(Action::DeleteManifest {
                     namespace,
                     reference,
                 });
@@ -242,11 +220,7 @@ fn try_find_manifests<'a>(method: &Method, path: &'a str) -> Option<Route<'a>> {
     None
 }
 
-fn try_find_referrers<'a>(
-    method: &Method,
-    path: &'a str,
-    params: Option<&'a str>,
-) -> Option<Route<'a>> {
+fn try_find_referrers(method: &Method, path: &str, params: Option<&str>) -> Option<Action> {
     if let Some(referrers_position) = path.rfind("/referrers/") {
         let namespace_str = &path[..referrers_position];
         let namespace = Namespace::new(namespace_str).ok()?;
@@ -259,7 +233,7 @@ fn try_find_referrers<'a>(
             .and_then(|f| f.artifact_type);
 
         if *method == Method::GET {
-            return Some(Route::GetReferrer {
+            return Some(Action::GetReferrer {
                 namespace,
                 digest,
                 artifact_type,
@@ -270,7 +244,7 @@ fn try_find_referrers<'a>(
     None
 }
 
-fn try_find_tags<'a>(method: &Method, path: &'a str, params: Option<&'a str>) -> Option<Route<'a>> {
+fn try_find_tags(method: &Method, path: &str, params: Option<&str>) -> Option<Action> {
     if let Some(namespace_str) = path.strip_suffix("/tags/list")
         && *method == Method::GET
     {
@@ -281,7 +255,7 @@ fn try_find_tags<'a>(method: &Method, path: &'a str, params: Option<&'a str>) ->
             (None, None)
         };
 
-        return Some(Route::ListTags { namespace, n, last });
+        return Some(Action::ListTags { namespace, n, last });
     }
 
     None
@@ -296,7 +270,7 @@ mod tests {
         let method = Method::GET;
         let uri: Uri = "/healthz".parse().unwrap();
         let route = parse(&method, &uri);
-        assert!(matches!(route, Route::Healthz));
+        assert!(matches!(route, Some(Action::Healthz)));
     }
 
     #[test]
@@ -304,7 +278,7 @@ mod tests {
         let method = Method::GET;
         let uri: Uri = "/metrics".parse().unwrap();
         let route = parse(&method, &uri);
-        assert!(matches!(route, Route::Metrics));
+        assert!(matches!(route, Some(Action::Metrics)));
     }
 
     #[test]
@@ -312,7 +286,7 @@ mod tests {
         let method = Method::GET;
         let uri: Uri = "/v2".parse().unwrap();
         let route = parse(&method, &uri);
-        assert!(matches!(route, Route::ApiVersion));
+        assert!(matches!(route, Some(Action::ApiVersion)));
     }
 
     #[test]
@@ -320,7 +294,7 @@ mod tests {
         let method = Method::GET;
         let uri: Uri = "/v2/".parse().unwrap();
         let route = parse(&method, &uri);
-        assert!(matches!(route, Route::ApiVersion));
+        assert!(matches!(route, Some(Action::ApiVersion)));
     }
 
     #[test]
@@ -330,10 +304,10 @@ mod tests {
         let route = parse(&method, &uri);
         assert!(matches!(
             route,
-            Route::ListCatalog {
+            Some(Action::ListCatalog {
                 n: None,
                 last: None
-            }
+            })
         ));
     }
 
@@ -342,7 +316,7 @@ mod tests {
         let method = Method::GET;
         let uri: Uri = "/v2/_catalog?n=10&last=myrepo".parse().unwrap();
         let route = parse(&method, &uri);
-        if let Route::ListCatalog { n, last } = route {
+        if let Some(Action::ListCatalog { n, last }) = route {
             assert_eq!(n, Some(10));
             assert_eq!(last, Some("myrepo".to_string()));
         } else {
@@ -355,7 +329,7 @@ mod tests {
         let method = Method::POST;
         let uri: Uri = "/v2/myrepo/app/blobs/uploads".parse().unwrap();
         let route = parse(&method, &uri);
-        if let Route::StartUpload { namespace, digest } = route {
+        if let Some(Action::StartUpload { namespace, digest }) = route {
             assert_eq!(namespace, "myrepo/app");
             assert!(digest.is_none());
         } else {
@@ -368,7 +342,7 @@ mod tests {
         let method = Method::POST;
         let uri: Uri = "/v2/myrepo/app/blobs/uploads/".parse().unwrap();
         let route = parse(&method, &uri);
-        if let Route::StartUpload { namespace, digest } = route {
+        if let Some(Action::StartUpload { namespace, digest }) = route {
             assert_eq!(namespace, "myrepo/app");
             assert!(digest.is_none());
         } else {
@@ -381,7 +355,7 @@ mod tests {
         let method = Method::POST;
         let uri: Uri = "/v2/myrepo/app/blobs/uploads?digest=sha256:1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef".parse().unwrap();
         let route = parse(&method, &uri);
-        if let Route::StartUpload { namespace, digest } = route {
+        if let Some(Action::StartUpload { namespace, digest }) = route {
             assert_eq!(namespace, "myrepo/app");
             assert!(digest.is_some());
             assert_eq!(
@@ -401,10 +375,10 @@ mod tests {
             .parse()
             .unwrap();
         let route = parse(&method, &uri);
-        if let Route::GetUpload {
+        if let Some(Action::GetUpload {
             namespace,
             uuid: parsed_uuid,
-        } = route
+        }) = route
         {
             assert_eq!(namespace, "myrepo/app");
             assert_eq!(parsed_uuid, uuid);
@@ -421,10 +395,10 @@ mod tests {
             .parse()
             .unwrap();
         let route = parse(&method, &uri);
-        if let Route::PatchUpload {
+        if let Some(Action::PatchUpload {
             namespace,
             uuid: parsed_uuid,
-        } = route
+        }) = route
         {
             assert_eq!(namespace, "myrepo/app");
             assert_eq!(parsed_uuid, uuid);
@@ -439,11 +413,11 @@ mod tests {
         let uuid = Uuid::new_v4();
         let uri: Uri = format!("/v2/myrepo/app/blobs/uploads/{uuid}?digest=sha256:1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef").parse().unwrap();
         let route = parse(&method, &uri);
-        if let Route::PutUpload {
+        if let Some(Action::PutUpload {
             namespace,
             uuid: parsed_uuid,
             digest,
-        } = route
+        }) = route
         {
             assert_eq!(namespace, "myrepo/app");
             assert_eq!(parsed_uuid, uuid);
@@ -464,7 +438,7 @@ mod tests {
             .parse()
             .unwrap();
         let route = parse(&method, &uri);
-        assert!(matches!(route, Route::Unknown));
+        assert!(route.is_none());
     }
 
     #[test]
@@ -475,10 +449,10 @@ mod tests {
             .parse()
             .unwrap();
         let route = parse(&method, &uri);
-        if let Route::DeleteUpload {
+        if let Some(Action::DeleteUpload {
             namespace,
             uuid: parsed_uuid,
-        } = route
+        }) = route
         {
             assert_eq!(namespace, "myrepo/app");
             assert_eq!(parsed_uuid, uuid);
@@ -492,7 +466,7 @@ mod tests {
         let method = Method::GET;
         let uri: Uri = "/v2/myrepo/app/blobs/sha256:1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef".parse().unwrap();
         let route = parse(&method, &uri);
-        if let Route::GetBlob { namespace, digest } = route {
+        if let Some(Action::GetBlob { namespace, digest }) = route {
             assert_eq!(namespace, "myrepo/app");
             assert_eq!(
                 digest.to_string(),
@@ -508,7 +482,7 @@ mod tests {
         let method = Method::HEAD;
         let uri: Uri = "/v2/myrepo/app/blobs/sha256:1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef".parse().unwrap();
         let route = parse(&method, &uri);
-        if let Route::HeadBlob { namespace, digest } = route {
+        if let Some(Action::HeadBlob { namespace, digest }) = route {
             assert_eq!(namespace, "myrepo/app");
             assert_eq!(
                 digest.to_string(),
@@ -524,7 +498,7 @@ mod tests {
         let method = Method::DELETE;
         let uri: Uri = "/v2/myrepo/app/blobs/sha256:1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef".parse().unwrap();
         let route = parse(&method, &uri);
-        if let Route::DeleteBlob { namespace, digest } = route {
+        if let Some(Action::DeleteBlob { namespace, digest }) = route {
             assert_eq!(namespace, "myrepo/app");
             assert_eq!(
                 digest.to_string(),
@@ -540,10 +514,10 @@ mod tests {
         let method = Method::GET;
         let uri: Uri = "/v2/myrepo/app/manifests/v1.0.0".parse().unwrap();
         let route = parse(&method, &uri);
-        if let Route::GetManifest {
+        if let Some(Action::GetManifest {
             namespace,
             reference,
-        } = route
+        }) = route
         {
             assert_eq!(namespace, "myrepo/app");
             assert_eq!(reference.to_string(), "v1.0.0");
@@ -557,10 +531,10 @@ mod tests {
         let method = Method::GET;
         let uri: Uri = "/v2/myrepo/app/manifests/sha256:1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef".parse().unwrap();
         let route = parse(&method, &uri);
-        if let Route::GetManifest {
+        if let Some(Action::GetManifest {
             namespace,
             reference,
-        } = route
+        }) = route
         {
             assert_eq!(namespace, "myrepo/app");
             assert_eq!(
@@ -577,10 +551,10 @@ mod tests {
         let method = Method::HEAD;
         let uri: Uri = "/v2/myrepo/app/manifests/v1.0.0".parse().unwrap();
         let route = parse(&method, &uri);
-        if let Route::HeadManifest {
+        if let Some(Action::HeadManifest {
             namespace,
             reference,
-        } = route
+        }) = route
         {
             assert_eq!(namespace, "myrepo/app");
             assert_eq!(reference.to_string(), "v1.0.0");
@@ -594,10 +568,10 @@ mod tests {
         let method = Method::PUT;
         let uri: Uri = "/v2/myrepo/app/manifests/v1.0.0".parse().unwrap();
         let route = parse(&method, &uri);
-        if let Route::PutManifest {
+        if let Some(Action::PutManifest {
             namespace,
             reference,
-        } = route
+        }) = route
         {
             assert_eq!(namespace, "myrepo/app");
             assert_eq!(reference.to_string(), "v1.0.0");
@@ -611,10 +585,10 @@ mod tests {
         let method = Method::DELETE;
         let uri: Uri = "/v2/myrepo/app/manifests/sha256:1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef".parse().unwrap();
         let route = parse(&method, &uri);
-        if let Route::DeleteManifest {
+        if let Some(Action::DeleteManifest {
             namespace,
             reference,
-        } = route
+        }) = route
         {
             assert_eq!(namespace, "myrepo/app");
             assert_eq!(
@@ -631,11 +605,11 @@ mod tests {
         let method = Method::GET;
         let uri: Uri = "/v2/myrepo/app/referrers/sha256:1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef".parse().unwrap();
         let route = parse(&method, &uri);
-        if let Route::GetReferrer {
+        if let Some(Action::GetReferrer {
             namespace,
             digest,
             artifact_type,
-        } = route
+        }) = route
         {
             assert_eq!(namespace, "myrepo/app");
             assert_eq!(
@@ -653,11 +627,11 @@ mod tests {
         let method = Method::GET;
         let uri: Uri = "/v2/myrepo/app/referrers/sha256:1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef?artifactType=application/vnd.oci.image.manifest.v1%2Bjson".parse().unwrap();
         let route = parse(&method, &uri);
-        if let Route::GetReferrer {
+        if let Some(Action::GetReferrer {
             namespace,
             digest,
             artifact_type,
-        } = route
+        }) = route
         {
             assert_eq!(namespace, "myrepo/app");
             assert_eq!(
@@ -678,7 +652,7 @@ mod tests {
         let method = Method::GET;
         let uri: Uri = "/v2/myrepo/app/tags/list".parse().unwrap();
         let route = parse(&method, &uri);
-        if let Route::ListTags { namespace, n, last } = route {
+        if let Some(Action::ListTags { namespace, n, last }) = route {
             assert_eq!(namespace, "myrepo/app");
             assert!(n.is_none());
             assert!(last.is_none());
@@ -692,7 +666,7 @@ mod tests {
         let method = Method::GET;
         let uri: Uri = "/v2/myrepo/app/tags/list?n=50&last=v1.0.0".parse().unwrap();
         let route = parse(&method, &uri);
-        if let Route::ListTags { namespace, n, last } = route {
+        if let Some(Action::ListTags { namespace, n, last }) = route {
             assert_eq!(namespace, "myrepo/app");
             assert_eq!(n, Some(50));
             assert_eq!(last, Some("v1.0.0".to_string()));
@@ -706,7 +680,7 @@ mod tests {
         let method = Method::GET;
         let uri: Uri = "/unknown/path".parse().unwrap();
         let route = parse(&method, &uri);
-        if let Route::UiAsset { path } = route {
+        if let Some(Action::UiAsset { path }) = route {
             assert_eq!(path, "/unknown/path");
         } else {
             panic!("Expected UiAsset route for unknown GET path");
@@ -718,7 +692,7 @@ mod tests {
         let method = Method::POST;
         let uri: Uri = "/unknown/path".parse().unwrap();
         let route = parse(&method, &uri);
-        assert!(matches!(route, Route::Unknown));
+        assert!(route.is_none());
     }
 
     #[test]
@@ -726,7 +700,7 @@ mod tests {
         let method = Method::OPTIONS;
         let uri: Uri = "/v2/myrepo/app/blobs/sha256:1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef".parse().unwrap();
         let route = parse(&method, &uri);
-        assert!(matches!(route, Route::Unknown));
+        assert!(route.is_none());
     }
 
     #[test]
@@ -734,7 +708,7 @@ mod tests {
         let method = Method::GET;
         let uri: Uri = "/v2/myrepo/app/blobs/invalid-digest".parse().unwrap();
         let route = parse(&method, &uri);
-        assert!(matches!(route, Route::Unknown));
+        assert!(route.is_none());
     }
 
     #[test]
@@ -742,7 +716,7 @@ mod tests {
         let method = Method::GET;
         let uri: Uri = "/v2/myrepo/app/blobs/uploads/invalid-uuid".parse().unwrap();
         let route = parse(&method, &uri);
-        assert!(matches!(route, Route::Unknown));
+        assert!(route.is_none());
     }
 
     #[test]
@@ -837,7 +811,7 @@ mod tests {
         let path = "myrepo/app/blobs/uploads";
         let route = try_parse_uploads(&method, path, None);
         assert!(route.is_some());
-        if let Some(Route::StartUpload { namespace, digest }) = route {
+        if let Some(Action::StartUpload { namespace, digest }) = route {
             assert_eq!(namespace, "myrepo/app");
             assert!(digest.is_none());
         } else {
@@ -875,7 +849,7 @@ mod tests {
         let path = "myrepo/app/manifests/latest";
         let route = try_find_manifests(&method, path);
         assert!(route.is_some());
-        if let Some(Route::GetManifest {
+        if let Some(Action::GetManifest {
             namespace,
             reference,
         }) = route
@@ -908,10 +882,10 @@ mod tests {
         let method = Method::GET;
         let uri: Uri = "/v2/org/team/project/app/manifests/v1.0.0".parse().unwrap();
         let route = parse(&method, &uri);
-        if let Route::GetManifest {
+        if let Some(Action::GetManifest {
             namespace,
             reference,
-        } = route
+        }) = route
         {
             assert_eq!(namespace, "org/team/project/app");
             assert_eq!(reference.to_string(), "v1.0.0");
@@ -925,7 +899,7 @@ mod tests {
         let method = Method::GET;
         let uri: Uri = "/v2/myrepo/app/blobs/sha512:1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef".parse().unwrap();
         let route = parse(&method, &uri);
-        assert!(matches!(route, Route::Unknown));
+        assert!(route.is_none());
     }
 
     #[test]
@@ -933,10 +907,10 @@ mod tests {
         let method = Method::GET;
         let uri: Uri = "/v2/myrepo/app/manifests/v1.0.0-alpha.1".parse().unwrap();
         let route = parse(&method, &uri);
-        if let Route::GetManifest {
+        if let Some(Action::GetManifest {
             namespace,
             reference,
-        } = route
+        }) = route
         {
             assert_eq!(namespace, "myrepo/app");
             assert_eq!(reference.to_string(), "v1.0.0-alpha.1");
@@ -950,7 +924,7 @@ mod tests {
         let method = Method::GET;
         let uri: Uri = "/v2/myrepo/app/manifests/v1.0.0+build.123".parse().unwrap();
         let route = parse(&method, &uri);
-        assert!(matches!(route, Route::Unknown));
+        assert!(route.is_none());
     }
 
     #[test]
@@ -958,7 +932,7 @@ mod tests {
         let method = Method::GET;
         let uri: Uri = "/".parse().unwrap();
         let route = parse(&method, &uri);
-        if let Route::UiAsset { path } = route {
+        if let Some(Action::UiAsset { path }) = route {
             assert_eq!(path, "/");
         } else {
             panic!("Expected UiAsset route");
@@ -970,7 +944,7 @@ mod tests {
         let method = Method::GET;
         let uri: Uri = "/index.html".parse().unwrap();
         let route = parse(&method, &uri);
-        if let Route::UiAsset { path } = route {
+        if let Some(Action::UiAsset { path }) = route {
             assert_eq!(path, "/index.html");
         } else {
             panic!("Expected UiAsset route");
@@ -982,7 +956,7 @@ mod tests {
         let method = Method::HEAD;
         let uri: Uri = "/style.css".parse().unwrap();
         let route = parse(&method, &uri);
-        if let Route::UiAsset { path } = route {
+        if let Some(Action::UiAsset { path }) = route {
             assert_eq!(path, "/style.css");
         } else {
             panic!("Expected UiAsset route");
@@ -994,7 +968,7 @@ mod tests {
         let method = Method::POST;
         let uri: Uri = "/index.html".parse().unwrap();
         let route = parse(&method, &uri);
-        assert!(matches!(route, Route::Unknown));
+        assert!(route.is_none());
     }
 
     #[test]
@@ -1002,7 +976,7 @@ mod tests {
         let method = Method::GET;
         let uri: Uri = "/v2/_ext/myrepo/app/_revisions".parse().unwrap();
         let route = parse(&method, &uri);
-        if let Route::ListRevisions { namespace } = route {
+        if let Some(Action::ListRevisions { namespace }) = route {
             assert_eq!(namespace, "myrepo/app");
         } else {
             panic!("Expected ListRevisions route");
@@ -1014,7 +988,7 @@ mod tests {
         let method = Method::GET;
         let uri: Uri = "/v2/_ext/library/_revisions".parse().unwrap();
         let route = parse(&method, &uri);
-        if let Route::ListRevisions { namespace } = route {
+        if let Some(Action::ListRevisions { namespace }) = route {
             assert_eq!(namespace, "library");
         } else {
             panic!("Expected ListRevisions route");
@@ -1026,7 +1000,7 @@ mod tests {
         let method = Method::GET;
         let uri: Uri = "/v2/_ext/org/team/project/_revisions".parse().unwrap();
         let route = parse(&method, &uri);
-        if let Route::ListRevisions { namespace } = route {
+        if let Some(Action::ListRevisions { namespace }) = route {
             assert_eq!(namespace, "org/team/project");
         } else {
             panic!("Expected ListRevisions route");
@@ -1038,6 +1012,6 @@ mod tests {
         let method = Method::POST;
         let uri: Uri = "/v2/_ext/myrepo/_revisions".parse().unwrap();
         let route = parse(&method, &uri);
-        assert!(matches!(route, Route::Unknown));
+        assert!(route.is_none());
     }
 }

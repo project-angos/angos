@@ -21,7 +21,7 @@ use tracing::warn;
 use crate::{
     cache::{Cache, CacheExt},
     command::server::error::Error,
-    identity::{ClientIdentity, Route},
+    identity::{Action, ClientIdentity},
     secret::Secret,
 };
 
@@ -217,30 +217,30 @@ fn set_forwarded_for_header(
     Ok(())
 }
 
-fn set_registry_action_header(route: &Route<'_>, headers: &mut HeaderMap) -> Result<(), Error> {
-    let value = build_header_value(route.action_name())?;
+fn set_registry_action_header(action: &Action, headers: &mut HeaderMap) -> Result<(), Error> {
+    let value = build_header_value(action.action_name())?;
     headers.insert(X_REGISTRY_ACTION, value);
     Ok(())
 }
 
-fn set_registry_namespace_header(route: &Route<'_>, headers: &mut HeaderMap) -> Result<(), Error> {
-    if let Some(namespace) = route.get_namespace() {
+fn set_registry_namespace_header(action: &Action, headers: &mut HeaderMap) -> Result<(), Error> {
+    if let Some(namespace) = action.get_namespace() {
         let value = build_header_value(namespace)?;
         headers.insert(X_REGISTRY_NAMESPACE, value);
     }
     Ok(())
 }
 
-fn set_registry_reference_header(route: &Route<'_>, headers: &mut HeaderMap) -> Result<(), Error> {
-    if let Some(reference) = route.get_reference() {
+fn set_registry_reference_header(action: &Action, headers: &mut HeaderMap) -> Result<(), Error> {
+    if let Some(reference) = action.get_reference() {
         let value = build_header_value(reference.as_str())?;
         headers.insert(X_REGISTRY_REFERENCE, value);
     }
     Ok(())
 }
 
-fn set_registry_digest_header(route: &Route<'_>, headers: &mut HeaderMap) -> Result<(), Error> {
-    if let Some(digest) = route.get_digest() {
+fn set_registry_digest_header(action: &Action, headers: &mut HeaderMap) -> Result<(), Error> {
+    if let Some(digest) = action.get_digest() {
         let value = build_header_value(&digest.to_string())?;
         headers.insert(X_REGISTRY_DIGEST, value);
     }
@@ -307,7 +307,7 @@ fn set_forwarded_headers(
 
 fn build_headers(
     forward_headers: &[String],
-    route: &Route<'_>,
+    action: &Action,
     identity: &ClientIdentity,
     parts: &Parts,
 ) -> Result<HeaderMap, Error> {
@@ -319,10 +319,10 @@ fn build_headers(
     set_forwarded_uri_header(parts, &mut headers)?;
     set_forwarded_for_header(identity, &mut headers)?;
 
-    set_registry_action_header(route, &mut headers)?;
-    set_registry_namespace_header(route, &mut headers)?;
-    set_registry_reference_header(route, &mut headers)?;
-    set_registry_digest_header(route, &mut headers)?;
+    set_registry_action_header(action, &mut headers)?;
+    set_registry_namespace_header(action, &mut headers)?;
+    set_registry_reference_header(action, &mut headers)?;
+    set_registry_digest_header(action, &mut headers)?;
 
     set_registry_username_header(identity, &mut headers)?;
     set_registry_identity_id_header(identity, &mut headers)?;
@@ -336,11 +336,11 @@ fn build_headers(
 
 fn build_cache_key(
     name: &str,
-    route: &Route<'_>,
+    action: &Action,
     identity: &ClientIdentity,
 ) -> Result<String, Error> {
-    let Ok(route_json) = serde_json::to_string(route) else {
-        let msg = "Failed to serialize route".to_string();
+    let Ok(action_json) = serde_json::to_string(action) else {
+        let msg = "Failed to serialize action".to_string();
         return Err(Error::Execution(msg));
     };
 
@@ -349,7 +349,7 @@ fn build_cache_key(
         return Err(Error::Execution(msg));
     };
 
-    Ok(format!("webhook:{name}:{identity_json}:{route_json}"))
+    Ok(format!("webhook:{name}:{identity_json}:{action_json}"))
 }
 
 async fn cache_retrieve(
@@ -407,11 +407,11 @@ impl WebhookAuthorizer {
 
     pub async fn authorize(
         &self,
-        route: &Route<'_>,
+        action: &Action,
         identity: &ClientIdentity,
         parts: &Parts,
     ) -> Result<bool, Error> {
-        let cache_key = build_cache_key(&self.name, route, identity);
+        let cache_key = build_cache_key(&self.name, action, identity);
 
         if let Ok(cache_key) = &cache_key
             && let Ok(Some(cached)) = cache_retrieve(&self.cache, &self.name, cache_key).await
@@ -423,7 +423,7 @@ impl WebhookAuthorizer {
             .with_label_values(&[&self.name])
             .start_timer();
 
-        let headers = build_headers(&self.config.forward_headers, route, identity, parts)?;
+        let headers = build_headers(&self.config.forward_headers, action, identity, parts)?;
         let mut request = self.client.get(&self.config.url);
         for (key, value) in &headers {
             request = request.header(key, value);
