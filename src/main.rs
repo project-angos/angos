@@ -15,8 +15,7 @@ use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitEx
 
 use crate::{
     command::{argon, scrub, server},
-    configuration::{Configuration, ObservabilityConfig},
-    watcher::ConfigWatcher,
+    configuration::{Configuration, ObservabilityConfig, watcher::ConfigWatcher},
 };
 
 mod cache;
@@ -31,7 +30,6 @@ mod oci;
 mod policy;
 mod registry;
 mod secret;
-mod watcher;
 
 fn set_tracing(config: Option<ObservabilityConfig>) -> Result<(), configuration::Error> {
     if let Some(ObservabilityConfig {

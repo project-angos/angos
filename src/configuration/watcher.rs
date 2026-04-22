@@ -10,10 +10,8 @@ use notify::{Event, EventKind, RecursiveMode, Watcher};
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 
-use crate::{
-    command::server::listeners::tls::ServerTlsConfig,
-    configuration::{Configuration, Error, ServerConfig},
-};
+use super::{Configuration, Error, ServerConfig};
+use crate::command::server::listeners::tls::ServerTlsConfig;
 
 #[derive(Debug, PartialEq)]
 enum ChangeKind {

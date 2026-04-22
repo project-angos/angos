@@ -8,6 +8,7 @@ use serde::Deserialize;
 use tracing::{info, warn};
 
 mod error;
+pub mod watcher;
 
 pub use error::Error;
 
