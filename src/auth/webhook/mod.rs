@@ -20,7 +20,7 @@ use tracing::warn;
 
 use crate::{
     cache::{Cache, CacheExt},
-    command::server::error::Error,
+    command::server::Error,
     identity::{Action, ClientIdentity},
     secret::Secret,
 };

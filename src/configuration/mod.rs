@@ -16,11 +16,9 @@ pub use error::Error;
 mod tests;
 
 use crate::{
+    auth::authenticator,
     cache,
-    command::server::{
-        auth::authenticator,
-        listeners::{insecure, tls},
-    },
+    command::server::listeners::{insecure, tls},
     event_webhook::config::EventWebhookConfig,
     policy::{AccessPolicyConfig, RetentionPolicyConfig},
     registry::{blob_store, metadata_store, repository},

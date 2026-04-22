@@ -5,7 +5,7 @@ use std::collections::HashMap;
 
 use async_trait::async_trait;
 
-use crate::command::server::error::Error;
+use crate::command::server::Error;
 
 #[async_trait]
 pub trait OidcProvider: Send + Sync {

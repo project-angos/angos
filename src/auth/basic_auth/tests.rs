@@ -6,7 +6,7 @@ use hyper::{Request, http::request::Parts};
 use serde::Deserialize;
 
 use crate::{
-    command::server::auth::{
+    auth::{
         AuthMiddleware, AuthResult, BasicAuthValidator,
         basic_auth::{Config, build_users},
     },

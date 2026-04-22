@@ -4,10 +4,8 @@ use hyper::http::request::Parts;
 use tracing::instrument;
 
 use crate::{
-    command::server::{
-        auth::{Authenticator, Authorizer},
-        error::Error,
-    },
+    auth::{Authenticator, Authorizer},
+    command::server::error::Error,
     configuration::Configuration,
     event_webhook::{dispatcher::EventDispatcher, event::Event},
     identity::{Action, ClientIdentity},

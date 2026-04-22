@@ -5,8 +5,9 @@ use regex::Regex;
 use tracing::{debug, error, info, instrument};
 
 use crate::{
+    auth::webhook::WebhookAuthorizer,
     cache::Cache,
-    command::server::{auth::webhook::WebhookAuthorizer, error::Error},
+    command::server::Error,
     configuration::Configuration,
     identity::{Action, ClientIdentity},
     oci::{Namespace, Reference},

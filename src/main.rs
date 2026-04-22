@@ -18,6 +18,7 @@ use crate::{
     configuration::{Configuration, ObservabilityConfig, watcher::ConfigWatcher},
 };
 
+mod auth;
 mod cache;
 mod circuit_breaker;
 mod command;

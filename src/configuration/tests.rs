@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use super::*;
-use crate::{command::server::auth::oidc, registry::data_store};
+use crate::{auth::oidc, registry::data_store};
 
 #[test]
 fn test_load_minimal_config() {

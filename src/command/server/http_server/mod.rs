@@ -26,9 +26,9 @@ use tracing_opentelemetry::OpenTelemetrySpanExt;
 use uuid::Uuid;
 
 use crate::{
+    auth::PeerCertificate,
     command::server::{
         ServerContext,
-        auth::PeerCertificate,
         error::Error,
         handlers,
         request_ext::{HeaderExt, IntoAsyncRead},

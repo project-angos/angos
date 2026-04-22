@@ -9,8 +9,8 @@ use super::{
     oidc::OidcValidator, webhook,
 };
 use crate::{
-    cache::Cache, command::server::error::Error, configuration::Configuration,
-    identity::ClientIdentity, metrics_provider::AUTH_ATTEMPTS,
+    cache::Cache, command::server::Error, configuration::Configuration, identity::ClientIdentity,
+    metrics_provider::AUTH_ATTEMPTS,
 };
 
 #[derive(Clone, Debug, Default, Deserialize)]
