@@ -254,7 +254,7 @@ async fn test_delete_manifest() {
 
         // Test delete manifest by tag
         registry
-            .delete_manifest(namespace, &Reference::Tag(tag.to_string()))
+            .delete_manifest(None, namespace, &Reference::Tag(tag.to_string()))
             .await
             .unwrap();
 
@@ -275,6 +275,7 @@ async fn test_delete_manifest() {
         // Test delete manifest by digest
         registry
             .delete_manifest(
+                None,
                 namespace,
                 &Reference::Digest(header_digest(&response.headers)),
             )
@@ -434,6 +435,7 @@ async fn test_handle_put_manifest() {
         let manifest_stream = Cursor::new(content.clone());
         let response = registry
             .accept_put_manifest(
+                None,
                 namespace,
                 Reference::Tag(tag.to_string()),
                 media_type.clone(),
@@ -486,7 +488,7 @@ async fn test_handle_delete_manifest() {
             .unwrap();
 
         registry
-            .delete_manifest(namespace, &Reference::Tag(tag.to_string()))
+            .delete_manifest(None, namespace, &Reference::Tag(tag.to_string()))
             .await
             .unwrap();
 
@@ -596,6 +598,7 @@ async fn test_delete_manifest_by_digest_removes_multiple_tags() {
 
         registry
             .delete_manifest(
+                None,
                 namespace,
                 &Reference::Digest(header_digest(&response.headers)),
             )
@@ -685,6 +688,7 @@ async fn test_delete_manifest_by_digest_preserves_unrelated_tags() {
 
         registry
             .delete_manifest(
+                None,
                 namespace,
                 &Reference::Digest(header_digest(&response_a.headers)),
             )
@@ -778,6 +782,7 @@ async fn test_delete_manifest_with_many_tags() {
 
         registry
             .delete_manifest(
+                None,
                 namespace,
                 &Reference::Digest(header_digest(&response_a.headers)),
             )
@@ -1004,12 +1009,13 @@ async fn test_delete_manifest_no_tags_by_digest() {
             .unwrap();
 
         registry
-            .delete_manifest(namespace, &Reference::Tag("temp".to_string()))
+            .delete_manifest(None, namespace, &Reference::Tag("temp".to_string()))
             .await
             .unwrap();
 
         registry
             .delete_manifest(
+                None,
                 namespace,
                 &Reference::Digest(header_digest(&response.headers)),
             )

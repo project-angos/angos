@@ -6,6 +6,8 @@ use crate::{
     command::server::{
         ServerContext, error::Error, handlers::build_response, response_body::ResponseBody,
     },
+    event_webhook::event::{Event, EventActor},
+    identity::ClientIdentity,
     oci::{Digest, Namespace},
     registry::StartUploadResponse,
 };
@@ -71,16 +73,20 @@ pub async fn handle_put_upload<S>(
     digest: &Digest,
     content_length: u64,
     body_reader: S,
-) -> Result<Response<ResponseBody>, Error>
+    identity: &ClientIdentity,
+) -> Result<(Response<ResponseBody>, Vec<Event>), Error>
 where
     S: AsyncRead + Unpin + Send + Sync + 'static,
 {
+    let actor = Some(EventActor::from(identity.clone()));
     let response = context
         .registry
-        .complete_upload(namespace, uuid, digest, content_length, body_reader)
+        .complete_upload(actor, namespace, uuid, digest, content_length, body_reader)
         .await?;
 
-    build_response(StatusCode::CREATED, response.headers, ResponseBody::empty())
+    let http_response =
+        build_response(StatusCode::CREATED, response.headers, ResponseBody::empty())?;
+    Ok((http_response, response.events))
 }
 
 pub async fn handle_delete_upload(

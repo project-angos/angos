@@ -35,7 +35,7 @@ use crate::{
         response_body::ResponseBody,
         router, ui,
     },
-    event_webhook::event::{Event, EventActor, EventKind},
+    event_webhook::event::Event,
     identity::{Action, ClientIdentity},
     metrics_provider::{InFlightGuard, METRICS_PROVIDER},
     oci::{Digest, Namespace, Reference},
@@ -54,10 +54,7 @@ pub async fn serve_request<S>(
     let conn = http1::Builder::new().serve_connection(
         stream,
         service_fn(move |mut request| {
-            if let Some(ref cert_data) = peer_certificate {
-                let peer_certificate = PeerCertificate(Arc::new(cert_data.clone()));
-                request.extensions_mut().insert(peer_certificate);
-            }
+            inject_peer_certificate(&mut request, peer_certificate.as_deref());
             request.extensions_mut().insert(remote_address);
             handle_request(Arc::clone(&context), request)
         }),
@@ -272,12 +269,23 @@ fn handle_unknown_route(parts: &Parts) -> Result<Response<ResponseBody>, Error> 
     }
 }
 
-fn repository_name_for(context: &ServerContext, namespace: &Namespace) -> String {
-    context
-        .registry
-        .get_repository_for_namespace(namespace)
-        .map(|r| r.name.clone())
-        .unwrap_or_default()
+/// Attaches the peer TLS certificate (if present) as a request extension so
+/// downstream authenticators can inspect it.
+fn inject_peer_certificate(request: &mut Request<Incoming>, cert_data: Option<&[u8]>) {
+    if let Some(cert_data) = cert_data {
+        let peer_certificate = PeerCertificate(Arc::new(cert_data.to_vec()));
+        request.extensions_mut().insert(peer_certificate);
+    }
+}
+
+/// Dispatches events produced by a handler through the server's event
+/// dispatcher. Handlers are responsible for building events; the HTTP layer
+/// only forwards them.
+async fn dispatch_events(context: &ServerContext, events: Vec<Event>) -> Result<(), Error> {
+    for event in events {
+        context.dispatch_event(&event).await?;
+    }
+    Ok(())
 }
 
 async fn handle_patch_upload(
@@ -324,25 +332,18 @@ async fn handle_put_upload(
         .unwrap_or(0);
     let body_stream = incoming.into_async_read();
 
-    let response = handlers::upload::handle_put_upload(
+    let (response, events) = handlers::upload::handle_put_upload(
         context,
         namespace,
         uuid,
         &digest,
         content_length,
         body_stream,
+        identity,
     )
     .await?;
 
-    let event = Event::new(
-        EventKind::BlobPush,
-        namespace.to_string(),
-        repository_name_for(context, namespace),
-    )
-    .digest(Some(digest.to_string()))
-    .actor(Some(EventActor::from(identity.clone())));
-    context.dispatch_event(&event).await?;
-
+    dispatch_events(context, events).await?;
     Ok(response)
 }
 
@@ -421,43 +422,17 @@ async fn handle_put_manifest(
 
     let body_stream = incoming.into_async_read();
 
-    let response = handlers::manifest::handle_put_manifest(
+    let (response, events) = handlers::manifest::handle_put_manifest(
         context,
         namespace,
-        reference.clone(),
+        reference,
         mime_type,
         body_stream,
+        identity,
     )
     .await?;
 
-    let digest = response
-        .headers()
-        .get("Docker-Content-Digest")
-        .and_then(|v| v.to_str().ok())
-        .map(ToString::to_string);
-
-    let repository = repository_name_for(context, namespace);
-    let actor = Some(EventActor::from(identity.clone()));
-
-    let manifest_event = Event::new(
-        EventKind::ManifestPush,
-        namespace.to_string(),
-        repository.clone(),
-    )
-    .digest(digest.clone())
-    .reference(Some(reference.to_string()))
-    .actor(actor.clone());
-    context.dispatch_event(&manifest_event).await?;
-
-    if let Reference::Tag(tag) = &reference {
-        let tag_event = Event::new(EventKind::TagCreate, namespace.to_string(), repository)
-            .digest(digest)
-            .reference(Some(reference.to_string()))
-            .tag(Some(tag.clone()))
-            .actor(actor);
-        context.dispatch_event(&tag_event).await?;
-    }
-
+    dispatch_events(context, events).await?;
     Ok(response)
 }
 
@@ -467,36 +442,10 @@ async fn handle_delete_manifest(
     reference: Reference,
     identity: &ClientIdentity,
 ) -> Result<Response<ResponseBody>, Error> {
-    let response =
-        handlers::manifest::handle_delete_manifest(context, namespace, reference.clone()).await?;
+    let (response, events) =
+        handlers::manifest::handle_delete_manifest(context, namespace, reference, identity).await?;
 
-    let repository = repository_name_for(context, namespace);
-    let actor = Some(EventActor::from(identity.clone()));
-
-    let digest = match &reference {
-        Reference::Digest(d) => Some(d.to_string()),
-        Reference::Tag(_) => None,
-    };
-
-    let delete_event = Event::new(
-        EventKind::ManifestDelete,
-        namespace.to_string(),
-        repository.clone(),
-    )
-    .digest(digest.clone())
-    .reference(Some(reference.to_string()))
-    .actor(actor.clone());
-    context.dispatch_event(&delete_event).await?;
-
-    if let Reference::Tag(tag) = &reference {
-        let tag_event = Event::new(EventKind::TagDelete, namespace.to_string(), repository)
-            .digest(digest)
-            .reference(Some(reference.to_string()))
-            .tag(Some(tag.clone()))
-            .actor(actor);
-        context.dispatch_event(&tag_event).await?;
-    }
-
+    dispatch_events(context, events).await?;
     Ok(response)
 }
 

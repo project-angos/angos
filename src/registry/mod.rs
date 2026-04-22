@@ -175,6 +175,15 @@ impl Registry {
             .map(|(_, repository)| repository)
             .ok_or(Error::NameUnknown)
     }
+
+    /// Resolves the configured repository name for a namespace, or empty string
+    /// if none matches. Used when constructing events where the event's
+    /// `repository` field should reflect the configured repository scope.
+    pub(crate) fn repository_name_for(&self, namespace: &Namespace) -> String {
+        self.get_repository_for_namespace(namespace)
+            .map(|r| r.name.clone())
+            .unwrap_or_default()
+    }
 }
 
 #[cfg(test)]

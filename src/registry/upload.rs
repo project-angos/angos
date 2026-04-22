@@ -6,6 +6,7 @@ use tracing::{instrument, warn};
 use uuid::Uuid;
 
 use crate::{
+    event_webhook::event::{Event, EventActor, EventKind},
     oci::{Digest, Namespace},
     registry::{DOCKER_CONTENT_DIGEST, DOCKER_UPLOAD_UUID, Error, Registry, blob_store},
 };
@@ -29,6 +30,7 @@ pub struct PatchUploadResponse {
 
 pub struct CompleteUploadResponse {
     pub headers: HashMap<&'static str, String>,
+    pub events: Vec<Event>,
 }
 
 /// Headers for a completed-blob response (used by `StartUpload` when the digest
@@ -148,9 +150,10 @@ impl Registry {
         })
     }
 
-    #[instrument(skip(stream))]
+    #[instrument(skip(stream, actor))]
     pub async fn complete_upload<S>(
         &self,
+        actor: Option<EventActor>,
         namespace: &Namespace,
         session_id: Uuid,
         digest: &Digest,
@@ -197,8 +200,14 @@ impl Registry {
             .delete_upload(namespace, &session_key)
             .await?;
 
+        let repository = self.repository_name_for(namespace);
+        let event = Event::new(EventKind::BlobPush, namespace.to_string(), repository)
+            .digest(Some(digest.to_string()))
+            .actor(actor);
+
         Ok(CompleteUploadResponse {
             headers: blob_location_headers(namespace, digest),
+            events: vec![event],
         })
     }
 
@@ -364,7 +373,7 @@ mod tests {
 
             let empty_stream = Cursor::new(Vec::new());
             let response = registry
-                .complete_upload(namespace, session_id, &upload_digest, 0, empty_stream)
+                .complete_upload(None, namespace, session_id, &upload_digest, 0, empty_stream)
                 .await
                 .unwrap();
 
@@ -372,6 +381,11 @@ mod tests {
                 response.headers[DOCKER_CONTENT_DIGEST],
                 upload_digest.to_string()
             );
+            assert_eq!(response.events.len(), 1);
+            assert!(matches!(
+                response.events[0].kind,
+                crate::event_webhook::event::EventKind::BlobPush
+            ));
 
             let stored_content = registry.blob_store.read_blob(&upload_digest).await.unwrap();
             assert_eq!(stored_content, content);
@@ -504,7 +518,7 @@ mod tests {
 
             let empty_stream = Cursor::new(Vec::new());
             let result = registry
-                .complete_upload(namespace, session_id, &wrong_digest, 0, empty_stream)
+                .complete_upload(None, namespace, session_id, &wrong_digest, 0, empty_stream)
                 .await;
 
             assert!(matches!(result, Err(Error::DigestInvalid)));
@@ -637,7 +651,7 @@ mod tests {
 
         let empty_stream = Cursor::new(Vec::new());
         let result = registry
-            .complete_upload(namespace, session_id, &upload_digest, 0, empty_stream)
+            .complete_upload(None, namespace, session_id, &upload_digest, 0, empty_stream)
             .await;
 
         assert!(
