@@ -7,21 +7,18 @@ use wiremock::{
 };
 
 use crate::{
-    cache,
-    command::server::{
-        Error,
-        auth::webhook::{
-            Config, WebhookAuth, WebhookAuthorizer, build_header_name, build_header_value,
-            build_headers, load_certificate_bundle, load_file, load_identity,
-            set_forwarded_for_header, set_forwarded_headers, set_forwarded_host_header,
-            set_forwarded_method_header, set_forwarded_proto_header, set_forwarded_uri_header,
-            set_registry_action_header, set_registry_certificate_cn_header,
-            set_registry_certificate_o_header, set_registry_digest_header,
-            set_registry_identity_id_header, set_registry_namespace_header,
-            set_registry_reference_header, set_registry_username_header,
-        },
+    auth::webhook::{
+        Config, WebhookAuth, WebhookAuthorizer, build_header_name, build_header_value,
+        build_headers, load_certificate_bundle, load_file, load_identity, set_forwarded_for_header,
+        set_forwarded_headers, set_forwarded_host_header, set_forwarded_method_header,
+        set_forwarded_proto_header, set_forwarded_uri_header, set_registry_action_header,
+        set_registry_certificate_cn_header, set_registry_certificate_o_header,
+        set_registry_digest_header, set_registry_identity_id_header, set_registry_namespace_header,
+        set_registry_reference_header, set_registry_username_header,
     },
-    identity::{ClientIdentity, Route},
+    cache,
+    command::server::Error,
+    identity::{Action, ClientIdentity},
     oci::{Digest, Namespace, Reference},
     secret::Secret,
 };
@@ -368,49 +365,49 @@ fn test_set_forwarded_for_header() {
 
 #[test]
 fn test_set_registry_action_header() {
-    let route = Route::ApiVersion;
+    let action = Action::ApiVersion;
     let mut headers = HeaderMap::new();
 
-    assert!(set_registry_action_header(&route, &mut headers).is_ok());
+    assert!(set_registry_action_header(&action, &mut headers).is_ok());
     assert_eq!(headers.get("X-Registry-Action").unwrap(), "get-api-version");
 }
 
 #[test]
 fn test_set_registry_namespace_header() {
-    let route = Route::GetManifest {
+    let action = Action::GetManifest {
         namespace: Namespace::new("test-namespace").unwrap(),
         reference: Reference::Tag("latest".to_string()),
     };
     let mut headers = HeaderMap::new();
 
-    assert!(set_registry_namespace_header(&route, &mut headers).is_ok());
+    assert!(set_registry_namespace_header(&action, &mut headers).is_ok());
     assert_eq!(
         headers.get("X-Registry-Namespace").unwrap(),
         "test-namespace"
     );
 
-    let route = Route::ApiVersion;
+    let action = Action::ApiVersion;
     let mut headers = HeaderMap::new();
 
-    assert!(set_registry_namespace_header(&route, &mut headers).is_ok());
+    assert!(set_registry_namespace_header(&action, &mut headers).is_ok());
     assert!(headers.get("X-Registry-Namespace").is_none());
 }
 
 #[test]
 fn test_set_registry_reference_header() {
-    let route = Route::GetManifest {
+    let action = Action::GetManifest {
         namespace: Namespace::new("test-namespace").unwrap(),
         reference: Reference::Tag("v1.0.0".to_string()),
     };
     let mut headers = HeaderMap::new();
 
-    assert!(set_registry_reference_header(&route, &mut headers).is_ok());
+    assert!(set_registry_reference_header(&action, &mut headers).is_ok());
     assert_eq!(headers.get("X-Registry-Reference").unwrap(), "v1.0.0");
 
-    let route = Route::ApiVersion;
+    let action = Action::ApiVersion;
     let mut headers = HeaderMap::new();
 
-    assert!(set_registry_reference_header(&route, &mut headers).is_ok());
+    assert!(set_registry_reference_header(&action, &mut headers).is_ok());
     assert!(headers.get("X-Registry-Reference").is_none());
 }
 
@@ -418,22 +415,22 @@ fn test_set_registry_reference_header() {
 fn test_set_registry_digest_header() {
     let digest = "sha256:1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef";
     let digest = Digest::from_str(digest).unwrap();
-    let route = Route::DeleteBlob {
+    let action = Action::DeleteBlob {
         namespace: Namespace::new("test-namespace").unwrap(),
         digest: digest.clone(),
     };
     let mut headers = HeaderMap::new();
 
-    assert!(set_registry_digest_header(&route, &mut headers).is_ok());
+    assert!(set_registry_digest_header(&action, &mut headers).is_ok());
     assert_eq!(
         headers.get("X-Registry-Digest").unwrap(),
         &digest.to_string()
     );
 
-    let route = Route::ApiVersion;
+    let action = Action::ApiVersion;
     let mut headers = HeaderMap::new();
 
-    assert!(set_registry_digest_header(&route, &mut headers).is_ok());
+    assert!(set_registry_digest_header(&action, &mut headers).is_ok());
     assert!(headers.get("X-Registry-Digest").is_none());
 }
 
@@ -550,7 +547,7 @@ fn test_build_headers() {
 
     let (parts, ()) = request.into_parts();
 
-    let route = Route::GetManifest {
+    let action = Action::GetManifest {
         namespace: Namespace::new("test-namespace").unwrap(),
         reference: Reference::Tag("latest".to_string()),
     };
@@ -561,7 +558,7 @@ fn test_build_headers() {
 
     let forward_headers = vec!["X-Custom-Header".to_string()];
 
-    let headers = build_headers(&forward_headers, &route, &identity, &parts);
+    let headers = build_headers(&forward_headers, &action, &identity, &parts);
 
     assert!(headers.is_ok());
     let headers = headers.unwrap();
@@ -680,7 +677,7 @@ async fn test_authorize_success() {
     let cache = cache::Config::Memory.to_backend().unwrap();
     let webhook = WebhookAuthorizer::new("test".to_string(), config, cache).unwrap();
 
-    let route = Route::ApiVersion;
+    let action = Action::ApiVersion;
     let identity = ClientIdentity::new(None);
 
     let request = Builder::new()
@@ -689,7 +686,10 @@ async fn test_authorize_success() {
         .unwrap();
     let (parts, ()) = request.into_parts();
 
-    assert_eq!(webhook.authorize(&route, &identity, &parts).await, Ok(true));
+    assert_eq!(
+        webhook.authorize(&action, &identity, &parts).await,
+        Ok(true)
+    );
 }
 
 #[tokio::test]
@@ -707,7 +707,7 @@ async fn test_authorize_denied() {
     let cache = cache::Config::Memory.to_backend().unwrap();
     let webhook = WebhookAuthorizer::new("test".to_string(), config, cache).unwrap();
 
-    let route = Route::ApiVersion;
+    let action = Action::ApiVersion;
     let identity = ClientIdentity::new(None);
 
     let request = Builder::new()
@@ -717,7 +717,7 @@ async fn test_authorize_denied() {
     let (parts, ()) = request.into_parts();
 
     assert_eq!(
-        webhook.authorize(&route, &identity, &parts).await,
+        webhook.authorize(&action, &identity, &parts).await,
         Ok(false)
     );
 }
@@ -740,7 +740,7 @@ async fn test_authorize_with_bearer_token() {
     let cache = cache::Config::Memory.to_backend().unwrap();
     let webhook = WebhookAuthorizer::new("test".to_string(), config, cache).unwrap();
 
-    let route = Route::ApiVersion;
+    let action = Action::ApiVersion;
     let identity = ClientIdentity::new(None);
 
     let request = Builder::new()
@@ -749,7 +749,10 @@ async fn test_authorize_with_bearer_token() {
         .unwrap();
     let (parts, ()) = request.into_parts();
 
-    assert_eq!(webhook.authorize(&route, &identity, &parts).await, Ok(true));
+    assert_eq!(
+        webhook.authorize(&action, &identity, &parts).await,
+        Ok(true)
+    );
 }
 
 #[tokio::test]
@@ -771,7 +774,7 @@ async fn test_authorize_with_basic_auth() {
     let cache = cache::Config::Memory.to_backend().unwrap();
     let webhook = WebhookAuthorizer::new("test".to_string(), config, cache).unwrap();
 
-    let route = Route::ApiVersion;
+    let action = Action::ApiVersion;
     let identity = ClientIdentity::new(None);
 
     let request = Builder::new()
@@ -780,7 +783,10 @@ async fn test_authorize_with_basic_auth() {
         .unwrap();
     let (parts, ()) = request.into_parts();
 
-    assert_eq!(webhook.authorize(&route, &identity, &parts).await, Ok(true));
+    assert_eq!(
+        webhook.authorize(&action, &identity, &parts).await,
+        Ok(true)
+    );
 }
 
 #[tokio::test]
@@ -798,7 +804,7 @@ async fn test_authorize_sends_correct_headers() {
     let cache = cache::Config::Memory.to_backend().unwrap();
     let webhook = WebhookAuthorizer::new("test".to_string(), config, cache).unwrap();
 
-    let route = Route::ApiVersion;
+    let action = Action::ApiVersion;
     let identity = ClientIdentity::new(None);
 
     let request = Builder::new()
@@ -808,7 +814,10 @@ async fn test_authorize_sends_correct_headers() {
         .unwrap();
     let (parts, ()) = request.into_parts();
 
-    assert_eq!(webhook.authorize(&route, &identity, &parts).await, Ok(true));
+    assert_eq!(
+        webhook.authorize(&action, &identity, &parts).await,
+        Ok(true)
+    );
 }
 
 #[tokio::test]
@@ -827,7 +836,7 @@ async fn test_authorize_uses_cache() {
     let cache = cache::Config::Memory.to_backend().unwrap();
     let webhook = WebhookAuthorizer::new("test".to_string(), config, cache).unwrap();
 
-    let route = Route::ApiVersion;
+    let action = Action::ApiVersion;
     let identity = ClientIdentity::new(None);
 
     let request = Builder::new()
@@ -836,8 +845,14 @@ async fn test_authorize_uses_cache() {
         .unwrap();
     let (parts, ()) = request.into_parts();
 
-    assert_eq!(webhook.authorize(&route, &identity, &parts).await, Ok(true));
-    assert_eq!(webhook.authorize(&route, &identity, &parts).await, Ok(true));
+    assert_eq!(
+        webhook.authorize(&action, &identity, &parts).await,
+        Ok(true)
+    );
+    assert_eq!(
+        webhook.authorize(&action, &identity, &parts).await,
+        Ok(true)
+    );
 }
 
 #[tokio::test]
@@ -848,7 +863,7 @@ async fn test_authorize_network_error_denies() {
     let cache = cache::Config::Memory.to_backend().unwrap();
     let webhook = WebhookAuthorizer::new("test".to_string(), config, cache).unwrap();
 
-    let route = Route::ApiVersion;
+    let action = Action::ApiVersion;
     let identity = ClientIdentity::new(None);
 
     let request = Builder::new()
@@ -858,7 +873,7 @@ async fn test_authorize_network_error_denies() {
     let (parts, ()) = request.into_parts();
 
     assert_eq!(
-        webhook.authorize(&route, &identity, &parts).await,
+        webhook.authorize(&action, &identity, &parts).await,
         Ok(false)
     );
 }

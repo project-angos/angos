@@ -19,14 +19,13 @@ use crate::{
     cache,
     cache::Cache,
     command::server::error::Error,
-    configuration::{Configuration, ServerConfig},
+    configuration::{Configuration, ServerConfig, watcher::ConfigNotifier},
     registry::{
         Registry, RegistryConfig, Repository, blob_store,
         blob_store::BlobStore,
         metadata_store::{ConditionalCapabilities, MetadataStore, MetadataStoreConfig},
         repository,
     },
-    watcher::ConfigNotifier,
 };
 
 pub enum ServiceListener {

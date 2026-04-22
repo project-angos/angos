@@ -3,9 +3,9 @@ use std::collections::HashMap;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
-use crate::command::server::{
+use crate::{
     auth::oidc::{OidcProvider, provider::generic},
-    error::Error,
+    command::server::Error,
 };
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -103,7 +103,7 @@ impl OidcProvider for Provider {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::command::server::error::Error;
+    use crate::command::server::Error;
 
     #[test]
     fn test_config_deserialize_minimal() {

@@ -5,6 +5,8 @@ use crate::{
     command::server::{
         ServerContext, error::Error, handlers::build_response, response_body::ResponseBody,
     },
+    event_webhook::event::{Event, EventActor},
+    identity::ClientIdentity,
     oci::{Namespace, Reference},
     registry::GetManifestResponse,
 };
@@ -61,29 +63,36 @@ pub async fn handle_put_manifest<S>(
     reference: Reference,
     mime_type: String,
     body_stream: S,
-) -> Result<Response<ResponseBody>, Error>
+    identity: &ClientIdentity,
+) -> Result<(Response<ResponseBody>, Vec<Event>), Error>
 where
     S: AsyncRead + Unpin + Send,
 {
+    let actor = Some(EventActor::from(identity.clone()));
     let response = context
         .registry
-        .accept_put_manifest(namespace, reference, mime_type, body_stream)
+        .accept_put_manifest(actor, namespace, reference, mime_type, body_stream)
         .await?;
 
-    build_response(StatusCode::CREATED, response.headers, ResponseBody::empty())
+    let http_response =
+        build_response(StatusCode::CREATED, response.headers, ResponseBody::empty())?;
+    Ok((http_response, response.events))
 }
 
 pub async fn handle_delete_manifest(
     context: &ServerContext,
     namespace: &Namespace,
     reference: Reference,
-) -> Result<Response<ResponseBody>, Error> {
-    context
+    identity: &ClientIdentity,
+) -> Result<(Response<ResponseBody>, Vec<Event>), Error> {
+    let actor = Some(EventActor::from(identity.clone()));
+    let response = context
         .registry
-        .delete_manifest(namespace, &reference)
+        .delete_manifest(actor, namespace, &reference)
         .await?;
 
-    Ok(Response::builder()
+    let http_response = Response::builder()
         .status(StatusCode::ACCEPTED)
-        .body(ResponseBody::empty())?)
+        .body(ResponseBody::empty())?;
+    Ok((http_response, response.events))
 }

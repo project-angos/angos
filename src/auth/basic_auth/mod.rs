@@ -11,7 +11,7 @@ use tracing::{debug, instrument, warn};
 
 use super::{AuthMiddleware, AuthResult};
 use crate::{
-    command::server::{error::Error, request_ext::HeaderExt},
+    command::server::{Error, request_ext::HeaderExt},
     identity::ClientIdentity,
 };
 

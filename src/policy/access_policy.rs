@@ -19,11 +19,8 @@ use cel_interpreter::{Context, Program, Value};
 use serde::Deserialize;
 use tracing::{debug, warn};
 
-use super::Error;
-use crate::{
-    cel,
-    identity::{ClientIdentity, Route},
-};
+use super::{Error, cel};
+use crate::identity::{Action, ClientIdentity};
 
 /// Configuration for access control policies.
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -57,22 +54,22 @@ impl AccessPolicy {
         })
     }
 
-    /// Evaluates the access policy for a given request and identity.
+    /// Evaluates the access policy for a given action and identity.
     ///
     /// # Arguments
-    /// * `request` - The validation info containing action and resource information
+    /// * `action` - The domain action representing the registry operation
     /// * `identity` - The client identity containing authentication information
     ///
     /// # Returns
     /// * `Ok(true)` if access should be granted
     /// * `Ok(false)` if access should be denied
     /// * `Err` if policy evaluation fails
-    pub fn evaluate(&self, request: &Route, identity: &ClientIdentity) -> Result<bool, Error> {
+    pub fn evaluate(&self, action: &Action, identity: &ClientIdentity) -> Result<bool, Error> {
         if self.rules.is_empty() {
             return Ok(self.default_allow);
         }
 
-        let context = Self::build_context(request, identity)?;
+        let context = Self::build_context(action, identity)?;
         let rule_kind = if self.default_allow { "deny" } else { "allow" };
 
         for (index, rule) in self.rules.iter().enumerate() {
@@ -100,12 +97,12 @@ impl AccessPolicy {
     }
 
     fn build_context<'a>(
-        request: &'a Route,
+        action: &'a Action,
         identity: &'a ClientIdentity,
     ) -> Result<Context<'a>, Error> {
         let mut context = Context::default();
         context
-            .add_variable("request", request)
+            .add_variable("request", action)
             .map_err(|e| Error::Initialization(e.to_string()))?;
         context
             .add_variable("identity", identity)
@@ -125,10 +122,10 @@ mod tests {
             rules: vec![],
         };
         let policy = AccessPolicy::new(&config).unwrap();
-        let request = Route::ApiVersion;
+        let action = Action::ApiVersion;
         let identity = ClientIdentity::default();
 
-        let result = policy.evaluate(&request, &identity);
+        let result = policy.evaluate(&action, &identity);
         assert!(result.unwrap());
     }
 
@@ -139,10 +136,10 @@ mod tests {
             rules: vec![],
         };
         let policy = AccessPolicy::new(&config).unwrap();
-        let request = Route::ApiVersion;
+        let action = Action::ApiVersion;
         let identity = ClientIdentity::default();
 
-        let result = policy.evaluate(&request, &identity);
+        let result = policy.evaluate(&action, &identity);
         assert!(!result.unwrap());
     }
 
@@ -154,13 +151,13 @@ mod tests {
         };
         let policy = AccessPolicy::new(&config).unwrap();
 
-        let request = Route::ApiVersion;
+        let action = Action::ApiVersion;
         let identity = ClientIdentity {
             username: Some("forbidden".to_string()),
             ..ClientIdentity::default()
         };
 
-        let result = policy.evaluate(&request, &identity);
+        let result = policy.evaluate(&action, &identity);
         assert!(!result.unwrap());
 
         let identity = ClientIdentity {
@@ -168,7 +165,7 @@ mod tests {
             ..ClientIdentity::default()
         };
 
-        let result = policy.evaluate(&request, &identity);
+        let result = policy.evaluate(&action, &identity);
         assert!(result.unwrap());
     }
 
@@ -180,13 +177,13 @@ mod tests {
         };
         let policy = AccessPolicy::new(&config).unwrap();
 
-        let request = Route::ApiVersion;
+        let action = Action::ApiVersion;
         let identity = ClientIdentity {
             username: Some("admin".to_string()),
             ..ClientIdentity::default()
         };
 
-        let result = policy.evaluate(&request, &identity);
+        let result = policy.evaluate(&action, &identity);
         assert!(result.unwrap());
 
         let identity = ClientIdentity {
@@ -194,7 +191,7 @@ mod tests {
             ..ClientIdentity::default()
         };
 
-        let result = policy.evaluate(&request, &identity);
+        let result = policy.evaluate(&action, &identity);
         assert!(!result.unwrap());
     }
 }

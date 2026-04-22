@@ -4,13 +4,11 @@ use hyper::http::request::Parts;
 use tracing::instrument;
 
 use crate::{
-    command::server::{
-        auth::{Authenticator, Authorizer},
-        error::Error,
-    },
+    auth::{Authenticator, Authorizer},
+    command::server::error::Error,
     configuration::Configuration,
     event_webhook::{dispatcher::EventDispatcher, event::Event},
-    identity::{ClientIdentity, Route},
+    identity::{Action, ClientIdentity},
     oci::{Namespace, Reference},
     registry::Registry,
 };
@@ -78,7 +76,7 @@ impl ServerContext {
     #[instrument(skip(self, request))]
     pub async fn authorize_request(
         &self,
-        route: &Route<'_>,
+        route: &Action,
         identity: &ClientIdentity,
         request: &Parts,
     ) -> Result<(), Error> {

@@ -5,10 +5,11 @@ use regex::Regex;
 use tracing::{debug, error, info, instrument};
 
 use crate::{
+    auth::webhook::WebhookAuthorizer,
     cache::Cache,
-    command::server::{auth::webhook::WebhookAuthorizer, error::Error},
+    command::server::Error,
     configuration::Configuration,
-    identity::{ClientIdentity, Route},
+    identity::{Action, ClientIdentity},
     oci::{Namespace, Reference},
     registry::{AccessPolicy, Registry},
 };
@@ -112,19 +113,19 @@ impl Authorizer {
     #[instrument(skip(self, request, registry))]
     pub async fn authorize_request(
         &self,
-        route: &Route<'_>,
+        action: &Action,
         identity: &ClientIdentity,
         request: &Parts,
         registry: &Registry,
     ) -> Result<(), Error> {
         debug!("Evaluating global access policy");
-        if self.global_access_policy.evaluate(route, identity) != Ok(true) {
+        if self.global_access_policy.evaluate(action, identity) != Ok(true) {
             log_denial("global policy", identity);
             return Err(Error::Unauthorized(ACCESS_DENIED.to_string()));
         }
 
-        if let Some(namespace) = route.get_namespace() {
-            self.authorize_namespace_request(namespace, route, identity, request, registry)
+        if let Some(namespace) = action.get_namespace() {
+            self.authorize_namespace_request(namespace, action, identity, request, registry)
                 .await?;
         } else if let Some(webhook_name) = &self.global_authorization_webhook {
             debug!("Evaluating global webhook authorization: {}", webhook_name);
@@ -134,7 +135,7 @@ impl Authorizer {
                 .get(webhook_name)
                 .ok_or_else(|| Error::Execution(format!("Webhook '{webhook_name}' not found")))?;
 
-            let allowed = webhook.authorize(route, identity, request).await?;
+            let allowed = webhook.authorize(action, identity, request).await?;
             if !allowed {
                 log_denial(&format!("global webhook '{webhook_name}'"), identity);
                 return Err(Error::Unauthorized(ACCESS_DENIED.to_string()));
@@ -147,7 +148,7 @@ impl Authorizer {
     async fn authorize_namespace_request(
         &self,
         namespace: &Namespace,
-        route: &Route<'_>,
+        action: &Action,
         identity: &ClientIdentity,
         request: &Parts,
         registry: &Registry,
@@ -169,7 +170,7 @@ impl Authorizer {
         })?;
 
         if let Some(ref access_policy) = auth_repo.access_policy
-            && access_policy.evaluate(route, identity) != Ok(true)
+            && access_policy.evaluate(action, identity) != Ok(true)
         {
             log_denial(
                 &format!("repository '{}' policy", repository.name),
@@ -178,10 +179,10 @@ impl Authorizer {
             return Err(Error::Unauthorized(ACCESS_DENIED.to_string()));
         }
 
-        if let Route::PutManifest {
+        if let Action::PutManifest {
             reference: Reference::Tag(tag),
             ..
-        } = route
+        } = action
             && !self.is_tag_mutable(auth_repo, tag)
         {
             let msg = format!("Tag '{tag}' is immutable and cannot be overwritten");
@@ -202,14 +203,14 @@ impl Authorizer {
                 .get(webhook_name)
                 .ok_or_else(|| Error::Execution(format!("Webhook '{webhook_name}' not found")))?;
 
-            let allowed = webhook.authorize(route, identity, request).await?;
+            let allowed = webhook.authorize(action, identity, request).await?;
             if !allowed {
                 log_denial(&format!("webhook '{webhook_name}'"), identity);
                 return Err(Error::Unauthorized(ACCESS_DENIED.to_string()));
             }
         }
 
-        if repository.is_pull_through() && route.is_push() {
+        if repository.is_pull_through() && action.is_push() {
             return Err(Error::Unauthorized(
                 "Push operations are not supported on pull-through cache repositories".to_string(),
             ));
@@ -742,7 +743,7 @@ mod tests {
 
         let namespace = Namespace::new("docker-io/library/nginx").unwrap();
         let reference = Reference::from_str("latest").unwrap();
-        let route = Route::DeleteManifest {
+        let route = Action::DeleteManifest {
             namespace,
             reference,
         };
@@ -779,7 +780,7 @@ mod tests {
             "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
         )
         .unwrap();
-        let route = Route::DeleteBlob { namespace, digest };
+        let route = Action::DeleteBlob { namespace, digest };
         let identity = ClientIdentity::new(None);
         let (parts, ()) = hyper::Request::builder()
             .uri("/v2/")
@@ -817,7 +818,7 @@ mod tests {
 
         let namespace = Namespace::new("docker-io/library/nginx").unwrap();
         let reference = Reference::from_str("latest").unwrap();
-        let put_manifest_route = Route::PutManifest {
+        let put_manifest_route = Action::PutManifest {
             namespace: namespace.clone(),
             reference,
         };
@@ -829,7 +830,7 @@ mod tests {
             "PutManifest should be blocked on pull-through cache repositories"
         );
 
-        let start_upload_route = Route::StartUpload {
+        let start_upload_route = Action::StartUpload {
             namespace,
             digest: None,
         };

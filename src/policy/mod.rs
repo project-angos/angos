@@ -1,4 +1,5 @@
 mod access_policy;
+mod cel;
 mod error;
 mod retention_policy;
 

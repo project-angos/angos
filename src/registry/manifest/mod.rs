@@ -6,6 +6,7 @@ use tokio::io::{AsyncRead, AsyncReadExt};
 use tracing::{error, instrument, warn};
 
 use crate::{
+    event_webhook::event::{Event, EventActor, EventKind},
     oci::{Digest, Manifest, Namespace, Reference},
     registry::{
         DOCKER_CONTENT_DIGEST, Error, OCI_SUBJECT, Registry, Repository,
@@ -41,6 +42,11 @@ pub struct HeadManifestResponse {
 
 pub struct PutManifestResponse {
     pub headers: HashMap<&'static str, String>,
+    pub events: Vec<Event>,
+}
+
+pub struct DeleteManifestResponse {
+    pub events: Vec<Event>,
 }
 
 fn head_manifest_headers(meta: &ManifestMeta) -> HashMap<&'static str, String> {
@@ -431,15 +437,17 @@ impl Registry {
 
         Ok(PutManifestResponse {
             headers: put_manifest_headers(namespace, reference, &digest, subject.as_ref()),
+            events: Vec::new(),
         })
     }
 
-    #[instrument]
+    #[instrument(skip(actor))]
     pub async fn delete_manifest(
         &self,
+        actor: Option<EventActor>,
         namespace: &Namespace,
         reference: &Reference,
-    ) -> Result<(), Error> {
+    ) -> Result<DeleteManifestResponse, Error> {
         let mut tx = self.metadata_store.begin_transaction(namespace);
 
         match reference {
@@ -517,7 +525,36 @@ impl Registry {
         }
 
         tx.commit().await?;
-        Ok(())
+
+        let repository = self.repository_name_for(namespace);
+        let digest_str = match reference {
+            Reference::Digest(d) => Some(d.to_string()),
+            Reference::Tag(_) => None,
+        };
+
+        let mut events = Vec::new();
+        events.push(
+            Event::new(
+                EventKind::ManifestDelete,
+                namespace.to_string(),
+                repository.clone(),
+            )
+            .digest(digest_str.clone())
+            .reference(Some(reference.to_string()))
+            .actor(actor.clone()),
+        );
+
+        if let Reference::Tag(tag) = reference {
+            events.push(
+                Event::new(EventKind::TagDelete, namespace.to_string(), repository)
+                    .digest(digest_str)
+                    .reference(Some(reference.to_string()))
+                    .tag(Some(tag.clone()))
+                    .actor(actor),
+            );
+        }
+
+        Ok(DeleteManifestResponse { events })
     }
 
     /// Resolves a manifest GET request to either a presigned redirect URL or the manifest body.
@@ -598,9 +635,10 @@ impl Registry {
     }
 
     /// Reads the body stream, calls `put_manifest`, and returns the domain response.
-    #[instrument(skip(self, body_stream))]
+    #[instrument(skip(self, body_stream, actor))]
     pub async fn accept_put_manifest<S>(
         &self,
+        actor: Option<EventActor>,
         namespace: &Namespace,
         reference: Reference,
         mime_type: String,
@@ -619,8 +657,35 @@ impl Registry {
             })?;
         let request_body = request_body.into_bytes();
 
-        self.put_manifest(namespace, &reference, Some(&mime_type), &request_body)
-            .await
+        let mut response = self
+            .put_manifest(namespace, &reference, Some(&mime_type), &request_body)
+            .await?;
+
+        let repository = self.repository_name_for(namespace);
+        let digest_str = response.headers.get(DOCKER_CONTENT_DIGEST).cloned();
+
+        response.events.push(
+            Event::new(
+                EventKind::ManifestPush,
+                namespace.to_string(),
+                repository.clone(),
+            )
+            .digest(digest_str.clone())
+            .reference(Some(reference.to_string()))
+            .actor(actor.clone()),
+        );
+
+        if let Reference::Tag(tag) = &reference {
+            response.events.push(
+                Event::new(EventKind::TagCreate, namespace.to_string(), repository)
+                    .digest(digest_str)
+                    .reference(Some(reference.to_string()))
+                    .tag(Some(tag.clone()))
+                    .actor(actor),
+            );
+        }
+
+        Ok(response)
     }
 }
 

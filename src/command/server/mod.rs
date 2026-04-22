@@ -1,6 +1,5 @@
 mod command;
 
-pub mod auth;
 mod error;
 pub mod handlers;
 pub mod http_server;

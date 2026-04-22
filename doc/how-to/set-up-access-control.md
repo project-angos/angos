@@ -311,7 +311,6 @@ RUST_LOG=angos::registry::access_policy=debug \
 | `list-uploads`      | Extension: list uploads in progress  |
 | `ui-asset`          | UI static assets                     |
 | `ui-config`         | UI configuration                     |
-| `unknown`           | Unrecognized request                 |
 
 - [CEL Expressions Reference](../reference/cel-expressions.md) - All variables and functions
 - [Configuration Reference](../reference/configuration.md) - Policy configuration options

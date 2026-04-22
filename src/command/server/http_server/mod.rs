@@ -26,17 +26,17 @@ use tracing_opentelemetry::OpenTelemetrySpanExt;
 use uuid::Uuid;
 
 use crate::{
+    auth::PeerCertificate,
     command::server::{
         ServerContext,
-        auth::PeerCertificate,
         error::Error,
         handlers,
         request_ext::{HeaderExt, IntoAsyncRead},
         response_body::ResponseBody,
         router, ui,
     },
-    event_webhook::event::{Event, EventActor, EventKind},
-    identity::{ClientIdentity, Route},
+    event_webhook::event::Event,
+    identity::{Action, ClientIdentity},
     metrics_provider::{InFlightGuard, METRICS_PROVIDER},
     oci::{Digest, Namespace, Reference},
     registry::metadata_store::ConditionalCapabilities,
@@ -54,10 +54,7 @@ pub async fn serve_request<S>(
     let conn = http1::Builder::new().serve_connection(
         stream,
         service_fn(move |mut request| {
-            if let Some(ref cert_data) = peer_certificate {
-                let peer_certificate = PeerCertificate(Arc::new(cert_data.clone()));
-                request.extensions_mut().insert(peer_certificate);
-            }
+            inject_peer_certificate(&mut request, peer_certificate.as_deref());
             request.extensions_mut().insert(remote_address);
             handle_request(Arc::clone(&context), request)
         }),
@@ -92,7 +89,9 @@ async fn handle_request(
     let start_time = Instant::now();
     let method = request.method().to_owned();
     let path = request.uri().path().to_owned();
-    let route_action = router::parse(request.method(), request.uri()).action_name();
+    let route_action = router::parse(request.method(), request.uri())
+        .as_ref()
+        .map_or("unknown", Action::action_name);
 
     let trace_id = trace_id_of(&Span::current());
 
@@ -150,16 +149,18 @@ async fn router(
     req: Request<Incoming>,
 ) -> Result<Response<ResponseBody>, Error> {
     let (parts, incoming) = req.into_parts();
-    let route = router::parse(&parts.method, &parts.uri);
+    let Some(action) = router::parse(&parts.method, &parts.uri) else {
+        return handle_unknown_route(&parts);
+    };
 
-    let identity = authenticate_and_authorize(&context, &route, &parts).await?;
-    dispatch_route(&context, route, &parts, incoming, &identity).await
+    let identity = authenticate_and_authorize(&context, &action, &parts).await?;
+    dispatch_route(&context, action, &parts, incoming, &identity).await
 }
 
 #[instrument(skip(context, parts))]
 async fn authenticate_and_authorize(
     context: &ServerContext,
-    route: &Route<'_>,
+    route: &Action,
     parts: &Parts,
 ) -> Result<ClientIdentity, Error> {
     let remote_address = parts.extensions.get::<std::net::SocketAddr>().copied();
@@ -171,59 +172,59 @@ async fn authenticate_and_authorize(
 #[instrument(skip(context, parts, incoming, identity))]
 async fn dispatch_route<'a>(
     context: &'a ServerContext,
-    route: Route<'a>,
+    route: Action,
     parts: &'a Parts,
     incoming: Incoming,
     identity: &ClientIdentity,
 ) -> Result<Response<ResponseBody>, Error> {
     match route {
-        Route::UiAsset { path } if context.enable_ui => ui::serve_asset(path),
-        Route::UiConfig if context.enable_ui => handle_ui_config(context),
-        Route::Unknown | Route::UiAsset { .. } | Route::UiConfig => handle_unknown_route(parts),
-        Route::ApiVersion => Ok(handlers::version::handle_get_api_version()?),
-        Route::StartUpload { namespace, digest } => {
+        Action::UiAsset { path } if context.enable_ui => ui::serve_asset(&path),
+        Action::UiConfig if context.enable_ui => handle_ui_config(context),
+        Action::UiAsset { .. } | Action::UiConfig => handle_unknown_route(parts),
+        Action::ApiVersion => Ok(handlers::version::handle_get_api_version()?),
+        Action::StartUpload { namespace, digest } => {
             handlers::upload::handle_start_upload(context, &namespace, digest).await
         }
-        Route::GetUpload { namespace, uuid } => {
+        Action::GetUpload { namespace, uuid } => {
             handlers::upload::handle_get_upload(context, &namespace, uuid).await
         }
-        Route::PatchUpload { namespace, uuid } => {
+        Action::PatchUpload { namespace, uuid } => {
             handle_patch_upload(context, parts, incoming, &namespace, uuid).await
         }
-        Route::PutUpload {
+        Action::PutUpload {
             namespace,
             uuid,
             digest,
         } => handle_put_upload(context, parts, incoming, &namespace, uuid, digest, identity).await,
-        Route::DeleteUpload { namespace, uuid } => {
+        Action::DeleteUpload { namespace, uuid } => {
             handlers::upload::handle_delete_upload(context, &namespace, uuid).await
         }
-        Route::GetBlob { namespace, digest } => {
+        Action::GetBlob { namespace, digest } => {
             handle_get_blob(context, parts, &namespace, digest).await
         }
-        Route::HeadBlob { namespace, digest } => {
+        Action::HeadBlob { namespace, digest } => {
             handle_head_blob(context, parts, &namespace, digest).await
         }
-        Route::DeleteBlob { namespace, digest } => {
+        Action::DeleteBlob { namespace, digest } => {
             handlers::blob::handle_delete_blob(context, &namespace, &digest).await
         }
-        Route::GetManifest {
+        Action::GetManifest {
             namespace,
             reference,
         } => handle_get_manifest(context, parts, &namespace, reference).await,
-        Route::HeadManifest {
+        Action::HeadManifest {
             namespace,
             reference,
         } => handle_head_manifest(context, parts, &namespace, reference).await,
-        Route::PutManifest {
+        Action::PutManifest {
             namespace,
             reference,
         } => handle_put_manifest(context, parts, incoming, &namespace, reference, identity).await,
-        Route::DeleteManifest {
+        Action::DeleteManifest {
             namespace,
             reference,
         } => handle_delete_manifest(context, &namespace, reference, identity).await,
-        Route::GetReferrer {
+        Action::GetReferrer {
             namespace,
             digest,
             artifact_type,
@@ -236,25 +237,25 @@ async fn dispatch_route<'a>(
             )
             .await
         }
-        Route::ListCatalog { n, last } => {
+        Action::ListCatalog { n, last } => {
             handlers::content_discovery::handle_list_catalog(context, n, last).await
         }
-        Route::ListTags { namespace, n, last } => {
+        Action::ListTags { namespace, n, last } => {
             handlers::content_discovery::handle_list_tags(context, &namespace, n, last).await
         }
-        Route::ListRevisions { namespace } => {
+        Action::ListRevisions { namespace } => {
             handlers::ext::handle_list_revisions(context, &namespace).await
         }
-        Route::ListUploads { namespace } => {
+        Action::ListUploads { namespace } => {
             handlers::ext::handle_list_uploads(context, &namespace).await
         }
-        Route::ListRepositories => handlers::ext::handle_list_repositories(context).await,
-        Route::ListNamespaces { repository } => {
-            handlers::ext::handle_list_namespaces(context, repository).await
+        Action::ListRepositories => handlers::ext::handle_list_repositories(context).await,
+        Action::ListNamespaces { repository } => {
+            handlers::ext::handle_list_namespaces(context, &repository).await
         }
-        Route::Healthz => handle_healthz(),
-        Route::Readyz => handle_readyz(context, parts).await,
-        Route::Metrics => handle_metrics(),
+        Action::Healthz => handle_healthz(),
+        Action::Readyz => handle_readyz(context, parts).await,
+        Action::Metrics => handle_metrics(),
     }
 }
 
@@ -268,12 +269,23 @@ fn handle_unknown_route(parts: &Parts) -> Result<Response<ResponseBody>, Error> 
     }
 }
 
-fn repository_name_for(context: &ServerContext, namespace: &Namespace) -> String {
-    context
-        .registry
-        .get_repository_for_namespace(namespace)
-        .map(|r| r.name.clone())
-        .unwrap_or_default()
+/// Attaches the peer TLS certificate (if present) as a request extension so
+/// downstream authenticators can inspect it.
+fn inject_peer_certificate(request: &mut Request<Incoming>, cert_data: Option<&[u8]>) {
+    if let Some(cert_data) = cert_data {
+        let peer_certificate = PeerCertificate(Arc::new(cert_data.to_vec()));
+        request.extensions_mut().insert(peer_certificate);
+    }
+}
+
+/// Dispatches events produced by a handler through the server's event
+/// dispatcher. Handlers are responsible for building events; the HTTP layer
+/// only forwards them.
+async fn dispatch_events(context: &ServerContext, events: Vec<Event>) -> Result<(), Error> {
+    for event in events {
+        context.dispatch_event(&event).await?;
+    }
+    Ok(())
 }
 
 async fn handle_patch_upload(
@@ -320,25 +332,18 @@ async fn handle_put_upload(
         .unwrap_or(0);
     let body_stream = incoming.into_async_read();
 
-    let response = handlers::upload::handle_put_upload(
+    let (response, events) = handlers::upload::handle_put_upload(
         context,
         namespace,
         uuid,
         &digest,
         content_length,
         body_stream,
+        identity,
     )
     .await?;
 
-    let event = Event::new(
-        EventKind::BlobPush,
-        namespace.to_string(),
-        repository_name_for(context, namespace),
-    )
-    .digest(Some(digest.to_string()))
-    .actor(Some(EventActor::from(identity.clone())));
-    context.dispatch_event(&event).await?;
-
+    dispatch_events(context, events).await?;
     Ok(response)
 }
 
@@ -417,43 +422,17 @@ async fn handle_put_manifest(
 
     let body_stream = incoming.into_async_read();
 
-    let response = handlers::manifest::handle_put_manifest(
+    let (response, events) = handlers::manifest::handle_put_manifest(
         context,
         namespace,
-        reference.clone(),
+        reference,
         mime_type,
         body_stream,
+        identity,
     )
     .await?;
 
-    let digest = response
-        .headers()
-        .get("Docker-Content-Digest")
-        .and_then(|v| v.to_str().ok())
-        .map(ToString::to_string);
-
-    let repository = repository_name_for(context, namespace);
-    let actor = Some(EventActor::from(identity.clone()));
-
-    let manifest_event = Event::new(
-        EventKind::ManifestPush,
-        namespace.to_string(),
-        repository.clone(),
-    )
-    .digest(digest.clone())
-    .reference(Some(reference.to_string()))
-    .actor(actor.clone());
-    context.dispatch_event(&manifest_event).await?;
-
-    if let Reference::Tag(tag) = &reference {
-        let tag_event = Event::new(EventKind::TagCreate, namespace.to_string(), repository)
-            .digest(digest)
-            .reference(Some(reference.to_string()))
-            .tag(Some(tag.clone()))
-            .actor(actor);
-        context.dispatch_event(&tag_event).await?;
-    }
-
+    dispatch_events(context, events).await?;
     Ok(response)
 }
 
@@ -463,36 +442,10 @@ async fn handle_delete_manifest(
     reference: Reference,
     identity: &ClientIdentity,
 ) -> Result<Response<ResponseBody>, Error> {
-    let response =
-        handlers::manifest::handle_delete_manifest(context, namespace, reference.clone()).await?;
+    let (response, events) =
+        handlers::manifest::handle_delete_manifest(context, namespace, reference, identity).await?;
 
-    let repository = repository_name_for(context, namespace);
-    let actor = Some(EventActor::from(identity.clone()));
-
-    let digest = match &reference {
-        Reference::Digest(d) => Some(d.to_string()),
-        Reference::Tag(_) => None,
-    };
-
-    let delete_event = Event::new(
-        EventKind::ManifestDelete,
-        namespace.to_string(),
-        repository.clone(),
-    )
-    .digest(digest.clone())
-    .reference(Some(reference.to_string()))
-    .actor(actor.clone());
-    context.dispatch_event(&delete_event).await?;
-
-    if let Reference::Tag(tag) = &reference {
-        let tag_event = Event::new(EventKind::TagDelete, namespace.to_string(), repository)
-            .digest(digest)
-            .reference(Some(reference.to_string()))
-            .tag(Some(tag.clone()))
-            .actor(actor);
-        context.dispatch_event(&tag_event).await?;
-    }
-
+    dispatch_events(context, events).await?;
     Ok(response)
 }
 

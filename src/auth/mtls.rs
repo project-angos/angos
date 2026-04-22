@@ -7,7 +7,7 @@ use x509_parser::{certificate::X509Certificate, prelude::FromDer};
 
 use super::{AuthMiddleware, AuthResult};
 use crate::{
-    command::server::error::Error,
+    command::server::Error,
     identity::{ClientCertificate, ClientIdentity},
 };
 

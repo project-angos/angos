@@ -7,12 +7,9 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use tracing::{debug, info, warn};
 
 use crate::{
+    auth::oidc::{Jwk, OidcProvider},
     cache::{Cache, CacheExt},
-    command::server::{
-        auth::oidc::{Jwk, OidcProvider},
-        error::Error,
-        sha256_hash,
-    },
+    command::server::{Error, sha256_hash},
     identity::OidcClaims,
 };
 
@@ -263,8 +260,8 @@ mod tests {
 
     use super::*;
     use crate::{
+        auth::oidc::tests::{create_rsa_keypair, rsa_public_key_to_jwk},
         cache,
-        command::server::auth::oidc::tests::{create_rsa_keypair, rsa_public_key_to_jwk},
     };
 
     fn build_test_provider_config(uri: &str) -> ProviderConfig {
