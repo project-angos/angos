@@ -12,7 +12,7 @@ use tracing::warn;
 
 use super::Backend;
 use crate::registry::{
-    metadata_store::{Error, LinkMetadata, link_kind::LinkKind},
+    metadata_store::{Error, LinkMetadata, link_kind::LinkKind, lock_ops::LockOps},
     path_builder,
 };
 
