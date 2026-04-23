@@ -93,6 +93,7 @@ fn create_test_config(
     repository_filter: Option<Vec<String>>,
 ) -> EventWebhookConfig {
     EventWebhookConfig {
+        name: String::new(),
         url: "https://example.com/webhook".to_string(),
         policy: DeliveryPolicy::Optional,
         token: None,
@@ -227,6 +228,7 @@ fn create_webhook_config_for_url(
     token: Option<String>,
 ) -> EventWebhookConfig {
     EventWebhookConfig {
+        name: String::new(),
         url: url.to_string(),
         policy: DeliveryPolicy::Required,
         token,
@@ -458,6 +460,7 @@ fn create_webhook_config_with_policy(
     events: Vec<EventKind>,
 ) -> EventWebhookConfig {
     EventWebhookConfig {
+        name: String::new(),
         url: url.to_string(),
         policy,
         token: None,
@@ -656,6 +659,7 @@ fn create_webhook_config_with_retries(
     max_retries: u32,
 ) -> EventWebhookConfig {
     EventWebhookConfig {
+        name: String::new(),
         url: url.to_string(),
         policy,
         token: None,

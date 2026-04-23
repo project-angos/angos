@@ -45,6 +45,10 @@ static WEBHOOK_DURATION: LazyLock<HistogramVec> = LazyLock::new(|| {
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct Config {
+    /// Populated during configuration resolution; not present in TOML.
+    #[serde(skip, default)]
+    pub name: String,
+
     pub url: String,
     pub timeout_ms: u64,
 
@@ -373,6 +377,10 @@ async fn cache_retrieve(
 }
 
 impl WebhookAuthorizer {
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
     pub fn new(name: String, config: Config, cache: Arc<dyn Cache>) -> Result<Self, Error> {
         let mut client_builder = Client::builder()
             .redirect(Policy::none())

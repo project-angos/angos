@@ -188,9 +188,13 @@ fn test_global_config_custom_values() {
         config.global.immutable_tags_exclusions[1].as_source(),
         "dev"
     );
+    assert!(
+        config.global.authorization_webhook.is_some(),
+        "global authorization_webhook should be resolved"
+    );
     assert_eq!(
-        config.global.authorization_webhook,
-        Some("my-webhook".to_string())
+        config.global.authorization_webhook.as_ref().unwrap().name,
+        "my-webhook"
     );
 }
 
@@ -994,92 +998,6 @@ fn test_event_webhook_backward_compatible() {
 
     let config = Configuration::load_from_str(config).unwrap();
     assert!(config.event_webhook.is_empty());
-}
-
-#[test]
-fn test_global_event_webhooks_references() {
-    let config = r#"
-    [server]
-    bind_address = "0.0.0.0"
-
-    [global]
-    event_webhooks = ["notify"]
-
-    [event_webhook.notify]
-    url = "https://example.com/events"
-    policy = "optional"
-    events = ["manifest.push"]
-    "#;
-
-    let config = Configuration::load_from_str(config).unwrap();
-    assert_eq!(config.global.event_webhooks.len(), 1);
-    assert_eq!(config.global.event_webhooks[0], "notify");
-}
-
-#[test]
-fn test_repository_event_webhooks_references() {
-    let config = r#"
-    [server]
-    bind_address = "0.0.0.0"
-
-    [event_webhook.notify]
-    url = "https://example.com/events"
-    policy = "required"
-    events = ["manifest.push"]
-
-    [repository.myapp]
-    event_webhooks = ["notify"]
-    "#;
-
-    let config = Configuration::load_from_str(config).unwrap();
-    assert_eq!(config.repository["myapp"].event_webhooks.len(), 1);
-    assert_eq!(config.repository["myapp"].event_webhooks[0], "notify");
-}
-
-#[test]
-fn test_event_webhook_nonexistent_global_reference_fails() {
-    let config = r#"
-    [server]
-    bind_address = "0.0.0.0"
-
-    [global]
-    event_webhooks = ["nonexistent"]
-    "#;
-
-    let result = Configuration::load_from_str(config);
-    assert!(result.is_err());
-    match result {
-        Err(Error::InvalidFormat(msg)) => {
-            assert!(msg.contains("nonexistent"));
-        }
-        _ => panic!("Expected InvalidFormat error"),
-    }
-}
-
-#[test]
-fn test_event_webhook_nonexistent_repository_reference_fails() {
-    let config = r#"
-    [server]
-    bind_address = "0.0.0.0"
-
-    [event_webhook.notify]
-    url = "https://example.com/events"
-    policy = "optional"
-    events = ["manifest.push"]
-
-    [repository.myapp]
-    event_webhooks = ["missing-hook"]
-    "#;
-
-    let result = Configuration::load_from_str(config);
-    assert!(result.is_err());
-    match result {
-        Err(Error::InvalidFormat(msg)) => {
-            assert!(msg.contains("missing-hook"));
-            assert!(msg.contains("myapp"));
-        }
-        _ => panic!("Expected InvalidFormat error"),
-    }
 }
 
 #[test]

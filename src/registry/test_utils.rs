@@ -79,8 +79,7 @@ pub async fn create_test_blob(
             retention_policy: RetentionPolicyConfig { rules: Vec::new() },
             immutable_tags: false,
             immutable_tags_exclusions: Vec::new(),
-            authorization_webhook: None,
-            event_webhooks: Vec::new(),
+            ..repository::Config::default()
         },
         &cache,
     )

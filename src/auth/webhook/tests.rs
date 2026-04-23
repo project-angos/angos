@@ -167,6 +167,7 @@ fn test_config_deserialize() {
 #[test]
 fn test_config_validate() {
     let valid_config = Config {
+        name: String::new(),
         url: "https://example.com".to_string(),
         timeout_ms: 1000,
         auth: Some(WebhookAuth::BearerToken(Secret::new("token".to_string()))),
@@ -585,6 +586,7 @@ fn build_test_config(
     client_private_key: Option<PathBuf>,
 ) -> Config {
     Config {
+        name: String::new(),
         url,
         timeout_ms: 1000,
         auth: Some(WebhookAuth::BearerToken(Secret::new("token".to_string()))),

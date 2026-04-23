@@ -77,7 +77,18 @@ impl Serialize for RegexPattern {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::configuration::global::GlobalConfig;
+
+    fn minimal_config(global_section: &str) -> String {
+        format!(
+            r#"
+[server]
+address = "127.0.0.1:5000"
+
+[global]
+{global_section}
+"#
+        )
+    }
 
     #[test]
     fn valid_regex_compiles() {
@@ -123,8 +134,9 @@ mod tests {
 
     #[test]
     fn invalid_regex_fails_at_deserialize() {
-        let toml = r#"immutable_tags_exclusions = ["[invalid"]"#;
-        let result: Result<GlobalConfig, _> = toml::from_str(toml);
+        use crate::configuration::Configuration;
+        let toml = minimal_config(r#"immutable_tags_exclusions = ["[invalid"]"#);
+        let result = Configuration::load_from_str(&toml);
         assert!(
             result.is_err(),
             "invalid regex must fail at deserialize time"
@@ -133,11 +145,18 @@ mod tests {
 
     #[test]
     fn valid_regex_deserializes() {
-        let toml = r#"immutable_tags_exclusions = ["^latest$", "^dev-.*"]"#;
-        let config: GlobalConfig = toml::from_str(toml).expect("valid regex must deserialize");
-        assert_eq!(config.immutable_tags_exclusions.len(), 2);
-        assert_eq!(config.immutable_tags_exclusions[0].as_source(), "^latest$");
-        assert_eq!(config.immutable_tags_exclusions[1].as_source(), "^dev-.*");
+        use crate::configuration::Configuration;
+        let toml = minimal_config(r#"immutable_tags_exclusions = ["^latest$", "^dev-.*"]"#);
+        let config = Configuration::load_from_str(&toml).expect("valid regex must deserialize");
+        assert_eq!(config.global.immutable_tags_exclusions.len(), 2);
+        assert_eq!(
+            config.global.immutable_tags_exclusions[0].as_source(),
+            "^latest$"
+        );
+        assert_eq!(
+            config.global.immutable_tags_exclusions[1].as_source(),
+            "^dev-.*"
+        );
     }
 
     #[test]

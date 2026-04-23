@@ -14,6 +14,10 @@ pub enum DeliveryPolicy {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct EventWebhookConfig {
+    /// Populated during configuration resolution; not present in TOML.
+    #[serde(skip, default)]
+    pub name: String,
+
     pub url: String,
     pub policy: DeliveryPolicy,
     #[serde(default)]
