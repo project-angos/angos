@@ -55,7 +55,9 @@ fn set_tracing(config: Option<ObservabilityConfig>) -> Result<(), configuration:
             .with_batch_exporter(otlp_exporter)
             .with_id_generator(RandomIdGenerator::default())
             .with_resource(resource)
-            .with_sampler(Sampler::TraceIdRatioBased(tracing_config.sampling_rate))
+            .with_sampler(Sampler::TraceIdRatioBased(
+                tracing_config.sampling_rate.into(),
+            ))
             .build();
 
         let tracer = tracer_provider.tracer("angos");

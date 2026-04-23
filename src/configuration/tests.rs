@@ -344,7 +344,7 @@ fn test_observability_config() {
     assert!(observability.tracing.is_some());
     let tracing = observability.tracing.unwrap();
     assert_eq!(tracing.endpoint, "http://jaeger:4317");
-    assert!((tracing.sampling_rate - 0.1).abs() < f64::EPSILON);
+    assert!((f64::from(tracing.sampling_rate) - 0.1).abs() < f64::EPSILON);
 }
 
 #[test]
