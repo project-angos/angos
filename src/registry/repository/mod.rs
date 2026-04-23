@@ -58,7 +58,7 @@ impl Repository {
             upstreams.push(RegistryClient::new(config, cache.clone())?);
         }
 
-        let retention_policy = RetentionPolicy::new(&config.retention_policy)?;
+        let retention_policy = RetentionPolicy::new(&config.retention_policy);
 
         Ok(Self {
             name: name.to_string(),

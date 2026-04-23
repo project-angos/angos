@@ -22,18 +22,18 @@
 //! - `top_pushed(n)`: Check if tag is in top N most recently pushed
 //! - `top_pulled(n)`: Check if tag is in top N most recently pulled
 
-use cel_interpreter::{Context, Program, Value};
+use cel_interpreter::{Context, Value};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use tracing::debug;
 
-use super::{Error, cel};
+use super::{CelRule, Error};
 
 /// Configuration for retention policies.
 #[derive(Clone, Debug, Default, Deserialize)]
 pub struct RetentionPolicyConfig {
     #[serde(default)]
-    pub rules: Vec<String>,
+    pub rules: Vec<CelRule>,
 }
 
 /// Manifest image information used in retention decisions.
@@ -49,18 +49,17 @@ pub struct ManifestImage {
 /// Evaluates CEL expressions to determine if manifests should be retained.
 /// Rules are pre-compiled at configuration time for better performance.
 pub struct RetentionPolicy {
-    rules: Vec<Program>,
+    rules: Vec<CelRule>,
 }
 
 impl RetentionPolicy {
     /// Creates a new retention policy from configuration.
     ///
-    /// Compiles CEL expressions from the configuration into programs.
-    pub fn new(config: &RetentionPolicyConfig) -> Result<Self, Error> {
-        let rules =
-            cel::compile_rules(&config.rules, "retention policy").map_err(Error::Initialization)?;
-
-        Ok(Self { rules })
+    /// Rules are already compiled; this constructor is infallible.
+    pub fn new(config: &RetentionPolicyConfig) -> Self {
+        Self {
+            rules: config.rules.clone(),
+        }
     }
 
     pub fn has_rules(&self) -> bool {
@@ -116,7 +115,7 @@ impl RetentionPolicy {
 
         context
             .add_variable("image", manifest)
-            .map_err(|e| Error::Initialization(e.to_string()))?;
+            .map_err(|e| Error::Evaluation(e.to_string()))?;
 
         context.add_function("now", || Utc::now().timestamp());
         context.add_function("days", |d: i64| d * 86400);
@@ -150,12 +149,15 @@ impl RetentionPolicy {
 mod tests {
     use super::*;
 
+    fn rule(s: &str) -> CelRule {
+        CelRule::compile(s).unwrap()
+    }
+
     #[test]
     fn test_top_pushed_in_top_n() {
         let policy = RetentionPolicy::new(&RetentionPolicyConfig {
-            rules: vec!["top_pushed(3)".to_string()],
-        })
-        .unwrap();
+            rules: vec![rule("top_pushed(3)")],
+        });
 
         let manifest = ManifestImage {
             tag: Some("v2".to_string()),
@@ -169,9 +171,8 @@ mod tests {
     #[test]
     fn test_top_pushed_not_in_top_n() {
         let policy = RetentionPolicy::new(&RetentionPolicyConfig {
-            rules: vec!["top_pushed(2)".to_string()],
-        })
-        .unwrap();
+            rules: vec![rule("top_pushed(2)")],
+        });
 
         let manifest = ManifestImage {
             tag: Some("v1".to_string()),
@@ -185,9 +186,8 @@ mod tests {
     #[test]
     fn test_top_pushed_orphan_manifest() {
         let policy = RetentionPolicy::new(&RetentionPolicyConfig {
-            rules: vec!["top_pushed(10)".to_string()],
-        })
-        .unwrap();
+            rules: vec![rule("top_pushed(10)")],
+        });
 
         let manifest = ManifestImage {
             tag: None,
@@ -201,9 +201,8 @@ mod tests {
     #[test]
     fn test_top_pulled_in_top_n() {
         let policy = RetentionPolicy::new(&RetentionPolicyConfig {
-            rules: vec!["top_pulled(2)".to_string()],
-        })
-        .unwrap();
+            rules: vec![rule("top_pulled(2)")],
+        });
 
         let manifest = ManifestImage {
             tag: Some("v1".to_string()),
@@ -217,9 +216,8 @@ mod tests {
     #[test]
     fn test_top_pulled_not_in_top_n() {
         let policy = RetentionPolicy::new(&RetentionPolicyConfig {
-            rules: vec!["top_pulled(1)".to_string()],
-        })
-        .unwrap();
+            rules: vec![rule("top_pulled(1)")],
+        });
 
         let manifest = ManifestImage {
             tag: Some("v2".to_string()),
@@ -233,9 +231,8 @@ mod tests {
     #[test]
     fn test_pushed_at_recent() {
         let policy = RetentionPolicy::new(&RetentionPolicyConfig {
-            rules: vec!["image.pushed_at > now() - days(1)".to_string()],
-        })
-        .unwrap();
+            rules: vec![rule("image.pushed_at > now() - days(1)")],
+        });
 
         let manifest = ManifestImage {
             tag: Some("v1".to_string()),
@@ -249,9 +246,8 @@ mod tests {
     #[test]
     fn test_pushed_at_old() {
         let policy = RetentionPolicy::new(&RetentionPolicyConfig {
-            rules: vec!["image.pushed_at > now() - days(1)".to_string()],
-        })
-        .unwrap();
+            rules: vec![rule("image.pushed_at > now() - days(1)")],
+        });
 
         let manifest = ManifestImage {
             tag: Some("v1".to_string()),
@@ -265,9 +261,8 @@ mod tests {
     #[test]
     fn test_last_pulled_at_recent() {
         let policy = RetentionPolicy::new(&RetentionPolicyConfig {
-            rules: vec!["image.last_pulled_at > now() - hours(1)".to_string()],
-        })
-        .unwrap();
+            rules: vec![rule("image.last_pulled_at > now() - hours(1)")],
+        });
 
         let manifest = ManifestImage {
             tag: Some("v1".to_string()),
@@ -281,9 +276,8 @@ mod tests {
     #[test]
     fn test_last_pulled_at_old() {
         let policy = RetentionPolicy::new(&RetentionPolicyConfig {
-            rules: vec!["image.last_pulled_at > now() - hours(1)".to_string()],
-        })
-        .unwrap();
+            rules: vec![rule("image.last_pulled_at > now() - hours(1)")],
+        });
 
         let manifest = ManifestImage {
             tag: Some("v2".to_string()),

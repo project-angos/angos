@@ -36,10 +36,7 @@ struct AuthorizerRepository {
 
 impl Authorizer {
     pub fn new(config: &Configuration, cache: &Arc<dyn Cache>) -> Result<Self, Error> {
-        let global_access_policy =
-            AccessPolicy::new(&config.global.access_policy).map_err(|e| {
-                Error::Initialization(format!("Failed to create global access policy: {e}"))
-            })?;
+        let global_access_policy = AccessPolicy::new(&config.global.access_policy);
 
         let mut webhooks = HashMap::new();
         for (name, webhook_config) in &config.auth.webhook {
@@ -59,11 +56,7 @@ impl Authorizer {
             {
                 None
             } else {
-                Some(AccessPolicy::new(&repo_config.access_policy).map_err(|e| {
-                    Error::Initialization(format!(
-                        "Failed to create access policy for repository '{name}': {e}"
-                    ))
-                })?)
+                Some(AccessPolicy::new(&repo_config.access_policy))
             };
 
             let immutable_tags_exclusions = repo_config

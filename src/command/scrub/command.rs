@@ -122,20 +122,12 @@ fn build_repositories(
     Ok(Arc::new(repositories))
 }
 
-fn build_global_retention_policy(
-    config: &RetentionPolicyConfig,
-) -> Result<Option<Arc<RetentionPolicy>>, Error> {
+fn build_global_retention_policy(config: &RetentionPolicyConfig) -> Option<Arc<RetentionPolicy>> {
     if config.rules.is_empty() {
-        return Ok(None);
+        return None;
     }
 
-    match RetentionPolicy::new(config) {
-        Ok(policy) => Ok(Some(Arc::new(policy))),
-        Err(err) => {
-            let msg = format!("Failed to initialize global retention policy: {err}");
-            Err(Error::Initialization(msg))
-        }
-    }
+    Some(Arc::new(RetentionPolicy::new(config)))
 }
 
 fn build_namespace_checkers(
@@ -144,12 +136,12 @@ fn build_namespace_checkers(
     blob_store: &Arc<dyn BlobStore>,
     metadata_store: &Arc<dyn MetadataStore>,
     repositories: &Arc<HashMap<String, Repository>>,
-) -> Result<Vec<Box<dyn NamespaceChecker>>, Error> {
+) -> Vec<Box<dyn NamespaceChecker>> {
     let mut checkers: Vec<Box<dyn NamespaceChecker>> = Vec::new();
 
     if options.retention {
         let global_retention_policy =
-            build_global_retention_policy(&config.global.retention_policy)?;
+            build_global_retention_policy(&config.global.retention_policy);
         checkers.push(Box::new(RetentionChecker::new(
             blob_store.clone(),
             metadata_store.clone(),
@@ -204,7 +196,7 @@ fn build_namespace_checkers(
         )));
     }
 
-    Ok(checkers)
+    checkers
 }
 
 fn build_blob_checker(
@@ -243,7 +235,7 @@ impl Command {
         let repositories = build_repositories(&config.repository, &auth_cache)?;
 
         let namespace_checkers =
-            build_namespace_checkers(options, config, &blob_store, &metadata_store, &repositories)?;
+            build_namespace_checkers(options, config, &blob_store, &metadata_store, &repositories);
         let blob_checker = build_blob_checker(options, &blob_store, &metadata_store);
         let multipart_checker = build_multipart_checker(options, &config.blob_store);
 
@@ -306,35 +298,38 @@ impl Command {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::policy::CelRule;
+
+    fn rule(s: &str) -> CelRule {
+        CelRule::compile(s).unwrap()
+    }
 
     #[test]
     fn test_build_global_retention_policy_empty() {
         let config = RetentionPolicyConfig { rules: vec![] };
         let result = build_global_retention_policy(&config);
 
-        assert!(result.is_ok());
-        assert!(result.unwrap().is_none());
+        assert!(result.is_none());
     }
 
     #[test]
     fn test_build_global_retention_policy_with_rules() {
         let config = RetentionPolicyConfig {
-            rules: vec!["image.pushed_at > now() - days(30)".to_string()],
+            rules: vec![rule("image.pushed_at > now() - days(30)")],
         };
         let result = build_global_retention_policy(&config);
 
-        assert!(result.is_ok());
-        assert!(result.unwrap().is_some());
+        assert!(result.is_some());
     }
 
     #[test]
-    fn test_build_global_retention_policy_invalid_rule() {
-        let config = RetentionPolicyConfig {
-            rules: vec!["invalid cel expression!!!".to_string()],
-        };
-        let result = build_global_retention_policy(&config);
-
-        assert!(result.is_err());
+    fn invalid_retention_rule_fails_at_deserialize() {
+        let toml = r#"rules = ["invalid cel expression!!!"]"#;
+        let result: Result<RetentionPolicyConfig, _> = toml::from_str(toml);
+        assert!(
+            result.is_err(),
+            "invalid CEL rule must fail at deserialization"
+        );
     }
 
     #[tokio::test]

@@ -15,11 +15,11 @@
 //! - `identity`: Client identity information (id, username, certificate details)
 //! - `request`: Request details (action, namespace, digest, reference)
 
-use cel_interpreter::{Context, Program, Value};
+use cel_interpreter::{Context, Value};
 use serde::Deserialize;
 use tracing::{debug, warn};
 
-use super::{Error, cel};
+use super::{CelRule, Error};
 use crate::identity::{Action, ClientIdentity};
 
 /// Configuration for access control policies.
@@ -28,7 +28,7 @@ pub struct AccessPolicyConfig {
     #[serde(default)]
     pub default_allow: bool,
     #[serde(default)]
-    pub rules: Vec<String>,
+    pub rules: Vec<CelRule>,
 }
 
 /// Access control policy engine.
@@ -37,21 +37,18 @@ pub struct AccessPolicyConfig {
 /// Rules are pre-compiled at configuration time for better performance.
 pub struct AccessPolicy {
     default_allow: bool,
-    rules: Vec<Program>,
+    rules: Vec<CelRule>,
 }
 
 impl AccessPolicy {
     /// Creates a new access policy from configuration.
     ///
-    /// Compiles CEL expressions from the configuration into programs.
-    pub fn new(config: &AccessPolicyConfig) -> Result<Self, Error> {
-        let rules =
-            cel::compile_rules(&config.rules, "access policy").map_err(Error::Initialization)?;
-
-        Ok(Self {
+    /// Rules are already compiled; this constructor is infallible.
+    pub fn new(config: &AccessPolicyConfig) -> Self {
+        Self {
             default_allow: config.default_allow,
-            rules,
-        })
+            rules: config.rules.clone(),
+        }
     }
 
     /// Evaluates the access policy for a given action and identity.
@@ -103,10 +100,10 @@ impl AccessPolicy {
         let mut context = Context::default();
         context
             .add_variable("request", action)
-            .map_err(|e| Error::Initialization(e.to_string()))?;
+            .map_err(|e| Error::Evaluation(e.to_string()))?;
         context
             .add_variable("identity", identity)
-            .map_err(|e| Error::Initialization(e.to_string()))?;
+            .map_err(|e| Error::Evaluation(e.to_string()))?;
         Ok(context)
     }
 }
@@ -115,13 +112,17 @@ impl AccessPolicy {
 mod tests {
     use super::*;
 
+    fn rule(s: &str) -> CelRule {
+        CelRule::compile(s).unwrap()
+    }
+
     #[test]
     fn test_access_policy_default_allow_no_rules() {
         let config = AccessPolicyConfig {
             default_allow: true,
             rules: vec![],
         };
-        let policy = AccessPolicy::new(&config).unwrap();
+        let policy = AccessPolicy::new(&config);
         let action = Action::ApiVersion;
         let identity = ClientIdentity::default();
 
@@ -135,7 +136,7 @@ mod tests {
             default_allow: false,
             rules: vec![],
         };
-        let policy = AccessPolicy::new(&config).unwrap();
+        let policy = AccessPolicy::new(&config);
         let action = Action::ApiVersion;
         let identity = ClientIdentity::default();
 
@@ -147,9 +148,9 @@ mod tests {
     fn test_access_policy_default_allow_with_deny_rule() {
         let config = AccessPolicyConfig {
             default_allow: true,
-            rules: vec!["identity.username == 'forbidden'".to_string()],
+            rules: vec![rule("identity.username == 'forbidden'")],
         };
-        let policy = AccessPolicy::new(&config).unwrap();
+        let policy = AccessPolicy::new(&config);
 
         let action = Action::ApiVersion;
         let identity = ClientIdentity {
@@ -173,9 +174,9 @@ mod tests {
     fn test_access_policy_default_deny_with_allow_rule() {
         let config = AccessPolicyConfig {
             default_allow: false,
-            rules: vec!["identity.username == 'admin'".to_string()],
+            rules: vec![rule("identity.username == 'admin'")],
         };
-        let policy = AccessPolicy::new(&config).unwrap();
+        let policy = AccessPolicy::new(&config);
 
         let action = Action::ApiVersion;
         let identity = ClientIdentity {
