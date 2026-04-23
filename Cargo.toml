@@ -54,6 +54,7 @@ toml = "1.1"
 tracing = "0.1"
 tracing-opentelemetry = "0.32"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+url = { version = "2.5", features = ["serde"] }
 uuid = { version = "1.23", features = ["v4", "serde"] }
 x509-parser = "0.18"
 zeroize = { version = "1.8", features = ["derive"] }

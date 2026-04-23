@@ -1,6 +1,6 @@
-use hyper::Uri;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
+use url::Url;
 
 use crate::{configuration::Error, event_webhook::event::EventKind};
 
@@ -18,7 +18,7 @@ pub struct EventWebhookConfig {
     #[serde(skip, default)]
     pub name: String,
 
-    pub url: String,
+    pub url: Url,
     pub policy: DeliveryPolicy,
     #[serde(default)]
     pub token: Option<String>,
@@ -37,12 +37,6 @@ fn default_timeout_ms() -> u64 {
 
 impl EventWebhookConfig {
     pub fn validate(&self) -> Result<(), Error> {
-        if let Err(e) = Uri::try_from(&self.url) {
-            return Err(Error::Initialization(format!(
-                "Invalid event webhook URL: {e}"
-            )));
-        }
-
         if self.events.is_empty() {
             return Err(Error::Initialization(
                 "Event webhook must have at least one event".to_string(),
@@ -119,7 +113,7 @@ mod tests {
         "#;
 
         let config: EventWebhookConfig = toml::from_str(toml).unwrap();
-        assert_eq!(config.url, "https://example.com/webhook");
+        assert_eq!(config.url.as_str(), "https://example.com/webhook");
         assert_eq!(config.policy, DeliveryPolicy::Required);
         assert_eq!(config.token, Some("secret-token".to_string()));
         assert_eq!(config.timeout_ms, 10000);
@@ -142,7 +136,7 @@ mod tests {
         "#;
 
         let config: EventWebhookConfig = toml::from_str(toml).unwrap();
-        assert_eq!(config.url, "https://example.com/webhook");
+        assert_eq!(config.url.as_str(), "https://example.com/webhook");
         assert_eq!(config.policy, DeliveryPolicy::Optional);
         assert_eq!(config.token, None);
         assert_eq!(config.timeout_ms, 5000);
@@ -166,15 +160,14 @@ mod tests {
     }
 
     #[test]
-    fn validate_webhook_config_invalid_url_rejected() {
+    fn invalid_url_fails_at_deserialize() {
         let toml = r#"
             url = "ht!tp://::invalid"
             policy = "required"
             events = ["manifest.push"]
         "#;
 
-        let config: EventWebhookConfig = toml::from_str(toml).unwrap();
-        let result = config.validate();
+        let result: Result<EventWebhookConfig, _> = toml::from_str(toml);
         assert!(result.is_err());
     }
 

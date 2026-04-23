@@ -2,6 +2,7 @@ use std::{collections::HashMap, time::Duration};
 
 use chrono::Utc;
 use prometheus::proto::MetricType;
+use url::Url;
 use uuid::Uuid;
 use wiremock::{
     Mock, MockServer, ResponseTemplate,
@@ -94,7 +95,7 @@ fn create_test_config(
 ) -> EventWebhookConfig {
     EventWebhookConfig {
         name: String::new(),
-        url: "https://example.com/webhook".to_string(),
+        url: Url::parse("https://example.com/webhook").unwrap(),
         policy: DeliveryPolicy::Optional,
         token: None,
         timeout_ms: 5000,
@@ -229,7 +230,7 @@ fn create_webhook_config_for_url(
 ) -> EventWebhookConfig {
     EventWebhookConfig {
         name: String::new(),
-        url: url.to_string(),
+        url: Url::parse(url).unwrap(),
         policy: DeliveryPolicy::Required,
         token,
         timeout_ms: 5000,
@@ -461,7 +462,7 @@ fn create_webhook_config_with_policy(
 ) -> EventWebhookConfig {
     EventWebhookConfig {
         name: String::new(),
-        url: url.to_string(),
+        url: Url::parse(url).unwrap(),
         policy,
         token: None,
         timeout_ms: 5000,
@@ -660,7 +661,7 @@ fn create_webhook_config_with_retries(
 ) -> EventWebhookConfig {
     EventWebhookConfig {
         name: String::new(),
-        url: url.to_string(),
+        url: Url::parse(url).unwrap(),
         policy,
         token: None,
         timeout_ms: 5000,

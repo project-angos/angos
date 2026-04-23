@@ -1,6 +1,7 @@
 use std::{fs, path::PathBuf, str::FromStr};
 
 use hyper::{HeaderMap, Method, http::request::Builder};
+use url::Url;
 use wiremock::{
     Mock, MockServer, ResponseTemplate,
     matchers::{header, method},
@@ -132,7 +133,7 @@ fn test_config_deserialize() {
     let config: Config = toml::from_str(valid_config).unwrap();
 
     assert!(config.validate().is_ok());
-    assert_eq!(config.url, "https://example.com");
+    assert_eq!(config.url.as_str(), "https://example.com/");
     assert_eq!(config.timeout_ms, 1000);
     assert!(
         matches!(config.auth, Some(WebhookAuth::BasicAuth { username, password }) if username == "user" && password.expose() == "pass")
@@ -152,7 +153,7 @@ fn test_config_deserialize() {
     let config: Config = toml::from_str(valid_config).unwrap();
 
     assert!(config.validate().is_ok());
-    assert_eq!(config.url, "https://example.com");
+    assert_eq!(config.url.as_str(), "https://example.com/");
     assert_eq!(config.timeout_ms, 1000);
     assert!(
         matches!(config.auth, Some(WebhookAuth::BearerToken(token)) if token.expose() == "hello-token")
@@ -168,7 +169,7 @@ fn test_config_deserialize() {
 fn test_config_validate() {
     let valid_config = Config {
         name: String::new(),
-        url: "https://example.com".to_string(),
+        url: Url::parse("https://example.com").unwrap(),
         timeout_ms: 1000,
         auth: Some(WebhookAuth::BearerToken(Secret::new("token".to_string()))),
         client_certificate_bundle: Some("/valid/path/to/cert.pem".into()),
@@ -186,10 +187,17 @@ fn test_config_validate() {
     let mut invalid_config = valid_config.clone();
     invalid_config.client_certificate_bundle = None;
     assert!(invalid_config.validate().is_err());
+}
 
-    let mut invalid_config = valid_config.clone();
-    invalid_config.url = "@invalid-url@".to_string();
-    assert!(invalid_config.validate().is_err());
+#[test]
+fn invalid_url_fails_at_deserialize() {
+    let toml = r#"
+        url = "ht!tp://::invalid"
+        timeout_ms = 1000
+    "#;
+
+    let result: Result<Config, _> = toml::from_str(toml);
+    assert!(result.is_err());
 }
 
 #[test]
@@ -580,7 +588,7 @@ fn test_build_headers() {
 }
 
 fn build_test_config(
-    url: String,
+    url: Url,
     server_ca_bundle: Option<PathBuf>,
     client_certificate_bundle: Option<PathBuf>,
     client_private_key: Option<PathBuf>,
@@ -611,7 +619,7 @@ fn test_new_invalid_mtls() {
     fs::write(&ca_file_path, TEST_BUNDLE).unwrap();
 
     let config = build_test_config(
-        "https://example.com".to_string(),
+        Url::parse("https://example.com").unwrap(),
         Some(ca_file_path),
         Some(cert_file_path),
         Some(key_file_path),
@@ -638,7 +646,7 @@ fn test_new_mtls() {
     fs::write(&ca_file_path, TEST_BUNDLE).unwrap();
 
     let config = build_test_config(
-        "https://example.com".to_string(),
+        Url::parse("https://example.com").unwrap(),
         Some(ca_file_path),
         Some(cert_file_path),
         Some(key_file_path),
@@ -654,7 +662,7 @@ fn test_new_mtls() {
 
 #[test]
 fn test_new_simple() {
-    let config = build_test_config("https://example.com".to_string(), None, None, None);
+    let config = build_test_config(Url::parse("https://example.com").unwrap(), None, None, None);
     let webhook = WebhookAuthorizer::new(
         "test".to_string(),
         config,
@@ -673,7 +681,7 @@ async fn test_authorize_success() {
         .mount(&mock_server)
         .await;
 
-    let mut config = build_test_config(mock_server.uri(), None, None, None);
+    let mut config = build_test_config(Url::parse(&mock_server.uri()).unwrap(), None, None, None);
     config.auth = None;
 
     let cache = cache::Config::Memory.to_backend().unwrap();
@@ -703,7 +711,7 @@ async fn test_authorize_denied() {
         .mount(&mock_server)
         .await;
 
-    let mut config = build_test_config(mock_server.uri(), None, None, None);
+    let mut config = build_test_config(Url::parse(&mock_server.uri()).unwrap(), None, None, None);
     config.auth = None;
 
     let cache = cache::Config::Memory.to_backend().unwrap();
@@ -734,7 +742,7 @@ async fn test_authorize_with_bearer_token() {
         .mount(&mock_server)
         .await;
 
-    let mut config = build_test_config(mock_server.uri(), None, None, None);
+    let mut config = build_test_config(Url::parse(&mock_server.uri()).unwrap(), None, None, None);
     config.auth = Some(WebhookAuth::BearerToken(Secret::new(
         "test-token".to_string(),
     )));
@@ -767,7 +775,7 @@ async fn test_authorize_with_basic_auth() {
         .mount(&mock_server)
         .await;
 
-    let mut config = build_test_config(mock_server.uri(), None, None, None);
+    let mut config = build_test_config(Url::parse(&mock_server.uri()).unwrap(), None, None, None);
     config.auth = Some(WebhookAuth::BasicAuth {
         username: "testuser".to_string(),
         password: Secret::new("testpass".to_string()),
@@ -802,7 +810,7 @@ async fn test_authorize_sends_correct_headers() {
         .mount(&mock_server)
         .await;
 
-    let config = build_test_config(mock_server.uri(), None, None, None);
+    let config = build_test_config(Url::parse(&mock_server.uri()).unwrap(), None, None, None);
     let cache = cache::Config::Memory.to_backend().unwrap();
     let webhook = WebhookAuthorizer::new("test".to_string(), config, cache).unwrap();
 
@@ -832,7 +840,7 @@ async fn test_authorize_uses_cache() {
         .mount(&mock_server)
         .await;
 
-    let mut config = build_test_config(mock_server.uri(), None, None, None);
+    let mut config = build_test_config(Url::parse(&mock_server.uri()).unwrap(), None, None, None);
     config.auth = None;
 
     let cache = cache::Config::Memory.to_backend().unwrap();
@@ -859,7 +867,7 @@ async fn test_authorize_uses_cache() {
 
 #[tokio::test]
 async fn test_authorize_network_error_denies() {
-    let mut config = build_test_config("http://localhost:1".to_string(), None, None, None);
+    let mut config = build_test_config(Url::parse("http://localhost:1").unwrap(), None, None, None);
     config.auth = None;
 
     let cache = cache::Config::Memory.to_backend().unwrap();

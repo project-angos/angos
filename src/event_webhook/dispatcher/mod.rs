@@ -181,7 +181,7 @@ impl EventDispatcher {
         let mut in_flight_guard = self.in_flight.lock().await;
         in_flight_guard.spawn(deliver_async(
             endpoint.client.clone(),
-            endpoint.config.url.clone(),
+            endpoint.config.url.to_string(),
             endpoint.config.token.clone(),
             body.to_vec(),
             event_kind_header.to_string(),
@@ -208,7 +208,7 @@ impl EventDispatcher {
             DeliveryPolicy::Required => {
                 send_and_record(
                     &endpoint.client,
-                    &endpoint.config.url,
+                    endpoint.config.url.as_str(),
                     endpoint.config.token.as_deref(),
                     body,
                     event_kind_header,
@@ -222,7 +222,7 @@ impl EventDispatcher {
             DeliveryPolicy::Optional => {
                 if let Err(e) = send_and_record(
                     &endpoint.client,
-                    &endpoint.config.url,
+                    endpoint.config.url.as_str(),
                     endpoint.config.token.as_deref(),
                     body,
                     event_kind_header,

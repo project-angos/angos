@@ -9,7 +9,6 @@ use std::{
 };
 
 use hyper::{
-    Uri,
     header::{HeaderName, HeaderValue},
     http::{HeaderMap, request::Parts},
 };
@@ -17,6 +16,7 @@ use prometheus::{HistogramVec, IntCounterVec, register_histogram_vec, register_i
 use reqwest::{Certificate, Client, Identity, header::AUTHORIZATION, redirect::Policy};
 use serde::Deserialize;
 use tracing::warn;
+use url::Url;
 
 use crate::{
     cache::{Cache, CacheExt},
@@ -49,7 +49,7 @@ pub struct Config {
     #[serde(skip, default)]
     pub name: String,
 
-    pub url: String,
+    pub url: Url,
     pub timeout_ms: u64,
 
     #[serde(flatten)]
@@ -85,11 +85,6 @@ impl Config {
     pub fn validate(&self) -> Result<(), Error> {
         if self.client_certificate_bundle.is_some() != self.client_private_key.is_some() {
             let msg = "Both certificate and key required for mTLS".to_string();
-            return Err(Error::Initialization(msg));
-        }
-
-        if let Err(e) = Uri::try_from(&self.url) {
-            let msg = format!("Invalid webhook URL: {e}");
             return Err(Error::Initialization(msg));
         }
 
@@ -432,7 +427,7 @@ impl WebhookAuthorizer {
             .start_timer();
 
         let headers = build_headers(&self.config.forward_headers, action, identity, parts)?;
-        let mut request = self.client.get(&self.config.url);
+        let mut request = self.client.get(self.config.url.clone());
         for (key, value) in &headers {
             request = request.header(key, value);
         }
