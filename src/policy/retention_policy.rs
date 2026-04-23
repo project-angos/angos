@@ -24,7 +24,7 @@
 
 use cel_interpreter::{Context, Value};
 use chrono::Utc;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, Serializer};
 use tracing::debug;
 
 use super::{CelRule, Error};
@@ -36,12 +36,38 @@ pub struct RetentionPolicyConfig {
     pub rules: Vec<CelRule>,
 }
 
+/// Seconds since the Unix epoch, guaranteed non-negative.
+///
+/// Constructed from `i64` values returned by `chrono::DateTime::timestamp()`.
+/// Negative inputs (pre-epoch dates) are saturated to zero.
+///
+/// Serializes as `i64` so that CEL expressions using integer arithmetic
+/// (e.g. `image.pushed_at > now() - days(30)`) continue to work without
+/// cross-type coercion.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct EpochSeconds(u64);
+
+impl EpochSeconds {
+    /// Constructs an `EpochSeconds` from a signed timestamp.
+    ///
+    /// Negative values (pre-epoch) are saturated to zero.
+    pub fn from_seconds(s: i64) -> Self {
+        Self(u64::try_from(s).unwrap_or(0))
+    }
+}
+
+impl Serialize for EpochSeconds {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_i64(i64::try_from(self.0).unwrap_or(i64::MAX))
+    }
+}
+
 /// Manifest image information used in retention decisions.
 #[derive(Debug, Default, Serialize)]
 pub struct ManifestImage {
     pub tag: Option<String>,
-    pub pushed_at: i64,
-    pub last_pulled_at: i64,
+    pub pushed_at: EpochSeconds,
+    pub last_pulled_at: EpochSeconds,
 }
 
 /// Retention policy engine.
@@ -236,7 +262,7 @@ mod tests {
 
         let manifest = ManifestImage {
             tag: Some("v1".to_string()),
-            pushed_at: Utc::now().timestamp(),
+            pushed_at: EpochSeconds::from_seconds(Utc::now().timestamp()),
             ..Default::default()
         };
 
@@ -251,7 +277,7 @@ mod tests {
 
         let manifest = ManifestImage {
             tag: Some("v1".to_string()),
-            pushed_at: Utc::now().timestamp() - 2 * 86400,
+            pushed_at: EpochSeconds::from_seconds(Utc::now().timestamp() - 2 * 86400),
             ..Default::default()
         };
 
@@ -266,7 +292,7 @@ mod tests {
 
         let manifest = ManifestImage {
             tag: Some("v1".to_string()),
-            last_pulled_at: Utc::now().timestamp(),
+            last_pulled_at: EpochSeconds::from_seconds(Utc::now().timestamp()),
             ..Default::default()
         };
 
@@ -281,10 +307,17 @@ mod tests {
 
         let manifest = ManifestImage {
             tag: Some("v2".to_string()),
-            last_pulled_at: Utc::now().timestamp() - 2 * 3600,
+            last_pulled_at: EpochSeconds::from_seconds(Utc::now().timestamp() - 2 * 3600),
             ..Default::default()
         };
 
         assert!(!policy.should_retain(&manifest, &[], &[]).unwrap());
+    }
+
+    #[test]
+    fn negative_timestamp_saturates_to_zero() {
+        let t = EpochSeconds::from_seconds(-100);
+        let serialized = serde_json::to_value(t).unwrap();
+        assert_eq!(serialized, serde_json::json!(0));
     }
 }

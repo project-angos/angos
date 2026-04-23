@@ -7,7 +7,7 @@ use tracing::{debug, info};
 use crate::{
     command::scrub::check::NamespaceChecker,
     oci::Digest,
-    policy::{ManifestImage, RetentionPolicy},
+    policy::{EpochSeconds, ManifestImage, RetentionPolicy},
     registry::{
         Error,
         blob_store::BlobStore,
@@ -180,16 +180,12 @@ impl RetentionChecker {
 
         let manifest = ManifestImage {
             tag: Some(tag.name.clone()),
-            pushed_at: tag
-                .metadata
-                .created_at
-                .map(|t| t.timestamp())
-                .unwrap_or_default(),
-            last_pulled_at: tag
-                .metadata
-                .accessed_at
-                .map(|t| t.timestamp())
-                .unwrap_or_default(),
+            pushed_at: EpochSeconds::from_seconds(
+                tag.metadata.created_at.map_or(0, |t| t.timestamp()),
+            ),
+            last_pulled_at: EpochSeconds::from_seconds(
+                tag.metadata.accessed_at.map_or(0, |t| t.timestamp()),
+            ),
         };
 
         self.evaluate_retention_policies(namespace, &tag.name, &manifest, last_pushed, last_pulled)
@@ -294,14 +290,10 @@ impl RetentionChecker {
 
         let manifest = ManifestImage {
             tag: None,
-            pushed_at: metadata
-                .created_at
-                .map(|t| t.timestamp())
-                .unwrap_or_default(),
-            last_pulled_at: metadata
-                .accessed_at
-                .map(|t| t.timestamp())
-                .unwrap_or_default(),
+            pushed_at: EpochSeconds::from_seconds(metadata.created_at.map_or(0, |t| t.timestamp())),
+            last_pulled_at: EpochSeconds::from_seconds(
+                metadata.accessed_at.map_or(0, |t| t.timestamp()),
+            ),
         };
 
         let label = format!("{namespace}@{digest}");
