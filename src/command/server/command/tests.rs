@@ -4,7 +4,7 @@ use super::*;
 use crate::{
     command::server::listeners::tls::tests::build_config,
     configuration,
-    policy::{AccessPolicyConfig, CelRule},
+    policy::{AccessMode, AccessPolicyConfig, CelRule},
     secret::Secret,
 };
 
@@ -49,7 +49,7 @@ fn create_config_with_repository() -> Configuration {
         max_concurrent_cache_jobs = 10
 
         [repository.test-repo.access_policy]
-        default_allow = true
+        default = "allow"
         rules = []
     "#;
 
@@ -113,7 +113,7 @@ fn test_build_auth_cache_memory_success() {
 fn test_build_repository_success() {
     let repo_config = repository::Config {
         access_policy: AccessPolicyConfig {
-            default_allow: true,
+            default: AccessMode::Allow,
             ..AccessPolicyConfig::default()
         },
         ..repository::Config::default()
@@ -132,7 +132,7 @@ fn test_build_repository_success() {
 fn test_build_repository_with_upstream() {
     let repo_config = repository::Config {
         access_policy: AccessPolicyConfig {
-            default_allow: true,
+            default: AccessMode::Allow,
             ..AccessPolicyConfig::default()
         },
         upstream: vec![repository::RegistryClientConfig {
@@ -158,7 +158,7 @@ fn test_build_repository_with_upstream() {
 fn test_build_repository_with_immutable_tags() {
     let repo_config = repository::Config {
         access_policy: AccessPolicyConfig {
-            default_allow: true,
+            default: AccessMode::Allow,
             ..AccessPolicyConfig::default()
         },
         immutable_tags: true,
@@ -193,7 +193,7 @@ fn test_build_repositories_empty() {
 fn test_build_repositories_single() {
     let repo_config = repository::Config {
         access_policy: AccessPolicyConfig {
-            default_allow: true,
+            default: AccessMode::Allow,
             ..AccessPolicyConfig::default()
         },
         ..repository::Config::default()
@@ -216,7 +216,7 @@ fn test_build_repositories_single() {
 fn test_build_repositories_multiple() {
     let repo_config = repository::Config {
         access_policy: AccessPolicyConfig {
-            default_allow: true,
+            default: AccessMode::Allow,
             ..AccessPolicyConfig::default()
         },
         ..repository::Config::default()
@@ -345,7 +345,7 @@ async fn test_service_listener_enum_variants() {
 fn test_build_repositories_preserves_names() {
     let repo_config = repository::Config {
         access_policy: AccessPolicyConfig {
-            default_allow: true,
+            default: AccessMode::Allow,
             ..AccessPolicyConfig::default()
         },
         ..repository::Config::default()
@@ -401,14 +401,14 @@ async fn test_command_new_validates_configuration() {
 fn test_build_repositories_with_different_configs() {
     let repo_config1 = repository::Config {
         access_policy: AccessPolicyConfig {
-            default_allow: true,
+            default: AccessMode::Allow,
             ..AccessPolicyConfig::default()
         },
         ..repository::Config::default()
     };
     let repo_config2 = repository::Config {
         access_policy: AccessPolicyConfig {
-            default_allow: false,
+            default: AccessMode::Deny,
             rules: vec![CelRule::compile("identity.username == 'admin'").unwrap()],
         },
         ..repository::Config::default()

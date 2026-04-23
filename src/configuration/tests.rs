@@ -711,7 +711,7 @@ fn test_access_policy_in_global_config() {
     bind_address = "0.0.0.0"
 
     [global.access_policy]
-    mode = "deny"
+    default = "deny"
     rules = ["allow(true)"]
     "#;
 

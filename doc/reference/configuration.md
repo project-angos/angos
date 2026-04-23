@@ -63,7 +63,7 @@ When omitted, the server runs without TLS (insecure).
 
 | Option          | Type     | Default | Description                        |
 |-----------------|----------|---------|------------------------------------|
-| `default_allow` | bool     | `false` | Default action when no rules match |
+| `mode`          | string   | `"deny"` | Default action when no rules match (`"allow"` or `"deny"`) |
 | `rules`         | [string] | `[]`    | CEL expressions for access control |
 
 ### Global Retention Policy (`global.retention_policy`)
@@ -502,7 +502,7 @@ password = "$argon2id$v=19$m=19456,t=2,p=1$..."
 provider = "github"
 
 [global.access_policy]
-default_allow = false
+default = "deny"
 rules = ["identity.username != ''"]
 
 [repository."docker-io"]

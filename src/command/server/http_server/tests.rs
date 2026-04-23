@@ -410,7 +410,7 @@ async fn test_authenticate_and_authorize_returns_client_identity() {
         max_concurrent_cache_jobs = 10
 
         [global.access_policy]
-        default_allow = true
+        default = "allow"
         rules = []
     "#;
 
@@ -462,7 +462,7 @@ async fn create_test_context_with_allow_policy() -> ServerContext {
         max_concurrent_cache_jobs = 10
 
         [global.access_policy]
-        default_allow = true
+        default = "allow"
         rules = []
     "#;
 

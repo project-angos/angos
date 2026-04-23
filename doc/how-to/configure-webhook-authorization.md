@@ -266,7 +266,7 @@ Webhooks run **after** CEL policies. Use CEL for fast common rules:
 ```toml
 # CEL handles basic checks
 [global.access_policy]
-default_allow = false
+default = "deny"
 rules = [
   "identity.username != null"
 ]

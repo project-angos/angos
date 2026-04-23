@@ -422,14 +422,14 @@ async fn test_authorize_request_with_global_policy() {
         max_concurrent_cache_jobs = 10
 
         [global.access_policy]
-        default_allow = true
+        default = "allow"
         rules = []
 
         [repository.test]
         namespace_pattern = "^test/.*"
 
         [repository.test.access_policy]
-        default_allow = true
+        default = "allow"
         rules = []
     "#;
 

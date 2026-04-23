@@ -2,7 +2,7 @@ use super::*;
 use crate::{
     configuration::GlobalConfig,
     oci::Digest,
-    policy::{AccessPolicyConfig, RetentionPolicyConfig},
+    policy::{AccessMode, AccessPolicyConfig, RetentionPolicyConfig},
     registry::metadata_store::{MetadataStoreExt, link_kind::LinkKind},
 };
 
@@ -11,7 +11,7 @@ pub fn create_test_repositories() -> Arc<HashMap<String, Repository>> {
 
     let config = repository::Config {
         access_policy: AccessPolicyConfig {
-            default_allow: true,
+            default: AccessMode::Allow,
             ..AccessPolicyConfig::default()
         },
         retention_policy: RetentionPolicyConfig::default(),

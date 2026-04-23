@@ -10,6 +10,7 @@ use crate::{
     configuration::{Configuration, RegexPattern},
     identity::{Action, ClientIdentity},
     oci::{Namespace, Reference},
+    policy::AccessMode,
     registry::{AccessPolicy, Registry},
 };
 
@@ -62,7 +63,7 @@ impl Authorizer {
             .iter()
             .map(|(name, repo_config)| {
                 let access_policy = if repo_config.access_policy.rules.is_empty()
-                    && !repo_config.access_policy.default_allow
+                    && repo_config.access_policy.default == AccessMode::Deny
                 {
                     None
                 } else {
@@ -310,7 +311,7 @@ mod tests {
             max_concurrent_cache_jobs = 10
 
             [global.access_policy]
-            default_allow = true
+            default = "allow"
             rules = ["identity.username == 'admin'"]
         "#;
 
@@ -672,7 +673,7 @@ mod tests {
             max_concurrent_cache_jobs = 10
 
             [global.access_policy]
-            default_allow = true
+            default = "allow"
 
             [repository."docker-io"]
 

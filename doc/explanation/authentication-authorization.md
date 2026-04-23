@@ -166,12 +166,12 @@ sequenceDiagram
 
 ### CEL Policy Modes
 
-**default_allow = false** (recommended):
+**default = "deny"** (recommended):
 - Deny unless a rule explicitly allows
 - Rules act as "allow" rules: `true` → allow
 - At least one rule must return `true` for access
 
-**default_allow = true**:
+**default = "allow"**:
 - Allow unless a rule explicitly denies
 - Rules act as "deny" rules: `true` → deny
 - Any rule returning `true` denies access
@@ -212,8 +212,8 @@ identity = {
 
 **Rule evaluation:** Rules are evaluated disjunctively (OR'd). The meaning depends on the mode:
 
-- **`default_allow = false`** (default-deny): rules act as **allow** rules — access is granted if ANY rule returns true.
-- **`default_allow = true`** (default-allow): rules act as **deny** rules — access is denied if ANY rule returns true.
+- **`default = "deny"`** (default-deny): rules act as **allow** rules — access is granted if ANY rule returns true.
+- **`default = "allow"`** (default-allow): rules act as **deny** rules — access is denied if ANY rule returns true.
 
 Do not mix allow and deny logic in the same rules array — since rules are OR'd, a single matching rule determines the outcome.
 
@@ -225,7 +225,7 @@ Do not mix allow and deny logic in the same rules array — since rules are OR'd
 
 ```toml
 [global.access_policy]
-default_allow = false
+default = "deny"
 rules = ["identity.username != null"]
 ```
 

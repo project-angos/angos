@@ -32,7 +32,7 @@ Configure which repositories can access your registry:
 
 ```toml
 [global.access_policy]
-default_allow = false
+default = "deny"
 rules = [
   # Allow GitHub Actions from your organization
   "identity.oidc != null && identity.oidc.claims['repository'].startsWith('myorg/')"
@@ -103,7 +103,7 @@ The username must match the provider name (`github-actions` in this example).
 
 ```toml
 [repository."myapp".access_policy]
-default_allow = false
+default = "deny"
 rules = [
   '''identity.oidc != null &&
      identity.oidc.claims["repository"].matches("^myorg/(app1|app2|app3)$")'''
@@ -114,7 +114,7 @@ rules = [
 
 ```toml
 [repository."production".access_policy]
-default_allow = false
+default = "deny"
 rules = [
   '''identity.oidc != null &&
      identity.oidc.claims["ref"] == "refs/heads/main" &&
@@ -126,7 +126,7 @@ rules = [
 
 ```toml
 [repository."releases".access_policy]
-default_allow = false
+default = "deny"
 rules = [
   '''identity.oidc != null &&
      identity.oidc.claims["ref"].matches("^refs/tags/v[0-9]+\\.[0-9]+\\.[0-9]+$")'''
@@ -183,7 +183,7 @@ provider = "github"
 
 # Production: only main branch from specific repos
 [repository."production".access_policy]
-default_allow = false
+default = "deny"
 rules = [
   '''identity.oidc != null &&
      identity.oidc.provider_name == "github-actions" &&
@@ -193,7 +193,7 @@ rules = [
 
 # Dev: any branch from org
 [repository."dev".access_policy]
-default_allow = false
+default = "deny"
 rules = [
   '''identity.oidc != null &&
      identity.oidc.claims["repository"].startsWith("myorg/")'''
