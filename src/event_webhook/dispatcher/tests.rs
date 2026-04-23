@@ -10,9 +10,12 @@ use wiremock::{
 };
 
 use super::{EventDispatcher, compute_signature, matches_event};
-use crate::event_webhook::{
-    config::{DeliveryPolicy, EventWebhookConfig},
-    event::{Event, EventKind},
+use crate::{
+    configuration::RegexPattern,
+    event_webhook::{
+        config::{DeliveryPolicy, EventWebhookConfig},
+        event::{Event, EventKind},
+    },
 };
 
 fn create_test_event() -> Event {
@@ -91,7 +94,7 @@ fn compute_signature_empty_body() {
 
 fn create_test_config(
     events: Vec<EventKind>,
-    repository_filter: Option<Vec<String>>,
+    repository_filter: Option<Vec<RegexPattern>>,
 ) -> EventWebhookConfig {
     EventWebhookConfig {
         name: String::new(),
@@ -125,7 +128,7 @@ fn matches_event_no_filter_matches_all_repositories() {
 fn matches_event_with_filter_matches_matching_repository() {
     let config = create_test_config(
         vec![EventKind::ManifestPush],
-        Some(vec!["^myapp/.*".to_string()]),
+        Some(vec![RegexPattern::compile("^myapp/.*").unwrap()]),
     );
     assert!(matches_event(
         &config,
@@ -138,7 +141,7 @@ fn matches_event_with_filter_matches_matching_repository() {
 fn matches_event_with_filter_rejects_non_matching_repository() {
     let config = create_test_config(
         vec![EventKind::ManifestPush],
-        Some(vec!["^myapp/.*".to_string()]),
+        Some(vec![RegexPattern::compile("^myapp/.*").unwrap()]),
     );
     assert!(!matches_event(
         &config,
@@ -151,7 +154,10 @@ fn matches_event_with_filter_rejects_non_matching_repository() {
 fn matches_event_multiple_filters_matches_if_any_pattern_matches() {
     let config = create_test_config(
         vec![EventKind::ManifestPush],
-        Some(vec!["^myapp/.*".to_string(), "^library/.*".to_string()]),
+        Some(vec![
+            RegexPattern::compile("^myapp/.*").unwrap(),
+            RegexPattern::compile("^library/.*").unwrap(),
+        ]),
     );
     assert!(matches_event(
         &config,
@@ -203,7 +209,7 @@ fn matches_event_multiple_event_kinds() {
 fn matches_event_both_event_kind_and_repository_must_match() {
     let config = create_test_config(
         vec![EventKind::ManifestPush],
-        Some(vec!["^myapp/.*".to_string()]),
+        Some(vec![RegexPattern::compile("^myapp/.*").unwrap()]),
     );
     assert!(matches_event(
         &config,
@@ -447,7 +453,7 @@ async fn dispatch_skips_webhook_for_non_matching_repository() {
     let mut webhooks = HashMap::new();
     let mut config =
         create_webhook_config_for_url(&server.uri(), vec![EventKind::ManifestPush], None);
-    config.repository_filter = Some(vec!["^internal/.*".to_string()]);
+    config.repository_filter = Some(vec![RegexPattern::compile("^internal/.*").unwrap()]);
     webhooks.insert("test-hook".to_string(), config);
 
     let dispatcher = EventDispatcher::new(webhooks).unwrap();

@@ -1,8 +1,10 @@
-use regex::Regex;
 use serde::{Deserialize, Serialize};
 use url::Url;
 
-use crate::{configuration::Error, event_webhook::event::EventKind};
+use crate::{
+    configuration::{Error, RegexPattern},
+    event_webhook::event::EventKind,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -28,7 +30,7 @@ pub struct EventWebhookConfig {
     pub max_retries: u32,
     pub events: Vec<EventKind>,
     #[serde(default)]
-    pub repository_filter: Option<Vec<String>>,
+    pub repository_filter: Option<Vec<RegexPattern>>,
 }
 
 fn default_timeout_ms() -> u64 {
@@ -43,25 +45,18 @@ impl EventWebhookConfig {
             ));
         }
 
-        if let Some(filters) = &self.repository_filter {
-            for pattern in filters {
-                if let Err(e) = Regex::new(pattern) {
-                    return Err(Error::Initialization(format!(
-                        "Invalid repository filter regex '{pattern}': {e}"
-                    )));
-                }
-            }
-        }
-
         Ok(())
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::event_webhook::{
-        config::{DeliveryPolicy, EventWebhookConfig},
-        event::EventKind,
+    use crate::{
+        configuration::RegexPattern,
+        event_webhook::{
+            config::{DeliveryPolicy, EventWebhookConfig},
+            event::EventKind,
+        },
     };
 
     #[test]
@@ -123,7 +118,10 @@ mod tests {
         assert_eq!(config.events[1], EventKind::TagCreate);
         assert_eq!(
             config.repository_filter,
-            Some(vec!["^myapp/.*".to_string(), "^library/.*".to_string()])
+            Some(vec![
+                RegexPattern::compile("^myapp/.*").unwrap(),
+                RegexPattern::compile("^library/.*").unwrap(),
+            ])
         );
     }
 
@@ -172,7 +170,7 @@ mod tests {
     }
 
     #[test]
-    fn validate_webhook_config_invalid_regex_rejected() {
+    fn invalid_repository_filter_fails_at_deserialize() {
         let toml = r#"
             url = "https://example.com/webhook"
             policy = "required"
@@ -180,8 +178,7 @@ mod tests {
             repository_filter = ["^valid/.*", "[invalid"]
         "#;
 
-        let config: EventWebhookConfig = toml::from_str(toml).unwrap();
-        let result = config.validate();
+        let result: Result<EventWebhookConfig, _> = toml::from_str(toml);
         assert!(result.is_err());
     }
 

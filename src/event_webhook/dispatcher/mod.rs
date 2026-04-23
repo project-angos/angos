@@ -19,9 +19,9 @@ mod transport;
 #[cfg(test)]
 mod tests;
 
+use endpoint::WebhookEndpoint;
 #[cfg(test)]
 pub use endpoint::matches_event;
-use endpoint::{WebhookEndpoint, compile_filters};
 #[cfg(test)]
 pub use signature::compute_signature;
 use transport::send_with_retries;
@@ -124,19 +124,7 @@ impl EventDispatcher {
                     ))
                 })?;
 
-            let compiled_filters = compile_filters(
-                config.repository_filter.as_deref().unwrap_or_default(),
-                &name,
-            );
-
-            endpoints.insert(
-                name,
-                WebhookEndpoint {
-                    client,
-                    config,
-                    compiled_filters,
-                },
-            );
+            endpoints.insert(name, WebhookEndpoint { client, config });
         }
 
         Ok(Self {
