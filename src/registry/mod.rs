@@ -44,6 +44,7 @@ pub struct JsonResponse {
 pub use crate::policy::AccessPolicy;
 use crate::{
     cache,
+    configuration::RegexPattern,
     oci::Namespace,
     registry::{blob_store::BlobStore, metadata_store::MetadataStore, task_queue::TaskQueue},
 };
@@ -55,7 +56,7 @@ pub struct RegistryConfig {
     pub enable_manifest_redirect: bool,
     pub concurrent_cache_jobs: usize,
     pub global_immutable_tags: bool,
-    pub global_immutable_tags_exclusions: Vec<String>,
+    pub global_immutable_tags_exclusions: Vec<RegexPattern>,
 }
 
 impl Default for RegistryConfig {
@@ -101,7 +102,7 @@ impl RegistryConfig {
         self
     }
 
-    pub fn global_immutable_tags_exclusions(mut self, exclusions: Vec<String>) -> Self {
+    pub fn global_immutable_tags_exclusions(mut self, exclusions: Vec<RegexPattern>) -> Self {
         self.global_immutable_tags_exclusions = exclusions;
         self
     }
@@ -117,7 +118,7 @@ pub struct Registry {
     update_pull_time: bool,
     task_queue: TaskQueue,
     global_immutable_tags: bool,
-    global_immutable_tags_exclusions: Vec<String>,
+    global_immutable_tags_exclusions: Vec<RegexPattern>,
 }
 
 impl Debug for Registry {

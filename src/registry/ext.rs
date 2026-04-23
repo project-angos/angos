@@ -6,6 +6,7 @@ use serde::Serialize;
 use tracing::instrument;
 
 use crate::{
+    configuration::RegexPattern,
     oci::{Digest, Manifest, Namespace, Platform as OciPlatform},
     registry::{
         Error, JsonResponse, Registry, metadata_store::link_kind::LinkKind,
@@ -46,7 +47,7 @@ struct NamespacesBody {
     pull_through_cache: bool,
     upstream_urls: Vec<String>,
     immutable_tags: bool,
-    immutable_tags_exclusions: Vec<String>,
+    immutable_tags_exclusions: Vec<RegexPattern>,
 }
 
 #[derive(Serialize, Debug, Clone)]
@@ -122,7 +123,7 @@ struct RepositoryConfig {
     pull_through_cache: bool,
     upstream_urls: Vec<String>,
     immutable_tags: bool,
-    immutable_tags_exclusions: Vec<String>,
+    immutable_tags_exclusions: Vec<RegexPattern>,
 }
 
 impl Registry {

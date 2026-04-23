@@ -8,6 +8,7 @@ mod global;
 pub mod listeners;
 mod metadata_resolver;
 mod observability;
+pub mod regex_pattern;
 mod server;
 mod ui;
 mod validate;
@@ -16,6 +17,7 @@ pub mod watcher;
 pub use error::Error;
 pub use global::GlobalConfig;
 pub use observability::ObservabilityConfig;
+pub use regex_pattern::RegexPattern;
 pub use server::ServerConfig;
 pub use ui::UiConfig;
 

@@ -1,14 +1,13 @@
 use std::{collections::HashMap, sync::Arc};
 
 use hyper::http::request::Parts;
-use regex::Regex;
-use tracing::{debug, error, info, instrument};
+use tracing::{debug, info, instrument};
 
 use crate::{
     auth::webhook::WebhookAuthorizer,
     cache::Cache,
     command::server::Error,
-    configuration::Configuration,
+    configuration::{Configuration, RegexPattern},
     identity::{Action, ClientIdentity},
     oci::{Namespace, Reference},
     registry::{AccessPolicy, Registry},
@@ -21,7 +20,7 @@ pub struct Authorizer {
     global_access_policy: AccessPolicy,
     global_authorization_webhook: Option<String>,
     global_immutable_tags: bool,
-    global_immutable_tags_exclusions: Vec<Regex>,
+    global_immutable_tags_exclusions: Vec<RegexPattern>,
     webhooks: HashMap<String, Arc<WebhookAuthorizer>>,
     repositories: HashMap<String, AuthorizerRepository>,
 }
@@ -31,7 +30,7 @@ struct AuthorizerRepository {
     access_policy: Option<AccessPolicy>,
     authorization_webhook: Option<String>,
     immutable_tags: bool,
-    immutable_tags_exclusions: Vec<Regex>,
+    immutable_tags_exclusions: Vec<RegexPattern>,
 }
 
 impl Authorizer {
@@ -59,39 +58,16 @@ impl Authorizer {
                 Some(AccessPolicy::new(&repo_config.access_policy))
             };
 
-            let immutable_tags_exclusions = repo_config
-                .immutable_tags_exclusions
-                .iter()
-                .filter_map(|p| match Regex::new(p) {
-                    Ok(regex) => Some(regex),
-                    Err(e) => {
-                        error!("Invalid regex pattern '{p}' in repository '{name}': {e}");
-                        None
-                    }
-                })
-                .collect();
-
             let auth_repo = AuthorizerRepository {
                 access_policy,
                 authorization_webhook: repo_config.authorization_webhook.clone(),
                 immutable_tags: repo_config.immutable_tags,
-                immutable_tags_exclusions,
+                immutable_tags_exclusions: repo_config.immutable_tags_exclusions.clone(),
             };
             repositories.insert(name.clone(), auth_repo);
         }
 
-        let global_immutable_tags_exclusions = config
-            .global
-            .immutable_tags_exclusions
-            .iter()
-            .filter_map(|p| match Regex::new(p) {
-                Ok(regex) => Some(regex),
-                Err(e) => {
-                    error!("Invalid global regex pattern '{}': {}", p, e);
-                    None
-                }
-            })
-            .collect();
+        let global_immutable_tags_exclusions = config.global.immutable_tags_exclusions.clone();
 
         Ok(Self {
             global_access_policy,
@@ -394,7 +370,7 @@ mod tests {
     }
 
     #[test]
-    fn test_authorizer_new_with_invalid_global_regex() {
+    fn test_invalid_global_regex_fails_at_deserialize() {
         let toml = r#"
             [blob_store.fs]
             root_dir = "/tmp/test"
@@ -415,18 +391,15 @@ mod tests {
             immutable_tags_exclusions = ["[invalid"]
         "#;
 
-        let config: Configuration = toml::from_str(toml).unwrap();
-        let cache = cache::Config::Memory.to_backend().unwrap();
-
-        let authorizer = Authorizer::new(&config, &cache);
-
-        assert!(authorizer.is_ok());
-        let authorizer = authorizer.unwrap();
-        assert!(authorizer.global_immutable_tags_exclusions.is_empty());
+        let result: Result<Configuration, _> = toml::from_str(toml);
+        assert!(
+            result.is_err(),
+            "invalid global regex must fail at deserialize time"
+        );
     }
 
     #[test]
-    fn test_authorizer_new_with_invalid_repository_regex() {
+    fn test_invalid_repository_regex_fails_at_deserialize() {
         let toml = r#"
             [blob_store.fs]
             root_dir = "/tmp/test"
@@ -450,15 +423,11 @@ mod tests {
             immutable_tags_exclusions = ["[invalid"]
         "#;
 
-        let config: Configuration = toml::from_str(toml).unwrap();
-        let cache = cache::Config::Memory.to_backend().unwrap();
-
-        let authorizer = Authorizer::new(&config, &cache);
-
-        assert!(authorizer.is_ok());
-        let authorizer = authorizer.unwrap();
-        let repo = authorizer.repositories.get("myrepo").unwrap();
-        assert!(repo.immutable_tags_exclusions.is_empty());
+        let result: Result<Configuration, _> = toml::from_str(toml);
+        assert!(
+            result.is_err(),
+            "invalid repository regex must fail at deserialize time"
+        );
     }
 
     #[test]

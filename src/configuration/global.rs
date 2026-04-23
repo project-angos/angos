@@ -1,6 +1,9 @@
 use serde::Deserialize;
 
-use crate::policy::{AccessPolicyConfig, RetentionPolicyConfig};
+use crate::{
+    configuration::RegexPattern,
+    policy::{AccessPolicyConfig, RetentionPolicyConfig},
+};
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct GlobalConfig {
@@ -23,7 +26,7 @@ pub struct GlobalConfig {
     #[serde(default)]
     pub immutable_tags: bool,
     #[serde(default)]
-    pub immutable_tags_exclusions: Vec<String>,
+    pub immutable_tags_exclusions: Vec<RegexPattern>,
     pub authorization_webhook: Option<String>,
     #[serde(default)]
     pub event_webhooks: Vec<String>,

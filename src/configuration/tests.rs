@@ -180,8 +180,14 @@ fn test_global_config_custom_values() {
     assert!(config.global.update_pull_time);
     assert!(config.global.immutable_tags);
     assert_eq!(config.global.immutable_tags_exclusions.len(), 2);
-    assert_eq!(config.global.immutable_tags_exclusions[0], "latest");
-    assert_eq!(config.global.immutable_tags_exclusions[1], "dev");
+    assert_eq!(
+        config.global.immutable_tags_exclusions[0].as_source(),
+        "latest"
+    );
+    assert_eq!(
+        config.global.immutable_tags_exclusions[1].as_source(),
+        "dev"
+    );
     assert_eq!(
         config.global.authorization_webhook,
         Some("my-webhook".to_string())

@@ -5,6 +5,7 @@ use tracing::instrument;
 
 use crate::{
     cache::Cache,
+    configuration::RegexPattern,
     oci::{Digest, Namespace, Reference},
     policy::{AccessPolicyConfig, RetentionPolicy, RetentionPolicyConfig},
     registry::{Error, blob_store::BoxedReader},
@@ -26,7 +27,7 @@ pub struct Config {
     #[serde(default)]
     pub immutable_tags: bool,
     #[serde(default)]
-    pub immutable_tags_exclusions: Vec<String>,
+    pub immutable_tags_exclusions: Vec<RegexPattern>,
     pub authorization_webhook: Option<String>,
     #[serde(default)]
     pub event_webhooks: Vec<String>,
@@ -37,7 +38,7 @@ pub struct Repository {
     pub upstreams: Vec<RegistryClient>,
     pub retention_policy: RetentionPolicy,
     pub immutable_tags: bool,
-    pub immutable_tags_exclusions: Vec<String>,
+    pub immutable_tags_exclusions: Vec<RegexPattern>,
 }
 
 macro_rules! try_upstreams {
