@@ -11,7 +11,9 @@ use super::{Backend, chunked_reader::ChunkedReader};
 use crate::{
     oci::Digest,
     registry::{
-        blob_store::{Error, UploadState, hashing_reader::HashingReader, sha256_ext::Sha256Ext},
+        blob_store::{
+            Error, UploadState, UploadSummary, hashing_reader::HashingReader, sha256_ext::Sha256Ext,
+        },
         path_builder,
     },
 };
@@ -270,15 +272,14 @@ impl Backend {
         name: &str,
         uuid: &str,
         state: &UploadState,
-    ) -> Result<(Digest, u64, DateTime<Utc>), Error> {
+    ) -> Result<UploadSummary, Error> {
         let size = state.size;
-        let digest = self.load_hasher(name, uuid, size).await?.digest();
         let date_path = path_builder::upload_start_date_path(name, uuid);
         let date_bytes = self.store.get_object_body(&date_path, None).await?;
         let date_str = String::from_utf8_lossy(&date_bytes);
-        let start_date = DateTime::parse_from_rfc3339(&date_str)
+        let started_at = DateTime::parse_from_rfc3339(&date_str)
             .unwrap_or_else(|_| Utc::now().fixed_offset())
             .with_timezone(&Utc);
-        Ok((digest, size, start_date))
+        Ok(UploadSummary { size, started_at })
     }
 }

@@ -224,13 +224,11 @@ impl Registry {
 
         let mut all_uploads = Vec::new();
         for uuid in uuids {
-            if let Ok((_, size, started_at)) =
-                self.blob_store.read_upload_summary(namespace, &uuid).await
-            {
+            if let Ok(summary) = self.blob_store.read_upload_summary(namespace, &uuid).await {
                 all_uploads.push(UploadEntry {
                     uuid,
-                    size,
-                    started_at,
+                    size: summary.size,
+                    started_at: summary.started_at,
                 });
             }
         }

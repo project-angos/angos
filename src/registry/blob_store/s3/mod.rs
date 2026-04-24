@@ -16,7 +16,7 @@ use std::{
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use chrono::{DateTime, Utc};
+use chrono::Utc;
 use sha2::{Digest as ShaDigestTrait, Sha256};
 use tokio::io::AsyncRead;
 use tracing::{debug, info, instrument};
@@ -25,7 +25,9 @@ use crate::{
     cache::Cache,
     oci::Digest,
     registry::{
-        blob_store::{BlobStore, BoxedReader, Error, UploadState, sha256_ext::Sha256Ext},
+        blob_store::{
+            BlobStore, BoxedReader, Error, UploadState, UploadSummary, sha256_ext::Sha256Ext,
+        },
         data_store, pagination, path_builder,
     },
 };
@@ -181,11 +183,7 @@ impl BlobStore for Backend {
     }
 
     #[instrument(skip(self))]
-    async fn read_upload_summary(
-        &self,
-        name: &str,
-        uuid: &str,
-    ) -> Result<(Digest, u64, DateTime<Utc>), Error> {
+    async fn read_upload_summary(&self, name: &str, uuid: &str) -> Result<UploadSummary, Error> {
         let state = if self.uniform_parts {
             self.get_upload_state_uniform(name, uuid).await?
         } else {

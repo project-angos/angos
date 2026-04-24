@@ -16,6 +16,13 @@ use crate::oci::Digest;
 
 pub type BoxedReader = Box<dyn AsyncRead + Unpin + Send + Sync>;
 
+/// Summary of an in-progress or completed upload session.
+#[derive(Debug, Clone)]
+pub struct UploadSummary {
+    pub size: u64,
+    pub started_at: DateTime<Utc>,
+}
+
 /// A single part that has been successfully uploaded as part of a multipart upload.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct UploadedPart {
@@ -78,7 +85,7 @@ pub trait BlobStore: Send + Sync {
         &self,
         namespace: &str,
         uuid: &str,
-    ) -> Result<(Digest, u64, DateTime<Utc>), Error>;
+    ) -> Result<UploadSummary, Error>;
 
     async fn complete_upload(
         &self,
@@ -134,6 +141,11 @@ mod tests {
         let namespace = &Namespace::new("test-repo").unwrap();
 
         let upload_ids = ["upload1", "upload2", "upload3"];
+        let expected_first_digest = {
+            let mut hasher = Sha256::new();
+            hasher.update(format!("Content for upload {}", upload_ids[0]).into_bytes());
+            hasher.digest()
+        };
         for id in upload_ids {
             store.create_upload(namespace, id).await.unwrap();
 
@@ -182,16 +194,11 @@ mod tests {
 
         // Test upload operations - verify we can complete an upload
         let upload_to_complete = upload_ids[0];
-        let (digest, _size, _) = store
-            .read_upload_summary(namespace, upload_to_complete)
-            .await
-            .unwrap();
-
         let completed_digest = store
             .complete_upload(namespace, upload_to_complete, None)
             .await
             .unwrap();
-        assert_eq!(completed_digest, digest);
+        assert_eq!(completed_digest, expected_first_digest);
 
         // The upload should be gone after completion
         let (uploads_after_complete, _) = store.list_uploads(namespace, 10, None).await.unwrap();
@@ -321,13 +328,12 @@ mod tests {
             .await
             .unwrap();
 
-        let (digest, size, start_date) = store.read_upload_summary(namespace, &uuid).await.unwrap();
-        assert_eq!(size, test_content.len() as u64);
-        assert!(Utc::now().signed_duration_since(start_date) < Duration::hours(1));
-        assert_eq!(expected_digest, digest);
+        let summary = store.read_upload_summary(namespace, &uuid).await.unwrap();
+        assert_eq!(summary.size, test_content.len() as u64);
+        assert!(Utc::now().signed_duration_since(summary.started_at) < Duration::hours(1));
 
         let final_digest = store.complete_upload(namespace, &uuid, None).await.unwrap();
-        assert_eq!(final_digest, digest);
+        assert_eq!(final_digest, expected_digest);
 
         let blob_content = store.read_blob(&final_digest).await.unwrap();
         assert_eq!(blob_content, test_content);

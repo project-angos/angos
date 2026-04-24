@@ -18,8 +18,8 @@ use crate::{
     oci::Digest,
     registry::{
         blob_store::{
-            BlobStore, BoxedReader, Error, UploadState, hashing_reader::HashingReader,
-            sha256_ext::Sha256Ext,
+            BlobStore, BoxedReader, Error, UploadState, UploadSummary,
+            hashing_reader::HashingReader, sha256_ext::Sha256Ext,
         },
         data_store, pagination, path_builder,
     },
@@ -204,23 +204,18 @@ impl BlobStore for Backend {
     }
 
     #[instrument(skip(self))]
-    async fn read_upload_summary(
-        &self,
-        name: &str,
-        uuid: &str,
-    ) -> Result<(Digest, u64, DateTime<Utc>), Error> {
+    async fn read_upload_summary(&self, name: &str, uuid: &str) -> Result<UploadSummary, Error> {
         let path = path_builder::upload_path(name, uuid);
         let size = self.file_size_or_err(&path, Error::UploadNotFound).await?;
-        let digest = self.load_hasher(name, uuid, size).await?.digest();
 
         let date = path_builder::upload_start_date_path(name, uuid);
         let date_str = self.store.read_to_string(&date).await.unwrap_or_default();
-        let start_date = DateTime::parse_from_rfc3339(&date_str)
+        let started_at = DateTime::parse_from_rfc3339(&date_str)
             .ok()
             .unwrap_or_default() // Fallbacks to epoch
             .with_timezone(&Utc);
 
-        Ok((digest, size, start_date))
+        Ok(UploadSummary { size, started_at })
     }
 
     #[instrument(skip(self))]

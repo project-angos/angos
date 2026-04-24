@@ -230,12 +230,12 @@ impl Registry {
         session_id: Uuid,
     ) -> Result<GetUploadResponse, Error> {
         let uuid = session_id.to_string();
-        let (_, size, _) = self
+        let summary = self
             .blob_store
             .read_upload_summary(namespace, &uuid)
             .await?;
 
-        let range_max = size.saturating_sub(1);
+        let range_max = summary.size.saturating_sub(1);
 
         Ok(GetUploadResponse {
             headers: upload_status_headers(namespace, session_id, range_max),
@@ -247,16 +247,24 @@ impl Registry {
 mod tests {
     use std::io::Cursor;
 
+    use sha2::{Digest as ShaDigestTrait, Sha256};
     use uuid::Uuid;
 
     use super::*;
     use crate::{
-        oci::Namespace,
+        oci::{Digest, Namespace},
         registry::{
+            blob_store::sha256_ext::Sha256Ext,
             path_builder,
             tests::{FSRegistryTestCase, backends},
         },
     };
+
+    fn sha256_digest(content: &[u8]) -> Digest {
+        let mut hasher = Sha256::new();
+        hasher.update(content);
+        hasher.digest()
+    }
 
     #[tokio::test]
     async fn test_start_upload() {
@@ -336,12 +344,15 @@ mod tests {
                 format!("0-{}", content.len() + additional_content.len() - 1)
             );
 
-            let (_, size, _) = registry
+            let summary = registry
                 .blob_store
                 .read_upload_summary(namespace, &session_id.to_string())
                 .await
                 .unwrap();
-            assert_eq!(size, (content.len() + additional_content.len()) as u64);
+            assert_eq!(
+                summary.size,
+                (content.len() + additional_content.len()) as u64
+            );
         }
     }
 
@@ -365,21 +376,24 @@ mod tests {
                 .await
                 .unwrap();
 
-            let (upload_digest, _, _) = registry
-                .blob_store
-                .read_upload_summary(namespace, &session_id.to_string())
-                .await
-                .unwrap();
+            let expected_digest = sha256_digest(content);
 
             let empty_stream = Cursor::new(Vec::new());
             let response = registry
-                .complete_upload(None, namespace, session_id, &upload_digest, 0, empty_stream)
+                .complete_upload(
+                    None,
+                    namespace,
+                    session_id,
+                    &expected_digest,
+                    0,
+                    empty_stream,
+                )
                 .await
                 .unwrap();
 
             assert_eq!(
                 response.headers[DOCKER_CONTENT_DIGEST],
-                upload_digest.to_string()
+                expected_digest.to_string()
             );
             assert_eq!(response.events.len(), 1);
             assert!(matches!(
@@ -387,7 +401,11 @@ mod tests {
                 crate::event_webhook::event::EventKind::BlobPush
             ));
 
-            let stored_content = registry.blob_store.read_blob(&upload_digest).await.unwrap();
+            let stored_content = registry
+                .blob_store
+                .read_blob(&expected_digest)
+                .await
+                .unwrap();
             assert_eq!(stored_content, content);
         }
     }
@@ -555,15 +573,15 @@ mod tests {
                 .unwrap();
 
             assert_eq!(size, content.len() as u64);
+            assert_eq!(digest, sha256_digest(content));
 
-            let (expected_digest, expected_size, _) = registry
+            let summary = registry
                 .blob_store
                 .read_upload_summary(namespace, &session_id.to_string())
                 .await
                 .unwrap();
 
-            assert_eq!(digest, expected_digest);
-            assert_eq!(size, expected_size);
+            assert_eq!(size, summary.size);
         }
     }
 
@@ -632,26 +650,33 @@ mod tests {
             .await
             .unwrap();
 
-        let (upload_digest, size, _) = registry
+        let summary = registry
             .blob_store
             .read_upload_summary(namespace, &session_id.to_string())
             .await
             .unwrap();
 
-        assert_eq!(size, content.len() as u64);
+        assert_eq!(summary.size, content.len() as u64);
 
         let hash_state_path = path_builder::upload_hash_context_path(
             namespace,
             &session_id.to_string(),
             "sha256",
-            size,
+            summary.size,
         );
         let full_path = test_case.temp_dir().path().join(&hash_state_path);
         std::fs::write(&full_path, b"corrupted data").unwrap();
 
         let empty_stream = Cursor::new(Vec::new());
         let result = registry
-            .complete_upload(None, namespace, session_id, &upload_digest, 0, empty_stream)
+            .complete_upload(
+                None,
+                namespace,
+                session_id,
+                &sha256_digest(content),
+                0,
+                empty_stream,
+            )
             .await;
 
         assert!(

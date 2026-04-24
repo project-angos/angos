@@ -30,14 +30,13 @@ impl UploadChecker {
 
     async fn check_upload(&self, namespace: &str, uuid: &str) -> Result<(), Error> {
         debug!("Checking upload '{namespace}/{uuid}'");
-        let Ok((_, _, start_date)) = self.blob_store.read_upload_summary(namespace, uuid).await
-        else {
+        let Ok(summary) = self.blob_store.read_upload_summary(namespace, uuid).await else {
             debug!("Inconsistent upload state '{namespace}/{uuid}', deleting it");
             self.delete_upload(namespace, uuid).await?;
             return Ok(());
         };
 
-        if self.is_upload_obsolete(start_date) {
+        if self.is_upload_obsolete(summary.started_at) {
             self.delete_upload(namespace, uuid).await?;
         }
 
