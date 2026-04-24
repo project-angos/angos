@@ -78,16 +78,9 @@ impl Serialize for RegexPattern {
 mod tests {
     use super::*;
 
-    fn minimal_config(global_section: &str) -> String {
-        format!(
-            r#"
-[server]
-address = "127.0.0.1:5000"
-
-[global]
-{global_section}
-"#
-        )
+    #[derive(Debug, serde::Deserialize)]
+    struct Wrapper {
+        patterns: Vec<RegexPattern>,
     }
 
     #[test]
@@ -134,9 +127,7 @@ address = "127.0.0.1:5000"
 
     #[test]
     fn invalid_regex_fails_at_deserialize() {
-        use crate::configuration::Configuration;
-        let toml = minimal_config(r#"immutable_tags_exclusions = ["[invalid"]"#);
-        let result = Configuration::load_from_str(&toml);
+        let result: Result<Wrapper, _> = toml::from_str(r#"patterns = ["[invalid"]"#);
         assert!(
             result.is_err(),
             "invalid regex must fail at deserialize time"
@@ -145,18 +136,11 @@ address = "127.0.0.1:5000"
 
     #[test]
     fn valid_regex_deserializes() {
-        use crate::configuration::Configuration;
-        let toml = minimal_config(r#"immutable_tags_exclusions = ["^latest$", "^dev-.*"]"#);
-        let config = Configuration::load_from_str(&toml).expect("valid regex must deserialize");
-        assert_eq!(config.global.immutable_tags_exclusions.len(), 2);
-        assert_eq!(
-            config.global.immutable_tags_exclusions[0].as_source(),
-            "^latest$"
-        );
-        assert_eq!(
-            config.global.immutable_tags_exclusions[1].as_source(),
-            "^dev-.*"
-        );
+        let w: Wrapper =
+            toml::from_str(r#"patterns = ["^latest$", "^dev-.*"]"#).expect("valid regex");
+        assert_eq!(w.patterns.len(), 2);
+        assert_eq!(w.patterns[0].as_source(), "^latest$");
+        assert_eq!(w.patterns[1].as_source(), "^dev-.*");
     }
 
     #[test]

@@ -126,7 +126,7 @@ fn test_auth_section() {
 
     [auth.identity.user1]
     username = "bob"
-    password = "password456"
+    password = "$argon2id$v=19$m=19456,t=2,p=1$9pxWwg0VtZzDXno/25417Q$e+cuKy9VisJVxec/EEuKvvfIIIOy5yDGRzYKiuDLjx0"
 
     [auth.oidc.generic]
     provider = "generic"
@@ -520,13 +520,11 @@ fn test_validate_invalid_webhook_config() {
     "#;
 
     let result = Configuration::load_from_str(config);
-    assert!(result.is_err());
-    match result {
-        Err(Error::InvalidFormat(msg)) => {
-            assert!(msg.contains("Invalid webhook 'bad-webhook'"));
-        }
-        _ => panic!("Expected InvalidFormat error"),
-    }
+    let err = result.expect_err("malformed webhook URL must fail to load");
+    assert!(
+        err.to_string().contains("url"),
+        "error should mention the offending url field: {err}"
+    );
 }
 
 #[test]
@@ -1013,13 +1011,11 @@ fn test_event_webhook_invalid_config_fails_validation() {
     "#;
 
     let result = Configuration::load_from_str(config);
-    assert!(result.is_err());
-    match result {
-        Err(Error::InvalidFormat(msg)) => {
-            assert!(msg.contains("bad"));
-        }
-        _ => panic!("Expected InvalidFormat error"),
-    }
+    let err = result.expect_err("malformed event webhook URL must fail to load");
+    assert!(
+        err.to_string().contains("url"),
+        "error should mention the offending url field: {err}"
+    );
 }
 
 #[test]
