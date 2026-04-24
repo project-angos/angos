@@ -85,7 +85,7 @@ impl ConfigWatcher {
     }
 }
 
-fn get_tls_dirs(config: &Configuration, config_dir: &Path) -> HashSet<PathBuf> {
+fn compute_tls_dirs(config: &Configuration, config_dir: &Path) -> HashSet<PathBuf> {
     let ServerConfig::Tls(tls_config) = &config.server else {
         return HashSet::new();
     };
@@ -121,14 +121,19 @@ async fn watch_config_loop(
         fs::canonicalize(&config_path).unwrap_or_else(|_| config_path.clone());
     let canonical_config_dir = fs::canonicalize(&config_dir).unwrap_or_else(|_| config_dir.clone());
 
+    let mut cached_config: Option<Configuration> = match Configuration::load(&config_path) {
+        Ok(cfg) => Some(cfg),
+        Err(e) => {
+            warn!("Failed to load configuration, watching for changes: {e}");
+            None
+        }
+    };
+
     loop {
-        let tls_dirs = match Configuration::load(&config_path) {
-            Ok(config) => get_tls_dirs(&config, &config_dir),
-            Err(e) => {
-                warn!("Failed to load configuration, watching for changes: {e}");
-                HashSet::new()
-            }
-        };
+        let tls_dirs = cached_config
+            .as_ref()
+            .map(|cfg| compute_tls_dirs(cfg, &config_dir))
+            .unwrap_or_default();
         let canonical_tls_dirs: HashSet<PathBuf> = tls_dirs
             .iter()
             .map(|d| fs::canonicalize(d).unwrap_or_else(|_| d.clone()))
@@ -164,14 +169,19 @@ async fn watch_config_loop(
                 &canonical_config_dir,
                 &canonical_tls_dirs,
             ) {
-                ChangeKind::Irrelevant => continue,
+                ChangeKind::Irrelevant => {}
                 ChangeKind::Config => {
                     tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
                     info!("Configuration change detected, reloading");
                     match Configuration::load(&config_path) {
-                        Ok(ref cfg) => {
-                            notifier.notify_config_change(cfg).await;
+                        Ok(cfg) => {
+                            notifier.notify_config_change(&cfg).await;
                             info!("Configuration reloaded");
+                            let new_tls_dirs = compute_tls_dirs(&cfg, &config_dir);
+                            cached_config = Some(cfg);
+                            if new_tls_dirs != tls_dirs {
+                                break;
+                            }
                         }
                         Err(e) => warn!("Failed to reload configuration: {e}"),
                     }
@@ -179,21 +189,16 @@ async fn watch_config_loop(
                 ChangeKind::Tls => {
                     tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
                     info!("TLS certificate change detected, reloading");
-                    match Configuration::load(&config_path) {
-                        Ok(Configuration {
-                            server: ServerConfig::Tls(tls_config),
-                            ..
-                        }) => {
-                            notifier.notify_tls_config_change(&tls_config.tls);
-                            info!("TLS configuration reloaded");
-                        }
-                        Ok(_) => {}
-                        Err(e) => warn!("Failed to load configuration for TLS reload: {e}"),
+                    if let Some(Configuration {
+                        server: ServerConfig::Tls(tls_config),
+                        ..
+                    }) = cached_config.as_ref()
+                    {
+                        notifier.notify_tls_config_change(&tls_config.tls);
+                        info!("TLS configuration reloaded");
                     }
                 }
             }
-
-            break;
         }
     }
 }
