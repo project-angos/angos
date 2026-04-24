@@ -3,17 +3,20 @@ use std::{
     fs,
     path::{Path, PathBuf},
     sync::Arc,
+    time::Duration,
 };
 
 use async_trait::async_trait;
 use notify::{Event, EventKind, RecursiveMode, Watcher};
-use tokio::sync::mpsc;
+use tokio::{sync::mpsc, time::timeout};
 use tracing::{error, info, warn};
 
 use super::{Configuration, Error, ServerConfig};
 use crate::configuration::listeners::tls::ServerTlsConfig;
 
-#[derive(Debug, PartialEq)]
+const DEBOUNCE: Duration = Duration::from_millis(100);
+
+#[derive(Debug, Clone, Copy, PartialEq)]
 enum ChangeKind {
     Config,
     Tls,
@@ -53,6 +56,44 @@ fn classify_event(
     }
 
     ChangeKind::Irrelevant
+}
+
+/// Combines two `ChangeKind` values, preferring the stronger action.
+/// `Config` dominates `Tls`; a config edit covers TLS-path changes too.
+fn merge_change_kind(a: ChangeKind, b: ChangeKind) -> ChangeKind {
+    match (a, b) {
+        (ChangeKind::Config, _) | (_, ChangeKind::Config) => ChangeKind::Config,
+        (ChangeKind::Tls, _) | (_, ChangeKind::Tls) => ChangeKind::Tls,
+        _ => ChangeKind::Irrelevant,
+    }
+}
+
+/// After the first relevant event, drains the channel until no event arrives
+/// for `DEBOUNCE`. Returns the coalesced `ChangeKind` across the burst.
+/// Returns `None` if the channel closes during the debounce window.
+async fn coalesce_events(
+    rx: &mut mpsc::Receiver<Event>,
+    initial: ChangeKind,
+    canonical_config_path: &Path,
+    canonical_config_dir: &Path,
+    canonical_tls_dirs: &HashSet<PathBuf>,
+) -> Option<ChangeKind> {
+    let mut accumulated = initial;
+    loop {
+        match timeout(DEBOUNCE, rx.recv()).await {
+            Ok(Some(event)) => {
+                let kind = classify_event(
+                    &event,
+                    canonical_config_path,
+                    canonical_config_dir,
+                    canonical_tls_dirs,
+                );
+                accumulated = merge_change_kind(accumulated, kind);
+            }
+            Ok(None) => return None,
+            Err(_elapsed) => return Some(accumulated),
+        }
+    }
 }
 
 #[async_trait]
@@ -163,15 +204,32 @@ async fn watch_config_loop(
                 return Ok(());
             };
 
-            match classify_event(
+            let initial_kind = classify_event(
                 &event,
                 &canonical_config_path,
                 &canonical_config_dir,
                 &canonical_tls_dirs,
-            ) {
+            );
+            if matches!(initial_kind, ChangeKind::Irrelevant) {
+                continue;
+            }
+
+            let Some(kind) = coalesce_events(
+                &mut rx,
+                initial_kind,
+                &canonical_config_path,
+                &canonical_config_dir,
+                &canonical_tls_dirs,
+            )
+            .await
+            else {
+                error!("Config watcher channel closed");
+                return Ok(());
+            };
+
+            match kind {
                 ChangeKind::Irrelevant => {}
                 ChangeKind::Config => {
-                    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
                     info!("Configuration change detected, reloading");
                     match Configuration::load(&config_path) {
                         Ok(cfg) => {
@@ -187,7 +245,6 @@ async fn watch_config_loop(
                     }
                 }
                 ChangeKind::Tls => {
-                    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
                     info!("TLS certificate change detected, reloading");
                     if let Some(Configuration {
                         server: ServerConfig::Tls(tls_config),
@@ -603,5 +660,142 @@ bind_address = "10.0.0.1"
             detected,
             "Watcher should recover and detect valid config after invalid config"
         );
+    }
+
+    #[test]
+    fn merge_change_kind_config_dominates_tls() {
+        assert_eq!(
+            merge_change_kind(ChangeKind::Config, ChangeKind::Tls),
+            ChangeKind::Config,
+        );
+        assert_eq!(
+            merge_change_kind(ChangeKind::Tls, ChangeKind::Config),
+            ChangeKind::Config,
+        );
+    }
+
+    #[test]
+    fn merge_change_kind_tls_dominates_irrelevant() {
+        assert_eq!(
+            merge_change_kind(ChangeKind::Tls, ChangeKind::Irrelevant),
+            ChangeKind::Tls,
+        );
+        assert_eq!(
+            merge_change_kind(ChangeKind::Irrelevant, ChangeKind::Tls),
+            ChangeKind::Tls,
+        );
+    }
+
+    #[test]
+    fn merge_change_kind_both_irrelevant_stays_irrelevant() {
+        assert_eq!(
+            merge_change_kind(ChangeKind::Irrelevant, ChangeKind::Irrelevant),
+            ChangeKind::Irrelevant,
+        );
+    }
+
+    /// Verifies that a burst of N events coalesces into a single `ChangeKind`
+    /// result rather than producing N separate results. The coalescer must
+    /// drain all events and then return after the quiet-period timeout, not
+    /// once per event received.
+    #[tokio::test]
+    async fn coalesce_events_collapses_burst_into_single_result() {
+        let config_path = PathBuf::from("/etc/app/config.toml");
+        let config_dir = PathBuf::from("/etc/app");
+        let tls_dirs: HashSet<PathBuf> = HashSet::new();
+
+        let (tx, mut rx) = mpsc::channel(100);
+
+        // Send a burst of 10 events that classify as Config — all sent before
+        // the coalescer has a chance to time out, simulating e.g. an editor
+        // write → truncate → write sequence.
+        for _ in 0..10 {
+            let event = make_event(
+                EventKind::Modify(notify::event::ModifyKind::Data(
+                    notify::event::DataChange::Content,
+                )),
+                vec![config_path.clone()],
+            );
+            tx.send(event).await.unwrap();
+        }
+        // Keep `tx` alive so the coalescer terminates via the quiet-period
+        // timeout (Err(_elapsed)) path, not via channel close (Ok(None)).
+
+        let result = coalesce_events(
+            &mut rx,
+            ChangeKind::Config,
+            &config_path,
+            &config_dir,
+            &tls_dirs,
+        )
+        .await;
+
+        // All 10 events must have been folded into exactly one Config result.
+        assert_eq!(result, Some(ChangeKind::Config));
+    }
+
+    /// Verifies that a mixed burst (Tls events followed by a Config event)
+    /// coalesces to Config, since Config dominates Tls.
+    #[tokio::test]
+    async fn coalesce_events_config_dominates_tls_in_mixed_burst() {
+        let config_path = PathBuf::from("/etc/app/config.toml");
+        let config_dir = PathBuf::from("/etc/app");
+        let tls_dir = PathBuf::from("/etc/app/tls");
+        let tls_dirs: HashSet<PathBuf> = [tls_dir.clone()].into_iter().collect();
+
+        let (tx, mut rx) = mpsc::channel(100);
+
+        // Send TLS events first, then a Config event.
+        for _ in 0..5 {
+            let tls_event = make_event(
+                EventKind::Modify(notify::event::ModifyKind::Data(
+                    notify::event::DataChange::Content,
+                )),
+                vec![tls_dir.join("server.pem")],
+            );
+            tx.send(tls_event).await.unwrap();
+        }
+        let config_event = make_event(
+            EventKind::Modify(notify::event::ModifyKind::Data(
+                notify::event::DataChange::Content,
+            )),
+            vec![config_path.clone()],
+        );
+        tx.send(config_event).await.unwrap();
+        // Keep `tx` alive so the coalescer exits via quiet-period timeout.
+
+        let result = coalesce_events(
+            &mut rx,
+            ChangeKind::Tls,
+            &config_path,
+            &config_dir,
+            &tls_dirs,
+        )
+        .await;
+
+        assert_eq!(result, Some(ChangeKind::Config));
+    }
+
+    /// Verifies that channel closure during debounce returns None.
+    #[tokio::test]
+    async fn coalesce_events_returns_none_on_channel_close() {
+        let config_path = PathBuf::from("/etc/app/config.toml");
+        let config_dir = PathBuf::from("/etc/app");
+        let tls_dirs: HashSet<PathBuf> = HashSet::new();
+
+        let (tx, mut rx) = mpsc::channel(1);
+        // Close immediately without sending anything.
+        drop(tx);
+
+        let result = coalesce_events(
+            &mut rx,
+            ChangeKind::Config,
+            &config_path,
+            &config_dir,
+            &tls_dirs,
+        )
+        .await;
+
+        assert_eq!(result, None);
     }
 }
