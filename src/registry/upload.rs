@@ -254,7 +254,6 @@ mod tests {
     use crate::{
         oci::{Digest, Namespace},
         registry::{
-            blob_store::sha256_ext::Sha256Ext,
             path_builder,
             tests::{FSRegistryTestCase, backends},
         },
@@ -263,7 +262,7 @@ mod tests {
     fn sha256_digest(content: &[u8]) -> Digest {
         let mut hasher = Sha256::new();
         hasher.update(content);
-        hasher.digest()
+        Digest::Sha256(hex::encode(hasher.finalize().as_slice()).into())
     }
 
     #[tokio::test]
