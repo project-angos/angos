@@ -25,7 +25,7 @@
 use cel_interpreter::{Context, Value};
 use chrono::Utc;
 use serde::{Deserialize, Serialize, Serializer};
-use tracing::debug;
+use tracing::{debug, warn};
 
 use super::{CelRule, Error};
 
@@ -94,6 +94,23 @@ impl RetentionPolicy {
 
     /// Evaluates whether a manifest should be retained.
     ///
+    /// Rules are evaluated in order; the first matching rule (returning `true`) causes the
+    /// manifest to be kept. If no rule matches, the manifest is eligible for deletion.
+    ///
+    /// # Fail-open semantics (data safety)
+    ///
+    /// Retention policies are **fail-open**: unexpected rule outcomes default to keeping the
+    /// manifest. This is the safer choice — it is better to retain a manifest that should have
+    /// been deleted than to silently delete one that should have been kept.
+    ///
+    /// | Outcome                        | Behaviour          | Log level |
+    /// |--------------------------------|--------------------|-----------|
+    /// | `bool(true)`                   | retain             | `debug`   |
+    /// | `bool(false)`                  | continue to next rule | —      |
+    /// | non-boolean value (misconfiguration) | retain (fail-open) | `warn` |
+    /// | evaluation error               | retain (fail-open) | `warn`   |
+    /// | no rules matched               | delete             | —         |
+    ///
     /// # Arguments
     /// * `manifest` - The manifest image information
     /// * `last_pushed` - List of recently pushed tags (most recent first)
@@ -102,7 +119,7 @@ impl RetentionPolicy {
     /// # Returns
     /// * `Ok(true)` if the manifest should be retained
     /// * `Ok(false)` if the manifest can be deleted
-    /// * `Err` if policy evaluation fails
+    /// * `Err` if context construction fails (rule execution errors are handled internally)
     pub fn should_retain(
         &self,
         manifest: &ManifestImage,
@@ -115,15 +132,26 @@ impl RetentionPolicy {
 
         let context = Self::build_context(manifest, last_pushed, last_pulled)?;
 
-        for rule in &self.rules {
+        for (index, rule) in self.rules.iter().enumerate() {
+            let rule_index = index + 1;
             match rule.execute(&context) {
                 Ok(Value::Bool(true)) => {
-                    debug!("Retention rule matched");
+                    debug!("Retention rule {rule_index} matched");
                     return Ok(true);
                 }
                 Ok(Value::Bool(false)) => {}
-                _ => {
-                    debug!("Retention rule did not evaluate to a boolean, retaining");
+                Ok(value) => {
+                    warn!(
+                        "Retention rule {rule_index} returned non-boolean value: {value:?}; \
+                         treating as 'retain' (fail-open)"
+                    );
+                    return Ok(true);
+                }
+                Err(e) => {
+                    warn!(
+                        "Retention rule {rule_index} evaluation failed: {e}; \
+                         treating as 'retain' (fail-open)"
+                    );
                     return Ok(true);
                 }
             }
@@ -319,5 +347,51 @@ mod tests {
         let t = EpochSeconds::from_seconds(-100);
         let serialized = serde_json::to_value(t).unwrap();
         assert_eq!(serialized, serde_json::json!(0));
+    }
+
+    #[test]
+    fn non_boolean_rule_retains_fail_open() {
+        // A rule that returns an integer instead of a bool is a misconfiguration.
+        // The evaluator must treat this as "retain" (fail-open) without panicking.
+        let policy = RetentionPolicy::new(&RetentionPolicyConfig {
+            rules: vec![rule("42")],
+        });
+        let manifest = ManifestImage {
+            tag: Some("v1".to_string()),
+            ..Default::default()
+        };
+        assert!(policy.should_retain(&manifest, &[], &[]).unwrap());
+    }
+
+    #[test]
+    fn non_boolean_rule_string_retains_fail_open() {
+        // A rule that returns a string instead of a bool.
+        let policy = RetentionPolicy::new(&RetentionPolicyConfig {
+            rules: vec![rule("'keep'")],
+        });
+        let manifest = ManifestImage::default();
+        assert!(policy.should_retain(&manifest, &[], &[]).unwrap());
+    }
+
+    #[test]
+    fn failed_rule_evaluation_retains_fail_open() {
+        // A rule that references an unbound variable fails at execution time
+        // (not compile time).  The evaluator must treat this as "retain" (fail-open).
+        let policy = RetentionPolicy::new(&RetentionPolicyConfig {
+            rules: vec![rule("nonexistent_var")],
+        });
+        let manifest = ManifestImage::default();
+        assert!(policy.should_retain(&manifest, &[], &[]).unwrap());
+    }
+
+    #[test]
+    fn non_boolean_rule_does_not_shadow_later_rules() {
+        // When rule 1 returns a non-bool, the evaluator returns retain immediately
+        // (fail-open), so rule 2 is never reached.  Both orderings should retain.
+        let policy = RetentionPolicy::new(&RetentionPolicyConfig {
+            rules: vec![rule("42"), rule("false")],
+        });
+        let manifest = ManifestImage::default();
+        assert!(policy.should_retain(&manifest, &[], &[]).unwrap());
     }
 }

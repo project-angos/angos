@@ -97,6 +97,42 @@ impl AccessPolicy {
 
     /// Evaluates the access policy for a given action and identity.
     ///
+    /// Rules are evaluated in order; the first matching rule (returning `true`) flips the
+    /// default decision.  If no rule matches, the `default` mode determines the outcome.
+    ///
+    /// # Fail-open vs fail-closed semantics
+    ///
+    /// Access policies are **fail-closed by default** for non-boolean results: a misconfigured
+    /// rule that returns a non-boolean value is treated as a match (flipping the default).
+    /// The effect on the final decision depends on the operating mode:
+    ///
+    /// ## Allow mode (default-allow; rules are DENY rules)
+    ///
+    /// | Outcome                             | Behaviour              | Log level |
+    /// |-------------------------------------|------------------------|-----------|
+    /// | `bool(true)`  — rule matched        | deny (fail-closed)     | `debug`   |
+    /// | `bool(false)` — rule did not match  | continue to next rule  | —         |
+    /// | non-boolean value (misconfiguration)| deny (fail-closed)     | `warn`    |
+    /// | evaluation error                    | continue (fail-**open**)| `warn`   |
+    /// | no rules matched                    | allow (default)        | —         |
+    ///
+    /// In Allow mode, an evaluation error is the one genuinely fail-open case: a broken DENY
+    /// rule is skipped, and the default grants access.  This is a known trade-off; changing it
+    /// would require propagating `Err` through all callers.
+    ///
+    /// ## Deny mode (default-deny; rules are ALLOW rules)
+    ///
+    /// | Outcome                             | Behaviour              | Log level |
+    /// |-------------------------------------|------------------------|-----------|
+    /// | `bool(true)`  — rule matched        | allow (fail-open)      | `debug`   |
+    /// | `bool(false)` — rule did not match  | continue to next rule  | —         |
+    /// | non-boolean value (misconfiguration)| continue (skip rule)   | `warn`    |
+    /// | evaluation error                    | continue (skip rule)   | `warn`    |
+    /// | no rules matched                    | deny (default)         | —         |
+    ///
+    /// In Deny mode, both anomalous outcomes skip the rule and eventually fall through to the
+    /// default deny — fail-closed.
+    ///
     /// # Arguments
     /// * `action` - The domain action representing the registry operation
     /// * `identity` - The client identity containing authentication information
@@ -104,7 +140,7 @@ impl AccessPolicy {
     /// # Returns
     /// * `Ok(true)` if access should be granted
     /// * `Ok(false)` if access should be denied
-    /// * `Err` if policy evaluation fails
+    /// * `Err` if context construction fails (rule execution errors are handled internally)
     pub fn evaluate(&self, action: &Action, identity: &ClientIdentity) -> Result<bool, Error> {
         if self.rules.is_empty() {
             return Ok(self.default == AccessMode::Allow);
@@ -281,5 +317,67 @@ mod tests {
         "#;
         let config: AccessPolicyConfig = toml::from_str(toml).unwrap();
         assert_eq!(config.default, AccessMode::Deny);
+    }
+
+    // --- Non-boolean and error rule behaviour ---
+
+    #[test]
+    fn non_boolean_rule_in_allow_mode_denies_fail_closed() {
+        // Allow mode: rules are DENY rules.  A non-bool result is treated as a
+        // match → access is denied (fail-closed).
+        let config = AccessPolicyConfig {
+            default: AccessMode::Allow,
+            rules: vec![rule("42")],
+        };
+        let policy = AccessPolicy::new(&config);
+        let action = Action::ApiVersion;
+        let identity = ClientIdentity::default();
+
+        assert!(!policy.evaluate(&action, &identity).unwrap());
+    }
+
+    #[test]
+    fn non_boolean_rule_in_deny_mode_falls_through_to_deny() {
+        // Deny mode: rules are ALLOW rules.  A non-bool result is skipped (not
+        // treated as a match), so evaluation falls through to the default → deny.
+        let config = AccessPolicyConfig {
+            default: AccessMode::Deny,
+            rules: vec![rule("42")],
+        };
+        let policy = AccessPolicy::new(&config);
+        let action = Action::ApiVersion;
+        let identity = ClientIdentity::default();
+
+        assert!(!policy.evaluate(&action, &identity).unwrap());
+    }
+
+    #[test]
+    fn failed_rule_in_allow_mode_falls_through_to_allow_fail_open() {
+        // Allow mode: an evaluation error in a DENY rule is skipped, and the
+        // default grants access.  This is the documented fail-open case in Allow mode.
+        let config = AccessPolicyConfig {
+            default: AccessMode::Allow,
+            rules: vec![rule("nonexistent_var")],
+        };
+        let policy = AccessPolicy::new(&config);
+        let action = Action::ApiVersion;
+        let identity = ClientIdentity::default();
+
+        assert!(policy.evaluate(&action, &identity).unwrap());
+    }
+
+    #[test]
+    fn failed_rule_in_deny_mode_falls_through_to_deny_fail_closed() {
+        // Deny mode: an evaluation error in an ALLOW rule is skipped, and the
+        // default denies access (fail-closed).
+        let config = AccessPolicyConfig {
+            default: AccessMode::Deny,
+            rules: vec![rule("nonexistent_var")],
+        };
+        let policy = AccessPolicy::new(&config);
+        let action = Action::ApiVersion;
+        let identity = ClientIdentity::default();
+
+        assert!(!policy.evaluate(&action, &identity).unwrap());
     }
 }
