@@ -93,7 +93,7 @@ async fn handle_request(
         .as_ref()
         .map_or("unknown", Action::action_name);
 
-    let trace_id = trace_id_of(&Span::current());
+    let trace_id = current_trace_id(&Span::current());
 
     let response = match router(Arc::clone(&context), request).await {
         Ok(response) => response,
@@ -132,7 +132,7 @@ async fn handle_request(
 ///
 /// Returns `None` if the span has no `OpenTelemetry` bridge context (e.g. the
 /// span is disabled, or no `OpenTelemetry` layer is registered with the subscriber).
-fn trace_id_of(span: &Span) -> Option<String> {
+fn current_trace_id(span: &Span) -> Option<String> {
     let context = span.context();
     let otel_span = context.span();
     let span_context = otel_span.span_context();

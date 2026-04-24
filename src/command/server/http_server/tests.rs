@@ -1,5 +1,9 @@
 use std::collections::HashMap;
 
+use opentelemetry::trace::TracerProvider;
+use opentelemetry_sdk::trace::{Sampler, SdkTracerProvider};
+use tracing_subscriber::{layer::SubscriberExt, registry::Registry as TracingRegistry};
+
 use super::*;
 use crate::{
     command::server::handlers::{
@@ -513,4 +517,42 @@ async fn test_handle_delete_blob() {
         .unwrap();
 
     let _result = handle_delete_blob(&context, &namespace, &digest).await;
+}
+
+#[test]
+fn current_trace_id_returns_none_without_otel_layer() {
+    // Active tracing subscriber without any OpenTelemetry layer: span has no
+    // OTel context bridge, so current_trace_id must return None.
+    let subscriber = TracingRegistry::default();
+    let result = tracing::subscriber::with_default(subscriber, || {
+        let span = tracing::info_span!("test_span");
+        current_trace_id(&span)
+    });
+    assert_eq!(result, None);
+}
+
+#[test]
+fn current_trace_id_returns_hex_id_with_otel_layer() {
+    let provider = SdkTracerProvider::builder()
+        .with_sampler(Sampler::AlwaysOn)
+        .build();
+    let tracer = provider.tracer("angos-test");
+    let subscriber =
+        tracing_subscriber::registry().with(tracing_opentelemetry::layer().with_tracer(tracer));
+
+    let trace_id = tracing::subscriber::with_default(subscriber, || {
+        let span = tracing::info_span!("test_span");
+        current_trace_id(&span)
+    });
+
+    let trace_id = trace_id.expect("OTel-equipped subscriber must yield a trace ID");
+    assert_eq!(
+        trace_id.len(),
+        32,
+        "W3C trace ID is 32 hex chars, got {trace_id:?}"
+    );
+    assert!(
+        trace_id.chars().all(|c| c.is_ascii_hexdigit()),
+        "trace ID must be lowercase hex, got {trace_id:?}"
+    );
 }
