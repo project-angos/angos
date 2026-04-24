@@ -449,25 +449,36 @@ async fn handle_delete_manifest(
     Ok(response)
 }
 
-fn handle_ui_config(context: &ServerContext) -> Result<Response<ResponseBody>, Error> {
-    let config = serde_json::json!({
-        "name": context.ui_name
-    });
-    let body = serde_json::to_string(&config)?;
-
+fn json_response(
+    status: StatusCode,
+    body: impl Serialize,
+) -> Result<Response<ResponseBody>, Error> {
+    let json = serde_json::to_string(&body)?;
     Ok(Response::builder()
-        .status(StatusCode::OK)
+        .status(status)
         .header(CONTENT_TYPE, "application/json")
-        .body(ResponseBody::Fixed(Full::new(Bytes::from(body))))?)
+        .body(ResponseBody::Fixed(Full::new(Bytes::from(json))))?)
+}
+
+fn handle_ui_config(context: &ServerContext) -> Result<Response<ResponseBody>, Error> {
+    #[derive(Serialize)]
+    struct UiConfigResponse<'a> {
+        name: &'a str,
+    }
+    json_response(
+        StatusCode::OK,
+        &UiConfigResponse {
+            name: &context.ui_name,
+        },
+    )
 }
 
 fn handle_healthz() -> Result<Response<ResponseBody>, Error> {
-    Ok(Response::builder()
-        .status(StatusCode::OK)
-        .header(CONTENT_TYPE, "application/json")
-        .body(ResponseBody::Fixed(Full::new(Bytes::from(
-            r#"{"status":"ok"}"#,
-        ))))?)
+    #[derive(Serialize)]
+    struct HealthResponse {
+        status: &'static str,
+    }
+    json_response(StatusCode::OK, &HealthResponse { status: "ok" })
 }
 
 async fn handle_readyz(
@@ -498,22 +509,14 @@ async fn handle_readyz(
                 status: "ready",
                 conditional: if verbose { conditional.as_ref() } else { None },
             };
-            let body = serde_json::to_string(&payload)?;
-            Ok(Response::builder()
-                .status(StatusCode::OK)
-                .header(CONTENT_TYPE, "application/json")
-                .body(ResponseBody::Fixed(Full::new(Bytes::from(body))))?)
+            json_response(StatusCode::OK, &payload)
         }
         Err(e) => {
             let payload = NotReadyResponse {
                 status: "not_ready",
                 error: e.to_string(),
             };
-            let body = serde_json::to_string(&payload)?;
-            Ok(Response::builder()
-                .status(StatusCode::SERVICE_UNAVAILABLE)
-                .header(CONTENT_TYPE, "application/json")
-                .body(ResponseBody::Fixed(Full::new(Bytes::from(body))))?)
+            json_response(StatusCode::SERVICE_UNAVAILABLE, &payload)
         }
     }
 }
