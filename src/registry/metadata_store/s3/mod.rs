@@ -732,7 +732,7 @@ impl Backend {
                     any_creates = true;
                     let mut metadata = LinkMetadata::from_digest(target.clone())
                         .with_media_type(media_type.clone())
-                        .with_descriptor(descriptor.as_ref().clone());
+                        .with_descriptor(descriptor.as_deref().cloned());
                     if let Some(r) = referrer {
                         metadata.add_referrer(r.clone());
                     }
@@ -852,7 +852,7 @@ impl Backend {
                         old_target,
                         referrer: referrer.clone(),
                         media_type: media_type.clone(),
-                        descriptor: descriptor.as_ref().clone(),
+                        descriptor: descriptor.as_deref().cloned(),
                     });
                 }
                 LinkOperation::Delete { link, referrer } => {

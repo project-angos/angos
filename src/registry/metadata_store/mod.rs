@@ -91,7 +91,7 @@ pub enum LinkOperation {
         target: Digest,
         referrer: Option<Digest>,
         media_type: Option<String>,
-        descriptor: Box<Option<Descriptor>>,
+        descriptor: Option<Box<Descriptor>>,
     },
     Delete {
         link: LinkKind,
@@ -143,7 +143,7 @@ impl CreateLinkBuilder<'_> {
             target: self.target,
             referrer: self.referrer,
             media_type: self.media_type,
-            descriptor: Box::new(self.descriptor),
+            descriptor: self.descriptor.map(Box::new),
         });
     }
 }

@@ -77,7 +77,7 @@ pub trait LockOps: Send + Sync {
                             old_target,
                             referrer: referrer.clone(),
                             media_type: media_type.clone(),
-                            descriptor: descriptor.as_ref().clone(),
+                            descriptor: descriptor.as_deref().cloned(),
                         }),
                         None,
                     )
