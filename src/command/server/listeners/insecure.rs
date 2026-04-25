@@ -270,7 +270,8 @@ mod tests {
     }
 
     async fn create_server_context_from_config(config: &Configuration) -> ServerContext {
-        let blob_store = config.blob_store.to_backend(None).unwrap();
+        let (blob_store, upload_store, presigned_blob_store) =
+            config.blob_store.to_backend(None).unwrap();
         let metadata_store = config
             .resolve_metadata_config()
             .to_backend(None)
@@ -286,8 +287,15 @@ mod tests {
             .global_immutable_tags(false)
             .global_immutable_tags_exclusions(Vec::new());
 
-        let registry =
-            Registry::new(blob_store, metadata_store, repositories, registry_config).unwrap();
+        let registry = Registry::new(
+            blob_store,
+            upload_store,
+            presigned_blob_store,
+            metadata_store,
+            repositories,
+            registry_config,
+        )
+        .unwrap();
 
         ServerContext::new(config, registry).unwrap()
     }
@@ -532,7 +540,8 @@ mod tests {
         "#;
 
         let invalid_config: Configuration = toml::from_str(invalid_toml).unwrap();
-        let blob_store = invalid_config.blob_store.to_backend(None).unwrap();
+        let (blob_store, upload_store, presigned_blob_store) =
+            invalid_config.blob_store.to_backend(None).unwrap();
         let metadata_store = invalid_config
             .resolve_metadata_config()
             .to_backend(None)
@@ -548,8 +557,15 @@ mod tests {
             .global_immutable_tags(false)
             .global_immutable_tags_exclusions(Vec::new());
 
-        let registry =
-            Registry::new(blob_store, metadata_store, repositories, registry_config).unwrap();
+        let registry = Registry::new(
+            blob_store,
+            upload_store,
+            presigned_blob_store,
+            metadata_store,
+            repositories,
+            registry_config,
+        )
+        .unwrap();
 
         let result = ServerContext::new(&invalid_config, registry);
         assert!(result.is_err());

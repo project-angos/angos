@@ -17,6 +17,7 @@ use std::{
 use async_trait::async_trait;
 use bytes::Bytes;
 use chrono::Utc;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest as ShaDigestTrait, Sha256};
 use tokio::io::AsyncRead;
 use tracing::{debug, info, instrument};
@@ -26,7 +27,8 @@ use crate::{
     oci::Digest,
     registry::{
         blob_store::{
-            BlobStore, BoxedReader, Error, UploadState, UploadSummary, sha256_ext::Sha256Ext,
+            BlobStore, BoxedReader, Error, PresignedBlobStore, UploadState, UploadStore,
+            UploadSummary, sha256_ext::Sha256Ext,
         },
         data_store, pagination, path_builder,
     },
@@ -34,6 +36,24 @@ use crate::{
 
 pub const MIN_PART_SIZE: u64 = 5 * 1024 * 1024;
 pub const FRAME_SIZE: usize = 256 * 1024;
+
+/// A single part that has been successfully uploaded as part of a multipart upload.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct UploadedPart {
+    pub part_number: i32,
+    pub e_tag: String,
+    pub size: i64,
+}
+
+/// S3-internal upload state, cached between `write_upload` calls to avoid
+/// redundant round-trips to the S3 API.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct S3UploadState {
+    pub size: u64,
+    pub multipart_upload_id: Option<String>,
+    pub parts: Vec<UploadedPart>,
+    pub pending_size: u64,
+}
 
 #[derive(Clone)]
 pub struct Backend {
@@ -73,7 +93,7 @@ impl Backend {
 #[async_trait]
 impl BlobStore for Backend {
     #[instrument(skip(self))]
-    async fn list_blobs(
+    async fn list(
         &self,
         n: u16,
         continuation_token: Option<String>,
@@ -117,109 +137,8 @@ impl BlobStore for Backend {
         ))
     }
 
-    #[instrument(skip(self))]
-    async fn list_uploads(
-        &self,
-        namespace: &str,
-        n: u16,
-        continuation_token: Option<String>,
-    ) -> Result<(Vec<String>, Option<String>), Error> {
-        debug!(
-            "Fetching {n} upload(s) for namespace '{namespace}' with continuation token: {continuation_token:?}"
-        );
-        let uploads_dir = path_builder::uploads_root_dir(namespace);
-
-        let (prefixes, _, next_continuation_token) = self
-            .store
-            .list_prefixes(&uploads_dir, "/", i32::from(n), continuation_token, None)
-            .await?;
-
-        Ok((prefixes, next_continuation_token))
-    }
-
-    #[instrument(skip(self))]
-    async fn create_upload(&self, name: &str, uuid: &str) -> Result<String, Error> {
-        let date_path = path_builder::upload_start_date_path(name, uuid);
-        self.store
-            .put_object(&date_path, Utc::now().to_rfc3339())
-            .await?;
-
-        let state = Sha256::new().serialized_state();
-        self.save_hasher(name, uuid, 0, state).await?;
-
-        Ok(uuid.to_string())
-    }
-
-    #[instrument(skip(self, stream))]
-    async fn write_upload(
-        &self,
-        name: &str,
-        uuid: &str,
-        stream: Box<dyn AsyncRead + Unpin + Send + Sync>,
-        content_length: u64,
-        append: bool,
-        state: Option<UploadState>,
-    ) -> Result<(Digest, u64), Error> {
-        let result = if self.uniform_parts {
-            self.write_upload_uniform(name, uuid, stream, append, state)
-                .await
-        } else {
-            self.write_upload_nonuniform(name, uuid, stream, content_length, state)
-                .await
-        };
-        if result.is_ok() {
-            self.evict_upload_state(name, uuid).await;
-        }
-        result
-    }
-
-    #[instrument(skip(self))]
-    async fn get_upload_state(&self, name: &str, uuid: &str) -> Result<UploadState, Error> {
-        if self.uniform_parts {
-            self.get_upload_state_uniform(name, uuid).await
-        } else {
-            self.get_upload_state_nonuniform(name, uuid).await
-        }
-    }
-
-    #[instrument(skip(self))]
-    async fn read_upload_summary(&self, name: &str, uuid: &str) -> Result<UploadSummary, Error> {
-        let state = if self.uniform_parts {
-            self.get_upload_state_uniform(name, uuid).await?
-        } else {
-            self.get_upload_state_nonuniform(name, uuid).await?
-        };
-        self.build_upload_summary(name, uuid, &state).await
-    }
-
-    #[instrument(skip(self))]
-    async fn complete_upload(
-        &self,
-        name: &str,
-        uuid: &str,
-        digest: Option<&Digest>,
-    ) -> Result<Digest, Error> {
-        if self.uniform_parts {
-            self.complete_upload_uniform(name, uuid, digest).await
-        } else {
-            self.complete_upload_nonuniform(name, uuid, digest).await
-        }
-    }
-
-    #[instrument(skip(self))]
-    async fn delete_upload(&self, name: &str, uuid: &str) -> Result<(), Error> {
-        let upload_path = path_builder::upload_path(name, uuid);
-        self.evict_upload_id(&upload_path).await;
-        self.evict_upload_state(name, uuid).await;
-        self.store.abort_pending_uploads(&upload_path).await?;
-
-        let upload_path = path_builder::upload_container_path(name, uuid);
-        self.store.delete_prefix(&upload_path).await?;
-        Ok(())
-    }
-
     #[instrument(skip(self, content))]
-    async fn create_blob(&self, content: &[u8]) -> Result<Digest, Error> {
+    async fn create(&self, content: &[u8]) -> Result<Digest, Error> {
         let mut hasher = Sha256::new();
         hasher.update(content);
         let digest = hasher.digest();
@@ -233,13 +152,13 @@ impl BlobStore for Backend {
     }
 
     #[instrument(skip(self))]
-    async fn read_blob(&self, digest: &Digest) -> Result<Vec<u8>, Error> {
+    async fn read(&self, digest: &Digest) -> Result<Vec<u8>, Error> {
         let path = path_builder::blob_path(digest);
         Ok(self.store.get_object_body(&path, None).await?)
     }
 
     #[instrument(skip(self))]
-    async fn get_blob_size(&self, digest: &Digest) -> Result<u64, Error> {
+    async fn size(&self, digest: &Digest) -> Result<u64, Error> {
         let path = path_builder::blob_path(digest);
         match self.store.object_size(&path).await {
             Ok(size) => Ok(size),
@@ -249,7 +168,7 @@ impl BlobStore for Backend {
     }
 
     #[instrument(skip(self))]
-    async fn build_blob_reader(
+    async fn reader(
         &self,
         digest: &Digest,
         start_offset: Option<u64>,
@@ -278,7 +197,120 @@ impl BlobStore for Backend {
     }
 
     #[instrument(skip(self))]
-    async fn get_blob_url(
+    async fn delete(&self, digest: &Digest) -> Result<(), Error> {
+        let path = path_builder::blob_container_dir(digest);
+        self.store.delete_prefix(&path).await?;
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl UploadStore for Backend {
+    #[instrument(skip(self))]
+    async fn list(
+        &self,
+        namespace: &str,
+        n: u16,
+        continuation_token: Option<String>,
+    ) -> Result<(Vec<String>, Option<String>), Error> {
+        debug!(
+            "Fetching {n} upload(s) for namespace '{namespace}' with continuation token: {continuation_token:?}"
+        );
+        let uploads_dir = path_builder::uploads_root_dir(namespace);
+
+        let (prefixes, _, next_continuation_token) = self
+            .store
+            .list_prefixes(&uploads_dir, "/", i32::from(n), continuation_token, None)
+            .await?;
+
+        Ok((prefixes, next_continuation_token))
+    }
+
+    #[instrument(skip(self))]
+    async fn create(&self, name: &str, uuid: &str) -> Result<String, Error> {
+        let date_path = path_builder::upload_start_date_path(name, uuid);
+        self.store
+            .put_object(&date_path, Utc::now().to_rfc3339())
+            .await?;
+
+        let state = Sha256::new().serialized_state();
+        self.save_hasher(name, uuid, 0, state).await?;
+
+        Ok(uuid.to_string())
+    }
+
+    #[instrument(skip(self, stream))]
+    async fn write(
+        &self,
+        name: &str,
+        uuid: &str,
+        stream: Box<dyn AsyncRead + Unpin + Send + Sync>,
+        content_length: u64,
+        append: bool,
+    ) -> Result<(Digest, u64), Error> {
+        let result = if self.uniform_parts {
+            self.write_upload_uniform(name, uuid, stream, append).await
+        } else {
+            self.write_upload_nonuniform(name, uuid, stream, content_length)
+                .await
+        };
+        if result.is_ok() {
+            self.evict_upload_state(name, uuid).await;
+        }
+        result
+    }
+
+    #[instrument(skip(self))]
+    async fn state(&self, name: &str, uuid: &str) -> Result<UploadState, Error> {
+        let size = if self.uniform_parts {
+            self.get_upload_state_uniform(name, uuid).await?.size
+        } else {
+            self.get_upload_state_nonuniform(name, uuid).await?.size
+        };
+        Ok(UploadState { size })
+    }
+
+    #[instrument(skip(self))]
+    async fn summary(&self, name: &str, uuid: &str) -> Result<UploadSummary, Error> {
+        let state = if self.uniform_parts {
+            self.get_upload_state_uniform(name, uuid).await?
+        } else {
+            self.get_upload_state_nonuniform(name, uuid).await?
+        };
+        self.build_upload_summary(name, uuid, state.size).await
+    }
+
+    #[instrument(skip(self))]
+    async fn complete(
+        &self,
+        name: &str,
+        uuid: &str,
+        digest: Option<&Digest>,
+    ) -> Result<Digest, Error> {
+        if self.uniform_parts {
+            self.complete_upload_uniform(name, uuid, digest).await
+        } else {
+            self.complete_upload_nonuniform(name, uuid, digest).await
+        }
+    }
+
+    #[instrument(skip(self))]
+    async fn delete(&self, name: &str, uuid: &str) -> Result<(), Error> {
+        let upload_path = path_builder::upload_path(name, uuid);
+        self.evict_upload_id(&upload_path).await;
+        self.evict_upload_state(name, uuid).await;
+        self.store.abort_pending_uploads(&upload_path).await?;
+
+        let upload_path = path_builder::upload_container_path(name, uuid);
+        self.store.delete_prefix(&upload_path).await?;
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl PresignedBlobStore for Backend {
+    #[instrument(skip(self))]
+    async fn url(
         &self,
         digest: &Digest,
         content_type: Option<&str>,
@@ -289,12 +321,5 @@ impl BlobStore for Backend {
             .generate_presigned_url(&path, StdDuration::from_mins(30), content_type)
             .await?;
         Ok(Some(url))
-    }
-
-    #[instrument(skip(self))]
-    async fn delete_blob(&self, digest: &Digest) -> Result<(), Error> {
-        let path = path_builder::blob_container_dir(digest);
-        self.store.delete_prefix(&path).await?;
-        Ok(())
     }
 }

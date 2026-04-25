@@ -46,7 +46,8 @@ fn create_test_config() -> Configuration {
 
 pub async fn create_test_server_context() -> ServerContext {
     let config = create_test_config();
-    let blob_store = config.blob_store.to_backend(None).unwrap();
+    let (blob_store, upload_store, presigned_blob_store) =
+        config.blob_store.to_backend(None).unwrap();
     let metadata_store = config
         .resolve_metadata_config()
         .to_backend(None)
@@ -62,8 +63,15 @@ pub async fn create_test_server_context() -> ServerContext {
         .global_immutable_tags(false)
         .global_immutable_tags_exclusions(Vec::new());
 
-    let registry =
-        Registry::new(blob_store, metadata_store, repositories, registry_config).unwrap();
+    let registry = Registry::new(
+        blob_store,
+        upload_store,
+        presigned_blob_store,
+        metadata_store,
+        repositories,
+        registry_config,
+    )
+    .unwrap();
 
     ServerContext::new(&config, registry).unwrap()
 }
@@ -91,7 +99,8 @@ fn create_minimal_config() -> Configuration {
 }
 
 async fn create_test_registry(config: &Configuration) -> Registry {
-    let blob_store = config.blob_store.to_backend(None).unwrap();
+    let (blob_store, upload_store, presigned_blob_store) =
+        config.blob_store.to_backend(None).unwrap();
     let metadata_store = config
         .resolve_metadata_config()
         .to_backend(None)
@@ -114,7 +123,15 @@ async fn create_test_registry(config: &Configuration) -> Registry {
         .global_immutable_tags(config.global.immutable_tags)
         .global_immutable_tags_exclusions(config.global.immutable_tags_exclusions.clone());
 
-    Registry::new(blob_store, metadata_store, repositories, registry_config).unwrap()
+    Registry::new(
+        blob_store,
+        upload_store,
+        presigned_blob_store,
+        metadata_store,
+        repositories,
+        registry_config,
+    )
+    .unwrap()
 }
 
 #[tokio::test]
@@ -940,7 +957,8 @@ async fn test_shutdown_flushes_pending_access_times() {
             root_dir: "/tmp/test-blobs-shutdown-flush".to_string(),
             ..Default::default()
         });
-    let blob_store = blob_store_config.to_backend(None).unwrap();
+    let (blob_store, upload_store, presigned_blob_store) =
+        blob_store_config.to_backend(None).unwrap();
 
     let registry_config = RegistryConfig::new()
         .update_pull_time(false)
@@ -953,6 +971,8 @@ async fn test_shutdown_flushes_pending_access_times() {
     let repositories = Arc::new(HashMap::new());
     let registry = Registry::new(
         blob_store,
+        upload_store,
+        presigned_blob_store,
         metadata_store.clone(),
         repositories,
         registry_config,
@@ -1044,7 +1064,8 @@ async fn test_server_context_new_invalid_cache_config() {
 
     let config: Configuration = toml::from_str(toml).unwrap();
 
-    let blob_store = config.blob_store.to_backend(None).unwrap();
+    let (blob_store, upload_store, presigned_blob_store) =
+        config.blob_store.to_backend(None).unwrap();
     let metadata_store = config
         .resolve_metadata_config()
         .to_backend(None)
@@ -1060,8 +1081,15 @@ async fn test_server_context_new_invalid_cache_config() {
         .global_immutable_tags(config.global.immutable_tags)
         .global_immutable_tags_exclusions(config.global.immutable_tags_exclusions.clone());
 
-    let registry =
-        Registry::new(blob_store, metadata_store, repositories, registry_config).unwrap();
+    let registry = Registry::new(
+        blob_store,
+        upload_store,
+        presigned_blob_store,
+        metadata_store,
+        repositories,
+        registry_config,
+    )
+    .unwrap();
 
     let context = ServerContext::new(&config, registry);
 

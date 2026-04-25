@@ -689,7 +689,8 @@ mod tests {
 
         use crate::registry::{RegistryConfig, Repository};
 
-        let blob_store = config.blob_store.to_backend(None).unwrap();
+        let (blob_store, upload_store, presigned_blob_store) =
+            config.blob_store.to_backend(None).unwrap();
         let metadata_store = config
             .resolve_metadata_config()
             .to_backend(None)
@@ -712,7 +713,15 @@ mod tests {
             .global_immutable_tags(config.global.immutable_tags)
             .global_immutable_tags_exclusions(config.global.immutable_tags_exclusions.clone());
 
-        Registry::new(blob_store, metadata_store, repositories, registry_config).unwrap()
+        Registry::new(
+            blob_store,
+            upload_store,
+            presigned_blob_store,
+            metadata_store,
+            repositories,
+            registry_config,
+        )
+        .unwrap()
     }
 
     #[tokio::test]

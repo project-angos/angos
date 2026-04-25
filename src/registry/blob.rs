@@ -9,7 +9,7 @@ use crate::{
     oci::{Digest, Namespace},
     registry::{
         DOCKER_CONTENT_DIGEST, Error, Registry, Repository,
-        blob_store::{BlobStore, BoxedReader},
+        blob_store::{BlobStore, BoxedReader, UploadStore},
         metadata_store::{self, BlobIndexOperation, MetadataStoreExt, link_kind::LinkKind},
         task_queue,
     },
@@ -107,7 +107,7 @@ impl Registry {
             self.check_blob_namespace_access(namespace, digest).await?;
         }
 
-        let blob = self.blob_store.get_blob_size(digest).await;
+        let blob = self.blob_store.size(digest).await;
 
         match blob {
             Ok(size) => Ok(HeadBlobResponse {
@@ -128,40 +128,43 @@ impl Registry {
         }
     }
 
-    #[instrument(skip(storage_engine, stream))]
+    #[instrument(skip(storage_engine, upload_engine, stream))]
     async fn copy_blob(
         storage_engine: Arc<dyn BlobStore + Send + Sync>,
+        upload_engine: Arc<dyn UploadStore + Send + Sync>,
         stream: impl AsyncRead + Send + Sync + Unpin + 'static,
         namespace: &Namespace,
         digest: &Digest,
     ) -> Result<(), Error> {
         let session_id = Uuid::new_v4().to_string();
 
-        storage_engine.create_upload(namespace, &session_id).await?;
+        upload_engine.create(namespace, &session_id).await?;
 
-        storage_engine
-            .write_upload(namespace, &session_id, Box::new(stream), 0, false, None)
+        upload_engine
+            .write(namespace, &session_id, Box::new(stream), 0, false)
             .await?;
 
-        if let Err(error) = storage_engine
-            .complete_upload(namespace, &session_id, Some(digest))
+        if let Err(error) = upload_engine
+            .complete(namespace, &session_id, Some(digest))
             .await
         {
             debug!("Failed to complete upload: {error}");
             return Err(error.into());
         }
 
+        drop(storage_engine);
         Ok::<(), Error>(())
     }
 
     async fn cache_blob(
         store: Arc<dyn BlobStore + Send + Sync>,
+        upload_store: Arc<dyn UploadStore + Send + Sync>,
         stream: BoxedReader,
         namespace: Namespace,
         digest: Digest,
     ) -> Result<(), task_queue::Error> {
         debug!("Fetching blob: {digest}");
-        Self::copy_blob(store, stream, &namespace, &digest)
+        Self::copy_blob(store, upload_store, stream, &namespace, &digest)
             .await
             .map_err(|e| task_queue::Error::TaskExecution(e.to_string()))?;
         info!("Caching of {digest} completed");
@@ -209,6 +212,7 @@ impl Registry {
             &task_key,
             Self::cache_blob(
                 self.blob_store.clone(),
+                self.upload_store.clone(),
                 caching_stream,
                 namespace.clone(),
                 digest.clone(),
@@ -229,7 +233,7 @@ impl Registry {
     ) -> Result<GetBlobResponse, Error> {
         let start = range.map(|(start, _)| start);
 
-        let (reader, total_length) = self.blob_store.build_blob_reader(digest, start).await?;
+        let (reader, total_length) = self.blob_store.reader(digest, start).await?;
 
         if let Some((start, _)) = range
             && start > total_length
@@ -288,7 +292,7 @@ impl Registry {
             Err(_) => true,
         };
 
-        if should_delete && let Err(error) = self.blob_store.delete_blob(digest).await {
+        if should_delete && let Err(error) = self.blob_store.delete(digest).await {
             warn!("Failed to delete blob data: {error}");
         }
 
@@ -313,16 +317,11 @@ impl Registry {
             self.check_blob_namespace_access(namespace, digest).await?;
         }
 
-        // For pull-through repositories the blob index is populated when the
-        // manifest is cached, but the layer/config blobs themselves are only
-        // fetched on their first GET. Verify the blob is actually present in
-        // the local store before issuing a redirect; otherwise the client
-        // would follow the 307 to a missing object and see a 404.
         if range.is_none()
             && self.enable_blob_redirect
-            && (!repository.is_pull_through()
-                || self.blob_store.get_blob_size(digest).await.is_ok())
-            && let Ok(Some(presigned_url)) = self.blob_store.get_blob_url(digest, None).await
+            && (!repository.is_pull_through() || self.blob_store.size(digest).await.is_ok())
+            && let Some(presigned) = &self.presigned_blob_store
+            && let Ok(Some(presigned_url)) = presigned.url(digest, None).await
         {
             return Ok(GetBlobResponse::Redirect {
                 headers: get_blob_redirect_headers(presigned_url, digest),
@@ -501,12 +500,13 @@ mod tests {
 
             let stream = Cursor::new(content.to_vec());
             let storage_engine = registry.blob_store.clone();
+            let upload_engine = registry.upload_store.clone();
 
-            Registry::copy_blob(storage_engine, stream, namespace, &digest)
+            Registry::copy_blob(storage_engine, upload_engine, stream, namespace, &digest)
                 .await
                 .unwrap();
 
-            let stored_content = registry.blob_store.read_blob(&digest).await.unwrap();
+            let stored_content = registry.blob_store.read(&digest).await.unwrap();
             assert_eq!(stored_content, content);
         }
     }

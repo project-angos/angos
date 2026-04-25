@@ -1,8 +1,5 @@
-use super::Backend;
-use crate::{
-    cache::CacheExt,
-    registry::blob_store::{Error, UploadState},
-};
+use super::{Backend, S3UploadState};
+use crate::{cache::CacheExt, registry::blob_store::Error};
 
 impl Backend {
     pub fn upload_id_cache_key(path: &str) -> String {
@@ -40,7 +37,7 @@ impl Backend {
         format!("upload_state:{namespace}:{uuid}")
     }
 
-    pub async fn cache_upload_state(&self, namespace: &str, uuid: &str, state: &UploadState) {
+    pub async fn cache_upload_state(&self, namespace: &str, uuid: &str, state: &S3UploadState) {
         if let Some(cache) = &self.cache {
             let key = Self::upload_state_cache_key(namespace, uuid);
             let _ = cache.store(&key, state, 3600).await;
@@ -51,10 +48,10 @@ impl Backend {
         &self,
         namespace: &str,
         uuid: &str,
-    ) -> Option<UploadState> {
+    ) -> Option<S3UploadState> {
         if let Some(cache) = &self.cache {
             let key = Self::upload_state_cache_key(namespace, uuid);
-            if let Ok(Some(state)) = cache.retrieve::<UploadState>(&key).await {
+            if let Ok(Some(state)) = cache.retrieve::<S3UploadState>(&key).await {
                 return Some(state);
             }
         }

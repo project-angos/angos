@@ -46,7 +46,11 @@ use crate::{
     cache,
     configuration::RegexPattern,
     oci::Namespace,
-    registry::{blob_store::BlobStore, metadata_store::MetadataStore, task_queue::TaskQueue},
+    registry::{
+        blob_store::{BlobStore, PresignedBlobStore, UploadStore},
+        metadata_store::MetadataStore,
+        task_queue::TaskQueue,
+    },
 };
 
 #[allow(clippy::struct_excessive_bools)]
@@ -110,7 +114,9 @@ impl RegistryConfig {
 
 #[allow(clippy::struct_excessive_bools)]
 pub struct Registry {
-    blob_store: Arc<dyn BlobStore + Send + Sync>,
+    blob_store: Arc<dyn BlobStore>,
+    upload_store: Arc<dyn UploadStore>,
+    presigned_blob_store: Option<Arc<dyn PresignedBlobStore>>,
     metadata_store: Arc<dyn MetadataStore + Send + Sync>,
     repositories: Arc<HashMap<String, Repository>>,
     enable_blob_redirect: bool,
@@ -128,9 +134,18 @@ impl Debug for Registry {
 }
 
 impl Registry {
-    #[instrument(skip(blob_store, metadata_store, repositories, config))]
+    #[instrument(skip(
+        blob_store,
+        upload_store,
+        presigned_blob_store,
+        metadata_store,
+        repositories,
+        config
+    ))]
     pub fn new(
         blob_store: Arc<dyn BlobStore>,
+        upload_store: Arc<dyn UploadStore>,
+        presigned_blob_store: Option<Arc<dyn PresignedBlobStore>>,
         metadata_store: Arc<dyn MetadataStore>,
         repositories: Arc<HashMap<String, Repository>>,
         config: RegistryConfig,
@@ -140,6 +155,8 @@ impl Registry {
             enable_blob_redirect: config.enable_blob_redirect,
             enable_manifest_redirect: config.enable_manifest_redirect,
             blob_store,
+            upload_store,
+            presigned_blob_store,
             metadata_store,
             repositories,
             task_queue: TaskQueue::new(config.concurrent_cache_jobs, "cache-worker")?,

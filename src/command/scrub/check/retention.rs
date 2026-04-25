@@ -351,7 +351,7 @@ impl RetentionChecker {
 
         info!("Deleting orphan manifest '{namespace}@{digest}' (policy)");
 
-        let content = self.blob_store.read_blob(digest).await?;
+        let content = self.blob_store.read(digest).await?;
         let manifest = parse_manifest_digests(&content, None)?;
 
         let mut tx = self.metadata_store.begin_transaction(namespace);
@@ -480,7 +480,7 @@ mod tests {
             let blob_store = test_case.blob_store();
             let metadata_store = test_case.metadata_store();
 
-            let digest = blob_store.create_blob(TEST_MANIFEST).await.unwrap();
+            let digest = blob_store.create(TEST_MANIFEST).await.unwrap();
 
             let mut tx = metadata_store.begin_transaction(namespace);
             tx.create_link(&LinkKind::Digest(digest.clone()), &digest)
@@ -518,7 +518,7 @@ mod tests {
             let blob_store = test_case.blob_store();
             let metadata_store = test_case.metadata_store();
 
-            let digest = blob_store.create_blob(TEST_MANIFEST).await.unwrap();
+            let digest = blob_store.create(TEST_MANIFEST).await.unwrap();
 
             let mut tx = metadata_store.begin_transaction(namespace);
             tx.create_link(&LinkKind::Digest(digest.clone()), &digest)
@@ -552,8 +552,8 @@ mod tests {
             let blob_store = test_case.blob_store();
             let metadata_store = test_case.metadata_store();
 
-            let child_digest = blob_store.create_blob(TEST_MANIFEST).await.unwrap();
-            let index_digest = blob_store.create_blob(TEST_INDEX).await.unwrap();
+            let child_digest = blob_store.create(TEST_MANIFEST).await.unwrap();
+            let index_digest = blob_store.create(TEST_INDEX).await.unwrap();
 
             let mut tx = metadata_store.begin_transaction(namespace);
             tx.create_link(&LinkKind::Digest(child_digest.clone()), &child_digest)

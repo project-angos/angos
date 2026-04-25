@@ -89,7 +89,7 @@ impl Registry {
         digest: Option<Digest>,
     ) -> Result<StartUploadResponse, Error> {
         if let Some(digest) = digest
-            && self.blob_store.get_blob_size(&digest).await.is_ok()
+            && self.blob_store.size(&digest).await.is_ok()
         {
             return Ok(StartUploadResponse::ExistingBlob {
                 headers: blob_location_headers(namespace, &digest),
@@ -97,9 +97,7 @@ impl Registry {
         }
 
         let session_uuid = Uuid::new_v4().to_string();
-        self.blob_store
-            .create_upload(namespace, &session_uuid)
-            .await?;
+        self.upload_store.create(namespace, &session_uuid).await?;
 
         Ok(StartUploadResponse::Session {
             headers: upload_session_headers(namespace, &session_uuid),
@@ -120,10 +118,7 @@ impl Registry {
     {
         let session_key = session_id.to_string();
 
-        let state = self
-            .blob_store
-            .get_upload_state(namespace, &session_key)
-            .await?;
+        let state = self.upload_store.state(namespace, &session_key).await?;
 
         if let Some(offset) = start_offset
             && offset != state.size
@@ -132,14 +127,13 @@ impl Registry {
         }
 
         let (_, size) = self
-            .blob_store
-            .write_upload(
+            .upload_store
+            .write(
                 namespace,
                 &session_key,
                 Box::new(stream),
                 content_length,
                 true,
-                Some(state),
             )
             .await?;
 
@@ -165,26 +159,20 @@ impl Registry {
     {
         let session_key = session_id.to_string();
 
-        let state = match self
-            .blob_store
-            .get_upload_state(namespace, &session_key)
-            .await
-        {
-            Ok(state) => Some(state),
-            Err(blob_store::Error::UploadNotFound) => None,
+        let append = match self.upload_store.state(namespace, &session_key).await {
+            Ok(state) => state.size > 0,
+            Err(blob_store::Error::UploadNotFound) => false,
             Err(e) => return Err(e.into()),
         };
-        let append = state.as_ref().is_some_and(|s| s.size > 0);
 
         let (upload_digest, _) = self
-            .blob_store
-            .write_upload(
+            .upload_store
+            .write(
                 namespace,
                 &session_key,
                 Box::new(stream),
                 content_length,
                 append,
-                state,
             )
             .await?;
 
@@ -193,12 +181,10 @@ impl Registry {
             return Err(Error::DigestInvalid);
         }
 
-        self.blob_store
-            .complete_upload(namespace, &session_key, Some(digest))
+        self.upload_store
+            .complete(namespace, &session_key, Some(digest))
             .await?;
-        self.blob_store
-            .delete_upload(namespace, &session_key)
-            .await?;
+        self.upload_store.delete(namespace, &session_key).await?;
 
         let repository = self.repository_name_for(namespace);
         let event = Event::new(EventKind::BlobPush, namespace.to_string(), repository)
@@ -218,7 +204,7 @@ impl Registry {
         session_id: Uuid,
     ) -> Result<(), Error> {
         let uuid = session_id.to_string();
-        self.blob_store.delete_upload(namespace, &uuid).await?;
+        self.upload_store.delete(namespace, &uuid).await?;
 
         Ok(())
     }
@@ -230,10 +216,7 @@ impl Registry {
         session_id: Uuid,
     ) -> Result<GetUploadResponse, Error> {
         let uuid = session_id.to_string();
-        let summary = self
-            .blob_store
-            .read_upload_summary(namespace, &uuid)
-            .await?;
+        let summary = self.upload_store.summary(namespace, &uuid).await?;
 
         let range_max = summary.size.saturating_sub(1);
 
@@ -284,7 +267,7 @@ mod tests {
                 StartUploadResponse::ExistingBlob { .. } => panic!("Expected Session response"),
             }
 
-            let digest = registry.blob_store.create_blob(content).await.unwrap();
+            let digest = registry.blob_store.create(content).await.unwrap();
             let response = registry
                 .start_upload(namespace, Some(digest.clone()))
                 .await
@@ -311,8 +294,8 @@ mod tests {
             let session_id = Uuid::new_v4();
 
             registry
-                .blob_store
-                .create_upload(namespace, &session_id.to_string())
+                .upload_store
+                .create(namespace, &session_id.to_string())
                 .await
                 .unwrap();
 
@@ -344,8 +327,8 @@ mod tests {
             );
 
             let summary = registry
-                .blob_store
-                .read_upload_summary(namespace, &session_id.to_string())
+                .upload_store
+                .summary(namespace, &session_id.to_string())
                 .await
                 .unwrap();
             assert_eq!(
@@ -364,8 +347,8 @@ mod tests {
             let session_id = Uuid::new_v4();
 
             registry
-                .blob_store
-                .create_upload(namespace, &session_id.to_string())
+                .upload_store
+                .create(namespace, &session_id.to_string())
                 .await
                 .unwrap();
 
@@ -400,11 +383,7 @@ mod tests {
                 crate::event_webhook::event::EventKind::BlobPush
             ));
 
-            let stored_content = registry
-                .blob_store
-                .read_blob(&expected_digest)
-                .await
-                .unwrap();
+            let stored_content = registry.blob_store.read(&expected_digest).await.unwrap();
             assert_eq!(stored_content, content);
         }
     }
@@ -417,15 +396,15 @@ mod tests {
             let session_id = Uuid::new_v4();
 
             registry
-                .blob_store
-                .create_upload(namespace, &session_id.to_string())
+                .upload_store
+                .create(namespace, &session_id.to_string())
                 .await
                 .unwrap();
 
             assert!(
                 registry
-                    .blob_store
-                    .read_upload_summary(namespace, &session_id.to_string())
+                    .upload_store
+                    .summary(namespace, &session_id.to_string())
                     .await
                     .is_ok()
             );
@@ -434,8 +413,8 @@ mod tests {
 
             assert!(
                 registry
-                    .blob_store
-                    .read_upload_summary(namespace, &session_id.to_string())
+                    .upload_store
+                    .summary(namespace, &session_id.to_string())
                     .await
                     .is_err()
             );
@@ -451,8 +430,8 @@ mod tests {
             let session_id = Uuid::new_v4();
 
             registry
-                .blob_store
-                .create_upload(namespace, &session_id.to_string())
+                .upload_store
+                .create(namespace, &session_id.to_string())
                 .await
                 .unwrap();
 
@@ -487,8 +466,8 @@ mod tests {
             let session_id = Uuid::new_v4();
 
             registry
-                .blob_store
-                .create_upload(namespace, &session_id.to_string())
+                .upload_store
+                .create(namespace, &session_id.to_string())
                 .await
                 .unwrap();
 
@@ -517,8 +496,8 @@ mod tests {
             let session_id = Uuid::new_v4();
 
             registry
-                .blob_store
-                .create_upload(namespace, &session_id.to_string())
+                .upload_store
+                .create(namespace, &session_id.to_string())
                 .await
                 .unwrap();
 
@@ -551,22 +530,21 @@ mod tests {
             let content = b"hello world upload";
 
             registry
-                .blob_store
-                .create_upload(namespace, &session_id.to_string())
+                .upload_store
+                .create(namespace, &session_id.to_string())
                 .await
                 .unwrap();
 
             let stream: Box<dyn tokio::io::AsyncRead + Unpin + Send + Sync> =
                 Box::new(Cursor::new(content.to_vec()));
             let (digest, size) = registry
-                .blob_store
-                .write_upload(
+                .upload_store
+                .write(
                     namespace,
                     &session_id.to_string(),
                     stream,
                     content.len() as u64,
                     false,
-                    None,
                 )
                 .await
                 .unwrap();
@@ -575,8 +553,8 @@ mod tests {
             assert_eq!(digest, sha256_digest(content));
 
             let summary = registry
-                .blob_store
-                .read_upload_summary(namespace, &session_id.to_string())
+                .upload_store
+                .summary(namespace, &session_id.to_string())
                 .await
                 .unwrap();
 
@@ -593,14 +571,14 @@ mod tests {
             let content = b"size check content";
 
             registry
-                .blob_store
-                .create_upload(namespace, &session_id.to_string())
+                .upload_store
+                .create(namespace, &session_id.to_string())
                 .await
                 .unwrap();
 
             let state = registry
-                .blob_store
-                .get_upload_state(namespace, &session_id.to_string())
+                .upload_store
+                .state(namespace, &session_id.to_string())
                 .await
                 .unwrap();
             assert_eq!(state.size, 0);
@@ -608,21 +586,20 @@ mod tests {
             let stream: Box<dyn tokio::io::AsyncRead + Unpin + Send + Sync> =
                 Box::new(Cursor::new(content.to_vec()));
             registry
-                .blob_store
-                .write_upload(
+                .upload_store
+                .write(
                     namespace,
                     &session_id.to_string(),
                     stream,
                     content.len() as u64,
                     false,
-                    None,
                 )
                 .await
                 .unwrap();
 
             let state = registry
-                .blob_store
-                .get_upload_state(namespace, &session_id.to_string())
+                .upload_store
+                .state(namespace, &session_id.to_string())
                 .await
                 .unwrap();
             assert_eq!(state.size, content.len() as u64);
@@ -638,8 +615,8 @@ mod tests {
         let session_id = Uuid::new_v4();
 
         registry
-            .blob_store
-            .create_upload(namespace, &session_id.to_string())
+            .upload_store
+            .create(namespace, &session_id.to_string())
             .await
             .unwrap();
 
@@ -650,8 +627,8 @@ mod tests {
             .unwrap();
 
         let summary = registry
-            .blob_store
-            .read_upload_summary(namespace, &session_id.to_string())
+            .upload_store
+            .summary(namespace, &session_id.to_string())
             .await
             .unwrap();
 

@@ -17,10 +17,15 @@ use crate::{
     configuration::Configuration,
     policy::{RetentionPolicy, RetentionPolicyConfig},
     registry::{
-        Repository, blob_store, blob_store::BlobStore, metadata_store::MetadataStore,
-        pagination::collect_all_pages, repository,
+        Repository, blob_store,
+        blob_store::{BlobStore, UploadStore},
+        metadata_store::MetadataStore,
+        pagination::collect_all_pages,
+        repository,
     },
 };
+
+type BlobStores = (Arc<dyn BlobStore>, Arc<dyn UploadStore>);
 
 #[derive(FromArgs, PartialEq, Debug)]
 #[allow(clippy::struct_excessive_bools)]
@@ -66,13 +71,13 @@ pub struct Command {
     multipart_checker: Option<MultipartChecker>,
 }
 
-fn build_blob_store(config: &blob_store::BlobStorageConfig) -> Result<Arc<dyn BlobStore>, Error> {
-    let Ok(blob_store) = config.to_backend(None) else {
-        let msg = "Failed to initialize blob store".to_string();
-        return Err(Error::Initialization(msg));
-    };
-
-    Ok(blob_store)
+fn build_stores(config: &blob_store::BlobStorageConfig) -> Result<BlobStores, Error> {
+    match config.to_backend(None) {
+        Ok((blob_store, upload_store, _)) => Ok((blob_store, upload_store)),
+        Err(_) => Err(Error::Initialization(
+            "Failed to initialize blob store".to_string(),
+        )),
+    }
 }
 
 async fn build_metadata_store(config: &Configuration) -> Result<Arc<dyn MetadataStore>, Error> {
@@ -134,6 +139,7 @@ fn build_namespace_checkers(
     options: &Options,
     config: &Configuration,
     blob_store: &Arc<dyn BlobStore>,
+    upload_store: &Arc<dyn UploadStore>,
     metadata_store: &Arc<dyn MetadataStore>,
     repositories: &Arc<HashMap<String, Repository>>,
 ) -> Vec<Box<dyn NamespaceChecker>> {
@@ -159,7 +165,7 @@ fn build_namespace_checkers(
             upload_timeout.num_seconds()
         );
         checkers.push(Box::new(UploadChecker::new(
-            blob_store.clone(),
+            upload_store.clone(),
             upload_timeout,
             options.dry_run,
         )));
@@ -229,13 +235,19 @@ fn build_multipart_checker(
 
 impl Command {
     pub async fn new(options: &Options, config: &Configuration) -> Result<Self, Error> {
-        let blob_store = build_blob_store(&config.blob_store)?;
+        let (blob_store, upload_store) = build_stores(&config.blob_store)?;
         let metadata_store = build_metadata_store(config).await?;
         let auth_cache = build_auth_cache(&config.cache)?;
         let repositories = build_repositories(&config.repository, &auth_cache)?;
 
-        let namespace_checkers =
-            build_namespace_checkers(options, config, &blob_store, &metadata_store, &repositories);
+        let namespace_checkers = build_namespace_checkers(
+            options,
+            config,
+            &blob_store,
+            &upload_store,
+            &metadata_store,
+            &repositories,
+        );
         let blob_checker = build_blob_checker(options, &blob_store, &metadata_store);
         let multipart_checker = build_multipart_checker(options, &config.blob_store);
 

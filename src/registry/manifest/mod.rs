@@ -234,14 +234,10 @@ impl Registry {
             .await?;
 
         if let Some(media_type) = link.media_type {
-            let size = self
-                .blob_store
-                .get_blob_size(&link.target)
-                .await
-                .map_err(|error| {
-                    error!("Failed to get blob size: {error}");
-                    Error::ManifestUnknown
-                })?;
+            let size = self.blob_store.size(&link.target).await.map_err(|error| {
+                error!("Failed to get blob size: {error}");
+                Error::ManifestUnknown
+            })?;
 
             return Ok(ManifestMeta {
                 media_type: Some(media_type),
@@ -252,14 +248,14 @@ impl Registry {
 
         // Backward compatibility: links created before media_type was stored require
         // a full blob read. Remove this fallback once all links have been re-pushed.
-        let (mut reader, _) = self
-            .blob_store
-            .build_blob_reader(&link.target, None)
-            .await
-            .map_err(|error| {
-                error!("Failed to build blob reader: {error}");
-                Error::ManifestUnknown
-            })?;
+        let (mut reader, _) =
+            self.blob_store
+                .reader(&link.target, None)
+                .await
+                .map_err(|error| {
+                    error!("Failed to build blob reader: {error}");
+                    Error::ManifestUnknown
+                })?;
 
         let mut manifest_content = Vec::new();
         reader.read_to_end(&mut manifest_content).await?;
@@ -333,7 +329,7 @@ impl Registry {
             .read_link(namespace, &blob_link, self.update_pull_time)
             .await?;
 
-        let content = self.blob_store.read_blob(&link.target).await?;
+        let content = self.blob_store.read(&link.target).await?;
         let manifest = serde_json::from_slice::<Manifest>(&content).map_err(|error| {
             warn!("Failed to deserialize manifest: {error}");
             Error::ManifestInvalid("Failed to deserialize manifest".to_string())
@@ -361,7 +357,7 @@ impl Registry {
 
         validate_media_type_match(&manifest, content_type)?;
 
-        let digest = self.blob_store.create_blob(body).await?;
+        let digest = self.blob_store.create(body).await?;
 
         if let Reference::Digest(provided_digest) = reference
             && provided_digest != &digest
@@ -499,7 +495,7 @@ impl Registry {
                     tx.delete_link(&tag_link);
                 }
 
-                if let Ok(content) = self.blob_store.read_blob(digest).await
+                if let Ok(content) = self.blob_store.read(digest).await
                     && let Ok(manifest) = Manifest::from_slice(&content)
                 {
                     if let Some(subject) = manifest.subject {
@@ -586,10 +582,9 @@ impl Registry {
                     .await
             }
             && let Some(media_type) = link.media_type
-            && let Ok(Some(presigned_url)) = self
-                .blob_store
-                .get_blob_url(&link.target, Some(media_type.as_str()))
-                .await
+            && let Some(presigned) = &self.presigned_blob_store
+            && let Ok(Some(presigned_url)) =
+                presigned.url(&link.target, Some(media_type.as_str())).await
         {
             return Ok(GetManifestResponse::Redirect {
                 headers: get_manifest_redirect_headers(
@@ -614,9 +609,9 @@ impl Registry {
         // lacks media_type), fall back to redirecting after reading the full blob.
         // Remove this block once all links have been re-pushed.
         if self.enable_manifest_redirect
-            && let Ok(Some(presigned_url)) = self
-                .blob_store
-                .get_blob_url(&manifest.digest, manifest.media_type.as_deref())
+            && let Some(presigned) = &self.presigned_blob_store
+            && let Ok(Some(presigned_url)) = presigned
+                .url(&manifest.digest, manifest.media_type.as_deref())
                 .await
         {
             return Ok(GetManifestResponse::Redirect {

@@ -9,7 +9,6 @@ use async_trait::async_trait;
 use chrono::{DateTime, Duration, Utc};
 pub use config::BlobStorageConfig;
 pub use error::Error;
-use serde::{Deserialize, Serialize};
 use tokio::io::AsyncRead;
 
 use crate::oci::Digest;
@@ -23,98 +22,80 @@ pub struct UploadSummary {
     pub started_at: DateTime<Utc>,
 }
 
-/// A single part that has been successfully uploaded as part of a multipart upload.
-#[derive(Debug, Serialize, Deserialize)]
-pub struct UploadedPart {
-    pub part_number: i32,
-    pub e_tag: String,
-    pub size: i64,
-}
-
-/// Precomputed state for an in-progress upload session.
+/// State for an in-progress upload session as visible to callers outside the blob-store.
 ///
-/// Returned by [`BlobStore::get_upload_state`] and accepted by
-/// [`BlobStore::write_upload`] to avoid redundant S3 round-trips.
-/// The `size` field is the only value callers outside the blob-store module
-/// need to inspect; the remaining fields are consumed by `write_upload`.
-#[derive(Debug, Serialize, Deserialize)]
+/// Only the total byte count is part of the public contract. Backend-specific state
+/// (multipart upload IDs, part lists, pending buffers) is managed entirely within
+/// each backend implementation.
+#[derive(Debug, Clone)]
 pub struct UploadState {
     pub size: u64,
-    /// Multipart upload ID; `None` for backends that do not use multipart uploads.
-    pub multipart_upload_id: Option<String>,
-    /// Parts already uploaded in the current multipart upload session.
-    pub parts: Vec<UploadedPart>,
-    /// Bytes buffered in the pending object (non-uniform S3 mode only).
-    pub pending_size: u64,
 }
 
 #[async_trait]
 pub trait BlobStore: Send + Sync {
-    async fn list_blobs(
+    async fn list(
         &self,
         n: u16,
         continuation_token: Option<String>,
     ) -> Result<(Vec<Digest>, Option<String>), Error>;
 
-    async fn list_uploads(
+    async fn create(&self, content: &[u8]) -> Result<Digest, Error>;
+
+    async fn read(&self, digest: &Digest) -> Result<Vec<u8>, Error>;
+
+    async fn size(&self, digest: &Digest) -> Result<u64, Error>;
+
+    async fn reader(
+        &self,
+        digest: &Digest,
+        start_offset: Option<u64>,
+    ) -> Result<(BoxedReader, u64), Error>;
+
+    async fn delete(&self, digest: &Digest) -> Result<(), Error>;
+}
+
+#[async_trait]
+pub trait UploadStore: Send + Sync {
+    async fn list(
         &self,
         namespace: &str,
         n: u16,
         continuation_token: Option<String>,
     ) -> Result<(Vec<String>, Option<String>), Error>;
 
-    async fn create_upload(&self, namespace: &str, uuid: &str) -> Result<String, Error>;
+    async fn create(&self, namespace: &str, uuid: &str) -> Result<String, Error>;
 
-    async fn write_upload(
+    async fn write(
         &self,
         namespace: &str,
         uuid: &str,
         stream: Box<dyn AsyncRead + Unpin + Send + Sync>,
         content_length: u64,
         append: bool,
-        state: Option<UploadState>,
     ) -> Result<(Digest, u64), Error>;
 
-    /// Returns the precomputed state for an upload session.
-    ///
-    /// Callers that subsequently invoke [`BlobStore::write_upload`] should pass
-    /// the returned `UploadState` through to avoid redundant storage queries.
-    async fn get_upload_state(&self, namespace: &str, uuid: &str) -> Result<UploadState, Error>;
+    async fn state(&self, namespace: &str, uuid: &str) -> Result<UploadState, Error>;
 
-    async fn read_upload_summary(
-        &self,
-        namespace: &str,
-        uuid: &str,
-    ) -> Result<UploadSummary, Error>;
+    async fn summary(&self, namespace: &str, uuid: &str) -> Result<UploadSummary, Error>;
 
-    async fn complete_upload(
+    async fn complete(
         &self,
         namespace: &str,
         uuid: &str,
         digest: Option<&Digest>,
     ) -> Result<Digest, Error>;
 
-    async fn delete_upload(&self, namespace: &str, uuid: &str) -> Result<(), Error>;
+    async fn delete(&self, namespace: &str, uuid: &str) -> Result<(), Error>;
+}
 
-    async fn create_blob(&self, content: &[u8]) -> Result<Digest, Error>;
-
-    async fn read_blob(&self, digest: &Digest) -> Result<Vec<u8>, Error>;
-
-    async fn get_blob_size(&self, digest: &Digest) -> Result<u64, Error>;
-
-    async fn build_blob_reader(
-        &self,
-        digest: &Digest,
-        start_offset: Option<u64>,
-    ) -> Result<(BoxedReader, u64), Error>;
-
-    async fn get_blob_url(
+#[async_trait]
+pub trait PresignedBlobStore: Send + Sync {
+    async fn url(
         &self,
         digest: &Digest,
         content_type: Option<&str>,
     ) -> Result<Option<String>, Error>;
-
-    async fn delete_blob(&self, digest: &Digest) -> Result<(), Error>;
 }
 
 #[async_trait]
@@ -137,65 +118,58 @@ mod tests {
     use super::*;
     use crate::{oci::Namespace, registry::blob_store::sha256_ext::Sha256Ext};
 
-    pub async fn test_datastore_list_uploads(store: &impl BlobStore) {
+    pub async fn test_datastore_list_uploads(store: &impl UploadStore) {
         let namespace = &Namespace::new("test-repo").unwrap();
 
         let upload_ids = ["upload1", "upload2", "upload3"];
         for id in upload_ids {
-            store.create_upload(namespace, id).await.unwrap();
+            store.create(namespace, id).await.unwrap();
 
             let content = format!("Content for upload {id}").into_bytes();
             store
-                .write_upload(
-                    namespace,
-                    id,
-                    Box::new(Cursor::new(content)),
-                    0,
-                    false,
-                    None,
-                )
+                .write(namespace, id, Box::new(Cursor::new(content)), 0, false)
                 .await
                 .unwrap();
         }
 
         // Verify we can list all uploads
-        let (uploads, _token) = store.list_uploads(namespace, 10, None).await.unwrap();
+        let (uploads, _token) = store.list(namespace, 10, None).await.unwrap();
         assert_eq!(uploads.len(), upload_ids.len());
         for id in upload_ids {
             assert!(uploads.contains(&id.to_string()));
         }
 
         // Test pagination (2 items per page)
-        let (page1, token1) = store.list_uploads(namespace, 2, None).await.unwrap();
+        let (page1, token1) = store.list(namespace, 2, None).await.unwrap();
         assert_eq!(page1.len(), 2);
         assert!(token1.is_some());
 
-        let (page2, token2) = store.list_uploads(namespace, 2, token1).await.unwrap();
+        let (page2, token2) = store.list(namespace, 2, token1).await.unwrap();
         assert_eq!(page2.len(), 1);
         assert!(token2.is_none());
 
         // Test pagination (1 item per page)
-        let (page1, token1) = store.list_uploads(namespace, 1, None).await.unwrap();
+        let (page1, token1) = store.list(namespace, 1, None).await.unwrap();
         assert_eq!(page1.len(), 1);
         assert!(token1.is_some());
 
-        let (page2, token2) = store.list_uploads(namespace, 1, token1).await.unwrap();
+        let (page2, token2) = store.list(namespace, 1, token1).await.unwrap();
         assert_eq!(page2.len(), 1);
         assert!(token2.is_some());
 
-        let (page3, token3) = store.list_uploads(namespace, 1, token2).await.unwrap();
+        let (page3, token3) = store.list(namespace, 1, token2).await.unwrap();
         assert_eq!(page3.len(), 1);
         assert!(token3.is_none());
 
         // Test upload operations - verify we can complete an upload
         let upload_to_complete = upload_ids[0];
         store
-            .complete_upload(namespace, upload_to_complete, None)
+            .complete(namespace, upload_to_complete, None)
             .await
             .unwrap();
 
         // The upload should be gone after completion
-        let (uploads_after_complete, _) = store.list_uploads(namespace, 10, None).await.unwrap();
+        let (uploads_after_complete, _) = store.list(namespace, 10, None).await.unwrap();
         assert_eq!(uploads_after_complete.len(), upload_ids.len() - 1);
         assert!(!uploads_after_complete.contains(&upload_to_complete.to_string()));
     }
@@ -209,52 +183,52 @@ mod tests {
 
         let mut digests = Vec::new();
         for content in &blob_contents {
-            let digest = store.create_blob(content).await.unwrap();
+            let digest = store.create(content).await.unwrap();
             digests.push(digest);
         }
 
         // Test without pagination
-        let (blobs, _token) = store.list_blobs(10, None).await.unwrap();
+        let (blobs, _token) = store.list(10, None).await.unwrap();
         assert!(blobs.len() >= blob_contents.len());
         for digest in &digests {
             assert!(blobs.contains(digest));
         }
 
         // Test pagination (2 items per page)
-        let (page1, token1) = store.list_blobs(2, None).await.unwrap();
+        let (page1, token1) = store.list(2, None).await.unwrap();
         assert_eq!(page1.len(), 2);
         assert!(token1.is_some());
 
-        let (page2, token2) = store.list_blobs(2, token1).await.unwrap();
+        let (page2, token2) = store.list(2, token1).await.unwrap();
         assert_eq!(page2.len(), 1);
         assert!(token2.is_none());
 
         // Test pagination (1 item per page)
-        let (page1, token1) = store.list_blobs(1, None).await.unwrap();
+        let (page1, token1) = store.list(1, None).await.unwrap();
         assert_eq!(page1.len(), 1);
         assert!(token1.is_some());
 
-        let (page2, token2) = store.list_blobs(1, token1).await.unwrap();
+        let (page2, token2) = store.list(1, token1).await.unwrap();
         assert_eq!(page2.len(), 1);
         assert!(token2.is_some());
 
-        let (page3, token3) = store.list_blobs(1, token2).await.unwrap();
+        let (page3, token3) = store.list(1, token2).await.unwrap();
         assert_eq!(page3.len(), 1);
         assert!(token3.is_none());
     }
 
     pub async fn test_datastore_blob_operations(store: &impl BlobStore) {
         let test_content = b"Test blob content";
-        let digest = store.create_blob(test_content).await.unwrap();
+        let digest = store.create(test_content).await.unwrap();
 
-        let retrieved_content = store.read_blob(&digest).await.unwrap();
+        let retrieved_content = store.read(&digest).await.unwrap();
         assert_eq!(retrieved_content, test_content);
 
-        let size = store.get_blob_size(&digest).await.unwrap();
+        let size = store.size(&digest).await.unwrap();
         assert_eq!(size, test_content.len() as u64);
 
         // Test blob reader
-        let (mut reader, _) = store.build_blob_reader(&digest, None).await.unwrap();
+        let (mut reader, _) = store.reader(&digest, None).await.unwrap();
         let mut buffer = Vec::new();
         tokio::io::AsyncReadExt::read_to_end(&mut reader, &mut buffer)
             .await
@@ -266,9 +240,9 @@ mod tests {
         use tokio::io::AsyncReadExt;
 
         let test_content = b"blob reader size test content";
-        let digest = store.create_blob(test_content).await.unwrap();
+        let digest = store.create(test_content).await.unwrap();
 
-        let (mut reader, size) = store.build_blob_reader(&digest, None).await.unwrap();
+        let (mut reader, size) = store.reader(&digest, None).await.unwrap();
         assert_eq!(size, test_content.len() as u64);
 
         let mut buffer = Vec::new();
@@ -281,13 +255,10 @@ mod tests {
         use tokio::io::AsyncReadExt;
 
         let test_content = b"offset blob reader content here";
-        let digest = store.create_blob(test_content).await.unwrap();
+        let digest = store.create(test_content).await.unwrap();
         let offset = 10u64;
 
-        let (mut reader, size) = store
-            .build_blob_reader(&digest, Some(offset))
-            .await
-            .unwrap();
+        let (mut reader, size) = store.reader(&digest, Some(offset)).await.unwrap();
 
         // Should return the TOTAL blob size, not remaining size
         assert_eq!(size, test_content.len() as u64);
@@ -297,11 +268,17 @@ mod tests {
         assert_eq!(buffer, &test_content[offset as usize..]);
     }
 
-    pub async fn test_datastore_upload_operations(store: &impl BlobStore) {
+    pub async fn test_datastore_upload_operations<S>(store: &S)
+    where
+        S: BlobStore + UploadStore,
+    {
+        let blob: &dyn BlobStore = store;
+        let upload: &dyn UploadStore = store;
+
         let namespace = &Namespace::new("test-namespace").unwrap();
         let uuid = Uuid::new_v4().to_string();
 
-        let upload_id = store.create_upload(namespace, &uuid).await.unwrap();
+        let upload_id = upload.create(namespace, &uuid).await.unwrap();
         assert_eq!(upload_id, uuid);
 
         let test_content = b"Test upload content";
@@ -310,30 +287,29 @@ mod tests {
         hasher.update(test_content);
         let expected_digest = hasher.digest();
 
-        store
-            .write_upload(
+        upload
+            .write(
                 namespace,
                 &uuid,
                 Box::new(Cursor::new(test_content.to_vec())),
                 test_content.len() as u64,
                 false,
-                None,
             )
             .await
             .unwrap();
 
-        let summary = store.read_upload_summary(namespace, &uuid).await.unwrap();
+        let summary = upload.summary(namespace, &uuid).await.unwrap();
         assert_eq!(summary.size, test_content.len() as u64);
         assert!(Utc::now().signed_duration_since(summary.started_at) < Duration::hours(1));
 
-        let final_digest = store.complete_upload(namespace, &uuid, None).await.unwrap();
+        let final_digest = upload.complete(namespace, &uuid, None).await.unwrap();
         assert_eq!(final_digest, expected_digest);
 
-        let blob_content = store.read_blob(&final_digest).await.unwrap();
+        let blob_content = blob.read(&final_digest).await.unwrap();
         assert_eq!(blob_content, test_content);
 
         // Test upload not found after completion
-        let upload_result = store.read_upload_summary(namespace, &uuid).await;
+        let upload_result = upload.summary(namespace, &uuid).await;
         assert!(upload_result.is_err());
     }
 }

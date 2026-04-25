@@ -946,7 +946,7 @@ async fn test_head_manifest_fallback_without_media_type() {
         let namespace = &Namespace::new("test-repo/head-fallback").unwrap();
         let (content, media_type) = create_test_manifest();
 
-        let digest = registry.blob_store.create_blob(&content).await.unwrap();
+        let digest = registry.blob_store.create(&content).await.unwrap();
 
         let mut tx = registry.metadata_store.begin_transaction(namespace);
         tx.create_link(&LinkKind::Digest(digest.clone()), &digest)
@@ -1234,7 +1234,7 @@ async fn test_handle_get_manifest_redirect_fallback_without_media_type() {
         let namespace = &Namespace::new("test-repo/redirect-fallback").unwrap();
         let (content, media_type) = create_test_manifest();
 
-        let digest = registry.blob_store.create_blob(&content).await.unwrap();
+        let digest = registry.blob_store.create(&content).await.unwrap();
 
         let mut tx = registry.metadata_store.begin_transaction(namespace);
         tx.create_link(&LinkKind::Digest(digest.clone()), &digest)

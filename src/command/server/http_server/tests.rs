@@ -419,7 +419,8 @@ async fn test_authenticate_and_authorize_returns_client_identity() {
     "#;
 
     let config: Configuration = toml::from_str(toml).unwrap();
-    let blob_store = config.blob_store.to_backend(None).unwrap();
+    let (blob_store, upload_store, presigned_blob_store) =
+        config.blob_store.to_backend(None).unwrap();
     let metadata_store = config
         .resolve_metadata_config()
         .to_backend(None)
@@ -433,8 +434,15 @@ async fn test_authenticate_and_authorize_returns_client_identity() {
         .concurrent_cache_jobs(10)
         .global_immutable_tags(false)
         .global_immutable_tags_exclusions(Vec::new());
-    let registry =
-        Registry::new(blob_store, metadata_store, repositories, registry_config).unwrap();
+    let registry = Registry::new(
+        blob_store,
+        upload_store,
+        presigned_blob_store,
+        metadata_store,
+        repositories,
+        registry_config,
+    )
+    .unwrap();
     let context = ServerContext::new(&config, registry).unwrap();
 
     let request = Request::builder().uri("/v2/").body(()).unwrap();
@@ -471,7 +479,8 @@ async fn create_test_context_with_allow_policy() -> ServerContext {
     "#;
 
     let config: Configuration = toml::from_str(toml).unwrap();
-    let blob_store = config.blob_store.to_backend(None).unwrap();
+    let (blob_store, upload_store, presigned_blob_store) =
+        config.blob_store.to_backend(None).unwrap();
     let metadata_store = config
         .resolve_metadata_config()
         .to_backend(None)
@@ -485,8 +494,15 @@ async fn create_test_context_with_allow_policy() -> ServerContext {
         .concurrent_cache_jobs(10)
         .global_immutable_tags(false)
         .global_immutable_tags_exclusions(Vec::new());
-    let registry =
-        Registry::new(blob_store, metadata_store, repositories, registry_config).unwrap();
+    let registry = Registry::new(
+        blob_store,
+        upload_store,
+        presigned_blob_store,
+        metadata_store,
+        repositories,
+        registry_config,
+    )
+    .unwrap();
     ServerContext::new(&config, registry).unwrap()
 }
 

@@ -6,10 +6,16 @@ use tracing::warn;
 use crate::{
     cache::Cache,
     registry::{
-        blob_store::{BlobStore, Error, MultipartCleanup, fs, s3},
+        blob_store::{BlobStore, Error, MultipartCleanup, PresignedBlobStore, UploadStore, fs, s3},
         data_store,
     },
 };
+
+type BlobStoreTriple = (
+    Arc<dyn BlobStore>,
+    Arc<dyn UploadStore>,
+    Option<Arc<dyn PresignedBlobStore>>,
+);
 
 #[derive(Clone, Debug, Deserialize, PartialEq)]
 #[allow(clippy::large_enum_variant)]
@@ -27,15 +33,23 @@ impl Default for BlobStorageConfig {
 }
 
 impl BlobStorageConfig {
-    pub fn to_backend(&self, cache: Option<Arc<dyn Cache>>) -> Result<Arc<dyn BlobStore>, Error> {
+    pub fn to_backend(&self, cache: Option<Arc<dyn Cache>>) -> Result<BlobStoreTriple, Error> {
         match self {
-            BlobStorageConfig::FS(config) => Ok(Arc::new(fs::Backend::new(config))),
+            BlobStorageConfig::FS(config) => {
+                let backend = Arc::new(fs::Backend::new(config));
+                Ok((backend.clone(), backend, None))
+            }
             BlobStorageConfig::S3(config) => {
                 let mut backend = s3::Backend::new(config)?;
                 if let Some(cache) = cache {
                     backend = backend.with_cache(cache);
                 }
-                Ok(Arc::new(backend))
+                let backend = Arc::new(backend);
+                Ok((
+                    backend.clone(),
+                    backend.clone(),
+                    Some(backend as Arc<dyn PresignedBlobStore>),
+                ))
             }
         }
     }

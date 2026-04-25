@@ -3,7 +3,10 @@ use crate::{
     configuration::GlobalConfig,
     oci::Digest,
     policy::{AccessMode, AccessPolicyConfig, RetentionPolicyConfig},
-    registry::metadata_store::{MetadataStoreExt, link_kind::LinkKind},
+    registry::{
+        blob_store::{BlobStore, PresignedBlobStore, UploadStore},
+        metadata_store::{MetadataStore, MetadataStoreExt, link_kind::LinkKind},
+    },
 };
 
 pub fn create_test_repositories() -> Arc<HashMap<String, Repository>> {
@@ -29,6 +32,8 @@ pub fn create_test_repositories() -> Arc<HashMap<String, Repository>> {
 
 pub fn create_test_registry(
     blob_store: Arc<dyn BlobStore + Send + Sync>,
+    upload_store: Arc<dyn UploadStore + Send + Sync>,
+    presigned_blob_store: Option<Arc<dyn PresignedBlobStore>>,
     metadata_store: Arc<dyn MetadataStore + Send + Sync>,
 ) -> Registry {
     let repositories_config = create_test_repositories();
@@ -42,7 +47,15 @@ pub fn create_test_registry(
         .global_immutable_tags(global.immutable_tags)
         .global_immutable_tags_exclusions(global.immutable_tags_exclusions.clone());
 
-    Registry::new(blob_store, metadata_store, repositories_config, config).unwrap()
+    Registry::new(
+        blob_store,
+        upload_store,
+        presigned_blob_store,
+        metadata_store,
+        repositories_config,
+        config,
+    )
+    .unwrap()
 }
 
 pub async fn create_test_blob(
@@ -50,8 +63,7 @@ pub async fn create_test_blob(
     namespace: &str,
     content: &[u8],
 ) -> (Digest, Repository) {
-    // Create a test blob
-    let digest = registry.blob_store.create_blob(content).await.unwrap();
+    let digest = registry.blob_store.create(content).await.unwrap();
 
     let tag_link = LinkKind::Tag("latest".to_string());
     let layer_link = LinkKind::Layer(digest.clone());
@@ -69,7 +81,6 @@ pub async fn create_test_blob(
     let namespace_links = blob_index.namespace.get(namespace).unwrap();
     assert!(namespace_links.contains(&layer_link));
 
-    // Create a non-pull-through repository
     let cache = cache::Config::Memory.to_backend().unwrap();
     let repository = Repository::new(
         "test-repo",
