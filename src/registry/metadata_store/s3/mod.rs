@@ -65,12 +65,11 @@ type DeleteOpsResult = (
 #[derive(Clone)]
 pub struct Backend {
     pub store: data_store::s3::Backend,
-    lock: Arc<dyn LockBackend + Send + Sync>,
     cache: Option<Arc<dyn Cache>>,
     link_cache_ttl: u64,
     access_time_writer: Option<access_time::AccessTimeWriter>,
     coordinator: Arc<dyn WriteCoordinator>,
-    known_namespaces: Arc<Mutex<HashSet<String>>>,
+    pub known_namespaces: Arc<Mutex<HashSet<String>>>,
     // Held for Drop side-effect: signals the flush task to exit when the last Backend is dropped.
     #[allow(dead_code)]
     flush_handle: Option<Arc<access_time::FlushHandle>>,
@@ -80,12 +79,70 @@ const MAX_UPDATE_RETRIES: u32 = 10;
 const MAX_BLOB_INDEX_CAS_RETRIES: u32 = 20;
 
 impl Backend {
+    fn build_coordinator(
+        config: &BackendConfig,
+        caps: &ConditionalCapabilities,
+    ) -> Result<Arc<dyn WriteCoordinator>, Error> {
+        if caps.supports_full_cas() {
+            let s3_lock_config = match &config.lock_strategy {
+                LockStrategy::S3(c) => c.clone(),
+                _ => lock::s3::S3LockConfig::default(),
+            };
+            info!("Using CAS coordinator with S3 lock for S3 metadata-store");
+            let lock_store = Arc::new(
+                data_store::s3::Backend::new(&config.to_lock_store_config(&s3_lock_config))
+                    .map_err(|e| Error::Lock(format!("Failed to initialize S3 lock store: {e}")))?,
+            );
+            let lock = Arc::new(
+                lock::S3LockBackend::new(lock_store, &s3_lock_config, true)
+                    .map_err(|e| Error::Lock(format!("Failed to initialize S3 lock store: {e}")))?,
+            );
+            Ok(Arc::new(coordinator::CasCoordinator { lock }))
+        } else {
+            let lock: Arc<dyn LockBackend + Send + Sync> = match &config.lock_strategy {
+                LockStrategy::Redis(redis_config) => {
+                    info!("Using Redis lock store for S3 metadata-store");
+                    let backend = lock::RedisBackend::new(redis_config).map_err(|e| {
+                        Error::Lock(format!("Failed to initialize Redis lock store: {e}"))
+                    })?;
+                    Arc::new(backend)
+                }
+                LockStrategy::S3(s3_lock_config) => {
+                    info!("Using S3 lock store for S3 metadata-store");
+                    let lock_store = Arc::new(
+                        data_store::s3::Backend::new(&config.to_lock_store_config(s3_lock_config))
+                            .map_err(|e| {
+                                Error::Lock(format!("Failed to initialize S3 lock store: {e}"))
+                            })?,
+                    );
+                    Arc::new(
+                        lock::S3LockBackend::new(lock_store, s3_lock_config, caps.delete_if_match)
+                            .map_err(|e| {
+                                Error::Lock(format!("Failed to initialize S3 lock store: {e}"))
+                            })?,
+                    )
+                }
+                LockStrategy::Memory => {
+                    info!("Using in-memory lock store for S3 metadata-store");
+                    Arc::new(MemoryBackend::new())
+                }
+            };
+            Ok(Arc::new(coordinator::LockCoordinator { lock }))
+        }
+    }
+
     /// Create a new S3 metadata-store backend.
     ///
-    /// `conditional` overrides the capabilities used for lock backend construction and CAS
+    /// `conditional` overrides the capabilities used for coordinator selection and CAS
     /// write paths. Pass `None` to use defaults (all capabilities assumed present for S3 lock
     /// strategy, none for other strategies). Pass `Some(caps)` with the result of
     /// `probe_conditional_capabilities` to use the actual probed values.
+    ///
+    /// When all three CAS capabilities are available (`put_if_none_match`, `put_if_match`,
+    /// `delete_if_match`), the CAS coordinator is selected regardless of `lock_strategy`.
+    /// In that case the `lock_strategy` value is used only to tune the CAS coordinator's
+    /// internal S3 lock: if `lock_strategy` is `S3`, its timing parameters are applied;
+    /// any other value causes default S3 lock parameters to be used instead.
     pub fn new(
         config: &BackendConfig,
         conditional: Option<ConditionalCapabilities>,
@@ -105,40 +162,7 @@ impl Backend {
             }
         });
 
-        let coordinator: Arc<dyn WriteCoordinator> = if caps.supports_cas() {
-            Arc::new(coordinator::CasCoordinator)
-        } else {
-            Arc::new(coordinator::LockCoordinator)
-        };
-
-        let lock: Arc<dyn LockBackend + Send + Sync> = match &config.lock_strategy {
-            LockStrategy::Redis(redis_config) => {
-                info!("Using Redis lock store for S3 metadata-store");
-                let backend = lock::RedisBackend::new(redis_config).map_err(|e| {
-                    Error::Lock(format!("Failed to initialize Redis lock store: {e}"))
-                })?;
-                Arc::new(backend)
-            }
-            LockStrategy::S3(s3_lock_config) => {
-                info!("Using S3 lock store for S3 metadata-store");
-                let lock_store = Arc::new(
-                    data_store::s3::Backend::new(&config.to_lock_store_config(s3_lock_config))
-                        .map_err(|e| {
-                            Error::Lock(format!("Failed to initialize S3 lock store: {e}"))
-                        })?,
-                );
-                Arc::new(
-                    lock::S3LockBackend::new(lock_store, s3_lock_config, caps.delete_if_match)
-                        .map_err(|e| {
-                            Error::Lock(format!("Failed to initialize S3 lock store: {e}"))
-                        })?,
-                )
-            }
-            LockStrategy::Memory => {
-                info!("Using in-memory lock store for S3 metadata-store");
-                Arc::new(MemoryBackend::new())
-            }
-        };
+        let coordinator = Self::build_coordinator(config, &caps)?;
 
         if config.access_time_debounce_secs == 0
             && matches!(config.lock_strategy, LockStrategy::S3(_))
@@ -164,7 +188,6 @@ impl Backend {
 
             let flush_backend = Self {
                 store: store.clone(),
-                lock: lock.clone(),
                 cache: None,
                 link_cache_ttl: config.link_cache_ttl,
                 access_time_writer: access_time_writer.clone(),
@@ -191,7 +214,6 @@ impl Backend {
 
         let backend = Self {
             store,
-            lock,
             cache: None,
             link_cache_ttl: config.link_cache_ttl,
             access_time_writer,
@@ -681,102 +703,10 @@ impl MetadataStore for Backend {
 }
 
 impl Backend {
-    /// Executes link operations under a distributed lock, returning pending
-    /// blob index operations for CAS updates after the lock is released.
-    async fn execute_locked_cas_updates(
-        &self,
-        namespace: &str,
-        operations: &[LinkOperation],
-    ) -> Result<HashMap<Digest, Vec<BlobIndexOperation>>, Error> {
-        if operations.is_empty() {
-            return Ok(HashMap::new());
-        }
-
-        let mut lock_keys: Vec<String> = operations
-            .iter()
-            .map(|op| {
-                let link = match op {
-                    LinkOperation::Create { link, .. } | LinkOperation::Delete { link, .. } => link,
-                };
-                format!("{namespace}:{link}")
-            })
-            .collect();
-        lock_keys.sort();
-        lock_keys.dedup();
-
-        let guard = self.lock.acquire(&lock_keys).await?;
-
-        let read_results = join_all(operations.iter().map(|op| async move {
-            let link = match op {
-                LinkOperation::Create { link, .. } | LinkOperation::Delete { link, .. } => link,
-            };
-            let metadata = self.read_link_reference(namespace, link).await.ok();
-            (op, metadata)
-        }))
-        .await;
-
-        let mut link_cache: HashMap<LinkKind, LinkMetadata> = HashMap::new();
-        let mut creates: Vec<ResolvedCreate> = Vec::new();
-        let mut deletes: Vec<ResolvedDelete> = Vec::new();
-
-        for (op, metadata) in &read_results {
-            match op {
-                LinkOperation::Create {
-                    link,
-                    target,
-                    referrer,
-                    media_type,
-                    descriptor,
-                } => {
-                    let old_target = metadata.as_ref().map(|m| m.target.clone());
-                    if let Some(m) = metadata {
-                        link_cache.insert(link.clone(), m.clone());
-                    }
-                    creates.push(ResolvedCreate {
-                        link: link.clone(),
-                        target: target.clone(),
-                        old_target,
-                        referrer: referrer.clone(),
-                        media_type: media_type.clone(),
-                        descriptor: descriptor.as_deref().cloned(),
-                    });
-                }
-                LinkOperation::Delete { link, referrer } => {
-                    if let Some(m) = metadata {
-                        link_cache.insert(link.clone(), m.clone());
-                        deletes.push(ResolvedDelete {
-                            link: link.clone(),
-                            target: m.target.clone(),
-                            referrer: referrer.clone(),
-                        });
-                    }
-                }
-            }
-        }
-
-        if creates.is_empty() && deletes.is_empty() {
-            guard.release().await;
-            return Ok(HashMap::new());
-        }
-
-        if !guard.is_valid() {
-            guard.release().await;
-            return Err(Error::Lock("lock invalidated during operation".into()));
-        }
-
-        let pending_blob_ops = self
-            .apply_link_operations(namespace, &creates, &deletes, &mut link_cache)
-            .await?;
-
-        guard.release().await;
-
-        Ok(pending_blob_ops)
-    }
-
     /// Executes the write+delete+cache-update sequence for a set of create and
     /// delete link operations, returning the accumulated pending blob index
     /// operations for the caller to apply.
-    async fn apply_link_operations(
+    pub async fn apply_link_operations(
         &self,
         namespace: &str,
         creates: &[ResolvedCreate],

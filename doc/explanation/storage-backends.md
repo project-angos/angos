@@ -202,7 +202,7 @@ For multiple registry instances, you need:
 
 ### With S3 Locking (Simplest)
 
-Uses S3 conditional writes (`If-None-Match: *`) for locking — no extra infrastructure required. The S3 provider must support conditional writes; Angos verifies this at startup.
+Angos automatically uses S3 conditional writes for coordination when the provider supports all three conditional operations (`put_if_none_match`, `put_if_match`, and `delete_if_match`). No extra infrastructure is required. Angos probes for these capabilities at startup and fails fast if any is missing.
 
 ```toml
 [blob_store.s3]
@@ -214,7 +214,7 @@ bucket = "registry-data"
 # ... S3 config
 ```
 
-To customize lock behavior:
+The `lock_strategy.s3` block lets you tune internal lock timing parameters but is not required to enable CAS coordination — it activates automatically when the provider supports it:
 
 ```toml
 [metadata_store.s3.lock_strategy.s3]
@@ -224,6 +224,8 @@ retry_delay_ms = 50    # Delay between retries (default: 50)
 ```
 
 ### With S3 + Redis
+
+Redis is used for distributed locking when the S3 provider does not support all three conditional operations. For providers that do support full CAS (AWS S3, Exoscale SOS), the Redis lock backend is not used even if configured — the registry selects CAS coordination automatically.
 
 ```toml
 [blob_store.s3]

@@ -194,9 +194,8 @@ When using S3 as the metadata store, you can declare which conditional write ope
 
 **Probe behavior:**
 - When `capabilities` table is explicitly configured, the startup probe is skipped entirely. Provide accurate values matching your S3 provider's capabilities.
-- When `capabilities` is omitted:
-  - If `lock_strategy = "s3"`, a startup probe automatically tests each capability and populates the status.
-  - For other lock strategies, capabilities default to all `false` (no probing occurs).
+- When `capabilities` is omitted, a startup probe runs at startup (and on every config reload that doesn't already have a cached value) to detect each capability. The probed values are cached for subsequent reloads.
+- To skip the probe cost entirely while staying on lock-based coordination (the pre-CAS behavior), declare `capabilities` with all three flags set to `false`.
 
 **Example with explicit capabilities (AWS S3):**
 ```toml
@@ -217,18 +216,18 @@ put_if_match = false
 delete_if_match = false
 ```
 
-**Example with auto-probe (S3 locking):**
+**Example with auto-probe:**
 ```toml
 [metadata_store.s3]
-# No capabilities field — probe runs at startup for S3 lock strategy
-[metadata_store.s3.lock_strategy.s3]
-ttl_secs = 30
+# No capabilities field — probe runs at startup to detect provider support
 ```
 
 **Performance impact:**
 - When `put_if_match` is available, access time writes use optimized compare-and-swap (CAS) instead of distributed lock operations, reducing S3 API calls per manifest pull.
 - When `delete_if_match` is available, S3 lock release is atomic and race-condition-free.
-- Both features require both `put_if_none_match` and `put_if_match` to be `true` for full CAS support.
+- When all three flags are `true`, the registry selects CAS-based coordination for all writes and serialization. No Redis or Memory lock backend is built or used in this mode.
+- In CAS mode, `lock_strategy` no longer drives coordinator selection. It is consulted only to tune the internal S3 lock that the CAS coordinator uses for its rare locked-fallback path: `lock_strategy.s3` parameters (TTL, retries, timeouts) are honored if set; `"memory"` and `"redis"` are accepted but their lock backend is never built — the registry synthesizes default S3 lock parameters instead. Set `lock_strategy.s3` explicitly if you want to control these parameters.
+- When any flag is `false`, the registry falls back to lock-based coordination using the configured `lock_strategy`.
 
 > **Warning:** Setting `access_time_debounce_secs = 0` with S3 lock strategy causes every manifest pull to perform a full lock-acquire → read → write → release cycle via S3 API. At scale with many concurrent pulls, this adds significant latency and S3 API costs. Keep the default value of 60 or higher for S3-locked deployments, or disable access time tracking entirely if not needed for retention policies.
 
@@ -244,6 +243,8 @@ Multi-replica deployments require a distributed lock backend. The `lock_strategy
 | redis | Yes | Yes |
 | s3 | Yes | No |
 
+> **Note:** This matrix applies when CAS-based coordination is not active (i.e., the S3 provider does not support all three conditional operations). When all three capabilities are available, the registry uses CAS coordination automatically and the `lock_strategy` governs only internal S3 lock tuning, not coordinator selection.
+
 **Memory** (default) — in-process locks, suitable for single-instance deployments only:
 
 ```toml
@@ -251,7 +252,7 @@ Multi-replica deployments require a distributed lock backend. The `lock_strategy
 lock_strategy = "memory"
 ```
 
-**S3** — uses S3 conditional writes (`If-None-Match: *`) for distributed locking without extra infrastructure. The S3 provider must support conditional writes; angos verifies this at startup:
+**S3** — uses S3 conditional writes (`If-None-Match: *`) for distributed locking without extra infrastructure. The S3 provider must support all three conditional operations (`put_if_none_match`, `put_if_match`, and `delete_if_match`); angos verifies this at startup and fails fast if any is missing:
 
 ```toml
 # With defaults (empty table body; all fields use defaults)

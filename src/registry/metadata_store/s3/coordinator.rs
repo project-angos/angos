@@ -1,4 +1,4 @@
-use std::{collections::HashMap, io::ErrorKind, time::Duration};
+use std::{collections::HashMap, io::ErrorKind, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -11,8 +11,9 @@ use crate::{
     registry::{
         data_store,
         metadata_store::{
-            BlobIndexOperation, Error, LinkMetadata, LinkOperation,
+            BlobIndexOperation, Error, LinkMetadata, LinkOperation, ResolvedCreate, ResolvedDelete,
             link_kind::LinkKind,
+            lock::{LockBackend, S3LockBackend},
             lock_ops::{LockOps, ValidationResult},
             simple_jitter,
         },
@@ -63,10 +64,109 @@ pub trait WriteCoordinator: Send + Sync + std::fmt::Debug {
 }
 
 #[derive(Debug)]
-pub struct CasCoordinator;
+pub struct CasCoordinator {
+    pub lock: Arc<S3LockBackend>,
+}
 
 #[derive(Debug)]
-pub struct LockCoordinator;
+pub struct LockCoordinator {
+    pub lock: Arc<dyn LockBackend + Send + Sync>,
+}
+
+impl CasCoordinator {
+    /// Executes link operations under a distributed lock, returning pending
+    /// blob index operations for CAS updates after the lock is released.
+    async fn execute_locked_cas_updates(
+        &self,
+        backend: &Backend,
+        namespace: &str,
+        operations: &[LinkOperation],
+    ) -> Result<HashMap<Digest, Vec<BlobIndexOperation>>, Error> {
+        if operations.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let mut lock_keys: Vec<String> = operations
+            .iter()
+            .map(|op| {
+                let link = match op {
+                    LinkOperation::Create { link, .. } | LinkOperation::Delete { link, .. } => link,
+                };
+                format!("{namespace}:{link}")
+            })
+            .collect();
+        lock_keys.sort();
+        lock_keys.dedup();
+
+        let guard = self.lock.acquire(&lock_keys).await?;
+
+        let read_results = join_all(operations.iter().map(|op| async move {
+            let link = match op {
+                LinkOperation::Create { link, .. } | LinkOperation::Delete { link, .. } => link,
+            };
+            let metadata = backend.read_link_reference(namespace, link).await.ok();
+            (op, metadata)
+        }))
+        .await;
+
+        let mut link_cache: HashMap<LinkKind, LinkMetadata> = HashMap::new();
+        let mut creates: Vec<ResolvedCreate> = Vec::new();
+        let mut deletes: Vec<ResolvedDelete> = Vec::new();
+
+        for (op, metadata) in &read_results {
+            match op {
+                LinkOperation::Create {
+                    link,
+                    target,
+                    referrer,
+                    media_type,
+                    descriptor,
+                } => {
+                    let old_target = metadata.as_ref().map(|m| m.target.clone());
+                    if let Some(m) = metadata {
+                        link_cache.insert(link.clone(), m.clone());
+                    }
+                    creates.push(ResolvedCreate {
+                        link: link.clone(),
+                        target: target.clone(),
+                        old_target,
+                        referrer: referrer.clone(),
+                        media_type: media_type.clone(),
+                        descriptor: descriptor.as_deref().cloned(),
+                    });
+                }
+                LinkOperation::Delete { link, referrer } => {
+                    if let Some(m) = metadata {
+                        link_cache.insert(link.clone(), m.clone());
+                        deletes.push(ResolvedDelete {
+                            link: link.clone(),
+                            target: m.target.clone(),
+                            referrer: referrer.clone(),
+                        });
+                    }
+                }
+            }
+        }
+
+        if creates.is_empty() && deletes.is_empty() {
+            guard.release().await;
+            return Ok(HashMap::new());
+        }
+
+        if !guard.is_valid() {
+            guard.release().await;
+            return Err(Error::Lock("lock invalidated during operation".into()));
+        }
+
+        let pending_blob_ops = backend
+            .apply_link_operations(namespace, &creates, &deletes, &mut link_cache)
+            .await?;
+
+        guard.release().await;
+
+        Ok(pending_blob_ops)
+    }
+}
 
 #[async_trait]
 impl WriteCoordinator for CasCoordinator {
@@ -128,8 +228,8 @@ impl WriteCoordinator for CasCoordinator {
             }
         }
 
-        let locked_blob_ops = backend
-            .execute_locked_cas_updates(namespace, &locked_ops)
+        let locked_blob_ops = self
+            .execute_locked_cas_updates(backend, namespace, &locked_ops)
             .await?;
 
         let mut pending_blob_ops = lockfree_blob_ops;
@@ -342,7 +442,7 @@ impl WriteCoordinator for LockCoordinator {
                 return Ok(());
             }
 
-            let guard = backend.lock.acquire(&lock_keys).await?;
+            let guard = self.lock.acquire(&lock_keys).await?;
 
             if backend
                 .validate_creates_under_lock(namespace, &creates, &mut link_cache)
@@ -439,7 +539,7 @@ impl WriteCoordinator for LockCoordinator {
         let shard_key = path_builder::namespace_shard_key(namespace);
         let path = path_builder::namespace_registry_shard_path(namespace);
         let lock_key = format!("namespace_registry_shard_{shard_key}");
-        let guard = backend.lock.acquire(&[lock_key]).await?;
+        let guard = self.lock.acquire(&[lock_key]).await?;
 
         let mut registry = match backend.store.read(&path).await {
             Ok(data) => {
@@ -485,7 +585,7 @@ impl WriteCoordinator for LockCoordinator {
         content: Bytes,
     ) -> Result<(), Error> {
         let lock_key = format!("namespace_registry_shard_{shard_key}");
-        let guard = backend.lock.acquire(&[lock_key]).await?;
+        let guard = self.lock.acquire(&[lock_key]).await?;
         backend.store.put_object(path, content).await?;
         guard.release().await;
         Ok(())
@@ -498,10 +598,7 @@ impl WriteCoordinator for LockCoordinator {
         namespace: &str,
         link: &LinkKind,
     ) -> Result<LinkMetadata, Error> {
-        let guard = backend
-            .lock
-            .acquire(&[format!("{namespace}:{link}")])
-            .await?;
+        let guard = self.lock.acquire(&[format!("{namespace}:{link}")]).await?;
         let link_data = backend
             .read_link_reference(namespace, link)
             .await?
@@ -526,10 +623,7 @@ impl WriteCoordinator for LockCoordinator {
         namespace: &str,
         link: &LinkKind,
     ) -> Result<(), Error> {
-        let guard = backend
-            .lock
-            .acquire(&[format!("{namespace}:{link}")])
-            .await?;
+        let guard = self.lock.acquire(&[format!("{namespace}:{link}")]).await?;
         let link_data = backend
             .read_link_reference(namespace, link)
             .await?
