@@ -1,10 +1,12 @@
+use std::sync::Arc;
+
 use reqwest::Client;
 
 use crate::event_webhook::{config::EventWebhookConfig, event::EventKind};
 
 pub struct WebhookEndpoint {
     pub client: Client,
-    pub config: EventWebhookConfig,
+    pub config: Arc<EventWebhookConfig>,
 }
 
 impl WebhookEndpoint {

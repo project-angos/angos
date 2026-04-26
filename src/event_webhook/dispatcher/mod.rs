@@ -111,8 +111,8 @@ fn serialize_event(event: &Event) -> Result<(Vec<u8>, String), Error> {
 }
 
 impl EventDispatcher {
-    pub fn new(webhooks: HashMap<String, EventWebhookConfig>) -> Result<Self, Error> {
-        let mut endpoints = HashMap::new();
+    pub fn new(webhooks: HashMap<String, Arc<EventWebhookConfig>>) -> Result<Self, Error> {
+        let mut endpoints = HashMap::with_capacity(webhooks.len());
 
         for (name, config) in webhooks {
             let client = Client::builder()

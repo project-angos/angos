@@ -63,7 +63,7 @@ When omitted, the server runs without TLS (insecure).
 
 | Option          | Type     | Default | Description                        |
 |-----------------|----------|---------|------------------------------------|
-| `mode`          | string   | `"deny"` | Default action when no rules match (`"allow"` or `"deny"`) |
+| `default`       | string   | `"deny"` | Default action when no rules match (`"allow"` or `"deny"`). The legacy `default_allow` boolean is still accepted but emits a deprecation warning. |
 | `rules`         | [string] | `[]`    | CEL expressions for access control |
 
 ### Global Retention Policy (`global.retention_policy`)
@@ -314,6 +314,8 @@ ttl = 10
 |------------|--------|----------|----------------------|
 | `username` | string | required | Username             |
 | `password` | string | required | Argon2 password hash |
+
+Password hashes are validated when the configuration is parsed. An invalid Argon2 hash causes the server to fail to start with a clear error. Use `angos argon` to generate a valid hash.
 
 ### OIDC (`auth.oidc.<name>`)
 

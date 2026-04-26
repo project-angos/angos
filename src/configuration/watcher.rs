@@ -9,7 +9,7 @@ use std::{
 use async_trait::async_trait;
 use notify::{Event, EventKind, RecursiveMode, Watcher};
 use tokio::{sync::mpsc, time::timeout};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use super::{Configuration, Error, ServerConfig};
 use crate::configuration::listeners::tls::ServerTlsConfig;
@@ -149,6 +149,55 @@ fn compute_tls_dirs(config: &Configuration, config_dir: &Path) -> HashSet<PathBu
     .collect()
 }
 
+/// Resolves the active `Configuration`, loading from disk when the cache is
+/// empty.  Returns `None` and logs a warning if the disk load fails.
+fn resolve_config<'a>(
+    cached: &'a mut Option<Configuration>,
+    config_path: &Path,
+) -> Option<&'a Configuration> {
+    if cached.is_none() {
+        match Configuration::load(config_path) {
+            Ok(cfg) => {
+                *cached = Some(cfg);
+            }
+            Err(e) => {
+                warn!(
+                    "TLS file change detected but configuration could not be \
+                     loaded from disk; TLS reload skipped: {e}"
+                );
+                return None;
+            }
+        }
+    }
+    cached.as_ref()
+}
+
+/// Handles a `ChangeKind::Tls` event: ensures a usable `Configuration` is
+/// available (loading from disk when the cache is empty), then notifies the
+/// subscriber if the server is configured for TLS.
+fn handle_tls_event(
+    cached_config: &mut Option<Configuration>,
+    config_path: &Path,
+    notifier: &dyn ConfigNotifier,
+) {
+    info!("TLS certificate change detected, reloading");
+    let Some(cfg) = resolve_config(cached_config, config_path) else {
+        return;
+    };
+    match cfg {
+        Configuration {
+            server: ServerConfig::Tls(tls_config),
+            ..
+        } => {
+            notifier.notify_tls_config_change(&tls_config.tls);
+            info!("TLS configuration reloaded");
+        }
+        _ => {
+            debug!("TLS file change detected but server is not configured for TLS; ignoring");
+        }
+    }
+}
+
 async fn watch_config_loop(
     config_path: PathBuf,
     notifier: Arc<dyn ConfigNotifier>,
@@ -245,15 +294,7 @@ async fn watch_config_loop(
                     }
                 }
                 ChangeKind::Tls => {
-                    info!("TLS certificate change detected, reloading");
-                    if let Some(Configuration {
-                        server: ServerConfig::Tls(tls_config),
-                        ..
-                    }) = cached_config.as_ref()
-                    {
-                        notifier.notify_tls_config_change(&tls_config.tls);
-                        info!("TLS configuration reloaded");
-                    }
+                    handle_tls_event(&mut cached_config, &config_path, notifier.as_ref());
                 }
             }
         }
@@ -797,5 +838,129 @@ bind_address = "10.0.0.1"
         .await;
 
         assert_eq!(result, None);
+    }
+
+    // --- Direct unit tests for the cache-empty path ---
+    //
+    // These exercise the bug fix at the unit level: the integration path
+    // through `watch_config_loop` does not normally exhibit the empty-cache
+    // race in tests (a config-repair write fires `ChangeKind::Config` first,
+    // populating the cache before any TLS event), so it cannot reliably cover
+    // the `cached.is_none()` branch in `resolve_config` / `handle_tls_event`.
+    // Calling those helpers directly does.
+
+    #[test]
+    fn resolve_config_loads_from_disk_when_cache_is_empty() {
+        let temp_dir = TempDir::new().unwrap();
+        let tls_dir = temp_dir.path().join("tls");
+        fs::create_dir_all(&tls_dir).unwrap();
+        let cert_path = tls_dir.join("server.pem");
+        let key_path = tls_dir.join("server.key");
+        fs::write(&cert_path, "cert").unwrap();
+        fs::write(&key_path, "key").unwrap();
+
+        let config_path = temp_dir.path().join("config.toml");
+        fs::write(
+            &config_path,
+            minimal_tls_config(cert_path.to_str().unwrap(), key_path.to_str().unwrap()),
+        )
+        .unwrap();
+
+        let mut cached: Option<Configuration> = None;
+        let resolved = resolve_config(&mut cached, &config_path);
+
+        assert!(resolved.is_some(), "must load from disk when cache empty");
+        assert!(
+            cached.is_some(),
+            "must populate cache after successful load"
+        );
+    }
+
+    #[test]
+    fn resolve_config_returns_none_when_cache_empty_and_disk_invalid() {
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("config.toml");
+        fs::write(&config_path, b"invalid toml [[[").unwrap();
+
+        let mut cached: Option<Configuration> = None;
+        let resolved = resolve_config(&mut cached, &config_path);
+
+        assert!(resolved.is_none());
+        assert!(cached.is_none(), "must not populate cache on load failure");
+    }
+
+    #[test]
+    fn resolve_config_returns_cached_without_reading_disk() {
+        let temp_dir = TempDir::new().unwrap();
+        // Cache is preloaded with a non-TLS config.
+        let cached_cfg: Configuration =
+            Configuration::load_from_str("[server]\nbind_address = \"127.0.0.1\"").unwrap();
+        let mut cached: Option<Configuration> = Some(cached_cfg);
+
+        // Point at a non-existent path; must not be touched.
+        let bogus_path = temp_dir.path().join("does-not-exist.toml");
+        let resolved = resolve_config(&mut cached, &bogus_path);
+
+        assert!(resolved.is_some(), "must reuse cached value");
+    }
+
+    #[tokio::test]
+    async fn handle_tls_event_loads_from_disk_when_cache_empty_and_notifies() {
+        let temp_dir = TempDir::new().unwrap();
+        let tls_dir = temp_dir.path().join("tls");
+        fs::create_dir_all(&tls_dir).unwrap();
+        let cert_path = tls_dir.join("server.pem");
+        let key_path = tls_dir.join("server.key");
+        fs::write(&cert_path, "cert").unwrap();
+        fs::write(&key_path, "key").unwrap();
+        let config_path = temp_dir.path().join("config.toml");
+        fs::write(
+            &config_path,
+            minimal_tls_config(cert_path.to_str().unwrap(), key_path.to_str().unwrap()),
+        )
+        .unwrap();
+
+        let notifier = TestNotifier::new();
+        let mut cached: Option<Configuration> = None;
+        handle_tls_event(&mut cached, &config_path, &notifier);
+
+        assert_eq!(
+            notifier.tls_change_count(),
+            1,
+            "must notify once when cache is empty but disk has a TLS config"
+        );
+        assert!(
+            cached.is_some(),
+            "cache must be populated after fallback load"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_tls_event_does_not_notify_when_cache_empty_and_disk_invalid() {
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("config.toml");
+        fs::write(&config_path, b"invalid toml [[[").unwrap();
+
+        let notifier = TestNotifier::new();
+        let mut cached: Option<Configuration> = None;
+        handle_tls_event(&mut cached, &config_path, &notifier);
+
+        assert_eq!(notifier.tls_change_count(), 0);
+        assert!(cached.is_none());
+    }
+
+    #[tokio::test]
+    async fn handle_tls_event_does_not_notify_when_server_is_not_tls() {
+        let temp_dir = TempDir::new().unwrap();
+        // Insecure server config — no TLS section.
+        let cached_cfg: Configuration =
+            Configuration::load_from_str("[server]\nbind_address = \"127.0.0.1\"").unwrap();
+
+        let notifier = TestNotifier::new();
+        let mut cached: Option<Configuration> = Some(cached_cfg);
+        let bogus_path = temp_dir.path().join("does-not-exist.toml");
+        handle_tls_event(&mut cached, &bogus_path, &notifier);
+
+        assert_eq!(notifier.tls_change_count(), 0);
     }
 }

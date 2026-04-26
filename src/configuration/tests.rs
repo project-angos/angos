@@ -1258,3 +1258,88 @@ fn test_redirect_resolver_nothing_set_defaults_true() {
     assert!(config.resolved_enable_blob_redirect());
     assert!(config.resolved_enable_manifest_redirect());
 }
+
+#[test]
+fn event_webhook_valid_global_reference_loads() {
+    let config = r#"
+    [server]
+    bind_address = "0.0.0.0"
+
+    [global]
+    event_webhooks = ["my-hook"]
+
+    [event_webhook.my-hook]
+    url = "https://example.com/hook"
+    policy = "optional"
+    events = ["manifest.push"]
+    "#;
+
+    let config = Configuration::load_from_str(config).unwrap();
+    assert!(config.event_webhook.contains_key("my-hook"));
+}
+
+#[test]
+fn event_webhook_valid_repo_reference_loads() {
+    let config = r#"
+    [server]
+    bind_address = "0.0.0.0"
+
+    [event_webhook.repo-hook]
+    url = "https://example.com/hook"
+    policy = "optional"
+    events = ["manifest.push"]
+
+    [repository.myrepo]
+    event_webhooks = ["repo-hook"]
+    "#;
+
+    let config = Configuration::load_from_str(config).unwrap();
+    assert!(config.repository.contains_key("myrepo"));
+    assert!(config.event_webhook.contains_key("repo-hook"));
+}
+
+#[test]
+fn event_webhook_bad_global_reference_fails_load() {
+    let config = r#"
+    [server]
+    bind_address = "0.0.0.0"
+
+    [global]
+    event_webhooks = ["nonexistent-hook"]
+    "#;
+
+    let result = Configuration::load_from_str(config);
+    assert!(result.is_err());
+    let msg = result.unwrap_err().to_string();
+    assert!(
+        msg.contains("nonexistent-hook"),
+        "Error must name the unresolved webhook: {msg}"
+    );
+    assert!(
+        msg.contains("globally") || msg.contains("global"),
+        "Error must identify global as the source: {msg}"
+    );
+}
+
+#[test]
+fn event_webhook_bad_repo_reference_fails_load() {
+    let config = r#"
+    [server]
+    bind_address = "0.0.0.0"
+
+    [repository.prod]
+    event_webhooks = ["ghost-hook"]
+    "#;
+
+    let result = Configuration::load_from_str(config);
+    assert!(result.is_err());
+    let msg = result.unwrap_err().to_string();
+    assert!(
+        msg.contains("ghost-hook"),
+        "Error must name the unresolved webhook: {msg}"
+    );
+    assert!(
+        msg.contains("prod"),
+        "Error must identify the repository as the source: {msg}"
+    );
+}

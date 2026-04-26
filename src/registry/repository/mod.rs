@@ -31,6 +31,8 @@ pub struct RawConfig {
     #[serde(default)]
     pub immutable_tags_exclusions: Vec<RegexPattern>,
     pub authorization_webhook: Option<String>,
+    #[serde(default)]
+    pub event_webhooks: Vec<String>,
 }
 
 /// Resolved repository configuration with webhook references replaced by their definitions.

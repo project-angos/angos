@@ -32,6 +32,8 @@ pub struct RawGlobalConfig {
     #[serde(default)]
     pub immutable_tags_exclusions: Vec<RegexPattern>,
     pub authorization_webhook: Option<String>,
+    #[serde(default)]
+    pub event_webhooks: Vec<String>,
 }
 
 fn default_max_concurrent_requests() -> usize {
@@ -60,6 +62,7 @@ impl Default for RawGlobalConfig {
             immutable_tags: false,
             immutable_tags_exclusions: Vec::new(),
             authorization_webhook: None,
+            event_webhooks: Vec::new(),
         }
     }
 }

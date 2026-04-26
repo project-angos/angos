@@ -453,6 +453,7 @@ fn create_config_with_webhook(url: &str) -> Configuration {
         [global]
         update_pull_time = false
         max_concurrent_cache_jobs = 10
+        event_webhooks = ["test_hook"]
 
         [event_webhook.test_hook]
         url = "{url}"
@@ -482,6 +483,7 @@ fn create_config_with_two_webhooks(url_a: &str, url_b: &str) -> Configuration {
         [global]
         update_pull_time = false
         max_concurrent_cache_jobs = 10
+        event_webhooks = ["hook_a", "hook_b"]
 
         [event_webhook.hook_a]
         url = "{url_a}"
@@ -718,6 +720,7 @@ fn create_invalid_cache_config_with_webhook(url: &str) -> Configuration {
         [global]
         update_pull_time = false
         max_concurrent_cache_jobs = 10
+        event_webhooks = ["test_hook"]
 
         [event_webhook.test_hook]
         url = "{url}"

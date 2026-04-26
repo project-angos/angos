@@ -1,7 +1,7 @@
 #![forbid(unsafe_code)]
 #![warn(clippy::pedantic)]
 
-use std::{sync::Arc, time::Duration};
+use std::{process::exit, sync::Arc, time::Duration};
 
 use argh::FromArgs;
 use opentelemetry::{KeyValue, global, trace::TracerProvider as _};
@@ -104,9 +104,15 @@ fn main() {
 
     let cli_args: GlobalArguments = argh::from_env();
 
-    let Ok(config) = Configuration::load(&cli_args.config) else {
-        eprintln!("Failed to load configuration from {}", &cli_args.config);
-        std::process::exit(1);
+    let config = match Configuration::load(&cli_args.config) {
+        Ok(cfg) => cfg,
+        Err(e) => {
+            eprintln!(
+                "Failed to load configuration from {}: {e}",
+                &cli_args.config
+            );
+            exit(1);
+        }
     };
 
     tokio::runtime::Builder::new_multi_thread()
@@ -120,7 +126,7 @@ fn main() {
 async fn run_command(cli_args: GlobalArguments, config: Configuration) {
     if let Err(err) = set_tracing(config.observability.clone()) {
         eprintln!("Failed to set up tracing: {err}");
-        std::process::exit(1);
+        exit(1);
     }
 
     config.log_deprecations();
@@ -129,19 +135,19 @@ async fn run_command(cli_args: GlobalArguments, config: Configuration) {
         SubCommand::Argon(_) => {
             if let Err(err) = argon::Command::run() {
                 error!("Argon error: {}", err);
-                std::process::exit(1);
+                exit(1);
             }
         }
         SubCommand::Scrub(scrub_options) => {
             if let Err(err) = run_scrub(scrub_options, config).await {
                 error!("Scrub error: {err}");
-                std::process::exit(1);
+                exit(1);
             }
         }
         SubCommand::Serve(_) => {
             if let Err(err) = run_server(cli_args, config).await {
                 error!("Server error: {err}");
-                std::process::exit(1);
+                exit(1);
             }
         }
     }
@@ -157,7 +163,7 @@ async fn run_server(options: GlobalArguments, config: Configuration) -> Result<(
 
     let Ok(_watcher) = ConfigWatcher::new(&options.config, server.clone()) else {
         error!("Failed to start configuration watcher");
-        std::process::exit(1);
+        exit(1);
     };
 
     let shutdown_server = Arc::clone(&server);
@@ -168,7 +174,7 @@ async fn run_server(options: GlobalArguments, config: Configuration) -> Result<(
             .shutdown_with_timeout(Duration::from_secs(30))
             .await;
         info!("Graceful shutdown complete");
-        std::process::exit(0);
+        exit(0);
     });
 
     server.run().await

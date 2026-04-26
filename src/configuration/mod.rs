@@ -78,7 +78,7 @@ pub struct Configuration {
     pub metadata_store: Option<metadata_store::MetadataStoreConfig>,
     pub auth: authenticator::AuthConfig,
     pub repository: HashMap<String, repository::Config>,
-    pub event_webhook: HashMap<String, EventWebhookConfig>,
+    pub event_webhook: HashMap<String, Arc<EventWebhookConfig>>,
     pub observability: Option<ObservabilityConfig>,
 }
 
@@ -108,8 +108,8 @@ impl Configuration {
     fn resolve(raw: RawConfiguration) -> Result<Self, Error> {
         let auth_webhooks = resolve_auth_webhooks(raw.auth.webhook)?;
         let event_webhooks = resolve_event_webhooks(raw.event_webhook)?;
-        let global = resolve_global(raw.global, &auth_webhooks)?;
-        let repositories = resolve_repositories(raw.repository, &auth_webhooks)?;
+        let global = resolve_global(raw.global, &auth_webhooks, &event_webhooks)?;
+        let repositories = resolve_repositories(raw.repository, &auth_webhooks, &event_webhooks)?;
         let auth = authenticator::AuthConfig {
             identity: raw.auth.identity,
             oidc: raw.auth.oidc,
@@ -155,14 +155,14 @@ fn resolve_auth_webhooks(
 
 fn resolve_event_webhooks(
     raw: HashMap<String, EventWebhookConfig>,
-) -> Result<HashMap<String, EventWebhookConfig>, Error> {
+) -> Result<HashMap<String, Arc<EventWebhookConfig>>, Error> {
     raw.into_iter()
         .map(|(name, mut config)| {
             config.validate().map_err(|e| {
                 Error::InvalidFormat(format!("Invalid event webhook '{name}': {e}"))
             })?;
             config.name.clone_from(&name);
-            Ok((name, config))
+            Ok((name, Arc::new(config)))
         })
         .collect()
 }
@@ -170,6 +170,7 @@ fn resolve_event_webhooks(
 fn resolve_global(
     raw: RawGlobalConfig,
     auth_webhooks: &HashMap<String, Arc<webhook::Config>>,
+    event_webhooks: &HashMap<String, Arc<EventWebhookConfig>>,
 ) -> Result<GlobalConfig, Error> {
     let authorization_webhook = raw
         .authorization_webhook
@@ -179,6 +180,17 @@ fn resolve_global(
             })
         })
         .transpose()?;
+
+    // Names listed in `global.event_webhooks` must resolve to a defined webhook.
+    // The dispatcher itself fires every configured webhook whose filter matches
+    // the event, so the resolved values are not stored here.
+    for name in &raw.event_webhooks {
+        if !event_webhooks.contains_key(name) {
+            return Err(Error::InvalidFormat(format!(
+                "Event webhook '{name}' not found (referenced globally)"
+            )));
+        }
+    }
 
     Ok(GlobalConfig {
         max_concurrent_requests: raw.max_concurrent_requests,
@@ -198,29 +210,56 @@ fn resolve_global(
 fn resolve_repositories(
     raw: HashMap<String, RawRepositoryConfig>,
     auth_webhooks: &HashMap<String, Arc<webhook::Config>>,
+    event_webhooks: &HashMap<String, Arc<EventWebhookConfig>>,
 ) -> Result<HashMap<String, repository::Config>, Error> {
-    raw.into_iter()
-        .map(|(repo_name, raw_repo)| {
-            let authorization_webhook = raw_repo
-                .authorization_webhook
-                .filter(|name| !name.is_empty())
-                .map(|name| {
-                    auth_webhooks.get(&name).cloned().ok_or_else(|| {
-                        Error::InvalidFormat(format!(
-                            "Webhook '{name}' not found (referenced in '{repo_name}' repository)"
-                        ))
-                    })
-                })
-                .transpose()?;
-            let config = repository::Config {
-                upstream: raw_repo.upstream,
-                access_policy: raw_repo.access_policy,
-                retention_policy: raw_repo.retention_policy,
-                immutable_tags: raw_repo.immutable_tags,
-                immutable_tags_exclusions: raw_repo.immutable_tags_exclusions,
-                authorization_webhook,
-            };
-            Ok((repo_name, config))
-        })
-        .collect()
+    let mut resolved = HashMap::with_capacity(raw.len());
+    for (repo_name, raw_repo) in raw {
+        let authorization_webhook = resolve_repo_authorization_webhook(
+            &repo_name,
+            raw_repo.authorization_webhook,
+            auth_webhooks,
+        )?;
+        validate_repo_event_webhooks(&repo_name, &raw_repo.event_webhooks, event_webhooks)?;
+
+        let config = repository::Config {
+            upstream: raw_repo.upstream,
+            access_policy: raw_repo.access_policy,
+            retention_policy: raw_repo.retention_policy,
+            immutable_tags: raw_repo.immutable_tags,
+            immutable_tags_exclusions: raw_repo.immutable_tags_exclusions,
+            authorization_webhook,
+        };
+        resolved.insert(repo_name, config);
+    }
+    Ok(resolved)
+}
+
+fn resolve_repo_authorization_webhook(
+    repo_name: &str,
+    name: Option<String>,
+    auth_webhooks: &HashMap<String, Arc<webhook::Config>>,
+) -> Result<Option<Arc<webhook::Config>>, Error> {
+    let Some(name) = name.filter(|n| !n.is_empty()) else {
+        return Ok(None);
+    };
+    auth_webhooks.get(&name).cloned().map(Some).ok_or_else(|| {
+        Error::InvalidFormat(format!(
+            "Webhook '{name}' not found (referenced in '{repo_name}' repository)"
+        ))
+    })
+}
+
+fn validate_repo_event_webhooks(
+    repo_name: &str,
+    names: &[String],
+    event_webhooks: &HashMap<String, Arc<EventWebhookConfig>>,
+) -> Result<(), Error> {
+    for name in names {
+        if !event_webhooks.contains_key(name) {
+            return Err(Error::InvalidFormat(format!(
+                "Event webhook '{name}' not found (referenced in '{repo_name}' repository)"
+            )));
+        }
+    }
+    Ok(())
 }

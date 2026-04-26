@@ -685,6 +685,7 @@ async fn test_dispatch_event_delivers_to_webhook() {
         [global]
         update_pull_time = false
         max_concurrent_cache_jobs = 10
+        event_webhooks = ["test_hook"]
 
         [event_webhook.test_hook]
         url = "{}/webhook"
@@ -740,6 +741,7 @@ async fn test_dispatch_event_required_webhook_failure_returns_error() {
         [global]
         update_pull_time = false
         max_concurrent_cache_jobs = 10
+        event_webhooks = ["test_hook"]
 
         [event_webhook.test_hook]
         url = "{}/webhook"
@@ -806,6 +808,7 @@ async fn test_server_context_shutdown_drains_in_flight_async_delivery() {
         [global]
         update_pull_time = false
         max_concurrent_cache_jobs = 10
+        event_webhooks = ["slow_hook"]
 
         [event_webhook.slow_hook]
         url = "{}/webhook"

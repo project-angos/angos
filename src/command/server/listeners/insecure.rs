@@ -258,6 +258,7 @@ mod tests {
             [global]
             update_pull_time = false
             max_concurrent_cache_jobs = 10
+            event_webhooks = ["test_hook"]
 
             [event_webhook.test_hook]
             url = "{webhook_url}"
@@ -395,6 +396,7 @@ mod tests {
             [global]
             update_pull_time = false
             max_concurrent_cache_jobs = 10
+            event_webhooks = ["hook_a", "hook_b"]
 
             [event_webhook.hook_a]
             url = "{url_a}"
