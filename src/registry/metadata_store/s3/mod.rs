@@ -292,7 +292,11 @@ impl Backend {
         };
 
         // Cleanup — may already have been deleted by the delete_if_match test.
-        let _ = store.delete(&probe_key).await;
+        if let Err(e) = store.delete(&probe_key).await
+            && e.kind() != ErrorKind::NotFound
+        {
+            warn!("conditional probe: cleanup failed for probe object {probe_key}: {e}");
+        }
 
         let capabilities = ConditionalCapabilities {
             put_if_none_match,
