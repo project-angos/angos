@@ -6,6 +6,7 @@ use tokio::{
     io::{AsyncRead, AsyncReadExt},
     sync::mpsc,
 };
+use tokio_util::task::AbortOnDropHandle;
 use tracing::instrument;
 
 use super::{
@@ -103,7 +104,7 @@ impl Backend {
         let store = self.store.clone();
         let upload_path_owned = ctx.upload_path.to_string();
         let upload_id_owned = ctx.upload_id.to_string();
-        let upload_handle = tokio::spawn(async move {
+        let upload_handle = AbortOnDropHandle::new(tokio::spawn(async move {
             store
                 .upload_part_streaming(
                     &upload_path_owned,
@@ -113,7 +114,7 @@ impl Backend {
                     body,
                 )
                 .await
-        });
+        }));
 
         let mut buf = BytesMut::with_capacity(FRAME_SIZE);
         loop {
