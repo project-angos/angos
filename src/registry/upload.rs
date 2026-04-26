@@ -118,10 +118,10 @@ impl Registry {
     {
         let session_key = session_id.to_string();
 
-        let state = self.upload_store.state(namespace, &session_key).await?;
+        let summary = self.upload_store.summary(namespace, &session_key).await?;
 
         if let Some(offset) = start_offset
-            && offset != state.size
+            && offset != summary.size
         {
             return Err(Error::RangeNotSatisfiable);
         }
@@ -159,8 +159,8 @@ impl Registry {
     {
         let session_key = session_id.to_string();
 
-        let append = match self.upload_store.state(namespace, &session_key).await {
-            Ok(state) => state.size > 0,
+        let append = match self.upload_store.summary(namespace, &session_key).await {
+            Ok(summary) => summary.size > 0,
             Err(blob_store::Error::UploadNotFound) => false,
             Err(e) => return Err(e.into()),
         };
@@ -563,7 +563,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_get_upload_state() {
+    async fn test_upload_summary_size_accumulates() {
         for test_case in backends() {
             let registry = test_case.registry();
             let namespace = &Namespace::new("test-repo").unwrap();
@@ -576,12 +576,12 @@ mod tests {
                 .await
                 .unwrap();
 
-            let state = registry
+            let summary = registry
                 .upload_store
-                .state(namespace, &session_id.to_string())
+                .summary(namespace, &session_id.to_string())
                 .await
                 .unwrap();
-            assert_eq!(state.size, 0);
+            assert_eq!(summary.size, 0);
 
             let stream: Box<dyn tokio::io::AsyncRead + Unpin + Send + Sync> =
                 Box::new(Cursor::new(content.to_vec()));
@@ -597,12 +597,12 @@ mod tests {
                 .await
                 .unwrap();
 
-            let state = registry
+            let summary = registry
                 .upload_store
-                .state(namespace, &session_id.to_string())
+                .summary(namespace, &session_id.to_string())
                 .await
                 .unwrap();
-            assert_eq!(state.size, content.len() as u64);
+            assert_eq!(summary.size, content.len() as u64);
         }
     }
 

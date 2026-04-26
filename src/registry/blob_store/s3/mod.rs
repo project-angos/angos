@@ -27,8 +27,8 @@ use crate::{
     oci::Digest,
     registry::{
         blob_store::{
-            BlobStore, BoxedReader, Error, PresignedBlobStore, UploadState, UploadStore,
-            UploadSummary, sha256_ext::Sha256Ext,
+            BlobStore, BoxedReader, Error, PresignedBlobStore, UploadStore, UploadSummary,
+            sha256_ext::Sha256Ext,
         },
         data_store, pagination, path_builder,
     },
@@ -258,16 +258,6 @@ impl UploadStore for Backend {
             self.evict_upload_state(name, uuid).await;
         }
         result
-    }
-
-    #[instrument(skip(self))]
-    async fn state(&self, name: &str, uuid: &str) -> Result<UploadState, Error> {
-        let size = if self.uniform_parts {
-            self.get_upload_state_uniform(name, uuid).await?.size
-        } else {
-            self.get_upload_state_nonuniform(name, uuid).await?.size
-        };
-        Ok(UploadState { size })
     }
 
     #[instrument(skip(self))]

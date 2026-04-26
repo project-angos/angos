@@ -22,16 +22,6 @@ pub struct UploadSummary {
     pub started_at: DateTime<Utc>,
 }
 
-/// State for an in-progress upload session as visible to callers outside the blob-store.
-///
-/// Only the total byte count is part of the public contract. Backend-specific state
-/// (multipart upload IDs, part lists, pending buffers) is managed entirely within
-/// each backend implementation.
-#[derive(Debug, Clone)]
-pub struct UploadState {
-    pub size: u64,
-}
-
 #[async_trait]
 pub trait BlobStore: Send + Sync {
     async fn list(
@@ -74,8 +64,6 @@ pub trait UploadStore: Send + Sync {
         content_length: u64,
         append: bool,
     ) -> Result<(Digest, u64), Error>;
-
-    async fn state(&self, namespace: &str, uuid: &str) -> Result<UploadState, Error>;
 
     async fn summary(&self, namespace: &str, uuid: &str) -> Result<UploadSummary, Error>;
 

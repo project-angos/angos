@@ -18,7 +18,7 @@ use crate::{
     oci::Digest,
     registry::{
         blob_store::{
-            BlobStore, BoxedReader, Error, UploadState, UploadStore, UploadSummary,
+            BlobStore, BoxedReader, Error, UploadStore, UploadSummary,
             hashing_reader::HashingReader, sha256_ext::Sha256Ext,
         },
         data_store, pagination, path_builder,
@@ -241,13 +241,6 @@ impl UploadStore for Backend {
             .await?;
 
         Ok((digest, total_size))
-    }
-
-    #[instrument(skip(self))]
-    async fn state(&self, name: &str, uuid: &str) -> Result<UploadState, Error> {
-        let path = path_builder::upload_path(name, uuid);
-        let size = self.file_size_or_err(&path, Error::UploadNotFound).await?;
-        Ok(UploadState { size })
     }
 
     #[instrument(skip(self))]
