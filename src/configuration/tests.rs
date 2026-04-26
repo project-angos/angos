@@ -411,8 +411,8 @@ fn test_invalid_toml_format() {
     let result = Configuration::load_from_str(config);
     assert!(result.is_err());
     match result {
-        Err(Error::NotReadable(_)) => {}
-        _ => panic!("Expected NotReadable error"),
+        Err(Error::InvalidFormat(_)) => {}
+        _ => panic!("Expected InvalidFormat error"),
     }
 }
 
@@ -887,8 +887,8 @@ fn test_load_from_file_with_invalid_content() {
     assert!(result.is_err());
 
     match result {
-        Err(Error::NotReadable(_)) => {}
-        _ => panic!("Expected NotReadable error"),
+        Err(Error::InvalidFormat(_)) => {}
+        _ => panic!("Expected InvalidFormat error"),
     }
 }
 

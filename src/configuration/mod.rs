@@ -101,7 +101,7 @@ impl Configuration {
     /// Parse and resolve a TOML configuration string, returning typed errors.
     pub fn load_from_str(slice: &str) -> Result<Self, Error> {
         let raw: RawConfiguration =
-            toml::from_str(slice).map_err(|e| Error::NotReadable(e.to_string()))?;
+            toml::from_str(slice).map_err(|e| Error::InvalidFormat(e.to_string()))?;
         Self::resolve(raw)
     }
 
