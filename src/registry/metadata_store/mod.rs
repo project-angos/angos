@@ -3,7 +3,6 @@ mod error;
 use std::{
     collections::{HashMap, HashSet, hash_map::RandomState},
     hash::{BuildHasher, Hasher},
-    sync::Arc,
 };
 
 use async_trait::async_trait;
@@ -99,8 +98,8 @@ pub enum LinkOperation {
     },
 }
 
-pub struct Transaction {
-    store: Arc<dyn MetadataStore + Send + Sync>,
+pub struct Transaction<'a> {
+    store: &'a (dyn MetadataStore + Send + Sync),
     namespace: String,
     operations: Vec<LinkOperation>,
 }
@@ -108,8 +107,8 @@ pub struct Transaction {
 /// Builder for a single `Create` link operation within a [`Transaction`].
 ///
 /// Obtain one via [`Transaction::create_link`] and finalize it by calling [`add`](Self::add).
-pub struct CreateLinkBuilder<'a> {
-    tx: &'a mut Transaction,
+pub struct CreateLinkBuilder<'tx, 'store: 'tx> {
+    tx: &'tx mut Transaction<'store>,
     link: LinkKind,
     target: Digest,
     referrer: Option<Digest>,
@@ -117,7 +116,7 @@ pub struct CreateLinkBuilder<'a> {
     descriptor: Option<Descriptor>,
 }
 
-impl CreateLinkBuilder<'_> {
+impl<'tx, 'store: 'tx> CreateLinkBuilder<'tx, 'store> {
     /// Associates a referrer digest with this link.
     pub fn with_referrer(mut self, referrer: &Digest) -> Self {
         self.referrer = Some(referrer.clone());
@@ -148,8 +147,12 @@ impl CreateLinkBuilder<'_> {
     }
 }
 
-impl Transaction {
-    pub fn create_link(&mut self, link: &LinkKind, target: &Digest) -> CreateLinkBuilder<'_> {
+impl<'store> Transaction<'store> {
+    pub fn create_link<'tx>(
+        &'tx mut self,
+        link: &LinkKind,
+        target: &Digest,
+    ) -> CreateLinkBuilder<'tx, 'store> {
         CreateLinkBuilder {
             tx: self,
             link: link.clone(),
@@ -185,13 +188,13 @@ impl Transaction {
 }
 
 pub trait MetadataStoreExt {
-    fn begin_transaction(&self, namespace: &str) -> Transaction;
+    fn begin_transaction(&self, namespace: &str) -> Transaction<'_>;
 }
 
-impl MetadataStoreExt for Arc<dyn MetadataStore + Send + Sync> {
-    fn begin_transaction(&self, namespace: &str) -> Transaction {
+impl MetadataStoreExt for dyn MetadataStore + Send + Sync {
+    fn begin_transaction(&self, namespace: &str) -> Transaction<'_> {
         Transaction {
-            store: self.clone(),
+            store: self,
             namespace: namespace.to_string(),
             operations: Vec::new(),
         }
