@@ -310,12 +310,6 @@ impl Backend {
         Ok(capabilities)
     }
 
-    pub async fn flush_access_times(&self) {
-        if let Some(writer) = &self.access_time_writer {
-            writer.flush(self).await;
-        }
-    }
-
     pub fn with_cache(mut self, cache: Arc<dyn Cache>) -> Self {
         self.cache = Some(cache);
         self
@@ -676,7 +670,9 @@ impl MetadataStore for Backend {
     }
 
     async fn flush_access_times(&self) {
-        Backend::flush_access_times(self).await;
+        if let Some(writer) = &self.access_time_writer {
+            writer.flush(self).await;
+        }
     }
 }
 
