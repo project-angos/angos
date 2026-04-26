@@ -32,14 +32,12 @@ impl MetadataStoreConfig {
                 let caps =
                     metadata_store::s3::Backend::probe_conditional_capabilities(&store).await?;
 
-                if matches!(config.lock_strategy, LockStrategy::S3(_)) && !caps.supports_full_cas()
-                {
+                if matches!(config.lock_strategy, LockStrategy::S3(_)) && !caps.supports_cas() {
                     return Err(Error::Lock(format!(
-                        "S3 lock strategy requires If-None-Match, If-Match, and Delete-If-Match \
-                         support, but probe found: If-None-Match={}, If-Match={}, \
-                         Delete-If-Match={}. Use lock_strategy = redis or \
-                         lock_strategy = memory instead.",
-                        caps.put_if_none_match, caps.put_if_match, caps.delete_if_match
+                        "S3 lock strategy requires If-None-Match and If-Match support, \
+                         but probe found: If-None-Match={}, If-Match={}. \
+                         Use lock_strategy = redis or lock_strategy = memory instead.",
+                        caps.put_if_none_match, caps.put_if_match
                     )));
                 }
 
@@ -67,16 +65,13 @@ impl MetadataStoreConfig {
                 let caps = match &config.capabilities {
                     Some(declared) => {
                         if matches!(config.lock_strategy, LockStrategy::S3(_))
-                            && !declared.supports_full_cas()
+                            && !declared.supports_cas()
                         {
                             return Err(Error::Lock(format!(
-                                "S3 lock strategy requires If-None-Match, If-Match, and \
-                                 Delete-If-Match support, but config declares: \
-                                 put_if_none_match={}, put_if_match={}, delete_if_match={}. \
+                                "S3 lock strategy requires If-None-Match and If-Match support, \
+                                 but config declares: put_if_none_match={}, put_if_match={}. \
                                  Use lock_strategy = redis or lock_strategy = memory instead.",
-                                declared.put_if_none_match,
-                                declared.put_if_match,
-                                declared.delete_if_match
+                                declared.put_if_none_match, declared.put_if_match
                             )));
                         }
                         Some(declared.clone())
@@ -97,7 +92,6 @@ impl MetadataStoreConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::registry::metadata_store::lock::s3::S3LockConfig;
 
     fn s3_config_with_memory_lock() -> MetadataStoreConfig {
         MetadataStoreConfig::S3(metadata_store::s3::BackendConfig {
@@ -127,33 +121,6 @@ mod tests {
             .expect("S3 config should return capabilities");
         assert!(caps.put_if_none_match, "MinIO should support If-None-Match");
         assert!(caps.put_if_match, "MinIO should support If-Match");
-    }
-
-    #[tokio::test]
-    async fn test_probe_s3_lock_strategy_requires_full_cas() {
-        let config = MetadataStoreConfig::S3(metadata_store::s3::BackendConfig {
-            access_key_id: "root".to_string(),
-            secret_key: "roottoor".to_string(),
-            endpoint: "http://127.0.0.1:9000".to_string(),
-            bucket: "registry".to_string(),
-            region: "us-east-1".to_string(),
-            key_prefix: format!("probe-s3lock-{}", uuid::Uuid::new_v4()),
-            lock_strategy: LockStrategy::S3(S3LockConfig::default()),
-            link_cache_ttl: 30,
-            access_time_debounce_secs: 0,
-            capabilities: None,
-        });
-        let result = config.probe().await;
-        match result {
-            Ok(_) => {}
-            Err(Error::Lock(msg)) => {
-                assert!(
-                    msg.contains("Delete-If-Match"),
-                    "Error should mention Delete-If-Match requirement: {msg}"
-                );
-            }
-            Err(e) => panic!("Unexpected error type: {e:?}"),
-        }
     }
 
     #[tokio::test]

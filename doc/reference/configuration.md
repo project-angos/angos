@@ -223,11 +223,10 @@ delete_if_match = false
 ```
 
 **Performance impact:**
-- When `put_if_match` is available, access time writes use optimized compare-and-swap (CAS) instead of distributed lock operations, reducing S3 API calls per manifest pull.
-- When `delete_if_match` is available, S3 lock release is atomic and race-condition-free.
-- When all three flags are `true`, the registry selects CAS-based coordination for all writes and serialization. No Redis or Memory lock backend is built or used in this mode.
-- In CAS mode, `lock_strategy` no longer drives coordinator selection. It is consulted only to tune the internal S3 lock that the CAS coordinator uses for its rare locked-fallback path: `lock_strategy.s3` parameters (TTL, retries, timeouts) are honored if set; `"memory"` and `"redis"` are accepted but their lock backend is never built — the registry synthesizes default S3 lock parameters instead. Set `lock_strategy.s3` explicitly if you want to control these parameters.
-- When any flag is `false`, the registry falls back to lock-based coordination using the configured `lock_strategy`.
+- When `put_if_none_match` and `put_if_match` are both available, the registry selects CAS-based coordination for all writes and serialization. No Redis or Memory lock backend is built or used in this mode.
+- `delete_if_match` is optional within CAS mode. When available, the CAS coordinator's internal S3 lock uses race-free conditional release. When absent, release falls back to plain delete (functional but race-prone under contention).
+- In CAS mode, `lock_strategy` no longer drives coordinator selection. It is consulted only to tune the internal S3 lock that the CAS coordinator uses for its locked-fallback path: `lock_strategy.s3` parameters (TTL, retries, timeouts) are honored if set; `"memory"` and `"redis"` are accepted but their lock backend is never built — the registry synthesizes default S3 lock parameters instead. Set `lock_strategy.s3` explicitly if you want to control these parameters.
+- When `put_if_none_match` or `put_if_match` is missing, the registry falls back to lock-based coordination using the configured `lock_strategy`. In that case `lock_strategy = "s3"` is rejected at startup (S3 locking is impossible without those flags); use `redis` or `memory` instead.
 
 > **Warning:** Setting `access_time_debounce_secs = 0` with S3 lock strategy causes every manifest pull to perform a full lock-acquire → read → write → release cycle via S3 API. At scale with many concurrent pulls, this adds significant latency and S3 API costs. Keep the default value of 60 or higher for S3-locked deployments, or disable access time tracking entirely if not needed for retention policies.
 
@@ -243,7 +242,7 @@ Multi-replica deployments require a distributed lock backend. The `lock_strategy
 | redis | Yes | Yes |
 | s3 | Yes | No |
 
-> **Note:** This matrix applies when CAS-based coordination is not active (i.e., the S3 provider does not support all three conditional operations). When all three capabilities are available, the registry uses CAS coordination automatically and the `lock_strategy` governs only internal S3 lock tuning, not coordinator selection.
+> **Note:** This matrix applies when CAS-based coordination is not active (i.e., the S3 provider lacks `put_if_none_match` or `put_if_match`). When both are available, the registry uses CAS coordination automatically and `lock_strategy` governs only internal S3 lock tuning, not coordinator selection. The `S3` row applies only outside CAS mode and is rejected at startup against providers without `put_if_none_match` and `put_if_match`.
 
 **Memory** (default) — in-process locks, suitable for single-instance deployments only:
 
@@ -252,7 +251,7 @@ Multi-replica deployments require a distributed lock backend. The `lock_strategy
 lock_strategy = "memory"
 ```
 
-**S3** — uses S3 conditional writes (`If-None-Match: *`) for distributed locking without extra infrastructure. The S3 provider must support all three conditional operations (`put_if_none_match`, `put_if_match`, and `delete_if_match`); angos verifies this at startup and fails fast if any is missing:
+**S3** — uses S3 conditional writes (`If-None-Match: *`) for distributed locking without extra infrastructure. The S3 provider must support `put_if_none_match` and `put_if_match`; angos verifies this at startup and fails fast if either is missing. `delete_if_match` is optional — when absent, lock release falls back to plain delete (functional but race-prone under contention):
 
 ```toml
 # With defaults (empty table body; all fields use defaults)

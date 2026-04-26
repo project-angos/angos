@@ -51,11 +51,12 @@ pub struct ConditionalCapabilities {
 }
 
 impl ConditionalCapabilities {
-    /// All three conditional operations are required for the CAS coordinator:
-    /// `put_if_none_match` and `put_if_match` for optimistic writes, and
-    /// `delete_if_match` for race-free S3 lock release.
-    pub fn supports_full_cas(&self) -> bool {
-        self.put_if_none_match && self.put_if_match && self.delete_if_match
+    /// Both conditional put operations are needed for CAS-based coordination
+    /// and for the S3-based lock backend's acquire/heartbeat paths. The
+    /// `delete_if_match` capability further enables race-free lock release;
+    /// when absent, release falls back to plain delete (race-prone but functional).
+    pub fn supports_cas(&self) -> bool {
+        self.put_if_none_match && self.put_if_match
     }
 }
 
