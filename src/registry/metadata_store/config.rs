@@ -22,27 +22,25 @@ pub enum MetadataStoreConfig {
 impl MetadataStoreConfig {
     pub async fn probe(&self) -> Result<Option<ConditionalCapabilities>, Error> {
         match self {
-            MetadataStoreConfig::S3(config) => {
-                let store_config = match &config.lock_strategy {
-                    LockStrategy::S3(lock_config) => config.to_lock_store_config(lock_config),
-                    _ => config.to_data_store_config(),
-                };
-                let store = data_store::s3::Backend::new(&store_config)
-                    .map_err(|e| Error::StorageBackend(e.to_string()))?;
-                let caps =
-                    metadata_store::s3::Backend::probe_conditional_capabilities(&store).await?;
-
-                if matches!(config.lock_strategy, LockStrategy::S3(_)) && !caps.supports_cas() {
-                    return Err(Error::Lock(format!(
-                        "S3 lock strategy requires If-None-Match and If-Match support, \
-                         but probe found: If-None-Match={}, If-Match={}. \
-                         Use lock_strategy = redis or lock_strategy = memory instead.",
-                        caps.put_if_none_match, caps.put_if_match
-                    )));
+            MetadataStoreConfig::S3(config) => match &config.lock_strategy {
+                LockStrategy::S3(lock_config) => {
+                    let store =
+                        data_store::s3::Backend::new(&config.to_lock_store_config(lock_config))
+                            .map_err(|e| Error::StorageBackend(e.to_string()))?;
+                    let caps =
+                        metadata_store::s3::Backend::probe_conditional_capabilities(&store).await?;
+                    if !caps.supports_cas() {
+                        return Err(Error::Lock(format!(
+                            "S3 lock strategy requires If-None-Match and If-Match support, \
+                             but probe found: If-None-Match={}, If-Match={}. \
+                             Use lock_strategy = redis or lock_strategy = memory instead.",
+                            caps.put_if_none_match, caps.put_if_match
+                        )));
+                    }
+                    Ok(Some(caps))
                 }
-
-                Ok(Some(caps))
-            }
+                _ => Ok(None),
+            },
             MetadataStoreConfig::FS(_) => Ok(None),
         }
     }
@@ -93,7 +91,7 @@ impl MetadataStoreConfig {
 mod tests {
     use super::*;
 
-    fn s3_config_with_memory_lock() -> MetadataStoreConfig {
+    fn s3_config_with_lock_strategy(lock_strategy: LockStrategy) -> MetadataStoreConfig {
         MetadataStoreConfig::S3(metadata_store::s3::BackendConfig {
             access_key_id: "root".to_string(),
             secret_key: "roottoor".to_string(),
@@ -101,7 +99,7 @@ mod tests {
             bucket: "registry".to_string(),
             region: "us-east-1".to_string(),
             key_prefix: format!("probe-test-{}", uuid::Uuid::new_v4()),
-            lock_strategy: LockStrategy::Memory,
+            lock_strategy,
             link_cache_ttl: 30,
             access_time_debounce_secs: 0,
             capabilities: None,
@@ -109,42 +107,33 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_probe_detects_minio_capabilities() {
-        let config = s3_config_with_memory_lock();
+    async fn test_probe_s3_lock_strategy_detects_minio_capabilities() {
+        use crate::registry::metadata_store::lock::s3::S3LockConfig;
+
+        let config = s3_config_with_lock_strategy(LockStrategy::S3(S3LockConfig::default()));
         let result = config.probe().await;
         assert!(
             result.is_ok(),
-            "Probe should succeed against MinIO: {result:?}"
+            "Probe should succeed against MinIO with S3 lock strategy: {result:?}"
         );
         let caps = result
             .unwrap()
-            .expect("S3 config should return capabilities");
+            .expect("S3 lock strategy should return capabilities");
         assert!(caps.put_if_none_match, "MinIO should support If-None-Match");
         assert!(caps.put_if_match, "MinIO should support If-Match");
     }
 
     #[tokio::test]
-    async fn test_probe_memory_lock_strategy_returns_capabilities() {
-        let config = MetadataStoreConfig::S3(metadata_store::s3::BackendConfig {
-            access_key_id: "root".to_string(),
-            secret_key: "roottoor".to_string(),
-            endpoint: "http://127.0.0.1:9000".to_string(),
-            bucket: "registry".to_string(),
-            region: "us-east-1".to_string(),
-            key_prefix: format!("probe-memory-{}", uuid::Uuid::new_v4()),
-            lock_strategy: LockStrategy::Memory,
-            link_cache_ttl: 30,
-            access_time_debounce_secs: 0,
-            capabilities: None,
-        });
+    async fn test_probe_memory_lock_strategy_is_noop() {
+        let config = s3_config_with_lock_strategy(LockStrategy::Memory);
         let result = config.probe().await;
         assert!(
             result.is_ok(),
-            "Probe should run for Memory lock strategy: {result:?}"
+            "Probe should be a no-op for Memory lock strategy: {result:?}"
         );
         assert!(
-            result.unwrap().is_some(),
-            "Memory lock strategy should return probed capabilities"
+            result.unwrap().is_none(),
+            "Memory lock strategy should not produce capabilities",
         );
     }
 

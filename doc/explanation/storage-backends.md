@@ -202,7 +202,7 @@ For multiple registry instances, you need:
 
 ### With S3 Locking (Simplest)
 
-Angos automatically uses CAS-based coordination when the provider supports all three conditional operations (`put_if_none_match`, `put_if_match`, and `delete_if_match`); otherwise it falls back to lock-based coordination using whichever `lock_strategy` is configured. The lock-based S3 strategy itself only requires `put_if_none_match` and `put_if_match` — `delete_if_match` improves lock-release safety but is not mandatory. Angos probes capabilities at startup and fails fast if `put_if_none_match` or `put_if_match` is missing on a provider configured with `lock_strategy = s3`.
+Selecting `lock_strategy = "s3"` activates the CAS coordinator, which uses S3 conditional writes for all coordination, no extra infrastructure being required. The provider must support `put_if_none_match` and `put_if_match`; angos probes at startup and fails fast if either is missing. `delete_if_match` is optional and, when available, makes the coordinator's internal lock release race-free.
 
 ```toml
 [blob_store.s3]
@@ -225,7 +225,7 @@ retry_delay_ms = 50    # Delay between retries (default: 50)
 
 ### With S3 + Redis
 
-Redis is used for distributed locking when the S3 provider lacks `put_if_none_match` or `put_if_match`. When all three CAS flags are present, the registry selects CAS-based coordination automatically and the Redis lock backend is not built even if configured.
+Selecting `lock_strategy = "redis"` activates the lock coordinator with Redis as the distributed lock backend. The S3 provider's conditional capabilities are not consulted in this mode — Redis handles all serialization regardless of what the provider supports.
 
 ```toml
 [blob_store.s3]

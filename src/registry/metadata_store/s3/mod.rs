@@ -28,7 +28,7 @@ use crate::{
             BlobIndex, BlobIndexOperation, ConditionalCapabilities, Error, LinkMetadata,
             LinkOperation, LockStrategy, MetadataStore, ResolvedCreate, ResolvedDelete,
             link_kind::LinkKind,
-            lock::{self, LockBackend, MemoryBackend},
+            lock::{self, MemoryBackend},
             lock_ops::LockOps,
         },
         pagination, path_builder,
@@ -83,61 +83,61 @@ impl Backend {
         config: &BackendConfig,
         caps: &ConditionalCapabilities,
     ) -> Result<Arc<dyn WriteCoordinator>, Error> {
-        if caps.supports_cas() {
-            let s3_lock_config = match &config.lock_strategy {
-                LockStrategy::S3(c) => c.clone(),
-                _ => lock::s3::S3LockConfig::default(),
-            };
-            info!("Using CAS coordinator with S3 lock for S3 metadata-store");
-            let lock_store = Arc::new(
-                data_store::s3::Backend::new(&config.to_lock_store_config(&s3_lock_config))
-                    .map_err(|e| Error::Lock(format!("Failed to initialize S3 lock store: {e}")))?,
-            );
-            let lock = Arc::new(
-                lock::S3LockBackend::new(lock_store, &s3_lock_config, caps.delete_if_match)
-                    .map_err(|e| Error::Lock(format!("Failed to initialize S3 lock store: {e}")))?,
-            );
-            Ok(Arc::new(coordinator::CasCoordinator { lock }))
-        } else {
-            let lock: Arc<dyn LockBackend + Send + Sync> = match &config.lock_strategy {
-                LockStrategy::Redis(redis_config) => {
-                    info!("Using Redis lock store for S3 metadata-store");
-                    let backend = lock::RedisBackend::new(redis_config).map_err(|e| {
-                        Error::Lock(format!("Failed to initialize Redis lock store: {e}"))
-                    })?;
-                    Arc::new(backend)
+        match &config.lock_strategy {
+            LockStrategy::S3(s3_lock_config) => {
+                if !caps.supports_cas() {
+                    return Err(Error::Lock(format!(
+                        "S3 lock strategy requires If-None-Match and If-Match support, \
+                         but provider has put_if_none_match={}, put_if_match={}. \
+                         Use lock_strategy = redis or lock_strategy = memory instead.",
+                        caps.put_if_none_match, caps.put_if_match
+                    )));
                 }
-                LockStrategy::Memory => {
-                    info!("Using in-memory lock store for S3 metadata-store");
-                    Arc::new(MemoryBackend::new())
-                }
-                LockStrategy::S3(_) => {
-                    return Err(Error::Lock(
-                        "S3 lock strategy requires CAS support; provider lacks \
-                         If-None-Match or If-Match. Use lock_strategy = redis or \
-                         lock_strategy = memory instead."
-                            .into(),
-                    ));
-                }
-            };
-            Ok(Arc::new(coordinator::LockCoordinator { lock }))
+                info!("Using CAS coordinator with S3 lock for S3 metadata-store");
+                let lock_store = Arc::new(
+                    data_store::s3::Backend::new(&config.to_lock_store_config(s3_lock_config))
+                        .map_err(|e| {
+                            Error::Lock(format!("Failed to initialize S3 lock store: {e}"))
+                        })?,
+                );
+                let lock = Arc::new(
+                    lock::S3LockBackend::new(lock_store, s3_lock_config, caps.delete_if_match)
+                        .map_err(|e| {
+                            Error::Lock(format!("Failed to initialize S3 lock store: {e}"))
+                        })?,
+                );
+                Ok(Arc::new(coordinator::CasCoordinator { lock }))
+            }
+            LockStrategy::Redis(redis_config) => {
+                info!("Using Redis lock store for S3 metadata-store");
+                let backend = lock::RedisBackend::new(redis_config).map_err(|e| {
+                    Error::Lock(format!("Failed to initialize Redis lock store: {e}"))
+                })?;
+                Ok(Arc::new(coordinator::LockCoordinator {
+                    lock: Arc::new(backend),
+                }))
+            }
+            LockStrategy::Memory => {
+                info!("Using in-memory lock store for S3 metadata-store");
+                Ok(Arc::new(coordinator::LockCoordinator {
+                    lock: Arc::new(MemoryBackend::new()),
+                }))
+            }
         }
     }
 
     /// Create a new S3 metadata-store backend.
     ///
-    /// `conditional` overrides the capabilities used for coordinator selection and CAS
-    /// write paths. Pass `None` to use defaults (all capabilities assumed present for S3 lock
-    /// strategy, none for other strategies). Pass `Some(caps)` with the result of
-    /// `probe_conditional_capabilities` to use the actual probed values.
+    /// `conditional` carries the capabilities used by the CAS coordinator when the
+    /// operator selects `lock_strategy = "s3"`. Pass `None` to assume all capabilities
+    /// are present for the S3 lock strategy and none for other strategies, or
+    /// `Some(caps)` with the result of `probe_conditional_capabilities`.
     ///
-    /// When the provider supports `put_if_none_match` and `put_if_match`, the CAS
-    /// coordinator is selected regardless of `lock_strategy`. The `delete_if_match`
-    /// capability is propagated to the CAS coordinator's internal S3 lock to control
-    /// release safety; when absent, the lock falls back to plain delete on release.
-    /// In CAS mode the `lock_strategy` value is consulted only to tune the internal
-    /// S3 lock parameters: if `lock_strategy` is `S3`, its timing parameters are
-    /// applied; any other value causes default S3 lock parameters to be used instead.
+    /// `lock_strategy` drives coordinator selection: `"s3"` selects the CAS coordinator
+    /// (which requires `put_if_none_match` and `put_if_match`; `delete_if_match` is
+    /// propagated to the internal S3 lock for release safety), while `"redis"` and
+    /// `"memory"` select the lock coordinator with the corresponding lock backend.
+    /// Capabilities are not consulted outside the S3 lock strategy.
     pub fn new(
         config: &BackendConfig,
         conditional: Option<ConditionalCapabilities>,
