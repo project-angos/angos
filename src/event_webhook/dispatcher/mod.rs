@@ -19,9 +19,9 @@ mod transport;
 #[cfg(test)]
 mod tests;
 
+use endpoint::WebhookEndpoint;
 #[cfg(test)]
 pub use endpoint::matches_event;
-use endpoint::{WebhookEndpoint, compile_filters};
 #[cfg(test)]
 pub use signature::compute_signature;
 use transport::send_with_retries;
@@ -111,8 +111,8 @@ fn serialize_event(event: &Event) -> Result<(Vec<u8>, String), Error> {
 }
 
 impl EventDispatcher {
-    pub fn new(webhooks: HashMap<String, EventWebhookConfig>) -> Result<Self, Error> {
-        let mut endpoints = HashMap::new();
+    pub fn new(webhooks: HashMap<String, Arc<EventWebhookConfig>>) -> Result<Self, Error> {
+        let mut endpoints = HashMap::with_capacity(webhooks.len());
 
         for (name, config) in webhooks {
             let client = Client::builder()
@@ -124,19 +124,7 @@ impl EventDispatcher {
                     ))
                 })?;
 
-            let compiled_filters = compile_filters(
-                config.repository_filter.as_deref().unwrap_or_default(),
-                &name,
-            );
-
-            endpoints.insert(
-                name,
-                WebhookEndpoint {
-                    client,
-                    config,
-                    compiled_filters,
-                },
-            );
+            endpoints.insert(name, WebhookEndpoint { client, config });
         }
 
         Ok(Self {
@@ -181,7 +169,7 @@ impl EventDispatcher {
         let mut in_flight_guard = self.in_flight.lock().await;
         in_flight_guard.spawn(deliver_async(
             endpoint.client.clone(),
-            endpoint.config.url.clone(),
+            endpoint.config.url.to_string(),
             endpoint.config.token.clone(),
             body.to_vec(),
             event_kind_header.to_string(),
@@ -208,7 +196,7 @@ impl EventDispatcher {
             DeliveryPolicy::Required => {
                 send_and_record(
                     &endpoint.client,
-                    &endpoint.config.url,
+                    endpoint.config.url.as_str(),
                     endpoint.config.token.as_deref(),
                     body,
                     event_kind_header,
@@ -222,7 +210,7 @@ impl EventDispatcher {
             DeliveryPolicy::Optional => {
                 if let Err(e) = send_and_record(
                     &endpoint.client,
-                    &endpoint.config.url,
+                    endpoint.config.url.as_str(),
                     endpoint.config.token.as_deref(),
                     body,
                     event_kind_header,

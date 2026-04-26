@@ -106,14 +106,14 @@ Angos implements fail-closed authorization for critical security decisions:
 | Invalid Basic Auth password         | Proceeds as anonymous identity     |
 | CEL evaluation error                | Rule skipped, evaluation continues |
 
-**Important:** Without authentication, requests proceed with an anonymous identity. Without access policies, the default behavior is to deny access (`default_allow = false`). To allow anonymous reads, you must explicitly configure access policies with appropriate rules.
+**Important:** Without authentication, requests proceed with an anonymous identity. Without access policies, the default behavior is to deny access (`default = "deny"`). To allow anonymous reads, you must explicitly configure access policies with appropriate rules.
 
 ### Policy Defaults
 
 ```toml
 # Recommended: explicit allow
 [global.access_policy]
-default_allow = false
+default = "deny"
 rules = ["identity.username != null"]
 ```
 
@@ -344,7 +344,7 @@ Detect anomalies:
 
 ### Policies
 
-- [ ] default_allow = false
+- [ ] default = "deny"
 - [ ] Minimum necessary access granted
 - [ ] Production/development separated
 - [ ] Delete operations restricted

@@ -1,7 +1,8 @@
-use std::{collections::HashMap, time::Duration};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use chrono::Utc;
 use prometheus::proto::MetricType;
+use url::Url;
 use uuid::Uuid;
 use wiremock::{
     Mock, MockServer, ResponseTemplate,
@@ -9,10 +10,29 @@ use wiremock::{
 };
 
 use super::{EventDispatcher, compute_signature, matches_event};
-use crate::event_webhook::{
-    config::{DeliveryPolicy, EventWebhookConfig},
-    event::{Event, EventKind},
+use crate::{
+    configuration::RegexPattern,
+    event_webhook::{
+        config::{DeliveryPolicy, EventWebhookConfig},
+        event::{Event, EventKind},
+    },
 };
+
+/// Wraps each `EventWebhookConfig` in an `Arc` so the map matches the
+/// signature of [`EventDispatcher::new`].
+fn into_arc_map(
+    webhooks: HashMap<String, EventWebhookConfig>,
+) -> HashMap<String, Arc<EventWebhookConfig>> {
+    let mut out = HashMap::with_capacity(webhooks.len());
+    for (name, config) in webhooks {
+        out.insert(name, Arc::new(config));
+    }
+    out
+}
+
+fn build_dispatcher(webhooks: HashMap<String, EventWebhookConfig>) -> EventDispatcher {
+    EventDispatcher::new(into_arc_map(webhooks)).expect("dispatcher should build in tests")
+}
 
 fn create_test_event() -> Event {
     Event {
@@ -90,10 +110,11 @@ fn compute_signature_empty_body() {
 
 fn create_test_config(
     events: Vec<EventKind>,
-    repository_filter: Option<Vec<String>>,
+    repository_filter: Option<Vec<RegexPattern>>,
 ) -> EventWebhookConfig {
     EventWebhookConfig {
-        url: "https://example.com/webhook".to_string(),
+        name: String::new(),
+        url: Url::parse("https://example.com/webhook").unwrap(),
         policy: DeliveryPolicy::Optional,
         token: None,
         timeout_ms: 5000,
@@ -123,7 +144,7 @@ fn matches_event_no_filter_matches_all_repositories() {
 fn matches_event_with_filter_matches_matching_repository() {
     let config = create_test_config(
         vec![EventKind::ManifestPush],
-        Some(vec!["^myapp/.*".to_string()]),
+        Some(vec![RegexPattern::compile("^myapp/.*").unwrap()]),
     );
     assert!(matches_event(
         &config,
@@ -136,7 +157,7 @@ fn matches_event_with_filter_matches_matching_repository() {
 fn matches_event_with_filter_rejects_non_matching_repository() {
     let config = create_test_config(
         vec![EventKind::ManifestPush],
-        Some(vec!["^myapp/.*".to_string()]),
+        Some(vec![RegexPattern::compile("^myapp/.*").unwrap()]),
     );
     assert!(!matches_event(
         &config,
@@ -149,7 +170,10 @@ fn matches_event_with_filter_rejects_non_matching_repository() {
 fn matches_event_multiple_filters_matches_if_any_pattern_matches() {
     let config = create_test_config(
         vec![EventKind::ManifestPush],
-        Some(vec!["^myapp/.*".to_string(), "^library/.*".to_string()]),
+        Some(vec![
+            RegexPattern::compile("^myapp/.*").unwrap(),
+            RegexPattern::compile("^library/.*").unwrap(),
+        ]),
     );
     assert!(matches_event(
         &config,
@@ -201,7 +225,7 @@ fn matches_event_multiple_event_kinds() {
 fn matches_event_both_event_kind_and_repository_must_match() {
     let config = create_test_config(
         vec![EventKind::ManifestPush],
-        Some(vec!["^myapp/.*".to_string()]),
+        Some(vec![RegexPattern::compile("^myapp/.*").unwrap()]),
     );
     assert!(matches_event(
         &config,
@@ -227,7 +251,8 @@ fn create_webhook_config_for_url(
     token: Option<String>,
 ) -> EventWebhookConfig {
     EventWebhookConfig {
-        url: url.to_string(),
+        name: String::new(),
+        url: Url::parse(url).unwrap(),
         policy: DeliveryPolicy::Required,
         token,
         timeout_ms: 5000,
@@ -257,14 +282,14 @@ fn event_dispatcher_new_constructs_from_configs() {
         ),
     );
 
-    let dispatcher = EventDispatcher::new(webhooks);
+    let dispatcher = EventDispatcher::new(into_arc_map(webhooks));
     assert!(dispatcher.is_ok());
 }
 
 #[test]
 fn event_dispatcher_new_empty_configs() {
     let webhooks = HashMap::new();
-    let dispatcher = EventDispatcher::new(webhooks);
+    let dispatcher = EventDispatcher::new(into_arc_map(webhooks));
     assert!(dispatcher.is_ok());
 }
 
@@ -288,7 +313,7 @@ async fn dispatch_sends_post_with_json_body() {
         create_webhook_config_for_url(&server.uri(), vec![EventKind::ManifestPush], None),
     );
 
-    let dispatcher = EventDispatcher::new(webhooks).unwrap();
+    let dispatcher = build_dispatcher(webhooks);
     let result = dispatcher.dispatch(&event).await;
     assert!(result.is_ok());
 }
@@ -311,7 +336,7 @@ async fn dispatch_sends_event_kind_header() {
         create_webhook_config_for_url(&server.uri(), vec![EventKind::ManifestPush], None),
     );
 
-    let dispatcher = EventDispatcher::new(webhooks).unwrap();
+    let dispatcher = build_dispatcher(webhooks);
     let result = dispatcher.dispatch(&event).await;
     assert!(result.is_ok());
 }
@@ -338,7 +363,7 @@ async fn dispatch_sends_authorization_bearer_header() {
         ),
     );
 
-    let dispatcher = EventDispatcher::new(webhooks).unwrap();
+    let dispatcher = build_dispatcher(webhooks);
     let result = dispatcher.dispatch(&event).await;
     assert!(result.is_ok());
 }
@@ -367,7 +392,7 @@ async fn dispatch_sends_hmac_signature_header() {
         ),
     );
 
-    let dispatcher = EventDispatcher::new(webhooks).unwrap();
+    let dispatcher = build_dispatcher(webhooks);
     let result = dispatcher.dispatch(&event).await;
     assert!(result.is_ok());
 }
@@ -389,7 +414,7 @@ async fn dispatch_no_signature_header_without_token() {
         create_webhook_config_for_url(&server.uri(), vec![EventKind::ManifestPush], None),
     );
 
-    let dispatcher = EventDispatcher::new(webhooks).unwrap();
+    let dispatcher = build_dispatcher(webhooks);
     let result = dispatcher.dispatch(&event).await;
     assert!(result.is_ok());
 
@@ -425,7 +450,7 @@ async fn dispatch_skips_webhook_for_non_matching_event_kind() {
         ),
     );
 
-    let dispatcher = EventDispatcher::new(webhooks).unwrap();
+    let dispatcher = build_dispatcher(webhooks);
     let result = dispatcher.dispatch(&event).await;
     assert!(result.is_ok());
 }
@@ -444,10 +469,10 @@ async fn dispatch_skips_webhook_for_non_matching_repository() {
     let mut webhooks = HashMap::new();
     let mut config =
         create_webhook_config_for_url(&server.uri(), vec![EventKind::ManifestPush], None);
-    config.repository_filter = Some(vec!["^internal/.*".to_string()]);
+    config.repository_filter = Some(vec![RegexPattern::compile("^internal/.*").unwrap()]);
     webhooks.insert("test-hook".to_string(), config);
 
-    let dispatcher = EventDispatcher::new(webhooks).unwrap();
+    let dispatcher = build_dispatcher(webhooks);
     let result = dispatcher.dispatch(&event).await;
     assert!(result.is_ok());
 }
@@ -458,7 +483,8 @@ fn create_webhook_config_with_policy(
     events: Vec<EventKind>,
 ) -> EventWebhookConfig {
     EventWebhookConfig {
-        url: url.to_string(),
+        name: String::new(),
+        url: Url::parse(url).unwrap(),
         policy,
         token: None,
         timeout_ms: 5000,
@@ -489,7 +515,7 @@ async fn dispatch_required_policy_returns_error_on_server_error() {
         ),
     );
 
-    let dispatcher = EventDispatcher::new(webhooks).unwrap();
+    let dispatcher = build_dispatcher(webhooks);
     let result = dispatcher.dispatch(&event).await;
     assert!(result.is_err(), "Required policy must return error on 500");
 }
@@ -515,7 +541,7 @@ async fn dispatch_required_policy_returns_ok_on_success() {
         ),
     );
 
-    let dispatcher = EventDispatcher::new(webhooks).unwrap();
+    let dispatcher = build_dispatcher(webhooks);
     let result = dispatcher.dispatch(&event).await;
     assert!(result.is_ok());
 }
@@ -541,7 +567,7 @@ async fn dispatch_optional_policy_returns_ok_on_server_error() {
         ),
     );
 
-    let dispatcher = EventDispatcher::new(webhooks).unwrap();
+    let dispatcher = build_dispatcher(webhooks);
     let result = dispatcher.dispatch(&event).await;
     assert!(result.is_ok(), "Optional policy must return Ok even on 500");
 }
@@ -567,7 +593,7 @@ async fn dispatch_optional_policy_returns_ok_on_success() {
         ),
     );
 
-    let dispatcher = EventDispatcher::new(webhooks).unwrap();
+    let dispatcher = build_dispatcher(webhooks);
     let result = dispatcher.dispatch(&event).await;
     assert!(result.is_ok());
 }
@@ -597,7 +623,7 @@ async fn dispatch_async_policy_returns_ok_immediately_despite_slow_webhook() {
         ),
     );
 
-    let dispatcher = EventDispatcher::new(webhooks).unwrap();
+    let dispatcher = build_dispatcher(webhooks);
 
     let start = std::time::Instant::now();
     let result = dispatcher.dispatch(&event).await;
@@ -635,7 +661,7 @@ async fn dispatch_async_policy_eventually_delivers() {
         ),
     );
 
-    let dispatcher = EventDispatcher::new(webhooks).unwrap();
+    let dispatcher = build_dispatcher(webhooks);
     let result = dispatcher.dispatch(&event).await;
     assert!(result.is_ok());
 
@@ -656,7 +682,8 @@ fn create_webhook_config_with_retries(
     max_retries: u32,
 ) -> EventWebhookConfig {
     EventWebhookConfig {
-        url: url.to_string(),
+        name: String::new(),
+        url: Url::parse(url).unwrap(),
         policy,
         token: None,
         timeout_ms: 5000,
@@ -691,7 +718,7 @@ async fn dispatch_required_retries_until_success() {
         create_webhook_config_with_retries(&server.uri(), DeliveryPolicy::Required, 2),
     );
 
-    let dispatcher = EventDispatcher::new(webhooks).unwrap();
+    let dispatcher = build_dispatcher(webhooks);
     let result = dispatcher.dispatch(&event).await;
     assert!(result.is_ok(), "Should succeed after retrying: {result:?}");
 
@@ -721,7 +748,7 @@ async fn dispatch_required_retries_exhausted_returns_error() {
         create_webhook_config_with_retries(&server.uri(), DeliveryPolicy::Required, 1),
     );
 
-    let dispatcher = EventDispatcher::new(webhooks).unwrap();
+    let dispatcher = build_dispatcher(webhooks);
     let result = dispatcher.dispatch(&event).await;
     assert!(
         result.is_err(),
@@ -747,7 +774,7 @@ async fn dispatch_optional_retries_exhausted_returns_ok() {
         create_webhook_config_with_retries(&server.uri(), DeliveryPolicy::Optional, 2),
     );
 
-    let dispatcher = EventDispatcher::new(webhooks).unwrap();
+    let dispatcher = build_dispatcher(webhooks);
     let result = dispatcher.dispatch(&event).await;
     assert!(
         result.is_ok(),
@@ -772,7 +799,7 @@ async fn dispatch_no_retry_when_max_retries_zero() {
         create_webhook_config_with_retries(&server.uri(), DeliveryPolicy::Required, 0),
     );
 
-    let dispatcher = EventDispatcher::new(webhooks).unwrap();
+    let dispatcher = build_dispatcher(webhooks);
     let result = dispatcher.dispatch(&event).await;
     assert!(result.is_err());
 
@@ -805,7 +832,7 @@ async fn dispatch_records_delivery_total_metric() {
         ),
     );
 
-    let dispatcher = EventDispatcher::new(webhooks).unwrap();
+    let dispatcher = build_dispatcher(webhooks);
     dispatcher.dispatch(&event).await.unwrap();
 
     let families = prometheus::gather();
@@ -858,7 +885,7 @@ async fn dispatch_records_delivery_duration_metric() {
         ),
     );
 
-    let dispatcher = EventDispatcher::new(webhooks).unwrap();
+    let dispatcher = build_dispatcher(webhooks);
     dispatcher.dispatch(&event).await.unwrap();
 
     let families = prometheus::gather();
@@ -911,7 +938,7 @@ async fn test_shutdown_completes_in_flight_async_delivery() {
         ),
     );
 
-    let dispatcher = EventDispatcher::new(webhooks).unwrap();
+    let dispatcher = build_dispatcher(webhooks);
     dispatcher.dispatch(&event).await.unwrap();
 
     // Immediately call shutdown — it must block until the in-flight delivery finishes
@@ -948,7 +975,7 @@ async fn test_shutdown_rejects_new_async_dispatches() {
         ),
     );
 
-    let dispatcher = EventDispatcher::new(webhooks).unwrap();
+    let dispatcher = build_dispatcher(webhooks);
     dispatcher.shutdown().await;
 
     // Dispatch after shutdown — delivery must be skipped
@@ -970,7 +997,7 @@ async fn test_shutdown_rejects_new_async_dispatches() {
 #[tokio::test]
 async fn test_shutdown_with_no_in_flight_returns_immediately() {
     let webhooks = HashMap::new();
-    let dispatcher = EventDispatcher::new(webhooks).unwrap();
+    let dispatcher = build_dispatcher(webhooks);
 
     let start = std::time::Instant::now();
     dispatcher.shutdown().await;
@@ -1013,7 +1040,7 @@ async fn test_multiple_in_flight_async_deliveries_drain_on_shutdown() {
         );
     }
 
-    let dispatcher = EventDispatcher::new(webhooks).unwrap();
+    let dispatcher = build_dispatcher(webhooks);
 
     let event = create_test_event();
     dispatcher.dispatch(&event).await.unwrap();
@@ -1057,7 +1084,7 @@ async fn test_shutdown_with_timeout_returns_after_timeout_when_tasks_are_too_slo
         ),
     );
 
-    let dispatcher = EventDispatcher::new(webhooks).unwrap();
+    let dispatcher = build_dispatcher(webhooks);
     dispatcher.dispatch(&event).await.unwrap();
 
     let start = std::time::Instant::now();
@@ -1095,7 +1122,7 @@ async fn test_shutdown_with_timeout_drains_fast_tasks_within_timeout() {
         ),
     );
 
-    let dispatcher = EventDispatcher::new(webhooks).unwrap();
+    let dispatcher = build_dispatcher(webhooks);
     dispatcher.dispatch(&event).await.unwrap();
 
     dispatcher
@@ -1132,7 +1159,7 @@ async fn test_shutdown_is_idempotent() {
         ),
     );
 
-    let dispatcher = EventDispatcher::new(webhooks).unwrap();
+    let dispatcher = build_dispatcher(webhooks);
     dispatcher.dispatch(&event).await.unwrap();
 
     // Calling shutdown twice must not panic or deadlock
@@ -1143,7 +1170,7 @@ async fn test_shutdown_is_idempotent() {
 #[tokio::test]
 async fn test_shutdown_with_timeout_is_idempotent() {
     let webhooks = HashMap::new();
-    let dispatcher = EventDispatcher::new(webhooks).unwrap();
+    let dispatcher = build_dispatcher(webhooks);
 
     // Both calls must complete without panic or deadlock
     dispatcher
@@ -1192,7 +1219,7 @@ async fn test_shutdown_drains_mix_of_fast_and_slow_deliveries() {
         ),
     );
 
-    let dispatcher = EventDispatcher::new(webhooks).unwrap();
+    let dispatcher = build_dispatcher(webhooks);
     dispatcher.dispatch(&event).await.unwrap();
 
     // shutdown() must drain both the fast and the slow delivery

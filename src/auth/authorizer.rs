@@ -1,16 +1,16 @@
 use std::{collections::HashMap, sync::Arc};
 
 use hyper::http::request::Parts;
-use regex::Regex;
-use tracing::{debug, error, info, instrument};
+use tracing::{debug, info, instrument};
 
 use crate::{
-    auth::webhook::WebhookAuthorizer,
+    auth::webhook::{self, WebhookAuthorizer},
     cache::Cache,
     command::server::Error,
-    configuration::Configuration,
+    configuration::{Configuration, RegexPattern},
     identity::{Action, ClientIdentity},
     oci::{Namespace, Reference},
+    policy::AccessMode,
     registry::{AccessPolicy, Registry},
 };
 
@@ -19,93 +19,82 @@ const ACCESS_DENIED: &str = "Access denied";
 /// Centralized authorization component that handles all access control decisions
 pub struct Authorizer {
     global_access_policy: AccessPolicy,
-    global_authorization_webhook: Option<String>,
+    global_authorization_webhook: Option<Arc<WebhookAuthorizer>>,
     global_immutable_tags: bool,
-    global_immutable_tags_exclusions: Vec<Regex>,
-    webhooks: HashMap<String, Arc<WebhookAuthorizer>>,
+    global_immutable_tags_exclusions: Vec<RegexPattern>,
     repositories: HashMap<String, AuthorizerRepository>,
 }
 
 /// Repository-specific authorization configuration
 struct AuthorizerRepository {
     access_policy: Option<AccessPolicy>,
-    authorization_webhook: Option<String>,
+    authorization_webhook: Option<Arc<WebhookAuthorizer>>,
     immutable_tags: bool,
-    immutable_tags_exclusions: Vec<Regex>,
+    immutable_tags_exclusions: Vec<RegexPattern>,
 }
 
 impl Authorizer {
     pub fn new(config: &Configuration, cache: &Arc<dyn Cache>) -> Result<Self, Error> {
-        let global_access_policy =
-            AccessPolicy::new(&config.global.access_policy).map_err(|e| {
-                Error::Initialization(format!("Failed to create global access policy: {e}"))
-            })?;
+        let global_access_policy = AccessPolicy::new(&config.global.access_policy);
 
-        let mut webhooks = HashMap::new();
-        for (name, webhook_config) in &config.auth.webhook {
-            let authorizer = Arc::new(
-                WebhookAuthorizer::new(name.clone(), webhook_config.clone(), cache.clone())
+        // Build WebhookAuthorizer instances keyed by webhook name, deduplicated via Arc.
+        let webhook_authorizers: HashMap<String, Arc<WebhookAuthorizer>> = config
+            .auth
+            .webhook
+            .iter()
+            .map(|(name, webhook_config)| {
+                WebhookAuthorizer::new(name.clone(), webhook_config.as_ref().clone(), cache.clone())
+                    .map(|a| (name.clone(), Arc::new(a)))
                     .map_err(|e| {
                         Error::Initialization(format!("Failed to create webhook '{name}': {e}"))
-                    })?,
-            );
-            webhooks.insert(name.clone(), authorizer);
-        }
-
-        let mut repositories = HashMap::new();
-        for (name, repo_config) in &config.repository {
-            let access_policy = if repo_config.access_policy.rules.is_empty()
-                && !repo_config.access_policy.default_allow
-            {
-                None
-            } else {
-                Some(AccessPolicy::new(&repo_config.access_policy).map_err(|e| {
-                    Error::Initialization(format!(
-                        "Failed to create access policy for repository '{name}': {e}"
-                    ))
-                })?)
-            };
-
-            let immutable_tags_exclusions = repo_config
-                .immutable_tags_exclusions
-                .iter()
-                .filter_map(|p| match Regex::new(p) {
-                    Ok(regex) => Some(regex),
-                    Err(e) => {
-                        error!("Invalid regex pattern '{p}' in repository '{name}': {e}");
-                        None
-                    }
-                })
-                .collect();
-
-            let auth_repo = AuthorizerRepository {
-                access_policy,
-                authorization_webhook: repo_config.authorization_webhook.clone(),
-                immutable_tags: repo_config.immutable_tags,
-                immutable_tags_exclusions,
-            };
-            repositories.insert(name.clone(), auth_repo);
-        }
-
-        let global_immutable_tags_exclusions = config
-            .global
-            .immutable_tags_exclusions
-            .iter()
-            .filter_map(|p| match Regex::new(p) {
-                Ok(regex) => Some(regex),
-                Err(e) => {
-                    error!("Invalid global regex pattern '{}': {}", p, e);
-                    None
-                }
+                    })
             })
-            .collect();
+            .collect::<Result<_, _>>()?;
+
+        let global_authorization_webhook = config
+            .global
+            .authorization_webhook
+            .as_ref()
+            .map(|cfg| lookup_webhook(&webhook_authorizers, cfg))
+            .transpose()?;
+
+        let repositories: HashMap<String, AuthorizerRepository> = config
+            .repository
+            .iter()
+            .map(|(name, repo_config)| {
+                let access_policy = if repo_config.access_policy.rules.is_empty()
+                    && repo_config.access_policy.default == AccessMode::Deny
+                {
+                    None
+                } else {
+                    Some(AccessPolicy::new(&repo_config.access_policy))
+                };
+
+                let authorization_webhook = repo_config
+                    .authorization_webhook
+                    .as_ref()
+                    .map(|cfg| lookup_webhook(&webhook_authorizers, cfg))
+                    .transpose()?;
+
+                Ok((
+                    name.clone(),
+                    AuthorizerRepository {
+                        access_policy,
+                        authorization_webhook,
+                        immutable_tags: repo_config.immutable_tags,
+                        immutable_tags_exclusions: repo_config.immutable_tags_exclusions.clone(),
+                    },
+                ))
+            })
+            .collect::<Result<_, Error>>()?;
+
+        let global_immutable_tags_exclusions = config.global.immutable_tags_exclusions.clone();
 
         Ok(Self {
             global_access_policy,
-            global_authorization_webhook: config.global.authorization_webhook.clone(),
+            global_authorization_webhook,
             global_immutable_tags: config.global.immutable_tags,
             global_immutable_tags_exclusions,
-            webhooks,
             repositories,
         })
     }
@@ -127,17 +116,15 @@ impl Authorizer {
         if let Some(namespace) = action.get_namespace() {
             self.authorize_namespace_request(namespace, action, identity, request, registry)
                 .await?;
-        } else if let Some(webhook_name) = &self.global_authorization_webhook {
-            debug!("Evaluating global webhook authorization: {}", webhook_name);
-
-            let webhook = self
-                .webhooks
-                .get(webhook_name)
-                .ok_or_else(|| Error::Execution(format!("Webhook '{webhook_name}' not found")))?;
+        } else if let Some(webhook) = &self.global_authorization_webhook {
+            debug!(
+                "Evaluating global webhook authorization: {}",
+                webhook.name()
+            );
 
             let allowed = webhook.authorize(action, identity, request).await?;
             if !allowed {
-                log_denial(&format!("global webhook '{webhook_name}'"), identity);
+                log_denial(&format!("global webhook '{}'", webhook.name()), identity);
                 return Err(Error::Unauthorized(ACCESS_DENIED.to_string()));
             }
         }
@@ -189,23 +176,17 @@ impl Authorizer {
             return Err(Error::Conflict(msg));
         }
 
-        let webhook_name = auth_repo
+        let webhook = auth_repo
             .authorization_webhook
             .as_ref()
-            .filter(|name| !name.is_empty())
             .or(self.global_authorization_webhook.as_ref());
 
-        if let Some(webhook_name) = webhook_name {
-            debug!("Evaluating webhook authorization: {}", webhook_name);
-
-            let webhook = self
-                .webhooks
-                .get(webhook_name)
-                .ok_or_else(|| Error::Execution(format!("Webhook '{webhook_name}' not found")))?;
+        if let Some(webhook) = webhook {
+            debug!("Evaluating webhook authorization: {}", webhook.name());
 
             let allowed = webhook.authorize(action, identity, request).await?;
             if !allowed {
-                log_denial(&format!("webhook '{webhook_name}'"), identity);
+                log_denial(&format!("webhook '{}'", webhook.name()), identity);
                 return Err(Error::Unauthorized(ACCESS_DENIED.to_string()));
             }
         }
@@ -256,6 +237,18 @@ fn log_denial(reason: &str, identity: &ClientIdentity) {
     info!("Access denied: {reason} | Identity: {identity:?}");
 }
 
+fn lookup_webhook(
+    authorizers: &HashMap<String, Arc<WebhookAuthorizer>>,
+    cfg: &webhook::Config,
+) -> Result<Arc<WebhookAuthorizer>, Error> {
+    authorizers.get(&cfg.name).cloned().ok_or_else(|| {
+        Error::Initialization(format!(
+            "Internal: webhook '{}' missing from authorizer map",
+            cfg.name
+        ))
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -280,7 +273,7 @@ mod tests {
             max_concurrent_cache_jobs = 10
         "#;
 
-        toml::from_str(toml).unwrap()
+        Configuration::load_from_str(toml).unwrap()
     }
 
     #[test]
@@ -295,7 +288,6 @@ mod tests {
         assert!(authorizer.global_authorization_webhook.is_none());
         assert!(!authorizer.global_immutable_tags);
         assert!(authorizer.global_immutable_tags_exclusions.is_empty());
-        assert!(authorizer.webhooks.is_empty());
         assert!(authorizer.repositories.is_empty());
     }
 
@@ -319,11 +311,11 @@ mod tests {
             max_concurrent_cache_jobs = 10
 
             [global.access_policy]
-            default_allow = true
+            default = "allow"
             rules = ["identity.username == 'admin'"]
         "#;
 
-        let config: Configuration = toml::from_str(toml).unwrap();
+        let config = Configuration::load_from_str(toml).unwrap();
         let cache = cache::Config::Memory.to_backend().unwrap();
 
         let authorizer = Authorizer::new(&config, &cache);
@@ -353,7 +345,7 @@ mod tests {
             immutable_tags_exclusions = ["^latest$", "^dev-.*"]
         "#;
 
-        let config: Configuration = toml::from_str(toml).unwrap();
+        let config = Configuration::load_from_str(toml).unwrap();
         let cache = cache::Config::Memory.to_backend().unwrap();
 
         let authorizer = Authorizer::new(&config, &cache);
@@ -389,7 +381,7 @@ mod tests {
             immutable_tags_exclusions = ["^test-.*"]
         "#;
 
-        let config: Configuration = toml::from_str(toml).unwrap();
+        let config = Configuration::load_from_str(toml).unwrap();
         let cache = cache::Config::Memory.to_backend().unwrap();
 
         let authorizer = Authorizer::new(&config, &cache);
@@ -401,7 +393,7 @@ mod tests {
     }
 
     #[test]
-    fn test_authorizer_new_with_invalid_global_regex() {
+    fn test_invalid_global_regex_fails_at_deserialize() {
         let toml = r#"
             [blob_store.fs]
             root_dir = "/tmp/test"
@@ -422,18 +414,15 @@ mod tests {
             immutable_tags_exclusions = ["[invalid"]
         "#;
 
-        let config: Configuration = toml::from_str(toml).unwrap();
-        let cache = cache::Config::Memory.to_backend().unwrap();
-
-        let authorizer = Authorizer::new(&config, &cache);
-
-        assert!(authorizer.is_ok());
-        let authorizer = authorizer.unwrap();
-        assert!(authorizer.global_immutable_tags_exclusions.is_empty());
+        let result = Configuration::load_from_str(toml);
+        assert!(
+            result.is_err(),
+            "invalid global regex must fail at deserialize time"
+        );
     }
 
     #[test]
-    fn test_authorizer_new_with_invalid_repository_regex() {
+    fn test_invalid_repository_regex_fails_at_deserialize() {
         let toml = r#"
             [blob_store.fs]
             root_dir = "/tmp/test"
@@ -457,15 +446,11 @@ mod tests {
             immutable_tags_exclusions = ["[invalid"]
         "#;
 
-        let config: Configuration = toml::from_str(toml).unwrap();
-        let cache = cache::Config::Memory.to_backend().unwrap();
-
-        let authorizer = Authorizer::new(&config, &cache);
-
-        assert!(authorizer.is_ok());
-        let authorizer = authorizer.unwrap();
-        let repo = authorizer.repositories.get("myrepo").unwrap();
-        assert!(repo.immutable_tags_exclusions.is_empty());
+        let result = Configuration::load_from_str(toml);
+        assert!(
+            result.is_err(),
+            "invalid repository regex must fail at deserialize time"
+        );
     }
 
     #[test]
@@ -489,7 +474,7 @@ mod tests {
             immutable_tags = true
         "#;
 
-        let config: Configuration = toml::from_str(toml).unwrap();
+        let config = Configuration::load_from_str(toml).unwrap();
         let cache = cache::Config::Memory.to_backend().unwrap();
         let authorizer = Authorizer::new(&config, &cache).unwrap();
 
@@ -518,7 +503,7 @@ mod tests {
             immutable_tags_exclusions = ["^latest$", "^dev-.*"]
         "#;
 
-        let config: Configuration = toml::from_str(toml).unwrap();
+        let config = Configuration::load_from_str(toml).unwrap();
         let cache = cache::Config::Memory.to_backend().unwrap();
         let authorizer = Authorizer::new(&config, &cache).unwrap();
 
@@ -552,7 +537,7 @@ mod tests {
             immutable_tags = true
         "#;
 
-        let config: Configuration = toml::from_str(toml).unwrap();
+        let config = Configuration::load_from_str(toml).unwrap();
         let cache = cache::Config::Memory.to_backend().unwrap();
         let authorizer = Authorizer::new(&config, &cache).unwrap();
 
@@ -586,7 +571,7 @@ mod tests {
             immutable_tags_exclusions = ["^test-.*"]
         "#;
 
-        let config: Configuration = toml::from_str(toml).unwrap();
+        let config = Configuration::load_from_str(toml).unwrap();
         let cache = cache::Config::Memory.to_backend().unwrap();
         let authorizer = Authorizer::new(&config, &cache).unwrap();
 
@@ -620,7 +605,7 @@ mod tests {
             immutable_tags_exclusions = ["^latest$"]
         "#;
 
-        let config: Configuration = toml::from_str(toml).unwrap();
+        let config = Configuration::load_from_str(toml).unwrap();
         let cache = cache::Config::Memory.to_backend().unwrap();
         let authorizer = Authorizer::new(&config, &cache).unwrap();
 
@@ -655,7 +640,7 @@ mod tests {
             immutable_tags = false
         "#;
 
-        let config: Configuration = toml::from_str(toml).unwrap();
+        let config = Configuration::load_from_str(toml).unwrap();
         let cache = cache::Config::Memory.to_backend().unwrap();
         let authorizer = Authorizer::new(&config, &cache).unwrap();
         let auth_repo = authorizer.repositories.get("myrepo").unwrap();
@@ -688,7 +673,7 @@ mod tests {
             max_concurrent_cache_jobs = 10
 
             [global.access_policy]
-            default_allow = true
+            default = "allow"
 
             [repository."docker-io"]
 
@@ -696,7 +681,7 @@ mod tests {
             url = "https://registry-1.docker.io"
         "#;
 
-        toml::from_str(toml).unwrap()
+        Configuration::load_from_str(toml).unwrap()
     }
 
     async fn create_pull_through_registry(config: &Configuration) -> Registry {
@@ -704,8 +689,9 @@ mod tests {
 
         use crate::registry::{RegistryConfig, Repository};
 
-        let blob_store = config.blob_store.to_backend(None).unwrap();
-        let metadata_store = config
+        let (blob_store, upload_store, presigned_blob_store) =
+            config.blob_store.to_backend(None).unwrap();
+        let (metadata_store, _) = config
             .resolve_metadata_config()
             .to_backend(None)
             .await
@@ -727,7 +713,15 @@ mod tests {
             .global_immutable_tags(config.global.immutable_tags)
             .global_immutable_tags_exclusions(config.global.immutable_tags_exclusions.clone());
 
-        Registry::new(blob_store, metadata_store, repositories, registry_config).unwrap()
+        Registry::new(
+            blob_store,
+            upload_store,
+            presigned_blob_store,
+            metadata_store,
+            repositories,
+            registry_config,
+        )
+        .unwrap()
     }
 
     #[tokio::test]

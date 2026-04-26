@@ -49,11 +49,12 @@ sha2 = "0.11.0-rc.5"
 tempfile = "3.27"
 tokio = { version = "1.52", features = ["full", "tracing"] }
 tokio-rustls = "0.26"
-tokio-util = { version = "0.7", features = ["io-util"] }
+tokio-util = { version = "0.7", features = ["io-util", "rt"] }
 toml = "1.1"
 tracing = "0.1"
 tracing-opentelemetry = "0.32"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+url = { version = "2.5", features = ["serde"] }
 uuid = { version = "1.23", features = ["v4", "serde"] }
 x509-parser = "0.18"
 zeroize = { version = "1.8", features = ["derive"] }

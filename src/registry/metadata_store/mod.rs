@@ -3,7 +3,6 @@ mod error;
 use std::{
     collections::{HashMap, HashSet, hash_map::RandomState},
     hash::{BuildHasher, Hasher},
-    sync::Arc,
 };
 
 use async_trait::async_trait;
@@ -52,7 +51,10 @@ pub struct ConditionalCapabilities {
 }
 
 impl ConditionalCapabilities {
-    /// Both conditional put operations are needed for CAS read-modify-write loops.
+    /// Both conditional put operations are needed for CAS-based coordination
+    /// and for the S3-based lock backend's acquire/heartbeat paths. The
+    /// `delete_if_match` capability further enables race-free lock release;
+    /// when absent, release falls back to plain delete (race-prone but functional).
     pub fn supports_cas(&self) -> bool {
         self.put_if_none_match && self.put_if_match
     }
@@ -91,7 +93,7 @@ pub enum LinkOperation {
         target: Digest,
         referrer: Option<Digest>,
         media_type: Option<String>,
-        descriptor: Box<Option<Descriptor>>,
+        descriptor: Option<Box<Descriptor>>,
     },
     Delete {
         link: LinkKind,
@@ -99,8 +101,8 @@ pub enum LinkOperation {
     },
 }
 
-pub struct Transaction {
-    store: Arc<dyn MetadataStore + Send + Sync>,
+pub struct Transaction<'a> {
+    store: &'a (dyn MetadataStore + Send + Sync),
     namespace: String,
     operations: Vec<LinkOperation>,
 }
@@ -108,8 +110,8 @@ pub struct Transaction {
 /// Builder for a single `Create` link operation within a [`Transaction`].
 ///
 /// Obtain one via [`Transaction::create_link`] and finalize it by calling [`add`](Self::add).
-pub struct CreateLinkBuilder<'a> {
-    tx: &'a mut Transaction,
+pub struct CreateLinkBuilder<'tx, 'store: 'tx> {
+    tx: &'tx mut Transaction<'store>,
     link: LinkKind,
     target: Digest,
     referrer: Option<Digest>,
@@ -117,7 +119,7 @@ pub struct CreateLinkBuilder<'a> {
     descriptor: Option<Descriptor>,
 }
 
-impl CreateLinkBuilder<'_> {
+impl<'tx, 'store: 'tx> CreateLinkBuilder<'tx, 'store> {
     /// Associates a referrer digest with this link.
     pub fn with_referrer(mut self, referrer: &Digest) -> Self {
         self.referrer = Some(referrer.clone());
@@ -143,13 +145,17 @@ impl CreateLinkBuilder<'_> {
             target: self.target,
             referrer: self.referrer,
             media_type: self.media_type,
-            descriptor: Box::new(self.descriptor),
+            descriptor: self.descriptor.map(Box::new),
         });
     }
 }
 
-impl Transaction {
-    pub fn create_link(&mut self, link: &LinkKind, target: &Digest) -> CreateLinkBuilder<'_> {
+impl<'store> Transaction<'store> {
+    pub fn create_link<'tx>(
+        &'tx mut self,
+        link: &LinkKind,
+        target: &Digest,
+    ) -> CreateLinkBuilder<'tx, 'store> {
         CreateLinkBuilder {
             tx: self,
             link: link.clone(),
@@ -185,13 +191,13 @@ impl Transaction {
 }
 
 pub trait MetadataStoreExt {
-    fn begin_transaction(&self, namespace: &str) -> Transaction;
+    fn begin_transaction(&self, namespace: &str) -> Transaction<'_>;
 }
 
-impl MetadataStoreExt for Arc<dyn MetadataStore + Send + Sync> {
-    fn begin_transaction(&self, namespace: &str) -> Transaction {
+impl MetadataStoreExt for dyn MetadataStore + Send + Sync {
+    fn begin_transaction(&self, namespace: &str) -> Transaction<'_> {
         Transaction {
-            store: self.clone(),
+            store: self,
             namespace: namespace.to_string(),
             operations: Vec::new(),
         }
@@ -254,8 +260,4 @@ pub trait MetadataStore: Send + Sync {
     ) -> Result<(), Error>;
 
     async fn flush_access_times(&self) {}
-
-    fn conditional_capabilities(&self) -> Option<ConditionalCapabilities> {
-        None
-    }
 }

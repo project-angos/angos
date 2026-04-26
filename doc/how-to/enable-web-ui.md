@@ -83,7 +83,7 @@ The UI uses the same access policies as the API:
 
 ```toml
 [global.access_policy]
-default_allow = false
+default = "deny"
 rules = [
   # Allow UI assets to load (required)
   "request.action == 'ui-asset' || request.action == 'ui-config'",

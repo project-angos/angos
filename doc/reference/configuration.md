@@ -63,7 +63,7 @@ When omitted, the server runs without TLS (insecure).
 
 | Option          | Type     | Default | Description                        |
 |-----------------|----------|---------|------------------------------------|
-| `default_allow` | bool     | `false` | Default action when no rules match |
+| `default`       | string   | `"deny"` | Default action when no rules match (`"allow"` or `"deny"`). The legacy `default_allow` boolean is still accepted but emits a deprecation warning. |
 | `rules`         | [string] | `[]`    | CEL expressions for access control |
 
 ### Global Retention Policy (`global.retention_policy`)
@@ -193,10 +193,9 @@ When using S3 as the metadata store, you can declare which conditional write ope
 | `delete_if_match`   | bool | -       | S3 supports `DeleteObject` with `If-Match: <etag>` (conditional delete, reject if ETag mismatch)          |
 
 **Probe behavior:**
-- When `capabilities` table is explicitly configured, the startup probe is skipped entirely. Provide accurate values matching your S3 provider's capabilities.
-- When `capabilities` is omitted:
-  - If `lock_strategy = "s3"`, a startup probe automatically tests each capability and populates the status.
-  - For other lock strategies, capabilities default to all `false` (no probing occurs).
+- The probe runs only when `lock_strategy = "s3"` (the only strategy that depends on conditional ops). For `lock_strategy = "memory"` or `"redis"`, no probe runs and `capabilities` is unused.
+- When `capabilities` is explicitly configured for an `s3` lock strategy, the startup probe is skipped. Declared values are validated against the lock strategy's requirements (`put_if_none_match` and `put_if_match`).
+- When `capabilities` is omitted for an `s3` lock strategy, the probe runs at startup (and on each config reload that has no cached value); probed values are cached for subsequent reloads.
 
 **Example with explicit capabilities (AWS S3):**
 ```toml
@@ -217,18 +216,17 @@ put_if_match = false
 delete_if_match = false
 ```
 
-**Example with auto-probe (S3 locking):**
+**Example with auto-probe:**
 ```toml
 [metadata_store.s3]
-# No capabilities field — probe runs at startup for S3 lock strategy
-[metadata_store.s3.lock_strategy.s3]
-ttl_secs = 30
+# No capabilities field — probe runs at startup to detect provider support
 ```
 
 **Performance impact:**
-- When `put_if_match` is available, access time writes use optimized compare-and-swap (CAS) instead of distributed lock operations, reducing S3 API calls per manifest pull.
-- When `delete_if_match` is available, S3 lock release is atomic and race-condition-free.
-- Both features require both `put_if_none_match` and `put_if_match` to be `true` for full CAS support.
+- `lock_strategy` selects the coordinator: `"s3"` selects the CAS coordinator (which uses S3 conditional writes for all coordination); `"redis"` and `"memory"` select the lock coordinator with the corresponding lock backend.
+- The CAS coordinator requires `put_if_none_match` and `put_if_match` from the provider; startup fails if either is missing under `lock_strategy = "s3"`.
+- `delete_if_match` is optional within the CAS coordinator. When available, its internal S3 lock uses race-free conditional release. When absent, release falls back to plain delete (functional but race-prone under contention).
+- Capabilities are not consulted under `lock_strategy = "memory"` or `"redis"`, the lock coordinator runs entirely on the configured lock backend.
 
 > **Warning:** Setting `access_time_debounce_secs = 0` with S3 lock strategy causes every manifest pull to perform a full lock-acquire → read → write → release cycle via S3 API. At scale with many concurrent pulls, this adds significant latency and S3 API costs. Keep the default value of 60 or higher for S3-locked deployments, or disable access time tracking entirely if not needed for retention policies.
 
@@ -244,6 +242,8 @@ Multi-replica deployments require a distributed lock backend. The `lock_strategy
 | redis | Yes | Yes |
 | s3 | Yes | No |
 
+> **Note:** `lock_strategy = "s3"` selects the CAS-based coordinator and requires the provider to support `put_if_none_match` and `put_if_match`; startup fails fast if either is missing. `lock_strategy = "memory"` and `"redis"` select the lock coordinator and do not depend on conditional capabilities.
+
 **Memory** (default) — in-process locks, suitable for single-instance deployments only:
 
 ```toml
@@ -251,7 +251,7 @@ Multi-replica deployments require a distributed lock backend. The `lock_strategy
 lock_strategy = "memory"
 ```
 
-**S3** — uses S3 conditional writes (`If-None-Match: *`) for distributed locking without extra infrastructure. The S3 provider must support conditional writes; angos verifies this at startup:
+**S3** — uses S3 conditional writes (`If-None-Match: *`) for distributed locking without extra infrastructure. The S3 provider must support `put_if_none_match` and `put_if_match`; angos verifies this at startup and fails fast if either is missing. `delete_if_match` is optional — when absent, lock release falls back to plain delete (functional but race-prone under contention):
 
 ```toml
 # With defaults (empty table body; all fields use defaults)
@@ -314,6 +314,8 @@ ttl = 10
 |------------|--------|----------|----------------------|
 | `username` | string | required | Username             |
 | `password` | string | required | Argon2 password hash |
+
+Password hashes are validated when the configuration is parsed. An invalid Argon2 hash causes the server to fail to start with a clear error. Use `angos argon` to generate a valid hash.
 
 ### OIDC (`auth.oidc.<name>`)
 
@@ -502,7 +504,7 @@ password = "$argon2id$v=19$m=19456,t=2,p=1$..."
 provider = "github"
 
 [global.access_policy]
-default_allow = false
+default = "deny"
 rules = ["identity.username != ''"]
 
 [repository."docker-io"]

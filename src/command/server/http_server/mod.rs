@@ -39,7 +39,6 @@ use crate::{
     identity::{Action, ClientIdentity},
     metrics_provider::{InFlightGuard, METRICS_PROVIDER},
     oci::{Digest, Namespace, Reference},
-    registry::metadata_store::ConditionalCapabilities,
 };
 
 pub async fn serve_request<S>(
@@ -93,7 +92,7 @@ async fn handle_request(
         .as_ref()
         .map_or("unknown", Action::action_name);
 
-    let trace_id = trace_id_of(&Span::current());
+    let trace_id = current_trace_id(&Span::current());
 
     let response = match router(Arc::clone(&context), request).await {
         Ok(response) => response,
@@ -132,7 +131,7 @@ async fn handle_request(
 ///
 /// Returns `None` if the span has no `OpenTelemetry` bridge context (e.g. the
 /// span is disabled, or no `OpenTelemetry` layer is registered with the subscriber).
-fn trace_id_of(span: &Span) -> Option<String> {
+fn current_trace_id(span: &Span) -> Option<String> {
     let context = span.context();
     let otel_span = context.span();
     let span_context = otel_span.span_context();
@@ -254,7 +253,7 @@ async fn dispatch_route<'a>(
             handlers::ext::handle_list_namespaces(context, &repository).await
         }
         Action::Healthz => handle_healthz(),
-        Action::Readyz => handle_readyz(context, parts).await,
+        Action::Readyz => handle_readyz(context).await,
         Action::Metrics => handle_metrics(),
     }
 }
@@ -449,36 +448,42 @@ async fn handle_delete_manifest(
     Ok(response)
 }
 
-fn handle_ui_config(context: &ServerContext) -> Result<Response<ResponseBody>, Error> {
-    let config = serde_json::json!({
-        "name": context.ui_name
-    });
-    let body = serde_json::to_string(&config)?;
-
+fn json_response(
+    status: StatusCode,
+    body: impl Serialize,
+) -> Result<Response<ResponseBody>, Error> {
+    let json = serde_json::to_string(&body)?;
     Ok(Response::builder()
-        .status(StatusCode::OK)
+        .status(status)
         .header(CONTENT_TYPE, "application/json")
-        .body(ResponseBody::Fixed(Full::new(Bytes::from(body))))?)
+        .body(ResponseBody::Fixed(Full::new(Bytes::from(json))))?)
+}
+
+fn handle_ui_config(context: &ServerContext) -> Result<Response<ResponseBody>, Error> {
+    #[derive(Serialize)]
+    struct UiConfigResponse<'a> {
+        name: &'a str,
+    }
+    json_response(
+        StatusCode::OK,
+        &UiConfigResponse {
+            name: &context.ui_name,
+        },
+    )
 }
 
 fn handle_healthz() -> Result<Response<ResponseBody>, Error> {
-    Ok(Response::builder()
-        .status(StatusCode::OK)
-        .header(CONTENT_TYPE, "application/json")
-        .body(ResponseBody::Fixed(Full::new(Bytes::from(
-            r#"{"status":"ok"}"#,
-        ))))?)
+    #[derive(Serialize)]
+    struct HealthResponse {
+        status: &'static str,
+    }
+    json_response(StatusCode::OK, &HealthResponse { status: "ok" })
 }
 
-async fn handle_readyz(
-    context: &ServerContext,
-    parts: &Parts,
-) -> Result<Response<ResponseBody>, Error> {
+async fn handle_readyz(context: &ServerContext) -> Result<Response<ResponseBody>, Error> {
     #[derive(Serialize)]
-    struct ReadyResponse<'a> {
-        status: &'a str,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        conditional: Option<&'a ConditionalCapabilities>,
+    struct ReadyResponse {
+        status: &'static str,
     }
 
     #[derive(Serialize)]
@@ -487,33 +492,14 @@ async fn handle_readyz(
         error: String,
     }
 
-    let verbose = parts
-        .uri
-        .query()
-        .is_some_and(|q| q.contains("verbose=true"));
-
     match context.registry.check_ready().await {
-        Ok(conditional) => {
-            let payload = ReadyResponse {
-                status: "ready",
-                conditional: if verbose { conditional.as_ref() } else { None },
-            };
-            let body = serde_json::to_string(&payload)?;
-            Ok(Response::builder()
-                .status(StatusCode::OK)
-                .header(CONTENT_TYPE, "application/json")
-                .body(ResponseBody::Fixed(Full::new(Bytes::from(body))))?)
-        }
+        Ok(()) => json_response(StatusCode::OK, &ReadyResponse { status: "ready" }),
         Err(e) => {
             let payload = NotReadyResponse {
                 status: "not_ready",
                 error: e.to_string(),
             };
-            let body = serde_json::to_string(&payload)?;
-            Ok(Response::builder()
-                .status(StatusCode::SERVICE_UNAVAILABLE)
-                .header(CONTENT_TYPE, "application/json")
-                .body(ResponseBody::Fixed(Full::new(Bytes::from(body))))?)
+            json_response(StatusCode::SERVICE_UNAVAILABLE, &payload)
         }
     }
 }

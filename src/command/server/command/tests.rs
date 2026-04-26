@@ -1,7 +1,12 @@
 use std::sync::{Arc, Mutex};
 
 use super::*;
-use crate::command::server::listeners::tls::tests::build_config;
+use crate::{
+    command::server::listeners::tls::tests::build_config,
+    configuration,
+    policy::{AccessMode, AccessPolicyConfig, CelRule},
+    secret::Secret,
+};
 
 fn create_minimal_config() -> Configuration {
     let toml = r#"
@@ -22,7 +27,7 @@ fn create_minimal_config() -> Configuration {
         max_concurrent_cache_jobs = 10
     "#;
 
-    toml::from_str(toml).unwrap()
+    Configuration::load_from_str(toml).unwrap()
 }
 
 fn create_config_with_repository() -> Configuration {
@@ -44,18 +49,18 @@ fn create_config_with_repository() -> Configuration {
         max_concurrent_cache_jobs = 10
 
         [repository.test-repo.access_policy]
-        default_allow = true
+        default = "allow"
         rules = []
     "#;
 
-    toml::from_str(toml).unwrap()
+    Configuration::load_from_str(toml).unwrap()
 }
 
 #[test]
 fn test_build_blob_store_filesystem_success() {
     let config = create_minimal_config();
     let auth_cache = build_auth_cache(&config.cache).unwrap();
-    let result = build_blob_store(&config.blob_store, &auth_cache);
+    let result = build_blob_stores(&config.blob_store, &auth_cache);
 
     assert!(result.is_ok());
 }
@@ -89,7 +94,7 @@ async fn test_build_metadata_store_with_explicit_config() {
         max_concurrent_cache_jobs = 10
     "#;
 
-    let config: Configuration = toml::from_str(toml).unwrap();
+    let config = Configuration::load_from_str(toml).unwrap();
     let auth_cache = build_auth_cache(&config.cache).unwrap();
     let result = build_metadata_store(&config, &auth_cache, &Arc::new(Mutex::new(None))).await;
 
@@ -106,13 +111,13 @@ fn test_build_auth_cache_memory_success() {
 
 #[test]
 fn test_build_repository_success() {
-    let toml = r"
-        [access_policy]
-        default_allow = true
-        rules = []
-    ";
-
-    let repo_config: repository::Config = toml::from_str(toml).unwrap();
+    let repo_config = repository::Config {
+        access_policy: AccessPolicyConfig {
+            default: AccessMode::Allow,
+            ..AccessPolicyConfig::default()
+        },
+        ..repository::Config::default()
+    };
     let cache_config = cache::Config::Memory;
     let cache = build_auth_cache(&cache_config).unwrap();
 
@@ -125,18 +130,22 @@ fn test_build_repository_success() {
 
 #[test]
 fn test_build_repository_with_upstream() {
-    let toml = r#"
-        [access_policy]
-        default_allow = true
-        rules = []
-
-        [[upstream]]
-        url = "https://registry-1.docker.io"
-        username = "testuser"
-        password = "testpass"
-    "#;
-
-    let repo_config: repository::Config = toml::from_str(toml).unwrap();
+    let repo_config = repository::Config {
+        access_policy: AccessPolicyConfig {
+            default: AccessMode::Allow,
+            ..AccessPolicyConfig::default()
+        },
+        upstream: vec![repository::RegistryClientConfig {
+            url: "https://registry-1.docker.io".to_string(),
+            max_redirect: 5,
+            server_ca_bundle: None,
+            client_certificate: None,
+            client_private_key: None,
+            username: Some("testuser".to_string()),
+            password: Some(Secret::new("testpass".to_string())),
+        }],
+        ..repository::Config::default()
+    };
     let cache_config = cache::Config::Memory;
     let cache = build_auth_cache(&cache_config).unwrap();
 
@@ -147,16 +156,18 @@ fn test_build_repository_with_upstream() {
 
 #[test]
 fn test_build_repository_with_immutable_tags() {
-    let toml = r#"
-        [access_policy]
-        default_allow = true
-        rules = []
-
-        immutable_tags = true
-        immutable_tags_exclusions = ["latest", "dev-.*"]
-    "#;
-
-    let repo_config: repository::Config = toml::from_str(toml).unwrap();
+    let repo_config = repository::Config {
+        access_policy: AccessPolicyConfig {
+            default: AccessMode::Allow,
+            ..AccessPolicyConfig::default()
+        },
+        immutable_tags: true,
+        immutable_tags_exclusions: vec![
+            configuration::RegexPattern::compile("latest").unwrap(),
+            configuration::RegexPattern::compile("dev-.*").unwrap(),
+        ],
+        ..repository::Config::default()
+    };
     let cache_config = cache::Config::Memory;
     let cache = build_auth_cache(&cache_config).unwrap();
 
@@ -180,13 +191,13 @@ fn test_build_repositories_empty() {
 
 #[test]
 fn test_build_repositories_single() {
-    let toml = r"
-        [access_policy]
-        default_allow = true
-        rules = []
-    ";
-
-    let repo_config: repository::Config = toml::from_str(toml).unwrap();
+    let repo_config = repository::Config {
+        access_policy: AccessPolicyConfig {
+            default: AccessMode::Allow,
+            ..AccessPolicyConfig::default()
+        },
+        ..repository::Config::default()
+    };
     let mut configs = HashMap::new();
     configs.insert("repo1".to_string(), repo_config);
 
@@ -203,13 +214,13 @@ fn test_build_repositories_single() {
 
 #[test]
 fn test_build_repositories_multiple() {
-    let toml = r"
-        [access_policy]
-        default_allow = true
-        rules = []
-    ";
-
-    let repo_config: repository::Config = toml::from_str(toml).unwrap();
+    let repo_config = repository::Config {
+        access_policy: AccessPolicyConfig {
+            default: AccessMode::Allow,
+            ..AccessPolicyConfig::default()
+        },
+        ..repository::Config::default()
+    };
     let mut configs = HashMap::new();
     configs.insert("repo1".to_string(), repo_config.clone());
     configs.insert("repo2".to_string(), repo_config.clone());
@@ -264,7 +275,7 @@ async fn test_build_registry_with_update_pull_time() {
         max_concurrent_cache_jobs = 20
     "#;
 
-    let config: Configuration = toml::from_str(toml).unwrap();
+    let config = Configuration::load_from_str(toml).unwrap();
     let result = build_registry(&config, &Arc::new(Mutex::new(None))).await;
 
     assert!(result.is_ok());
@@ -332,13 +343,13 @@ async fn test_service_listener_enum_variants() {
 
 #[test]
 fn test_build_repositories_preserves_names() {
-    let toml = r"
-        [access_policy]
-        default_allow = true
-        rules = []
-    ";
-
-    let repo_config: repository::Config = toml::from_str(toml).unwrap();
+    let repo_config = repository::Config {
+        access_policy: AccessPolicyConfig {
+            default: AccessMode::Allow,
+            ..AccessPolicyConfig::default()
+        },
+        ..repository::Config::default()
+    };
     let mut configs = HashMap::new();
     configs.insert("alpha".to_string(), repo_config.clone());
     configs.insert("beta".to_string(), repo_config.clone());
@@ -359,7 +370,8 @@ async fn test_build_registry_components_integration() {
     let config = create_config_with_repository();
 
     let auth_cache = build_auth_cache(&config.cache).unwrap();
-    let blob_store = build_blob_store(&config.blob_store, &auth_cache).unwrap();
+    let (blob_store, upload_store, presigned_blob_store) =
+        build_blob_stores(&config.blob_store, &auth_cache).unwrap();
     let metadata_store = build_metadata_store(&config, &auth_cache, &Arc::new(Mutex::new(None)))
         .await
         .unwrap();
@@ -373,7 +385,14 @@ async fn test_build_registry_components_integration() {
         .global_immutable_tags(config.global.immutable_tags)
         .global_immutable_tags_exclusions(config.global.immutable_tags_exclusions.clone());
 
-    let registry = Registry::new(blob_store, metadata_store, repositories, registry_config);
+    let registry = Registry::new(
+        blob_store,
+        upload_store,
+        presigned_blob_store,
+        metadata_store,
+        repositories,
+        registry_config,
+    );
 
     assert!(registry.is_ok());
 }
@@ -388,20 +407,20 @@ async fn test_command_new_validates_configuration() {
 
 #[test]
 fn test_build_repositories_with_different_configs() {
-    let toml1 = r"
-        [access_policy]
-        default_allow = true
-        rules = []
-    ";
-
-    let toml2 = r#"
-        [access_policy]
-        default_allow = false
-        rules = ["identity.username == 'admin'"]
-    "#;
-
-    let repo_config1: repository::Config = toml::from_str(toml1).unwrap();
-    let repo_config2: repository::Config = toml::from_str(toml2).unwrap();
+    let repo_config1 = repository::Config {
+        access_policy: AccessPolicyConfig {
+            default: AccessMode::Allow,
+            ..AccessPolicyConfig::default()
+        },
+        ..repository::Config::default()
+    };
+    let repo_config2 = repository::Config {
+        access_policy: AccessPolicyConfig {
+            default: AccessMode::Deny,
+            rules: vec![CelRule::compile("identity.username == 'admin'").unwrap()],
+        },
+        ..repository::Config::default()
+    };
 
     let mut configs = HashMap::new();
     configs.insert("public".to_string(), repo_config1);
@@ -434,6 +453,7 @@ fn create_config_with_webhook(url: &str) -> Configuration {
         [global]
         update_pull_time = false
         max_concurrent_cache_jobs = 10
+        event_webhooks = ["test_hook"]
 
         [event_webhook.test_hook]
         url = "{url}"
@@ -442,7 +462,7 @@ fn create_config_with_webhook(url: &str) -> Configuration {
     "#
     );
 
-    toml::from_str(&toml).unwrap()
+    Configuration::load_from_str(&toml).unwrap()
 }
 
 fn create_config_with_two_webhooks(url_a: &str, url_b: &str) -> Configuration {
@@ -463,6 +483,7 @@ fn create_config_with_two_webhooks(url_a: &str, url_b: &str) -> Configuration {
         [global]
         update_pull_time = false
         max_concurrent_cache_jobs = 10
+        event_webhooks = ["hook_a", "hook_b"]
 
         [event_webhook.hook_a]
         url = "{url_a}"
@@ -476,7 +497,7 @@ fn create_config_with_two_webhooks(url_a: &str, url_b: &str) -> Configuration {
     "#
     );
 
-    toml::from_str(&toml).unwrap()
+    Configuration::load_from_str(&toml).unwrap()
 }
 
 fn create_test_event() -> crate::event_webhook::event::Event {
@@ -699,6 +720,7 @@ fn create_invalid_cache_config_with_webhook(url: &str) -> Configuration {
         [global]
         update_pull_time = false
         max_concurrent_cache_jobs = 10
+        event_webhooks = ["test_hook"]
 
         [event_webhook.test_hook]
         url = "{url}"
@@ -707,7 +729,7 @@ fn create_invalid_cache_config_with_webhook(url: &str) -> Configuration {
     "#
     );
 
-    toml::from_str(&toml).unwrap()
+    Configuration::load_from_str(&toml).unwrap()
 }
 
 #[tokio::test]

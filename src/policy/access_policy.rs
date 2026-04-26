@@ -6,8 +6,8 @@
 //! # Policy Evaluation
 //!
 //! Access policies support two modes:
-//! - **Default Allow**: Access is granted unless explicitly denied by a rule
-//! - **Default Deny**: Access is denied unless explicitly granted by a rule
+//! - **Allow**: Access is granted unless explicitly denied by a rule
+//! - **Deny**: Access is denied unless explicitly granted by a rule
 //!
 //! # Available Variables
 //!
@@ -15,20 +15,64 @@
 //! - `identity`: Client identity information (id, username, certificate details)
 //! - `request`: Request details (action, namespace, digest, reference)
 
-use cel_interpreter::{Context, Program, Value};
+use cel_interpreter::{Context, Value};
 use serde::Deserialize;
 use tracing::{debug, warn};
 
-use super::{Error, cel};
+use super::{CelRule, Error};
 use crate::identity::{Action, ClientIdentity};
+
+/// Whether an access policy defaults to allowing or denying requests.
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum AccessMode {
+    /// Access is denied unless a rule explicitly grants it.
+    #[default]
+    Deny,
+    /// Access is granted unless a rule explicitly denies it.
+    Allow,
+}
 
 /// Configuration for access control policies.
 #[derive(Clone, Debug, Default, Deserialize)]
+#[serde(from = "RawAccessPolicyConfig")]
 pub struct AccessPolicyConfig {
-    #[serde(default)]
-    pub default_allow: bool,
-    #[serde(default)]
-    pub rules: Vec<String>,
+    pub default: AccessMode,
+    pub rules: Vec<CelRule>,
+}
+
+/// Intermediate shape that also accepts the deprecated `default_allow` field.
+///
+/// `default` takes precedence when both are present. `default_allow` usage
+/// emits a deprecation warning and will be removed in a future release.
+#[derive(Default, Deserialize)]
+#[serde(default)]
+struct RawAccessPolicyConfig {
+    default: Option<AccessMode>,
+    default_allow: Option<bool>,
+    rules: Vec<CelRule>,
+}
+
+impl From<RawAccessPolicyConfig> for AccessPolicyConfig {
+    fn from(raw: RawAccessPolicyConfig) -> Self {
+        if raw.default_allow.is_some() {
+            warn!("'access_policy.default_allow' is deprecated; use 'default' instead");
+        }
+        let default = raw
+            .default
+            .or_else(|| raw.default_allow.map(AccessMode::from_default_allow))
+            .unwrap_or_default();
+        Self {
+            default,
+            rules: raw.rules,
+        }
+    }
+}
+
+impl AccessMode {
+    fn from_default_allow(allow: bool) -> Self {
+        if allow { Self::Allow } else { Self::Deny }
+    }
 }
 
 /// Access control policy engine.
@@ -36,25 +80,58 @@ pub struct AccessPolicyConfig {
 /// Evaluates CEL expressions to determine if a request should be allowed.
 /// Rules are pre-compiled at configuration time for better performance.
 pub struct AccessPolicy {
-    default_allow: bool,
-    rules: Vec<Program>,
+    default: AccessMode,
+    rules: Vec<CelRule>,
 }
 
 impl AccessPolicy {
     /// Creates a new access policy from configuration.
     ///
-    /// Compiles CEL expressions from the configuration into programs.
-    pub fn new(config: &AccessPolicyConfig) -> Result<Self, Error> {
-        let rules =
-            cel::compile_rules(&config.rules, "access policy").map_err(Error::Initialization)?;
-
-        Ok(Self {
-            default_allow: config.default_allow,
-            rules,
-        })
+    /// Rules are already compiled; this constructor is infallible.
+    pub fn new(config: &AccessPolicyConfig) -> Self {
+        Self {
+            default: config.default,
+            rules: config.rules.clone(),
+        }
     }
 
     /// Evaluates the access policy for a given action and identity.
+    ///
+    /// Rules are evaluated in order; the first matching rule (returning `true`) flips the
+    /// default decision.  If no rule matches, the `default` mode determines the outcome.
+    ///
+    /// # Fail-open vs fail-closed semantics
+    ///
+    /// Access policies are **fail-closed by default** for non-boolean results: a misconfigured
+    /// rule that returns a non-boolean value is treated as a match (flipping the default).
+    /// The effect on the final decision depends on the operating mode:
+    ///
+    /// ## Allow mode (default-allow; rules are DENY rules)
+    ///
+    /// | Outcome                             | Behaviour              | Log level |
+    /// |-------------------------------------|------------------------|-----------|
+    /// | `bool(true)`  — rule matched        | deny (fail-closed)     | `debug`   |
+    /// | `bool(false)` — rule did not match  | continue to next rule  | —         |
+    /// | non-boolean value (misconfiguration)| deny (fail-closed)     | `warn`    |
+    /// | evaluation error                    | continue (fail-**open**)| `warn`   |
+    /// | no rules matched                    | allow (default)        | —         |
+    ///
+    /// In Allow mode, an evaluation error is the one genuinely fail-open case: a broken DENY
+    /// rule is skipped, and the default grants access.  This is a known trade-off; changing it
+    /// would require propagating `Err` through all callers.
+    ///
+    /// ## Deny mode (default-deny; rules are ALLOW rules)
+    ///
+    /// | Outcome                             | Behaviour              | Log level |
+    /// |-------------------------------------|------------------------|-----------|
+    /// | `bool(true)`  — rule matched        | allow (fail-open)      | `debug`   |
+    /// | `bool(false)` — rule did not match  | continue to next rule  | —         |
+    /// | non-boolean value (misconfiguration)| continue (skip rule)   | `warn`    |
+    /// | evaluation error                    | continue (skip rule)   | `warn`    |
+    /// | no rules matched                    | deny (default)         | —         |
+    ///
+    /// In Deny mode, both anomalous outcomes skip the rule and eventually fall through to the
+    /// default deny — fail-closed.
     ///
     /// # Arguments
     /// * `action` - The domain action representing the registry operation
@@ -63,28 +140,31 @@ impl AccessPolicy {
     /// # Returns
     /// * `Ok(true)` if access should be granted
     /// * `Ok(false)` if access should be denied
-    /// * `Err` if policy evaluation fails
+    /// * `Err` if context construction fails (rule execution errors are handled internally)
     pub fn evaluate(&self, action: &Action, identity: &ClientIdentity) -> Result<bool, Error> {
         if self.rules.is_empty() {
-            return Ok(self.default_allow);
+            return Ok(self.default == AccessMode::Allow);
         }
 
         let context = Self::build_context(action, identity)?;
-        let rule_kind = if self.default_allow { "deny" } else { "allow" };
+        let rule_kind = match self.default {
+            AccessMode::Allow => "deny",
+            AccessMode::Deny => "allow",
+        };
 
         for (index, rule) in self.rules.iter().enumerate() {
             let rule_index = index + 1;
             match rule.execute(&context) {
                 Ok(Value::Bool(true)) => {
                     debug!("{rule_kind} rule {rule_index} matched");
-                    return Ok(!self.default_allow);
+                    return Ok(self.default == AccessMode::Deny);
                 }
                 Ok(Value::Bool(false)) => {}
                 Ok(value) => {
                     warn!(
                         "Access policy {rule_kind} rule {rule_index} returned non-boolean value: {value:?}"
                     );
-                    if self.default_allow {
+                    if self.default == AccessMode::Allow {
                         return Ok(false);
                     }
                 }
@@ -93,7 +173,7 @@ impl AccessPolicy {
                 }
             }
         }
-        Ok(self.default_allow)
+        Ok(self.default == AccessMode::Allow)
     }
 
     fn build_context<'a>(
@@ -103,10 +183,10 @@ impl AccessPolicy {
         let mut context = Context::default();
         context
             .add_variable("request", action)
-            .map_err(|e| Error::Initialization(e.to_string()))?;
+            .map_err(|e| Error::Evaluation(e.to_string()))?;
         context
             .add_variable("identity", identity)
-            .map_err(|e| Error::Initialization(e.to_string()))?;
+            .map_err(|e| Error::Evaluation(e.to_string()))?;
         Ok(context)
     }
 }
@@ -115,41 +195,43 @@ impl AccessPolicy {
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_access_policy_default_allow_no_rules() {
-        let config = AccessPolicyConfig {
-            default_allow: true,
-            rules: vec![],
-        };
-        let policy = AccessPolicy::new(&config).unwrap();
-        let action = Action::ApiVersion;
-        let identity = ClientIdentity::default();
-
-        let result = policy.evaluate(&action, &identity);
-        assert!(result.unwrap());
+    fn rule(s: &str) -> CelRule {
+        CelRule::compile(s).unwrap()
     }
 
     #[test]
-    fn test_access_policy_default_deny_no_rules() {
+    fn test_access_policy_allow_mode_no_rules() {
         let config = AccessPolicyConfig {
-            default_allow: false,
+            default: AccessMode::Allow,
             rules: vec![],
         };
-        let policy = AccessPolicy::new(&config).unwrap();
+        let policy = AccessPolicy::new(&config);
         let action = Action::ApiVersion;
         let identity = ClientIdentity::default();
 
-        let result = policy.evaluate(&action, &identity);
-        assert!(!result.unwrap());
+        assert!(policy.evaluate(&action, &identity).unwrap());
     }
 
     #[test]
-    fn test_access_policy_default_allow_with_deny_rule() {
+    fn test_access_policy_deny_mode_no_rules() {
         let config = AccessPolicyConfig {
-            default_allow: true,
-            rules: vec!["identity.username == 'forbidden'".to_string()],
+            default: AccessMode::Deny,
+            rules: vec![],
         };
-        let policy = AccessPolicy::new(&config).unwrap();
+        let policy = AccessPolicy::new(&config);
+        let action = Action::ApiVersion;
+        let identity = ClientIdentity::default();
+
+        assert!(!policy.evaluate(&action, &identity).unwrap());
+    }
+
+    #[test]
+    fn test_access_policy_allow_mode_with_deny_rule() {
+        let config = AccessPolicyConfig {
+            default: AccessMode::Allow,
+            rules: vec![rule("identity.username == 'forbidden'")],
+        };
+        let policy = AccessPolicy::new(&config);
 
         let action = Action::ApiVersion;
         let identity = ClientIdentity {
@@ -157,25 +239,23 @@ mod tests {
             ..ClientIdentity::default()
         };
 
-        let result = policy.evaluate(&action, &identity);
-        assert!(!result.unwrap());
+        assert!(!policy.evaluate(&action, &identity).unwrap());
 
         let identity = ClientIdentity {
             username: Some("allowed".to_string()),
             ..ClientIdentity::default()
         };
 
-        let result = policy.evaluate(&action, &identity);
-        assert!(result.unwrap());
+        assert!(policy.evaluate(&action, &identity).unwrap());
     }
 
     #[test]
-    fn test_access_policy_default_deny_with_allow_rule() {
+    fn test_access_policy_deny_mode_with_allow_rule() {
         let config = AccessPolicyConfig {
-            default_allow: false,
-            rules: vec!["identity.username == 'admin'".to_string()],
+            default: AccessMode::Deny,
+            rules: vec![rule("identity.username == 'admin'")],
         };
-        let policy = AccessPolicy::new(&config).unwrap();
+        let policy = AccessPolicy::new(&config);
 
         let action = Action::ApiVersion;
         let identity = ClientIdentity {
@@ -183,15 +263,121 @@ mod tests {
             ..ClientIdentity::default()
         };
 
-        let result = policy.evaluate(&action, &identity);
-        assert!(result.unwrap());
+        assert!(policy.evaluate(&action, &identity).unwrap());
 
         let identity = ClientIdentity {
             username: Some("user".to_string()),
             ..ClientIdentity::default()
         };
 
-        let result = policy.evaluate(&action, &identity);
-        assert!(!result.unwrap());
+        assert!(!policy.evaluate(&action, &identity).unwrap());
+    }
+
+    #[test]
+    fn test_access_policy_default_toml_allow() {
+        let config: AccessPolicyConfig = toml::from_str("default = \"allow\"").unwrap();
+        assert_eq!(config.default, AccessMode::Allow);
+    }
+
+    #[test]
+    fn test_access_policy_default_toml_deny() {
+        let config: AccessPolicyConfig = toml::from_str("default = \"deny\"").unwrap();
+        assert_eq!(config.default, AccessMode::Deny);
+    }
+
+    #[test]
+    fn test_access_policy_default_toml_missing_is_deny() {
+        let config: AccessPolicyConfig = toml::from_str("").unwrap();
+        assert_eq!(config.default, AccessMode::Deny);
+    }
+
+    #[test]
+    fn test_access_policy_default_toml_unknown_value_fails() {
+        let result: Result<AccessPolicyConfig, _> = toml::from_str("default = \"maybe\"");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_deprecated_default_allow_true_maps_to_allow() {
+        let config: AccessPolicyConfig = toml::from_str("default_allow = true").unwrap();
+        assert_eq!(config.default, AccessMode::Allow);
+    }
+
+    #[test]
+    fn test_deprecated_default_allow_false_maps_to_deny() {
+        let config: AccessPolicyConfig = toml::from_str("default_allow = false").unwrap();
+        assert_eq!(config.default, AccessMode::Deny);
+    }
+
+    #[test]
+    fn test_default_wins_over_deprecated_default_allow() {
+        let toml = r#"
+            default = "deny"
+            default_allow = true
+        "#;
+        let config: AccessPolicyConfig = toml::from_str(toml).unwrap();
+        assert_eq!(config.default, AccessMode::Deny);
+    }
+
+    // --- Non-boolean and error rule behaviour ---
+
+    #[test]
+    fn non_boolean_rule_in_allow_mode_denies_fail_closed() {
+        // Allow mode: rules are DENY rules.  A non-bool result is treated as a
+        // match → access is denied (fail-closed).
+        let config = AccessPolicyConfig {
+            default: AccessMode::Allow,
+            rules: vec![rule("42")],
+        };
+        let policy = AccessPolicy::new(&config);
+        let action = Action::ApiVersion;
+        let identity = ClientIdentity::default();
+
+        assert!(!policy.evaluate(&action, &identity).unwrap());
+    }
+
+    #[test]
+    fn non_boolean_rule_in_deny_mode_falls_through_to_deny() {
+        // Deny mode: rules are ALLOW rules.  A non-bool result is skipped (not
+        // treated as a match), so evaluation falls through to the default → deny.
+        let config = AccessPolicyConfig {
+            default: AccessMode::Deny,
+            rules: vec![rule("42")],
+        };
+        let policy = AccessPolicy::new(&config);
+        let action = Action::ApiVersion;
+        let identity = ClientIdentity::default();
+
+        assert!(!policy.evaluate(&action, &identity).unwrap());
+    }
+
+    #[test]
+    fn failed_rule_in_allow_mode_falls_through_to_allow_fail_open() {
+        // Allow mode: an evaluation error in a DENY rule is skipped, and the
+        // default grants access.  This is the documented fail-open case in Allow mode.
+        let config = AccessPolicyConfig {
+            default: AccessMode::Allow,
+            rules: vec![rule("nonexistent_var")],
+        };
+        let policy = AccessPolicy::new(&config);
+        let action = Action::ApiVersion;
+        let identity = ClientIdentity::default();
+
+        assert!(policy.evaluate(&action, &identity).unwrap());
+    }
+
+    #[test]
+    fn failed_rule_in_deny_mode_falls_through_to_deny_fail_closed() {
+        // Deny mode: an evaluation error in an ALLOW rule is skipped, and the
+        // default denies access (fail-closed).
+        let config = AccessPolicyConfig {
+            default: AccessMode::Deny,
+            rules: vec![rule("nonexistent_var")],
+        };
+        let policy = AccessPolicy::new(&config);
+        let action = Action::ApiVersion;
+        let identity = ClientIdentity::default();
+
+        assert!(!policy.evaluate(&action, &identity).unwrap());
     }
 }

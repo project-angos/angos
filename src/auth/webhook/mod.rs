@@ -9,7 +9,6 @@ use std::{
 };
 
 use hyper::{
-    Uri,
     header::{HeaderName, HeaderValue},
     http::{HeaderMap, request::Parts},
 };
@@ -17,6 +16,7 @@ use prometheus::{HistogramVec, IntCounterVec, register_histogram_vec, register_i
 use reqwest::{Certificate, Client, Identity, header::AUTHORIZATION, redirect::Policy};
 use serde::Deserialize;
 use tracing::warn;
+use url::Url;
 
 use crate::{
     cache::{Cache, CacheExt},
@@ -45,7 +45,11 @@ static WEBHOOK_DURATION: LazyLock<HistogramVec> = LazyLock::new(|| {
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct Config {
-    pub url: String,
+    /// Populated during configuration resolution; not present in TOML.
+    #[serde(skip, default)]
+    pub name: String,
+
+    pub url: Url,
     pub timeout_ms: u64,
 
     #[serde(flatten)]
@@ -81,11 +85,6 @@ impl Config {
     pub fn validate(&self) -> Result<(), Error> {
         if self.client_certificate_bundle.is_some() != self.client_private_key.is_some() {
             let msg = "Both certificate and key required for mTLS".to_string();
-            return Err(Error::Initialization(msg));
-        }
-
-        if let Err(e) = Uri::try_from(&self.url) {
-            let msg = format!("Invalid webhook URL: {e}");
             return Err(Error::Initialization(msg));
         }
 
@@ -373,6 +372,10 @@ async fn cache_retrieve(
 }
 
 impl WebhookAuthorizer {
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
     pub fn new(name: String, config: Config, cache: Arc<dyn Cache>) -> Result<Self, Error> {
         let mut client_builder = Client::builder()
             .redirect(Policy::none())
@@ -424,7 +427,7 @@ impl WebhookAuthorizer {
             .start_timer();
 
         let headers = build_headers(&self.config.forward_headers, action, identity, parts)?;
-        let mut request = self.client.get(&self.config.url);
+        let mut request = self.client.get(self.config.url.clone());
         for (key, value) in &headers {
             request = request.header(key, value);
         }

@@ -35,12 +35,7 @@ impl BlobChecker {
         debug!("Checking blobs");
 
         for_each_page(
-            |marker| async move {
-                self.blob_store
-                    .list_blobs(100, marker)
-                    .await
-                    .map_err(Error::from)
-            },
+            |marker| async move { self.blob_store.list(100, marker).await.map_err(Error::from) },
             |blobs| self.process_page(blobs),
         )
         .await
@@ -100,7 +95,7 @@ impl BlobChecker {
         }
 
         info!("Deleting orphan blob '{blob}'");
-        self.blob_store.delete_blob(blob).await?;
+        self.blob_store.delete(blob).await?;
         Ok(())
     }
 
@@ -193,15 +188,15 @@ mod tests {
             let metadata_store = test_case.metadata_store();
 
             let orphan_content = b"orphan blob content";
-            let orphan_digest = blob_store.create_blob(orphan_content).await.unwrap();
+            let orphan_digest = blob_store.create(orphan_content).await.unwrap();
 
-            let blob_exists_before = blob_store.read_blob(&orphan_digest).await.is_ok();
+            let blob_exists_before = blob_store.read(&orphan_digest).await.is_ok();
             assert!(blob_exists_before, "Orphan blob should exist before scrub");
 
             let scrubber = BlobChecker::new(blob_store.clone(), metadata_store.clone(), false);
             scrubber.check_all().await.unwrap();
 
-            let blob_exists_after = blob_store.read_blob(&orphan_digest).await.is_ok();
+            let blob_exists_after = blob_store.read(&orphan_digest).await.is_ok();
             assert!(
                 !blob_exists_after,
                 "Orphan blob without index should be deleted after scrub"
@@ -216,15 +211,15 @@ mod tests {
             let metadata_store = test_case.metadata_store();
 
             let orphan_content = b"orphan blob content for dry run";
-            let orphan_digest = blob_store.create_blob(orphan_content).await.unwrap();
+            let orphan_digest = blob_store.create(orphan_content).await.unwrap();
 
-            let blob_exists_before = blob_store.read_blob(&orphan_digest).await.is_ok();
+            let blob_exists_before = blob_store.read(&orphan_digest).await.is_ok();
             assert!(blob_exists_before, "Orphan blob should exist before scrub");
 
             let scrubber = BlobChecker::new(blob_store.clone(), metadata_store.clone(), true);
             scrubber.check_all().await.unwrap();
 
-            let blob_exists_after = blob_store.read_blob(&orphan_digest).await.is_ok();
+            let blob_exists_after = blob_store.read(&orphan_digest).await.is_ok();
             assert!(
                 blob_exists_after,
                 "Orphan blob should be preserved in dry-run mode"

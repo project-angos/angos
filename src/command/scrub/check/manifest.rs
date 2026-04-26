@@ -35,7 +35,7 @@ impl ManifestChecker {
     }
 
     async fn repair_manifest_links(&self, namespace: &str, revision: &Digest) -> Result<(), Error> {
-        let content = self.blob_store.read_blob(revision).await?;
+        let content = self.blob_store.read(revision).await?;
         let manifest = parse_manifest_digests(&content, None)?;
 
         for layer in &manifest.layers {
@@ -152,7 +152,7 @@ mod tests {
             );
 
             let manifest_digest = blob_store
-                .create_blob(manifest_content.as_bytes())
+                .create(manifest_content.as_bytes())
                 .await
                 .unwrap();
 

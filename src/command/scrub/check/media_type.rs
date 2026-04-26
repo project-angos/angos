@@ -73,7 +73,7 @@ impl MediaTypeChecker {
     }
 
     async fn read_media_type(&self, digest: &Digest) -> Result<Option<String>, Error> {
-        let content = self.blob_store.read_blob(digest).await?;
+        let content = self.blob_store.read(digest).await?;
         match serde_json::from_slice::<Manifest>(&content) {
             Ok(manifest) => Ok(manifest.media_type),
             Err(e) => {
@@ -164,7 +164,7 @@ mod tests {
             );
 
             let manifest_digest = blob_store
-                .create_blob(manifest_content.as_bytes())
+                .create(manifest_content.as_bytes())
                 .await
                 .unwrap();
 
@@ -249,7 +249,7 @@ mod tests {
             );
 
             let manifest_digest = blob_store
-                .create_blob(manifest_content.as_bytes())
+                .create(manifest_content.as_bytes())
                 .await
                 .unwrap();
 
@@ -307,7 +307,7 @@ mod tests {
             );
 
             let manifest_digest = blob_store
-                .create_blob(manifest_content.as_bytes())
+                .create(manifest_content.as_bytes())
                 .await
                 .unwrap();
 

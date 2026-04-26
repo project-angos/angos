@@ -35,7 +35,7 @@ impl LinkReferencesChecker {
     }
 
     async fn repair_referenced_by(&self, namespace: &str, revision: &Digest) -> Result<(), Error> {
-        let content = self.blob_store.read_blob(revision).await?;
+        let content = self.blob_store.read(revision).await?;
         let manifest = parse_manifest_digests(&content, None)?;
 
         if let Some(config) = &manifest.config {
@@ -157,8 +157,7 @@ mod tests {
         registry::{
             Registry,
             metadata_store::{
-                BlobIndex, BlobIndexOperation, ConditionalCapabilities, LinkMetadata,
-                LinkOperation, MetadataStoreExt,
+                BlobIndex, BlobIndexOperation, LinkMetadata, LinkOperation, MetadataStoreExt,
             },
             test_utils,
             tests::{FSRegistryTestCase, RegistryTestCase, backends},
@@ -198,7 +197,7 @@ mod tests {
         );
 
         let manifest_digest = blob_store
-            .create_blob(manifest_content.as_bytes())
+            .create(manifest_content.as_bytes())
             .await
             .unwrap();
 
@@ -332,7 +331,7 @@ mod tests {
         }"#;
 
             let manifest_digest = blob_store
-                .create_blob(manifest_content.as_bytes())
+                .create(manifest_content.as_bytes())
                 .await
                 .unwrap();
 
@@ -458,10 +457,6 @@ mod tests {
             _operations: &[LinkOperation],
         ) -> Result<(), metadata_store::Error> {
             unimplemented!()
-        }
-
-        fn conditional_capabilities(&self) -> Option<ConditionalCapabilities> {
-            None
         }
     }
 

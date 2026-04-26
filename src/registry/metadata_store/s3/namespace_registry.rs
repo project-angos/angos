@@ -1,15 +1,11 @@
-use std::{collections::HashMap, io::ErrorKind, time::Duration};
+use std::{collections::HashMap, io::ErrorKind};
 
 use bytes::Bytes;
 use futures_util::stream::{self, StreamExt};
-use tracing::{debug, warn};
+use tracing::warn;
 
 use super::Backend;
-use crate::registry::{
-    data_store,
-    metadata_store::{Error, simple_jitter},
-    path_builder,
-};
+use crate::registry::{metadata_store::Error, path_builder};
 
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct NamespaceRegistry {
@@ -123,41 +119,9 @@ impl Backend {
             path_builder::namespace_registry_shard_dir()
         );
 
-        if self.conditional.supports_cas() {
-            let etag = match self.store.read_with_etag(&path).await {
-                Ok((_, etag)) => etag,
-                Err(e) if e.kind() == ErrorKind::NotFound => None,
-                Err(e) => return Err(Error::from(e)),
-            };
-            let write_result = if let Some(ref etag) = etag {
-                self.store
-                    .put_object_if_match(&path, etag, content)
-                    .await
-                    .map(|_| ())
-            } else {
-                self.store
-                    .put_object_if_not_exists(&path, content)
-                    .await
-                    .map(|_| ())
-            };
-            match write_result {
-                Ok(()) => {}
-                Err(data_store::Error::PreconditionFailed) => {
-                    debug!(
-                        shard_key,
-                        "Namespace registry shard rebuild lost CAS race; concurrent write wins"
-                    );
-                }
-                Err(e) => return Err(Error::StorageBackend(e.to_string())),
-            }
-        } else {
-            let lock_key = format!("namespace_registry_shard_{shard_key}");
-            let guard = self.lock.acquire(&[lock_key]).await?;
-            self.store.put_object(&path, content).await?;
-            guard.release().await;
-        }
-
-        Ok(())
+        self.coordinator
+            .rebuild_namespace_registry_shard(self, shard_key, &path, content)
+            .await
     }
 
     pub async fn register_namespace(&self, namespace: &str) -> Result<(), Error> {
@@ -165,105 +129,7 @@ impl Backend {
             return Ok(());
         }
 
-        if self.conditional.supports_cas() {
-            self.register_namespace_cas(namespace).await
-        } else {
-            self.register_namespace_unconditional(namespace).await
-        }
-    }
-
-    async fn register_namespace_unconditional(&self, namespace: &str) -> Result<(), Error> {
-        let shard_key = path_builder::namespace_shard_key(namespace);
-        let path = path_builder::namespace_registry_shard_path(namespace);
-        let lock_key = format!("namespace_registry_shard_{shard_key}");
-        let guard = self.lock.acquire(&[lock_key]).await?;
-
-        let mut registry = match self.store.read(&path).await {
-            Ok(data) => serde_json::from_slice::<NamespaceRegistry>(&data).unwrap_or_default(),
-            Err(e) if e.kind() == ErrorKind::NotFound => NamespaceRegistry::default(),
-            Err(e) => {
-                guard.release().await;
-                return Err(Error::from(e));
-            }
-        };
-
-        if let Err(pos) = registry.namespaces.binary_search(&namespace.to_string()) {
-            registry.namespaces.insert(pos, namespace.to_string());
-            let content = Bytes::from(serde_json::to_vec(&registry)?);
-            if let Err(e) = self.store.put_object(&path, content).await {
-                guard.release().await;
-                return Err(e.into());
-            }
-        }
-
-        guard.release().await;
-        self.known_namespaces
-            .lock()
-            .await
-            .insert(namespace.to_string());
-        Ok(())
-    }
-
-    async fn register_namespace_cas(&self, namespace: &str) -> Result<(), Error> {
-        let path = path_builder::namespace_registry_shard_path(namespace);
-
-        for attempt in 0..super::MAX_BLOB_INDEX_CAS_RETRIES {
-            let (mut registry, etag) = match self.store.read_with_etag(&path).await {
-                Ok((data, etag)) => match serde_json::from_slice::<NamespaceRegistry>(&data) {
-                    Ok(r) => (r, etag),
-                    Err(_) => (NamespaceRegistry::default(), etag),
-                },
-                Err(e) if e.kind() == ErrorKind::NotFound => (NamespaceRegistry::default(), None),
-                Err(e) => return Err(Error::from(e)),
-            };
-
-            let Err(pos) = registry.namespaces.binary_search(&namespace.to_string()) else {
-                self.known_namespaces
-                    .lock()
-                    .await
-                    .insert(namespace.to_string());
-                return Ok(());
-            };
-            registry.namespaces.insert(pos, namespace.to_string());
-
-            let content = Bytes::from(serde_json::to_vec(&registry)?);
-            let write_result = if let Some(ref etag) = etag {
-                self.store
-                    .put_object_if_match(&path, etag, content)
-                    .await
-                    .map(|_| ())
-            } else {
-                self.store
-                    .put_object_if_not_exists(&path, content)
-                    .await
-                    .map(|_| ())
-            };
-
-            match write_result {
-                Ok(()) => {
-                    self.known_namespaces
-                        .lock()
-                        .await
-                        .insert(namespace.to_string());
-                    return Ok(());
-                }
-                Err(data_store::Error::PreconditionFailed) => {
-                    debug!(
-                        namespace,
-                        attempt, "Namespace registry shard CAS conflict, retrying"
-                    );
-                    let max_ms = 50u64.saturating_mul(1u64 << attempt.min(4));
-                    tokio::time::sleep(Duration::from_millis(simple_jitter(max_ms))).await;
-                }
-                Err(e) => return Err(Error::StorageBackend(e.to_string())),
-            }
-        }
-
-        warn!(
-            namespace,
-            "Namespace registry shard CAS retries exhausted; namespace will appear after scrub reconciles"
-        );
-        Ok(())
+        self.coordinator.register_namespace(self, namespace).await
     }
 
     pub async fn collect_namespaces(
