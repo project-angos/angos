@@ -48,34 +48,40 @@ impl MetadataStoreConfig {
     pub async fn to_backend(
         &self,
         cache: Option<Arc<dyn Cache>>,
-    ) -> Result<Arc<dyn MetadataStore + Send + Sync>, Error> {
+    ) -> Result<
+        (
+            Arc<dyn MetadataStore + Send + Sync>,
+            Option<ConditionalCapabilities>,
+        ),
+        Error,
+    > {
         match self {
             MetadataStoreConfig::FS(config) => {
-                Ok(Arc::new(metadata_store::fs::Backend::new(config)?))
+                Ok((Arc::new(metadata_store::fs::Backend::new(config)?), None))
             }
             MetadataStoreConfig::S3(config) => {
-                let conditional = match &config.capabilities {
-                    Some(caps) => {
+                let caps = match &config.capabilities {
+                    Some(declared) => {
                         if matches!(config.lock_strategy, LockStrategy::S3(_))
-                            && !caps.supports_cas()
+                            && !declared.supports_cas()
                         {
                             return Err(Error::Lock(format!(
                                 "S3 lock strategy requires If-None-Match and If-Match support, \
                                  but config declares: put_if_none_match={}, put_if_match={}. \
                                  Use lock_strategy = redis or lock_strategy = memory instead.",
-                                caps.put_if_none_match, caps.put_if_match
+                                declared.put_if_none_match, declared.put_if_match
                             )));
                         }
-                        Some(caps.clone())
+                        Some(declared.clone())
                     }
                     None => self.probe().await?,
                 };
-                let backend = metadata_store::s3::Backend::new(config, conditional)?;
+                let backend = metadata_store::s3::Backend::new(config, caps.clone())?;
                 let backend = match cache {
                     Some(c) => backend.with_cache(c),
                     None => backend,
                 };
-                Ok(Arc::new(backend))
+                Ok((Arc::new(backend), caps))
             }
         }
     }

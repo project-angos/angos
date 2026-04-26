@@ -691,7 +691,7 @@ mod tests {
 
         let (blob_store, upload_store, presigned_blob_store) =
             config.blob_store.to_backend(None).unwrap();
-        let metadata_store = config
+        let (metadata_store, _) = config
             .resolve_metadata_config()
             .to_backend(None)
             .await

@@ -171,14 +171,12 @@ impl Registry {
         self.metadata_store.flush_access_times().await;
     }
 
-    pub async fn check_ready(
-        &self,
-    ) -> Result<Option<metadata_store::ConditionalCapabilities>, Error> {
+    pub async fn check_ready(&self) -> Result<(), Error> {
         self.metadata_store
             .list_namespaces(1, None)
             .await
             .map_err(|e| Error::Internal(format!("storage backend not ready: {e}")))?;
-        Ok(self.metadata_store.conditional_capabilities())
+        Ok(())
     }
 
     #[instrument]
@@ -199,7 +197,7 @@ impl Registry {
     /// Resolves the configured repository name for a namespace, or empty string
     /// if none matches. Used when constructing events where the event's
     /// `repository` field should reflect the configured repository scope.
-    pub(crate) fn repository_name_for(&self, namespace: &Namespace) -> String {
+    pub fn repository_name_for(&self, namespace: &Namespace) -> String {
         self.get_repository_for_namespace(namespace)
             .map(|r| r.name.clone())
             .unwrap_or_default()

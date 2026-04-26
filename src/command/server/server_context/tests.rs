@@ -48,7 +48,7 @@ pub async fn create_test_server_context() -> ServerContext {
     let config = create_test_config();
     let (blob_store, upload_store, presigned_blob_store) =
         config.blob_store.to_backend(None).unwrap();
-    let metadata_store = config
+    let (metadata_store, _) = config
         .resolve_metadata_config()
         .to_backend(None)
         .await
@@ -101,7 +101,7 @@ fn create_minimal_config() -> Configuration {
 async fn create_test_registry(config: &Configuration) -> Registry {
     let (blob_store, upload_store, presigned_blob_store) =
         config.blob_store.to_backend(None).unwrap();
-    let metadata_store = config
+    let (metadata_store, _) = config
         .resolve_metadata_config()
         .to_backend(None)
         .await
@@ -1066,7 +1066,7 @@ async fn test_server_context_new_invalid_cache_config() {
 
     let (blob_store, upload_store, presigned_blob_store) =
         config.blob_store.to_backend(None).unwrap();
-    let metadata_store = config
+    let (metadata_store, _) = config
         .resolve_metadata_config()
         .to_backend(None)
         .await

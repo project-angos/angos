@@ -82,7 +82,7 @@ fn build_stores(config: &blob_store::BlobStorageConfig) -> Result<BlobStores, Er
 
 async fn build_metadata_store(config: &Configuration) -> Result<Arc<dyn MetadataStore>, Error> {
     match config.resolve_metadata_config().to_backend(None).await {
-        Ok(store) => Ok(store),
+        Ok((store, _)) => Ok(store),
         Err(err) => {
             let msg = format!("Failed to initialize metadata store: {err}");
             Err(Error::Initialization(msg))

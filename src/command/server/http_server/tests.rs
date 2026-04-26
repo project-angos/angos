@@ -421,7 +421,7 @@ async fn test_authenticate_and_authorize_returns_client_identity() {
     let config: Configuration = toml::from_str(toml).unwrap();
     let (blob_store, upload_store, presigned_blob_store) =
         config.blob_store.to_backend(None).unwrap();
-    let metadata_store = config
+    let (metadata_store, _) = config
         .resolve_metadata_config()
         .to_backend(None)
         .await
@@ -481,7 +481,7 @@ async fn create_test_context_with_allow_policy() -> ServerContext {
     let config: Configuration = toml::from_str(toml).unwrap();
     let (blob_store, upload_store, presigned_blob_store) =
         config.blob_store.to_backend(None).unwrap();
-    let metadata_store = config
+    let (metadata_store, _) = config
         .resolve_metadata_config()
         .to_backend(None)
         .await

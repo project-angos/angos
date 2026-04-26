@@ -157,8 +157,7 @@ mod tests {
         registry::{
             Registry,
             metadata_store::{
-                BlobIndex, BlobIndexOperation, ConditionalCapabilities, LinkMetadata,
-                LinkOperation, MetadataStoreExt,
+                BlobIndex, BlobIndexOperation, LinkMetadata, LinkOperation, MetadataStoreExt,
             },
             test_utils,
             tests::{FSRegistryTestCase, RegistryTestCase, backends},
@@ -458,10 +457,6 @@ mod tests {
             _operations: &[LinkOperation],
         ) -> Result<(), metadata_store::Error> {
             unimplemented!()
-        }
-
-        fn conditional_capabilities(&self) -> Option<ConditionalCapabilities> {
-            None
         }
     }
 

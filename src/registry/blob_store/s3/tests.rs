@@ -265,7 +265,7 @@ async fn test_complete_upload_cleans_upload_container() {
     );
 
     let container_prefix = path_builder::upload_container_path("ns", &uuid);
-    let (objects_after, _) = store
+    let (objects_after, _) = backend
         .store
         .list_objects(&container_prefix, 1000, None)
         .await

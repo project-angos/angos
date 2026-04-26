@@ -80,11 +80,11 @@ async fn build_metadata_store(
     }
 
     match metadata_config.to_backend(Some(cache.clone())).await {
-        Ok(store) => {
+        Ok((store, caps)) => {
             let mut guard = cached_capabilities
                 .lock()
                 .expect("capabilities mutex poisoned");
-            *guard = store.conditional_capabilities();
+            *guard = caps;
             Ok(store)
         }
         Err(err) => {

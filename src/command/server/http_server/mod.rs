@@ -39,7 +39,6 @@ use crate::{
     identity::{Action, ClientIdentity},
     metrics_provider::{InFlightGuard, METRICS_PROVIDER},
     oci::{Digest, Namespace, Reference},
-    registry::metadata_store::ConditionalCapabilities,
 };
 
 pub async fn serve_request<S>(
@@ -254,7 +253,7 @@ async fn dispatch_route<'a>(
             handlers::ext::handle_list_namespaces(context, &repository).await
         }
         Action::Healthz => handle_healthz(),
-        Action::Readyz => handle_readyz(context, parts).await,
+        Action::Readyz => handle_readyz(context).await,
         Action::Metrics => handle_metrics(),
     }
 }
@@ -481,15 +480,10 @@ fn handle_healthz() -> Result<Response<ResponseBody>, Error> {
     json_response(StatusCode::OK, &HealthResponse { status: "ok" })
 }
 
-async fn handle_readyz(
-    context: &ServerContext,
-    parts: &Parts,
-) -> Result<Response<ResponseBody>, Error> {
+async fn handle_readyz(context: &ServerContext) -> Result<Response<ResponseBody>, Error> {
     #[derive(Serialize)]
-    struct ReadyResponse<'a> {
-        status: &'a str,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        conditional: Option<&'a ConditionalCapabilities>,
+    struct ReadyResponse {
+        status: &'static str,
     }
 
     #[derive(Serialize)]
@@ -498,19 +492,8 @@ async fn handle_readyz(
         error: String,
     }
 
-    let verbose = parts
-        .uri
-        .query()
-        .is_some_and(|q| q.contains("verbose=true"));
-
     match context.registry.check_ready().await {
-        Ok(conditional) => {
-            let payload = ReadyResponse {
-                status: "ready",
-                conditional: if verbose { conditional.as_ref() } else { None },
-            };
-            json_response(StatusCode::OK, &payload)
-        }
+        Ok(()) => json_response(StatusCode::OK, &ReadyResponse { status: "ready" }),
         Err(e) => {
             let payload = NotReadyResponse {
                 status: "not_ready",

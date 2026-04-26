@@ -29,7 +29,7 @@ use crate::{
             LinkOperation, LockStrategy, MetadataStore, ResolvedCreate, ResolvedDelete,
             link_kind::LinkKind,
             lock::{self, LockBackend, MemoryBackend},
-            lock_ops::{LockOps, ValidationResult},
+            lock_ops::LockOps,
         },
         pagination, path_builder,
     },
@@ -38,11 +38,14 @@ use crate::{
 mod access_time;
 mod blob_index;
 mod config;
+mod coordinator;
 mod link_ops;
 mod namespace_registry;
 
 #[cfg(test)]
 mod tests;
+
+use coordinator::WriteCoordinator;
 
 /// Return type of `build_create_ops`.
 type CreateOpsResult = (
@@ -66,10 +69,7 @@ pub struct Backend {
     cache: Option<Arc<dyn Cache>>,
     link_cache_ttl: u64,
     access_time_writer: Option<access_time::AccessTimeWriter>,
-    /// Per-operation conditional capabilities probed at startup.
-    /// Controls whether CAS paths are used for blob index, link updates, namespace
-    /// registry writes, and access-time updates.
-    conditional: ConditionalCapabilities,
+    coordinator: Arc<dyn WriteCoordinator>,
     known_namespaces: Arc<Mutex<HashSet<String>>>,
     // Held for Drop side-effect: signals the flush task to exit when the last Backend is dropped.
     #[allow(dead_code)]
@@ -93,7 +93,7 @@ impl Backend {
         info!("Using S3 metadata-store backend");
         let store = data_store::s3::Backend::new(&config.to_data_store_config())?;
 
-        let conditional = conditional.unwrap_or_else(|| {
+        let caps = conditional.unwrap_or_else(|| {
             if matches!(config.lock_strategy, LockStrategy::S3(_)) {
                 ConditionalCapabilities {
                     put_if_none_match: true,
@@ -104,6 +104,12 @@ impl Backend {
                 ConditionalCapabilities::default()
             }
         });
+
+        let coordinator: Arc<dyn WriteCoordinator> = if caps.supports_cas() {
+            Arc::new(coordinator::CasCoordinator)
+        } else {
+            Arc::new(coordinator::LockCoordinator)
+        };
 
         let lock: Arc<dyn LockBackend + Send + Sync> = match &config.lock_strategy {
             LockStrategy::Redis(redis_config) => {
@@ -122,12 +128,10 @@ impl Backend {
                         })?,
                 );
                 Arc::new(
-                    lock::S3LockBackend::new(
-                        lock_store,
-                        s3_lock_config,
-                        conditional.delete_if_match,
-                    )
-                    .map_err(|e| Error::Lock(format!("Failed to initialize S3 lock store: {e}")))?,
+                    lock::S3LockBackend::new(lock_store, s3_lock_config, caps.delete_if_match)
+                        .map_err(|e| {
+                            Error::Lock(format!("Failed to initialize S3 lock store: {e}"))
+                        })?,
                 )
             }
             LockStrategy::Memory => {
@@ -164,7 +168,7 @@ impl Backend {
                 cache: None,
                 link_cache_ttl: config.link_cache_ttl,
                 access_time_writer: access_time_writer.clone(),
-                conditional: conditional.clone(),
+                coordinator: coordinator.clone(),
                 known_namespaces: Arc::new(Mutex::new(HashSet::new())),
                 flush_handle: None,
             };
@@ -191,7 +195,7 @@ impl Backend {
             cache: None,
             link_cache_ttl: config.link_cache_ttl,
             access_time_writer,
-            conditional,
+            coordinator,
             known_namespaces: Arc::new(Mutex::new(HashSet::new())),
             flush_handle,
         };
@@ -320,10 +324,6 @@ impl Backend {
 
 #[async_trait]
 impl MetadataStore for Backend {
-    fn conditional_capabilities(&self) -> Option<ConditionalCapabilities> {
-        Some(self.conditional.clone())
-    }
-
     #[instrument(skip(self))]
     async fn list_namespaces(
         &self,
@@ -622,13 +622,8 @@ impl MetadataStore for Backend {
         digest: &Digest,
         operation: BlobIndexOperation,
     ) -> Result<(), Error> {
-        if self.conditional.supports_cas() {
-            return self
-                .update_blob_index_cas(namespace, digest, &[operation])
-                .await;
-        }
-
-        self.update_blob_index_shard(namespace, digest, &[operation])
+        self.coordinator
+            .update_blob_index(self, namespace, digest, operation)
             .await
     }
 
@@ -650,25 +645,10 @@ impl MetadataStore for Backend {
                 };
                 writer.record(namespace, link).await;
                 Ok(link_data)
-            } else if self.conditional.put_if_match {
-                let link_data = self
-                    .read_and_spawn_access_time_update(namespace, link)
-                    .await?;
-                self.cache_put(namespace, link, &link_data).await;
-                Ok(link_data)
             } else {
-                let guard = self.lock.acquire(&[format!("{namespace}:{link}")]).await?;
-                let link_data = self.read_link_reference(namespace, link).await?.accessed();
-                if !guard.is_valid() {
-                    return Err(Error::Lock(
-                        "lock invalidated during access time update".into(),
-                    ));
-                }
-                self.write_link_reference(namespace, link, &link_data)
-                    .await?;
-                self.cache_put(namespace, link, &link_data).await;
-                guard.release().await;
-                Ok(link_data)
+                self.coordinator
+                    .touch_link_access_time(self, namespace, link)
+                    .await
             }
         } else {
             if let Some(cached) = self.cache_get(namespace, link).await {
@@ -690,11 +670,9 @@ impl MetadataStore for Backend {
             return Ok(());
         }
 
-        if self.conditional.supports_cas() {
-            self.update_links_cas(namespace, operations).await
-        } else {
-            self.update_links_locked(namespace, operations).await
-        }
+        self.coordinator
+            .update_links(self, namespace, operations)
+            .await
     }
 
     async fn flush_access_times(&self) {
@@ -703,98 +681,6 @@ impl MetadataStore for Backend {
 }
 
 impl Backend {
-    /// CAS-optimized write path.
-    ///
-    /// Phase 1: All creates attempt lock-free `If-None-Match: *`.
-    ///
-    /// Phase 2: Locked read-modify-write for creates that lost the race and deletes.
-    ///
-    /// Phase 3: CAS blob index writes for new or re-targeted links.
-    async fn update_links_cas(
-        &self,
-        namespace: &str,
-        operations: &[LinkOperation],
-    ) -> Result<(), Error> {
-        let mut locked_ops: Vec<LinkOperation> = Vec::new();
-        let mut any_creates = false;
-
-        let mut optimistic: Vec<(LinkOperation, LinkKind, Digest, LinkMetadata)> = Vec::new();
-
-        for op in operations {
-            match op {
-                LinkOperation::Create {
-                    link,
-                    target,
-                    referrer,
-                    media_type,
-                    descriptor,
-                } => {
-                    any_creates = true;
-                    let mut metadata = LinkMetadata::from_digest(target.clone())
-                        .with_media_type(media_type.clone())
-                        .with_descriptor(descriptor.as_deref().cloned());
-                    if let Some(r) = referrer {
-                        metadata.add_referrer(r.clone());
-                    }
-                    optimistic.push((op.clone(), link.clone(), target.clone(), metadata));
-                }
-                LinkOperation::Delete { .. } => {
-                    locked_ops.push(op.clone());
-                }
-            }
-        }
-
-        // Phase 1: All creates attempt lock-free If-None-Match: *
-        let link_results = join_all(optimistic.iter().map(|(_, link, _, metadata)| {
-            self.write_link_if_not_exists(namespace, link, metadata)
-        }))
-        .await;
-
-        let mut lockfree_blob_ops: HashMap<Digest, Vec<BlobIndexOperation>> = HashMap::new();
-        for ((op, link, target, metadata), result) in optimistic.into_iter().zip(link_results) {
-            match result {
-                Ok(true) => {
-                    lockfree_blob_ops
-                        .entry(target)
-                        .or_default()
-                        .push(BlobIndexOperation::Insert(link.clone()));
-                    self.cache_put(namespace, &link, &metadata).await;
-                }
-                Ok(false) => {
-                    locked_ops.push(op);
-                }
-                Err(e) => return Err(e),
-            }
-        }
-
-        // Phase 2: Locked path for remaining operations.
-        let locked_blob_ops = self
-            .execute_locked_cas_updates(namespace, &locked_ops)
-            .await?;
-
-        // Merge blob index operations from both paths.
-        let mut pending_blob_ops = lockfree_blob_ops;
-        for (digest, ops) in locked_blob_ops {
-            pending_blob_ops.entry(digest).or_default().extend(ops);
-        }
-
-        // Phase 3: CAS blob index writes.
-        join_all(
-            pending_blob_ops
-                .iter()
-                .map(|(digest, ops)| self.update_blob_index_cas(namespace, digest, ops)),
-        )
-        .await
-        .into_iter()
-        .collect::<Result<Vec<_>, _>>()?;
-
-        if any_creates && let Err(e) = self.register_namespace(namespace).await {
-            warn!(namespace, error = %e, "Failed to register namespace");
-        }
-
-        Ok(())
-    }
-
     /// Executes link operations under a distributed lock, returning pending
     /// blob index operations for CAS updates after the lock is released.
     async fn execute_locked_cas_updates(
@@ -885,106 +771,6 @@ impl Backend {
         guard.release().await;
 
         Ok(pending_blob_ops)
-    }
-
-    /// Non-CAS write path: pre-lock reads to compute blob digest lock keys,
-    /// then validates under the lock with re-reads. Retries on concurrent
-    /// modification to ensure lock key coverage.
-    async fn update_links_locked(
-        &self,
-        namespace: &str,
-        operations: &[LinkOperation],
-    ) -> Result<(), Error> {
-        let mut update_retries = MAX_UPDATE_RETRIES;
-        loop {
-            let mut link_cache: HashMap<LinkKind, LinkMetadata> = HashMap::new();
-
-            let (creates, deletes, lock_keys) =
-                self.prelock_resolve_operations(namespace, operations).await;
-
-            if creates.is_empty() && deletes.is_empty() {
-                return Ok(());
-            }
-
-            let guard = self.lock.acquire(&lock_keys).await?;
-
-            if self
-                .validate_creates_under_lock(namespace, &creates, &mut link_cache)
-                .await
-                == ValidationResult::NeedsRetry
-            {
-                guard.release().await;
-                if update_retries == 0 {
-                    return Err(Error::Lock(
-                        "update_links exceeded maximum retries due to concurrent modifications"
-                            .into(),
-                    ));
-                }
-                update_retries -= 1;
-                continue;
-            }
-
-            if !guard.is_valid() {
-                guard.release().await;
-                return Err(Error::Lock("lock invalidated during operation".into()));
-            }
-
-            let (valid_deletes, delete_status) = self
-                .validate_deletes_under_lock(namespace, deletes, &mut link_cache)
-                .await?;
-
-            if delete_status == ValidationResult::NeedsRetry {
-                guard.release().await;
-                if update_retries == 0 {
-                    return Err(Error::Lock(
-                        "update_links exceeded maximum retries due to concurrent modifications"
-                            .into(),
-                    ));
-                }
-                update_retries -= 1;
-                continue;
-            }
-
-            if !guard.is_valid() {
-                guard.release().await;
-                return Err(Error::Lock("lock invalidated during operation".into()));
-            }
-
-            let pending_blob_ops = self
-                .apply_link_operations(namespace, &creates, &valid_deletes, &mut link_cache)
-                .await?;
-
-            if !guard.is_valid() {
-                guard.release().await;
-                return Err(Error::Lock("lock invalidated during operation".into()));
-            }
-
-            // Blob index shard updates run under the lock (blob:{digest} keys
-            // are included in lock_keys above).
-            join_all(
-                pending_blob_ops
-                    .iter()
-                    .map(|(digest, ops)| self.update_blob_index_shard(namespace, digest, ops)),
-            )
-            .await
-            .into_iter()
-            .collect::<Result<Vec<_>, _>>()?;
-
-            if !guard.is_valid() {
-                guard.release().await;
-                return Err(Error::Lock("lock invalidated during operation".into()));
-            }
-
-            guard.release().await;
-
-            if !creates.is_empty()
-                && let Err(e) = self.register_namespace(namespace).await
-            {
-                warn!(namespace, error = %e, "Failed to register namespace");
-            }
-
-            return Ok(());
-        }
     }
 
     /// Executes the write+delete+cache-update sequence for a set of create and

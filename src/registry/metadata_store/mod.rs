@@ -254,8 +254,4 @@ pub trait MetadataStore: Send + Sync {
     ) -> Result<(), Error>;
 
     async fn flush_access_times(&self) {}
-
-    fn conditional_capabilities(&self) -> Option<ConditionalCapabilities> {
-        None
-    }
 }
