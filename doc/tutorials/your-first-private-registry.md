@@ -61,7 +61,7 @@ Add a global access policy that requires authentication:
 
 ```toml
 [global.access_policy]
-default_allow = false
+default = "deny"
 rules = [
   "identity.username != null"
 ]
@@ -82,7 +82,7 @@ username = "alice"
 password = "$argon2id$v=19$m=19456,t=2,p=1$..."
 
 [global.access_policy]
-default_allow = false
+default = "deny"
 rules = [
   "identity.username != null"
 ]

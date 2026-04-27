@@ -222,7 +222,7 @@ top_pulled(5)
 
 ```toml
 [global.access_policy]
-default_allow = false
+default = "deny"
 rules = [
   "identity.username == 'admin'",
   "identity.certificate.organizations.contains('Platform')",
@@ -234,7 +234,7 @@ rules = [
 
 ```toml
 [repository."public".access_policy]
-default_allow = false
+default = "deny"
 rules = [
   "request.action in ['get-manifest', 'get-blob', 'list-tags']",
   "identity.username == 'admin'"

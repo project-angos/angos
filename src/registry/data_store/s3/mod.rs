@@ -18,7 +18,7 @@ use serde::Deserialize;
 
 use crate::{
     circuit_breaker::CircuitBreaker,
-    registry::{blob_store::UploadedPart, data_store::Error},
+    registry::{blob_store::s3::UploadedPart, data_store::Error},
 };
 
 #[derive(Clone, Debug, Deserialize, PartialEq)]

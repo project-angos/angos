@@ -17,10 +17,15 @@ use crate::{
     configuration::Configuration,
     policy::{RetentionPolicy, RetentionPolicyConfig},
     registry::{
-        Repository, blob_store, blob_store::BlobStore, metadata_store::MetadataStore,
-        pagination::collect_all_pages, repository,
+        Repository, blob_store,
+        blob_store::{BlobStore, UploadStore},
+        metadata_store::MetadataStore,
+        pagination::collect_all_pages,
+        repository,
     },
 };
+
+type BlobStores = (Arc<dyn BlobStore>, Arc<dyn UploadStore>);
 
 #[derive(FromArgs, PartialEq, Debug)]
 #[allow(clippy::struct_excessive_bools)]
@@ -66,18 +71,18 @@ pub struct Command {
     multipart_checker: Option<MultipartChecker>,
 }
 
-fn build_blob_store(config: &blob_store::BlobStorageConfig) -> Result<Arc<dyn BlobStore>, Error> {
-    let Ok(blob_store) = config.to_backend(None) else {
-        let msg = "Failed to initialize blob store".to_string();
-        return Err(Error::Initialization(msg));
-    };
-
-    Ok(blob_store)
+fn build_stores(config: &blob_store::BlobStorageConfig) -> Result<BlobStores, Error> {
+    match config.to_backend(None) {
+        Ok((blob_store, upload_store, _)) => Ok((blob_store, upload_store)),
+        Err(_) => Err(Error::Initialization(
+            "Failed to initialize blob store".to_string(),
+        )),
+    }
 }
 
 async fn build_metadata_store(config: &Configuration) -> Result<Arc<dyn MetadataStore>, Error> {
     match config.resolve_metadata_config().to_backend(None).await {
-        Ok(store) => Ok(store),
+        Ok((store, _)) => Ok(store),
         Err(err) => {
             let msg = format!("Failed to initialize metadata store: {err}");
             Err(Error::Initialization(msg))
@@ -122,34 +127,27 @@ fn build_repositories(
     Ok(Arc::new(repositories))
 }
 
-fn build_global_retention_policy(
-    config: &RetentionPolicyConfig,
-) -> Result<Option<Arc<RetentionPolicy>>, Error> {
+fn build_global_retention_policy(config: &RetentionPolicyConfig) -> Option<Arc<RetentionPolicy>> {
     if config.rules.is_empty() {
-        return Ok(None);
+        return None;
     }
 
-    match RetentionPolicy::new(config) {
-        Ok(policy) => Ok(Some(Arc::new(policy))),
-        Err(err) => {
-            let msg = format!("Failed to initialize global retention policy: {err}");
-            Err(Error::Initialization(msg))
-        }
-    }
+    Some(Arc::new(RetentionPolicy::new(config)))
 }
 
 fn build_namespace_checkers(
     options: &Options,
     config: &Configuration,
     blob_store: &Arc<dyn BlobStore>,
+    upload_store: &Arc<dyn UploadStore>,
     metadata_store: &Arc<dyn MetadataStore>,
     repositories: &Arc<HashMap<String, Repository>>,
-) -> Result<Vec<Box<dyn NamespaceChecker>>, Error> {
+) -> Vec<Box<dyn NamespaceChecker>> {
     let mut checkers: Vec<Box<dyn NamespaceChecker>> = Vec::new();
 
     if options.retention {
         let global_retention_policy =
-            build_global_retention_policy(&config.global.retention_policy)?;
+            build_global_retention_policy(&config.global.retention_policy);
         checkers.push(Box::new(RetentionChecker::new(
             blob_store.clone(),
             metadata_store.clone(),
@@ -167,7 +165,7 @@ fn build_namespace_checkers(
             upload_timeout.num_seconds()
         );
         checkers.push(Box::new(UploadChecker::new(
-            blob_store.clone(),
+            upload_store.clone(),
             upload_timeout,
             options.dry_run,
         )));
@@ -204,7 +202,7 @@ fn build_namespace_checkers(
         )));
     }
 
-    Ok(checkers)
+    checkers
 }
 
 fn build_blob_checker(
@@ -237,13 +235,19 @@ fn build_multipart_checker(
 
 impl Command {
     pub async fn new(options: &Options, config: &Configuration) -> Result<Self, Error> {
-        let blob_store = build_blob_store(&config.blob_store)?;
+        let (blob_store, upload_store) = build_stores(&config.blob_store)?;
         let metadata_store = build_metadata_store(config).await?;
         let auth_cache = build_auth_cache(&config.cache)?;
         let repositories = build_repositories(&config.repository, &auth_cache)?;
 
-        let namespace_checkers =
-            build_namespace_checkers(options, config, &blob_store, &metadata_store, &repositories)?;
+        let namespace_checkers = build_namespace_checkers(
+            options,
+            config,
+            &blob_store,
+            &upload_store,
+            &metadata_store,
+            &repositories,
+        );
         let blob_checker = build_blob_checker(options, &blob_store, &metadata_store);
         let multipart_checker = build_multipart_checker(options, &config.blob_store);
 
@@ -306,35 +310,38 @@ impl Command {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::policy::CelRule;
+
+    fn rule(s: &str) -> CelRule {
+        CelRule::compile(s).unwrap()
+    }
 
     #[test]
     fn test_build_global_retention_policy_empty() {
         let config = RetentionPolicyConfig { rules: vec![] };
         let result = build_global_retention_policy(&config);
 
-        assert!(result.is_ok());
-        assert!(result.unwrap().is_none());
+        assert!(result.is_none());
     }
 
     #[test]
     fn test_build_global_retention_policy_with_rules() {
         let config = RetentionPolicyConfig {
-            rules: vec!["image.pushed_at > now() - days(30)".to_string()],
+            rules: vec![rule("image.pushed_at > now() - days(30)")],
         };
         let result = build_global_retention_policy(&config);
 
-        assert!(result.is_ok());
-        assert!(result.unwrap().is_some());
+        assert!(result.is_some());
     }
 
     #[test]
-    fn test_build_global_retention_policy_invalid_rule() {
-        let config = RetentionPolicyConfig {
-            rules: vec!["invalid cel expression!!!".to_string()],
-        };
-        let result = build_global_retention_policy(&config);
-
-        assert!(result.is_err());
+    fn invalid_retention_rule_fails_at_deserialize() {
+        let toml = r#"rules = ["invalid cel expression!!!"]"#;
+        let result: Result<RetentionPolicyConfig, _> = toml::from_str(toml);
+        assert!(
+            result.is_err(),
+            "invalid CEL rule must fail at deserialization"
+        );
     }
 
     #[tokio::test]

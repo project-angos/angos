@@ -6,23 +6,23 @@ use tracing::{debug, error, info};
 
 use crate::{
     command::scrub::check::NamespaceChecker,
-    registry::{Error, blob_store::BlobStore, pagination::for_each_page},
+    registry::{Error, blob_store::UploadStore, pagination::for_each_page},
 };
 
 pub struct UploadChecker {
-    blob_store: Arc<dyn BlobStore + Send + Sync>,
+    upload_store: Arc<dyn UploadStore>,
     upload_timeout: Duration,
     dry_run: bool,
 }
 
 impl UploadChecker {
     pub fn new(
-        blob_store: Arc<dyn BlobStore + Send + Sync>,
+        upload_store: Arc<dyn UploadStore>,
         upload_timeout: Duration,
         dry_run: bool,
     ) -> Self {
         Self {
-            blob_store,
+            upload_store,
             upload_timeout,
             dry_run,
         }
@@ -30,14 +30,13 @@ impl UploadChecker {
 
     async fn check_upload(&self, namespace: &str, uuid: &str) -> Result<(), Error> {
         debug!("Checking upload '{namespace}/{uuid}'");
-        let Ok((_, _, start_date)) = self.blob_store.read_upload_summary(namespace, uuid).await
-        else {
+        let Ok(summary) = self.upload_store.summary(namespace, uuid).await else {
             debug!("Inconsistent upload state '{namespace}/{uuid}', deleting it");
             self.delete_upload(namespace, uuid).await?;
             return Ok(());
         };
 
-        if self.is_upload_obsolete(start_date) {
+        if self.is_upload_obsolete(summary.started_at) {
             self.delete_upload(namespace, uuid).await?;
         }
 
@@ -51,7 +50,7 @@ impl UploadChecker {
         }
 
         info!("Deleting expired upload from namespace '{namespace}/{uuid}'");
-        self.blob_store.delete_upload(namespace, uuid).await?;
+        self.upload_store.delete(namespace, uuid).await?;
         Ok(())
     }
 
@@ -78,8 +77,8 @@ impl NamespaceChecker for UploadChecker {
 
         for_each_page(
             |marker| async move {
-                self.blob_store
-                    .list_uploads(namespace, 100, marker)
+                self.upload_store
+                    .list(namespace, 100, marker)
                     .await
                     .map_err(Error::from)
             },
@@ -98,21 +97,16 @@ mod tests {
     async fn test_scrub_uploads_removes_obsolete() {
         for test_case in backends() {
             let namespace = "test-repo/app";
-            let blob_store = test_case.blob_store();
+            let upload_store = test_case.upload_store();
 
             let upload_uuid = uuid::Uuid::new_v4().to_string();
-            blob_store
-                .create_upload(namespace, &upload_uuid)
-                .await
-                .unwrap();
+            upload_store.create(namespace, &upload_uuid).await.unwrap();
 
-            let scrubber = UploadChecker::new(blob_store.clone(), Duration::zero(), false);
+            let scrubber = UploadChecker::new(upload_store.clone(), Duration::zero(), false);
 
             scrubber.check_namespace(namespace).await.unwrap();
 
-            let result = blob_store
-                .read_upload_summary(namespace, &upload_uuid)
-                .await;
+            let result = upload_store.summary(namespace, &upload_uuid).await;
             assert!(result.is_err(), "Obsolete upload should be deleted");
         }
     }
@@ -121,21 +115,16 @@ mod tests {
     async fn test_scrub_uploads_keeps_recent() {
         for test_case in backends() {
             let namespace = "test-repo/app";
-            let blob_store = test_case.blob_store();
+            let upload_store = test_case.upload_store();
 
             let upload_uuid = uuid::Uuid::new_v4().to_string();
-            blob_store
-                .create_upload(namespace, &upload_uuid)
-                .await
-                .unwrap();
+            upload_store.create(namespace, &upload_uuid).await.unwrap();
 
-            let scrubber = UploadChecker::new(blob_store.clone(), Duration::days(1), false);
+            let scrubber = UploadChecker::new(upload_store.clone(), Duration::days(1), false);
 
             scrubber.check_namespace(namespace).await.unwrap();
 
-            let result = blob_store
-                .read_upload_summary(namespace, &upload_uuid)
-                .await;
+            let result = upload_store.summary(namespace, &upload_uuid).await;
             assert!(result.is_ok(), "Recent upload should be kept");
         }
     }
@@ -144,21 +133,16 @@ mod tests {
     async fn test_scrub_uploads_dry_run() {
         for test_case in backends() {
             let namespace = "test-repo/app";
-            let blob_store = test_case.blob_store();
+            let upload_store = test_case.upload_store();
 
             let upload_uuid = uuid::Uuid::new_v4().to_string();
-            blob_store
-                .create_upload(namespace, &upload_uuid)
-                .await
-                .unwrap();
+            upload_store.create(namespace, &upload_uuid).await.unwrap();
 
-            let scrubber = UploadChecker::new(blob_store.clone(), Duration::zero(), true);
+            let scrubber = UploadChecker::new(upload_store.clone(), Duration::zero(), true);
 
             scrubber.check_namespace(namespace).await.unwrap();
 
-            let result = blob_store
-                .read_upload_summary(namespace, &upload_uuid)
-                .await;
+            let result = upload_store.summary(namespace, &upload_uuid).await;
             assert!(result.is_ok(), "Dry run should not delete obsolete upload");
         }
     }

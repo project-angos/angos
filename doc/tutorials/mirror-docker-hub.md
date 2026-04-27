@@ -34,7 +34,7 @@ port = 8000
 root_dir = "./registry-data"
 
 [global.access_policy]
-default_allow = true
+default = "allow"
 
 [[repository."docker-io".upstream]]
 url = "https://registry-1.docker.io"
@@ -135,7 +135,7 @@ secret_key = "YOUR_SECRET_KEY"
 # For S3-compatible providers (MinIO, Exoscale SOS, etc.), set endpoint accordingly
 
 [global.access_policy]
-default_allow = true
+default = "allow"
 
 # Docker Hub official images
 [repository."docker-io"]

@@ -139,7 +139,7 @@ Use certificate attributes in access policies:
 
 ```toml
 [global.access_policy]
-default_allow = false
+default = "deny"
 rules = [
   # Allow clients with specific organization
   "identity.certificate.organizations.contains('Infrastructure')",
@@ -184,7 +184,7 @@ All clients must present a valid certificate:
 
 ```toml
 [global.access_policy]
-default_allow = false
+default = "deny"
 rules = [
   "size(identity.certificate.common_names) > 0"
 ]
@@ -196,7 +196,7 @@ Certificate enhances access but isn't required:
 
 ```toml
 [global.access_policy]
-default_allow = false
+default = "deny"
 rules = [
   # Certificate grants full access
   "identity.certificate.organizations.contains('DevOps')",
@@ -211,14 +211,14 @@ rules = [
 ```toml
 # Developers can push to dev repo
 [repository."dev".access_policy]
-default_allow = false
+default = "deny"
 rules = [
   "identity.certificate.organizations.contains('Developers')"
 ]
 
 # Only platform team can push to production
 [repository."prod".access_policy]
-default_allow = false
+default = "deny"
 rules = [
   "identity.certificate.organizations.contains('Platform')"
 ]

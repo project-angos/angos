@@ -126,7 +126,7 @@ fn test_auth_section() {
 
     [auth.identity.user1]
     username = "bob"
-    password = "password456"
+    password = "$argon2id$v=19$m=19456,t=2,p=1$9pxWwg0VtZzDXno/25417Q$e+cuKy9VisJVxec/EEuKvvfIIIOy5yDGRzYKiuDLjx0"
 
     [auth.oidc.generic]
     provider = "generic"
@@ -180,11 +180,21 @@ fn test_global_config_custom_values() {
     assert!(config.global.update_pull_time);
     assert!(config.global.immutable_tags);
     assert_eq!(config.global.immutable_tags_exclusions.len(), 2);
-    assert_eq!(config.global.immutable_tags_exclusions[0], "latest");
-    assert_eq!(config.global.immutable_tags_exclusions[1], "dev");
     assert_eq!(
-        config.global.authorization_webhook,
-        Some("my-webhook".to_string())
+        config.global.immutable_tags_exclusions[0].as_source(),
+        "latest"
+    );
+    assert_eq!(
+        config.global.immutable_tags_exclusions[1].as_source(),
+        "dev"
+    );
+    assert!(
+        config.global.authorization_webhook.is_some(),
+        "global authorization_webhook should be resolved"
+    );
+    assert_eq!(
+        config.global.authorization_webhook.as_ref().unwrap().name,
+        "my-webhook"
     );
 }
 
@@ -334,7 +344,7 @@ fn test_observability_config() {
     assert!(observability.tracing.is_some());
     let tracing = observability.tracing.unwrap();
     assert_eq!(tracing.endpoint, "http://jaeger:4317");
-    assert!((tracing.sampling_rate - 0.1).abs() < f64::EPSILON);
+    assert!((f64::from(tracing.sampling_rate) - 0.1).abs() < f64::EPSILON);
 }
 
 #[test]
@@ -401,8 +411,8 @@ fn test_invalid_toml_format() {
     let result = Configuration::load_from_str(config);
     assert!(result.is_err());
     match result {
-        Err(Error::NotReadable(_)) => {}
-        _ => panic!("Expected NotReadable error"),
+        Err(Error::InvalidFormat(_)) => {}
+        _ => panic!("Expected InvalidFormat error"),
     }
 }
 
@@ -510,13 +520,11 @@ fn test_validate_invalid_webhook_config() {
     "#;
 
     let result = Configuration::load_from_str(config);
-    assert!(result.is_err());
-    match result {
-        Err(Error::InvalidFormat(msg)) => {
-            assert!(msg.contains("Invalid webhook 'bad-webhook'"));
-        }
-        _ => panic!("Expected InvalidFormat error"),
-    }
+    let err = result.expect_err("malformed webhook URL must fail to load");
+    assert!(
+        err.to_string().contains("url"),
+        "error should mention the offending url field: {err}"
+    );
 }
 
 #[test]
@@ -701,7 +709,7 @@ fn test_access_policy_in_global_config() {
     bind_address = "0.0.0.0"
 
     [global.access_policy]
-    mode = "deny"
+    default = "deny"
     rules = ["allow(true)"]
     "#;
 
@@ -879,8 +887,8 @@ fn test_load_from_file_with_invalid_content() {
     assert!(result.is_err());
 
     match result {
-        Err(Error::NotReadable(_)) => {}
-        _ => panic!("Expected NotReadable error"),
+        Err(Error::InvalidFormat(_)) => {}
+        _ => panic!("Expected InvalidFormat error"),
     }
 }
 
@@ -991,92 +999,6 @@ fn test_event_webhook_backward_compatible() {
 }
 
 #[test]
-fn test_global_event_webhooks_references() {
-    let config = r#"
-    [server]
-    bind_address = "0.0.0.0"
-
-    [global]
-    event_webhooks = ["notify"]
-
-    [event_webhook.notify]
-    url = "https://example.com/events"
-    policy = "optional"
-    events = ["manifest.push"]
-    "#;
-
-    let config = Configuration::load_from_str(config).unwrap();
-    assert_eq!(config.global.event_webhooks.len(), 1);
-    assert_eq!(config.global.event_webhooks[0], "notify");
-}
-
-#[test]
-fn test_repository_event_webhooks_references() {
-    let config = r#"
-    [server]
-    bind_address = "0.0.0.0"
-
-    [event_webhook.notify]
-    url = "https://example.com/events"
-    policy = "required"
-    events = ["manifest.push"]
-
-    [repository.myapp]
-    event_webhooks = ["notify"]
-    "#;
-
-    let config = Configuration::load_from_str(config).unwrap();
-    assert_eq!(config.repository["myapp"].event_webhooks.len(), 1);
-    assert_eq!(config.repository["myapp"].event_webhooks[0], "notify");
-}
-
-#[test]
-fn test_event_webhook_nonexistent_global_reference_fails() {
-    let config = r#"
-    [server]
-    bind_address = "0.0.0.0"
-
-    [global]
-    event_webhooks = ["nonexistent"]
-    "#;
-
-    let result = Configuration::load_from_str(config);
-    assert!(result.is_err());
-    match result {
-        Err(Error::InvalidFormat(msg)) => {
-            assert!(msg.contains("nonexistent"));
-        }
-        _ => panic!("Expected InvalidFormat error"),
-    }
-}
-
-#[test]
-fn test_event_webhook_nonexistent_repository_reference_fails() {
-    let config = r#"
-    [server]
-    bind_address = "0.0.0.0"
-
-    [event_webhook.notify]
-    url = "https://example.com/events"
-    policy = "optional"
-    events = ["manifest.push"]
-
-    [repository.myapp]
-    event_webhooks = ["missing-hook"]
-    "#;
-
-    let result = Configuration::load_from_str(config);
-    assert!(result.is_err());
-    match result {
-        Err(Error::InvalidFormat(msg)) => {
-            assert!(msg.contains("missing-hook"));
-            assert!(msg.contains("myapp"));
-        }
-        _ => panic!("Expected InvalidFormat error"),
-    }
-}
-
-#[test]
 fn test_event_webhook_invalid_config_fails_validation() {
     let config = r#"
     [server]
@@ -1089,13 +1011,11 @@ fn test_event_webhook_invalid_config_fails_validation() {
     "#;
 
     let result = Configuration::load_from_str(config);
-    assert!(result.is_err());
-    match result {
-        Err(Error::InvalidFormat(msg)) => {
-            assert!(msg.contains("bad"));
-        }
-        _ => panic!("Expected InvalidFormat error"),
-    }
+    let err = result.expect_err("malformed event webhook URL must fail to load");
+    assert!(
+        err.to_string().contains("url"),
+        "error should mention the offending url field: {err}"
+    );
 }
 
 #[test]
@@ -1337,4 +1257,89 @@ fn test_redirect_resolver_nothing_set_defaults_true() {
     let config = GlobalConfig::default();
     assert!(config.resolved_enable_blob_redirect());
     assert!(config.resolved_enable_manifest_redirect());
+}
+
+#[test]
+fn event_webhook_valid_global_reference_loads() {
+    let config = r#"
+    [server]
+    bind_address = "0.0.0.0"
+
+    [global]
+    event_webhooks = ["my-hook"]
+
+    [event_webhook.my-hook]
+    url = "https://example.com/hook"
+    policy = "optional"
+    events = ["manifest.push"]
+    "#;
+
+    let config = Configuration::load_from_str(config).unwrap();
+    assert!(config.event_webhook.contains_key("my-hook"));
+}
+
+#[test]
+fn event_webhook_valid_repo_reference_loads() {
+    let config = r#"
+    [server]
+    bind_address = "0.0.0.0"
+
+    [event_webhook.repo-hook]
+    url = "https://example.com/hook"
+    policy = "optional"
+    events = ["manifest.push"]
+
+    [repository.myrepo]
+    event_webhooks = ["repo-hook"]
+    "#;
+
+    let config = Configuration::load_from_str(config).unwrap();
+    assert!(config.repository.contains_key("myrepo"));
+    assert!(config.event_webhook.contains_key("repo-hook"));
+}
+
+#[test]
+fn event_webhook_bad_global_reference_fails_load() {
+    let config = r#"
+    [server]
+    bind_address = "0.0.0.0"
+
+    [global]
+    event_webhooks = ["nonexistent-hook"]
+    "#;
+
+    let result = Configuration::load_from_str(config);
+    assert!(result.is_err());
+    let msg = result.unwrap_err().to_string();
+    assert!(
+        msg.contains("nonexistent-hook"),
+        "Error must name the unresolved webhook: {msg}"
+    );
+    assert!(
+        msg.contains("globally") || msg.contains("global"),
+        "Error must identify global as the source: {msg}"
+    );
+}
+
+#[test]
+fn event_webhook_bad_repo_reference_fails_load() {
+    let config = r#"
+    [server]
+    bind_address = "0.0.0.0"
+
+    [repository.prod]
+    event_webhooks = ["ghost-hook"]
+    "#;
+
+    let result = Configuration::load_from_str(config);
+    assert!(result.is_err());
+    let msg = result.unwrap_err().to_string();
+    assert!(
+        msg.contains("ghost-hook"),
+        "Error must name the unresolved webhook: {msg}"
+    );
+    assert!(
+        msg.contains("prod"),
+        "Error must identify the repository as the source: {msg}"
+    );
 }

@@ -202,7 +202,7 @@ For multiple registry instances, you need:
 
 ### With S3 Locking (Simplest)
 
-Uses S3 conditional writes (`If-None-Match: *`) for locking — no extra infrastructure required. The S3 provider must support conditional writes; Angos verifies this at startup.
+Selecting `lock_strategy = "s3"` activates the CAS coordinator, which uses S3 conditional writes for all coordination, no extra infrastructure being required. The provider must support `put_if_none_match` and `put_if_match`; angos probes at startup and fails fast if either is missing. `delete_if_match` is optional and, when available, makes the coordinator's internal lock release race-free.
 
 ```toml
 [blob_store.s3]
@@ -214,7 +214,7 @@ bucket = "registry-data"
 # ... S3 config
 ```
 
-To customize lock behavior:
+The `lock_strategy.s3` block lets you tune internal lock timing parameters but is not required to enable CAS coordination — it activates automatically when the provider supports it:
 
 ```toml
 [metadata_store.s3.lock_strategy.s3]
@@ -224,6 +224,8 @@ retry_delay_ms = 50    # Delay between retries (default: 50)
 ```
 
 ### With S3 + Redis
+
+Selecting `lock_strategy = "redis"` activates the lock coordinator with Redis as the distributed lock backend. The S3 provider's conditional capabilities are not consulted in this mode — Redis handles all serialization regardless of what the provider supports.
 
 ```toml
 [blob_store.s3]
@@ -487,6 +489,8 @@ rules = ["manifest.last_pulled_at < now() - days(30)"]
 ```
 
 When using S3 locking, **never set `access_time_debounce_secs = 0`** in production. This disables buffering and causes every manifest pull to acquire and release a lock, which is expensive. Use the default 60 seconds or higher.
+
+**Note on `lock_strategy = "redis"`:** With Redis as the lock strategy, access-time flushes always go through Redis locking, even when the S3 provider supports conditional writes (`put_if_match`). On AWS S3, MinIO, or Exoscale SOS, `lock_strategy = "s3"` (the CAS coordinator) is more efficient: each access-time flush is a single conditional S3 PUT instead of a Redis round-trip plus two S3 calls. `lock_strategy = "redis"` remains the right choice when running multi-replica on a provider that lacks conditional writes, or when Redis is already deployed for other reasons.
 
 #### Blob Index Sharding
 

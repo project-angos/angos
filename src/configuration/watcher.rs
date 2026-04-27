@@ -3,17 +3,20 @@ use std::{
     fs,
     path::{Path, PathBuf},
     sync::Arc,
+    time::Duration,
 };
 
 use async_trait::async_trait;
 use notify::{Event, EventKind, RecursiveMode, Watcher};
-use tokio::sync::mpsc;
-use tracing::{error, info, warn};
+use tokio::{sync::mpsc, time::timeout};
+use tracing::{debug, error, info, warn};
 
 use super::{Configuration, Error, ServerConfig};
 use crate::configuration::listeners::tls::ServerTlsConfig;
 
-#[derive(Debug, PartialEq)]
+const DEBOUNCE: Duration = Duration::from_millis(100);
+
+#[derive(Debug, Clone, Copy, PartialEq)]
 enum ChangeKind {
     Config,
     Tls,
@@ -55,6 +58,44 @@ fn classify_event(
     ChangeKind::Irrelevant
 }
 
+/// Combines two `ChangeKind` values, preferring the stronger action.
+/// `Config` dominates `Tls`; a config edit covers TLS-path changes too.
+fn merge_change_kind(a: ChangeKind, b: ChangeKind) -> ChangeKind {
+    match (a, b) {
+        (ChangeKind::Config, _) | (_, ChangeKind::Config) => ChangeKind::Config,
+        (ChangeKind::Tls, _) | (_, ChangeKind::Tls) => ChangeKind::Tls,
+        _ => ChangeKind::Irrelevant,
+    }
+}
+
+/// After the first relevant event, drains the channel until no event arrives
+/// for `DEBOUNCE`. Returns the coalesced `ChangeKind` across the burst.
+/// Returns `None` if the channel closes during the debounce window.
+async fn coalesce_events(
+    rx: &mut mpsc::Receiver<Event>,
+    initial: ChangeKind,
+    canonical_config_path: &Path,
+    canonical_config_dir: &Path,
+    canonical_tls_dirs: &HashSet<PathBuf>,
+) -> Option<ChangeKind> {
+    let mut accumulated = initial;
+    loop {
+        match timeout(DEBOUNCE, rx.recv()).await {
+            Ok(Some(event)) => {
+                let kind = classify_event(
+                    &event,
+                    canonical_config_path,
+                    canonical_config_dir,
+                    canonical_tls_dirs,
+                );
+                accumulated = merge_change_kind(accumulated, kind);
+            }
+            Ok(None) => return None,
+            Err(_elapsed) => return Some(accumulated),
+        }
+    }
+}
+
 #[async_trait]
 pub trait ConfigNotifier: Send + Sync {
     async fn notify_config_change(&self, config: &Configuration);
@@ -85,7 +126,7 @@ impl ConfigWatcher {
     }
 }
 
-fn get_tls_dirs(config: &Configuration, config_dir: &Path) -> HashSet<PathBuf> {
+fn compute_tls_dirs(config: &Configuration, config_dir: &Path) -> HashSet<PathBuf> {
     let ServerConfig::Tls(tls_config) = &config.server else {
         return HashSet::new();
     };
@@ -108,6 +149,55 @@ fn get_tls_dirs(config: &Configuration, config_dir: &Path) -> HashSet<PathBuf> {
     .collect()
 }
 
+/// Resolves the active `Configuration`, loading from disk when the cache is
+/// empty.  Returns `None` and logs a warning if the disk load fails.
+fn resolve_config<'a>(
+    cached: &'a mut Option<Configuration>,
+    config_path: &Path,
+) -> Option<&'a Configuration> {
+    if cached.is_none() {
+        match Configuration::load(config_path) {
+            Ok(cfg) => {
+                *cached = Some(cfg);
+            }
+            Err(e) => {
+                warn!(
+                    "TLS file change detected but configuration could not be \
+                     loaded from disk; TLS reload skipped: {e}"
+                );
+                return None;
+            }
+        }
+    }
+    cached.as_ref()
+}
+
+/// Handles a `ChangeKind::Tls` event: ensures a usable `Configuration` is
+/// available (loading from disk when the cache is empty), then notifies the
+/// subscriber if the server is configured for TLS.
+fn handle_tls_event(
+    cached_config: &mut Option<Configuration>,
+    config_path: &Path,
+    notifier: &dyn ConfigNotifier,
+) {
+    info!("TLS certificate change detected, reloading");
+    let Some(cfg) = resolve_config(cached_config, config_path) else {
+        return;
+    };
+    match cfg {
+        Configuration {
+            server: ServerConfig::Tls(tls_config),
+            ..
+        } => {
+            notifier.notify_tls_config_change(&tls_config.tls);
+            info!("TLS configuration reloaded");
+        }
+        _ => {
+            debug!("TLS file change detected but server is not configured for TLS; ignoring");
+        }
+    }
+}
+
 async fn watch_config_loop(
     config_path: PathBuf,
     notifier: Arc<dyn ConfigNotifier>,
@@ -121,14 +211,19 @@ async fn watch_config_loop(
         fs::canonicalize(&config_path).unwrap_or_else(|_| config_path.clone());
     let canonical_config_dir = fs::canonicalize(&config_dir).unwrap_or_else(|_| config_dir.clone());
 
+    let mut cached_config: Option<Configuration> = match Configuration::load(&config_path) {
+        Ok(cfg) => Some(cfg),
+        Err(e) => {
+            warn!("Failed to load configuration, watching for changes: {e}");
+            None
+        }
+    };
+
     loop {
-        let tls_dirs = match Configuration::load(&config_path) {
-            Ok(config) => get_tls_dirs(&config, &config_dir),
-            Err(e) => {
-                warn!("Failed to load configuration, watching for changes: {e}");
-                HashSet::new()
-            }
-        };
+        let tls_dirs = cached_config
+            .as_ref()
+            .map(|cfg| compute_tls_dirs(cfg, &config_dir))
+            .unwrap_or_default();
         let canonical_tls_dirs: HashSet<PathBuf> = tls_dirs
             .iter()
             .map(|d| fs::canonicalize(d).unwrap_or_else(|_| d.clone()))
@@ -158,42 +253,50 @@ async fn watch_config_loop(
                 return Ok(());
             };
 
-            match classify_event(
+            let initial_kind = classify_event(
                 &event,
                 &canonical_config_path,
                 &canonical_config_dir,
                 &canonical_tls_dirs,
-            ) {
-                ChangeKind::Irrelevant => continue,
+            );
+            if matches!(initial_kind, ChangeKind::Irrelevant) {
+                continue;
+            }
+
+            let Some(kind) = coalesce_events(
+                &mut rx,
+                initial_kind,
+                &canonical_config_path,
+                &canonical_config_dir,
+                &canonical_tls_dirs,
+            )
+            .await
+            else {
+                error!("Config watcher channel closed");
+                return Ok(());
+            };
+
+            match kind {
+                ChangeKind::Irrelevant => {}
                 ChangeKind::Config => {
-                    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
                     info!("Configuration change detected, reloading");
                     match Configuration::load(&config_path) {
-                        Ok(ref cfg) => {
-                            notifier.notify_config_change(cfg).await;
+                        Ok(cfg) => {
+                            notifier.notify_config_change(&cfg).await;
                             info!("Configuration reloaded");
+                            let new_tls_dirs = compute_tls_dirs(&cfg, &config_dir);
+                            cached_config = Some(cfg);
+                            if new_tls_dirs != tls_dirs {
+                                break;
+                            }
                         }
                         Err(e) => warn!("Failed to reload configuration: {e}"),
                     }
                 }
                 ChangeKind::Tls => {
-                    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-                    info!("TLS certificate change detected, reloading");
-                    match Configuration::load(&config_path) {
-                        Ok(Configuration {
-                            server: ServerConfig::Tls(tls_config),
-                            ..
-                        }) => {
-                            notifier.notify_tls_config_change(&tls_config.tls);
-                            info!("TLS configuration reloaded");
-                        }
-                        Ok(_) => {}
-                        Err(e) => warn!("Failed to load configuration for TLS reload: {e}"),
-                    }
+                    handle_tls_event(&mut cached_config, &config_path, notifier.as_ref());
                 }
             }
-
-            break;
         }
     }
 }
@@ -598,5 +701,266 @@ bind_address = "10.0.0.1"
             detected,
             "Watcher should recover and detect valid config after invalid config"
         );
+    }
+
+    #[test]
+    fn merge_change_kind_config_dominates_tls() {
+        assert_eq!(
+            merge_change_kind(ChangeKind::Config, ChangeKind::Tls),
+            ChangeKind::Config,
+        );
+        assert_eq!(
+            merge_change_kind(ChangeKind::Tls, ChangeKind::Config),
+            ChangeKind::Config,
+        );
+    }
+
+    #[test]
+    fn merge_change_kind_tls_dominates_irrelevant() {
+        assert_eq!(
+            merge_change_kind(ChangeKind::Tls, ChangeKind::Irrelevant),
+            ChangeKind::Tls,
+        );
+        assert_eq!(
+            merge_change_kind(ChangeKind::Irrelevant, ChangeKind::Tls),
+            ChangeKind::Tls,
+        );
+    }
+
+    #[test]
+    fn merge_change_kind_both_irrelevant_stays_irrelevant() {
+        assert_eq!(
+            merge_change_kind(ChangeKind::Irrelevant, ChangeKind::Irrelevant),
+            ChangeKind::Irrelevant,
+        );
+    }
+
+    /// Verifies that a burst of N events coalesces into a single `ChangeKind`
+    /// result rather than producing N separate results. The coalescer must
+    /// drain all events and then return after the quiet-period timeout, not
+    /// once per event received.
+    #[tokio::test]
+    async fn coalesce_events_collapses_burst_into_single_result() {
+        let config_path = PathBuf::from("/etc/app/config.toml");
+        let config_dir = PathBuf::from("/etc/app");
+        let tls_dirs: HashSet<PathBuf> = HashSet::new();
+
+        let (tx, mut rx) = mpsc::channel(100);
+
+        // Send a burst of 10 events that classify as Config — all sent before
+        // the coalescer has a chance to time out, simulating e.g. an editor
+        // write → truncate → write sequence.
+        for _ in 0..10 {
+            let event = make_event(
+                EventKind::Modify(notify::event::ModifyKind::Data(
+                    notify::event::DataChange::Content,
+                )),
+                vec![config_path.clone()],
+            );
+            tx.send(event).await.unwrap();
+        }
+        // Keep `tx` alive so the coalescer terminates via the quiet-period
+        // timeout (Err(_elapsed)) path, not via channel close (Ok(None)).
+
+        let result = coalesce_events(
+            &mut rx,
+            ChangeKind::Config,
+            &config_path,
+            &config_dir,
+            &tls_dirs,
+        )
+        .await;
+
+        // All 10 events must have been folded into exactly one Config result.
+        assert_eq!(result, Some(ChangeKind::Config));
+    }
+
+    /// Verifies that a mixed burst (Tls events followed by a Config event)
+    /// coalesces to Config, since Config dominates Tls.
+    #[tokio::test]
+    async fn coalesce_events_config_dominates_tls_in_mixed_burst() {
+        let config_path = PathBuf::from("/etc/app/config.toml");
+        let config_dir = PathBuf::from("/etc/app");
+        let tls_dir = PathBuf::from("/etc/app/tls");
+        let tls_dirs: HashSet<PathBuf> = [tls_dir.clone()].into_iter().collect();
+
+        let (tx, mut rx) = mpsc::channel(100);
+
+        // Send TLS events first, then a Config event.
+        for _ in 0..5 {
+            let tls_event = make_event(
+                EventKind::Modify(notify::event::ModifyKind::Data(
+                    notify::event::DataChange::Content,
+                )),
+                vec![tls_dir.join("server.pem")],
+            );
+            tx.send(tls_event).await.unwrap();
+        }
+        let config_event = make_event(
+            EventKind::Modify(notify::event::ModifyKind::Data(
+                notify::event::DataChange::Content,
+            )),
+            vec![config_path.clone()],
+        );
+        tx.send(config_event).await.unwrap();
+        // Keep `tx` alive so the coalescer exits via quiet-period timeout.
+
+        let result = coalesce_events(
+            &mut rx,
+            ChangeKind::Tls,
+            &config_path,
+            &config_dir,
+            &tls_dirs,
+        )
+        .await;
+
+        assert_eq!(result, Some(ChangeKind::Config));
+    }
+
+    /// Verifies that channel closure during debounce returns None.
+    #[tokio::test]
+    async fn coalesce_events_returns_none_on_channel_close() {
+        let config_path = PathBuf::from("/etc/app/config.toml");
+        let config_dir = PathBuf::from("/etc/app");
+        let tls_dirs: HashSet<PathBuf> = HashSet::new();
+
+        let (tx, mut rx) = mpsc::channel(1);
+        // Close immediately without sending anything.
+        drop(tx);
+
+        let result = coalesce_events(
+            &mut rx,
+            ChangeKind::Config,
+            &config_path,
+            &config_dir,
+            &tls_dirs,
+        )
+        .await;
+
+        assert_eq!(result, None);
+    }
+
+    // --- Direct unit tests for the cache-empty path ---
+    //
+    // These exercise the bug fix at the unit level: the integration path
+    // through `watch_config_loop` does not normally exhibit the empty-cache
+    // race in tests (a config-repair write fires `ChangeKind::Config` first,
+    // populating the cache before any TLS event), so it cannot reliably cover
+    // the `cached.is_none()` branch in `resolve_config` / `handle_tls_event`.
+    // Calling those helpers directly does.
+
+    #[test]
+    fn resolve_config_loads_from_disk_when_cache_is_empty() {
+        let temp_dir = TempDir::new().unwrap();
+        let tls_dir = temp_dir.path().join("tls");
+        fs::create_dir_all(&tls_dir).unwrap();
+        let cert_path = tls_dir.join("server.pem");
+        let key_path = tls_dir.join("server.key");
+        fs::write(&cert_path, "cert").unwrap();
+        fs::write(&key_path, "key").unwrap();
+
+        let config_path = temp_dir.path().join("config.toml");
+        fs::write(
+            &config_path,
+            minimal_tls_config(cert_path.to_str().unwrap(), key_path.to_str().unwrap()),
+        )
+        .unwrap();
+
+        let mut cached: Option<Configuration> = None;
+        let resolved = resolve_config(&mut cached, &config_path);
+
+        assert!(resolved.is_some(), "must load from disk when cache empty");
+        assert!(
+            cached.is_some(),
+            "must populate cache after successful load"
+        );
+    }
+
+    #[test]
+    fn resolve_config_returns_none_when_cache_empty_and_disk_invalid() {
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("config.toml");
+        fs::write(&config_path, b"invalid toml [[[").unwrap();
+
+        let mut cached: Option<Configuration> = None;
+        let resolved = resolve_config(&mut cached, &config_path);
+
+        assert!(resolved.is_none());
+        assert!(cached.is_none(), "must not populate cache on load failure");
+    }
+
+    #[test]
+    fn resolve_config_returns_cached_without_reading_disk() {
+        let temp_dir = TempDir::new().unwrap();
+        // Cache is preloaded with a non-TLS config.
+        let cached_cfg: Configuration =
+            Configuration::load_from_str("[server]\nbind_address = \"127.0.0.1\"").unwrap();
+        let mut cached: Option<Configuration> = Some(cached_cfg);
+
+        // Point at a non-existent path; must not be touched.
+        let bogus_path = temp_dir.path().join("does-not-exist.toml");
+        let resolved = resolve_config(&mut cached, &bogus_path);
+
+        assert!(resolved.is_some(), "must reuse cached value");
+    }
+
+    #[tokio::test]
+    async fn handle_tls_event_loads_from_disk_when_cache_empty_and_notifies() {
+        let temp_dir = TempDir::new().unwrap();
+        let tls_dir = temp_dir.path().join("tls");
+        fs::create_dir_all(&tls_dir).unwrap();
+        let cert_path = tls_dir.join("server.pem");
+        let key_path = tls_dir.join("server.key");
+        fs::write(&cert_path, "cert").unwrap();
+        fs::write(&key_path, "key").unwrap();
+        let config_path = temp_dir.path().join("config.toml");
+        fs::write(
+            &config_path,
+            minimal_tls_config(cert_path.to_str().unwrap(), key_path.to_str().unwrap()),
+        )
+        .unwrap();
+
+        let notifier = TestNotifier::new();
+        let mut cached: Option<Configuration> = None;
+        handle_tls_event(&mut cached, &config_path, &notifier);
+
+        assert_eq!(
+            notifier.tls_change_count(),
+            1,
+            "must notify once when cache is empty but disk has a TLS config"
+        );
+        assert!(
+            cached.is_some(),
+            "cache must be populated after fallback load"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_tls_event_does_not_notify_when_cache_empty_and_disk_invalid() {
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("config.toml");
+        fs::write(&config_path, b"invalid toml [[[").unwrap();
+
+        let notifier = TestNotifier::new();
+        let mut cached: Option<Configuration> = None;
+        handle_tls_event(&mut cached, &config_path, &notifier);
+
+        assert_eq!(notifier.tls_change_count(), 0);
+        assert!(cached.is_none());
+    }
+
+    #[tokio::test]
+    async fn handle_tls_event_does_not_notify_when_server_is_not_tls() {
+        let temp_dir = TempDir::new().unwrap();
+        // Insecure server config — no TLS section.
+        let cached_cfg: Configuration =
+            Configuration::load_from_str("[server]\nbind_address = \"127.0.0.1\"").unwrap();
+
+        let notifier = TestNotifier::new();
+        let mut cached: Option<Configuration> = Some(cached_cfg);
+        let bogus_path = temp_dir.path().join("does-not-exist.toml");
+        handle_tls_event(&mut cached, &bogus_path, &notifier);
+
+        assert_eq!(notifier.tls_change_count(), 0);
     }
 }

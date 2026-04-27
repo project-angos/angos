@@ -6,6 +6,7 @@ use serde::Serialize;
 use tracing::instrument;
 
 use crate::{
+    configuration::RegexPattern,
     oci::{Digest, Manifest, Namespace, Platform as OciPlatform},
     registry::{
         Error, JsonResponse, Registry, metadata_store::link_kind::LinkKind,
@@ -46,7 +47,7 @@ struct NamespacesBody {
     pull_through_cache: bool,
     upstream_urls: Vec<String>,
     immutable_tags: bool,
-    immutable_tags_exclusions: Vec<String>,
+    immutable_tags_exclusions: Vec<RegexPattern>,
 }
 
 #[derive(Serialize, Debug, Clone)]
@@ -122,7 +123,7 @@ struct RepositoryConfig {
     pull_through_cache: bool,
     upstream_urls: Vec<String>,
     immutable_tags: bool,
-    immutable_tags_exclusions: Vec<String>,
+    immutable_tags_exclusions: Vec<RegexPattern>,
 }
 
 impl Registry {
@@ -214,8 +215,8 @@ impl Registry {
     #[instrument(skip(self))]
     pub async fn get_uploads_info(&self, namespace: &Namespace) -> Result<JsonResponse, Error> {
         let uuids = collect_all_pages(|token| async move {
-            self.blob_store
-                .list_uploads(namespace, 1000, token)
+            self.upload_store
+                .list(namespace, 1000, token)
                 .await
                 .map_err(Error::from)
         })
@@ -223,13 +224,11 @@ impl Registry {
 
         let mut all_uploads = Vec::new();
         for uuid in uuids {
-            if let Ok((_, size, started_at)) =
-                self.blob_store.read_upload_summary(namespace, &uuid).await
-            {
+            if let Ok(summary) = self.upload_store.summary(namespace, &uuid).await {
                 all_uploads.push(UploadEntry {
                     uuid,
-                    size,
-                    started_at,
+                    size: summary.size,
+                    started_at: summary.started_at,
                 });
             }
         }
@@ -280,7 +279,7 @@ impl Registry {
         let mut docker_referrers: HashMap<Digest, Vec<ReferrerInfo>> = HashMap::new();
 
         for digest in all_revisions {
-            let Ok(blob_data) = self.blob_store.read_blob(digest).await else {
+            let Ok(blob_data) = self.blob_store.read(digest).await else {
                 continue;
             };
             let Ok(manifest) = Manifest::from_slice(&blob_data) else {
@@ -294,8 +293,7 @@ impl Registry {
                 {
                     if let Ok(subject_digest) = subject_digest_str.parse::<Digest>() {
                         let mut annotations = child_descriptor.annotations.clone();
-                        if let Ok(child_blob) =
-                            self.blob_store.read_blob(&child_descriptor.digest).await
+                        if let Ok(child_blob) = self.blob_store.read(&child_descriptor.digest).await
                             && let Ok(child_manifest) = Manifest::from_slice(&child_blob)
                         {
                             for layer in &child_manifest.layers {
@@ -395,8 +393,8 @@ impl Registry {
 
     async fn count_uploads(&self, namespace: &Namespace) -> Result<usize, Error> {
         let uploads = collect_all_pages(|token| async move {
-            self.blob_store
-                .list_uploads(namespace, 1000, token)
+            self.upload_store
+                .list(namespace, 1000, token)
                 .await
                 .map_err(Error::from)
         })

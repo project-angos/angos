@@ -7,7 +7,7 @@ use tracing::{debug, info};
 use crate::{
     command::scrub::check::NamespaceChecker,
     oci::Digest,
-    policy::{ManifestImage, RetentionPolicy},
+    policy::{EpochSeconds, ManifestImage, RetentionPolicy},
     registry::{
         Error,
         blob_store::BlobStore,
@@ -180,16 +180,12 @@ impl RetentionChecker {
 
         let manifest = ManifestImage {
             tag: Some(tag.name.clone()),
-            pushed_at: tag
-                .metadata
-                .created_at
-                .map(|t| t.timestamp())
-                .unwrap_or_default(),
-            last_pulled_at: tag
-                .metadata
-                .accessed_at
-                .map(|t| t.timestamp())
-                .unwrap_or_default(),
+            pushed_at: EpochSeconds::from_seconds(
+                tag.metadata.created_at.map_or(0, |t| t.timestamp()),
+            ),
+            last_pulled_at: EpochSeconds::from_seconds(
+                tag.metadata.accessed_at.map_or(0, |t| t.timestamp()),
+            ),
         };
 
         self.evaluate_retention_policies(namespace, &tag.name, &manifest, last_pushed, last_pulled)
@@ -294,14 +290,10 @@ impl RetentionChecker {
 
         let manifest = ManifestImage {
             tag: None,
-            pushed_at: metadata
-                .created_at
-                .map(|t| t.timestamp())
-                .unwrap_or_default(),
-            last_pulled_at: metadata
-                .accessed_at
-                .map(|t| t.timestamp())
-                .unwrap_or_default(),
+            pushed_at: EpochSeconds::from_seconds(metadata.created_at.map_or(0, |t| t.timestamp())),
+            last_pulled_at: EpochSeconds::from_seconds(
+                metadata.accessed_at.map_or(0, |t| t.timestamp()),
+            ),
         };
 
         let label = format!("{namespace}@{digest}");
@@ -359,7 +351,7 @@ impl RetentionChecker {
 
         info!("Deleting orphan manifest '{namespace}@{digest}' (policy)");
 
-        let content = self.blob_store.read_blob(digest).await?;
+        let content = self.blob_store.read(digest).await?;
         let manifest = parse_manifest_digests(&content, None)?;
 
         let mut tx = self.metadata_store.begin_transaction(namespace);
@@ -391,7 +383,7 @@ impl RetentionChecker {
 mod tests {
     use super::*;
     use crate::{
-        policy::{RetentionPolicy, RetentionPolicyConfig},
+        policy::{CelRule, RetentionPolicy, RetentionPolicyConfig},
         registry::{test_utils, tests::backends},
     };
 
@@ -416,10 +408,10 @@ mod tests {
             tx.commit().await.unwrap();
 
             let retention_config = RetentionPolicyConfig {
-                rules: vec!["top_pushed(10)".to_string()],
+                rules: vec![CelRule::compile("top_pushed(10)").unwrap()],
             };
 
-            let retention_policy = Arc::new(RetentionPolicy::new(&retention_config).unwrap());
+            let retention_policy = Arc::new(RetentionPolicy::new(&retention_config));
 
             let repositories = test_utils::create_test_repositories();
             let scrubber = RetentionChecker::new(
@@ -488,19 +480,16 @@ mod tests {
             let blob_store = test_case.blob_store();
             let metadata_store = test_case.metadata_store();
 
-            let digest = blob_store.create_blob(TEST_MANIFEST).await.unwrap();
+            let digest = blob_store.create(TEST_MANIFEST).await.unwrap();
 
             let mut tx = metadata_store.begin_transaction(namespace);
             tx.create_link(&LinkKind::Digest(digest.clone()), &digest)
                 .add();
             tx.commit().await.unwrap();
 
-            let policy = Arc::new(
-                RetentionPolicy::new(&RetentionPolicyConfig {
-                    rules: vec!["image.tag != null".to_string()],
-                })
-                .unwrap(),
-            );
+            let policy = Arc::new(RetentionPolicy::new(&RetentionPolicyConfig {
+                rules: vec![CelRule::compile("image.tag != null").unwrap()],
+            }));
 
             RetentionChecker::new(
                 blob_store,
@@ -529,7 +518,7 @@ mod tests {
             let blob_store = test_case.blob_store();
             let metadata_store = test_case.metadata_store();
 
-            let digest = blob_store.create_blob(TEST_MANIFEST).await.unwrap();
+            let digest = blob_store.create(TEST_MANIFEST).await.unwrap();
 
             let mut tx = metadata_store.begin_transaction(namespace);
             tx.create_link(&LinkKind::Digest(digest.clone()), &digest)
@@ -563,8 +552,8 @@ mod tests {
             let blob_store = test_case.blob_store();
             let metadata_store = test_case.metadata_store();
 
-            let child_digest = blob_store.create_blob(TEST_MANIFEST).await.unwrap();
-            let index_digest = blob_store.create_blob(TEST_INDEX).await.unwrap();
+            let child_digest = blob_store.create(TEST_MANIFEST).await.unwrap();
+            let index_digest = blob_store.create(TEST_INDEX).await.unwrap();
 
             let mut tx = metadata_store.begin_transaction(namespace);
             tx.create_link(&LinkKind::Digest(child_digest.clone()), &child_digest)
@@ -580,12 +569,9 @@ mod tests {
             .add();
             tx.commit().await.unwrap();
 
-            let policy = Arc::new(
-                RetentionPolicy::new(&RetentionPolicyConfig {
-                    rules: vec!["image.tag != null".to_string()],
-                })
-                .unwrap(),
-            );
+            let policy = Arc::new(RetentionPolicy::new(&RetentionPolicyConfig {
+                rules: vec![CelRule::compile("image.tag != null").unwrap()],
+            }));
 
             RetentionChecker::new(
                 blob_store.clone(),

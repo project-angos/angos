@@ -11,10 +11,7 @@ use tokio::sync::Mutex;
 use tracing::warn;
 
 use super::Backend;
-use crate::registry::{
-    metadata_store::{Error, LinkMetadata, link_kind::LinkKind, lock_ops::LockOps},
-    path_builder,
-};
+use crate::registry::metadata_store::link_kind::LinkKind;
 
 #[derive(Clone)]
 pub(super) struct AccessTimeWriter {
@@ -44,46 +41,15 @@ impl AccessTimeWriter {
 
         stream::iter(entries)
             .for_each_concurrent(10, |(namespace, link)| async move {
-                if let Err(e) = Self::flush_one(backend, &namespace, &link).await {
+                if let Err(e) = backend
+                    .coordinator
+                    .flush_access_time(backend, &namespace, &link)
+                    .await
+                {
                     warn!("Failed to flush access time for {namespace}:{link}: {e}");
                 }
             })
             .await;
-    }
-
-    async fn flush_one(backend: &Backend, namespace: &str, link: &LinkKind) -> Result<(), Error> {
-        if backend.conditional.put_if_match {
-            let link_path = path_builder::link_path(link, namespace);
-            let (data, etag) = backend.store.read_with_etag(&link_path).await?;
-            let link_data = LinkMetadata::from_bytes(data)?.accessed();
-            if let Some(etag) = etag {
-                let content = serde_json::to_vec(&link_data)
-                    .map_err(|e| Error::InvalidData(e.to_string()))?;
-                backend
-                    .store
-                    .put_object_if_match(&link_path, &etag, content)
-                    .await?;
-            }
-            return Ok(());
-        }
-        let guard = backend
-            .lock
-            .acquire(&[format!("{namespace}:{link}")])
-            .await?;
-        let link_data = backend
-            .read_link_reference(namespace, link)
-            .await?
-            .accessed();
-        if !guard.is_valid() {
-            return Err(Error::Lock(
-                "lock invalidated during access time flush".into(),
-            ));
-        }
-        backend
-            .write_link_reference(namespace, link, &link_data)
-            .await?;
-        guard.release().await;
-        Ok(())
     }
 }
 

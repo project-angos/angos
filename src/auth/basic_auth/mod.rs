@@ -6,8 +6,8 @@ use std::collections::HashMap;
 use argon2::{Argon2, PasswordVerifier, password_hash::PasswordHashString};
 use async_trait::async_trait;
 use hyper::http::request::Parts;
-use serde::Deserialize;
-use tracing::{debug, instrument, warn};
+use serde::{Deserialize, de};
+use tracing::{debug, instrument};
 
 use super::{AuthMiddleware, AuthResult};
 use crate::{
@@ -15,33 +15,45 @@ use crate::{
     identity::ClientIdentity,
 };
 
-#[derive(Clone, Debug, Default, Deserialize)]
+/// An Argon2 password hash string, validated at deserialize time.
+#[derive(Clone, Debug)]
+pub struct PasswordHash(PasswordHashString);
+
+impl PasswordHash {
+    pub fn as_password_hash(&self) -> argon2::password_hash::PasswordHash<'_> {
+        self.0.password_hash()
+    }
+}
+
+impl<'de> Deserialize<'de> for PasswordHash {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let source = String::deserialize(deserializer)?;
+        PasswordHashString::new(&source)
+            .map(Self)
+            .map_err(|e| de::Error::custom(format!("invalid Argon2 password hash: {e}")))
+    }
+}
+
+#[derive(Clone, Debug, Deserialize)]
 pub struct Config {
     pub username: String,
-    pub password: String,
+    pub password: PasswordHash,
 }
 
 pub struct BasicAuthValidator {
-    users: HashMap<String, (String, PasswordHashString)>,
+    users: HashMap<String, (String, PasswordHash)>,
 }
 
-fn build_users(
-    identities: &HashMap<String, Config>,
-) -> HashMap<String, (String, PasswordHashString)> {
-    let mut credentials = HashMap::new();
-    for (id, config) in identities {
-        let password_hash = match PasswordHashString::new(&config.password) {
-            Ok(hash) => hash,
-            Err(err) => {
-                warn!("Invalid password hash for user {}: {err}", config.username);
-                continue;
-            }
-        };
-
-        credentials.insert(config.username.clone(), (id.clone(), password_hash));
-    }
-
-    credentials
+fn build_users(identities: &HashMap<String, Config>) -> HashMap<String, (String, PasswordHash)> {
+    identities
+        .iter()
+        .map(|(id, config)| {
+            (
+                config.username.clone(),
+                (id.clone(), config.password.clone()),
+            )
+        })
+        .collect()
 }
 
 impl BasicAuthValidator {
@@ -58,9 +70,9 @@ impl BasicAuthValidator {
             return None;
         };
 
-        let identity_password = identity_password.password_hash();
-
-        match Argon2::default().verify_password(password.as_bytes(), &identity_password) {
+        match Argon2::default()
+            .verify_password(password.as_bytes(), &identity_password.as_password_hash())
+        {
             Ok(()) => Some(identity_id.clone()),
             Err(error) => {
                 debug!("Password verification failed: {error}");

@@ -51,7 +51,7 @@ Useful modules:
 3. Check access policy allows the action:
    ```toml
    [global.access_policy]
-   default_allow = false
+   default = "deny"
    rules = ["identity.username != ''"]
    ```
 

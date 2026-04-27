@@ -7,11 +7,11 @@ use sha2::Sha256;
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tracing::instrument;
 
-use super::{Backend, chunked_reader::ChunkedReader};
+use super::{Backend, S3UploadState, chunked_reader::ChunkedReader};
 use crate::{
     oci::Digest,
     registry::{
-        blob_store::{Error, UploadState, hashing_reader::HashingReader, sha256_ext::Sha256Ext},
+        blob_store::{Error, UploadSummary, hashing_reader::HashingReader, sha256_ext::Sha256Ext},
         path_builder,
     },
 };
@@ -70,16 +70,15 @@ impl Backend {
         uuid: &str,
         stream: Box<dyn AsyncRead + Unpin + Send + Sync>,
         append: bool,
-        state: Option<UploadState>,
     ) -> Result<(Digest, u64), Error> {
         let upload_path = path_builder::upload_path(name, uuid);
 
         let (upload_id, part_list) = if append {
-            if let Some(UploadState {
+            if let Some(S3UploadState {
                 multipart_upload_id: Some(id),
                 parts,
                 ..
-            }) = state
+            }) = self.retrieve_cached_upload_state(name, uuid).await
             {
                 (id, parts)
             } else {
@@ -162,7 +161,7 @@ impl Backend {
         &self,
         name: &str,
         uuid: &str,
-    ) -> Result<UploadState, Error> {
+    ) -> Result<S3UploadState, Error> {
         if let Some(cached) = self.retrieve_cached_upload_state(name, uuid).await {
             return Ok(cached);
         }
@@ -185,7 +184,7 @@ impl Backend {
             size += staged_size;
         }
 
-        let state = UploadState {
+        let state = S3UploadState {
             size,
             multipart_upload_id,
             parts,
@@ -269,16 +268,14 @@ impl Backend {
         &self,
         name: &str,
         uuid: &str,
-        state: &UploadState,
-    ) -> Result<(Digest, u64, DateTime<Utc>), Error> {
-        let size = state.size;
-        let digest = self.load_hasher(name, uuid, size).await?.digest();
+        size: u64,
+    ) -> Result<UploadSummary, Error> {
         let date_path = path_builder::upload_start_date_path(name, uuid);
         let date_bytes = self.store.get_object_body(&date_path, None).await?;
         let date_str = String::from_utf8_lossy(&date_bytes);
-        let start_date = DateTime::parse_from_rfc3339(&date_str)
+        let started_at = DateTime::parse_from_rfc3339(&date_str)
             .unwrap_or_else(|_| Utc::now().fixed_offset())
             .with_timezone(&Utc);
-        Ok((digest, size, start_date))
+        Ok(UploadSummary { size, started_at })
     }
 }

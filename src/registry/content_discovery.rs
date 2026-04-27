@@ -157,7 +157,7 @@ mod tests {
                 .unwrap();
 
             let test_content = b"test content";
-            let test_digest = registry.blob_store.create_blob(test_content).await.unwrap();
+            let test_digest = registry.blob_store.create(test_content).await.unwrap();
             let tag_link = LinkKind::Tag("latest".to_string());
             let mut tx = registry.metadata_store.begin_transaction(namespace);
             tx.create_link(&tag_link, &test_digest).add();
@@ -206,7 +206,7 @@ mod tests {
             let namespace = &Namespace::new("test-repo").unwrap();
 
             let test_content = b"test content";
-            let test_digest = registry.blob_store.create_blob(test_content).await.unwrap();
+            let test_digest = registry.blob_store.create(test_content).await.unwrap();
             let tags = ["latest", "v1.0", "v2.0"];
             let mut tx = registry.metadata_store.begin_transaction(namespace);
             for tag in tags {

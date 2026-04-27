@@ -16,8 +16,8 @@ Configure CEL-based access control policies for fine-grained authorization.
 ## Basic Concepts
 
 Access control uses CEL (Common Expression Language) to evaluate rules:
-- **default_allow = true**: Deny if any rule returns false
-- **default_allow = false**: Allow if any rule returns true
+- **default = "allow"**: Deny if any rule returns true
+- **default = "deny"**: Allow if any rule returns true
 
 Policies can be configured globally or per-repository.
 
@@ -29,7 +29,7 @@ Apply policies to all repositories:
 
 ```toml
 [global.access_policy]
-default_allow = false
+default = "deny"
 rules = [
   "identity.username != null"  # Require authentication
 ]
@@ -43,7 +43,7 @@ Override or supplement global policies for specific repositories:
 
 ```toml
 [repository."production".access_policy]
-default_allow = false
+default = "deny"
 rules = [
   "identity.username == 'admin'",
   "identity.certificate.organizations.contains('Platform')"
@@ -58,7 +58,7 @@ rules = [
 
 ```toml
 [global.access_policy]
-default_allow = false
+default = "deny"
 rules = [
   "identity.username != null"
 ]
@@ -68,7 +68,7 @@ rules = [
 
 ```toml
 [global.access_policy]
-default_allow = false
+default = "deny"
 rules = [
   # Anyone can pull images (anonymous read)
   "request.action in ['get-manifest', 'get-blob', 'list-tags']",
@@ -163,7 +163,7 @@ Control access to UI-specific actions:
 
 ```toml
 [global.access_policy]
-default_allow = false
+default = "deny"
 rules = [
   # Allow UI assets to load
   "request.action == 'ui-asset' || request.action == 'ui-config'",
@@ -184,7 +184,7 @@ Combine different authentication methods:
 
 ```toml
 [global.access_policy]
-default_allow = false
+default = "deny"
 rules = [
   # Basic auth admin
   "identity.username == 'admin'",
@@ -211,28 +211,28 @@ rules = [
 ```toml
 # Global baseline
 [global.access_policy]
-default_allow = false
+default = "deny"
 rules = [
   "request.action == 'healthz'"  # Always allow health checks
 ]
 
 # Public read-only repo
 [repository."public".access_policy]
-default_allow = false
+default = "deny"
 rules = [
   "request.action in ['get-manifest', 'get-blob', 'list-tags']"
 ]
 
 # Development: team access
 [repository."dev".access_policy]
-default_allow = false
+default = "deny"
 rules = [
   "identity.certificate.organizations.contains('Engineering')"
 ]
 
 # Production: restricted access
 [repository."prod".access_policy]
-default_allow = false
+default = "deny"
 rules = [
   "identity.username == 'deployer'",
   '''identity.oidc != null &&
@@ -270,7 +270,7 @@ RUST_LOG=angos::registry::access_policy=debug \
 
 **All requests denied:**
 - Check if any rule can match
-- For `default_allow = false`, at least one rule must return true
+- For `default = "deny"`, at least one rule must return true
 - Enable debug logging to see rule evaluation
 
 **OIDC rules not matching:**

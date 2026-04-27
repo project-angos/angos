@@ -50,7 +50,7 @@ async fn test_read_link_cache_hit_skips_s3() {
         target: digest.clone(),
         referrer: None,
         media_type: None,
-        descriptor: Box::new(None),
+        descriptor: None,
     }];
     backend.update_links(namespace, &ops).await.unwrap();
 
@@ -83,7 +83,7 @@ async fn test_read_link_cache_miss_fetches_from_s3() {
         target: digest.clone(),
         referrer: None,
         media_type: None,
-        descriptor: Box::new(None),
+        descriptor: None,
     }];
     backend.update_links(namespace, &ops).await.unwrap();
 
@@ -118,7 +118,7 @@ async fn test_read_link_cache_expired_refetches() {
         target: digest_a.clone(),
         referrer: None,
         media_type: None,
-        descriptor: Box::new(None),
+        descriptor: None,
     }];
     backend.update_links(namespace, &ops).await.unwrap();
 
@@ -160,7 +160,7 @@ async fn test_update_links_populates_cache_on_overwrite() {
         target: digest_a.clone(),
         referrer: None,
         media_type: None,
-        descriptor: Box::new(None),
+        descriptor: None,
     }];
     backend.update_links(namespace, &ops).await.unwrap();
 
@@ -174,7 +174,7 @@ async fn test_update_links_populates_cache_on_overwrite() {
         target: digest_b.clone(),
         referrer: None,
         media_type: None,
-        descriptor: Box::new(None),
+        descriptor: None,
     }];
     backend.update_links(namespace, &ops).await.unwrap();
 
@@ -203,7 +203,7 @@ async fn test_update_links_populates_cache_on_create() {
         target: digest.clone(),
         referrer: None,
         media_type: None,
-        descriptor: Box::new(None),
+        descriptor: None,
     }];
     backend.update_links(namespace, &ops).await.unwrap();
 
@@ -232,7 +232,7 @@ async fn test_update_links_invalidates_cache_on_delete() {
         target: digest.clone(),
         referrer: None,
         media_type: None,
-        descriptor: Box::new(None),
+        descriptor: None,
     }];
     backend.update_links(namespace, &ops).await.unwrap();
 
@@ -271,7 +271,7 @@ async fn test_read_link_with_access_time_update_populates_cache() {
         target: digest.clone(),
         referrer: None,
         media_type: None,
-        descriptor: Box::new(None),
+        descriptor: None,
     }];
     backend.update_links(namespace, &ops).await.unwrap();
 
@@ -309,7 +309,7 @@ async fn test_cache_disabled_when_ttl_zero() {
         target: digest.clone(),
         referrer: None,
         media_type: None,
-        descriptor: Box::new(None),
+        descriptor: None,
     }];
     backend.update_links(namespace, &ops).await.unwrap();
 
@@ -349,7 +349,7 @@ async fn test_cache_keys_are_namespace_scoped() {
         target: digest_a.clone(),
         referrer: None,
         media_type: None,
-        descriptor: Box::new(None),
+        descriptor: None,
     }];
     backend.update_links(namespace_a, &ops_a).await.unwrap();
 
@@ -358,7 +358,7 @@ async fn test_cache_keys_are_namespace_scoped() {
         target: digest_b.clone(),
         referrer: None,
         media_type: None,
-        descriptor: Box::new(None),
+        descriptor: None,
     }];
     backend.update_links(namespace_b, &ops_b).await.unwrap();
 
@@ -391,7 +391,7 @@ async fn test_deferred_access_time_returns_data_immediately() {
         target: digest.clone(),
         referrer: None,
         media_type: None,
-        descriptor: Box::new(None),
+        descriptor: None,
     }];
     backend.update_links(namespace, &ops).await.unwrap();
 
@@ -422,7 +422,7 @@ async fn test_deferred_access_time_writes_eventually() {
         target: digest.clone(),
         referrer: None,
         media_type: None,
-        descriptor: Box::new(None),
+        descriptor: None,
     }];
     backend.update_links(namespace, &ops).await.unwrap();
 
@@ -455,7 +455,7 @@ async fn test_deferred_access_time_coalesces_writes() {
         target: digest.clone(),
         referrer: None,
         media_type: None,
-        descriptor: Box::new(None),
+        descriptor: None,
     }];
     backend.update_links(namespace, &ops).await.unwrap();
 
@@ -504,14 +504,14 @@ async fn test_deferred_access_time_different_links_independent() {
             target: digest1.clone(),
             referrer: None,
             media_type: None,
-            descriptor: Box::new(None),
+            descriptor: None,
         },
         LinkOperation::Create {
             link: tag2.clone(),
             target: digest2.clone(),
             referrer: None,
             media_type: None,
-            descriptor: Box::new(None),
+            descriptor: None,
         },
     ];
     backend.update_links(namespace, &ops).await.unwrap();
@@ -551,7 +551,7 @@ async fn test_deferred_access_time_flush_on_explicit_call() {
         target: digest.clone(),
         referrer: None,
         media_type: None,
-        descriptor: Box::new(None),
+        descriptor: None,
     }];
     backend.update_links(namespace, &ops).await.unwrap();
 
@@ -584,7 +584,7 @@ async fn test_deferred_access_time_zero_debounce_writes_synchronously() {
         target: digest.clone(),
         referrer: None,
         media_type: None,
-        descriptor: Box::new(None),
+        descriptor: None,
     }];
     backend.update_links(namespace, &ops).await.unwrap();
 
@@ -614,7 +614,7 @@ async fn test_deferred_access_time_does_not_block_read_path() {
         target: digest.clone(),
         referrer: None,
         media_type: None,
-        descriptor: Box::new(None),
+        descriptor: None,
     }];
     backend.update_links(namespace, &ops).await.unwrap();
 
@@ -660,7 +660,7 @@ async fn test_flush_processes_entries_concurrently() {
             target: digest,
             referrer: None,
             media_type: None,
-            descriptor: Box::new(None),
+            descriptor: None,
         }];
         backend.update_links(namespace, &ops).await.unwrap();
         tags.push(tag);
@@ -718,14 +718,14 @@ async fn test_flush_errors_do_not_prevent_other_entries() {
             target: digest1,
             referrer: None,
             media_type: None,
-            descriptor: Box::new(None),
+            descriptor: None,
         },
         LinkOperation::Create {
             link: tag2.clone(),
             target: digest2,
             referrer: None,
             media_type: None,
-            descriptor: Box::new(None),
+            descriptor: None,
         },
     ];
     backend.update_links(namespace, &ops).await.unwrap();
@@ -782,7 +782,7 @@ async fn test_blob_index_updates_multiple_digests() {
             target: digest.clone(),
             referrer: None,
             media_type: None,
-            descriptor: Box::new(None),
+            descriptor: None,
         })
         .collect();
 
@@ -829,7 +829,7 @@ async fn test_tracked_link_creates_with_referrers() {
             target: d.clone(),
             referrer: Some(referrer_digest.clone()),
             media_type: None,
-            descriptor: Box::new(None),
+            descriptor: None,
         })
         .collect();
 
@@ -838,7 +838,7 @@ async fn test_tracked_link_creates_with_referrers() {
         target: config_digest.clone(),
         referrer: Some(referrer_digest.clone()),
         media_type: None,
-        descriptor: Box::new(None),
+        descriptor: None,
     });
 
     backend.update_links(namespace, &ops).await.unwrap();
@@ -892,7 +892,7 @@ async fn test_tracked_link_deletes_with_referrers() {
             target: d.clone(),
             referrer: Some(referrer_digest.clone()),
             media_type: None,
-            descriptor: Box::new(None),
+            descriptor: None,
         })
         .collect();
     backend.update_links(namespace, &create_ops).await.unwrap();
@@ -954,14 +954,14 @@ async fn test_mixed_creates_and_deletes_across_digests() {
             target: digest_keep.clone(),
             referrer: None,
             media_type: None,
-            descriptor: Box::new(None),
+            descriptor: None,
         },
         LinkOperation::Create {
             link: LinkKind::Tag("remove-tag".into()),
             target: digest_remove.clone(),
             referrer: None,
             media_type: None,
-            descriptor: Box::new(None),
+            descriptor: None,
         },
     ];
     backend.update_links(namespace, &setup_ops).await.unwrap();
@@ -977,7 +977,7 @@ async fn test_mixed_creates_and_deletes_across_digests() {
             target: digest_add.clone(),
             referrer: None,
             media_type: None,
-            descriptor: Box::new(None),
+            descriptor: None,
         },
     ];
     backend.update_links(namespace, &mixed_ops).await.unwrap();
@@ -1038,7 +1038,7 @@ async fn test_read_link_with_access_time_debounce_uses_cache() {
         target: digest.clone(),
         referrer: None,
         media_type: None,
-        descriptor: Box::new(None),
+        descriptor: None,
     }];
     backend.update_links(namespace, &ops).await.unwrap();
 

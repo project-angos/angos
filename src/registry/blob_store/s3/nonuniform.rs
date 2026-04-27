@@ -6,15 +6,16 @@ use tokio::{
     io::{AsyncRead, AsyncReadExt},
     sync::mpsc,
 };
+use tokio_util::task::AbortOnDropHandle;
 use tracing::instrument;
 
-use super::{Backend, FRAME_SIZE, MIN_PART_SIZE, channel_body::ChannelBody};
+use super::{
+    Backend, FRAME_SIZE, MIN_PART_SIZE, S3UploadState, UploadedPart, channel_body::ChannelBody,
+};
 use crate::{
     oci::Digest,
     registry::{
-        blob_store::{
-            Error, UploadState, UploadedPart, hashing_reader::HashingReader, sha256_ext::Sha256Ext,
-        },
+        blob_store::{Error, hashing_reader::HashingReader, sha256_ext::Sha256Ext},
         path_builder,
     },
 };
@@ -40,21 +41,9 @@ impl Backend {
         &self,
         name: &str,
         uuid: &str,
-        state: Option<UploadState>,
     ) -> Result<(String, Vec<UploadedPart>, u64, u64), Error> {
         let upload_path = path_builder::upload_path(name, uuid);
-        if let Some(UploadState {
-            multipart_upload_id: Some(id),
-            parts,
-            pending_size,
-            ..
-        }) = state
-        {
-            #[allow(clippy::cast_sign_loss)]
-            let uploaded: u64 = parts.iter().map(|p| p.size as u64).sum();
-            return Ok((id, parts, uploaded, pending_size));
-        }
-        if let Some(UploadState {
+        if let Some(S3UploadState {
             multipart_upload_id: Some(id),
             parts,
             pending_size,
@@ -115,7 +104,7 @@ impl Backend {
         let store = self.store.clone();
         let upload_path_owned = ctx.upload_path.to_string();
         let upload_id_owned = ctx.upload_id.to_string();
-        let upload_handle = tokio::spawn(async move {
+        let upload_handle = AbortOnDropHandle::new(tokio::spawn(async move {
             store
                 .upload_part_streaming(
                     &upload_path_owned,
@@ -125,7 +114,7 @@ impl Backend {
                     body,
                 )
                 .await
-        });
+        }));
 
         let mut buf = BytesMut::with_capacity(FRAME_SIZE);
         loop {
@@ -192,12 +181,11 @@ impl Backend {
         uuid: &str,
         stream: Box<dyn AsyncRead + Unpin + Send + Sync>,
         content_length: u64,
-        state: Option<UploadState>,
     ) -> Result<(Digest, u64), Error> {
         let upload_path = path_builder::upload_path(name, uuid);
 
         let (upload_id, part_list, uploaded_size, pending_size) =
-            self.resolve_nonuniform_state(name, uuid, state).await?;
+            self.resolve_nonuniform_state(name, uuid).await?;
 
         #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
         let next_part_number = (part_list.len() + 1) as i32;
@@ -244,7 +232,7 @@ impl Backend {
         &self,
         name: &str,
         uuid: &str,
-    ) -> Result<UploadState, Error> {
+    ) -> Result<S3UploadState, Error> {
         if let Some(cached) = self.retrieve_cached_upload_state(name, uuid).await {
             return Ok(cached);
         }
@@ -265,7 +253,7 @@ impl Backend {
         let pending_path = path_builder::upload_patch_pending_path(name, uuid);
         let pending_size = self.store.object_size(&pending_path).await.unwrap_or(0);
 
-        let state = UploadState {
+        let state = S3UploadState {
             size: uploaded + pending_size,
             multipart_upload_id,
             parts,

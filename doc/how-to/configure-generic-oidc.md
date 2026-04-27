@@ -45,7 +45,7 @@ clock_skew_tolerance = 60                # Allow 60s clock drift (default)
 
 ```toml
 [global.access_policy]
-default_allow = false
+default = "deny"
 rules = [
   "identity.oidc != null && identity.oidc.claims['email'].endsWith('@example.com')"
 ]

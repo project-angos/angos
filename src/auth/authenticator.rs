@@ -1,7 +1,6 @@
 use std::{collections::HashMap, net::SocketAddr, sync::Arc};
 
 use hyper::http::request::Parts;
-use serde::Deserialize;
 use tracing::{debug, instrument, warn};
 
 use super::{
@@ -13,14 +12,11 @@ use crate::{
     metrics_provider::AUTH_ATTEMPTS,
 };
 
-#[derive(Clone, Debug, Default, Deserialize)]
+#[derive(Clone, Debug, Default)]
 pub struct AuthConfig {
-    #[serde(default)]
     pub identity: HashMap<String, basic_auth::Config>,
-    #[serde(default)]
     pub oidc: HashMap<String, oidc::Config>,
-    #[serde(default)]
-    pub webhook: HashMap<String, webhook::Config>,
+    pub webhook: HashMap<String, Arc<webhook::Config>>,
 }
 
 type OidcValidators = Vec<(String, Arc<dyn AuthMiddleware>)>;
@@ -191,69 +187,11 @@ mod tests {
             max_concurrent_cache_jobs = 10
         "#;
 
-        toml::from_str(toml).unwrap()
+        Configuration::load_from_str(toml).unwrap()
     }
 
-    #[test]
-    fn test_auth_config_deserialize_empty() {
-        let toml = r"";
-        let config: AuthConfig = toml::from_str(toml).unwrap();
-        assert!(config.identity.is_empty());
-        assert!(config.oidc.is_empty());
-        assert!(config.webhook.is_empty());
-    }
-
-    #[test]
-    fn test_auth_config_deserialize_with_identity() {
-        let toml = r#"
-            [identity.user1]
-            username = "user1"
-            password = "$argon2id$v=19$m=19456,t=2,p=1$test"
-        "#;
-
-        let config: AuthConfig = toml::from_str(toml).unwrap();
-        assert_eq!(config.identity.len(), 1);
-        assert!(config.identity.contains_key("user1"));
-    }
-
-    #[test]
-    fn test_auth_config_deserialize_with_oidc() {
-        let toml = r#"
-            [oidc.github]
-            provider = "github"
-        "#;
-
-        let config: AuthConfig = toml::from_str(toml).unwrap();
-        assert_eq!(config.oidc.len(), 1);
-        assert!(config.oidc.contains_key("github"));
-    }
-
-    #[test]
-    fn test_auth_config_deserialize_with_webhook() {
-        let toml = r#"
-            [webhook.test]
-            url = "http://localhost:8080/auth"
-            timeout_ms = 5000
-        "#;
-
-        let config: AuthConfig = toml::from_str(toml).unwrap();
-        assert_eq!(config.webhook.len(), 1);
-        assert!(config.webhook.contains_key("test"));
-    }
-
-    #[test]
-    fn test_authenticator_new_minimal() {
-        let config = create_minimal_config();
-        let cache = cache::Config::Memory.to_backend().unwrap();
-
-        let authenticator = Authenticator::new(&config, &cache);
-
-        assert!(authenticator.is_ok());
-    }
-
-    #[test]
-    fn test_authenticator_new_with_basic_auth() {
-        let toml = r#"
+    fn minimal_config_prefix() -> &'static str {
+        r#"
             [blob_store.fs]
             root_dir = "/tmp/test"
 
@@ -269,13 +207,87 @@ mod tests {
             [global]
             update_pull_time = false
             max_concurrent_cache_jobs = 10
+        "#
+    }
 
+    #[test]
+    fn test_auth_config_empty() {
+        let config = create_minimal_config();
+        assert!(config.auth.identity.is_empty());
+        assert!(config.auth.oidc.is_empty());
+        assert!(config.auth.webhook.is_empty());
+    }
+
+    #[test]
+    fn test_auth_config_with_identity() {
+        let toml = format!(
+            r#"{}
+            [auth.identity.user1]
+            username = "user1"
+            password = "$argon2id$v=19$m=19456,t=2,p=1$test"
+        "#,
+            minimal_config_prefix()
+        );
+
+        let config = Configuration::load_from_str(&toml).unwrap();
+        assert_eq!(config.auth.identity.len(), 1);
+        assert!(config.auth.identity.contains_key("user1"));
+    }
+
+    #[test]
+    fn test_auth_config_with_oidc() {
+        let toml = format!(
+            r#"{}
+            [auth.oidc.github]
+            provider = "github"
+        "#,
+            minimal_config_prefix()
+        );
+
+        let config = Configuration::load_from_str(&toml).unwrap();
+        assert_eq!(config.auth.oidc.len(), 1);
+        assert!(config.auth.oidc.contains_key("github"));
+    }
+
+    #[test]
+    fn test_auth_config_with_webhook() {
+        let toml = format!(
+            r#"{}
+            [auth.webhook.test]
+            url = "http://localhost:8080/auth"
+            timeout_ms = 5000
+        "#,
+            minimal_config_prefix()
+        );
+
+        let config = Configuration::load_from_str(&toml).unwrap();
+        assert_eq!(config.auth.webhook.len(), 1);
+        assert!(config.auth.webhook.contains_key("test"));
+        assert_eq!(config.auth.webhook["test"].name, "test");
+    }
+
+    #[test]
+    fn test_authenticator_new_minimal() {
+        let config = create_minimal_config();
+        let cache = cache::Config::Memory.to_backend().unwrap();
+
+        let authenticator = Authenticator::new(&config, &cache);
+
+        assert!(authenticator.is_ok());
+    }
+
+    #[test]
+    fn test_authenticator_new_with_basic_auth() {
+        let toml = format!(
+            r#"{}
             [auth.identity.testuser]
             username = "testuser"
             password = "$argon2id$v=19$m=19456,t=2,p=1$test"
-        "#;
+        "#,
+            minimal_config_prefix()
+        );
 
-        let config: Configuration = toml::from_str(toml).unwrap();
+        let config = Configuration::load_from_str(&toml).unwrap();
         let cache = cache::Config::Memory.to_backend().unwrap();
 
         let authenticator = Authenticator::new(&config, &cache);
@@ -296,15 +308,18 @@ mod tests {
 
     #[test]
     fn test_build_oidc_validators_with_github() {
-        let toml = r#"
-            [oidc.github]
+        let toml = format!(
+            r#"{}
+            [auth.oidc.github]
             provider = "github"
-        "#;
+        "#,
+            minimal_config_prefix()
+        );
 
-        let auth_config: AuthConfig = toml::from_str(toml).unwrap();
+        let config = Configuration::load_from_str(&toml).unwrap();
         let cache = cache::Config::Memory.to_backend().unwrap();
 
-        let validators = Authenticator::build_oidc_validators(&auth_config, &cache);
+        let validators = Authenticator::build_oidc_validators(&config.auth, &cache);
 
         assert!(validators.is_ok());
         let validators = validators.unwrap();
@@ -314,16 +329,19 @@ mod tests {
 
     #[test]
     fn test_build_oidc_validators_with_generic() {
-        let toml = r#"
-            [oidc.custom]
+        let toml = format!(
+            r#"{}
+            [auth.oidc.custom]
             provider = "generic"
             issuer = "https://auth.example.com"
-        "#;
+        "#,
+            minimal_config_prefix()
+        );
 
-        let auth_config: AuthConfig = toml::from_str(toml).unwrap();
+        let config = Configuration::load_from_str(&toml).unwrap();
         let cache = cache::Config::Memory.to_backend().unwrap();
 
-        let validators = Authenticator::build_oidc_validators(&auth_config, &cache);
+        let validators = Authenticator::build_oidc_validators(&config.auth, &cache);
 
         assert!(validators.is_ok());
         let validators = validators.unwrap();
@@ -333,19 +351,22 @@ mod tests {
 
     #[test]
     fn test_build_oidc_validators_multiple() {
-        let toml = r#"
-            [oidc.github]
+        let toml = format!(
+            r#"{}
+            [auth.oidc.github]
             provider = "github"
 
-            [oidc.custom]
+            [auth.oidc.custom]
             provider = "generic"
             issuer = "https://auth.example.com"
-        "#;
+        "#,
+            minimal_config_prefix()
+        );
 
-        let auth_config: AuthConfig = toml::from_str(toml).unwrap();
+        let config = Configuration::load_from_str(&toml).unwrap();
         let cache = cache::Config::Memory.to_backend().unwrap();
 
-        let validators = Authenticator::build_oidc_validators(&auth_config, &cache);
+        let validators = Authenticator::build_oidc_validators(&config.auth, &cache);
 
         assert!(validators.is_ok());
         let validators = validators.unwrap();
@@ -378,30 +399,15 @@ mod tests {
         let password_hash = argon.hash_password(b"testpass", &salt).unwrap().to_string();
 
         let toml = format!(
-            r#"
-            [blob_store.fs]
-            root_dir = "/tmp/test"
-
-            [metadata_store.fs]
-            root_dir = "/tmp/test"
-
-            [cache.memory]
-
-            [server]
-            bind_address = "0.0.0.0"
-            port = 8000
-
-            [global]
-            update_pull_time = false
-            max_concurrent_cache_jobs = 10
-
+            r#"{}
             [auth.identity.testuser]
             username = "testuser"
             password = "{password_hash}"
-        "#
+        "#,
+            minimal_config_prefix()
         );
 
-        let config: Configuration = toml::from_str(&toml).unwrap();
+        let config = Configuration::load_from_str(&toml).unwrap();
         let cache = cache::Config::Memory.to_backend().unwrap();
         let authenticator = Authenticator::new(&config, &cache).unwrap();
 
@@ -428,30 +434,15 @@ mod tests {
         let password_hash = argon.hash_password(b"testpass", &salt).unwrap().to_string();
 
         let toml = format!(
-            r#"
-            [blob_store.fs]
-            root_dir = "/tmp/test"
-
-            [metadata_store.fs]
-            root_dir = "/tmp/test"
-
-            [cache.memory]
-
-            [server]
-            bind_address = "0.0.0.0"
-            port = 8000
-
-            [global]
-            update_pull_time = false
-            max_concurrent_cache_jobs = 10
-
+            r#"{}
             [auth.identity.testuser]
             username = "testuser"
             password = "{password_hash}"
-        "#
+        "#,
+            minimal_config_prefix()
         );
 
-        let config: Configuration = toml::from_str(&toml).unwrap();
+        let config = Configuration::load_from_str(&toml).unwrap();
         let cache = cache::Config::Memory.to_backend().unwrap();
         let authenticator = Authenticator::new(&config, &cache).unwrap();
 

@@ -90,7 +90,7 @@ UI-specific actions for access policies:
 
 ```toml
 [global.access_policy]
-default_allow = false
+default = "deny"
 rules = [
   # Allow UI to load
   "request.action == 'ui-asset' || request.action == 'ui-config'",

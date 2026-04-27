@@ -18,7 +18,7 @@ struct TestConfig {
     identity: HashMap<String, Config>,
 }
 
-static TEST_CONFIG: &str = r#"
+static VALID_TEST_CONFIG: &str = r#"
 [identity.id_1]
 username = "user1"
 password = "$argon2id$v=19$m=19456,t=2,p=1$9pxWwg0VtZzDXno/25417Q$e+cuKy9VisJVxec/EEuKvvfIIIOy5yDGRzYKiuDLjx0"  # password is "password1"
@@ -26,15 +26,10 @@ password = "$argon2id$v=19$m=19456,t=2,p=1$9pxWwg0VtZzDXno/25417Q$e+cuKy9VisJVxe
 [identity.id_2]
 username = "user2"
 password = "$argon2id$v=19$m=19456,t=2,p=1$Uy1qF140d+2nOKIz1ZFltw$xAii0VrKbNn2d/rb5hUWUmEcwq6kjVFE5mW5ymzFudw"  # password is "password2"
-
-[identity.id_3]
-username = "user3"
-password = "invalid-password-hash"
 "#;
 
 fn build_test_config() -> TestConfig {
-    let config: TestConfig = toml::from_str(TEST_CONFIG).expect("Failed to parse test config");
-    config
+    toml::from_str(VALID_TEST_CONFIG).expect("Failed to parse test config")
 }
 
 fn build_basic_auth_header(username: &str, password: &str) -> String {
@@ -68,7 +63,7 @@ fn test_build_users() {
     assert_eq!(id1, "id_1");
     assert!(
         Argon2::default()
-            .verify_password("password1".as_bytes(), &pass1.password_hash())
+            .verify_password("password1".as_bytes(), &pass1.as_password_hash())
             .is_ok()
     );
 
@@ -76,22 +71,19 @@ fn test_build_users() {
     assert_eq!(id2, "id_2");
     assert!(
         Argon2::default()
-            .verify_password("password2".as_bytes(), &pass2.password_hash())
+            .verify_password("password2".as_bytes(), &pass2.as_password_hash())
             .is_ok()
     );
-    assert_eq!(users.get("user3"), None);
 }
 
 #[test]
 fn test_new_auth() {
     let config = build_test_config();
-
     let auth = BasicAuthValidator::new(&config.identity);
 
     assert_eq!(auth.users.len(), 2);
     assert!(auth.users.contains_key("user1"));
     assert!(auth.users.contains_key("user2"));
-    assert!(!auth.users.contains_key("user3")); // invalid
 }
 
 #[test]
@@ -99,18 +91,15 @@ fn test_validate_credentials() {
     let config = build_test_config();
     let auth = BasicAuthValidator::new(&config.identity);
 
-    // Valid credentials
     let user1_id = auth.validate_credentials("user1", "password1");
     assert_eq!(user1_id, Some("id_1".to_string()));
 
     let user2_id = auth.validate_credentials("user2", "password2");
     assert_eq!(user2_id, Some("id_2".to_string()));
 
-    // Invalid username
     let invalid_user = auth.validate_credentials("invalid_user", "password1");
     assert_eq!(invalid_user, None);
 
-    // Invalid password
     let invalid_pass = auth.validate_credentials("user1", "wrong_password");
     assert_eq!(invalid_pass, None);
 }
@@ -136,4 +125,19 @@ async fn test_authenticate() {
     let mut identity = ClientIdentity::default();
     let result = auth.authenticate(&parts, &mut identity).await.unwrap();
     assert!(matches!(result, AuthResult::NoCredentials));
+}
+
+#[test]
+fn test_invalid_password_hash_fails_at_deserialize() {
+    let toml = r#"
+[identity.id_1]
+username = "user1"
+password = "not-a-valid-argon2-hash"
+"#;
+
+    let result: Result<TestConfig, _> = toml::from_str(toml);
+    assert!(
+        result.is_err(),
+        "invalid Argon2 hash must fail at deserialization"
+    );
 }

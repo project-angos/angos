@@ -250,29 +250,6 @@ Use this for Kubernetes readiness probes to detect when a replica is unable to s
 {"status":"ready"}
 ```
 
-Add `?verbose=true` to the query string to include conditional operation capabilities (S3 metadata store only):
-
-```
-GET /readyz?verbose=true
-```
-
-**Verbose Success Response (S3 metadata store):**
-```json
-{
-  "status": "ready",
-  "conditional": {
-    "put_if_none_match": true,
-    "put_if_match": true,
-    "delete_if_match": true
-  }
-}
-```
-
-**Verbose Success Response (filesystem metadata store):**
-```json
-{"status":"ready"}
-```
-
 **Service Unavailable Response (503):**
 ```json
 {"status":"not_ready","error":"storage backend not ready: ..."}

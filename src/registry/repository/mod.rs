@@ -4,7 +4,9 @@ use serde::Deserialize;
 use tracing::instrument;
 
 use crate::{
+    auth::webhook,
     cache::Cache,
+    configuration::RegexPattern,
     oci::{Digest, Namespace, Reference},
     policy::{AccessPolicyConfig, RetentionPolicy, RetentionPolicyConfig},
     registry::{Error, blob_store::BoxedReader},
@@ -15,8 +17,9 @@ mod registry_client;
 use registry_client::RegistryClient;
 pub use registry_client::RegistryClientConfig;
 
+/// Parsed shape of `[repository.<name>]` before webhook name references are resolved.
 #[derive(Clone, Debug, Default, Deserialize)]
-pub struct Config {
+pub struct RawConfig {
     #[serde(default)]
     pub upstream: Vec<RegistryClientConfig>,
     #[serde(default)]
@@ -26,10 +29,21 @@ pub struct Config {
     #[serde(default)]
     pub immutable_tags: bool,
     #[serde(default)]
-    pub immutable_tags_exclusions: Vec<String>,
+    pub immutable_tags_exclusions: Vec<RegexPattern>,
     pub authorization_webhook: Option<String>,
     #[serde(default)]
     pub event_webhooks: Vec<String>,
+}
+
+/// Resolved repository configuration with webhook references replaced by their definitions.
+#[derive(Clone, Debug, Default)]
+pub struct Config {
+    pub upstream: Vec<RegistryClientConfig>,
+    pub access_policy: AccessPolicyConfig,
+    pub retention_policy: RetentionPolicyConfig,
+    pub immutable_tags: bool,
+    pub immutable_tags_exclusions: Vec<RegexPattern>,
+    pub authorization_webhook: Option<Arc<webhook::Config>>,
 }
 
 pub struct Repository {
@@ -37,7 +51,7 @@ pub struct Repository {
     pub upstreams: Vec<RegistryClient>,
     pub retention_policy: RetentionPolicy,
     pub immutable_tags: bool,
-    pub immutable_tags_exclusions: Vec<String>,
+    pub immutable_tags_exclusions: Vec<RegexPattern>,
 }
 
 macro_rules! try_upstreams {
@@ -58,7 +72,7 @@ impl Repository {
             upstreams.push(RegistryClient::new(config, cache.clone())?);
         }
 
-        let retention_policy = RetentionPolicy::new(&config.retention_policy)?;
+        let retention_policy = RetentionPolicy::new(&config.retention_policy);
 
         Ok(Self {
             name: name.to_string(),

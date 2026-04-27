@@ -28,8 +28,8 @@ use crate::{
             BlobIndex, BlobIndexOperation, ConditionalCapabilities, Error, LinkMetadata,
             LinkOperation, LockStrategy, MetadataStore, ResolvedCreate, ResolvedDelete,
             link_kind::LinkKind,
-            lock::{self, LockBackend, MemoryBackend},
-            lock_ops::{LockOps, ValidationResult},
+            lock::{self, MemoryBackend},
+            lock_ops::LockOps,
         },
         pagination, path_builder,
     },
@@ -38,11 +38,14 @@ use crate::{
 mod access_time;
 mod blob_index;
 mod config;
+mod coordinator;
 mod link_ops;
 mod namespace_registry;
 
 #[cfg(test)]
 mod tests;
+
+use coordinator::WriteCoordinator;
 
 /// Return type of `build_create_ops`.
 type CreateOpsResult = (
@@ -62,15 +65,11 @@ type DeleteOpsResult = (
 #[derive(Clone)]
 pub struct Backend {
     pub store: data_store::s3::Backend,
-    lock: Arc<dyn LockBackend + Send + Sync>,
     cache: Option<Arc<dyn Cache>>,
     link_cache_ttl: u64,
     access_time_writer: Option<access_time::AccessTimeWriter>,
-    /// Per-operation conditional capabilities probed at startup.
-    /// Controls whether CAS paths are used for blob index, link updates, namespace
-    /// registry writes, and access-time updates.
-    conditional: ConditionalCapabilities,
-    known_namespaces: Arc<Mutex<HashSet<String>>>,
+    coordinator: Arc<dyn WriteCoordinator>,
+    pub known_namespaces: Arc<Mutex<HashSet<String>>>,
     // Held for Drop side-effect: signals the flush task to exit when the last Backend is dropped.
     #[allow(dead_code)]
     flush_handle: Option<Arc<access_time::FlushHandle>>,
@@ -80,12 +79,65 @@ const MAX_UPDATE_RETRIES: u32 = 10;
 const MAX_BLOB_INDEX_CAS_RETRIES: u32 = 20;
 
 impl Backend {
+    fn build_coordinator(
+        config: &BackendConfig,
+        caps: &ConditionalCapabilities,
+    ) -> Result<Arc<dyn WriteCoordinator>, Error> {
+        match &config.lock_strategy {
+            LockStrategy::S3(s3_lock_config) => {
+                if !caps.supports_cas() {
+                    return Err(Error::Lock(format!(
+                        "S3 lock strategy requires If-None-Match and If-Match support, \
+                         but provider has put_if_none_match={}, put_if_match={}. \
+                         Use lock_strategy = redis or lock_strategy = memory instead.",
+                        caps.put_if_none_match, caps.put_if_match
+                    )));
+                }
+                info!("Using CAS coordinator with S3 lock for S3 metadata-store");
+                let lock_store = Arc::new(
+                    data_store::s3::Backend::new(&config.to_lock_store_config(s3_lock_config))
+                        .map_err(|e| {
+                            Error::Lock(format!("Failed to initialize S3 lock store: {e}"))
+                        })?,
+                );
+                let lock = Arc::new(
+                    lock::S3LockBackend::new(lock_store, s3_lock_config, caps.delete_if_match)
+                        .map_err(|e| {
+                            Error::Lock(format!("Failed to initialize S3 lock store: {e}"))
+                        })?,
+                );
+                Ok(Arc::new(coordinator::CasCoordinator { lock }))
+            }
+            LockStrategy::Redis(redis_config) => {
+                info!("Using Redis lock store for S3 metadata-store");
+                let backend = lock::RedisBackend::new(redis_config).map_err(|e| {
+                    Error::Lock(format!("Failed to initialize Redis lock store: {e}"))
+                })?;
+                Ok(Arc::new(coordinator::LockCoordinator {
+                    lock: Arc::new(backend),
+                }))
+            }
+            LockStrategy::Memory => {
+                info!("Using in-memory lock store for S3 metadata-store");
+                Ok(Arc::new(coordinator::LockCoordinator {
+                    lock: Arc::new(MemoryBackend::new()),
+                }))
+            }
+        }
+    }
+
     /// Create a new S3 metadata-store backend.
     ///
-    /// `conditional` overrides the capabilities used for lock backend construction and CAS
-    /// write paths. Pass `None` to use defaults (all capabilities assumed present for S3 lock
-    /// strategy, none for other strategies). Pass `Some(caps)` with the result of
-    /// `probe_conditional_capabilities` to use the actual probed values.
+    /// `conditional` carries the capabilities used by the CAS coordinator when the
+    /// operator selects `lock_strategy = "s3"`. Pass `None` to assume all capabilities
+    /// are present for the S3 lock strategy and none for other strategies, or
+    /// `Some(caps)` with the result of `probe_conditional_capabilities`.
+    ///
+    /// `lock_strategy` drives coordinator selection: `"s3"` selects the CAS coordinator
+    /// (which requires `put_if_none_match` and `put_if_match`; `delete_if_match` is
+    /// propagated to the internal S3 lock for release safety), while `"redis"` and
+    /// `"memory"` select the lock coordinator with the corresponding lock backend.
+    /// Capabilities are not consulted outside the S3 lock strategy.
     pub fn new(
         config: &BackendConfig,
         conditional: Option<ConditionalCapabilities>,
@@ -93,7 +145,7 @@ impl Backend {
         info!("Using S3 metadata-store backend");
         let store = data_store::s3::Backend::new(&config.to_data_store_config())?;
 
-        let conditional = conditional.unwrap_or_else(|| {
+        let caps = conditional.unwrap_or_else(|| {
             if matches!(config.lock_strategy, LockStrategy::S3(_)) {
                 ConditionalCapabilities {
                     put_if_none_match: true,
@@ -105,36 +157,7 @@ impl Backend {
             }
         });
 
-        let lock: Arc<dyn LockBackend + Send + Sync> = match &config.lock_strategy {
-            LockStrategy::Redis(redis_config) => {
-                info!("Using Redis lock store for S3 metadata-store");
-                let backend = lock::RedisBackend::new(redis_config).map_err(|e| {
-                    Error::Lock(format!("Failed to initialize Redis lock store: {e}"))
-                })?;
-                Arc::new(backend)
-            }
-            LockStrategy::S3(s3_lock_config) => {
-                info!("Using S3 lock store for S3 metadata-store");
-                let lock_store = Arc::new(
-                    data_store::s3::Backend::new(&config.to_lock_store_config(s3_lock_config))
-                        .map_err(|e| {
-                            Error::Lock(format!("Failed to initialize S3 lock store: {e}"))
-                        })?,
-                );
-                Arc::new(
-                    lock::S3LockBackend::new(
-                        lock_store,
-                        s3_lock_config,
-                        conditional.delete_if_match,
-                    )
-                    .map_err(|e| Error::Lock(format!("Failed to initialize S3 lock store: {e}")))?,
-                )
-            }
-            LockStrategy::Memory => {
-                info!("Using in-memory lock store for S3 metadata-store");
-                Arc::new(MemoryBackend::new())
-            }
-        };
+        let coordinator = Self::build_coordinator(config, &caps)?;
 
         if config.access_time_debounce_secs == 0
             && matches!(config.lock_strategy, LockStrategy::S3(_))
@@ -160,11 +183,10 @@ impl Backend {
 
             let flush_backend = Self {
                 store: store.clone(),
-                lock: lock.clone(),
                 cache: None,
                 link_cache_ttl: config.link_cache_ttl,
                 access_time_writer: access_time_writer.clone(),
-                conditional: conditional.clone(),
+                coordinator: coordinator.clone(),
                 known_namespaces: Arc::new(Mutex::new(HashSet::new())),
                 flush_handle: None,
             };
@@ -187,11 +209,10 @@ impl Backend {
 
         let backend = Self {
             store,
-            lock,
             cache: None,
             link_cache_ttl: config.link_cache_ttl,
             access_time_writer,
-            conditional,
+            coordinator,
             known_namespaces: Arc::new(Mutex::new(HashSet::new())),
             flush_handle,
         };
@@ -288,7 +309,11 @@ impl Backend {
         };
 
         // Cleanup — may already have been deleted by the delete_if_match test.
-        let _ = store.delete(&probe_key).await;
+        if let Err(e) = store.delete(&probe_key).await
+            && e.kind() != ErrorKind::NotFound
+        {
+            warn!("conditional probe: cleanup failed for probe object {probe_key}: {e}");
+        }
 
         let capabilities = ConditionalCapabilities {
             put_if_none_match,
@@ -306,12 +331,6 @@ impl Backend {
         Ok(capabilities)
     }
 
-    pub async fn flush_access_times(&self) {
-        if let Some(writer) = &self.access_time_writer {
-            writer.flush(self).await;
-        }
-    }
-
     pub fn with_cache(mut self, cache: Arc<dyn Cache>) -> Self {
         self.cache = Some(cache);
         self
@@ -320,10 +339,6 @@ impl Backend {
 
 #[async_trait]
 impl MetadataStore for Backend {
-    fn conditional_capabilities(&self) -> Option<ConditionalCapabilities> {
-        Some(self.conditional.clone())
-    }
-
     #[instrument(skip(self))]
     async fn list_namespaces(
         &self,
@@ -622,13 +637,8 @@ impl MetadataStore for Backend {
         digest: &Digest,
         operation: BlobIndexOperation,
     ) -> Result<(), Error> {
-        if self.conditional.supports_cas() {
-            return self
-                .update_blob_index_cas(namespace, digest, &[operation])
-                .await;
-        }
-
-        self.update_blob_index_shard(namespace, digest, &[operation])
+        self.coordinator
+            .update_blob_index(self, namespace, digest, operation)
             .await
     }
 
@@ -650,25 +660,10 @@ impl MetadataStore for Backend {
                 };
                 writer.record(namespace, link).await;
                 Ok(link_data)
-            } else if self.conditional.put_if_match {
-                let link_data = self
-                    .read_and_spawn_access_time_update(namespace, link)
-                    .await?;
-                self.cache_put(namespace, link, &link_data).await;
-                Ok(link_data)
             } else {
-                let guard = self.lock.acquire(&[format!("{namespace}:{link}")]).await?;
-                let link_data = self.read_link_reference(namespace, link).await?.accessed();
-                if !guard.is_valid() {
-                    return Err(Error::Lock(
-                        "lock invalidated during access time update".into(),
-                    ));
-                }
-                self.write_link_reference(namespace, link, &link_data)
-                    .await?;
-                self.cache_put(namespace, link, &link_data).await;
-                guard.release().await;
-                Ok(link_data)
+                self.coordinator
+                    .touch_link_access_time(self, namespace, link)
+                    .await
             }
         } else {
             if let Some(cached) = self.cache_get(namespace, link).await {
@@ -690,307 +685,23 @@ impl MetadataStore for Backend {
             return Ok(());
         }
 
-        if self.conditional.supports_cas() {
-            self.update_links_cas(namespace, operations).await
-        } else {
-            self.update_links_locked(namespace, operations).await
-        }
+        self.coordinator
+            .update_links(self, namespace, operations)
+            .await
     }
 
     async fn flush_access_times(&self) {
-        Backend::flush_access_times(self).await;
+        if let Some(writer) = &self.access_time_writer {
+            writer.flush(self).await;
+        }
     }
 }
 
 impl Backend {
-    /// CAS-optimized write path.
-    ///
-    /// Phase 1: All creates attempt lock-free `If-None-Match: *`.
-    ///
-    /// Phase 2: Locked read-modify-write for creates that lost the race and deletes.
-    ///
-    /// Phase 3: CAS blob index writes for new or re-targeted links.
-    async fn update_links_cas(
-        &self,
-        namespace: &str,
-        operations: &[LinkOperation],
-    ) -> Result<(), Error> {
-        let mut locked_ops: Vec<LinkOperation> = Vec::new();
-        let mut any_creates = false;
-
-        let mut optimistic: Vec<(LinkOperation, LinkKind, Digest, LinkMetadata)> = Vec::new();
-
-        for op in operations {
-            match op {
-                LinkOperation::Create {
-                    link,
-                    target,
-                    referrer,
-                    media_type,
-                    descriptor,
-                } => {
-                    any_creates = true;
-                    let mut metadata = LinkMetadata::from_digest(target.clone())
-                        .with_media_type(media_type.clone())
-                        .with_descriptor(descriptor.as_ref().clone());
-                    if let Some(r) = referrer {
-                        metadata.add_referrer(r.clone());
-                    }
-                    optimistic.push((op.clone(), link.clone(), target.clone(), metadata));
-                }
-                LinkOperation::Delete { .. } => {
-                    locked_ops.push(op.clone());
-                }
-            }
-        }
-
-        // Phase 1: All creates attempt lock-free If-None-Match: *
-        let link_results = join_all(optimistic.iter().map(|(_, link, _, metadata)| {
-            self.write_link_if_not_exists(namespace, link, metadata)
-        }))
-        .await;
-
-        let mut lockfree_blob_ops: HashMap<Digest, Vec<BlobIndexOperation>> = HashMap::new();
-        for ((op, link, target, metadata), result) in optimistic.into_iter().zip(link_results) {
-            match result {
-                Ok(true) => {
-                    lockfree_blob_ops
-                        .entry(target)
-                        .or_default()
-                        .push(BlobIndexOperation::Insert(link.clone()));
-                    self.cache_put(namespace, &link, &metadata).await;
-                }
-                Ok(false) => {
-                    locked_ops.push(op);
-                }
-                Err(e) => return Err(e),
-            }
-        }
-
-        // Phase 2: Locked path for remaining operations.
-        let locked_blob_ops = self
-            .execute_locked_cas_updates(namespace, &locked_ops)
-            .await?;
-
-        // Merge blob index operations from both paths.
-        let mut pending_blob_ops = lockfree_blob_ops;
-        for (digest, ops) in locked_blob_ops {
-            pending_blob_ops.entry(digest).or_default().extend(ops);
-        }
-
-        // Phase 3: CAS blob index writes.
-        join_all(
-            pending_blob_ops
-                .iter()
-                .map(|(digest, ops)| self.update_blob_index_cas(namespace, digest, ops)),
-        )
-        .await
-        .into_iter()
-        .collect::<Result<Vec<_>, _>>()?;
-
-        if any_creates && let Err(e) = self.register_namespace(namespace).await {
-            warn!(namespace, error = %e, "Failed to register namespace");
-        }
-
-        Ok(())
-    }
-
-    /// Executes link operations under a distributed lock, returning pending
-    /// blob index operations for CAS updates after the lock is released.
-    async fn execute_locked_cas_updates(
-        &self,
-        namespace: &str,
-        operations: &[LinkOperation],
-    ) -> Result<HashMap<Digest, Vec<BlobIndexOperation>>, Error> {
-        if operations.is_empty() {
-            return Ok(HashMap::new());
-        }
-
-        let mut lock_keys: Vec<String> = operations
-            .iter()
-            .map(|op| {
-                let link = match op {
-                    LinkOperation::Create { link, .. } | LinkOperation::Delete { link, .. } => link,
-                };
-                format!("{namespace}:{link}")
-            })
-            .collect();
-        lock_keys.sort();
-        lock_keys.dedup();
-
-        let guard = self.lock.acquire(&lock_keys).await?;
-
-        let read_results = join_all(operations.iter().map(|op| async move {
-            let link = match op {
-                LinkOperation::Create { link, .. } | LinkOperation::Delete { link, .. } => link,
-            };
-            let metadata = self.read_link_reference(namespace, link).await.ok();
-            (op, metadata)
-        }))
-        .await;
-
-        let mut link_cache: HashMap<LinkKind, LinkMetadata> = HashMap::new();
-        let mut creates: Vec<ResolvedCreate> = Vec::new();
-        let mut deletes: Vec<ResolvedDelete> = Vec::new();
-
-        for (op, metadata) in &read_results {
-            match op {
-                LinkOperation::Create {
-                    link,
-                    target,
-                    referrer,
-                    media_type,
-                    descriptor,
-                } => {
-                    let old_target = metadata.as_ref().map(|m| m.target.clone());
-                    if let Some(m) = metadata {
-                        link_cache.insert(link.clone(), m.clone());
-                    }
-                    creates.push(ResolvedCreate {
-                        link: link.clone(),
-                        target: target.clone(),
-                        old_target,
-                        referrer: referrer.clone(),
-                        media_type: media_type.clone(),
-                        descriptor: descriptor.as_ref().clone(),
-                    });
-                }
-                LinkOperation::Delete { link, referrer } => {
-                    if let Some(m) = metadata {
-                        link_cache.insert(link.clone(), m.clone());
-                        deletes.push(ResolvedDelete {
-                            link: link.clone(),
-                            target: m.target.clone(),
-                            referrer: referrer.clone(),
-                        });
-                    }
-                }
-            }
-        }
-
-        if creates.is_empty() && deletes.is_empty() {
-            guard.release().await;
-            return Ok(HashMap::new());
-        }
-
-        if !guard.is_valid() {
-            guard.release().await;
-            return Err(Error::Lock("lock invalidated during operation".into()));
-        }
-
-        let pending_blob_ops = self
-            .apply_link_operations(namespace, &creates, &deletes, &mut link_cache)
-            .await?;
-
-        guard.release().await;
-
-        Ok(pending_blob_ops)
-    }
-
-    /// Non-CAS write path: pre-lock reads to compute blob digest lock keys,
-    /// then validates under the lock with re-reads. Retries on concurrent
-    /// modification to ensure lock key coverage.
-    async fn update_links_locked(
-        &self,
-        namespace: &str,
-        operations: &[LinkOperation],
-    ) -> Result<(), Error> {
-        let mut update_retries = MAX_UPDATE_RETRIES;
-        loop {
-            let mut link_cache: HashMap<LinkKind, LinkMetadata> = HashMap::new();
-
-            let (creates, deletes, lock_keys) =
-                self.prelock_resolve_operations(namespace, operations).await;
-
-            if creates.is_empty() && deletes.is_empty() {
-                return Ok(());
-            }
-
-            let guard = self.lock.acquire(&lock_keys).await?;
-
-            if self
-                .validate_creates_under_lock(namespace, &creates, &mut link_cache)
-                .await
-                == ValidationResult::NeedsRetry
-            {
-                guard.release().await;
-                if update_retries == 0 {
-                    return Err(Error::Lock(
-                        "update_links exceeded maximum retries due to concurrent modifications"
-                            .into(),
-                    ));
-                }
-                update_retries -= 1;
-                continue;
-            }
-
-            if !guard.is_valid() {
-                guard.release().await;
-                return Err(Error::Lock("lock invalidated during operation".into()));
-            }
-
-            let (valid_deletes, delete_status) = self
-                .validate_deletes_under_lock(namespace, deletes, &mut link_cache)
-                .await?;
-
-            if delete_status == ValidationResult::NeedsRetry {
-                guard.release().await;
-                if update_retries == 0 {
-                    return Err(Error::Lock(
-                        "update_links exceeded maximum retries due to concurrent modifications"
-                            .into(),
-                    ));
-                }
-                update_retries -= 1;
-                continue;
-            }
-
-            if !guard.is_valid() {
-                guard.release().await;
-                return Err(Error::Lock("lock invalidated during operation".into()));
-            }
-
-            let pending_blob_ops = self
-                .apply_link_operations(namespace, &creates, &valid_deletes, &mut link_cache)
-                .await?;
-
-            if !guard.is_valid() {
-                guard.release().await;
-                return Err(Error::Lock("lock invalidated during operation".into()));
-            }
-
-            // Blob index shard updates run under the lock (blob:{digest} keys
-            // are included in lock_keys above).
-            join_all(
-                pending_blob_ops
-                    .iter()
-                    .map(|(digest, ops)| self.update_blob_index_shard(namespace, digest, ops)),
-            )
-            .await
-            .into_iter()
-            .collect::<Result<Vec<_>, _>>()?;
-
-            if !guard.is_valid() {
-                guard.release().await;
-                return Err(Error::Lock("lock invalidated during operation".into()));
-            }
-
-            guard.release().await;
-
-            if !creates.is_empty()
-                && let Err(e) = self.register_namespace(namespace).await
-            {
-                warn!(namespace, error = %e, "Failed to register namespace");
-            }
-
-            return Ok(());
-        }
-    }
-
     /// Executes the write+delete+cache-update sequence for a set of create and
     /// delete link operations, returning the accumulated pending blob index
     /// operations for the caller to apply.
-    async fn apply_link_operations(
+    pub async fn apply_link_operations(
         &self,
         namespace: &str,
         creates: &[ResolvedCreate],
