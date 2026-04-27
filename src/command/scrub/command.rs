@@ -17,15 +17,13 @@ use crate::{
     configuration::Configuration,
     policy::{RetentionPolicy, RetentionPolicyConfig},
     registry::{
-        Repository, blob_store,
-        blob_store::{BlobStore, UploadStore},
+        Repository,
+        blob_store::{BlobStore, MultipartCleanup, UploadStore},
         metadata_store::MetadataStore,
         pagination::collect_all_pages,
         repository,
     },
 };
-
-type BlobStores = (Arc<dyn BlobStore>, Arc<dyn UploadStore>);
 
 #[derive(FromArgs, PartialEq, Debug)]
 #[allow(clippy::struct_excessive_bools)]
@@ -69,15 +67,6 @@ pub struct Command {
     namespace_checkers: Vec<Box<dyn NamespaceChecker>>,
     blob_checker: Option<BlobChecker>,
     multipart_checker: Option<MultipartChecker>,
-}
-
-fn build_stores(config: &blob_store::BlobStorageConfig) -> Result<BlobStores, Error> {
-    match config.to_backend(None) {
-        Ok((blob_store, upload_store, _)) => Ok((blob_store, upload_store)),
-        Err(_) => Err(Error::Initialization(
-            "Failed to initialize blob store".to_string(),
-        )),
-    }
 }
 
 async fn build_metadata_store(config: &Configuration) -> Result<Arc<dyn MetadataStore>, Error> {
@@ -223,19 +212,24 @@ fn build_blob_checker(
 
 fn build_multipart_checker(
     options: &Options,
-    blob_store_config: &blob_store::BlobStorageConfig,
+    cleanup: Arc<dyn MultipartCleanup + Send + Sync>,
 ) -> Option<MultipartChecker> {
     let multipart_timeout = options.multipart?;
     let multipart_timeout =
         Duration::from_std(multipart_timeout.into()).expect("Multipart timeout must be valid");
-    blob_store_config
-        .to_multipart_cleanup()
-        .map(|cleanup| MultipartChecker::new(cleanup, multipart_timeout, options.dry_run))
+    Some(MultipartChecker::new(
+        cleanup,
+        multipart_timeout,
+        options.dry_run,
+    ))
 }
 
 impl Command {
     pub async fn new(options: &Options, config: &Configuration) -> Result<Self, Error> {
-        let (blob_store, upload_store) = build_stores(&config.blob_store)?;
+        let blob_handles = config
+            .blob_store
+            .to_backend(None)
+            .map_err(|_| Error::Initialization("Failed to initialize blob store".to_string()))?;
         let metadata_store = build_metadata_store(config).await?;
         let auth_cache = build_auth_cache(&config.cache)?;
         let repositories = build_repositories(&config.repository, &auth_cache)?;
@@ -243,13 +237,13 @@ impl Command {
         let namespace_checkers = build_namespace_checkers(
             options,
             config,
-            &blob_store,
-            &upload_store,
+            &blob_handles.blob_store,
+            &blob_handles.upload_store,
             &metadata_store,
             &repositories,
         );
-        let blob_checker = build_blob_checker(options, &blob_store, &metadata_store);
-        let multipart_checker = build_multipart_checker(options, &config.blob_store);
+        let blob_checker = build_blob_checker(options, &blob_handles.blob_store, &metadata_store);
+        let multipart_checker = build_multipart_checker(options, blob_handles.multipart_cleanup);
 
         if options.dry_run {
             info!("Dry-run mode: no changes will be made to the storage");

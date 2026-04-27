@@ -7,7 +7,7 @@ mod sha256_ext;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Duration, Utc};
-pub use config::BlobStorageConfig;
+pub use config::{BlobStorageConfig, BlobStoreHandles};
 pub use error::Error;
 use tokio::io::AsyncRead;
 
