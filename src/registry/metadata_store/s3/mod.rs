@@ -1,8 +1,6 @@
 use std::{
-    collections::{HashMap, HashSet},
-    future::Future,
+    collections::HashSet,
     io::ErrorKind,
-    pin::Pin,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -12,10 +10,7 @@ use std::{
 
 use async_trait::async_trait;
 pub use config::BackendConfig;
-use futures_util::{
-    future::join_all,
-    stream::{self, StreamExt},
-};
+use futures_util::stream::{self, StreamExt};
 use tokio::sync::Mutex;
 use tracing::{debug, info, instrument, warn};
 
@@ -26,7 +21,7 @@ use crate::{
         data_store,
         metadata_store::{
             BlobIndex, BlobIndexOperation, ConditionalCapabilities, Error, LinkMetadata,
-            LinkOperation, LockStrategy, MetadataStore, ResolvedCreate, ResolvedDelete,
+            LinkOperation, LockStrategy, MetadataStore,
             link_kind::LinkKind,
             lock::{self, MemoryBackend},
             lock_ops::LockOps,
@@ -47,21 +42,6 @@ mod namespace_registry;
 mod tests;
 
 use coordinator::WriteCoordinator;
-
-/// Return type of `build_create_ops`.
-type CreateOpsResult = (
-    HashMap<Digest, Vec<BlobIndexOperation>>,
-    Vec<(LinkKind, LinkMetadata)>,
-    Vec<(LinkKind, LinkMetadata)>,
-);
-
-/// Return type of `build_delete_ops`.
-type DeleteOpsResult = (
-    HashMap<Digest, Vec<BlobIndexOperation>>,
-    Vec<(LinkKind, LinkMetadata)>,
-    Vec<LinkKind>,
-    Vec<LinkKind>,
-);
 
 #[derive(Clone)]
 pub struct Backend {
@@ -662,188 +642,5 @@ impl MetadataStore for Backend {
         if let Some(writer) = &self.access_time_writer {
             writer.flush(self).await;
         }
-    }
-}
-
-impl Backend {
-    /// Executes the write+delete+cache-update sequence for a set of create and
-    /// delete link operations, returning the accumulated pending blob index
-    /// operations for the caller to apply.
-    pub async fn apply_link_operations(
-        &self,
-        namespace: &str,
-        creates: &[ResolvedCreate],
-        deletes: &[ResolvedDelete],
-        link_cache: &mut HashMap<LinkKind, LinkMetadata>,
-    ) -> Result<HashMap<Digest, Vec<BlobIndexOperation>>, Error> {
-        let (pending_blob_ops, tracked_create_writes, non_tracked_create_writes) =
-            Self::build_create_ops(creates, link_cache);
-
-        join_all(
-            tracked_create_writes
-                .iter()
-                .chain(non_tracked_create_writes.iter())
-                .map(|(link, metadata)| async move {
-                    self.write_link_reference(namespace, link, metadata).await
-                }),
-        )
-        .await
-        .into_iter()
-        .collect::<Result<Vec<_>, _>>()?;
-
-        let (
-            pending_blob_ops,
-            tracked_delete_writes,
-            tracked_delete_removes,
-            non_tracked_delete_links,
-        ) = Self::build_delete_ops(deletes, link_cache, pending_blob_ops);
-
-        join_all(
-            tracked_delete_writes
-                .iter()
-                .map(|(link, metadata)| {
-                    let fut: Pin<Box<dyn Future<Output = Result<(), Error>> + Send + '_>> =
-                        Box::pin(self.write_link_reference(namespace, link, metadata));
-                    fut
-                })
-                .chain(
-                    tracked_delete_removes
-                        .iter()
-                        .chain(non_tracked_delete_links.iter())
-                        .map(|link| {
-                            let fut: Pin<Box<dyn Future<Output = Result<(), Error>> + Send + '_>> =
-                                Box::pin(self.delete_link_reference(namespace, link));
-                            fut
-                        }),
-                ),
-        )
-        .await
-        .into_iter()
-        .collect::<Result<Vec<_>, _>>()?;
-
-        for (link, metadata) in tracked_create_writes
-            .iter()
-            .chain(non_tracked_create_writes.iter())
-            .chain(tracked_delete_writes.iter())
-        {
-            self.cache_put(namespace, link, metadata).await;
-        }
-        for link in tracked_delete_removes
-            .iter()
-            .chain(non_tracked_delete_links.iter())
-        {
-            self.cache_invalidate(namespace, link).await;
-        }
-
-        Ok(pending_blob_ops)
-    }
-
-    /// Builds blob index operations and link writes for create operations.
-    fn build_create_ops(
-        creates: &[ResolvedCreate],
-        link_cache: &mut HashMap<LinkKind, LinkMetadata>,
-    ) -> CreateOpsResult {
-        let mut pending_blob_ops: HashMap<Digest, Vec<BlobIndexOperation>> = HashMap::new();
-        let mut tracked_create_writes: Vec<(LinkKind, LinkMetadata)> = Vec::new();
-        let mut non_tracked_create_writes: Vec<(LinkKind, LinkMetadata)> = Vec::new();
-
-        for op in creates {
-            let is_tracked = op.link.is_tracked();
-
-            if is_tracked && op.referrer.is_some() {
-                let mut metadata = link_cache.remove(&op.link).unwrap_or_else(|| {
-                    LinkMetadata::from_digest(op.target.clone())
-                        .with_media_type(op.media_type.clone())
-                        .with_descriptor(op.descriptor.clone())
-                });
-
-                if let Some(manifest_digest) = &op.referrer {
-                    metadata.add_referrer(manifest_digest.clone());
-                }
-
-                if op.old_target.is_none() {
-                    pending_blob_ops
-                        .entry(op.target.clone())
-                        .or_default()
-                        .push(BlobIndexOperation::Insert(op.link.clone()));
-                }
-
-                tracked_create_writes.push((op.link.clone(), metadata));
-            } else {
-                if op.old_target.as_ref() != Some(&op.target) {
-                    pending_blob_ops
-                        .entry(op.target.clone())
-                        .or_default()
-                        .push(BlobIndexOperation::Insert(op.link.clone()));
-                    if let Some(old) = &op.old_target
-                        && *old != op.target
-                    {
-                        pending_blob_ops
-                            .entry(old.clone())
-                            .or_default()
-                            .push(BlobIndexOperation::Remove(op.link.clone()));
-                    }
-                }
-
-                non_tracked_create_writes.push((
-                    op.link.clone(),
-                    LinkMetadata::from_digest(op.target.clone())
-                        .with_media_type(op.media_type.clone())
-                        .with_descriptor(op.descriptor.clone()),
-                ));
-            }
-        }
-
-        (
-            pending_blob_ops,
-            tracked_create_writes,
-            non_tracked_create_writes,
-        )
-    }
-
-    /// Builds blob index operations and link writes/deletes for delete operations.
-    fn build_delete_ops(
-        deletes: &[ResolvedDelete],
-        link_cache: &mut HashMap<LinkKind, LinkMetadata>,
-        mut pending_blob_ops: HashMap<Digest, Vec<BlobIndexOperation>>,
-    ) -> DeleteOpsResult {
-        let mut tracked_delete_writes: Vec<(LinkKind, LinkMetadata)> = Vec::new();
-        let mut tracked_delete_removes: Vec<LinkKind> = Vec::new();
-        let mut non_tracked_delete_links: Vec<LinkKind> = Vec::new();
-
-        for op in deletes {
-            let is_tracked = op.link.is_tracked();
-
-            if is_tracked && op.referrer.is_some() {
-                if let Some(mut metadata) = link_cache.remove(&op.link) {
-                    if let Some(manifest_digest) = &op.referrer {
-                        metadata.remove_referrer(manifest_digest);
-                    }
-
-                    if metadata.has_references() {
-                        tracked_delete_writes.push((op.link.clone(), metadata));
-                    } else {
-                        tracked_delete_removes.push(op.link.clone());
-                        pending_blob_ops
-                            .entry(op.target.clone())
-                            .or_default()
-                            .push(BlobIndexOperation::Remove(op.link.clone()));
-                    }
-                }
-            } else {
-                non_tracked_delete_links.push(op.link.clone());
-                pending_blob_ops
-                    .entry(op.target.clone())
-                    .or_default()
-                    .push(BlobIndexOperation::Remove(op.link.clone()));
-            }
-        }
-
-        (
-            pending_blob_ops,
-            tracked_delete_writes,
-            tracked_delete_removes,
-            non_tracked_delete_links,
-        )
     }
 }

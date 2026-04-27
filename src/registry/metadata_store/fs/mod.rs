@@ -1,10 +1,7 @@
 use std::{collections::HashMap, path::PathBuf, sync::Arc};
 
 use async_trait::async_trait;
-use futures_util::{
-    future::join_all,
-    stream::{self, StreamExt},
-};
+use futures_util::stream::{self, StreamExt};
 use serde::Deserialize;
 use tracing::{debug, info, instrument};
 
@@ -14,7 +11,7 @@ use crate::{
         data_store,
         metadata_store::{
             BlobIndex, BlobIndexOperation, Error, LinkMetadata, LinkOperation, LockConfig,
-            LockStrategy, MetadataStore, ResolvedCreate, ResolvedDelete,
+            LockStrategy, MetadataStore,
             link_kind::LinkKind,
             lock::{self, LockBackend, MemoryBackend},
             lock_ops::{LockOps, ValidationResult},
@@ -409,22 +406,9 @@ impl MetadataStore for Backend {
                 return Err(Error::Lock("lock invalidated during operation".into()));
             }
 
-            let mut pending_blob_ops = self
-                .apply_creates(namespace, &creates, &mut link_cache)
+            let pending_blob_ops = self
+                .apply_link_operations(namespace, &creates, &valid_deletes, &mut link_cache)
                 .await?;
-
-            if !guard.is_valid() {
-                guard.release().await;
-                return Err(Error::Lock("lock invalidated during operation".into()));
-            }
-
-            self.apply_deletes(
-                namespace,
-                &valid_deletes,
-                &mut link_cache,
-                &mut pending_blob_ops,
-            )
-            .await?;
 
             if !guard.is_valid() {
                 guard.release().await;
@@ -453,120 +437,16 @@ impl MetadataStore for Backend {
     }
 }
 
-impl Backend {
-    async fn apply_creates(
+#[async_trait]
+impl LockOps for Backend {
+    async fn read_link_reference(
         &self,
         namespace: &str,
-        creates: &[ResolvedCreate],
-        link_cache: &mut HashMap<LinkKind, LinkMetadata>,
-    ) -> Result<HashMap<Digest, Vec<BlobIndexOperation>>, Error> {
-        let mut pending_blob_ops: HashMap<Digest, Vec<BlobIndexOperation>> = HashMap::new();
-        let mut non_tracked_create_writes: Vec<(LinkKind, LinkMetadata)> = Vec::new();
-
-        for op in creates {
-            if op.link.is_tracked() && op.referrer.is_some() {
-                let mut metadata = link_cache.remove(&op.link).unwrap_or_else(|| {
-                    LinkMetadata::from_digest(op.target.clone())
-                        .with_media_type(op.media_type.clone())
-                });
-
-                if let Some(manifest_digest) = &op.referrer {
-                    metadata.add_referrer(manifest_digest.clone());
-                }
-
-                if op.old_target.is_none() {
-                    pending_blob_ops
-                        .entry(op.target.clone())
-                        .or_default()
-                        .push(BlobIndexOperation::Insert(op.link.clone()));
-                }
-
-                self.write_link_reference(namespace, &op.link, &metadata)
-                    .await?;
-            } else {
-                pending_blob_ops
-                    .entry(op.target.clone())
-                    .or_default()
-                    .push(BlobIndexOperation::Insert(op.link.clone()));
-
-                if let Some(old) = &op.old_target
-                    && *old != op.target
-                {
-                    pending_blob_ops
-                        .entry(old.clone())
-                        .or_default()
-                        .push(BlobIndexOperation::Remove(op.link.clone()));
-                }
-
-                non_tracked_create_writes.push((
-                    op.link.clone(),
-                    LinkMetadata::from_digest(op.target.clone())
-                        .with_media_type(op.media_type.clone())
-                        .with_descriptor(op.descriptor.clone()),
-                ));
-            }
-        }
-
-        join_all(
-            non_tracked_create_writes
-                .iter()
-                .map(|(link, metadata)| async move {
-                    self.write_link_reference(namespace, link, metadata).await
-                }),
-        )
-        .await
-        .into_iter()
-        .collect::<Result<Vec<_>, _>>()?;
-
-        Ok(pending_blob_ops)
-    }
-
-    async fn apply_deletes(
-        &self,
-        namespace: &str,
-        deletes: &[ResolvedDelete],
-        link_cache: &mut HashMap<LinkKind, LinkMetadata>,
-        pending_blob_ops: &mut HashMap<Digest, Vec<BlobIndexOperation>>,
-    ) -> Result<(), Error> {
-        let mut non_tracked_delete_links: Vec<LinkKind> = Vec::new();
-
-        for op in deletes {
-            if op.link.is_tracked() && op.referrer.is_some() {
-                if let Some(mut metadata) = link_cache.remove(&op.link) {
-                    if let Some(manifest_digest) = &op.referrer {
-                        metadata.remove_referrer(manifest_digest);
-                    }
-
-                    if metadata.has_references() {
-                        self.write_link_reference(namespace, &op.link, &metadata)
-                            .await?;
-                    } else {
-                        self.delete_link_reference(namespace, &op.link).await?;
-                        pending_blob_ops
-                            .entry(op.target.clone())
-                            .or_default()
-                            .push(BlobIndexOperation::Remove(op.link.clone()));
-                    }
-                }
-            } else {
-                non_tracked_delete_links.push(op.link.clone());
-                pending_blob_ops
-                    .entry(op.target.clone())
-                    .or_default()
-                    .push(BlobIndexOperation::Remove(op.link.clone()));
-            }
-        }
-
-        join_all(
-            non_tracked_delete_links
-                .iter()
-                .map(|link| async move { self.delete_link_reference(namespace, link).await }),
-        )
-        .await
-        .into_iter()
-        .collect::<Result<Vec<_>, _>>()?;
-
-        Ok(())
+        link: &LinkKind,
+    ) -> Result<LinkMetadata, Error> {
+        let link_path = path_builder::link_path(link, namespace);
+        let data = self.store.read(&link_path).await?;
+        LinkMetadata::from_bytes(data)
     }
 
     async fn write_link_reference(
@@ -587,19 +467,6 @@ impl Backend {
         self.store.delete_dir(&path).await?;
         let _ = self.store.delete_empty_parent_dirs(&path).await;
         Ok(())
-    }
-}
-
-#[async_trait]
-impl LockOps for Backend {
-    async fn read_link_reference(
-        &self,
-        namespace: &str,
-        link: &LinkKind,
-    ) -> Result<LinkMetadata, Error> {
-        let link_path = path_builder::link_path(link, namespace);
-        let data = self.store.read(&link_path).await?;
-        LinkMetadata::from_bytes(data)
     }
 
     fn lock_key_for_link(_namespace: &str, link: &LinkKind) -> String {
