@@ -253,28 +253,14 @@ impl S3LockBackend {
         let supports_conditional_delete = self.supports_conditional_delete;
         LockGuard::with_async_release_and_heartbeat(
             move || {
-                Box::pin(async move {
-                    if !valid_for_release.load(Ordering::Acquire) {
-                        debug!("Lock ownership lost, skipping delete on release");
-                        return;
-                    }
-                    // Read cached ETags outside the futures so the RwLock guard is not
-                    // held across any await point.
-                    let futs: Vec<_> = lock_paths
-                        .iter()
-                        .map(|path| {
-                            let cached_etag = etag_cache.read().unwrap().get(path).cloned();
-                            release_lock_path(
-                                store.clone(),
-                                path.clone(),
-                                instance_id.clone(),
-                                cached_etag,
-                                supports_conditional_delete,
-                            )
-                        })
-                        .collect();
-                    join_all(futs).await;
-                })
+                Box::pin(release_guard(
+                    valid_for_release,
+                    lock_paths,
+                    etag_cache,
+                    store,
+                    instance_id,
+                    supports_conditional_delete,
+                ))
             },
             valid,
             heartbeat_handle,
@@ -619,6 +605,36 @@ async fn heartbeat_tick_path(
             HeartbeatPathResult::Failure
         }
     }
+}
+
+async fn release_guard(
+    valid: Arc<AtomicBool>,
+    paths: Vec<String>,
+    etag_cache: Arc<RwLock<HashMap<String, String>>>,
+    store: Arc<data_store::s3::Backend>,
+    instance_id: String,
+    supports_conditional_delete: bool,
+) {
+    if !valid.load(Ordering::Acquire) {
+        debug!("Lock ownership lost, skipping delete on release");
+        return;
+    }
+    // Read cached ETags outside the futures so the RwLock guard is not
+    // held across any await point.
+    let futs: Vec<_> = paths
+        .iter()
+        .map(|path| {
+            let cached_etag = etag_cache.read().unwrap().get(path).cloned();
+            release_lock_path(
+                store.clone(),
+                path.clone(),
+                instance_id.clone(),
+                cached_etag,
+                supports_conditional_delete,
+            )
+        })
+        .collect();
+    join_all(futs).await;
 }
 
 async fn release_lock_path(
