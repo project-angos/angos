@@ -21,7 +21,7 @@ use tracing::{debug, info, instrument, warn};
 
 use crate::{
     cache::Cache,
-    oci::{Descriptor, Digest, Manifest},
+    oci::{Descriptor, Digest},
     registry::{
         data_store,
         metadata_store::{
@@ -30,6 +30,7 @@ use crate::{
             link_kind::LinkKind,
             lock::{self, MemoryBackend},
             lock_ops::LockOps,
+            referrer_resolver::resolve_referrer_descriptor,
         },
         pagination, path_builder,
     },
@@ -408,62 +409,29 @@ impl MetadataStore for Backend {
                 .list_objects(&referrers_dir, 100, continuation_token)
                 .await?;
 
-            let digest_entries: Vec<(Digest, LinkKind)> = objects
+            let digest_entries: Vec<Digest> = objects
                 .iter()
                 .filter_map(|key| {
                     let parts: Vec<&str> = key.split('/').collect();
                     if parts.len() < 2 || parts[0] != "sha256" {
                         return None;
                     }
-                    let manifest_digest = Digest::Sha256(parts[1].into());
-                    let referrer_link = LinkKind::Referrer(digest.clone(), manifest_digest.clone());
-                    Some((manifest_digest, referrer_link))
+                    Some(Digest::Sha256(parts[1].into()))
                 })
                 .collect();
 
             let results: Vec<Option<Descriptor>> = stream::iter(digest_entries)
-                .map(|(manifest_digest, referrer_link)| {
+                .map(|manifest_digest| {
                     let artifact_type = artifact_type.as_ref();
                     async move {
-                        if let Ok(metadata) =
-                            self.read_link_reference(namespace, &referrer_link).await
-                            && let Some(desc) = metadata.descriptor
-                        {
-                            match artifact_type {
-                                Some(at) if desc.artifact_type.as_ref() == Some(at) => {
-                                    return Some(desc);
-                                }
-                                None => return Some(desc),
-                                Some(_) if desc.artifact_type.is_none() => {}
-                                Some(_) => return None,
-                            }
-                        }
-
-                        let blob_path = path_builder::blob_path(&manifest_digest);
-                        match self.store.read(&blob_path).await {
-                            Ok(data) => {
-                                let manifest_len = data.len();
-                                match Manifest::from_slice(&data) {
-                                    Ok(manifest) => manifest.to_descriptor(
-                                        artifact_type,
-                                        manifest_digest,
-                                        manifest_len as u64,
-                                    ),
-                                    Err(e) => {
-                                        warn!("Failed to parse manifest at {blob_path}: {e}");
-                                        None
-                                    }
-                                }
-                            }
-                            Err(e) if e.kind() == ErrorKind::NotFound => {
-                                warn!("Referrer blob not found at {blob_path}, skipping");
-                                None
-                            }
-                            Err(e) => {
-                                warn!("Failed to read referrer blob at {blob_path}: {e}");
-                                None
-                            }
-                        }
+                        resolve_referrer_descriptor(
+                            digest,
+                            manifest_digest,
+                            artifact_type,
+                            |link| async move { self.read_link_reference(namespace, &link).await },
+                            |path| async move { self.store.read(&path).await },
+                        )
+                        .await
                     }
                 })
                 .buffer_unordered(10)
