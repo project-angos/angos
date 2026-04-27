@@ -387,12 +387,12 @@ impl S3LockBackend {
         let instance_id = self.instance_id.clone();
         let ttl_secs = self.ttl_secs;
         let max_hold_secs = self.max_hold_secs;
-        let interval = Duration::from_secs(ttl_secs / 3);
+        let tick_deadline = Duration::from_secs(ttl_secs / 3);
 
         tokio::spawn(async move {
             let started_at = tokio::time::Instant::now();
             let max_hold = Duration::from_secs(max_hold_secs);
-            let mut interval_timer = tokio::time::interval(interval);
+            let mut interval_timer = tokio::time::interval(tick_deadline);
             interval_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             interval_timer.tick().await; // consume immediate first tick
 
@@ -413,87 +413,109 @@ impl S3LockBackend {
                     return;
                 }
 
-                let results: Vec<(String, HeartbeatPathResult)> =
-                    join_all(paths.iter().map(|path| {
-                        let cached_etag = etag_cache.read().unwrap().get(path).cloned();
-                        let store = store.clone();
-                        let instance_id = instance_id.clone();
-                        let tick_deadline = interval;
-                        async move {
-                            // Cap each tick to the heartbeat interval. The slow path
-                            // (no cached ETag) issues two sequential SDK calls that
-                            // could each consume the full operation timeout, exceeding
-                            // the heartbeat interval and risking TTL expiry.
-                            let result = if let Ok(result) = tokio::time::timeout(
-                                tick_deadline,
-                                heartbeat_tick_path(
-                                    &store,
-                                    path,
-                                    &instance_id,
-                                    ttl_secs,
-                                    cached_etag,
-                                ),
-                            )
-                            .await
-                            {
-                                result
-                            } else {
-                                warn!(path, "Heartbeat tick timed out");
-                                HeartbeatPathResult::Failure
-                            };
-                            (path.clone(), result)
-                        }
-                    }))
-                    .await;
-
-                let mut tick_had_failure = false;
-                for (path, result) in results {
-                    match result {
-                        HeartbeatPathResult::Ok(new_etag) => {
-                            let mut cache = etag_cache.write().unwrap();
-                            if let Some(etag) = new_etag {
-                                cache.insert(path, etag);
-                            } else {
-                                cache.remove(&path);
-                            }
-                        }
-                        HeartbeatPathResult::Invalidate(reason) => {
-                            LOCK_INVALIDATIONS.with_label_values(&["s3", reason]).inc();
-                            valid.store(false, Ordering::Release);
-                            return;
-                        }
-                        HeartbeatPathResult::Failure => {
-                            etag_cache.write().unwrap().remove(&path);
-                            tick_had_failure = true;
-                        }
-                    }
-                }
-
-                if tick_had_failure {
-                    consecutive_failures = consecutive_failures.saturating_add(1);
-                    if u64::from(consecutive_failures) * (ttl_secs / 3) >= ttl_secs {
-                        warn!(
-                            consecutive_failures,
-                            "Too many consecutive heartbeat tick failures, invalidating lock"
-                        );
-                        LOCK_INVALIDATIONS
-                            .with_label_values(&["s3", "heartbeat_failure"])
-                            .inc();
+                match run_heartbeat_tick(
+                    &paths,
+                    &store,
+                    &instance_id,
+                    ttl_secs,
+                    tick_deadline,
+                    &etag_cache,
+                    &mut consecutive_failures,
+                )
+                .await
+                {
+                    TickOutcome::Continue => {}
+                    TickOutcome::Invalidate(reason) => {
+                        LOCK_INVALIDATIONS.with_label_values(&["s3", reason]).inc();
                         valid.store(false, Ordering::Release);
                         return;
                     }
-                } else {
-                    consecutive_failures = 0;
                 }
             }
         })
     }
 }
 
+enum TickOutcome {
+    Continue,
+    Invalidate(&'static str),
+}
+
 enum HeartbeatPathResult {
     Ok(Option<String>),
     Invalidate(&'static str),
     Failure,
+}
+
+async fn run_heartbeat_tick(
+    paths: &[String],
+    store: &data_store::s3::Backend,
+    instance_id: &str,
+    ttl_secs: u64,
+    tick_deadline: Duration,
+    etag_cache: &Arc<RwLock<HashMap<String, String>>>,
+    consecutive_failures: &mut u32,
+) -> TickOutcome {
+    let results: Vec<(String, HeartbeatPathResult)> = join_all(paths.iter().map(|path| {
+        let cached_etag = etag_cache.read().unwrap().get(path).cloned();
+        let store = store.clone();
+        let instance_id = instance_id.to_owned();
+        async move {
+            // Cap each tick to the heartbeat interval. The slow path
+            // (no cached ETag) issues two sequential SDK calls that
+            // could each consume the full operation timeout, exceeding
+            // the heartbeat interval and risking TTL expiry.
+            let result = if let Ok(result) = tokio::time::timeout(
+                tick_deadline,
+                heartbeat_tick_path(&store, path, &instance_id, ttl_secs, cached_etag),
+            )
+            .await
+            {
+                result
+            } else {
+                warn!(path, "Heartbeat tick timed out");
+                HeartbeatPathResult::Failure
+            };
+            (path.clone(), result)
+        }
+    }))
+    .await;
+
+    let mut tick_had_failure = false;
+    for (path, result) in results {
+        match result {
+            HeartbeatPathResult::Ok(new_etag) => {
+                let mut cache = etag_cache.write().unwrap();
+                if let Some(etag) = new_etag {
+                    cache.insert(path, etag);
+                } else {
+                    cache.remove(&path);
+                }
+            }
+            HeartbeatPathResult::Invalidate(reason) => {
+                return TickOutcome::Invalidate(reason);
+            }
+            HeartbeatPathResult::Failure => {
+                etag_cache.write().unwrap().remove(&path);
+                tick_had_failure = true;
+            }
+        }
+    }
+
+    if tick_had_failure {
+        *consecutive_failures = consecutive_failures.saturating_add(1);
+        if u64::from(*consecutive_failures) * (ttl_secs / 3) >= ttl_secs {
+            warn!(
+                consecutive_failures,
+                "Too many consecutive heartbeat tick failures, invalidating lock"
+            );
+            return TickOutcome::Invalidate("heartbeat_failure");
+        }
+    } else {
+        *consecutive_failures = 0;
+    }
+
+    TickOutcome::Continue
 }
 
 async fn heartbeat_tick_path(
