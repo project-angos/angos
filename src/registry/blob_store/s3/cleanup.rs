@@ -8,11 +8,15 @@ use crate::registry::{
     path_builder,
 };
 
-pub fn parse_upload_key(key: &str) -> Option<(String, String)> {
-    let key = key.strip_prefix("v2/repositories/")?;
-    let key = key.strip_suffix("/data")?;
-    let (namespace, uuid) = key.rsplit_once("/_uploads/")?;
-    Some((namespace.to_string(), uuid.to_string()))
+/// Inverse of [`path_builder::upload_path`]: parses
+/// `v2/repositories/{namespace}/_uploads/{uuid}/data` into `(namespace, uuid)`.
+///
+/// Returns slices borrowed from `key` so cleanup passes don't allocate per upload.
+pub fn parse_upload_key(key: &str) -> Option<(&str, &str)> {
+    key.strip_prefix(path_builder::repository_dir())?
+        .strip_prefix('/')?
+        .strip_suffix("/data")?
+        .rsplit_once("/_uploads/")
 }
 
 impl Backend {
@@ -31,7 +35,7 @@ impl Backend {
         let Some((namespace, uuid)) = parse_upload_key(key) else {
             return Ok(false);
         };
-        let startedat_path = path_builder::upload_start_date_path(&namespace, &uuid);
+        let startedat_path = path_builder::upload_start_date_path(namespace, uuid);
         if self.store.object_size(&startedat_path).await.is_ok() {
             return Ok(false);
         }
@@ -91,19 +95,13 @@ mod tests {
     #[test]
     fn test_parse_upload_key_valid() {
         let result = parse_upload_key("v2/repositories/my-repo/_uploads/abc-123-def/data");
-        assert_eq!(
-            result,
-            Some(("my-repo".to_string(), "abc-123-def".to_string()))
-        );
+        assert_eq!(result, Some(("my-repo", "abc-123-def")));
     }
 
     #[test]
     fn test_parse_upload_key_nested_namespace() {
         let result = parse_upload_key("v2/repositories/org/project/image/_uploads/uuid-here/data");
-        assert_eq!(
-            result,
-            Some(("org/project/image".to_string(), "uuid-here".to_string()))
-        );
+        assert_eq!(result, Some(("org/project/image", "uuid-here")));
     }
 
     #[test]
