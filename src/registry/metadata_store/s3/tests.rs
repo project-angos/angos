@@ -1077,7 +1077,7 @@ async fn test_probe_conditional_capabilities() {
     })
     .unwrap();
 
-    let result = Backend::probe_conditional_capabilities(&store).await;
+    let result = super::probe_conditional_capabilities(&store).await;
     assert!(result.is_ok(), "Probe should pass on MinIO: {result:?}");
     let caps = result.unwrap();
     assert!(caps.put_if_none_match, "MinIO should support If-None-Match");

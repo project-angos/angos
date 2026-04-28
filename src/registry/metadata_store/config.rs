@@ -27,8 +27,7 @@ impl MetadataStoreConfig {
                     let store =
                         data_store::s3::Backend::new(&config.to_lock_store_config(lock_config))
                             .map_err(|e| Error::StorageBackend(e.to_string()))?;
-                    let caps =
-                        metadata_store::s3::Backend::probe_conditional_capabilities(&store).await?;
+                    let caps = metadata_store::s3::probe_conditional_capabilities(&store).await?;
                     if !caps.supports_cas() {
                         return Err(Error::Lock(format!(
                             "S3 lock strategy requires If-None-Match and If-Match support, \

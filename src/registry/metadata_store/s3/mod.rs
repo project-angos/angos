@@ -1,6 +1,5 @@
 use std::{
     collections::HashSet,
-    io::ErrorKind,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -21,10 +20,7 @@ use crate::{
         data_store,
         metadata_store::{
             BlobIndex, BlobIndexOperation, ConditionalCapabilities, Error, LinkMetadata,
-            LinkOperation, LockStrategy, MetadataStore,
-            link_kind::LinkKind,
-            lock::{self, MemoryBackend},
-            lock_ops::LockOps,
+            LinkOperation, LockStrategy, MetadataStore, link_kind::LinkKind, lock_ops::LockOps,
             referrer_resolver::resolve_referrer_descriptor,
         },
         pagination, path_builder,
@@ -37,11 +33,13 @@ mod config;
 mod coordinator;
 mod link_ops;
 mod namespace_registry;
+mod probe;
 
 #[cfg(test)]
 mod tests;
 
 use coordinator::WriteCoordinator;
+pub use probe::probe_conditional_capabilities;
 
 #[derive(Clone)]
 pub struct Backend {
@@ -60,53 +58,6 @@ const MAX_UPDATE_RETRIES: u32 = 10;
 const MAX_BLOB_INDEX_CAS_RETRIES: u32 = 20;
 
 impl Backend {
-    fn build_coordinator(
-        config: &BackendConfig,
-        caps: &ConditionalCapabilities,
-    ) -> Result<Arc<dyn WriteCoordinator>, Error> {
-        match &config.lock_strategy {
-            LockStrategy::S3(s3_lock_config) => {
-                if !caps.supports_cas() {
-                    return Err(Error::Lock(format!(
-                        "S3 lock strategy requires If-None-Match and If-Match support, \
-                         but provider has put_if_none_match={}, put_if_match={}. \
-                         Use lock_strategy = redis or lock_strategy = memory instead.",
-                        caps.put_if_none_match, caps.put_if_match
-                    )));
-                }
-                info!("Using CAS coordinator with S3 lock for S3 metadata-store");
-                let lock_store = Arc::new(
-                    data_store::s3::Backend::new(&config.to_lock_store_config(s3_lock_config))
-                        .map_err(|e| {
-                            Error::Lock(format!("Failed to initialize S3 lock store: {e}"))
-                        })?,
-                );
-                let lock = Arc::new(
-                    lock::S3LockBackend::new(lock_store, s3_lock_config, caps.delete_if_match)
-                        .map_err(|e| {
-                            Error::Lock(format!("Failed to initialize S3 lock store: {e}"))
-                        })?,
-                );
-                Ok(Arc::new(coordinator::CasCoordinator { lock }))
-            }
-            LockStrategy::Redis(redis_config) => {
-                info!("Using Redis lock store for S3 metadata-store");
-                let backend = lock::RedisBackend::new(redis_config).map_err(|e| {
-                    Error::Lock(format!("Failed to initialize Redis lock store: {e}"))
-                })?;
-                Ok(Arc::new(coordinator::LockCoordinator {
-                    lock: Arc::new(backend),
-                }))
-            }
-            LockStrategy::Memory => {
-                info!("Using in-memory lock store for S3 metadata-store");
-                Ok(Arc::new(coordinator::LockCoordinator {
-                    lock: Arc::new(MemoryBackend::new()),
-                }))
-            }
-        }
-    }
-
     /// Create a new S3 metadata-store backend.
     ///
     /// `conditional` carries the capabilities used by the CAS coordinator when the
@@ -138,7 +89,7 @@ impl Backend {
             }
         });
 
-        let coordinator = Self::build_coordinator(config, &caps)?;
+        let coordinator = coordinator::build_coordinator(config, &caps)?;
 
         if config.access_time_debounce_secs == 0
             && matches!(config.lock_strategy, LockStrategy::S3(_))
@@ -199,117 +150,6 @@ impl Backend {
         };
 
         Ok(backend)
-    }
-
-    /// Probe each conditional S3 operation independently.
-    ///
-    /// Tests `PutObject If-None-Match: *`, `PutObject If-Match: <etag>`, and
-    /// `DeleteObject If-Match: <etag>` in sequence. Each probe is self-validating:
-    /// bogus-ETag attempts verify that the provider actually enforces the condition.
-    ///
-    /// Returns the probed capabilities. The caller is responsible for failing startup
-    /// if any required capability is absent.
-    pub async fn probe_conditional_capabilities(
-        store: &data_store::s3::Backend,
-    ) -> Result<ConditionalCapabilities, Error> {
-        let probe_key = format!("_angos_probe_{}", uuid::Uuid::new_v4());
-        let content: &[u8] = b"probe";
-
-        store.put_object(&probe_key, content).await.map_err(|e| {
-            Error::Lock(format!(
-                "conditional capability probe: failed to create probe object: {e}"
-            ))
-        })?;
-
-        // Test If-None-Match: * — expect 412 because the object already exists.
-        let put_if_none_match = match store.put_object_if_not_exists(&probe_key, content).await {
-            Err(data_store::Error::PreconditionFailed) => true,
-            Ok(_) => {
-                warn!(
-                    "conditional probe: If-None-Match: * was accepted on existing key; provider does not enforce it"
-                );
-                false
-            }
-            Err(e) => {
-                warn!("conditional probe: If-None-Match error: {e}");
-                false
-            }
-        };
-
-        // Test If-Match: <etag> — correct ETag must succeed; bogus ETag must fail.
-        let put_if_match = match store.read_with_etag(&probe_key).await {
-            Ok((_, Some(etag))) => {
-                let correct = store
-                    .put_object_if_match(&probe_key, &etag, b"updated".to_vec())
-                    .await
-                    .is_ok();
-                let bogus_rejected = matches!(
-                    store
-                        .put_object_if_match(&probe_key, "\"bogus\"", b"fail".to_vec())
-                        .await,
-                    Err(data_store::Error::PreconditionFailed)
-                );
-                correct && bogus_rejected
-            }
-            Ok((_, None)) => {
-                warn!("conditional probe: ETag not returned; If-Match support cannot be verified");
-                false
-            }
-            Err(e) => {
-                warn!("conditional probe: failed to read probe object for If-Match test: {e}");
-                false
-            }
-        };
-
-        // Test DeleteObject If-Match: <etag> — bogus ETag must fail; correct ETag must succeed.
-        // Re-read the current ETag after the put_if_match update may have changed it.
-        let delete_if_match = match store.read_with_etag(&probe_key).await {
-            Ok((_, Some(etag))) => {
-                // Bogus-ETag attempt first: if the provider ignores the condition and deletes
-                // the object, the correct-ETag attempt below will hit NotFound and correct=false.
-                let bogus_rejected = matches!(
-                    store.delete_if_match(&probe_key, "\"bogus\"").await,
-                    Err(data_store::Error::PreconditionFailed)
-                );
-                let correct = store.delete_if_match(&probe_key, &etag).await.is_ok();
-                bogus_rejected && correct
-            }
-            Ok((_, None)) => {
-                warn!(
-                    "conditional probe: ETag not returned; DeleteObject If-Match support cannot be verified"
-                );
-                false
-            }
-            Err(e) if e.kind() == ErrorKind::NotFound => false,
-            Err(e) => {
-                warn!(
-                    "conditional probe: failed to read probe object for delete_if_match test: {e}"
-                );
-                false
-            }
-        };
-
-        // Cleanup — may already have been deleted by the delete_if_match test.
-        if let Err(e) = store.delete(&probe_key).await
-            && e.kind() != ErrorKind::NotFound
-        {
-            warn!("conditional probe: cleanup failed for probe object {probe_key}: {e}");
-        }
-
-        let capabilities = ConditionalCapabilities {
-            put_if_none_match,
-            put_if_match,
-            delete_if_match,
-        };
-
-        info!(
-            if_none_match = capabilities.put_if_none_match,
-            if_match = capabilities.put_if_match,
-            delete_if_match = capabilities.delete_if_match,
-            "S3 conditional capability probe complete"
-        );
-
-        Ok(capabilities)
     }
 
     pub fn with_cache(mut self, cache: Arc<dyn Cache>) -> Self {
@@ -485,97 +325,7 @@ impl MetadataStore for Backend {
 
     #[instrument(skip(self))]
     async fn read_blob_index(&self, digest: &Digest) -> Result<BlobIndex, Error> {
-        // Try sharded format first (refs/{namespace}.json per namespace)
-        let refs_dir = path_builder::blob_index_refs_dir(digest);
-        let mut index = BlobIndex::default();
-        let mut found_shards = false;
-        let mut continuation_token = None;
-
-        loop {
-            let (_, objects, next_token) = self
-                .store
-                .list_prefixes(&refs_dir, "/", 1000, continuation_token, None)
-                .await?;
-
-            if !objects.is_empty() {
-                found_shards = true;
-            }
-
-            let shard_results: Vec<Result<Option<(String, HashSet<LinkKind>)>, Error>> =
-                stream::iter(objects.into_iter().map(|obj| {
-                    let shard_path = format!("{refs_dir}/{obj}");
-                    async move {
-                        match self.store.read(&shard_path).await {
-                            Ok(data) => {
-                                if let Ok(links) =
-                                    serde_json::from_slice::<HashSet<LinkKind>>(&data)
-                                {
-                                    let namespace = obj
-                                        .strip_suffix(".json")
-                                        .unwrap_or(&obj)
-                                        .replace("%2F", "/")
-                                        .replace("%25", "%");
-                                    if !links.is_empty() {
-                                        return Ok(Some((namespace, links)));
-                                    }
-                                }
-                                Ok(None)
-                            }
-                            Err(e) if e.kind() == ErrorKind::NotFound => Ok(None),
-                            Err(e) => Err(Error::from(e)),
-                        }
-                    }
-                }))
-                .buffer_unordered(10)
-                .collect()
-                .await;
-
-            for result in shard_results {
-                if let Some((namespace, links)) = result? {
-                    index.namespace.insert(namespace, links);
-                }
-            }
-
-            continuation_token = next_token;
-            if continuation_token.is_none() {
-                break;
-            }
-        }
-
-        if found_shards {
-            if index.namespace.is_empty() {
-                return Err(Error::ReferenceNotFound);
-            }
-            return Ok(index);
-        }
-
-        // Legacy index.json fallback — remove after v2.0.0 migration
-        let legacy_path = path_builder::blob_index_path(digest);
-        let data = match self.store.read(&legacy_path).await {
-            Ok(data) => data,
-            Err(e) if e.kind() == ErrorKind::NotFound => {
-                return Err(Error::ReferenceNotFound);
-            }
-            Err(e) => return Err(e.into()),
-        };
-        let blob_index: BlobIndex = serde_json::from_slice(&data).map_err(Error::from)?;
-
-        // Migrate: write shards, then delete legacy file
-        for (namespace, links) in &blob_index.namespace {
-            let ops: Vec<BlobIndexOperation> = links
-                .iter()
-                .map(|link| BlobIndexOperation::Insert(link.clone()))
-                .collect();
-            self.update_blob_index_shard(namespace, digest, &ops)
-                .await?;
-        }
-        self.store.delete(&legacy_path).await?;
-        info!(
-            "Migrated legacy blob index for '{digest}' ({} namespaces)",
-            blob_index.namespace.len()
-        );
-
-        Ok(blob_index)
+        self.read_blob_index_impl(digest).await
     }
 
     #[instrument(skip(self))]

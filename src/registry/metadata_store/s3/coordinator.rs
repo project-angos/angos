@@ -3,17 +3,18 @@ use std::{collections::HashMap, io::ErrorKind, sync::Arc, time::Duration};
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures_util::future::join_all;
-use tracing::{debug, instrument, warn};
+use tracing::{debug, info, instrument, warn};
 
-use super::{Backend, MAX_BLOB_INDEX_CAS_RETRIES};
+use super::{Backend, MAX_BLOB_INDEX_CAS_RETRIES, config::BackendConfig};
 use crate::{
     oci::Digest,
     registry::{
         data_store,
         metadata_store::{
-            BlobIndexOperation, Error, LinkMetadata, LinkOperation, ResolvedCreate, ResolvedDelete,
+            BlobIndexOperation, ConditionalCapabilities, Error, LinkMetadata, LinkOperation,
+            LockStrategy, ResolvedCreate, ResolvedDelete,
             link_kind::LinkKind,
-            lock::{LockBackend, S3LockBackend},
+            lock::{self, LockBackend, MemoryBackend, S3LockBackend},
             lock_ops::{LockOps, ValidationResult},
             simple_jitter,
         },
@@ -638,5 +639,47 @@ impl WriteCoordinator for LockCoordinator {
             .await?;
         guard.release().await;
         Ok(())
+    }
+}
+
+pub(super) fn build_coordinator(
+    config: &BackendConfig,
+    caps: &ConditionalCapabilities,
+) -> Result<Arc<dyn WriteCoordinator>, Error> {
+    match &config.lock_strategy {
+        LockStrategy::S3(s3_lock_config) => {
+            if !caps.supports_cas() {
+                return Err(Error::Lock(format!(
+                    "S3 lock strategy requires If-None-Match and If-Match support, \
+                     but provider has put_if_none_match={}, put_if_match={}. \
+                     Use lock_strategy = redis or lock_strategy = memory instead.",
+                    caps.put_if_none_match, caps.put_if_match
+                )));
+            }
+            info!("Using CAS coordinator with S3 lock for S3 metadata-store");
+            let lock_store = Arc::new(
+                data_store::s3::Backend::new(&config.to_lock_store_config(s3_lock_config))
+                    .map_err(|e| Error::Lock(format!("Failed to initialize S3 lock store: {e}")))?,
+            );
+            let lock = Arc::new(
+                S3LockBackend::new(lock_store, s3_lock_config, caps.delete_if_match)
+                    .map_err(|e| Error::Lock(format!("Failed to initialize S3 lock store: {e}")))?,
+            );
+            Ok(Arc::new(CasCoordinator { lock }))
+        }
+        LockStrategy::Redis(redis_config) => {
+            info!("Using Redis lock store for S3 metadata-store");
+            let backend = lock::RedisBackend::new(redis_config)
+                .map_err(|e| Error::Lock(format!("Failed to initialize Redis lock store: {e}")))?;
+            Ok(Arc::new(LockCoordinator {
+                lock: Arc::new(backend),
+            }))
+        }
+        LockStrategy::Memory => {
+            info!("Using in-memory lock store for S3 metadata-store");
+            Ok(Arc::new(LockCoordinator {
+                lock: Arc::new(MemoryBackend::new()),
+            }))
+        }
     }
 }
