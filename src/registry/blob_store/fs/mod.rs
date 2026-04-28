@@ -4,12 +4,12 @@ pub mod tests;
 use std::{
     fmt,
     fmt::{Debug, Formatter},
-    io::{ErrorKind, SeekFrom},
-    path::PathBuf,
+    io::{self, ErrorKind, SeekFrom},
+    path::{Path, PathBuf},
 };
 
 use async_trait::async_trait;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration, Utc};
 use sha2::{Digest as Sha256Digest, Sha256};
 use tokio::io::{AsyncRead, AsyncSeekExt};
 use tracing::{error, info, instrument};
@@ -18,7 +18,7 @@ use crate::{
     oci::Digest,
     registry::{
         blob_store::{
-            BlobStore, BoxedReader, Error, UploadStore, UploadSummary,
+            BlobStore, BoxedReader, Error, MultipartCleanup, UploadStore, UploadSummary,
             hashing_reader::HashingReader, sha256_ext::Sha256Ext,
         },
         data_store, pagination, path_builder,
@@ -221,13 +221,7 @@ impl UploadStore for Backend {
         } else {
             self.store.create_file(&file_path).await
         }
-        .map_err(|error| {
-            error!("Error opening upload file {file_path}: {error}");
-            match error.kind() {
-                ErrorKind::NotFound => Error::UploadNotFound,
-                _ => error.into(),
-            }
-        })?;
+        .map_err(|e| classify_open_error(e, Path::new(&file_path)))?;
         file.seek(SeekFrom::Start(upload_size)).await?;
 
         let hasher = self.load_hasher(name, uuid, upload_size).await?;
@@ -291,5 +285,25 @@ impl UploadStore for Backend {
         self.store.delete_dir(&path).await?;
         self.store.delete_empty_parent_dirs(&path).await?;
         Ok(())
+    }
+}
+
+#[async_trait]
+impl MultipartCleanup for Backend {
+    // FS uploads are plain files; there are no S3 multipart uploads to clean up.
+    async fn cleanup_orphan_multipart_uploads(
+        &self,
+        _timeout: Duration,
+        _dry_run: bool,
+    ) -> Result<usize, Error> {
+        Ok(0)
+    }
+}
+
+fn classify_open_error(error: io::Error, path: &Path) -> Error {
+    error!("Error opening upload file {}: {error}", path.display());
+    match error.kind() {
+        ErrorKind::NotFound => Error::UploadNotFound,
+        _ => error.into(),
     }
 }

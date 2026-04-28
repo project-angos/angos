@@ -30,27 +30,6 @@ impl Backend {
             .flatten()
     }
 
-    pub async fn cache_put(&self, namespace: &str, link: &LinkKind, metadata: &LinkMetadata) {
-        if self.link_cache_ttl == 0 {
-            return;
-        }
-        if let Some(cache) = &self.cache {
-            let _ = cache
-                .store(
-                    &Self::cache_key(namespace, link),
-                    metadata,
-                    self.link_cache_ttl,
-                )
-                .await;
-        }
-    }
-
-    pub async fn cache_invalidate(&self, namespace: &str, link: &LinkKind) {
-        if let Some(cache) = &self.cache {
-            let _ = cache.delete_value(&Self::cache_key(namespace, link)).await;
-        }
-    }
-
     /// Reads the link with its `ETag`, then spawns the access time write as a
     /// background task so the caller doesn't block on the CAS round-trip.
     ///
@@ -88,20 +67,6 @@ impl Backend {
         Ok(link_data)
     }
 
-    pub async fn write_link_reference(
-        &self,
-        namespace: &str,
-        link: &LinkKind,
-        metadata: &LinkMetadata,
-    ) -> Result<(), Error> {
-        let link_path = path_builder::link_path(link, namespace);
-        let serialized_link_data = Bytes::from(serde_json::to_vec(metadata)?);
-        self.store
-            .put_object(&link_path, serialized_link_data)
-            .await?;
-        Ok(())
-    }
-
     /// Atomically creates a link only if it does not already exist, using
     /// S3 conditional `If-None-Match: *`. Returns `true` if the link was
     /// created, `false` if it already existed (precondition failed).
@@ -123,16 +88,6 @@ impl Backend {
             Err(e) => Err(Error::StorageBackend(e.to_string())),
         }
     }
-
-    pub async fn delete_link_reference(
-        &self,
-        namespace: &str,
-        link: &LinkKind,
-    ) -> Result<(), Error> {
-        let link_path = path_builder::link_path(link, namespace);
-        self.store.delete(&link_path).await?;
-        Ok(())
-    }
 }
 
 #[async_trait]
@@ -150,7 +105,48 @@ impl LockOps for Backend {
         }
     }
 
+    async fn write_link_reference(
+        &self,
+        namespace: &str,
+        link: &LinkKind,
+        metadata: &LinkMetadata,
+    ) -> Result<(), Error> {
+        let link_path = path_builder::link_path(link, namespace);
+        let serialized_link_data = Bytes::from(serde_json::to_vec(metadata)?);
+        self.store
+            .put_object(&link_path, serialized_link_data)
+            .await?;
+        Ok(())
+    }
+
+    async fn delete_link_reference(&self, namespace: &str, link: &LinkKind) -> Result<(), Error> {
+        let link_path = path_builder::link_path(link, namespace);
+        self.store.delete(&link_path).await?;
+        Ok(())
+    }
+
     fn lock_key_for_link(namespace: &str, link: &LinkKind) -> String {
         format!("{namespace}:{link}")
+    }
+
+    async fn cache_put(&self, namespace: &str, link: &LinkKind, metadata: &LinkMetadata) {
+        if self.link_cache_ttl == 0 {
+            return;
+        }
+        if let Some(cache) = &self.cache {
+            let _ = cache
+                .store(
+                    &Self::cache_key(namespace, link),
+                    metadata,
+                    self.link_cache_ttl,
+                )
+                .await;
+        }
+    }
+
+    async fn cache_invalidate(&self, namespace: &str, link: &LinkKind) {
+        if let Some(cache) = &self.cache {
+            let _ = cache.delete_value(&Self::cache_key(namespace, link)).await;
+        }
     }
 }

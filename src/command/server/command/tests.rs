@@ -370,8 +370,7 @@ async fn test_build_registry_components_integration() {
     let config = create_config_with_repository();
 
     let auth_cache = build_auth_cache(&config.cache).unwrap();
-    let (blob_store, upload_store, presigned_blob_store) =
-        build_blob_stores(&config.blob_store, &auth_cache).unwrap();
+    let blob_handles = build_blob_stores(&config.blob_store, &auth_cache).unwrap();
     let metadata_store = build_metadata_store(&config, &auth_cache, &Arc::new(Mutex::new(None)))
         .await
         .unwrap();
@@ -386,9 +385,9 @@ async fn test_build_registry_components_integration() {
         .global_immutable_tags_exclusions(config.global.immutable_tags_exclusions.clone());
 
     let registry = Registry::new(
-        blob_store,
-        upload_store,
-        presigned_blob_store,
+        blob_handles.blob_store,
+        blob_handles.upload_store,
+        blob_handles.presigned_store,
         metadata_store,
         repositories,
         registry_config,

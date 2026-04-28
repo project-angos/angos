@@ -1,13 +1,19 @@
 use std::{collections::HashSet, io::ErrorKind, time::Duration};
 
 use bytes::Bytes;
-use tracing::{debug, warn};
+use futures_util::stream::{self, StreamExt};
+use tracing::{debug, info, instrument, warn};
 
 use super::Backend;
-use crate::registry::{
-    data_store,
-    metadata_store::{BlobIndexOperation, Error, link_kind::LinkKind, simple_jitter},
-    path_builder,
+use crate::{
+    oci::Digest,
+    registry::{
+        data_store,
+        metadata_store::{
+            BlobIndex, BlobIndexOperation, Error, link_kind::LinkKind, simple_jitter,
+        },
+        path_builder,
+    },
 };
 
 impl Backend {
@@ -89,6 +95,98 @@ impl Backend {
             "blob index CAS retries exhausted for digest {digest} after {} attempts",
             super::MAX_BLOB_INDEX_CAS_RETRIES
         )))
+    }
+
+    #[instrument(skip(self))]
+    pub async fn read_blob_index_impl(&self, digest: &Digest) -> Result<BlobIndex, Error> {
+        // Try sharded format first (refs/{namespace}.json per namespace)
+        let refs_dir = path_builder::blob_index_refs_dir(digest);
+        let mut index = BlobIndex::default();
+        let mut found_shards = false;
+        let mut continuation_token = None;
+
+        loop {
+            let (_, objects, next_token) = self
+                .store
+                .list_prefixes(&refs_dir, "/", 1000, continuation_token, None)
+                .await?;
+
+            if !objects.is_empty() {
+                found_shards = true;
+            }
+
+            let shard_results = stream::iter(objects.into_iter().map(|obj| {
+                let shard_path = format!("{refs_dir}/{obj}");
+                async move {
+                    match self.store.read(&shard_path).await {
+                        Ok(data) => {
+                            if let Ok(links) = serde_json::from_slice::<HashSet<LinkKind>>(&data) {
+                                let namespace = obj
+                                    .strip_suffix(".json")
+                                    .unwrap_or(&obj)
+                                    .replace("%2F", "/")
+                                    .replace("%25", "%");
+                                if !links.is_empty() {
+                                    return Ok(Some((namespace, links)));
+                                }
+                            }
+                            Ok(None)
+                        }
+                        Err(e) if e.kind() == ErrorKind::NotFound => Ok(None),
+                        Err(e) => Err(Error::from(e)),
+                    }
+                }
+            }))
+            .buffer_unordered(10)
+            .collect::<Vec<Result<Option<(String, HashSet<LinkKind>)>, Error>>>()
+            .await;
+
+            for result in shard_results {
+                if let Some((namespace, links)) = result? {
+                    index.namespace.insert(namespace, links);
+                }
+            }
+
+            continuation_token = next_token;
+            if continuation_token.is_none() {
+                break;
+            }
+        }
+
+        if found_shards {
+            if index.namespace.is_empty() {
+                return Err(Error::ReferenceNotFound);
+            }
+            return Ok(index);
+        }
+
+        // Legacy index.json fallback — remove after v2.0.0 migration
+        let legacy_path = path_builder::blob_index_path(digest);
+        let data = match self.store.read(&legacy_path).await {
+            Ok(data) => data,
+            Err(e) if e.kind() == ErrorKind::NotFound => {
+                return Err(Error::ReferenceNotFound);
+            }
+            Err(e) => return Err(e.into()),
+        };
+        let blob_index: BlobIndex = serde_json::from_slice(&data).map_err(Error::from)?;
+
+        // Migrate: write shards, then delete legacy file
+        for (namespace, links) in &blob_index.namespace {
+            let ops: Vec<BlobIndexOperation> = links
+                .iter()
+                .map(|link| BlobIndexOperation::Insert(link.clone()))
+                .collect();
+            self.update_blob_index_shard(namespace, digest, &ops)
+                .await?;
+        }
+        self.store.delete(&legacy_path).await?;
+        info!(
+            "Migrated legacy blob index for '{digest}' ({} namespaces)",
+            blob_index.namespace.len()
+        );
+
+        Ok(blob_index)
     }
 
     /// Unconditional read-modify-write on a namespace shard (caller must hold lock).

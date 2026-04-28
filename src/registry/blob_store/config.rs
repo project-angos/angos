@@ -1,7 +1,6 @@
 use std::sync::Arc;
 
 use serde::Deserialize;
-use tracing::warn;
 
 use crate::{
     cache::Cache,
@@ -11,11 +10,12 @@ use crate::{
     },
 };
 
-type BlobStoreTriple = (
-    Arc<dyn BlobStore>,
-    Arc<dyn UploadStore>,
-    Option<Arc<dyn PresignedBlobStore>>,
-);
+pub struct BlobStoreHandles {
+    pub blob_store: Arc<dyn BlobStore>,
+    pub upload_store: Arc<dyn UploadStore>,
+    pub presigned_store: Option<Arc<dyn PresignedBlobStore>>,
+    pub multipart_cleanup: Arc<dyn MultipartCleanup + Send + Sync>,
+}
 
 #[derive(Clone, Debug, Deserialize, PartialEq)]
 #[allow(clippy::large_enum_variant)]
@@ -33,11 +33,16 @@ impl Default for BlobStorageConfig {
 }
 
 impl BlobStorageConfig {
-    pub fn to_backend(&self, cache: Option<Arc<dyn Cache>>) -> Result<BlobStoreTriple, Error> {
+    pub fn to_backend(&self, cache: Option<Arc<dyn Cache>>) -> Result<BlobStoreHandles, Error> {
         match self {
             BlobStorageConfig::FS(config) => {
                 let backend = Arc::new(fs::Backend::new(config));
-                Ok((backend.clone(), backend, None))
+                Ok(BlobStoreHandles {
+                    blob_store: backend.clone(),
+                    upload_store: backend.clone(),
+                    presigned_store: None,
+                    multipart_cleanup: backend,
+                })
             }
             BlobStorageConfig::S3(config) => {
                 let mut backend = s3::Backend::new(config)?;
@@ -45,25 +50,55 @@ impl BlobStorageConfig {
                     backend = backend.with_cache(cache);
                 }
                 let backend = Arc::new(backend);
-                Ok((
-                    backend.clone(),
-                    backend.clone(),
-                    Some(backend as Arc<dyn PresignedBlobStore>),
-                ))
+                Ok(BlobStoreHandles {
+                    blob_store: backend.clone(),
+                    upload_store: backend.clone(),
+                    presigned_store: Some(backend.clone() as Arc<dyn PresignedBlobStore>),
+                    multipart_cleanup: backend,
+                })
             }
         }
     }
+}
 
-    pub fn to_multipart_cleanup(&self) -> Option<Arc<dyn MultipartCleanup + Send + Sync>> {
-        match self {
-            BlobStorageConfig::FS(_) => None,
-            BlobStorageConfig::S3(config) => match s3::Backend::new(config) {
-                Ok(backend) => Some(Arc::new(backend) as _),
-                Err(e) => {
-                    warn!("Failed to create S3 backend for multipart cleanup: {e}");
-                    None
-                }
-            },
-        }
+#[cfg(test)]
+mod tests {
+    use chrono::Duration;
+    use tempfile::TempDir;
+
+    use super::*;
+    use crate::registry::data_store;
+
+    #[tokio::test]
+    async fn fs_backend_provides_multipart_cleanup() {
+        let temp_dir = TempDir::new().unwrap();
+        let config = BlobStorageConfig::FS(data_store::fs::BackendConfig {
+            root_dir: temp_dir.path().to_string_lossy().to_string(),
+            sync_to_disk: false,
+        });
+
+        let handles = config.to_backend(None).unwrap();
+        let result = handles
+            .multipart_cleanup
+            .cleanup_orphan_multipart_uploads(Duration::hours(1), false)
+            .await
+            .unwrap();
+        assert_eq!(result, 0);
+    }
+
+    #[test]
+    fn s3_backend_provides_multipart_cleanup() {
+        let config = BlobStorageConfig::S3(data_store::s3::BackendConfig {
+            endpoint: "http://127.0.0.1:9000".to_string(),
+            region: "us-east-1".to_string(),
+            bucket: "test-bucket".to_string(),
+            access_key_id: "minioadmin".to_string(),
+            secret_key: "minioadmin".to_string(),
+            ..Default::default()
+        });
+
+        let handles = config.to_backend(None).unwrap();
+        // Verifies the handle is present; no live S3 call needed.
+        let _ = handles.multipart_cleanup;
     }
 }

@@ -46,24 +46,29 @@ impl LinkMetadata {
     }
 
     pub fn from_bytes(s: Vec<u8>) -> Result<Self, Error> {
-        // Try to deserialize the data as LinkMetadata, if it fails, it means
-        // the link is a simple string (probably coming from "distribution" implementation).
         if let Ok(metadata) = serde_json::from_slice(&s) {
-            Ok(metadata)
-        } else {
-            let target = String::from_utf8(s).map_err(|e| Error::InvalidData(e.to_string()))?;
-            let target =
-                Digest::try_from(target.as_str()).map_err(|e| Error::InvalidData(e.to_string()))?;
-
-            Ok(LinkMetadata {
-                target,
-                created_at: Some(Utc::now()),
-                accessed_at: None,
-                referenced_by: HashSet::new(),
-                media_type: None,
-                descriptor: None,
-            })
+            return Ok(metadata);
         }
+        Self::from_legacy_bytes(s)
+    }
+
+    /// Parses pre-JSON link data left over from the upstream `distribution`
+    /// implementation, where each link file held only the bare digest string.
+    /// `created_at` is synthesised from the current time since the legacy
+    /// format carried no timestamp.
+    fn from_legacy_bytes(s: Vec<u8>) -> Result<Self, Error> {
+        let target = String::from_utf8(s).map_err(|e| Error::InvalidData(e.to_string()))?;
+        let target =
+            Digest::try_from(target.as_str()).map_err(|e| Error::InvalidData(e.to_string()))?;
+
+        Ok(LinkMetadata {
+            target,
+            created_at: Some(Utc::now()),
+            accessed_at: None,
+            referenced_by: HashSet::new(),
+            media_type: None,
+            descriptor: None,
+        })
     }
 
     pub fn with_media_type(mut self, media_type: Option<String>) -> Self {

@@ -271,8 +271,7 @@ mod tests {
     }
 
     async fn create_server_context_from_config(config: &Configuration) -> ServerContext {
-        let (blob_store, upload_store, presigned_blob_store) =
-            config.blob_store.to_backend(None).unwrap();
+        let blob_handles = config.blob_store.to_backend(None).unwrap();
         let (metadata_store, _) = config
             .resolve_metadata_config()
             .to_backend(None)
@@ -289,9 +288,9 @@ mod tests {
             .global_immutable_tags_exclusions(Vec::new());
 
         let registry = Registry::new(
-            blob_store,
-            upload_store,
-            presigned_blob_store,
+            blob_handles.blob_store,
+            blob_handles.upload_store,
+            blob_handles.presigned_store,
             metadata_store,
             repositories,
             registry_config,
@@ -542,8 +541,7 @@ mod tests {
         "#;
 
         let invalid_config: Configuration = toml::from_str(invalid_toml).unwrap();
-        let (blob_store, upload_store, presigned_blob_store) =
-            invalid_config.blob_store.to_backend(None).unwrap();
+        let blob_handles = invalid_config.blob_store.to_backend(None).unwrap();
         let (metadata_store, _) = invalid_config
             .resolve_metadata_config()
             .to_backend(None)
@@ -560,9 +558,9 @@ mod tests {
             .global_immutable_tags_exclusions(Vec::new());
 
         let registry = Registry::new(
-            blob_store,
-            upload_store,
-            presigned_blob_store,
+            blob_handles.blob_store,
+            blob_handles.upload_store,
+            blob_handles.presigned_store,
             metadata_store,
             repositories,
             registry_config,

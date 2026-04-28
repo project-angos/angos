@@ -118,19 +118,19 @@ impl Backend {
             chunk_reader.read_to_end(&mut chunk).await?;
             let chunk = Bytes::from(chunk);
             let chunk_len = chunk.len() as u64;
+            let flush = should_flush(chunk_len, self.multipart_part_size as u64);
 
-            if chunk.len() < self.multipart_part_size {
-                reader.mark_finished();
-                self.store_staged_chunk(name, uuid, chunk, uploaded_size)
-                    .await?;
-                total_size = uploaded_size + chunk_len;
-            } else {
+            if flush {
                 self.store
                     .upload_part(&upload_path, &upload_id, uploaded_parts, chunk)
                     .await?;
                 uploaded_parts += 1;
-                total_size = uploaded_size + chunk_len;
+            } else {
+                reader.mark_finished();
+                self.store_staged_chunk(name, uuid, chunk, uploaded_size)
+                    .await?;
             }
+            total_size = uploaded_size + chunk_len;
 
             if append {
                 self.save_hasher(
@@ -142,7 +142,7 @@ impl Backend {
                 .await?;
             }
 
-            if chunk_len >= self.multipart_part_size as u64 {
+            if flush {
                 uploaded_size += chunk_len;
             }
         }
@@ -277,5 +277,37 @@ impl Backend {
             .unwrap_or_else(|_| Utc::now().fixed_offset())
             .with_timezone(&Utc);
         Ok(UploadSummary { size, started_at })
+    }
+}
+
+/// Returns `true` when `chunk_len` is large enough to flush as a multipart part.
+/// Smaller chunks must be staged so they can accumulate across PATCH requests
+/// before reaching the S3 minimum part size.
+fn should_flush(chunk_len: u64, multipart_part_size: u64) -> bool {
+    chunk_len >= multipart_part_size
+}
+
+#[cfg(test)]
+mod tests {
+    use super::should_flush;
+
+    #[test]
+    fn flushes_when_chunk_meets_part_size() {
+        assert!(should_flush(5 * 1024 * 1024, 5 * 1024 * 1024));
+    }
+
+    #[test]
+    fn flushes_when_chunk_exceeds_part_size() {
+        assert!(should_flush(5 * 1024 * 1024 + 1, 5 * 1024 * 1024));
+    }
+
+    #[test]
+    fn stages_when_chunk_below_part_size() {
+        assert!(!should_flush(5 * 1024 * 1024 - 1, 5 * 1024 * 1024));
+    }
+
+    #[test]
+    fn stages_empty_chunk() {
+        assert!(!should_flush(0, 5 * 1024 * 1024));
     }
 }

@@ -1,10 +1,17 @@
+use std::{io, path::Path};
+
 use tokio::fs;
 
+use super::classify_open_error;
 use crate::registry::{
-    blob_store::tests::{
-        test_build_blob_reader_returns_size, test_build_blob_reader_with_offset_returns_full_size,
-        test_datastore_blob_operations, test_datastore_list_blobs, test_datastore_list_uploads,
-        test_datastore_upload_operations,
+    blob_store::{
+        Error,
+        tests::{
+            test_build_blob_reader_returns_size,
+            test_build_blob_reader_with_offset_returns_full_size, test_datastore_blob_operations,
+            test_datastore_list_blobs, test_datastore_list_uploads,
+            test_datastore_upload_operations,
+        },
     },
     tests::FSRegistryTestCase,
 };
@@ -92,4 +99,18 @@ async fn test_blob_reader_returns_size() {
 async fn test_blob_reader_with_offset_returns_full_size() {
     let t = FSRegistryTestCase::new();
     test_build_blob_reader_with_offset_returns_full_size(t.blob_store()).await;
+}
+
+#[test]
+fn classify_open_error_maps_not_found_to_upload_not_found() {
+    let err = io::Error::from(io::ErrorKind::NotFound);
+    let result = classify_open_error(err, Path::new("/some/upload/path"));
+    assert!(matches!(result, Error::UploadNotFound));
+}
+
+#[test]
+fn classify_open_error_maps_other_kinds_via_from_impl() {
+    let err = io::Error::from(io::ErrorKind::PermissionDenied);
+    let result = classify_open_error(err, Path::new("/some/upload/path"));
+    assert!(matches!(result, Error::StorageBackend(_)));
 }

@@ -46,8 +46,7 @@ fn create_test_config() -> Configuration {
 
 pub async fn create_test_server_context() -> ServerContext {
     let config = create_test_config();
-    let (blob_store, upload_store, presigned_blob_store) =
-        config.blob_store.to_backend(None).unwrap();
+    let blob_handles = config.blob_store.to_backend(None).unwrap();
     let (metadata_store, _) = config
         .resolve_metadata_config()
         .to_backend(None)
@@ -64,9 +63,9 @@ pub async fn create_test_server_context() -> ServerContext {
         .global_immutable_tags_exclusions(Vec::new());
 
     let registry = Registry::new(
-        blob_store,
-        upload_store,
-        presigned_blob_store,
+        blob_handles.blob_store,
+        blob_handles.upload_store,
+        blob_handles.presigned_store,
         metadata_store,
         repositories,
         registry_config,
@@ -99,8 +98,7 @@ fn create_minimal_config() -> Configuration {
 }
 
 async fn create_test_registry(config: &Configuration) -> Registry {
-    let (blob_store, upload_store, presigned_blob_store) =
-        config.blob_store.to_backend(None).unwrap();
+    let blob_handles = config.blob_store.to_backend(None).unwrap();
     let (metadata_store, _) = config
         .resolve_metadata_config()
         .to_backend(None)
@@ -124,9 +122,9 @@ async fn create_test_registry(config: &Configuration) -> Registry {
         .global_immutable_tags_exclusions(config.global.immutable_tags_exclusions.clone());
 
     Registry::new(
-        blob_store,
-        upload_store,
-        presigned_blob_store,
+        blob_handles.blob_store,
+        blob_handles.upload_store,
+        blob_handles.presigned_store,
         metadata_store,
         repositories,
         registry_config,
@@ -960,8 +958,7 @@ async fn test_shutdown_flushes_pending_access_times() {
             root_dir: "/tmp/test-blobs-shutdown-flush".to_string(),
             ..Default::default()
         });
-    let (blob_store, upload_store, presigned_blob_store) =
-        blob_store_config.to_backend(None).unwrap();
+    let blob_handles = blob_store_config.to_backend(None).unwrap();
 
     let registry_config = RegistryConfig::new()
         .update_pull_time(false)
@@ -973,9 +970,9 @@ async fn test_shutdown_flushes_pending_access_times() {
 
     let repositories = Arc::new(HashMap::new());
     let registry = Registry::new(
-        blob_store,
-        upload_store,
-        presigned_blob_store,
+        blob_handles.blob_store,
+        blob_handles.upload_store,
+        blob_handles.presigned_store,
         metadata_store.clone(),
         repositories,
         registry_config,
@@ -1067,8 +1064,7 @@ async fn test_server_context_new_invalid_cache_config() {
 
     let config: Configuration = toml::from_str(toml).unwrap();
 
-    let (blob_store, upload_store, presigned_blob_store) =
-        config.blob_store.to_backend(None).unwrap();
+    let blob_handles = config.blob_store.to_backend(None).unwrap();
     let (metadata_store, _) = config
         .resolve_metadata_config()
         .to_backend(None)
@@ -1085,9 +1081,9 @@ async fn test_server_context_new_invalid_cache_config() {
         .global_immutable_tags_exclusions(config.global.immutable_tags_exclusions.clone());
 
     let registry = Registry::new(
-        blob_store,
-        upload_store,
-        presigned_blob_store,
+        blob_handles.blob_store,
+        blob_handles.upload_store,
+        blob_handles.presigned_store,
         metadata_store,
         repositories,
         registry_config,

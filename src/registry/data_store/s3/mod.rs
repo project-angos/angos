@@ -258,38 +258,40 @@ impl Backend {
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(|e| IoError::other(e.to_string()))?;
 
-            if !keys.is_empty() {
-                let delete = Delete::builder()
-                    .set_objects(Some(keys))
-                    .build()
-                    .map_err(|e| IoError::other(e.to_string()))?;
-
-                let result = self
-                    .s3_client
-                    .delete_objects()
-                    .bucket(&self.bucket)
-                    .delete(delete)
-                    .send()
-                    .await
-                    .map_err(|e| IoError::other(e.to_string()))?;
-
-                if let Some(errors) = result.errors
-                    && !errors.is_empty()
-                {
-                    let msg = errors
-                        .iter()
-                        .filter_map(|e| e.message())
-                        .collect::<Vec<_>>()
-                        .join("; ");
-                    return Err(IoError::other(format!("batch delete errors: {msg}")));
-                }
-            }
+            self.delete_batch(keys).await?;
 
             if res.is_truncated.unwrap_or(false) {
                 continuation_token = res.next_continuation_token;
             } else {
                 break;
             }
+        }
+
+        Ok(())
+    }
+
+    async fn delete_batch(&self, objects: Vec<ObjectIdentifier>) -> Result<(), IoError> {
+        // Skip the API call entirely when the page contained no objects.
+        if objects.is_empty() {
+            return Ok(());
+        }
+
+        let delete = Delete::builder()
+            .set_objects(Some(objects))
+            .build()
+            .map_err(|e| IoError::other(e.to_string()))?;
+
+        let result = self
+            .s3_client
+            .delete_objects()
+            .bucket(&self.bucket)
+            .delete(delete)
+            .send()
+            .await
+            .map_err(|e| IoError::other(e.to_string()))?;
+
+        if let Some(err) = aggregate_batch_delete_errors(&result.errors.unwrap_or_default()) {
+            return Err(err);
         }
 
         Ok(())
@@ -917,6 +919,18 @@ impl Backend {
     }
 }
 
+fn aggregate_batch_delete_errors(errors: &[aws_sdk_s3::types::Error]) -> Option<IoError> {
+    if errors.is_empty() {
+        return None;
+    }
+    let msg = errors
+        .iter()
+        .filter_map(|e| e.message())
+        .collect::<Vec<_>>()
+        .join("; ");
+    Some(IoError::other(format!("batch delete errors: {msg}")))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1025,5 +1039,26 @@ mod tests {
         if let Err(err) = result {
             assert!(err.to_string().contains("error") || err.to_string().contains("refused"));
         }
+    }
+
+    #[test]
+    fn test_aggregate_batch_delete_errors_joins_messages() {
+        use aws_sdk_s3::types::Error as S3Error;
+        let errors = vec![
+            S3Error::builder().message("first failure").build(),
+            S3Error::builder().message("second failure").build(),
+        ];
+        let result = aggregate_batch_delete_errors(&errors);
+        let err = result.expect("non-empty errors must produce IoError");
+        let msg = err.to_string();
+        assert!(msg.contains("batch delete errors:"), "got: {msg}");
+        assert!(msg.contains("first failure"), "got: {msg}");
+        assert!(msg.contains("second failure"), "got: {msg}");
+        assert!(msg.contains("; "), "got: {msg}");
+    }
+
+    #[test]
+    fn test_aggregate_batch_delete_errors_empty_returns_none() {
+        assert!(aggregate_batch_delete_errors(&[]).is_none());
     }
 }

@@ -1,6 +1,6 @@
 use std::{
-    io::{ErrorKind, Write},
-    path::PathBuf,
+    io::{self, ErrorKind, Write},
+    path::{Path, PathBuf},
 };
 
 use serde::Deserialize;
@@ -41,13 +41,10 @@ impl Backend {
 
     pub async fn write(&self, path: &str, data: &[u8]) -> Result<(), std::io::Error> {
         let full_path = self.full_path(path);
-        if let Some(parent) = full_path.parent() {
-            fs::create_dir_all(parent).await?;
-        }
+        ensure_parent_dir(&full_path).await?;
 
-        let mut temp_file = tempfile::NamedTempFile::new_in(
-            full_path.parent().unwrap_or(std::path::Path::new(".")),
-        )?;
+        let mut temp_file =
+            tempfile::NamedTempFile::new_in(full_path.parent().unwrap_or(Path::new(".")))?;
 
         temp_file.write_all(data)?;
 
@@ -130,11 +127,7 @@ impl Backend {
     pub async fn rename(&self, from: &str, to: &str) -> Result<(), std::io::Error> {
         let from_path = self.full_path(from);
         let to_path = self.full_path(to);
-
-        if let Some(parent) = to_path.parent() {
-            fs::create_dir_all(parent).await?;
-        }
-
+        ensure_parent_dir(&to_path).await?;
         fs::rename(from_path, to_path).await
     }
 
@@ -144,23 +137,28 @@ impl Backend {
 
     pub async fn create_file(&self, path: &str) -> Result<fs::File, std::io::Error> {
         let full_path = self.full_path(path);
-        if let Some(parent) = full_path.parent() {
-            fs::create_dir_all(parent).await?;
-        }
+        ensure_parent_dir(&full_path).await?;
         fs::File::create(full_path).await
     }
 
     pub async fn open_file_append(&self, path: &str) -> Result<fs::File, std::io::Error> {
         let full_path = self.full_path(path);
-        if let Some(parent) = full_path.parent() {
-            fs::create_dir_all(parent).await?;
-        }
+        ensure_parent_dir(&full_path).await?;
         fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(full_path)
             .await
     }
+}
+
+/// Creates the parent directory of `path` (and any missing ancestors) if `path`
+/// has a parent. No-op when `path` is a root or has no parent component.
+async fn ensure_parent_dir(path: &Path) -> io::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).await?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]

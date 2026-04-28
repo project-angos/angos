@@ -22,17 +22,10 @@ use crate::{
     configuration::{Configuration, ServerConfig, watcher::ConfigNotifier},
     registry::{
         Registry, RegistryConfig, Repository, blob_store,
-        blob_store::{BlobStore, PresignedBlobStore, UploadStore},
         metadata_store::{ConditionalCapabilities, MetadataStore, MetadataStoreConfig},
         repository,
     },
 };
-
-type BlobStoreTriple = (
-    Arc<dyn BlobStore>,
-    Arc<dyn UploadStore>,
-    Option<Arc<dyn PresignedBlobStore>>,
-);
 
 pub enum ServiceListener {
     Insecure(InsecureListener),
@@ -55,7 +48,7 @@ pub struct Command {
 fn build_blob_stores(
     config: &blob_store::BlobStorageConfig,
     cache: &Arc<dyn Cache>,
-) -> Result<BlobStoreTriple, Error> {
+) -> Result<blob_store::BlobStoreHandles, Error> {
     config
         .to_backend(Some(cache.clone()))
         .map_err(|_| Error::Initialization("Failed to initialize blob store".to_string()))
@@ -136,8 +129,7 @@ async fn build_registry(
     cached_capabilities: &Arc<Mutex<Option<ConditionalCapabilities>>>,
 ) -> Result<Registry, Error> {
     let auth_cache = build_auth_cache(&config.cache)?;
-    let (blob_store, upload_store, presigned_blob_store) =
-        build_blob_stores(&config.blob_store, &auth_cache)?;
+    let blob_handles = build_blob_stores(&config.blob_store, &auth_cache)?;
     let metadata_store = build_metadata_store(config, &auth_cache, cached_capabilities).await?;
     let repositories = build_repositories(&config.repository, &auth_cache)?;
 
@@ -150,9 +142,9 @@ async fn build_registry(
         .global_immutable_tags_exclusions(config.global.immutable_tags_exclusions.clone());
 
     let Ok(registry) = Registry::new(
-        blob_store,
-        upload_store,
-        presigned_blob_store,
+        blob_handles.blob_store,
+        blob_handles.upload_store,
+        blob_handles.presigned_store,
         metadata_store,
         repositories,
         registry_config,
