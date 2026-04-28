@@ -46,35 +46,7 @@ impl Authorizer {
             .map(|cfg| lookup_webhook(&webhook_authorizers, cfg))
             .transpose()?;
 
-        let repositories: HashMap<String, AuthorizerRepository> = config
-            .repository
-            .iter()
-            .map(|(name, repo_config)| {
-                let access_policy = if repo_config.access_policy.rules.is_empty()
-                    && repo_config.access_policy.default == AccessMode::Deny
-                {
-                    None
-                } else {
-                    Some(AccessPolicy::new(&repo_config.access_policy))
-                };
-
-                let authorization_webhook = repo_config
-                    .authorization_webhook
-                    .as_ref()
-                    .map(|cfg| lookup_webhook(&webhook_authorizers, cfg))
-                    .transpose()?;
-
-                Ok((
-                    name.clone(),
-                    AuthorizerRepository {
-                        access_policy,
-                        authorization_webhook,
-                        immutable_tags: repo_config.immutable_tags,
-                        immutable_tags_exclusions: repo_config.immutable_tags_exclusions.clone(),
-                    },
-                ))
-            })
-            .collect::<Result<_, Error>>()?;
+        let repositories = build_repositories(config, &webhook_authorizers)?;
 
         let global_immutable_tags_exclusions = config.global.immutable_tags_exclusions.clone();
 
@@ -236,6 +208,39 @@ fn build_webhooks(
         webhooks.insert(name.clone(), Arc::new(authorizer));
     }
     Ok(webhooks)
+}
+
+fn build_repositories(
+    config: &Configuration,
+    webhook_authorizers: &HashMap<String, Arc<WebhookAuthorizer>>,
+) -> Result<HashMap<String, AuthorizerRepository>, Error> {
+    let mut repositories = HashMap::with_capacity(config.repository.len());
+    for (name, repo_config) in &config.repository {
+        let access_policy = if repo_config.access_policy.rules.is_empty()
+            && repo_config.access_policy.default == AccessMode::Deny
+        {
+            None
+        } else {
+            Some(AccessPolicy::new(&repo_config.access_policy))
+        };
+
+        let authorization_webhook = repo_config
+            .authorization_webhook
+            .as_ref()
+            .map(|cfg| lookup_webhook(webhook_authorizers, cfg))
+            .transpose()?;
+
+        repositories.insert(
+            name.clone(),
+            AuthorizerRepository {
+                access_policy,
+                authorization_webhook,
+                immutable_tags: repo_config.immutable_tags,
+                immutable_tags_exclusions: repo_config.immutable_tags_exclusions.clone(),
+            },
+        );
+    }
+    Ok(repositories)
 }
 
 fn log_denial(reason: &str, identity: &ClientIdentity) {
