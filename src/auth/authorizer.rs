@@ -9,7 +9,7 @@ use crate::{
     command::server::Error,
     configuration::{Configuration, RegexPattern},
     identity::{Action, ClientIdentity},
-    oci::{Namespace, Reference},
+    oci::{Namespace, Reference, namespace_belongs_to},
     policy::AccessMode,
     registry::{AccessPolicy, Registry},
 };
@@ -217,9 +217,10 @@ impl Authorizer {
     }
 
     pub fn is_tag_immutable(&self, namespace: &str, tag: &str) -> bool {
-        let auth_repo = self.repositories.iter().find(|(name, _)| {
-            namespace == name.as_str() || namespace.starts_with(&format!("{name}/"))
-        });
+        let auth_repo = self
+            .repositories
+            .iter()
+            .find(|(name, _)| namespace_belongs_to(namespace, name));
 
         if let Some((_, auth_repo)) = auth_repo {
             !self.is_tag_mutable(auth_repo, tag)

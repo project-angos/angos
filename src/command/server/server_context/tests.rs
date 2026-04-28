@@ -1162,3 +1162,65 @@ fn test_resolve_client_ip_x_forwarded_for_takes_precedence() {
         Some("192.168.1.100".to_string())
     );
 }
+
+/// Verifies that `Registry::get_repository_for_namespace` and
+/// `ServerContext::is_tag_immutable` make the same namespace-membership
+/// decision.  Any future change to one lookup path that is not reflected in
+/// the other will be caught here.
+#[tokio::test]
+async fn test_namespace_lookup_consistent_between_registry_and_authorizer() {
+    let toml = r#"
+        [blob_store.fs]
+        root_dir = "/tmp/test"
+
+        [metadata_store.fs]
+        root_dir = "/tmp/test"
+
+        [cache.memory]
+
+        [server]
+        bind_address = "0.0.0.0"
+        port = 8000
+
+        [global]
+        update_pull_time = false
+        max_concurrent_cache_jobs = 10
+        immutable_tags = false
+
+        [repository.myrepo]
+        immutable_tags = true
+    "#;
+
+    let config: Configuration = toml::from_str(toml).unwrap();
+    let registry = create_test_registry(&config).await;
+    let context = ServerContext::new(&config, registry).unwrap();
+
+    // Sub-namespace of "myrepo": both lookups must find the repository.
+    let sub_ns = Namespace::new("myrepo/sub/path").unwrap();
+    assert!(
+        context
+            .registry
+            .get_repository_for_namespace(&sub_ns)
+            .is_ok(),
+        "Registry must resolve myrepo/sub/path to repository myrepo"
+    );
+    assert!(
+        context.is_tag_immutable("myrepo/sub/path", "v1.0.0"),
+        "is_tag_immutable must apply myrepo's immutable_tags = true for myrepo/sub/path"
+    );
+
+    // "myrepo2" shares a prefix with "myrepo" but is NOT a sub-namespace.
+    // Both lookups must agree that it does not belong to the "myrepo" repository.
+    let sibling_ns = Namespace::new("myrepo2").unwrap();
+    assert!(
+        context
+            .registry
+            .get_repository_for_namespace(&sibling_ns)
+            .is_err(),
+        "Registry must not resolve myrepo2 to repository myrepo"
+    );
+    assert!(
+        !context.is_tag_immutable("myrepo2", "v1.0.0"),
+        "is_tag_immutable must not apply myrepo's immutable_tags for myrepo2 (global default is false)"
+    );
+}
