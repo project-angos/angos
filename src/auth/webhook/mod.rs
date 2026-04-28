@@ -438,35 +438,39 @@ impl WebhookAuthorizer {
             request = request.basic_auth(username, Some(password.expose()));
         }
 
-        let response = request.send().await;
-
-        let allowed = match response {
-            Ok(resp) => resp.status().is_success(),
-            Err(e) => {
-                warn!("Webhook '{}' request failed: {e}", self.name);
-                false
-            }
-        };
-
+        let send_result = request.send().await;
         timer.observe_duration();
 
-        let result_label = if allowed {
-            "allow".to_string()
-        } else {
-            "deny".to_string()
-        };
-
-        WEBHOOK_REQUESTS
-            .with_label_values(&[&self.name, &result_label])
-            .inc();
-
-        if let Ok(cache_key) = &cache_key {
-            let _ = self
-                .cache
-                .store(cache_key, &allowed, self.config.cache_ttl)
-                .await;
+        match send_result {
+            Ok(resp) => {
+                let allowed = resp.status().is_success();
+                let result_label = if allowed { "allow" } else { "deny" }.to_string();
+                WEBHOOK_REQUESTS
+                    .with_label_values(&[&self.name, &result_label])
+                    .inc();
+                if let Ok(cache_key) = &cache_key {
+                    let _ = self
+                        .cache
+                        .store(cache_key, &allowed, self.config.cache_ttl)
+                        .await;
+                }
+                Ok(allowed)
+            }
+            Err(e) => {
+                // Authorization webhook unreachable: fail closed and surface the
+                // transport-failure cause to operators. The "transport_error" metric
+                // label distinguishes this from explicit deny on dashboards. The
+                // cache is intentionally NOT updated — a transient outage must not
+                // pin a stale deny for cache_ttl.
+                warn!("Webhook '{}' request failed: {e}", self.name);
+                WEBHOOK_REQUESTS
+                    .with_label_values(&[&self.name, &"transport_error".to_string()])
+                    .inc();
+                Err(Error::Unauthorized(format!(
+                    "authorization webhook '{}' unreachable: {e}",
+                    self.name
+                )))
+            }
         }
-
-        Ok(allowed)
     }
 }

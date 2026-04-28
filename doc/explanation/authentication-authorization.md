@@ -287,7 +287,7 @@ sequenceDiagram
 **Response interpretation:**
 - 2xx → Allow
 - Any other status → Deny
-- Timeout/error → Deny (fail-closed)
+- Timeout/transport error → Deny (fail-closed). Distinguishable from explicit deny on dashboards via the `webhook_authorization_requests_total{result="transport_error"}` metric label; the cache is not updated so the deny is not pinned past recovery.
 
 ---
 
@@ -296,7 +296,7 @@ sequenceDiagram
 ### Fail-Closed Design
 
 - No policies = no access
-- Webhook timeout = denied
+- Webhook timeout = denied (authorization is a security gate; an unreachable gate cannot make an allow decision)
 - CEL evaluation error = rule skipped (continues evaluation)
 
 ### Token Validation
