@@ -37,19 +37,7 @@ impl Authorizer {
     pub fn new(config: &Configuration, cache: &Arc<dyn Cache>) -> Result<Self, Error> {
         let global_access_policy = AccessPolicy::new(&config.global.access_policy);
 
-        // Build WebhookAuthorizer instances keyed by webhook name, deduplicated via Arc.
-        let webhook_authorizers: HashMap<String, Arc<WebhookAuthorizer>> = config
-            .auth
-            .webhook
-            .iter()
-            .map(|(name, webhook_config)| {
-                WebhookAuthorizer::new(name.clone(), webhook_config.as_ref().clone(), cache.clone())
-                    .map(|a| (name.clone(), Arc::new(a)))
-                    .map_err(|e| {
-                        Error::Initialization(format!("Failed to create webhook '{name}': {e}"))
-                    })
-            })
-            .collect::<Result<_, _>>()?;
+        let webhook_authorizers = build_webhooks(config, cache)?;
 
         let global_authorization_webhook = config
             .global
@@ -232,6 +220,22 @@ impl Authorizer {
                     .any(|pattern| pattern.is_match(tag))
         }
     }
+}
+
+fn build_webhooks(
+    config: &Configuration,
+    cache: &Arc<dyn Cache>,
+) -> Result<HashMap<String, Arc<WebhookAuthorizer>>, Error> {
+    let mut webhooks = HashMap::with_capacity(config.auth.webhook.len());
+    for (name, webhook_config) in &config.auth.webhook {
+        let authorizer =
+            WebhookAuthorizer::new(name.clone(), webhook_config.as_ref().clone(), cache.clone())
+                .map_err(|e| {
+                    Error::Initialization(format!("Failed to create webhook '{name}': {e}"))
+                })?;
+        webhooks.insert(name.clone(), Arc::new(authorizer));
+    }
+    Ok(webhooks)
 }
 
 fn log_denial(reason: &str, identity: &ClientIdentity) {
