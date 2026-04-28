@@ -1,7 +1,7 @@
 use std::{collections::HashMap, net::SocketAddr, sync::Arc};
 
 use hyper::http::request::Parts;
-use tracing::{debug, instrument, warn};
+use tracing::{debug, info, instrument, warn};
 
 use super::{
     AuthMiddleware, AuthResult, BasicAuthValidator, MtlsValidator, basic_auth, oidc,
@@ -61,13 +61,14 @@ impl Authenticator {
         auth_config: &AuthConfig,
         cache: &Arc<dyn Cache>,
     ) -> Result<OidcValidators, Error> {
-        let mut validators = Vec::new();
+        let mut validators = Vec::with_capacity(auth_config.oidc.len());
 
         for (name, oidc_config) in &auth_config.oidc {
             let validator = OidcValidator::new(name.clone(), oidc_config, cache.clone())?;
             validators.push((name.clone(), Arc::new(validator) as Arc<dyn AuthMiddleware>));
         }
 
+        validators.sort_by(|a, b| a.0.cmp(&b.0));
         Ok(validators)
     }
 
@@ -116,13 +117,20 @@ impl Authenticator {
         false
     }
 
-    /// Tries each OIDC provider in order, returning `true` on first success.
-    /// Returns `Err` if credentials were presented but invalid.
+    /// Tries each OIDC provider in sorted order, returning `true` on first success.
+    /// A failure from one provider does not prevent subsequent providers from being tried.
+    /// If no provider succeeds and at least one returned an error, the first error is returned —
+    /// first rather than last so that deterministic sort order also makes error reporting deterministic.
+    ///
+    /// One `AUTH_ATTEMPTS` increment is emitted per request, reflecting the chain's overall
+    /// outcome (success or failure). Per-provider failures during the chain are still logged
+    /// individually for diagnostic context but are not counted as separate attempts.
     async fn try_oidc_authentication(
         &self,
         parts: &Parts,
         identity: &mut ClientIdentity,
     ) -> Result<bool, Error> {
+        let mut first_error: Option<Error> = None;
         for (provider_name, validator) in &self.oidc_validators {
             match validator.authenticate(parts, identity).await {
                 Ok(AuthResult::Authenticated) => {
@@ -132,13 +140,20 @@ impl Authenticator {
                 }
                 Ok(AuthResult::NoCredentials) => {}
                 Err(e) => {
-                    warn!("OIDC validation failed for provider {provider_name}: {e}");
-                    AUTH_ATTEMPTS.with_label_values(&["oidc", "failed"]).inc();
-                    return Err(e);
+                    info!("OIDC validation failed for provider {provider_name}: {e}");
+                    if first_error.is_none() {
+                        first_error = Some(e);
+                    }
                 }
             }
         }
-        Ok(false)
+        match first_error {
+            Some(e) => {
+                AUTH_ATTEMPTS.with_label_values(&["oidc", "failed"]).inc();
+                Err(e)
+            }
+            None => Ok(false),
+        }
     }
 
     /// Attempts basic auth authentication, returning `true` on success.
@@ -520,5 +535,168 @@ mod tests {
         assert!(result.is_ok());
         let identity = result.unwrap();
         assert_eq!(identity.client_ip, Some("192.168.1.100".to_string()));
+    }
+
+    #[test]
+    fn test_build_oidc_validators_multiple_are_sorted_by_name() {
+        // "custom" < "github" alphabetically; HashMap iteration order is non-deterministic,
+        // so this test would be flaky without the explicit sort added in build_oidc_validators.
+        let toml = format!(
+            r#"{}
+            [auth.oidc.github]
+            provider = "github"
+
+            [auth.oidc.custom]
+            provider = "generic"
+            issuer = "https://auth.example.com"
+        "#,
+            minimal_config_prefix()
+        );
+
+        let config = Configuration::load_from_str(&toml).unwrap();
+        let cache = cache::Config::Memory.to_backend().unwrap();
+
+        let validators = Authenticator::build_oidc_validators(&config.auth, &cache).unwrap();
+
+        assert_eq!(validators.len(), 2);
+        assert_eq!(validators[0].0, "custom");
+        assert_eq!(validators[1].0, "github");
+    }
+
+    // ---------------------------------------------------------------------------
+    // Mock AuthMiddleware for unit-testing try_oidc_authentication in isolation.
+    // ---------------------------------------------------------------------------
+
+    #[derive(Clone)]
+    enum MockOutcome {
+        Authenticated,
+        NoCredentials,
+        Fail(String),
+    }
+
+    struct MockValidator {
+        outcome: MockOutcome,
+    }
+
+    #[async_trait::async_trait]
+    impl AuthMiddleware for MockValidator {
+        async fn authenticate(
+            &self,
+            _parts: &Parts,
+            identity: &mut crate::identity::ClientIdentity,
+        ) -> Result<AuthResult, crate::command::server::Error> {
+            match &self.outcome {
+                MockOutcome::Authenticated => {
+                    identity.oidc = Some(crate::identity::OidcClaims {
+                        provider_name: "mock".to_string(),
+                        provider_type: "Mock".to_string(),
+                        claims: std::collections::HashMap::new(),
+                    });
+                    Ok(AuthResult::Authenticated)
+                }
+                MockOutcome::NoCredentials => Ok(AuthResult::NoCredentials),
+                MockOutcome::Fail(msg) => {
+                    Err(crate::command::server::Error::Unauthorized(msg.clone()))
+                }
+            }
+        }
+    }
+
+    fn make_authenticator_with_mocks(
+        validators: Vec<(&'static str, MockOutcome)>,
+    ) -> Authenticator {
+        let oidc_validators: OidcValidators = validators
+            .into_iter()
+            .map(|(name, outcome)| {
+                let v: Arc<dyn AuthMiddleware> = Arc::new(MockValidator { outcome });
+                (name.to_string(), v)
+            })
+            .collect();
+
+        Authenticator {
+            mtls_validator: MtlsValidator::new(),
+            oidc_validators,
+            basic_auth_validator: BasicAuthValidator::new(&std::collections::HashMap::new()),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_try_oidc_no_providers_returns_false() {
+        let authenticator = make_authenticator_with_mocks(vec![]);
+
+        let request = Request::builder().body(()).unwrap();
+        let (parts, ()) = request.into_parts();
+        let mut identity = crate::identity::ClientIdentity::new(None);
+
+        let result = authenticator
+            .try_oidc_authentication(&parts, &mut identity)
+            .await;
+
+        assert!(!result.unwrap());
+        assert!(identity.oidc.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_try_oidc_falls_through_error_to_success() {
+        // Provider "alpha" (first in sorted order) returns Err; provider "beta" returns Authenticated.
+        // The old code would have returned the error from "alpha" without ever trying "beta".
+        // With the fix, "beta" succeeds and the overall result is Ok(true).
+        let authenticator = make_authenticator_with_mocks(vec![
+            ("alpha", MockOutcome::Fail("alpha auth failed".to_string())),
+            ("beta", MockOutcome::Authenticated),
+        ]);
+
+        let request = Request::builder().body(()).unwrap();
+        let (parts, ()) = request.into_parts();
+        let mut identity = crate::identity::ClientIdentity::new(None);
+
+        let result = authenticator
+            .try_oidc_authentication(&parts, &mut identity)
+            .await;
+
+        assert!(result.unwrap());
+        assert!(identity.oidc.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_try_oidc_returns_first_error_when_all_fail() {
+        // Both providers fail; the error from the alphabetically-first provider is returned.
+        let authenticator = make_authenticator_with_mocks(vec![
+            ("alpha", MockOutcome::Fail("alpha error".to_string())),
+            ("beta", MockOutcome::Fail("beta error".to_string())),
+        ]);
+
+        let request = Request::builder().body(()).unwrap();
+        let (parts, ()) = request.into_parts();
+        let mut identity = crate::identity::ClientIdentity::new(None);
+
+        let result = authenticator
+            .try_oidc_authentication(&parts, &mut identity)
+            .await;
+
+        let err = result.unwrap_err();
+        assert!(
+            matches!(&err, crate::command::server::Error::Unauthorized(msg) if msg == "alpha error"),
+            "expected alpha's error, got: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_try_oidc_all_no_credentials_returns_false() {
+        let authenticator = make_authenticator_with_mocks(vec![
+            ("alpha", MockOutcome::NoCredentials),
+            ("beta", MockOutcome::NoCredentials),
+        ]);
+
+        let request = Request::builder().body(()).unwrap();
+        let (parts, ()) = request.into_parts();
+        let mut identity = crate::identity::ClientIdentity::new(None);
+
+        let result = authenticator
+            .try_oidc_authentication(&parts, &mut identity)
+            .await;
+
+        assert!(!result.unwrap());
+        assert!(identity.oidc.is_none());
     }
 }

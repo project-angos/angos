@@ -104,7 +104,11 @@ required_audience = "api://your-app-id"
 
 ## Multiple Providers
 
-Configure multiple providers simultaneously:
+You can declare more than one provider; on each request the registry tries them each after another and stops at the first one that authenticates the
+token. Providers that don't recognise the credentials are skipped silently; if a
+provider rejects the token (e.g. signature mismatch), the next one is still tried.
+Pick distinct, well-scoped issuers/audiences so a token only matches the provider
+that actually signed it.
 
 ```toml
 [auth.oidc.github-actions]
