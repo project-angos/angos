@@ -126,15 +126,7 @@ impl Authorizer {
             return Err(Error::Unauthorized(ACCESS_DENIED.to_string()));
         }
 
-        if let Action::PutManifest {
-            reference: Reference::Tag(tag),
-            ..
-        } = action
-            && !self.is_tag_mutable(auth_repo, tag)
-        {
-            let msg = format!("Tag '{tag}' is immutable and cannot be overwritten");
-            return Err(Error::Conflict(msg));
-        }
+        self.check_immutable_tag(auth_repo, action)?;
 
         let webhook = auth_repo
             .authorization_webhook
@@ -157,6 +149,24 @@ impl Authorizer {
             ));
         }
 
+        Ok(())
+    }
+
+    fn check_immutable_tag(
+        &self,
+        auth_repo: &AuthorizerRepository,
+        action: &Action,
+    ) -> Result<(), Error> {
+        if let Action::PutManifest {
+            reference: Reference::Tag(tag),
+            ..
+        } = action
+            && !self.is_tag_mutable(auth_repo, tag)
+        {
+            return Err(Error::Conflict(format!(
+                "Tag '{tag}' is immutable and cannot be overwritten"
+            )));
+        }
         Ok(())
     }
 
@@ -656,6 +666,58 @@ mod tests {
         let auth_repo = authorizer.repositories.get("myrepo").unwrap();
 
         assert!(authorizer.is_tag_mutable(auth_repo, "any-tag"));
+    }
+
+    #[test]
+    fn test_check_immutable_tag_returns_conflict_for_tagged_putmanifest() {
+        use std::str::FromStr;
+
+        use crate::{
+            command::server::Error,
+            oci::{Namespace, Reference},
+        };
+
+        let toml = r#"
+            [blob_store.fs]
+            root_dir = "/tmp/test"
+
+            [metadata_store.fs]
+            root_dir = "/tmp/test"
+
+            [cache.memory]
+
+            [server]
+            bind_address = "0.0.0.0"
+            port = 8000
+
+            [global]
+            update_pull_time = false
+            max_concurrent_cache_jobs = 10
+            immutable_tags = true
+
+            [repository.myrepo]
+            namespace_pattern = "^myrepo/.*"
+        "#;
+
+        let config = Configuration::load_from_str(toml).unwrap();
+        let cache = cache::Config::Memory.to_backend().unwrap();
+        let authorizer = Authorizer::new(&config, &cache).unwrap();
+        let auth_repo = authorizer.repositories.get("myrepo").unwrap();
+
+        let action = Action::PutManifest {
+            namespace: Namespace::new("myrepo/app").unwrap(),
+            reference: Reference::from_str("v1.0.0").unwrap(),
+        };
+
+        let result = authorizer.check_immutable_tag(auth_repo, &action);
+
+        let Err(Error::Conflict(msg)) = result else {
+            panic!("expected Err(Error::Conflict(_)), got: {result:?}");
+        };
+        assert!(
+            msg.contains("v1.0.0") && msg.contains("immutable"),
+            "error message must mention the tag and 'immutable', got: {msg}"
+        );
     }
 
     #[test]
