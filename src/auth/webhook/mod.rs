@@ -448,11 +448,19 @@ impl WebhookAuthorizer {
                 WEBHOOK_REQUESTS
                     .with_label_values(&[&self.name, &result_label])
                     .inc();
-                if let Ok(cache_key) = &cache_key {
-                    let _ = self
+                if let Ok(cache_key) = &cache_key
+                    && let Err(e) = self
                         .cache
                         .store(cache_key, &allowed, self.config.cache_ttl)
-                        .await;
+                        .await
+                {
+                    // Best-effort: cache-write failure must not affect the authorization
+                    // decision, but a misbehaving cache silently doubling webhook traffic
+                    // is exactly the symptom the warn surfaces.
+                    warn!(
+                        "Webhook '{}' cache store failed: {e}; authorization unaffected",
+                        self.name
+                    );
                 }
                 Ok(allowed)
             }
