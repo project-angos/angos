@@ -21,6 +21,20 @@ pub struct AuthConfig {
 
 type OidcValidators = Vec<(String, Arc<dyn AuthMiddleware>)>;
 
+/// Returns the strongest method that succeeded, using first-wins priority: mTLS > OIDC > Basic.
+fn select_auth_method(mtls: bool, oidc: bool, basic: bool) -> Option<&'static str> {
+    if mtls {
+        return Some("mtls");
+    }
+    if oidc {
+        return Some("oidc");
+    }
+    if basic {
+        return Some("basic");
+    }
+    None
+}
+
 /// Coordinates all authentication methods and handles the authentication chain
 pub struct Authenticator {
     mtls_validator: MtlsValidator,
@@ -65,18 +79,16 @@ impl Authenticator {
         remote_address: Option<SocketAddr>,
     ) -> Result<ClientIdentity, Error> {
         let mut identity = ClientIdentity::new(remote_address);
-        let mut authenticated_method = None;
 
-        if self.try_mtls_authentication(parts, &mut identity).await {
-            authenticated_method = Some("mtls");
-        }
+        let mtls_ok = self.try_mtls_authentication(parts, &mut identity).await;
+        let oidc_ok = self.try_oidc_authentication(parts, &mut identity).await?;
+        let basic_ok = if oidc_ok {
+            false
+        } else {
+            self.try_basic_authentication(parts, &mut identity).await?
+        };
 
-        if self.try_oidc_authentication(parts, &mut identity).await? {
-            authenticated_method = Some("oidc");
-        } else if self.try_basic_authentication(parts, &mut identity).await? {
-            authenticated_method = Some("basic");
-        }
-
+        let authenticated_method = select_auth_method(mtls_ok, oidc_ok, basic_ok);
         tracing::Span::current().record("auth_method", authenticated_method.unwrap_or("anonymous"));
 
         Ok(identity)
@@ -458,6 +470,37 @@ mod tests {
         assert!(result.is_ok());
         let identity = result.unwrap();
         assert!(identity.username.is_none());
+    }
+
+    #[test]
+    fn select_auth_method_returns_mtls_when_only_mtls_succeeds() {
+        assert_eq!(select_auth_method(true, false, false), Some("mtls"));
+    }
+
+    #[test]
+    fn select_auth_method_keeps_mtls_when_basic_also_succeeds() {
+        // Bug: basic-auth success used to overwrite mtls. Must not.
+        assert_eq!(select_auth_method(true, false, true), Some("mtls"));
+    }
+
+    #[test]
+    fn select_auth_method_keeps_mtls_when_oidc_also_succeeds() {
+        assert_eq!(select_auth_method(true, true, false), Some("mtls"));
+    }
+
+    #[test]
+    fn select_auth_method_returns_oidc_when_no_mtls() {
+        assert_eq!(select_auth_method(false, true, false), Some("oidc"));
+    }
+
+    #[test]
+    fn select_auth_method_returns_basic_when_no_mtls_no_oidc() {
+        assert_eq!(select_auth_method(false, false, true), Some("basic"));
+    }
+
+    #[test]
+    fn select_auth_method_returns_none_when_nothing_succeeded() {
+        assert_eq!(select_auth_method(false, false, false), None);
     }
 
     #[tokio::test]
