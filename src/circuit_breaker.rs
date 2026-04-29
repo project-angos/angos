@@ -86,6 +86,100 @@ mod tests {
     use super::*;
 
     #[test]
+    fn new_check_passes_immediately() {
+        let cb = CircuitBreaker::new();
+        assert!(cb.check().is_ok());
+    }
+
+    #[test]
+    fn default_is_equivalent_to_new() {
+        let cb = CircuitBreaker::default();
+        assert_eq!(cb.consecutive_failures.load(Ordering::Acquire), 0);
+        assert_eq!(cb.opened_at_epoch_secs.load(Ordering::Acquire), 0);
+        assert!(cb.check().is_ok());
+    }
+
+    #[test]
+    fn open_error_message_contains_expected_wording() {
+        let cb = CircuitBreaker::new();
+        for _ in 0..CIRCUIT_BREAKER_THRESHOLD {
+            cb.record_failure();
+        }
+        let err = cb.check().unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("circuit breaker open"),
+            "error must mention 'circuit breaker open', got: {msg}"
+        );
+        assert!(
+            msg.contains(&CIRCUIT_BREAKER_THRESHOLD.to_string()),
+            "error must include failure count, got: {msg}"
+        );
+        assert!(
+            msg.contains(&CIRCUIT_BREAKER_COOLDOWN_SECS.to_string()),
+            "error must include cooldown seconds, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn success_mid_sequence_resets_failure_count() {
+        let cb = CircuitBreaker::new();
+        for _ in 0..(CIRCUIT_BREAKER_THRESHOLD - 1) {
+            cb.record_failure();
+        }
+        cb.record_success();
+
+        // After the reset, THRESHOLD - 1 additional failures must not open the breaker.
+        for _ in 0..(CIRCUIT_BREAKER_THRESHOLD - 1) {
+            cb.record_failure();
+        }
+        assert!(
+            cb.check().is_ok(),
+            "THRESHOLD-1 failures after a success must not open the breaker"
+        );
+
+        // One more failure crosses the threshold.
+        cb.record_failure();
+        assert!(
+            cb.check().is_err(),
+            "reaching THRESHOLD failures after a mid-sequence reset must open the breaker"
+        );
+    }
+
+    #[test]
+    fn post_cooldown_success_fully_clears_state() {
+        let cb = CircuitBreaker::new();
+        for _ in 0..CIRCUIT_BREAKER_THRESHOLD {
+            cb.record_failure();
+        }
+        // Simulate cooldown elapse by rewinding `opened_at`.
+        cb.opened_at_epoch_secs.store(
+            cb.opened_at_epoch_secs
+                .load(Ordering::Acquire)
+                .saturating_sub(CIRCUIT_BREAKER_COOLDOWN_SECS + 1),
+            Ordering::Release,
+        );
+        assert!(cb.check().is_ok(), "breaker should pass after cooldown");
+
+        cb.record_success();
+
+        assert_eq!(
+            cb.consecutive_failures.load(Ordering::Acquire),
+            0,
+            "record_success must zero consecutive_failures"
+        );
+        assert_eq!(
+            cb.opened_at_epoch_secs.load(Ordering::Acquire),
+            0,
+            "record_success must zero opened_at_epoch_secs"
+        );
+        assert!(
+            cb.check().is_ok(),
+            "breaker must pass after success fully clears state"
+        );
+    }
+
+    #[test]
     fn check_passes_when_below_threshold() {
         let cb = CircuitBreaker::new();
         for _ in 0..(CIRCUIT_BREAKER_THRESHOLD - 1) {
