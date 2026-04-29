@@ -48,15 +48,11 @@ impl OidcValidator {
         provider_config: &Config,
         cache: Arc<dyn Cache>,
     ) -> Result<Self, Error> {
-        let client = Client::builder().timeout(Duration::from_secs(30)).build();
-
-        let client = match client {
-            Ok(client) => Ok(Arc::new(client)),
-            Err(err) => {
-                let msg = format!("Failed to build HTTP client: {err}");
-                Err(Error::Initialization(msg))
-            }
-        }?;
+        let client = Client::builder()
+            .timeout(Duration::from_secs(30))
+            .build()
+            .map(Arc::new)
+            .map_err(|e| Error::Initialization(format!("Failed to build HTTP client: {e}")))?;
 
         let provider = provider_config.to_backend();
 
