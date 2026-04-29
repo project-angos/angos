@@ -44,19 +44,13 @@ pub fn build_header_value(value: &str) -> Result<HeaderValue, Error> {
     }
 }
 
-pub fn set_forwarded_method_header(
-    parts: &Parts,
-    headers: &mut HeaderMap,
-) -> Result<(), Error> {
+pub fn set_forwarded_method_header(parts: &Parts, headers: &mut HeaderMap) -> Result<(), Error> {
     let value = build_header_value(parts.method.as_str())?;
     headers.insert(X_FORWARDED_METHOD, value);
     Ok(())
 }
 
-pub fn set_forwarded_proto_header(
-    parts: &Parts,
-    headers: &mut HeaderMap,
-) -> Result<(), Error> {
+pub fn set_forwarded_proto_header(parts: &Parts, headers: &mut HeaderMap) -> Result<(), Error> {
     let proto = if parts.uri.scheme_str() == Some("https") {
         build_header_value("https")?
     } else {
@@ -73,10 +67,7 @@ pub fn set_forwarded_host_header(parts: &Parts, headers: &mut HeaderMap) {
     }
 }
 
-pub fn set_forwarded_uri_header(
-    parts: &Parts,
-    headers: &mut HeaderMap,
-) -> Result<(), Error> {
+pub fn set_forwarded_uri_header(parts: &Parts, headers: &mut HeaderMap) -> Result<(), Error> {
     let uri = parts.uri.to_string();
     let value = build_header_value(&uri)?;
     headers.insert(X_FORWARDED_URI, value);
@@ -94,10 +85,7 @@ pub fn set_forwarded_for_header(
     Ok(())
 }
 
-pub fn set_registry_action_header(
-    action: &Action,
-    headers: &mut HeaderMap,
-) -> Result<(), Error> {
+pub fn set_registry_action_header(action: &Action, headers: &mut HeaderMap) -> Result<(), Error> {
     let value = build_header_value(action.action_name())?;
     headers.insert(X_REGISTRY_ACTION, value);
     Ok(())
@@ -125,10 +113,7 @@ pub fn set_registry_reference_header(
     Ok(())
 }
 
-pub fn set_registry_digest_header(
-    action: &Action,
-    headers: &mut HeaderMap,
-) -> Result<(), Error> {
+pub fn set_registry_digest_header(action: &Action, headers: &mut HeaderMap) -> Result<(), Error> {
     if let Some(digest) = action.get_digest() {
         let value = build_header_value(&digest.to_string())?;
         headers.insert(X_REGISTRY_DIGEST, value);
