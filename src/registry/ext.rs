@@ -7,7 +7,7 @@ use tracing::instrument;
 
 use crate::{
     configuration::RegexPattern,
-    oci::{Digest, Manifest, Namespace, Platform as OciPlatform},
+    oci::{Descriptor, Digest, Manifest, Namespace, Platform as OciPlatform},
     registry::{
         Error, JsonResponse, Registry, metadata_store::link_kind::LinkKind,
         pagination::collect_all_pages,
@@ -124,6 +124,44 @@ struct RepositoryConfig {
     upstream_urls: Vec<String>,
     immutable_tags: bool,
     immutable_tags_exclusions: Vec<RegexPattern>,
+}
+
+fn apply_predicate_type(child_manifest: &Manifest, annotations: &mut HashMap<String, String>) {
+    const ANNOTATION_PREDICATE_TYPE: &str = "in-toto.io/predicate-type";
+
+    if let Some(predicate_type) = child_manifest
+        .layers
+        .iter()
+        .find_map(|layer| layer.annotations.get(ANNOTATION_PREDICATE_TYPE).cloned())
+    {
+        annotations.insert(ANNOTATION_PREDICATE_TYPE.to_string(), predicate_type);
+    }
+}
+
+/// If the child descriptor has a parseable Docker referrer subject, returns it;
+/// otherwise treats the descriptor as a regular index child and inserts a parent
+/// entry. A descriptor whose annotation is present but unparseable is silently
+/// skipped (no parent, no referrer).
+fn resolve_referrer_subject(
+    parent_digest: &Digest,
+    child_descriptor: &Descriptor,
+    child_to_parents: &mut HashMap<Digest, Vec<(Digest, Option<Platform>)>>,
+) -> Option<Digest> {
+    const ANNOTATION_DOCKER_REFERENCE_DIGEST: &str = "vnd.docker.reference.digest";
+
+    let Some(subject_str) = child_descriptor
+        .annotations
+        .get(ANNOTATION_DOCKER_REFERENCE_DIGEST)
+    else {
+        let platform = child_descriptor.platform.clone().map(Platform::from);
+        child_to_parents
+            .entry(child_descriptor.digest.clone())
+            .or_default()
+            .push((parent_digest.clone(), platform));
+        return None;
+    };
+
+    subject_str.parse::<Digest>().ok()
 }
 
 impl Registry {
@@ -279,51 +317,29 @@ impl Registry {
         let mut docker_referrers: HashMap<Digest, Vec<ReferrerInfo>> = HashMap::new();
 
         for digest in all_revisions {
-            let Ok(blob_data) = self.blob_store.read(digest).await else {
-                continue;
-            };
-            let Ok(manifest) = Manifest::from_slice(&blob_data) else {
+            let Some(manifest) = self.read_manifest(digest).await else {
                 continue;
             };
 
             for child_descriptor in &manifest.manifests {
-                if let Some(subject_digest_str) = child_descriptor
-                    .annotations
-                    .get("vnd.docker.reference.digest")
-                {
-                    if let Ok(subject_digest) = subject_digest_str.parse::<Digest>() {
-                        let mut annotations = child_descriptor.annotations.clone();
-                        if let Ok(child_blob) = self.blob_store.read(&child_descriptor.digest).await
-                            && let Ok(child_manifest) = Manifest::from_slice(&child_blob)
-                        {
-                            for layer in &child_manifest.layers {
-                                if let Some(predicate_type) =
-                                    layer.annotations.get("in-toto.io/predicate-type")
-                                {
-                                    annotations.insert(
-                                        "in-toto.io/predicate-type".to_string(),
-                                        predicate_type.clone(),
-                                    );
-                                    break;
-                                }
-                            }
-                        }
-                        docker_referrers
-                            .entry(subject_digest)
-                            .or_default()
-                            .push(ReferrerInfo {
-                                digest: child_descriptor.digest.to_string(),
-                                artifact_type: child_descriptor.artifact_type.clone(),
-                                annotations,
-                            });
-                    }
-                } else {
-                    let platform = child_descriptor.platform.clone().map(Platform::from);
-                    child_to_parents
-                        .entry(child_descriptor.digest.clone())
-                        .or_default()
-                        .push((digest.clone(), platform));
+                let Some(subject) =
+                    resolve_referrer_subject(digest, child_descriptor, &mut child_to_parents)
+                else {
+                    continue;
+                };
+
+                let mut annotations = child_descriptor.annotations.clone();
+                if let Some(child_manifest) = self.read_manifest(&child_descriptor.digest).await {
+                    apply_predicate_type(&child_manifest, &mut annotations);
                 }
+                docker_referrers
+                    .entry(subject)
+                    .or_default()
+                    .push(ReferrerInfo {
+                        digest: child_descriptor.digest.to_string(),
+                        artifact_type: child_descriptor.artifact_type.clone(),
+                        annotations,
+                    });
             }
         }
 
@@ -450,5 +466,97 @@ impl Registry {
 
         matching_namespaces.sort_unstable();
         Ok(matching_namespaces)
+    }
+
+    async fn read_manifest(&self, digest: &Digest) -> Option<Manifest> {
+        let blob = self.blob_store.read(digest).await.ok()?;
+        Manifest::from_slice(&blob).ok()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use super::apply_predicate_type;
+    use crate::oci::{Descriptor, Digest, Manifest};
+
+    const ANNOTATION_PREDICATE_TYPE: &str = "in-toto.io/predicate-type";
+
+    fn test_digest() -> Digest {
+        "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+            .parse()
+            .unwrap()
+    }
+
+    fn manifest_with_layers(layer_annotations: Vec<HashMap<String, String>>) -> Manifest {
+        let layers: Vec<Descriptor> = layer_annotations
+            .into_iter()
+            .map(|ann| Descriptor {
+                media_type: "application/vnd.oci.image.layer.v1.tar+gzip".to_string(),
+                digest: test_digest(),
+                size: 0,
+                annotations: ann,
+                artifact_type: None,
+                platform: None,
+            })
+            .collect();
+        Manifest {
+            layers,
+            ..Manifest::default()
+        }
+    }
+
+    #[test]
+    fn apply_predicate_type_noop_for_zero_layers() {
+        let manifest = manifest_with_layers(vec![]);
+        let mut annotations = HashMap::new();
+        apply_predicate_type(&manifest, &mut annotations);
+        assert!(annotations.is_empty());
+    }
+
+    #[test]
+    fn apply_predicate_type_noop_when_annotation_absent() {
+        let manifest = manifest_with_layers(vec![HashMap::from([(
+            "some.other.key".to_string(),
+            "value".to_string(),
+        )])]);
+        let mut annotations = HashMap::new();
+        apply_predicate_type(&manifest, &mut annotations);
+        assert!(annotations.is_empty());
+    }
+
+    #[test]
+    fn apply_predicate_type_inserts_first_when_multiple_layers_have_it() {
+        let manifest = manifest_with_layers(vec![
+            HashMap::from([(
+                ANNOTATION_PREDICATE_TYPE.to_string(),
+                "https://slsa.dev/provenance/v0.2".to_string(),
+            )]),
+            HashMap::from([(
+                ANNOTATION_PREDICATE_TYPE.to_string(),
+                "https://slsa.dev/provenance/v1".to_string(),
+            )]),
+        ]);
+        let mut annotations = HashMap::new();
+        apply_predicate_type(&manifest, &mut annotations);
+        assert_eq!(
+            annotations.get(ANNOTATION_PREDICATE_TYPE),
+            Some(&"https://slsa.dev/provenance/v0.2".to_string())
+        );
+    }
+
+    #[test]
+    fn apply_predicate_type_inserts_when_single_layer_has_it() {
+        let manifest = manifest_with_layers(vec![HashMap::from([(
+            ANNOTATION_PREDICATE_TYPE.to_string(),
+            "https://slsa.dev/provenance/v0.2".to_string(),
+        )])]);
+        let mut annotations = HashMap::new();
+        apply_predicate_type(&manifest, &mut annotations);
+        assert_eq!(
+            annotations.get(ANNOTATION_PREDICATE_TYPE),
+            Some(&"https://slsa.dev/provenance/v0.2".to_string())
+        );
     }
 }
