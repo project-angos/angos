@@ -5,7 +5,6 @@ use chrono::Duration;
 use tracing::{error, info};
 
 use crate::{
-    cache,
     cache::Cache,
     command::scrub::{
         check::{
@@ -70,37 +69,14 @@ pub struct Command {
 }
 
 async fn build_metadata_store(config: &Configuration) -> Result<Arc<dyn MetadataStore>, Error> {
-    match config.resolve_metadata_config().to_backend(None).await {
-        Ok((store, _)) => Ok(store),
-        Err(err) => {
-            let msg = format!("Failed to initialize metadata store: {err}");
-            Err(Error::Initialization(msg))
-        }
-    }
-}
-
-fn build_auth_cache(config: &cache::Config) -> Result<Arc<dyn Cache>, Error> {
-    match config.to_backend() {
-        Ok(cache) => Ok(cache),
-        Err(err) => {
-            let msg = format!("Failed to initialize auth token cache: {err}");
-            Err(Error::Initialization(msg))
-        }
-    }
-}
-
-fn build_repository(
-    name: &str,
-    config: &repository::Config,
-    auth_cache: &Arc<dyn Cache>,
-) -> Result<Repository, Error> {
-    match Repository::new(name, config, auth_cache) {
-        Ok(repo) => Ok(repo),
-        Err(err) => {
-            let msg = format!("Failed to initialize repository '{name}': {err}");
-            Err(Error::Initialization(msg))
-        }
-    }
+    let (store, _) = config
+        .resolve_metadata_config()
+        .to_backend(None)
+        .await
+        .map_err(|err| {
+            Error::Initialization(format!("Failed to initialize metadata store: {err}"))
+        })?;
+    Ok(store)
 }
 
 fn build_repositories(
@@ -109,7 +85,9 @@ fn build_repositories(
 ) -> Result<Arc<HashMap<String, Repository>>, Error> {
     let mut repositories = HashMap::new();
     for (name, config) in configs {
-        let repo = build_repository(name, config, auth_cache)?;
+        let repo = Repository::new(name, config, auth_cache).map_err(|err| {
+            Error::Initialization(format!("Failed to initialize repository '{name}': {err}"))
+        })?;
         repositories.insert(name.clone(), repo);
     }
 
@@ -231,7 +209,9 @@ impl Command {
             .to_backend(None)
             .map_err(|_| Error::Initialization("Failed to initialize blob store".to_string()))?;
         let metadata_store = build_metadata_store(config).await?;
-        let auth_cache = build_auth_cache(&config.cache)?;
+        let auth_cache = config.cache.to_backend().map_err(|err| {
+            Error::Initialization(format!("Failed to initialize auth token cache: {err}"))
+        })?;
         let repositories = build_repositories(&config.repository, &auth_cache)?;
 
         let namespace_checkers = build_namespace_checkers(
