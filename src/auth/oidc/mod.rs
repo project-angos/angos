@@ -83,23 +83,7 @@ impl AuthMiddleware for OidcValidator {
         parts: &Parts,
         identity: &mut ClientIdentity,
     ) -> Result<AuthResult, Error> {
-        let token = if let Some(bearer_token) = parts.bearer_token() {
-            debug!(
-                "Found Bearer token for OIDC provider '{}'",
-                self.provider_name
-            );
-            bearer_token
-        } else if let Some((username, password)) = parts.basic_auth() {
-            debug!("Found Basic auth credentials with username '{}'", username);
-            if username != self.provider_name {
-                debug!(
-                    "Basic auth username '{}' doesn't match OIDC provider name '{}', skipping",
-                    username, self.provider_name
-                );
-                return Ok(AuthResult::NoCredentials);
-            }
-            password
-        } else {
+        let Some(token) = extract_oidc_credential(parts, &self.provider_name) else {
             return Ok(AuthResult::NoCredentials);
         };
 
@@ -121,6 +105,29 @@ impl AuthMiddleware for OidcValidator {
             }
         }
     }
+}
+
+/// Extracts an OIDC credential string from `parts`:
+/// - `Authorization: Bearer <token>` → `Some(token)` (any provider can claim a Bearer header).
+/// - `Authorization: Basic <user:pass>` where `user == provider_name` → `Some(password)`
+///   (the OIDC token is in the password field; the username gates which provider claims it).
+/// - Anything else → `None`.
+fn extract_oidc_credential(parts: &Parts, provider_name: &str) -> Option<String> {
+    if let Some(bearer_token) = parts.bearer_token() {
+        debug!("Found Bearer token for OIDC provider '{provider_name}'");
+        return Some(bearer_token);
+    }
+    if let Some((username, password)) = parts.basic_auth() {
+        debug!("Found Basic auth credentials with username '{username}'");
+        if username == provider_name {
+            return Some(password);
+        }
+        debug!(
+            "Basic auth username '{username}' doesn't match OIDC provider name \
+             '{provider_name}', skipping"
+        );
+    }
+    None
 }
 
 #[cfg(test)]
