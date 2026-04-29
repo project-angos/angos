@@ -16,6 +16,7 @@ use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitEx
 use crate::{
     command::{argon, scrub, server},
     configuration::{Configuration, ObservabilityConfig, watcher::ConfigWatcher},
+    metrics_provider::initialize_metrics,
 };
 
 mod auth;
@@ -114,6 +115,11 @@ fn main() {
             exit(1);
         }
     };
+
+    if let Err(e) = initialize_metrics() {
+        eprintln!("Failed to initialize metrics provider: {e}");
+        exit(1);
+    }
 
     tokio::runtime::Builder::new_multi_thread()
         .worker_threads(config.global.max_concurrent_requests)

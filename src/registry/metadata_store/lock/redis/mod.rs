@@ -9,7 +9,7 @@ use tokio::{sync::Notify, task::JoinHandle, time::sleep};
 use tracing::debug;
 
 use crate::{
-    metrics_provider::{LOCK_ACQUISITION_DURATION, LOCK_ACQUISITIONS, LOCK_RETRIES},
+    metrics_provider::metrics_provider,
     registry::metadata_store::{
         Error,
         lock::{LockBackend, LockGuard},
@@ -187,10 +187,12 @@ impl LockBackend for RedisBackend {
                 .get_multiplexed_async_connection()
                 .await
                 .inspect_err(|_| {
-                    LOCK_ACQUISITION_DURATION
+                    metrics_provider()
+                        .lock_acquisition_duration
                         .with_label_values(&["redis"])
                         .observe(start.elapsed().as_secs_f64() * 1000.0);
-                    LOCK_ACQUISITIONS
+                    metrics_provider()
+                        .lock_acquisitions
                         .with_label_values(&["redis", "error"])
                         .inc();
                 })?;
@@ -202,10 +204,12 @@ impl LockBackend for RedisBackend {
                 .invoke_async(&mut conn)
                 .await
                 .inspect_err(|_| {
-                    LOCK_ACQUISITION_DURATION
+                    metrics_provider()
+                        .lock_acquisition_duration
                         .with_label_values(&["redis"])
                         .observe(start.elapsed().as_secs_f64() * 1000.0);
-                    LOCK_ACQUISITIONS
+                    metrics_provider()
+                        .lock_acquisitions
                         .with_label_values(&["redis", "error"])
                         .inc();
                 })?;
@@ -213,10 +217,12 @@ impl LockBackend for RedisBackend {
             if acquired == 1 {
                 let (refresh_handle, stop_notify) = self.spawn_refresh_task(lock_keys.clone());
 
-                LOCK_ACQUISITION_DURATION
+                metrics_provider()
+                    .lock_acquisition_duration
                     .with_label_values(&["redis"])
                     .observe(start.elapsed().as_secs_f64() * 1000.0);
-                LOCK_ACQUISITIONS
+                metrics_provider()
+                    .lock_acquisitions
                     .with_label_values(&["redis", "success"])
                     .inc();
 
@@ -230,10 +236,12 @@ impl LockBackend for RedisBackend {
             }
 
             if retries == 0 {
-                LOCK_ACQUISITION_DURATION
+                metrics_provider()
+                    .lock_acquisition_duration
                     .with_label_values(&["redis"])
                     .observe(start.elapsed().as_secs_f64() * 1000.0);
-                LOCK_ACQUISITIONS
+                metrics_provider()
+                    .lock_acquisitions
                     .with_label_values(&["redis", "timeout"])
                     .inc();
                 return Err(Error::Lock(format!(
@@ -242,7 +250,10 @@ impl LockBackend for RedisBackend {
             }
 
             retries -= 1;
-            LOCK_RETRIES.with_label_values(&["redis"]).inc();
+            metrics_provider()
+                .lock_retries
+                .with_label_values(&["redis"])
+                .inc();
             debug!("Lock busy, retrying... ({} attempts left)", retries);
             tokio::time::sleep(retry_delay).await;
         }

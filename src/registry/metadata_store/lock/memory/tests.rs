@@ -1,7 +1,11 @@
-use crate::registry::metadata_store::lock::{LockBackend, MemoryBackend};
+use crate::{
+    metrics_provider,
+    registry::metadata_store::lock::{LockBackend, MemoryBackend},
+};
 
 #[tokio::test]
 async fn test_acquire_lock() {
+    metrics_provider::init_for_tests();
     let memory_backend = MemoryBackend::new();
 
     let lock = memory_backend.acquire(&["test".to_string()]).await.unwrap();
@@ -13,6 +17,7 @@ async fn test_acquire_lock() {
 
 #[tokio::test]
 async fn test_acquire_multiple_locks() {
+    metrics_provider::init_for_tests();
     let memory_backend = MemoryBackend::new();
 
     let lock = memory_backend
@@ -27,6 +32,7 @@ async fn test_acquire_multiple_locks() {
 
 #[tokio::test]
 async fn test_acquire_empty_keys() {
+    metrics_provider::init_for_tests();
     let memory_backend = MemoryBackend::new();
 
     let lock = memory_backend.acquire(&[]).await.unwrap();

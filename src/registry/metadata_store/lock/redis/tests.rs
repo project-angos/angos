@@ -1,7 +1,11 @@
-use crate::registry::metadata_store::lock::{LockBackend, RedisBackend, redis::LockConfig};
+use crate::{
+    metrics_provider,
+    registry::metadata_store::lock::{LockBackend, RedisBackend, redis::LockConfig},
+};
 
 #[tokio::test]
 async fn test_acquire_lock() {
+    metrics_provider::init_for_tests();
     let config = LockConfig {
         url: "redis://localhost:6379/2".to_owned(),
         ttl: 2,
@@ -36,6 +40,7 @@ async fn test_acquire_lock() {
 
 #[tokio::test]
 async fn test_acquire_multiple_locks() {
+    metrics_provider::init_for_tests();
     let config = LockConfig {
         url: "redis://localhost:6379/2".to_owned(),
         ttl: 2,
@@ -70,6 +75,7 @@ async fn test_acquire_multiple_locks() {
 
 #[tokio::test]
 async fn test_acquire_atomic_all_or_nothing() {
+    metrics_provider::init_for_tests();
     let config = LockConfig {
         url: "redis://localhost:6379/2".to_owned(),
         ttl: 2,

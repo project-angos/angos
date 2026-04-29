@@ -14,7 +14,7 @@ use async_trait::async_trait;
 use tokio::sync::{Mutex, OwnedMutexGuard};
 
 use crate::{
-    metrics_provider::{LOCK_ACQUISITION_DURATION, LOCK_ACQUISITIONS},
+    metrics_provider::metrics_provider,
     registry::metadata_store::{
         Error,
         lock::{LockBackend, LockGuard},
@@ -88,10 +88,12 @@ impl LockBackend for MemoryBackend {
             guards.push(mutex.lock_owned().await);
         }
 
-        LOCK_ACQUISITION_DURATION
+        metrics_provider()
+            .lock_acquisition_duration
             .with_label_values(&["memory"])
             .observe(start.elapsed().as_secs_f64() * 1000.0);
-        LOCK_ACQUISITIONS
+        metrics_provider()
+            .lock_acquisitions
             .with_label_values(&["memory", "success"])
             .inc();
 

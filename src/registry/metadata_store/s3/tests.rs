@@ -8,10 +8,12 @@ use super::*;
 use crate::{
     cache,
     cache::CacheExt,
+    metrics_provider,
     registry::metadata_store::{LinkOperation, MetadataStore},
 };
 
 fn test_config() -> BackendConfig {
+    metrics_provider::init_for_tests();
     BackendConfig {
         access_key_id: "root".to_string(),
         secret_key: "roottoor".to_string(),

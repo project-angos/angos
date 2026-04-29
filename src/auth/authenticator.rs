@@ -9,7 +9,7 @@ use super::{
 };
 use crate::{
     cache::Cache, command::server::Error, configuration::Configuration, identity::ClientIdentity,
-    metrics_provider::AUTH_ATTEMPTS,
+    metrics_provider::metrics_provider,
 };
 
 #[derive(Clone, Debug, Default)]
@@ -104,14 +104,20 @@ impl Authenticator {
                 if !identity.certificate.common_names.is_empty()
                     || !identity.certificate.organizations.is_empty()
                 {
-                    AUTH_ATTEMPTS.with_label_values(&["mtls", "success"]).inc();
+                    metrics_provider()
+                        .auth_attempts
+                        .with_label_values(&["mtls", "success"])
+                        .inc();
                     return true;
                 }
             }
             Ok(AuthResult::NoCredentials) => {}
             Err(e) => {
                 warn!("mTLS validation error: {e}");
-                AUTH_ATTEMPTS.with_label_values(&["mtls", "failed"]).inc();
+                metrics_provider()
+                    .auth_attempts
+                    .with_label_values(&["mtls", "failed"])
+                    .inc();
             }
         }
         false
@@ -135,7 +141,10 @@ impl Authenticator {
             match validator.authenticate(parts, identity).await {
                 Ok(AuthResult::Authenticated) => {
                     debug!("OIDC authentication succeeded with provider: {provider_name}");
-                    AUTH_ATTEMPTS.with_label_values(&["oidc", "success"]).inc();
+                    metrics_provider()
+                        .auth_attempts
+                        .with_label_values(&["oidc", "success"])
+                        .inc();
                     return Ok(true);
                 }
                 Ok(AuthResult::NoCredentials) => {}
@@ -149,7 +158,10 @@ impl Authenticator {
         }
         match first_error {
             Some(e) => {
-                AUTH_ATTEMPTS.with_label_values(&["oidc", "failed"]).inc();
+                metrics_provider()
+                    .auth_attempts
+                    .with_label_values(&["oidc", "failed"])
+                    .inc();
                 Err(e)
             }
             None => Ok(false),
@@ -170,13 +182,19 @@ impl Authenticator {
         {
             Ok(AuthResult::Authenticated) => {
                 debug!("Basic authentication succeeded");
-                AUTH_ATTEMPTS.with_label_values(&["basic", "success"]).inc();
+                metrics_provider()
+                    .auth_attempts
+                    .with_label_values(&["basic", "success"])
+                    .inc();
                 Ok(true)
             }
             Ok(AuthResult::NoCredentials) => Ok(false),
             Err(e) => {
                 warn!("Basic auth validation failed: {e}");
-                AUTH_ATTEMPTS.with_label_values(&["basic", "failed"]).inc();
+                metrics_provider()
+                    .auth_attempts
+                    .with_label_values(&["basic", "failed"])
+                    .inc();
                 Err(e)
             }
         }
@@ -193,9 +211,10 @@ mod tests {
     use hyper::{Request, header::AUTHORIZATION};
 
     use super::*;
-    use crate::{cache, configuration::Configuration};
+    use crate::{cache, configuration::Configuration, metrics_provider};
 
     fn create_minimal_config() -> Configuration {
+        metrics_provider::init_for_tests();
         let toml = r#"
             [blob_store.fs]
             root_dir = "/tmp/test"

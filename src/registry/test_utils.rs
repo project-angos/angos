@@ -1,6 +1,7 @@
 use super::*;
 use crate::{
     configuration::GlobalConfig,
+    metrics_provider,
     oci::Digest,
     policy::{AccessMode, AccessPolicyConfig, RetentionPolicyConfig},
     registry::{
@@ -10,6 +11,7 @@ use crate::{
 };
 
 pub fn create_test_repositories() -> Arc<HashMap<String, Repository>> {
+    metrics_provider::init_for_tests();
     let token_cache = cache::Config::default().to_backend().unwrap();
 
     let config = repository::Config {

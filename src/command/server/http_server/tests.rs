@@ -12,7 +12,7 @@ use crate::{
     },
     configuration::Configuration,
     identity::ClientIdentity,
-    registry,
+    metrics_provider, registry,
     registry::{Registry, RegistryConfig},
 };
 
@@ -208,6 +208,7 @@ async fn test_handle_healthz_body_content() {
 
 #[test]
 fn test_handle_metrics_success() {
+    metrics_provider::init_for_tests();
     let result = handle_metrics();
 
     assert!(result.is_ok());
@@ -220,6 +221,7 @@ fn test_handle_metrics_success() {
 async fn test_handle_metrics_body_not_empty() {
     use http_body_util::BodyExt;
 
+    metrics_provider::init_for_tests();
     let result = handle_metrics();
     assert!(result.is_ok());
 
@@ -238,6 +240,7 @@ async fn test_handle_metrics_body_not_empty() {
 async fn test_handle_metrics_contains_metric_data() {
     use http_body_util::BodyExt;
 
+    metrics_provider::init_for_tests();
     let result = handle_metrics();
     assert!(result.is_ok());
 
