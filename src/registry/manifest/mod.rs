@@ -10,10 +10,23 @@ use crate::{
     oci::{Digest, Manifest, Namespace, Reference},
     registry::{
         DOCKER_CONTENT_DIGEST, Error, OCI_SUBJECT, Registry, Repository,
-        metadata_store::{MetadataStoreExt, link_kind::LinkKind},
+        metadata_store::{MetadataStoreExt, Transaction, link_kind::LinkKind},
         pagination::collect_all_pages,
     },
 };
+
+fn add_link_with_media_type(
+    tx: &mut Transaction<'_>,
+    link: &LinkKind,
+    target: &Digest,
+    media_type: Option<&str>,
+) {
+    let mut builder = tx.create_link(link, target);
+    if let Some(mt) = media_type {
+        builder = builder.with_media_type(mt);
+    }
+    builder.add();
+}
 
 pub(crate) struct ManifestMeta {
     pub media_type: Option<String>,
@@ -375,23 +388,20 @@ impl Registry {
             .cloned()
             .or_else(|| manifest.media_type.clone());
 
-        if let Some(ref mt) = effective_media_type {
-            tx.create_link(&LinkKind::Digest(digest.clone()), &digest)
-                .with_media_type(mt)
-                .add();
-        } else {
-            tx.create_link(&LinkKind::Digest(digest.clone()), &digest)
-                .add();
-        }
+        add_link_with_media_type(
+            &mut tx,
+            &LinkKind::Digest(digest.clone()),
+            &digest,
+            effective_media_type.as_deref(),
+        );
 
         if let Reference::Tag(tag) = reference {
-            if let Some(ref mt) = effective_media_type {
-                tx.create_link(&LinkKind::Tag(tag.clone()), &digest)
-                    .with_media_type(mt)
-                    .add();
-            } else {
-                tx.create_link(&LinkKind::Tag(tag.clone()), &digest).add();
-            }
+            add_link_with_media_type(
+                &mut tx,
+                &LinkKind::Tag(tag.clone()),
+                &digest,
+                effective_media_type.as_deref(),
+            );
         }
 
         if let Some(subject) = &manifest.subject {
