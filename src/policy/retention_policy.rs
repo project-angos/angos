@@ -171,10 +171,10 @@ impl RetentionPolicy {
             .add_variable("image", manifest)
             .map_err(|e| Error::Evaluation(e.to_string()))?;
 
-        context.add_function("now", || Utc::now().timestamp());
-        context.add_function("days", |d: i64| d * 86400);
-        context.add_function("hours", |h: i64| h * 3600);
-        context.add_function("minutes", |m: i64| m * 60);
+        context.add_function("now", now);
+        context.add_function("days", days);
+        context.add_function("hours", hours);
+        context.add_function("minutes", minutes);
 
         context.add_function(
             "top_pushed",
@@ -197,6 +197,22 @@ impl RetentionPolicy {
             list.iter().take(limit).any(|t| t == tag)
         }
     }
+}
+
+fn now() -> i64 {
+    Utc::now().timestamp()
+}
+
+fn days(d: i64) -> i64 {
+    d * 86400
+}
+
+fn hours(h: i64) -> i64 {
+    h * 3600
+}
+
+fn minutes(m: i64) -> i64 {
+    m * 60
 }
 
 #[cfg(test)]
