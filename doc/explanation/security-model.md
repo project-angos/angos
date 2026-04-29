@@ -105,6 +105,8 @@ Angos implements fail-closed authorization for critical security decisions:
 | Invalid OIDC token                  | 401 Unauthorized (fail-closed)     |
 | Invalid Basic Auth password         | Proceeds as anonymous identity     |
 | CEL evaluation error                | Rule skipped, evaluation continues |
+| CEL non-boolean result (allow mode) | Access denied (fail-closed)        |
+| CEL non-boolean result (deny mode)  | Rule skipped, evaluation continues |
 
 **Important:** Without authentication, requests proceed with an anonymous identity. Without access policies, the default behavior is to deny access (`default = "deny"`). To allow anonymous reads, you must explicitly configure access policies with appropriate rules.
 
