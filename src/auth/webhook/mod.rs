@@ -13,7 +13,9 @@ use hyper::{
     http::{HeaderMap, request::Parts},
 };
 use prometheus::{HistogramVec, IntCounterVec, register_histogram_vec, register_int_counter_vec};
-use reqwest::{Certificate, Client, Identity, header::AUTHORIZATION, redirect::Policy};
+use reqwest::{
+    Certificate, Client, Identity, RequestBuilder, header::AUTHORIZATION, redirect::Policy,
+};
 use serde::Deserialize;
 use tracing::warn;
 use url::Url;
@@ -75,6 +77,19 @@ pub enum WebhookAuth {
         password: Secret<String>,
     },
     BearerToken(Secret<String>),
+}
+
+impl WebhookAuth {
+    fn apply_to(&self, request: RequestBuilder) -> RequestBuilder {
+        match self {
+            Self::BearerToken(token) => {
+                request.header(AUTHORIZATION, format!("Bearer {}", token.expose()))
+            }
+            Self::BasicAuth { username, password } => {
+                request.basic_auth(username, Some(password.expose()))
+            }
+        }
+    }
 }
 
 impl Config {
@@ -432,10 +447,8 @@ impl WebhookAuthorizer {
             request = request.header(key, value);
         }
 
-        if let Some(WebhookAuth::BearerToken(token)) = &self.config.auth {
-            request = request.header(AUTHORIZATION, format!("Bearer {}", token.expose()));
-        } else if let Some(WebhookAuth::BasicAuth { username, password }) = &self.config.auth {
-            request = request.basic_auth(username, Some(password.expose()));
+        if let Some(auth) = &self.config.auth {
+            request = auth.apply_to(request);
         }
 
         let send_result = request.send().await;
