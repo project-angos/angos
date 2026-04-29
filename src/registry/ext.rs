@@ -281,28 +281,28 @@ impl Registry {
     }
 
     fn get_repository_config(&self, name: &str) -> RepositoryConfig {
-        if let Some(repo) = self.repositories.get(name) {
-            let upstream_urls: Vec<String> = repo.upstreams.iter().map(|u| u.url.clone()).collect();
-            let pull_through_cache = !upstream_urls.is_empty();
-            let immutable_tags = repo.immutable_tags || self.global_immutable_tags;
-            let immutable_tags_exclusions = if repo.immutable_tags_exclusions.is_empty() {
-                self.global_immutable_tags_exclusions.clone()
-            } else {
-                repo.immutable_tags_exclusions.clone()
-            };
-            RepositoryConfig {
-                pull_through_cache,
-                upstream_urls,
-                immutable_tags,
-                immutable_tags_exclusions,
-            }
-        } else {
-            RepositoryConfig {
+        let global_exclusions = || self.global_immutable_tags_exclusions.clone();
+
+        let Some(repo) = self.repositories.get(name) else {
+            return RepositoryConfig {
                 pull_through_cache: false,
                 upstream_urls: Vec::new(),
                 immutable_tags: self.global_immutable_tags,
-                immutable_tags_exclusions: self.global_immutable_tags_exclusions.clone(),
-            }
+                immutable_tags_exclusions: global_exclusions(),
+            };
+        };
+
+        let upstream_urls: Vec<String> = repo.upstreams.iter().map(|u| u.url.clone()).collect();
+        let immutable_tags_exclusions = if repo.immutable_tags_exclusions.is_empty() {
+            global_exclusions()
+        } else {
+            repo.immutable_tags_exclusions.clone()
+        };
+        RepositoryConfig {
+            pull_through_cache: !upstream_urls.is_empty(),
+            upstream_urls,
+            immutable_tags: repo.immutable_tags || self.global_immutable_tags,
+            immutable_tags_exclusions,
         }
     }
 
