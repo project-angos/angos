@@ -11,6 +11,7 @@ use crate::{
     registry::{
         DOCKER_CONTENT_DIGEST, Error, OCI_SUBJECT, Registry, Repository,
         metadata_store::{MetadataStoreExt, link_kind::LinkKind},
+        pagination::collect_all_pages,
     },
 };
 
@@ -437,6 +438,40 @@ impl Registry {
         })
     }
 
+    async fn find_tags_for_digest(
+        &self,
+        namespace: &Namespace,
+        digest: &Digest,
+    ) -> Result<Vec<String>, Error> {
+        let all_tags = collect_all_pages(|marker| async move {
+            self.metadata_store.list_tags(namespace, 100, marker).await
+        })
+        .await?;
+
+        let matching = futures_util::stream::iter(all_tags)
+            .map(|tag| async move {
+                let result = self
+                    .metadata_store
+                    .read_link(namespace, &LinkKind::Tag(tag.clone()), false)
+                    .await;
+                (tag, result)
+            })
+            .buffer_unordered(20)
+            .filter_map(|(tag, result)| async move {
+                if let Ok(metadata) = result
+                    && &metadata.target == digest
+                {
+                    Some(tag)
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>()
+            .await;
+
+        Ok(matching)
+    }
+
     #[instrument(skip(actor))]
     pub async fn delete_manifest(
         &self,
@@ -453,46 +488,9 @@ impl Registry {
             Reference::Digest(digest) => {
                 tx.delete_link(&LinkKind::Digest(digest.clone()));
 
-                let mut all_tags = Vec::new();
-                let mut marker = None;
-                loop {
-                    let (tags, next_marker) = self
-                        .metadata_store
-                        .list_tags(namespace, 100, marker)
-                        .await?;
-                    all_tags.extend(tags);
-                    if next_marker.is_none() {
-                        break;
-                    }
-                    marker = next_marker;
-                }
-
-                let matching_tags: Vec<_> = futures_util::stream::iter(all_tags)
-                    .map(|tag| {
-                        let tag_link = LinkKind::Tag(tag);
-                        async {
-                            let result = self
-                                .metadata_store
-                                .read_link(namespace, &tag_link, false)
-                                .await;
-                            (tag_link, result)
-                        }
-                    })
-                    .buffer_unordered(20)
-                    .filter_map(|(tag_link, result)| async {
-                        if let Ok(metadata) = result
-                            && &metadata.target == digest
-                        {
-                            Some(tag_link)
-                        } else {
-                            None
-                        }
-                    })
-                    .collect()
-                    .await;
-
-                for tag_link in matching_tags {
-                    tx.delete_link(&tag_link);
+                let matching_tags = self.find_tags_for_digest(namespace, digest).await?;
+                for tag in matching_tags {
+                    tx.delete_link(&LinkKind::Tag(tag));
                 }
 
                 if let Ok(content) = self.blob_store.read(digest).await
