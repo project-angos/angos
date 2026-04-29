@@ -11,7 +11,9 @@ use crate::{
     registry::{
         Error,
         blob_store::BlobStore,
-        metadata_store::{LinkMetadata, MetadataStore, MetadataStoreExt, link_kind::LinkKind},
+        metadata_store::{
+            BlobIndex, LinkMetadata, MetadataStore, MetadataStoreExt, link_kind::LinkKind,
+        },
         pagination::collect_all_pages,
         parse_manifest_digests,
         repository::Repository,
@@ -29,6 +31,17 @@ pub struct RetentionChecker {
     repositories: Arc<HashMap<String, Repository>>,
     global_retention_policy: Option<Arc<RetentionPolicy>>,
     dry_run: bool,
+}
+
+fn has_link_kind(
+    blob_index: &BlobIndex,
+    namespace: &str,
+    predicate: impl Fn(&LinkKind) -> bool,
+) -> bool {
+    blob_index
+        .namespace
+        .get(namespace)
+        .is_some_and(|refs| refs.iter().any(predicate))
 }
 
 async fn fetch_single_tag_metadata(
@@ -313,13 +326,11 @@ impl RetentionChecker {
     async fn is_protected(&self, namespace: &str, digest: &Digest) -> Result<bool, Error> {
         // Index child manifests are protected
         if let Ok(blob_index) = self.metadata_store.read_blob_index(digest).await
-            && let Some(refs) = blob_index.namespace.get(namespace)
+            && has_link_kind(&blob_index, namespace, |link| {
+                matches!(link, LinkKind::Manifest(_, _))
+            })
         {
-            for link in refs {
-                if matches!(link, LinkKind::Manifest(_, _)) {
-                    return Ok(true);
-                }
-            }
+            return Ok(true);
         }
 
         // Referrer subjects are protected
@@ -332,13 +343,11 @@ impl RetentionChecker {
 
     async fn has_tags(&self, namespace: &str, digest: &Digest) -> Result<bool, Error> {
         if let Ok(blob_index) = self.metadata_store.read_blob_index(digest).await
-            && let Some(refs) = blob_index.namespace.get(namespace)
+            && has_link_kind(&blob_index, namespace, |link| {
+                matches!(link, LinkKind::Tag(_))
+            })
         {
-            for link in refs {
-                if matches!(link, LinkKind::Tag(_)) {
-                    return Ok(true);
-                }
-            }
+            return Ok(true);
         }
         Ok(false)
     }
