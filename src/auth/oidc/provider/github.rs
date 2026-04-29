@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    auth::oidc::{OidcProvider, provider::generic},
+    auth::oidc::provider::{BaseConfig, OidcProvider},
     command::server::Error,
 };
 
@@ -39,49 +39,31 @@ fn default_clock_skew_tolerance() -> u64 {
 }
 
 pub struct Provider {
-    generic: generic::Provider,
+    base: BaseConfig,
 }
 
 impl Provider {
     pub fn new(config: ProviderConfig) -> Self {
-        let generic_config = generic::ProviderConfig {
-            issuer: config.issuer,
-            jwks_uri: Some(config.jwks_uri),
-            jwks_refresh_interval: config.jwks_refresh_interval,
-            required_audience: config.required_audience,
-            clock_skew_tolerance: config.clock_skew_tolerance,
-        };
-
         Self {
-            generic: generic::Provider::new(generic_config),
+            base: BaseConfig {
+                issuer: config.issuer,
+                jwks_uri: Some(config.jwks_uri),
+                jwks_refresh_interval: config.jwks_refresh_interval,
+                required_audience: config.required_audience,
+                clock_skew_tolerance: config.clock_skew_tolerance,
+            },
         }
     }
 }
 
 #[async_trait]
 impl OidcProvider for Provider {
-    fn issuer(&self) -> &str {
-        self.generic.issuer()
-    }
-
-    fn jwks_uri(&self) -> Option<&str> {
-        self.generic.jwks_uri()
+    fn base(&self) -> &BaseConfig {
+        &self.base
     }
 
     fn name(&self) -> &'static str {
         "GitHub Actions"
-    }
-
-    fn jwks_refresh_interval(&self) -> u64 {
-        self.generic.jwks_refresh_interval()
-    }
-
-    fn required_audience(&self) -> Option<&str> {
-        self.generic.required_audience()
-    }
-
-    fn clock_skew_tolerance(&self) -> u64 {
-        self.generic.clock_skew_tolerance()
     }
 
     fn validate_provider_claims(

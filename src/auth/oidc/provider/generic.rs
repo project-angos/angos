@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
-use crate::auth::oidc::OidcProvider;
+use crate::auth::oidc::provider::{BaseConfig, OidcProvider};
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ProviderConfig {
@@ -25,39 +25,31 @@ fn default_clock_skew_tolerance() -> u64 {
 }
 
 pub struct Provider {
-    config: ProviderConfig,
+    base: BaseConfig,
 }
 
 impl Provider {
     pub fn new(config: ProviderConfig) -> Self {
-        Self { config }
+        Self {
+            base: BaseConfig {
+                issuer: config.issuer,
+                jwks_uri: config.jwks_uri,
+                jwks_refresh_interval: config.jwks_refresh_interval,
+                required_audience: config.required_audience,
+                clock_skew_tolerance: config.clock_skew_tolerance,
+            },
+        }
     }
 }
 
 #[async_trait]
 impl OidcProvider for Provider {
-    fn issuer(&self) -> &str {
-        &self.config.issuer
-    }
-
-    fn jwks_uri(&self) -> Option<&str> {
-        self.config.jwks_uri.as_deref()
+    fn base(&self) -> &BaseConfig {
+        &self.base
     }
 
     fn name(&self) -> &'static str {
         "Generic OIDC"
-    }
-
-    fn jwks_refresh_interval(&self) -> u64 {
-        self.config.jwks_refresh_interval
-    }
-
-    fn required_audience(&self) -> Option<&str> {
-        self.config.required_audience.as_deref()
-    }
-
-    fn clock_skew_tolerance(&self) -> u64 {
-        self.config.clock_skew_tolerance
     }
 }
 

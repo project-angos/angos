@@ -217,7 +217,10 @@ mod tests {
     use crate::{
         auth::oidc::{
             OidcProvider,
-            provider::generic::{Provider, ProviderConfig},
+            provider::{
+                BaseConfig,
+                generic::{Provider, ProviderConfig},
+            },
             tests::{create_rsa_keypair, rsa_public_key_to_jwk},
         },
         cache,
@@ -1005,18 +1008,20 @@ mod tests {
     }
 
     struct TestProvider {
-        issuer: String,
-        audience: Option<String>,
-        clock_skew: u64,
+        base: BaseConfig,
         claim_error: Option<String>,
     }
 
     impl TestProvider {
         fn new(issuer: &str, audience: Option<&str>) -> Self {
             Self {
-                issuer: issuer.to_string(),
-                audience: audience.map(str::to_string),
-                clock_skew: 0,
+                base: BaseConfig {
+                    issuer: issuer.to_string(),
+                    jwks_uri: None,
+                    jwks_refresh_interval: 3600,
+                    required_audience: audience.map(str::to_string),
+                    clock_skew_tolerance: 0,
+                },
                 claim_error: None,
             }
         }
@@ -1028,28 +1033,12 @@ mod tests {
     }
 
     impl OidcProvider for TestProvider {
-        fn issuer(&self) -> &str {
-            &self.issuer
-        }
-
-        fn jwks_uri(&self) -> Option<&str> {
-            None
+        fn base(&self) -> &BaseConfig {
+            &self.base
         }
 
         fn name(&self) -> &'static str {
             "Test"
-        }
-
-        fn jwks_refresh_interval(&self) -> u64 {
-            3600
-        }
-
-        fn required_audience(&self) -> Option<&str> {
-            self.audience.as_deref()
-        }
-
-        fn clock_skew_tolerance(&self) -> u64 {
-            self.clock_skew
         }
 
         fn validate_provider_claims(
