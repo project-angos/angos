@@ -132,6 +132,15 @@ impl ConfigWatcher {
     }
 }
 
+fn handle_notify_result(res: Result<Event, notify::Error>, tx: &mpsc::Sender<Event>) {
+    match res {
+        Ok(event) => {
+            let _ = tx.blocking_send(event);
+        }
+        Err(e) => warn!("File system watcher error: {e}"),
+    }
+}
+
 fn resolve_tls_dir(config_dir: &Path, path: &Path) -> Option<PathBuf> {
     let full = if path.is_absolute() {
         path.to_path_buf()
@@ -239,12 +248,7 @@ async fn watch_config_loop(
 
         let tx_clone = tx.clone();
         let mut watcher =
-            notify::recommended_watcher(move |res: Result<Event, notify::Error>| match res {
-                Ok(event) => {
-                    let _ = tx_clone.blocking_send(event);
-                }
-                Err(e) => warn!("File system watcher error: {e}"),
-            })?;
+            notify::recommended_watcher(move |res| handle_notify_result(res, &tx_clone))?;
 
         watcher.watch(&config_dir, RecursiveMode::NonRecursive)?;
         for dir in &tls_dirs {
