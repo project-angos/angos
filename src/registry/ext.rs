@@ -86,6 +86,16 @@ struct ReferrerInfo {
     annotations: HashMap<String, String>,
 }
 
+impl From<Descriptor> for ReferrerInfo {
+    fn from(descriptor: Descriptor) -> Self {
+        Self {
+            digest: descriptor.digest.to_string(),
+            artifact_type: descriptor.artifact_type,
+            annotations: descriptor.annotations,
+        }
+    }
+}
+
 #[derive(Serialize, Debug)]
 struct ManifestEntry {
     digest: String,
@@ -379,13 +389,7 @@ impl Registry {
                 docker_referrers.remove(&digest).unwrap_or_default();
 
             if let Ok(oci_referrers) = self.list_referrers(namespace, &digest, None).await {
-                for descriptor in oci_referrers {
-                    referrers.push(ReferrerInfo {
-                        digest: descriptor.digest.to_string(),
-                        artifact_type: descriptor.artifact_type,
-                        annotations: descriptor.annotations,
-                    });
-                }
+                referrers.extend(oci_referrers.into_iter().map(ReferrerInfo::from));
             }
 
             let (pushed_at, last_pulled_at) = self
