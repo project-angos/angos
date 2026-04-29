@@ -1,5 +1,6 @@
 pub mod jwk;
 pub mod provider;
+pub mod validator;
 
 use std::{sync::Arc, time::Duration};
 
@@ -65,7 +66,7 @@ impl OidcValidator {
     }
 
     pub async fn validate_token(&self, token: &str) -> Result<OidcClaims, Error> {
-        generic::validate_oidc_token(
+        validator::validate_oidc_token(
             &self.provider_name,
             &*self.provider,
             token,
