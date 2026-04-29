@@ -45,7 +45,7 @@ pub use crate::policy::AccessPolicy;
 use crate::{
     cache,
     configuration::RegexPattern,
-    oci::Namespace,
+    oci::{Namespace, namespace_belongs_to},
     registry::{
         blob_store::{BlobStore, PresignedBlobStore, UploadStore},
         metadata_store::MetadataStore,
@@ -186,10 +186,7 @@ impl Registry {
     ) -> Result<&Repository, Error> {
         self.repositories
             .iter()
-            .find(|(repository, _)| {
-                namespace.as_ref() == repository.as_str()
-                    || namespace.starts_with(&format!("{repository}/"))
-            })
+            .find(|(name, _)| namespace_belongs_to(namespace.as_ref(), name))
             .map(|(_, repository)| repository)
             .ok_or(Error::NameUnknown)
     }

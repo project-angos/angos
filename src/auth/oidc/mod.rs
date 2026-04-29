@@ -1,5 +1,6 @@
 pub mod jwk;
 pub mod provider;
+pub mod validator;
 
 use std::{sync::Arc, time::Duration};
 
@@ -48,15 +49,11 @@ impl OidcValidator {
         provider_config: &Config,
         cache: Arc<dyn Cache>,
     ) -> Result<Self, Error> {
-        let client = Client::builder().timeout(Duration::from_secs(30)).build();
-
-        let client = match client {
-            Ok(client) => Ok(Arc::new(client)),
-            Err(err) => {
-                let msg = format!("Failed to build HTTP client: {err}");
-                Err(Error::Initialization(msg))
-            }
-        }?;
+        let client = Client::builder()
+            .timeout(Duration::from_secs(30))
+            .build()
+            .map(Arc::new)
+            .map_err(|e| Error::Initialization(format!("Failed to build HTTP client: {e}")))?;
 
         let provider = provider_config.to_backend();
 
@@ -69,7 +66,7 @@ impl OidcValidator {
     }
 
     pub async fn validate_token(&self, token: &str) -> Result<OidcClaims, Error> {
-        generic::validate_oidc_token(
+        validator::validate_oidc_token(
             &self.provider_name,
             &*self.provider,
             token,
@@ -87,23 +84,7 @@ impl AuthMiddleware for OidcValidator {
         parts: &Parts,
         identity: &mut ClientIdentity,
     ) -> Result<AuthResult, Error> {
-        let token = if let Some(bearer_token) = parts.bearer_token() {
-            debug!(
-                "Found Bearer token for OIDC provider '{}'",
-                self.provider_name
-            );
-            bearer_token
-        } else if let Some((username, password)) = parts.basic_auth() {
-            debug!("Found Basic auth credentials with username '{}'", username);
-            if username != self.provider_name {
-                debug!(
-                    "Basic auth username '{}' doesn't match OIDC provider name '{}', skipping",
-                    username, self.provider_name
-                );
-                return Ok(AuthResult::NoCredentials);
-            }
-            password
-        } else {
+        let Some(token) = extract_oidc_credential(parts, &self.provider_name) else {
             return Ok(AuthResult::NoCredentials);
         };
 
@@ -125,6 +106,29 @@ impl AuthMiddleware for OidcValidator {
             }
         }
     }
+}
+
+/// Extracts an OIDC credential string from `parts`:
+/// - `Authorization: Bearer <token>` → `Some(token)` (any provider can claim a Bearer header).
+/// - `Authorization: Basic <user:pass>` where `user == provider_name` → `Some(password)`
+///   (the OIDC token is in the password field; the username gates which provider claims it).
+/// - Anything else → `None`.
+fn extract_oidc_credential(parts: &Parts, provider_name: &str) -> Option<String> {
+    if let Some(bearer_token) = parts.bearer_token() {
+        debug!("Found Bearer token for OIDC provider '{provider_name}'");
+        return Some(bearer_token);
+    }
+    if let Some((username, password)) = parts.basic_auth() {
+        debug!("Found Basic auth credentials with username '{username}'");
+        if username == provider_name {
+            return Some(password);
+        }
+        debug!(
+            "Basic auth username '{username}' doesn't match OIDC provider name \
+             '{provider_name}', skipping"
+        );
+    }
+    None
 }
 
 #[cfg(test)]

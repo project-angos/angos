@@ -9,13 +9,18 @@ use wiremock::{
 
 use crate::{
     auth::webhook::{
-        Config, WebhookAuth, WebhookAuthorizer, build_header_name, build_header_value,
-        build_headers, load_certificate_bundle, load_file, load_identity, set_forwarded_for_header,
-        set_forwarded_headers, set_forwarded_host_header, set_forwarded_method_header,
-        set_forwarded_proto_header, set_forwarded_uri_header, set_registry_action_header,
-        set_registry_certificate_cn_header, set_registry_certificate_o_header,
-        set_registry_digest_header, set_registry_identity_id_header, set_registry_namespace_header,
-        set_registry_reference_header, set_registry_username_header,
+        Config, WebhookAuthorizer,
+        config::WebhookAuth,
+        headers::{
+            build_header_name, build_header_value, build_headers, set_forwarded_for_header,
+            set_forwarded_headers, set_forwarded_host_header, set_forwarded_method_header,
+            set_forwarded_proto_header, set_forwarded_uri_header, set_registry_action_header,
+            set_registry_certificate_cn_header, set_registry_certificate_o_header,
+            set_registry_digest_header, set_registry_identity_id_header,
+            set_registry_namespace_header, set_registry_reference_header,
+            set_registry_username_header,
+        },
+        tls::{load_certificate_bundle, load_file, load_identity},
     },
     cache,
     command::server::Error,
@@ -866,8 +871,8 @@ async fn test_authorize_uses_cache() {
 }
 
 #[tokio::test]
-async fn test_authorize_network_error_denies() {
-    let mut config = build_test_config(Url::parse("http://localhost:1").unwrap(), None, None, None);
+async fn test_authorize_returns_err_on_unreachable_url() {
+    let mut config = build_test_config(Url::parse("http://127.0.0.1:1").unwrap(), None, None, None);
     config.auth = None;
 
     let cache = cache::Config::Memory.to_backend().unwrap();
@@ -882,8 +887,66 @@ async fn test_authorize_network_error_denies() {
         .unwrap();
     let (parts, ()) = request.into_parts();
 
+    let result = webhook.authorize(&action, &identity, &parts).await;
+    let err = result.expect_err("unreachable URL must produce Err, not Ok(false)");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("unreachable"),
+        "transport-failure error must mention unreachability so it is distinguishable from explicit deny in logs: {msg}"
+    );
+}
+
+#[tokio::test]
+async fn test_authorize_does_not_cache_transport_errors() {
+    let mock_server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let action = Action::ApiVersion;
+    let identity = ClientIdentity::new(None);
+    let request_parts = {
+        let (parts, ()) = Builder::new()
+            .uri("https://example.com/v2/")
+            .body(())
+            .unwrap()
+            .into_parts();
+        parts
+    };
+
+    // First call: point at an unreachable port to produce TransportError.
+    let mut unreachable_config =
+        build_test_config(Url::parse("http://127.0.0.1:1").unwrap(), None, None, None);
+    unreachable_config.auth = None;
+    let cache = cache::Config::Memory.to_backend().unwrap();
+    let unreachable_webhook =
+        WebhookAuthorizer::new("test".to_string(), unreachable_config, cache.clone()).unwrap();
+
+    let first = unreachable_webhook
+        .authorize(&action, &identity, &request_parts)
+        .await;
+    assert!(
+        first.is_err(),
+        "unreachable URL must produce Err, not Ok(false)"
+    );
+
+    // Second call: same cache, but now using the live mock server.
+    // If transport failures had been cached as Deny the result would be false
+    // without a network call, causing the mock's expect(1) assertion to fail.
+    let mut live_config =
+        build_test_config(Url::parse(&mock_server.uri()).unwrap(), None, None, None);
+    live_config.auth = None;
+    let live_webhook = WebhookAuthorizer::new("test".to_string(), live_config, cache).unwrap();
+
+    let second = live_webhook
+        .authorize(&action, &identity, &request_parts)
+        .await;
     assert_eq!(
-        webhook.authorize(&action, &identity, &parts).await,
-        Ok(false)
+        second,
+        Ok(true),
+        "second call must reach the live server, not return a cached denial"
     );
 }

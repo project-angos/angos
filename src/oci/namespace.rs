@@ -124,6 +124,16 @@ impl Borrow<str> for Namespace {
     }
 }
 
+/// Returns `true` when `namespace` belongs to the configured `repository_name` —
+/// either as an exact match or as a direct sub-namespace of the form
+/// `{repository_name}/...`.
+///
+/// The `/` separator check is intentional: without it, `"myrepo2"` would
+/// spuriously match `"myrepo"` via `starts_with`.
+pub fn namespace_belongs_to(namespace: &str, repository_name: &str) -> bool {
+    namespace == repository_name || namespace.starts_with(&format!("{repository_name}/"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -326,5 +336,27 @@ mod tests {
         assert!(Namespace::new("a/-b").is_err());
         assert!(Namespace::new("a/_b").is_err());
         assert!(Namespace::new("a/.b").is_err());
+    }
+
+    #[test]
+    fn test_namespace_belongs_to_exact_match() {
+        assert!(namespace_belongs_to("myrepo", "myrepo"));
+    }
+
+    #[test]
+    fn test_namespace_belongs_to_prefix_match() {
+        assert!(namespace_belongs_to("myrepo/sub", "myrepo"));
+        assert!(namespace_belongs_to("myrepo/sub/path", "myrepo"));
+    }
+
+    #[test]
+    fn test_namespace_belongs_to_no_false_positive_shared_prefix() {
+        assert!(!namespace_belongs_to("myrepo2", "myrepo"));
+    }
+
+    #[test]
+    fn test_namespace_belongs_to_distinct_namespace() {
+        assert!(!namespace_belongs_to("other", "myrepo"));
+        assert!(!namespace_belongs_to("other/sub", "myrepo"));
     }
 }

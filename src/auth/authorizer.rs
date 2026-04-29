@@ -9,7 +9,7 @@ use crate::{
     command::server::Error,
     configuration::{Configuration, RegexPattern},
     identity::{Action, ClientIdentity},
-    oci::{Namespace, Reference},
+    oci::{Namespace, Reference, namespace_belongs_to},
     policy::AccessMode,
     registry::{AccessPolicy, Registry},
 };
@@ -37,19 +37,7 @@ impl Authorizer {
     pub fn new(config: &Configuration, cache: &Arc<dyn Cache>) -> Result<Self, Error> {
         let global_access_policy = AccessPolicy::new(&config.global.access_policy);
 
-        // Build WebhookAuthorizer instances keyed by webhook name, deduplicated via Arc.
-        let webhook_authorizers: HashMap<String, Arc<WebhookAuthorizer>> = config
-            .auth
-            .webhook
-            .iter()
-            .map(|(name, webhook_config)| {
-                WebhookAuthorizer::new(name.clone(), webhook_config.as_ref().clone(), cache.clone())
-                    .map(|a| (name.clone(), Arc::new(a)))
-                    .map_err(|e| {
-                        Error::Initialization(format!("Failed to create webhook '{name}': {e}"))
-                    })
-            })
-            .collect::<Result<_, _>>()?;
+        let webhook_authorizers = build_webhooks(config, cache)?;
 
         let global_authorization_webhook = config
             .global
@@ -58,35 +46,7 @@ impl Authorizer {
             .map(|cfg| lookup_webhook(&webhook_authorizers, cfg))
             .transpose()?;
 
-        let repositories: HashMap<String, AuthorizerRepository> = config
-            .repository
-            .iter()
-            .map(|(name, repo_config)| {
-                let access_policy = if repo_config.access_policy.rules.is_empty()
-                    && repo_config.access_policy.default == AccessMode::Deny
-                {
-                    None
-                } else {
-                    Some(AccessPolicy::new(&repo_config.access_policy))
-                };
-
-                let authorization_webhook = repo_config
-                    .authorization_webhook
-                    .as_ref()
-                    .map(|cfg| lookup_webhook(&webhook_authorizers, cfg))
-                    .transpose()?;
-
-                Ok((
-                    name.clone(),
-                    AuthorizerRepository {
-                        access_policy,
-                        authorization_webhook,
-                        immutable_tags: repo_config.immutable_tags,
-                        immutable_tags_exclusions: repo_config.immutable_tags_exclusions.clone(),
-                    },
-                ))
-            })
-            .collect::<Result<_, Error>>()?;
+        let repositories = build_repositories(config, &webhook_authorizers)?;
 
         let global_immutable_tags_exclusions = config.global.immutable_tags_exclusions.clone();
 
@@ -166,15 +126,7 @@ impl Authorizer {
             return Err(Error::Unauthorized(ACCESS_DENIED.to_string()));
         }
 
-        if let Action::PutManifest {
-            reference: Reference::Tag(tag),
-            ..
-        } = action
-            && !self.is_tag_mutable(auth_repo, tag)
-        {
-            let msg = format!("Tag '{tag}' is immutable and cannot be overwritten");
-            return Err(Error::Conflict(msg));
-        }
+        self.check_immutable_tag(auth_repo, action)?;
 
         let webhook = auth_repo
             .authorization_webhook
@@ -200,6 +152,24 @@ impl Authorizer {
         Ok(())
     }
 
+    fn check_immutable_tag(
+        &self,
+        auth_repo: &AuthorizerRepository,
+        action: &Action,
+    ) -> Result<(), Error> {
+        if let Action::PutManifest {
+            reference: Reference::Tag(tag),
+            ..
+        } = action
+            && !self.is_tag_mutable(auth_repo, tag)
+        {
+            return Err(Error::Conflict(format!(
+                "Tag '{tag}' is immutable and cannot be overwritten"
+            )));
+        }
+        Ok(())
+    }
+
     fn is_tag_mutable(&self, auth_repo: &AuthorizerRepository, tag: &str) -> bool {
         let immutable = auth_repo.immutable_tags || self.global_immutable_tags;
 
@@ -217,9 +187,10 @@ impl Authorizer {
     }
 
     pub fn is_tag_immutable(&self, namespace: &str, tag: &str) -> bool {
-        let auth_repo = self.repositories.iter().find(|(name, _)| {
-            namespace == name.as_str() || namespace.starts_with(&format!("{name}/"))
-        });
+        let auth_repo = self
+            .repositories
+            .iter()
+            .find(|(name, _)| namespace_belongs_to(namespace, name));
 
         if let Some((_, auth_repo)) = auth_repo {
             !self.is_tag_mutable(auth_repo, tag)
@@ -231,6 +202,55 @@ impl Authorizer {
                     .any(|pattern| pattern.is_match(tag))
         }
     }
+}
+
+fn build_webhooks(
+    config: &Configuration,
+    cache: &Arc<dyn Cache>,
+) -> Result<HashMap<String, Arc<WebhookAuthorizer>>, Error> {
+    let mut webhooks = HashMap::with_capacity(config.auth.webhook.len());
+    for (name, webhook_config) in &config.auth.webhook {
+        let authorizer =
+            WebhookAuthorizer::new(name.clone(), webhook_config.as_ref().clone(), cache.clone())
+                .map_err(|e| {
+                    Error::Initialization(format!("Failed to create webhook '{name}': {e}"))
+                })?;
+        webhooks.insert(name.clone(), Arc::new(authorizer));
+    }
+    Ok(webhooks)
+}
+
+fn build_repositories(
+    config: &Configuration,
+    webhook_authorizers: &HashMap<String, Arc<WebhookAuthorizer>>,
+) -> Result<HashMap<String, AuthorizerRepository>, Error> {
+    let mut repositories = HashMap::with_capacity(config.repository.len());
+    for (name, repo_config) in &config.repository {
+        let access_policy = if repo_config.access_policy.rules.is_empty()
+            && repo_config.access_policy.default == AccessMode::Deny
+        {
+            None
+        } else {
+            Some(AccessPolicy::new(&repo_config.access_policy))
+        };
+
+        let authorization_webhook = repo_config
+            .authorization_webhook
+            .as_ref()
+            .map(|cfg| lookup_webhook(webhook_authorizers, cfg))
+            .transpose()?;
+
+        repositories.insert(
+            name.clone(),
+            AuthorizerRepository {
+                access_policy,
+                authorization_webhook,
+                immutable_tags: repo_config.immutable_tags,
+                immutable_tags_exclusions: repo_config.immutable_tags_exclusions.clone(),
+            },
+        );
+    }
+    Ok(repositories)
 }
 
 fn log_denial(reason: &str, identity: &ClientIdentity) {
@@ -646,6 +666,58 @@ mod tests {
         let auth_repo = authorizer.repositories.get("myrepo").unwrap();
 
         assert!(authorizer.is_tag_mutable(auth_repo, "any-tag"));
+    }
+
+    #[test]
+    fn test_check_immutable_tag_returns_conflict_for_tagged_putmanifest() {
+        use std::str::FromStr;
+
+        use crate::{
+            command::server::Error,
+            oci::{Namespace, Reference},
+        };
+
+        let toml = r#"
+            [blob_store.fs]
+            root_dir = "/tmp/test"
+
+            [metadata_store.fs]
+            root_dir = "/tmp/test"
+
+            [cache.memory]
+
+            [server]
+            bind_address = "0.0.0.0"
+            port = 8000
+
+            [global]
+            update_pull_time = false
+            max_concurrent_cache_jobs = 10
+            immutable_tags = true
+
+            [repository.myrepo]
+            namespace_pattern = "^myrepo/.*"
+        "#;
+
+        let config = Configuration::load_from_str(toml).unwrap();
+        let cache = cache::Config::Memory.to_backend().unwrap();
+        let authorizer = Authorizer::new(&config, &cache).unwrap();
+        let auth_repo = authorizer.repositories.get("myrepo").unwrap();
+
+        let action = Action::PutManifest {
+            namespace: Namespace::new("myrepo/app").unwrap(),
+            reference: Reference::from_str("v1.0.0").unwrap(),
+        };
+
+        let result = authorizer.check_immutable_tag(auth_repo, &action);
+
+        let Err(Error::Conflict(msg)) = result else {
+            panic!("expected Err(Error::Conflict(_)), got: {result:?}");
+        };
+        assert!(
+            msg.contains("v1.0.0") && msg.contains("immutable"),
+            "error message must mention the tag and 'immutable', got: {msg}"
+        );
     }
 
     #[test]

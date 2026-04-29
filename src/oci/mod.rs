@@ -11,7 +11,7 @@ pub use descriptor::{Descriptor, Platform};
 pub use digest::Digest;
 pub use error::Error;
 pub use manifest::Manifest;
-pub use namespace::Namespace;
+pub use namespace::{Namespace, namespace_belongs_to};
 pub use reference::Reference;
 
 #[derive(Serialize, Debug)]
