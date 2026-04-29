@@ -30,32 +30,22 @@ pub trait Cache: Any + Debug + Send + Sync {
 pub trait CacheExt: Cache {
     /// Retrieve and deserialize a JSON value from the cache
     async fn retrieve<T: DeserializeOwned + Send>(&self, key: &str) -> Result<Option<T>, Error> {
-        let cached = match self.retrieve_value(key).await {
-            Ok(s) => s,
-            Err(err) => {
-                warn!("Failed to retrieve value from cache for key {key}: {err}");
-                return Err(Error::Execution(format!(
-                    "Failed to retrieve value from cache: {err}"
-                )));
-            }
-        };
+        let cached = self.retrieve_value(key).await.map_err(|err| {
+            warn!("Failed to retrieve value from cache for key {key}: {err}");
+            Error::Execution(format!("Failed to retrieve value from cache: {err}"))
+        })?;
 
         let Some(cached) = cached else {
             return Ok(None);
         };
 
-        match serde_json::from_str::<T>(&cached) {
-            Ok(value) => {
-                debug!("Using cached value for key: {key}");
-                Ok(Some(value))
-            }
-            Err(e) => {
-                warn!("Failed to deserialize cached value for key {key}: {e}");
-                Err(Error::Execution(format!(
-                    "Failed to deserialize cached value: {e}"
-                )))
-            }
-        }
+        let value = serde_json::from_str::<T>(&cached).map_err(|e| {
+            warn!("Failed to deserialize cached value for key {key}: {e}");
+            Error::Execution(format!("Failed to deserialize cached value: {e}"))
+        })?;
+
+        debug!("Using cached value for key: {key}");
+        Ok(Some(value))
     }
 
     /// Serialize and store a JSON value in the cache
