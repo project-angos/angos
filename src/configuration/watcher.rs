@@ -132,6 +132,15 @@ impl ConfigWatcher {
     }
 }
 
+fn resolve_tls_dir(config_dir: &Path, path: &Path) -> Option<PathBuf> {
+    let full = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        config_dir.join(path)
+    };
+    full.parent().map(Path::to_path_buf)
+}
+
 fn compute_tls_dirs(config: &Configuration, config_dir: &Path) -> HashSet<PathBuf> {
     let ServerConfig::Tls(tls_config) = &config.server else {
         return HashSet::new();
@@ -144,14 +153,7 @@ fn compute_tls_dirs(config: &Configuration, config_dir: &Path) -> HashSet<PathBu
     ]
     .into_iter()
     .flatten()
-    .filter_map(|p| {
-        let full = if p.is_absolute() {
-            p.clone()
-        } else {
-            config_dir.join(p)
-        };
-        full.parent().map(Path::to_path_buf)
-    })
+    .filter_map(|p| resolve_tls_dir(config_dir, p))
     .collect()
 }
 
@@ -766,6 +768,42 @@ bind_address = "10.0.0.1"
     fn is_k8s_data_symlink_rejects_path_with_no_filename() {
         let config_dir = Path::new("/etc/registry");
         assert!(!is_k8s_data_symlink(Path::new("/"), config_dir));
+    }
+
+    #[test]
+    fn resolve_tls_dir_absolute_path_returns_parent() {
+        let config_dir = Path::new("/etc/registry");
+        let path = Path::new("/var/secrets/tls/server.pem");
+        assert_eq!(
+            resolve_tls_dir(config_dir, path),
+            Some(PathBuf::from("/var/secrets/tls")),
+        );
+    }
+
+    #[test]
+    fn resolve_tls_dir_relative_path_joins_with_config_dir() {
+        let config_dir = Path::new("/etc/registry");
+        let path = Path::new("tls/server.pem");
+        assert_eq!(
+            resolve_tls_dir(config_dir, path),
+            Some(PathBuf::from("/etc/registry/tls")),
+        );
+    }
+
+    #[test]
+    fn resolve_tls_dir_absolute_root_path_has_no_parent() {
+        let config_dir = Path::new("/etc/registry");
+        assert_eq!(resolve_tls_dir(config_dir, Path::new("/")), None);
+    }
+
+    #[test]
+    fn resolve_tls_dir_relative_bare_filename_lands_in_config_dir() {
+        let config_dir = Path::new("/etc/registry");
+        let path = Path::new("server.pem");
+        assert_eq!(
+            resolve_tls_dir(config_dir, path),
+            Some(PathBuf::from("/etc/registry")),
+        );
     }
 
     /// Verifies that a burst of N events coalesces into a single `ChangeKind`
