@@ -140,7 +140,7 @@ impl RetentionChecker {
 
     fn rank_by<K: Ord>(tags: &[TagWithMetadata], key: impl Fn(&LinkMetadata) -> K) -> Vec<String> {
         let mut indices: Vec<usize> = (0..tags.len()).collect();
-        indices.sort_by(|&a, &b| key(&tags[b].metadata).cmp(&key(&tags[a].metadata)));
+        indices.sort_by_cached_key(|&i| std::cmp::Reverse(key(&tags[i].metadata)));
         indices.iter().map(|&i| tags[i].name.clone()).collect()
     }
 
