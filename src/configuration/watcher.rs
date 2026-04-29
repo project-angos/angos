@@ -23,6 +23,15 @@ enum ChangeKind {
     Irrelevant,
 }
 
+/// Detects K8s ConfigMap/Secret-style atomic-update symlinks: directories mounted
+/// from those resources contain `..data` symlinks that point to a versioned subdir,
+/// and content updates manifest as a swap of the symlink rather than a write to the
+/// target file. Treating modifications of `<config_dir>/..data` as config changes
+/// keeps hot-reload working under K8s.
+fn is_k8s_data_symlink(path: &Path, config_dir: &Path) -> bool {
+    path.file_name().is_some_and(|n| n == "..data") && path.parent() == Some(config_dir)
+}
+
 fn classify_event(
     event: &Event,
     canonical_config_path: &Path,
@@ -36,13 +45,10 @@ fn classify_event(
         return ChangeKind::Irrelevant;
     }
 
-    let is_data_symlink = |p: &PathBuf| {
-        p.file_name().is_some_and(|n| n == "..data") && p.parent() == Some(canonical_config_dir)
-    };
     let affects_config = event
         .paths
         .iter()
-        .any(|p| p == canonical_config_path || is_data_symlink(p));
+        .any(|p| p == canonical_config_path || is_k8s_data_symlink(p, canonical_config_dir));
     if affects_config {
         return ChangeKind::Config;
     }
@@ -733,6 +739,33 @@ bind_address = "10.0.0.1"
             merge_change_kind(ChangeKind::Irrelevant, ChangeKind::Irrelevant),
             ChangeKind::Irrelevant,
         );
+    }
+
+    #[test]
+    fn is_k8s_data_symlink_recognizes_dotdot_data_in_config_dir() {
+        let config_dir = Path::new("/etc/registry");
+        let path = config_dir.join("..data");
+        assert!(is_k8s_data_symlink(&path, config_dir));
+    }
+
+    #[test]
+    fn is_k8s_data_symlink_rejects_other_filenames_in_config_dir() {
+        let config_dir = Path::new("/etc/registry");
+        let path = config_dir.join("config.toml");
+        assert!(!is_k8s_data_symlink(&path, config_dir));
+    }
+
+    #[test]
+    fn is_k8s_data_symlink_rejects_dotdot_data_in_other_directory() {
+        let config_dir = Path::new("/etc/registry");
+        let path = Path::new("/var/lib/other/..data");
+        assert!(!is_k8s_data_symlink(path, config_dir));
+    }
+
+    #[test]
+    fn is_k8s_data_symlink_rejects_path_with_no_filename() {
+        let config_dir = Path::new("/etc/registry");
+        assert!(!is_k8s_data_symlink(Path::new("/"), config_dir));
     }
 
     /// Verifies that a burst of N events coalesces into a single `ChangeKind`
