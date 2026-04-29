@@ -28,12 +28,7 @@ pub fn parse(method: &Method, uri: &Uri) -> Option<Action> {
         "/_ui/config" if method == Method::GET => return Some(Action::UiConfig),
         "/v2" | "/v2/" if method == Method::GET => return Some(Action::ApiVersion),
         "/v2/_catalog" if method == Method::GET => {
-            let (n, last) = if let Some(p) = params.map(parse_query::<PaginationQuery>) {
-                (p.n, p.last)
-            } else {
-                (None, None)
-            };
-
+            let (n, last) = parse_pagination(params);
             return Some(Action::ListCatalog { n, last });
         }
         _ => {}
@@ -79,6 +74,11 @@ struct ArtifactTypeQuery {
 struct PaginationQuery {
     n: Option<u16>,
     last: Option<String>,
+}
+
+fn parse_pagination(params: Option<&str>) -> (Option<u16>, Option<String>) {
+    let query: PaginationQuery = params.map(parse_query).unwrap_or_default();
+    (query.n, query.last)
 }
 
 fn try_parse_extension(method: &Method, path: &str) -> Option<Action> {
@@ -249,12 +249,7 @@ fn try_find_tags(method: &Method, path: &str, params: Option<&str>) -> Option<Ac
         && *method == Method::GET
     {
         let namespace = Namespace::new(namespace_str).ok()?;
-        let (n, last) = if let Some(p) = params.map(parse_query::<PaginationQuery>) {
-            (p.n, p.last)
-        } else {
-            (None, None)
-        };
-
+        let (n, last) = parse_pagination(params);
         return Some(Action::ListTags { namespace, n, last });
     }
 
@@ -803,6 +798,33 @@ mod tests {
         let query: PaginationQuery = parse_query(params);
         assert_eq!(query.n, Some(25));
         assert!(query.last.is_none());
+    }
+
+    #[test]
+    fn test_parse_pagination_none_params() {
+        assert_eq!(parse_pagination(None), (None, None));
+    }
+
+    #[test]
+    fn test_parse_pagination_empty_params() {
+        assert_eq!(parse_pagination(Some("")), (None, None));
+    }
+
+    #[test]
+    fn test_parse_pagination_full_params() {
+        assert_eq!(
+            parse_pagination(Some("n=50&last=foo")),
+            (Some(50), Some("foo".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_parse_pagination_partial_params() {
+        assert_eq!(parse_pagination(Some("n=10")), (Some(10), None));
+        assert_eq!(
+            parse_pagination(Some("last=bar")),
+            (None, Some("bar".to_string()))
+        );
     }
 
     #[test]
