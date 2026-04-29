@@ -1130,7 +1130,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_validate_oidc_token_invalid_jwt_format() {
-
         let mock_server = MockServer::start().await;
 
         let jwks_response = json!({ "keys": [] });
@@ -1200,8 +1199,8 @@ mod tests {
             IHgjvvya3tp4E/ZbyQLAntc=\n\
             -----END PRIVATE KEY-----";
 
-        // JWK n/e components that correspond to TEST_PRIVATE_KEY_PEM.
-        // Derived from the SubjectPublicKeyInfo DER at offsets [33..289] and [291..294].
+    // JWK n/e components that correspond to TEST_PRIVATE_KEY_PEM.
+    // Derived from the SubjectPublicKeyInfo DER at offsets [33..289] and [291..294].
     const TEST_JWK_N: &str = "tWVhJ9QwV_SgjQa2FyfOngXZNhj5aschbiR1Zy2omvmODXbnuxiBI0qy08dBTsEddeZKGyMi1MSTMCdTz-uYVQw2bSX_W1zUwWUdrMAj-qgblDnWmR5w274LOaiNyQpuKjvFaSyORWqVqLobpP2FvodqJOS9GTbDpSfT1pLJfS_5oqDFiprykomDyCET6qVEYT0x0UT9qJt0-CtdVoFYcMSWfQKQgtweS3xPnkFuUIeOAqZUWrTQZ0u7WrqXhgv5kKGe-AdQ67dY85qBcu4oewMjkqDISVc7We4qsypS_8WQw1ZG9-jJbjGaA947v5LYZFxGeYAFFIKuIMQ7c7W56Q";
     const TEST_JWK_E: &str = "AQAB";
     const TEST_KID: &str = "unit-test-key-1";
@@ -1303,7 +1302,6 @@ mod tests {
 
     #[test]
     fn verify_jwt_accepts_valid_token() {
-
         let issuer = "https://issuer.example.com";
         let audience = "my-audience";
         let provider = TestProvider::new(issuer, Some(audience));
@@ -1325,7 +1323,6 @@ mod tests {
 
     #[test]
     fn verify_jwt_rejects_unknown_kid() {
-
         let issuer = "https://issuer.example.com";
         let provider = TestProvider::new(issuer, None);
         let jwks = test_jwks();
@@ -1342,7 +1339,6 @@ mod tests {
 
     #[test]
     fn verify_jwt_rejects_expired_token() {
-
         let issuer = "https://issuer.example.com";
         // clock_skew = 0 so even a 1-second-old exp is rejected
         let provider = TestProvider::new(issuer, None);
@@ -1371,7 +1367,6 @@ mod tests {
 
     #[test]
     fn verify_jwt_rejects_wrong_issuer() {
-
         let provider = TestProvider::new("https://expected-issuer.example.com", None);
         let jwks = test_jwks();
         let claims = valid_claims("https://wrong-issuer.example.com", "any");
@@ -1384,7 +1379,6 @@ mod tests {
 
     #[test]
     fn verify_jwt_rejects_wrong_audience() {
-
         let issuer = "https://issuer.example.com";
         let provider = TestProvider::new(issuer, Some("required-audience"));
         let jwks = test_jwks();
@@ -1398,7 +1392,6 @@ mod tests {
 
     #[test]
     fn verify_jwt_skips_audience_when_provider_has_none() {
-
         let issuer = "https://issuer.example.com";
         // required_audience = None → validate_aud is disabled
         let provider = TestProvider::new(issuer, None);
@@ -1417,7 +1410,6 @@ mod tests {
 
     #[test]
     fn verify_jwt_rejects_invalid_signature() {
-
         let issuer = "https://issuer.example.com";
         let provider = TestProvider::new(issuer, None);
         let jwks = test_jwks(); // contains public key for TEST_PRIVATE_KEY_PEM
@@ -1445,7 +1437,6 @@ mod tests {
 
     #[test]
     fn verify_jwt_rejects_malformed_header() {
-
         let provider = TestProvider::new("https://issuer.example.com", None);
         let jwks = test_jwks();
 
@@ -1462,7 +1453,6 @@ mod tests {
 
     #[test]
     fn verify_jwt_propagates_provider_claim_validation_error() {
-
         let issuer = "https://issuer.example.com";
         let provider =
             TestProvider::new(issuer, None).with_claim_error("custom claim check failed");
