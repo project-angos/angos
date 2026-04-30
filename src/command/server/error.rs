@@ -102,17 +102,7 @@ impl From<registry::Error> for Error {
                 code: "INTERNAL_SERVER_ERROR".to_string(),
                 msg: Some(msg),
             },
-            registry::Error::Configuration(_)
-            | registry::Error::Cache(_)
-            | registry::Error::MetadataStore(_)
-            | registry::Error::TaskQueue(_)
-            | registry::Error::Io(_)
-            | registry::Error::Http(_)
-            | registry::Error::Serde(_)
-            | registry::Error::PolicyExecution(_)
-            | registry::Error::InvalidHeader(_)
-            | registry::Error::InvalidUri(_)
-            | registry::Error::Serialization(_) => Error::Custom {
+            _ => Error::Custom {
                 status_code: StatusCode::INTERNAL_SERVER_ERROR,
                 code: "INTERNAL_SERVER_ERROR".to_string(),
                 msg: Some(error.to_string()),
@@ -455,6 +445,45 @@ mod tests {
             if let Some(msg) = expected_message {
                 assert_eq!(json["errors"][0]["message"], msg);
             }
+        }
+    }
+
+    /// Variants outside the OCI-spec set route through the wildcard arm to a
+    /// generic 500 `INTERNAL_SERVER_ERROR` carrying the rendered Display text.
+    /// Pins this contract so a regression that broke `error.to_string()`
+    /// formatting (or accidentally rerouted typed variants) would fail.
+    #[test]
+    fn test_typed_registry_variants_route_to_internal_server_error() {
+        let cases: Vec<(registry::Error, &str)> = vec![
+            (
+                registry::Error::Io(std::io::Error::other("disk full")),
+                "I/O error during operations",
+            ),
+            (
+                registry::Error::MetadataStore(crate::registry::metadata_store::Error::Lock(
+                    "redis unreachable".to_string(),
+                )),
+                "metadata store error during operations",
+            ),
+        ];
+
+        for (registry_error, expected_display_prefix) in cases {
+            let display = registry_error.to_string();
+            let server_error: Error = registry_error.into();
+            assert_eq!(
+                server_error.status_code(),
+                StatusCode::INTERNAL_SERVER_ERROR
+            );
+            let json = server_error.as_json(None);
+            assert_eq!(json["errors"][0]["code"], "INTERNAL_SERVER_ERROR");
+            let message = json["errors"][0]["message"]
+                .as_str()
+                .expect("message must be a string");
+            assert!(
+                message.starts_with(expected_display_prefix),
+                "expected message to start with {expected_display_prefix:?}, got: {message:?}"
+            );
+            assert_eq!(message, display, "message must equal Display output");
         }
     }
 
