@@ -190,7 +190,7 @@ mod tests {
 
     #[test]
     fn from_oci_error_routes_to_name_invalid() {
-        let err: Error = oci::Error::InvalidFormat("bad namespace".to_string()).into();
+        let err: Error = oci::Error::InvalidDigest("bad digest".to_string()).into();
         assert!(matches!(err, Error::NameInvalid));
     }
 

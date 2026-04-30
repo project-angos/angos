@@ -33,7 +33,7 @@ impl FromStr for Reference {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         if s.is_empty() {
-            return Err(Error::InvalidFormat(
+            return Err(Error::InvalidReference(
                 "Reference cannot be empty".to_string(),
             ));
         }
@@ -43,7 +43,7 @@ impl FromStr for Reference {
         } else if TAG_REGEX.is_match(s) {
             Ok(Reference::Tag(s.to_string()))
         } else {
-            Err(Error::InvalidFormat(format!("Invalid reference: '{s}'")))
+            Err(Error::InvalidReference(format!("Invalid reference: '{s}'")))
         }
     }
 }

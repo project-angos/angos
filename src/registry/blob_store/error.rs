@@ -247,7 +247,7 @@ mod tests {
 
     #[test]
     fn test_from_oci_error() {
-        let oci_error = oci::Error::InvalidFormat("bad".to_string());
+        let oci_error = oci::Error::InvalidDigest("bad".to_string());
         assert!(matches!(Error::from(oci_error), Error::InvalidFormat(_)));
     }
 
