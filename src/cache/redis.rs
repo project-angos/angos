@@ -73,13 +73,26 @@ impl Cache for Backend {
     }
 }
 
+/// Tests in this module are integration tests that require a Redis instance
+/// running at `redis://localhost:6379`. Start one with `docker-compose up -d redis`
+/// before running `cargo test`. They exercise the real network path and are
+/// therefore slower than unit tests.
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
 
     use tokio::time;
+    use uuid::Uuid;
 
     use super::*;
+
+    fn make_backend(db: u8) -> Backend {
+        let config = BackendConfig {
+            url: format!("redis://localhost:6379/{db}"),
+            key_prefix: String::new(),
+        };
+        Backend::new(&config).unwrap()
+    }
 
     #[tokio::test]
     async fn test_store_and_retrieve() {
@@ -97,5 +110,47 @@ mod tests {
 
         time::sleep(Duration::from_millis(1050)).await;
         assert_eq!(cache.retrieve_value("key").await, Ok(None));
+    }
+
+    /// Retrieve a key that was never stored must return `None`, not an error.
+    #[tokio::test]
+    async fn test_missing_key_returns_none() {
+        let cache = make_backend(1);
+        let key = format!("test_missing_{}", Uuid::new_v4());
+
+        let result = cache.retrieve_value(&key).await;
+        assert_eq!(result, Ok(None));
+    }
+
+    /// A multi-kilobyte value must survive a store/retrieve round-trip intact.
+    #[tokio::test]
+    async fn test_large_value_round_trip() {
+        let cache = make_backend(1);
+        let key = format!("test_large_{}", Uuid::new_v4());
+        // 64 KiB of printable ASCII
+        let large_value: String = "x".repeat(65_536);
+
+        cache.store_value(&key, &large_value, 10).await.unwrap();
+        let retrieved = cache.retrieve_value(&key).await.unwrap();
+        // Best-effort cleanup before asserting so the key is removed even on failure.
+        let _ = cache.delete_value(&key).await;
+
+        assert_eq!(retrieved, Some(large_value));
+    }
+
+    /// `delete_value` must remove an existing key so subsequent retrieval returns `None`.
+    #[tokio::test]
+    async fn test_delete_removes_key() {
+        let cache = make_backend(1);
+        let key = format!("test_delete_{}", Uuid::new_v4());
+
+        cache.store_value(&key, "to_be_deleted", 60).await.unwrap();
+        assert_eq!(
+            cache.retrieve_value(&key).await,
+            Ok(Some("to_be_deleted".to_string()))
+        );
+
+        cache.delete_value(&key).await.unwrap();
+        assert_eq!(cache.retrieve_value(&key).await, Ok(None));
     }
 }

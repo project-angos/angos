@@ -2,6 +2,7 @@ use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use chrono::Utc;
 use prometheus::proto::MetricType;
+use reqwest::Client;
 use url::Url;
 use uuid::Uuid;
 use wiremock::{
@@ -9,7 +10,7 @@ use wiremock::{
     matchers::{body_json, header, method},
 };
 
-use super::{EventDispatcher, matches_event, signature::compute_signature};
+use super::{EventDispatcher, endpoint::WebhookEndpoint, signature::compute_signature};
 use crate::{
     configuration::RegexPattern,
     event_webhook::{
@@ -64,125 +65,83 @@ fn create_test_config(
     }
 }
 
+fn build_endpoint(config: EventWebhookConfig) -> WebhookEndpoint {
+    WebhookEndpoint {
+        client: Client::new(),
+        config: Arc::new(config),
+    }
+}
+
 #[test]
 fn matches_event_no_filter_matches_all_repositories() {
-    let config = create_test_config(vec![EventKind::ManifestPush], None);
-    assert!(matches_event(
-        &config,
-        &EventKind::ManifestPush,
-        "myapp/backend"
-    ));
-    assert!(matches_event(
-        &config,
-        &EventKind::ManifestPush,
-        "other/thing"
-    ));
-    assert!(matches_event(&config, &EventKind::ManifestPush, "anything"));
+    let endpoint = build_endpoint(create_test_config(vec![EventKind::ManifestPush], None));
+    assert!(endpoint.matches_event(&EventKind::ManifestPush, "myapp/backend"));
+    assert!(endpoint.matches_event(&EventKind::ManifestPush, "other/thing"));
+    assert!(endpoint.matches_event(&EventKind::ManifestPush, "anything"));
 }
 
 #[test]
 fn matches_event_with_filter_matches_matching_repository() {
-    let config = create_test_config(
+    let endpoint = build_endpoint(create_test_config(
         vec![EventKind::ManifestPush],
         Some(vec![RegexPattern::compile("^myapp/.*").unwrap()]),
-    );
-    assert!(matches_event(
-        &config,
-        &EventKind::ManifestPush,
-        "myapp/backend"
     ));
+    assert!(endpoint.matches_event(&EventKind::ManifestPush, "myapp/backend"));
 }
 
 #[test]
 fn matches_event_with_filter_rejects_non_matching_repository() {
-    let config = create_test_config(
+    let endpoint = build_endpoint(create_test_config(
         vec![EventKind::ManifestPush],
         Some(vec![RegexPattern::compile("^myapp/.*").unwrap()]),
-    );
-    assert!(!matches_event(
-        &config,
-        &EventKind::ManifestPush,
-        "other/thing"
     ));
+    assert!(!endpoint.matches_event(&EventKind::ManifestPush, "other/thing"));
 }
 
 #[test]
 fn matches_event_multiple_filters_matches_if_any_pattern_matches() {
-    let config = create_test_config(
+    let endpoint = build_endpoint(create_test_config(
         vec![EventKind::ManifestPush],
         Some(vec![
             RegexPattern::compile("^myapp/.*").unwrap(),
             RegexPattern::compile("^library/.*").unwrap(),
         ]),
-    );
-    assert!(matches_event(
-        &config,
-        &EventKind::ManifestPush,
-        "myapp/backend"
     ));
-    assert!(matches_event(
-        &config,
-        &EventKind::ManifestPush,
-        "library/nginx"
-    ));
-    assert!(!matches_event(
-        &config,
-        &EventKind::ManifestPush,
-        "other/repo"
-    ));
+    assert!(endpoint.matches_event(&EventKind::ManifestPush, "myapp/backend"));
+    assert!(endpoint.matches_event(&EventKind::ManifestPush, "library/nginx"));
+    assert!(!endpoint.matches_event(&EventKind::ManifestPush, "other/repo"));
 }
 
 #[test]
 fn matches_event_filters_by_event_kind() {
-    let config = create_test_config(vec![EventKind::ManifestPush], None);
-    assert!(matches_event(
-        &config,
-        &EventKind::ManifestPush,
-        "myapp/backend"
-    ));
-    assert!(!matches_event(
-        &config,
-        &EventKind::BlobPush,
-        "myapp/backend"
-    ));
-    assert!(!matches_event(
-        &config,
-        &EventKind::TagCreate,
-        "myapp/backend"
-    ));
+    let endpoint = build_endpoint(create_test_config(vec![EventKind::ManifestPush], None));
+    assert!(endpoint.matches_event(&EventKind::ManifestPush, "myapp/backend"));
+    assert!(!endpoint.matches_event(&EventKind::BlobPush, "myapp/backend"));
+    assert!(!endpoint.matches_event(&EventKind::TagCreate, "myapp/backend"));
 }
 
 #[test]
 fn matches_event_multiple_event_kinds() {
-    let config = create_test_config(vec![EventKind::ManifestPush, EventKind::TagCreate], None);
-    assert!(matches_event(&config, &EventKind::ManifestPush, "repo"));
-    assert!(matches_event(&config, &EventKind::TagCreate, "repo"));
-    assert!(!matches_event(&config, &EventKind::ManifestDelete, "repo"));
-    assert!(!matches_event(&config, &EventKind::BlobPush, "repo"));
+    let endpoint = build_endpoint(create_test_config(
+        vec![EventKind::ManifestPush, EventKind::TagCreate],
+        None,
+    ));
+    assert!(endpoint.matches_event(&EventKind::ManifestPush, "repo"));
+    assert!(endpoint.matches_event(&EventKind::TagCreate, "repo"));
+    assert!(!endpoint.matches_event(&EventKind::ManifestDelete, "repo"));
+    assert!(!endpoint.matches_event(&EventKind::BlobPush, "repo"));
 }
 
 #[test]
 fn matches_event_both_event_kind_and_repository_must_match() {
-    let config = create_test_config(
+    let endpoint = build_endpoint(create_test_config(
         vec![EventKind::ManifestPush],
         Some(vec![RegexPattern::compile("^myapp/.*").unwrap()]),
-    );
-    assert!(matches_event(
-        &config,
-        &EventKind::ManifestPush,
-        "myapp/backend"
     ));
-    assert!(!matches_event(
-        &config,
-        &EventKind::BlobPush,
-        "myapp/backend"
-    ));
-    assert!(!matches_event(
-        &config,
-        &EventKind::ManifestPush,
-        "other/repo"
-    ));
-    assert!(!matches_event(&config, &EventKind::BlobPush, "other/repo"));
+    assert!(endpoint.matches_event(&EventKind::ManifestPush, "myapp/backend"));
+    assert!(!endpoint.matches_event(&EventKind::BlobPush, "myapp/backend"));
+    assert!(!endpoint.matches_event(&EventKind::ManifestPush, "other/repo"));
+    assert!(!endpoint.matches_event(&EventKind::BlobPush, "other/repo"));
 }
 
 fn create_webhook_config_for_url(

@@ -20,8 +20,6 @@ mod transport;
 mod tests;
 
 use endpoint::WebhookEndpoint;
-#[cfg(test)]
-pub use endpoint::matches_event;
 use transport::send_with_retries;
 
 use crate::{
