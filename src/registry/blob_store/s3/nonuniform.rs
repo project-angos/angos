@@ -7,7 +7,7 @@ use tokio::{
     sync::mpsc,
 };
 use tokio_util::task::AbortOnDropHandle;
-use tracing::instrument;
+use tracing::{error, instrument, warn};
 
 use super::{
     Backend, FRAME_SIZE, MIN_PART_SIZE, S3UploadState, UploadedPart, channel_body::ChannelBody,
@@ -130,9 +130,41 @@ impl Backend {
             }
         }
         drop(tx);
-        upload_handle
-            .await
-            .map_err(|e| Error::StorageBackend(e.to_string()))??;
+        // Routine S3/upload errors are propagated without aborting the multipart session so
+        // the client can retry via a subsequent PATCH using the same upload UUID.  Panic or
+        // cancellation of the spawned task puts the session in an unknown state, so we abort
+        // the multipart upload and evict cached state to prevent poisoning future retries.
+        match upload_handle.await {
+            Ok(Ok(_etag)) => {}
+            Ok(Err(e)) => return Err(e.into()),
+            Err(join_error) => {
+                let kind = if join_error.is_panic() {
+                    "panicked"
+                } else if join_error.is_cancelled() {
+                    "was cancelled"
+                } else {
+                    "failed unexpectedly"
+                };
+                error!(
+                    "nonuniform upload task {kind} for '{name}/{uuid}'; aborting multipart upload {upload_id}: {join_error}",
+                    upload_id = ctx.upload_id,
+                );
+                if let Err(abort_err) = self
+                    .store
+                    .abort_multipart_upload(ctx.upload_path, ctx.upload_id)
+                    .await
+                {
+                    warn!(
+                        "abort_multipart_upload failed during cleanup of '{name}/{uuid}': {abort_err}"
+                    );
+                }
+                self.evict_upload_id(ctx.upload_path).await;
+                self.evict_upload_state(name, uuid).await;
+                return Err(Error::StorageBackend(format!(
+                    "upload task {kind}: {join_error}"
+                )));
+            }
+        }
 
         if ctx.pending_size > 0 {
             self.store.delete_object(ctx.pending_path).await?;
