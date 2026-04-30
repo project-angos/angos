@@ -271,6 +271,8 @@ fn lookup_webhook(
 
 #[cfg(test)]
 mod tests {
+    use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};
+
     use super::*;
     use crate::{cache, configuration::Configuration};
 
@@ -905,6 +907,330 @@ mod tests {
         assert!(
             result.is_err(),
             "StartUpload should be blocked on pull-through cache repositories"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // Story 7.3.4 — global-deny, webhook path, invalid-regex fallback
+    // -------------------------------------------------------------------
+
+    // Criterion 1: global deny policy rejects every request regardless of action.
+    //
+    // The `[global.access_policy]` block with `default = "deny"` and no allow-rules
+    // causes `AccessPolicy::evaluate` to return `Ok(false)` for all identities.
+    // `authorize_request` must short-circuit before consulting any webhook or
+    // repository.
+    #[tokio::test]
+    async fn global_deny_policy_rejects_all_requests() {
+        use crate::command::server::Error as ServerError;
+
+        let toml = r#"
+            [blob_store.fs]
+            root_dir = "/tmp/test"
+
+            [metadata_store.fs]
+            root_dir = "/tmp/test"
+
+            [cache.memory]
+
+            [server]
+            bind_address = "0.0.0.0"
+            port = 8000
+
+            [global]
+            update_pull_time = false
+            max_concurrent_cache_jobs = 10
+
+            [global.access_policy]
+            default = "deny"
+        "#;
+
+        let config = Configuration::load_from_str(toml).unwrap();
+        let cache = cache::Config::Memory.to_backend().unwrap();
+        let authorizer = Authorizer::new(&config, &cache).unwrap();
+        let registry = create_pull_through_registry(&config).await;
+
+        let identity = ClientIdentity::new(None);
+        let (parts, ()) = hyper::Request::builder()
+            .uri("/v2/")
+            .body(())
+            .unwrap()
+            .into_parts();
+
+        let result = authorizer
+            .authorize_request(&Action::ApiVersion, &identity, &parts, &registry)
+            .await;
+
+        assert!(
+            matches!(result, Err(ServerError::Unauthorized(_))),
+            "global deny policy must reject ApiVersion, got: {result:?}"
+        );
+    }
+
+    // Criterion 2 (allow): global allow policy + global webhook returning 200 → request allowed.
+    //
+    // `Action::ApiVersion` carries no namespace, so `authorize_request` takes the
+    // non-namespace branch and calls the global webhook directly.  A 200 response
+    // means the webhook grants access.
+    #[tokio::test]
+    async fn global_webhook_path_allow_when_webhook_returns_200() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&mock_server)
+            .await;
+
+        let toml = format!(
+            r#"
+            [blob_store.fs]
+            root_dir = "/tmp/test"
+
+            [metadata_store.fs]
+            root_dir = "/tmp/test"
+
+            [cache.memory]
+
+            [server]
+            bind_address = "0.0.0.0"
+            port = 8000
+
+            [global]
+            update_pull_time = false
+            max_concurrent_cache_jobs = 10
+            authorization_webhook = "gatekeeper"
+
+            [global.access_policy]
+            default = "allow"
+
+            [auth.webhook.gatekeeper]
+            url = "{url}"
+            timeout_ms = 1000
+            "#,
+            url = mock_server.uri()
+        );
+
+        let config = Configuration::load_from_str(&toml).unwrap();
+        let cache = cache::Config::Memory.to_backend().unwrap();
+        let authorizer = Authorizer::new(&config, &cache).unwrap();
+        let registry = create_pull_through_registry(&config).await;
+
+        let identity = ClientIdentity::new(None);
+        let (parts, ()) = hyper::Request::builder()
+            .uri("/v2/")
+            .body(())
+            .unwrap()
+            .into_parts();
+
+        let result = authorizer
+            .authorize_request(&Action::ApiVersion, &identity, &parts, &registry)
+            .await;
+
+        assert!(
+            result.is_ok(),
+            "global webhook returning 200 must allow the request, got: {result:?}"
+        );
+    }
+
+    // Criterion 2 (deny): global allow policy + global webhook returning 403 → request denied.
+    #[tokio::test]
+    async fn global_webhook_path_deny_when_webhook_returns_403() {
+        use crate::command::server::Error as ServerError;
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(403))
+            .mount(&mock_server)
+            .await;
+
+        let toml = format!(
+            r#"
+            [blob_store.fs]
+            root_dir = "/tmp/test"
+
+            [metadata_store.fs]
+            root_dir = "/tmp/test"
+
+            [cache.memory]
+
+            [server]
+            bind_address = "0.0.0.0"
+            port = 8000
+
+            [global]
+            update_pull_time = false
+            max_concurrent_cache_jobs = 10
+            authorization_webhook = "gatekeeper"
+
+            [global.access_policy]
+            default = "allow"
+
+            [auth.webhook.gatekeeper]
+            url = "{url}"
+            timeout_ms = 1000
+            "#,
+            url = mock_server.uri()
+        );
+
+        let config = Configuration::load_from_str(&toml).unwrap();
+        let cache = cache::Config::Memory.to_backend().unwrap();
+        let authorizer = Authorizer::new(&config, &cache).unwrap();
+        let registry = create_pull_through_registry(&config).await;
+
+        let identity = ClientIdentity::new(None);
+        let (parts, ()) = hyper::Request::builder()
+            .uri("/v2/")
+            .body(())
+            .unwrap()
+            .into_parts();
+
+        let result = authorizer
+            .authorize_request(&Action::ApiVersion, &identity, &parts, &registry)
+            .await;
+
+        assert!(
+            matches!(result, Err(ServerError::Unauthorized(_))),
+            "global webhook returning 403 must deny the request, got: {result:?}"
+        );
+    }
+
+    // Criterion 3: invalid-regex unreachability.
+    //
+    // Story 6.14 introduced `RegexPattern`, which compiles the regex at TOML
+    // deserialise time.  An invalid pattern causes `Configuration::load_from_str`
+    // to return `Err` before any `Authorizer` is constructed, so it can never
+    // reach `is_tag_mutable`.  This test documents the `RegexPattern::compile` API
+    // directly so the compile-time rejection invariant is grep-able from here.
+    #[test]
+    fn regex_pattern_compile_rejects_invalid_pattern() {
+        let err = RegexPattern::compile("[invalid");
+        assert!(
+            err.is_err(),
+            "an invalid regex must be rejected by RegexPattern::compile; \
+             it can therefore never reach is_tag_mutable"
+        );
+    }
+
+    // Criterion 4: a namespace that maps to no configured repository is passed
+    // through without error or panic under an allow policy.
+    //
+    // `authorize_namespace_request` returns `Ok(())` early when
+    // `get_repository_for_namespace` returns `Err`, so the default policy is
+    // applied implicitly (allow here).
+    #[tokio::test]
+    async fn authorize_request_unknown_namespace_is_allowed_under_allow_policy() {
+        use crate::oci::Namespace;
+
+        let toml = r#"
+            [blob_store.fs]
+            root_dir = "/tmp/test"
+
+            [metadata_store.fs]
+            root_dir = "/tmp/test"
+
+            [cache.memory]
+
+            [server]
+            bind_address = "0.0.0.0"
+            port = 8000
+
+            [global]
+            update_pull_time = false
+            max_concurrent_cache_jobs = 10
+
+            [global.access_policy]
+            default = "allow"
+        "#;
+
+        let config = Configuration::load_from_str(toml).unwrap();
+        let cache = cache::Config::Memory.to_backend().unwrap();
+        let authorizer = Authorizer::new(&config, &cache).unwrap();
+        let registry = create_pull_through_registry(&config).await;
+
+        let identity = ClientIdentity::new(None);
+        let (parts, ()) = hyper::Request::builder()
+            .uri("/v2/")
+            .body(())
+            .unwrap()
+            .into_parts();
+
+        let action = Action::GetManifest {
+            namespace: Namespace::new("no-such-repo/image").unwrap(),
+            reference: Reference::Tag("latest".to_string()),
+        };
+
+        let result = authorizer
+            .authorize_request(&action, &identity, &parts, &registry)
+            .await;
+
+        assert!(
+            result.is_ok(),
+            "a namespace that matches no repository must not panic or deny under an allow policy, got: {result:?}"
+        );
+    }
+
+    // Criterion 5: webhook unreachable → fail-closed.
+    //
+    // When the webhook endpoint is unreachable, `WebhookAuthorizer::authorize`
+    // returns `Err(Error::Unauthorized(...))`.  `authorize_namespace_request`
+    // propagates that error so the authorizer returns `Err`, not `Ok(false)`.
+    // This distinguishes a transport failure from an explicit deny on dashboards.
+    #[tokio::test]
+    async fn webhook_unreachable_fails_closed() {
+        use crate::oci::Namespace;
+
+        let toml = r#"
+            [blob_store.fs]
+            root_dir = "/tmp/test"
+
+            [metadata_store.fs]
+            root_dir = "/tmp/test"
+
+            [cache.memory]
+
+            [server]
+            bind_address = "0.0.0.0"
+            port = 8000
+
+            [global]
+            update_pull_time = false
+            max_concurrent_cache_jobs = 10
+
+            [global.access_policy]
+            default = "allow"
+
+            [repository.myrepo]
+            namespace_pattern = "^myrepo/.*"
+            authorization_webhook = "gatekeeper"
+
+            [auth.webhook.gatekeeper]
+            url = "http://127.0.0.1:1"
+            timeout_ms = 500
+        "#;
+
+        let config = Configuration::load_from_str(toml).unwrap();
+        let cache = cache::Config::Memory.to_backend().unwrap();
+        let authorizer = Authorizer::new(&config, &cache).unwrap();
+        let registry = create_pull_through_registry(&config).await;
+
+        let identity = ClientIdentity::new(None);
+        let (parts, ()) = hyper::Request::builder()
+            .uri("/v2/")
+            .body(())
+            .unwrap()
+            .into_parts();
+
+        let action = Action::GetManifest {
+            namespace: Namespace::new("myrepo/app").unwrap(),
+            reference: Reference::Tag("latest".to_string()),
+        };
+
+        let result = authorizer
+            .authorize_request(&action, &identity, &parts, &registry)
+            .await;
+
+        assert!(
+            result.is_err(),
+            "an unreachable webhook must produce Err (fail-closed), not Ok; got: {result:?}"
         );
     }
 }

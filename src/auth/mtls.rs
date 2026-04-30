@@ -83,70 +83,28 @@ impl AuthMiddleware for MtlsValidator {
 
 #[cfg(test)]
 mod tests {
+    use base64::{Engine, engine::general_purpose::STANDARD};
     use hyper::Request;
 
     use super::*;
 
-    fn generate_test_certificate() -> Vec<u8> {
-        use std::process::Command;
+    // Pre-generated RSA-2048 self-signed certificate, base64-encoded DER. Valid 100 years.
+    // Subject: CN=test-user, O=TestOrg, O=SecondOrg. Regenerate with:
+    //   openssl req -x509 -newkey rsa:2048 -nodes -keyout /dev/null -days 36500 \
+    //       -subj "/CN=test-user/O=TestOrg/O=SecondOrg" -outform DER | base64
+    const TEST_CERT_DER_B64: &str = "MIIDVzCCAj+gAwIBAgIUHmULkmU2Hbcp1bbIQiXTZ6pv+CYwDQYJKoZIhvcNAQELBQAwOjESMBAGA1UEAwwJdGVzdC11c2VyMRAwDgYDVQQKDAdUZXN0T3JnMRIwEAYDVQQKDAlTZWNvbmRPcmcwIBcNMjYwNDMwMTkyMjQ5WhgPMjEyNjA0MDYxOTIyNDlaMDoxEjAQBgNVBAMMCXRlc3QtdXNlcjEQMA4GA1UECgwHVGVzdE9yZzESMBAGA1UECgwJU2Vjb25kT3JnMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAxxRce9HTV6iOzLVFbvO7i49pJNG4N/wE9wVuON6Y5Rg6mofcObQlYq1wO+u/46Al9JWYAaFDARP/NEXsKIxc2ehnpH4SJQc5Vf9bQS+mOnuSEKKzmjUU1vz0jyF+Rxur514CSpZvU6rvTlx+cn9BWUH33qgk6aYt/gUDgHNJlRFXovYw4C2xMNhr9uG4tlE9mYUsiWyVYV0116JyEp8gjBEl7p6dwljb1YGQZQtrRbxgLkFSKllRv1xLVnEP9yaihTn03jznF34VJpmvPPcvdIRT/MnRqDXkA13VhVshAhcgwD+jS+C1SGGkzDmi+8r1EHmPj96fbB1mwjqfJPnfAwIDAQABo1MwUTAdBgNVHQ4EFgQUB2RMQ0tmakSMOjYxJUnAqy87EjIwHwYDVR0jBBgwFoAUB2RMQ0tmakSMOjYxJUnAqy87EjIwDwYDVR0TAQH/BAUwAwEB/zANBgkqhkiG9w0BAQsFAAOCAQEAVzO6ne+HaF7Cx8TEyXo6ZRte7+MR/Ajp+7FJqOtWUESMQwSaYq7u/XqR2ZxCs7MjFrQXmJ9EZbqgWJi1rGjHe1ych+6cA4aZGPl91MqFOs8GH2QZV+yUh68fDiFFJ4FUZ2vHCc7na3QUUyMAavApzKJ8Nc5yYAYa1o3wbGlHKYGjktWjllYM3O4Ekq4UFwH3/Iye6+UaZQa/0p2Bs2OAFQEPBqie8B+cXQ3y+WUoFHaMozrUGgd31Fpf2jV0Mp46vDashe/wQXKGL8Yipi54vicvIpZX4hEUb/umDSLvwhX9Aeqb4nKHPLTm1mW23sJHCBhg26RlH+sDNf/dURxlkA==";
 
-        let output = Command::new("openssl")
-            .args([
-                "req",
-                "-x509",
-                "-newkey",
-                "rsa:2048",
-                "-nodes",
-                "-keyout",
-                "/dev/null",
-                "-out",
-                "/dev/stdout",
-                "-days",
-                "1",
-                "-subj",
-                "/CN=test-user/O=TestOrg/O=SecondOrg",
-                "-outform",
-                "DER",
-            ])
-            .output()
-            .expect("Failed to generate test certificate");
+    // Same recipe but with `-subj "/"` for an empty-subject certificate.
+    const TEST_MINIMAL_CERT_DER_B64: &str = "MIIC4zCCAcugAwIBAgIUVrZ4zPRzLjG5S1tXP/3QFEncOVEwDQYJKoZIhvcNAQELBQAwADAgFw0yNjA0MzAxOTIyNTNaGA8yMTI2MDQwNjE5MjI1M1owADCCASIwDQYJKoZIhvcNAQEBBQADggEPADCCAQoCggEBAMy4pZXVXfaXsnTAA093TCoW+FS85mwKSaql97+BqzQhgq0EYSXMnNwLFIaYacuDtTCeTUZlMwNsfdCY7J5dTaTJEIgeaa1vXllXAy+iLaIh3ZPIQLn3HnW51HHGw1BlHxlEwyYfHSocxtXH8GQdgEt4HjBWpJPGl/VC4PP6nD1f4xVRVTtVpUpc01+3D8eQw2WJ4nP8s6wOgdG5Q4RAllLGo/Pmcg3BJmlz0mf+GpGGb+zYYSar9oWVKL9Ddsj8cQLvzswTmSAW7NF5PwfhPg6J6x2QLqhXolDHWd10g4uAWpYDzEbFyNOpxZ3S7hLJYqY+VgJZa1815rkD5ouEaDsCAwEAAaNTMFEwHQYDVR0OBBYEFKXr4W+le2mTkghIGKW81H71hobKMB8GA1UdIwQYMBaAFKXr4W+le2mTkghIGKW81H71hobKMA8GA1UdEwEB/wQFMAMBAf8wDQYJKoZIhvcNAQELBQADggEBAEmaD9queRFSzopsVie+d6cQGUqcnxG3aZHqda0ebMQfZjDJ2KpffhWqf6Nw9qdi6zNuwknGrgAuUUz/sgmF/13OaQnAXredzmymZKrbN/qSz/x05rHm63tcHV0jIVseKS6cmEdY7jMjpaTBxDMRf3621sa/4QJkeOHsv5mf92lZjPDCz5CVwFNFQ4vF9BvYesNvmqxIij1l6TCX8mJjZ9pF45j/4l+kmxo25cr+vSslIQcXkOZbAkGEzBzAMzDb1CWOngFltV4T0DpKsXLqnNIx18kbtDcBYJi9aX8iHElHNPEF6qc2qFOuerbhI0r3NvN2uG7ElkfZzWGgS8EV1Pg=";
 
-        assert!(
-            output.status.success(),
-            "OpenSSL failed to generate certificate"
-        );
-        output.stdout
+    fn test_cert_der() -> Vec<u8> {
+        STANDARD.decode(TEST_CERT_DER_B64).expect("valid base64")
     }
 
-    fn generate_minimal_certificate() -> Vec<u8> {
-        use std::process::Command;
-
-        let output = Command::new("openssl")
-            .args([
-                "req",
-                "-x509",
-                "-newkey",
-                "rsa:2048",
-                "-nodes",
-                "-keyout",
-                "/dev/null",
-                "-out",
-                "/dev/stdout",
-                "-days",
-                "1",
-                "-subj",
-                "/",
-                "-outform",
-                "DER",
-            ])
-            .output()
-            .expect("Failed to generate minimal certificate");
-
-        assert!(
-            output.status.success(),
-            "OpenSSL failed to generate certificate"
-        );
-        output.stdout
+    fn test_minimal_cert_der() -> Vec<u8> {
+        STANDARD
+            .decode(TEST_MINIMAL_CERT_DER_B64)
+            .expect("valid base64")
     }
 
     #[tokio::test]
@@ -167,8 +125,7 @@ mod tests {
     #[tokio::test]
     async fn test_authenticate_with_valid_certificate() {
         let validator = MtlsValidator::new();
-        let cert_der = generate_test_certificate();
-        let peer_cert = PeerCertificate(Arc::new(cert_der));
+        let peer_cert = PeerCertificate(Arc::new(test_cert_der()));
 
         let mut request = Request::builder().body(()).unwrap();
         request.extensions_mut().insert(peer_cert);
@@ -190,8 +147,7 @@ mod tests {
     #[tokio::test]
     async fn test_authenticate_with_minimal_certificate() {
         let validator = MtlsValidator::new();
-        let cert_der = generate_minimal_certificate();
-        let peer_cert = PeerCertificate(Arc::new(cert_der));
+        let peer_cert = PeerCertificate(Arc::new(test_minimal_cert_der()));
 
         let mut request = Request::builder().body(()).unwrap();
         request.extensions_mut().insert(peer_cert);
@@ -227,8 +183,8 @@ mod tests {
 
     #[test]
     fn test_extract_certificate_identity() {
-        let cert_der = generate_test_certificate();
-        let (_, cert) = X509Certificate::from_der(&cert_der).unwrap();
+        let der = test_cert_der();
+        let (_, cert) = X509Certificate::from_der(&der).unwrap();
 
         let result = MtlsValidator::extract_certificate_identity(&cert);
 
@@ -240,8 +196,8 @@ mod tests {
 
     #[test]
     fn test_extract_certificate_identity_minimal() {
-        let cert_der = generate_minimal_certificate();
-        let (_, cert) = X509Certificate::from_der(&cert_der).unwrap();
+        let der = test_minimal_cert_der();
+        let (_, cert) = X509Certificate::from_der(&der).unwrap();
 
         let result = MtlsValidator::extract_certificate_identity(&cert);
 

@@ -718,4 +718,208 @@ mod tests {
         assert!(!result.unwrap());
         assert!(identity.oidc.is_none());
     }
+
+    // ---------------------------------------------------------------------------
+    // Helpers shared by method-tracking integration tests below.
+    // ---------------------------------------------------------------------------
+
+    fn generate_test_certificate_der() -> Vec<u8> {
+        use std::process::Command;
+
+        let output = Command::new("openssl")
+            .args([
+                "req",
+                "-x509",
+                "-newkey",
+                "rsa:2048",
+                "-nodes",
+                "-keyout",
+                "/dev/null",
+                "-out",
+                "/dev/stdout",
+                "-days",
+                "1",
+                "-subj",
+                "/CN=test-user/O=TestOrg",
+                "-outform",
+                "DER",
+            ])
+            .output()
+            .expect("openssl must be available");
+
+        assert!(output.status.success(), "openssl failed to generate cert");
+        output.stdout
+    }
+
+    fn make_authenticator_with_cert_and_mocks(
+        validators: Vec<(&'static str, MockOutcome)>,
+    ) -> (Authenticator, crate::auth::PeerCertificate) {
+        let cert_der = generate_test_certificate_der();
+        let peer_cert = crate::auth::PeerCertificate(Arc::new(cert_der));
+        let authenticator = make_authenticator_with_mocks(validators);
+        (authenticator, peer_cert)
+    }
+
+    // ---------------------------------------------------------------------------
+    // Method-tracking integration tests (criteria 1–3, 5 from Story 7.3.3).
+    // ---------------------------------------------------------------------------
+
+    /// Criterion 2: mTLS succeeds + all OIDC providers return `NoCredentials`.
+    /// The identity must carry certificate info and no OIDC claims.
+    /// `select_auth_method(true, false, false)` → "mtls"; certificate not downgraded.
+    #[tokio::test]
+    async fn method_tracking_mtls_success_oidc_no_credentials_preserves_cert() {
+        metrics_provider::init_for_tests();
+        let (authenticator, peer_cert) = make_authenticator_with_cert_and_mocks(vec![
+            ("alpha", MockOutcome::NoCredentials),
+            ("beta", MockOutcome::NoCredentials),
+        ]);
+
+        let mut request = Request::builder().body(()).unwrap();
+        request.extensions_mut().insert(peer_cert);
+        let (parts, ()) = request.into_parts();
+
+        let identity = authenticator
+            .authenticate_request(&parts, None)
+            .await
+            .unwrap();
+
+        // mTLS succeeded: cert info present.
+        assert!(
+            !identity.certificate.common_names.is_empty()
+                || !identity.certificate.organizations.is_empty(),
+            "certificate info must be populated when mTLS succeeds"
+        );
+        // OIDC must not have been set (NoCredentials from all providers).
+        assert!(
+            identity.oidc.is_none(),
+            "oidc claims must not be set when no OIDC provider had credentials"
+        );
+    }
+
+    /// Criterion 3: mTLS has no certificate (`NoCredentials`) + one OIDC provider succeeds.
+    /// The identity must carry OIDC claims and no certificate info.
+    /// `select_auth_method(false, true, false)` → "oidc".
+    #[tokio::test]
+    async fn method_tracking_no_mtls_oidc_success_sets_oidc_identity() {
+        metrics_provider::init_for_tests();
+        let authenticator =
+            make_authenticator_with_mocks(vec![("provider", MockOutcome::Authenticated)]);
+
+        let request = Request::builder().body(()).unwrap();
+        let (parts, ()) = request.into_parts();
+
+        let identity = authenticator
+            .authenticate_request(&parts, None)
+            .await
+            .unwrap();
+
+        // OIDC succeeded: claims present.
+        assert!(
+            identity.oidc.is_some(),
+            "oidc claims must be set when an OIDC provider succeeds"
+        );
+        // mTLS must not have populated certificate info (no cert in request).
+        assert!(
+            identity.certificate.common_names.is_empty()
+                && identity.certificate.organizations.is_empty(),
+            "certificate info must be empty when no mTLS cert was presented"
+        );
+    }
+
+    /// Criterion 1: mTLS succeeds + OIDC provider A fails, provider B also fails.
+    /// The chain propagates the first OIDC error via `?`, so `authenticate_request`
+    /// returns `Err`.  The test verifies the error is the one from the
+    /// alphabetically-first provider ("alpha") — the method-label computation
+    /// (`select_auth_method`) is never reached in this path, which is correct
+    /// behaviour: an explicit OIDC credential rejection overrides mTLS success.
+    #[tokio::test]
+    async fn method_tracking_mtls_success_oidc_all_fail_returns_oidc_error() {
+        metrics_provider::init_for_tests();
+        let (authenticator, peer_cert) = make_authenticator_with_cert_and_mocks(vec![
+            ("alpha", MockOutcome::Fail("alpha rejected".to_string())),
+            ("beta", MockOutcome::Fail("beta rejected".to_string())),
+        ]);
+
+        let mut request = Request::builder().body(()).unwrap();
+        request.extensions_mut().insert(peer_cert);
+        let (parts, ()) = request.into_parts();
+
+        let result = authenticator.authenticate_request(&parts, None).await;
+
+        let err = result.unwrap_err();
+        assert!(
+            matches!(&err, Error::Unauthorized(msg) if msg == "alpha rejected"),
+            "expected alpha's error to propagate, got: {err:?}"
+        );
+    }
+
+    /// Criterion 5: when OIDC succeeds, basic auth is skipped entirely.
+    /// Even if valid basic-auth credentials are present in the request, the
+    /// OIDC success short-circuits the basic-auth path (`if oidc_ok { false }`).
+    /// The identity carries OIDC claims; username is None (basic never ran).
+    #[tokio::test]
+    async fn method_tracking_oidc_success_skips_basic_auth() {
+        use argon2::{
+            Algorithm, Argon2, Params, PasswordHasher, Version,
+            password_hash::{SaltString, rand_core::OsRng},
+        };
+
+        metrics_provider::init_for_tests();
+
+        // Generate a valid Argon2 hash, then embed it in a config string so that
+        // `basic_auth::PasswordHash` is constructed through the normal deserialisation path
+        // (its inner type is not publicly constructible).
+        let salt = SaltString::generate(OsRng);
+        let argon = Argon2::new(Algorithm::Argon2id, Version::V0x13, Params::default());
+        let password_hash = argon.hash_password(b"secret", &salt).unwrap().to_string();
+
+        let toml = format!(
+            r#"{}
+            [auth.identity.admin]
+            username = "admin"
+            password = "{password_hash}"
+        "#,
+            minimal_config_prefix()
+        );
+        let config = Configuration::load_from_str(&toml).unwrap();
+        let basic_auth_validator = BasicAuthValidator::new(&config.auth.identity);
+
+        let oidc_validators: OidcValidators = vec![(
+            "mock-provider".to_string(),
+            Arc::new(MockValidator {
+                outcome: MockOutcome::Authenticated,
+            }) as Arc<dyn AuthMiddleware>,
+        )];
+
+        let authenticator = Authenticator {
+            mtls_validator: MtlsValidator::new(),
+            oidc_validators,
+            basic_auth_validator,
+        };
+
+        // Include valid basic-auth credentials in the request.
+        let credentials = BASE64_STANDARD.encode("admin:secret");
+        let request = Request::builder()
+            .header(AUTHORIZATION, format!("Basic {credentials}"))
+            .body(())
+            .unwrap();
+        let (parts, ()) = request.into_parts();
+
+        let identity = authenticator
+            .authenticate_request(&parts, None)
+            .await
+            .unwrap();
+
+        // OIDC won: claims must be present.
+        assert!(
+            identity.oidc.is_some(),
+            "oidc claims must be set when OIDC provider succeeds"
+        );
+        // Basic auth must have been skipped: username stays None.
+        assert!(
+            identity.username.is_none(),
+            "basic auth must be skipped when OIDC already succeeded; username must be None"
+        );
+    }
 }

@@ -6,6 +6,7 @@ use std::{
         Arc,
         atomic::{AtomicUsize, Ordering},
     },
+    time::Duration,
 };
 
 use async_trait::async_trait;
@@ -988,6 +989,21 @@ async fn test_authorize_does_not_cache_transport_errors() {
     );
 }
 
+// Build a Config with non-default timeout_ms or cache_ttl.
+fn build_test_config_with(url: Url, timeout_ms: u64, cache_ttl: u64) -> Config {
+    Config {
+        name: String::new(),
+        url,
+        timeout_ms,
+        auth: None,
+        client_certificate_bundle: None,
+        client_private_key: None,
+        server_ca_bundle: None,
+        forward_headers: vec![],
+        cache_ttl,
+    }
+}
+
 #[tokio::test]
 // Verifies authorization succeeds even when the cache store returns an error.
 async fn webhook_authorization_succeeds_despite_cache_store_error() {
@@ -1024,5 +1040,123 @@ async fn webhook_authorization_succeeds_despite_cache_store_error() {
         failing_cache.store_call_count.load(Ordering::Relaxed),
         1,
         "store_value must be attempted exactly once"
+    );
+}
+
+#[tokio::test]
+// A timed-out request must not write to the cache. The next call must reach
+// the real backend instead of returning a stale cached denial.
+async fn test_authorize_timeout_does_not_cache_and_retries() {
+    let slow_server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_millis(2000)))
+        .expect(1)
+        .mount(&slow_server)
+        .await;
+
+    let shared_cache = cache::Config::Memory.to_backend().unwrap();
+
+    // First call: very short timeout causes a transport error.
+    let slow_webhook = WebhookAuthorizer::new(
+        "test".to_string(),
+        build_test_config_with(Url::parse(&slow_server.uri()).unwrap(), 100, 60),
+        shared_cache.clone(),
+    )
+    .unwrap();
+
+    let action = Action::ApiVersion;
+    let identity = ClientIdentity::new(None);
+    let (parts, ()) = Builder::new()
+        .uri("https://example.com/v2/")
+        .body(())
+        .unwrap()
+        .into_parts();
+
+    let first = slow_webhook.authorize(&action, &identity, &parts).await;
+    assert!(first.is_err(), "timed-out request must return Err");
+
+    // Second call: live server with the same cache. If the timeout had been
+    // cached the live server would never be hit and the mock's expect(1) on
+    // the live server would fail.
+    let live_server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&live_server)
+        .await;
+
+    let live_webhook = WebhookAuthorizer::new(
+        "test".to_string(),
+        build_test_config_with(Url::parse(&live_server.uri()).unwrap(), 1000, 60),
+        shared_cache,
+    )
+    .unwrap();
+
+    let second = live_webhook.authorize(&action, &identity, &parts).await;
+    assert_eq!(
+        second,
+        Ok(true),
+        "after a timeout the next call must reach the live server — no stale cache entry"
+    );
+}
+
+#[tokio::test]
+// After cache_ttl seconds the cached authorization decision must be discarded
+// and the next call must hit the network again.
+async fn test_authorize_cache_entry_expires_and_refetches() {
+    let mock_server = MockServer::start().await;
+
+    // First request returns 200 (allow); subsequent requests return 403 (deny).
+    // Using up_to_n_times(1) means the 200 response is consumed on the first
+    // network call; the fallback mock then serves 403 for any later calls.
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(200))
+        .up_to_n_times(1)
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(403))
+        .mount(&mock_server)
+        .await;
+
+    let cache = cache::Config::Memory.to_backend().unwrap();
+    let webhook = WebhookAuthorizer::new(
+        "test".to_string(),
+        build_test_config_with(Url::parse(&mock_server.uri()).unwrap(), 1000, 1),
+        cache,
+    )
+    .unwrap();
+
+    let action = Action::ApiVersion;
+    let identity = ClientIdentity::new(None);
+    let (parts, ()) = Builder::new()
+        .uri("https://example.com/v2/")
+        .body(())
+        .unwrap()
+        .into_parts();
+
+    // First call: goes to the network, gets 200, caches the allow decision.
+    assert_eq!(
+        webhook.authorize(&action, &identity, &parts).await,
+        Ok(true),
+        "first call must be allowed"
+    );
+
+    // Immediate second call: served from cache, still allow, no network hop.
+    assert_eq!(
+        webhook.authorize(&action, &identity, &parts).await,
+        Ok(true),
+        "second call must be served from cache"
+    );
+
+    // Wait for the 1-second TTL to expire.
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+
+    // Third call: cache expired, goes to network again, gets the fallback 403.
+    assert_eq!(
+        webhook.authorize(&action, &identity, &parts).await,
+        Ok(false),
+        "after TTL expiry authorization must fetch fresh from network and get deny"
     );
 }

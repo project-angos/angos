@@ -141,3 +141,69 @@ password = "not-a-valid-argon2-hash"
         "invalid Argon2 hash must fail at deserialization"
     );
 }
+
+#[tokio::test]
+async fn test_empty_identity_map_returns_no_credentials() {
+    let auth = BasicAuthValidator::new(&HashMap::new());
+
+    let parts = build_test_parts("user1", "password1");
+    let mut identity = ClientIdentity::default();
+    let result = auth.authenticate(&parts, &mut identity).await.unwrap();
+    assert!(matches!(result, AuthResult::NoCredentials));
+}
+
+#[test]
+fn test_duplicate_usernames_last_wins() {
+    // Two config entries share the same username field. build_users keys by username,
+    // so one entry silently overwrites the other. The resulting map has exactly one
+    // entry for that username; which identity_id survives is non-deterministic (HashMap
+    // iteration order), but the size must be 1.
+    let toml = r#"
+[identity.id_a]
+username = "shared"
+password = "$argon2id$v=19$m=19456,t=2,p=1$9pxWwg0VtZzDXno/25417Q$e+cuKy9VisJVxec/EEuKvvfIIIOy5yDGRzYKiuDLjx0"
+
+[identity.id_b]
+username = "shared"
+password = "$argon2id$v=19$m=19456,t=2,p=1$Uy1qF140d+2nOKIz1ZFltw$xAii0VrKbNn2d/rb5hUWUmEcwq6kjVFE5mW5ymzFudw"
+"#;
+
+    let config: TestConfig = toml::from_str(toml).expect("valid TOML");
+    let users = build_users(&config.identity);
+
+    assert_eq!(users.len(), 1, "duplicate usernames collapse to one entry");
+    assert!(users.contains_key("shared"));
+}
+
+#[test]
+fn test_validate_credentials_empty_username_returns_none() {
+    let config = build_test_config();
+    let auth = BasicAuthValidator::new(&config.identity);
+
+    let result = auth.validate_credentials("", "password1");
+    assert_eq!(result, None);
+}
+
+#[test]
+fn test_validate_credentials_whitespace_only_username_returns_none() {
+    let config = build_test_config();
+    let auth = BasicAuthValidator::new(&config.identity);
+
+    let result = auth.validate_credentials("   ", "password1");
+    assert_eq!(result, None);
+}
+
+#[test]
+fn test_empty_password_hash_string_fails_at_deserialize() {
+    let toml = r#"
+[identity.id_1]
+username = "user1"
+password = ""
+"#;
+
+    let result: Result<TestConfig, _> = toml::from_str(toml);
+    assert!(
+        result.is_err(),
+        "empty password hash string must fail at deserialization"
+    );
+}
