@@ -1343,3 +1343,78 @@ fn event_webhook_bad_repo_reference_fails_load() {
         "Error must identify the repository as the source: {msg}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Story 7.4.5 — log_deprecations output and webhook nested-field validation
+// ---------------------------------------------------------------------------
+
+#[test]
+fn deprecated_fields_empty_when_no_deprecated_config() {
+    let config = r#"
+    [server]
+    bind_address = "0.0.0.0"
+    "#;
+
+    let config = Configuration::load_from_str(config).unwrap();
+    assert!(
+        config.deprecated_fields().is_empty(),
+        "No deprecated fields should be reported for a clean config"
+    );
+}
+
+#[test]
+fn deprecated_fields_contains_enable_redirect_when_set() {
+    let config = r#"
+    [server]
+    bind_address = "0.0.0.0"
+
+    [global]
+    enable_redirect = true
+    "#;
+
+    let config = Configuration::load_from_str(config).unwrap();
+    let fields = config.deprecated_fields();
+    assert_eq!(fields, vec!["global.enable_redirect"]);
+}
+
+#[test]
+fn deprecated_fields_not_present_when_new_redirect_fields_used() {
+    let config = r#"
+    [server]
+    bind_address = "0.0.0.0"
+
+    [global]
+    enable_blob_redirect = true
+    enable_manifest_redirect = false
+    "#;
+
+    let config = Configuration::load_from_str(config).unwrap();
+    assert!(
+        config.deprecated_fields().is_empty(),
+        "New redirect fields must not trigger the deprecation warning"
+    );
+}
+
+#[test]
+fn event_webhook_empty_events_list_fails_load() {
+    // Exercises the nested-field validation path inside resolve_event_webhooks,
+    // which calls EventWebhookConfig::validate() and surfaces the error through
+    // load_from_str. This is distinct from the unit-level test in
+    // event_webhook/config.rs because it verifies the integration path.
+    let config = r#"
+    [server]
+    bind_address = "0.0.0.0"
+
+    [event_webhook.silent]
+    url = "https://example.com/hook"
+    policy = "required"
+    events = []
+    "#;
+
+    let result = Configuration::load_from_str(config);
+    let err = result.expect_err("event webhook with empty events list must fail to load");
+    assert!(
+        err.to_string().contains("silent"),
+        "Error must identify the offending webhook by name: {err}"
+    );
+}

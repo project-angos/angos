@@ -477,6 +477,79 @@ mod tests {
         assert!(policy.should_retain(&manifest, &[], &[]).unwrap());
     }
 
+    /// Empty rules list means no retention criteria are configured.
+    /// `should_retain` returns `true` immediately so that manifests are never
+    /// deleted when the operator has not expressed an intent to delete anything.
+    #[test]
+    fn empty_rules_retain_all() {
+        let policy = RetentionPolicy::new(&RetentionPolicyConfig { rules: vec![] }, system_clock());
+        let tagged = ManifestImage {
+            tag: Some("v1".to_string()),
+            ..Default::default()
+        };
+        let orphan = ManifestImage {
+            tag: None,
+            ..Default::default()
+        };
+        assert!(policy.should_retain(&tagged, &[], &[]).unwrap());
+        assert!(policy.should_retain(&orphan, &[], &[]).unwrap());
+    }
+
+    /// `top_pushed(-n)` clamps the count to 0 via `count.max(0)`, so the
+    /// effective window is empty and no tag can ever match.  The manifest is
+    /// eligible for deletion rather than being retained.
+    #[test]
+    fn top_pushed_with_negative_count_clamps_to_zero() {
+        let policy = RetentionPolicy::new(
+            &RetentionPolicyConfig {
+                rules: vec![rule("top_pushed(-5)")],
+            },
+            system_clock(),
+        );
+        let manifest = ManifestImage {
+            tag: Some("v1".to_string()),
+            ..Default::default()
+        };
+        let last_pushed = vec!["v1".to_string(), "v2".to_string()];
+        assert!(!policy.should_retain(&manifest, &last_pushed, &[]).unwrap());
+    }
+
+    /// `top_pulled(-n)` clamps the count to 0 via `count.max(0)`, so the
+    /// effective window is empty and no tag can ever match.
+    #[test]
+    fn top_pulled_with_negative_count_clamps_to_zero() {
+        let policy = RetentionPolicy::new(
+            &RetentionPolicyConfig {
+                rules: vec![rule("top_pulled(-1)")],
+            },
+            system_clock(),
+        );
+        let manifest = ManifestImage {
+            tag: Some("v1".to_string()),
+            ..Default::default()
+        };
+        let last_pulled = vec!["v1".to_string()];
+        assert!(!policy.should_retain(&manifest, &[], &last_pulled).unwrap());
+    }
+
+    /// Rules are evaluated in OR fashion: the first rule that returns `true`
+    /// causes immediate retention.  When rule 1 returns `false` and rule 2
+    /// returns `true`, the manifest is still retained.
+    #[test]
+    fn multiple_rules_first_false_then_true_retains() {
+        let policy = RetentionPolicy::new(
+            &RetentionPolicyConfig {
+                rules: vec![rule("false"), rule("true")],
+            },
+            system_clock(),
+        );
+        let manifest = ManifestImage {
+            tag: Some("v1".to_string()),
+            ..Default::default()
+        };
+        assert!(policy.should_retain(&manifest, &[], &[]).unwrap());
+    }
+
     #[test]
     fn injected_clock_is_observed_by_now_function() {
         let fixed = fixed_now();

@@ -1038,4 +1038,265 @@ bind_address = "10.0.0.1"
 
         assert_eq!(notifier.tls_change_count(), 0);
     }
+
+    // -----------------------------------------------------------------------
+    // Story 7.4.4 — startup-with-invalid-config, debounce-burst,
+    //               missing-TLS-dir, dynamic-TLS-path
+    // -----------------------------------------------------------------------
+
+    /// `ConfigWatcher::new` must return `Err(Error::NotReadable)` immediately
+    /// when the config file does not exist at all.  The caller (the `server`
+    /// command) relies on this to abort startup with a clear error message
+    /// rather than silently watching a path that will never fire.
+    #[tokio::test]
+    async fn startup_with_nonexistent_config_returns_err() {
+        let temp_dir = TempDir::new().unwrap();
+        let missing = temp_dir.path().join("does-not-exist.toml");
+        let notifier = Arc::new(TestNotifier::new());
+
+        let result = ConfigWatcher::new(
+            missing.to_str().unwrap(),
+            Arc::clone(&notifier) as Arc<dyn ConfigNotifier>,
+        );
+
+        assert!(
+            matches!(result, Err(Error::NotReadable(_))),
+            "expected Err(NotReadable), got {:?}",
+            result.err()
+        );
+    }
+
+    /// When the config file *exists* but contains invalid TOML,
+    /// `ConfigWatcher::new` must return `Ok` — the watcher starts, logs a
+    /// warning, and waits for a corrected file to appear.  This is the
+    /// intentional "soft startup" behaviour: if the operator wrote a bad
+    /// config, the running registry keeps serving traffic while the watcher
+    /// waits for a fix, rather than killing the process.
+    ///
+    /// After writing a valid config the notifier must receive at least one
+    /// reload callback, confirming the watcher did not stall.
+    #[tokio::test]
+    async fn startup_with_invalid_toml_recovers_on_valid_write() {
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("config.toml");
+        fs::write(&config_path, b"this is not valid toml [[[").unwrap();
+
+        let notifier = Arc::new(TestNotifier::new());
+        let _watcher = ConfigWatcher::new(
+            config_path.to_str().unwrap(),
+            Arc::clone(&notifier) as Arc<dyn ConfigNotifier>,
+        )
+        .expect("ConfigWatcher::new must succeed even with invalid TOML at startup");
+
+        // Give the background task time to initialise the notify watcher before
+        // writing the valid config.  The existing integration tests use 500 ms
+        // for a valid-startup case; we use the same budget here because the
+        // background task setup path is identical.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        // Now write a valid config; the watcher must detect it and call
+        // notify_config_change at least once.
+        fs::write(&config_path, MINIMAL_CONFIG).unwrap();
+
+        let detected = wait_for_condition(
+            || notifier.config_change_count() >= 1,
+            Duration::from_secs(5),
+        )
+        .await;
+
+        assert!(
+            detected,
+            "watcher did not recover and notify after invalid-TOML startup"
+        );
+    }
+
+    /// A rapid burst of writes to the config file (simulating an editor
+    /// save sequence) must produce at most a small number of reload
+    /// notifications — far fewer than the number of writes — because the
+    /// debounce window coalesces consecutive events.
+    ///
+    /// We write 10 times in a tight loop and assert the notifier is called
+    /// no more than 3 times.  In practice the debouncer collapses everything
+    /// into one reload; we allow a small upper bound to tolerate the OS
+    /// delivering events in two distinct quiet gaps on slow CI runners.
+    #[tokio::test]
+    async fn burst_config_writes_produce_bounded_reloads() {
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("config.toml");
+        fs::write(&config_path, MINIMAL_CONFIG).unwrap();
+
+        let notifier = Arc::new(TestNotifier::new());
+        let _watcher = ConfigWatcher::new(
+            config_path.to_str().unwrap(),
+            Arc::clone(&notifier) as Arc<dyn ConfigNotifier>,
+        )
+        .unwrap();
+
+        // Wait for the watcher background task to initialise its inotify fd
+        // before the burst; otherwise the first few events may be missed
+        // entirely, producing 0 reloads instead of the bounded > 0 we want.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        // Write a valid config 10 times as fast as the OS allows.
+        for i in 0_u8..10 {
+            let content = format!("[server]\nbind_address = \"10.0.0.{i}\"\n");
+            let mut file = fs::File::create(&config_path).unwrap();
+            file.write_all(content.as_bytes()).unwrap();
+            file.sync_all().unwrap();
+        }
+
+        // Wait long enough for debounce to settle (DEBOUNCE = 100 ms; give it
+        // several multiples to ensure all coalesced reloads have fired).
+        tokio::time::sleep(Duration::from_millis(800)).await;
+
+        let count = notifier.config_change_count();
+        assert!(
+            count >= 1,
+            "expected at least one reload after burst, got {count}"
+        );
+        assert!(
+            count <= 3,
+            "debounce should collapse burst to ≤ 3 reloads, got {count}"
+        );
+    }
+
+    /// When the configuration references a TLS directory that does not exist
+    /// on disk, the watcher must log a warning and continue rather than
+    /// failing.  A subsequent ordinary config-file write must still trigger
+    /// a reload notification, confirming the watcher loop is alive.
+    ///
+    /// This exercises the `warn!("Failed to watch TLS directory …")` branch
+    /// in `watch_config_loop`.
+    #[tokio::test]
+    async fn missing_tls_dir_does_not_prevent_config_reload() {
+        let temp_dir = TempDir::new().unwrap();
+
+        // Point the TLS config at directories that do not exist.
+        let phantom_cert = temp_dir.path().join("nonexistent/tls/server.pem");
+        let phantom_key = temp_dir.path().join("nonexistent/tls/server.key");
+        let config_path = temp_dir.path().join("config.toml");
+        fs::write(
+            &config_path,
+            minimal_tls_config(
+                phantom_cert.to_str().unwrap(),
+                phantom_key.to_str().unwrap(),
+            ),
+        )
+        .unwrap();
+
+        let notifier = Arc::new(TestNotifier::new());
+        // Must not return Err even though the TLS dir doesn't exist.
+        let _watcher = ConfigWatcher::new(
+            config_path.to_str().unwrap(),
+            Arc::clone(&notifier) as Arc<dyn ConfigNotifier>,
+        )
+        .expect("watcher must start even when TLS directory is absent");
+
+        // Give the background task time to initialise the watcher.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        // Write a fresh valid config; watcher must still detect it.
+        let updated = "[server]\nbind_address = \"192.0.2.1\"\n";
+        let mut file = fs::File::create(&config_path).unwrap();
+        file.write_all(updated.as_bytes()).unwrap();
+        file.sync_all().unwrap();
+
+        let detected = wait_for_condition(
+            || notifier.config_change_count() >= 1,
+            Duration::from_secs(5),
+        )
+        .await;
+
+        assert!(
+            detected,
+            "watcher must detect config changes even when TLS dir is missing"
+        );
+    }
+
+    /// When a config reload changes the TLS certificate/key paths to point to
+    /// a new directory, the watcher must restart its directory watches and
+    /// subsequently detect cert rotations in the new location.
+    ///
+    /// Sequence:
+    ///   1. Start with TLS paths in `tls_v1/`.
+    ///   2. Reload config pointing to `tls_v2/` (triggers `ChangeKind::Config`
+    ///      and a `break` in the inner loop to re-arm watches).
+    ///   3. Rotate the cert in `tls_v2/`; expect a TLS notification.
+    #[tokio::test]
+    async fn dynamic_tls_path_change_rewatches_new_directory() {
+        let temp_dir = TempDir::new().unwrap();
+
+        // --- initial TLS dir ---
+        let tls_v1 = temp_dir.path().join("tls_v1");
+        fs::create_dir_all(&tls_v1).unwrap();
+        let cert_v1 = tls_v1.join("server.pem");
+        let key_v1 = tls_v1.join("server.key");
+        fs::write(&cert_v1, "cert-v1").unwrap();
+        fs::write(&key_v1, "key-v1").unwrap();
+
+        // --- new TLS dir (not yet in config) ---
+        let tls_v2 = temp_dir.path().join("tls_v2");
+        fs::create_dir_all(&tls_v2).unwrap();
+        let cert_v2 = tls_v2.join("server.pem");
+        let key_v2 = tls_v2.join("server.key");
+        fs::write(&cert_v2, "cert-v2").unwrap();
+        fs::write(&key_v2, "key-v2").unwrap();
+
+        let config_path = temp_dir.path().join("config.toml");
+        fs::write(
+            &config_path,
+            minimal_tls_config(cert_v1.to_str().unwrap(), key_v1.to_str().unwrap()),
+        )
+        .unwrap();
+
+        let notifier = Arc::new(TestNotifier::new());
+        let _watcher = ConfigWatcher::new(
+            config_path.to_str().unwrap(),
+            Arc::clone(&notifier) as Arc<dyn ConfigNotifier>,
+        )
+        .unwrap();
+
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        // Step 2: update config to point at tls_v2 — fires ChangeKind::Config,
+        // which causes the inner loop to break and re-arm watches for tls_v2.
+        fs::write(
+            &config_path,
+            minimal_tls_config(cert_v2.to_str().unwrap(), key_v2.to_str().unwrap()),
+        )
+        .unwrap();
+
+        // Wait for the config-reload notification and for the watcher to
+        // re-arm (the inner loop breaks and the outer loop re-enters).
+        let config_reloaded = wait_for_condition(
+            || notifier.config_change_count() >= 1,
+            Duration::from_secs(5),
+        )
+        .await;
+        assert!(
+            config_reloaded,
+            "config change to new TLS dir was not detected"
+        );
+
+        // Give the outer loop time to re-arm the notify watcher for tls_v2.
+        tokio::time::sleep(Duration::from_millis(600)).await;
+
+        let tls_before = notifier.tls_change_count();
+
+        // Step 3: rotate the cert in the *new* dir; the watcher must notice.
+        let mut file = fs::File::create(&cert_v2).unwrap();
+        file.write_all(b"cert-v2-rotated").unwrap();
+        file.sync_all().unwrap();
+
+        let tls_detected = wait_for_condition(
+            || notifier.tls_change_count() > tls_before,
+            Duration::from_secs(5),
+        )
+        .await;
+
+        assert!(
+            tls_detected,
+            "TLS rotation in dynamically-updated path was not detected"
+        );
+    }
 }
