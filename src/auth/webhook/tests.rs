@@ -1,5 +1,14 @@
-use std::{fs, path::PathBuf, str::FromStr};
+use std::{
+    fs,
+    path::PathBuf,
+    str::FromStr,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+};
 
+use async_trait::async_trait;
 use hyper::{HeaderMap, Method, http::request::Builder};
 use url::Url;
 use wiremock::{
@@ -22,12 +31,40 @@ use crate::{
         },
         tls::{load_certificate_bundle, load_file, load_identity},
     },
-    cache,
+    cache::{self, Cache},
     command::server::Error,
     identity::{Action, ClientIdentity},
     oci::{Digest, Namespace, Reference},
     secret::Secret,
 };
+
+// Always fails store_value so tests can exercise the cache-write-error path.
+#[derive(Debug, Default)]
+struct FailingCache {
+    store_call_count: AtomicUsize,
+}
+
+#[async_trait]
+impl Cache for FailingCache {
+    async fn store_value(
+        &self,
+        _key: &str,
+        _value: &str,
+        _expires_in: u64,
+    ) -> Result<(), cache::Error> {
+        self.store_call_count.fetch_add(1, Ordering::Relaxed);
+        Err(cache::Error::Backend("injected store failure".to_string()))
+    }
+
+    async fn retrieve_value(&self, _key: &str) -> Result<Option<String>, cache::Error> {
+        // Cache miss: always forward to the webhook.
+        Ok(None)
+    }
+
+    async fn delete_value(&self, _key: &str) -> Result<(), cache::Error> {
+        Ok(())
+    }
+}
 
 static TEST_BUNDLE: &str = r"-----BEGIN CERTIFICATE-----
 MIIDgjCCAmqgAwIBAgIUFCYlDkKrxnJCnCtYXKvA9BaXnfowDQYJKoZIhvcNAQEL
@@ -948,5 +985,44 @@ async fn test_authorize_does_not_cache_transport_errors() {
         second,
         Ok(true),
         "second call must reach the live server, not return a cached denial"
+    );
+}
+
+#[tokio::test]
+// Verifies authorization succeeds even when the cache store returns an error.
+async fn webhook_authorization_succeeds_despite_cache_store_error() {
+    let mock_server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let mut config = build_test_config(Url::parse(&mock_server.uri()).unwrap(), None, None, None);
+    config.auth = None;
+
+    let failing_cache = Arc::new(FailingCache::default());
+    let webhook =
+        WebhookAuthorizer::new("test".to_string(), config, failing_cache.clone()).unwrap();
+
+    let action = Action::ApiVersion;
+    let identity = ClientIdentity::new(None);
+
+    let request = Builder::new()
+        .uri("https://example.com/v2/")
+        .body(())
+        .unwrap();
+    let (parts, ()) = request.into_parts();
+
+    assert_eq!(
+        webhook.authorize(&action, &identity, &parts).await,
+        Ok(true),
+        "cache store error must not fail authorization"
+    );
+    assert_eq!(
+        failing_cache.store_call_count.load(Ordering::Relaxed),
+        1,
+        "store_value must be attempted exactly once"
     );
 }
