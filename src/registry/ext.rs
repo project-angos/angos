@@ -7,7 +7,7 @@ use tracing::instrument;
 
 use crate::{
     configuration::RegexPattern,
-    oci::{Descriptor, Digest, Manifest, Namespace, Platform as OciPlatform},
+    oci::{Descriptor, Digest, Manifest, Namespace, Platform as OciPlatform, namespace_belongs_to},
     registry::{
         Error, JsonResponse, Registry, metadata_store::link_kind::LinkKind,
         pagination::collect_all_pages,
@@ -465,7 +465,7 @@ impl Registry {
 
         let mut matching_namespaces: Vec<String> = all_namespaces
             .into_iter()
-            .filter(|ns| ns == repository || ns.starts_with(&format!("{repository}/")))
+            .filter(|ns| namespace_belongs_to(ns, repository))
             .collect();
 
         matching_namespaces.sort_unstable();

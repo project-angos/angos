@@ -6,7 +6,7 @@ use tracing::{debug, info};
 
 use crate::{
     command::scrub::check::NamespaceChecker,
-    oci::Digest,
+    oci::{Digest, namespace_belongs_to},
     policy::{EpochSeconds, ManifestImage, RetentionPolicy},
     registry::{
         Error,
@@ -207,10 +207,7 @@ impl RetentionChecker {
     fn find_repository_for_namespace(&self, namespace: &str) -> Option<&Repository> {
         self.repositories
             .iter()
-            .find(|(repository_name, _)| {
-                namespace == repository_name.as_str()
-                    || namespace.starts_with(&format!("{repository_name}/"))
-            })
+            .find(|(repository_name, _)| namespace_belongs_to(namespace, repository_name))
             .map(|(_, repository)| repository)
     }
 
