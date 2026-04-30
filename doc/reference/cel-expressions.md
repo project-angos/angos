@@ -261,8 +261,14 @@ rules = [
 
 ## Error Handling
 
+**Access policy rules:**
 - Rules that fail to evaluate (e.g., null access) are skipped with a warning
 - For default-deny: at least one rule must return true to allow
 - For default-allow: at least one rule must return false to deny
 - Always check `identity.oidc != null` before accessing OIDC fields
 - Use bracket notation for claims: `identity.oidc.claims['claim_name']`
+
+**Retention policy rules:**
+- A rule that returns a non-boolean value or fails to evaluate causes the manifest to be retained and emits a `warn`-level log
+- Retention is fail-open by design: unexpected rule outcomes keep the manifest rather than deleting it
+- See [Configure Retention Policies — Misconfigured Rules](../how-to/configure-retention-policies.md#misconfigured-rules-and-fail-open-semantics) for details and log examples
