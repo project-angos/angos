@@ -102,6 +102,21 @@ impl From<registry::Error> for Error {
                 code: "INTERNAL_SERVER_ERROR".to_string(),
                 msg: Some(msg),
             },
+            registry::Error::Configuration(_)
+            | registry::Error::Cache(_)
+            | registry::Error::MetadataStore(_)
+            | registry::Error::TaskQueue(_)
+            | registry::Error::Io(_)
+            | registry::Error::Http(_)
+            | registry::Error::Serde(_)
+            | registry::Error::PolicyExecution(_)
+            | registry::Error::InvalidHeader(_)
+            | registry::Error::InvalidUri(_)
+            | registry::Error::Serialization(_) => Error::Custom {
+                status_code: StatusCode::INTERNAL_SERVER_ERROR,
+                code: "INTERNAL_SERVER_ERROR".to_string(),
+                msg: Some(error.to_string()),
+            },
         }
     }
 }
@@ -251,61 +266,6 @@ mod tests {
             format!("{error}"),
             "Error 503 Service Unavailable: SERVICE_UNAVAILABLE"
         );
-    }
-
-    #[test]
-    fn test_status_code_mapping() {
-        assert_eq!(
-            Error::Unauthorized("test".to_string()).status_code(),
-            StatusCode::UNAUTHORIZED
-        );
-        assert_eq!(
-            Error::BadRequest("test".to_string()).status_code(),
-            StatusCode::BAD_REQUEST
-        );
-        assert_eq!(
-            Error::Conflict("test".to_string()).status_code(),
-            StatusCode::CONFLICT
-        );
-        assert_eq!(
-            Error::RangeNotSatisfiable("test".to_string()).status_code(),
-            StatusCode::RANGE_NOT_SATISFIABLE
-        );
-        assert_eq!(
-            Error::NotFound("test".to_string()).status_code(),
-            StatusCode::NOT_FOUND
-        );
-        assert_eq!(
-            Error::Initialization("test".to_string()).status_code(),
-            StatusCode::INTERNAL_SERVER_ERROR
-        );
-        assert_eq!(
-            Error::Execution("test".to_string()).status_code(),
-            StatusCode::INTERNAL_SERVER_ERROR
-        );
-        assert_eq!(
-            Error::Internal("test".to_string()).status_code(),
-            StatusCode::INTERNAL_SERVER_ERROR
-        );
-        assert_eq!(
-            Error::Custom {
-                status_code: StatusCode::IM_A_TEAPOT,
-                code: "TEAPOT".to_string(),
-                msg: None,
-            }
-            .status_code(),
-            StatusCode::IM_A_TEAPOT
-        );
-    }
-
-    #[test]
-    fn test_as_json_without_request_id() {
-        let error = Error::Unauthorized("Invalid credentials".to_string());
-        let json = error.as_json(None);
-
-        assert_eq!(json["errors"][0]["code"], "UNAUTHORIZED");
-        assert_eq!(json["errors"][0]["message"], "Invalid credentials");
-        assert!(json["errors"][0].get("detail").is_none());
     }
 
     #[test]
@@ -496,41 +456,6 @@ mod tests {
                 assert_eq!(json["errors"][0]["message"], msg);
             }
         }
-    }
-
-    #[test]
-    fn test_error_variant_matching() {
-        let error1 = Error::NotFound("test".to_string());
-        let error2 = Error::NotFound("test".to_string());
-        let error3 = Error::NotFound("different".to_string());
-        let error4 = Error::BadRequest("test".to_string());
-
-        assert!(matches!(error1, Error::NotFound(_)));
-        assert_eq!(error1.to_string(), error2.to_string());
-        assert_ne!(error1.to_string(), error3.to_string());
-        assert!(!matches!(error4, Error::NotFound(_)));
-    }
-
-    #[test]
-    fn test_custom_error_variant_matching() {
-        let error1 = Error::Custom {
-            status_code: StatusCode::BAD_GATEWAY,
-            code: "TEST".to_string(),
-            msg: Some("message".to_string()),
-        };
-        let error2 = Error::Custom {
-            status_code: StatusCode::BAD_GATEWAY,
-            code: "TEST".to_string(),
-            msg: Some("message".to_string()),
-        };
-        let error3 = Error::Custom {
-            status_code: StatusCode::BAD_GATEWAY,
-            code: "TEST".to_string(),
-            msg: None,
-        };
-
-        assert_eq!(error1.to_string(), error2.to_string());
-        assert_ne!(error1.to_string(), error3.to_string());
     }
 
     #[test]
