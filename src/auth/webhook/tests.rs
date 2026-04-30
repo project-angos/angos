@@ -54,7 +54,9 @@ impl Cache for FailingCache {
         _expires_in: u64,
     ) -> Result<(), cache::Error> {
         self.store_call_count.fetch_add(1, Ordering::Relaxed);
-        Err(cache::Error::Backend("injected store failure".to_string()))
+        Err(cache::Error::Execution(
+            "injected store failure".to_string(),
+        ))
     }
 
     async fn retrieve_value(&self, _key: &str) -> Result<Option<String>, cache::Error> {

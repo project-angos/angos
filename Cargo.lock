@@ -68,6 +68,7 @@ dependencies = [
  "serde_urlencoded",
  "sha2 0.11.0",
  "tempfile",
+ "thiserror 2.0.18",
  "tokio",
  "tokio-rustls 0.26.4",
  "tokio-util",

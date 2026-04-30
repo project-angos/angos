@@ -94,7 +94,7 @@ mod tests {
         }
 
         async fn retrieve_value(&self, _key: &str) -> Result<Option<String>, cache::Error> {
-            Err(cache::Error::Backend(
+            Err(cache::Error::Execution(
                 "injected retrieve failure".to_string(),
             ))
         }

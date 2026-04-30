@@ -2,7 +2,7 @@ use std::{collections::HashMap, sync::Arc};
 
 use argh::FromArgs;
 use chrono::Duration;
-use tracing::{error, info};
+use tracing::info;
 
 use crate::{
     cache::Cache,
@@ -69,13 +69,7 @@ pub struct Command {
 }
 
 async fn build_metadata_store(config: &Configuration) -> Result<Arc<dyn MetadataStore>, Error> {
-    let (store, _) = config
-        .resolve_metadata_config()
-        .to_backend(None)
-        .await
-        .map_err(|err| {
-            Error::Initialization(format!("Failed to initialize metadata store: {err}"))
-        })?;
+    let (store, _) = config.resolve_metadata_config().to_backend(None).await?;
     Ok(store)
 }
 
@@ -207,14 +201,9 @@ fn build_multipart_checker(
 
 impl Command {
     pub async fn new(options: &Options, config: &Configuration) -> Result<Self, Error> {
-        let blob_handles = config
-            .blob_store
-            .to_backend(None)
-            .map_err(|_| Error::Initialization("Failed to initialize blob store".to_string()))?;
+        let blob_handles = config.blob_store.to_backend(None).map_err(Error::from)?;
         let metadata_store = build_metadata_store(config).await?;
-        let auth_cache = config.cache.to_backend().map_err(|err| {
-            Error::Initialization(format!("Failed to initialize auth token cache: {err}"))
-        })?;
+        let auth_cache = config.cache.to_backend().map_err(Error::from)?;
         let repositories = build_repositories(&config.repository, &auth_cache)?;
 
         let namespace_checkers = build_namespace_checkers(
@@ -250,12 +239,7 @@ impl Command {
 
     async fn scrub_metadata(&self) -> Result<(), Error> {
         let namespaces =
-            collect_all_pages(|marker| self.metadata_store.list_namespaces(100, marker))
-                .await
-                .map_err(|_| {
-                    error!("Failed to read catalog");
-                    Error::Execution("Failed to read catalog".to_string())
-                })?;
+            collect_all_pages(|marker| self.metadata_store.list_namespaces(100, marker)).await?;
 
         for namespace in namespaces {
             for checker in &self.namespace_checkers {
@@ -275,10 +259,7 @@ impl Command {
 
     async fn scrub_multipart_uploads(&self) -> Result<(), Error> {
         if let Some(checker) = &self.multipart_checker {
-            checker
-                .check_all()
-                .await
-                .map_err(|e| Error::Execution(format!("Multipart cleanup failed: {e}")))?;
+            checker.check_all().await?;
         }
         Ok(())
     }

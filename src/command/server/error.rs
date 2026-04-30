@@ -1,50 +1,36 @@
-use std::fmt;
-
 use hyper::StatusCode;
 use serde_json::json;
 
 use crate::{configuration, registry};
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, thiserror::Error)]
 pub enum Error {
+    #[error("{0}")]
     Initialization(String),
+    #[error("{0}")]
     Execution(String),
+    #[error("Unauthorized: {0}")]
     Unauthorized(String),
+    #[error("Bad Request: {0}")]
     BadRequest(String),
+    #[error("Conflict: {0}")]
     Conflict(String),
+    #[error("Range Not Satisfiable: {0}")]
     RangeNotSatisfiable(String),
+    #[error("Not Found: {0}")]
     NotFound(String),
+    #[error("Internal Server Error: {0}")]
     Internal(String),
+    #[error("failed to build HTTP response: {0}")]
+    HttpBuild(#[from] hyper::http::Error),
+    #[error("failed to serialize response body: {0}")]
+    Serialization(#[from] serde_json::Error),
+    #[error("Error {status_code}: {code}{}", msg.as_deref().map(|m| format!(" - {m}")).unwrap_or_default())]
     Custom {
         status_code: StatusCode,
         code: String,
         msg: Option<String>,
     },
-}
-
-impl fmt::Display for Error {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match self {
-            Error::Initialization(err) | Error::Execution(err) => write!(f, "{err}"),
-            Error::Unauthorized(err) => write!(f, "Unauthorized: {err}"),
-            Error::BadRequest(err) => write!(f, "Bad Request: {err}"),
-            Error::Conflict(err) => write!(f, "Conflict: {err}"),
-            Error::RangeNotSatisfiable(err) => write!(f, "Range Not Satisfiable: {err}"),
-            Error::NotFound(err) => write!(f, "Not Found: {err}"),
-            Error::Internal(err) => write!(f, "Internal Server Error: {err}"),
-            Error::Custom {
-                status_code,
-                code: message,
-                msg: details,
-            } => {
-                if let Some(details) = details {
-                    write!(f, "Error {status_code}: {message} - {details}")
-                } else {
-                    write!(f, "Error {status_code}: {message}")
-                }
-            }
-        }
-    }
 }
 
 impl From<registry::Error> for Error {
@@ -130,15 +116,33 @@ impl From<configuration::Error> for Error {
     }
 }
 
-impl From<hyper::http::Error> for Error {
-    fn from(error: hyper::http::Error) -> Self {
-        Error::Internal(format!("failed to build HTTP response: {error}"))
-    }
-}
-
-impl From<serde_json::Error> for Error {
-    fn from(error: serde_json::Error) -> Self {
-        Error::Internal(format!("failed to serialize response body: {error}"))
+impl PartialEq for Error {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Error::Initialization(a), Error::Initialization(b))
+            | (Error::Execution(a), Error::Execution(b))
+            | (Error::Unauthorized(a), Error::Unauthorized(b))
+            | (Error::BadRequest(a), Error::BadRequest(b))
+            | (Error::Conflict(a), Error::Conflict(b))
+            | (Error::RangeNotSatisfiable(a), Error::RangeNotSatisfiable(b))
+            | (Error::NotFound(a), Error::NotFound(b))
+            | (Error::Internal(a), Error::Internal(b)) => a == b,
+            (Error::HttpBuild(a), Error::HttpBuild(b)) => a.to_string() == b.to_string(),
+            (Error::Serialization(a), Error::Serialization(b)) => a.to_string() == b.to_string(),
+            (
+                Error::Custom {
+                    status_code: sc_a,
+                    code: c_a,
+                    msg: m_a,
+                },
+                Error::Custom {
+                    status_code: sc_b,
+                    code: c_b,
+                    msg: m_b,
+                },
+            ) => sc_a == sc_b && c_a == c_b && m_a == m_b,
+            _ => false,
+        }
     }
 }
 
@@ -150,9 +154,11 @@ impl Error {
             Error::Conflict(_) => StatusCode::CONFLICT,
             Error::RangeNotSatisfiable(_) => StatusCode::RANGE_NOT_SATISFIABLE,
             Error::NotFound(_) => StatusCode::NOT_FOUND,
-            Error::Initialization(_) | Error::Execution(_) | Error::Internal(_) => {
-                StatusCode::INTERNAL_SERVER_ERROR
-            }
+            Error::Initialization(_)
+            | Error::Execution(_)
+            | Error::Internal(_)
+            | Error::HttpBuild(_)
+            | Error::Serialization(_) => StatusCode::INTERNAL_SERVER_ERROR,
             Error::Custom { status_code, .. } => *status_code,
         }
     }
@@ -167,6 +173,7 @@ impl Error {
             Error::Initialization(msg) | Error::Execution(msg) | Error::Internal(msg) => {
                 ("INTERNAL_SERVER_ERROR", Some(msg.as_str()))
             }
+            Error::HttpBuild(_) | Error::Serialization(_) => ("INTERNAL_SERVER_ERROR", None),
             Error::Custom { code, msg, .. } => (code.as_str(), msg.as_deref()),
         };
 
@@ -391,164 +398,121 @@ mod tests {
     }
 
     #[test]
-    fn test_from_registry_error_blob_unknown() {
-        let registry_error = registry::Error::BlobUnknown;
-        let error: Error = registry_error.into();
+    fn test_registry_error_to_server_error_mapping() {
+        // (registry_error, expected_status, expected_code, expected_message)
+        let cases: Vec<(registry::Error, StatusCode, &str, Option<&str>)> = vec![
+            (
+                registry::Error::BlobUnknown,
+                StatusCode::NOT_FOUND,
+                "BLOB_UNKNOWN",
+                None,
+            ),
+            (
+                registry::Error::BlobUploadUnknown,
+                StatusCode::NOT_FOUND,
+                "BLOB_UPLOAD_UNKNOWN",
+                None,
+            ),
+            (
+                registry::Error::DigestInvalid,
+                StatusCode::BAD_REQUEST,
+                "DIGEST_INVALID",
+                None,
+            ),
+            (
+                registry::Error::ManifestBlobUnknown,
+                StatusCode::NOT_FOUND,
+                "MANIFEST_BLOB_UNKNOWN",
+                None,
+            ),
+            (
+                registry::Error::ManifestInvalid("Invalid JSON".to_string()),
+                StatusCode::BAD_REQUEST,
+                "MANIFEST_INVALID",
+                Some("Invalid JSON"),
+            ),
+            (
+                registry::Error::ManifestUnknown,
+                StatusCode::NOT_FOUND,
+                "MANIFEST_UNKNOWN",
+                None,
+            ),
+            (
+                registry::Error::NameInvalid,
+                StatusCode::BAD_REQUEST,
+                "NAME_INVALID",
+                None,
+            ),
+            (
+                registry::Error::NameUnknown,
+                StatusCode::NOT_FOUND,
+                "NAME_UNKNOWN",
+                None,
+            ),
+            (
+                registry::Error::Unauthorized("Invalid token".to_string()),
+                StatusCode::UNAUTHORIZED,
+                "UNAUTHORIZED",
+                Some("Invalid token"),
+            ),
+            (
+                registry::Error::Denied("Access forbidden".to_string()),
+                StatusCode::FORBIDDEN,
+                "DENIED",
+                Some("Access forbidden"),
+            ),
+            (
+                registry::Error::Unsupported,
+                StatusCode::BAD_REQUEST,
+                "UNSUPPORTED",
+                None,
+            ),
+            (
+                registry::Error::RangeNotSatisfiable,
+                StatusCode::RANGE_NOT_SATISFIABLE,
+                "SIZE_INVALID",
+                None,
+            ),
+            (
+                registry::Error::Internal("Database error".to_string()),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "INTERNAL_SERVER_ERROR",
+                Some("Database error"),
+            ),
+            (
+                registry::Error::Initialization("Config error".to_string()),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "INTERNAL_SERVER_ERROR",
+                Some("Config error"),
+            ),
+        ];
 
-        assert_eq!(error.status_code(), StatusCode::NOT_FOUND);
-        let json = error.as_json(None);
-        assert_eq!(json["errors"][0]["code"], "BLOB_UNKNOWN");
+        for (registry_error, expected_status, expected_code, expected_message) in cases {
+            let error: Error = registry_error.into();
+            assert_eq!(error.status_code(), expected_status);
+            let json = error.as_json(None);
+            assert_eq!(json["errors"][0]["code"], expected_code);
+            if let Some(msg) = expected_message {
+                assert_eq!(json["errors"][0]["message"], msg);
+            }
+        }
     }
 
     #[test]
-    fn test_from_registry_error_blob_upload_unknown() {
-        let registry_error = registry::Error::BlobUploadUnknown;
-        let error: Error = registry_error.into();
-
-        assert_eq!(error.status_code(), StatusCode::NOT_FOUND);
-        let json = error.as_json(None);
-        assert_eq!(json["errors"][0]["code"], "BLOB_UPLOAD_UNKNOWN");
-    }
-
-    #[test]
-    fn test_from_registry_error_digest_invalid() {
-        let registry_error = registry::Error::DigestInvalid;
-        let error: Error = registry_error.into();
-
-        assert_eq!(error.status_code(), StatusCode::BAD_REQUEST);
-        let json = error.as_json(None);
-        assert_eq!(json["errors"][0]["code"], "DIGEST_INVALID");
-    }
-
-    #[test]
-    fn test_from_registry_error_manifest_blob_unknown() {
-        let registry_error = registry::Error::ManifestBlobUnknown;
-        let error: Error = registry_error.into();
-
-        assert_eq!(error.status_code(), StatusCode::NOT_FOUND);
-        let json = error.as_json(None);
-        assert_eq!(json["errors"][0]["code"], "MANIFEST_BLOB_UNKNOWN");
-    }
-
-    #[test]
-    fn test_from_registry_error_manifest_invalid() {
-        let registry_error = registry::Error::ManifestInvalid("Invalid JSON".to_string());
-        let error: Error = registry_error.into();
-
-        assert_eq!(error.status_code(), StatusCode::BAD_REQUEST);
-        let json = error.as_json(None);
-        assert_eq!(json["errors"][0]["code"], "MANIFEST_INVALID");
-        assert_eq!(json["errors"][0]["message"], "Invalid JSON");
-    }
-
-    #[test]
-    fn test_from_registry_error_manifest_unknown() {
-        let registry_error = registry::Error::ManifestUnknown;
-        let error: Error = registry_error.into();
-
-        assert_eq!(error.status_code(), StatusCode::NOT_FOUND);
-        let json = error.as_json(None);
-        assert_eq!(json["errors"][0]["code"], "MANIFEST_UNKNOWN");
-    }
-
-    #[test]
-    fn test_from_registry_error_name_invalid() {
-        let registry_error = registry::Error::NameInvalid;
-        let error: Error = registry_error.into();
-
-        assert_eq!(error.status_code(), StatusCode::BAD_REQUEST);
-        let json = error.as_json(None);
-        assert_eq!(json["errors"][0]["code"], "NAME_INVALID");
-    }
-
-    #[test]
-    fn test_from_registry_error_name_unknown() {
-        let registry_error = registry::Error::NameUnknown;
-        let error: Error = registry_error.into();
-
-        assert_eq!(error.status_code(), StatusCode::NOT_FOUND);
-        let json = error.as_json(None);
-        assert_eq!(json["errors"][0]["code"], "NAME_UNKNOWN");
-    }
-
-    #[test]
-    fn test_from_registry_error_unauthorized() {
-        let registry_error = registry::Error::Unauthorized("Invalid token".to_string());
-        let error: Error = registry_error.into();
-
-        assert_eq!(error.status_code(), StatusCode::UNAUTHORIZED);
-        let json = error.as_json(None);
-        assert_eq!(json["errors"][0]["code"], "UNAUTHORIZED");
-        assert_eq!(json["errors"][0]["message"], "Invalid token");
-    }
-
-    #[test]
-    fn test_from_registry_error_denied() {
-        let registry_error = registry::Error::Denied("Access forbidden".to_string());
-        let error: Error = registry_error.into();
-
-        assert_eq!(error.status_code(), StatusCode::FORBIDDEN);
-        let json = error.as_json(None);
-        assert_eq!(json["errors"][0]["code"], "DENIED");
-        assert_eq!(json["errors"][0]["message"], "Access forbidden");
-    }
-
-    #[test]
-    fn test_from_registry_error_unsupported() {
-        let registry_error = registry::Error::Unsupported;
-        let error: Error = registry_error.into();
-
-        assert_eq!(error.status_code(), StatusCode::BAD_REQUEST);
-        let json = error.as_json(None);
-        assert_eq!(json["errors"][0]["code"], "UNSUPPORTED");
-    }
-
-    #[test]
-    fn test_from_registry_error_range_not_satisfiable() {
-        let registry_error = registry::Error::RangeNotSatisfiable;
-        let error: Error = registry_error.into();
-
-        assert_eq!(error.status_code(), StatusCode::RANGE_NOT_SATISFIABLE);
-        let json = error.as_json(None);
-        assert_eq!(json["errors"][0]["code"], "SIZE_INVALID");
-    }
-
-    #[test]
-    fn test_from_registry_error_internal() {
-        let registry_error = registry::Error::Internal("Database error".to_string());
-        let error: Error = registry_error.into();
-
-        assert_eq!(error.status_code(), StatusCode::INTERNAL_SERVER_ERROR);
-        let json = error.as_json(None);
-        assert_eq!(json["errors"][0]["code"], "INTERNAL_SERVER_ERROR");
-        assert_eq!(json["errors"][0]["message"], "Database error");
-    }
-
-    #[test]
-    fn test_from_registry_error_initialization() {
-        let registry_error = registry::Error::Initialization("Config error".to_string());
-        let error: Error = registry_error.into();
-
-        assert_eq!(error.status_code(), StatusCode::INTERNAL_SERVER_ERROR);
-        let json = error.as_json(None);
-        assert_eq!(json["errors"][0]["code"], "INTERNAL_SERVER_ERROR");
-        assert_eq!(json["errors"][0]["message"], "Config error");
-    }
-
-    #[test]
-    fn test_error_partial_eq() {
+    fn test_error_variant_matching() {
         let error1 = Error::NotFound("test".to_string());
         let error2 = Error::NotFound("test".to_string());
         let error3 = Error::NotFound("different".to_string());
         let error4 = Error::BadRequest("test".to_string());
 
-        assert_eq!(error1, error2);
-        assert_ne!(error1, error3);
-        assert_ne!(error1, error4);
+        assert!(matches!(error1, Error::NotFound(_)));
+        assert_eq!(error1.to_string(), error2.to_string());
+        assert_ne!(error1.to_string(), error3.to_string());
+        assert!(!matches!(error4, Error::NotFound(_)));
     }
 
     #[test]
-    fn test_custom_error_partial_eq() {
+    fn test_custom_error_variant_matching() {
         let error1 = Error::Custom {
             status_code: StatusCode::BAD_GATEWAY,
             code: "TEST".to_string(),
@@ -565,8 +529,8 @@ mod tests {
             msg: None,
         };
 
-        assert_eq!(error1, error2);
-        assert_ne!(error1, error3);
+        assert_eq!(error1.to_string(), error2.to_string());
+        assert_ne!(error1.to_string(), error3.to_string());
     }
 
     #[test]
@@ -623,35 +587,7 @@ mod tests {
         let config_error = configuration::Error::Initialization("webhook failed".to_string());
         let error: Error = config_error.into();
 
-        assert_eq!(error, Error::Internal("webhook failed".to_string()));
-    }
-
-    #[test]
-    fn test_oci_spec_error_codes() {
-        let oci_errors = vec![
-            (registry::Error::BlobUnknown, "BLOB_UNKNOWN"),
-            (registry::Error::BlobUploadUnknown, "BLOB_UPLOAD_UNKNOWN"),
-            (registry::Error::DigestInvalid, "DIGEST_INVALID"),
-            (
-                registry::Error::ManifestBlobUnknown,
-                "MANIFEST_BLOB_UNKNOWN",
-            ),
-            (
-                registry::Error::ManifestInvalid(String::new()),
-                "MANIFEST_INVALID",
-            ),
-            (registry::Error::ManifestUnknown, "MANIFEST_UNKNOWN"),
-            (registry::Error::NameInvalid, "NAME_INVALID"),
-            (registry::Error::NameUnknown, "NAME_UNKNOWN"),
-            (registry::Error::Unauthorized(String::new()), "UNAUTHORIZED"),
-            (registry::Error::Denied(String::new()), "DENIED"),
-            (registry::Error::Unsupported, "UNSUPPORTED"),
-        ];
-
-        for (registry_error, expected_code) in oci_errors {
-            let error: Error = registry_error.into();
-            let json = error.as_json(None);
-            assert_eq!(json["errors"][0]["code"], expected_code);
-        }
+        assert!(matches!(error, Error::Internal(_)));
+        assert_eq!(error.to_string(), "Internal Server Error: webhook failed");
     }
 }

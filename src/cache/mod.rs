@@ -136,7 +136,7 @@ mod tests {
         ) -> Result<(), Error> {
             let mut storage = self.storage.lock().unwrap();
             if let Some(error) = &storage.store_error {
-                return Err(Error::Backend(error.clone()));
+                return Err(Error::Execution(error.clone()));
             }
             storage.data = Some(value.to_string());
             Ok(())
@@ -145,7 +145,7 @@ mod tests {
         async fn retrieve_value(&self, _key: &str) -> Result<Option<String>, Error> {
             let storage = self.storage.lock().unwrap();
             if let Some(error) = &storage.retrieve_error {
-                return Err(Error::Backend(error.clone()));
+                return Err(Error::Execution(error.clone()));
             }
             Ok(storage.data.clone())
         }

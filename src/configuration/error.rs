@@ -1,28 +1,19 @@
-use std::fmt;
-
-#[derive(Debug, PartialEq)]
+#[derive(Debug, thiserror::Error)]
 pub enum Error {
+    #[error("initialization error: {0}")]
     Initialization(String),
+    #[error("invalid configuration format: {0}")]
     InvalidFormat(String),
+    #[error("unable to read configuration: {0}")]
     NotReadable(String),
 }
 
-impl fmt::Display for Error {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match self {
-            Error::Initialization(err) => write!(f, "initialization error: {err}"),
-            Error::InvalidFormat(err) => write!(f, "invalid configuration format: {err}"),
-            Error::NotReadable(err) => write!(f, "unable to read configuration: {err}"),
-        }
-    }
-}
-
-impl std::error::Error for Error {}
-
+// `notify::Error` is wrapped with a "Watcher error: " prefix to preserve context,
+// so a bare `#[from]` variant is not used here — the message-building `From` impl
+// is kept instead.
 impl From<notify::Error> for Error {
     fn from(err: notify::Error) -> Self {
-        let msg = format!("Watcher error: {err}");
-        Error::NotReadable(msg)
+        Error::NotReadable(format!("Watcher error: {err}"))
     }
 }
 
@@ -57,9 +48,6 @@ mod tests {
             format!("{error}"),
             "unable to read configuration: Watcher error: Generic error"
         );
-        assert_eq!(
-            error,
-            Error::NotReadable("Watcher error: Generic error".to_string())
-        );
+        assert!(matches!(error, Error::NotReadable(_)));
     }
 }
