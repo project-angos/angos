@@ -22,8 +22,6 @@ mod tests;
 use endpoint::WebhookEndpoint;
 #[cfg(test)]
 pub use endpoint::matches_event;
-#[cfg(test)]
-pub use signature::compute_signature;
 use transport::send_with_retries;
 
 use crate::{

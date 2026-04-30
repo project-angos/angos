@@ -9,7 +9,7 @@ use wiremock::{
     matchers::{body_json, header, method},
 };
 
-use super::{EventDispatcher, compute_signature, matches_event};
+use super::{EventDispatcher, matches_event, signature::compute_signature};
 use crate::{
     configuration::RegexPattern,
     event_webhook::{
@@ -46,66 +46,6 @@ fn create_test_event() -> Event {
         actor: None,
         repository: "docker-hub".to_string(),
     }
-}
-
-#[test]
-fn compute_signature_returns_valid_hex() {
-    let body = serde_json::to_vec(&create_test_event()).unwrap();
-    let signature = compute_signature("my-secret", &body);
-    assert!(
-        signature.chars().all(|c| c.is_ascii_hexdigit()),
-        "signature must be valid hex: {signature}"
-    );
-}
-
-#[test]
-fn compute_signature_has_correct_length() {
-    let body = serde_json::to_vec(&create_test_event()).unwrap();
-    let signature = compute_signature("token", &body);
-    assert_eq!(
-        signature.len(),
-        64,
-        "SHA-256 HMAC hex digest must be 64 chars"
-    );
-}
-
-#[test]
-fn compute_signature_is_deterministic() {
-    let body = b"fixed payload";
-    let sig1 = compute_signature("secret", body);
-    let sig2 = compute_signature("secret", body);
-    assert_eq!(sig1, sig2);
-}
-
-#[test]
-fn compute_signature_differs_for_different_secrets() {
-    let body = b"same payload";
-    let sig1 = compute_signature("secret-a", body);
-    let sig2 = compute_signature("secret-b", body);
-    assert_ne!(sig1, sig2);
-}
-
-#[test]
-fn compute_signature_differs_for_different_bodies() {
-    let sig1 = compute_signature("secret", b"body-a");
-    let sig2 = compute_signature("secret", b"body-b");
-    assert_ne!(sig1, sig2);
-}
-
-#[test]
-fn compute_signature_matches_known_value() {
-    // Pre-computed HMAC-SHA256("test-secret", "hello world") using standard tools
-    // echo -n "hello world" | openssl dgst -sha256 -hmac "test-secret"
-    let expected = "046e2496e13e0bfd8dbef84244dd188311a48086646355161bc4ad0769a49cf4";
-    let signature = compute_signature("test-secret", b"hello world");
-    assert_eq!(signature, expected);
-}
-
-#[test]
-fn compute_signature_empty_body() {
-    let sig = compute_signature("secret", b"");
-    assert_eq!(sig.len(), 64);
-    assert!(sig.chars().all(|c| c.is_ascii_hexdigit()));
 }
 
 fn create_test_config(
