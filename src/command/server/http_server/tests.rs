@@ -573,3 +573,95 @@ fn current_trace_id_returns_hex_id_with_otel_layer() {
         "trace ID must be lowercase hex, got {trace_id:?}"
     );
 }
+
+#[test]
+fn current_trace_id_returns_none_for_disabled_span() {
+    // tracing::Span::none() creates a permanently-disabled (no-op) span.
+    // Without an entered span there is no OTel bridge context, so
+    // current_trace_id must return None regardless of the subscriber.
+    let provider = SdkTracerProvider::builder()
+        .with_sampler(Sampler::AlwaysOn)
+        .build();
+    let tracer = provider.tracer("angos-test");
+    let subscriber =
+        tracing_subscriber::registry().with(tracing_opentelemetry::layer().with_tracer(tracer));
+    let trace_id = tracing::subscriber::with_default(subscriber, || {
+        let span = tracing::Span::none();
+        current_trace_id(&span)
+    });
+    assert_eq!(
+        trace_id, None,
+        "disabled no-op span must not produce a trace ID"
+    );
+}
+
+#[test]
+fn current_trace_id_child_span_inherits_parent_trace_id() {
+    // The reason current_trace_id exists: requests log a single trace ID across
+    // their entire span tree. A child span entered while the parent is active
+    // must report the parent's trace ID, not a fresh one.
+    let provider = SdkTracerProvider::builder()
+        .with_sampler(Sampler::AlwaysOn)
+        .build();
+    let tracer = provider.tracer("angos-test");
+    let subscriber =
+        tracing_subscriber::registry().with(tracing_opentelemetry::layer().with_tracer(tracer));
+    let (parent_id, child_id) = tracing::subscriber::with_default(subscriber, || {
+        let parent = tracing::info_span!("parent");
+        let _enter = parent.enter();
+        let parent_id = current_trace_id(&parent);
+        let child = tracing::info_span!("child");
+        let child_id = current_trace_id(&child);
+        (parent_id, child_id)
+    });
+    let parent_id = parent_id.expect("parent span must produce a trace ID");
+    let child_id = child_id.expect("child span must inherit a trace ID");
+    assert_eq!(
+        parent_id, child_id,
+        "child span entered under an active parent must inherit its trace ID"
+    );
+}
+
+#[test]
+fn inject_peer_certificate_skips_extension_when_cert_is_none() {
+    let mut request = Request::builder().uri("/").body(()).unwrap();
+    inject_peer_certificate(&mut request, None);
+    assert!(request.extensions().get::<PeerCertificate>().is_none());
+}
+
+#[test]
+fn inject_peer_certificate_inserts_extension_for_valid_cert() {
+    let cert = b"-----BEGIN CERTIFICATE-----\nMIIBIjANBgkq\n-----END CERTIFICATE-----\n".as_slice();
+    let mut request = Request::builder().uri("/").body(()).unwrap();
+    inject_peer_certificate(&mut request, Some(cert));
+    let stored = request
+        .extensions()
+        .get::<PeerCertificate>()
+        .expect("PeerCertificate extension must be present");
+    assert_eq!(stored.0.as_ref(), cert);
+}
+
+#[test]
+fn inject_peer_certificate_inserts_extension_for_empty_cert() {
+    // Empty Some(data) is still Some, so the extension is inserted.
+    // Validation happens later in the mTLS authenticator, not here.
+    let mut request = Request::builder().uri("/").body(()).unwrap();
+    inject_peer_certificate(&mut request, Some(&[]));
+    let stored = request
+        .extensions()
+        .get::<PeerCertificate>()
+        .expect("PeerCertificate extension must be present even for empty cert");
+    assert!(stored.0.as_ref().is_empty());
+}
+
+#[test]
+fn inject_peer_certificate_last_write_wins_when_called_twice() {
+    // Extensions::insert replaces any existing value of the same type.
+    let first = b"first-cert-data".as_slice();
+    let second = b"second-cert-data".as_slice();
+    let mut request = Request::builder().uri("/").body(()).unwrap();
+    inject_peer_certificate(&mut request, Some(first));
+    inject_peer_certificate(&mut request, Some(second));
+    let stored = request.extensions().get::<PeerCertificate>().unwrap();
+    assert_eq!(stored.0.as_ref(), second);
+}

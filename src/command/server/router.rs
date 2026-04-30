@@ -828,6 +828,38 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_pagination_non_numeric_n() {
+        // Non-numeric value for `n` fails deserialization; unwrap_or_default yields (None, None).
+        assert_eq!(parse_pagination(Some("n=abc")), (None, None));
+    }
+
+    #[test]
+    fn test_parse_pagination_n_zero() {
+        // Zero is a valid u16; it should be preserved.
+        assert_eq!(parse_pagination(Some("n=0")), (Some(0), None));
+    }
+
+    #[test]
+    fn test_parse_pagination_n_exceeds_u16_max() {
+        // 65536 overflows u16; deserialization fails and unwrap_or_default yields (None, None).
+        assert_eq!(parse_pagination(Some("n=65536")), (None, None));
+    }
+
+    #[test]
+    fn test_parse_pagination_n_equals_only() {
+        // `n=` with no value is an empty string, which fails u16 deserialization.
+        assert_eq!(parse_pagination(Some("n=")), (None, None));
+    }
+
+    #[test]
+    fn test_parse_pagination_last_url_encoded_special_chars() {
+        // `last` may contain URL-encoded characters; serde_urlencoded decodes them.
+        let (n, last) = parse_pagination(Some("last=foo%2Fbar%3Abaz"));
+        assert!(n.is_none());
+        assert_eq!(last, Some("foo/bar:baz".to_string()));
+    }
+
+    #[test]
     fn test_try_parse_uploads_post_method() {
         let method = Method::POST;
         let path = "myrepo/app/blobs/uploads";
@@ -847,6 +879,50 @@ mod tests {
         let path = "myrepo/app/blobs/uploads";
         let route = try_parse_uploads(&method, path, None);
         assert!(route.is_none());
+    }
+
+    #[test]
+    fn test_try_parse_uploads_no_slash() {
+        let method = Method::POST;
+
+        // No-slash variant: /v2/foo/blobs/uploads → StartUpload for namespace "foo".
+        let route = try_parse_uploads(&method, "foo/blobs/uploads", None);
+        assert!(
+            matches!(route, Some(Action::StartUpload { ref namespace, digest: None }) if namespace == "foo"),
+            "no-slash variant must yield StartUpload with correct namespace"
+        );
+
+        // With-slash variant: /v2/foo/blobs/uploads/ → same result.
+        let route = try_parse_uploads(&method, "foo/blobs/uploads/", None);
+        assert!(
+            matches!(route, Some(Action::StartUpload { ref namespace, digest: None }) if namespace == "foo"),
+            "with-slash variant must yield StartUpload with correct namespace"
+        );
+
+        // Nested namespace without slash.
+        let route = try_parse_uploads(&method, "org/team/blobs/uploads", None);
+        assert!(
+            matches!(route, Some(Action::StartUpload { ref namespace, .. }) if namespace == "org/team"),
+            "nested namespace without slash must parse correctly"
+        );
+
+        // Invalid namespace: empty string before the suffix.
+        let route = try_parse_uploads(&method, "blobs/uploads", None);
+        assert!(route.is_none(), "empty namespace must not yield a route");
+
+        // Invalid namespace: contains uppercase letter.
+        let route = try_parse_uploads(&method, "MyRepo/blobs/uploads", None);
+        assert!(
+            route.is_none(),
+            "uppercase namespace must not yield a route"
+        );
+
+        // Invalid namespace: contains a space (invalid character).
+        let route = try_parse_uploads(&method, "bad ns/blobs/uploads", None);
+        assert!(
+            route.is_none(),
+            "namespace with space must not yield a route"
+        );
     }
 
     #[test]

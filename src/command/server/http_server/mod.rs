@@ -270,7 +270,7 @@ fn handle_unknown_route(parts: &Parts) -> Result<Response<ResponseBody>, Error> 
 
 /// Attaches the peer TLS certificate (if present) as a request extension so
 /// downstream authenticators can inspect it.
-fn inject_peer_certificate(request: &mut Request<Incoming>, cert_data: Option<&[u8]>) {
+fn inject_peer_certificate<B>(request: &mut Request<B>, cert_data: Option<&[u8]>) {
     if let Some(cert_data) = cert_data {
         let peer_certificate = PeerCertificate(Arc::new(cert_data.to_vec()));
         request.extensions_mut().insert(peer_certificate);
@@ -540,3 +540,6 @@ pub fn error_to_response(error: &Error, request_id: Option<&String>) -> Response
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod event_emission_tests;
