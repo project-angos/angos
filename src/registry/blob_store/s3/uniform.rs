@@ -103,7 +103,7 @@ impl Backend {
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         let mut uploaded_size: u64 = part_list.iter().map(|p| p.size as u64).sum();
         #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-        let mut uploaded_parts = (part_list.len() + 1) as i32;
+        let mut uploaded_parts = next_part_number(part_list.len());
 
         let chunk = self.load_staged_chunk(name, uuid, uploaded_size).await?;
         let hasher = self.load_hasher(name, uuid, uploaded_size).await?;
@@ -231,7 +231,7 @@ impl Backend {
 
         if let Ok(staged_size) = self.store.object_size(&source_key).await {
             #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-            let part_number = (parts.len() + 1) as i32;
+            let part_number = next_part_number(parts.len());
             let e_tag = self
                 .store
                 .upload_part_copy(&source_key, &key, &upload_id, part_number, None)
@@ -287,9 +287,18 @@ fn should_flush(chunk_len: u64, multipart_part_size: u64) -> bool {
     chunk_len >= multipart_part_size
 }
 
+/// Returns the 1-based part number for the next part to upload, given the
+/// number of parts already completed.  S3 part numbers start at 1.
+#[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+fn next_part_number(completed_parts: usize) -> i32 {
+    (completed_parts + 1) as i32
+}
+
 #[cfg(test)]
 mod tests {
-    use super::should_flush;
+    use super::{next_part_number, should_flush};
+
+    // --- should_flush ---
 
     #[test]
     fn flushes_when_chunk_meets_part_size() {
@@ -309,5 +318,37 @@ mod tests {
     #[test]
     fn stages_empty_chunk() {
         assert!(!should_flush(0, 5 * 1024 * 1024));
+    }
+
+    #[test]
+    fn flushes_when_part_size_is_one_and_chunk_is_nonempty() {
+        assert!(should_flush(1, 1));
+    }
+
+    #[test]
+    fn stages_when_part_size_is_one_and_chunk_is_empty() {
+        assert!(!should_flush(0, 1));
+    }
+
+    #[test]
+    fn flushes_when_chunk_is_max_u64() {
+        assert!(should_flush(u64::MAX, 5 * 1024 * 1024));
+    }
+
+    // --- next_part_number ---
+
+    #[test]
+    fn first_part_when_no_parts_uploaded() {
+        assert_eq!(next_part_number(0), 1);
+    }
+
+    #[test]
+    fn second_part_after_one_uploaded() {
+        assert_eq!(next_part_number(1), 2);
+    }
+
+    #[test]
+    fn part_number_increments_with_part_count() {
+        assert_eq!(next_part_number(9), 10);
     }
 }

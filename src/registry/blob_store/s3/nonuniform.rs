@@ -220,13 +220,13 @@ impl Backend {
             self.resolve_nonuniform_state(name, uuid).await?;
 
         #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-        let next_part_number = (part_list.len() + 1) as i32;
+        let next_part_number = next_part_number(part_list.len());
 
         let pending_path = path_builder::upload_patch_pending_path(name, uuid);
         let available = pending_size + content_length;
         let pending_bytes = self.load_pending_bytes(&pending_path, pending_size).await;
 
-        if available >= MIN_PART_SIZE {
+        if should_flush_pending(pending_size, content_length, MIN_PART_SIZE) {
             self.flush_pending_as_part(
                 name,
                 uuid,
@@ -331,7 +331,7 @@ impl Backend {
         if pending_size > 0 {
             let pending_data = self.store.get_object_body(&pending_path, None).await?;
             #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-            let next_part = (parts.len() + 1) as i32;
+            let next_part = next_part_number(parts.len());
             let e_tag = self
                 .store
                 .upload_part(
@@ -368,5 +368,76 @@ impl Backend {
         self.store.delete_prefix(&container).await?;
 
         Ok(digest)
+    }
+}
+
+/// Returns `true` when the combined pending and incoming bytes meet or exceed
+/// `min_part_size`, meaning the data can be flushed immediately as a multipart
+/// part rather than accumulated in the pending buffer.
+fn should_flush_pending(pending_size: u64, content_length: u64, min_part_size: u64) -> bool {
+    pending_size + content_length >= min_part_size
+}
+
+/// Returns the 1-based S3 part number for the next part to upload, given the
+/// number of parts already completed.
+#[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+fn next_part_number(completed_parts: usize) -> i32 {
+    (completed_parts + 1) as i32
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{next_part_number, should_flush_pending};
+
+    const MIN: u64 = 5 * 1024 * 1024;
+
+    // --- should_flush_pending ---
+
+    #[test]
+    fn flushes_when_combined_meets_min_part_size() {
+        assert!(should_flush_pending(0, MIN, MIN));
+    }
+
+    #[test]
+    fn flushes_when_combined_exceeds_min_part_size() {
+        assert!(should_flush_pending(1, MIN, MIN));
+    }
+
+    #[test]
+    fn buffers_when_combined_is_below_min_part_size() {
+        assert!(!should_flush_pending(0, MIN - 1, MIN));
+    }
+
+    #[test]
+    fn flushes_when_pending_alone_meets_min_part_size() {
+        assert!(should_flush_pending(MIN, 0, MIN));
+    }
+
+    #[test]
+    fn buffers_empty_content_with_zero_pending() {
+        assert!(!should_flush_pending(0, 0, MIN));
+    }
+
+    #[test]
+    fn flushes_when_pending_and_content_together_reach_threshold() {
+        let half = MIN / 2;
+        assert!(should_flush_pending(half, MIN - half, MIN));
+    }
+
+    // --- next_part_number ---
+
+    #[test]
+    fn first_part_when_no_parts_uploaded() {
+        assert_eq!(next_part_number(0), 1);
+    }
+
+    #[test]
+    fn second_part_after_one_uploaded() {
+        assert_eq!(next_part_number(1), 2);
+    }
+
+    #[test]
+    fn part_number_increments_with_part_count() {
+        assert_eq!(next_part_number(9), 10);
     }
 }

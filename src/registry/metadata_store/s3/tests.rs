@@ -1,4 +1,5 @@
 use std::{
+    io::ErrorKind,
     str::FromStr,
     sync::Arc,
     time::{Duration, Instant},
@@ -1089,5 +1090,97 @@ async fn test_probe_conditional_capabilities() {
     assert!(
         !caps.delete_if_match,
         "MinIO does not support conditional delete (ignores If-Match on DeleteObject)"
+    );
+}
+
+/// After a successful probe the temporary object must not remain in the bucket.
+/// Uses a deterministic probe key so the cleanup can be confirmed via a direct
+/// `read_with_etag` call without having to list the entire bucket.
+#[tokio::test]
+async fn test_probe_cleanup_removes_probe_object() {
+    let config = test_config();
+    let store = data_store::s3::Backend::new(&data_store::s3::BackendConfig {
+        access_key_id: config.access_key_id.clone(),
+        secret_key: config.secret_key.clone(),
+        endpoint: config.endpoint.clone(),
+        bucket: config.bucket.clone(),
+        region: config.region.clone(),
+        key_prefix: config.key_prefix.clone(),
+        ..Default::default()
+    })
+    .unwrap();
+
+    let probe_key = format!("_angos_probe_cleanup_{}", uuid::Uuid::new_v4());
+
+    let result = super::probe::probe_conditional_capabilities_with_key(&store, &probe_key).await;
+    assert!(
+        result.is_ok(),
+        "Probe should succeed against MinIO: {result:?}"
+    );
+
+    // The probe object must be absent after the call returns.
+    let read_result = store.read_with_etag(&probe_key).await;
+    assert!(
+        matches!(
+            read_result,
+            Err(ref e) if e.kind() == ErrorKind::NotFound
+        ),
+        "Probe object '{probe_key}' should have been deleted after probe, got: {read_result:?}"
+    );
+}
+
+/// Running the probe twice against the same bucket must succeed both times.
+/// This verifies that successful cleanup in the first run does not leave state
+/// that would cause the second run to fail (e.g. a leftover object that
+/// triggers an unexpected If-None-Match success on a fresh key).
+#[tokio::test]
+async fn test_probe_idempotent_back_to_back() {
+    let config = test_config();
+    let store = data_store::s3::Backend::new(&data_store::s3::BackendConfig {
+        access_key_id: config.access_key_id.clone(),
+        secret_key: config.secret_key.clone(),
+        endpoint: config.endpoint.clone(),
+        bucket: config.bucket.clone(),
+        region: config.region.clone(),
+        key_prefix: config.key_prefix.clone(),
+        ..Default::default()
+    })
+    .unwrap();
+
+    let first = super::probe_conditional_capabilities(&store).await;
+    assert!(first.is_ok(), "First probe should succeed: {first:?}");
+
+    let second = super::probe_conditional_capabilities(&store).await;
+    assert!(second.is_ok(), "Second probe should succeed: {second:?}");
+
+    // Both runs must report identical capabilities.
+    assert_eq!(
+        first.unwrap(),
+        second.unwrap(),
+        "Probe must return consistent capabilities across successive invocations"
+    );
+}
+
+/// When the configured bucket does not exist the probe must return an error
+/// rather than panicking or hanging, exercising the early-return branch where
+/// probe-object creation itself fails.
+#[tokio::test]
+async fn test_probe_with_nonexistent_bucket_returns_err() {
+    let config = test_config();
+    let store = data_store::s3::Backend::new(&data_store::s3::BackendConfig {
+        access_key_id: config.access_key_id.clone(),
+        secret_key: config.secret_key.clone(),
+        endpoint: config.endpoint.clone(),
+        bucket: "angos-probe-nonexistent-bucket-xyzzy".to_string(),
+        region: config.region.clone(),
+        key_prefix: config.key_prefix.clone(),
+        ..Default::default()
+    })
+    .unwrap();
+
+    let result = super::probe_conditional_capabilities(&store).await;
+    assert!(
+        result.is_err(),
+        "Probe against a non-existent bucket must return Err, got: {result:?}"
     );
 }

@@ -1,12 +1,13 @@
 use std::io::Cursor;
 
 use bytesize::ByteSize;
+use chrono::Duration;
 use sha2::{Digest as ShaDigest, Sha256};
 use uuid::Uuid;
 
 use crate::registry::{
     blob_store::{
-        self,
+        self, MultipartCleanup,
         sha256_ext::Sha256Ext,
         tests::{
             test_build_blob_reader_returns_size,
@@ -422,4 +423,106 @@ async fn test_uniform_round_trip_integrity() {
         blob_data, expected_content,
         "Round-tripped blob content must exactly match the original upload"
     );
+}
+
+/// Creates a raw S3 multipart upload without a `startedat` marker, making it a
+/// genuine orphan from the registry's perspective.  With a zero timeout every
+/// upload satisfies `age >= 0`, so `cleanup_orphan_multipart_uploads` must abort
+/// it and return a count of at least 1.
+#[tokio::test]
+async fn test_cleanup_orphan_multipart_uploads_aborts_old_uploads() {
+    let t = S3RegistryTestCase::new();
+    let backend = t.blob_store();
+
+    // Build a key that parses correctly as an upload path so the orphan check
+    // proceeds past `parse_upload_key` — but deliberately omit the `startedat`
+    // object so the registry treats it as a leaked upload.
+    let uuid = Uuid::new_v4().to_string();
+    let upload_key = path_builder::upload_path("ns", &uuid);
+
+    backend
+        .store
+        .create_multipart_upload(&upload_key)
+        .await
+        .unwrap();
+
+    // Verify the upload is visible before cleanup.
+    let (uploads_before, _, _) = backend
+        .store
+        .list_multipart_uploads(None, None, None)
+        .await
+        .unwrap();
+    assert!(
+        uploads_before.iter().any(|(k, _, _)| k == &upload_key),
+        "orphan upload should appear in list before cleanup"
+    );
+
+    // A zero timeout means every upload, no matter how fresh, satisfies `age >= 0`.
+    let aborted = backend
+        .cleanup_orphan_multipart_uploads(Duration::zero(), false)
+        .await
+        .unwrap();
+    assert!(
+        aborted >= 1,
+        "at least the orphan upload must have been aborted"
+    );
+
+    // The upload must no longer appear in the listing.
+    let (uploads_after, _, _) = backend
+        .store
+        .list_multipart_uploads(None, None, None)
+        .await
+        .unwrap();
+    assert!(
+        !uploads_after.iter().any(|(k, _, _)| k == &upload_key),
+        "orphan upload must be gone from the list after cleanup"
+    );
+}
+
+/// Dry-run mode must count the orphan but must not abort it — the upload must
+/// still appear in the listing after the cleanup call returns.
+#[tokio::test]
+async fn test_cleanup_orphan_multipart_uploads_dry_run_does_not_abort() {
+    let t = S3RegistryTestCase::new();
+    let backend = t.blob_store();
+
+    let uuid = Uuid::new_v4().to_string();
+    let upload_key = path_builder::upload_path("ns-dry", &uuid);
+
+    backend
+        .store
+        .create_multipart_upload(&upload_key)
+        .await
+        .unwrap();
+
+    // Dry-run with zero timeout: should count but not abort.
+    let counted = backend
+        .cleanup_orphan_multipart_uploads(Duration::zero(), true)
+        .await
+        .unwrap();
+    assert!(counted >= 1, "dry-run should still count the orphan upload");
+
+    // The upload must still exist because dry-run must not modify state.
+    let (uploads_after, _, _) = backend
+        .store
+        .list_multipart_uploads(None, None, None)
+        .await
+        .unwrap();
+    assert!(
+        uploads_after.iter().any(|(k, _, _)| k == &upload_key),
+        "dry-run must not abort the upload; it must still appear in the listing"
+    );
+
+    // Clean up the lingering multipart upload so MinIO stays tidy.
+    let (pending, _, _) = backend
+        .store
+        .list_multipart_uploads(None, None, None)
+        .await
+        .unwrap();
+    for (k, id, _) in pending.into_iter().filter(|(k, _, _)| k == &upload_key) {
+        let store = backend.store.clone();
+        tokio::spawn(async move {
+            let _ = store.abort_multipart_upload(&k, &id).await;
+        });
+    }
 }
