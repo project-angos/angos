@@ -33,80 +33,56 @@ pub enum Error {
     },
 }
 
+fn oci_error(status_code: StatusCode, code: &'static str, msg: Option<String>) -> Error {
+    Error::Custom {
+        status_code,
+        code: code.to_string(),
+        msg,
+    }
+}
+
 impl From<registry::Error> for Error {
     fn from(error: registry::Error) -> Self {
         match error {
             registry::Error::Initialization(msg) => Error::Initialization(msg),
-            registry::Error::BlobUnknown => Error::Custom {
-                status_code: StatusCode::NOT_FOUND,
-                code: "BLOB_UNKNOWN".to_string(),
-                msg: None,
-            },
-            registry::Error::BlobUploadUnknown => Error::Custom {
-                status_code: StatusCode::NOT_FOUND,
-                code: "BLOB_UPLOAD_UNKNOWN".to_string(),
-                msg: None,
-            },
-            registry::Error::DigestInvalid => Error::Custom {
-                status_code: StatusCode::BAD_REQUEST,
-                code: "DIGEST_INVALID".to_string(),
-                msg: None,
-            },
-            registry::Error::ManifestBlobUnknown => Error::Custom {
-                status_code: StatusCode::NOT_FOUND,
-                code: "MANIFEST_BLOB_UNKNOWN".to_string(),
-                msg: None,
-            },
-            registry::Error::ManifestInvalid(msg) => Error::Custom {
-                status_code: StatusCode::BAD_REQUEST,
-                code: "MANIFEST_INVALID".to_string(),
-                msg: Some(msg),
-            },
-            registry::Error::ManifestUnknown => Error::Custom {
-                status_code: StatusCode::NOT_FOUND,
-                code: "MANIFEST_UNKNOWN".to_string(),
-                msg: None,
-            },
-            registry::Error::NameInvalid => Error::Custom {
-                status_code: StatusCode::BAD_REQUEST,
-                code: "NAME_INVALID".to_string(),
-                msg: None,
-            },
-            registry::Error::NameUnknown => Error::Custom {
-                status_code: StatusCode::NOT_FOUND,
-                code: "NAME_UNKNOWN".to_string(),
-                msg: None,
-            },
-            registry::Error::Unauthorized(msg) => Error::Custom {
-                status_code: StatusCode::UNAUTHORIZED,
-                code: "UNAUTHORIZED".to_string(),
-                msg: Some(msg),
-            },
-            registry::Error::Denied(msg) => Error::Custom {
-                status_code: StatusCode::FORBIDDEN,
-                code: "DENIED".to_string(),
-                msg: Some(msg),
-            },
-            registry::Error::Unsupported => Error::Custom {
-                status_code: StatusCode::BAD_REQUEST,
-                code: "UNSUPPORTED".to_string(),
-                msg: None,
-            },
-            registry::Error::RangeNotSatisfiable => Error::Custom {
-                status_code: StatusCode::RANGE_NOT_SATISFIABLE,
-                code: "SIZE_INVALID".to_string(),
-                msg: None,
-            },
-            registry::Error::Internal(msg) => Error::Custom {
-                status_code: StatusCode::INTERNAL_SERVER_ERROR,
-                code: "INTERNAL_SERVER_ERROR".to_string(),
-                msg: Some(msg),
-            },
-            _ => Error::Custom {
-                status_code: StatusCode::INTERNAL_SERVER_ERROR,
-                code: "INTERNAL_SERVER_ERROR".to_string(),
-                msg: Some(error.to_string()),
-            },
+            registry::Error::BlobUnknown => oci_error(StatusCode::NOT_FOUND, "BLOB_UNKNOWN", None),
+            registry::Error::BlobUploadUnknown => {
+                oci_error(StatusCode::NOT_FOUND, "BLOB_UPLOAD_UNKNOWN", None)
+            }
+            registry::Error::DigestInvalid => {
+                oci_error(StatusCode::BAD_REQUEST, "DIGEST_INVALID", None)
+            }
+            registry::Error::ManifestBlobUnknown => {
+                oci_error(StatusCode::NOT_FOUND, "MANIFEST_BLOB_UNKNOWN", None)
+            }
+            registry::Error::ManifestInvalid(msg) => {
+                oci_error(StatusCode::BAD_REQUEST, "MANIFEST_INVALID", Some(msg))
+            }
+            registry::Error::ManifestUnknown => {
+                oci_error(StatusCode::NOT_FOUND, "MANIFEST_UNKNOWN", None)
+            }
+            registry::Error::NameInvalid => {
+                oci_error(StatusCode::BAD_REQUEST, "NAME_INVALID", None)
+            }
+            registry::Error::NameUnknown => oci_error(StatusCode::NOT_FOUND, "NAME_UNKNOWN", None),
+            registry::Error::Unauthorized(msg) => {
+                oci_error(StatusCode::UNAUTHORIZED, "UNAUTHORIZED", Some(msg))
+            }
+            registry::Error::Denied(msg) => oci_error(StatusCode::FORBIDDEN, "DENIED", Some(msg)),
+            registry::Error::Unsupported => oci_error(StatusCode::BAD_REQUEST, "UNSUPPORTED", None),
+            registry::Error::RangeNotSatisfiable => {
+                oci_error(StatusCode::RANGE_NOT_SATISFIABLE, "SIZE_INVALID", None)
+            }
+            registry::Error::Internal(msg) => oci_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "INTERNAL_SERVER_ERROR",
+                Some(msg),
+            ),
+            _ => oci_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "INTERNAL_SERVER_ERROR",
+                Some(error.to_string()),
+            ),
         }
     }
 }
