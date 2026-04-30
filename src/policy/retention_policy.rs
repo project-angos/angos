@@ -22,12 +22,13 @@
 //! - `top_pushed(n)`: Check if tag is in top N most recently pushed
 //! - `top_pulled(n)`: Check if tag is in top N most recently pulled
 
+use std::sync::Arc;
+
 use cel_interpreter::{Context, Value};
-use chrono::Utc;
 use serde::{Deserialize, Serialize, Serializer};
 use tracing::{debug, warn};
 
-use super::{CelRule, Error};
+use super::{CelRule, Error, clock::Clock};
 
 /// Configuration for retention policies.
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -76,15 +77,17 @@ pub struct ManifestImage {
 /// Rules are pre-compiled at configuration time for better performance.
 pub struct RetentionPolicy {
     rules: Vec<CelRule>,
+    clock: Arc<dyn Clock>,
 }
 
 impl RetentionPolicy {
     /// Creates a new retention policy from configuration.
     ///
     /// Rules are already compiled; this constructor is infallible.
-    pub fn new(config: &RetentionPolicyConfig) -> Self {
+    pub fn new(config: &RetentionPolicyConfig, clock: Arc<dyn Clock>) -> Self {
         Self {
             rules: config.rules.clone(),
+            clock,
         }
     }
 
@@ -130,7 +133,7 @@ impl RetentionPolicy {
             return Ok(true);
         }
 
-        let context = Self::build_context(manifest, last_pushed, last_pulled)?;
+        let context = self.build_context(manifest, last_pushed, last_pulled)?;
 
         for (index, rule) in self.rules.iter().enumerate() {
             let rule_index = index + 1;
@@ -161,6 +164,7 @@ impl RetentionPolicy {
     }
 
     fn build_context<'a>(
+        &self,
         manifest: &'a ManifestImage,
         last_pushed: &'a [String],
         last_pulled: &'a [String],
@@ -171,7 +175,8 @@ impl RetentionPolicy {
             .add_variable("image", manifest)
             .map_err(|e| Error::Evaluation(e.to_string()))?;
 
-        context.add_function("now", now);
+        let clock_for_now = self.clock.clone();
+        context.add_function("now", move || clock_for_now.now().timestamp());
         context.add_function("days", days);
         context.add_function("hours", hours);
         context.add_function("minutes", minutes);
@@ -199,10 +204,6 @@ impl RetentionPolicy {
     }
 }
 
-fn now() -> i64 {
-    Utc::now().timestamp()
-}
-
 fn days(d: i64) -> i64 {
     d * 86400
 }
@@ -217,17 +218,42 @@ fn minutes(m: i64) -> i64 {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use chrono::{DateTime, TimeZone, Utc};
+
+    use super::{super::clock::SystemClock, *};
 
     fn rule(s: &str) -> CelRule {
         CelRule::compile(s).unwrap()
     }
 
+    fn system_clock() -> Arc<dyn Clock> {
+        Arc::new(SystemClock)
+    }
+
+    struct FixedClock(DateTime<Utc>);
+
+    impl Clock for FixedClock {
+        fn now(&self) -> DateTime<Utc> {
+            self.0
+        }
+    }
+
+    fn fixed_clock(dt: DateTime<Utc>) -> Arc<dyn Clock> {
+        Arc::new(FixedClock(dt))
+    }
+
+    fn fixed_now() -> DateTime<Utc> {
+        Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap()
+    }
+
     #[test]
     fn test_top_pushed_in_top_n() {
-        let policy = RetentionPolicy::new(&RetentionPolicyConfig {
-            rules: vec![rule("top_pushed(3)")],
-        });
+        let policy = RetentionPolicy::new(
+            &RetentionPolicyConfig {
+                rules: vec![rule("top_pushed(3)")],
+            },
+            system_clock(),
+        );
 
         let manifest = ManifestImage {
             tag: Some("v2".to_string()),
@@ -240,9 +266,12 @@ mod tests {
 
     #[test]
     fn test_top_pushed_not_in_top_n() {
-        let policy = RetentionPolicy::new(&RetentionPolicyConfig {
-            rules: vec![rule("top_pushed(2)")],
-        });
+        let policy = RetentionPolicy::new(
+            &RetentionPolicyConfig {
+                rules: vec![rule("top_pushed(2)")],
+            },
+            system_clock(),
+        );
 
         let manifest = ManifestImage {
             tag: Some("v1".to_string()),
@@ -255,9 +284,12 @@ mod tests {
 
     #[test]
     fn test_top_pushed_orphan_manifest() {
-        let policy = RetentionPolicy::new(&RetentionPolicyConfig {
-            rules: vec![rule("top_pushed(10)")],
-        });
+        let policy = RetentionPolicy::new(
+            &RetentionPolicyConfig {
+                rules: vec![rule("top_pushed(10)")],
+            },
+            system_clock(),
+        );
 
         let manifest = ManifestImage {
             tag: None,
@@ -270,9 +302,12 @@ mod tests {
 
     #[test]
     fn test_top_pulled_in_top_n() {
-        let policy = RetentionPolicy::new(&RetentionPolicyConfig {
-            rules: vec![rule("top_pulled(2)")],
-        });
+        let policy = RetentionPolicy::new(
+            &RetentionPolicyConfig {
+                rules: vec![rule("top_pulled(2)")],
+            },
+            system_clock(),
+        );
 
         let manifest = ManifestImage {
             tag: Some("v1".to_string()),
@@ -285,9 +320,12 @@ mod tests {
 
     #[test]
     fn test_top_pulled_not_in_top_n() {
-        let policy = RetentionPolicy::new(&RetentionPolicyConfig {
-            rules: vec![rule("top_pulled(1)")],
-        });
+        let policy = RetentionPolicy::new(
+            &RetentionPolicyConfig {
+                rules: vec![rule("top_pulled(1)")],
+            },
+            system_clock(),
+        );
 
         let manifest = ManifestImage {
             tag: Some("v2".to_string()),
@@ -300,13 +338,17 @@ mod tests {
 
     #[test]
     fn test_pushed_at_recent() {
-        let policy = RetentionPolicy::new(&RetentionPolicyConfig {
-            rules: vec![rule("image.pushed_at > now() - days(1)")],
-        });
+        let now = fixed_now();
+        let policy = RetentionPolicy::new(
+            &RetentionPolicyConfig {
+                rules: vec![rule("image.pushed_at > now() - days(1)")],
+            },
+            fixed_clock(now),
+        );
 
         let manifest = ManifestImage {
             tag: Some("v1".to_string()),
-            pushed_at: EpochSeconds::from_seconds(Utc::now().timestamp()),
+            pushed_at: EpochSeconds::from_seconds(now.timestamp()),
             ..Default::default()
         };
 
@@ -315,13 +357,17 @@ mod tests {
 
     #[test]
     fn test_pushed_at_old() {
-        let policy = RetentionPolicy::new(&RetentionPolicyConfig {
-            rules: vec![rule("image.pushed_at > now() - days(1)")],
-        });
+        let now = fixed_now();
+        let policy = RetentionPolicy::new(
+            &RetentionPolicyConfig {
+                rules: vec![rule("image.pushed_at > now() - days(1)")],
+            },
+            fixed_clock(now),
+        );
 
         let manifest = ManifestImage {
             tag: Some("v1".to_string()),
-            pushed_at: EpochSeconds::from_seconds(Utc::now().timestamp() - 2 * 86400),
+            pushed_at: EpochSeconds::from_seconds(now.timestamp() - 2 * 86400),
             ..Default::default()
         };
 
@@ -330,13 +376,17 @@ mod tests {
 
     #[test]
     fn test_last_pulled_at_recent() {
-        let policy = RetentionPolicy::new(&RetentionPolicyConfig {
-            rules: vec![rule("image.last_pulled_at > now() - hours(1)")],
-        });
+        let now = fixed_now();
+        let policy = RetentionPolicy::new(
+            &RetentionPolicyConfig {
+                rules: vec![rule("image.last_pulled_at > now() - hours(1)")],
+            },
+            fixed_clock(now),
+        );
 
         let manifest = ManifestImage {
             tag: Some("v1".to_string()),
-            last_pulled_at: EpochSeconds::from_seconds(Utc::now().timestamp()),
+            last_pulled_at: EpochSeconds::from_seconds(now.timestamp()),
             ..Default::default()
         };
 
@@ -345,13 +395,17 @@ mod tests {
 
     #[test]
     fn test_last_pulled_at_old() {
-        let policy = RetentionPolicy::new(&RetentionPolicyConfig {
-            rules: vec![rule("image.last_pulled_at > now() - hours(1)")],
-        });
+        let now = fixed_now();
+        let policy = RetentionPolicy::new(
+            &RetentionPolicyConfig {
+                rules: vec![rule("image.last_pulled_at > now() - hours(1)")],
+            },
+            fixed_clock(now),
+        );
 
         let manifest = ManifestImage {
             tag: Some("v2".to_string()),
-            last_pulled_at: EpochSeconds::from_seconds(Utc::now().timestamp() - 2 * 3600),
+            last_pulled_at: EpochSeconds::from_seconds(now.timestamp() - 2 * 3600),
             ..Default::default()
         };
 
@@ -369,9 +423,12 @@ mod tests {
     fn non_boolean_rule_retains_fail_open() {
         // A rule that returns an integer instead of a bool is a misconfiguration.
         // The evaluator must treat this as "retain" (fail-open) without panicking.
-        let policy = RetentionPolicy::new(&RetentionPolicyConfig {
-            rules: vec![rule("42")],
-        });
+        let policy = RetentionPolicy::new(
+            &RetentionPolicyConfig {
+                rules: vec![rule("42")],
+            },
+            system_clock(),
+        );
         let manifest = ManifestImage {
             tag: Some("v1".to_string()),
             ..Default::default()
@@ -382,9 +439,12 @@ mod tests {
     #[test]
     fn non_boolean_rule_string_retains_fail_open() {
         // A rule that returns a string instead of a bool.
-        let policy = RetentionPolicy::new(&RetentionPolicyConfig {
-            rules: vec![rule("'keep'")],
-        });
+        let policy = RetentionPolicy::new(
+            &RetentionPolicyConfig {
+                rules: vec![rule("'keep'")],
+            },
+            system_clock(),
+        );
         let manifest = ManifestImage::default();
         assert!(policy.should_retain(&manifest, &[], &[]).unwrap());
     }
@@ -393,9 +453,12 @@ mod tests {
     fn failed_rule_evaluation_retains_fail_open() {
         // A rule that references an unbound variable fails at execution time
         // (not compile time).  The evaluator must treat this as "retain" (fail-open).
-        let policy = RetentionPolicy::new(&RetentionPolicyConfig {
-            rules: vec![rule("nonexistent_var")],
-        });
+        let policy = RetentionPolicy::new(
+            &RetentionPolicyConfig {
+                rules: vec![rule("nonexistent_var")],
+            },
+            system_clock(),
+        );
         let manifest = ManifestImage::default();
         assert!(policy.should_retain(&manifest, &[], &[]).unwrap());
     }
@@ -404,10 +467,44 @@ mod tests {
     fn non_boolean_rule_does_not_shadow_later_rules() {
         // When rule 1 returns a non-bool, the evaluator returns retain immediately
         // (fail-open), so rule 2 is never reached.  Both orderings should retain.
-        let policy = RetentionPolicy::new(&RetentionPolicyConfig {
-            rules: vec![rule("42"), rule("false")],
-        });
+        let policy = RetentionPolicy::new(
+            &RetentionPolicyConfig {
+                rules: vec![rule("42"), rule("false")],
+            },
+            system_clock(),
+        );
         let manifest = ManifestImage::default();
         assert!(policy.should_retain(&manifest, &[], &[]).unwrap());
+    }
+
+    #[test]
+    fn injected_clock_is_observed_by_now_function() {
+        let fixed = fixed_now();
+        let policy = RetentionPolicy::new(
+            &RetentionPolicyConfig {
+                rules: vec![rule("image.pushed_at == now()")],
+            },
+            fixed_clock(fixed),
+        );
+
+        let matching = ManifestImage {
+            tag: Some("v1".to_string()),
+            pushed_at: EpochSeconds::from_seconds(fixed.timestamp()),
+            ..Default::default()
+        };
+        assert!(
+            policy.should_retain(&matching, &[], &[]).unwrap(),
+            "manifest pushed exactly at the fixed clock time should be retained"
+        );
+
+        let one_second_later = ManifestImage {
+            tag: Some("v1".to_string()),
+            pushed_at: EpochSeconds::from_seconds(fixed.timestamp() + 1),
+            ..Default::default()
+        };
+        assert!(
+            !policy.should_retain(&one_second_later, &[], &[]).unwrap(),
+            "manifest pushed one second after the fixed clock time should not be retained"
+        );
     }
 }

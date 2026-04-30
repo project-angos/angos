@@ -392,7 +392,7 @@ impl RetentionChecker {
 mod tests {
     use super::*;
     use crate::{
-        policy::{CelRule, RetentionPolicy, RetentionPolicyConfig},
+        policy::{CelRule, RetentionPolicy, RetentionPolicyConfig, SystemClock},
         registry::{test_utils, tests::backends},
     };
 
@@ -420,7 +420,10 @@ mod tests {
                 rules: vec![CelRule::compile("top_pushed(10)").unwrap()],
             };
 
-            let retention_policy = Arc::new(RetentionPolicy::new(&retention_config));
+            let retention_policy = Arc::new(RetentionPolicy::new(
+                &retention_config,
+                Arc::new(SystemClock),
+            ));
 
             let repositories = test_utils::create_test_repositories();
             let scrubber = RetentionChecker::new(
@@ -496,9 +499,12 @@ mod tests {
                 .add();
             tx.commit().await.unwrap();
 
-            let policy = Arc::new(RetentionPolicy::new(&RetentionPolicyConfig {
-                rules: vec![CelRule::compile("image.tag != null").unwrap()],
-            }));
+            let policy = Arc::new(RetentionPolicy::new(
+                &RetentionPolicyConfig {
+                    rules: vec![CelRule::compile("image.tag != null").unwrap()],
+                },
+                Arc::new(SystemClock),
+            ));
 
             RetentionChecker::new(
                 blob_store,
@@ -578,9 +584,12 @@ mod tests {
             .add();
             tx.commit().await.unwrap();
 
-            let policy = Arc::new(RetentionPolicy::new(&RetentionPolicyConfig {
-                rules: vec![CelRule::compile("image.tag != null").unwrap()],
-            }));
+            let policy = Arc::new(RetentionPolicy::new(
+                &RetentionPolicyConfig {
+                    rules: vec![CelRule::compile("image.tag != null").unwrap()],
+                },
+                Arc::new(SystemClock),
+            ));
 
             RetentionChecker::new(
                 blob_store.clone(),

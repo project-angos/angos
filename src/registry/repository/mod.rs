@@ -8,7 +8,7 @@ use crate::{
     cache::Cache,
     configuration::RegexPattern,
     oci::{Digest, Namespace, Reference},
-    policy::{AccessPolicyConfig, RetentionPolicy, RetentionPolicyConfig},
+    policy::{AccessPolicyConfig, RetentionPolicy, RetentionPolicyConfig, SystemClock},
     registry::{Error, blob_store::BoxedReader},
 };
 
@@ -72,7 +72,8 @@ impl Repository {
             upstreams.push(RegistryClient::new(config, cache.clone())?);
         }
 
-        let retention_policy = RetentionPolicy::new(&config.retention_policy);
+        let retention_policy =
+            RetentionPolicy::new(&config.retention_policy, Arc::new(SystemClock));
 
         Ok(Self {
             name: name.to_string(),

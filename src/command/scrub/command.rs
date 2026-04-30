@@ -14,7 +14,7 @@ use crate::{
         error::Error,
     },
     configuration::Configuration,
-    policy::{RetentionPolicy, RetentionPolicyConfig},
+    policy::{RetentionPolicy, RetentionPolicyConfig, SystemClock},
     registry::{
         Repository,
         blob_store::{BlobStore, MultipartCleanup, UploadStore},
@@ -99,7 +99,10 @@ fn build_global_retention_policy(config: &RetentionPolicyConfig) -> Option<Arc<R
         return None;
     }
 
-    Some(Arc::new(RetentionPolicy::new(config)))
+    Some(Arc::new(RetentionPolicy::new(
+        config,
+        Arc::new(SystemClock),
+    )))
 }
 
 fn build_namespace_checkers(
