@@ -2,6 +2,7 @@ use std::io::ErrorKind;
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use tracing::warn;
 
 use super::Backend;
 use crate::{
@@ -134,13 +135,10 @@ impl LockOps for Backend {
             return;
         }
         if let Some(cache) = &self.cache {
-            let _ = cache
-                .store(
-                    &Self::cache_key(namespace, link),
-                    metadata,
-                    self.link_cache_ttl,
-                )
-                .await;
+            let key = Self::cache_key(namespace, link);
+            if let Err(err) = cache.store(&key, metadata, self.link_cache_ttl).await {
+                warn!("Failed to store link metadata in cache for {namespace}/{link}: {err}");
+            }
         }
     }
 

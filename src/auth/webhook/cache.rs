@@ -1,5 +1,7 @@
 use std::sync::Arc;
 
+use tracing::warn;
+
 use crate::{
     cache::{Cache, CacheExt},
     command::server::Error,
@@ -10,21 +12,24 @@ pub async fn cache_retrieve(
     name: &str,
     cache_key: &str,
 ) -> Result<Option<bool>, Error> {
-    let Ok(Some(cached)) = cache.retrieve::<bool>(cache_key).await else {
-        return Ok(None);
-    };
-
-    let label = if cached {
-        "cached_allow"
-    } else {
-        "cached_deny"
-    };
-
-    super::authorizer::WEBHOOK_REQUESTS
-        .with_label_values(&[name, label])
-        .inc();
-
-    Ok(Some(cached))
+    match cache.retrieve::<bool>(cache_key).await {
+        Ok(Some(cached)) => {
+            let label = if cached {
+                "cached_allow"
+            } else {
+                "cached_deny"
+            };
+            super::authorizer::WEBHOOK_REQUESTS
+                .with_label_values(&[name, label])
+                .inc();
+            Ok(Some(cached))
+        }
+        Err(err) => {
+            warn!("Webhook '{name}' cache retrieve failed for key {cache_key}: {err}");
+            Ok(None)
+        }
+        Ok(None) => Ok(None),
+    }
 }
 
 #[cfg(test)]

@@ -2,7 +2,7 @@ use std::{any::Any, fmt::Debug};
 
 use async_trait::async_trait;
 use serde::{Serialize, de::DeserializeOwned};
-use tracing::{debug, warn};
+use tracing::debug;
 
 mod config;
 mod error;
@@ -30,19 +30,12 @@ pub trait Cache: Any + Debug + Send + Sync {
 pub trait CacheExt: Cache {
     /// Retrieve and deserialize a JSON value from the cache
     async fn retrieve<T: DeserializeOwned + Send>(&self, key: &str) -> Result<Option<T>, Error> {
-        let cached = self.retrieve_value(key).await.map_err(|err| {
-            warn!("Failed to retrieve value from cache for key {key}: {err}");
-            Error::Execution(format!("Failed to retrieve value from cache: {err}"))
-        })?;
-
-        let Some(cached) = cached else {
+        let Some(cached) = self.retrieve_value(key).await? else {
             return Ok(None);
         };
 
-        let value = serde_json::from_str::<T>(&cached).map_err(|e| {
-            warn!("Failed to deserialize cached value for key {key}: {e}");
-            Error::Execution(format!("Failed to deserialize cached value: {e}"))
-        })?;
+        let value = serde_json::from_str::<T>(&cached)
+            .map_err(|e| Error::Execution(format!("Failed to deserialize cached value: {e}")))?;
 
         debug!("Using cached value for key: {key}");
         Ok(Some(value))
@@ -55,24 +48,9 @@ pub trait CacheExt: Cache {
         value: &T,
         ttl: u64,
     ) -> Result<(), Error> {
-        let serialized = match serde_json::to_string(value) {
-            Ok(s) => s,
-            Err(e) => {
-                warn!("Failed to serialize value for caching for key {key}: {e}");
-                return Err(Error::Execution(format!(
-                    "Failed to serialize value for caching: {e}"
-                )));
-            }
-        };
-
-        if let Err(err) = self.store_value(key, &serialized, ttl).await {
-            warn!("Failed to store value in cache for key {key}: {err}");
-            return Err(Error::Execution(format!(
-                "Failed to store value in cache: {err}"
-            )));
-        }
-
-        Ok(())
+        let serialized = serde_json::to_string(value)
+            .map_err(|e| Error::Execution(format!("Failed to serialize value for caching: {e}")))?;
+        self.store_value(key, &serialized, ttl).await
     }
 }
 
