@@ -1,4 +1,4 @@
-use std::{fmt, fmt::Debug, io, num::TryFromIntError, string::FromUtf8Error};
+use std::{fmt, io, num::TryFromIntError, string::FromUtf8Error};
 
 use aws_sdk_s3::{
     config::http::HttpResponse,
@@ -86,28 +86,25 @@ impl From<TryFromIntError> for Error {
 
 impl From<HeadObjectError> for Error {
     fn from(e: HeadObjectError) -> Self {
-        Error::StorageBackend(format!("HeadObjectError: {e:?}"))
+        Error::StorageBackend(format!("HeadObjectError: {e}"))
     }
 }
 
 impl From<GetObjectError> for Error {
     fn from(e: GetObjectError) -> Self {
-        Error::StorageBackend(format!("GetObjectError: {e:?}"))
+        Error::StorageBackend(format!("GetObjectError: {e}"))
     }
 }
 
-impl<T> From<SdkError<T, HttpResponse>> for Error
-where
-    T: Debug,
-{
+impl<T> From<SdkError<T, HttpResponse>> for Error {
     fn from(e: SdkError<T, HttpResponse>) -> Self {
-        Error::StorageBackend(format!("SdkError: {e:?}"))
+        Error::StorageBackend(format!("SdkError: {e}"))
     }
 }
 
 impl From<ByteStreamError> for Error {
     fn from(e: ByteStreamError) -> Self {
-        Error::StorageBackend(format!("ByteStreamError: {e:?}"))
+        Error::StorageBackend(format!("ByteStreamError: {e}"))
     }
 }
 
@@ -280,5 +277,26 @@ mod tests {
         let sdk_error: SdkError<PutObjectError, _> =
             SdkError::construction_failure(io::Error::new(io::ErrorKind::TimedOut, "timeout"));
         assert!(matches!(Error::from(sdk_error), Error::StorageBackend(_)));
+    }
+
+    #[test]
+    fn test_head_object_error_display_format() {
+        let head_error =
+            HeadObjectError::NotFound(aws_sdk_s3::types::error::NotFound::builder().build());
+        let err = Error::from(head_error);
+        let msg = format!("{err}");
+        assert!(
+            msg.starts_with("Storage backend error: HeadObjectError: "),
+            "unexpected prefix: {msg}"
+        );
+        // Debug formatting leaks struct field punctuation; Display must not
+        assert!(
+            !msg.contains("{ "),
+            "Display message contains Debug-style brace punctuation: {msg}"
+        );
+        assert!(
+            !msg.contains("__type"),
+            "Display message leaks SDK internal field __type: {msg}"
+        );
     }
 }
