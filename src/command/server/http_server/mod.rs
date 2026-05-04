@@ -515,12 +515,9 @@ fn handle_metrics() -> Result<Response<ResponseBody>, Error> {
 
 pub fn error_to_response(error: &Error, request_id: Option<&String>) -> Response<ResponseBody> {
     let status = error.status_code();
-    let body = error.as_json(request_id);
+    let body = Bytes::from(error.as_json(request_id).to_string());
 
-    let body = body.to_string();
-    let body = Bytes::from(body);
-
-    match error {
+    let result = match error {
         Error::Unauthorized(_) => Response::builder()
             .status(status)
             .header(CONTENT_TYPE, "application/json")
@@ -528,14 +525,26 @@ pub fn error_to_response(error: &Error, request_id: Option<&String>) -> Response
                 WWW_AUTHENTICATE,
                 r#"Basic realm="Simple Registry", charset="UTF-8""#,
             )
-            .body(ResponseBody::Fixed(Full::new(body)))
-            .unwrap(),
+            .body(ResponseBody::Fixed(Full::new(body))),
         _ => Response::builder()
             .status(status)
             .header(CONTENT_TYPE, "application/json")
-            .body(ResponseBody::Fixed(Full::new(body)))
-            .unwrap(),
-    }
+            .body(ResponseBody::Fixed(Full::new(body))),
+    };
+
+    result.unwrap_or_else(|_| fallback_500())
+}
+
+fn fallback_500() -> Response<ResponseBody> {
+    let mut response = Response::new(ResponseBody::Fixed(Full::new(Bytes::from_static(
+        b"Internal Server Error",
+    ))));
+    *response.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
+    response.headers_mut().insert(
+        CONTENT_TYPE,
+        hyper::header::HeaderValue::from_static("text/plain"),
+    );
+    response
 }
 
 #[cfg(test)]

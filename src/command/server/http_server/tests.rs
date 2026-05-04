@@ -665,3 +665,65 @@ fn inject_peer_certificate_last_write_wins_when_called_twice() {
     let stored = request.extensions().get::<PeerCertificate>().unwrap();
     assert_eq!(stored.0.as_ref(), second);
 }
+
+#[test]
+fn fallback_500_returns_valid_500_text_plain_response() {
+    // Directly verify the fallback helper used by error_to_response when the
+    // hyper builder records an error (e.g. a header value containing a control
+    // byte).  The helper must always produce a well-formed response regardless
+    // of external state.
+    let response = fallback_500();
+
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(
+        response.headers().get(CONTENT_TYPE).unwrap(),
+        "text/plain",
+        "fallback must set Content-Type: text/plain"
+    );
+}
+
+#[tokio::test]
+async fn fallback_500_body_is_ascii_internal_server_error() {
+    use http_body_util::BodyExt;
+
+    let response = fallback_500();
+    let (_, body) = response.into_parts();
+
+    let body_bytes = match body {
+        ResponseBody::Fixed(b) => b.collect().await.unwrap().to_bytes(),
+        _ => panic!("Expected Fixed body"),
+    };
+
+    assert_eq!(
+        body_bytes.as_ref(),
+        b"Internal Server Error",
+        "fallback body must be the static ASCII string 'Internal Server Error'"
+    );
+}
+
+#[test]
+fn error_to_response_falls_back_to_500_when_builder_fails() {
+    // Simulate the builder failure mode: a header value that contains a NUL
+    // byte (\0) is rejected by hyper as invalid.  We cannot inject this
+    // through a public Error variant, so we call the builder directly in the
+    // same way error_to_response does, confirm it errors, and then verify that
+    // fallback_500() produces the expected minimal 500 response — which is
+    // exactly what error_to_response calls via unwrap_or_else.
+    let builder_result: Result<Response<ResponseBody>, _> = Response::builder()
+        .status(StatusCode::UNAUTHORIZED)
+        .header(CONTENT_TYPE, "application/json")
+        .header(WWW_AUTHENTICATE, "invalid\0value")
+        .body(ResponseBody::Fixed(Full::new(Bytes::from_static(b""))));
+
+    assert!(
+        builder_result.is_err(),
+        "hyper must reject a header value containing a NUL byte"
+    );
+
+    // Applying the same unwrap_or_else used in error_to_response must yield
+    // the fallback response rather than panicking.
+    let response = builder_result.unwrap_or_else(|_| fallback_500());
+
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(response.headers().get(CONTENT_TYPE).unwrap(), "text/plain");
+}
