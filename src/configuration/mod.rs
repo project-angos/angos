@@ -199,13 +199,7 @@ fn resolve_global(
     // Names listed in `global.event_webhooks` must resolve to a defined webhook.
     // The dispatcher itself fires every configured webhook whose filter matches
     // the event, so the resolved values are not stored here.
-    for name in &raw.event_webhooks {
-        if !event_webhooks.contains_key(name) {
-            return Err(Error::InvalidFormat(format!(
-                "Event webhook '{name}' not found (referenced globally)"
-            )));
-        }
-    }
+    validate_event_webhook_refs(&raw.event_webhooks, event_webhooks, "referenced globally")?;
 
     Ok(GlobalConfig {
         max_concurrent_requests: raw.max_concurrent_requests,
@@ -269,10 +263,22 @@ fn validate_repo_event_webhooks(
     names: &[String],
     event_webhooks: &HashMap<String, Arc<EventWebhookConfig>>,
 ) -> Result<(), Error> {
-    for name in names {
-        if !event_webhooks.contains_key(name) {
+    let context = format!("referenced in '{repo_name}' repository");
+    validate_event_webhook_refs(names, event_webhooks, &context)
+}
+
+/// Validates that every name in `refs` exists in `known`. The `context` string
+/// is appended to the error message in parentheses to identify the caller
+/// (e.g. `"referenced globally"`, `"referenced in 'foo' repository"`).
+fn validate_event_webhook_refs(
+    refs: &[String],
+    known: &HashMap<String, Arc<EventWebhookConfig>>,
+    context: &str,
+) -> Result<(), Error> {
+    for name in refs {
+        if !known.contains_key(name) {
             return Err(Error::InvalidFormat(format!(
-                "Event webhook '{name}' not found (referenced in '{repo_name}' repository)"
+                "Event webhook '{name}' not found ({context})"
             )));
         }
     }
