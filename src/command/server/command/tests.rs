@@ -861,3 +861,30 @@ async fn test_command_shutdown_drains_in_flight_async_delivery() {
         "Command::shutdown() must drain in-flight async webhook deliveries"
     );
 }
+
+#[test]
+fn test_poisoned_capabilities_mutex_recovers_without_crash() {
+    let lock: Arc<Mutex<Option<ConditionalCapabilities>>> = Arc::new(Mutex::new(None));
+    let lock_clone = Arc::clone(&lock);
+
+    // Poison the mutex by panicking while holding the guard.
+    let _ = std::thread::spawn(move || {
+        let _guard = lock_clone.lock().unwrap();
+        panic!("intentional panic to poison the mutex");
+    })
+    .join();
+
+    assert!(
+        lock.is_poisoned(),
+        "mutex must be poisoned after thread panic"
+    );
+
+    // The recovery pattern used in build_metadata_store must not panic.
+    let guard = lock
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    assert!(
+        guard.is_none(),
+        "recovered guard must yield the original None value"
+    );
+}
