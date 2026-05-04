@@ -1,4 +1,4 @@
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use url::Url;
 
 use crate::{
@@ -27,7 +27,10 @@ pub struct EventWebhookConfig {
     pub token: Option<Secret<String>>,
     #[serde(default = "default_timeout_ms")]
     pub timeout_ms: u64,
-    #[serde(default)]
+    /// Maximum number of retry attempts after the initial delivery. Accepted range: 0–16.
+    /// Values above 16 are rejected at configuration load time to prevent retry storms
+    /// and arithmetic overflow in the exponential-backoff calculation.
+    #[serde(default, deserialize_with = "deserialize_max_retries")]
     pub max_retries: u32,
     pub events: Vec<EventKind>,
     #[serde(default)]
@@ -36,6 +39,20 @@ pub struct EventWebhookConfig {
 
 fn default_timeout_ms() -> u64 {
     5000
+}
+
+fn deserialize_max_retries<'de, D>(deserializer: D) -> Result<u32, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    const MAX: u32 = 16;
+    let v = u32::deserialize(deserializer)?;
+    if v > MAX {
+        return Err(serde::de::Error::custom(format!(
+            "max_retries={v} exceeds the supported maximum of {MAX}"
+        )));
+    }
+    Ok(v)
 }
 
 impl EventWebhookConfig {
@@ -224,5 +241,66 @@ mod tests {
         let config: EventWebhookConfig = toml::from_str(toml).unwrap();
         let result = config.validate();
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn max_retries_boundary_accepted() {
+        let toml = r#"
+            url = "https://example.com/webhook"
+            policy = "required"
+            events = ["manifest.push"]
+            max_retries = 16
+        "#;
+
+        let config: EventWebhookConfig = toml::from_str(toml).unwrap();
+        assert_eq!(config.max_retries, 16);
+    }
+
+    #[test]
+    fn max_retries_above_boundary_rejected() {
+        let toml = r#"
+            url = "https://example.com/webhook"
+            policy = "required"
+            events = ["manifest.push"]
+            max_retries = 17
+        "#;
+
+        let result: Result<EventWebhookConfig, _> = toml::from_str(toml);
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("max_retries=17 exceeds the supported maximum of 16"),
+            "unexpected error message: {err}"
+        );
+    }
+
+    #[test]
+    fn max_retries_far_out_of_range_rejected() {
+        let toml = r#"
+            url = "https://example.com/webhook"
+            policy = "required"
+            events = ["manifest.push"]
+            max_retries = 999999
+        "#;
+
+        let result: Result<EventWebhookConfig, _> = toml::from_str(toml);
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("max_retries=999999 exceeds the supported maximum of 16"),
+            "unexpected error message: {err}"
+        );
+    }
+
+    #[test]
+    fn max_retries_defaults_to_zero() {
+        let toml = r#"
+            url = "https://example.com/webhook"
+            policy = "optional"
+            events = ["blob.push"]
+        "#;
+
+        let config: EventWebhookConfig = toml::from_str(toml).unwrap();
+        assert_eq!(config.max_retries, 0);
     }
 }
