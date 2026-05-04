@@ -403,7 +403,7 @@ mod tests {
                 fs::{Backend as FsMetadataStore, BackendConfig as FsMetadataConfig},
             },
             test_utils,
-            tests::backends,
+            test_utils::backends,
         },
     };
 

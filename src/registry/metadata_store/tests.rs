@@ -12,7 +12,7 @@ use crate::{
         metadata_store::{
             Error, LinkMetadata, MetadataStore, MetadataStoreExt, link_kind::LinkKind,
         },
-        tests::backends,
+        test_utils::backends,
     },
 };
 

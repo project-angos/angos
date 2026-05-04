@@ -142,8 +142,7 @@ mod tests {
         oci::{Namespace, Reference},
         registry::{
             metadata_store::{MetadataStoreExt, link_kind::LinkKind},
-            test_utils::create_test_blob,
-            tests::backends,
+            test_utils::{backends, create_test_blob},
         },
     };
 

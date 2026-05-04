@@ -540,6 +540,3 @@ pub fn error_to_response(error: &Error, request_id: Option<&String>) -> Response
 
 #[cfg(test)]
 mod tests;
-
-#[cfg(test)]
-mod event_emission_tests;

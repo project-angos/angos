@@ -17,7 +17,7 @@ use crate::registry::{
         },
     },
     data_store, path_builder,
-    tests::S3RegistryTestCase,
+    test_utils::S3RegistryTestCase,
 };
 
 struct UniformTestCase {

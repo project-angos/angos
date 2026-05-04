@@ -160,7 +160,7 @@ mod tests {
                 BlobIndex, BlobIndexOperation, LinkMetadata, LinkOperation, MetadataStoreExt,
             },
             test_utils,
-            tests::{FSRegistryTestCase, RegistryTestCase, backends},
+            test_utils::{FSRegistryTestCase, RegistryTestCase, backends},
         },
     };
 

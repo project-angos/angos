@@ -6,7 +6,7 @@ use serde_json::json;
 use super::*;
 use crate::{
     oci::Namespace,
-    registry::tests::{FSRegistryTestCase, backends},
+    registry::test_utils::{FSRegistryTestCase, backends},
 };
 
 fn header_digest(headers: &HashMap<&'static str, String>) -> Digest {

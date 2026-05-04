@@ -7,6 +7,8 @@ pub mod blob_store;
 pub mod content_discovery;
 pub mod data_store;
 mod error;
+#[cfg(test)]
+mod event_emission_tests;
 mod ext;
 pub mod manifest;
 pub mod metadata_store;
@@ -16,8 +18,6 @@ pub mod repository;
 pub mod task_queue;
 #[cfg(test)]
 pub mod test_utils;
-#[cfg(test)]
-pub mod tests;
 pub mod upload;
 pub mod version;
 

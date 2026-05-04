@@ -91,7 +91,7 @@ impl NamespaceChecker for UploadChecker {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::registry::tests::backends;
+    use crate::registry::test_utils::backends;
 
     #[tokio::test]
     async fn test_scrub_uploads_removes_obsolete() {
