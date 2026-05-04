@@ -46,7 +46,7 @@ struct RawConfiguration {
     #[serde(default, alias = "storage")]
     blob_store: blob_store::BlobStorageConfig,
     #[serde(default)]
-    metadata_store: Option<metadata_store::MetadataStoreConfig>,
+    metadata_store: metadata_store::MetadataStoreConfig,
     #[serde(default)]
     auth: RawAuthConfig,
     #[serde(default)]
@@ -75,7 +75,7 @@ pub struct Configuration {
     pub ui: UiConfig,
     pub cache: cache::Config,
     pub blob_store: blob_store::BlobStorageConfig,
-    pub metadata_store: Option<metadata_store::MetadataStoreConfig>,
+    pub metadata_store: metadata_store::MetadataStoreConfig,
     pub auth: authenticator::AuthConfig,
     pub repository: HashMap<String, repository::Config>,
     pub event_webhook: HashMap<String, Arc<EventWebhookConfig>>,

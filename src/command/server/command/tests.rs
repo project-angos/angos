@@ -699,7 +699,6 @@ async fn test_hot_reload_inflight_old_dispatcher_still_works() {
         .unwrap();
 }
 
-
 #[tokio::test]
 async fn test_command_shutdown_with_no_dispatcher() {
     use std::time::Duration;
