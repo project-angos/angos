@@ -166,7 +166,7 @@ impl EventDispatcher {
         in_flight_guard.spawn(deliver_async(
             endpoint.client.clone(),
             endpoint.config.url.to_string(),
-            endpoint.config.token.clone(),
+            endpoint.config.token.as_ref().map(|t| t.expose().clone()),
             body.to_vec(),
             event_kind_header.to_string(),
             endpoint.config.max_retries,
@@ -193,7 +193,7 @@ impl EventDispatcher {
                 send_and_record(
                     &endpoint.client,
                     endpoint.config.url.as_str(),
-                    endpoint.config.token.as_deref(),
+                    endpoint.config.token.as_ref().map(|t| t.expose().as_str()),
                     body,
                     event_kind_header,
                     endpoint.config.max_retries,
@@ -207,7 +207,7 @@ impl EventDispatcher {
                 if let Err(e) = send_and_record(
                     &endpoint.client,
                     endpoint.config.url.as_str(),
-                    endpoint.config.token.as_deref(),
+                    endpoint.config.token.as_ref().map(|t| t.expose().as_str()),
                     body,
                     event_kind_header,
                     endpoint.config.max_retries,

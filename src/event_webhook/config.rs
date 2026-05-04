@@ -4,6 +4,7 @@ use url::Url;
 use crate::{
     configuration::{Error, RegexPattern},
     event_webhook::event::EventKind,
+    secret::Secret,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -23,7 +24,7 @@ pub struct EventWebhookConfig {
     pub url: Url,
     pub policy: DeliveryPolicy,
     #[serde(default)]
-    pub token: Option<String>,
+    pub token: Option<Secret<String>>,
     #[serde(default = "default_timeout_ms")]
     pub timeout_ms: u64,
     #[serde(default)]
@@ -110,7 +111,10 @@ mod tests {
         let config: EventWebhookConfig = toml::from_str(toml).unwrap();
         assert_eq!(config.url.as_str(), "https://example.com/webhook");
         assert_eq!(config.policy, DeliveryPolicy::Required);
-        assert_eq!(config.token, Some("secret-token".to_string()));
+        assert_eq!(
+            config.token.as_ref().map(|t| t.expose().as_str()),
+            Some("secret-token")
+        );
         assert_eq!(config.timeout_ms, 10000);
         assert_eq!(config.max_retries, 3);
         assert_eq!(config.events.len(), 2);

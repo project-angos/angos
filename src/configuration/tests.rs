@@ -292,8 +292,8 @@ fn test_resolve_metadata_config_from_s3_blob_store() {
             assert_eq!(s3_config.bucket, "my-bucket");
             assert_eq!(s3_config.region, "us-east-1");
             assert_eq!(s3_config.endpoint, "https://s3.example.com");
-            assert_eq!(s3_config.access_key_id, "key123");
-            assert_eq!(s3_config.secret_key, "secret456");
+            assert_eq!(s3_config.access_key_id.expose(), "key123");
+            assert_eq!(s3_config.secret_key.expose(), "secret456");
             assert_eq!(s3_config.key_prefix, "prefix/");
             assert_eq!(
                 s3_config.lock_strategy,

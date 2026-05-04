@@ -5,19 +5,22 @@ use chrono::Duration;
 use sha2::{Digest as ShaDigest, Sha256};
 use uuid::Uuid;
 
-use crate::registry::{
-    blob_store::{
-        self, MultipartCleanup,
-        sha256_ext::Sha256Ext,
-        tests::{
-            test_build_blob_reader_returns_size,
-            test_build_blob_reader_with_offset_returns_full_size, test_datastore_blob_operations,
-            test_datastore_list_blobs, test_datastore_list_uploads,
-            test_datastore_upload_operations,
+use crate::{
+    registry::{
+        blob_store::{
+            self, MultipartCleanup,
+            sha256_ext::Sha256Ext,
+            tests::{
+                test_build_blob_reader_returns_size,
+                test_build_blob_reader_with_offset_returns_full_size,
+                test_datastore_blob_operations, test_datastore_list_blobs,
+                test_datastore_list_uploads, test_datastore_upload_operations,
+            },
         },
+        data_store, path_builder,
+        test_utils::S3RegistryTestCase,
     },
-    data_store, path_builder,
-    test_utils::S3RegistryTestCase,
+    secret::Secret,
 };
 
 struct UniformTestCase {
@@ -29,8 +32,8 @@ impl UniformTestCase {
     fn new() -> Self {
         let key_prefix = format!("test-uniform-{}", Uuid::new_v4());
         let store = blob_store::s3::Backend::new(&data_store::s3::BackendConfig {
-            access_key_id: "root".to_string(),
-            secret_key: "roottoor".to_string(),
+            access_key_id: Secret::new("root".to_string()),
+            secret_key: Secret::new("roottoor".to_string()),
             endpoint: "http://127.0.0.1:9000".to_string(),
             region: "region".to_string(),
             bucket: "registry".to_string(),

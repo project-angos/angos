@@ -1,7 +1,7 @@
 #[cfg(test)]
 mod tests;
 
-use std::collections::HashMap;
+use std::{collections::HashMap, fmt};
 
 use argon2::{Argon2, PasswordVerifier, password_hash::PasswordHashString};
 use async_trait::async_trait;
@@ -16,8 +16,14 @@ use crate::{
 };
 
 /// An Argon2 password hash string, validated at deserialize time.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct PasswordHash(PasswordHashString);
+
+impl fmt::Debug for PasswordHash {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("[REDACTED]")
+    }
+}
 
 impl PasswordHash {
     pub fn as_password_hash(&self) -> argon2::password_hash::PasswordHash<'_> {

@@ -13,14 +13,15 @@ use super::{RecoveryOutcome, S3LockBackend, S3LockConfig, S3LockPayload};
 use crate::{
     metrics_provider,
     registry::{data_store, metadata_store::lock::LockBackend},
+    secret::Secret,
 };
 
 fn test_store(prefix: &str) -> Arc<data_store::s3::Backend> {
     metrics_provider::init_for_tests();
     let run_id = Uuid::new_v4();
     let config = data_store::s3::BackendConfig {
-        access_key_id: "root".to_string(),
-        secret_key: "roottoor".to_string(),
+        access_key_id: Secret::new("root".to_string()),
+        secret_key: Secret::new("roottoor".to_string()),
         endpoint: "http://127.0.0.1:9000".to_string(),
         bucket: "registry".to_string(),
         region: "us-east-1".to_string(),

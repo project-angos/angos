@@ -21,6 +21,7 @@ use crate::{
     metrics_provider,
     oci::{Namespace, Reference},
     registry::{Registry, RegistryConfig, Repository},
+    secret::Secret,
 };
 
 fn create_test_config() -> Configuration {
@@ -940,8 +941,8 @@ async fn test_shutdown_flushes_pending_access_times() {
     let namespace = format!("{unique_prefix}/myimage");
 
     let s3_config = BackendConfig {
-        access_key_id: "root".to_string(),
-        secret_key: "roottoor".to_string(),
+        access_key_id: Secret::new("root".to_string()),
+        secret_key: Secret::new("roottoor".to_string()),
         endpoint: "http://127.0.0.1:9000".to_string(),
         bucket: "registry".to_string(),
         region: "region".to_string(),

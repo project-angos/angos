@@ -1,14 +1,17 @@
 use serde::{Deserialize, Deserializer};
 
-use crate::registry::{
-    data_store,
-    metadata_store::{ConditionalCapabilities, LockConfig, LockStrategy, lock},
+use crate::{
+    registry::{
+        data_store,
+        metadata_store::{ConditionalCapabilities, LockConfig, LockStrategy, lock},
+    },
+    secret::Secret,
 };
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct BackendConfig {
-    pub access_key_id: String,
-    pub secret_key: String,
+    pub access_key_id: Secret<String>,
+    pub secret_key: Secret<String>,
     pub endpoint: String,
     pub bucket: String,
     pub region: String,
@@ -35,8 +38,8 @@ pub struct BackendConfig {
 impl Default for BackendConfig {
     fn default() -> Self {
         Self {
-            access_key_id: String::new(),
-            secret_key: String::new(),
+            access_key_id: Secret::new(String::new()),
+            secret_key: Secret::new(String::new()),
             endpoint: String::new(),
             bucket: String::new(),
             region: String::new(),
@@ -80,8 +83,8 @@ impl<'de> Deserialize<'de> for BackendConfig {
         let lock_strategy = lock::resolve_lock_strategy(raw.lock_strategy, raw.redis, true)?;
 
         Ok(BackendConfig {
-            access_key_id: raw.access_key_id,
-            secret_key: raw.secret_key,
+            access_key_id: Secret::new(raw.access_key_id),
+            secret_key: Secret::new(raw.secret_key),
             endpoint: raw.endpoint,
             bucket: raw.bucket,
             region: raw.region,

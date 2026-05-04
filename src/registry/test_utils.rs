@@ -15,6 +15,7 @@ use crate::{
         data_store, metadata_store,
         metadata_store::{MetadataStore, MetadataStoreExt, link_kind::LinkKind},
     },
+    secret::Secret,
 };
 
 pub fn create_test_repositories() -> Arc<HashMap<String, Repository>> {
@@ -212,8 +213,8 @@ impl S3RegistryTestCase {
 
         let blob_store = Arc::new(
             blob_store::s3::Backend::new(&data_store::s3::BackendConfig {
-                access_key_id: "root".to_string(),
-                secret_key: "roottoor".to_string(),
+                access_key_id: Secret::new("root".to_string()),
+                secret_key: Secret::new("roottoor".to_string()),
                 endpoint: "http://127.0.0.1:9000".to_string(),
                 region: "region".to_string(),
                 bucket: "registry".to_string(),
@@ -229,8 +230,8 @@ impl S3RegistryTestCase {
         let metadata_store = Arc::new(
             metadata_store::s3::Backend::new(
                 &metadata_store::s3::BackendConfig {
-                    access_key_id: "root".to_string(),
-                    secret_key: "roottoor".to_string(),
+                    access_key_id: Secret::new("root".to_string()),
+                    secret_key: Secret::new("roottoor".to_string()),
                     endpoint: "http://127.0.0.1:9000".to_string(),
                     region: "region".to_string(),
                     bucket: "registry".to_string(),
