@@ -64,3 +64,4 @@ zeroize = { version = "1.8", features = ["derive"] }
 wiremock = "0.6"
 rcgen = { version = "0.13", default-features = false, features = ["pem", "ring"] }
 p256 = { version = "0.13", features = ["ecdsa", "pem", "jwk"] }
+opentelemetry_sdk = { version = "0.31", features = ["testing"] }
