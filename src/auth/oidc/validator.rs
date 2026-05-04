@@ -216,7 +216,7 @@ async fn fetch_oidc_configuration(
 }
 
 #[cfg(test)]
-pub(crate) mod tests {
+pub mod tests {
     use std::collections::HashMap;
 
     use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
@@ -238,6 +238,7 @@ pub(crate) mod tests {
         },
         cache,
         command::server::Error,
+        test_fixtures::oidc::{KID, alt_private_key_pem, jwk_x, jwk_y, private_key_pem},
     };
 
     fn build_test_provider_config(uri: &str) -> ProviderConfig {
@@ -250,16 +251,17 @@ pub(crate) mod tests {
         }
     }
 
-    /// Returns the JWKS JSON body for the static `TEST_PRIVATE_KEY_PEM` fixture.
+    /// Returns the JWKS JSON body for the `private_key_pem()` fixture.
     fn static_jwks_response() -> serde_json::Value {
         json!({
             "keys": [{
-                "kty": "RSA",
+                "kty": "EC",
                 "use": "sig",
-                "kid": TEST_KID,
-                "n": TEST_JWK_N,
-                "e": TEST_JWK_E,
-                "alg": "RS256"
+                "kid": KID,
+                "crv": "P-256",
+                "x": jwk_x(),
+                "y": jwk_y(),
+                "alg": "ES256"
             }]
         })
     }
@@ -579,7 +581,7 @@ pub(crate) mod tests {
         );
         claims.insert("iat".to_string(), json!(chrono::Utc::now().timestamp()));
 
-        let token = make_token(&claims, TEST_KID);
+        let token = make_token(&claims, KID);
 
         let provider = Provider::new(build_test_provider_config(&mock_server.uri()));
         let client = Client::new();
@@ -599,15 +601,15 @@ pub(crate) mod tests {
     async fn test_validate_oidc_token_invalid_signature() {
         let mock_server = MockServer::start().await;
 
-        // JWKS advertises TEST_PRIVATE_KEY_PEM's public key; token is signed with the alt key.
+        // JWKS advertises private_key_pem()'s public key; token is signed with the alt key.
         Mock::given(method("GET"))
             .and(path("/.well-known/jwks"))
             .respond_with(ResponseTemplate::new(200).set_body_json(static_jwks_response()))
             .mount(&mock_server)
             .await;
 
-        let mut header = Header::new(Algorithm::RS256);
-        header.kid = Some(TEST_KID.to_string());
+        let mut header = Header::new(Algorithm::ES256);
+        header.kid = Some(KID.to_string());
 
         let mut claims: HashMap<String, serde_json::Value> = HashMap::new();
         claims.insert("iss".to_string(), json!(mock_server.uri()));
@@ -619,8 +621,8 @@ pub(crate) mod tests {
         );
         claims.insert("iat".to_string(), json!(chrono::Utc::now().timestamp()));
 
-        let alt_key = EncodingKey::from_rsa_pem(TEST_ALT_PRIVATE_KEY_PEM.as_bytes())
-            .expect("alt key must parse");
+        let alt_key =
+            EncodingKey::from_ec_pem(alt_private_key_pem().as_bytes()).expect("alt key must parse");
         let token = encode(&header, &claims, &alt_key).unwrap();
 
         let provider = Provider::new(build_test_provider_config(&mock_server.uri()));
@@ -662,7 +664,7 @@ pub(crate) mod tests {
             json!((chrono::Utc::now() - chrono::Duration::hours(2)).timestamp()),
         );
 
-        let token = make_token(&claims, TEST_KID);
+        let token = make_token(&claims, KID);
 
         let provider = Provider::new(build_test_provider_config(&mock_server.uri()));
         let client = Client::new();
@@ -700,7 +702,7 @@ pub(crate) mod tests {
         );
         claims.insert("iat".to_string(), json!(chrono::Utc::now().timestamp()));
 
-        let token = make_token(&claims, TEST_KID);
+        let token = make_token(&claims, KID);
 
         let provider = Provider::new(build_test_provider_config(&mock_server.uri()));
         let client = Client::new();
@@ -732,7 +734,7 @@ pub(crate) mod tests {
         );
         claims.insert("iat".to_string(), json!(chrono::Utc::now().timestamp()));
 
-        let token = make_token(&claims, TEST_KID);
+        let token = make_token(&claims, KID);
 
         let provider = Provider::new(build_test_provider_config(&mock_server.uri()));
         let client = Client::new();
@@ -765,7 +767,7 @@ pub(crate) mod tests {
         );
         claims.insert("iat".to_string(), json!(chrono::Utc::now().timestamp()));
 
-        let header = Header::new(Algorithm::RS256);
+        let header = Header::new(Algorithm::ES256);
         let token = encode(&header, &claims, &encoding_key()).unwrap();
 
         let config = ProviderConfig {
@@ -811,7 +813,7 @@ pub(crate) mod tests {
         );
         claims.insert("iat".to_string(), json!(chrono::Utc::now().timestamp()));
 
-        let token = make_token(&claims, TEST_KID);
+        let token = make_token(&claims, KID);
 
         let config = ProviderConfig {
             issuer: mock_server.uri(),
@@ -872,92 +874,25 @@ pub(crate) mod tests {
         }
     }
 
-    // RSA-2048 PKCS8 private key (test-only).
-    pub(crate) const TEST_PRIVATE_KEY_PEM: &str = "-----BEGIN PRIVATE KEY-----\n\
-            MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQC1ZWEn1DBX9KCN\n\
-            BrYXJ86eBdk2GPlqxyFuJHVnLaia+Y4Ndue7GIEjSrLTx0FOwR115kobIyLUxJMw\n\
-            J1PP65hVDDZtJf9bXNTBZR2swCP6qBuUOdaZHnDbvgs5qI3JCm4qO8VpLI5FapWo\n\
-            uhuk/YW+h2ok5L0ZNsOlJ9PWksl9L/mioMWKmvKSiYPIIRPqpURhPTHRRP2om3T4\n\
-            K11WgVhwxJZ9ApCC3B5LfE+eQW5Qh44CplRatNBnS7taupeGC/mQoZ74B1Drt1jz\n\
-            moFy7ih7AyOSoMhJVztZ7iqzKlL/xZDDVkb36MluMZoD3ju/kthkXEZ5gAUUgq4g\n\
-            xDtztbnpAgMBAAECggEAJCR5ATiUEVJakv7dVSvHTVEZAGBlgdL/ZDS7d71vNMG4\n\
-            fhJNBchSIrgFfZDcAFcWCaHC7jlH/WDVeui7GFh216tBROonQQr0ETyWdw8pnA3W\n\
-            wOftTED2d7IcBncBGSeM37ldEiGgj1A3VZEPZQZmmZndmlBBJT72KHgRC1Xf86M/\n\
-            h2hxnGJeVhOsYENr9um2NHsW2EKB2GJtInMy4Krbl4ySE2Kl4HIl+CasYcF6dC73\n\
-            oGjsuoOyxZYVCnaKHU4L1vbEqRp6nxSYfFIuR0M8ihtg77y+mFEmEmwUZLntnTRp\n\
-            fjX+n0jWdJyakdgPqcOqorXKZSFbnkmQYnB0Bu7kqQKBgQDgIzf7Qfr3NAjGS8lV\n\
-            DceixVVxqYIkY1HEHMHbj+aGp3DYmDbQG2y/M/cx8linJlXauPbyq9x9b/KUiPsP\n\
-            w+CXtIkYdQGKsucKkWjkSgB9cJBA0d8C+UPStUYXm9DNBztt1/bEf75EBV31DmjH\n\
-            MD9yyJTxkOFpY1+QmE9+4AI05wKBgQDPLrditvYciCS0yEu+MIupQEk9NS78qNX+\n\
-            FT1owzzoPt/icCIG/82pn6S1XYgpRil4VCSss7zkLHXrU9qm7ueQ+FCaRqgRjWeB\n\
-            2RCCWfMzWLaAgsXNhqkklWaoJo6HNA8zS/7rfK+QjkpZHleWUqRve2ISE8tU7Oij\n\
-            +6M67C3wrwKBgQCBm7v+ffvqwNsmF6L3nP1JIYU0McoA0rHwjpSHK2IpkV+O0A46\n\
-            LvGmax1Rc4tSNLfGv9iFIV5h5r9GpyNOzXztHMd+LgLTOnqhwM3/3M8FunagFPw5\n\
-            kvxmNs6uTjripID4Fr8qh5f1a4kWcNuj+0FlVZnTSm0ebQlQ6tJlUpHUFwKBgEw0\n\
-            CZ2UYBeEd8PKvBk7L9NT4txReHPUAcmPtGOZFAj0P1LBHbLnWZTfNCzFNzS/Kreo\n\
-            c0jWX06pj8G7uPuXebLXsoXcISs7kGuxFCJtxUcIhS/laa27rvDWxshoThoqqsCa\n\
-            XivtU4He5De9MkgHI5YhkqPFhg85iCPwhUxB3G/fAoGANeHenNFrYY7NVIgIU4//\n\
-            /7TL+n7tTgo7K05RnMcDlN34ZkWZ90WLsFaDFAY0NndHd5ZH9NXeKMrebfHHiHRb\n\
-            CqmT+3Bc8S+MAqHHwdjPl1TRhkIS5iAXWDkw++un2PtwJYJILWC3Xqz6d+FSS8FO\n\
-            IHgjvvya3tp4E/ZbyQLAntc=\n\
-            -----END PRIVATE KEY-----";
-
-    // A second RSA-2048 PKCS8 private key whose public key is NOT in any test JWKS.
-    // Used to produce tokens with a valid structure but a signature that will fail verification.
-    pub(crate) const TEST_ALT_PRIVATE_KEY_PEM: &str = "-----BEGIN PRIVATE KEY-----\n\
-            MIIEvAIBADANBgkqhkiG9w0BAQEFAASCBKYwggSiAgEAAoIBAQDnak+edHSXsUMs\n\
-            hzXSgN6yCUur14LXDSFF7P/sD7Ty07gtlKrEopiCzZ2OyYMAmDVz15DtOBRb1+Kv\n\
-            R6fi4A2laGQMpsGeE7UBlw6CMlu6HenfZV70eZJiuPDWW2tg7LBVA71ZOzW9t1+Y\n\
-            jf0nlso37KltqlzaSvkjtSJHCkK6+WDTJSBvI1oMUJoXA3DI4LOKhOq9cRlhhrBT\n\
-            +syJme7+EKIpQ0TLfd6QzHuRgSlIGG9E/xh0VuqYRh59Z5dzheYm0wRlNqin8Ou+\n\
-            37kznJzBrIf6UfdHZLcyaxjpPo606PJTtxUqLZbqhcFEGbAbVzZ485zgimqhAIeX\n\
-            q6aVZzchAgMBAAECggEAJEQKVzQ741vhwZQs8KDGhZMkWzlKZWZG3Rz/nGB3xIg+\n\
-            eFIwkuFCUlljxDE7SPgRhGZ3bV2Y/y2tdjeeDVV8ffwGld76P8op1yZznR7ENj4i\n\
-            3SIXR+vXb4Y5I/autMFS/ve3kEjRqroWjqNN1YrxhOMfSDLnG0Sdl6V2yjhG7eMD\n\
-            m/TbUrDKk3BP+pv0rWgIAw7KCz3tDyV+Y3NrsvaF9sJb/UWCbWEU8k3UEsw9XLbo\n\
-            de8O0KTRbaMi6B0VRiXyT/R3D/jp2yLA4iEvrPJokwLTny/XsSoEUPC28icmUcEf\n\
-            Rw2atJqObMUMsgMb6ZSCoGY7KfD62kauVpwZLIPf+QKBgQD84TczV9EJruuIaYpD\n\
-            6rE8YUD973Wvhnxu/CZ6M2zfngIe5yShpdElFmhtTHpFJ0tbqkdlEKSA1hlgM2Pu\n\
-            71epwKQLI+XKVR6yM2GmGFB0RQafGFeaXJ+gG+iV5hqmonT8/cRp/F4eLntLkTJv\n\
-            DcB6MdkFv3GZ333dJVf5MYt1zQKBgQDqRUtg2FsxfRDVoiie21nkImc61XxI3VT4\n\
-            JmTWYjwK0bj5Snt35Ctp/iELv723svixOfFfbAgBodtfQOEWy2m1s+uGLKpeYN03\n\
-            cQtlZUzLETITjidOnzonjW4JwHLyYZstoE3tieExcFEpnIZenD2oefsbh9ZbJljD\n\
-            Q/ENLUtypQKBgGi+uOixdUq3g6QrYzQioGtMNWl5qJud7yjhlOaFKpGtl19JiujS\n\
-            EEF2eKbdSMAgOJyteYkpTZp4FGa+oqQzy3Hq84gRxHr8qwxRMB9mbtzaQpXftVmh\n\
-            CBV/ueVtPJjNLfwk+RiVij6iLjvs1qEdZx62SxiQZfPAmRfjAf+cQBH5AoGAesGm\n\
-            tu+IEY2MVbVr/ZnJJ57TYuPdBT1dOc68hg3hknXErHRX8EHSce7lGAf3/Js+b3eC\n\
-            QFMWeux6TBZuHAiosrq9jog3Gc89+8AzjYUgUUQIbnDNrggHbBRS9a8vTEzTCHx4\n\
-            eSEHrGVDUj+ftVG/iVmpuApcy1RzrJYcaKA0abUCgYBcM9wD5L8euPt/YI4iU/GF\n\
-            bWrHzhXUVYg66/VwuHKU98hfyOqi/DpWiaqR7w2wyUdYlyYY9r2Fm0tRFcSVHiyG\n\
-            OS6IHhdak+C2RE3MPUC/OtoMwQ5HIg54eBPNLILXNVPEb0jJ0dP+oDP9C2RYI9HO\n\
-            IFuUoI9M0VsogF31fImz+g==\n\
-            -----END PRIVATE KEY-----";
-
-    // JWK n/e components that correspond to TEST_PRIVATE_KEY_PEM.
-    // Derived from the SubjectPublicKeyInfo DER at offsets [33..289] and [291..294].
-    pub(crate) const TEST_JWK_N: &str = "tWVhJ9QwV_SgjQa2FyfOngXZNhj5aschbiR1Zy2omvmODXbnuxiBI0qy08dBTsEddeZKGyMi1MSTMCdTz-uYVQw2bSX_W1zUwWUdrMAj-qgblDnWmR5w274LOaiNyQpuKjvFaSyORWqVqLobpP2FvodqJOS9GTbDpSfT1pLJfS_5oqDFiprykomDyCET6qVEYT0x0UT9qJt0-CtdVoFYcMSWfQKQgtweS3xPnkFuUIeOAqZUWrTQZ0u7WrqXhgv5kKGe-AdQ67dY85qBcu4oewMjkqDISVc7We4qsypS_8WQw1ZG9-jJbjGaA947v5LYZFxGeYAFFIKuIMQ7c7W56Q";
-    pub(crate) const TEST_JWK_E: &str = "AQAB";
-    pub(crate) const TEST_KID: &str = "unit-test-key-1";
-
     fn test_jwks() -> Jwks {
         Jwks {
-            keys: vec![Jwk::Rsa {
+            keys: vec![Jwk::Ec {
                 key_use: Some("sig".to_string()),
-                kid: Some(TEST_KID.to_string()),
-                alg: Some("RS256".to_string()),
-                n: TEST_JWK_N.to_string(),
-                e: TEST_JWK_E.to_string(),
+                kid: Some(KID.to_string()),
+                alg: Some("ES256".to_string()),
+                x: jwk_x().to_string(),
+                y: jwk_y().to_string(),
             }],
         }
     }
 
-    pub(crate) fn encoding_key() -> EncodingKey {
-        EncodingKey::from_rsa_pem(TEST_PRIVATE_KEY_PEM.as_bytes())
-            .expect("hardcoded test key must parse")
+    pub fn encoding_key() -> EncodingKey {
+        EncodingKey::from_ec_pem(private_key_pem().as_bytes())
+            .expect("generated test key must parse")
     }
 
-    pub(crate) fn make_token(claims: &HashMap<String, serde_json::Value>, kid: &str) -> String {
-        let mut header = Header::new(Algorithm::RS256);
+    pub fn make_token(claims: &HashMap<String, serde_json::Value>, kid: &str) -> String {
+        let mut header = Header::new(Algorithm::ES256);
         header.kid = Some(kid.to_string());
         encode(&header, claims, &encoding_key()).expect("token encoding must succeed")
     }
@@ -1027,7 +962,7 @@ pub(crate) mod tests {
         let provider = TestProvider::new(issuer, Some(audience));
         let jwks = test_jwks();
         let claims = valid_claims(issuer, audience);
-        let token = make_token(&claims, TEST_KID);
+        let token = make_token(&claims, KID);
 
         let result = verify_jwt(&token, &jwks, "test-provider", &provider);
 
@@ -1076,8 +1011,8 @@ pub(crate) mod tests {
             serde_json::json!((chrono::Utc::now() - chrono::Duration::hours(2)).timestamp()),
         );
 
-        let mut header = Header::new(Algorithm::RS256);
-        header.kid = Some(TEST_KID.to_string());
+        let mut header = Header::new(Algorithm::ES256);
+        header.kid = Some(KID.to_string());
         let token = encode(&header, &claims, &encoding_key()).unwrap();
 
         let result = verify_jwt(&token, &jwks, "test-provider", &provider);
@@ -1090,7 +1025,7 @@ pub(crate) mod tests {
         let provider = TestProvider::new("https://expected-issuer.example.com", None);
         let jwks = test_jwks();
         let claims = valid_claims("https://wrong-issuer.example.com", "any");
-        let token = make_token(&claims, TEST_KID);
+        let token = make_token(&claims, KID);
 
         let result = verify_jwt(&token, &jwks, "test-provider", &provider);
 
@@ -1103,7 +1038,7 @@ pub(crate) mod tests {
         let provider = TestProvider::new(issuer, Some("required-audience"));
         let jwks = test_jwks();
         let claims = valid_claims(issuer, "wrong-audience");
-        let token = make_token(&claims, TEST_KID);
+        let token = make_token(&claims, KID);
 
         let result = verify_jwt(&token, &jwks, "test-provider", &provider);
 
@@ -1118,7 +1053,7 @@ pub(crate) mod tests {
         let jwks = test_jwks();
         // Token has an audience claim, but the provider doesn't require a specific one
         let claims = valid_claims(issuer, "any-audience-value");
-        let token = make_token(&claims, TEST_KID);
+        let token = make_token(&claims, KID);
 
         let result = verify_jwt(&token, &jwks, "test-provider", &provider);
 
@@ -1132,14 +1067,14 @@ pub(crate) mod tests {
     fn verify_jwt_rejects_invalid_signature() {
         let issuer = "https://issuer.example.com";
         let provider = TestProvider::new(issuer, None);
-        let jwks = test_jwks(); // contains public key for TEST_PRIVATE_KEY_PEM
+        let jwks = test_jwks(); // contains public key for private_key_pem()
 
-        // Sign with the static alt key — kid matches, but signature won't verify against JWKS.
-        let alt_encoding_key = EncodingKey::from_rsa_pem(TEST_ALT_PRIVATE_KEY_PEM.as_bytes())
-            .expect("alt key must parse");
+        // Sign with the alt key — kid matches, but signature won't verify against JWKS.
+        let alt_encoding_key =
+            EncodingKey::from_ec_pem(alt_private_key_pem().as_bytes()).expect("alt key must parse");
 
-        let mut header = Header::new(Algorithm::RS256);
-        header.kid = Some(TEST_KID.to_string());
+        let mut header = Header::new(Algorithm::ES256);
+        header.kid = Some(KID.to_string());
         let claims = valid_claims(issuer, "any");
         let token = encode(&header, &claims, &alt_encoding_key).unwrap();
 
@@ -1177,7 +1112,7 @@ pub(crate) mod tests {
             TestProvider::new(issuer, None).with_claim_error("custom claim check failed");
         let jwks = test_jwks();
         let claims = valid_claims(issuer, "any");
-        let token = make_token(&claims, TEST_KID);
+        let token = make_token(&claims, KID);
 
         let result = verify_jwt(&token, &jwks, "test-provider", &provider);
 
@@ -1210,7 +1145,7 @@ pub(crate) mod tests {
             json!((chrono::Utc::now() + chrono::Duration::hours(1)).timestamp()),
         );
 
-        let token = make_token(&claims, TEST_KID);
+        let token = make_token(&claims, KID);
 
         let result = verify_jwt(&token, &jwks, "test-provider", &provider);
 
@@ -1225,33 +1160,34 @@ pub(crate) mod tests {
         let audience = "my-audience";
         let provider = TestProvider::new(issuer, Some(audience));
 
-        // Add a second RSA key with a different kid.  Its n/e values are
-        // arbitrary — we only need the decoding to succeed for TEST_KID.
-        // A structurally valid but unrelated JWK is sufficient as the "decoy".
-        let decoy_n = "sIGm4N1v3ELbpqX2x9pJE3VhMTXK8j5RzQyA4WcNdUfPkLmHoB6VtDwYsC0rO7IuFe2GaZbJhXlSnKpVqiRd1cMT8fWjE6yAo4NuHw3BzDkFtGvCmLsPxQeIr5KaJhUlVbNwDyOqEcPfMtSgBnXuZoRiHkAjIlWmFvCdQpYsTbEa2KrGhJnMoLwUxVzD1BkFiHpAtNqWySjCeBrOgXlDuZmKvPnRaTsHoUcJwIyMfLdEbQiGkVpYnXzAoSwBtFuCjDlHmKrNvPxQeRgSyUwVzYaBcDeEfGhIjKlMnOpQrStUvWxYzAb";
-        let decoy_e = "AQAB";
+        // Add a second EC key with a different kid as a decoy.
+        // The x/y values below are from the JWK.rs test — they form a valid
+        // P-256 public key so `to_decoding_key()` succeeds, but the kid won't
+        // match KID and the signature won't verify with it.
+        let decoy_x = "MKBCTNIcKUSDii11ySs3526iDZ8AiTo7Tu6KPAqv7D4";
+        let decoy_y = "4Etl6SRW2YiLUrN5vfvVHuhp7x8PxltmWWlbbM4IFyM";
 
         let jwks = Jwks {
             keys: vec![
-                Jwk::Rsa {
+                Jwk::Ec {
                     key_use: Some("sig".to_string()),
                     kid: Some("decoy-key".to_string()),
-                    alg: Some("RS256".to_string()),
-                    n: decoy_n.to_string(),
-                    e: decoy_e.to_string(),
+                    alg: Some("ES256".to_string()),
+                    x: decoy_x.to_string(),
+                    y: decoy_y.to_string(),
                 },
-                Jwk::Rsa {
+                Jwk::Ec {
                     key_use: Some("sig".to_string()),
-                    kid: Some(TEST_KID.to_string()),
-                    alg: Some("RS256".to_string()),
-                    n: TEST_JWK_N.to_string(),
-                    e: TEST_JWK_E.to_string(),
+                    kid: Some(KID.to_string()),
+                    alg: Some("ES256".to_string()),
+                    x: jwk_x().to_string(),
+                    y: jwk_y().to_string(),
                 },
             ],
         };
 
         let claims = valid_claims(issuer, audience);
-        let token = make_token(&claims, TEST_KID);
+        let token = make_token(&claims, KID);
 
         let result = verify_jwt(&token, &jwks, "test-provider", &provider);
 
@@ -1283,7 +1219,7 @@ pub(crate) mod tests {
             json!("owner/repo/.github/workflows/ci.yml@refs/heads/main"),
         );
 
-        let token = make_token(&claims, TEST_KID);
+        let token = make_token(&claims, KID);
 
         let result = verify_jwt(&token, &jwks, "github-provider", &provider);
 

@@ -62,3 +62,6 @@ zeroize = { version = "1.8", features = ["derive"] }
 
 [dev-dependencies]
 wiremock = "0.6"
+rcgen = { version = "0.13", default-features = false, features = ["pem", "ring"] }
+p256 = { version = "0.13", features = ["ecdsa", "pem", "jwk"] }
+yasna = { version = "0.5", features = ["bit-vec", "num-bigint"] }

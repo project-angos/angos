@@ -37,6 +37,7 @@ use crate::{
     identity::{Action, ClientIdentity},
     oci::{Digest, Namespace, Reference},
     secret::Secret,
+    test_fixtures::webhook::{ca_bundle_pem, client_cert_pem, client_key_pem},
 };
 
 // Always fails store_value so tests can exercise the cache-write-error path.
@@ -68,104 +69,6 @@ impl Cache for FailingCache {
         Ok(())
     }
 }
-
-static TEST_BUNDLE: &str = r"-----BEGIN CERTIFICATE-----
-MIIDgjCCAmqgAwIBAgIUFCYlDkKrxnJCnCtYXKvA9BaXnfowDQYJKoZIhvcNAQEL
-BQAwWDELMAkGA1UEBhMCTFUxCzAJBgNVBAgMAkxVMRMwEQYDVQQHDApMdXhlbWJv
-dXJnMRMwEQYDVQQKDApNeSBDb21wYW55MRIwEAYDVQQDDAlTZXJ2ZXIgQ0EwHhcN
-MjUxMDA5MTcxNjIyWhcNMjYxMDA5MTcxNjIyWjBaMQswCQYDVQQGEwJMVTELMAkG
-A1UECAwCTFUxEzARBgNVBAcMCkx1eGVtYm91cmcxEzARBgNVBAoMCk15IENvbXBh
-bnkxFDASBgNVBAMMC2V4YW1wbGUuY29tMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8A
-MIIBCgKCAQEAp4FMkW8y3+ZJDM1gZTSGpYk7WPHzv+eQOnWxcVif++j4EKxyIX3y
-fKm11GokU7eKIbbUGcDEzBgh5V+VQoiweBC/S4mag86JCESX5dFv1jQ+KnjP6BkW
-4bATqWwUwqUX/tXn3Oe/gTue64cU3nl7y6xOgX/jUF93GzVNS69Rz9E5DszeN1kw
-zmh8dq88CZrReZ+nrQNFNmxFooqi/6bgnV8YlFfYT5ide+8LY+8Yho3ZcJ9cv530
-TCCpX2xMfhqGFhfnVyR+Raj0/EU6PArIM+bXCw5a9llnU4ZQJBiaG6N0gSrPTHw6
-kZyi9UE5KA4TwOtFcscFC/Rhm7pqY4z7mQIDAQABo0IwQDAdBgNVHQ4EFgQUgSvE
-fVmU14s8Z4zAx3zv0x09pQMwHwYDVR0jBBgwFoAUCRVUTFXrNWkUWA8CwKljxF4R
-FlgwDQYJKoZIhvcNAQELBQADggEBAFYCZiW1zpZAty9YFg/yNL2xw4XuDxJyvapT
-4yd9LVhdIhNLSJo5dOsZynEFXOmvLpjEgfSRMAI0MhdqdqAjaDr2Wfg0P4VqfkC5
-3BoRkwZ4sFDu9r7jiKvZplBO9qln+LxS20YFme1TpjzWzzCy1v/40xVF0PGONmiq
-fTmTCQdUw11s7r6NwQPgrpJuyAX5iAY0MKccHMej5cnMy3HyjeCsByKdBqxOb+X4
-IBcx+tr+Vvs6YWA7pd2UB6GbRbMgmELwVqkMFi6P7mzJv2PXsabzLzdSD41Xh/rL
-pJ1J56iviNUViU6cY4Yy/Q9qe8aifhXXgaRgu5r8oBARAWo5LiE=
------END CERTIFICATE-----
------BEGIN CERTIFICATE-----
-MIIDkTCCAnmgAwIBAgIUL9X2kxKF7VYkVhPH/mNa3jlPp68wDQYJKoZIhvcNAQEL
-BQAwWDELMAkGA1UEBhMCTFUxCzAJBgNVBAgMAkxVMRMwEQYDVQQHDApMdXhlbWJv
-dXJnMRMwEQYDVQQKDApNeSBDb21wYW55MRIwEAYDVQQDDAlTZXJ2ZXIgQ0EwHhcN
-MjUxMDA5MTcxNjIyWhcNMjYxMDA5MTcxNjIyWjBYMQswCQYDVQQGEwJMVTELMAkG
-A1UECAwCTFUxEzARBgNVBAcMCkx1eGVtYm91cmcxEzARBgNVBAoMCk15IENvbXBh
-bnkxEjAQBgNVBAMMCVNlcnZlciBDQTCCASIwDQYJKoZIhvcNAQEBBQADggEPADCC
-AQoCggEBAMUKZYCdJF1ZsIGfjZeXfnjjWYnF7dunTBcJkdGgCi6D3Kpx3B+o61p/
-0VFkbgOZWfRpCO/aXI/YSQ+t8SPMALZ2EITb1JWFlPzy6jkP1cYw+pXEWAkwHmLA
-saEz8xZ629JlEEJ+7ZYKvkKffe1IiLS4Nswc8beW67+S1BrCRtiwlKWxKgMRQZs6
-4Z5ERTacwB+nmaCNCYs18I8Qby28OHyyJsOSVviWDQflIUarypd3+gt7RvsjS9hl
-/u05Se1lZnGTVlAIjbF0iItODSQBgWQ/GR/JsJiRazoZAHbeIsD+BysUcRPAClJl
-3Za+v9FqA2OieFJLN1jypS01S7KUKGcCAwEAAaNTMFEwHQYDVR0OBBYEFAkVVExV
-6zVpFFgPAsCpY8ReERZYMB8GA1UdIwQYMBaAFAkVVExV6zVpFFgPAsCpY8ReERZY
-MA8GA1UdEwEB/wQFMAMBAf8wDQYJKoZIhvcNAQELBQADggEBAG+IPbRcwR34T2ng
-m65iFhXHa5G+Tsjtj2XvnbaL7gImbMub3CpVdcyk+jfKbEkQypAiC1M+FA36Nx9D
-9EVrXAVieSj5sVewaPLlxyKmwMT/mUc8QghLtIU44uw4JU169Aq+csoXiVgjhwpr
-BZ3/ZjKtbGFhVuo+bmzrX8fMcHDSgRZVMc74BCqtBUubKpDzopdxsu+DmQ3gQ/wJ
-b+KEHQc1oSyOA2fh2K/CE0jSo8Rh5sAxMLbr+htmNS1AtQCoZbK6rM71fR1fKnV4
-NlSR1ByFrL5KUbQYWIYPILTHyK6SSpwGqaETpuJHm0AUrBrBUZT3Qc4Ij/YDgDhS
-iCKvlQA=
------END CERTIFICATE-----
-";
-
-static TEST_CERT: &str = r"-----BEGIN CERTIFICATE-----
-MIIDezCCAmOgAwIBAgIUEModFXgLFuzRPgiCn43Z7Xr+Au8wDQYJKoZIhvcNAQEL
-BQAwWDELMAkGA1UEBhMCTFUxCzAJBgNVBAgMAkxVMRMwEQYDVQQHDApMdXhlbWJv
-dXJnMRMwEQYDVQQKDApNeSBDb21wYW55MRIwEAYDVQQDDAlDbGllbnQgQ0EwHhcN
-MjUxMDA5MTcxNjIyWhcNMjYxMDA5MTcxNjIyWjBTMQswCQYDVQQGEwJMVTELMAkG
-A1UECAwCTFUxEzARBgNVBAcMCkx1eGVtYm91cmcxDzANBgNVBAoMBmFkbWluczER
-MA8GA1UEAwwIcGhpbGlwcGUwggEiMA0GCSqGSIb3DQEBAQUAA4IBDwAwggEKAoIB
-AQDGrO6cHAkKrTEEylFLQnweym1fzbdLCN3IV/YwtwOfiFZjx3yxcfaQXyyKaWQg
-lyVCuih/QJRFxEnZVmczmbNplEwbN/Ky4siSTZbF2Tt/9vqg+mlFZfYWO1F9tyuZ
-5O+IuaEO2thecqFMEHAIh2k5iSYo/Jx5RD3EUQ99FCaCjWWrY85laWzpb4S9NZRc
-pFo0/I1OF2PSJaFaHvQal7OMIHoXyF5AVlL6Dk9gSJ/poTVBjzn6HiI9JaoFr8AQ
-TeQwWUik0NrVOvzBhIYhCnLY/UyOhI+FkYgQ2ivSgWnYvc2FtODaQ+WcvYV5lMpO
-yrzUGtGUvP+W8DFuG/u/56MPAgMBAAGjQjBAMB0GA1UdDgQWBBRndHyZYvWkSA+a
-N2MnoNDMMckCPDAfBgNVHSMEGDAWgBQlAxQ0Idm1PwjvOpOACBgOL8wwlTANBgkq
-hkiG9w0BAQsFAAOCAQEAWWIPGg3PEs21XhuL5SIANOhyXQkwTzqHUsi7sPWKFSWv
-kIYgDKmj2faPEJZ6PG4lsfFEI+7Gr+/P+gEbvvwHjmekR434hPHxeAvwQqacYtMj
-2CkrkvpQkNdKZFcFkPaG6t48qJWOcVV4esuXQ/irlhYQBCqrQ6zsFDQ42pEtTdJ7
-LmCKvaKYTMYeiGt0XLEkz+3MS6AW2RSKqKsV53PEKYx/zxusVg1GuspYCzG5o8xm
-ytDuL5zW+HB/R/unvX0QwwunrXe1KE2xFiYPzcXOYIA8eoKDBpeyl7u4J5Fd7Vkq
-C6stttHEnme/iUDVYcjLLE9nG+CT/MZRg7O1j5JDVA==
------END CERTIFICATE-----
-";
-
-static TEST_KEY: &str = r"-----BEGIN PRIVATE KEY-----
-MIIEvgIBADANBgkqhkiG9w0BAQEFAASCBKgwggSkAgEAAoIBAQDGrO6cHAkKrTEE
-ylFLQnweym1fzbdLCN3IV/YwtwOfiFZjx3yxcfaQXyyKaWQglyVCuih/QJRFxEnZ
-VmczmbNplEwbN/Ky4siSTZbF2Tt/9vqg+mlFZfYWO1F9tyuZ5O+IuaEO2thecqFM
-EHAIh2k5iSYo/Jx5RD3EUQ99FCaCjWWrY85laWzpb4S9NZRcpFo0/I1OF2PSJaFa
-HvQal7OMIHoXyF5AVlL6Dk9gSJ/poTVBjzn6HiI9JaoFr8AQTeQwWUik0NrVOvzB
-hIYhCnLY/UyOhI+FkYgQ2ivSgWnYvc2FtODaQ+WcvYV5lMpOyrzUGtGUvP+W8DFu
-G/u/56MPAgMBAAECggEAKWUoxkAVJjNVzlC1RYARynyU82wyb6DmTPL+6cGIMLpA
-fcO32GUNYaFi72fsI9o6Oj/9Zh43hp3SYUVedWLl/e6XOOicWedksQ8XhhuwCQaV
-y+rA+mO3NYSggxgiLouD2TIMO8MfZ/ZsYyPdo/lK1GEeIVYY6C9uyzO0jXQgXfzo
-FUe9+U5KBMgWKSigv6oGFEQjTa30r5LsPMo4BvZu9dS80KRSSRFE9BPhg/u8aM/O
-gXTanZzz/v/dxwrE6Qq8pGIYiCjekcwPU/XKey/5tbaaAM61nZGdnwmMLXRO3/3f
-ktDoVnnB5QfTGhbh9IcrxJ5oj6NpFUUnGvrmp3kU2QKBgQDpE1wONEqEhBe876Y+
-qKxzDVPiAArhl/t0GGTunPcxCQshWaiLrFRyInvuoFp1PE9/PeFww2fMbywS0TLz
-b7j/fBRGCHCAQ4hH2Ine3mhYHvi8gXLX1C9XOCmOUGNxn+9zYs7Y3eaLPN3LKGmw
-VJd4IurtmpEfLNQ99RHZkMxQ0wKBgQDaN2howGxeBIcZzQUqdx4Yyx24HOzMqhiO
-tnXIgEMENClDa16NxEqBrBSIPCXgppp70QjXnzhW0V7x6H4maeHlahIvzomo+nLP
-6AocqKsfvPSTgv9pb0sldE+9537e0Ck6+8NYVNCIMqjjZRjz7jfWVAuN2XA8al4C
-zlKjRhPfVQKBgBzqxPoSLMiiJtvPE94kSTkBB0472R3CIHV37VXZbaXMzG+30vx5
-RgTfGGczx+VRtT9BKy41YDRx+pLfF6YyT06LU2yY8XRIbKkVSY24JFQCi7O/j8MN
-VU5J7oX0nVHkmO3E7YrkhQzzYUUqX2p8JErIckNGcQjgI/kH5c4Lc/33AoGBAL9K
-8Tla7eShXXmts4idcYHUlRHwMVndBrgclTYV0inePAoBFpt6ZsI0Aq/G4oGEK0q9
-XV4AEthwpCW2ZNfx2/hLuvOzwBOksX82b57d8V1aPKEPpi1cRejohHr6c8qJeotd
-ZsqJV2D93/Wvi2dS/hniBVrtMSmVKSKWkfTVmtgdAoGBANpxg6Vw1q0KX/9Xw/b4
-Dibexd+opAZR8v9/sWQbShtgb6HN1HrnjpCCRoCML5OgAfT5jZatYhXG958aJVoX
-QZNkCzFWJ+PY4vUsqDTqpcwtd+VWlwepuaWp7O96i2vhHvLJ9z6/gYHg6RxQ96nU
-4x20RWq1FM8sACYdrLbayZCL
------END PRIVATE KEY-----
-";
 
 #[test]
 fn test_config_deserialize() {
@@ -264,7 +167,7 @@ fn test_load_file() {
 fn test_load_certificate_bundle() {
     let tmp_dir = tempfile::tempdir().unwrap();
     let file_path = tmp_dir.path().join("bundle.pem");
-    fs::write(&file_path, TEST_BUNDLE).unwrap();
+    fs::write(&file_path, ca_bundle_pem()).unwrap();
 
     let loaded_certificates = load_certificate_bundle(&file_path).unwrap();
     assert_eq!(loaded_certificates.len(), 2);
@@ -288,17 +191,17 @@ fn test_load_certificate_invalid() {
 fn test_load_identity() {
     let tmp_dir = tempfile::tempdir().unwrap();
     let cert_file_path = tmp_dir.path().join("certificate.pem");
-    fs::write(&cert_file_path, TEST_CERT).unwrap();
+    fs::write(&cert_file_path, client_cert_pem()).unwrap();
 
     let key_file_path = tmp_dir.path().join("private-key.pem");
-    fs::write(&key_file_path, TEST_KEY).unwrap();
+    fs::write(&key_file_path, client_key_pem()).unwrap();
 
     let identity = load_identity(Some(&cert_file_path), Some(&key_file_path));
     assert!(matches!(identity, Ok(Some(_))));
 
     let cert_file_path = tmp_dir.path().join("certificate.pem");
     let key_file_path = tmp_dir.path().join("private-key.pem");
-    fs::write(&key_file_path, TEST_BUNDLE).unwrap();
+    fs::write(&key_file_path, ca_bundle_pem()).unwrap();
 
     let identity = load_identity(Some(&cert_file_path), Some(&key_file_path));
     assert!(matches!(identity, Err(Error::Initialization(_))));
@@ -655,13 +558,13 @@ fn build_test_config(
 fn test_new_invalid_mtls() {
     let tmp_dir = tempfile::tempdir().unwrap();
     let cert_file_path = tmp_dir.path().join("certificate.pem");
-    fs::write(&cert_file_path, TEST_CERT).unwrap();
+    fs::write(&cert_file_path, client_cert_pem()).unwrap();
 
     let key_file_path = tmp_dir.path().join("private-key.pem");
-    fs::write(&key_file_path, TEST_BUNDLE).unwrap();
+    fs::write(&key_file_path, ca_bundle_pem()).unwrap();
 
     let ca_file_path = tmp_dir.path().join("ca.pem");
-    fs::write(&ca_file_path, TEST_BUNDLE).unwrap();
+    fs::write(&ca_file_path, ca_bundle_pem()).unwrap();
 
     let config = build_test_config(
         Url::parse("https://example.com").unwrap(),
@@ -682,13 +585,13 @@ fn test_new_invalid_mtls() {
 fn test_new_mtls() {
     let tmp_dir = tempfile::tempdir().unwrap();
     let cert_file_path = tmp_dir.path().join("certificate.pem");
-    fs::write(&cert_file_path, TEST_CERT).unwrap();
+    fs::write(&cert_file_path, client_cert_pem()).unwrap();
 
     let key_file_path = tmp_dir.path().join("private-key.pem");
-    fs::write(&key_file_path, TEST_KEY).unwrap();
+    fs::write(&key_file_path, client_key_pem()).unwrap();
 
     let ca_file_path = tmp_dir.path().join("ca.pem");
-    fs::write(&ca_file_path, TEST_BUNDLE).unwrap();
+    fs::write(&ca_file_path, ca_bundle_pem()).unwrap();
 
     let config = build_test_config(
         Url::parse("https://example.com").unwrap(),

@@ -145,9 +145,10 @@ mod tests {
 
     use super::*;
     use crate::{
-        auth::oidc::validator::tests::{TEST_JWK_E, TEST_JWK_N, TEST_KID, make_token},
+        auth::oidc::validator::tests::make_token,
         cache,
         identity::ClientIdentity,
+        test_fixtures::oidc::{KID, jwk_x, jwk_y},
     };
 
     fn build_config(mock_server: &MockServer) -> Config {
@@ -163,12 +164,13 @@ mod tests {
     fn static_jwks_response() -> serde_json::Value {
         json!({
             "keys": [{
-                "kty": "RSA",
+                "kty": "EC",
                 "use": "sig",
-                "kid": TEST_KID,
-                "n": TEST_JWK_N,
-                "e": TEST_JWK_E,
-                "alg": "RS256"
+                "kid": KID,
+                "crv": "P-256",
+                "x": jwk_x(),
+                "y": jwk_y(),
+                "alg": "ES256"
             }]
         })
     }
@@ -182,7 +184,7 @@ mod tests {
             json!((chrono::Utc::now() + chrono::Duration::hours(1)).timestamp()),
         );
         claims.insert("iat".to_string(), json!(chrono::Utc::now().timestamp()));
-        make_token(&claims, TEST_KID)
+        make_token(&claims, KID)
     }
 
     #[test]
@@ -507,7 +509,7 @@ mod tests {
         );
         claims.insert("iat".to_string(), json!(chrono::Utc::now().timestamp()));
 
-        let token = make_token(&claims, TEST_KID);
+        let token = make_token(&claims, KID);
         let request = Request::builder()
             .header(AUTHORIZATION, format!("Bearer {token}"))
             .body(())

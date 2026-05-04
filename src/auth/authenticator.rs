@@ -726,7 +726,7 @@ mod tests {
     fn make_authenticator_with_cert_and_mocks(
         validators: Vec<(&'static str, MockOutcome)>,
     ) -> (Authenticator, crate::auth::PeerCertificate) {
-        let cert_der = crate::auth::mtls::tests::test_cert_der();
+        let cert_der = crate::test_fixtures::mtls::cert_der();
         let peer_cert = crate::auth::PeerCertificate(Arc::new(cert_der));
         let authenticator = make_authenticator_with_mocks(validators);
         (authenticator, peer_cert)

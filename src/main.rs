@@ -32,6 +32,9 @@ mod policy;
 mod registry;
 mod secret;
 
+#[cfg(test)]
+pub mod test_fixtures;
+
 fn set_tracing(config: Option<ObservabilityConfig>) -> Result<(), configuration::Error> {
     if let Some(ObservabilityConfig {
         tracing: Some(tracing_config),
