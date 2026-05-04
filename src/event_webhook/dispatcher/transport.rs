@@ -48,8 +48,7 @@ pub(super) async fn send_with_retries(
 
     for attempt in 0..=max_retries {
         if attempt > 0 {
-            let backoff = Duration::from_millis(100 * 2u64.pow(attempt - 1));
-            tokio::time::sleep(backoff).await;
+            tokio::time::sleep(backoff_for_attempt(attempt)).await;
         }
 
         match send_request(client, url, token, body, event_kind_header).await {
@@ -59,4 +58,28 @@ pub(super) async fn send_with_retries(
     }
 
     Err(last_err.unwrap_or_else(|| "unknown error".to_string()))
+}
+
+// `attempt` must be >= 1. Both operations saturate at u64::MAX rather than
+// panicking, so an unexpectedly large value yields Duration::from_millis(u64::MAX)
+// (~584 million years) instead of an arithmetic panic.
+fn backoff_for_attempt(attempt: u32) -> Duration {
+    Duration::from_millis(100u64.saturating_mul(2u64.saturating_pow(attempt - 1)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn backoff_grows_exponentially() {
+        assert_eq!(backoff_for_attempt(1), Duration::from_millis(100));
+        assert_eq!(backoff_for_attempt(2), Duration::from_millis(200));
+        assert_eq!(backoff_for_attempt(3), Duration::from_millis(400));
+    }
+
+    #[test]
+    fn backoff_saturates_for_huge_attempt() {
+        assert_eq!(backoff_for_attempt(100), Duration::from_millis(u64::MAX));
+    }
 }
