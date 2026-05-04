@@ -41,8 +41,12 @@ struct RawConfiguration {
     global: RawGlobalConfig,
     #[serde(default)]
     ui: UiConfig,
+    /// `cache_store` is a legacy alias kept for backwards-compatibility with
+    /// pre-1.0 configs. Prefer `cache` in new deployments.
     #[serde(default, alias = "cache_store")]
     cache: cache::Config,
+    /// `storage` is a legacy alias kept for backwards-compatibility with
+    /// pre-1.0 configs. Prefer `blob_store` in new deployments.
     #[serde(default, alias = "storage")]
     blob_store: blob_store::BlobStorageConfig,
     #[serde(default)]
