@@ -910,11 +910,7 @@ mod tests {
         );
     }
 
-    // -------------------------------------------------------------------
-    // Story 7.3.4 — global-deny, webhook path, invalid-regex fallback
-    // -------------------------------------------------------------------
-
-    // Criterion 1: global deny policy rejects every request regardless of action.
+    // Global deny policy rejects every request regardless of action.
     //
     // The `[global.access_policy]` block with `default = "deny"` and no allow-rules
     // causes `AccessPolicy::evaluate` to return `Ok(false)` for all identities.
@@ -967,7 +963,7 @@ mod tests {
         );
     }
 
-    // Criterion 2 (allow): global allow policy + global webhook returning 200 → request allowed.
+    // Global allow policy + global webhook returning 200 → request allowed.
     //
     // `Action::ApiVersion` carries no namespace, so `authorize_request` takes the
     // non-namespace branch and calls the global webhook directly.  A 200 response
@@ -1031,7 +1027,7 @@ mod tests {
         );
     }
 
-    // Criterion 2 (deny): global allow policy + global webhook returning 403 → request denied.
+    // Global allow policy + global webhook returning 403 → request denied.
     #[tokio::test]
     async fn global_webhook_path_deny_when_webhook_returns_403() {
         use crate::command::server::Error as ServerError;
@@ -1093,13 +1089,13 @@ mod tests {
         );
     }
 
-    // Criterion 3: invalid-regex unreachability.
+    // Invalid-regex unreachability.
     //
-    // Story 6.14 introduced `RegexPattern`, which compiles the regex at TOML
-    // deserialise time.  An invalid pattern causes `Configuration::load_from_str`
-    // to return `Err` before any `Authorizer` is constructed, so it can never
-    // reach `is_tag_mutable`.  This test documents the `RegexPattern::compile` API
-    // directly so the compile-time rejection invariant is grep-able from here.
+    // `RegexPattern` compiles the regex at TOML deserialise time. An invalid
+    // pattern causes `Configuration::load_from_str` to return `Err` before any
+    // `Authorizer` is constructed, so it can never reach `is_tag_mutable`. This
+    // test documents the `RegexPattern::compile` API directly so the
+    // compile-time rejection invariant is grep-able from here.
     #[test]
     fn regex_pattern_compile_rejects_invalid_pattern() {
         let err = RegexPattern::compile("[invalid");
@@ -1110,8 +1106,8 @@ mod tests {
         );
     }
 
-    // Criterion 4: a namespace that maps to no configured repository is passed
-    // through without error or panic under an allow policy.
+    // A namespace that maps to no configured repository is passed through
+    // without error or panic under an allow policy.
     //
     // `authorize_namespace_request` returns `Ok(())` early when
     // `get_repository_for_namespace` returns `Err`, so the default policy is
@@ -1168,7 +1164,7 @@ mod tests {
         );
     }
 
-    // Criterion 5: webhook unreachable → fail-closed.
+    // Webhook unreachable → fail-closed.
     //
     // When the webhook endpoint is unreachable, `WebhookAuthorizer::authorize`
     // returns `Err(Error::Unauthorized(...))`.  `authorize_namespace_request`

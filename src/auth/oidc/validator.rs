@@ -1123,8 +1123,7 @@ pub mod tests {
     }
 
     /// A token whose `nbf` (not-before) is in the future must be rejected.
-    /// The story calls this "future iat"; the actual enforcement mechanism in
-    /// `verify_jwt` is `validation.validate_nbf = true`.
+    /// The enforcement mechanism in `verify_jwt` is `validation.validate_nbf = true`.
     #[test]
     fn verify_jwt_rejects_future_nbf() {
         let issuer = "https://issuer.example.com";

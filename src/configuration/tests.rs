@@ -1344,10 +1344,6 @@ fn event_webhook_bad_repo_reference_fails_load() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// Story 7.4.5 — log_deprecations output and webhook nested-field validation
-// ---------------------------------------------------------------------------
-
 #[test]
 fn deprecated_fields_empty_when_no_deprecated_config() {
     let config = r#"

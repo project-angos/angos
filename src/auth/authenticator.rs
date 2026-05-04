@@ -733,10 +733,10 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------------
-    // Method-tracking integration tests (criteria 1–3, 5 from Story 7.3.3).
+    // Method-tracking integration tests.
     // ---------------------------------------------------------------------------
 
-    /// Criterion 2: mTLS succeeds + all OIDC providers return `NoCredentials`.
+    /// mTLS succeeds + all OIDC providers return `NoCredentials`.
     /// The identity must carry certificate info and no OIDC claims.
     /// `select_auth_method(true, false, false)` → "mtls"; certificate not downgraded.
     #[tokio::test]
@@ -769,7 +769,7 @@ mod tests {
         );
     }
 
-    /// Criterion 3: mTLS has no certificate (`NoCredentials`) + one OIDC provider succeeds.
+    /// mTLS has no certificate (`NoCredentials`) + one OIDC provider succeeds.
     /// The identity must carry OIDC claims and no certificate info.
     /// `select_auth_method(false, true, false)` → "oidc".
     #[tokio::test]
@@ -799,7 +799,7 @@ mod tests {
         );
     }
 
-    /// Criterion 1: mTLS succeeds + OIDC provider A fails, provider B also fails.
+    /// mTLS succeeds + OIDC provider A fails, provider B also fails.
     /// The chain propagates the first OIDC error via `?`, so `authenticate_request`
     /// returns `Err`.  The test verifies the error is the one from the
     /// alphabetically-first provider ("alpha") — the method-label computation
@@ -826,7 +826,7 @@ mod tests {
         );
     }
 
-    /// Criterion 5: when OIDC succeeds, basic auth is skipped entirely.
+    /// When OIDC succeeds, basic auth is skipped entirely.
     /// Even if valid basic-auth credentials are present in the request, the
     /// OIDC success short-circuits the basic-auth path (`if oidc_ok { false }`).
     /// The identity carries OIDC claims; username is None (basic never ran).

@@ -1039,11 +1039,6 @@ bind_address = "10.0.0.1"
         assert_eq!(notifier.tls_change_count(), 0);
     }
 
-    // -----------------------------------------------------------------------
-    // Story 7.4.4 — startup-with-invalid-config, debounce-burst,
-    //               missing-TLS-dir, dynamic-TLS-path
-    // -----------------------------------------------------------------------
-
     /// `ConfigWatcher::new` must return `Err(Error::NotReadable)` immediately
     /// when the config file does not exist at all.  The caller (the `server`
     /// command) relies on this to abort startup with a clear error message
