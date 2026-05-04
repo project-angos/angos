@@ -723,38 +723,10 @@ mod tests {
     // Helpers shared by method-tracking integration tests below.
     // ---------------------------------------------------------------------------
 
-    fn generate_test_certificate_der() -> Vec<u8> {
-        use std::process::Command;
-
-        let output = Command::new("openssl")
-            .args([
-                "req",
-                "-x509",
-                "-newkey",
-                "rsa:2048",
-                "-nodes",
-                "-keyout",
-                "/dev/null",
-                "-out",
-                "/dev/stdout",
-                "-days",
-                "1",
-                "-subj",
-                "/CN=test-user/O=TestOrg",
-                "-outform",
-                "DER",
-            ])
-            .output()
-            .expect("openssl must be available");
-
-        assert!(output.status.success(), "openssl failed to generate cert");
-        output.stdout
-    }
-
     fn make_authenticator_with_cert_and_mocks(
         validators: Vec<(&'static str, MockOutcome)>,
     ) -> (Authenticator, crate::auth::PeerCertificate) {
-        let cert_der = generate_test_certificate_der();
+        let cert_der = crate::auth::mtls::tests::test_cert_der();
         let peer_cert = crate::auth::PeerCertificate(Arc::new(cert_der));
         let authenticator = make_authenticator_with_mocks(validators);
         (authenticator, peer_cert)
