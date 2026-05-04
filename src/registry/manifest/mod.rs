@@ -10,9 +10,23 @@ use crate::{
     oci::{Digest, Manifest, Namespace, Reference},
     registry::{
         DOCKER_CONTENT_DIGEST, Error, OCI_SUBJECT, Registry, Repository,
-        metadata_store::{MetadataStoreExt, link_kind::LinkKind},
+        metadata_store::{MetadataStoreExt, Transaction, link_kind::LinkKind},
+        pagination::collect_all_pages,
     },
 };
+
+fn add_link_with_media_type(
+    tx: &mut Transaction<'_>,
+    link: &LinkKind,
+    target: &Digest,
+    media_type: Option<&str>,
+) {
+    let mut builder = tx.create_link(link, target);
+    if let Some(mt) = media_type {
+        builder = builder.with_media_type(mt);
+    }
+    builder.add();
+}
 
 pub(crate) struct ManifestMeta {
     pub media_type: Option<String>,
@@ -374,23 +388,20 @@ impl Registry {
             .cloned()
             .or_else(|| manifest.media_type.clone());
 
-        if let Some(ref mt) = effective_media_type {
-            tx.create_link(&LinkKind::Digest(digest.clone()), &digest)
-                .with_media_type(mt)
-                .add();
-        } else {
-            tx.create_link(&LinkKind::Digest(digest.clone()), &digest)
-                .add();
-        }
+        add_link_with_media_type(
+            &mut tx,
+            &LinkKind::Digest(digest.clone()),
+            &digest,
+            effective_media_type.as_deref(),
+        );
 
         if let Reference::Tag(tag) = reference {
-            if let Some(ref mt) = effective_media_type {
-                tx.create_link(&LinkKind::Tag(tag.clone()), &digest)
-                    .with_media_type(mt)
-                    .add();
-            } else {
-                tx.create_link(&LinkKind::Tag(tag.clone()), &digest).add();
-            }
+            add_link_with_media_type(
+                &mut tx,
+                &LinkKind::Tag(tag.clone()),
+                &digest,
+                effective_media_type.as_deref(),
+            );
         }
 
         if let Some(subject) = &manifest.subject {
@@ -437,6 +448,40 @@ impl Registry {
         })
     }
 
+    async fn find_tags_for_digest(
+        &self,
+        namespace: &Namespace,
+        digest: &Digest,
+    ) -> Result<Vec<String>, Error> {
+        let all_tags = collect_all_pages(|marker| async move {
+            self.metadata_store.list_tags(namespace, 100, marker).await
+        })
+        .await?;
+
+        let matching = futures_util::stream::iter(all_tags)
+            .map(|tag| async move {
+                let result = self
+                    .metadata_store
+                    .read_link(namespace, &LinkKind::Tag(tag.clone()), false)
+                    .await;
+                (tag, result)
+            })
+            .buffer_unordered(20)
+            .filter_map(|(tag, result)| async move {
+                if let Ok(metadata) = result
+                    && &metadata.target == digest
+                {
+                    Some(tag)
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>()
+            .await;
+
+        Ok(matching)
+    }
+
     #[instrument(skip(actor))]
     pub async fn delete_manifest(
         &self,
@@ -453,46 +498,9 @@ impl Registry {
             Reference::Digest(digest) => {
                 tx.delete_link(&LinkKind::Digest(digest.clone()));
 
-                let mut all_tags = Vec::new();
-                let mut marker = None;
-                loop {
-                    let (tags, next_marker) = self
-                        .metadata_store
-                        .list_tags(namespace, 100, marker)
-                        .await?;
-                    all_tags.extend(tags);
-                    if next_marker.is_none() {
-                        break;
-                    }
-                    marker = next_marker;
-                }
-
-                let matching_tags: Vec<_> = futures_util::stream::iter(all_tags)
-                    .map(|tag| {
-                        let tag_link = LinkKind::Tag(tag);
-                        async {
-                            let result = self
-                                .metadata_store
-                                .read_link(namespace, &tag_link, false)
-                                .await;
-                            (tag_link, result)
-                        }
-                    })
-                    .buffer_unordered(20)
-                    .filter_map(|(tag_link, result)| async {
-                        if let Ok(metadata) = result
-                            && &metadata.target == digest
-                        {
-                            Some(tag_link)
-                        } else {
-                            None
-                        }
-                    })
-                    .collect()
-                    .await;
-
-                for tag_link in matching_tags {
-                    tx.delete_link(&tag_link);
+                let matching_tags = self.find_tags_for_digest(namespace, digest).await?;
+                for tag in matching_tags {
+                    tx.delete_link(&LinkKind::Tag(tag));
                 }
 
                 if let Ok(content) = self.blob_store.read(digest).await

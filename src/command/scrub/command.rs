@@ -2,10 +2,9 @@ use std::{collections::HashMap, sync::Arc};
 
 use argh::FromArgs;
 use chrono::Duration;
-use tracing::{error, info};
+use tracing::info;
 
 use crate::{
-    cache,
     cache::Cache,
     command::scrub::{
         check::{
@@ -15,7 +14,7 @@ use crate::{
         error::Error,
     },
     configuration::Configuration,
-    policy::{RetentionPolicy, RetentionPolicyConfig},
+    policy::{RetentionPolicy, RetentionPolicyConfig, SystemClock},
     registry::{
         Repository,
         blob_store::{BlobStore, MultipartCleanup, UploadStore},
@@ -70,37 +69,8 @@ pub struct Command {
 }
 
 async fn build_metadata_store(config: &Configuration) -> Result<Arc<dyn MetadataStore>, Error> {
-    match config.resolve_metadata_config().to_backend(None).await {
-        Ok((store, _)) => Ok(store),
-        Err(err) => {
-            let msg = format!("Failed to initialize metadata store: {err}");
-            Err(Error::Initialization(msg))
-        }
-    }
-}
-
-fn build_auth_cache(config: &cache::Config) -> Result<Arc<dyn Cache>, Error> {
-    match config.to_backend() {
-        Ok(cache) => Ok(cache),
-        Err(err) => {
-            let msg = format!("Failed to initialize auth token cache: {err}");
-            Err(Error::Initialization(msg))
-        }
-    }
-}
-
-fn build_repository(
-    name: &str,
-    config: &repository::Config,
-    auth_cache: &Arc<dyn Cache>,
-) -> Result<Repository, Error> {
-    match Repository::new(name, config, auth_cache) {
-        Ok(repo) => Ok(repo),
-        Err(err) => {
-            let msg = format!("Failed to initialize repository '{name}': {err}");
-            Err(Error::Initialization(msg))
-        }
-    }
+    let (store, _) = config.resolve_metadata_config().to_backend(None).await?;
+    Ok(store)
 }
 
 fn build_repositories(
@@ -109,7 +79,9 @@ fn build_repositories(
 ) -> Result<Arc<HashMap<String, Repository>>, Error> {
     let mut repositories = HashMap::new();
     for (name, config) in configs {
-        let repo = build_repository(name, config, auth_cache)?;
+        let repo = Repository::new(name, config, auth_cache).map_err(|err| {
+            Error::Initialization(format!("Failed to initialize repository '{name}': {err}"))
+        })?;
         repositories.insert(name.clone(), repo);
     }
 
@@ -121,7 +93,10 @@ fn build_global_retention_policy(config: &RetentionPolicyConfig) -> Option<Arc<R
         return None;
     }
 
-    Some(Arc::new(RetentionPolicy::new(config)))
+    Some(Arc::new(RetentionPolicy::new(
+        config,
+        Arc::new(SystemClock),
+    )))
 }
 
 fn build_namespace_checkers(
@@ -226,12 +201,9 @@ fn build_multipart_checker(
 
 impl Command {
     pub async fn new(options: &Options, config: &Configuration) -> Result<Self, Error> {
-        let blob_handles = config
-            .blob_store
-            .to_backend(None)
-            .map_err(|_| Error::Initialization("Failed to initialize blob store".to_string()))?;
+        let blob_handles = config.blob_store.to_backend(None).map_err(Error::from)?;
         let metadata_store = build_metadata_store(config).await?;
-        let auth_cache = build_auth_cache(&config.cache)?;
+        let auth_cache = config.cache.to_backend().map_err(Error::from)?;
         let repositories = build_repositories(&config.repository, &auth_cache)?;
 
         let namespace_checkers = build_namespace_checkers(
@@ -267,12 +239,7 @@ impl Command {
 
     async fn scrub_metadata(&self) -> Result<(), Error> {
         let namespaces =
-            collect_all_pages(|marker| self.metadata_store.list_namespaces(100, marker))
-                .await
-                .map_err(|_| {
-                    error!("Failed to read catalog");
-                    Error::Execution("Failed to read catalog".to_string())
-                })?;
+            collect_all_pages(|marker| self.metadata_store.list_namespaces(100, marker)).await?;
 
         for namespace in namespaces {
             for checker in &self.namespace_checkers {
@@ -292,10 +259,7 @@ impl Command {
 
     async fn scrub_multipart_uploads(&self) -> Result<(), Error> {
         if let Some(checker) = &self.multipart_checker {
-            checker
-                .check_all()
-                .await
-                .map_err(|e| Error::Execution(format!("Multipart cleanup failed: {e}")))?;
+            checker.check_all().await?;
         }
         Ok(())
     }

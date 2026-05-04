@@ -260,6 +260,29 @@ curl http://localhost:8000/v2/_ext/myrepo/myimage/_revisions | jq
 
 ---
 
+## Misconfigured Rules and Fail-Open Semantics
+
+Retention policies are **fail-open**: when a rule behaves unexpectedly, the manifest is retained rather than deleted. This is a deliberate safety choice — it is safer to keep a manifest that should have been deleted than to silently delete one that should have been kept.
+
+| Situation | Result | Log level |
+|---|---|---|
+| Rule returns `true` | manifest retained | `debug` |
+| Rule returns `false` | next rule evaluated | — |
+| Rule returns a non-boolean (misconfiguration) | manifest retained | `warn` |
+| Rule fails to evaluate (e.g., reference to undefined variable) | manifest retained | `warn` |
+| No rule returns `true` | manifest eligible for deletion | — |
+
+When a misconfigured rule triggers the fail-open path, Angos emits a `warn`-level log line that includes the rule index (1-based) and the unexpected value or error. Grep your logs for lines containing `"treating as 'retain' (fail-open)"` to surface any misconfigured rules.
+
+```
+WARN retention rule 2 returned non-boolean value: Int(42); treating as 'retain' (fail-open)
+WARN retention rule 3 evaluation failed: no such key: nonexistent_var; treating as 'retain' (fail-open)
+```
+
+Fix the offending rule and re-run `scrub --retention --dry-run` to verify the corrected behaviour before running without `--dry-run`.
+
+---
+
 ## Troubleshooting
 
 **Images not being deleted:**

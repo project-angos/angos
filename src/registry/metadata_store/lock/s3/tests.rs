@@ -10,9 +10,13 @@ use chrono::Utc;
 use uuid::Uuid;
 
 use super::{RecoveryOutcome, S3LockBackend, S3LockConfig, S3LockPayload};
-use crate::registry::{data_store, metadata_store::lock::LockBackend};
+use crate::{
+    metrics_provider,
+    registry::{data_store, metadata_store::lock::LockBackend},
+};
 
 fn test_store(prefix: &str) -> Arc<data_store::s3::Backend> {
+    metrics_provider::init_for_tests();
     let run_id = Uuid::new_v4();
     let config = data_store::s3::BackendConfig {
         access_key_id: "root".to_string(),

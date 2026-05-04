@@ -127,7 +127,7 @@ mod tests {
     use super::*;
     use crate::{
         oci::Digest,
-        registry::{metadata_store::BlobIndexOperation, test_utils, tests::backends},
+        registry::{metadata_store::BlobIndexOperation, test_utils, test_utils::backends},
     };
 
     #[tokio::test]

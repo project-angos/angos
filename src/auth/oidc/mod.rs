@@ -133,7 +133,7 @@ fn extract_oidc_credential(parts: &Parts, provider_name: &str) -> Option<String>
 
 #[cfg(test)]
 mod tests {
-    use std::net::SocketAddr;
+    use std::{collections::HashMap, net::SocketAddr};
 
     use base64::{Engine, engine::general_purpose::STANDARD as BASE64_STANDARD};
     use hyper::{Request, header::AUTHORIZATION};
@@ -144,7 +144,12 @@ mod tests {
     };
 
     use super::*;
-    use crate::{cache, identity::ClientIdentity};
+    use crate::{
+        auth::oidc::validator::tests::make_token,
+        cache,
+        identity::ClientIdentity,
+        test_fixtures::oidc::{KID, jwk_x, jwk_y},
+    };
 
     fn build_config(mock_server: &MockServer) -> Config {
         Config::Generic(generic::ProviderConfig {
@@ -154,6 +159,32 @@ mod tests {
             required_audience: None,
             clock_skew_tolerance: 60,
         })
+    }
+
+    fn static_jwks_response() -> serde_json::Value {
+        json!({
+            "keys": [{
+                "kty": "EC",
+                "use": "sig",
+                "kid": KID,
+                "crv": "P-256",
+                "x": jwk_x(),
+                "y": jwk_y(),
+                "alg": "ES256"
+            }]
+        })
+    }
+
+    fn make_test_token(issuer: &str) -> String {
+        let mut claims = HashMap::new();
+        claims.insert("iss".to_string(), json!(issuer));
+        claims.insert("sub".to_string(), json!("test-user"));
+        claims.insert(
+            "exp".to_string(),
+            json!((chrono::Utc::now() + chrono::Duration::hours(1)).timestamp()),
+        );
+        claims.insert("iat".to_string(), json!(chrono::Utc::now().timestamp()));
+        make_token(&claims, KID)
     }
 
     #[test]
@@ -267,77 +298,13 @@ mod tests {
         );
     }
 
-    pub fn create_rsa_keypair() -> (String, String) {
-        use std::process::Command;
-
-        let output = Command::new("openssl")
-            .args(["genrsa", "2048"])
-            .output()
-            .expect("Failed to generate RSA key");
-
-        let private_key = String::from_utf8(output.stdout).expect("Invalid UTF-8");
-
-        let output = Command::new("openssl")
-            .args(["rsa", "-pubout"])
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .spawn()
-            .and_then(|mut child| {
-                use std::io::Write;
-                child
-                    .stdin
-                    .as_mut()
-                    .unwrap()
-                    .write_all(private_key.as_bytes())?;
-                child.wait_with_output()
-            })
-            .expect("Failed to extract public key");
-
-        let public_key = String::from_utf8(output.stdout).expect("Invalid UTF-8");
-
-        (private_key, public_key)
-    }
-
-    pub fn rsa_public_key_to_jwk(public_key_pem: &str) -> serde_json::Value {
-        use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
-
-        let public_key_pem = public_key_pem
-            .replace("-----BEGIN PUBLIC KEY-----", "")
-            .replace("-----END PUBLIC KEY-----", "")
-            .replace('\n', "");
-
-        let der = base64::engine::general_purpose::STANDARD
-            .decode(public_key_pem)
-            .expect("Failed to decode base64");
-
-        let n = URL_SAFE_NO_PAD.encode(&der[33..289]);
-        let e = URL_SAFE_NO_PAD.encode(&der[291..294]);
-
-        json!({
-            "kty": "RSA",
-            "use": "sig",
-            "kid": "test-key-1",
-            "n": n,
-            "e": e,
-            "alg": "RS256"
-        })
-    }
-
     #[tokio::test]
     async fn test_validate_token_success() {
-        use jsonwebtoken::{EncodingKey, Header, encode};
-
         let mock_server = MockServer::start().await;
-        let (private_key, public_key) = create_rsa_keypair();
-        let jwk = rsa_public_key_to_jwk(&public_key);
-
-        let jwks_response = json!({
-            "keys": [jwk]
-        });
 
         Mock::given(method("GET"))
             .and(path("/.well-known/jwks"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(&jwks_response))
+            .respond_with(ResponseTemplate::new(200).set_body_json(static_jwks_response()))
             .mount(&mock_server)
             .await;
 
@@ -345,25 +312,7 @@ mod tests {
         let cache = cache::Config::Memory.to_backend().unwrap();
         let validator = OidcValidator::new("test-provider".to_string(), &config, cache).unwrap();
 
-        let mut header = Header::new(jsonwebtoken::Algorithm::RS256);
-        header.kid = Some("test-key-1".to_string());
-
-        let mut claims = std::collections::HashMap::new();
-        claims.insert("iss".to_string(), json!(mock_server.uri()));
-        claims.insert("sub".to_string(), json!("test-user"));
-        claims.insert(
-            "exp".to_string(),
-            json!((chrono::Utc::now() + chrono::Duration::hours(1)).timestamp()),
-        );
-        claims.insert("iat".to_string(), json!(chrono::Utc::now().timestamp()));
-
-        let token = encode(
-            &header,
-            &claims,
-            &EncodingKey::from_rsa_pem(private_key.as_bytes()).unwrap(),
-        )
-        .unwrap();
-
+        let token = make_test_token(&mock_server.uri());
         let result = validator.validate_token(&token).await;
 
         assert!(result.is_ok());
@@ -393,19 +342,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_authenticate_with_bearer_token() {
-        use jsonwebtoken::{EncodingKey, Header, encode};
-
         let mock_server = MockServer::start().await;
-        let (private_key, public_key) = create_rsa_keypair();
-        let jwk = rsa_public_key_to_jwk(&public_key);
-
-        let jwks_response = json!({
-            "keys": [jwk]
-        });
 
         Mock::given(method("GET"))
             .and(path("/.well-known/jwks"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(&jwks_response))
+            .respond_with(ResponseTemplate::new(200).set_body_json(static_jwks_response()))
             .mount(&mock_server)
             .await;
 
@@ -413,25 +354,7 @@ mod tests {
         let cache = cache::Config::Memory.to_backend().unwrap();
         let validator = OidcValidator::new("test-provider".to_string(), &config, cache).unwrap();
 
-        let mut header = Header::new(jsonwebtoken::Algorithm::RS256);
-        header.kid = Some("test-key-1".to_string());
-
-        let mut claims = std::collections::HashMap::new();
-        claims.insert("iss".to_string(), json!(mock_server.uri()));
-        claims.insert("sub".to_string(), json!("test-user"));
-        claims.insert(
-            "exp".to_string(),
-            json!((chrono::Utc::now() + chrono::Duration::hours(1)).timestamp()),
-        );
-        claims.insert("iat".to_string(), json!(chrono::Utc::now().timestamp()));
-
-        let token = encode(
-            &header,
-            &claims,
-            &EncodingKey::from_rsa_pem(private_key.as_bytes()).unwrap(),
-        )
-        .unwrap();
-
+        let token = make_test_token(&mock_server.uri());
         let request = Request::builder()
             .header(AUTHORIZATION, format!("Bearer {token}"))
             .body(())
@@ -452,19 +375,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_authenticate_with_basic_auth_matching_provider() {
-        use jsonwebtoken::{EncodingKey, Header, encode};
-
         let mock_server = MockServer::start().await;
-        let (private_key, public_key) = create_rsa_keypair();
-        let jwk = rsa_public_key_to_jwk(&public_key);
-
-        let jwks_response = json!({
-            "keys": [jwk]
-        });
 
         Mock::given(method("GET"))
             .and(path("/.well-known/jwks"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(&jwks_response))
+            .respond_with(ResponseTemplate::new(200).set_body_json(static_jwks_response()))
             .mount(&mock_server)
             .await;
 
@@ -472,25 +387,7 @@ mod tests {
         let cache = cache::Config::Memory.to_backend().unwrap();
         let validator = OidcValidator::new("github".to_string(), &config, cache).unwrap();
 
-        let mut header = Header::new(jsonwebtoken::Algorithm::RS256);
-        header.kid = Some("test-key-1".to_string());
-
-        let mut claims = std::collections::HashMap::new();
-        claims.insert("iss".to_string(), json!(mock_server.uri()));
-        claims.insert("sub".to_string(), json!("test-user"));
-        claims.insert(
-            "exp".to_string(),
-            json!((chrono::Utc::now() + chrono::Duration::hours(1)).timestamp()),
-        );
-        claims.insert("iat".to_string(), json!(chrono::Utc::now().timestamp()));
-
-        let token = encode(
-            &header,
-            &claims,
-            &EncodingKey::from_rsa_pem(private_key.as_bytes()).unwrap(),
-        )
-        .unwrap();
-
+        let token = make_test_token(&mock_server.uri());
         let credentials = BASE64_STANDARD.encode(format!("github:{token}"));
         let request = Request::builder()
             .header(AUTHORIZATION, format!("Basic {credentials}"))
@@ -590,19 +487,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_authenticate_populates_identity() {
-        use jsonwebtoken::{EncodingKey, Header, encode};
-
         let mock_server = MockServer::start().await;
-        let (private_key, public_key) = create_rsa_keypair();
-        let jwk = rsa_public_key_to_jwk(&public_key);
-
-        let jwks_response = json!({
-            "keys": [jwk]
-        });
 
         Mock::given(method("GET"))
             .and(path("/.well-known/jwks"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(&jwks_response))
+            .respond_with(ResponseTemplate::new(200).set_body_json(static_jwks_response()))
             .mount(&mock_server)
             .await;
 
@@ -610,10 +499,7 @@ mod tests {
         let cache = cache::Config::Memory.to_backend().unwrap();
         let validator = OidcValidator::new("my-provider".to_string(), &config, cache).unwrap();
 
-        let mut header = Header::new(jsonwebtoken::Algorithm::RS256);
-        header.kid = Some("test-key-1".to_string());
-
-        let mut claims = std::collections::HashMap::new();
+        let mut claims = HashMap::new();
         claims.insert("iss".to_string(), json!(mock_server.uri()));
         claims.insert("sub".to_string(), json!("user-123"));
         claims.insert("email".to_string(), json!("user@example.com"));
@@ -623,13 +509,7 @@ mod tests {
         );
         claims.insert("iat".to_string(), json!(chrono::Utc::now().timestamp()));
 
-        let token = encode(
-            &header,
-            &claims,
-            &EncodingKey::from_rsa_pem(private_key.as_bytes()).unwrap(),
-        )
-        .unwrap();
-
+        let token = make_token(&claims, KID);
         let request = Request::builder()
             .header(AUTHORIZATION, format!("Bearer {token}"))
             .body(())

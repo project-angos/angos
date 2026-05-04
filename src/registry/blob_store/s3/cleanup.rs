@@ -19,6 +19,15 @@ pub fn parse_upload_key(key: &str) -> Option<(&str, &str)> {
         .rsplit_once("/_uploads/")
 }
 
+/// Returns `true` when a multipart upload initiated at `initiated` should be
+/// considered orphaned — i.e., its age as of `now` meets or exceeds `timeout`.
+///
+/// A negative age (clock skew where `initiated` is in the future) is never
+/// considered orphaned.
+pub fn is_orphan(initiated: DateTime<Utc>, now: DateTime<Utc>, timeout: Duration) -> bool {
+    now.signed_duration_since(initiated) >= timeout
+}
+
 impl Backend {
     async fn check_and_abort_orphan(
         &self,
@@ -29,7 +38,7 @@ impl Backend {
         timeout: Duration,
         dry_run: bool,
     ) -> Result<bool, Error> {
-        if now.signed_duration_since(initiated) < timeout {
+        if !is_orphan(initiated, now, timeout) {
             return Ok(false);
         }
         let Some((namespace, uuid)) = parse_upload_key(key) else {
@@ -91,6 +100,47 @@ impl MultipartCleanup for Backend {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- is_orphan unit tests ---
+
+    #[test]
+    fn test_is_orphan_recent_upload_is_not_orphan() {
+        let now = Utc::now();
+        let initiated = now - Duration::minutes(5);
+        let timeout = Duration::hours(1);
+        assert!(!is_orphan(initiated, now, timeout));
+    }
+
+    #[test]
+    fn test_is_orphan_old_upload_is_orphan() {
+        let now = Utc::now();
+        let initiated = now - Duration::hours(2);
+        let timeout = Duration::hours(1);
+        assert!(is_orphan(initiated, now, timeout));
+    }
+
+    /// At the exact boundary (age == timeout), the upload is considered orphaned
+    /// because the check uses `>=`. An upload that has been sitting for exactly
+    /// the timeout duration is no longer considered recent.
+    #[test]
+    fn test_is_orphan_at_exact_timeout_boundary() {
+        let now = Utc::now();
+        let timeout = Duration::hours(1);
+        let initiated = now - timeout;
+        assert!(is_orphan(initiated, now, timeout));
+    }
+
+    /// An upload whose `initiated` timestamp is in the future (clock skew) must
+    /// never be treated as orphaned — age is negative and below any positive timeout.
+    #[test]
+    fn test_is_orphan_future_initiated_is_not_orphan() {
+        let now = Utc::now();
+        let initiated = now + Duration::minutes(10);
+        let timeout = Duration::hours(1);
+        assert!(!is_orphan(initiated, now, timeout));
+    }
+
+    // --- parse_upload_key unit tests ---
 
     #[test]
     fn test_parse_upload_key_valid() {

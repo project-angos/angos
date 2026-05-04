@@ -53,13 +53,13 @@ impl TryFrom<&str> for Digest {
 
     fn try_from(s: &str) -> Result<Self, Self::Error> {
         let (algorithm, hash) = s.split_once(':').ok_or_else(|| {
-            Error::InvalidFormat(format!(
+            Error::InvalidDigest(format!(
                 "Digest must be in the format 'algorithm:hash', got '{s}'"
             ))
         })?;
 
         if algorithm != "sha256" {
-            return Err(Error::InvalidFormat(format!(
+            return Err(Error::InvalidDigest(format!(
                 "Unsupported digest algorithm '{algorithm}'"
             )));
         }
@@ -73,7 +73,7 @@ impl TryFrom<&str> for Digest {
         // REF:
         // - https://github.com/opencontainers/image-spec/blob/v1.0.1/descriptor.md#sha-256
         if hash.len() != 64 || !hash.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
-            return Err(Error::InvalidFormat(format!(
+            return Err(Error::InvalidDigest(format!(
                 "Invalid sha256 hash '{hash}'"
             )));
         }
@@ -162,7 +162,7 @@ mod tests {
 
     #[test]
     fn test_rejects_empty_string() {
-        let Err(Error::InvalidFormat(msg)) = Digest::from_str("") else {
+        let Err(Error::InvalidDigest(msg)) = Digest::from_str("") else {
             panic!("expected error");
         };
         assert!(msg.contains("''"), "msg: {msg}");
@@ -170,7 +170,7 @@ mod tests {
 
     #[test]
     fn test_rejects_no_colon() {
-        let Err(Error::InvalidFormat(msg)) = Digest::from_str("sha256nocolon") else {
+        let Err(Error::InvalidDigest(msg)) = Digest::from_str("sha256nocolon") else {
             panic!("expected error");
         };
         assert!(msg.contains("'sha256nocolon'"), "msg: {msg}");
@@ -178,7 +178,7 @@ mod tests {
 
     #[test]
     fn test_rejects_empty_algorithm() {
-        let Err(Error::InvalidFormat(msg)) = Digest::from_str(&format!(":{VALID_HASH}")) else {
+        let Err(Error::InvalidDigest(msg)) = Digest::from_str(&format!(":{VALID_HASH}")) else {
             panic!("expected error");
         };
         assert_eq!(msg, "Unsupported digest algorithm ''");
@@ -186,7 +186,7 @@ mod tests {
 
     #[test]
     fn test_rejects_empty_hash() {
-        let Err(Error::InvalidFormat(msg)) = Digest::from_str("sha256:") else {
+        let Err(Error::InvalidDigest(msg)) = Digest::from_str("sha256:") else {
             panic!("expected error");
         };
         assert_eq!(msg, "Invalid sha256 hash ''");
@@ -195,7 +195,7 @@ mod tests {
     #[test]
     fn test_rejects_invalid_hex_chars() {
         let invalid_hash = "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz";
-        let Err(Error::InvalidFormat(msg)) = Digest::from_str(&format!("sha256:{invalid_hash}"))
+        let Err(Error::InvalidDigest(msg)) = Digest::from_str(&format!("sha256:{invalid_hash}"))
         else {
             panic!("expected error");
         };
@@ -204,7 +204,7 @@ mod tests {
 
     #[test]
     fn test_rejects_hash_too_short() {
-        let Err(Error::InvalidFormat(msg)) = Digest::from_str("sha256:abc") else {
+        let Err(Error::InvalidDigest(msg)) = Digest::from_str("sha256:abc") else {
             panic!("expected error");
         };
         assert!(msg.contains("'abc'"), "msg: {msg}");
@@ -213,7 +213,7 @@ mod tests {
     #[test]
     fn test_rejects_hash_too_long() {
         let long_hash = format!("{VALID_HASH}a");
-        let Err(Error::InvalidFormat(msg)) = Digest::from_str(&format!("sha256:{long_hash}"))
+        let Err(Error::InvalidDigest(msg)) = Digest::from_str(&format!("sha256:{long_hash}"))
         else {
             panic!("expected error");
         };
@@ -222,7 +222,7 @@ mod tests {
 
     #[test]
     fn test_rejects_multiple_colons() {
-        let Err(Error::InvalidFormat(msg)) = Digest::from_str(&format!("sha256:abc:{VALID_HASH}"))
+        let Err(Error::InvalidDigest(msg)) = Digest::from_str(&format!("sha256:abc:{VALID_HASH}"))
         else {
             panic!("expected error");
         };
@@ -231,7 +231,7 @@ mod tests {
 
     #[test]
     fn test_rejects_leading_whitespace() {
-        let Err(Error::InvalidFormat(msg)) = Digest::from_str(&format!(" sha256:{VALID_HASH}"))
+        let Err(Error::InvalidDigest(msg)) = Digest::from_str(&format!(" sha256:{VALID_HASH}"))
         else {
             panic!("expected error");
         };
@@ -241,7 +241,7 @@ mod tests {
     #[test]
     fn test_rejects_trailing_newline() {
         let hash_with_newline = format!("{VALID_HASH}\n");
-        let Err(Error::InvalidFormat(msg)) =
+        let Err(Error::InvalidDigest(msg)) =
             Digest::from_str(&format!("sha256:{hash_with_newline}"))
         else {
             panic!("expected error");

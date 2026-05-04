@@ -13,7 +13,7 @@ use crate::registry::{
             test_datastore_upload_operations,
         },
     },
-    tests::FSRegistryTestCase,
+    test_utils::FSRegistryTestCase,
 };
 
 #[tokio::test]

@@ -126,7 +126,7 @@ impl NamespaceChecker for MediaTypeChecker {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::registry::{metadata_store::MetadataStoreExt, test_utils, tests::backends};
+    use crate::registry::{metadata_store::MetadataStoreExt, test_utils, test_utils::backends};
 
     #[tokio::test]
     async fn test_media_type_checker_backfills_missing_media_type() {

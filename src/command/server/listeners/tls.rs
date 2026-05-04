@@ -185,7 +185,10 @@ pub mod tests {
     use tempfile::NamedTempFile;
 
     use super::*;
-    use crate::command::server::server_context::tests::create_test_server_context;
+    use crate::{
+        command::server::server_context::tests::create_test_server_context,
+        test_fixtures::tls::{server_cert_pem, server_key_pem},
+    };
 
     static INIT: Once = Once::new();
 
@@ -196,57 +199,6 @@ pub mod tests {
                 .ok();
         });
     }
-
-    const TEST_SERVER_CERT: &str = r"-----BEGIN CERTIFICATE-----
-MIIDgjCCAmqgAwIBAgIUFCYlDkKrxnJCnCtYXKvA9BaXnfowDQYJKoZIhvcNAQEL
-BQAwWDELMAkGA1UEBhMCTFUxCzAJBgNVBAgMAkxVMRMwEQYDVQQHDApMdXhlbWJv
-dXJnMRMwEQYDVQQKDApNeSBDb21wYW55MRIwEAYDVQQDDAlTZXJ2ZXIgQ0EwHhcN
-MjUxMDA5MTcxNjIyWhcNMjYxMDA5MTcxNjIyWjBaMQswCQYDVQQGEwJMVTELMAkG
-A1UECAwCTFUxEzARBgNVBAcMCkx1eGVtYm91cmcxEzARBgNVBAoMCk15IENvbXBh
-bnkxFDASBgNVBAMMC2V4YW1wbGUuY29tMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8A
-MIIBCgKCAQEAp4FMkW8y3+ZJDM1gZTSGpYk7WPHzv+eQOnWxcVif++j4EKxyIX3y
-fKm11GokU7eKIbbUGcDEzBgh5V+VQoiweBC/S4mag86JCESX5dFv1jQ+KnjP6BkW
-4bATqWwUwqUX/tXn3Oe/gTue64cU3nl7y6xOgX/jUF93GzVNS69Rz9E5DszeN1kw
-zmh8dq88CZrReZ+nrQNFNmxFooqi/6bgnV8YlFfYT5ide+8LY+8Yho3ZcJ9cv530
-TCCpX2xMfhqGFhfnVyR+Raj0/EU6PArIM+bXCw5a9llnU4ZQJBiaG6N0gSrPTHw6
-kZyi9UE5KA4TwOtFcscFC/Rhm7pqY4z7mQIDAQABo0IwQDAdBgNVHQ4EFgQUgSvE
-fVmU14s8Z4zAx3zv0x09pQMwHwYDVR0jBBgwFoAUCRVUTFXrNWkUWA8CwKljxF4R
-FlgwDQYJKoZIhvcNAQELBQADggEBAFYCZiW1zpZAty9YFg/yNL2xw4XuDxJyvapT
-4yd9LVhdIhNLSJo5dOsZynEFXOmvLpjEgfSRMAI0MhdqdqAjaDr2Wfg0P4VqfkC5
-3BoRkwZ4sFDu9r7jiKvZplBO9qln+LxS20YFme1TpjzWzzCy1v/40xVF0PGONmiq
-fTmTCQdUw11s7r6NwQPgrpJuyAX5iAY0MKccHMej5cnMy3HyjeCsByKdBqxOb+X4
-IBcx+tr+Vvs6YWA7pd2UB6GbRbMgmELwVqkMFi6P7mzJv2PXsabzLzdSD41Xh/rL
-pJ1J56iviNUViU6cY4Yy/Q9qe8aifhXXgaRgu5r8oBARAWo5LiE=
------END CERTIFICATE-----";
-
-    const TEST_SERVER_KEY: &str = r"-----BEGIN PRIVATE KEY-----
-MIIEvAIBADANBgkqhkiG9w0BAQEFAASCBKYwggSiAgEAAoIBAQCngUyRbzLf5kkM
-zWBlNIaliTtY8fO/55A6dbFxWJ/76PgQrHIhffJ8qbXUaiRTt4ohttQZwMTMGCHl
-X5VCiLB4EL9LiZqDzokIRJfl0W/WND4qeM/oGRbhsBOpbBTCpRf+1efc57+BO57r
-hxTeeXvLrE6Bf+NQX3cbNU1Lr1HP0TkOzN43WTDOaHx2rzwJmtF5n6etA0U2bEWi
-iqL/puCdXxiUV9hPmJ177wtj7xiGjdlwn1y/nfRMIKlfbEx+GoYWF+dXJH5FqPT8
-RTo8Csgz5tcLDlr2WWdThlAkGJobo3SBKs9MfDqRnKL1QTkoDhPA60VyxwUL9GGb
-umpjjPuZAgMBAAECggEAM+nzaJmdm138Yu7eAs/KMVC8Z38pa98hSLUERxxQDRtx
-kn1XrACkYDWa6Jfy5U1bjsJirw6bD6QlETlUAbhqdPO/zfH6RQKEXt8fcrc74Zf0
-cmZaDVWFTXIsTdR1BLR1IOJ7x2+93xgy001czuy4zPF8rU8NDPJhcDnPWHcgNHdj
-QK4gz9pGARHyj68tW2nPnBdq1pPQcIelJ2BRM23R+uG/a2JWYztk5Rj0sbL7O83U
-ly0i4aMqvndFV1QqGMLK45NUcaQ1132VPtGK8uXLDPcx59BnZhsDWKdL4BSnc8j6
-Zv5EJipdxcBb6hDptlxru48KrDiV2Tr0LK2+1Q11TwKBgQDi/g72bTQiyss1wFWj
-FYPlDQRFzpSxI8zq6edrYr0X6y+7kqpzHtScKdY9Y9vd2ajT5ygCJHFgHy0JSvf0
-C2+CjbNjTd9wOi6RLsQc8wP3mLV2+ksw1GY9y+7NDD2oAfh1xoFAUfkEkszvyWP4
-GMoPAYikIntU7S4QmcHSuqEI6wKBgQC86SR7EGcptnSDowz8QcH5bRq+WTvxXgXl
-T6yhmCYUyc7KPB4QBsQ+Ny7/AgBTEpFdrK803GXNFGFswz+wLUk7gExd6Q8eF9ZC
-89Qc2EowRxKcey8gCxGms4BW/pDI/nuPBEJu6mYFg4UyhSHTzRAnNNRRoTiCtIJT
-taNFhI5siwKBgAs1SD/avIxLPyV0TcYztcOFlQRtYuIsRl4DFq4yveuEbWLxpwDw
-MMdVOYLmf2DA8pkj/NG+QurgHzUqQnwGZIcpwAXTPokoFkyM5poXVcbP/4XUbgoH
-MtUyUKRHSnQVRNNr7c3jPkx/gycD5q/FaZS8GqcgHL7gxzmCnhNtq63pAoGAOLIs
-HbcljxJQU7WazxaZNde14Az9/Ym/cTwBTppQS4rpwi5aw2qUeSussiISoNwAvsF1
-8AJ5lxwXxUGwGprs0KvHv6OTwu9agcuWDHYpheW+wzIBSbeou4RB71oFcB1YTer0
-WT+GEP+Q+UGVjnCL+YhUdI9TW377Yk4wS0vmRtMCgYBIj9PI5TKYtafptgLpga3t
-o7QwZTWY2S2Al2epdI8+Zx3O7qAVVdN5ynoRnXuhSV4zL6U0wYqo6K2C/Jr1ErDF
-MyMgL1gcqJFWmtfn1TE+IPz1HEN3GXgDI9PYOV63PrTQg3ZU9ixvj2wJYbT7xNWy
-PpGhlTQXVV6Evtahtp+cRw==
------END PRIVATE KEY-----";
 
     fn create_temp_cert_file(content: &str) -> NamedTempFile {
         let mut file = NamedTempFile::new().unwrap();
@@ -261,9 +213,9 @@ PpGhlTQXVV6Evtahtp+cRw==
         ServerTlsConfig,
         (NamedTempFile, NamedTempFile, NamedTempFile),
     ) {
-        let cert_file = create_temp_cert_file(TEST_SERVER_CERT);
-        let key_file = create_temp_cert_file(TEST_SERVER_KEY);
-        let ca_file = create_temp_cert_file(TEST_SERVER_CERT);
+        let cert_file = create_temp_cert_file(server_cert_pem());
+        let key_file = create_temp_cert_file(server_key_pem());
+        let ca_file = create_temp_cert_file(server_cert_pem());
 
         let server_certificate_bundle = cert_file.path().to_path_buf();
         let server_private_key = key_file.path().to_path_buf();
@@ -285,8 +237,8 @@ PpGhlTQXVV6Evtahtp+cRw==
 
     #[test]
     fn test_config_default_values() {
-        let cert_file = create_temp_cert_file(TEST_SERVER_CERT);
-        let key_file = create_temp_cert_file(TEST_SERVER_KEY);
+        let cert_file = create_temp_cert_file(server_cert_pem());
+        let key_file = create_temp_cert_file(server_key_pem());
 
         let toml = format!(
             r#"
@@ -308,8 +260,8 @@ PpGhlTQXVV6Evtahtp+cRw==
 
     #[test]
     fn test_config_custom_values() {
-        let cert_file = create_temp_cert_file(TEST_SERVER_CERT);
-        let key_file = create_temp_cert_file(TEST_SERVER_KEY);
+        let cert_file = create_temp_cert_file(server_cert_pem());
+        let key_file = create_temp_cert_file(server_key_pem());
 
         let toml = format!(
             r#"
@@ -338,8 +290,8 @@ PpGhlTQXVV6Evtahtp+cRw==
 
     #[test]
     fn test_config_ipv6_address() {
-        let cert_file = create_temp_cert_file(TEST_SERVER_CERT);
-        let key_file = create_temp_cert_file(TEST_SERVER_KEY);
+        let cert_file = create_temp_cert_file(server_cert_pem());
+        let key_file = create_temp_cert_file(server_key_pem());
 
         let toml = format!(
             r#"

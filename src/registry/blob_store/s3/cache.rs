@@ -1,3 +1,5 @@
+use tracing::warn;
+
 use super::{Backend, S3UploadState};
 use crate::{cache::CacheExt, registry::blob_store::Error};
 
@@ -40,7 +42,9 @@ impl Backend {
     pub async fn cache_upload_state(&self, namespace: &str, uuid: &str, state: &S3UploadState) {
         if let Some(cache) = &self.cache {
             let key = Self::upload_state_cache_key(namespace, uuid);
-            let _ = cache.store(&key, state, 3600).await;
+            if let Err(err) = cache.store(&key, state, 3600).await {
+                warn!("Failed to cache upload state for {namespace}/{uuid}: {err}");
+            }
         }
     }
 
@@ -51,8 +55,12 @@ impl Backend {
     ) -> Option<S3UploadState> {
         if let Some(cache) = &self.cache {
             let key = Self::upload_state_cache_key(namespace, uuid);
-            if let Ok(Some(state)) = cache.retrieve::<S3UploadState>(&key).await {
-                return Some(state);
+            match cache.retrieve::<S3UploadState>(&key).await {
+                Ok(Some(state)) => return Some(state),
+                Err(err) => {
+                    warn!("Failed to retrieve cached upload state for {namespace}/{uuid}: {err}");
+                }
+                Ok(None) => {}
             }
         }
         None

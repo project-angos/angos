@@ -238,7 +238,7 @@ mod tests {
         oci::{Digest, Namespace},
         registry::{
             path_builder,
-            tests::{FSRegistryTestCase, backends},
+            test_utils::{FSRegistryTestCase, backends},
         },
     };
 

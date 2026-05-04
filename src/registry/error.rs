@@ -1,173 +1,262 @@
-use std::{
-    cmp::PartialEq,
-    fmt::{Debug, Display},
-};
-
 use cel_interpreter::SerializationError;
 use hyper::{header::InvalidHeaderValue, http::uri::InvalidUri};
-use tracing::{debug, warn};
 
 use crate::{
     configuration, oci, policy,
     registry::{blob_store, cache, metadata_store, task_queue},
 };
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum Error {
+    #[error("{0}")]
     Initialization(String),
+    #[error("blob unknown to registry")]
     BlobUnknown,
+    #[error("blob upload unknown to registry")]
     BlobUploadUnknown,
+    #[error("provided digest did not match uploaded content")]
     DigestInvalid,
+    #[error("manifest references a blob unknown to registry")]
     ManifestBlobUnknown,
+    #[error("manifest invalid: {0}")]
     ManifestInvalid(String),
+    #[error("manifest unknown to registry")]
     ManifestUnknown,
+    #[error("invalid repository name")]
     NameInvalid,
+    #[error("repository name not known to registry")]
     NameUnknown,
+    #[error("{0}")]
     Unauthorized(String),
+    #[error("{0}")]
     Denied(String),
+    #[error("the operation is unsupported")]
     Unsupported,
+    #[error("range not satisfiable")]
     RangeNotSatisfiable,
+    #[error("internal server error: {0}")]
     Internal(String),
+
+    // Typed variants that preserve the source error chain.
+    #[error("configuration error during operations: {0}")]
+    Configuration(#[from] configuration::Error),
+    #[error("cache error during operations: {0}")]
+    Cache(#[from] cache::Error),
+    #[error("metadata store error during operations: {0}")]
+    MetadataStore(#[from] metadata_store::Error),
+    #[error("task pool error during operations: {0}")]
+    TaskQueue(#[from] task_queue::Error),
+    #[error("I/O error during operations: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("HTTP error during operations: {0}")]
+    Http(#[from] hyper::http::Error),
+    #[error("(de)serialization error during operations: {0}")]
+    Serde(#[from] serde_json::Error),
+    #[error("policy evaluation error: {0}")]
+    PolicyExecution(#[from] cel_interpreter::ExecutionError),
+    #[error("invalid header value: {0}")]
+    InvalidHeader(#[from] InvalidHeaderValue),
+    #[error("invalid URI: {0}")]
+    InvalidUri(#[from] InvalidUri),
+    #[error("serialization error during operations: {0}")]
+    Serialization(#[from] SerializationError),
 }
 
-impl Display for Error {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Error::BlobUnknown => write!(f, "blob unknown to registry"),
-            Error::BlobUploadUnknown => write!(f, "blob upload unknown to registry"),
-            Error::DigestInvalid => write!(f, "provided digest did not match uploaded content"),
-            Error::ManifestBlobUnknown => {
-                write!(f, "manifest references a blob unknown to registry")
-            }
-            Error::ManifestInvalid(s) => write!(f, "manifest invalid: {s}"),
-            Error::ManifestUnknown => write!(f, "manifest unknown to registry"),
-            Error::NameInvalid => write!(f, "invalid repository name"),
-            Error::NameUnknown => write!(f, "repository name not known to registry"),
-            Error::Initialization(s) | Error::Unauthorized(s) | Error::Denied(s) => {
-                write!(f, "{s}")
-            }
-            Error::Unsupported => write!(f, "the operation is unsupported"),
-            Error::RangeNotSatisfiable => write!(f, "range not satisfiable"),
-            Error::Internal(s) => write!(f, "internal server error: {s}"),
-        }
-    }
-}
-
-impl From<configuration::Error> for Error {
-    fn from(error: configuration::Error) -> Self {
-        warn!("Configuration error: {error}");
-        Error::Internal("Configuration error during operations".to_string())
-    }
-}
-
+// `policy::Error` does not implement `std::error::Error`, so `#[from]` cannot
+// be used here. Routes to `Initialization` to preserve the prior behaviour.
 impl From<policy::Error> for Error {
     fn from(error: policy::Error) -> Self {
-        warn!("Policy error: {error}");
         Error::Initialization(error.to_string())
     }
 }
 
-impl From<cache::Error> for Error {
-    fn from(error: cache::Error) -> Self {
-        warn!("Cache error: {error}");
-        Error::Internal("Cache error during operations".to_string())
-    }
-}
-
-impl From<oci::Error> for Error {
-    fn from(error: oci::Error) -> Self {
-        warn!("OCI error: {error}");
-        Error::NameInvalid
-    }
-}
-
+// `blob_store::Error` requires variant-level routing, so the manual `From` is
+// retained.  The catch-all arm produces `Internal` because `blob_store::Error`
+// does not implement `std::error::Error`, preventing source chain attachment.
 impl From<blob_store::Error> for Error {
     fn from(error: blob_store::Error) -> Self {
         match error {
             blob_store::Error::UploadNotFound => Error::BlobUploadUnknown,
             blob_store::Error::BlobNotFound => Error::BlobUnknown,
             blob_store::Error::ReferenceNotFound => Error::ManifestBlobUnknown,
-            _ => {
-                warn!("Data store error: {error}");
-                Error::Internal("Data store error during operations".to_string())
-            }
+            _ => Error::Internal(format!("Data store error during operations: {error}")),
         }
     }
 }
 
-impl From<metadata_store::Error> for Error {
-    fn from(error: metadata_store::Error) -> Self {
-        warn!("Metadata store error: {error}");
-        Error::Internal("Metadata store error during operations".to_string())
+// `oci::Error` routes to `NameInvalid` — preserve that semantic.
+impl From<oci::Error> for Error {
+    fn from(_: oci::Error) -> Self {
+        Error::NameInvalid
     }
 }
 
-impl From<task_queue::Error> for Error {
-    fn from(error: task_queue::Error) -> Self {
-        warn!("Task pool error: {error}");
-        Error::Internal("Task pool error during operations".to_string())
-    }
-}
-
-impl From<std::io::Error> for Error {
-    fn from(error: std::io::Error) -> Self {
-        debug!("Error: {error}");
-        Error::Internal("I/O error during operations".to_string())
-    }
-}
-
-impl From<hyper::http::Error> for Error {
-    fn from(error: hyper::http::Error) -> Self {
-        debug!("Hyper HTTP error: {error}");
-        Error::Internal("HTTP error during operations".to_string())
-    }
-}
-
-impl From<serde_json::Error> for Error {
-    fn from(error: serde_json::Error) -> Self {
-        debug!("Serde JSON error: {error}");
-        Error::Internal("(De)Serialization error during operations".to_string())
-    }
-}
-
-impl From<cel_interpreter::ExecutionError> for Error {
-    fn from(error: cel_interpreter::ExecutionError) -> Self {
-        debug!("CEL error: {error}");
-        Error::Internal("Policy evaluation error".to_string())
-    }
-}
-
-impl From<Box<dyn std::error::Error>> for Error {
-    fn from(error: Box<dyn std::error::Error>) -> Self {
-        debug!("STD Error: {error}");
-        Error::Internal("Error during operations".to_string())
-    }
-}
-
-impl From<InvalidHeaderValue> for Error {
-    fn from(error: InvalidHeaderValue) -> Self {
-        debug!("Invalid header value: {error}");
-        Error::Internal("Invalid header value".to_string())
-    }
-}
-
-impl From<InvalidUri> for Error {
-    fn from(error: InvalidUri) -> Self {
-        debug!("Invalid URI: {error}");
-        Error::Internal("Invalid URI".to_string())
-    }
-}
-
-impl From<SerializationError> for Error {
-    fn from(error: SerializationError) -> Self {
-        debug!("Serialization error: {error}");
-        Error::Internal("Serialization error during operations".to_string())
-    }
-}
-
+// `x509_parser::error::X509Error` routes to `Unauthorized` — preserve that
+// semantic.
 impl From<x509_parser::error::X509Error> for Error {
-    fn from(error: x509_parser::error::X509Error) -> Self {
-        debug!("X509 parsing error: {error}");
+    fn from(_: x509_parser::error::X509Error) -> Self {
         Error::Unauthorized("Invalid client certificate".to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::error::Error as StdError;
+
+    use super::*;
+
+    #[test]
+    fn from_io_error_preserves_source() {
+        let io_err = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "permission denied");
+        let err: Error = io_err.into();
+        assert!(matches!(err, Error::Io(_)));
+        assert!(StdError::source(&err).is_some());
+        assert!(err.to_string().contains("I/O error during operations"));
+    }
+
+    #[test]
+    fn from_serde_json_preserves_source() {
+        let serde_err = serde_json::from_str::<serde_json::Value>("{invalid}").unwrap_err();
+        let err: Error = serde_err.into();
+        assert!(matches!(err, Error::Serde(_)));
+        assert!(StdError::source(&err).is_some());
+        assert!(
+            err.to_string()
+                .contains("(de)serialization error during operations")
+        );
+    }
+
+    #[test]
+    fn from_metadata_store_preserves_source() {
+        let meta_err = metadata_store::Error::ReferenceNotFound;
+        let err: Error = meta_err.into();
+        assert!(matches!(err, Error::MetadataStore(_)));
+        assert!(StdError::source(&err).is_some());
+        assert!(
+            err.to_string()
+                .contains("metadata store error during operations")
+        );
+    }
+
+    #[test]
+    fn from_configuration_preserves_source() {
+        let config_err = configuration::Error::Initialization("cfg failed".to_string());
+        let err: Error = config_err.into();
+        assert!(matches!(err, Error::Configuration(_)));
+        assert!(StdError::source(&err).is_some());
+        assert!(
+            err.to_string()
+                .contains("configuration error during operations")
+        );
+    }
+
+    #[test]
+    fn from_cache_preserves_source() {
+        let cache_err = cache::Error::Execution("cache miss".to_string());
+        let err: Error = cache_err.into();
+        assert!(matches!(err, Error::Cache(_)));
+        assert!(StdError::source(&err).is_some());
+        assert!(err.to_string().contains("cache error during operations"));
+    }
+
+    #[test]
+    fn from_blob_store_routes_upload_not_found() {
+        let err: Error = blob_store::Error::UploadNotFound.into();
+        assert!(matches!(err, Error::BlobUploadUnknown));
+    }
+
+    #[test]
+    fn from_blob_store_routes_blob_not_found() {
+        let err: Error = blob_store::Error::BlobNotFound.into();
+        assert!(matches!(err, Error::BlobUnknown));
+    }
+
+    #[test]
+    fn from_blob_store_routes_reference_not_found() {
+        let err: Error = blob_store::Error::ReferenceNotFound.into();
+        assert!(matches!(err, Error::ManifestBlobUnknown));
+    }
+
+    #[test]
+    fn from_blob_store_catch_all_produces_internal() {
+        let err: Error = blob_store::Error::StorageBackend("backend down".to_string()).into();
+        assert!(matches!(err, Error::Internal(_)));
+        assert!(
+            err.to_string()
+                .contains("Data store error during operations")
+        );
+    }
+
+    #[test]
+    fn from_oci_error_routes_to_name_invalid() {
+        let err: Error = oci::Error::InvalidDigest("bad digest".to_string()).into();
+        assert!(matches!(err, Error::NameInvalid));
+    }
+
+    #[test]
+    fn from_policy_error_routes_to_initialization() {
+        let err: Error = policy::Error::Evaluation("eval failed".to_string()).into();
+        assert!(matches!(err, Error::Initialization(_)));
+        assert!(err.to_string().contains("eval failed"));
+    }
+
+    #[test]
+    fn from_x509_error_routes_to_unauthorized() {
+        use x509_parser::error::X509Error;
+        let err: Error = X509Error::InvalidCertificate.into();
+        assert!(matches!(err, Error::Unauthorized(_)));
+        assert!(err.to_string().contains("Invalid client certificate"));
+    }
+
+    #[test]
+    fn display_strings_match_legacy_values() {
+        assert_eq!(Error::BlobUnknown.to_string(), "blob unknown to registry");
+        assert_eq!(
+            Error::BlobUploadUnknown.to_string(),
+            "blob upload unknown to registry"
+        );
+        assert_eq!(
+            Error::DigestInvalid.to_string(),
+            "provided digest did not match uploaded content"
+        );
+        assert_eq!(
+            Error::ManifestBlobUnknown.to_string(),
+            "manifest references a blob unknown to registry"
+        );
+        assert_eq!(
+            Error::ManifestInvalid("oops".to_string()).to_string(),
+            "manifest invalid: oops"
+        );
+        assert_eq!(
+            Error::ManifestUnknown.to_string(),
+            "manifest unknown to registry"
+        );
+        assert_eq!(Error::NameInvalid.to_string(), "invalid repository name");
+        assert_eq!(
+            Error::NameUnknown.to_string(),
+            "repository name not known to registry"
+        );
+        assert_eq!(
+            Error::Unsupported.to_string(),
+            "the operation is unsupported"
+        );
+        assert_eq!(
+            Error::RangeNotSatisfiable.to_string(),
+            "range not satisfiable"
+        );
+        assert_eq!(
+            Error::Internal("oops".to_string()).to_string(),
+            "internal server error: oops"
+        );
+        assert_eq!(
+            Error::Initialization("boot failed".to_string()).to_string(),
+            "boot failed"
+        );
+        assert_eq!(
+            Error::Unauthorized("bad token".to_string()).to_string(),
+            "bad token"
+        );
+        assert_eq!(Error::Denied("nope".to_string()).to_string(), "nope");
     }
 }

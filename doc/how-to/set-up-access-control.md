@@ -281,6 +281,7 @@ RUST_LOG=angos::registry::access_policy=debug \
 **Rule evaluation errors:**
 - Failed rules are skipped with a warning
 - Check for null access (e.g., `identity.oidc.claims` when not using OIDC)
+- Rules that return a non-boolean value (e.g., a string or integer) are treated as misconfigured: in `allow` mode the request is denied (fail-closed); in `deny` mode the rule is skipped
 
 ## Reference
 

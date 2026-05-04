@@ -106,4 +106,42 @@ mod tests {
             "valid CEL rule must deserialize successfully"
         );
     }
+
+    // cel_interpreter (via the underlying antlr4rust parser) panics on an
+    // empty source string rather than returning a parse error.  This is a
+    // known limitation of the upstream library: the ANTLR-generated parser
+    // hits an `unreachable!()` branch when the token stream is empty.
+    // The test documents this behaviour so a future library upgrade that
+    // converts the panic into an Err is detected immediately.
+    #[test]
+    #[should_panic(expected = "internal error: entered unreachable code")]
+    fn empty_expression_panics_in_upstream_parser() {
+        let _ = CelRule::compile("");
+    }
+
+    // The cel_interpreter library is lazy about variable resolution: it does
+    // not check whether identifiers exist at compile time.  An expression
+    // referencing an undeclared variable compiles without error.
+    #[test]
+    fn undefined_variable_compiles_lazily() {
+        assert!(
+            CelRule::compile("nonexistent_var").is_ok(),
+            "cel_interpreter defers variable resolution to execute time"
+        );
+    }
+
+    // Variable resolution errors surface at execute time, not compile time.
+    // This test pins the runtime error variant so a change in error-reporting
+    // behaviour is caught by CI.
+    #[test]
+    fn undefined_variable_fails_at_execute_time() {
+        let rule =
+            CelRule::compile("nonexistent_var").expect("expression with unknown var must compile");
+        let ctx = Context::default();
+        let result = rule.execute(&ctx);
+        assert!(
+            matches!(result, Err(ExecutionError::UndeclaredReference(_))),
+            "expected UndeclaredReference error at execute time, got: {result:?}"
+        );
+    }
 }

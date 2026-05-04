@@ -1,26 +1,30 @@
-use std::fmt;
-
 use redis::RedisError;
 
-#[derive(Debug, PartialEq)]
+/// Errors that can occur during cache operations.
+#[derive(Debug, thiserror::Error)]
 pub enum Error {
-    Backend(String),
+    /// A higher-level execution error (JSON serialization, deserialization, or
+    /// other programmer-visible logic failures).
+    #[error("cache execution error: {0}")]
     Execution(String),
+    /// A Redis protocol or network error, preserving the original source.
+    #[error("redis error: {0}")]
+    Redis(#[from] RedisError),
 }
 
-impl fmt::Display for Error {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match self {
-            Error::Backend(err) | Error::Execution(err) => write!(f, "{err}"),
+// Manual `PartialEq` is required because `redis::RedisError` does not implement
+// `PartialEq`, so `#[derive(PartialEq)]` cannot be used on an enum that contains
+// it. Tests in `memory.rs` and `redis.rs` compare `Result<Option<String>, Error>`
+// against `Ok(…)` values, which requires `Error: PartialEq` to compile. The
+// `Redis` variant is intentionally excluded from equality because two distinct
+// `RedisError` values produced by separate I/O operations are not meaningfully
+// comparable.
+impl PartialEq for Error {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Execution(a), Self::Execution(b)) => a == b,
+            _ => false,
         }
-    }
-}
-
-impl std::error::Error for Error {}
-
-impl From<RedisError> for Error {
-    fn from(error: RedisError) -> Self {
-        Error::Backend(error.to_string())
     }
 }
 
@@ -31,19 +35,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_error_display() {
-        let error = Error::Backend("Some error".to_string());
-        assert_eq!(format!("{error}"), "Some error");
-
-        let error = Error::Execution("Some error".to_string());
-        assert_eq!(format!("{error}"), "Some error");
+    fn test_error_display_execution() {
+        let error = Error::Execution("JSON parse failed".to_string());
+        assert_eq!(
+            format!("{error}"),
+            "cache execution error: JSON parse failed"
+        );
     }
 
     #[test]
-    fn test_from_redis_error() {
-        let error = RedisError::from((redis::ErrorKind::Io, "IO error occurred"));
-        let error: Error = error.into();
-        assert!(matches!(error, Error::Backend(_)));
+    fn test_from_redis_error_preserves_source() {
+        let redis_err = RedisError::from((redis::ErrorKind::Io, "IO error occurred"));
+        let error: Error = redis_err.into();
+        assert!(matches!(error, Error::Redis(_)));
         assert!(format!("{error}").contains("IO error occurred"));
+        // Verify source is accessible via std::error::Error::source().
+        assert!(std::error::Error::source(&error).is_some());
     }
 }

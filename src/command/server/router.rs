@@ -28,12 +28,7 @@ pub fn parse(method: &Method, uri: &Uri) -> Option<Action> {
         "/_ui/config" if method == Method::GET => return Some(Action::UiConfig),
         "/v2" | "/v2/" if method == Method::GET => return Some(Action::ApiVersion),
         "/v2/_catalog" if method == Method::GET => {
-            let (n, last) = if let Some(p) = params.map(parse_query::<PaginationQuery>) {
-                (p.n, p.last)
-            } else {
-                (None, None)
-            };
-
+            let (n, last) = parse_pagination(params);
             return Some(Action::ListCatalog { n, last });
         }
         _ => {}
@@ -79,6 +74,11 @@ struct ArtifactTypeQuery {
 struct PaginationQuery {
     n: Option<u16>,
     last: Option<String>,
+}
+
+fn parse_pagination(params: Option<&str>) -> (Option<u16>, Option<String>) {
+    let query: PaginationQuery = params.map(parse_query).unwrap_or_default();
+    (query.n, query.last)
 }
 
 fn try_parse_extension(method: &Method, path: &str) -> Option<Action> {
@@ -249,12 +249,7 @@ fn try_find_tags(method: &Method, path: &str, params: Option<&str>) -> Option<Ac
         && *method == Method::GET
     {
         let namespace = Namespace::new(namespace_str).ok()?;
-        let (n, last) = if let Some(p) = params.map(parse_query::<PaginationQuery>) {
-            (p.n, p.last)
-        } else {
-            (None, None)
-        };
-
+        let (n, last) = parse_pagination(params);
         return Some(Action::ListTags { namespace, n, last });
     }
 
@@ -806,6 +801,65 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_pagination_none_params() {
+        assert_eq!(parse_pagination(None), (None, None));
+    }
+
+    #[test]
+    fn test_parse_pagination_empty_params() {
+        assert_eq!(parse_pagination(Some("")), (None, None));
+    }
+
+    #[test]
+    fn test_parse_pagination_full_params() {
+        assert_eq!(
+            parse_pagination(Some("n=50&last=foo")),
+            (Some(50), Some("foo".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_parse_pagination_partial_params() {
+        assert_eq!(parse_pagination(Some("n=10")), (Some(10), None));
+        assert_eq!(
+            parse_pagination(Some("last=bar")),
+            (None, Some("bar".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_parse_pagination_non_numeric_n() {
+        // Non-numeric value for `n` fails deserialization; unwrap_or_default yields (None, None).
+        assert_eq!(parse_pagination(Some("n=abc")), (None, None));
+    }
+
+    #[test]
+    fn test_parse_pagination_n_zero() {
+        // Zero is a valid u16; it should be preserved.
+        assert_eq!(parse_pagination(Some("n=0")), (Some(0), None));
+    }
+
+    #[test]
+    fn test_parse_pagination_n_exceeds_u16_max() {
+        // 65536 overflows u16; deserialization fails and unwrap_or_default yields (None, None).
+        assert_eq!(parse_pagination(Some("n=65536")), (None, None));
+    }
+
+    #[test]
+    fn test_parse_pagination_n_equals_only() {
+        // `n=` with no value is an empty string, which fails u16 deserialization.
+        assert_eq!(parse_pagination(Some("n=")), (None, None));
+    }
+
+    #[test]
+    fn test_parse_pagination_last_url_encoded_special_chars() {
+        // `last` may contain URL-encoded characters; serde_urlencoded decodes them.
+        let (n, last) = parse_pagination(Some("last=foo%2Fbar%3Abaz"));
+        assert!(n.is_none());
+        assert_eq!(last, Some("foo/bar:baz".to_string()));
+    }
+
+    #[test]
     fn test_try_parse_uploads_post_method() {
         let method = Method::POST;
         let path = "myrepo/app/blobs/uploads";
@@ -825,6 +879,50 @@ mod tests {
         let path = "myrepo/app/blobs/uploads";
         let route = try_parse_uploads(&method, path, None);
         assert!(route.is_none());
+    }
+
+    #[test]
+    fn test_try_parse_uploads_no_slash() {
+        let method = Method::POST;
+
+        // No-slash variant: /v2/foo/blobs/uploads → StartUpload for namespace "foo".
+        let route = try_parse_uploads(&method, "foo/blobs/uploads", None);
+        assert!(
+            matches!(route, Some(Action::StartUpload { ref namespace, digest: None }) if namespace == "foo"),
+            "no-slash variant must yield StartUpload with correct namespace"
+        );
+
+        // With-slash variant: /v2/foo/blobs/uploads/ → same result.
+        let route = try_parse_uploads(&method, "foo/blobs/uploads/", None);
+        assert!(
+            matches!(route, Some(Action::StartUpload { ref namespace, digest: None }) if namespace == "foo"),
+            "with-slash variant must yield StartUpload with correct namespace"
+        );
+
+        // Nested namespace without slash.
+        let route = try_parse_uploads(&method, "org/team/blobs/uploads", None);
+        assert!(
+            matches!(route, Some(Action::StartUpload { ref namespace, .. }) if namespace == "org/team"),
+            "nested namespace without slash must parse correctly"
+        );
+
+        // Invalid namespace: empty string before the suffix.
+        let route = try_parse_uploads(&method, "blobs/uploads", None);
+        assert!(route.is_none(), "empty namespace must not yield a route");
+
+        // Invalid namespace: contains uppercase letter.
+        let route = try_parse_uploads(&method, "MyRepo/blobs/uploads", None);
+        assert!(
+            route.is_none(),
+            "uppercase namespace must not yield a route"
+        );
+
+        // Invalid namespace: contains a space (invalid character).
+        let route = try_parse_uploads(&method, "bad ns/blobs/uploads", None);
+        assert!(
+            route.is_none(),
+            "namespace with space must not yield a route"
+        );
     }
 
     #[test]

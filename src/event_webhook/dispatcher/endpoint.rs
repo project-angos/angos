@@ -20,19 +20,3 @@ impl WebhookEndpoint {
         }
     }
 }
-
-#[cfg(test)]
-pub fn matches_event(
-    config: &EventWebhookConfig,
-    event_kind: &EventKind,
-    repository: &str,
-) -> bool {
-    if !config.events.contains(event_kind) {
-        return false;
-    }
-
-    match &config.repository_filter {
-        None => true,
-        Some(filters) => filters.iter().any(|p| p.is_match(repository)),
-    }
-}

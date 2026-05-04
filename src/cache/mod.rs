@@ -2,7 +2,7 @@ use std::{any::Any, fmt::Debug};
 
 use async_trait::async_trait;
 use serde::{Serialize, de::DeserializeOwned};
-use tracing::{debug, warn};
+use tracing::debug;
 
 mod config;
 mod error;
@@ -30,32 +30,15 @@ pub trait Cache: Any + Debug + Send + Sync {
 pub trait CacheExt: Cache {
     /// Retrieve and deserialize a JSON value from the cache
     async fn retrieve<T: DeserializeOwned + Send>(&self, key: &str) -> Result<Option<T>, Error> {
-        let cached = match self.retrieve_value(key).await {
-            Ok(s) => s,
-            Err(err) => {
-                warn!("Failed to retrieve value from cache for key {key}: {err}");
-                return Err(Error::Execution(format!(
-                    "Failed to retrieve value from cache: {err}"
-                )));
-            }
-        };
-
-        let Some(cached) = cached else {
+        let Some(cached) = self.retrieve_value(key).await? else {
             return Ok(None);
         };
 
-        match serde_json::from_str::<T>(&cached) {
-            Ok(value) => {
-                debug!("Using cached value for key: {key}");
-                Ok(Some(value))
-            }
-            Err(e) => {
-                warn!("Failed to deserialize cached value for key {key}: {e}");
-                Err(Error::Execution(format!(
-                    "Failed to deserialize cached value: {e}"
-                )))
-            }
-        }
+        let value = serde_json::from_str::<T>(&cached)
+            .map_err(|e| Error::Execution(format!("Failed to deserialize cached value: {e}")))?;
+
+        debug!("Using cached value for key: {key}");
+        Ok(Some(value))
     }
 
     /// Serialize and store a JSON value in the cache
@@ -65,24 +48,9 @@ pub trait CacheExt: Cache {
         value: &T,
         ttl: u64,
     ) -> Result<(), Error> {
-        let serialized = match serde_json::to_string(value) {
-            Ok(s) => s,
-            Err(e) => {
-                warn!("Failed to serialize value for caching for key {key}: {e}");
-                return Err(Error::Execution(format!(
-                    "Failed to serialize value for caching: {e}"
-                )));
-            }
-        };
-
-        if let Err(err) = self.store_value(key, &serialized, ttl).await {
-            warn!("Failed to store value in cache for key {key}: {err}");
-            return Err(Error::Execution(format!(
-                "Failed to store value in cache: {err}"
-            )));
-        }
-
-        Ok(())
+        let serialized = serde_json::to_string(value)
+            .map_err(|e| Error::Execution(format!("Failed to serialize value for caching: {e}")))?;
+        self.store_value(key, &serialized, ttl).await
     }
 }
 
@@ -146,7 +114,7 @@ mod tests {
         ) -> Result<(), Error> {
             let mut storage = self.storage.lock().unwrap();
             if let Some(error) = &storage.store_error {
-                return Err(Error::Backend(error.clone()));
+                return Err(Error::Execution(error.clone()));
             }
             storage.data = Some(value.to_string());
             Ok(())
@@ -155,7 +123,7 @@ mod tests {
         async fn retrieve_value(&self, _key: &str) -> Result<Option<String>, Error> {
             let storage = self.storage.lock().unwrap();
             if let Some(error) = &storage.retrieve_error {
-                return Err(Error::Backend(error.clone()));
+                return Err(Error::Execution(error.clone()));
             }
             Ok(storage.data.clone())
         }

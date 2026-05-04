@@ -326,4 +326,68 @@ mod tests {
         let provider = Provider::new(config);
         assert_eq!(provider.name(), "GitHub Actions");
     }
+
+    // Tests for Provider::new with default-chained config (config deserialized from TOML,
+    // then passed to Provider::new). This exercises the full composition path:
+    // serde defaults → ProviderConfig → Provider::new → BaseConfig → trait accessors.
+
+    #[test]
+    fn test_provider_new_from_deserialized_defaults() {
+        // An empty TOML section must produce a provider pointing at the canonical
+        // GitHub Actions OIDC endpoint with the bundled JWKS URL.
+        let config: ProviderConfig = toml::from_str("").unwrap();
+        let provider = Provider::new(config);
+
+        assert_eq!(
+            provider.issuer(),
+            "https://token.actions.githubusercontent.com"
+        );
+        assert_eq!(
+            provider.jwks_uri(),
+            Some("https://token.actions.githubusercontent.com/.well-known/jwks")
+        );
+        assert_eq!(provider.jwks_refresh_interval(), 3600);
+        assert_eq!(provider.clock_skew_tolerance(), 60);
+        assert!(provider.required_audience().is_none());
+    }
+
+    #[test]
+    fn test_provider_new_custom_issuer_from_toml() {
+        // A custom issuer in the TOML config must override the default and flow
+        // through Provider::new into the BaseConfig unchanged.
+        let toml = r#"
+            issuer = "https://custom.example.com"
+        "#;
+
+        let config: ProviderConfig = toml::from_str(toml).unwrap();
+        let provider = Provider::new(config);
+
+        assert_eq!(provider.issuer(), "https://custom.example.com");
+        // JWKS URI still takes its default when not specified.
+        assert_eq!(
+            provider.jwks_uri(),
+            Some("https://token.actions.githubusercontent.com/.well-known/jwks")
+        );
+    }
+
+    #[test]
+    fn test_provider_new_custom_jwks_uri_from_toml() {
+        // A custom jwks_uri in the TOML config must override the default and flow
+        // through Provider::new into the BaseConfig unchanged.
+        let toml = r#"
+            jwks_uri = "https://custom.example.com/.well-known/jwks"
+        "#;
+
+        let config: ProviderConfig = toml::from_str(toml).unwrap();
+        let provider = Provider::new(config);
+
+        assert_eq!(
+            provider.issuer(),
+            "https://token.actions.githubusercontent.com"
+        );
+        assert_eq!(
+            provider.jwks_uri(),
+            Some("https://custom.example.com/.well-known/jwks")
+        );
+    }
 }

@@ -160,7 +160,7 @@ mod tests {
                 BlobIndex, BlobIndexOperation, LinkMetadata, LinkOperation, MetadataStoreExt,
             },
             test_utils,
-            tests::{FSRegistryTestCase, RegistryTestCase, backends},
+            test_utils::{FSRegistryTestCase, RegistryTestCase, backends},
         },
     };
 
@@ -482,8 +482,8 @@ mod tests {
             .await;
 
         assert!(
-            matches!(result, Err(Error::Internal(_))),
-            "StorageBackend error must propagate as Error::Internal, got: {result:?}"
+            matches!(result, Err(Error::MetadataStore(_))),
+            "StorageBackend error must propagate as Error::MetadataStore, got: {result:?}"
         );
     }
 }

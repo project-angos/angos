@@ -24,7 +24,7 @@ impl Namespace {
         if NAMESPACE_RE.is_match(&s) {
             Ok(Self(s))
         } else {
-            Err(Error::InvalidFormat(format!(
+            Err(Error::InvalidNamespace(format!(
                 "Invalid namespace format: '{s}'"
             )))
         }

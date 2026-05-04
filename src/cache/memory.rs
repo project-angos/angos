@@ -80,7 +80,7 @@ impl Cache for Backend {
 mod tests {
     use std::time::Duration;
 
-    use tokio::time;
+    use tokio::{task::JoinSet, time};
 
     use super::*;
 
@@ -128,5 +128,128 @@ mod tests {
             Ok(Some("value".to_string()))
         );
         assert_eq!(cache.retrieve_value("short_0").await, Ok(None));
+    }
+
+    /// Deleting a key that was never stored must return `Ok(())` without panicking.
+    #[tokio::test]
+    async fn test_delete_missing_key() {
+        let cache = Backend::new();
+        let result = cache.delete_value("never_stored").await;
+        assert!(result.is_ok());
+    }
+
+    /// Ten tasks each store a distinct key concurrently; every key must be
+    /// retrievable afterwards.
+    #[tokio::test]
+    async fn test_concurrent_store_distinct_keys() {
+        let cache = Arc::new(Backend::new());
+        let mut set = JoinSet::new();
+
+        for i in 0..10_u32 {
+            let c = Arc::clone(&cache);
+            set.spawn(async move {
+                c.store_value(&format!("concurrent_key_{i}"), &format!("v{i}"), 60)
+                    .await
+                    .unwrap();
+            });
+        }
+
+        while let Some(res) = set.join_next().await {
+            res.unwrap();
+        }
+
+        for i in 0..10_u32 {
+            assert_eq!(
+                cache.retrieve_value(&format!("concurrent_key_{i}")).await,
+                Ok(Some(format!("v{i}"))),
+                "key concurrent_key_{i} missing after concurrent stores"
+            );
+        }
+    }
+
+    /// Ten tasks delete the same key concurrently.  The first deletion
+    /// removes it; the rest are silent no-ops.  None must panic or return an
+    /// error.
+    #[tokio::test]
+    async fn test_concurrent_delete_same_key() {
+        let cache = Arc::new(Backend::new());
+        cache.store_value("shared", "value", 60).await.unwrap();
+
+        let mut set = JoinSet::new();
+        for _ in 0..10_u32 {
+            let c = Arc::clone(&cache);
+            set.spawn(async move { c.delete_value("shared").await.unwrap() });
+        }
+
+        while let Some(res) = set.join_next().await {
+            res.unwrap();
+        }
+
+        // Key must be gone; no panic occurred.
+        assert_eq!(cache.retrieve_value("shared").await, Ok(None));
+    }
+
+    /// An entry stored with TTL 0 is stored with expiry equal to the instant of
+    /// insertion (`Instant::now() + 0`).  The retrieval check is strict `expiry > now`,
+    /// so any non-negative wall-clock progress between store and retrieve makes
+    /// the entry invisible.  In practice the entry is never observable: the
+    /// `maybe_cleanup` call inside `retrieve_value` runs first, which also
+    /// acquires the write lock before the read, giving the clock time to advance
+    /// at least slightly.  This test documents that TTL 0 behaves as
+    /// "already expired" from the caller's perspective.
+    #[tokio::test]
+    async fn test_ttl_zero_expires_immediately() {
+        let cache = Backend::new();
+        cache.store_value("zero_ttl", "value", 0).await.unwrap();
+        // The expiry instant equals the store instant; any elapsed time since
+        // then makes `expiry > now` false.
+        assert_eq!(cache.retrieve_value("zero_ttl").await, Ok(None));
+    }
+
+    /// An entry stored with a TTL larger than one year (400 days) must still
+    /// be present when retrieved immediately without any sleep.
+    #[tokio::test]
+    async fn test_huge_ttl_not_expired() {
+        const FOUR_HUNDRED_DAYS_SECS: u64 = 400 * 24 * 3600;
+        let cache = Backend::new();
+        cache
+            .store_value("huge_ttl", "persisted", FOUR_HUNDRED_DAYS_SECS)
+            .await
+            .unwrap();
+        assert_eq!(
+            cache.retrieve_value("huge_ttl").await,
+            Ok(Some("persisted".to_string()))
+        );
+    }
+
+    /// Verifies the TTL boundary: the entry is present before expiry and absent
+    /// after.  The implementation stores `tokio::time::Instant` values; because
+    /// the `test-util` tokio feature is not enabled in this workspace, the test
+    /// uses real wall-clock sleeps with a short TTL (2 s) and generous margins
+    /// (1 s before, 3 s after) to avoid timer precision issues on CI.
+    #[tokio::test]
+    async fn test_ttl_boundary() {
+        const TTL_SECS: u64 = 2;
+        let cache = Backend::new();
+        cache
+            .store_value("ttl_key", "alive", TTL_SECS)
+            .await
+            .unwrap();
+
+        // One second before expiry: entry must still be present.
+        time::sleep(Duration::from_secs(1)).await;
+        assert_eq!(
+            cache.retrieve_value("ttl_key").await,
+            Ok(Some("alive".to_string())),
+            "entry should be present before TTL expires"
+        );
+
+        // Sleep past the TTL boundary with a generous margin.
+        time::sleep(Duration::from_secs(3)).await;
+        assert_eq!(
+            cache.retrieve_value("ttl_key").await,
+            Ok(None),
+            "entry should be absent after TTL expires"
+        );
     }
 }

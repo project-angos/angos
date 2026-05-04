@@ -37,7 +37,7 @@ use crate::{
     },
     event_webhook::event::Event,
     identity::{Action, ClientIdentity},
-    metrics_provider::{InFlightGuard, METRICS_PROVIDER},
+    metrics_provider::{InFlightGuard, metrics_provider},
     oci::{Digest, Namespace, Reference},
 };
 
@@ -103,11 +103,11 @@ async fn handle_request(
     let elapsed = start_time.elapsed().as_millis() as f64;
     let status = response.status();
 
-    METRICS_PROVIDER
+    metrics_provider()
         .metric_http_request_total
         .with_label_values(&[method.as_str(), route_action, status.as_str()])
         .inc();
-    METRICS_PROVIDER
+    metrics_provider()
         .metric_http_request_duration
         .with_label_values(&[method.as_str(), route_action])
         .observe(elapsed);
@@ -270,7 +270,7 @@ fn handle_unknown_route(parts: &Parts) -> Result<Response<ResponseBody>, Error> 
 
 /// Attaches the peer TLS certificate (if present) as a request extension so
 /// downstream authenticators can inspect it.
-fn inject_peer_certificate(request: &mut Request<Incoming>, cert_data: Option<&[u8]>) {
+fn inject_peer_certificate<B>(request: &mut Request<B>, cert_data: Option<&[u8]>) {
     if let Some(cert_data) = cert_data {
         let peer_certificate = PeerCertificate(Arc::new(cert_data.to_vec()));
         request.extensions_mut().insert(peer_certificate);
@@ -505,7 +505,7 @@ async fn handle_readyz(context: &ServerContext) -> Result<Response<ResponseBody>
 }
 
 fn handle_metrics() -> Result<Response<ResponseBody>, Error> {
-    let (content_type, metrics) = METRICS_PROVIDER.gather()?;
+    let (content_type, metrics) = metrics_provider().gather()?;
 
     Ok(Response::builder()
         .status(StatusCode::OK)

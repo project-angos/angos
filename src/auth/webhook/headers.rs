@@ -225,3 +225,112 @@ pub fn build_cache_key(
 
     Ok(format!("webhook:{name}:{identity_json}:{action_json}"))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::build_cache_key;
+    use crate::{
+        identity::{Action, ClientIdentity},
+        oci::{Namespace, Reference},
+    };
+
+    fn anonymous() -> ClientIdentity {
+        ClientIdentity::new(None)
+    }
+
+    fn identity_with_username(username: &str) -> ClientIdentity {
+        let mut id = ClientIdentity::new(None);
+        id.username = Some(username.to_string());
+        id
+    }
+
+    #[test]
+    fn same_inputs_produce_same_key() {
+        let action = Action::ApiVersion;
+        let identity = anonymous();
+
+        let k1 = build_cache_key("wh", &action, &identity).unwrap();
+        let k2 = build_cache_key("wh", &action, &identity).unwrap();
+
+        assert_eq!(k1, k2);
+    }
+
+    #[test]
+    fn different_action_produces_different_key() {
+        let identity = anonymous();
+
+        let k_api = build_cache_key("wh", &Action::ApiVersion, &identity).unwrap();
+        let k_manifest = build_cache_key(
+            "wh",
+            &Action::GetManifest {
+                namespace: Namespace::new("library/nginx").unwrap(),
+                reference: Reference::Tag("latest".to_string()),
+            },
+            &identity,
+        )
+        .unwrap();
+
+        assert_ne!(k_api, k_manifest);
+    }
+
+    #[test]
+    fn different_identity_produces_different_key() {
+        let action = Action::ApiVersion;
+
+        let k_anon = build_cache_key("wh", &action, &anonymous()).unwrap();
+        let k_user = build_cache_key("wh", &action, &identity_with_username("alice")).unwrap();
+
+        assert_ne!(k_anon, k_user);
+    }
+
+    #[test]
+    fn different_webhook_name_produces_different_key() {
+        let action = Action::ApiVersion;
+        let identity = anonymous();
+
+        let k_a = build_cache_key("webhook-a", &action, &identity).unwrap();
+        let k_b = build_cache_key("webhook-b", &action, &identity).unwrap();
+
+        assert_ne!(k_a, k_b);
+    }
+
+    #[test]
+    fn key_contains_webhook_prefix_and_name() {
+        let action = Action::ApiVersion;
+        let identity = anonymous();
+
+        let key = build_cache_key("my-hook", &action, &identity).unwrap();
+
+        assert!(
+            key.starts_with("webhook:my-hook:"),
+            "key must be prefixed with 'webhook:<name>:': {key}"
+        );
+    }
+
+    #[test]
+    fn different_reference_same_namespace_produces_different_key() {
+        let identity = anonymous();
+
+        let k_latest = build_cache_key(
+            "wh",
+            &Action::GetManifest {
+                namespace: Namespace::new("library/nginx").unwrap(),
+                reference: Reference::Tag("latest".to_string()),
+            },
+            &identity,
+        )
+        .unwrap();
+
+        let k_v1 = build_cache_key(
+            "wh",
+            &Action::GetManifest {
+                namespace: Namespace::new("library/nginx").unwrap(),
+                reference: Reference::Tag("v1.0.0".to_string()),
+            },
+            &identity,
+        )
+        .unwrap();
+
+        assert_ne!(k_latest, k_v1);
+    }
+}

@@ -130,12 +130,23 @@ impl Configuration {
     }
 
     pub fn log_deprecations(&self) {
-        if self.global.enable_redirect.is_some() {
+        for field in self.deprecated_fields() {
             warn!(
-                "'global.enable_redirect' is deprecated; use \
+                "'{field}' is deprecated; use \
                  'global.enable_blob_redirect' and 'global.enable_manifest_redirect' instead"
             );
         }
+    }
+
+    /// Returns the names of deprecated configuration fields that are set.
+    ///
+    /// Exposed for testing without requiring log capture infrastructure.
+    pub fn deprecated_fields(&self) -> Vec<&'static str> {
+        let mut fields = Vec::new();
+        if self.global.enable_redirect.is_some() {
+            fields.push("global.enable_redirect");
+        }
+        fields
     }
 }
 

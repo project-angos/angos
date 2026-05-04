@@ -74,7 +74,7 @@ impl NamespaceChecker for TagChecker {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::registry::{metadata_store::MetadataStoreExt, test_utils, tests::backends};
+    use crate::registry::{metadata_store::MetadataStoreExt, test_utils, test_utils::backends};
 
     #[tokio::test]
     async fn test_scrub_tags_creates_missing_digest_links() {

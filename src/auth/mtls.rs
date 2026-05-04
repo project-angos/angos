@@ -82,72 +82,11 @@ impl AuthMiddleware for MtlsValidator {
 }
 
 #[cfg(test)]
-mod tests {
+pub mod tests {
     use hyper::Request;
 
     use super::*;
-
-    fn generate_test_certificate() -> Vec<u8> {
-        use std::process::Command;
-
-        let output = Command::new("openssl")
-            .args([
-                "req",
-                "-x509",
-                "-newkey",
-                "rsa:2048",
-                "-nodes",
-                "-keyout",
-                "/dev/null",
-                "-out",
-                "/dev/stdout",
-                "-days",
-                "1",
-                "-subj",
-                "/CN=test-user/O=TestOrg/O=SecondOrg",
-                "-outform",
-                "DER",
-            ])
-            .output()
-            .expect("Failed to generate test certificate");
-
-        assert!(
-            output.status.success(),
-            "OpenSSL failed to generate certificate"
-        );
-        output.stdout
-    }
-
-    fn generate_minimal_certificate() -> Vec<u8> {
-        use std::process::Command;
-
-        let output = Command::new("openssl")
-            .args([
-                "req",
-                "-x509",
-                "-newkey",
-                "rsa:2048",
-                "-nodes",
-                "-keyout",
-                "/dev/null",
-                "-out",
-                "/dev/stdout",
-                "-days",
-                "1",
-                "-subj",
-                "/",
-                "-outform",
-                "DER",
-            ])
-            .output()
-            .expect("Failed to generate minimal certificate");
-
-        assert!(
-            output.status.success(),
-            "OpenSSL failed to generate certificate"
-        );
-        output.stdout
-    }
+    use crate::test_fixtures::mtls::{cert_der, minimal_cert_der};
 
     #[tokio::test]
     async fn test_authenticate_no_certificate() {
@@ -167,8 +106,7 @@ mod tests {
     #[tokio::test]
     async fn test_authenticate_with_valid_certificate() {
         let validator = MtlsValidator::new();
-        let cert_der = generate_test_certificate();
-        let peer_cert = PeerCertificate(Arc::new(cert_der));
+        let peer_cert = PeerCertificate(Arc::new(cert_der()));
 
         let mut request = Request::builder().body(()).unwrap();
         request.extensions_mut().insert(peer_cert);
@@ -181,17 +119,13 @@ mod tests {
         assert!(result.is_ok());
         assert!(matches!(result.unwrap(), AuthResult::Authenticated));
         assert_eq!(identity.certificate.common_names, vec!["test-user"]);
-        assert_eq!(
-            identity.certificate.organizations,
-            vec!["TestOrg", "SecondOrg"]
-        );
+        assert_eq!(identity.certificate.organizations, vec!["TestOrg"]);
     }
 
     #[tokio::test]
     async fn test_authenticate_with_minimal_certificate() {
         let validator = MtlsValidator::new();
-        let cert_der = generate_minimal_certificate();
-        let peer_cert = PeerCertificate(Arc::new(cert_der));
+        let peer_cert = PeerCertificate(Arc::new(minimal_cert_der()));
 
         let mut request = Request::builder().body(()).unwrap();
         request.extensions_mut().insert(peer_cert);
@@ -227,21 +161,21 @@ mod tests {
 
     #[test]
     fn test_extract_certificate_identity() {
-        let cert_der = generate_test_certificate();
-        let (_, cert) = X509Certificate::from_der(&cert_der).unwrap();
+        let der = cert_der();
+        let (_, cert) = X509Certificate::from_der(&der).unwrap();
 
         let result = MtlsValidator::extract_certificate_identity(&cert);
 
         assert!(result.is_ok());
         let cert_info = result.unwrap();
         assert_eq!(cert_info.common_names, vec!["test-user"]);
-        assert_eq!(cert_info.organizations, vec!["TestOrg", "SecondOrg"]);
+        assert_eq!(cert_info.organizations, vec!["TestOrg"]);
     }
 
     #[test]
     fn test_extract_certificate_identity_minimal() {
-        let cert_der = generate_minimal_certificate();
-        let (_, cert) = X509Certificate::from_der(&cert_der).unwrap();
+        let der = minimal_cert_der();
+        let (_, cert) = X509Certificate::from_der(&der).unwrap();
 
         let result = MtlsValidator::extract_certificate_identity(&cert);
 

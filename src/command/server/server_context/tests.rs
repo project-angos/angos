@@ -18,11 +18,13 @@ use crate::{
         event::{Event, EventKind},
     },
     identity::ClientIdentity,
+    metrics_provider,
     oci::{Namespace, Reference},
     registry::{Registry, RegistryConfig, Repository},
 };
 
 fn create_test_config() -> Configuration {
+    metrics_provider::init_for_tests();
     let toml = r#"
         [blob_store.fs]
         root_dir = "/tmp/test-blobs"

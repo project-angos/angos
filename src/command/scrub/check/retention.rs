@@ -6,12 +6,14 @@ use tracing::{debug, info};
 
 use crate::{
     command::scrub::check::NamespaceChecker,
-    oci::Digest,
+    oci::{Digest, namespace_belongs_to},
     policy::{EpochSeconds, ManifestImage, RetentionPolicy},
     registry::{
         Error,
         blob_store::BlobStore,
-        metadata_store::{LinkMetadata, MetadataStore, MetadataStoreExt, link_kind::LinkKind},
+        metadata_store::{
+            BlobIndex, LinkMetadata, MetadataStore, MetadataStoreExt, link_kind::LinkKind,
+        },
         pagination::collect_all_pages,
         parse_manifest_digests,
         repository::Repository,
@@ -29,6 +31,17 @@ pub struct RetentionChecker {
     repositories: Arc<HashMap<String, Repository>>,
     global_retention_policy: Option<Arc<RetentionPolicy>>,
     dry_run: bool,
+}
+
+fn has_link_kind(
+    blob_index: &BlobIndex,
+    namespace: &str,
+    predicate: impl Fn(&LinkKind) -> bool,
+) -> bool {
+    blob_index
+        .namespace
+        .get(namespace)
+        .is_some_and(|refs| refs.iter().any(predicate))
 }
 
 async fn fetch_single_tag_metadata(
@@ -127,7 +140,7 @@ impl RetentionChecker {
 
     fn rank_by<K: Ord>(tags: &[TagWithMetadata], key: impl Fn(&LinkMetadata) -> K) -> Vec<String> {
         let mut indices: Vec<usize> = (0..tags.len()).collect();
-        indices.sort_by(|&a, &b| key(&tags[b].metadata).cmp(&key(&tags[a].metadata)));
+        indices.sort_by_cached_key(|&i| std::cmp::Reverse(key(&tags[i].metadata)));
         indices.iter().map(|&i| tags[i].name.clone()).collect()
     }
 
@@ -194,10 +207,7 @@ impl RetentionChecker {
     fn find_repository_for_namespace(&self, namespace: &str) -> Option<&Repository> {
         self.repositories
             .iter()
-            .find(|(repository_name, _)| {
-                namespace == repository_name.as_str()
-                    || namespace.starts_with(&format!("{repository_name}/"))
-            })
+            .find(|(repository_name, _)| namespace_belongs_to(namespace, repository_name))
             .map(|(_, repository)| repository)
     }
 
@@ -313,13 +323,11 @@ impl RetentionChecker {
     async fn is_protected(&self, namespace: &str, digest: &Digest) -> Result<bool, Error> {
         // Index child manifests are protected
         if let Ok(blob_index) = self.metadata_store.read_blob_index(digest).await
-            && let Some(refs) = blob_index.namespace.get(namespace)
+            && has_link_kind(&blob_index, namespace, |link| {
+                matches!(link, LinkKind::Manifest(_, _))
+            })
         {
-            for link in refs {
-                if matches!(link, LinkKind::Manifest(_, _)) {
-                    return Ok(true);
-                }
-            }
+            return Ok(true);
         }
 
         // Referrer subjects are protected
@@ -332,13 +340,11 @@ impl RetentionChecker {
 
     async fn has_tags(&self, namespace: &str, digest: &Digest) -> Result<bool, Error> {
         if let Ok(blob_index) = self.metadata_store.read_blob_index(digest).await
-            && let Some(refs) = blob_index.namespace.get(namespace)
+            && has_link_kind(&blob_index, namespace, |link| {
+                matches!(link, LinkKind::Tag(_))
+            })
         {
-            for link in refs {
-                if matches!(link, LinkKind::Tag(_)) {
-                    return Ok(true);
-                }
-            }
+            return Ok(true);
         }
         Ok(false)
     }
@@ -381,11 +387,192 @@ impl RetentionChecker {
 
 #[cfg(test)]
 mod tests {
+    use std::{collections::HashSet, str::FromStr};
+
+    use chrono::{TimeZone, Utc};
+
     use super::*;
     use crate::{
-        policy::{CelRule, RetentionPolicy, RetentionPolicyConfig},
-        registry::{test_utils, tests::backends},
+        oci::Digest,
+        policy::{CelRule, RetentionPolicy, RetentionPolicyConfig, SystemClock},
+        registry::{
+            blob_store::fs::Backend as FsBlobStore,
+            data_store::fs::BackendConfig as FsBackendConfig,
+            metadata_store::{
+                LockStrategy,
+                fs::{Backend as FsMetadataStore, BackendConfig as FsMetadataConfig},
+            },
+            test_utils,
+            test_utils::backends,
+        },
     };
+
+    fn dummy_digest() -> Digest {
+        Digest::from_str("sha256:0000000000000000000000000000000000000000000000000000000000000000")
+            .unwrap()
+    }
+
+    fn tag_with_times(
+        name: &str,
+        created: Option<chrono::DateTime<Utc>>,
+        accessed: Option<chrono::DateTime<Utc>>,
+    ) -> TagWithMetadata {
+        TagWithMetadata {
+            name: name.to_string(),
+            metadata: LinkMetadata {
+                target: dummy_digest(),
+                created_at: created,
+                accessed_at: accessed,
+                referenced_by: HashSet::default(),
+                media_type: None,
+                descriptor: None,
+            },
+        }
+    }
+
+    fn make_checker_with_repos(
+        repositories: Arc<HashMap<String, crate::registry::Repository>>,
+    ) -> RetentionChecker {
+        use tempfile::TempDir;
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().to_string_lossy().to_string();
+        // Keep dir alive for the duration of the function by leaking it; these
+        // tests exercise pure methods that never touch the filesystem.
+        std::mem::forget(dir);
+        let blob_store = Arc::new(FsBlobStore::new(&FsBackendConfig {
+            root_dir: path.clone(),
+            sync_to_disk: false,
+        }));
+        let metadata_store = Arc::new(
+            FsMetadataStore::new(&FsMetadataConfig {
+                root_dir: path,
+                sync_to_disk: false,
+                lock_strategy: LockStrategy::Memory,
+            })
+            .unwrap(),
+        );
+        RetentionChecker::new(blob_store, metadata_store, repositories, None, false)
+    }
+
+    // --- rank_by ---
+
+    #[test]
+    fn rank_by_sorts_descending_by_key() {
+        let t1 = Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap();
+        let t2 = Utc.with_ymd_and_hms(2024, 6, 1, 0, 0, 0).unwrap();
+        let t3 = Utc.with_ymd_and_hms(2024, 12, 1, 0, 0, 0).unwrap();
+
+        let tags = vec![
+            tag_with_times("oldest", Some(t1), None),
+            tag_with_times("newest", Some(t3), None),
+            tag_with_times("middle", Some(t2), None),
+        ];
+
+        let ranked = RetentionChecker::rank_by(&tags, |m| m.created_at);
+
+        assert_eq!(ranked, vec!["newest", "middle", "oldest"]);
+    }
+
+    #[test]
+    fn rank_by_empty_slice_returns_empty() {
+        let ranked = RetentionChecker::rank_by(&[], |m| m.created_at);
+        assert!(ranked.is_empty());
+    }
+
+    #[test]
+    fn rank_by_all_none_timestamps_returns_all_names() {
+        let tags = vec![
+            tag_with_times("alpha", None, None),
+            tag_with_times("beta", None, None),
+        ];
+        let ranked = RetentionChecker::rank_by(&tags, |m| m.created_at);
+        // All keys are equal (None); every tag must appear exactly once.
+        assert_eq!(ranked.len(), 2);
+        assert!(ranked.contains(&"alpha".to_string()));
+        assert!(ranked.contains(&"beta".to_string()));
+    }
+
+    // --- build_sorted_rankings ---
+
+    #[test]
+    fn build_sorted_rankings_pushed_order() {
+        let t1 = Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap();
+        let t3 = Utc.with_ymd_and_hms(2024, 12, 1, 0, 0, 0).unwrap();
+
+        let tags = vec![
+            tag_with_times("old", Some(t1), None),
+            tag_with_times("new", Some(t3), None),
+        ];
+
+        let (last_pushed, last_pulled) = RetentionChecker::build_sorted_rankings(&tags);
+
+        assert_eq!(
+            last_pushed[0], "new",
+            "most recently pushed must come first"
+        );
+        assert_eq!(last_pushed[1], "old");
+        // Neither tag has an accessed_at; both must still appear.
+        assert_eq!(last_pulled.len(), 2);
+    }
+
+    #[test]
+    fn build_sorted_rankings_empty_input() {
+        let (last_pushed, last_pulled) = RetentionChecker::build_sorted_rankings(&[]);
+        assert!(last_pushed.is_empty());
+        assert!(last_pulled.is_empty());
+    }
+
+    #[test]
+    fn build_sorted_rankings_pulled_independent_of_pushed() {
+        let pushed_time = Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap();
+        let pulled_time = Utc.with_ymd_and_hms(2024, 12, 1, 0, 0, 0).unwrap();
+
+        // "a" was pushed later but pulled first (older pull time).
+        // "b" was pushed earlier but pulled most recently.
+        let tags = vec![
+            tag_with_times("a", Some(pulled_time), Some(pushed_time)),
+            tag_with_times("b", Some(pushed_time), Some(pulled_time)),
+        ];
+
+        let (last_pushed, last_pulled) = RetentionChecker::build_sorted_rankings(&tags);
+
+        assert_eq!(last_pushed[0], "a", "a has the more recent pushed time");
+        assert_eq!(last_pulled[0], "b", "b has the more recent pulled time");
+    }
+
+    // --- find_repository_for_namespace ---
+
+    #[test]
+    fn find_repository_for_namespace_exact_match() {
+        let repos = test_utils::create_test_repositories();
+        let checker = make_checker_with_repos(repos);
+
+        let found = checker.find_repository_for_namespace("test-repo");
+        assert!(found.is_some(), "exact repository name must match");
+        assert_eq!(found.unwrap().name, "test-repo");
+    }
+
+    #[test]
+    fn find_repository_for_namespace_prefix_match() {
+        let repos = test_utils::create_test_repositories();
+        let checker = make_checker_with_repos(repos);
+
+        let found = checker.find_repository_for_namespace("test-repo/images/app");
+        assert!(
+            found.is_some(),
+            "namespace under a repository prefix must match"
+        );
+        assert_eq!(found.unwrap().name, "test-repo");
+    }
+
+    #[test]
+    fn find_repository_for_namespace_unknown_returns_none() {
+        let repos = test_utils::create_test_repositories();
+        let checker = make_checker_with_repos(repos);
+
+        let found = checker.find_repository_for_namespace("completely-different");
+        assert!(found.is_none(), "unknown namespace must return None");
+    }
 
     const TEST_MANIFEST: &[u8] = br#"{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{"mediaType":"application/vnd.oci.image.config.v1+json","digest":"sha256:0000000000000000000000000000000000000000000000000000000000000000","size":0},"layers":[]}"#;
 
@@ -411,7 +598,10 @@ mod tests {
                 rules: vec![CelRule::compile("top_pushed(10)").unwrap()],
             };
 
-            let retention_policy = Arc::new(RetentionPolicy::new(&retention_config));
+            let retention_policy = Arc::new(RetentionPolicy::new(
+                &retention_config,
+                Arc::new(SystemClock),
+            ));
 
             let repositories = test_utils::create_test_repositories();
             let scrubber = RetentionChecker::new(
@@ -487,9 +677,12 @@ mod tests {
                 .add();
             tx.commit().await.unwrap();
 
-            let policy = Arc::new(RetentionPolicy::new(&RetentionPolicyConfig {
-                rules: vec![CelRule::compile("image.tag != null").unwrap()],
-            }));
+            let policy = Arc::new(RetentionPolicy::new(
+                &RetentionPolicyConfig {
+                    rules: vec![CelRule::compile("image.tag != null").unwrap()],
+                },
+                Arc::new(SystemClock),
+            ));
 
             RetentionChecker::new(
                 blob_store,
@@ -569,9 +762,12 @@ mod tests {
             .add();
             tx.commit().await.unwrap();
 
-            let policy = Arc::new(RetentionPolicy::new(&RetentionPolicyConfig {
-                rules: vec![CelRule::compile("image.tag != null").unwrap()],
-            }));
+            let policy = Arc::new(RetentionPolicy::new(
+                &RetentionPolicyConfig {
+                    rules: vec![CelRule::compile("image.tag != null").unwrap()],
+                },
+                Arc::new(SystemClock),
+            ));
 
             RetentionChecker::new(
                 blob_store.clone(),

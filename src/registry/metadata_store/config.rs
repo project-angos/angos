@@ -1,11 +1,12 @@
 use std::sync::Arc;
 
 use serde::Deserialize;
+use tracing::info;
 
 use crate::{
     cache::Cache,
     registry::{
-        data_store, metadata_store,
+        blob_store, data_store, metadata_store,
         metadata_store::{ConditionalCapabilities, Error, LockStrategy, MetadataStore},
     },
 };
@@ -20,6 +21,30 @@ pub enum MetadataStoreConfig {
 }
 
 impl MetadataStoreConfig {
+    pub fn from_blob_store(blob: &blob_store::BlobStorageConfig) -> Self {
+        match blob {
+            blob_store::BlobStorageConfig::FS(config) => {
+                MetadataStoreConfig::FS(metadata_store::fs::BackendConfig {
+                    root_dir: config.root_dir.clone(),
+                    sync_to_disk: config.sync_to_disk,
+                    ..Default::default()
+                })
+            }
+            blob_store::BlobStorageConfig::S3(config) => {
+                info!("Auto-configuring S3 metadata-store from blob-store");
+                MetadataStoreConfig::S3(metadata_store::s3::BackendConfig {
+                    bucket: config.bucket.clone(),
+                    region: config.region.clone(),
+                    endpoint: config.endpoint.clone(),
+                    access_key_id: config.access_key_id.clone(),
+                    secret_key: config.secret_key.clone(),
+                    key_prefix: config.key_prefix.clone(),
+                    ..Default::default()
+                })
+            }
+        }
+    }
+
     pub async fn probe(&self) -> Result<Option<ConditionalCapabilities>, Error> {
         match self {
             MetadataStoreConfig::S3(config) => match &config.lock_strategy {
@@ -149,5 +174,44 @@ mod tests {
             result.unwrap().is_none(),
             "FS config should return no capabilities"
         );
+    }
+
+    #[test]
+    fn test_from_blob_store_fs_copies_paths_and_sync() {
+        let blob = blob_store::BlobStorageConfig::FS(data_store::fs::BackendConfig {
+            root_dir: "/var/lib/registry".to_string(),
+            sync_to_disk: true,
+        });
+        match MetadataStoreConfig::from_blob_store(&blob) {
+            MetadataStoreConfig::FS(c) => {
+                assert_eq!(c.root_dir, "/var/lib/registry");
+                assert!(c.sync_to_disk);
+            }
+            MetadataStoreConfig::S3(_) => panic!("expected FS metadata config"),
+        }
+    }
+
+    #[test]
+    fn test_from_blob_store_s3_copies_credentials_and_bucket() {
+        let blob = blob_store::BlobStorageConfig::S3(data_store::s3::BackendConfig {
+            bucket: "test-bucket".to_string(),
+            region: "us-east-1".to_string(),
+            endpoint: "http://localhost:9000".to_string(),
+            access_key_id: "key".to_string(),
+            secret_key: "secret".to_string(),
+            key_prefix: "foo".to_string(),
+            ..Default::default()
+        });
+        match MetadataStoreConfig::from_blob_store(&blob) {
+            MetadataStoreConfig::S3(c) => {
+                assert_eq!(c.bucket, "test-bucket");
+                assert_eq!(c.region, "us-east-1");
+                assert_eq!(c.endpoint, "http://localhost:9000");
+                assert_eq!(c.access_key_id, "key");
+                assert_eq!(c.secret_key, "secret");
+                assert_eq!(c.key_prefix, "foo");
+            }
+            MetadataStoreConfig::FS(_) => panic!("expected S3 metadata config"),
+        }
     }
 }

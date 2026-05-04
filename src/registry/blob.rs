@@ -343,7 +343,10 @@ mod tests {
     use super::*;
     use crate::{
         oci::Namespace,
-        registry::{DOCKER_CONTENT_DIGEST, test_utils::create_test_blob, tests::backends},
+        registry::{
+            DOCKER_CONTENT_DIGEST,
+            test_utils::{backends, create_test_blob},
+        },
     };
 
     #[tokio::test]

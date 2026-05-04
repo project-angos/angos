@@ -116,7 +116,7 @@ impl NamespaceChecker for ManifestChecker {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::registry::{metadata_store::MetadataStoreExt, test_utils, tests::backends};
+    use crate::registry::{metadata_store::MetadataStoreExt, test_utils, test_utils::backends};
 
     #[tokio::test]
     async fn test_scrub_revisions_validates_manifest_links() {
