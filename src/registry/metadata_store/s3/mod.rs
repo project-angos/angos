@@ -54,7 +54,6 @@ pub struct Backend {
     flush_handle: Option<Arc<access_time::FlushHandle>>,
 }
 
-const MAX_UPDATE_RETRIES: u32 = 10;
 const MAX_BLOB_INDEX_CAS_RETRIES: u32 = 20;
 
 impl Backend {

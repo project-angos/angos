@@ -1,15 +1,19 @@
-use std::io::ErrorKind;
+use std::{collections::HashMap, io::ErrorKind};
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use futures_util::future::join_all;
 use tracing::warn;
 
 use super::Backend;
 use crate::{
     cache::CacheExt,
+    oci::Digest,
     registry::{
         data_store,
-        metadata_store::{Error, LinkMetadata, link_kind::LinkKind, lock_ops::LockOps},
+        metadata_store::{
+            BlobIndexOperation, Error, LinkMetadata, link_kind::LinkKind, lock_ops::LockOps,
+        },
         path_builder,
     },
 };
@@ -146,5 +150,39 @@ impl LockOps for Backend {
         if let Some(cache) = &self.cache {
             let _ = cache.delete_value(&Self::cache_key(namespace, link)).await;
         }
+    }
+
+    /// Applies blob-index operations concurrently, one task per digest.
+    ///
+    /// Each digest's shard is updated via an unconditional read-modify-write
+    /// (`update_blob_index_shard`). Cross-call updates to the same digest are
+    /// serialized by the `blob:{digest}` lock key acquired before this method
+    /// is called.
+    async fn apply_pending_blob_index_ops(
+        &self,
+        namespace: &str,
+        pending_blob_ops: HashMap<Digest, Vec<BlobIndexOperation>>,
+    ) -> Result<(), Error> {
+        join_all(
+            pending_blob_ops
+                .iter()
+                .map(|(digest, ops)| self.update_blob_index_shard(namespace, digest, ops)),
+        )
+        .await
+        .into_iter()
+        .collect::<Result<Vec<_>, _>>()?;
+        Ok(())
+    }
+
+    /// Registers the namespace in the namespace registry after a successful
+    /// transaction that included create operations.
+    ///
+    /// Failure to register is non-fatal: the error is logged at `warn` level
+    /// and `Ok(())` is returned so the transaction result is not affected.
+    async fn after_update(&self, namespace: &str, had_creates: bool) -> Result<(), Error> {
+        if had_creates && let Err(e) = self.register_namespace(namespace).await {
+            warn!(namespace, error = %e, "Failed to register namespace");
+        }
+        Ok(())
     }
 }

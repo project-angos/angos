@@ -19,6 +19,7 @@ mod lock;
 pub mod lock_ops;
 pub mod referrer_resolver;
 pub mod s3;
+pub mod transaction;
 
 #[cfg(test)]
 mod tests;
@@ -29,6 +30,15 @@ pub use lock::{LockStrategy, redis::LockConfig};
 
 use crate::registry::metadata_store::link_kind::LinkKind;
 
+/// Returns a random number in `[0, max_ms)` for use as retry-loop jitter.
+///
+/// Entropy comes from `std::collections::hash_map::RandomState`, which the
+/// stdlib seeds from the OS at process start. This is sufficient for jitter
+/// because the only goal is to spread retry attempts across competing tasks —
+/// adversaries learning the value gain nothing. **This is not a
+/// security-critical RNG**: do not use it for tokens, nonces, or anything an
+/// attacker could exploit if predicted. For those uses, draw from
+/// `rand::rng()` or a CSPRNG instead.
 pub fn simple_jitter(max_ms: u64) -> u64 {
     if max_ms == 0 {
         return 0;
