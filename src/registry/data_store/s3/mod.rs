@@ -14,53 +14,15 @@ use aws_sdk_s3::{
 use bytes::Bytes;
 use bytesize::ByteSize;
 use chrono::{DateTime, Utc};
-use serde::Deserialize;
 
 use crate::{
     circuit_breaker::CircuitBreaker,
     registry::{blob_store::s3::UploadedPart, data_store::Error},
-    secret::Secret,
 };
 
-#[derive(Clone, Debug, Deserialize, PartialEq)]
-#[serde(default)]
-pub struct BackendConfig {
-    pub access_key_id: Secret<String>,
-    pub secret_key: Secret<String>,
-    pub endpoint: String,
-    pub bucket: String,
-    pub region: String,
-    pub key_prefix: String,
-    pub multipart_copy_threshold: ByteSize,
-    pub multipart_copy_chunk_size: ByteSize,
-    pub multipart_copy_jobs: usize,
-    pub multipart_part_size: ByteSize,
-    pub multipart_uniform_parts: bool,
-    pub operation_timeout_secs: u64,
-    pub operation_attempt_timeout_secs: u64,
-    pub max_attempts: u32,
-}
+mod config;
 
-impl Default for BackendConfig {
-    fn default() -> Self {
-        Self {
-            access_key_id: Secret::new(String::new()),
-            secret_key: Secret::new(String::new()),
-            endpoint: String::new(),
-            bucket: String::new(),
-            region: String::new(),
-            key_prefix: String::new(),
-            multipart_copy_threshold: ByteSize::gb(5),
-            multipart_copy_chunk_size: ByteSize::mb(100),
-            multipart_copy_jobs: 4,
-            multipart_part_size: ByteSize::mib(50),
-            multipart_uniform_parts: false,
-            operation_timeout_secs: 900,
-            operation_attempt_timeout_secs: 300,
-            max_attempts: 3,
-        }
-    }
-}
+pub use config::BackendConfig;
 
 #[derive(Clone, Debug)]
 pub struct Backend {
@@ -935,6 +897,7 @@ fn aggregate_batch_delete_errors(errors: &[aws_sdk_s3::types::Error]) -> Option<
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::secret::Secret;
 
     fn test_config(overrides: impl FnOnce(&mut BackendConfig)) -> BackendConfig {
         let mut config = BackendConfig {
