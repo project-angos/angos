@@ -10,7 +10,7 @@ use std::{
     fmt::{self, Debug, Formatter},
     io,
     sync::Arc,
-    time::Duration as StdDuration,
+    time::Duration,
 };
 
 use async_trait::async_trait;
@@ -293,7 +293,7 @@ impl PresignedBlobStore for Backend {
         let path = path_builder::blob_path(digest);
         let url = self
             .store
-            .generate_presigned_url(&path, StdDuration::from_mins(30), content_type)
+            .generate_presigned_url(&path, Duration::from_mins(30), content_type)
             .await?;
         Ok(Some(url))
     }
