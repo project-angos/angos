@@ -455,3 +455,280 @@ pub trait LockOps: Send + Sync {
         Ok(pending_blob_ops)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::{collections::HashMap, sync::Mutex};
+
+    use async_trait::async_trait;
+
+    use super::*;
+    use crate::{
+        oci::Digest,
+        registry::metadata_store::{
+            BlobIndexOperation, LinkMetadata, LinkOperation, link_kind::LinkKind,
+        },
+    };
+
+    fn digest(hex: &str) -> Digest {
+        let padded = format!("{hex:0<64}");
+        format!("sha256:{padded}").parse().unwrap()
+    }
+
+    struct MockBackend {
+        store: Mutex<HashMap<(String, LinkKind), LinkMetadata>>,
+    }
+
+    impl MockBackend {
+        fn new() -> Self {
+            Self {
+                store: Mutex::new(HashMap::new()),
+            }
+        }
+
+        fn with_link(self, namespace: &str, link: LinkKind, metadata: LinkMetadata) -> Self {
+            self.store
+                .lock()
+                .unwrap()
+                .insert((namespace.to_string(), link), metadata);
+            self
+        }
+    }
+
+    #[async_trait]
+    impl LockOps for MockBackend {
+        async fn read_link_reference(
+            &self,
+            namespace: &str,
+            link: &LinkKind,
+        ) -> Result<LinkMetadata, Error> {
+            self.store
+                .lock()
+                .unwrap()
+                .get(&(namespace.to_string(), link.clone()))
+                .cloned()
+                .ok_or(Error::ReferenceNotFound)
+        }
+
+        async fn write_link_reference(
+            &self,
+            namespace: &str,
+            link: &LinkKind,
+            metadata: &LinkMetadata,
+        ) -> Result<(), Error> {
+            self.store
+                .lock()
+                .unwrap()
+                .insert((namespace.to_string(), link.clone()), metadata.clone());
+            Ok(())
+        }
+
+        async fn delete_link_reference(
+            &self,
+            namespace: &str,
+            link: &LinkKind,
+        ) -> Result<(), Error> {
+            self.store
+                .lock()
+                .unwrap()
+                .remove(&(namespace.to_string(), link.clone()));
+            Ok(())
+        }
+
+        fn lock_key_for_link(namespace: &str, link: &LinkKind) -> String
+        where
+            Self: Sized,
+        {
+            format!("{namespace}:{link}")
+        }
+
+        async fn apply_pending_blob_index_ops(
+            &self,
+            _namespace: &str,
+            _pending_blob_ops: HashMap<Digest, Vec<BlobIndexOperation>>,
+        ) -> Result<(), Error> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn prelock_resolves_create_with_no_prior_link() {
+        let backend = MockBackend::new();
+        let target = digest("aa");
+        let link = LinkKind::Tag("v1".to_string());
+
+        let ops = vec![LinkOperation::Create {
+            link: link.clone(),
+            target: target.clone(),
+            referrer: None,
+            media_type: None,
+            descriptor: None,
+        }];
+
+        let (creates, deletes, lock_keys) = backend.prelock_resolve_operations("ns", &ops).await;
+
+        assert_eq!(creates.len(), 1);
+        assert!(creates[0].old_target.is_none());
+        assert_eq!(creates[0].target, target);
+        assert!(deletes.is_empty());
+        assert!(lock_keys.contains(&"ns:tag:v1".to_string()));
+        assert!(lock_keys.contains(&format!("blob:{target}")));
+    }
+
+    #[tokio::test]
+    async fn prelock_resolves_create_with_existing_link() {
+        let prior_target = digest("bb");
+        let new_target = digest("cc");
+        let link = LinkKind::Tag("v1".to_string());
+        let prior_metadata = LinkMetadata::from_digest(prior_target.clone());
+
+        let backend = MockBackend::new().with_link("ns", link.clone(), prior_metadata);
+
+        let ops = vec![LinkOperation::Create {
+            link: link.clone(),
+            target: new_target.clone(),
+            referrer: None,
+            media_type: None,
+            descriptor: None,
+        }];
+
+        let (creates, deletes, lock_keys) = backend.prelock_resolve_operations("ns", &ops).await;
+
+        assert_eq!(creates.len(), 1);
+        assert_eq!(creates[0].old_target, Some(prior_target.clone()));
+        assert_eq!(creates[0].target, new_target);
+        assert!(deletes.is_empty());
+        assert!(lock_keys.contains(&"ns:tag:v1".to_string()));
+        assert!(lock_keys.contains(&format!("blob:{new_target}")));
+        assert!(lock_keys.contains(&format!("blob:{prior_target}")));
+    }
+
+    #[tokio::test]
+    async fn prelock_resolves_delete_for_existing_link() {
+        let target = digest("dd");
+        let link = LinkKind::Tag("v2".to_string());
+        let metadata = LinkMetadata::from_digest(target.clone());
+
+        let backend = MockBackend::new().with_link("ns", link.clone(), metadata);
+
+        let ops = vec![LinkOperation::Delete {
+            link: link.clone(),
+            referrer: None,
+        }];
+
+        let (creates, deletes, lock_keys) = backend.prelock_resolve_operations("ns", &ops).await;
+
+        assert!(creates.is_empty());
+        assert_eq!(deletes.len(), 1);
+        assert_eq!(deletes[0].target, target);
+        assert!(lock_keys.contains(&"ns:tag:v2".to_string()));
+        assert!(lock_keys.contains(&format!("blob:{target}")));
+    }
+
+    #[tokio::test]
+    async fn prelock_drops_delete_for_missing_link() {
+        let backend = MockBackend::new();
+        let link = LinkKind::Tag("ghost".to_string());
+
+        let ops = vec![LinkOperation::Delete {
+            link,
+            referrer: None,
+        }];
+
+        let (creates, deletes, lock_keys) = backend.prelock_resolve_operations("ns", &ops).await;
+
+        assert!(creates.is_empty());
+        assert!(deletes.is_empty());
+        assert!(lock_keys.is_empty());
+    }
+
+    #[tokio::test]
+    async fn prelock_handles_mixed_create_and_delete() {
+        let create_target = digest("ee");
+        let delete_target = digest("ff");
+        let create_link = LinkKind::Tag("new".to_string());
+        let delete_link = LinkKind::Tag("old".to_string());
+        let delete_metadata = LinkMetadata::from_digest(delete_target.clone());
+
+        let backend = MockBackend::new().with_link("ns", delete_link.clone(), delete_metadata);
+
+        let ops = vec![
+            LinkOperation::Create {
+                link: create_link.clone(),
+                target: create_target.clone(),
+                referrer: None,
+                media_type: None,
+                descriptor: None,
+            },
+            LinkOperation::Delete {
+                link: delete_link.clone(),
+                referrer: None,
+            },
+        ];
+
+        let (creates, deletes, lock_keys) = backend.prelock_resolve_operations("ns", &ops).await;
+
+        assert_eq!(creates.len(), 1);
+        assert_eq!(creates[0].target, create_target);
+        assert!(creates[0].old_target.is_none());
+
+        assert_eq!(deletes.len(), 1);
+        assert_eq!(deletes[0].target, delete_target);
+
+        assert!(lock_keys.contains(&"ns:tag:new".to_string()));
+        assert!(lock_keys.contains(&"ns:tag:old".to_string()));
+        assert!(lock_keys.contains(&format!("blob:{create_target}")));
+        assert!(lock_keys.contains(&format!("blob:{delete_target}")));
+    }
+
+    #[tokio::test]
+    async fn prelock_dedupes_lock_keys() {
+        let shared_target = digest("1234");
+        let link_a = LinkKind::Tag("a".to_string());
+        let link_b = LinkKind::Tag("b".to_string());
+
+        let backend = MockBackend::new();
+
+        let ops = vec![
+            LinkOperation::Create {
+                link: link_a.clone(),
+                target: shared_target.clone(),
+                referrer: None,
+                media_type: None,
+                descriptor: None,
+            },
+            LinkOperation::Create {
+                link: link_b.clone(),
+                target: shared_target.clone(),
+                referrer: None,
+                media_type: None,
+                descriptor: None,
+            },
+        ];
+
+        let (creates, _deletes, lock_keys) = backend.prelock_resolve_operations("ns", &ops).await;
+
+        assert_eq!(creates.len(), 2);
+
+        let blob_key = format!("blob:{shared_target}");
+        let blob_key_count = lock_keys.iter().filter(|k| *k == &blob_key).count();
+        assert_eq!(
+            blob_key_count, 1,
+            "blob key must appear exactly once after dedup"
+        );
+
+        let is_sorted = lock_keys.windows(2).all(|w| w[0] <= w[1]);
+        assert!(is_sorted, "lock_keys must be sorted");
+    }
+
+    #[tokio::test]
+    async fn prelock_returns_empty_for_empty_input() {
+        let backend = MockBackend::new();
+
+        let (creates, deletes, lock_keys) = backend.prelock_resolve_operations("ns", &[]).await;
+
+        assert!(creates.is_empty());
+        assert!(deletes.is_empty());
+        assert!(lock_keys.is_empty());
+    }
+}
