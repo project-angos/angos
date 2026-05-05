@@ -20,7 +20,7 @@ mod transport;
 mod tests;
 
 use endpoint::WebhookEndpoint;
-use transport::send_with_retries;
+use transport::{DeliveryRequest, send_with_retries};
 
 use crate::{
     configuration::Error,
@@ -54,7 +54,7 @@ pub struct EventDispatcher {
     in_flight: Arc<Mutex<JoinSet<()>>>,
 }
 
-async fn deliver_async(
+struct DeliveryJob {
     client: Client,
     url: String,
     token: Option<String>,
@@ -62,35 +62,35 @@ async fn deliver_async(
     event_kind_header: String,
     max_retries: u32,
     name: String,
-) {
-    if let Err(e) = send_and_record(
-        &client,
-        &url,
-        token.as_deref(),
-        &body,
-        &event_kind_header,
-        max_retries,
-        &name,
-    )
-    .await
-    {
-        warn!("Async webhook '{name}' failed: {e}");
+}
+
+impl DeliveryJob {
+    fn as_request(&self) -> DeliveryRequest<'_> {
+        DeliveryRequest {
+            client: &self.client,
+            url: &self.url,
+            token: self.token.as_deref(),
+            body: &self.body,
+            event_kind_header: &self.event_kind_header,
+        }
+    }
+}
+
+async fn deliver_async(job: DeliveryJob) {
+    if let Err(e) = send_and_record(&job.as_request(), job.max_retries, &job.name).await {
+        warn!("Async webhook '{}' failed: {e}", job.name);
     }
 }
 
 async fn send_and_record(
-    client: &Client,
-    url: &str,
-    token: Option<&str>,
-    body: &[u8],
-    event_kind_header: &str,
+    req: &DeliveryRequest<'_>,
     max_retries: u32,
     webhook_name: &str,
 ) -> Result<(), String> {
-    let result = send_with_retries(client, url, token, body, event_kind_header, max_retries).await;
+    let result = send_with_retries(req, max_retries).await;
     let result_label = if result.is_ok() { "success" } else { "error" };
     DELIVERY_TOTAL
-        .with_label_values(&[webhook_name, event_kind_header, result_label])
+        .with_label_values(&[webhook_name, req.event_kind_header, result_label])
         .inc();
     result
 }
@@ -157,15 +157,15 @@ impl EventDispatcher {
             return false;
         }
         let mut in_flight_guard = self.in_flight.lock().await;
-        in_flight_guard.spawn(deliver_async(
-            endpoint.client.clone(),
-            endpoint.config.url.to_string(),
-            endpoint.config.token.as_ref().map(|t| t.expose().clone()),
-            body.to_vec(),
-            event_kind_header.to_string(),
-            endpoint.config.max_retries,
-            name.to_string(),
-        ));
+        in_flight_guard.spawn(deliver_async(DeliveryJob {
+            client: endpoint.client.clone(),
+            url: endpoint.config.url.to_string(),
+            token: endpoint.config.token.as_ref().map(|t| t.expose().clone()),
+            body: body.to_vec(),
+            event_kind_header: event_kind_header.to_string(),
+            max_retries: endpoint.config.max_retries,
+            name: name.to_string(),
+        }));
         true
     }
 
@@ -184,31 +184,27 @@ impl EventDispatcher {
                 Ok(spawned)
             }
             DeliveryPolicy::Required => {
-                send_and_record(
-                    &endpoint.client,
-                    endpoint.config.url.as_str(),
-                    endpoint.config.token.as_ref().map(|t| t.expose().as_str()),
+                let req = DeliveryRequest {
+                    client: &endpoint.client,
+                    url: endpoint.config.url.as_str(),
+                    token: endpoint.config.token.as_ref().map(|t| t.expose().as_str()),
                     body,
                     event_kind_header,
-                    endpoint.config.max_retries,
-                    name,
-                )
-                .await
-                .map_err(|e| Error::Initialization(format!("Webhook '{name}' failed: {e}")))?;
+                };
+                send_and_record(&req, endpoint.config.max_retries, name)
+                    .await
+                    .map_err(|e| Error::Initialization(format!("Webhook '{name}' failed: {e}")))?;
                 Ok(true)
             }
             DeliveryPolicy::Optional => {
-                if let Err(e) = send_and_record(
-                    &endpoint.client,
-                    endpoint.config.url.as_str(),
-                    endpoint.config.token.as_ref().map(|t| t.expose().as_str()),
+                let req = DeliveryRequest {
+                    client: &endpoint.client,
+                    url: endpoint.config.url.as_str(),
+                    token: endpoint.config.token.as_ref().map(|t| t.expose().as_str()),
                     body,
                     event_kind_header,
-                    endpoint.config.max_retries,
-                    name,
-                )
-                .await
-                {
+                };
+                if let Err(e) = send_and_record(&req, endpoint.config.max_retries, name).await {
                     warn!("Optional webhook '{name}' failed: {e}");
                 }
                 Ok(true)

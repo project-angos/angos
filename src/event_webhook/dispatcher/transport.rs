@@ -4,27 +4,30 @@ use reqwest::Client;
 
 use super::signature::compute_signature;
 
-pub(super) async fn send_request(
-    client: &Client,
-    url: &str,
-    token: Option<&str>,
-    body: &[u8],
-    event_kind_header: &str,
-) -> Result<(), String> {
-    let mut request = client
-        .post(url)
-        .header("content-type", "application/json")
-        .header("X-Registry-Event", event_kind_header);
+pub struct DeliveryRequest<'a> {
+    pub client: &'a Client,
+    pub url: &'a str,
+    pub token: Option<&'a str>,
+    pub body: &'a [u8],
+    pub event_kind_header: &'a str,
+}
 
-    if let Some(token) = token {
-        let signature = compute_signature(token, body);
+pub async fn send_request(req: &DeliveryRequest<'_>) -> Result<(), String> {
+    let mut request = req
+        .client
+        .post(req.url)
+        .header("content-type", "application/json")
+        .header("X-Registry-Event", req.event_kind_header);
+
+    if let Some(token) = req.token {
+        let signature = compute_signature(token, req.body);
         request = request
             .header("Authorization", format!("Bearer {token}"))
             .header("X-Registry-Signature-256", format!("sha256={signature}"));
     }
 
     let response = request
-        .body(body.to_vec())
+        .body(req.body.to_vec())
         .send()
         .await
         .map_err(|e| e.to_string())?;
@@ -36,14 +39,7 @@ pub(super) async fn send_request(
     Ok(())
 }
 
-pub(super) async fn send_with_retries(
-    client: &Client,
-    url: &str,
-    token: Option<&str>,
-    body: &[u8],
-    event_kind_header: &str,
-    max_retries: u32,
-) -> Result<(), String> {
+pub async fn send_with_retries(req: &DeliveryRequest<'_>, max_retries: u32) -> Result<(), String> {
     let mut last_err = None;
 
     for attempt in 0..=max_retries {
@@ -51,7 +47,7 @@ pub(super) async fn send_with_retries(
             tokio::time::sleep(backoff_for_attempt(attempt)).await;
         }
 
-        match send_request(client, url, token, body, event_kind_header).await {
+        match send_request(req).await {
             Ok(()) => return Ok(()),
             Err(e) => last_err = Some(e),
         }
