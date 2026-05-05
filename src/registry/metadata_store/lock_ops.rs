@@ -731,4 +731,425 @@ mod tests {
         assert!(deletes.is_empty());
         assert!(lock_keys.is_empty());
     }
+
+    // -------------------------------------------------------------------------
+    // Helpers for inspecting BlobIndexOperation without PartialEq
+    // -------------------------------------------------------------------------
+
+    fn is_insert(op: &BlobIndexOperation, expected_link: &LinkKind) -> bool {
+        matches!(op, BlobIndexOperation::Insert(l) if l == expected_link)
+    }
+
+    fn is_remove(op: &BlobIndexOperation, expected_link: &LinkKind) -> bool {
+        matches!(op, BlobIndexOperation::Remove(l) if l == expected_link)
+    }
+
+    // =========================================================================
+    // build_create_ops tests
+    // =========================================================================
+
+    #[test]
+    fn build_create_ops_empty_returns_all_empty() {
+        let mut cache: HashMap<LinkKind, LinkMetadata> = HashMap::new();
+        let (blob_ops, tracked, non_tracked) = build_create_ops(&[], &mut cache);
+
+        assert!(blob_ops.is_empty());
+        assert!(tracked.is_empty());
+        assert!(non_tracked.is_empty());
+        assert!(cache.is_empty(), "cache must remain untouched");
+    }
+
+    #[test]
+    fn build_create_ops_tracked_link_no_prior_target() {
+        // Layer is tracked; providing a referrer puts the op on the tracked path.
+        // old_target = None → an Insert must be emitted for the new target.
+        let link = LinkKind::Layer(digest("1100"));
+        let target = digest("1101");
+        let referrer = digest("1102");
+
+        let creates = [ResolvedCreate {
+            link: link.clone(),
+            target: target.clone(),
+            old_target: None,
+            referrer: Some(referrer.clone()),
+            media_type: None,
+            descriptor: None,
+        }];
+        let mut cache: HashMap<LinkKind, LinkMetadata> = HashMap::new();
+
+        let (blob_ops, tracked, non_tracked) = build_create_ops(&creates, &mut cache);
+
+        assert_eq!(tracked.len(), 1, "one tracked write expected");
+        assert!(non_tracked.is_empty());
+
+        let (written_link, written_meta) = &tracked[0];
+        assert_eq!(written_link, &link);
+        assert!(
+            written_meta.referenced_by.contains(&referrer),
+            "referrer must appear in referenced_by"
+        );
+
+        let ops = blob_ops.get(&target).expect("blob ops for target expected");
+        assert_eq!(ops.len(), 1);
+        assert!(is_insert(&ops[0], &link));
+    }
+
+    #[test]
+    fn build_create_ops_tracked_link_same_old_target() {
+        // When old_target == target, no blob Insert should be emitted.
+        let link = LinkKind::Layer(digest("1200"));
+        let target = digest("1201");
+        let referrer = digest("1202");
+
+        let creates = [ResolvedCreate {
+            link: link.clone(),
+            target: target.clone(),
+            old_target: Some(target.clone()),
+            referrer: Some(referrer.clone()),
+            media_type: None,
+            descriptor: None,
+        }];
+        let mut cache: HashMap<LinkKind, LinkMetadata> = HashMap::new();
+
+        let (blob_ops, tracked, non_tracked) = build_create_ops(&creates, &mut cache);
+
+        assert_eq!(tracked.len(), 1);
+        assert!(non_tracked.is_empty());
+        assert!(
+            blob_ops.is_empty(),
+            "no blob ops when old_target equals new target on tracked path"
+        );
+
+        let (_, written_meta) = &tracked[0];
+        assert!(written_meta.referenced_by.contains(&referrer));
+    }
+
+    #[test]
+    fn build_create_ops_non_tracked_new_target() {
+        // Tag is non-tracked; old_target = None → Insert emitted.
+        let link = LinkKind::Tag("v3".to_string());
+        let target = digest("1300");
+
+        let creates = [ResolvedCreate {
+            link: link.clone(),
+            target: target.clone(),
+            old_target: None,
+            referrer: None,
+            media_type: None,
+            descriptor: None,
+        }];
+        let mut cache: HashMap<LinkKind, LinkMetadata> = HashMap::new();
+
+        let (blob_ops, tracked, non_tracked) = build_create_ops(&creates, &mut cache);
+
+        assert!(tracked.is_empty());
+        assert_eq!(non_tracked.len(), 1);
+        assert_eq!(non_tracked[0].0, link);
+
+        let ops = blob_ops.get(&target).expect("blob ops for target expected");
+        assert_eq!(ops.len(), 1);
+        assert!(is_insert(&ops[0], &link));
+    }
+
+    #[test]
+    fn build_create_ops_non_tracked_replaces_prior_target() {
+        // old_target differs from new target → Insert for new + Remove for old.
+        let link = LinkKind::Tag("v4".to_string());
+        let old_target = digest("1400");
+        let new_target = digest("1401");
+
+        let creates = [ResolvedCreate {
+            link: link.clone(),
+            target: new_target.clone(),
+            old_target: Some(old_target.clone()),
+            referrer: None,
+            media_type: None,
+            descriptor: None,
+        }];
+        let mut cache: HashMap<LinkKind, LinkMetadata> = HashMap::new();
+
+        let (blob_ops, tracked, non_tracked) = build_create_ops(&creates, &mut cache);
+
+        assert!(tracked.is_empty());
+        assert_eq!(non_tracked.len(), 1);
+
+        let new_ops = blob_ops
+            .get(&new_target)
+            .expect("blob ops for new target expected");
+        assert_eq!(new_ops.len(), 1);
+        assert!(is_insert(&new_ops[0], &link));
+
+        let old_ops = blob_ops
+            .get(&old_target)
+            .expect("blob ops for old target expected");
+        assert_eq!(old_ops.len(), 1);
+        assert!(is_remove(&old_ops[0], &link));
+    }
+
+    #[test]
+    fn build_create_ops_non_tracked_same_old_target() {
+        // Re-pushing a non-tracked link to the same digest: no blob ops, but
+        // the link metadata is still written (idempotent metadata refresh).
+        let link = LinkKind::Tag("v5".to_string());
+        let target = digest("1500");
+
+        let creates = [ResolvedCreate {
+            link: link.clone(),
+            target: target.clone(),
+            old_target: Some(target.clone()),
+            referrer: None,
+            media_type: None,
+            descriptor: None,
+        }];
+        let mut cache: HashMap<LinkKind, LinkMetadata> = HashMap::new();
+
+        let (blob_ops, tracked, non_tracked) = build_create_ops(&creates, &mut cache);
+
+        assert!(tracked.is_empty());
+        assert_eq!(non_tracked.len(), 1, "link metadata is still written");
+        assert!(
+            blob_ops.is_empty(),
+            "no blob ops when old_target equals new target on non-tracked path"
+        );
+    }
+
+    #[test]
+    fn build_create_ops_uses_cached_metadata_when_present() {
+        // Pre-populate the cache for a tracked link. The function should consume
+        // the cache entry and add the new referrer into it.
+        let link = LinkKind::Layer(digest("1600"));
+        let target = digest("1601");
+        let existing_referrer = digest("1602");
+        let new_referrer = digest("1603");
+
+        let mut cached_meta = LinkMetadata::from_digest(target.clone());
+        cached_meta.add_referrer(existing_referrer.clone());
+        let mut cache: HashMap<LinkKind, LinkMetadata> = HashMap::new();
+        cache.insert(link.clone(), cached_meta);
+
+        let creates = [ResolvedCreate {
+            link: link.clone(),
+            target: target.clone(),
+            old_target: Some(target.clone()),
+            referrer: Some(new_referrer.clone()),
+            media_type: None,
+            descriptor: None,
+        }];
+
+        let (blob_ops, tracked, non_tracked) = build_create_ops(&creates, &mut cache);
+
+        assert!(non_tracked.is_empty());
+        assert_eq!(tracked.len(), 1);
+
+        let (_, written_meta) = &tracked[0];
+        assert!(
+            written_meta.referenced_by.contains(&existing_referrer),
+            "existing referrer must be preserved from cache"
+        );
+        assert!(
+            written_meta.referenced_by.contains(&new_referrer),
+            "new referrer must be added"
+        );
+
+        assert!(
+            !cache.contains_key(&link),
+            "cache entry must be consumed by build_create_ops"
+        );
+
+        assert!(blob_ops.is_empty());
+    }
+
+    // =========================================================================
+    // build_delete_ops tests
+    // =========================================================================
+
+    #[test]
+    fn build_delete_ops_empty_preserves_input_blob_ops() {
+        // Empty deletes slice must leave pending_blob_ops unchanged.
+        let target = digest("1700");
+        let link = LinkKind::Tag("pre".to_string());
+        let mut input_ops: HashMap<Digest, Vec<BlobIndexOperation>> = HashMap::new();
+        input_ops
+            .entry(target.clone())
+            .or_default()
+            .push(BlobIndexOperation::Insert(link.clone()));
+
+        let mut cache: HashMap<LinkKind, LinkMetadata> = HashMap::new();
+
+        let (blob_ops, tracked_writes, tracked_removes, non_tracked) =
+            build_delete_ops(&[], &mut cache, input_ops);
+
+        assert_eq!(blob_ops.len(), 1, "pre-existing blob op must be preserved");
+        let ops = blob_ops.get(&target).unwrap();
+        assert_eq!(ops.len(), 1);
+        assert!(is_insert(&ops[0], &link));
+
+        assert!(tracked_writes.is_empty());
+        assert!(tracked_removes.is_empty());
+        assert!(non_tracked.is_empty());
+    }
+
+    #[test]
+    fn build_delete_ops_tracked_with_remaining_referrers_writes() {
+        // Two referrers in cache; removing one should produce a write (not a remove).
+        let link = LinkKind::Layer(digest("1800"));
+        let target = digest("1801");
+        let referrer_a = digest("1802");
+        let referrer_b = digest("1803");
+
+        let mut meta = LinkMetadata::from_digest(target.clone());
+        meta.add_referrer(referrer_a.clone());
+        meta.add_referrer(referrer_b.clone());
+
+        let mut cache: HashMap<LinkKind, LinkMetadata> = HashMap::new();
+        cache.insert(link.clone(), meta);
+
+        let deletes = [ResolvedDelete {
+            link: link.clone(),
+            target: target.clone(),
+            referrer: Some(referrer_a.clone()),
+        }];
+
+        let (blob_ops, tracked_writes, tracked_removes, non_tracked) =
+            build_delete_ops(&deletes, &mut cache, HashMap::new());
+
+        assert_eq!(tracked_writes.len(), 1, "must write updated metadata");
+        assert!(tracked_removes.is_empty(), "link must not be removed yet");
+        assert!(non_tracked.is_empty());
+        assert!(blob_ops.is_empty(), "no blob Remove when referrer remains");
+
+        let (written_link, written_meta) = &tracked_writes[0];
+        assert_eq!(written_link, &link);
+        assert!(
+            !written_meta.referenced_by.contains(&referrer_a),
+            "deleted referrer must be absent"
+        );
+        assert!(
+            written_meta.referenced_by.contains(&referrer_b),
+            "surviving referrer must remain"
+        );
+    }
+
+    #[test]
+    fn build_delete_ops_tracked_last_referrer_removes() {
+        // One referrer in cache; removing it empties referenced_by → link removed.
+        let link = LinkKind::Layer(digest("1900"));
+        let target = digest("1901");
+        let referrer = digest("1902");
+
+        let mut meta = LinkMetadata::from_digest(target.clone());
+        meta.add_referrer(referrer.clone());
+
+        let mut cache: HashMap<LinkKind, LinkMetadata> = HashMap::new();
+        cache.insert(link.clone(), meta);
+
+        let deletes = [ResolvedDelete {
+            link: link.clone(),
+            target: target.clone(),
+            referrer: Some(referrer.clone()),
+        }];
+
+        let (blob_ops, tracked_writes, tracked_removes, non_tracked) =
+            build_delete_ops(&deletes, &mut cache, HashMap::new());
+
+        assert!(
+            tracked_writes.is_empty(),
+            "no partial write when last referrer removed"
+        );
+        assert_eq!(tracked_removes.len(), 1);
+        assert_eq!(tracked_removes[0], link);
+        assert!(non_tracked.is_empty());
+
+        let ops = blob_ops.get(&target).expect("blob Remove expected");
+        assert_eq!(ops.len(), 1);
+        assert!(is_remove(&ops[0], &link));
+    }
+
+    #[test]
+    fn build_delete_ops_tracked_no_metadata_in_cache_skipped() {
+        // Delete for a tracked link not present in the cache is silently dropped.
+        let link = LinkKind::Layer(digest("2000"));
+        let target = digest("2001");
+
+        let mut cache: HashMap<LinkKind, LinkMetadata> = HashMap::new();
+
+        let deletes = [ResolvedDelete {
+            link: link.clone(),
+            target: target.clone(),
+            referrer: Some(digest("2002")),
+        }];
+
+        let (blob_ops, tracked_writes, tracked_removes, non_tracked) =
+            build_delete_ops(&deletes, &mut cache, HashMap::new());
+
+        assert!(blob_ops.is_empty());
+        assert!(tracked_writes.is_empty());
+        assert!(tracked_removes.is_empty());
+        assert!(non_tracked.is_empty());
+    }
+
+    #[test]
+    fn build_delete_ops_non_tracked_emits_remove() {
+        // Non-tracked link (Tag with no referrer) must land in non_tracked_delete_links
+        // and emit a blob Remove.
+        let link = LinkKind::Tag("v11".to_string());
+        let target = digest("2100");
+
+        let mut cache: HashMap<LinkKind, LinkMetadata> = HashMap::new();
+
+        let deletes = [ResolvedDelete {
+            link: link.clone(),
+            target: target.clone(),
+            referrer: None,
+        }];
+
+        let (blob_ops, tracked_writes, tracked_removes, non_tracked) =
+            build_delete_ops(&deletes, &mut cache, HashMap::new());
+
+        assert!(tracked_writes.is_empty());
+        assert!(tracked_removes.is_empty());
+        assert_eq!(non_tracked.len(), 1);
+        assert_eq!(non_tracked[0], link);
+
+        let ops = blob_ops.get(&target).expect("blob Remove expected");
+        assert_eq!(ops.len(), 1);
+        assert!(is_remove(&ops[0], &link));
+    }
+
+    #[test]
+    fn build_delete_ops_combines_with_input_blob_ops() {
+        // blob ops from a prior build_create_ops call must be extended, not replaced.
+        let pre_link = LinkKind::Tag("pre12".to_string());
+        let pre_target = digest("2200");
+        let del_link = LinkKind::Tag("del12".to_string());
+        let del_target = digest("2201");
+
+        let mut prior_ops: HashMap<Digest, Vec<BlobIndexOperation>> = HashMap::new();
+        prior_ops
+            .entry(pre_target.clone())
+            .or_default()
+            .push(BlobIndexOperation::Insert(pre_link.clone()));
+
+        let mut cache: HashMap<LinkKind, LinkMetadata> = HashMap::new();
+
+        let deletes = [ResolvedDelete {
+            link: del_link.clone(),
+            target: del_target.clone(),
+            referrer: None,
+        }];
+
+        let (blob_ops, _, _, _) = build_delete_ops(&deletes, &mut cache, prior_ops);
+
+        let pre_ops = blob_ops
+            .get(&pre_target)
+            .expect("pre-existing blob op must survive");
+        assert_eq!(pre_ops.len(), 1);
+        assert!(is_insert(&pre_ops[0], &pre_link));
+
+        let del_ops = blob_ops
+            .get(&del_target)
+            .expect("new blob Remove must be added");
+        assert_eq!(del_ops.len(), 1);
+        assert!(is_remove(&del_ops[0], &del_link));
+    }
 }
