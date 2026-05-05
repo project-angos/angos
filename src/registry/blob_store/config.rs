@@ -67,7 +67,7 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
-    use crate::registry::data_store;
+    use crate::{registry::data_store, secret::Secret};
 
     #[tokio::test]
     async fn fs_backend_provides_multipart_cleanup() {
@@ -92,8 +92,8 @@ mod tests {
             endpoint: "http://127.0.0.1:9000".to_string(),
             region: "us-east-1".to_string(),
             bucket: "test-bucket".to_string(),
-            access_key_id: "minioadmin".to_string(),
-            secret_key: "minioadmin".to_string(),
+            access_key_id: Secret::new("minioadmin".to_string()),
+            secret_key: Secret::new("minioadmin".to_string()),
             ..Default::default()
         });
 

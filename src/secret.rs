@@ -14,13 +14,18 @@ use zeroize::{Zeroize, ZeroizeOnDrop};
 pub struct Secret<T: Zeroize>(T);
 
 impl<T: Zeroize> Secret<T> {
-    #[cfg(test)]
     pub fn new(value: T) -> Self {
         Self(value)
     }
 
     pub fn expose(&self) -> &T {
         &self.0
+    }
+}
+
+impl<T: Zeroize + PartialEq> PartialEq for Secret<T> {
+    fn eq(&self, other: &Self) -> bool {
+        self.0 == other.0
     }
 }
 

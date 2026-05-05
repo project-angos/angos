@@ -11,9 +11,16 @@ use crate::{
     },
 };
 
-#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
 #[allow(clippy::large_enum_variant)]
 pub enum MetadataStoreConfig {
+    /// Inherit blob-store credentials and root path.
+    ///
+    /// Resolved via [`Configuration::resolve_metadata_config`] before reaching
+    /// [`MetadataStoreConfig::to_backend`] or [`MetadataStoreConfig::probe`].
+    /// Reaching either method with this variant is a programming error.
+    #[default]
+    Inherit,
     #[serde(rename = "fs")]
     FS(metadata_store::fs::BackendConfig),
     #[serde(rename = "s3")]
@@ -47,6 +54,10 @@ impl MetadataStoreConfig {
 
     pub async fn probe(&self) -> Result<Option<ConditionalCapabilities>, Error> {
         match self {
+            MetadataStoreConfig::Inherit => unreachable!(
+                "MetadataStoreConfig::Inherit must be resolved via \
+                 Configuration::resolve_metadata_config before probe"
+            ),
             MetadataStoreConfig::S3(config) => match &config.lock_strategy {
                 LockStrategy::S3(lock_config) => {
                     let store =
@@ -80,6 +91,10 @@ impl MetadataStoreConfig {
         Error,
     > {
         match self {
+            MetadataStoreConfig::Inherit => unreachable!(
+                "MetadataStoreConfig::Inherit must be resolved via \
+                 Configuration::resolve_metadata_config before to_backend"
+            ),
             MetadataStoreConfig::FS(config) => {
                 Ok((Arc::new(metadata_store::fs::Backend::new(config)?), None))
             }
@@ -114,11 +129,12 @@ impl MetadataStoreConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::secret::Secret;
 
     fn s3_config_with_lock_strategy(lock_strategy: LockStrategy) -> MetadataStoreConfig {
         MetadataStoreConfig::S3(metadata_store::s3::BackendConfig {
-            access_key_id: "root".to_string(),
-            secret_key: "roottoor".to_string(),
+            access_key_id: Secret::new("root".to_string()),
+            secret_key: Secret::new("roottoor".to_string()),
             endpoint: "http://127.0.0.1:9000".to_string(),
             bucket: "registry".to_string(),
             region: "us-east-1".to_string(),
@@ -187,7 +203,9 @@ mod tests {
                 assert_eq!(c.root_dir, "/var/lib/registry");
                 assert!(c.sync_to_disk);
             }
-            MetadataStoreConfig::S3(_) => panic!("expected FS metadata config"),
+            MetadataStoreConfig::Inherit | MetadataStoreConfig::S3(_) => {
+                panic!("expected FS metadata config")
+            }
         }
     }
 
@@ -197,8 +215,8 @@ mod tests {
             bucket: "test-bucket".to_string(),
             region: "us-east-1".to_string(),
             endpoint: "http://localhost:9000".to_string(),
-            access_key_id: "key".to_string(),
-            secret_key: "secret".to_string(),
+            access_key_id: Secret::new("key".to_string()),
+            secret_key: Secret::new("secret".to_string()),
             key_prefix: "foo".to_string(),
             ..Default::default()
         });
@@ -207,11 +225,13 @@ mod tests {
                 assert_eq!(c.bucket, "test-bucket");
                 assert_eq!(c.region, "us-east-1");
                 assert_eq!(c.endpoint, "http://localhost:9000");
-                assert_eq!(c.access_key_id, "key");
-                assert_eq!(c.secret_key, "secret");
+                assert_eq!(c.access_key_id.expose(), "key");
+                assert_eq!(c.secret_key.expose(), "secret");
                 assert_eq!(c.key_prefix, "foo");
             }
-            MetadataStoreConfig::FS(_) => panic!("expected S3 metadata config"),
+            MetadataStoreConfig::Inherit | MetadataStoreConfig::FS(_) => {
+                panic!("expected S3 metadata config")
+            }
         }
     }
 }

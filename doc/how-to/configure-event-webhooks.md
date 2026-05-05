@@ -226,7 +226,7 @@ Formula: `100ms * 2^(attempt - 1)`
 url = "https://hooks.example.com/events"
 policy = "required"
 events = ["manifest.push"]
-max_retries = 3       # Up to 3 retries after the initial attempt
+max_retries = 3       # Up to 3 retries after the initial attempt (maximum supported value: 16; higher values are rejected at configuration load time to prevent retry storms and arithmetic overflow in the exponential-backoff calculation)
 timeout_ms = 5000     # Per-request timeout
 ```
 

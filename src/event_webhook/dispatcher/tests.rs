@@ -17,6 +17,7 @@ use crate::{
         config::{DeliveryPolicy, EventWebhookConfig},
         event::{Event, EventKind},
     },
+    secret::Secret,
 };
 
 /// Wraps each `EventWebhookConfig` in an `Arc` so the map matches the
@@ -147,13 +148,13 @@ fn matches_event_both_event_kind_and_repository_must_match() {
 fn create_webhook_config_for_url(
     url: &str,
     events: Vec<EventKind>,
-    token: Option<String>,
+    token: Option<&str>,
 ) -> EventWebhookConfig {
     EventWebhookConfig {
         name: String::new(),
         url: Url::parse(url).unwrap(),
         policy: DeliveryPolicy::Required,
-        token,
+        token: token.map(|t| Secret::new(t.to_string())),
         timeout_ms: 5000,
         max_retries: 0,
         events,
@@ -177,7 +178,7 @@ fn event_dispatcher_new_constructs_from_configs() {
         create_webhook_config_for_url(
             "https://example.com/hook2",
             vec![EventKind::TagCreate],
-            Some("secret".to_string()),
+            Some("secret"),
         ),
     );
 
@@ -258,7 +259,7 @@ async fn dispatch_sends_authorization_bearer_header() {
         create_webhook_config_for_url(
             &server.uri(),
             vec![EventKind::ManifestPush],
-            Some("my-token".to_string()),
+            Some("my-token"),
         ),
     );
 
@@ -287,7 +288,7 @@ async fn dispatch_sends_hmac_signature_header() {
         create_webhook_config_for_url(
             &server.uri(),
             vec![EventKind::ManifestPush],
-            Some("hmac-secret".to_string()),
+            Some("hmac-secret"),
         ),
     );
 

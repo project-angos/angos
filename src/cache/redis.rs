@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use redis::AsyncCommands;
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 use tokio::sync::OnceCell;
 use tracing::info;
 
@@ -8,8 +8,21 @@ use crate::cache::{Cache, Error};
 
 #[derive(Clone, Debug, Deserialize, PartialEq)]
 pub struct BackendConfig {
+    #[serde(deserialize_with = "validate_redis_url")]
     pub url: String,
     pub key_prefix: String,
+}
+
+/// Rejects URLs that the `redis` client would refuse at `Client::open` time.
+/// Catching the error here surfaces it at config-load instead of at first connect.
+fn validate_redis_url<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let s = String::deserialize(deserializer)?;
+    redis::Client::open(s.as_str())
+        .map_err(|e| serde::de::Error::custom(format!("invalid Redis URL: {e}")))?;
+    Ok(s)
 }
 
 pub struct Backend {
@@ -152,5 +165,50 @@ mod tests {
 
         cache.delete_value(&key).await.unwrap();
         assert_eq!(cache.retrieve_value(&key).await, Ok(None));
+    }
+
+    /// A `redis://` URL with a valid host and port deserializes successfully.
+    #[test]
+    fn redis_url_accepts_valid_url() {
+        let toml = r#"
+            url = "redis://localhost:6379"
+            key_prefix = "test:"
+        "#;
+        let result = toml::from_str::<BackendConfig>(toml);
+        assert!(result.is_ok(), "expected Ok, got: {result:?}");
+        assert_eq!(result.unwrap().url, "redis://localhost:6379");
+    }
+
+    /// A `redis://` URL that selects a non-default database deserializes
+    /// successfully and round-trips the input string unchanged.
+    #[test]
+    fn redis_url_accepts_url_with_database_path() {
+        let toml = r#"
+            url = "redis://localhost:6380/3"
+            key_prefix = "test:"
+        "#;
+        let result = toml::from_str::<BackendConfig>(toml);
+        assert!(result.is_ok(), "expected Ok, got: {result:?}");
+        assert_eq!(result.unwrap().url, "redis://localhost:6380/3");
+    }
+
+    /// A URL that the redis client rejects must produce a deserialization error
+    /// whose message contains `"invalid Redis URL"`.
+    #[test]
+    fn redis_url_rejects_invalid_url() {
+        let toml = r#"
+            url = "not a url"
+            key_prefix = "test:"
+        "#;
+        let result = toml::from_str::<BackendConfig>(toml);
+        assert!(
+            result.is_err(),
+            "expected Err for invalid URL, got: {result:?}"
+        );
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("invalid Redis URL"),
+            "error message does not contain 'invalid Redis URL': {err_msg}"
+        );
     }
 }

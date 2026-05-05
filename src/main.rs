@@ -35,7 +35,9 @@ mod secret;
 #[cfg(test)]
 pub mod test_fixtures;
 
-fn set_tracing(config: Option<ObservabilityConfig>) -> Result<(), configuration::Error> {
+fn set_tracing(
+    config: Option<ObservabilityConfig>,
+) -> Result<Option<SdkTracerProvider>, configuration::Error> {
     if let Some(ObservabilityConfig {
         tracing: Some(tracing_config),
     }) = config
@@ -65,7 +67,9 @@ fn set_tracing(config: Option<ObservabilityConfig>) -> Result<(), configuration:
             .build();
 
         let tracer = tracer_provider.tracer("angos");
-        global::set_tracer_provider(tracer_provider);
+        // Clone before registering globally so the caller retains a handle to shut
+        // down the batch exporter and flush in-flight spans before the process exits.
+        global::set_tracer_provider(tracer_provider.clone());
         let telemetry = tracing_opentelemetry::layer().with_tracer(tracer);
 
         let _ = tracing_subscriber::registry()
@@ -73,13 +77,16 @@ fn set_tracing(config: Option<ObservabilityConfig>) -> Result<(), configuration:
             .with(tracing_subscriber::fmt::layer().json())
             .with(telemetry)
             .try_init();
+
+        Ok(Some(tracer_provider))
     } else {
         let _ = tracing_subscriber::registry()
             .with(EnvFilter::from_default_env())
             .with(tracing_subscriber::fmt::layer().json())
             .try_init();
+
+        Ok(None)
     }
-    Ok(())
 }
 
 #[derive(FromArgs, PartialEq, Debug)]
@@ -133,32 +140,48 @@ fn main() {
 }
 
 async fn run_command(cli_args: GlobalArguments, config: Configuration) {
-    if let Err(err) = set_tracing(config.observability.clone()) {
-        eprintln!("Failed to set up tracing: {err}");
-        exit(1);
-    }
+    let tracer_provider = match set_tracing(config.observability.clone()) {
+        Ok(p) => p,
+        Err(err) => {
+            eprintln!("Failed to set up tracing: {err}");
+            exit(1);
+        }
+    };
 
     config.log_deprecations();
 
-    match cli_args.subcommand {
-        SubCommand::Argon(_) => {
-            if let Err(err) = argon::Command::run() {
+    let exit_code = match cli_args.subcommand {
+        SubCommand::Argon(_) => match argon::Command::run() {
+            Ok(()) => 0,
+            Err(err) => {
                 error!("Argon error: {}", err);
-                exit(1);
+                1
             }
-        }
-        SubCommand::Scrub(scrub_options) => {
-            if let Err(err) = run_scrub(scrub_options, config).await {
+        },
+        SubCommand::Scrub(scrub_options) => match run_scrub(scrub_options, config).await {
+            Ok(()) => 0,
+            Err(err) => {
                 error!("Scrub error: {err}");
-                exit(1);
+                1
             }
-        }
-        SubCommand::Serve(_) => {
-            if let Err(err) = run_server(cli_args, config).await {
+        },
+        SubCommand::Serve(_) => match run_server(cli_args, config).await {
+            Ok(()) => 0,
+            Err(err) => {
                 error!("Server error: {err}");
-                exit(1);
+                1
             }
-        }
+        },
+    };
+
+    if let Some(provider) = tracer_provider
+        && let Err(err) = provider.shutdown()
+    {
+        eprintln!("Failed to flush tracer provider: {err}");
+    }
+
+    if exit_code != 0 {
+        exit(exit_code);
     }
 }
 
@@ -175,18 +198,15 @@ async fn run_server(options: GlobalArguments, config: Configuration) -> Result<(
         exit(1);
     };
 
-    let shutdown_server = Arc::clone(&server);
-    tokio::spawn(async move {
-        shutdown_signal().await;
-        info!("Shutdown signal received, draining in-flight webhook deliveries");
-        shutdown_server
-            .shutdown_with_timeout(Duration::from_secs(30))
-            .await;
-        info!("Graceful shutdown complete");
-        exit(0);
-    });
-
-    server.run().await
+    tokio::select! {
+        result = server.run() => result,
+        () = shutdown_signal() => {
+            info!("Shutdown signal received, draining in-flight webhook deliveries");
+            server.shutdown_with_timeout(Duration::from_secs(30)).await;
+            info!("Graceful shutdown complete");
+            Ok(())
+        }
+    }
 }
 
 async fn shutdown_signal() {
@@ -205,5 +225,38 @@ async fn shutdown_signal() {
     #[cfg(not(unix))]
     {
         ctrl_c.await.expect("failed to listen for Ctrl+C");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use opentelemetry::trace::{Span as _, Tracer as _, TracerProvider as _};
+    use opentelemetry_sdk::trace::{
+        InMemorySpanExporterBuilder, SdkTracerProvider, SimpleSpanProcessor,
+    };
+
+    /// Verifies that spans emitted before `provider.shutdown()` are flushed to
+    /// the exporter.  With `SimpleSpanProcessor` each span is exported
+    /// synchronously when it ends, so `force_flush` followed by `shutdown`
+    /// must leave the span visible in the exporter's buffer.
+    #[test]
+    fn tracer_provider_shutdown_flushes_spans() {
+        let exporter = InMemorySpanExporterBuilder::new().build();
+        let provider = SdkTracerProvider::builder()
+            .with_span_processor(SimpleSpanProcessor::new(exporter.clone()))
+            .build();
+
+        let tracer = provider.tracer("angos-test");
+        tracer.start("pre-shutdown-span").end();
+
+        provider.force_flush().expect("force_flush must succeed");
+
+        let spans = exporter
+            .get_finished_spans()
+            .expect("must be able to read finished spans");
+        assert_eq!(spans.len(), 1, "one span must be captured before shutdown");
+        assert_eq!(spans[0].name, "pre-shutdown-span");
+
+        provider.shutdown().expect("shutdown must succeed");
     }
 }

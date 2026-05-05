@@ -66,7 +66,7 @@ async fn build_metadata_store(
     {
         let guard = cached_capabilities
             .lock()
-            .expect("capabilities mutex poisoned");
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if guard.is_some() {
             backend_config.capabilities.clone_from(&guard);
         }
@@ -76,7 +76,7 @@ async fn build_metadata_store(
         Ok((store, caps)) => {
             let mut guard = cached_capabilities
                 .lock()
-                .expect("capabilities mutex poisoned");
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             *guard = caps;
             Ok(store)
         }

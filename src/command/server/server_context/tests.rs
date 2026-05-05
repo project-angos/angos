@@ -21,6 +21,7 @@ use crate::{
     metrics_provider,
     oci::{Namespace, Reference},
     registry::{Registry, RegistryConfig, Repository},
+    secret::Secret,
 };
 
 fn create_test_config() -> Configuration {
@@ -940,8 +941,8 @@ async fn test_shutdown_flushes_pending_access_times() {
     let namespace = format!("{unique_prefix}/myimage");
 
     let s3_config = BackendConfig {
-        access_key_id: "root".to_string(),
-        secret_key: "roottoor".to_string(),
+        access_key_id: Secret::new("root".to_string()),
+        secret_key: Secret::new("roottoor".to_string()),
         endpoint: "http://127.0.0.1:9000".to_string(),
         bucket: "registry".to_string(),
         region: "region".to_string(),
@@ -1038,68 +1039,6 @@ async fn test_shutdown_flushes_pending_access_times() {
         after.accessed_at.is_some(),
         "shutdown_with_timeout() must flush pending access times to S3"
     );
-}
-
-#[tokio::test]
-async fn test_server_context_new_invalid_cache_config() {
-    use crate::registry::{Registry, RegistryConfig};
-
-    let toml = r#"
-        [blob_store.fs]
-        root_dir = "/tmp/test"
-
-        [metadata_store.fs]
-        root_dir = "/tmp/test"
-
-        [cache.redis]
-        url = "redis://invalid:99999"
-        key_prefix = "test:"
-
-        [server]
-        bind_address = "0.0.0.0"
-        port = 8000
-
-        [global]
-        update_pull_time = false
-        max_concurrent_cache_jobs = 10
-    "#;
-
-    let config: Configuration = toml::from_str(toml).unwrap();
-
-    let blob_handles = config.blob_store.to_backend(None).unwrap();
-    let (metadata_store, _) = config
-        .resolve_metadata_config()
-        .to_backend(None)
-        .await
-        .unwrap();
-    let repositories = Arc::new(HashMap::new());
-
-    let registry_config = RegistryConfig::new()
-        .update_pull_time(config.global.update_pull_time)
-        .enable_blob_redirect(config.global.resolved_enable_blob_redirect())
-        .enable_manifest_redirect(config.global.resolved_enable_manifest_redirect())
-        .concurrent_cache_jobs(config.global.max_concurrent_cache_jobs)
-        .global_immutable_tags(config.global.immutable_tags)
-        .global_immutable_tags_exclusions(config.global.immutable_tags_exclusions.clone());
-
-    let registry = Registry::new(
-        blob_handles.blob_store,
-        blob_handles.upload_store,
-        blob_handles.presigned_store,
-        metadata_store,
-        repositories,
-        registry_config,
-    )
-    .unwrap();
-
-    let context = ServerContext::new(&config, registry);
-
-    assert!(context.is_err());
-    if let Err(crate::command::server::error::Error::Initialization(msg)) = context {
-        assert_eq!(msg, "Failed to initialize cache backend");
-    } else {
-        panic!("Expected Initialization error");
-    }
 }
 
 #[test]

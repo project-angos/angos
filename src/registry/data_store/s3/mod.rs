@@ -19,13 +19,14 @@ use serde::Deserialize;
 use crate::{
     circuit_breaker::CircuitBreaker,
     registry::{blob_store::s3::UploadedPart, data_store::Error},
+    secret::Secret,
 };
 
 #[derive(Clone, Debug, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct BackendConfig {
-    pub access_key_id: String,
-    pub secret_key: String,
+    pub access_key_id: Secret<String>,
+    pub secret_key: Secret<String>,
     pub endpoint: String,
     pub bucket: String,
     pub region: String,
@@ -43,8 +44,8 @@ pub struct BackendConfig {
 impl Default for BackendConfig {
     fn default() -> Self {
         Self {
-            access_key_id: String::new(),
-            secret_key: String::new(),
+            access_key_id: Secret::new(String::new()),
+            secret_key: Secret::new(String::new()),
             endpoint: String::new(),
             bucket: String::new(),
             region: String::new(),
@@ -102,8 +103,8 @@ impl Backend {
         }
 
         let credentials = Credentials::new(
-            &config.access_key_id,
-            &config.secret_key,
+            config.access_key_id.expose(),
+            config.secret_key.expose(),
             None,
             None,
             "custom",
@@ -937,8 +938,8 @@ mod tests {
 
     fn test_config(overrides: impl FnOnce(&mut BackendConfig)) -> BackendConfig {
         let mut config = BackendConfig {
-            access_key_id: "key".to_string(),
-            secret_key: "secret".to_string(),
+            access_key_id: Secret::new("key".to_string()),
+            secret_key: Secret::new("secret".to_string()),
             endpoint: "http://localhost:9000".to_string(),
             bucket: "test".to_string(),
             region: "us-east-1".to_string(),
@@ -1001,8 +1002,8 @@ mod tests {
     #[tokio::test]
     async fn test_upload_part_returns_etag() {
         let config = test_config(|c| {
-            c.access_key_id = "minioadmin".to_string();
-            c.secret_key = "minioadmin".to_string();
+            c.access_key_id = Secret::new("minioadmin".to_string());
+            c.secret_key = Secret::new("minioadmin".to_string());
             c.bucket = "test-bucket".to_string();
         });
 
@@ -1025,8 +1026,8 @@ mod tests {
     #[tokio::test]
     async fn test_abort_multipart_upload() {
         let config = test_config(|c| {
-            c.access_key_id = "minioadmin".to_string();
-            c.secret_key = "minioadmin".to_string();
+            c.access_key_id = Secret::new("minioadmin".to_string());
+            c.secret_key = Secret::new("minioadmin".to_string());
             c.bucket = "test-bucket".to_string();
         });
 

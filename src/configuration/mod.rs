@@ -41,12 +41,16 @@ struct RawConfiguration {
     global: RawGlobalConfig,
     #[serde(default)]
     ui: UiConfig,
+    /// `cache_store` is a legacy alias kept for backwards-compatibility with
+    /// pre-1.0 configs. Prefer `cache` in new deployments.
     #[serde(default, alias = "cache_store")]
     cache: cache::Config,
+    /// `storage` is a legacy alias kept for backwards-compatibility with
+    /// pre-1.0 configs. Prefer `blob_store` in new deployments.
     #[serde(default, alias = "storage")]
     blob_store: blob_store::BlobStorageConfig,
     #[serde(default)]
-    metadata_store: Option<metadata_store::MetadataStoreConfig>,
+    metadata_store: metadata_store::MetadataStoreConfig,
     #[serde(default)]
     auth: RawAuthConfig,
     #[serde(default)]
@@ -75,7 +79,7 @@ pub struct Configuration {
     pub ui: UiConfig,
     pub cache: cache::Config,
     pub blob_store: blob_store::BlobStorageConfig,
-    pub metadata_store: Option<metadata_store::MetadataStoreConfig>,
+    pub metadata_store: metadata_store::MetadataStoreConfig,
     pub auth: authenticator::AuthConfig,
     pub repository: HashMap<String, repository::Config>,
     pub event_webhook: HashMap<String, Arc<EventWebhookConfig>>,
@@ -195,13 +199,7 @@ fn resolve_global(
     // Names listed in `global.event_webhooks` must resolve to a defined webhook.
     // The dispatcher itself fires every configured webhook whose filter matches
     // the event, so the resolved values are not stored here.
-    for name in &raw.event_webhooks {
-        if !event_webhooks.contains_key(name) {
-            return Err(Error::InvalidFormat(format!(
-                "Event webhook '{name}' not found (referenced globally)"
-            )));
-        }
-    }
+    validate_event_webhook_refs(&raw.event_webhooks, event_webhooks, "referenced globally")?;
 
     Ok(GlobalConfig {
         max_concurrent_requests: raw.max_concurrent_requests,
@@ -265,10 +263,22 @@ fn validate_repo_event_webhooks(
     names: &[String],
     event_webhooks: &HashMap<String, Arc<EventWebhookConfig>>,
 ) -> Result<(), Error> {
-    for name in names {
-        if !event_webhooks.contains_key(name) {
+    let context = format!("referenced in '{repo_name}' repository");
+    validate_event_webhook_refs(names, event_webhooks, &context)
+}
+
+/// Validates that every name in `refs` exists in `known`. The `context` string
+/// is appended to the error message in parentheses to identify the caller
+/// (e.g. `"referenced globally"`, `"referenced in 'foo' repository"`).
+fn validate_event_webhook_refs(
+    refs: &[String],
+    known: &HashMap<String, Arc<EventWebhookConfig>>,
+    context: &str,
+) -> Result<(), Error> {
+    for name in refs {
+        if !known.contains_key(name) {
             return Err(Error::InvalidFormat(format!(
-                "Event webhook '{name}' not found (referenced in '{repo_name}' repository)"
+                "Event webhook '{name}' not found ({context})"
             )));
         }
     }

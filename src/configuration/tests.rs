@@ -54,8 +54,11 @@ fn test_storage_field_backward_compatibility() {
     });
     assert_eq!(config.blob_store, expected);
 
-    // Should autoconfigure metadata store based on blob store
-    assert_eq!(config.metadata_store, None);
+    // No explicit metadata_store section — field must be Inherit
+    assert_eq!(
+        config.metadata_store,
+        metadata_store::MetadataStoreConfig::Inherit
+    );
 }
 
 #[test]
@@ -111,7 +114,7 @@ fn test_metadata_store_explicit_config_not_overridden() {
 
     // Should keep the explicitly configured FS metadata store
     match config.metadata_store {
-        Some(metadata_store::MetadataStoreConfig::FS(config)) => {
+        metadata_store::MetadataStoreConfig::FS(config) => {
             assert_eq!(config.root_dir, "/custom/metadata/path");
         }
         _ => panic!("Expected explicitly configured FS metadata store to be preserved"),
@@ -263,7 +266,8 @@ fn test_resolve_metadata_config_from_fs_blob_store() {
                 metadata_store::LockStrategy::Memory
             );
         }
-        metadata_store::MetadataStoreConfig::S3(_) => {
+        metadata_store::MetadataStoreConfig::Inherit
+        | metadata_store::MetadataStoreConfig::S3(_) => {
             panic!("Expected FS metadata store config")
         }
     }
@@ -292,15 +296,16 @@ fn test_resolve_metadata_config_from_s3_blob_store() {
             assert_eq!(s3_config.bucket, "my-bucket");
             assert_eq!(s3_config.region, "us-east-1");
             assert_eq!(s3_config.endpoint, "https://s3.example.com");
-            assert_eq!(s3_config.access_key_id, "key123");
-            assert_eq!(s3_config.secret_key, "secret456");
+            assert_eq!(s3_config.access_key_id.expose(), "key123");
+            assert_eq!(s3_config.secret_key.expose(), "secret456");
             assert_eq!(s3_config.key_prefix, "prefix/");
             assert_eq!(
                 s3_config.lock_strategy,
                 metadata_store::LockStrategy::Memory
             );
         }
-        metadata_store::MetadataStoreConfig::FS(_) => {
+        metadata_store::MetadataStoreConfig::Inherit
+        | metadata_store::MetadataStoreConfig::FS(_) => {
             panic!("Expected S3 metadata store config")
         }
     }
@@ -646,7 +651,8 @@ fn test_metadata_store_s3_with_redis() {
                 other => panic!("Expected Redis lock strategy, got {other:?}"),
             }
         }
-        metadata_store::MetadataStoreConfig::FS(_) => {
+        metadata_store::MetadataStoreConfig::Inherit
+        | metadata_store::MetadataStoreConfig::FS(_) => {
             panic!("Expected S3 metadata store config")
         }
     }
@@ -680,7 +686,8 @@ fn test_metadata_store_fs_with_redis() {
                 other => panic!("Expected Redis lock strategy, got {other:?}"),
             }
         }
-        metadata_store::MetadataStoreConfig::S3(_) => {
+        metadata_store::MetadataStoreConfig::Inherit
+        | metadata_store::MetadataStoreConfig::S3(_) => {
             panic!("Expected FS metadata store config")
         }
     }
@@ -761,7 +768,8 @@ fn test_resolve_metadata_config_preserves_explicit_s3_config() {
             assert_eq!(s3_config.region, "eu-west-1");
             assert_eq!(s3_config.endpoint, "https://metadata.example.com");
         }
-        metadata_store::MetadataStoreConfig::FS(_) => {
+        metadata_store::MetadataStoreConfig::Inherit
+        | metadata_store::MetadataStoreConfig::FS(_) => {
             panic!("Expected S3 metadata store config")
         }
     }
@@ -1056,7 +1064,8 @@ fn test_metadata_store_s3_lock_strategy_s3_defaults() {
                 other => panic!("Expected S3 lock strategy, got {other:?}"),
             }
         }
-        metadata_store::MetadataStoreConfig::FS(_) => {
+        metadata_store::MetadataStoreConfig::Inherit
+        | metadata_store::MetadataStoreConfig::FS(_) => {
             panic!("Expected S3 metadata store config")
         }
     }
@@ -1100,7 +1109,8 @@ fn test_metadata_store_s3_lock_strategy_s3_custom_values() {
             }
             other => panic!("Expected S3 lock strategy, got {other:?}"),
         },
-        metadata_store::MetadataStoreConfig::FS(_) => {
+        metadata_store::MetadataStoreConfig::Inherit
+        | metadata_store::MetadataStoreConfig::FS(_) => {
             panic!("Expected S3 metadata store config")
         }
     }
@@ -1142,7 +1152,8 @@ fn test_metadata_store_s3_lock_strategy_memory() {
                 s3_config.lock_strategy
             );
         }
-        metadata_store::MetadataStoreConfig::FS(_) => {
+        metadata_store::MetadataStoreConfig::Inherit
+        | metadata_store::MetadataStoreConfig::FS(_) => {
             panic!("Expected S3 metadata store config")
         }
     }

@@ -699,128 +699,6 @@ async fn test_hot_reload_inflight_old_dispatcher_still_works() {
         .unwrap();
 }
 
-fn create_invalid_cache_config_with_webhook(url: &str) -> Configuration {
-    let toml = format!(
-        r#"
-        [blob_store.fs]
-        root_dir = "/tmp/test-blobs"
-
-        [metadata_store.fs]
-        root_dir = "/tmp/test-metadata"
-
-        [cache.redis]
-        url = "redis://invalid:99999"
-        key_prefix = "test:"
-
-        [server]
-        bind_address = "127.0.0.1"
-        port = 8080
-
-        [global]
-        update_pull_time = false
-        max_concurrent_cache_jobs = 10
-        event_webhooks = ["test_hook"]
-
-        [event_webhook.test_hook]
-        url = "{url}"
-        policy = "optional"
-        events = ["manifest.push"]
-    "#
-    );
-
-    Configuration::load_from_str(&toml).unwrap()
-}
-
-#[tokio::test]
-async fn test_failed_reload_preserves_old_context() {
-    use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};
-
-    let server = MockServer::start().await;
-
-    Mock::given(method("POST"))
-        .respond_with(ResponseTemplate::new(200))
-        .expect(1)
-        .mount(&server)
-        .await;
-
-    let valid_config = create_config_with_webhook(&server.uri());
-    let command = Command::new(&valid_config).await.unwrap();
-
-    assert!(
-        command
-            .insecure_listener()
-            .current_context()
-            .event_dispatcher()
-            .is_some()
-    );
-
-    let invalid_config = create_invalid_cache_config_with_webhook("https://other.example.com");
-    let result = command.notify_config_change(&invalid_config).await;
-    assert!(result.is_err());
-
-    assert!(
-        command
-            .insecure_listener()
-            .current_context()
-            .event_dispatcher()
-            .is_some()
-    );
-
-    let context = command.insecure_listener().current_context();
-    context.dispatch_event(&create_test_event()).await.unwrap();
-}
-
-#[tokio::test]
-async fn test_valid_reload_works_after_failed_reload() {
-    use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};
-
-    let server_a = MockServer::start().await;
-    let server_b = MockServer::start().await;
-
-    Mock::given(method("POST"))
-        .respond_with(ResponseTemplate::new(200))
-        .expect(0)
-        .mount(&server_a)
-        .await;
-
-    Mock::given(method("POST"))
-        .respond_with(ResponseTemplate::new(200))
-        .expect(1)
-        .mount(&server_b)
-        .await;
-
-    let config_a = create_config_with_webhook(&server_a.uri());
-    let command = Command::new(&config_a).await.unwrap();
-
-    let invalid_config = create_invalid_cache_config_with_webhook("https://bad.example.com");
-    let result = command.notify_config_change(&invalid_config).await;
-    assert!(result.is_err());
-
-    let config_b = create_config_with_webhook(&server_b.uri());
-    command.notify_config_change(&config_b).await.unwrap();
-
-    let context = command.insecure_listener().current_context();
-    context.dispatch_event(&create_test_event()).await.unwrap();
-}
-
-#[tokio::test]
-async fn test_config_notifier_trait_handles_reload_error_gracefully() {
-    let valid_config = create_minimal_config();
-    let command = Command::new(&valid_config).await.unwrap();
-
-    let invalid_config = create_invalid_cache_config_with_webhook("https://example.com");
-
-    ConfigNotifier::notify_config_change(&command, &invalid_config).await;
-
-    assert!(
-        command
-            .insecure_listener()
-            .current_context()
-            .event_dispatcher()
-            .is_none()
-    );
-}
-
 #[tokio::test]
 async fn test_command_shutdown_with_no_dispatcher() {
     use std::time::Duration;
@@ -859,5 +737,32 @@ async fn test_command_shutdown_drains_in_flight_async_delivery() {
         requests.len(),
         1,
         "Command::shutdown() must drain in-flight async webhook deliveries"
+    );
+}
+
+#[test]
+fn test_poisoned_capabilities_mutex_recovers_without_crash() {
+    let lock: Arc<Mutex<Option<ConditionalCapabilities>>> = Arc::new(Mutex::new(None));
+    let lock_clone = Arc::clone(&lock);
+
+    // Poison the mutex by panicking while holding the guard.
+    let _ = std::thread::spawn(move || {
+        let _guard = lock_clone.lock().unwrap();
+        panic!("intentional panic to poison the mutex");
+    })
+    .join();
+
+    assert!(
+        lock.is_poisoned(),
+        "mutex must be poisoned after thread panic"
+    );
+
+    // The recovery pattern used in build_metadata_store must not panic.
+    let guard = lock
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    assert!(
+        guard.is_none(),
+        "recovered guard must yield the original None value"
     );
 }
