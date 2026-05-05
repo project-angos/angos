@@ -19,7 +19,7 @@ mod object;
 mod presign;
 
 pub use config::BackendConfig;
-pub use multipart::{MultipartUpload, UploadedPart};
+pub use multipart::UploadedPart;
 
 #[derive(Clone, Debug)]
 pub struct Backend {

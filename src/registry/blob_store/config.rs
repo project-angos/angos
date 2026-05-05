@@ -78,12 +78,12 @@ mod tests {
         });
 
         let handles = config.to_backend(None).unwrap();
-        let result = handles
+        let orphans = handles
             .multipart_cleanup
-            .cleanup_orphan_multipart_uploads(Duration::hours(1), false)
+            .list_orphan_multipart_uploads(Duration::hours(1))
             .await
             .unwrap();
-        assert_eq!(result, 0);
+        assert!(orphans.is_empty());
     }
 
     #[test]

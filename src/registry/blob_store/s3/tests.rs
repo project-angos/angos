@@ -8,7 +8,7 @@ use uuid::Uuid;
 use crate::{
     registry::{
         blob_store::{
-            self, MultipartCleanup,
+            self, MultipartCleanup, OrphanMultipartUpload,
             sha256_ext::Sha256Ext,
             tests::{
                 test_build_blob_reader_returns_size,
@@ -430,8 +430,8 @@ async fn test_uniform_round_trip_integrity() {
 
 /// Creates a raw S3 multipart upload without a `startedat` marker, making it a
 /// genuine orphan from the registry's perspective.  With a zero timeout every
-/// upload satisfies `age >= 0`, so `cleanup_orphan_multipart_uploads` must abort
-/// it and return a count of at least 1.
+/// upload satisfies `age >= 0`, so listing must return it and aborting must
+/// remove it.
 #[tokio::test]
 async fn test_cleanup_orphan_multipart_uploads_aborts_old_uploads() {
     let t = S3RegistryTestCase::new();
@@ -461,14 +461,18 @@ async fn test_cleanup_orphan_multipart_uploads_aborts_old_uploads() {
     );
 
     // A zero timeout means every upload, no matter how fresh, satisfies `age >= 0`.
-    let aborted = backend
-        .cleanup_orphan_multipart_uploads(Duration::zero(), false)
+    let orphans: Vec<OrphanMultipartUpload> = backend
+        .list_orphan_multipart_uploads(Duration::zero())
         .await
         .unwrap();
     assert!(
-        aborted >= 1,
-        "at least the orphan upload must have been aborted"
+        !orphans.is_empty(),
+        "at least the orphan upload must appear in the listing"
     );
+
+    for orphan in &orphans {
+        backend.abort_orphan_multipart_upload(orphan).await.unwrap();
+    }
 
     // The upload must no longer appear in the listing.
     let (uploads_after, _, _) = backend
@@ -478,14 +482,14 @@ async fn test_cleanup_orphan_multipart_uploads_aborts_old_uploads() {
         .unwrap();
     assert!(
         !uploads_after.iter().any(|u| u.key == upload_key),
-        "orphan upload must be gone from the list after cleanup"
+        "orphan upload must be gone from the list after abort"
     );
 }
 
-/// Dry-run mode must count the orphan but must not abort it — the upload must
-/// still appear in the listing after the cleanup call returns.
+/// Listing orphans is pure observation — it must not modify state.  Not calling
+/// abort after listing is the structural equivalent of the old dry-run mode.
 #[tokio::test]
-async fn test_cleanup_orphan_multipart_uploads_dry_run_does_not_abort() {
+async fn test_list_orphan_multipart_uploads_does_not_modify_state() {
     let t = S3RegistryTestCase::new();
     let backend = t.blob_store();
 
@@ -498,14 +502,17 @@ async fn test_cleanup_orphan_multipart_uploads_dry_run_does_not_abort() {
         .await
         .unwrap();
 
-    // Dry-run with zero timeout: should count but not abort.
-    let counted = backend
-        .cleanup_orphan_multipart_uploads(Duration::zero(), true)
+    // List with zero timeout: the just-created upload must appear as an orphan.
+    let orphans = backend
+        .list_orphan_multipart_uploads(Duration::zero())
         .await
         .unwrap();
-    assert!(counted >= 1, "dry-run should still count the orphan upload");
+    assert!(
+        orphans.iter().any(|o| o.key == upload_key),
+        "orphan upload must appear in list"
+    );
 
-    // The upload must still exist because dry-run must not modify state.
+    // Re-list the raw multipart uploads: listing must not have modified state.
     let (uploads_after, _, _) = backend
         .store
         .list_multipart_uploads(None, None, None)
@@ -513,7 +520,7 @@ async fn test_cleanup_orphan_multipart_uploads_dry_run_does_not_abort() {
         .unwrap();
     assert!(
         uploads_after.iter().any(|u| u.key == upload_key),
-        "dry-run must not abort the upload; it must still appear in the listing"
+        "listing orphans must not abort the upload; it must still appear in the listing"
     );
 
     // Clean up the lingering multipart upload so MinIO stays tidy.

@@ -18,8 +18,8 @@ use crate::{
     oci::Digest,
     registry::{
         blob_store::{
-            BlobStore, BoxedReader, Error, MultipartCleanup, UploadStore, UploadSummary,
-            hashing_reader::HashingReader, sha256_ext::Sha256Ext,
+            BlobStore, BoxedReader, Error, MultipartCleanup, OrphanMultipartUpload, UploadStore,
+            UploadSummary, hashing_reader::HashingReader, sha256_ext::Sha256Ext,
         },
         data_store, pagination, path_builder,
     },
@@ -291,12 +291,18 @@ impl UploadStore for Backend {
 #[async_trait]
 impl MultipartCleanup for Backend {
     // FS uploads are plain files; there are no S3 multipart uploads to clean up.
-    async fn cleanup_orphan_multipart_uploads(
+    async fn list_orphan_multipart_uploads(
         &self,
         _timeout: Duration,
-        _dry_run: bool,
-    ) -> Result<usize, Error> {
-        Ok(0)
+    ) -> Result<Vec<OrphanMultipartUpload>, Error> {
+        Ok(Vec::new())
+    }
+
+    async fn abort_orphan_multipart_upload(
+        &self,
+        _upload: &OrphanMultipartUpload,
+    ) -> Result<(), Error> {
+        Ok(())
     }
 }
 

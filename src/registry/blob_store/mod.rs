@@ -86,13 +86,27 @@ pub trait PresignedBlobStore: Send + Sync {
     ) -> Result<Option<String>, Error>;
 }
 
+pub struct OrphanMultipartUpload {
+    pub key: String,
+    pub upload_id: String,
+}
+
 #[async_trait]
 pub trait MultipartCleanup: Send + Sync {
-    async fn cleanup_orphan_multipart_uploads(
+    /// Lists multipart uploads that have exceeded `timeout` and are not
+    /// associated with a live upload session (i.e., the start-date marker is
+    /// gone).  Pure discovery — does not modify any state.
+    async fn list_orphan_multipart_uploads(
         &self,
         timeout: Duration,
-        dry_run: bool,
-    ) -> Result<usize, Error>;
+    ) -> Result<Vec<OrphanMultipartUpload>, Error>;
+
+    /// Aborts a single orphan upload previously returned by
+    /// `list_orphan_multipart_uploads`.
+    async fn abort_orphan_multipart_upload(
+        &self,
+        upload: &OrphanMultipartUpload,
+    ) -> Result<(), Error>;
 }
 
 #[cfg(test)]

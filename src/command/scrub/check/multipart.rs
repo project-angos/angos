@@ -25,72 +25,118 @@ impl MultipartChecker {
     }
 
     pub async fn check_all(&self) -> Result<(), Error> {
-        let count = self
+        let orphans = self
             .cleanup
-            .cleanup_orphan_multipart_uploads(self.timeout, self.dry_run)
+            .list_orphan_multipart_uploads(self.timeout)
             .await?;
+        let count = orphans.len();
+        for orphan in &orphans {
+            if self.dry_run {
+                info!(
+                    "DRY RUN: would abort orphan multipart upload {}",
+                    orphan.key
+                );
+            } else {
+                info!("Aborting orphan multipart upload {}", orphan.key);
+                self.cleanup.abort_orphan_multipart_upload(orphan).await?;
+            }
+        }
         info!("Cleaned up {count} orphan multipart upload(s)");
         Ok(())
     }
 }
 
-// Full integration coverage for `MultipartCleanup` (orphan abort, dry-run
-// count) lives in `src/registry/blob_store/s3/tests.rs` where a real MinIO
+// Full integration coverage for `MultipartCleanup` (orphan abort, listing)
+// lives in `src/registry/blob_store/s3/tests.rs` where a real MinIO
 // bucket is available.  The tests below cover the pure `MultipartChecker`
 // layer: construction and delegation.
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+    use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
 
     use async_trait::async_trait;
 
     use super::*;
+    use crate::registry::blob_store::OrphanMultipartUpload;
 
     struct SpyCleanup {
-        called_timeout_secs: AtomicI64,
-        called_dry_run: AtomicBool,
-        result: usize,
+        list_called_timeout_secs: AtomicI64,
+        abort_call_count: AtomicUsize,
+        orphans: Vec<String>,
     }
 
     impl SpyCleanup {
-        fn new(result: usize) -> Arc<Self> {
+        fn new(orphan_keys: Vec<&str>) -> Arc<Self> {
             Arc::new(Self {
-                called_timeout_secs: AtomicI64::new(-1),
-                called_dry_run: AtomicBool::new(false),
-                result,
+                list_called_timeout_secs: AtomicI64::new(-1),
+                abort_call_count: AtomicUsize::new(0),
+                orphans: orphan_keys.into_iter().map(str::to_owned).collect(),
             })
         }
     }
 
     #[async_trait]
     impl MultipartCleanup for SpyCleanup {
-        async fn cleanup_orphan_multipart_uploads(
+        async fn list_orphan_multipart_uploads(
             &self,
             timeout: Duration,
-            dry_run: bool,
-        ) -> Result<usize, Error> {
-            self.called_timeout_secs
+        ) -> Result<Vec<OrphanMultipartUpload>, Error> {
+            self.list_called_timeout_secs
                 .store(timeout.num_seconds(), Ordering::SeqCst);
-            self.called_dry_run.store(dry_run, Ordering::SeqCst);
-            Ok(self.result)
+            Ok(self
+                .orphans
+                .iter()
+                .map(|k| OrphanMultipartUpload {
+                    key: k.clone(),
+                    upload_id: "spy-upload-id".to_string(),
+                })
+                .collect())
+        }
+
+        async fn abort_orphan_multipart_upload(
+            &self,
+            _upload: &OrphanMultipartUpload,
+        ) -> Result<(), Error> {
+            self.abort_call_count.fetch_add(1, Ordering::SeqCst);
+            Ok(())
         }
     }
 
     #[tokio::test]
-    async fn check_all_delegates_timeout_and_dry_run_to_cleanup() {
-        let spy = SpyCleanup::new(3);
+    async fn check_all_lists_orphans_and_skips_abort_in_dry_run() {
+        let spy = SpyCleanup::new(vec!["ns/_uploads/uuid1/data", "ns/_uploads/uuid2/data"]);
         let checker = MultipartChecker::new(spy.clone(), Duration::hours(2), true);
 
         checker.check_all().await.unwrap();
 
         assert_eq!(
-            spy.called_timeout_secs.load(Ordering::SeqCst),
+            spy.list_called_timeout_secs.load(Ordering::SeqCst),
             7200,
             "timeout forwarded as 2 h = 7200 s"
         );
-        assert!(
-            spy.called_dry_run.load(Ordering::SeqCst),
-            "dry_run flag must be forwarded"
+        assert_eq!(
+            spy.abort_call_count.load(Ordering::SeqCst),
+            0,
+            "dry_run must not invoke abort"
+        );
+    }
+
+    #[tokio::test]
+    async fn check_all_aborts_orphans_when_not_dry_run() {
+        let spy = SpyCleanup::new(vec!["ns/_uploads/uuid1/data", "ns/_uploads/uuid2/data"]);
+        let checker = MultipartChecker::new(spy.clone(), Duration::hours(2), false);
+
+        checker.check_all().await.unwrap();
+
+        assert_eq!(
+            spy.list_called_timeout_secs.load(Ordering::SeqCst),
+            7200,
+            "timeout forwarded as 2 h = 7200 s"
+        );
+        assert_eq!(
+            spy.abort_call_count.load(Ordering::SeqCst),
+            2,
+            "abort must be called once per orphan"
         );
     }
 
@@ -100,12 +146,18 @@ mod tests {
 
         #[async_trait]
         impl MultipartCleanup for FailingCleanup {
-            async fn cleanup_orphan_multipart_uploads(
+            async fn list_orphan_multipart_uploads(
                 &self,
                 _timeout: Duration,
-                _dry_run: bool,
-            ) -> Result<usize, Error> {
+            ) -> Result<Vec<OrphanMultipartUpload>, Error> {
                 Err(Error::StorageBackend("backend failure".to_string()))
+            }
+
+            async fn abort_orphan_multipart_upload(
+                &self,
+                _upload: &OrphanMultipartUpload,
+            ) -> Result<(), Error> {
+                Ok(())
             }
         }
 
