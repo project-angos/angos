@@ -782,7 +782,11 @@ mod tests {
 
         let plan = build_create_ops(&creates, &mut cache);
 
-        assert_eq!(plan.tracked_writes.len(), 1, "one plan.tracked_writes write expected");
+        assert_eq!(
+            plan.tracked_writes.len(),
+            1,
+            "one plan.tracked_writes write expected"
+        );
         assert!(plan.non_tracked_writes.is_empty());
 
         let (written_link, written_meta) = &plan.tracked_writes[0];
@@ -792,7 +796,10 @@ mod tests {
             "referrer must appear in referenced_by"
         );
 
-        let ops = plan.pending_blob_ops.get(&target).expect("blob ops for target expected");
+        let ops = plan
+            .pending_blob_ops
+            .get(&target)
+            .expect("blob ops for target expected");
         assert_eq!(ops.len(), 1);
         assert!(is_insert(&ops[0], &link));
     }
@@ -849,7 +856,10 @@ mod tests {
         assert_eq!(plan.non_tracked_writes.len(), 1);
         assert_eq!(plan.non_tracked_writes[0].0, link);
 
-        let ops = plan.pending_blob_ops.get(&target).expect("blob ops for target expected");
+        let ops = plan
+            .pending_blob_ops
+            .get(&target)
+            .expect("blob ops for target expected");
         assert_eq!(ops.len(), 1);
         assert!(is_insert(&ops[0], &link));
     }
@@ -876,13 +886,15 @@ mod tests {
         assert!(plan.tracked_writes.is_empty());
         assert_eq!(plan.non_tracked_writes.len(), 1);
 
-        let new_ops = plan.pending_blob_ops
+        let new_ops = plan
+            .pending_blob_ops
             .get(&new_target)
             .expect("blob ops for new target expected");
         assert_eq!(new_ops.len(), 1);
         assert!(is_insert(&new_ops[0], &link));
 
-        let old_ops = plan.pending_blob_ops
+        let old_ops = plan
+            .pending_blob_ops
             .get(&old_target)
             .expect("blob ops for old target expected");
         assert_eq!(old_ops.len(), 1);
@@ -909,7 +921,11 @@ mod tests {
         let plan = build_create_ops(&creates, &mut cache);
 
         assert!(plan.tracked_writes.is_empty());
-        assert_eq!(plan.non_tracked_writes.len(), 1, "link metadata is still written");
+        assert_eq!(
+            plan.non_tracked_writes.len(),
+            1,
+            "link metadata is still written"
+        );
         assert!(
             plan.pending_blob_ops.is_empty(),
             "no blob ops when old_target equals new target on non-plan.tracked_writes path"
@@ -981,7 +997,11 @@ mod tests {
 
         let dplan = build_delete_ops(&[], &mut cache, input_ops);
 
-        assert_eq!(dplan.pending_blob_ops.len(), 1, "pre-existing blob op must be preserved");
+        assert_eq!(
+            dplan.pending_blob_ops.len(),
+            1,
+            "pre-existing blob op must be preserved"
+        );
         let ops = dplan.pending_blob_ops.get(&target).unwrap();
         assert_eq!(ops.len(), 1);
         assert!(is_insert(&ops[0], &link));
@@ -1015,9 +1035,15 @@ mod tests {
         let dplan = build_delete_ops(&deletes, &mut cache, HashMap::new());
 
         assert_eq!(dplan.tracked_writes.len(), 1, "must write updated metadata");
-        assert!(dplan.tracked_removes.is_empty(), "link must not be removed yet");
+        assert!(
+            dplan.tracked_removes.is_empty(),
+            "link must not be removed yet"
+        );
         assert!(dplan.non_tracked_links.is_empty());
-        assert!(dplan.pending_blob_ops.is_empty(), "no blob Remove when referrer remains");
+        assert!(
+            dplan.pending_blob_ops.is_empty(),
+            "no blob Remove when referrer remains"
+        );
 
         let (written_link, written_meta) = &dplan.tracked_writes[0];
         assert_eq!(written_link, &link);
@@ -1060,7 +1086,10 @@ mod tests {
         assert_eq!(dplan.tracked_removes[0], link);
         assert!(dplan.non_tracked_links.is_empty());
 
-        let ops = dplan.pending_blob_ops.get(&target).expect("blob Remove expected");
+        let ops = dplan
+            .pending_blob_ops
+            .get(&target)
+            .expect("blob Remove expected");
         assert_eq!(ops.len(), 1);
         assert!(is_remove(&ops[0], &link));
     }
@@ -1109,7 +1138,10 @@ mod tests {
         assert_eq!(dplan.non_tracked_links.len(), 1);
         assert_eq!(dplan.non_tracked_links[0], link);
 
-        let ops = dplan.pending_blob_ops.get(&target).expect("blob Remove expected");
+        let ops = dplan
+            .pending_blob_ops
+            .get(&target)
+            .expect("blob Remove expected");
         assert_eq!(ops.len(), 1);
         assert!(is_remove(&ops[0], &link));
     }
@@ -1138,13 +1170,15 @@ mod tests {
 
         let dplan = build_delete_ops(&deletes, &mut cache, prior_ops);
 
-        let pre_ops = dplan.pending_blob_ops
+        let pre_ops = dplan
+            .pending_blob_ops
             .get(&pre_target)
             .expect("pre-existing blob op must survive");
         assert_eq!(pre_ops.len(), 1);
         assert!(is_insert(&pre_ops[0], &pre_link));
 
-        let del_ops = dplan.pending_blob_ops
+        let del_ops = dplan
+            .pending_blob_ops
             .get(&del_target)
             .expect("new blob Remove must be added");
         assert_eq!(del_ops.len(), 1);
