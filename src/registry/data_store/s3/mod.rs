@@ -113,7 +113,7 @@ impl Backend {
 #[cfg(test)]
 mod tests {
     use bytes::Bytes;
-    use object::aggregate_batch_delete_errors;
+    use object::{aggregate_batch_delete_errors, build_object_identifiers};
 
     use super::*;
     use crate::secret::Secret;
@@ -222,6 +222,39 @@ mod tests {
         if let Err(err) = result {
             assert!(err.to_string().contains("error") || err.to_string().contains("refused"));
         }
+    }
+
+    #[test]
+    fn test_build_object_identifiers_empty_input() {
+        let result = build_object_identifiers(vec![]);
+        let ids = result.expect("empty input must succeed");
+        assert!(ids.is_empty());
+    }
+
+    #[test]
+    fn test_build_object_identifiers_all_keys_present() {
+        use aws_sdk_s3::types::Object;
+        let objects = vec![
+            Object::builder().key("a/b/c").build(),
+            Object::builder().key("d/e/f").build(),
+            Object::builder().key("g/h/i").build(),
+        ];
+        let result = build_object_identifiers(objects);
+        let ids = result.expect("all keys present must succeed");
+        assert_eq!(ids.len(), 3);
+    }
+
+    #[test]
+    fn test_build_object_identifiers_skips_missing_keys() {
+        use aws_sdk_s3::types::Object;
+        let objects = vec![
+            Object::builder().key("present/key").build(),
+            Object::builder().build(),
+            Object::builder().key("another/key").build(),
+        ];
+        let result = build_object_identifiers(objects);
+        let ids = result.expect("objects with missing keys are filtered, not errors");
+        assert_eq!(ids.len(), 2);
     }
 
     #[test]

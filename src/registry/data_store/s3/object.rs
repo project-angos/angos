@@ -8,7 +8,7 @@ use std::{
 use aws_sdk_s3::{
     error::ProvideErrorMetadata,
     primitives::ByteStream,
-    types::{Delete, Error as S3TypesError, ObjectIdentifier},
+    types::{Delete, Error as S3TypesError, Object, ObjectIdentifier},
 };
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
@@ -39,6 +39,14 @@ fn classify_conditional_put_error(error: &(impl ProvideErrorMetadata + Display))
     } else {
         Error::Io(error.to_string())
     }
+}
+
+pub fn build_object_identifiers(contents: Vec<Object>) -> Result<Vec<ObjectIdentifier>, IoError> {
+    contents
+        .into_iter()
+        .filter_map(|obj| obj.key.map(|k| ObjectIdentifier::builder().key(k).build()))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| IoError::other(e.to_string()))
 }
 
 pub fn aggregate_batch_delete_errors(errors: &[S3TypesError]) -> Option<IoError> {
@@ -137,13 +145,7 @@ impl Backend {
                 .await
                 .map_err(|e| IoError::other(e.to_string()))?;
 
-            let keys: Vec<ObjectIdentifier> = res
-                .contents
-                .unwrap_or_default()
-                .into_iter()
-                .filter_map(|obj| obj.key.map(|k| ObjectIdentifier::builder().key(k).build()))
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|e| IoError::other(e.to_string()))?;
+            let keys = build_object_identifiers(res.contents.unwrap_or_default())?;
 
             self.delete_batch(keys).await?;
 
