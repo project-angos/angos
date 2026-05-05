@@ -1,23 +1,17 @@
 #[cfg(test)]
 mod tests;
 
+mod auth;
 mod bearer_token;
+mod http_client;
+mod upstream_url;
 
-use std::{
-    collections::HashMap,
-    fs, io,
-    sync::{Arc, LazyLock},
-    time::Duration,
-};
+use std::{io, sync::Arc};
 
-use base64::{Engine, engine::general_purpose::STANDARD as BASE64_STANDARD};
-use bearer_token::BearerToken;
 use futures_util::TryStreamExt;
-use regex::Regex;
 use reqwest::{
-    Certificate, Client, Identity, Method, Response, StatusCode,
-    header::{ACCEPT, AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE, WWW_AUTHENTICATE},
-    redirect::Policy,
+    Client, Method, Response, StatusCode,
+    header::{ACCEPT, AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE},
 };
 use serde::Deserialize;
 use tokio::{io::AsyncReadExt, sync::RwLock};
@@ -26,13 +20,10 @@ use tracing::{info, warn};
 
 use crate::{
     cache::Cache,
-    oci::{Digest, Reference},
+    oci::Digest,
     registry::{DOCKER_CONTENT_DIGEST, Error, blob_store::BoxedReader},
     secret::Secret,
 };
-
-static BEARER_PARAM_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r#"(\w+)="([^"]+)""#).unwrap());
 
 fn parse_header<T: std::str::FromStr>(
     response: &Response,
@@ -75,37 +66,7 @@ pub struct RegistryClient {
 
 impl RegistryClient {
     pub fn new(config: &RegistryClientConfig, cache: Arc<dyn Cache>) -> Result<Self, Error> {
-        let mut client_builder = Client::builder()
-            .redirect(Policy::limited(config.max_redirect as usize))
-            .timeout(Duration::from_mins(5));
-
-        if let Some(ca_bundle) = &config.server_ca_bundle {
-            let cert_pem = fs::read(ca_bundle)
-                .map_err(|e| Error::Initialization(format!("Failed to read CA bundle: {e}")))?;
-            let cert = Certificate::from_pem(&cert_pem)
-                .map_err(|e| Error::Initialization(format!("Failed to parse CA bundle: {e}")))?;
-            client_builder = client_builder.add_root_certificate(cert);
-        } else {
-            client_builder = client_builder.use_rustls_tls();
-        }
-
-        if let (Some(cert_path), Some(key_path)) =
-            (&config.client_certificate, &config.client_private_key)
-        {
-            let cert_pem = fs::read(cert_path).map_err(|e| {
-                Error::Initialization(format!("Failed to read client certificate: {e}"))
-            })?;
-            let key_pem = fs::read(key_path)
-                .map_err(|e| Error::Initialization(format!("Failed to read client key: {e}")))?;
-            let identity = Identity::from_pem(&[cert_pem, key_pem].concat()).map_err(|e| {
-                Error::Initialization(format!("Failed to create client identity: {e}"))
-            })?;
-            client_builder = client_builder.identity(identity);
-        }
-
-        let client = client_builder
-            .build()
-            .map_err(|e| Error::Initialization(format!("Failed to build HTTP client: {e}")))?;
+        let client = http_client::build_http_client(config)?;
 
         let basic_auth = match (&config.username, &config.password) {
             (Some(username), Some(password)) => Some((username.clone(), password.expose().clone())),
@@ -245,96 +206,5 @@ impl RegistryClient {
         StreamReader::new(stream).read_to_end(&mut content).await?;
 
         Ok((media_type, digest, content))
-    }
-
-    async fn authenticate(&self, response: &Response) -> Result<String, Error> {
-        let auth_header: String = parse_header(response, WWW_AUTHENTICATE)
-            .map_err(|_| Error::Unauthorized("Missing WWW-Authenticate".to_string()))?;
-
-        if let Some(bearer_params) = auth_header.strip_prefix("Bearer ") {
-            let mut params = HashMap::new();
-
-            for cap in BEARER_PARAM_RE.captures_iter(bearer_params) {
-                params.insert(cap[1].to_string(), cap[2].to_string());
-            }
-
-            let realm = params.remove("realm").ok_or_else(|| {
-                Error::Internal("Missing realm parameter in WWW-Authenticate header".to_string())
-            })?;
-
-            let query = params
-                .iter()
-                .map(|(k, v)| format!("{k}={v}"))
-                .collect::<Vec<_>>()
-                .join("&");
-
-            let mut req = self.client.get(format!("{realm}?{query}"));
-
-            if let Some((user, pass)) = &self.basic_auth {
-                let encoded = BASE64_STANDARD.encode(format!("{user}:{pass}"));
-                req = req.header(AUTHORIZATION, format!("Basic {encoded}"));
-            }
-
-            let resp = req
-                .send()
-                .await
-                .map_err(|e| Error::Internal(format!("Token request failed: {e}")))?;
-
-            if !resp.status().is_success() {
-                return Err(Error::Unauthorized(format!(
-                    "Token acquisition failed: {}",
-                    resp.status()
-                )));
-            }
-
-            let bearer: BearerToken = resp
-                .json()
-                .await
-                .map_err(|e| Error::Internal(format!("Failed to parse token response: {e}")))?;
-
-            let token = format!("Bearer {}", bearer.token()?);
-
-            let authority = response.url().host_str().unwrap_or("unknown");
-            let cache_key = format!("auth:{authority}");
-            let _ = self
-                .cache
-                .store_value(&cache_key, &token, bearer.ttl())
-                .await;
-
-            Ok(token)
-        } else if auth_header.starts_with("Basic ") {
-            let (user, pass) = self.basic_auth.as_ref().ok_or_else(|| {
-                Error::Unauthorized("Basic auth required but not configured".to_string())
-            })?;
-            let encoded = BASE64_STANDARD.encode(format!("{user}:{pass}"));
-            Ok(format!("Basic {encoded}"))
-        } else {
-            Err(Error::Internal(
-                "Unsupported authentication scheme in WWW-Authenticate header".to_string(),
-            ))
-        }
-    }
-
-    fn get_upstream_namespace(local_name: &str, upstream_name: &str) -> String {
-        upstream_name
-            .strip_prefix(local_name)
-            .unwrap_or(upstream_name)
-            .trim_start_matches('/')
-            .to_string()
-    }
-
-    pub fn get_manifest_path(
-        &self,
-        local_name: &str,
-        upstream_name: &str,
-        reference: &Reference,
-    ) -> String {
-        let namespace = Self::get_upstream_namespace(local_name, upstream_name);
-        format!("{}/v2/{namespace}/manifests/{reference}", self.url)
-    }
-
-    pub fn get_blob_path(&self, local_name: &str, upstream_name: &str, digest: &Digest) -> String {
-        let namespace = Self::get_upstream_namespace(local_name, upstream_name);
-        format!("{}/v2/{namespace}/blobs/{digest}", self.url)
     }
 }
