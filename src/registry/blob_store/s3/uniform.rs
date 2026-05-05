@@ -15,6 +15,18 @@ use crate::{
     },
 };
 
+struct ChunkContext<'a> {
+    upload_path: &'a str,
+    upload_id: &'a str,
+    uploaded_size: u64,
+    append: bool,
+}
+
+struct ChunkOutcome {
+    chunk_len: u64,
+    flushed: bool,
+}
+
 impl Backend {
     #[instrument(skip(self, chunk))]
     pub async fn store_staged_chunk(
@@ -62,6 +74,79 @@ impl Backend {
         Sha256::from_state(&state)
     }
 
+    async fn resolve_uniform_state(
+        &self,
+        name: &str,
+        uuid: &str,
+        upload_path: &str,
+        append: bool,
+    ) -> Result<(String, Vec<UploadedPart>), Error> {
+        if append {
+            if let Some(S3UploadState {
+                multipart_upload_id: Some(id),
+                parts,
+                ..
+            }) = self.retrieve_cached_upload_state(name, uuid).await
+            {
+                return Ok((id, parts));
+            }
+            let id = if let Some(id) = self.get_or_search_upload_id(upload_path).await? {
+                id
+            } else {
+                let id = self.store.create_multipart_upload(upload_path).await?;
+                self.cache_upload_id(upload_path, &id).await;
+                id
+            };
+            let parts = self.store.list_parts(upload_path, &id).await?;
+            Ok((id, parts))
+        } else {
+            self.evict_upload_id(upload_path).await;
+            self.store.abort_pending_uploads(upload_path).await?;
+            let id = self.store.create_multipart_upload(upload_path).await?;
+            self.cache_upload_id(upload_path, &id).await;
+            Ok((id, Vec::new()))
+        }
+    }
+
+    async fn process_chunk(
+        &self,
+        name: &str,
+        uuid: &str,
+        ctx: ChunkContext<'_>,
+        uploaded_parts: &mut u32,
+        chunk: Bytes,
+        reader: &mut ChunkedReader<HashingReader<impl AsyncRead + Unpin + Send + Sync>>,
+    ) -> Result<ChunkOutcome, Error> {
+        let chunk_len = u64::try_from(chunk.len())?;
+        let flush = should_flush(chunk_len, self.multipart_part_size);
+
+        if flush {
+            self.store
+                .upload_part(ctx.upload_path, ctx.upload_id, *uploaded_parts, chunk)
+                .await?;
+            *uploaded_parts += 1;
+        } else {
+            reader.mark_finished();
+            self.store_staged_chunk(name, uuid, chunk, ctx.uploaded_size)
+                .await?;
+        }
+
+        if ctx.append {
+            self.save_hasher(
+                name,
+                uuid,
+                ctx.uploaded_size + chunk_len,
+                reader.serialized_state(),
+            )
+            .await?;
+        }
+
+        Ok(ChunkOutcome {
+            chunk_len,
+            flushed: flush,
+        })
+    }
+
     #[instrument(skip(self, stream))]
     pub async fn write_upload_uniform(
         &self,
@@ -72,75 +157,43 @@ impl Backend {
     ) -> Result<(Digest, u64), Error> {
         let upload_path = path_builder::upload_path(name, uuid);
 
-        let (upload_id, part_list) = if append {
-            if let Some(S3UploadState {
-                multipart_upload_id: Some(id),
-                parts,
-                ..
-            }) = self.retrieve_cached_upload_state(name, uuid).await
-            {
-                (id, parts)
-            } else {
-                let id = if let Some(id) = self.get_or_search_upload_id(&upload_path).await? {
-                    id
-                } else {
-                    let id = self.store.create_multipart_upload(&upload_path).await?;
-                    self.cache_upload_id(&upload_path, &id).await;
-                    id
-                };
-                let parts = self.store.list_parts(&upload_path, &id).await?;
-                (id, parts)
-            }
-        } else {
-            self.evict_upload_id(&upload_path).await;
-            self.store.abort_pending_uploads(&upload_path).await?;
-            let id = self.store.create_multipart_upload(&upload_path).await?;
-            self.cache_upload_id(&upload_path, &id).await;
-            (id, Vec::new())
-        };
+        let (upload_id, part_list) = self
+            .resolve_uniform_state(name, uuid, &upload_path, append)
+            .await?;
 
         let mut uploaded_size: u64 = part_list.iter().map(|p| p.size).sum();
         let mut uploaded_parts = next_part_number(part_list.len())?;
 
-        let chunk = self.load_staged_chunk(name, uuid, uploaded_size).await?;
+        let staged = self.load_staged_chunk(name, uuid, uploaded_size).await?;
         let hasher = self.load_hasher(name, uuid, uploaded_size).await?;
 
-        let reader = Cursor::new(chunk).chain(stream);
+        let reader = Cursor::new(staged).chain(stream);
         let reader = HashingReader::with_hasher(reader, hasher);
         let mut reader = ChunkedReader::new(reader, self.multipart_part_size);
 
         let mut total_size = uploaded_size;
         while let Some(mut chunk_reader) = reader.next_chunk() {
-            let mut chunk = Vec::with_capacity(usize::try_from(self.multipart_part_size)?);
-            chunk_reader.read_to_end(&mut chunk).await?;
-            let chunk = Bytes::from(chunk);
-            let chunk_len = u64::try_from(chunk.len())?;
-            let flush = should_flush(chunk_len, self.multipart_part_size);
-
-            if flush {
-                self.store
-                    .upload_part(&upload_path, &upload_id, uploaded_parts, chunk)
-                    .await?;
-                uploaded_parts += 1;
-            } else {
-                reader.mark_finished();
-                self.store_staged_chunk(name, uuid, chunk, uploaded_size)
-                    .await?;
-            }
-            total_size = uploaded_size + chunk_len;
-
-            if append {
-                self.save_hasher(
+            let mut buf = Vec::with_capacity(usize::try_from(self.multipart_part_size)?);
+            chunk_reader.read_to_end(&mut buf).await?;
+            let chunk = Bytes::from(buf);
+            let outcome = self
+                .process_chunk(
                     name,
                     uuid,
-                    uploaded_size + chunk_len,
-                    reader.serialized_state(),
+                    ChunkContext {
+                        upload_path: &upload_path,
+                        upload_id: &upload_id,
+                        uploaded_size,
+                        append,
+                    },
+                    &mut uploaded_parts,
+                    chunk,
+                    &mut reader,
                 )
                 .await?;
-            }
-
-            if flush {
-                uploaded_size += chunk_len;
+            total_size = uploaded_size + outcome.chunk_len;
+            if outcome.flushed {
+                uploaded_size += outcome.chunk_len;
             }
         }
 
