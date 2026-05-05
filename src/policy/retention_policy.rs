@@ -205,15 +205,15 @@ impl RetentionPolicy {
 }
 
 fn days(d: i64) -> i64 {
-    d * 86400
+    d.saturating_mul(86400)
 }
 
 fn hours(h: i64) -> i64 {
-    h * 3600
+    h.saturating_mul(3600)
 }
 
 fn minutes(m: i64) -> i64 {
-    m * 60
+    m.saturating_mul(60)
 }
 
 #[cfg(test)]
@@ -579,5 +579,30 @@ mod tests {
             !policy.should_retain(&one_second_later, &[], &[]).unwrap(),
             "manifest pushed one second after the fixed clock time should not be retained"
         );
+    }
+
+    #[test]
+    fn days_overflow_saturates() {
+        assert_eq!(days(i64::MAX), i64::MAX);
+    }
+
+    #[test]
+    fn hours_overflow_saturates() {
+        assert_eq!(hours(i64::MAX), i64::MAX);
+    }
+
+    #[test]
+    fn minutes_overflow_saturates() {
+        assert_eq!(minutes(i64::MAX), i64::MAX);
+    }
+
+    #[test]
+    fn days_negative_overflow_saturates() {
+        assert_eq!(days(i64::MIN), i64::MIN);
+    }
+
+    #[test]
+    fn days_normal_value() {
+        assert_eq!(days(7), 7 * 86400);
     }
 }
