@@ -1,5 +1,4 @@
 mod cache;
-mod channel_body;
 mod chunked_reader;
 mod cleanup;
 mod nonuniform;
@@ -22,6 +21,7 @@ use sha2::{Digest as ShaDigestTrait, Sha256};
 use tokio::io::AsyncRead;
 use tracing::{debug, info, instrument};
 
+pub use crate::registry::data_store::s3::UploadedPart;
 use crate::{
     cache::Cache,
     oci::Digest,
@@ -37,14 +37,6 @@ use crate::{
 pub const MIN_PART_SIZE: u64 = 5 * 1024 * 1024;
 pub const FRAME_SIZE: usize = 256 * 1024;
 
-/// A single part that has been successfully uploaded as part of a multipart upload.
-#[derive(Debug, Serialize, Deserialize)]
-pub struct UploadedPart {
-    pub part_number: i32,
-    pub e_tag: String,
-    pub size: i64,
-}
-
 /// S3-internal upload state, cached between `write_upload` calls to avoid
 /// redundant round-trips to the S3 API.
 #[derive(Debug, Serialize, Deserialize)]
@@ -58,7 +50,7 @@ pub struct S3UploadState {
 #[derive(Clone)]
 pub struct Backend {
     pub store: data_store::s3::Backend,
-    multipart_part_size: usize,
+    multipart_part_size: u64,
     uniform_parts: bool,
     cache: Option<Arc<dyn Cache>>,
 }
@@ -72,8 +64,7 @@ impl Debug for Backend {
 impl Backend {
     pub fn new(config: &data_store::s3::BackendConfig) -> Result<Self, Error> {
         info!("Using S3 blob-store backend");
-        #[allow(clippy::cast_possible_truncation)]
-        let multipart_part_size = config.multipart_part_size.as_u64() as usize;
+        let multipart_part_size = config.multipart_part_size.as_u64();
         let store = data_store::s3::Backend::new(config)?;
 
         Ok(Self {
@@ -186,14 +177,8 @@ impl BlobStore for Backend {
                 }
             })?;
 
-        let remaining: u64 = res
-            .content_length
-            .unwrap_or_default()
-            .try_into()
-            .unwrap_or(0);
-        let total_size = remaining + start_offset.unwrap_or(0);
-
-        Ok((Box::new(res.body.into_async_read()), total_size))
+        let total_size = res.content_length + start_offset.unwrap_or(0);
+        Ok((res.body, total_size))
     }
 
     #[instrument(skip(self))]
@@ -220,7 +205,7 @@ impl UploadStore for Backend {
 
         let (prefixes, _, next_continuation_token) = self
             .store
-            .list_prefixes(&uploads_dir, "/", i32::from(n), continuation_token, None)
+            .list_prefixes(&uploads_dir, "/", n, continuation_token, None)
             .await?;
 
         Ok((prefixes, next_continuation_token))

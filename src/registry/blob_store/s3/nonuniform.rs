@@ -1,6 +1,5 @@
 use std::io::Cursor;
 
-use aws_sdk_s3::{primitives::ByteStream, types::CompletedPart};
 use bytes::{Bytes, BytesMut};
 use tokio::{
     io::{AsyncRead, AsyncReadExt},
@@ -9,9 +8,7 @@ use tokio::{
 use tokio_util::task::AbortOnDropHandle;
 use tracing::{error, instrument, warn};
 
-use super::{
-    Backend, FRAME_SIZE, MIN_PART_SIZE, S3UploadState, UploadedPart, channel_body::ChannelBody,
-};
+use super::{Backend, FRAME_SIZE, MIN_PART_SIZE, S3UploadState, UploadedPart};
 use crate::{
     oci::Digest,
     registry::{
@@ -23,7 +20,7 @@ use crate::{
 struct FlushContext<'a> {
     upload_path: &'a str,
     upload_id: &'a str,
-    part_number: i32,
+    part_number: u32,
     pending_path: &'a str,
     pending_size: u64,
     uploaded_size: u64,
@@ -50,8 +47,7 @@ impl Backend {
             ..
         }) = self.retrieve_cached_upload_state(name, uuid).await
         {
-            #[allow(clippy::cast_sign_loss)]
-            let uploaded: u64 = parts.iter().map(|p| p.size as u64).sum();
+            let uploaded: u64 = parts.iter().map(|p| p.size).sum();
             return Ok((id, parts, uploaded, pending_size));
         }
         let id = if let Some(id) = self.get_or_search_upload_id(&upload_path).await? {
@@ -62,8 +58,7 @@ impl Backend {
             id
         };
         let parts = self.store.list_parts(&upload_path, &id).await?;
-        #[allow(clippy::cast_sign_loss)]
-        let uploaded: u64 = parts.iter().map(|p| p.size as u64).sum();
+        let uploaded: u64 = parts.iter().map(|p| p.size).sum();
         let pending_path = path_builder::upload_patch_pending_path(name, uuid);
         let pending = self.store.object_size(&pending_path).await.unwrap_or(0);
         Ok((id, parts, uploaded, pending))
@@ -99,7 +94,6 @@ impl Backend {
         let mut hashing_reader = HashingReader::with_hasher(combined, hasher);
 
         let (tx, rx) = mpsc::channel::<Bytes>(32);
-        let body = ByteStream::from_body_1_x(ChannelBody { rx });
 
         let store = self.store.clone();
         let upload_path_owned = ctx.upload_path.to_string();
@@ -111,7 +105,7 @@ impl Backend {
                     &upload_id_owned,
                     ctx.part_number,
                     ctx.available,
-                    body,
+                    rx,
                 )
                 .await
         }));
@@ -193,8 +187,7 @@ impl Backend {
         let mut hashing_reader = HashingReader::with_hasher(stream, hasher);
         hashing_reader.read_to_end(&mut buf).await?;
 
-        #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-        let new_logical = ctx.uploaded_size + buf.len() as u64;
+        let new_logical = ctx.uploaded_size + u64::try_from(buf.len())?;
         self.store
             .put_object(ctx.pending_path, Bytes::from(buf))
             .await?;
@@ -219,8 +212,7 @@ impl Backend {
         let (upload_id, part_list, uploaded_size, pending_size) =
             self.resolve_nonuniform_state(name, uuid).await?;
 
-        #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-        let next_part_number = next_part_number(part_list.len());
+        let next_part_number = next_part_number(part_list.len())?;
 
         let pending_path = path_builder::upload_patch_pending_path(name, uuid);
         let available = pending_size + content_length;
@@ -279,8 +271,7 @@ impl Backend {
                 (None, Vec::new())
             };
 
-        #[allow(clippy::cast_sign_loss)]
-        let uploaded: u64 = parts.iter().map(|p| p.size as u64).sum();
+        let uploaded: u64 = parts.iter().map(|p| p.size).sum();
 
         let pending_path = path_builder::upload_patch_pending_path(name, uuid);
         let pending_size = self.store.object_size(&pending_path).await.unwrap_or(0);
@@ -308,30 +299,18 @@ impl Backend {
             .await?
             .ok_or(Error::UploadNotFound)?;
 
-        let part_list = if let Some(cached) = self.retrieve_cached_upload_state(name, uuid).await {
+        let mut parts = if let Some(cached) = self.retrieve_cached_upload_state(name, uuid).await {
             cached.parts
         } else {
             self.store.list_parts(&upload_path, &upload_id).await?
         };
-        #[allow(clippy::cast_sign_loss)]
-        let mut uploaded_size: u64 = part_list.iter().map(|p| p.size as u64).sum();
-
-        let mut parts: Vec<CompletedPart> = part_list
-            .into_iter()
-            .map(|p| {
-                CompletedPart::builder()
-                    .part_number(p.part_number)
-                    .e_tag(p.e_tag)
-                    .build()
-            })
-            .collect();
+        let mut uploaded_size: u64 = parts.iter().map(|p| p.size).sum();
 
         let pending_path = path_builder::upload_patch_pending_path(name, uuid);
         let pending_size = self.store.object_size(&pending_path).await.unwrap_or(0);
         if pending_size > 0 {
             let pending_data = self.store.get_object_body(&pending_path, None).await?;
-            #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-            let next_part = next_part_number(parts.len());
+            let next_part = next_part_number(parts.len())?;
             let e_tag = self
                 .store
                 .upload_part(
@@ -341,12 +320,11 @@ impl Backend {
                     Bytes::from(pending_data),
                 )
                 .await?;
-            parts.push(
-                CompletedPart::builder()
-                    .part_number(next_part)
-                    .e_tag(e_tag)
-                    .build(),
-            );
+            parts.push(UploadedPart {
+                part_number: next_part,
+                e_tag,
+                size: pending_size,
+            });
             uploaded_size += pending_size;
         }
 
@@ -355,7 +333,7 @@ impl Backend {
             .unwrap_or(self.load_hasher(name, uuid, uploaded_size).await?.digest());
 
         self.store
-            .complete_multipart_upload(&upload_path, &upload_id, parts)
+            .complete_multipart_upload(&upload_path, &upload_id, &parts)
             .await?;
 
         self.evict_upload_id(&upload_path).await;
@@ -379,10 +357,11 @@ fn should_flush_pending(pending_size: u64, content_length: u64, min_part_size: u
 }
 
 /// Returns the 1-based S3 part number for the next part to upload, given the
-/// number of parts already completed.
-#[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-fn next_part_number(completed_parts: usize) -> i32 {
-    (completed_parts + 1) as i32
+/// number of parts already completed. Errors only if `completed_parts + 1`
+/// overflows `u32` — practically unreachable since S3 caps part counts at
+/// `10_000`, but propagated cleanly to keep the call path panic-free.
+fn next_part_number(completed_parts: usize) -> Result<u32, Error> {
+    Ok(u32::try_from(completed_parts + 1)?)
 }
 
 #[cfg(test)]
@@ -428,16 +407,16 @@ mod tests {
 
     #[test]
     fn first_part_when_no_parts_uploaded() {
-        assert_eq!(next_part_number(0), 1);
+        assert_eq!(next_part_number(0).unwrap(), 1);
     }
 
     #[test]
     fn second_part_after_one_uploaded() {
-        assert_eq!(next_part_number(1), 2);
+        assert_eq!(next_part_number(1).unwrap(), 2);
     }
 
     #[test]
     fn part_number_increments_with_part_count() {
-        assert_eq!(next_part_number(9), 10);
+        assert_eq!(next_part_number(9).unwrap(), 10);
     }
 }
