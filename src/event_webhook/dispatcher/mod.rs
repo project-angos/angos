@@ -130,12 +130,6 @@ impl EventDispatcher {
         })
     }
 
-    #[cfg(test)]
-    pub async fn shutdown(&self) {
-        self.shutdown.store(true, Ordering::SeqCst);
-        self.drain_in_flight().await;
-    }
-
     pub async fn shutdown_with_timeout(&self, timeout: Duration) {
         self.shutdown.store(true, Ordering::SeqCst);
         if tokio::time::timeout(timeout, self.drain_in_flight())

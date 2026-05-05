@@ -20,6 +20,10 @@ use crate::{
     secret::Secret,
 };
 
+/// Generous timeout for test shutdowns — long enough that any legitimately
+/// in-flight delivery completes, short enough to fail fast on a deadlock.
+const TEST_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Wraps each `EventWebhookConfig` in an `Arc` so the map matches the
 /// signature of [`EventDispatcher::new`].
 fn into_arc_map(
@@ -842,7 +846,9 @@ async fn test_shutdown_completes_in_flight_async_delivery() {
     dispatcher.dispatch(&event).await.unwrap();
 
     // Immediately call shutdown — it must block until the in-flight delivery finishes
-    dispatcher.shutdown().await;
+    dispatcher
+        .shutdown_with_timeout(TEST_SHUTDOWN_TIMEOUT)
+        .await;
 
     // If shutdown drained the in-flight task, the server must have received the request
     let requests = server.received_requests().await.unwrap();
@@ -876,7 +882,9 @@ async fn test_shutdown_rejects_new_async_dispatches() {
     );
 
     let dispatcher = build_dispatcher(webhooks);
-    dispatcher.shutdown().await;
+    dispatcher
+        .shutdown_with_timeout(TEST_SHUTDOWN_TIMEOUT)
+        .await;
 
     // Dispatch after shutdown — delivery must be skipped
     let result = dispatcher.dispatch(&event).await;
@@ -900,7 +908,9 @@ async fn test_shutdown_with_no_in_flight_returns_immediately() {
     let dispatcher = build_dispatcher(webhooks);
 
     let start = std::time::Instant::now();
-    dispatcher.shutdown().await;
+    dispatcher
+        .shutdown_with_timeout(TEST_SHUTDOWN_TIMEOUT)
+        .await;
     let elapsed = start.elapsed();
 
     assert!(
@@ -946,7 +956,9 @@ async fn test_multiple_in_flight_async_deliveries_drain_on_shutdown() {
     dispatcher.dispatch(&event).await.unwrap();
 
     // shutdown() must drain all three concurrent in-flight deliveries
-    dispatcher.shutdown().await;
+    dispatcher
+        .shutdown_with_timeout(TEST_SHUTDOWN_TIMEOUT)
+        .await;
 
     for (label, server) in [
         ("server_a", &server_a),
@@ -1063,8 +1075,12 @@ async fn test_shutdown_is_idempotent() {
     dispatcher.dispatch(&event).await.unwrap();
 
     // Calling shutdown twice must not panic or deadlock
-    dispatcher.shutdown().await;
-    dispatcher.shutdown().await;
+    dispatcher
+        .shutdown_with_timeout(TEST_SHUTDOWN_TIMEOUT)
+        .await;
+    dispatcher
+        .shutdown_with_timeout(TEST_SHUTDOWN_TIMEOUT)
+        .await;
 }
 
 #[tokio::test]
@@ -1123,7 +1139,9 @@ async fn test_shutdown_drains_mix_of_fast_and_slow_deliveries() {
     dispatcher.dispatch(&event).await.unwrap();
 
     // shutdown() must drain both the fast and the slow delivery
-    dispatcher.shutdown().await;
+    dispatcher
+        .shutdown_with_timeout(TEST_SHUTDOWN_TIMEOUT)
+        .await;
 
     let fast_reqs = fast_server.received_requests().await.unwrap();
     let slow_reqs = slow_server.received_requests().await.unwrap();
