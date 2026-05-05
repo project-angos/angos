@@ -5,6 +5,7 @@ use tracing::{info, instrument};
 use super::Backend;
 use crate::registry::{
     blob_store::{Error, MultipartCleanup},
+    data_store::s3::MultipartUpload,
     path_builder,
 };
 
@@ -31,17 +32,15 @@ pub fn is_orphan(initiated: DateTime<Utc>, now: DateTime<Utc>, timeout: Duration
 impl Backend {
     async fn check_and_abort_orphan(
         &self,
-        key: &str,
-        upload_id: &str,
-        initiated: DateTime<Utc>,
+        upload: &MultipartUpload,
         now: DateTime<Utc>,
         timeout: Duration,
         dry_run: bool,
     ) -> Result<bool, Error> {
-        if !is_orphan(initiated, now, timeout) {
+        if !is_orphan(upload.initiated_at, now, timeout) {
             return Ok(false);
         }
-        let Some((namespace, uuid)) = parse_upload_key(key) else {
+        let Some((namespace, uuid)) = parse_upload_key(&upload.key) else {
             return Ok(false);
         };
         let startedat_path = path_builder::upload_start_date_path(namespace, uuid);
@@ -49,10 +48,15 @@ impl Backend {
             return Ok(false);
         }
         if dry_run {
-            info!("DRY RUN: would abort orphan multipart upload {key}");
+            info!(
+                "DRY RUN: would abort orphan multipart upload {}",
+                upload.key
+            );
         } else {
-            info!("Aborting orphan multipart upload {key}");
-            self.store.abort_multipart_upload(key, upload_id).await?;
+            info!("Aborting orphan multipart upload {}", upload.key);
+            self.store
+                .abort_multipart_upload(&upload.key, &upload.upload_id)
+                .await?;
         }
         Ok(true)
     }
@@ -77,9 +81,9 @@ impl MultipartCleanup for Backend {
                 .list_multipart_uploads(None, key_marker.as_deref(), upload_id_marker.as_deref())
                 .await?;
 
-            for (key, upload_id, initiated) in uploads {
+            for upload in uploads {
                 if self
-                    .check_and_abort_orphan(&key, &upload_id, initiated, now, timeout, dry_run)
+                    .check_and_abort_orphan(&upload, now, timeout, dry_run)
                     .await?
                 {
                     count += 1;

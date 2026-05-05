@@ -456,7 +456,7 @@ async fn test_cleanup_orphan_multipart_uploads_aborts_old_uploads() {
         .await
         .unwrap();
     assert!(
-        uploads_before.iter().any(|(k, _, _)| k == &upload_key),
+        uploads_before.iter().any(|u| u.key == upload_key),
         "orphan upload should appear in list before cleanup"
     );
 
@@ -477,7 +477,7 @@ async fn test_cleanup_orphan_multipart_uploads_aborts_old_uploads() {
         .await
         .unwrap();
     assert!(
-        !uploads_after.iter().any(|(k, _, _)| k == &upload_key),
+        !uploads_after.iter().any(|u| u.key == upload_key),
         "orphan upload must be gone from the list after cleanup"
     );
 }
@@ -512,7 +512,7 @@ async fn test_cleanup_orphan_multipart_uploads_dry_run_does_not_abort() {
         .await
         .unwrap();
     assert!(
-        uploads_after.iter().any(|(k, _, _)| k == &upload_key),
+        uploads_after.iter().any(|u| u.key == upload_key),
         "dry-run must not abort the upload; it must still appear in the listing"
     );
 
@@ -522,10 +522,12 @@ async fn test_cleanup_orphan_multipart_uploads_dry_run_does_not_abort() {
         .list_multipart_uploads(None, None, None)
         .await
         .unwrap();
-    for (k, id, _) in pending.into_iter().filter(|(k, _, _)| k == &upload_key) {
+    for upload in pending.into_iter().filter(|u| u.key == upload_key) {
         let store = backend.store.clone();
         tokio::spawn(async move {
-            let _ = store.abort_multipart_upload(&k, &id).await;
+            let _ = store
+                .abort_multipart_upload(&upload.key, &upload.upload_id)
+                .await;
         });
     }
 }

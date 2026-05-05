@@ -26,6 +26,14 @@ pub struct UploadedPart {
     pub size: u64,
 }
 
+/// Summary of a single in-progress multipart upload returned by [`Backend::list_multipart_uploads`].
+#[derive(Debug)]
+pub struct MultipartUpload {
+    pub key: String,
+    pub upload_id: String,
+    pub initiated_at: DateTime<Utc>,
+}
+
 impl Backend {
     pub async fn create_multipart_upload(&self, path: &str) -> Result<String, IoError> {
         let key = self.full_key(path);
@@ -195,14 +203,7 @@ impl Backend {
         prefix: Option<&str>,
         key_marker: Option<&str>,
         upload_id_marker: Option<&str>,
-    ) -> Result<
-        (
-            Vec<(String, String, DateTime<Utc>)>,
-            Option<String>,
-            Option<String>,
-        ),
-        IoError,
-    > {
+    ) -> Result<(Vec<MultipartUpload>, Option<String>, Option<String>), IoError> {
         let mut req = self.s3_client.list_multipart_uploads().bucket(&self.bucket);
 
         if let Some(prefix) = prefix {
@@ -233,7 +234,11 @@ impl Backend {
                 let initiated =
                     DateTime::from_timestamp(initiated.secs(), initiated.subsec_nanos())
                         .unwrap_or_else(Utc::now);
-                uploads.push((relative_key.to_string(), upload_id, initiated));
+                uploads.push(MultipartUpload {
+                    key: relative_key.to_string(),
+                    upload_id,
+                    initiated_at: initiated,
+                });
             }
         }
 
@@ -259,9 +264,9 @@ impl Backend {
                 )
                 .await?;
 
-            for (upload_key, upload_id, _initiated) in uploads {
-                if upload_key == path {
-                    return Ok(Some(upload_id));
+            for upload in uploads {
+                if upload.key == path {
+                    return Ok(Some(upload.upload_id));
                 }
             }
 
