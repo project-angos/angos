@@ -145,7 +145,7 @@ impl EventDispatcher {
         while in_flight.join_next().await.is_some() {}
     }
 
-    async fn spawn_async_delivery(
+    async fn send_async(
         &self,
         name: &str,
         endpoint: &WebhookEndpoint,
@@ -169,6 +169,32 @@ impl EventDispatcher {
         true
     }
 
+    async fn send_required(
+        &self,
+        name: &str,
+        endpoint: &WebhookEndpoint,
+        body: &[u8],
+        event_kind_header: &str,
+    ) -> Result<(), Error> {
+        let req = endpoint.build_request(body, event_kind_header);
+        send_and_record(&req, endpoint.config.max_retries, name)
+            .await
+            .map_err(|e| Error::Initialization(format!("Webhook '{name}' failed: {e}")))
+    }
+
+    async fn send_optional(
+        &self,
+        name: &str,
+        endpoint: &WebhookEndpoint,
+        body: &[u8],
+        event_kind_header: &str,
+    ) {
+        let req = endpoint.build_request(body, event_kind_header);
+        if let Err(e) = send_and_record(&req, endpoint.config.max_retries, name).await {
+            warn!("Optional webhook '{name}' failed: {e}");
+        }
+    }
+
     async fn deliver_for_endpoint(
         &self,
         name: &str,
@@ -177,36 +203,17 @@ impl EventDispatcher {
         event_kind_header: &str,
     ) -> Result<bool, Error> {
         match endpoint.config.policy {
-            DeliveryPolicy::Async => {
-                let spawned = self
-                    .spawn_async_delivery(name, endpoint, body, event_kind_header)
-                    .await;
-                Ok(spawned)
-            }
+            DeliveryPolicy::Async => Ok(self
+                .send_async(name, endpoint, body, event_kind_header)
+                .await),
             DeliveryPolicy::Required => {
-                let req = DeliveryRequest {
-                    client: &endpoint.client,
-                    url: endpoint.config.url.as_str(),
-                    token: endpoint.config.token.as_ref().map(|t| t.expose().as_str()),
-                    body,
-                    event_kind_header,
-                };
-                send_and_record(&req, endpoint.config.max_retries, name)
-                    .await
-                    .map_err(|e| Error::Initialization(format!("Webhook '{name}' failed: {e}")))?;
+                self.send_required(name, endpoint, body, event_kind_header)
+                    .await?;
                 Ok(true)
             }
             DeliveryPolicy::Optional => {
-                let req = DeliveryRequest {
-                    client: &endpoint.client,
-                    url: endpoint.config.url.as_str(),
-                    token: endpoint.config.token.as_ref().map(|t| t.expose().as_str()),
-                    body,
-                    event_kind_header,
-                };
-                if let Err(e) = send_and_record(&req, endpoint.config.max_retries, name).await {
-                    warn!("Optional webhook '{name}' failed: {e}");
-                }
+                self.send_optional(name, endpoint, body, event_kind_header)
+                    .await;
                 Ok(true)
             }
         }
