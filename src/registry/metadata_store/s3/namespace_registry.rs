@@ -83,9 +83,7 @@ impl Backend {
 
     pub async fn rebuild_namespace_registry(&self) -> Result<(), Error> {
         let repo_dir = path_builder::repository_dir();
-        let mut namespaces = Vec::new();
-        self.collect_namespaces(repo_dir, "", &mut namespaces)
-            .await?;
+        let mut namespaces = self.collect_namespaces(repo_dir, "").await?;
         namespaces.sort();
         namespaces.dedup();
 
@@ -132,40 +130,53 @@ impl Backend {
         self.coordinator.register_namespace(self, namespace).await
     }
 
-    pub async fn collect_namespaces(
+    async fn collect_namespaces(
         &self,
-        path: &str,
-        prefix: &str,
-        namespaces: &mut Vec<String>,
-    ) -> Result<(), Error> {
-        let mut continuation_token = None;
-        loop {
-            let (prefixes, _, next_token) = self
-                .store
-                .list_prefixes(path, "/", 1000, continuation_token, None)
-                .await?;
+        root_path: &str,
+        root_prefix: &str,
+    ) -> Result<Vec<String>, Error> {
+        // Children are pushed in reverse so that pop() yields them in original iteration order,
+        // preserving depth-first pre-order traversal.
+        let mut stack: Vec<(String, String)> =
+            vec![(root_path.to_string(), root_prefix.to_string())];
+        let mut namespaces = Vec::new();
 
-            for entry in &prefixes {
-                if entry.starts_with('_') {
-                    if entry == "_manifests" {
-                        let namespace = prefix.strip_suffix('/').unwrap_or(prefix);
-                        if !namespace.is_empty() {
-                            namespaces.push(namespace.to_string());
+        while let Some((path, prefix)) = stack.pop() {
+            let mut continuation_token = None;
+            loop {
+                let (prefixes, _, next_token) = self
+                    .store
+                    .list_prefixes(&path, "/", 1000, continuation_token, None)
+                    .await?;
+
+                let mut children = Vec::new();
+                for entry in &prefixes {
+                    if entry.starts_with('_') {
+                        if entry == "_manifests" {
+                            let namespace = prefix.strip_suffix('/').unwrap_or(&prefix);
+                            if !namespace.is_empty() {
+                                namespaces.push(namespace.to_string());
+                            }
                         }
+                        continue;
                     }
-                    continue;
+
+                    let child_path = format!("{path}/{entry}");
+                    let child_prefix = format!("{prefix}{entry}/");
+                    children.push((child_path, child_prefix));
                 }
 
-                let child_path = format!("{path}/{entry}");
-                let child_prefix = format!("{prefix}{entry}/");
-                Box::pin(self.collect_namespaces(&child_path, &child_prefix, namespaces)).await?;
-            }
+                for child in children.into_iter().rev() {
+                    stack.push(child);
+                }
 
-            continuation_token = next_token;
-            if continuation_token.is_none() {
-                break;
+                continuation_token = next_token;
+                if continuation_token.is_none() {
+                    break;
+                }
             }
         }
-        Ok(())
+
+        Ok(namespaces)
     }
 }
