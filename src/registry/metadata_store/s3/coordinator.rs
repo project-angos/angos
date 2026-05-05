@@ -15,8 +15,8 @@ use crate::{
             LockStrategy, ResolvedCreate, ResolvedDelete,
             link_kind::LinkKind,
             lock::{self, LockBackend, MemoryBackend, S3LockBackend},
-            lock_ops::{LockOps, ValidationResult},
-            simple_jitter,
+            lock_ops::LockOps,
+            simple_jitter, transaction,
         },
         path_builder,
     },
@@ -431,95 +431,7 @@ impl WriteCoordinator for LockCoordinator {
         namespace: &str,
         operations: &[LinkOperation],
     ) -> Result<(), Error> {
-        let mut update_retries = super::MAX_UPDATE_RETRIES;
-        loop {
-            let mut link_cache: HashMap<LinkKind, LinkMetadata> = HashMap::new();
-
-            let (creates, deletes, lock_keys) = backend
-                .prelock_resolve_operations(namespace, operations)
-                .await;
-
-            if creates.is_empty() && deletes.is_empty() {
-                return Ok(());
-            }
-
-            let guard = self.lock.acquire(&lock_keys).await?;
-
-            if backend
-                .validate_creates_under_lock(namespace, &creates, &mut link_cache)
-                .await
-                == ValidationResult::NeedsRetry
-            {
-                guard.release().await;
-                if update_retries == 0 {
-                    return Err(Error::Lock(
-                        "update_links exceeded maximum retries due to concurrent modifications"
-                            .into(),
-                    ));
-                }
-                update_retries -= 1;
-                continue;
-            }
-
-            if !guard.is_valid() {
-                guard.release().await;
-                return Err(Error::Lock("lock invalidated during operation".into()));
-            }
-
-            let (valid_deletes, delete_status) = backend
-                .validate_deletes_under_lock(namespace, deletes, &mut link_cache)
-                .await?;
-
-            if delete_status == ValidationResult::NeedsRetry {
-                guard.release().await;
-                if update_retries == 0 {
-                    return Err(Error::Lock(
-                        "update_links exceeded maximum retries due to concurrent modifications"
-                            .into(),
-                    ));
-                }
-                update_retries -= 1;
-                continue;
-            }
-
-            if !guard.is_valid() {
-                guard.release().await;
-                return Err(Error::Lock("lock invalidated during operation".into()));
-            }
-
-            let pending_blob_ops = backend
-                .apply_link_operations(namespace, &creates, &valid_deletes, &mut link_cache)
-                .await?;
-
-            if !guard.is_valid() {
-                guard.release().await;
-                return Err(Error::Lock("lock invalidated during operation".into()));
-            }
-
-            join_all(
-                pending_blob_ops
-                    .iter()
-                    .map(|(digest, ops)| backend.update_blob_index_shard(namespace, digest, ops)),
-            )
-            .await
-            .into_iter()
-            .collect::<Result<Vec<_>, _>>()?;
-
-            if !guard.is_valid() {
-                guard.release().await;
-                return Err(Error::Lock("lock invalidated during operation".into()));
-            }
-
-            guard.release().await;
-
-            if !creates.is_empty()
-                && let Err(e) = backend.register_namespace(namespace).await
-            {
-                warn!(namespace, error = %e, "Failed to register namespace");
-            }
-
-            return Ok(());
-        }
+        transaction::run_link_transaction(backend, &*self.lock, namespace, operations).await
     }
 
     #[instrument(name = "update_blob_index_locked", skip(self, backend))]

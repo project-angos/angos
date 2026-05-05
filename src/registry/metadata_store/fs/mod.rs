@@ -14,8 +14,9 @@ use crate::{
             LockStrategy, MetadataStore,
             link_kind::LinkKind,
             lock::{self, LockBackend, MemoryBackend},
-            lock_ops::{LockOps, ValidationResult},
+            lock_ops::LockOps,
             referrer_resolver::resolve_referrer_descriptor,
+            transaction,
         },
         pagination, path_builder,
     },
@@ -80,8 +81,6 @@ pub struct Backend {
     store: data_store::fs::Backend,
     lock: Arc<dyn LockBackend + Send + Sync>,
 }
-
-const MAX_UPDATE_RETRIES: u32 = 10;
 
 impl Backend {
     pub fn new(config: &BackendConfig) -> Result<Self, Error> {
@@ -347,93 +346,7 @@ impl MetadataStore for Backend {
         namespace: &str,
         operations: &[LinkOperation],
     ) -> Result<(), Error> {
-        if operations.is_empty() {
-            return Ok(());
-        }
-
-        let mut update_retries = MAX_UPDATE_RETRIES;
-        loop {
-            let mut link_cache: HashMap<LinkKind, LinkMetadata> = HashMap::new();
-
-            let (creates, deletes, lock_keys) =
-                self.prelock_resolve_operations(namespace, operations).await;
-
-            if creates.is_empty() && deletes.is_empty() {
-                return Ok(());
-            }
-
-            let guard = self.lock.acquire(&lock_keys).await?;
-
-            if self
-                .validate_creates_under_lock(namespace, &creates, &mut link_cache)
-                .await
-                == ValidationResult::NeedsRetry
-            {
-                guard.release().await;
-                if update_retries == 0 {
-                    return Err(Error::Lock(
-                        "update_links exceeded maximum retries due to concurrent modifications"
-                            .into(),
-                    ));
-                }
-                update_retries -= 1;
-                continue;
-            }
-
-            if !guard.is_valid() {
-                guard.release().await;
-                return Err(Error::Lock("lock invalidated during operation".into()));
-            }
-
-            let (valid_deletes, delete_status) = self
-                .validate_deletes_under_lock(namespace, deletes, &mut link_cache)
-                .await?;
-
-            if delete_status == ValidationResult::NeedsRetry {
-                guard.release().await;
-                if update_retries == 0 {
-                    return Err(Error::Lock(
-                        "update_links exceeded maximum retries due to concurrent modifications"
-                            .into(),
-                    ));
-                }
-                update_retries -= 1;
-                continue;
-            }
-
-            if !guard.is_valid() {
-                guard.release().await;
-                return Err(Error::Lock("lock invalidated during operation".into()));
-            }
-
-            let pending_blob_ops = self
-                .apply_link_operations(namespace, &creates, &valid_deletes, &mut link_cache)
-                .await?;
-
-            if !guard.is_valid() {
-                guard.release().await;
-                return Err(Error::Lock("lock invalidated during operation".into()));
-            }
-
-            // Blob index updates for different digests are independent (each digest has its
-            // own file). Updates for the same digest within this call are grouped by the
-            // pending_blob_ops HashMap. Cross-call updates to the same digest are serialized
-            // by the `blob:{digest}` lock key acquired above.
-            for (digest, ops) in &pending_blob_ops {
-                for op in ops {
-                    self.update_blob_index(namespace, digest, op.clone())
-                        .await?;
-                }
-            }
-
-            if !guard.is_valid() {
-                guard.release().await;
-                return Err(Error::Lock("lock invalidated during operation".into()));
-            }
-
-            guard.release().await;
-            return Ok(());
-        }
+        transaction::run_link_transaction(self, &*self.lock, namespace, operations).await
     }
 }
 
@@ -471,5 +384,26 @@ impl LockOps for Backend {
 
     fn lock_key_for_link(_namespace: &str, link: &LinkKind) -> String {
         link.to_string()
+    }
+
+    /// Applies blob-index operations sequentially.
+    ///
+    /// Blob index updates for different digests are independent (each digest
+    /// has its own file). Updates for the same digest within this call are
+    /// grouped by the `pending_blob_ops` `HashMap`. Cross-call updates to the
+    /// same digest are serialized by the `blob:{digest}` lock key acquired
+    /// before this method is called.
+    async fn apply_pending_blob_index_ops(
+        &self,
+        namespace: &str,
+        pending_blob_ops: HashMap<Digest, Vec<BlobIndexOperation>>,
+    ) -> Result<(), Error> {
+        for (digest, ops) in &pending_blob_ops {
+            for op in ops {
+                self.update_blob_index(namespace, digest, op.clone())
+                    .await?;
+            }
+        }
+        Ok(())
     }
 }

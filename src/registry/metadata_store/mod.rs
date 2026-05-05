@@ -19,6 +19,7 @@ mod lock;
 pub mod lock_ops;
 pub mod referrer_resolver;
 pub mod s3;
+pub mod transaction;
 
 #[cfg(test)]
 mod tests;

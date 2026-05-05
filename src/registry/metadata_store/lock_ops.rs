@@ -154,6 +154,10 @@ pub fn build_delete_ops(
 /// - `lock_key_for_link`: how a link name is formatted as a distributed-lock
 ///   key (FS uses bare `link.to_string()`, S3 prefixes with `{namespace}:`).
 /// - `cache_put` / `cache_invalidate`: cache integration (no-op default for FS).
+/// - `apply_pending_blob_index_ops`: how accumulated blob-index operations are
+///   flushed after `apply_link_operations` completes.
+/// - `after_update`: optional hook called after a successful transaction; S3
+///   uses this to register the namespace, FS does nothing.
 ///
 /// The shared pre-lock / under-lock / apply helpers are provided as default
 /// methods so each backend only needs to implement the storage primitives.
@@ -183,6 +187,26 @@ pub trait LockOps: Send + Sync {
     fn lock_key_for_link(namespace: &str, link: &LinkKind) -> String
     where
         Self: Sized;
+
+    /// Apply the accumulated blob-index operations after `apply_link_operations`
+    /// completes and before the distributed lock is released.
+    ///
+    /// FS performs per-operation sequential writes; S3 (lock coordinator)
+    /// performs per-digest concurrent updates via `update_blob_index_shard`.
+    async fn apply_pending_blob_index_ops(
+        &self,
+        namespace: &str,
+        pending_blob_ops: HashMap<Digest, Vec<BlobIndexOperation>>,
+    ) -> Result<(), Error>;
+
+    /// Hook called after a successful transaction, outside the lock.
+    ///
+    /// S3 uses this to register the namespace in the namespace registry when
+    /// creates were part of the transaction. FS does nothing. The default
+    /// implementation is a no-op that always returns `Ok(())`.
+    async fn after_update(&self, _namespace: &str, _had_creates: bool) -> Result<(), Error> {
+        Ok(())
+    }
 
     /// Store `metadata` in the link cache. No-op by default (FS has no cache).
     async fn cache_put(&self, _namespace: &str, _link: &LinkKind, _metadata: &LinkMetadata) {}
