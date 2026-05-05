@@ -1,4 +1,4 @@
-use std::{any::Any, fmt::Debug};
+use std::fmt::Debug;
 
 use async_trait::async_trait;
 use serde::{Serialize, de::DeserializeOwned};
@@ -14,7 +14,7 @@ pub use error::Error;
 
 /// Trait for cache implementations that can store and retrieve values with a given TTL
 #[async_trait]
-pub trait Cache: Any + Debug + Send + Sync {
+pub trait Cache: Debug + Send + Sync {
     /// Store a value with a given TTL in the cache
     async fn store_value(&self, key: &str, value: &str, expires_in: u64) -> Result<(), Error>;
 
