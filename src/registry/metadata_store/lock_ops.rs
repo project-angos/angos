@@ -18,32 +18,46 @@ pub enum ValidationResult {
     NeedsRetry,
 }
 
-/// Return type of [`build_create_ops`].
-type CreateOpsResult = (
-    HashMap<Digest, Vec<BlobIndexOperation>>,
-    Vec<(LinkKind, LinkMetadata)>,
-    Vec<(LinkKind, LinkMetadata)>,
-);
+/// Plan emitted by [`build_create_ops`].
+///
+/// Categorises the work for a batch of creates into the link-write lists each
+/// backend will issue and the blob-index operations the engine must apply.
+#[derive(Debug, Default)]
+pub struct CreateOpsPlan {
+    /// Pending blob-index operations keyed by target digest.
+    pub pending_blob_ops: HashMap<Digest, Vec<BlobIndexOperation>>,
+    /// Link writes for tracked links (referrer-aware metadata).
+    pub tracked_writes: Vec<(LinkKind, LinkMetadata)>,
+    /// Link writes for non-tracked links (plain target metadata).
+    pub non_tracked_writes: Vec<(LinkKind, LinkMetadata)>,
+}
 
-/// Return type of [`build_delete_ops`].
-type DeleteOpsResult = (
-    HashMap<Digest, Vec<BlobIndexOperation>>,
-    Vec<(LinkKind, LinkMetadata)>,
-    Vec<LinkKind>,
-    Vec<LinkKind>,
-);
+/// Plan emitted by [`build_delete_ops`].
+///
+/// Categorises the work for a batch of deletes into the link-write/remove
+/// lists each backend will issue and the blob-index operations the engine
+/// must apply.
+#[derive(Debug, Default)]
+pub struct DeleteOpsPlan {
+    /// Pending blob-index operations keyed by target digest.
+    pub pending_blob_ops: HashMap<Digest, Vec<BlobIndexOperation>>,
+    /// Link writes for tracked links whose metadata still has remaining
+    /// referrers after the delete (the entry survives, just with one fewer
+    /// referrer).
+    pub tracked_writes: Vec<(LinkKind, LinkMetadata)>,
+    /// Tracked links to fully remove (last referrer was dropped).
+    pub tracked_removes: Vec<LinkKind>,
+    /// Non-tracked links to remove unconditionally.
+    pub non_tracked_links: Vec<LinkKind>,
+}
 
 /// Pure data transform: resolves blob index operations and categorises link
 /// writes for a set of create operations.
-///
-/// Returns `(pending_blob_ops, tracked_create_writes, non_tracked_create_writes)`.
 pub fn build_create_ops(
     creates: &[ResolvedCreate],
     link_cache: &mut HashMap<LinkKind, LinkMetadata>,
-) -> CreateOpsResult {
-    let mut pending_blob_ops: HashMap<Digest, Vec<BlobIndexOperation>> = HashMap::new();
-    let mut tracked_create_writes: Vec<(LinkKind, LinkMetadata)> = Vec::new();
-    let mut non_tracked_create_writes: Vec<(LinkKind, LinkMetadata)> = Vec::new();
+) -> CreateOpsPlan {
+    let mut plan = CreateOpsPlan::default();
 
     for op in creates {
         if op.link.is_tracked() && op.referrer.is_some() {
@@ -58,32 +72,32 @@ pub fn build_create_ops(
             }
 
             if op.old_target.is_none() {
-                pending_blob_ops
+                plan.pending_blob_ops
                     .entry(op.target.clone())
                     .or_default()
                     .push(BlobIndexOperation::Insert(op.link.clone()));
             }
 
-            tracked_create_writes.push((op.link.clone(), metadata));
+            plan.tracked_writes.push((op.link.clone(), metadata));
         } else {
             // Only update the blob index when the target actually changes: skip
             // the insert when re-pushing the same link to the same digest.
             if op.old_target.as_ref() != Some(&op.target) {
-                pending_blob_ops
+                plan.pending_blob_ops
                     .entry(op.target.clone())
                     .or_default()
                     .push(BlobIndexOperation::Insert(op.link.clone()));
                 if let Some(old) = &op.old_target
                     && *old != op.target
                 {
-                    pending_blob_ops
+                    plan.pending_blob_ops
                         .entry(old.clone())
                         .or_default()
                         .push(BlobIndexOperation::Remove(op.link.clone()));
                 }
             }
 
-            non_tracked_create_writes.push((
+            plan.non_tracked_writes.push((
                 op.link.clone(),
                 LinkMetadata::from_digest(op.target.clone())
                     .with_media_type(op.media_type.clone())
@@ -92,25 +106,20 @@ pub fn build_create_ops(
         }
     }
 
-    (
-        pending_blob_ops,
-        tracked_create_writes,
-        non_tracked_create_writes,
-    )
+    plan
 }
 
 /// Pure data transform: resolves blob index operations and categorises link
 /// writes/deletes for a set of delete operations.
-///
-/// Returns `(pending_blob_ops, tracked_delete_writes, tracked_delete_removes, non_tracked_delete_links)`.
 pub fn build_delete_ops(
     deletes: &[ResolvedDelete],
     link_cache: &mut HashMap<LinkKind, LinkMetadata>,
-    mut pending_blob_ops: HashMap<Digest, Vec<BlobIndexOperation>>,
-) -> DeleteOpsResult {
-    let mut tracked_delete_writes: Vec<(LinkKind, LinkMetadata)> = Vec::new();
-    let mut tracked_delete_removes: Vec<LinkKind> = Vec::new();
-    let mut non_tracked_delete_links: Vec<LinkKind> = Vec::new();
+    pending_blob_ops: HashMap<Digest, Vec<BlobIndexOperation>>,
+) -> DeleteOpsPlan {
+    let mut plan = DeleteOpsPlan {
+        pending_blob_ops,
+        ..DeleteOpsPlan::default()
+    };
 
     for op in deletes {
         if op.link.is_tracked() && op.referrer.is_some() {
@@ -120,30 +129,25 @@ pub fn build_delete_ops(
                 }
 
                 if metadata.has_references() {
-                    tracked_delete_writes.push((op.link.clone(), metadata));
+                    plan.tracked_writes.push((op.link.clone(), metadata));
                 } else {
-                    tracked_delete_removes.push(op.link.clone());
-                    pending_blob_ops
+                    plan.tracked_removes.push(op.link.clone());
+                    plan.pending_blob_ops
                         .entry(op.target.clone())
                         .or_default()
                         .push(BlobIndexOperation::Remove(op.link.clone()));
                 }
             }
         } else {
-            non_tracked_delete_links.push(op.link.clone());
-            pending_blob_ops
+            plan.non_tracked_links.push(op.link.clone());
+            plan.pending_blob_ops
                 .entry(op.target.clone())
                 .or_default()
                 .push(BlobIndexOperation::Remove(op.link.clone()));
         }
     }
 
-    (
-        pending_blob_ops,
-        tracked_delete_writes,
-        tracked_delete_removes,
-        non_tracked_delete_links,
-    )
+    plan
 }
 
 /// Abstracts the hook points that differ between FS and S3 backends:
@@ -393,13 +397,13 @@ pub trait LockOps: Send + Sync {
     where
         Self: Sized,
     {
-        let (pending_blob_ops, tracked_create_writes, non_tracked_create_writes) =
-            build_create_ops(creates, link_cache);
+        let create_plan = build_create_ops(creates, link_cache);
 
         join_all(
-            tracked_create_writes
+            create_plan
+                .tracked_writes
                 .iter()
-                .chain(non_tracked_create_writes.iter())
+                .chain(create_plan.non_tracked_writes.iter())
                 .map(|(link, metadata)| async move {
                     self.write_link_reference(namespace, link, metadata).await
                 }),
@@ -408,15 +412,11 @@ pub trait LockOps: Send + Sync {
         .into_iter()
         .collect::<Result<Vec<_>, _>>()?;
 
-        let (
-            pending_blob_ops,
-            tracked_delete_writes,
-            tracked_delete_removes,
-            non_tracked_delete_links,
-        ) = build_delete_ops(deletes, link_cache, pending_blob_ops);
+        let delete_plan = build_delete_ops(deletes, link_cache, create_plan.pending_blob_ops);
 
         join_all(
-            tracked_delete_writes
+            delete_plan
+                .tracked_writes
                 .iter()
                 .map(|(link, metadata)| {
                     let fut: Pin<Box<dyn Future<Output = Result<(), Error>> + Send + '_>> =
@@ -424,9 +424,10 @@ pub trait LockOps: Send + Sync {
                     fut
                 })
                 .chain(
-                    tracked_delete_removes
+                    delete_plan
+                        .tracked_removes
                         .iter()
-                        .chain(non_tracked_delete_links.iter())
+                        .chain(delete_plan.non_tracked_links.iter())
                         .map(|link| {
                             let fut: Pin<Box<dyn Future<Output = Result<(), Error>> + Send + '_>> =
                                 Box::pin(self.delete_link_reference(namespace, link));
@@ -438,21 +439,23 @@ pub trait LockOps: Send + Sync {
         .into_iter()
         .collect::<Result<Vec<_>, _>>()?;
 
-        for (link, metadata) in tracked_create_writes
+        for (link, metadata) in create_plan
+            .tracked_writes
             .iter()
-            .chain(non_tracked_create_writes.iter())
-            .chain(tracked_delete_writes.iter())
+            .chain(create_plan.non_tracked_writes.iter())
+            .chain(delete_plan.tracked_writes.iter())
         {
             self.cache_put(namespace, link, metadata).await;
         }
-        for link in tracked_delete_removes
+        for link in delete_plan
+            .tracked_removes
             .iter()
-            .chain(non_tracked_delete_links.iter())
+            .chain(delete_plan.non_tracked_links.iter())
         {
             self.cache_invalidate(namespace, link).await;
         }
 
-        Ok(pending_blob_ops)
+        Ok(delete_plan.pending_blob_ops)
     }
 }
 
@@ -751,11 +754,11 @@ mod tests {
     #[test]
     fn build_create_ops_empty_returns_all_empty() {
         let mut cache: HashMap<LinkKind, LinkMetadata> = HashMap::new();
-        let (blob_ops, tracked, non_tracked) = build_create_ops(&[], &mut cache);
+        let plan = build_create_ops(&[], &mut cache);
 
-        assert!(blob_ops.is_empty());
-        assert!(tracked.is_empty());
-        assert!(non_tracked.is_empty());
+        assert!(plan.pending_blob_ops.is_empty());
+        assert!(plan.tracked_writes.is_empty());
+        assert!(plan.non_tracked_writes.is_empty());
         assert!(cache.is_empty(), "cache must remain untouched");
     }
 
@@ -777,19 +780,19 @@ mod tests {
         }];
         let mut cache: HashMap<LinkKind, LinkMetadata> = HashMap::new();
 
-        let (blob_ops, tracked, non_tracked) = build_create_ops(&creates, &mut cache);
+        let plan = build_create_ops(&creates, &mut cache);
 
-        assert_eq!(tracked.len(), 1, "one tracked write expected");
-        assert!(non_tracked.is_empty());
+        assert_eq!(plan.tracked_writes.len(), 1, "one plan.tracked_writes write expected");
+        assert!(plan.non_tracked_writes.is_empty());
 
-        let (written_link, written_meta) = &tracked[0];
+        let (written_link, written_meta) = &plan.tracked_writes[0];
         assert_eq!(written_link, &link);
         assert!(
             written_meta.referenced_by.contains(&referrer),
             "referrer must appear in referenced_by"
         );
 
-        let ops = blob_ops.get(&target).expect("blob ops for target expected");
+        let ops = plan.pending_blob_ops.get(&target).expect("blob ops for target expected");
         assert_eq!(ops.len(), 1);
         assert!(is_insert(&ops[0], &link));
     }
@@ -811,16 +814,16 @@ mod tests {
         }];
         let mut cache: HashMap<LinkKind, LinkMetadata> = HashMap::new();
 
-        let (blob_ops, tracked, non_tracked) = build_create_ops(&creates, &mut cache);
+        let plan = build_create_ops(&creates, &mut cache);
 
-        assert_eq!(tracked.len(), 1);
-        assert!(non_tracked.is_empty());
+        assert_eq!(plan.tracked_writes.len(), 1);
+        assert!(plan.non_tracked_writes.is_empty());
         assert!(
-            blob_ops.is_empty(),
-            "no blob ops when old_target equals new target on tracked path"
+            plan.pending_blob_ops.is_empty(),
+            "no blob ops when old_target equals new target on plan.tracked_writes path"
         );
 
-        let (_, written_meta) = &tracked[0];
+        let (_, written_meta) = &plan.tracked_writes[0];
         assert!(written_meta.referenced_by.contains(&referrer));
     }
 
@@ -840,13 +843,13 @@ mod tests {
         }];
         let mut cache: HashMap<LinkKind, LinkMetadata> = HashMap::new();
 
-        let (blob_ops, tracked, non_tracked) = build_create_ops(&creates, &mut cache);
+        let plan = build_create_ops(&creates, &mut cache);
 
-        assert!(tracked.is_empty());
-        assert_eq!(non_tracked.len(), 1);
-        assert_eq!(non_tracked[0].0, link);
+        assert!(plan.tracked_writes.is_empty());
+        assert_eq!(plan.non_tracked_writes.len(), 1);
+        assert_eq!(plan.non_tracked_writes[0].0, link);
 
-        let ops = blob_ops.get(&target).expect("blob ops for target expected");
+        let ops = plan.pending_blob_ops.get(&target).expect("blob ops for target expected");
         assert_eq!(ops.len(), 1);
         assert!(is_insert(&ops[0], &link));
     }
@@ -868,18 +871,18 @@ mod tests {
         }];
         let mut cache: HashMap<LinkKind, LinkMetadata> = HashMap::new();
 
-        let (blob_ops, tracked, non_tracked) = build_create_ops(&creates, &mut cache);
+        let plan = build_create_ops(&creates, &mut cache);
 
-        assert!(tracked.is_empty());
-        assert_eq!(non_tracked.len(), 1);
+        assert!(plan.tracked_writes.is_empty());
+        assert_eq!(plan.non_tracked_writes.len(), 1);
 
-        let new_ops = blob_ops
+        let new_ops = plan.pending_blob_ops
             .get(&new_target)
             .expect("blob ops for new target expected");
         assert_eq!(new_ops.len(), 1);
         assert!(is_insert(&new_ops[0], &link));
 
-        let old_ops = blob_ops
+        let old_ops = plan.pending_blob_ops
             .get(&old_target)
             .expect("blob ops for old target expected");
         assert_eq!(old_ops.len(), 1);
@@ -903,13 +906,13 @@ mod tests {
         }];
         let mut cache: HashMap<LinkKind, LinkMetadata> = HashMap::new();
 
-        let (blob_ops, tracked, non_tracked) = build_create_ops(&creates, &mut cache);
+        let plan = build_create_ops(&creates, &mut cache);
 
-        assert!(tracked.is_empty());
-        assert_eq!(non_tracked.len(), 1, "link metadata is still written");
+        assert!(plan.tracked_writes.is_empty());
+        assert_eq!(plan.non_tracked_writes.len(), 1, "link metadata is still written");
         assert!(
-            blob_ops.is_empty(),
-            "no blob ops when old_target equals new target on non-tracked path"
+            plan.pending_blob_ops.is_empty(),
+            "no blob ops when old_target equals new target on non-plan.tracked_writes path"
         );
     }
 
@@ -936,12 +939,12 @@ mod tests {
             descriptor: None,
         }];
 
-        let (blob_ops, tracked, non_tracked) = build_create_ops(&creates, &mut cache);
+        let plan = build_create_ops(&creates, &mut cache);
 
-        assert!(non_tracked.is_empty());
-        assert_eq!(tracked.len(), 1);
+        assert!(plan.non_tracked_writes.is_empty());
+        assert_eq!(plan.tracked_writes.len(), 1);
 
-        let (_, written_meta) = &tracked[0];
+        let (_, written_meta) = &plan.tracked_writes[0];
         assert!(
             written_meta.referenced_by.contains(&existing_referrer),
             "existing referrer must be preserved from cache"
@@ -956,7 +959,7 @@ mod tests {
             "cache entry must be consumed by build_create_ops"
         );
 
-        assert!(blob_ops.is_empty());
+        assert!(plan.pending_blob_ops.is_empty());
     }
 
     // =========================================================================
@@ -976,17 +979,16 @@ mod tests {
 
         let mut cache: HashMap<LinkKind, LinkMetadata> = HashMap::new();
 
-        let (blob_ops, tracked_writes, tracked_removes, non_tracked) =
-            build_delete_ops(&[], &mut cache, input_ops);
+        let dplan = build_delete_ops(&[], &mut cache, input_ops);
 
-        assert_eq!(blob_ops.len(), 1, "pre-existing blob op must be preserved");
-        let ops = blob_ops.get(&target).unwrap();
+        assert_eq!(dplan.pending_blob_ops.len(), 1, "pre-existing blob op must be preserved");
+        let ops = dplan.pending_blob_ops.get(&target).unwrap();
         assert_eq!(ops.len(), 1);
         assert!(is_insert(&ops[0], &link));
 
-        assert!(tracked_writes.is_empty());
-        assert!(tracked_removes.is_empty());
-        assert!(non_tracked.is_empty());
+        assert!(dplan.tracked_writes.is_empty());
+        assert!(dplan.tracked_removes.is_empty());
+        assert!(dplan.non_tracked_links.is_empty());
     }
 
     #[test]
@@ -1010,15 +1012,14 @@ mod tests {
             referrer: Some(referrer_a.clone()),
         }];
 
-        let (blob_ops, tracked_writes, tracked_removes, non_tracked) =
-            build_delete_ops(&deletes, &mut cache, HashMap::new());
+        let dplan = build_delete_ops(&deletes, &mut cache, HashMap::new());
 
-        assert_eq!(tracked_writes.len(), 1, "must write updated metadata");
-        assert!(tracked_removes.is_empty(), "link must not be removed yet");
-        assert!(non_tracked.is_empty());
-        assert!(blob_ops.is_empty(), "no blob Remove when referrer remains");
+        assert_eq!(dplan.tracked_writes.len(), 1, "must write updated metadata");
+        assert!(dplan.tracked_removes.is_empty(), "link must not be removed yet");
+        assert!(dplan.non_tracked_links.is_empty());
+        assert!(dplan.pending_blob_ops.is_empty(), "no blob Remove when referrer remains");
 
-        let (written_link, written_meta) = &tracked_writes[0];
+        let (written_link, written_meta) = &dplan.tracked_writes[0];
         assert_eq!(written_link, &link);
         assert!(
             !written_meta.referenced_by.contains(&referrer_a),
@@ -1049,18 +1050,17 @@ mod tests {
             referrer: Some(referrer.clone()),
         }];
 
-        let (blob_ops, tracked_writes, tracked_removes, non_tracked) =
-            build_delete_ops(&deletes, &mut cache, HashMap::new());
+        let dplan = build_delete_ops(&deletes, &mut cache, HashMap::new());
 
         assert!(
-            tracked_writes.is_empty(),
+            dplan.tracked_writes.is_empty(),
             "no partial write when last referrer removed"
         );
-        assert_eq!(tracked_removes.len(), 1);
-        assert_eq!(tracked_removes[0], link);
-        assert!(non_tracked.is_empty());
+        assert_eq!(dplan.tracked_removes.len(), 1);
+        assert_eq!(dplan.tracked_removes[0], link);
+        assert!(dplan.non_tracked_links.is_empty());
 
-        let ops = blob_ops.get(&target).expect("blob Remove expected");
+        let ops = dplan.pending_blob_ops.get(&target).expect("blob Remove expected");
         assert_eq!(ops.len(), 1);
         assert!(is_remove(&ops[0], &link));
     }
@@ -1079,13 +1079,12 @@ mod tests {
             referrer: Some(digest("2002")),
         }];
 
-        let (blob_ops, tracked_writes, tracked_removes, non_tracked) =
-            build_delete_ops(&deletes, &mut cache, HashMap::new());
+        let dplan = build_delete_ops(&deletes, &mut cache, HashMap::new());
 
-        assert!(blob_ops.is_empty());
-        assert!(tracked_writes.is_empty());
-        assert!(tracked_removes.is_empty());
-        assert!(non_tracked.is_empty());
+        assert!(dplan.pending_blob_ops.is_empty());
+        assert!(dplan.tracked_writes.is_empty());
+        assert!(dplan.tracked_removes.is_empty());
+        assert!(dplan.non_tracked_links.is_empty());
     }
 
     #[test]
@@ -1103,15 +1102,14 @@ mod tests {
             referrer: None,
         }];
 
-        let (blob_ops, tracked_writes, tracked_removes, non_tracked) =
-            build_delete_ops(&deletes, &mut cache, HashMap::new());
+        let dplan = build_delete_ops(&deletes, &mut cache, HashMap::new());
 
-        assert!(tracked_writes.is_empty());
-        assert!(tracked_removes.is_empty());
-        assert_eq!(non_tracked.len(), 1);
-        assert_eq!(non_tracked[0], link);
+        assert!(dplan.tracked_writes.is_empty());
+        assert!(dplan.tracked_removes.is_empty());
+        assert_eq!(dplan.non_tracked_links.len(), 1);
+        assert_eq!(dplan.non_tracked_links[0], link);
 
-        let ops = blob_ops.get(&target).expect("blob Remove expected");
+        let ops = dplan.pending_blob_ops.get(&target).expect("blob Remove expected");
         assert_eq!(ops.len(), 1);
         assert!(is_remove(&ops[0], &link));
     }
@@ -1138,15 +1136,15 @@ mod tests {
             referrer: None,
         }];
 
-        let (blob_ops, _, _, _) = build_delete_ops(&deletes, &mut cache, prior_ops);
+        let dplan = build_delete_ops(&deletes, &mut cache, prior_ops);
 
-        let pre_ops = blob_ops
+        let pre_ops = dplan.pending_blob_ops
             .get(&pre_target)
             .expect("pre-existing blob op must survive");
         assert_eq!(pre_ops.len(), 1);
         assert!(is_insert(&pre_ops[0], &pre_link));
 
-        let del_ops = blob_ops
+        let del_ops = dplan.pending_blob_ops
             .get(&del_target)
             .expect("new blob Remove must be added");
         assert_eq!(del_ops.len(), 1);
