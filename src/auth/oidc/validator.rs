@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use jsonwebtoken::{Validation, decode, decode_header};
+use jsonwebtoken::{Algorithm, Validation, decode, decode_header};
 use reqwest::{Client, header::ACCEPT};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use tracing::{debug, info, warn};
@@ -67,16 +67,7 @@ fn verify_jwt(
 
     let decoding_key = jwk.to_decoding_key()?;
 
-    let mut validation = Validation::new(header.alg);
-    validation.set_issuer(&[provider.issuer()]);
-    if let Some(aud) = provider.required_audience() {
-        validation.set_audience(&[aud]);
-    } else {
-        validation.validate_aud = false;
-    }
-    validation.leeway = provider.clock_skew_tolerance();
-    validation.validate_exp = true;
-    validation.validate_nbf = true;
+    let validation = build_validation(provider, header.alg);
 
     debug!(
         "Validation settings: issuer={:?}, audience={:?}, leeway={}, validate_exp={}, validate_nbf={}, algorithms={:?}",
@@ -104,6 +95,20 @@ fn verify_jwt(
         provider_type: provider.name().to_string(),
         claims: token_data.claims,
     })
+}
+
+fn build_validation(provider: &dyn OidcProvider, alg: Algorithm) -> Validation {
+    let mut validation = Validation::new(alg);
+    validation.set_issuer(&[provider.issuer()]);
+    if let Some(aud) = provider.required_audience() {
+        validation.set_audience(&[aud]);
+    } else {
+        validation.validate_aud = false;
+    }
+    validation.leeway = provider.clock_skew_tolerance();
+    validation.validate_exp = true;
+    validation.validate_nbf = true;
+    validation
 }
 
 async fn query_json<T>(client: &Client, url: &str) -> Result<T, Error>
