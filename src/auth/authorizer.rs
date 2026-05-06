@@ -9,7 +9,7 @@ use crate::{
     command::server::Error,
     configuration::{Configuration, RegexPattern},
     identity::{Action, ClientIdentity},
-    oci::{Namespace, Reference, namespace_belongs_to},
+    oci::{Namespace, Reference},
     policy::AccessMode,
     registry::{AccessPolicy, Registry},
 };
@@ -182,13 +182,13 @@ impl Authorizer {
         !is_immutable || is_excluded
     }
 
-    pub fn is_tag_immutable(&self, namespace: &str, tag: &str) -> bool {
-        let auth_repo = self
-            .repositories
-            .iter()
-            .find(|(name, _)| namespace_belongs_to(namespace, name));
+    pub fn is_tag_immutable(&self, registry: &Registry, namespace: &Namespace, tag: &str) -> bool {
+        let auth_repo = registry
+            .get_repository_for_namespace(namespace)
+            .ok()
+            .and_then(|repo| self.repositories.get(&repo.name));
 
-        if let Some((_, auth_repo)) = auth_repo {
+        if let Some(auth_repo) = auth_repo {
             !self.is_tag_mutable(auth_repo, tag)
         } else {
             self.global_immutable_tags
@@ -471,8 +471,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_is_tag_immutable_with_global_setting() {
+    #[tokio::test]
+    async fn test_is_tag_immutable_with_global_setting() {
         let toml = r#"
             [blob_store.fs]
             root_dir = "/tmp/test"
@@ -495,12 +495,14 @@ mod tests {
         let config = Configuration::load_from_str(toml).unwrap();
         let cache = cache::Config::Memory.to_backend().unwrap();
         let authorizer = Authorizer::new(&config, &cache).unwrap();
+        let registry = create_pull_through_registry(&config).await;
 
-        assert!(authorizer.is_tag_immutable("unknown-namespace", "v1.0.0"));
+        let ns = Namespace::new("unknown-namespace").unwrap();
+        assert!(authorizer.is_tag_immutable(&registry, &ns, "v1.0.0"));
     }
 
-    #[test]
-    fn test_is_tag_immutable_with_global_exclusions() {
+    #[tokio::test]
+    async fn test_is_tag_immutable_with_global_exclusions() {
         let toml = r#"
             [blob_store.fs]
             root_dir = "/tmp/test"
@@ -524,14 +526,16 @@ mod tests {
         let config = Configuration::load_from_str(toml).unwrap();
         let cache = cache::Config::Memory.to_backend().unwrap();
         let authorizer = Authorizer::new(&config, &cache).unwrap();
+        let registry = create_pull_through_registry(&config).await;
 
-        assert!(!authorizer.is_tag_immutable("unknown-namespace", "latest"));
-        assert!(!authorizer.is_tag_immutable("unknown-namespace", "dev-branch"));
-        assert!(authorizer.is_tag_immutable("unknown-namespace", "v1.0.0"));
+        let ns = Namespace::new("unknown-namespace").unwrap();
+        assert!(!authorizer.is_tag_immutable(&registry, &ns, "latest"));
+        assert!(!authorizer.is_tag_immutable(&registry, &ns, "dev-branch"));
+        assert!(authorizer.is_tag_immutable(&registry, &ns, "v1.0.0"));
     }
 
-    #[test]
-    fn test_is_tag_immutable_with_repository_setting() {
+    #[tokio::test]
+    async fn test_is_tag_immutable_with_repository_setting() {
         let toml = r#"
             [blob_store.fs]
             root_dir = "/tmp/test"
@@ -558,12 +562,14 @@ mod tests {
         let config = Configuration::load_from_str(toml).unwrap();
         let cache = cache::Config::Memory.to_backend().unwrap();
         let authorizer = Authorizer::new(&config, &cache).unwrap();
+        let registry = create_pull_through_registry(&config).await;
 
-        assert!(authorizer.is_tag_immutable("myrepo", "v1.0.0"));
+        let ns = Namespace::new("myrepo").unwrap();
+        assert!(authorizer.is_tag_immutable(&registry, &ns, "v1.0.0"));
     }
 
-    #[test]
-    fn test_is_tag_immutable_with_repository_exclusions() {
+    #[tokio::test]
+    async fn test_is_tag_immutable_with_repository_exclusions() {
         let toml = r#"
             [blob_store.fs]
             root_dir = "/tmp/test"
@@ -592,14 +598,16 @@ mod tests {
         let config = Configuration::load_from_str(toml).unwrap();
         let cache = cache::Config::Memory.to_backend().unwrap();
         let authorizer = Authorizer::new(&config, &cache).unwrap();
+        let registry = create_pull_through_registry(&config).await;
 
-        assert!(!authorizer.is_tag_immutable("myrepo", "test-123"));
-        assert!(authorizer.is_tag_immutable("myrepo", "latest"));
-        assert!(authorizer.is_tag_immutable("myrepo", "v1.0.0"));
+        let ns = Namespace::new("myrepo").unwrap();
+        assert!(!authorizer.is_tag_immutable(&registry, &ns, "test-123"));
+        assert!(authorizer.is_tag_immutable(&registry, &ns, "latest"));
+        assert!(authorizer.is_tag_immutable(&registry, &ns, "v1.0.0"));
     }
 
-    #[test]
-    fn test_is_tag_immutable_with_sub_namespace() {
+    #[tokio::test]
+    async fn test_is_tag_immutable_with_sub_namespace() {
         let toml = r#"
             [blob_store.fs]
             root_dir = "/tmp/test"
@@ -626,11 +634,15 @@ mod tests {
         let config = Configuration::load_from_str(toml).unwrap();
         let cache = cache::Config::Memory.to_backend().unwrap();
         let authorizer = Authorizer::new(&config, &cache).unwrap();
+        let registry = create_pull_through_registry(&config).await;
 
-        assert!(authorizer.is_tag_immutable("docker-io", "v1.0.0"));
-        assert!(authorizer.is_tag_immutable("docker-io/library/nginx", "v1.0.0"));
-        assert!(!authorizer.is_tag_immutable("docker-io/library/nginx", "latest"));
-        assert!(!authorizer.is_tag_immutable("other/namespace", "v1.0.0"));
+        let ns_root = Namespace::new("docker-io").unwrap();
+        let ns_sub = Namespace::new("docker-io/library/nginx").unwrap();
+        let ns_other = Namespace::new("other/namespace").unwrap();
+        assert!(authorizer.is_tag_immutable(&registry, &ns_root, "v1.0.0"));
+        assert!(authorizer.is_tag_immutable(&registry, &ns_sub, "v1.0.0"));
+        assert!(!authorizer.is_tag_immutable(&registry, &ns_sub, "latest"));
+        assert!(!authorizer.is_tag_immutable(&registry, &ns_other, "v1.0.0"));
     }
 
     #[test]
