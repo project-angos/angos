@@ -4,20 +4,15 @@ use reqwest::{Certificate, Identity};
 
 use crate::command::server::Error;
 
-pub fn load_file(path: &PathBuf) -> Result<Vec<u8>, Error> {
-    match std::fs::read(path) {
-        Ok(pem) => Ok(pem),
-        Err(e) => {
-            let msg = format!("Failed to read certificate file: {e}");
-            Err(Error::Initialization(msg))
-        }
-    }
+pub fn load_pem_file(path: &PathBuf) -> Result<String, Error> {
+    std::fs::read_to_string(path)
+        .map_err(|e| Error::Initialization(format!("Failed to read PEM file: {e}")))
 }
 
 pub fn load_certificate_bundle(path: &PathBuf) -> Result<Vec<Certificate>, Error> {
-    let certificate_pem = load_file(path)?;
+    let certificate_pem = load_pem_file(path)?;
 
-    match Certificate::from_pem_bundle(&certificate_pem) {
+    match Certificate::from_pem_bundle(certificate_pem.as_bytes()) {
         Ok(cert) => Ok(cert),
         Err(e) => {
             let msg = format!("Failed to parse certificate: {e}");
@@ -34,10 +29,10 @@ pub fn load_identity(
         return Ok(None);
     };
 
-    let cert_pem = load_file(cert_path)?;
-    let key_pem = load_file(key_path)?;
+    let cert_pem = load_pem_file(cert_path)?;
+    let key_pem = load_pem_file(key_path)?;
 
-    match Identity::from_pem(&[cert_pem, key_pem].concat()) {
+    match Identity::from_pem(format!("{cert_pem}{key_pem}").as_bytes()) {
         Ok(identity) => Ok(Some(identity)),
         Err(e) => {
             let msg = format!("Failed to create identity from PEM: {e}");

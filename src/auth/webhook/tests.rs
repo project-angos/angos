@@ -30,7 +30,7 @@ use crate::{
             set_registry_namespace_header, set_registry_reference_header,
             set_registry_username_header,
         },
-        tls::{load_certificate_bundle, load_file, load_identity},
+        tls::{load_certificate_bundle, load_identity, load_pem_file},
     },
     cache::{self, Cache},
     command::server::Error,
@@ -149,17 +149,17 @@ fn invalid_url_fails_at_deserialize() {
 }
 
 #[test]
-fn test_load_file() {
+fn test_load_pem_file() {
     let content = "test content";
 
     let tmp_dir = tempfile::tempdir().unwrap();
     let file_path = tmp_dir.path().join("test.txt");
     fs::write(&file_path, content).unwrap();
 
-    let loaded_content = load_file(&file_path).unwrap();
-    assert_eq!(loaded_content, content.as_bytes());
+    let loaded_content = load_pem_file(&file_path).unwrap();
+    assert_eq!(loaded_content, content);
 
-    let invalid_path = load_file(&PathBuf::from("/invalid/path/to/file"));
+    let invalid_path = load_pem_file(&PathBuf::from("/invalid/path/to/file"));
     assert!(matches!(invalid_path, Err(Error::Initialization(_))));
 }
 
