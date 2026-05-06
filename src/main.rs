@@ -31,6 +31,7 @@ mod oci;
 mod policy;
 mod registry;
 mod secret;
+mod timing;
 
 #[cfg(test)]
 pub mod test_fixtures;

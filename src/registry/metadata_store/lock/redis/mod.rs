@@ -14,6 +14,7 @@ use crate::{
         Error,
         lock::{LockBackend, LockGuard},
     },
+    timing::elapsed_ms,
 };
 
 // ARGV[1] = instance_id, ARGV[2] = ttl
@@ -190,7 +191,7 @@ impl LockBackend for RedisBackend {
                     metrics_provider()
                         .lock_acquisition_duration
                         .with_label_values(&["redis"])
-                        .observe(start.elapsed().as_secs_f64() * 1000.0);
+                        .observe(elapsed_ms(start));
                     metrics_provider()
                         .lock_acquisitions
                         .with_label_values(&["redis", "error"])
@@ -207,7 +208,7 @@ impl LockBackend for RedisBackend {
                     metrics_provider()
                         .lock_acquisition_duration
                         .with_label_values(&["redis"])
-                        .observe(start.elapsed().as_secs_f64() * 1000.0);
+                        .observe(elapsed_ms(start));
                     metrics_provider()
                         .lock_acquisitions
                         .with_label_values(&["redis", "error"])
@@ -220,7 +221,7 @@ impl LockBackend for RedisBackend {
                 metrics_provider()
                     .lock_acquisition_duration
                     .with_label_values(&["redis"])
-                    .observe(start.elapsed().as_secs_f64() * 1000.0);
+                    .observe(elapsed_ms(start));
                 metrics_provider()
                     .lock_acquisitions
                     .with_label_values(&["redis", "success"])
@@ -239,7 +240,7 @@ impl LockBackend for RedisBackend {
                 metrics_provider()
                     .lock_acquisition_duration
                     .with_label_values(&["redis"])
-                    .observe(start.elapsed().as_secs_f64() * 1000.0);
+                    .observe(elapsed_ms(start));
                 metrics_provider()
                     .lock_acquisitions
                     .with_label_values(&["redis", "timeout"])

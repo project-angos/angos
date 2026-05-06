@@ -19,6 +19,7 @@ use crate::{
         Error,
         lock::{LockBackend, LockGuard},
     },
+    timing::elapsed_ms,
 };
 
 pub struct MemoryGuard {
@@ -91,7 +92,7 @@ impl LockBackend for MemoryBackend {
         metrics_provider()
             .lock_acquisition_duration
             .with_label_values(&["memory"])
-            .observe(start.elapsed().as_secs_f64() * 1000.0);
+            .observe(elapsed_ms(start));
         metrics_provider()
             .lock_acquisitions
             .with_label_values(&["memory", "success"])

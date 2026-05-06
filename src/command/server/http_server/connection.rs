@@ -22,6 +22,7 @@ use crate::{
     command::server::{ServerContext, response_body::ResponseBody, router},
     identity::Action,
     metrics_provider::{InFlightGuard, metrics_provider},
+    timing::elapsed_ms,
 };
 
 pub async fn serve_request<S>(
@@ -98,8 +99,7 @@ async fn handle_request(
         Err(error) => error_to_response(&error, trace_id.as_ref()),
     };
 
-    #[allow(clippy::cast_precision_loss)]
-    let elapsed = start_time.elapsed().as_millis() as f64;
+    let elapsed = elapsed_ms(start_time);
     let status = response.status();
 
     metrics_provider()
