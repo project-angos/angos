@@ -1,4 +1,4 @@
-use std::{io, sync::LazyLock};
+use std::{io, str::FromStr, sync::LazyLock};
 
 use base64::{Engine, prelude::BASE64_STANDARD};
 use futures_util::TryStreamExt;
@@ -28,6 +28,13 @@ pub trait HeaderExt {
             .get(header)
             .and_then(|header| header.to_str().ok())
             .map(ToString::to_string)
+    }
+
+    fn parse_header<T: FromStr, K: AsHeaderName>(&self, header: K) -> Option<T> {
+        self.headers()
+            .get(header)
+            .and_then(|header| header.to_str().ok())
+            .and_then(|s| s.parse().ok())
     }
 
     fn range(&self, header: HeaderName) -> Result<Option<(u64, Option<u64>)>, Error> {

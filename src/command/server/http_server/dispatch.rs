@@ -1,29 +1,12 @@
-use std::sync::Arc;
+use std::{net::SocketAddr, sync::Arc};
 
-use hyper::{
-    Method, Request, Response,
-    body::Incoming,
-    header::{CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, RANGE},
-    http::request::Parts,
-};
+use hyper::{Method, Request, Response, body::Incoming, http::request::Parts};
 use tracing::instrument;
-use uuid::Uuid;
 
-use super::{
-    event_emission::dispatch_events,
-    observability::{handle_healthz, handle_metrics, handle_readyz, handle_ui_config},
-};
+use super::observability::{handle_healthz, handle_metrics, handle_readyz, handle_ui_config};
 use crate::{
-    command::server::{
-        ServerContext,
-        error::Error,
-        handlers,
-        request_ext::{HeaderExt, IntoAsyncRead},
-        response_body::ResponseBody,
-        ui,
-    },
+    command::server::{ServerContext, error::Error, handlers, response_body::ResponseBody, ui},
     identity::{Action, ClientIdentity},
-    oci::{Digest, Namespace, Reference},
 };
 
 #[instrument(skip(context, req, action))]
@@ -47,7 +30,7 @@ pub async fn authenticate_and_authorize(
     route: &Action,
     parts: &Parts,
 ) -> Result<ClientIdentity, Error> {
-    let remote_address = parts.extensions.get::<std::net::SocketAddr>().copied();
+    let remote_address = parts.extensions.get::<SocketAddr>().copied();
     let identity = context.authenticate_request(parts, remote_address).await?;
     context.authorize_request(route, &identity, parts).await?;
     Ok(identity)
@@ -73,21 +56,27 @@ async fn dispatch_route<'a>(
             handlers::upload::handle_get_upload(context, &namespace, uuid).await
         }
         Action::PatchUpload { namespace, uuid } => {
-            handle_patch_upload(context, parts, incoming, &namespace, uuid).await
+            handlers::upload::dispatch_patch_upload(context, parts, incoming, &namespace, uuid)
+                .await
         }
         Action::PutUpload {
             namespace,
             uuid,
             digest,
-        } => handle_put_upload(context, parts, incoming, &namespace, uuid, digest, identity).await,
+        } => {
+            handlers::upload::dispatch_put_upload(
+                context, parts, incoming, &namespace, uuid, digest, identity,
+            )
+            .await
+        }
         Action::DeleteUpload { namespace, uuid } => {
             handlers::upload::handle_delete_upload(context, &namespace, uuid).await
         }
         Action::GetBlob { namespace, digest } => {
-            handle_get_blob(context, parts, &namespace, digest).await
+            handlers::blob::dispatch_get_blob(context, parts, &namespace, digest).await
         }
         Action::HeadBlob { namespace, digest } => {
-            handle_head_blob(context, parts, &namespace, digest).await
+            handlers::blob::dispatch_head_blob(context, parts, &namespace, digest).await
         }
         Action::DeleteBlob { namespace, digest } => {
             handlers::blob::handle_delete_blob(context, &namespace, &digest).await
@@ -95,19 +84,29 @@ async fn dispatch_route<'a>(
         Action::GetManifest {
             namespace,
             reference,
-        } => handle_get_manifest(context, parts, &namespace, reference).await,
+        } => handlers::manifest::dispatch_get_manifest(context, parts, &namespace, reference).await,
         Action::HeadManifest {
             namespace,
             reference,
-        } => handle_head_manifest(context, parts, &namespace, reference).await,
+        } => {
+            handlers::manifest::dispatch_head_manifest(context, parts, &namespace, reference).await
+        }
         Action::PutManifest {
             namespace,
             reference,
-        } => handle_put_manifest(context, parts, incoming, &namespace, reference, identity).await,
+        } => {
+            handlers::manifest::dispatch_put_manifest(
+                context, parts, incoming, &namespace, reference, identity,
+            )
+            .await
+        }
         Action::DeleteManifest {
             namespace,
             reference,
-        } => handle_delete_manifest(context, &namespace, reference, identity).await,
+        } => {
+            handlers::manifest::dispatch_delete_manifest(context, &namespace, reference, identity)
+                .await
+        }
         Action::GetReferrer {
             namespace,
             digest,
@@ -151,165 +150,4 @@ pub fn handle_unknown_route(parts: &Parts) -> Result<Response<ResponseBody>, Err
         let msg = format!("unsupported route: {} {}", parts.method, parts.uri);
         Err(Error::BadRequest(msg))
     }
-}
-
-async fn handle_patch_upload(
-    context: &ServerContext,
-    parts: &Parts,
-    incoming: Incoming,
-    namespace: &Namespace,
-    uuid: Uuid,
-) -> Result<Response<ResponseBody>, Error> {
-    let start_offset = parts.range(CONTENT_RANGE)?.map(|(start, _)| start);
-    let content_length: u64 = parts
-        .headers
-        .get(CONTENT_LENGTH)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0);
-    let body_stream = incoming.into_async_read();
-
-    handlers::upload::handle_patch_upload(
-        context,
-        namespace,
-        uuid,
-        start_offset,
-        content_length,
-        body_stream,
-    )
-    .await
-}
-
-async fn handle_put_upload(
-    context: &ServerContext,
-    parts: &Parts,
-    incoming: Incoming,
-    namespace: &Namespace,
-    uuid: Uuid,
-    digest: Digest,
-    identity: &ClientIdentity,
-) -> Result<Response<ResponseBody>, Error> {
-    let content_length: u64 = parts
-        .headers
-        .get(CONTENT_LENGTH)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0);
-    let body_stream = incoming.into_async_read();
-
-    let (response, events) = handlers::upload::handle_put_upload(
-        context,
-        namespace,
-        uuid,
-        &digest,
-        content_length,
-        body_stream,
-        identity,
-    )
-    .await?;
-
-    dispatch_events(context, events).await?;
-    Ok(response)
-}
-
-async fn handle_get_blob(
-    context: &ServerContext,
-    parts: &Parts,
-    namespace: &Namespace,
-    digest: Digest,
-) -> Result<Response<ResponseBody>, Error> {
-    let mime_types = parts.accepted_content_types();
-    let range = parts.range(RANGE)?;
-
-    handlers::blob::handle_get_blob(context, namespace, &digest, &mime_types, range).await
-}
-
-async fn handle_head_blob(
-    context: &ServerContext,
-    parts: &Parts,
-    namespace: &Namespace,
-    digest: Digest,
-) -> Result<Response<ResponseBody>, Error> {
-    let mime_types = parts.accepted_content_types();
-
-    handlers::blob::handle_head_blob(context, namespace, &digest, &mime_types).await
-}
-
-async fn handle_get_manifest(
-    context: &ServerContext,
-    parts: &Parts,
-    namespace: &Namespace,
-    reference: Reference,
-) -> Result<Response<ResponseBody>, Error> {
-    let mime_types = parts.accepted_content_types();
-    let is_immutable = context.is_reference_immutable(namespace, &reference);
-
-    handlers::manifest::handle_get_manifest(
-        context,
-        namespace,
-        reference,
-        &mime_types,
-        is_immutable,
-    )
-    .await
-}
-
-async fn handle_head_manifest(
-    context: &ServerContext,
-    parts: &Parts,
-    namespace: &Namespace,
-    reference: Reference,
-) -> Result<Response<ResponseBody>, Error> {
-    let mime_types = parts.accepted_content_types();
-    let is_immutable = context.is_reference_immutable(namespace, &reference);
-
-    handlers::manifest::handle_head_manifest(
-        context,
-        namespace,
-        reference,
-        &mime_types,
-        is_immutable,
-    )
-    .await
-}
-
-async fn handle_put_manifest(
-    context: &ServerContext,
-    parts: &Parts,
-    incoming: Incoming,
-    namespace: &Namespace,
-    reference: Reference,
-    identity: &ClientIdentity,
-) -> Result<Response<ResponseBody>, Error> {
-    let mime_type = parts.get_header(CONTENT_TYPE).ok_or(Error::BadRequest(
-        "No Content-Type header provided".to_string(),
-    ))?;
-
-    let body_stream = incoming.into_async_read();
-
-    let (response, events) = handlers::manifest::handle_put_manifest(
-        context,
-        namespace,
-        reference,
-        mime_type,
-        body_stream,
-        identity,
-    )
-    .await?;
-
-    dispatch_events(context, events).await?;
-    Ok(response)
-}
-
-async fn handle_delete_manifest(
-    context: &ServerContext,
-    namespace: &Namespace,
-    reference: Reference,
-    identity: &ClientIdentity,
-) -> Result<Response<ResponseBody>, Error> {
-    let (response, events) =
-        handlers::manifest::handle_delete_manifest(context, namespace, reference, identity).await?;
-
-    dispatch_events(context, events).await?;
-    Ok(response)
 }

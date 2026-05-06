@@ -1,7 +1,7 @@
 mod connection;
 mod dispatch;
 mod error_response;
-mod event_emission;
+pub mod event_emission;
 mod observability;
 
 #[cfg(test)]

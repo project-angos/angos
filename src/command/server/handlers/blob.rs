@@ -1,8 +1,9 @@
-use hyper::{Response, StatusCode};
+use hyper::{Response, StatusCode, header::RANGE, http::request::Parts};
 
 use crate::{
     command::server::{
-        ServerContext, error::Error, handlers::build_response, response_body::ResponseBody,
+        ServerContext, error::Error, handlers::build_response, request_ext::HeaderExt,
+        response_body::ResponseBody,
     },
     oci::{Digest, Namespace},
     registry::GetBlobResponse,
@@ -62,4 +63,27 @@ pub async fn handle_get_blob(
             ResponseBody::streaming(body),
         ),
     }
+}
+
+pub async fn dispatch_get_blob(
+    context: &ServerContext,
+    parts: &Parts,
+    namespace: &Namespace,
+    digest: Digest,
+) -> Result<Response<ResponseBody>, Error> {
+    let mime_types = parts.accepted_content_types();
+    let range = parts.range(RANGE)?;
+
+    handle_get_blob(context, namespace, &digest, &mime_types, range).await
+}
+
+pub async fn dispatch_head_blob(
+    context: &ServerContext,
+    parts: &Parts,
+    namespace: &Namespace,
+    digest: Digest,
+) -> Result<Response<ResponseBody>, Error> {
+    let mime_types = parts.accepted_content_types();
+
+    handle_head_blob(context, namespace, &digest, &mime_types).await
 }

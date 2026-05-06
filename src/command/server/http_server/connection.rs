@@ -1,6 +1,7 @@
 use std::{
     convert::Infallible,
     fmt::Debug,
+    net::SocketAddr,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -28,7 +29,7 @@ pub async fn serve_request<S>(
     context: Arc<ServerContext>,
     peer_certificate: Option<Vec<u8>>,
     timeouts: Arc<[Duration; 2]>,
-    remote_address: std::net::SocketAddr,
+    remote_address: SocketAddr,
 ) where
     S: Unpin + AsyncWrite + AsyncRead + Send + Debug + 'static,
 {
