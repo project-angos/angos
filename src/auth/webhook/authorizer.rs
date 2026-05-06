@@ -1,10 +1,6 @@
-use std::{
-    sync::{Arc, LazyLock},
-    time::Duration,
-};
+use std::{sync::Arc, time::Duration};
 
 use hyper::http::request::Parts;
-use prometheus::{HistogramVec, IntCounterVec, register_histogram_vec, register_int_counter_vec};
 use reqwest::{Client, redirect::Policy};
 use tracing::warn;
 
@@ -12,6 +8,7 @@ use super::{
     cache::cache_retrieve,
     config::Config,
     headers::{build_cache_key, build_headers},
+    metrics::{WEBHOOK_DURATION, WEBHOOK_REQUESTS},
     tls::{load_certificate_bundle, load_identity},
 };
 use crate::{
@@ -19,24 +16,6 @@ use crate::{
     command::server::Error,
     identity::{Action, ClientIdentity},
 };
-
-pub static WEBHOOK_REQUESTS: LazyLock<IntCounterVec> = LazyLock::new(|| {
-    register_int_counter_vec!(
-        "webhook_authorization_requests_total",
-        "Total webhook authorization requests",
-        &["webhook", "result"]
-    )
-    .unwrap()
-});
-
-static WEBHOOK_DURATION: LazyLock<HistogramVec> = LazyLock::new(|| {
-    register_histogram_vec!(
-        "webhook_authorization_duration_seconds",
-        "Webhook authorization request duration",
-        &["webhook"]
-    )
-    .unwrap()
-});
 
 pub struct WebhookAuthorizer {
     name: String,

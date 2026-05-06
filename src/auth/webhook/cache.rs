@@ -19,7 +19,7 @@ pub async fn cache_retrieve(
             } else {
                 "cached_deny"
             };
-            super::authorizer::WEBHOOK_REQUESTS
+            super::metrics::WEBHOOK_REQUESTS
                 .with_label_values(&[name, label])
                 .inc();
             Ok(Some(cached))
