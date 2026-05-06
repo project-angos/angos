@@ -27,33 +27,29 @@ impl Config {
 
 #[cfg(test)]
 mod tests {
-    use std::any::TypeId;
-
     use super::*;
     use crate::cache::redis::BackendConfig;
 
-    #[test]
-    fn test_memory_backend() {
-        let config = Config::Memory;
-        let backend = config.to_backend();
+    #[tokio::test]
+    async fn test_memory_backend() {
+        let backend = Config::Memory.to_backend().unwrap();
 
-        assert!(backend.is_ok());
-
-        let backend = backend.unwrap();
-        assert_eq!((*backend).type_id(), TypeId::of::<cache::memory::Backend>());
+        backend.store_value("k", "v", 60).await.unwrap();
+        let retrieved = backend.retrieve_value("k").await.unwrap();
+        assert_eq!(retrieved.as_deref(), Some("v"));
     }
 
-    #[test]
-    fn test_redis_backend() {
-        let config = Config::Redis(BackendConfig {
+    #[tokio::test]
+    async fn test_redis_backend() {
+        let backend = Config::Redis(BackendConfig {
             url: "redis://localhost:6379/0".to_string(),
             key_prefix: "test_cache_config".to_string(),
-        });
-        let backend = config.to_backend();
+        })
+        .to_backend()
+        .unwrap();
 
-        assert!(backend.is_ok());
-
-        let backend = backend.unwrap();
-        assert_eq!((*backend).type_id(), TypeId::of::<cache::redis::Backend>());
+        backend.store_value("k", "v", 60).await.unwrap();
+        let retrieved = backend.retrieve_value("k").await.unwrap();
+        assert_eq!(retrieved.as_deref(), Some("v"));
     }
 }

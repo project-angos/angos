@@ -198,7 +198,7 @@ impl MetadataStore for Backend {
 
         let (tags, _, next_token) = self
             .store
-            .list_prefixes(&tags_dir, "/", i32::from(n), None, last)
+            .list_prefixes(&tags_dir, "/", n, None, last)
             .await?;
 
         let continuation = if next_token.is_some() {
@@ -290,7 +290,7 @@ impl MetadataStore for Backend {
 
         let (prefixes, _, next_last) = self
             .store
-            .list_prefixes(&revisions_dir, "/", i32::from(n), continuation_token, None)
+            .list_prefixes(&revisions_dir, "/", n, continuation_token, None)
             .await?;
 
         let mut revisions = Vec::new();

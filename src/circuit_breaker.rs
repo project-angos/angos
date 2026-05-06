@@ -1,5 +1,5 @@
 use std::{
-    io::Error,
+    fmt,
     sync::{
         Arc,
         atomic::{AtomicU32, AtomicU64, Ordering},
@@ -11,6 +11,30 @@ use tracing::warn;
 
 const CIRCUIT_BREAKER_THRESHOLD: u32 = 5;
 const CIRCUIT_BREAKER_COOLDOWN_SECS: u64 = 10;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CircuitBreakerError {
+    pub failures: u32,
+    pub cooldown_secs: u64,
+}
+
+impl fmt::Display for CircuitBreakerError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "circuit breaker open: {} consecutive failures, cooling down for {}s",
+            self.failures, self.cooldown_secs
+        )
+    }
+}
+
+impl std::error::Error for CircuitBreakerError {}
+
+impl From<CircuitBreakerError> for std::io::Error {
+    fn from(e: CircuitBreakerError) -> Self {
+        std::io::Error::other(e.to_string())
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct CircuitBreaker {
@@ -26,7 +50,7 @@ impl CircuitBreaker {
         }
     }
 
-    pub fn check(&self) -> Result<(), Error> {
+    pub fn check(&self) -> Result<(), CircuitBreakerError> {
         let failures = self.consecutive_failures.load(Ordering::Acquire);
         if failures < CIRCUIT_BREAKER_THRESHOLD {
             return Ok(());
@@ -39,10 +63,10 @@ impl CircuitBreaker {
         if now.saturating_sub(opened_at) >= CIRCUIT_BREAKER_COOLDOWN_SECS {
             return Ok(());
         }
-        Err(Error::other(format!(
-            "circuit breaker open: {failures} consecutive failures, \
-             cooling down for {CIRCUIT_BREAKER_COOLDOWN_SECS}s"
-        )))
+        Err(CircuitBreakerError {
+            failures,
+            cooldown_secs: CIRCUIT_BREAKER_COOLDOWN_SECS,
+        })
     }
 
     pub fn record_success(&self) {
@@ -119,6 +143,17 @@ mod tests {
             msg.contains(&CIRCUIT_BREAKER_COOLDOWN_SECS.to_string()),
             "error must include cooldown seconds, got: {msg}"
         );
+    }
+
+    #[test]
+    fn open_error_carries_typed_failure_count_and_cooldown() {
+        let cb = CircuitBreaker::new();
+        for _ in 0..CIRCUIT_BREAKER_THRESHOLD {
+            cb.record_failure();
+        }
+        let err = cb.check().unwrap_err();
+        assert_eq!(err.failures, CIRCUIT_BREAKER_THRESHOLD);
+        assert_eq!(err.cooldown_secs, CIRCUIT_BREAKER_COOLDOWN_SECS);
     }
 
     #[test]

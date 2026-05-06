@@ -1,13 +1,12 @@
 use std::io::{self, Cursor};
 
-use aws_sdk_s3::types::CompletedPart;
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use sha2::Sha256;
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tracing::instrument;
 
-use super::{Backend, S3UploadState, chunked_reader::ChunkedReader};
+use super::{Backend, S3UploadState, UploadedPart, chunked_reader::ChunkedReader};
 use crate::{
     oci::Digest,
     registry::{
@@ -15,6 +14,18 @@ use crate::{
         path_builder,
     },
 };
+
+struct ChunkContext<'a> {
+    upload_path: &'a str,
+    upload_id: &'a str,
+    uploaded_size: u64,
+    append: bool,
+}
+
+struct ChunkOutcome {
+    chunk_len: u64,
+    flushed: bool,
+}
 
 impl Backend {
     #[instrument(skip(self, chunk))]
@@ -63,6 +74,79 @@ impl Backend {
         Sha256::from_state(&state)
     }
 
+    async fn resolve_uniform_state(
+        &self,
+        name: &str,
+        uuid: &str,
+        upload_path: &str,
+        append: bool,
+    ) -> Result<(String, Vec<UploadedPart>), Error> {
+        if append {
+            if let Some(S3UploadState {
+                multipart_upload_id: Some(id),
+                parts,
+                ..
+            }) = self.retrieve_cached_upload_state(name, uuid).await
+            {
+                return Ok((id, parts));
+            }
+            let id = if let Some(id) = self.get_or_search_upload_id(upload_path).await? {
+                id
+            } else {
+                let id = self.store.create_multipart_upload(upload_path).await?;
+                self.cache_upload_id(upload_path, &id).await;
+                id
+            };
+            let parts = self.store.list_parts(upload_path, &id).await?;
+            Ok((id, parts))
+        } else {
+            self.evict_upload_id(upload_path).await;
+            self.store.abort_pending_uploads(upload_path).await?;
+            let id = self.store.create_multipart_upload(upload_path).await?;
+            self.cache_upload_id(upload_path, &id).await;
+            Ok((id, Vec::new()))
+        }
+    }
+
+    async fn process_chunk(
+        &self,
+        name: &str,
+        uuid: &str,
+        ctx: ChunkContext<'_>,
+        uploaded_parts: &mut u32,
+        chunk: Bytes,
+        reader: &mut ChunkedReader<HashingReader<impl AsyncRead + Unpin + Send + Sync>>,
+    ) -> Result<ChunkOutcome, Error> {
+        let chunk_len = u64::try_from(chunk.len())?;
+        let flush = should_flush(chunk_len, self.multipart_part_size);
+
+        if flush {
+            self.store
+                .upload_part(ctx.upload_path, ctx.upload_id, *uploaded_parts, chunk)
+                .await?;
+            *uploaded_parts += 1;
+        } else {
+            reader.mark_finished();
+            self.store_staged_chunk(name, uuid, chunk, ctx.uploaded_size)
+                .await?;
+        }
+
+        if ctx.append {
+            self.save_hasher(
+                name,
+                uuid,
+                ctx.uploaded_size + chunk_len,
+                reader.serialized_state(),
+            )
+            .await?;
+        }
+
+        Ok(ChunkOutcome {
+            chunk_len,
+            flushed: flush,
+        })
+    }
+
     #[instrument(skip(self, stream))]
     pub async fn write_upload_uniform(
         &self,
@@ -73,77 +157,43 @@ impl Backend {
     ) -> Result<(Digest, u64), Error> {
         let upload_path = path_builder::upload_path(name, uuid);
 
-        let (upload_id, part_list) = if append {
-            if let Some(S3UploadState {
-                multipart_upload_id: Some(id),
-                parts,
-                ..
-            }) = self.retrieve_cached_upload_state(name, uuid).await
-            {
-                (id, parts)
-            } else {
-                let id = if let Some(id) = self.get_or_search_upload_id(&upload_path).await? {
-                    id
-                } else {
-                    let id = self.store.create_multipart_upload(&upload_path).await?;
-                    self.cache_upload_id(&upload_path, &id).await;
-                    id
-                };
-                let parts = self.store.list_parts(&upload_path, &id).await?;
-                (id, parts)
-            }
-        } else {
-            self.evict_upload_id(&upload_path).await;
-            self.store.abort_pending_uploads(&upload_path).await?;
-            let id = self.store.create_multipart_upload(&upload_path).await?;
-            self.cache_upload_id(&upload_path, &id).await;
-            (id, Vec::new())
-        };
+        let (upload_id, part_list) = self
+            .resolve_uniform_state(name, uuid, &upload_path, append)
+            .await?;
 
-        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-        let mut uploaded_size: u64 = part_list.iter().map(|p| p.size as u64).sum();
-        #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-        let mut uploaded_parts = next_part_number(part_list.len());
+        let mut uploaded_size: u64 = part_list.iter().map(|p| p.size).sum();
+        let mut uploaded_parts = next_part_number(part_list.len())?;
 
-        let chunk = self.load_staged_chunk(name, uuid, uploaded_size).await?;
+        let staged = self.load_staged_chunk(name, uuid, uploaded_size).await?;
         let hasher = self.load_hasher(name, uuid, uploaded_size).await?;
 
-        let reader = Cursor::new(chunk).chain(stream);
+        let reader = Cursor::new(staged).chain(stream);
         let reader = HashingReader::with_hasher(reader, hasher);
-        let mut reader = ChunkedReader::new(reader, self.multipart_part_size as u64);
+        let mut reader = ChunkedReader::new(reader, self.multipart_part_size);
 
         let mut total_size = uploaded_size;
         while let Some(mut chunk_reader) = reader.next_chunk() {
-            let mut chunk = Vec::with_capacity(self.multipart_part_size);
-            chunk_reader.read_to_end(&mut chunk).await?;
-            let chunk = Bytes::from(chunk);
-            let chunk_len = chunk.len() as u64;
-            let flush = should_flush(chunk_len, self.multipart_part_size as u64);
-
-            if flush {
-                self.store
-                    .upload_part(&upload_path, &upload_id, uploaded_parts, chunk)
-                    .await?;
-                uploaded_parts += 1;
-            } else {
-                reader.mark_finished();
-                self.store_staged_chunk(name, uuid, chunk, uploaded_size)
-                    .await?;
-            }
-            total_size = uploaded_size + chunk_len;
-
-            if append {
-                self.save_hasher(
+            let mut buf = Vec::with_capacity(usize::try_from(self.multipart_part_size)?);
+            chunk_reader.read_to_end(&mut buf).await?;
+            let chunk = Bytes::from(buf);
+            let outcome = self
+                .process_chunk(
                     name,
                     uuid,
-                    uploaded_size + chunk_len,
-                    reader.serialized_state(),
+                    ChunkContext {
+                        upload_path: &upload_path,
+                        upload_id: &upload_id,
+                        uploaded_size,
+                        append,
+                    },
+                    &mut uploaded_parts,
+                    chunk,
+                    &mut reader,
                 )
                 .await?;
-            }
-
-            if flush {
-                uploaded_size += chunk_len;
+            total_size = uploaded_size + outcome.chunk_len;
+            if outcome.flushed {
+                uploaded_size += outcome.chunk_len;
             }
         }
 
@@ -176,8 +226,7 @@ impl Backend {
                 (None, Vec::new())
             };
 
-        #[allow(clippy::cast_sign_loss)]
-        let mut size: u64 = parts.iter().map(|p| p.size as u64).sum();
+        let mut size: u64 = parts.iter().map(|p| p.size).sum();
 
         let staged_path = path_builder::upload_staged_container_path(name, uuid, size);
         if let Ok(staged_size) = self.store.object_size(&staged_path).await {
@@ -207,41 +256,26 @@ impl Backend {
             return Err(Error::UploadNotFound);
         };
 
-        let part_list = if let Some(cached) = self.retrieve_cached_upload_state(name, uuid).await {
+        let mut parts = if let Some(cached) = self.retrieve_cached_upload_state(name, uuid).await {
             cached.parts
         } else {
             self.store.list_parts(&key, &upload_id).await?
         };
-        let mut size = part_list
-            .iter()
-            .map(|p| u64::try_from(p.size).unwrap_or(0))
-            .sum::<u64>();
+        let mut size: u64 = parts.iter().map(|p| p.size).sum();
 
         let source_key = path_builder::upload_staged_container_path(name, uuid, size);
 
-        let mut parts = Vec::new();
-        for part in part_list {
-            parts.push(
-                CompletedPart::builder()
-                    .part_number(part.part_number)
-                    .e_tag(part.e_tag)
-                    .build(),
-            );
-        }
-
         if let Ok(staged_size) = self.store.object_size(&source_key).await {
-            #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-            let part_number = next_part_number(parts.len());
+            let part_number = next_part_number(parts.len())?;
             let e_tag = self
                 .store
                 .upload_part_copy(&source_key, &key, &upload_id, part_number, None)
                 .await?;
-            parts.push(
-                CompletedPart::builder()
-                    .part_number(part_number)
-                    .e_tag(e_tag)
-                    .build(),
-            );
+            parts.push(UploadedPart {
+                part_number,
+                e_tag,
+                size: staged_size,
+            });
             size += staged_size;
         }
 
@@ -249,7 +283,7 @@ impl Backend {
         let digest = digest.unwrap_or(self.load_hasher(name, uuid, size).await?.digest());
 
         self.store
-            .complete_multipart_upload(&key, &upload_id, parts)
+            .complete_multipart_upload(&key, &upload_id, &parts)
             .await?;
 
         self.evict_upload_id(&key).await;
@@ -289,9 +323,8 @@ fn should_flush(chunk_len: u64, multipart_part_size: u64) -> bool {
 
 /// Returns the 1-based part number for the next part to upload, given the
 /// number of parts already completed.  S3 part numbers start at 1.
-#[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-fn next_part_number(completed_parts: usize) -> i32 {
-    (completed_parts + 1) as i32
+fn next_part_number(completed_parts: usize) -> Result<u32, Error> {
+    Ok(u32::try_from(completed_parts + 1)?)
 }
 
 #[cfg(test)]
@@ -339,16 +372,16 @@ mod tests {
 
     #[test]
     fn first_part_when_no_parts_uploaded() {
-        assert_eq!(next_part_number(0), 1);
+        assert_eq!(next_part_number(0).unwrap(), 1);
     }
 
     #[test]
     fn second_part_after_one_uploaded() {
-        assert_eq!(next_part_number(1), 2);
+        assert_eq!(next_part_number(1).unwrap(), 2);
     }
 
     #[test]
     fn part_number_increments_with_part_count() {
-        assert_eq!(next_part_number(9), 10);
+        assert_eq!(next_part_number(9).unwrap(), 10);
     }
 }

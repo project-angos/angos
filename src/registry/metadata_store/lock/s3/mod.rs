@@ -762,24 +762,27 @@ enum AcquireRoundOutcome {
     },
 }
 
-impl S3LockBackend {
-    async fn try_acquire_round(&self, lock_paths: &[String]) -> AcquireRoundOutcome {
-        // Parallel PUTs with overlapping key sets across instances can cause
-        // repeated rollbacks. This parallel round is used only for the first
-        // attempt (optimistic fast path). On any failure, `acquire` switches
-        // to `try_acquire_sequential` which acquires keys one-by-one in sorted
-        // order, eliminating circular wait and preventing livelock. Randomized
-        // jitter on retry delays desynchronises retrying instances.
-        let futs: Vec<_> = lock_paths
-            .iter()
-            .enumerate()
-            .map(|(i, path)| {
-                let path = path.clone();
-                async move { (i, self.try_acquire_key(&path).await) }
-            })
-            .collect();
-        let results: Vec<(usize, Result<Option<String>, Error>)> = join_all(futs).await;
+struct ClassifiedRound {
+    acquired_etags: HashMap<String, String>,
+    acquired_paths: Vec<String>,
+    failed_indices: Vec<usize>,
+}
 
+struct RecoveredRound {
+    acquired_etags: HashMap<String, String>,
+    acquired_paths: Vec<String>,
+    recovered_paths: Vec<String>,
+}
+
+impl S3LockBackend {
+    /// Walks per-key acquire results into (etags, acquired paths, failed indices).
+    /// Returns `Err(HardError(_))` after releasing any partially-acquired paths
+    /// when one of the underlying PUTs returned an unrecoverable backend error.
+    async fn classify_acquire_results(
+        &self,
+        lock_paths: &[String],
+        results: Vec<(usize, Result<Option<String>, Error>)>,
+    ) -> Result<ClassifiedRound, AcquireRoundOutcome> {
         let mut acquired_etags: HashMap<String, String> = HashMap::new();
         let mut acquired_paths = Vec::new();
         let mut failed_indices = Vec::new();
@@ -802,11 +805,38 @@ impl S3LockBackend {
 
         if let Some(e) = hard_error {
             self.release_paths(&acquired_paths).await;
-            return AcquireRoundOutcome::HardError(e);
+            return Err(AcquireRoundOutcome::HardError(e));
         }
 
+        Ok(ClassifiedRound {
+            acquired_etags,
+            acquired_paths,
+            failed_indices,
+        })
+    }
+
+    /// For each failed index, attempts stale-lock recovery and merges the
+    /// outcome. Short-circuits on `RecoveryOutcome::Error` by surfacing
+    /// `Err(RecoveryError { ... })` carrying the paths that must be released
+    /// by the caller.  When `classified.failed_indices` is empty, the helper
+    /// is a no-op fast path.
+    async fn run_recoveries(
+        &self,
+        lock_paths: &[String],
+        classified: ClassifiedRound,
+    ) -> Result<RecoveredRound, AcquireRoundOutcome> {
+        let ClassifiedRound {
+            mut acquired_etags,
+            acquired_paths,
+            failed_indices,
+        } = classified;
+
         if failed_indices.is_empty() {
-            return AcquireRoundOutcome::AllAcquired(acquired_etags);
+            return Ok(RecoveredRound {
+                acquired_etags,
+                acquired_paths,
+                recovered_paths: Vec::new(),
+            });
         }
 
         let recovery_futs: Vec<_> = failed_indices
@@ -830,11 +860,26 @@ impl S3LockBackend {
                 RecoveryOutcome::Error(msg) => {
                     let mut to_release = acquired_paths;
                     to_release.extend(recovered_paths);
-                    return AcquireRoundOutcome::RecoveryError { msg, to_release };
+                    return Err(AcquireRoundOutcome::RecoveryError { msg, to_release });
                 }
                 RecoveryOutcome::Failed | RecoveryOutcome::NotStale | RecoveryOutcome::Retry => {}
             }
         }
+
+        Ok(RecoveredRound {
+            acquired_etags,
+            acquired_paths,
+            recovered_paths,
+        })
+    }
+
+    /// Pure decision: returns `AllAcquired` when every path is held, else `Retry`.
+    fn finalize_round(lock_paths: &[String], recovered: RecoveredRound) -> AcquireRoundOutcome {
+        let RecoveredRound {
+            acquired_etags,
+            acquired_paths,
+            recovered_paths,
+        } = recovered;
 
         if recovered_paths.len() + acquired_paths.len() == lock_paths.len() {
             return AcquireRoundOutcome::AllAcquired(acquired_etags);
@@ -844,6 +889,34 @@ impl S3LockBackend {
             acquired: acquired_paths,
             recovered: recovered_paths,
         }
+    }
+
+    async fn try_acquire_round(&self, lock_paths: &[String]) -> AcquireRoundOutcome {
+        // Parallel PUTs with overlapping key sets across instances can cause
+        // repeated rollbacks. This parallel round is used only for the first
+        // attempt (optimistic fast path). On any failure, `acquire` switches
+        // to `try_acquire_sequential` which acquires keys one-by-one in sorted
+        // order, eliminating circular wait and preventing livelock. Randomized
+        // jitter on retry delays desynchronises retrying instances.
+        let futs: Vec<_> = lock_paths
+            .iter()
+            .enumerate()
+            .map(|(i, path)| {
+                let path = path.clone();
+                async move { (i, self.try_acquire_key(&path).await) }
+            })
+            .collect();
+        let results = join_all(futs).await;
+
+        let classified = match self.classify_acquire_results(lock_paths, results).await {
+            Ok(c) => c,
+            Err(outcome) => return outcome,
+        };
+        let recovered = match self.run_recoveries(lock_paths, classified).await {
+            Ok(r) => r,
+            Err(outcome) => return outcome,
+        };
+        Self::finalize_round(lock_paths, recovered)
     }
 
     async fn try_acquire_sequential(&self, lock_paths: &[String]) -> AcquireRoundOutcome {

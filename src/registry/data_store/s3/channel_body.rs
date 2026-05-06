@@ -1,3 +1,7 @@
+//! `http_body::Body` adapter that pumps `Bytes` frames from an mpsc channel.
+//! Used internally to bridge a producer task into the AWS SDK `ByteStream`
+//! without exposing the SDK's body abstractions to callers.
+
 use std::{
     convert::Infallible,
     pin::Pin,

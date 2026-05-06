@@ -1,11 +1,5 @@
 use std::{fmt, io, num::TryFromIntError, string::FromUtf8Error};
 
-use aws_sdk_s3::{
-    config::http::HttpResponse,
-    error::SdkError,
-    operation::{get_object::GetObjectError, head_object::HeadObjectError},
-    primitives::ByteStreamError,
-};
 use sha2::digest::common::hazmat::DeserializeStateError;
 
 use crate::{oci, registry::data_store};
@@ -82,32 +76,6 @@ impl From<TryFromIntError> for Error {
     }
 }
 
-// S3 errors
-
-impl From<HeadObjectError> for Error {
-    fn from(e: HeadObjectError) -> Self {
-        Error::StorageBackend(format!("HeadObjectError: {e}"))
-    }
-}
-
-impl From<GetObjectError> for Error {
-    fn from(e: GetObjectError) -> Self {
-        Error::StorageBackend(format!("GetObjectError: {e}"))
-    }
-}
-
-impl<T> From<SdkError<T, HttpResponse>> for Error {
-    fn from(e: SdkError<T, HttpResponse>) -> Self {
-        Error::StorageBackend(format!("SdkError: {e}"))
-    }
-}
-
-impl From<ByteStreamError> for Error {
-    fn from(e: ByteStreamError) -> Self {
-        Error::StorageBackend(format!("ByteStreamError: {e}"))
-    }
-}
-
 impl From<chrono::format::ParseError> for Error {
     fn from(e: chrono::format::ParseError) -> Self {
         Error::InvalidFormat(e.to_string())
@@ -122,13 +90,6 @@ impl From<oci::Error> for Error {
 
 #[cfg(test)]
 mod tests {
-    use aws_sdk_s3::{
-        error::SdkError,
-        operation::{
-            get_object::GetObjectError, head_object::HeadObjectError, put_object::PutObjectError,
-        },
-        primitives::ByteStreamError,
-    };
     use sha2::digest::common::hazmat::DeserializeStateError;
 
     use super::*;
@@ -246,57 +207,5 @@ mod tests {
     fn test_from_oci_error() {
         let oci_error = oci::Error::InvalidDigest("bad".to_string());
         assert!(matches!(Error::from(oci_error), Error::InvalidFormat(_)));
-    }
-
-    #[test]
-    fn test_from_head_object_error() {
-        let head_error =
-            HeadObjectError::NotFound(aws_sdk_s3::types::error::NotFound::builder().build());
-        assert!(matches!(Error::from(head_error), Error::StorageBackend(_)));
-    }
-
-    #[test]
-    fn test_from_get_object_error() {
-        let get_error =
-            GetObjectError::NoSuchKey(aws_sdk_s3::types::error::NoSuchKey::builder().build());
-        assert!(matches!(Error::from(get_error), Error::StorageBackend(_)));
-    }
-
-    #[test]
-    fn test_from_byte_stream_error() {
-        let stream_error =
-            ByteStreamError::from(io::Error::new(io::ErrorKind::UnexpectedEof, "stream error"));
-        assert!(matches!(
-            Error::from(stream_error),
-            Error::StorageBackend(_)
-        ));
-    }
-
-    #[test]
-    fn test_from_sdk_error() {
-        let sdk_error: SdkError<PutObjectError, _> =
-            SdkError::construction_failure(io::Error::new(io::ErrorKind::TimedOut, "timeout"));
-        assert!(matches!(Error::from(sdk_error), Error::StorageBackend(_)));
-    }
-
-    #[test]
-    fn test_head_object_error_display_format() {
-        let head_error =
-            HeadObjectError::NotFound(aws_sdk_s3::types::error::NotFound::builder().build());
-        let err = Error::from(head_error);
-        let msg = format!("{err}");
-        assert!(
-            msg.starts_with("Storage backend error: HeadObjectError: "),
-            "unexpected prefix: {msg}"
-        );
-        // Debug formatting leaks struct field punctuation; Display must not
-        assert!(
-            !msg.contains("{ "),
-            "Display message contains Debug-style brace punctuation: {msg}"
-        );
-        assert!(
-            !msg.contains("__type"),
-            "Display message leaks SDK internal field __type: {msg}"
-        );
     }
 }

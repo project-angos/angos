@@ -102,9 +102,9 @@ impl AccessPolicy {
     ///
     /// # Fail-open vs fail-closed semantics
     ///
-    /// Access policies are **fail-closed by default** for non-boolean results: a misconfigured
-    /// rule that returns a non-boolean value is treated as a match (flipping the default).
-    /// The effect on the final decision depends on the operating mode:
+    /// Access policies are **fail-closed for non-boolean results in both modes**: a misconfigured
+    /// rule that returns a non-boolean value immediately denies access. This eliminates the risk
+    /// of a typo in an ALLOW rule (Deny mode) silently letting subsequent rules grant access.
     ///
     /// ## Allow mode (default-allow; rules are DENY rules)
     ///
@@ -126,12 +126,12 @@ impl AccessPolicy {
     /// |-------------------------------------|------------------------|-----------|
     /// | `bool(true)`  — rule matched        | allow (fail-open)      | `debug`   |
     /// | `bool(false)` — rule did not match  | continue to next rule  | —         |
-    /// | non-boolean value (misconfiguration)| continue (skip rule)   | `warn`    |
+    /// | non-boolean value (misconfiguration)| deny (fail-closed)     | `warn`    |
     /// | evaluation error                    | continue (skip rule)   | `warn`    |
     /// | no rules matched                    | deny (default)         | —         |
     ///
-    /// In Deny mode, both anomalous outcomes skip the rule and eventually fall through to the
-    /// default deny — fail-closed.
+    /// In Deny mode, evaluation errors skip the rule and fall through to the default deny.
+    /// Non-boolean results immediately deny (matching Allow mode's fail-closed behavior).
     ///
     /// # Arguments
     /// * `action` - The domain action representing the registry operation
@@ -164,9 +164,7 @@ impl AccessPolicy {
                     warn!(
                         "Access policy {rule_kind} rule {rule_index} returned non-boolean value: {value:?}"
                     );
-                    if self.default == AccessMode::Allow {
-                        return Ok(false);
-                    }
+                    return Ok(false);
                 }
                 Err(e) => {
                     warn!("Access policy {rule_kind} rule {rule_index} evaluation failed: {e}");
@@ -337,9 +335,9 @@ mod tests {
     }
 
     #[test]
-    fn non_boolean_rule_in_deny_mode_falls_through_to_deny() {
-        // Deny mode: rules are ALLOW rules.  A non-bool result is skipped (not
-        // treated as a match), so evaluation falls through to the default → deny.
+    fn non_boolean_rule_in_deny_mode_denies_fail_closed() {
+        // Deny mode: rules are ALLOW rules.  A non-bool result is treated as a
+        // misconfiguration and immediately denies access (fail-closed).
         let config = AccessPolicyConfig {
             default: AccessMode::Deny,
             rules: vec![rule("42")],
@@ -349,6 +347,24 @@ mod tests {
         let identity = ClientIdentity::default();
 
         assert!(!policy.evaluate(&action, &identity).unwrap());
+    }
+
+    #[test]
+    fn non_boolean_rule_in_deny_mode_short_circuits_subsequent_allow_rules() {
+        // Deny mode + ALLOW rules: a non-bool result must fail-closed immediately,
+        // not silently skip and let a later rule grant access.
+        let config = AccessPolicyConfig {
+            default: AccessMode::Deny,
+            rules: vec![rule("42"), rule("true")],
+        };
+        let policy = AccessPolicy::new(&config);
+        let action = Action::ApiVersion;
+        let identity = ClientIdentity::default();
+
+        assert!(
+            !policy.evaluate(&action, &identity).unwrap(),
+            "non-boolean rule must short-circuit to deny, even when a later rule would allow"
+        );
     }
 
     #[test]

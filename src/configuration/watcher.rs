@@ -14,6 +14,10 @@ use tracing::{debug, error, info, warn};
 use super::{Configuration, Error, ServerConfig};
 use crate::configuration::listeners::tls::ServerTlsConfig;
 
+/// Window during which filesystem events are coalesced into a single reload.
+/// Editors typically emit several `Modify`/`Create`/`Remove` events per save
+/// (atomic-write rename, swap-file dance, etc.); waiting this long after the
+/// last event before reloading collapses the burst into one config-load pass.
 const DEBOUNCE: Duration = Duration::from_millis(100);
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -192,7 +196,7 @@ fn resolve_config<'a>(
 /// Handles a `ChangeKind::Tls` event: ensures a usable `Configuration` is
 /// available (loading from disk when the cache is empty), then notifies the
 /// subscriber if the server is configured for TLS.
-fn handle_tls_event(
+fn reload_tls(
     cached_config: &mut Option<Configuration>,
     config_path: &Path,
     notifier: &dyn ConfigNotifier,
@@ -215,6 +219,125 @@ fn handle_tls_event(
     }
 }
 
+fn load_initial_config(config_path: &Path) -> Option<Configuration> {
+    match Configuration::load(config_path) {
+        Ok(cfg) => Some(cfg),
+        Err(e) => {
+            warn!("Failed to load configuration, watching for changes: {e}");
+            None
+        }
+    }
+}
+
+fn build_watcher(
+    config_dir: &Path,
+    tls_dirs: &HashSet<PathBuf>,
+    tx: mpsc::Sender<Event>,
+) -> Result<notify::RecommendedWatcher, Error> {
+    let mut watcher = notify::recommended_watcher(move |res| handle_notify_result(res, &tx))?;
+    watcher.watch(config_dir, RecursiveMode::NonRecursive)?;
+    for dir in tls_dirs {
+        if dir != config_dir
+            && let Err(e) = watcher.watch(dir, RecursiveMode::NonRecursive)
+        {
+            warn!("Failed to watch TLS directory {:?}: {e}", dir);
+        }
+    }
+    Ok(watcher)
+}
+
+struct WatchPaths<'a> {
+    config_path: &'a Path,
+    config_dir: &'a Path,
+    canonical_config_path: &'a Path,
+    canonical_config_dir: &'a Path,
+    canonical_tls_dirs: &'a HashSet<PathBuf>,
+    tls_dirs: &'a HashSet<PathBuf>,
+}
+
+async fn run_event_loop(
+    rx: &mut mpsc::Receiver<Event>,
+    paths: &WatchPaths<'_>,
+    cached_config: &mut Option<Configuration>,
+    notifier: &dyn ConfigNotifier,
+) -> bool {
+    loop {
+        let Some(event) = rx.recv().await else {
+            error!("Config watcher channel closed");
+            return false;
+        };
+
+        let initial_kind = classify_event(
+            &event,
+            paths.canonical_config_path,
+            paths.canonical_config_dir,
+            paths.canonical_tls_dirs,
+        );
+        if matches!(initial_kind, ChangeKind::Irrelevant) {
+            continue;
+        }
+
+        let Some(kind) = coalesce_events(
+            rx,
+            initial_kind,
+            paths.canonical_config_path,
+            paths.canonical_config_dir,
+            paths.canonical_tls_dirs,
+        )
+        .await
+        else {
+            error!("Config watcher channel closed");
+            return false;
+        };
+
+        match kind {
+            ChangeKind::Irrelevant => {}
+            ChangeKind::Config => {
+                if reload_config(
+                    paths.config_path,
+                    paths.config_dir,
+                    cached_config,
+                    paths.tls_dirs,
+                    notifier,
+                )
+                .await
+                {
+                    return true;
+                }
+            }
+            ChangeKind::Tls => {
+                reload_tls(cached_config, paths.config_path, notifier);
+            }
+        }
+    }
+}
+
+/// Handles a `ChangeKind::Config` event: loads the new configuration, notifies
+/// the subscriber, and returns `true` when the set of watched TLS directories
+/// has changed — signalling that the outer loop must rebuild the watcher.
+async fn reload_config(
+    config_path: &Path,
+    config_dir: &Path,
+    cached_config: &mut Option<Configuration>,
+    tls_dirs: &HashSet<PathBuf>,
+    notifier: &dyn ConfigNotifier,
+) -> bool {
+    info!("Configuration change detected, reloading");
+    match Configuration::load(config_path) {
+        Ok(cfg) => {
+            notifier.notify_config_change(&cfg).await;
+            info!("Configuration reloaded");
+            let new_tls_dirs = compute_tls_dirs(&cfg, config_dir);
+            *cached_config = Some(cfg);
+            new_tls_dirs != *tls_dirs
+        }
+        Err(e) => {
+            warn!("Failed to reload configuration: {e}");
+            false
+        }
+    }
+}
+
 async fn watch_config_loop(
     config_path: PathBuf,
     notifier: Arc<dyn ConfigNotifier>,
@@ -227,15 +350,7 @@ async fn watch_config_loop(
     let canonical_config_path =
         fs::canonicalize(&config_path).unwrap_or_else(|_| config_path.clone());
     let canonical_config_dir = fs::canonicalize(&config_dir).unwrap_or_else(|_| config_dir.clone());
-
-    let mut cached_config: Option<Configuration> = match Configuration::load(&config_path) {
-        Ok(cfg) => Some(cfg),
-        Err(e) => {
-            warn!("Failed to load configuration, watching for changes: {e}");
-            None
-        }
-    };
-
+    let mut cached_config = load_initial_config(&config_path);
     loop {
         let tls_dirs = cached_config
             .as_ref()
@@ -245,70 +360,17 @@ async fn watch_config_loop(
             .iter()
             .map(|d| fs::canonicalize(d).unwrap_or_else(|_| d.clone()))
             .collect();
-
-        let tx_clone = tx.clone();
-        let mut watcher =
-            notify::recommended_watcher(move |res| handle_notify_result(res, &tx_clone))?;
-
-        watcher.watch(&config_dir, RecursiveMode::NonRecursive)?;
-        for dir in &tls_dirs {
-            if *dir != config_dir
-                && let Err(e) = watcher.watch(dir, RecursiveMode::NonRecursive)
-            {
-                warn!("Failed to watch TLS directory {:?}: {e}", dir);
-            }
-        }
-
-        loop {
-            let Some(event) = rx.recv().await else {
-                error!("Config watcher channel closed");
-                return Ok(());
-            };
-
-            let initial_kind = classify_event(
-                &event,
-                &canonical_config_path,
-                &canonical_config_dir,
-                &canonical_tls_dirs,
-            );
-            if matches!(initial_kind, ChangeKind::Irrelevant) {
-                continue;
-            }
-
-            let Some(kind) = coalesce_events(
-                &mut rx,
-                initial_kind,
-                &canonical_config_path,
-                &canonical_config_dir,
-                &canonical_tls_dirs,
-            )
-            .await
-            else {
-                error!("Config watcher channel closed");
-                return Ok(());
-            };
-
-            match kind {
-                ChangeKind::Irrelevant => {}
-                ChangeKind::Config => {
-                    info!("Configuration change detected, reloading");
-                    match Configuration::load(&config_path) {
-                        Ok(cfg) => {
-                            notifier.notify_config_change(&cfg).await;
-                            info!("Configuration reloaded");
-                            let new_tls_dirs = compute_tls_dirs(&cfg, &config_dir);
-                            cached_config = Some(cfg);
-                            if new_tls_dirs != tls_dirs {
-                                break;
-                            }
-                        }
-                        Err(e) => warn!("Failed to reload configuration: {e}"),
-                    }
-                }
-                ChangeKind::Tls => {
-                    handle_tls_event(&mut cached_config, &config_path, notifier.as_ref());
-                }
-            }
+        let _watcher = build_watcher(&config_dir, &tls_dirs, tx.clone())?;
+        let paths = WatchPaths {
+            config_path: &config_path,
+            config_dir: &config_dir,
+            canonical_config_path: &canonical_config_path,
+            canonical_config_dir: &canonical_config_dir,
+            canonical_tls_dirs: &canonical_tls_dirs,
+            tls_dirs: &tls_dirs,
+        };
+        if !run_event_loop(&mut rx, &paths, &mut cached_config, notifier.as_ref()).await {
+            return Ok(());
         }
     }
 }
@@ -921,7 +983,7 @@ bind_address = "10.0.0.1"
     // through `watch_config_loop` does not normally exhibit the empty-cache
     // race in tests (a config-repair write fires `ChangeKind::Config` first,
     // populating the cache before any TLS event), so it cannot reliably cover
-    // the `cached.is_none()` branch in `resolve_config` / `handle_tls_event`.
+    // the `cached.is_none()` branch in `resolve_config` / `reload_tls`.
     // Calling those helpers directly does.
 
     #[test]
@@ -980,7 +1042,7 @@ bind_address = "10.0.0.1"
     }
 
     #[tokio::test]
-    async fn handle_tls_event_loads_from_disk_when_cache_empty_and_notifies() {
+    async fn reload_tls_loads_from_disk_when_cache_empty_and_notifies() {
         let temp_dir = TempDir::new().unwrap();
         let tls_dir = temp_dir.path().join("tls");
         fs::create_dir_all(&tls_dir).unwrap();
@@ -997,7 +1059,7 @@ bind_address = "10.0.0.1"
 
         let notifier = TestNotifier::new();
         let mut cached: Option<Configuration> = None;
-        handle_tls_event(&mut cached, &config_path, &notifier);
+        reload_tls(&mut cached, &config_path, &notifier);
 
         assert_eq!(
             notifier.tls_change_count(),
@@ -1011,21 +1073,21 @@ bind_address = "10.0.0.1"
     }
 
     #[tokio::test]
-    async fn handle_tls_event_does_not_notify_when_cache_empty_and_disk_invalid() {
+    async fn reload_tls_does_not_notify_when_cache_empty_and_disk_invalid() {
         let temp_dir = TempDir::new().unwrap();
         let config_path = temp_dir.path().join("config.toml");
         fs::write(&config_path, b"invalid toml [[[").unwrap();
 
         let notifier = TestNotifier::new();
         let mut cached: Option<Configuration> = None;
-        handle_tls_event(&mut cached, &config_path, &notifier);
+        reload_tls(&mut cached, &config_path, &notifier);
 
         assert_eq!(notifier.tls_change_count(), 0);
         assert!(cached.is_none());
     }
 
     #[tokio::test]
-    async fn handle_tls_event_does_not_notify_when_server_is_not_tls() {
+    async fn reload_tls_does_not_notify_when_server_is_not_tls() {
         let temp_dir = TempDir::new().unwrap();
         // Insecure server config — no TLS section.
         let cached_cfg: Configuration =
@@ -1034,7 +1096,7 @@ bind_address = "10.0.0.1"
         let notifier = TestNotifier::new();
         let mut cached: Option<Configuration> = Some(cached_cfg);
         let bogus_path = temp_dir.path().join("does-not-exist.toml");
-        handle_tls_event(&mut cached, &bogus_path, &notifier);
+        reload_tls(&mut cached, &bogus_path, &notifier);
 
         assert_eq!(notifier.tls_change_count(), 0);
     }

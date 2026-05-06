@@ -1,4 +1,10 @@
-//! Shared distributed-lock transaction engine for `update_links`.
+//! Transaction builder and lock-coordinated executor for `update_links`.
+//!
+//! The public face of this module is [`Transaction`] (obtained via
+//! [`MetadataStoreExt::begin_transaction`]) and its associated builder
+//! [`CreateLinkBuilder`]. The [`run_link_transaction`] function is the shared
+//! distributed-lock engine used by the filesystem and S3 lock-coordinator
+//! backends.
 //!
 //! Both the filesystem and S3 (lock-coordinator) backends delegate their
 //! `update_links` implementation to [`run_link_transaction`]. The differences
@@ -13,10 +19,14 @@
 
 use std::collections::HashMap;
 
-use crate::registry::metadata_store::{
-    Error, LinkOperation,
-    lock::LockBackend,
-    lock_ops::{LockOps, ValidationResult},
+use crate::{
+    oci::{Descriptor, Digest},
+    registry::metadata_store::{
+        Error, MetadataStore,
+        link_kind::LinkKind,
+        lock::LockBackend,
+        lock_ops::{LockOps, ValidationResult},
+    },
 };
 
 /// Maximum number of retry attempts when concurrent modifications invalidate
@@ -133,4 +143,131 @@ fn retry_exceeded_error() -> Error {
 
 fn lock_invalidated_error() -> Error {
     Error::Lock("lock invalidated during operation".into())
+}
+
+pub struct ResolvedCreate {
+    pub link: LinkKind,
+    pub target: Digest,
+    pub old_target: Option<Digest>,
+    pub referrer: Option<Digest>,
+    pub media_type: Option<String>,
+    pub descriptor: Option<Descriptor>,
+}
+
+pub struct ResolvedDelete {
+    pub link: LinkKind,
+    pub target: Digest,
+    pub referrer: Option<Digest>,
+}
+
+#[derive(Debug, Clone)]
+pub enum LinkOperation {
+    Create {
+        link: LinkKind,
+        target: Digest,
+        referrer: Option<Digest>,
+        media_type: Option<String>,
+        descriptor: Option<Box<Descriptor>>,
+    },
+    Delete {
+        link: LinkKind,
+        referrer: Option<Digest>,
+    },
+}
+
+pub struct Transaction<'a> {
+    store: &'a (dyn MetadataStore + Send + Sync),
+    namespace: String,
+    operations: Vec<LinkOperation>,
+}
+
+/// Builder for a single `Create` link operation within a [`Transaction`].
+///
+/// Obtain one via [`Transaction::create_link`] and finalize it by calling [`add`](Self::add).
+pub struct CreateLinkBuilder<'tx, 'store: 'tx> {
+    tx: &'tx mut Transaction<'store>,
+    link: LinkKind,
+    target: Digest,
+    referrer: Option<Digest>,
+    media_type: Option<String>,
+    descriptor: Option<Descriptor>,
+}
+
+impl<'tx, 'store: 'tx> CreateLinkBuilder<'tx, 'store> {
+    /// Associates a referrer digest with this link.
+    pub fn with_referrer(mut self, referrer: &Digest) -> Self {
+        self.referrer = Some(referrer.clone());
+        self
+    }
+
+    /// Associates a media type with this link.
+    pub fn with_media_type(mut self, media_type: &str) -> Self {
+        self.media_type = Some(media_type.to_string());
+        self
+    }
+
+    /// Associates an OCI descriptor with this link.
+    pub fn with_descriptor(mut self, descriptor: Descriptor) -> Self {
+        self.descriptor = Some(descriptor);
+        self
+    }
+
+    /// Appends the operation to the enclosing transaction.
+    pub fn add(self) {
+        self.tx.operations.push(LinkOperation::Create {
+            link: self.link,
+            target: self.target,
+            referrer: self.referrer,
+            media_type: self.media_type,
+            descriptor: self.descriptor.map(Box::new),
+        });
+    }
+}
+
+impl<'store> Transaction<'store> {
+    pub fn new(store: &'store (dyn MetadataStore + Send + Sync), namespace: String) -> Self {
+        Transaction {
+            store,
+            namespace,
+            operations: Vec::new(),
+        }
+    }
+
+    pub fn create_link<'tx>(
+        &'tx mut self,
+        link: &LinkKind,
+        target: &Digest,
+    ) -> CreateLinkBuilder<'tx, 'store> {
+        CreateLinkBuilder {
+            tx: self,
+            link: link.clone(),
+            target: target.clone(),
+            referrer: None,
+            media_type: None,
+            descriptor: None,
+        }
+    }
+
+    pub fn delete_link(&mut self, link: &LinkKind) {
+        self.operations.push(LinkOperation::Delete {
+            link: link.clone(),
+            referrer: None,
+        });
+    }
+
+    pub fn delete_link_with_referrer(&mut self, link: &LinkKind, referrer: &Digest) {
+        self.operations.push(LinkOperation::Delete {
+            link: link.clone(),
+            referrer: Some(referrer.clone()),
+        });
+    }
+
+    pub async fn commit(self) -> Result<(), Error> {
+        if self.operations.is_empty() {
+            return Ok(());
+        }
+        self.store
+            .update_links(&self.namespace, &self.operations)
+            .await
+    }
 }

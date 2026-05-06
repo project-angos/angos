@@ -1,10 +1,10 @@
 use async_trait::async_trait;
 use chrono::{DateTime, Duration, Utc};
-use tracing::{info, instrument};
+use tracing::instrument;
 
 use super::Backend;
 use crate::registry::{
-    blob_store::{Error, MultipartCleanup},
+    blob_store::{Error, MultipartCleanup, OrphanMultipartUpload},
     path_builder,
 };
 
@@ -28,45 +28,14 @@ pub fn is_orphan(initiated: DateTime<Utc>, now: DateTime<Utc>, timeout: Duration
     now.signed_duration_since(initiated) >= timeout
 }
 
-impl Backend {
-    async fn check_and_abort_orphan(
-        &self,
-        key: &str,
-        upload_id: &str,
-        initiated: DateTime<Utc>,
-        now: DateTime<Utc>,
-        timeout: Duration,
-        dry_run: bool,
-    ) -> Result<bool, Error> {
-        if !is_orphan(initiated, now, timeout) {
-            return Ok(false);
-        }
-        let Some((namespace, uuid)) = parse_upload_key(key) else {
-            return Ok(false);
-        };
-        let startedat_path = path_builder::upload_start_date_path(namespace, uuid);
-        if self.store.object_size(&startedat_path).await.is_ok() {
-            return Ok(false);
-        }
-        if dry_run {
-            info!("DRY RUN: would abort orphan multipart upload {key}");
-        } else {
-            info!("Aborting orphan multipart upload {key}");
-            self.store.abort_multipart_upload(key, upload_id).await?;
-        }
-        Ok(true)
-    }
-}
-
 #[async_trait]
 impl MultipartCleanup for Backend {
     #[instrument(skip(self))]
-    async fn cleanup_orphan_multipart_uploads(
+    async fn list_orphan_multipart_uploads(
         &self,
         timeout: Duration,
-        dry_run: bool,
-    ) -> Result<usize, Error> {
-        let mut count = 0;
+    ) -> Result<Vec<OrphanMultipartUpload>, Error> {
+        let mut orphans = Vec::new();
         let now = Utc::now();
         let mut key_marker: Option<String> = None;
         let mut upload_id_marker: Option<String> = None;
@@ -77,13 +46,21 @@ impl MultipartCleanup for Backend {
                 .list_multipart_uploads(None, key_marker.as_deref(), upload_id_marker.as_deref())
                 .await?;
 
-            for (key, upload_id, initiated) in uploads {
-                if self
-                    .check_and_abort_orphan(&key, &upload_id, initiated, now, timeout, dry_run)
-                    .await?
-                {
-                    count += 1;
+            for upload in uploads {
+                if !is_orphan(upload.initiated_at, now, timeout) {
+                    continue;
                 }
+                let Some((namespace, uuid)) = parse_upload_key(&upload.key) else {
+                    continue;
+                };
+                let startedat_path = path_builder::upload_start_date_path(namespace, uuid);
+                if self.store.object_size(&startedat_path).await.is_ok() {
+                    continue;
+                }
+                orphans.push(OrphanMultipartUpload {
+                    key: upload.key,
+                    upload_id: upload.upload_id,
+                });
             }
 
             if next_key.is_none() {
@@ -93,7 +70,17 @@ impl MultipartCleanup for Backend {
             upload_id_marker = next_upload_id;
         }
 
-        Ok(count)
+        Ok(orphans)
+    }
+
+    async fn abort_orphan_multipart_upload(
+        &self,
+        upload: &OrphanMultipartUpload,
+    ) -> Result<(), Error> {
+        self.store
+            .abort_multipart_upload(&upload.key, &upload.upload_id)
+            .await
+            .map_err(Error::from)
     }
 }
 
