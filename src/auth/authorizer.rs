@@ -171,19 +171,15 @@ impl Authorizer {
     }
 
     fn is_tag_mutable(&self, auth_repo: &AuthorizerRepository, tag: &str) -> bool {
-        let immutable = auth_repo.immutable_tags || self.global_immutable_tags;
-
-        if !immutable {
-            return true;
-        }
-
+        let is_immutable = auth_repo.immutable_tags || self.global_immutable_tags;
         let exclusions = if auth_repo.immutable_tags_exclusions.is_empty() {
             &self.global_immutable_tags_exclusions
         } else {
             &auth_repo.immutable_tags_exclusions
         };
+        let is_excluded = exclusions.iter().any(|pattern| pattern.is_match(tag));
 
-        exclusions.iter().any(|pattern| pattern.is_match(tag))
+        !is_immutable || is_excluded
     }
 
     pub fn is_tag_immutable(&self, namespace: &str, tag: &str) -> bool {
