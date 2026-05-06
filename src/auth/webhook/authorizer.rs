@@ -5,7 +5,7 @@ use reqwest::{Client, redirect::Policy};
 use tracing::warn;
 
 use super::{
-    cache::cache_retrieve,
+    cache::lookup_cached_decision,
     config::Config,
     headers::{build_cache_key, build_headers},
     metrics::{WEBHOOK_DURATION, WEBHOOK_REQUESTS},
@@ -70,7 +70,7 @@ impl WebhookAuthorizer {
         let cache_key = build_cache_key(&self.name, action, identity);
 
         if let Ok(cache_key) = &cache_key
-            && let Ok(Some(cached)) = cache_retrieve(&self.cache, &self.name, cache_key).await
+            && let Some(cached) = lookup_cached_decision(&self.cache, &self.name, cache_key).await
         {
             return Ok(cached);
         }
