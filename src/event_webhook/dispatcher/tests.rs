@@ -886,10 +886,10 @@ async fn test_shutdown_rejects_new_async_dispatches() {
         .shutdown_with_timeout(TEST_SHUTDOWN_TIMEOUT)
         .await;
 
-    // Dispatch after shutdown — delivery must be skipped
-    let result = dispatcher.dispatch(&event).await;
-    // Either an error or Ok with no delivery is acceptable
-    let _ = result;
+    // Dispatch after shutdown — delivery must be skipped. Either an error or
+    // Ok with no delivery is acceptable; the absence of HTTP requests is the
+    // real assertion (verified below via server.received_requests()).
+    drop(dispatcher.dispatch(&event).await);
 
     // Give any (unexpected) background task time to run
     tokio::time::sleep(Duration::from_millis(200)).await;
