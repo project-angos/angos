@@ -14,6 +14,10 @@ use tracing::{debug, error, info, warn};
 use super::{Configuration, Error, ServerConfig};
 use crate::configuration::listeners::tls::ServerTlsConfig;
 
+/// Window during which filesystem events are coalesced into a single reload.
+/// Editors typically emit several `Modify`/`Create`/`Remove` events per save
+/// (atomic-write rename, swap-file dance, etc.); waiting this long after the
+/// last event before reloading collapses the burst into one config-load pass.
 const DEBOUNCE: Duration = Duration::from_millis(100);
 
 #[derive(Debug, Clone, Copy, PartialEq)]
