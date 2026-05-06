@@ -19,22 +19,19 @@ pub fn serve_asset(path: &str) -> Result<Response<ResponseBody>, Error> {
 
     if let Some(content) = UiAssets::get(asset_path) {
         let mime = mime_guess::from_path(asset_path).first_or_octet_stream();
-        return Ok(Response::builder()
-            .status(StatusCode::OK)
-            .header(CONTENT_TYPE, mime.as_ref())
-            .body(ResponseBody::Fixed(Full::new(Bytes::from(
-                content.data.into_owned(),
-            ))))?);
+        return serve_bytes(mime.as_ref(), content.data.into_owned());
     }
 
     if let Some(content) = UiAssets::get("index.html") {
-        return Ok(Response::builder()
-            .status(StatusCode::OK)
-            .header(CONTENT_TYPE, "text/html; charset=utf-8")
-            .body(ResponseBody::Fixed(Full::new(Bytes::from(
-                content.data.into_owned(),
-            ))))?);
+        return serve_bytes("text/html; charset=utf-8", content.data.into_owned());
     }
 
     Err(Error::NotFound("UI asset not found".to_string()))
+}
+
+fn serve_bytes(mime: &str, data: Vec<u8>) -> Result<Response<ResponseBody>, Error> {
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .header(CONTENT_TYPE, mime)
+        .body(ResponseBody::Fixed(Full::new(Bytes::from(data))))?)
 }
