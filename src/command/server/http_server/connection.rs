@@ -70,13 +70,12 @@ async fn handle_request(
     let start_time = Instant::now();
     let method = request.method().to_owned();
     let path = request.uri().path().to_owned();
-    let route_action = router::parse(request.method(), request.uri())
-        .as_ref()
-        .map_or("unknown", Action::action_name);
+    let action = router::parse(request.method(), request.uri());
+    let route_action = action.as_ref().map_or("unknown", Action::action_name);
 
     let trace_id = current_trace_id(&Span::current());
 
-    let response = match dispatch_request(Arc::clone(&context), request).await {
+    let response = match dispatch_request(Arc::clone(&context), request, action).await {
         Ok(response) => response,
         Err(error) => error_to_response(&error, trace_id.as_ref()),
     };

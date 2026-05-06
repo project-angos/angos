@@ -20,19 +20,20 @@ use crate::{
         handlers,
         request_ext::{HeaderExt, IntoAsyncRead},
         response_body::ResponseBody,
-        router, ui,
+        ui,
     },
     identity::{Action, ClientIdentity},
     oci::{Digest, Namespace, Reference},
 };
 
-#[instrument(skip(context, req))]
+#[instrument(skip(context, req, action))]
 pub async fn dispatch_request(
     context: Arc<ServerContext>,
     req: Request<Incoming>,
+    action: Option<Action>,
 ) -> Result<Response<ResponseBody>, Error> {
     let (parts, incoming) = req.into_parts();
-    let Some(action) = router::parse(&parts.method, &parts.uri) else {
+    let Some(action) = action else {
         return handle_unknown_route(&parts);
     };
 
