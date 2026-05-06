@@ -1,6 +1,6 @@
 use std::{sync::Arc, time::Duration};
 
-use hyper::http::request::Parts;
+use hyper::http::{HeaderMap, request::Parts};
 use reqwest::{Client, redirect::Policy};
 use tracing::warn;
 
@@ -61,6 +61,38 @@ impl WebhookAuthorizer {
         })
     }
 
+    async fn do_request(&self, headers: &HeaderMap) -> Result<reqwest::Response, reqwest::Error> {
+        let mut request = self.client.get(self.config.url.clone());
+        for (key, value) in headers {
+            request = request.header(key, value);
+        }
+        if let Some(auth) = &self.config.auth {
+            request = auth.apply_to(request);
+        }
+        request.send().await
+    }
+
+    fn record_outcome(&self, label: &str) {
+        WEBHOOK_REQUESTS
+            .with_label_values(&[self.name.as_str(), label])
+            .inc();
+    }
+
+    /// Best-effort: a cache-store failure does not affect the authorization decision;
+    /// the warn surfaces a misbehaving cache that would silently double webhook traffic.
+    async fn cache_outcome(&self, cache_key: &str, allowed: bool) {
+        if let Err(e) = self
+            .cache
+            .store(cache_key, &allowed, self.config.cache_ttl)
+            .await
+        {
+            warn!(
+                "Webhook '{}' cache store failed: {e}; authorization unaffected",
+                self.name
+            );
+        }
+    }
+
     pub async fn authorize(
         &self,
         action: &Action,
@@ -78,53 +110,25 @@ impl WebhookAuthorizer {
         let timer = WEBHOOK_DURATION
             .with_label_values(&[&self.name])
             .start_timer();
-
         let headers = build_headers(&self.config.forward_headers, action, identity, parts)?;
-        let mut request = self.client.get(self.config.url.clone());
-        for (key, value) in &headers {
-            request = request.header(key, value);
-        }
-
-        if let Some(auth) = &self.config.auth {
-            request = auth.apply_to(request);
-        }
-
-        let send_result = request.send().await;
+        let send_result = self.do_request(&headers).await;
         timer.observe_duration();
 
         match send_result {
             Ok(resp) => {
                 let allowed = resp.status().is_success();
-                let result_label = if allowed { "allow" } else { "deny" }.to_string();
-                WEBHOOK_REQUESTS
-                    .with_label_values(&[&self.name, &result_label])
-                    .inc();
-                if let Ok(cache_key) = &cache_key
-                    && let Err(e) = self
-                        .cache
-                        .store(cache_key, &allowed, self.config.cache_ttl)
-                        .await
-                {
-                    // Best-effort: cache-write failure must not affect the authorization
-                    // decision, but a misbehaving cache silently doubling webhook traffic
-                    // is exactly the symptom the warn surfaces.
-                    warn!(
-                        "Webhook '{}' cache store failed: {e}; authorization unaffected",
-                        self.name
-                    );
+                self.record_outcome(if allowed { "allow" } else { "deny" });
+                if let Ok(cache_key) = &cache_key {
+                    self.cache_outcome(cache_key, allowed).await;
                 }
                 Ok(allowed)
             }
             Err(e) => {
-                // Authorization webhook unreachable: fail closed and surface the
-                // transport-failure cause to operators. The "transport_error" metric
-                // label distinguishes this from explicit deny on dashboards. The
-                // cache is intentionally NOT updated — a transient outage must not
+                // Webhook unreachable: fail closed and surface the transport cause.
+                // Cache is intentionally not updated so a transient outage does not
                 // pin a stale deny for cache_ttl.
                 warn!("Webhook '{}' request failed: {e}", self.name);
-                WEBHOOK_REQUESTS
-                    .with_label_values(&[&self.name, &"transport_error".to_string()])
-                    .inc();
+                self.record_outcome("transport_error");
                 Err(Error::Unauthorized(format!(
                     "authorization webhook '{}' unreachable: {e}",
                     self.name
