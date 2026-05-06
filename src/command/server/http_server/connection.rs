@@ -45,20 +45,37 @@ pub async fn serve_request<S>(
 
     let _in_flight_guard = InFlightGuard::new();
 
-    for (iter, sleep_duration) in timeouts.iter().enumerate() {
-        debug!("iter = {iter} sleep_duration = {sleep_duration:?}");
-        tokio::select! {
-            res = conn.as_mut() => {
-                match res {
-                    Ok(()) => debug!("after polling conn, no error"),
-                    Err(error) =>  debug!("error serving connection: {error}"),
-                }
-                break;
+    let [query_timeout, grace_period] = *timeouts;
+
+    // Phase 1: serve until the connection finishes or its query timeout (a wall-clock
+    // deadline from connection start, not an activity-reset watchdog) fires. On
+    // timeout, signal a graceful shutdown so the connection stops accepting new
+    // requests on the keepalive but still drains the in-flight one.
+    tokio::select! {
+        res = conn.as_mut() => {
+            match res {
+                Ok(()) => debug!("connection completed before query timeout"),
+                Err(error) => debug!("connection error before query timeout: {error}"),
             }
-            () = tokio::time::sleep(*sleep_duration) => {
-                debug!("iter = {iter} got timeout_interval, calling conn.graceful_shutdown");
-                conn.as_mut().graceful_shutdown();
+            return;
+        }
+        () = tokio::time::sleep(query_timeout) => {
+            debug!("query timeout reached, signalling graceful shutdown");
+            conn.as_mut().graceful_shutdown();
+        }
+    }
+
+    // Phase 2: graceful shutdown — wait for the connection to drain, or for the
+    // grace period to elapse and drop the connection.
+    tokio::select! {
+        res = conn.as_mut() => {
+            match res {
+                Ok(()) => debug!("connection drained after graceful shutdown"),
+                Err(error) => debug!("connection error during graceful shutdown: {error}"),
             }
+        }
+        () = tokio::time::sleep(grace_period) => {
+            debug!("grace period expired, dropping connection");
         }
     }
 }
