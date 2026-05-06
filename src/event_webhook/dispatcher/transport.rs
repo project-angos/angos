@@ -40,20 +40,44 @@ pub async fn send_request(req: &DeliveryRequest<'_>) -> Result<(), String> {
 }
 
 pub async fn send_with_retries(req: &DeliveryRequest<'_>, max_retries: u32) -> Result<(), String> {
-    let mut last_err = None;
+    let mut first_err: Option<String> = None;
+    let mut last_err: Option<String> = None;
+    let mut attempts: u32 = 0;
 
     for attempt in 0..=max_retries {
         if attempt > 0 {
             tokio::time::sleep(backoff_for_attempt(attempt)).await;
         }
 
+        attempts += 1;
         match send_request(req).await {
             Ok(()) => return Ok(()),
-            Err(e) => last_err = Some(e),
+            Err(e) => {
+                if first_err.is_none() {
+                    first_err = Some(e.clone());
+                }
+                last_err = Some(e);
+            }
         }
     }
 
-    Err(last_err.unwrap_or_else(|| "unknown error".to_string()))
+    Err(format_retry_failure(
+        attempts,
+        first_err.as_deref(),
+        last_err.as_deref(),
+    ))
+}
+
+fn format_retry_failure(attempts: u32, first: Option<&str>, last: Option<&str>) -> String {
+    match (first, last) {
+        (None, _) | (_, None) => format!("after {attempts} attempt(s): unknown error"),
+        (Some(f), Some(l)) if f == l => {
+            format!("after {attempts} attempt(s): {f}")
+        }
+        (Some(f), Some(l)) => {
+            format!("after {attempts} attempt(s); first error: {f}; last error: {l}")
+        }
+    }
 }
 
 // `attempt` must be >= 1. Both operations saturate at u64::MAX rather than
@@ -77,5 +101,37 @@ mod tests {
     #[test]
     fn backoff_saturates_for_huge_attempt() {
         assert_eq!(backoff_for_attempt(100), Duration::from_millis(u64::MAX));
+    }
+
+    #[test]
+    fn format_retry_failure_one_attempt_identical_error() {
+        assert_eq!(
+            format_retry_failure(1, Some("connection refused"), Some("connection refused")),
+            "after 1 attempt(s): connection refused"
+        );
+    }
+
+    #[test]
+    fn format_retry_failure_three_attempts_identical_error() {
+        assert_eq!(
+            format_retry_failure(3, Some("connection refused"), Some("connection refused")),
+            "after 3 attempt(s): connection refused"
+        );
+    }
+
+    #[test]
+    fn format_retry_failure_three_attempts_different_errors() {
+        assert_eq!(
+            format_retry_failure(3, Some("timeout"), Some("503 Service Unavailable")),
+            "after 3 attempt(s); first error: timeout; last error: 503 Service Unavailable"
+        );
+    }
+
+    #[test]
+    fn format_retry_failure_none_is_defensive_unknown() {
+        assert_eq!(
+            format_retry_failure(0, None, None),
+            "after 0 attempt(s): unknown error"
+        );
     }
 }
