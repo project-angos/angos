@@ -79,7 +79,8 @@ impl Backend {
     }
 
     pub fn check_circuit_breaker(&self) -> Result<(), IoError> {
-        self.circuit_breaker.check()
+        self.circuit_breaker.check()?;
+        Ok(())
     }
 
     pub fn record_io_result<T>(&self, result: &Result<T, IoError>) {
