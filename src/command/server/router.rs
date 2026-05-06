@@ -64,6 +64,12 @@ impl DigestQuery {
     }
 }
 
+fn digest_from_params(params: Option<&str>) -> Option<Digest> {
+    params
+        .map(parse_query::<DigestQuery>)
+        .and_then(|r| r.to_digest())
+}
+
 #[derive(Deserialize, Debug, Default)]
 #[serde(rename_all = "camelCase")]
 struct ArtifactTypeQuery {
@@ -119,9 +125,7 @@ fn try_parse_uploads(method: &Method, path: &str, params: Option<&str>) -> Optio
             && method == Method::POST
         {
             let namespace = Namespace::new(namespace_str).ok()?;
-            let digest = params
-                .map(parse_query::<DigestQuery>)
-                .and_then(|r| r.to_digest());
+            let digest = digest_from_params(params);
 
             return Some(Action::StartUpload { namespace, digest });
         }
@@ -142,10 +146,7 @@ fn try_parse_upload(method: &Method, path: &str, params: Option<&str>) -> Option
             Method::GET => return Some(Action::GetUpload { namespace, uuid }),
             Method::PATCH => return Some(Action::PatchUpload { namespace, uuid }),
             Method::PUT => {
-                if let Some(digest) = params
-                    .map(parse_query::<DigestQuery>)
-                    .and_then(|r| r.to_digest())
-                {
+                if let Some(digest) = digest_from_params(params) {
                     return Some(Action::PutUpload {
                         namespace,
                         uuid,
