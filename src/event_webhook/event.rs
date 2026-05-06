@@ -18,6 +18,18 @@ pub enum EventKind {
     TagDelete,
 }
 
+impl EventKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            EventKind::ManifestPush => "manifest.push",
+            EventKind::ManifestDelete => "manifest.delete",
+            EventKind::BlobPush => "blob.push",
+            EventKind::TagCreate => "tag.create",
+            EventKind::TagDelete => "tag.delete",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct EventActor {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -292,5 +304,34 @@ mod tests {
         assert!(json["actor"].get("id").is_none());
         assert_eq!(json["actor"]["username"], "ci-bot");
         assert!(json["actor"].get("client_ip").is_none());
+    }
+
+    #[test]
+    fn event_kind_as_str_covers_all_variants() {
+        assert_eq!(EventKind::ManifestPush.as_str(), "manifest.push");
+        assert_eq!(EventKind::ManifestDelete.as_str(), "manifest.delete");
+        assert_eq!(EventKind::BlobPush.as_str(), "blob.push");
+        assert_eq!(EventKind::TagCreate.as_str(), "tag.create");
+        assert_eq!(EventKind::TagDelete.as_str(), "tag.delete");
+    }
+
+    #[test]
+    fn event_kind_as_str_matches_serde_rename() {
+        let variants = [
+            EventKind::ManifestPush,
+            EventKind::ManifestDelete,
+            EventKind::BlobPush,
+            EventKind::TagCreate,
+            EventKind::TagDelete,
+        ];
+        for kind in variants {
+            let serialized = serde_json::to_string(&kind).unwrap();
+            let unquoted = serialized.trim_matches('"');
+            assert_eq!(
+                kind.as_str(),
+                unquoted,
+                "as_str must equal serde rename for {kind:?}"
+            );
+        }
     }
 }

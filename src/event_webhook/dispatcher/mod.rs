@@ -95,15 +95,10 @@ async fn send_and_record(
     result
 }
 
-fn serialize_event(event: &Event) -> Result<(Vec<u8>, String), Error> {
+fn serialize_event(event: &Event) -> Result<(Vec<u8>, &'static str), Error> {
     let body = serde_json::to_vec(event)
         .map_err(|e| Error::Initialization(format!("Failed to serialize event: {e}")))?;
-    let event_kind_header = serde_json::to_value(&event.kind)
-        .map_err(|e| Error::Initialization(format!("Failed to serialize event kind: {e}")))?
-        .as_str()
-        .unwrap_or_default()
-        .to_string();
-    Ok((body, event_kind_header))
+    Ok((body, event.kind.as_str()))
 }
 
 impl EventDispatcher {
@@ -228,11 +223,11 @@ impl EventDispatcher {
             }
 
             let timer = DELIVERY_DURATION
-                .with_label_values(&[name.as_str(), event_kind_header.as_str()])
+                .with_label_values(&[name.as_str(), event_kind_header])
                 .start_timer();
 
             if !self
-                .deliver_for_endpoint(name, endpoint, &body, &event_kind_header)
+                .deliver_for_endpoint(name, endpoint, &body, event_kind_header)
                 .await?
             {
                 continue;
