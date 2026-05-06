@@ -54,13 +54,13 @@ pub async fn accept_loop<C: Connector>(
         let context = Arc::clone(&context.load());
         let timeouts = Arc::clone(&timeouts.load());
 
-        tokio::spawn(Box::pin(serve_request(
+        tokio::spawn(serve_request(
             stream,
             context,
             handshake.peer_certificate,
             timeouts,
             remote_address,
-        )));
+        ));
     }
 }
 
