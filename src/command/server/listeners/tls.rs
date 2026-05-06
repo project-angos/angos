@@ -58,9 +58,8 @@ impl Connector for TlsConnector<'_> {
         tcp: TcpStream,
         remote_address: SocketAddr,
     ) -> Option<HandshakeResult<Self::Stream>> {
-        let acceptor = self.tls_acceptor.load();
+        let acceptor = Arc::clone(&self.tls_acceptor.load());
         let result = acceptor.accept(tcp).await;
-        drop(acceptor);
 
         let tls = match result {
             Ok(tls) => tls,
