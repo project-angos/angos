@@ -1,12 +1,68 @@
-use std::net::SocketAddr;
+use std::{fmt::Debug, net::SocketAddr, sync::Arc, time::Duration};
 
-use tokio::net::{TcpListener, TcpStream};
-use tracing::debug;
+use arc_swap::ArcSwap;
+use async_trait::async_trait;
+use hyper_util::rt::TokioIo;
+use tokio::{
+    io::{AsyncRead, AsyncWrite},
+    net::{TcpListener, TcpStream},
+};
+use tracing::{debug, info};
 
-use crate::command::server::error::Error;
+use crate::command::server::{ServerContext, error::Error, serve_request};
 
 pub mod insecure;
 pub mod tls;
+
+pub struct HandshakeResult<S> {
+    pub stream: S,
+    pub peer_certificate: Option<Vec<u8>>,
+}
+
+#[async_trait]
+pub trait Connector: Send + Sync {
+    type Stream: Unpin + AsyncWrite + AsyncRead + Send + Debug + 'static;
+
+    async fn handshake(
+        &self,
+        tcp: TcpStream,
+        remote_address: SocketAddr,
+    ) -> Option<HandshakeResult<Self::Stream>>;
+
+    fn label(&self) -> &'static str;
+}
+
+pub async fn accept_loop<C: Connector>(
+    binding_address: SocketAddr,
+    connector: &C,
+    context: &ArcSwap<ServerContext>,
+    timeouts: &ArcSwap<[Duration; 2]>,
+) -> Result<(), Error> {
+    info!("Listening on {} ({})", binding_address, connector.label());
+    let listener = build_listener(binding_address).await?;
+
+    loop {
+        debug!("Waiting for incoming connection");
+        let (tcp, remote_address) = accept(&listener).await?;
+
+        let Some(handshake) = connector.handshake(tcp, remote_address).await else {
+            continue;
+        };
+
+        debug!("Accepted connection from {remote_address}");
+        let stream = TokioIo::new(handshake.stream);
+        let context = Arc::clone(&context.load());
+        let timeouts = Arc::clone(&timeouts.load());
+
+        tokio::spawn(Box::pin(serve_request(
+            stream,
+            context,
+            handshake.peer_certificate,
+            timeouts,
+            remote_address,
+        )));
+    }
+}
 
 async fn build_listener(binding_address: SocketAddr) -> Result<TcpListener, Error> {
     match TcpListener::bind(binding_address).await {
