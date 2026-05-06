@@ -7,7 +7,7 @@ use crate::{
         error::Error,
         handlers::build_response,
         http_server::event_emission::dispatch_events,
-        request_ext::{HeaderExt, IntoAsyncRead},
+        request_ext::{HeaderExt, incoming_into_async_read},
         response_body::ResponseBody,
     },
     event_webhook::event::{Event, EventActor},
@@ -138,7 +138,7 @@ pub async fn dispatch_put_manifest(
         "No Content-Type header provided".to_string(),
     ))?;
 
-    let body_stream = incoming.into_async_read();
+    let body_stream = incoming_into_async_read(incoming);
 
     let (response, events) = handle_put_manifest(
         context,

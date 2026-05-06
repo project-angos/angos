@@ -13,7 +13,7 @@ use crate::{
         error::Error,
         handlers::build_response,
         http_server::event_emission::dispatch_events,
-        request_ext::{HeaderExt, IntoAsyncRead},
+        request_ext::{HeaderExt, incoming_into_async_read},
         response_body::ResponseBody,
     },
     event_webhook::event::{Event, EventActor},
@@ -120,7 +120,7 @@ pub async fn dispatch_patch_upload(
 ) -> Result<Response<ResponseBody>, Error> {
     let start_offset = parts.range(CONTENT_RANGE)?.map(|(start, _)| start);
     let content_length: u64 = parts.parse_header(CONTENT_LENGTH).unwrap_or(0);
-    let body_stream = incoming.into_async_read();
+    let body_stream = incoming_into_async_read(incoming);
 
     handle_patch_upload(
         context,
@@ -143,7 +143,7 @@ pub async fn dispatch_put_upload(
     identity: &ClientIdentity,
 ) -> Result<Response<ResponseBody>, Error> {
     let content_length: u64 = parts.parse_header(CONTENT_LENGTH).unwrap_or(0);
-    let body_stream = incoming.into_async_read();
+    let body_stream = incoming_into_async_read(incoming);
 
     let (response, events) = handle_put_upload(
         context,

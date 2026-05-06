@@ -117,15 +117,9 @@ impl HeaderExt for response::Parts {
     }
 }
 
-pub trait IntoAsyncRead {
-    fn into_async_read(self) -> impl AsyncRead;
-}
-
-impl IntoAsyncRead for Incoming {
-    fn into_async_read(self) -> impl AsyncRead {
-        let stream = self.into_data_stream().map_err(io::Error::other);
-        StreamReader::new(stream)
-    }
+pub fn incoming_into_async_read(incoming: Incoming) -> impl AsyncRead {
+    let stream = incoming.into_data_stream().map_err(io::Error::other);
+    StreamReader::new(stream)
 }
 
 #[cfg(test)]
