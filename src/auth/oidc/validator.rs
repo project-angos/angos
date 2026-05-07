@@ -7,7 +7,7 @@ use tracing::{debug, info, warn};
 
 use crate::{
     auth::oidc::{Jwk, OidcProvider},
-    cache::{Cache, CacheExt},
+    cache::{Cache, CacheExt, CacheOutcome},
     command::server::{Error, sha256_hash},
     identity::OidcClaims,
 };
@@ -160,12 +160,14 @@ async fn fetch_jwks(
     let cache_key = format!("oidc:{provider_name}:jwks:{issuer_hash}");
 
     match cache.retrieve::<Jwks>(&cache_key).await {
-        Ok(Some(cached)) => {
+        CacheOutcome::Hit(cached) => {
             debug!("Using cached JWKS for provider: {provider_name}");
             return Ok(cached);
         }
-        Err(err) => warn!("OIDC JWKS cache retrieve failed for {provider_name}: {err}"),
-        Ok(None) => {}
+        CacheOutcome::Error(err) => {
+            warn!("OIDC JWKS cache retrieve failed for {provider_name}: {err}");
+        }
+        CacheOutcome::Miss => {}
     }
 
     let jwks_url = get_jwks_url(provider, client, cache).await?;
@@ -191,12 +193,14 @@ async fn fetch_oidc_configuration(
     let cache_key = format!("oidc:{provider_name}:config:{issuer_hash}");
 
     match cache.retrieve::<OpenIdConfiguration>(&cache_key).await {
-        Ok(Some(cached)) => {
+        CacheOutcome::Hit(cached) => {
             debug!("Using cached OIDC configuration");
             return Ok(cached);
         }
-        Err(err) => warn!("OIDC configuration cache retrieve failed for {provider_name}: {err}"),
-        Ok(None) => {}
+        CacheOutcome::Error(err) => {
+            warn!("OIDC configuration cache retrieve failed for {provider_name}: {err}");
+        }
+        CacheOutcome::Miss => {}
     }
 
     let config_url = format!("{}/.well-known/openid-configuration", provider.issuer());
