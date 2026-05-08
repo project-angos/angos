@@ -297,3 +297,27 @@ impl Drop for S3RegistryTestCase {
         }
     }
 }
+
+/// No-op `MultipartCleanup` for tests that need to construct a scrub `Executor`
+/// or `MultipartChecker` but don't exercise multipart cleanup behaviour.
+///
+/// Returns an empty list of orphans and silently succeeds on abort. Use when
+/// the test's subject under test doesn't touch S3 multipart uploads.
+pub struct NoopMultipart;
+
+#[async_trait::async_trait]
+impl blob_store::MultipartCleanup for NoopMultipart {
+    async fn list_orphan_multipart_uploads(
+        &self,
+        _timeout: chrono::Duration,
+    ) -> Result<Vec<blob_store::OrphanMultipartUpload>, blob_store::Error> {
+        Ok(vec![])
+    }
+
+    async fn abort_orphan_multipart_upload(
+        &self,
+        _upload: &blob_store::OrphanMultipartUpload,
+    ) -> Result<(), blob_store::Error> {
+        Ok(())
+    }
+}

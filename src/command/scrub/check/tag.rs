@@ -4,28 +4,32 @@ use async_trait::async_trait;
 use tracing::{debug, error};
 
 use crate::{
-    command::scrub::check::{NamespaceChecker, ensure_link},
+    command::scrub::{
+        check::{NamespaceChecker, ensure_link},
+        error::Error,
+        executor::ActionSink,
+    },
     registry::{
-        Error,
         metadata_store::{MetadataStore, link_kind::LinkKind},
-        pagination::for_each_page,
+        pagination::collect_all_pages,
     },
 };
 
 pub struct TagChecker {
     metadata_store: Arc<dyn MetadataStore + Send + Sync>,
-    dry_run: bool,
 }
 
 impl TagChecker {
-    pub fn new(metadata_store: Arc<dyn MetadataStore + Send + Sync>, dry_run: bool) -> Self {
-        Self {
-            metadata_store,
-            dry_run,
-        }
+    pub fn new(metadata_store: Arc<dyn MetadataStore + Send + Sync>) -> Self {
+        Self { metadata_store }
     }
 
-    async fn repair_tag_digest_link(&self, namespace: &str, tag: &str) -> Result<(), Error> {
+    async fn repair_tag_digest_link(
+        &self,
+        namespace: &str,
+        tag: &str,
+        sink: &mut (dyn ActionSink + Send),
+    ) -> Result<(), Error> {
         debug!("Checking digest link for tag '{namespace}:{tag}'");
         let tag_metadata = self
             .metadata_store
@@ -38,43 +42,47 @@ impl TagChecker {
             namespace,
             &digest_link,
             &tag_metadata.target,
-            self.dry_run,
+            sink,
         )
         .await
-    }
-
-    async fn process_page(&self, namespace: &str, tags: Vec<String>) -> Result<(), Error> {
-        for tag in &tags {
-            if let Err(e) = self.repair_tag_digest_link(namespace, tag).await {
-                error!("Failed to check tag from '{namespace}' (tag '{tag}'): {e}");
-            }
-        }
-        Ok(())
     }
 }
 
 #[async_trait]
 impl NamespaceChecker for TagChecker {
-    async fn check_namespace(&self, namespace: &str) -> Result<(), Error> {
+    async fn check(
+        &self,
+        namespace: &str,
+        sink: &mut (dyn ActionSink + Send),
+    ) -> Result<(), Error> {
         debug!("Checking tags inconsistencies from namespace '{namespace}'");
 
-        for_each_page(
-            |marker| async move {
-                self.metadata_store
-                    .list_tags(namespace, 100, marker)
-                    .await
-                    .map_err(Error::from)
-            },
-            |tags| self.process_page(namespace, tags),
-        )
+        let tags: Vec<String> = collect_all_pages(|marker| async move {
+            self.metadata_store.list_tags(namespace, 100, marker).await
+        })
         .await
+        .map_err(Error::from)?;
+
+        for tag in &tags {
+            if let Err(e) = self.repair_tag_digest_link(namespace, tag, sink).await {
+                error!("Failed to check tag from '{namespace}' (tag '{tag}'): {e}");
+            }
+        }
+
+        Ok(())
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::registry::{metadata_store::MetadataStoreExt, test_utils, test_utils::backends};
+    use crate::{
+        command::scrub::executor::Executor,
+        registry::{
+            metadata_store::MetadataStoreExt,
+            test_utils::{self, NoopMultipart, backends},
+        },
+    };
 
     #[tokio::test]
     async fn test_scrub_tags_creates_missing_digest_links() {
@@ -92,9 +100,16 @@ mod tests {
                 .add();
             tx.commit().await.unwrap();
 
-            let scrubber = TagChecker::new(metadata_store.clone(), false);
+            let mut executor = Executor::new(
+                false,
+                test_case.blob_store(),
+                metadata_store.clone(),
+                test_case.upload_store(),
+                std::sync::Arc::new(NoopMultipart),
+            );
 
-            scrubber.check_namespace(namespace).await.unwrap();
+            let scrubber = TagChecker::new(metadata_store.clone());
+            scrubber.check(namespace, &mut executor).await.unwrap();
 
             let digest_link = metadata_store
                 .read_link(namespace, &LinkKind::Digest(blob_digest.clone()), false)
@@ -114,6 +129,7 @@ mod tests {
             let namespace = "test-repo/app";
             let registry = test_case.registry();
             let metadata_store = test_case.metadata_store();
+            let blob_store = test_case.blob_store();
 
             let (blob_digest, _) =
                 test_utils::create_test_blob(registry, namespace, b"test manifest").await;
@@ -124,9 +140,16 @@ mod tests {
                 .add();
             tx.commit().await.unwrap();
 
-            let scrubber = TagChecker::new(metadata_store.clone(), false);
+            let mut executor = Executor::new(
+                false,
+                blob_store.clone(),
+                metadata_store.clone(),
+                test_case.upload_store(),
+                std::sync::Arc::new(NoopMultipart),
+            );
 
-            scrubber.check_namespace(namespace).await.unwrap();
+            let scrubber = TagChecker::new(metadata_store.clone());
+            scrubber.check(namespace, &mut executor).await.unwrap();
 
             let digest_link = metadata_store
                 .read_link(namespace, &LinkKind::Digest(blob_digest.clone()), false)

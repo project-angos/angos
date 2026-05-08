@@ -1,121 +1,108 @@
 use std::sync::Arc;
 
-use tracing::{debug, error, info};
+use async_trait::async_trait;
+use tracing::{debug, error};
 
 use crate::{
+    command::scrub::{action::Action, check::StoreChecker, error::Error, executor::ActionSink},
     oci::Digest,
     registry::{
-        Error,
-        blob_store::BlobStore,
-        metadata_store::{self, BlobIndexOperation, MetadataStore, link_kind::LinkKind},
-        pagination::for_each_page,
+        blob_store::{self, BlobStore},
+        metadata_store::{self, MetadataStore, link_kind::LinkKind},
+        pagination::collect_all_pages,
     },
 };
 
 pub struct BlobChecker {
     blob_store: Arc<dyn BlobStore + Send + Sync>,
     metadata_store: Arc<dyn MetadataStore + Send + Sync>,
-    dry_run: bool,
 }
 
 impl BlobChecker {
     pub fn new(
         blob_store: Arc<dyn BlobStore + Send + Sync>,
         metadata_store: Arc<dyn MetadataStore + Send + Sync>,
-        dry_run: bool,
     ) -> Self {
         Self {
             blob_store,
             metadata_store,
-            dry_run,
         }
     }
 
-    pub async fn check_all(&self) -> Result<(), Error> {
-        debug!("Checking blobs");
-
-        for_each_page(
-            |marker| async move { self.blob_store.list(100, marker).await.map_err(Error::from) },
-            |blobs| self.process_page(blobs),
-        )
-        .await
-    }
-
-    async fn process_page(&self, blobs: Vec<Digest>) -> Result<(), Error> {
-        for blob in &blobs {
-            if let Err(e) = self.check_blob(blob).await {
-                error!("Failed to process blob index for {blob}: {e}");
-            }
-        }
-        Ok(())
-    }
-
-    async fn check_blob(&self, blob: &Digest) -> Result<(), Error> {
+    async fn check_blob(
+        &self,
+        blob: &Digest,
+        sink: &mut (dyn ActionSink + Send),
+    ) -> Result<(), Error> {
         debug!("Checking blob index for blob '{blob}'");
 
         let blob_index = match self.metadata_store.read_blob_index(blob).await {
             Ok(index) => index,
             Err(metadata_store::Error::ReferenceNotFound) => {
-                return self.delete_orphan_blob(blob).await;
+                sink.apply(Action::DeleteOrphanBlob(blob.clone())).await?;
+                return Ok(());
             }
             Err(e) => return Err(e.into()),
         };
 
         if blob_index.namespace.is_empty() {
-            return self.delete_orphan_blob(blob).await;
+            sink.apply(Action::DeleteOrphanBlob(blob.clone())).await?;
+            return Ok(());
         }
 
         for (namespace, references) in blob_index.namespace {
             for link in references {
-                self.probe_and_cleanup_link(&namespace, blob, &link).await;
+                self.probe_and_cleanup_link(&namespace, blob, &link, sink)
+                    .await;
             }
         }
 
         Ok(())
     }
 
-    async fn probe_and_cleanup_link(&self, namespace: &str, blob: &Digest, link: &LinkKind) {
+    async fn probe_and_cleanup_link(
+        &self,
+        namespace: &str,
+        blob: &Digest,
+        link: &LinkKind,
+        sink: &mut (dyn ActionSink + Send),
+    ) {
         if self
             .metadata_store
             .read_link(namespace, link, false)
             .await
             .is_err()
-            && let Err(err) = self.remove_invalid_link(namespace, blob, link).await
+            && let Err(err) = sink
+                .apply(Action::RemoveBlobIndexLink {
+                    namespace: namespace.to_string(),
+                    blob: blob.clone(),
+                    link: link.clone(),
+                })
+                .await
         {
             error!(
                 "Failed to remove invalid link '{link}' from blob index '{namespace}/{blob}': {err}"
             );
         }
     }
+}
 
-    async fn delete_orphan_blob(&self, blob: &Digest) -> Result<(), Error> {
-        if self.dry_run {
-            info!("DRY RUN: would delete orphan blob '{blob}'");
-            return Ok(());
+#[async_trait]
+impl StoreChecker for BlobChecker {
+    async fn check_all(&self, sink: &mut (dyn ActionSink + Send)) -> Result<(), Error> {
+        debug!("Checking blobs");
+
+        let blobs: Vec<Digest> =
+            collect_all_pages(|marker| async move { self.blob_store.list(100, marker).await })
+                .await
+                .map_err(|e: blob_store::Error| Error::from(e))?;
+
+        for blob in &blobs {
+            if let Err(e) = self.check_blob(blob, sink).await {
+                error!("Failed to process blob index for {blob}: {e}");
+            }
         }
 
-        info!("Deleting orphan blob '{blob}'");
-        self.blob_store.delete(blob).await?;
-        Ok(())
-    }
-
-    async fn remove_invalid_link(
-        &self,
-        namespace: &str,
-        blob: &Digest,
-        link: &LinkKind,
-    ) -> Result<(), Error> {
-        if self.dry_run {
-            info!(
-                "DRY RUN: would remove invalid link from blob index '{namespace}/{blob}': '{link}'"
-            );
-            return Ok(());
-        }
-
-        info!("Removing invalid link from blob index '{namespace}/{blob}': '{link}'");
-        self.metadata_store
-            .update_blob_index(namespace, blob, BlobIndexOperation::Remove(link.clone()))
-            .await?;
         Ok(())
     }
 }
@@ -126,9 +113,18 @@ mod tests {
 
     use super::*;
     use crate::{
+        command::scrub::{action::Action, executor::Executor},
         oci::Digest,
-        registry::{metadata_store::BlobIndexOperation, test_utils, test_utils::backends},
+        registry::{
+            blob_store::MultipartCleanup,
+            metadata_store::BlobIndexOperation,
+            test_utils::{self, NoopMultipart, backends},
+        },
     };
+
+    fn noop_multipart() -> std::sync::Arc<dyn MultipartCleanup + Send + Sync> {
+        std::sync::Arc::new(NoopMultipart)
+    }
 
     #[tokio::test]
     async fn test_cleanup_orphan_blobs_removes_invalid_index_entries() {
@@ -163,9 +159,17 @@ mod tests {
                 .get(namespace)
                 .map_or(0, std::collections::HashSet::len);
 
-            let scrubber = BlobChecker::new(blob_store.clone(), metadata_store.clone(), false);
+            let checker = BlobChecker::new(blob_store.clone(), metadata_store.clone());
 
-            scrubber.check_all().await.unwrap();
+            let mut executor = Executor::new(
+                false,
+                blob_store.clone(),
+                metadata_store.clone(),
+                test_case.upload_store(),
+                noop_multipart(),
+            );
+
+            checker.check_all(&mut executor).await.unwrap();
 
             let blob_index_after = metadata_store.read_blob_index(&blob_digest).await.unwrap();
 
@@ -190,15 +194,22 @@ mod tests {
             let orphan_content = b"orphan blob content";
             let orphan_digest = blob_store.create(orphan_content).await.unwrap();
 
-            let blob_exists_before = blob_store.read(&orphan_digest).await.is_ok();
-            assert!(blob_exists_before, "Orphan blob should exist before scrub");
+            assert!(blob_store.read(&orphan_digest).await.is_ok());
 
-            let scrubber = BlobChecker::new(blob_store.clone(), metadata_store.clone(), false);
-            scrubber.check_all().await.unwrap();
+            let checker = BlobChecker::new(blob_store.clone(), metadata_store.clone());
 
-            let blob_exists_after = blob_store.read(&orphan_digest).await.is_ok();
+            let mut executor = Executor::new(
+                false,
+                blob_store.clone(),
+                metadata_store,
+                test_case.upload_store(),
+                noop_multipart(),
+            );
+
+            checker.check_all(&mut executor).await.unwrap();
+
             assert!(
-                !blob_exists_after,
+                blob_store.read(&orphan_digest).await.is_err(),
                 "Orphan blob without index should be deleted after scrub"
             );
         }
@@ -213,16 +224,21 @@ mod tests {
             let orphan_content = b"orphan blob content for dry run";
             let orphan_digest = blob_store.create(orphan_content).await.unwrap();
 
-            let blob_exists_before = blob_store.read(&orphan_digest).await.is_ok();
-            assert!(blob_exists_before, "Orphan blob should exist before scrub");
+            assert!(blob_store.read(&orphan_digest).await.is_ok());
 
-            let scrubber = BlobChecker::new(blob_store.clone(), metadata_store.clone(), true);
-            scrubber.check_all().await.unwrap();
+            let checker = BlobChecker::new(blob_store.clone(), metadata_store.clone());
 
-            let blob_exists_after = blob_store.read(&orphan_digest).await.is_ok();
+            let mut sink: Vec<Action> = Vec::new();
+            checker.check_all(&mut sink).await.unwrap();
+
             assert!(
-                blob_exists_after,
-                "Orphan blob should be preserved in dry-run mode"
+                blob_store.read(&orphan_digest).await.is_ok(),
+                "Vec sink must not mutate storage"
+            );
+            assert!(
+                sink.iter()
+                    .any(|a| matches!(a, Action::DeleteOrphanBlob(_))),
+                "Vec sink must capture the DeleteOrphanBlob action"
             );
         }
     }

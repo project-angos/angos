@@ -187,7 +187,7 @@ async fn run_command(cli_args: GlobalArguments, config: Configuration) {
 }
 
 async fn run_scrub(options: scrub::Options, config: Configuration) -> Result<(), scrub::Error> {
-    let scrub = scrub::Command::new(&options, &config).await?;
+    let mut scrub = scrub::Command::new(&options, &config).await?;
     scrub.run().await
 }
 

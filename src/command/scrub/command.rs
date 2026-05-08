@@ -10,9 +10,11 @@ use crate::{
         scrub::{
             check::{
                 BlobChecker, LinkReferencesChecker, ManifestChecker, MediaTypeChecker,
-                MultipartChecker, NamespaceChecker, RetentionChecker, TagChecker, UploadChecker,
+                MultipartChecker, NamespaceChecker, RetentionChecker, StoreChecker, TagChecker,
+                UploadChecker,
             },
             error::Error,
+            executor::Executor,
         },
     },
     configuration::Configuration,
@@ -67,6 +69,7 @@ pub struct Command {
     namespace_checkers: Vec<Box<dyn NamespaceChecker>>,
     blob_checker: Option<BlobChecker>,
     multipart_checker: Option<MultipartChecker>,
+    executor: Executor,
 }
 
 fn build_global_retention_policy(config: &RetentionPolicyConfig) -> Option<Arc<RetentionPolicy>> {
@@ -87,24 +90,22 @@ fn build_namespace_checkers(
     upload_store: &Arc<dyn UploadStore>,
     metadata_store: &Arc<dyn MetadataStore + Send + Sync>,
     repositories: &Arc<HashMap<String, Repository>>,
-) -> Vec<Box<dyn NamespaceChecker>> {
+) -> Result<Vec<Box<dyn NamespaceChecker>>, Error> {
     let mut checkers: Vec<Box<dyn NamespaceChecker>> = Vec::new();
 
     if options.retention {
         let global_retention_policy =
             build_global_retention_policy(&config.global.retention_policy);
         checkers.push(Box::new(RetentionChecker::new(
-            blob_store.clone(),
             metadata_store.clone(),
             repositories.clone(),
             global_retention_policy,
-            options.dry_run,
         )));
     }
 
     if let Some(upload_timeout) = options.uploads {
-        let upload_timeout =
-            Duration::from_std(upload_timeout.into()).expect("Upload timeout must be valid");
+        let upload_timeout = Duration::from_std(upload_timeout.into())
+            .map_err(|e| Error::Initialization(format!("Upload timeout is invalid: {e}")))?;
         info!(
             "Upload timeout set to {} second(s)",
             upload_timeout.num_seconds()
@@ -112,22 +113,17 @@ fn build_namespace_checkers(
         checkers.push(Box::new(UploadChecker::new(
             upload_store.clone(),
             upload_timeout,
-            options.dry_run,
         )));
     }
 
     if options.tags {
-        checkers.push(Box::new(TagChecker::new(
-            metadata_store.clone(),
-            options.dry_run,
-        )));
+        checkers.push(Box::new(TagChecker::new(metadata_store.clone())));
     }
 
     if options.manifests {
         checkers.push(Box::new(ManifestChecker::new(
             blob_store.clone(),
             metadata_store.clone(),
-            options.dry_run,
         )));
     }
 
@@ -135,7 +131,6 @@ fn build_namespace_checkers(
         checkers.push(Box::new(LinkReferencesChecker::new(
             blob_store.clone(),
             metadata_store.clone(),
-            options.dry_run,
         )));
     }
 
@@ -143,11 +138,10 @@ fn build_namespace_checkers(
         checkers.push(Box::new(MediaTypeChecker::new(
             blob_store.clone(),
             metadata_store.clone(),
-            options.dry_run,
         )));
     }
 
-    checkers
+    Ok(checkers)
 }
 
 fn build_blob_checker(
@@ -155,29 +149,21 @@ fn build_blob_checker(
     blob_store: &Arc<dyn BlobStore>,
     metadata_store: &Arc<dyn MetadataStore + Send + Sync>,
 ) -> Option<BlobChecker> {
-    if options.blobs {
-        Some(BlobChecker::new(
-            blob_store.clone(),
-            metadata_store.clone(),
-            options.dry_run,
-        ))
-    } else {
-        None
-    }
+    options
+        .blobs
+        .then(|| BlobChecker::new(blob_store.clone(), metadata_store.clone()))
 }
 
 fn build_multipart_checker(
     options: &Options,
     cleanup: Arc<dyn MultipartCleanup + Send + Sync>,
-) -> Option<MultipartChecker> {
-    let multipart_timeout = options.multipart?;
-    let multipart_timeout =
-        Duration::from_std(multipart_timeout.into()).expect("Multipart timeout must be valid");
-    Some(MultipartChecker::new(
-        cleanup,
-        multipart_timeout,
-        options.dry_run,
-    ))
+) -> Result<Option<MultipartChecker>, Error> {
+    let Some(multipart_timeout) = options.multipart else {
+        return Ok(None);
+    };
+    let multipart_timeout = Duration::from_std(multipart_timeout.into())
+        .map_err(|e| Error::Initialization(format!("Multipart timeout is invalid: {e}")))?;
+    Ok(Some(MultipartChecker::new(cleanup, multipart_timeout)))
 }
 
 impl Command {
@@ -195,9 +181,18 @@ impl Command {
             &blob_handles.upload_store,
             &metadata_store,
             &repositories,
-        );
+        )?;
         let blob_checker = build_blob_checker(options, &blob_handles.blob_store, &metadata_store);
-        let multipart_checker = build_multipart_checker(options, blob_handles.multipart_cleanup);
+        let multipart_checker =
+            build_multipart_checker(options, blob_handles.multipart_cleanup.clone())?;
+
+        let executor = Executor::new(
+            options.dry_run,
+            blob_handles.blob_store.clone(),
+            metadata_store.clone(),
+            blob_handles.upload_store.clone(),
+            blob_handles.multipart_cleanup,
+        );
 
         if options.dry_run {
             info!("Dry-run mode: no changes will be made to the storage");
@@ -208,10 +203,11 @@ impl Command {
             namespace_checkers,
             blob_checker,
             multipart_checker,
+            executor,
         })
     }
 
-    pub async fn run(&self) -> Result<(), Error> {
+    pub async fn run(&mut self) -> Result<(), Error> {
         self.scrub_metadata().await?;
         self.scrub_blobs().await?;
         self.scrub_multipart_uploads().await?;
@@ -219,29 +215,39 @@ impl Command {
         Ok(())
     }
 
-    async fn scrub_metadata(&self) -> Result<(), Error> {
+    async fn scrub_metadata(&mut self) -> Result<(), Error> {
         let namespaces =
             collect_all_pages(|marker| self.metadata_store.list_namespaces(100, marker)).await?;
 
         for namespace in namespaces {
-            for checker in &self.namespace_checkers {
-                let _ = checker.check_namespace(&namespace).await;
+            for i in 0..self.namespace_checkers.len() {
+                if let Err(e) = self.namespace_checkers[i]
+                    .check(&namespace, &mut self.executor)
+                    .await
+                {
+                    tracing::warn!("Scrub checker failed for namespace '{namespace}': {e}");
+                }
             }
         }
 
         Ok(())
     }
 
-    async fn scrub_blobs(&self) -> Result<(), Error> {
-        if let Some(checker) = &self.blob_checker {
-            let _ = checker.check_all().await;
+    async fn scrub_blobs(&mut self) -> Result<(), Error> {
+        if let Some(checker) = self.blob_checker.take() {
+            if let Err(e) = checker.check_all(&mut self.executor).await {
+                tracing::warn!("Blob scrub checker failed: {e}");
+            }
+            self.blob_checker = Some(checker);
         }
         Ok(())
     }
 
-    async fn scrub_multipart_uploads(&self) -> Result<(), Error> {
-        if let Some(checker) = &self.multipart_checker {
-            checker.check_all().await?;
+    async fn scrub_multipart_uploads(&mut self) -> Result<(), Error> {
+        if let Some(checker) = self.multipart_checker.take() {
+            let result = checker.check_all(&mut self.executor).await;
+            self.multipart_checker = Some(checker);
+            result?;
         }
         Ok(())
     }
@@ -384,7 +390,7 @@ mod tests {
             media_types: false,
         };
 
-        let command = Command::new(&options, &config).await.unwrap();
+        let mut command = Command::new(&options, &config).await.unwrap();
         let result = command.run().await;
 
         assert!(result.is_ok());

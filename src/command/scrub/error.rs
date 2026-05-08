@@ -1,6 +1,6 @@
 use crate::{
-    cache,
-    registry::{blob_store, metadata_store},
+    cache, policy,
+    registry::{self, blob_store, metadata_store},
 };
 
 /// Errors that can occur during a scrub run.
@@ -47,6 +47,21 @@ pub enum Error {
 impl From<blob_store::Error> for Error {
     fn from(e: blob_store::Error) -> Self {
         Error::BlobStore(e)
+    }
+}
+
+impl From<policy::Error> for Error {
+    fn from(e: policy::Error) -> Self {
+        Error::Initialization(e.to_string())
+    }
+}
+
+impl From<registry::Error> for Error {
+    fn from(e: registry::Error) -> Self {
+        match e {
+            registry::Error::MetadataStore(inner) => Error::MetadataStore(inner),
+            other => Error::Initialization(other.to_string()),
+        }
     }
 }
 
