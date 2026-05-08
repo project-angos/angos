@@ -1,5 +1,4 @@
 use std::{
-    collections::HashMap,
     sync::{Arc, Mutex},
     time::Duration,
 };
@@ -16,14 +15,12 @@ use super::{
     },
 };
 use crate::{
-    cache,
     cache::Cache,
-    command::server::error::Error,
+    command::{bootstrap, server::error::Error},
     configuration::{Configuration, ServerConfig, watcher::ConfigNotifier},
     registry::{
-        Registry, RegistryConfig, Repository, blob_store,
+        Registry, RegistryConfig,
         metadata_store::{ConditionalCapabilities, MetadataStore, MetadataStoreConfig},
-        repository,
     },
 };
 
@@ -45,15 +42,6 @@ pub struct Command {
     cached_capabilities: Arc<Mutex<Option<ConditionalCapabilities>>>,
 }
 
-fn build_blob_stores(
-    config: &blob_store::BlobStorageConfig,
-    cache: &Arc<dyn Cache>,
-) -> Result<blob_store::BlobStoreHandles, Error> {
-    config
-        .to_backend(Some(cache.clone()))
-        .map_err(|_| Error::Initialization("Failed to initialize blob store".to_string()))
-}
-
 async fn build_metadata_store(
     config: &Configuration,
     cache: &Arc<dyn Cache>,
@@ -72,66 +60,26 @@ async fn build_metadata_store(
         }
     }
 
-    match metadata_config.to_backend(Some(cache.clone())).await {
-        Ok((store, caps)) => {
-            let mut guard = cached_capabilities
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            *guard = caps;
-            Ok(store)
-        }
-        Err(err) => {
-            let msg = format!("Failed to initialize metadata store: {err}");
-            Err(Error::Initialization(msg))
-        }
-    }
-}
+    let (store, caps) = bootstrap::metadata_store(&metadata_config, cache)
+        .await
+        .map_err(Error::from)?;
 
-fn build_auth_cache(config: &cache::Config) -> Result<Arc<dyn Cache>, Error> {
-    match config.to_backend() {
-        Ok(cache) => Ok(cache),
-        Err(err) => {
-            let msg = format!("Failed to initialize auth token cache: {err}");
-            Err(Error::Initialization(msg))
-        }
-    }
-}
+    let mut guard = cached_capabilities
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    *guard = caps;
 
-fn build_repository(
-    name: &str,
-    config: &repository::Config,
-    auth_cache: &Arc<dyn Cache>,
-) -> Result<Repository, Error> {
-    match Repository::new(name, config, auth_cache) {
-        Ok(repo) => Ok(repo),
-        Err(err) => {
-            let msg = format!("Failed to initialize repository '{name}': {err}");
-            Err(Error::Initialization(msg))
-        }
-    }
-}
-
-fn build_repositories(
-    configs: &HashMap<String, repository::Config>,
-    auth_cache: &Arc<dyn Cache>,
-) -> Result<Arc<HashMap<String, Repository>>, Error> {
-    let mut repositories = HashMap::new();
-    for (name, config) in configs {
-        let repo = build_repository(name, config, auth_cache)?;
-        repositories.insert(name.clone(), repo);
-    }
-
-    Ok(Arc::new(repositories))
+    Ok(store)
 }
 
 async fn build_registry(
     config: &Configuration,
     cached_capabilities: &Arc<Mutex<Option<ConditionalCapabilities>>>,
 ) -> Result<Registry, Error> {
-    let auth_cache = build_auth_cache(&config.cache)?;
-    let blob_handles = build_blob_stores(&config.blob_store, &auth_cache)?;
+    let auth_cache = bootstrap::auth_cache(&config.cache)?;
+    let blob_handles = bootstrap::blob_stores(&config.blob_store, &auth_cache)?;
     let metadata_store = build_metadata_store(config, &auth_cache, cached_capabilities).await?;
-    let repositories = build_repositories(&config.repository, &auth_cache)?;
+    let repositories = bootstrap::repositories(&config.repository, &auth_cache)?;
 
     let registry_config = RegistryConfig::new()
         .update_pull_time(config.global.update_pull_time)

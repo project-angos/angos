@@ -1,10 +1,15 @@
-use std::sync::{Arc, Mutex};
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex},
+};
 
 use super::*;
 use crate::{
-    command::server::listeners::tls::tests::build_config,
+    cache,
+    command::{bootstrap, server::listeners::tls::tests::build_config},
     configuration,
     policy::{AccessMode, AccessPolicyConfig, CelRule},
+    registry::{Registry, RegistryConfig, repository},
     secret::Secret,
 };
 
@@ -59,8 +64,8 @@ fn create_config_with_repository() -> Configuration {
 #[test]
 fn test_build_blob_store_filesystem_success() {
     let config = create_minimal_config();
-    let auth_cache = build_auth_cache(&config.cache).unwrap();
-    let result = build_blob_stores(&config.blob_store, &auth_cache);
+    let auth_cache = bootstrap::auth_cache(&config.cache).unwrap();
+    let result = bootstrap::blob_stores(&config.blob_store, &auth_cache);
 
     assert!(result.is_ok());
 }
@@ -68,7 +73,7 @@ fn test_build_blob_store_filesystem_success() {
 #[tokio::test]
 async fn test_build_metadata_store_filesystem_success() {
     let config = create_minimal_config();
-    let auth_cache = build_auth_cache(&config.cache).unwrap();
+    let auth_cache = bootstrap::auth_cache(&config.cache).unwrap();
     let result = build_metadata_store(&config, &auth_cache, &Arc::new(Mutex::new(None))).await;
 
     assert!(result.is_ok());
@@ -95,7 +100,7 @@ async fn test_build_metadata_store_with_explicit_config() {
     "#;
 
     let config = Configuration::load_from_str(toml).unwrap();
-    let auth_cache = build_auth_cache(&config.cache).unwrap();
+    let auth_cache = bootstrap::auth_cache(&config.cache).unwrap();
     let result = build_metadata_store(&config, &auth_cache, &Arc::new(Mutex::new(None))).await;
 
     assert!(result.is_ok());
@@ -104,7 +109,7 @@ async fn test_build_metadata_store_with_explicit_config() {
 #[test]
 fn test_build_auth_cache_memory_success() {
     let config = cache::Config::Memory;
-    let result = build_auth_cache(&config);
+    let result = bootstrap::auth_cache(&config);
 
     assert!(result.is_ok());
 }
@@ -119,9 +124,9 @@ fn test_build_repository_success() {
         ..repository::Config::default()
     };
     let cache_config = cache::Config::Memory;
-    let cache = build_auth_cache(&cache_config).unwrap();
+    let cache = bootstrap::auth_cache(&cache_config).unwrap();
 
-    let result = build_repository("test-repo", &repo_config, &cache);
+    let result = bootstrap::repository("test-repo", &repo_config, &cache);
 
     assert!(result.is_ok());
     let repo = result.unwrap();
@@ -147,9 +152,9 @@ fn test_build_repository_with_upstream() {
         ..repository::Config::default()
     };
     let cache_config = cache::Config::Memory;
-    let cache = build_auth_cache(&cache_config).unwrap();
+    let cache = bootstrap::auth_cache(&cache_config).unwrap();
 
-    let result = build_repository("cached-repo", &repo_config, &cache);
+    let result = bootstrap::repository("cached-repo", &repo_config, &cache);
 
     assert!(result.is_ok());
 }
@@ -169,9 +174,9 @@ fn test_build_repository_with_immutable_tags() {
         ..repository::Config::default()
     };
     let cache_config = cache::Config::Memory;
-    let cache = build_auth_cache(&cache_config).unwrap();
+    let cache = bootstrap::auth_cache(&cache_config).unwrap();
 
-    let result = build_repository("immutable-repo", &repo_config, &cache);
+    let result = bootstrap::repository("immutable-repo", &repo_config, &cache);
 
     assert!(result.is_ok());
 }
@@ -180,9 +185,9 @@ fn test_build_repository_with_immutable_tags() {
 fn test_build_repositories_empty() {
     let configs = HashMap::new();
     let cache_config = cache::Config::Memory;
-    let cache = build_auth_cache(&cache_config).unwrap();
+    let cache = bootstrap::auth_cache(&cache_config).unwrap();
 
-    let result = build_repositories(&configs, &cache);
+    let result = bootstrap::repositories(&configs, &cache);
 
     assert!(result.is_ok());
     let repos = result.unwrap();
@@ -202,9 +207,9 @@ fn test_build_repositories_single() {
     configs.insert("repo1".to_string(), repo_config);
 
     let cache_config = cache::Config::Memory;
-    let cache = build_auth_cache(&cache_config).unwrap();
+    let cache = bootstrap::auth_cache(&cache_config).unwrap();
 
-    let result = build_repositories(&configs, &cache);
+    let result = bootstrap::repositories(&configs, &cache);
 
     assert!(result.is_ok());
     let repos = result.unwrap();
@@ -227,9 +232,9 @@ fn test_build_repositories_multiple() {
     configs.insert("repo3".to_string(), repo_config);
 
     let cache_config = cache::Config::Memory;
-    let cache = build_auth_cache(&cache_config).unwrap();
+    let cache = bootstrap::auth_cache(&cache_config).unwrap();
 
-    let result = build_repositories(&configs, &cache);
+    let result = bootstrap::repositories(&configs, &cache);
 
     assert!(result.is_ok());
     let repos = result.unwrap();
@@ -356,8 +361,8 @@ fn test_build_repositories_preserves_names() {
     configs.insert("gamma".to_string(), repo_config);
 
     let cache_config = cache::Config::Memory;
-    let cache = build_auth_cache(&cache_config).unwrap();
-    let repos = build_repositories(&configs, &cache).unwrap();
+    let cache = bootstrap::auth_cache(&cache_config).unwrap();
+    let repos = bootstrap::repositories(&configs, &cache).unwrap();
 
     assert!(repos.get("alpha").is_some());
     assert!(repos.get("beta").is_some());
@@ -369,12 +374,12 @@ fn test_build_repositories_preserves_names() {
 async fn test_build_registry_components_integration() {
     let config = create_config_with_repository();
 
-    let auth_cache = build_auth_cache(&config.cache).unwrap();
-    let blob_handles = build_blob_stores(&config.blob_store, &auth_cache).unwrap();
+    let auth_cache = bootstrap::auth_cache(&config.cache).unwrap();
+    let blob_handles = bootstrap::blob_stores(&config.blob_store, &auth_cache).unwrap();
     let metadata_store = build_metadata_store(&config, &auth_cache, &Arc::new(Mutex::new(None)))
         .await
         .unwrap();
-    let repositories = build_repositories(&config.repository, &auth_cache).unwrap();
+    let repositories = bootstrap::repositories(&config.repository, &auth_cache).unwrap();
 
     let registry_config = RegistryConfig::new()
         .update_pull_time(config.global.update_pull_time)
@@ -426,8 +431,8 @@ fn test_build_repositories_with_different_configs() {
     configs.insert("private".to_string(), repo_config2);
 
     let cache_config = cache::Config::Memory;
-    let cache = build_auth_cache(&cache_config).unwrap();
-    let result = build_repositories(&configs, &cache);
+    let cache = bootstrap::auth_cache(&cache_config).unwrap();
+    let result = bootstrap::repositories(&configs, &cache);
 
     assert!(result.is_ok());
     let repos = result.unwrap();

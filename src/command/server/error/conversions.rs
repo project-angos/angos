@@ -1,7 +1,7 @@
 use hyper::StatusCode;
 
 use super::Error;
-use crate::{configuration, registry};
+use crate::{command::bootstrap, configuration, registry};
 
 fn oci_error(status_code: StatusCode, code: &'static str, msg: Option<String>) -> Error {
     Error::Custom {
@@ -53,6 +53,25 @@ impl From<registry::Error> for Error {
                 "INTERNAL_SERVER_ERROR",
                 Some(error.to_string()),
             ),
+        }
+    }
+}
+
+impl From<bootstrap::Error> for Error {
+    fn from(e: bootstrap::Error) -> Self {
+        match e {
+            bootstrap::Error::BlobStore(_) => {
+                Error::Initialization("Failed to initialize blob store".to_string())
+            }
+            bootstrap::Error::MetadataStore(inner) => {
+                Error::Initialization(format!("Failed to initialize metadata store: {inner}"))
+            }
+            bootstrap::Error::Cache(inner) => {
+                Error::Initialization(format!("Failed to initialize auth token cache: {inner}"))
+            }
+            bootstrap::Error::Repository { name, source } => Error::Initialization(format!(
+                "Failed to initialize repository '{name}': {source}"
+            )),
         }
     }
 }

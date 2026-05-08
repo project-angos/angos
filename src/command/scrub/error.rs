@@ -50,6 +50,19 @@ impl From<blob_store::Error> for Error {
     }
 }
 
+impl From<crate::command::bootstrap::Error> for Error {
+    fn from(e: crate::command::bootstrap::Error) -> Self {
+        match e {
+            crate::command::bootstrap::Error::BlobStore(inner) => Error::BlobStore(inner),
+            crate::command::bootstrap::Error::MetadataStore(inner) => Error::MetadataStore(inner),
+            crate::command::bootstrap::Error::Cache(inner) => Error::Cache(inner),
+            crate::command::bootstrap::Error::Repository { name, source } => Error::Initialization(
+                format!("Failed to initialize repository '{name}': {source}"),
+            ),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::error::Error as StdError;

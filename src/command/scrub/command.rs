@@ -5,13 +5,15 @@ use chrono::Duration;
 use tracing::info;
 
 use crate::{
-    cache::Cache,
-    command::scrub::{
-        check::{
-            BlobChecker, LinkReferencesChecker, ManifestChecker, MediaTypeChecker,
-            MultipartChecker, NamespaceChecker, RetentionChecker, TagChecker, UploadChecker,
+    command::{
+        bootstrap,
+        scrub::{
+            check::{
+                BlobChecker, LinkReferencesChecker, ManifestChecker, MediaTypeChecker,
+                MultipartChecker, NamespaceChecker, RetentionChecker, TagChecker, UploadChecker,
+            },
+            error::Error,
         },
-        error::Error,
     },
     configuration::Configuration,
     policy::{RetentionPolicy, RetentionPolicyConfig, SystemClock},
@@ -20,7 +22,6 @@ use crate::{
         blob_store::{BlobStore, MultipartCleanup, UploadStore},
         metadata_store::MetadataStore,
         pagination::collect_all_pages,
-        repository,
     },
 };
 
@@ -68,26 +69,6 @@ pub struct Command {
     multipart_checker: Option<MultipartChecker>,
 }
 
-async fn build_metadata_store(config: &Configuration) -> Result<Arc<dyn MetadataStore>, Error> {
-    let (store, _) = config.resolve_metadata_config().to_backend(None).await?;
-    Ok(store)
-}
-
-fn build_repositories(
-    configs: &HashMap<String, repository::Config>,
-    auth_cache: &Arc<dyn Cache>,
-) -> Result<Arc<HashMap<String, Repository>>, Error> {
-    let mut repositories = HashMap::new();
-    for (name, config) in configs {
-        let repo = Repository::new(name, config, auth_cache).map_err(|err| {
-            Error::Initialization(format!("Failed to initialize repository '{name}': {err}"))
-        })?;
-        repositories.insert(name.clone(), repo);
-    }
-
-    Ok(Arc::new(repositories))
-}
-
 fn build_global_retention_policy(config: &RetentionPolicyConfig) -> Option<Arc<RetentionPolicy>> {
     if config.rules.is_empty() {
         return None;
@@ -104,7 +85,7 @@ fn build_namespace_checkers(
     config: &Configuration,
     blob_store: &Arc<dyn BlobStore>,
     upload_store: &Arc<dyn UploadStore>,
-    metadata_store: &Arc<dyn MetadataStore>,
+    metadata_store: &Arc<dyn MetadataStore + Send + Sync>,
     repositories: &Arc<HashMap<String, Repository>>,
 ) -> Vec<Box<dyn NamespaceChecker>> {
     let mut checkers: Vec<Box<dyn NamespaceChecker>> = Vec::new();
@@ -172,7 +153,7 @@ fn build_namespace_checkers(
 fn build_blob_checker(
     options: &Options,
     blob_store: &Arc<dyn BlobStore>,
-    metadata_store: &Arc<dyn MetadataStore>,
+    metadata_store: &Arc<dyn MetadataStore + Send + Sync>,
 ) -> Option<BlobChecker> {
     if options.blobs {
         Some(BlobChecker::new(
@@ -201,10 +182,11 @@ fn build_multipart_checker(
 
 impl Command {
     pub async fn new(options: &Options, config: &Configuration) -> Result<Self, Error> {
-        let blob_handles = config.blob_store.to_backend(None).map_err(Error::from)?;
-        let metadata_store = build_metadata_store(config).await?;
-        let auth_cache = config.cache.to_backend().map_err(Error::from)?;
-        let repositories = build_repositories(&config.repository, &auth_cache)?;
+        let auth_cache = bootstrap::auth_cache(&config.cache)?;
+        let blob_handles = bootstrap::blob_stores(&config.blob_store, &auth_cache)?;
+        let (metadata_store, _) =
+            bootstrap::metadata_store(&config.resolve_metadata_config(), &auth_cache).await?;
+        let repositories = bootstrap::repositories(&config.repository, &auth_cache)?;
 
         let namespace_checkers = build_namespace_checkers(
             options,
