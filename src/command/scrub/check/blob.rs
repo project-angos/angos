@@ -7,7 +7,7 @@ use crate::{
     command::scrub::{action::Action, check::StoreChecker, error::Error, executor::ActionSink},
     oci::Digest,
     registry::{
-        blob_store::{self, BlobStore},
+        blob_store::BlobStore,
         metadata_store::{self, MetadataStore, link_kind::LinkKind},
         pagination::collect_all_pages,
     },
@@ -94,8 +94,7 @@ impl StoreChecker for BlobChecker {
 
         let blobs: Vec<Digest> =
             collect_all_pages(|marker| async move { self.blob_store.list(100, marker).await })
-                .await
-                .map_err(|e: blob_store::Error| Error::from(e))?;
+                .await?;
 
         for blob in &blobs {
             if let Err(e) = self.check_blob(blob, sink).await {
