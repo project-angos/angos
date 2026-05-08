@@ -1,30 +1,20 @@
-use std::{collections::HashMap, sync::Arc};
+use std::sync::Arc;
 
 use argh::FromArgs;
-use chrono::Duration;
 use tracing::info;
 
 use crate::{
     command::{
         bootstrap,
         scrub::{
-            check::{
-                BlobChecker, LinkReferencesChecker, ManifestChecker, MediaTypeChecker,
-                MultipartChecker, NamespaceChecker, RetentionChecker, StoreChecker, TagChecker,
-                UploadChecker,
-            },
+            check::{BlobChecker, MultipartChecker, NamespaceChecker, StoreChecker},
             error::Error,
             executor::Executor,
+            setup,
         },
     },
     configuration::Configuration,
-    policy::{RetentionPolicy, RetentionPolicyConfig, SystemClock},
-    registry::{
-        Repository,
-        blob_store::{BlobStore, MultipartCleanup, UploadStore},
-        metadata_store::MetadataStore,
-        pagination::collect_all_pages,
-    },
+    registry::{metadata_store::MetadataStore, pagination::collect_all_pages},
 };
 
 #[derive(FromArgs, PartialEq, Debug)]
@@ -72,100 +62,6 @@ pub struct Command {
     executor: Executor,
 }
 
-fn build_global_retention_policy(config: &RetentionPolicyConfig) -> Option<Arc<RetentionPolicy>> {
-    if config.rules.is_empty() {
-        return None;
-    }
-
-    Some(Arc::new(RetentionPolicy::new(
-        config,
-        Arc::new(SystemClock),
-    )))
-}
-
-fn build_namespace_checkers(
-    options: &Options,
-    config: &Configuration,
-    blob_store: &Arc<dyn BlobStore>,
-    upload_store: &Arc<dyn UploadStore>,
-    metadata_store: &Arc<dyn MetadataStore + Send + Sync>,
-    repositories: &Arc<HashMap<String, Repository>>,
-) -> Result<Vec<Box<dyn NamespaceChecker>>, Error> {
-    let mut checkers: Vec<Box<dyn NamespaceChecker>> = Vec::new();
-
-    if options.retention {
-        let global_retention_policy =
-            build_global_retention_policy(&config.global.retention_policy);
-        checkers.push(Box::new(RetentionChecker::new(
-            metadata_store.clone(),
-            repositories.clone(),
-            global_retention_policy,
-        )));
-    }
-
-    if let Some(upload_timeout) = options.uploads {
-        let upload_timeout = Duration::from_std(upload_timeout.into())
-            .map_err(|e| Error::Initialization(format!("Upload timeout is invalid: {e}")))?;
-        info!(
-            "Upload timeout set to {} second(s)",
-            upload_timeout.num_seconds()
-        );
-        checkers.push(Box::new(UploadChecker::new(
-            upload_store.clone(),
-            upload_timeout,
-        )));
-    }
-
-    if options.tags {
-        checkers.push(Box::new(TagChecker::new(metadata_store.clone())));
-    }
-
-    if options.manifests {
-        checkers.push(Box::new(ManifestChecker::new(
-            blob_store.clone(),
-            metadata_store.clone(),
-        )));
-    }
-
-    if options.links {
-        checkers.push(Box::new(LinkReferencesChecker::new(
-            blob_store.clone(),
-            metadata_store.clone(),
-        )));
-    }
-
-    if options.media_types {
-        checkers.push(Box::new(MediaTypeChecker::new(
-            blob_store.clone(),
-            metadata_store.clone(),
-        )));
-    }
-
-    Ok(checkers)
-}
-
-fn build_blob_checker(
-    options: &Options,
-    blob_store: &Arc<dyn BlobStore>,
-    metadata_store: &Arc<dyn MetadataStore + Send + Sync>,
-) -> Option<BlobChecker> {
-    options
-        .blobs
-        .then(|| BlobChecker::new(blob_store.clone(), metadata_store.clone()))
-}
-
-fn build_multipart_checker(
-    options: &Options,
-    cleanup: Arc<dyn MultipartCleanup + Send + Sync>,
-) -> Result<Option<MultipartChecker>, Error> {
-    let Some(multipart_timeout) = options.multipart else {
-        return Ok(None);
-    };
-    let multipart_timeout = Duration::from_std(multipart_timeout.into())
-        .map_err(|e| Error::Initialization(format!("Multipart timeout is invalid: {e}")))?;
-    Ok(Some(MultipartChecker::new(cleanup, multipart_timeout)))
-}
-
 impl Command {
     pub async fn new(options: &Options, config: &Configuration) -> Result<Self, Error> {
         let auth_cache = bootstrap::auth_cache(&config.cache)?;
@@ -174,7 +70,7 @@ impl Command {
             bootstrap::metadata_store(&config.resolve_metadata_config(), &auth_cache).await?;
         let repositories = bootstrap::repositories(&config.repository, &auth_cache)?;
 
-        let namespace_checkers = build_namespace_checkers(
+        let namespace_checkers = setup::namespace_checkers(
             options,
             config,
             &blob_handles.blob_store,
@@ -182,9 +78,9 @@ impl Command {
             &metadata_store,
             &repositories,
         )?;
-        let blob_checker = build_blob_checker(options, &blob_handles.blob_store, &metadata_store);
+        let blob_checker = setup::blob_checker(options, &blob_handles.blob_store, &metadata_store);
         let multipart_checker =
-            build_multipart_checker(options, blob_handles.multipart_cleanup.clone())?;
+            setup::multipart_checker(options, blob_handles.multipart_cleanup.clone())?;
 
         let executor = Executor::new(
             options.dry_run,
@@ -256,39 +152,6 @@ impl Command {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::policy::CelRule;
-
-    fn rule(s: &str) -> CelRule {
-        CelRule::compile(s).unwrap()
-    }
-
-    #[test]
-    fn test_build_global_retention_policy_empty() {
-        let config = RetentionPolicyConfig { rules: vec![] };
-        let result = build_global_retention_policy(&config);
-
-        assert!(result.is_none());
-    }
-
-    #[test]
-    fn test_build_global_retention_policy_with_rules() {
-        let config = RetentionPolicyConfig {
-            rules: vec![rule("image.pushed_at > now() - days(30)")],
-        };
-        let result = build_global_retention_policy(&config);
-
-        assert!(result.is_some());
-    }
-
-    #[test]
-    fn invalid_retention_rule_fails_at_deserialize() {
-        let toml = r#"rules = ["invalid cel expression!!!"]"#;
-        let result: Result<RetentionPolicyConfig, _> = toml::from_str(toml);
-        assert!(
-            result.is_err(),
-            "invalid CEL rule must fail at deserialization"
-        );
-    }
 
     #[tokio::test]
     async fn test_command_new_with_valid_config() {
