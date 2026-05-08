@@ -1,20 +1,20 @@
 use std::{net::SocketAddr, path::Path, sync::Arc, time::Duration};
 
 use arc_swap::ArcSwap;
-use hyper_util::rt::TokioIo;
+use async_trait::async_trait;
 use rustls::{
     RootCertStore,
     server::{WebPkiClientVerifier, danger::ClientCertVerifier},
 };
 use rustls_pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
+use tokio::net::TcpStream;
 use tokio_rustls::TlsAcceptor;
-use tracing::{debug, info};
+use tracing::debug;
 
 use crate::command::server::{
     ServerContext,
     error::Error,
-    listeners::{accept, build_listener},
-    serve_request,
+    listeners::{Connector, HandshakeResult, accept_loop},
 };
 pub use crate::configuration::listeners::tls::{ServerTlsConfig, TlsListenerConfig};
 
@@ -43,6 +43,47 @@ fn build_client_verifier(client_ca_bundle: &Path) -> Result<Arc<dyn ClientCertVe
                 "Failed to create TLS client certificate verifier: {e}"
             ))
         })
+}
+
+struct TlsConnector<'a> {
+    tls_acceptor: &'a ArcSwap<TlsAcceptor>,
+}
+
+#[async_trait]
+impl Connector for TlsConnector<'_> {
+    type Stream = tokio_rustls::server::TlsStream<TcpStream>;
+
+    async fn handshake(
+        &self,
+        tcp: TcpStream,
+        remote_address: SocketAddr,
+    ) -> Option<HandshakeResult<Self::Stream>> {
+        let acceptor = Arc::clone(&self.tls_acceptor.load());
+        let result = acceptor.accept(tcp).await;
+
+        let tls = match result {
+            Ok(tls) => tls,
+            Err(e) => {
+                debug!("TLS handshake failed from {remote_address}: {e}");
+                return None;
+            }
+        };
+
+        let (_, session) = tls.get_ref();
+        let peer_certificate = session
+            .peer_certificates()
+            .and_then(|certs| certs.first())
+            .map(|cert| cert.to_vec());
+
+        Some(HandshakeResult {
+            stream: tls,
+            peer_certificate,
+        })
+    }
+
+    fn label(&self) -> &'static str {
+        "mTLS"
+    }
 }
 
 pub struct TlsListener {
@@ -133,43 +174,16 @@ impl TlsListener {
     }
 
     pub async fn serve(&self) -> Result<(), Error> {
-        info!("Listening on {} (mTLS)", self.binding_address);
-        let listener = build_listener(self.binding_address).await?;
-
-        loop {
-            let (tcp, remote_address) = accept(&listener).await?;
-
-            let tls_acceptor = self.tls_acceptor.load();
-            let tls_stream = tls_acceptor.accept(tcp).await;
-            drop(tls_acceptor);
-
-            let tls = match tls_stream {
-                Ok(tls) => tls,
-                Err(e) => {
-                    debug!("TLS handshake failed from {remote_address}: {e}");
-                    continue;
-                }
-            };
-
-            let (_, session) = tls.get_ref();
-            let peer_certificate = session
-                .peer_certificates()
-                .and_then(|certs| certs.first())
-                .map(|cert| cert.to_vec());
-
-            debug!("Accepted connection from {remote_address}");
-            let stream = TokioIo::new(tls);
-            let context = Arc::clone(&self.context.load());
-            let timeouts = Arc::clone(&self.timeouts.load());
-
-            tokio::spawn(Box::pin(serve_request(
-                stream,
-                context,
-                peer_certificate,
-                timeouts,
-                remote_address,
-            )));
-        }
+        let connector = TlsConnector {
+            tls_acceptor: &self.tls_acceptor,
+        };
+        accept_loop(
+            self.binding_address,
+            &connector,
+            &self.context,
+            &self.timeouts,
+        )
+        .await
     }
 }
 

@@ -1,4 +1,4 @@
-use std::{io, sync::LazyLock};
+use std::{io, str::FromStr, sync::LazyLock};
 
 use base64::{Engine, prelude::BASE64_STANDARD};
 use futures_util::TryStreamExt;
@@ -28,6 +28,13 @@ pub trait HeaderExt {
             .get(header)
             .and_then(|header| header.to_str().ok())
             .map(ToString::to_string)
+    }
+
+    fn parse_header<T: FromStr, K: AsHeaderName>(&self, header: K) -> Option<T> {
+        self.headers()
+            .get(header)
+            .and_then(|header| header.to_str().ok())
+            .and_then(|s| s.parse().ok())
     }
 
     fn range(&self, header: HeaderName) -> Result<Option<(u64, Option<u64>)>, Error> {
@@ -110,15 +117,9 @@ impl HeaderExt for response::Parts {
     }
 }
 
-pub trait IntoAsyncRead {
-    fn into_async_read(self) -> impl AsyncRead;
-}
-
-impl IntoAsyncRead for Incoming {
-    fn into_async_read(self) -> impl AsyncRead {
-        let stream = self.into_data_stream().map_err(io::Error::other);
-        StreamReader::new(stream)
-    }
+pub fn incoming_into_async_read(incoming: Incoming) -> impl AsyncRead {
+    let stream = incoming.into_data_stream().map_err(io::Error::other);
+    StreamReader::new(stream)
 }
 
 #[cfg(test)]

@@ -2,33 +2,26 @@ use std::sync::Arc;
 
 use tracing::warn;
 
-use crate::{
-    cache::{Cache, CacheExt},
-    command::server::Error,
-};
+use crate::cache::{Cache, CacheExt, CacheOutcome};
 
-pub async fn cache_retrieve(
+pub async fn lookup_cached_decision(
     cache: &Arc<dyn Cache>,
     name: &str,
     cache_key: &str,
-) -> Result<Option<bool>, Error> {
+) -> Option<bool> {
     match cache.retrieve::<bool>(cache_key).await {
-        Ok(Some(cached)) => {
-            let label = if cached {
-                "cached_allow"
-            } else {
-                "cached_deny"
-            };
-            super::authorizer::WEBHOOK_REQUESTS
+        CacheOutcome::Hit(value) => {
+            let label = if value { "cached_allow" } else { "cached_deny" };
+            super::metrics::WEBHOOK_REQUESTS
                 .with_label_values(&[name, label])
                 .inc();
-            Ok(Some(cached))
+            Some(value)
         }
-        Err(err) => {
+        CacheOutcome::Miss => None,
+        CacheOutcome::Error(err) => {
             warn!("Webhook '{name}' cache retrieve failed for key {cache_key}: {err}");
-            Ok(None)
+            None
         }
-        Ok(None) => Ok(None),
     }
 }
 
@@ -38,52 +31,9 @@ mod tests {
 
     use async_trait::async_trait;
 
-    use super::cache_retrieve;
+    use super::lookup_cached_decision;
     use crate::cache::{self, Cache, CacheExt};
 
-    #[tokio::test]
-    async fn cache_retrieve_returns_none_on_miss() {
-        let cache = cache::Config::Memory.to_backend().unwrap();
-
-        let result = cache_retrieve(&cache, "wh", "missing-key").await;
-
-        assert_eq!(result, Ok(None));
-    }
-
-    #[tokio::test]
-    async fn cache_retrieve_returns_true_on_allow_hit() {
-        let cache = cache::Config::Memory.to_backend().unwrap();
-        cache.store("the-key", &true, 60).await.unwrap();
-
-        let result = cache_retrieve(&cache, "wh", "the-key").await;
-
-        assert_eq!(result, Ok(Some(true)));
-    }
-
-    #[tokio::test]
-    async fn cache_retrieve_returns_false_on_deny_hit() {
-        let cache = cache::Config::Memory.to_backend().unwrap();
-        cache.store("deny-key", &false, 60).await.unwrap();
-
-        let result = cache_retrieve(&cache, "wh", "deny-key").await;
-
-        assert_eq!(result, Ok(Some(false)));
-    }
-
-    #[tokio::test]
-    async fn cache_retrieve_returns_none_after_ttl_expiry() {
-        let cache = cache::Config::Memory.to_backend().unwrap();
-        // Store with TTL of 1 second then wait for expiry.
-        cache.store("exp-key", &true, 1).await.unwrap();
-
-        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
-
-        let result = cache_retrieve(&cache, "wh", "exp-key").await;
-
-        assert_eq!(result, Ok(None), "expired entry must be treated as a miss");
-    }
-
-    // A cache whose retrieve_value always returns a backend error.
     #[derive(Debug)]
     struct ErrorCache;
 
@@ -110,17 +60,35 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cache_retrieve_returns_none_on_backend_error() {
-        let cache: Arc<dyn Cache> = Arc::new(ErrorCache);
-
-        // A backend error must be treated as a miss (returns Ok(None)) so
-        // that authorization always falls through to the real webhook call.
-        let result = cache_retrieve(&cache, "wh", "any-key").await;
+    async fn lookup_cached_decision_unwraps_hit_to_some_value() {
+        let cache = cache::Config::Memory.to_backend().unwrap();
+        cache.store("allow-key", &true, 60).await.unwrap();
+        cache.store("deny-key", &false, 60).await.unwrap();
 
         assert_eq!(
-            result,
-            Ok(None),
-            "backend error during retrieve must not propagate — treat as miss"
+            lookup_cached_decision(&cache, "wh", "allow-key").await,
+            Some(true)
+        );
+        assert_eq!(
+            lookup_cached_decision(&cache, "wh", "deny-key").await,
+            Some(false)
+        );
+    }
+
+    #[tokio::test]
+    async fn lookup_cached_decision_returns_none_on_miss_or_error() {
+        let cache = cache::Config::Memory.to_backend().unwrap();
+        assert_eq!(
+            lookup_cached_decision(&cache, "wh", "no-such-key").await,
+            None,
+            "missing key must return None"
+        );
+
+        let error_cache: Arc<dyn Cache> = Arc::new(ErrorCache);
+        assert_eq!(
+            lookup_cached_decision(&error_cache, "wh", "any-key").await,
+            None,
+            "backend error must return None"
         );
     }
 }

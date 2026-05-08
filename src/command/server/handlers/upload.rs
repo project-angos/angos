@@ -1,10 +1,20 @@
-use hyper::{Response, StatusCode};
+use hyper::{
+    Response, StatusCode,
+    body::Incoming,
+    header::{CONTENT_LENGTH, CONTENT_RANGE},
+    http::request::Parts,
+};
 use tokio::io::AsyncRead;
 use uuid::Uuid;
 
 use crate::{
     command::server::{
-        ServerContext, error::Error, handlers::build_response, response_body::ResponseBody,
+        ServerContext,
+        error::Error,
+        handlers::build_response,
+        http_server::event_emission::dispatch_events,
+        request_ext::{HeaderExt, incoming_into_async_read},
+        response_body::ResponseBody,
     },
     event_webhook::event::{Event, EventActor},
     identity::ClientIdentity,
@@ -99,4 +109,53 @@ pub async fn handle_delete_upload(
     Ok(Response::builder()
         .status(StatusCode::NO_CONTENT)
         .body(ResponseBody::empty())?)
+}
+
+pub async fn dispatch_patch_upload(
+    context: &ServerContext,
+    parts: &Parts,
+    incoming: Incoming,
+    namespace: &Namespace,
+    uuid: Uuid,
+) -> Result<Response<ResponseBody>, Error> {
+    let start_offset = parts.range(CONTENT_RANGE)?.map(|(start, _)| start);
+    let content_length: u64 = parts.parse_header(CONTENT_LENGTH).unwrap_or(0);
+    let body_stream = incoming_into_async_read(incoming);
+
+    handle_patch_upload(
+        context,
+        namespace,
+        uuid,
+        start_offset,
+        content_length,
+        body_stream,
+    )
+    .await
+}
+
+pub async fn dispatch_put_upload(
+    context: &ServerContext,
+    parts: &Parts,
+    incoming: Incoming,
+    namespace: &Namespace,
+    uuid: Uuid,
+    digest: Digest,
+    identity: &ClientIdentity,
+) -> Result<Response<ResponseBody>, Error> {
+    let content_length: u64 = parts.parse_header(CONTENT_LENGTH).unwrap_or(0);
+    let body_stream = incoming_into_async_read(incoming);
+
+    let (response, events) = handle_put_upload(
+        context,
+        namespace,
+        uuid,
+        &digest,
+        content_length,
+        body_stream,
+        identity,
+    )
+    .await?;
+
+    dispatch_events(context, events).await?;
+    Ok(response)
 }

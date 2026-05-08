@@ -1,18 +1,37 @@
-use std::collections::HashMap;
+use std::{collections::HashMap, sync::Arc};
 
+use http_body_util::Full;
+use hyper::{
+    Request, Response, StatusCode,
+    body::Bytes,
+    header::{CONTENT_TYPE, WWW_AUTHENTICATE},
+};
 use opentelemetry::trace::TracerProvider;
 use opentelemetry_sdk::trace::{Sampler, SdkTracerProvider};
 use tracing_subscriber::{layer::SubscriberExt, registry::Registry as TracingRegistry};
 
-use super::*;
+use super::{
+    connection::{current_trace_id, inject_peer_certificate},
+    dispatch::authenticate_and_authorize,
+    error_response::{error_to_response, fallback_500},
+    observability::{handle_healthz, handle_metrics},
+};
 use crate::{
-    command::server::handlers::{
-        blob::handle_delete_blob, content_discovery::handle_list_catalog,
-        ext::handle_list_repositories,
+    auth::PeerCertificate,
+    command::server::{
+        ServerContext,
+        error::Error,
+        handlers::{
+            blob::handle_delete_blob, content_discovery::handle_list_catalog,
+            ext::handle_list_repositories,
+        },
+        response_body::ResponseBody,
     },
     configuration::Configuration,
-    identity::ClientIdentity,
-    metrics_provider, registry,
+    identity::{Action, ClientIdentity},
+    metrics_provider,
+    oci::{Digest, Namespace},
+    registry,
     registry::{Registry, RegistryConfig},
 };
 

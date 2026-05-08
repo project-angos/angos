@@ -1,14 +1,13 @@
 use std::{net::SocketAddr, sync::Arc, time::Duration};
 
 use arc_swap::ArcSwap;
-use hyper_util::rt::TokioIo;
-use tracing::{debug, info};
+use async_trait::async_trait;
+use tokio::net::TcpStream;
 
 use crate::command::server::{
     ServerContext,
     error::Error,
-    listeners::{accept, build_listener},
-    serve_request,
+    listeners::{Connector, HandshakeResult, accept_loop},
 };
 pub use crate::configuration::listeners::insecure::InsecureListenerConfig;
 
@@ -16,6 +15,28 @@ pub struct InsecureListener {
     binding_address: SocketAddr,
     context: ArcSwap<ServerContext>,
     timeouts: ArcSwap<[Duration; 2]>,
+}
+
+struct InsecureConnector;
+
+#[async_trait]
+impl Connector for InsecureConnector {
+    type Stream = TcpStream;
+
+    async fn handshake(
+        &self,
+        tcp: TcpStream,
+        _remote_address: SocketAddr,
+    ) -> Option<HandshakeResult<TcpStream>> {
+        Some(HandshakeResult {
+            stream: tcp,
+            peer_certificate: None,
+        })
+    }
+
+    fn label(&self) -> &'static str {
+        "non-TLS"
+    }
 }
 
 impl InsecureListener {
@@ -48,26 +69,13 @@ impl InsecureListener {
     }
 
     pub async fn serve(&self) -> Result<(), Error> {
-        info!("Listening on {} (non-TLS)", self.binding_address);
-        let listener = build_listener(self.binding_address).await?;
-
-        loop {
-            debug!("Waiting for incoming connection");
-            let (tcp, remote_address) = accept(&listener).await?;
-
-            debug!("Accepted connection from {remote_address}");
-            let stream = TokioIo::new(tcp);
-            let context = Arc::clone(&self.context.load());
-            let timeouts = Arc::clone(&self.timeouts.load());
-
-            tokio::spawn(Box::pin(serve_request(
-                stream,
-                context,
-                None,
-                timeouts,
-                remote_address,
-            )));
-        }
+        accept_loop(
+            self.binding_address,
+            &InsecureConnector,
+            &self.context,
+            &self.timeouts,
+        )
+        .await
     }
 }
 

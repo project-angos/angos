@@ -85,13 +85,12 @@ impl ServerContext {
             .await
     }
 
-    pub fn is_tag_immutable(&self, namespace: &str, tag: &str) -> bool {
-        self.authorizer.is_tag_immutable(namespace, tag)
-    }
-
     pub fn is_reference_immutable(&self, namespace: &Namespace, reference: &Reference) -> bool {
         match reference {
-            Reference::Tag(tag) => self.is_tag_immutable(namespace, tag.as_str()),
+            Reference::Tag(tag) => {
+                self.authorizer
+                    .is_tag_immutable(&self.registry, namespace, tag.as_str())
+            }
             Reference::Digest(_) => false,
         }
     }

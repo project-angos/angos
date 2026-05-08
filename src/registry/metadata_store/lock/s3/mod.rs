@@ -28,6 +28,7 @@ use crate::{
         },
         path_builder,
     },
+    timing::elapsed_ms,
 };
 
 const MAX_LOCK_TTL_SECS: u64 = 3600;
@@ -989,7 +990,7 @@ impl LockBackend for S3LockBackend {
                     metrics_provider()
                         .lock_acquisition_duration
                         .with_label_values(&["s3"])
-                        .observe(start.elapsed().as_secs_f64() * 1000.0);
+                        .observe(elapsed_ms(start));
                     metrics_provider()
                         .lock_acquisitions
                         .with_label_values(&["s3", "success"])
@@ -1000,7 +1001,7 @@ impl LockBackend for S3LockBackend {
                     metrics_provider()
                         .lock_acquisition_duration
                         .with_label_values(&["s3"])
-                        .observe(start.elapsed().as_secs_f64() * 1000.0);
+                        .observe(elapsed_ms(start));
                     metrics_provider()
                         .lock_acquisitions
                         .with_label_values(&["s3", "error"])
@@ -1012,7 +1013,7 @@ impl LockBackend for S3LockBackend {
                     metrics_provider()
                         .lock_acquisition_duration
                         .with_label_values(&["s3"])
-                        .observe(start.elapsed().as_secs_f64() * 1000.0);
+                        .observe(elapsed_ms(start));
                     metrics_provider()
                         .lock_acquisitions
                         .with_label_values(&["s3", "error"])
@@ -1033,7 +1034,7 @@ impl LockBackend for S3LockBackend {
                         metrics_provider()
                             .lock_acquisition_duration
                             .with_label_values(&["s3"])
-                            .observe(start.elapsed().as_secs_f64() * 1000.0);
+                            .observe(elapsed_ms(start));
                         metrics_provider()
                             .lock_acquisitions
                             .with_label_values(&["s3", "timeout"])

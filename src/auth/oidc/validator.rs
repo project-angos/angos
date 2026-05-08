@@ -1,13 +1,13 @@
 use std::collections::HashMap;
 
-use jsonwebtoken::{Validation, decode, decode_header};
+use jsonwebtoken::{Algorithm, Validation, decode, decode_header};
 use reqwest::{Client, header::ACCEPT};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use tracing::{debug, info, warn};
 
 use crate::{
     auth::oidc::{Jwk, OidcProvider},
-    cache::{Cache, CacheExt},
+    cache::{Cache, CacheExt, CacheOutcome},
     command::server::{Error, sha256_hash},
     identity::OidcClaims,
 };
@@ -67,16 +67,7 @@ fn verify_jwt(
 
     let decoding_key = jwk.to_decoding_key()?;
 
-    let mut validation = Validation::new(header.alg);
-    validation.set_issuer(&[provider.issuer()]);
-    if let Some(aud) = provider.required_audience() {
-        validation.set_audience(&[aud]);
-    } else {
-        validation.validate_aud = false;
-    }
-    validation.leeway = provider.clock_skew_tolerance();
-    validation.validate_exp = true;
-    validation.validate_nbf = true;
+    let validation = build_validation(provider, header.alg);
 
     debug!(
         "Validation settings: issuer={:?}, audience={:?}, leeway={}, validate_exp={}, validate_nbf={}, algorithms={:?}",
@@ -104,6 +95,20 @@ fn verify_jwt(
         provider_type: provider.name().to_string(),
         claims: token_data.claims,
     })
+}
+
+fn build_validation(provider: &dyn OidcProvider, alg: Algorithm) -> Validation {
+    let mut validation = Validation::new(alg);
+    validation.set_issuer(&[provider.issuer()]);
+    if let Some(aud) = provider.required_audience() {
+        validation.set_audience(&[aud]);
+    } else {
+        validation.validate_aud = false;
+    }
+    validation.leeway = provider.clock_skew_tolerance();
+    validation.validate_exp = true;
+    validation.validate_nbf = true;
+    validation
 }
 
 async fn query_json<T>(client: &Client, url: &str) -> Result<T, Error>
@@ -155,12 +160,14 @@ async fn fetch_jwks(
     let cache_key = format!("oidc:{provider_name}:jwks:{issuer_hash}");
 
     match cache.retrieve::<Jwks>(&cache_key).await {
-        Ok(Some(cached)) => {
+        CacheOutcome::Hit(cached) => {
             debug!("Using cached JWKS for provider: {provider_name}");
             return Ok(cached);
         }
-        Err(err) => warn!("OIDC JWKS cache retrieve failed for {provider_name}: {err}"),
-        Ok(None) => {}
+        CacheOutcome::Error(err) => {
+            warn!("OIDC JWKS cache retrieve failed for {provider_name}: {err}");
+        }
+        CacheOutcome::Miss => {}
     }
 
     let jwks_url = get_jwks_url(provider, client, cache).await?;
@@ -186,12 +193,14 @@ async fn fetch_oidc_configuration(
     let cache_key = format!("oidc:{provider_name}:config:{issuer_hash}");
 
     match cache.retrieve::<OpenIdConfiguration>(&cache_key).await {
-        Ok(Some(cached)) => {
+        CacheOutcome::Hit(cached) => {
             debug!("Using cached OIDC configuration");
             return Ok(cached);
         }
-        Err(err) => warn!("OIDC configuration cache retrieve failed for {provider_name}: {err}"),
-        Ok(None) => {}
+        CacheOutcome::Error(err) => {
+            warn!("OIDC configuration cache retrieve failed for {provider_name}: {err}");
+        }
+        CacheOutcome::Miss => {}
     }
 
     let config_url = format!("{}/.well-known/openid-configuration", provider.issuer());

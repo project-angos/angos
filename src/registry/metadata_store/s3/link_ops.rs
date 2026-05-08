@@ -31,8 +31,8 @@ impl Backend {
         cache
             .retrieve::<LinkMetadata>(&Self::cache_key(namespace, link))
             .await
-            .ok()
-            .flatten()
+            .try_into()
+            .unwrap_or_default()
     }
 
     /// Reads the link with its `ETag`, then spawns the access time write as a

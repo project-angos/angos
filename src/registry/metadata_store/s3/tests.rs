@@ -97,7 +97,7 @@ async fn test_read_link_cache_miss_fetches_from_s3() {
 
     // Verify cache was populated
     let cache_key = format!("link:{namespace}:{tag}");
-    let cached: Option<LinkMetadata> = cache.retrieve(&cache_key).await.unwrap();
+    let cached: Option<LinkMetadata> = cache.retrieve(&cache_key).await.try_into().unwrap();
     assert!(cached.is_some(), "Cache should be populated after read");
     assert_eq!(cached.unwrap().target, digest);
 }

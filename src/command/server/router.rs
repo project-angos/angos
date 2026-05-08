@@ -64,6 +64,12 @@ impl DigestQuery {
     }
 }
 
+fn digest_from_params(params: Option<&str>) -> Option<Digest> {
+    params
+        .map(parse_query::<DigestQuery>)
+        .and_then(|r| r.to_digest())
+}
+
 #[derive(Deserialize, Debug, Default)]
 #[serde(rename_all = "camelCase")]
 struct ArtifactTypeQuery {
@@ -119,9 +125,7 @@ fn try_parse_uploads(method: &Method, path: &str, params: Option<&str>) -> Optio
             && method == Method::POST
         {
             let namespace = Namespace::new(namespace_str).ok()?;
-            let digest = params
-                .map(parse_query::<DigestQuery>)
-                .and_then(|r| r.to_digest());
+            let digest = digest_from_params(params);
 
             return Some(Action::StartUpload { namespace, digest });
         }
@@ -131,21 +135,15 @@ fn try_parse_uploads(method: &Method, path: &str, params: Option<&str>) -> Optio
 }
 
 fn try_parse_upload(method: &Method, path: &str, params: Option<&str>) -> Option<Action> {
-    if let Some(upload_position) = path.rfind("/blobs/uploads/") {
-        let namespace_str = &path[..upload_position];
+    if let Some((namespace_str, uuid)) = path.rsplit_once("/blobs/uploads/") {
         let namespace = Namespace::new(namespace_str).ok()?;
-
-        let uuid = &path[upload_position + "/blobs/uploads/".len()..];
         let uuid = Uuid::from_str(uuid).ok()?;
 
         match *method {
             Method::GET => return Some(Action::GetUpload { namespace, uuid }),
             Method::PATCH => return Some(Action::PatchUpload { namespace, uuid }),
             Method::PUT => {
-                if let Some(digest) = params
-                    .map(parse_query::<DigestQuery>)
-                    .and_then(|r| r.to_digest())
-                {
+                if let Some(digest) = digest_from_params(params) {
                     return Some(Action::PutUpload {
                         namespace,
                         uuid,
@@ -162,11 +160,8 @@ fn try_parse_upload(method: &Method, path: &str, params: Option<&str>) -> Option
 }
 
 fn try_find_blobs(method: &Method, path: &str) -> Option<Action> {
-    if let Some(blob_position) = path.rfind("/blobs/") {
-        let namespace_str = &path[..blob_position];
+    if let Some((namespace_str, digest)) = path.rsplit_once("/blobs/") {
         let namespace = Namespace::new(namespace_str).ok()?;
-
-        let digest = &path[blob_position + "/blobs/".len()..];
         let digest = Digest::from_str(digest).ok()?;
 
         match *method {
@@ -181,11 +176,8 @@ fn try_find_blobs(method: &Method, path: &str) -> Option<Action> {
 }
 
 fn try_find_manifests(method: &Method, path: &str) -> Option<Action> {
-    if let Some(manifest_position) = path.rfind("/manifests/") {
-        let namespace_str = &path[..manifest_position];
+    if let Some((namespace_str, reference)) = path.rsplit_once("/manifests/") {
         let namespace = Namespace::new(namespace_str).ok()?;
-
-        let reference = &path[manifest_position + "/manifests/".len()..];
         let reference = Reference::from_str(reference).ok()?;
 
         match *method {
@@ -221,11 +213,8 @@ fn try_find_manifests(method: &Method, path: &str) -> Option<Action> {
 }
 
 fn try_find_referrers(method: &Method, path: &str, params: Option<&str>) -> Option<Action> {
-    if let Some(referrers_position) = path.rfind("/referrers/") {
-        let namespace_str = &path[..referrers_position];
+    if let Some((namespace_str, digest)) = path.rsplit_once("/referrers/") {
         let namespace = Namespace::new(namespace_str).ok()?;
-
-        let digest = &path[referrers_position + "/referrers/".len()..];
         let digest = Digest::from_str(digest).ok()?;
 
         let artifact_type = params

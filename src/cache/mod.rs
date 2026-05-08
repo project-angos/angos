@@ -12,6 +12,29 @@ mod redis;
 pub use config::Config;
 pub use error::Error;
 
+/// Three-way result of a cache lookup. Returned by [`CacheExt::retrieve`].
+/// Distinguishes miss from error so the caller can decide on logging or fall-through.
+pub enum CacheOutcome<T> {
+    Hit(T),
+    Miss,
+    Error(Error),
+}
+
+impl<T> TryFrom<CacheOutcome<T>> for Option<T> {
+    type Error = Error;
+
+    /// `Hit(v) → Ok(Some(v))`, `Miss → Ok(None)`, `Error(e) → Err(e)`.
+    /// Lets callers `?`-propagate backend errors while treating Hit and Miss
+    /// alike as "lookup completed".
+    fn try_from(outcome: CacheOutcome<T>) -> Result<Self, Self::Error> {
+        match outcome {
+            CacheOutcome::Hit(value) => Ok(Some(value)),
+            CacheOutcome::Miss => Ok(None),
+            CacheOutcome::Error(err) => Err(err),
+        }
+    }
+}
+
 /// Trait for cache implementations that can store and retrieve values with a given TTL
 #[async_trait]
 pub trait Cache: Debug + Send + Sync {
@@ -28,17 +51,24 @@ pub trait Cache: Debug + Send + Sync {
 /// Extension trait providing JSON serialization for cache operations
 #[async_trait]
 pub trait CacheExt: Cache {
-    /// Retrieve and deserialize a JSON value from the cache
-    async fn retrieve<T: DeserializeOwned + Send>(&self, key: &str) -> Result<Option<T>, Error> {
-        let Some(cached) = self.retrieve_value(key).await? else {
-            return Ok(None);
+    /// Retrieve and deserialize a JSON value as a [`CacheOutcome<T>`].
+    /// Distinguishes hit, miss, and backend/deserialization error so each caller
+    /// can apply its own logging and fall-through policy.
+    async fn retrieve<T: DeserializeOwned + Send>(&self, key: &str) -> CacheOutcome<T> {
+        let cached = match self.retrieve_value(key).await {
+            Ok(Some(s)) => s,
+            Ok(None) => return CacheOutcome::Miss,
+            Err(err) => return CacheOutcome::Error(err),
         };
-
-        let value = serde_json::from_str::<T>(&cached)
-            .map_err(|e| Error::Execution(format!("Failed to deserialize cached value: {e}")))?;
-
-        debug!("Using cached value for key: {key}");
-        Ok(Some(value))
+        match serde_json::from_str::<T>(&cached) {
+            Ok(value) => {
+                debug!("Using cached value for key: {key}");
+                CacheOutcome::Hit(value)
+            }
+            Err(e) => CacheOutcome::Error(Error::Execution(format!(
+                "Failed to deserialize cached value: {e}"
+            ))),
+        }
     }
 
     /// Serialize and store a JSON value in the cache
@@ -142,55 +172,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_retrieve_success() {
-        let cache = StubCache::new();
-        let test_data = TestData {
-            name: "test".to_string(),
-            value: 42,
-        };
-        let serialized = serde_json::to_string(&test_data).unwrap();
-        cache.set_data(Some(serialized));
-
-        let result: Result<Option<TestData>, Error> = cache.retrieve("test_key").await;
-
-        assert!(result.is_ok());
-        let retrieved = result.unwrap();
-        assert!(retrieved.is_some());
-        assert_eq!(retrieved.unwrap(), test_data);
-    }
-
-    #[tokio::test]
-    async fn test_retrieve_not_found() {
-        let cache = StubCache::new();
-        cache.set_data(None);
-
-        let result: Result<Option<TestData>, Error> = cache.retrieve("test_key").await;
-
-        assert!(result.is_ok());
-        assert!(result.unwrap().is_none());
-    }
-
-    #[tokio::test]
-    async fn test_retrieve_backend_error() {
-        let cache = StubCache::new();
-        cache.set_retrieve_error(Some("Backend failure".to_string()));
-
-        let result: Result<Option<TestData>, Error> = cache.retrieve("test_key").await;
-
-        assert!(matches!(result, Err(Error::Execution(_))));
-    }
-
-    #[tokio::test]
-    async fn test_retrieve_deserialization_error() {
-        let cache = StubCache::new();
-        cache.set_data(Some("invalid json".to_string()));
-
-        let result: Result<Option<TestData>, Error> = cache.retrieve("test_key").await;
-
-        assert!(matches!(result, Err(Error::Execution(_))));
-    }
-
-    #[tokio::test]
     async fn test_store_success() {
         let cache = StubCache::new();
         let test_data = TestData {
@@ -247,5 +228,65 @@ mod tests {
         let result = cache.store("test_key", &bad_data, 60).await;
 
         assert!(matches!(result, Err(Error::Execution(_))));
+    }
+
+    #[tokio::test]
+    async fn retrieve_returns_hit_on_stored_value() {
+        let cache = StubCache::new();
+        let stored = TestData {
+            name: "alice".to_string(),
+            value: 7,
+        };
+        cache.set_data(Some(serde_json::to_string(&stored).unwrap()));
+
+        let outcome: CacheOutcome<TestData> = cache.retrieve("k").await;
+
+        let CacheOutcome::Hit(value) = outcome else {
+            panic!("expected Hit, got Miss/Error");
+        };
+        assert_eq!(value, stored);
+    }
+
+    #[tokio::test]
+    async fn retrieve_returns_miss_on_missing_key() {
+        let cache = StubCache::new();
+        cache.set_data(None);
+
+        let outcome: CacheOutcome<TestData> = cache.retrieve("k").await;
+
+        assert!(matches!(outcome, CacheOutcome::Miss));
+    }
+
+    #[tokio::test]
+    async fn retrieve_returns_error_on_backend_failure() {
+        let cache = StubCache::new();
+        cache.set_retrieve_error(Some("backend down".to_string()));
+
+        let outcome: CacheOutcome<TestData> = cache.retrieve("k").await;
+
+        assert!(matches!(outcome, CacheOutcome::Error(Error::Execution(_))));
+    }
+
+    #[tokio::test]
+    async fn retrieve_returns_error_on_deserialization_failure() {
+        let cache = StubCache::new();
+        cache.set_data(Some("not valid json".to_string()));
+
+        let outcome: CacheOutcome<TestData> = cache.retrieve("k").await;
+
+        assert!(matches!(outcome, CacheOutcome::Error(Error::Execution(_))));
+    }
+
+    #[test]
+    fn try_from_outcome_maps_hit_and_miss_to_ok_and_error_to_err() {
+        let hit: Result<Option<i32>, Error> = CacheOutcome::Hit(42_i32).try_into();
+        assert_eq!(hit.unwrap(), Some(42));
+
+        let miss: Result<Option<i32>, Error> = CacheOutcome::<i32>::Miss.try_into();
+        assert_eq!(miss.unwrap(), None);
+
+        let err: Result<Option<i32>, Error> =
+            CacheOutcome::<i32>::Error(Error::Execution("boom".to_string())).try_into();
+        assert!(matches!(err, Err(Error::Execution(msg)) if msg == "boom"));
     }
 }
