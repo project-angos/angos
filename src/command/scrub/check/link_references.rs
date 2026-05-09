@@ -80,6 +80,12 @@ impl LinkReferencesChecker {
         Ok(())
     }
 
+    /// Returns `true` only when the link exists but its `referenced_by` set is
+    /// missing `referrer` — the back-link is absent and must be added.
+    ///
+    /// A `ReferenceNotFound` error means the link itself does not exist, so
+    /// there is nothing to update; orphan-link cleanup handles that case in a
+    /// separate scrub stage.
     async fn needs_referrer_update(
         &self,
         namespace: &str,
@@ -88,7 +94,6 @@ impl LinkReferencesChecker {
     ) -> Result<bool, Error> {
         match self.metadata_store.read_link(namespace, link, false).await {
             Ok(metadata) if metadata.referenced_by.contains(referrer) => Ok(false),
-            // A missing referrer entry means the backlink is absent and needs adding.
             Ok(_) => Ok(true),
             Err(metadata_store::Error::ReferenceNotFound) => Ok(false),
             Err(e) => Err(e.into()),
