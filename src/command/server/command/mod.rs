@@ -4,6 +4,7 @@ use std::{
 };
 
 use argh::FromArgs;
+use tracing::warn;
 
 use super::{
     ServerContext,
@@ -65,11 +66,26 @@ impl Command {
         let context = ServerContext::new(config, registry)?;
 
         match (&self.listener, &config.server) {
-            (ServiceListener::Insecure(listener), _) => listener.notify_config_change(context),
+            (ServiceListener::Insecure(listener), ServerConfig::Insecure(_)) => {
+                listener.notify_config_change(context);
+            }
+            (ServiceListener::Insecure(listener), ServerConfig::Tls(_)) => {
+                warn!(
+                    "Listener type transition from insecure to TLS is not supported at runtime; \
+                     restart the server to apply the new listener configuration. \
+                     Non-listener changes will still be applied."
+                );
+                listener.notify_config_change(context);
+            }
             (ServiceListener::Secure(listener), ServerConfig::Tls(server_config)) => {
                 listener.notify_config_change(server_config, context)?;
             }
-            _ => {}
+            (ServiceListener::Secure(_), ServerConfig::Insecure(_)) => {
+                warn!(
+                    "Listener type transition from TLS to insecure is not supported at runtime; \
+                     restart the server to apply the new listener configuration."
+                );
+            }
         }
 
         Ok(())

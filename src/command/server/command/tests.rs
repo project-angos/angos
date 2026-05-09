@@ -1,6 +1,6 @@
 use std::{
     collections::HashMap,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, Once},
 };
 
 use super::{Command, ServerContext, ServiceListener, setup};
@@ -15,6 +15,16 @@ use crate::{
     registry::{Registry, RegistryConfig, metadata_store::ConditionalCapabilities, repository},
     secret::Secret,
 };
+
+static CRYPTO_INIT: Once = Once::new();
+
+fn init_crypto_provider() {
+    CRYPTO_INIT.call_once(|| {
+        rustls::crypto::aws_lc_rs::default_provider()
+            .install_default()
+            .ok();
+    });
+}
 
 fn create_minimal_config() -> Configuration {
     let toml = r#"
@@ -749,6 +759,71 @@ async fn test_command_shutdown_drains_in_flight_async_delivery() {
         1,
         "Command::shutdown() must drain in-flight async webhook deliveries"
     );
+}
+
+fn create_tls_config() -> (
+    Configuration,
+    (
+        tempfile::NamedTempFile,
+        tempfile::NamedTempFile,
+        tempfile::NamedTempFile,
+    ),
+) {
+    let (tls_config, temp_files) = build_config(false);
+
+    let toml = format!(
+        r#"
+        [blob_store.fs]
+        root_dir = "/tmp/test-blobs"
+
+        [metadata_store.fs]
+        root_dir = "/tmp/test-metadata"
+
+        [cache.memory]
+
+        [server]
+        bind_address = "127.0.0.1"
+        port = 8443
+
+        [server.tls]
+        server_certificate_bundle = "{cert}"
+        server_private_key = "{key}"
+
+        [global]
+        update_pull_time = false
+        max_concurrent_cache_jobs = 10
+    "#,
+        cert = tls_config.server_certificate_bundle.display(),
+        key = tls_config.server_private_key.display(),
+    );
+
+    (Configuration::load_from_str(&toml).unwrap(), temp_files)
+}
+
+#[tokio::test]
+async fn test_notify_config_change_insecure_to_tls_does_not_fail() {
+    init_crypto_provider();
+
+    let insecure_config = create_minimal_config();
+    let command = Command::new(&insecure_config).await.unwrap();
+
+    let (tls_config, _temp_files) = create_tls_config();
+    let result = command.notify_config_change(&tls_config).await;
+
+    assert!(result.is_ok());
+}
+
+#[tokio::test]
+async fn test_notify_config_change_tls_to_insecure_does_not_fail() {
+    init_crypto_provider();
+
+    let (tls_config, _temp_files) = create_tls_config();
+    let command = Command::new(&tls_config).await.unwrap();
+
+    let insecure_config = create_minimal_config();
+    let result = command.notify_config_change(&insecure_config).await;
+
+    assert!(result.is_ok());
 }
 
 #[test]
