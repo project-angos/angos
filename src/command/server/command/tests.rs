@@ -3,13 +3,16 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use super::*;
+use super::{Command, ServerContext, ServiceListener, setup};
 use crate::{
     cache,
-    command::{bootstrap, server::listeners::tls::tests::build_config},
-    configuration,
+    command::{
+        bootstrap,
+        server::listeners::{insecure::InsecureListener, tls::tests::build_config},
+    },
+    configuration::{self, Configuration, ServerConfig},
     policy::{AccessMode, AccessPolicyConfig, CelRule},
-    registry::{Registry, RegistryConfig, repository},
+    registry::{Registry, RegistryConfig, metadata_store::ConditionalCapabilities, repository},
     secret::Secret,
 };
 
@@ -74,7 +77,8 @@ fn test_build_blob_store_filesystem_success() {
 async fn test_build_metadata_store_filesystem_success() {
     let config = create_minimal_config();
     let auth_cache = bootstrap::auth_cache(&config.cache).unwrap();
-    let result = build_metadata_store(&config, &auth_cache, &Arc::new(Mutex::new(None))).await;
+    let result =
+        setup::build_metadata_store(&config, &auth_cache, &Arc::new(Mutex::new(None))).await;
 
     assert!(result.is_ok());
 }
@@ -101,7 +105,8 @@ async fn test_build_metadata_store_with_explicit_config() {
 
     let config = Configuration::load_from_str(toml).unwrap();
     let auth_cache = bootstrap::auth_cache(&config.cache).unwrap();
-    let result = build_metadata_store(&config, &auth_cache, &Arc::new(Mutex::new(None))).await;
+    let result =
+        setup::build_metadata_store(&config, &auth_cache, &Arc::new(Mutex::new(None))).await;
 
     assert!(result.is_ok());
 }
@@ -247,7 +252,7 @@ fn test_build_repositories_multiple() {
 #[tokio::test]
 async fn test_build_registry_minimal_config() {
     let config = create_minimal_config();
-    let result = build_registry(&config, &Arc::new(Mutex::new(None))).await;
+    let result = setup::build_registry(&config, &Arc::new(Mutex::new(None))).await;
 
     assert!(result.is_ok());
 }
@@ -255,7 +260,7 @@ async fn test_build_registry_minimal_config() {
 #[tokio::test]
 async fn test_build_registry_with_repositories() {
     let config = create_config_with_repository();
-    let result = build_registry(&config, &Arc::new(Mutex::new(None))).await;
+    let result = setup::build_registry(&config, &Arc::new(Mutex::new(None))).await;
 
     assert!(result.is_ok());
 }
@@ -281,7 +286,7 @@ async fn test_build_registry_with_update_pull_time() {
     "#;
 
     let config = Configuration::load_from_str(toml).unwrap();
-    let result = build_registry(&config, &Arc::new(Mutex::new(None))).await;
+    let result = setup::build_registry(&config, &Arc::new(Mutex::new(None))).await;
 
     assert!(result.is_ok());
 }
@@ -337,7 +342,7 @@ async fn test_service_listener_enum_variants() {
         panic!("Expected insecure config")
     };
 
-    let registry = build_registry(&config, &Arc::new(Mutex::new(None)))
+    let registry = setup::build_registry(&config, &Arc::new(Mutex::new(None)))
         .await
         .unwrap();
     let context = ServerContext::new(&config, registry).unwrap();
@@ -376,9 +381,10 @@ async fn test_build_registry_components_integration() {
 
     let auth_cache = bootstrap::auth_cache(&config.cache).unwrap();
     let blob_handles = bootstrap::blob_stores(&config.blob_store, &auth_cache).unwrap();
-    let metadata_store = build_metadata_store(&config, &auth_cache, &Arc::new(Mutex::new(None)))
-        .await
-        .unwrap();
+    let metadata_store =
+        setup::build_metadata_store(&config, &auth_cache, &Arc::new(Mutex::new(None)))
+            .await
+            .unwrap();
     let repositories = bootstrap::repositories(&config.repository, &auth_cache).unwrap();
 
     let registry_config = RegistryConfig::new()
