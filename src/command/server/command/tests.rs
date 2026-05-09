@@ -546,7 +546,8 @@ async fn test_hot_reload_adds_webhook_via_command() {
 
     assert!(
         command
-            .insecure_listener()
+            .as_insecure()
+            .unwrap()
             .current_context()
             .event_dispatcher()
             .is_none()
@@ -557,7 +558,8 @@ async fn test_hot_reload_adds_webhook_via_command() {
 
     assert!(
         command
-            .insecure_listener()
+            .as_insecure()
+            .unwrap()
             .current_context()
             .event_dispatcher()
             .is_some()
@@ -571,7 +573,8 @@ async fn test_hot_reload_removes_webhook_via_command() {
 
     assert!(
         command
-            .insecure_listener()
+            .as_insecure()
+            .unwrap()
             .current_context()
             .event_dispatcher()
             .is_some()
@@ -582,7 +585,8 @@ async fn test_hot_reload_removes_webhook_via_command() {
 
     assert!(
         command
-            .insecure_listener()
+            .as_insecure()
+            .unwrap()
             .current_context()
             .event_dispatcher()
             .is_none()
@@ -619,7 +623,7 @@ async fn test_hot_reload_changes_webhook_url_via_command() {
     let config_b = create_config_with_webhook(&format!("{}/webhook", server_b.uri()));
     command.notify_config_change(&config_b).await.unwrap();
 
-    let context = command.insecure_listener().current_context();
+    let context = command.as_insecure().unwrap().current_context();
     context.dispatch_event(&create_test_event()).await.unwrap();
 }
 
@@ -648,7 +652,7 @@ async fn test_hot_reload_adds_second_webhook() {
     let config_two = create_config_with_two_webhooks(&server_a.uri(), &server_b.uri());
     command.notify_config_change(&config_two).await.unwrap();
 
-    let context = command.insecure_listener().current_context();
+    let context = command.as_insecure().unwrap().current_context();
     context.dispatch_event(&create_test_event()).await.unwrap();
 }
 
@@ -677,7 +681,7 @@ async fn test_hot_reload_removes_one_of_two_webhooks() {
     let config_one = create_config_with_webhook(&server_a.uri());
     command.notify_config_change(&config_one).await.unwrap();
 
-    let context = command.insecure_listener().current_context();
+    let context = command.as_insecure().unwrap().current_context();
     context.dispatch_event(&create_test_event()).await.unwrap();
 }
 
@@ -703,7 +707,7 @@ async fn test_hot_reload_inflight_old_dispatcher_still_works() {
     let config_old = create_config_with_webhook(&server_old.uri());
     let command = Command::new(&config_old).await.unwrap();
 
-    let old_context = Arc::clone(&command.insecure_listener().current_context());
+    let old_context = Arc::clone(&command.as_insecure().unwrap().current_context());
 
     let config_new = create_config_with_webhook(&server_new.uri());
     command.notify_config_change(&config_new).await.unwrap();
@@ -713,7 +717,7 @@ async fn test_hot_reload_inflight_old_dispatcher_still_works() {
         .await
         .unwrap();
 
-    let new_context = command.insecure_listener().current_context();
+    let new_context = command.as_insecure().unwrap().current_context();
     new_context
         .dispatch_event(&create_test_event())
         .await
@@ -747,7 +751,7 @@ async fn test_command_shutdown_drains_in_flight_async_delivery() {
     let config = create_config_with_webhook(&server.uri());
     let command = Command::new(&config).await.unwrap();
 
-    let context = command.insecure_listener().current_context();
+    let context = command.as_insecure().unwrap().current_context();
     context.dispatch_event(&create_test_event()).await.unwrap();
     drop(context);
 

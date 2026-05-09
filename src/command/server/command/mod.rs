@@ -100,10 +100,10 @@ impl Command {
     }
 
     #[cfg(test)]
-    pub fn insecure_listener(&self) -> &InsecureListener {
+    pub fn as_insecure(&self) -> Option<&InsecureListener> {
         match &self.listener {
-            ServiceListener::Insecure(listener) => listener,
-            ServiceListener::Secure(_) => panic!("Expected insecure listener"),
+            ServiceListener::Insecure(listener) => Some(listener),
+            ServiceListener::Secure(_) => None,
         }
     }
 
