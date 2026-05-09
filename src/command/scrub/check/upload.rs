@@ -2,14 +2,17 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use chrono::{Duration, Utc};
+use futures_util::StreamExt;
 use tracing::{debug, error};
 
 use crate::{
-    command::scrub::{action::Action, check::NamespaceChecker, error::Error, executor::ActionSink},
-    registry::{
-        blob_store::{self, UploadStore},
-        pagination::collect_all_pages,
+    command::scrub::{
+        action::Action,
+        check::{NamespaceChecker, list_all},
+        error::Error,
+        executor::ActionSink,
     },
+    registry::blob_store::UploadStore,
 };
 
 pub struct UploadChecker {
@@ -69,14 +72,10 @@ impl NamespaceChecker for UploadChecker {
     ) -> Result<(), Error> {
         debug!("Checking uploads from namespace '{namespace}'");
 
-        let uploads: Vec<String> = collect_all_pages(|marker| async move {
-            self.upload_store.list(namespace, 100, marker).await
-        })
-        .await
-        .map_err(|e: blob_store::Error| Error::from(e))?;
-
-        for uuid in &uploads {
-            if let Err(e) = self.check_upload(namespace, uuid, sink).await {
+        let mut uploads = list_all::uploads(&self.upload_store, namespace);
+        while let Some(uuid) = uploads.next().await {
+            let uuid = uuid?;
+            if let Err(e) = self.check_upload(namespace, &uuid, sink).await {
                 error!("Failed to check upload from '{namespace}' ('{uuid}'): {e}");
             }
         }

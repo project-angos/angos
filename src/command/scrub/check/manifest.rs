@@ -1,11 +1,12 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use futures_util::StreamExt;
 use tracing::{debug, error};
 
 use crate::{
     command::scrub::{
-        check::{NamespaceChecker, ensure_link},
+        check::{NamespaceChecker, ensure_link, list_all},
         error::Error,
         executor::ActionSink,
     },
@@ -13,7 +14,6 @@ use crate::{
     registry::{
         blob_store::BlobStore,
         metadata_store::{MetadataStore, link_kind::LinkKind},
-        pagination::collect_all_pages,
         parse_manifest_digests,
     },
 };
@@ -100,16 +100,10 @@ impl NamespaceChecker for ManifestChecker {
     ) -> Result<(), Error> {
         debug!("Checking manifest inconsistencies from namespace '{namespace}'");
 
-        let revisions: Vec<Digest> = collect_all_pages(|marker| async move {
-            self.metadata_store
-                .list_revisions(namespace, 100, marker)
-                .await
-        })
-        .await
-        .map_err(Error::from)?;
-
-        for revision in &revisions {
-            if let Err(e) = self.repair_manifest_links(namespace, revision, sink).await {
+        let mut revisions = list_all::revisions(&self.metadata_store, namespace);
+        while let Some(revision) = revisions.next().await {
+            let revision = revision?;
+            if let Err(e) = self.repair_manifest_links(namespace, &revision, sink).await {
                 error!("Failed to check tag from '{namespace}' (revision '{revision}'): {e}");
             }
         }

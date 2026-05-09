@@ -1,15 +1,20 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use futures_util::StreamExt;
 use tracing::{debug, error, warn};
 
 use crate::{
-    command::scrub::{action::Action, check::NamespaceChecker, error::Error, executor::ActionSink},
+    command::scrub::{
+        action::Action,
+        check::{NamespaceChecker, list_all},
+        error::Error,
+        executor::ActionSink,
+    },
     oci::{Digest, Manifest},
     registry::{
         blob_store::BlobStore,
         metadata_store::{MetadataStore, link_kind::LinkKind},
-        pagination::collect_all_pages,
     },
 };
 
@@ -83,15 +88,9 @@ impl NamespaceChecker for MediaTypeChecker {
     ) -> Result<(), Error> {
         debug!("Checking media_type field for namespace '{namespace}'");
 
-        let revisions = collect_all_pages(|marker| async move {
-            self.metadata_store
-                .list_revisions(namespace, 100, marker)
-                .await
-        })
-        .await
-        .map_err(Error::from)?;
-
-        for revision in &revisions {
+        let mut revisions = list_all::revisions(&self.metadata_store, namespace);
+        while let Some(revision) = revisions.next().await {
+            let revision = revision?;
             let link = LinkKind::Digest(revision.clone());
             if let Err(e) = self
                 .backfill_link(namespace, &link, &format!("revision {revision}"), sink)
@@ -103,13 +102,9 @@ impl NamespaceChecker for MediaTypeChecker {
             }
         }
 
-        let tags = collect_all_pages(|marker| async move {
-            self.metadata_store.list_tags(namespace, 100, marker).await
-        })
-        .await
-        .map_err(Error::from)?;
-
-        for tag in &tags {
+        let mut tags = list_all::tags(&self.metadata_store, namespace);
+        while let Some(tag) = tags.next().await {
+            let tag = tag?;
             let link = LinkKind::Tag(tag.clone());
             if let Err(e) = self
                 .backfill_link(namespace, &link, &format!("tag '{tag}'"), sink)

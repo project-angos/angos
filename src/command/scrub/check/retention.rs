@@ -1,11 +1,16 @@
 use std::{collections::HashMap, sync::Arc};
 
 use async_trait::async_trait;
-use futures_util::future::join_all;
+use futures_util::{StreamExt, future::join_all};
 use tracing::debug;
 
 use crate::{
-    command::scrub::{action::Action, check::NamespaceChecker, error::Error, executor::ActionSink},
+    command::scrub::{
+        action::Action,
+        check::{NamespaceChecker, list_all},
+        error::Error,
+        executor::ActionSink,
+    },
     oci::{Digest, namespace_belongs_to},
     policy::{EpochSeconds, ManifestImage, RetentionPolicy},
     registry::{
@@ -246,16 +251,10 @@ impl RetentionChecker {
         last_pulled: &[String],
         sink: &mut (dyn ActionSink + Send),
     ) -> Result<(), Error> {
-        let revisions = collect_all_pages(|marker| async move {
-            self.metadata_store
-                .list_revisions(namespace, 100, marker)
-                .await
-        })
-        .await
-        .map_err(Error::from)?;
-
-        for digest in &revisions {
-            self.process_orphan_revision(namespace, digest, last_pushed, last_pulled, sink)
+        let mut revisions = list_all::revisions(&self.metadata_store, namespace);
+        while let Some(digest) = revisions.next().await {
+            let digest = digest?;
+            self.process_orphan_revision(namespace, &digest, last_pushed, last_pulled, sink)
                 .await?;
         }
 

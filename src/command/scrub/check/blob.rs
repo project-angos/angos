@@ -1,15 +1,20 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use futures_util::StreamExt;
 use tracing::{debug, error};
 
 use crate::{
-    command::scrub::{action::Action, check::StoreChecker, error::Error, executor::ActionSink},
+    command::scrub::{
+        action::Action,
+        check::{StoreChecker, list_all},
+        error::Error,
+        executor::ActionSink,
+    },
     oci::Digest,
     registry::{
         blob_store::BlobStore,
         metadata_store::{self, MetadataStore, link_kind::LinkKind},
-        pagination::collect_all_pages,
     },
 };
 
@@ -92,12 +97,10 @@ impl StoreChecker for BlobChecker {
     async fn check_all(&self, sink: &mut (dyn ActionSink + Send)) -> Result<(), Error> {
         debug!("Checking blobs");
 
-        let blobs: Vec<Digest> =
-            collect_all_pages(|marker| async move { self.blob_store.list(100, marker).await })
-                .await?;
-
-        for blob in &blobs {
-            if let Err(e) = self.check_blob(blob, sink).await {
+        let mut blobs = list_all::blobs(&self.blob_store);
+        while let Some(blob) = blobs.next().await {
+            let blob = blob?;
+            if let Err(e) = self.check_blob(&blob, sink).await {
                 error!("Failed to process blob index for {blob}: {e}");
             }
         }

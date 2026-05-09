@@ -1,18 +1,16 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use futures_util::StreamExt;
 use tracing::{debug, error};
 
 use crate::{
     command::scrub::{
-        check::{NamespaceChecker, ensure_link},
+        check::{NamespaceChecker, ensure_link, list_all},
         error::Error,
         executor::ActionSink,
     },
-    registry::{
-        metadata_store::{MetadataStore, link_kind::LinkKind},
-        pagination::collect_all_pages,
-    },
+    registry::metadata_store::{MetadataStore, link_kind::LinkKind},
 };
 
 pub struct TagChecker {
@@ -57,14 +55,10 @@ impl NamespaceChecker for TagChecker {
     ) -> Result<(), Error> {
         debug!("Checking tags inconsistencies from namespace '{namespace}'");
 
-        let tags: Vec<String> = collect_all_pages(|marker| async move {
-            self.metadata_store.list_tags(namespace, 100, marker).await
-        })
-        .await
-        .map_err(Error::from)?;
-
-        for tag in &tags {
-            if let Err(e) = self.repair_tag_digest_link(namespace, tag, sink).await {
+        let mut tags = list_all::tags(&self.metadata_store, namespace);
+        while let Some(tag) = tags.next().await {
+            let tag = tag?;
+            if let Err(e) = self.repair_tag_digest_link(namespace, &tag, sink).await {
                 error!("Failed to check tag from '{namespace}' (tag '{tag}'): {e}");
             }
         }
