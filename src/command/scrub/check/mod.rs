@@ -1,6 +1,6 @@
 mod blob;
-mod link_ops;
 mod link_references;
+mod link_repair;
 mod manifest;
 mod media_type;
 mod multipart;
@@ -10,8 +10,8 @@ mod upload;
 
 use async_trait::async_trait;
 pub use blob::BlobChecker;
-pub use link_ops::ensure_link;
 pub use link_references::LinkReferencesChecker;
+pub use link_repair::ensure_link;
 pub use manifest::ManifestChecker;
 pub use media_type::MediaTypeChecker;
 pub use multipart::MultipartChecker;
