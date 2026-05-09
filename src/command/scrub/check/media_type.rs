@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use futures_util::StreamExt;
+use futures_util::{Stream, StreamExt};
 use tracing::{debug, error, warn};
 
 use crate::{
@@ -67,6 +67,34 @@ impl MediaTypeChecker {
         .await
     }
 
+    async fn backfill_all<T, S, F>(
+        &self,
+        namespace: &str,
+        item_kind: &str,
+        mut items: S,
+        to_link_and_name: F,
+        sink: &mut (dyn ActionSink + Send),
+    ) -> Result<(), Error>
+    where
+        T: std::fmt::Display,
+        S: Stream<Item = Result<T, Error>> + Unpin,
+        F: Fn(&T) -> (LinkKind, String),
+    {
+        while let Some(item) = items.next().await {
+            let item = item?;
+            let (link, display_name) = to_link_and_name(&item);
+            if let Err(e) = self
+                .backfill_link(namespace, &link, &display_name, sink)
+                .await
+            {
+                error!(
+                    "Failed to backfill media_type for '{namespace}' ({item_kind} '{item}'): {e}"
+                );
+            }
+        }
+        Ok(())
+    }
+
     async fn read_media_type(&self, digest: &Digest) -> Result<Option<String>, Error> {
         let content = self.blob_store.read(digest).await?;
         match serde_json::from_slice::<Manifest>(&content) {
@@ -88,31 +116,25 @@ impl NamespaceChecker for MediaTypeChecker {
     ) -> Result<(), Error> {
         debug!("Checking media_type field for namespace '{namespace}'");
 
-        let mut revisions = list_all::revisions(&self.metadata_store, namespace);
-        while let Some(revision) = revisions.next().await {
-            let revision = revision?;
-            let link = LinkKind::Digest(revision.clone());
-            if let Err(e) = self
-                .backfill_link(namespace, &link, &format!("revision {revision}"), sink)
-                .await
-            {
-                error!(
-                    "Failed to backfill media_type for '{namespace}' (revision '{revision}'): {e}"
-                );
-            }
-        }
+        let revisions = list_all::revisions(&self.metadata_store, namespace);
+        self.backfill_all(
+            namespace,
+            "revision",
+            revisions,
+            |d| (LinkKind::Digest(d.clone()), format!("revision {d}")),
+            sink,
+        )
+        .await?;
 
-        let mut tags = list_all::tags(&self.metadata_store, namespace);
-        while let Some(tag) = tags.next().await {
-            let tag = tag?;
-            let link = LinkKind::Tag(tag.clone());
-            if let Err(e) = self
-                .backfill_link(namespace, &link, &format!("tag '{tag}'"), sink)
-                .await
-            {
-                error!("Failed to backfill media_type for '{namespace}' (tag '{tag}'): {e}");
-            }
-        }
+        let tags = list_all::tags(&self.metadata_store, namespace);
+        self.backfill_all(
+            namespace,
+            "tag",
+            tags,
+            |t| (LinkKind::Tag(t.clone()), format!("tag '{t}'")),
+            sink,
+        )
+        .await?;
 
         Ok(())
     }
