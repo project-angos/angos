@@ -26,7 +26,8 @@ pub fn run() -> Result<(), error::Error> {
 fn generate_password(password: &str) -> Result<String, error::Error> {
     let salt = SaltString::generate(OsRng);
 
-    let params = Params::default();
+    // OWASP Argon2id minimum (19 MiB, 2 iterations, 1 thread)
+    let params = Params::new(19_456, 2, 1, None).expect("Argon2 params are within valid range");
     let argon = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
     let hash = argon.hash_password(password.as_bytes(), &salt)?;
 
