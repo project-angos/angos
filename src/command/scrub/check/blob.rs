@@ -14,9 +14,31 @@ use crate::{
     oci::Digest,
     registry::{
         blob_store::BlobStore,
-        metadata_store::{self, MetadataStore, link_kind::LinkKind},
+        metadata_store::{self, BlobIndex, MetadataStore, link_kind::LinkKind},
     },
 };
+
+enum BlobVerdict {
+    /// Blob has no recorded references in any namespace; safe to delete.
+    Orphan,
+    /// Blob is referenced; iterate references to probe each link's validity.
+    Referenced(BlobIndex),
+}
+
+async fn classify_blob(
+    metadata_store: &Arc<dyn MetadataStore + Send + Sync>,
+    blob: &Digest,
+) -> Result<BlobVerdict, Error> {
+    let blob_index = match metadata_store.read_blob_index(blob).await {
+        Ok(index) => index,
+        Err(metadata_store::Error::ReferenceNotFound) => return Ok(BlobVerdict::Orphan),
+        Err(e) => return Err(e.into()),
+    };
+    if blob_index.namespace.is_empty() {
+        return Ok(BlobVerdict::Orphan);
+    }
+    Ok(BlobVerdict::Referenced(blob_index))
+}
 
 pub struct BlobChecker {
     blob_store: Arc<dyn BlobStore + Send + Sync>,
@@ -40,28 +62,19 @@ impl BlobChecker {
         sink: &mut (dyn ActionSink + Send),
     ) -> Result<(), Error> {
         debug!("Checking blob index for blob '{blob}'");
-
-        let blob_index = match self.metadata_store.read_blob_index(blob).await {
-            Ok(index) => index,
-            Err(metadata_store::Error::ReferenceNotFound) => {
+        match classify_blob(&self.metadata_store, blob).await? {
+            BlobVerdict::Orphan => {
                 sink.apply(Action::DeleteOrphanBlob(blob.clone())).await?;
-                return Ok(());
             }
-            Err(e) => return Err(e.into()),
-        };
-
-        if blob_index.namespace.is_empty() {
-            sink.apply(Action::DeleteOrphanBlob(blob.clone())).await?;
-            return Ok(());
-        }
-
-        for (namespace, references) in blob_index.namespace {
-            for link in references {
-                self.probe_and_cleanup_link(&namespace, blob, &link, sink)
-                    .await;
+            BlobVerdict::Referenced(blob_index) => {
+                for (namespace, references) in blob_index.namespace {
+                    for link in references {
+                        self.probe_and_cleanup_link(&namespace, blob, &link, sink)
+                            .await;
+                    }
+                }
             }
         }
-
         Ok(())
     }
 
@@ -123,6 +136,80 @@ mod tests {
             test_utils::{self, NoopMultipart, backends},
         },
     };
+
+    #[tokio::test]
+    async fn classify_blob_returns_orphan_when_no_index_entry() {
+        for test_case in backends() {
+            let blob_store = test_case.blob_store();
+            let metadata_store = test_case.metadata_store();
+
+            let orphan_digest = blob_store.create(b"orphan content").await.unwrap();
+
+            let verdict = classify_blob(&metadata_store, &orphan_digest)
+                .await
+                .unwrap();
+            assert!(
+                matches!(verdict, BlobVerdict::Orphan),
+                "A blob with no index entry must be classified as Orphan"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn classify_blob_returns_orphan_when_namespace_map_is_empty() {
+        for test_case in backends() {
+            let blob_store = test_case.blob_store();
+            let metadata_store = test_case.metadata_store();
+
+            let digest = blob_store
+                .create(b"content with empty index")
+                .await
+                .unwrap();
+
+            // Insert then immediately remove the only link so the namespace map exists but is empty.
+            let namespace = "test-repo/empty";
+            let link = LinkKind::Layer(digest.clone());
+            metadata_store
+                .update_blob_index(namespace, &digest, BlobIndexOperation::Insert(link.clone()))
+                .await
+                .unwrap();
+            metadata_store
+                .update_blob_index(namespace, &digest, BlobIndexOperation::Remove(link))
+                .await
+                .unwrap();
+
+            let verdict = classify_blob(&metadata_store, &digest).await.unwrap();
+            assert!(
+                matches!(verdict, BlobVerdict::Orphan),
+                "A blob whose namespace map is empty must be classified as Orphan"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn classify_blob_returns_referenced_when_index_has_links() {
+        for test_case in backends() {
+            let namespace = "test-repo/app";
+            let registry = test_case.registry();
+            let metadata_store = test_case.metadata_store();
+
+            let (blob_digest, _) =
+                test_utils::create_test_blob(registry, namespace, b"referenced content").await;
+
+            let verdict = classify_blob(&metadata_store, &blob_digest).await.unwrap();
+            match verdict {
+                BlobVerdict::Referenced(index) => {
+                    assert!(
+                        index.namespace.contains_key(namespace),
+                        "Referenced verdict must carry the namespace in its BlobIndex"
+                    );
+                }
+                BlobVerdict::Orphan => {
+                    panic!("Expected Referenced, got Orphan");
+                }
+            }
+        }
+    }
 
     fn noop_multipart() -> std::sync::Arc<dyn MultipartCleanup + Send + Sync> {
         std::sync::Arc::new(NoopMultipart)
