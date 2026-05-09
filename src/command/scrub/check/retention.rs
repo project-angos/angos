@@ -56,6 +56,51 @@ async fn fetch_single_tag_metadata(
     })
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum PolicyDecision {
+    Retain,
+    Delete,
+    NoOpinion,
+}
+
+fn check_global_policy(
+    policy: Option<&RetentionPolicy>,
+    manifest: &ManifestImage,
+    last_pushed: &[String],
+    last_pulled: &[String],
+) -> Result<PolicyDecision, Error> {
+    let Some(policy) = policy else {
+        return Ok(PolicyDecision::NoOpinion);
+    };
+    if policy.should_retain(manifest, last_pushed, last_pulled)? {
+        Ok(PolicyDecision::Retain)
+    } else {
+        Ok(PolicyDecision::Delete)
+    }
+}
+
+fn check_repo_policy(
+    repository: Option<&Repository>,
+    manifest: &ManifestImage,
+    last_pushed: &[String],
+    last_pulled: &[String],
+) -> Result<PolicyDecision, Error> {
+    let Some(repo) = repository else {
+        return Ok(PolicyDecision::NoOpinion);
+    };
+    if !repo.retention_policy.has_rules() {
+        return Ok(PolicyDecision::NoOpinion);
+    }
+    if repo
+        .retention_policy
+        .should_retain(manifest, last_pushed, last_pulled)?
+    {
+        Ok(PolicyDecision::Retain)
+    } else {
+        Ok(PolicyDecision::Delete)
+    }
+}
+
 impl RetentionChecker {
     pub fn new(
         metadata_store: Arc<dyn MetadataStore + Send + Sync>,
@@ -211,37 +256,34 @@ impl RetentionChecker {
         last_pushed: &[String],
         last_pulled: &[String],
     ) -> Result<bool, Error> {
-        let has_global_policy = self.global_retention_policy.is_some();
-        let repository = self.find_repository_for_namespace(namespace);
-        let has_repo_policy = repository.is_some_and(|r| r.retention_policy.has_rules());
+        let global = check_global_policy(
+            self.global_retention_policy.as_deref(),
+            manifest,
+            last_pushed,
+            last_pulled,
+        )?;
+        let repo = check_repo_policy(
+            self.find_repository_for_namespace(namespace),
+            manifest,
+            last_pushed,
+            last_pulled,
+        )?;
 
-        if !has_global_policy && !has_repo_policy {
-            debug!("No retention policies defined, keeping {namespace}:{tag} by default");
-            return Ok(true);
-        }
-
-        if let Some(global_policy) = &self.global_retention_policy {
-            debug!("Evaluating global retention policy for {namespace}:{tag}");
-            if global_policy.should_retain(manifest, last_pushed, last_pulled)? {
+        match (global, repo) {
+            (PolicyDecision::Retain, _) => {
                 debug!("Global retention policy says to retain {namespace}:{tag}");
-                return Ok(true);
+                Ok(true)
             }
-        }
-
-        if let Some(repo) = repository
-            && repo.retention_policy.has_rules()
-        {
-            debug!("Evaluating repository retention policy for {namespace}:{tag}");
-            if repo
-                .retention_policy
-                .should_retain(manifest, last_pushed, last_pulled)?
-            {
+            (_, PolicyDecision::Retain) => {
                 debug!("Repository retention policy says to retain {namespace}:{tag}");
-                return Ok(true);
+                Ok(true)
             }
+            (PolicyDecision::NoOpinion, PolicyDecision::NoOpinion) => {
+                debug!("No retention policies defined, keeping {namespace}:{tag} by default");
+                Ok(true)
+            }
+            _ => Ok(false),
         }
-
-        Ok(false)
     }
 
     async fn emit_delete_orphan_manifests(
@@ -813,5 +855,91 @@ mod tests {
                 .is_ok(),
             "Vec sink must not delete the tag"
         );
+    }
+
+    fn make_manifest(tag: &str) -> ManifestImage {
+        ManifestImage {
+            tag: Some(tag.to_string()),
+            pushed_at: EpochSeconds::from_seconds(0),
+            last_pulled_at: EpochSeconds::from_seconds(0),
+        }
+    }
+
+    #[test]
+    fn check_global_policy_returns_no_opinion_when_policy_absent() {
+        let manifest = make_manifest("v1");
+        let result = check_global_policy(None, &manifest, &[], &[]).unwrap();
+        assert_eq!(result, PolicyDecision::NoOpinion);
+    }
+
+    #[test]
+    fn check_global_policy_returns_retain_when_policy_keeps() {
+        let policy = RetentionPolicy::new(
+            &RetentionPolicyConfig {
+                rules: vec![CelRule::compile("image.tag == 'v1'").unwrap()],
+            },
+            Arc::new(SystemClock),
+        );
+        let manifest = make_manifest("v1");
+        let result = check_global_policy(Some(&policy), &manifest, &[], &[]).unwrap();
+        assert_eq!(result, PolicyDecision::Retain);
+    }
+
+    #[test]
+    fn check_global_policy_returns_delete_when_policy_drops() {
+        let policy = RetentionPolicy::new(
+            &RetentionPolicyConfig {
+                rules: vec![CelRule::compile("image.tag == 'keep-me'").unwrap()],
+            },
+            Arc::new(SystemClock),
+        );
+        let manifest = make_manifest("v1");
+        let result = check_global_policy(Some(&policy), &manifest, &[], &[]).unwrap();
+        assert_eq!(result, PolicyDecision::Delete);
+    }
+
+    fn make_repo(name: &str, rules: Vec<CelRule>) -> crate::registry::Repository {
+        use crate::{cache, policy::AccessPolicyConfig, registry::repository};
+        let token_cache = cache::Config::Memory.to_backend().unwrap();
+        let config = repository::Config {
+            access_policy: AccessPolicyConfig::default(),
+            retention_policy: RetentionPolicyConfig { rules },
+            ..repository::Config::default()
+        };
+        crate::registry::Repository::new(name, &config, &token_cache).unwrap()
+    }
+
+    #[test]
+    fn check_repo_policy_returns_no_opinion_when_repository_absent() {
+        let manifest = make_manifest("v1");
+        let result = check_repo_policy(None, &manifest, &[], &[]).unwrap();
+        assert_eq!(result, PolicyDecision::NoOpinion);
+    }
+
+    #[test]
+    fn check_repo_policy_returns_no_opinion_when_repo_has_no_rules() {
+        let repo = make_repo("r", vec![]);
+        let manifest = make_manifest("v1");
+        let result = check_repo_policy(Some(&repo), &manifest, &[], &[]).unwrap();
+        assert_eq!(result, PolicyDecision::NoOpinion);
+    }
+
+    #[test]
+    fn check_repo_policy_returns_retain_when_repo_policy_keeps() {
+        let repo = make_repo("r", vec![CelRule::compile("image.tag == 'v1'").unwrap()]);
+        let manifest = make_manifest("v1");
+        let result = check_repo_policy(Some(&repo), &manifest, &[], &[]).unwrap();
+        assert_eq!(result, PolicyDecision::Retain);
+    }
+
+    #[test]
+    fn check_repo_policy_returns_delete_when_repo_policy_drops() {
+        let repo = make_repo(
+            "r",
+            vec![CelRule::compile("image.tag == 'keep-me'").unwrap()],
+        );
+        let manifest = make_manifest("v1");
+        let result = check_repo_policy(Some(&repo), &manifest, &[], &[]).unwrap();
+        assert_eq!(result, PolicyDecision::Delete);
     }
 }
