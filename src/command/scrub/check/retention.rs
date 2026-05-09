@@ -42,20 +42,6 @@ fn has_link_kind(
         .is_some_and(|refs| refs.iter().any(predicate))
 }
 
-async fn fetch_single_tag_metadata(
-    metadata_store: Arc<dyn MetadataStore + Send + Sync>,
-    namespace: String,
-    tag_name: String,
-) -> Result<TagWithMetadata, Error> {
-    let metadata = metadata_store
-        .read_link(&namespace, &LinkKind::Tag(tag_name.clone()), false)
-        .await?;
-    Ok(TagWithMetadata {
-        name: tag_name,
-        metadata,
-    })
-}
-
 #[derive(Debug, PartialEq, Eq)]
 enum PolicyDecision {
     Retain,
@@ -162,16 +148,29 @@ impl RetentionChecker {
         namespace: &str,
         tag_names: &[String],
     ) -> Result<Vec<TagWithMetadata>, Error> {
-        join_all(tag_names.iter().map(|tag| {
-            fetch_single_tag_metadata(
-                self.metadata_store.clone(),
-                namespace.to_string(),
-                tag.clone(),
-            )
-        }))
+        join_all(
+            tag_names
+                .iter()
+                .map(|tag| self.fetch_single_tag_metadata(namespace, tag.clone())),
+        )
         .await
         .into_iter()
         .collect()
+    }
+
+    async fn fetch_single_tag_metadata(
+        &self,
+        namespace: &str,
+        tag_name: String,
+    ) -> Result<TagWithMetadata, Error> {
+        let metadata = self
+            .metadata_store
+            .read_link(namespace, &LinkKind::Tag(tag_name.clone()), false)
+            .await?;
+        Ok(TagWithMetadata {
+            name: tag_name,
+            metadata,
+        })
     }
 
     fn build_sorted_rankings(tags: &[TagWithMetadata]) -> (Vec<String>, Vec<String>) {
