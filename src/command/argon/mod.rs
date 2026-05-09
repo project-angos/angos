@@ -16,15 +16,11 @@ use zeroize::Zeroizing;
 )]
 pub struct Options {}
 
-pub struct Command {}
-
-impl Command {
-    pub fn run() -> Result<(), error::Error> {
-        let password = Zeroizing::new(rpassword::prompt_password("Input Password: ")?);
-        let hash = generate_password(&password)?;
-        println!("{hash}");
-        Ok(())
-    }
+pub fn run() -> Result<(), error::Error> {
+    let password = Zeroizing::new(rpassword::prompt_password("Input Password: ")?);
+    let hash = generate_password(&password)?;
+    println!("{hash}");
+    Ok(())
 }
 
 fn generate_password(password: &str) -> Result<String, error::Error> {
