@@ -87,6 +87,56 @@ fn check_repo_policy(
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum Fate {
+    /// Manifest is protected by another reference, has tags, or its link
+    /// metadata is missing — leave it alone.
+    Skip,
+    /// Retention policy says to keep this manifest.
+    Retain,
+    /// Retention policy says to delete this manifest.
+    Delete,
+}
+
+/// Pure decision over pre-loaded inputs: should this orphan manifest be skipped,
+/// retained, or deleted? The caller is responsible for fetching `is_protected`,
+/// `has_tags`, and `metadata` and for resolving the relevant `Repository` /
+/// global policy from the checker's state.
+fn decide_orphan_fate(
+    is_protected: bool,
+    has_tags: bool,
+    metadata: Option<&LinkMetadata>,
+    repository: Option<&Repository>,
+    global_policy: Option<&RetentionPolicy>,
+    last_pushed: &[String],
+    last_pulled: &[String],
+) -> Result<Fate, Error> {
+    if is_protected || has_tags {
+        return Ok(Fate::Skip);
+    }
+    let Some(metadata) = metadata else {
+        return Ok(Fate::Skip);
+    };
+
+    let manifest = ManifestImage {
+        tag: None,
+        pushed_at: EpochSeconds::from_seconds(metadata.created_at.map_or(0, |t| t.timestamp())),
+        last_pulled_at: EpochSeconds::from_seconds(
+            metadata.accessed_at.map_or(0, |t| t.timestamp()),
+        ),
+    };
+
+    let global = check_global_policy(global_policy, &manifest, last_pushed, last_pulled)?;
+    let repo = check_repo_policy(repository, &manifest, last_pushed, last_pulled)?;
+
+    Ok(match (global, repo) {
+        (PolicyDecision::Retain, _)
+        | (_, PolicyDecision::Retain)
+        | (PolicyDecision::NoOpinion, PolicyDecision::NoOpinion) => Fate::Retain,
+        _ => Fate::Delete,
+    })
+}
+
 impl RetentionChecker {
     pub fn new(
         metadata_store: Arc<dyn MetadataStore + Send + Sync>,
@@ -310,47 +360,52 @@ impl RetentionChecker {
         last_pulled: &[String],
         sink: &mut (dyn ActionSink + Send),
     ) -> Result<(), Error> {
-        if self.is_protected(namespace, digest).await? {
+        let is_protected = self.is_protected(namespace, digest).await?;
+        if is_protected {
             debug!("Skipping protected manifest '{namespace}@{digest}'");
-            return Ok(());
         }
 
-        if self.has_tags(namespace, digest).await? {
-            return Ok(());
-        }
+        let has_tags = !is_protected && self.has_tags(namespace, digest).await?;
 
-        let Ok(metadata) = self
-            .metadata_store
-            .read_link(namespace, &LinkKind::Digest(digest.clone()), false)
-            .await
-        else {
-            return Ok(());
+        let metadata = if is_protected || has_tags {
+            None
+        } else {
+            self.metadata_store
+                .read_link(namespace, &LinkKind::Digest(digest.clone()), false)
+                .await
+                .ok()
         };
 
-        let manifest = ManifestImage {
-            tag: None,
-            pushed_at: EpochSeconds::from_seconds(metadata.created_at.map_or(0, |t| t.timestamp())),
-            last_pulled_at: EpochSeconds::from_seconds(
-                metadata.accessed_at.map_or(0, |t| t.timestamp()),
-            ),
-        };
-
-        let label = format!("{namespace}@{digest}");
-        if !self.evaluate_retention_policies(
-            namespace,
-            &label,
-            &manifest,
+        let fate = decide_orphan_fate(
+            is_protected,
+            has_tags,
+            metadata.as_ref(),
+            self.find_repository_for_namespace(namespace),
+            self.global_retention_policy.as_deref(),
             last_pushed,
             last_pulled,
-        )? {
-            sink.apply(Action::DeleteOrphanManifest {
-                namespace: namespace.to_string(),
-                digest: digest.clone(),
-            })
-            .await?;
-        }
+        )?;
 
-        Ok(())
+        self.apply_fate(namespace, digest, fate, sink).await
+    }
+
+    async fn apply_fate(
+        &self,
+        namespace: &str,
+        digest: &Digest,
+        fate: Fate,
+        sink: &mut (dyn ActionSink + Send),
+    ) -> Result<(), Error> {
+        match fate {
+            Fate::Skip | Fate::Retain => Ok(()),
+            Fate::Delete => {
+                sink.apply(Action::DeleteOrphanManifest {
+                    namespace: namespace.to_string(),
+                    digest: digest.clone(),
+                })
+                .await
+            }
+        }
     }
 
     async fn is_protected(&self, namespace: &str, digest: &Digest) -> Result<bool, Error> {
@@ -940,5 +995,71 @@ mod tests {
         let manifest = make_manifest("v1");
         let result = check_repo_policy(Some(&repo), &manifest, &[], &[]).unwrap();
         assert_eq!(result, PolicyDecision::Delete);
+    }
+
+    fn dummy_metadata() -> LinkMetadata {
+        LinkMetadata {
+            target: dummy_digest(),
+            created_at: None,
+            accessed_at: None,
+            referenced_by: HashSet::default(),
+            media_type: None,
+            descriptor: None,
+        }
+    }
+
+    #[test]
+    fn decide_orphan_fate_skips_protected_manifest() {
+        let metadata = dummy_metadata();
+        let fate = decide_orphan_fate(true, false, Some(&metadata), None, None, &[], &[]).unwrap();
+        assert_eq!(fate, Fate::Skip);
+    }
+
+    #[test]
+    fn decide_orphan_fate_skips_manifest_with_tags() {
+        let metadata = dummy_metadata();
+        let fate = decide_orphan_fate(false, true, Some(&metadata), None, None, &[], &[]).unwrap();
+        assert_eq!(fate, Fate::Skip);
+    }
+
+    #[test]
+    fn decide_orphan_fate_skips_when_metadata_missing() {
+        let fate = decide_orphan_fate(false, false, None, None, None, &[], &[]).unwrap();
+        assert_eq!(fate, Fate::Skip);
+    }
+
+    #[test]
+    fn decide_orphan_fate_retains_when_no_policies_apply() {
+        let metadata = dummy_metadata();
+        let fate = decide_orphan_fate(false, false, Some(&metadata), None, None, &[], &[]).unwrap();
+        assert_eq!(fate, Fate::Retain);
+    }
+
+    #[test]
+    fn decide_orphan_fate_retains_when_global_policy_keeps() {
+        let metadata = dummy_metadata();
+        let policy = RetentionPolicy::new(
+            &RetentionPolicyConfig {
+                rules: vec![CelRule::compile("image.tag == null").unwrap()],
+            },
+            Arc::new(SystemClock),
+        );
+        let fate = decide_orphan_fate(false, false, Some(&metadata), None, Some(&policy), &[], &[])
+            .unwrap();
+        assert_eq!(fate, Fate::Retain);
+    }
+
+    #[test]
+    fn decide_orphan_fate_deletes_when_all_applicable_policies_drop() {
+        let metadata = dummy_metadata();
+        let policy = RetentionPolicy::new(
+            &RetentionPolicyConfig {
+                rules: vec![CelRule::compile("image.tag == 'keep-me'").unwrap()],
+            },
+            Arc::new(SystemClock),
+        );
+        let fate = decide_orphan_fate(false, false, Some(&metadata), None, Some(&policy), &[], &[])
+            .unwrap();
+        assert_eq!(fate, Fate::Delete);
     }
 }
