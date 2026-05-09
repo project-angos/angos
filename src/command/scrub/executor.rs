@@ -5,7 +5,9 @@ use tracing::info;
 
 use crate::{
     command::scrub::{action::Action, error::Error},
+    oci::Digest,
     registry::{
+        ParsedManifestDigests,
         blob_store::{BlobStore, MultipartCleanup, OrphanMultipartUpload, UploadStore},
         metadata_store::{
             BlobIndexOperation, MetadataStore, MetadataStoreExt, link_kind::LinkKind,
@@ -22,6 +24,30 @@ use crate::{
 #[async_trait]
 pub trait ActionSink: Send {
     async fn apply(&mut self, action: Action) -> Result<(), Error>;
+}
+
+/// Returns the `LinkKind`s that must be deleted to remove a manifest from a
+/// namespace. Pure: no I/O, no state. Each entry corresponds to a
+/// `LinkOperation::Delete` with no referrer when applied to a transaction.
+///
+/// Order is fixed: config (if present), layers, child manifests, subject's
+/// referrer back-link (if present), then the manifest's own digest link.
+fn build_delete_transaction(manifest: &ParsedManifestDigests, digest: &Digest) -> Vec<LinkKind> {
+    let mut links = Vec::new();
+    if let Some(config) = &manifest.config {
+        links.push(LinkKind::Config(config.clone()));
+    }
+    for layer in &manifest.layers {
+        links.push(LinkKind::Layer(layer.clone()));
+    }
+    for child in &manifest.manifests {
+        links.push(LinkKind::Manifest(digest.clone(), child.clone()));
+    }
+    if let Some(subject) = &manifest.subject {
+        links.push(LinkKind::Referrer(subject.clone(), digest.clone()));
+    }
+    links.push(LinkKind::Digest(digest.clone()));
+    links
 }
 
 /// Applies scrub actions against live storage backends.
@@ -127,25 +153,9 @@ impl ActionSink for Executor {
                 let manifest = parse_manifest_digests(&content, None)?;
 
                 let mut tx = self.metadata_store.begin_transaction(&namespace);
-
-                if let Some(config) = &manifest.config {
-                    tx.delete_link(&LinkKind::Config(config.clone()));
+                for link in build_delete_transaction(&manifest, &digest) {
+                    tx.delete_link(&link);
                 }
-
-                for layer in &manifest.layers {
-                    tx.delete_link(&LinkKind::Layer(layer.clone()));
-                }
-
-                for child in &manifest.manifests {
-                    tx.delete_link(&LinkKind::Manifest(digest.clone(), child.clone()));
-                }
-
-                if let Some(subject) = &manifest.subject {
-                    tx.delete_link(&LinkKind::Referrer(subject.clone(), digest.clone()));
-                }
-
-                tx.delete_link(&LinkKind::Digest(digest));
-
                 tx.commit().await?;
             }
             Action::DeleteExpiredUpload { namespace, uuid } => {
@@ -260,5 +270,56 @@ mod tests {
         assert_eq!(sink.len(), 2);
         assert!(matches!(sink[0], Action::DeleteOrphanBlob(_)));
         assert!(matches!(sink[1], Action::DeleteExpiredUpload { .. }));
+    }
+
+    fn dummy_digest(byte: u8) -> Digest {
+        let hex = format!("{byte:02x}").repeat(32);
+        Digest::from_str(&format!("sha256:{hex}")).unwrap()
+    }
+
+    #[test]
+    fn build_delete_transaction_emits_only_self_link_for_minimal_manifest() {
+        let manifest = ParsedManifestDigests {
+            subject: None,
+            config: None,
+            layers: vec![],
+            manifests: vec![],
+        };
+        let digest = dummy_digest(0xaa);
+
+        let links = build_delete_transaction(&manifest, &digest);
+
+        assert_eq!(links.len(), 1);
+        assert!(matches!(&links[0], LinkKind::Digest(d) if d == &digest));
+    }
+
+    #[test]
+    fn build_delete_transaction_includes_config_layers_children_and_subject() {
+        let digest = dummy_digest(0xff);
+        let config_digest = dummy_digest(0x01);
+        let layer_a = dummy_digest(0x02);
+        let layer_b = dummy_digest(0x03);
+        let child = dummy_digest(0x04);
+        let subject = dummy_digest(0x05);
+
+        let manifest = ParsedManifestDigests {
+            subject: Some(subject.clone()),
+            config: Some(config_digest.clone()),
+            layers: vec![layer_a.clone(), layer_b.clone()],
+            manifests: vec![child.clone()],
+        };
+
+        let links = build_delete_transaction(&manifest, &digest);
+
+        // Order: config, layers (in input order), child manifests, subject referrer, self.
+        assert_eq!(links.len(), 6);
+        assert!(matches!(&links[0], LinkKind::Config(d) if d == &config_digest));
+        assert!(matches!(&links[1], LinkKind::Layer(d) if d == &layer_a));
+        assert!(matches!(&links[2], LinkKind::Layer(d) if d == &layer_b));
+        assert!(
+            matches!(&links[3], LinkKind::Manifest(parent, c) if parent == &digest && c == &child)
+        );
+        assert!(matches!(&links[4], LinkKind::Referrer(s, r) if s == &subject && r == &digest));
+        assert!(matches!(&links[5], LinkKind::Digest(d) if d == &digest));
     }
 }
