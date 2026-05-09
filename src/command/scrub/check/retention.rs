@@ -1,6 +1,7 @@
 use std::{collections::HashMap, sync::Arc};
 
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 use futures_util::{StreamExt, future::join_all};
 use tracing::debug;
 
@@ -40,6 +41,10 @@ fn has_link_kind(
         .namespace
         .get(namespace)
         .is_some_and(|refs| refs.iter().any(predicate))
+}
+
+fn to_epoch(timestamp: Option<DateTime<Utc>>) -> i64 {
+    timestamp.map_or(0, |t| t.timestamp())
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -120,10 +125,8 @@ fn decide_orphan_fate(
 
     let manifest = ManifestImage {
         tag: None,
-        pushed_at: EpochSeconds::from_seconds(metadata.created_at.map_or(0, |t| t.timestamp())),
-        last_pulled_at: EpochSeconds::from_seconds(
-            metadata.accessed_at.map_or(0, |t| t.timestamp()),
-        ),
+        pushed_at: EpochSeconds::from_seconds(to_epoch(metadata.created_at)),
+        last_pulled_at: EpochSeconds::from_seconds(to_epoch(metadata.accessed_at)),
     };
 
     let global = check_global_policy(global_policy, &manifest, last_pushed, last_pulled)?;
@@ -279,12 +282,8 @@ impl RetentionChecker {
 
         let manifest = ManifestImage {
             tag: Some(tag.name.clone()),
-            pushed_at: EpochSeconds::from_seconds(
-                tag.metadata.created_at.map_or(0, |t| t.timestamp()),
-            ),
-            last_pulled_at: EpochSeconds::from_seconds(
-                tag.metadata.accessed_at.map_or(0, |t| t.timestamp()),
-            ),
+            pushed_at: EpochSeconds::from_seconds(to_epoch(tag.metadata.created_at)),
+            last_pulled_at: EpochSeconds::from_seconds(to_epoch(tag.metadata.accessed_at)),
         };
 
         self.evaluate_retention_policies(namespace, &tag.name, &manifest, last_pushed, last_pulled)
