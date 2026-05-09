@@ -13,11 +13,11 @@ Verify storage integrity and enforce retention policies using the `scrub` comman
 - Angos installed
 - Access to the same configuration and storage as the running registry
 
-## Online vs Offline Operations
+## Automatic vs Scheduled Maintenance
 
-Angos performs garbage collection **online** during normal operation - unreferenced blobs are automatically cleaned up without downtime.
+Angos performs garbage collection **automatically** during normal operation — unreferenced blobs are cleaned up as part of request handling, without downtime.
 
-The `scrub` command is for **offline maintenance** tasks:
+The `scrub` command runs as a **separate periodic process** that operates alongside the live server (no shutdown required):
 - Checking and repairing data corruption
 - Verifying storage consistency
 - Enforcing retention policies
