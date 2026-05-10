@@ -10,7 +10,7 @@ use crate::{
         scrub::{
             check::{BlobChecker, MultipartChecker, NamespaceChecker, StoreChecker, list_all},
             error::Error,
-            executor::Executor,
+            executor::{ActionSink, DryRunSink, Executor},
             setup,
         },
     },
@@ -60,7 +60,7 @@ pub struct Command {
     namespace_checkers: Vec<Box<dyn NamespaceChecker>>,
     blob_checker: Option<BlobChecker>,
     multipart_checker: Option<MultipartChecker>,
-    executor: Executor,
+    sink: Box<dyn ActionSink + Send>,
 }
 
 impl Command {
@@ -83,24 +83,24 @@ impl Command {
         let multipart_checker =
             setup::multipart_checker(options, blob_handles.multipart_cleanup.clone())?;
 
-        let executor = Executor::new(
-            options.dry_run,
-            blob_handles.blob_store.clone(),
-            metadata_store.clone(),
-            blob_handles.upload_store.clone(),
-            blob_handles.multipart_cleanup,
-        );
-
-        if options.dry_run {
+        let sink: Box<dyn ActionSink + Send> = if options.dry_run {
             info!("Dry-run mode: no changes will be made to the storage");
-        }
+            Box::new(DryRunSink)
+        } else {
+            Box::new(Executor::new(
+                blob_handles.blob_store.clone(),
+                metadata_store.clone(),
+                blob_handles.upload_store.clone(),
+                blob_handles.multipart_cleanup,
+            ))
+        };
 
         Ok(Self {
             metadata_store,
             namespace_checkers,
             blob_checker,
             multipart_checker,
-            executor,
+            sink,
         })
     }
 
@@ -118,7 +118,7 @@ impl Command {
             let namespace = namespace?;
             for i in 0..self.namespace_checkers.len() {
                 if let Err(e) = self.namespace_checkers[i]
-                    .check(&namespace, &mut self.executor)
+                    .check(&namespace, self.sink.as_mut())
                     .await
                 {
                     tracing::warn!("Scrub checker failed for namespace '{namespace}': {e}");
@@ -130,7 +130,7 @@ impl Command {
 
     async fn scrub_blobs(&mut self) -> Result<(), Error> {
         if let Some(checker) = self.blob_checker.take() {
-            if let Err(e) = checker.check_all(&mut self.executor).await {
+            if let Err(e) = checker.check_all(self.sink.as_mut()).await {
                 tracing::warn!("Blob scrub checker failed: {e}");
             }
             self.blob_checker = Some(checker);
@@ -140,7 +140,7 @@ impl Command {
 
     async fn scrub_multipart_uploads(&mut self) -> Result<(), Error> {
         if let Some(checker) = self.multipart_checker.take() {
-            let result = checker.check_all(&mut self.executor).await;
+            let result = checker.check_all(self.sink.as_mut()).await;
             self.multipart_checker = Some(checker);
             result?;
         }

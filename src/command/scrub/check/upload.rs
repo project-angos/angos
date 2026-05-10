@@ -234,7 +234,6 @@ mod tests {
             upload_store.create(namespace, &upload_uuid).await.unwrap();
 
             let mut executor = Executor::new(
-                false,
                 test_case.blob_store(),
                 test_case.metadata_store(),
                 upload_store.clone(),

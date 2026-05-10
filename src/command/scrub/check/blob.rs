@@ -251,7 +251,6 @@ mod tests {
             let checker = BlobChecker::new(blob_store.clone(), metadata_store.clone());
 
             let mut executor = Executor::new(
-                false,
                 blob_store.clone(),
                 metadata_store.clone(),
                 test_case.upload_store(),
@@ -288,7 +287,6 @@ mod tests {
             let checker = BlobChecker::new(blob_store.clone(), metadata_store.clone());
 
             let mut executor = Executor::new(
-                false,
                 blob_store.clone(),
                 metadata_store,
                 test_case.upload_store(),

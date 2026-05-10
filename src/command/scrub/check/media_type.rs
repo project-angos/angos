@@ -205,7 +205,6 @@ mod tests {
             assert!(digest_link.media_type.is_none());
 
             let mut executor = Executor::new(
-                false,
                 blob_store.clone(),
                 metadata_store.clone(),
                 test_case.upload_store(),

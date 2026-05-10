@@ -170,7 +170,6 @@ mod tests {
         upload_store: Arc<dyn crate::registry::blob_store::UploadStore>,
     ) -> Executor {
         Executor::new(
-            false,
             blob_store,
             metadata_store,
             upload_store,

@@ -17,10 +17,6 @@ use crate::{
 };
 
 /// A sink that receives `Action` values produced by scrub checkers.
-///
-/// The production implementation (`Executor`) either applies or skips the
-/// action based on `dry_run`; the `Vec<Action>` implementation captures
-/// actions for test assertions without touching any storage.
 #[async_trait]
 pub trait ActionSink: Send {
     async fn apply(&mut self, action: Action) -> Result<(), Error>;
@@ -50,13 +46,19 @@ fn build_delete_transaction(manifest: &ParsedManifestDigests, digest: &Digest) -
     links
 }
 
+/// Logs actions as dry-run without applying any mutations to storage.
+pub struct DryRunSink;
+
+#[async_trait]
+impl ActionSink for DryRunSink {
+    async fn apply(&mut self, action: Action) -> Result<(), Error> {
+        info!("DRY RUN: would {action}");
+        Ok(())
+    }
+}
+
 /// Applies scrub actions against live storage backends.
-///
-/// This is the single place that honours `dry_run`: every checker emits
-/// `Action` values unconditionally and this type decides whether to perform
-/// or skip the underlying mutation.
 pub struct Executor {
-    dry_run: bool,
     blob_store: Arc<dyn BlobStore>,
     metadata_store: Arc<dyn MetadataStore + Send + Sync>,
     upload_store: Arc<dyn UploadStore>,
@@ -65,14 +67,12 @@ pub struct Executor {
 
 impl Executor {
     pub fn new(
-        dry_run: bool,
         blob_store: Arc<dyn BlobStore>,
         metadata_store: Arc<dyn MetadataStore + Send + Sync>,
         upload_store: Arc<dyn UploadStore>,
         multipart_cleanup: Arc<dyn MultipartCleanup + Send + Sync>,
     ) -> Self {
         Self {
-            dry_run,
             blob_store,
             metadata_store,
             upload_store,
@@ -84,11 +84,6 @@ impl Executor {
 #[async_trait]
 impl ActionSink for Executor {
     async fn apply(&mut self, action: Action) -> Result<(), Error> {
-        if self.dry_run {
-            info!("DRY RUN: would {action}");
-            return Ok(());
-        }
-
         info!("{action}");
 
         match action {
@@ -193,22 +188,12 @@ mod tests {
     async fn executor_dry_run_does_not_delete_blob() {
         for test_case in backends() {
             let blob_store = test_case.blob_store();
-            let metadata_store = test_case.metadata_store();
-            let upload_store = test_case.upload_store();
 
             let orphan_content = b"executor dry-run test";
             let orphan_digest = blob_store.create(orphan_content).await.unwrap();
 
-            let mut executor = Executor::new(
-                true,
-                blob_store.clone(),
-                metadata_store,
-                upload_store,
-                Arc::new(NoopMultipart),
-            );
-
-            executor
-                .apply(Action::DeleteOrphanBlob(orphan_digest.clone()))
+            let mut sink = DryRunSink;
+            sink.apply(Action::DeleteOrphanBlob(orphan_digest.clone()))
                 .await
                 .unwrap();
 
@@ -230,7 +215,6 @@ mod tests {
             let orphan_digest = blob_store.create(orphan_content).await.unwrap();
 
             let mut executor = Executor::new(
-                false,
                 blob_store.clone(),
                 metadata_store,
                 upload_store,

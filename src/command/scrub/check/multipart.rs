@@ -134,7 +134,6 @@ mod tests {
         // multipart_cleanup is exercised in this test.
         let test_case = backends().into_iter().next().unwrap();
         let mut executor = Executor::new(
-            false,
             test_case.blob_store(),
             test_case.metadata_store(),
             test_case.upload_store(),

@@ -167,7 +167,6 @@ mod tests {
             tx.commit().await.unwrap();
 
             let mut executor = Executor::new(
-                false,
                 blob_store.clone(),
                 metadata_store.clone(),
                 test_case.upload_store(),
