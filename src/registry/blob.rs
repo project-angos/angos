@@ -184,13 +184,13 @@ impl Registry {
             self.check_blob_namespace_access(namespace, digest).await?;
         }
 
-        let local_blob = self.get_local_blob(digest, range).await;
-
-        if let Ok(response) = local_blob {
-            return Ok(response);
-        } else if !repository.is_pull_through() {
-            warn!("Blob not found locally: {digest}");
-            return Err(Error::BlobUnknown);
+        match self.get_local_blob(digest, range).await {
+            Ok(response) => return Ok(response),
+            Err(_) if !repository.is_pull_through() => {
+                warn!("Blob not found locally: {digest}");
+                return Err(Error::BlobUnknown);
+            }
+            Err(_) => {}
         }
 
         if range.is_some() {
