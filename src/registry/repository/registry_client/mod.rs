@@ -94,37 +94,17 @@ impl RegistryClient {
     ) -> Result<Response, Error> {
         info!("Requesting from upstream: {location}");
 
-        let mut request = self.client.request(method.clone(), location);
-
-        for accepted_type in accepted_types {
-            request = request.header(ACCEPT, accepted_type);
-        }
-
-        if let Some(cached_auth) = self.auth_cache.read().await.as_ref() {
-            request = request.header(AUTHORIZATION, cached_auth);
-        }
-
-        let response = request
-            .send()
-            .await
-            .map_err(|e| Error::Internal(format!("HTTP request failed: {e}")))?;
+        let cached_auth = self.auth_cache.read().await.clone();
+        let response = self
+            .send(method, accepted_types, location, cached_auth.as_deref())
+            .await?;
 
         if response.status() == StatusCode::UNAUTHORIZED {
             let token = self.authenticate(&response).await?;
             *self.auth_cache.write().await = Some(token.clone());
-
-            let mut retry_request = self.client.request(method.clone(), location);
-            for accepted_type in accepted_types {
-                retry_request = retry_request.header(ACCEPT, accepted_type);
-            }
-            retry_request = retry_request.header(AUTHORIZATION, &token);
-
-            let retry_response = retry_request
-                .send()
-                .await
-                .map_err(|e| Error::Internal(format!("HTTP request failed: {e}")))?;
-
-            return Ok(retry_response);
+            return self
+                .send(method, accepted_types, location, Some(&token))
+                .await;
         }
 
         if response.status() == StatusCode::FORBIDDEN {
@@ -132,6 +112,26 @@ impl RegistryClient {
         }
 
         Ok(response)
+    }
+
+    async fn send(
+        &self,
+        method: &Method,
+        accepted_types: &[String],
+        location: &str,
+        auth_header: Option<&str>,
+    ) -> Result<Response, Error> {
+        let mut request = self.client.request(method.clone(), location);
+        for accepted_type in accepted_types {
+            request = request.header(ACCEPT, accepted_type);
+        }
+        if let Some(auth) = auth_header {
+            request = request.header(AUTHORIZATION, auth);
+        }
+        request
+            .send()
+            .await
+            .map_err(|e| Error::Internal(format!("HTTP request failed: {e}")))
     }
 
     pub async fn head_blob(
@@ -142,7 +142,7 @@ impl RegistryClient {
         let response = self.query(&Method::HEAD, accepted_types, location).await?;
 
         if !response.status().is_success() {
-            return Err(Error::ManifestUnknown);
+            return Err(Error::BlobUnknown);
         }
 
         let digest = parse_header(&response, DOCKER_CONTENT_DIGEST)?;
@@ -159,7 +159,7 @@ impl RegistryClient {
         let response = self.query(&Method::GET, accepted_types, location).await?;
 
         if !response.status().is_success() {
-            return Err(Error::ManifestUnknown);
+            return Err(Error::BlobUnknown);
         }
 
         let total_length = parse_header(&response, CONTENT_LENGTH)?;

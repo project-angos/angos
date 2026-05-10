@@ -467,7 +467,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        oci::Digest,
+        oci::{Descriptor, Digest},
         registry::metadata_store::{
             BlobIndexOperation, LinkMetadata, LinkOperation, link_kind::LinkKind,
         },
@@ -1183,5 +1183,193 @@ mod tests {
             .expect("new blob Remove must be added");
         assert_eq!(del_ops.len(), 1);
         assert!(is_remove(&del_ops[0], &del_link));
+    }
+
+    fn minimal_descriptor(digest: Digest) -> Descriptor {
+        Descriptor {
+            media_type: "application/vnd.oci.image.layer.v1.tar+gzip".to_string(),
+            digest,
+            size: 512,
+            annotations: HashMap::new(),
+            artifact_type: None,
+            platform: None,
+        }
+    }
+
+    #[test]
+    fn build_create_ops_tracked_link_propagates_media_type_and_descriptor() {
+        // A tracked link create with media_type and descriptor set must propagate
+        // both fields into the written LinkMetadata when no cache entry exists.
+        let link = LinkKind::Layer(digest("aa01"));
+        let target = digest("aa02");
+        let referrer = digest("aa03");
+        let desc = minimal_descriptor(target.clone());
+
+        let creates = [ResolvedCreate {
+            link: link.clone(),
+            target: target.clone(),
+            old_target: None,
+            referrer: Some(referrer.clone()),
+            media_type: Some("application/vnd.foo".to_string()),
+            descriptor: Some(desc.clone()),
+        }];
+        let mut cache: HashMap<LinkKind, LinkMetadata> = HashMap::new();
+
+        let plan = build_create_ops(&creates, &mut cache);
+
+        assert_eq!(plan.tracked_writes.len(), 1);
+        assert!(plan.non_tracked_writes.is_empty());
+
+        let (_, written_meta) = &plan.tracked_writes[0];
+        assert_eq!(
+            written_meta.media_type.as_deref(),
+            Some("application/vnd.foo"),
+            "media_type must be propagated into the written metadata"
+        );
+        assert_eq!(
+            written_meta.descriptor.as_ref(),
+            Some(&desc),
+            "descriptor must be propagated into the written metadata"
+        );
+    }
+
+    #[test]
+    fn build_create_ops_non_tracked_link_propagates_media_type_and_descriptor() {
+        // A non-tracked link create with media_type and descriptor set must
+        // propagate both fields into the written LinkMetadata.
+        let link = LinkKind::Tag("v-media".to_string());
+        let target = digest("bb01");
+        let desc = minimal_descriptor(target.clone());
+
+        let creates = [ResolvedCreate {
+            link: link.clone(),
+            target: target.clone(),
+            old_target: None,
+            referrer: None,
+            media_type: Some("application/vnd.bar".to_string()),
+            descriptor: Some(desc.clone()),
+        }];
+        let mut cache: HashMap<LinkKind, LinkMetadata> = HashMap::new();
+
+        let plan = build_create_ops(&creates, &mut cache);
+
+        assert!(plan.tracked_writes.is_empty());
+        assert_eq!(plan.non_tracked_writes.len(), 1);
+
+        let (written_link, written_meta) = &plan.non_tracked_writes[0];
+        assert_eq!(written_link, &link);
+        assert_eq!(
+            written_meta.media_type.as_deref(),
+            Some("application/vnd.bar"),
+            "media_type must be propagated into the written metadata"
+        );
+        assert_eq!(
+            written_meta.descriptor.as_ref(),
+            Some(&desc),
+            "descriptor must be propagated into the written metadata"
+        );
+    }
+
+    #[test]
+    fn build_create_ops_tracked_link_cached_metadata_ignores_create_op_descriptor() {
+        // When the link cache already holds an entry for a tracked link, the
+        // cached metadata is used as-is (after adding the new referrer). The
+        // create op's media_type and descriptor are discarded because the
+        // unwrap_or_else branch is not taken.
+        let link = LinkKind::Layer(digest("cc01"));
+        let target = digest("cc02");
+        let referrer = digest("cc03");
+
+        let mut cached_meta = LinkMetadata::from_digest(target.clone())
+            .with_media_type(Some("cached".to_string()))
+            .with_descriptor(None);
+        cached_meta.add_referrer(referrer.clone());
+
+        let desc_from_op = minimal_descriptor(target.clone());
+        let mut cache: HashMap<LinkKind, LinkMetadata> = HashMap::new();
+        cache.insert(link.clone(), cached_meta);
+
+        let creates = [ResolvedCreate {
+            link: link.clone(),
+            target: target.clone(),
+            old_target: Some(target.clone()),
+            referrer: Some(referrer.clone()),
+            media_type: Some("ignored".to_string()),
+            descriptor: Some(desc_from_op),
+        }];
+
+        let plan = build_create_ops(&creates, &mut cache);
+
+        assert_eq!(plan.tracked_writes.len(), 1);
+        let (_, written_meta) = &plan.tracked_writes[0];
+        assert_eq!(
+            written_meta.media_type.as_deref(),
+            Some("cached"),
+            "cached media_type must win over the create op's media_type"
+        );
+        assert!(
+            written_meta.descriptor.is_none(),
+            "cached descriptor (None) must win over the create op's descriptor"
+        );
+        assert!(
+            !cache.contains_key(&link),
+            "cache entry must be consumed by build_create_ops"
+        );
+    }
+
+    #[test]
+    fn build_create_then_delete_ops_threads_pending_blob_ops() {
+        // The pending_blob_ops produced by build_create_ops must be passed
+        // through to build_delete_ops and merged with any new ops the delete
+        // phase adds. This verifies that the two pure functions compose correctly.
+        let create_link = LinkKind::Tag("create-tag".to_string());
+        let create_target = digest("dd01");
+
+        let delete_link = LinkKind::Tag("delete-tag".to_string());
+        let delete_target = digest("dd02");
+
+        // --- Create phase ---
+        let creates = [ResolvedCreate {
+            link: create_link.clone(),
+            target: create_target.clone(),
+            old_target: None,
+            referrer: None,
+            media_type: None,
+            descriptor: None,
+        }];
+        let mut cache: HashMap<LinkKind, LinkMetadata> = HashMap::new();
+        let create_plan = build_create_ops(&creates, &mut cache);
+
+        // The create phase must emit one Insert for create_link on create_target.
+        let create_ops = create_plan
+            .pending_blob_ops
+            .get(&create_target)
+            .expect("blob ops for create_target expected");
+        assert_eq!(create_ops.len(), 1);
+        assert!(is_insert(&create_ops[0], &create_link));
+
+        // --- Delete phase (threads pending_blob_ops from the create phase) ---
+        let deletes = [ResolvedDelete {
+            link: delete_link.clone(),
+            target: delete_target.clone(),
+            referrer: None,
+        }];
+        let delete_plan = build_delete_ops(&deletes, &mut cache, create_plan.pending_blob_ops);
+
+        // The carried-over Insert from the create phase must still be present.
+        let carried_over_ops = delete_plan
+            .pending_blob_ops
+            .get(&create_target)
+            .expect("carried-over blob op from create phase must survive");
+        assert_eq!(carried_over_ops.len(), 1);
+        assert!(is_insert(&carried_over_ops[0], &create_link));
+
+        // The delete phase must have added a Remove for delete_link on delete_target.
+        let delete_ops = delete_plan
+            .pending_blob_ops
+            .get(&delete_target)
+            .expect("blob Remove from delete phase expected");
+        assert_eq!(delete_ops.len(), 1);
+        assert!(is_remove(&delete_ops[0], &delete_link));
     }
 }

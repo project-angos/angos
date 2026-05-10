@@ -3,7 +3,7 @@ use std::{collections::HashMap, io::Cursor, slice};
 use hyper::header::{CONTENT_LENGTH, CONTENT_TYPE, LOCATION};
 use serde_json::json;
 
-use super::*;
+use super::{parse::manifest_meta_from_body, *};
 use crate::{
     oci::Namespace,
     registry::test_utils::{FSRegistryTestCase, backends},
@@ -334,6 +334,136 @@ fn test_parse_manifest_digests() {
     // Test media type mismatch
     let wrong_media_type = "application/wrong.media.type".to_string();
     assert!(parse_manifest_digests(&content, Some(&wrong_media_type)).is_err());
+}
+
+#[tokio::test]
+async fn test_malformed_json_yields_same_error_shape() {
+    let malformed = b"not json";
+
+    let parse_err = parse_manifest_digests(malformed, None)
+        .err()
+        .expect("expected Err from parse_manifest_digests");
+    match parse_err {
+        crate::registry::Error::ManifestInvalid(s) => {
+            assert!(
+                s.starts_with("invalid manifest JSON:"),
+                "parse_manifest_digests error should start with 'invalid manifest JSON:'; got: {s}"
+            );
+        }
+        other => panic!("expected ManifestInvalid from parse_manifest_digests, got {other:?}"),
+    }
+
+    // Parse failure is detected before any blob/metadata store access, so a
+    // single backend exercises the full path.
+    let test_case = FSRegistryTestCase::new();
+    let registry = test_case.registry();
+    let namespace = &Namespace::new("test-repo").unwrap();
+    let put_err = registry
+        .put_manifest(
+            namespace,
+            &Reference::Tag("latest".to_string()),
+            None,
+            malformed,
+        )
+        .await
+        .err()
+        .expect("expected Err from put_manifest");
+    match put_err {
+        crate::registry::Error::ManifestInvalid(s) => {
+            assert!(
+                s.starts_with("invalid manifest JSON:"),
+                "put_manifest error should start with 'invalid manifest JSON:'; got: {s}"
+            );
+        }
+        other => panic!("expected ManifestInvalid from put_manifest, got {other:?}"),
+    }
+}
+
+#[test]
+fn parse_manifest_digests_media_type_mismatch_returns_manifest_invalid() {
+    let (content, _) = create_test_manifest();
+    let wrong_type = "application/vnd.oci.image.manifest.v1+json".to_string();
+
+    let err = parse_manifest_digests(&content, Some(&wrong_type))
+        .err()
+        .expect("expected error on media type mismatch");
+    assert!(
+        matches!(err, crate::registry::Error::ManifestInvalid(_)),
+        "expected ManifestInvalid for media type mismatch, got: {err:?}"
+    );
+}
+
+#[test]
+fn parse_manifest_digests_empty_layers_succeeds_with_empty_vec() {
+    let body = serde_json::to_vec(&serde_json::json!({
+        "schemaVersion": 2,
+        "mediaType": "application/vnd.docker.distribution.manifest.v2+json",
+        "config": {
+            "mediaType": "application/vnd.docker.container.image.v1+json",
+            "digest": "sha256:1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
+            "size": 100
+        },
+        "layers": []
+    }))
+    .unwrap();
+
+    let digests =
+        parse_manifest_digests(&body, None).expect("empty layers must parse successfully");
+    assert!(digests.layers.is_empty(), "layers must be empty");
+    assert!(digests.config.is_some(), "config must be present");
+}
+
+#[test]
+fn parse_manifest_digests_only_subject_succeeds() {
+    // A manifest carrying only a subject (no config/layers) must parse successfully.
+    let body = serde_json::to_vec(&serde_json::json!({
+        "schemaVersion": 2,
+        "subject": {
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "digest": "sha256:9876543210fedcba9876543210fedcba9876543210fedcba9876543210fedcba",
+            "size": 512
+        }
+    }))
+    .unwrap();
+
+    let digests = parse_manifest_digests(&body, None).expect("subject-only manifest must parse");
+    assert!(digests.subject.is_some(), "subject must be populated");
+    assert!(digests.config.is_none());
+    assert!(digests.layers.is_empty());
+    assert!(digests.manifests.is_empty());
+}
+
+#[test]
+fn parse_manifest_digests_index_manifest_populates_manifests_vec() {
+    // An OCI image index carries a `manifests` array, no `layers`.
+    let body = serde_json::to_vec(&serde_json::json!({
+        "schemaVersion": 2,
+        "mediaType": "application/vnd.oci.image.index.v1+json",
+        "manifests": [
+            {
+                "mediaType": "application/vnd.oci.image.manifest.v1+json",
+                "digest": "sha256:aaaa0000bbbb1111cccc2222dddd3333eeee4444ffff555500001111aaaabbbb",
+                "size": 100,
+                "platform": { "architecture": "amd64", "os": "linux" }
+            },
+            {
+                "mediaType": "application/vnd.oci.image.manifest.v1+json",
+                "digest": "sha256:bbbb1111cccc2222dddd3333eeee4444ffff555500001111aaaabbbbccccdddd",
+                "size": 200,
+                "platform": { "architecture": "arm64", "os": "linux" }
+            }
+        ]
+    }))
+    .unwrap();
+
+    let digests = parse_manifest_digests(&body, None).expect("index manifest must parse");
+    assert_eq!(
+        digests.manifests.len(),
+        2,
+        "both child manifests must be collected"
+    );
+    assert!(digests.layers.is_empty());
+    assert!(digests.config.is_none());
 }
 
 #[tokio::test]
@@ -1321,4 +1451,90 @@ async fn test_handle_get_manifest_no_redirect_returns_body() {
             }
         }
     }
+}
+
+fn fixed_digest() -> Digest {
+    "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+        .parse()
+        .unwrap()
+}
+
+#[test]
+fn manifest_meta_from_body_returns_meta_for_valid_image_manifest_with_media_type() {
+    let body = serde_json::to_vec(&json!({
+        "schemaVersion": 2,
+        "mediaType": "application/vnd.oci.image.manifest.v1+json",
+        "config": {
+            "mediaType": "application/vnd.oci.image.config.v1+json",
+            "digest": "sha256:1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
+            "size": 256
+        },
+        "layers": []
+    }))
+    .unwrap();
+
+    let target = fixed_digest();
+    let meta = manifest_meta_from_body(&target, &body).unwrap();
+
+    assert_eq!(
+        meta.media_type.as_deref(),
+        Some("application/vnd.oci.image.manifest.v1+json")
+    );
+    assert_eq!(meta.digest, target);
+    assert_eq!(meta.size, body.len() as u64);
+}
+
+#[test]
+fn manifest_meta_from_body_returns_meta_for_image_manifest_without_media_type() {
+    let body = serde_json::to_vec(&json!({
+        "schemaVersion": 2,
+        "config": {
+            "mediaType": "application/vnd.oci.image.config.v1+json",
+            "digest": "sha256:1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
+            "size": 256
+        },
+        "layers": []
+    }))
+    .unwrap();
+
+    let target = fixed_digest();
+    let meta = manifest_meta_from_body(&target, &body).unwrap();
+
+    assert_eq!(meta.media_type, None);
+    assert_eq!(meta.digest, target);
+    assert_eq!(meta.size, body.len() as u64);
+}
+
+#[test]
+fn manifest_meta_from_body_returns_meta_for_oci_index() {
+    let body = serde_json::to_vec(&json!({
+        "schemaVersion": 2,
+        "mediaType": "application/vnd.oci.image.index.v1+json",
+        "manifests": [
+            {
+                "mediaType": "application/vnd.oci.image.manifest.v1+json",
+                "digest": "sha256:abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890",
+                "size": 512,
+                "platform": { "architecture": "amd64", "os": "linux" }
+            }
+        ]
+    }))
+    .unwrap();
+
+    let target = fixed_digest();
+    let meta = manifest_meta_from_body(&target, &body).unwrap();
+
+    assert_eq!(
+        meta.media_type.as_deref(),
+        Some("application/vnd.oci.image.index.v1+json")
+    );
+    assert_eq!(meta.digest, target);
+    assert_eq!(meta.size, body.len() as u64);
+}
+
+#[test]
+fn manifest_meta_from_body_errors_on_malformed_json() {
+    let target = fixed_digest();
+    let result = manifest_meta_from_body(&target, b"not json");
+    assert!(result.is_err());
 }

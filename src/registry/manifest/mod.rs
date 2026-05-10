@@ -1,7 +1,16 @@
-use std::collections::HashMap;
+mod parse;
+mod response;
 
 use futures_util::StreamExt;
-use hyper::header::{CONTENT_LENGTH, CONTENT_TYPE, LOCATION};
+pub use parse::{ParsedManifestDigests, parse_manifest_digests};
+use parse::{manifest_meta_from_body, parse_and_validate_manifest};
+pub use response::{
+    DeleteManifestResponse, GetManifestResponse, HeadManifestResponse, PutManifestResponse,
+};
+use response::{
+    ManifestBody, ManifestMeta, get_manifest_body_headers, get_manifest_redirect_headers,
+    head_manifest_headers, put_manifest_headers,
+};
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tracing::{error, instrument, warn};
 
@@ -9,175 +18,40 @@ use crate::{
     event_webhook::event::{Event, EventActor, EventKind},
     oci::{Digest, Manifest, Namespace, Reference},
     registry::{
-        DOCKER_CONTENT_DIGEST, Error, OCI_SUBJECT, Registry, Repository,
-        metadata_store::{MetadataStoreExt, Transaction, link_kind::LinkKind},
+        DOCKER_CONTENT_DIGEST, Error, Registry, Repository,
+        metadata_store::{MetadataStoreExt, link_kind::LinkKind},
         pagination::collect_all_pages,
     },
 };
 
-fn add_link_with_media_type(
-    tx: &mut Transaction<'_>,
-    link: &LinkKind,
-    target: &Digest,
-    media_type: Option<&str>,
-) {
-    let mut builder = tx.create_link(link, target);
-    if let Some(mt) = media_type {
-        builder = builder.with_media_type(mt);
-    }
-    builder.add();
-}
-
-pub(crate) struct ManifestMeta {
-    pub media_type: Option<String>,
-    pub digest: Digest,
-    pub size: u64,
-}
-
-pub(crate) struct ManifestBody {
-    pub media_type: Option<String>,
-    pub digest: Digest,
-    pub content: Vec<u8>,
-}
-
-pub enum GetManifestResponse {
-    Redirect {
-        headers: HashMap<&'static str, String>,
-    },
-    Body {
-        headers: HashMap<&'static str, String>,
-        content: Vec<u8>,
-    },
-}
-
-pub struct HeadManifestResponse {
-    pub headers: HashMap<&'static str, String>,
-}
-
-pub struct PutManifestResponse {
-    pub headers: HashMap<&'static str, String>,
-    pub events: Vec<Event>,
-}
-
-pub struct DeleteManifestResponse {
-    pub events: Vec<Event>,
-}
-
-fn head_manifest_headers(meta: &ManifestMeta) -> HashMap<&'static str, String> {
-    let mut headers = HashMap::from([
-        (DOCKER_CONTENT_DIGEST, meta.digest.to_string()),
-        (CONTENT_LENGTH.as_str(), meta.size.to_string()),
-    ]);
-    if let Some(media_type) = meta.media_type.clone() {
-        headers.insert(CONTENT_TYPE.as_str(), media_type);
-    }
-    headers
-}
-
-fn get_manifest_body_headers(
-    media_type: Option<&str>,
-    digest: &Digest,
-) -> HashMap<&'static str, String> {
-    let mut headers = HashMap::from([(DOCKER_CONTENT_DIGEST, digest.to_string())]);
-    if let Some(media_type) = media_type {
-        headers.insert(CONTENT_TYPE.as_str(), media_type.to_string());
-    }
-    headers
-}
-
-fn get_manifest_redirect_headers(
-    url: String,
-    digest: &Digest,
-    media_type: Option<String>,
-) -> HashMap<&'static str, String> {
-    let mut headers = HashMap::from([
-        (LOCATION.as_str(), url),
-        (DOCKER_CONTENT_DIGEST, digest.to_string()),
-    ]);
-    if let Some(media_type) = media_type {
-        headers.insert(CONTENT_TYPE.as_str(), media_type);
-    }
-    headers
-}
-
-fn put_manifest_headers(
+fn manifest_event(
+    kind: EventKind,
     namespace: &Namespace,
+    repository: String,
+    digest: Option<String>,
     reference: &Reference,
-    digest: &Digest,
-    subject: Option<&Digest>,
-) -> HashMap<&'static str, String> {
-    let mut headers = HashMap::from([
-        (
-            LOCATION.as_str(),
-            format!("/v2/{namespace}/manifests/{reference}"),
-        ),
-        (DOCKER_CONTENT_DIGEST, digest.to_string()),
-    ]);
-    if let Some(subject) = subject {
-        headers.insert(OCI_SUBJECT, subject.to_string());
-    }
-    headers
+    actor: Option<EventActor>,
+) -> Event {
+    Event::new(kind, namespace.to_string(), repository)
+        .digest(digest)
+        .reference(Some(reference.to_string()))
+        .actor(actor)
 }
 
-pub struct ParsedManifestDigests {
-    pub subject: Option<Digest>,
-    pub config: Option<Digest>,
-    pub layers: Vec<Digest>,
-    pub manifests: Vec<Digest>,
-}
-
-fn validate_media_type_match(
-    manifest: &Manifest,
-    content_type: Option<&String>,
-) -> Result<(), Error> {
-    if content_type.is_some()
-        && manifest.media_type.is_some()
-        && manifest.media_type.as_ref() != content_type
-    {
-        warn!(
-            "Manifest media type mismatch: {content_type:?} (expected) != {:?} (found)",
-            manifest.media_type
-        );
-        return Err(Error::ManifestInvalid(
-            "Expected manifest media type mismatch".to_string(),
-        ));
-    }
-    Ok(())
-}
-
-pub fn parse_manifest_digests(
-    body: &[u8],
-    content_type: Option<&String>,
-) -> Result<ParsedManifestDigests, Error> {
-    let manifest: Manifest = serde_json::from_slice(body).map_err(|e| {
-        warn!("Failed to deserialize manifest: {e}");
-        Error::ManifestInvalid(format!("invalid manifest JSON: {e}"))
-    })?;
-
-    validate_media_type_match(&manifest, content_type)?;
-
-    let subject = manifest.subject.map(|subject| subject.digest);
-
-    let config = manifest.config.map(|config| config.digest);
-
-    let layers = manifest
-        .layers
-        .into_iter()
-        .map(|layer| layer.digest)
-        .collect::<Vec<_>>();
-
-    let manifests = manifest
-        .manifests
-        .into_iter()
-        .map(|m| m.digest)
-        .collect::<Vec<_>>();
-
-    Ok(ParsedManifestDigests {
-        subject,
-        config,
-        layers,
-        manifests,
-    })
+fn tag_event(
+    kind: EventKind,
+    namespace: &Namespace,
+    repository: String,
+    digest: Option<String>,
+    reference: &Reference,
+    tag: &str,
+    actor: Option<EventActor>,
+) -> Event {
+    Event::new(kind, namespace.to_string(), repository)
+        .digest(digest)
+        .reference(Some(reference.to_string()))
+        .tag(Some(tag.to_string()))
+        .actor(actor)
 }
 
 impl Registry {
@@ -241,7 +115,7 @@ impl Registry {
         namespace: &Namespace,
         reference: &Reference,
     ) -> Result<ManifestMeta, Error> {
-        let blob_link = reference.clone().into();
+        let blob_link = LinkKind::from_reference(reference);
         let link = self
             .metadata_store
             .read_link(namespace, &blob_link, self.update_pull_time)
@@ -274,13 +148,7 @@ impl Registry {
         let mut manifest_content = Vec::new();
         reader.read_to_end(&mut manifest_content).await?;
 
-        let manifest = serde_json::from_slice::<Manifest>(&manifest_content)?;
-
-        Ok(ManifestMeta {
-            media_type: manifest.media_type,
-            digest: link.target,
-            size: manifest_content.len() as u64,
-        })
+        manifest_meta_from_body(&link.target, &manifest_content)
     }
 
     #[instrument(skip(repository))]
@@ -337,14 +205,14 @@ impl Registry {
         namespace: &Namespace,
         reference: &Reference,
     ) -> Result<ManifestBody, Error> {
-        let blob_link = reference.clone().into();
+        let blob_link = LinkKind::from_reference(reference);
         let link = self
             .metadata_store
             .read_link(namespace, &blob_link, self.update_pull_time)
             .await?;
 
         let content = self.blob_store.read(&link.target).await?;
-        let manifest = serde_json::from_slice::<Manifest>(&content).map_err(|error| {
+        let manifest: Manifest = serde_json::from_slice(&content).map_err(|error| {
             warn!("Failed to deserialize manifest: {error}");
             Error::ManifestInvalid("Failed to deserialize manifest".to_string())
         })?;
@@ -364,12 +232,7 @@ impl Registry {
         content_type: Option<&String>,
         body: &[u8],
     ) -> Result<PutManifestResponse, Error> {
-        let manifest: Manifest = serde_json::from_slice(body).map_err(|e| {
-            warn!("Failed to deserialize manifest: {e}");
-            Error::ManifestInvalid(format!("invalid manifest JSON: {e}"))
-        })?;
-
-        validate_media_type_match(&manifest, content_type)?;
+        let mut manifest = parse_and_validate_manifest(body, content_type)?;
 
         let digest = self.blob_store.create(body).await?;
 
@@ -388,27 +251,19 @@ impl Registry {
             .cloned()
             .or_else(|| manifest.media_type.clone());
 
-        add_link_with_media_type(
-            &mut tx,
-            &LinkKind::Digest(digest.clone()),
-            &digest,
-            effective_media_type.as_deref(),
-        );
+        tx.create_link(&LinkKind::Digest(digest.clone()), &digest)
+            .with_optional_media_type(effective_media_type.as_deref())
+            .add();
 
         if let Reference::Tag(tag) = reference {
-            add_link_with_media_type(
-                &mut tx,
-                &LinkKind::Tag(tag.clone()),
-                &digest,
-                effective_media_type.as_deref(),
-            );
+            tx.create_link(&LinkKind::Tag(tag.clone()), &digest)
+                .with_optional_media_type(effective_media_type.as_deref())
+                .add();
         }
 
         if let Some(subject) = &manifest.subject {
             let referrer_link = LinkKind::Referrer(subject.digest.clone(), digest.clone());
-            if let Some(descriptor) =
-                manifest.to_descriptor(None, digest.clone(), body.len() as u64)
-            {
+            if let Some(descriptor) = manifest.take_descriptor(digest.clone(), body.len() as u64) {
                 tx.create_link(&referrer_link, &digest)
                     .with_descriptor(descriptor)
                     .add();
@@ -448,11 +303,11 @@ impl Registry {
         })
     }
 
-    async fn find_tags_for_digest(
+    async fn find_tags_pointing_at(
         &self,
         namespace: &Namespace,
         digest: &Digest,
-    ) -> Result<Vec<String>, Error> {
+    ) -> Result<Vec<LinkKind>, Error> {
         let all_tags = collect_all_pages(|marker| async move {
             self.metadata_store.list_tags(namespace, 100, marker).await
         })
@@ -471,7 +326,7 @@ impl Registry {
                 if let Ok(metadata) = result
                     && &metadata.target == digest
                 {
-                    Some(tag)
+                    Some(LinkKind::Tag(tag))
                 } else {
                     None
                 }
@@ -498,9 +353,8 @@ impl Registry {
             Reference::Digest(digest) => {
                 tx.delete_link(&LinkKind::Digest(digest.clone()));
 
-                let matching_tags = self.find_tags_for_digest(namespace, digest).await?;
-                for tag in matching_tags {
-                    tx.delete_link(&LinkKind::Tag(tag));
+                for link in self.find_tags_pointing_at(namespace, digest).await? {
+                    tx.delete_link(&link);
                 }
 
                 if let Ok(content) = self.blob_store.read(digest).await
@@ -536,29 +390,56 @@ impl Registry {
             Reference::Tag(_) => None,
         };
 
-        let mut events = Vec::new();
-        events.push(
-            Event::new(
-                EventKind::ManifestDelete,
-                namespace.to_string(),
-                repository.clone(),
-            )
-            .digest(digest_str.clone())
-            .reference(Some(reference.to_string()))
-            .actor(actor.clone()),
-        );
+        let mut events = vec![manifest_event(
+            EventKind::ManifestDelete,
+            namespace,
+            repository.clone(),
+            digest_str.clone(),
+            reference,
+            actor.clone(),
+        )];
 
         if let Reference::Tag(tag) = reference {
-            events.push(
-                Event::new(EventKind::TagDelete, namespace.to_string(), repository)
-                    .digest(digest_str)
-                    .reference(Some(reference.to_string()))
-                    .tag(Some(tag.clone()))
-                    .actor(actor),
-            );
+            events.push(tag_event(
+                EventKind::TagDelete,
+                namespace,
+                repository,
+                digest_str,
+                reference,
+                tag,
+                actor,
+            ));
         }
 
         Ok(DeleteManifestResponse { events })
+    }
+
+    /// Attempts to short-circuit a manifest GET into a presigned redirect using
+    /// only the link metadata (without reading the manifest blob). Returns
+    /// `Some(Redirect)` when the link records a `media_type` AND the configured
+    /// `PresignedBlobStore` produces a URL; otherwise returns `None` so the caller
+    /// falls through to the body-loading path.
+    async fn try_redirect_via_link(
+        &self,
+        namespace: &Namespace,
+        reference: &Reference,
+    ) -> Option<GetManifestResponse> {
+        let blob_link = LinkKind::from_reference(reference);
+        let link = self
+            .metadata_store
+            .read_link(namespace, &blob_link, self.update_pull_time)
+            .await
+            .ok()?;
+        let media_type = link.media_type?;
+        let presigned = self.presigned_blob_store.as_ref()?;
+        let presigned_url = presigned
+            .url(&link.target, Some(media_type.as_str()))
+            .await
+            .ok()??;
+
+        Some(GetManifestResponse::Redirect {
+            headers: get_manifest_redirect_headers(presigned_url, &link.target, Some(media_type)),
+        })
     }
 
     /// Resolves a manifest GET request to either a presigned redirect URL or the manifest body.
@@ -583,24 +464,9 @@ impl Registry {
 
         if self.enable_manifest_redirect
             && redirect_is_authoritative
-            && let Ok(link) = {
-                let blob_link: LinkKind = reference.clone().into();
-                self.metadata_store
-                    .read_link(namespace, &blob_link, self.update_pull_time)
-                    .await
-            }
-            && let Some(media_type) = link.media_type
-            && let Some(presigned) = &self.presigned_blob_store
-            && let Ok(Some(presigned_url)) =
-                presigned.url(&link.target, Some(media_type.as_str())).await
+            && let Some(resp) = self.try_redirect_via_link(namespace, &reference).await
         {
-            return Ok(GetManifestResponse::Redirect {
-                headers: get_manifest_redirect_headers(
-                    presigned_url,
-                    &link.target,
-                    Some(media_type),
-                ),
-            });
+            return Ok(resp);
         }
 
         let manifest = self
@@ -650,15 +516,14 @@ impl Registry {
     where
         S: AsyncRead + Unpin + Send,
     {
-        let mut request_body = String::new();
+        let mut request_body = Vec::new();
 
         body_stream
-            .read_to_string(&mut request_body)
+            .read_to_end(&mut request_body)
             .await
             .map_err(|_| {
                 Error::ManifestInvalid("Unable to retrieve manifest from client query".to_string())
             })?;
-        let request_body = request_body.into_bytes();
 
         let mut response = self
             .put_manifest(namespace, &reference, Some(&mime_type), &request_body)
@@ -667,25 +532,25 @@ impl Registry {
         let repository = self.repository_name_for(namespace);
         let digest_str = response.headers.get(DOCKER_CONTENT_DIGEST).cloned();
 
-        response.events.push(
-            Event::new(
-                EventKind::ManifestPush,
-                namespace.to_string(),
-                repository.clone(),
-            )
-            .digest(digest_str.clone())
-            .reference(Some(reference.to_string()))
-            .actor(actor.clone()),
-        );
+        response.events.push(manifest_event(
+            EventKind::ManifestPush,
+            namespace,
+            repository.clone(),
+            digest_str.clone(),
+            &reference,
+            actor.clone(),
+        ));
 
         if let Reference::Tag(tag) = &reference {
-            response.events.push(
-                Event::new(EventKind::TagCreate, namespace.to_string(), repository)
-                    .digest(digest_str)
-                    .reference(Some(reference.to_string()))
-                    .tag(Some(tag.clone()))
-                    .actor(actor),
-            );
+            response.events.push(tag_event(
+                EventKind::TagCreate,
+                namespace,
+                repository,
+                digest_str,
+                &reference,
+                tag,
+                actor,
+            ));
         }
 
         Ok(response)

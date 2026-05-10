@@ -1,6 +1,9 @@
 use std::collections::HashMap;
 
-use argon2::{Argon2, PasswordVerifier};
+use argon2::{
+    Algorithm, Argon2, Params, PasswordHasher, PasswordVerifier, Version,
+    password_hash::{SaltString, rand_core::OsRng},
+};
 use base64::{Engine, prelude::BASE64_STANDARD};
 use hyper::{Request, http::request::Parts};
 use serde::Deserialize;
@@ -18,18 +21,39 @@ struct TestConfig {
     identity: HashMap<String, Config>,
 }
 
-static VALID_TEST_CONFIG: &str = r#"
+// Minimal Argon2 cost parameters for test-only use — chosen for speed, not security.
+// Production code uses OWASP-recommended defaults (m=19456, t=2, p=1).
+fn tiny_argon_params() -> Params {
+    Params::new(8, 1, 1, None).expect("minimal Argon2 params must be valid")
+}
+
+fn hash_password_for_test(password: &str) -> String {
+    let salt = SaltString::generate(OsRng);
+    let argon = Argon2::new(Algorithm::Argon2id, Version::V0x13, tiny_argon_params());
+    argon
+        .hash_password(password.as_bytes(), &salt)
+        .expect("test password hash must succeed")
+        .to_string()
+}
+
+fn build_test_toml() -> String {
+    let hash1 = hash_password_for_test("password1");
+    let hash2 = hash_password_for_test("password2");
+    format!(
+        r#"
 [identity.id_1]
 username = "user1"
-password = "$argon2id$v=19$m=19456,t=2,p=1$9pxWwg0VtZzDXno/25417Q$e+cuKy9VisJVxec/EEuKvvfIIIOy5yDGRzYKiuDLjx0"  # password is "password1"
+password = "{hash1}"
 
 [identity.id_2]
 username = "user2"
-password = "$argon2id$v=19$m=19456,t=2,p=1$Uy1qF140d+2nOKIz1ZFltw$xAii0VrKbNn2d/rb5hUWUmEcwq6kjVFE5mW5ymzFudw"  # password is "password2"
-"#;
+password = "{hash2}"
+"#
+    )
+}
 
 fn build_test_config() -> TestConfig {
-    toml::from_str(VALID_TEST_CONFIG).expect("Failed to parse test config")
+    toml::from_str(&build_test_toml()).expect("Failed to parse test config")
 }
 
 fn build_basic_auth_header(username: &str, password: &str) -> String {
@@ -61,8 +85,10 @@ fn test_build_users() {
 
     let (id1, pass1) = users.get("user1").unwrap();
     assert_eq!(id1, "id_1");
+    // Use the minimal-cost verifier — the hash was also produced with tiny params.
+    let argon = Argon2::new(Algorithm::Argon2id, Version::V0x13, tiny_argon_params());
     assert!(
-        Argon2::default()
+        argon
             .verify_password("password1".as_bytes(), &pass1.as_password_hash())
             .is_ok()
     );
@@ -70,7 +96,7 @@ fn test_build_users() {
     let (id2, pass2) = users.get("user2").unwrap();
     assert_eq!(id2, "id_2");
     assert!(
-        Argon2::default()
+        argon
             .verify_password("password2".as_bytes(), &pass2.as_password_hash())
             .is_ok()
     );
@@ -158,17 +184,21 @@ fn test_duplicate_usernames_last_wins() {
     // so one entry silently overwrites the other. The resulting map has exactly one
     // entry for that username; which identity_id survives is non-deterministic (HashMap
     // iteration order), but the size must be 1.
-    let toml = r#"
+    let hash_a = hash_password_for_test("password-a");
+    let hash_b = hash_password_for_test("password-b");
+    let toml = format!(
+        r#"
 [identity.id_a]
 username = "shared"
-password = "$argon2id$v=19$m=19456,t=2,p=1$9pxWwg0VtZzDXno/25417Q$e+cuKy9VisJVxec/EEuKvvfIIIOy5yDGRzYKiuDLjx0"
+password = "{hash_a}"
 
 [identity.id_b]
 username = "shared"
-password = "$argon2id$v=19$m=19456,t=2,p=1$Uy1qF140d+2nOKIz1ZFltw$xAii0VrKbNn2d/rb5hUWUmEcwq6kjVFE5mW5ymzFudw"
-"#;
+password = "{hash_b}"
+"#
+    );
 
-    let config: TestConfig = toml::from_str(toml).expect("valid TOML");
+    let config: TestConfig = toml::from_str(&toml).expect("valid TOML");
     let users = build_users(&config.identity);
 
     assert_eq!(users.len(), 1, "duplicate usernames collapse to one entry");

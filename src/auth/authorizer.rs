@@ -678,6 +678,86 @@ mod tests {
         assert!(authorizer.is_tag_mutable(auth_repo, "any-tag"));
     }
 
+    // When immutable_tags is true and the tag matches an exclusion pattern, the
+    // tag is mutable (the exclusion carves out a writable subset).
+    #[test]
+    fn is_tag_mutable_returns_true_when_immutable_but_excluded() {
+        let toml = r#"
+            [blob_store.fs]
+            root_dir = "/tmp/test"
+
+            [metadata_store.fs]
+            root_dir = "/tmp/test"
+
+            [cache.memory]
+
+            [server]
+            bind_address = "0.0.0.0"
+            port = 8000
+
+            [global]
+            update_pull_time = false
+            max_concurrent_cache_jobs = 10
+
+            [repository.myrepo]
+            namespace_pattern = "^myrepo/.*"
+            immutable_tags = true
+            immutable_tags_exclusions = ["^latest$", "^dev-.*"]
+        "#;
+
+        let config = Configuration::load_from_str(toml).unwrap();
+        let cache = cache::Config::Memory.to_backend().unwrap();
+        let authorizer = Authorizer::new(&config, &cache).unwrap();
+        let auth_repo = authorizer.repositories.get("myrepo").unwrap();
+
+        assert!(
+            authorizer.is_tag_mutable(auth_repo, "latest"),
+            "'latest' must be mutable because it matches the exclusion pattern"
+        );
+        assert!(
+            authorizer.is_tag_mutable(auth_repo, "dev-feature"),
+            "'dev-feature' must be mutable because it matches 'dev-.*'"
+        );
+    }
+
+    // When immutable_tags is true and the tag does not match any exclusion,
+    // the tag is immutable.
+    #[test]
+    fn is_tag_mutable_returns_false_when_immutable_and_not_excluded() {
+        let toml = r#"
+            [blob_store.fs]
+            root_dir = "/tmp/test"
+
+            [metadata_store.fs]
+            root_dir = "/tmp/test"
+
+            [cache.memory]
+
+            [server]
+            bind_address = "0.0.0.0"
+            port = 8000
+
+            [global]
+            update_pull_time = false
+            max_concurrent_cache_jobs = 10
+
+            [repository.myrepo]
+            namespace_pattern = "^myrepo/.*"
+            immutable_tags = true
+            immutable_tags_exclusions = ["^latest$"]
+        "#;
+
+        let config = Configuration::load_from_str(toml).unwrap();
+        let cache = cache::Config::Memory.to_backend().unwrap();
+        let authorizer = Authorizer::new(&config, &cache).unwrap();
+        let auth_repo = authorizer.repositories.get("myrepo").unwrap();
+
+        assert!(
+            !authorizer.is_tag_mutable(auth_repo, "v1.0.0"),
+            "'v1.0.0' must be immutable: immutable_tags=true and not excluded"
+        );
+    }
+
     #[test]
     fn test_check_immutable_tag_returns_conflict_for_tagged_putmanifest() {
         use std::str::FromStr;

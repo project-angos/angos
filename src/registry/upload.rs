@@ -58,7 +58,7 @@ fn upload_session_headers(
 
 fn upload_status_headers(
     namespace: &Namespace,
-    session_id: Uuid,
+    session_id: &str,
     range_max: u64,
 ) -> HashMap<&'static str, String> {
     HashMap::from([
@@ -73,7 +73,7 @@ fn upload_status_headers(
 
 fn patch_upload_headers(
     namespace: &Namespace,
-    session_id: Uuid,
+    session_id: &str,
     range_max: u64,
 ) -> HashMap<&'static str, String> {
     let mut headers = upload_status_headers(namespace, session_id, range_max);
@@ -140,7 +140,7 @@ impl Registry {
         let range_max = size.saturating_sub(1);
 
         Ok(PatchUploadResponse {
-            headers: patch_upload_headers(namespace, session_id, range_max),
+            headers: patch_upload_headers(namespace, &session_key, range_max),
         })
     }
 
@@ -221,7 +221,7 @@ impl Registry {
         let range_max = summary.size.saturating_sub(1);
 
         Ok(GetUploadResponse {
-            headers: upload_status_headers(namespace, session_id, range_max),
+            headers: upload_status_headers(namespace, &uuid, range_max),
         })
     }
 }

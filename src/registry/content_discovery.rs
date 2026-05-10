@@ -5,13 +5,41 @@ use serde::Serialize;
 use tracing::instrument;
 
 use crate::{
-    oci::{Descriptor, Digest, Namespace, ReferrerList},
-    registry::{Error, JsonResponse, Registry},
+    oci::{Descriptor, Digest, Namespace, OCI_MANIFEST_SCHEMA_VERSION},
+    registry::{APPLICATION_JSON, Error, JsonResponse, Registry},
 };
 
 const OCI_FILTERS_APPLIED: &str = "OCI-Filters-Applied";
 const OCI_INDEX_MEDIA_TYPE: &str = "application/vnd.oci.image.index.v1+json";
-const APPLICATION_JSON: &str = "application/json";
+
+#[derive(Serialize, Debug)]
+#[serde(rename_all = "camelCase")]
+struct ReferrerList {
+    schema_version: i32,
+    media_type: String,
+    manifests: Vec<Descriptor>,
+}
+
+impl Default for ReferrerList {
+    fn default() -> Self {
+        ReferrerList {
+            schema_version: OCI_MANIFEST_SCHEMA_VERSION,
+            media_type: OCI_INDEX_MEDIA_TYPE.to_string(),
+            manifests: Vec::new(),
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct CatalogBody {
+    repositories: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct TagsBody<'a> {
+    name: &'a str,
+    tags: Vec<String>,
+}
 
 fn referrers_headers(artifact_type_filtered: bool) -> HashMap<&'static str, String> {
     let mut headers = HashMap::from([(CONTENT_TYPE.as_str(), OCI_INDEX_MEDIA_TYPE.to_string())]);
@@ -98,11 +126,6 @@ impl Registry {
         n: Option<u16>,
         last: Option<String>,
     ) -> Result<JsonResponse, Error> {
-        #[derive(Serialize)]
-        struct CatalogBody {
-            repositories: Vec<String>,
-        }
-
         let (repositories, link) = self.list_catalog_entries(n, last).await?;
 
         Ok(JsonResponse {
@@ -118,12 +141,6 @@ impl Registry {
         n: Option<u16>,
         last: Option<String>,
     ) -> Result<JsonResponse, Error> {
-        #[derive(Serialize)]
-        struct TagsBody<'a> {
-            name: &'a str,
-            tags: Vec<String>,
-        }
-
         let (tags, link) = self.list_tag_entries(namespace, n, last).await?;
 
         Ok(JsonResponse {
@@ -272,6 +289,86 @@ mod tests {
             assert_eq!(tags.len(), 2);
             assert!(token.is_none());
         }
+    }
+
+    // list_catalog_entries pagination: write N namespaces then page through them
+    // using the returned continuation token, asserting every entry is visited
+    // exactly once.
+    #[tokio::test]
+    async fn list_catalog_entries_continuation_token_round_trip() {
+        use crate::registry::metadata_store::MetadataStoreExt;
+
+        // Use only the FS backend — this tests pagination logic, not backend specifics.
+        let test_case = crate::registry::test_utils::FSRegistryTestCase::new();
+        let registry = test_case.registry();
+
+        let namespaces = [
+            "alpha/image",
+            "beta/image",
+            "gamma/image",
+            "delta/image",
+            "epsilon/image",
+        ];
+
+        let blob_content = b"pagination-test-blob";
+        let digest = registry.blob_store.create(blob_content).await.unwrap();
+
+        for ns_str in &namespaces {
+            let ns = Namespace::new(*ns_str).unwrap();
+            let mut tx = registry.metadata_store.begin_transaction(&ns);
+            tx.create_link(&LinkKind::Tag("latest".to_string()), &digest)
+                .add();
+            tx.commit().await.unwrap();
+        }
+
+        // Fetch 2 at a time and collect all namespaces.
+        let mut all_collected: Vec<String> = Vec::new();
+        let mut last: Option<String> = None;
+
+        loop {
+            let (page, token) = registry.list_catalog_entries(Some(2), last).await.unwrap();
+            all_collected.extend(page);
+
+            match token {
+                None => break,
+                Some(link) => {
+                    // The link is a URL fragment; extract the `last=` parameter.
+                    last = link.split("last=").nth(1).map(ToString::to_string);
+                }
+            }
+        }
+
+        assert_eq!(
+            all_collected.len(),
+            namespaces.len(),
+            "pagination must visit every namespace exactly once"
+        );
+        for ns in &namespaces {
+            assert!(
+                all_collected.contains(&ns.to_string()),
+                "namespace '{ns}' must appear in paginated results"
+            );
+        }
+    }
+
+    // list_tag_entries for a namespace that has never been written must return
+    // an empty tag list and no continuation token.
+    #[tokio::test]
+    async fn list_tag_entries_unknown_namespace_returns_empty() {
+        let test_case = crate::registry::test_utils::FSRegistryTestCase::new();
+        let registry = test_case.registry();
+        let unknown = Namespace::new("no-such-repo/no-such-image").unwrap();
+
+        let (tags, token) = registry
+            .list_tag_entries(&unknown, None, None)
+            .await
+            .unwrap();
+
+        assert!(tags.is_empty(), "unknown namespace must have no tags");
+        assert!(
+            token.is_none(),
+            "unknown namespace must have no continuation token"
+        );
     }
 
     #[tokio::test]
