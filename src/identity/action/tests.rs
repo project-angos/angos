@@ -267,8 +267,8 @@ fn test_get_reference() {
             reference: r.clone()
         }
         .get_reference()
-        .map(Reference::as_str),
-        Some(r.as_str())
+        .map(Reference::to_string),
+        Some(r.to_string())
     );
     assert!(Action::ApiVersion.get_reference().is_none());
     assert!(

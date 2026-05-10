@@ -32,12 +32,6 @@ impl Digest {
             Digest::Sha256(s) => &s[0..2],
         }
     }
-
-    pub fn as_str(&self) -> &str {
-        match self {
-            Digest::Sha256(s) => s,
-        }
-    }
 }
 
 impl FromStr for Digest {

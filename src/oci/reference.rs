@@ -19,15 +19,6 @@ pub enum Reference {
     Digest(Digest),
 }
 
-impl Reference {
-    pub fn as_str(&self) -> &str {
-        match self {
-            Reference::Tag(s) => s,
-            Reference::Digest(d) => d.as_str(),
-        }
-    }
-}
-
 impl FromStr for Reference {
     type Err = Error;
 
@@ -91,6 +82,13 @@ mod tests {
     #[test]
     fn test_display() {
         assert_eq!(Reference::Tag("latest".to_string()).to_string(), "latest");
+    }
+
+    #[test]
+    fn test_display_digest_includes_algorithm_prefix() {
+        let input = format!("sha256:{VALID_HASH}");
+        let reference = Reference::from_str(&input).unwrap();
+        assert_eq!(reference.to_string(), input);
     }
 
     // Edge case: empty string is rejected

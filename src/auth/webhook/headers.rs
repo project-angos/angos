@@ -107,7 +107,7 @@ pub fn set_registry_reference_header(
     headers: &mut HeaderMap,
 ) -> Result<(), Error> {
     if let Some(reference) = action.get_reference() {
-        let value = build_header_value(reference.as_str())?;
+        let value = build_header_value(&reference.to_string())?;
         headers.insert(X_REGISTRY_REFERENCE, value);
     }
     Ok(())
