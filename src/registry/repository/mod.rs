@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use serde::Deserialize;
-use tracing::instrument;
+use tracing::{instrument, warn};
 
 use crate::{
     auth::webhook,
@@ -54,18 +54,33 @@ pub struct Repository {
     pub immutable_tags_exclusions: Vec<RegexPattern>,
 }
 
-macro_rules! try_upstreams {
-    ($self:expr, $fallback:expr, |$upstream:ident| $body:expr) => {{
-        for $upstream in &$self.upstreams {
-            if let Ok(result) = $body {
-                return Ok(result);
+impl Repository {
+    async fn try_upstreams<'a, F, T>(
+        &'a self,
+        namespace: &'a str,
+        fallback: Error,
+        mut op: F,
+    ) -> Result<T, Error>
+    where
+        F: FnMut(
+            &'a RegistryClient,
+        )
+            -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<T, Error>> + Send + 'a>>,
+    {
+        for upstream in &self.upstreams {
+            match op(upstream).await {
+                Ok(result) => return Ok(result),
+                Err(e) => {
+                    warn!(
+                        "Upstream operation failed for namespace '{namespace}' against {}: {e}",
+                        upstream.url
+                    );
+                }
             }
         }
-        Err($fallback)
-    }};
-}
+        Err(fallback)
+    }
 
-impl Repository {
     pub fn new(name: &str, config: &Config, cache: &Arc<dyn Cache>) -> Result<Self, Error> {
         let mut upstreams = Vec::new();
         for config in &config.upstream {
@@ -109,10 +124,11 @@ impl Repository {
         namespace: &str,
         digest: &Digest,
     ) -> Result<(Digest, u64), Error> {
-        try_upstreams!(self, Error::BlobUnknown, |upstream| {
+        self.try_upstreams(namespace, Error::BlobUnknown, |upstream| {
             let location = upstream.get_blob_path(&self.name, namespace, digest);
-            upstream.head_blob(accepted_types, &location).await
+            Box::pin(async move { upstream.head_blob(accepted_types, &location).await })
         })
+        .await
     }
 
     #[instrument(skip(self))]
@@ -122,10 +138,11 @@ impl Repository {
         namespace: &str,
         digest: &Digest,
     ) -> Result<(u64, BoxedReader), Error> {
-        try_upstreams!(self, Error::BlobUnknown, |upstream| {
+        self.try_upstreams(namespace, Error::BlobUnknown, |upstream| {
             let location = upstream.get_blob_path(&self.name, namespace, digest);
-            upstream.get_blob(accepted_types, &location).await
+            Box::pin(async move { upstream.get_blob(accepted_types, &location).await })
         })
+        .await
     }
 
     #[instrument(skip(self))]
@@ -135,10 +152,11 @@ impl Repository {
         namespace: &str,
         reference: &Reference,
     ) -> Result<(Option<String>, Digest, u64), Error> {
-        try_upstreams!(self, Error::ManifestUnknown, |upstream| {
+        self.try_upstreams(namespace, Error::ManifestUnknown, |upstream| {
             let location = upstream.get_manifest_path(&self.name, namespace, reference);
-            upstream.head_manifest(accepted_types, &location).await
+            Box::pin(async move { upstream.head_manifest(accepted_types, &location).await })
         })
+        .await
     }
 
     #[instrument(skip(self))]
@@ -148,10 +166,11 @@ impl Repository {
         namespace: &str,
         reference: &Reference,
     ) -> Result<(Option<String>, Digest, Vec<u8>), Error> {
-        try_upstreams!(self, Error::ManifestUnknown, |upstream| {
+        self.try_upstreams(namespace, Error::ManifestUnknown, |upstream| {
             let location = upstream.get_manifest_path(&self.name, namespace, reference);
-            upstream.get_manifest(accepted_types, &location).await
+            Box::pin(async move { upstream.get_manifest(accepted_types, &location).await })
         })
+        .await
     }
 }
 
