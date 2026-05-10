@@ -39,18 +39,19 @@ impl Manifest {
         types
     }
 
-    pub fn to_descriptor(
-        &self,
-        artifact_type: Option<&String>,
-        digest: Digest,
-        size: u64,
-    ) -> Option<Descriptor> {
-        if let Some(artifact_type) = artifact_type
-            && !self.artifact_types().contains(artifact_type)
-        {
-            return None;
+    /// Returns whether this manifest's `artifact_type` (or one of its config
+    /// media types) matches the given filter. A `None` filter matches anything.
+    pub fn artifact_type_matches(&self, filter: Option<&String>) -> bool {
+        match filter {
+            None => true,
+            Some(want) => self.artifact_types().contains(want),
         }
+    }
 
+    /// Builds a `Descriptor` for this manifest. Returns `None` only when the
+    /// manifest carries no `media_type`. Filter-mismatch is a separate concern;
+    /// callers that need filtering call `artifact_type_matches` first.
+    pub fn to_descriptor(&self, digest: Digest, size: u64) -> Option<Descriptor> {
         Some(Descriptor {
             media_type: self.media_type.clone()?,
             annotations: self.annotations.clone(),
@@ -136,12 +137,12 @@ pub mod tests {
         );
     }
 
-    // to_descriptor: no artifact_type filter, media_type present → Some(Descriptor)
+    // to_descriptor: media_type present → Some(Descriptor)
     #[test]
-    fn test_to_descriptor_no_filter_returns_descriptor() {
+    fn test_to_descriptor_with_media_type_returns_descriptor() {
         let manifest = demo_manifest();
         let digest = valid_digest();
-        let descriptor = manifest.to_descriptor(None, digest.clone(), 999);
+        let descriptor = manifest.to_descriptor(digest.clone(), 999);
         let d = descriptor.expect("expected Some(Descriptor)");
         assert_eq!(d.media_type, MEDIA_TYPE_MANIFEST);
         assert_eq!(d.digest, digest);
@@ -149,50 +150,46 @@ pub mod tests {
         assert_eq!(d.artifact_type.as_deref(), Some("oci.image.index.v1"));
     }
 
-    // to_descriptor: artifact_type filter matches manifest's own artifact_type → Some(Descriptor)
-    #[test]
-    fn test_to_descriptor_filter_matches_artifact_type() {
-        let manifest = demo_manifest();
-        let digest = valid_digest();
-        let filter = "oci.image.index.v1".to_string();
-        let descriptor = manifest.to_descriptor(Some(&filter), digest.clone(), 42);
-        assert!(
-            descriptor.is_some(),
-            "filter matching artifact_type must yield Some"
-        );
-        assert_eq!(descriptor.unwrap().digest, digest);
-    }
-
-    // to_descriptor: artifact_type filter matches the config's media_type → Some(Descriptor)
-    #[test]
-    fn test_to_descriptor_filter_matches_config_media_type() {
-        let manifest = demo_manifest();
-        let digest = valid_digest();
-        let filter = MEDIA_TYPE_CONFIG.to_string();
-        let descriptor = manifest.to_descriptor(Some(&filter), digest, 7);
-        assert!(
-            descriptor.is_some(),
-            "filter matching config media_type must yield Some"
-        );
-    }
-
-    // to_descriptor: artifact_type filter does not match any type → None
-    #[test]
-    fn test_to_descriptor_filter_no_match_returns_none() {
-        let manifest = demo_manifest();
-        let filter = "application/vnd.example.unknown".to_string();
-        let descriptor = manifest.to_descriptor(Some(&filter), valid_digest(), 0);
-        assert!(descriptor.is_none(), "unmatched filter must yield None");
-    }
-
-    // to_descriptor: media_type absent → None regardless of filter
+    // to_descriptor: media_type absent → None (only reason to return None now)
     #[test]
     fn test_to_descriptor_no_media_type_returns_none() {
         let manifest = Manifest {
             media_type: None,
             ..Manifest::default()
         };
-        let descriptor = manifest.to_descriptor(None, valid_digest(), 0);
+        let descriptor = manifest.to_descriptor(valid_digest(), 0);
         assert!(descriptor.is_none(), "absent media_type must yield None");
+    }
+
+    // artifact_type_matches: None filter matches anything
+    #[test]
+    fn test_artifact_type_matches_none_filter_always_matches() {
+        assert!(demo_manifest().artifact_type_matches(None));
+        let bare = Manifest::default();
+        assert!(bare.artifact_type_matches(None));
+    }
+
+    // artifact_type_matches: filter matches the manifest's own artifact_type
+    #[test]
+    fn test_artifact_type_matches_filter_matches_artifact_type() {
+        let manifest = demo_manifest();
+        let filter = "oci.image.index.v1".to_string();
+        assert!(manifest.artifact_type_matches(Some(&filter)));
+    }
+
+    // artifact_type_matches: filter matches the config media_type
+    #[test]
+    fn test_artifact_type_matches_filter_matches_config_media_type() {
+        let manifest = demo_manifest();
+        let filter = MEDIA_TYPE_CONFIG.to_string();
+        assert!(manifest.artifact_type_matches(Some(&filter)));
+    }
+
+    // artifact_type_matches: filter doesn't match any type
+    #[test]
+    fn test_artifact_type_matches_filter_no_match() {
+        let manifest = demo_manifest();
+        let filter = "application/vnd.example.unknown".to_string();
+        assert!(!manifest.artifact_type_matches(Some(&filter)));
     }
 }

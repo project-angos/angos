@@ -58,7 +58,10 @@ where
             let manifest_len = data.len();
             match Manifest::from_slice(&data) {
                 Ok(manifest) => {
-                    manifest.to_descriptor(artifact_type, manifest_digest, manifest_len as u64)
+                    if !manifest.artifact_type_matches(artifact_type) {
+                        return None;
+                    }
+                    manifest.to_descriptor(manifest_digest, manifest_len as u64)
                 }
                 Err(e) => {
                     warn!("Failed to parse manifest at {blob_path}: {e}");

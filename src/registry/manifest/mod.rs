@@ -233,9 +233,7 @@ impl Registry {
 
         if let Some(subject) = &manifest.subject {
             let referrer_link = LinkKind::Referrer(subject.digest.clone(), digest.clone());
-            if let Some(descriptor) =
-                manifest.to_descriptor(None, digest.clone(), body.len() as u64)
-            {
+            if let Some(descriptor) = manifest.to_descriptor(digest.clone(), body.len() as u64) {
                 tx.create_link(&referrer_link, &digest)
                     .with_descriptor(descriptor)
                     .add();
