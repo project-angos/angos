@@ -24,6 +24,36 @@ use crate::{
     },
 };
 
+fn manifest_event(
+    kind: EventKind,
+    namespace: &Namespace,
+    repository: String,
+    digest: Option<String>,
+    reference: &Reference,
+    actor: Option<EventActor>,
+) -> Event {
+    Event::new(kind, namespace.to_string(), repository)
+        .digest(digest)
+        .reference(Some(reference.to_string()))
+        .actor(actor)
+}
+
+fn tag_event(
+    kind: EventKind,
+    namespace: &Namespace,
+    repository: String,
+    digest: Option<String>,
+    reference: &Reference,
+    tag: &str,
+    actor: Option<EventActor>,
+) -> Event {
+    Event::new(kind, namespace.to_string(), repository)
+        .digest(digest)
+        .reference(Some(reference.to_string()))
+        .tag(Some(tag.to_string()))
+        .actor(actor)
+}
+
 impl Registry {
     #[instrument(skip(repository))]
     pub async fn head_manifest(
@@ -360,26 +390,25 @@ impl Registry {
             Reference::Tag(_) => None,
         };
 
-        let mut events = Vec::new();
-        events.push(
-            Event::new(
-                EventKind::ManifestDelete,
-                namespace.to_string(),
-                repository.clone(),
-            )
-            .digest(digest_str.clone())
-            .reference(Some(reference.to_string()))
-            .actor(actor.clone()),
-        );
+        let mut events = vec![manifest_event(
+            EventKind::ManifestDelete,
+            namespace,
+            repository.clone(),
+            digest_str.clone(),
+            reference,
+            actor.clone(),
+        )];
 
         if let Reference::Tag(tag) = reference {
-            events.push(
-                Event::new(EventKind::TagDelete, namespace.to_string(), repository)
-                    .digest(digest_str)
-                    .reference(Some(reference.to_string()))
-                    .tag(Some(tag.clone()))
-                    .actor(actor),
-            );
+            events.push(tag_event(
+                EventKind::TagDelete,
+                namespace,
+                repository,
+                digest_str,
+                reference,
+                tag,
+                actor,
+            ));
         }
 
         Ok(DeleteManifestResponse { events })
@@ -504,25 +533,25 @@ impl Registry {
         let repository = self.repository_name_for(namespace);
         let digest_str = response.headers.get(DOCKER_CONTENT_DIGEST).cloned();
 
-        response.events.push(
-            Event::new(
-                EventKind::ManifestPush,
-                namespace.to_string(),
-                repository.clone(),
-            )
-            .digest(digest_str.clone())
-            .reference(Some(reference.to_string()))
-            .actor(actor.clone()),
-        );
+        response.events.push(manifest_event(
+            EventKind::ManifestPush,
+            namespace,
+            repository.clone(),
+            digest_str.clone(),
+            &reference,
+            actor.clone(),
+        ));
 
         if let Reference::Tag(tag) = &reference {
-            response.events.push(
-                Event::new(EventKind::TagCreate, namespace.to_string(), repository)
-                    .digest(digest_str)
-                    .reference(Some(reference.to_string()))
-                    .tag(Some(tag.clone()))
-                    .actor(actor),
-            );
+            response.events.push(tag_event(
+                EventKind::TagCreate,
+                namespace,
+                repository,
+                digest_str,
+                &reference,
+                tag,
+                actor,
+            ));
         }
 
         Ok(response)
