@@ -212,7 +212,7 @@ impl Registry {
             .await?;
 
         let content = self.blob_store.read(&link.target).await?;
-        let manifest = serde_json::from_slice::<Manifest>(&content).map_err(|error| {
+        let manifest: Manifest = serde_json::from_slice(&content).map_err(|error| {
             warn!("Failed to deserialize manifest: {error}");
             Error::ManifestInvalid("Failed to deserialize manifest".to_string())
         })?;

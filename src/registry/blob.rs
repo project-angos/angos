@@ -153,7 +153,7 @@ impl Registry {
         }
 
         drop(storage_engine);
-        Ok::<(), Error>(())
+        Ok(())
     }
 
     async fn cache_blob(
