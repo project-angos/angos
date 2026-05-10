@@ -4,6 +4,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::oci::{Descriptor, Digest, Error};
 
+/// OCI image-spec manifest `schemaVersion` (only version 2 is supported).
+pub const OCI_MANIFEST_SCHEMA_VERSION: i32 = 2;
+
 #[derive(Debug, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct Manifest {
@@ -66,7 +69,7 @@ impl Manifest {
 impl Default for Manifest {
     fn default() -> Self {
         Self {
-            schema_version: 2,
+            schema_version: OCI_MANIFEST_SCHEMA_VERSION,
             media_type: None,
             config: None,
             layers: Vec::new(),

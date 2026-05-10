@@ -5,7 +5,7 @@ use serde::Serialize;
 use tracing::instrument;
 
 use crate::{
-    oci::{Descriptor, Digest, Namespace},
+    oci::{Descriptor, Digest, Namespace, OCI_MANIFEST_SCHEMA_VERSION},
     registry::{APPLICATION_JSON, Error, JsonResponse, Registry},
 };
 
@@ -23,7 +23,7 @@ struct ReferrerList {
 impl Default for ReferrerList {
     fn default() -> Self {
         ReferrerList {
-            schema_version: 2,
+            schema_version: OCI_MANIFEST_SCHEMA_VERSION,
             media_type: OCI_INDEX_MEDIA_TYPE.to_string(),
             manifests: Vec::new(),
         }
