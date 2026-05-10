@@ -64,8 +64,9 @@ impl Repository {
     where
         F: FnMut(
             &'a RegistryClient,
-        )
-            -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<T, Error>> + Send + 'a>>,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<T, Error>> + Send + 'a>,
+        >,
     {
         for upstream in &self.upstreams {
             match op(upstream).await {

@@ -205,7 +205,7 @@ async fn test_head_blob_not_found() {
         .await;
 
     assert!(result.is_err());
-    assert!(matches!(result.unwrap_err(), Error::ManifestUnknown));
+    assert!(matches!(result.unwrap_err(), Error::BlobUnknown));
 }
 
 #[tokio::test]
@@ -536,8 +536,8 @@ async fn test_get_blob_not_found() {
 
     assert!(result.is_err());
     match result {
-        Err(Error::ManifestUnknown) => (),
-        _ => panic!("Expected Error::ManifestUnknown"),
+        Err(Error::BlobUnknown) => (),
+        _ => panic!("Expected Error::BlobUnknown"),
     }
 }
 

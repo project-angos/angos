@@ -142,7 +142,7 @@ impl RegistryClient {
         let response = self.query(&Method::HEAD, accepted_types, location).await?;
 
         if !response.status().is_success() {
-            return Err(Error::ManifestUnknown);
+            return Err(Error::BlobUnknown);
         }
 
         let digest = parse_header(&response, DOCKER_CONTENT_DIGEST)?;
@@ -159,7 +159,7 @@ impl RegistryClient {
         let response = self.query(&Method::GET, accepted_types, location).await?;
 
         if !response.status().is_success() {
-            return Err(Error::ManifestUnknown);
+            return Err(Error::BlobUnknown);
         }
 
         let total_length = parse_header(&response, CONTENT_LENGTH)?;
