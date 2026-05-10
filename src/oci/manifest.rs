@@ -82,7 +82,7 @@ impl Default for Manifest {
 }
 
 #[cfg(test)]
-pub mod tests {
+mod tests {
     use super::*;
     use crate::oci::Digest;
 
@@ -94,7 +94,7 @@ pub mod tests {
         Digest::Sha256(VALID_HASH.into())
     }
 
-    pub fn demo_manifest() -> Manifest {
+    fn demo_manifest() -> Manifest {
         Manifest {
             media_type: Some(MEDIA_TYPE_MANIFEST.to_string()),
             config: Some(Descriptor {
