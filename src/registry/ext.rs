@@ -20,21 +20,6 @@ fn json_headers() -> HashMap<&'static str, String> {
     HashMap::from([(CONTENT_TYPE.as_str(), APPLICATION_JSON.to_string())])
 }
 
-/// Classification of a child descriptor inside an OCI index.
-///
-/// Used by `classify_child_descriptor` to separate Docker-style referrers
-/// (which carry a `vnd.docker.reference.digest` annotation) from ordinary
-/// platform-specific index children.
-#[derive(Debug, PartialEq)]
-enum DescriptorClassification {
-    /// The descriptor has a parseable `vnd.docker.reference.digest` annotation.
-    Referrer { subject: Digest },
-    /// No referrer annotation — treat as a regular multi-arch index child.
-    IndexChild { platform: Option<Platform> },
-    /// Annotation is present but its value cannot be parsed as a `Digest`.
-    Unparseable,
-}
-
 #[derive(Serialize, Debug)]
 struct RepositoryInfo {
     name: String,
@@ -151,61 +136,80 @@ struct RepositoryConfig {
     immutable_tags_exclusions: Vec<RegexPattern>,
 }
 
+/// Detected Docker-style referrer: a child descriptor that points back at a
+/// `subject` via the `vnd.docker.reference.digest` annotation.
+struct DockerReferrerCandidate {
+    /// The subject manifest this referrer points to.
+    subject: Digest,
+    /// The referrer manifest's own digest (used to fetch its body for in-toto
+    /// predicate enrichment).
+    child_digest: Digest,
+    /// Pre-built referrer record. Annotations are NOT yet enriched with the
+    /// in-toto predicate type; the caller does that after reading the child
+    /// manifest body.
+    info: ReferrerInfo,
+}
+
+/// Returns the Docker-style referrer candidate carried by `descriptor`, if any.
+/// Pure — no I/O. Returns `None` when the descriptor has no
+/// `vnd.docker.reference.digest` annotation or when the annotation value
+/// cannot be parsed as a `Digest`.
+fn extract_docker_referrer(descriptor: &Descriptor) -> Option<DockerReferrerCandidate> {
+    const ANNOTATION_DOCKER_REFERENCE_DIGEST: &str = "vnd.docker.reference.digest";
+    let subject_str = descriptor
+        .annotations
+        .get(ANNOTATION_DOCKER_REFERENCE_DIGEST)?;
+    let subject = subject_str.parse::<Digest>().ok()?;
+    Some(DockerReferrerCandidate {
+        subject,
+        child_digest: descriptor.digest.clone(),
+        info: ReferrerInfo {
+            digest: descriptor.digest.to_string(),
+            artifact_type: descriptor.artifact_type.clone(),
+            annotations: descriptor.annotations.clone(),
+        },
+    })
+}
+
 /// Returns the `in-toto.io/predicate-type` annotation value from the first
-/// layer that carries it, if any.
-fn resolve_predicate_type(manifest: &Manifest) -> Option<String> {
+/// layer that carries it, if any. Pure — no I/O.
+fn extract_in_toto_predicate(child_manifest: &Manifest) -> Option<String> {
     const ANNOTATION_PREDICATE_TYPE: &str = "in-toto.io/predicate-type";
-    manifest
+    child_manifest
         .layers
         .iter()
         .find_map(|layer| layer.annotations.get(ANNOTATION_PREDICATE_TYPE).cloned())
 }
 
-fn apply_predicate_type(child_manifest: &Manifest, annotations: &mut HashMap<String, String>) {
-    const ANNOTATION_PREDICATE_TYPE: &str = "in-toto.io/predicate-type";
-    if let Some(predicate_type) = resolve_predicate_type(child_manifest) {
-        annotations.insert(ANNOTATION_PREDICATE_TYPE.to_string(), predicate_type);
-    }
+/// Pure analysis of a parent manifest's `manifests` array, partitioning each
+/// child descriptor into either a parent-link (regular index child) or a
+/// Docker-style referrer candidate.
+struct ManifestAnalysis {
+    /// Index children that are NOT referrers — `(child_digest, platform)` pairs
+    /// where the analyzed manifest is the parent.
+    parent_links: Vec<(Digest, Option<Platform>)>,
+    /// Docker-style referrer candidates carried by this manifest.
+    referrer_candidates: Vec<DockerReferrerCandidate>,
 }
 
-/// Classifies a child descriptor within an OCI index as a Docker-style
-/// referrer, a regular index child, or unparseable.
-fn classify_child_descriptor(descriptor: &Descriptor) -> DescriptorClassification {
-    const ANNOTATION_DOCKER_REFERENCE_DIGEST: &str = "vnd.docker.reference.digest";
-
-    let Some(subject_str) = descriptor
-        .annotations
-        .get(ANNOTATION_DOCKER_REFERENCE_DIGEST)
-    else {
-        return DescriptorClassification::IndexChild {
-            platform: descriptor.platform.clone().map(Platform::from),
-        };
-    };
-
-    match subject_str.parse::<Digest>() {
-        Ok(subject) => DescriptorClassification::Referrer { subject },
-        Err(_) => DescriptorClassification::Unparseable,
-    }
-}
-
-/// Dispatches the side effects of `classify_child_descriptor`: either records
-/// this descriptor as a child with the given parent, or returns the referrer
-/// subject digest so the caller can build the referrer map entry.
-fn resolve_referrer_subject(
-    parent_digest: &Digest,
-    child_descriptor: &Descriptor,
-    child_to_parents: &mut HashMap<Digest, Vec<(Digest, Option<Platform>)>>,
-) -> Option<Digest> {
-    match classify_child_descriptor(child_descriptor) {
-        DescriptorClassification::Referrer { subject } => Some(subject),
-        DescriptorClassification::IndexChild { platform } => {
-            child_to_parents
-                .entry(child_descriptor.digest.clone())
-                .or_default()
-                .push((parent_digest.clone(), platform));
-            None
+/// Partitions all child descriptors in `manifest.manifests` into parent-links
+/// and Docker-style referrer candidates. Pure — no I/O.
+fn analyze_manifest(manifest: &Manifest) -> ManifestAnalysis {
+    let mut parent_links = Vec::new();
+    let mut referrer_candidates = Vec::new();
+    for child in &manifest.manifests {
+        if let Some(referrer) = extract_docker_referrer(child) {
+            referrer_candidates.push(referrer);
+        } else {
+            parent_links.push((
+                child.digest.clone(),
+                child.platform.clone().map(Platform::from),
+            ));
         }
-        DescriptorClassification::Unparseable => None,
+    }
+    ManifestAnalysis {
+        parent_links,
+        referrer_candidates,
     }
 }
 
@@ -404,30 +408,44 @@ impl Registry {
             let Some(manifest) = self.read_manifest(digest).await else {
                 continue;
             };
+            let analysis = analyze_manifest(&manifest);
 
-            for child_descriptor in &manifest.manifests {
-                let Some(subject) =
-                    resolve_referrer_subject(digest, child_descriptor, &mut child_to_parents)
-                else {
-                    continue;
-                };
-
-                let mut annotations = child_descriptor.annotations.clone();
-                if let Some(child_manifest) = self.read_manifest(&child_descriptor.digest).await {
-                    apply_predicate_type(&child_manifest, &mut annotations);
-                }
-                docker_referrers
-                    .entry(subject)
+            for (child_digest, platform) in analysis.parent_links {
+                child_to_parents
+                    .entry(child_digest)
                     .or_default()
-                    .push(ReferrerInfo {
-                        digest: child_descriptor.digest.to_string(),
-                        artifact_type: child_descriptor.artifact_type.clone(),
-                        annotations,
-                    });
+                    .push((digest.clone(), platform));
+            }
+
+            for referrer in analysis.referrer_candidates {
+                let info = self
+                    .enrich_referrer_with_predicate(referrer.info, &referrer.child_digest)
+                    .await;
+                docker_referrers
+                    .entry(referrer.subject)
+                    .or_default()
+                    .push(info);
             }
         }
 
         (child_to_parents, docker_referrers)
+    }
+
+    /// Reads the child manifest and enriches `info` with the in-toto predicate
+    /// type annotation when the manifest carries one.
+    async fn enrich_referrer_with_predicate(
+        &self,
+        mut info: ReferrerInfo,
+        child_digest: &Digest,
+    ) -> ReferrerInfo {
+        const ANNOTATION_PREDICATE_TYPE: &str = "in-toto.io/predicate-type";
+        if let Some(child_manifest) = self.read_manifest(child_digest).await
+            && let Some(predicate) = extract_in_toto_predicate(&child_manifest)
+        {
+            info.annotations
+                .insert(ANNOTATION_PREDICATE_TYPE.to_string(), predicate);
+        }
+        info
     }
 
     async fn build_manifest_entries(
@@ -538,9 +556,8 @@ mod tests {
     use std::collections::HashMap;
 
     use super::{
-        DescriptorClassification, Platform, apply_predicate_type,
-        build_digest_to_tags_map_from_pairs, classify_child_descriptor, parents_for_digest,
-        resolve_predicate_type,
+        Platform, analyze_manifest, build_digest_to_tags_map_from_pairs, extract_docker_referrer,
+        extract_in_toto_predicate, parents_for_digest,
     };
     use crate::oci::{Descriptor, Digest, Manifest, Platform as OciPlatform};
 
@@ -586,25 +603,25 @@ mod tests {
         }
     }
 
-    // --- resolve_predicate_type ---
+    // --- extract_in_toto_predicate ---
 
     #[test]
-    fn resolve_predicate_type_returns_none_for_no_layers() {
+    fn extract_in_toto_predicate_returns_none_for_no_layers() {
         let manifest = manifest_with_layers(vec![]);
-        assert_eq!(resolve_predicate_type(&manifest), None);
+        assert_eq!(extract_in_toto_predicate(&manifest), None);
     }
 
     #[test]
-    fn resolve_predicate_type_returns_none_when_annotation_absent() {
+    fn extract_in_toto_predicate_returns_none_when_annotation_absent() {
         let manifest = manifest_with_layers(vec![HashMap::from([(
             "some.other.key".to_string(),
             "value".to_string(),
         )])]);
-        assert_eq!(resolve_predicate_type(&manifest), None);
+        assert_eq!(extract_in_toto_predicate(&manifest), None);
     }
 
     #[test]
-    fn resolve_predicate_type_returns_first_match_across_layers() {
+    fn extract_in_toto_predicate_returns_first_match_across_layers() {
         let manifest = manifest_with_layers(vec![
             HashMap::from([(
                 ANNOTATION_PREDICATE_TYPE.to_string(),
@@ -616,137 +633,169 @@ mod tests {
             )]),
         ]);
         assert_eq!(
-            resolve_predicate_type(&manifest),
+            extract_in_toto_predicate(&manifest),
             Some("https://slsa.dev/provenance/v0.2".to_string()),
         );
     }
 
     #[test]
-    fn resolve_predicate_type_returns_value_when_single_layer_has_it() {
+    fn extract_in_toto_predicate_returns_value_when_single_layer_has_it() {
         let manifest = manifest_with_layers(vec![HashMap::from([(
             ANNOTATION_PREDICATE_TYPE.to_string(),
             "https://slsa.dev/provenance/v0.2".to_string(),
         )])]);
         assert_eq!(
-            resolve_predicate_type(&manifest),
+            extract_in_toto_predicate(&manifest),
             Some("https://slsa.dev/provenance/v0.2".to_string()),
         );
     }
 
-    // --- apply_predicate_type (existing tests retained) ---
+    // --- extract_docker_referrer ---
 
     #[test]
-    fn apply_predicate_type_noop_for_zero_layers() {
-        let manifest = manifest_with_layers(vec![]);
-        let mut annotations = HashMap::new();
-        apply_predicate_type(&manifest, &mut annotations);
-        assert!(annotations.is_empty());
-    }
-
-    #[test]
-    fn apply_predicate_type_noop_when_annotation_absent() {
-        let manifest = manifest_with_layers(vec![HashMap::from([(
-            "some.other.key".to_string(),
-            "value".to_string(),
-        )])]);
-        let mut annotations = HashMap::new();
-        apply_predicate_type(&manifest, &mut annotations);
-        assert!(annotations.is_empty());
-    }
-
-    #[test]
-    fn apply_predicate_type_inserts_first_when_multiple_layers_have_it() {
-        let manifest = manifest_with_layers(vec![
-            HashMap::from([(
-                ANNOTATION_PREDICATE_TYPE.to_string(),
-                "https://slsa.dev/provenance/v0.2".to_string(),
-            )]),
-            HashMap::from([(
-                ANNOTATION_PREDICATE_TYPE.to_string(),
-                "https://slsa.dev/provenance/v1".to_string(),
-            )]),
-        ]);
-        let mut annotations = HashMap::new();
-        apply_predicate_type(&manifest, &mut annotations);
-        assert_eq!(
-            annotations.get(ANNOTATION_PREDICATE_TYPE),
-            Some(&"https://slsa.dev/provenance/v0.2".to_string())
-        );
-    }
-
-    #[test]
-    fn apply_predicate_type_inserts_when_single_layer_has_it() {
-        let manifest = manifest_with_layers(vec![HashMap::from([(
-            ANNOTATION_PREDICATE_TYPE.to_string(),
-            "https://slsa.dev/provenance/v0.2".to_string(),
-        )])]);
-        let mut annotations = HashMap::new();
-        apply_predicate_type(&manifest, &mut annotations);
-        assert_eq!(
-            annotations.get(ANNOTATION_PREDICATE_TYPE),
-            Some(&"https://slsa.dev/provenance/v0.2".to_string())
-        );
-    }
-
-    // --- classify_child_descriptor ---
-
-    #[test]
-    fn classify_child_descriptor_no_annotation_is_index_child_without_platform() {
+    fn extract_docker_referrer_returns_none_when_annotation_absent() {
         let descriptor = descriptor_with_annotations(HashMap::new());
-        assert_eq!(
-            classify_child_descriptor(&descriptor),
-            DescriptorClassification::IndexChild { platform: None },
-        );
+        assert!(extract_docker_referrer(&descriptor).is_none());
     }
 
     #[test]
-    fn classify_child_descriptor_no_annotation_with_platform_is_index_child() {
-        let mut descriptor = descriptor_with_annotations(HashMap::new());
-        descriptor.platform = Some(OciPlatform {
+    fn extract_docker_referrer_returns_none_when_annotation_not_a_valid_digest() {
+        let descriptor = descriptor_with_annotations(HashMap::from([(
+            ANNOTATION_DOCKER_REF.to_string(),
+            "not-a-valid-digest".to_string(),
+        )]));
+        assert!(extract_docker_referrer(&descriptor).is_none());
+    }
+
+    #[test]
+    fn extract_docker_referrer_returns_candidate_with_parsed_subject() {
+        let subject = digest("beef");
+        let child = digest("cafe");
+        let mut descriptor = descriptor_with_annotations(HashMap::from([(
+            ANNOTATION_DOCKER_REF.to_string(),
+            subject.to_string(),
+        )]));
+        descriptor.digest = child.clone();
+        descriptor.artifact_type =
+            Some("application/vnd.dev.cosign.artifact.sig.v1+json".to_string());
+
+        let candidate = extract_docker_referrer(&descriptor).expect("should return Some");
+        assert_eq!(candidate.subject, subject);
+        assert_eq!(candidate.child_digest, child);
+        assert_eq!(candidate.info.digest, child.to_string());
+        assert_eq!(
+            candidate.info.artifact_type.as_deref(),
+            Some("application/vnd.dev.cosign.artifact.sig.v1+json")
+        );
+        assert_eq!(
+            candidate.info.annotations.get(ANNOTATION_DOCKER_REF),
+            Some(&subject.to_string())
+        );
+    }
+
+    // --- analyze_manifest ---
+
+    #[test]
+    fn analyze_manifest_returns_empty_for_manifest_with_no_children() {
+        let manifest = Manifest::default();
+        let analysis = analyze_manifest(&manifest);
+        assert!(analysis.parent_links.is_empty());
+        assert!(analysis.referrer_candidates.is_empty());
+    }
+
+    #[test]
+    fn analyze_manifest_returns_parent_links_for_non_referrer_children() {
+        let child_digest = digest("1111");
+        let platform = OciPlatform {
             architecture: "amd64".to_string(),
             os: "linux".to_string(),
             variant: None,
             os_version: None,
             os_features: None,
             features: None,
-        });
-        let expected_platform = Platform {
-            os: "linux".to_string(),
-            architecture: "amd64".to_string(),
-            variant: None,
         };
-        assert_eq!(
-            classify_child_descriptor(&descriptor),
-            DescriptorClassification::IndexChild {
-                platform: Some(expected_platform)
-            },
-        );
+        let child = Descriptor {
+            media_type: "application/vnd.oci.image.manifest.v1+json".to_string(),
+            digest: child_digest.clone(),
+            size: 0,
+            annotations: HashMap::new(),
+            artifact_type: None,
+            platform: Some(platform),
+        };
+        let manifest = Manifest {
+            manifests: vec![child],
+            ..Manifest::default()
+        };
+
+        let analysis = analyze_manifest(&manifest);
+        assert_eq!(analysis.parent_links.len(), 1);
+        assert!(analysis.referrer_candidates.is_empty());
+        let (d, plat) = &analysis.parent_links[0];
+        assert_eq!(d, &child_digest);
+        let p = plat.as_ref().expect("platform should be present");
+        assert_eq!(p.os, "linux");
+        assert_eq!(p.architecture, "amd64");
     }
 
     #[test]
-    fn classify_child_descriptor_valid_referrer_annotation_is_referrer() {
+    fn analyze_manifest_returns_referrer_candidates_for_docker_referrer_children() {
         let subject = digest("beef");
-        let descriptor = descriptor_with_annotations(HashMap::from([(
-            ANNOTATION_DOCKER_REF.to_string(),
-            subject.to_string(),
-        )]));
-        assert_eq!(
-            classify_child_descriptor(&descriptor),
-            DescriptorClassification::Referrer {
-                subject: subject.clone()
-            },
-        );
+        let child_digest = digest("cafe");
+        let child = Descriptor {
+            media_type: "application/vnd.oci.image.manifest.v1+json".to_string(),
+            digest: child_digest.clone(),
+            size: 0,
+            annotations: HashMap::from([(ANNOTATION_DOCKER_REF.to_string(), subject.to_string())]),
+            artifact_type: None,
+            platform: None,
+        };
+        let manifest = Manifest {
+            manifests: vec![child],
+            ..Manifest::default()
+        };
+
+        let analysis = analyze_manifest(&manifest);
+        assert!(analysis.parent_links.is_empty());
+        assert_eq!(analysis.referrer_candidates.len(), 1);
+        assert_eq!(analysis.referrer_candidates[0].subject, subject);
+        assert_eq!(analysis.referrer_candidates[0].child_digest, child_digest);
     }
 
     #[test]
-    fn classify_child_descriptor_invalid_referrer_annotation_is_unparseable() {
-        let descriptor = descriptor_with_annotations(HashMap::from([(
-            ANNOTATION_DOCKER_REF.to_string(),
-            "not-a-valid-digest".to_string(),
-        )]));
+    fn analyze_manifest_partitions_mixed_children_correctly() {
+        let subject = digest("beef");
+        let referrer_digest = digest("cafe");
+        let index_child_digest = digest("1234");
+
+        let referrer_child = Descriptor {
+            media_type: "application/vnd.oci.image.manifest.v1+json".to_string(),
+            digest: referrer_digest.clone(),
+            size: 0,
+            annotations: HashMap::from([(ANNOTATION_DOCKER_REF.to_string(), subject.to_string())]),
+            artifact_type: None,
+            platform: None,
+        };
+        let index_child = Descriptor {
+            media_type: "application/vnd.oci.image.manifest.v1+json".to_string(),
+            digest: index_child_digest.clone(),
+            size: 0,
+            annotations: HashMap::new(),
+            artifact_type: None,
+            platform: None,
+        };
+        let manifest = Manifest {
+            manifests: vec![referrer_child, index_child],
+            ..Manifest::default()
+        };
+
+        let analysis = analyze_manifest(&manifest);
+        assert_eq!(analysis.parent_links.len(), 1);
+        assert_eq!(analysis.referrer_candidates.len(), 1);
+        assert_eq!(analysis.parent_links[0].0, index_child_digest);
+        assert_eq!(analysis.referrer_candidates[0].subject, subject);
         assert_eq!(
-            classify_child_descriptor(&descriptor),
-            DescriptorClassification::Unparseable,
+            analysis.referrer_candidates[0].child_digest,
+            referrer_digest
         );
     }
 
