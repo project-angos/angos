@@ -12,6 +12,11 @@ use reqwest::{
 use super::{RegistryClient, bearer_token::BearerToken, parse_header};
 use crate::registry::Error;
 
+fn authority_for_cache_key(url: &url::Url) -> Result<&str, Error> {
+    url.host_str()
+        .ok_or_else(|| Error::Internal("Response URL is missing host authority".to_string()))
+}
+
 static BEARER_PARAM_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r#"(\w+)="([^"]+)""#).unwrap());
 
@@ -63,7 +68,7 @@ impl RegistryClient {
 
             let token = format!("Bearer {}", bearer.token()?);
 
-            let authority = response.url().host_str().unwrap_or("unknown");
+            let authority = authority_for_cache_key(response.url())?;
             let cache_key = format!("auth:{authority}");
             let _ = self
                 .cache
@@ -82,5 +87,26 @@ impl RegistryClient {
                 "Unsupported authentication scheme in WWW-Authenticate header".to_string(),
             ))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn authority_for_cache_key_returns_host() {
+        let url = url::Url::parse("https://registry.example.com/v2/").unwrap();
+        assert_eq!(
+            authority_for_cache_key(&url).unwrap(),
+            "registry.example.com"
+        );
+    }
+
+    #[test]
+    fn authority_for_cache_key_errors_when_host_missing() {
+        let url = url::Url::parse("data:text/plain,hello").unwrap();
+        let err = authority_for_cache_key(&url).expect_err("expected Err for hostless URL");
+        assert!(matches!(err, Error::Internal(_)));
     }
 }
