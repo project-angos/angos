@@ -291,6 +291,86 @@ mod tests {
         }
     }
 
+    // list_catalog_entries pagination: write N namespaces then page through them
+    // using the returned continuation token, asserting every entry is visited
+    // exactly once.
+    #[tokio::test]
+    async fn list_catalog_entries_continuation_token_round_trip() {
+        use crate::registry::metadata_store::MetadataStoreExt;
+
+        // Use only the FS backend — this tests pagination logic, not backend specifics.
+        let test_case = crate::registry::test_utils::FSRegistryTestCase::new();
+        let registry = test_case.registry();
+
+        let namespaces = [
+            "alpha/image",
+            "beta/image",
+            "gamma/image",
+            "delta/image",
+            "epsilon/image",
+        ];
+
+        let blob_content = b"pagination-test-blob";
+        let digest = registry.blob_store.create(blob_content).await.unwrap();
+
+        for ns_str in &namespaces {
+            let ns = Namespace::new(*ns_str).unwrap();
+            let mut tx = registry.metadata_store.begin_transaction(&ns);
+            tx.create_link(&LinkKind::Tag("latest".to_string()), &digest)
+                .add();
+            tx.commit().await.unwrap();
+        }
+
+        // Fetch 2 at a time and collect all namespaces.
+        let mut all_collected: Vec<String> = Vec::new();
+        let mut last: Option<String> = None;
+
+        loop {
+            let (page, token) = registry.list_catalog_entries(Some(2), last).await.unwrap();
+            all_collected.extend(page);
+
+            match token {
+                None => break,
+                Some(link) => {
+                    // The link is a URL fragment; extract the `last=` parameter.
+                    last = link.split("last=").nth(1).map(ToString::to_string);
+                }
+            }
+        }
+
+        assert_eq!(
+            all_collected.len(),
+            namespaces.len(),
+            "pagination must visit every namespace exactly once"
+        );
+        for ns in &namespaces {
+            assert!(
+                all_collected.contains(&ns.to_string()),
+                "namespace '{ns}' must appear in paginated results"
+            );
+        }
+    }
+
+    // list_tag_entries for a namespace that has never been written must return
+    // an empty tag list and no continuation token.
+    #[tokio::test]
+    async fn list_tag_entries_unknown_namespace_returns_empty() {
+        let test_case = crate::registry::test_utils::FSRegistryTestCase::new();
+        let registry = test_case.registry();
+        let unknown = Namespace::new("no-such-repo/no-such-image").unwrap();
+
+        let (tags, token) = registry
+            .list_tag_entries(&unknown, None, None)
+            .await
+            .unwrap();
+
+        assert!(tags.is_empty(), "unknown namespace must have no tags");
+        assert!(
+            token.is_none(),
+            "unknown namespace must have no continuation token"
+        );
+    }
+
     #[tokio::test]
     async fn test_list_referrers_with_manifest() {
         for test_case in backends() {

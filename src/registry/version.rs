@@ -18,3 +18,30 @@ impl Default for ApiVersionResponse {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_contains_expected_header_values() {
+        let response = ApiVersionResponse::default();
+        assert_eq!(
+            response
+                .headers
+                .get(DOCKER_DISTRIBUTION_API_VERSION)
+                .map(String::as_str),
+            Some("registry/2.0"),
+        );
+        assert_eq!(
+            response.headers.get(X_POWERED_BY).map(String::as_str),
+            Some("Angos"),
+        );
+    }
+
+    #[test]
+    fn default_contains_exactly_two_headers() {
+        let response = ApiVersionResponse::default();
+        assert_eq!(response.headers.len(), 2);
+    }
+}

@@ -168,4 +168,73 @@ mod tests {
             Some(vec!["feature1".to_string(), "feature2".to_string()])
         );
     }
+
+    #[test]
+    fn platform_os_version_dot_rename_populates_field() {
+        // The serde rename is "os.version" (with a dot), not snake_case.
+        // Verify a JSON payload carrying the correct dotted key sets os_version.
+        let json = r#"{
+            "architecture": "amd64",
+            "os": "windows",
+            "os.version": "10.0.19041"
+        }"#;
+
+        let platform: Platform = serde_json::from_str(json).unwrap();
+        assert_eq!(platform.os_version, Some("10.0.19041".to_string()));
+    }
+
+    #[test]
+    fn platform_os_version_snake_case_does_not_populate_field() {
+        // "os_version" (snake_case) is not the serde rename; the field must remain None.
+        let json = r#"{
+            "architecture": "amd64",
+            "os": "linux",
+            "os_version": "22.04"
+        }"#;
+
+        let platform: Platform = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            platform.os_version, None,
+            "snake_case 'os_version' must not populate the 'os.version' serde field"
+        );
+    }
+
+    #[test]
+    fn descriptor_with_platform_os_version_round_trips() {
+        use std::str::FromStr;
+
+        let digest = Digest::from_str(
+            "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        )
+        .unwrap();
+
+        let descriptor = Descriptor {
+            media_type: "application/vnd.oci.image.manifest.v1+json".to_string(),
+            digest,
+            size: 100,
+            annotations: std::collections::HashMap::new(),
+            artifact_type: None,
+            platform: Some(Platform {
+                architecture: "amd64".to_string(),
+                os: "linux".to_string(),
+                variant: None,
+                os_version: Some("22.04".to_string()),
+                os_features: None,
+                features: None,
+            }),
+        };
+
+        let json = serde_json::to_string(&descriptor).unwrap();
+        // Serialized JSON must use the dot-notation key, not snake_case.
+        assert!(
+            json.contains(r#""os.version":"22.04""#),
+            "serialized JSON must contain 'os.version' key, got: {json}"
+        );
+        // Deserializing back must recover the original value.
+        let round_tripped: Descriptor = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            round_tripped.platform.unwrap().os_version,
+            Some("22.04".to_string())
+        );
+    }
 }

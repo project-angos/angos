@@ -52,4 +52,20 @@ mod tests {
         let retrieved = backend.retrieve_value("k").await.unwrap();
         assert_eq!(retrieved.as_deref(), Some("v"));
     }
+
+    // Verify that Config::Redis selects the Redis variant without actually
+    // connecting (construction is lazy — no network call at `to_backend()`).
+    #[test]
+    fn redis_config_to_backend_constructs_without_connecting() {
+        let result = Config::Redis(BackendConfig {
+            url: "redis://localhost:6379/0".to_string(),
+            key_prefix: "test:".to_string(),
+        })
+        .to_backend();
+        // `to_backend()` only opens the redis::Client; it does not connect.
+        assert!(
+            result.is_ok(),
+            "Redis backend construction must succeed without a live server, got: {result:?}"
+        );
+    }
 }

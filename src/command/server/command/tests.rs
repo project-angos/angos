@@ -3,6 +3,8 @@ use std::{
     sync::{Arc, Mutex, Once},
 };
 
+use tempfile::TempDir;
+
 use super::{Command, ServerContext, ServiceListener, setup};
 use crate::{
     cache,
@@ -26,13 +28,18 @@ fn init_crypto_provider() {
     });
 }
 
-fn create_minimal_config() -> Configuration {
-    let toml = r#"
+// Each call allocates a fresh temporary directory pair; the returned `TempDir`
+// values must be kept alive for the duration of the test that uses the config.
+fn create_minimal_config() -> (Configuration, TempDir, TempDir) {
+    let blobs = TempDir::new().unwrap();
+    let meta = TempDir::new().unwrap();
+    let toml = format!(
+        r#"
         [blob_store.fs]
-        root_dir = "/tmp/test-blobs"
+        root_dir = "{blobs}"
 
         [metadata_store.fs]
-        root_dir = "/tmp/test-metadata"
+        root_dir = "{meta}"
 
         [cache.memory]
 
@@ -43,18 +50,23 @@ fn create_minimal_config() -> Configuration {
         [global]
         update_pull_time = false
         max_concurrent_cache_jobs = 10
-    "#;
-
-    Configuration::load_from_str(toml).unwrap()
+    "#,
+        blobs = blobs.path().display(),
+        meta = meta.path().display(),
+    );
+    (Configuration::load_from_str(&toml).unwrap(), blobs, meta)
 }
 
-fn create_config_with_repository() -> Configuration {
-    let toml = r#"
+fn create_config_with_repository() -> (Configuration, TempDir, TempDir) {
+    let blobs = TempDir::new().unwrap();
+    let meta = TempDir::new().unwrap();
+    let toml = format!(
+        r#"
         [blob_store.fs]
-        root_dir = "/tmp/test-blobs"
+        root_dir = "{blobs}"
 
         [metadata_store.fs]
-        root_dir = "/tmp/test-metadata"
+        root_dir = "{meta}"
 
         [cache.memory]
 
@@ -69,14 +81,16 @@ fn create_config_with_repository() -> Configuration {
         [repository.test-repo.access_policy]
         default = "allow"
         rules = []
-    "#;
-
-    Configuration::load_from_str(toml).unwrap()
+    "#,
+        blobs = blobs.path().display(),
+        meta = meta.path().display(),
+    );
+    (Configuration::load_from_str(&toml).unwrap(), blobs, meta)
 }
 
 #[test]
 fn test_build_blob_store_filesystem_success() {
-    let config = create_minimal_config();
+    let (config, _blobs, _meta) = create_minimal_config();
     let auth_cache = bootstrap::auth_cache(&config.cache).unwrap();
     let result = bootstrap::blob_stores(&config.blob_store, &auth_cache);
 
@@ -85,7 +99,7 @@ fn test_build_blob_store_filesystem_success() {
 
 #[tokio::test]
 async fn test_build_metadata_store_filesystem_success() {
-    let config = create_minimal_config();
+    let (config, _blobs, _meta) = create_minimal_config();
     let auth_cache = bootstrap::auth_cache(&config.cache).unwrap();
     let result =
         setup::build_metadata_store(&config, &auth_cache, &Arc::new(Mutex::new(None))).await;
@@ -95,12 +109,15 @@ async fn test_build_metadata_store_filesystem_success() {
 
 #[tokio::test]
 async fn test_build_metadata_store_with_explicit_config() {
-    let toml = r#"
+    let blobs = TempDir::new().unwrap();
+    let meta = TempDir::new().unwrap();
+    let toml = format!(
+        r#"
         [blob_store.fs]
-        root_dir = "/tmp/test-blobs"
+        root_dir = "{blobs}"
 
         [metadata_store.fs]
-        root_dir = "/tmp/test-metadata-explicit"
+        root_dir = "{meta}"
 
         [cache.memory]
 
@@ -111,9 +128,12 @@ async fn test_build_metadata_store_with_explicit_config() {
         [global]
         update_pull_time = false
         max_concurrent_cache_jobs = 10
-    "#;
+    "#,
+        blobs = blobs.path().display(),
+        meta = meta.path().display(),
+    );
 
-    let config = Configuration::load_from_str(toml).unwrap();
+    let config = Configuration::load_from_str(&toml).unwrap();
     let auth_cache = bootstrap::auth_cache(&config.cache).unwrap();
     let result =
         setup::build_metadata_store(&config, &auth_cache, &Arc::new(Mutex::new(None))).await;
@@ -261,7 +281,7 @@ fn test_build_repositories_multiple() {
 
 #[tokio::test]
 async fn test_build_registry_minimal_config() {
-    let config = create_minimal_config();
+    let (config, _blobs, _meta) = create_minimal_config();
     let result = setup::build_registry(&config, &Arc::new(Mutex::new(None))).await;
 
     assert!(result.is_ok());
@@ -269,7 +289,7 @@ async fn test_build_registry_minimal_config() {
 
 #[tokio::test]
 async fn test_build_registry_with_repositories() {
-    let config = create_config_with_repository();
+    let (config, _blobs, _meta) = create_config_with_repository();
     let result = setup::build_registry(&config, &Arc::new(Mutex::new(None))).await;
 
     assert!(result.is_ok());
@@ -277,12 +297,15 @@ async fn test_build_registry_with_repositories() {
 
 #[tokio::test]
 async fn test_build_registry_with_update_pull_time() {
-    let toml = r#"
+    let blobs = TempDir::new().unwrap();
+    let meta = TempDir::new().unwrap();
+    let toml = format!(
+        r#"
         [blob_store.fs]
-        root_dir = "/tmp/test-blobs"
+        root_dir = "{blobs}"
 
         [metadata_store.fs]
-        root_dir = "/tmp/test-metadata"
+        root_dir = "{meta}"
 
         [cache.memory]
 
@@ -293,9 +316,12 @@ async fn test_build_registry_with_update_pull_time() {
         [global]
         update_pull_time = true
         max_concurrent_cache_jobs = 20
-    "#;
+    "#,
+        blobs = blobs.path().display(),
+        meta = meta.path().display(),
+    );
 
-    let config = Configuration::load_from_str(toml).unwrap();
+    let config = Configuration::load_from_str(&toml).unwrap();
     let result = setup::build_registry(&config, &Arc::new(Mutex::new(None))).await;
 
     assert!(result.is_ok());
@@ -303,7 +329,7 @@ async fn test_build_registry_with_update_pull_time() {
 
 #[tokio::test]
 async fn test_command_new_insecure_listener() {
-    let config = create_minimal_config();
+    let (config, _blobs, _meta) = create_minimal_config();
     let result = Command::new(&config).await;
 
     assert!(result.is_ok());
@@ -317,7 +343,7 @@ async fn test_command_new_insecure_listener() {
 
 #[tokio::test]
 async fn test_command_new_with_repositories() {
-    let config = create_config_with_repository();
+    let (config, _blobs, _meta) = create_config_with_repository();
     let result = Command::new(&config).await;
 
     assert!(result.is_ok());
@@ -325,10 +351,10 @@ async fn test_command_new_with_repositories() {
 
 #[tokio::test]
 async fn test_command_notify_config_change_insecure() {
-    let config = create_minimal_config();
+    let (config, _blobs, _meta) = create_minimal_config();
     let command = Command::new(&config).await.unwrap();
 
-    let new_config = create_minimal_config();
+    let (new_config, _new_blobs, _new_meta) = create_minimal_config();
     let result = command.notify_config_change(&new_config).await;
 
     assert!(result.is_ok());
@@ -336,7 +362,7 @@ async fn test_command_notify_config_change_insecure() {
 
 #[tokio::test]
 async fn test_command_notify_tls_config_change_with_insecure_listener() {
-    let config = create_minimal_config();
+    let (config, _blobs, _meta) = create_minimal_config();
     let command = Command::new(&config).await.unwrap();
 
     let (tls_config, _temp_files) = build_config(false);
@@ -347,7 +373,7 @@ async fn test_command_notify_tls_config_change_with_insecure_listener() {
 
 #[tokio::test]
 async fn test_service_listener_enum_variants() {
-    let config = create_minimal_config();
+    let (config, _blobs, _meta) = create_minimal_config();
     let ServerConfig::Insecure(insecure_config) = &config.server else {
         panic!("Expected insecure config")
     };
@@ -387,7 +413,7 @@ fn test_build_repositories_preserves_names() {
 
 #[tokio::test]
 async fn test_build_registry_components_integration() {
-    let config = create_config_with_repository();
+    let (config, _blobs, _meta) = create_config_with_repository();
 
     let auth_cache = bootstrap::auth_cache(&config.cache).unwrap();
     let blob_handles = bootstrap::blob_stores(&config.blob_store, &auth_cache).unwrap();
@@ -419,7 +445,7 @@ async fn test_build_registry_components_integration() {
 
 #[tokio::test]
 async fn test_command_new_validates_configuration() {
-    let config = create_minimal_config();
+    let (config, _blobs, _meta) = create_minimal_config();
     let result = Command::new(&config).await;
 
     assert!(result.is_ok());
@@ -455,14 +481,16 @@ fn test_build_repositories_with_different_configs() {
     assert_eq!(repos.len(), 2);
 }
 
-fn create_config_with_webhook(url: &str) -> Configuration {
+fn create_config_with_webhook(url: &str) -> (Configuration, TempDir, TempDir) {
+    let blobs = TempDir::new().unwrap();
+    let meta = TempDir::new().unwrap();
     let toml = format!(
         r#"
         [blob_store.fs]
-        root_dir = "/tmp/test-blobs"
+        root_dir = "{blobs}"
 
         [metadata_store.fs]
-        root_dir = "/tmp/test-metadata"
+        root_dir = "{meta}"
 
         [cache.memory]
 
@@ -479,20 +507,23 @@ fn create_config_with_webhook(url: &str) -> Configuration {
         url = "{url}"
         policy = "optional"
         events = ["manifest.push"]
-    "#
+    "#,
+        blobs = blobs.path().display(),
+        meta = meta.path().display(),
     );
-
-    Configuration::load_from_str(&toml).unwrap()
+    (Configuration::load_from_str(&toml).unwrap(), blobs, meta)
 }
 
-fn create_config_with_two_webhooks(url_a: &str, url_b: &str) -> Configuration {
+fn create_config_with_two_webhooks(url_a: &str, url_b: &str) -> (Configuration, TempDir, TempDir) {
+    let blobs = TempDir::new().unwrap();
+    let meta = TempDir::new().unwrap();
     let toml = format!(
         r#"
         [blob_store.fs]
-        root_dir = "/tmp/test-blobs"
+        root_dir = "{blobs}"
 
         [metadata_store.fs]
-        root_dir = "/tmp/test-metadata"
+        root_dir = "{meta}"
 
         [cache.memory]
 
@@ -514,10 +545,11 @@ fn create_config_with_two_webhooks(url_a: &str, url_b: &str) -> Configuration {
         url = "{url_b}"
         policy = "optional"
         events = ["manifest.push"]
-    "#
+    "#,
+        blobs = blobs.path().display(),
+        meta = meta.path().display(),
     );
-
-    Configuration::load_from_str(&toml).unwrap()
+    (Configuration::load_from_str(&toml).unwrap(), blobs, meta)
 }
 
 fn create_test_event() -> crate::event_webhook::event::Event {
@@ -541,7 +573,7 @@ fn create_test_event() -> crate::event_webhook::event::Event {
 
 #[tokio::test]
 async fn test_hot_reload_adds_webhook_via_command() {
-    let config = create_minimal_config();
+    let (config, _blobs, _meta) = create_minimal_config();
     let command = Command::new(&config).await.unwrap();
 
     assert!(
@@ -553,7 +585,8 @@ async fn test_hot_reload_adds_webhook_via_command() {
             .is_none()
     );
 
-    let new_config = create_config_with_webhook("https://example.com/webhook");
+    let (new_config, _new_blobs, _new_meta) =
+        create_config_with_webhook("https://example.com/webhook");
     command.notify_config_change(&new_config).await.unwrap();
 
     assert!(
@@ -568,7 +601,7 @@ async fn test_hot_reload_adds_webhook_via_command() {
 
 #[tokio::test]
 async fn test_hot_reload_removes_webhook_via_command() {
-    let config = create_config_with_webhook("https://example.com/webhook");
+    let (config, _blobs, _meta) = create_config_with_webhook("https://example.com/webhook");
     let command = Command::new(&config).await.unwrap();
 
     assert!(
@@ -580,7 +613,7 @@ async fn test_hot_reload_removes_webhook_via_command() {
             .is_some()
     );
 
-    let new_config = create_minimal_config();
+    let (new_config, _new_blobs, _new_meta) = create_minimal_config();
     command.notify_config_change(&new_config).await.unwrap();
 
     assert!(
@@ -617,10 +650,12 @@ async fn test_hot_reload_changes_webhook_url_via_command() {
         .mount(&server_b)
         .await;
 
-    let config_a = create_config_with_webhook(&format!("{}/webhook", server_a.uri()));
+    let (config_a, _blobs_a, _meta_a) =
+        create_config_with_webhook(&format!("{}/webhook", server_a.uri()));
     let command = Command::new(&config_a).await.unwrap();
 
-    let config_b = create_config_with_webhook(&format!("{}/webhook", server_b.uri()));
+    let (config_b, _blobs_b, _meta_b) =
+        create_config_with_webhook(&format!("{}/webhook", server_b.uri()));
     command.notify_config_change(&config_b).await.unwrap();
 
     let context = command.as_insecure().unwrap().current_context();
@@ -646,10 +681,11 @@ async fn test_hot_reload_adds_second_webhook() {
         .mount(&server_b)
         .await;
 
-    let config_one = create_config_with_webhook(&server_a.uri());
+    let (config_one, _blobs_one, _meta_one) = create_config_with_webhook(&server_a.uri());
     let command = Command::new(&config_one).await.unwrap();
 
-    let config_two = create_config_with_two_webhooks(&server_a.uri(), &server_b.uri());
+    let (config_two, _blobs_two, _meta_two) =
+        create_config_with_two_webhooks(&server_a.uri(), &server_b.uri());
     command.notify_config_change(&config_two).await.unwrap();
 
     let context = command.as_insecure().unwrap().current_context();
@@ -675,10 +711,11 @@ async fn test_hot_reload_removes_one_of_two_webhooks() {
         .mount(&server_b)
         .await;
 
-    let config_two = create_config_with_two_webhooks(&server_a.uri(), &server_b.uri());
+    let (config_two, _blobs_two, _meta_two) =
+        create_config_with_two_webhooks(&server_a.uri(), &server_b.uri());
     let command = Command::new(&config_two).await.unwrap();
 
-    let config_one = create_config_with_webhook(&server_a.uri());
+    let (config_one, _blobs_one, _meta_one) = create_config_with_webhook(&server_a.uri());
     command.notify_config_change(&config_one).await.unwrap();
 
     let context = command.as_insecure().unwrap().current_context();
@@ -704,12 +741,12 @@ async fn test_hot_reload_inflight_old_dispatcher_still_works() {
         .mount(&server_new)
         .await;
 
-    let config_old = create_config_with_webhook(&server_old.uri());
+    let (config_old, _blobs_old, _meta_old) = create_config_with_webhook(&server_old.uri());
     let command = Command::new(&config_old).await.unwrap();
 
     let old_context = Arc::clone(&command.as_insecure().unwrap().current_context());
 
-    let config_new = create_config_with_webhook(&server_new.uri());
+    let (config_new, _blobs_new, _meta_new) = create_config_with_webhook(&server_new.uri());
     command.notify_config_change(&config_new).await.unwrap();
 
     old_context
@@ -728,7 +765,7 @@ async fn test_hot_reload_inflight_old_dispatcher_still_works() {
 async fn test_command_shutdown_with_no_dispatcher() {
     use std::time::Duration;
 
-    let config = create_minimal_config();
+    let (config, _blobs, _meta) = create_minimal_config();
     let command = Command::new(&config).await.unwrap();
 
     command.shutdown_with_timeout(Duration::from_secs(10)).await;
@@ -748,7 +785,7 @@ async fn test_command_shutdown_drains_in_flight_async_delivery() {
         .mount(&server)
         .await;
 
-    let config = create_config_with_webhook(&server.uri());
+    let (config, _blobs, _meta) = create_config_with_webhook(&server.uri());
     let command = Command::new(&config).await.unwrap();
 
     let context = command.as_insecure().unwrap().current_context();
@@ -767,21 +804,25 @@ async fn test_command_shutdown_drains_in_flight_async_delivery() {
 
 fn create_tls_config() -> (
     Configuration,
+    TempDir,
+    TempDir,
     (
         tempfile::NamedTempFile,
         tempfile::NamedTempFile,
         tempfile::NamedTempFile,
     ),
 ) {
+    let blobs = TempDir::new().unwrap();
+    let meta = TempDir::new().unwrap();
     let (tls_config, temp_files) = build_config(false);
 
     let toml = format!(
         r#"
         [blob_store.fs]
-        root_dir = "/tmp/test-blobs"
+        root_dir = "{blobs}"
 
         [metadata_store.fs]
-        root_dir = "/tmp/test-metadata"
+        root_dir = "{meta}"
 
         [cache.memory]
 
@@ -797,21 +838,28 @@ fn create_tls_config() -> (
         update_pull_time = false
         max_concurrent_cache_jobs = 10
     "#,
+        blobs = blobs.path().display(),
+        meta = meta.path().display(),
         cert = tls_config.server_certificate_bundle.display(),
         key = tls_config.server_private_key.display(),
     );
 
-    (Configuration::load_from_str(&toml).unwrap(), temp_files)
+    (
+        Configuration::load_from_str(&toml).unwrap(),
+        blobs,
+        meta,
+        temp_files,
+    )
 }
 
 #[tokio::test]
 async fn test_notify_config_change_insecure_to_tls_does_not_fail() {
     init_crypto_provider();
 
-    let insecure_config = create_minimal_config();
+    let (insecure_config, _blobs, _meta) = create_minimal_config();
     let command = Command::new(&insecure_config).await.unwrap();
 
-    let (tls_config, _temp_files) = create_tls_config();
+    let (tls_config, _tls_blobs, _tls_meta, _temp_files) = create_tls_config();
     let result = command.notify_config_change(&tls_config).await;
 
     assert!(result.is_ok());
@@ -821,10 +869,10 @@ async fn test_notify_config_change_insecure_to_tls_does_not_fail() {
 async fn test_notify_config_change_tls_to_insecure_does_not_fail() {
     init_crypto_provider();
 
-    let (tls_config, _temp_files) = create_tls_config();
+    let (tls_config, _tls_blobs, _tls_meta, _temp_files) = create_tls_config();
     let command = Command::new(&tls_config).await.unwrap();
 
-    let insecure_config = create_minimal_config();
+    let (insecure_config, _blobs, _meta) = create_minimal_config();
     let result = command.notify_config_change(&insecure_config).await;
 
     assert!(result.is_ok());

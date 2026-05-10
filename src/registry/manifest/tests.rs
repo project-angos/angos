@@ -379,6 +379,93 @@ async fn test_malformed_json_yields_same_error_shape() {
     }
 }
 
+#[test]
+fn parse_manifest_digests_media_type_mismatch_returns_manifest_invalid() {
+    let (content, _) = create_test_manifest();
+    let wrong_type = "application/vnd.oci.image.manifest.v1+json".to_string();
+
+    let err = parse_manifest_digests(&content, Some(&wrong_type))
+        .err()
+        .expect("expected error on media type mismatch");
+    assert!(
+        matches!(err, crate::registry::Error::ManifestInvalid(_)),
+        "expected ManifestInvalid for media type mismatch, got: {err:?}"
+    );
+}
+
+#[test]
+fn parse_manifest_digests_empty_layers_succeeds_with_empty_vec() {
+    let body = serde_json::to_vec(&serde_json::json!({
+        "schemaVersion": 2,
+        "mediaType": "application/vnd.docker.distribution.manifest.v2+json",
+        "config": {
+            "mediaType": "application/vnd.docker.container.image.v1+json",
+            "digest": "sha256:1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
+            "size": 100
+        },
+        "layers": []
+    }))
+    .unwrap();
+
+    let digests =
+        parse_manifest_digests(&body, None).expect("empty layers must parse successfully");
+    assert!(digests.layers.is_empty(), "layers must be empty");
+    assert!(digests.config.is_some(), "config must be present");
+}
+
+#[test]
+fn parse_manifest_digests_only_subject_succeeds() {
+    // A manifest carrying only a subject (no config/layers) must parse successfully.
+    let body = serde_json::to_vec(&serde_json::json!({
+        "schemaVersion": 2,
+        "subject": {
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "digest": "sha256:9876543210fedcba9876543210fedcba9876543210fedcba9876543210fedcba",
+            "size": 512
+        }
+    }))
+    .unwrap();
+
+    let digests = parse_manifest_digests(&body, None).expect("subject-only manifest must parse");
+    assert!(digests.subject.is_some(), "subject must be populated");
+    assert!(digests.config.is_none());
+    assert!(digests.layers.is_empty());
+    assert!(digests.manifests.is_empty());
+}
+
+#[test]
+fn parse_manifest_digests_index_manifest_populates_manifests_vec() {
+    // An OCI image index carries a `manifests` array, no `layers`.
+    let body = serde_json::to_vec(&serde_json::json!({
+        "schemaVersion": 2,
+        "mediaType": "application/vnd.oci.image.index.v1+json",
+        "manifests": [
+            {
+                "mediaType": "application/vnd.oci.image.manifest.v1+json",
+                "digest": "sha256:aaaa0000bbbb1111cccc2222dddd3333eeee4444ffff555500001111aaaabbbb",
+                "size": 100,
+                "platform": { "architecture": "amd64", "os": "linux" }
+            },
+            {
+                "mediaType": "application/vnd.oci.image.manifest.v1+json",
+                "digest": "sha256:bbbb1111cccc2222dddd3333eeee4444ffff555500001111aaaabbbbccccdddd",
+                "size": 200,
+                "platform": { "architecture": "arm64", "os": "linux" }
+            }
+        ]
+    }))
+    .unwrap();
+
+    let digests = parse_manifest_digests(&body, None).expect("index manifest must parse");
+    assert_eq!(
+        digests.manifests.len(),
+        2,
+        "both child manifests must be collected"
+    );
+    assert!(digests.layers.is_empty());
+    assert!(digests.config.is_none());
+}
+
 #[tokio::test]
 async fn test_handle_head_manifest() {
     for test_case in backends() {
