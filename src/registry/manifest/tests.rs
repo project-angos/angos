@@ -337,6 +337,49 @@ fn test_parse_manifest_digests() {
 }
 
 #[tokio::test]
+async fn test_malformed_json_yields_same_error_shape() {
+    let malformed = b"not json";
+
+    let parse_err = parse_manifest_digests(malformed, None)
+        .err()
+        .expect("expected Err from parse_manifest_digests");
+    match parse_err {
+        crate::registry::Error::ManifestInvalid(s) => {
+            assert!(
+                s.starts_with("invalid manifest JSON:"),
+                "parse_manifest_digests error should start with 'invalid manifest JSON:'; got: {s}"
+            );
+        }
+        other => panic!("expected ManifestInvalid from parse_manifest_digests, got {other:?}"),
+    }
+
+    // Parse failure is detected before any blob/metadata store access, so a
+    // single backend exercises the full path.
+    let test_case = FSRegistryTestCase::new();
+    let registry = test_case.registry();
+    let namespace = &Namespace::new("test-repo").unwrap();
+    let put_err = registry
+        .put_manifest(
+            namespace,
+            &Reference::Tag("latest".to_string()),
+            None,
+            malformed,
+        )
+        .await
+        .err()
+        .expect("expected Err from put_manifest");
+    match put_err {
+        crate::registry::Error::ManifestInvalid(s) => {
+            assert!(
+                s.starts_with("invalid manifest JSON:"),
+                "put_manifest error should start with 'invalid manifest JSON:'; got: {s}"
+            );
+        }
+        other => panic!("expected ManifestInvalid from put_manifest, got {other:?}"),
+    }
+}
+
+#[tokio::test]
 async fn test_handle_head_manifest() {
     for test_case in backends() {
         let registry = test_case.registry();

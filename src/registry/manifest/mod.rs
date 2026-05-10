@@ -145,16 +145,27 @@ fn validate_media_type_match(
     Ok(())
 }
 
-pub fn parse_manifest_digests(
+/// Deserialize a manifest body and verify its declared media type matches the
+/// optional `content_type` hint. Centralises the JSON-to-`Manifest` conversion
+/// so both `parse_manifest_digests` (digest projection) and `put_manifest`
+/// (full-manifest writer) share one error payload.
+fn parse_and_validate_manifest(
     body: &[u8],
     content_type: Option<&String>,
-) -> Result<ParsedManifestDigests, Error> {
+) -> Result<Manifest, Error> {
     let manifest: Manifest = serde_json::from_slice(body).map_err(|e| {
         warn!("Failed to deserialize manifest: {e}");
         Error::ManifestInvalid(format!("invalid manifest JSON: {e}"))
     })?;
-
     validate_media_type_match(&manifest, content_type)?;
+    Ok(manifest)
+}
+
+pub fn parse_manifest_digests(
+    body: &[u8],
+    content_type: Option<&String>,
+) -> Result<ParsedManifestDigests, Error> {
+    let manifest = parse_and_validate_manifest(body, content_type)?;
 
     let subject = manifest.subject.map(|subject| subject.digest);
 
@@ -364,12 +375,7 @@ impl Registry {
         content_type: Option<&String>,
         body: &[u8],
     ) -> Result<PutManifestResponse, Error> {
-        let manifest: Manifest = serde_json::from_slice(body).map_err(|e| {
-            warn!("Failed to deserialize manifest: {e}");
-            Error::ManifestInvalid(format!("invalid manifest JSON: {e}"))
-        })?;
-
-        validate_media_type_match(&manifest, content_type)?;
+        let manifest = parse_and_validate_manifest(body, content_type)?;
 
         let digest = self.blob_store.create(body).await?;
 
