@@ -31,6 +31,17 @@ impl Default for ReferrerList {
     }
 }
 
+#[derive(Serialize)]
+struct CatalogBody {
+    repositories: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct TagsBody<'a> {
+    name: &'a str,
+    tags: Vec<String>,
+}
+
 fn referrers_headers(artifact_type_filtered: bool) -> HashMap<&'static str, String> {
     let mut headers = HashMap::from([(CONTENT_TYPE.as_str(), OCI_INDEX_MEDIA_TYPE.to_string())]);
     if artifact_type_filtered {
@@ -116,11 +127,6 @@ impl Registry {
         n: Option<u16>,
         last: Option<String>,
     ) -> Result<JsonResponse, Error> {
-        #[derive(Serialize)]
-        struct CatalogBody {
-            repositories: Vec<String>,
-        }
-
         let (repositories, link) = self.list_catalog_entries(n, last).await?;
 
         Ok(JsonResponse {
@@ -136,12 +142,6 @@ impl Registry {
         n: Option<u16>,
         last: Option<String>,
     ) -> Result<JsonResponse, Error> {
-        #[derive(Serialize)]
-        struct TagsBody<'a> {
-            name: &'a str,
-            tags: Vec<String>,
-        }
-
         let (tags, link) = self.list_tag_entries(namespace, n, last).await?;
 
         Ok(JsonResponse {
