@@ -3,7 +3,7 @@ use std::{collections::HashMap, io::Cursor, slice};
 use hyper::header::{CONTENT_LENGTH, CONTENT_TYPE, LOCATION};
 use serde_json::json;
 
-use super::*;
+use super::{parse::manifest_meta_from_body, *};
 use crate::{
     oci::Namespace,
     registry::test_utils::{FSRegistryTestCase, backends},
