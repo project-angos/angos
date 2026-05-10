@@ -229,9 +229,9 @@ fn build_digest_to_tags_map_from_pairs(
 
 /// Returns the `ParentRef` list for `digest` using the pre-built parent and
 /// tag maps. Produces an empty `Vec` when `digest` has no recorded parents.
-fn parents_for_digest(
-    child_to_parents: &HashMap<Digest, Vec<(Digest, Option<Platform>)>>,
+fn parent_refs_for(
     digest: &Digest,
+    child_to_parents: &HashMap<Digest, Vec<(Digest, Option<Platform>)>>,
     digest_to_tags: &HashMap<Digest, Vec<String>>,
 ) -> Vec<ParentRef> {
     child_to_parents
@@ -460,7 +460,7 @@ impl Registry {
 
         for digest in all_revisions {
             let tags = digest_to_tags.get(&digest).cloned().unwrap_or_default();
-            let parents = parents_for_digest(&child_to_parents, &digest, digest_to_tags);
+            let parents = parent_refs_for(&digest, &child_to_parents, digest_to_tags);
 
             let mut referrers: Vec<ReferrerInfo> =
                 docker_referrers.remove(&digest).unwrap_or_default();
@@ -557,7 +557,7 @@ mod tests {
 
     use super::{
         Platform, analyze_manifest, build_digest_to_tags_map_from_pairs, extract_docker_referrer,
-        extract_in_toto_predicate, parents_for_digest,
+        extract_in_toto_predicate, parent_refs_for,
     };
     use crate::oci::{Descriptor, Digest, Manifest, Platform as OciPlatform};
 
@@ -843,24 +843,24 @@ mod tests {
         assert_eq!(result[&d2], vec!["beta".to_string()]);
     }
 
-    // --- parents_for_digest ---
+    // --- parent_refs_for ---
 
     #[test]
-    fn parents_for_digest_returns_empty_when_digest_not_in_parent_map() {
+    fn parent_refs_for_returns_empty_when_digest_not_in_parent_map() {
         let child_to_parents: HashMap<Digest, Vec<(Digest, Option<Platform>)>> = HashMap::new();
         let digest_to_tags: HashMap<Digest, Vec<String>> = HashMap::new();
-        let result = parents_for_digest(&child_to_parents, &digest("cccc"), &digest_to_tags);
+        let result = parent_refs_for(&digest("cccc"), &child_to_parents, &digest_to_tags);
         assert!(result.is_empty());
     }
 
     #[test]
-    fn parents_for_digest_single_parent_no_tags_no_platform() {
+    fn parent_refs_for_single_parent_no_tags_no_platform() {
         let child = digest("cccc");
         let parent = digest("dddd");
         let child_to_parents = HashMap::from([(child.clone(), vec![(parent.clone(), None)])]);
         let digest_to_tags: HashMap<Digest, Vec<String>> = HashMap::new();
 
-        let result = parents_for_digest(&child_to_parents, &child, &digest_to_tags);
+        let result = parent_refs_for(&child, &child_to_parents, &digest_to_tags);
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].digest, parent.to_string());
         assert!(result[0].tags.is_empty());
@@ -868,19 +868,19 @@ mod tests {
     }
 
     #[test]
-    fn parents_for_digest_single_parent_with_tags() {
+    fn parent_refs_for_single_parent_with_tags() {
         let child = digest("eeee");
         let parent = digest("ffff");
         let child_to_parents = HashMap::from([(child.clone(), vec![(parent.clone(), None)])]);
         let digest_to_tags = HashMap::from([(parent.clone(), vec!["v2".to_string()])]);
 
-        let result = parents_for_digest(&child_to_parents, &child, &digest_to_tags);
+        let result = parent_refs_for(&child, &child_to_parents, &digest_to_tags);
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].tags, vec!["v2".to_string()]);
     }
 
     #[test]
-    fn parents_for_digest_multiple_parents_emitted_in_order() {
+    fn parent_refs_for_multiple_parents_emitted_in_order() {
         let child = digest("1234");
         let parent_a = digest("aaaa");
         let parent_b = digest("bbbb");
@@ -898,7 +898,7 @@ mod tests {
         )]);
         let digest_to_tags: HashMap<Digest, Vec<String>> = HashMap::new();
 
-        let result = parents_for_digest(&child_to_parents, &child, &digest_to_tags);
+        let result = parent_refs_for(&child, &child_to_parents, &digest_to_tags);
         assert_eq!(result.len(), 2);
 
         let ref_a = result
