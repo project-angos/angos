@@ -206,6 +206,14 @@ impl<'tx, 'store: 'tx> CreateLinkBuilder<'tx, 'store> {
         self
     }
 
+    /// Associates a media type with this link when `media_type` is `Some`.
+    pub fn with_optional_media_type(self, media_type: Option<&str>) -> Self {
+        match media_type {
+            Some(mt) => self.with_media_type(mt),
+            None => self,
+        }
+    }
+
     /// Associates an OCI descriptor with this link.
     pub fn with_descriptor(mut self, descriptor: Descriptor) -> Self {
         self.descriptor = Some(descriptor);
