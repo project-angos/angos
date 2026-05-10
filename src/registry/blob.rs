@@ -90,7 +90,7 @@ impl Registry {
             Err(metadata_store::Error::ReferenceNotFound) => Ok(()),
             Err(e) => {
                 warn!("Failed to read blob index for {digest}: {e}");
-                Err(Error::Internal(format!("storage error: {e}")))
+                Err(e.into())
             }
         }
     }
