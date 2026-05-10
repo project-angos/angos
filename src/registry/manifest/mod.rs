@@ -566,6 +566,34 @@ impl Registry {
         Ok(DeleteManifestResponse { events })
     }
 
+    /// Attempts to short-circuit a manifest GET into a presigned redirect using
+    /// only the link metadata (without reading the manifest blob). Returns
+    /// `Some(Redirect)` when the link records a `media_type` AND the configured
+    /// `PresignedBlobStore` produces a URL; otherwise returns `None` so the caller
+    /// falls through to the body-loading path.
+    async fn try_redirect_via_link(
+        &self,
+        namespace: &Namespace,
+        reference: &Reference,
+    ) -> Option<GetManifestResponse> {
+        let blob_link: LinkKind = reference.clone().into();
+        let link = self
+            .metadata_store
+            .read_link(namespace, &blob_link, self.update_pull_time)
+            .await
+            .ok()?;
+        let media_type = link.media_type?;
+        let presigned = self.presigned_blob_store.as_ref()?;
+        let presigned_url = presigned
+            .url(&link.target, Some(media_type.as_str()))
+            .await
+            .ok()??;
+
+        Some(GetManifestResponse::Redirect {
+            headers: get_manifest_redirect_headers(presigned_url, &link.target, Some(media_type)),
+        })
+    }
+
     /// Resolves a manifest GET request to either a presigned redirect URL or the manifest body.
     ///
     /// The redirect fast-path is safe only when the cached target is authoritative:
@@ -588,24 +616,9 @@ impl Registry {
 
         if self.enable_manifest_redirect
             && redirect_is_authoritative
-            && let Ok(link) = {
-                let blob_link: LinkKind = reference.clone().into();
-                self.metadata_store
-                    .read_link(namespace, &blob_link, self.update_pull_time)
-                    .await
-            }
-            && let Some(media_type) = link.media_type
-            && let Some(presigned) = &self.presigned_blob_store
-            && let Ok(Some(presigned_url)) =
-                presigned.url(&link.target, Some(media_type.as_str())).await
+            && let Some(resp) = self.try_redirect_via_link(namespace, &reference).await
         {
-            return Ok(GetManifestResponse::Redirect {
-                headers: get_manifest_redirect_headers(
-                    presigned_url,
-                    &link.target,
-                    Some(media_type),
-                ),
-            });
+            return Ok(resp);
         }
 
         let manifest = self
