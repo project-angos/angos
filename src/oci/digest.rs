@@ -46,6 +46,15 @@ impl TryFrom<&str> for Digest {
     type Error = Error;
 
     fn try_from(s: &str) -> Result<Self, Self::Error> {
+        // As per the image specification:
+        //
+        // "When the algorithm identifier is sha256, the encoded portion MUST match /[a-f0-9]{64}/.
+        // Note that [A-F] MUST NOT be used here."
+        //
+        // REF:
+        // - https://github.com/opencontainers/image-spec/blob/v1.0.1/descriptor.md#sha-256
+        const SHA256_HEX_LEN: usize = 64;
+
         let (algorithm, hash) = s.split_once(':').ok_or_else(|| {
             Error::InvalidDigest(format!(
                 "Digest must be in the format 'algorithm:hash', got '{s}'"
@@ -58,15 +67,10 @@ impl TryFrom<&str> for Digest {
             )));
         }
 
-        // Check that hash is a valid 64 bytes representation
-        // As per the image specification, the hash must be a lowercase hex string:
-        //
-        // "When the algorithm identifier is sha256, the encoded portion MUST match /[a-f0-9]{64}/.
-        // Note that [A-F] MUST NOT be used here."
-        //
-        // REF:
-        // - https://github.com/opencontainers/image-spec/blob/v1.0.1/descriptor.md#sha-256
-        if hash.len() != 64 || !hash.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
+        // Hash must be exactly SHA256_HEX_LEN lowercase hex characters.
+        if hash.len() != SHA256_HEX_LEN
+            || !hash.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+        {
             return Err(Error::InvalidDigest(format!(
                 "Invalid sha256 hash '{hash}'"
             )));
