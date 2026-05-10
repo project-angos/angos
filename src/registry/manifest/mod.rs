@@ -132,6 +132,18 @@ fn validate_media_type_match(
     Ok(())
 }
 
+/// Constructs a `ManifestMeta` from raw manifest body bytes for a known target
+/// digest. Centralises the deserialize-and-project step so the I/O fallback in
+/// `head_local_manifest` and any future caller share one implementation.
+fn manifest_meta_from_body(target: &Digest, bytes: &[u8]) -> Result<ManifestMeta, Error> {
+    let manifest = serde_json::from_slice::<Manifest>(bytes)?;
+    Ok(ManifestMeta {
+        media_type: manifest.media_type,
+        digest: target.clone(),
+        size: bytes.len() as u64,
+    })
+}
+
 /// Deserialize a manifest body and verify its declared media type matches the
 /// optional `content_type` hint. Centralises the JSON-to-`Manifest` conversion
 /// so both `parse_manifest_digests` (digest projection) and `put_manifest`
@@ -272,13 +284,7 @@ impl Registry {
         let mut manifest_content = Vec::new();
         reader.read_to_end(&mut manifest_content).await?;
 
-        let manifest = serde_json::from_slice::<Manifest>(&manifest_content)?;
-
-        Ok(ManifestMeta {
-            media_type: manifest.media_type,
-            digest: link.target,
-            size: manifest_content.len() as u64,
-        })
+        manifest_meta_from_body(&link.target, &manifest_content)
     }
 
     #[instrument(skip(repository))]

@@ -1365,3 +1365,89 @@ async fn test_handle_get_manifest_no_redirect_returns_body() {
         }
     }
 }
+
+fn fixed_digest() -> Digest {
+    "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+        .parse()
+        .unwrap()
+}
+
+#[test]
+fn manifest_meta_from_body_returns_meta_for_valid_image_manifest_with_media_type() {
+    let body = serde_json::to_vec(&json!({
+        "schemaVersion": 2,
+        "mediaType": "application/vnd.oci.image.manifest.v1+json",
+        "config": {
+            "mediaType": "application/vnd.oci.image.config.v1+json",
+            "digest": "sha256:1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
+            "size": 256
+        },
+        "layers": []
+    }))
+    .unwrap();
+
+    let target = fixed_digest();
+    let meta = manifest_meta_from_body(&target, &body).unwrap();
+
+    assert_eq!(
+        meta.media_type.as_deref(),
+        Some("application/vnd.oci.image.manifest.v1+json")
+    );
+    assert_eq!(meta.digest, target);
+    assert_eq!(meta.size, body.len() as u64);
+}
+
+#[test]
+fn manifest_meta_from_body_returns_meta_for_image_manifest_without_media_type() {
+    let body = serde_json::to_vec(&json!({
+        "schemaVersion": 2,
+        "config": {
+            "mediaType": "application/vnd.oci.image.config.v1+json",
+            "digest": "sha256:1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
+            "size": 256
+        },
+        "layers": []
+    }))
+    .unwrap();
+
+    let target = fixed_digest();
+    let meta = manifest_meta_from_body(&target, &body).unwrap();
+
+    assert_eq!(meta.media_type, None);
+    assert_eq!(meta.digest, target);
+    assert_eq!(meta.size, body.len() as u64);
+}
+
+#[test]
+fn manifest_meta_from_body_returns_meta_for_oci_index() {
+    let body = serde_json::to_vec(&json!({
+        "schemaVersion": 2,
+        "mediaType": "application/vnd.oci.image.index.v1+json",
+        "manifests": [
+            {
+                "mediaType": "application/vnd.oci.image.manifest.v1+json",
+                "digest": "sha256:abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890",
+                "size": 512,
+                "platform": { "architecture": "amd64", "os": "linux" }
+            }
+        ]
+    }))
+    .unwrap();
+
+    let target = fixed_digest();
+    let meta = manifest_meta_from_body(&target, &body).unwrap();
+
+    assert_eq!(
+        meta.media_type.as_deref(),
+        Some("application/vnd.oci.image.index.v1+json")
+    );
+    assert_eq!(meta.digest, target);
+    assert_eq!(meta.size, body.len() as u64);
+}
+
+#[test]
+fn manifest_meta_from_body_errors_on_malformed_json() {
+    let target = fixed_digest();
+    let result = manifest_meta_from_body(&target, b"not json");
+    assert!(result.is_err());
+}
