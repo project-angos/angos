@@ -9,12 +9,10 @@ use crate::{
     configuration::RegexPattern,
     oci::{Descriptor, Digest, Manifest, Namespace, Platform as OciPlatform, namespace_belongs_to},
     registry::{
-        Error, JsonResponse, Registry, metadata_store::link_kind::LinkKind,
+        APPLICATION_JSON, Error, JsonResponse, Registry, metadata_store::link_kind::LinkKind,
         pagination::collect_all_pages,
     },
 };
-
-const APPLICATION_JSON: &str = "application/json";
 
 fn json_headers() -> HashMap<&'static str, String> {
     HashMap::from([(CONTENT_TYPE.as_str(), APPLICATION_JSON.to_string())])

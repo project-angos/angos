@@ -6,12 +6,11 @@ use tracing::instrument;
 
 use crate::{
     oci::{Descriptor, Digest, Namespace},
-    registry::{Error, JsonResponse, Registry},
+    registry::{APPLICATION_JSON, Error, JsonResponse, Registry},
 };
 
 const OCI_FILTERS_APPLIED: &str = "OCI-Filters-Applied";
 const OCI_INDEX_MEDIA_TYPE: &str = "application/vnd.oci.image.index.v1+json";
-const APPLICATION_JSON: &str = "application/json";
 
 #[derive(Serialize, Debug)]
 #[serde(rename_all = "camelCase")]
