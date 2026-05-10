@@ -86,3 +86,178 @@ impl LinkMetadata {
         self
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use super::*;
+
+    const VALID_HASH: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    const OTHER_HASH: &str = "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210";
+
+    fn digest() -> Digest {
+        Digest::Sha256(VALID_HASH.into())
+    }
+
+    fn other_digest() -> Digest {
+        Digest::Sha256(OTHER_HASH.into())
+    }
+
+    fn minimal_descriptor() -> Descriptor {
+        Descriptor {
+            media_type: "application/vnd.oci.image.manifest.v1+json".to_string(),
+            digest: digest(),
+            size: 42,
+            annotations: HashMap::new(),
+            artifact_type: None,
+            platform: None,
+        }
+    }
+
+    #[test]
+    fn from_digest_initialises_target_and_timestamps() {
+        let meta = LinkMetadata::from_digest(digest());
+        assert_eq!(meta.target, digest());
+        assert!(meta.created_at.is_some());
+        assert!(meta.accessed_at.is_none());
+        assert!(meta.referenced_by.is_empty());
+        assert!(meta.media_type.is_none());
+        assert!(meta.descriptor.is_none());
+    }
+
+    #[test]
+    fn from_bytes_parses_json_serialised_form() {
+        let mut meta = LinkMetadata::from_digest(digest());
+        meta.add_referrer(other_digest());
+        let meta = meta
+            .with_media_type(Some(
+                "application/vnd.oci.image.manifest.v1+json".to_string(),
+            ))
+            .with_descriptor(Some(minimal_descriptor()));
+
+        let bytes = serde_json::to_vec(&meta).unwrap();
+        let parsed = LinkMetadata::from_bytes(bytes).unwrap();
+
+        assert_eq!(parsed.target, meta.target);
+        assert_eq!(parsed.referenced_by, meta.referenced_by);
+        assert_eq!(parsed.media_type, meta.media_type);
+        assert_eq!(parsed.descriptor, meta.descriptor);
+    }
+
+    #[test]
+    fn from_bytes_falls_back_to_legacy_digest_string() {
+        let raw = format!("sha256:{VALID_HASH}");
+        let parsed = LinkMetadata::from_bytes(raw.into_bytes()).unwrap();
+        assert_eq!(parsed.target, digest());
+    }
+
+    #[test]
+    fn from_bytes_legacy_synthesises_created_at() {
+        let raw = format!("sha256:{VALID_HASH}");
+        let parsed = LinkMetadata::from_bytes(raw.into_bytes()).unwrap();
+        assert!(parsed.created_at.is_some());
+    }
+
+    #[test]
+    fn from_bytes_rejects_malformed_input() {
+        let result = LinkMetadata::from_bytes(b"this is not JSON or a digest".to_vec());
+        assert!(matches!(result, Err(Error::InvalidData(_))));
+    }
+
+    #[test]
+    fn from_bytes_rejects_invalid_utf8() {
+        let result = LinkMetadata::from_bytes(vec![0xff, 0xfe, 0xfd]);
+        assert!(matches!(result, Err(Error::InvalidData(_))));
+    }
+
+    #[test]
+    fn from_bytes_rejects_empty_input() {
+        let result = LinkMetadata::from_bytes(Vec::new());
+        assert!(matches!(result, Err(Error::InvalidData(_))));
+    }
+
+    #[test]
+    fn add_referrer_inserts_unique_digest() {
+        let mut meta = LinkMetadata::from_digest(digest());
+        meta.add_referrer(other_digest());
+        assert!(meta.referenced_by.contains(&other_digest()));
+        assert!(meta.has_references());
+    }
+
+    #[test]
+    fn add_referrer_is_idempotent() {
+        let mut meta = LinkMetadata::from_digest(digest());
+        meta.add_referrer(other_digest());
+        meta.add_referrer(other_digest());
+        assert_eq!(meta.referenced_by.len(), 1);
+    }
+
+    #[test]
+    fn remove_referrer_eliminates_existing_digest() {
+        let mut meta = LinkMetadata::from_digest(digest());
+        meta.add_referrer(other_digest());
+        meta.remove_referrer(&other_digest());
+        assert!(meta.referenced_by.is_empty());
+        assert!(!meta.has_references());
+    }
+
+    #[test]
+    fn remove_referrer_unknown_digest_is_noop() {
+        let mut meta = LinkMetadata::from_digest(digest());
+        meta.remove_referrer(&other_digest());
+        assert!(meta.referenced_by.is_empty());
+    }
+
+    #[test]
+    fn has_references_reflects_set_state() {
+        let mut meta = LinkMetadata::from_digest(digest());
+        assert!(!meta.has_references());
+        meta.add_referrer(other_digest());
+        assert!(meta.has_references());
+        meta.remove_referrer(&other_digest());
+        assert!(!meta.has_references());
+    }
+
+    #[test]
+    fn accessed_sets_accessed_at() {
+        let before = Utc::now();
+        let meta = LinkMetadata::from_digest(digest()).accessed();
+        assert!(meta.accessed_at.is_some());
+        let accessed_at = meta.accessed_at.unwrap();
+        assert!(accessed_at >= before);
+        assert!(meta.created_at.is_some());
+        assert_eq!(meta.target, digest());
+    }
+
+    #[test]
+    fn accessed_does_not_mutate_referrer_list() {
+        let mut meta = LinkMetadata::from_digest(digest());
+        meta.add_referrer(other_digest());
+        let meta = meta.accessed();
+        assert_eq!(meta.referenced_by.len(), 1);
+        assert!(meta.referenced_by.contains(&other_digest()));
+    }
+
+    #[test]
+    fn with_media_type_assigns_field() {
+        let meta =
+            LinkMetadata::from_digest(digest()).with_media_type(Some("application/vnd.foo".into()));
+        assert_eq!(meta.media_type, Some("application/vnd.foo".to_string()));
+    }
+
+    #[test]
+    fn with_media_type_none_clears_field() {
+        let meta = LinkMetadata::from_digest(digest())
+            .with_media_type(Some("application/vnd.foo".into()))
+            .with_media_type(None);
+        assert!(meta.media_type.is_none());
+    }
+
+    #[test]
+    fn with_descriptor_assigns_field() {
+        let desc = minimal_descriptor();
+        let meta = LinkMetadata::from_digest(digest()).with_descriptor(Some(desc.clone()));
+        assert_eq!(meta.descriptor, Some(desc));
+    }
+}
