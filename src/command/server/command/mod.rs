@@ -1,12 +1,10 @@
 use std::{
-    collections::HashMap,
     sync::{Arc, Mutex},
     time::Duration,
 };
 
 use argh::FromArgs;
-use async_trait::async_trait;
-use tracing::error;
+use tracing::warn;
 
 use super::{
     ServerContext,
@@ -16,16 +14,13 @@ use super::{
     },
 };
 use crate::{
-    cache,
-    cache::Cache,
     command::server::error::Error,
-    configuration::{Configuration, ServerConfig, watcher::ConfigNotifier},
-    registry::{
-        Registry, RegistryConfig, Repository, blob_store,
-        metadata_store::{ConditionalCapabilities, MetadataStore, MetadataStoreConfig},
-        repository,
-    },
+    configuration::{Configuration, ServerConfig},
+    registry::metadata_store::ConditionalCapabilities,
 };
+
+mod notifier;
+pub mod setup;
 
 pub enum ServiceListener {
     Insecure(InsecureListener),
@@ -45,121 +40,10 @@ pub struct Command {
     cached_capabilities: Arc<Mutex<Option<ConditionalCapabilities>>>,
 }
 
-fn build_blob_stores(
-    config: &blob_store::BlobStorageConfig,
-    cache: &Arc<dyn Cache>,
-) -> Result<blob_store::BlobStoreHandles, Error> {
-    config
-        .to_backend(Some(cache.clone()))
-        .map_err(|_| Error::Initialization("Failed to initialize blob store".to_string()))
-}
-
-async fn build_metadata_store(
-    config: &Configuration,
-    cache: &Arc<dyn Cache>,
-    cached_capabilities: &Arc<Mutex<Option<ConditionalCapabilities>>>,
-) -> Result<Arc<dyn MetadataStore>, Error> {
-    let mut metadata_config = config.resolve_metadata_config();
-
-    if let MetadataStoreConfig::S3(ref mut backend_config) = metadata_config
-        && backend_config.capabilities.is_none()
-    {
-        let guard = cached_capabilities
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if guard.is_some() {
-            backend_config.capabilities.clone_from(&guard);
-        }
-    }
-
-    match metadata_config.to_backend(Some(cache.clone())).await {
-        Ok((store, caps)) => {
-            let mut guard = cached_capabilities
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            *guard = caps;
-            Ok(store)
-        }
-        Err(err) => {
-            let msg = format!("Failed to initialize metadata store: {err}");
-            Err(Error::Initialization(msg))
-        }
-    }
-}
-
-fn build_auth_cache(config: &cache::Config) -> Result<Arc<dyn Cache>, Error> {
-    match config.to_backend() {
-        Ok(cache) => Ok(cache),
-        Err(err) => {
-            let msg = format!("Failed to initialize auth token cache: {err}");
-            Err(Error::Initialization(msg))
-        }
-    }
-}
-
-fn build_repository(
-    name: &str,
-    config: &repository::Config,
-    auth_cache: &Arc<dyn Cache>,
-) -> Result<Repository, Error> {
-    match Repository::new(name, config, auth_cache) {
-        Ok(repo) => Ok(repo),
-        Err(err) => {
-            let msg = format!("Failed to initialize repository '{name}': {err}");
-            Err(Error::Initialization(msg))
-        }
-    }
-}
-
-fn build_repositories(
-    configs: &HashMap<String, repository::Config>,
-    auth_cache: &Arc<dyn Cache>,
-) -> Result<Arc<HashMap<String, Repository>>, Error> {
-    let mut repositories = HashMap::new();
-    for (name, config) in configs {
-        let repo = build_repository(name, config, auth_cache)?;
-        repositories.insert(name.clone(), repo);
-    }
-
-    Ok(Arc::new(repositories))
-}
-
-async fn build_registry(
-    config: &Configuration,
-    cached_capabilities: &Arc<Mutex<Option<ConditionalCapabilities>>>,
-) -> Result<Registry, Error> {
-    let auth_cache = build_auth_cache(&config.cache)?;
-    let blob_handles = build_blob_stores(&config.blob_store, &auth_cache)?;
-    let metadata_store = build_metadata_store(config, &auth_cache, cached_capabilities).await?;
-    let repositories = build_repositories(&config.repository, &auth_cache)?;
-
-    let registry_config = RegistryConfig::new()
-        .update_pull_time(config.global.update_pull_time)
-        .enable_blob_redirect(config.global.resolved_enable_blob_redirect())
-        .enable_manifest_redirect(config.global.resolved_enable_manifest_redirect())
-        .concurrent_cache_jobs(config.global.max_concurrent_cache_jobs)
-        .global_immutable_tags(config.global.immutable_tags)
-        .global_immutable_tags_exclusions(config.global.immutable_tags_exclusions.clone());
-
-    let Ok(registry) = Registry::new(
-        blob_handles.blob_store,
-        blob_handles.upload_store,
-        blob_handles.presigned_store,
-        metadata_store,
-        repositories,
-        registry_config,
-    ) else {
-        let msg = "Failed to initialize registry".to_string();
-        return Err(Error::Initialization(msg));
-    };
-
-    Ok(registry)
-}
-
 impl Command {
     pub async fn new(config: &Configuration) -> Result<Command, Error> {
         let cached_capabilities = Arc::new(Mutex::new(None));
-        let registry = build_registry(config, &cached_capabilities).await?;
+        let registry = setup::build_registry(config, &cached_capabilities).await?;
         let context = ServerContext::new(config, registry)?;
 
         let listener = match &config.server {
@@ -178,15 +62,30 @@ impl Command {
     }
 
     pub async fn notify_config_change(&self, config: &Configuration) -> Result<(), Error> {
-        let registry = build_registry(config, &self.cached_capabilities).await?;
+        let registry = setup::build_registry(config, &self.cached_capabilities).await?;
         let context = ServerContext::new(config, registry)?;
 
         match (&self.listener, &config.server) {
-            (ServiceListener::Insecure(listener), _) => listener.notify_config_change(context),
+            (ServiceListener::Insecure(listener), ServerConfig::Insecure(_)) => {
+                listener.notify_config_change(context);
+            }
+            (ServiceListener::Insecure(listener), ServerConfig::Tls(_)) => {
+                warn!(
+                    "Listener type transition from insecure to TLS is not supported at runtime; \
+                     restart the server to apply the new listener configuration. \
+                     Non-listener changes will still be applied."
+                );
+                listener.notify_config_change(context);
+            }
             (ServiceListener::Secure(listener), ServerConfig::Tls(server_config)) => {
                 listener.notify_config_change(server_config, context)?;
             }
-            _ => {}
+            (ServiceListener::Secure(_), ServerConfig::Insecure(_)) => {
+                warn!(
+                    "Listener type transition from TLS to insecure is not supported at runtime; \
+                     restart the server to apply the new listener configuration."
+                );
+            }
         }
 
         Ok(())
@@ -201,10 +100,10 @@ impl Command {
     }
 
     #[cfg(test)]
-    pub fn insecure_listener(&self) -> &InsecureListener {
+    pub fn as_insecure(&self) -> Option<&InsecureListener> {
         match &self.listener {
-            ServiceListener::Insecure(listener) => listener,
-            ServiceListener::Secure(_) => panic!("Expected insecure listener"),
+            ServiceListener::Insecure(listener) => Some(listener),
+            ServiceListener::Secure(_) => None,
         }
     }
 
@@ -222,21 +121,6 @@ impl Command {
         }
 
         Ok(())
-    }
-}
-
-#[async_trait]
-impl ConfigNotifier for Command {
-    async fn notify_config_change(&self, config: &Configuration) {
-        if let Err(e) = self.notify_config_change(config).await {
-            error!("Failed to apply configuration: {e}");
-        }
-    }
-
-    fn notify_tls_config_change(&self, tls: &ServerTlsConfig) {
-        if let Err(e) = self.notify_tls_config_change(tls) {
-            error!("Failed to reload TLS configuration: {e}");
-        }
     }
 }
 

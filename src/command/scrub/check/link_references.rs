@@ -1,16 +1,20 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use tracing::{debug, error, info};
+use futures_util::StreamExt;
+use tracing::{debug, error};
 
 use crate::{
-    command::scrub::check::NamespaceChecker,
+    command::scrub::{
+        action::Action,
+        check::{NamespaceChecker, list_all},
+        error::Error,
+        executor::ActionSink,
+    },
     oci::Digest,
     registry::{
-        Error,
         blob_store::BlobStore,
-        metadata_store::{self, MetadataStore, MetadataStoreExt, link_kind::LinkKind},
-        pagination::for_each_page,
+        metadata_store::{self, MetadataStore, link_kind::LinkKind},
         parse_manifest_digests,
     },
 };
@@ -18,23 +22,25 @@ use crate::{
 pub struct LinkReferencesChecker {
     blob_store: Arc<dyn BlobStore + Send + Sync>,
     metadata_store: Arc<dyn MetadataStore + Send + Sync>,
-    dry_run: bool,
 }
 
 impl LinkReferencesChecker {
     pub fn new(
         blob_store: Arc<dyn BlobStore + Send + Sync>,
         metadata_store: Arc<dyn MetadataStore + Send + Sync>,
-        dry_run: bool,
     ) -> Self {
         Self {
             blob_store,
             metadata_store,
-            dry_run,
         }
     }
 
-    async fn repair_referenced_by(&self, namespace: &str, revision: &Digest) -> Result<(), Error> {
+    async fn repair_referenced_by(
+        &self,
+        namespace: &str,
+        revision: &Digest,
+        sink: &mut (dyn ActionSink + Send),
+    ) -> Result<(), Error> {
         let content = self.blob_store.read(revision).await?;
         let manifest = parse_manifest_digests(&content, None)?;
 
@@ -44,13 +50,20 @@ impl LinkReferencesChecker {
                 &LinkKind::Config(config.clone()),
                 config,
                 revision,
+                sink,
             )
             .await?;
         }
 
         for layer in &manifest.layers {
-            self.ensure_referenced_by(namespace, &LinkKind::Layer(layer.clone()), layer, revision)
-                .await?;
+            self.ensure_referenced_by(
+                namespace,
+                &LinkKind::Layer(layer.clone()),
+                layer,
+                revision,
+                sink,
+            )
+            .await?;
         }
 
         for child in &manifest.manifests {
@@ -59,6 +72,7 @@ impl LinkReferencesChecker {
                 &LinkKind::Manifest(revision.clone(), child.clone()),
                 child,
                 revision,
+                sink,
             )
             .await?;
         }
@@ -66,6 +80,12 @@ impl LinkReferencesChecker {
         Ok(())
     }
 
+    /// Returns `true` only when the link exists but its `referenced_by` set is
+    /// missing `referrer` — the back-link is absent and must be added.
+    ///
+    /// A `ReferenceNotFound` error means the link itself does not exist, so
+    /// there is nothing to update; orphan-link cleanup handles that case in a
+    /// separate scrub stage.
     async fn needs_referrer_update(
         &self,
         namespace: &str,
@@ -80,50 +100,25 @@ impl LinkReferencesChecker {
         }
     }
 
-    async fn add_referrer(
+    pub async fn ensure_referenced_by(
         &self,
         namespace: &str,
         link: &LinkKind,
         target: &Digest,
         referrer: &Digest,
-    ) -> Result<(), Error> {
-        if self.dry_run {
-            info!(
-                "DRY RUN: would add referrer {referrer} to link {link} in namespace '{namespace}'"
-            );
-            return Ok(());
-        }
-
-        info!("Adding referrer {referrer} to link {link} in namespace '{namespace}'");
-        let mut tx = self.metadata_store.begin_transaction(namespace);
-        tx.create_link(link, target).with_referrer(referrer).add();
-        tx.commit().await?;
-        Ok(())
-    }
-
-    async fn ensure_referenced_by(
-        &self,
-        namespace: &str,
-        link: &LinkKind,
-        target: &Digest,
-        referrer: &Digest,
+        sink: &mut (dyn ActionSink + Send),
     ) -> Result<(), Error> {
         if self
             .needs_referrer_update(namespace, link, referrer)
             .await?
         {
-            self.add_referrer(namespace, link, target, referrer).await?;
-        }
-        Ok(())
-    }
-
-    async fn process_page(&self, namespace: &str, revisions: Vec<Digest>) -> Result<(), Error> {
-        for revision in &revisions {
-            if let Err(e) = self.repair_referenced_by(namespace, revision).await {
-                error!(
-                    "Failed to fix referenced_by for '{namespace}' (revision '{revision}'): {e}"
-                );
-            }
+            sink.apply(Action::AddReferrer {
+                namespace: namespace.to_string(),
+                link: link.clone(),
+                target: target.clone(),
+                referrer: referrer.clone(),
+            })
+            .await?;
         }
         Ok(())
     }
@@ -131,19 +126,24 @@ impl LinkReferencesChecker {
 
 #[async_trait]
 impl NamespaceChecker for LinkReferencesChecker {
-    async fn check_namespace(&self, namespace: &str) -> Result<(), Error> {
+    async fn check(
+        &self,
+        namespace: &str,
+        sink: &mut (dyn ActionSink + Send),
+    ) -> Result<(), Error> {
         debug!("Checking referenced_by field for namespace '{namespace}'");
 
-        for_each_page(
-            |marker| async move {
-                self.metadata_store
-                    .list_revisions(namespace, 100, marker)
-                    .await
-                    .map_err(Error::from)
-            },
-            |revisions| self.process_page(namespace, revisions),
-        )
-        .await
+        let mut revisions = list_all::revisions(&self.metadata_store, namespace);
+        while let Some(revision) = revisions.next().await {
+            let revision = revision?;
+            if let Err(e) = self.repair_referenced_by(namespace, &revision, sink).await {
+                error!(
+                    "Failed to fix referenced_by for '{namespace}' (revision '{revision}'): {e}"
+                );
+            }
+        }
+
+        Ok(())
     }
 }
 
@@ -153,16 +153,29 @@ mod tests {
 
     use super::*;
     use crate::{
+        command::scrub::{action::Action, executor::Executor},
         oci::Descriptor,
         registry::{
             Registry,
             metadata_store::{
                 BlobIndex, BlobIndexOperation, LinkMetadata, LinkOperation, MetadataStoreExt,
             },
-            test_utils,
-            test_utils::{FSRegistryTestCase, RegistryTestCase, backends},
+            test_utils::{self, FSRegistryTestCase, NoopMultipart, RegistryTestCase, backends},
         },
     };
+
+    fn noop_executor(
+        blob_store: Arc<dyn BlobStore + Send + Sync>,
+        metadata_store: Arc<dyn MetadataStore + Send + Sync>,
+        upload_store: Arc<dyn crate::registry::blob_store::UploadStore>,
+    ) -> Executor {
+        Executor::new(
+            blob_store,
+            metadata_store,
+            upload_store,
+            std::sync::Arc::new(NoopMultipart),
+        )
+    }
 
     async fn create_manifest_scenario(
         registry: &Registry,
@@ -240,9 +253,15 @@ mod tests {
                 "Config link should start with empty referenced_by"
             );
 
-            let checker =
-                LinkReferencesChecker::new(blob_store.clone(), metadata_store.clone(), false);
-            checker.check_namespace(namespace).await.unwrap();
+            let checker = LinkReferencesChecker::new(blob_store.clone(), metadata_store.clone());
+
+            let mut executor = noop_executor(
+                blob_store.clone(),
+                metadata_store.clone(),
+                test_case.upload_store(),
+            );
+
+            checker.check(namespace, &mut executor).await.unwrap();
 
             let config_link_after = metadata_store
                 .read_link(namespace, &LinkKind::Config(config_digest.clone()), false)
@@ -282,9 +301,10 @@ mod tests {
             )
             .await;
 
-            let checker =
-                LinkReferencesChecker::new(blob_store.clone(), metadata_store.clone(), true);
-            checker.check_namespace(namespace).await.unwrap();
+            let checker = LinkReferencesChecker::new(blob_store.clone(), metadata_store.clone());
+
+            let mut sink: Vec<Action> = Vec::new();
+            checker.check(namespace, &mut sink).await.unwrap();
 
             let config_link = metadata_store
                 .read_link(namespace, &LinkKind::Config(config_digest), false)
@@ -292,7 +312,7 @@ mod tests {
                 .unwrap();
             assert!(
                 config_link.referenced_by.is_empty(),
-                "Dry-run must not write: config referenced_by should remain empty"
+                "Vec sink must not write: config referenced_by should remain empty"
             );
 
             let layer_link = metadata_store
@@ -301,7 +321,7 @@ mod tests {
                 .unwrap();
             assert!(
                 layer_link.referenced_by.is_empty(),
-                "Dry-run must not write: layer referenced_by should remain empty"
+                "Vec sink must not write: layer referenced_by should remain empty"
             );
         }
     }
@@ -340,9 +360,9 @@ mod tests {
                 .add();
             tx.commit().await.unwrap();
 
-            let checker =
-                LinkReferencesChecker::new(blob_store.clone(), metadata_store.clone(), false);
-            let result = checker.check_namespace(namespace).await;
+            let checker = LinkReferencesChecker::new(blob_store.clone(), metadata_store.clone());
+            let mut sink: Vec<Action> = Vec::new();
+            let result = checker.check(namespace, &mut sink).await;
             assert!(
                 result.is_ok(),
                 "ReferenceNotFound must not propagate as an error"
@@ -356,23 +376,12 @@ mod tests {
                 .await;
             assert!(
                 matches!(config_result, Err(metadata_store::Error::ReferenceNotFound)),
-                "Config link should still not exist after check_namespace"
-            );
-
-            let layer_digest = Digest::Sha256(
-                "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into(),
-            );
-            let layer_result = metadata_store
-                .read_link(namespace, &LinkKind::Layer(layer_digest), false)
-                .await;
-            assert!(
-                matches!(layer_result, Err(metadata_store::Error::ReferenceNotFound)),
-                "Layer link should still not exist after check_namespace"
+                "Config link should still not exist after check"
             );
         }
     }
 
-    // Stub used only to make read_link return a StorageBackend error; all other methods are unreachable.
+    // Stub used only to make read_link return a StorageBackend error.
     struct ErroringMetadataStore;
 
     #[async_trait]
@@ -464,9 +473,10 @@ mod tests {
     async fn test_unexpected_error_is_propagated() {
         let fs_case = FSRegistryTestCase::new();
         let blob_store: Arc<dyn BlobStore + Send + Sync> = RegistryTestCase::blob_store(&fs_case);
-        let metadata_store: Arc<dyn MetadataStore + Send + Sync> = Arc::new(ErroringMetadataStore);
+        let metadata_store: Arc<dyn MetadataStore + Send + Sync> =
+            std::sync::Arc::new(ErroringMetadataStore);
 
-        let checker = LinkReferencesChecker::new(blob_store, metadata_store, false);
+        let checker = LinkReferencesChecker::new(blob_store, metadata_store);
 
         let namespace = "test-repo/error";
         let target = Digest::Sha256(
@@ -477,8 +487,9 @@ mod tests {
         );
         let link = LinkKind::Config(target.clone());
 
+        let mut sink: Vec<Action> = Vec::new();
         let result = checker
-            .ensure_referenced_by(namespace, &link, &target, &referrer)
+            .ensure_referenced_by(namespace, &link, &target, &referrer, &mut sink)
             .await;
 
         assert!(

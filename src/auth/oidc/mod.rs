@@ -16,7 +16,7 @@ use super::{AuthMiddleware, AuthResult};
 use crate::{
     auth::oidc::provider::{generic, github},
     cache::Cache,
-    command::server::{Error, request_ext::HeaderExt},
+    command::server::{Error, HeaderExt},
     identity::{ClientIdentity, OidcClaims},
 };
 

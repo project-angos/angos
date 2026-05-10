@@ -1,12 +1,30 @@
-use std::sync::{Arc, Mutex};
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex, Once},
+};
 
-use super::*;
+use super::{Command, ServerContext, ServiceListener, setup};
 use crate::{
-    command::server::listeners::tls::tests::build_config,
-    configuration,
+    cache,
+    command::{
+        bootstrap,
+        server::listeners::{insecure::InsecureListener, tls::tests::build_config},
+    },
+    configuration::{self, Configuration, ServerConfig},
     policy::{AccessMode, AccessPolicyConfig, CelRule},
+    registry::{Registry, RegistryConfig, metadata_store::ConditionalCapabilities, repository},
     secret::Secret,
 };
+
+static CRYPTO_INIT: Once = Once::new();
+
+fn init_crypto_provider() {
+    CRYPTO_INIT.call_once(|| {
+        rustls::crypto::aws_lc_rs::default_provider()
+            .install_default()
+            .ok();
+    });
+}
 
 fn create_minimal_config() -> Configuration {
     let toml = r#"
@@ -59,8 +77,8 @@ fn create_config_with_repository() -> Configuration {
 #[test]
 fn test_build_blob_store_filesystem_success() {
     let config = create_minimal_config();
-    let auth_cache = build_auth_cache(&config.cache).unwrap();
-    let result = build_blob_stores(&config.blob_store, &auth_cache);
+    let auth_cache = bootstrap::auth_cache(&config.cache).unwrap();
+    let result = bootstrap::blob_stores(&config.blob_store, &auth_cache);
 
     assert!(result.is_ok());
 }
@@ -68,8 +86,9 @@ fn test_build_blob_store_filesystem_success() {
 #[tokio::test]
 async fn test_build_metadata_store_filesystem_success() {
     let config = create_minimal_config();
-    let auth_cache = build_auth_cache(&config.cache).unwrap();
-    let result = build_metadata_store(&config, &auth_cache, &Arc::new(Mutex::new(None))).await;
+    let auth_cache = bootstrap::auth_cache(&config.cache).unwrap();
+    let result =
+        setup::build_metadata_store(&config, &auth_cache, &Arc::new(Mutex::new(None))).await;
 
     assert!(result.is_ok());
 }
@@ -95,8 +114,9 @@ async fn test_build_metadata_store_with_explicit_config() {
     "#;
 
     let config = Configuration::load_from_str(toml).unwrap();
-    let auth_cache = build_auth_cache(&config.cache).unwrap();
-    let result = build_metadata_store(&config, &auth_cache, &Arc::new(Mutex::new(None))).await;
+    let auth_cache = bootstrap::auth_cache(&config.cache).unwrap();
+    let result =
+        setup::build_metadata_store(&config, &auth_cache, &Arc::new(Mutex::new(None))).await;
 
     assert!(result.is_ok());
 }
@@ -104,7 +124,7 @@ async fn test_build_metadata_store_with_explicit_config() {
 #[test]
 fn test_build_auth_cache_memory_success() {
     let config = cache::Config::Memory;
-    let result = build_auth_cache(&config);
+    let result = bootstrap::auth_cache(&config);
 
     assert!(result.is_ok());
 }
@@ -119,9 +139,9 @@ fn test_build_repository_success() {
         ..repository::Config::default()
     };
     let cache_config = cache::Config::Memory;
-    let cache = build_auth_cache(&cache_config).unwrap();
+    let cache = bootstrap::auth_cache(&cache_config).unwrap();
 
-    let result = build_repository("test-repo", &repo_config, &cache);
+    let result = bootstrap::repository("test-repo", &repo_config, &cache);
 
     assert!(result.is_ok());
     let repo = result.unwrap();
@@ -147,9 +167,9 @@ fn test_build_repository_with_upstream() {
         ..repository::Config::default()
     };
     let cache_config = cache::Config::Memory;
-    let cache = build_auth_cache(&cache_config).unwrap();
+    let cache = bootstrap::auth_cache(&cache_config).unwrap();
 
-    let result = build_repository("cached-repo", &repo_config, &cache);
+    let result = bootstrap::repository("cached-repo", &repo_config, &cache);
 
     assert!(result.is_ok());
 }
@@ -169,9 +189,9 @@ fn test_build_repository_with_immutable_tags() {
         ..repository::Config::default()
     };
     let cache_config = cache::Config::Memory;
-    let cache = build_auth_cache(&cache_config).unwrap();
+    let cache = bootstrap::auth_cache(&cache_config).unwrap();
 
-    let result = build_repository("immutable-repo", &repo_config, &cache);
+    let result = bootstrap::repository("immutable-repo", &repo_config, &cache);
 
     assert!(result.is_ok());
 }
@@ -180,9 +200,9 @@ fn test_build_repository_with_immutable_tags() {
 fn test_build_repositories_empty() {
     let configs = HashMap::new();
     let cache_config = cache::Config::Memory;
-    let cache = build_auth_cache(&cache_config).unwrap();
+    let cache = bootstrap::auth_cache(&cache_config).unwrap();
 
-    let result = build_repositories(&configs, &cache);
+    let result = bootstrap::repositories(&configs, &cache);
 
     assert!(result.is_ok());
     let repos = result.unwrap();
@@ -202,9 +222,9 @@ fn test_build_repositories_single() {
     configs.insert("repo1".to_string(), repo_config);
 
     let cache_config = cache::Config::Memory;
-    let cache = build_auth_cache(&cache_config).unwrap();
+    let cache = bootstrap::auth_cache(&cache_config).unwrap();
 
-    let result = build_repositories(&configs, &cache);
+    let result = bootstrap::repositories(&configs, &cache);
 
     assert!(result.is_ok());
     let repos = result.unwrap();
@@ -227,9 +247,9 @@ fn test_build_repositories_multiple() {
     configs.insert("repo3".to_string(), repo_config);
 
     let cache_config = cache::Config::Memory;
-    let cache = build_auth_cache(&cache_config).unwrap();
+    let cache = bootstrap::auth_cache(&cache_config).unwrap();
 
-    let result = build_repositories(&configs, &cache);
+    let result = bootstrap::repositories(&configs, &cache);
 
     assert!(result.is_ok());
     let repos = result.unwrap();
@@ -242,7 +262,7 @@ fn test_build_repositories_multiple() {
 #[tokio::test]
 async fn test_build_registry_minimal_config() {
     let config = create_minimal_config();
-    let result = build_registry(&config, &Arc::new(Mutex::new(None))).await;
+    let result = setup::build_registry(&config, &Arc::new(Mutex::new(None))).await;
 
     assert!(result.is_ok());
 }
@@ -250,7 +270,7 @@ async fn test_build_registry_minimal_config() {
 #[tokio::test]
 async fn test_build_registry_with_repositories() {
     let config = create_config_with_repository();
-    let result = build_registry(&config, &Arc::new(Mutex::new(None))).await;
+    let result = setup::build_registry(&config, &Arc::new(Mutex::new(None))).await;
 
     assert!(result.is_ok());
 }
@@ -276,7 +296,7 @@ async fn test_build_registry_with_update_pull_time() {
     "#;
 
     let config = Configuration::load_from_str(toml).unwrap();
-    let result = build_registry(&config, &Arc::new(Mutex::new(None))).await;
+    let result = setup::build_registry(&config, &Arc::new(Mutex::new(None))).await;
 
     assert!(result.is_ok());
 }
@@ -332,7 +352,7 @@ async fn test_service_listener_enum_variants() {
         panic!("Expected insecure config")
     };
 
-    let registry = build_registry(&config, &Arc::new(Mutex::new(None)))
+    let registry = setup::build_registry(&config, &Arc::new(Mutex::new(None)))
         .await
         .unwrap();
     let context = ServerContext::new(&config, registry).unwrap();
@@ -356,8 +376,8 @@ fn test_build_repositories_preserves_names() {
     configs.insert("gamma".to_string(), repo_config);
 
     let cache_config = cache::Config::Memory;
-    let cache = build_auth_cache(&cache_config).unwrap();
-    let repos = build_repositories(&configs, &cache).unwrap();
+    let cache = bootstrap::auth_cache(&cache_config).unwrap();
+    let repos = bootstrap::repositories(&configs, &cache).unwrap();
 
     assert!(repos.get("alpha").is_some());
     assert!(repos.get("beta").is_some());
@@ -369,12 +389,13 @@ fn test_build_repositories_preserves_names() {
 async fn test_build_registry_components_integration() {
     let config = create_config_with_repository();
 
-    let auth_cache = build_auth_cache(&config.cache).unwrap();
-    let blob_handles = build_blob_stores(&config.blob_store, &auth_cache).unwrap();
-    let metadata_store = build_metadata_store(&config, &auth_cache, &Arc::new(Mutex::new(None)))
-        .await
-        .unwrap();
-    let repositories = build_repositories(&config.repository, &auth_cache).unwrap();
+    let auth_cache = bootstrap::auth_cache(&config.cache).unwrap();
+    let blob_handles = bootstrap::blob_stores(&config.blob_store, &auth_cache).unwrap();
+    let metadata_store =
+        setup::build_metadata_store(&config, &auth_cache, &Arc::new(Mutex::new(None)))
+            .await
+            .unwrap();
+    let repositories = bootstrap::repositories(&config.repository, &auth_cache).unwrap();
 
     let registry_config = RegistryConfig::new()
         .update_pull_time(config.global.update_pull_time)
@@ -426,8 +447,8 @@ fn test_build_repositories_with_different_configs() {
     configs.insert("private".to_string(), repo_config2);
 
     let cache_config = cache::Config::Memory;
-    let cache = build_auth_cache(&cache_config).unwrap();
-    let result = build_repositories(&configs, &cache);
+    let cache = bootstrap::auth_cache(&cache_config).unwrap();
+    let result = bootstrap::repositories(&configs, &cache);
 
     assert!(result.is_ok());
     let repos = result.unwrap();
@@ -525,7 +546,8 @@ async fn test_hot_reload_adds_webhook_via_command() {
 
     assert!(
         command
-            .insecure_listener()
+            .as_insecure()
+            .unwrap()
             .current_context()
             .event_dispatcher()
             .is_none()
@@ -536,7 +558,8 @@ async fn test_hot_reload_adds_webhook_via_command() {
 
     assert!(
         command
-            .insecure_listener()
+            .as_insecure()
+            .unwrap()
             .current_context()
             .event_dispatcher()
             .is_some()
@@ -550,7 +573,8 @@ async fn test_hot_reload_removes_webhook_via_command() {
 
     assert!(
         command
-            .insecure_listener()
+            .as_insecure()
+            .unwrap()
             .current_context()
             .event_dispatcher()
             .is_some()
@@ -561,7 +585,8 @@ async fn test_hot_reload_removes_webhook_via_command() {
 
     assert!(
         command
-            .insecure_listener()
+            .as_insecure()
+            .unwrap()
             .current_context()
             .event_dispatcher()
             .is_none()
@@ -598,7 +623,7 @@ async fn test_hot_reload_changes_webhook_url_via_command() {
     let config_b = create_config_with_webhook(&format!("{}/webhook", server_b.uri()));
     command.notify_config_change(&config_b).await.unwrap();
 
-    let context = command.insecure_listener().current_context();
+    let context = command.as_insecure().unwrap().current_context();
     context.dispatch_event(&create_test_event()).await.unwrap();
 }
 
@@ -627,7 +652,7 @@ async fn test_hot_reload_adds_second_webhook() {
     let config_two = create_config_with_two_webhooks(&server_a.uri(), &server_b.uri());
     command.notify_config_change(&config_two).await.unwrap();
 
-    let context = command.insecure_listener().current_context();
+    let context = command.as_insecure().unwrap().current_context();
     context.dispatch_event(&create_test_event()).await.unwrap();
 }
 
@@ -656,7 +681,7 @@ async fn test_hot_reload_removes_one_of_two_webhooks() {
     let config_one = create_config_with_webhook(&server_a.uri());
     command.notify_config_change(&config_one).await.unwrap();
 
-    let context = command.insecure_listener().current_context();
+    let context = command.as_insecure().unwrap().current_context();
     context.dispatch_event(&create_test_event()).await.unwrap();
 }
 
@@ -682,7 +707,7 @@ async fn test_hot_reload_inflight_old_dispatcher_still_works() {
     let config_old = create_config_with_webhook(&server_old.uri());
     let command = Command::new(&config_old).await.unwrap();
 
-    let old_context = Arc::clone(&command.insecure_listener().current_context());
+    let old_context = Arc::clone(&command.as_insecure().unwrap().current_context());
 
     let config_new = create_config_with_webhook(&server_new.uri());
     command.notify_config_change(&config_new).await.unwrap();
@@ -692,7 +717,7 @@ async fn test_hot_reload_inflight_old_dispatcher_still_works() {
         .await
         .unwrap();
 
-    let new_context = command.insecure_listener().current_context();
+    let new_context = command.as_insecure().unwrap().current_context();
     new_context
         .dispatch_event(&create_test_event())
         .await
@@ -726,7 +751,7 @@ async fn test_command_shutdown_drains_in_flight_async_delivery() {
     let config = create_config_with_webhook(&server.uri());
     let command = Command::new(&config).await.unwrap();
 
-    let context = command.insecure_listener().current_context();
+    let context = command.as_insecure().unwrap().current_context();
     context.dispatch_event(&create_test_event()).await.unwrap();
     drop(context);
 
@@ -738,6 +763,71 @@ async fn test_command_shutdown_drains_in_flight_async_delivery() {
         1,
         "Command::shutdown() must drain in-flight async webhook deliveries"
     );
+}
+
+fn create_tls_config() -> (
+    Configuration,
+    (
+        tempfile::NamedTempFile,
+        tempfile::NamedTempFile,
+        tempfile::NamedTempFile,
+    ),
+) {
+    let (tls_config, temp_files) = build_config(false);
+
+    let toml = format!(
+        r#"
+        [blob_store.fs]
+        root_dir = "/tmp/test-blobs"
+
+        [metadata_store.fs]
+        root_dir = "/tmp/test-metadata"
+
+        [cache.memory]
+
+        [server]
+        bind_address = "127.0.0.1"
+        port = 8443
+
+        [server.tls]
+        server_certificate_bundle = "{cert}"
+        server_private_key = "{key}"
+
+        [global]
+        update_pull_time = false
+        max_concurrent_cache_jobs = 10
+    "#,
+        cert = tls_config.server_certificate_bundle.display(),
+        key = tls_config.server_private_key.display(),
+    );
+
+    (Configuration::load_from_str(&toml).unwrap(), temp_files)
+}
+
+#[tokio::test]
+async fn test_notify_config_change_insecure_to_tls_does_not_fail() {
+    init_crypto_provider();
+
+    let insecure_config = create_minimal_config();
+    let command = Command::new(&insecure_config).await.unwrap();
+
+    let (tls_config, _temp_files) = create_tls_config();
+    let result = command.notify_config_change(&tls_config).await;
+
+    assert!(result.is_ok());
+}
+
+#[tokio::test]
+async fn test_notify_config_change_tls_to_insecure_does_not_fail() {
+    init_crypto_provider();
+
+    let (tls_config, _temp_files) = create_tls_config();
+    let command = Command::new(&tls_config).await.unwrap();
+
+    let insecure_config = create_minimal_config();
+    let result = command.notify_config_change(&insecure_config).await;
+
+    assert!(result.is_ok());
 }
 
 #[test]

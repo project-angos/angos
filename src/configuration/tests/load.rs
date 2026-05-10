@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use super::*;
+use super::super::*;
 use crate::{auth::oidc, registry::data_store};
 
 #[test]
@@ -244,74 +244,6 @@ fn test_ui_custom_name() {
 }
 
 #[test]
-fn test_resolve_metadata_config_from_fs_blob_store() {
-    let config = r#"
-    [server]
-    bind_address = "0.0.0.0"
-
-    [blob_store.fs]
-    root_dir = "/data/blobs"
-    sync_to_disk = true
-    "#;
-
-    let config = Configuration::load_from_str(config).unwrap();
-    let metadata_config = config.resolve_metadata_config();
-
-    match metadata_config {
-        metadata_store::MetadataStoreConfig::FS(fs_config) => {
-            assert_eq!(fs_config.root_dir, "/data/blobs");
-            assert!(fs_config.sync_to_disk);
-            assert_eq!(
-                fs_config.lock_strategy,
-                metadata_store::LockStrategy::Memory
-            );
-        }
-        metadata_store::MetadataStoreConfig::Inherit
-        | metadata_store::MetadataStoreConfig::S3(_) => {
-            panic!("Expected FS metadata store config")
-        }
-    }
-}
-
-#[test]
-fn test_resolve_metadata_config_from_s3_blob_store() {
-    let config = r#"
-    [server]
-    bind_address = "0.0.0.0"
-
-    [blob_store.s3]
-    bucket = "my-bucket"
-    region = "us-east-1"
-    endpoint = "https://s3.example.com"
-    access_key_id = "key123"
-    secret_key = "secret456"
-    key_prefix = "prefix/"
-    "#;
-
-    let config = Configuration::load_from_str(config).unwrap();
-    let metadata_config = config.resolve_metadata_config();
-
-    match metadata_config {
-        metadata_store::MetadataStoreConfig::S3(s3_config) => {
-            assert_eq!(s3_config.bucket, "my-bucket");
-            assert_eq!(s3_config.region, "us-east-1");
-            assert_eq!(s3_config.endpoint, "https://s3.example.com");
-            assert_eq!(s3_config.access_key_id.expose(), "key123");
-            assert_eq!(s3_config.secret_key.expose(), "secret456");
-            assert_eq!(s3_config.key_prefix, "prefix/");
-            assert_eq!(
-                s3_config.lock_strategy,
-                metadata_store::LockStrategy::Memory
-            );
-        }
-        metadata_store::MetadataStoreConfig::Inherit
-        | metadata_store::MetadataStoreConfig::FS(_) => {
-            panic!("Expected S3 metadata store config")
-        }
-    }
-}
-
-#[test]
 fn test_repository_config() {
     let config = r#"
     [server]
@@ -419,117 +351,6 @@ fn test_invalid_toml_format() {
         Err(Error::InvalidFormat(_)) => {}
         _ => panic!("Expected InvalidFormat error"),
     }
-}
-
-#[test]
-fn test_validate_webhook_referenced_globally() {
-    let config = r#"
-    [server]
-    bind_address = "0.0.0.0"
-
-    [global]
-    authorization_webhook = "my-webhook"
-
-    [auth.webhook.my-webhook]
-    url = "https://example.com/webhook"
-    timeout_ms = 5000
-    "#;
-
-    let result = Configuration::load_from_str(config);
-    assert!(result.is_ok());
-}
-
-#[test]
-fn test_validate_webhook_missing_global_reference() {
-    let config = r#"
-    [server]
-    bind_address = "0.0.0.0"
-
-    [global]
-    authorization_webhook = "nonexistent-webhook"
-    "#;
-
-    let result = Configuration::load_from_str(config);
-    assert!(result.is_err());
-    match result {
-        Err(Error::InvalidFormat(msg)) => {
-            assert!(msg.contains("Webhook 'nonexistent-webhook' not found"));
-            assert!(msg.contains("referenced globally"));
-        }
-        _ => panic!("Expected InvalidFormat error"),
-    }
-}
-
-#[test]
-fn test_validate_webhook_referenced_in_repository() {
-    let config = r#"
-    [server]
-    bind_address = "0.0.0.0"
-
-    [repository.myapp]
-    authorization_webhook = "repo-webhook"
-
-    [auth.webhook.repo-webhook]
-    url = "https://example.com/webhook"
-    timeout_ms = 5000
-    "#;
-
-    let result = Configuration::load_from_str(config);
-    assert!(result.is_ok());
-}
-
-#[test]
-fn test_validate_webhook_missing_repository_reference() {
-    let config = r#"
-    [server]
-    bind_address = "0.0.0.0"
-
-    [repository.myapp]
-    authorization_webhook = "missing-webhook"
-    "#;
-
-    let result = Configuration::load_from_str(config);
-    assert!(result.is_err());
-    match result {
-        Err(Error::InvalidFormat(msg)) => {
-            assert!(msg.contains("Webhook 'missing-webhook' not found"));
-            assert!(msg.contains("referenced in 'myapp' repository"));
-        }
-        _ => panic!("Expected InvalidFormat error"),
-    }
-}
-
-#[test]
-fn test_validate_webhook_empty_string_in_repository() {
-    let config = r#"
-    [server]
-    bind_address = "0.0.0.0"
-
-    [repository.myapp]
-    authorization_webhook = ""
-    "#;
-
-    let result = Configuration::load_from_str(config);
-    assert!(result.is_ok());
-}
-
-#[test]
-fn test_validate_invalid_webhook_config() {
-    let config = r#"
-    [server]
-    bind_address = "0.0.0.0"
-
-    [auth.webhook.bad-webhook]
-    url = "ht!tp://::invalid"
-    timeout_ms = 5000
-    "#;
-
-    let result = Configuration::load_from_str(config);
-    let err = result.expect_err("malformed webhook URL must fail to load");
-    assert!(
-        err.to_string().contains("url"),
-        "error should mention the offending url field: {err}"
-    );
 }
 
 #[test]
@@ -739,43 +560,6 @@ fn test_retention_policy_in_global_config() {
 }
 
 #[test]
-fn test_resolve_metadata_config_preserves_explicit_s3_config() {
-    let config = r#"
-    [server]
-    bind_address = "0.0.0.0"
-
-    [blob_store.s3]
-    bucket = "blob-bucket"
-    region = "us-east-1"
-    endpoint = "https://s3.amazonaws.com"
-    access_key_id = "blob-key"
-    secret_key = "blob-secret"
-
-    [metadata_store.s3]
-    bucket = "metadata-bucket"
-    region = "eu-west-1"
-    endpoint = "https://metadata.example.com"
-    access_key_id = "meta-key"
-    secret_key = "meta-secret"
-    "#;
-
-    let config = Configuration::load_from_str(config).unwrap();
-    let metadata_config = config.resolve_metadata_config();
-
-    match metadata_config {
-        metadata_store::MetadataStoreConfig::S3(s3_config) => {
-            assert_eq!(s3_config.bucket, "metadata-bucket");
-            assert_eq!(s3_config.region, "eu-west-1");
-            assert_eq!(s3_config.endpoint, "https://metadata.example.com");
-        }
-        metadata_store::MetadataStoreConfig::Inherit
-        | metadata_store::MetadataStoreConfig::FS(_) => {
-            panic!("Expected S3 metadata store config")
-        }
-    }
-}
-
-#[test]
 fn test_multiple_webhooks() {
     let config = r#"
     [server]
@@ -799,31 +583,6 @@ fn test_multiple_webhooks() {
     assert!(config.auth.webhook.contains_key("webhook1"));
     assert!(config.auth.webhook.contains_key("webhook2"));
     assert!(config.auth.webhook.contains_key("webhook3"));
-}
-
-#[test]
-fn test_validate_multiple_repositories_with_webhooks() {
-    let config = r#"
-    [server]
-    bind_address = "0.0.0.0"
-
-    [repository.app1]
-    authorization_webhook = "webhook1"
-
-    [repository.app2]
-    authorization_webhook = "webhook2"
-
-    [auth.webhook.webhook1]
-    url = "https://webhook1.example.com"
-    timeout_ms = 5000
-
-    [auth.webhook.webhook2]
-    url = "https://webhook2.example.com"
-    timeout_ms = 5000
-    "#;
-
-    let result = Configuration::load_from_str(config);
-    assert!(result.is_ok());
 }
 
 #[test]
@@ -1222,55 +981,6 @@ fn test_metadata_store_fs_lock_strategy_s3_fails() {
 }
 
 #[test]
-fn test_redirect_resolver_only_enable_redirect_true() {
-    let config = GlobalConfig {
-        enable_redirect: Some(true),
-        ..GlobalConfig::default()
-    };
-    assert!(config.resolved_enable_blob_redirect());
-    assert!(config.resolved_enable_manifest_redirect());
-}
-
-#[test]
-fn test_redirect_resolver_only_enable_redirect_false() {
-    let config = GlobalConfig {
-        enable_redirect: Some(false),
-        ..GlobalConfig::default()
-    };
-    assert!(!config.resolved_enable_blob_redirect());
-    assert!(!config.resolved_enable_manifest_redirect());
-}
-
-#[test]
-fn test_redirect_resolver_both_new_fields_set() {
-    let config = GlobalConfig {
-        enable_blob_redirect: Some(true),
-        enable_manifest_redirect: Some(false),
-        ..GlobalConfig::default()
-    };
-    assert!(config.resolved_enable_blob_redirect());
-    assert!(!config.resolved_enable_manifest_redirect());
-}
-
-#[test]
-fn test_redirect_resolver_new_wins_over_old() {
-    let config = GlobalConfig {
-        enable_redirect: Some(false),
-        enable_blob_redirect: Some(true),
-        ..GlobalConfig::default()
-    };
-    assert!(config.resolved_enable_blob_redirect());
-    assert!(!config.resolved_enable_manifest_redirect());
-}
-
-#[test]
-fn test_redirect_resolver_nothing_set_defaults_true() {
-    let config = GlobalConfig::default();
-    assert!(config.resolved_enable_blob_redirect());
-    assert!(config.resolved_enable_manifest_redirect());
-}
-
-#[test]
 fn event_webhook_valid_global_reference_loads() {
     let config = r#"
     [server]
@@ -1307,99 +1017,6 @@ fn event_webhook_valid_repo_reference_loads() {
     let config = Configuration::load_from_str(config).unwrap();
     assert!(config.repository.contains_key("myrepo"));
     assert!(config.event_webhook.contains_key("repo-hook"));
-}
-
-#[test]
-fn event_webhook_bad_global_reference_fails_load() {
-    let config = r#"
-    [server]
-    bind_address = "0.0.0.0"
-
-    [global]
-    event_webhooks = ["nonexistent-hook"]
-    "#;
-
-    let result = Configuration::load_from_str(config);
-    assert!(result.is_err());
-    let msg = result.unwrap_err().to_string();
-    assert!(
-        msg.contains("nonexistent-hook"),
-        "Error must name the unresolved webhook: {msg}"
-    );
-    assert!(
-        msg.contains("globally") || msg.contains("global"),
-        "Error must identify global as the source: {msg}"
-    );
-}
-
-#[test]
-fn event_webhook_bad_repo_reference_fails_load() {
-    let config = r#"
-    [server]
-    bind_address = "0.0.0.0"
-
-    [repository.prod]
-    event_webhooks = ["ghost-hook"]
-    "#;
-
-    let result = Configuration::load_from_str(config);
-    assert!(result.is_err());
-    let msg = result.unwrap_err().to_string();
-    assert!(
-        msg.contains("ghost-hook"),
-        "Error must name the unresolved webhook: {msg}"
-    );
-    assert!(
-        msg.contains("prod"),
-        "Error must identify the repository as the source: {msg}"
-    );
-}
-
-#[test]
-fn deprecated_fields_empty_when_no_deprecated_config() {
-    let config = r#"
-    [server]
-    bind_address = "0.0.0.0"
-    "#;
-
-    let config = Configuration::load_from_str(config).unwrap();
-    assert!(
-        config.deprecated_fields().is_empty(),
-        "No deprecated fields should be reported for a clean config"
-    );
-}
-
-#[test]
-fn deprecated_fields_contains_enable_redirect_when_set() {
-    let config = r#"
-    [server]
-    bind_address = "0.0.0.0"
-
-    [global]
-    enable_redirect = true
-    "#;
-
-    let config = Configuration::load_from_str(config).unwrap();
-    let fields = config.deprecated_fields();
-    assert_eq!(fields, vec!["global.enable_redirect"]);
-}
-
-#[test]
-fn deprecated_fields_not_present_when_new_redirect_fields_used() {
-    let config = r#"
-    [server]
-    bind_address = "0.0.0.0"
-
-    [global]
-    enable_blob_redirect = true
-    enable_manifest_redirect = false
-    "#;
-
-    let config = Configuration::load_from_str(config).unwrap();
-    assert!(
-        config.deprecated_fields().is_empty(),
-        "New redirect fields must not trigger the deprecation warning"
-    );
 }
 
 #[test]

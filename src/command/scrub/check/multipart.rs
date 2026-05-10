@@ -1,45 +1,40 @@
 use std::sync::Arc;
 
+use async_trait::async_trait;
 use chrono::Duration;
 use tracing::info;
 
-use crate::registry::blob_store::{Error, MultipartCleanup};
+use crate::{
+    command::scrub::{action::Action, check::StoreChecker, error::Error, executor::ActionSink},
+    registry::blob_store::{self, MultipartCleanup},
+};
 
 pub struct MultipartChecker {
     cleanup: Arc<dyn MultipartCleanup + Send + Sync>,
     timeout: Duration,
-    dry_run: bool,
 }
 
 impl MultipartChecker {
-    pub fn new(
-        cleanup: Arc<dyn MultipartCleanup + Send + Sync>,
-        timeout: Duration,
-        dry_run: bool,
-    ) -> Self {
-        Self {
-            cleanup,
-            timeout,
-            dry_run,
-        }
+    pub fn new(cleanup: Arc<dyn MultipartCleanup + Send + Sync>, timeout: Duration) -> Self {
+        Self { cleanup, timeout }
     }
+}
 
-    pub async fn check_all(&self) -> Result<(), Error> {
+#[async_trait]
+impl StoreChecker for MultipartChecker {
+    async fn check_all(&self, sink: &mut (dyn ActionSink + Send)) -> Result<(), Error> {
         let orphans = self
             .cleanup
             .list_orphan_multipart_uploads(self.timeout)
-            .await?;
+            .await
+            .map_err(|e: blob_store::Error| Error::from(e))?;
         let count = orphans.len();
         for orphan in &orphans {
-            if self.dry_run {
-                info!(
-                    "DRY RUN: would abort orphan multipart upload {}",
-                    orphan.key
-                );
-            } else {
-                info!("Aborting orphan multipart upload {}", orphan.key);
-                self.cleanup.abort_orphan_multipart_upload(orphan).await?;
-            }
+            sink.apply(Action::AbortMultipartUpload {
+                key: orphan.key.clone(),
+                upload_id: orphan.upload_id.clone(),
+            })
+            .await?;
         }
         info!("Cleaned up {count} orphan multipart upload(s)");
         Ok(())
@@ -57,7 +52,10 @@ mod tests {
     use async_trait::async_trait;
 
     use super::*;
-    use crate::registry::blob_store::OrphanMultipartUpload;
+    use crate::{
+        command::scrub::{action::Action, executor::Executor},
+        registry::{blob_store::OrphanMultipartUpload, test_utils::backends},
+    };
 
     struct SpyCleanup {
         list_called_timeout_secs: AtomicI64,
@@ -80,7 +78,7 @@ mod tests {
         async fn list_orphan_multipart_uploads(
             &self,
             timeout: Duration,
-        ) -> Result<Vec<OrphanMultipartUpload>, Error> {
+        ) -> Result<Vec<OrphanMultipartUpload>, blob_store::Error> {
             self.list_called_timeout_secs
                 .store(timeout.num_seconds(), Ordering::SeqCst);
             Ok(self
@@ -96,18 +94,19 @@ mod tests {
         async fn abort_orphan_multipart_upload(
             &self,
             _upload: &OrphanMultipartUpload,
-        ) -> Result<(), Error> {
+        ) -> Result<(), blob_store::Error> {
             self.abort_call_count.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
     }
 
     #[tokio::test]
-    async fn check_all_lists_orphans_and_skips_abort_in_dry_run() {
+    async fn check_all_lists_orphans_and_captures_in_vec_sink() {
         let spy = SpyCleanup::new(vec!["ns/_uploads/uuid1/data", "ns/_uploads/uuid2/data"]);
-        let checker = MultipartChecker::new(spy.clone(), Duration::hours(2), true);
+        let checker = MultipartChecker::new(spy.clone(), Duration::hours(2));
 
-        checker.check_all().await.unwrap();
+        let mut sink: Vec<Action> = Vec::new();
+        checker.check_all(&mut sink).await.unwrap();
 
         assert_eq!(
             spy.list_called_timeout_secs.load(Ordering::SeqCst),
@@ -117,22 +116,32 @@ mod tests {
         assert_eq!(
             spy.abort_call_count.load(Ordering::SeqCst),
             0,
-            "dry_run must not invoke abort"
+            "Vec sink must not invoke abort"
+        );
+        assert_eq!(sink.len(), 2, "two orphans produce two actions");
+        assert!(
+            sink.iter()
+                .all(|a| matches!(a, Action::AbortMultipartUpload { .. }))
         );
     }
 
     #[tokio::test]
-    async fn check_all_aborts_orphans_when_not_dry_run() {
+    async fn check_all_aborts_orphans_when_executor_used() {
         let spy = SpyCleanup::new(vec!["ns/_uploads/uuid1/data", "ns/_uploads/uuid2/data"]);
-        let checker = MultipartChecker::new(spy.clone(), Duration::hours(2), false);
+        let checker = MultipartChecker::new(spy.clone(), Duration::hours(2));
 
-        checker.check_all().await.unwrap();
-
-        assert_eq!(
-            spy.list_called_timeout_secs.load(Ordering::SeqCst),
-            7200,
-            "timeout forwarded as 2 h = 7200 s"
+        // Use the first available test backend just for stores; only
+        // multipart_cleanup is exercised in this test.
+        let test_case = backends().into_iter().next().unwrap();
+        let mut executor = Executor::new(
+            test_case.blob_store(),
+            test_case.metadata_store(),
+            test_case.upload_store(),
+            spy.clone(),
         );
+
+        checker.check_all(&mut executor).await.unwrap();
+
         assert_eq!(
             spy.abort_call_count.load(Ordering::SeqCst),
             2,
@@ -149,22 +158,25 @@ mod tests {
             async fn list_orphan_multipart_uploads(
                 &self,
                 _timeout: Duration,
-            ) -> Result<Vec<OrphanMultipartUpload>, Error> {
-                Err(Error::StorageBackend("backend failure".to_string()))
+            ) -> Result<Vec<OrphanMultipartUpload>, blob_store::Error> {
+                Err(blob_store::Error::StorageBackend(
+                    "backend failure".to_string(),
+                ))
             }
 
             async fn abort_orphan_multipart_upload(
                 &self,
                 _upload: &OrphanMultipartUpload,
-            ) -> Result<(), Error> {
+            ) -> Result<(), blob_store::Error> {
                 Ok(())
             }
         }
 
-        let checker = MultipartChecker::new(Arc::new(FailingCleanup), Duration::minutes(30), false);
+        let checker = MultipartChecker::new(Arc::new(FailingCleanup), Duration::minutes(30));
+        let mut sink: Vec<Action> = Vec::new();
 
         assert!(
-            checker.check_all().await.is_err(),
+            checker.check_all(&mut sink).await.is_err(),
             "errors from the cleanup backend must propagate"
         );
     }

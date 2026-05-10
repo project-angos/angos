@@ -23,7 +23,7 @@ pub mod version;
 
 pub use blob::GetBlobResponse;
 pub use error::Error;
-pub use manifest::{GetManifestResponse, parse_manifest_digests};
+pub use manifest::{GetManifestResponse, ParsedManifestDigests, parse_manifest_digests};
 pub use repository::Repository;
 pub use upload::StartUploadResponse;
 

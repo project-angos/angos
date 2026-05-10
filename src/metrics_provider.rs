@@ -7,7 +7,7 @@ use prometheus::{
 };
 use tracing::error;
 
-use crate::registry::Error;
+use crate::registry::{Error, metadata_store::lock::metrics::LockMetrics};
 
 pub static IN_FLIGHT_REQUESTS: AtomicU64 = AtomicU64::new(0);
 
@@ -66,11 +66,7 @@ pub struct MetricsProvider {
     pub metric_http_request_duration: HistogramVec,
     pub metric_http_request_in_flight: IntGauge,
     pub auth_attempts: IntCounterVec,
-    pub lock_acquisition_duration: HistogramVec,
-    pub lock_acquisitions: IntCounterVec,
-    pub lock_retries: IntCounterVec,
-    pub lock_invalidations: IntCounterVec,
-    pub lock_recoveries: IntCounterVec,
+    pub locks: LockMetrics,
 }
 
 struct HttpMetrics {
@@ -123,19 +119,8 @@ fn register_http_metrics(registry: &PrometheusRegistry) -> Result<HttpMetrics, E
     })
 }
 
-struct LockAndAuthMetrics {
-    auth_attempts: IntCounterVec,
-    lock_acquisition_duration: HistogramVec,
-    lock_acquisitions: IntCounterVec,
-    lock_retries: IntCounterVec,
-    lock_invalidations: IntCounterVec,
-    lock_recoveries: IntCounterVec,
-}
-
-fn register_lock_and_auth_metrics(
-    registry: &PrometheusRegistry,
-) -> Result<LockAndAuthMetrics, Error> {
-    let auth_attempts = register_int_counter_vec_with_registry!(
+fn register_auth_metrics(registry: &PrometheusRegistry) -> Result<IntCounterVec, Error> {
+    register_int_counter_vec_with_registry!(
         "auth_attempts_total",
         "Total number of authentication attempts",
         &["method", "result"],
@@ -144,78 +129,6 @@ fn register_lock_and_auth_metrics(
     .map_err(|error| {
         error!("Unable to create auth_attempts_total metric: {error}");
         Error::Initialization(String::from("Unable to create auth_attempts_total metric"))
-    })?;
-
-    let lock_acquisition_duration = register_histogram_vec_with_registry!(
-        "lock_acquisition_duration_ms",
-        "Lock acquisition duration in milliseconds",
-        &["backend"],
-        registry
-    )
-    .map_err(|error| {
-        error!("Unable to create lock_acquisition_duration_ms metric: {error}");
-        Error::Initialization(String::from(
-            "Unable to create lock_acquisition_duration_ms metric",
-        ))
-    })?;
-
-    let lock_acquisitions = register_int_counter_vec_with_registry!(
-        "lock_acquisitions_total",
-        "Total lock acquisition attempts",
-        &["backend", "result"],
-        registry
-    )
-    .map_err(|error| {
-        error!("Unable to create lock_acquisitions_total metric: {error}");
-        Error::Initialization(String::from(
-            "Unable to create lock_acquisitions_total metric",
-        ))
-    })?;
-
-    let lock_retries = register_int_counter_vec_with_registry!(
-        "lock_retries_total",
-        "Total lock acquisition retries",
-        &["backend"],
-        registry
-    )
-    .map_err(|error| {
-        error!("Unable to create lock_retries_total metric: {error}");
-        Error::Initialization(String::from("Unable to create lock_retries_total metric"))
-    })?;
-
-    let lock_invalidations = register_int_counter_vec_with_registry!(
-        "lock_invalidations_total",
-        "Total lock invalidations",
-        &["backend", "reason"],
-        registry
-    )
-    .map_err(|error| {
-        error!("Unable to create lock_invalidations_total metric: {error}");
-        Error::Initialization(String::from(
-            "Unable to create lock_invalidations_total metric",
-        ))
-    })?;
-
-    let lock_recoveries = register_int_counter_vec_with_registry!(
-        "lock_recoveries_total",
-        "Total stale lock recovery attempts",
-        &["backend", "result"],
-        registry
-    )
-    .map_err(|error| {
-        error!("Unable to create lock_recoveries_total metric: {error}");
-        Error::Initialization(String::from(
-            "Unable to create lock_recoveries_total metric",
-        ))
-    })?;
-
-    Ok(LockAndAuthMetrics {
-        auth_attempts,
-        lock_acquisition_duration,
-        lock_acquisitions,
-        lock_retries,
-        lock_invalidations,
-        lock_recoveries,
     })
 }
 
@@ -223,19 +136,16 @@ impl MetricsProvider {
     pub fn new() -> Result<Self, Error> {
         let registry = PrometheusRegistry::new();
         let http = register_http_metrics(&registry)?;
-        let lock_auth = register_lock_and_auth_metrics(&registry)?;
+        let auth_attempts = register_auth_metrics(&registry)?;
+        let locks = crate::registry::metadata_store::lock::metrics::register(&registry)?;
 
         Ok(Self {
             registry,
             metric_http_request_total: http.total,
             metric_http_request_duration: http.duration,
             metric_http_request_in_flight: http.in_flight,
-            auth_attempts: lock_auth.auth_attempts,
-            lock_acquisition_duration: lock_auth.lock_acquisition_duration,
-            lock_acquisitions: lock_auth.lock_acquisitions,
-            lock_retries: lock_auth.lock_retries,
-            lock_invalidations: lock_auth.lock_invalidations,
-            lock_recoveries: lock_auth.lock_recoveries,
+            auth_attempts,
+            locks,
         })
     }
 

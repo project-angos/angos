@@ -1,16 +1,19 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use futures_util::StreamExt;
 use tracing::{debug, error};
 
 use crate::{
-    command::scrub::check::{NamespaceChecker, ensure_link},
+    command::scrub::{
+        check::{NamespaceChecker, ensure_link, list_all},
+        error::Error,
+        executor::ActionSink,
+    },
     oci::Digest,
     registry::{
-        Error,
         blob_store::BlobStore,
         metadata_store::{MetadataStore, link_kind::LinkKind},
-        pagination::for_each_page,
         parse_manifest_digests,
     },
 };
@@ -18,23 +21,25 @@ use crate::{
 pub struct ManifestChecker {
     blob_store: Arc<dyn BlobStore + Send + Sync>,
     metadata_store: Arc<dyn MetadataStore + Send + Sync>,
-    dry_run: bool,
 }
 
 impl ManifestChecker {
     pub fn new(
         blob_store: Arc<dyn BlobStore + Send + Sync>,
         metadata_store: Arc<dyn MetadataStore + Send + Sync>,
-        dry_run: bool,
     ) -> Self {
         Self {
             blob_store,
             metadata_store,
-            dry_run,
         }
     }
 
-    async fn repair_manifest_links(&self, namespace: &str, revision: &Digest) -> Result<(), Error> {
+    async fn repair_manifest_links(
+        &self,
+        namespace: &str,
+        revision: &Digest,
+        sink: &mut (dyn ActionSink + Send),
+    ) -> Result<(), Error> {
         let content = self.blob_store.read(revision).await?;
         let manifest = parse_manifest_digests(&content, None)?;
 
@@ -44,7 +49,7 @@ impl ManifestChecker {
                 namespace,
                 &LinkKind::Layer(layer.clone()),
                 layer,
-                self.dry_run,
+                sink,
             )
             .await?;
         }
@@ -55,7 +60,7 @@ impl ManifestChecker {
                 namespace,
                 &LinkKind::Config(config.clone()),
                 config,
-                self.dry_run,
+                sink,
             )
             .await?;
         }
@@ -66,7 +71,7 @@ impl ManifestChecker {
                 namespace,
                 &LinkKind::Referrer(subject.clone(), revision.clone()),
                 revision,
-                self.dry_run,
+                sink,
             )
             .await?;
         }
@@ -77,46 +82,46 @@ impl ManifestChecker {
                 namespace,
                 &LinkKind::Manifest(revision.clone(), child.clone()),
                 child,
-                self.dry_run,
+                sink,
             )
             .await?;
         }
 
         Ok(())
     }
-
-    async fn process_page(&self, namespace: &str, revisions: Vec<Digest>) -> Result<(), Error> {
-        for revision in &revisions {
-            if let Err(e) = self.repair_manifest_links(namespace, revision).await {
-                error!("Failed to check tag from '{namespace}' (revision '{revision}'): {e}");
-            }
-        }
-        Ok(())
-    }
 }
 
 #[async_trait]
 impl NamespaceChecker for ManifestChecker {
-    async fn check_namespace(&self, namespace: &str) -> Result<(), Error> {
+    async fn check(
+        &self,
+        namespace: &str,
+        sink: &mut (dyn ActionSink + Send),
+    ) -> Result<(), Error> {
         debug!("Checking manifest inconsistencies from namespace '{namespace}'");
 
-        for_each_page(
-            |marker| async move {
-                self.metadata_store
-                    .list_revisions(namespace, 100, marker)
-                    .await
-                    .map_err(Error::from)
-            },
-            |revisions| self.process_page(namespace, revisions),
-        )
-        .await
+        let mut revisions = list_all::revisions(&self.metadata_store, namespace);
+        while let Some(revision) = revisions.next().await {
+            let revision = revision?;
+            if let Err(e) = self.repair_manifest_links(namespace, &revision, sink).await {
+                error!("Failed to check tag from '{namespace}' (revision '{revision}'): {e}");
+            }
+        }
+
+        Ok(())
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::registry::{metadata_store::MetadataStoreExt, test_utils, test_utils::backends};
+    use crate::{
+        command::scrub::executor::Executor,
+        registry::{
+            metadata_store::MetadataStoreExt,
+            test_utils::{self, NoopMultipart, backends},
+        },
+    };
 
     #[tokio::test]
     async fn test_scrub_revisions_validates_manifest_links() {
@@ -161,9 +166,15 @@ mod tests {
                 .add();
             tx.commit().await.unwrap();
 
-            let scrubber = ManifestChecker::new(blob_store.clone(), metadata_store.clone(), false);
+            let mut executor = Executor::new(
+                blob_store.clone(),
+                metadata_store.clone(),
+                test_case.upload_store(),
+                std::sync::Arc::new(NoopMultipart),
+            );
 
-            scrubber.check_namespace(namespace).await.unwrap();
+            let scrubber = ManifestChecker::new(blob_store.clone(), metadata_store.clone());
+            scrubber.check(namespace, &mut executor).await.unwrap();
 
             let config_link = metadata_store
                 .read_link(namespace, &LinkKind::Config(config_digest.clone()), false)
@@ -173,14 +184,8 @@ mod tests {
                 .read_link(namespace, &LinkKind::Layer(layer_digest.clone()), false)
                 .await;
 
-            assert!(
-                config_link.is_ok(),
-                "scrub_revisions should ensure config link exists"
-            );
-            assert!(
-                layer_link.is_ok(),
-                "scrub_revisions should ensure layer link exists"
-            );
+            assert!(config_link.is_ok());
+            assert!(layer_link.is_ok());
         }
     }
 }

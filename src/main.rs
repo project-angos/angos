@@ -10,7 +10,7 @@ use opentelemetry_sdk::{
     Resource,
     trace::{RandomIdGenerator, Sampler, SdkTracerProvider},
 };
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
 
 use crate::{
@@ -152,7 +152,7 @@ async fn run_command(cli_args: GlobalArguments, config: Configuration) {
     config.log_deprecations();
 
     let exit_code = match cli_args.subcommand {
-        SubCommand::Argon(_) => match argon::Command::run() {
+        SubCommand::Argon(_) => match argon::run() {
             Ok(()) => 0,
             Err(err) => {
                 error!("Argon error: {}", err);
@@ -187,7 +187,7 @@ async fn run_command(cli_args: GlobalArguments, config: Configuration) {
 }
 
 async fn run_scrub(options: scrub::Options, config: Configuration) -> Result<(), scrub::Error> {
-    let scrub = scrub::Command::new(&options, &config).await?;
+    let mut scrub = scrub::Command::new(&options, &config).await?;
     scrub.run().await
 }
 
@@ -214,12 +214,16 @@ async fn shutdown_signal() {
     let ctrl_c = tokio::signal::ctrl_c();
 
     #[cfg(unix)]
-    {
-        let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-            .expect("failed to register SIGTERM handler");
-        tokio::select! {
-            _ = ctrl_c => {}
-            _ = sigterm.recv() => {}
+    match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+        Ok(mut sigterm) => {
+            tokio::select! {
+                _ = ctrl_c => {}
+                _ = sigterm.recv() => {}
+            }
+        }
+        Err(e) => {
+            warn!("Failed to register SIGTERM handler, falling back to ctrl-c only: {e}");
+            let _ = ctrl_c.await;
         }
     }
 
