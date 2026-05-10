@@ -16,6 +16,7 @@ use tracing::warn;
 use crate::registry::metadata_store::Error;
 
 pub mod memory;
+pub mod metrics;
 pub mod redis;
 pub mod s3;
 

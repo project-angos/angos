@@ -16,7 +16,7 @@ mod config;
 pub mod fs;
 pub mod link_kind;
 mod link_metadata;
-mod lock;
+pub mod lock;
 pub mod lock_ops;
 pub mod referrer_resolver;
 pub mod s3;
