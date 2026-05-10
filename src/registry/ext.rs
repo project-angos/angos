@@ -51,16 +51,16 @@ struct NamespacesBody {
 }
 
 #[derive(Serialize, Debug, Clone, PartialEq)]
-struct Platform {
+struct ExtPlatform {
     os: String,
     architecture: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     variant: Option<String>,
 }
 
-impl From<OciPlatform> for Platform {
+impl From<OciPlatform> for ExtPlatform {
     fn from(p: OciPlatform) -> Self {
-        Platform {
+        ExtPlatform {
             os: p.os,
             architecture: p.architecture,
             variant: p.variant,
@@ -73,7 +73,7 @@ struct ParentRef {
     digest: String,
     tags: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    platform: Option<Platform>,
+    platform: Option<ExtPlatform>,
 }
 
 #[derive(Serialize, Debug, Clone)]
@@ -187,7 +187,7 @@ fn extract_in_toto_predicate(child_manifest: &Manifest) -> Option<String> {
 struct ManifestAnalysis {
     /// Index children that are NOT referrers — `(child_digest, platform)` pairs
     /// where the analyzed manifest is the parent.
-    parent_links: Vec<(Digest, Option<Platform>)>,
+    parent_links: Vec<(Digest, Option<ExtPlatform>)>,
     /// Docker-style referrer candidates carried by this manifest.
     referrer_candidates: Vec<DockerReferrerCandidate>,
 }
@@ -203,7 +203,7 @@ fn analyze_manifest(manifest: &Manifest) -> ManifestAnalysis {
         } else {
             parent_links.push((
                 child.digest.clone(),
-                child.platform.clone().map(Platform::from),
+                child.platform.clone().map(ExtPlatform::from),
             ));
         }
     }
@@ -231,7 +231,7 @@ fn build_digest_to_tags_map_from_pairs(
 /// tag maps. Produces an empty `Vec` when `digest` has no recorded parents.
 fn parent_refs_for(
     digest: &Digest,
-    child_to_parents: &HashMap<Digest, Vec<(Digest, Option<Platform>)>>,
+    child_to_parents: &HashMap<Digest, Vec<(Digest, Option<ExtPlatform>)>>,
     digest_to_tags: &HashMap<Digest, Vec<String>>,
 ) -> Vec<ParentRef> {
     child_to_parents
@@ -398,10 +398,11 @@ impl Registry {
         &self,
         all_revisions: &[Digest],
     ) -> (
-        HashMap<Digest, Vec<(Digest, Option<Platform>)>>,
+        HashMap<Digest, Vec<(Digest, Option<ExtPlatform>)>>,
         HashMap<Digest, Vec<ReferrerInfo>>,
     ) {
-        let mut child_to_parents: HashMap<Digest, Vec<(Digest, Option<Platform>)>> = HashMap::new();
+        let mut child_to_parents: HashMap<Digest, Vec<(Digest, Option<ExtPlatform>)>> =
+            HashMap::new();
         let mut docker_referrers: HashMap<Digest, Vec<ReferrerInfo>> = HashMap::new();
 
         for digest in all_revisions {
@@ -453,7 +454,7 @@ impl Registry {
         namespace: &Namespace,
         all_revisions: Vec<Digest>,
         digest_to_tags: &HashMap<Digest, Vec<String>>,
-        child_to_parents: HashMap<Digest, Vec<(Digest, Option<Platform>)>>,
+        child_to_parents: HashMap<Digest, Vec<(Digest, Option<ExtPlatform>)>>,
         mut docker_referrers: HashMap<Digest, Vec<ReferrerInfo>>,
     ) -> Vec<ManifestEntry> {
         let mut manifests: Vec<ManifestEntry> = Vec::with_capacity(all_revisions.len());
@@ -556,8 +557,8 @@ mod tests {
     use std::collections::HashMap;
 
     use super::{
-        Platform, analyze_manifest, build_digest_to_tags_map_from_pairs, extract_docker_referrer,
-        extract_in_toto_predicate, parent_refs_for,
+        ExtPlatform, analyze_manifest, build_digest_to_tags_map_from_pairs,
+        extract_docker_referrer, extract_in_toto_predicate, parent_refs_for,
     };
     use crate::oci::{Descriptor, Digest, Manifest, Platform as OciPlatform};
 
@@ -847,7 +848,7 @@ mod tests {
 
     #[test]
     fn parent_refs_for_returns_empty_when_digest_not_in_parent_map() {
-        let child_to_parents: HashMap<Digest, Vec<(Digest, Option<Platform>)>> = HashMap::new();
+        let child_to_parents: HashMap<Digest, Vec<(Digest, Option<ExtPlatform>)>> = HashMap::new();
         let digest_to_tags: HashMap<Digest, Vec<String>> = HashMap::new();
         let result = parent_refs_for(&digest("cccc"), &child_to_parents, &digest_to_tags);
         assert!(result.is_empty());
@@ -884,7 +885,7 @@ mod tests {
         let child = digest("1234");
         let parent_a = digest("aaaa");
         let parent_b = digest("bbbb");
-        let platform = Platform {
+        let platform = ExtPlatform {
             os: "linux".to_string(),
             architecture: "arm64".to_string(),
             variant: Some("v8".to_string()),
