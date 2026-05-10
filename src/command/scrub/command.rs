@@ -1,20 +1,21 @@
 use std::sync::Arc;
 
 use argh::FromArgs;
+use futures_util::StreamExt;
 use tracing::info;
 
 use crate::{
     command::{
         bootstrap,
         scrub::{
-            check::{BlobChecker, MultipartChecker, NamespaceChecker, StoreChecker},
+            check::{BlobChecker, MultipartChecker, NamespaceChecker, StoreChecker, list_all},
             error::Error,
             executor::Executor,
             setup,
         },
     },
     configuration::Configuration,
-    registry::{metadata_store::MetadataStore, pagination::collect_all_pages},
+    registry::metadata_store::MetadataStore,
 };
 
 #[derive(FromArgs, PartialEq, Debug)]
@@ -112,10 +113,9 @@ impl Command {
     }
 
     async fn scrub_metadata(&mut self) -> Result<(), Error> {
-        let namespaces =
-            collect_all_pages(|marker| self.metadata_store.list_namespaces(100, marker)).await?;
-
-        for namespace in namespaces {
+        let mut namespaces = list_all::namespaces(&self.metadata_store);
+        while let Some(namespace) = namespaces.next().await {
+            let namespace = namespace?;
             for i in 0..self.namespace_checkers.len() {
                 if let Err(e) = self.namespace_checkers[i]
                     .check(&namespace, &mut self.executor)
@@ -125,7 +125,6 @@ impl Command {
                 }
             }
         }
-
         Ok(())
     }
 

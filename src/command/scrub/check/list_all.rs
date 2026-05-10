@@ -62,6 +62,17 @@ pub fn blobs(blob_store: &Arc<dyn BlobStore + Send + Sync>) -> ResultStream<'_, 
     }))
 }
 
+pub fn namespaces(
+    metadata_store: &Arc<dyn MetadataStore + Send + Sync>,
+) -> ResultStream<'_, String> {
+    Box::pin(paginated(move |marker| async move {
+        metadata_store
+            .list_namespaces(PAGE_SIZE, marker)
+            .await
+            .map_err(Error::from)
+    }))
+}
+
 /// Drives a paginated source as a stream. Each yielded item is one entry from
 /// the underlying source; pages are fetched lazily, one at a time.
 fn paginated<T, F, Fut>(fetch: F) -> impl Stream<Item = Result<T, Error>>
@@ -120,6 +131,31 @@ mod tests {
             }
 
             assert_eq!(collected, vec![digest]);
+        }
+    }
+
+    #[tokio::test]
+    async fn namespaces_streams_each_stored_namespace() {
+        for test_case in backends() {
+            let registry = test_case.registry();
+            let metadata_store = test_case.metadata_store();
+            let namespace = "list-all-test/namespaces";
+
+            let (digest, _) =
+                crate::registry::test_utils::create_test_blob(registry, namespace, b"manifest")
+                    .await;
+            let mut tx = metadata_store.begin_transaction(namespace);
+            tx.create_link(&LinkKind::Digest(digest.clone()), &digest)
+                .add();
+            tx.commit().await.unwrap();
+
+            let mut stream = namespaces(&metadata_store);
+            let mut collected: Vec<String> = Vec::new();
+            while let Some(item) = stream.next().await {
+                collected.push(item.unwrap());
+            }
+
+            assert!(collected.contains(&namespace.to_string()));
         }
     }
 }
