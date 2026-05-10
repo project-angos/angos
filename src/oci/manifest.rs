@@ -51,13 +51,15 @@ impl Manifest {
         }
     }
 
-    /// Builds a `Descriptor` for this manifest. Returns `None` only when the
-    /// manifest carries no `media_type`. Filter-mismatch is a separate concern;
-    /// callers that need filtering call `artifact_type_matches` first.
-    pub fn to_descriptor(&self, digest: Digest, size: u64) -> Option<Descriptor> {
+    /// Builds a `Descriptor` for this manifest, moving the (potentially large)
+    /// annotations map out of `self` rather than cloning it. Returns `None`
+    /// only when the manifest carries no `media_type`. Filter-mismatch is a
+    /// separate concern; callers that need filtering call
+    /// `artifact_type_matches` first.
+    pub fn take_descriptor(&mut self, digest: Digest, size: u64) -> Option<Descriptor> {
         Some(Descriptor {
             media_type: self.media_type.clone()?,
-            annotations: self.annotations.clone(),
+            annotations: std::mem::take(&mut self.annotations),
             artifact_type: self.artifact_type.clone(),
             platform: None,
             digest,
@@ -140,12 +142,12 @@ mod tests {
         );
     }
 
-    // to_descriptor: media_type present → Some(Descriptor)
+    // take_descriptor: media_type present → Some(Descriptor)
     #[test]
-    fn test_to_descriptor_with_media_type_returns_descriptor() {
-        let manifest = demo_manifest();
+    fn test_take_descriptor_with_media_type_returns_descriptor() {
+        let mut manifest = demo_manifest();
         let digest = valid_digest();
-        let descriptor = manifest.to_descriptor(digest.clone(), 999);
+        let descriptor = manifest.take_descriptor(digest.clone(), 999);
         let d = descriptor.expect("expected Some(Descriptor)");
         assert_eq!(d.media_type, MEDIA_TYPE_MANIFEST);
         assert_eq!(d.digest, digest);
@@ -153,14 +155,14 @@ mod tests {
         assert_eq!(d.artifact_type.as_deref(), Some("oci.image.index.v1"));
     }
 
-    // to_descriptor: media_type absent → None (only reason to return None now)
+    // take_descriptor: media_type absent → None (only reason to return None now)
     #[test]
-    fn test_to_descriptor_no_media_type_returns_none() {
-        let manifest = Manifest {
+    fn test_take_descriptor_no_media_type_returns_none() {
+        let mut manifest = Manifest {
             media_type: None,
             ..Manifest::default()
         };
-        let descriptor = manifest.to_descriptor(valid_digest(), 0);
+        let descriptor = manifest.take_descriptor(valid_digest(), 0);
         assert!(descriptor.is_none(), "absent media_type must yield None");
     }
 

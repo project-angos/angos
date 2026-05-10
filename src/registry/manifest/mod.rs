@@ -232,7 +232,7 @@ impl Registry {
         content_type: Option<&String>,
         body: &[u8],
     ) -> Result<PutManifestResponse, Error> {
-        let manifest = parse_and_validate_manifest(body, content_type)?;
+        let mut manifest = parse_and_validate_manifest(body, content_type)?;
 
         let digest = self.blob_store.create(body).await?;
 
@@ -263,7 +263,7 @@ impl Registry {
 
         if let Some(subject) = &manifest.subject {
             let referrer_link = LinkKind::Referrer(subject.digest.clone(), digest.clone());
-            if let Some(descriptor) = manifest.to_descriptor(digest.clone(), body.len() as u64) {
+            if let Some(descriptor) = manifest.take_descriptor(digest.clone(), body.len() as u64) {
                 tx.create_link(&referrer_link, &digest)
                     .with_descriptor(descriptor)
                     .add();
