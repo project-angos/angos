@@ -1,0 +1,432 @@
+use std::{
+    collections::HashMap,
+    net::{IpAddr, Ipv4Addr, Ipv6Addr},
+};
+
+use chrono::Utc;
+use uuid::Uuid;
+use wiremock::{
+    Mock, MockServer, ResponseTemplate,
+    matchers::{method, path},
+};
+
+use super::*;
+use crate::{
+    command::server::server_context::tests::create_test_server_context,
+    configuration::Configuration,
+    event_webhook::event::{Event, EventKind},
+    registry::{Registry, RegistryConfig},
+};
+
+#[test]
+fn test_config_default_values() {
+    let config = InsecureListenerConfig::default();
+
+    assert_eq!(config.port, 8000);
+    assert_eq!(config.query_timeout, 3600);
+    assert_eq!(config.query_timeout_grace_period, 60);
+    assert_eq!(config.bind_address, IpAddr::from(Ipv4Addr::from([0; 4])));
+}
+
+#[test]
+fn test_config_custom_values() {
+    let toml = r#"
+        bind_address = "192.168.1.100"
+        port = 9000
+        query_timeout = 7200
+        query_timeout_grace_period = 120
+    "#;
+
+    let config: InsecureListenerConfig = toml::from_str(toml).unwrap();
+
+    assert_eq!(config.port, 9000);
+    assert_eq!(config.query_timeout, 7200);
+    assert_eq!(config.query_timeout_grace_period, 120);
+    assert_eq!(
+        config.bind_address,
+        "192.168.1.100".parse::<IpAddr>().unwrap()
+    );
+}
+
+#[test]
+fn test_config_partial_defaults() {
+    let toml = r#"
+        bind_address = "10.0.0.1"
+    "#;
+
+    let config: InsecureListenerConfig = toml::from_str(toml).unwrap();
+
+    assert_eq!(config.port, 8000);
+    assert_eq!(config.query_timeout, 3600);
+    assert_eq!(config.query_timeout_grace_period, 60);
+}
+
+#[test]
+fn test_config_ipv6_address() {
+    let toml = r#"
+        bind_address = "::1"
+        port = 8443
+    "#;
+
+    let config: InsecureListenerConfig = toml::from_str(toml).unwrap();
+
+    assert_eq!(config.bind_address, IpAddr::from(Ipv6Addr::LOCALHOST));
+    assert_eq!(config.port, 8443);
+}
+
+#[tokio::test]
+async fn test_insecure_listener_new() {
+    let config = InsecureListenerConfig {
+        bind_address: "127.0.0.1".parse().unwrap(),
+        port: 8080,
+        query_timeout: 1800,
+        query_timeout_grace_period: 30,
+    };
+
+    let context = create_test_server_context().await;
+    let listener = InsecureListener::new(&config, context);
+
+    assert_eq!(
+        listener.binding_address,
+        SocketAddr::from(([127, 0, 0, 1], 8080))
+    );
+}
+
+#[tokio::test]
+async fn test_insecure_listener_new_with_ipv6() {
+    let config = InsecureListenerConfig {
+        bind_address: "::1".parse().unwrap(),
+        port: 9000,
+        query_timeout: 3600,
+        query_timeout_grace_period: 60,
+    };
+
+    let context = create_test_server_context().await;
+    let listener = InsecureListener::new(&config, context);
+
+    assert_eq!(
+        listener.binding_address.ip(),
+        "::1".parse::<IpAddr>().unwrap()
+    );
+    assert_eq!(listener.binding_address.port(), 9000);
+}
+
+#[tokio::test]
+async fn test_insecure_listener_notify_config_change() {
+    let config = InsecureListenerConfig::default();
+    let context1 = create_test_server_context().await;
+    let listener = InsecureListener::new(&config, context1);
+
+    let context2 = create_test_server_context().await;
+    listener.notify_config_change(context2);
+}
+
+#[tokio::test]
+async fn test_insecure_listener_timeouts_initialization() {
+    let config = InsecureListenerConfig {
+        bind_address: "127.0.0.1".parse().unwrap(),
+        port: 8080,
+        query_timeout: 5000,
+        query_timeout_grace_period: 100,
+    };
+
+    let context = create_test_server_context().await;
+    let listener = InsecureListener::new(&config, context);
+
+    let timeouts = listener.timeouts.load();
+    assert_eq!(timeouts[0], Duration::from_secs(5000));
+    assert_eq!(timeouts[1], Duration::from_secs(100));
+}
+
+#[tokio::test]
+async fn test_insecure_listener_with_zero_port() {
+    let config = InsecureListenerConfig {
+        bind_address: "127.0.0.1".parse().unwrap(),
+        port: 0,
+        query_timeout: 3600,
+        query_timeout_grace_period: 60,
+    };
+
+    let context = create_test_server_context().await;
+    let listener = InsecureListener::new(&config, context);
+
+    assert_eq!(listener.binding_address.port(), 0);
+}
+
+#[tokio::test]
+async fn test_insecure_listener_multiple_config_changes() {
+    let config = InsecureListenerConfig::default();
+    let context1 = create_test_server_context().await;
+    let listener = InsecureListener::new(&config, context1);
+
+    for _ in 0..5 {
+        let context = create_test_server_context().await;
+        listener.notify_config_change(context);
+    }
+}
+
+fn create_config_with_webhook(webhook_url: &str) -> Configuration {
+    let toml = format!(
+        r#"
+        [blob_store.fs]
+        root_dir = "/tmp/test-blobs"
+
+        [metadata_store.fs]
+        root_dir = "/tmp/test-metadata"
+
+        [cache.memory]
+
+        [server]
+        bind_address = "127.0.0.1"
+        port = 8080
+
+        [global]
+        update_pull_time = false
+        max_concurrent_cache_jobs = 10
+        event_webhooks = ["test_hook"]
+
+        [event_webhook.test_hook]
+        url = "{webhook_url}"
+        policy = "optional"
+        events = ["manifest.push"]
+    "#
+    );
+
+    toml::from_str(&toml).unwrap()
+}
+
+async fn create_server_context_from_config(config: &Configuration) -> ServerContext {
+    let blob_handles = config.blob_store.to_backend(None).unwrap();
+    let (metadata_store, _) = config
+        .resolve_metadata_config()
+        .to_backend(None)
+        .await
+        .unwrap();
+    let repositories = Arc::new(HashMap::new());
+
+    let registry_config = RegistryConfig::new()
+        .update_pull_time(false)
+        .enable_blob_redirect(true)
+        .enable_manifest_redirect(true)
+        .concurrent_cache_jobs(10)
+        .global_immutable_tags(false)
+        .global_immutable_tags_exclusions(Vec::new());
+
+    let registry = Registry::new(
+        blob_handles.blob_store,
+        blob_handles.upload_store,
+        blob_handles.presigned_store,
+        metadata_store,
+        repositories,
+        registry_config,
+    )
+    .unwrap();
+
+    ServerContext::new(config, registry).unwrap()
+}
+
+fn create_test_event() -> Event {
+    Event {
+        id: Uuid::new_v4(),
+        timestamp: Utc::now(),
+        kind: EventKind::ManifestPush,
+        namespace: "test/repo".to_string(),
+        digest: Some("sha256:abc123".to_string()),
+        reference: Some("sha256:abc123".to_string()),
+        tag: None,
+        actor: None,
+        repository: "test-repo".to_string(),
+    }
+}
+
+#[tokio::test]
+async fn test_hot_reload_updates_webhook_config() {
+    let listener_config = InsecureListenerConfig::default();
+    let context_without_webhooks = create_test_server_context().await;
+    let listener = InsecureListener::new(&listener_config, context_without_webhooks);
+
+    assert!(listener.current_context().event_dispatcher().is_none());
+
+    let config_with_webhook = create_config_with_webhook("https://example.com/webhook");
+    let context_with_webhooks = create_server_context_from_config(&config_with_webhook).await;
+    listener.notify_config_change(context_with_webhooks);
+
+    assert!(listener.current_context().event_dispatcher().is_some());
+}
+
+#[tokio::test]
+async fn test_hot_reload_removes_webhooks() {
+    let listener_config = InsecureListenerConfig::default();
+    let config_with_webhook = create_config_with_webhook("https://example.com/webhook");
+    let context_with_webhooks = create_server_context_from_config(&config_with_webhook).await;
+    let listener = InsecureListener::new(&listener_config, context_with_webhooks);
+
+    assert!(listener.current_context().event_dispatcher().is_some());
+
+    let context_without_webhooks = create_test_server_context().await;
+    listener.notify_config_change(context_without_webhooks);
+
+    assert!(listener.current_context().event_dispatcher().is_none());
+}
+
+#[tokio::test]
+async fn test_hot_reload_changes_webhook_url() {
+    let server_a = MockServer::start().await;
+    let server_b = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/webhook"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(0)
+        .mount(&server_a)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/webhook"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&server_b)
+        .await;
+
+    let listener_config = InsecureListenerConfig::default();
+    let config_a = create_config_with_webhook(&format!("{}/webhook", server_a.uri()));
+    let context_a = create_server_context_from_config(&config_a).await;
+    let listener = InsecureListener::new(&listener_config, context_a);
+
+    let config_b = create_config_with_webhook(&format!("{}/webhook", server_b.uri()));
+    let context_b = create_server_context_from_config(&config_b).await;
+    listener.notify_config_change(context_b);
+
+    let current_context = listener.current_context();
+    let event = create_test_event();
+    current_context.dispatch_event(&event).await.unwrap();
+}
+
+fn create_config_with_two_webhooks(url_a: &str, url_b: &str) -> Configuration {
+    let toml = format!(
+        r#"
+        [blob_store.fs]
+        root_dir = "/tmp/test-blobs"
+
+        [metadata_store.fs]
+        root_dir = "/tmp/test-metadata"
+
+        [cache.memory]
+
+        [server]
+        bind_address = "127.0.0.1"
+        port = 8080
+
+        [global]
+        update_pull_time = false
+        max_concurrent_cache_jobs = 10
+        event_webhooks = ["hook_a", "hook_b"]
+
+        [event_webhook.hook_a]
+        url = "{url_a}"
+        policy = "optional"
+        events = ["manifest.push"]
+
+        [event_webhook.hook_b]
+        url = "{url_b}"
+        policy = "optional"
+        events = ["manifest.push"]
+    "#
+    );
+
+    toml::from_str(&toml).unwrap()
+}
+
+#[tokio::test]
+async fn test_hot_reload_adds_second_webhook() {
+    let server_a = MockServer::start().await;
+    let server_b = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&server_a)
+        .await;
+
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&server_b)
+        .await;
+
+    let listener_config = InsecureListenerConfig::default();
+    let config_one = create_config_with_webhook(&server_a.uri());
+    let context_one = create_server_context_from_config(&config_one).await;
+    let listener = InsecureListener::new(&listener_config, context_one);
+
+    let config_two = create_config_with_two_webhooks(&server_a.uri(), &server_b.uri());
+    let context_two = create_server_context_from_config(&config_two).await;
+    listener.notify_config_change(context_two);
+
+    let context = listener.current_context();
+    context.dispatch_event(&create_test_event()).await.unwrap();
+}
+
+#[tokio::test]
+async fn test_hot_reload_removes_one_of_two_webhooks() {
+    let server_a = MockServer::start().await;
+    let server_b = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(0)
+        .mount(&server_a)
+        .await;
+
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&server_b)
+        .await;
+
+    let listener_config = InsecureListenerConfig::default();
+    let config_two = create_config_with_two_webhooks(&server_a.uri(), &server_b.uri());
+    let context_two = create_server_context_from_config(&config_two).await;
+    let listener = InsecureListener::new(&listener_config, context_two);
+
+    let config_one = create_config_with_webhook(&server_b.uri());
+    let context_one = create_server_context_from_config(&config_one).await;
+    listener.notify_config_change(context_one);
+
+    let context = listener.current_context();
+    context.dispatch_event(&create_test_event()).await.unwrap();
+}
+
+#[tokio::test]
+async fn test_hot_reload_in_flight_delivery_not_disrupted() {
+    let server_old = MockServer::start().await;
+    let server_new = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&server_old)
+        .await;
+
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(0)
+        .mount(&server_new)
+        .await;
+
+    let listener_config = InsecureListenerConfig::default();
+    let config_old = create_config_with_webhook(&server_old.uri());
+    let context_old = create_server_context_from_config(&config_old).await;
+    let listener = InsecureListener::new(&listener_config, context_old);
+
+    let old_context = Arc::clone(&listener.current_context());
+
+    let config_new = create_config_with_webhook(&server_new.uri());
+    let context_new = create_server_context_from_config(&config_new).await;
+    listener.notify_config_change(context_new);
+
+    old_context
+        .dispatch_event(&create_test_event())
+        .await
+        .unwrap();
+}
