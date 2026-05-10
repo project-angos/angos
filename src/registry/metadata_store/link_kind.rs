@@ -21,6 +21,13 @@ impl LinkKind {
             LinkKind::Layer(_) | LinkKind::Config(_) | LinkKind::Manifest(_, _)
         )
     }
+
+    pub fn from_reference(reference: &Reference) -> Self {
+        match reference {
+            Reference::Tag(s) => LinkKind::Tag(s.clone()),
+            Reference::Digest(d) => LinkKind::Digest(d.clone()),
+        }
+    }
 }
 
 impl Display for LinkKind {
@@ -36,15 +43,6 @@ impl Display for LinkKind {
     }
 }
 
-impl From<Reference> for LinkKind {
-    fn from(r: Reference) -> Self {
-        match r {
-            Reference::Tag(s) => LinkKind::Tag(s),
-            Reference::Digest(d) => LinkKind::Digest(d),
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -54,10 +52,10 @@ mod tests {
     fn test_from_reference() {
         let tag = Reference::Tag("tag".to_string());
         let tag_link = LinkKind::Tag("tag".to_string());
-        assert_eq!(LinkKind::from(tag), tag_link);
+        assert_eq!(LinkKind::from_reference(&tag), tag_link);
 
         let digest = Reference::Digest(Digest::Sha256("digest".into()));
         let digest_link = LinkKind::Digest(Digest::Sha256("digest".into()));
-        assert_eq!(LinkKind::from(digest), digest_link);
+        assert_eq!(LinkKind::from_reference(&digest), digest_link);
     }
 }

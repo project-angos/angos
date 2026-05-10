@@ -85,7 +85,7 @@ impl Registry {
         namespace: &Namespace,
         reference: &Reference,
     ) -> Result<ManifestMeta, Error> {
-        let blob_link = reference.clone().into();
+        let blob_link = LinkKind::from_reference(reference);
         let link = self
             .metadata_store
             .read_link(namespace, &blob_link, self.update_pull_time)
@@ -175,7 +175,7 @@ impl Registry {
         namespace: &Namespace,
         reference: &Reference,
     ) -> Result<ManifestBody, Error> {
-        let blob_link = reference.clone().into();
+        let blob_link = LinkKind::from_reference(reference);
         let link = self
             .metadata_store
             .read_link(namespace, &blob_link, self.update_pull_time)
@@ -397,7 +397,7 @@ impl Registry {
         namespace: &Namespace,
         reference: &Reference,
     ) -> Option<GetManifestResponse> {
-        let blob_link: LinkKind = reference.clone().into();
+        let blob_link = LinkKind::from_reference(reference);
         let link = self
             .metadata_store
             .read_link(namespace, &blob_link, self.update_pull_time)
