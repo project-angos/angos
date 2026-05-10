@@ -5,13 +5,31 @@ use serde::Serialize;
 use tracing::instrument;
 
 use crate::{
-    oci::{Descriptor, Digest, Namespace, ReferrerList},
+    oci::{Descriptor, Digest, Namespace},
     registry::{Error, JsonResponse, Registry},
 };
 
 const OCI_FILTERS_APPLIED: &str = "OCI-Filters-Applied";
 const OCI_INDEX_MEDIA_TYPE: &str = "application/vnd.oci.image.index.v1+json";
 const APPLICATION_JSON: &str = "application/json";
+
+#[derive(Serialize, Debug)]
+#[serde(rename_all = "camelCase")]
+struct ReferrerList {
+    schema_version: i32,
+    media_type: String,
+    manifests: Vec<Descriptor>,
+}
+
+impl Default for ReferrerList {
+    fn default() -> Self {
+        ReferrerList {
+            schema_version: 2,
+            media_type: OCI_INDEX_MEDIA_TYPE.to_string(),
+            manifests: Vec::new(),
+        }
+    }
+}
 
 fn referrers_headers(artifact_type_filtered: bool) -> HashMap<&'static str, String> {
     let mut headers = HashMap::from([(CONTENT_TYPE.as_str(), OCI_INDEX_MEDIA_TYPE.to_string())]);
