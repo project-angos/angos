@@ -516,15 +516,14 @@ impl Registry {
     where
         S: AsyncRead + Unpin + Send,
     {
-        let mut request_body = String::new();
+        let mut request_body = Vec::new();
 
         body_stream
-            .read_to_string(&mut request_body)
+            .read_to_end(&mut request_body)
             .await
             .map_err(|_| {
                 Error::ManifestInvalid("Unable to retrieve manifest from client query".to_string())
             })?;
-        let request_body = request_body.into_bytes();
 
         let mut response = self
             .put_manifest(namespace, &reference, Some(&mime_type), &request_body)
