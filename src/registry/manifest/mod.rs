@@ -454,11 +454,11 @@ impl Registry {
         })
     }
 
-    async fn find_tags_for_digest(
+    async fn find_tags_pointing_at(
         &self,
         namespace: &Namespace,
         digest: &Digest,
-    ) -> Result<Vec<String>, Error> {
+    ) -> Result<Vec<LinkKind>, Error> {
         let all_tags = collect_all_pages(|marker| async move {
             self.metadata_store.list_tags(namespace, 100, marker).await
         })
@@ -477,7 +477,7 @@ impl Registry {
                 if let Ok(metadata) = result
                     && &metadata.target == digest
                 {
-                    Some(tag)
+                    Some(LinkKind::Tag(tag))
                 } else {
                     None
                 }
@@ -504,9 +504,8 @@ impl Registry {
             Reference::Digest(digest) => {
                 tx.delete_link(&LinkKind::Digest(digest.clone()));
 
-                let matching_tags = self.find_tags_for_digest(namespace, digest).await?;
-                for tag in matching_tags {
-                    tx.delete_link(&LinkKind::Tag(tag));
+                for link in self.find_tags_pointing_at(namespace, digest).await? {
+                    tx.delete_link(&link);
                 }
 
                 if let Ok(content) = self.blob_store.read(digest).await
