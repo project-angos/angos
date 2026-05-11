@@ -179,12 +179,8 @@ impl AccessPolicy {
         identity: &'a ClientIdentity,
     ) -> Result<Context<'a>, Error> {
         let mut context = Context::default();
-        context
-            .add_variable("request", action)
-            .map_err(|e| Error::Evaluation(e.to_string()))?;
-        context
-            .add_variable("identity", identity)
-            .map_err(|e| Error::Evaluation(e.to_string()))?;
+        context.add_variable("request", action)?;
+        context.add_variable("identity", identity)?;
         Ok(context)
     }
 }

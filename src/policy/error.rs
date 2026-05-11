@@ -1,7 +1,15 @@
+use cel_interpreter::SerializationError;
+
 #[derive(Debug, PartialEq, thiserror::Error)]
 pub enum Error {
     #[error("Policy evaluation error: {0}")]
     Evaluation(String),
+}
+
+impl From<SerializationError> for Error {
+    fn from(e: SerializationError) -> Self {
+        Self::Evaluation(e.to_string())
+    }
 }
 
 #[cfg(test)]
