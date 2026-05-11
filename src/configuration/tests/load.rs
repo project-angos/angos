@@ -20,11 +20,11 @@ fn test_load_minimal_config() {
         panic!("Expected Insecure server config");
     };
 
-    let bind_address = server_config.bind_address.to_string();
+    let bind_address = server_config.base.bind_address.to_string();
     assert_eq!(bind_address, "0.0.0.0".to_string());
-    assert_eq!(server_config.port, 8000);
-    assert_eq!(server_config.query_timeout, 3600);
-    assert_eq!(server_config.query_timeout_grace_period, 60);
+    assert_eq!(server_config.base.port, 8000);
+    assert_eq!(server_config.base.query_timeout, 3600);
+    assert_eq!(server_config.base.query_timeout_grace_period, 60);
 
     assert_eq!(config.cache, cache::Config::Memory);
     assert_eq!(config.blob_store, blob_store::BlobStorageConfig::default());
@@ -399,10 +399,10 @@ fn test_insecure_config_with_custom_port() {
     let config = Configuration::load_from_str(config).unwrap();
     match config.server {
         ServerConfig::Insecure(insecure_config) => {
-            assert_eq!(insecure_config.bind_address.to_string(), "127.0.0.1");
-            assert_eq!(insecure_config.port, 9000);
-            assert_eq!(insecure_config.query_timeout, 7200);
-            assert_eq!(insecure_config.query_timeout_grace_period, 120);
+            assert_eq!(insecure_config.base.bind_address.to_string(), "127.0.0.1");
+            assert_eq!(insecure_config.base.port, 9000);
+            assert_eq!(insecure_config.base.query_timeout, 7200);
+            assert_eq!(insecure_config.base.query_timeout_grace_period, 120);
         }
         ServerConfig::Tls(_) => panic!("Expected Insecure server config"),
     }
@@ -524,7 +524,7 @@ fn test_ipv6_bind_address() {
     let config = Configuration::load_from_str(config).unwrap();
     match config.server {
         ServerConfig::Insecure(insecure_config) => {
-            assert_eq!(insecure_config.bind_address.to_string(), "::1");
+            assert_eq!(insecure_config.base.bind_address.to_string(), "::1");
         }
         ServerConfig::Tls(_) => panic!("Expected Insecure server config"),
     }
@@ -615,8 +615,8 @@ fn test_load_from_file() {
 
     match config.server {
         ServerConfig::Insecure(server_config) => {
-            assert_eq!(server_config.bind_address.to_string(), "127.0.0.1");
-            assert_eq!(server_config.port, 8080);
+            assert_eq!(server_config.base.bind_address.to_string(), "127.0.0.1");
+            assert_eq!(server_config.base.port, 8080);
         }
         ServerConfig::Tls(_) => panic!("Expected Insecure server config"),
     }

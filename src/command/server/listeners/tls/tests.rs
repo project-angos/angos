@@ -10,6 +10,7 @@ use tempfile::NamedTempFile;
 use super::*;
 use crate::{
     command::server::server_context::tests::create_test_server_context,
+    configuration::listeners::ListenerBaseConfig,
     test_fixtures::tls::{server_cert_pem, server_key_pem},
 };
 
@@ -76,9 +77,9 @@ fn test_config_default_values() {
 
     let config: TlsListenerConfig = toml::from_str(&toml).unwrap();
 
-    assert_eq!(config.port, 8000);
-    assert_eq!(config.query_timeout, 3600);
-    assert_eq!(config.query_timeout_grace_period, 60);
+    assert_eq!(config.base.port, 8000);
+    assert_eq!(config.base.query_timeout, 3600);
+    assert_eq!(config.base.query_timeout_grace_period, 60);
 }
 
 #[test]
@@ -102,11 +103,11 @@ fn test_config_custom_values() {
 
     let config: TlsListenerConfig = toml::from_str(&toml).unwrap();
 
-    assert_eq!(config.port, 9000);
-    assert_eq!(config.query_timeout, 7200);
-    assert_eq!(config.query_timeout_grace_period, 120);
+    assert_eq!(config.base.port, 9000);
+    assert_eq!(config.base.query_timeout, 7200);
+    assert_eq!(config.base.query_timeout_grace_period, 120);
     assert_eq!(
-        config.bind_address,
+        config.base.bind_address,
         "192.168.1.100".parse::<IpAddr>().unwrap()
     );
 }
@@ -130,8 +131,8 @@ fn test_config_ipv6_address() {
 
     let config: TlsListenerConfig = toml::from_str(&toml).unwrap();
 
-    assert_eq!(config.bind_address, IpAddr::from(Ipv6Addr::LOCALHOST));
-    assert_eq!(config.port, 8443);
+    assert_eq!(config.base.bind_address, IpAddr::from(Ipv6Addr::LOCALHOST));
+    assert_eq!(config.base.port, 8443);
 }
 
 #[test]
@@ -231,10 +232,12 @@ async fn test_tls_listener_new() {
     let (tls, _temp_files) = build_config(false);
 
     let config = TlsListenerConfig {
-        bind_address: "127.0.0.1".parse().unwrap(),
-        port: 8443,
-        query_timeout: 3600,
-        query_timeout_grace_period: 60,
+        base: ListenerBaseConfig {
+            bind_address: "127.0.0.1".parse().unwrap(),
+            port: 8443,
+            query_timeout: 3600,
+            query_timeout_grace_period: 60,
+        },
         tls,
     };
 
@@ -255,10 +258,12 @@ async fn test_tls_listener_new_with_ipv6() {
     let (tls, _temp_files) = build_config(false);
 
     let config = TlsListenerConfig {
-        bind_address: "::1".parse().unwrap(),
-        port: 9443,
-        query_timeout: 3600,
-        query_timeout_grace_period: 60,
+        base: ListenerBaseConfig {
+            bind_address: "::1".parse().unwrap(),
+            port: 9443,
+            query_timeout: 3600,
+            query_timeout_grace_period: 60,
+        },
         tls,
     };
 
@@ -285,10 +290,12 @@ async fn test_tls_listener_new_with_invalid_certs() {
     tls.server_private_key = key_file.path().to_path_buf();
 
     let config = TlsListenerConfig {
-        bind_address: "127.0.0.1".parse().unwrap(),
-        port: 8443,
-        query_timeout: 3600,
-        query_timeout_grace_period: 60,
+        base: ListenerBaseConfig {
+            bind_address: "127.0.0.1".parse().unwrap(),
+            port: 8443,
+            query_timeout: 3600,
+            query_timeout_grace_period: 60,
+        },
         tls,
     };
 
@@ -304,10 +311,12 @@ async fn test_tls_listener_notify_config_change() {
     let (tls, _temp_files) = build_config(false);
 
     let config = TlsListenerConfig {
-        bind_address: "127.0.0.1".parse().unwrap(),
-        port: 8443,
-        query_timeout: 3600,
-        query_timeout_grace_period: 60,
+        base: ListenerBaseConfig {
+            bind_address: "127.0.0.1".parse().unwrap(),
+            port: 8443,
+            query_timeout: 3600,
+            query_timeout_grace_period: 60,
+        },
         tls,
     };
 
@@ -326,10 +335,12 @@ async fn test_tls_listener_notify_tls_config_change() {
     let (tls, _temp_files) = build_config(false);
 
     let config = TlsListenerConfig {
-        bind_address: "127.0.0.1".parse().unwrap(),
-        port: 8443,
-        query_timeout: 3600,
-        query_timeout_grace_period: 60,
+        base: ListenerBaseConfig {
+            bind_address: "127.0.0.1".parse().unwrap(),
+            port: 8443,
+            query_timeout: 3600,
+            query_timeout_grace_period: 60,
+        },
         tls,
     };
 
@@ -348,10 +359,12 @@ async fn test_tls_listener_notify_tls_config_change_with_invalid_certs() {
 
     let (tls, _temp_files) = build_config(false);
     let config = TlsListenerConfig {
-        bind_address: "127.0.0.1".parse().unwrap(),
-        port: 8443,
-        query_timeout: 3600,
-        query_timeout_grace_period: 60,
+        base: ListenerBaseConfig {
+            bind_address: "127.0.0.1".parse().unwrap(),
+            port: 8443,
+            query_timeout: 3600,
+            query_timeout_grace_period: 60,
+        },
         tls,
     };
 

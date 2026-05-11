@@ -95,11 +95,11 @@ pub struct TlsListener {
 
 impl TlsListener {
     pub fn new(config: &TlsListenerConfig, context: ServerContext) -> Result<Self, Error> {
-        let binding_address = SocketAddr::new(config.bind_address, config.port);
+        let binding_address = SocketAddr::new(config.base.bind_address, config.base.port);
         let tls_acceptor = ArcSwap::from_pointee(Self::build_tls_acceptor(&config.tls)?);
         let timeouts = [
-            Duration::from_secs(config.query_timeout),
-            Duration::from_secs(config.query_timeout_grace_period),
+            Duration::from_secs(config.base.query_timeout),
+            Duration::from_secs(config.base.query_timeout_grace_period),
         ];
 
         Ok(Self {
@@ -123,8 +123,8 @@ impl TlsListener {
         self.tls_acceptor.store(acceptor);
 
         let timeouts = [
-            Duration::from_secs(config.query_timeout),
-            Duration::from_secs(config.query_timeout_grace_period),
+            Duration::from_secs(config.base.query_timeout),
+            Duration::from_secs(config.base.query_timeout_grace_period),
         ];
 
         self.timeouts.store(Arc::new(timeouts));

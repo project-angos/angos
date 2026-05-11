@@ -41,11 +41,12 @@ impl Connector for InsecureConnector {
 
 impl InsecureListener {
     pub fn new(server_config: &InsecureListenerConfig, context: ServerContext) -> Self {
-        let binding_address = SocketAddr::new(server_config.bind_address, server_config.port);
+        let binding_address =
+            SocketAddr::new(server_config.base.bind_address, server_config.base.port);
 
         let timeouts = [
-            Duration::from_secs(server_config.query_timeout),
-            Duration::from_secs(server_config.query_timeout_grace_period),
+            Duration::from_secs(server_config.base.query_timeout),
+            Duration::from_secs(server_config.base.query_timeout_grace_period),
         ];
 
         Self {

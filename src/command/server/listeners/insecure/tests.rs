@@ -13,7 +13,7 @@ use wiremock::{
 use super::*;
 use crate::{
     command::server::server_context::tests::create_test_server_context,
-    configuration::Configuration,
+    configuration::{Configuration, listeners::ListenerBaseConfig},
     event_webhook::event::{Event, EventKind},
     registry::{Registry, RegistryConfig},
 };
@@ -22,10 +22,13 @@ use crate::{
 fn test_config_default_values() {
     let config = InsecureListenerConfig::default();
 
-    assert_eq!(config.port, 8000);
-    assert_eq!(config.query_timeout, 3600);
-    assert_eq!(config.query_timeout_grace_period, 60);
-    assert_eq!(config.bind_address, IpAddr::from(Ipv4Addr::from([0; 4])));
+    assert_eq!(config.base.port, 8000);
+    assert_eq!(config.base.query_timeout, 3600);
+    assert_eq!(config.base.query_timeout_grace_period, 60);
+    assert_eq!(
+        config.base.bind_address,
+        IpAddr::from(Ipv4Addr::from([0; 4]))
+    );
 }
 
 #[test]
@@ -39,11 +42,11 @@ fn test_config_custom_values() {
 
     let config: InsecureListenerConfig = toml::from_str(toml).unwrap();
 
-    assert_eq!(config.port, 9000);
-    assert_eq!(config.query_timeout, 7200);
-    assert_eq!(config.query_timeout_grace_period, 120);
+    assert_eq!(config.base.port, 9000);
+    assert_eq!(config.base.query_timeout, 7200);
+    assert_eq!(config.base.query_timeout_grace_period, 120);
     assert_eq!(
-        config.bind_address,
+        config.base.bind_address,
         "192.168.1.100".parse::<IpAddr>().unwrap()
     );
 }
@@ -56,9 +59,9 @@ fn test_config_partial_defaults() {
 
     let config: InsecureListenerConfig = toml::from_str(toml).unwrap();
 
-    assert_eq!(config.port, 8000);
-    assert_eq!(config.query_timeout, 3600);
-    assert_eq!(config.query_timeout_grace_period, 60);
+    assert_eq!(config.base.port, 8000);
+    assert_eq!(config.base.query_timeout, 3600);
+    assert_eq!(config.base.query_timeout_grace_period, 60);
 }
 
 #[test]
@@ -70,17 +73,19 @@ fn test_config_ipv6_address() {
 
     let config: InsecureListenerConfig = toml::from_str(toml).unwrap();
 
-    assert_eq!(config.bind_address, IpAddr::from(Ipv6Addr::LOCALHOST));
-    assert_eq!(config.port, 8443);
+    assert_eq!(config.base.bind_address, IpAddr::from(Ipv6Addr::LOCALHOST));
+    assert_eq!(config.base.port, 8443);
 }
 
 #[tokio::test]
 async fn test_insecure_listener_new() {
     let config = InsecureListenerConfig {
-        bind_address: "127.0.0.1".parse().unwrap(),
-        port: 8080,
-        query_timeout: 1800,
-        query_timeout_grace_period: 30,
+        base: ListenerBaseConfig {
+            bind_address: "127.0.0.1".parse().unwrap(),
+            port: 8080,
+            query_timeout: 1800,
+            query_timeout_grace_period: 30,
+        },
     };
 
     let context = create_test_server_context().await;
@@ -95,10 +100,12 @@ async fn test_insecure_listener_new() {
 #[tokio::test]
 async fn test_insecure_listener_new_with_ipv6() {
     let config = InsecureListenerConfig {
-        bind_address: "::1".parse().unwrap(),
-        port: 9000,
-        query_timeout: 3600,
-        query_timeout_grace_period: 60,
+        base: ListenerBaseConfig {
+            bind_address: "::1".parse().unwrap(),
+            port: 9000,
+            query_timeout: 3600,
+            query_timeout_grace_period: 60,
+        },
     };
 
     let context = create_test_server_context().await;
@@ -124,10 +131,12 @@ async fn test_insecure_listener_notify_config_change() {
 #[tokio::test]
 async fn test_insecure_listener_timeouts_initialization() {
     let config = InsecureListenerConfig {
-        bind_address: "127.0.0.1".parse().unwrap(),
-        port: 8080,
-        query_timeout: 5000,
-        query_timeout_grace_period: 100,
+        base: ListenerBaseConfig {
+            bind_address: "127.0.0.1".parse().unwrap(),
+            port: 8080,
+            query_timeout: 5000,
+            query_timeout_grace_period: 100,
+        },
     };
 
     let context = create_test_server_context().await;
@@ -141,10 +150,12 @@ async fn test_insecure_listener_timeouts_initialization() {
 #[tokio::test]
 async fn test_insecure_listener_with_zero_port() {
     let config = InsecureListenerConfig {
-        bind_address: "127.0.0.1".parse().unwrap(),
-        port: 0,
-        query_timeout: 3600,
-        query_timeout_grace_period: 60,
+        base: ListenerBaseConfig {
+            bind_address: "127.0.0.1".parse().unwrap(),
+            port: 0,
+            query_timeout: 3600,
+            query_timeout_grace_period: 60,
+        },
     };
 
     let context = create_test_server_context().await;
