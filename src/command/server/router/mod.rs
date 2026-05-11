@@ -98,10 +98,9 @@ fn try_parse_extension(method: &Method, path: &str) -> Option<Action> {
         return Some(Action::ListRepositories);
     }
 
-    if let Some(repository) = path.strip_suffix("/_namespaces") {
-        return Some(Action::ListNamespaces {
-            repository: repository.to_string(),
-        });
+    if let Some(repository_str) = path.strip_suffix("/_namespaces") {
+        let repository = Namespace::new(repository_str).ok()?;
+        return Some(Action::ListNamespaces { repository });
     }
 
     if let Some(namespace_str) = path.strip_suffix("/_revisions") {

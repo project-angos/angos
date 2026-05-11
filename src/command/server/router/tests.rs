@@ -850,3 +850,43 @@ fn test_parse_list_revisions_post_not_allowed() {
     let route = parse(&method, &uri);
     assert!(route.is_none());
 }
+
+#[test]
+fn test_parse_list_namespaces() {
+    let method = Method::GET;
+    let uri: Uri = "/v2/_ext/myrepo/_namespaces".parse().unwrap();
+    let route = parse(&method, &uri);
+    if let Some(Action::ListNamespaces { repository }) = route {
+        assert_eq!(repository, "myrepo");
+    } else {
+        panic!("Expected ListNamespaces route");
+    }
+}
+
+#[test]
+fn test_parse_list_namespaces_nested() {
+    let method = Method::GET;
+    let uri: Uri = "/v2/_ext/org/team/_namespaces".parse().unwrap();
+    let route = parse(&method, &uri);
+    if let Some(Action::ListNamespaces { repository }) = route {
+        assert_eq!(repository, "org/team");
+    } else {
+        panic!("Expected ListNamespaces route");
+    }
+}
+
+#[test]
+fn test_parse_list_namespaces_invalid_repository_returns_none() {
+    let method = Method::GET;
+    let uri: Uri = "/v2/_ext/INVALID/_namespaces".parse().unwrap();
+    let route = parse(&method, &uri);
+    assert!(route.is_none());
+}
+
+#[test]
+fn test_parse_list_namespaces_post_not_allowed() {
+    let method = Method::POST;
+    let uri: Uri = "/v2/_ext/myrepo/_namespaces".parse().unwrap();
+    let route = parse(&method, &uri);
+    assert!(route.is_none());
+}

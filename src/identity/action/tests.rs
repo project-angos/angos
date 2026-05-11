@@ -135,7 +135,7 @@ fn test_action_serialization_cel_compatibility() {
         (
             "list-namespaces",
             Action::ListNamespaces {
-                repository: "test".to_string(),
+                repository: Namespace::new("test").unwrap(),
             },
         ),
     ];
@@ -152,6 +152,16 @@ fn test_action_serialization_cel_compatibility() {
             "action_name() mismatch for {action:?}"
         );
     }
+}
+
+#[test]
+fn test_list_namespaces_repository_serializes_as_plain_string() {
+    let action = Action::ListNamespaces {
+        repository: Namespace::new("myrepo").unwrap(),
+    };
+    let json = serde_json::to_value(&action).unwrap();
+    assert_eq!(json["action"], "list-namespaces");
+    assert_eq!(json["repository"], "myrepo");
 }
 
 #[test]

@@ -151,7 +151,7 @@ pub enum Action {
     ListRepositories,
     #[serde(rename = "list-namespaces")]
     ListNamespaces {
-        repository: String,
+        repository: Namespace,
     },
 }
 
