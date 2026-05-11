@@ -19,10 +19,9 @@ static NAMESPACE_RE: LazyLock<Regex> = LazyLock::new(|| {
 pub struct Namespace(String);
 
 impl Namespace {
-    pub fn new(s: impl Into<String>) -> Result<Self, Error> {
-        let s = s.into();
-        if NAMESPACE_RE.is_match(&s) {
-            Ok(Self(s))
+    pub fn new(s: &str) -> Result<Self, Error> {
+        if NAMESPACE_RE.is_match(s) {
+            Ok(Self(s.to_owned()))
         } else {
             Err(Error::InvalidNamespace(format!(
                 "Invalid namespace format: '{s}'"
@@ -43,7 +42,13 @@ impl TryFrom<String> for Namespace {
     type Error = Error;
 
     fn try_from(s: String) -> Result<Self, Self::Error> {
-        Self::new(s)
+        if NAMESPACE_RE.is_match(&s) {
+            Ok(Self(s))
+        } else {
+            Err(Error::InvalidNamespace(format!(
+                "Invalid namespace format: '{s}'"
+            )))
+        }
     }
 }
 
@@ -90,7 +95,7 @@ impl<'de> Deserialize<'de> for Namespace {
         D: serde::Deserializer<'de>,
     {
         let s = String::deserialize(deserializer)?;
-        Self::new(s).map_err(serde::de::Error::custom)
+        Self::try_from(s).map_err(serde::de::Error::custom)
     }
 }
 
@@ -271,7 +276,7 @@ mod tests {
     #[test]
     fn test_valid_long_namespace() {
         let long = "a".repeat(10_000);
-        assert!(Namespace::new(long).is_ok());
+        assert!(Namespace::new(&long).is_ok());
     }
 
     #[test]

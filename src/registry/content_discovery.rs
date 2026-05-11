@@ -314,7 +314,7 @@ mod tests {
         let digest = registry.blob_store.create(blob_content).await.unwrap();
 
         for ns_str in &namespaces {
-            let ns = Namespace::new(*ns_str).unwrap();
+            let ns = Namespace::new(ns_str).unwrap();
             let mut tx = registry.metadata_store.begin_transaction(&ns);
             tx.create_link(&LinkKind::Tag("latest".to_string()), &digest)
                 .add();
