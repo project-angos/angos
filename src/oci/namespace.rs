@@ -131,7 +131,10 @@ impl Borrow<str> for Namespace {
 /// The `/` separator check is intentional: without it, `"myrepo2"` would
 /// spuriously match `"myrepo"` via `starts_with`.
 pub fn namespace_belongs_to(namespace: &str, repository_name: &str) -> bool {
-    namespace == repository_name || namespace.starts_with(&format!("{repository_name}/"))
+    namespace == repository_name
+        || namespace
+            .strip_prefix(repository_name)
+            .is_some_and(|rest| rest.starts_with('/'))
 }
 
 #[cfg(test)]
@@ -358,5 +361,12 @@ mod tests {
     fn test_namespace_belongs_to_distinct_namespace() {
         assert!(!namespace_belongs_to("other", "myrepo"));
         assert!(!namespace_belongs_to("other/sub", "myrepo"));
+    }
+
+    #[test]
+    fn test_namespace_belongs_to_no_trailing_slash_without_sub() {
+        assert!(!namespace_belongs_to("myrepo", "myrepo/"));
+        assert!(!namespace_belongs_to("myrepo2", "myrepo"));
+        assert!(!namespace_belongs_to("myrepo", "myrepo2"));
     }
 }
