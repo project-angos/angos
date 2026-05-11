@@ -82,7 +82,7 @@ impl Repository {
         Err(fallback)
     }
 
-    pub fn new(name: &str, config: &Config, cache: &Arc<dyn Cache>) -> Result<Self, Error> {
+    pub fn new(name: &str, config: &Config, cache: &Arc<Cache>) -> Result<Self, Error> {
         let mut upstreams = Vec::new();
         for config in &config.upstream {
             upstreams.push(RegistryClient::new(config, cache.clone())?);

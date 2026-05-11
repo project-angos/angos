@@ -7,7 +7,7 @@ use tracing::{debug, info, warn};
 
 use crate::{
     auth::oidc::{Jwk, OidcProvider},
-    cache::{Cache, CacheExt, CacheOutcome},
+    cache::Cache,
     command::server::{Error, sha256_hash},
     identity::OidcClaims,
 };
@@ -28,7 +28,7 @@ pub async fn validate_oidc_token(
     provider: &dyn OidcProvider,
     token: &str,
     client: &Client,
-    cache: &dyn Cache,
+    cache: &Cache,
 ) -> Result<OidcClaims, Error> {
     let jwks = fetch_jwks(provider, client, cache).await?;
     verify_jwt(token, &jwks, provider_name, provider)
@@ -140,7 +140,7 @@ where
 async fn get_jwks_url(
     provider: &dyn OidcProvider,
     client: &Client,
-    cache: &dyn Cache,
+    cache: &Cache,
 ) -> Result<String, Error> {
     if let Some(uri) = provider.jwks_uri() {
         return Ok(uri.to_string());
@@ -153,21 +153,21 @@ async fn get_jwks_url(
 async fn fetch_jwks(
     provider: &dyn OidcProvider,
     client: &Client,
-    cache: &dyn Cache,
+    cache: &Cache,
 ) -> Result<Jwks, Error> {
     let provider_name = provider.name();
     let issuer_hash = sha256_hash(provider.issuer());
     let cache_key = format!("oidc:{provider_name}:jwks:{issuer_hash}");
 
     match cache.retrieve::<Jwks>(&cache_key).await {
-        CacheOutcome::Hit(cached) => {
+        Ok(Some(cached)) => {
             debug!("Using cached JWKS for provider: {provider_name}");
             return Ok(cached);
         }
-        CacheOutcome::Error(err) => {
+        Err(err) => {
             warn!("OIDC JWKS cache retrieve failed for {provider_name}: {err}");
         }
-        CacheOutcome::Miss => {}
+        Ok(None) => {}
     }
 
     let jwks_url = get_jwks_url(provider, client, cache).await?;
@@ -186,21 +186,21 @@ async fn fetch_jwks(
 async fn fetch_oidc_configuration(
     provider: &dyn OidcProvider,
     client: &Client,
-    cache: &dyn Cache,
+    cache: &Cache,
 ) -> Result<OpenIdConfiguration, Error> {
     let provider_name = provider.name();
     let issuer_hash = sha256_hash(provider.issuer());
     let cache_key = format!("oidc:{provider_name}:config:{issuer_hash}");
 
     match cache.retrieve::<OpenIdConfiguration>(&cache_key).await {
-        CacheOutcome::Hit(cached) => {
+        Ok(Some(cached)) => {
             debug!("Using cached OIDC configuration");
             return Ok(cached);
         }
-        CacheOutcome::Error(err) => {
+        Err(err) => {
             warn!("OIDC configuration cache retrieve failed for {provider_name}: {err}");
         }
-        CacheOutcome::Miss => {}
+        Ok(None) => {}
     }
 
     let config_url = format!("{}/.well-known/openid-configuration", provider.issuer());
@@ -307,7 +307,7 @@ pub mod tests {
         let client = Client::new();
         let cache = cache::Config::Memory.to_backend().unwrap();
 
-        let result = fetch_jwks(&provider, &client, &*cache).await;
+        let result = fetch_jwks(&provider, &client, cache.as_ref()).await;
 
         assert!(result.is_ok());
         let jwks = result.unwrap();
@@ -357,7 +357,7 @@ pub mod tests {
         let client = Client::new();
         let cache = cache::Config::Memory.to_backend().unwrap();
 
-        let result = fetch_jwks(&provider, &client, &*cache).await;
+        let result = fetch_jwks(&provider, &client, cache.as_ref()).await;
 
         assert!(result.is_ok());
         let jwks = result.unwrap();
@@ -397,10 +397,10 @@ pub mod tests {
         let client = Client::new();
         let cache = cache::Config::Memory.to_backend().unwrap();
 
-        let result1 = fetch_jwks(&provider, &client, &*cache).await;
+        let result1 = fetch_jwks(&provider, &client, cache.as_ref()).await;
         assert!(result1.is_ok());
 
-        let result2 = fetch_jwks(&provider, &client, &*cache).await;
+        let result2 = fetch_jwks(&provider, &client, cache.as_ref()).await;
         assert!(result2.is_ok());
     }
 
@@ -426,7 +426,7 @@ pub mod tests {
         let client = Client::new();
         let cache = cache::Config::Memory.to_backend().unwrap();
 
-        let result = fetch_jwks(&provider, &client, &*cache).await;
+        let result = fetch_jwks(&provider, &client, cache.as_ref()).await;
 
         assert!(result.is_err());
     }
@@ -459,7 +459,7 @@ pub mod tests {
         let client = Client::new();
         let cache = cache::Config::Memory.to_backend().unwrap();
 
-        let result = fetch_oidc_configuration(&provider, &client, &*cache).await;
+        let result = fetch_oidc_configuration(&provider, &client, cache.as_ref()).await;
 
         assert!(result.is_ok());
         let config = result.unwrap();
@@ -498,10 +498,10 @@ pub mod tests {
         let client = Client::new();
         let cache = cache::Config::Memory.to_backend().unwrap();
 
-        let result1 = fetch_oidc_configuration(&provider, &client, &*cache).await;
+        let result1 = fetch_oidc_configuration(&provider, &client, cache.as_ref()).await;
         assert!(result1.is_ok());
 
-        let result2 = fetch_oidc_configuration(&provider, &client, &*cache).await;
+        let result2 = fetch_oidc_configuration(&provider, &client, cache.as_ref()).await;
         assert!(result2.is_ok());
     }
 
@@ -532,7 +532,7 @@ pub mod tests {
         let client = Client::new();
         let cache = cache::Config::Memory.to_backend().unwrap();
 
-        let result = fetch_oidc_configuration(&provider, &client, &*cache).await;
+        let result = fetch_oidc_configuration(&provider, &client, cache.as_ref()).await;
 
         assert!(result.is_err());
         match result.unwrap_err() {
@@ -565,7 +565,7 @@ pub mod tests {
         let client = Client::new();
         let cache = cache::Config::Memory.to_backend().unwrap();
 
-        let result = fetch_oidc_configuration(&provider, &client, &*cache).await;
+        let result = fetch_oidc_configuration(&provider, &client, cache.as_ref()).await;
 
         assert!(result.is_err());
     }
@@ -597,7 +597,7 @@ pub mod tests {
         let cache = cache::Config::Memory.to_backend().unwrap();
 
         let result =
-            validate_oidc_token("test-provider", &provider, &token, &client, &*cache).await;
+            validate_oidc_token("test-provider", &provider, &token, &client, cache.as_ref()).await;
 
         assert!(result.is_ok());
         let oidc_claims = result.unwrap();
@@ -639,7 +639,7 @@ pub mod tests {
         let cache = cache::Config::Memory.to_backend().unwrap();
 
         let result =
-            validate_oidc_token("test-provider", &provider, &token, &client, &*cache).await;
+            validate_oidc_token("test-provider", &provider, &token, &client, cache.as_ref()).await;
 
         assert!(result.is_err());
         match result.unwrap_err() {
@@ -680,7 +680,7 @@ pub mod tests {
         let cache = cache::Config::Memory.to_backend().unwrap();
 
         let result =
-            validate_oidc_token("test-provider", &provider, &token, &client, &*cache).await;
+            validate_oidc_token("test-provider", &provider, &token, &client, cache.as_ref()).await;
 
         assert!(result.is_err());
         match result.unwrap_err() {
@@ -718,7 +718,7 @@ pub mod tests {
         let cache = cache::Config::Memory.to_backend().unwrap();
 
         let result =
-            validate_oidc_token("test-provider", &provider, &token, &client, &*cache).await;
+            validate_oidc_token("test-provider", &provider, &token, &client, cache.as_ref()).await;
 
         assert!(result.is_err());
     }
@@ -750,7 +750,7 @@ pub mod tests {
         let cache = cache::Config::Memory.to_backend().unwrap();
 
         let result =
-            validate_oidc_token("test-provider", &provider, &token, &client, &*cache).await;
+            validate_oidc_token("test-provider", &provider, &token, &client, cache.as_ref()).await;
 
         assert!(result.is_err());
     }
@@ -792,7 +792,7 @@ pub mod tests {
         let cache = cache::Config::Memory.to_backend().unwrap();
 
         let result =
-            validate_oidc_token("test-provider", &provider, &token, &client, &*cache).await;
+            validate_oidc_token("test-provider", &provider, &token, &client, cache.as_ref()).await;
 
         assert!(result.is_err());
         match result.unwrap_err() {
@@ -837,7 +837,7 @@ pub mod tests {
         let cache = cache::Config::Memory.to_backend().unwrap();
 
         let result =
-            validate_oidc_token("test-provider", &provider, &token, &client, &*cache).await;
+            validate_oidc_token("test-provider", &provider, &token, &client, cache.as_ref()).await;
 
         assert!(result.is_ok());
     }
@@ -870,7 +870,7 @@ pub mod tests {
             &provider,
             "not-a-valid-jwt",
             &client,
-            &*cache,
+            cache.as_ref(),
         )
         .await;
 

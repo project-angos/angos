@@ -12,7 +12,7 @@ use crate::{
 
 pub async fn build_metadata_store(
     config: &Configuration,
-    cache: &Arc<dyn Cache>,
+    cache: &Arc<Cache>,
     cached_capabilities: &Arc<Mutex<Option<ConditionalCapabilities>>>,
 ) -> Result<Arc<dyn MetadataStore>, Error> {
     let mut metadata_config = config.resolve_metadata_config();

@@ -34,7 +34,7 @@ struct AuthorizerRepository {
 }
 
 impl Authorizer {
-    pub fn new(config: &Configuration, cache: &Arc<dyn Cache>) -> Result<Self, Error> {
+    pub fn new(config: &Configuration, cache: &Arc<Cache>) -> Result<Self, Error> {
         let global_access_policy = AccessPolicy::new(config.global.access_policy.clone());
 
         let webhook_authorizers = build_webhooks(config, cache)?;
@@ -202,7 +202,7 @@ impl Authorizer {
 
 fn build_webhooks(
     config: &Configuration,
-    cache: &Arc<dyn Cache>,
+    cache: &Arc<Cache>,
 ) -> Result<HashMap<String, Arc<WebhookAuthorizer>>, Error> {
     let mut webhooks = HashMap::with_capacity(config.auth.webhook.len());
     for (name, webhook_config) in &config.auth.webhook {

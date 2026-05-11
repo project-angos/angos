@@ -82,7 +82,7 @@ impl MetadataStoreConfig {
 
     pub async fn to_backend(
         &self,
-        cache: Option<Arc<dyn Cache>>,
+        cache: Option<Arc<Cache>>,
     ) -> Result<
         (
             Arc<dyn MetadataStore + Send + Sync>,

@@ -40,14 +40,14 @@ pub struct OidcValidator {
     provider_name: String,
     provider: Arc<dyn OidcProvider>,
     client: Arc<Client>,
-    cache: Arc<dyn Cache>,
+    cache: Arc<Cache>,
 }
 
 impl OidcValidator {
     pub fn new(
         provider_name: String,
         provider_config: &Config,
-        cache: Arc<dyn Cache>,
+        cache: Arc<Cache>,
     ) -> Result<Self, Error> {
         let client = Client::builder()
             .timeout(Duration::from_secs(30))
@@ -71,7 +71,7 @@ impl OidcValidator {
             &*self.provider,
             token,
             &self.client,
-            &*self.cache,
+            self.cache.as_ref(),
         )
         .await
     }

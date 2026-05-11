@@ -7,9 +7,7 @@ use std::{
 
 use super::*;
 use crate::{
-    cache,
-    cache::CacheExt,
-    metrics_provider,
+    cache, metrics_provider,
     registry::metadata_store::{LinkOperation, MetadataStore},
     secret::Secret,
 };
@@ -30,8 +28,8 @@ fn test_config() -> BackendConfig {
     }
 }
 
-fn test_backend_with_cache(config: &BackendConfig) -> (Backend, Arc<dyn cache::Cache>) {
-    let cache: Arc<dyn cache::Cache> = Arc::new(cache::memory::Backend::new());
+fn test_backend_with_cache(config: &BackendConfig) -> (Backend, Arc<cache::Cache>) {
+    let cache = Arc::new(cache::Cache::Memory(cache::memory::Backend::new()));
     let backend = Backend::new(config, None)
         .unwrap()
         .with_cache(cache.clone());
@@ -97,7 +95,7 @@ async fn test_read_link_cache_miss_fetches_from_s3() {
 
     // Verify cache was populated
     let cache_key = format!("link:{namespace}:{tag}");
-    let cached: Option<LinkMetadata> = cache.retrieve(&cache_key).await.try_into().unwrap();
+    let cached: Option<LinkMetadata> = cache.retrieve(&cache_key).await.unwrap();
     assert!(cached.is_some(), "Cache should be populated after read");
     assert_eq!(cached.unwrap().target, digest);
 }
@@ -1028,7 +1026,7 @@ async fn test_read_link_with_access_time_debounce_uses_cache() {
     let config = test_config();
     let mut cfg = config.clone();
     cfg.access_time_debounce_secs = 60;
-    let cache: Arc<dyn cache::Cache> = Arc::new(cache::memory::Backend::new());
+    let cache = Arc::new(cache::Cache::Memory(cache::memory::Backend::new()));
     let backend = Backend::new(&cfg, None).unwrap().with_cache(cache.clone());
     let namespace = "cache-debounce-hit-ns";
     let digest =

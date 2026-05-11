@@ -60,12 +60,12 @@ pub struct RegistryClient {
     pub url: String,
     client: Client,
     basic_auth: Option<(String, String)>,
-    cache: Arc<dyn Cache>,
+    cache: Arc<Cache>,
     auth_cache: Arc<RwLock<Option<String>>>,
 }
 
 impl RegistryClient {
-    pub fn new(config: &RegistryClientConfig, cache: Arc<dyn Cache>) -> Result<Self, Error> {
+    pub fn new(config: &RegistryClientConfig, cache: Arc<Cache>) -> Result<Self, Error> {
         let client = http_client::build_http_client(config)?;
 
         let basic_auth = match (&config.username, &config.password) {

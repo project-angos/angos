@@ -33,7 +33,7 @@ impl Default for BlobStorageConfig {
 }
 
 impl BlobStorageConfig {
-    pub fn to_backend(&self, cache: Option<Arc<dyn Cache>>) -> Result<BlobStoreHandles, Error> {
+    pub fn to_backend(&self, cache: Option<Arc<Cache>>) -> Result<BlobStoreHandles, Error> {
         match self {
             BlobStorageConfig::FS(config) => {
                 let backend = Arc::new(fs::Backend::new(config));

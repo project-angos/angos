@@ -60,7 +60,7 @@ pub struct Authenticator {
 }
 
 impl Authenticator {
-    pub fn new(config: &Configuration, cache: &Arc<dyn Cache>) -> Result<Self, Error> {
+    pub fn new(config: &Configuration, cache: &Arc<Cache>) -> Result<Self, Error> {
         let auth_config = &config.auth;
 
         let mtls_validator = MtlsValidator::new();
@@ -76,7 +76,7 @@ impl Authenticator {
 
     fn build_oidc_validators(
         auth_config: &AuthConfig,
-        cache: &Arc<dyn Cache>,
+        cache: &Arc<Cache>,
     ) -> Result<OidcValidators, Error> {
         let mut validators = Vec::with_capacity(auth_config.oidc.len());
 

@@ -1,30 +1,26 @@
 use std::{
     collections::HashMap,
-    sync::{
-        Arc,
-        atomic::{AtomicUsize, Ordering},
-    },
+    sync::atomic::{AtomicUsize, Ordering},
     time::Duration,
 };
 
-use async_trait::async_trait;
 use tokio::{sync::RwLock, time::Instant};
 use tracing::info;
 
-use crate::cache::{Cache, Error};
+use crate::cache::Error;
 
 #[derive(Debug)]
 pub struct Backend {
-    store: Arc<RwLock<HashMap<String, (String, Instant)>>>,
-    counter: Arc<AtomicUsize>,
+    store: RwLock<HashMap<String, (String, Instant)>>,
+    counter: AtomicUsize,
 }
 
 impl Backend {
     pub fn new() -> Self {
         info!("Using in-memory cache store");
         Backend {
-            store: Arc::new(RwLock::new(HashMap::new())),
-            counter: Arc::new(AtomicUsize::new(0)),
+            store: RwLock::new(HashMap::new()),
+            counter: AtomicUsize::new(0),
         }
     }
 
@@ -40,24 +36,18 @@ impl Backend {
             self.cleanup_expired().await;
         }
     }
-}
 
-#[async_trait]
-impl Cache for Backend {
-    async fn store_value(&self, key: &str, value: &str, expires_in: u64) -> Result<(), Error> {
+    pub async fn store_value(&self, key: &str, value: &str, ttl: u64) -> Result<(), Error> {
         self.maybe_cleanup().await;
         let mut store = self.store.write().await;
         store.insert(
             key.to_string(),
-            (
-                value.to_string(),
-                Instant::now() + Duration::from_secs(expires_in),
-            ),
+            (value.to_string(), Instant::now() + Duration::from_secs(ttl)),
         );
         Ok(())
     }
 
-    async fn retrieve_value(&self, key: &str) -> Result<Option<String>, Error> {
+    pub async fn retrieve_value(&self, key: &str) -> Result<Option<String>, Error> {
         self.maybe_cleanup().await;
         let store = self.store.read().await;
         if let Some((value, expiry)) = store.get(key)
@@ -69,7 +59,7 @@ impl Cache for Backend {
         Ok(None)
     }
 
-    async fn delete_value(&self, key: &str) -> Result<(), Error> {
+    pub async fn delete_value(&self, key: &str) -> Result<(), Error> {
         let mut store = self.store.write().await;
         store.remove(key);
         Ok(())
@@ -78,7 +68,7 @@ impl Cache for Backend {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
+    use std::{sync::Arc, time::Duration};
 
     use tokio::{task::JoinSet, time};
 

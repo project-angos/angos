@@ -17,10 +17,13 @@ pub enum Config {
 }
 
 impl Config {
-    pub fn to_backend(&self) -> Result<Arc<dyn Cache>, Error> {
+    pub fn to_backend(&self) -> Result<Arc<Cache>, Error> {
         match self {
-            Config::Redis(config) => Ok(Arc::new(cache::redis::Backend::new(config)?)),
-            Config::Memory => Ok(Arc::new(cache::memory::Backend::new())),
+            Config::Redis(config) => {
+                let backend = cache::redis::Backend::new(config)?;
+                Ok(Arc::new(Cache::Redis(Box::new(backend))))
+            }
+            Config::Memory => Ok(Arc::new(Cache::Memory(cache::memory::Backend::new()))),
         }
     }
 }
@@ -62,7 +65,6 @@ mod tests {
             key_prefix: "test:".to_string(),
         })
         .to_backend();
-        // `to_backend()` only opens the redis::Client; it does not connect.
         assert!(
             result.is_ok(),
             "Redis backend construction must succeed without a live server, got: {result:?}"

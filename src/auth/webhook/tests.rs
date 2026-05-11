@@ -1,15 +1,5 @@
-use std::{
-    fs,
-    path::PathBuf,
-    str::FromStr,
-    sync::{
-        Arc,
-        atomic::{AtomicUsize, Ordering},
-    },
-    time::Duration,
-};
+use std::{fs, path::PathBuf, str::FromStr, sync::Arc, time::Duration};
 
-use async_trait::async_trait;
 use hyper::{HeaderMap, Method, http::request::Builder};
 use url::Url;
 use wiremock::{
@@ -39,36 +29,6 @@ use crate::{
     secret::Secret,
     test_fixtures::webhook::{ca_bundle_pem, client_cert_pem, client_key_pem},
 };
-
-// Always fails store_value so tests can exercise the cache-write-error path.
-#[derive(Debug, Default)]
-struct FailingCache {
-    store_call_count: AtomicUsize,
-}
-
-#[async_trait]
-impl Cache for FailingCache {
-    async fn store_value(
-        &self,
-        _key: &str,
-        _value: &str,
-        _expires_in: u64,
-    ) -> Result<(), cache::Error> {
-        self.store_call_count.fetch_add(1, Ordering::Relaxed);
-        Err(cache::Error::Execution(
-            "injected store failure".to_string(),
-        ))
-    }
-
-    async fn retrieve_value(&self, _key: &str) -> Result<Option<String>, cache::Error> {
-        // Cache miss: always forward to the webhook.
-        Ok(None)
-    }
-
-    async fn delete_value(&self, _key: &str) -> Result<(), cache::Error> {
-        Ok(())
-    }
-}
 
 #[test]
 fn test_config_deserialize() {
@@ -923,7 +883,9 @@ async fn webhook_authorization_succeeds_despite_cache_store_error() {
     let mut config = build_test_config(Url::parse(&mock_server.uri()).unwrap(), None, None, None);
     config.auth = None;
 
-    let failing_cache = Arc::new(FailingCache::default());
+    let failing_backend = cache::stub::Backend::new();
+    failing_backend.set_store_error(Some("injected store failure".to_string()));
+    let failing_cache = Arc::new(Cache::Stub(failing_backend.clone()));
     let webhook =
         WebhookAuthorizer::new("test".to_string(), config, failing_cache.clone()).unwrap();
 
@@ -942,7 +904,7 @@ async fn webhook_authorization_succeeds_despite_cache_store_error() {
         "cache store error must not fail authorization"
     );
     assert_eq!(
-        failing_cache.store_call_count.load(Ordering::Relaxed),
+        failing_backend.store_calls(),
         1,
         "store_value must be attempted exactly once"
     );

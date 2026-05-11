@@ -7,7 +7,6 @@ use tracing::warn;
 
 use super::Backend;
 use crate::{
-    cache::CacheExt,
     oci::Digest,
     registry::{
         data_store,
@@ -31,8 +30,8 @@ impl Backend {
         cache
             .retrieve::<LinkMetadata>(&Self::cache_key(namespace, link))
             .await
-            .try_into()
-            .unwrap_or_default()
+            .ok()
+            .flatten()
     }
 
     /// Reads the link with its `ETag`, then spawns the access time write as a

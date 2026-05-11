@@ -39,7 +39,7 @@ impl From<blob_store::Error> for Error {
 
 pub fn blob_stores(
     config: &blob_store::BlobStorageConfig,
-    auth_cache: &Arc<dyn Cache>,
+    auth_cache: &Arc<Cache>,
 ) -> Result<BlobStoreHandles, Error> {
     config
         .to_backend(Some(auth_cache.clone()))
@@ -48,7 +48,7 @@ pub fn blob_stores(
 
 pub async fn metadata_store(
     config: &MetadataStoreConfig,
-    auth_cache: &Arc<dyn Cache>,
+    auth_cache: &Arc<Cache>,
 ) -> Result<
     (
         Arc<dyn MetadataStore + Send + Sync>,
@@ -62,14 +62,14 @@ pub async fn metadata_store(
         .map_err(Error::from)
 }
 
-pub fn auth_cache(config: &cache::Config) -> Result<Arc<dyn Cache>, Error> {
+pub fn auth_cache(config: &cache::Config) -> Result<Arc<Cache>, Error> {
     config.to_backend().map_err(Error::from)
 }
 
 pub fn repository(
     name: &str,
     config: &repository::Config,
-    auth_cache: &Arc<dyn Cache>,
+    auth_cache: &Arc<Cache>,
 ) -> Result<Repository, Error> {
     Repository::new(name, config, auth_cache).map_err(|source| Error::Repository {
         name: name.to_string(),
@@ -79,7 +79,7 @@ pub fn repository(
 
 pub fn repositories(
     configs: &HashMap<String, repository::Config>,
-    auth_cache: &Arc<dyn Cache>,
+    auth_cache: &Arc<Cache>,
 ) -> Result<Arc<HashMap<String, Repository>>, Error> {
     let mut map = HashMap::with_capacity(configs.len());
     for (name, config) in configs {
