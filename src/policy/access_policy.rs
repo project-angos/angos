@@ -88,10 +88,10 @@ impl AccessPolicy {
     /// Creates a new access policy from configuration.
     ///
     /// Rules are already compiled; this constructor is infallible.
-    pub fn new(config: &AccessPolicyConfig) -> Self {
+    pub fn new(config: AccessPolicyConfig) -> Self {
         Self {
             default: config.default,
-            rules: config.rules.clone(),
+            rules: config.rules,
         }
     }
 
@@ -199,11 +199,10 @@ mod tests {
 
     #[test]
     fn test_access_policy_allow_mode_no_rules() {
-        let config = AccessPolicyConfig {
+        let policy = AccessPolicy::new(AccessPolicyConfig {
             default: AccessMode::Allow,
             rules: vec![],
-        };
-        let policy = AccessPolicy::new(&config);
+        });
         let action = Action::ApiVersion;
         let identity = ClientIdentity::default();
 
@@ -212,11 +211,10 @@ mod tests {
 
     #[test]
     fn test_access_policy_deny_mode_no_rules() {
-        let config = AccessPolicyConfig {
+        let policy = AccessPolicy::new(AccessPolicyConfig {
             default: AccessMode::Deny,
             rules: vec![],
-        };
-        let policy = AccessPolicy::new(&config);
+        });
         let action = Action::ApiVersion;
         let identity = ClientIdentity::default();
 
@@ -225,11 +223,10 @@ mod tests {
 
     #[test]
     fn test_access_policy_allow_mode_with_deny_rule() {
-        let config = AccessPolicyConfig {
+        let policy = AccessPolicy::new(AccessPolicyConfig {
             default: AccessMode::Allow,
             rules: vec![rule("identity.username == 'forbidden'")],
-        };
-        let policy = AccessPolicy::new(&config);
+        });
 
         let action = Action::ApiVersion;
         let identity = ClientIdentity {
@@ -249,11 +246,10 @@ mod tests {
 
     #[test]
     fn test_access_policy_deny_mode_with_allow_rule() {
-        let config = AccessPolicyConfig {
+        let policy = AccessPolicy::new(AccessPolicyConfig {
             default: AccessMode::Deny,
             rules: vec![rule("identity.username == 'admin'")],
-        };
-        let policy = AccessPolicy::new(&config);
+        });
 
         let action = Action::ApiVersion;
         let identity = ClientIdentity {
@@ -323,11 +319,10 @@ mod tests {
     fn non_boolean_rule_in_allow_mode_denies_fail_closed() {
         // Allow mode: rules are DENY rules.  A non-bool result is treated as a
         // match → access is denied (fail-closed).
-        let config = AccessPolicyConfig {
+        let policy = AccessPolicy::new(AccessPolicyConfig {
             default: AccessMode::Allow,
             rules: vec![rule("42")],
-        };
-        let policy = AccessPolicy::new(&config);
+        });
         let action = Action::ApiVersion;
         let identity = ClientIdentity::default();
 
@@ -338,11 +333,10 @@ mod tests {
     fn non_boolean_rule_in_deny_mode_denies_fail_closed() {
         // Deny mode: rules are ALLOW rules.  A non-bool result is treated as a
         // misconfiguration and immediately denies access (fail-closed).
-        let config = AccessPolicyConfig {
+        let policy = AccessPolicy::new(AccessPolicyConfig {
             default: AccessMode::Deny,
             rules: vec![rule("42")],
-        };
-        let policy = AccessPolicy::new(&config);
+        });
         let action = Action::ApiVersion;
         let identity = ClientIdentity::default();
 
@@ -353,11 +347,10 @@ mod tests {
     fn non_boolean_rule_in_deny_mode_short_circuits_subsequent_allow_rules() {
         // Deny mode + ALLOW rules: a non-bool result must fail-closed immediately,
         // not silently skip and let a later rule grant access.
-        let config = AccessPolicyConfig {
+        let policy = AccessPolicy::new(AccessPolicyConfig {
             default: AccessMode::Deny,
             rules: vec![rule("42"), rule("true")],
-        };
-        let policy = AccessPolicy::new(&config);
+        });
         let action = Action::ApiVersion;
         let identity = ClientIdentity::default();
 
@@ -371,11 +364,10 @@ mod tests {
     fn failed_rule_in_allow_mode_falls_through_to_allow_fail_open() {
         // Allow mode: an evaluation error in a DENY rule is skipped, and the
         // default grants access.  This is the documented fail-open case in Allow mode.
-        let config = AccessPolicyConfig {
+        let policy = AccessPolicy::new(AccessPolicyConfig {
             default: AccessMode::Allow,
             rules: vec![rule("nonexistent_var")],
-        };
-        let policy = AccessPolicy::new(&config);
+        });
         let action = Action::ApiVersion;
         let identity = ClientIdentity::default();
 
@@ -386,11 +378,10 @@ mod tests {
     fn failed_rule_in_deny_mode_falls_through_to_deny_fail_closed() {
         // Deny mode: an evaluation error in an ALLOW rule is skipped, and the
         // default denies access (fail-closed).
-        let config = AccessPolicyConfig {
+        let policy = AccessPolicy::new(AccessPolicyConfig {
             default: AccessMode::Deny,
             rules: vec![rule("nonexistent_var")],
-        };
-        let policy = AccessPolicy::new(&config);
+        });
         let action = Action::ApiVersion;
         let identity = ClientIdentity::default();
 
@@ -405,14 +396,13 @@ mod tests {
         // (true), so access is denied immediately.  Rule 2 would grant access if it
         // were the active mode, but it is never reached.  The final outcome must be
         // deny, pinning short-circuit behaviour.
-        let config = AccessPolicyConfig {
+        let policy = AccessPolicy::new(AccessPolicyConfig {
             default: AccessMode::Allow,
             rules: vec![
                 rule("true"),  // rule 1: always triggers → deny
                 rule("false"), // rule 2: would not trigger, but is unreachable anyway
             ],
-        };
-        let policy = AccessPolicy::new(&config);
+        });
         let action = Action::ApiVersion;
         let identity = ClientIdentity::default();
 
@@ -424,14 +414,13 @@ mod tests {
         // Deny mode: rules are ALLOW rules evaluated in order.  Rule 1 always matches
         // (true), so access is granted immediately.  Rule 2 is never evaluated.
         // The final outcome must be allow, pinning short-circuit behaviour.
-        let config = AccessPolicyConfig {
+        let policy = AccessPolicy::new(AccessPolicyConfig {
             default: AccessMode::Deny,
             rules: vec![
                 rule("true"),  // rule 1: always triggers → allow
                 rule("false"), // rule 2: unreachable
             ],
-        };
-        let policy = AccessPolicy::new(&config);
+        });
         let action = Action::ApiVersion;
         let identity = ClientIdentity::default();
 
@@ -442,21 +431,19 @@ mod tests {
     fn multi_rule_no_match_falls_through_to_default() {
         // Both modes: when no rule returns true the default applies.
         // Allow mode with two false rules → allow (default).
-        let config_allow = AccessPolicyConfig {
+        let policy_allow = AccessPolicy::new(AccessPolicyConfig {
             default: AccessMode::Allow,
             rules: vec![rule("false"), rule("false")],
-        };
-        let policy_allow = AccessPolicy::new(&config_allow);
+        });
         let action = Action::ApiVersion;
         let identity = ClientIdentity::default();
         assert!(policy_allow.evaluate(&action, &identity).unwrap());
 
         // Deny mode with two false rules → deny (default).
-        let config_deny = AccessPolicyConfig {
+        let policy_deny = AccessPolicy::new(AccessPolicyConfig {
             default: AccessMode::Deny,
             rules: vec![rule("false"), rule("false")],
-        };
-        let policy_deny = AccessPolicy::new(&config_deny);
+        });
         assert!(!policy_deny.evaluate(&action, &identity).unwrap());
     }
 }

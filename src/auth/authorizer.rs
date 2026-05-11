@@ -35,7 +35,7 @@ struct AuthorizerRepository {
 
 impl Authorizer {
     pub fn new(config: &Configuration, cache: &Arc<dyn Cache>) -> Result<Self, Error> {
-        let global_access_policy = AccessPolicy::new(&config.global.access_policy);
+        let global_access_policy = AccessPolicy::new(config.global.access_policy.clone());
 
         let webhook_authorizers = build_webhooks(config, cache)?;
 
@@ -227,7 +227,7 @@ fn build_repositories(
         {
             None
         } else {
-            Some(AccessPolicy::new(&repo_config.access_policy))
+            Some(AccessPolicy::new(repo_config.access_policy.clone()))
         };
 
         let authorization_webhook = repo_config
