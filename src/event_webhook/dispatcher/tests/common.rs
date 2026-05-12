@@ -17,18 +17,8 @@ use crate::{
 
 pub const TEST_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
-pub fn into_arc_map(
-    webhooks: HashMap<String, EventWebhookConfig>,
-) -> HashMap<String, Arc<EventWebhookConfig>> {
-    let mut out = HashMap::with_capacity(webhooks.len());
-    for (name, config) in webhooks {
-        out.insert(name, Arc::new(config));
-    }
-    out
-}
-
 pub fn build_dispatcher(webhooks: HashMap<String, EventWebhookConfig>) -> EventDispatcher {
-    EventDispatcher::new(into_arc_map(webhooks)).expect("dispatcher should build in tests")
+    EventDispatcher::new(webhooks).expect("dispatcher should build in tests")
 }
 
 pub fn create_test_event() -> Event {

@@ -1,6 +1,7 @@
 use std::{collections::HashMap, net::SocketAddr, sync::Arc};
 
 use hyper::http::request::Parts;
+use serde::Deserialize;
 use tracing::{debug, info, instrument, warn};
 
 use super::{
@@ -12,11 +13,14 @@ use crate::{
     metrics_provider::metrics_provider,
 };
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Deserialize)]
 pub struct AuthConfig {
+    #[serde(default)]
     pub identity: HashMap<String, basic_auth::Config>,
+    #[serde(default)]
     pub oidc: HashMap<String, oidc::Config>,
-    pub webhook: HashMap<String, Arc<webhook::Config>>,
+    #[serde(default)]
+    pub webhook: HashMap<String, webhook::Config>,
 }
 
 type OidcValidators = Vec<(String, Arc<dyn AuthMiddleware>)>;

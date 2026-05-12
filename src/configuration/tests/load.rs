@@ -196,7 +196,7 @@ fn test_global_config_custom_values() {
         "global authorization_webhook should be resolved"
     );
     assert_eq!(
-        config.global.authorization_webhook.as_ref().unwrap().name,
+        config.global.authorization_webhook.as_ref().unwrap(),
         "my-webhook"
     );
 }

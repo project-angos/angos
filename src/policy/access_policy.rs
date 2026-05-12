@@ -15,8 +15,13 @@
 //! - `identity`: Client identity information (id, username, certificate details)
 //! - `request`: Request details (action, namespace, digest, reference)
 
+use std::fmt;
+
 use cel_interpreter::{Context, Value};
-use serde::Deserialize;
+use serde::{
+    Deserialize, Deserializer,
+    de::{self, MapAccess, Visitor},
+};
 use tracing::{debug, warn};
 
 use super::{CelRule, Error};
@@ -34,39 +39,72 @@ pub enum AccessMode {
 }
 
 /// Configuration for access control policies.
-#[derive(Clone, Debug, Default, Deserialize)]
-#[serde(from = "RawAccessPolicyConfig")]
+#[derive(Clone, Debug, Default)]
 pub struct AccessPolicyConfig {
     pub default: AccessMode,
     pub rules: Vec<CelRule>,
 }
 
-/// Intermediate shape that also accepts the deprecated `default_allow` field.
-///
-/// `default` takes precedence when both are present. `default_allow` usage
-/// emits a deprecation warning and will be removed in a future release.
-#[derive(Default, Deserialize)]
-#[serde(default)]
-struct RawAccessPolicyConfig {
-    default: Option<AccessMode>,
-    default_allow: Option<bool>,
-    rules: Vec<CelRule>,
+impl<'de> Deserialize<'de> for AccessPolicyConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct AccessPolicyVisitor;
+
+        impl<'de> Visitor<'de> for AccessPolicyVisitor {
+            type Value = AccessPolicyConfig;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("access policy configuration")
+            }
+
+            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+            where
+                A: MapAccess<'de>,
+            {
+                let mut default = None;
+                let mut default_allow = None;
+                let mut rules = None;
+
+                while let Some(key) = map.next_key::<String>()? {
+                    match key.as_str() {
+                        "default" => assign_once(&mut default, "default", map.next_value()?)?,
+                        "default_allow" => {
+                            assign_once(&mut default_allow, "default_allow", map.next_value()?)?
+                        }
+                        "rules" => assign_once(&mut rules, "rules", map.next_value()?)?,
+                        _ => {
+                            let _ = map.next_value::<de::IgnoredAny>()?;
+                        }
+                    }
+                }
+
+                if default_allow.is_some() {
+                    warn!("'access_policy.default_allow' is deprecated; use 'default' instead");
+                }
+
+                Ok(AccessPolicyConfig {
+                    default: default
+                        .or_else(|| default_allow.map(AccessMode::from_default_allow))
+                        .unwrap_or_default(),
+                    rules: rules.unwrap_or_default(),
+                })
+            }
+        }
+
+        deserializer.deserialize_map(AccessPolicyVisitor)
+    }
 }
 
-impl From<RawAccessPolicyConfig> for AccessPolicyConfig {
-    fn from(raw: RawAccessPolicyConfig) -> Self {
-        if raw.default_allow.is_some() {
-            warn!("'access_policy.default_allow' is deprecated; use 'default' instead");
-        }
-        let default = raw
-            .default
-            .or_else(|| raw.default_allow.map(AccessMode::from_default_allow))
-            .unwrap_or_default();
-        Self {
-            default,
-            rules: raw.rules,
-        }
+fn assign_once<T, E>(slot: &mut Option<T>, field: &'static str, value: T) -> Result<(), E>
+where
+    E: de::Error,
+{
+    if slot.replace(value).is_some() {
+        return Err(de::Error::duplicate_field(field));
     }
+    Ok(())
 }
 
 impl AccessMode {

@@ -43,7 +43,7 @@ port = 8000
 root_dir = "./registry-data"
 
 [global.access_policy]
-default_allow = true
+default = "allow"
 
 [repository."test"]
 EOF

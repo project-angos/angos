@@ -1,16 +1,12 @@
-use std::sync::Arc;
-
 use serde::Deserialize;
 
 use crate::{
-    auth::webhook,
     configuration::RegexPattern,
     policy::{AccessPolicyConfig, RetentionPolicyConfig},
 };
 
-/// Parsed shape of `[global]` before webhook name references are resolved.
 #[derive(Clone, Debug, Deserialize)]
-pub struct RawGlobalConfig {
+pub struct GlobalConfig {
     #[serde(default = "default_max_concurrent_requests")]
     pub max_concurrent_requests: usize,
     #[serde(default = "default_max_concurrent_cache_jobs")]
@@ -48,41 +44,6 @@ fn default_update_pull_time() -> bool {
     false
 }
 
-impl Default for RawGlobalConfig {
-    fn default() -> Self {
-        RawGlobalConfig {
-            max_concurrent_requests: default_max_concurrent_requests(),
-            max_concurrent_cache_jobs: default_max_concurrent_cache_jobs(),
-            update_pull_time: default_update_pull_time(),
-            enable_redirect: None,
-            enable_blob_redirect: None,
-            enable_manifest_redirect: None,
-            access_policy: AccessPolicyConfig::default(),
-            retention_policy: RetentionPolicyConfig::default(),
-            immutable_tags: false,
-            immutable_tags_exclusions: Vec::new(),
-            authorization_webhook: None,
-            event_webhooks: Vec::new(),
-        }
-    }
-}
-
-/// Resolved global configuration with webhook references replaced by their definitions.
-#[derive(Clone, Debug)]
-pub struct GlobalConfig {
-    pub max_concurrent_requests: usize,
-    pub max_concurrent_cache_jobs: usize,
-    pub update_pull_time: bool,
-    pub enable_redirect: Option<bool>,
-    pub enable_blob_redirect: Option<bool>,
-    pub enable_manifest_redirect: Option<bool>,
-    pub access_policy: AccessPolicyConfig,
-    pub retention_policy: RetentionPolicyConfig,
-    pub immutable_tags: bool,
-    pub immutable_tags_exclusions: Vec<RegexPattern>,
-    pub authorization_webhook: Option<Arc<webhook::Config>>,
-}
-
 impl Default for GlobalConfig {
     fn default() -> Self {
         GlobalConfig {
@@ -97,6 +58,7 @@ impl Default for GlobalConfig {
             immutable_tags: false,
             immutable_tags_exclusions: Vec::new(),
             authorization_webhook: None,
+            event_webhooks: Vec::new(),
         }
     }
 }

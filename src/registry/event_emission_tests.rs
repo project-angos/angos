@@ -80,7 +80,7 @@ impl FsRegistryFixture {
 fn build_dispatcher_for_server(server_uri: &str) -> EventDispatcher {
     use std::collections::HashMap;
 
-    let config = Arc::new(EventWebhookConfig {
+    let config = EventWebhookConfig {
         name: "test-hook".to_string(),
         url: Url::parse(server_uri).unwrap(),
         policy: DeliveryPolicy::Required,
@@ -94,7 +94,7 @@ fn build_dispatcher_for_server(server_uri: &str) -> EventDispatcher {
             EventKind::TagDelete,
         ],
         repository_filter: None,
-    });
+    };
     let mut webhooks = HashMap::new();
     webhooks.insert("test-hook".to_string(), config);
     EventDispatcher::new(webhooks).expect("dispatcher build")

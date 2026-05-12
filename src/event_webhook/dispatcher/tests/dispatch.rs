@@ -8,7 +8,7 @@ use wiremock::{
 
 use super::common::{
     build_dispatcher, create_test_event, create_webhook_config_for_url,
-    create_webhook_config_with_policy, into_arc_map,
+    create_webhook_config_with_policy,
 };
 use crate::{
     configuration::RegexPattern,
@@ -35,14 +35,14 @@ fn event_dispatcher_new_constructs_from_configs() {
         ),
     );
 
-    let dispatcher = super::super::EventDispatcher::new(into_arc_map(webhooks));
+    let dispatcher = super::super::EventDispatcher::new(webhooks);
     assert!(dispatcher.is_ok());
 }
 
 #[test]
 fn event_dispatcher_new_empty_configs() {
     let webhooks = HashMap::new();
-    let dispatcher = super::super::EventDispatcher::new(into_arc_map(webhooks));
+    let dispatcher = super::super::EventDispatcher::new(webhooks);
     assert!(dispatcher.is_ok());
 }
 

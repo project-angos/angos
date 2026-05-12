@@ -4,7 +4,6 @@ use serde::Deserialize;
 use tracing::{instrument, warn};
 
 use crate::{
-    auth::webhook,
     cache::Cache,
     configuration::RegexPattern,
     oci::{Digest, Namespace, Reference},
@@ -17,9 +16,8 @@ mod registry_client;
 use registry_client::RegistryClient;
 pub use registry_client::RegistryClientConfig;
 
-/// Parsed shape of `[repository.<name>]` before webhook name references are resolved.
 #[derive(Clone, Debug, Default, Deserialize)]
-pub struct RawConfig {
+pub struct Config {
     #[serde(default)]
     pub upstream: Vec<RegistryClientConfig>,
     #[serde(default)]
@@ -33,17 +31,6 @@ pub struct RawConfig {
     pub authorization_webhook: Option<String>,
     #[serde(default)]
     pub event_webhooks: Vec<String>,
-}
-
-/// Resolved repository configuration with webhook references replaced by their definitions.
-#[derive(Clone, Debug, Default)]
-pub struct Config {
-    pub upstream: Vec<RegistryClientConfig>,
-    pub access_policy: AccessPolicyConfig,
-    pub retention_policy: RetentionPolicyConfig,
-    pub immutable_tags: bool,
-    pub immutable_tags_exclusions: Vec<RegexPattern>,
-    pub authorization_webhook: Option<Arc<webhook::Config>>,
 }
 
 pub struct Repository {

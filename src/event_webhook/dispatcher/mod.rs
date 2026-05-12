@@ -102,7 +102,7 @@ fn serialize_event(event: &Event) -> Result<(Vec<u8>, &'static str), Error> {
 }
 
 impl EventDispatcher {
-    pub fn new(webhooks: HashMap<String, Arc<EventWebhookConfig>>) -> Result<Self, Error> {
+    pub fn new(webhooks: HashMap<String, EventWebhookConfig>) -> Result<Self, Error> {
         let mut endpoints = HashMap::with_capacity(webhooks.len());
 
         for (name, config) in webhooks {
@@ -115,7 +115,13 @@ impl EventDispatcher {
                     ))
                 })?;
 
-            endpoints.insert(name, WebhookEndpoint { client, config });
+            endpoints.insert(
+                name,
+                WebhookEndpoint {
+                    client,
+                    config: Arc::new(config),
+                },
+            );
         }
 
         Ok(Self {

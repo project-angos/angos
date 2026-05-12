@@ -4,7 +4,7 @@ use hyper::http::request::Parts;
 use tracing::{debug, info, instrument};
 
 use crate::{
-    auth::webhook::{self, WebhookAuthorizer},
+    auth::webhook::WebhookAuthorizer,
     cache::Cache,
     command::server::Error,
     configuration::{Configuration, RegexPattern},
@@ -43,7 +43,7 @@ impl Authorizer {
             .global
             .authorization_webhook
             .as_ref()
-            .map(|cfg| lookup_webhook(&webhook_authorizers, cfg))
+            .map(|name| lookup_webhook(&webhook_authorizers, name))
             .transpose()?;
 
         let repositories = build_repositories(config, &webhook_authorizers)?;
@@ -207,10 +207,9 @@ fn build_webhooks(
     let mut webhooks = HashMap::with_capacity(config.auth.webhook.len());
     for (name, webhook_config) in &config.auth.webhook {
         let authorizer =
-            WebhookAuthorizer::new(name.clone(), webhook_config.as_ref().clone(), cache.clone())
-                .map_err(|e| {
-                    Error::Initialization(format!("Failed to create webhook '{name}': {e}"))
-                })?;
+            WebhookAuthorizer::new(name.clone(), webhook_config.clone(), cache.clone()).map_err(
+                |e| Error::Initialization(format!("Failed to create webhook '{name}': {e}")),
+            )?;
         webhooks.insert(name.clone(), Arc::new(authorizer));
     }
     Ok(webhooks)
@@ -233,7 +232,7 @@ fn build_repositories(
         let authorization_webhook = repo_config
             .authorization_webhook
             .as_ref()
-            .map(|cfg| lookup_webhook(webhook_authorizers, cfg))
+            .map(|name| lookup_webhook(webhook_authorizers, name))
             .transpose()?;
 
         repositories.insert(
@@ -255,12 +254,11 @@ fn log_denial(reason: &str, identity: &ClientIdentity) {
 
 fn lookup_webhook(
     authorizers: &HashMap<String, Arc<WebhookAuthorizer>>,
-    cfg: &webhook::Config,
+    name: &str,
 ) -> Result<Arc<WebhookAuthorizer>, Error> {
-    authorizers.get(&cfg.name).cloned().ok_or_else(|| {
+    authorizers.get(name).cloned().ok_or_else(|| {
         Error::Initialization(format!(
-            "Internal: webhook '{}' missing from authorizer map",
-            cfg.name
+            "Internal: webhook '{name}' missing from authorizer map",
         ))
     })
 }
