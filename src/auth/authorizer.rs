@@ -268,28 +268,14 @@ mod tests {
     use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};
 
     use super::*;
-    use crate::{cache, configuration::Configuration};
+    use crate::{
+        cache,
+        configuration::Configuration,
+        test_fixtures::configuration::{config_toml, minimal_config},
+    };
 
     fn create_minimal_config() -> Configuration {
-        let toml = r#"
-            [blob_store.fs]
-            root_dir = "/tmp/test"
-
-            [metadata_store.fs]
-            root_dir = "/tmp/test"
-
-            [cache.memory]
-
-            [server]
-            bind_address = "0.0.0.0"
-            port = 8000
-
-            [global]
-            update_pull_time = false
-            max_concurrent_cache_jobs = 10
-        "#;
-
-        Configuration::load_from_str(toml).unwrap()
+        minimal_config()
     }
 
     #[test]
@@ -309,29 +295,15 @@ mod tests {
 
     #[test]
     fn test_authorizer_new_with_global_access_policy() {
-        let toml = r#"
-            [blob_store.fs]
-            root_dir = "/tmp/test"
-
-            [metadata_store.fs]
-            root_dir = "/tmp/test"
-
-            [cache.memory]
-
-            [server]
-            bind_address = "0.0.0.0"
-            port = 8000
-
-            [global]
-            update_pull_time = false
-            max_concurrent_cache_jobs = 10
-
+        let toml = config_toml(
+            r#"
             [global.access_policy]
             default = "allow"
             rules = ["identity.username == 'admin'"]
-        "#;
+        "#,
+        );
 
-        let config = Configuration::load_from_str(toml).unwrap();
+        let config = Configuration::load_from_str(&toml).unwrap();
         let cache = cache::Config::Memory.to_backend().unwrap();
 
         let authorizer = Authorizer::new(&config, &cache);
@@ -341,27 +313,14 @@ mod tests {
 
     #[test]
     fn test_authorizer_new_with_global_immutable_tags() {
-        let toml = r#"
-            [blob_store.fs]
-            root_dir = "/tmp/test"
-
-            [metadata_store.fs]
-            root_dir = "/tmp/test"
-
-            [cache.memory]
-
-            [server]
-            bind_address = "0.0.0.0"
-            port = 8000
-
-            [global]
-            update_pull_time = false
-            max_concurrent_cache_jobs = 10
+        let toml = config_toml(
+            r#"
             immutable_tags = true
             immutable_tags_exclusions = ["^latest$", "^dev-.*"]
-        "#;
+        "#,
+        );
 
-        let config = Configuration::load_from_str(toml).unwrap();
+        let config = Configuration::load_from_str(&toml).unwrap();
         let cache = cache::Config::Memory.to_backend().unwrap();
 
         let authorizer = Authorizer::new(&config, &cache);
@@ -374,30 +333,16 @@ mod tests {
 
     #[test]
     fn test_authorizer_new_with_repository_config() {
-        let toml = r#"
-            [blob_store.fs]
-            root_dir = "/tmp/test"
-
-            [metadata_store.fs]
-            root_dir = "/tmp/test"
-
-            [cache.memory]
-
-            [server]
-            bind_address = "0.0.0.0"
-            port = 8000
-
-            [global]
-            update_pull_time = false
-            max_concurrent_cache_jobs = 10
-
+        let toml = config_toml(
+            r#"
             [repository.myrepo]
             namespace_pattern = "^myrepo/.*"
             immutable_tags = true
             immutable_tags_exclusions = ["^test-.*"]
-        "#;
+        "#,
+        );
 
-        let config = Configuration::load_from_str(toml).unwrap();
+        let config = Configuration::load_from_str(&toml).unwrap();
         let cache = cache::Config::Memory.to_backend().unwrap();
 
         let authorizer = Authorizer::new(&config, &cache);
@@ -410,27 +355,14 @@ mod tests {
 
     #[test]
     fn test_invalid_global_regex_fails_at_deserialize() {
-        let toml = r#"
-            [blob_store.fs]
-            root_dir = "/tmp/test"
-
-            [metadata_store.fs]
-            root_dir = "/tmp/test"
-
-            [cache.memory]
-
-            [server]
-            bind_address = "0.0.0.0"
-            port = 8000
-
-            [global]
-            update_pull_time = false
-            max_concurrent_cache_jobs = 10
+        let toml = config_toml(
+            r#"
             immutable_tags = true
             immutable_tags_exclusions = ["[invalid"]
-        "#;
+        "#,
+        );
 
-        let result = Configuration::load_from_str(toml);
+        let result = Configuration::load_from_str(&toml);
         assert!(
             result.is_err(),
             "invalid global regex must fail at deserialize time"
@@ -439,30 +371,16 @@ mod tests {
 
     #[test]
     fn test_invalid_repository_regex_fails_at_deserialize() {
-        let toml = r#"
-            [blob_store.fs]
-            root_dir = "/tmp/test"
-
-            [metadata_store.fs]
-            root_dir = "/tmp/test"
-
-            [cache.memory]
-
-            [server]
-            bind_address = "0.0.0.0"
-            port = 8000
-
-            [global]
-            update_pull_time = false
-            max_concurrent_cache_jobs = 10
-
+        let toml = config_toml(
+            r#"
             [repository.myrepo]
             namespace_pattern = "^myrepo/.*"
             immutable_tags = true
             immutable_tags_exclusions = ["[invalid"]
-        "#;
+        "#,
+        );
 
-        let result = Configuration::load_from_str(toml);
+        let result = Configuration::load_from_str(&toml);
         assert!(
             result.is_err(),
             "invalid repository regex must fail at deserialize time"
@@ -471,26 +389,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_is_tag_immutable_with_global_setting() {
-        let toml = r#"
-            [blob_store.fs]
-            root_dir = "/tmp/test"
-
-            [metadata_store.fs]
-            root_dir = "/tmp/test"
-
-            [cache.memory]
-
-            [server]
-            bind_address = "0.0.0.0"
-            port = 8000
-
-            [global]
-            update_pull_time = false
-            max_concurrent_cache_jobs = 10
+        let toml = config_toml(
+            r#"
             immutable_tags = true
-        "#;
+        "#,
+        );
 
-        let config = Configuration::load_from_str(toml).unwrap();
+        let config = Configuration::load_from_str(&toml).unwrap();
         let cache = cache::Config::Memory.to_backend().unwrap();
         let authorizer = Authorizer::new(&config, &cache).unwrap();
         let registry = create_pull_through_registry(&config).await;
@@ -501,27 +406,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_is_tag_immutable_with_global_exclusions() {
-        let toml = r#"
-            [blob_store.fs]
-            root_dir = "/tmp/test"
-
-            [metadata_store.fs]
-            root_dir = "/tmp/test"
-
-            [cache.memory]
-
-            [server]
-            bind_address = "0.0.0.0"
-            port = 8000
-
-            [global]
-            update_pull_time = false
-            max_concurrent_cache_jobs = 10
+        let toml = config_toml(
+            r#"
             immutable_tags = true
             immutable_tags_exclusions = ["^latest$", "^dev-.*"]
-        "#;
+        "#,
+        );
 
-        let config = Configuration::load_from_str(toml).unwrap();
+        let config = Configuration::load_from_str(&toml).unwrap();
         let cache = cache::Config::Memory.to_backend().unwrap();
         let authorizer = Authorizer::new(&config, &cache).unwrap();
         let registry = create_pull_through_registry(&config).await;
@@ -534,30 +426,17 @@ mod tests {
 
     #[tokio::test]
     async fn test_is_tag_immutable_with_repository_setting() {
-        let toml = r#"
-            [blob_store.fs]
-            root_dir = "/tmp/test"
-
-            [metadata_store.fs]
-            root_dir = "/tmp/test"
-
-            [cache.memory]
-
-            [server]
-            bind_address = "0.0.0.0"
-            port = 8000
-
-            [global]
-            update_pull_time = false
-            max_concurrent_cache_jobs = 10
+        let toml = config_toml(
+            r#"
             immutable_tags = false
 
             [repository.myrepo]
             namespace_pattern = "^myrepo/.*"
             immutable_tags = true
-        "#;
+        "#,
+        );
 
-        let config = Configuration::load_from_str(toml).unwrap();
+        let config = Configuration::load_from_str(&toml).unwrap();
         let cache = cache::Config::Memory.to_backend().unwrap();
         let authorizer = Authorizer::new(&config, &cache).unwrap();
         let registry = create_pull_through_registry(&config).await;
@@ -568,22 +447,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_is_tag_immutable_with_repository_exclusions() {
-        let toml = r#"
-            [blob_store.fs]
-            root_dir = "/tmp/test"
-
-            [metadata_store.fs]
-            root_dir = "/tmp/test"
-
-            [cache.memory]
-
-            [server]
-            bind_address = "0.0.0.0"
-            port = 8000
-
-            [global]
-            update_pull_time = false
-            max_concurrent_cache_jobs = 10
+        let toml = config_toml(
+            r#"
             immutable_tags = true
             immutable_tags_exclusions = ["^latest$"]
 
@@ -591,9 +456,10 @@ mod tests {
             namespace_pattern = "^myrepo/.*"
             immutable_tags = true
             immutable_tags_exclusions = ["^test-.*"]
-        "#;
+        "#,
+        );
 
-        let config = Configuration::load_from_str(toml).unwrap();
+        let config = Configuration::load_from_str(&toml).unwrap();
         let cache = cache::Config::Memory.to_backend().unwrap();
         let authorizer = Authorizer::new(&config, &cache).unwrap();
         let registry = create_pull_through_registry(&config).await;
@@ -606,30 +472,17 @@ mod tests {
 
     #[tokio::test]
     async fn test_is_tag_immutable_with_sub_namespace() {
-        let toml = r#"
-            [blob_store.fs]
-            root_dir = "/tmp/test"
-
-            [metadata_store.fs]
-            root_dir = "/tmp/test"
-
-            [cache.memory]
-
-            [server]
-            bind_address = "0.0.0.0"
-            port = 8000
-
-            [global]
-            update_pull_time = false
-            max_concurrent_cache_jobs = 10
+        let toml = config_toml(
+            r#"
             immutable_tags = false
 
             [repository."docker-io"]
             immutable_tags = true
             immutable_tags_exclusions = ["^latest$"]
-        "#;
+        "#,
+        );
 
-        let config = Configuration::load_from_str(toml).unwrap();
+        let config = Configuration::load_from_str(&toml).unwrap();
         let cache = cache::Config::Memory.to_backend().unwrap();
         let authorizer = Authorizer::new(&config, &cache).unwrap();
         let registry = create_pull_through_registry(&config).await;
@@ -645,30 +498,17 @@ mod tests {
 
     #[test]
     fn test_is_tag_mutable_when_not_immutable() {
-        let toml = r#"
-            [blob_store.fs]
-            root_dir = "/tmp/test"
-
-            [metadata_store.fs]
-            root_dir = "/tmp/test"
-
-            [cache.memory]
-
-            [server]
-            bind_address = "0.0.0.0"
-            port = 8000
-
-            [global]
-            update_pull_time = false
-            max_concurrent_cache_jobs = 10
+        let toml = config_toml(
+            r#"
             immutable_tags = false
 
             [repository.myrepo]
             namespace_pattern = "^myrepo/.*"
             immutable_tags = false
-        "#;
+        "#,
+        );
 
-        let config = Configuration::load_from_str(toml).unwrap();
+        let config = Configuration::load_from_str(&toml).unwrap();
         let cache = cache::Config::Memory.to_backend().unwrap();
         let authorizer = Authorizer::new(&config, &cache).unwrap();
         let auth_repo = authorizer.repositories.get("myrepo").unwrap();
@@ -680,30 +520,16 @@ mod tests {
     // tag is mutable (the exclusion carves out a writable subset).
     #[test]
     fn is_tag_mutable_returns_true_when_immutable_but_excluded() {
-        let toml = r#"
-            [blob_store.fs]
-            root_dir = "/tmp/test"
-
-            [metadata_store.fs]
-            root_dir = "/tmp/test"
-
-            [cache.memory]
-
-            [server]
-            bind_address = "0.0.0.0"
-            port = 8000
-
-            [global]
-            update_pull_time = false
-            max_concurrent_cache_jobs = 10
-
+        let toml = config_toml(
+            r#"
             [repository.myrepo]
             namespace_pattern = "^myrepo/.*"
             immutable_tags = true
             immutable_tags_exclusions = ["^latest$", "^dev-.*"]
-        "#;
+        "#,
+        );
 
-        let config = Configuration::load_from_str(toml).unwrap();
+        let config = Configuration::load_from_str(&toml).unwrap();
         let cache = cache::Config::Memory.to_backend().unwrap();
         let authorizer = Authorizer::new(&config, &cache).unwrap();
         let auth_repo = authorizer.repositories.get("myrepo").unwrap();
@@ -722,30 +548,16 @@ mod tests {
     // the tag is immutable.
     #[test]
     fn is_tag_mutable_returns_false_when_immutable_and_not_excluded() {
-        let toml = r#"
-            [blob_store.fs]
-            root_dir = "/tmp/test"
-
-            [metadata_store.fs]
-            root_dir = "/tmp/test"
-
-            [cache.memory]
-
-            [server]
-            bind_address = "0.0.0.0"
-            port = 8000
-
-            [global]
-            update_pull_time = false
-            max_concurrent_cache_jobs = 10
-
+        let toml = config_toml(
+            r#"
             [repository.myrepo]
             namespace_pattern = "^myrepo/.*"
             immutable_tags = true
             immutable_tags_exclusions = ["^latest$"]
-        "#;
+        "#,
+        );
 
-        let config = Configuration::load_from_str(toml).unwrap();
+        let config = Configuration::load_from_str(&toml).unwrap();
         let cache = cache::Config::Memory.to_backend().unwrap();
         let authorizer = Authorizer::new(&config, &cache).unwrap();
         let auth_repo = authorizer.repositories.get("myrepo").unwrap();
@@ -765,29 +577,16 @@ mod tests {
             oci::{Namespace, Reference},
         };
 
-        let toml = r#"
-            [blob_store.fs]
-            root_dir = "/tmp/test"
-
-            [metadata_store.fs]
-            root_dir = "/tmp/test"
-
-            [cache.memory]
-
-            [server]
-            bind_address = "0.0.0.0"
-            port = 8000
-
-            [global]
-            update_pull_time = false
-            max_concurrent_cache_jobs = 10
+        let toml = config_toml(
+            r#"
             immutable_tags = true
 
             [repository.myrepo]
             namespace_pattern = "^myrepo/.*"
-        "#;
+        "#,
+        );
 
-        let config = Configuration::load_from_str(toml).unwrap();
+        let config = Configuration::load_from_str(&toml).unwrap();
         let cache = cache::Config::Memory.to_backend().unwrap();
         let authorizer = Authorizer::new(&config, &cache).unwrap();
         let auth_repo = authorizer.repositories.get("myrepo").unwrap();
@@ -815,23 +614,8 @@ mod tests {
     }
 
     fn create_pull_through_config() -> Configuration {
-        let toml = r#"
-            [blob_store.fs]
-            root_dir = "/tmp/test"
-
-            [metadata_store.fs]
-            root_dir = "/tmp/test"
-
-            [cache.memory]
-
-            [server]
-            bind_address = "0.0.0.0"
-            port = 8000
-
-            [global]
-            update_pull_time = false
-            max_concurrent_cache_jobs = 10
-
+        let toml = config_toml(
+            r#"
             [global.access_policy]
             default = "allow"
 
@@ -839,9 +623,10 @@ mod tests {
 
             [[repository."docker-io".upstream]]
             url = "https://registry-1.docker.io"
-        "#;
+        "#,
+        );
 
-        Configuration::load_from_str(toml).unwrap()
+        Configuration::load_from_str(&toml).unwrap()
     }
 
     async fn create_pull_through_registry(config: &Configuration) -> Registry {
@@ -1006,28 +791,14 @@ mod tests {
     async fn global_deny_policy_rejects_all_requests() {
         use crate::command::server::Error as ServerError;
 
-        let toml = r#"
-            [blob_store.fs]
-            root_dir = "/tmp/test"
-
-            [metadata_store.fs]
-            root_dir = "/tmp/test"
-
-            [cache.memory]
-
-            [server]
-            bind_address = "0.0.0.0"
-            port = 8000
-
-            [global]
-            update_pull_time = false
-            max_concurrent_cache_jobs = 10
-
+        let toml = config_toml(
+            r#"
             [global.access_policy]
             default = "deny"
-        "#;
+        "#,
+        );
 
-        let config = Configuration::load_from_str(toml).unwrap();
+        let config = Configuration::load_from_str(&toml).unwrap();
         let cache = cache::Config::Memory.to_backend().unwrap();
         let authorizer = Authorizer::new(&config, &cache).unwrap();
         let registry = create_pull_through_registry(&config).await;
@@ -1062,23 +833,8 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        let toml = format!(
+        let toml = config_toml(&format!(
             r#"
-            [blob_store.fs]
-            root_dir = "/tmp/test"
-
-            [metadata_store.fs]
-            root_dir = "/tmp/test"
-
-            [cache.memory]
-
-            [server]
-            bind_address = "0.0.0.0"
-            port = 8000
-
-            [global]
-            update_pull_time = false
-            max_concurrent_cache_jobs = 10
             authorization_webhook = "gatekeeper"
 
             [global.access_policy]
@@ -1089,7 +845,7 @@ mod tests {
             timeout_ms = 1000
             "#,
             url = mock_server.uri()
-        );
+        ));
 
         let config = Configuration::load_from_str(&toml).unwrap();
         let cache = cache::Config::Memory.to_backend().unwrap();
@@ -1124,23 +880,8 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        let toml = format!(
+        let toml = config_toml(&format!(
             r#"
-            [blob_store.fs]
-            root_dir = "/tmp/test"
-
-            [metadata_store.fs]
-            root_dir = "/tmp/test"
-
-            [cache.memory]
-
-            [server]
-            bind_address = "0.0.0.0"
-            port = 8000
-
-            [global]
-            update_pull_time = false
-            max_concurrent_cache_jobs = 10
             authorization_webhook = "gatekeeper"
 
             [global.access_policy]
@@ -1151,7 +892,7 @@ mod tests {
             timeout_ms = 1000
             "#,
             url = mock_server.uri()
-        );
+        ));
 
         let config = Configuration::load_from_str(&toml).unwrap();
         let cache = cache::Config::Memory.to_backend().unwrap();
@@ -1202,28 +943,14 @@ mod tests {
     async fn authorize_request_unknown_namespace_is_allowed_under_allow_policy() {
         use crate::oci::Namespace;
 
-        let toml = r#"
-            [blob_store.fs]
-            root_dir = "/tmp/test"
-
-            [metadata_store.fs]
-            root_dir = "/tmp/test"
-
-            [cache.memory]
-
-            [server]
-            bind_address = "0.0.0.0"
-            port = 8000
-
-            [global]
-            update_pull_time = false
-            max_concurrent_cache_jobs = 10
-
+        let toml = config_toml(
+            r#"
             [global.access_policy]
             default = "allow"
-        "#;
+        "#,
+        );
 
-        let config = Configuration::load_from_str(toml).unwrap();
+        let config = Configuration::load_from_str(&toml).unwrap();
         let cache = cache::Config::Memory.to_backend().unwrap();
         let authorizer = Authorizer::new(&config, &cache).unwrap();
         let registry = create_pull_through_registry(&config).await;
@@ -1260,23 +987,8 @@ mod tests {
     async fn webhook_unreachable_fails_closed() {
         use crate::oci::Namespace;
 
-        let toml = r#"
-            [blob_store.fs]
-            root_dir = "/tmp/test"
-
-            [metadata_store.fs]
-            root_dir = "/tmp/test"
-
-            [cache.memory]
-
-            [server]
-            bind_address = "0.0.0.0"
-            port = 8000
-
-            [global]
-            update_pull_time = false
-            max_concurrent_cache_jobs = 10
-
+        let toml = config_toml(
+            r#"
             [global.access_policy]
             default = "allow"
 
@@ -1287,9 +999,10 @@ mod tests {
             [auth.webhook.gatekeeper]
             url = "http://127.0.0.1:1"
             timeout_ms = 500
-        "#;
+        "#,
+        );
 
-        let config = Configuration::load_from_str(toml).unwrap();
+        let config = Configuration::load_from_str(&toml).unwrap();
         let cache = cache::Config::Memory.to_backend().unwrap();
         let authorizer = Authorizer::new(&config, &cache).unwrap();
         let registry = create_pull_through_registry(&config).await;

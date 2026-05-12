@@ -231,49 +231,16 @@ mod tests {
     use hyper::{Request, header::AUTHORIZATION};
 
     use super::*;
-    use crate::{cache, configuration::Configuration, metrics_provider};
+    use crate::{
+        cache,
+        configuration::Configuration,
+        metrics_provider,
+        test_fixtures::configuration::{config_toml, minimal_config},
+    };
 
     fn create_minimal_config() -> Configuration {
         metrics_provider::init_for_tests();
-        let toml = r#"
-            [blob_store.fs]
-            root_dir = "/tmp/test"
-
-            [metadata_store.fs]
-            root_dir = "/tmp/test"
-
-            [cache.memory]
-
-            [server]
-            bind_address = "0.0.0.0"
-            port = 8000
-
-            [global]
-            update_pull_time = false
-            max_concurrent_cache_jobs = 10
-        "#;
-
-        Configuration::load_from_str(toml).unwrap()
-    }
-
-    fn minimal_config_prefix() -> &'static str {
-        r#"
-            [blob_store.fs]
-            root_dir = "/tmp/test"
-
-            [metadata_store.fs]
-            root_dir = "/tmp/test"
-
-            [cache.memory]
-
-            [server]
-            bind_address = "0.0.0.0"
-            port = 8000
-
-            [global]
-            update_pull_time = false
-            max_concurrent_cache_jobs = 10
-        "#
+        minimal_config()
     }
 
     #[test]
@@ -286,13 +253,12 @@ mod tests {
 
     #[test]
     fn test_auth_config_with_identity() {
-        let toml = format!(
-            r#"{}
+        let toml = config_toml(
+            r#"
             [auth.identity.user1]
             username = "user1"
             password = "$argon2id$v=19$m=19456,t=2,p=1$test"
         "#,
-            minimal_config_prefix()
         );
 
         let config = Configuration::load_from_str(&toml).unwrap();
@@ -302,12 +268,11 @@ mod tests {
 
     #[test]
     fn test_auth_config_with_oidc() {
-        let toml = format!(
-            r#"{}
+        let toml = config_toml(
+            r#"
             [auth.oidc.github]
             provider = "github"
         "#,
-            minimal_config_prefix()
         );
 
         let config = Configuration::load_from_str(&toml).unwrap();
@@ -317,13 +282,12 @@ mod tests {
 
     #[test]
     fn test_auth_config_with_webhook() {
-        let toml = format!(
-            r#"{}
+        let toml = config_toml(
+            r#"
             [auth.webhook.test]
             url = "http://localhost:8080/auth"
             timeout_ms = 5000
         "#,
-            minimal_config_prefix()
         );
 
         let config = Configuration::load_from_str(&toml).unwrap();
@@ -343,13 +307,12 @@ mod tests {
 
     #[test]
     fn test_authenticator_new_with_basic_auth() {
-        let toml = format!(
-            r#"{}
+        let toml = config_toml(
+            r#"
             [auth.identity.testuser]
             username = "testuser"
             password = "$argon2id$v=19$m=19456,t=2,p=1$test"
         "#,
-            minimal_config_prefix()
         );
 
         let config = Configuration::load_from_str(&toml).unwrap();
@@ -373,12 +336,11 @@ mod tests {
 
     #[test]
     fn test_build_oidc_validators_with_github() {
-        let toml = format!(
-            r#"{}
+        let toml = config_toml(
+            r#"
             [auth.oidc.github]
             provider = "github"
         "#,
-            minimal_config_prefix()
         );
 
         let config = Configuration::load_from_str(&toml).unwrap();
@@ -394,13 +356,12 @@ mod tests {
 
     #[test]
     fn test_build_oidc_validators_with_generic() {
-        let toml = format!(
-            r#"{}
+        let toml = config_toml(
+            r#"
             [auth.oidc.custom]
             provider = "generic"
             issuer = "https://auth.example.com"
         "#,
-            minimal_config_prefix()
         );
 
         let config = Configuration::load_from_str(&toml).unwrap();
@@ -416,8 +377,8 @@ mod tests {
 
     #[test]
     fn test_build_oidc_validators_multiple() {
-        let toml = format!(
-            r#"{}
+        let toml = config_toml(
+            r#"
             [auth.oidc.github]
             provider = "github"
 
@@ -425,7 +386,6 @@ mod tests {
             provider = "generic"
             issuer = "https://auth.example.com"
         "#,
-            minimal_config_prefix()
         );
 
         let config = Configuration::load_from_str(&toml).unwrap();
@@ -463,14 +423,13 @@ mod tests {
         let argon = Argon2::new(Algorithm::Argon2id, Version::V0x13, config);
         let password_hash = argon.hash_password(b"testpass", &salt).unwrap().to_string();
 
-        let toml = format!(
-            r#"{}
+        let toml = config_toml(&format!(
+            r#"
             [auth.identity.testuser]
             username = "testuser"
             password = "{password_hash}"
         "#,
-            minimal_config_prefix()
-        );
+        ));
 
         let config = Configuration::load_from_str(&toml).unwrap();
         let cache = cache::Config::Memory.to_backend().unwrap();
@@ -498,14 +457,13 @@ mod tests {
         let argon = Argon2::new(Algorithm::Argon2id, Version::V0x13, config);
         let password_hash = argon.hash_password(b"testpass", &salt).unwrap().to_string();
 
-        let toml = format!(
-            r#"{}
+        let toml = config_toml(&format!(
+            r#"
             [auth.identity.testuser]
             username = "testuser"
             password = "{password_hash}"
         "#,
-            minimal_config_prefix()
-        );
+        ));
 
         let config = Configuration::load_from_str(&toml).unwrap();
         let cache = cache::Config::Memory.to_backend().unwrap();
@@ -599,8 +557,8 @@ mod tests {
     fn test_build_oidc_validators_multiple_are_sorted_by_name() {
         // "custom" < "github" alphabetically; HashMap iteration order is non-deterministic,
         // so this test would be flaky without the explicit sort added in build_oidc_validators.
-        let toml = format!(
-            r#"{}
+        let toml = config_toml(
+            r#"
             [auth.oidc.github]
             provider = "github"
 
@@ -608,7 +566,6 @@ mod tests {
             provider = "generic"
             issuer = "https://auth.example.com"
         "#,
-            minimal_config_prefix()
         );
 
         let config = Configuration::load_from_str(&toml).unwrap();
@@ -885,14 +842,13 @@ mod tests {
         let argon = Argon2::new(Algorithm::Argon2id, Version::V0x13, Params::default());
         let password_hash = argon.hash_password(b"secret", &salt).unwrap().to_string();
 
-        let toml = format!(
-            r#"{}
+        let toml = config_toml(&format!(
+            r#"
             [auth.identity.admin]
             username = "admin"
             password = "{password_hash}"
         "#,
-            minimal_config_prefix()
-        );
+        ));
         let config = Configuration::load_from_str(&toml).unwrap();
         let basic_auth_validator = BasicAuthValidator::new(&config.auth.identity);
 

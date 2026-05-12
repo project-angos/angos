@@ -5,6 +5,8 @@
 //! static base64 blobs or shell-out recipes to maintain.
 
 #[allow(clippy::must_use_candidate)]
+pub mod configuration;
+#[allow(clippy::must_use_candidate)]
 pub mod mtls;
 #[allow(clippy::must_use_candidate)]
 pub mod oidc;
