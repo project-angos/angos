@@ -25,6 +25,7 @@ mod circuit_breaker;
 mod command;
 mod configuration;
 mod event_webhook;
+pub mod http_client;
 mod identity;
 mod metrics_provider;
 mod oci;

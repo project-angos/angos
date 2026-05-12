@@ -20,7 +20,6 @@ use crate::{
             set_registry_namespace_header, set_registry_reference_header,
             set_registry_username_header,
         },
-        tls::{load_certificate_bundle, load_identity, load_pem_file},
     },
     cache::{self, Cache},
     command::server::Error,
@@ -112,68 +111,6 @@ fn invalid_url_fails_at_deserialize() {
 
     let result: Result<Config, _> = toml::from_str(toml);
     assert!(result.is_err());
-}
-
-#[test]
-fn test_load_pem_file() {
-    let content = "test content";
-
-    let tmp_dir = tempfile::tempdir().unwrap();
-    let file_path = tmp_dir.path().join("test.txt");
-    fs::write(&file_path, content).unwrap();
-
-    let loaded_content = load_pem_file(&file_path).unwrap();
-    assert_eq!(loaded_content, content);
-
-    let invalid_path = load_pem_file(&PathBuf::from("/invalid/path/to/file"));
-    assert!(matches!(invalid_path, Err(Error::Initialization(_))));
-}
-
-#[test]
-fn test_load_certificate_bundle() {
-    let tmp_dir = tempfile::tempdir().unwrap();
-    let file_path = tmp_dir.path().join("bundle.pem");
-    fs::write(&file_path, ca_bundle_pem()).unwrap();
-
-    let loaded_certificates = load_certificate_bundle(&file_path).unwrap();
-    assert_eq!(loaded_certificates.len(), 2);
-}
-
-#[test]
-fn test_load_certificate_invalid() {
-    let content = "-----BEGIN INVALID CERTIFICATE-----LOLNOP-----END CERTIFICATE-----";
-    let tmp_dir = tempfile::tempdir().unwrap();
-    let file_path = tmp_dir.path().join("test.txt");
-    fs::write(&file_path, content).unwrap();
-
-    let invalid_certificates = load_certificate_bundle(&file_path);
-    assert!(matches!(
-        invalid_certificates,
-        Err(Error::Initialization(_))
-    ));
-}
-
-#[test]
-fn test_load_identity() {
-    let tmp_dir = tempfile::tempdir().unwrap();
-    let cert_file_path = tmp_dir.path().join("certificate.pem");
-    fs::write(&cert_file_path, client_cert_pem()).unwrap();
-
-    let key_file_path = tmp_dir.path().join("private-key.pem");
-    fs::write(&key_file_path, client_key_pem()).unwrap();
-
-    let identity = load_identity(Some(&cert_file_path), Some(&key_file_path));
-    assert!(matches!(identity, Ok(Some(_))));
-
-    let cert_file_path = tmp_dir.path().join("certificate.pem");
-    let key_file_path = tmp_dir.path().join("private-key.pem");
-    fs::write(&key_file_path, ca_bundle_pem()).unwrap();
-
-    let identity = load_identity(Some(&cert_file_path), Some(&key_file_path));
-    assert!(matches!(identity, Err(Error::Initialization(_))));
-
-    let identity = load_identity(None, None);
-    assert!(matches!(identity, Ok(None)));
 }
 
 #[test]

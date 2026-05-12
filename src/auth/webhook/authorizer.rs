@@ -1,19 +1,19 @@
 use std::{sync::Arc, time::Duration};
 
 use hyper::http::{HeaderMap, request::Parts};
-use reqwest::{Client, redirect::Policy};
+use reqwest::Client;
 use tracing::warn;
 
-use super::{
-    cache::lookup_cached_decision,
-    config::Config,
-    headers::{build_cache_key, build_headers},
-    metrics::{WEBHOOK_DURATION, WEBHOOK_REQUESTS},
-    tls::{load_certificate_bundle, load_identity},
-};
 use crate::{
+    auth::webhook::{
+        cache::lookup_cached_decision,
+        config::Config,
+        headers::{build_cache_key, build_headers},
+        metrics::{WEBHOOK_DURATION, WEBHOOK_REQUESTS},
+    },
     cache::Cache,
     command::server::Error,
+    http_client::HttpClientBuilder,
     identity::{Action, ClientIdentity},
 };
 
@@ -30,28 +30,23 @@ impl WebhookAuthorizer {
     }
 
     pub fn new(name: String, config: Config, cache: Arc<Cache>) -> Result<Self, Error> {
-        let mut client_builder = Client::builder()
-            .redirect(Policy::none())
+        let mut client_builder = HttpClientBuilder::new()
+            .redirect(reqwest::redirect::Policy::none())
             .timeout(Duration::from_millis(config.timeout_ms));
 
         if let Some(ca_bundle) = &config.server_ca_bundle {
-            let ca_bundle_certs = load_certificate_bundle(ca_bundle)?;
-            for cert in ca_bundle_certs {
-                client_builder = client_builder.add_root_certificate(cert);
-            }
-        }
-
-        let identity = load_identity(
-            config.client_certificate_bundle.as_ref(),
-            config.client_private_key.as_ref(),
-        )?;
-        if let Some(identity) = identity {
-            client_builder = client_builder.identity(identity);
+            client_builder = client_builder
+                .add_root_certificate_file(ca_bundle)
+                .map_err(Error::Initialization)?;
         }
 
         let client = client_builder
-            .build()
-            .map_err(|e| Error::Initialization(format!("Failed to create HTTP client: {e}")))?;
+            .identity_files(
+                config.client_certificate_bundle.as_deref(),
+                config.client_private_key.as_deref(),
+            )
+            .and_then(HttpClientBuilder::build)
+            .map_err(Error::Initialization)?;
 
         Ok(Self {
             name,

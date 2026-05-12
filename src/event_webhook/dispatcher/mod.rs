@@ -28,6 +28,7 @@ use crate::{
         config::{DeliveryPolicy, EventWebhookConfig},
         event::Event,
     },
+    http_client::HttpClientBuilder,
 };
 
 static DELIVERY_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
@@ -106,7 +107,7 @@ impl EventDispatcher {
         let mut endpoints = HashMap::with_capacity(webhooks.len());
 
         for (name, config) in webhooks {
-            let client = Client::builder()
+            let client = HttpClientBuilder::new()
                 .timeout(Duration::from_millis(config.timeout_ms))
                 .build()
                 .map_err(|e| {

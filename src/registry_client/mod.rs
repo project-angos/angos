@@ -3,10 +3,9 @@ mod tests;
 
 mod auth;
 mod bearer_token;
-mod http_client;
 mod upstream_url;
 
-use std::{io, sync::Arc};
+use std::{io, path::Path, sync::Arc, time::Duration};
 
 use auth::token_cache_key;
 use futures_util::TryStreamExt;
@@ -21,6 +20,7 @@ use tracing::{info, warn};
 
 use crate::{
     cache::Cache,
+    http_client::HttpClientBuilder,
     oci::Digest,
     registry::{DOCKER_CONTENT_DIGEST, Error, blob_store::BoxedReader},
     secret::Secret,
@@ -67,7 +67,28 @@ pub struct RegistryClient {
 
 impl RegistryClient {
     pub fn new(config: &RegistryClientConfig, cache: Arc<Cache>) -> Result<Self, Error> {
-        let client = http_client::build_http_client(config)?;
+        let mut client_builder = HttpClientBuilder::new()
+            .redirect(reqwest::redirect::Policy::limited(
+                config.max_redirect as usize,
+            ))
+            .timeout(Duration::from_mins(5));
+
+        if let Some(ca_bundle) = &config.server_ca_bundle {
+            client_builder = client_builder
+                .add_root_certificate_file(ca_bundle)
+                .map_err(Error::Initialization)?;
+        } else {
+            client_builder = client_builder.rustls_tls();
+        }
+
+        client_builder = client_builder
+            .identity_files(
+                config.client_certificate.as_deref().map(Path::new),
+                config.client_private_key.as_deref().map(Path::new),
+            )
+            .map_err(Error::Initialization)?;
+
+        let client = client_builder.build().map_err(Error::Initialization)?;
 
         let basic_auth = match (&config.username, &config.password) {
             (Some(username), Some(password)) => Some((username.clone(), password.expose().clone())),
