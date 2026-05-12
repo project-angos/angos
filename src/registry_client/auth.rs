@@ -20,9 +20,23 @@ fn authority_for_cache_key(url: &url::Url) -> Result<&str, Error> {
         .ok_or_else(|| Error::Internal("Response URL is missing host authority".to_string()))
 }
 
-pub fn token_cache_key(url: &url::Url) -> Result<String, Error> {
+pub fn token_cache_key(
+    url: &url::Url,
+    realm: &str,
+    service: Option<&str>,
+    scope: Option<&str>,
+) -> Result<String, Error> {
     let authority = authority_for_cache_key(url)?;
-    Ok(format!("auth:{authority}"))
+    let service = service.unwrap_or_default();
+    let scope = scope.unwrap_or_default();
+    Ok(format!(
+        "auth:{authority}:realm={realm}:service={service}:scope={scope}"
+    ))
+}
+
+pub fn token_index_cache_key(url: &url::Url) -> Result<String, Error> {
+    let authority = authority_for_cache_key(url)?;
+    Ok(format!("auth-index:{authority}:{}", url.as_str()))
 }
 
 static BEARER_PARAM_RE: LazyLock<Regex> =
@@ -59,6 +73,23 @@ struct BearerChallenge {
     other: Vec<(String, String)>,
 }
 
+impl BearerChallenge {
+    fn param(&self, name: &str) -> Option<&str> {
+        self.other
+            .iter()
+            .find_map(|(key, value)| (key == name).then_some(value.as_str()))
+    }
+
+    fn cache_key(&self, response_url: &url::Url) -> Result<String, Error> {
+        token_cache_key(
+            response_url,
+            &self.realm,
+            self.param("service"),
+            self.param("scope"),
+        )
+    }
+}
+
 fn parse_bearer_challenge(header: &str) -> Option<BearerChallenge> {
     let bearer_params = header.strip_prefix("Bearer ")?;
     let mut realm: Option<String> = None;
@@ -80,11 +111,26 @@ fn parse_bearer_challenge(header: &str) -> Option<BearerChallenge> {
 
 impl RegistryClient {
     pub async fn authenticate(&self, response: &Response) -> Result<String, Error> {
+        self.authenticate_with_cache(response, None).await
+    }
+
+    pub async fn authenticate_with_cache(
+        &self,
+        response: &Response,
+        attempted_auth: Option<&str>,
+    ) -> Result<String, Error> {
         let auth_header: String = parse_header(response, WWW_AUTHENTICATE)
             .map_err(|_| Error::Unauthorized("Missing WWW-Authenticate".to_string()))?;
 
         if let Some(challenge) = parse_bearer_challenge(&auth_header) {
-            self.exchange_bearer_token(challenge, response.url()).await
+            let cache_key = challenge.cache_key(response.url())?;
+            if let Some(auth_header) = self.cached_auth_header_for_key(&cache_key).await
+                && Some(auth_header.as_str()) != attempted_auth
+            {
+                return Ok(auth_header);
+            }
+            self.exchange_bearer_token(challenge, response.url(), &cache_key)
+                .await
         } else if auth_header.starts_with("Basic ") {
             self.build_basic_auth_header()
         } else {
@@ -98,6 +144,7 @@ impl RegistryClient {
         &self,
         challenge: BearerChallenge,
         response_url: &url::Url,
+        cache_key: &str,
     ) -> Result<String, Error> {
         let query = challenge
             .other
@@ -131,10 +178,17 @@ impl RegistryClient {
 
         let token = format!("Bearer {}", bearer.token()?);
 
-        let cache_key = token_cache_key(response_url)?;
         let _ = self
             .cache
-            .store_value(&cache_key, &token, bearer.ttl())
+            .store_value(cache_key, &token, bearer.ttl())
+            .await;
+        let _ = self
+            .cache
+            .store_value(
+                &token_index_cache_key(response_url)?,
+                cache_key,
+                bearer.ttl(),
+            )
             .await;
 
         Ok(token)
@@ -232,9 +286,39 @@ mod tests {
     }
 
     #[test]
-    fn token_cache_key_uses_authority_prefix() {
+    fn token_cache_key_includes_bearer_scope() {
         let url = url::Url::parse("https://registry.example.com/v2/").unwrap();
-        assert_eq!(token_cache_key(&url).unwrap(), "auth:registry.example.com");
+        assert_eq!(
+            token_cache_key(
+                &url,
+                "https://auth.example.com/token",
+                Some("registry"),
+                Some("repository:foo:pull")
+            )
+            .unwrap(),
+            "auth:registry.example.com:realm=https://auth.example.com/token:service=registry:scope=repository:foo:pull"
+        );
+    }
+
+    #[test]
+    fn token_cache_key_separates_different_scopes() {
+        let url = url::Url::parse("https://registry.example.com/v2/").unwrap();
+        let foo = token_cache_key(
+            &url,
+            "https://auth.example.com/token",
+            Some("registry"),
+            Some("repository:foo:pull"),
+        )
+        .unwrap();
+        let bar = token_cache_key(
+            &url,
+            "https://auth.example.com/token",
+            Some("registry"),
+            Some("repository:bar:pull"),
+        )
+        .unwrap();
+
+        assert_ne!(foo, bar);
     }
 
     #[test]

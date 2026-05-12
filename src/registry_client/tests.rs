@@ -11,7 +11,10 @@ use crate::{
     cache,
     oci::{Digest, Namespace, Reference},
     registry::{DOCKER_CONTENT_DIGEST, Error},
-    registry_client::{RegistryClient, RegistryClientConfig, auth::token_cache_key},
+    registry_client::{
+        RegistryClient, RegistryClientConfig,
+        auth::{token_cache_key, token_index_cache_key},
+    },
     secret::Secret,
 };
 
@@ -384,9 +387,20 @@ async fn test_cached_bearer_token_is_used() {
     let registry_url = mock_server.uri();
     let location = format!("{registry_url}/v2/test/manifests/latest");
     let cache = cache::Config::Memory.to_backend().unwrap();
-    let cache_key = token_cache_key(&Url::parse(&location).unwrap()).unwrap();
+    let url = Url::parse(&location).unwrap();
+    let cache_key = token_cache_key(
+        &url,
+        "https://auth.example.com/token",
+        Some("registry"),
+        Some("repository:test:pull"),
+    )
+    .unwrap();
     cache
         .store_value(&cache_key, "Bearer cached-token", 3600)
+        .await
+        .unwrap();
+    cache
+        .store_value(&token_index_cache_key(&url).unwrap(), &cache_key, 3600)
         .await
         .unwrap();
 
@@ -423,15 +437,134 @@ async fn test_cached_bearer_token_is_used() {
 }
 
 #[tokio::test]
+async fn test_bearer_tokens_are_cached_per_scope() {
+    let mock_server = MockServer::start().await;
+    let auth_server = MockServer::start().await;
+    let registry_url = mock_server.uri();
+    let alpha_location = format!("{registry_url}/v2/alpha/manifests/latest");
+    let beta_location = format!("{registry_url}/v2/beta/manifests/latest");
+
+    Mock::given(method("GET"))
+        .and(path("/v2/alpha/manifests/latest"))
+        .and(|request: &Request| !request.headers.contains_key("authorization"))
+        .respond_with(ResponseTemplate::new(401).insert_header(
+            "WWW-Authenticate",
+            format!(
+                r#"Bearer realm="{}",service="registry",scope="repository:alpha:pull""#,
+                auth_server.uri()
+            ),
+        ))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/v2/beta/manifests/latest"))
+        .and(|request: &Request| !request.headers.contains_key("authorization"))
+        .respond_with(ResponseTemplate::new(401).insert_header(
+            "WWW-Authenticate",
+            format!(
+                r#"Bearer realm="{}",service="registry",scope="repository:beta:pull""#,
+                auth_server.uri()
+            ),
+        ))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(query_param("service", "registry"))
+        .and(query_param("scope", "repository:alpha:pull"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({"token": "token-alpha", "expires_in": 3600})),
+        )
+        .expect(1)
+        .mount(&auth_server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(query_param("service", "registry"))
+        .and(query_param("scope", "repository:beta:pull"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({"token": "token-beta", "expires_in": 3600})),
+        )
+        .expect(1)
+        .mount(&auth_server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/v2/alpha/manifests/latest"))
+        .and(header("Authorization", "Bearer token-alpha"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_bytes(b"{}")
+                .insert_header(
+                    DOCKER_CONTENT_DIGEST,
+                    "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                )
+                .insert_header("Content-Type", "application/json"),
+        )
+        .expect(2)
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/v2/beta/manifests/latest"))
+        .and(header("Authorization", "Bearer token-beta"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_bytes(b"{}")
+                .insert_header(
+                    DOCKER_CONTENT_DIGEST,
+                    "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                )
+                .insert_header("Content-Type", "application/json"),
+        )
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let config = RegistryClientConfig {
+        url: registry_url,
+        max_redirect: 5,
+        server_ca_bundle: None,
+        client_certificate: None,
+        client_private_key: None,
+        username: None,
+        password: None,
+    };
+
+    let cache = cache::Config::Memory.to_backend().unwrap();
+    let client = RegistryClient::new(&config, cache).unwrap();
+
+    assert!(client.get_manifest(&[], &alpha_location).await.is_ok());
+    assert!(client.get_manifest(&[], &beta_location).await.is_ok());
+    assert!(client.get_manifest(&[], &alpha_location).await.is_ok());
+}
+
+#[tokio::test]
 async fn test_expired_bearer_token_is_refetched() {
     let mock_server = MockServer::start().await;
     let auth_server = MockServer::start().await;
     let registry_url = mock_server.uri();
     let location = format!("{registry_url}/v2/test/manifests/latest");
     let cache = cache::Config::Memory.to_backend().unwrap();
-    let cache_key = token_cache_key(&Url::parse(&location).unwrap()).unwrap();
+    let url = Url::parse(&location).unwrap();
+    let cache_key = token_cache_key(
+        &url,
+        &format!("{}/token", auth_server.uri()),
+        Some("registry"),
+        Some("repository:test:pull"),
+    )
+    .unwrap();
     cache
         .store_value(&cache_key, "Bearer stale-token", 0)
+        .await
+        .unwrap();
+    cache
+        .store_value(&token_index_cache_key(&url).unwrap(), &cache_key, 3600)
         .await
         .unwrap();
 

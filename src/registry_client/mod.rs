@@ -6,7 +6,7 @@ mod upstream_url;
 
 use std::{io, path::Path, sync::Arc, time::Duration};
 
-use auth::token_cache_key;
+use auth::token_index_cache_key;
 use futures_util::TryStreamExt;
 use reqwest::{
     Client, Method, Response, StatusCode,
@@ -160,11 +160,11 @@ impl RegistryClient {
             return Ok(auth_header);
         }
 
-        self.authenticate(response).await
+        self.authenticate_with_cache(response, attempted_auth).await
     }
 
     async fn cached_auth_header_for_url(&self, url: &url::Url) -> Option<String> {
-        let key = match token_cache_key(url) {
+        let index_key = match token_index_cache_key(url) {
             Ok(key) => key,
             Err(e) => {
                 warn!("Unable to build auth cache key: {e}");
@@ -172,7 +172,20 @@ impl RegistryClient {
             }
         };
 
-        match self.cache.retrieve_value(&key).await {
+        let key = match self.cache.retrieve_value(&index_key).await {
+            Ok(Some(key)) => key,
+            Ok(None) => return None,
+            Err(e) => {
+                warn!("Unable to read upstream auth cache index: {e}");
+                return None;
+            }
+        };
+
+        self.cached_auth_header_for_key(&key).await
+    }
+
+    async fn cached_auth_header_for_key(&self, key: &str) -> Option<String> {
+        match self.cache.retrieve_value(key).await {
             Ok(auth_header) => auth_header,
             Err(e) => {
                 warn!("Unable to read upstream auth cache: {e}");
