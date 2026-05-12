@@ -329,7 +329,6 @@ mod tests {
         let config = Configuration::load_from_str(&toml).unwrap();
         assert_eq!(config.auth.webhook.len(), 1);
         assert!(config.auth.webhook.contains_key("test"));
-        assert_eq!(config.auth.webhook["test"].name, "test");
     }
 
     #[test]

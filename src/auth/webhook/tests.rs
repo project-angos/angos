@@ -40,7 +40,6 @@ fn test_config_deserialize() {
 
     let config: Config = toml::from_str(valid_config).unwrap();
 
-    assert!(config.validate().is_ok());
     assert_eq!(config.url.as_str(), "https://example.com/");
     assert_eq!(config.timeout_ms, 1000);
     assert!(
@@ -60,7 +59,6 @@ fn test_config_deserialize() {
 
     let config: Config = toml::from_str(valid_config).unwrap();
 
-    assert!(config.validate().is_ok());
     assert_eq!(config.url.as_str(), "https://example.com/");
     assert_eq!(config.timeout_ms, 1000);
     assert!(
@@ -74,27 +72,35 @@ fn test_config_deserialize() {
 }
 
 #[test]
-fn test_config_validate() {
-    let valid_config = Config {
-        name: String::new(),
-        url: Url::parse("https://example.com").unwrap(),
-        timeout_ms: 1000,
-        auth: Some(WebhookAuth::BearerToken(Secret::new("token".to_string()))),
-        client_certificate_bundle: Some("/valid/path/to/cert.pem".into()),
-        client_private_key: Some("/valid/path/to/key.pem".into()),
-        server_ca_bundle: Some("/valid/path/to/ca.pem".into()),
-        forward_headers: vec!["X-Custom-Header".to_string()],
-        cache_ttl: 60,
-    };
-    assert!(valid_config.validate().is_ok());
+fn mtls_pair_must_be_complete_at_deserialize_time() {
+    let invalid_toml = r#"
+        url = "https://example.com"
+        timeout_ms = 1000
+        client_certificate_bundle = "/valid/path/to/cert.pem"
+    "#;
+    assert!(toml::from_str::<Config>(invalid_toml).is_err());
 
-    let mut invalid_config = valid_config.clone();
-    invalid_config.client_private_key = None;
-    assert!(invalid_config.validate().is_err());
+    let invalid_toml = r#"
+        url = "https://example.com"
+        timeout_ms = 1000
+        client_private_key = "/valid/path/to/key.pem"
+    "#;
+    assert!(toml::from_str::<Config>(invalid_toml).is_err());
+}
 
-    let mut invalid_config = valid_config.clone();
-    invalid_config.client_certificate_bundle = None;
-    assert!(invalid_config.validate().is_err());
+#[test]
+fn invalid_forward_header_fails_at_deserialize_time() {
+    let toml = r#"
+        url = "https://example.com"
+        timeout_ms = 1000
+        forward_headers = ["X-Good-Header", "Invalid Header!"]
+    "#;
+
+    let err = toml::from_str::<Config>(toml).unwrap_err();
+    assert!(
+        err.to_string().contains("Invalid Header!"),
+        "error should identify the invalid forwarded header: {err}"
+    );
 }
 
 #[test]
@@ -502,7 +508,6 @@ fn build_test_config(
     client_private_key: Option<PathBuf>,
 ) -> Config {
     Config {
-        name: String::new(),
         url,
         timeout_ms: 1000,
         auth: Some(WebhookAuth::BearerToken(Secret::new("token".to_string()))),
@@ -857,7 +862,6 @@ async fn test_authorize_does_not_cache_transport_errors() {
 // Build a Config with non-default timeout_ms or cache_ttl.
 fn build_test_config_with(url: Url, timeout_ms: u64, cache_ttl: u64) -> Config {
     Config {
-        name: String::new(),
         url,
         timeout_ms,
         auth: None,

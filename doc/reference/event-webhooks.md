@@ -212,6 +212,7 @@ The following conditions are validated at configuration load time:
 
 - `url` must be a valid URI
 - `events` must contain at least one event type
+- `token`, when set, must not be empty
 - `repository_filter` patterns must be valid regex
 - Webhook names referenced in `global.event_webhooks` and `repository.*.event_webhooks` must exist in `[event_webhook.*]`
 

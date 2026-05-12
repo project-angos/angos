@@ -4,30 +4,63 @@ use reqwest::{RequestBuilder, header::AUTHORIZATION};
 use serde::Deserialize;
 use url::Url;
 
-use crate::{command::server::Error, secret::Secret};
+use crate::{auth::webhook::headers::build_header_name, secret::Secret};
 
 #[derive(Clone, Debug, Deserialize)]
+#[serde(try_from = "ConfigFields")]
 pub struct Config {
-    /// Populated during configuration resolution; not present in TOML.
-    #[serde(skip, default)]
-    pub name: String,
-
     pub url: Url,
     pub timeout_ms: u64,
-
-    #[serde(flatten)]
     pub auth: Option<WebhookAuth>,
-
     pub client_certificate_bundle: Option<PathBuf>,
     pub client_private_key: Option<PathBuf>,
-
     pub server_ca_bundle: Option<PathBuf>,
-
-    #[serde(default)]
     pub forward_headers: Vec<String>,
-
-    #[serde(default = "Config::default_cache_ttl")]
     pub cache_ttl: u64,
+}
+
+#[derive(Deserialize)]
+struct ConfigFields {
+    url: Url,
+    timeout_ms: u64,
+    #[serde(flatten)]
+    auth: Option<WebhookAuth>,
+    client_certificate_bundle: Option<PathBuf>,
+    client_private_key: Option<PathBuf>,
+    server_ca_bundle: Option<PathBuf>,
+    #[serde(default)]
+    forward_headers: Vec<String>,
+    #[serde(default = "Config::default_cache_ttl")]
+    cache_ttl: u64,
+}
+
+impl TryFrom<ConfigFields> for Config {
+    type Error = String;
+
+    fn try_from(fields: ConfigFields) -> Result<Self, Self::Error> {
+        if fields.client_certificate_bundle.is_some() != fields.client_private_key.is_some() {
+            return Err(
+                "both client_certificate_bundle and client_private_key are required for mTLS"
+                    .to_string(),
+            );
+        }
+
+        for header in &fields.forward_headers {
+            build_header_name(header)
+                .map_err(|e| format!("invalid forward_headers entry '{header}': {e}"))?;
+        }
+
+        Ok(Self {
+            url: fields.url,
+            timeout_ms: fields.timeout_ms,
+            auth: fields.auth,
+            client_certificate_bundle: fields.client_certificate_bundle,
+            client_private_key: fields.client_private_key,
+            server_ca_bundle: fields.server_ca_bundle,
+            forward_headers: fields.forward_headers,
+            cache_ttl: fields.cache_ttl,
+        })
+    }
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -56,14 +89,5 @@ impl WebhookAuth {
 impl Config {
     fn default_cache_ttl() -> u64 {
         60
-    }
-
-    pub fn validate(&self) -> Result<(), Error> {
-        if self.client_certificate_bundle.is_some() != self.client_private_key.is_some() {
-            let msg = "Both certificate and key required for mTLS".to_string();
-            return Err(Error::Initialization(msg));
-        }
-
-        Ok(())
     }
 }

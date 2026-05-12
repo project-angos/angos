@@ -766,7 +766,7 @@ fn test_event_webhook_backward_compatible() {
 }
 
 #[test]
-fn test_event_webhook_invalid_config_fails_validation() {
+fn test_event_webhook_invalid_config_fails_deserialization() {
     let config = r#"
     [server]
     bind_address = "0.0.0.0"
@@ -1021,10 +1021,6 @@ fn event_webhook_valid_repo_reference_loads() {
 
 #[test]
 fn event_webhook_empty_events_list_fails_load() {
-    // Exercises the nested-field validation path inside resolve_event_webhooks,
-    // which calls EventWebhookConfig::validate() and surfaces the error through
-    // load_from_str. This is distinct from the unit-level test in
-    // event_webhook/config.rs because it verifies the integration path.
     let config = r#"
     [server]
     bind_address = "0.0.0.0"

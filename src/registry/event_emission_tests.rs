@@ -81,7 +81,6 @@ fn build_dispatcher_for_server(server_uri: &str) -> EventDispatcher {
     use std::collections::HashMap;
 
     let config = EventWebhookConfig {
-        name: "test-hook".to_string(),
         url: Url::parse(server_uri).unwrap(),
         policy: DeliveryPolicy::Required,
         token: None,

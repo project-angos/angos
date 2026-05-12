@@ -115,7 +115,7 @@ impl<'de> Deserialize<'de> for Configuration {
                     event_webhook: event_webhook.unwrap_or_default(),
                     observability: observability.unwrap_or_default(),
                 }
-                .validate_and_normalize()
+                .validate()
                 .map_err(de::Error::custom)
             }
         }
@@ -146,9 +146,7 @@ impl Configuration {
         toml::from_str(slice).map_err(|e| Error::InvalidFormat(e.to_string()))
     }
 
-    fn validate_and_normalize(mut self) -> Result<Self, Error> {
-        normalize_auth_webhooks(&mut self.auth.webhook)?;
-        normalize_event_webhooks(&mut self.event_webhook)?;
+    fn validate(self) -> Result<Self, Error> {
         validate_global(&self.global, &self.auth.webhook, &self.event_webhook)?;
         validate_repositories(&self.repository, &self.auth.webhook, &self.event_webhook)?;
         Ok(self)
@@ -173,26 +171,6 @@ impl Configuration {
         }
         fields
     }
-}
-
-fn normalize_auth_webhooks(raw: &mut HashMap<String, webhook::Config>) -> Result<(), Error> {
-    for (name, config) in raw {
-        config
-            .validate()
-            .map_err(|e| Error::InvalidFormat(format!("Invalid webhook '{name}': {e}")))?;
-        config.name.clone_from(name);
-    }
-    Ok(())
-}
-
-fn normalize_event_webhooks(raw: &mut HashMap<String, EventWebhookConfig>) -> Result<(), Error> {
-    for (name, config) in raw {
-        config
-            .validate()
-            .map_err(|e| Error::InvalidFormat(format!("Invalid event webhook '{name}': {e}")))?;
-        config.name.clone_from(name);
-    }
-    Ok(())
 }
 
 fn validate_global(

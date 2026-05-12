@@ -356,6 +356,10 @@ Password hashes are validated when the configuration is parsed. An invalid Argon
 | `forward_headers`           | [string] | `[]`     | Headers to forward from client         |
 | `cache_ttl`                 | u64      | `60`     | Response cache duration (0 to disable) |
 
+`url` and `forward_headers` are validated when the configuration is loaded.
+If either `client_certificate_bundle` or `client_private_key` is set, both
+must be set.
+
 ---
 
 ## Repository (`repository."<namespace>"`)
@@ -404,6 +408,9 @@ HTTP POST notifications for registry operations. See [Event Webhooks Reference](
 | `timeout_ms`        | u64      | `5000`   | HTTP request timeout in milliseconds             |
 | `max_retries`       | u32      | `0`      | Maximum retry attempts after initial failure     |
 | `repository_filter` | [string] | -        | Regex patterns to match repository names         |
+
+`url`, `events`, `token`, and `repository_filter` are validated when the
+configuration is loaded. If `token` is set, it must not be empty.
 
 Webhooks are enabled by referencing their names:
 
