@@ -14,6 +14,7 @@ use crate::{
     registry_client::{
         RegistryClient, RegistryClientConfig,
         auth::{token_cache_key, token_index_cache_key},
+        get_upstream_namespace,
     },
     secret::Secret,
 };
@@ -23,18 +24,18 @@ fn test_get_upstream_namespace() {
     let local_name = "local";
     let upstream_name = "local/repo";
 
-    let result = RegistryClient::get_upstream_namespace(local_name, upstream_name);
+    let result = get_upstream_namespace(local_name, upstream_name);
     assert_eq!(result, "repo");
 
     let repo_name = "local/nested";
     let namespace = &Namespace::new("completely/different/path").unwrap();
-    let result = RegistryClient::get_upstream_namespace(repo_name, namespace);
+    let result = get_upstream_namespace(repo_name, namespace);
     assert_eq!(result, "completely/different/path");
 }
 
 #[test]
 fn test_get_upstream_namespace_no_prefix_match() {
-    let result = RegistryClient::get_upstream_namespace("foo", "bar/baz");
+    let result = get_upstream_namespace("foo", "bar/baz");
     assert_eq!(result, "bar/baz");
 }
 
