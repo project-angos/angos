@@ -15,7 +15,7 @@ use reqwest::{
     header::{ACCEPT, AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE},
 };
 use serde::Deserialize;
-use tokio::io::AsyncReadExt;
+use tokio::{io::AsyncReadExt, sync::Mutex};
 use tokio_util::io::StreamReader;
 use tracing::{info, warn};
 
@@ -62,6 +62,7 @@ pub struct RegistryClient {
     client: Client,
     basic_auth: Option<(String, String)>,
     cache: Arc<Cache>,
+    token_refresh: Mutex<()>,
 }
 
 impl RegistryClient {
@@ -82,6 +83,7 @@ impl RegistryClient {
             client,
             basic_auth,
             cache,
+            token_refresh: Mutex::new(()),
         })
     }
 
@@ -99,7 +101,9 @@ impl RegistryClient {
             .await?;
 
         if response.status() == StatusCode::UNAUTHORIZED {
-            let token = self.authenticate(&response).await?;
+            let token = self
+                .refresh_auth_header(&response, cached_auth.as_deref())
+                .await?;
             return self
                 .send(method, accepted_types, location, Some(&token))
                 .await;
@@ -121,7 +125,27 @@ impl RegistryClient {
             }
         };
 
-        let key = match token_cache_key(&url) {
+        self.cached_auth_header_for_url(&url).await
+    }
+
+    async fn refresh_auth_header(
+        &self,
+        response: &Response,
+        attempted_auth: Option<&str>,
+    ) -> Result<String, Error> {
+        let _guard = self.token_refresh.lock().await;
+
+        if let Some(auth_header) = self.cached_auth_header_for_url(response.url()).await
+            && Some(auth_header.as_str()) != attempted_auth
+        {
+            return Ok(auth_header);
+        }
+
+        self.authenticate(response).await
+    }
+
+    async fn cached_auth_header_for_url(&self, url: &url::Url) -> Option<String> {
+        let key = match token_cache_key(url) {
             Ok(key) => key,
             Err(e) => {
                 warn!("Unable to build auth cache key: {e}");
