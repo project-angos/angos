@@ -61,10 +61,6 @@ impl BearerToken {
             .or(self.access_token.clone())
             .ok_or_else(|| Error::Internal("Missing token in authentication response".to_string()))
     }
-
-    fn ttl(&self) -> u64 {
-        self.expires_in
-    }
 }
 
 struct BearerChallenge {
@@ -178,18 +174,12 @@ impl RegistryClient {
             .map_err(|e| Error::Internal(format!("Failed to parse token response: {e}")))?;
 
         let token = format!("Bearer {}", bearer.token()?);
+        let ttl = bearer.expires_in;
 
+        let _ = self.cache.store_value(cache_key, &token, ttl).await;
         let _ = self
             .cache
-            .store_value(cache_key, &token, bearer.ttl())
-            .await;
-        let _ = self
-            .cache
-            .store_value(
-                &token_index_cache_key(response_url)?,
-                cache_key,
-                bearer.ttl(),
-            )
+            .store_value(&token_index_cache_key(response_url)?, cache_key, ttl)
             .await;
 
         Ok(token)
@@ -257,17 +247,6 @@ mod tests {
         let result = bearer.token();
         assert!(result.is_err());
         assert!(matches!(result.unwrap_err(), Error::Internal(_)));
-    }
-
-    #[test]
-    fn test_ttl_returns_expires_in() {
-        let bearer = BearerToken {
-            token: Some("token".to_string()),
-            access_token: None,
-            expires_in: 7200,
-        };
-
-        assert_eq!(bearer.ttl(), 7200);
     }
 
     #[test]
