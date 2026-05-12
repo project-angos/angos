@@ -644,7 +644,9 @@ mod tests {
 
         let mut repositories_map = HashMap::new();
         for (name, repo_config) in &config.repository {
-            let repo = Repository::new(name, repo_config, &auth_cache).unwrap();
+            let repo = Repository::new(name, repo_config, &auth_cache)
+                .await
+                .unwrap();
             repositories_map.insert(name.clone(), repo);
         }
         let repositories = Arc::new(repositories_map);

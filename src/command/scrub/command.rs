@@ -69,7 +69,7 @@ impl Command {
         let blob_handles = bootstrap::blob_stores(&config.blob_store, &auth_cache)?;
         let (metadata_store, _) =
             bootstrap::metadata_store(&config.resolve_metadata_config(), &auth_cache).await?;
-        let repositories = bootstrap::repositories(&config.repository, &auth_cache)?;
+        let repositories = bootstrap::repositories(&config.repository, &auth_cache).await?;
 
         let namespace_checkers = setup::namespace_checkers(
             options,

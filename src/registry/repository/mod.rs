@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use serde::Deserialize;
+use tokio::task;
 use tracing::{instrument, warn};
 
 pub use crate::registry_client::RegistryClientConfig;
@@ -66,11 +67,22 @@ impl Repository {
         Err(fallback)
     }
 
-    pub fn new(name: &str, config: &Config, cache: &Arc<Cache>) -> Result<Self, Error> {
-        let mut upstreams = Vec::new();
-        for config in &config.upstream {
-            upstreams.push(RegistryClient::new(config, cache.clone())?);
-        }
+    pub async fn new(name: &str, config: &Config, cache: &Arc<Cache>) -> Result<Self, Error> {
+        let upstreams = if config.upstream.is_empty() {
+            Vec::new()
+        } else {
+            let upstream_configs = config.upstream.clone();
+            let cache = Arc::clone(cache);
+            task::spawn_blocking(move || {
+                let mut upstreams = Vec::new();
+                for config in &upstream_configs {
+                    upstreams.push(RegistryClient::new(config, Arc::clone(&cache))?);
+                }
+                Ok::<_, Error>(upstreams)
+            })
+            .await
+            .map_err(|e| Error::Internal(format!("Failed to initialize upstream clients: {e}")))??
+        };
 
         let retention_policy =
             RetentionPolicy::new(&config.retention_policy, Arc::new(SystemClock));
@@ -161,19 +173,22 @@ impl Repository {
 
 #[cfg(test)]
 mod tests {
+    use std::{fs, time::Duration};
+
+    use tokio::time::timeout;
     use wiremock::{
         Mock, MockServer, ResponseTemplate,
         matchers::{method, path},
     };
 
     use super::*;
-    use crate::cache;
+    use crate::{cache, test_fixtures::webhook::ca_bundle_pem};
 
-    #[test]
-    fn test_is_pull_through_empty() {
+    #[tokio::test]
+    async fn test_is_pull_through_empty() {
         let cache = cache::Config::Memory.to_backend().unwrap();
         let config = Config::default();
-        let repo = Repository::new("test", &config, &cache).unwrap();
+        let repo = Repository::new("test", &config, &cache).await.unwrap();
 
         assert!(!repo.is_pull_through());
     }
@@ -196,8 +211,38 @@ mod tests {
             ..Default::default()
         };
 
-        let repo = Repository::new("test", &config, &cache).unwrap();
+        let repo = Repository::new("test", &config, &cache).await.unwrap();
         assert!(repo.is_pull_through());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn new_loads_upstream_tls_files_on_single_worker_runtime() {
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let ca_bundle_path = tmp_dir.path().join("ca.pem");
+        fs::write(&ca_bundle_path, ca_bundle_pem()).unwrap();
+
+        let cache = cache::Config::Memory.to_backend().unwrap();
+        let config = Config {
+            upstream: vec![RegistryClientConfig {
+                url: "https://registry.example.test".to_string(),
+                max_redirect: 5,
+                server_ca_bundle: Some(ca_bundle_path.to_string_lossy().to_string()),
+                client_certificate: None,
+                client_private_key: None,
+                username: None,
+                password: None,
+            }],
+            ..Default::default()
+        };
+
+        let repository = timeout(
+            Duration::from_secs(2),
+            Repository::new("test", &config, &cache),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(repository.is_pull_through());
     }
 
     #[tokio::test]
@@ -231,7 +276,7 @@ mod tests {
             ..Default::default()
         };
 
-        let repo = Repository::new("local", &config, &cache).unwrap();
+        let repo = Repository::new("local", &config, &cache).await.unwrap();
         let reference = Reference::Tag("latest".to_string());
 
         let result = repo.head_manifest(&[], "local/repo", &reference).await;
@@ -298,7 +343,7 @@ mod tests {
             ..Default::default()
         };
 
-        let repo = Repository::new("local", &config, &cache).unwrap();
+        let repo = Repository::new("local", &config, &cache).await.unwrap();
         let reference = Reference::Tag("latest".to_string());
 
         let result = repo.head_manifest(&[], "local/repo", &reference).await;
@@ -339,7 +384,7 @@ mod tests {
             ..Default::default()
         };
 
-        let repo = Repository::new("local", &config, &cache).unwrap();
+        let repo = Repository::new("local", &config, &cache).await.unwrap();
         let reference = Reference::Tag("latest".to_string());
 
         let result = repo.head_manifest(&[], "local/repo", &reference).await;
@@ -379,7 +424,7 @@ mod tests {
             ..Default::default()
         };
 
-        let repo = Repository::new("local", &config, &cache).unwrap();
+        let repo = Repository::new("local", &config, &cache).await.unwrap();
         let reference = Reference::Tag("latest".to_string());
 
         let result = repo.get_manifest(&[], "local/repo", &reference).await;
@@ -439,7 +484,7 @@ mod tests {
             ..Default::default()
         };
 
-        let repo = Repository::new("local", &config, &cache).unwrap();
+        let repo = Repository::new("local", &config, &cache).await.unwrap();
         let reference = Reference::Tag("latest".to_string());
 
         let result = repo.get_manifest(&[], "local/repo", &reference).await;
@@ -473,7 +518,7 @@ mod tests {
             ..Default::default()
         };
 
-        let repo = Repository::new("local", &config, &cache).unwrap();
+        let repo = Repository::new("local", &config, &cache).await.unwrap();
         let reference = Reference::Tag("latest".to_string());
 
         let result = repo.get_manifest(&[], "local/repo", &reference).await;
@@ -512,7 +557,7 @@ mod tests {
             ..Default::default()
         };
 
-        let repo = Repository::new("local", &config, &cache).unwrap();
+        let repo = Repository::new("local", &config, &cache).await.unwrap();
         let digest = Digest::try_from(
             "sha256:1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
         )
@@ -575,7 +620,7 @@ mod tests {
             ..Default::default()
         };
 
-        let repo = Repository::new("local", &config, &cache).unwrap();
+        let repo = Repository::new("local", &config, &cache).await.unwrap();
         let digest = Digest::try_from(
             "sha256:1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
         )
@@ -612,7 +657,7 @@ mod tests {
             ..Default::default()
         };
 
-        let repo = Repository::new("local", &config, &cache).unwrap();
+        let repo = Repository::new("local", &config, &cache).await.unwrap();
         let digest = Digest::try_from(
             "sha256:1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
         )
@@ -648,7 +693,7 @@ mod tests {
             ..Default::default()
         };
 
-        let repo = Repository::new("local", &config, &cache).unwrap();
+        let repo = Repository::new("local", &config, &cache).await.unwrap();
         let digest = Digest::try_from(
             "sha256:1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
         )
@@ -710,7 +755,7 @@ mod tests {
             ..Default::default()
         };
 
-        let repo = Repository::new("local", &config, &cache).unwrap();
+        let repo = Repository::new("local", &config, &cache).await.unwrap();
         let digest = Digest::try_from(
             "sha256:1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
         )
@@ -753,7 +798,7 @@ mod tests {
             ..Default::default()
         };
 
-        let repo = Repository::new("local", &config, &cache).unwrap();
+        let repo = Repository::new("local", &config, &cache).await.unwrap();
         let digest = Digest::try_from(
             "sha256:1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
         )

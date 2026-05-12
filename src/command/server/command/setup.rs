@@ -47,7 +47,7 @@ pub async fn build_registry(
     let auth_cache = bootstrap::auth_cache(&config.cache)?;
     let blob_handles = bootstrap::blob_stores(&config.blob_store, &auth_cache)?;
     let metadata_store = build_metadata_store(config, &auth_cache, cached_capabilities).await?;
-    let repositories = bootstrap::repositories(&config.repository, &auth_cache)?;
+    let repositories = bootstrap::repositories(&config.repository, &auth_cache).await?;
 
     let registry_config = RegistryConfig::new()
         .update_pull_time(config.global.update_pull_time)

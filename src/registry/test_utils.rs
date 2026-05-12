@@ -9,7 +9,7 @@ use crate::{
     configuration::GlobalConfig,
     metrics_provider,
     oci::Digest,
-    policy::{AccessMode, AccessPolicyConfig, RetentionPolicyConfig},
+    policy::{AccessMode, AccessPolicyConfig, RetentionPolicy, RetentionPolicyConfig, SystemClock},
     registry::{
         blob_store::{self, BlobStore, PresignedBlobStore, UploadStore},
         data_store, metadata_store,
@@ -20,7 +20,6 @@ use crate::{
 
 pub fn create_test_repositories() -> Arc<HashMap<String, Repository>> {
     metrics_provider::init_for_tests();
-    let token_cache = cache::Config::default().to_backend().unwrap();
 
     let config = repository::Config {
         access_policy: AccessPolicyConfig {
@@ -34,7 +33,13 @@ pub fn create_test_repositories() -> Arc<HashMap<String, Repository>> {
     let mut repositories = HashMap::new();
     repositories.insert(
         "test-repo".to_string(),
-        Repository::new("test-repo", &config, &token_cache).unwrap(),
+        Repository {
+            name: "test-repo".to_string(),
+            upstreams: Vec::new(),
+            retention_policy: RetentionPolicy::new(&config.retention_policy, Arc::new(SystemClock)),
+            immutable_tags: config.immutable_tags,
+            immutable_tags_exclusions: config.immutable_tags_exclusions,
+        },
     );
 
     Arc::new(repositories)
@@ -91,20 +96,16 @@ pub async fn create_test_blob(
     let namespace_links = blob_index.namespace.get(namespace).unwrap();
     assert!(namespace_links.contains(&layer_link));
 
-    let cache = cache::Config::Memory.to_backend().unwrap();
-    let repository = Repository::new(
-        "test-repo",
-        &repository::Config {
-            upstream: Vec::new(),
-            access_policy: AccessPolicyConfig::default(),
-            retention_policy: RetentionPolicyConfig { rules: Vec::new() },
-            immutable_tags: false,
-            immutable_tags_exclusions: Vec::new(),
-            ..repository::Config::default()
-        },
-        &cache,
-    )
-    .unwrap();
+    let repository = Repository {
+        name: "test-repo".to_string(),
+        upstreams: Vec::new(),
+        retention_policy: RetentionPolicy::new(
+            &RetentionPolicyConfig { rules: Vec::new() },
+            Arc::new(SystemClock),
+        ),
+        immutable_tags: false,
+        immutable_tags_exclusions: Vec::new(),
+    };
 
     (digest, repository)
 }
