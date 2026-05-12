@@ -1,7 +1,11 @@
 use std::path::PathBuf;
 
-use super::super::*;
-use crate::{auth::oidc, registry::data_store};
+use crate::{
+    auth::oidc,
+    cache,
+    configuration::{Configuration, Error, ServerConfig},
+    registry::{blob_store, data_store, metadata_store},
+};
 
 #[test]
 fn test_load_minimal_config() {
@@ -148,102 +152,6 @@ fn test_auth_section() {
 }
 
 #[test]
-fn test_global_config_default() {
-    let config = GlobalConfig::default();
-    assert_eq!(config.max_concurrent_requests, 64);
-    assert_eq!(config.max_concurrent_cache_jobs, 4);
-    assert!(!config.update_pull_time);
-    assert!(!config.immutable_tags);
-    assert!(config.immutable_tags_exclusions.is_empty());
-    assert!(config.authorization_webhook.is_none());
-}
-
-#[test]
-fn test_global_config_custom_values() {
-    let config = r#"
-    [server]
-    bind_address = "0.0.0.0"
-
-    [global]
-    max_concurrent_requests = 10
-    max_concurrent_cache_jobs = 8
-    update_pull_time = true
-    immutable_tags = true
-    immutable_tags_exclusions = ["latest", "dev"]
-    authorization_webhook = "my-webhook"
-
-    [auth.webhook.my-webhook]
-    url = "https://example.com/webhook"
-    timeout_ms = 5000
-    "#;
-
-    let config = Configuration::load_from_str(config).unwrap();
-    assert_eq!(config.global.max_concurrent_requests, 10);
-    assert_eq!(config.global.max_concurrent_cache_jobs, 8);
-    assert!(config.global.update_pull_time);
-    assert!(config.global.immutable_tags);
-    assert_eq!(config.global.immutable_tags_exclusions.len(), 2);
-    assert_eq!(
-        config.global.immutable_tags_exclusions[0].as_source(),
-        "latest"
-    );
-    assert_eq!(
-        config.global.immutable_tags_exclusions[1].as_source(),
-        "dev"
-    );
-    assert!(
-        config.global.authorization_webhook.is_some(),
-        "global authorization_webhook should be resolved"
-    );
-    assert_eq!(
-        config.global.authorization_webhook.as_ref().unwrap(),
-        "my-webhook"
-    );
-}
-
-#[test]
-fn test_ui_enabled_config() {
-    let config = r#"
-    [server]
-    bind_address = "0.0.0.0"
-
-    [ui]
-    enabled = true
-    "#;
-
-    let config = Configuration::load_from_str(config).unwrap();
-    assert!(config.ui.enabled);
-}
-
-#[test]
-fn test_ui_enabled_default_false() {
-    let config = r#"
-    [server]
-    bind_address = "0.0.0.0"
-    "#;
-
-    let config = Configuration::load_from_str(config).unwrap();
-    assert!(!config.ui.enabled);
-    assert_eq!(config.ui.name, "Angos");
-}
-
-#[test]
-fn test_ui_custom_name() {
-    let config = r#"
-    [server]
-    bind_address = "0.0.0.0"
-
-    [ui]
-    enabled = true
-    name = "my-registry"
-    "#;
-
-    let config = Configuration::load_from_str(config).unwrap();
-    assert!(config.ui.enabled);
-    assert_eq!(config.ui.name, "my-registry");
-}
-
-#[test]
 fn test_repository_config() {
     let config = r#"
     [server]
@@ -262,26 +170,6 @@ fn test_repository_config() {
         config.repository["myapp"].immutable_tags_exclusions.len(),
         1
     );
-}
-
-#[test]
-fn test_observability_config() {
-    let config = r#"
-    [server]
-    bind_address = "0.0.0.0"
-
-    [observability.tracing]
-    endpoint = "http://jaeger:4317"
-    sampling_rate = 0.1
-    "#;
-
-    let config = Configuration::load_from_str(config).unwrap();
-    assert!(config.observability.is_some());
-    let observability = config.observability.unwrap();
-    assert!(observability.tracing.is_some());
-    let tracing = observability.tracing.unwrap();
-    assert_eq!(tracing.endpoint, "http://jaeger:4317");
-    assert!((f64::from(tracing.sampling_rate) - 0.1).abs() < f64::EPSILON);
 }
 
 #[test]

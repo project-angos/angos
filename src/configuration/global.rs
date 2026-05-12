@@ -76,3 +76,44 @@ impl GlobalConfig {
             .unwrap_or(true)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::configuration::GlobalConfig;
+
+    #[test]
+    fn default_values_match_configuration_defaults() {
+        let config = GlobalConfig::default();
+
+        assert_eq!(config.max_concurrent_requests, 64);
+        assert_eq!(config.max_concurrent_cache_jobs, 4);
+        assert!(!config.update_pull_time);
+        assert!(!config.immutable_tags);
+        assert!(config.immutable_tags_exclusions.is_empty());
+        assert!(config.authorization_webhook.is_none());
+    }
+
+    #[test]
+    fn custom_values_parse() {
+        let config = toml::from_str::<GlobalConfig>(
+            r#"
+            max_concurrent_requests = 10
+            max_concurrent_cache_jobs = 8
+            update_pull_time = true
+            immutable_tags = true
+            immutable_tags_exclusions = ["latest", "dev"]
+            authorization_webhook = "my-webhook"
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(config.max_concurrent_requests, 10);
+        assert_eq!(config.max_concurrent_cache_jobs, 8);
+        assert!(config.update_pull_time);
+        assert!(config.immutable_tags);
+        assert_eq!(config.immutable_tags_exclusions.len(), 2);
+        assert_eq!(config.immutable_tags_exclusions[0].as_source(), "latest");
+        assert_eq!(config.immutable_tags_exclusions[1].as_source(), "dev");
+        assert_eq!(config.authorization_webhook.as_deref(), Some("my-webhook"));
+    }
+}
