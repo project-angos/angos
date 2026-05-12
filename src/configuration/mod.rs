@@ -201,29 +201,20 @@ fn validate_repositories(
     event_webhooks: &HashMap<String, EventWebhookConfig>,
 ) -> Result<(), Error> {
     for (repo_name, repo) in repositories {
-        validate_repo_authorization_webhook(
-            repo_name,
-            repo.authorization_webhook.as_deref(),
-            auth_webhooks,
-        )?;
+        if let Some(name) = repo
+            .authorization_webhook
+            .as_deref()
+            .filter(|n| !n.is_empty())
+        {
+            auth_webhooks.get(name).map(|_| ()).ok_or_else(|| {
+                Error::InvalidFormat(format!(
+                    "Webhook '{name}' not found (referenced in '{repo_name}' repository)"
+                ))
+            })?;
+        }
         validate_repo_event_webhooks(repo_name, &repo.event_webhooks, event_webhooks)?;
     }
     Ok(())
-}
-
-fn validate_repo_authorization_webhook(
-    repo_name: &str,
-    name: Option<&str>,
-    auth_webhooks: &HashMap<String, webhook::Config>,
-) -> Result<(), Error> {
-    let Some(name) = name.filter(|n| !n.is_empty()) else {
-        return Ok(());
-    };
-    auth_webhooks.get(name).map(|_| ()).ok_or_else(|| {
-        Error::InvalidFormat(format!(
-            "Webhook '{name}' not found (referenced in '{repo_name}' repository)"
-        ))
-    })
 }
 
 fn validate_repo_event_webhooks(
