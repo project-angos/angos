@@ -88,6 +88,14 @@ impl BearerChallenge {
             self.param("scope"),
         )
     }
+
+    fn token_url(&self) -> Result<url::Url, Error> {
+        let mut url = url::Url::parse(&self.realm)
+            .map_err(|e| Error::Internal(format!("Invalid bearer token realm: {e}")))?;
+        url.query_pairs_mut()
+            .extend_pairs(self.other.iter().map(|(k, v)| (k.as_str(), v.as_str())));
+        Ok(url)
+    }
 }
 
 fn parse_bearer_challenge(header: &str) -> Option<BearerChallenge> {
@@ -146,14 +154,7 @@ impl RegistryClient {
         response_url: &url::Url,
         cache_key: &str,
     ) -> Result<String, Error> {
-        let query = challenge
-            .other
-            .iter()
-            .map(|(k, v)| format!("{k}={v}"))
-            .collect::<Vec<_>>()
-            .join("&");
-
-        let mut req = self.client.get(format!("{}?{}", challenge.realm, query));
+        let mut req = self.client.get(challenge.token_url()?);
         if let Some((user, pass)) = &self.basic_auth {
             let encoded = BASE64_STANDARD.encode(format!("{user}:{pass}"));
             req = req.header(AUTHORIZATION, format!("Basic {encoded}"));
@@ -355,5 +356,33 @@ mod tests {
                 .iter()
                 .any(|(k, v)| k == "scope" && v == "repository:foo:pull")
         );
+    }
+
+    #[test]
+    fn bearer_challenge_token_url_preserves_simple_ascii_values() {
+        let header =
+            r#"Bearer realm="https://auth.example.com/token",service="registry.example.com""#;
+        let challenge = parse_bearer_challenge(header).expect("expected Some");
+
+        assert_eq!(
+            challenge.token_url().unwrap().as_str(),
+            "https://auth.example.com/token?service=registry.example.com"
+        );
+    }
+
+    #[test]
+    fn bearer_challenge_token_url_encodes_special_characters() {
+        let header = r#"Bearer realm="https://auth.example.com/token",service="registry.example.com",scope="repository:team/app image:pull,push""#;
+        let url = parse_bearer_challenge(header)
+            .expect("expected Some")
+            .token_url()
+            .unwrap();
+
+        assert_eq!(
+            url.as_str(),
+            "https://auth.example.com/token?service=registry.example.com&scope=repository%3Ateam%2Fapp+image%3Apull%2Cpush"
+        );
+        assert!(url.query().unwrap().contains("%2F"));
+        assert!(url.query().unwrap().contains('+'));
     }
 }
