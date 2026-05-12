@@ -3,18 +3,15 @@ use std::sync::Arc;
 use serde::Deserialize;
 use tracing::{instrument, warn};
 
+pub use crate::registry_client::RegistryClientConfig;
 use crate::{
     cache::Cache,
     configuration::RegexPattern,
     oci::{Digest, Namespace, Reference},
     policy::{AccessPolicyConfig, RetentionPolicy, RetentionPolicyConfig, SystemClock},
     registry::{Error, blob_store::BoxedReader},
+    registry_client::RegistryClient,
 };
-
-mod registry_client;
-
-use registry_client::RegistryClient;
-pub use registry_client::RegistryClientConfig;
 
 #[derive(Clone, Debug, Default, Deserialize)]
 pub struct Config {

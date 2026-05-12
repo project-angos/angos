@@ -30,6 +30,7 @@ mod metrics_provider;
 mod oci;
 mod policy;
 mod registry;
+pub mod registry_client;
 mod secret;
 mod timing;
 
