@@ -1,6 +1,6 @@
 use std::{collections::HashMap, sync::Arc};
 
-use http_body_util::Full;
+use http_body_util::{BodyExt, Full};
 use hyper::{
     Request, Response, StatusCode,
     body::Bytes,
@@ -8,6 +8,7 @@ use hyper::{
 };
 use opentelemetry::trace::TracerProvider;
 use opentelemetry_sdk::trace::{Sampler, SdkTracerProvider};
+use serde_json::{Value, from_slice};
 use tracing_subscriber::{layer::SubscriberExt, registry::Registry as TracingRegistry};
 
 use super::{
@@ -116,8 +117,8 @@ fn test_error_to_response_internal() {
     assert!(response.headers().get(WWW_AUTHENTICATE).is_none());
 }
 
-#[test]
-fn test_error_to_response_from_registry_error() {
+#[tokio::test]
+async fn test_error_to_response_from_registry_error() {
     let registry_error = registry::Error::BlobUnknown;
     let error: Error = registry_error.into();
     let request_id = Some("req-blob".to_string());
@@ -129,6 +130,14 @@ fn test_error_to_response_from_registry_error() {
         response.headers().get(CONTENT_TYPE).unwrap(),
         "application/json"
     );
+
+    let (_, body) = response.into_parts();
+    let body_bytes = match body {
+        ResponseBody::Fixed(b) => b.collect().await.unwrap().to_bytes(),
+        _ => panic!("Expected Fixed body"),
+    };
+    let json: Value = from_slice(&body_bytes).unwrap();
+    assert_eq!(json["errors"][0]["code"], "BLOB_UNKNOWN");
 }
 
 #[test]
