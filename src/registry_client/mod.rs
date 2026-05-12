@@ -9,7 +9,7 @@ use std::{io, path::Path, sync::Arc, time::Duration};
 use auth::token_index_cache_key;
 use futures_util::TryStreamExt;
 use reqwest::{
-    Client, Method, Response, StatusCode,
+    Client, Method, RequestBuilder, Response, StatusCode,
     header::{ACCEPT, AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE},
 };
 use serde::Deserialize;
@@ -201,6 +201,19 @@ impl RegistryClient {
         location: &str,
         auth_header: Option<&str>,
     ) -> Result<Response, Error> {
+        self.build_request(method, accepted_types, location, auth_header)
+            .send()
+            .await
+            .map_err(|e| Error::Internal(format!("HTTP request failed: {e}")))
+    }
+
+    fn build_request(
+        &self,
+        method: &Method,
+        accepted_types: &[String],
+        location: &str,
+        auth_header: Option<&str>,
+    ) -> RequestBuilder {
         let mut request = self.client.request(method.clone(), location);
         for accepted_type in accepted_types {
             request = request.header(ACCEPT, accepted_type);
@@ -209,9 +222,6 @@ impl RegistryClient {
             request = request.header(AUTHORIZATION, auth);
         }
         request
-            .send()
-            .await
-            .map_err(|e| Error::Internal(format!("HTTP request failed: {e}")))
     }
 
     pub async fn head_blob(
