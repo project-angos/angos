@@ -1,6 +1,7 @@
 use std::{
     collections::HashMap,
     net::{IpAddr, Ipv4Addr, Ipv6Addr},
+    num::NonZeroU64,
 };
 
 use chrono::Utc;
@@ -23,8 +24,8 @@ fn test_config_default_values() {
     let config = InsecureListenerConfig::default();
 
     assert_eq!(config.base.port, 8000);
-    assert_eq!(config.base.query_timeout, 3600);
-    assert_eq!(config.base.query_timeout_grace_period, 60);
+    assert_eq!(config.base.query_timeout_secs.get(), 3600);
+    assert_eq!(config.base.query_timeout_grace_period_secs.get(), 60);
     assert_eq!(
         config.base.bind_address,
         IpAddr::from(Ipv4Addr::from([0; 4]))
@@ -36,18 +37,60 @@ fn test_config_custom_values() {
     let toml = r#"
         bind_address = "192.168.1.100"
         port = 9000
+        query_timeout_secs = 7200
+        query_timeout_grace_period_secs = 120
+    "#;
+
+    let config: InsecureListenerConfig = toml::from_str(toml).unwrap();
+
+    assert_eq!(config.base.port, 9000);
+    assert_eq!(config.base.query_timeout_secs.get(), 7200);
+    assert_eq!(config.base.query_timeout_grace_period_secs.get(), 120);
+    assert_eq!(
+        config.base.bind_address,
+        "192.168.1.100".parse::<IpAddr>().unwrap()
+    );
+}
+
+#[test]
+fn test_config_accepts_legacy_timeout_names() {
+    let toml = r#"
+        bind_address = "192.168.1.100"
         query_timeout = 7200
         query_timeout_grace_period = 120
     "#;
 
     let config: InsecureListenerConfig = toml::from_str(toml).unwrap();
 
-    assert_eq!(config.base.port, 9000);
-    assert_eq!(config.base.query_timeout, 7200);
-    assert_eq!(config.base.query_timeout_grace_period, 120);
-    assert_eq!(
-        config.base.bind_address,
-        "192.168.1.100".parse::<IpAddr>().unwrap()
+    assert_eq!(config.base.query_timeout_secs.get(), 7200);
+    assert_eq!(config.base.query_timeout_grace_period_secs.get(), 120);
+}
+
+#[test]
+fn test_config_rejects_zero_query_timeout() {
+    let toml = r#"
+        bind_address = "192.168.1.100"
+        query_timeout_secs = 0
+    "#;
+
+    let error = toml::from_str::<InsecureListenerConfig>(toml).unwrap_err();
+
+    assert!(error.to_string().contains("query_timeout_secs must be > 0"));
+}
+
+#[test]
+fn test_config_rejects_zero_query_timeout_grace_period() {
+    let toml = r#"
+        bind_address = "192.168.1.100"
+        query_timeout_grace_period_secs = 0
+    "#;
+
+    let error = toml::from_str::<InsecureListenerConfig>(toml).unwrap_err();
+
+    assert!(
+        error
+            .to_string()
+            .contains("query_timeout_grace_period_secs must be > 0")
     );
 }
 
@@ -60,8 +103,8 @@ fn test_config_partial_defaults() {
     let config: InsecureListenerConfig = toml::from_str(toml).unwrap();
 
     assert_eq!(config.base.port, 8000);
-    assert_eq!(config.base.query_timeout, 3600);
-    assert_eq!(config.base.query_timeout_grace_period, 60);
+    assert_eq!(config.base.query_timeout_secs.get(), 3600);
+    assert_eq!(config.base.query_timeout_grace_period_secs.get(), 60);
 }
 
 #[test]
@@ -83,8 +126,8 @@ async fn test_insecure_listener_new() {
         base: ListenerBaseConfig {
             bind_address: "127.0.0.1".parse().unwrap(),
             port: 8080,
-            query_timeout: 1800,
-            query_timeout_grace_period: 30,
+            query_timeout_secs: NonZeroU64::new(1800).unwrap(),
+            query_timeout_grace_period_secs: NonZeroU64::new(30).unwrap(),
         },
     };
 
@@ -103,8 +146,8 @@ async fn test_insecure_listener_new_with_ipv6() {
         base: ListenerBaseConfig {
             bind_address: "::1".parse().unwrap(),
             port: 9000,
-            query_timeout: 3600,
-            query_timeout_grace_period: 60,
+            query_timeout_secs: NonZeroU64::new(3600).unwrap(),
+            query_timeout_grace_period_secs: NonZeroU64::new(60).unwrap(),
         },
     };
 
@@ -134,8 +177,8 @@ async fn test_insecure_listener_timeouts_initialization() {
         base: ListenerBaseConfig {
             bind_address: "127.0.0.1".parse().unwrap(),
             port: 8080,
-            query_timeout: 5000,
-            query_timeout_grace_period: 100,
+            query_timeout_secs: NonZeroU64::new(5000).unwrap(),
+            query_timeout_grace_period_secs: NonZeroU64::new(100).unwrap(),
         },
     };
 
@@ -153,8 +196,8 @@ async fn test_insecure_listener_with_zero_port() {
         base: ListenerBaseConfig {
             bind_address: "127.0.0.1".parse().unwrap(),
             port: 0,
-            query_timeout: 3600,
-            query_timeout_grace_period: 60,
+            query_timeout_secs: NonZeroU64::new(3600).unwrap(),
+            query_timeout_grace_period_secs: NonZeroU64::new(60).unwrap(),
         },
     };
 

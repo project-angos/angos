@@ -1,6 +1,6 @@
 use serde::Deserialize;
 
-use super::ListenerBaseConfig;
+use crate::configuration::listeners::ListenerBaseConfig;
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq)]
 pub struct InsecureListenerConfig {

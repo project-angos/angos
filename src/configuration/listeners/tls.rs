@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use serde::Deserialize;
 
-use super::ListenerBaseConfig;
+use crate::configuration::listeners::ListenerBaseConfig;
 
 #[derive(Clone, Debug, Deserialize, PartialEq)]
 pub struct TlsListenerConfig {
