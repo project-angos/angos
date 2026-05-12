@@ -108,6 +108,7 @@ impl EventDispatcher {
 
         for (name, config) in webhooks {
             let client = HttpClientBuilder::new()
+                .rustls_tls()
                 .timeout(Duration::from_millis(config.timeout_ms))
                 .build()
                 .map_err(|e| {

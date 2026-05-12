@@ -67,6 +67,7 @@ pub struct RegistryClient {
 impl RegistryClient {
     pub fn new(config: &RegistryClientConfig, cache: Arc<Cache>) -> Result<Self, Error> {
         let mut client_builder = HttpClientBuilder::new()
+            .rustls_tls()
             .redirect(reqwest::redirect::Policy::limited(
                 config.max_redirect as usize,
             ))
@@ -76,8 +77,6 @@ impl RegistryClient {
             client_builder = client_builder
                 .add_root_certificate_file(ca_bundle)
                 .map_err(Error::Initialization)?;
-        } else {
-            client_builder = client_builder.rustls_tls();
         }
 
         client_builder = client_builder

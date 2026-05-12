@@ -95,7 +95,7 @@ mod tests {
     use std::{fs, path::PathBuf};
 
     use crate::{
-        http_client::{load_certificate_bundle, load_identity, load_pem_file},
+        http_client::{HttpClientBuilder, load_certificate_bundle, load_identity, load_pem_file},
         test_fixtures::webhook::{ca_bundle_pem, client_cert_pem, client_key_pem},
     };
 
@@ -132,6 +132,21 @@ mod tests {
 
         let invalid_certificates = load_certificate_bundle(&file_path);
         assert!(invalid_certificates.is_err());
+    }
+
+    #[test]
+    fn rustls_tls_builds_with_and_without_ca_bundle() {
+        assert!(HttpClientBuilder::new().rustls_tls().build().is_ok());
+
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let file_path = tmp_dir.path().join("bundle.pem");
+        fs::write(&file_path, ca_bundle_pem()).unwrap();
+
+        let client = HttpClientBuilder::new()
+            .rustls_tls()
+            .add_root_certificate_file(&file_path)
+            .and_then(HttpClientBuilder::build);
+        assert!(client.is_ok());
     }
 
     #[test]

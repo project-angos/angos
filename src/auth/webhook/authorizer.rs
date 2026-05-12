@@ -31,6 +31,7 @@ impl WebhookAuthorizer {
 
     pub fn new(name: String, config: Config, cache: Arc<Cache>) -> Result<Self, Error> {
         let mut client_builder = HttpClientBuilder::new()
+            .rustls_tls()
             .redirect(reqwest::redirect::Policy::none())
             .timeout(Duration::from_millis(config.timeout_ms));
 
