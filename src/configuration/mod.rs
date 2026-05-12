@@ -212,18 +212,10 @@ fn validate_repositories(
                 ))
             })?;
         }
-        validate_repo_event_webhooks(repo_name, &repo.event_webhooks, event_webhooks)?;
+        let context = format!("referenced in '{repo_name}' repository");
+        validate_event_webhook_refs(&repo.event_webhooks, event_webhooks, &context)?;
     }
     Ok(())
-}
-
-fn validate_repo_event_webhooks(
-    repo_name: &str,
-    names: &[String],
-    event_webhooks: &HashMap<String, EventWebhookConfig>,
-) -> Result<(), Error> {
-    let context = format!("referenced in '{repo_name}' repository");
-    validate_event_webhook_refs(names, event_webhooks, &context)
 }
 
 /// Validates that every name in `refs` exists in `known`. The `context` string
