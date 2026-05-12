@@ -2,7 +2,6 @@
 mod tests;
 
 mod auth;
-mod bearer_token;
 mod upstream_url;
 
 use std::{io, path::Path, sync::Arc, time::Duration};
