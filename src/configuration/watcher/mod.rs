@@ -115,9 +115,10 @@ fn compute_tls_dirs(config: &Configuration, config_dir: &Path) -> HashSet<PathBu
     .collect()
 }
 
-/// Resolves the active `Configuration`, loading from disk when the cache is
-/// empty.  Returns `None` and logs a warning if the disk load fails.
-fn resolve_config<'a>(
+/// Returns the cached `Configuration`, loading it from disk and storing it in
+/// `cached` when the cache is empty. Returns `None` and logs a warning if the
+/// disk load fails.
+fn ensure_config_cached<'a>(
     cached: &'a mut Option<Configuration>,
     config_path: &Path,
 ) -> Option<&'a Configuration> {
@@ -147,7 +148,7 @@ fn reload_tls(
     notifier: &dyn ConfigNotifier,
 ) {
     info!("TLS certificate change detected, reloading");
-    let Some(cfg) = resolve_config(cached_config, config_path) else {
+    let Some(cfg) = ensure_config_cached(cached_config, config_path) else {
         return;
     };
     match cfg {
