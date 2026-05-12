@@ -1,12 +1,10 @@
 use std::{
     net::{IpAddr, Ipv4Addr},
     num::NonZeroU64,
+    path::PathBuf,
 };
 
 use serde::{Deserialize, Deserializer, de::Error};
-
-pub mod insecure;
-pub mod tls;
 
 #[derive(Clone, Debug, Deserialize, PartialEq)]
 pub struct ListenerBaseConfig {
@@ -25,6 +23,26 @@ pub struct ListenerBaseConfig {
         deserialize_with = "deserialize_query_timeout_grace_period_secs"
     )]
     pub query_timeout_grace_period_secs: NonZeroU64,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
+pub struct InsecureListenerConfig {
+    #[serde(flatten)]
+    pub base: ListenerBaseConfig,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+pub struct TlsListenerConfig {
+    #[serde(flatten)]
+    pub base: ListenerBaseConfig,
+    pub tls: ServerTlsConfig,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+pub struct ServerTlsConfig {
+    pub server_certificate_bundle: PathBuf,
+    pub server_private_key: PathBuf,
+    pub client_ca_bundle: Option<PathBuf>,
 }
 
 impl ListenerBaseConfig {

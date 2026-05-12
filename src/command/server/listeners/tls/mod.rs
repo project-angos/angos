@@ -16,7 +16,7 @@ use crate::command::server::{
     error::Error,
     listeners::{Connector, HandshakeResult, accept_loop},
 };
-pub use crate::configuration::listeners::tls::{ServerTlsConfig, TlsListenerConfig};
+pub use crate::configuration::listeners::{ServerTlsConfig, TlsListenerConfig};
 
 fn build_client_verifier(client_ca_bundle: &Path) -> Result<Arc<dyn ClientCertVerifier>, Error> {
     let client_certs: Vec<CertificateDer> = CertificateDer::pem_file_iter(client_ca_bundle)

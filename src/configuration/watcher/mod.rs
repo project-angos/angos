@@ -15,7 +15,7 @@ use tokio::{sync::mpsc, time::timeout};
 use tracing::{debug, error, info, warn};
 
 use super::{Configuration, Error, ServerConfig};
-use crate::configuration::listeners::tls::ServerTlsConfig;
+use crate::configuration::listeners::ServerTlsConfig;
 
 /// Window during which filesystem events are coalesced into a single reload.
 /// Editors typically emit several `Modify`/`Create`/`Remove` events per save

@@ -7,7 +7,7 @@ use notify::{
 use tempfile::TempDir;
 
 use super::{classify::is_k8s_data_symlink, *};
-use crate::configuration::listeners::tls::ServerTlsConfig;
+use crate::configuration::listeners::ServerTlsConfig;
 
 fn make_event(kind: EventKind, paths: Vec<PathBuf>) -> Event {
     Event {

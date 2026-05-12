@@ -9,7 +9,7 @@ use crate::command::server::{
     error::Error,
     listeners::{Connector, HandshakeResult, accept_loop},
 };
-pub use crate::configuration::listeners::insecure::InsecureListenerConfig;
+pub use crate::configuration::listeners::InsecureListenerConfig;
 
 pub struct InsecureListener {
     binding_address: SocketAddr,
