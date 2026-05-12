@@ -4,6 +4,7 @@ use crate::{
     auth::oidc,
     cache,
     configuration::{Configuration, Error, ServerConfig},
+    policy::AccessMode,
     registry::{blob_store, data_store, metadata_store},
 };
 
@@ -157,19 +158,57 @@ fn test_repository_config() {
     [server]
     bind_address = "0.0.0.0"
 
+    [auth.webhook.repo-auth]
+    url = "https://auth.example.com/authorize"
+    timeout_ms = 1000
+
+    [event_webhook.repo-events]
+    url = "https://events.example.com/hook"
+    policy = "optional"
+    events = ["manifest.push"]
+
     [repository.myapp]
     immutable_tags = true
     immutable_tags_exclusions = ["dev"]
+    authorization_webhook = "repo-auth"
+    event_webhooks = ["repo-events"]
+
+    [[repository.myapp.upstream]]
+    url = "https://registry.example.com"
+    max_redirect = 3
+    username = "mirror"
+    password = "secret"
+
+    [repository.myapp.access_policy]
+    default = "allow"
+    rules = ["identity.username == 'admin'"]
+
+    [repository.myapp.retention_policy]
+    rules = ["image.tag == 'latest'"]
     "#;
 
     let config = Configuration::load_from_str(config).unwrap();
     assert_eq!(config.repository.len(), 1);
-    assert!(config.repository.contains_key("myapp"));
-    assert!(config.repository["myapp"].immutable_tags);
+    let repo = &config.repository["myapp"];
+    assert_eq!(repo.upstream.len(), 1);
+    assert_eq!(repo.upstream[0].url, "https://registry.example.com");
+    assert_eq!(repo.upstream[0].max_redirect, 3);
+    assert_eq!(repo.upstream[0].username.as_deref(), Some("mirror"));
     assert_eq!(
-        config.repository["myapp"].immutable_tags_exclusions.len(),
-        1
+        repo.upstream[0]
+            .password
+            .as_ref()
+            .map(|p| p.expose().as_str()),
+        Some("secret")
     );
+    assert_eq!(repo.access_policy.default, AccessMode::Allow);
+    assert_eq!(repo.access_policy.rules.len(), 1);
+    assert_eq!(repo.retention_policy.rules.len(), 1);
+    assert!(repo.immutable_tags);
+    assert_eq!(repo.immutable_tags_exclusions.len(), 1);
+    assert_eq!(repo.immutable_tags_exclusions[0].as_source(), "dev");
+    assert_eq!(repo.authorization_webhook.as_deref(), Some("repo-auth"));
+    assert_eq!(repo.event_webhooks, ["repo-events"]);
 }
 
 #[test]
