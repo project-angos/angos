@@ -16,7 +16,7 @@ update_pull_time = false
 # Optional: Global access policy that applies to all repositories
 # If not defined, repositories without specific policies will deny access
 #[global.access_policy]
-#default_allow = false
+#default = "deny"
 #rules = [
 #    'identity.username == "admin"',
 #    'identity.certificate.organizations.contains("infrastructure")'
@@ -118,15 +118,15 @@ password = "$argon2id$v=19$m=16,t=2,p=1$MTIzNDU2Nzg$lurg6dYCXXrJP3zaFwu35w" # te
 #url = "https://hooks.example.com/production"
 #policy = "required"
 #events = ["manifest.push"]
-#repository_filter = ["^production/.*"]
+#repository_filter = ["^production$"]
 
 [repository."nginx"]
 
 [repository."nginx".access_policy]
-default_allow = true
+default = "allow"
 
 [repository."test".access_policy]
-default_allow = false
+default = "deny"
 rules = [
     'identity.username in ["philippe"]',
     '"philippe" in identity.certificate.common_names',
