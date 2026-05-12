@@ -1,4 +1,4 @@
-//! WWW-Authenticate header parsing, bearer-token negotiation, and auth-token cache write.
+//! WWW-Authenticate header parsing, bearer-token negotiation, and auth-token cache keys.
 
 use std::sync::LazyLock;
 
@@ -9,12 +9,19 @@ use reqwest::{
     header::{AUTHORIZATION, WWW_AUTHENTICATE},
 };
 
-use super::{RegistryClient, bearer_token::BearerToken, parse_header};
-use crate::registry::Error;
+use crate::{
+    registry::Error,
+    registry_client::{RegistryClient, bearer_token::BearerToken, parse_header},
+};
 
 fn authority_for_cache_key(url: &url::Url) -> Result<&str, Error> {
     url.host_str()
         .ok_or_else(|| Error::Internal("Response URL is missing host authority".to_string()))
+}
+
+pub fn token_cache_key(url: &url::Url) -> Result<String, Error> {
+    let authority = authority_for_cache_key(url)?;
+    Ok(format!("auth:{authority}"))
 }
 
 static BEARER_PARAM_RE: LazyLock<Regex> =
@@ -98,8 +105,7 @@ impl RegistryClient {
 
         let token = format!("Bearer {}", bearer.token()?);
 
-        let authority = authority_for_cache_key(response_url)?;
-        let cache_key = format!("auth:{authority}");
+        let cache_key = token_cache_key(response_url)?;
         let _ = self
             .cache
             .store_value(&cache_key, &token, bearer.ttl())
@@ -119,7 +125,10 @@ impl RegistryClient {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::{
+        registry::Error,
+        registry_client::auth::{authority_for_cache_key, parse_bearer_challenge, token_cache_key},
+    };
 
     #[test]
     fn authority_for_cache_key_returns_host() {
@@ -135,6 +144,12 @@ mod tests {
         let url = url::Url::parse("data:text/plain,hello").unwrap();
         let err = authority_for_cache_key(&url).expect_err("expected Err for hostless URL");
         assert!(matches!(err, Error::Internal(_)));
+    }
+
+    #[test]
+    fn token_cache_key_uses_authority_prefix() {
+        let url = url::Url::parse("https://registry.example.com/v2/").unwrap();
+        assert_eq!(token_cache_key(&url).unwrap(), "auth:registry.example.com");
     }
 
     #[test]

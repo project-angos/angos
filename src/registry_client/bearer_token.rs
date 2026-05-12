@@ -29,7 +29,7 @@ impl BearerToken {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::{registry::Error, registry_client::bearer_token::BearerToken};
 
     #[test]
     fn test_token_from_token_field() {

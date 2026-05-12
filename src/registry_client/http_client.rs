@@ -4,8 +4,7 @@ use std::{fs, time::Duration};
 
 use reqwest::{Certificate, Client, Identity, redirect::Policy};
 
-use super::RegistryClientConfig;
-use crate::registry::Error;
+use crate::{registry::Error, registry_client::RegistryClientConfig};
 
 pub fn build_http_client(config: &RegistryClientConfig) -> Result<Client, Error> {
     let mut client_builder = Client::builder()

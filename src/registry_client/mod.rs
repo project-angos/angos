@@ -8,13 +8,14 @@ mod upstream_url;
 
 use std::{io, sync::Arc};
 
+use auth::token_cache_key;
 use futures_util::TryStreamExt;
 use reqwest::{
     Client, Method, Response, StatusCode,
     header::{ACCEPT, AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE},
 };
 use serde::Deserialize;
-use tokio::{io::AsyncReadExt, sync::RwLock};
+use tokio::io::AsyncReadExt;
 use tokio_util::io::StreamReader;
 use tracing::{info, warn};
 
@@ -61,7 +62,6 @@ pub struct RegistryClient {
     client: Client,
     basic_auth: Option<(String, String)>,
     cache: Arc<Cache>,
-    auth_cache: Arc<RwLock<Option<String>>>,
 }
 
 impl RegistryClient {
@@ -82,7 +82,6 @@ impl RegistryClient {
             client,
             basic_auth,
             cache,
-            auth_cache: Arc::new(RwLock::new(None)),
         })
     }
 
@@ -94,14 +93,13 @@ impl RegistryClient {
     ) -> Result<Response, Error> {
         info!("Requesting from upstream: {location}");
 
-        let cached_auth = self.auth_cache.read().await.clone();
+        let cached_auth = self.cached_auth_header(location).await;
         let response = self
             .send(method, accepted_types, location, cached_auth.as_deref())
             .await?;
 
         if response.status() == StatusCode::UNAUTHORIZED {
             let token = self.authenticate(&response).await?;
-            *self.auth_cache.write().await = Some(token.clone());
             return self
                 .send(method, accepted_types, location, Some(&token))
                 .await;
@@ -112,6 +110,32 @@ impl RegistryClient {
         }
 
         Ok(response)
+    }
+
+    async fn cached_auth_header(&self, location: &str) -> Option<String> {
+        let url = match url::Url::parse(location) {
+            Ok(url) => url,
+            Err(e) => {
+                warn!("Unable to parse upstream URL for auth cache lookup: {e}");
+                return None;
+            }
+        };
+
+        let key = match token_cache_key(&url) {
+            Ok(key) => key,
+            Err(e) => {
+                warn!("Unable to build auth cache key: {e}");
+                return None;
+            }
+        };
+
+        match self.cache.retrieve_value(&key).await {
+            Ok(auth_header) => auth_header,
+            Err(e) => {
+                warn!("Unable to read upstream auth cache: {e}");
+                None
+            }
+        }
     }
 
     async fn send(

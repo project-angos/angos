@@ -1,7 +1,9 @@
 //! Namespace resolution and URL builders for upstream registry requests.
 
-use super::RegistryClient;
-use crate::oci::{Digest, Reference};
+use crate::{
+    oci::{Digest, Reference},
+    registry_client::RegistryClient,
+};
 
 impl RegistryClient {
     pub fn get_upstream_namespace(local_name: &str, upstream_name: &str) -> String {
