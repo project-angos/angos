@@ -363,7 +363,7 @@ async fn test_build_registry_preserves_registry_error_details() {
     let error = result.expect_err("registry build should fail");
     assert!(
         error.to_string().contains(
-            "task pool error during operations: failed to build Tokio runtime: worker_threads must be greater than 0"
+            "task pool error during operations: failed to initialize task queue: max_concurrent_cache_jobs must be greater than 0"
         ),
         "error should preserve registry failure details, got: {error}"
     );

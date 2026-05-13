@@ -1,19 +1,19 @@
-use std::{collections::HashSet, fmt, future::Future, sync::Arc, thread};
+use std::{collections::HashSet, fmt, future::Future, sync::Arc};
 
 use parking_lot::Mutex;
-use tokio::runtime::{self, Handle};
+use tokio::{runtime::Handle, sync::Semaphore};
 use tracing::info;
 
 #[derive(Debug)]
 pub enum Error {
-    RuntimeBuild(String),
+    Initialization(String),
     TaskExecution(String),
 }
 
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Error::RuntimeBuild(e) => write!(f, "failed to build Tokio runtime: {e}"),
+            Error::Initialization(e) => write!(f, "failed to initialize task queue: {e}"),
             Error::TaskExecution(e) => write!(f, "task execution failed: {e}"),
         }
     }
@@ -23,35 +23,23 @@ impl std::error::Error for Error {}
 
 pub struct TaskQueue {
     handle: Handle,
+    permits: Arc<Semaphore>,
     active_tasks: Arc<Mutex<HashSet<String>>>,
-    _runtime_thread: thread::JoinHandle<()>,
 }
 
 impl TaskQueue {
-    pub fn new(worker_threads: usize, thread_name: &str) -> Result<Self, Error> {
-        if worker_threads == 0 {
-            return Err(Error::RuntimeBuild(
-                "worker_threads must be greater than 0".to_string(),
+    pub fn new(max_concurrent_jobs: usize) -> Result<Self, Error> {
+        if max_concurrent_jobs == 0 {
+            return Err(Error::Initialization(
+                "max_concurrent_cache_jobs must be greater than 0".to_string(),
             ));
         }
 
-        let runtime = runtime::Builder::new_multi_thread()
-            .worker_threads(worker_threads)
-            .thread_name(thread_name)
-            .enable_all()
-            .build()
-            .map_err(|e| Error::RuntimeBuild(e.to_string()))?;
-
-        let handle = runtime.handle().clone();
-
-        let runtime_thread = thread::spawn(move || {
-            runtime.block_on(std::future::pending::<()>());
-        });
-
         Ok(Self {
-            handle,
+            handle: Handle::try_current()
+                .map_err(|error| Error::Initialization(error.to_string()))?,
+            permits: Arc::new(Semaphore::new(max_concurrent_jobs)),
             active_tasks: Arc::new(Mutex::new(HashSet::new())),
-            _runtime_thread: runtime_thread,
         })
     }
 
@@ -67,8 +55,11 @@ impl TaskQueue {
 
         let reference = reference.to_string();
         let active_tasks = self.active_tasks.clone();
+        let permits = self.permits.clone();
         self.handle.spawn(async move {
-            let _ = fut.await;
+            if let Ok(_permit) = permits.acquire_owned().await {
+                let _ = fut.await;
+            }
             active_tasks.lock().remove(&reference);
         });
     }
@@ -100,7 +91,7 @@ mod tests {
     use super::{Error, TaskQueue};
 
     fn make_queue() -> TaskQueue {
-        TaskQueue::new(2, "test-task-queue").expect("failed to build TaskQueue")
+        TaskQueue::new(2).expect("failed to build TaskQueue")
     }
 
     // Future that immediately increments the counter and resolves.
@@ -153,8 +144,8 @@ mod tests {
     }
 
     // Single task submitted, runs exactly once, and is removed from the active set.
-    #[test]
-    fn single_submit_runs_to_completion() {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn single_submit_runs_to_completion() {
         let queue = make_queue();
         let counter = Arc::new(AtomicUsize::new(0));
 
@@ -168,8 +159,8 @@ mod tests {
 
     // Submitting the same reference twice while the first task is still in-flight
     // results in one execution, not two.
-    #[test]
-    fn duplicate_submit_is_deduplicated() {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn duplicate_submit_is_deduplicated() {
         let queue = make_queue();
         let counter = Arc::new(AtomicUsize::new(0));
 
@@ -193,8 +184,8 @@ mod tests {
     }
 
     // Two submissions with different references both execute independently.
-    #[test]
-    fn different_references_run_independently() {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn different_references_run_independently() {
         let queue = make_queue();
         let counter_a = Arc::new(AtomicUsize::new(0));
         let counter_b = Arc::new(AtomicUsize::new(0));
@@ -211,10 +202,30 @@ mod tests {
         assert_eq!(queue.active_task_count(), 0);
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn max_concurrent_jobs_limits_running_tasks() {
+        let queue = TaskQueue::new(1).expect("failed to build TaskQueue");
+        let counter = Arc::new(AtomicUsize::new(0));
+        let first_gate = Arc::new(Notify::new());
+        let second_gate = Arc::new(Notify::new());
+
+        queue.submit("ref-first", notify_task(&counter, first_gate.clone()));
+        queue.submit("ref-second", notify_task(&counter, second_gate.clone()));
+
+        assert!(wait_until(|| counter.load(Ordering::SeqCst) == 1));
+        assert_eq!(queue.active_task_count(), 2);
+
+        first_gate.notify_one();
+        assert!(wait_until(|| counter.load(Ordering::SeqCst) == 2));
+
+        second_gate.notify_one();
+        assert!(wait_until(|| queue.active_task_count() == 0));
+    }
+
     // After a task completes and its reference is removed from the active set,
     // re-submitting the same reference spawns a new task (not the stale one).
-    #[test]
-    fn completed_task_cleanup_allows_resubmission() {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn completed_task_cleanup_allows_resubmission() {
         let queue = make_queue();
         let counter = Arc::new(AtomicUsize::new(0));
 
@@ -234,8 +245,8 @@ mod tests {
 
     // N concurrent callers submitting the same reference cause the underlying
     // future to run exactly once; all surplus submissions are dropped silently.
-    #[test]
-    fn concurrent_dedup_runs_future_exactly_once() {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_dedup_runs_future_exactly_once() {
         let queue = Arc::new(make_queue());
         let counter = Arc::new(AtomicUsize::new(0));
         let gate = Arc::new(Notify::new());
@@ -271,8 +282,8 @@ mod tests {
 
     // Dedup, then resubmit, then dedup again in tight sequence confirms the
     // cleanup path does not race with a new submission for the same key.
-    #[test]
-    fn cleanup_completion_race_no_deadlock() {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cleanup_completion_race_no_deadlock() {
         let queue = make_queue();
         let counter = Arc::new(AtomicUsize::new(0));
 
@@ -301,8 +312,8 @@ mod tests {
     }
 
     // Edge-case reference values (empty, whitespace, non-ASCII) are valid dedup keys.
-    #[test]
-    fn edge_case_keys_are_valid_dedup_keys() {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn edge_case_keys_are_valid_dedup_keys() {
         let queue = make_queue();
 
         for key in &["", "   ", "日本語"] {
