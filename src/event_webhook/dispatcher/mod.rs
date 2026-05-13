@@ -170,14 +170,12 @@ async fn send_request(req: &DeliveryRequest<'_>) -> Result<(), String> {
 async fn send_with_retries(req: &DeliveryRequest<'_>, max_retries: u32) -> Result<(), String> {
     let mut first_err: Option<String> = None;
     let mut last_err: Option<String> = None;
-    let mut attempts: u32 = 0;
 
     for attempt in 0..=max_retries {
         if attempt > 0 {
             tokio::time::sleep(backoff_for_attempt(attempt)).await;
         }
 
-        attempts += 1;
         match send_request(req).await {
             Ok(()) => return Ok(()),
             Err(e) => {
@@ -190,7 +188,7 @@ async fn send_with_retries(req: &DeliveryRequest<'_>, max_retries: u32) -> Resul
     }
 
     Err(format_retry_failure(
-        attempts,
+        max_retries + 1,
         first_err.as_deref(),
         last_err.as_deref(),
     ))
