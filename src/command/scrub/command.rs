@@ -129,20 +129,17 @@ impl Command {
     }
 
     async fn scrub_blobs(&mut self) -> Result<(), Error> {
-        if let Some(checker) = self.blob_checker.take() {
+        if let Some(checker) = &self.blob_checker {
             if let Err(e) = checker.check_all(self.sink.as_mut()).await {
                 tracing::warn!("Blob scrub checker failed: {e}");
             }
-            self.blob_checker = Some(checker);
         }
         Ok(())
     }
 
     async fn scrub_multipart_uploads(&mut self) -> Result<(), Error> {
-        if let Some(checker) = self.multipart_checker.take() {
-            let result = checker.check_all(self.sink.as_mut()).await;
-            self.multipart_checker = Some(checker);
-            result?;
+        if let Some(checker) = &self.multipart_checker {
+            checker.check_all(self.sink.as_mut()).await?;
         }
         Ok(())
     }
