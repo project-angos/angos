@@ -283,7 +283,7 @@ In-flight deliveries on the old configuration continue to completion.
 
 ## Graceful Shutdown
 
-On `SIGTERM` or `SIGINT`, the registry drains in-flight async webhook deliveries before shutting down. Deliveries that exceed the shutdown timeout are logged and abandoned.
+On `SIGTERM` or `SIGINT`, the registry drains in-flight async webhook deliveries before shutting down. Deliveries that exceed the shutdown timeout are aborted, logged, and abandoned.
 
 ---
 

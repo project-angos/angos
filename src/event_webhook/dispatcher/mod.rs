@@ -251,7 +251,9 @@ impl EventDispatcher {
             .await
             .is_err()
         {
-            warn!("Shutdown timed out; some in-flight async deliveries may not have completed");
+            let mut in_flight = self.in_flight.lock().await;
+            in_flight.abort_all();
+            warn!("Shutdown timed out; aborted unfinished async webhook deliveries");
         }
     }
 
