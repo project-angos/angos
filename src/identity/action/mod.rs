@@ -151,8 +151,26 @@ pub enum Action {
     ListRepositories,
     #[serde(rename = "list-namespaces")]
     ListNamespaces {
-        repository: String,
+        repository: Namespace,
     },
+}
+
+struct ActionData<'a> {
+    namespace: Option<&'a Namespace>,
+    digest: Option<&'a Digest>,
+    reference: Option<&'a Reference>,
+    is_push: bool,
+}
+
+impl ActionData<'_> {
+    const fn none() -> Self {
+        Self {
+            namespace: None,
+            digest: None,
+            reference: None,
+            is_push: false,
+        }
+    }
 }
 
 impl Action {
@@ -185,25 +203,9 @@ impl Action {
         }
     }
 
-    /// Returns the namespace associated with this action, if any.
-    pub fn get_namespace(&self) -> Option<&Namespace> {
+    #[allow(clippy::too_many_lines)]
+    fn action_data(&self) -> ActionData<'_> {
         match self {
-            Action::ListTags { namespace, .. }
-            | Action::StartUpload { namespace, .. }
-            | Action::GetUpload { namespace, .. }
-            | Action::PatchUpload { namespace, .. }
-            | Action::PutUpload { namespace, .. }
-            | Action::DeleteUpload { namespace, .. }
-            | Action::GetBlob { namespace, .. }
-            | Action::HeadBlob { namespace, .. }
-            | Action::DeleteBlob { namespace, .. }
-            | Action::GetManifest { namespace, .. }
-            | Action::HeadManifest { namespace, .. }
-            | Action::PutManifest { namespace, .. }
-            | Action::DeleteManifest { namespace, .. }
-            | Action::GetReferrer { namespace, .. }
-            | Action::ListRevisions { namespace, .. }
-            | Action::ListUploads { namespace, .. } => Some(namespace),
             Action::UiAsset { .. }
             | Action::UiConfig
             | Action::Healthz
@@ -212,103 +214,100 @@ impl Action {
             | Action::ApiVersion
             | Action::ListCatalog { .. }
             | Action::ListRepositories
-            | Action::ListNamespaces { .. } => None,
+            | Action::ListNamespaces { .. } => ActionData::none(),
+
+            Action::ListTags { namespace, .. }
+            | Action::GetUpload { namespace, .. }
+            | Action::ListRevisions { namespace }
+            | Action::ListUploads { namespace } => ActionData {
+                namespace: Some(namespace),
+                ..ActionData::none()
+            },
+
+            Action::PatchUpload { namespace, .. } | Action::DeleteUpload { namespace, .. } => {
+                ActionData {
+                    namespace: Some(namespace),
+                    is_push: true,
+                    ..ActionData::none()
+                }
+            }
+
+            Action::StartUpload { namespace, digest } => ActionData {
+                namespace: Some(namespace),
+                digest: digest.as_ref(),
+                is_push: true,
+                ..ActionData::none()
+            },
+
+            Action::PutUpload {
+                namespace, digest, ..
+            } => ActionData {
+                namespace: Some(namespace),
+                digest: Some(digest),
+                is_push: true,
+                ..ActionData::none()
+            },
+
+            Action::GetBlob { namespace, digest }
+            | Action::HeadBlob { namespace, digest }
+            | Action::DeleteBlob { namespace, digest }
+            | Action::GetReferrer {
+                namespace, digest, ..
+            } => ActionData {
+                namespace: Some(namespace),
+                digest: Some(digest),
+                ..ActionData::none()
+            },
+
+            Action::GetManifest {
+                namespace,
+                reference,
+            }
+            | Action::HeadManifest {
+                namespace,
+                reference,
+            }
+            | Action::DeleteManifest {
+                namespace,
+                reference,
+            } => ActionData {
+                namespace: Some(namespace),
+                reference: Some(reference),
+                ..ActionData::none()
+            },
+
+            Action::PutManifest {
+                namespace,
+                reference,
+            } => ActionData {
+                namespace: Some(namespace),
+                reference: Some(reference),
+                is_push: true,
+                ..ActionData::none()
+            },
         }
+    }
+
+    /// Returns the namespace associated with this action, if any.
+    pub fn get_namespace(&self) -> Option<&Namespace> {
+        self.action_data().namespace
     }
 
     /// Returns the digest associated with this action, if any.
     pub fn get_digest(&self) -> Option<&Digest> {
-        match self {
-            Action::GetBlob { digest, .. }
-            | Action::HeadBlob { digest, .. }
-            | Action::DeleteBlob { digest, .. }
-            | Action::GetReferrer { digest, .. }
-            | Action::PutUpload { digest, .. } => Some(digest),
-            Action::StartUpload { digest, .. } => digest.as_ref(),
-            Action::UiAsset { .. }
-            | Action::UiConfig
-            | Action::Healthz
-            | Action::Readyz
-            | Action::Metrics
-            | Action::ApiVersion
-            | Action::ListCatalog { .. }
-            | Action::ListTags { .. }
-            | Action::GetUpload { .. }
-            | Action::PatchUpload { .. }
-            | Action::DeleteUpload { .. }
-            | Action::GetManifest { .. }
-            | Action::HeadManifest { .. }
-            | Action::PutManifest { .. }
-            | Action::DeleteManifest { .. }
-            | Action::ListRevisions { .. }
-            | Action::ListUploads { .. }
-            | Action::ListRepositories
-            | Action::ListNamespaces { .. } => None,
-        }
+        self.action_data().digest
     }
 
     /// Returns the manifest reference associated with this action, if any.
     pub fn get_reference(&self) -> Option<&Reference> {
-        match self {
-            Action::GetManifest { reference, .. }
-            | Action::HeadManifest { reference, .. }
-            | Action::PutManifest { reference, .. }
-            | Action::DeleteManifest { reference, .. } => Some(reference),
-            Action::UiAsset { .. }
-            | Action::UiConfig
-            | Action::Healthz
-            | Action::Readyz
-            | Action::Metrics
-            | Action::ApiVersion
-            | Action::ListCatalog { .. }
-            | Action::ListTags { .. }
-            | Action::StartUpload { .. }
-            | Action::GetUpload { .. }
-            | Action::PatchUpload { .. }
-            | Action::PutUpload { .. }
-            | Action::DeleteUpload { .. }
-            | Action::GetBlob { .. }
-            | Action::HeadBlob { .. }
-            | Action::DeleteBlob { .. }
-            | Action::GetReferrer { .. }
-            | Action::ListRevisions { .. }
-            | Action::ListUploads { .. }
-            | Action::ListRepositories
-            | Action::ListNamespaces { .. } => None,
-        }
+        self.action_data().reference
     }
 
     /// Returns `true` if this action writes registry state (uploads or manifest puts).
     ///
     /// Used to reject push operations against pull-through cache repositories.
     pub fn is_push(&self) -> bool {
-        match self {
-            Action::StartUpload { .. }
-            | Action::PatchUpload { .. }
-            | Action::PutUpload { .. }
-            | Action::DeleteUpload { .. }
-            | Action::PutManifest { .. } => true,
-            Action::UiAsset { .. }
-            | Action::UiConfig
-            | Action::Healthz
-            | Action::Readyz
-            | Action::Metrics
-            | Action::ApiVersion
-            | Action::ListCatalog { .. }
-            | Action::ListTags { .. }
-            | Action::GetUpload { .. }
-            | Action::GetBlob { .. }
-            | Action::HeadBlob { .. }
-            | Action::DeleteBlob { .. }
-            | Action::GetManifest { .. }
-            | Action::HeadManifest { .. }
-            | Action::DeleteManifest { .. }
-            | Action::GetReferrer { .. }
-            | Action::ListRevisions { .. }
-            | Action::ListUploads { .. }
-            | Action::ListRepositories
-            | Action::ListNamespaces { .. } => false,
-        }
+        self.action_data().is_push
     }
 }
 

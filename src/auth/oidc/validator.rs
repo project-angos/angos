@@ -1,15 +1,17 @@
-use std::collections::HashMap;
+use std::{collections::HashMap, time::Duration};
 
-use jsonwebtoken::{Algorithm, Validation, decode, decode_header};
+use jsonwebtoken::{Algorithm, Header, Validation, decode, decode_header};
 use reqwest::{Client, header::ACCEPT};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use tokio::time::timeout;
 use tracing::{debug, info, warn};
 
 use crate::{
     auth::oidc::{Jwk, OidcProvider},
-    cache::{Cache, CacheExt, CacheOutcome},
-    command::server::{Error, sha256_hash},
+    cache::Cache,
+    command::server::Error,
     identity::OidcClaims,
+    util::sha256,
 };
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -23,28 +25,62 @@ struct Jwks {
     keys: Vec<Jwk>,
 }
 
+#[derive(Debug)]
+struct FetchedJwks {
+    jwks: Jwks,
+    from_cache: bool,
+}
+
+struct CachedJson<T> {
+    value: T,
+    from_cache: bool,
+}
+
+struct CachedJsonRequest<'a> {
+    client: &'a Client,
+    cache: &'a Cache,
+    cache_key: &'a str,
+    url: &'a str,
+    ttl: u64,
+    read_cache: bool,
+    fetch_timeout: Option<Duration>,
+}
+
+const JWKS_REFRESH_TIMEOUT: Duration = Duration::from_secs(5);
+
 pub async fn validate_oidc_token(
     provider_name: &str,
     provider: &dyn OidcProvider,
     token: &str,
     client: &Client,
-    cache: &dyn Cache,
+    cache: &Cache,
 ) -> Result<OidcClaims, Error> {
-    let jwks = fetch_jwks(provider, client, cache).await?;
-    verify_jwt(token, &jwks, provider_name, provider)
+    let header = decode_header(token)
+        .map_err(|e| Error::Unauthorized(format!("Failed to decode JWT header: {e}")))?;
+    verify_allowed_algorithm(provider, header.alg)?;
+
+    let mut fetched_jwks = fetch_jwks(provider, client, cache).await?;
+    if fetched_jwks.from_cache && cached_jwks_misses_kid(&fetched_jwks.jwks, &header) {
+        info!(
+            "Cached JWKS for provider {} does not contain kid {:?}; refreshing",
+            provider.name(),
+            header.kid
+        );
+        fetched_jwks =
+            fetch_jwks_with_cache(provider, client, cache, false, Some(JWKS_REFRESH_TIMEOUT))
+                .await?;
+    }
+
+    verify_jwt_with_header(token, &header, &fetched_jwks.jwks, provider_name, provider)
 }
 
-/// Pure JWT verification — no I/O. Validates the token against the supplied JWKS and provider
-/// configuration and returns structured claims on success.
-fn verify_jwt(
+fn verify_jwt_with_header(
     token: &str,
+    header: &Header,
     jwks: &Jwks,
     provider_name: &str,
     provider: &dyn OidcProvider,
 ) -> Result<OidcClaims, Error> {
-    let header = decode_header(token)
-        .map_err(|e| Error::Unauthorized(format!("Failed to decode JWT header: {e}")))?;
-
     debug!(
         "JWT header: alg={:?}, kid={:?}, typ={:?}",
         header.alg, header.kid, header.typ
@@ -97,8 +133,19 @@ fn verify_jwt(
     })
 }
 
+fn verify_allowed_algorithm(provider: &dyn OidcProvider, alg: Algorithm) -> Result<(), Error> {
+    if provider.allowed_algorithms().contains(&alg) {
+        return Ok(());
+    }
+    Err(Error::Unauthorized(format!(
+        "algorithm {alg:?} not allowed for provider {}",
+        provider.name()
+    )))
+}
+
 fn build_validation(provider: &dyn OidcProvider, alg: Algorithm) -> Validation {
     let mut validation = Validation::new(alg);
+    validation.algorithms = provider.allowed_algorithms().to_vec();
     validation.set_issuer(&[provider.issuer()]);
     if let Some(aud) = provider.required_audience() {
         validation.set_audience(&[aud]);
@@ -111,101 +158,200 @@ fn build_validation(provider: &dyn OidcProvider, alg: Algorithm) -> Validation {
     validation
 }
 
-async fn query_json<T>(client: &Client, url: &str) -> Result<T, Error>
+fn cached_jwks_misses_kid(jwks: &Jwks, header: &Header) -> bool {
+    let Some(kid) = header.kid.as_deref() else {
+        return false;
+    };
+    !jwks.keys.iter().any(|key| key.kid() == Some(kid))
+}
+
+async fn query_json<T>(
+    client: &Client,
+    url: &str,
+    fetch_timeout: Option<Duration>,
+) -> Result<T, Error>
 where
     T: DeserializeOwned,
 {
-    let response = client
-        .get(url)
-        .header(ACCEPT, "application/json")
-        .send()
-        .await;
+    let fetch = async {
+        let response = client
+            .get(url)
+            .header(ACCEPT, "application/json")
+            .send()
+            .await
+            .map_err(|e| Error::ProviderUnavailable(format!("Failed to fetch URL {url}: {e}")))?;
 
-    let response =
-        response.map_err(|e| Error::Unauthorized(format!("Failed to fetch URL {url}: {e}")))?;
+        if !response.status().is_success() {
+            let msg = format!("Failed to fetch URL {url}: HTTP {}", response.status());
+            return Err(Error::ProviderUnavailable(msg));
+        }
 
-    if !response.status().is_success() {
-        let msg = format!("Failed to fetch URL {url}: HTTP {}", response.status());
-        return Err(Error::Unauthorized(msg));
+        response.json().await.map_err(|e| {
+            Error::ProviderUnavailable(format!("Failed to parse JSON from {url}: {e}"))
+        })
+    };
+
+    match fetch_timeout {
+        Some(duration) => timeout(duration, fetch)
+            .await
+            .map_err(|_| Error::ProviderUnavailable(format!("Timed out fetching URL {url}")))?,
+        None => fetch.await,
     }
-
-    let data: T = response
-        .json()
-        .await
-        .map_err(|e| Error::Unauthorized(format!("Failed to parse JSON from {url}: {e}")))?;
-
-    Ok(data)
 }
 
 async fn get_jwks_url(
     provider: &dyn OidcProvider,
     client: &Client,
-    cache: &dyn Cache,
+    cache: &Cache,
+    fetch_timeout: Option<Duration>,
 ) -> Result<String, Error> {
     if let Some(uri) = provider.jwks_uri() {
         return Ok(uri.to_string());
     }
-    let oidc_config = fetch_oidc_configuration(provider, client, cache).await?;
+    let oidc_config =
+        fetch_oidc_configuration_with_timeout(provider, client, cache, fetch_timeout).await?;
 
     Ok(oidc_config.jwks_uri)
+}
+
+fn jwks_cache_key(provider: &dyn OidcProvider) -> String {
+    let provider_name = provider.name();
+    let issuer_hash = sha256::hex(provider.issuer());
+    format!("oidc:{provider_name}:jwks:{issuer_hash}")
+}
+
+fn oidc_configuration_cache_key(provider: &dyn OidcProvider) -> String {
+    let provider_name = provider.name();
+    let issuer_hash = sha256::hex(provider.issuer());
+    format!("oidc:{provider_name}:config:{issuer_hash}")
+}
+
+async fn fetch_cached_json<T, F>(
+    request: CachedJsonRequest<'_>,
+    validate_fresh: F,
+) -> Result<CachedJson<T>, Error>
+where
+    T: DeserializeOwned + Serialize,
+    F: FnOnce(&T) -> Result<(), Error>,
+{
+    if request.read_cache {
+        match request.cache.retrieve::<T>(request.cache_key).await {
+            Ok(Some(value)) => {
+                debug!("Using cached OIDC JSON for {}", request.cache_key);
+                return Ok(CachedJson {
+                    value,
+                    from_cache: true,
+                });
+            }
+            Err(err) => {
+                warn!(
+                    "OIDC cache retrieve failed for {}: {err}",
+                    request.cache_key
+                );
+            }
+            Ok(None) => {}
+        }
+    }
+
+    let value = query_json::<T>(request.client, request.url, request.fetch_timeout).await?;
+    validate_fresh(&value)?;
+
+    if let Err(err) = request
+        .cache
+        .store(request.cache_key, &value, request.ttl)
+        .await
+    {
+        warn!("OIDC cache store failed for {}: {err}", request.cache_key);
+    }
+
+    Ok(CachedJson {
+        value,
+        from_cache: false,
+    })
 }
 
 async fn fetch_jwks(
     provider: &dyn OidcProvider,
     client: &Client,
-    cache: &dyn Cache,
-) -> Result<Jwks, Error> {
-    let provider_name = provider.name();
-    let issuer_hash = sha256_hash(provider.issuer());
-    let cache_key = format!("oidc:{provider_name}:jwks:{issuer_hash}");
-
-    match cache.retrieve::<Jwks>(&cache_key).await {
-        CacheOutcome::Hit(cached) => {
-            debug!("Using cached JWKS for provider: {provider_name}");
-            return Ok(cached);
-        }
-        CacheOutcome::Error(err) => {
-            warn!("OIDC JWKS cache retrieve failed for {provider_name}: {err}");
-        }
-        CacheOutcome::Miss => {}
-    }
-
-    let jwks_url = get_jwks_url(provider, client, cache).await?;
-    let jwks = query_json::<Jwks>(client, &jwks_url).await?;
-
-    if let Err(err) = cache
-        .store(&cache_key, &jwks, provider.jwks_refresh_interval())
-        .await
-    {
-        warn!("OIDC JWKS cache store failed for {provider_name}: {err}");
-    }
-    info!("Fetched JWKS from {jwks_url}");
-    Ok(jwks)
+    cache: &Cache,
+) -> Result<FetchedJwks, Error> {
+    fetch_jwks_with_cache(provider, client, cache, true, None).await
 }
 
+async fn fetch_jwks_with_cache(
+    provider: &dyn OidcProvider,
+    client: &Client,
+    cache: &Cache,
+    read_cache: bool,
+    fetch_timeout: Option<Duration>,
+) -> Result<FetchedJwks, Error> {
+    let cache_key = jwks_cache_key(provider);
+    let jwks_url = get_jwks_url(provider, client, cache, fetch_timeout).await?;
+    let fetched = fetch_cached_json::<Jwks, _>(
+        CachedJsonRequest {
+            client,
+            cache,
+            cache_key: &cache_key,
+            url: &jwks_url,
+            ttl: provider.jwks_refresh_interval(),
+            read_cache,
+            fetch_timeout,
+        },
+        |_| Ok(()),
+    )
+    .await?;
+
+    if !fetched.from_cache {
+        info!("Fetched JWKS from {jwks_url}");
+    }
+
+    Ok(FetchedJwks {
+        jwks: fetched.value,
+        from_cache: fetched.from_cache,
+    })
+}
+
+#[cfg(test)]
 async fn fetch_oidc_configuration(
     provider: &dyn OidcProvider,
     client: &Client,
-    cache: &dyn Cache,
+    cache: &Cache,
 ) -> Result<OpenIdConfiguration, Error> {
-    let provider_name = provider.name();
-    let issuer_hash = sha256_hash(provider.issuer());
-    let cache_key = format!("oidc:{provider_name}:config:{issuer_hash}");
+    fetch_oidc_configuration_with_timeout(provider, client, cache, None).await
+}
 
-    match cache.retrieve::<OpenIdConfiguration>(&cache_key).await {
-        CacheOutcome::Hit(cached) => {
-            debug!("Using cached OIDC configuration");
-            return Ok(cached);
-        }
-        CacheOutcome::Error(err) => {
-            warn!("OIDC configuration cache retrieve failed for {provider_name}: {err}");
-        }
-        CacheOutcome::Miss => {}
-    }
-
+async fn fetch_oidc_configuration_with_timeout(
+    provider: &dyn OidcProvider,
+    client: &Client,
+    cache: &Cache,
+    fetch_timeout: Option<Duration>,
+) -> Result<OpenIdConfiguration, Error> {
+    let cache_key = oidc_configuration_cache_key(provider);
     let config_url = format!("{}/.well-known/openid-configuration", provider.issuer());
-    let config = query_json::<OpenIdConfiguration>(client, &config_url).await?;
+    let fetched = fetch_cached_json::<OpenIdConfiguration, _>(
+        CachedJsonRequest {
+            client,
+            cache,
+            cache_key: &cache_key,
+            url: &config_url,
+            ttl: provider.jwks_refresh_interval(),
+            read_cache: true,
+            fetch_timeout,
+        },
+        |config| validate_oidc_configuration(provider, config),
+    )
+    .await?;
 
+    if !fetched.from_cache {
+        info!("Fetched OIDC configuration from {config_url}");
+    }
+    Ok(fetched.value)
+}
+
+fn validate_oidc_configuration(
+    provider: &dyn OidcProvider,
+    config: &OpenIdConfiguration,
+) -> Result<(), Error> {
     if config.issuer != provider.issuer() {
         return Err(Error::Unauthorized(format!(
             "OIDC configuration issuer mismatch: expected {}, got {}",
@@ -214,21 +360,14 @@ async fn fetch_oidc_configuration(
         )));
     }
 
-    if let Err(err) = cache
-        .store(&cache_key, &config, provider.jwks_refresh_interval())
-        .await
-    {
-        warn!("OIDC configuration cache store failed for {provider_name}: {err}");
-    }
-    info!("Fetched OIDC configuration from {config_url}");
-    Ok(config)
+    Ok(())
 }
 
 #[cfg(test)]
 pub mod tests {
-    use std::collections::HashMap;
+    use std::{collections::HashMap, net::TcpListener, time::Duration};
 
-    use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
+    use jsonwebtoken::{Algorithm, EncodingKey, Header, decode_header, encode};
     use reqwest::Client;
     use serde_json::json;
     use wiremock::{
@@ -236,17 +375,22 @@ pub mod tests {
         matchers::{method, path},
     };
 
-    use super::*;
     use crate::{
         auth::oidc::{
-            OidcProvider,
+            Jwk, OidcProvider,
             provider::{
-                BaseConfig,
+                BaseConfig, HasBaseConfig,
                 generic::{Provider, ProviderConfig},
+            },
+            validator::{
+                Jwks, OpenIdConfiguration, fetch_jwks, fetch_oidc_configuration, jwks_cache_key,
+                oidc_configuration_cache_key, validate_oidc_token, verify_allowed_algorithm,
+                verify_jwt_with_header,
             },
         },
         cache,
         command::server::Error,
+        identity::OidcClaims,
         test_fixtures::oidc::{KID, alt_private_key_pem, jwk_x, jwk_y, private_key_pem},
     };
 
@@ -257,7 +401,20 @@ pub mod tests {
             jwks_refresh_interval: 3600,
             required_audience: Some("test-audience".to_string()),
             clock_skew_tolerance: 60,
+            allowed_algorithms: vec![Algorithm::ES256],
         }
+    }
+
+    fn verify_jwt(
+        token: &str,
+        jwks: &Jwks,
+        provider_name: &str,
+        provider: &dyn OidcProvider,
+    ) -> Result<OidcClaims, Error> {
+        let header = decode_header(token)
+            .map_err(|e| Error::Unauthorized(format!("Failed to decode JWT header: {e}")))?;
+        verify_allowed_algorithm(provider, header.alg)?;
+        verify_jwt_with_header(token, &header, jwks, provider_name, provider)
     }
 
     /// Returns the JWKS JSON body for the `private_key_pem()` fixture.
@@ -301,17 +458,19 @@ pub mod tests {
             jwks_refresh_interval: 3600,
             required_audience: None,
             clock_skew_tolerance: 60,
+            allowed_algorithms: vec![Algorithm::ES256],
         };
 
         let provider = Provider::new(config);
         let client = Client::new();
         let cache = cache::Config::Memory.to_backend().unwrap();
 
-        let result = fetch_jwks(&provider, &client, &*cache).await;
+        let result = fetch_jwks(&provider, &client, cache.as_ref()).await;
 
         assert!(result.is_ok());
         let jwks = result.unwrap();
-        assert_eq!(jwks.keys.len(), 1);
+        assert_eq!(jwks.jwks.keys.len(), 1);
+        assert!(!jwks.from_cache);
     }
 
     #[tokio::test]
@@ -351,17 +510,19 @@ pub mod tests {
             jwks_refresh_interval: 3600,
             required_audience: None,
             clock_skew_tolerance: 60,
+            allowed_algorithms: vec![Algorithm::ES256],
         };
 
         let provider = Provider::new(config);
         let client = Client::new();
         let cache = cache::Config::Memory.to_backend().unwrap();
 
-        let result = fetch_jwks(&provider, &client, &*cache).await;
+        let result = fetch_jwks(&provider, &client, cache.as_ref()).await;
 
         assert!(result.is_ok());
         let jwks = result.unwrap();
-        assert_eq!(jwks.keys.len(), 1);
+        assert_eq!(jwks.jwks.keys.len(), 1);
+        assert!(!jwks.from_cache);
     }
 
     #[tokio::test]
@@ -391,17 +552,19 @@ pub mod tests {
             jwks_refresh_interval: 3600,
             required_audience: None,
             clock_skew_tolerance: 60,
+            allowed_algorithms: vec![Algorithm::ES256],
         };
 
         let provider = Provider::new(config);
         let client = Client::new();
         let cache = cache::Config::Memory.to_backend().unwrap();
 
-        let result1 = fetch_jwks(&provider, &client, &*cache).await;
+        let result1 = fetch_jwks(&provider, &client, cache.as_ref()).await;
         assert!(result1.is_ok());
 
-        let result2 = fetch_jwks(&provider, &client, &*cache).await;
+        let result2 = fetch_jwks(&provider, &client, cache.as_ref()).await;
         assert!(result2.is_ok());
+        assert!(result2.unwrap().from_cache);
     }
 
     #[tokio::test]
@@ -420,15 +583,20 @@ pub mod tests {
             jwks_refresh_interval: 3600,
             required_audience: None,
             clock_skew_tolerance: 60,
+            allowed_algorithms: vec![Algorithm::ES256],
         };
 
         let provider = Provider::new(config);
         let client = Client::new();
         let cache = cache::Config::Memory.to_backend().unwrap();
 
-        let result = fetch_jwks(&provider, &client, &*cache).await;
+        let result = fetch_jwks(&provider, &client, cache.as_ref()).await;
 
         assert!(result.is_err());
+        match result.unwrap_err() {
+            Error::ProviderUnavailable(msg) => assert!(msg.contains("HTTP 500")),
+            err => panic!("Expected ProviderUnavailable error, got {err:?}"),
+        }
     }
 
     #[tokio::test]
@@ -453,13 +621,14 @@ pub mod tests {
             jwks_refresh_interval: 3600,
             required_audience: None,
             clock_skew_tolerance: 60,
+            allowed_algorithms: vec![Algorithm::ES256],
         };
 
         let provider = Provider::new(config);
         let client = Client::new();
         let cache = cache::Config::Memory.to_backend().unwrap();
 
-        let result = fetch_oidc_configuration(&provider, &client, &*cache).await;
+        let result = fetch_oidc_configuration(&provider, &client, cache.as_ref()).await;
 
         assert!(result.is_ok());
         let config = result.unwrap();
@@ -492,16 +661,17 @@ pub mod tests {
             jwks_refresh_interval: 3600,
             required_audience: None,
             clock_skew_tolerance: 60,
+            allowed_algorithms: vec![Algorithm::ES256],
         };
 
         let provider = Provider::new(config);
         let client = Client::new();
         let cache = cache::Config::Memory.to_backend().unwrap();
 
-        let result1 = fetch_oidc_configuration(&provider, &client, &*cache).await;
+        let result1 = fetch_oidc_configuration(&provider, &client, cache.as_ref()).await;
         assert!(result1.is_ok());
 
-        let result2 = fetch_oidc_configuration(&provider, &client, &*cache).await;
+        let result2 = fetch_oidc_configuration(&provider, &client, cache.as_ref()).await;
         assert!(result2.is_ok());
     }
 
@@ -526,13 +696,14 @@ pub mod tests {
             jwks_refresh_interval: 3600,
             required_audience: None,
             clock_skew_tolerance: 60,
+            allowed_algorithms: vec![Algorithm::ES256],
         };
 
         let provider = Provider::new(config);
         let client = Client::new();
         let cache = cache::Config::Memory.to_backend().unwrap();
 
-        let result = fetch_oidc_configuration(&provider, &client, &*cache).await;
+        let result = fetch_oidc_configuration(&provider, &client, cache.as_ref()).await;
 
         assert!(result.is_err());
         match result.unwrap_err() {
@@ -541,6 +712,12 @@ pub mod tests {
             }
             _ => panic!("Expected Unauthorized error"),
         }
+
+        let cached = cache
+            .retrieve::<OpenIdConfiguration>(&oidc_configuration_cache_key(&provider))
+            .await
+            .unwrap();
+        assert!(cached.is_none());
     }
 
     #[tokio::test]
@@ -559,15 +736,51 @@ pub mod tests {
             jwks_refresh_interval: 3600,
             required_audience: None,
             clock_skew_tolerance: 60,
+            allowed_algorithms: vec![Algorithm::ES256],
         };
 
         let provider = Provider::new(config);
         let client = Client::new();
         let cache = cache::Config::Memory.to_backend().unwrap();
 
-        let result = fetch_oidc_configuration(&provider, &client, &*cache).await;
+        let result = fetch_oidc_configuration(&provider, &client, cache.as_ref()).await;
 
         assert!(result.is_err());
+        match result.unwrap_err() {
+            Error::ProviderUnavailable(msg) => assert!(msg.contains("HTTP 404")),
+            err => panic!("Expected ProviderUnavailable error, got {err:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_fetch_jwks_network_error_returns_provider_unavailable() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        drop(listener);
+
+        let config = ProviderConfig {
+            issuer: url.clone(),
+            jwks_uri: Some(format!("{url}/.well-known/jwks")),
+            jwks_refresh_interval: 3600,
+            required_audience: None,
+            clock_skew_tolerance: 60,
+            allowed_algorithms: vec![Algorithm::ES256],
+        };
+
+        let provider = Provider::new(config);
+        let client = Client::builder()
+            .timeout(Duration::from_millis(200))
+            .build()
+            .unwrap();
+        let cache = cache::Config::Memory.to_backend().unwrap();
+
+        let result = fetch_jwks(&provider, &client, cache.as_ref()).await;
+
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            Error::ProviderUnavailable(msg) => assert!(msg.contains("Failed to fetch URL")),
+            err => panic!("Expected ProviderUnavailable error, got {err:?}"),
+        }
     }
 
     #[tokio::test]
@@ -597,13 +810,102 @@ pub mod tests {
         let cache = cache::Config::Memory.to_backend().unwrap();
 
         let result =
-            validate_oidc_token("test-provider", &provider, &token, &client, &*cache).await;
+            validate_oidc_token("test-provider", &provider, &token, &client, cache.as_ref()).await;
 
         assert!(result.is_ok());
         let oidc_claims = result.unwrap();
         assert_eq!(oidc_claims.provider_name, "test-provider");
         assert_eq!(oidc_claims.provider_type, "Generic OIDC");
         assert_eq!(oidc_claims.claims.get("sub").unwrap(), "test-user");
+    }
+
+    #[tokio::test]
+    async fn test_validate_oidc_token_refreshes_jwks_once_when_cached_kid_is_missing() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/.well-known/jwks"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(static_jwks_response()))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let provider = Provider::new(build_test_provider_config(&mock_server.uri()));
+        let client = Client::new();
+        let cache = cache::Config::Memory.to_backend().unwrap();
+        let stale_jwks = Jwks {
+            keys: vec![Jwk::Ec {
+                key_use: Some("sig".to_string()),
+                kid: Some("old-kid".to_string()),
+                alg: Some("ES256".to_string()),
+                x: jwk_x().to_string(),
+                y: jwk_y().to_string(),
+            }],
+        };
+        cache
+            .store(&jwks_cache_key(&provider), &stale_jwks, 3600)
+            .await
+            .unwrap();
+
+        let claims = valid_claims(&mock_server.uri(), "test-audience");
+        let token = make_token(&claims, KID);
+
+        let result =
+            validate_oidc_token("test-provider", &provider, &token, &client, cache.as_ref()).await;
+
+        assert!(
+            result.is_ok(),
+            "expected rotated key to validate, got {result:?}"
+        );
+        let cached_jwks = cache
+            .retrieve::<Jwks>(&jwks_cache_key(&provider))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(cached_jwks.keys.iter().any(|key| key.kid() == Some(KID)));
+    }
+
+    #[tokio::test]
+    async fn test_validate_oidc_token_returns_unauthorized_when_refreshed_jwks_still_misses_kid() {
+        let mock_server = MockServer::start().await;
+        let refreshed_jwks = json!({
+            "keys": [{
+                "kty": "EC",
+                "use": "sig",
+                "kid": "different-kid",
+                "crv": "P-256",
+                "x": jwk_x(),
+                "y": jwk_y(),
+                "alg": "ES256"
+            }]
+        });
+
+        Mock::given(method("GET"))
+            .and(path("/.well-known/jwks"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(refreshed_jwks))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let provider = Provider::new(build_test_provider_config(&mock_server.uri()));
+        let client = Client::new();
+        let cache = cache::Config::Memory.to_backend().unwrap();
+        let stale_jwks = Jwks { keys: Vec::new() };
+        cache
+            .store(&jwks_cache_key(&provider), &stale_jwks, 3600)
+            .await
+            .unwrap();
+
+        let claims = valid_claims(&mock_server.uri(), "test-audience");
+        let token = make_token(&claims, KID);
+
+        let result =
+            validate_oidc_token("test-provider", &provider, &token, &client, cache.as_ref()).await;
+
+        match result.unwrap_err() {
+            Error::Unauthorized(msg) => assert!(msg.contains("No matching key")),
+            err => panic!("expected Unauthorized, got {err:?}"),
+        }
     }
 
     #[tokio::test]
@@ -639,7 +941,7 @@ pub mod tests {
         let cache = cache::Config::Memory.to_backend().unwrap();
 
         let result =
-            validate_oidc_token("test-provider", &provider, &token, &client, &*cache).await;
+            validate_oidc_token("test-provider", &provider, &token, &client, cache.as_ref()).await;
 
         assert!(result.is_err());
         match result.unwrap_err() {
@@ -647,6 +949,42 @@ pub mod tests {
                 assert!(msg.contains("validation failed"));
             }
             _ => panic!("Expected Unauthorized error"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_validate_oidc_token_rejects_disallowed_algorithm_before_jwks_fetch() {
+        let mock_server = MockServer::start().await;
+        let mut claims: HashMap<String, serde_json::Value> = HashMap::new();
+        claims.insert("iss".to_string(), json!(mock_server.uri()));
+        claims.insert("sub".to_string(), json!("test-user"));
+        claims.insert("aud".to_string(), json!("test-audience"));
+        claims.insert(
+            "exp".to_string(),
+            json!((chrono::Utc::now() + chrono::Duration::hours(1)).timestamp()),
+        );
+        claims.insert("iat".to_string(), json!(chrono::Utc::now().timestamp()));
+
+        let token = make_token(&claims, KID);
+        let config = ProviderConfig {
+            issuer: mock_server.uri(),
+            jwks_uri: Some(format!("{}/.well-known/jwks", mock_server.uri())),
+            jwks_refresh_interval: 3600,
+            required_audience: Some("test-audience".to_string()),
+            clock_skew_tolerance: 60,
+            allowed_algorithms: vec![Algorithm::RS256],
+        };
+
+        let provider = Provider::new(config);
+        let client = Client::new();
+        let cache = cache::Config::Memory.to_backend().unwrap();
+
+        let result =
+            validate_oidc_token("test-provider", &provider, &token, &client, cache.as_ref()).await;
+
+        match result.unwrap_err() {
+            Error::Unauthorized(msg) => assert!(msg.contains("algorithm ES256 not allowed")),
+            e => panic!("expected Unauthorized, got {e:?}"),
         }
     }
 
@@ -680,7 +1018,7 @@ pub mod tests {
         let cache = cache::Config::Memory.to_backend().unwrap();
 
         let result =
-            validate_oidc_token("test-provider", &provider, &token, &client, &*cache).await;
+            validate_oidc_token("test-provider", &provider, &token, &client, cache.as_ref()).await;
 
         assert!(result.is_err());
         match result.unwrap_err() {
@@ -718,7 +1056,7 @@ pub mod tests {
         let cache = cache::Config::Memory.to_backend().unwrap();
 
         let result =
-            validate_oidc_token("test-provider", &provider, &token, &client, &*cache).await;
+            validate_oidc_token("test-provider", &provider, &token, &client, cache.as_ref()).await;
 
         assert!(result.is_err());
     }
@@ -750,7 +1088,7 @@ pub mod tests {
         let cache = cache::Config::Memory.to_backend().unwrap();
 
         let result =
-            validate_oidc_token("test-provider", &provider, &token, &client, &*cache).await;
+            validate_oidc_token("test-provider", &provider, &token, &client, cache.as_ref()).await;
 
         assert!(result.is_err());
     }
@@ -785,6 +1123,7 @@ pub mod tests {
             jwks_refresh_interval: 3600,
             required_audience: Some("test-audience".to_string()),
             clock_skew_tolerance: 60,
+            allowed_algorithms: vec![Algorithm::ES256],
         };
 
         let provider = Provider::new(config);
@@ -792,7 +1131,7 @@ pub mod tests {
         let cache = cache::Config::Memory.to_backend().unwrap();
 
         let result =
-            validate_oidc_token("test-provider", &provider, &token, &client, &*cache).await;
+            validate_oidc_token("test-provider", &provider, &token, &client, cache.as_ref()).await;
 
         assert!(result.is_err());
         match result.unwrap_err() {
@@ -830,6 +1169,7 @@ pub mod tests {
             jwks_refresh_interval: 3600,
             required_audience: None,
             clock_skew_tolerance: 60,
+            allowed_algorithms: vec![Algorithm::ES256],
         };
 
         let provider = Provider::new(config);
@@ -837,7 +1177,7 @@ pub mod tests {
         let cache = cache::Config::Memory.to_backend().unwrap();
 
         let result =
-            validate_oidc_token("test-provider", &provider, &token, &client, &*cache).await;
+            validate_oidc_token("test-provider", &provider, &token, &client, cache.as_ref()).await;
 
         assert!(result.is_ok());
     }
@@ -859,6 +1199,7 @@ pub mod tests {
             jwks_refresh_interval: 3600,
             required_audience: None,
             clock_skew_tolerance: 60,
+            allowed_algorithms: vec![Algorithm::ES256],
         };
 
         let provider = Provider::new(config);
@@ -870,7 +1211,7 @@ pub mod tests {
             &provider,
             "not-a-valid-jwt",
             &client,
-            &*cache,
+            cache.as_ref(),
         )
         .await;
 
@@ -933,6 +1274,7 @@ pub mod tests {
                     jwks_refresh_interval: 3600,
                     required_audience: audience.map(str::to_string),
                     clock_skew_tolerance: 0,
+                    allowed_algorithms: vec![Algorithm::ES256],
                 },
                 claim_error: None,
             }
@@ -944,11 +1286,13 @@ pub mod tests {
         }
     }
 
-    impl OidcProvider for TestProvider {
-        fn base(&self) -> &BaseConfig {
+    impl HasBaseConfig for TestProvider {
+        fn base_config(&self) -> &BaseConfig {
             &self.base
         }
+    }
 
+    impl OidcProvider for TestProvider {
         fn name(&self) -> &'static str {
             "Test"
         }
@@ -1008,16 +1352,16 @@ pub mod tests {
         let provider = TestProvider::new(issuer, None);
         let jwks = test_jwks();
 
-        let mut claims = std::collections::HashMap::new();
-        claims.insert("iss".to_string(), serde_json::json!(issuer));
-        claims.insert("sub".to_string(), serde_json::json!("user"));
+        let mut claims = HashMap::new();
+        claims.insert("iss".to_string(), json!(issuer));
+        claims.insert("sub".to_string(), json!("user"));
         claims.insert(
             "exp".to_string(),
-            serde_json::json!((chrono::Utc::now() - chrono::Duration::hours(1)).timestamp()),
+            json!((chrono::Utc::now() - chrono::Duration::hours(1)).timestamp()),
         );
         claims.insert(
             "iat".to_string(),
-            serde_json::json!((chrono::Utc::now() - chrono::Duration::hours(2)).timestamp()),
+            json!((chrono::Utc::now() - chrono::Duration::hours(2)).timestamp()),
         );
 
         let mut header = Header::new(Algorithm::ES256);

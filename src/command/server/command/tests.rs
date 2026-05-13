@@ -5,12 +5,16 @@ use std::{
 
 use tempfile::TempDir;
 
-use super::{Command, ServerContext, ServiceListener, setup};
 use crate::{
     cache,
     command::{
         bootstrap,
-        server::listeners::{insecure::InsecureListener, tls::tests::build_config},
+        server::{
+            Command, ServerContext,
+            command::{ServiceListener, setup},
+            listeners::{insecure::InsecureListener, tls::tests::build_config},
+            server_context::tests::create_test_event,
+        },
     },
     configuration::{self, Configuration, ServerConfig},
     policy::{AccessMode, AccessPolicyConfig, CelRule},
@@ -149,8 +153,8 @@ fn test_build_auth_cache_memory_success() {
     assert!(result.is_ok());
 }
 
-#[test]
-fn test_build_repository_success() {
+#[tokio::test]
+async fn test_build_repository_success() {
     let repo_config = repository::Config {
         access_policy: AccessPolicyConfig {
             default: AccessMode::Allow,
@@ -161,15 +165,15 @@ fn test_build_repository_success() {
     let cache_config = cache::Config::Memory;
     let cache = bootstrap::auth_cache(&cache_config).unwrap();
 
-    let result = bootstrap::repository("test-repo", &repo_config, &cache);
+    let result = bootstrap::repository("test-repo", &repo_config, &cache).await;
 
     assert!(result.is_ok());
     let repo = result.unwrap();
     assert_eq!(repo.name, "test-repo");
 }
 
-#[test]
-fn test_build_repository_with_upstream() {
+#[tokio::test]
+async fn test_build_repository_with_upstream() {
     let repo_config = repository::Config {
         access_policy: AccessPolicyConfig {
             default: AccessMode::Allow,
@@ -189,13 +193,13 @@ fn test_build_repository_with_upstream() {
     let cache_config = cache::Config::Memory;
     let cache = bootstrap::auth_cache(&cache_config).unwrap();
 
-    let result = bootstrap::repository("cached-repo", &repo_config, &cache);
+    let result = bootstrap::repository("cached-repo", &repo_config, &cache).await;
 
     assert!(result.is_ok());
 }
 
-#[test]
-fn test_build_repository_with_immutable_tags() {
+#[tokio::test]
+async fn test_build_repository_with_immutable_tags() {
     let repo_config = repository::Config {
         access_policy: AccessPolicyConfig {
             default: AccessMode::Allow,
@@ -211,26 +215,26 @@ fn test_build_repository_with_immutable_tags() {
     let cache_config = cache::Config::Memory;
     let cache = bootstrap::auth_cache(&cache_config).unwrap();
 
-    let result = bootstrap::repository("immutable-repo", &repo_config, &cache);
+    let result = bootstrap::repository("immutable-repo", &repo_config, &cache).await;
 
     assert!(result.is_ok());
 }
 
-#[test]
-fn test_build_repositories_empty() {
+#[tokio::test]
+async fn test_build_repositories_empty() {
     let configs = HashMap::new();
     let cache_config = cache::Config::Memory;
     let cache = bootstrap::auth_cache(&cache_config).unwrap();
 
-    let result = bootstrap::repositories(&configs, &cache);
+    let result = bootstrap::repositories(&configs, &cache).await;
 
     assert!(result.is_ok());
     let repos = result.unwrap();
     assert_eq!(repos.len(), 0);
 }
 
-#[test]
-fn test_build_repositories_single() {
+#[tokio::test]
+async fn test_build_repositories_single() {
     let repo_config = repository::Config {
         access_policy: AccessPolicyConfig {
             default: AccessMode::Allow,
@@ -244,7 +248,7 @@ fn test_build_repositories_single() {
     let cache_config = cache::Config::Memory;
     let cache = bootstrap::auth_cache(&cache_config).unwrap();
 
-    let result = bootstrap::repositories(&configs, &cache);
+    let result = bootstrap::repositories(&configs, &cache).await;
 
     assert!(result.is_ok());
     let repos = result.unwrap();
@@ -252,8 +256,8 @@ fn test_build_repositories_single() {
     assert!(repos.contains_key("repo1"));
 }
 
-#[test]
-fn test_build_repositories_multiple() {
+#[tokio::test]
+async fn test_build_repositories_multiple() {
     let repo_config = repository::Config {
         access_policy: AccessPolicyConfig {
             default: AccessMode::Allow,
@@ -269,7 +273,7 @@ fn test_build_repositories_multiple() {
     let cache_config = cache::Config::Memory;
     let cache = bootstrap::auth_cache(&cache_config).unwrap();
 
-    let result = bootstrap::repositories(&configs, &cache);
+    let result = bootstrap::repositories(&configs, &cache).await;
 
     assert!(result.is_ok());
     let repos = result.unwrap();
@@ -325,6 +329,44 @@ async fn test_build_registry_with_update_pull_time() {
     let result = setup::build_registry(&config, &Arc::new(Mutex::new(None))).await;
 
     assert!(result.is_ok());
+}
+
+#[tokio::test]
+async fn test_build_registry_preserves_registry_error_details() {
+    let blobs = TempDir::new().unwrap();
+    let meta = TempDir::new().unwrap();
+    let toml = format!(
+        r#"
+        [blob_store.fs]
+        root_dir = "{blobs}"
+
+        [metadata_store.fs]
+        root_dir = "{meta}"
+
+        [cache.memory]
+
+        [server]
+        bind_address = "127.0.0.1"
+        port = 8080
+
+        [global]
+        update_pull_time = false
+        max_concurrent_cache_jobs = 0
+    "#,
+        blobs = blobs.path().display(),
+        meta = meta.path().display(),
+    );
+
+    let config = Configuration::load_from_str(&toml).unwrap();
+    let result = setup::build_registry(&config, &Arc::new(Mutex::new(None))).await;
+
+    let error = result.expect_err("registry build should fail");
+    assert!(
+        error.to_string().contains(
+            "task pool error during operations: failed to initialize task queue: max_concurrent_cache_jobs must be greater than 0"
+        ),
+        "error should preserve registry failure details, got: {error}"
+    );
 }
 
 #[tokio::test]
@@ -387,8 +429,8 @@ async fn test_service_listener_enum_variants() {
     let _service_listener = ServiceListener::Insecure(insecure_listener);
 }
 
-#[test]
-fn test_build_repositories_preserves_names() {
+#[tokio::test]
+async fn test_build_repositories_preserves_names() {
     let repo_config = repository::Config {
         access_policy: AccessPolicyConfig {
             default: AccessMode::Allow,
@@ -403,7 +445,7 @@ fn test_build_repositories_preserves_names() {
 
     let cache_config = cache::Config::Memory;
     let cache = bootstrap::auth_cache(&cache_config).unwrap();
-    let repos = bootstrap::repositories(&configs, &cache).unwrap();
+    let repos = bootstrap::repositories(&configs, &cache).await.unwrap();
 
     assert!(repos.get("alpha").is_some());
     assert!(repos.get("beta").is_some());
@@ -421,9 +463,11 @@ async fn test_build_registry_components_integration() {
         setup::build_metadata_store(&config, &auth_cache, &Arc::new(Mutex::new(None)))
             .await
             .unwrap();
-    let repositories = bootstrap::repositories(&config.repository, &auth_cache).unwrap();
+    let repositories = bootstrap::repositories(&config.repository, &auth_cache)
+        .await
+        .unwrap();
 
-    let registry_config = RegistryConfig::new()
+    let registry_config = RegistryConfig::default()
         .update_pull_time(config.global.update_pull_time)
         .enable_blob_redirect(config.global.resolved_enable_blob_redirect())
         .enable_manifest_redirect(config.global.resolved_enable_manifest_redirect())
@@ -451,8 +495,8 @@ async fn test_command_new_validates_configuration() {
     assert!(result.is_ok());
 }
 
-#[test]
-fn test_build_repositories_with_different_configs() {
+#[tokio::test]
+async fn test_build_repositories_with_different_configs() {
     let repo_config1 = repository::Config {
         access_policy: AccessPolicyConfig {
             default: AccessMode::Allow,
@@ -474,7 +518,7 @@ fn test_build_repositories_with_different_configs() {
 
     let cache_config = cache::Config::Memory;
     let cache = bootstrap::auth_cache(&cache_config).unwrap();
-    let result = bootstrap::repositories(&configs, &cache);
+    let result = bootstrap::repositories(&configs, &cache).await;
 
     assert!(result.is_ok());
     let repos = result.unwrap();
@@ -550,25 +594,6 @@ fn create_config_with_two_webhooks(url_a: &str, url_b: &str) -> (Configuration, 
         meta = meta.path().display(),
     );
     (Configuration::load_from_str(&toml).unwrap(), blobs, meta)
-}
-
-fn create_test_event() -> crate::event_webhook::event::Event {
-    use chrono::Utc;
-    use uuid::Uuid;
-
-    use crate::event_webhook::event::{Event, EventKind};
-
-    Event {
-        id: Uuid::new_v4(),
-        timestamp: Utc::now(),
-        kind: EventKind::ManifestPush,
-        namespace: "test/repo".to_string(),
-        digest: Some("sha256:abc123".to_string()),
-        reference: Some("sha256:abc123".to_string()),
-        tag: None,
-        actor: None,
-        repository: "test-repo".to_string(),
-    }
 }
 
 #[tokio::test]

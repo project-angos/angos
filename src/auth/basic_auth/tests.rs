@@ -13,6 +13,7 @@ use crate::{
         AuthMiddleware, AuthResult, BasicAuthValidator,
         basic_auth::{Config, build_users},
     },
+    command::server::Error,
     identity::ClientIdentity,
 };
 
@@ -70,6 +71,12 @@ fn build_test_parts(username: &str, password: &str) -> Parts {
         .body(())
         .unwrap();
 
+    let (parts, ()) = request.into_parts();
+    parts
+}
+
+fn build_empty_parts() -> Parts {
+    let request = Request::builder().body(()).unwrap();
     let (parts, ()) = request.into_parts();
     parts
 }
@@ -144,12 +151,24 @@ async fn test_authenticate() {
 
     let parts = build_test_parts("user1", "wrong_password");
     let mut identity = ClientIdentity::default();
-    let result = auth.authenticate(&parts, &mut identity).await.unwrap();
-    assert!(matches!(result, AuthResult::NoCredentials));
+    let result = auth.authenticate(&parts, &mut identity).await;
+    assert!(matches!(result, Err(Error::Unauthorized(_))));
 
     let parts = build_test_parts("invalid_user", "password1");
     let mut identity = ClientIdentity::default();
+    let result = auth.authenticate(&parts, &mut identity).await;
+    assert!(matches!(result, Err(Error::Unauthorized(_))));
+}
+
+#[tokio::test]
+async fn test_authenticate_without_authorization_header_returns_no_credentials() {
+    let config = build_test_config();
+    let auth = BasicAuthValidator::new(&config.identity);
+
+    let parts = build_empty_parts();
+    let mut identity = ClientIdentity::default();
     let result = auth.authenticate(&parts, &mut identity).await.unwrap();
+
     assert!(matches!(result, AuthResult::NoCredentials));
 }
 
@@ -169,13 +188,13 @@ password = "not-a-valid-argon2-hash"
 }
 
 #[tokio::test]
-async fn test_empty_identity_map_returns_no_credentials() {
+async fn test_empty_identity_map_rejects_presented_credentials() {
     let auth = BasicAuthValidator::new(&HashMap::new());
 
     let parts = build_test_parts("user1", "password1");
     let mut identity = ClientIdentity::default();
-    let result = auth.authenticate(&parts, &mut identity).await.unwrap();
-    assert!(matches!(result, AuthResult::NoCredentials));
+    let result = auth.authenticate(&parts, &mut identity).await;
+    assert!(matches!(result, Err(Error::Unauthorized(_))));
 }
 
 #[test]

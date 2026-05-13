@@ -2,7 +2,10 @@ use hyper::{Response, StatusCode, header::RANGE, http::request::Parts};
 
 use crate::{
     command::server::{
-        ServerContext, error::Error, handlers::build_response, request_ext::HeaderExt,
+        ServerContext,
+        error::Error,
+        handlers::build_response,
+        request::{accepted_content_types, range},
         response_body::ResponseBody,
     },
     oci::{Digest, Namespace},
@@ -71,8 +74,8 @@ pub async fn dispatch_get_blob(
     namespace: &Namespace,
     digest: Digest,
 ) -> Result<Response<ResponseBody>, Error> {
-    let mime_types = parts.accepted_content_types();
-    let range = parts.range(RANGE)?;
+    let mime_types = accepted_content_types(&parts.headers);
+    let range = range(&parts.headers, RANGE)?;
 
     handle_get_blob(context, namespace, &digest, &mime_types, range).await
 }
@@ -83,7 +86,7 @@ pub async fn dispatch_head_blob(
     namespace: &Namespace,
     digest: Digest,
 ) -> Result<Response<ResponseBody>, Error> {
-    let mime_types = parts.accepted_content_types();
+    let mime_types = accepted_content_types(&parts.headers);
 
     handle_head_blob(context, namespace, &digest, &mime_types).await
 }

@@ -1,7 +1,6 @@
 use hyper::StatusCode;
 
-use super::*;
-use crate::registry;
+use crate::{command::server::Error, event_webhook, registry};
 
 #[test]
 fn test_error_display() {
@@ -28,6 +27,12 @@ fn test_error_display() {
 
     let error = Error::NotFound("Item not found".to_string());
     assert_eq!(format!("{error}"), "Not Found: Item not found");
+
+    let error = Error::ProviderUnavailable("OIDC provider unavailable".to_string());
+    assert_eq!(
+        format!("{error}"),
+        "Provider unavailable: OIDC provider unavailable"
+    );
 
     let error = Error::Internal("Unexpected error".to_string());
     assert_eq!(
@@ -96,18 +101,23 @@ fn test_as_json_all_error_types() {
             "not found",
         ),
         (
+            Error::ProviderUnavailable("provider unavailable".to_string()),
+            "PROVIDER_UNAVAILABLE",
+            "provider unavailable",
+        ),
+        (
             Error::Initialization("init".to_string()),
-            "INTERNAL_SERVER_ERROR",
+            "INTERNAL_ERROR",
             "init",
         ),
         (
             Error::Execution("exec".to_string()),
-            "INTERNAL_SERVER_ERROR",
+            "INTERNAL_ERROR",
             "exec",
         ),
         (
             Error::Internal("internal".to_string()),
-            "INTERNAL_SERVER_ERROR",
+            "INTERNAL_ERROR",
             "internal",
         ),
     ];
@@ -224,13 +234,13 @@ fn test_registry_error_to_server_error_mapping() {
         (
             registry::Error::Internal("Database error".to_string()),
             StatusCode::INTERNAL_SERVER_ERROR,
-            "INTERNAL_SERVER_ERROR",
+            "INTERNAL_ERROR",
             Some("Database error"),
         ),
         (
             registry::Error::Initialization("Config error".to_string()),
             StatusCode::INTERNAL_SERVER_ERROR,
-            "INTERNAL_SERVER_ERROR",
+            "INTERNAL_ERROR",
             Some("Config error"),
         ),
     ];
@@ -247,7 +257,7 @@ fn test_registry_error_to_server_error_mapping() {
 }
 
 /// Variants outside the OCI-spec set route through the wildcard arm to a
-/// generic 500 `INTERNAL_SERVER_ERROR` carrying the rendered Display text.
+/// generic 500 `INTERNAL_ERROR` carrying the rendered Display text.
 /// Pins this contract so a regression that broke `error.to_string()`
 /// formatting (or accidentally rerouted typed variants) would fail.
 #[test]
@@ -273,7 +283,7 @@ fn test_typed_registry_variants_route_to_internal_server_error() {
             StatusCode::INTERNAL_SERVER_ERROR
         );
         let json = server_error.as_json(None);
-        assert_eq!(json["errors"][0]["code"], "INTERNAL_SERVER_ERROR");
+        assert_eq!(json["errors"][0]["code"], "INTERNAL_ERROR");
         let message = json["errors"][0]["message"]
             .as_str()
             .expect("message must be a string");
@@ -314,6 +324,10 @@ fn test_status_code_coverage() {
         ),
         (StatusCode::NOT_FOUND, Error::NotFound(String::new())),
         (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Error::ProviderUnavailable(String::new()),
+        ),
+        (
             StatusCode::INTERNAL_SERVER_ERROR,
             Error::Initialization(String::new()),
         ),
@@ -341,4 +355,42 @@ fn test_from_configuration_error_initialization() {
 
     assert!(matches!(error, Error::Internal(_)));
     assert_eq!(error.to_string(), "Internal Server Error: webhook failed");
+}
+
+#[test]
+fn test_from_event_webhook_error_mapping() {
+    let init_error = event_webhook::Error::Initialization("bad webhook config".to_string());
+    let error: Error = init_error.into();
+    assert!(matches!(error, Error::Initialization(_)));
+    assert_eq!(error.to_string(), "bad webhook config");
+
+    let dispatch_error = event_webhook::Error::Dispatch("webhook failed".to_string());
+    let error: Error = dispatch_error.into();
+    assert!(matches!(error, Error::Execution(_)));
+    assert_eq!(error.to_string(), "webhook failed");
+}
+
+#[test]
+fn test_opaque_errors_with_same_display_are_not_equal() {
+    let http_left = Error::HttpBuild(
+        hyper::http::Response::builder()
+            .status(1000)
+            .body(())
+            .unwrap_err(),
+    );
+    let http_right = Error::HttpBuild(
+        hyper::http::Response::builder()
+            .status(1000)
+            .body(())
+            .unwrap_err(),
+    );
+    assert_eq!(http_left.to_string(), http_right.to_string());
+    assert_ne!(http_left, http_right);
+
+    let json_left =
+        Error::Serialization(serde_json::from_str::<serde_json::Value>("}").unwrap_err());
+    let json_right =
+        Error::Serialization(serde_json::from_str::<serde_json::Value>("}").unwrap_err());
+    assert_eq!(json_left.to_string(), json_right.to_string());
+    assert_ne!(json_left, json_right);
 }

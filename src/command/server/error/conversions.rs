@@ -1,7 +1,7 @@
 use hyper::StatusCode;
 
 use super::Error;
-use crate::{command::bootstrap, configuration, registry};
+use crate::{command::bootstrap, configuration, event_webhook, registry};
 
 fn oci_error(status_code: StatusCode, code: &'static str, msg: Option<String>) -> Error {
     Error::Custom {
@@ -45,12 +45,12 @@ impl From<registry::Error> for Error {
             }
             registry::Error::Internal(msg) => oci_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                "INTERNAL_SERVER_ERROR",
+                "INTERNAL_ERROR",
                 Some(msg),
             ),
             _ => oci_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                "INTERNAL_SERVER_ERROR",
+                "INTERNAL_ERROR",
                 Some(error.to_string()),
             ),
         }
@@ -82,6 +82,15 @@ impl From<configuration::Error> for Error {
             configuration::Error::Initialization(msg)
             | configuration::Error::InvalidFormat(msg)
             | configuration::Error::NotReadable(msg) => Error::Internal(msg),
+        }
+    }
+}
+
+impl From<event_webhook::Error> for Error {
+    fn from(error: event_webhook::Error) -> Self {
+        match error {
+            event_webhook::Error::Initialization(msg) => Error::Initialization(msg),
+            event_webhook::Error::Dispatch(msg) => Error::Execution(msg),
         }
     }
 }

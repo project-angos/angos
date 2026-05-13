@@ -212,6 +212,7 @@ The following conditions are validated at configuration load time:
 
 - `url` must be a valid URI
 - `events` must contain at least one event type
+- `token`, when set, must not be empty
 - `repository_filter` patterns must be valid regex
 - Webhook names referenced in `global.event_webhooks` and `repository.*.event_webhooks` must exist in `[event_webhook.*]`
 
@@ -234,4 +235,7 @@ Changes that do **not** require restart:
 On shutdown, the dispatcher:
 1. Stops accepting new async deliveries
 2. Waits for in-flight async deliveries to complete (with timeout)
-3. Logs any deliveries that did not complete within the timeout
+3. Aborts and logs any deliveries that did not complete within the timeout
+
+The timeout is a shutdown deadline, not a delivery guarantee. Async deliveries
+that exceed it are abandoned so shutdown can continue promptly.

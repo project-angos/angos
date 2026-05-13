@@ -1,4 +1,4 @@
-use std::sync::{OnceLock, atomic::AtomicU64};
+use std::sync::OnceLock;
 
 use prometheus::{
     Encoder, HistogramVec, IntCounterVec, IntGauge, Registry as PrometheusRegistry, TextEncoder,
@@ -8,8 +8,6 @@ use prometheus::{
 use tracing::error;
 
 use crate::registry::{Error, metadata_store::lock::metrics::LockMetrics};
-
-pub static IN_FLIGHT_REQUESTS: AtomicU64 = AtomicU64::new(0);
 
 static METRICS: OnceLock<MetricsProvider> = OnceLock::new();
 
@@ -40,23 +38,14 @@ pub struct InFlightGuard;
 
 impl InFlightGuard {
     pub fn new() -> Self {
-        IN_FLIGHT_REQUESTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        Self::update_gauge();
+        metrics_provider().metric_http_request_in_flight.inc();
         Self
-    }
-
-    fn update_gauge() {
-        metrics_provider().metric_http_request_in_flight.set(
-            i64::try_from(IN_FLIGHT_REQUESTS.load(std::sync::atomic::Ordering::Relaxed))
-                .unwrap_or(i64::MAX),
-        );
     }
 }
 
 impl Drop for InFlightGuard {
     fn drop(&mut self) {
-        IN_FLIGHT_REQUESTS.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-        Self::update_gauge();
+        metrics_provider().metric_http_request_in_flight.dec();
     }
 }
 
@@ -169,14 +158,14 @@ pub(crate) fn init_for_tests() {
 #[cfg(test)]
 mod tests {
     use std::{
-        sync::{Mutex, PoisonError, atomic::Ordering::Relaxed},
+        sync::{Mutex, PoisonError},
         thread,
     };
 
     use super::*;
 
-    // Serializes all tests that touch IN_FLIGHT_REQUESTS so they cannot observe
-    // each other's intermediate atomic values.
+    // Serializes all tests that touch the in-flight gauge so they cannot observe
+    // each other's intermediate values.
     static IN_FLIGHT_TEST_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
@@ -240,55 +229,35 @@ mod tests {
             .unwrap_or_else(PoisonError::into_inner);
         init_for_tests();
 
-        let baseline = IN_FLIGHT_REQUESTS.load(Relaxed);
-        let expected_gauge_baseline = i64::try_from(baseline).unwrap_or(i64::MAX);
+        let gauge = &metrics_provider().metric_http_request_in_flight;
+        let baseline = gauge.get();
 
         let outer = InFlightGuard::new();
         assert_eq!(
-            IN_FLIGHT_REQUESTS.load(Relaxed),
+            gauge.get(),
             baseline + 1,
-            "atomic must be baseline+1 after outer guard created"
-        );
-        assert_eq!(
-            metrics_provider().metric_http_request_in_flight.get(),
-            expected_gauge_baseline + 1,
-            "gauge must track atomic after outer guard created"
+            "gauge must be baseline+1 after outer guard created"
         );
 
         let inner = InFlightGuard::new();
         assert_eq!(
-            IN_FLIGHT_REQUESTS.load(Relaxed),
+            gauge.get(),
             baseline + 2,
-            "atomic must be baseline+2 after inner guard created"
-        );
-        assert_eq!(
-            metrics_provider().metric_http_request_in_flight.get(),
-            expected_gauge_baseline + 2,
-            "gauge must track atomic after inner guard created"
+            "gauge must be baseline+2 after inner guard created"
         );
 
         drop(inner);
         assert_eq!(
-            IN_FLIGHT_REQUESTS.load(Relaxed),
+            gauge.get(),
             baseline + 1,
-            "atomic must return to baseline+1 after inner guard dropped"
-        );
-        assert_eq!(
-            metrics_provider().metric_http_request_in_flight.get(),
-            expected_gauge_baseline + 1,
-            "gauge must track atomic after inner guard dropped"
+            "gauge must return to baseline+1 after inner guard dropped"
         );
 
         drop(outer);
         assert_eq!(
-            IN_FLIGHT_REQUESTS.load(Relaxed),
+            gauge.get(),
             baseline,
-            "atomic must return to baseline after outer guard dropped"
-        );
-        assert_eq!(
-            metrics_provider().metric_http_request_in_flight.get(),
-            expected_gauge_baseline,
-            "gauge must track atomic after outer guard dropped"
+            "gauge must return to baseline after outer guard dropped"
         );
     }
 
@@ -302,7 +271,7 @@ mod tests {
             .unwrap_or_else(PoisonError::into_inner);
         init_for_tests();
 
-        let baseline = IN_FLIGHT_REQUESTS.load(Relaxed);
+        let baseline = metrics_provider().metric_http_request_in_flight.get();
 
         let handles: Vec<_> = (0..THREADS)
             .map(|_| {
@@ -319,50 +288,10 @@ mod tests {
         }
 
         assert_eq!(
-            IN_FLIGHT_REQUESTS.load(Relaxed),
+            metrics_provider().metric_http_request_in_flight.get(),
             baseline,
-            "atomic must return to baseline after all guards are dropped"
+            "gauge must return to baseline after all guards are dropped"
         );
-        assert_eq!(
-            metrics_provider().metric_http_request_in_flight.get(),
-            i64::try_from(baseline).unwrap_or(i64::MAX),
-            "gauge must equal baseline after all guards are dropped"
-        );
-    }
-
-    #[test]
-    fn in_flight_gauge_saturates_on_u64_overflow() {
-        let _lock = IN_FLIGHT_TEST_LOCK
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        init_for_tests();
-
-        let original = IN_FLIGHT_REQUESTS.load(Relaxed);
-
-        // Place the counter one below wrapping so that fetch_add in InFlightGuard::new
-        // produces u64::MAX, which cannot be represented as i64.
-        IN_FLIGHT_REQUESTS.store(u64::MAX - 1, Relaxed);
-
-        let guard = InFlightGuard::new();
-        // The atomic is now u64::MAX; update_gauge must saturate to i64::MAX.
-        assert_eq!(
-            metrics_provider().metric_http_request_in_flight.get(),
-            i64::MAX,
-            "gauge must saturate to i64::MAX when atomic holds u64::MAX"
-        );
-
-        drop(guard);
-        // After drop, fetch_sub brings the atomic back to u64::MAX - 1, which still
-        // exceeds i64::MAX, so the gauge must remain saturated.
-        assert_eq!(
-            metrics_provider().metric_http_request_in_flight.get(),
-            i64::MAX,
-            "gauge must remain i64::MAX after drop when atomic still exceeds i64::MAX"
-        );
-
-        // Restore so subsequent tests see a clean counter.
-        IN_FLIGHT_REQUESTS.store(original, Relaxed);
-        InFlightGuard::update_gauge();
     }
 
     #[test]

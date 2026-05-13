@@ -72,6 +72,7 @@ mod tests {
     use super::*;
     use crate::{
         command::scrub::executor::Executor,
+        oci::Namespace,
         registry::{
             metadata_store::MetadataStoreExt,
             test_utils::{self, NoopMultipart, backends},
@@ -81,7 +82,7 @@ mod tests {
     #[tokio::test]
     async fn test_scrub_tags_creates_missing_digest_links() {
         for test_case in backends() {
-            let namespace = "test-repo/app";
+            let namespace = &Namespace::new("test-repo/app").unwrap();
             let tag_name = "v1.0.0";
             let registry = test_case.registry();
             let metadata_store = test_case.metadata_store();
@@ -113,13 +114,14 @@ mod tests {
                 "Digest link should be created if missing"
             );
             assert_eq!(digest_link.unwrap().target, blob_digest);
+            test_case.cleanup().await;
         }
     }
 
     #[tokio::test]
     async fn test_scrub_tags_creates_digest_links() {
         for test_case in backends() {
-            let namespace = "test-repo/app";
+            let namespace = &Namespace::new("test-repo/app").unwrap();
             let registry = test_case.registry();
             let metadata_store = test_case.metadata_store();
             let blob_store = test_case.blob_store();
@@ -151,6 +153,7 @@ mod tests {
                 digest_link.is_ok(),
                 "scrub_tags should create missing digest links"
             );
+            test_case.cleanup().await;
         }
     }
 }

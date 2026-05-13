@@ -25,12 +25,14 @@ TLS certificate files are also automatically reloaded when they change.
 
 ## Server (`server`)
 
-| Option                       | Type   | Default  | Description                                        |
-|------------------------------|--------|----------|----------------------------------------------------|
-| `bind_address`               | string | required | Address to bind (e.g., `"0.0.0.0"`, `"127.0.0.1"`) |
-| `port`                       | u16    | `8000`   | Port number                                        |
-| `query_timeout`              | u64    | `3600`   | Query timeout in seconds                           |
-| `query_timeout_grace_period` | u64    | `60`     | Grace period for queries in seconds                |
+| Option                            | Type         | Default  | Description                                        |
+|-----------------------------------|--------------|----------|----------------------------------------------------|
+| `bind_address`                    | string       | required | Address to bind (e.g., `"0.0.0.0"`, `"127.0.0.1"`) |
+| `port`                            | u16          | `8000`   | Port number                                        |
+| `query_timeout_secs`              | non-zero u64 | `3600`   | Query timeout in seconds                           |
+| `query_timeout_grace_period_secs` | non-zero u64 | `60`     | Grace period for queries in seconds                |
+
+Timeout values must be greater than zero. The older unsuffixed names are still accepted for compatibility, but new configuration should use the `_secs` names.
 
 ### TLS (`server.tls`)
 
@@ -49,7 +51,7 @@ When omitted, the server runs without TLS (insecure).
 | Option                      | Type     | Default  | Description                                 |
 |-----------------------------|----------|----------|---------------------------------------------|
 | `max_concurrent_requests`   | usize    | `64`     | Tokio worker threads (see Performance Tuning) |
-| `max_concurrent_cache_jobs` | usize    | `4`      | Maximum concurrent cache jobs               |
+| `max_concurrent_cache_jobs` | usize    | `4`      | Maximum concurrent cache jobs (minimum `1`) |
 | `update_pull_time`          | bool     | `false`  | Track pull times for retention policies     |
 | `enable_redirect`           | bool     | —        | **Deprecated.** Fallback for both fields below when unset. |
 | `enable_blob_redirect`      | bool     | `true`   | Allow HTTP 307 redirects for blob downloads. |
@@ -109,8 +111,8 @@ Choose one: `blob_store.fs` or `blob_store.s3`.
 | `region`                         | string | required  | AWS region                         |
 | `key_prefix`                     | string | -         | Prefix for S3 keys                 |
 | `multipart_part_size`            | string | `"50MiB"` | Minimum multipart part size        |
-| `multipart_copy_threshold`       | string | `"5GB"`   | Threshold for multipart copy       |
-| `multipart_copy_chunk_size`      | string | `"100MB"` | Chunk size for multipart copy      |
+| `multipart_copy_threshold`       | string | `"5GB"`   | Blob size above which S3 upload completion uses multipart copy |
+| `multipart_copy_chunk_size`      | string | `"100MB"` | Server-side part size for multipart copy |
 | `multipart_copy_jobs`            | usize  | `4`       | Max concurrent multipart copy jobs |
 | `multipart_uniform_parts`        | bool   | `false`   | Use uniform multipart upload mode  |
 | `max_attempts`                   | u32    | `3`       | Retry attempts for S3 operations   |
@@ -131,7 +133,7 @@ Memory usage per upload: ~8 KiB during each `PATCH` (a single streaming read fra
 
 A long-lived S3 multipart upload is maintained across all `PATCH` requests. Each committed part is exactly `multipart_part_size` bytes (except the last). The S3 protocol only requires non-final parts to be ≥ 5 MiB; uniform sizing is an additional constraint imposed by some S3 storage providers. Use this mode only if your provider rejects uploads with variable part sizes.
 
-Memory usage per upload: up to `multipart_part_size` (default 50 MiB) per active upload, as each part is buffered in memory before being sent to S3.
+Memory usage per upload: streaming read frames for full parts, plus at most one trailing staged chunk smaller than `multipart_part_size`.
 
 ```toml
 # Most S3 providers (AWS S3, MinIO, Exoscale, etc.)
@@ -329,17 +331,21 @@ Password hashes are validated when the configuration is parsed. An invalid Argon
 | `jwks_refresh_interval` | u64    | `3600`                                                           | JWKS refresh interval (seconds) |
 | `required_audience`     | string | -                                                                | Required audience claim         |
 | `clock_skew_tolerance`  | u64    | `60`                                                             | Clock skew tolerance (seconds)  |
+| `allowed_algorithms`    | array  | `["RS256"]`                                                       | Allowed JWT signing algorithms  |
 
 #### Generic Provider
 
-| Option                  | Type   | Default  | Description                                  |
-|-------------------------|--------|----------|----------------------------------------------|
-| `provider`              | string | required | Must be `"generic"`                          |
-| `issuer`                | string | required | OIDC issuer URL                              |
-| `jwks_uri`              | string | -        | Custom JWKS URI (auto-discovered if not set) |
-| `jwks_refresh_interval` | u64    | `3600`   | JWKS refresh interval (seconds)              |
-| `required_audience`     | string | -        | Required audience claim                      |
-| `clock_skew_tolerance`  | u64    | `60`     | Clock skew tolerance (seconds)               |
+| Option                  | Type   | Default    | Description                                  |
+|-------------------------|--------|------------|----------------------------------------------|
+| `provider`              | string | required   | Must be `"generic"`                          |
+| `issuer`                | string | required   | OIDC issuer URL                              |
+| `jwks_uri`              | string | -          | Custom JWKS URI (auto-discovered if not set) |
+| `jwks_refresh_interval` | u64    | `3600`     | JWKS refresh interval (seconds)              |
+| `required_audience`     | string | -          | Required audience claim                      |
+| `clock_skew_tolerance`  | u64    | `60`       | Clock skew tolerance (seconds)               |
+| `allowed_algorithms`    | array  | `["RS256"]` | Allowed JWT signing algorithms              |
+
+`allowed_algorithms` accepts JWT algorithm names such as `"RS256"`, `"RS384"`, `"RS512"`, `"ES256"`, and `"ES384"`. Angos rejects tokens whose header claims an algorithm outside the provider allowlist before signature verification to prevent algorithm-confusion attacks.
 
 ### Webhooks (`auth.webhook.<name>`)
 
@@ -355,6 +361,10 @@ Password hashes are validated when the configuration is parsed. An invalid Argon
 | `server_ca_bundle`          | string   | -        | CA bundle for server verification      |
 | `forward_headers`           | [string] | `[]`     | Headers to forward from client         |
 | `cache_ttl`                 | u64      | `60`     | Response cache duration (0 to disable) |
+
+`url` and `forward_headers` are validated when the configuration is loaded.
+If either `client_certificate_bundle` or `client_private_key` is set, both
+must be set.
 
 ---
 
@@ -404,6 +414,9 @@ HTTP POST notifications for registry operations. See [Event Webhooks Reference](
 | `timeout_ms`        | u64      | `5000`   | HTTP request timeout in milliseconds             |
 | `max_retries`       | u32      | `0`      | Maximum retry attempts after initial failure     |
 | `repository_filter` | [string] | -        | Regex patterns to match repository names         |
+
+`url`, `events`, `token`, and `repository_filter` are validated when the
+configuration is loaded. If `token` is set, it must not be empty.
 
 Webhooks are enabled by referencing their names:
 

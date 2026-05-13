@@ -63,8 +63,9 @@ pub enum Error {
     Serialization(#[from] SerializationError),
 }
 
-// `policy::Error` does not implement `std::error::Error`, so `#[from]` cannot
-// be used here. Routes to `Initialization` to preserve the prior behaviour.
+// `policy::Error` routes to `Initialization` to preserve the prior behaviour.
+// A `#[from]` variant is not used here because the mapping is semantic, not
+// structural: all policy errors collapse into the string-carrying `Initialization`.
 impl From<policy::Error> for Error {
     fn from(error: policy::Error) -> Self {
         Error::Initialization(error.to_string())

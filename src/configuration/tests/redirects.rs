@@ -1,4 +1,7 @@
-use super::super::*;
+use crate::{
+    configuration::{Configuration, GlobalConfig},
+    test_fixtures::configuration::{MINIMAL_CONFIG_TOML, config_toml},
+};
 
 #[test]
 fn test_redirect_resolver_only_enable_redirect_true() {
@@ -51,12 +54,7 @@ fn test_redirect_resolver_nothing_set_defaults_true() {
 
 #[test]
 fn deprecated_fields_empty_when_no_deprecated_config() {
-    let config = r#"
-    [server]
-    bind_address = "0.0.0.0"
-    "#;
-
-    let config = Configuration::load_from_str(config).unwrap();
+    let config = Configuration::load_from_str(MINIMAL_CONFIG_TOML).unwrap();
     assert!(
         config.deprecated_fields().is_empty(),
         "No deprecated fields should be reported for a clean config"
@@ -65,31 +63,27 @@ fn deprecated_fields_empty_when_no_deprecated_config() {
 
 #[test]
 fn deprecated_fields_contains_enable_redirect_when_set() {
-    let config = r#"
-    [server]
-    bind_address = "0.0.0.0"
+    let config = config_toml(
+        r"
+        enable_redirect = true
+        ",
+    );
 
-    [global]
-    enable_redirect = true
-    "#;
-
-    let config = Configuration::load_from_str(config).unwrap();
+    let config = Configuration::load_from_str(&config).unwrap();
     let fields = config.deprecated_fields();
     assert_eq!(fields, vec!["global.enable_redirect"]);
 }
 
 #[test]
 fn deprecated_fields_not_present_when_new_redirect_fields_used() {
-    let config = r#"
-    [server]
-    bind_address = "0.0.0.0"
+    let config = config_toml(
+        r"
+        enable_blob_redirect = true
+        enable_manifest_redirect = false
+        ",
+    );
 
-    [global]
-    enable_blob_redirect = true
-    enable_manifest_redirect = false
-    "#;
-
-    let config = Configuration::load_from_str(config).unwrap();
+    let config = Configuration::load_from_str(&config).unwrap();
     assert!(
         config.deprecated_fields().is_empty(),
         "New redirect fields must not trigger the deprecation warning"

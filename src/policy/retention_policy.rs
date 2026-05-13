@@ -171,9 +171,7 @@ impl RetentionPolicy {
     ) -> Result<Context<'a>, Error> {
         let mut context = Context::default();
 
-        context
-            .add_variable("image", manifest)
-            .map_err(|e| Error::Evaluation(e.to_string()))?;
+        context.add_variable("image", manifest)?;
 
         let clock_for_now = self.clock.clone();
         context.add_function("now", move || clock_for_now.now().timestamp());

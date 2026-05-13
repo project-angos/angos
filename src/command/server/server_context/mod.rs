@@ -36,10 +36,8 @@ impl ServerContext {
         let event_dispatcher = if config.event_webhook.is_empty() {
             None
         } else {
-            Some(Arc::new(
-                EventDispatcher::new(config.event_webhook.clone())
-                    .map_err(|e| Error::Initialization(e.to_string()))?,
-            ))
+            let dispatcher = EventDispatcher::new(config.event_webhook.clone())?;
+            Some(Arc::new(dispatcher))
         };
 
         Ok(Self {
@@ -87,10 +85,13 @@ impl ServerContext {
 
     pub fn is_reference_immutable(&self, namespace: &Namespace, reference: &Reference) -> bool {
         match reference {
-            Reference::Tag(tag) => {
-                self.authorizer
-                    .is_tag_immutable(&self.registry, namespace, tag.as_str())
-            }
+            Reference::Tag(tag) => !self.authorizer.is_tag_mutable(
+                self.registry
+                    .get_repository_for_namespace(namespace)
+                    .ok()
+                    .map(|repository| repository.name.as_str()),
+                tag.as_str(),
+            ),
             Reference::Digest(_) => false,
         }
     }
@@ -98,6 +99,13 @@ impl ServerContext {
     pub async fn dispatch_event(&self, event: &Event) -> Result<(), Error> {
         if let Some(dispatcher) = &self.event_dispatcher {
             dispatcher.dispatch(event).await?;
+        }
+        Ok(())
+    }
+
+    pub async fn dispatch_events(&self, events: &[Event]) -> Result<(), Error> {
+        for event in events {
+            self.dispatch_event(event).await?;
         }
         Ok(())
     }

@@ -58,18 +58,6 @@ fn paginated_json_headers(link: Option<&str>) -> HashMap<&'static str, String> {
 }
 
 impl Registry {
-    pub(crate) async fn list_referrers(
-        &self,
-        namespace: &Namespace,
-        digest: &Digest,
-        artifact_type: Option<String>,
-    ) -> Result<Vec<Descriptor>, Error> {
-        Ok(self
-            .metadata_store
-            .list_referrers(namespace, digest, artifact_type)
-            .await?)
-    }
-
     pub(crate) async fn list_catalog_entries(
         &self,
         n: Option<u16>,
@@ -107,6 +95,7 @@ impl Registry {
     ) -> Result<JsonResponse, Error> {
         let filtered = artifact_type.is_some();
         let manifests = self
+            .metadata_store
             .list_referrers(namespace, digest, artifact_type)
             .await?;
         let referrer_list = ReferrerList {
@@ -164,36 +153,6 @@ mod tests {
     };
 
     #[tokio::test]
-    async fn test_list_referrers() {
-        for test_case in backends() {
-            let registry = test_case.registry();
-            let namespace = &Namespace::new("test-repo").unwrap();
-            let digest = "sha256:1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef"
-                .parse()
-                .unwrap();
-
-            let test_content = b"test content";
-            let test_digest = registry.blob_store.create(test_content).await.unwrap();
-            let tag_link = LinkKind::Tag("latest".to_string());
-            let mut tx = registry.metadata_store.begin_transaction(namespace);
-            tx.create_link(&tag_link, &test_digest).add();
-            tx.commit().await.unwrap();
-
-            let referrers = registry
-                .list_referrers(namespace, &digest, None)
-                .await
-                .unwrap();
-            assert!(referrers.is_empty());
-
-            let referrers = registry
-                .list_referrers(namespace, &digest, Some("test-type".to_string()))
-                .await
-                .unwrap();
-            assert!(referrers.is_empty());
-        }
-    }
-
-    #[tokio::test]
     async fn test_list_catalog_entries() {
         for test_case in backends() {
             let registry = test_case.registry();
@@ -212,6 +171,7 @@ mod tests {
                 .unwrap();
             assert!(namespaces.is_empty());
             assert!(token.is_none());
+            test_case.cleanup().await;
         }
     }
 
@@ -288,6 +248,7 @@ mod tests {
                 .unwrap();
             assert_eq!(tags.len(), 2);
             assert!(token.is_none());
+            test_case.cleanup().await;
         }
     }
 
@@ -314,7 +275,7 @@ mod tests {
         let digest = registry.blob_store.create(blob_content).await.unwrap();
 
         for ns_str in &namespaces {
-            let ns = Namespace::new(*ns_str).unwrap();
+            let ns = Namespace::new(ns_str).unwrap();
             let mut tx = registry.metadata_store.begin_transaction(&ns);
             tx.create_link(&LinkKind::Tag("latest".to_string()), &digest)
                 .add();
@@ -414,12 +375,14 @@ mod tests {
             tx.commit().await.unwrap();
 
             let referrers = registry
+                .metadata_store
                 .list_referrers(namespace, &base_manifest_digest, None)
                 .await
                 .unwrap();
 
             assert_eq!(referrers.len(), 1);
             assert_eq!(referrers[0].digest, referrer_manifest_digest);
+            test_case.cleanup().await;
         }
     }
 }

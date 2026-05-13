@@ -78,10 +78,6 @@ impl Default for RegistryConfig {
 }
 
 impl RegistryConfig {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
     pub fn update_pull_time(mut self, enabled: bool) -> Self {
         self.update_pull_time = enabled;
         self
@@ -160,7 +156,7 @@ impl Registry {
             presigned_blob_store,
             metadata_store,
             repositories,
-            task_queue: TaskQueue::new(config.concurrent_cache_jobs, "cache-worker")?,
+            task_queue: TaskQueue::new(config.concurrent_cache_jobs)?,
             global_immutable_tags: config.global_immutable_tags,
             global_immutable_tags_exclusions: config.global_immutable_tags_exclusions,
         };

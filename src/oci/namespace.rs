@@ -19,10 +19,9 @@ static NAMESPACE_RE: LazyLock<Regex> = LazyLock::new(|| {
 pub struct Namespace(String);
 
 impl Namespace {
-    pub fn new(s: impl Into<String>) -> Result<Self, Error> {
-        let s = s.into();
-        if NAMESPACE_RE.is_match(&s) {
-            Ok(Self(s))
+    pub fn new(s: &str) -> Result<Self, Error> {
+        if NAMESPACE_RE.is_match(s) {
+            Ok(Self(s.to_owned()))
         } else {
             Err(Error::InvalidNamespace(format!(
                 "Invalid namespace format: '{s}'"
@@ -43,7 +42,13 @@ impl TryFrom<String> for Namespace {
     type Error = Error;
 
     fn try_from(s: String) -> Result<Self, Self::Error> {
-        Self::new(s)
+        if NAMESPACE_RE.is_match(&s) {
+            Ok(Self(s))
+        } else {
+            Err(Error::InvalidNamespace(format!(
+                "Invalid namespace format: '{s}'"
+            )))
+        }
     }
 }
 
@@ -90,7 +95,7 @@ impl<'de> Deserialize<'de> for Namespace {
         D: serde::Deserializer<'de>,
     {
         let s = String::deserialize(deserializer)?;
-        Self::new(s).map_err(serde::de::Error::custom)
+        Self::try_from(s).map_err(serde::de::Error::custom)
     }
 }
 
@@ -131,7 +136,10 @@ impl Borrow<str> for Namespace {
 /// The `/` separator check is intentional: without it, `"myrepo2"` would
 /// spuriously match `"myrepo"` via `starts_with`.
 pub fn namespace_belongs_to(namespace: &str, repository_name: &str) -> bool {
-    namespace == repository_name || namespace.starts_with(&format!("{repository_name}/"))
+    namespace == repository_name
+        || namespace
+            .strip_prefix(repository_name)
+            .is_some_and(|rest| rest.starts_with('/'))
 }
 
 #[cfg(test)]
@@ -268,7 +276,7 @@ mod tests {
     #[test]
     fn test_valid_long_namespace() {
         let long = "a".repeat(10_000);
-        assert!(Namespace::new(long).is_ok());
+        assert!(Namespace::new(&long).is_ok());
     }
 
     #[test]
@@ -358,5 +366,12 @@ mod tests {
     fn test_namespace_belongs_to_distinct_namespace() {
         assert!(!namespace_belongs_to("other", "myrepo"));
         assert!(!namespace_belongs_to("other/sub", "myrepo"));
+    }
+
+    #[test]
+    fn test_namespace_belongs_to_no_trailing_slash_without_sub() {
+        assert!(!namespace_belongs_to("myrepo", "myrepo/"));
+        assert!(!namespace_belongs_to("myrepo2", "myrepo"));
+        assert!(!namespace_belongs_to("myrepo", "myrepo2"));
     }
 }

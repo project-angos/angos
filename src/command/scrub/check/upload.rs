@@ -245,6 +245,7 @@ mod tests {
 
             let result = upload_store.summary(namespace, &upload_uuid).await;
             assert!(result.is_err(), "Obsolete upload should be deleted");
+            test_case.cleanup().await;
         }
     }
 
@@ -268,6 +269,7 @@ mod tests {
 
             let result = upload_store.summary(namespace, &upload_uuid).await;
             assert!(result.is_ok(), "Recent upload should be kept");
+            test_case.cleanup().await;
         }
     }
 
@@ -292,6 +294,7 @@ mod tests {
 
             let result = upload_store.summary(namespace, &upload_uuid).await;
             assert!(result.is_ok(), "Vec sink must not delete the upload");
+            test_case.cleanup().await;
         }
     }
 }

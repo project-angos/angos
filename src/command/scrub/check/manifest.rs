@@ -117,6 +117,7 @@ mod tests {
     use super::*;
     use crate::{
         command::scrub::executor::Executor,
+        oci::Namespace,
         registry::{
             metadata_store::MetadataStoreExt,
             test_utils::{self, NoopMultipart, backends},
@@ -126,7 +127,7 @@ mod tests {
     #[tokio::test]
     async fn test_scrub_revisions_validates_manifest_links() {
         for test_case in backends() {
-            let namespace = "test-repo/app";
+            let namespace = &Namespace::new("test-repo/app").unwrap();
             let registry = test_case.registry();
             let metadata_store = test_case.metadata_store();
             let blob_store = test_case.blob_store();
@@ -186,6 +187,7 @@ mod tests {
 
             assert!(config_link.is_ok());
             assert!(layer_link.is_ok());
+            test_case.cleanup().await;
         }
     }
 }

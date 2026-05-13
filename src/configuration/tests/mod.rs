@@ -1,4 +1,3 @@
-mod load;
+mod integration;
 mod redirects;
-mod resolve_metadata;
 mod validate;

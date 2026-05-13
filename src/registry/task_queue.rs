@@ -1,19 +1,19 @@
-use std::{collections::HashSet, fmt, future::Future, sync::Arc, thread};
+use std::{collections::HashSet, fmt, future::Future, sync::Arc};
 
 use parking_lot::Mutex;
-use tokio::runtime::{self, Handle};
-use tracing::info;
+use tokio::{runtime::Handle, sync::Semaphore};
+use tracing::{info, warn};
 
 #[derive(Debug)]
 pub enum Error {
-    RuntimeBuild(String),
+    Initialization(String),
     TaskExecution(String),
 }
 
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Error::RuntimeBuild(e) => write!(f, "failed to build Tokio runtime: {e}"),
+            Error::Initialization(e) => write!(f, "failed to initialize task queue: {e}"),
             Error::TaskExecution(e) => write!(f, "task execution failed: {e}"),
         }
     }
@@ -23,29 +23,23 @@ impl std::error::Error for Error {}
 
 pub struct TaskQueue {
     handle: Handle,
+    permits: Arc<Semaphore>,
     active_tasks: Arc<Mutex<HashSet<String>>>,
-    _runtime_thread: thread::JoinHandle<()>,
 }
 
 impl TaskQueue {
-    pub fn new(worker_threads: usize, thread_name: &str) -> Result<Self, Error> {
-        let runtime = runtime::Builder::new_multi_thread()
-            .worker_threads(worker_threads)
-            .thread_name(thread_name)
-            .enable_all()
-            .build()
-            .map_err(|e| Error::RuntimeBuild(e.to_string()))?;
-
-        let handle = runtime.handle().clone();
-
-        let runtime_thread = thread::spawn(move || {
-            runtime.block_on(std::future::pending::<()>());
-        });
+    pub fn new(max_concurrent_jobs: usize) -> Result<Self, Error> {
+        if max_concurrent_jobs == 0 {
+            return Err(Error::Initialization(
+                "max_concurrent_cache_jobs must be greater than 0".to_string(),
+            ));
+        }
 
         Ok(Self {
-            handle,
+            handle: Handle::try_current()
+                .map_err(|error| Error::Initialization(error.to_string()))?,
+            permits: Arc::new(Semaphore::new(max_concurrent_jobs)),
             active_tasks: Arc::new(Mutex::new(HashSet::new())),
-            _runtime_thread: runtime_thread,
         })
     }
 
@@ -61,8 +55,17 @@ impl TaskQueue {
 
         let reference = reference.to_string();
         let active_tasks = self.active_tasks.clone();
+        let permits = self.permits.clone();
         self.handle.spawn(async move {
-            let _ = fut.await;
+            let Ok(_permit) = permits.acquire_owned().await else {
+                active_tasks.lock().remove(&reference);
+                return;
+            };
+
+            if let Err(error) = fut.await {
+                warn!("Task '{reference}' failed: {error}");
+            }
+
             active_tasks.lock().remove(&reference);
         });
     }
@@ -82,19 +85,21 @@ impl TaskQueue {
 mod tests {
     use std::{
         future::Future,
+        io::{self, Write},
         sync::{
-            Arc,
+            Arc, Mutex as StdMutex,
             atomic::{AtomicUsize, Ordering},
         },
         time::Duration,
     };
 
     use tokio::sync::{Notify, oneshot};
+    use tracing_subscriber::fmt::MakeWriter;
 
     use super::{Error, TaskQueue};
 
     fn make_queue() -> TaskQueue {
-        TaskQueue::new(2, "test-task-queue").expect("failed to build TaskQueue")
+        TaskQueue::new(2).expect("failed to build TaskQueue")
     }
 
     // Future that immediately increments the counter and resolves.
@@ -105,6 +110,16 @@ mod tests {
         async move {
             c.fetch_add(1, Ordering::SeqCst);
             Ok(())
+        }
+    }
+
+    fn failing_task(
+        counter: &Arc<AtomicUsize>,
+    ) -> impl Future<Output = Result<(), Error>> + Send + 'static {
+        let c = counter.clone();
+        async move {
+            c.fetch_add(1, Ordering::SeqCst);
+            Err(Error::TaskExecution("expected failure".to_string()))
         }
     }
 
@@ -146,9 +161,56 @@ mod tests {
         false
     }
 
+    async fn wait_until_async(predicate: impl Fn() -> bool) -> bool {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            if predicate() {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        false
+    }
+
+    #[derive(Clone, Default)]
+    struct LogCapture {
+        content: Arc<StdMutex<Vec<u8>>>,
+    }
+
+    impl LogCapture {
+        fn contents(&self) -> String {
+            String::from_utf8(self.content.lock().unwrap().clone()).unwrap()
+        }
+    }
+
+    struct LogWriter {
+        content: Arc<StdMutex<Vec<u8>>>,
+    }
+
+    impl Write for LogWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.content.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> MakeWriter<'a> for LogCapture {
+        type Writer = LogWriter;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            LogWriter {
+                content: self.content.clone(),
+            }
+        }
+    }
+
     // Single task submitted, runs exactly once, and is removed from the active set.
-    #[test]
-    fn single_submit_runs_to_completion() {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn single_submit_runs_to_completion() {
         let queue = make_queue();
         let counter = Arc::new(AtomicUsize::new(0));
 
@@ -160,10 +222,33 @@ mod tests {
         assert_eq!(queue.active_task_count(), 0);
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn failed_task_logs_error_and_cleans_up() {
+        let logs = LogCapture::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(logs.clone())
+            .with_ansi(false)
+            .without_time()
+            .finish();
+
+        let queue = make_queue();
+        let counter = Arc::new(AtomicUsize::new(0));
+
+        let _guard = tracing::subscriber::set_default(subscriber);
+        queue.submit("ref-fail", failing_task(&counter));
+
+        assert!(wait_until_async(|| counter.load(Ordering::SeqCst) == 1).await);
+        assert!(wait_until_async(|| !queue.is_active("ref-fail")).await);
+
+        let logs = logs.contents();
+        assert!(logs.contains("Task 'ref-fail' failed"), "logs were: {logs}");
+        assert!(logs.contains("expected failure"), "logs were: {logs}");
+    }
+
     // Submitting the same reference twice while the first task is still in-flight
     // results in one execution, not two.
-    #[test]
-    fn duplicate_submit_is_deduplicated() {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn duplicate_submit_is_deduplicated() {
         let queue = make_queue();
         let counter = Arc::new(AtomicUsize::new(0));
 
@@ -187,8 +272,8 @@ mod tests {
     }
 
     // Two submissions with different references both execute independently.
-    #[test]
-    fn different_references_run_independently() {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn different_references_run_independently() {
         let queue = make_queue();
         let counter_a = Arc::new(AtomicUsize::new(0));
         let counter_b = Arc::new(AtomicUsize::new(0));
@@ -205,10 +290,30 @@ mod tests {
         assert_eq!(queue.active_task_count(), 0);
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn max_concurrent_jobs_limits_running_tasks() {
+        let queue = TaskQueue::new(1).expect("failed to build TaskQueue");
+        let counter = Arc::new(AtomicUsize::new(0));
+        let (first_tx, first_rx) = oneshot::channel::<()>();
+        let (second_tx, second_rx) = oneshot::channel::<()>();
+
+        queue.submit("ref-first", gated_task(&counter, first_rx));
+        queue.submit("ref-second", gated_task(&counter, second_rx));
+
+        assert!(wait_until_async(|| counter.load(Ordering::SeqCst) == 1).await);
+        assert_eq!(queue.active_task_count(), 2);
+
+        let _ = first_tx.send(());
+        assert!(wait_until_async(|| counter.load(Ordering::SeqCst) == 2).await);
+
+        let _ = second_tx.send(());
+        assert!(wait_until_async(|| queue.active_task_count() == 0).await);
+    }
+
     // After a task completes and its reference is removed from the active set,
     // re-submitting the same reference spawns a new task (not the stale one).
-    #[test]
-    fn completed_task_cleanup_allows_resubmission() {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn completed_task_cleanup_allows_resubmission() {
         let queue = make_queue();
         let counter = Arc::new(AtomicUsize::new(0));
 
@@ -228,8 +333,8 @@ mod tests {
 
     // N concurrent callers submitting the same reference cause the underlying
     // future to run exactly once; all surplus submissions are dropped silently.
-    #[test]
-    fn concurrent_dedup_runs_future_exactly_once() {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_dedup_runs_future_exactly_once() {
         let queue = Arc::new(make_queue());
         let counter = Arc::new(AtomicUsize::new(0));
         let gate = Arc::new(Notify::new());
@@ -265,8 +370,8 @@ mod tests {
 
     // Dedup, then resubmit, then dedup again in tight sequence confirms the
     // cleanup path does not race with a new submission for the same key.
-    #[test]
-    fn cleanup_completion_race_no_deadlock() {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cleanup_completion_race_no_deadlock() {
         let queue = make_queue();
         let counter = Arc::new(AtomicUsize::new(0));
 
@@ -295,8 +400,8 @@ mod tests {
     }
 
     // Edge-case reference values (empty, whitespace, non-ASCII) are valid dedup keys.
-    #[test]
-    fn edge_case_keys_are_valid_dedup_keys() {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn edge_case_keys_are_valid_dedup_keys() {
         let queue = make_queue();
 
         for key in &["", "   ", "日本語"] {

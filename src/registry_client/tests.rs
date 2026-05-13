@@ -1,13 +1,21 @@
+use std::time::Duration;
+
+use futures_util::future::join_all;
+use url::Url;
 use wiremock::{
-    Mock, MockServer, ResponseTemplate,
+    Mock, MockServer, Request, ResponseTemplate,
     matchers::{header, method, path, query_param},
 };
 
-use super::*;
 use crate::{
     cache,
     oci::{Digest, Namespace, Reference},
-    registry::DOCKER_CONTENT_DIGEST,
+    registry::{DOCKER_CONTENT_DIGEST, Error},
+    registry_client::{
+        RegistryClient, RegistryClientConfig,
+        auth::{token_cache_key, token_index_cache_key},
+        get_upstream_namespace,
+    },
     secret::Secret,
 };
 
@@ -16,18 +24,18 @@ fn test_get_upstream_namespace() {
     let local_name = "local";
     let upstream_name = "local/repo";
 
-    let result = RegistryClient::get_upstream_namespace(local_name, upstream_name);
+    let result = get_upstream_namespace(local_name, upstream_name);
     assert_eq!(result, "repo");
 
     let repo_name = "local/nested";
     let namespace = &Namespace::new("completely/different/path").unwrap();
-    let result = RegistryClient::get_upstream_namespace(repo_name, namespace);
+    let result = get_upstream_namespace(repo_name, namespace);
     assert_eq!(result, "completely/different/path");
 }
 
 #[test]
 fn test_get_upstream_namespace_no_prefix_match() {
-    let result = RegistryClient::get_upstream_namespace("foo", "bar/baz");
+    let result = get_upstream_namespace("foo", "bar/baz");
     assert_eq!(result, "bar/baz");
 }
 
@@ -372,6 +380,324 @@ async fn test_bearer_authentication() {
         .await;
 
     assert!(result.is_ok());
+}
+
+#[tokio::test]
+async fn test_cached_bearer_token_is_used() {
+    let mock_server = MockServer::start().await;
+    let registry_url = mock_server.uri();
+    let location = format!("{registry_url}/v2/test/manifests/latest");
+    let cache = cache::Config::Memory.to_backend().unwrap();
+    let url = Url::parse(&location).unwrap();
+    let cache_key = token_cache_key(
+        &url,
+        "https://auth.example.com/token",
+        Some("registry"),
+        Some("repository:test:pull"),
+    )
+    .unwrap();
+    cache
+        .store_value(&cache_key, "Bearer cached-token", 3600)
+        .await
+        .unwrap();
+    cache
+        .store_value(&token_index_cache_key(&url).unwrap(), &cache_key, 3600)
+        .await
+        .unwrap();
+
+    Mock::given(method("GET"))
+        .and(path("/v2/test/manifests/latest"))
+        .and(header("Authorization", "Bearer cached-token"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_bytes(b"{}")
+                .insert_header(
+                    DOCKER_CONTENT_DIGEST,
+                    "sha256:3333333333333333333333333333333333333333333333333333333333333333",
+                )
+                .insert_header("Content-Type", "application/json"),
+        )
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let config = RegistryClientConfig {
+        url: registry_url,
+        max_redirect: 5,
+        server_ca_bundle: None,
+        client_certificate: None,
+        client_private_key: None,
+        username: None,
+        password: None,
+    };
+
+    let client = RegistryClient::new(&config, cache).unwrap();
+    let result = client.get_manifest(&[], &location).await;
+
+    assert!(result.is_ok());
+}
+
+#[tokio::test]
+async fn test_bearer_tokens_are_cached_per_scope() {
+    let mock_server = MockServer::start().await;
+    let auth_server = MockServer::start().await;
+    let registry_url = mock_server.uri();
+    let alpha_location = format!("{registry_url}/v2/alpha/manifests/latest");
+    let beta_location = format!("{registry_url}/v2/beta/manifests/latest");
+
+    Mock::given(method("GET"))
+        .and(path("/v2/alpha/manifests/latest"))
+        .and(|request: &Request| !request.headers.contains_key("authorization"))
+        .respond_with(ResponseTemplate::new(401).insert_header(
+            "WWW-Authenticate",
+            format!(
+                r#"Bearer realm="{}",service="registry",scope="repository:alpha:pull""#,
+                auth_server.uri()
+            ),
+        ))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/v2/beta/manifests/latest"))
+        .and(|request: &Request| !request.headers.contains_key("authorization"))
+        .respond_with(ResponseTemplate::new(401).insert_header(
+            "WWW-Authenticate",
+            format!(
+                r#"Bearer realm="{}",service="registry",scope="repository:beta:pull""#,
+                auth_server.uri()
+            ),
+        ))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(query_param("service", "registry"))
+        .and(query_param("scope", "repository:alpha:pull"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({"token": "token-alpha", "expires_in": 3600})),
+        )
+        .expect(1)
+        .mount(&auth_server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(query_param("service", "registry"))
+        .and(query_param("scope", "repository:beta:pull"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({"token": "token-beta", "expires_in": 3600})),
+        )
+        .expect(1)
+        .mount(&auth_server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/v2/alpha/manifests/latest"))
+        .and(header("Authorization", "Bearer token-alpha"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_bytes(b"{}")
+                .insert_header(
+                    DOCKER_CONTENT_DIGEST,
+                    "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                )
+                .insert_header("Content-Type", "application/json"),
+        )
+        .expect(2)
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/v2/beta/manifests/latest"))
+        .and(header("Authorization", "Bearer token-beta"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_bytes(b"{}")
+                .insert_header(
+                    DOCKER_CONTENT_DIGEST,
+                    "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                )
+                .insert_header("Content-Type", "application/json"),
+        )
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let config = RegistryClientConfig {
+        url: registry_url,
+        max_redirect: 5,
+        server_ca_bundle: None,
+        client_certificate: None,
+        client_private_key: None,
+        username: None,
+        password: None,
+    };
+
+    let cache = cache::Config::Memory.to_backend().unwrap();
+    let client = RegistryClient::new(&config, cache).unwrap();
+
+    assert!(client.get_manifest(&[], &alpha_location).await.is_ok());
+    assert!(client.get_manifest(&[], &beta_location).await.is_ok());
+    assert!(client.get_manifest(&[], &alpha_location).await.is_ok());
+}
+
+#[tokio::test]
+async fn test_expired_bearer_token_is_refetched() {
+    let mock_server = MockServer::start().await;
+    let auth_server = MockServer::start().await;
+    let registry_url = mock_server.uri();
+    let location = format!("{registry_url}/v2/test/manifests/latest");
+    let cache = cache::Config::Memory.to_backend().unwrap();
+    let url = Url::parse(&location).unwrap();
+    let cache_key = token_cache_key(
+        &url,
+        &format!("{}/token", auth_server.uri()),
+        Some("registry"),
+        Some("repository:test:pull"),
+    )
+    .unwrap();
+    cache
+        .store_value(&cache_key, "Bearer stale-token", 0)
+        .await
+        .unwrap();
+    cache
+        .store_value(&token_index_cache_key(&url).unwrap(), &cache_key, 3600)
+        .await
+        .unwrap();
+
+    Mock::given(method("GET"))
+        .and(path("/v2/test/manifests/latest"))
+        .and(header("Authorization", "Bearer stale-token"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/v2/test/manifests/latest"))
+        .respond_with(ResponseTemplate::new(401).insert_header(
+            "WWW-Authenticate",
+            format!(
+                r#"Bearer realm="{}",service="registry",scope="repository:test:pull""#,
+                auth_server.uri()
+            ),
+        ))
+        .up_to_n_times(1)
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(query_param("service", "registry"))
+        .and(query_param("scope", "repository:test:pull"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({"token": "fresh-token", "expires_in": 3600})),
+        )
+        .expect(1)
+        .mount(&auth_server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/v2/test/manifests/latest"))
+        .and(header("Authorization", "Bearer fresh-token"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_bytes(b"{}")
+                .insert_header(
+                    DOCKER_CONTENT_DIGEST,
+                    "sha256:4444444444444444444444444444444444444444444444444444444444444444",
+                )
+                .insert_header("Content-Type", "application/json"),
+        )
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let config = RegistryClientConfig {
+        url: registry_url,
+        max_redirect: 5,
+        server_ca_bundle: None,
+        client_certificate: None,
+        client_private_key: None,
+        username: None,
+        password: None,
+    };
+
+    let client = RegistryClient::new(&config, cache).unwrap();
+    let result = client.get_manifest(&[], &location).await;
+
+    assert!(result.is_ok());
+}
+
+#[tokio::test]
+async fn test_concurrent_bearer_refresh_uses_single_token_exchange() {
+    let mock_server = MockServer::start().await;
+    let auth_server = MockServer::start().await;
+    let registry_url = mock_server.uri();
+    let location = format!("{registry_url}/v2/test/manifests/latest");
+
+    Mock::given(method("GET"))
+        .and(path("/v2/test/manifests/latest"))
+        .and(|request: &Request| !request.headers.contains_key("authorization"))
+        .respond_with(ResponseTemplate::new(401).insert_header(
+            "WWW-Authenticate",
+            format!(
+                r#"Bearer realm="{}",service="registry",scope="repository:test:pull""#,
+                auth_server.uri()
+            ),
+        ))
+        .expect(10)
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(query_param("service", "registry"))
+        .and(query_param("scope", "repository:test:pull"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_delay(Duration::from_millis(50))
+                .set_body_json(serde_json::json!({"token": "shared-token", "expires_in": 3600})),
+        )
+        .expect(1)
+        .mount(&auth_server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/v2/test/manifests/latest"))
+        .and(header("Authorization", "Bearer shared-token"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_bytes(b"{}")
+                .insert_header(
+                    DOCKER_CONTENT_DIGEST,
+                    "sha256:5555555555555555555555555555555555555555555555555555555555555555",
+                )
+                .insert_header("Content-Type", "application/json"),
+        )
+        .expect(10)
+        .mount(&mock_server)
+        .await;
+
+    let config = RegistryClientConfig {
+        url: registry_url,
+        max_redirect: 5,
+        server_ca_bundle: None,
+        client_certificate: None,
+        client_private_key: None,
+        username: None,
+        password: None,
+    };
+
+    let cache = cache::Config::Memory.to_backend().unwrap();
+    let client = RegistryClient::new(&config, cache).unwrap();
+    let results = join_all((0..10).map(|_| client.get_manifest(&[], &location))).await;
+
+    assert!(results.iter().all(Result::is_ok));
 }
 
 #[tokio::test]

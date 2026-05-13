@@ -55,7 +55,7 @@ Multiple authentication methods processed in order:
 2. **OIDC**: JWT token validation with JWKS
 3. **Basic Auth**: Username/password with Argon2
 
-Authentication is fail-open: invalid credentials try the next method.
+Missing credentials continue to the next method; invalid credentials fail the request.
 
 ### Authorization Layer
 

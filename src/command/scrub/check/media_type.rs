@@ -145,6 +145,7 @@ mod tests {
     use super::*;
     use crate::{
         command::scrub::{action::Action, executor::Executor},
+        oci::Namespace,
         registry::{
             metadata_store::MetadataStoreExt,
             test_utils::{self, NoopMultipart, backends},
@@ -154,7 +155,7 @@ mod tests {
     #[tokio::test]
     async fn test_media_type_checker_backfills_missing_media_type() {
         for test_case in backends() {
-            let namespace = "test-repo/app";
+            let namespace = &Namespace::new("test-repo/app").unwrap();
             let registry = test_case.registry();
             let metadata_store = test_case.metadata_store();
             let blob_store = test_case.blob_store();
@@ -225,13 +226,14 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(tag_link.media_type.as_deref(), Some(media_type));
+            test_case.cleanup().await;
         }
     }
 
     #[tokio::test]
     async fn test_media_type_checker_skips_links_with_media_type() {
         for test_case in backends() {
-            let namespace = "test-repo/skip";
+            let namespace = &Namespace::new("test-repo/skip").unwrap();
             let registry = test_case.registry();
             let metadata_store = test_case.metadata_store();
             let blob_store = test_case.blob_store();
@@ -282,13 +284,14 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(digest_link.media_type.as_deref(), Some(media_type));
+            test_case.cleanup().await;
         }
     }
 
     #[tokio::test]
     async fn test_media_type_checker_dry_run() {
         for test_case in backends() {
-            let namespace = "test-repo/dry-run";
+            let namespace = &Namespace::new("test-repo/dry-run").unwrap();
             let registry = test_case.registry();
             let metadata_store = test_case.metadata_store();
             let blob_store = test_case.blob_store();
@@ -342,6 +345,7 @@ mod tests {
                     .any(|a| matches!(a, Action::SetMediaType { .. })),
                 "Vec sink must capture SetMediaType actions"
             );
+            test_case.cleanup().await;
         }
     }
 }

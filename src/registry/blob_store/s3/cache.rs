@@ -1,10 +1,7 @@
 use tracing::warn;
 
 use super::{Backend, S3UploadState};
-use crate::{
-    cache::{CacheExt, CacheOutcome},
-    registry::blob_store::Error,
-};
+use crate::registry::blob_store::Error;
 
 impl Backend {
     pub fn upload_id_cache_key(path: &str) -> String {
@@ -59,11 +56,11 @@ impl Backend {
         if let Some(cache) = &self.cache {
             let key = Self::upload_state_cache_key(namespace, uuid);
             match cache.retrieve::<S3UploadState>(&key).await {
-                CacheOutcome::Hit(state) => return Some(state),
-                CacheOutcome::Error(err) => {
+                Ok(Some(state)) => return Some(state),
+                Err(err) => {
                     warn!("Failed to retrieve cached upload state for {namespace}/{uuid}: {err}");
                 }
-                CacheOutcome::Miss => {}
+                Ok(None) => {}
             }
         }
         None

@@ -47,7 +47,9 @@ impl From<SamplingRate> for f64 {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use serde::Deserialize;
+
+    use crate::configuration::observability::{ObservabilityConfig, SamplingRate};
 
     #[derive(Debug, Deserialize)]
     struct Wrapper {
@@ -84,5 +86,21 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("[0.0, 1.0]"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn tracing_config_parses() {
+        let config = toml::from_str::<ObservabilityConfig>(
+            r#"
+            [tracing]
+            endpoint = "http://jaeger:4317"
+            sampling_rate = 0.1
+            "#,
+        )
+        .unwrap();
+
+        let tracing = config.tracing.expect("tracing config");
+        assert_eq!(tracing.endpoint, "http://jaeger:4317");
+        assert!((f64::from(tracing.sampling_rate) - 0.1).abs() < f64::EPSILON);
     }
 }

@@ -3,7 +3,7 @@ pub mod github;
 
 use std::collections::HashMap;
 
-use async_trait::async_trait;
+use jsonwebtoken::Algorithm;
 
 use crate::command::server::Error;
 
@@ -13,32 +13,54 @@ pub struct BaseConfig {
     pub jwks_refresh_interval: u64,
     pub required_audience: Option<String>,
     pub clock_skew_tolerance: u64,
+    pub allowed_algorithms: Vec<Algorithm>,
 }
 
-#[async_trait]
-pub trait OidcProvider: Send + Sync {
-    fn base(&self) -> &BaseConfig;
+impl BaseConfig {
+    pub fn default_jwks_refresh_interval() -> u64 {
+        3600
+    }
 
+    pub fn default_clock_skew_tolerance() -> u64 {
+        60
+    }
+
+    pub fn default_allowed_algorithms() -> Vec<Algorithm> {
+        vec![Algorithm::RS256]
+    }
+}
+
+/// Provides the shared OIDC configuration required by every provider.
+pub trait HasBaseConfig {
+    fn base_config(&self) -> &BaseConfig;
+}
+
+/// OIDC provider behavior layered on top of the shared base configuration.
+pub trait OidcProvider: HasBaseConfig + Send + Sync {
     fn name(&self) -> &'static str;
 
     fn issuer(&self) -> &str {
-        &self.base().issuer
+        &self.base_config().issuer
     }
 
     fn jwks_uri(&self) -> Option<&str> {
-        self.base().jwks_uri.as_deref()
+        self.base_config().jwks_uri.as_deref()
     }
 
     fn jwks_refresh_interval(&self) -> u64 {
-        self.base().jwks_refresh_interval
+        self.base_config().jwks_refresh_interval
     }
 
     fn required_audience(&self) -> Option<&str> {
-        self.base().required_audience.as_deref()
+        self.base_config().required_audience.as_deref()
     }
 
     fn clock_skew_tolerance(&self) -> u64 {
-        self.base().clock_skew_tolerance
+        self.base_config().clock_skew_tolerance
+    }
+
+    fn allowed_algorithms(&self) -> &[Algorithm] {
+        &self.base_config().allowed_algorithms
     }
 
     fn validate_provider_claims(

@@ -103,7 +103,7 @@ Angos implements fail-closed authorization for critical security decisions:
 | Webhook not configured              | Not evaluated, access continues    |
 | Invalid mTLS certificate            | TLS handshake fails                |
 | Invalid OIDC token                  | 401 Unauthorized (fail-closed)     |
-| Invalid Basic Auth password         | Proceeds as anonymous identity     |
+| Invalid Basic Auth password         | 401 Unauthorized (fail-closed)     |
 | CEL evaluation error                | Rule skipped, evaluation continues |
 | CEL non-boolean result (any mode)   | Access denied (fail-closed)        |
 
@@ -154,7 +154,8 @@ Argon2id with strong parameters:
 
 OIDC tokens are fully verified:
 - Signature against provider's JWKS
-- Algorithm allowlist (RS256, RS384, RS512, ES256, ES384)
+- Per-provider algorithm allowlist before signature verification, defaulting to RS256
+- One cache-bypassing JWKS refresh when a cached key set misses a token `kid`
 - Issuer claim must match
 - Audience claim checked if configured
 - Expiration enforced

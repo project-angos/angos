@@ -9,7 +9,7 @@ use crate::command::server::{
     error::Error,
     listeners::{Connector, HandshakeResult, accept_loop},
 };
-pub use crate::configuration::listeners::insecure::InsecureListenerConfig;
+pub use crate::configuration::listeners::InsecureListenerConfig;
 
 pub struct InsecureListener {
     binding_address: SocketAddr,
@@ -41,11 +41,12 @@ impl Connector for InsecureConnector {
 
 impl InsecureListener {
     pub fn new(server_config: &InsecureListenerConfig, context: ServerContext) -> Self {
-        let binding_address = SocketAddr::new(server_config.bind_address, server_config.port);
+        let binding_address =
+            SocketAddr::new(server_config.base.bind_address, server_config.base.port);
 
         let timeouts = [
-            Duration::from_secs(server_config.query_timeout),
-            Duration::from_secs(server_config.query_timeout_grace_period),
+            Duration::from_secs(server_config.base.query_timeout_secs.get()),
+            Duration::from_secs(server_config.base.query_timeout_grace_period_secs.get()),
         ];
 
         Self {

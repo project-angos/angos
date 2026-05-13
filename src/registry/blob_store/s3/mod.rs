@@ -1,5 +1,4 @@
 mod cache;
-mod chunked_reader;
 mod cleanup;
 mod nonuniform;
 #[cfg(test)]
@@ -52,7 +51,7 @@ pub struct Backend {
     pub store: data_store::s3::Backend,
     multipart_part_size: u64,
     uniform_parts: bool,
-    cache: Option<Arc<dyn Cache>>,
+    cache: Option<Arc<Cache>>,
 }
 
 impl Debug for Backend {
@@ -75,7 +74,7 @@ impl Backend {
         })
     }
 
-    pub fn with_cache(mut self, cache: Arc<dyn Cache>) -> Self {
+    pub fn with_cache(mut self, cache: Arc<Cache>) -> Self {
         self.cache = Some(cache);
         self
     }
@@ -234,7 +233,8 @@ impl UploadStore for Backend {
         append: bool,
     ) -> Result<(Digest, u64), Error> {
         let result = if self.uniform_parts {
-            self.write_upload_uniform(name, uuid, stream, append).await
+            self.write_upload_uniform(name, uuid, stream, content_length, append)
+                .await
         } else {
             self.write_upload_nonuniform(name, uuid, stream, content_length)
                 .await

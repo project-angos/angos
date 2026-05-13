@@ -1,14 +1,27 @@
-use std::fmt;
+use cel_interpreter::SerializationError;
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, thiserror::Error)]
 pub enum Error {
+    #[error("Policy evaluation error: {0}")]
     Evaluation(String),
 }
 
-impl fmt::Display for Error {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match self {
-            Error::Evaluation(s) => write!(f, "Policy evaluation error: {s}"),
-        }
+impl From<SerializationError> for Error {
+    fn from(e: SerializationError) -> Self {
+        Self::Evaluation(e.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn evaluation_display_matches_original() {
+        let err = Error::Evaluation("something went wrong".to_string());
+        assert_eq!(
+            err.to_string(),
+            "Policy evaluation error: something went wrong"
+        );
     }
 }

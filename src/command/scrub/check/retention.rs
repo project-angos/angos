@@ -444,7 +444,7 @@ mod tests {
     use super::*;
     use crate::{
         command::scrub::{action::Action, executor::Executor},
-        oci::Digest,
+        oci::{Digest, Namespace},
         policy::{CelRule, RetentionPolicy, RetentionPolicyConfig, SystemClock},
         registry::{
             metadata_store::{
@@ -626,7 +626,7 @@ mod tests {
     #[tokio::test]
     async fn test_enforce_retention_with_policy() {
         for test_case in backends() {
-            let namespace = "test-repo/app";
+            let namespace = &Namespace::new("test-repo/app").unwrap();
             let registry = test_case.registry();
             let metadata_store = test_case.metadata_store();
 
@@ -663,13 +663,14 @@ mod tests {
                 .await;
 
             assert!(tag_link.is_ok());
+            test_case.cleanup().await;
         }
     }
 
     #[tokio::test]
     async fn test_enforce_retention_no_policy() {
         for test_case in backends() {
-            let namespace = "test-repo/app";
+            let namespace = &Namespace::new("test-repo/app").unwrap();
             let registry = test_case.registry();
             let metadata_store = test_case.metadata_store();
 
@@ -696,6 +697,7 @@ mod tests {
                 .await;
 
             assert!(tag_link.is_ok());
+            test_case.cleanup().await;
         }
     }
 
@@ -740,6 +742,7 @@ mod tests {
                     .await
                     .is_err()
             );
+            test_case.cleanup().await;
         }
     }
 
@@ -777,6 +780,7 @@ mod tests {
                     .await
                     .is_ok()
             );
+            test_case.cleanup().await;
         }
     }
 
@@ -861,13 +865,14 @@ mod tests {
                     .await
                     .is_err()
             );
+            test_case.cleanup().await;
         }
     }
 
     #[tokio::test]
     async fn test_delete_tag_action_emitted_without_storage_mutation() {
         let test_case = backends().into_iter().next().unwrap();
-        let namespace = "test-repo/app";
+        let namespace = &Namespace::new("test-repo/app").unwrap();
         let registry = test_case.registry();
         let metadata_store = test_case.metadata_store();
 
@@ -907,6 +912,7 @@ mod tests {
                 .is_ok(),
             "Vec sink must not delete the tag"
         );
+        test_case.cleanup().await;
     }
 
     fn make_manifest(tag: &str) -> ManifestImage {
@@ -951,14 +957,16 @@ mod tests {
     }
 
     fn make_repo(name: &str, rules: Vec<CelRule>) -> crate::registry::Repository {
-        use crate::{cache, policy::AccessPolicyConfig, registry::repository};
-        let token_cache = cache::Config::Memory.to_backend().unwrap();
-        let config = repository::Config {
-            access_policy: AccessPolicyConfig::default(),
-            retention_policy: RetentionPolicyConfig { rules },
-            ..repository::Config::default()
-        };
-        crate::registry::Repository::new(name, &config, &token_cache).unwrap()
+        crate::registry::Repository {
+            name: name.to_string(),
+            upstreams: Vec::new(),
+            retention_policy: RetentionPolicy::new(
+                &RetentionPolicyConfig { rules },
+                Arc::new(SystemClock),
+            ),
+            immutable_tags: false,
+            immutable_tags_exclusions: Vec::new(),
+        }
     }
 
     #[test]

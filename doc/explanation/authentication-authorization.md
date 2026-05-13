@@ -53,13 +53,13 @@ Each method handles missing vs invalid credentials differently:
 |------------|----------------|---------------------|
 | mTLS       | Continue       | **TLS handshake fails** |
 | OIDC       | Continue       | **Reject immediately** |
-| Basic Auth | Continue       | Anonymous identity  |
+| Basic Auth | Continue       | **Reject immediately** |
 
 This means:
 - Missing credentials → try next method
 - Invalid mTLS certificate → connection rejected at TLS layer
 - Invalid OIDC token → immediate 401 (fail-closed)
-- Invalid Basic Auth password → anonymous identity (fail-open)
+- Invalid Basic Auth password → immediate 401 (fail-closed)
 
 ---
 
@@ -159,6 +159,11 @@ sequenceDiagram
 **Repository policy** runs second (if defined):
 - Can add stricter rules
 - Cannot override global denials
+- Applies only when the namespace matches a configured repository
+
+Namespaces that do not match any configured repository are governed only by the
+global policy, because there is no repository policy or repository webhook to
+evaluate for them.
 
 **Webhook** runs last (if configured):
 - External authorization service
@@ -303,9 +308,12 @@ sequenceDiagram
 
 OIDC tokens are cryptographically verified:
 - Signature against provider's JWKS
+- Header algorithm must be in the provider's allowlist
 - Issuer must match configuration
 - Expiration is enforced
 - Clock skew tolerance is configurable
+
+Bad OIDC tokens return 401. If Angos cannot reach or parse the configured provider discovery or JWKS endpoint, it returns 503 because the provider is temporarily unavailable rather than treating the credential as rejected.
 
 ### Password Storage
 

@@ -1,25 +1,21 @@
 use std::sync::Arc;
 
 use serde::Deserialize;
+use tokio::task;
 use tracing::{instrument, warn};
 
+pub use crate::registry_client::RegistryClientConfig;
 use crate::{
-    auth::webhook,
     cache::Cache,
     configuration::RegexPattern,
     oci::{Digest, Namespace, Reference},
     policy::{AccessPolicyConfig, RetentionPolicy, RetentionPolicyConfig, SystemClock},
     registry::{Error, blob_store::BoxedReader},
+    registry_client::RegistryClient,
 };
 
-mod registry_client;
-
-use registry_client::RegistryClient;
-pub use registry_client::RegistryClientConfig;
-
-/// Parsed shape of `[repository.<name>]` before webhook name references are resolved.
 #[derive(Clone, Debug, Default, Deserialize)]
-pub struct RawConfig {
+pub struct Config {
     #[serde(default)]
     pub upstream: Vec<RegistryClientConfig>,
     #[serde(default)]
@@ -33,17 +29,6 @@ pub struct RawConfig {
     pub authorization_webhook: Option<String>,
     #[serde(default)]
     pub event_webhooks: Vec<String>,
-}
-
-/// Resolved repository configuration with webhook references replaced by their definitions.
-#[derive(Clone, Debug, Default)]
-pub struct Config {
-    pub upstream: Vec<RegistryClientConfig>,
-    pub access_policy: AccessPolicyConfig,
-    pub retention_policy: RetentionPolicyConfig,
-    pub immutable_tags: bool,
-    pub immutable_tags_exclusions: Vec<RegexPattern>,
-    pub authorization_webhook: Option<Arc<webhook::Config>>,
 }
 
 pub struct Repository {
@@ -82,11 +67,22 @@ impl Repository {
         Err(fallback)
     }
 
-    pub fn new(name: &str, config: &Config, cache: &Arc<dyn Cache>) -> Result<Self, Error> {
-        let mut upstreams = Vec::new();
-        for config in &config.upstream {
-            upstreams.push(RegistryClient::new(config, cache.clone())?);
-        }
+    pub async fn new(name: &str, config: &Config, cache: &Arc<Cache>) -> Result<Self, Error> {
+        let upstreams = if config.upstream.is_empty() {
+            Vec::new()
+        } else {
+            let upstream_configs = config.upstream.clone();
+            let cache = Arc::clone(cache);
+            task::spawn_blocking(move || {
+                let mut upstreams = Vec::new();
+                for config in &upstream_configs {
+                    upstreams.push(RegistryClient::new(config, Arc::clone(&cache))?);
+                }
+                Ok::<_, Error>(upstreams)
+            })
+            .await
+            .map_err(|e| Error::Internal(format!("Failed to initialize upstream clients: {e}")))??
+        };
 
         let retention_policy =
             RetentionPolicy::new(&config.retention_policy, Arc::new(SystemClock));
@@ -177,19 +173,96 @@ impl Repository {
 
 #[cfg(test)]
 mod tests {
+    use std::{fs, time::Duration};
+
+    use tokio::{io::AsyncReadExt, time::timeout};
     use wiremock::{
         Mock, MockServer, ResponseTemplate,
         matchers::{method, path},
     };
 
-    use super::*;
-    use crate::cache;
+    use crate::{
+        cache,
+        oci::{Digest, Reference},
+        registry::{
+            Error,
+            repository::{Config, RegistryClientConfig, Repository},
+        },
+        test_fixtures::webhook::ca_bundle_pem,
+    };
 
-    #[test]
-    fn test_is_pull_through_empty() {
+    const TEST_DIGEST: &str =
+        "sha256:1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef";
+    const FALLBACK_DIGEST: &str =
+        "sha256:abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890";
+    const MANIFEST_PATH: &str = "/v2/repo/manifests/latest";
+    const BLOB_PATH: &str =
+        "/v2/repo/blobs/sha256:1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef";
+
+    fn registry_client_config(url: String) -> RegistryClientConfig {
+        RegistryClientConfig {
+            url,
+            max_redirect: 5,
+            server_ca_bundle: None,
+            client_certificate: None,
+            client_private_key: None,
+            username: None,
+            password: None,
+        }
+    }
+
+    async fn repository_with_upstreams(first_url: String, second_url: String) -> Repository {
+        let cache = cache::Config::Memory.to_backend().unwrap();
+        let config = Config {
+            upstream: vec![
+                registry_client_config(first_url),
+                registry_client_config(second_url),
+            ],
+            ..Default::default()
+        };
+
+        Repository::new("local", &config, &cache).await.unwrap()
+    }
+
+    async fn mount_response(
+        server: &MockServer,
+        request_method: &str,
+        request_path: &str,
+        response: ResponseTemplate,
+    ) {
+        Mock::given(method(request_method))
+            .and(path(request_path))
+            .respond_with(response)
+            .mount(server)
+            .await;
+    }
+
+    async fn fallback_repository(
+        request_method: &str,
+        request_path: &str,
+        response: ResponseTemplate,
+    ) -> (Repository, MockServer, MockServer) {
+        let first = MockServer::start().await;
+        let second = MockServer::start().await;
+
+        mount_response(
+            &first,
+            request_method,
+            request_path,
+            ResponseTemplate::new(404),
+        )
+        .await;
+        mount_response(&second, request_method, request_path, response).await;
+
+        let repository = repository_with_upstreams(first.uri(), second.uri()).await;
+        (repository, first, second)
+    }
+
+    #[tokio::test]
+    async fn test_is_pull_through_empty() {
         let cache = cache::Config::Memory.to_backend().unwrap();
         let config = Config::default();
-        let repo = Repository::new("test", &config, &cache).unwrap();
+        let repo = Repository::new("test", &config, &cache).await.unwrap();
 
         assert!(!repo.is_pull_through());
     }
@@ -212,8 +285,38 @@ mod tests {
             ..Default::default()
         };
 
-        let repo = Repository::new("test", &config, &cache).unwrap();
+        let repo = Repository::new("test", &config, &cache).await.unwrap();
         assert!(repo.is_pull_through());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn new_loads_upstream_tls_files_on_single_worker_runtime() {
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let ca_bundle_path = tmp_dir.path().join("ca.pem");
+        fs::write(&ca_bundle_path, ca_bundle_pem()).unwrap();
+
+        let cache = cache::Config::Memory.to_backend().unwrap();
+        let config = Config {
+            upstream: vec![RegistryClientConfig {
+                url: "https://registry.example.test".to_string(),
+                max_redirect: 5,
+                server_ca_bundle: Some(ca_bundle_path.to_string_lossy().to_string()),
+                client_certificate: None,
+                client_private_key: None,
+                username: None,
+                password: None,
+            }],
+            ..Default::default()
+        };
+
+        let repository = timeout(
+            Duration::from_secs(2),
+            Repository::new("test", &config, &cache),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(repository.is_pull_through());
     }
 
     #[tokio::test]
@@ -247,7 +350,7 @@ mod tests {
             ..Default::default()
         };
 
-        let repo = Repository::new("local", &config, &cache).unwrap();
+        let repo = Repository::new("local", &config, &cache).await.unwrap();
         let reference = Reference::Tag("latest".to_string());
 
         let result = repo.head_manifest(&[], "local/repo", &reference).await;
@@ -266,69 +369,72 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_head_manifest_fallback_to_second_upstream() {
-        let mock_server1 = MockServer::start().await;
-        let mock_server2 = MockServer::start().await;
-
-        Mock::given(method("HEAD"))
-            .and(path("/v2/repo/manifests/latest"))
-            .respond_with(ResponseTemplate::new(404))
-            .mount(&mock_server1)
-            .await;
-
-        Mock::given(method("HEAD"))
-            .and(path("/v2/repo/manifests/latest"))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .insert_header("Content-Length", "5678")
-                    .insert_header(
-                        "Docker-Content-Digest",
-                        "sha256:abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890",
-                    ),
-            )
-            .mount(&mock_server2)
-            .await;
-
-        let cache = cache::Config::Memory.to_backend().unwrap();
-        let config = Config {
-            upstream: vec![
-                RegistryClientConfig {
-                    url: mock_server1.uri(),
-                    max_redirect: 5,
-                    server_ca_bundle: None,
-                    client_certificate: None,
-                    client_private_key: None,
-                    username: None,
-                    password: None,
-                },
-                RegistryClientConfig {
-                    url: mock_server2.uri(),
-                    max_redirect: 5,
-                    server_ca_bundle: None,
-                    client_certificate: None,
-                    client_private_key: None,
-                    username: None,
-                    password: None,
-                },
-            ],
-            ..Default::default()
-        };
-
-        let repo = Repository::new("local", &config, &cache).unwrap();
+    async fn test_fallback_to_second_upstream() {
         let reference = Reference::Tag("latest".to_string());
 
+        let (repo, _first, _second) = fallback_repository(
+            "HEAD",
+            MANIFEST_PATH,
+            ResponseTemplate::new(200)
+                .insert_header("Content-Length", "5678")
+                .insert_header("Docker-Content-Digest", FALLBACK_DIGEST),
+        )
+        .await;
         let result = repo.head_manifest(&[], "local/repo", &reference).await;
         assert!(result.is_ok());
 
         let (_content_type, digest, size) = result.unwrap();
         assert_eq!(size, 5678);
-        assert_eq!(
-            digest,
-            Digest::try_from(
-                "sha256:abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890"
-            )
-            .unwrap()
-        );
+        assert_eq!(digest, Digest::try_from(FALLBACK_DIGEST).unwrap());
+
+        let manifest_content = b"{\"schemaVersion\":2}";
+        let (repo, _first, _second) = fallback_repository(
+            "GET",
+            MANIFEST_PATH,
+            ResponseTemplate::new(200)
+                .set_body_bytes(manifest_content)
+                .insert_header("Docker-Content-Digest", TEST_DIGEST),
+        )
+        .await;
+        let result = repo.get_manifest(&[], "local/repo", &reference).await;
+        assert!(result.is_ok());
+
+        let (_content_type, _digest, body) = result.unwrap();
+        assert_eq!(body, manifest_content);
+
+        let digest = Digest::try_from(TEST_DIGEST).unwrap();
+        let (repo, _first, _second) = fallback_repository(
+            "HEAD",
+            BLOB_PATH,
+            ResponseTemplate::new(200)
+                .insert_header("Content-Length", "5432")
+                .insert_header("Docker-Content-Digest", TEST_DIGEST),
+        )
+        .await;
+        let result = repo.head_blob(&[], "local/repo", &digest).await;
+        assert!(result.is_ok());
+
+        let (_returned_digest, size) = result.unwrap();
+        assert_eq!(size, 5432);
+
+        let blob_content = b"blob data here";
+        let (repo, _first, _second) = fallback_repository(
+            "GET",
+            BLOB_PATH,
+            ResponseTemplate::new(200).set_body_bytes(blob_content),
+        )
+        .await;
+        let result = repo.get_blob(&[], "local/repo", &digest).await;
+        assert!(result.is_ok());
+
+        let (size, mut reader) = result.unwrap();
+        assert_eq!(size, blob_content.len() as u64);
+
+        let mut buffer = Vec::new();
+        AsyncReadExt::read_to_end(&mut reader, &mut buffer)
+            .await
+            .unwrap();
+        assert_eq!(buffer, blob_content);
     }
 
     #[tokio::test]
@@ -355,7 +461,7 @@ mod tests {
             ..Default::default()
         };
 
-        let repo = Repository::new("local", &config, &cache).unwrap();
+        let repo = Repository::new("local", &config, &cache).await.unwrap();
         let reference = Reference::Tag("latest".to_string());
 
         let result = repo.head_manifest(&[], "local/repo", &reference).await;
@@ -395,67 +501,7 @@ mod tests {
             ..Default::default()
         };
 
-        let repo = Repository::new("local", &config, &cache).unwrap();
-        let reference = Reference::Tag("latest".to_string());
-
-        let result = repo.get_manifest(&[], "local/repo", &reference).await;
-        assert!(result.is_ok());
-
-        let (_content_type, _digest, body) = result.unwrap();
-        assert_eq!(body, manifest_content);
-    }
-
-    #[tokio::test]
-    async fn test_get_manifest_fallback_to_second_upstream() {
-        let mock_server1 = MockServer::start().await;
-        let mock_server2 = MockServer::start().await;
-        let manifest_content = b"{\"schemaVersion\":2}";
-
-        Mock::given(method("GET"))
-            .and(path("/v2/repo/manifests/latest"))
-            .respond_with(ResponseTemplate::new(404))
-            .mount(&mock_server1)
-            .await;
-
-        Mock::given(method("GET"))
-            .and(path("/v2/repo/manifests/latest"))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_bytes(manifest_content)
-                    .insert_header(
-                        "Docker-Content-Digest",
-                        "sha256:1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
-                    ),
-            )
-            .mount(&mock_server2)
-            .await;
-
-        let cache = cache::Config::Memory.to_backend().unwrap();
-        let config = Config {
-            upstream: vec![
-                RegistryClientConfig {
-                    url: mock_server1.uri(),
-                    max_redirect: 5,
-                    server_ca_bundle: None,
-                    client_certificate: None,
-                    client_private_key: None,
-                    username: None,
-                    password: None,
-                },
-                RegistryClientConfig {
-                    url: mock_server2.uri(),
-                    max_redirect: 5,
-                    server_ca_bundle: None,
-                    client_certificate: None,
-                    client_private_key: None,
-                    username: None,
-                    password: None,
-                },
-            ],
-            ..Default::default()
-        };
-
-        let repo = Repository::new("local", &config, &cache).unwrap();
+        let repo = Repository::new("local", &config, &cache).await.unwrap();
         let reference = Reference::Tag("latest".to_string());
 
         let result = repo.get_manifest(&[], "local/repo", &reference).await;
@@ -489,7 +535,7 @@ mod tests {
             ..Default::default()
         };
 
-        let repo = Repository::new("local", &config, &cache).unwrap();
+        let repo = Repository::new("local", &config, &cache).await.unwrap();
         let reference = Reference::Tag("latest".to_string());
 
         let result = repo.get_manifest(&[], "local/repo", &reference).await;
@@ -528,7 +574,7 @@ mod tests {
             ..Default::default()
         };
 
-        let repo = Repository::new("local", &config, &cache).unwrap();
+        let repo = Repository::new("local", &config, &cache).await.unwrap();
         let digest = Digest::try_from(
             "sha256:1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
         )
@@ -540,68 +586,6 @@ mod tests {
         let (returned_digest, size) = result.unwrap();
         assert_eq!(size, 9876);
         assert_eq!(returned_digest, digest);
-    }
-
-    #[tokio::test]
-    async fn test_head_blob_fallback_to_second_upstream() {
-        let mock_server1 = MockServer::start().await;
-        let mock_server2 = MockServer::start().await;
-
-        Mock::given(method("HEAD"))
-            .and(path("/v2/repo/blobs/sha256:1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef"))
-            .respond_with(ResponseTemplate::new(404))
-            .mount(&mock_server1)
-            .await;
-
-        Mock::given(method("HEAD"))
-            .and(path("/v2/repo/blobs/sha256:1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef"))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .insert_header("Content-Length", "5432")
-                    .insert_header(
-                        "Docker-Content-Digest",
-                        "sha256:1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
-                    ),
-            )
-            .mount(&mock_server2)
-            .await;
-
-        let cache = cache::Config::Memory.to_backend().unwrap();
-        let config = Config {
-            upstream: vec![
-                RegistryClientConfig {
-                    url: mock_server1.uri(),
-                    max_redirect: 5,
-                    server_ca_bundle: None,
-                    client_certificate: None,
-                    client_private_key: None,
-                    username: None,
-                    password: None,
-                },
-                RegistryClientConfig {
-                    url: mock_server2.uri(),
-                    max_redirect: 5,
-                    server_ca_bundle: None,
-                    client_certificate: None,
-                    client_private_key: None,
-                    username: None,
-                    password: None,
-                },
-            ],
-            ..Default::default()
-        };
-
-        let repo = Repository::new("local", &config, &cache).unwrap();
-        let digest = Digest::try_from(
-            "sha256:1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
-        )
-        .unwrap();
-
-        let result = repo.head_blob(&[], "local/repo", &digest).await;
-        assert!(result.is_ok());
-
-        let (_returned_digest, size) = result.unwrap();
-        assert_eq!(size, 5432);
     }
 
     #[tokio::test]
@@ -628,7 +612,7 @@ mod tests {
             ..Default::default()
         };
 
-        let repo = Repository::new("local", &config, &cache).unwrap();
+        let repo = Repository::new("local", &config, &cache).await.unwrap();
         let digest = Digest::try_from(
             "sha256:1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
         )
@@ -664,7 +648,7 @@ mod tests {
             ..Default::default()
         };
 
-        let repo = Repository::new("local", &config, &cache).unwrap();
+        let repo = Repository::new("local", &config, &cache).await.unwrap();
         let digest = Digest::try_from(
             "sha256:1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
         )
@@ -677,69 +661,7 @@ mod tests {
         assert_eq!(size, blob_content.len() as u64);
 
         let mut buffer = Vec::new();
-        tokio::io::AsyncReadExt::read_to_end(&mut reader, &mut buffer)
-            .await
-            .unwrap();
-        assert_eq!(buffer, blob_content);
-    }
-
-    #[tokio::test]
-    async fn test_get_blob_fallback_to_second_upstream() {
-        let mock_server1 = MockServer::start().await;
-        let mock_server2 = MockServer::start().await;
-        let blob_content = b"blob data here";
-
-        Mock::given(method("GET"))
-            .and(path("/v2/repo/blobs/sha256:1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef"))
-            .respond_with(ResponseTemplate::new(404))
-            .mount(&mock_server1)
-            .await;
-
-        Mock::given(method("GET"))
-            .and(path("/v2/repo/blobs/sha256:1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef"))
-            .respond_with(ResponseTemplate::new(200).set_body_bytes(blob_content))
-            .mount(&mock_server2)
-            .await;
-
-        let cache = cache::Config::Memory.to_backend().unwrap();
-        let config = Config {
-            upstream: vec![
-                RegistryClientConfig {
-                    url: mock_server1.uri(),
-                    max_redirect: 5,
-                    server_ca_bundle: None,
-                    client_certificate: None,
-                    client_private_key: None,
-                    username: None,
-                    password: None,
-                },
-                RegistryClientConfig {
-                    url: mock_server2.uri(),
-                    max_redirect: 5,
-                    server_ca_bundle: None,
-                    client_certificate: None,
-                    client_private_key: None,
-                    username: None,
-                    password: None,
-                },
-            ],
-            ..Default::default()
-        };
-
-        let repo = Repository::new("local", &config, &cache).unwrap();
-        let digest = Digest::try_from(
-            "sha256:1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
-        )
-        .unwrap();
-
-        let result = repo.get_blob(&[], "local/repo", &digest).await;
-        assert!(result.is_ok());
-
-        let (size, mut reader) = result.unwrap();
-        assert_eq!(size, blob_content.len() as u64);
-
-        let mut buffer = Vec::new();
-        tokio::io::AsyncReadExt::read_to_end(&mut reader, &mut buffer)
+        AsyncReadExt::read_to_end(&mut reader, &mut buffer)
             .await
             .unwrap();
         assert_eq!(buffer, blob_content);
@@ -769,7 +691,7 @@ mod tests {
             ..Default::default()
         };
 
-        let repo = Repository::new("local", &config, &cache).unwrap();
+        let repo = Repository::new("local", &config, &cache).await.unwrap();
         let digest = Digest::try_from(
             "sha256:1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
         )

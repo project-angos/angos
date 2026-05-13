@@ -1,7 +1,12 @@
 use std::path::PathBuf;
 
-use super::super::*;
-use crate::{auth::oidc, registry::data_store};
+use crate::{
+    auth::oidc,
+    cache,
+    configuration::{Configuration, Error, ServerConfig},
+    policy::AccessMode,
+    registry::{blob_store, data_store, metadata_store},
+};
 
 #[test]
 fn test_load_minimal_config() {
@@ -20,11 +25,11 @@ fn test_load_minimal_config() {
         panic!("Expected Insecure server config");
     };
 
-    let bind_address = server_config.bind_address.to_string();
+    let bind_address = server_config.base.bind_address.to_string();
     assert_eq!(bind_address, "0.0.0.0".to_string());
-    assert_eq!(server_config.port, 8000);
-    assert_eq!(server_config.query_timeout, 3600);
-    assert_eq!(server_config.query_timeout_grace_period, 60);
+    assert_eq!(server_config.base.port, 8000);
+    assert_eq!(server_config.base.query_timeout_secs.get(), 3600);
+    assert_eq!(server_config.base.query_timeout_grace_period_secs.get(), 60);
 
     assert_eq!(config.cache, cache::Config::Memory);
     assert_eq!(config.blob_store, blob_store::BlobStorageConfig::default());
@@ -148,140 +153,62 @@ fn test_auth_section() {
 }
 
 #[test]
-fn test_global_config_default() {
-    let config = GlobalConfig::default();
-    assert_eq!(config.max_concurrent_requests, 64);
-    assert_eq!(config.max_concurrent_cache_jobs, 4);
-    assert!(!config.update_pull_time);
-    assert!(!config.immutable_tags);
-    assert!(config.immutable_tags_exclusions.is_empty());
-    assert!(config.authorization_webhook.is_none());
-}
-
-#[test]
-fn test_global_config_custom_values() {
-    let config = r#"
-    [server]
-    bind_address = "0.0.0.0"
-
-    [global]
-    max_concurrent_requests = 10
-    max_concurrent_cache_jobs = 8
-    update_pull_time = true
-    immutable_tags = true
-    immutable_tags_exclusions = ["latest", "dev"]
-    authorization_webhook = "my-webhook"
-
-    [auth.webhook.my-webhook]
-    url = "https://example.com/webhook"
-    timeout_ms = 5000
-    "#;
-
-    let config = Configuration::load_from_str(config).unwrap();
-    assert_eq!(config.global.max_concurrent_requests, 10);
-    assert_eq!(config.global.max_concurrent_cache_jobs, 8);
-    assert!(config.global.update_pull_time);
-    assert!(config.global.immutable_tags);
-    assert_eq!(config.global.immutable_tags_exclusions.len(), 2);
-    assert_eq!(
-        config.global.immutable_tags_exclusions[0].as_source(),
-        "latest"
-    );
-    assert_eq!(
-        config.global.immutable_tags_exclusions[1].as_source(),
-        "dev"
-    );
-    assert!(
-        config.global.authorization_webhook.is_some(),
-        "global authorization_webhook should be resolved"
-    );
-    assert_eq!(
-        config.global.authorization_webhook.as_ref().unwrap().name,
-        "my-webhook"
-    );
-}
-
-#[test]
-fn test_ui_enabled_config() {
-    let config = r#"
-    [server]
-    bind_address = "0.0.0.0"
-
-    [ui]
-    enabled = true
-    "#;
-
-    let config = Configuration::load_from_str(config).unwrap();
-    assert!(config.ui.enabled);
-}
-
-#[test]
-fn test_ui_enabled_default_false() {
-    let config = r#"
-    [server]
-    bind_address = "0.0.0.0"
-    "#;
-
-    let config = Configuration::load_from_str(config).unwrap();
-    assert!(!config.ui.enabled);
-    assert_eq!(config.ui.name, "Angos");
-}
-
-#[test]
-fn test_ui_custom_name() {
-    let config = r#"
-    [server]
-    bind_address = "0.0.0.0"
-
-    [ui]
-    enabled = true
-    name = "my-registry"
-    "#;
-
-    let config = Configuration::load_from_str(config).unwrap();
-    assert!(config.ui.enabled);
-    assert_eq!(config.ui.name, "my-registry");
-}
-
-#[test]
 fn test_repository_config() {
     let config = r#"
     [server]
     bind_address = "0.0.0.0"
 
+    [auth.webhook.repo-auth]
+    url = "https://auth.example.com/authorize"
+    timeout_ms = 1000
+
+    [event_webhook.repo-events]
+    url = "https://events.example.com/hook"
+    policy = "optional"
+    events = ["manifest.push"]
+
     [repository.myapp]
     immutable_tags = true
     immutable_tags_exclusions = ["dev"]
+    authorization_webhook = "repo-auth"
+    event_webhooks = ["repo-events"]
+
+    [[repository.myapp.upstream]]
+    url = "https://registry.example.com"
+    max_redirect = 3
+    username = "mirror"
+    password = "secret"
+
+    [repository.myapp.access_policy]
+    default = "allow"
+    rules = ["identity.username == 'admin'"]
+
+    [repository.myapp.retention_policy]
+    rules = ["image.tag == 'latest'"]
     "#;
 
     let config = Configuration::load_from_str(config).unwrap();
     assert_eq!(config.repository.len(), 1);
-    assert!(config.repository.contains_key("myapp"));
-    assert!(config.repository["myapp"].immutable_tags);
+    let repo = &config.repository["myapp"];
+    assert_eq!(repo.upstream.len(), 1);
+    assert_eq!(repo.upstream[0].url, "https://registry.example.com");
+    assert_eq!(repo.upstream[0].max_redirect, 3);
+    assert_eq!(repo.upstream[0].username.as_deref(), Some("mirror"));
     assert_eq!(
-        config.repository["myapp"].immutable_tags_exclusions.len(),
-        1
+        repo.upstream[0]
+            .password
+            .as_ref()
+            .map(|p| p.expose().as_str()),
+        Some("secret")
     );
-}
-
-#[test]
-fn test_observability_config() {
-    let config = r#"
-    [server]
-    bind_address = "0.0.0.0"
-
-    [observability.tracing]
-    endpoint = "http://jaeger:4317"
-    sampling_rate = 0.1
-    "#;
-
-    let config = Configuration::load_from_str(config).unwrap();
-    assert!(config.observability.is_some());
-    let observability = config.observability.unwrap();
-    assert!(observability.tracing.is_some());
-    let tracing = observability.tracing.unwrap();
-    assert_eq!(tracing.endpoint, "http://jaeger:4317");
-    assert!((f64::from(tracing.sampling_rate) - 0.1).abs() < f64::EPSILON);
+    assert_eq!(repo.access_policy.default, AccessMode::Allow);
+    assert_eq!(repo.access_policy.rules.len(), 1);
+    assert_eq!(repo.retention_policy.rules.len(), 1);
+    assert!(repo.immutable_tags);
+    assert_eq!(repo.immutable_tags_exclusions.len(), 1);
+    assert_eq!(repo.immutable_tags_exclusions[0].as_source(), "dev");
+    assert_eq!(repo.authorization_webhook.as_deref(), Some("repo-auth"));
+    assert_eq!(repo.event_webhooks, ["repo-events"]);
 }
 
 #[test]
@@ -392,17 +319,20 @@ fn test_insecure_config_with_custom_port() {
     [server]
     bind_address = "127.0.0.1"
     port = 9000
-    query_timeout = 7200
-    query_timeout_grace_period = 120
+    query_timeout_secs = 7200
+    query_timeout_grace_period_secs = 120
     "#;
 
     let config = Configuration::load_from_str(config).unwrap();
     match config.server {
         ServerConfig::Insecure(insecure_config) => {
-            assert_eq!(insecure_config.bind_address.to_string(), "127.0.0.1");
-            assert_eq!(insecure_config.port, 9000);
-            assert_eq!(insecure_config.query_timeout, 7200);
-            assert_eq!(insecure_config.query_timeout_grace_period, 120);
+            assert_eq!(insecure_config.base.bind_address.to_string(), "127.0.0.1");
+            assert_eq!(insecure_config.base.port, 9000);
+            assert_eq!(insecure_config.base.query_timeout_secs.get(), 7200);
+            assert_eq!(
+                insecure_config.base.query_timeout_grace_period_secs.get(),
+                120
+            );
         }
         ServerConfig::Tls(_) => panic!("Expected Insecure server config"),
     }
@@ -524,7 +454,7 @@ fn test_ipv6_bind_address() {
     let config = Configuration::load_from_str(config).unwrap();
     match config.server {
         ServerConfig::Insecure(insecure_config) => {
-            assert_eq!(insecure_config.bind_address.to_string(), "::1");
+            assert_eq!(insecure_config.base.bind_address.to_string(), "::1");
         }
         ServerConfig::Tls(_) => panic!("Expected Insecure server config"),
     }
@@ -615,8 +545,8 @@ fn test_load_from_file() {
 
     match config.server {
         ServerConfig::Insecure(server_config) => {
-            assert_eq!(server_config.bind_address.to_string(), "127.0.0.1");
-            assert_eq!(server_config.port, 8080);
+            assert_eq!(server_config.base.bind_address.to_string(), "127.0.0.1");
+            assert_eq!(server_config.base.port, 8080);
         }
         ServerConfig::Tls(_) => panic!("Expected Insecure server config"),
     }
@@ -766,7 +696,7 @@ fn test_event_webhook_backward_compatible() {
 }
 
 #[test]
-fn test_event_webhook_invalid_config_fails_validation() {
+fn test_event_webhook_invalid_config_fails_deserialization() {
     let config = r#"
     [server]
     bind_address = "0.0.0.0"
@@ -1021,10 +951,6 @@ fn event_webhook_valid_repo_reference_loads() {
 
 #[test]
 fn event_webhook_empty_events_list_fails_load() {
-    // Exercises the nested-field validation path inside resolve_event_webhooks,
-    // which calls EventWebhookConfig::validate() and surfaces the error through
-    // load_from_str. This is distinct from the unit-level test in
-    // event_webhook/config.rs because it verifies the integration path.
     let config = r#"
     [server]
     bind_address = "0.0.0.0"

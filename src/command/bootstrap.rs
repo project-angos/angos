@@ -39,7 +39,7 @@ impl From<blob_store::Error> for Error {
 
 pub fn blob_stores(
     config: &blob_store::BlobStorageConfig,
-    auth_cache: &Arc<dyn Cache>,
+    auth_cache: &Arc<Cache>,
 ) -> Result<BlobStoreHandles, Error> {
     config
         .to_backend(Some(auth_cache.clone()))
@@ -48,7 +48,7 @@ pub fn blob_stores(
 
 pub async fn metadata_store(
     config: &MetadataStoreConfig,
-    auth_cache: &Arc<dyn Cache>,
+    auth_cache: &Arc<Cache>,
 ) -> Result<
     (
         Arc<dyn MetadataStore + Send + Sync>,
@@ -62,28 +62,30 @@ pub async fn metadata_store(
         .map_err(Error::from)
 }
 
-pub fn auth_cache(config: &cache::Config) -> Result<Arc<dyn Cache>, Error> {
+pub fn auth_cache(config: &cache::Config) -> Result<Arc<Cache>, Error> {
     config.to_backend().map_err(Error::from)
 }
 
-pub fn repository(
+pub async fn repository(
     name: &str,
     config: &repository::Config,
-    auth_cache: &Arc<dyn Cache>,
+    auth_cache: &Arc<Cache>,
 ) -> Result<Repository, Error> {
-    Repository::new(name, config, auth_cache).map_err(|source| Error::Repository {
-        name: name.to_string(),
-        source: Box::new(source),
-    })
+    Repository::new(name, config, auth_cache)
+        .await
+        .map_err(|source| Error::Repository {
+            name: name.to_string(),
+            source: Box::new(source),
+        })
 }
 
-pub fn repositories(
+pub async fn repositories(
     configs: &HashMap<String, repository::Config>,
-    auth_cache: &Arc<dyn Cache>,
+    auth_cache: &Arc<Cache>,
 ) -> Result<Arc<HashMap<String, Repository>>, Error> {
     let mut map = HashMap::with_capacity(configs.len());
     for (name, config) in configs {
-        map.insert(name.clone(), repository(name, config, auth_cache)?);
+        map.insert(name.clone(), repository(name, config, auth_cache).await?);
     }
     Ok(Arc::new(map))
 }
@@ -103,8 +105,8 @@ mod tests {
         assert!(result.is_ok());
     }
 
-    #[test]
-    fn repository_with_default_config_succeeds() {
+    #[tokio::test]
+    async fn repository_with_default_config_succeeds() {
         let repo_config = repository::Config {
             access_policy: AccessPolicyConfig {
                 default: AccessMode::Allow,
@@ -113,16 +115,16 @@ mod tests {
             ..repository::Config::default()
         };
         let cache = auth_cache(&cache::Config::Memory).unwrap();
-        let result = repository("test-repo", &repo_config, &cache);
+        let result = repository("test-repo", &repo_config, &cache).await;
         assert!(result.is_ok());
         assert_eq!(result.unwrap().name, "test-repo");
     }
 
-    #[test]
-    fn repositories_empty_map_succeeds() {
+    #[tokio::test]
+    async fn repositories_empty_map_succeeds() {
         let configs = HashMap::new();
         let cache = auth_cache(&cache::Config::Memory).unwrap();
-        let result = repositories(&configs, &cache);
+        let result = repositories(&configs, &cache).await;
         assert!(result.is_ok());
         assert_eq!(result.unwrap().len(), 0);
     }

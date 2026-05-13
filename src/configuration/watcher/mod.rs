@@ -15,7 +15,7 @@ use tokio::{sync::mpsc, time::timeout};
 use tracing::{debug, error, info, warn};
 
 use super::{Configuration, Error, ServerConfig};
-use crate::configuration::listeners::tls::ServerTlsConfig;
+use crate::configuration::listeners::ServerTlsConfig;
 
 /// Window during which filesystem events are coalesced into a single reload.
 /// Editors typically emit several `Modify`/`Create`/`Remove` events per save
@@ -115,9 +115,10 @@ fn compute_tls_dirs(config: &Configuration, config_dir: &Path) -> HashSet<PathBu
     .collect()
 }
 
-/// Resolves the active `Configuration`, loading from disk when the cache is
-/// empty.  Returns `None` and logs a warning if the disk load fails.
-fn resolve_config<'a>(
+/// Returns the cached `Configuration`, loading it from disk and storing it in
+/// `cached` when the cache is empty. Returns `None` and logs a warning if the
+/// disk load fails.
+fn ensure_config_cached<'a>(
     cached: &'a mut Option<Configuration>,
     config_path: &Path,
 ) -> Option<&'a Configuration> {
@@ -147,7 +148,7 @@ fn reload_tls(
     notifier: &dyn ConfigNotifier,
 ) {
     info!("TLS certificate change detected, reloading");
-    let Some(cfg) = resolve_config(cached_config, config_path) else {
+    let Some(cfg) = ensure_config_cached(cached_config, config_path) else {
         return;
     };
     match cfg {
@@ -191,43 +192,42 @@ fn build_watcher(
     Ok(watcher)
 }
 
-struct WatchPaths<'a> {
+struct WatchState<'a> {
+    rx: &'a mut mpsc::Receiver<Event>,
     config_path: &'a Path,
     config_dir: &'a Path,
     canonical_config_path: &'a Path,
     canonical_config_dir: &'a Path,
-    canonical_tls_dirs: &'a HashSet<PathBuf>,
-    tls_dirs: &'a HashSet<PathBuf>,
+    tls_dirs: HashSet<PathBuf>,
+    canonical_tls_dirs: HashSet<PathBuf>,
+    cached_config: &'a mut Option<Configuration>,
+    notifier: &'a dyn ConfigNotifier,
+    _watcher: notify::RecommendedWatcher,
 }
 
-async fn run_event_loop(
-    rx: &mut mpsc::Receiver<Event>,
-    paths: &WatchPaths<'_>,
-    cached_config: &mut Option<Configuration>,
-    notifier: &dyn ConfigNotifier,
-) -> bool {
+async fn run_event_loop(state: &mut WatchState<'_>) -> bool {
     loop {
-        let Some(event) = rx.recv().await else {
+        let Some(event) = state.rx.recv().await else {
             error!("Config watcher channel closed");
             return false;
         };
 
         let initial_kind = classify_event(
             &event,
-            paths.canonical_config_path,
-            paths.canonical_config_dir,
-            paths.canonical_tls_dirs,
+            state.canonical_config_path,
+            state.canonical_config_dir,
+            &state.canonical_tls_dirs,
         );
         if matches!(initial_kind, ChangeKind::Irrelevant) {
             continue;
         }
 
         let Some(kind) = coalesce_events(
-            rx,
+            state.rx,
             initial_kind,
-            paths.canonical_config_path,
-            paths.canonical_config_dir,
-            paths.canonical_tls_dirs,
+            state.canonical_config_path,
+            state.canonical_config_dir,
+            &state.canonical_tls_dirs,
         )
         .await
         else {
@@ -239,11 +239,11 @@ async fn run_event_loop(
             ChangeKind::Irrelevant => {}
             ChangeKind::Config => {
                 if reload_config(
-                    paths.config_path,
-                    paths.config_dir,
-                    cached_config,
-                    paths.tls_dirs,
-                    notifier,
+                    state.config_path,
+                    state.config_dir,
+                    state.cached_config,
+                    &state.tls_dirs,
+                    state.notifier,
                 )
                 .await
                 {
@@ -251,7 +251,7 @@ async fn run_event_loop(
                 }
             }
             ChangeKind::Tls => {
-                reload_tls(cached_config, paths.config_path, notifier);
+                reload_tls(state.cached_config, state.config_path, state.notifier);
             }
         }
     }
@@ -305,16 +305,20 @@ async fn watch_config_loop(
             .iter()
             .map(|d| fs::canonicalize(d).unwrap_or_else(|_| d.clone()))
             .collect();
-        let _watcher = build_watcher(&config_dir, &tls_dirs, tx.clone())?;
-        let paths = WatchPaths {
+        let watcher = build_watcher(&config_dir, &tls_dirs, tx.clone())?;
+        let mut state = WatchState {
+            rx: &mut rx,
             config_path: &config_path,
             config_dir: &config_dir,
             canonical_config_path: &canonical_config_path,
             canonical_config_dir: &canonical_config_dir,
-            canonical_tls_dirs: &canonical_tls_dirs,
-            tls_dirs: &tls_dirs,
+            tls_dirs,
+            canonical_tls_dirs,
+            cached_config: &mut cached_config,
+            notifier: notifier.as_ref(),
+            _watcher: watcher,
         };
-        if !run_event_loop(&mut rx, &paths, &mut cached_config, notifier.as_ref()).await {
+        if !run_event_loop(&mut state).await {
             return Ok(());
         }
     }

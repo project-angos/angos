@@ -1,10 +1,9 @@
-use async_trait::async_trait;
 use redis::AsyncCommands;
 use serde::{Deserialize, Deserializer};
 use tokio::sync::OnceCell;
 use tracing::info;
 
-use crate::cache::{Cache, Error};
+use crate::cache::Error;
 
 #[derive(Clone, Debug, Deserialize, PartialEq)]
 pub struct BackendConfig {
@@ -61,24 +60,21 @@ impl Backend {
             .await
             .cloned()
     }
-}
 
-#[async_trait]
-impl Cache for Backend {
-    async fn store_value(&self, key: &str, value: &str, expires_in: u64) -> Result<(), Error> {
+    pub async fn store_value(&self, key: &str, value: &str, ttl: u64) -> Result<(), Error> {
         let mut conn = self.connection().await?;
         let key = format!("{}{key}", self.key_prefix);
-        Ok(conn.set_ex(key, value, expires_in).await?)
+        Ok(conn.set_ex(key, value, ttl).await?)
     }
 
-    async fn retrieve_value(&self, key: &str) -> Result<Option<String>, Error> {
+    pub async fn retrieve_value(&self, key: &str) -> Result<Option<String>, Error> {
         let mut conn = self.connection().await?;
         let key = format!("{}{key}", self.key_prefix);
         let value: Option<String> = conn.get(key).await?;
         Ok(value)
     }
 
-    async fn delete_value(&self, key: &str) -> Result<(), Error> {
+    pub async fn delete_value(&self, key: &str) -> Result<(), Error> {
         let mut conn = self.connection().await?;
         let key = format!("{}{key}", self.key_prefix);
         let () = conn.del(key).await?;

@@ -79,6 +79,44 @@ mod tests {
     }
 
     #[test]
+    fn test_explicit_s3_config_is_not_overridden_by_s3_blob_store() {
+        let config_str = r#"
+        [server]
+        bind_address = "0.0.0.0"
+
+        [blob_store.s3]
+        bucket = "blob-bucket"
+        region = "us-east-1"
+        endpoint = "https://s3.amazonaws.com"
+        access_key_id = "blob-key"
+        secret_key = "blob-secret"
+
+        [metadata_store.s3]
+        bucket = "metadata-bucket"
+        region = "eu-west-1"
+        endpoint = "https://metadata.example.com"
+        access_key_id = "meta-key"
+        secret_key = "meta-secret"
+        "#;
+
+        let config = Configuration::load_from_str(config_str).unwrap();
+        assert!(
+            matches!(config.metadata_store, MetadataStoreConfig::S3(_)),
+            "explicit [metadata_store.s3] must not be Inherit"
+        );
+
+        let resolved = config.resolve_metadata_config();
+        match resolved {
+            MetadataStoreConfig::S3(s3_config) => {
+                assert_eq!(s3_config.bucket, "metadata-bucket");
+                assert_eq!(s3_config.region, "eu-west-1");
+                assert_eq!(s3_config.endpoint, "https://metadata.example.com");
+            }
+            other => panic!("expected explicit S3 metadata config, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn test_inherit_resolves_to_s3_from_s3_blob_store() {
         let config_str = r#"
         [server]

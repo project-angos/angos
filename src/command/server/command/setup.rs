@@ -12,7 +12,7 @@ use crate::{
 
 pub async fn build_metadata_store(
     config: &Configuration,
-    cache: &Arc<dyn Cache>,
+    cache: &Arc<Cache>,
     cached_capabilities: &Arc<Mutex<Option<ConditionalCapabilities>>>,
 ) -> Result<Arc<dyn MetadataStore>, Error> {
     let mut metadata_config = config.resolve_metadata_config();
@@ -47,9 +47,9 @@ pub async fn build_registry(
     let auth_cache = bootstrap::auth_cache(&config.cache)?;
     let blob_handles = bootstrap::blob_stores(&config.blob_store, &auth_cache)?;
     let metadata_store = build_metadata_store(config, &auth_cache, cached_capabilities).await?;
-    let repositories = bootstrap::repositories(&config.repository, &auth_cache)?;
+    let repositories = bootstrap::repositories(&config.repository, &auth_cache).await?;
 
-    let registry_config = RegistryConfig::new()
+    let registry_config = RegistryConfig::default()
         .update_pull_time(config.global.update_pull_time)
         .enable_blob_redirect(config.global.resolved_enable_blob_redirect())
         .enable_manifest_redirect(config.global.resolved_enable_manifest_redirect())
@@ -57,17 +57,13 @@ pub async fn build_registry(
         .global_immutable_tags(config.global.immutable_tags)
         .global_immutable_tags_exclusions(config.global.immutable_tags_exclusions.clone());
 
-    let Ok(registry) = Registry::new(
+    Registry::new(
         blob_handles.blob_store,
         blob_handles.upload_store,
         blob_handles.presigned_store,
         metadata_store,
         repositories,
         registry_config,
-    ) else {
-        let msg = "Failed to initialize registry".to_string();
-        return Err(Error::Initialization(msg));
-    };
-
-    Ok(registry)
+    )
+    .map_err(|e| Error::Initialization(e.to_string()))
 }

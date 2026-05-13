@@ -1,18 +1,17 @@
 use std::{sync::Arc, time::Duration};
 
 use hyper::http::{HeaderMap, request::Parts};
-use reqwest::{Client, redirect::Policy};
+use reqwest::Client;
 use tracing::warn;
 
-use super::{
-    cache::lookup_cached_decision,
-    config::Config,
-    headers::{build_cache_key, build_headers},
-    metrics::{WEBHOOK_DURATION, WEBHOOK_REQUESTS},
-    tls::{load_certificate_bundle, load_identity},
-};
 use crate::{
-    cache::{Cache, CacheExt},
+    auth::webhook::{
+        cache::lookup_cached_decision,
+        config::Config,
+        headers::{build_cache_key, build_headers},
+        metrics::{WEBHOOK_DURATION, WEBHOOK_REQUESTS},
+    },
+    cache::Cache,
     command::server::Error,
     identity::{Action, ClientIdentity},
 };
@@ -21,7 +20,7 @@ pub struct WebhookAuthorizer {
     name: String,
     config: Config,
     client: Client,
-    cache: Arc<dyn Cache>,
+    cache: Arc<Cache>,
 }
 
 impl WebhookAuthorizer {
@@ -29,29 +28,13 @@ impl WebhookAuthorizer {
         &self.name
     }
 
-    pub fn new(name: String, config: Config, cache: Arc<dyn Cache>) -> Result<Self, Error> {
-        let mut client_builder = Client::builder()
-            .redirect(Policy::none())
-            .timeout(Duration::from_millis(config.timeout_ms));
-
-        if let Some(ca_bundle) = &config.server_ca_bundle {
-            let ca_bundle_certs = load_certificate_bundle(ca_bundle)?;
-            for cert in ca_bundle_certs {
-                client_builder = client_builder.add_root_certificate(cert);
-            }
-        }
-
-        let identity = load_identity(
-            config.client_certificate_bundle.as_ref(),
-            config.client_private_key.as_ref(),
-        )?;
-        if let Some(identity) = identity {
-            client_builder = client_builder.identity(identity);
-        }
-
-        let client = client_builder
-            .build()
-            .map_err(|e| Error::Initialization(format!("Failed to create HTTP client: {e}")))?;
+    pub fn new(
+        name: String,
+        config: Config,
+        client: Client,
+        cache: Arc<Cache>,
+    ) -> Result<Self, Error> {
+        config.validate().map_err(Error::Initialization)?;
 
         Ok(Self {
             name,
@@ -62,7 +45,10 @@ impl WebhookAuthorizer {
     }
 
     async fn do_request(&self, headers: &HeaderMap) -> Result<reqwest::Response, reqwest::Error> {
-        let mut request = self.client.get(self.config.url.clone());
+        let mut request = self
+            .client
+            .get(self.config.url.clone())
+            .timeout(Duration::from_millis(self.config.timeout_ms));
         for (key, value) in headers {
             request = request.header(key, value);
         }
@@ -102,7 +88,8 @@ impl WebhookAuthorizer {
         let cache_key = build_cache_key(&self.name, action, identity);
 
         if let Ok(cache_key) = &cache_key
-            && let Some(cached) = lookup_cached_decision(&self.cache, &self.name, cache_key).await
+            && let Some(cached) =
+                lookup_cached_decision(self.cache.as_ref(), &self.name, cache_key).await
         {
             return Ok(cached);
         }

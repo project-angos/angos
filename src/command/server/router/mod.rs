@@ -36,7 +36,6 @@ pub fn parse(method: &Method, uri: &Uri) -> Option<Action> {
 
     if let Some(api_path) = path.strip_prefix("/v2/") {
         return try_parse_extension(method, api_path)
-            .or_else(|| try_parse_uploads(method, api_path, params))
             .or_else(|| try_parse_upload(method, api_path, params))
             .or_else(|| try_find_blobs(method, api_path))
             .or_else(|| try_find_manifests(method, api_path))
@@ -98,10 +97,9 @@ fn try_parse_extension(method: &Method, path: &str) -> Option<Action> {
         return Some(Action::ListRepositories);
     }
 
-    if let Some(repository) = path.strip_suffix("/_namespaces") {
-        return Some(Action::ListNamespaces {
-            repository: repository.to_string(),
-        });
+    if let Some(repository_str) = path.strip_suffix("/_namespaces") {
+        let repository = Namespace::new(repository_str).ok()?;
+        return Some(Action::ListNamespaces { repository });
     }
 
     if let Some(namespace_str) = path.strip_suffix("/_revisions") {
@@ -117,46 +115,38 @@ fn try_parse_extension(method: &Method, path: &str) -> Option<Action> {
     None
 }
 
-fn try_parse_uploads(method: &Method, path: &str, params: Option<&str>) -> Option<Action> {
-    let suffixes = ["/blobs/uploads", "/blobs/uploads/"];
-
-    for suffix in suffixes {
-        if let Some(namespace_str) = path.strip_suffix(suffix)
-            && method == Method::POST
-        {
-            let namespace = Namespace::new(namespace_str).ok()?;
-            let digest = digest_from_params(params);
-
-            return Some(Action::StartUpload { namespace, digest });
-        }
-    }
-
-    None
-}
-
 fn try_parse_upload(method: &Method, path: &str, params: Option<&str>) -> Option<Action> {
-    if let Some((namespace_str, uuid)) = path.rsplit_once("/blobs/uploads/") {
+    if let Some(namespace_str) = path
+        .strip_suffix("/blobs/uploads")
+        .or_else(|| path.strip_suffix("/blobs/uploads/"))
+    {
         let namespace = Namespace::new(namespace_str).ok()?;
-        let uuid = Uuid::from_str(uuid).ok()?;
+        let digest = digest_from_params(params);
 
-        match *method {
-            Method::GET => return Some(Action::GetUpload { namespace, uuid }),
-            Method::PATCH => return Some(Action::PatchUpload { namespace, uuid }),
-            Method::PUT => {
-                if let Some(digest) = digest_from_params(params) {
-                    return Some(Action::PutUpload {
-                        namespace,
-                        uuid,
-                        digest,
-                    });
-                }
-            }
-            Method::DELETE => return Some(Action::DeleteUpload { namespace, uuid }),
-            _ => {}
-        }
+        return match *method {
+            Method::POST => Some(Action::StartUpload { namespace, digest }),
+            _ => None,
+        };
     }
 
-    None
+    let (namespace_str, uuid) = path.rsplit_once("/blobs/uploads/")?;
+    let namespace = Namespace::new(namespace_str).ok()?;
+    let uuid = Uuid::from_str(uuid).ok()?;
+
+    match *method {
+        Method::GET => Some(Action::GetUpload { namespace, uuid }),
+        Method::PATCH => Some(Action::PatchUpload { namespace, uuid }),
+        Method::PUT => {
+            let digest = digest_from_params(params)?;
+            Some(Action::PutUpload {
+                namespace,
+                uuid,
+                digest,
+            })
+        }
+        Method::DELETE => Some(Action::DeleteUpload { namespace, uuid }),
+        _ => None,
+    }
 }
 
 fn try_find_blobs(method: &Method, path: &str) -> Option<Action> {

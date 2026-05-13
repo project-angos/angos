@@ -12,8 +12,7 @@ use crate::{
         ServerContext,
         error::Error,
         handlers::build_response,
-        http_server::event_emission::dispatch_events,
-        request_ext::{HeaderExt, incoming_into_async_read},
+        request::{incoming_into_async_read, parse_header, range},
         response_body::ResponseBody,
     },
     event_webhook::event::{Event, EventActor},
@@ -118,8 +117,8 @@ pub async fn dispatch_patch_upload(
     namespace: &Namespace,
     uuid: Uuid,
 ) -> Result<Response<ResponseBody>, Error> {
-    let start_offset = parts.range(CONTENT_RANGE)?.map(|(start, _)| start);
-    let content_length: u64 = parts.parse_header(CONTENT_LENGTH).unwrap_or(0);
+    let start_offset = range(&parts.headers, CONTENT_RANGE)?.map(|(start, _)| start);
+    let content_length: u64 = parse_header(&parts.headers, CONTENT_LENGTH).unwrap_or(0);
     let body_stream = incoming_into_async_read(incoming);
 
     handle_patch_upload(
@@ -142,7 +141,7 @@ pub async fn dispatch_put_upload(
     digest: Digest,
     identity: &ClientIdentity,
 ) -> Result<Response<ResponseBody>, Error> {
-    let content_length: u64 = parts.parse_header(CONTENT_LENGTH).unwrap_or(0);
+    let content_length: u64 = parse_header(&parts.headers, CONTENT_LENGTH).unwrap_or(0);
     let body_stream = incoming_into_async_read(incoming);
 
     let (response, events) = handle_put_upload(
@@ -156,6 +155,6 @@ pub async fn dispatch_put_upload(
     )
     .await?;
 
-    dispatch_events(context, events).await?;
+    context.dispatch_events(&events).await?;
     Ok(response)
 }

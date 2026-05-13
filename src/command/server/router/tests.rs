@@ -598,10 +598,10 @@ fn test_parse_pagination_last_url_encoded_special_chars() {
 }
 
 #[test]
-fn test_try_parse_uploads_post_method() {
+fn test_try_parse_upload_start_post_method() {
     let method = Method::POST;
     let path = "myrepo/app/blobs/uploads";
-    let route = try_parse_uploads(&method, path, None);
+    let route = try_parse_upload(&method, path, None);
     assert!(route.is_some());
     if let Some(Action::StartUpload { namespace, digest }) = route {
         assert_eq!(namespace, "myrepo/app");
@@ -612,51 +612,51 @@ fn test_try_parse_uploads_post_method() {
 }
 
 #[test]
-fn test_try_parse_uploads_wrong_method() {
+fn test_try_parse_upload_start_wrong_method() {
     let method = Method::GET;
     let path = "myrepo/app/blobs/uploads";
-    let route = try_parse_uploads(&method, path, None);
+    let route = try_parse_upload(&method, path, None);
     assert!(route.is_none());
 }
 
 #[test]
-fn test_try_parse_uploads_no_slash() {
+fn test_try_parse_upload_start_no_slash() {
     let method = Method::POST;
 
     // No-slash variant: /v2/foo/blobs/uploads → StartUpload for namespace "foo".
-    let route = try_parse_uploads(&method, "foo/blobs/uploads", None);
+    let route = try_parse_upload(&method, "foo/blobs/uploads", None);
     assert!(
         matches!(route, Some(Action::StartUpload { ref namespace, digest: None }) if namespace == "foo"),
         "no-slash variant must yield StartUpload with correct namespace"
     );
 
     // With-slash variant: /v2/foo/blobs/uploads/ → same result.
-    let route = try_parse_uploads(&method, "foo/blobs/uploads/", None);
+    let route = try_parse_upload(&method, "foo/blobs/uploads/", None);
     assert!(
         matches!(route, Some(Action::StartUpload { ref namespace, digest: None }) if namespace == "foo"),
         "with-slash variant must yield StartUpload with correct namespace"
     );
 
     // Nested namespace without slash.
-    let route = try_parse_uploads(&method, "org/team/blobs/uploads", None);
+    let route = try_parse_upload(&method, "org/team/blobs/uploads", None);
     assert!(
         matches!(route, Some(Action::StartUpload { ref namespace, .. }) if namespace == "org/team"),
         "nested namespace without slash must parse correctly"
     );
 
     // Invalid namespace: empty string before the suffix.
-    let route = try_parse_uploads(&method, "blobs/uploads", None);
+    let route = try_parse_upload(&method, "blobs/uploads", None);
     assert!(route.is_none(), "empty namespace must not yield a route");
 
     // Invalid namespace: contains uppercase letter.
-    let route = try_parse_uploads(&method, "MyRepo/blobs/uploads", None);
+    let route = try_parse_upload(&method, "MyRepo/blobs/uploads", None);
     assert!(
         route.is_none(),
         "uppercase namespace must not yield a route"
     );
 
     // Invalid namespace: contains a space (invalid character).
-    let route = try_parse_uploads(&method, "bad ns/blobs/uploads", None);
+    let route = try_parse_upload(&method, "bad ns/blobs/uploads", None);
     assert!(
         route.is_none(),
         "namespace with space must not yield a route"
@@ -847,6 +847,46 @@ fn test_parse_list_revisions_nested_namespace() {
 fn test_parse_list_revisions_post_not_allowed() {
     let method = Method::POST;
     let uri: Uri = "/v2/_ext/myrepo/_revisions".parse().unwrap();
+    let route = parse(&method, &uri);
+    assert!(route.is_none());
+}
+
+#[test]
+fn test_parse_list_namespaces() {
+    let method = Method::GET;
+    let uri: Uri = "/v2/_ext/myrepo/_namespaces".parse().unwrap();
+    let route = parse(&method, &uri);
+    if let Some(Action::ListNamespaces { repository }) = route {
+        assert_eq!(repository, "myrepo");
+    } else {
+        panic!("Expected ListNamespaces route");
+    }
+}
+
+#[test]
+fn test_parse_list_namespaces_nested() {
+    let method = Method::GET;
+    let uri: Uri = "/v2/_ext/org/team/_namespaces".parse().unwrap();
+    let route = parse(&method, &uri);
+    if let Some(Action::ListNamespaces { repository }) = route {
+        assert_eq!(repository, "org/team");
+    } else {
+        panic!("Expected ListNamespaces route");
+    }
+}
+
+#[test]
+fn test_parse_list_namespaces_invalid_repository_returns_none() {
+    let method = Method::GET;
+    let uri: Uri = "/v2/_ext/INVALID/_namespaces".parse().unwrap();
+    let route = parse(&method, &uri);
+    assert!(route.is_none());
+}
+
+#[test]
+fn test_parse_list_namespaces_post_not_allowed() {
+    let method = Method::POST;
+    let uri: Uri = "/v2/_ext/myrepo/_namespaces".parse().unwrap();
     let route = parse(&method, &uri);
     assert!(route.is_none());
 }

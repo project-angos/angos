@@ -11,6 +11,7 @@ pub use authorizer::Authorizer;
 pub use basic_auth::BasicAuthValidator;
 use hyper::http::request::Parts;
 pub use mtls::{MtlsValidator, PeerCertificate};
+pub use oidc::OidcValidator;
 
 use crate::{command::server::Error, identity::ClientIdentity};
 

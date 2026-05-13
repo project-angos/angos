@@ -1,22 +1,31 @@
-use std::{collections::HashMap, net::SocketAddr, sync::Arc};
+use std::{collections::HashMap, net::SocketAddr, sync::Arc, time::Duration};
 
 use hyper::http::request::Parts;
+use reqwest::Client;
+use serde::Deserialize;
 use tracing::{debug, info, instrument, warn};
 
-use super::{
-    AuthMiddleware, AuthResult, BasicAuthValidator, MtlsValidator, basic_auth, oidc,
-    oidc::OidcValidator, webhook,
-};
 use crate::{
-    cache::Cache, command::server::Error, configuration::Configuration, identity::ClientIdentity,
+    auth::{
+        AuthMiddleware, AuthResult, BasicAuthValidator, MtlsValidator, OidcValidator, basic_auth,
+        oidc, webhook,
+    },
+    cache::Cache,
+    command::server::Error,
+    configuration::Configuration,
+    http_client::HttpClientBuilder,
+    identity::ClientIdentity,
     metrics_provider::metrics_provider,
 };
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Deserialize)]
 pub struct AuthConfig {
+    #[serde(default)]
     pub identity: HashMap<String, basic_auth::Config>,
+    #[serde(default)]
     pub oidc: HashMap<String, oidc::Config>,
-    pub webhook: HashMap<String, Arc<webhook::Config>>,
+    #[serde(default)]
+    pub webhook: HashMap<String, webhook::Config>,
 }
 
 type OidcValidators = Vec<(String, Arc<dyn AuthMiddleware>)>;
@@ -40,18 +49,6 @@ struct AuthOutcome {
     identity: ClientIdentity,
 }
 
-fn combine_outcome(
-    mtls_ok: bool,
-    oidc_ok: bool,
-    basic_ok: bool,
-    identity: ClientIdentity,
-) -> AuthOutcome {
-    AuthOutcome {
-        method: select_auth_method(mtls_ok, oidc_ok, basic_ok),
-        identity,
-    }
-}
-
 /// Coordinates all authentication methods and handles the authentication chain
 pub struct Authenticator {
     mtls_validator: MtlsValidator,
@@ -60,11 +57,17 @@ pub struct Authenticator {
 }
 
 impl Authenticator {
-    pub fn new(config: &Configuration, cache: &Arc<dyn Cache>) -> Result<Self, Error> {
+    pub fn new(config: &Configuration, cache: &Arc<Cache>) -> Result<Self, Error> {
         let auth_config = &config.auth;
+        let oidc_client = Arc::new(
+            HttpClientBuilder::new()
+                .timeout(Duration::from_secs(30))
+                .build()
+                .map_err(Error::Initialization)?,
+        );
 
         let mtls_validator = MtlsValidator::new();
-        let oidc_validators = Self::build_oidc_validators(auth_config, cache)?;
+        let oidc_validators = Self::build_oidc_validators(auth_config, &oidc_client, cache);
         let basic_auth_validator = BasicAuthValidator::new(&auth_config.identity);
 
         Ok(Self {
@@ -76,17 +79,23 @@ impl Authenticator {
 
     fn build_oidc_validators(
         auth_config: &AuthConfig,
-        cache: &Arc<dyn Cache>,
-    ) -> Result<OidcValidators, Error> {
+        client: &Arc<Client>,
+        cache: &Arc<Cache>,
+    ) -> OidcValidators {
         let mut validators = Vec::with_capacity(auth_config.oidc.len());
 
         for (name, oidc_config) in &auth_config.oidc {
-            let validator = OidcValidator::new(name.clone(), oidc_config, cache.clone())?;
+            let validator = OidcValidator::new(
+                name.clone(),
+                oidc_config,
+                Arc::clone(client),
+                Arc::clone(cache),
+            );
             validators.push((name.clone(), Arc::new(validator) as Arc<dyn AuthMiddleware>));
         }
 
         validators.sort_by(|a, b| a.0.cmp(&b.0));
-        Ok(validators)
+        validators
     }
 
     /// Authentication order: mTLS → OIDC → Basic Auth
@@ -106,7 +115,10 @@ impl Authenticator {
             self.try_basic_authentication(parts, &mut identity).await?
         };
 
-        let outcome = combine_outcome(mtls_ok, oidc_ok, basic_ok, identity);
+        let outcome = AuthOutcome {
+            method: select_auth_method(mtls_ok, oidc_ok, basic_ok),
+            identity,
+        };
         tracing::Span::current().record("auth_method", outcome.method.unwrap_or("anonymous"));
         Ok(outcome.identity)
     }
@@ -227,49 +239,20 @@ mod tests {
     use hyper::{Request, header::AUTHORIZATION};
 
     use super::*;
-    use crate::{cache, configuration::Configuration, metrics_provider};
+    use crate::{
+        cache,
+        configuration::Configuration,
+        metrics_provider,
+        test_fixtures::configuration::{load_config, minimal_config},
+    };
 
     fn create_minimal_config() -> Configuration {
         metrics_provider::init_for_tests();
-        let toml = r#"
-            [blob_store.fs]
-            root_dir = "/tmp/test"
-
-            [metadata_store.fs]
-            root_dir = "/tmp/test"
-
-            [cache.memory]
-
-            [server]
-            bind_address = "0.0.0.0"
-            port = 8000
-
-            [global]
-            update_pull_time = false
-            max_concurrent_cache_jobs = 10
-        "#;
-
-        Configuration::load_from_str(toml).unwrap()
+        minimal_config()
     }
 
-    fn minimal_config_prefix() -> &'static str {
-        r#"
-            [blob_store.fs]
-            root_dir = "/tmp/test"
-
-            [metadata_store.fs]
-            root_dir = "/tmp/test"
-
-            [cache.memory]
-
-            [server]
-            bind_address = "0.0.0.0"
-            port = 8000
-
-            [global]
-            update_pull_time = false
-            max_concurrent_cache_jobs = 10
-        "#
+    fn test_http_client() -> Arc<Client> {
+        Arc::new(Client::new())
     }
 
     #[test]
@@ -282,50 +265,43 @@ mod tests {
 
     #[test]
     fn test_auth_config_with_identity() {
-        let toml = format!(
-            r#"{}
+        let config = load_config(
+            r#"
             [auth.identity.user1]
             username = "user1"
             password = "$argon2id$v=19$m=19456,t=2,p=1$test"
         "#,
-            minimal_config_prefix()
         );
 
-        let config = Configuration::load_from_str(&toml).unwrap();
         assert_eq!(config.auth.identity.len(), 1);
         assert!(config.auth.identity.contains_key("user1"));
     }
 
     #[test]
     fn test_auth_config_with_oidc() {
-        let toml = format!(
-            r#"{}
+        let config = load_config(
+            r#"
             [auth.oidc.github]
             provider = "github"
         "#,
-            minimal_config_prefix()
         );
 
-        let config = Configuration::load_from_str(&toml).unwrap();
         assert_eq!(config.auth.oidc.len(), 1);
         assert!(config.auth.oidc.contains_key("github"));
     }
 
     #[test]
     fn test_auth_config_with_webhook() {
-        let toml = format!(
-            r#"{}
+        let config = load_config(
+            r#"
             [auth.webhook.test]
             url = "http://localhost:8080/auth"
             timeout_ms = 5000
         "#,
-            minimal_config_prefix()
         );
 
-        let config = Configuration::load_from_str(&toml).unwrap();
         assert_eq!(config.auth.webhook.len(), 1);
         assert!(config.auth.webhook.contains_key("test"));
-        assert_eq!(config.auth.webhook["test"].name, "test");
     }
 
     #[test]
@@ -340,16 +316,14 @@ mod tests {
 
     #[test]
     fn test_authenticator_new_with_basic_auth() {
-        let toml = format!(
-            r#"{}
+        let config = load_config(
+            r#"
             [auth.identity.testuser]
             username = "testuser"
             password = "$argon2id$v=19$m=19456,t=2,p=1$test"
         "#,
-            minimal_config_prefix()
         );
 
-        let config = Configuration::load_from_str(&toml).unwrap();
         let cache = cache::Config::Memory.to_backend().unwrap();
 
         let authenticator = Authenticator::new(&config, &cache);
@@ -362,59 +336,53 @@ mod tests {
         let auth_config = AuthConfig::default();
         let cache = cache::Config::Memory.to_backend().unwrap();
 
-        let validators = Authenticator::build_oidc_validators(&auth_config, &cache);
+        let validators =
+            Authenticator::build_oidc_validators(&auth_config, &test_http_client(), &cache);
 
-        assert!(validators.is_ok());
-        assert!(validators.unwrap().is_empty());
+        assert!(validators.is_empty());
     }
 
     #[test]
     fn test_build_oidc_validators_with_github() {
-        let toml = format!(
-            r#"{}
+        let config = load_config(
+            r#"
             [auth.oidc.github]
             provider = "github"
         "#,
-            minimal_config_prefix()
         );
 
-        let config = Configuration::load_from_str(&toml).unwrap();
         let cache = cache::Config::Memory.to_backend().unwrap();
 
-        let validators = Authenticator::build_oidc_validators(&config.auth, &cache);
+        let validators =
+            Authenticator::build_oidc_validators(&config.auth, &test_http_client(), &cache);
 
-        assert!(validators.is_ok());
-        let validators = validators.unwrap();
         assert_eq!(validators.len(), 1);
         assert_eq!(validators[0].0, "github");
     }
 
     #[test]
     fn test_build_oidc_validators_with_generic() {
-        let toml = format!(
-            r#"{}
+        let config = load_config(
+            r#"
             [auth.oidc.custom]
             provider = "generic"
             issuer = "https://auth.example.com"
         "#,
-            minimal_config_prefix()
         );
 
-        let config = Configuration::load_from_str(&toml).unwrap();
         let cache = cache::Config::Memory.to_backend().unwrap();
 
-        let validators = Authenticator::build_oidc_validators(&config.auth, &cache);
+        let validators =
+            Authenticator::build_oidc_validators(&config.auth, &test_http_client(), &cache);
 
-        assert!(validators.is_ok());
-        let validators = validators.unwrap();
         assert_eq!(validators.len(), 1);
         assert_eq!(validators[0].0, "custom");
     }
 
     #[test]
     fn test_build_oidc_validators_multiple() {
-        let toml = format!(
-            r#"{}
+        let config = load_config(
+            r#"
             [auth.oidc.github]
             provider = "github"
 
@@ -422,16 +390,13 @@ mod tests {
             provider = "generic"
             issuer = "https://auth.example.com"
         "#,
-            minimal_config_prefix()
         );
 
-        let config = Configuration::load_from_str(&toml).unwrap();
         let cache = cache::Config::Memory.to_backend().unwrap();
 
-        let validators = Authenticator::build_oidc_validators(&config.auth, &cache);
+        let validators =
+            Authenticator::build_oidc_validators(&config.auth, &test_http_client(), &cache);
 
-        assert!(validators.is_ok());
-        let validators = validators.unwrap();
         assert_eq!(validators.len(), 2);
     }
 
@@ -460,16 +425,14 @@ mod tests {
         let argon = Argon2::new(Algorithm::Argon2id, Version::V0x13, config);
         let password_hash = argon.hash_password(b"testpass", &salt).unwrap().to_string();
 
-        let toml = format!(
-            r#"{}
+        let config = load_config(&format!(
+            r#"
             [auth.identity.testuser]
             username = "testuser"
             password = "{password_hash}"
         "#,
-            minimal_config_prefix()
-        );
+        ));
 
-        let config = Configuration::load_from_str(&toml).unwrap();
         let cache = cache::Config::Memory.to_backend().unwrap();
         let authenticator = Authenticator::new(&config, &cache).unwrap();
 
@@ -490,21 +453,20 @@ mod tests {
 
     #[tokio::test]
     async fn test_authenticate_request_with_invalid_basic_auth() {
+        metrics_provider::init_for_tests();
         let salt = SaltString::generate(OsRng);
         let config = Params::default();
         let argon = Argon2::new(Algorithm::Argon2id, Version::V0x13, config);
         let password_hash = argon.hash_password(b"testpass", &salt).unwrap().to_string();
 
-        let toml = format!(
-            r#"{}
+        let config = load_config(&format!(
+            r#"
             [auth.identity.testuser]
             username = "testuser"
             password = "{password_hash}"
         "#,
-            minimal_config_prefix()
-        );
+        ));
 
-        let config = Configuration::load_from_str(&toml).unwrap();
         let cache = cache::Config::Memory.to_backend().unwrap();
         let authenticator = Authenticator::new(&config, &cache).unwrap();
 
@@ -517,9 +479,7 @@ mod tests {
 
         let result = authenticator.authenticate_request(&parts, None).await;
 
-        assert!(result.is_ok());
-        let identity = result.unwrap();
-        assert!(identity.username.is_none());
+        assert!(matches!(result, Err(Error::Unauthorized(_))));
     }
 
     #[test]
@@ -553,26 +513,6 @@ mod tests {
         assert_eq!(select_auth_method(false, false, false), None);
     }
 
-    #[test]
-    fn combine_outcome_returns_method_from_select_auth_method() {
-        let outcome = combine_outcome(true, false, false, ClientIdentity::new(None));
-        assert_eq!(outcome.method, Some("mtls"));
-    }
-
-    #[test]
-    fn combine_outcome_passes_identity_through_unchanged() {
-        let mut identity = ClientIdentity::new(None);
-        identity.username = Some("alice".into());
-        let outcome = combine_outcome(false, false, true, identity);
-        assert_eq!(outcome.identity.username, Some("alice".into()));
-    }
-
-    #[test]
-    fn combine_outcome_returns_anonymous_when_no_method_succeeded() {
-        let outcome = combine_outcome(false, false, false, ClientIdentity::new(None));
-        assert_eq!(outcome.method, None);
-    }
-
     #[tokio::test]
     async fn test_authenticate_request_preserves_client_ip() {
         let config = create_minimal_config();
@@ -596,8 +536,8 @@ mod tests {
     fn test_build_oidc_validators_multiple_are_sorted_by_name() {
         // "custom" < "github" alphabetically; HashMap iteration order is non-deterministic,
         // so this test would be flaky without the explicit sort added in build_oidc_validators.
-        let toml = format!(
-            r#"{}
+        let config = load_config(
+            r#"
             [auth.oidc.github]
             provider = "github"
 
@@ -605,13 +545,12 @@ mod tests {
             provider = "generic"
             issuer = "https://auth.example.com"
         "#,
-            minimal_config_prefix()
         );
 
-        let config = Configuration::load_from_str(&toml).unwrap();
         let cache = cache::Config::Memory.to_backend().unwrap();
 
-        let validators = Authenticator::build_oidc_validators(&config.auth, &cache).unwrap();
+        let validators =
+            Authenticator::build_oidc_validators(&config.auth, &test_http_client(), &cache);
 
         assert_eq!(validators.len(), 2);
         assert_eq!(validators[0].0, "custom");
@@ -882,15 +821,13 @@ mod tests {
         let argon = Argon2::new(Algorithm::Argon2id, Version::V0x13, Params::default());
         let password_hash = argon.hash_password(b"secret", &salt).unwrap().to_string();
 
-        let toml = format!(
-            r#"{}
+        let config = load_config(&format!(
+            r#"
             [auth.identity.admin]
             username = "admin"
             password = "{password_hash}"
         "#,
-            minimal_config_prefix()
-        );
-        let config = Configuration::load_from_str(&toml).unwrap();
+        ));
         let basic_auth_validator = BasicAuthValidator::new(&config.auth.identity);
 
         let oidc_validators: OidcValidators = vec![(

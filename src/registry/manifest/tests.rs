@@ -112,6 +112,7 @@ async fn test_put_manifest() {
             .unwrap();
 
         assert_eq!(header_digest(&response.headers), digest);
+        test_case.cleanup().await;
     }
 }
 
@@ -165,6 +166,7 @@ async fn test_get_manifest() {
         assert_eq!(manifest.content, content);
         assert_eq!(manifest.media_type.unwrap(), media_type);
         assert_eq!(manifest.digest, header_digest(&response.headers));
+        test_case.cleanup().await;
     }
 }
 
@@ -230,6 +232,7 @@ async fn test_head_manifest() {
             manifest.headers[CONTENT_LENGTH.as_str()],
             content.len().to_string()
         );
+        test_case.cleanup().await;
     }
 }
 
@@ -295,6 +298,7 @@ async fn test_delete_manifest() {
                 .await
                 .is_err()
         );
+        test_case.cleanup().await;
     }
 }
 
@@ -505,6 +509,7 @@ async fn test_handle_head_manifest() {
             content.len().to_string()
         );
         assert_eq!(head.headers[CONTENT_TYPE.as_str()], media_type);
+        test_case.cleanup().await;
     }
 }
 
@@ -551,6 +556,7 @@ async fn test_handle_get_manifest() {
                 assert_eq!(body, content);
             }
         }
+        test_case.cleanup().await;
     }
 }
 
@@ -596,6 +602,7 @@ async fn test_handle_put_manifest() {
         assert_eq!(stored_manifest.content, content);
         assert_eq!(stored_manifest.media_type.unwrap(), media_type);
         assert_eq!(stored_manifest.digest, header_digest(&response.headers));
+        test_case.cleanup().await;
     }
 }
 
@@ -634,6 +641,7 @@ async fn test_handle_delete_manifest() {
                 .await
                 .is_err()
         );
+        test_case.cleanup().await;
     }
 }
 
@@ -775,6 +783,7 @@ async fn test_delete_manifest_by_digest_removes_multiple_tags() {
                 .await
                 .is_err()
         );
+        test_case.cleanup().await;
     }
 }
 
@@ -865,6 +874,7 @@ async fn test_delete_manifest_by_digest_preserves_unrelated_tags() {
             .unwrap();
 
         assert_eq!(manifest_b.digest, header_digest(&response_b.headers));
+        test_case.cleanup().await;
     }
 }
 
@@ -959,6 +969,7 @@ async fn test_delete_manifest_with_many_tags() {
             .await
             .unwrap();
         assert_eq!(tags.len(), 20, "expected exactly 20 remaining tags");
+        test_case.cleanup().await;
     }
 }
 
@@ -1003,6 +1014,7 @@ async fn test_put_manifest_stores_media_type() {
             Some(media_type),
             "Tag link should have media_type stored"
         );
+        test_case.cleanup().await;
     }
 }
 
@@ -1066,6 +1078,7 @@ async fn test_head_manifest_returns_correct_media_type() {
             head_by_digest.headers[CONTENT_LENGTH.as_str()],
             content.len().to_string()
         );
+        test_case.cleanup().await;
     }
 }
 
@@ -1118,6 +1131,7 @@ async fn test_head_manifest_fallback_without_media_type() {
             head.headers[CONTENT_LENGTH.as_str()],
             content.len().to_string()
         );
+        test_case.cleanup().await;
     }
 }
 
@@ -1166,6 +1180,7 @@ async fn test_delete_manifest_no_tags_by_digest() {
                 .await
                 .is_err()
         );
+        test_case.cleanup().await;
     }
 }
 
@@ -1211,6 +1226,7 @@ async fn test_put_manifest_stores_media_type_in_links() {
             Some(media_type.clone()),
             "Tag link should have media_type stored"
         );
+        test_case.cleanup().await;
     }
 }
 
@@ -1272,6 +1288,7 @@ async fn test_head_local_manifest_uses_metadata_media_type() {
             head.headers[CONTENT_LENGTH.as_str()],
             content.len().to_string()
         );
+        test_case.cleanup().await;
     }
 }
 
@@ -1307,6 +1324,7 @@ async fn test_put_manifest_without_content_type_stores_manifest_media_type() {
             Some("application/vnd.docker.distribution.manifest.v2+json".to_string()),
             "Digest link should have media_type from manifest body"
         );
+        test_case.cleanup().await;
     }
 }
 
@@ -1354,6 +1372,7 @@ async fn test_handle_get_manifest_redirect_includes_content_type() {
                 assert_eq!(headers[CONTENT_TYPE.as_str()], media_type);
             }
         }
+        test_case.cleanup().await;
     }
 }
 
@@ -1398,6 +1417,7 @@ async fn test_handle_get_manifest_redirect_fallback_without_media_type() {
                 assert!(headers.contains_key(CONTENT_TYPE.as_str()));
             }
         }
+        test_case.cleanup().await;
     }
 }
 
@@ -1450,6 +1470,7 @@ async fn test_handle_get_manifest_no_redirect_returns_body() {
                 assert_eq!(body, content);
             }
         }
+        test_case.cleanup().await;
     }
 }
 

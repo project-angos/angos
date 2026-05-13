@@ -26,6 +26,9 @@ pub struct Backend {
     s3_client: S3Client,
     bucket: String,
     key_prefix: String,
+    multipart_copy_threshold: u64,
+    multipart_copy_chunk_size: u64,
+    multipart_copy_jobs: usize,
     circuit_breaker: CircuitBreaker,
 }
 
@@ -40,6 +43,12 @@ impl Backend {
         if config.multipart_copy_chunk_size > ByteSize::gib(5) {
             return Err(Error::Configuration(
                 "Multipart copy chunk size must be at most 5GiB".to_string(),
+            ));
+        }
+
+        if config.multipart_copy_chunk_size < ByteSize::mib(5) {
+            return Err(Error::Configuration(
+                "Multipart copy chunk size must be at least 5MiB".to_string(),
             ));
         }
 
@@ -74,6 +83,9 @@ impl Backend {
             s3_client,
             bucket: config.bucket.clone(),
             key_prefix: config.key_prefix.clone(),
+            multipart_copy_threshold: config.multipart_copy_threshold.as_u64(),
+            multipart_copy_chunk_size: config.multipart_copy_chunk_size.as_u64(),
+            multipart_copy_jobs: config.multipart_copy_jobs,
             circuit_breaker: CircuitBreaker::new(),
         })
     }
@@ -154,6 +166,13 @@ mod tests {
     #[test]
     fn test_new_multipart_copy_chunk_size_too_large() {
         let config = test_config(|c| c.multipart_copy_chunk_size = ByteSize::gib(6));
+        let result = Backend::new(&config);
+        assert!(matches!(result, Err(Error::Configuration(_))));
+    }
+
+    #[test]
+    fn test_new_multipart_copy_chunk_size_too_small() {
+        let config = test_config(|c| c.multipart_copy_chunk_size = ByteSize::mib(4));
         let result = Backend::new(&config);
         assert!(matches!(result, Err(Error::Configuration(_))));
     }

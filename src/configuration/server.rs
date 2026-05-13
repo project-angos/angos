@@ -1,6 +1,6 @@
 use serde::Deserialize;
 
-use crate::configuration::listeners::{insecure::InsecureListenerConfig, tls::TlsListenerConfig};
+use crate::configuration::listeners::{InsecureListenerConfig, TlsListenerConfig};
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(untagged)]

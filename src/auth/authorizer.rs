@@ -1,6 +1,7 @@
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, fmt, path::PathBuf, sync::Arc};
 
 use hyper::http::request::Parts;
+use reqwest::Client;
 use tracing::{debug, info, instrument};
 
 use crate::{
@@ -8,6 +9,7 @@ use crate::{
     cache::Cache,
     command::server::Error,
     configuration::{Configuration, RegexPattern},
+    http_client::HttpClientBuilder,
     identity::{Action, ClientIdentity},
     oci::{Namespace, Reference},
     policy::AccessMode,
@@ -33,9 +35,84 @@ struct AuthorizerRepository {
     immutable_tags_exclusions: Vec<RegexPattern>,
 }
 
+#[derive(Clone, Hash, Eq, PartialEq)]
+struct WebhookClientConfig {
+    server_ca_bundle: Option<PathBuf>,
+    client_certificate_bundle: Option<PathBuf>,
+    client_private_key: Option<PathBuf>,
+}
+
+impl From<&webhook::Config> for WebhookClientConfig {
+    fn from(config: &webhook::Config) -> Self {
+        Self {
+            server_ca_bundle: config.server_ca_bundle.clone(),
+            client_certificate_bundle: config.client_certificate_bundle.clone(),
+            client_private_key: config.client_private_key.clone(),
+        }
+    }
+}
+
+struct AuditIdentity<'a> {
+    auth_type: &'static str,
+    id: Option<&'a str>,
+    username: Option<&'a str>,
+    client_ip: Option<&'a str>,
+    certificate_organizations: &'a [String],
+    certificate_common_names: &'a [String],
+    oidc_provider_name: Option<&'a str>,
+    oidc_provider_type: Option<&'a str>,
+}
+
+impl fmt::Debug for AuditIdentity<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AuditIdentity")
+            .field("auth_type", &self.auth_type)
+            .field("id", &self.id)
+            .field("username", &self.username)
+            .field("client_ip", &self.client_ip)
+            .field("certificate_organizations", &self.certificate_organizations)
+            .field("certificate_common_names", &self.certificate_common_names)
+            .field("oidc_provider_name", &self.oidc_provider_name)
+            .field("oidc_provider_type", &self.oidc_provider_type)
+            .finish()
+    }
+}
+
+impl<'a> From<&'a ClientIdentity> for AuditIdentity<'a> {
+    fn from(identity: &'a ClientIdentity) -> Self {
+        let has_basic = identity.id.is_some() || identity.username.is_some();
+        let has_certificate = !identity.certificate.organizations.is_empty()
+            || !identity.certificate.common_names.is_empty();
+        let has_oidc = identity.oidc.is_some();
+
+        Self {
+            auth_type: match (has_basic, has_certificate, has_oidc) {
+                (false, false, false) => "anonymous",
+                (true, false, false) => "basic",
+                (false, true, false) => "mtls",
+                (false, false, true) => "oidc",
+                _ => "multiple",
+            },
+            id: identity.id.as_deref(),
+            username: identity.username.as_deref(),
+            client_ip: identity.client_ip.as_deref(),
+            certificate_organizations: &identity.certificate.organizations,
+            certificate_common_names: &identity.certificate.common_names,
+            oidc_provider_name: identity
+                .oidc
+                .as_ref()
+                .map(|oidc| oidc.provider_name.as_str()),
+            oidc_provider_type: identity
+                .oidc
+                .as_ref()
+                .map(|oidc| oidc.provider_type.as_str()),
+        }
+    }
+}
+
 impl Authorizer {
-    pub fn new(config: &Configuration, cache: &Arc<dyn Cache>) -> Result<Self, Error> {
-        let global_access_policy = AccessPolicy::new(&config.global.access_policy);
+    pub fn new(config: &Configuration, cache: &Arc<Cache>) -> Result<Self, Error> {
+        let global_access_policy = AccessPolicy::new(config.global.access_policy.clone());
 
         let webhook_authorizers = build_webhooks(config, cache)?;
 
@@ -43,7 +120,7 @@ impl Authorizer {
             .global
             .authorization_webhook
             .as_ref()
-            .map(|cfg| lookup_webhook(&webhook_authorizers, cfg))
+            .map(|name| lookup_webhook(&webhook_authorizers, name))
             .transpose()?;
 
         let repositories = build_repositories(config, &webhook_authorizers)?;
@@ -101,6 +178,8 @@ impl Authorizer {
         registry: &Registry,
     ) -> Result<(), Error> {
         let Ok(repository) = registry.get_repository_for_namespace(namespace) else {
+            // Unconfigured namespaces have no repository policy or webhook to evaluate.
+            // The global policy was already enforced by authorize_request.
             return Ok(());
         };
 
@@ -126,7 +205,7 @@ impl Authorizer {
             return Err(Error::Unauthorized(ACCESS_DENIED.to_string()));
         }
 
-        self.check_immutable_tag(auth_repo, action)?;
+        self.check_immutable_tag(repository.name.as_str(), action)?;
 
         let webhook = auth_repo
             .authorization_webhook
@@ -152,16 +231,12 @@ impl Authorizer {
         Ok(())
     }
 
-    fn check_immutable_tag(
-        &self,
-        auth_repo: &AuthorizerRepository,
-        action: &Action,
-    ) -> Result<(), Error> {
+    fn check_immutable_tag(&self, repository_name: &str, action: &Action) -> Result<(), Error> {
         if let Action::PutManifest {
             reference: Reference::Tag(tag),
             ..
         } = action
-            && !self.is_tag_mutable(auth_repo, tag)
+            && !self.is_tag_mutable(Some(repository_name), tag)
         {
             return Err(Error::Conflict(format!(
                 "Tag '{tag}' is immutable and cannot be overwritten"
@@ -170,50 +245,62 @@ impl Authorizer {
         Ok(())
     }
 
-    fn is_tag_mutable(&self, auth_repo: &AuthorizerRepository, tag: &str) -> bool {
-        let is_immutable = auth_repo.immutable_tags || self.global_immutable_tags;
-        let exclusions = if auth_repo.immutable_tags_exclusions.is_empty() {
-            &self.global_immutable_tags_exclusions
-        } else {
-            &auth_repo.immutable_tags_exclusions
-        };
-        let is_excluded = exclusions.iter().any(|pattern| pattern.is_match(tag));
-
-        !is_immutable || is_excluded
-    }
-
-    pub fn is_tag_immutable(&self, registry: &Registry, namespace: &Namespace, tag: &str) -> bool {
-        let auth_repo = registry
-            .get_repository_for_namespace(namespace)
-            .ok()
-            .and_then(|repo| self.repositories.get(&repo.name));
-
-        if let Some(auth_repo) = auth_repo {
-            !self.is_tag_mutable(auth_repo, tag)
-        } else {
-            self.global_immutable_tags
-                && !self
-                    .global_immutable_tags_exclusions
-                    .iter()
-                    .any(|pattern| pattern.is_match(tag))
+    pub fn is_tag_mutable(&self, repository_name: Option<&str>, tag: &str) -> bool {
+        let repository = repository_name.and_then(|name| self.repositories.get(name));
+        let immutable_tags =
+            self.global_immutable_tags || repository.is_some_and(|repo| repo.immutable_tags);
+        if !immutable_tags {
+            return true;
         }
+
+        let exclusions = match repository {
+            Some(repo) if !repo.immutable_tags_exclusions.is_empty() => {
+                &repo.immutable_tags_exclusions
+            }
+            _ => &self.global_immutable_tags_exclusions,
+        };
+
+        exclusions.iter().any(|pattern| pattern.is_match(tag))
     }
 }
 
 fn build_webhooks(
     config: &Configuration,
-    cache: &Arc<dyn Cache>,
+    cache: &Arc<Cache>,
 ) -> Result<HashMap<String, Arc<WebhookAuthorizer>>, Error> {
     let mut webhooks = HashMap::with_capacity(config.auth.webhook.len());
+    let mut clients: HashMap<WebhookClientConfig, Client> = HashMap::new();
     for (name, webhook_config) in &config.auth.webhook {
+        let client_config = WebhookClientConfig::from(webhook_config);
+        let client = if let Some(client) = clients.get(&client_config) {
+            client.clone()
+        } else {
+            let client = build_webhook_client(webhook_config).map_err(|e| {
+                Error::Initialization(format!("Failed to create webhook '{name}': {e}"))
+            })?;
+            clients.insert(client_config, client.clone());
+            client
+        };
         let authorizer =
-            WebhookAuthorizer::new(name.clone(), webhook_config.as_ref().clone(), cache.clone())
+            WebhookAuthorizer::new(name.clone(), webhook_config.clone(), client, cache.clone())
                 .map_err(|e| {
                     Error::Initialization(format!("Failed to create webhook '{name}': {e}"))
                 })?;
         webhooks.insert(name.clone(), Arc::new(authorizer));
     }
     Ok(webhooks)
+}
+
+fn build_webhook_client(config: &webhook::Config) -> Result<Client, String> {
+    HttpClientBuilder::new()
+        .rustls_tls()
+        .redirect(reqwest::redirect::Policy::none())
+        .tls_files(
+            config.server_ca_bundle.as_deref(),
+            config.client_certificate_bundle.as_deref(),
+            config.client_private_key.as_deref(),
+        )?
+        .build()
 }
 
 fn build_repositories(
@@ -227,13 +314,13 @@ fn build_repositories(
         {
             None
         } else {
-            Some(AccessPolicy::new(&repo_config.access_policy))
+            Some(AccessPolicy::new(repo_config.access_policy.clone()))
         };
 
         let authorization_webhook = repo_config
             .authorization_webhook
             .as_ref()
-            .map(|cfg| lookup_webhook(webhook_authorizers, cfg))
+            .map(|name| lookup_webhook(webhook_authorizers, name))
             .transpose()?;
 
         repositories.insert(
@@ -250,48 +337,76 @@ fn build_repositories(
 }
 
 fn log_denial(reason: &str, identity: &ClientIdentity) {
-    info!("Access denied: {reason} | Identity: {identity:?}");
+    info!(
+        "Access denied: {reason} | Identity: {:?}",
+        AuditIdentity::from(identity)
+    );
 }
 
 fn lookup_webhook(
     authorizers: &HashMap<String, Arc<WebhookAuthorizer>>,
-    cfg: &webhook::Config,
+    name: &str,
 ) -> Result<Arc<WebhookAuthorizer>, Error> {
-    authorizers.get(&cfg.name).cloned().ok_or_else(|| {
+    authorizers.get(name).cloned().ok_or_else(|| {
         Error::Initialization(format!(
-            "Internal: webhook '{}' missing from authorizer map",
-            cfg.name
+            "Internal: webhook '{name}' missing from authorizer map",
         ))
     })
 }
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        io::{self, Write},
+        sync::{Arc, Mutex},
+    };
+
+    use serde_json::json;
+    use tracing::Level;
+    use tracing_subscriber::fmt::MakeWriter;
     use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};
 
     use super::*;
-    use crate::{cache, configuration::Configuration};
+    use crate::{
+        cache,
+        configuration::Configuration,
+        identity::{ClientCertificate, OidcClaims},
+        test_fixtures::configuration::{load_config, minimal_config, try_load_config},
+    };
+
+    #[derive(Clone, Default)]
+    struct LogCapture(Arc<Mutex<Vec<u8>>>);
+
+    struct LogWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl LogCapture {
+        fn contents(&self) -> String {
+            let bytes = self.0.lock().unwrap().clone();
+            String::from_utf8(bytes).unwrap()
+        }
+    }
+
+    impl Write for LogWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> MakeWriter<'a> for LogCapture {
+        type Writer = LogWriter;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            LogWriter(Arc::clone(&self.0))
+        }
+    }
 
     fn create_minimal_config() -> Configuration {
-        let toml = r#"
-            [blob_store.fs]
-            root_dir = "/tmp/test"
-
-            [metadata_store.fs]
-            root_dir = "/tmp/test"
-
-            [cache.memory]
-
-            [server]
-            bind_address = "0.0.0.0"
-            port = 8000
-
-            [global]
-            update_pull_time = false
-            max_concurrent_cache_jobs = 10
-        "#;
-
-        Configuration::load_from_str(toml).unwrap()
+        minimal_config()
     }
 
     #[test]
@@ -311,29 +426,14 @@ mod tests {
 
     #[test]
     fn test_authorizer_new_with_global_access_policy() {
-        let toml = r#"
-            [blob_store.fs]
-            root_dir = "/tmp/test"
-
-            [metadata_store.fs]
-            root_dir = "/tmp/test"
-
-            [cache.memory]
-
-            [server]
-            bind_address = "0.0.0.0"
-            port = 8000
-
-            [global]
-            update_pull_time = false
-            max_concurrent_cache_jobs = 10
-
+        let config = load_config(
+            r#"
             [global.access_policy]
             default = "allow"
             rules = ["identity.username == 'admin'"]
-        "#;
+        "#,
+        );
 
-        let config = Configuration::load_from_str(toml).unwrap();
         let cache = cache::Config::Memory.to_backend().unwrap();
 
         let authorizer = Authorizer::new(&config, &cache);
@@ -343,27 +443,13 @@ mod tests {
 
     #[test]
     fn test_authorizer_new_with_global_immutable_tags() {
-        let toml = r#"
-            [blob_store.fs]
-            root_dir = "/tmp/test"
-
-            [metadata_store.fs]
-            root_dir = "/tmp/test"
-
-            [cache.memory]
-
-            [server]
-            bind_address = "0.0.0.0"
-            port = 8000
-
-            [global]
-            update_pull_time = false
-            max_concurrent_cache_jobs = 10
+        let config = load_config(
+            r#"
             immutable_tags = true
             immutable_tags_exclusions = ["^latest$", "^dev-.*"]
-        "#;
+        "#,
+        );
 
-        let config = Configuration::load_from_str(toml).unwrap();
         let cache = cache::Config::Memory.to_backend().unwrap();
 
         let authorizer = Authorizer::new(&config, &cache);
@@ -376,30 +462,15 @@ mod tests {
 
     #[test]
     fn test_authorizer_new_with_repository_config() {
-        let toml = r#"
-            [blob_store.fs]
-            root_dir = "/tmp/test"
-
-            [metadata_store.fs]
-            root_dir = "/tmp/test"
-
-            [cache.memory]
-
-            [server]
-            bind_address = "0.0.0.0"
-            port = 8000
-
-            [global]
-            update_pull_time = false
-            max_concurrent_cache_jobs = 10
-
+        let config = load_config(
+            r#"
             [repository.myrepo]
             namespace_pattern = "^myrepo/.*"
             immutable_tags = true
             immutable_tags_exclusions = ["^test-.*"]
-        "#;
+        "#,
+        );
 
-        let config = Configuration::load_from_str(toml).unwrap();
         let cache = cache::Config::Memory.to_backend().unwrap();
 
         let authorizer = Authorizer::new(&config, &cache);
@@ -412,27 +483,13 @@ mod tests {
 
     #[test]
     fn test_invalid_global_regex_fails_at_deserialize() {
-        let toml = r#"
-            [blob_store.fs]
-            root_dir = "/tmp/test"
-
-            [metadata_store.fs]
-            root_dir = "/tmp/test"
-
-            [cache.memory]
-
-            [server]
-            bind_address = "0.0.0.0"
-            port = 8000
-
-            [global]
-            update_pull_time = false
-            max_concurrent_cache_jobs = 10
+        let result = try_load_config(
+            r#"
             immutable_tags = true
             immutable_tags_exclusions = ["[invalid"]
-        "#;
+        "#,
+        );
 
-        let result = Configuration::load_from_str(toml);
         assert!(
             result.is_err(),
             "invalid global regex must fail at deserialize time"
@@ -441,151 +498,71 @@ mod tests {
 
     #[test]
     fn test_invalid_repository_regex_fails_at_deserialize() {
-        let toml = r#"
-            [blob_store.fs]
-            root_dir = "/tmp/test"
-
-            [metadata_store.fs]
-            root_dir = "/tmp/test"
-
-            [cache.memory]
-
-            [server]
-            bind_address = "0.0.0.0"
-            port = 8000
-
-            [global]
-            update_pull_time = false
-            max_concurrent_cache_jobs = 10
-
+        let result = try_load_config(
+            r#"
             [repository.myrepo]
             namespace_pattern = "^myrepo/.*"
             immutable_tags = true
             immutable_tags_exclusions = ["[invalid"]
-        "#;
+        "#,
+        );
 
-        let result = Configuration::load_from_str(toml);
         assert!(
             result.is_err(),
             "invalid repository regex must fail at deserialize time"
         );
     }
 
-    #[tokio::test]
-    async fn test_is_tag_immutable_with_global_setting() {
-        let toml = r#"
-            [blob_store.fs]
-            root_dir = "/tmp/test"
-
-            [metadata_store.fs]
-            root_dir = "/tmp/test"
-
-            [cache.memory]
-
-            [server]
-            bind_address = "0.0.0.0"
-            port = 8000
-
-            [global]
-            update_pull_time = false
-            max_concurrent_cache_jobs = 10
+    #[test]
+    fn test_is_tag_mutable_with_global_setting() {
+        let config = load_config(
+            r"
             immutable_tags = true
-        "#;
+        ",
+        );
 
-        let config = Configuration::load_from_str(toml).unwrap();
         let cache = cache::Config::Memory.to_backend().unwrap();
         let authorizer = Authorizer::new(&config, &cache).unwrap();
-        let registry = create_pull_through_registry(&config).await;
-
-        let ns = Namespace::new("unknown-namespace").unwrap();
-        assert!(authorizer.is_tag_immutable(&registry, &ns, "v1.0.0"));
+        assert!(!authorizer.is_tag_mutable(None, "v1.0.0"));
     }
 
-    #[tokio::test]
-    async fn test_is_tag_immutable_with_global_exclusions() {
-        let toml = r#"
-            [blob_store.fs]
-            root_dir = "/tmp/test"
-
-            [metadata_store.fs]
-            root_dir = "/tmp/test"
-
-            [cache.memory]
-
-            [server]
-            bind_address = "0.0.0.0"
-            port = 8000
-
-            [global]
-            update_pull_time = false
-            max_concurrent_cache_jobs = 10
+    #[test]
+    fn test_is_tag_mutable_with_global_exclusions() {
+        let config = load_config(
+            r#"
             immutable_tags = true
             immutable_tags_exclusions = ["^latest$", "^dev-.*"]
-        "#;
+        "#,
+        );
 
-        let config = Configuration::load_from_str(toml).unwrap();
         let cache = cache::Config::Memory.to_backend().unwrap();
         let authorizer = Authorizer::new(&config, &cache).unwrap();
-        let registry = create_pull_through_registry(&config).await;
-
-        let ns = Namespace::new("unknown-namespace").unwrap();
-        assert!(!authorizer.is_tag_immutable(&registry, &ns, "latest"));
-        assert!(!authorizer.is_tag_immutable(&registry, &ns, "dev-branch"));
-        assert!(authorizer.is_tag_immutable(&registry, &ns, "v1.0.0"));
+        assert!(authorizer.is_tag_mutable(None, "latest"));
+        assert!(authorizer.is_tag_mutable(None, "dev-branch"));
+        assert!(!authorizer.is_tag_mutable(None, "v1.0.0"));
     }
 
-    #[tokio::test]
-    async fn test_is_tag_immutable_with_repository_setting() {
-        let toml = r#"
-            [blob_store.fs]
-            root_dir = "/tmp/test"
-
-            [metadata_store.fs]
-            root_dir = "/tmp/test"
-
-            [cache.memory]
-
-            [server]
-            bind_address = "0.0.0.0"
-            port = 8000
-
-            [global]
-            update_pull_time = false
-            max_concurrent_cache_jobs = 10
+    #[test]
+    fn test_is_tag_mutable_with_repository_setting() {
+        let config = load_config(
+            r#"
             immutable_tags = false
 
             [repository.myrepo]
             namespace_pattern = "^myrepo/.*"
             immutable_tags = true
-        "#;
+        "#,
+        );
 
-        let config = Configuration::load_from_str(toml).unwrap();
         let cache = cache::Config::Memory.to_backend().unwrap();
         let authorizer = Authorizer::new(&config, &cache).unwrap();
-        let registry = create_pull_through_registry(&config).await;
-
-        let ns = Namespace::new("myrepo").unwrap();
-        assert!(authorizer.is_tag_immutable(&registry, &ns, "v1.0.0"));
+        assert!(!authorizer.is_tag_mutable(Some("myrepo"), "v1.0.0"));
     }
 
-    #[tokio::test]
-    async fn test_is_tag_immutable_with_repository_exclusions() {
-        let toml = r#"
-            [blob_store.fs]
-            root_dir = "/tmp/test"
-
-            [metadata_store.fs]
-            root_dir = "/tmp/test"
-
-            [cache.memory]
-
-            [server]
-            bind_address = "0.0.0.0"
-            port = 8000
-
-            [global]
-            update_pull_time = false
-            max_concurrent_cache_jobs = 10
+    #[test]
+    fn test_is_tag_mutable_with_repository_exclusions() {
+        let config = load_config(
+            r#"
             immutable_tags = true
             immutable_tags_exclusions = ["^latest$"]
 
@@ -593,129 +570,73 @@ mod tests {
             namespace_pattern = "^myrepo/.*"
             immutable_tags = true
             immutable_tags_exclusions = ["^test-.*"]
-        "#;
+        "#,
+        );
 
-        let config = Configuration::load_from_str(toml).unwrap();
         let cache = cache::Config::Memory.to_backend().unwrap();
         let authorizer = Authorizer::new(&config, &cache).unwrap();
-        let registry = create_pull_through_registry(&config).await;
-
-        let ns = Namespace::new("myrepo").unwrap();
-        assert!(!authorizer.is_tag_immutable(&registry, &ns, "test-123"));
-        assert!(authorizer.is_tag_immutable(&registry, &ns, "latest"));
-        assert!(authorizer.is_tag_immutable(&registry, &ns, "v1.0.0"));
+        assert!(authorizer.is_tag_mutable(Some("myrepo"), "test-123"));
+        assert!(!authorizer.is_tag_mutable(Some("myrepo"), "latest"));
+        assert!(!authorizer.is_tag_mutable(Some("myrepo"), "v1.0.0"));
     }
 
-    #[tokio::test]
-    async fn test_is_tag_immutable_with_sub_namespace() {
-        let toml = r#"
-            [blob_store.fs]
-            root_dir = "/tmp/test"
-
-            [metadata_store.fs]
-            root_dir = "/tmp/test"
-
-            [cache.memory]
-
-            [server]
-            bind_address = "0.0.0.0"
-            port = 8000
-
-            [global]
-            update_pull_time = false
-            max_concurrent_cache_jobs = 10
+    #[test]
+    fn test_is_tag_mutable_with_repository_name() {
+        let config = load_config(
+            r#"
             immutable_tags = false
 
             [repository."docker-io"]
             immutable_tags = true
             immutable_tags_exclusions = ["^latest$"]
-        "#;
+        "#,
+        );
 
-        let config = Configuration::load_from_str(toml).unwrap();
         let cache = cache::Config::Memory.to_backend().unwrap();
         let authorizer = Authorizer::new(&config, &cache).unwrap();
-        let registry = create_pull_through_registry(&config).await;
-
-        let ns_root = Namespace::new("docker-io").unwrap();
-        let ns_sub = Namespace::new("docker-io/library/nginx").unwrap();
-        let ns_other = Namespace::new("other/namespace").unwrap();
-        assert!(authorizer.is_tag_immutable(&registry, &ns_root, "v1.0.0"));
-        assert!(authorizer.is_tag_immutable(&registry, &ns_sub, "v1.0.0"));
-        assert!(!authorizer.is_tag_immutable(&registry, &ns_sub, "latest"));
-        assert!(!authorizer.is_tag_immutable(&registry, &ns_other, "v1.0.0"));
+        assert!(!authorizer.is_tag_mutable(Some("docker-io"), "v1.0.0"));
+        assert!(authorizer.is_tag_mutable(Some("docker-io"), "latest"));
+        assert!(authorizer.is_tag_mutable(None, "v1.0.0"));
     }
 
     #[test]
     fn test_is_tag_mutable_when_not_immutable() {
-        let toml = r#"
-            [blob_store.fs]
-            root_dir = "/tmp/test"
-
-            [metadata_store.fs]
-            root_dir = "/tmp/test"
-
-            [cache.memory]
-
-            [server]
-            bind_address = "0.0.0.0"
-            port = 8000
-
-            [global]
-            update_pull_time = false
-            max_concurrent_cache_jobs = 10
+        let config = load_config(
+            r#"
             immutable_tags = false
 
             [repository.myrepo]
             namespace_pattern = "^myrepo/.*"
             immutable_tags = false
-        "#;
+        "#,
+        );
 
-        let config = Configuration::load_from_str(toml).unwrap();
         let cache = cache::Config::Memory.to_backend().unwrap();
         let authorizer = Authorizer::new(&config, &cache).unwrap();
-        let auth_repo = authorizer.repositories.get("myrepo").unwrap();
-
-        assert!(authorizer.is_tag_mutable(auth_repo, "any-tag"));
+        assert!(authorizer.is_tag_mutable(Some("myrepo"), "any-tag"));
     }
 
     // When immutable_tags is true and the tag matches an exclusion pattern, the
     // tag is mutable (the exclusion carves out a writable subset).
     #[test]
     fn is_tag_mutable_returns_true_when_immutable_but_excluded() {
-        let toml = r#"
-            [blob_store.fs]
-            root_dir = "/tmp/test"
-
-            [metadata_store.fs]
-            root_dir = "/tmp/test"
-
-            [cache.memory]
-
-            [server]
-            bind_address = "0.0.0.0"
-            port = 8000
-
-            [global]
-            update_pull_time = false
-            max_concurrent_cache_jobs = 10
-
+        let config = load_config(
+            r#"
             [repository.myrepo]
             namespace_pattern = "^myrepo/.*"
             immutable_tags = true
             immutable_tags_exclusions = ["^latest$", "^dev-.*"]
-        "#;
+        "#,
+        );
 
-        let config = Configuration::load_from_str(toml).unwrap();
         let cache = cache::Config::Memory.to_backend().unwrap();
         let authorizer = Authorizer::new(&config, &cache).unwrap();
-        let auth_repo = authorizer.repositories.get("myrepo").unwrap();
-
         assert!(
-            authorizer.is_tag_mutable(auth_repo, "latest"),
+            authorizer.is_tag_mutable(Some("myrepo"), "latest"),
             "'latest' must be mutable because it matches the exclusion pattern"
         );
         assert!(
-            authorizer.is_tag_mutable(auth_repo, "dev-feature"),
+            authorizer.is_tag_mutable(Some("myrepo"), "dev-feature"),
             "'dev-feature' must be mutable because it matches 'dev-.*'"
         );
     }
@@ -724,36 +645,19 @@ mod tests {
     // the tag is immutable.
     #[test]
     fn is_tag_mutable_returns_false_when_immutable_and_not_excluded() {
-        let toml = r#"
-            [blob_store.fs]
-            root_dir = "/tmp/test"
-
-            [metadata_store.fs]
-            root_dir = "/tmp/test"
-
-            [cache.memory]
-
-            [server]
-            bind_address = "0.0.0.0"
-            port = 8000
-
-            [global]
-            update_pull_time = false
-            max_concurrent_cache_jobs = 10
-
+        let config = load_config(
+            r#"
             [repository.myrepo]
             namespace_pattern = "^myrepo/.*"
             immutable_tags = true
             immutable_tags_exclusions = ["^latest$"]
-        "#;
+        "#,
+        );
 
-        let config = Configuration::load_from_str(toml).unwrap();
         let cache = cache::Config::Memory.to_backend().unwrap();
         let authorizer = Authorizer::new(&config, &cache).unwrap();
-        let auth_repo = authorizer.repositories.get("myrepo").unwrap();
-
         assert!(
-            !authorizer.is_tag_mutable(auth_repo, "v1.0.0"),
+            !authorizer.is_tag_mutable(Some("myrepo"), "v1.0.0"),
             "'v1.0.0' must be immutable: immutable_tags=true and not excluded"
         );
     }
@@ -767,39 +671,24 @@ mod tests {
             oci::{Namespace, Reference},
         };
 
-        let toml = r#"
-            [blob_store.fs]
-            root_dir = "/tmp/test"
-
-            [metadata_store.fs]
-            root_dir = "/tmp/test"
-
-            [cache.memory]
-
-            [server]
-            bind_address = "0.0.0.0"
-            port = 8000
-
-            [global]
-            update_pull_time = false
-            max_concurrent_cache_jobs = 10
+        let config = load_config(
+            r#"
             immutable_tags = true
 
             [repository.myrepo]
             namespace_pattern = "^myrepo/.*"
-        "#;
+        "#,
+        );
 
-        let config = Configuration::load_from_str(toml).unwrap();
         let cache = cache::Config::Memory.to_backend().unwrap();
         let authorizer = Authorizer::new(&config, &cache).unwrap();
-        let auth_repo = authorizer.repositories.get("myrepo").unwrap();
 
         let action = Action::PutManifest {
             namespace: Namespace::new("myrepo/app").unwrap(),
             reference: Reference::from_str("v1.0.0").unwrap(),
         };
 
-        let result = authorizer.check_immutable_tag(auth_repo, &action);
+        let result = authorizer.check_immutable_tag("myrepo", &action);
 
         let Err(Error::Conflict(msg)) = result else {
             panic!("expected Err(Error::Conflict(_)), got: {result:?}");
@@ -811,29 +700,55 @@ mod tests {
     }
 
     #[test]
-    fn test_log_denial() {
-        let identity = ClientIdentity::new(None);
-        log_denial("test reason", &identity);
+    fn log_denial_uses_audit_identity_without_oidc_claims() {
+        let log_capture = LogCapture::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(Level::INFO)
+            .with_writer(log_capture.clone())
+            .with_ansi(false)
+            .finish();
+        let identity = ClientIdentity {
+            id: Some("client-123".to_string()),
+            username: Some("ci-bot".to_string()),
+            certificate: ClientCertificate {
+                organizations: vec!["BuildOrg".to_string()],
+                common_names: vec!["build-cert".to_string()],
+            },
+            oidc: Some(OidcClaims {
+                provider_name: "github-actions".to_string(),
+                provider_type: "GitHub Actions".to_string(),
+                claims: HashMap::from([
+                    ("sub".to_string(), json!("repo:private/repo:ref:main")),
+                    ("email".to_string(), json!("person@example.com")),
+                    ("custom_claim".to_string(), json!("internal-secret")),
+                ]),
+            }),
+            client_ip: Some("192.0.2.10".to_string()),
+        };
+
+        tracing::subscriber::with_default(subscriber, || log_denial("test reason", &identity));
+
+        let logs = log_capture.contents();
+        assert!(logs.contains("test reason"), "logs were: {logs}");
+        assert!(logs.contains("multiple"), "logs were: {logs}");
+        assert!(logs.contains("client-123"), "logs were: {logs}");
+        assert!(logs.contains("ci-bot"), "logs were: {logs}");
+        assert!(logs.contains("192.0.2.10"), "logs were: {logs}");
+        assert!(logs.contains("BuildOrg"), "logs were: {logs}");
+        assert!(logs.contains("build-cert"), "logs were: {logs}");
+        assert!(logs.contains("github-actions"), "logs were: {logs}");
+        assert!(logs.contains("GitHub Actions"), "logs were: {logs}");
+        assert!(!logs.contains("person@example.com"), "logs were: {logs}");
+        assert!(!logs.contains("repo:private/repo"), "logs were: {logs}");
+        assert!(!logs.contains("internal-secret"), "logs were: {logs}");
+        assert!(!logs.contains("custom_claim"), "logs were: {logs}");
+        assert!(!logs.contains("email"), "logs were: {logs}");
+        assert!(!logs.contains("sub"), "logs were: {logs}");
     }
 
     fn create_pull_through_config() -> Configuration {
-        let toml = r#"
-            [blob_store.fs]
-            root_dir = "/tmp/test"
-
-            [metadata_store.fs]
-            root_dir = "/tmp/test"
-
-            [cache.memory]
-
-            [server]
-            bind_address = "0.0.0.0"
-            port = 8000
-
-            [global]
-            update_pull_time = false
-            max_concurrent_cache_jobs = 10
-
+        load_config(
+            r#"
             [global.access_policy]
             default = "allow"
 
@@ -841,9 +756,8 @@ mod tests {
 
             [[repository."docker-io".upstream]]
             url = "https://registry-1.docker.io"
-        "#;
-
-        Configuration::load_from_str(toml).unwrap()
+        "#,
+        )
     }
 
     async fn create_pull_through_registry(config: &Configuration) -> Registry {
@@ -861,12 +775,14 @@ mod tests {
 
         let mut repositories_map = HashMap::new();
         for (name, repo_config) in &config.repository {
-            let repo = Repository::new(name, repo_config, &auth_cache).unwrap();
+            let repo = Repository::new(name, repo_config, &auth_cache)
+                .await
+                .unwrap();
             repositories_map.insert(name.clone(), repo);
         }
         let repositories = Arc::new(repositories_map);
 
-        let registry_config = RegistryConfig::new()
+        let registry_config = RegistryConfig::default()
             .update_pull_time(config.global.update_pull_time)
             .enable_blob_redirect(config.global.resolved_enable_blob_redirect())
             .enable_manifest_redirect(config.global.resolved_enable_manifest_redirect())
@@ -1008,28 +924,13 @@ mod tests {
     async fn global_deny_policy_rejects_all_requests() {
         use crate::command::server::Error as ServerError;
 
-        let toml = r#"
-            [blob_store.fs]
-            root_dir = "/tmp/test"
-
-            [metadata_store.fs]
-            root_dir = "/tmp/test"
-
-            [cache.memory]
-
-            [server]
-            bind_address = "0.0.0.0"
-            port = 8000
-
-            [global]
-            update_pull_time = false
-            max_concurrent_cache_jobs = 10
-
+        let config = load_config(
+            r#"
             [global.access_policy]
             default = "deny"
-        "#;
+        "#,
+        );
 
-        let config = Configuration::load_from_str(toml).unwrap();
         let cache = cache::Config::Memory.to_backend().unwrap();
         let authorizer = Authorizer::new(&config, &cache).unwrap();
         let registry = create_pull_through_registry(&config).await;
@@ -1064,23 +965,8 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        let toml = format!(
+        let config = load_config(&format!(
             r#"
-            [blob_store.fs]
-            root_dir = "/tmp/test"
-
-            [metadata_store.fs]
-            root_dir = "/tmp/test"
-
-            [cache.memory]
-
-            [server]
-            bind_address = "0.0.0.0"
-            port = 8000
-
-            [global]
-            update_pull_time = false
-            max_concurrent_cache_jobs = 10
             authorization_webhook = "gatekeeper"
 
             [global.access_policy]
@@ -1091,9 +977,8 @@ mod tests {
             timeout_ms = 1000
             "#,
             url = mock_server.uri()
-        );
+        ));
 
-        let config = Configuration::load_from_str(&toml).unwrap();
         let cache = cache::Config::Memory.to_backend().unwrap();
         let authorizer = Authorizer::new(&config, &cache).unwrap();
         let registry = create_pull_through_registry(&config).await;
@@ -1126,23 +1011,8 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        let toml = format!(
+        let config = load_config(&format!(
             r#"
-            [blob_store.fs]
-            root_dir = "/tmp/test"
-
-            [metadata_store.fs]
-            root_dir = "/tmp/test"
-
-            [cache.memory]
-
-            [server]
-            bind_address = "0.0.0.0"
-            port = 8000
-
-            [global]
-            update_pull_time = false
-            max_concurrent_cache_jobs = 10
             authorization_webhook = "gatekeeper"
 
             [global.access_policy]
@@ -1153,9 +1023,8 @@ mod tests {
             timeout_ms = 1000
             "#,
             url = mock_server.uri()
-        );
+        ));
 
-        let config = Configuration::load_from_str(&toml).unwrap();
         let cache = cache::Config::Memory.to_backend().unwrap();
         let authorizer = Authorizer::new(&config, &cache).unwrap();
         let registry = create_pull_through_registry(&config).await;
@@ -1204,28 +1073,13 @@ mod tests {
     async fn authorize_request_unknown_namespace_is_allowed_under_allow_policy() {
         use crate::oci::Namespace;
 
-        let toml = r#"
-            [blob_store.fs]
-            root_dir = "/tmp/test"
-
-            [metadata_store.fs]
-            root_dir = "/tmp/test"
-
-            [cache.memory]
-
-            [server]
-            bind_address = "0.0.0.0"
-            port = 8000
-
-            [global]
-            update_pull_time = false
-            max_concurrent_cache_jobs = 10
-
+        let config = load_config(
+            r#"
             [global.access_policy]
             default = "allow"
-        "#;
+        "#,
+        );
 
-        let config = Configuration::load_from_str(toml).unwrap();
         let cache = cache::Config::Memory.to_backend().unwrap();
         let authorizer = Authorizer::new(&config, &cache).unwrap();
         let registry = create_pull_through_registry(&config).await;
@@ -1262,23 +1116,8 @@ mod tests {
     async fn webhook_unreachable_fails_closed() {
         use crate::oci::Namespace;
 
-        let toml = r#"
-            [blob_store.fs]
-            root_dir = "/tmp/test"
-
-            [metadata_store.fs]
-            root_dir = "/tmp/test"
-
-            [cache.memory]
-
-            [server]
-            bind_address = "0.0.0.0"
-            port = 8000
-
-            [global]
-            update_pull_time = false
-            max_concurrent_cache_jobs = 10
-
+        let config = load_config(
+            r#"
             [global.access_policy]
             default = "allow"
 
@@ -1289,9 +1128,9 @@ mod tests {
             [auth.webhook.gatekeeper]
             url = "http://127.0.0.1:1"
             timeout_ms = 500
-        "#;
+        "#,
+        );
 
-        let config = Configuration::load_from_str(toml).unwrap();
         let cache = cache::Config::Memory.to_backend().unwrap();
         let authorizer = Authorizer::new(&config, &cache).unwrap();
         let registry = create_pull_through_registry(&config).await;

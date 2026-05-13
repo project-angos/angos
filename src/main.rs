@@ -25,13 +25,16 @@ mod circuit_breaker;
 mod command;
 mod configuration;
 mod event_webhook;
+pub mod http_client;
 mod identity;
 mod metrics_provider;
 mod oci;
 mod policy;
 mod registry;
+pub mod registry_client;
 mod secret;
 mod timing;
+mod util;
 
 #[cfg(test)]
 pub mod test_fixtures;

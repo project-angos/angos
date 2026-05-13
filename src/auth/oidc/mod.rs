@@ -2,7 +2,7 @@ pub mod jwk;
 pub mod provider;
 pub mod validator;
 
-use std::{sync::Arc, time::Duration};
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use hyper::http::request::Parts;
@@ -16,7 +16,7 @@ use super::{AuthMiddleware, AuthResult};
 use crate::{
     auth::oidc::provider::{generic, github},
     cache::Cache,
-    command::server::{Error, HeaderExt},
+    command::server::{Error, basic_auth, bearer_token},
     identity::{ClientIdentity, OidcClaims},
 };
 
@@ -40,29 +40,24 @@ pub struct OidcValidator {
     provider_name: String,
     provider: Arc<dyn OidcProvider>,
     client: Arc<Client>,
-    cache: Arc<dyn Cache>,
+    cache: Arc<Cache>,
 }
 
 impl OidcValidator {
     pub fn new(
         provider_name: String,
         provider_config: &Config,
-        cache: Arc<dyn Cache>,
-    ) -> Result<Self, Error> {
-        let client = Client::builder()
-            .timeout(Duration::from_secs(30))
-            .build()
-            .map(Arc::new)
-            .map_err(|e| Error::Initialization(format!("Failed to build HTTP client: {e}")))?;
-
+        client: Arc<Client>,
+        cache: Arc<Cache>,
+    ) -> Self {
         let provider = provider_config.to_backend();
 
-        Ok(Self {
+        Self {
             provider_name,
             provider,
             client,
             cache,
-        })
+        }
     }
 
     pub async fn validate_token(&self, token: &str) -> Result<OidcClaims, Error> {
@@ -71,7 +66,7 @@ impl OidcValidator {
             &*self.provider,
             token,
             &self.client,
-            &*self.cache,
+            self.cache.as_ref(),
         )
         .await
     }
@@ -114,11 +109,11 @@ impl AuthMiddleware for OidcValidator {
 ///   (the OIDC token is in the password field; the username gates which provider claims it).
 /// - Anything else → `None`.
 fn extract_oidc_credential(parts: &Parts, provider_name: &str) -> Option<String> {
-    if let Some(bearer_token) = parts.bearer_token() {
+    if let Some(bearer_token) = bearer_token(&parts.headers) {
         debug!("Found Bearer token for OIDC provider '{provider_name}'");
         return Some(bearer_token);
     }
-    if let Some((username, password)) = parts.basic_auth() {
+    if let Some((username, password)) = basic_auth(&parts.headers) {
         debug!("Found Basic auth credentials with username '{username}'");
         if username == provider_name {
             return Some(password);
@@ -133,10 +128,11 @@ fn extract_oidc_credential(parts: &Parts, provider_name: &str) -> Option<String>
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashMap, net::SocketAddr};
+    use std::{collections::HashMap, net::SocketAddr, sync::Arc};
 
     use base64::{Engine, engine::general_purpose::STANDARD as BASE64_STANDARD};
     use hyper::{Request, header::AUTHORIZATION};
+    use jsonwebtoken::Algorithm;
     use serde_json::json;
     use wiremock::{
         Mock, MockServer, ResponseTemplate,
@@ -158,6 +154,7 @@ mod tests {
             jwks_refresh_interval: 3600,
             required_audience: None,
             clock_skew_tolerance: 60,
+            allowed_algorithms: vec![Algorithm::ES256],
         })
     }
 
@@ -185,6 +182,10 @@ mod tests {
         );
         claims.insert("iat".to_string(), json!(chrono::Utc::now().timestamp()));
         make_token(&claims, KID)
+    }
+
+    fn test_http_client() -> Arc<Client> {
+        Arc::new(Client::new())
     }
 
     #[test]
@@ -232,6 +233,7 @@ mod tests {
             jwks_refresh_interval: 3600,
             required_audience: None,
             clock_skew_tolerance: 60,
+            allowed_algorithms: vec![Algorithm::RS256],
         });
 
         let provider = config.to_backend();
@@ -247,6 +249,7 @@ mod tests {
             jwks_refresh_interval: 3600,
             required_audience: None,
             clock_skew_tolerance: 60,
+            allowed_algorithms: vec![Algorithm::RS256],
         });
 
         let provider = config.to_backend();
@@ -265,15 +268,17 @@ mod tests {
             jwks_refresh_interval: 3600,
             required_audience: Some("test-audience".to_string()),
             clock_skew_tolerance: 60,
+            allowed_algorithms: vec![Algorithm::RS256],
         });
 
         let cache = cache::Config::Memory.to_backend().unwrap();
-        let validator = OidcValidator::new("test-provider".to_string(), &config, cache);
+        let client = test_http_client();
+        let validator =
+            OidcValidator::new("test-provider".to_string(), &config, client.clone(), cache);
 
-        assert!(validator.is_ok());
-        let validator = validator.unwrap();
         assert_eq!(validator.provider_name, "test-provider");
         assert_eq!(validator.provider.issuer(), "https://auth.example.com");
+        assert!(Arc::ptr_eq(&validator.client, &client));
     }
 
     #[test]
@@ -284,13 +289,13 @@ mod tests {
             jwks_refresh_interval: 3600,
             required_audience: None,
             clock_skew_tolerance: 60,
+            allowed_algorithms: vec![Algorithm::RS256],
         });
 
         let cache = cache::Config::Memory.to_backend().unwrap();
-        let validator = OidcValidator::new("github".to_string(), &config, cache);
+        let validator =
+            OidcValidator::new("github".to_string(), &config, test_http_client(), cache);
 
-        assert!(validator.is_ok());
-        let validator = validator.unwrap();
         assert_eq!(validator.provider_name, "github");
         assert_eq!(
             validator.provider.issuer(),
@@ -310,7 +315,12 @@ mod tests {
 
         let config = build_config(&mock_server);
         let cache = cache::Config::Memory.to_backend().unwrap();
-        let validator = OidcValidator::new("test-provider".to_string(), &config, cache).unwrap();
+        let validator = OidcValidator::new(
+            "test-provider".to_string(),
+            &config,
+            test_http_client(),
+            cache,
+        );
 
         let token = make_test_token(&mock_server.uri());
         let result = validator.validate_token(&token).await;
@@ -330,10 +340,16 @@ mod tests {
             jwks_refresh_interval: 3600,
             required_audience: None,
             clock_skew_tolerance: 60,
+            allowed_algorithms: vec![Algorithm::RS256],
         });
 
         let cache = cache::Config::Memory.to_backend().unwrap();
-        let validator = OidcValidator::new("test-provider".to_string(), &config, cache).unwrap();
+        let validator = OidcValidator::new(
+            "test-provider".to_string(),
+            &config,
+            test_http_client(),
+            cache,
+        );
 
         let result = validator.validate_token("invalid-token").await;
 
@@ -352,7 +368,12 @@ mod tests {
 
         let config = build_config(&mock_server);
         let cache = cache::Config::Memory.to_backend().unwrap();
-        let validator = OidcValidator::new("test-provider".to_string(), &config, cache).unwrap();
+        let validator = OidcValidator::new(
+            "test-provider".to_string(),
+            &config,
+            test_http_client(),
+            cache,
+        );
 
         let token = make_test_token(&mock_server.uri());
         let request = Request::builder()
@@ -385,7 +406,8 @@ mod tests {
 
         let config = build_config(&mock_server);
         let cache = cache::Config::Memory.to_backend().unwrap();
-        let validator = OidcValidator::new("github".to_string(), &config, cache).unwrap();
+        let validator =
+            OidcValidator::new("github".to_string(), &config, test_http_client(), cache);
 
         let token = make_test_token(&mock_server.uri());
         let credentials = BASE64_STANDARD.encode(format!("github:{token}"));
@@ -412,10 +434,12 @@ mod tests {
             jwks_refresh_interval: 3600,
             required_audience: None,
             clock_skew_tolerance: 60,
+            allowed_algorithms: vec![Algorithm::RS256],
         });
 
         let cache = cache::Config::Memory.to_backend().unwrap();
-        let validator = OidcValidator::new("github".to_string(), &config, cache).unwrap();
+        let validator =
+            OidcValidator::new("github".to_string(), &config, test_http_client(), cache);
 
         let credentials = BASE64_STANDARD.encode("wrong-provider:token");
         let request = Request::builder()
@@ -441,10 +465,16 @@ mod tests {
             jwks_refresh_interval: 3600,
             required_audience: None,
             clock_skew_tolerance: 60,
+            allowed_algorithms: vec![Algorithm::RS256],
         });
 
         let cache = cache::Config::Memory.to_backend().unwrap();
-        let validator = OidcValidator::new("test-provider".to_string(), &config, cache).unwrap();
+        let validator = OidcValidator::new(
+            "test-provider".to_string(),
+            &config,
+            test_http_client(),
+            cache,
+        );
 
         let request = Request::builder().body(()).unwrap();
 
@@ -466,10 +496,16 @@ mod tests {
             jwks_refresh_interval: 3600,
             required_audience: None,
             clock_skew_tolerance: 60,
+            allowed_algorithms: vec![Algorithm::RS256],
         });
 
         let cache = cache::Config::Memory.to_backend().unwrap();
-        let validator = OidcValidator::new("test-provider".to_string(), &config, cache).unwrap();
+        let validator = OidcValidator::new(
+            "test-provider".to_string(),
+            &config,
+            test_http_client(),
+            cache,
+        );
 
         let request = Request::builder()
             .header(AUTHORIZATION, "Bearer invalid-token")
@@ -497,7 +533,12 @@ mod tests {
 
         let config = build_config(&mock_server);
         let cache = cache::Config::Memory.to_backend().unwrap();
-        let validator = OidcValidator::new("my-provider".to_string(), &config, cache).unwrap();
+        let validator = OidcValidator::new(
+            "my-provider".to_string(),
+            &config,
+            test_http_client(),
+            cache,
+        );
 
         let mut claims = HashMap::new();
         claims.insert("iss".to_string(), json!(mock_server.uri()));

@@ -154,7 +154,7 @@ mod tests {
     use super::*;
     use crate::{
         command::scrub::{action::Action, executor::Executor},
-        oci::Descriptor,
+        oci::{Descriptor, Namespace},
         registry::{
             Registry,
             metadata_store::{
@@ -181,7 +181,7 @@ mod tests {
         registry: &Registry,
         metadata_store: &Arc<dyn MetadataStore + Send + Sync>,
         blob_store: &Arc<dyn BlobStore>,
-        namespace: &str,
+        namespace: &Namespace,
         config_content: &[u8],
         layer_content: &[u8],
     ) -> (Digest, Digest, Digest) {
@@ -229,7 +229,7 @@ mod tests {
     #[tokio::test]
     async fn test_link_references_checker_fixes_missing_references() {
         for test_case in backends() {
-            let namespace = "test-repo/app";
+            let namespace = &Namespace::new("test-repo/app").unwrap();
             let registry = test_case.registry();
             let metadata_store = test_case.metadata_store();
             let blob_store = test_case.blob_store();
@@ -280,13 +280,14 @@ mod tests {
                 layer_link_after.referenced_by.contains(&manifest_digest),
                 "Layer link should have manifest digest in referenced_by after check"
             );
+            test_case.cleanup().await;
         }
     }
 
     #[tokio::test]
     async fn test_dry_run_makes_no_writes() {
         for test_case in backends() {
-            let namespace = "test-repo/dry-run";
+            let namespace = &Namespace::new("test-repo/dry-run").unwrap();
             let registry = test_case.registry();
             let metadata_store = test_case.metadata_store();
             let blob_store = test_case.blob_store();
@@ -323,6 +324,7 @@ mod tests {
                 layer_link.referenced_by.is_empty(),
                 "Vec sink must not write: layer referenced_by should remain empty"
             );
+            test_case.cleanup().await;
         }
     }
 
@@ -378,6 +380,7 @@ mod tests {
                 matches!(config_result, Err(metadata_store::Error::ReferenceNotFound)),
                 "Config link should still not exist after check"
             );
+            test_case.cleanup().await;
         }
     }
 

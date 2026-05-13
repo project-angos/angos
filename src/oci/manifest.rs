@@ -31,24 +31,21 @@ impl Manifest {
         Ok(serde_json::from_slice(s)?)
     }
 
-    fn artifact_types(&self) -> Vec<String> {
-        let mut types = Vec::new();
-        if let Some(artifact_type) = &self.artifact_type {
-            types.push(artifact_type.clone());
-        }
-        if let Some(config) = &self.config {
-            types.push(config.media_type.clone());
-        }
-        types
+    /// Returns `true` if `artifact_type` equals either the manifest's top-level
+    /// `artifactType` field or, per the OCI Referrers API spec, the config's
+    /// `mediaType` fallback.
+    pub fn has_artifact_type(&self, artifact_type: &str) -> bool {
+        self.artifact_type.as_deref() == Some(artifact_type)
+            || self
+                .config
+                .as_ref()
+                .is_some_and(|c| c.media_type == artifact_type)
     }
 
-    /// Returns whether this manifest's `artifact_type` (or one of its config
-    /// media types) matches the given filter. A `None` filter matches anything.
+    /// Returns whether this manifest's `artifact_type` (or config `mediaType`
+    /// fallback) matches the given filter. A `None` filter matches anything.
     pub fn artifact_type_matches(&self, filter: Option<&String>) -> bool {
-        match filter {
-            None => true,
-            Some(want) => self.artifact_types().contains(want),
-        }
+        filter.is_none_or(|want| self.has_artifact_type(want))
     }
 
     /// Builds a `Descriptor` for this manifest, moving the (potentially large)
@@ -131,15 +128,27 @@ mod tests {
     }
 
     #[test]
-    fn test_artifact_types() {
+    fn test_has_artifact_type_top_level_field() {
         let manifest = demo_manifest();
-        assert_eq!(
-            manifest.artifact_types(),
-            vec![
-                "oci.image.index.v1".to_string(),
-                MEDIA_TYPE_CONFIG.to_string(),
-            ]
-        );
+        assert!(manifest.has_artifact_type("oci.image.index.v1"));
+    }
+
+    #[test]
+    fn test_has_artifact_type_config_media_type_fallback() {
+        let manifest = demo_manifest();
+        assert!(manifest.has_artifact_type(MEDIA_TYPE_CONFIG));
+    }
+
+    #[test]
+    fn test_has_artifact_type_no_match() {
+        let manifest = demo_manifest();
+        assert!(!manifest.has_artifact_type("application/vnd.example.unknown"));
+    }
+
+    #[test]
+    fn test_has_artifact_type_none_artifact_type_none_config() {
+        let manifest = Manifest::default();
+        assert!(!manifest.has_artifact_type("application/vnd.anything"));
     }
 
     // take_descriptor: media_type present → Some(Descriptor)

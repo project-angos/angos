@@ -1,7 +1,9 @@
 use std::{
     convert::Infallible,
     fmt::Debug,
+    future::Future,
     net::SocketAddr,
+    pin::Pin,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -19,11 +21,16 @@ use tracing_opentelemetry::OpenTelemetrySpanExt;
 use super::{dispatch::dispatch_request, error_to_response};
 use crate::{
     auth::PeerCertificate,
-    command::server::{ServerContext, response_body::ResponseBody, router},
+    command::server::{
+        ServerContext, error::Error as ServerError, response_body::ResponseBody, router,
+    },
     identity::Action,
     metrics_provider::{InFlightGuard, metrics_provider},
     timing::elapsed_ms,
 };
+
+type DispatchFuture =
+    Pin<Box<dyn Future<Output = Result<Response<ResponseBody>, ServerError>> + Send + 'static>>;
 
 pub async fn serve_request<S>(
     stream: TokioIo<S>,
@@ -94,7 +101,9 @@ async fn handle_request(
 
     let trace_id = current_trace_id(&Span::current());
 
-    let response = match dispatch_request(Arc::clone(&context), request, action).await {
+    let dispatch: DispatchFuture =
+        Box::pin(dispatch_request(Arc::clone(&context), request, action));
+    let response = match dispatch.await {
         Ok(response) => response,
         Err(error) => error_to_response(&error, trace_id.as_ref()),
     };

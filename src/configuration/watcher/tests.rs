@@ -7,7 +7,7 @@ use notify::{
 use tempfile::TempDir;
 
 use super::{classify::is_k8s_data_symlink, *};
-use crate::configuration::listeners::tls::ServerTlsConfig;
+use crate::configuration::listeners::ServerTlsConfig;
 
 fn make_event(kind: EventKind, paths: Vec<PathBuf>) -> Event {
     Event {
@@ -608,11 +608,11 @@ async fn coalesce_events_returns_none_on_channel_close() {
 // through `watch_config_loop` does not normally exhibit the empty-cache
 // race in tests (a config-repair write fires `ChangeKind::Config` first,
 // populating the cache before any TLS event), so it cannot reliably cover
-// the `cached.is_none()` branch in `resolve_config` / `reload_tls`.
+// the `cached.is_none()` branch in `ensure_config_cached` / `reload_tls`.
 // Calling those helpers directly does.
 
 #[test]
-fn resolve_config_loads_from_disk_when_cache_is_empty() {
+fn ensure_config_cached_loads_from_disk_when_cache_is_empty() {
     let temp_dir = TempDir::new().unwrap();
     let tls_dir = temp_dir.path().join("tls");
     fs::create_dir_all(&tls_dir).unwrap();
@@ -629,7 +629,7 @@ fn resolve_config_loads_from_disk_when_cache_is_empty() {
     .unwrap();
 
     let mut cached: Option<Configuration> = None;
-    let resolved = resolve_config(&mut cached, &config_path);
+    let resolved = ensure_config_cached(&mut cached, &config_path);
 
     assert!(resolved.is_some(), "must load from disk when cache empty");
     assert!(
@@ -639,20 +639,20 @@ fn resolve_config_loads_from_disk_when_cache_is_empty() {
 }
 
 #[test]
-fn resolve_config_returns_none_when_cache_empty_and_disk_invalid() {
+fn ensure_config_cached_returns_none_when_cache_empty_and_disk_invalid() {
     let temp_dir = TempDir::new().unwrap();
     let config_path = temp_dir.path().join("config.toml");
     fs::write(&config_path, b"invalid toml [[[").unwrap();
 
     let mut cached: Option<Configuration> = None;
-    let resolved = resolve_config(&mut cached, &config_path);
+    let resolved = ensure_config_cached(&mut cached, &config_path);
 
     assert!(resolved.is_none());
     assert!(cached.is_none(), "must not populate cache on load failure");
 }
 
 #[test]
-fn resolve_config_returns_cached_without_reading_disk() {
+fn ensure_config_cached_returns_cached_without_reading_disk() {
     let temp_dir = TempDir::new().unwrap();
     // Cache is preloaded with a non-TLS config.
     let cached_cfg: Configuration =
@@ -661,7 +661,7 @@ fn resolve_config_returns_cached_without_reading_disk() {
 
     // Point at a non-existent path; must not be touched.
     let bogus_path = temp_dir.path().join("does-not-exist.toml");
-    let resolved = resolve_config(&mut cached, &bogus_path);
+    let resolved = ensure_config_cached(&mut cached, &bogus_path);
 
     assert!(resolved.is_some(), "must reuse cached value");
 }

@@ -2,24 +2,25 @@
 mod tests;
 
 mod auth;
-mod bearer_token;
-mod http_client;
 mod upstream_url;
 
-use std::{io, sync::Arc};
+use std::{io, path::Path, sync::Arc, time::Duration};
 
+use auth::token_index_cache_key;
 use futures_util::TryStreamExt;
 use reqwest::{
-    Client, Method, Response, StatusCode,
+    Client, Method, RequestBuilder, Response, StatusCode,
     header::{ACCEPT, AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE},
 };
 use serde::Deserialize;
-use tokio::{io::AsyncReadExt, sync::RwLock};
+use tokio::{io::AsyncReadExt, sync::Mutex};
 use tokio_util::io::StreamReader;
 use tracing::{info, warn};
+pub use upstream_url::get_upstream_namespace;
 
 use crate::{
     cache::Cache,
+    http_client::HttpClientBuilder,
     oci::Digest,
     registry::{DOCKER_CONTENT_DIGEST, Error, blob_store::BoxedReader},
     secret::Secret,
@@ -60,13 +61,31 @@ pub struct RegistryClient {
     pub url: String,
     client: Client,
     basic_auth: Option<(String, String)>,
-    cache: Arc<dyn Cache>,
-    auth_cache: Arc<RwLock<Option<String>>>,
+    cache: Arc<Cache>,
+    token_refresh: Mutex<()>,
 }
 
 impl RegistryClient {
-    pub fn new(config: &RegistryClientConfig, cache: Arc<dyn Cache>) -> Result<Self, Error> {
-        let client = http_client::build_http_client(config)?;
+    /// Creates a registry client for one upstream registry.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when TLS files cannot be loaded or the HTTP client cannot be built.
+    pub fn new(config: &RegistryClientConfig, cache: Arc<Cache>) -> Result<Self, Error> {
+        let client = HttpClientBuilder::new()
+            .rustls_tls()
+            .redirect(reqwest::redirect::Policy::limited(
+                config.max_redirect as usize,
+            ))
+            .timeout(Duration::from_mins(5))
+            .tls_files(
+                config.server_ca_bundle.as_deref().map(Path::new),
+                config.client_certificate.as_deref().map(Path::new),
+                config.client_private_key.as_deref().map(Path::new),
+            )
+            .map_err(Error::Initialization)?
+            .build()
+            .map_err(Error::Initialization)?;
 
         let basic_auth = match (&config.username, &config.password) {
             (Some(username), Some(password)) => Some((username.clone(), password.expose().clone())),
@@ -82,7 +101,7 @@ impl RegistryClient {
             client,
             basic_auth,
             cache,
-            auth_cache: Arc::new(RwLock::new(None)),
+            token_refresh: Mutex::new(()),
         })
     }
 
@@ -94,14 +113,15 @@ impl RegistryClient {
     ) -> Result<Response, Error> {
         info!("Requesting from upstream: {location}");
 
-        let cached_auth = self.auth_cache.read().await.clone();
+        let cached_auth = self.cached_auth_header(location).await;
         let response = self
             .send(method, accepted_types, location, cached_auth.as_deref())
             .await?;
 
         if response.status() == StatusCode::UNAUTHORIZED {
-            let token = self.authenticate(&response).await?;
-            *self.auth_cache.write().await = Some(token.clone());
+            let token = self
+                .refresh_auth_header(&response, cached_auth.as_deref())
+                .await?;
             return self
                 .send(method, accepted_types, location, Some(&token))
                 .await;
@@ -114,6 +134,65 @@ impl RegistryClient {
         Ok(response)
     }
 
+    async fn cached_auth_header(&self, location: &str) -> Option<String> {
+        let url = match url::Url::parse(location) {
+            Ok(url) => url,
+            Err(e) => {
+                warn!("Unable to parse upstream URL for auth cache lookup: {e}");
+                return None;
+            }
+        };
+
+        self.cached_auth_header_for_url(&url).await
+    }
+
+    async fn refresh_auth_header(
+        &self,
+        response: &Response,
+        attempted_auth: Option<&str>,
+    ) -> Result<String, Error> {
+        let _guard = self.token_refresh.lock().await;
+
+        if let Some(auth_header) = self.cached_auth_header_for_url(response.url()).await
+            && Some(auth_header.as_str()) != attempted_auth
+        {
+            return Ok(auth_header);
+        }
+
+        self.authenticate_with_cache(response, attempted_auth).await
+    }
+
+    async fn cached_auth_header_for_url(&self, url: &url::Url) -> Option<String> {
+        let index_key = match token_index_cache_key(url) {
+            Ok(key) => key,
+            Err(e) => {
+                warn!("Unable to build auth cache key: {e}");
+                return None;
+            }
+        };
+
+        let key = match self.cache.retrieve_value(&index_key).await {
+            Ok(Some(key)) => key,
+            Ok(None) => return None,
+            Err(e) => {
+                warn!("Unable to read upstream auth cache index: {e}");
+                return None;
+            }
+        };
+
+        self.cached_auth_header_for_key(&key).await
+    }
+
+    async fn cached_auth_header_for_key(&self, key: &str) -> Option<String> {
+        match self.cache.retrieve_value(key).await {
+            Ok(auth_header) => auth_header,
+            Err(e) => {
+                warn!("Unable to read upstream auth cache: {e}");
+                None
+            }
+        }
+    }
+
     async fn send(
         &self,
         method: &Method,
@@ -121,6 +200,19 @@ impl RegistryClient {
         location: &str,
         auth_header: Option<&str>,
     ) -> Result<Response, Error> {
+        self.build_request(method, accepted_types, location, auth_header)
+            .send()
+            .await
+            .map_err(|e| Error::Internal(format!("HTTP request failed: {e}")))
+    }
+
+    fn build_request(
+        &self,
+        method: &Method,
+        accepted_types: &[String],
+        location: &str,
+        auth_header: Option<&str>,
+    ) -> RequestBuilder {
         let mut request = self.client.request(method.clone(), location);
         for accepted_type in accepted_types {
             request = request.header(ACCEPT, accepted_type);
@@ -129,11 +221,14 @@ impl RegistryClient {
             request = request.header(AUTHORIZATION, auth);
         }
         request
-            .send()
-            .await
-            .map_err(|e| Error::Internal(format!("HTTP request failed: {e}")))
     }
 
+    /// Sends a HEAD request for a blob and returns its digest and size.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the upstream request fails, rejects access, omits required
+    /// headers, or reports that the blob is unknown.
     pub async fn head_blob(
         &self,
         accepted_types: &[String],
@@ -151,6 +246,12 @@ impl RegistryClient {
         Ok((digest, size))
     }
 
+    /// Streams a blob from the upstream registry.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the upstream request fails, rejects access, omits required
+    /// headers, or reports that the blob is unknown.
     pub async fn get_blob(
         &self,
         accepted_types: &[String],
@@ -169,6 +270,12 @@ impl RegistryClient {
         Ok((total_length, Box::new(reader)))
     }
 
+    /// Sends a HEAD request for a manifest and returns its metadata.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the upstream request fails, rejects access, omits required
+    /// headers, or reports that the manifest is unknown.
     pub async fn head_manifest(
         &self,
         accepted_types: &[String],
@@ -187,6 +294,12 @@ impl RegistryClient {
         Ok((media_type, digest, size))
     }
 
+    /// Fetches a manifest body from the upstream registry.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the upstream request fails, rejects access, omits required
+    /// headers, reports that the manifest is unknown, or the response body cannot be read.
     pub async fn get_manifest(
         &self,
         accepted_types: &[String],

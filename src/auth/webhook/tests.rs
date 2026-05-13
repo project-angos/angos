@@ -1,16 +1,7 @@
-use std::{
-    fs,
-    path::PathBuf,
-    str::FromStr,
-    sync::{
-        Arc,
-        atomic::{AtomicUsize, Ordering},
-    },
-    time::Duration,
-};
+use std::{fs, path::PathBuf, str::FromStr, sync::Arc, time::Duration};
 
-use async_trait::async_trait;
 use hyper::{HeaderMap, Method, http::request::Builder};
+use reqwest::Client;
 use url::Url;
 use wiremock::{
     Mock, MockServer, ResponseTemplate,
@@ -30,45 +21,15 @@ use crate::{
             set_registry_namespace_header, set_registry_reference_header,
             set_registry_username_header,
         },
-        tls::{load_certificate_bundle, load_identity, load_pem_file},
     },
     cache::{self, Cache},
     command::server::Error,
+    http_client::HttpClientBuilder,
     identity::{Action, ClientIdentity},
     oci::{Digest, Namespace, Reference},
     secret::Secret,
     test_fixtures::webhook::{ca_bundle_pem, client_cert_pem, client_key_pem},
 };
-
-// Always fails store_value so tests can exercise the cache-write-error path.
-#[derive(Debug, Default)]
-struct FailingCache {
-    store_call_count: AtomicUsize,
-}
-
-#[async_trait]
-impl Cache for FailingCache {
-    async fn store_value(
-        &self,
-        _key: &str,
-        _value: &str,
-        _expires_in: u64,
-    ) -> Result<(), cache::Error> {
-        self.store_call_count.fetch_add(1, Ordering::Relaxed);
-        Err(cache::Error::Execution(
-            "injected store failure".to_string(),
-        ))
-    }
-
-    async fn retrieve_value(&self, _key: &str) -> Result<Option<String>, cache::Error> {
-        // Cache miss: always forward to the webhook.
-        Ok(None)
-    }
-
-    async fn delete_value(&self, _key: &str) -> Result<(), cache::Error> {
-        Ok(())
-    }
-}
 
 #[test]
 fn test_config_deserialize() {
@@ -80,7 +41,6 @@ fn test_config_deserialize() {
 
     let config: Config = toml::from_str(valid_config).unwrap();
 
-    assert!(config.validate().is_ok());
     assert_eq!(config.url.as_str(), "https://example.com/");
     assert_eq!(config.timeout_ms, 1000);
     assert!(
@@ -100,7 +60,6 @@ fn test_config_deserialize() {
 
     let config: Config = toml::from_str(valid_config).unwrap();
 
-    assert!(config.validate().is_ok());
     assert_eq!(config.url.as_str(), "https://example.com/");
     assert_eq!(config.timeout_ms, 1000);
     assert!(
@@ -114,27 +73,35 @@ fn test_config_deserialize() {
 }
 
 #[test]
-fn test_config_validate() {
-    let valid_config = Config {
-        name: String::new(),
-        url: Url::parse("https://example.com").unwrap(),
-        timeout_ms: 1000,
-        auth: Some(WebhookAuth::BearerToken(Secret::new("token".to_string()))),
-        client_certificate_bundle: Some("/valid/path/to/cert.pem".into()),
-        client_private_key: Some("/valid/path/to/key.pem".into()),
-        server_ca_bundle: Some("/valid/path/to/ca.pem".into()),
-        forward_headers: vec!["X-Custom-Header".to_string()],
-        cache_ttl: 60,
-    };
-    assert!(valid_config.validate().is_ok());
+fn mtls_pair_must_be_complete_at_deserialize_time() {
+    let invalid_toml = r#"
+        url = "https://example.com"
+        timeout_ms = 1000
+        client_certificate_bundle = "/valid/path/to/cert.pem"
+    "#;
+    assert!(toml::from_str::<Config>(invalid_toml).is_err());
 
-    let mut invalid_config = valid_config.clone();
-    invalid_config.client_private_key = None;
-    assert!(invalid_config.validate().is_err());
+    let invalid_toml = r#"
+        url = "https://example.com"
+        timeout_ms = 1000
+        client_private_key = "/valid/path/to/key.pem"
+    "#;
+    assert!(toml::from_str::<Config>(invalid_toml).is_err());
+}
 
-    let mut invalid_config = valid_config.clone();
-    invalid_config.client_certificate_bundle = None;
-    assert!(invalid_config.validate().is_err());
+#[test]
+fn invalid_forward_header_fails_at_deserialize_time() {
+    let toml = r#"
+        url = "https://example.com"
+        timeout_ms = 1000
+        forward_headers = ["X-Good-Header", "Invalid Header!"]
+    "#;
+
+    let err = toml::from_str::<Config>(toml).unwrap_err();
+    assert!(
+        err.to_string().contains("Invalid Header!"),
+        "error should identify the invalid forwarded header: {err}"
+    );
 }
 
 #[test]
@@ -146,68 +113,6 @@ fn invalid_url_fails_at_deserialize() {
 
     let result: Result<Config, _> = toml::from_str(toml);
     assert!(result.is_err());
-}
-
-#[test]
-fn test_load_pem_file() {
-    let content = "test content";
-
-    let tmp_dir = tempfile::tempdir().unwrap();
-    let file_path = tmp_dir.path().join("test.txt");
-    fs::write(&file_path, content).unwrap();
-
-    let loaded_content = load_pem_file(&file_path).unwrap();
-    assert_eq!(loaded_content, content);
-
-    let invalid_path = load_pem_file(&PathBuf::from("/invalid/path/to/file"));
-    assert!(matches!(invalid_path, Err(Error::Initialization(_))));
-}
-
-#[test]
-fn test_load_certificate_bundle() {
-    let tmp_dir = tempfile::tempdir().unwrap();
-    let file_path = tmp_dir.path().join("bundle.pem");
-    fs::write(&file_path, ca_bundle_pem()).unwrap();
-
-    let loaded_certificates = load_certificate_bundle(&file_path).unwrap();
-    assert_eq!(loaded_certificates.len(), 2);
-}
-
-#[test]
-fn test_load_certificate_invalid() {
-    let content = "-----BEGIN INVALID CERTIFICATE-----LOLNOP-----END CERTIFICATE-----";
-    let tmp_dir = tempfile::tempdir().unwrap();
-    let file_path = tmp_dir.path().join("test.txt");
-    fs::write(&file_path, content).unwrap();
-
-    let invalid_certificates = load_certificate_bundle(&file_path);
-    assert!(matches!(
-        invalid_certificates,
-        Err(Error::Initialization(_))
-    ));
-}
-
-#[test]
-fn test_load_identity() {
-    let tmp_dir = tempfile::tempdir().unwrap();
-    let cert_file_path = tmp_dir.path().join("certificate.pem");
-    fs::write(&cert_file_path, client_cert_pem()).unwrap();
-
-    let key_file_path = tmp_dir.path().join("private-key.pem");
-    fs::write(&key_file_path, client_key_pem()).unwrap();
-
-    let identity = load_identity(Some(&cert_file_path), Some(&key_file_path));
-    assert!(matches!(identity, Ok(Some(_))));
-
-    let cert_file_path = tmp_dir.path().join("certificate.pem");
-    let key_file_path = tmp_dir.path().join("private-key.pem");
-    fs::write(&key_file_path, ca_bundle_pem()).unwrap();
-
-    let identity = load_identity(Some(&cert_file_path), Some(&key_file_path));
-    assert!(matches!(identity, Err(Error::Initialization(_))));
-
-    let identity = load_identity(None, None);
-    assert!(matches!(identity, Ok(None)));
 }
 
 #[test]
@@ -542,7 +447,6 @@ fn build_test_config(
     client_private_key: Option<PathBuf>,
 ) -> Config {
     Config {
-        name: String::new(),
         url,
         timeout_ms: 1000,
         auth: Some(WebhookAuth::BearerToken(Secret::new("token".to_string()))),
@@ -552,6 +456,28 @@ fn build_test_config(
         forward_headers: vec!["X-Custom-Header".to_string()],
         cache_ttl: 60,
     }
+}
+
+fn build_test_client(config: &Config) -> Result<Client, String> {
+    HttpClientBuilder::new()
+        .rustls_tls()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(Duration::from_millis(config.timeout_ms))
+        .tls_files(
+            config.server_ca_bundle.as_deref(),
+            config.client_certificate_bundle.as_deref(),
+            config.client_private_key.as_deref(),
+        )?
+        .build()
+}
+
+fn build_test_webhook(
+    name: String,
+    config: Config,
+    cache: Arc<Cache>,
+) -> Result<WebhookAuthorizer, Error> {
+    let client = build_test_client(&config).map_err(Error::Initialization)?;
+    WebhookAuthorizer::new(name, config, client, cache)
 }
 
 #[test]
@@ -572,13 +498,32 @@ fn test_new_invalid_mtls() {
         Some(cert_file_path),
         Some(key_file_path),
     );
-    let webhook = WebhookAuthorizer::new(
+    let webhook = build_test_webhook(
         "test".to_string(),
         config,
         cache::Config::Memory.to_backend().unwrap(),
     );
 
     assert!(matches!(webhook, Err(Error::Initialization(_))));
+}
+
+#[test]
+fn test_new_rejects_incomplete_mtls_config() {
+    let config = build_test_config(
+        Url::parse("https://example.com").unwrap(),
+        None,
+        Some(PathBuf::from("certificate.pem")),
+        None,
+    );
+    let webhook = build_test_webhook(
+        "test".to_string(),
+        config,
+        cache::Config::Memory.to_backend().unwrap(),
+    );
+
+    assert!(
+        matches!(webhook, Err(Error::Initialization(msg)) if msg.contains("client_private_key"))
+    );
 }
 
 #[test]
@@ -599,7 +544,7 @@ fn test_new_mtls() {
         Some(cert_file_path),
         Some(key_file_path),
     );
-    let webhook = WebhookAuthorizer::new(
+    let webhook = build_test_webhook(
         "test".to_string(),
         config,
         cache::Config::Memory.to_backend().unwrap(),
@@ -611,7 +556,7 @@ fn test_new_mtls() {
 #[test]
 fn test_new_simple() {
     let config = build_test_config(Url::parse("https://example.com").unwrap(), None, None, None);
-    let webhook = WebhookAuthorizer::new(
+    let webhook = build_test_webhook(
         "test".to_string(),
         config,
         cache::Config::Memory.to_backend().unwrap(),
@@ -633,7 +578,7 @@ async fn test_authorize_success() {
     config.auth = None;
 
     let cache = cache::Config::Memory.to_backend().unwrap();
-    let webhook = WebhookAuthorizer::new("test".to_string(), config, cache).unwrap();
+    let webhook = build_test_webhook("test".to_string(), config, cache).unwrap();
 
     let action = Action::ApiVersion;
     let identity = ClientIdentity::new(None);
@@ -663,7 +608,7 @@ async fn test_authorize_denied() {
     config.auth = None;
 
     let cache = cache::Config::Memory.to_backend().unwrap();
-    let webhook = WebhookAuthorizer::new("test".to_string(), config, cache).unwrap();
+    let webhook = build_test_webhook("test".to_string(), config, cache).unwrap();
 
     let action = Action::ApiVersion;
     let identity = ClientIdentity::new(None);
@@ -696,7 +641,7 @@ async fn test_authorize_with_bearer_token() {
     )));
 
     let cache = cache::Config::Memory.to_backend().unwrap();
-    let webhook = WebhookAuthorizer::new("test".to_string(), config, cache).unwrap();
+    let webhook = build_test_webhook("test".to_string(), config, cache).unwrap();
 
     let action = Action::ApiVersion;
     let identity = ClientIdentity::new(None);
@@ -730,7 +675,7 @@ async fn test_authorize_with_basic_auth() {
     });
 
     let cache = cache::Config::Memory.to_backend().unwrap();
-    let webhook = WebhookAuthorizer::new("test".to_string(), config, cache).unwrap();
+    let webhook = build_test_webhook("test".to_string(), config, cache).unwrap();
 
     let action = Action::ApiVersion;
     let identity = ClientIdentity::new(None);
@@ -760,7 +705,7 @@ async fn test_authorize_sends_correct_headers() {
 
     let config = build_test_config(Url::parse(&mock_server.uri()).unwrap(), None, None, None);
     let cache = cache::Config::Memory.to_backend().unwrap();
-    let webhook = WebhookAuthorizer::new("test".to_string(), config, cache).unwrap();
+    let webhook = build_test_webhook("test".to_string(), config, cache).unwrap();
 
     let action = Action::ApiVersion;
     let identity = ClientIdentity::new(None);
@@ -792,7 +737,7 @@ async fn test_authorize_uses_cache() {
     config.auth = None;
 
     let cache = cache::Config::Memory.to_backend().unwrap();
-    let webhook = WebhookAuthorizer::new("test".to_string(), config, cache).unwrap();
+    let webhook = build_test_webhook("test".to_string(), config, cache).unwrap();
 
     let action = Action::ApiVersion;
     let identity = ClientIdentity::new(None);
@@ -819,7 +764,7 @@ async fn test_authorize_returns_err_on_unreachable_url() {
     config.auth = None;
 
     let cache = cache::Config::Memory.to_backend().unwrap();
-    let webhook = WebhookAuthorizer::new("test".to_string(), config, cache).unwrap();
+    let webhook = build_test_webhook("test".to_string(), config, cache).unwrap();
 
     let action = Action::ApiVersion;
     let identity = ClientIdentity::new(None);
@@ -866,7 +811,7 @@ async fn test_authorize_does_not_cache_transport_errors() {
     unreachable_config.auth = None;
     let cache = cache::Config::Memory.to_backend().unwrap();
     let unreachable_webhook =
-        WebhookAuthorizer::new("test".to_string(), unreachable_config, cache.clone()).unwrap();
+        build_test_webhook("test".to_string(), unreachable_config, cache.clone()).unwrap();
 
     let first = unreachable_webhook
         .authorize(&action, &identity, &request_parts)
@@ -882,7 +827,7 @@ async fn test_authorize_does_not_cache_transport_errors() {
     let mut live_config =
         build_test_config(Url::parse(&mock_server.uri()).unwrap(), None, None, None);
     live_config.auth = None;
-    let live_webhook = WebhookAuthorizer::new("test".to_string(), live_config, cache).unwrap();
+    let live_webhook = build_test_webhook("test".to_string(), live_config, cache).unwrap();
 
     let second = live_webhook
         .authorize(&action, &identity, &request_parts)
@@ -897,7 +842,6 @@ async fn test_authorize_does_not_cache_transport_errors() {
 // Build a Config with non-default timeout_ms or cache_ttl.
 fn build_test_config_with(url: Url, timeout_ms: u64, cache_ttl: u64) -> Config {
     Config {
-        name: String::new(),
         url,
         timeout_ms,
         auth: None,
@@ -923,9 +867,10 @@ async fn webhook_authorization_succeeds_despite_cache_store_error() {
     let mut config = build_test_config(Url::parse(&mock_server.uri()).unwrap(), None, None, None);
     config.auth = None;
 
-    let failing_cache = Arc::new(FailingCache::default());
-    let webhook =
-        WebhookAuthorizer::new("test".to_string(), config, failing_cache.clone()).unwrap();
+    let failing_backend = cache::stub::Backend::new();
+    failing_backend.set_store_error(Some("injected store failure".to_string()));
+    let failing_cache = Arc::new(Cache::Stub(failing_backend.clone()));
+    let webhook = build_test_webhook("test".to_string(), config, failing_cache.clone()).unwrap();
 
     let action = Action::ApiVersion;
     let identity = ClientIdentity::new(None);
@@ -942,7 +887,7 @@ async fn webhook_authorization_succeeds_despite_cache_store_error() {
         "cache store error must not fail authorization"
     );
     assert_eq!(
-        failing_cache.store_call_count.load(Ordering::Relaxed),
+        failing_backend.store_calls(),
         1,
         "store_value must be attempted exactly once"
     );
@@ -962,7 +907,7 @@ async fn test_authorize_timeout_does_not_cache_and_retries() {
     let shared_cache = cache::Config::Memory.to_backend().unwrap();
 
     // First call: very short timeout causes a transport error.
-    let slow_webhook = WebhookAuthorizer::new(
+    let slow_webhook = build_test_webhook(
         "test".to_string(),
         build_test_config_with(Url::parse(&slow_server.uri()).unwrap(), 100, 60),
         shared_cache.clone(),
@@ -990,7 +935,7 @@ async fn test_authorize_timeout_does_not_cache_and_retries() {
         .mount(&live_server)
         .await;
 
-    let live_webhook = WebhookAuthorizer::new(
+    let live_webhook = build_test_webhook(
         "test".to_string(),
         build_test_config_with(Url::parse(&live_server.uri()).unwrap(), 1000, 60),
         shared_cache,
@@ -1026,7 +971,7 @@ async fn test_authorize_cache_entry_expires_and_refetches() {
         .await;
 
     let cache = cache::Config::Memory.to_backend().unwrap();
-    let webhook = WebhookAuthorizer::new(
+    let webhook = build_test_webhook(
         "test".to_string(),
         build_test_config_with(Url::parse(&mock_server.uri()).unwrap(), 1000, 1),
         cache,

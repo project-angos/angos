@@ -1,11 +1,7 @@
 use serde::{Deserialize, Deserializer, Serialize};
 use url::Url;
 
-use crate::{
-    configuration::{Error, RegexPattern},
-    event_webhook::event::EventKind,
-    secret::Secret,
-};
+use crate::{configuration::RegexPattern, event_webhook::event::EventKind, secret::Secret};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -16,55 +12,84 @@ pub enum DeliveryPolicy {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(try_from = "EventWebhookConfigFields")]
 pub struct EventWebhookConfig {
-    /// Populated during configuration resolution; not present in TOML.
-    #[serde(skip, default)]
-    pub name: String,
-
     pub url: Url,
     pub policy: DeliveryPolicy,
-    #[serde(default)]
     pub token: Option<Secret<String>>,
-    #[serde(default = "default_timeout_ms")]
     pub timeout_ms: u64,
-    /// Maximum number of retry attempts after the initial delivery. Accepted range: 0–16.
-    /// Values above 16 are rejected at configuration load time to prevent retry storms
-    /// and arithmetic overflow in the exponential-backoff calculation.
-    #[serde(default, deserialize_with = "deserialize_max_retries")]
     pub max_retries: u32,
     pub events: Vec<EventKind>,
-    #[serde(default)]
     pub repository_filter: Option<Vec<RegexPattern>>,
+}
+
+#[derive(Deserialize)]
+struct EventWebhookConfigFields {
+    url: Url,
+    policy: DeliveryPolicy,
+    #[serde(default, deserialize_with = "deserialize_token")]
+    token: Option<Secret<String>>,
+    #[serde(default = "default_timeout_ms")]
+    timeout_ms: u64,
+    #[serde(default, deserialize_with = "deserialize_max_retries")]
+    max_retries: u32,
+    events: Vec<EventKind>,
+    #[serde(default)]
+    repository_filter: Option<Vec<RegexPattern>>,
+}
+
+impl TryFrom<EventWebhookConfigFields> for EventWebhookConfig {
+    type Error = String;
+
+    fn try_from(fields: EventWebhookConfigFields) -> Result<Self, Self::Error> {
+        if fields.events.is_empty() {
+            return Err("event webhook must have at least one event".to_string());
+        }
+
+        Ok(Self {
+            url: fields.url,
+            policy: fields.policy,
+            token: fields.token,
+            timeout_ms: fields.timeout_ms,
+            max_retries: fields.max_retries,
+            events: fields.events,
+            repository_filter: fields.repository_filter,
+        })
+    }
 }
 
 fn default_timeout_ms() -> u64 {
     5000
 }
 
+fn deserialize_token<'de, D>(deserializer: D) -> Result<Option<Secret<String>>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let token = Option::<Secret<String>>::deserialize(deserializer)?;
+    if token
+        .as_ref()
+        .is_some_and(|token| token.expose().is_empty())
+    {
+        return Err(serde::de::Error::custom(
+            "event webhook token must not be empty",
+        ));
+    }
+    Ok(token)
+}
+
 fn deserialize_max_retries<'de, D>(deserializer: D) -> Result<u32, D::Error>
 where
     D: Deserializer<'de>,
 {
-    const MAX: u32 = 16;
-    let v = u32::deserialize(deserializer)?;
-    if v > MAX {
+    const MAX_RETRIES: u32 = 16;
+    let max_retries = u32::deserialize(deserializer)?;
+    if max_retries > MAX_RETRIES {
         return Err(serde::de::Error::custom(format!(
-            "max_retries={v} exceeds the supported maximum of {MAX}"
+            "max_retries={max_retries} exceeds the supported maximum of {MAX_RETRIES}"
         )));
     }
-    Ok(v)
-}
-
-impl EventWebhookConfig {
-    pub fn validate(&self) -> Result<(), Error> {
-        if self.events.is_empty() {
-            return Err(Error::Initialization(
-                "Event webhook must have at least one event".to_string(),
-            ));
-        }
-
-        Ok(())
-    }
+    Ok(max_retries)
 }
 
 #[cfg(test)]
@@ -78,24 +103,17 @@ mod tests {
     };
 
     #[test]
-    fn serialize_delivery_policy_required() {
-        let policy = DeliveryPolicy::Required;
-        let json = serde_json::to_string(&policy).unwrap();
-        assert_eq!(json, r#""required""#);
-    }
+    fn serialize_delivery_policy_all_variants() {
+        let cases = [
+            (DeliveryPolicy::Required, r#""required""#),
+            (DeliveryPolicy::Optional, r#""optional""#),
+            (DeliveryPolicy::Async, r#""async""#),
+        ];
 
-    #[test]
-    fn serialize_delivery_policy_optional() {
-        let policy = DeliveryPolicy::Optional;
-        let json = serde_json::to_string(&policy).unwrap();
-        assert_eq!(json, r#""optional""#);
-    }
-
-    #[test]
-    fn serialize_delivery_policy_async() {
-        let policy = DeliveryPolicy::Async;
-        let json = serde_json::to_string(&policy).unwrap();
-        assert_eq!(json, r#""async""#);
+        for (policy, expected) in cases {
+            let json = serde_json::to_string(&policy).unwrap();
+            assert_eq!(json, expected);
+        }
     }
 
     #[test]
@@ -204,20 +222,40 @@ mod tests {
     }
 
     #[test]
-    fn validate_webhook_config_empty_events_rejected() {
+    fn empty_token_fails_at_deserialize_time() {
+        let toml = r#"
+            url = "https://example.com/webhook"
+            policy = "required"
+            token = ""
+            events = ["manifest.push"]
+        "#;
+
+        let err = toml::from_str::<EventWebhookConfig>(toml).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("event webhook token must not be empty"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn empty_events_fail_at_deserialize_time() {
         let toml = r#"
             url = "https://example.com/webhook"
             policy = "required"
             events = []
         "#;
 
-        let config: EventWebhookConfig = toml::from_str(toml).unwrap();
-        let result = config.validate();
-        assert!(result.is_err());
+        let err = toml::from_str::<EventWebhookConfig>(toml).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("event webhook must have at least one event"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
-    fn validate_webhook_config_valid_passes() {
+    fn valid_webhook_config_deserializes() {
         let toml = r#"
             url = "https://example.com/webhook"
             policy = "optional"
@@ -225,22 +263,18 @@ mod tests {
             repository_filter = ["^myapp/.*"]
         "#;
 
-        let config: EventWebhookConfig = toml::from_str(toml).unwrap();
-        let result = config.validate();
-        assert!(result.is_ok());
+        assert!(toml::from_str::<EventWebhookConfig>(toml).is_ok());
     }
 
     #[test]
-    fn validate_webhook_config_valid_without_filter() {
+    fn valid_webhook_config_without_filter_deserializes() {
         let toml = r#"
             url = "https://example.com/webhook"
             policy = "async"
             events = ["tag.create", "tag.delete"]
         "#;
 
-        let config: EventWebhookConfig = toml::from_str(toml).unwrap();
-        let result = config.validate();
-        assert!(result.is_ok());
+        assert!(toml::from_str::<EventWebhookConfig>(toml).is_ok());
     }
 
     #[test]

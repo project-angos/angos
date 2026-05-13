@@ -8,8 +8,8 @@ use super::*;
 use crate::{
     configuration::GlobalConfig,
     metrics_provider,
-    oci::Digest,
-    policy::{AccessMode, AccessPolicyConfig, RetentionPolicyConfig},
+    oci::{Digest, Namespace},
+    policy::{AccessMode, AccessPolicyConfig, RetentionPolicy, RetentionPolicyConfig, SystemClock},
     registry::{
         blob_store::{self, BlobStore, PresignedBlobStore, UploadStore},
         data_store, metadata_store,
@@ -20,7 +20,6 @@ use crate::{
 
 pub fn create_test_repositories() -> Arc<HashMap<String, Repository>> {
     metrics_provider::init_for_tests();
-    let token_cache = cache::Config::default().to_backend().unwrap();
 
     let config = repository::Config {
         access_policy: AccessPolicyConfig {
@@ -34,7 +33,13 @@ pub fn create_test_repositories() -> Arc<HashMap<String, Repository>> {
     let mut repositories = HashMap::new();
     repositories.insert(
         "test-repo".to_string(),
-        Repository::new("test-repo", &config, &token_cache).unwrap(),
+        Repository {
+            name: "test-repo".to_string(),
+            upstreams: Vec::new(),
+            retention_policy: RetentionPolicy::new(&config.retention_policy, Arc::new(SystemClock)),
+            immutable_tags: config.immutable_tags,
+            immutable_tags_exclusions: config.immutable_tags_exclusions,
+        },
     );
 
     Arc::new(repositories)
@@ -49,7 +54,7 @@ pub fn create_test_registry(
     let repositories_config = create_test_repositories();
     let global = GlobalConfig::default();
 
-    let config = RegistryConfig::new()
+    let config = RegistryConfig::default()
         .update_pull_time(global.update_pull_time)
         .enable_blob_redirect(global.resolved_enable_blob_redirect())
         .enable_manifest_redirect(global.resolved_enable_manifest_redirect())
@@ -70,7 +75,7 @@ pub fn create_test_registry(
 
 pub async fn create_test_blob(
     registry: &Registry,
-    namespace: &str,
+    namespace: &Namespace,
     content: &[u8],
 ) -> (Digest, Repository) {
     let digest = registry.blob_store.create(content).await.unwrap();
@@ -87,33 +92,31 @@ pub async fn create_test_blob(
         .read_blob_index(&digest)
         .await
         .unwrap();
-    assert!(blob_index.namespace.contains_key(namespace));
-    let namespace_links = blob_index.namespace.get(namespace).unwrap();
+    assert!(blob_index.namespace.contains_key(namespace.as_ref()));
+    let namespace_links = blob_index.namespace.get(namespace.as_ref()).unwrap();
     assert!(namespace_links.contains(&layer_link));
 
-    let cache = cache::Config::Memory.to_backend().unwrap();
-    let repository = Repository::new(
-        "test-repo",
-        &repository::Config {
-            upstream: Vec::new(),
-            access_policy: AccessPolicyConfig::default(),
-            retention_policy: RetentionPolicyConfig { rules: Vec::new() },
-            immutable_tags: false,
-            immutable_tags_exclusions: Vec::new(),
-            ..repository::Config::default()
-        },
-        &cache,
-    )
-    .unwrap();
+    let repository = Repository {
+        name: "test-repo".to_string(),
+        upstreams: Vec::new(),
+        retention_policy: RetentionPolicy::new(
+            &RetentionPolicyConfig { rules: Vec::new() },
+            Arc::new(SystemClock),
+        ),
+        immutable_tags: false,
+        immutable_tags_exclusions: Vec::new(),
+    };
 
     (digest, repository)
 }
 
+#[async_trait::async_trait(?Send)]
 pub trait RegistryTestCase {
     fn registry(&self) -> &Registry;
     fn blob_store(&self) -> Arc<dyn BlobStore>;
     fn upload_store(&self) -> Arc<dyn UploadStore>;
     fn metadata_store(&self) -> Arc<dyn MetadataStore + Send + Sync>;
+    async fn cleanup(&self) {}
 }
 
 pub fn backends() -> Vec<Box<dyn RegistryTestCase>> {
@@ -182,6 +185,7 @@ impl FSRegistryTestCase {
     }
 }
 
+#[async_trait::async_trait(?Send)]
 impl RegistryTestCase for FSRegistryTestCase {
     fn registry(&self) -> &Registry {
         &self.registry
@@ -266,6 +270,20 @@ impl S3RegistryTestCase {
     }
 }
 
+impl S3RegistryTestCase {
+    pub async fn cleanup(&self) {
+        if let Err(e) = self
+            .s3_blob_store
+            .store
+            .delete_prefix(&self.key_prefix)
+            .await
+        {
+            println!("Warning: Failed to clean up S3RegistryTestCase data: {e:?}");
+        }
+    }
+}
+
+#[async_trait::async_trait(?Send)]
 impl RegistryTestCase for S3RegistryTestCase {
     fn registry(&self) -> &Registry {
         &self.s3_registry
@@ -282,19 +300,9 @@ impl RegistryTestCase for S3RegistryTestCase {
     fn metadata_store(&self) -> Arc<dyn MetadataStore + Send + Sync> {
         self.s3_metadata_store.clone()
     }
-}
 
-impl Drop for S3RegistryTestCase {
-    fn drop(&mut self) {
-        if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            let key_prefix = self.key_prefix.clone();
-            let blob_store = self.s3_blob_store.clone();
-            handle.spawn(async move {
-                if let Err(e) = blob_store.store.delete_prefix(&key_prefix).await {
-                    println!("Warning: Failed to clean up S3RegistryTestCase data: {e:?}");
-                }
-            });
-        }
+    async fn cleanup(&self) {
+        S3RegistryTestCase::cleanup(self).await;
     }
 }
 

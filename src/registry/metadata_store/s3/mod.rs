@@ -44,7 +44,7 @@ pub use probe::probe_conditional_capabilities;
 #[derive(Clone)]
 pub struct Backend {
     pub store: data_store::s3::Backend,
-    cache: Option<Arc<dyn Cache>>,
+    cache: Option<Arc<Cache>>,
     link_cache_ttl: u64,
     access_time_writer: Option<access_time::AccessTimeWriter>,
     coordinator: Arc<dyn WriteCoordinator>,
@@ -151,7 +151,7 @@ impl Backend {
         Ok(backend)
     }
 
-    pub fn with_cache(mut self, cache: Arc<dyn Cache>) -> Self {
+    pub fn with_cache(mut self, cache: Arc<Cache>) -> Self {
         self.cache = Some(cache);
         self
     }

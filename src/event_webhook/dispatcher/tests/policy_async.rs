@@ -5,8 +5,10 @@ use wiremock::{
     matchers::{header, method},
 };
 
-use super::common::{build_dispatcher, create_test_event, create_webhook_config_with_policy};
-use crate::event_webhook::{config::DeliveryPolicy, event::EventKind};
+use super::common::{
+    TEST_SHUTDOWN_TIMEOUT, build_dispatcher, create_test_event, create_test_webhook_config,
+};
+use crate::event_webhook::config::DeliveryPolicy;
 
 #[tokio::test]
 async fn dispatch_async_policy_returns_ok_immediately_despite_slow_webhook() {
@@ -26,11 +28,7 @@ async fn dispatch_async_policy_returns_ok_immediately_despite_slow_webhook() {
     let mut webhooks = HashMap::new();
     webhooks.insert(
         "async-hook".to_string(),
-        create_webhook_config_with_policy(
-            &server.uri(),
-            DeliveryPolicy::Async,
-            vec![EventKind::ManifestPush],
-        ),
+        create_test_webhook_config(&server.uri(), DeliveryPolicy::Async, None, 0),
     );
 
     let dispatcher = build_dispatcher(webhooks);
@@ -45,8 +43,9 @@ async fn dispatch_async_policy_returns_ok_immediately_despite_slow_webhook() {
         "Async dispatch must return immediately, took {elapsed:?}"
     );
 
-    // Wait for the background task to complete so wiremock can verify
-    tokio::time::sleep(Duration::from_secs(3)).await;
+    dispatcher
+        .shutdown_with_timeout(TEST_SHUTDOWN_TIMEOUT)
+        .await;
 }
 
 #[tokio::test]
@@ -64,19 +63,16 @@ async fn dispatch_async_policy_eventually_delivers() {
     let mut webhooks = HashMap::new();
     webhooks.insert(
         "async-hook".to_string(),
-        create_webhook_config_with_policy(
-            &server.uri(),
-            DeliveryPolicy::Async,
-            vec![EventKind::ManifestPush],
-        ),
+        create_test_webhook_config(&server.uri(), DeliveryPolicy::Async, None, 0),
     );
 
     let dispatcher = build_dispatcher(webhooks);
     let result = dispatcher.dispatch(&event).await;
     assert!(result.is_ok());
 
-    // Give the spawned task time to deliver
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    dispatcher
+        .shutdown_with_timeout(TEST_SHUTDOWN_TIMEOUT)
+        .await;
 
     let requests = server.received_requests().await.unwrap();
     assert_eq!(
