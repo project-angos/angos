@@ -44,8 +44,8 @@ impl PartialEq for Error {
             | (Error::RangeNotSatisfiable(a), Error::RangeNotSatisfiable(b))
             | (Error::NotFound(a), Error::NotFound(b))
             | (Error::Internal(a), Error::Internal(b)) => a == b,
-            (Error::HttpBuild(a), Error::HttpBuild(b)) => a.to_string() == b.to_string(),
-            (Error::Serialization(a), Error::Serialization(b)) => a.to_string() == b.to_string(),
+            (Error::HttpBuild(a), Error::HttpBuild(b)) => std::ptr::eq(a, b),
+            (Error::Serialization(a), Error::Serialization(b)) => std::ptr::eq(a, b),
             (
                 Error::Custom {
                     status_code: sc_a,
