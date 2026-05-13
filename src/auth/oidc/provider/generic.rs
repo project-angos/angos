@@ -1,4 +1,3 @@
-use async_trait::async_trait;
 use jsonwebtoken::Algorithm;
 use serde::{Deserialize, Serialize};
 
@@ -46,7 +45,6 @@ impl Provider {
     }
 }
 
-#[async_trait]
 impl OidcProvider for Provider {
     fn base(&self) -> &BaseConfig {
         &self.base

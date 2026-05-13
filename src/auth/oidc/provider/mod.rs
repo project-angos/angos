@@ -3,7 +3,6 @@ pub mod github;
 
 use std::collections::HashMap;
 
-use async_trait::async_trait;
 use jsonwebtoken::Algorithm;
 
 use crate::command::server::Error;
@@ -21,7 +20,6 @@ pub fn default_allowed_algorithms() -> Vec<Algorithm> {
     vec![Algorithm::RS256]
 }
 
-#[async_trait]
 pub trait OidcProvider: Send + Sync {
     fn base(&self) -> &BaseConfig;
 
