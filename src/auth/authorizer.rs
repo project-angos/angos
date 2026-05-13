@@ -1,4 +1,4 @@
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, fmt, sync::Arc};
 
 use hyper::http::request::Parts;
 use tracing::{debug, info, instrument};
@@ -31,6 +31,64 @@ struct AuthorizerRepository {
     authorization_webhook: Option<Arc<WebhookAuthorizer>>,
     immutable_tags: bool,
     immutable_tags_exclusions: Vec<RegexPattern>,
+}
+
+struct AuditIdentity<'a> {
+    auth_type: &'static str,
+    id: Option<&'a str>,
+    username: Option<&'a str>,
+    client_ip: Option<&'a str>,
+    certificate_organizations: &'a [String],
+    certificate_common_names: &'a [String],
+    oidc_provider_name: Option<&'a str>,
+    oidc_provider_type: Option<&'a str>,
+}
+
+impl fmt::Debug for AuditIdentity<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AuditIdentity")
+            .field("auth_type", &self.auth_type)
+            .field("id", &self.id)
+            .field("username", &self.username)
+            .field("client_ip", &self.client_ip)
+            .field("certificate_organizations", &self.certificate_organizations)
+            .field("certificate_common_names", &self.certificate_common_names)
+            .field("oidc_provider_name", &self.oidc_provider_name)
+            .field("oidc_provider_type", &self.oidc_provider_type)
+            .finish()
+    }
+}
+
+impl<'a> From<&'a ClientIdentity> for AuditIdentity<'a> {
+    fn from(identity: &'a ClientIdentity) -> Self {
+        let has_basic = identity.id.is_some() || identity.username.is_some();
+        let has_certificate = !identity.certificate.organizations.is_empty()
+            || !identity.certificate.common_names.is_empty();
+        let has_oidc = identity.oidc.is_some();
+
+        Self {
+            auth_type: match (has_basic, has_certificate, has_oidc) {
+                (false, false, false) => "anonymous",
+                (true, false, false) => "basic",
+                (false, true, false) => "mtls",
+                (false, false, true) => "oidc",
+                _ => "multiple",
+            },
+            id: identity.id.as_deref(),
+            username: identity.username.as_deref(),
+            client_ip: identity.client_ip.as_deref(),
+            certificate_organizations: &identity.certificate.organizations,
+            certificate_common_names: &identity.certificate.common_names,
+            oidc_provider_name: identity
+                .oidc
+                .as_ref()
+                .map(|oidc| oidc.provider_name.as_str()),
+            oidc_provider_type: identity
+                .oidc
+                .as_ref()
+                .map(|oidc| oidc.provider_type.as_str()),
+        }
+    }
 }
 
 impl Authorizer {
@@ -236,7 +294,10 @@ fn build_repositories(
 }
 
 fn log_denial(reason: &str, identity: &ClientIdentity) {
-    info!("Access denied: {reason} | Identity: {identity:?}");
+    info!(
+        "Access denied: {reason} | Identity: {:?}",
+        AuditIdentity::from(identity)
+    );
 }
 
 fn lookup_webhook(
@@ -252,14 +313,54 @@ fn lookup_webhook(
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        io::{self, Write},
+        sync::{Arc, Mutex},
+    };
+
+    use serde_json::json;
+    use tracing::Level;
+    use tracing_subscriber::fmt::MakeWriter;
     use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};
 
     use super::*;
     use crate::{
         cache,
         configuration::Configuration,
+        identity::{ClientCertificate, OidcClaims},
         test_fixtures::configuration::{config_toml, minimal_config},
     };
+
+    #[derive(Clone, Default)]
+    struct LogCapture(Arc<Mutex<Vec<u8>>>);
+
+    struct LogWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl LogCapture {
+        fn contents(&self) -> String {
+            let bytes = self.0.lock().unwrap().clone();
+            String::from_utf8(bytes).unwrap()
+        }
+    }
+
+    impl Write for LogWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> MakeWriter<'a> for LogCapture {
+        type Writer = LogWriter;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            LogWriter(Arc::clone(&self.0))
+        }
+    }
 
     fn create_minimal_config() -> Configuration {
         minimal_config()
@@ -570,9 +671,50 @@ mod tests {
     }
 
     #[test]
-    fn test_log_denial() {
-        let identity = ClientIdentity::new(None);
-        log_denial("test reason", &identity);
+    fn log_denial_uses_audit_identity_without_oidc_claims() {
+        let log_capture = LogCapture::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(Level::INFO)
+            .with_writer(log_capture.clone())
+            .with_ansi(false)
+            .finish();
+        let identity = ClientIdentity {
+            id: Some("client-123".to_string()),
+            username: Some("ci-bot".to_string()),
+            certificate: ClientCertificate {
+                organizations: vec!["BuildOrg".to_string()],
+                common_names: vec!["build-cert".to_string()],
+            },
+            oidc: Some(OidcClaims {
+                provider_name: "github-actions".to_string(),
+                provider_type: "GitHub Actions".to_string(),
+                claims: HashMap::from([
+                    ("sub".to_string(), json!("repo:private/repo:ref:main")),
+                    ("email".to_string(), json!("person@example.com")),
+                    ("custom_claim".to_string(), json!("internal-secret")),
+                ]),
+            }),
+            client_ip: Some("192.0.2.10".to_string()),
+        };
+
+        tracing::subscriber::with_default(subscriber, || log_denial("test reason", &identity));
+
+        let logs = log_capture.contents();
+        assert!(logs.contains("test reason"), "logs were: {logs}");
+        assert!(logs.contains("multiple"), "logs were: {logs}");
+        assert!(logs.contains("client-123"), "logs were: {logs}");
+        assert!(logs.contains("ci-bot"), "logs were: {logs}");
+        assert!(logs.contains("192.0.2.10"), "logs were: {logs}");
+        assert!(logs.contains("BuildOrg"), "logs were: {logs}");
+        assert!(logs.contains("build-cert"), "logs were: {logs}");
+        assert!(logs.contains("github-actions"), "logs were: {logs}");
+        assert!(logs.contains("GitHub Actions"), "logs were: {logs}");
+        assert!(!logs.contains("person@example.com"), "logs were: {logs}");
+        assert!(!logs.contains("repo:private/repo"), "logs were: {logs}");
+        assert!(!logs.contains("internal-secret"), "logs were: {logs}");
+        assert!(!logs.contains("custom_claim"), "logs were: {logs}");
+        assert!(!logs.contains("email"), "logs were: {logs}");
+        assert!(!logs.contains("sub"), "logs were: {logs}");
     }
 
     fn create_pull_through_config() -> Configuration {
