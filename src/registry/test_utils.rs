@@ -54,7 +54,7 @@ pub fn create_test_registry(
     let repositories_config = create_test_repositories();
     let global = GlobalConfig::default();
 
-    let config = RegistryConfig::new()
+    let config = RegistryConfig::default()
         .update_pull_time(global.update_pull_time)
         .enable_blob_redirect(global.resolved_enable_blob_redirect())
         .enable_manifest_redirect(global.resolved_enable_manifest_redirect())

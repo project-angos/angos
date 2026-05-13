@@ -49,7 +49,7 @@ pub async fn build_registry(
     let metadata_store = build_metadata_store(config, &auth_cache, cached_capabilities).await?;
     let repositories = bootstrap::repositories(&config.repository, &auth_cache).await?;
 
-    let registry_config = RegistryConfig::new()
+    let registry_config = RegistryConfig::default()
         .update_pull_time(config.global.update_pull_time)
         .enable_blob_redirect(config.global.resolved_enable_blob_redirect())
         .enable_manifest_redirect(config.global.resolved_enable_manifest_redirect())

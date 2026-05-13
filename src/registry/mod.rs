@@ -78,10 +78,6 @@ impl Default for RegistryConfig {
 }
 
 impl RegistryConfig {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
     pub fn update_pull_time(mut self, enabled: bool) -> Self {
         self.update_pull_time = enabled;
         self

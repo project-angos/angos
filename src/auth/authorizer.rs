@@ -782,7 +782,7 @@ mod tests {
         }
         let repositories = Arc::new(repositories_map);
 
-        let registry_config = RegistryConfig::new()
+        let registry_config = RegistryConfig::default()
             .update_pull_time(config.global.update_pull_time)
             .enable_blob_redirect(config.global.resolved_enable_blob_redirect())
             .enable_manifest_redirect(config.global.resolved_enable_manifest_redirect())

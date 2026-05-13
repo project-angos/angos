@@ -141,7 +141,7 @@ pub async fn create_test_registry(config: &Configuration) -> Registry {
     }
     let repositories = Arc::new(repositories_map);
 
-    let registry_config = RegistryConfig::new()
+    let registry_config = RegistryConfig::default()
         .update_pull_time(config.global.update_pull_time)
         .enable_blob_redirect(config.global.resolved_enable_blob_redirect())
         .enable_manifest_redirect(config.global.resolved_enable_manifest_redirect())
@@ -908,7 +908,7 @@ async fn test_shutdown_flushes_pending_access_times() {
         });
     let blob_handles = blob_store_config.to_backend(None).unwrap();
 
-    let registry_config = RegistryConfig::new()
+    let registry_config = RegistryConfig::default()
         .update_pull_time(false)
         .enable_blob_redirect(false)
         .enable_manifest_redirect(false)
