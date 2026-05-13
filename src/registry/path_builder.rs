@@ -1,6 +1,4 @@
-use sha2::{Digest as Sha2Digest, Sha256};
-
-use crate::{oci::Digest, registry::metadata_store::link_kind::LinkKind};
+use crate::{oci::Digest, registry::metadata_store::link_kind::LinkKind, util::sha256};
 
 const BLOBS_ROOT: &str = "v2/blobs";
 const REPOS_ROOT: &str = "v2/repositories";
@@ -31,8 +29,7 @@ pub fn namespace_registry_shard_path(namespace: &str) -> String {
 // guaranteed to be stable across Rust versions. Changing the hash algorithm after
 // deployment would remap existing data to different shard paths, corrupting storage.
 pub fn shard_key(value: &str) -> String {
-    let hash = Sha256::digest(value.as_bytes());
-    format!("{:02x}", hash[0])
+    sha256::shard_key(value)
 }
 
 pub fn namespace_shard_key(namespace: &str) -> String {

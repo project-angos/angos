@@ -230,23 +230,17 @@ impl Registry {
 mod tests {
     use std::io::Cursor;
 
-    use sha2::{Digest as ShaDigestTrait, Sha256};
     use uuid::Uuid;
 
     use super::*;
     use crate::{
-        oci::{Digest, Namespace},
+        oci::Namespace,
         registry::{
             path_builder,
             test_utils::{FSRegistryTestCase, backends},
         },
+        util::sha256,
     };
-
-    fn sha256_digest(content: &[u8]) -> Digest {
-        let mut hasher = Sha256::new();
-        hasher.update(content);
-        Digest::Sha256(hex::encode(hasher.finalize().as_slice()).into())
-    }
 
     #[tokio::test]
     async fn test_start_upload() {
@@ -358,7 +352,7 @@ mod tests {
                 .await
                 .unwrap();
 
-            let expected_digest = sha256_digest(content);
+            let expected_digest = sha256::digest(content);
 
             let empty_stream = Cursor::new(Vec::new());
             let response = registry
@@ -550,7 +544,7 @@ mod tests {
                 .unwrap();
 
             assert_eq!(size, content.len() as u64);
-            assert_eq!(digest, sha256_digest(content));
+            assert_eq!(digest, sha256::digest(content));
 
             let summary = registry
                 .upload_store
@@ -649,7 +643,7 @@ mod tests {
                 None,
                 namespace,
                 session_id,
-                &sha256_digest(content),
+                &sha256::digest(content),
                 0,
                 empty_stream,
             )

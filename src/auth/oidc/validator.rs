@@ -8,8 +8,9 @@ use tracing::{debug, info, warn};
 use crate::{
     auth::oidc::{Jwk, OidcProvider},
     cache::Cache,
-    command::server::{Error, sha256_hash},
+    command::server::Error,
     identity::OidcClaims,
+    util::sha256,
 };
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -156,7 +157,7 @@ async fn fetch_jwks(
     cache: &Cache,
 ) -> Result<Jwks, Error> {
     let provider_name = provider.name();
-    let issuer_hash = sha256_hash(provider.issuer());
+    let issuer_hash = sha256::hex(provider.issuer());
     let cache_key = format!("oidc:{provider_name}:jwks:{issuer_hash}");
 
     match cache.retrieve::<Jwks>(&cache_key).await {
@@ -189,7 +190,7 @@ async fn fetch_oidc_configuration(
     cache: &Cache,
 ) -> Result<OpenIdConfiguration, Error> {
     let provider_name = provider.name();
-    let issuer_hash = sha256_hash(provider.issuer());
+    let issuer_hash = sha256::hex(provider.issuer());
     let cache_key = format!("oidc:{provider_name}:config:{issuer_hash}");
 
     match cache.retrieve::<OpenIdConfiguration>(&cache_key).await {
