@@ -38,19 +38,7 @@ impl TryFrom<ConfigFields> for Config {
     type Error = String;
 
     fn try_from(fields: ConfigFields) -> Result<Self, Self::Error> {
-        if fields.client_certificate_bundle.is_some() != fields.client_private_key.is_some() {
-            return Err(
-                "both client_certificate_bundle and client_private_key are required for mTLS"
-                    .to_string(),
-            );
-        }
-
-        for header in &fields.forward_headers {
-            build_header_name(header)
-                .map_err(|e| format!("invalid forward_headers entry '{header}': {e}"))?;
-        }
-
-        Ok(Self {
+        let config = Self {
             url: fields.url,
             timeout_ms: fields.timeout_ms,
             auth: fields.auth,
@@ -59,7 +47,9 @@ impl TryFrom<ConfigFields> for Config {
             server_ca_bundle: fields.server_ca_bundle,
             forward_headers: fields.forward_headers,
             cache_ttl: fields.cache_ttl,
-        })
+        };
+        config.validate()?;
+        Ok(config)
     }
 }
 
@@ -89,5 +79,21 @@ impl WebhookAuth {
 impl Config {
     fn default_cache_ttl() -> u64 {
         60
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        if self.client_certificate_bundle.is_some() != self.client_private_key.is_some() {
+            return Err(
+                "both client_certificate_bundle and client_private_key are required for mTLS"
+                    .to_string(),
+            );
+        }
+
+        for header in &self.forward_headers {
+            build_header_name(header)
+                .map_err(|e| format!("invalid forward_headers entry '{header}': {e}"))?;
+        }
+
+        Ok(())
     }
 }

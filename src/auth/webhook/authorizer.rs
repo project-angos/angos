@@ -30,6 +30,8 @@ impl WebhookAuthorizer {
     }
 
     pub fn new(name: String, config: Config, cache: Arc<Cache>) -> Result<Self, Error> {
+        config.validate().map_err(Error::Initialization)?;
+
         let client = HttpClientBuilder::new()
             .rustls_tls()
             .redirect(reqwest::redirect::Policy::none())

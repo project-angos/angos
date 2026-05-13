@@ -484,6 +484,25 @@ fn test_new_invalid_mtls() {
 }
 
 #[test]
+fn test_new_rejects_incomplete_mtls_config() {
+    let config = build_test_config(
+        Url::parse("https://example.com").unwrap(),
+        None,
+        Some(PathBuf::from("certificate.pem")),
+        None,
+    );
+    let webhook = WebhookAuthorizer::new(
+        "test".to_string(),
+        config,
+        cache::Config::Memory.to_backend().unwrap(),
+    );
+
+    assert!(
+        matches!(webhook, Err(Error::Initialization(msg)) if msg.contains("client_private_key"))
+    );
+}
+
+#[test]
 fn test_new_mtls() {
     let tmp_dir = tempfile::tempdir().unwrap();
     let cert_file_path = tmp_dir.path().join("certificate.pem");
