@@ -76,11 +76,11 @@ impl OidcProvider for Provider {
     ) -> Result<(), Error> {
         if !claims.contains_key("repository") {
             let msg = "Missing repository claim in GitHub token".to_string();
-            return Err(Error::Execution(msg));
+            return Err(Error::Unauthorized(msg));
         }
         if !claims.contains_key("actor") {
             let msg = "Missing actor claim in GitHub token".to_string();
-            return Err(Error::Execution(msg));
+            return Err(Error::Unauthorized(msg));
         }
         Ok(())
     }
@@ -88,6 +88,8 @@ impl OidcProvider for Provider {
 
 #[cfg(test)]
 mod tests {
+    use hyper::StatusCode;
+
     use super::*;
     use crate::command::server::Error;
 
@@ -284,11 +286,13 @@ mod tests {
 
         let result = provider.validate_provider_claims(&claims);
         assert!(result.is_err());
-        match result.unwrap_err() {
-            Error::Execution(msg) => {
+        let err = result.unwrap_err();
+        assert_eq!(err.status_code(), StatusCode::UNAUTHORIZED);
+        match err {
+            Error::Unauthorized(msg) => {
                 assert!(msg.contains("repository"));
             }
-            _ => panic!("Expected Execution error"),
+            err => panic!("Expected Unauthorized error, got {err:?}"),
         }
     }
 
@@ -310,11 +314,13 @@ mod tests {
 
         let result = provider.validate_provider_claims(&claims);
         assert!(result.is_err());
-        match result.unwrap_err() {
-            Error::Execution(msg) => {
+        let err = result.unwrap_err();
+        assert_eq!(err.status_code(), StatusCode::UNAUTHORIZED);
+        match err {
+            Error::Unauthorized(msg) => {
                 assert!(msg.contains("actor"));
             }
-            _ => panic!("Expected Execution error"),
+            err => panic!("Expected Unauthorized error, got {err:?}"),
         }
     }
 
@@ -331,7 +337,9 @@ mod tests {
 
         let provider = Provider::new(config);
         let claims = HashMap::new();
-        assert!(provider.validate_provider_claims(&claims).is_err());
+        let result = provider.validate_provider_claims(&claims);
+        assert!(matches!(&result, Err(Error::Unauthorized(_))));
+        assert_eq!(result.unwrap_err().status_code(), StatusCode::UNAUTHORIZED);
     }
 
     #[test]
