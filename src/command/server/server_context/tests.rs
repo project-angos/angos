@@ -11,7 +11,10 @@ use uuid::Uuid;
 use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};
 
 use crate::{
-    command::server::server_context::{ServerContext, resolve_client_ip},
+    command::server::{
+        error::Error,
+        server_context::{ServerContext, resolve_client_ip},
+    },
     configuration::Configuration,
     event_webhook::{
         config::EventWebhookConfig,
@@ -711,7 +714,7 @@ async fn test_dispatch_event_required_webhook_failure_returns_error() {
     };
 
     let result = context.dispatch_event(&event).await;
-    assert!(result.is_err());
+    assert!(matches!(result, Err(Error::Execution(_))));
 }
 
 #[tokio::test]

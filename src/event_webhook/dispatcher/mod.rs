@@ -18,8 +18,8 @@ use tracing::warn;
 mod tests;
 
 use crate::{
-    configuration::Error,
     event_webhook::{
+        Error,
         config::{DeliveryPolicy, EventWebhookConfig},
         event::{Event, EventKind},
     },
@@ -132,7 +132,7 @@ async fn send_and_record(
 
 fn serialize_event(event: &Event) -> Result<(Vec<u8>, &'static str), Error> {
     let body = serde_json::to_vec(event)
-        .map_err(|e| Error::Initialization(format!("Failed to serialize event: {e}")))?;
+        .map_err(|e| Error::Dispatch(format!("Failed to serialize event: {e}")))?;
     Ok((body, event.kind.as_str()))
 }
 
@@ -295,7 +295,7 @@ impl EventDispatcher {
         let req = endpoint.build_request(body, event_kind_header);
         send_and_record(&req, endpoint.config.max_retries, name)
             .await
-            .map_err(|e| Error::Initialization(format!("Webhook '{name}' failed: {e}")))
+            .map_err(|e| Error::Dispatch(format!("Webhook '{name}' failed: {e}")))
     }
 
     async fn send_optional(

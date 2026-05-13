@@ -36,10 +36,8 @@ impl ServerContext {
         let event_dispatcher = if config.event_webhook.is_empty() {
             None
         } else {
-            Some(Arc::new(
-                EventDispatcher::new(config.event_webhook.clone())
-                    .map_err(|e| Error::Initialization(e.to_string()))?,
-            ))
+            let dispatcher = EventDispatcher::new(config.event_webhook.clone())?;
+            Some(Arc::new(dispatcher))
         };
 
         Ok(Self {

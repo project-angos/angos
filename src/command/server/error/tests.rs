@@ -1,7 +1,7 @@
 use hyper::StatusCode;
 
 use super::*;
-use crate::registry;
+use crate::{event_webhook, registry};
 
 #[test]
 fn test_error_display() {
@@ -341,6 +341,19 @@ fn test_from_configuration_error_initialization() {
 
     assert!(matches!(error, Error::Internal(_)));
     assert_eq!(error.to_string(), "Internal Server Error: webhook failed");
+}
+
+#[test]
+fn test_from_event_webhook_error_mapping() {
+    let init_error = event_webhook::Error::Initialization("bad webhook config".to_string());
+    let error: Error = init_error.into();
+    assert!(matches!(error, Error::Initialization(_)));
+    assert_eq!(error.to_string(), "bad webhook config");
+
+    let dispatch_error = event_webhook::Error::Dispatch("webhook failed".to_string());
+    let error: Error = dispatch_error.into();
+    assert!(matches!(error, Error::Execution(_)));
+    assert_eq!(error.to_string(), "webhook failed");
 }
 
 #[test]

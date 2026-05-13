@@ -6,7 +6,7 @@ use super::common::{
     build_dispatcher, create_test_event, create_webhook_config_with_policy,
     create_webhook_config_with_retries,
 };
-use crate::event_webhook::{config::DeliveryPolicy, event::EventKind};
+use crate::event_webhook::{Error, config::DeliveryPolicy, event::EventKind};
 
 #[tokio::test]
 async fn dispatch_required_policy_returns_error_on_server_error() {
@@ -31,7 +31,10 @@ async fn dispatch_required_policy_returns_error_on_server_error() {
 
     let dispatcher = build_dispatcher(webhooks);
     let result = dispatcher.dispatch(&event).await;
-    assert!(result.is_err(), "Required policy must return error on 500");
+    assert!(
+        matches!(result, Err(Error::Dispatch(_))),
+        "Required policy must return dispatch error on 500"
+    );
 }
 
 #[tokio::test]
@@ -118,8 +121,8 @@ async fn dispatch_required_retries_exhausted_returns_error() {
     let dispatcher = build_dispatcher(webhooks);
     let result = dispatcher.dispatch(&event).await;
     assert!(
-        result.is_err(),
-        "Required policy must error when all retries exhausted"
+        matches!(result, Err(Error::Dispatch(_))),
+        "Required policy must return dispatch error when all retries exhausted"
     );
 }
 
@@ -142,7 +145,7 @@ async fn dispatch_no_retry_when_max_retries_zero() {
 
     let dispatcher = build_dispatcher(webhooks);
     let result = dispatcher.dispatch(&event).await;
-    assert!(result.is_err());
+    assert!(matches!(result, Err(Error::Dispatch(_))));
 
     let requests = server.received_requests().await.unwrap();
     assert_eq!(
