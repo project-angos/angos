@@ -31,6 +31,11 @@ struct FetchedJwks {
     from_cache: bool,
 }
 
+struct CachedJson<T> {
+    value: T,
+    from_cache: bool,
+}
+
 const JWKS_REFRESH_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub async fn validate_oidc_token(
@@ -51,7 +56,9 @@ pub async fn validate_oidc_token(
             provider.name(),
             header.kid
         );
-        fetched_jwks.jwks = fetch_fresh_jwks_with_timeout(provider, client, cache).await?;
+        fetched_jwks =
+            fetch_jwks_with_cache(provider, client, cache, false, Some(JWKS_REFRESH_TIMEOUT))
+                .await?;
     }
 
     verify_jwt_with_header(token, &header, &fetched_jwks.jwks, provider_name, provider)
@@ -148,41 +155,51 @@ fn cached_jwks_misses_kid(jwks: &Jwks, header: &Header) -> bool {
     !jwks.keys.iter().any(|key| key.kid() == Some(kid))
 }
 
-async fn query_json<T>(client: &Client, url: &str) -> Result<T, Error>
+async fn query_json<T>(
+    client: &Client,
+    url: &str,
+    fetch_timeout: Option<Duration>,
+) -> Result<T, Error>
 where
     T: DeserializeOwned,
 {
-    let response = client
-        .get(url)
-        .header(ACCEPT, "application/json")
-        .send()
-        .await;
+    let fetch = async {
+        let response = client
+            .get(url)
+            .header(ACCEPT, "application/json")
+            .send()
+            .await
+            .map_err(|e| Error::ProviderUnavailable(format!("Failed to fetch URL {url}: {e}")))?;
 
-    let response = response
-        .map_err(|e| Error::ProviderUnavailable(format!("Failed to fetch URL {url}: {e}")))?;
+        if !response.status().is_success() {
+            let msg = format!("Failed to fetch URL {url}: HTTP {}", response.status());
+            return Err(Error::ProviderUnavailable(msg));
+        }
 
-    if !response.status().is_success() {
-        let msg = format!("Failed to fetch URL {url}: HTTP {}", response.status());
-        return Err(Error::ProviderUnavailable(msg));
+        response.json().await.map_err(|e| {
+            Error::ProviderUnavailable(format!("Failed to parse JSON from {url}: {e}"))
+        })
+    };
+
+    match fetch_timeout {
+        Some(duration) => timeout(duration, fetch)
+            .await
+            .map_err(|_| Error::ProviderUnavailable(format!("Timed out fetching URL {url}")))?,
+        None => fetch.await,
     }
-
-    let data: T = response
-        .json()
-        .await
-        .map_err(|e| Error::ProviderUnavailable(format!("Failed to parse JSON from {url}: {e}")))?;
-
-    Ok(data)
 }
 
 async fn get_jwks_url(
     provider: &dyn OidcProvider,
     client: &Client,
     cache: &Cache,
+    fetch_timeout: Option<Duration>,
 ) -> Result<String, Error> {
     if let Some(uri) = provider.jwks_uri() {
         return Ok(uri.to_string());
     }
-    let oidc_config = fetch_oidc_configuration(provider, client, cache).await?;
+    let oidc_config =
+        fetch_oidc_configuration_with_timeout(provider, client, cache, fetch_timeout).await?;
 
     Ok(oidc_config.jwks_uri)
 }
@@ -193,72 +210,92 @@ fn jwks_cache_key(provider: &dyn OidcProvider) -> String {
     format!("oidc:{provider_name}:jwks:{issuer_hash}")
 }
 
+fn oidc_configuration_cache_key(provider: &dyn OidcProvider) -> String {
+    let provider_name = provider.name();
+    let issuer_hash = sha256::hex(provider.issuer());
+    format!("oidc:{provider_name}:config:{issuer_hash}")
+}
+
+async fn fetch_cached_json<T, F>(
+    client: &Client,
+    cache: &Cache,
+    cache_key: &str,
+    url: &str,
+    ttl: u64,
+    read_cache: bool,
+    fetch_timeout: Option<Duration>,
+    validate_fresh: F,
+) -> Result<CachedJson<T>, Error>
+where
+    T: DeserializeOwned + Serialize,
+    F: FnOnce(&T) -> Result<(), Error>,
+{
+    if read_cache {
+        match cache.retrieve::<T>(cache_key).await {
+            Ok(Some(value)) => {
+                debug!("Using cached OIDC JSON for {cache_key}");
+                return Ok(CachedJson {
+                    value,
+                    from_cache: true,
+                });
+            }
+            Err(err) => {
+                warn!("OIDC cache retrieve failed for {cache_key}: {err}");
+            }
+            Ok(None) => {}
+        }
+    }
+
+    let value = query_json::<T>(client, url, fetch_timeout).await?;
+    validate_fresh(&value)?;
+
+    if let Err(err) = cache.store(cache_key, &value, ttl).await {
+        warn!("OIDC cache store failed for {cache_key}: {err}");
+    }
+
+    Ok(CachedJson {
+        value,
+        from_cache: false,
+    })
+}
+
 async fn fetch_jwks(
     provider: &dyn OidcProvider,
     client: &Client,
     cache: &Cache,
 ) -> Result<FetchedJwks, Error> {
-    let provider_name = provider.name();
-    let cache_key = jwks_cache_key(provider);
-
-    match cache.retrieve::<Jwks>(&cache_key).await {
-        Ok(Some(cached)) => {
-            debug!("Using cached JWKS for provider: {provider_name}");
-            return Ok(FetchedJwks {
-                jwks: cached,
-                from_cache: true,
-            });
-        }
-        Err(err) => {
-            warn!("OIDC JWKS cache retrieve failed for {provider_name}: {err}");
-        }
-        Ok(None) => {}
-    }
-
-    fetch_fresh_jwks(provider, client, cache)
-        .await
-        .map(|jwks| FetchedJwks {
-            jwks,
-            from_cache: false,
-        })
+    fetch_jwks_with_cache(provider, client, cache, true, None).await
 }
 
-async fn fetch_fresh_jwks_with_timeout(
+async fn fetch_jwks_with_cache(
     provider: &dyn OidcProvider,
     client: &Client,
     cache: &Cache,
-) -> Result<Jwks, Error> {
-    timeout(
-        JWKS_REFRESH_TIMEOUT,
-        fetch_fresh_jwks(provider, client, cache),
+    read_cache: bool,
+    fetch_timeout: Option<Duration>,
+) -> Result<FetchedJwks, Error> {
+    let cache_key = jwks_cache_key(provider);
+    let jwks_url = get_jwks_url(provider, client, cache, fetch_timeout).await?;
+    let fetched = fetch_cached_json::<Jwks, _>(
+        client,
+        cache,
+        &cache_key,
+        &jwks_url,
+        provider.jwks_refresh_interval(),
+        read_cache,
+        fetch_timeout,
+        |_| Ok(()),
     )
-    .await
-    .map_err(|_| {
-        Error::Unauthorized(format!(
-            "Timed out refreshing JWKS for provider {}",
-            provider.name()
-        ))
-    })?
-}
+    .await?;
 
-async fn fetch_fresh_jwks(
-    provider: &dyn OidcProvider,
-    client: &Client,
-    cache: &Cache,
-) -> Result<Jwks, Error> {
-    let provider_name = provider.name();
-    let cache_key = jwks_cache_key(provider);
-    let jwks_url = get_jwks_url(provider, client, cache).await?;
-    let jwks = query_json::<Jwks>(client, &jwks_url).await?;
-
-    if let Err(err) = cache
-        .store(&cache_key, &jwks, provider.jwks_refresh_interval())
-        .await
-    {
-        warn!("OIDC JWKS cache store failed for {provider_name}: {err}");
+    if !fetched.from_cache {
+        info!("Fetched JWKS from {jwks_url}");
     }
-    info!("Fetched JWKS from {jwks_url}");
-    Ok(jwks)
+
+    Ok(FetchedJwks {
+        jwks: fetched.value,
+        from_cache: fetched.from_cache,
+    })
 }
 
 async fn fetch_oidc_configuration(
@@ -266,24 +303,39 @@ async fn fetch_oidc_configuration(
     client: &Client,
     cache: &Cache,
 ) -> Result<OpenIdConfiguration, Error> {
-    let provider_name = provider.name();
-    let issuer_hash = sha256::hex(provider.issuer());
-    let cache_key = format!("oidc:{provider_name}:config:{issuer_hash}");
+    fetch_oidc_configuration_with_timeout(provider, client, cache, None).await
+}
 
-    match cache.retrieve::<OpenIdConfiguration>(&cache_key).await {
-        Ok(Some(cached)) => {
-            debug!("Using cached OIDC configuration");
-            return Ok(cached);
-        }
-        Err(err) => {
-            warn!("OIDC configuration cache retrieve failed for {provider_name}: {err}");
-        }
-        Ok(None) => {}
-    }
-
+async fn fetch_oidc_configuration_with_timeout(
+    provider: &dyn OidcProvider,
+    client: &Client,
+    cache: &Cache,
+    fetch_timeout: Option<Duration>,
+) -> Result<OpenIdConfiguration, Error> {
+    let cache_key = oidc_configuration_cache_key(provider);
     let config_url = format!("{}/.well-known/openid-configuration", provider.issuer());
-    let config = query_json::<OpenIdConfiguration>(client, &config_url).await?;
+    let fetched = fetch_cached_json::<OpenIdConfiguration, _>(
+        client,
+        cache,
+        &cache_key,
+        &config_url,
+        provider.jwks_refresh_interval(),
+        true,
+        fetch_timeout,
+        |config| validate_oidc_configuration(provider, config),
+    )
+    .await?;
 
+    if !fetched.from_cache {
+        info!("Fetched OIDC configuration from {config_url}");
+    }
+    Ok(fetched.value)
+}
+
+fn validate_oidc_configuration(
+    provider: &dyn OidcProvider,
+    config: &OpenIdConfiguration,
+) -> Result<(), Error> {
     if config.issuer != provider.issuer() {
         return Err(Error::Unauthorized(format!(
             "OIDC configuration issuer mismatch: expected {}, got {}",
@@ -292,14 +344,7 @@ async fn fetch_oidc_configuration(
         )));
     }
 
-    if let Err(err) = cache
-        .store(&cache_key, &config, provider.jwks_refresh_interval())
-        .await
-    {
-        warn!("OIDC configuration cache store failed for {provider_name}: {err}");
-    }
-    info!("Fetched OIDC configuration from {config_url}");
-    Ok(config)
+    Ok(())
 }
 
 #[cfg(test)]
@@ -322,8 +367,9 @@ pub mod tests {
                 generic::{Provider, ProviderConfig},
             },
             validator::{
-                Jwks, fetch_jwks, fetch_oidc_configuration, jwks_cache_key, validate_oidc_token,
-                verify_allowed_algorithm, verify_jwt_with_header,
+                Jwks, OpenIdConfiguration, fetch_jwks, fetch_oidc_configuration, jwks_cache_key,
+                oidc_configuration_cache_key, validate_oidc_token, verify_allowed_algorithm,
+                verify_jwt_with_header,
             },
         },
         cache,
@@ -650,6 +696,12 @@ pub mod tests {
             }
             _ => panic!("Expected Unauthorized error"),
         }
+
+        let cached = cache
+            .retrieve::<OpenIdConfiguration>(&oidc_configuration_cache_key(&provider))
+            .await
+            .unwrap();
+        assert!(cached.is_none());
     }
 
     #[tokio::test]
