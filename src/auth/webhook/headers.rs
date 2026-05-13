@@ -8,6 +8,7 @@ use hyper::{
 use crate::{
     command::server::Error,
     identity::{Action, ClientIdentity},
+    util::sha256,
 };
 
 static X_FORWARDED_METHOD: &str = "X-Forwarded-Method";
@@ -213,24 +214,23 @@ pub fn build_cache_key(
     action: &Action,
     identity: &ClientIdentity,
 ) -> Result<String, Error> {
-    let Ok(action_json) = serde_json::to_string(action) else {
-        let msg = "Failed to serialize action".to_string();
+    let Ok(key_material) = serde_json::to_vec(&(identity, action)) else {
+        let msg = "Failed to serialize webhook cache key".to_string();
         return Err(Error::Execution(msg));
     };
 
-    let Ok(identity_json) = serde_json::to_string(&identity) else {
-        let msg = "Failed to serialize identity".to_string();
-        return Err(Error::Execution(msg));
-    };
-
-    Ok(format!("webhook:{name}:{identity_json}:{action_json}"))
+    Ok(format!("webhook:{name}:{}", sha256::hex(key_material)))
 }
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
+    use serde_json::json;
+
     use super::build_cache_key;
     use crate::{
-        identity::{Action, ClientIdentity},
+        identity::{Action, ClientIdentity, OidcClaims},
         oci::{Namespace, Reference},
     };
 
@@ -305,6 +305,44 @@ mod tests {
             key.starts_with("webhook:my-hook:"),
             "key must be prefixed with 'webhook:<name>:': {key}"
         );
+    }
+
+    #[test]
+    fn key_uses_bounded_sha256_digest() {
+        let action = Action::ApiVersion;
+        let identity = anonymous();
+
+        let key = build_cache_key("my-hook", &action, &identity).unwrap();
+        let digest = key.strip_prefix("webhook:my-hook:").unwrap();
+
+        assert_eq!(digest.len(), 64);
+        assert!(digest.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn key_does_not_expose_oidc_claims() {
+        let action = Action::ApiVersion;
+        let identity = ClientIdentity {
+            oidc: Some(OidcClaims {
+                provider_name: "github-actions".to_string(),
+                provider_type: "GitHub Actions".to_string(),
+                claims: HashMap::from([
+                    ("sub".to_string(), json!("repo:private/repo:ref:main")),
+                    ("email".to_string(), json!("person@example.com")),
+                    ("custom_claim".to_string(), json!("internal-secret")),
+                ]),
+            }),
+            ..ClientIdentity::new(None)
+        };
+
+        let key = build_cache_key("my-hook", &action, &identity).unwrap();
+
+        assert!(!key.contains("person@example.com"), "key was: {key}");
+        assert!(!key.contains("repo:private/repo"), "key was: {key}");
+        assert!(!key.contains("internal-secret"), "key was: {key}");
+        assert!(!key.contains("custom_claim"), "key was: {key}");
+        assert!(!key.contains("email"), "key was: {key}");
+        assert!(!key.contains("sub"), "key was: {key}");
     }
 
     #[test]
