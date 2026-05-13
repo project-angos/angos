@@ -7,6 +7,7 @@ use std::{
     time::Duration,
 };
 
+use bytes::Bytes;
 use hmac::{Hmac, KeyInit, Mac};
 use prometheus::{HistogramVec, IntCounterVec, register_histogram_vec, register_int_counter_vec};
 use reqwest::Client;
@@ -66,11 +67,7 @@ impl WebhookEndpoint {
         }
     }
 
-    fn build_request<'a>(
-        &'a self,
-        body: &'a [u8],
-        event_kind_header: &'a str,
-    ) -> DeliveryRequest<'a> {
+    fn build_request<'a>(&'a self, body: Bytes, event_kind_header: &'a str) -> DeliveryRequest<'a> {
         DeliveryRequest {
             client: &self.client,
             url: self.config.url.as_str(),
@@ -85,7 +82,7 @@ struct DeliveryRequest<'a> {
     client: &'a Client,
     url: &'a str,
     token: Option<&'a str>,
-    body: &'a [u8],
+    body: Bytes,
     event_kind_header: &'a str,
 }
 
@@ -93,7 +90,7 @@ struct DeliveryJob {
     client: Client,
     url: String,
     token: Option<String>,
-    body: Vec<u8>,
+    body: Bytes,
     event_kind_header: String,
     max_retries: u32,
     name: String,
@@ -105,7 +102,7 @@ impl DeliveryJob {
             client: &self.client,
             url: &self.url,
             token: self.token.as_deref(),
-            body: &self.body,
+            body: self.body.clone(),
             event_kind_header: &self.event_kind_header,
         }
     }
@@ -130,10 +127,10 @@ async fn send_and_record(
     result
 }
 
-fn serialize_event(event: &Event) -> Result<(Vec<u8>, &'static str), Error> {
+fn serialize_event(event: &Event) -> Result<(Bytes, &'static str), Error> {
     let body = serde_json::to_vec(event)
         .map_err(|e| Error::Dispatch(format!("Failed to serialize event: {e}")))?;
-    Ok((body, event.kind.as_str()))
+    Ok((Bytes::from(body), event.kind.as_str()))
 }
 
 fn compute_signature(secret: &str, body: &[u8]) -> String {
@@ -151,14 +148,14 @@ async fn send_request(req: &DeliveryRequest<'_>) -> Result<(), String> {
         .header("X-Registry-Event", req.event_kind_header);
 
     if let Some(token) = req.token {
-        let signature = compute_signature(token, req.body);
+        let signature = compute_signature(token, &req.body);
         request = request
             .header("Authorization", format!("Bearer {token}"))
             .header("X-Registry-Signature-256", format!("sha256={signature}"));
     }
 
     let response = request
-        .body(req.body.to_vec())
+        .body(req.body.clone())
         .send()
         .await
         .map_err(|e| e.to_string())?;
@@ -265,7 +262,7 @@ impl EventDispatcher {
         &self,
         name: &str,
         endpoint: &WebhookEndpoint,
-        body: &[u8],
+        body: Bytes,
         event_kind_header: &str,
     ) -> bool {
         if self.shutdown.load(Ordering::SeqCst) {
@@ -277,7 +274,7 @@ impl EventDispatcher {
             client: endpoint.client.clone(),
             url: endpoint.config.url.to_string(),
             token: endpoint.config.token.as_ref().map(|t| t.expose().clone()),
-            body: body.to_vec(),
+            body,
             event_kind_header: event_kind_header.to_string(),
             max_retries: endpoint.config.max_retries,
             name: name.to_string(),
@@ -289,7 +286,7 @@ impl EventDispatcher {
         &self,
         name: &str,
         endpoint: &WebhookEndpoint,
-        body: &[u8],
+        body: Bytes,
         event_kind_header: &str,
     ) -> Result<(), Error> {
         let req = endpoint.build_request(body, event_kind_header);
@@ -302,7 +299,7 @@ impl EventDispatcher {
         &self,
         name: &str,
         endpoint: &WebhookEndpoint,
-        body: &[u8],
+        body: Bytes,
         event_kind_header: &str,
     ) {
         let req = endpoint.build_request(body, event_kind_header);
@@ -315,7 +312,7 @@ impl EventDispatcher {
         &self,
         name: &str,
         endpoint: &WebhookEndpoint,
-        body: &[u8],
+        body: Bytes,
         event_kind_header: &str,
     ) -> Result<bool, Error> {
         match endpoint.config.policy {
@@ -348,7 +345,7 @@ impl EventDispatcher {
                 .start_timer();
 
             if !self
-                .deliver_for_endpoint(name, endpoint, &body, event_kind_header)
+                .deliver_for_endpoint(name, endpoint, body.clone(), event_kind_header)
                 .await?
             {
                 continue;
