@@ -19,6 +19,8 @@ pub enum Error {
     RangeNotSatisfiable(String),
     #[error("Not Found: {0}")]
     NotFound(String),
+    #[error("Provider unavailable: {0}")]
+    ProviderUnavailable(String),
     #[error("Internal Server Error: {0}")]
     Internal(String),
     #[error("failed to build HTTP response: {0}")]
@@ -43,6 +45,7 @@ impl PartialEq for Error {
             | (Error::Conflict(a), Error::Conflict(b))
             | (Error::RangeNotSatisfiable(a), Error::RangeNotSatisfiable(b))
             | (Error::NotFound(a), Error::NotFound(b))
+            | (Error::ProviderUnavailable(a), Error::ProviderUnavailable(b))
             | (Error::Internal(a), Error::Internal(b)) => a == b,
             (Error::HttpBuild(a), Error::HttpBuild(b)) => std::ptr::eq(a, b),
             (Error::Serialization(a), Error::Serialization(b)) => std::ptr::eq(a, b),
@@ -71,6 +74,7 @@ impl Error {
             Error::Conflict(_) => StatusCode::CONFLICT,
             Error::RangeNotSatisfiable(_) => StatusCode::RANGE_NOT_SATISFIABLE,
             Error::NotFound(_) => StatusCode::NOT_FOUND,
+            Error::ProviderUnavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
             Error::Initialization(_)
             | Error::Execution(_)
             | Error::Internal(_)
@@ -87,6 +91,7 @@ impl Error {
             Error::Conflict(msg) => ("CONFLICT", Some(msg.as_str())),
             Error::RangeNotSatisfiable(msg) => ("RANGE_NOT_SATISFIABLE", Some(msg.as_str())),
             Error::NotFound(msg) => ("NOT_FOUND", Some(msg.as_str())),
+            Error::ProviderUnavailable(msg) => ("PROVIDER_UNAVAILABLE", Some(msg.as_str())),
             Error::Initialization(msg) | Error::Execution(msg) | Error::Internal(msg) => {
                 ("INTERNAL_ERROR", Some(msg.as_str()))
             }

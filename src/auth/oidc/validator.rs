@@ -25,6 +25,7 @@ struct Jwks {
     keys: Vec<Jwk>,
 }
 
+#[derive(Debug)]
 struct FetchedJwks {
     jwks: Jwks,
     from_cache: bool,
@@ -157,18 +158,18 @@ where
         .send()
         .await;
 
-    let response =
-        response.map_err(|e| Error::Unauthorized(format!("Failed to fetch URL {url}: {e}")))?;
+    let response = response
+        .map_err(|e| Error::ProviderUnavailable(format!("Failed to fetch URL {url}: {e}")))?;
 
     if !response.status().is_success() {
         let msg = format!("Failed to fetch URL {url}: HTTP {}", response.status());
-        return Err(Error::Unauthorized(msg));
+        return Err(Error::ProviderUnavailable(msg));
     }
 
     let data: T = response
         .json()
         .await
-        .map_err(|e| Error::Unauthorized(format!("Failed to parse JSON from {url}: {e}")))?;
+        .map_err(|e| Error::ProviderUnavailable(format!("Failed to parse JSON from {url}: {e}")))?;
 
     Ok(data)
 }
@@ -303,7 +304,7 @@ async fn fetch_oidc_configuration(
 
 #[cfg(test)]
 pub mod tests {
-    use std::collections::HashMap;
+    use std::{collections::HashMap, net::TcpListener, time::Duration};
 
     use jsonwebtoken::{Algorithm, EncodingKey, Header, decode_header, encode};
     use reqwest::Client;
@@ -313,17 +314,21 @@ pub mod tests {
         matchers::{method, path},
     };
 
-    use super::*;
     use crate::{
         auth::oidc::{
-            OidcProvider,
+            Jwk, OidcProvider,
             provider::{
                 BaseConfig,
                 generic::{Provider, ProviderConfig},
             },
+            validator::{
+                Jwks, fetch_jwks, fetch_oidc_configuration, jwks_cache_key, validate_oidc_token,
+                verify_allowed_algorithm, verify_jwt_with_header,
+            },
         },
         cache,
         command::server::Error,
+        identity::OidcClaims,
         test_fixtures::oidc::{KID, alt_private_key_pem, jwk_x, jwk_y, private_key_pem},
     };
 
@@ -526,6 +531,10 @@ pub mod tests {
         let result = fetch_jwks(&provider, &client, cache.as_ref()).await;
 
         assert!(result.is_err());
+        match result.unwrap_err() {
+            Error::ProviderUnavailable(msg) => assert!(msg.contains("HTTP 500")),
+            err => panic!("Expected ProviderUnavailable error, got {err:?}"),
+        }
     }
 
     #[tokio::test]
@@ -669,6 +678,41 @@ pub mod tests {
         let result = fetch_oidc_configuration(&provider, &client, cache.as_ref()).await;
 
         assert!(result.is_err());
+        match result.unwrap_err() {
+            Error::ProviderUnavailable(msg) => assert!(msg.contains("HTTP 404")),
+            err => panic!("Expected ProviderUnavailable error, got {err:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_fetch_jwks_network_error_returns_provider_unavailable() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        drop(listener);
+
+        let config = ProviderConfig {
+            issuer: url.clone(),
+            jwks_uri: Some(format!("{url}/.well-known/jwks")),
+            jwks_refresh_interval: 3600,
+            required_audience: None,
+            clock_skew_tolerance: 60,
+            allowed_algorithms: vec![Algorithm::ES256],
+        };
+
+        let provider = Provider::new(config);
+        let client = Client::builder()
+            .timeout(Duration::from_millis(200))
+            .build()
+            .unwrap();
+        let cache = cache::Config::Memory.to_backend().unwrap();
+
+        let result = fetch_jwks(&provider, &client, cache.as_ref()).await;
+
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            Error::ProviderUnavailable(msg) => assert!(msg.contains("Failed to fetch URL")),
+            err => panic!("Expected ProviderUnavailable error, got {err:?}"),
+        }
     }
 
     #[tokio::test]
@@ -1238,16 +1282,16 @@ pub mod tests {
         let provider = TestProvider::new(issuer, None);
         let jwks = test_jwks();
 
-        let mut claims = std::collections::HashMap::new();
-        claims.insert("iss".to_string(), serde_json::json!(issuer));
-        claims.insert("sub".to_string(), serde_json::json!("user"));
+        let mut claims = HashMap::new();
+        claims.insert("iss".to_string(), json!(issuer));
+        claims.insert("sub".to_string(), json!("user"));
         claims.insert(
             "exp".to_string(),
-            serde_json::json!((chrono::Utc::now() - chrono::Duration::hours(1)).timestamp()),
+            json!((chrono::Utc::now() - chrono::Duration::hours(1)).timestamp()),
         );
         claims.insert(
             "iat".to_string(),
-            serde_json::json!((chrono::Utc::now() - chrono::Duration::hours(2)).timestamp()),
+            json!((chrono::Utc::now() - chrono::Duration::hours(2)).timestamp()),
         );
 
         let mut header = Header::new(Algorithm::ES256);

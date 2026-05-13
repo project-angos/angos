@@ -77,7 +77,6 @@ Useful modules:
 - Token expired
 - Issuer mismatch
 - Audience mismatch
-- JWKS fetch failure
 - Token signed after OIDC provider key rotation
 
 **Solutions**:
@@ -89,6 +88,15 @@ Useful modules:
    curl https://token.actions.githubusercontent.com/.well-known/jwks
    ```
    If a token uses a new `kid`, Angos refreshes JWKS once outside the cache before rejecting it.
+
+### OIDC Provider Unavailable
+
+If Angos cannot fetch or parse the provider discovery document or JWKS, it returns 503 instead of treating the token as bad credentials.
+
+**Solutions**:
+- Ensure registry can reach the OIDC provider over the network
+- Check provider status and JWKS/discovery endpoints
+- Verify proxy, DNS, and firewall settings
 
 ### mTLS Certificate Rejected
 

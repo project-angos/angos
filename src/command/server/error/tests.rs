@@ -1,7 +1,6 @@
 use hyper::StatusCode;
 
-use super::*;
-use crate::{event_webhook, registry};
+use crate::{command::server::Error, event_webhook, registry};
 
 #[test]
 fn test_error_display() {
@@ -28,6 +27,12 @@ fn test_error_display() {
 
     let error = Error::NotFound("Item not found".to_string());
     assert_eq!(format!("{error}"), "Not Found: Item not found");
+
+    let error = Error::ProviderUnavailable("OIDC provider unavailable".to_string());
+    assert_eq!(
+        format!("{error}"),
+        "Provider unavailable: OIDC provider unavailable"
+    );
 
     let error = Error::Internal("Unexpected error".to_string());
     assert_eq!(
@@ -94,6 +99,11 @@ fn test_as_json_all_error_types() {
             Error::NotFound("not found".to_string()),
             "NOT_FOUND",
             "not found",
+        ),
+        (
+            Error::ProviderUnavailable("provider unavailable".to_string()),
+            "PROVIDER_UNAVAILABLE",
+            "provider unavailable",
         ),
         (
             Error::Initialization("init".to_string()),
@@ -313,6 +323,10 @@ fn test_status_code_coverage() {
             Error::RangeNotSatisfiable(String::new()),
         ),
         (StatusCode::NOT_FOUND, Error::NotFound(String::new())),
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Error::ProviderUnavailable(String::new()),
+        ),
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             Error::Initialization(String::new()),

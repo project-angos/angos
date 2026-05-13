@@ -308,6 +308,8 @@ OIDC tokens are cryptographically verified:
 - Expiration is enforced
 - Clock skew tolerance is configurable
 
+Bad OIDC tokens return 401. If Angos cannot reach or parse the configured provider discovery or JWKS endpoint, it returns 503 because the provider is temporarily unavailable rather than treating the credential as rejected.
+
 ### Password Storage
 
 - Argon2id hashing
