@@ -1,6 +1,7 @@
-use std::{collections::HashMap, net::SocketAddr, sync::Arc};
+use std::{collections::HashMap, net::SocketAddr, sync::Arc, time::Duration};
 
 use hyper::http::request::Parts;
+use reqwest::Client;
 use serde::Deserialize;
 use tracing::{debug, info, instrument, warn};
 
@@ -12,6 +13,7 @@ use crate::{
     cache::Cache,
     command::server::Error,
     configuration::Configuration,
+    http_client::HttpClientBuilder,
     identity::ClientIdentity,
     metrics_provider::metrics_provider,
 };
@@ -57,9 +59,15 @@ pub struct Authenticator {
 impl Authenticator {
     pub fn new(config: &Configuration, cache: &Arc<Cache>) -> Result<Self, Error> {
         let auth_config = &config.auth;
+        let oidc_client = Arc::new(
+            HttpClientBuilder::new()
+                .timeout(Duration::from_secs(30))
+                .build()
+                .map_err(Error::Initialization)?,
+        );
 
         let mtls_validator = MtlsValidator::new();
-        let oidc_validators = Self::build_oidc_validators(auth_config, cache)?;
+        let oidc_validators = Self::build_oidc_validators(auth_config, oidc_client, cache)?;
         let basic_auth_validator = BasicAuthValidator::new(&auth_config.identity);
 
         Ok(Self {
@@ -71,12 +79,14 @@ impl Authenticator {
 
     fn build_oidc_validators(
         auth_config: &AuthConfig,
+        client: Arc<Client>,
         cache: &Arc<Cache>,
     ) -> Result<OidcValidators, Error> {
         let mut validators = Vec::with_capacity(auth_config.oidc.len());
 
         for (name, oidc_config) in &auth_config.oidc {
-            let validator = OidcValidator::new(name.clone(), oidc_config, cache.clone())?;
+            let validator =
+                OidcValidator::new(name.clone(), oidc_config, client.clone(), cache.clone())?;
             validators.push((name.clone(), Arc::new(validator) as Arc<dyn AuthMiddleware>));
         }
 
@@ -237,6 +247,10 @@ mod tests {
         minimal_config()
     }
 
+    fn test_http_client() -> Arc<Client> {
+        Arc::new(Client::new())
+    }
+
     #[test]
     fn test_auth_config_empty() {
         let config = create_minimal_config();
@@ -318,7 +332,8 @@ mod tests {
         let auth_config = AuthConfig::default();
         let cache = cache::Config::Memory.to_backend().unwrap();
 
-        let validators = Authenticator::build_oidc_validators(&auth_config, &cache);
+        let validators =
+            Authenticator::build_oidc_validators(&auth_config, test_http_client(), &cache);
 
         assert!(validators.is_ok());
         assert!(validators.unwrap().is_empty());
@@ -335,7 +350,8 @@ mod tests {
 
         let cache = cache::Config::Memory.to_backend().unwrap();
 
-        let validators = Authenticator::build_oidc_validators(&config.auth, &cache);
+        let validators =
+            Authenticator::build_oidc_validators(&config.auth, test_http_client(), &cache);
 
         assert!(validators.is_ok());
         let validators = validators.unwrap();
@@ -355,7 +371,8 @@ mod tests {
 
         let cache = cache::Config::Memory.to_backend().unwrap();
 
-        let validators = Authenticator::build_oidc_validators(&config.auth, &cache);
+        let validators =
+            Authenticator::build_oidc_validators(&config.auth, test_http_client(), &cache);
 
         assert!(validators.is_ok());
         let validators = validators.unwrap();
@@ -378,7 +395,8 @@ mod tests {
 
         let cache = cache::Config::Memory.to_backend().unwrap();
 
-        let validators = Authenticator::build_oidc_validators(&config.auth, &cache);
+        let validators =
+            Authenticator::build_oidc_validators(&config.auth, test_http_client(), &cache);
 
         assert!(validators.is_ok());
         let validators = validators.unwrap();
@@ -534,7 +552,8 @@ mod tests {
 
         let cache = cache::Config::Memory.to_backend().unwrap();
 
-        let validators = Authenticator::build_oidc_validators(&config.auth, &cache).unwrap();
+        let validators =
+            Authenticator::build_oidc_validators(&config.auth, test_http_client(), &cache).unwrap();
 
         assert_eq!(validators.len(), 2);
         assert_eq!(validators[0].0, "custom");

@@ -1,13 +1,15 @@
-use std::{collections::HashMap, fmt, sync::Arc};
+use std::{collections::HashMap, fmt, path::PathBuf, sync::Arc};
 
 use hyper::http::request::Parts;
+use reqwest::Client;
 use tracing::{debug, info, instrument};
 
 use crate::{
-    auth::webhook::WebhookAuthorizer,
+    auth::webhook::{self, WebhookAuthorizer},
     cache::Cache,
     command::server::Error,
     configuration::{Configuration, RegexPattern},
+    http_client::HttpClientBuilder,
     identity::{Action, ClientIdentity},
     oci::{Namespace, Reference},
     policy::AccessMode,
@@ -31,6 +33,23 @@ struct AuthorizerRepository {
     authorization_webhook: Option<Arc<WebhookAuthorizer>>,
     immutable_tags: bool,
     immutable_tags_exclusions: Vec<RegexPattern>,
+}
+
+#[derive(Clone, Hash, Eq, PartialEq)]
+struct WebhookClientConfig {
+    server_ca_bundle: Option<PathBuf>,
+    client_certificate_bundle: Option<PathBuf>,
+    client_private_key: Option<PathBuf>,
+}
+
+impl From<&webhook::Config> for WebhookClientConfig {
+    fn from(config: &webhook::Config) -> Self {
+        Self {
+            server_ca_bundle: config.server_ca_bundle.clone(),
+            client_certificate_bundle: config.client_certificate_bundle.clone(),
+            client_private_key: config.client_private_key.clone(),
+        }
+    }
 }
 
 struct AuditIdentity<'a> {
@@ -250,14 +269,38 @@ fn build_webhooks(
     cache: &Arc<Cache>,
 ) -> Result<HashMap<String, Arc<WebhookAuthorizer>>, Error> {
     let mut webhooks = HashMap::with_capacity(config.auth.webhook.len());
+    let mut clients: HashMap<WebhookClientConfig, Client> = HashMap::new();
     for (name, webhook_config) in &config.auth.webhook {
+        let client_config = WebhookClientConfig::from(webhook_config);
+        let client = if let Some(client) = clients.get(&client_config) {
+            client.clone()
+        } else {
+            let client = build_webhook_client(webhook_config).map_err(|e| {
+                Error::Initialization(format!("Failed to create webhook '{name}': {e}"))
+            })?;
+            clients.insert(client_config, client.clone());
+            client
+        };
         let authorizer =
-            WebhookAuthorizer::new(name.clone(), webhook_config.clone(), cache.clone()).map_err(
-                |e| Error::Initialization(format!("Failed to create webhook '{name}': {e}")),
-            )?;
+            WebhookAuthorizer::new(name.clone(), webhook_config.clone(), client, cache.clone())
+                .map_err(|e| {
+                    Error::Initialization(format!("Failed to create webhook '{name}': {e}"))
+                })?;
         webhooks.insert(name.clone(), Arc::new(authorizer));
     }
     Ok(webhooks)
+}
+
+fn build_webhook_client(config: &webhook::Config) -> Result<Client, String> {
+    HttpClientBuilder::new()
+        .rustls_tls()
+        .redirect(reqwest::redirect::Policy::none())
+        .tls_files(
+            config.server_ca_bundle.as_deref(),
+            config.client_certificate_bundle.as_deref(),
+            config.client_private_key.as_deref(),
+        )?
+        .build()
 }
 
 fn build_repositories(

@@ -13,7 +13,6 @@ use crate::{
     },
     cache::Cache,
     command::server::Error,
-    http_client::HttpClientBuilder,
     identity::{Action, ClientIdentity},
 };
 
@@ -29,21 +28,13 @@ impl WebhookAuthorizer {
         &self.name
     }
 
-    pub fn new(name: String, config: Config, cache: Arc<Cache>) -> Result<Self, Error> {
+    pub fn new(
+        name: String,
+        config: Config,
+        client: Client,
+        cache: Arc<Cache>,
+    ) -> Result<Self, Error> {
         config.validate().map_err(Error::Initialization)?;
-
-        let client = HttpClientBuilder::new()
-            .rustls_tls()
-            .redirect(reqwest::redirect::Policy::none())
-            .timeout(Duration::from_millis(config.timeout_ms))
-            .tls_files(
-                config.server_ca_bundle.as_deref(),
-                config.client_certificate_bundle.as_deref(),
-                config.client_private_key.as_deref(),
-            )
-            .map_err(Error::Initialization)?
-            .build()
-            .map_err(Error::Initialization)?;
 
         Ok(Self {
             name,
@@ -54,7 +45,10 @@ impl WebhookAuthorizer {
     }
 
     async fn do_request(&self, headers: &HeaderMap) -> Result<reqwest::Response, reqwest::Error> {
-        let mut request = self.client.get(self.config.url.clone());
+        let mut request = self
+            .client
+            .get(self.config.url.clone())
+            .timeout(Duration::from_millis(self.config.timeout_ms));
         for (key, value) in headers {
             request = request.header(key, value);
         }

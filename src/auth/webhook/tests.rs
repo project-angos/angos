@@ -1,6 +1,7 @@
 use std::{fs, path::PathBuf, str::FromStr, sync::Arc, time::Duration};
 
 use hyper::{HeaderMap, Method, http::request::Builder};
+use reqwest::Client;
 use url::Url;
 use wiremock::{
     Mock, MockServer, ResponseTemplate,
@@ -23,6 +24,7 @@ use crate::{
     },
     cache::{self, Cache},
     command::server::Error,
+    http_client::HttpClientBuilder,
     identity::{Action, ClientIdentity},
     oci::{Digest, Namespace, Reference},
     secret::Secret,
@@ -456,6 +458,28 @@ fn build_test_config(
     }
 }
 
+fn build_test_client(config: &Config) -> Result<Client, String> {
+    HttpClientBuilder::new()
+        .rustls_tls()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(Duration::from_millis(config.timeout_ms))
+        .tls_files(
+            config.server_ca_bundle.as_deref(),
+            config.client_certificate_bundle.as_deref(),
+            config.client_private_key.as_deref(),
+        )?
+        .build()
+}
+
+fn build_test_webhook(
+    name: String,
+    config: Config,
+    cache: Arc<Cache>,
+) -> Result<WebhookAuthorizer, Error> {
+    let client = build_test_client(&config).map_err(Error::Initialization)?;
+    WebhookAuthorizer::new(name, config, client, cache)
+}
+
 #[test]
 fn test_new_invalid_mtls() {
     let tmp_dir = tempfile::tempdir().unwrap();
@@ -474,7 +498,7 @@ fn test_new_invalid_mtls() {
         Some(cert_file_path),
         Some(key_file_path),
     );
-    let webhook = WebhookAuthorizer::new(
+    let webhook = build_test_webhook(
         "test".to_string(),
         config,
         cache::Config::Memory.to_backend().unwrap(),
@@ -491,7 +515,7 @@ fn test_new_rejects_incomplete_mtls_config() {
         Some(PathBuf::from("certificate.pem")),
         None,
     );
-    let webhook = WebhookAuthorizer::new(
+    let webhook = build_test_webhook(
         "test".to_string(),
         config,
         cache::Config::Memory.to_backend().unwrap(),
@@ -520,7 +544,7 @@ fn test_new_mtls() {
         Some(cert_file_path),
         Some(key_file_path),
     );
-    let webhook = WebhookAuthorizer::new(
+    let webhook = build_test_webhook(
         "test".to_string(),
         config,
         cache::Config::Memory.to_backend().unwrap(),
@@ -532,7 +556,7 @@ fn test_new_mtls() {
 #[test]
 fn test_new_simple() {
     let config = build_test_config(Url::parse("https://example.com").unwrap(), None, None, None);
-    let webhook = WebhookAuthorizer::new(
+    let webhook = build_test_webhook(
         "test".to_string(),
         config,
         cache::Config::Memory.to_backend().unwrap(),
@@ -554,7 +578,7 @@ async fn test_authorize_success() {
     config.auth = None;
 
     let cache = cache::Config::Memory.to_backend().unwrap();
-    let webhook = WebhookAuthorizer::new("test".to_string(), config, cache).unwrap();
+    let webhook = build_test_webhook("test".to_string(), config, cache).unwrap();
 
     let action = Action::ApiVersion;
     let identity = ClientIdentity::new(None);
@@ -584,7 +608,7 @@ async fn test_authorize_denied() {
     config.auth = None;
 
     let cache = cache::Config::Memory.to_backend().unwrap();
-    let webhook = WebhookAuthorizer::new("test".to_string(), config, cache).unwrap();
+    let webhook = build_test_webhook("test".to_string(), config, cache).unwrap();
 
     let action = Action::ApiVersion;
     let identity = ClientIdentity::new(None);
@@ -617,7 +641,7 @@ async fn test_authorize_with_bearer_token() {
     )));
 
     let cache = cache::Config::Memory.to_backend().unwrap();
-    let webhook = WebhookAuthorizer::new("test".to_string(), config, cache).unwrap();
+    let webhook = build_test_webhook("test".to_string(), config, cache).unwrap();
 
     let action = Action::ApiVersion;
     let identity = ClientIdentity::new(None);
@@ -651,7 +675,7 @@ async fn test_authorize_with_basic_auth() {
     });
 
     let cache = cache::Config::Memory.to_backend().unwrap();
-    let webhook = WebhookAuthorizer::new("test".to_string(), config, cache).unwrap();
+    let webhook = build_test_webhook("test".to_string(), config, cache).unwrap();
 
     let action = Action::ApiVersion;
     let identity = ClientIdentity::new(None);
@@ -681,7 +705,7 @@ async fn test_authorize_sends_correct_headers() {
 
     let config = build_test_config(Url::parse(&mock_server.uri()).unwrap(), None, None, None);
     let cache = cache::Config::Memory.to_backend().unwrap();
-    let webhook = WebhookAuthorizer::new("test".to_string(), config, cache).unwrap();
+    let webhook = build_test_webhook("test".to_string(), config, cache).unwrap();
 
     let action = Action::ApiVersion;
     let identity = ClientIdentity::new(None);
@@ -713,7 +737,7 @@ async fn test_authorize_uses_cache() {
     config.auth = None;
 
     let cache = cache::Config::Memory.to_backend().unwrap();
-    let webhook = WebhookAuthorizer::new("test".to_string(), config, cache).unwrap();
+    let webhook = build_test_webhook("test".to_string(), config, cache).unwrap();
 
     let action = Action::ApiVersion;
     let identity = ClientIdentity::new(None);
@@ -740,7 +764,7 @@ async fn test_authorize_returns_err_on_unreachable_url() {
     config.auth = None;
 
     let cache = cache::Config::Memory.to_backend().unwrap();
-    let webhook = WebhookAuthorizer::new("test".to_string(), config, cache).unwrap();
+    let webhook = build_test_webhook("test".to_string(), config, cache).unwrap();
 
     let action = Action::ApiVersion;
     let identity = ClientIdentity::new(None);
@@ -787,7 +811,7 @@ async fn test_authorize_does_not_cache_transport_errors() {
     unreachable_config.auth = None;
     let cache = cache::Config::Memory.to_backend().unwrap();
     let unreachable_webhook =
-        WebhookAuthorizer::new("test".to_string(), unreachable_config, cache.clone()).unwrap();
+        build_test_webhook("test".to_string(), unreachable_config, cache.clone()).unwrap();
 
     let first = unreachable_webhook
         .authorize(&action, &identity, &request_parts)
@@ -803,7 +827,7 @@ async fn test_authorize_does_not_cache_transport_errors() {
     let mut live_config =
         build_test_config(Url::parse(&mock_server.uri()).unwrap(), None, None, None);
     live_config.auth = None;
-    let live_webhook = WebhookAuthorizer::new("test".to_string(), live_config, cache).unwrap();
+    let live_webhook = build_test_webhook("test".to_string(), live_config, cache).unwrap();
 
     let second = live_webhook
         .authorize(&action, &identity, &request_parts)
@@ -846,8 +870,7 @@ async fn webhook_authorization_succeeds_despite_cache_store_error() {
     let failing_backend = cache::stub::Backend::new();
     failing_backend.set_store_error(Some("injected store failure".to_string()));
     let failing_cache = Arc::new(Cache::Stub(failing_backend.clone()));
-    let webhook =
-        WebhookAuthorizer::new("test".to_string(), config, failing_cache.clone()).unwrap();
+    let webhook = build_test_webhook("test".to_string(), config, failing_cache.clone()).unwrap();
 
     let action = Action::ApiVersion;
     let identity = ClientIdentity::new(None);
@@ -884,7 +907,7 @@ async fn test_authorize_timeout_does_not_cache_and_retries() {
     let shared_cache = cache::Config::Memory.to_backend().unwrap();
 
     // First call: very short timeout causes a transport error.
-    let slow_webhook = WebhookAuthorizer::new(
+    let slow_webhook = build_test_webhook(
         "test".to_string(),
         build_test_config_with(Url::parse(&slow_server.uri()).unwrap(), 100, 60),
         shared_cache.clone(),
@@ -912,7 +935,7 @@ async fn test_authorize_timeout_does_not_cache_and_retries() {
         .mount(&live_server)
         .await;
 
-    let live_webhook = WebhookAuthorizer::new(
+    let live_webhook = build_test_webhook(
         "test".to_string(),
         build_test_config_with(Url::parse(&live_server.uri()).unwrap(), 1000, 60),
         shared_cache,
@@ -948,7 +971,7 @@ async fn test_authorize_cache_entry_expires_and_refetches() {
         .await;
 
     let cache = cache::Config::Memory.to_backend().unwrap();
-    let webhook = WebhookAuthorizer::new(
+    let webhook = build_test_webhook(
         "test".to_string(),
         build_test_config_with(Url::parse(&mock_server.uri()).unwrap(), 1000, 1),
         cache,
