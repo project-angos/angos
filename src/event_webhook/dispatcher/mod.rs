@@ -187,20 +187,24 @@ async fn send_with_retries(req: &DeliveryRequest<'_>, max_retries: u32) -> Resul
         }
     }
 
-    Err(format_retry_failure(
-        max_retries + 1,
-        first_err.as_deref(),
-        last_err.as_deref(),
-    ))
+    let errors = (
+        first_err
+            .as_deref()
+            .expect("retry loop records first error before failing"),
+        last_err
+            .as_deref()
+            .expect("retry loop records last error before failing"),
+    );
+
+    Err(format_retry_failure(max_retries + 1, errors))
 }
 
-fn format_retry_failure(attempts: u32, first: Option<&str>, last: Option<&str>) -> String {
-    match (first, last) {
-        (None, _) | (_, None) => format!("after {attempts} attempt(s): unknown error"),
-        (Some(f), Some(l)) if f == l => {
+fn format_retry_failure(attempts: u32, errors: (&str, &str)) -> String {
+    match errors {
+        (f, l) if f == l => {
             format!("after {attempts} attempt(s): {f}")
         }
-        (Some(f), Some(l)) => {
+        (f, l) => {
             format!("after {attempts} attempt(s); first error: {f}; last error: {l}")
         }
     }

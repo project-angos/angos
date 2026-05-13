@@ -17,7 +17,7 @@ fn backoff_saturates_for_huge_attempt() {
 #[test]
 fn format_retry_failure_one_attempt_identical_error() {
     assert_eq!(
-        format_retry_failure(1, Some("connection refused"), Some("connection refused")),
+        format_retry_failure(1, ("connection refused", "connection refused")),
         "after 1 attempt(s): connection refused"
     );
 }
@@ -25,7 +25,7 @@ fn format_retry_failure_one_attempt_identical_error() {
 #[test]
 fn format_retry_failure_three_attempts_identical_error() {
     assert_eq!(
-        format_retry_failure(3, Some("connection refused"), Some("connection refused")),
+        format_retry_failure(3, ("connection refused", "connection refused")),
         "after 3 attempt(s): connection refused"
     );
 }
@@ -33,15 +33,7 @@ fn format_retry_failure_three_attempts_identical_error() {
 #[test]
 fn format_retry_failure_three_attempts_different_errors() {
     assert_eq!(
-        format_retry_failure(3, Some("timeout"), Some("503 Service Unavailable")),
+        format_retry_failure(3, ("timeout", "503 Service Unavailable")),
         "after 3 attempt(s); first error: timeout; last error: 503 Service Unavailable"
-    );
-}
-
-#[test]
-fn format_retry_failure_none_is_defensive_unknown() {
-    assert_eq!(
-        format_retry_failure(0, None, None),
-        "after 0 attempt(s): unknown error"
     );
 }
