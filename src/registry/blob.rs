@@ -9,7 +9,7 @@ use crate::{
     oci::{Digest, Namespace},
     registry::{
         DOCKER_CONTENT_DIGEST, Error, Registry, Repository,
-        blob_store::{BlobStore, BoxedReader, UploadStore},
+        blob_store::{BoxedReader, UploadStore},
         metadata_store::{self, BlobIndexOperation, MetadataStoreExt, link_kind::LinkKind},
         task_queue,
     },
@@ -128,9 +128,8 @@ impl Registry {
         }
     }
 
-    #[instrument(skip(storage_engine, upload_engine, stream))]
+    #[instrument(skip(upload_engine, stream))]
     async fn copy_blob(
-        storage_engine: Arc<dyn BlobStore + Send + Sync>,
         upload_engine: Arc<dyn UploadStore + Send + Sync>,
         stream: impl AsyncRead + Send + Sync + Unpin + 'static,
         namespace: &Namespace,
@@ -152,19 +151,17 @@ impl Registry {
             return Err(error.into());
         }
 
-        drop(storage_engine);
         Ok(())
     }
 
     async fn cache_blob(
-        store: Arc<dyn BlobStore + Send + Sync>,
         upload_store: Arc<dyn UploadStore + Send + Sync>,
         stream: BoxedReader,
         namespace: Namespace,
         digest: Digest,
     ) -> Result<(), task_queue::Error> {
         debug!("Fetching blob: {digest}");
-        Self::copy_blob(store, upload_store, stream, &namespace, &digest)
+        Self::copy_blob(upload_store, stream, &namespace, &digest)
             .await
             .map_err(|e| task_queue::Error::TaskExecution(e.to_string()))?;
         info!("Caching of {digest} completed");
@@ -211,7 +208,6 @@ impl Registry {
         self.task_queue.submit(
             &task_key,
             Self::cache_blob(
-                self.blob_store.clone(),
                 self.upload_store.clone(),
                 caching_stream,
                 namespace.clone(),
@@ -506,10 +502,9 @@ mod tests {
             let (digest, _) = create_test_blob(registry, namespace, content).await;
 
             let stream = Cursor::new(content.to_vec());
-            let storage_engine = registry.blob_store.clone();
             let upload_engine = registry.upload_store.clone();
 
-            Registry::copy_blob(storage_engine, upload_engine, stream, namespace, &digest)
+            Registry::copy_blob(upload_engine, stream, namespace, &digest)
                 .await
                 .unwrap();
 
