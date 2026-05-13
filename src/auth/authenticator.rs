@@ -44,18 +44,6 @@ struct AuthOutcome {
     identity: ClientIdentity,
 }
 
-fn combine_outcome(
-    mtls_ok: bool,
-    oidc_ok: bool,
-    basic_ok: bool,
-    identity: ClientIdentity,
-) -> AuthOutcome {
-    AuthOutcome {
-        method: select_auth_method(mtls_ok, oidc_ok, basic_ok),
-        identity,
-    }
-}
-
 /// Coordinates all authentication methods and handles the authentication chain
 pub struct Authenticator {
     mtls_validator: MtlsValidator,
@@ -110,7 +98,10 @@ impl Authenticator {
             self.try_basic_authentication(parts, &mut identity).await?
         };
 
-        let outcome = combine_outcome(mtls_ok, oidc_ok, basic_ok, identity);
+        let outcome = AuthOutcome {
+            method: select_auth_method(mtls_ok, oidc_ok, basic_ok),
+            identity,
+        };
         tracing::Span::current().record("auth_method", outcome.method.unwrap_or("anonymous"));
         Ok(outcome.identity)
     }
@@ -511,26 +502,6 @@ mod tests {
     #[test]
     fn select_auth_method_returns_none_when_nothing_succeeded() {
         assert_eq!(select_auth_method(false, false, false), None);
-    }
-
-    #[test]
-    fn combine_outcome_returns_method_from_select_auth_method() {
-        let outcome = combine_outcome(true, false, false, ClientIdentity::new(None));
-        assert_eq!(outcome.method, Some("mtls"));
-    }
-
-    #[test]
-    fn combine_outcome_passes_identity_through_unchanged() {
-        let mut identity = ClientIdentity::new(None);
-        identity.username = Some("alice".into());
-        let outcome = combine_outcome(false, false, true, identity);
-        assert_eq!(outcome.identity.username, Some("alice".into()));
-    }
-
-    #[test]
-    fn combine_outcome_returns_anonymous_when_no_method_succeeded() {
-        let outcome = combine_outcome(false, false, false, ClientIdentity::new(None));
-        assert_eq!(outcome.method, None);
     }
 
     #[tokio::test]
