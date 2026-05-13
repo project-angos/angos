@@ -4,7 +4,7 @@ use jsonwebtoken::Algorithm;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    auth::oidc::provider::{BaseConfig, HasBaseConfig, OidcProvider, default_allowed_algorithms},
+    auth::oidc::provider::{BaseConfig, HasBaseConfig, OidcProvider},
     command::server::Error,
 };
 
@@ -14,13 +14,13 @@ pub struct ProviderConfig {
     pub issuer: String,
     #[serde(default = "default_github_jwks_uri")]
     pub jwks_uri: String,
-    #[serde(default = "default_jwks_refresh_interval")]
+    #[serde(default = "BaseConfig::default_jwks_refresh_interval")]
     pub jwks_refresh_interval: u64,
     #[serde(default)]
     pub required_audience: Option<String>,
-    #[serde(default = "default_clock_skew_tolerance")]
+    #[serde(default = "BaseConfig::default_clock_skew_tolerance")]
     pub clock_skew_tolerance: u64,
-    #[serde(default = "default_allowed_algorithms")]
+    #[serde(default = "BaseConfig::default_allowed_algorithms")]
     pub allowed_algorithms: Vec<Algorithm>,
 }
 
@@ -30,14 +30,6 @@ fn default_github_issuer() -> String {
 
 fn default_github_jwks_uri() -> String {
     "https://token.actions.githubusercontent.com/.well-known/jwks".to_string()
-}
-
-fn default_jwks_refresh_interval() -> u64 {
-    3600
-}
-
-fn default_clock_skew_tolerance() -> u64 {
-    60
 }
 
 pub struct Provider {
@@ -160,8 +152,12 @@ mod tests {
             default_github_jwks_uri(),
             "https://token.actions.githubusercontent.com/.well-known/jwks"
         );
-        assert_eq!(default_jwks_refresh_interval(), 3600);
-        assert_eq!(default_clock_skew_tolerance(), 60);
+        assert_eq!(BaseConfig::default_jwks_refresh_interval(), 3600);
+        assert_eq!(BaseConfig::default_clock_skew_tolerance(), 60);
+        assert_eq!(
+            BaseConfig::default_allowed_algorithms(),
+            vec![Algorithm::RS256]
+        );
     }
 
     #[test]
@@ -196,10 +192,10 @@ mod tests {
         let config = ProviderConfig {
             issuer: default_github_issuer(),
             jwks_uri: default_github_jwks_uri(),
-            jwks_refresh_interval: default_jwks_refresh_interval(),
+            jwks_refresh_interval: BaseConfig::default_jwks_refresh_interval(),
             required_audience: Some("my-audience".to_string()),
-            clock_skew_tolerance: default_clock_skew_tolerance(),
-            allowed_algorithms: default_allowed_algorithms(),
+            clock_skew_tolerance: BaseConfig::default_clock_skew_tolerance(),
+            allowed_algorithms: BaseConfig::default_allowed_algorithms(),
         };
 
         let provider = Provider::new(config);
@@ -224,8 +220,8 @@ mod tests {
             jwks_uri: default_github_jwks_uri(),
             jwks_refresh_interval: 7200,
             required_audience: None,
-            clock_skew_tolerance: default_clock_skew_tolerance(),
-            allowed_algorithms: default_allowed_algorithms(),
+            clock_skew_tolerance: BaseConfig::default_clock_skew_tolerance(),
+            allowed_algorithms: BaseConfig::default_allowed_algorithms(),
         };
 
         let provider = Provider::new(config);
@@ -237,10 +233,10 @@ mod tests {
         let config = ProviderConfig {
             issuer: default_github_issuer(),
             jwks_uri: default_github_jwks_uri(),
-            jwks_refresh_interval: default_jwks_refresh_interval(),
+            jwks_refresh_interval: BaseConfig::default_jwks_refresh_interval(),
             required_audience: None,
             clock_skew_tolerance: 120,
-            allowed_algorithms: default_allowed_algorithms(),
+            allowed_algorithms: BaseConfig::default_allowed_algorithms(),
         };
 
         let provider = Provider::new(config);
@@ -252,10 +248,10 @@ mod tests {
         let config = ProviderConfig {
             issuer: default_github_issuer(),
             jwks_uri: default_github_jwks_uri(),
-            jwks_refresh_interval: default_jwks_refresh_interval(),
+            jwks_refresh_interval: BaseConfig::default_jwks_refresh_interval(),
             required_audience: None,
-            clock_skew_tolerance: default_clock_skew_tolerance(),
-            allowed_algorithms: default_allowed_algorithms(),
+            clock_skew_tolerance: BaseConfig::default_clock_skew_tolerance(),
+            allowed_algorithms: BaseConfig::default_allowed_algorithms(),
         };
 
         let provider = Provider::new(config);
@@ -273,10 +269,10 @@ mod tests {
         let config = ProviderConfig {
             issuer: default_github_issuer(),
             jwks_uri: default_github_jwks_uri(),
-            jwks_refresh_interval: default_jwks_refresh_interval(),
+            jwks_refresh_interval: BaseConfig::default_jwks_refresh_interval(),
             required_audience: None,
-            clock_skew_tolerance: default_clock_skew_tolerance(),
-            allowed_algorithms: default_allowed_algorithms(),
+            clock_skew_tolerance: BaseConfig::default_clock_skew_tolerance(),
+            allowed_algorithms: BaseConfig::default_allowed_algorithms(),
         };
 
         let provider = Provider::new(config);
@@ -301,10 +297,10 @@ mod tests {
         let config = ProviderConfig {
             issuer: default_github_issuer(),
             jwks_uri: default_github_jwks_uri(),
-            jwks_refresh_interval: default_jwks_refresh_interval(),
+            jwks_refresh_interval: BaseConfig::default_jwks_refresh_interval(),
             required_audience: None,
-            clock_skew_tolerance: default_clock_skew_tolerance(),
-            allowed_algorithms: default_allowed_algorithms(),
+            clock_skew_tolerance: BaseConfig::default_clock_skew_tolerance(),
+            allowed_algorithms: BaseConfig::default_allowed_algorithms(),
         };
 
         let provider = Provider::new(config);
@@ -329,10 +325,10 @@ mod tests {
         let config = ProviderConfig {
             issuer: default_github_issuer(),
             jwks_uri: default_github_jwks_uri(),
-            jwks_refresh_interval: default_jwks_refresh_interval(),
+            jwks_refresh_interval: BaseConfig::default_jwks_refresh_interval(),
             required_audience: None,
-            clock_skew_tolerance: default_clock_skew_tolerance(),
-            allowed_algorithms: default_allowed_algorithms(),
+            clock_skew_tolerance: BaseConfig::default_clock_skew_tolerance(),
+            allowed_algorithms: BaseConfig::default_allowed_algorithms(),
         };
 
         let provider = Provider::new(config);
@@ -347,10 +343,10 @@ mod tests {
         let config = ProviderConfig {
             issuer: default_github_issuer(),
             jwks_uri: default_github_jwks_uri(),
-            jwks_refresh_interval: default_jwks_refresh_interval(),
+            jwks_refresh_interval: BaseConfig::default_jwks_refresh_interval(),
             required_audience: None,
-            clock_skew_tolerance: default_clock_skew_tolerance(),
-            allowed_algorithms: default_allowed_algorithms(),
+            clock_skew_tolerance: BaseConfig::default_clock_skew_tolerance(),
+            allowed_algorithms: BaseConfig::default_allowed_algorithms(),
         };
 
         let provider = Provider::new(config);

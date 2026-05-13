@@ -16,8 +16,18 @@ pub struct BaseConfig {
     pub allowed_algorithms: Vec<Algorithm>,
 }
 
-pub fn default_allowed_algorithms() -> Vec<Algorithm> {
-    vec![Algorithm::RS256]
+impl BaseConfig {
+    pub fn default_jwks_refresh_interval() -> u64 {
+        3600
+    }
+
+    pub fn default_clock_skew_tolerance() -> u64 {
+        60
+    }
+
+    pub fn default_allowed_algorithms() -> Vec<Algorithm> {
+        vec![Algorithm::RS256]
+    }
 }
 
 /// Provides the shared OIDC configuration required by every provider.

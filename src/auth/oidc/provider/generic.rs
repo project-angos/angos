@@ -1,31 +1,21 @@
 use jsonwebtoken::Algorithm;
 use serde::{Deserialize, Serialize};
 
-use crate::auth::oidc::provider::{
-    BaseConfig, HasBaseConfig, OidcProvider, default_allowed_algorithms,
-};
+use crate::auth::oidc::provider::{BaseConfig, HasBaseConfig, OidcProvider};
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ProviderConfig {
     pub issuer: String,
     #[serde(default)]
     pub jwks_uri: Option<String>,
-    #[serde(default = "default_jwks_refresh_interval")]
+    #[serde(default = "BaseConfig::default_jwks_refresh_interval")]
     pub jwks_refresh_interval: u64,
     #[serde(default)]
     pub required_audience: Option<String>,
-    #[serde(default = "default_clock_skew_tolerance")]
+    #[serde(default = "BaseConfig::default_clock_skew_tolerance")]
     pub clock_skew_tolerance: u64,
-    #[serde(default = "default_allowed_algorithms")]
+    #[serde(default = "BaseConfig::default_allowed_algorithms")]
     pub allowed_algorithms: Vec<Algorithm>,
-}
-
-fn default_jwks_refresh_interval() -> u64 {
-    3600
-}
-
-fn default_clock_skew_tolerance() -> u64 {
-    60
 }
 
 pub struct Provider {
@@ -108,8 +98,12 @@ mod tests {
 
     #[test]
     fn test_default_functions() {
-        assert_eq!(default_jwks_refresh_interval(), 3600);
-        assert_eq!(default_clock_skew_tolerance(), 60);
+        assert_eq!(BaseConfig::default_jwks_refresh_interval(), 3600);
+        assert_eq!(BaseConfig::default_clock_skew_tolerance(), 60);
+        assert_eq!(
+            BaseConfig::default_allowed_algorithms(),
+            vec![Algorithm::RS256]
+        );
     }
 
     #[test]
@@ -160,10 +154,10 @@ mod tests {
         let config = ProviderConfig {
             issuer: "https://example.com".to_string(),
             jwks_uri: None,
-            jwks_refresh_interval: default_jwks_refresh_interval(),
+            jwks_refresh_interval: BaseConfig::default_jwks_refresh_interval(),
             required_audience: None,
-            clock_skew_tolerance: default_clock_skew_tolerance(),
-            allowed_algorithms: default_allowed_algorithms(),
+            clock_skew_tolerance: BaseConfig::default_clock_skew_tolerance(),
+            allowed_algorithms: BaseConfig::default_allowed_algorithms(),
         };
 
         let provider = Provider::new(config);
