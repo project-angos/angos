@@ -7,7 +7,10 @@ use tracing::instrument;
 
 use crate::{
     configuration::RegexPattern,
-    oci::{Descriptor, Digest, Manifest, Namespace, Platform as OciPlatform, namespace_belongs_to},
+    oci::{
+        DOCKER_REFERENCE_DIGEST, Descriptor, Digest, IN_TOTO_PREDICATE_TYPE, Manifest, Namespace,
+        Platform as OciPlatform, namespace_belongs_to,
+    },
     registry::{
         APPLICATION_JSON, Error, JsonResponse, Registry, metadata_store::link_kind::LinkKind,
         pagination::collect_all_pages,
@@ -135,7 +138,7 @@ struct RepositoryConfig {
 }
 
 /// Detected Docker-style referrer: a child descriptor that points back at a
-/// `subject` via the `vnd.docker.reference.digest` annotation.
+/// `subject` via the Docker reference digest annotation.
 struct DockerReferrerCandidate {
     /// The subject manifest this referrer points to.
     subject: Digest,
@@ -150,13 +153,10 @@ struct DockerReferrerCandidate {
 
 /// Returns the Docker-style referrer candidate carried by `descriptor`, if any.
 /// Pure — no I/O. Returns `None` when the descriptor has no
-/// `vnd.docker.reference.digest` annotation or when the annotation value
+/// Docker reference digest annotation or when the annotation value
 /// cannot be parsed as a `Digest`.
 fn extract_docker_referrer(descriptor: &Descriptor) -> Option<DockerReferrerCandidate> {
-    const ANNOTATION_DOCKER_REFERENCE_DIGEST: &str = "vnd.docker.reference.digest";
-    let subject_str = descriptor
-        .annotations
-        .get(ANNOTATION_DOCKER_REFERENCE_DIGEST)?;
+    let subject_str = descriptor.annotations.get(DOCKER_REFERENCE_DIGEST)?;
     let subject = subject_str.parse::<Digest>().ok()?;
     Some(DockerReferrerCandidate {
         subject,
@@ -169,14 +169,13 @@ fn extract_docker_referrer(descriptor: &Descriptor) -> Option<DockerReferrerCand
     })
 }
 
-/// Returns the `in-toto.io/predicate-type` annotation value from the first
+/// Returns the in-toto predicate type annotation value from the first
 /// layer that carries it, if any. Pure — no I/O.
 fn extract_in_toto_predicate(child_manifest: &Manifest) -> Option<String> {
-    const ANNOTATION_PREDICATE_TYPE: &str = "in-toto.io/predicate-type";
     child_manifest
         .layers
         .iter()
-        .find_map(|layer| layer.annotations.get(ANNOTATION_PREDICATE_TYPE).cloned())
+        .find_map(|layer| layer.annotations.get(IN_TOTO_PREDICATE_TYPE).cloned())
 }
 
 /// Pure analysis of a parent manifest's `manifests` array, partitioning each
@@ -437,12 +436,11 @@ impl Registry {
         mut info: ReferrerInfo,
         child_digest: &Digest,
     ) -> ReferrerInfo {
-        const ANNOTATION_PREDICATE_TYPE: &str = "in-toto.io/predicate-type";
         if let Some(child_manifest) = self.read_manifest(child_digest).await
             && let Some(predicate) = extract_in_toto_predicate(&child_manifest)
         {
             info.annotations
-                .insert(ANNOTATION_PREDICATE_TYPE.to_string(), predicate);
+                .insert(IN_TOTO_PREDICATE_TYPE.to_string(), predicate);
         }
         info
     }
@@ -562,10 +560,10 @@ mod tests {
         ExtPlatform, analyze_manifest, build_digest_to_tags_map_from_pairs,
         extract_docker_referrer, extract_in_toto_predicate, parent_refs_for,
     };
-    use crate::oci::{Descriptor, Digest, Manifest, Platform as OciPlatform};
-
-    const ANNOTATION_PREDICATE_TYPE: &str = "in-toto.io/predicate-type";
-    const ANNOTATION_DOCKER_REF: &str = "vnd.docker.reference.digest";
+    use crate::oci::{
+        DOCKER_REFERENCE_DIGEST, Descriptor, Digest, IN_TOTO_PREDICATE_TYPE, Manifest,
+        Platform as OciPlatform,
+    };
 
     fn digest(hex_suffix: &str) -> Digest {
         // Pad to 64 hex chars with the suffix at the end.
@@ -627,11 +625,11 @@ mod tests {
     fn extract_in_toto_predicate_returns_first_match_across_layers() {
         let manifest = manifest_with_layers(vec![
             HashMap::from([(
-                ANNOTATION_PREDICATE_TYPE.to_string(),
+                IN_TOTO_PREDICATE_TYPE.to_string(),
                 "https://slsa.dev/provenance/v0.2".to_string(),
             )]),
             HashMap::from([(
-                ANNOTATION_PREDICATE_TYPE.to_string(),
+                IN_TOTO_PREDICATE_TYPE.to_string(),
                 "https://slsa.dev/provenance/v1".to_string(),
             )]),
         ]);
@@ -644,7 +642,7 @@ mod tests {
     #[test]
     fn extract_in_toto_predicate_returns_value_when_single_layer_has_it() {
         let manifest = manifest_with_layers(vec![HashMap::from([(
-            ANNOTATION_PREDICATE_TYPE.to_string(),
+            IN_TOTO_PREDICATE_TYPE.to_string(),
             "https://slsa.dev/provenance/v0.2".to_string(),
         )])]);
         assert_eq!(
@@ -664,7 +662,7 @@ mod tests {
     #[test]
     fn extract_docker_referrer_returns_none_when_annotation_not_a_valid_digest() {
         let descriptor = descriptor_with_annotations(HashMap::from([(
-            ANNOTATION_DOCKER_REF.to_string(),
+            DOCKER_REFERENCE_DIGEST.to_string(),
             "not-a-valid-digest".to_string(),
         )]));
         assert!(extract_docker_referrer(&descriptor).is_none());
@@ -675,7 +673,7 @@ mod tests {
         let subject = digest("beef");
         let child = digest("cafe");
         let mut descriptor = descriptor_with_annotations(HashMap::from([(
-            ANNOTATION_DOCKER_REF.to_string(),
+            DOCKER_REFERENCE_DIGEST.to_string(),
             subject.to_string(),
         )]));
         descriptor.digest = child.clone();
@@ -691,7 +689,7 @@ mod tests {
             Some("application/vnd.dev.cosign.artifact.sig.v1+json")
         );
         assert_eq!(
-            candidate.info.annotations.get(ANNOTATION_DOCKER_REF),
+            candidate.info.annotations.get(DOCKER_REFERENCE_DIGEST),
             Some(&subject.to_string())
         );
     }
@@ -748,7 +746,10 @@ mod tests {
             media_type: "application/vnd.oci.image.manifest.v1+json".to_string(),
             digest: child_digest.clone(),
             size: 0,
-            annotations: HashMap::from([(ANNOTATION_DOCKER_REF.to_string(), subject.to_string())]),
+            annotations: HashMap::from([(
+                DOCKER_REFERENCE_DIGEST.to_string(),
+                subject.to_string(),
+            )]),
             artifact_type: None,
             platform: None,
         };
@@ -774,7 +775,10 @@ mod tests {
             media_type: "application/vnd.oci.image.manifest.v1+json".to_string(),
             digest: referrer_digest.clone(),
             size: 0,
-            annotations: HashMap::from([(ANNOTATION_DOCKER_REF.to_string(), subject.to_string())]),
+            annotations: HashMap::from([(
+                DOCKER_REFERENCE_DIGEST.to_string(),
+                subject.to_string(),
+            )]),
             artifact_type: None,
             platform: None,
         };

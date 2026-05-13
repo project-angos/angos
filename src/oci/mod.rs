@@ -1,3 +1,5 @@
+pub mod constants;
+
 mod descriptor;
 mod digest;
 mod error;
@@ -5,6 +7,7 @@ mod manifest;
 mod namespace;
 mod reference;
 
+pub use constants::{DOCKER_REFERENCE_DIGEST, IN_TOTO_PREDICATE_TYPE};
 pub use descriptor::{Descriptor, Platform};
 pub use digest::Digest;
 pub use error::Error;
