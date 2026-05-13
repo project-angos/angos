@@ -4,7 +4,7 @@ use jsonwebtoken::Algorithm;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    auth::oidc::provider::{BaseConfig, OidcProvider, default_allowed_algorithms},
+    auth::oidc::provider::{BaseConfig, HasBaseConfig, OidcProvider, default_allowed_algorithms},
     command::server::Error,
 };
 
@@ -59,11 +59,13 @@ impl Provider {
     }
 }
 
-impl OidcProvider for Provider {
-    fn base(&self) -> &BaseConfig {
+impl HasBaseConfig for Provider {
+    fn base_config(&self) -> &BaseConfig {
         &self.base
     }
+}
 
+impl OidcProvider for Provider {
     fn name(&self) -> &'static str {
         "GitHub Actions"
     }

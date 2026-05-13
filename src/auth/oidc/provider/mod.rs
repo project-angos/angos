@@ -20,33 +20,37 @@ pub fn default_allowed_algorithms() -> Vec<Algorithm> {
     vec![Algorithm::RS256]
 }
 
-pub trait OidcProvider: Send + Sync {
-    fn base(&self) -> &BaseConfig;
+/// Provides the shared OIDC configuration required by every provider.
+pub trait HasBaseConfig {
+    fn base_config(&self) -> &BaseConfig;
+}
 
+/// OIDC provider behavior layered on top of the shared base configuration.
+pub trait OidcProvider: HasBaseConfig + Send + Sync {
     fn name(&self) -> &'static str;
 
     fn issuer(&self) -> &str {
-        &self.base().issuer
+        &self.base_config().issuer
     }
 
     fn jwks_uri(&self) -> Option<&str> {
-        self.base().jwks_uri.as_deref()
+        self.base_config().jwks_uri.as_deref()
     }
 
     fn jwks_refresh_interval(&self) -> u64 {
-        self.base().jwks_refresh_interval
+        self.base_config().jwks_refresh_interval
     }
 
     fn required_audience(&self) -> Option<&str> {
-        self.base().required_audience.as_deref()
+        self.base_config().required_audience.as_deref()
     }
 
     fn clock_skew_tolerance(&self) -> u64 {
-        self.base().clock_skew_tolerance
+        self.base_config().clock_skew_tolerance
     }
 
     fn allowed_algorithms(&self) -> &[Algorithm] {
-        &self.base().allowed_algorithms
+        &self.base_config().allowed_algorithms
     }
 
     fn validate_provider_claims(

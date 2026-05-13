@@ -1,7 +1,9 @@
 use jsonwebtoken::Algorithm;
 use serde::{Deserialize, Serialize};
 
-use crate::auth::oidc::provider::{BaseConfig, OidcProvider, default_allowed_algorithms};
+use crate::auth::oidc::provider::{
+    BaseConfig, HasBaseConfig, OidcProvider, default_allowed_algorithms,
+};
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ProviderConfig {
@@ -45,11 +47,13 @@ impl Provider {
     }
 }
 
-impl OidcProvider for Provider {
-    fn base(&self) -> &BaseConfig {
+impl HasBaseConfig for Provider {
+    fn base_config(&self) -> &BaseConfig {
         &self.base
     }
+}
 
+impl OidcProvider for Provider {
     fn name(&self) -> &'static str {
         "Generic OIDC"
     }

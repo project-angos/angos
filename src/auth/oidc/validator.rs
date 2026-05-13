@@ -363,7 +363,7 @@ pub mod tests {
         auth::oidc::{
             Jwk, OidcProvider,
             provider::{
-                BaseConfig,
+                BaseConfig, HasBaseConfig,
                 generic::{Provider, ProviderConfig},
             },
             validator::{
@@ -1270,11 +1270,13 @@ pub mod tests {
         }
     }
 
-    impl OidcProvider for TestProvider {
-        fn base(&self) -> &BaseConfig {
+    impl HasBaseConfig for TestProvider {
+        fn base_config(&self) -> &BaseConfig {
             &self.base
         }
+    }
 
+    impl OidcProvider for TestProvider {
         fn name(&self) -> &'static str {
             "Test"
         }
