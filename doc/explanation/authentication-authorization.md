@@ -159,6 +159,11 @@ sequenceDiagram
 **Repository policy** runs second (if defined):
 - Can add stricter rules
 - Cannot override global denials
+- Applies only when the namespace matches a configured repository
+
+Namespaces that do not match any configured repository are governed only by the
+global policy, because there is no repository policy or repository webhook to
+evaluate for them.
 
 **Webhook** runs last (if configured):
 - External authorization service

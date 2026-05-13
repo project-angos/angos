@@ -101,6 +101,8 @@ impl Authorizer {
         registry: &Registry,
     ) -> Result<(), Error> {
         let Ok(repository) = registry.get_repository_for_namespace(namespace) else {
+            // Unconfigured namespaces have no repository policy or webhook to evaluate.
+            // The global policy was already enforced by authorize_request.
             return Ok(());
         };
 
