@@ -114,38 +114,19 @@ mod tests {
     };
 
     #[test]
-    fn serialize_event_kind_manifest_push() {
-        let kind = EventKind::ManifestPush;
-        let json = serde_json::to_string(&kind).unwrap();
-        assert_eq!(json, r#""manifest.push""#);
-    }
+    fn serialize_event_kind_all_variants() {
+        let cases = [
+            (EventKind::ManifestPush, r#""manifest.push""#),
+            (EventKind::ManifestDelete, r#""manifest.delete""#),
+            (EventKind::BlobPush, r#""blob.push""#),
+            (EventKind::TagCreate, r#""tag.create""#),
+            (EventKind::TagDelete, r#""tag.delete""#),
+        ];
 
-    #[test]
-    fn serialize_event_kind_manifest_delete() {
-        let kind = EventKind::ManifestDelete;
-        let json = serde_json::to_string(&kind).unwrap();
-        assert_eq!(json, r#""manifest.delete""#);
-    }
-
-    #[test]
-    fn serialize_event_kind_blob_push() {
-        let kind = EventKind::BlobPush;
-        let json = serde_json::to_string(&kind).unwrap();
-        assert_eq!(json, r#""blob.push""#);
-    }
-
-    #[test]
-    fn serialize_event_kind_tag_create() {
-        let kind = EventKind::TagCreate;
-        let json = serde_json::to_string(&kind).unwrap();
-        assert_eq!(json, r#""tag.create""#);
-    }
-
-    #[test]
-    fn serialize_event_kind_tag_delete() {
-        let kind = EventKind::TagDelete;
-        let json = serde_json::to_string(&kind).unwrap();
-        assert_eq!(json, r#""tag.delete""#);
+        for (kind, expected) in cases {
+            let json = serde_json::to_string(&kind).unwrap();
+            assert_eq!(json, expected);
+        }
     }
 
     #[test]

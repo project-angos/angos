@@ -103,24 +103,17 @@ mod tests {
     };
 
     #[test]
-    fn serialize_delivery_policy_required() {
-        let policy = DeliveryPolicy::Required;
-        let json = serde_json::to_string(&policy).unwrap();
-        assert_eq!(json, r#""required""#);
-    }
+    fn serialize_delivery_policy_all_variants() {
+        let cases = [
+            (DeliveryPolicy::Required, r#""required""#),
+            (DeliveryPolicy::Optional, r#""optional""#),
+            (DeliveryPolicy::Async, r#""async""#),
+        ];
 
-    #[test]
-    fn serialize_delivery_policy_optional() {
-        let policy = DeliveryPolicy::Optional;
-        let json = serde_json::to_string(&policy).unwrap();
-        assert_eq!(json, r#""optional""#);
-    }
-
-    #[test]
-    fn serialize_delivery_policy_async() {
-        let policy = DeliveryPolicy::Async;
-        let json = serde_json::to_string(&policy).unwrap();
-        assert_eq!(json, r#""async""#);
+        for (policy, expected) in cases {
+            let json = serde_json::to_string(&policy).unwrap();
+            assert_eq!(json, expected);
+        }
     }
 
     #[test]
