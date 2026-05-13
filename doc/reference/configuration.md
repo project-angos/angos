@@ -111,8 +111,8 @@ Choose one: `blob_store.fs` or `blob_store.s3`.
 | `region`                         | string | required  | AWS region                         |
 | `key_prefix`                     | string | -         | Prefix for S3 keys                 |
 | `multipart_part_size`            | string | `"50MiB"` | Minimum multipart part size        |
-| `multipart_copy_threshold`       | string | `"5GB"`   | Threshold for multipart copy       |
-| `multipart_copy_chunk_size`      | string | `"100MB"` | Chunk size for multipart copy      |
+| `multipart_copy_threshold`       | string | `"5GB"`   | Blob size above which S3 upload completion uses multipart copy |
+| `multipart_copy_chunk_size`      | string | `"100MB"` | Server-side part size for multipart copy |
 | `multipart_copy_jobs`            | usize  | `4`       | Max concurrent multipart copy jobs |
 | `multipart_uniform_parts`        | bool   | `false`   | Use uniform multipart upload mode  |
 | `max_attempts`                   | u32    | `3`       | Retry attempts for S3 operations   |

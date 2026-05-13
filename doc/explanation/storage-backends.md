@@ -427,12 +427,18 @@ multipart_part_size = "50MiB"
 # Blobs larger than this use multipart copy
 multipart_copy_threshold = "5GB"
 
-# Size of each copy chunk (when copying existing blobs)
+# Size of each server-side copy part
 multipart_copy_chunk_size = "100MB"
 
-# Concurrent copy operations (when copying existing blobs)
+# Concurrent server-side copy operations
 multipart_copy_jobs = 4
 ```
+
+During S3 upload completion, Angos copies the assembled upload object into the
+content-addressed blob path. Objects at or below `multipart_copy_threshold` use a
+single S3 `CopyObject`; larger objects use S3 multipart copy with ranged
+`UploadPartCopy` requests. This keeps large blob completion inside S3's supported
+copy limits without proxying blob bytes through Angos.
 
 ---
 
