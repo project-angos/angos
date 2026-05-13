@@ -2,7 +2,7 @@ use std::{collections::HashSet, fmt, future::Future, sync::Arc};
 
 use parking_lot::Mutex;
 use tokio::{runtime::Handle, sync::Semaphore};
-use tracing::info;
+use tracing::{info, warn};
 
 #[derive(Debug)]
 pub enum Error {
@@ -58,7 +58,9 @@ impl TaskQueue {
         let permits = self.permits.clone();
         self.handle.spawn(async move {
             if let Ok(_permit) = permits.acquire_owned().await {
-                let _ = fut.await;
+                if let Err(error) = fut.await {
+                    warn!("Task '{reference}' failed: {error}");
+                }
             }
             active_tasks.lock().remove(&reference);
         });
@@ -79,14 +81,16 @@ impl TaskQueue {
 mod tests {
     use std::{
         future::Future,
+        io::{self, Write},
         sync::{
-            Arc,
+            Arc, Mutex as StdMutex,
             atomic::{AtomicUsize, Ordering},
         },
         time::Duration,
     };
 
     use tokio::sync::{Notify, oneshot};
+    use tracing_subscriber::fmt::MakeWriter;
 
     use super::{Error, TaskQueue};
 
@@ -102,6 +106,16 @@ mod tests {
         async move {
             c.fetch_add(1, Ordering::SeqCst);
             Ok(())
+        }
+    }
+
+    fn failing_task(
+        counter: &Arc<AtomicUsize>,
+    ) -> impl Future<Output = Result<(), Error>> + Send + 'static {
+        let c = counter.clone();
+        async move {
+            c.fetch_add(1, Ordering::SeqCst);
+            Err(Error::TaskExecution("expected failure".to_string()))
         }
     }
 
@@ -143,6 +157,53 @@ mod tests {
         false
     }
 
+    async fn wait_until_async(predicate: impl Fn() -> bool) -> bool {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            if predicate() {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        false
+    }
+
+    #[derive(Clone, Default)]
+    struct LogCapture {
+        content: Arc<StdMutex<Vec<u8>>>,
+    }
+
+    impl LogCapture {
+        fn contents(&self) -> String {
+            String::from_utf8(self.content.lock().unwrap().clone()).unwrap()
+        }
+    }
+
+    struct LogWriter {
+        content: Arc<StdMutex<Vec<u8>>>,
+    }
+
+    impl Write for LogWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.content.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> MakeWriter<'a> for LogCapture {
+        type Writer = LogWriter;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            LogWriter {
+                content: self.content.clone(),
+            }
+        }
+    }
+
     // Single task submitted, runs exactly once, and is removed from the active set.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn single_submit_runs_to_completion() {
@@ -155,6 +216,29 @@ mod tests {
         assert!(wait_until(|| !queue.is_active("ref-a")));
         assert_eq!(counter.load(Ordering::SeqCst), 1);
         assert_eq!(queue.active_task_count(), 0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn failed_task_logs_error_and_cleans_up() {
+        let logs = LogCapture::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(logs.clone())
+            .with_ansi(false)
+            .without_time()
+            .finish();
+
+        let queue = make_queue();
+        let counter = Arc::new(AtomicUsize::new(0));
+
+        let _guard = tracing::subscriber::set_default(subscriber);
+        queue.submit("ref-fail", failing_task(&counter));
+
+        assert!(wait_until_async(|| counter.load(Ordering::SeqCst) == 1).await);
+        assert!(wait_until_async(|| !queue.is_active("ref-fail")).await);
+
+        let logs = logs.contents();
+        assert!(logs.contains("Task 'ref-fail' failed"), "logs were: {logs}");
+        assert!(logs.contains("expected failure"), "logs were: {logs}");
     }
 
     // Submitting the same reference twice while the first task is still in-flight
@@ -206,19 +290,19 @@ mod tests {
     async fn max_concurrent_jobs_limits_running_tasks() {
         let queue = TaskQueue::new(1).expect("failed to build TaskQueue");
         let counter = Arc::new(AtomicUsize::new(0));
-        let first_gate = Arc::new(Notify::new());
-        let second_gate = Arc::new(Notify::new());
+        let (first_tx, first_rx) = oneshot::channel::<()>();
+        let (second_tx, second_rx) = oneshot::channel::<()>();
 
-        queue.submit("ref-first", notify_task(&counter, first_gate.clone()));
-        queue.submit("ref-second", notify_task(&counter, second_gate.clone()));
+        queue.submit("ref-first", gated_task(&counter, first_rx));
+        queue.submit("ref-second", gated_task(&counter, second_rx));
 
         assert!(wait_until(|| counter.load(Ordering::SeqCst) == 1));
         assert_eq!(queue.active_task_count(), 2);
 
-        first_gate.notify_one();
+        let _ = first_tx.send(());
         assert!(wait_until(|| counter.load(Ordering::SeqCst) == 2));
 
-        second_gate.notify_one();
+        let _ = second_tx.send(());
         assert!(wait_until(|| queue.active_task_count() == 0));
     }
 
