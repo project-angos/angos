@@ -29,6 +29,12 @@ pub struct TaskQueue {
 
 impl TaskQueue {
     pub fn new(worker_threads: usize, thread_name: &str) -> Result<Self, Error> {
+        if worker_threads == 0 {
+            return Err(Error::RuntimeBuild(
+                "worker_threads must be greater than 0".to_string(),
+            ));
+        }
+
         let runtime = runtime::Builder::new_multi_thread()
             .worker_threads(worker_threads)
             .thread_name(thread_name)

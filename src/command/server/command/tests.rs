@@ -332,6 +332,44 @@ async fn test_build_registry_with_update_pull_time() {
 }
 
 #[tokio::test]
+async fn test_build_registry_preserves_registry_error_details() {
+    let blobs = TempDir::new().unwrap();
+    let meta = TempDir::new().unwrap();
+    let toml = format!(
+        r#"
+        [blob_store.fs]
+        root_dir = "{blobs}"
+
+        [metadata_store.fs]
+        root_dir = "{meta}"
+
+        [cache.memory]
+
+        [server]
+        bind_address = "127.0.0.1"
+        port = 8080
+
+        [global]
+        update_pull_time = false
+        max_concurrent_cache_jobs = 0
+    "#,
+        blobs = blobs.path().display(),
+        meta = meta.path().display(),
+    );
+
+    let config = Configuration::load_from_str(&toml).unwrap();
+    let result = setup::build_registry(&config, &Arc::new(Mutex::new(None))).await;
+
+    let error = result.expect_err("registry build should fail");
+    assert!(
+        error.to_string().contains(
+            "task pool error during operations: failed to build Tokio runtime: worker_threads must be greater than 0"
+        ),
+        "error should preserve registry failure details, got: {error}"
+    );
+}
+
+#[tokio::test]
 async fn test_command_new_insecure_listener() {
     let (config, _blobs, _meta) = create_minimal_config();
     let result = Command::new(&config).await;

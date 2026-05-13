@@ -57,17 +57,13 @@ pub async fn build_registry(
         .global_immutable_tags(config.global.immutable_tags)
         .global_immutable_tags_exclusions(config.global.immutable_tags_exclusions.clone());
 
-    let Ok(registry) = Registry::new(
+    Registry::new(
         blob_handles.blob_store,
         blob_handles.upload_store,
         blob_handles.presigned_store,
         metadata_store,
         repositories,
         registry_config,
-    ) else {
-        let msg = "Failed to initialize registry".to_string();
-        return Err(Error::Initialization(msg));
-    };
-
-    Ok(registry)
+    )
+    .map_err(|e| Error::Initialization(e.to_string()))
 }
