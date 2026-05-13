@@ -85,10 +85,13 @@ impl ServerContext {
 
     pub fn is_reference_immutable(&self, namespace: &Namespace, reference: &Reference) -> bool {
         match reference {
-            Reference::Tag(tag) => {
-                self.authorizer
-                    .is_tag_immutable(&self.registry, namespace, tag.as_str())
-            }
+            Reference::Tag(tag) => !self.authorizer.is_tag_mutable(
+                self.registry
+                    .get_repository_for_namespace(namespace)
+                    .ok()
+                    .map(|repository| repository.name.as_str()),
+                tag.as_str(),
+            ),
             Reference::Digest(_) => false,
         }
     }

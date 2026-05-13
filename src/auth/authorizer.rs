@@ -128,7 +128,7 @@ impl Authorizer {
             return Err(Error::Unauthorized(ACCESS_DENIED.to_string()));
         }
 
-        self.check_immutable_tag(auth_repo, action)?;
+        self.check_immutable_tag(repository.name.as_str(), action)?;
 
         let webhook = auth_repo
             .authorization_webhook
@@ -154,16 +154,12 @@ impl Authorizer {
         Ok(())
     }
 
-    fn check_immutable_tag(
-        &self,
-        auth_repo: &AuthorizerRepository,
-        action: &Action,
-    ) -> Result<(), Error> {
+    fn check_immutable_tag(&self, repository_name: &str, action: &Action) -> Result<(), Error> {
         if let Action::PutManifest {
             reference: Reference::Tag(tag),
             ..
         } = action
-            && !self.is_tag_mutable(auth_repo, tag)
+            && !self.is_tag_mutable(Some(repository_name), tag)
         {
             return Err(Error::Conflict(format!(
                 "Tag '{tag}' is immutable and cannot be overwritten"
@@ -172,33 +168,22 @@ impl Authorizer {
         Ok(())
     }
 
-    fn is_tag_mutable(&self, auth_repo: &AuthorizerRepository, tag: &str) -> bool {
-        let is_immutable = auth_repo.immutable_tags || self.global_immutable_tags;
-        let exclusions = if auth_repo.immutable_tags_exclusions.is_empty() {
-            &self.global_immutable_tags_exclusions
-        } else {
-            &auth_repo.immutable_tags_exclusions
-        };
-        let is_excluded = exclusions.iter().any(|pattern| pattern.is_match(tag));
-
-        !is_immutable || is_excluded
-    }
-
-    pub fn is_tag_immutable(&self, registry: &Registry, namespace: &Namespace, tag: &str) -> bool {
-        let auth_repo = registry
-            .get_repository_for_namespace(namespace)
-            .ok()
-            .and_then(|repo| self.repositories.get(&repo.name));
-
-        if let Some(auth_repo) = auth_repo {
-            !self.is_tag_mutable(auth_repo, tag)
-        } else {
-            self.global_immutable_tags
-                && !self
-                    .global_immutable_tags_exclusions
-                    .iter()
-                    .any(|pattern| pattern.is_match(tag))
+    pub fn is_tag_mutable(&self, repository_name: Option<&str>, tag: &str) -> bool {
+        let repository = repository_name.and_then(|name| self.repositories.get(name));
+        let immutable_tags =
+            self.global_immutable_tags || repository.is_some_and(|repo| repo.immutable_tags);
+        if !immutable_tags {
+            return true;
         }
+
+        let exclusions = match repository {
+            Some(repo) if !repo.immutable_tags_exclusions.is_empty() => {
+                &repo.immutable_tags_exclusions
+            }
+            _ => &self.global_immutable_tags_exclusions,
+        };
+
+        exclusions.iter().any(|pattern| pattern.is_match(tag))
     }
 }
 
@@ -389,8 +374,8 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn test_is_tag_immutable_with_global_setting() {
+    #[test]
+    fn test_is_tag_mutable_with_global_setting() {
         let toml = config_toml(
             r#"
             immutable_tags = true
@@ -400,14 +385,11 @@ mod tests {
         let config = Configuration::load_from_str(&toml).unwrap();
         let cache = cache::Config::Memory.to_backend().unwrap();
         let authorizer = Authorizer::new(&config, &cache).unwrap();
-        let registry = create_pull_through_registry(&config).await;
-
-        let ns = Namespace::new("unknown-namespace").unwrap();
-        assert!(authorizer.is_tag_immutable(&registry, &ns, "v1.0.0"));
+        assert!(!authorizer.is_tag_mutable(None, "v1.0.0"));
     }
 
-    #[tokio::test]
-    async fn test_is_tag_immutable_with_global_exclusions() {
+    #[test]
+    fn test_is_tag_mutable_with_global_exclusions() {
         let toml = config_toml(
             r#"
             immutable_tags = true
@@ -418,16 +400,13 @@ mod tests {
         let config = Configuration::load_from_str(&toml).unwrap();
         let cache = cache::Config::Memory.to_backend().unwrap();
         let authorizer = Authorizer::new(&config, &cache).unwrap();
-        let registry = create_pull_through_registry(&config).await;
-
-        let ns = Namespace::new("unknown-namespace").unwrap();
-        assert!(!authorizer.is_tag_immutable(&registry, &ns, "latest"));
-        assert!(!authorizer.is_tag_immutable(&registry, &ns, "dev-branch"));
-        assert!(authorizer.is_tag_immutable(&registry, &ns, "v1.0.0"));
+        assert!(authorizer.is_tag_mutable(None, "latest"));
+        assert!(authorizer.is_tag_mutable(None, "dev-branch"));
+        assert!(!authorizer.is_tag_mutable(None, "v1.0.0"));
     }
 
-    #[tokio::test]
-    async fn test_is_tag_immutable_with_repository_setting() {
+    #[test]
+    fn test_is_tag_mutable_with_repository_setting() {
         let toml = config_toml(
             r#"
             immutable_tags = false
@@ -441,14 +420,11 @@ mod tests {
         let config = Configuration::load_from_str(&toml).unwrap();
         let cache = cache::Config::Memory.to_backend().unwrap();
         let authorizer = Authorizer::new(&config, &cache).unwrap();
-        let registry = create_pull_through_registry(&config).await;
-
-        let ns = Namespace::new("myrepo").unwrap();
-        assert!(authorizer.is_tag_immutable(&registry, &ns, "v1.0.0"));
+        assert!(!authorizer.is_tag_mutable(Some("myrepo"), "v1.0.0"));
     }
 
-    #[tokio::test]
-    async fn test_is_tag_immutable_with_repository_exclusions() {
+    #[test]
+    fn test_is_tag_mutable_with_repository_exclusions() {
         let toml = config_toml(
             r#"
             immutable_tags = true
@@ -464,16 +440,13 @@ mod tests {
         let config = Configuration::load_from_str(&toml).unwrap();
         let cache = cache::Config::Memory.to_backend().unwrap();
         let authorizer = Authorizer::new(&config, &cache).unwrap();
-        let registry = create_pull_through_registry(&config).await;
-
-        let ns = Namespace::new("myrepo").unwrap();
-        assert!(!authorizer.is_tag_immutable(&registry, &ns, "test-123"));
-        assert!(authorizer.is_tag_immutable(&registry, &ns, "latest"));
-        assert!(authorizer.is_tag_immutable(&registry, &ns, "v1.0.0"));
+        assert!(authorizer.is_tag_mutable(Some("myrepo"), "test-123"));
+        assert!(!authorizer.is_tag_mutable(Some("myrepo"), "latest"));
+        assert!(!authorizer.is_tag_mutable(Some("myrepo"), "v1.0.0"));
     }
 
-    #[tokio::test]
-    async fn test_is_tag_immutable_with_sub_namespace() {
+    #[test]
+    fn test_is_tag_mutable_with_repository_name() {
         let toml = config_toml(
             r#"
             immutable_tags = false
@@ -487,15 +460,9 @@ mod tests {
         let config = Configuration::load_from_str(&toml).unwrap();
         let cache = cache::Config::Memory.to_backend().unwrap();
         let authorizer = Authorizer::new(&config, &cache).unwrap();
-        let registry = create_pull_through_registry(&config).await;
-
-        let ns_root = Namespace::new("docker-io").unwrap();
-        let ns_sub = Namespace::new("docker-io/library/nginx").unwrap();
-        let ns_other = Namespace::new("other/namespace").unwrap();
-        assert!(authorizer.is_tag_immutable(&registry, &ns_root, "v1.0.0"));
-        assert!(authorizer.is_tag_immutable(&registry, &ns_sub, "v1.0.0"));
-        assert!(!authorizer.is_tag_immutable(&registry, &ns_sub, "latest"));
-        assert!(!authorizer.is_tag_immutable(&registry, &ns_other, "v1.0.0"));
+        assert!(!authorizer.is_tag_mutable(Some("docker-io"), "v1.0.0"));
+        assert!(authorizer.is_tag_mutable(Some("docker-io"), "latest"));
+        assert!(authorizer.is_tag_mutable(None, "v1.0.0"));
     }
 
     #[test]
@@ -513,9 +480,7 @@ mod tests {
         let config = Configuration::load_from_str(&toml).unwrap();
         let cache = cache::Config::Memory.to_backend().unwrap();
         let authorizer = Authorizer::new(&config, &cache).unwrap();
-        let auth_repo = authorizer.repositories.get("myrepo").unwrap();
-
-        assert!(authorizer.is_tag_mutable(auth_repo, "any-tag"));
+        assert!(authorizer.is_tag_mutable(Some("myrepo"), "any-tag"));
     }
 
     // When immutable_tags is true and the tag matches an exclusion pattern, the
@@ -534,14 +499,12 @@ mod tests {
         let config = Configuration::load_from_str(&toml).unwrap();
         let cache = cache::Config::Memory.to_backend().unwrap();
         let authorizer = Authorizer::new(&config, &cache).unwrap();
-        let auth_repo = authorizer.repositories.get("myrepo").unwrap();
-
         assert!(
-            authorizer.is_tag_mutable(auth_repo, "latest"),
+            authorizer.is_tag_mutable(Some("myrepo"), "latest"),
             "'latest' must be mutable because it matches the exclusion pattern"
         );
         assert!(
-            authorizer.is_tag_mutable(auth_repo, "dev-feature"),
+            authorizer.is_tag_mutable(Some("myrepo"), "dev-feature"),
             "'dev-feature' must be mutable because it matches 'dev-.*'"
         );
     }
@@ -562,10 +525,8 @@ mod tests {
         let config = Configuration::load_from_str(&toml).unwrap();
         let cache = cache::Config::Memory.to_backend().unwrap();
         let authorizer = Authorizer::new(&config, &cache).unwrap();
-        let auth_repo = authorizer.repositories.get("myrepo").unwrap();
-
         assert!(
-            !authorizer.is_tag_mutable(auth_repo, "v1.0.0"),
+            !authorizer.is_tag_mutable(Some("myrepo"), "v1.0.0"),
             "'v1.0.0' must be immutable: immutable_tags=true and not excluded"
         );
     }
@@ -591,14 +552,13 @@ mod tests {
         let config = Configuration::load_from_str(&toml).unwrap();
         let cache = cache::Config::Memory.to_backend().unwrap();
         let authorizer = Authorizer::new(&config, &cache).unwrap();
-        let auth_repo = authorizer.repositories.get("myrepo").unwrap();
 
         let action = Action::PutManifest {
             namespace: Namespace::new("myrepo/app").unwrap(),
             reference: Reference::from_str("v1.0.0").unwrap(),
         };
 
-        let result = authorizer.check_immutable_tag(auth_repo, &action);
+        let result = authorizer.check_immutable_tag("myrepo", &action);
 
         let Err(Error::Conflict(msg)) = result else {
             panic!("expected Err(Error::Conflict(_)), got: {result:?}");
