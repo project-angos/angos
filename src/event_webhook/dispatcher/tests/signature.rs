@@ -5,11 +5,13 @@ use wiremock::{
     matchers::{header, method},
 };
 
-use super::{
-    super::signature::compute_signature,
-    common::{build_dispatcher, create_test_event, create_webhook_config_for_url},
+use crate::event_webhook::{
+    dispatcher::{
+        compute_signature,
+        tests::common::{build_dispatcher, create_test_event, create_webhook_config_for_url},
+    },
+    event::EventKind,
 };
-use crate::event_webhook::event::EventKind;
 
 #[tokio::test]
 async fn dispatch_sends_hmac_signature_header() {

@@ -7,26 +7,21 @@ use std::{
     time::Duration,
 };
 
+use hmac::{Hmac, KeyInit, Mac};
 use prometheus::{HistogramVec, IntCounterVec, register_histogram_vec, register_int_counter_vec};
 use reqwest::Client;
+use sha2::Sha256;
 use tokio::{sync::Mutex, task::JoinSet};
 use tracing::warn;
 
-mod endpoint;
-mod signature;
-mod transport;
-
 #[cfg(test)]
 mod tests;
-
-use endpoint::WebhookEndpoint;
-use transport::{DeliveryRequest, send_with_retries};
 
 use crate::{
     configuration::Error,
     event_webhook::{
         config::{DeliveryPolicy, EventWebhookConfig},
-        event::Event,
+        event::{Event, EventKind},
     },
     http_client::HttpClientBuilder,
 };
@@ -53,6 +48,45 @@ pub struct EventDispatcher {
     endpoints: HashMap<String, WebhookEndpoint>,
     shutdown: Arc<AtomicBool>,
     in_flight: Arc<Mutex<JoinSet<()>>>,
+}
+
+struct WebhookEndpoint {
+    client: Client,
+    config: Arc<EventWebhookConfig>,
+}
+
+impl WebhookEndpoint {
+    fn matches_event(&self, event_kind: &EventKind, repository: &str) -> bool {
+        if !self.config.events.contains(event_kind) {
+            return false;
+        }
+        match &self.config.repository_filter {
+            None => true,
+            Some(filters) => filters.iter().any(|p| p.is_match(repository)),
+        }
+    }
+
+    fn build_request<'a>(
+        &'a self,
+        body: &'a [u8],
+        event_kind_header: &'a str,
+    ) -> DeliveryRequest<'a> {
+        DeliveryRequest {
+            client: &self.client,
+            url: self.config.url.as_str(),
+            token: self.config.token.as_ref().map(|t| t.expose().as_str()),
+            body,
+            event_kind_header,
+        }
+    }
+}
+
+struct DeliveryRequest<'a> {
+    client: &'a Client,
+    url: &'a str,
+    token: Option<&'a str>,
+    body: &'a [u8],
+    event_kind_header: &'a str,
 }
 
 struct DeliveryJob {
@@ -100,6 +134,85 @@ fn serialize_event(event: &Event) -> Result<(Vec<u8>, &'static str), Error> {
     let body = serde_json::to_vec(event)
         .map_err(|e| Error::Initialization(format!("Failed to serialize event: {e}")))?;
     Ok((body, event.kind.as_str()))
+}
+
+fn compute_signature(secret: &str, body: &[u8]) -> String {
+    let mut mac =
+        Hmac::<Sha256>::new_from_slice(secret.as_bytes()).expect("HMAC accepts keys of any length");
+    mac.update(body);
+    hex::encode(mac.finalize().into_bytes())
+}
+
+async fn send_request(req: &DeliveryRequest<'_>) -> Result<(), String> {
+    let mut request = req
+        .client
+        .post(req.url)
+        .header("content-type", "application/json")
+        .header("X-Registry-Event", req.event_kind_header);
+
+    if let Some(token) = req.token {
+        let signature = compute_signature(token, req.body);
+        request = request
+            .header("Authorization", format!("Bearer {token}"))
+            .header("X-Registry-Signature-256", format!("sha256={signature}"));
+    }
+
+    let response = request
+        .body(req.body.to_vec())
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+
+    if !response.status().is_success() {
+        return Err(format!("returned status {}", response.status()));
+    }
+
+    Ok(())
+}
+
+async fn send_with_retries(req: &DeliveryRequest<'_>, max_retries: u32) -> Result<(), String> {
+    let mut first_err: Option<String> = None;
+    let mut last_err: Option<String> = None;
+    let mut attempts: u32 = 0;
+
+    for attempt in 0..=max_retries {
+        if attempt > 0 {
+            tokio::time::sleep(backoff_for_attempt(attempt)).await;
+        }
+
+        attempts += 1;
+        match send_request(req).await {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                if first_err.is_none() {
+                    first_err = Some(e.clone());
+                }
+                last_err = Some(e);
+            }
+        }
+    }
+
+    Err(format_retry_failure(
+        attempts,
+        first_err.as_deref(),
+        last_err.as_deref(),
+    ))
+}
+
+fn format_retry_failure(attempts: u32, first: Option<&str>, last: Option<&str>) -> String {
+    match (first, last) {
+        (None, _) | (_, None) => format!("after {attempts} attempt(s): unknown error"),
+        (Some(f), Some(l)) if f == l => {
+            format!("after {attempts} attempt(s): {f}")
+        }
+        (Some(f), Some(l)) => {
+            format!("after {attempts} attempt(s); first error: {f}; last error: {l}")
+        }
+    }
+}
+
+fn backoff_for_attempt(attempt: u32) -> Duration {
+    Duration::from_millis(100u64.saturating_mul(2u64.saturating_pow(attempt - 1)))
 }
 
 impl EventDispatcher {

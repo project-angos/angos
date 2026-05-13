@@ -1,4 +1,5 @@
 mod common;
+mod delivery;
 mod dispatch;
 mod matches_event;
 mod policy_async;

@@ -5,11 +5,11 @@ use reqwest::Client;
 use url::Url;
 use uuid::Uuid;
 
-use super::super::{EventDispatcher, endpoint::WebhookEndpoint};
 use crate::{
     configuration::RegexPattern,
     event_webhook::{
         config::{DeliveryPolicy, EventWebhookConfig},
+        dispatcher::{EventDispatcher, WebhookEndpoint},
         event::{Event, EventKind},
     },
     secret::Secret,
