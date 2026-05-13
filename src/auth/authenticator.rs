@@ -452,6 +452,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_authenticate_request_with_invalid_basic_auth() {
+        metrics_provider::init_for_tests();
         let salt = SaltString::generate(OsRng);
         let config = Params::default();
         let argon = Argon2::new(Algorithm::Argon2id, Version::V0x13, config);
@@ -478,9 +479,7 @@ mod tests {
 
         let result = authenticator.authenticate_request(&parts, None).await;
 
-        assert!(result.is_ok());
-        let identity = result.unwrap();
-        assert!(identity.username.is_none());
+        assert!(matches!(result, Err(Error::Unauthorized(_))));
     }
 
     #[test]

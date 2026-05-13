@@ -103,7 +103,7 @@ Angos implements fail-closed authorization for critical security decisions:
 | Webhook not configured              | Not evaluated, access continues    |
 | Invalid mTLS certificate            | TLS handshake fails                |
 | Invalid OIDC token                  | 401 Unauthorized (fail-closed)     |
-| Invalid Basic Auth password         | Proceeds as anonymous identity     |
+| Invalid Basic Auth password         | 401 Unauthorized (fail-closed)     |
 | CEL evaluation error                | Rule skipped, evaluation continues |
 | CEL non-boolean result (any mode)   | Access denied (fail-closed)        |
 

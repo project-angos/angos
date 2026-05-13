@@ -1,8 +1,13 @@
+use argon2::{
+    Algorithm, Argon2, Params, PasswordHasher, Version,
+    password_hash::{SaltString, rand_core::OsRng},
+};
+use base64::{Engine, prelude::BASE64_STANDARD};
 use http_body_util::{BodyExt, Full};
 use hyper::{
     Request, Response, StatusCode,
     body::Bytes,
-    header::{CONTENT_TYPE, WWW_AUTHENTICATE},
+    header::{AUTHORIZATION, CONTENT_TYPE, WWW_AUTHENTICATE},
 };
 use opentelemetry::trace::TracerProvider;
 use opentelemetry_sdk::trace::{Sampler, SdkTracerProvider};
@@ -25,8 +30,12 @@ use crate::{
             observability::{handle_healthz, handle_metrics},
         },
         response_body::ResponseBody,
-        server_context::tests::{TestConfigOptions, create_test_server_context_with},
+        server_context::tests::{
+            TestConfigOptions, create_test_server_context_from_config,
+            create_test_server_context_with,
+        },
     },
+    configuration::Configuration,
     identity::{Action, ClientIdentity},
     metrics_provider,
     oci::{Digest, Namespace},
@@ -435,6 +444,61 @@ async fn test_authenticate_and_authorize_returns_client_identity() {
 
     let identity: ClientIdentity = result.unwrap();
     assert!(identity.username.is_none());
+}
+
+#[tokio::test]
+async fn bad_basic_auth_returns_http_401() {
+    metrics_provider::init_for_tests();
+    let salt = SaltString::generate(OsRng);
+    let argon = Argon2::new(Algorithm::Argon2id, Version::V0x13, Params::default());
+    let password_hash = argon.hash_password(b"testpass", &salt).unwrap().to_string();
+    let toml = format!(
+        r#"
+        [blob_store.fs]
+        root_dir = "/tmp/test"
+
+        [metadata_store.fs]
+        root_dir = "/tmp/test"
+
+        [cache.memory]
+
+        [server]
+        bind_address = "0.0.0.0"
+        port = 8000
+
+        [global]
+        update_pull_time = false
+        max_concurrent_cache_jobs = 10
+
+        [global.access_policy]
+        default = "allow"
+        rules = []
+
+        [auth.identity.testuser]
+        username = "testuser"
+        password = "{password_hash}"
+    "#
+    );
+    let config: Configuration = toml::from_str(&toml).unwrap();
+    let context = create_test_server_context_from_config(&config).await;
+    let credentials = BASE64_STANDARD.encode("testuser:wrongpass");
+    let request = Request::builder()
+        .uri("/v2/")
+        .header(AUTHORIZATION, format!("Basic {credentials}"))
+        .body(())
+        .unwrap();
+    let (parts, ()) = request.into_parts();
+
+    let error = authenticate_and_authorize(&context, &Action::ApiVersion, &parts)
+        .await
+        .unwrap_err();
+    let response = error_to_response(&error, None);
+
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        response.headers().get(WWW_AUTHENTICATE).unwrap(),
+        r#"Basic realm="Simple Registry", charset="UTF-8""#
+    );
 }
 
 async fn create_test_context_with_allow_policy() -> ServerContext {

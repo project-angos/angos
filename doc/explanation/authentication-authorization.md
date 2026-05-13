@@ -53,13 +53,13 @@ Each method handles missing vs invalid credentials differently:
 |------------|----------------|---------------------|
 | mTLS       | Continue       | **TLS handshake fails** |
 | OIDC       | Continue       | **Reject immediately** |
-| Basic Auth | Continue       | Anonymous identity  |
+| Basic Auth | Continue       | **Reject immediately** |
 
 This means:
 - Missing credentials → try next method
 - Invalid mTLS certificate → connection rejected at TLS layer
 - Invalid OIDC token → immediate 401 (fail-closed)
-- Invalid Basic Auth password → anonymous identity (fail-open)
+- Invalid Basic Auth password → immediate 401 (fail-closed)
 
 ---
 

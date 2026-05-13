@@ -105,7 +105,9 @@ impl AuthMiddleware for BasicAuthValidator {
                 identity.username = Some(username);
                 Ok(AuthResult::Authenticated)
             }
-            None => Ok(AuthResult::NoCredentials),
+            None => Err(Error::Unauthorized(
+                "Invalid basic auth credentials".to_string(),
+            )),
         }
     }
 }
