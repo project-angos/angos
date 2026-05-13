@@ -1,55 +1,14 @@
+use base64::{Engine, prelude::BASE64_STANDARD};
 use hyper::{
     Request,
-    header::{HeaderValue, RANGE, USER_AGENT},
+    header::{ACCEPT, AUTHORIZATION, HeaderName, HeaderValue, RANGE},
 };
 
-use super::*;
-use crate::command::server::response_body::ResponseBody;
-
-#[test]
-fn test_get_header_exists() {
-    let request = Request::builder()
-        .header(USER_AGENT, "test-agent/1.0")
-        .body(())
-        .unwrap();
-    let (parts, ()) = request.into_parts();
-
-    let result = parts.get_header(USER_AGENT);
-    assert_eq!(result, Some("test-agent/1.0".to_string()));
-}
-
-#[test]
-fn test_get_header_missing() {
-    let request = Request::builder().body(()).unwrap();
-    let (parts, ()) = request.into_parts();
-
-    let result = parts.get_header(USER_AGENT);
-    assert_eq!(result, None);
-}
-
-#[test]
-fn test_get_header_custom_header() {
-    let request = Request::builder()
-        .header("X-Custom-Header", "custom-value")
-        .body(())
-        .unwrap();
-    let (parts, ()) = request.into_parts();
-
-    let result = parts.get_header("x-custom-header");
-    assert_eq!(result, Some("custom-value".to_string()));
-}
-
-#[test]
-fn test_get_header_invalid_utf8() {
-    let request = Request::builder()
-        .header("X-Test", HeaderValue::from_bytes(&[0xFF, 0xFE]).unwrap())
-        .body(())
-        .unwrap();
-    let (parts, ()) = request.into_parts();
-
-    let result = parts.get_header("x-test");
-    assert_eq!(result, None);
-}
+use crate::command::server::{
+    error::Error,
+    request::{accepted_content_types, basic_auth, bearer_token, range},
+    response_body::ResponseBody,
+};
 
 #[test]
 fn test_range_with_bytes_prefix() {
@@ -59,7 +18,7 @@ fn test_range_with_bytes_prefix() {
         .unwrap();
     let (parts, ()) = request.into_parts();
 
-    let range = parts.range(RANGE).unwrap().unwrap();
+    let range = range(&parts.headers, RANGE).unwrap().unwrap();
     assert_eq!(range, (0, Some(499)));
 }
 
@@ -71,7 +30,7 @@ fn test_range_without_bytes_prefix() {
         .unwrap();
     let (parts, ()) = request.into_parts();
 
-    let range = parts.range(RANGE).unwrap().unwrap();
+    let range = range(&parts.headers, RANGE).unwrap().unwrap();
     assert_eq!(range, (100, Some(200)));
 }
 
@@ -83,7 +42,7 @@ fn test_range_no_end() {
         .unwrap();
     let (parts, ()) = request.into_parts();
 
-    let range = parts.range(RANGE).unwrap().unwrap();
+    let range = range(&parts.headers, RANGE).unwrap().unwrap();
     assert_eq!(range, (0, None));
 }
 
@@ -95,7 +54,7 @@ fn test_range_large_numbers() {
         .unwrap();
     let (parts, ()) = request.into_parts();
 
-    let range = parts.range(RANGE).unwrap().unwrap();
+    let range = range(&parts.headers, RANGE).unwrap().unwrap();
     assert_eq!(range, (1_000_000_000, Some(2_000_000_000)));
 }
 
@@ -104,7 +63,7 @@ fn test_range_missing_header() {
     let request = Request::builder().body(()).unwrap();
     let (parts, ()) = request.into_parts();
 
-    let range = parts.range(RANGE).unwrap();
+    let range = range(&parts.headers, RANGE).unwrap();
     assert_eq!(range, None);
 }
 
@@ -117,7 +76,7 @@ fn test_range_custom_header_name() {
         .unwrap();
     let (parts, ()) = request.into_parts();
 
-    let range = parts.range(custom_header).unwrap().unwrap();
+    let range = range(&parts.headers, custom_header).unwrap().unwrap();
     assert_eq!(range, (50, Some(100)));
 }
 
@@ -129,7 +88,7 @@ fn test_range_start_greater_than_end() {
         .unwrap();
     let (parts, ()) = request.into_parts();
 
-    let result = parts.range(RANGE);
+    let result = range(&parts.headers, RANGE);
     assert!(result.is_err());
     match result.unwrap_err() {
         Error::RangeNotSatisfiable(msg) => {
@@ -147,7 +106,7 @@ fn test_range_missing_start() {
         .unwrap();
     let (parts, ()) = request.into_parts();
 
-    let result = parts.range(RANGE);
+    let result = range(&parts.headers, RANGE);
     assert!(result.is_err());
     match result.unwrap_err() {
         Error::RangeNotSatisfiable(_) => {}
@@ -163,7 +122,7 @@ fn test_range_invalid_format() {
         .unwrap();
     let (parts, ()) = request.into_parts();
 
-    let result = parts.range(RANGE);
+    let result = range(&parts.headers, RANGE);
     assert!(result.is_err());
     match result.unwrap_err() {
         Error::RangeNotSatisfiable(msg) => {
@@ -181,7 +140,7 @@ fn test_range_non_numeric_start() {
         .unwrap();
     let (parts, ()) = request.into_parts();
 
-    let result = parts.range(RANGE);
+    let result = range(&parts.headers, RANGE);
     assert!(result.is_err());
 }
 
@@ -193,7 +152,7 @@ fn test_range_non_numeric_end() {
         .unwrap();
     let (parts, ()) = request.into_parts();
 
-    let result = parts.range(RANGE);
+    let result = range(&parts.headers, RANGE);
     assert!(result.is_err());
     match result.unwrap_err() {
         Error::RangeNotSatisfiable(msg) => {
@@ -213,7 +172,7 @@ fn test_range_overflow() {
         .unwrap();
     let (parts, ()) = request.into_parts();
 
-    let result = parts.range(RANGE);
+    let result = range(&parts.headers, RANGE);
     assert!(result.is_err());
 }
 
@@ -226,7 +185,7 @@ fn test_accepted_content_types_multiple() {
     let request = request.body(ResponseBody::empty()).unwrap();
     let (parts, _) = request.into_parts();
 
-    let result = parts.accepted_content_types();
+    let result = accepted_content_types(&parts.headers);
     assert_eq!(
         result,
         vec!["application/json", "application/xml", "text/plain"]
@@ -241,7 +200,7 @@ fn test_accepted_content_types_single() {
         .unwrap();
     let (parts, ()) = request.into_parts();
 
-    let result = parts.accepted_content_types();
+    let result = accepted_content_types(&parts.headers);
     assert_eq!(result, vec!["application/json"]);
 }
 
@@ -250,7 +209,7 @@ fn test_accepted_content_types_empty() {
     let request = Request::builder().body(()).unwrap();
     let (parts, ()) = request.into_parts();
 
-    let result = parts.accepted_content_types();
+    let result = accepted_content_types(&parts.headers);
     assert!(result.is_empty());
 }
 
@@ -263,7 +222,7 @@ fn test_accepted_content_types_with_quality() {
         .unwrap();
     let (parts, ()) = request.into_parts();
 
-    let result = parts.accepted_content_types();
+    let result = accepted_content_types(&parts.headers);
     assert_eq!(result, vec!["application/json;q=0.9", "text/html;q=0.8"]);
 }
 
@@ -275,7 +234,7 @@ fn test_bearer_token_valid() {
         .unwrap();
     let (parts, ()) = request.into_parts();
 
-    let token = parts.bearer_token();
+    let token = bearer_token(&parts.headers);
     assert_eq!(token, Some("test-token-123".to_string()));
 }
 
@@ -290,7 +249,7 @@ fn test_bearer_token_with_special_characters() {
         .unwrap();
     let (parts, ()) = request.into_parts();
 
-    let token = parts.bearer_token();
+    let token = bearer_token(&parts.headers);
     assert_eq!(
         token,
         Some("eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.test".to_string())
@@ -302,7 +261,7 @@ fn test_bearer_token_missing() {
     let request = Request::builder().body(()).unwrap();
     let (parts, ()) = request.into_parts();
 
-    let token = parts.bearer_token();
+    let token = bearer_token(&parts.headers);
     assert_eq!(token, None);
 }
 
@@ -314,7 +273,7 @@ fn test_bearer_token_wrong_scheme() {
         .unwrap();
     let (parts, ()) = request.into_parts();
 
-    let token = parts.bearer_token();
+    let token = bearer_token(&parts.headers);
     assert_eq!(token, None);
 }
 
@@ -326,7 +285,7 @@ fn test_bearer_token_case_sensitive() {
         .unwrap();
     let (parts, ()) = request.into_parts();
 
-    let token = parts.bearer_token();
+    let token = bearer_token(&parts.headers);
     assert_eq!(token, None);
 }
 
@@ -338,7 +297,7 @@ fn test_bearer_token_empty() {
         .unwrap();
     let (parts, ()) = request.into_parts();
 
-    let token = parts.bearer_token();
+    let token = bearer_token(&parts.headers);
     assert_eq!(token, Some(String::new()));
 }
 
@@ -351,7 +310,7 @@ fn test_basic_auth_valid() {
         .unwrap();
     let (parts, ()) = request.into_parts();
 
-    let auth = parts.basic_auth();
+    let auth = basic_auth(&parts.headers);
     assert_eq!(auth, Some(("username".to_string(), "password".to_string())));
 }
 
@@ -364,7 +323,7 @@ fn test_basic_auth_with_special_characters() {
         .unwrap();
     let (parts, ()) = request.into_parts();
 
-    let auth = parts.basic_auth();
+    let auth = basic_auth(&parts.headers);
     assert_eq!(
         auth,
         Some(("user@example.com".to_string(), "p@ssw0rd!".to_string()))
@@ -380,7 +339,7 @@ fn test_basic_auth_with_colon_in_password() {
         .unwrap();
     let (parts, ()) = request.into_parts();
 
-    let auth = parts.basic_auth();
+    let auth = basic_auth(&parts.headers);
     assert_eq!(auth, Some(("user".to_string(), "pass:word".to_string())));
 }
 
@@ -393,7 +352,7 @@ fn test_basic_auth_empty_password() {
         .unwrap();
     let (parts, ()) = request.into_parts();
 
-    let auth = parts.basic_auth();
+    let auth = basic_auth(&parts.headers);
     assert_eq!(auth, Some(("username".to_string(), String::new())));
 }
 
@@ -402,7 +361,7 @@ fn test_basic_auth_missing() {
     let request = Request::builder().body(()).unwrap();
     let (parts, ()) = request.into_parts();
 
-    let auth = parts.basic_auth();
+    let auth = basic_auth(&parts.headers);
     assert_eq!(auth, None);
 }
 
@@ -414,7 +373,7 @@ fn test_basic_auth_wrong_scheme() {
         .unwrap();
     let (parts, ()) = request.into_parts();
 
-    let auth = parts.basic_auth();
+    let auth = basic_auth(&parts.headers);
     assert_eq!(auth, None);
 }
 
@@ -426,7 +385,7 @@ fn test_basic_auth_invalid_base64() {
         .unwrap();
     let (parts, ()) = request.into_parts();
 
-    let auth = parts.basic_auth();
+    let auth = basic_auth(&parts.headers);
     assert_eq!(auth, None);
 }
 
@@ -440,7 +399,7 @@ fn test_basic_auth_invalid_utf8() {
         .unwrap();
     let (parts, ()) = request.into_parts();
 
-    let auth = parts.basic_auth();
+    let auth = basic_auth(&parts.headers);
     assert_eq!(auth, None);
 }
 
@@ -453,7 +412,7 @@ fn test_basic_auth_no_colon() {
         .unwrap();
     let (parts, ()) = request.into_parts();
 
-    let auth = parts.basic_auth();
+    let auth = basic_auth(&parts.headers);
     assert_eq!(auth, None);
 }
 
@@ -466,6 +425,6 @@ fn test_basic_auth_case_sensitive() {
         .unwrap();
     let (parts, ()) = request.into_parts();
 
-    let auth = parts.basic_auth();
+    let auth = basic_auth(&parts.headers);
     assert_eq!(auth, None);
 }

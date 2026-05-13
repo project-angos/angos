@@ -16,7 +16,7 @@ use super::{AuthMiddleware, AuthResult};
 use crate::{
     auth::oidc::provider::{generic, github},
     cache::Cache,
-    command::server::{Error, HeaderExt},
+    command::server::{Error, basic_auth, bearer_token},
     identity::{ClientIdentity, OidcClaims},
 };
 
@@ -114,11 +114,11 @@ impl AuthMiddleware for OidcValidator {
 ///   (the OIDC token is in the password field; the username gates which provider claims it).
 /// - Anything else → `None`.
 fn extract_oidc_credential(parts: &Parts, provider_name: &str) -> Option<String> {
-    if let Some(bearer_token) = parts.bearer_token() {
+    if let Some(bearer_token) = bearer_token(&parts.headers) {
         debug!("Found Bearer token for OIDC provider '{provider_name}'");
         return Some(bearer_token);
     }
-    if let Some((username, password)) = parts.basic_auth() {
+    if let Some((username, password)) = basic_auth(&parts.headers) {
         debug!("Found Basic auth credentials with username '{username}'");
         if username == provider_name {
             return Some(password);
