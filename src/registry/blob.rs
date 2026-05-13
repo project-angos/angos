@@ -10,7 +10,9 @@ use crate::{
     registry::{
         DOCKER_CONTENT_DIGEST, Error, Registry, Repository,
         blob_store::{BoxedReader, UploadStore},
-        metadata_store::{self, BlobIndexOperation, MetadataStoreExt, link_kind::LinkKind},
+        metadata_store::{
+            self, BlobIndexOperation, MetadataStore, MetadataStoreExt, link_kind::LinkKind,
+        },
         task_queue,
     },
 };
@@ -156,12 +158,21 @@ impl Registry {
 
     async fn cache_blob(
         upload_store: Arc<dyn UploadStore + Send + Sync>,
+        metadata_store: Arc<dyn MetadataStore + Send + Sync>,
         stream: BoxedReader,
         namespace: Namespace,
         digest: Digest,
     ) -> Result<(), task_queue::Error> {
         debug!("Fetching blob: {digest}");
         Self::copy_blob(upload_store, stream, &namespace, &digest)
+            .await
+            .map_err(|e| task_queue::Error::TaskExecution(e.to_string()))?;
+        metadata_store
+            .update_blob_index(
+                namespace.as_ref(),
+                &digest,
+                BlobIndexOperation::Insert(LinkKind::Layer(digest.clone())),
+            )
             .await
             .map_err(|e| task_queue::Error::TaskExecution(e.to_string()))?;
         info!("Caching of {digest} completed");
@@ -209,6 +220,7 @@ impl Registry {
             &task_key,
             Self::cache_blob(
                 self.upload_store.clone(),
+                self.metadata_store.clone(),
                 caching_stream,
                 namespace.clone(),
                 digest.clone(),
@@ -343,6 +355,7 @@ mod tests {
             DOCKER_CONTENT_DIGEST,
             test_utils::{backends, create_test_blob},
         },
+        util::sha256,
     };
 
     #[tokio::test]
@@ -510,6 +523,52 @@ mod tests {
 
             let stored_content = registry.blob_store.read(&digest).await.unwrap();
             assert_eq!(stored_content, content);
+            test_case.cleanup().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn cache_blob_updates_namespace_blob_index() {
+        for test_case in backends() {
+            let registry = test_case.registry();
+            let namespace = Namespace::new("test-repo").unwrap();
+            let content = b"cached pull-through blob content";
+            let digest = sha256::digest(content);
+            let stream = Box::new(Cursor::new(content.to_vec()));
+
+            Registry::cache_blob(
+                registry.upload_store.clone(),
+                registry.metadata_store.clone(),
+                stream,
+                namespace.clone(),
+                digest.clone(),
+            )
+            .await
+            .unwrap();
+
+            let blob_index = registry
+                .metadata_store
+                .read_blob_index(&digest)
+                .await
+                .unwrap();
+            let namespace_links = blob_index.namespace.get(namespace.as_ref()).unwrap();
+            assert!(namespace_links.contains(&LinkKind::Layer(digest.clone())));
+
+            let repository = registry.get_repository_for_namespace(&namespace).unwrap();
+            let response = registry
+                .get_blob(repository, &[], &namespace, &digest, None)
+                .await
+                .unwrap();
+
+            match response {
+                GetBlobResponse::Reader { mut body, .. } => {
+                    let mut stored_content = Vec::new();
+                    body.read_to_end(&mut stored_content).await.unwrap();
+                    assert_eq!(stored_content, content);
+                }
+                GetBlobResponse::RangedReader { .. } => panic!("Expected Reader response"),
+                GetBlobResponse::Redirect { .. } => panic!("unexpected redirect from get_blob"),
+            }
             test_case.cleanup().await;
         }
     }
