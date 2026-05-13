@@ -184,7 +184,9 @@ impl Registry {
         self.upload_store
             .complete(namespace, &session_key, Some(digest))
             .await?;
-        self.upload_store.delete(namespace, &session_key).await?;
+        if let Err(error) = self.upload_store.delete(namespace, &session_key).await {
+            warn!("Failed to delete completed upload state: {error}");
+        }
 
         let repository = self.repository_name_for(namespace);
         let event = Event::new(EventKind::BlobPush, namespace.to_string(), repository)
@@ -228,19 +230,79 @@ impl Registry {
 
 #[cfg(test)]
 mod tests {
-    use std::io::Cursor;
+    use std::{io::Cursor, sync::Arc};
 
+    use async_trait::async_trait;
+    use hyper::header::{LOCATION, RANGE};
     use uuid::Uuid;
 
-    use super::*;
     use crate::{
-        oci::Namespace,
+        event_webhook::event::EventKind,
+        oci::{Digest, Namespace},
         registry::{
+            DOCKER_CONTENT_DIGEST, DOCKER_UPLOAD_UUID, Error, StartUploadResponse, blob_store,
+            blob_store::{BoxedReader, UploadStore, UploadSummary},
             path_builder,
-            test_utils::{FSRegistryTestCase, backends},
+            test_utils::{FSRegistryTestCase, RegistryTestCase, backends, create_test_registry},
         },
         util::sha256,
     };
+
+    struct DeleteFailingUploadStore {
+        inner: Arc<dyn UploadStore>,
+    }
+
+    #[async_trait]
+    impl UploadStore for DeleteFailingUploadStore {
+        async fn list(
+            &self,
+            namespace: &str,
+            n: u16,
+            continuation_token: Option<String>,
+        ) -> Result<(Vec<String>, Option<String>), blob_store::Error> {
+            self.inner.list(namespace, n, continuation_token).await
+        }
+
+        async fn create(&self, namespace: &str, uuid: &str) -> Result<String, blob_store::Error> {
+            self.inner.create(namespace, uuid).await
+        }
+
+        async fn write(
+            &self,
+            namespace: &str,
+            uuid: &str,
+            stream: BoxedReader,
+            content_length: u64,
+            append: bool,
+        ) -> Result<(Digest, u64), blob_store::Error> {
+            self.inner
+                .write(namespace, uuid, stream, content_length, append)
+                .await
+        }
+
+        async fn summary(
+            &self,
+            namespace: &str,
+            uuid: &str,
+        ) -> Result<UploadSummary, blob_store::Error> {
+            self.inner.summary(namespace, uuid).await
+        }
+
+        async fn complete(
+            &self,
+            namespace: &str,
+            uuid: &str,
+            digest: Option<&Digest>,
+        ) -> Result<Digest, blob_store::Error> {
+            self.inner.complete(namespace, uuid, digest).await
+        }
+
+        async fn delete(&self, _namespace: &str, _uuid: &str) -> Result<(), blob_store::Error> {
+            Err(blob_store::Error::StorageBackend(
+                "delete failed".to_string(),
+            ))
+        }
+    }
 
     #[tokio::test]
     async fn test_start_upload() {
@@ -374,15 +436,67 @@ mod tests {
                 expected_digest.to_string()
             );
             assert_eq!(response.events.len(), 1);
-            assert!(matches!(
-                response.events[0].kind,
-                crate::event_webhook::event::EventKind::BlobPush
-            ));
+            assert!(matches!(response.events[0].kind, EventKind::BlobPush));
 
             let stored_content = registry.blob_store.read(&expected_digest).await.unwrap();
             assert_eq!(stored_content, content);
             test_case.cleanup().await;
         }
+    }
+
+    #[tokio::test]
+    async fn test_complete_upload_succeeds_when_cleanup_delete_fails() {
+        let test_case = FSRegistryTestCase::new();
+        let registry = create_test_registry(
+            RegistryTestCase::blob_store(&test_case),
+            Arc::new(DeleteFailingUploadStore {
+                inner: test_case.upload_store(),
+            }),
+            None,
+            test_case.metadata_store(),
+        );
+        let namespace = &Namespace::new("test-repo").unwrap();
+        let content = b"test complete content despite cleanup failure";
+        let session_id = Uuid::new_v4();
+
+        registry
+            .upload_store
+            .create(namespace, &session_id.to_string())
+            .await
+            .unwrap();
+
+        registry
+            .patch_upload(
+                namespace,
+                session_id,
+                None,
+                content.len() as u64,
+                Cursor::new(content),
+            )
+            .await
+            .unwrap();
+
+        let expected_digest = sha256::digest(content);
+        let response = registry
+            .complete_upload(
+                None,
+                namespace,
+                session_id,
+                &expected_digest,
+                0,
+                Cursor::new(Vec::new()),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            response.headers[DOCKER_CONTENT_DIGEST],
+            expected_digest.to_string()
+        );
+        assert_eq!(
+            registry.blob_store.read(&expected_digest).await.unwrap(),
+            content
+        );
     }
 
     #[tokio::test]
@@ -507,7 +621,7 @@ mod tests {
                 .await
                 .unwrap();
 
-            let wrong_digest = crate::oci::Digest::from_str(
+            let wrong_digest = Digest::from_str(
                 "sha256:0000000000000000000000000000000000000000000000000000000000000000",
             )
             .unwrap();
