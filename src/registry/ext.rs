@@ -464,7 +464,11 @@ impl Registry {
             let mut referrers: Vec<ReferrerInfo> =
                 docker_referrers.remove(&digest).unwrap_or_default();
 
-            if let Ok(oci_referrers) = self.list_referrers(namespace, &digest, None).await {
+            if let Ok(oci_referrers) = self
+                .metadata_store
+                .list_referrers(namespace, &digest, None)
+                .await
+            {
                 referrers.extend(oci_referrers.into_iter().map(ReferrerInfo::from));
             }
 
