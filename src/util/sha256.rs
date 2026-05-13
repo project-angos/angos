@@ -6,6 +6,7 @@ pub fn hex(input: impl AsRef<[u8]>) -> String {
     hex::encode(Sha256::digest(input.as_ref()))
 }
 
+#[cfg(test)]
 pub fn digest(input: impl AsRef<[u8]>) -> Digest {
     Digest::Sha256(hex(input).into())
 }

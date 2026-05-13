@@ -67,7 +67,7 @@ impl Authenticator {
         );
 
         let mtls_validator = MtlsValidator::new();
-        let oidc_validators = Self::build_oidc_validators(auth_config, oidc_client, cache)?;
+        let oidc_validators = Self::build_oidc_validators(auth_config, &oidc_client, cache);
         let basic_auth_validator = BasicAuthValidator::new(&auth_config.identity);
 
         Ok(Self {
@@ -79,19 +79,23 @@ impl Authenticator {
 
     fn build_oidc_validators(
         auth_config: &AuthConfig,
-        client: Arc<Client>,
+        client: &Arc<Client>,
         cache: &Arc<Cache>,
-    ) -> Result<OidcValidators, Error> {
+    ) -> OidcValidators {
         let mut validators = Vec::with_capacity(auth_config.oidc.len());
 
         for (name, oidc_config) in &auth_config.oidc {
-            let validator =
-                OidcValidator::new(name.clone(), oidc_config, client.clone(), cache.clone())?;
+            let validator = OidcValidator::new(
+                name.clone(),
+                oidc_config,
+                Arc::clone(client),
+                Arc::clone(cache),
+            );
             validators.push((name.clone(), Arc::new(validator) as Arc<dyn AuthMiddleware>));
         }
 
         validators.sort_by(|a, b| a.0.cmp(&b.0));
-        Ok(validators)
+        validators
     }
 
     /// Authentication order: mTLS → OIDC → Basic Auth
@@ -333,10 +337,9 @@ mod tests {
         let cache = cache::Config::Memory.to_backend().unwrap();
 
         let validators =
-            Authenticator::build_oidc_validators(&auth_config, test_http_client(), &cache);
+            Authenticator::build_oidc_validators(&auth_config, &test_http_client(), &cache);
 
-        assert!(validators.is_ok());
-        assert!(validators.unwrap().is_empty());
+        assert!(validators.is_empty());
     }
 
     #[test]
@@ -351,10 +354,8 @@ mod tests {
         let cache = cache::Config::Memory.to_backend().unwrap();
 
         let validators =
-            Authenticator::build_oidc_validators(&config.auth, test_http_client(), &cache);
+            Authenticator::build_oidc_validators(&config.auth, &test_http_client(), &cache);
 
-        assert!(validators.is_ok());
-        let validators = validators.unwrap();
         assert_eq!(validators.len(), 1);
         assert_eq!(validators[0].0, "github");
     }
@@ -372,10 +373,8 @@ mod tests {
         let cache = cache::Config::Memory.to_backend().unwrap();
 
         let validators =
-            Authenticator::build_oidc_validators(&config.auth, test_http_client(), &cache);
+            Authenticator::build_oidc_validators(&config.auth, &test_http_client(), &cache);
 
-        assert!(validators.is_ok());
-        let validators = validators.unwrap();
         assert_eq!(validators.len(), 1);
         assert_eq!(validators[0].0, "custom");
     }
@@ -396,10 +395,8 @@ mod tests {
         let cache = cache::Config::Memory.to_backend().unwrap();
 
         let validators =
-            Authenticator::build_oidc_validators(&config.auth, test_http_client(), &cache);
+            Authenticator::build_oidc_validators(&config.auth, &test_http_client(), &cache);
 
-        assert!(validators.is_ok());
-        let validators = validators.unwrap();
         assert_eq!(validators.len(), 2);
     }
 
@@ -553,7 +550,7 @@ mod tests {
         let cache = cache::Config::Memory.to_backend().unwrap();
 
         let validators =
-            Authenticator::build_oidc_validators(&config.auth, test_http_client(), &cache).unwrap();
+            Authenticator::build_oidc_validators(&config.auth, &test_http_client(), &cache);
 
         assert_eq!(validators.len(), 2);
         assert_eq!(validators[0].0, "custom");

@@ -49,15 +49,15 @@ impl OidcValidator {
         provider_config: &Config,
         client: Arc<Client>,
         cache: Arc<Cache>,
-    ) -> Result<Self, Error> {
+    ) -> Self {
         let provider = provider_config.to_backend();
 
-        Ok(Self {
+        Self {
             provider_name,
             provider,
             client,
             cache,
-        })
+        }
     }
 
     pub async fn validate_token(&self, token: &str) -> Result<OidcClaims, Error> {
@@ -276,8 +276,6 @@ mod tests {
         let validator =
             OidcValidator::new("test-provider".to_string(), &config, client.clone(), cache);
 
-        assert!(validator.is_ok());
-        let validator = validator.unwrap();
         assert_eq!(validator.provider_name, "test-provider");
         assert_eq!(validator.provider.issuer(), "https://auth.example.com");
         assert!(Arc::ptr_eq(&validator.client, &client));
@@ -298,8 +296,6 @@ mod tests {
         let validator =
             OidcValidator::new("github".to_string(), &config, test_http_client(), cache);
 
-        assert!(validator.is_ok());
-        let validator = validator.unwrap();
         assert_eq!(validator.provider_name, "github");
         assert_eq!(
             validator.provider.issuer(),
@@ -324,8 +320,7 @@ mod tests {
             &config,
             test_http_client(),
             cache,
-        )
-        .unwrap();
+        );
 
         let token = make_test_token(&mock_server.uri());
         let result = validator.validate_token(&token).await;
@@ -354,8 +349,7 @@ mod tests {
             &config,
             test_http_client(),
             cache,
-        )
-        .unwrap();
+        );
 
         let result = validator.validate_token("invalid-token").await;
 
@@ -379,8 +373,7 @@ mod tests {
             &config,
             test_http_client(),
             cache,
-        )
-        .unwrap();
+        );
 
         let token = make_test_token(&mock_server.uri());
         let request = Request::builder()
@@ -414,7 +407,7 @@ mod tests {
         let config = build_config(&mock_server);
         let cache = cache::Config::Memory.to_backend().unwrap();
         let validator =
-            OidcValidator::new("github".to_string(), &config, test_http_client(), cache).unwrap();
+            OidcValidator::new("github".to_string(), &config, test_http_client(), cache);
 
         let token = make_test_token(&mock_server.uri());
         let credentials = BASE64_STANDARD.encode(format!("github:{token}"));
@@ -446,7 +439,7 @@ mod tests {
 
         let cache = cache::Config::Memory.to_backend().unwrap();
         let validator =
-            OidcValidator::new("github".to_string(), &config, test_http_client(), cache).unwrap();
+            OidcValidator::new("github".to_string(), &config, test_http_client(), cache);
 
         let credentials = BASE64_STANDARD.encode("wrong-provider:token");
         let request = Request::builder()
@@ -481,8 +474,7 @@ mod tests {
             &config,
             test_http_client(),
             cache,
-        )
-        .unwrap();
+        );
 
         let request = Request::builder().body(()).unwrap();
 
@@ -513,8 +505,7 @@ mod tests {
             &config,
             test_http_client(),
             cache,
-        )
-        .unwrap();
+        );
 
         let request = Request::builder()
             .header(AUTHORIZATION, "Bearer invalid-token")
@@ -547,8 +538,7 @@ mod tests {
             &config,
             test_http_client(),
             cache,
-        )
-        .unwrap();
+        );
 
         let mut claims = HashMap::new();
         claims.insert("iss".to_string(), json!(mock_server.uri()));

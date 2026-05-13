@@ -129,10 +129,10 @@ impl Command {
     }
 
     async fn scrub_blobs(&mut self) -> Result<(), Error> {
-        if let Some(checker) = &self.blob_checker {
-            if let Err(e) = checker.check_all(self.sink.as_mut()).await {
-                tracing::warn!("Blob scrub checker failed: {e}");
-            }
+        if let Some(checker) = &self.blob_checker
+            && let Err(e) = checker.check_all(self.sink.as_mut()).await
+        {
+            tracing::warn!("Blob scrub checker failed: {e}");
         }
         Ok(())
     }

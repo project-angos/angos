@@ -7,32 +7,42 @@ pub struct HttpClientBuilder {
 }
 
 impl HttpClientBuilder {
+    #[must_use]
     pub fn new() -> Self {
         Self {
             builder: Client::builder(),
         }
     }
 
+    #[must_use]
     pub fn timeout(mut self, timeout: Duration) -> Self {
         self.builder = self.builder.timeout(timeout);
         self
     }
 
+    #[must_use]
     pub fn redirect(mut self, policy: Policy) -> Self {
         self.builder = self.builder.redirect(policy);
         self
     }
 
+    #[must_use]
     pub fn rustls_tls(mut self) -> Self {
         self.builder = self.builder.use_rustls_tls();
         self
     }
 
+    #[must_use]
     pub fn default_headers(mut self, headers: HeaderMap) -> Self {
         self.builder = self.builder.default_headers(headers);
         self
     }
 
+    /// Adds optional CA and client certificate files to the client builder.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a configured certificate/key file cannot be read or parsed.
     pub fn tls_files(
         mut self,
         server_ca_bundle: Option<&Path>,
@@ -52,6 +62,11 @@ impl HttpClientBuilder {
         Ok(self)
     }
 
+    /// Builds the configured HTTP client.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the underlying reqwest client cannot be built.
     pub fn build(self) -> Result<Client, String> {
         self.builder
             .build()

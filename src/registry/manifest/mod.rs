@@ -78,7 +78,7 @@ impl Registry {
         }
 
         if let Ok(meta) = local {
-            if !self
+            let use_local = !self
                 .needs_upstream_pull_manifest(
                     repository,
                     accepted_types,
@@ -87,8 +87,9 @@ impl Registry {
                     is_tag_immutable,
                     &meta.digest,
                 )
-                .await?
-            {
+                .await?;
+
+            if use_local {
                 return Ok(HeadManifestResponse {
                     headers: head_manifest_headers(&meta),
                 });
@@ -174,7 +175,7 @@ impl Registry {
         }
 
         if let Ok(manifest) = local {
-            if !self
+            let use_local = !self
                 .needs_upstream_pull_manifest(
                     repository,
                     accepted_types,
@@ -183,8 +184,9 @@ impl Registry {
                     is_tag_immutable,
                     &manifest.digest,
                 )
-                .await?
-            {
+                .await?;
+
+            if use_local {
                 return Ok(manifest);
             }
         }

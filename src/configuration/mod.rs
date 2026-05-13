@@ -79,23 +79,23 @@ impl<'de> Deserialize<'de> for Configuration {
                         "global" => assign_once(&mut global, "global", map.next_value()?)?,
                         "ui" => assign_once(&mut ui, "ui", map.next_value()?)?,
                         "cache" | "cache_store" => {
-                            assign_once(&mut cache, "cache", map.next_value()?)?
+                            assign_once(&mut cache, "cache", map.next_value()?)?;
                         }
                         "blob_store" | "storage" => {
-                            assign_once(&mut blob_store, "blob_store", map.next_value()?)?
+                            assign_once(&mut blob_store, "blob_store", map.next_value()?)?;
                         }
                         "metadata_store" => {
-                            assign_once(&mut metadata_store, "metadata_store", map.next_value()?)?
+                            assign_once(&mut metadata_store, "metadata_store", map.next_value()?)?;
                         }
                         "auth" => assign_once(&mut auth, "auth", map.next_value()?)?,
                         "repository" => {
-                            assign_once(&mut repository, "repository", map.next_value()?)?
+                            assign_once(&mut repository, "repository", map.next_value()?)?;
                         }
                         "event_webhook" => {
-                            assign_once(&mut event_webhook, "event_webhook", map.next_value()?)?
+                            assign_once(&mut event_webhook, "event_webhook", map.next_value()?)?;
                         }
                         "observability" => {
-                            assign_once(&mut observability, "observability", map.next_value()?)?
+                            assign_once(&mut observability, "observability", map.next_value()?)?;
                         }
                         _ => {
                             let _ = map.next_value::<de::IgnoredAny>()?;

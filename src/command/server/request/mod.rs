@@ -39,7 +39,7 @@ pub fn range(headers: &HeaderMap, header: HeaderName) -> Result<Option<(u64, Opt
 
     let captures = RANGE_RE
         .captures(&range_header)
-        .ok_or_else(|| invalid_range_header())?;
+        .ok_or_else(invalid_range_header)?;
 
     let (Some(start), end) = (captures.name("start"), captures.name("end")) else {
         return Err(invalid_range_header());

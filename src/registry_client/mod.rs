@@ -66,6 +66,11 @@ pub struct RegistryClient {
 }
 
 impl RegistryClient {
+    /// Creates a registry client for one upstream registry.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when TLS files cannot be loaded or the HTTP client cannot be built.
     pub fn new(config: &RegistryClientConfig, cache: Arc<Cache>) -> Result<Self, Error> {
         let client = HttpClientBuilder::new()
             .rustls_tls()
@@ -218,6 +223,12 @@ impl RegistryClient {
         request
     }
 
+    /// Sends a HEAD request for a blob and returns its digest and size.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the upstream request fails, rejects access, omits required
+    /// headers, or reports that the blob is unknown.
     pub async fn head_blob(
         &self,
         accepted_types: &[String],
@@ -235,6 +246,12 @@ impl RegistryClient {
         Ok((digest, size))
     }
 
+    /// Streams a blob from the upstream registry.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the upstream request fails, rejects access, omits required
+    /// headers, or reports that the blob is unknown.
     pub async fn get_blob(
         &self,
         accepted_types: &[String],
@@ -253,6 +270,12 @@ impl RegistryClient {
         Ok((total_length, Box::new(reader)))
     }
 
+    /// Sends a HEAD request for a manifest and returns its metadata.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the upstream request fails, rejects access, omits required
+    /// headers, or reports that the manifest is unknown.
     pub async fn head_manifest(
         &self,
         accepted_types: &[String],
@@ -271,6 +294,12 @@ impl RegistryClient {
         Ok((media_type, digest, size))
     }
 
+    /// Fetches a manifest body from the upstream registry.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the upstream request fails, rejects access, omits required
+    /// headers, reports that the manifest is unknown, or the response body cannot be read.
     pub async fn get_manifest(
         &self,
         accepted_types: &[String],

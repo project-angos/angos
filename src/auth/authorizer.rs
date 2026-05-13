@@ -516,9 +516,9 @@ mod tests {
     #[test]
     fn test_is_tag_mutable_with_global_setting() {
         let config = load_config(
-            r#"
+            r"
             immutable_tags = true
-        "#,
+        ",
         );
 
         let cache = cache::Config::Memory.to_backend().unwrap();

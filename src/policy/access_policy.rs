@@ -71,7 +71,7 @@ impl<'de> Deserialize<'de> for AccessPolicyConfig {
                     match key.as_str() {
                         "default" => assign_once(&mut default, "default", map.next_value()?)?,
                         "default_allow" => {
-                            assign_once(&mut default_allow, "default_allow", map.next_value()?)?
+                            assign_once(&mut default_allow, "default_allow", map.next_value()?)?;
                         }
                         "rules" => assign_once(&mut rules, "rules", map.next_value()?)?,
                         _ => {

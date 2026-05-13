@@ -114,10 +114,22 @@ fn parse_bearer_challenge(header: &str) -> Option<BearerChallenge> {
 }
 
 impl RegistryClient {
+    /// Builds an authentication header from an upstream authentication challenge.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the challenge is missing, unsupported, or when bearer
+    /// token acquisition fails.
     pub async fn authenticate(&self, response: &Response) -> Result<String, Error> {
         self.authenticate_with_cache(response, None).await
     }
 
+    /// Builds an authentication header, reusing cached bearer tokens when possible.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the challenge is missing, unsupported, or when bearer
+    /// token acquisition fails.
     pub async fn authenticate_with_cache(
         &self,
         response: &Response,

@@ -64,9 +64,9 @@ fn deprecated_fields_empty_when_no_deprecated_config() {
 #[test]
 fn deprecated_fields_contains_enable_redirect_when_set() {
     let config = config_toml(
-        r#"
+        r"
         enable_redirect = true
-        "#,
+        ",
     );
 
     let config = Configuration::load_from_str(&config).unwrap();
@@ -77,10 +77,10 @@ fn deprecated_fields_contains_enable_redirect_when_set() {
 #[test]
 fn deprecated_fields_not_present_when_new_redirect_fields_used() {
     let config = config_toml(
-        r#"
+        r"
         enable_blob_redirect = true
         enable_manifest_redirect = false
-        "#,
+        ",
     );
 
     let config = Configuration::load_from_str(&config).unwrap();

@@ -5,6 +5,7 @@ use crate::{
     registry_client::RegistryClient,
 };
 
+#[must_use]
 pub fn get_upstream_namespace(local_name: &str, upstream_name: &str) -> String {
     upstream_name
         .strip_prefix(local_name)

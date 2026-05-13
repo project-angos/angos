@@ -57,11 +57,15 @@ impl TaskQueue {
         let active_tasks = self.active_tasks.clone();
         let permits = self.permits.clone();
         self.handle.spawn(async move {
-            if let Ok(_permit) = permits.acquire_owned().await {
-                if let Err(error) = fut.await {
-                    warn!("Task '{reference}' failed: {error}");
-                }
+            let Ok(_permit) = permits.acquire_owned().await else {
+                active_tasks.lock().remove(&reference);
+                return;
+            };
+
+            if let Err(error) = fut.await {
+                warn!("Task '{reference}' failed: {error}");
             }
+
             active_tasks.lock().remove(&reference);
         });
     }
@@ -296,14 +300,14 @@ mod tests {
         queue.submit("ref-first", gated_task(&counter, first_rx));
         queue.submit("ref-second", gated_task(&counter, second_rx));
 
-        assert!(wait_until(|| counter.load(Ordering::SeqCst) == 1));
+        assert!(wait_until_async(|| counter.load(Ordering::SeqCst) == 1).await);
         assert_eq!(queue.active_task_count(), 2);
 
         let _ = first_tx.send(());
-        assert!(wait_until(|| counter.load(Ordering::SeqCst) == 2));
+        assert!(wait_until_async(|| counter.load(Ordering::SeqCst) == 2).await);
 
         let _ = second_tx.send(());
-        assert!(wait_until(|| queue.active_task_count() == 0));
+        assert!(wait_until_async(|| queue.active_task_count() == 0).await);
     }
 
     // After a task completes and its reference is removed from the active set,
