@@ -331,17 +331,21 @@ Password hashes are validated when the configuration is parsed. An invalid Argon
 | `jwks_refresh_interval` | u64    | `3600`                                                           | JWKS refresh interval (seconds) |
 | `required_audience`     | string | -                                                                | Required audience claim         |
 | `clock_skew_tolerance`  | u64    | `60`                                                             | Clock skew tolerance (seconds)  |
+| `allowed_algorithms`    | array  | `["RS256"]`                                                       | Allowed JWT signing algorithms  |
 
 #### Generic Provider
 
-| Option                  | Type   | Default  | Description                                  |
-|-------------------------|--------|----------|----------------------------------------------|
-| `provider`              | string | required | Must be `"generic"`                          |
-| `issuer`                | string | required | OIDC issuer URL                              |
-| `jwks_uri`              | string | -        | Custom JWKS URI (auto-discovered if not set) |
-| `jwks_refresh_interval` | u64    | `3600`   | JWKS refresh interval (seconds)              |
-| `required_audience`     | string | -        | Required audience claim                      |
-| `clock_skew_tolerance`  | u64    | `60`     | Clock skew tolerance (seconds)               |
+| Option                  | Type   | Default    | Description                                  |
+|-------------------------|--------|------------|----------------------------------------------|
+| `provider`              | string | required   | Must be `"generic"`                          |
+| `issuer`                | string | required   | OIDC issuer URL                              |
+| `jwks_uri`              | string | -          | Custom JWKS URI (auto-discovered if not set) |
+| `jwks_refresh_interval` | u64    | `3600`     | JWKS refresh interval (seconds)              |
+| `required_audience`     | string | -          | Required audience claim                      |
+| `clock_skew_tolerance`  | u64    | `60`       | Clock skew tolerance (seconds)               |
+| `allowed_algorithms`    | array  | `["RS256"]` | Allowed JWT signing algorithms              |
+
+`allowed_algorithms` accepts JWT algorithm names such as `"RS256"`, `"RS384"`, `"RS512"`, `"ES256"`, and `"ES384"`. Angos rejects tokens whose header claims an algorithm outside the provider allowlist before signature verification to prevent algorithm-confusion attacks.
 
 ### Webhooks (`auth.webhook.<name>`)
 

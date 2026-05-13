@@ -25,6 +25,7 @@ provider = "github"
 ```
 
 That's it for basic configuration. The registry automatically uses GitHub's default issuer and JWKS endpoints.
+OIDC tokens must use an allowed JWT signing algorithm; the default allowlist is `["RS256"]`.
 
 ### Step 2: Add Access Policy
 

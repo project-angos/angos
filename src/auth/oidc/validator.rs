@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use jsonwebtoken::{Algorithm, Validation, decode, decode_header};
+use jsonwebtoken::{Algorithm, Header, Validation, decode, decode_header};
 use reqwest::{Client, header::ACCEPT};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use tracing::{debug, info, warn};
@@ -31,21 +31,21 @@ pub async fn validate_oidc_token(
     client: &Client,
     cache: &Cache,
 ) -> Result<OidcClaims, Error> {
+    let header = decode_header(token)
+        .map_err(|e| Error::Unauthorized(format!("Failed to decode JWT header: {e}")))?;
+    verify_allowed_algorithm(provider, header.alg)?;
+
     let jwks = fetch_jwks(provider, client, cache).await?;
-    verify_jwt(token, &jwks, provider_name, provider)
+    verify_jwt_with_header(token, &header, &jwks, provider_name, provider)
 }
 
-/// Pure JWT verification — no I/O. Validates the token against the supplied JWKS and provider
-/// configuration and returns structured claims on success.
-fn verify_jwt(
+fn verify_jwt_with_header(
     token: &str,
+    header: &Header,
     jwks: &Jwks,
     provider_name: &str,
     provider: &dyn OidcProvider,
 ) -> Result<OidcClaims, Error> {
-    let header = decode_header(token)
-        .map_err(|e| Error::Unauthorized(format!("Failed to decode JWT header: {e}")))?;
-
     debug!(
         "JWT header: alg={:?}, kid={:?}, typ={:?}",
         header.alg, header.kid, header.typ
@@ -98,8 +98,19 @@ fn verify_jwt(
     })
 }
 
+fn verify_allowed_algorithm(provider: &dyn OidcProvider, alg: Algorithm) -> Result<(), Error> {
+    if provider.allowed_algorithms().contains(&alg) {
+        return Ok(());
+    }
+    Err(Error::Unauthorized(format!(
+        "algorithm {alg:?} not allowed for provider {}",
+        provider.name()
+    )))
+}
+
 fn build_validation(provider: &dyn OidcProvider, alg: Algorithm) -> Validation {
     let mut validation = Validation::new(alg);
+    validation.algorithms = provider.allowed_algorithms().to_vec();
     validation.set_issuer(&[provider.issuer()]);
     if let Some(aud) = provider.required_audience() {
         validation.set_audience(&[aud]);
@@ -229,7 +240,7 @@ async fn fetch_oidc_configuration(
 pub mod tests {
     use std::collections::HashMap;
 
-    use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
+    use jsonwebtoken::{Algorithm, EncodingKey, Header, decode_header, encode};
     use reqwest::Client;
     use serde_json::json;
     use wiremock::{
@@ -258,7 +269,20 @@ pub mod tests {
             jwks_refresh_interval: 3600,
             required_audience: Some("test-audience".to_string()),
             clock_skew_tolerance: 60,
+            allowed_algorithms: vec![Algorithm::ES256],
         }
+    }
+
+    fn verify_jwt(
+        token: &str,
+        jwks: &Jwks,
+        provider_name: &str,
+        provider: &dyn OidcProvider,
+    ) -> Result<OidcClaims, Error> {
+        let header = decode_header(token)
+            .map_err(|e| Error::Unauthorized(format!("Failed to decode JWT header: {e}")))?;
+        verify_allowed_algorithm(provider, header.alg)?;
+        verify_jwt_with_header(token, &header, jwks, provider_name, provider)
     }
 
     /// Returns the JWKS JSON body for the `private_key_pem()` fixture.
@@ -302,6 +326,7 @@ pub mod tests {
             jwks_refresh_interval: 3600,
             required_audience: None,
             clock_skew_tolerance: 60,
+            allowed_algorithms: vec![Algorithm::ES256],
         };
 
         let provider = Provider::new(config);
@@ -352,6 +377,7 @@ pub mod tests {
             jwks_refresh_interval: 3600,
             required_audience: None,
             clock_skew_tolerance: 60,
+            allowed_algorithms: vec![Algorithm::ES256],
         };
 
         let provider = Provider::new(config);
@@ -392,6 +418,7 @@ pub mod tests {
             jwks_refresh_interval: 3600,
             required_audience: None,
             clock_skew_tolerance: 60,
+            allowed_algorithms: vec![Algorithm::ES256],
         };
 
         let provider = Provider::new(config);
@@ -421,6 +448,7 @@ pub mod tests {
             jwks_refresh_interval: 3600,
             required_audience: None,
             clock_skew_tolerance: 60,
+            allowed_algorithms: vec![Algorithm::ES256],
         };
 
         let provider = Provider::new(config);
@@ -454,6 +482,7 @@ pub mod tests {
             jwks_refresh_interval: 3600,
             required_audience: None,
             clock_skew_tolerance: 60,
+            allowed_algorithms: vec![Algorithm::ES256],
         };
 
         let provider = Provider::new(config);
@@ -493,6 +522,7 @@ pub mod tests {
             jwks_refresh_interval: 3600,
             required_audience: None,
             clock_skew_tolerance: 60,
+            allowed_algorithms: vec![Algorithm::ES256],
         };
 
         let provider = Provider::new(config);
@@ -527,6 +557,7 @@ pub mod tests {
             jwks_refresh_interval: 3600,
             required_audience: None,
             clock_skew_tolerance: 60,
+            allowed_algorithms: vec![Algorithm::ES256],
         };
 
         let provider = Provider::new(config);
@@ -560,6 +591,7 @@ pub mod tests {
             jwks_refresh_interval: 3600,
             required_audience: None,
             clock_skew_tolerance: 60,
+            allowed_algorithms: vec![Algorithm::ES256],
         };
 
         let provider = Provider::new(config);
@@ -648,6 +680,42 @@ pub mod tests {
                 assert!(msg.contains("validation failed"));
             }
             _ => panic!("Expected Unauthorized error"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_validate_oidc_token_rejects_disallowed_algorithm_before_jwks_fetch() {
+        let mock_server = MockServer::start().await;
+        let mut claims: HashMap<String, serde_json::Value> = HashMap::new();
+        claims.insert("iss".to_string(), json!(mock_server.uri()));
+        claims.insert("sub".to_string(), json!("test-user"));
+        claims.insert("aud".to_string(), json!("test-audience"));
+        claims.insert(
+            "exp".to_string(),
+            json!((chrono::Utc::now() + chrono::Duration::hours(1)).timestamp()),
+        );
+        claims.insert("iat".to_string(), json!(chrono::Utc::now().timestamp()));
+
+        let token = make_token(&claims, KID);
+        let config = ProviderConfig {
+            issuer: mock_server.uri(),
+            jwks_uri: Some(format!("{}/.well-known/jwks", mock_server.uri())),
+            jwks_refresh_interval: 3600,
+            required_audience: Some("test-audience".to_string()),
+            clock_skew_tolerance: 60,
+            allowed_algorithms: vec![Algorithm::RS256],
+        };
+
+        let provider = Provider::new(config);
+        let client = Client::new();
+        let cache = cache::Config::Memory.to_backend().unwrap();
+
+        let result =
+            validate_oidc_token("test-provider", &provider, &token, &client, cache.as_ref()).await;
+
+        match result.unwrap_err() {
+            Error::Unauthorized(msg) => assert!(msg.contains("algorithm ES256 not allowed")),
+            e => panic!("expected Unauthorized, got {e:?}"),
         }
     }
 
@@ -786,6 +854,7 @@ pub mod tests {
             jwks_refresh_interval: 3600,
             required_audience: Some("test-audience".to_string()),
             clock_skew_tolerance: 60,
+            allowed_algorithms: vec![Algorithm::ES256],
         };
 
         let provider = Provider::new(config);
@@ -831,6 +900,7 @@ pub mod tests {
             jwks_refresh_interval: 3600,
             required_audience: None,
             clock_skew_tolerance: 60,
+            allowed_algorithms: vec![Algorithm::ES256],
         };
 
         let provider = Provider::new(config);
@@ -860,6 +930,7 @@ pub mod tests {
             jwks_refresh_interval: 3600,
             required_audience: None,
             clock_skew_tolerance: 60,
+            allowed_algorithms: vec![Algorithm::ES256],
         };
 
         let provider = Provider::new(config);
@@ -934,6 +1005,7 @@ pub mod tests {
                     jwks_refresh_interval: 3600,
                     required_audience: audience.map(str::to_string),
                     clock_skew_tolerance: 0,
+                    allowed_algorithms: vec![Algorithm::ES256],
                 },
                 claim_error: None,
             }

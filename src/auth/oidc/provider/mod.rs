@@ -4,6 +4,7 @@ pub mod github;
 use std::collections::HashMap;
 
 use async_trait::async_trait;
+use jsonwebtoken::Algorithm;
 
 use crate::command::server::Error;
 
@@ -13,6 +14,11 @@ pub struct BaseConfig {
     pub jwks_refresh_interval: u64,
     pub required_audience: Option<String>,
     pub clock_skew_tolerance: u64,
+    pub allowed_algorithms: Vec<Algorithm>,
+}
+
+pub fn default_allowed_algorithms() -> Vec<Algorithm> {
+    vec![Algorithm::RS256]
 }
 
 #[async_trait]
@@ -39,6 +45,10 @@ pub trait OidcProvider: Send + Sync {
 
     fn clock_skew_tolerance(&self) -> u64 {
         self.base().clock_skew_tolerance
+    }
+
+    fn allowed_algorithms(&self) -> &[Algorithm] {
+        &self.base().allowed_algorithms
     }
 
     fn validate_provider_claims(

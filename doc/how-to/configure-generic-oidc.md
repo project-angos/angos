@@ -39,6 +39,7 @@ required_audience = "my-registry"        # Validate audience claim
 jwks_uri = "https://auth.example.com/.well-known/jwks.json"  # Override discovery
 jwks_refresh_interval = 3600             # Refresh keys hourly (default)
 clock_skew_tolerance = 60                # Allow 60s clock drift (default)
+allowed_algorithms = ["RS256"]           # Restrict accepted JWT algorithms (default)
 ```
 
 ### Step 3: Add Access Policy

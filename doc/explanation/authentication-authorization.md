@@ -303,6 +303,7 @@ sequenceDiagram
 
 OIDC tokens are cryptographically verified:
 - Signature against provider's JWKS
+- Header algorithm must be in the provider's allowlist
 - Issuer must match configuration
 - Expiration is enforced
 - Clock skew tolerance is configurable

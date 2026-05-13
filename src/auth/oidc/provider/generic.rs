@@ -1,7 +1,8 @@
 use async_trait::async_trait;
+use jsonwebtoken::Algorithm;
 use serde::{Deserialize, Serialize};
 
-use crate::auth::oidc::provider::{BaseConfig, OidcProvider};
+use crate::auth::oidc::provider::{BaseConfig, OidcProvider, default_allowed_algorithms};
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ProviderConfig {
@@ -14,6 +15,8 @@ pub struct ProviderConfig {
     pub required_audience: Option<String>,
     #[serde(default = "default_clock_skew_tolerance")]
     pub clock_skew_tolerance: u64,
+    #[serde(default = "default_allowed_algorithms")]
+    pub allowed_algorithms: Vec<Algorithm>,
 }
 
 fn default_jwks_refresh_interval() -> u64 {
@@ -37,6 +40,7 @@ impl Provider {
                 jwks_refresh_interval: config.jwks_refresh_interval,
                 required_audience: config.required_audience,
                 clock_skew_tolerance: config.clock_skew_tolerance,
+                allowed_algorithms: config.allowed_algorithms,
             },
         }
     }
@@ -57,8 +61,6 @@ impl OidcProvider for Provider {
 mod tests {
     use std::collections::HashMap;
 
-    use jsonwebtoken::{Algorithm, Validation};
-
     use super::*;
 
     #[test]
@@ -73,6 +75,7 @@ mod tests {
         assert_eq!(config.jwks_refresh_interval, 3600);
         assert!(config.required_audience.is_none());
         assert_eq!(config.clock_skew_tolerance, 60);
+        assert_eq!(config.allowed_algorithms, vec![Algorithm::RS256]);
     }
 
     #[test]
@@ -83,6 +86,7 @@ mod tests {
             jwks_refresh_interval = 7200
             required_audience = "my-app"
             clock_skew_tolerance = 120
+            allowed_algorithms = ["RS256", "ES256"]
         "#;
 
         let config: ProviderConfig = toml::from_str(toml).unwrap();
@@ -94,6 +98,10 @@ mod tests {
         assert_eq!(config.jwks_refresh_interval, 7200);
         assert_eq!(config.required_audience, Some("my-app".to_string()));
         assert_eq!(config.clock_skew_tolerance, 120);
+        assert_eq!(
+            config.allowed_algorithms,
+            vec![Algorithm::RS256, Algorithm::ES256]
+        );
     }
 
     #[test]
@@ -110,6 +118,7 @@ mod tests {
             jwks_refresh_interval: 3600,
             required_audience: Some("test-audience".to_string()),
             clock_skew_tolerance: 60,
+            allowed_algorithms: vec![Algorithm::RS256],
         };
 
         let provider = Provider::new(config);
@@ -119,6 +128,7 @@ mod tests {
         assert_eq!(provider.jwks_refresh_interval(), 3600);
         assert_eq!(provider.required_audience(), Some("test-audience"));
         assert_eq!(provider.clock_skew_tolerance(), 60);
+        assert_eq!(provider.allowed_algorithms(), &[Algorithm::RS256]);
     }
 
     #[test]
@@ -129,6 +139,7 @@ mod tests {
             jwks_refresh_interval: 7200,
             required_audience: None,
             clock_skew_tolerance: 120,
+            allowed_algorithms: vec![Algorithm::RS256],
         };
 
         let provider = Provider::new(config);
@@ -150,11 +161,13 @@ mod tests {
             jwks_refresh_interval: default_jwks_refresh_interval(),
             required_audience: None,
             clock_skew_tolerance: default_clock_skew_tolerance(),
+            allowed_algorithms: default_allowed_algorithms(),
         };
 
         let provider = Provider::new(config);
         assert_eq!(provider.jwks_refresh_interval(), 3600);
         assert_eq!(provider.clock_skew_tolerance(), 60);
+        assert_eq!(provider.allowed_algorithms(), &[Algorithm::RS256]);
     }
 
     #[test]
@@ -165,6 +178,7 @@ mod tests {
             jwks_refresh_interval: 3600,
             required_audience: None,
             clock_skew_tolerance: 60,
+            allowed_algorithms: vec![Algorithm::RS256],
         };
 
         let provider = Provider::new(config);
@@ -179,69 +193,11 @@ mod tests {
             jwks_refresh_interval: 3600,
             required_audience: None,
             clock_skew_tolerance: 60,
+            allowed_algorithms: vec![Algorithm::RS256],
         };
 
         let provider = Provider::new(config);
         let claims = HashMap::new();
         assert!(provider.validate_provider_claims(&claims).is_ok());
-    }
-
-    #[test]
-    fn test_validation_new_with_rs256() {
-        let header = jsonwebtoken::Header {
-            alg: Algorithm::RS256,
-            ..Default::default()
-        };
-
-        let validation = Validation::new(header.alg);
-        assert!(validation.algorithms.contains(&Algorithm::RS256));
-        assert_eq!(validation.algorithms.len(), 1);
-    }
-
-    #[test]
-    fn test_validation_algorithms_behavior() {
-        for alg in [
-            Algorithm::RS256,
-            Algorithm::RS384,
-            Algorithm::RS512,
-            Algorithm::ES256,
-            Algorithm::ES384,
-        ] {
-            let validation = Validation::new(alg);
-            assert!(
-                validation.algorithms.contains(&alg),
-                "Algorithm {alg:?} not found in validation.algorithms"
-            );
-            assert_eq!(
-                validation.algorithms.len(),
-                1,
-                "Expected single algorithm, got {:?}",
-                validation.algorithms
-            );
-        }
-    }
-
-    #[test]
-    fn test_github_actions_token_header() {
-        let header = jsonwebtoken::Header {
-            alg: Algorithm::RS256,
-            kid: Some("cc413527-173f-5a05-976e-9c52b1d7b431".to_string()),
-            typ: Some("JWT".to_string()),
-            ..Default::default()
-        };
-
-        let mut validation = Validation::new(header.alg);
-        validation.set_issuer(&["https://token.actions.githubusercontent.com"]);
-        validation.set_audience(&["https://github.com/angos"]);
-        validation.leeway = 60;
-        validation.validate_exp = true;
-        validation.validate_nbf = true;
-
-        assert!(validation.algorithms.contains(&Algorithm::RS256));
-        assert_eq!(validation.algorithms.len(), 1);
-
-        assert!(validation.iss.is_some());
-        assert!(validation.aud.is_some());
-        assert_eq!(validation.leeway, 60);
     }
 }

@@ -108,6 +108,8 @@ Useful modules:
 
 3. Ensure PEM format for all certificates
 
+Malformed certificates receive a generic `Invalid certificate` response. Enable debug logs to see parser details server-side.
+
 ---
 
 ## Push/Pull Issues

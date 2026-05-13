@@ -137,6 +137,7 @@ mod tests {
 
     use base64::{Engine, engine::general_purpose::STANDARD as BASE64_STANDARD};
     use hyper::{Request, header::AUTHORIZATION};
+    use jsonwebtoken::Algorithm;
     use serde_json::json;
     use wiremock::{
         Mock, MockServer, ResponseTemplate,
@@ -158,6 +159,7 @@ mod tests {
             jwks_refresh_interval: 3600,
             required_audience: None,
             clock_skew_tolerance: 60,
+            allowed_algorithms: vec![Algorithm::ES256],
         })
     }
 
@@ -232,6 +234,7 @@ mod tests {
             jwks_refresh_interval: 3600,
             required_audience: None,
             clock_skew_tolerance: 60,
+            allowed_algorithms: vec![Algorithm::RS256],
         });
 
         let provider = config.to_backend();
@@ -247,6 +250,7 @@ mod tests {
             jwks_refresh_interval: 3600,
             required_audience: None,
             clock_skew_tolerance: 60,
+            allowed_algorithms: vec![Algorithm::RS256],
         });
 
         let provider = config.to_backend();
@@ -265,6 +269,7 @@ mod tests {
             jwks_refresh_interval: 3600,
             required_audience: Some("test-audience".to_string()),
             clock_skew_tolerance: 60,
+            allowed_algorithms: vec![Algorithm::RS256],
         });
 
         let cache = cache::Config::Memory.to_backend().unwrap();
@@ -284,6 +289,7 @@ mod tests {
             jwks_refresh_interval: 3600,
             required_audience: None,
             clock_skew_tolerance: 60,
+            allowed_algorithms: vec![Algorithm::RS256],
         });
 
         let cache = cache::Config::Memory.to_backend().unwrap();
@@ -330,6 +336,7 @@ mod tests {
             jwks_refresh_interval: 3600,
             required_audience: None,
             clock_skew_tolerance: 60,
+            allowed_algorithms: vec![Algorithm::RS256],
         });
 
         let cache = cache::Config::Memory.to_backend().unwrap();
@@ -412,6 +419,7 @@ mod tests {
             jwks_refresh_interval: 3600,
             required_audience: None,
             clock_skew_tolerance: 60,
+            allowed_algorithms: vec![Algorithm::RS256],
         });
 
         let cache = cache::Config::Memory.to_backend().unwrap();
@@ -441,6 +449,7 @@ mod tests {
             jwks_refresh_interval: 3600,
             required_audience: None,
             clock_skew_tolerance: 60,
+            allowed_algorithms: vec![Algorithm::RS256],
         });
 
         let cache = cache::Config::Memory.to_backend().unwrap();
@@ -466,6 +475,7 @@ mod tests {
             jwks_refresh_interval: 3600,
             required_audience: None,
             clock_skew_tolerance: 60,
+            allowed_algorithms: vec![Algorithm::RS256],
         });
 
         let cache = cache::Config::Memory.to_backend().unwrap();
