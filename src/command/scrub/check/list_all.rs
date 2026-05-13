@@ -102,7 +102,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        oci::Digest,
+        oci::{Digest, Namespace},
         registry::{
             metadata_store::{MetadataStoreExt, link_kind::LinkKind},
             test_utils::backends,
@@ -114,7 +114,7 @@ mod tests {
         for test_case in backends() {
             let registry = test_case.registry();
             let metadata_store = test_case.metadata_store();
-            let namespace = "list-all-test/revisions";
+            let namespace = &Namespace::new("list-all-test/revisions").unwrap();
 
             let (digest, _) =
                 crate::registry::test_utils::create_test_blob(registry, namespace, b"manifest")
@@ -139,7 +139,7 @@ mod tests {
         for test_case in backends() {
             let registry = test_case.registry();
             let metadata_store = test_case.metadata_store();
-            let namespace = "list-all-test/namespaces";
+            let namespace = &Namespace::new("list-all-test/namespaces").unwrap();
 
             let (digest, _) =
                 crate::registry::test_utils::create_test_blob(registry, namespace, b"manifest")

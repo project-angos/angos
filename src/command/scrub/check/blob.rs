@@ -129,7 +129,7 @@ mod tests {
     use super::*;
     use crate::{
         command::scrub::{action::Action, executor::Executor},
-        oci::Digest,
+        oci::{Digest, Namespace},
         registry::{
             blob_store::MultipartCleanup,
             metadata_store::BlobIndexOperation,
@@ -189,7 +189,7 @@ mod tests {
     #[tokio::test]
     async fn classify_blob_returns_referenced_when_index_has_links() {
         for test_case in backends() {
-            let namespace = "test-repo/app";
+            let namespace = &Namespace::new("test-repo/app").unwrap();
             let registry = test_case.registry();
             let metadata_store = test_case.metadata_store();
 
@@ -200,7 +200,7 @@ mod tests {
             match verdict {
                 BlobVerdict::Referenced(index) => {
                     assert!(
-                        index.namespace.contains_key(namespace),
+                        index.namespace.contains_key(namespace.as_ref()),
                         "Referenced verdict must carry the namespace in its BlobIndex"
                     );
                 }
@@ -218,7 +218,7 @@ mod tests {
     #[tokio::test]
     async fn test_cleanup_orphan_blobs_removes_invalid_index_entries() {
         for test_case in backends() {
-            let namespace = "test-repo/app";
+            let namespace = &Namespace::new("test-repo/app").unwrap();
             let registry = test_case.registry();
             let metadata_store = test_case.metadata_store();
             let blob_store = test_case.blob_store();
@@ -245,7 +245,7 @@ mod tests {
 
             let initial_refs = blob_index_before
                 .namespace
-                .get(namespace)
+                .get(namespace.as_ref())
                 .map_or(0, std::collections::HashSet::len);
 
             let checker = BlobChecker::new(blob_store.clone(), metadata_store.clone());
@@ -263,7 +263,7 @@ mod tests {
 
             let final_refs = blob_index_after
                 .namespace
-                .get(namespace)
+                .get(namespace.as_ref())
                 .map_or(0, std::collections::HashSet::len);
 
             assert!(

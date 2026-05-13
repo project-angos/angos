@@ -8,7 +8,7 @@ use super::*;
 use crate::{
     configuration::GlobalConfig,
     metrics_provider,
-    oci::Digest,
+    oci::{Digest, Namespace},
     policy::{AccessMode, AccessPolicyConfig, RetentionPolicy, RetentionPolicyConfig, SystemClock},
     registry::{
         blob_store::{self, BlobStore, PresignedBlobStore, UploadStore},
@@ -75,7 +75,7 @@ pub fn create_test_registry(
 
 pub async fn create_test_blob(
     registry: &Registry,
-    namespace: &str,
+    namespace: &Namespace,
     content: &[u8],
 ) -> (Digest, Repository) {
     let digest = registry.blob_store.create(content).await.unwrap();
@@ -92,8 +92,8 @@ pub async fn create_test_blob(
         .read_blob_index(&digest)
         .await
         .unwrap();
-    assert!(blob_index.namespace.contains_key(namespace));
-    let namespace_links = blob_index.namespace.get(namespace).unwrap();
+    assert!(blob_index.namespace.contains_key(namespace.as_ref()));
+    let namespace_links = blob_index.namespace.get(namespace.as_ref()).unwrap();
     assert!(namespace_links.contains(&layer_link));
 
     let repository = Repository {
