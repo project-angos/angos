@@ -1,4 +1,4 @@
-use std::{collections::HashMap, time::Duration};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use argon2::{
     Algorithm, Argon2, Params, PasswordHasher, Version,
@@ -10,21 +10,34 @@ use hyper::{Request, header::HeaderMap};
 use uuid::Uuid;
 use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};
 
-use super::*;
 use crate::{
+    command::server::server_context::{ServerContext, resolve_client_ip},
     configuration::Configuration,
     event_webhook::{
+        config::EventWebhookConfig,
         dispatcher::EventDispatcher,
         event::{Event, EventKind},
     },
-    identity::ClientIdentity,
+    identity::{Action, ClientIdentity},
     metrics_provider,
     oci::{Namespace, Reference},
+    policy::AccessPolicyConfig,
     registry::{Registry, RegistryConfig, Repository},
     secret::Secret,
 };
 
-fn create_test_config() -> Configuration {
+#[derive(Default)]
+pub struct TestConfigOptions<'a> {
+    pub access_policy: Option<AccessPolicyConfig>,
+    pub webhooks: Vec<TestWebhook<'a>>,
+}
+
+pub struct TestWebhook<'a> {
+    pub name: &'a str,
+    pub url: &'a str,
+}
+
+pub fn create_test_config_with(options: TestConfigOptions<'_>) -> Configuration {
     metrics_provider::init_for_tests();
     let toml = r#"
         [blob_store.fs]
@@ -44,38 +57,45 @@ fn create_test_config() -> Configuration {
         max_concurrent_cache_jobs = 10
     "#;
 
-    toml::from_str(toml).unwrap()
+    let mut config: Configuration = toml::from_str(toml).unwrap();
+    if let Some(access_policy) = options.access_policy {
+        config.global.access_policy = access_policy;
+    }
+    for webhook in options.webhooks {
+        let webhook_config = format!(
+            r#"
+            url = "{}"
+            policy = "optional"
+            events = ["manifest.push"]
+        "#,
+            webhook.url
+        );
+        config.global.event_webhooks.push(webhook.name.to_string());
+        config.event_webhook.insert(
+            webhook.name.to_string(),
+            toml::from_str::<EventWebhookConfig>(&webhook_config).unwrap(),
+        );
+    }
+    config
+}
+
+fn create_test_config() -> Configuration {
+    create_test_config_with(TestConfigOptions::default())
 }
 
 pub async fn create_test_server_context() -> ServerContext {
     let config = create_test_config();
-    let blob_handles = config.blob_store.to_backend(None).unwrap();
-    let (metadata_store, _) = config
-        .resolve_metadata_config()
-        .to_backend(None)
-        .await
-        .unwrap();
-    let repositories = Arc::new(HashMap::new());
+    create_test_server_context_from_config(&config).await
+}
 
-    let registry_config = RegistryConfig::new()
-        .update_pull_time(false)
-        .enable_blob_redirect(true)
-        .enable_manifest_redirect(true)
-        .concurrent_cache_jobs(10)
-        .global_immutable_tags(false)
-        .global_immutable_tags_exclusions(Vec::new());
+pub async fn create_test_server_context_with(options: TestConfigOptions<'_>) -> ServerContext {
+    let config = create_test_config_with(options);
+    create_test_server_context_from_config(&config).await
+}
 
-    let registry = Registry::new(
-        blob_handles.blob_store,
-        blob_handles.upload_store,
-        blob_handles.presigned_store,
-        metadata_store,
-        repositories,
-        registry_config,
-    )
-    .unwrap();
-
-    ServerContext::new(&config, registry).unwrap()
+pub async fn create_test_server_context_from_config(config: &Configuration) -> ServerContext {
+    let registry = create_test_registry(config).await;
+    ServerContext::new(config, registry).unwrap()
 }
 
 fn create_minimal_config() -> Configuration {
@@ -100,7 +120,7 @@ fn create_minimal_config() -> Configuration {
     toml::from_str(toml).unwrap()
 }
 
-async fn create_test_registry(config: &Configuration) -> Registry {
+pub async fn create_test_registry(config: &Configuration) -> Registry {
     let blob_handles = config.blob_store.to_backend(None).unwrap();
     let (metadata_store, _) = config
         .resolve_metadata_config()
@@ -135,6 +155,20 @@ async fn create_test_registry(config: &Configuration) -> Registry {
         registry_config,
     )
     .unwrap()
+}
+
+pub fn create_test_event() -> Event {
+    Event {
+        id: Uuid::new_v4(),
+        timestamp: Utc::now(),
+        kind: EventKind::ManifestPush,
+        namespace: "test/repo".to_string(),
+        digest: Some("sha256:abc123".to_string()),
+        reference: Some("sha256:abc123".to_string()),
+        tag: None,
+        actor: None,
+        repository: "test-repo".to_string(),
+    }
 }
 
 #[tokio::test]

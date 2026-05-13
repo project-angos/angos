@@ -5,12 +5,16 @@ use std::{
 
 use tempfile::TempDir;
 
-use super::{Command, ServerContext, ServiceListener, setup};
 use crate::{
     cache,
     command::{
         bootstrap,
-        server::listeners::{insecure::InsecureListener, tls::tests::build_config},
+        server::{
+            Command, ServerContext,
+            command::{ServiceListener, setup},
+            listeners::{insecure::InsecureListener, tls::tests::build_config},
+            server_context::tests::create_test_event,
+        },
     },
     configuration::{self, Configuration, ServerConfig},
     policy::{AccessMode, AccessPolicyConfig, CelRule},
@@ -552,25 +556,6 @@ fn create_config_with_two_webhooks(url_a: &str, url_b: &str) -> (Configuration, 
         meta = meta.path().display(),
     );
     (Configuration::load_from_str(&toml).unwrap(), blobs, meta)
-}
-
-fn create_test_event() -> crate::event_webhook::event::Event {
-    use chrono::Utc;
-    use uuid::Uuid;
-
-    use crate::event_webhook::event::{Event, EventKind};
-
-    Event {
-        id: Uuid::new_v4(),
-        timestamp: Utc::now(),
-        kind: EventKind::ManifestPush,
-        namespace: "test/repo".to_string(),
-        digest: Some("sha256:abc123".to_string()),
-        reference: Some("sha256:abc123".to_string()),
-        tag: None,
-        actor: None,
-        repository: "test-repo".to_string(),
-    }
 }
 
 #[tokio::test]

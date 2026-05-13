@@ -1,5 +1,3 @@
-use std::{collections::HashMap, sync::Arc};
-
 use http_body_util::{BodyExt, Full};
 use hyper::{
     Request, Response, StatusCode,
@@ -11,12 +9,6 @@ use opentelemetry_sdk::trace::{Sampler, SdkTracerProvider};
 use serde_json::{Value, from_slice};
 use tracing_subscriber::{layer::SubscriberExt, registry::Registry as TracingRegistry};
 
-use super::{
-    connection::{current_trace_id, inject_peer_certificate},
-    dispatch::authenticate_and_authorize,
-    error_response::{error_to_response, fallback_500},
-    observability::{handle_healthz, handle_metrics},
-};
 use crate::{
     auth::PeerCertificate,
     command::server::{
@@ -26,14 +18,20 @@ use crate::{
             blob::handle_delete_blob, content_discovery::handle_list_catalog,
             ext::handle_list_repositories,
         },
+        http_server::{
+            connection::{current_trace_id, inject_peer_certificate},
+            dispatch::authenticate_and_authorize,
+            error_response::{error_to_response, fallback_500},
+            observability::{handle_healthz, handle_metrics},
+        },
         response_body::ResponseBody,
+        server_context::tests::{TestConfigOptions, create_test_server_context_with},
     },
-    configuration::Configuration,
     identity::{Action, ClientIdentity},
     metrics_provider,
     oci::{Digest, Namespace},
+    policy::{AccessMode, AccessPolicyConfig},
     registry,
-    registry::{Registry, RegistryConfig},
 };
 
 #[test]
@@ -427,53 +425,7 @@ fn test_error_to_response_multiple_errors_same_request_id() {
 
 #[tokio::test]
 async fn test_authenticate_and_authorize_returns_client_identity() {
-    let toml = r#"
-        [blob_store.fs]
-        root_dir = "/tmp/test-blobs"
-
-        [metadata_store.fs]
-        root_dir = "/tmp/test-metadata"
-
-        [cache.memory]
-
-        [server]
-        bind_address = "127.0.0.1"
-        port = 8080
-
-        [global]
-        update_pull_time = false
-        max_concurrent_cache_jobs = 10
-
-        [global.access_policy]
-        default = "allow"
-        rules = []
-    "#;
-
-    let config: Configuration = toml::from_str(toml).unwrap();
-    let blob_handles = config.blob_store.to_backend(None).unwrap();
-    let (metadata_store, _) = config
-        .resolve_metadata_config()
-        .to_backend(None)
-        .await
-        .unwrap();
-    let repositories = Arc::new(HashMap::new());
-    let registry_config = RegistryConfig::new()
-        .update_pull_time(false)
-        .enable_blob_redirect(true)
-        .enable_manifest_redirect(true)
-        .concurrent_cache_jobs(10)
-        .global_immutable_tags(false)
-        .global_immutable_tags_exclusions(Vec::new());
-    let registry = Registry::new(
-        blob_handles.blob_store,
-        blob_handles.upload_store,
-        blob_handles.presigned_store,
-        metadata_store,
-        repositories,
-        registry_config,
-    )
-    .unwrap();
-    let context = ServerContext::new(&config, registry).unwrap();
+    let context = create_test_context_with_allow_policy().await;
 
     let request = Request::builder().uri("/v2/").body(()).unwrap();
     let (parts, ()) = request.into_parts();
@@ -486,53 +438,14 @@ async fn test_authenticate_and_authorize_returns_client_identity() {
 }
 
 async fn create_test_context_with_allow_policy() -> ServerContext {
-    let toml = r#"
-        [blob_store.fs]
-        root_dir = "/tmp/test-blobs"
-
-        [metadata_store.fs]
-        root_dir = "/tmp/test-metadata"
-
-        [cache.memory]
-
-        [server]
-        bind_address = "127.0.0.1"
-        port = 8080
-
-        [global]
-        update_pull_time = false
-        max_concurrent_cache_jobs = 10
-
-        [global.access_policy]
-        default = "allow"
-        rules = []
-    "#;
-
-    let config: Configuration = toml::from_str(toml).unwrap();
-    let blob_handles = config.blob_store.to_backend(None).unwrap();
-    let (metadata_store, _) = config
-        .resolve_metadata_config()
-        .to_backend(None)
-        .await
-        .unwrap();
-    let repositories = Arc::new(HashMap::new());
-    let registry_config = RegistryConfig::new()
-        .update_pull_time(false)
-        .enable_blob_redirect(true)
-        .enable_manifest_redirect(true)
-        .concurrent_cache_jobs(10)
-        .global_immutable_tags(false)
-        .global_immutable_tags_exclusions(Vec::new());
-    let registry = Registry::new(
-        blob_handles.blob_store,
-        blob_handles.upload_store,
-        blob_handles.presigned_store,
-        metadata_store,
-        repositories,
-        registry_config,
-    )
-    .unwrap();
-    ServerContext::new(&config, registry).unwrap()
+    create_test_server_context_with(TestConfigOptions {
+        access_policy: Some(AccessPolicyConfig {
+            default: AccessMode::Allow,
+            ..AccessPolicyConfig::default()
+        }),
+        ..TestConfigOptions::default()
+    })
+    .await
 }
 
 #[tokio::test]
