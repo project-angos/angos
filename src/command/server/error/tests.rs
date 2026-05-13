@@ -97,17 +97,17 @@ fn test_as_json_all_error_types() {
         ),
         (
             Error::Initialization("init".to_string()),
-            "INTERNAL_SERVER_ERROR",
+            "INTERNAL_ERROR",
             "init",
         ),
         (
             Error::Execution("exec".to_string()),
-            "INTERNAL_SERVER_ERROR",
+            "INTERNAL_ERROR",
             "exec",
         ),
         (
             Error::Internal("internal".to_string()),
-            "INTERNAL_SERVER_ERROR",
+            "INTERNAL_ERROR",
             "internal",
         ),
     ];
@@ -224,13 +224,13 @@ fn test_registry_error_to_server_error_mapping() {
         (
             registry::Error::Internal("Database error".to_string()),
             StatusCode::INTERNAL_SERVER_ERROR,
-            "INTERNAL_SERVER_ERROR",
+            "INTERNAL_ERROR",
             Some("Database error"),
         ),
         (
             registry::Error::Initialization("Config error".to_string()),
             StatusCode::INTERNAL_SERVER_ERROR,
-            "INTERNAL_SERVER_ERROR",
+            "INTERNAL_ERROR",
             Some("Config error"),
         ),
     ];
@@ -247,7 +247,7 @@ fn test_registry_error_to_server_error_mapping() {
 }
 
 /// Variants outside the OCI-spec set route through the wildcard arm to a
-/// generic 500 `INTERNAL_SERVER_ERROR` carrying the rendered Display text.
+/// generic 500 `INTERNAL_ERROR` carrying the rendered Display text.
 /// Pins this contract so a regression that broke `error.to_string()`
 /// formatting (or accidentally rerouted typed variants) would fail.
 #[test]
@@ -273,7 +273,7 @@ fn test_typed_registry_variants_route_to_internal_server_error() {
             StatusCode::INTERNAL_SERVER_ERROR
         );
         let json = server_error.as_json(None);
-        assert_eq!(json["errors"][0]["code"], "INTERNAL_SERVER_ERROR");
+        assert_eq!(json["errors"][0]["code"], "INTERNAL_ERROR");
         let message = json["errors"][0]["message"]
             .as_str()
             .expect("message must be a string");

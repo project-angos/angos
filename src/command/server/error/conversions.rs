@@ -45,12 +45,12 @@ impl From<registry::Error> for Error {
             }
             registry::Error::Internal(msg) => oci_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                "INTERNAL_SERVER_ERROR",
+                "INTERNAL_ERROR",
                 Some(msg),
             ),
             _ => oci_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                "INTERNAL_SERVER_ERROR",
+                "INTERNAL_ERROR",
                 Some(error.to_string()),
             ),
         }

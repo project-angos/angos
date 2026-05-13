@@ -88,9 +88,9 @@ impl Error {
             Error::RangeNotSatisfiable(msg) => ("RANGE_NOT_SATISFIABLE", Some(msg.as_str())),
             Error::NotFound(msg) => ("NOT_FOUND", Some(msg.as_str())),
             Error::Initialization(msg) | Error::Execution(msg) | Error::Internal(msg) => {
-                ("INTERNAL_SERVER_ERROR", Some(msg.as_str()))
+                ("INTERNAL_ERROR", Some(msg.as_str()))
             }
-            Error::HttpBuild(_) | Error::Serialization(_) => ("INTERNAL_SERVER_ERROR", None),
+            Error::HttpBuild(_) | Error::Serialization(_) => ("INTERNAL_ERROR", None),
             Error::Custom { code, msg, .. } => (code.as_str(), msg.as_deref()),
         };
 
