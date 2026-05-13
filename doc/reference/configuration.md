@@ -133,7 +133,7 @@ Memory usage per upload: ~8 KiB during each `PATCH` (a single streaming read fra
 
 A long-lived S3 multipart upload is maintained across all `PATCH` requests. Each committed part is exactly `multipart_part_size` bytes (except the last). The S3 protocol only requires non-final parts to be ≥ 5 MiB; uniform sizing is an additional constraint imposed by some S3 storage providers. Use this mode only if your provider rejects uploads with variable part sizes.
 
-Memory usage per upload: up to `multipart_part_size` (default 50 MiB) per active upload, as each part is buffered in memory before being sent to S3.
+Memory usage per upload: streaming read frames for full parts, plus at most one trailing staged chunk smaller than `multipart_part_size`.
 
 ```toml
 # Most S3 providers (AWS S3, MinIO, Exoscale, etc.)

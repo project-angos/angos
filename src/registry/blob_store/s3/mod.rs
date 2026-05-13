@@ -1,5 +1,4 @@
 mod cache;
-mod chunked_reader;
 mod cleanup;
 mod nonuniform;
 #[cfg(test)]
@@ -234,7 +233,8 @@ impl UploadStore for Backend {
         append: bool,
     ) -> Result<(Digest, u64), Error> {
         let result = if self.uniform_parts {
-            self.write_upload_uniform(name, uuid, stream, append).await
+            self.write_upload_uniform(name, uuid, stream, content_length, append)
+                .await
         } else {
             self.write_upload_nonuniform(name, uuid, stream, content_length)
                 .await

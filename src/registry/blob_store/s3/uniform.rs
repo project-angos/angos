@@ -1,16 +1,24 @@
-use std::io::{self, Cursor};
+use std::io::{self, Cursor, ErrorKind};
 
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use chrono::{DateTime, Utc};
 use sha2::Sha256;
-use tokio::io::{AsyncRead, AsyncReadExt};
-use tracing::instrument;
+use tokio::{
+    io::{AsyncRead, AsyncReadExt},
+    sync::mpsc,
+};
+use tokio_util::task::AbortOnDropHandle;
+use tracing::{error, instrument, warn};
 
-use super::{Backend, S3UploadState, UploadedPart, chunked_reader::ChunkedReader};
 use crate::{
     oci::Digest,
     registry::{
-        blob_store::{Error, UploadSummary, hashing_reader::HashingReader, sha256_ext::Sha256Ext},
+        blob_store::{
+            Error, UploadSummary,
+            hashing_reader::HashingReader,
+            s3::{Backend, FRAME_SIZE, S3UploadState, UploadedPart},
+            sha256_ext::Sha256Ext,
+        },
         path_builder,
     },
 };
@@ -18,13 +26,8 @@ use crate::{
 struct ChunkContext<'a> {
     upload_path: &'a str,
     upload_id: &'a str,
-    uploaded_size: u64,
-    append: bool,
-}
-
-struct ChunkOutcome {
-    chunk_len: u64,
-    flushed: bool,
+    part_number: u32,
+    size: u64,
 }
 
 impl Backend {
@@ -108,43 +111,81 @@ impl Backend {
         }
     }
 
-    async fn process_chunk(
+    async fn stream_part(
         &self,
         name: &str,
         uuid: &str,
         ctx: ChunkContext<'_>,
-        uploaded_parts: &mut u32,
-        chunk: Bytes,
-        reader: &mut ChunkedReader<HashingReader<impl AsyncRead + Unpin + Send + Sync>>,
-    ) -> Result<ChunkOutcome, Error> {
-        let chunk_len = u64::try_from(chunk.len())?;
-        let flush = should_flush(chunk_len, self.multipart_part_size);
+        reader: &mut HashingReader<impl AsyncRead + Unpin + Send + Sync>,
+    ) -> Result<(), Error> {
+        let (tx, rx) = mpsc::channel::<Bytes>(32);
 
-        if flush {
-            self.store
-                .upload_part(ctx.upload_path, ctx.upload_id, *uploaded_parts, chunk)
-                .await?;
-            *uploaded_parts += 1;
-        } else {
-            reader.mark_finished();
-            self.store_staged_chunk(name, uuid, chunk, ctx.uploaded_size)
-                .await?;
+        let store = self.store.clone();
+        let upload_path = ctx.upload_path.to_string();
+        let upload_id = ctx.upload_id.to_string();
+        let upload_handle = AbortOnDropHandle::new(tokio::spawn(async move {
+            store
+                .upload_part_streaming(&upload_path, &upload_id, ctx.part_number, ctx.size, rx)
+                .await
+        }));
+
+        let mut part_reader = reader.take(ctx.size);
+        let mut sent = 0;
+        let mut buf = BytesMut::with_capacity(FRAME_SIZE);
+        loop {
+            buf.clear();
+            let n = part_reader.read_buf(&mut buf).await?;
+            if n == 0 {
+                break;
+            }
+            sent += u64::try_from(n)?;
+            if tx.send(buf.split().freeze()).await.is_err() {
+                return Err(Error::StorageBackend(
+                    "upload task failed to receive data".to_string(),
+                ));
+            }
         }
 
-        if ctx.append {
-            self.save_hasher(
-                name,
-                uuid,
-                ctx.uploaded_size + chunk_len,
-                reader.serialized_state(),
+        if sent != ctx.size {
+            return Err(io::Error::new(
+                ErrorKind::UnexpectedEof,
+                format!("expected {} bytes for multipart part, got {sent}", ctx.size),
             )
-            .await?;
+            .into());
         }
 
-        Ok(ChunkOutcome {
-            chunk_len,
-            flushed: flush,
-        })
+        drop(tx);
+        match upload_handle.await {
+            Ok(Ok(_etag)) => Ok(()),
+            Ok(Err(e)) => Err(e.into()),
+            Err(join_error) => {
+                let kind = if join_error.is_panic() {
+                    "panicked"
+                } else if join_error.is_cancelled() {
+                    "was cancelled"
+                } else {
+                    "failed unexpectedly"
+                };
+                error!(
+                    "uniform upload task {kind} for '{name}/{uuid}'; aborting multipart upload {upload_id}: {join_error}",
+                    upload_id = ctx.upload_id,
+                );
+                if let Err(abort_err) = self
+                    .store
+                    .abort_multipart_upload(ctx.upload_path, ctx.upload_id)
+                    .await
+                {
+                    warn!(
+                        "abort_multipart_upload failed during cleanup of '{name}/{uuid}': {abort_err}"
+                    );
+                }
+                self.evict_upload_id(ctx.upload_path).await;
+                self.evict_upload_state(name, uuid).await;
+                Err(Error::StorageBackend(format!(
+                    "upload task {kind}: {join_error}"
+                )))
+            }
+        }
     }
 
     #[instrument(skip(self, stream))]
@@ -153,6 +194,7 @@ impl Backend {
         name: &str,
         uuid: &str,
         stream: Box<dyn AsyncRead + Unpin + Send + Sync>,
+        content_length: u64,
         append: bool,
     ) -> Result<(Digest, u64), Error> {
         let upload_path = path_builder::upload_path(name, uuid);
@@ -165,39 +207,59 @@ impl Backend {
         let mut uploaded_parts = next_part_number(part_list.len())?;
 
         let staged = self.load_staged_chunk(name, uuid, uploaded_size).await?;
+        let staged_len = u64::try_from(staged.len())?;
         let hasher = self.load_hasher(name, uuid, uploaded_size).await?;
 
         let reader = Cursor::new(staged).chain(stream);
-        let reader = HashingReader::with_hasher(reader, hasher);
-        let mut reader = ChunkedReader::new(reader, self.multipart_part_size);
+        let mut reader = HashingReader::with_hasher(reader, hasher);
 
         let mut total_size = uploaded_size;
-        while let Some(mut chunk_reader) = reader.next_chunk() {
-            let mut buf = Vec::with_capacity(usize::try_from(self.multipart_part_size)?);
-            chunk_reader.read_to_end(&mut buf).await?;
-            let chunk = Bytes::from(buf);
-            let outcome = self
-                .process_chunk(
-                    name,
-                    uuid,
-                    ChunkContext {
-                        upload_path: &upload_path,
-                        upload_id: &upload_id,
-                        uploaded_size,
-                        append,
-                    },
-                    &mut uploaded_parts,
-                    chunk,
-                    &mut reader,
-                )
-                .await?;
-            total_size = uploaded_size + outcome.chunk_len;
-            if outcome.flushed {
-                uploaded_size += outcome.chunk_len;
+        let available = staged_len + content_length;
+        let full_parts = available / self.multipart_part_size;
+        let remainder = available % self.multipart_part_size;
+
+        for _ in 0..full_parts {
+            self.stream_part(
+                name,
+                uuid,
+                ChunkContext {
+                    upload_path: &upload_path,
+                    upload_id: &upload_id,
+                    part_number: uploaded_parts,
+                    size: self.multipart_part_size,
+                },
+                &mut reader,
+            )
+            .await?;
+            uploaded_parts += 1;
+            uploaded_size += self.multipart_part_size;
+            total_size += self.multipart_part_size;
+            if append {
+                self.save_hasher(name, uuid, total_size, reader.serialized_state())
+                    .await?;
             }
         }
 
-        if !append {
+        if remainder > 0 {
+            let mut staged = Vec::with_capacity(usize::try_from(remainder)?);
+            let mut remainder_reader = (&mut reader).take(remainder);
+            remainder_reader.read_to_end(&mut staged).await?;
+            if u64::try_from(staged.len())? != remainder {
+                return Err(io::Error::new(
+                    ErrorKind::UnexpectedEof,
+                    format!(
+                        "expected {remainder} bytes for staged multipart remainder, got {}",
+                        staged.len()
+                    ),
+                )
+                .into());
+            }
+            self.store_staged_chunk(name, uuid, Bytes::from(staged), uploaded_size)
+                .await?;
+            total_size += remainder;
+        }
+
+        if !append || remainder > 0 {
             self.save_hasher(name, uuid, total_size, reader.serialized_state())
                 .await?;
         }
@@ -314,13 +376,6 @@ impl Backend {
     }
 }
 
-/// Returns `true` when `chunk_len` is large enough to flush as a multipart part.
-/// Smaller chunks must be staged so they can accumulate across PATCH requests
-/// before reaching the S3 minimum part size.
-fn should_flush(chunk_len: u64, multipart_part_size: u64) -> bool {
-    chunk_len >= multipart_part_size
-}
-
 /// Returns the 1-based part number for the next part to upload, given the
 /// number of parts already completed.  S3 part numbers start at 1.
 fn next_part_number(completed_parts: usize) -> Result<u32, Error> {
@@ -329,46 +384,7 @@ fn next_part_number(completed_parts: usize) -> Result<u32, Error> {
 
 #[cfg(test)]
 mod tests {
-    use super::{next_part_number, should_flush};
-
-    // --- should_flush ---
-
-    #[test]
-    fn flushes_when_chunk_meets_part_size() {
-        assert!(should_flush(5 * 1024 * 1024, 5 * 1024 * 1024));
-    }
-
-    #[test]
-    fn flushes_when_chunk_exceeds_part_size() {
-        assert!(should_flush(5 * 1024 * 1024 + 1, 5 * 1024 * 1024));
-    }
-
-    #[test]
-    fn stages_when_chunk_below_part_size() {
-        assert!(!should_flush(5 * 1024 * 1024 - 1, 5 * 1024 * 1024));
-    }
-
-    #[test]
-    fn stages_empty_chunk() {
-        assert!(!should_flush(0, 5 * 1024 * 1024));
-    }
-
-    #[test]
-    fn flushes_when_part_size_is_one_and_chunk_is_nonempty() {
-        assert!(should_flush(1, 1));
-    }
-
-    #[test]
-    fn stages_when_part_size_is_one_and_chunk_is_empty() {
-        assert!(!should_flush(0, 1));
-    }
-
-    #[test]
-    fn flushes_when_chunk_is_max_u64() {
-        assert!(should_flush(u64::MAX, 5 * 1024 * 1024));
-    }
-
-    // --- next_part_number ---
+    use crate::registry::blob_store::s3::uniform::next_part_number;
 
     #[test]
     fn first_part_when_no_parts_uploaded() {

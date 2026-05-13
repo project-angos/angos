@@ -415,7 +415,7 @@ multipart_part_size = "50MiB"
 
 In this mode, a long-lived multipart upload is maintained across all `PATCH` requests. Each non-final part is exactly `multipart_part_size` bytes, and the final part may be smaller.
 
-**Memory usage:** up to `multipart_part_size` (default 50 MiB) per active upload, as each part is fully buffered in memory before being sent to S3.
+**Memory usage:** full parts stream to S3 in small read frames. Only the trailing staged chunk is buffered, and it is always smaller than `multipart_part_size`.
 
 ### Related Configuration
 
@@ -457,7 +457,7 @@ copy limits without proxying blob bytes through Angos.
 - **VPC Endpoint**: Reduce costs and latency by avoiding internet gateway
 
 **Multipart Upload:**
-- **Part size** (`multipart_part_size`, default 50 MiB): Larger parts reduce requests but consume more memory. Each active multipart upload buffers up to this size in memory.
+- **Part size** (`multipart_part_size`, default 50 MiB): Larger parts reduce S3 requests. Uniform mode streams full parts and only buffers the trailing staged chunk.
 - **Uniform parts** (`multipart_uniform_parts`, default false): Set to `true` only if your S3 provider strictly requires uniform non-final part sizes.
 
 **Timeout Configuration:**
