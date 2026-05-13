@@ -229,7 +229,7 @@ mod tests {
         cache,
         configuration::Configuration,
         metrics_provider,
-        test_fixtures::configuration::{config_toml, minimal_config},
+        test_fixtures::configuration::{load_config, minimal_config},
     };
 
     fn create_minimal_config() -> Configuration {
@@ -247,7 +247,7 @@ mod tests {
 
     #[test]
     fn test_auth_config_with_identity() {
-        let toml = config_toml(
+        let config = load_config(
             r#"
             [auth.identity.user1]
             username = "user1"
@@ -255,28 +255,26 @@ mod tests {
         "#,
         );
 
-        let config = Configuration::load_from_str(&toml).unwrap();
         assert_eq!(config.auth.identity.len(), 1);
         assert!(config.auth.identity.contains_key("user1"));
     }
 
     #[test]
     fn test_auth_config_with_oidc() {
-        let toml = config_toml(
+        let config = load_config(
             r#"
             [auth.oidc.github]
             provider = "github"
         "#,
         );
 
-        let config = Configuration::load_from_str(&toml).unwrap();
         assert_eq!(config.auth.oidc.len(), 1);
         assert!(config.auth.oidc.contains_key("github"));
     }
 
     #[test]
     fn test_auth_config_with_webhook() {
-        let toml = config_toml(
+        let config = load_config(
             r#"
             [auth.webhook.test]
             url = "http://localhost:8080/auth"
@@ -284,7 +282,6 @@ mod tests {
         "#,
         );
 
-        let config = Configuration::load_from_str(&toml).unwrap();
         assert_eq!(config.auth.webhook.len(), 1);
         assert!(config.auth.webhook.contains_key("test"));
     }
@@ -301,7 +298,7 @@ mod tests {
 
     #[test]
     fn test_authenticator_new_with_basic_auth() {
-        let toml = config_toml(
+        let config = load_config(
             r#"
             [auth.identity.testuser]
             username = "testuser"
@@ -309,7 +306,6 @@ mod tests {
         "#,
         );
 
-        let config = Configuration::load_from_str(&toml).unwrap();
         let cache = cache::Config::Memory.to_backend().unwrap();
 
         let authenticator = Authenticator::new(&config, &cache);
@@ -330,14 +326,13 @@ mod tests {
 
     #[test]
     fn test_build_oidc_validators_with_github() {
-        let toml = config_toml(
+        let config = load_config(
             r#"
             [auth.oidc.github]
             provider = "github"
         "#,
         );
 
-        let config = Configuration::load_from_str(&toml).unwrap();
         let cache = cache::Config::Memory.to_backend().unwrap();
 
         let validators = Authenticator::build_oidc_validators(&config.auth, &cache);
@@ -350,7 +345,7 @@ mod tests {
 
     #[test]
     fn test_build_oidc_validators_with_generic() {
-        let toml = config_toml(
+        let config = load_config(
             r#"
             [auth.oidc.custom]
             provider = "generic"
@@ -358,7 +353,6 @@ mod tests {
         "#,
         );
 
-        let config = Configuration::load_from_str(&toml).unwrap();
         let cache = cache::Config::Memory.to_backend().unwrap();
 
         let validators = Authenticator::build_oidc_validators(&config.auth, &cache);
@@ -371,7 +365,7 @@ mod tests {
 
     #[test]
     fn test_build_oidc_validators_multiple() {
-        let toml = config_toml(
+        let config = load_config(
             r#"
             [auth.oidc.github]
             provider = "github"
@@ -382,7 +376,6 @@ mod tests {
         "#,
         );
 
-        let config = Configuration::load_from_str(&toml).unwrap();
         let cache = cache::Config::Memory.to_backend().unwrap();
 
         let validators = Authenticator::build_oidc_validators(&config.auth, &cache);
@@ -417,7 +410,7 @@ mod tests {
         let argon = Argon2::new(Algorithm::Argon2id, Version::V0x13, config);
         let password_hash = argon.hash_password(b"testpass", &salt).unwrap().to_string();
 
-        let toml = config_toml(&format!(
+        let config = load_config(&format!(
             r#"
             [auth.identity.testuser]
             username = "testuser"
@@ -425,7 +418,6 @@ mod tests {
         "#,
         ));
 
-        let config = Configuration::load_from_str(&toml).unwrap();
         let cache = cache::Config::Memory.to_backend().unwrap();
         let authenticator = Authenticator::new(&config, &cache).unwrap();
 
@@ -452,7 +444,7 @@ mod tests {
         let argon = Argon2::new(Algorithm::Argon2id, Version::V0x13, config);
         let password_hash = argon.hash_password(b"testpass", &salt).unwrap().to_string();
 
-        let toml = config_toml(&format!(
+        let config = load_config(&format!(
             r#"
             [auth.identity.testuser]
             username = "testuser"
@@ -460,7 +452,6 @@ mod tests {
         "#,
         ));
 
-        let config = Configuration::load_from_str(&toml).unwrap();
         let cache = cache::Config::Memory.to_backend().unwrap();
         let authenticator = Authenticator::new(&config, &cache).unwrap();
 
@@ -530,7 +521,7 @@ mod tests {
     fn test_build_oidc_validators_multiple_are_sorted_by_name() {
         // "custom" < "github" alphabetically; HashMap iteration order is non-deterministic,
         // so this test would be flaky without the explicit sort added in build_oidc_validators.
-        let toml = config_toml(
+        let config = load_config(
             r#"
             [auth.oidc.github]
             provider = "github"
@@ -541,7 +532,6 @@ mod tests {
         "#,
         );
 
-        let config = Configuration::load_from_str(&toml).unwrap();
         let cache = cache::Config::Memory.to_backend().unwrap();
 
         let validators = Authenticator::build_oidc_validators(&config.auth, &cache).unwrap();
@@ -815,14 +805,13 @@ mod tests {
         let argon = Argon2::new(Algorithm::Argon2id, Version::V0x13, Params::default());
         let password_hash = argon.hash_password(b"secret", &salt).unwrap().to_string();
 
-        let toml = config_toml(&format!(
+        let config = load_config(&format!(
             r#"
             [auth.identity.admin]
             username = "admin"
             password = "{password_hash}"
         "#,
         ));
-        let config = Configuration::load_from_str(&toml).unwrap();
         let basic_auth_validator = BasicAuthValidator::new(&config.auth.identity);
 
         let oidc_validators: OidcValidators = vec![(

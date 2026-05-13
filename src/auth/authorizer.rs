@@ -328,7 +328,7 @@ mod tests {
         cache,
         configuration::Configuration,
         identity::{ClientCertificate, OidcClaims},
-        test_fixtures::configuration::{config_toml, minimal_config},
+        test_fixtures::configuration::{load_config, minimal_config, try_load_config},
     };
 
     #[derive(Clone, Default)]
@@ -383,7 +383,7 @@ mod tests {
 
     #[test]
     fn test_authorizer_new_with_global_access_policy() {
-        let toml = config_toml(
+        let config = load_config(
             r#"
             [global.access_policy]
             default = "allow"
@@ -391,7 +391,6 @@ mod tests {
         "#,
         );
 
-        let config = Configuration::load_from_str(&toml).unwrap();
         let cache = cache::Config::Memory.to_backend().unwrap();
 
         let authorizer = Authorizer::new(&config, &cache);
@@ -401,14 +400,13 @@ mod tests {
 
     #[test]
     fn test_authorizer_new_with_global_immutable_tags() {
-        let toml = config_toml(
+        let config = load_config(
             r#"
             immutable_tags = true
             immutable_tags_exclusions = ["^latest$", "^dev-.*"]
         "#,
         );
 
-        let config = Configuration::load_from_str(&toml).unwrap();
         let cache = cache::Config::Memory.to_backend().unwrap();
 
         let authorizer = Authorizer::new(&config, &cache);
@@ -421,7 +419,7 @@ mod tests {
 
     #[test]
     fn test_authorizer_new_with_repository_config() {
-        let toml = config_toml(
+        let config = load_config(
             r#"
             [repository.myrepo]
             namespace_pattern = "^myrepo/.*"
@@ -430,7 +428,6 @@ mod tests {
         "#,
         );
 
-        let config = Configuration::load_from_str(&toml).unwrap();
         let cache = cache::Config::Memory.to_backend().unwrap();
 
         let authorizer = Authorizer::new(&config, &cache);
@@ -443,14 +440,13 @@ mod tests {
 
     #[test]
     fn test_invalid_global_regex_fails_at_deserialize() {
-        let toml = config_toml(
+        let result = try_load_config(
             r#"
             immutable_tags = true
             immutable_tags_exclusions = ["[invalid"]
         "#,
         );
 
-        let result = Configuration::load_from_str(&toml);
         assert!(
             result.is_err(),
             "invalid global regex must fail at deserialize time"
@@ -459,7 +455,7 @@ mod tests {
 
     #[test]
     fn test_invalid_repository_regex_fails_at_deserialize() {
-        let toml = config_toml(
+        let result = try_load_config(
             r#"
             [repository.myrepo]
             namespace_pattern = "^myrepo/.*"
@@ -468,7 +464,6 @@ mod tests {
         "#,
         );
 
-        let result = Configuration::load_from_str(&toml);
         assert!(
             result.is_err(),
             "invalid repository regex must fail at deserialize time"
@@ -477,13 +472,12 @@ mod tests {
 
     #[test]
     fn test_is_tag_mutable_with_global_setting() {
-        let toml = config_toml(
+        let config = load_config(
             r#"
             immutable_tags = true
         "#,
         );
 
-        let config = Configuration::load_from_str(&toml).unwrap();
         let cache = cache::Config::Memory.to_backend().unwrap();
         let authorizer = Authorizer::new(&config, &cache).unwrap();
         assert!(!authorizer.is_tag_mutable(None, "v1.0.0"));
@@ -491,14 +485,13 @@ mod tests {
 
     #[test]
     fn test_is_tag_mutable_with_global_exclusions() {
-        let toml = config_toml(
+        let config = load_config(
             r#"
             immutable_tags = true
             immutable_tags_exclusions = ["^latest$", "^dev-.*"]
         "#,
         );
 
-        let config = Configuration::load_from_str(&toml).unwrap();
         let cache = cache::Config::Memory.to_backend().unwrap();
         let authorizer = Authorizer::new(&config, &cache).unwrap();
         assert!(authorizer.is_tag_mutable(None, "latest"));
@@ -508,7 +501,7 @@ mod tests {
 
     #[test]
     fn test_is_tag_mutable_with_repository_setting() {
-        let toml = config_toml(
+        let config = load_config(
             r#"
             immutable_tags = false
 
@@ -518,7 +511,6 @@ mod tests {
         "#,
         );
 
-        let config = Configuration::load_from_str(&toml).unwrap();
         let cache = cache::Config::Memory.to_backend().unwrap();
         let authorizer = Authorizer::new(&config, &cache).unwrap();
         assert!(!authorizer.is_tag_mutable(Some("myrepo"), "v1.0.0"));
@@ -526,7 +518,7 @@ mod tests {
 
     #[test]
     fn test_is_tag_mutable_with_repository_exclusions() {
-        let toml = config_toml(
+        let config = load_config(
             r#"
             immutable_tags = true
             immutable_tags_exclusions = ["^latest$"]
@@ -538,7 +530,6 @@ mod tests {
         "#,
         );
 
-        let config = Configuration::load_from_str(&toml).unwrap();
         let cache = cache::Config::Memory.to_backend().unwrap();
         let authorizer = Authorizer::new(&config, &cache).unwrap();
         assert!(authorizer.is_tag_mutable(Some("myrepo"), "test-123"));
@@ -548,7 +539,7 @@ mod tests {
 
     #[test]
     fn test_is_tag_mutable_with_repository_name() {
-        let toml = config_toml(
+        let config = load_config(
             r#"
             immutable_tags = false
 
@@ -558,7 +549,6 @@ mod tests {
         "#,
         );
 
-        let config = Configuration::load_from_str(&toml).unwrap();
         let cache = cache::Config::Memory.to_backend().unwrap();
         let authorizer = Authorizer::new(&config, &cache).unwrap();
         assert!(!authorizer.is_tag_mutable(Some("docker-io"), "v1.0.0"));
@@ -568,7 +558,7 @@ mod tests {
 
     #[test]
     fn test_is_tag_mutable_when_not_immutable() {
-        let toml = config_toml(
+        let config = load_config(
             r#"
             immutable_tags = false
 
@@ -578,7 +568,6 @@ mod tests {
         "#,
         );
 
-        let config = Configuration::load_from_str(&toml).unwrap();
         let cache = cache::Config::Memory.to_backend().unwrap();
         let authorizer = Authorizer::new(&config, &cache).unwrap();
         assert!(authorizer.is_tag_mutable(Some("myrepo"), "any-tag"));
@@ -588,7 +577,7 @@ mod tests {
     // tag is mutable (the exclusion carves out a writable subset).
     #[test]
     fn is_tag_mutable_returns_true_when_immutable_but_excluded() {
-        let toml = config_toml(
+        let config = load_config(
             r#"
             [repository.myrepo]
             namespace_pattern = "^myrepo/.*"
@@ -597,7 +586,6 @@ mod tests {
         "#,
         );
 
-        let config = Configuration::load_from_str(&toml).unwrap();
         let cache = cache::Config::Memory.to_backend().unwrap();
         let authorizer = Authorizer::new(&config, &cache).unwrap();
         assert!(
@@ -614,7 +602,7 @@ mod tests {
     // the tag is immutable.
     #[test]
     fn is_tag_mutable_returns_false_when_immutable_and_not_excluded() {
-        let toml = config_toml(
+        let config = load_config(
             r#"
             [repository.myrepo]
             namespace_pattern = "^myrepo/.*"
@@ -623,7 +611,6 @@ mod tests {
         "#,
         );
 
-        let config = Configuration::load_from_str(&toml).unwrap();
         let cache = cache::Config::Memory.to_backend().unwrap();
         let authorizer = Authorizer::new(&config, &cache).unwrap();
         assert!(
@@ -641,7 +628,7 @@ mod tests {
             oci::{Namespace, Reference},
         };
 
-        let toml = config_toml(
+        let config = load_config(
             r#"
             immutable_tags = true
 
@@ -650,7 +637,6 @@ mod tests {
         "#,
         );
 
-        let config = Configuration::load_from_str(&toml).unwrap();
         let cache = cache::Config::Memory.to_backend().unwrap();
         let authorizer = Authorizer::new(&config, &cache).unwrap();
 
@@ -718,7 +704,7 @@ mod tests {
     }
 
     fn create_pull_through_config() -> Configuration {
-        let toml = config_toml(
+        load_config(
             r#"
             [global.access_policy]
             default = "allow"
@@ -728,9 +714,7 @@ mod tests {
             [[repository."docker-io".upstream]]
             url = "https://registry-1.docker.io"
         "#,
-        );
-
-        Configuration::load_from_str(&toml).unwrap()
+        )
     }
 
     async fn create_pull_through_registry(config: &Configuration) -> Registry {
@@ -897,14 +881,13 @@ mod tests {
     async fn global_deny_policy_rejects_all_requests() {
         use crate::command::server::Error as ServerError;
 
-        let toml = config_toml(
+        let config = load_config(
             r#"
             [global.access_policy]
             default = "deny"
         "#,
         );
 
-        let config = Configuration::load_from_str(&toml).unwrap();
         let cache = cache::Config::Memory.to_backend().unwrap();
         let authorizer = Authorizer::new(&config, &cache).unwrap();
         let registry = create_pull_through_registry(&config).await;
@@ -939,7 +922,7 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        let toml = config_toml(&format!(
+        let config = load_config(&format!(
             r#"
             authorization_webhook = "gatekeeper"
 
@@ -953,7 +936,6 @@ mod tests {
             url = mock_server.uri()
         ));
 
-        let config = Configuration::load_from_str(&toml).unwrap();
         let cache = cache::Config::Memory.to_backend().unwrap();
         let authorizer = Authorizer::new(&config, &cache).unwrap();
         let registry = create_pull_through_registry(&config).await;
@@ -986,7 +968,7 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        let toml = config_toml(&format!(
+        let config = load_config(&format!(
             r#"
             authorization_webhook = "gatekeeper"
 
@@ -1000,7 +982,6 @@ mod tests {
             url = mock_server.uri()
         ));
 
-        let config = Configuration::load_from_str(&toml).unwrap();
         let cache = cache::Config::Memory.to_backend().unwrap();
         let authorizer = Authorizer::new(&config, &cache).unwrap();
         let registry = create_pull_through_registry(&config).await;
@@ -1049,14 +1030,13 @@ mod tests {
     async fn authorize_request_unknown_namespace_is_allowed_under_allow_policy() {
         use crate::oci::Namespace;
 
-        let toml = config_toml(
+        let config = load_config(
             r#"
             [global.access_policy]
             default = "allow"
         "#,
         );
 
-        let config = Configuration::load_from_str(&toml).unwrap();
         let cache = cache::Config::Memory.to_backend().unwrap();
         let authorizer = Authorizer::new(&config, &cache).unwrap();
         let registry = create_pull_through_registry(&config).await;
@@ -1093,7 +1073,7 @@ mod tests {
     async fn webhook_unreachable_fails_closed() {
         use crate::oci::Namespace;
 
-        let toml = config_toml(
+        let config = load_config(
             r#"
             [global.access_policy]
             default = "allow"
@@ -1108,7 +1088,6 @@ mod tests {
         "#,
         );
 
-        let config = Configuration::load_from_str(&toml).unwrap();
         let cache = cache::Config::Memory.to_backend().unwrap();
         let authorizer = Authorizer::new(&config, &cache).unwrap();
         let registry = create_pull_through_registry(&config).await;

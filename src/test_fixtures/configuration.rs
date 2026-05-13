@@ -1,4 +1,4 @@
-use crate::configuration::Configuration;
+use crate::configuration::{Configuration, Error};
 
 pub const MINIMAL_CONFIG_TOML: &str = r#"
     [blob_store.fs]
@@ -24,4 +24,12 @@ pub fn minimal_config() -> Configuration {
 
 pub fn config_toml(extra: &str) -> String {
     format!("{MINIMAL_CONFIG_TOML}\n{extra}")
+}
+
+pub fn load_config(extra: &str) -> Configuration {
+    try_load_config(extra).unwrap()
+}
+
+pub fn try_load_config(extra: &str) -> Result<Configuration, Error> {
+    Configuration::load_from_str(&config_toml(extra))
 }
