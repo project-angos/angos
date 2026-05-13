@@ -4,12 +4,15 @@ use hyper::http::request::Parts;
 use serde::Deserialize;
 use tracing::{debug, info, instrument, warn};
 
-use super::{
-    AuthMiddleware, AuthResult, BasicAuthValidator, MtlsValidator, basic_auth, oidc,
-    oidc::OidcValidator, webhook,
-};
 use crate::{
-    cache::Cache, command::server::Error, configuration::Configuration, identity::ClientIdentity,
+    auth::{
+        AuthMiddleware, AuthResult, BasicAuthValidator, MtlsValidator, OidcValidator, basic_auth,
+        oidc, webhook,
+    },
+    cache::Cache,
+    command::server::Error,
+    configuration::Configuration,
+    identity::ClientIdentity,
     metrics_provider::metrics_provider,
 };
 
