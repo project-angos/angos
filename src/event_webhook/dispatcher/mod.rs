@@ -246,7 +246,7 @@ impl EventDispatcher {
     }
 
     pub async fn shutdown_with_timeout(&self, timeout: Duration) {
-        self.shutdown.store(true, Ordering::SeqCst);
+        self.shutdown.store(true, Ordering::Release);
         if tokio::time::timeout(timeout, self.drain_in_flight())
             .await
             .is_err()
@@ -267,7 +267,7 @@ impl EventDispatcher {
         body: Bytes,
         event_kind_header: &str,
     ) -> bool {
-        if self.shutdown.load(Ordering::SeqCst) {
+        if self.shutdown.load(Ordering::Acquire) {
             warn!("Async webhook '{name}' skipped: dispatcher is shut down");
             return false;
         }
