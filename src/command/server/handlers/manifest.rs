@@ -6,7 +6,6 @@ use crate::{
         ServerContext,
         error::Error,
         handlers::build_response,
-        http_server::event_emission::dispatch_events,
         request_ext::{HeaderExt, incoming_into_async_read},
         response_body::ResponseBody,
     },
@@ -150,7 +149,7 @@ pub async fn dispatch_put_manifest(
     )
     .await?;
 
-    dispatch_events(context, events).await?;
+    context.dispatch_events(&events).await?;
     Ok(response)
 }
 
@@ -163,6 +162,6 @@ pub async fn dispatch_delete_manifest(
     let (response, events) =
         handle_delete_manifest(context, namespace, reference, identity).await?;
 
-    dispatch_events(context, events).await?;
+    context.dispatch_events(&events).await?;
     Ok(response)
 }

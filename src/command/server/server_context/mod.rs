@@ -102,6 +102,13 @@ impl ServerContext {
         Ok(())
     }
 
+    pub async fn dispatch_events(&self, events: &[Event]) -> Result<(), Error> {
+        for event in events {
+            self.dispatch_event(event).await?;
+        }
+        Ok(())
+    }
+
     pub async fn shutdown_with_timeout(&self, timeout: std::time::Duration) {
         self.registry.flush_pending_writes().await;
         if let Some(dispatcher) = &self.event_dispatcher {
