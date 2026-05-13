@@ -155,6 +155,7 @@ Argon2id with strong parameters:
 OIDC tokens are fully verified:
 - Signature against provider's JWKS
 - Per-provider algorithm allowlist before signature verification, defaulting to RS256
+- One cache-bypassing JWKS refresh when a cached key set misses a token `kid`
 - Issuer claim must match
 - Audience claim checked if configured
 - Expiration enforced

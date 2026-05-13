@@ -1,8 +1,9 @@
-use std::collections::HashMap;
+use std::{collections::HashMap, time::Duration};
 
 use jsonwebtoken::{Algorithm, Header, Validation, decode, decode_header};
 use reqwest::{Client, header::ACCEPT};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use tokio::time::timeout;
 use tracing::{debug, info, warn};
 
 use crate::{
@@ -24,6 +25,13 @@ struct Jwks {
     keys: Vec<Jwk>,
 }
 
+struct FetchedJwks {
+    jwks: Jwks,
+    from_cache: bool,
+}
+
+const JWKS_REFRESH_TIMEOUT: Duration = Duration::from_secs(5);
+
 pub async fn validate_oidc_token(
     provider_name: &str,
     provider: &dyn OidcProvider,
@@ -35,8 +43,17 @@ pub async fn validate_oidc_token(
         .map_err(|e| Error::Unauthorized(format!("Failed to decode JWT header: {e}")))?;
     verify_allowed_algorithm(provider, header.alg)?;
 
-    let jwks = fetch_jwks(provider, client, cache).await?;
-    verify_jwt_with_header(token, &header, &jwks, provider_name, provider)
+    let mut fetched_jwks = fetch_jwks(provider, client, cache).await?;
+    if fetched_jwks.from_cache && cached_jwks_misses_kid(&fetched_jwks.jwks, &header) {
+        info!(
+            "Cached JWKS for provider {} does not contain kid {:?}; refreshing",
+            provider.name(),
+            header.kid
+        );
+        fetched_jwks.jwks = fetch_fresh_jwks_with_timeout(provider, client, cache).await?;
+    }
+
+    verify_jwt_with_header(token, &header, &fetched_jwks.jwks, provider_name, provider)
 }
 
 fn verify_jwt_with_header(
@@ -123,6 +140,13 @@ fn build_validation(provider: &dyn OidcProvider, alg: Algorithm) -> Validation {
     validation
 }
 
+fn cached_jwks_misses_kid(jwks: &Jwks, header: &Header) -> bool {
+    let Some(kid) = header.kid.as_deref() else {
+        return false;
+    };
+    !jwks.keys.iter().any(|key| key.kid() == Some(kid))
+}
+
 async fn query_json<T>(client: &Client, url: &str) -> Result<T, Error>
 where
     T: DeserializeOwned,
@@ -162,19 +186,27 @@ async fn get_jwks_url(
     Ok(oidc_config.jwks_uri)
 }
 
+fn jwks_cache_key(provider: &dyn OidcProvider) -> String {
+    let provider_name = provider.name();
+    let issuer_hash = sha256::hex(provider.issuer());
+    format!("oidc:{provider_name}:jwks:{issuer_hash}")
+}
+
 async fn fetch_jwks(
     provider: &dyn OidcProvider,
     client: &Client,
     cache: &Cache,
-) -> Result<Jwks, Error> {
+) -> Result<FetchedJwks, Error> {
     let provider_name = provider.name();
-    let issuer_hash = sha256::hex(provider.issuer());
-    let cache_key = format!("oidc:{provider_name}:jwks:{issuer_hash}");
+    let cache_key = jwks_cache_key(provider);
 
     match cache.retrieve::<Jwks>(&cache_key).await {
         Ok(Some(cached)) => {
             debug!("Using cached JWKS for provider: {provider_name}");
-            return Ok(cached);
+            return Ok(FetchedJwks {
+                jwks: cached,
+                from_cache: true,
+            });
         }
         Err(err) => {
             warn!("OIDC JWKS cache retrieve failed for {provider_name}: {err}");
@@ -182,6 +214,39 @@ async fn fetch_jwks(
         Ok(None) => {}
     }
 
+    fetch_fresh_jwks(provider, client, cache)
+        .await
+        .map(|jwks| FetchedJwks {
+            jwks,
+            from_cache: false,
+        })
+}
+
+async fn fetch_fresh_jwks_with_timeout(
+    provider: &dyn OidcProvider,
+    client: &Client,
+    cache: &Cache,
+) -> Result<Jwks, Error> {
+    timeout(
+        JWKS_REFRESH_TIMEOUT,
+        fetch_fresh_jwks(provider, client, cache),
+    )
+    .await
+    .map_err(|_| {
+        Error::Unauthorized(format!(
+            "Timed out refreshing JWKS for provider {}",
+            provider.name()
+        ))
+    })?
+}
+
+async fn fetch_fresh_jwks(
+    provider: &dyn OidcProvider,
+    client: &Client,
+    cache: &Cache,
+) -> Result<Jwks, Error> {
+    let provider_name = provider.name();
+    let cache_key = jwks_cache_key(provider);
     let jwks_url = get_jwks_url(provider, client, cache).await?;
     let jwks = query_json::<Jwks>(client, &jwks_url).await?;
 
@@ -337,7 +402,8 @@ pub mod tests {
 
         assert!(result.is_ok());
         let jwks = result.unwrap();
-        assert_eq!(jwks.keys.len(), 1);
+        assert_eq!(jwks.jwks.keys.len(), 1);
+        assert!(!jwks.from_cache);
     }
 
     #[tokio::test]
@@ -388,7 +454,8 @@ pub mod tests {
 
         assert!(result.is_ok());
         let jwks = result.unwrap();
-        assert_eq!(jwks.keys.len(), 1);
+        assert_eq!(jwks.jwks.keys.len(), 1);
+        assert!(!jwks.from_cache);
     }
 
     #[tokio::test]
@@ -430,6 +497,7 @@ pub mod tests {
 
         let result2 = fetch_jwks(&provider, &client, cache.as_ref()).await;
         assert!(result2.is_ok());
+        assert!(result2.unwrap().from_cache);
     }
 
     #[tokio::test]
@@ -637,6 +705,95 @@ pub mod tests {
         assert_eq!(oidc_claims.provider_name, "test-provider");
         assert_eq!(oidc_claims.provider_type, "Generic OIDC");
         assert_eq!(oidc_claims.claims.get("sub").unwrap(), "test-user");
+    }
+
+    #[tokio::test]
+    async fn test_validate_oidc_token_refreshes_jwks_once_when_cached_kid_is_missing() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/.well-known/jwks"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(static_jwks_response()))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let provider = Provider::new(build_test_provider_config(&mock_server.uri()));
+        let client = Client::new();
+        let cache = cache::Config::Memory.to_backend().unwrap();
+        let stale_jwks = Jwks {
+            keys: vec![Jwk::Ec {
+                key_use: Some("sig".to_string()),
+                kid: Some("old-kid".to_string()),
+                alg: Some("ES256".to_string()),
+                x: jwk_x().to_string(),
+                y: jwk_y().to_string(),
+            }],
+        };
+        cache
+            .store(&jwks_cache_key(&provider), &stale_jwks, 3600)
+            .await
+            .unwrap();
+
+        let claims = valid_claims(&mock_server.uri(), "test-audience");
+        let token = make_token(&claims, KID);
+
+        let result =
+            validate_oidc_token("test-provider", &provider, &token, &client, cache.as_ref()).await;
+
+        assert!(
+            result.is_ok(),
+            "expected rotated key to validate, got {result:?}"
+        );
+        let cached_jwks = cache
+            .retrieve::<Jwks>(&jwks_cache_key(&provider))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(cached_jwks.keys.iter().any(|key| key.kid() == Some(KID)));
+    }
+
+    #[tokio::test]
+    async fn test_validate_oidc_token_returns_unauthorized_when_refreshed_jwks_still_misses_kid() {
+        let mock_server = MockServer::start().await;
+        let refreshed_jwks = json!({
+            "keys": [{
+                "kty": "EC",
+                "use": "sig",
+                "kid": "different-kid",
+                "crv": "P-256",
+                "x": jwk_x(),
+                "y": jwk_y(),
+                "alg": "ES256"
+            }]
+        });
+
+        Mock::given(method("GET"))
+            .and(path("/.well-known/jwks"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(refreshed_jwks))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let provider = Provider::new(build_test_provider_config(&mock_server.uri()));
+        let client = Client::new();
+        let cache = cache::Config::Memory.to_backend().unwrap();
+        let stale_jwks = Jwks { keys: Vec::new() };
+        cache
+            .store(&jwks_cache_key(&provider), &stale_jwks, 3600)
+            .await
+            .unwrap();
+
+        let claims = valid_claims(&mock_server.uri(), "test-audience");
+        let token = make_token(&claims, KID);
+
+        let result =
+            validate_oidc_token("test-provider", &provider, &token, &client, cache.as_ref()).await;
+
+        match result.unwrap_err() {
+            Error::Unauthorized(msg) => assert!(msg.contains("No matching key")),
+            err => panic!("expected Unauthorized, got {err:?}"),
+        }
     }
 
     #[tokio::test]

@@ -78,6 +78,7 @@ Useful modules:
 - Issuer mismatch
 - Audience mismatch
 - JWKS fetch failure
+- Token signed after OIDC provider key rotation
 
 **Solutions**:
 1. Verify token hasn't expired
@@ -87,6 +88,7 @@ Useful modules:
    ```bash
    curl https://token.actions.githubusercontent.com/.well-known/jwks
    ```
+   If a token uses a new `kid`, Angos refreshes JWKS once outside the cache before rejecting it.
 
 ### mTLS Certificate Rejected
 
