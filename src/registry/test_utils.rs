@@ -110,11 +110,13 @@ pub async fn create_test_blob(
     (digest, repository)
 }
 
+#[async_trait::async_trait(?Send)]
 pub trait RegistryTestCase {
     fn registry(&self) -> &Registry;
     fn blob_store(&self) -> Arc<dyn BlobStore>;
     fn upload_store(&self) -> Arc<dyn UploadStore>;
     fn metadata_store(&self) -> Arc<dyn MetadataStore + Send + Sync>;
+    async fn cleanup(&self) {}
 }
 
 pub fn backends() -> Vec<Box<dyn RegistryTestCase>> {
@@ -183,6 +185,7 @@ impl FSRegistryTestCase {
     }
 }
 
+#[async_trait::async_trait(?Send)]
 impl RegistryTestCase for FSRegistryTestCase {
     fn registry(&self) -> &Registry {
         &self.registry
@@ -267,6 +270,20 @@ impl S3RegistryTestCase {
     }
 }
 
+impl S3RegistryTestCase {
+    pub async fn cleanup(&self) {
+        if let Err(e) = self
+            .s3_blob_store
+            .store
+            .delete_prefix(&self.key_prefix)
+            .await
+        {
+            println!("Warning: Failed to clean up S3RegistryTestCase data: {e:?}");
+        }
+    }
+}
+
+#[async_trait::async_trait(?Send)]
 impl RegistryTestCase for S3RegistryTestCase {
     fn registry(&self) -> &Registry {
         &self.s3_registry
@@ -283,19 +300,9 @@ impl RegistryTestCase for S3RegistryTestCase {
     fn metadata_store(&self) -> Arc<dyn MetadataStore + Send + Sync> {
         self.s3_metadata_store.clone()
     }
-}
 
-impl Drop for S3RegistryTestCase {
-    fn drop(&mut self) {
-        if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            let key_prefix = self.key_prefix.clone();
-            let blob_store = self.s3_blob_store.clone();
-            handle.spawn(async move {
-                if let Err(e) = blob_store.store.delete_prefix(&key_prefix).await {
-                    println!("Warning: Failed to clean up S3RegistryTestCase data: {e:?}");
-                }
-            });
-        }
+    async fn cleanup(&self) {
+        S3RegistryTestCase::cleanup(self).await;
     }
 }
 

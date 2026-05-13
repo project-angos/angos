@@ -45,18 +45,10 @@ impl UniformTestCase {
         .unwrap();
         Self { key_prefix, store }
     }
-}
 
-impl Drop for UniformTestCase {
-    fn drop(&mut self) {
-        if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            let key_prefix = self.key_prefix.clone();
-            let data_store = self.store.store.clone();
-            handle.spawn(async move {
-                if let Err(e) = data_store.delete_prefix(&key_prefix).await {
-                    println!("Warning: Failed to clean up UniformTestCase data: {e:?}");
-                }
-            });
+    async fn cleanup(&self) {
+        if let Err(e) = self.store.store.delete_prefix(&self.key_prefix).await {
+            println!("Warning: Failed to clean up UniformTestCase data: {e:?}");
         }
     }
 }
@@ -65,36 +57,42 @@ impl Drop for UniformTestCase {
 async fn test_list_uploads() {
     let t = S3RegistryTestCase::new();
     test_datastore_list_uploads(t.blob_store()).await;
+    t.cleanup().await;
 }
 
 #[tokio::test]
 async fn test_list_blobs() {
     let t = S3RegistryTestCase::new();
     test_datastore_list_blobs(t.blob_store()).await;
+    t.cleanup().await;
 }
 
 #[tokio::test]
 async fn test_blob_operations() {
     let t = S3RegistryTestCase::new();
     test_datastore_blob_operations(t.blob_store()).await;
+    t.cleanup().await;
 }
 
 #[tokio::test]
 async fn test_upload_operations() {
     let t = S3RegistryTestCase::new();
     test_datastore_upload_operations(t.blob_store()).await;
+    t.cleanup().await;
 }
 
 #[tokio::test]
 async fn test_blob_reader_returns_size() {
     let t = S3RegistryTestCase::new();
     test_build_blob_reader_returns_size(t.blob_store()).await;
+    t.cleanup().await;
 }
 
 #[tokio::test]
 async fn test_blob_reader_with_offset_returns_full_size() {
     let t = S3RegistryTestCase::new();
     test_build_blob_reader_with_offset_returns_full_size(t.blob_store()).await;
+    t.cleanup().await;
 }
 
 /// Tests multipart upload with staged chunks and S3 parts produces correct digest
@@ -132,6 +130,7 @@ async fn test_multipart_upload_digest() {
 
     let digest = store.complete("ns", &uuid, None).await.unwrap();
     assert_eq!(digest, expected.digest());
+    t.cleanup().await;
 }
 
 #[tokio::test]
@@ -166,6 +165,7 @@ async fn test_delete_prefix_removes_all_objects() {
         summary_after.is_err(),
         "Upload should not exist after delete"
     );
+    t.cleanup().await;
 }
 
 #[tokio::test]
@@ -186,6 +186,7 @@ async fn test_delete_blob_removes_all_data() {
 
     let read_after = store.read(&digest).await;
     assert!(read_after.is_err(), "Blob should not exist after delete");
+    t.cleanup().await;
 }
 
 #[tokio::test]
@@ -233,6 +234,7 @@ async fn test_delete_upload_cleans_all_artifacts() {
         objects_after.is_empty(),
         "All objects under upload container should be removed after delete"
     );
+    t.cleanup().await;
 }
 
 #[tokio::test]
@@ -278,6 +280,7 @@ async fn test_complete_upload_cleans_upload_container() {
         objects_after.is_empty(),
         "Upload container should be cleaned up after complete"
     );
+    t.cleanup().await;
 }
 
 /// Uniform-mode single-part upload: data smaller than the 5 MiB part size
@@ -308,6 +311,7 @@ async fn test_uniform_single_part_upload() {
 
     let digest = store.complete("ns", &uuid, None).await.unwrap();
     assert_eq!(digest, expected.digest());
+    t.cleanup().await;
 }
 
 /// Uniform-mode multi-part upload: 3 chunks totalling 12 MiB, requiring multiple S3 parts
@@ -347,6 +351,7 @@ async fn test_uniform_multi_part_upload() {
 
     let digest = store.complete("ns", &uuid, None).await.unwrap();
     assert_eq!(digest, expected.digest());
+    t.cleanup().await;
 }
 
 /// Uniform-mode `complete` removes all staging artifacts from the upload container
@@ -385,6 +390,7 @@ async fn test_uniform_complete_cleans_artifacts() {
         objects_after.is_empty(),
         "Upload container should be empty after complete in uniform mode"
     );
+    t.cleanup().await;
 }
 
 /// Uniform-mode round-trip: uploaded bytes are faithfully preserved through `read`
@@ -426,6 +432,7 @@ async fn test_uniform_round_trip_integrity() {
         blob_data, expected_content,
         "Round-tripped blob content must exactly match the original upload"
     );
+    t.cleanup().await;
 }
 
 /// Creates a raw S3 multipart upload without a `startedat` marker, making it a
@@ -484,6 +491,7 @@ async fn test_cleanup_orphan_multipart_uploads_aborts_old_uploads() {
         !uploads_after.iter().any(|u| u.key == upload_key),
         "orphan upload must be gone from the list after abort"
     );
+    t.cleanup().await;
 }
 
 /// Listing orphans is pure observation — it must not modify state.  Not calling
@@ -530,11 +538,10 @@ async fn test_list_orphan_multipart_uploads_does_not_modify_state() {
         .await
         .unwrap();
     for upload in pending.into_iter().filter(|u| u.key == upload_key) {
-        let store = backend.store.clone();
-        tokio::spawn(async move {
-            let _ = store
-                .abort_multipart_upload(&upload.key, &upload.upload_id)
-                .await;
-        });
+        let _ = backend
+            .store
+            .abort_multipart_upload(&upload.key, &upload.upload_id)
+            .await;
     }
+    t.cleanup().await;
 }

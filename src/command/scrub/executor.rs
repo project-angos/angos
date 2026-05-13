@@ -201,6 +201,7 @@ mod tests {
                 blob_store.read(&orphan_digest).await.is_ok(),
                 "dry-run must not delete the blob"
             );
+            test_case.cleanup().await;
         }
     }
 
@@ -230,6 +231,7 @@ mod tests {
                 blob_store.read(&orphan_digest).await.is_err(),
                 "real-run must delete the blob"
             );
+            test_case.cleanup().await;
         }
     }
 

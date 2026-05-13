@@ -152,6 +152,7 @@ mod tests {
                 matches!(verdict, BlobVerdict::Orphan),
                 "A blob with no index entry must be classified as Orphan"
             );
+            test_case.cleanup().await;
         }
     }
 
@@ -183,6 +184,7 @@ mod tests {
                 matches!(verdict, BlobVerdict::Orphan),
                 "A blob whose namespace map is empty must be classified as Orphan"
             );
+            test_case.cleanup().await;
         }
     }
 
@@ -208,6 +210,7 @@ mod tests {
                     panic!("Expected Referenced, got Orphan");
                 }
             }
+            test_case.cleanup().await;
         }
     }
 
@@ -270,6 +273,7 @@ mod tests {
                 final_refs < initial_refs,
                 "Invalid blob index entry should be removed. Before: {initial_refs}, After: {final_refs}"
             );
+            test_case.cleanup().await;
         }
     }
 
@@ -299,6 +303,7 @@ mod tests {
                 blob_store.read(&orphan_digest).await.is_err(),
                 "Orphan blob without index should be deleted after scrub"
             );
+            test_case.cleanup().await;
         }
     }
 
@@ -327,6 +332,7 @@ mod tests {
                     .any(|a| matches!(a, Action::DeleteOrphanBlob(_))),
                 "Vec sink must capture the DeleteOrphanBlob action"
             );
+            test_case.cleanup().await;
         }
     }
 }

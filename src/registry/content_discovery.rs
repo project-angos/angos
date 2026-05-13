@@ -190,6 +190,7 @@ mod tests {
                 .await
                 .unwrap();
             assert!(referrers.is_empty());
+            test_case.cleanup().await;
         }
     }
 
@@ -212,6 +213,7 @@ mod tests {
                 .unwrap();
             assert!(namespaces.is_empty());
             assert!(token.is_none());
+            test_case.cleanup().await;
         }
     }
 
@@ -288,6 +290,7 @@ mod tests {
                 .unwrap();
             assert_eq!(tags.len(), 2);
             assert!(token.is_none());
+            test_case.cleanup().await;
         }
     }
 
@@ -420,6 +423,7 @@ mod tests {
 
             assert_eq!(referrers.len(), 1);
             assert_eq!(referrers[0].digest, referrer_manifest_digest);
+            test_case.cleanup().await;
         }
     }
 }

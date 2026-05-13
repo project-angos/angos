@@ -114,6 +114,7 @@ mod tests {
                 "Digest link should be created if missing"
             );
             assert_eq!(digest_link.unwrap().target, blob_digest);
+            test_case.cleanup().await;
         }
     }
 
@@ -152,6 +153,7 @@ mod tests {
                 digest_link.is_ok(),
                 "scrub_tags should create missing digest links"
             );
+            test_case.cleanup().await;
         }
     }
 }

@@ -367,6 +367,7 @@ mod tests {
                 response.headers[CONTENT_LENGTH.as_str()],
                 content.len().to_string()
             );
+            test_case.cleanup().await;
         }
     }
 
@@ -395,6 +396,7 @@ mod tests {
                 GetBlobResponse::RangedReader { .. } => panic!("Expected Reader response"),
                 GetBlobResponse::Redirect { .. } => panic!("unexpected redirect from get_blob"),
             }
+            test_case.cleanup().await;
         }
     }
 
@@ -428,6 +430,7 @@ mod tests {
                 GetBlobResponse::Reader { .. } => panic!("Expected RangedReader response"),
                 GetBlobResponse::Redirect { .. } => panic!("unexpected redirect from get_blob"),
             }
+            test_case.cleanup().await;
         }
     }
 
@@ -489,6 +492,7 @@ mod tests {
                     .await
                     .is_err()
             );
+            test_case.cleanup().await;
         }
     }
 
@@ -511,6 +515,7 @@ mod tests {
 
             let stored_content = registry.blob_store.read(&digest).await.unwrap();
             assert_eq!(stored_content, content);
+            test_case.cleanup().await;
         }
     }
 
@@ -559,6 +564,7 @@ mod tests {
                     panic!("unexpected redirect from get_local_blob")
                 }
             }
+            test_case.cleanup().await;
         }
     }
 
@@ -598,6 +604,7 @@ mod tests {
                 GetBlobResponse::RangedReader { .. } => panic!("Expected Reader response"),
                 GetBlobResponse::Redirect { .. } => panic!("unexpected redirect from get_blob"),
             }
+            test_case.cleanup().await;
         }
     }
 

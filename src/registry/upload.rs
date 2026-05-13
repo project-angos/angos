@@ -276,6 +276,7 @@ mod tests {
                 }
                 StartUploadResponse::Session { .. } => panic!("Expected Existing response"),
             }
+            test_case.cleanup().await;
         }
     }
 
@@ -329,6 +330,7 @@ mod tests {
                 summary.size,
                 (content.len() + additional_content.len()) as u64
             );
+            test_case.cleanup().await;
         }
     }
 
@@ -379,6 +381,7 @@ mod tests {
 
             let stored_content = registry.blob_store.read(&expected_digest).await.unwrap();
             assert_eq!(stored_content, content);
+            test_case.cleanup().await;
         }
     }
 
@@ -412,6 +415,7 @@ mod tests {
                     .await
                     .is_err()
             );
+            test_case.cleanup().await;
         }
     }
 
@@ -449,6 +453,7 @@ mod tests {
                 response.headers[RANGE.as_str()],
                 format!("0-{}", content.len() - 1)
             );
+            test_case.cleanup().await;
         }
     }
 
@@ -477,6 +482,7 @@ mod tests {
                 .await;
 
             assert!(matches!(result, Err(Error::RangeNotSatisfiable)));
+            test_case.cleanup().await;
         }
     }
 
@@ -512,6 +518,7 @@ mod tests {
                 .await;
 
             assert!(matches!(result, Err(Error::DigestInvalid)));
+            test_case.cleanup().await;
         }
     }
 
@@ -553,6 +560,7 @@ mod tests {
                 .unwrap();
 
             assert_eq!(size, summary.size);
+            test_case.cleanup().await;
         }
     }
 
@@ -597,6 +605,7 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(summary.size, content.len() as u64);
+            test_case.cleanup().await;
         }
     }
 

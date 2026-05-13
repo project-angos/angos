@@ -663,6 +663,7 @@ mod tests {
                 .await;
 
             assert!(tag_link.is_ok());
+            test_case.cleanup().await;
         }
     }
 
@@ -696,6 +697,7 @@ mod tests {
                 .await;
 
             assert!(tag_link.is_ok());
+            test_case.cleanup().await;
         }
     }
 
@@ -740,6 +742,7 @@ mod tests {
                     .await
                     .is_err()
             );
+            test_case.cleanup().await;
         }
     }
 
@@ -777,6 +780,7 @@ mod tests {
                     .await
                     .is_ok()
             );
+            test_case.cleanup().await;
         }
     }
 
@@ -861,6 +865,7 @@ mod tests {
                     .await
                     .is_err()
             );
+            test_case.cleanup().await;
         }
     }
 
@@ -907,6 +912,7 @@ mod tests {
                 .is_ok(),
             "Vec sink must not delete the tag"
         );
+        test_case.cleanup().await;
     }
 
     fn make_manifest(tag: &str) -> ManifestImage {

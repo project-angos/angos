@@ -288,6 +288,7 @@ pub async fn test_datastore_link_operations(
 async fn test_list_namespaces() {
     for test_case in backends() {
         test_datastore_list_namespaces(test_case.blob_store(), test_case.metadata_store()).await;
+        test_case.cleanup().await;
     }
 }
 
@@ -295,6 +296,7 @@ async fn test_list_namespaces() {
 async fn test_list_tags() {
     for test_case in backends() {
         test_datastore_list_tags(test_case.blob_store(), test_case.metadata_store()).await;
+        test_case.cleanup().await;
     }
 }
 
@@ -302,6 +304,7 @@ async fn test_list_tags() {
 async fn test_list_referrers() {
     for test_case in backends() {
         test_datastore_list_referrers(test_case.blob_store(), test_case.metadata_store()).await;
+        test_case.cleanup().await;
     }
 }
 
@@ -309,6 +312,7 @@ async fn test_list_referrers() {
 async fn test_list_revisions() {
     for test_case in backends() {
         test_datastore_list_revisions(test_case.blob_store(), test_case.metadata_store()).await;
+        test_case.cleanup().await;
     }
 }
 
@@ -316,6 +320,7 @@ async fn test_list_revisions() {
 async fn test_link_operations() {
     for test_case in backends() {
         test_datastore_link_operations(test_case.blob_store(), test_case.metadata_store()).await;
+        test_case.cleanup().await;
     }
 }
 
@@ -443,6 +448,7 @@ async fn test_list_namespaces_deduplication() {
             test_case.metadata_store(),
         )
         .await;
+        test_case.cleanup().await;
     }
 }
 
@@ -454,6 +460,7 @@ async fn test_list_namespaces_many_namespaces_pagination() {
             test_case.metadata_store(),
         )
         .await;
+        test_case.cleanup().await;
     }
 }
 
@@ -465,6 +472,7 @@ async fn test_list_namespaces_single_item_pages() {
             test_case.metadata_store(),
         )
         .await;
+        test_case.cleanup().await;
     }
 }
 
@@ -565,6 +573,7 @@ async fn test_list_tags_many_tags_pagination() {
             test_case.metadata_store(),
         )
         .await;
+        test_case.cleanup().await;
     }
 }
 
@@ -576,6 +585,7 @@ async fn test_list_tags_single_item_pages() {
             test_case.metadata_store(),
         )
         .await;
+        test_case.cleanup().await;
     }
 }
 
@@ -610,6 +620,7 @@ pub async fn test_update_links(b: Arc<dyn BlobStore>, m: Arc<dyn MetadataStore +
 async fn test_update_links_batched() {
     for test_case in backends() {
         test_update_links(test_case.blob_store(), test_case.metadata_store()).await;
+        test_case.cleanup().await;
     }
 }
 
@@ -651,6 +662,7 @@ async fn test_read_link_access_time_update() {
             test_case.metadata_store(),
         )
         .await;
+        test_case.cleanup().await;
     }
 }
 
@@ -689,6 +701,7 @@ async fn test_read_link_concurrent_readonly() {
             test_case.metadata_store(),
         )
         .await;
+        test_case.cleanup().await;
     }
 }
 
@@ -931,6 +944,7 @@ async fn test_list_referrers_parallel_correctness() {
             test_case.metadata_store(),
         )
         .await;
+        test_case.cleanup().await;
     }
 }
 
@@ -942,6 +956,7 @@ async fn test_list_referrers_with_artifact_type_filter() {
             test_case.metadata_store(),
         )
         .await;
+        test_case.cleanup().await;
     }
 }
 
@@ -953,6 +968,7 @@ async fn test_list_referrers_deterministic_order() {
             test_case.metadata_store(),
         )
         .await;
+        test_case.cleanup().await;
     }
 }
 
@@ -1014,6 +1030,7 @@ async fn test_parallel_multiple_creates() {
             test_case.metadata_store(),
         )
         .await;
+        test_case.cleanup().await;
     }
 }
 
@@ -1092,6 +1109,7 @@ async fn test_parallel_mixed_create_delete() {
             test_case.metadata_store(),
         )
         .await;
+        test_case.cleanup().await;
     }
 }
 
@@ -1158,6 +1176,7 @@ async fn test_parallel_blob_index_correctness() {
             test_case.metadata_store(),
         )
         .await;
+        test_case.cleanup().await;
     }
 }
 
@@ -1208,6 +1227,7 @@ async fn test_tracked_create_with_referrer() {
             test_case.metadata_store(),
         )
         .await;
+        test_case.cleanup().await;
     }
 }
 
@@ -1285,6 +1305,7 @@ async fn test_tracked_delete_with_referrer() {
             test_case.metadata_store(),
         )
         .await;
+        test_case.cleanup().await;
     }
 }
 
@@ -1338,6 +1359,7 @@ async fn test_tracked_delete_removes_when_no_referrers() {
             test_case.metadata_store(),
         )
         .await;
+        test_case.cleanup().await;
     }
 }
 
@@ -1447,6 +1469,7 @@ async fn test_mixed_tracked_untracked_operations() {
             test_case.metadata_store(),
         )
         .await;
+        test_case.cleanup().await;
     }
 }
 
@@ -1489,6 +1512,7 @@ async fn test_batch_deduplicates_same_digest_operations() {
             test_case.metadata_store(),
         )
         .await;
+        test_case.cleanup().await;
     }
 }
 
@@ -1528,6 +1552,7 @@ async fn test_batch_handles_mixed_insert_remove_same_digest() {
             test_case.metadata_store(),
         )
         .await;
+        test_case.cleanup().await;
     }
 }
 
@@ -1564,6 +1589,7 @@ async fn test_batch_deletes_empty_blob_container() {
             test_case.metadata_store(),
         )
         .await;
+        test_case.cleanup().await;
     }
 }
 
@@ -1620,6 +1646,7 @@ async fn test_batch_multiple_unique_digests() {
             test_case.metadata_store(),
         )
         .await;
+        test_case.cleanup().await;
     }
 }
 
@@ -1671,6 +1698,7 @@ async fn test_batch_preserves_existing_blob_index_entries() {
             test_case.metadata_store(),
         )
         .await;
+        test_case.cleanup().await;
     }
 }
 
@@ -1713,6 +1741,7 @@ async fn test_link_metadata_media_type() {
             .unwrap();
         assert_eq!(link.media_type, Some(media_type.to_string()));
         assert_eq!(link.target, digest);
+        test_case.cleanup().await;
     }
 }
 
@@ -1732,6 +1761,7 @@ async fn test_link_without_media_type_has_none() {
             .unwrap();
         assert_eq!(link.media_type, None);
         assert_eq!(link.target, digest);
+        test_case.cleanup().await;
     }
 }
 
@@ -1815,6 +1845,7 @@ async fn test_list_referrers_with_stored_descriptor() {
             test_case.metadata_store(),
         )
         .await;
+        test_case.cleanup().await;
     }
 }
 

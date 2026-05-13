@@ -226,6 +226,7 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(tag_link.media_type.as_deref(), Some(media_type));
+            test_case.cleanup().await;
         }
     }
 
@@ -283,6 +284,7 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(digest_link.media_type.as_deref(), Some(media_type));
+            test_case.cleanup().await;
         }
     }
 
@@ -343,6 +345,7 @@ mod tests {
                     .any(|a| matches!(a, Action::SetMediaType { .. })),
                 "Vec sink must capture SetMediaType actions"
             );
+            test_case.cleanup().await;
         }
     }
 }

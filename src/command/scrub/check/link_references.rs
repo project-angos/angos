@@ -280,6 +280,7 @@ mod tests {
                 layer_link_after.referenced_by.contains(&manifest_digest),
                 "Layer link should have manifest digest in referenced_by after check"
             );
+            test_case.cleanup().await;
         }
     }
 
@@ -323,6 +324,7 @@ mod tests {
                 layer_link.referenced_by.is_empty(),
                 "Vec sink must not write: layer referenced_by should remain empty"
             );
+            test_case.cleanup().await;
         }
     }
 
@@ -378,6 +380,7 @@ mod tests {
                 matches!(config_result, Err(metadata_store::Error::ReferenceNotFound)),
                 "Config link should still not exist after check"
             );
+            test_case.cleanup().await;
         }
     }
 

@@ -131,6 +131,7 @@ mod tests {
             }
 
             assert_eq!(collected, vec![digest]);
+            test_case.cleanup().await;
         }
     }
 
@@ -156,6 +157,7 @@ mod tests {
             }
 
             assert!(collected.contains(&namespace.to_string()));
+            test_case.cleanup().await;
         }
     }
 }

@@ -147,6 +147,7 @@ mod tests {
             2,
             "abort must be called once per orphan"
         );
+        test_case.cleanup().await;
     }
 
     #[tokio::test]

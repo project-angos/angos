@@ -187,6 +187,7 @@ mod tests {
 
             assert!(config_link.is_ok());
             assert!(layer_link.is_ok());
+            test_case.cleanup().await;
         }
     }
 }
