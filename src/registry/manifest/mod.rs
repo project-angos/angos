@@ -78,13 +78,17 @@ impl Registry {
         }
 
         if let Ok(meta) = local {
-            let needs_upstream_pull = matches!(&reference, Reference::Tag(_))
-                && !is_tag_immutable
-                && !repository
-                    .is_upstream_digest_match(accepted_types, namespace, &reference, &meta.digest)
-                    .await?;
-
-            if !needs_upstream_pull {
+            if !self
+                .needs_upstream_pull_manifest(
+                    repository,
+                    accepted_types,
+                    namespace,
+                    &reference,
+                    is_tag_immutable,
+                    &meta.digest,
+                )
+                .await?
+            {
                 return Ok(HeadManifestResponse {
                     headers: head_manifest_headers(&meta),
                 });
@@ -170,18 +174,17 @@ impl Registry {
         }
 
         if let Ok(manifest) = local {
-            let needs_upstream_pull = matches!(&reference, Reference::Tag(_))
-                && !is_tag_immutable
-                && !repository
-                    .is_upstream_digest_match(
-                        accepted_types,
-                        namespace,
-                        &reference,
-                        &manifest.digest,
-                    )
-                    .await?;
-
-            if !needs_upstream_pull {
+            if !self
+                .needs_upstream_pull_manifest(
+                    repository,
+                    accepted_types,
+                    namespace,
+                    &reference,
+                    is_tag_immutable,
+                    &manifest.digest,
+                )
+                .await?
+            {
                 return Ok(manifest);
             }
         }
@@ -198,6 +201,27 @@ impl Registry {
             digest,
             content,
         })
+    }
+
+    async fn needs_upstream_pull_manifest(
+        &self,
+        repository: &Repository,
+        accepted_types: &[String],
+        namespace: &Namespace,
+        reference: &Reference,
+        is_tag_immutable: bool,
+        local_digest: &Digest,
+    ) -> Result<bool, Error> {
+        if !repository.is_pull_through()
+            || !matches!(reference, Reference::Tag(_))
+            || is_tag_immutable
+        {
+            return Ok(false);
+        }
+
+        Ok(!repository
+            .is_upstream_digest_match(accepted_types, namespace, reference, local_digest)
+            .await?)
     }
 
     async fn get_local_manifest(
