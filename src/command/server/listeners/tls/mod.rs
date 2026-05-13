@@ -1,4 +1,4 @@
-use std::{net::SocketAddr, path::Path, sync::Arc, time::Duration};
+use std::{fs, net::SocketAddr, path::Path, sync::Arc, time::Duration};
 
 use arc_swap::ArcSwap;
 use async_trait::async_trait;
@@ -18,13 +18,26 @@ use crate::command::server::{
 };
 pub use crate::configuration::listeners::{ServerTlsConfig, TlsListenerConfig};
 
-fn build_client_verifier(client_ca_bundle: &Path) -> Result<Arc<dyn ClientCertVerifier>, Error> {
-    let client_certs: Vec<CertificateDer> = CertificateDer::pem_file_iter(client_ca_bundle)
-        .map_err(|e| {
-            Error::Initialization(format!("Failed to read client certificates bundle: {e}"))
-        })?
+fn load_certificate_bundle(
+    path: &Path,
+    description: &str,
+) -> Result<Vec<CertificateDer<'static>>, Error> {
+    let pem = fs::read(path)
+        .map_err(|e| Error::Initialization(format!("Failed to read {description}: {e}")))?;
+    CertificateDer::pem_slice_iter(&pem)
         .collect::<Result<_, _>>()
-        .map_err(|e| Error::Initialization(format!("Failed to build client certs: {e}")))?;
+        .map_err(|e| Error::Initialization(format!("Failed to build {description}: {e}")))
+}
+
+fn load_private_key(path: &Path, description: &str) -> Result<PrivateKeyDer<'static>, Error> {
+    let pem = fs::read(path)
+        .map_err(|e| Error::Initialization(format!("Failed to read {description}: {e}")))?;
+    PrivateKeyDer::from_pem_slice(&pem)
+        .map_err(|e| Error::Initialization(format!("Failed to build {description}: {e}")))
+}
+
+fn build_client_verifier(client_ca_bundle: &Path) -> Result<Arc<dyn ClientCertVerifier>, Error> {
+    let client_certs = load_certificate_bundle(client_ca_bundle, "client certificates bundle")?;
 
     let mut client_cert_store = RootCertStore::empty();
     for client_cert in client_certs {
@@ -142,16 +155,11 @@ impl TlsListener {
 
     fn build_tls_acceptor(tls_config: &ServerTlsConfig) -> Result<TlsAcceptor, Error> {
         debug!("Detected TLS configuration");
-        let server_certs = CertificateDer::pem_file_iter(&tls_config.server_certificate_bundle)
-            .map_err(|e| {
-                Error::Initialization(format!("Failed to read server certificates bundle: {e}"))
-            })?
-            .collect::<Result<_, _>>()
-            .map_err(|e| Error::Initialization(format!("Failed to build server certs: {e}")))?;
-        let server_key =
-            PrivateKeyDer::from_pem_file(&tls_config.server_private_key).map_err(|e| {
-                Error::Initialization(format!("Failed to read server private key: {e}"))
-            })?;
+        let server_certs = load_certificate_bundle(
+            &tls_config.server_certificate_bundle,
+            "server certificates bundle",
+        )?;
+        let server_key = load_private_key(&tls_config.server_private_key, "server private key")?;
 
         let server_config = if let Some(client_ca_bundle) = tls_config.client_ca_bundle.as_ref() {
             debug!("Client CA bundle detected");

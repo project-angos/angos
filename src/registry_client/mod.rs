@@ -67,27 +67,20 @@ pub struct RegistryClient {
 
 impl RegistryClient {
     pub fn new(config: &RegistryClientConfig, cache: Arc<Cache>) -> Result<Self, Error> {
-        let mut client_builder = HttpClientBuilder::new()
+        let client = HttpClientBuilder::new()
             .rustls_tls()
             .redirect(reqwest::redirect::Policy::limited(
                 config.max_redirect as usize,
             ))
-            .timeout(Duration::from_mins(5));
-
-        if let Some(ca_bundle) = &config.server_ca_bundle {
-            client_builder = client_builder
-                .add_root_certificate_file(ca_bundle)
-                .map_err(Error::Initialization)?;
-        }
-
-        client_builder = client_builder
-            .identity_files(
+            .timeout(Duration::from_mins(5))
+            .tls_files(
+                config.server_ca_bundle.as_deref().map(Path::new),
                 config.client_certificate.as_deref().map(Path::new),
                 config.client_private_key.as_deref().map(Path::new),
             )
+            .map_err(Error::Initialization)?
+            .build()
             .map_err(Error::Initialization)?;
-
-        let client = client_builder.build().map_err(Error::Initialization)?;
 
         let basic_auth = match (&config.username, &config.password) {
             (Some(username), Some(password)) => Some((username.clone(), password.expose().clone())),

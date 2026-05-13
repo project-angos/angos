@@ -30,23 +30,17 @@ impl WebhookAuthorizer {
     }
 
     pub fn new(name: String, config: Config, cache: Arc<Cache>) -> Result<Self, Error> {
-        let mut client_builder = HttpClientBuilder::new()
+        let client = HttpClientBuilder::new()
             .rustls_tls()
             .redirect(reqwest::redirect::Policy::none())
-            .timeout(Duration::from_millis(config.timeout_ms));
-
-        if let Some(ca_bundle) = &config.server_ca_bundle {
-            client_builder = client_builder
-                .add_root_certificate_file(ca_bundle)
-                .map_err(Error::Initialization)?;
-        }
-
-        let client = client_builder
-            .identity_files(
+            .timeout(Duration::from_millis(config.timeout_ms))
+            .tls_files(
+                config.server_ca_bundle.as_deref(),
                 config.client_certificate_bundle.as_deref(),
                 config.client_private_key.as_deref(),
             )
-            .and_then(HttpClientBuilder::build)
+            .map_err(Error::Initialization)?
+            .build()
             .map_err(Error::Initialization)?;
 
         Ok(Self {
