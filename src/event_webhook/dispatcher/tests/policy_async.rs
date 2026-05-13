@@ -5,8 +5,8 @@ use wiremock::{
     matchers::{header, method},
 };
 
-use super::common::{build_dispatcher, create_test_event, create_webhook_config_with_policy};
-use crate::event_webhook::{config::DeliveryPolicy, event::EventKind};
+use super::common::{build_dispatcher, create_test_event, create_test_webhook_config};
+use crate::event_webhook::config::DeliveryPolicy;
 
 #[tokio::test]
 async fn dispatch_async_policy_returns_ok_immediately_despite_slow_webhook() {
@@ -26,11 +26,7 @@ async fn dispatch_async_policy_returns_ok_immediately_despite_slow_webhook() {
     let mut webhooks = HashMap::new();
     webhooks.insert(
         "async-hook".to_string(),
-        create_webhook_config_with_policy(
-            &server.uri(),
-            DeliveryPolicy::Async,
-            vec![EventKind::ManifestPush],
-        ),
+        create_test_webhook_config(&server.uri(), DeliveryPolicy::Async, None, 0),
     );
 
     let dispatcher = build_dispatcher(webhooks);
@@ -64,11 +60,7 @@ async fn dispatch_async_policy_eventually_delivers() {
     let mut webhooks = HashMap::new();
     webhooks.insert(
         "async-hook".to_string(),
-        create_webhook_config_with_policy(
-            &server.uri(),
-            DeliveryPolicy::Async,
-            vec![EventKind::ManifestPush],
-        ),
+        create_test_webhook_config(&server.uri(), DeliveryPolicy::Async, None, 0),
     );
 
     let dispatcher = build_dispatcher(webhooks);

@@ -57,47 +57,16 @@ pub fn build_endpoint(config: EventWebhookConfig) -> WebhookEndpoint {
     }
 }
 
-pub fn create_webhook_config_for_url(
+pub fn create_test_webhook_config(
     url: &str,
-    events: Vec<EventKind>,
+    policy: DeliveryPolicy,
     token: Option<&str>,
-) -> EventWebhookConfig {
-    EventWebhookConfig {
-        url: Url::parse(url).unwrap(),
-        policy: DeliveryPolicy::Required,
-        token: token.map(|t| Secret::new(t.to_string())),
-        timeout_ms: 5000,
-        max_retries: 0,
-        events,
-        repository_filter: None,
-    }
-}
-
-pub fn create_webhook_config_with_policy(
-    url: &str,
-    policy: DeliveryPolicy,
-    events: Vec<EventKind>,
-) -> EventWebhookConfig {
-    EventWebhookConfig {
-        url: Url::parse(url).unwrap(),
-        policy,
-        token: None,
-        timeout_ms: 5000,
-        max_retries: 0,
-        events,
-        repository_filter: None,
-    }
-}
-
-pub fn create_webhook_config_with_retries(
-    url: &str,
-    policy: DeliveryPolicy,
     max_retries: u32,
 ) -> EventWebhookConfig {
     EventWebhookConfig {
         url: Url::parse(url).unwrap(),
         policy,
-        token: None,
+        token: token.map(|t| Secret::new(t.to_string())),
         timeout_ms: 5000,
         max_retries,
         events: vec![EventKind::ManifestPush],

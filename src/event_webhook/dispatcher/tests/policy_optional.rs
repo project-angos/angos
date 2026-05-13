@@ -2,11 +2,8 @@ use std::collections::HashMap;
 
 use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};
 
-use super::common::{
-    build_dispatcher, create_test_event, create_webhook_config_with_policy,
-    create_webhook_config_with_retries,
-};
-use crate::event_webhook::{config::DeliveryPolicy, event::EventKind};
+use super::common::{build_dispatcher, create_test_event, create_test_webhook_config};
+use crate::event_webhook::config::DeliveryPolicy;
 
 #[tokio::test]
 async fn dispatch_optional_policy_returns_ok_on_server_error() {
@@ -22,11 +19,7 @@ async fn dispatch_optional_policy_returns_ok_on_server_error() {
     let mut webhooks = HashMap::new();
     webhooks.insert(
         "optional-hook".to_string(),
-        create_webhook_config_with_policy(
-            &server.uri(),
-            DeliveryPolicy::Optional,
-            vec![EventKind::ManifestPush],
-        ),
+        create_test_webhook_config(&server.uri(), DeliveryPolicy::Optional, None, 0),
     );
 
     let dispatcher = build_dispatcher(webhooks);
@@ -48,11 +41,7 @@ async fn dispatch_optional_policy_returns_ok_on_success() {
     let mut webhooks = HashMap::new();
     webhooks.insert(
         "optional-hook".to_string(),
-        create_webhook_config_with_policy(
-            &server.uri(),
-            DeliveryPolicy::Optional,
-            vec![EventKind::ManifestPush],
-        ),
+        create_test_webhook_config(&server.uri(), DeliveryPolicy::Optional, None, 0),
     );
 
     let dispatcher = build_dispatcher(webhooks);
@@ -75,7 +64,7 @@ async fn dispatch_optional_retries_exhausted_returns_ok() {
     let mut webhooks = HashMap::new();
     webhooks.insert(
         "retry-hook".to_string(),
-        create_webhook_config_with_retries(&server.uri(), DeliveryPolicy::Optional, 2),
+        create_test_webhook_config(&server.uri(), DeliveryPolicy::Optional, None, 2),
     );
 
     let dispatcher = build_dispatcher(webhooks);

@@ -6,10 +6,7 @@ use wiremock::{
     matchers::{body_json, header, method},
 };
 
-use super::common::{
-    build_dispatcher, create_test_event, create_webhook_config_for_url,
-    create_webhook_config_with_policy,
-};
+use super::common::{build_dispatcher, create_test_event, create_test_webhook_config};
 use crate::{
     configuration::RegexPattern,
     event_webhook::{config::DeliveryPolicy, event::EventKind},
@@ -20,20 +17,21 @@ fn event_dispatcher_new_constructs_from_configs() {
     let mut webhooks = HashMap::new();
     webhooks.insert(
         "hook1".to_string(),
-        create_webhook_config_for_url(
+        create_test_webhook_config(
             "https://example.com/hook1",
-            vec![EventKind::ManifestPush],
+            DeliveryPolicy::Required,
             None,
+            0,
         ),
     );
-    webhooks.insert(
-        "hook2".to_string(),
-        create_webhook_config_for_url(
-            "https://example.com/hook2",
-            vec![EventKind::TagCreate],
-            Some("secret"),
-        ),
+    let mut hook2 = create_test_webhook_config(
+        "https://example.com/hook2",
+        DeliveryPolicy::Required,
+        Some("secret"),
+        0,
     );
+    hook2.events = vec![EventKind::TagCreate];
+    webhooks.insert("hook2".to_string(), hook2);
 
     let dispatcher = super::super::EventDispatcher::new(webhooks);
     assert!(dispatcher.is_ok());
@@ -63,7 +61,7 @@ async fn dispatch_sends_post_with_json_body() {
     let mut webhooks = HashMap::new();
     webhooks.insert(
         "test-hook".to_string(),
-        create_webhook_config_for_url(&server.uri(), vec![EventKind::ManifestPush], None),
+        create_test_webhook_config(&server.uri(), DeliveryPolicy::Required, None, 0),
     );
 
     let dispatcher = build_dispatcher(webhooks);
@@ -86,7 +84,7 @@ async fn dispatch_sends_event_kind_header() {
     let mut webhooks = HashMap::new();
     webhooks.insert(
         "test-hook".to_string(),
-        create_webhook_config_for_url(&server.uri(), vec![EventKind::ManifestPush], None),
+        create_test_webhook_config(&server.uri(), DeliveryPolicy::Required, None, 0),
     );
 
     let dispatcher = build_dispatcher(webhooks);
@@ -109,11 +107,7 @@ async fn dispatch_sends_authorization_bearer_header() {
     let mut webhooks = HashMap::new();
     webhooks.insert(
         "test-hook".to_string(),
-        create_webhook_config_for_url(
-            &server.uri(),
-            vec![EventKind::ManifestPush],
-            Some("my-token"),
-        ),
+        create_test_webhook_config(&server.uri(), DeliveryPolicy::Required, Some("my-token"), 0),
     );
 
     let dispatcher = build_dispatcher(webhooks);
@@ -133,14 +127,9 @@ async fn dispatch_skips_webhook_for_non_matching_event_kind() {
         .await;
 
     let mut webhooks = HashMap::new();
-    webhooks.insert(
-        "test-hook".to_string(),
-        create_webhook_config_for_url(
-            &server.uri(),
-            vec![EventKind::BlobPush], // does not match ManifestPush
-            None,
-        ),
-    );
+    let mut config = create_test_webhook_config(&server.uri(), DeliveryPolicy::Required, None, 0);
+    config.events = vec![EventKind::BlobPush]; // does not match ManifestPush
+    webhooks.insert("test-hook".to_string(), config);
 
     let dispatcher = build_dispatcher(webhooks);
     let result = dispatcher.dispatch(&event).await;
@@ -159,8 +148,7 @@ async fn dispatch_skips_webhook_for_non_matching_repository() {
         .await;
 
     let mut webhooks = HashMap::new();
-    let mut config =
-        create_webhook_config_for_url(&server.uri(), vec![EventKind::ManifestPush], None);
+    let mut config = create_test_webhook_config(&server.uri(), DeliveryPolicy::Required, None, 0);
     config.repository_filter = Some(vec![RegexPattern::compile("^internal/.*").unwrap()]);
     webhooks.insert("test-hook".to_string(), config);
 
@@ -183,11 +171,7 @@ async fn dispatch_records_delivery_total_metric() {
     let mut webhooks = HashMap::new();
     webhooks.insert(
         "metrics-hook".to_string(),
-        create_webhook_config_with_policy(
-            &server.uri(),
-            DeliveryPolicy::Required,
-            vec![EventKind::ManifestPush],
-        ),
+        create_test_webhook_config(&server.uri(), DeliveryPolicy::Required, None, 0),
     );
 
     let dispatcher = build_dispatcher(webhooks);
@@ -236,11 +220,7 @@ async fn dispatch_records_delivery_duration_metric() {
     let mut webhooks = HashMap::new();
     webhooks.insert(
         "duration-hook".to_string(),
-        create_webhook_config_with_policy(
-            &server.uri(),
-            DeliveryPolicy::Required,
-            vec![EventKind::ManifestPush],
-        ),
+        create_test_webhook_config(&server.uri(), DeliveryPolicy::Required, None, 0),
     );
 
     let dispatcher = build_dispatcher(webhooks);

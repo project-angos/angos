@@ -6,11 +6,11 @@ use wiremock::{
 };
 
 use crate::event_webhook::{
+    config::DeliveryPolicy,
     dispatcher::{
         compute_signature,
-        tests::common::{build_dispatcher, create_test_event, create_webhook_config_for_url},
+        tests::common::{build_dispatcher, create_test_event, create_test_webhook_config},
     },
-    event::EventKind,
 };
 
 #[tokio::test]
@@ -30,10 +30,11 @@ async fn dispatch_sends_hmac_signature_header() {
     let mut webhooks = HashMap::new();
     webhooks.insert(
         "test-hook".to_string(),
-        create_webhook_config_for_url(
+        create_test_webhook_config(
             &server.uri(),
-            vec![EventKind::ManifestPush],
+            DeliveryPolicy::Required,
             Some("hmac-secret"),
+            0,
         ),
     );
 
@@ -56,7 +57,7 @@ async fn dispatch_no_signature_header_without_token() {
     let mut webhooks = HashMap::new();
     webhooks.insert(
         "test-hook".to_string(),
-        create_webhook_config_for_url(&server.uri(), vec![EventKind::ManifestPush], None),
+        create_test_webhook_config(&server.uri(), DeliveryPolicy::Required, None, 0),
     );
 
     let dispatcher = build_dispatcher(webhooks);

@@ -3,9 +3,9 @@ use std::{collections::HashMap, time::Duration};
 use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};
 
 use super::common::{
-    TEST_SHUTDOWN_TIMEOUT, build_dispatcher, create_test_event, create_webhook_config_with_policy,
+    TEST_SHUTDOWN_TIMEOUT, build_dispatcher, create_test_event, create_test_webhook_config,
 };
-use crate::event_webhook::{config::DeliveryPolicy, event::EventKind};
+use crate::event_webhook::config::DeliveryPolicy;
 
 #[tokio::test]
 async fn test_shutdown_completes_in_flight_async_delivery() {
@@ -22,11 +22,7 @@ async fn test_shutdown_completes_in_flight_async_delivery() {
     let mut webhooks = HashMap::new();
     webhooks.insert(
         "slow-async-hook".to_string(),
-        create_webhook_config_with_policy(
-            &server.uri(),
-            DeliveryPolicy::Async,
-            vec![EventKind::ManifestPush],
-        ),
+        create_test_webhook_config(&server.uri(), DeliveryPolicy::Async, None, 0),
     );
 
     let dispatcher = build_dispatcher(webhooks);
@@ -61,11 +57,7 @@ async fn test_shutdown_rejects_new_async_dispatches() {
     let mut webhooks = HashMap::new();
     webhooks.insert(
         "async-hook".to_string(),
-        create_webhook_config_with_policy(
-            &server.uri(),
-            DeliveryPolicy::Async,
-            vec![EventKind::ManifestPush],
-        ),
+        create_test_webhook_config(&server.uri(), DeliveryPolicy::Async, None, 0),
     );
 
     let dispatcher = build_dispatcher(webhooks);
@@ -129,11 +121,7 @@ async fn test_multiple_in_flight_async_deliveries_drain_on_shutdown() {
     ] {
         webhooks.insert(
             name.to_string(),
-            create_webhook_config_with_policy(
-                &server.uri(),
-                DeliveryPolicy::Async,
-                vec![EventKind::ManifestPush],
-            ),
+            create_test_webhook_config(&server.uri(), DeliveryPolicy::Async, None, 0),
         );
     }
 
@@ -176,11 +164,7 @@ async fn test_shutdown_with_timeout_returns_after_timeout_when_tasks_are_too_slo
     let mut webhooks = HashMap::new();
     webhooks.insert(
         "very-slow-hook".to_string(),
-        create_webhook_config_with_policy(
-            &server.uri(),
-            DeliveryPolicy::Async,
-            vec![EventKind::ManifestPush],
-        ),
+        create_test_webhook_config(&server.uri(), DeliveryPolicy::Async, None, 0),
     );
 
     let dispatcher = build_dispatcher(webhooks);
@@ -214,11 +198,7 @@ async fn test_shutdown_with_timeout_drains_fast_tasks_within_timeout() {
     let mut webhooks = HashMap::new();
     webhooks.insert(
         "fast-async-hook".to_string(),
-        create_webhook_config_with_policy(
-            &server.uri(),
-            DeliveryPolicy::Async,
-            vec![EventKind::ManifestPush],
-        ),
+        create_test_webhook_config(&server.uri(), DeliveryPolicy::Async, None, 0),
     );
 
     let dispatcher = build_dispatcher(webhooks);
@@ -251,11 +231,7 @@ async fn test_shutdown_is_idempotent() {
     let mut webhooks = HashMap::new();
     webhooks.insert(
         "idempotent-hook".to_string(),
-        create_webhook_config_with_policy(
-            &server.uri(),
-            DeliveryPolicy::Async,
-            vec![EventKind::ManifestPush],
-        ),
+        create_test_webhook_config(&server.uri(), DeliveryPolicy::Async, None, 0),
     );
 
     let dispatcher = build_dispatcher(webhooks);
@@ -307,19 +283,11 @@ async fn test_shutdown_drains_mix_of_fast_and_slow_deliveries() {
     let mut webhooks = HashMap::new();
     webhooks.insert(
         "fast-hook".to_string(),
-        create_webhook_config_with_policy(
-            &fast_server.uri(),
-            DeliveryPolicy::Async,
-            vec![EventKind::ManifestPush],
-        ),
+        create_test_webhook_config(&fast_server.uri(), DeliveryPolicy::Async, None, 0),
     );
     webhooks.insert(
         "slow-hook".to_string(),
-        create_webhook_config_with_policy(
-            &slow_server.uri(),
-            DeliveryPolicy::Async,
-            vec![EventKind::ManifestPush],
-        ),
+        create_test_webhook_config(&slow_server.uri(), DeliveryPolicy::Async, None, 0),
     );
 
     let dispatcher = build_dispatcher(webhooks);
