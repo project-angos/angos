@@ -132,22 +132,6 @@ fn has_non_ownership_reference(links: &HashSet<LinkKind>, digest: &Digest) -> bo
 }
 
 impl Registry {
-    async fn check_blob_namespace_access(
-        &self,
-        namespace: &Namespace,
-        digest: &Digest,
-    ) -> Result<(), Error> {
-        let ownership = BlobOwnership::new(self.metadata_store.as_ref());
-        match ownership.can_read(namespace, digest).await {
-            Ok(true) => Ok(()),
-            Ok(false) => Err(Error::BlobUnknown),
-            Err(error) => {
-                warn!("Failed to read blob ownership for {digest}: {error}");
-                Err(error)
-            }
-        }
-    }
-
     #[instrument(skip(repository))]
     pub async fn head_blob(
         &self,
@@ -337,10 +321,12 @@ impl Registry {
 
     #[instrument]
     pub async fn delete_blob(&self, namespace: &Namespace, digest: &Digest) -> Result<(), Error> {
-        self.check_blob_namespace_access(namespace, digest).await?;
-
         let ownership = BlobOwnership::new(self.metadata_store.as_ref());
         let links = ownership.references(namespace, digest).await?;
+
+        if links.is_empty() {
+            return Err(Error::BlobUnknown);
+        }
 
         if has_non_ownership_reference(&links, digest) {
             return Err(Error::BlobReferenced);

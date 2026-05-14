@@ -328,6 +328,15 @@ impl MetadataStore for Backend {
     }
 
     #[instrument(skip(self))]
+    async fn read_blob_index_namespace(
+        &self,
+        namespace: &str,
+        digest: &Digest,
+    ) -> Result<HashSet<LinkKind>, Error> {
+        self.read_blob_index_namespace_impl(namespace, digest).await
+    }
+
+    #[instrument(skip(self))]
     async fn update_blob_index(
         &self,
         namespace: &str,

@@ -3,7 +3,7 @@ mod capabilities;
 mod error;
 
 use std::{
-    collections::hash_map::RandomState,
+    collections::{HashSet, hash_map::RandomState},
     hash::{BuildHasher, Hasher},
 };
 
@@ -94,6 +94,20 @@ pub trait MetadataStore: Send + Sync {
     async fn count_manifests(&self, namespace: &str) -> Result<usize, Error>;
 
     async fn read_blob_index(&self, digest: &Digest) -> Result<BlobIndex, Error>;
+
+    async fn read_blob_index_namespace(
+        &self,
+        namespace: &str,
+        digest: &Digest,
+    ) -> Result<HashSet<LinkKind>, Error> {
+        let blob_index = self.read_blob_index(digest).await?;
+        blob_index
+            .namespace
+            .get(namespace)
+            .cloned()
+            .filter(|links| !links.is_empty())
+            .ok_or(Error::ReferenceNotFound)
+    }
 
     async fn update_blob_index(
         &self,

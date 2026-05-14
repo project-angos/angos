@@ -189,6 +189,34 @@ impl Backend {
         Ok(blob_index)
     }
 
+    pub async fn read_blob_index_namespace_impl(
+        &self,
+        namespace: &str,
+        digest: &Digest,
+    ) -> Result<HashSet<LinkKind>, Error> {
+        let shard_path = path_builder::blob_index_shard_path(digest, namespace);
+        match self.store.read(&shard_path).await {
+            Ok(data) => {
+                let links = serde_json::from_slice::<HashSet<LinkKind>>(&data)?;
+                if links.is_empty() {
+                    Err(Error::ReferenceNotFound)
+                } else {
+                    Ok(links)
+                }
+            }
+            Err(e) if e.kind() == ErrorKind::NotFound => {
+                let blob_index = self.read_blob_index_impl(digest).await?;
+                blob_index
+                    .namespace
+                    .get(namespace)
+                    .cloned()
+                    .filter(|links| !links.is_empty())
+                    .ok_or(Error::ReferenceNotFound)
+            }
+            Err(e) => Err(e.into()),
+        }
+    }
+
     /// Unconditional read-modify-write on a namespace shard (caller must hold lock).
     pub async fn update_blob_index_shard(
         &self,

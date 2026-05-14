@@ -31,8 +31,12 @@ impl<'a> BlobOwnership<'a> {
     }
 
     pub async fn can_read(&self, namespace: &Namespace, digest: &Digest) -> Result<bool, Error> {
-        match self.metadata_store.read_blob_index(digest).await {
-            Ok(blob_index) => Ok(blob_index.namespace.contains_key(namespace.as_ref())),
+        match self
+            .metadata_store
+            .read_blob_index_namespace(namespace.as_ref(), digest)
+            .await
+        {
+            Ok(_) => Ok(true),
             Err(MetadataError::ReferenceNotFound) => Ok(false),
             Err(error) => Err(error.into()),
         }
@@ -55,12 +59,12 @@ impl<'a> BlobOwnership<'a> {
         namespace: &Namespace,
         digest: &Digest,
     ) -> Result<HashSet<LinkKind>, Error> {
-        match self.metadata_store.read_blob_index(digest).await {
-            Ok(blob_index) => Ok(blob_index
-                .namespace
-                .get(namespace.as_ref())
-                .cloned()
-                .unwrap_or_default()),
+        match self
+            .metadata_store
+            .read_blob_index_namespace(namespace.as_ref(), digest)
+            .await
+        {
+            Ok(links) => Ok(links),
             Err(MetadataError::ReferenceNotFound) => Ok(HashSet::new()),
             Err(error) => Err(error.into()),
         }
