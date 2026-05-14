@@ -591,6 +591,86 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn delete_blob_rejects_all_metadata_references() {
+        for test_case in backends() {
+            let registry = test_case.registry();
+            let namespace = &Namespace::new("test-repo").unwrap();
+            let parent = sha256::digest(b"index manifest");
+            let subject = sha256::digest(b"subject manifest");
+
+            let cases = [
+                LinkKind::Digest(sha256::digest(b"digest reference")),
+                LinkKind::Tag("latest".to_string()),
+                LinkKind::Layer(sha256::digest(b"layer reference")),
+                LinkKind::Config(sha256::digest(b"config reference")),
+                LinkKind::Manifest(parent.clone(), sha256::digest(b"child manifest")),
+                LinkKind::Referrer(subject, sha256::digest(b"referrer manifest")),
+            ];
+
+            for link in cases {
+                let content = format!("content for {link}").into_bytes();
+                let digest = registry.blob_store.create(&content).await.unwrap();
+                BlobOwnership::new(registry.metadata_store.as_ref())
+                    .grant(namespace, &digest)
+                    .await
+                    .unwrap();
+
+                let mut tx = registry.metadata_store.begin_transaction(namespace);
+                let builder = tx.create_link(&retarget_link(&link, &digest), &digest);
+                if let LinkKind::Manifest(parent, _) = &link {
+                    builder.with_referrer(parent).add();
+                } else {
+                    builder.add();
+                }
+                tx.commit().await.unwrap();
+
+                let result = registry.delete_blob(namespace, &digest).await;
+                assert!(matches!(result, Err(Error::BlobReferenced)));
+                assert_eq!(registry.blob_store.read(&digest).await.unwrap(), content);
+            }
+
+            test_case.cleanup().await;
+        }
+    }
+
+    fn retarget_link(link: &LinkKind, digest: &Digest) -> LinkKind {
+        match link {
+            LinkKind::Digest(_) => LinkKind::Digest(digest.clone()),
+            LinkKind::Layer(_) => LinkKind::Layer(digest.clone()),
+            LinkKind::Config(_) => LinkKind::Config(digest.clone()),
+            LinkKind::Manifest(parent, _) => LinkKind::Manifest(parent.clone(), digest.clone()),
+            LinkKind::Referrer(subject, _) => LinkKind::Referrer(subject.clone(), digest.clone()),
+            LinkKind::Blob(_) | LinkKind::Tag(_) => link.clone(),
+        }
+    }
+
+    #[tokio::test]
+    async fn delete_blob_keeps_data_owned_by_other_namespace() {
+        for test_case in backends() {
+            let registry = test_case.registry();
+            let first = &Namespace::new("test-repo/first").unwrap();
+            let second = &Namespace::new("test-repo/second").unwrap();
+            let content = b"shared blob content";
+            let digest = registry.blob_store.create(content).await.unwrap();
+            let ownership = BlobOwnership::new(registry.metadata_store.as_ref());
+
+            ownership.grant(first, &digest).await.unwrap();
+            ownership.grant(second, &digest).await.unwrap();
+
+            registry.delete_blob(first, &digest).await.unwrap();
+
+            assert_eq!(registry.blob_store.read(&digest).await.unwrap(), content);
+            assert!(!ownership.can_read(first, &digest).await.unwrap());
+            assert!(ownership.can_read(second, &digest).await.unwrap());
+
+            registry.delete_blob(second, &digest).await.unwrap();
+
+            assert!(registry.blob_store.read(&digest).await.is_err());
+            test_case.cleanup().await;
+        }
+    }
+
+    #[tokio::test]
     async fn delete_blob_rejects_unowned_blob() {
         for test_case in backends() {
             let registry = test_case.registry();
