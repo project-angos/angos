@@ -1,9 +1,4 @@
-use hyper::{
-    Response, StatusCode,
-    body::Incoming,
-    header::{CONTENT_LENGTH, CONTENT_RANGE},
-    http::request::Parts,
-};
+use hyper::{Response, StatusCode, body::Incoming, header::CONTENT_RANGE, http::request::Parts};
 use tokio::io::AsyncRead;
 use uuid::Uuid;
 
@@ -12,7 +7,7 @@ use crate::{
         ServerContext,
         error::Error,
         handlers::build_response,
-        request::{incoming_into_async_read, parse_header, range},
+        request::{RequestHeaders, incoming_into_async_read},
         response_body::ResponseBody,
     },
     event_webhook::event::{Event, EventActor},
@@ -117,8 +112,11 @@ pub async fn dispatch_patch_upload(
     namespace: &Namespace,
     uuid: Uuid,
 ) -> Result<Response<ResponseBody>, Error> {
-    let start_offset = range(&parts.headers, CONTENT_RANGE)?.map(|(start, _)| start);
-    let content_length: u64 = parse_header(&parts.headers, CONTENT_LENGTH).unwrap_or(0);
+    let headers = RequestHeaders::new(&parts.headers);
+    let start_offset = headers.range(CONTENT_RANGE)?.map(|(start, _)| start);
+    let content_length = headers.content_length()?.ok_or(Error::BadRequest(
+        "No Content-Length header provided".to_string(),
+    ))?;
     let body_stream = incoming_into_async_read(incoming);
 
     handle_patch_upload(
@@ -141,7 +139,8 @@ pub async fn dispatch_put_upload(
     digest: Digest,
     identity: &ClientIdentity,
 ) -> Result<Response<ResponseBody>, Error> {
-    let content_length: u64 = parse_header(&parts.headers, CONTENT_LENGTH).unwrap_or(0);
+    let headers = RequestHeaders::new(&parts.headers);
+    let content_length = headers.content_length()?.unwrap_or(0);
     let body_stream = incoming_into_async_read(incoming);
 
     let (response, events) = handle_put_upload(

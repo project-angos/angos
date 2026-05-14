@@ -11,7 +11,7 @@ use tracing::{debug, instrument};
 
 use super::{AuthMiddleware, AuthResult};
 use crate::{
-    command::server::{Error, basic_auth},
+    command::server::{Error, RequestHeaders},
     identity::ClientIdentity,
 };
 
@@ -95,7 +95,8 @@ impl AuthMiddleware for BasicAuthValidator {
         parts: &Parts,
         identity: &mut ClientIdentity,
     ) -> Result<AuthResult, Error> {
-        let Some((username, password)) = basic_auth(&parts.headers) else {
+        let headers = RequestHeaders::new(&parts.headers);
+        let Some((username, password)) = headers.basic_auth() else {
             return Ok(AuthResult::NoCredentials);
         };
 

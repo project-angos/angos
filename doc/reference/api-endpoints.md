@@ -14,6 +14,8 @@ Angos implements the [OCI Distribution Specification v1.1](https://github.com/op
 
 Base path: `/v2/`
 
+Comma-separated `Accept` header values are parsed and ordered by quality (`q`) before Angos uses them for upstream pull-through requests.
+
 ### API Version Check
 
 ```
@@ -72,13 +74,13 @@ Get upload status.
 PATCH /v2/{namespace}/blobs/uploads/{uuid}
 ```
 
-Upload a chunk. Use `Content-Range` header for chunked uploads.
+Upload a chunk. Use `Content-Range` for the chunk range and `Content-Length` for the exact chunk size. Missing or invalid `Content-Length` returns `400 Bad Request`.
 
 ```
 PUT /v2/{namespace}/blobs/uploads/{uuid}?digest={digest}
 ```
 
-Complete the upload with final digest.
+Complete the upload with final digest. If a final chunk is included, `Content-Length` must contain that chunk size. Without a final chunk, missing `Content-Length` is treated as zero.
 
 ```
 DELETE /v2/{namespace}/blobs/uploads/{uuid}
@@ -329,6 +331,8 @@ Authorization: Bearer <jwt-token>
 ```
 Authorization: Basic base64(provider-name:jwt-token)
 ```
+
+Authentication schemes are parsed case-insensitively, so `basic` and `bearer` are accepted the same as `Basic` and `Bearer`.
 
 When the username matches an OIDC provider name, the password is validated as a JWT token. This enables Docker clients to authenticate with OIDC tokens:
 
