@@ -184,10 +184,16 @@ impl Backend {
         let hasher = self.load_hasher(name, uuid, logical_offset).await?;
 
         let mut buf = pending_bytes;
+        let original_len = buf.len();
         let mut hashing_reader = HashingReader::with_hasher(stream, hasher);
         hashing_reader.read_to_end(&mut buf).await?;
 
         let new_logical = ctx.uploaded_size + u64::try_from(buf.len())?;
+        if buf.len() == original_len {
+            let digest = hashing_reader.digest();
+            return Ok((digest, new_logical));
+        }
+
         self.store
             .put_object(ctx.pending_path, Bytes::from(buf))
             .await?;

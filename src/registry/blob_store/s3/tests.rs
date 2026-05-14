@@ -134,6 +134,44 @@ async fn test_multipart_upload_digest() {
 }
 
 #[tokio::test]
+async fn test_zero_length_nonuniform_write_keeps_digest_and_size() {
+    use crate::registry::blob_store::UploadStore;
+
+    let t = S3RegistryTestCase::new();
+    let store: &dyn UploadStore = t.blob_store();
+    let uuid = Uuid::new_v4().to_string();
+
+    store.create("ns", &uuid).await.unwrap();
+
+    let data = vec![0xA5; 6 * 1024 * 1024];
+    let (digest, size) = store
+        .write(
+            "ns",
+            &uuid,
+            Box::new(Cursor::new(data)),
+            6 * 1024 * 1024,
+            true,
+        )
+        .await
+        .unwrap();
+
+    let summary = store.summary("ns", &uuid).await.unwrap();
+    assert_eq!(summary.size, size);
+
+    let (same_digest, same_size) = store
+        .write("ns", &uuid, Box::new(Cursor::new(Vec::new())), 0, true)
+        .await
+        .unwrap();
+
+    assert_eq!(same_digest, digest);
+    assert_eq!(same_size, size);
+
+    let completed = store.complete("ns", &uuid, Some(&digest)).await.unwrap();
+    assert_eq!(completed, digest);
+    t.cleanup().await;
+}
+
+#[tokio::test]
 async fn test_delete_prefix_removes_all_objects() {
     use crate::registry::blob_store::UploadStore;
 
