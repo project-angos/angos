@@ -9,10 +9,9 @@ use crate::{
     oci::{Digest, Namespace},
     registry::{
         DOCKER_CONTENT_DIGEST, Error, Registry, Repository,
+        blob_ownership::BlobOwnership,
         blob_store::{BoxedReader, UploadStore},
-        metadata_store::{
-            self, BlobIndexOperation, MetadataStore, MetadataStoreExt, link_kind::LinkKind,
-        },
+        metadata_store::{MetadataStore, MetadataStoreExt, link_kind::LinkKind},
         task_queue,
     },
 };
@@ -129,18 +128,13 @@ impl Registry {
         namespace: &Namespace,
         digest: &Digest,
     ) -> Result<(), Error> {
-        match self.metadata_store.read_blob_index(digest).await {
-            Ok(blob_index) => {
-                if blob_index.namespace.contains_key(namespace.as_ref()) {
-                    Ok(())
-                } else {
-                    Err(Error::BlobUnknown)
-                }
-            }
-            Err(metadata_store::Error::ReferenceNotFound) => Ok(()),
-            Err(e) => {
-                warn!("Failed to read blob index for {digest}: {e}");
-                Err(e.into())
+        let ownership = BlobOwnership::new(self.metadata_store.as_ref());
+        match ownership.can_read(namespace, digest).await {
+            Ok(true) => Ok(()),
+            Ok(false) => Err(Error::BlobUnknown),
+            Err(error) => {
+                warn!("Failed to read blob ownership for {digest}: {error}");
+                Err(error)
             }
         }
     }
@@ -153,29 +147,55 @@ impl Registry {
         namespace: &Namespace,
         digest: &Digest,
     ) -> Result<HeadBlobResponse, Error> {
-        if !repository.is_pull_through() {
-            self.check_blob_namespace_access(namespace, digest).await?;
+        let has_access = BlobOwnership::new(self.metadata_store.as_ref())
+            .can_read(namespace, digest)
+            .await?;
+
+        if !repository.is_pull_through() && !has_access {
+            return Err(Error::BlobUnknown);
         }
 
-        let blob = self.blob_store.size(digest).await;
-
-        match blob {
-            Ok(size) => Ok(HeadBlobResponse {
-                headers: head_blob_headers(digest, size),
-            }),
-            Err(_) if repository.is_pull_through() => {
-                let (digest, size) = repository
-                    .head_blob(accepted_types, namespace, digest)
-                    .await?;
-                Ok(HeadBlobResponse {
-                    headers: head_blob_headers(&digest, size),
-                })
-            }
-            Err(e) => {
-                warn!("Blob with digest {digest} not found: {e}");
-                Err(Error::BlobUnknown)
+        if has_access {
+            match self.blob_store.size(digest).await {
+                Ok(size) => {
+                    return Ok(HeadBlobResponse {
+                        headers: head_blob_headers(digest, size),
+                    });
+                }
+                Err(error) if !repository.is_pull_through() => {
+                    warn!("Blob with digest {digest} not found: {error}");
+                    return Err(Error::BlobUnknown);
+                }
+                Err(_) => {}
             }
         }
+
+        if repository.is_pull_through() {
+            let (digest, size) = repository
+                .head_blob(accepted_types, namespace, digest)
+                .await?;
+            Ok(HeadBlobResponse {
+                headers: head_blob_headers(&digest, size),
+            })
+        } else {
+            Err(Error::BlobUnknown)
+        }
+    }
+
+    async fn try_get_owned_local_blob(
+        &self,
+        namespace: &Namespace,
+        digest: &Digest,
+        range: Option<BlobRange>,
+    ) -> Result<Option<GetBlobResponse>, Error> {
+        if !BlobOwnership::new(self.metadata_store.as_ref())
+            .can_read(namespace, digest)
+            .await?
+        {
+            return Ok(None);
+        }
+
+        self.get_local_blob(digest, range).await.map(Some)
     }
 
     #[instrument(skip(upload_engine, stream))]
@@ -215,12 +235,8 @@ impl Registry {
         Self::copy_blob(upload_store, stream, &namespace, &digest)
             .await
             .map_err(|e| task_queue::Error::TaskExecution(e.to_string()))?;
-        metadata_store
-            .update_blob_index(
-                namespace.as_ref(),
-                &digest,
-                BlobIndexOperation::Insert(LinkKind::Layer(digest.clone())),
-            )
+        BlobOwnership::new(metadata_store.as_ref())
+            .grant(&namespace, &digest)
             .await
             .map_err(|e| task_queue::Error::TaskExecution(e.to_string()))?;
         info!("Caching of {digest} completed");
@@ -236,17 +252,15 @@ impl Registry {
         digest: &Digest,
         range: Option<BlobRange>,
     ) -> Result<GetBlobResponse, Error> {
-        if !repository.is_pull_through() {
-            self.check_blob_namespace_access(namespace, digest).await?;
-        }
-
-        match self.get_local_blob(digest, range).await {
-            Ok(response) => return Ok(response),
-            Err(_) if !repository.is_pull_through() => {
-                warn!("Blob not found locally: {digest}");
-                return Err(Error::BlobUnknown);
-            }
-            Err(_) => {}
+        match self
+            .try_get_owned_local_blob(namespace, digest, range)
+            .await
+        {
+            Ok(Some(response)) => return Ok(response),
+            Ok(None) if !repository.is_pull_through() => return Err(Error::BlobUnknown),
+            Ok(None) => {}
+            Err(Error::BlobUnknown) if repository.is_pull_through() => {}
+            Err(error) => return Err(error),
         }
 
         if range.is_some() {
@@ -314,6 +328,8 @@ impl Registry {
 
     #[instrument]
     pub async fn delete_blob(&self, namespace: &Namespace, digest: &Digest) -> Result<(), Error> {
+        self.check_blob_namespace_access(namespace, digest).await?;
+
         let mut tx = self.metadata_store.begin_transaction(namespace);
         tx.delete_link(&LinkKind::Layer(digest.clone()));
         tx.delete_link(&LinkKind::Config(digest.clone()));
@@ -322,27 +338,26 @@ impl Registry {
             warn!("Failed to delete blob links: {error}");
         }
 
-        if let Ok(blob_index) = self.metadata_store.read_blob_index(digest).await
-            && let Some(links) = blob_index.namespace.get(namespace.as_ref())
-        {
-            for link in links {
-                if let Err(error) = self
-                    .metadata_store
-                    .update_blob_index(
-                        namespace.as_ref(),
-                        digest,
-                        BlobIndexOperation::Remove(link.clone()),
-                    )
-                    .await
-                {
-                    warn!("Failed to remove blob index entry: {error}");
+        let ownership = BlobOwnership::new(self.metadata_store.as_ref());
+        match ownership.references(namespace, digest).await {
+            Ok(links) => {
+                for link in links {
+                    if let Err(error) = ownership.revoke(namespace, digest, link).await {
+                        warn!("Failed to revoke blob ownership: {error}");
+                    }
                 }
+            }
+            Err(error) => {
+                warn!("Failed to read blob ownership for {digest}: {error}");
             }
         }
 
-        let should_delete = match self.metadata_store.read_blob_index(digest).await {
-            Ok(blob_index) => blob_index.namespace.is_empty(),
-            Err(_) => true,
+        let should_delete = match ownership.has_any_reference(digest).await {
+            Ok(has_reference) => !has_reference,
+            Err(error) => {
+                warn!("Failed to determine blob ownership for {digest}: {error}");
+                false
+            }
         };
 
         if should_delete && let Err(error) = self.blob_store.delete(digest).await {
@@ -366,13 +381,18 @@ impl Registry {
     ) -> Result<GetBlobResponse, Error> {
         let repository = self.get_repository_for_namespace(namespace)?;
 
-        if !repository.is_pull_through() {
-            self.check_blob_namespace_access(namespace, digest).await?;
+        let has_access = BlobOwnership::new(self.metadata_store.as_ref())
+            .can_read(namespace, digest)
+            .await?;
+
+        if !repository.is_pull_through() && !has_access {
+            return Err(Error::BlobUnknown);
         }
 
         if range.is_none()
             && self.enable_blob_redirect
-            && (!repository.is_pull_through() || self.blob_store.size(digest).await.is_ok())
+            && has_access
+            && self.blob_store.size(digest).await.is_ok()
             && let Some(presigned) = &self.presigned_blob_store
             && let Ok(Some(presigned_url)) = presigned.url(digest, None).await
         {
@@ -450,6 +470,29 @@ mod tests {
                 GetBlobResponse::RangedReader { .. } => panic!("Expected Reader response"),
                 GetBlobResponse::Redirect { .. } => panic!("unexpected redirect from get_blob"),
             }
+            test_case.cleanup().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn get_blob_rejects_local_blob_without_namespace_ownership() {
+        for test_case in backends() {
+            let registry = test_case.registry();
+            let namespace = &Namespace::new("test-repo").unwrap();
+            let content = b"unowned blob content";
+            let digest = registry.blob_store.create(content).await.unwrap();
+            let repository = registry.get_repository_for_namespace(namespace).unwrap();
+
+            let head_result = registry
+                .head_blob(repository, &[], namespace, &digest)
+                .await;
+            assert!(matches!(head_result, Err(Error::BlobUnknown)));
+
+            let get_result = registry
+                .get_blob(repository, &[], namespace, &digest, None)
+                .await;
+            assert!(matches!(get_result, Err(Error::BlobUnknown)));
+
             test_case.cleanup().await;
         }
     }
@@ -554,6 +597,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn delete_blob_rejects_unowned_blob() {
+        for test_case in backends() {
+            let registry = test_case.registry();
+            let namespace = &Namespace::new("test-repo").unwrap();
+            let content = b"unowned delete content";
+            let digest = registry.blob_store.create(content).await.unwrap();
+
+            let result = registry.delete_blob(namespace, &digest).await;
+            assert!(matches!(result, Err(Error::BlobUnknown)));
+
+            let stored_content = registry.blob_store.read(&digest).await.unwrap();
+            assert_eq!(stored_content, content);
+
+            test_case.cleanup().await;
+        }
+    }
+
+    #[tokio::test]
     async fn test_copy_blob() {
         for test_case in backends() {
             let registry = test_case.registry();
@@ -600,7 +661,7 @@ mod tests {
                 .await
                 .unwrap();
             let namespace_links = blob_index.namespace.get(namespace.as_ref()).unwrap();
-            assert!(namespace_links.contains(&LinkKind::Layer(digest.clone())));
+            assert!(namespace_links.contains(&LinkKind::Blob(digest.clone())));
 
             let repository = registry.get_repository_for_namespace(&namespace).unwrap();
             let response = registry

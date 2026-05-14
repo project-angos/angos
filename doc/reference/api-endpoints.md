@@ -31,7 +31,8 @@ HEAD /v2/{namespace}/blobs/{digest}
 GET  /v2/{namespace}/blobs/{digest}
 ```
 
-Check existence or download a blob by digest.
+Check existence or download a blob by digest. A blob is visible only within namespaces that own it;
+a digest that exists in storage but is not linked to the requested namespace returns `BLOB_UNKNOWN`.
 
 `GET` supports a single byte range through the `Range` header:
 
@@ -50,7 +51,7 @@ Range requests for pull-through repositories are supported only after the blob i
 DELETE /v2/{namespace}/blobs/{digest}
 ```
 
-Delete a blob.
+Delete a blob owned by the namespace. Blob data is removed only after no namespace owns the digest.
 
 ### Blob Upload
 
@@ -61,7 +62,8 @@ POST /v2/{namespace}/blobs/uploads/
 Start a new blob upload. Returns `202 Accepted` with `Location` header.
 
 Query parameters:
-- `digest` - Complete upload in single request (monolithic)
+- `digest` - Return the existing blob only when the requested namespace already owns it; otherwise
+  start a new upload session.
 - `mount` - Mount blob from another repository
 
 ```
@@ -107,7 +109,8 @@ Push a manifest. Manifest bodies larger than `global.max_manifest_size` are reje
 DELETE /v2/{namespace}/manifests/{reference}
 ```
 
-Delete a manifest by tag or digest.
+Delete a manifest by tag or digest. This removes manifest metadata; uploaded blobs remain owned by
+the namespace until they are deleted through the blob endpoint.
 
 ### Tags
 

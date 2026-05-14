@@ -2,14 +2,16 @@ use std::{collections::HashMap, io::Cursor, slice};
 
 use hyper::header::{CONTENT_LENGTH, CONTENT_TYPE, LOCATION};
 use serde_json::json;
+use uuid::Uuid;
 
 use super::{parse::manifest_meta_from_body, *};
 use crate::{
     oci::Namespace,
     registry::{
-        Error,
+        Error, Registry,
         test_utils::{FSRegistryTestCase, backends},
     },
+    util::sha256,
 };
 
 fn header_digest(headers: &HashMap<&'static str, String>) -> Digest {
@@ -65,6 +67,30 @@ fn create_test_manifest_with_subject() -> (Vec<u8>, String) {
     let content = serde_json::to_vec(&manifest).unwrap();
     let media_type = "application/vnd.docker.distribution.manifest.v2+json".to_string();
     (content, media_type)
+}
+
+async fn upload_blob(registry: &Registry, namespace: &Namespace, content: &[u8]) -> Digest {
+    let session_id = Uuid::new_v4();
+    registry
+        .upload_store
+        .create(namespace, &session_id.to_string())
+        .await
+        .unwrap();
+
+    let body = content.to_vec();
+    let digest = sha256::digest(&body);
+    registry
+        .complete_upload(
+            None,
+            namespace,
+            session_id,
+            &digest,
+            body.len() as u64,
+            Cursor::new(body),
+        )
+        .await
+        .unwrap();
+    digest
 }
 
 #[tokio::test]
@@ -301,6 +327,68 @@ async fn test_delete_manifest() {
                 .await
                 .is_err()
         );
+        test_case.cleanup().await;
+    }
+}
+
+#[tokio::test]
+async fn delete_manifest_then_delete_uploaded_blobs() {
+    for test_case in backends() {
+        let registry = test_case.registry();
+        let namespace = &Namespace::new("test-repo/zot-cleanup").unwrap();
+        let layer_content = b"zot benchmark layer content";
+        let config_content = br#"{"architecture":"amd64","os":"linux"}"#;
+        let layer_digest = upload_blob(registry, namespace, layer_content).await;
+        let config_digest = upload_blob(registry, namespace, config_content).await;
+        let media_type = "application/vnd.oci.image.manifest.v1+json".to_string();
+        let manifest = json!({
+            "schemaVersion": 2,
+            "mediaType": media_type,
+            "config": {
+                "mediaType": "application/vnd.oci.image.config.v1+json",
+                "digest": config_digest,
+                "size": config_content.len()
+            },
+            "layers": [
+                {
+                    "mediaType": "application/vnd.oci.image.layer.v1.tar",
+                    "digest": layer_digest,
+                    "size": layer_content.len()
+                }
+            ]
+        });
+        let manifest_content = serde_json::to_vec(&manifest).unwrap();
+
+        let response = registry
+            .put_manifest(
+                namespace,
+                &Reference::Tag("latest".to_string()),
+                Some(&media_type),
+                &manifest_content,
+            )
+            .await
+            .unwrap();
+
+        registry
+            .delete_manifest(
+                None,
+                namespace,
+                &Reference::Digest(header_digest(&response.headers)),
+            )
+            .await
+            .unwrap();
+
+        registry
+            .delete_blob(namespace, &layer_digest)
+            .await
+            .unwrap();
+        registry
+            .delete_blob(namespace, &config_digest)
+            .await
+            .unwrap();
+
+        assert!(registry.blob_store.read(&layer_digest).await.is_err());
+        assert!(registry.blob_store.read(&config_digest).await.is_err());
         test_case.cleanup().await;
     }
 }

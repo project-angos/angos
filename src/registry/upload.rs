@@ -8,7 +8,10 @@ use uuid::Uuid;
 use crate::{
     event_webhook::event::{Event, EventActor, EventKind},
     oci::{Digest, Namespace},
-    registry::{DOCKER_CONTENT_DIGEST, DOCKER_UPLOAD_UUID, Error, Registry, blob_store},
+    registry::{
+        DOCKER_CONTENT_DIGEST, DOCKER_UPLOAD_UUID, Error, Registry, blob_ownership::BlobOwnership,
+        blob_store,
+    },
 };
 
 pub enum StartUploadResponse {
@@ -90,6 +93,9 @@ impl Registry {
     ) -> Result<StartUploadResponse, Error> {
         if let Some(digest) = digest
             && self.blob_store.size(&digest).await.is_ok()
+            && BlobOwnership::new(self.metadata_store.as_ref())
+                .can_read(namespace, &digest)
+                .await?
         {
             return Ok(StartUploadResponse::ExistingBlob {
                 headers: blob_location_headers(namespace, &digest),
@@ -184,6 +190,10 @@ impl Registry {
         self.upload_store
             .complete(namespace, &session_key, Some(digest))
             .await?;
+        BlobOwnership::new(self.metadata_store.as_ref())
+            .grant(namespace, digest)
+            .await?;
+
         if let Err(error) = self.upload_store.delete(namespace, &session_key).await {
             warn!("Failed to delete completed upload state: {error}");
         }
@@ -240,8 +250,11 @@ mod tests {
         event_webhook::event::EventKind,
         oci::{Digest, Namespace},
         registry::{
-            DOCKER_CONTENT_DIGEST, DOCKER_UPLOAD_UUID, Error, StartUploadResponse, blob_store,
+            DOCKER_CONTENT_DIGEST, DOCKER_UPLOAD_UUID, Error, StartUploadResponse,
+            blob_ownership::BlobOwnership,
+            blob_store,
             blob_store::{BoxedReader, UploadStore, UploadSummary},
+            metadata_store::link_kind::LinkKind,
             path_builder,
             test_utils::{FSRegistryTestCase, RegistryTestCase, backends, create_test_registry},
         },
@@ -324,6 +337,28 @@ mod tests {
             }
 
             let digest = registry.blob_store.create(content).await.unwrap();
+            let response = registry
+                .start_upload(namespace, Some(digest.clone()))
+                .await
+                .unwrap();
+            match response {
+                StartUploadResponse::Session { headers } => {
+                    assert!(
+                        headers[LOCATION.as_str()]
+                            .starts_with(&format!("/v2/{namespace}/blobs/uploads/"))
+                    );
+                    assert!(!headers[DOCKER_UPLOAD_UUID].is_empty());
+                }
+                StartUploadResponse::ExistingBlob { .. } => {
+                    panic!("Expected unowned blob to start a new session")
+                }
+            }
+
+            BlobOwnership::new(registry.metadata_store.as_ref())
+                .grant(namespace, &digest)
+                .await
+                .unwrap();
+
             let response = registry
                 .start_upload(namespace, Some(digest.clone()))
                 .await
@@ -440,6 +475,15 @@ mod tests {
 
             let stored_content = registry.blob_store.read(&expected_digest).await.unwrap();
             assert_eq!(stored_content, content);
+
+            let blob_index = registry
+                .metadata_store
+                .read_blob_index(&expected_digest)
+                .await
+                .unwrap();
+            let namespace_links = blob_index.namespace.get(namespace.as_ref()).unwrap();
+            assert!(namespace_links.contains(&LinkKind::Blob(expected_digest.clone())));
+
             test_case.cleanup().await;
         }
     }

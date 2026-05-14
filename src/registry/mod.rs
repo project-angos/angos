@@ -3,6 +3,7 @@ use std::{collections::HashMap, fmt::Debug, sync::Arc};
 use tracing::instrument;
 
 pub mod blob;
+pub mod blob_ownership;
 pub mod blob_store;
 pub mod content_discovery;
 pub mod data_store;
