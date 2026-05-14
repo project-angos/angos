@@ -328,6 +328,11 @@ impl MetadataStore for Backend {
     }
 
     #[instrument(skip(self))]
+    async fn has_blob_references(&self, digest: &Digest) -> Result<bool, Error> {
+        self.has_blob_references_impl(digest).await
+    }
+
+    #[instrument(skip(self))]
     async fn read_blob_index_namespace(
         &self,
         namespace: &str,

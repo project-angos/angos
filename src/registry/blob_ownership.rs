@@ -71,10 +71,9 @@ impl<'a> BlobOwnership<'a> {
     }
 
     pub async fn has_any_reference(&self, digest: &Digest) -> Result<bool, Error> {
-        match self.metadata_store.read_blob_index(digest).await {
-            Ok(blob_index) => Ok(!blob_index.namespace.is_empty()),
-            Err(MetadataError::ReferenceNotFound) => Ok(false),
-            Err(error) => Err(error.into()),
-        }
+        self.metadata_store
+            .has_blob_references(digest)
+            .await
+            .map_err(Error::from)
     }
 }

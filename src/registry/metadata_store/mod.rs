@@ -95,6 +95,14 @@ pub trait MetadataStore: Send + Sync {
 
     async fn read_blob_index(&self, digest: &Digest) -> Result<BlobIndex, Error>;
 
+    async fn has_blob_references(&self, digest: &Digest) -> Result<bool, Error> {
+        match self.read_blob_index(digest).await {
+            Ok(blob_index) => Ok(!blob_index.namespace.is_empty()),
+            Err(Error::ReferenceNotFound) => Ok(false),
+            Err(error) => Err(error),
+        }
+    }
+
     async fn read_blob_index_namespace(
         &self,
         namespace: &str,

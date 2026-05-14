@@ -217,6 +217,28 @@ impl Backend {
         }
     }
 
+    pub async fn has_blob_references_impl(&self, digest: &Digest) -> Result<bool, Error> {
+        let refs_dir = path_builder::blob_index_refs_dir(digest);
+        let (_, objects, _) = self
+            .store
+            .list_prefixes(&refs_dir, "/", 1, None, None)
+            .await?;
+
+        if !objects.is_empty() {
+            return Ok(true);
+        }
+
+        let legacy_path = path_builder::blob_index_path(digest);
+        match self.store.read(&legacy_path).await {
+            Ok(data) => {
+                let blob_index: BlobIndex = serde_json::from_slice(&data)?;
+                Ok(!blob_index.namespace.is_empty())
+            }
+            Err(e) if e.kind() == ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(e.into()),
+        }
+    }
+
     /// Unconditional read-modify-write on a namespace shard (caller must hold lock).
     pub async fn update_blob_index_shard(
         &self,
