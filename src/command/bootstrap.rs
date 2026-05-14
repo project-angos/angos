@@ -70,8 +70,9 @@ pub async fn repository(
     name: &str,
     config: &repository::Config,
     auth_cache: &Arc<Cache>,
+    max_manifest_size_bytes: usize,
 ) -> Result<Repository, Error> {
-    Repository::new(name, config, auth_cache)
+    Repository::new(name, config, auth_cache, max_manifest_size_bytes)
         .await
         .map_err(|source| Error::Repository {
             name: name.to_string(),
@@ -82,10 +83,14 @@ pub async fn repository(
 pub async fn repositories(
     configs: &HashMap<String, repository::Config>,
     auth_cache: &Arc<Cache>,
+    max_manifest_size_bytes: usize,
 ) -> Result<Arc<HashMap<String, Repository>>, Error> {
     let mut map = HashMap::with_capacity(configs.len());
     for (name, config) in configs {
-        map.insert(name.clone(), repository(name, config, auth_cache).await?);
+        map.insert(
+            name.clone(),
+            repository(name, config, auth_cache, max_manifest_size_bytes).await?,
+        );
     }
     Ok(Arc::new(map))
 }
@@ -96,6 +101,7 @@ mod tests {
     use crate::{
         cache,
         policy::{AccessMode, AccessPolicyConfig},
+        registry::manifest::DEFAULT_MAX_MANIFEST_SIZE_BYTES,
     };
 
     #[test]
@@ -115,7 +121,13 @@ mod tests {
             ..repository::Config::default()
         };
         let cache = auth_cache(&cache::Config::Memory).unwrap();
-        let result = repository("test-repo", &repo_config, &cache).await;
+        let result = repository(
+            "test-repo",
+            &repo_config,
+            &cache,
+            DEFAULT_MAX_MANIFEST_SIZE_BYTES,
+        )
+        .await;
         assert!(result.is_ok());
         assert_eq!(result.unwrap().name, "test-repo");
     }
@@ -124,7 +136,7 @@ mod tests {
     async fn repositories_empty_map_succeeds() {
         let configs = HashMap::new();
         let cache = auth_cache(&cache::Config::Memory).unwrap();
-        let result = repositories(&configs, &cache).await;
+        let result = repositories(&configs, &cache, DEFAULT_MAX_MANIFEST_SIZE_BYTES).await;
         assert!(result.is_ok());
         assert_eq!(result.unwrap().len(), 0);
     }

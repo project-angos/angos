@@ -4,6 +4,23 @@ use crate::{
 };
 
 #[test]
+fn global_max_manifest_size_must_be_greater_than_zero() {
+    let config = config_toml(
+        r"
+    max_manifest_size = 0
+    ",
+    );
+
+    let result = Configuration::load_from_str(&config);
+    match result {
+        Err(Error::InvalidFormat(msg)) => {
+            assert!(msg.contains("global.max_manifest_size must be greater than zero"));
+        }
+        other => panic!("Expected InvalidFormat error, got {other:?}"),
+    }
+}
+
+#[test]
 fn test_validate_webhook_referenced_globally() {
     let config = config_toml(
         r#"

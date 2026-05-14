@@ -6,7 +6,10 @@ use serde_json::json;
 use super::{parse::manifest_meta_from_body, *};
 use crate::{
     oci::Namespace,
-    registry::test_utils::{FSRegistryTestCase, backends},
+    registry::{
+        Error,
+        test_utils::{FSRegistryTestCase, backends},
+    },
 };
 
 fn header_digest(headers: &HashMap<&'static str, String>) -> Digest {
@@ -395,6 +398,33 @@ fn parse_manifest_digests_media_type_mismatch_returns_manifest_invalid() {
         matches!(err, crate::registry::Error::ManifestInvalid(_)),
         "expected ManifestInvalid for media type mismatch, got: {err:?}"
     );
+}
+
+#[tokio::test]
+async fn accept_put_manifest_rejects_body_above_limit() {
+    let test_case = FSRegistryTestCase::new();
+    let registry = test_case.registry();
+    let namespace = &Namespace::new("test-repo").unwrap();
+    let body = vec![b' '; DEFAULT_MAX_MANIFEST_SIZE_BYTES + 1];
+
+    let err = registry
+        .accept_put_manifest(
+            None,
+            namespace,
+            Reference::Tag("latest".to_string()),
+            "application/vnd.oci.image.manifest.v1+json".to_string(),
+            Cursor::new(body),
+        )
+        .await
+        .err()
+        .expect("expected oversized manifest upload to fail");
+
+    assert!(matches!(
+        err,
+        Error::ManifestBodyTooLarge {
+            limit: DEFAULT_MAX_MANIFEST_SIZE_BYTES
+        }
+    ));
 }
 
 #[test]

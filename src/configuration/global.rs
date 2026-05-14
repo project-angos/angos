@@ -1,3 +1,4 @@
+use bytesize::ByteSize;
 use serde::Deserialize;
 
 use crate::{
@@ -11,6 +12,8 @@ pub struct GlobalConfig {
     pub max_concurrent_requests: usize,
     #[serde(default = "default_max_concurrent_cache_jobs")]
     pub max_concurrent_cache_jobs: usize,
+    #[serde(default = "default_max_manifest_size")]
+    pub max_manifest_size: ByteSize,
     #[serde(default = "default_update_pull_time")]
     pub update_pull_time: bool,
     #[serde(default)]
@@ -40,6 +43,10 @@ fn default_max_concurrent_cache_jobs() -> usize {
     4
 }
 
+fn default_max_manifest_size() -> ByteSize {
+    ByteSize::mib(5)
+}
+
 fn default_update_pull_time() -> bool {
     false
 }
@@ -49,6 +56,7 @@ impl Default for GlobalConfig {
         GlobalConfig {
             max_concurrent_requests: default_max_concurrent_requests(),
             max_concurrent_cache_jobs: default_max_concurrent_cache_jobs(),
+            max_manifest_size: default_max_manifest_size(),
             update_pull_time: default_update_pull_time(),
             enable_redirect: None,
             enable_blob_redirect: None,
@@ -75,10 +83,16 @@ impl GlobalConfig {
             .or(self.enable_redirect)
             .unwrap_or(true)
     }
+
+    pub fn max_manifest_size_bytes(&self) -> usize {
+        usize::try_from(self.max_manifest_size.as_u64()).unwrap_or(usize::MAX)
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use bytesize::ByteSize;
+
     use crate::configuration::GlobalConfig;
 
     #[test]
@@ -87,6 +101,7 @@ mod tests {
 
         assert_eq!(config.max_concurrent_requests, 64);
         assert_eq!(config.max_concurrent_cache_jobs, 4);
+        assert_eq!(config.max_manifest_size, ByteSize::mib(5));
         assert!(!config.update_pull_time);
         assert!(!config.immutable_tags);
         assert!(config.immutable_tags_exclusions.is_empty());
@@ -99,6 +114,7 @@ mod tests {
             r#"
             max_concurrent_requests = 10
             max_concurrent_cache_jobs = 8
+            max_manifest_size = "7MiB"
             update_pull_time = true
             immutable_tags = true
             immutable_tags_exclusions = ["latest", "dev"]
@@ -109,11 +125,22 @@ mod tests {
 
         assert_eq!(config.max_concurrent_requests, 10);
         assert_eq!(config.max_concurrent_cache_jobs, 8);
+        assert_eq!(config.max_manifest_size, ByteSize::mib(7));
         assert!(config.update_pull_time);
         assert!(config.immutable_tags);
         assert_eq!(config.immutable_tags_exclusions.len(), 2);
         assert_eq!(config.immutable_tags_exclusions[0].as_source(), "latest");
         assert_eq!(config.immutable_tags_exclusions[1].as_source(), "dev");
         assert_eq!(config.authorization_webhook.as_deref(), Some("my-webhook"));
+    }
+
+    #[test]
+    fn max_manifest_size_bytes_returns_usize() {
+        let config = GlobalConfig {
+            max_manifest_size: ByteSize::mib(6),
+            ..GlobalConfig::default()
+        };
+
+        assert_eq!(config.max_manifest_size_bytes(), 6 * 1024 * 1024);
     }
 }

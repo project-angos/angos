@@ -24,6 +24,8 @@ use crate::{
     },
 };
 
+pub const DEFAULT_MAX_MANIFEST_SIZE_BYTES: usize = 5 * 1024 * 1024;
+
 fn manifest_event(
     kind: EventKind,
     namespace: &Namespace,
@@ -537,19 +539,25 @@ impl Registry {
         namespace: &Namespace,
         reference: Reference,
         mime_type: String,
-        mut body_stream: S,
+        body_stream: S,
     ) -> Result<PutManifestResponse, Error>
     where
         S: AsyncRead + Unpin + Send,
     {
+        let limit = self.max_manifest_size_bytes;
         let mut request_body = Vec::new();
+        let mut limited_body = body_stream.take(limit as u64 + 1);
 
-        body_stream
+        limited_body
             .read_to_end(&mut request_body)
             .await
             .map_err(|_| {
                 Error::ManifestInvalid("Unable to retrieve manifest from client query".to_string())
             })?;
+
+        if request_body.len() > limit {
+            return Err(Error::ManifestBodyTooLarge { limit });
+        }
 
         let mut response = self
             .put_manifest(namespace, &reference, Some(&mime_type), &request_body)

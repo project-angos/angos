@@ -22,7 +22,10 @@ use crate::{
     cache::Cache,
     http_client::HttpClientBuilder,
     oci::Digest,
-    registry::{DOCKER_CONTENT_DIGEST, Error, blob_store::BoxedReader},
+    registry::{
+        DOCKER_CONTENT_DIGEST, Error, blob_store::BoxedReader,
+        manifest::DEFAULT_MAX_MANIFEST_SIZE_BYTES,
+    },
     secret::Secret,
 };
 
@@ -63,6 +66,7 @@ pub struct RegistryClient {
     basic_auth: Option<(String, String)>,
     cache: Arc<Cache>,
     token_refresh: Mutex<()>,
+    max_manifest_size_bytes: usize,
 }
 
 impl RegistryClient {
@@ -72,6 +76,19 @@ impl RegistryClient {
     ///
     /// Returns an error when TLS files cannot be loaded or the HTTP client cannot be built.
     pub fn new(config: &RegistryClientConfig, cache: Arc<Cache>) -> Result<Self, Error> {
+        Self::new_with_manifest_size_limit(config, cache, DEFAULT_MAX_MANIFEST_SIZE_BYTES)
+    }
+
+    /// Creates a registry client with a custom manifest body size limit.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when TLS files cannot be loaded or the HTTP client cannot be built.
+    pub fn new_with_manifest_size_limit(
+        config: &RegistryClientConfig,
+        cache: Arc<Cache>,
+        max_manifest_size_bytes: usize,
+    ) -> Result<Self, Error> {
         let client = HttpClientBuilder::new()
             .rustls_tls()
             .redirect(reqwest::redirect::Policy::limited(
@@ -102,6 +119,7 @@ impl RegistryClient {
             basic_auth,
             cache,
             token_refresh: Mutex::new(()),
+            max_manifest_size_bytes,
         })
     }
 
@@ -314,9 +332,25 @@ impl RegistryClient {
         let media_type = parse_header(&response, CONTENT_TYPE).ok();
         let digest = parse_header(&response, DOCKER_CONTENT_DIGEST)?;
 
-        let mut content = Vec::new();
+        let limit = self.max_manifest_size_bytes;
+        let known_size = response.content_length();
+        if known_size.is_some_and(|size| size > limit as u64) {
+            return Err(Error::ManifestBodyTooLarge { limit });
+        }
+
+        let capacity = known_size
+            .and_then(|size| usize::try_from(size).ok())
+            .map(|size| size.min(limit))
+            .unwrap_or_default();
+
         let stream = response.bytes_stream().map_err(io::Error::other);
-        StreamReader::new(stream).read_to_end(&mut content).await?;
+        let mut content = Vec::with_capacity(capacity);
+        let mut reader = StreamReader::new(stream).take(limit as u64 + 1);
+        reader.read_to_end(&mut content).await?;
+
+        if content.len() > limit {
+            return Err(Error::ManifestBodyTooLarge { limit });
+        }
 
         Ok((media_type, digest, content))
     }

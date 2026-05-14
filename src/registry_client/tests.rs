@@ -316,6 +316,52 @@ async fn test_get_manifest_success() {
 }
 
 #[tokio::test]
+async fn test_get_manifest_rejects_oversized_body() {
+    let mock_server = MockServer::start().await;
+    let oversized_body = vec![b' '; 8];
+    let test_digest = "sha256:fedcba0987654321fedcba0987654321fedcba0987654321fedcba0987654321";
+
+    Mock::given(method("GET"))
+        .and(path("/v2/test/manifests/latest"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_bytes(oversized_body)
+                .insert_header(DOCKER_CONTENT_DIGEST, test_digest)
+                .insert_header(
+                    "Content-Type",
+                    "application/vnd.docker.distribution.manifest.v2+json",
+                ),
+        )
+        .mount(&mock_server)
+        .await;
+
+    let config = RegistryClientConfig {
+        url: mock_server.uri(),
+        max_redirect: 5,
+        server_ca_bundle: None,
+        client_certificate: None,
+        client_private_key: None,
+        username: None,
+        password: None,
+    };
+
+    let cache = cache::Config::Memory.to_backend().unwrap();
+    let client = RegistryClient::new_with_manifest_size_limit(&config, cache, 7).unwrap();
+
+    let result = client
+        .get_manifest(
+            &[],
+            &format!("{}/v2/test/manifests/latest", mock_server.uri()),
+        )
+        .await;
+
+    assert!(matches!(
+        result,
+        Err(Error::ManifestBodyTooLarge { limit: 7 })
+    ));
+}
+
+#[tokio::test]
 async fn test_bearer_authentication() {
     let mock_server = MockServer::start().await;
     let auth_server = MockServer::start().await;

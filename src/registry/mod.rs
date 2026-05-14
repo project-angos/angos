@@ -21,7 +21,7 @@ pub mod test_utils;
 pub mod upload;
 pub mod version;
 
-pub use blob::GetBlobResponse;
+pub use blob::{BlobRange, GetBlobResponse};
 pub use error::Error;
 pub use manifest::{GetManifestResponse, ParsedManifestDigests, parse_manifest_digests};
 pub use repository::Repository;
@@ -62,6 +62,7 @@ pub struct RegistryConfig {
     pub concurrent_cache_jobs: usize,
     pub global_immutable_tags: bool,
     pub global_immutable_tags_exclusions: Vec<RegexPattern>,
+    pub max_manifest_size_bytes: usize,
 }
 
 impl Default for RegistryConfig {
@@ -73,6 +74,7 @@ impl Default for RegistryConfig {
             concurrent_cache_jobs: 4,
             global_immutable_tags: false,
             global_immutable_tags_exclusions: Vec::new(),
+            max_manifest_size_bytes: manifest::DEFAULT_MAX_MANIFEST_SIZE_BYTES,
         }
     }
 }
@@ -107,6 +109,11 @@ impl RegistryConfig {
         self.global_immutable_tags_exclusions = exclusions;
         self
     }
+
+    pub fn max_manifest_size_bytes(mut self, limit: usize) -> Self {
+        self.max_manifest_size_bytes = limit;
+        self
+    }
 }
 
 #[allow(clippy::struct_excessive_bools)]
@@ -122,6 +129,7 @@ pub struct Registry {
     task_queue: TaskQueue,
     global_immutable_tags: bool,
     global_immutable_tags_exclusions: Vec<RegexPattern>,
+    max_manifest_size_bytes: usize,
 }
 
 impl Debug for Registry {
@@ -159,6 +167,7 @@ impl Registry {
             task_queue: TaskQueue::new(config.concurrent_cache_jobs)?,
             global_immutable_tags: config.global_immutable_tags,
             global_immutable_tags_exclusions: config.global_immutable_tags_exclusions,
+            max_manifest_size_bytes: config.max_manifest_size_bytes,
         };
 
         Ok(res)

@@ -19,6 +19,8 @@ pub enum Error {
     DigestInvalid,
     #[error("manifest references a blob unknown to registry")]
     ManifestBlobUnknown,
+    #[error("manifest body exceeds supported size limit of {limit} bytes")]
+    ManifestBodyTooLarge { limit: usize },
     #[error("manifest invalid: {0}")]
     ManifestInvalid(String),
     #[error("manifest unknown to registry")]

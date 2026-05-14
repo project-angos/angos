@@ -1,4 +1,4 @@
-use hyper::{Response, StatusCode, body::Incoming, header::CONTENT_TYPE, http::request::Parts};
+use hyper::{Response, StatusCode, body::Incoming, http::request::Parts};
 use tokio::io::AsyncRead;
 
 use crate::{
@@ -6,7 +6,7 @@ use crate::{
         ServerContext,
         error::Error,
         handlers::build_response,
-        request::{accepted_content_types, incoming_into_async_read, parse_header},
+        request::{RequestHeaders, incoming_into_async_read},
         response_body::ResponseBody,
     },
     event_webhook::event::{Event, EventActor},
@@ -107,7 +107,8 @@ pub async fn dispatch_get_manifest(
     namespace: &Namespace,
     reference: Reference,
 ) -> Result<Response<ResponseBody>, Error> {
-    let mime_types = accepted_content_types(&parts.headers);
+    let headers = RequestHeaders::new(&parts.headers);
+    let mime_types = headers.accepted_content_types();
     let is_immutable = context.is_reference_immutable(namespace, &reference);
 
     handle_get_manifest(context, namespace, reference, &mime_types, is_immutable).await
@@ -119,7 +120,8 @@ pub async fn dispatch_head_manifest(
     namespace: &Namespace,
     reference: Reference,
 ) -> Result<Response<ResponseBody>, Error> {
-    let mime_types = accepted_content_types(&parts.headers);
+    let headers = RequestHeaders::new(&parts.headers);
+    let mime_types = headers.accepted_content_types();
     let is_immutable = context.is_reference_immutable(namespace, &reference);
 
     handle_head_manifest(context, namespace, reference, &mime_types, is_immutable).await
@@ -133,7 +135,8 @@ pub async fn dispatch_put_manifest(
     reference: Reference,
     identity: &ClientIdentity,
 ) -> Result<Response<ResponseBody>, Error> {
-    let mime_type: String = parse_header(&parts.headers, CONTENT_TYPE).ok_or(Error::BadRequest(
+    let headers = RequestHeaders::new(&parts.headers);
+    let mime_type = headers.content_type()?.ok_or(Error::BadRequest(
         "No Content-Type header provided".to_string(),
     ))?;
 

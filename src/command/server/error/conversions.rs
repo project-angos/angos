@@ -25,6 +25,11 @@ impl From<registry::Error> for Error {
             registry::Error::ManifestBlobUnknown => {
                 oci_error(StatusCode::NOT_FOUND, "MANIFEST_BLOB_UNKNOWN", None)
             }
+            registry::Error::ManifestBodyTooLarge { .. } => oci_error(
+                StatusCode::BAD_REQUEST,
+                "MANIFEST_INVALID",
+                Some(error.to_string()),
+            ),
             registry::Error::ManifestInvalid(msg) => {
                 oci_error(StatusCode::BAD_REQUEST, "MANIFEST_INVALID", Some(msg))
             }

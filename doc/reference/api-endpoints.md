@@ -14,6 +14,8 @@ Angos implements the [OCI Distribution Specification v1.1](https://github.com/op
 
 Base path: `/v2/`
 
+Comma-separated `Accept` header values are parsed and ordered by quality (`q`) before Angos uses them for upstream pull-through requests.
+
 ### API Version Check
 
 ```
@@ -30,6 +32,19 @@ GET  /v2/{namespace}/blobs/{digest}
 ```
 
 Check existence or download a blob by digest.
+
+`GET` supports a single byte range through the `Range` header:
+
+- `Range: bytes=<start>-<end>` returns `206 Partial Content`.
+- `Range: bytes=<start>-` returns from `<start>` through the end of the blob.
+- `Range: bytes=-<suffix-length>` returns the final `<suffix-length>` bytes.
+- If `<end>` is beyond the blob length, Angos clamps it to the final byte.
+- If `<suffix-length>` is longer than the blob, Angos returns the full blob as `206 Partial Content`.
+- Multiple ranges are not supported; Angos ignores them and returns the normal full `200 OK` response.
+- A range whose start is at or beyond the blob length, or a zero-length suffix range, returns `416 Range Not Satisfiable`.
+- For an empty blob, Angos ignores a syntactically valid range and returns the normal `200 OK` empty body.
+
+Range requests for pull-through repositories are supported only after the blob is available locally. A range request for an uncached pull-through blob returns `416`; request the full blob first to populate the cache.
 
 ```
 DELETE /v2/{namespace}/blobs/{digest}
@@ -59,13 +74,13 @@ Get upload status.
 PATCH /v2/{namespace}/blobs/uploads/{uuid}
 ```
 
-Upload a chunk. Use `Content-Range` header for chunked uploads.
+Upload a chunk. Use `Content-Range` for the chunk range and `Content-Length` for the exact chunk size. Missing or invalid `Content-Length` returns `400 Bad Request`.
 
 ```
 PUT /v2/{namespace}/blobs/uploads/{uuid}?digest={digest}
 ```
 
-Complete the upload with final digest.
+Complete the upload with final digest. If a final chunk is included, `Content-Length` must contain that chunk size. Without a final chunk, missing `Content-Length` is treated as zero.
 
 ```
 DELETE /v2/{namespace}/blobs/uploads/{uuid}
@@ -86,7 +101,7 @@ Check existence or download a manifest. `{reference}` can be a tag or digest.
 PUT /v2/{namespace}/manifests/{reference}
 ```
 
-Push a manifest.
+Push a manifest. Manifest bodies larger than `global.max_manifest_size` are rejected with `MANIFEST_INVALID`.
 
 ```
 DELETE /v2/{namespace}/manifests/{reference}
@@ -316,6 +331,8 @@ Authorization: Bearer <jwt-token>
 ```
 Authorization: Basic base64(provider-name:jwt-token)
 ```
+
+Authentication schemes are parsed case-insensitively, so `basic` and `bearer` are accepted the same as `Basic` and `Bearer`.
 
 When the username matches an OIDC provider name, the password is validated as a JWT token. This enables Docker clients to authenticate with OIDC tokens:
 

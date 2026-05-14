@@ -17,6 +17,12 @@ use crate::{
     },
 };
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BlobRange {
+    FromTo { start: u64, end: Option<u64> },
+    Suffix(u64),
+}
+
 pub enum GetBlobResponse {
     Redirect {
         headers: HashMap<&'static str, String>,
@@ -35,6 +41,54 @@ pub struct HeadBlobResponse {
     pub headers: HashMap<&'static str, String>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ResolvedRange {
+    start: u64,
+    end: u64,
+    length: u64,
+    total_length: u64,
+}
+
+fn resolve_blob_range(
+    requested: BlobRange,
+    total_length: u64,
+) -> Result<Option<ResolvedRange>, Error> {
+    if total_length == 0 {
+        return Ok(None);
+    }
+
+    let last_byte = total_length - 1;
+    let (start, end) = match requested {
+        BlobRange::FromTo { start, end } => {
+            if start >= total_length {
+                return Err(Error::RangeNotSatisfiable);
+            }
+
+            let end = end.unwrap_or(last_byte).min(last_byte);
+            if end < start {
+                return Err(Error::RangeNotSatisfiable);
+            }
+
+            (start, end)
+        }
+        BlobRange::Suffix(suffix_length) => {
+            if suffix_length == 0 {
+                return Err(Error::RangeNotSatisfiable);
+            }
+
+            let length = suffix_length.min(total_length);
+            (total_length - length, last_byte)
+        }
+    };
+
+    Ok(Some(ResolvedRange {
+        start,
+        end,
+        length: end - start + 1,
+        total_length,
+    }))
+}
+
 fn head_blob_headers(digest: &Digest, size: u64) -> HashMap<&'static str, String> {
     HashMap::from([
         (DOCKER_CONTENT_DIGEST, digest.to_string()),
@@ -50,20 +104,14 @@ fn get_blob_headers(digest: &Digest, total_length: u64) -> HashMap<&'static str,
     ])
 }
 
-fn get_blob_range_headers(
-    digest: &Digest,
-    start: u64,
-    end: u64,
-    total_length: u64,
-) -> HashMap<&'static str, String> {
-    let length = end - start + 1;
+fn get_blob_range_headers(digest: &Digest, range: ResolvedRange) -> HashMap<&'static str, String> {
     HashMap::from([
         (DOCKER_CONTENT_DIGEST, digest.to_string()),
         (ACCEPT_RANGES.as_str(), "bytes".to_string()),
-        (CONTENT_LENGTH.as_str(), length.to_string()),
+        (CONTENT_LENGTH.as_str(), range.length.to_string()),
         (
             CONTENT_RANGE.as_str(),
-            format!("bytes {start}-{end}/{total_length}"),
+            format!("bytes {}-{}/{}", range.start, range.end, range.total_length),
         ),
     ])
 }
@@ -186,7 +234,7 @@ impl Registry {
         accepted_types: &[String],
         namespace: &Namespace,
         digest: &Digest,
-        range: Option<(u64, Option<u64>)>,
+        range: Option<BlobRange>,
     ) -> Result<GetBlobResponse, Error> {
         if !repository.is_pull_through() {
             self.check_blob_namespace_access(namespace, digest).await?;
@@ -237,34 +285,31 @@ impl Registry {
     async fn get_local_blob(
         &self,
         digest: &Digest,
-        range: Option<(u64, Option<u64>)>,
+        range: Option<BlobRange>,
     ) -> Result<GetBlobResponse, Error> {
-        let start = range.map(|(start, _)| start);
-
-        let (reader, total_length) = self.blob_store.reader(digest, start).await?;
-
-        if let Some((start, _)) = range
-            && start > total_length
-        {
-            warn!("Range start does not match content length");
-            return Err(Error::RangeNotSatisfiable);
-        }
-
-        match range {
-            Some((0, None)) | None => Ok(GetBlobResponse::Reader {
+        let Some(requested_range) = range else {
+            let (reader, total_length) = self.blob_store.reader(digest, None).await?;
+            return Ok(GetBlobResponse::Reader {
                 headers: get_blob_headers(digest, total_length),
                 body: reader,
-            }),
-            Some((start, end)) => {
-                let end = end.unwrap_or(total_length - 1);
-                let reader = Box::new(reader.take(end - start + 1));
+            });
+        };
 
-                Ok(GetBlobResponse::RangedReader {
-                    headers: get_blob_range_headers(digest, start, end, total_length),
-                    body: reader,
-                })
-            }
-        }
+        let total_length = self.blob_store.size(digest).await?;
+        let Some(range) = resolve_blob_range(requested_range, total_length)? else {
+            let (reader, _) = self.blob_store.reader(digest, None).await?;
+            return Ok(GetBlobResponse::Reader {
+                headers: get_blob_headers(digest, total_length),
+                body: reader,
+            });
+        };
+        let (reader, _) = self.blob_store.reader(digest, Some(range.start)).await?;
+        let reader = Box::new(reader.take(range.length));
+
+        Ok(GetBlobResponse::RangedReader {
+            headers: get_blob_range_headers(digest, range),
+            body: reader,
+        })
     }
 
     #[instrument]
@@ -317,7 +362,7 @@ impl Registry {
         namespace: &Namespace,
         digest: &Digest,
         mime_types: &[String],
-        range: Option<(u64, Option<u64>)>,
+        range: Option<BlobRange>,
     ) -> Result<GetBlobResponse, Error> {
         let repository = self.get_repository_for_namespace(namespace)?;
 
@@ -417,7 +462,10 @@ mod tests {
             let content = b"test blob content";
 
             let (digest, repository) = create_test_blob(registry, namespace, content).await;
-            let range = Some((5, Some(10)));
+            let range = Some(BlobRange::FromTo {
+                start: 5,
+                end: Some(10),
+            });
             let response = registry
                 .get_blob(&repository, &[], namespace, &digest, range)
                 .await
@@ -598,7 +646,10 @@ mod tests {
                 }
             }
 
-            let range = Some((5, Some(15)));
+            let range = Some(BlobRange::FromTo {
+                start: 5,
+                end: Some(15),
+            });
             let response = registry.get_local_blob(&digest, range).await.unwrap();
             match response {
                 GetBlobResponse::RangedReader { headers, mut body } => {
@@ -613,6 +664,226 @@ mod tests {
                 }
                 GetBlobResponse::Reader { .. } => {
                     panic!("Expected RangedReader response for ranged read")
+                }
+                GetBlobResponse::Redirect { .. } => {
+                    panic!("unexpected redirect from get_local_blob")
+                }
+            }
+            test_case.cleanup().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn get_local_blob_open_ended_range_returns_partial_content() {
+        for test_case in backends() {
+            let registry = test_case.registry();
+            let namespace = &Namespace::new("test-repo").unwrap();
+            let content = b"open ended range content";
+
+            let (digest, _) = create_test_blob(registry, namespace, content).await;
+            let response = registry
+                .get_local_blob(
+                    &digest,
+                    Some(BlobRange::FromTo {
+                        start: 0,
+                        end: None,
+                    }),
+                )
+                .await
+                .unwrap();
+
+            match response {
+                GetBlobResponse::RangedReader { headers, mut body } => {
+                    assert_eq!(
+                        headers[CONTENT_RANGE.as_str()],
+                        format!("bytes 0-{}/{}", content.len() - 1, content.len())
+                    );
+                    assert_eq!(headers[CONTENT_LENGTH.as_str()], content.len().to_string());
+
+                    let mut buf = Vec::new();
+                    body.read_to_end(&mut buf).await.unwrap();
+                    assert_eq!(buf, content);
+                }
+                GetBlobResponse::Reader { .. } => {
+                    panic!("Expected RangedReader response for explicit range")
+                }
+                GetBlobResponse::Redirect { .. } => {
+                    panic!("unexpected redirect from get_local_blob")
+                }
+            }
+            test_case.cleanup().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn get_local_blob_suffix_range_returns_tail() {
+        for test_case in backends() {
+            let registry = test_case.registry();
+            let namespace = &Namespace::new("test-repo").unwrap();
+            let content = b"suffix range content";
+            let suffix_length = 7;
+            let start = content.len() - suffix_length;
+
+            let (digest, _) = create_test_blob(registry, namespace, content).await;
+            let response = registry
+                .get_local_blob(&digest, Some(BlobRange::Suffix(suffix_length as u64)))
+                .await
+                .unwrap();
+
+            match response {
+                GetBlobResponse::RangedReader { headers, mut body } => {
+                    assert_eq!(
+                        headers[CONTENT_RANGE.as_str()],
+                        format!("bytes {}-{}/{}", start, content.len() - 1, content.len())
+                    );
+                    assert_eq!(headers[CONTENT_LENGTH.as_str()], suffix_length.to_string());
+
+                    let mut buf = Vec::new();
+                    body.read_to_end(&mut buf).await.unwrap();
+                    assert_eq!(buf, &content[start..]);
+                }
+                GetBlobResponse::Reader { .. } => {
+                    panic!("Expected RangedReader response for suffix range")
+                }
+                GetBlobResponse::Redirect { .. } => {
+                    panic!("unexpected redirect from get_local_blob")
+                }
+            }
+            test_case.cleanup().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn get_local_blob_suffix_range_longer_than_blob_returns_full_blob() {
+        for test_case in backends() {
+            let registry = test_case.registry();
+            let namespace = &Namespace::new("test-repo").unwrap();
+            let content = b"short suffix";
+
+            let (digest, _) = create_test_blob(registry, namespace, content).await;
+            let response = registry
+                .get_local_blob(&digest, Some(BlobRange::Suffix(10_000)))
+                .await
+                .unwrap();
+
+            match response {
+                GetBlobResponse::RangedReader { headers, mut body } => {
+                    assert_eq!(
+                        headers[CONTENT_RANGE.as_str()],
+                        format!("bytes 0-{}/{}", content.len() - 1, content.len())
+                    );
+                    assert_eq!(headers[CONTENT_LENGTH.as_str()], content.len().to_string());
+
+                    let mut buf = Vec::new();
+                    body.read_to_end(&mut buf).await.unwrap();
+                    assert_eq!(buf, content);
+                }
+                GetBlobResponse::Reader { .. } => {
+                    panic!("Expected RangedReader response for suffix range")
+                }
+                GetBlobResponse::Redirect { .. } => {
+                    panic!("unexpected redirect from get_local_blob")
+                }
+            }
+            test_case.cleanup().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn get_local_blob_clamps_range_end_to_blob_length() {
+        for test_case in backends() {
+            let registry = test_case.registry();
+            let namespace = &Namespace::new("test-repo").unwrap();
+            let content = b"clamped range content";
+
+            let (digest, _) = create_test_blob(registry, namespace, content).await;
+            let response = registry
+                .get_local_blob(
+                    &digest,
+                    Some(BlobRange::FromTo {
+                        start: 8,
+                        end: Some(10_000),
+                    }),
+                )
+                .await
+                .unwrap();
+
+            match response {
+                GetBlobResponse::RangedReader { headers, mut body } => {
+                    assert_eq!(
+                        headers[CONTENT_RANGE.as_str()],
+                        format!("bytes 8-{}/{}", content.len() - 1, content.len())
+                    );
+                    assert_eq!(
+                        headers[CONTENT_LENGTH.as_str()],
+                        (content.len() - 8).to_string()
+                    );
+
+                    let mut buf = Vec::new();
+                    body.read_to_end(&mut buf).await.unwrap();
+                    assert_eq!(buf, &content[8..]);
+                }
+                GetBlobResponse::Reader { .. } => {
+                    panic!("Expected RangedReader response for explicit range")
+                }
+                GetBlobResponse::Redirect { .. } => {
+                    panic!("unexpected redirect from get_local_blob")
+                }
+            }
+            test_case.cleanup().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn get_local_blob_rejects_range_start_at_blob_length() {
+        for test_case in backends() {
+            let registry = test_case.registry();
+            let namespace = &Namespace::new("test-repo").unwrap();
+            let content = b"range boundary";
+
+            let (digest, _) = create_test_blob(registry, namespace, content).await;
+            let result = registry
+                .get_local_blob(
+                    &digest,
+                    Some(BlobRange::FromTo {
+                        start: content.len() as u64,
+                        end: None,
+                    }),
+                )
+                .await;
+
+            assert!(matches!(result, Err(Error::RangeNotSatisfiable)));
+            test_case.cleanup().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn get_local_blob_ignores_ranges_for_empty_blobs() {
+        for test_case in backends() {
+            let registry = test_case.registry();
+            let namespace = &Namespace::new("test-repo").unwrap();
+
+            let (digest, _) = create_test_blob(registry, namespace, b"").await;
+            let response = registry
+                .get_local_blob(
+                    &digest,
+                    Some(BlobRange::FromTo {
+                        start: 0,
+                        end: None,
+                    }),
+                )
+                .await
+                .unwrap();
+
+            match response {
+                GetBlobResponse::Reader { headers, mut body } => {
+                    assert_eq!(headers[CONTENT_LENGTH.as_str()], "0");
+                    let mut buf = Vec::new();
+                    body.read_to_end(&mut buf).await.unwrap();
+                    assert!(buf.is_empty());
+                }
+                GetBlobResponse::RangedReader { .. } => {
+                    panic!("Expected Reader response for empty blob range")
                 }
                 GetBlobResponse::Redirect { .. } => {
                     panic!("unexpected redirect from get_local_blob")
@@ -691,9 +962,159 @@ mod tests {
             "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
                 .parse()
                 .unwrap();
-        let headers = get_blob_range_headers(&digest, 5, 10, 100);
+        let range = ResolvedRange {
+            start: 5,
+            end: 10,
+            length: 6,
+            total_length: 100,
+        };
+        let headers = get_blob_range_headers(&digest, range);
         assert_eq!(headers[CONTENT_LENGTH.as_str()], "6");
         assert_eq!(headers[CONTENT_RANGE.as_str()], "bytes 5-10/100");
+    }
+
+    #[test]
+    fn resolve_blob_range_ignores_ranges_for_empty_blob() {
+        assert!(matches!(
+            resolve_blob_range(
+                BlobRange::FromTo {
+                    start: 0,
+                    end: None,
+                },
+                0
+            ),
+            Ok(None)
+        ));
+        assert!(matches!(
+            resolve_blob_range(BlobRange::Suffix(1), 0),
+            Ok(None)
+        ));
+    }
+
+    #[test]
+    fn resolve_blob_range_rejects_start_at_or_after_length() {
+        assert!(matches!(
+            resolve_blob_range(
+                BlobRange::FromTo {
+                    start: 10,
+                    end: None,
+                },
+                10
+            ),
+            Err(Error::RangeNotSatisfiable)
+        ));
+        assert!(matches!(
+            resolve_blob_range(
+                BlobRange::FromTo {
+                    start: 11,
+                    end: None,
+                },
+                10
+            ),
+            Err(Error::RangeNotSatisfiable)
+        ));
+    }
+
+    #[test]
+    fn resolve_blob_range_clamps_end_to_last_byte() {
+        let range = resolve_blob_range(
+            BlobRange::FromTo {
+                start: 4,
+                end: Some(99),
+            },
+            10,
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(
+            range,
+            ResolvedRange {
+                start: 4,
+                end: 9,
+                length: 6,
+                total_length: 10,
+            }
+        );
+    }
+
+    #[test]
+    fn resolve_blob_range_expands_open_ended_range() {
+        let range = resolve_blob_range(
+            BlobRange::FromTo {
+                start: 4,
+                end: None,
+            },
+            10,
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(
+            range,
+            ResolvedRange {
+                start: 4,
+                end: 9,
+                length: 6,
+                total_length: 10,
+            }
+        );
+    }
+
+    #[test]
+    fn resolve_blob_range_resolves_suffix_range() {
+        let range = resolve_blob_range(BlobRange::Suffix(4), 10)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(
+            range,
+            ResolvedRange {
+                start: 6,
+                end: 9,
+                length: 4,
+                total_length: 10,
+            }
+        );
+    }
+
+    #[test]
+    fn resolve_blob_range_clamps_suffix_range_to_blob_length() {
+        let range = resolve_blob_range(BlobRange::Suffix(99), 10)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(
+            range,
+            ResolvedRange {
+                start: 0,
+                end: 9,
+                length: 10,
+                total_length: 10,
+            }
+        );
+    }
+
+    #[test]
+    fn resolve_blob_range_rejects_zero_suffix_range() {
+        assert!(matches!(
+            resolve_blob_range(BlobRange::Suffix(0), 10),
+            Err(Error::RangeNotSatisfiable)
+        ));
+    }
+
+    #[test]
+    fn resolve_blob_range_rejects_end_before_start() {
+        assert!(matches!(
+            resolve_blob_range(
+                BlobRange::FromTo {
+                    start: 5,
+                    end: Some(4),
+                },
+                10
+            ),
+            Err(Error::RangeNotSatisfiable)
+        ));
     }
 
     #[test]

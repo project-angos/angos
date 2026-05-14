@@ -52,6 +52,7 @@ When omitted, the server runs without TLS (insecure).
 |-----------------------------|----------|----------|---------------------------------------------|
 | `max_concurrent_requests`   | usize    | `64`     | Tokio worker threads (see Performance Tuning) |
 | `max_concurrent_cache_jobs` | usize    | `4`      | Maximum concurrent cache jobs (minimum `1`) |
+| `max_manifest_size`         | string   | `"5MiB"` | Maximum manifest body size accepted from clients or upstream registries |
 | `update_pull_time`          | bool     | `false`  | Track pull times for retention policies     |
 | `enable_redirect`           | bool     | —        | **Deprecated.** Fallback for both fields below when unset. |
 | `enable_blob_redirect`      | bool     | `true`   | Allow HTTP 307 redirects for blob downloads. |
@@ -60,6 +61,8 @@ When omitted, the server runs without TLS (insecure).
 | `immutable_tags_exclusions` | [string] | `[]`     | Regex patterns for mutable tags             |
 | `authorization_webhook`     | string   | -        | Name of webhook for authorization           |
 | `event_webhooks`            | [string] | `[]`     | Event webhook names for all repositories    |
+
+`max_manifest_size` must be greater than zero.
 
 ### Global Access Policy (`global.access_policy`)
 

@@ -104,6 +104,8 @@ issuer = "https://auth.example.com"
 - `Authorization: Bearer <token>` (standard OAuth2)
 - Basic Auth with username = provider name, password = token (Docker compatibility)
 
+Authorization schemes are case-insensitive; for example, `bearer` and `Bearer` are equivalent.
+
 **Identity fields:**
 - `identity.oidc.provider_name`
 - `identity.oidc.provider_type`

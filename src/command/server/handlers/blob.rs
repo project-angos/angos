@@ -1,15 +1,12 @@
-use hyper::{Response, StatusCode, header::RANGE, http::request::Parts};
+use hyper::{Response, StatusCode, http::request::Parts};
 
 use crate::{
     command::server::{
-        ServerContext,
-        error::Error,
-        handlers::build_response,
-        request::{accepted_content_types, range},
+        ServerContext, error::Error, handlers::build_response, request::RequestHeaders,
         response_body::ResponseBody,
     },
     oci::{Digest, Namespace},
-    registry::GetBlobResponse,
+    registry::{BlobRange, GetBlobResponse},
 };
 
 pub async fn handle_head_blob(
@@ -44,7 +41,7 @@ pub async fn handle_get_blob(
     namespace: &Namespace,
     digest: &Digest,
     mime_types: &[String],
-    range: Option<(u64, Option<u64>)>,
+    range: Option<BlobRange>,
 ) -> Result<Response<ResponseBody>, Error> {
     let response = context
         .registry
@@ -74,8 +71,9 @@ pub async fn dispatch_get_blob(
     namespace: &Namespace,
     digest: Digest,
 ) -> Result<Response<ResponseBody>, Error> {
-    let mime_types = accepted_content_types(&parts.headers);
-    let range = range(&parts.headers, RANGE)?;
+    let headers = RequestHeaders::new(&parts.headers);
+    let mime_types = headers.accepted_content_types();
+    let range = headers.blob_range()?;
 
     handle_get_blob(context, namespace, &digest, &mime_types, range).await
 }
@@ -86,7 +84,8 @@ pub async fn dispatch_head_blob(
     namespace: &Namespace,
     digest: Digest,
 ) -> Result<Response<ResponseBody>, Error> {
-    let mime_types = accepted_content_types(&parts.headers);
+    let headers = RequestHeaders::new(&parts.headers);
+    let mime_types = headers.accepted_content_types();
 
     handle_head_blob(context, namespace, &digest, &mime_types).await
 }
