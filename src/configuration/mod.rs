@@ -178,6 +178,12 @@ fn validate_global(
     auth_webhooks: &HashMap<String, webhook::Config>,
     event_webhooks: &HashMap<String, EventWebhookConfig>,
 ) -> Result<(), Error> {
+    if global.max_manifest_size.as_u64() == 0 {
+        return Err(Error::InvalidFormat(
+            "global.max_manifest_size must be greater than zero".to_string(),
+        ));
+    }
+
     global
         .authorization_webhook
         .as_ref()

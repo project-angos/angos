@@ -18,7 +18,10 @@ use crate::{
     },
     configuration::{self, Configuration, ServerConfig},
     policy::{AccessMode, AccessPolicyConfig, CelRule},
-    registry::{Registry, RegistryConfig, metadata_store::ConditionalCapabilities, repository},
+    registry::{
+        Registry, RegistryConfig, manifest::DEFAULT_MAX_MANIFEST_SIZE_BYTES,
+        metadata_store::ConditionalCapabilities, repository,
+    },
     secret::Secret,
 };
 
@@ -165,7 +168,13 @@ async fn test_build_repository_success() {
     let cache_config = cache::Config::Memory;
     let cache = bootstrap::auth_cache(&cache_config).unwrap();
 
-    let result = bootstrap::repository("test-repo", &repo_config, &cache).await;
+    let result = bootstrap::repository(
+        "test-repo",
+        &repo_config,
+        &cache,
+        DEFAULT_MAX_MANIFEST_SIZE_BYTES,
+    )
+    .await;
 
     assert!(result.is_ok());
     let repo = result.unwrap();
@@ -193,7 +202,13 @@ async fn test_build_repository_with_upstream() {
     let cache_config = cache::Config::Memory;
     let cache = bootstrap::auth_cache(&cache_config).unwrap();
 
-    let result = bootstrap::repository("cached-repo", &repo_config, &cache).await;
+    let result = bootstrap::repository(
+        "cached-repo",
+        &repo_config,
+        &cache,
+        DEFAULT_MAX_MANIFEST_SIZE_BYTES,
+    )
+    .await;
 
     assert!(result.is_ok());
 }
@@ -215,7 +230,13 @@ async fn test_build_repository_with_immutable_tags() {
     let cache_config = cache::Config::Memory;
     let cache = bootstrap::auth_cache(&cache_config).unwrap();
 
-    let result = bootstrap::repository("immutable-repo", &repo_config, &cache).await;
+    let result = bootstrap::repository(
+        "immutable-repo",
+        &repo_config,
+        &cache,
+        DEFAULT_MAX_MANIFEST_SIZE_BYTES,
+    )
+    .await;
 
     assert!(result.is_ok());
 }
@@ -226,7 +247,7 @@ async fn test_build_repositories_empty() {
     let cache_config = cache::Config::Memory;
     let cache = bootstrap::auth_cache(&cache_config).unwrap();
 
-    let result = bootstrap::repositories(&configs, &cache).await;
+    let result = bootstrap::repositories(&configs, &cache, DEFAULT_MAX_MANIFEST_SIZE_BYTES).await;
 
     assert!(result.is_ok());
     let repos = result.unwrap();
@@ -248,7 +269,7 @@ async fn test_build_repositories_single() {
     let cache_config = cache::Config::Memory;
     let cache = bootstrap::auth_cache(&cache_config).unwrap();
 
-    let result = bootstrap::repositories(&configs, &cache).await;
+    let result = bootstrap::repositories(&configs, &cache, DEFAULT_MAX_MANIFEST_SIZE_BYTES).await;
 
     assert!(result.is_ok());
     let repos = result.unwrap();
@@ -273,7 +294,7 @@ async fn test_build_repositories_multiple() {
     let cache_config = cache::Config::Memory;
     let cache = bootstrap::auth_cache(&cache_config).unwrap();
 
-    let result = bootstrap::repositories(&configs, &cache).await;
+    let result = bootstrap::repositories(&configs, &cache, DEFAULT_MAX_MANIFEST_SIZE_BYTES).await;
 
     assert!(result.is_ok());
     let repos = result.unwrap();
@@ -445,7 +466,9 @@ async fn test_build_repositories_preserves_names() {
 
     let cache_config = cache::Config::Memory;
     let cache = bootstrap::auth_cache(&cache_config).unwrap();
-    let repos = bootstrap::repositories(&configs, &cache).await.unwrap();
+    let repos = bootstrap::repositories(&configs, &cache, DEFAULT_MAX_MANIFEST_SIZE_BYTES)
+        .await
+        .unwrap();
 
     assert!(repos.get("alpha").is_some());
     assert!(repos.get("beta").is_some());
@@ -463,9 +486,13 @@ async fn test_build_registry_components_integration() {
         setup::build_metadata_store(&config, &auth_cache, &Arc::new(Mutex::new(None)))
             .await
             .unwrap();
-    let repositories = bootstrap::repositories(&config.repository, &auth_cache)
-        .await
-        .unwrap();
+    let repositories = bootstrap::repositories(
+        &config.repository,
+        &auth_cache,
+        DEFAULT_MAX_MANIFEST_SIZE_BYTES,
+    )
+    .await
+    .unwrap();
 
     let registry_config = RegistryConfig::default()
         .update_pull_time(config.global.update_pull_time)
@@ -518,7 +545,7 @@ async fn test_build_repositories_with_different_configs() {
 
     let cache_config = cache::Config::Memory;
     let cache = bootstrap::auth_cache(&cache_config).unwrap();
-    let result = bootstrap::repositories(&configs, &cache).await;
+    let result = bootstrap::repositories(&configs, &cache, DEFAULT_MAX_MANIFEST_SIZE_BYTES).await;
 
     assert!(result.is_ok());
     let repos = result.unwrap();

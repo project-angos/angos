@@ -775,9 +775,14 @@ mod tests {
 
         let mut repositories_map = HashMap::new();
         for (name, repo_config) in &config.repository {
-            let repo = Repository::new(name, repo_config, &auth_cache)
-                .await
-                .unwrap();
+            let repo = Repository::new(
+                name,
+                repo_config,
+                &auth_cache,
+                config.global.max_manifest_size_bytes(),
+            )
+            .await
+            .unwrap();
             repositories_map.insert(name.clone(), repo);
         }
         let repositories = Arc::new(repositories_map);
@@ -786,6 +791,7 @@ mod tests {
             .update_pull_time(config.global.update_pull_time)
             .enable_blob_redirect(config.global.resolved_enable_blob_redirect())
             .enable_manifest_redirect(config.global.resolved_enable_manifest_redirect())
+            .max_manifest_size_bytes(config.global.max_manifest_size_bytes())
             .concurrent_cache_jobs(config.global.max_concurrent_cache_jobs)
             .global_immutable_tags(config.global.immutable_tags)
             .global_immutable_tags_exclusions(config.global.immutable_tags_exclusions.clone());

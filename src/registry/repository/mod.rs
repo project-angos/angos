@@ -67,7 +67,12 @@ impl Repository {
         Err(fallback)
     }
 
-    pub async fn new(name: &str, config: &Config, cache: &Arc<Cache>) -> Result<Self, Error> {
+    pub async fn new(
+        name: &str,
+        config: &Config,
+        cache: &Arc<Cache>,
+        max_manifest_size_bytes: usize,
+    ) -> Result<Self, Error> {
         let upstreams = if config.upstream.is_empty() {
             Vec::new()
         } else {
@@ -76,7 +81,11 @@ impl Repository {
             task::spawn_blocking(move || {
                 let mut upstreams = Vec::new();
                 for config in &upstream_configs {
-                    upstreams.push(RegistryClient::new(config, Arc::clone(&cache))?);
+                    upstreams.push(RegistryClient::new_with_manifest_size_limit(
+                        config,
+                        Arc::clone(&cache),
+                        max_manifest_size_bytes,
+                    )?);
                 }
                 Ok::<_, Error>(upstreams)
             })
@@ -186,6 +195,7 @@ mod tests {
         oci::{Digest, Reference},
         registry::{
             Error,
+            manifest::DEFAULT_MAX_MANIFEST_SIZE_BYTES,
             repository::{Config, RegistryClientConfig, Repository},
         },
         test_fixtures::webhook::ca_bundle_pem,
@@ -221,7 +231,9 @@ mod tests {
             ..Default::default()
         };
 
-        Repository::new("local", &config, &cache).await.unwrap()
+        Repository::new("local", &config, &cache, DEFAULT_MAX_MANIFEST_SIZE_BYTES)
+            .await
+            .unwrap()
     }
 
     async fn mount_response(
@@ -262,7 +274,9 @@ mod tests {
     async fn test_is_pull_through_empty() {
         let cache = cache::Config::Memory.to_backend().unwrap();
         let config = Config::default();
-        let repo = Repository::new("test", &config, &cache).await.unwrap();
+        let repo = Repository::new("test", &config, &cache, DEFAULT_MAX_MANIFEST_SIZE_BYTES)
+            .await
+            .unwrap();
 
         assert!(!repo.is_pull_through());
     }
@@ -285,7 +299,9 @@ mod tests {
             ..Default::default()
         };
 
-        let repo = Repository::new("test", &config, &cache).await.unwrap();
+        let repo = Repository::new("test", &config, &cache, DEFAULT_MAX_MANIFEST_SIZE_BYTES)
+            .await
+            .unwrap();
         assert!(repo.is_pull_through());
     }
 
@@ -311,7 +327,7 @@ mod tests {
 
         let repository = timeout(
             Duration::from_secs(2),
-            Repository::new("test", &config, &cache),
+            Repository::new("test", &config, &cache, DEFAULT_MAX_MANIFEST_SIZE_BYTES),
         )
         .await
         .unwrap()
@@ -350,7 +366,9 @@ mod tests {
             ..Default::default()
         };
 
-        let repo = Repository::new("local", &config, &cache).await.unwrap();
+        let repo = Repository::new("local", &config, &cache, DEFAULT_MAX_MANIFEST_SIZE_BYTES)
+            .await
+            .unwrap();
         let reference = Reference::Tag("latest".to_string());
 
         let result = repo.head_manifest(&[], "local/repo", &reference).await;
@@ -461,7 +479,9 @@ mod tests {
             ..Default::default()
         };
 
-        let repo = Repository::new("local", &config, &cache).await.unwrap();
+        let repo = Repository::new("local", &config, &cache, DEFAULT_MAX_MANIFEST_SIZE_BYTES)
+            .await
+            .unwrap();
         let reference = Reference::Tag("latest".to_string());
 
         let result = repo.head_manifest(&[], "local/repo", &reference).await;
@@ -501,7 +521,9 @@ mod tests {
             ..Default::default()
         };
 
-        let repo = Repository::new("local", &config, &cache).await.unwrap();
+        let repo = Repository::new("local", &config, &cache, DEFAULT_MAX_MANIFEST_SIZE_BYTES)
+            .await
+            .unwrap();
         let reference = Reference::Tag("latest".to_string());
 
         let result = repo.get_manifest(&[], "local/repo", &reference).await;
@@ -535,7 +557,9 @@ mod tests {
             ..Default::default()
         };
 
-        let repo = Repository::new("local", &config, &cache).await.unwrap();
+        let repo = Repository::new("local", &config, &cache, DEFAULT_MAX_MANIFEST_SIZE_BYTES)
+            .await
+            .unwrap();
         let reference = Reference::Tag("latest".to_string());
 
         let result = repo.get_manifest(&[], "local/repo", &reference).await;
@@ -574,7 +598,9 @@ mod tests {
             ..Default::default()
         };
 
-        let repo = Repository::new("local", &config, &cache).await.unwrap();
+        let repo = Repository::new("local", &config, &cache, DEFAULT_MAX_MANIFEST_SIZE_BYTES)
+            .await
+            .unwrap();
         let digest = Digest::try_from(
             "sha256:1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
         )
@@ -612,7 +638,9 @@ mod tests {
             ..Default::default()
         };
 
-        let repo = Repository::new("local", &config, &cache).await.unwrap();
+        let repo = Repository::new("local", &config, &cache, DEFAULT_MAX_MANIFEST_SIZE_BYTES)
+            .await
+            .unwrap();
         let digest = Digest::try_from(
             "sha256:1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
         )
@@ -648,7 +676,9 @@ mod tests {
             ..Default::default()
         };
 
-        let repo = Repository::new("local", &config, &cache).await.unwrap();
+        let repo = Repository::new("local", &config, &cache, DEFAULT_MAX_MANIFEST_SIZE_BYTES)
+            .await
+            .unwrap();
         let digest = Digest::try_from(
             "sha256:1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
         )
@@ -691,7 +721,9 @@ mod tests {
             ..Default::default()
         };
 
-        let repo = Repository::new("local", &config, &cache).await.unwrap();
+        let repo = Repository::new("local", &config, &cache, DEFAULT_MAX_MANIFEST_SIZE_BYTES)
+            .await
+            .unwrap();
         let digest = Digest::try_from(
             "sha256:1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
         )

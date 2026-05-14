@@ -47,12 +47,15 @@ pub async fn build_registry(
     let auth_cache = bootstrap::auth_cache(&config.cache)?;
     let blob_handles = bootstrap::blob_stores(&config.blob_store, &auth_cache)?;
     let metadata_store = build_metadata_store(config, &auth_cache, cached_capabilities).await?;
-    let repositories = bootstrap::repositories(&config.repository, &auth_cache).await?;
+    let max_manifest_size_bytes = config.global.max_manifest_size_bytes();
+    let repositories =
+        bootstrap::repositories(&config.repository, &auth_cache, max_manifest_size_bytes).await?;
 
     let registry_config = RegistryConfig::default()
         .update_pull_time(config.global.update_pull_time)
         .enable_blob_redirect(config.global.resolved_enable_blob_redirect())
         .enable_manifest_redirect(config.global.resolved_enable_manifest_redirect())
+        .max_manifest_size_bytes(max_manifest_size_bytes)
         .concurrent_cache_jobs(config.global.max_concurrent_cache_jobs)
         .global_immutable_tags(config.global.immutable_tags)
         .global_immutable_tags_exclusions(config.global.immutable_tags_exclusions.clone());

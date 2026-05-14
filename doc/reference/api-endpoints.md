@@ -101,7 +101,7 @@ Check existence or download a manifest. `{reference}` can be a tag or digest.
 PUT /v2/{namespace}/manifests/{reference}
 ```
 
-Push a manifest.
+Push a manifest. Manifest bodies larger than `global.max_manifest_size` are rejected with `MANIFEST_INVALID`.
 
 ```
 DELETE /v2/{namespace}/manifests/{reference}
