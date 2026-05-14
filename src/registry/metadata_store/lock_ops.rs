@@ -195,8 +195,8 @@ pub trait LockOps: Send + Sync {
     /// Apply the accumulated blob-index operations after `apply_link_operations`
     /// completes and before the distributed lock is released.
     ///
-    /// FS performs per-operation sequential writes; S3 (lock coordinator)
-    /// performs per-digest concurrent updates via `update_blob_index_shard`.
+    /// FS applies one write per digest; S3 (lock coordinator) performs
+    /// per-digest concurrent updates via `update_blob_index_shard`.
     async fn apply_pending_blob_index_ops(
         &self,
         namespace: &str,

@@ -51,7 +51,10 @@ Range requests for pull-through repositories are supported only after the blob i
 DELETE /v2/{namespace}/blobs/{digest}
 ```
 
-Delete a blob owned by the namespace. Blob data is removed only after no namespace owns the digest.
+Delete a blob owned by the namespace. If the digest is still referenced by manifest metadata in
+that namespace, Angos returns `DENIED` and leaves the blob unchanged. After those references are
+removed, deleting the blob removes that namespace's ownership; the underlying blob data is removed
+only when no namespace references the digest.
 
 ### Blob Upload
 
@@ -109,8 +112,10 @@ Push a manifest. Manifest bodies larger than `global.max_manifest_size` are reje
 DELETE /v2/{namespace}/manifests/{reference}
 ```
 
-Delete a manifest by tag or digest. This removes manifest metadata; uploaded blobs remain owned by
-the namespace until they are deleted through the blob endpoint.
+Delete a manifest by tag or digest. Deleting by tag removes only that tag. Deleting by digest also
+removes tags pointing at the digest and removes the manifest body when no remaining namespace
+references it. Config and layer blobs remain owned by the namespace until they are deleted through
+the blob endpoint or scrubbed as orphans.
 
 ### Tags
 
@@ -389,5 +394,5 @@ Errors follow OCI Distribution error format:
 | `TAG_INVALID`         | 400          | Invalid tag               |
 | `TAG_IMMUTABLE`       | 409          | Tag cannot be overwritten |
 | `UNAUTHORIZED`        | 401          | Authentication required   |
-| `DENIED`              | 403          | Access denied by policy   |
+| `DENIED`              | 403 or 405   | Access denied by policy, or blob is still referenced |
 | `UNSUPPORTED`         | 415          | Unsupported operation     |

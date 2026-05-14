@@ -1,5 +1,6 @@
 use std::{collections::HashMap, io::Cursor, slice};
 
+use futures_util::future::join_all;
 use hyper::header::{CONTENT_LENGTH, CONTENT_TYPE, LOCATION};
 use serde_json::json;
 use uuid::Uuid;
@@ -9,7 +10,8 @@ use crate::{
     oci::Namespace,
     registry::{
         Error, Registry,
-        test_utils::{FSRegistryTestCase, backends},
+        metadata_store::link_kind::LinkKind,
+        test_utils::{FSRegistryTestCase, RegistryTestCase, backends},
     },
     util::sha256,
 };
@@ -368,15 +370,28 @@ async fn delete_manifest_then_delete_uploaded_blobs() {
             )
             .await
             .unwrap();
+        let manifest_digest = header_digest(&response.headers);
+
+        let manifest_blob_result = registry.delete_blob(namespace, &manifest_digest).await;
+        assert!(matches!(manifest_blob_result, Err(Error::BlobReferenced)));
+
+        let layer_result = registry.delete_blob(namespace, &layer_digest).await;
+        assert!(matches!(layer_result, Err(Error::BlobReferenced)));
 
         registry
-            .delete_manifest(
-                None,
-                namespace,
-                &Reference::Digest(header_digest(&response.headers)),
-            )
+            .delete_manifest(None, namespace, &Reference::Digest(manifest_digest.clone()))
             .await
             .unwrap();
+
+        assert!(registry.blob_store.read(&manifest_digest).await.is_err());
+        assert_eq!(
+            registry.blob_store.read(&layer_digest).await.unwrap(),
+            layer_content
+        );
+        assert_eq!(
+            registry.blob_store.read(&config_digest).await.unwrap(),
+            config_content
+        );
 
         registry
             .delete_blob(namespace, &layer_digest)
@@ -391,6 +406,67 @@ async fn delete_manifest_then_delete_uploaded_blobs() {
         assert!(registry.blob_store.read(&config_digest).await.is_err());
         test_case.cleanup().await;
     }
+}
+
+#[tokio::test]
+async fn concurrent_same_digest_pushes_keep_upload_ownership() {
+    let test_case = FSRegistryTestCase::new();
+    let registry = test_case.registry();
+    let media_type = "application/vnd.oci.image.manifest.v1+json".to_string();
+    let layer_content = b"shared zot benchmark layer content";
+    let config_content = br#"{"architecture":"amd64","os":"linux"}"#;
+
+    let namespaces = (0..32)
+        .map(|index| Namespace::new(&format!("test-repo/zot-{index}")).unwrap())
+        .collect::<Vec<_>>();
+
+    let pushes = namespaces.iter().map(|namespace| async {
+        let layer_digest = upload_blob(registry, namespace, layer_content).await;
+        let config_digest = upload_blob(registry, namespace, config_content).await;
+        let manifest = json!({
+            "schemaVersion": 2,
+            "mediaType": media_type,
+            "config": {
+                "mediaType": "application/vnd.oci.image.config.v1+json",
+                "digest": config_digest,
+                "size": config_content.len()
+            },
+            "layers": [
+                {
+                    "mediaType": "application/vnd.oci.image.layer.v1.tar",
+                    "digest": layer_digest,
+                    "size": layer_content.len()
+                }
+            ]
+        });
+        let manifest_content = serde_json::to_vec(&manifest).unwrap();
+        registry
+            .put_manifest(
+                namespace,
+                &Reference::Tag("latest".to_string()),
+                Some(&media_type),
+                &manifest_content,
+            )
+            .await
+            .unwrap();
+        layer_digest
+    });
+
+    let digests = join_all(pushes).await;
+    let layer_digest = &digests[0];
+    let blob_index = registry
+        .metadata_store
+        .read_blob_index(layer_digest)
+        .await
+        .unwrap();
+
+    for namespace in namespaces {
+        let links = blob_index.namespace.get(namespace.as_ref()).unwrap();
+        assert!(links.contains(&LinkKind::Blob(layer_digest.clone())));
+        assert!(links.contains(&LinkKind::Layer(layer_digest.clone())));
+    }
+
+    test_case.cleanup().await;
 }
 
 #[test]

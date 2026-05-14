@@ -412,6 +412,10 @@ impl Registry {
 
         tx.commit().await?;
 
+        if let Reference::Digest(digest) = reference {
+            self.delete_blob_data_if_unreferenced(digest).await?;
+        }
+
         let repository = self.repository_name_for(namespace);
         let digest_str = match reference {
             Reference::Digest(d) => Some(d.to_string()),

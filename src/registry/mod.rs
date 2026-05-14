@@ -47,9 +47,10 @@ pub use crate::policy::AccessPolicy;
 use crate::{
     cache,
     configuration::RegexPattern,
-    oci::{Namespace, namespace_belongs_to},
+    oci::{Digest, Namespace, namespace_belongs_to},
     registry::{
-        blob_store::{BlobStore, PresignedBlobStore, UploadStore},
+        blob_ownership::BlobOwnership,
+        blob_store::{BlobStore, Error as BlobStoreError, PresignedBlobStore, UploadStore},
         metadata_store::MetadataStore,
         task_queue::TaskQueue,
     },
@@ -205,5 +206,19 @@ impl Registry {
         self.get_repository_for_namespace(namespace)
             .map(|r| r.name.clone())
             .unwrap_or_default()
+    }
+
+    async fn delete_blob_data_if_unreferenced(&self, digest: &Digest) -> Result<(), Error> {
+        let ownership = BlobOwnership::new(self.metadata_store.as_ref());
+        if ownership.has_any_reference(digest).await? {
+            return Ok(());
+        }
+
+        match self.blob_store.delete(digest).await {
+            Ok(()) | Err(BlobStoreError::BlobNotFound | BlobStoreError::ReferenceNotFound) => {
+                Ok(())
+            }
+            Err(error) => Err(error.into()),
+        }
     }
 }

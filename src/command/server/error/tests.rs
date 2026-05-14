@@ -256,6 +256,16 @@ fn test_registry_error_to_server_error_mapping() {
     }
 }
 
+#[test]
+fn test_blob_referenced_registry_error_mapping() {
+    let error: Error = registry::Error::BlobReferenced.into();
+    assert_eq!(error.status_code(), StatusCode::METHOD_NOT_ALLOWED);
+
+    let json = error.as_json(None);
+    assert_eq!(json["errors"][0]["code"], "DENIED");
+    assert_eq!(json["errors"][0]["message"], "blob is still referenced");
+}
+
 /// Variants outside the OCI-spec set route through the wildcard arm to a
 /// generic 500 `INTERNAL_ERROR` carrying the rendered Display text.
 /// Pins this contract so a regression that broke `error.to_string()`

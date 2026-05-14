@@ -517,6 +517,11 @@ v2/blobs/sha256/ab/cdef.../refs/team%2Fbackend.json
 
 The namespace is percent-encoded in the filename (`/` → `%2F`, `%` → `%25`) to avoid ambiguity.
 
+Blob indexes separate metadata cleanup from blob data deletion. Manifest deletion removes manifest
+links and may reclaim the manifest body itself, but config and layer blobs are retained while they
+are still owned by a namespace. Explicit blob deletion refuses digests that are still referenced by
+manifests; once the remaining references are gone, the final delete removes the shared blob data.
+
 **Benefits:**
 
 - **Reduced contention** — Multiple namespaces can update their blob references concurrently without serializing on a single file.

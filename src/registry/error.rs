@@ -13,6 +13,8 @@ pub enum Error {
     Initialization(String),
     #[error("blob unknown to registry")]
     BlobUnknown,
+    #[error("blob is still referenced")]
+    BlobReferenced,
     #[error("blob upload unknown to registry")]
     BlobUploadUnknown,
     #[error("provided digest did not match uploaded content")]
@@ -215,6 +217,10 @@ mod tests {
     #[test]
     fn display_strings_match_legacy_values() {
         assert_eq!(Error::BlobUnknown.to_string(), "blob unknown to registry");
+        assert_eq!(
+            Error::BlobReferenced.to_string(),
+            "blob is still referenced"
+        );
         assert_eq!(
             Error::BlobUploadUnknown.to_string(),
             "blob upload unknown to registry"
