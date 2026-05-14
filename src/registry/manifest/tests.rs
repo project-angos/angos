@@ -20,18 +20,24 @@ fn header_digest(headers: &HashMap<&'static str, String>) -> Digest {
     headers[DOCKER_CONTENT_DIGEST].parse().unwrap()
 }
 
-fn create_test_manifest() -> (Vec<u8>, String) {
+const IMAGE_MANIFEST_MEDIA_TYPE: &str = "application/vnd.docker.distribution.manifest.v2+json";
+const CONFIG_MEDIA_TYPE: &str = "application/vnd.docker.container.image.v1+json";
+const LAYER_MEDIA_TYPE: &str = "application/vnd.docker.image.rootfs.diff.tar.gzip";
+const MISSING_SUBJECT_DIGEST: &str =
+    "sha256:9876543210fedcba9876543210fedcba9876543210fedcba9876543210fedcba";
+
+fn create_raw_test_manifest() -> (Vec<u8>, String) {
     let manifest = json!({
         "schemaVersion": 2,
-        "mediaType": "application/vnd.docker.distribution.manifest.v2+json",
+        "mediaType": IMAGE_MANIFEST_MEDIA_TYPE,
         "config": {
-            "mediaType": "application/vnd.docker.container.image.v1+json",
+            "mediaType": CONFIG_MEDIA_TYPE,
             "digest": "sha256:1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
             "size": 1234
         },
         "layers": [
             {
-                "mediaType": "application/vnd.docker.image.rootfs.diff.tar.gzip",
+                "mediaType": LAYER_MEDIA_TYPE,
                 "digest": "sha256:abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890",
                 "size": 5678
             }
@@ -39,27 +45,27 @@ fn create_test_manifest() -> (Vec<u8>, String) {
     });
 
     let content = serde_json::to_vec(&manifest).unwrap();
-    let media_type = "application/vnd.docker.distribution.manifest.v2+json".to_string();
+    let media_type = IMAGE_MANIFEST_MEDIA_TYPE.to_string();
     (content, media_type)
 }
 
-fn create_test_manifest_with_subject() -> (Vec<u8>, String) {
+fn create_raw_test_manifest_with_subject() -> (Vec<u8>, String) {
     let manifest = json!({
         "schemaVersion": 2,
-        "mediaType": "application/vnd.docker.distribution.manifest.v2+json",
+        "mediaType": IMAGE_MANIFEST_MEDIA_TYPE,
         "subject": {
-            "mediaType": "application/vnd.docker.distribution.manifest.v2+json",
-            "digest": "sha256:9876543210fedcba9876543210fedcba9876543210fedcba9876543210fedcba",
+            "mediaType": IMAGE_MANIFEST_MEDIA_TYPE,
+            "digest": MISSING_SUBJECT_DIGEST,
             "size": 1234
         },
         "config": {
-            "mediaType": "application/vnd.docker.container.image.v1+json",
+            "mediaType": CONFIG_MEDIA_TYPE,
             "digest": "sha256:1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
             "size": 1234
         },
         "layers": [
             {
-                "mediaType": "application/vnd.docker.image.rootfs.diff.tar.gzip",
+                "mediaType": LAYER_MEDIA_TYPE,
                 "digest": "sha256:abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890",
                 "size": 5678
             }
@@ -67,8 +73,117 @@ fn create_test_manifest_with_subject() -> (Vec<u8>, String) {
     });
 
     let content = serde_json::to_vec(&manifest).unwrap();
-    let media_type = "application/vnd.docker.distribution.manifest.v2+json".to_string();
+    let media_type = IMAGE_MANIFEST_MEDIA_TYPE.to_string();
     (content, media_type)
+}
+
+fn manifest_with_references(
+    config_digest: &Digest,
+    config_size: usize,
+    layer_digest: &Digest,
+    layer_size: usize,
+) -> (Vec<u8>, String) {
+    let manifest = json!({
+        "schemaVersion": 2,
+        "mediaType": IMAGE_MANIFEST_MEDIA_TYPE,
+        "config": {
+            "mediaType": CONFIG_MEDIA_TYPE,
+            "digest": config_digest,
+            "size": config_size
+        },
+        "layers": [
+            {
+                "mediaType": LAYER_MEDIA_TYPE,
+                "digest": layer_digest,
+                "size": layer_size
+            }
+        ]
+    });
+
+    let content = serde_json::to_vec(&manifest).unwrap();
+    (content, IMAGE_MANIFEST_MEDIA_TYPE.to_string())
+}
+
+fn manifest_with_subject_and_references(
+    config_digest: &Digest,
+    config_size: usize,
+    layer_digest: &Digest,
+    layer_size: usize,
+) -> (Vec<u8>, String) {
+    let manifest = json!({
+        "schemaVersion": 2,
+        "mediaType": IMAGE_MANIFEST_MEDIA_TYPE,
+        "subject": {
+            "mediaType": IMAGE_MANIFEST_MEDIA_TYPE,
+            "digest": MISSING_SUBJECT_DIGEST,
+            "size": 1234
+        },
+        "config": {
+            "mediaType": CONFIG_MEDIA_TYPE,
+            "digest": config_digest,
+            "size": config_size
+        },
+        "layers": [
+            {
+                "mediaType": LAYER_MEDIA_TYPE,
+                "digest": layer_digest,
+                "size": layer_size
+            }
+        ]
+    });
+
+    let content = serde_json::to_vec(&manifest).unwrap();
+    (content, IMAGE_MANIFEST_MEDIA_TYPE.to_string())
+}
+
+fn index_manifest_with_child(child_digest: &Digest) -> (Vec<u8>, String) {
+    let media_type = "application/vnd.oci.image.index.v1+json".to_string();
+    let manifest = json!({
+        "schemaVersion": 2,
+        "mediaType": media_type,
+        "manifests": [
+            {
+                "mediaType": "application/vnd.oci.image.manifest.v1+json",
+                "digest": child_digest,
+                "size": 512,
+                "platform": { "architecture": "amd64", "os": "linux" }
+            }
+        ]
+    });
+
+    let content = serde_json::to_vec(&manifest).unwrap();
+    (content, media_type)
+}
+
+async fn create_test_manifest(registry: &Registry, namespace: &Namespace) -> (Vec<u8>, String) {
+    let config_content = br#"{"architecture":"amd64","os":"linux"}"#;
+    let layer_content = b"test layer content";
+    let config_digest = upload_blob(registry, namespace, config_content).await;
+    let layer_digest = upload_blob(registry, namespace, layer_content).await;
+
+    manifest_with_references(
+        &config_digest,
+        config_content.len(),
+        &layer_digest,
+        layer_content.len(),
+    )
+}
+
+async fn create_test_manifest_with_subject(
+    registry: &Registry,
+    namespace: &Namespace,
+) -> (Vec<u8>, String) {
+    let config_content = br#"{"architecture":"amd64","os":"linux"}"#;
+    let layer_content = b"test layer content";
+    let config_digest = upload_blob(registry, namespace, config_content).await;
+    let layer_digest = upload_blob(registry, namespace, layer_content).await;
+
+    manifest_with_subject_and_references(
+        &config_digest,
+        config_content.len(),
+        &layer_digest,
+        layer_content.len(),
+    )
 }
 
 async fn upload_blob(registry: &Registry, namespace: &Namespace, content: &[u8]) -> Digest {
@@ -101,7 +216,7 @@ async fn test_put_manifest() {
         let registry = test_case.registry();
         let namespace = &Namespace::new("test-repo").unwrap();
         let tag = "latest";
-        let (content, media_type) = create_test_manifest();
+        let (content, media_type) = create_test_manifest(registry, namespace).await;
 
         // Test put manifest with tag
         let response = registry
@@ -148,12 +263,166 @@ async fn test_put_manifest() {
 }
 
 #[tokio::test]
+async fn put_manifest_rejects_missing_config_reference() {
+    for test_case in backends() {
+        let registry = test_case.registry();
+        let namespace = &Namespace::new("test-repo/missing-config").unwrap();
+        let missing_config = fixed_digest();
+        let layer_content = b"existing layer";
+        let layer_digest = upload_blob(registry, namespace, layer_content).await;
+        let (content, media_type) =
+            manifest_with_references(&missing_config, 256, &layer_digest, layer_content.len());
+
+        let Err(err) = registry
+            .put_manifest(
+                namespace,
+                &Reference::Tag("latest".to_string()),
+                Some(&media_type),
+                &content,
+            )
+            .await
+        else {
+            panic!("missing config must reject manifest push");
+        };
+
+        assert!(matches!(err, Error::ManifestBlobUnknown));
+        let manifest_digest = sha256::digest(&content);
+        assert!(registry.blob_store.read(&manifest_digest).await.is_err());
+        assert!(
+            registry
+                .metadata_store
+                .read_link(namespace, &LinkKind::Tag("latest".to_string()), false)
+                .await
+                .is_err()
+        );
+        test_case.cleanup().await;
+    }
+}
+
+#[tokio::test]
+async fn put_manifest_rejects_missing_layer_reference() {
+    for test_case in backends() {
+        let registry = test_case.registry();
+        let namespace = &Namespace::new("test-repo/missing-layer").unwrap();
+        let config_content = br#"{"architecture":"amd64","os":"linux"}"#;
+        let config_digest = upload_blob(registry, namespace, config_content).await;
+        let missing_layer = fixed_digest();
+        let (content, media_type) =
+            manifest_with_references(&config_digest, config_content.len(), &missing_layer, 512);
+
+        let Err(err) = registry
+            .put_manifest(
+                namespace,
+                &Reference::Tag("latest".to_string()),
+                Some(&media_type),
+                &content,
+            )
+            .await
+        else {
+            panic!("missing layer must reject manifest push");
+        };
+
+        assert!(matches!(err, Error::ManifestBlobUnknown));
+        test_case.cleanup().await;
+    }
+}
+
+#[tokio::test]
+async fn put_manifest_rejects_missing_child_manifest_reference() {
+    for test_case in backends() {
+        let registry = test_case.registry();
+        let namespace = &Namespace::new("test-repo/missing-child").unwrap();
+        let missing_child = fixed_digest();
+        let (content, media_type) = index_manifest_with_child(&missing_child);
+
+        let Err(err) = registry
+            .put_manifest(
+                namespace,
+                &Reference::Tag("latest".to_string()),
+                Some(&media_type),
+                &content,
+            )
+            .await
+        else {
+            panic!("missing child manifest must reject index push");
+        };
+
+        assert!(matches!(err, Error::ManifestBlobUnknown));
+        test_case.cleanup().await;
+    }
+}
+
+#[tokio::test]
+async fn put_manifest_rejects_references_owned_by_another_namespace() {
+    for test_case in backends() {
+        let registry = test_case.registry();
+        let owner_namespace = &Namespace::new("test-repo/source").unwrap();
+        let target_namespace = &Namespace::new("test-repo/target").unwrap();
+        let config_content = br#"{"architecture":"amd64","os":"linux"}"#;
+        let layer_content = b"shared layer bytes";
+        let config_digest = upload_blob(registry, owner_namespace, config_content).await;
+        let layer_digest = upload_blob(registry, owner_namespace, layer_content).await;
+        let (content, media_type) = manifest_with_references(
+            &config_digest,
+            config_content.len(),
+            &layer_digest,
+            layer_content.len(),
+        );
+
+        let Err(err) = registry
+            .put_manifest(
+                target_namespace,
+                &Reference::Tag("latest".to_string()),
+                Some(&media_type),
+                &content,
+            )
+            .await
+        else {
+            panic!("cross-namespace references must reject manifest push");
+        };
+
+        assert!(matches!(err, Error::ManifestBlobUnknown));
+        test_case.cleanup().await;
+    }
+}
+
+#[tokio::test]
+async fn put_manifest_allows_missing_subject_reference() {
+    for test_case in backends() {
+        let registry = test_case.registry();
+        let namespace = &Namespace::new("test-repo/missing-subject").unwrap();
+        let (content, media_type) = create_test_manifest_with_subject(registry, namespace).await;
+
+        let response = registry
+            .put_manifest(
+                namespace,
+                &Reference::Tag("latest".to_string()),
+                Some(&media_type),
+                &content,
+            )
+            .await
+            .expect("missing subject should not reject manifest push");
+
+        let subject = MISSING_SUBJECT_DIGEST.parse().unwrap();
+        let digest = header_digest(&response.headers);
+        let link = LinkKind::Referrer(subject, digest.clone());
+        let metadata = registry
+            .metadata_store
+            .read_link(namespace, &link, false)
+            .await
+            .unwrap();
+        assert_eq!(metadata.target, digest);
+        test_case.cleanup().await;
+    }
+}
+
+#[tokio::test]
 async fn test_get_manifest() {
     for test_case in backends() {
         let registry = test_case.registry();
         let namespace = &Namespace::new("test-repo").unwrap();
         let tag = "latest";
-        let (content, media_type) = create_test_manifest();
+        let (content, media_type) = create_test_manifest(registry, namespace).await;
 
         // Put manifest first
         let response = registry
@@ -207,7 +476,7 @@ async fn test_head_manifest() {
         let registry = test_case.registry();
         let namespace = &Namespace::new("test-repo").unwrap();
         let tag = "latest";
-        let (content, media_type) = create_test_manifest();
+        let (content, media_type) = create_test_manifest(registry, namespace).await;
 
         // Put manifest first
         let response = registry
@@ -273,7 +542,7 @@ async fn test_delete_manifest() {
         let registry = test_case.registry();
         let namespace = &Namespace::new("test-repo").unwrap();
         let tag = "latest";
-        let (content, media_type) = create_test_manifest();
+        let (content, media_type) = create_test_manifest(registry, namespace).await;
 
         // Put manifest first
         let response = registry
@@ -472,7 +741,7 @@ async fn concurrent_same_digest_pushes_keep_upload_ownership() {
 #[test]
 fn test_parse_manifest_digests() {
     // Test regular manifest
-    let (content, media_type) = create_test_manifest();
+    let (content, media_type) = create_raw_test_manifest();
     let digests = parse_manifest_digests(&content, Some(&media_type)).unwrap();
 
     assert!(digests.subject.is_none());
@@ -486,7 +755,7 @@ fn test_parse_manifest_digests() {
     );
 
     // Test manifest with subject
-    let (content, media_type) = create_test_manifest_with_subject();
+    let (content, media_type) = create_raw_test_manifest_with_subject();
     let digests = parse_manifest_digests(&content, Some(&media_type)).unwrap();
 
     assert_eq!(
@@ -552,7 +821,7 @@ async fn test_malformed_json_yields_same_error_shape() {
 
 #[test]
 fn parse_manifest_digests_media_type_mismatch_returns_manifest_invalid() {
-    let (content, _) = create_test_manifest();
+    let (content, _) = create_raw_test_manifest();
     let wrong_type = "application/vnd.oci.image.manifest.v1+json".to_string();
 
     let err = parse_manifest_digests(&content, Some(&wrong_type))
@@ -670,7 +939,7 @@ async fn test_handle_head_manifest() {
         let registry = test_case.registry();
         let namespace = &Namespace::new("test-repo").unwrap();
         let tag = "latest";
-        let (content, media_type) = create_test_manifest();
+        let (content, media_type) = create_test_manifest(registry, namespace).await;
 
         let put_response = registry
             .put_manifest(
@@ -713,7 +982,7 @@ async fn test_handle_get_manifest() {
         let registry = test_case.registry();
         let namespace = &Namespace::new("test-repo").unwrap();
         let tag = "latest";
-        let (content, media_type) = create_test_manifest();
+        let (content, media_type) = create_test_manifest(registry, namespace).await;
 
         let put_response = registry
             .put_manifest(
@@ -760,7 +1029,7 @@ async fn test_handle_put_manifest() {
         let registry = test_case.registry();
         let namespace = &Namespace::new("test-repo").unwrap();
         let tag = "latest";
-        let (content, media_type) = create_test_manifest();
+        let (content, media_type) = create_test_manifest(registry, namespace).await;
 
         let manifest_stream = Cursor::new(content.clone());
         let response = registry
@@ -806,7 +1075,7 @@ async fn test_handle_delete_manifest() {
         let registry = test_case.registry();
         let namespace = &Namespace::new("test-repo").unwrap();
         let tag = "latest";
-        let (content, media_type) = create_test_manifest();
+        let (content, media_type) = create_test_manifest(registry, namespace).await;
 
         registry
             .put_manifest(
@@ -841,12 +1110,12 @@ async fn test_handle_delete_manifest() {
 
 async fn test_pull_through_cache_optimization_impl(test_case: &mut FSRegistryTestCase) {
     let namespace = &Namespace::new("test-repo").unwrap();
-    let (content, media_type) = create_test_manifest();
 
     let repositories = crate::registry::test_utils::create_test_repositories();
 
     test_case.set_repositories(repositories);
     let registry = test_case.registry();
+    let (content, media_type) = create_test_manifest(registry, namespace).await;
 
     let immutable_tag = "v1.0.0";
     let put_result = registry
@@ -906,7 +1175,7 @@ async fn test_delete_manifest_by_digest_removes_multiple_tags() {
     for test_case in backends() {
         let registry = test_case.registry();
         let namespace = &Namespace::new("test-repo/delete-multi-tags").unwrap();
-        let (content, media_type) = create_test_manifest();
+        let (content, media_type) = create_test_manifest(registry, namespace).await;
 
         let response = registry
             .put_manifest(
@@ -986,8 +1255,9 @@ async fn test_delete_manifest_by_digest_preserves_unrelated_tags() {
     for test_case in backends() {
         let registry = test_case.registry();
         let namespace = &Namespace::new("test-repo/delete-preserve").unwrap();
-        let (content_a, media_type_a) = create_test_manifest();
-        let (content_b, media_type_b) = create_test_manifest_with_subject();
+        let (content_a, media_type_a) = create_test_manifest(registry, namespace).await;
+        let (content_b, media_type_b) =
+            create_test_manifest_with_subject(registry, namespace).await;
 
         let response_a = registry
             .put_manifest(
@@ -1077,8 +1347,9 @@ async fn test_delete_manifest_with_many_tags() {
     for test_case in backends() {
         let registry = test_case.registry();
         let namespace = &Namespace::new("test-repo/delete-many-tags").unwrap();
-        let (content_a, media_type_a) = create_test_manifest();
-        let (content_b, media_type_b) = create_test_manifest_with_subject();
+        let (content_a, media_type_a) = create_test_manifest(registry, namespace).await;
+        let (content_b, media_type_b) =
+            create_test_manifest_with_subject(registry, namespace).await;
 
         let response_a = registry
             .put_manifest(
@@ -1173,7 +1444,7 @@ async fn test_put_manifest_stores_media_type() {
         let registry = test_case.registry();
         let namespace = &Namespace::new("test-repo/media-type-store").unwrap();
         let tag = "latest";
-        let (content, media_type) = create_test_manifest();
+        let (content, media_type) = create_test_manifest(registry, namespace).await;
 
         let response = registry
             .put_manifest(
@@ -1217,7 +1488,7 @@ async fn test_head_manifest_returns_correct_media_type() {
     for test_case in backends() {
         let registry = test_case.registry();
         let namespace = &Namespace::new("test-repo/head-media-type").unwrap();
-        let (content, media_type) = create_test_manifest();
+        let (content, media_type) = create_test_manifest(registry, namespace).await;
 
         let put_response = registry
             .put_manifest(
@@ -1281,7 +1552,7 @@ async fn test_head_manifest_fallback_without_media_type() {
     for test_case in backends() {
         let registry = test_case.registry();
         let namespace = &Namespace::new("test-repo/head-fallback").unwrap();
-        let (content, media_type) = create_test_manifest();
+        let (content, media_type) = create_test_manifest(registry, namespace).await;
 
         let digest = registry.blob_store.create(&content).await.unwrap();
 
@@ -1334,7 +1605,7 @@ async fn test_delete_manifest_no_tags_by_digest() {
     for test_case in backends() {
         let registry = test_case.registry();
         let namespace = &Namespace::new("test-repo/delete-no-tags").unwrap();
-        let (content, media_type) = create_test_manifest();
+        let (content, media_type) = create_test_manifest(registry, namespace).await;
 
         let response = registry
             .put_manifest(
@@ -1383,7 +1654,7 @@ async fn test_put_manifest_stores_media_type_in_links() {
     for test_case in backends() {
         let registry = test_case.registry();
         let namespace = &Namespace::new("test-repo/media-type-links").unwrap();
-        let (content, media_type) = create_test_manifest();
+        let (content, media_type) = create_test_manifest(registry, namespace).await;
 
         let response = registry
             .put_manifest(
@@ -1429,7 +1700,7 @@ async fn test_head_local_manifest_uses_metadata_media_type() {
     for test_case in backends() {
         let registry = test_case.registry();
         let namespace = &Namespace::new("test-repo/head-optimized").unwrap();
-        let (content, media_type) = create_test_manifest();
+        let (content, media_type) = create_test_manifest(registry, namespace).await;
 
         let response = registry
             .put_manifest(
@@ -1491,7 +1762,7 @@ async fn test_put_manifest_without_content_type_stores_manifest_media_type() {
     for test_case in backends() {
         let registry = test_case.registry();
         let namespace = &Namespace::new("test-repo/no-content-type").unwrap();
-        let (content, _media_type) = create_test_manifest();
+        let (content, _media_type) = create_test_manifest(registry, namespace).await;
 
         let response = registry
             .put_manifest(
@@ -1527,7 +1798,7 @@ async fn test_handle_get_manifest_redirect_includes_content_type() {
     for test_case in backends() {
         let registry = test_case.registry();
         let namespace = &Namespace::new("test-repo/redirect-ct").unwrap();
-        let (content, media_type) = create_test_manifest();
+        let (content, media_type) = create_test_manifest(registry, namespace).await;
 
         let put_response = registry
             .put_manifest(
@@ -1575,7 +1846,7 @@ async fn test_handle_get_manifest_redirect_fallback_without_media_type() {
     for test_case in backends() {
         let registry = test_case.registry();
         let namespace = &Namespace::new("test-repo/redirect-fallback").unwrap();
-        let (content, media_type) = create_test_manifest();
+        let (content, media_type) = create_test_manifest(registry, namespace).await;
 
         let digest = registry.blob_store.create(&content).await.unwrap();
 
@@ -1620,7 +1891,7 @@ async fn test_handle_get_manifest_no_redirect_returns_body() {
     for test_case in backends() {
         let registry = test_case.registry();
         let namespace = &Namespace::new("test-repo/no-redirect").unwrap();
-        let (content, media_type) = create_test_manifest();
+        let (content, media_type) = create_test_manifest(registry, namespace).await;
 
         let put_response = registry
             .put_manifest(

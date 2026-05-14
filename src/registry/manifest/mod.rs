@@ -19,9 +19,12 @@ use crate::{
     oci::{Digest, Manifest, Namespace, Reference},
     registry::{
         DOCKER_CONTENT_DIGEST, Error, Registry, Repository,
+        blob_ownership::BlobOwnership,
+        blob_store::Error as BlobStoreError,
         metadata_store::{MetadataStoreExt, link_kind::LinkKind},
         pagination::collect_all_pages,
     },
+    util::sha256,
 };
 
 pub const DEFAULT_MAX_MANIFEST_SIZE_BYTES: usize = 5 * 1024 * 1024;
@@ -197,7 +200,7 @@ impl Registry {
             .get_manifest(accepted_types, namespace, &reference)
             .await?;
 
-        self.put_manifest(namespace, &reference, media_type.as_ref(), &content)
+        self.store_manifest(namespace, &reference, media_type.as_ref(), &content, false)
             .await?;
 
         Ok(ManifestBody {
@@ -260,19 +263,38 @@ impl Registry {
         content_type: Option<&String>,
         body: &[u8],
     ) -> Result<PutManifestResponse, Error> {
-        let mut manifest = parse_and_validate_manifest(body, content_type)?;
+        self.store_manifest(namespace, reference, content_type, body, true)
+            .await
+    }
 
-        let digest = self.blob_store.create(body).await?;
+    async fn store_manifest(
+        &self,
+        namespace: &Namespace,
+        reference: &Reference,
+        content_type: Option<&String>,
+        body: &[u8],
+        validate_references: bool,
+    ) -> Result<PutManifestResponse, Error> {
+        let mut manifest = parse_and_validate_manifest(body, content_type)?;
+        let computed_digest = Digest::Sha256(sha256::hex(body).into());
 
         if let Reference::Digest(provided_digest) = reference
-            && provided_digest != &digest
+            && provided_digest != &computed_digest
         {
-            warn!("Provided digest does not match computed digest: {provided_digest} != {digest}");
+            warn!(
+                "Provided digest does not match computed digest: {provided_digest} != {computed_digest}"
+            );
             return Err(Error::ManifestInvalid(
                 "Provided digest does not match computed digest".to_string(),
             ));
         }
 
+        if validate_references {
+            self.validate_manifest_references(namespace, &manifest)
+                .await?;
+        }
+
+        let digest = self.blob_store.create(body).await?;
         let mut tx = self.metadata_store.begin_transaction(namespace);
 
         let effective_media_type = content_type
@@ -329,6 +351,50 @@ impl Registry {
             headers: put_manifest_headers(namespace, reference, &digest, subject.as_ref()),
             events: Vec::new(),
         })
+    }
+
+    async fn validate_manifest_references(
+        &self,
+        namespace: &Namespace,
+        manifest: &Manifest,
+    ) -> Result<(), Error> {
+        let ownership = BlobOwnership::new(self.metadata_store.as_ref());
+
+        if let Some(config) = &manifest.config {
+            self.validate_manifest_reference(namespace, &ownership, &config.digest)
+                .await?;
+        }
+
+        for layer in &manifest.layers {
+            self.validate_manifest_reference(namespace, &ownership, &layer.digest)
+                .await?;
+        }
+
+        for child in &manifest.manifests {
+            self.validate_manifest_reference(namespace, &ownership, &child.digest)
+                .await?;
+        }
+
+        Ok(())
+    }
+
+    async fn validate_manifest_reference(
+        &self,
+        namespace: &Namespace,
+        ownership: &BlobOwnership<'_>,
+        digest: &Digest,
+    ) -> Result<(), Error> {
+        if !ownership.can_read(namespace, digest).await? {
+            return Err(Error::ManifestBlobUnknown);
+        }
+
+        match self.blob_store.size(digest).await {
+            Ok(_) => Ok(()),
+            Err(BlobStoreError::BlobNotFound | BlobStoreError::ReferenceNotFound) => {
+                Err(Error::ManifestBlobUnknown)
+            }
+            Err(error) => Err(error.into()),
+        }
     }
 
     async fn find_tags_pointing_at(

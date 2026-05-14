@@ -106,7 +106,10 @@ Check existence or download a manifest. `{reference}` can be a tag or digest.
 PUT /v2/{namespace}/manifests/{reference}
 ```
 
-Push a manifest. Manifest bodies larger than `global.max_manifest_size` are rejected with `MANIFEST_INVALID`.
+Push a manifest. Manifest bodies larger than `global.max_manifest_size` are rejected with
+`MANIFEST_INVALID`. Config, layer, and child manifest digests referenced by the manifest must
+already exist and be readable in the namespace; missing references are rejected with
+`MANIFEST_BLOB_UNKNOWN`. Subject digests used for referrers are not required to exist.
 
 ```
 DELETE /v2/{namespace}/manifests/{reference}
@@ -386,6 +389,7 @@ Errors follow OCI Distribution error format:
 | `BLOB_UPLOAD_INVALID` | 400          | Invalid upload            |
 | `BLOB_UPLOAD_UNKNOWN` | 404          | Upload session not found  |
 | `DIGEST_INVALID`      | 400          | Invalid digest format     |
+| `MANIFEST_BLOB_UNKNOWN` | 404        | Manifest reference is missing |
 | `MANIFEST_INVALID`    | 400          | Invalid manifest content  |
 | `MANIFEST_UNKNOWN`    | 404          | Manifest does not exist   |
 | `NAME_INVALID`        | 400          | Invalid repository name   |
