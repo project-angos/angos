@@ -4,10 +4,13 @@ use hyper::{
     header::{ACCEPT, AUTHORIZATION, HeaderName, HeaderValue, RANGE},
 };
 
-use crate::command::server::{
-    error::Error,
-    request::{accepted_content_types, basic_auth, bearer_token, range},
-    response_body::ResponseBody,
+use crate::{
+    command::server::{
+        error::Error,
+        request::{accepted_content_types, basic_auth, bearer_token, blob_range, range},
+        response_body::ResponseBody,
+    },
+    registry::BlobRange,
 };
 
 #[test]
@@ -23,6 +26,42 @@ fn test_range_with_bytes_prefix() {
 }
 
 #[test]
+fn test_blob_range_with_bytes_prefix() {
+    let request = Request::builder()
+        .header(RANGE, "bytes=0-499")
+        .body(())
+        .unwrap();
+    let (parts, ()) = request.into_parts();
+
+    let range = blob_range(&parts.headers, RANGE).unwrap().unwrap();
+    assert_eq!(
+        range,
+        BlobRange::FromTo {
+            start: 0,
+            end: Some(499)
+        }
+    );
+}
+
+#[test]
+fn test_blob_range_unit_is_case_insensitive() {
+    let request = Request::builder()
+        .header(RANGE, "Bytes=0-499")
+        .body(())
+        .unwrap();
+    let (parts, ()) = request.into_parts();
+
+    let range = blob_range(&parts.headers, RANGE).unwrap().unwrap();
+    assert_eq!(
+        range,
+        BlobRange::FromTo {
+            start: 0,
+            end: Some(499)
+        }
+    );
+}
+
+#[test]
 fn test_range_without_bytes_prefix() {
     let request = Request::builder()
         .header(RANGE, "100-200")
@@ -35,6 +74,18 @@ fn test_range_without_bytes_prefix() {
 }
 
 #[test]
+fn test_blob_range_requires_bytes_prefix() {
+    let request = Request::builder()
+        .header(RANGE, "100-200")
+        .body(())
+        .unwrap();
+    let (parts, ()) = request.into_parts();
+
+    let result = blob_range(&parts.headers, RANGE);
+    assert!(result.is_err());
+}
+
+#[test]
 fn test_range_no_end() {
     let request = Request::builder()
         .header(RANGE, "bytes=0-")
@@ -44,6 +95,30 @@ fn test_range_no_end() {
 
     let range = range(&parts.headers, RANGE).unwrap().unwrap();
     assert_eq!(range, (0, None));
+}
+
+#[test]
+fn test_blob_range_suffix_range() {
+    let request = Request::builder()
+        .header(RANGE, "bytes=-499")
+        .body(())
+        .unwrap();
+    let (parts, ()) = request.into_parts();
+
+    let range = blob_range(&parts.headers, RANGE).unwrap().unwrap();
+    assert_eq!(range, BlobRange::Suffix(499));
+}
+
+#[test]
+fn test_blob_range_zero_suffix_range() {
+    let request = Request::builder()
+        .header(RANGE, "bytes=-0")
+        .body(())
+        .unwrap();
+    let (parts, ()) = request.into_parts();
+
+    let range = blob_range(&parts.headers, RANGE).unwrap().unwrap();
+    assert_eq!(range, BlobRange::Suffix(0));
 }
 
 #[test]
@@ -99,7 +174,7 @@ fn test_range_start_greater_than_end() {
 }
 
 #[test]
-fn test_range_missing_start() {
+fn test_range_missing_start_is_invalid_for_start_end_parser() {
     let request = Request::builder()
         .header(RANGE, "bytes=-499")
         .body(())
@@ -109,7 +184,9 @@ fn test_range_missing_start() {
     let result = range(&parts.headers, RANGE);
     assert!(result.is_err());
     match result.unwrap_err() {
-        Error::RangeNotSatisfiable(_) => {}
+        Error::RangeNotSatisfiable(msg) => {
+            assert!(msg.contains("Invalid Range header format"));
+        }
         _ => panic!("Expected RangeNotSatisfiable error"),
     }
 }
@@ -130,6 +207,18 @@ fn test_range_invalid_format() {
         }
         _ => panic!("Expected RangeNotSatisfiable error"),
     }
+}
+
+#[test]
+fn test_blob_range_multiple_ranges_not_supported() {
+    let request = Request::builder()
+        .header(RANGE, "bytes=0-10,20-30")
+        .body(())
+        .unwrap();
+    let (parts, ()) = request.into_parts();
+
+    let range = blob_range(&parts.headers, RANGE).unwrap();
+    assert_eq!(range, None);
 }
 
 #[test]

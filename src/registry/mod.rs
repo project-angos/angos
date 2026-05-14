@@ -21,7 +21,7 @@ pub mod test_utils;
 pub mod upload;
 pub mod version;
 
-pub use blob::GetBlobResponse;
+pub use blob::{BlobRange, GetBlobResponse};
 pub use error::Error;
 pub use manifest::{GetManifestResponse, ParsedManifestDigests, parse_manifest_digests};
 pub use repository::Repository;

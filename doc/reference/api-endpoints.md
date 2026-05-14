@@ -31,6 +31,19 @@ GET  /v2/{namespace}/blobs/{digest}
 
 Check existence or download a blob by digest.
 
+`GET` supports a single byte range through the `Range` header:
+
+- `Range: bytes=<start>-<end>` returns `206 Partial Content`.
+- `Range: bytes=<start>-` returns from `<start>` through the end of the blob.
+- `Range: bytes=-<suffix-length>` returns the final `<suffix-length>` bytes.
+- If `<end>` is beyond the blob length, Angos clamps it to the final byte.
+- If `<suffix-length>` is longer than the blob, Angos returns the full blob as `206 Partial Content`.
+- Multiple ranges are not supported; Angos ignores them and returns the normal full `200 OK` response.
+- A range whose start is at or beyond the blob length, or a zero-length suffix range, returns `416 Range Not Satisfiable`.
+- For an empty blob, Angos ignores a syntactically valid range and returns the normal `200 OK` empty body.
+
+Range requests for pull-through repositories are supported only after the blob is available locally. A range request for an uncached pull-through blob returns `416`; request the full blob first to populate the cache.
+
 ```
 DELETE /v2/{namespace}/blobs/{digest}
 ```

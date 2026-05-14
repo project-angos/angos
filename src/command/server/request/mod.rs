@@ -12,11 +12,14 @@ use regex::Regex;
 use tokio::io::AsyncRead;
 use tokio_util::io::StreamReader;
 
-use crate::command::server::error::Error;
+use crate::{command::server::error::Error, registry::BlobRange};
 
-static RANGE_RE: LazyLock<Regex> =
+static START_END_RANGE_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^(?:bytes=)?(?P<start>\d+)-(?P<end>\d+)?$").unwrap());
+static SUFFIX_RANGE_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^(?:bytes=)?-(?P<suffix>\d+)$").unwrap());
 
+static BYTES_RANGE_PREFIX: &str = "bytes=";
 static BEARER_PREFIX: &str = "Bearer ";
 static BASIC_PREFIX: &str = "Basic ";
 
@@ -32,17 +35,58 @@ pub fn range(headers: &HeaderMap, header: HeaderName) -> Result<Option<(u64, Opt
         return Ok(None);
     };
 
-    let invalid_range_header = || {
-        let msg = format!("Invalid Range header format: '{range_header}'");
-        Error::RangeNotSatisfiable(msg)
+    parse_start_end_range(&range_header).map(Some)
+}
+
+pub fn blob_range(headers: &HeaderMap, header: HeaderName) -> Result<Option<BlobRange>, Error> {
+    let Some(range_header) = parse_header::<String, _>(headers, header) else {
+        return Ok(None);
     };
 
-    let captures = RANGE_RE
-        .captures(&range_header)
-        .ok_or_else(invalid_range_header)?;
+    let Some(range_value) = strip_bytes_prefix(&range_header) else {
+        return Err(invalid_range_header(&range_header));
+    };
+
+    if range_value.contains(',') {
+        return Ok(None);
+    }
+
+    if START_END_RANGE_RE.is_match(range_value) {
+        let (start, end) = parse_start_end_range(range_value)?;
+        return Ok(Some(BlobRange::FromTo { start, end }));
+    }
+
+    if SUFFIX_RANGE_RE.is_match(range_value) {
+        let suffix = parse_suffix_range(range_value)?;
+        return Ok(Some(BlobRange::Suffix(suffix)));
+    }
+
+    Err(invalid_range_header(&range_header))
+}
+
+fn strip_bytes_prefix(range_header: &str) -> Option<&str> {
+    if range_header.len() < BYTES_RANGE_PREFIX.len() {
+        return None;
+    }
+
+    let (prefix, range_value) = range_header.split_at(BYTES_RANGE_PREFIX.len());
+    prefix
+        .eq_ignore_ascii_case(BYTES_RANGE_PREFIX)
+        .then_some(range_value)
+}
+
+fn invalid_range_header(range_header: &str) -> Error {
+    let msg = format!("Invalid Range header format: '{range_header}'");
+    Error::RangeNotSatisfiable(msg)
+}
+
+fn parse_start_end_range(range_header: &str) -> Result<(u64, Option<u64>), Error> {
+    let captures = START_END_RANGE_RE
+        .captures(range_header)
+        .ok_or_else(|| invalid_range_header(range_header))?;
 
     let (Some(start), end) = (captures.name("start"), captures.name("end")) else {
-        return Err(invalid_range_header());
+        return Err(invalid_range_header(range_header));
     };
 
     let start = start.as_str().parse::<u64>().map_err(|error| {
@@ -61,10 +105,25 @@ pub fn range(headers: &HeaderMap, header: HeaderName) -> Result<Option<(u64, Opt
             return Err(Error::RangeNotSatisfiable(msg));
         }
 
-        Ok(Some((start, Some(end))))
+        Ok((start, Some(end)))
     } else {
-        Ok(Some((start, None)))
+        Ok((start, None))
     }
+}
+
+fn parse_suffix_range(range_header: &str) -> Result<u64, Error> {
+    let captures = SUFFIX_RANGE_RE
+        .captures(range_header)
+        .ok_or_else(|| invalid_range_header(range_header))?;
+
+    let Some(suffix) = captures.name("suffix") else {
+        return Err(invalid_range_header(range_header));
+    };
+
+    suffix.as_str().parse::<u64>().map_err(|error| {
+        let msg = format!("Error parsing 'suffix' in Range header: {error}");
+        Error::RangeNotSatisfiable(msg)
+    })
 }
 
 pub fn accepted_content_types(headers: &HeaderMap) -> Vec<String> {

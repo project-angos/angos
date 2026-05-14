@@ -5,11 +5,11 @@ use crate::{
         ServerContext,
         error::Error,
         handlers::build_response,
-        request::{accepted_content_types, range},
+        request::{accepted_content_types, blob_range},
         response_body::ResponseBody,
     },
     oci::{Digest, Namespace},
-    registry::GetBlobResponse,
+    registry::{BlobRange, GetBlobResponse},
 };
 
 pub async fn handle_head_blob(
@@ -44,7 +44,7 @@ pub async fn handle_get_blob(
     namespace: &Namespace,
     digest: &Digest,
     mime_types: &[String],
-    range: Option<(u64, Option<u64>)>,
+    range: Option<BlobRange>,
 ) -> Result<Response<ResponseBody>, Error> {
     let response = context
         .registry
@@ -75,7 +75,7 @@ pub async fn dispatch_get_blob(
     digest: Digest,
 ) -> Result<Response<ResponseBody>, Error> {
     let mime_types = accepted_content_types(&parts.headers);
-    let range = range(&parts.headers, RANGE)?;
+    let range = blob_range(&parts.headers, RANGE)?;
 
     handle_get_blob(context, namespace, &digest, &mime_types, range).await
 }
