@@ -85,6 +85,9 @@ impl From<blob_store::Error> for Error {
             blob_store::Error::UploadNotFound => Error::BlobUploadUnknown,
             blob_store::Error::BlobNotFound => Error::BlobUnknown,
             blob_store::Error::ReferenceNotFound => Error::ManifestBlobUnknown,
+            blob_store::Error::UploadBodyRead(_) | blob_store::Error::UploadBodySize { .. } => {
+                Error::RangeNotSatisfiable
+            }
             _ => Error::Internal(format!("Data store error during operations: {error}")),
         }
     }
@@ -181,6 +184,19 @@ mod tests {
     fn from_blob_store_routes_reference_not_found() {
         let err: Error = blob_store::Error::ReferenceNotFound.into();
         assert!(matches!(err, Error::ManifestBlobUnknown));
+    }
+
+    #[test]
+    fn from_blob_store_routes_upload_body_errors() {
+        let read_err: Error = blob_store::Error::UploadBodyRead("reset".to_string()).into();
+        assert!(matches!(read_err, Error::RangeNotSatisfiable));
+
+        let size_err: Error = blob_store::Error::UploadBodySize {
+            expected: 10,
+            actual: 8,
+        }
+        .into();
+        assert!(matches!(size_err, Error::RangeNotSatisfiable));
     }
 
     #[test]

@@ -10,6 +10,8 @@ pub enum Error {
     HashSerialization(String),
     JSONSerialization(String),
     StorageBackend(String),
+    UploadBodyRead(String),
+    UploadBodySize { expected: u64, actual: u64 },
     InvalidFormat(String),
     UploadNotFound,
     BlobNotFound,
@@ -23,6 +25,13 @@ impl fmt::Display for Error {
             Error::HashSerialization(e) => write!(f, "Hash state management error: {e}"),
             Error::JSONSerialization(e) => write!(f, "JSON serialization error: {e}"),
             Error::StorageBackend(e) => write!(f, "Storage backend error: {e}"),
+            Error::UploadBodyRead(e) => write!(f, "Upload body read error: {e}"),
+            Error::UploadBodySize { expected, actual } => {
+                write!(
+                    f,
+                    "Upload body size mismatch: expected {expected} bytes, read {actual}"
+                )
+            }
             Error::InvalidFormat(e) => write!(f, "Reference format error: {e}"),
             Error::UploadNotFound => write!(f, "Upload not found"),
             Error::BlobNotFound => write!(f, "Blob not found"),
@@ -117,6 +126,20 @@ mod tests {
                 Error::StorageBackend("S3 connection failed".to_string())
             ),
             "Storage backend error: S3 connection failed"
+        );
+        assert_eq!(
+            format!("{}", Error::UploadBodyRead("connection reset".to_string())),
+            "Upload body read error: connection reset"
+        );
+        assert_eq!(
+            format!(
+                "{}",
+                Error::UploadBodySize {
+                    expected: 10,
+                    actual: 8
+                }
+            ),
+            "Upload body size mismatch: expected 10 bytes, read 8"
         );
         assert_eq!(
             format!("{}", Error::InvalidFormat("Bad UTF-8".to_string())),

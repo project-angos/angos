@@ -172,6 +172,38 @@ async fn test_zero_length_nonuniform_write_keeps_digest_and_size() {
 }
 
 #[tokio::test]
+async fn test_nonuniform_write_rejects_short_body() {
+    use crate::registry::blob_store::UploadStore;
+
+    let t = S3RegistryTestCase::new();
+    let store: &dyn UploadStore = t.blob_store();
+    let uuid = Uuid::new_v4().to_string();
+
+    store.create("ns", &uuid).await.unwrap();
+
+    let result = store
+        .write(
+            "ns",
+            &uuid,
+            Box::new(Cursor::new(vec![0xA5; 1024])),
+            6 * 1024 * 1024,
+            true,
+        )
+        .await;
+
+    assert!(matches!(
+        result,
+        Err(blob_store::Error::UploadBodySize {
+            expected: 6_291_456,
+            actual: 1024,
+        })
+    ));
+
+    let _ = store.delete("ns", &uuid).await;
+    t.cleanup().await;
+}
+
+#[tokio::test]
 async fn test_delete_prefix_removes_all_objects() {
     use crate::registry::blob_store::UploadStore;
 
