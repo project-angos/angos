@@ -11,6 +11,7 @@ use crate::{
     registry::metadata_store::{
         LinkOperation, MetadataStore,
         lock::{LockBackend, MemoryBackend},
+        lock_ops::LockOps,
     },
     secret::Secret,
 };
@@ -1215,7 +1216,8 @@ async fn test_lock_coordinator_blob_index_update_uses_blob_lock() {
     let digest =
         Digest::from_str("sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff")
             .unwrap();
-    let lock_key = format!("blob:{digest}");
+    let namespace = "locked-blob-index";
+    let lock_key = Backend::lock_key_for_blob_index(namespace, &digest);
     let guard = lock.acquire(&[lock_key]).await.unwrap();
 
     let task_backend = backend.clone();
@@ -1224,7 +1226,7 @@ async fn test_lock_coordinator_blob_index_update_uses_blob_lock() {
         coordinator
             .update_blob_index(
                 &task_backend,
-                "locked-blob-index",
+                namespace,
                 &task_digest,
                 BlobIndexOperation::Insert(LinkKind::Blob(task_digest.clone())),
             )
