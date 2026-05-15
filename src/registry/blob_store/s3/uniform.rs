@@ -227,6 +227,12 @@ impl Backend {
         content_length: u64,
         append: bool,
     ) -> Result<(Digest, u64), Error> {
+        if append && content_length == 0 {
+            let state = self.get_upload_state_uniform(name, uuid).await?;
+            let digest = self.load_hasher(name, uuid, state.size).await?.digest();
+            return Ok((digest, state.size));
+        }
+
         let upload_path = path_builder::upload_path(name, uuid);
 
         let (upload_id, part_list) = self
