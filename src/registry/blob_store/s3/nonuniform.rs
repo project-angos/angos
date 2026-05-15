@@ -9,7 +9,9 @@ use tokio::{
 use tokio_util::task::AbortOnDropHandle;
 use tracing::{error, instrument, warn};
 
-use super::{Backend, FRAME_SIZE, MIN_PART_SIZE, S3UploadState, UploadedPart};
+use super::{
+    Backend, FRAME_BUFFER_CAPACITY, FRAME_SIZE, MIN_PART_SIZE, S3UploadState, UploadedPart,
+};
 use crate::{
     oci::Digest,
     registry::{
@@ -124,7 +126,7 @@ impl Backend {
 
         let mut hashing_reader = HashingReader::with_hasher(combined, hasher);
 
-        let (tx, rx) = mpsc::channel::<Bytes>(32);
+        let (tx, rx) = mpsc::channel::<Bytes>(FRAME_BUFFER_CAPACITY);
 
         let store = self.store.clone();
         let upload_path_owned = ctx.upload_path.to_string();

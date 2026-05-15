@@ -16,7 +16,7 @@ use crate::{
         blob_store::{
             Error, UploadSummary,
             hashing_reader::HashingReader,
-            s3::{Backend, FRAME_SIZE, S3UploadState, UploadedPart},
+            s3::{Backend, FRAME_BUFFER_CAPACITY, FRAME_SIZE, S3UploadState, UploadedPart},
             sha256_ext::Sha256Ext,
         },
         path_builder,
@@ -118,7 +118,7 @@ impl Backend {
         ctx: ChunkContext<'_>,
         reader: &mut HashingReader<impl AsyncRead + Unpin + Send + Sync>,
     ) -> Result<(), Error> {
-        let (tx, rx) = mpsc::channel::<Bytes>(32);
+        let (tx, rx) = mpsc::channel::<Bytes>(FRAME_BUFFER_CAPACITY);
 
         let store = self.store.clone();
         let upload_path = ctx.upload_path.to_string();

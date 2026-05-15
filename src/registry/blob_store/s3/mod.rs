@@ -34,7 +34,8 @@ use crate::{
 };
 
 pub const MIN_PART_SIZE: u64 = 5 * 1024 * 1024;
-pub const FRAME_SIZE: usize = 256 * 1024;
+pub const FRAME_SIZE: usize = 1024 * 1024;
+pub const FRAME_BUFFER_CAPACITY: usize = 8;
 
 /// S3-internal upload state, cached between `write_upload` calls to avoid
 /// redundant round-trips to the S3 API.
