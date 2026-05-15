@@ -126,44 +126,44 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - variant: fs
-            description: filesystem backend
-            config: config-fs.toml
+          - variant: fs-memory-variable-parts
+            description: filesystem backend with memory lock and variable parts
+            config: config-fs-memory-variable-parts.toml
             minio: false
             redis: false
-          - variant: s3
-            description: s3 backend
-            config: config-s3.toml
+          - variant: s3-memory-variable-parts
+            description: s3 backend with memory lock and variable parts
+            config: config-s3-memory-variable-parts.toml
             minio: true
             redis: false
-          - variant: s3-lock
-            description: s3 backend with s3 lock, no cache
-            config: config-s3-lock.toml
+          - variant: s3-cas-variable-parts
+            description: s3 CAS backend with variable parts
+            config: config-s3-cas-variable-parts.toml
             minio: true
             redis: false
-          - variant: s3-redis
-            description: s3 backend with redis lock
-            config: config-s3-redis.toml
+          - variant: s3-redis-variable-parts
+            description: s3 backend with redis lock and variable parts
+            config: config-s3-redis-variable-parts.toml
             minio: true
             redis: true
-          - variant: s3-uniform
-            description: s3 backend with uniform parts
-            config: config-s3-uniform.toml
+          - variant: s3-memory-uniform-parts
+            description: s3 backend with memory lock and uniform parts
+            config: config-s3-memory-uniform-parts.toml
             minio: true
             redis: false
-          - variant: s3-lock-uniform
-            description: s3 backend with s3 lock, uniform parts
-            config: config-s3-lock-uniform.toml
+          - variant: s3-cas-uniform-parts
+            description: s3 CAS backend with uniform parts
+            config: config-s3-cas-uniform-parts.toml
             minio: true
             redis: false
-          - variant: s3-redis-uniform
+          - variant: s3-redis-uniform-parts
             description: s3 backend with redis lock, uniform parts
-            config: config-s3-redis-uniform.toml
+            config: config-s3-redis-uniform-parts.toml
             minio: true
             redis: true
-          - variant: fs-redis
-            description: filesystem backend with redis lock
-            config: config-fs-redis.toml
+          - variant: fs-redis-variable-parts
+            description: filesystem backend with redis lock and variable parts
+            config: config-fs-redis-variable-parts.toml
             minio: false
             redis: true
     steps:
