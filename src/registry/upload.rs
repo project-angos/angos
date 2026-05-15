@@ -1,7 +1,8 @@
 use std::collections::HashMap;
 
 use hyper::header::{CONTENT_LENGTH, LOCATION, RANGE};
-use tokio::io::AsyncRead;
+use sha2::{Digest as ShaDigest, Sha256};
+use tokio::io::{AsyncRead, AsyncReadExt};
 use tracing::{instrument, warn};
 use uuid::Uuid;
 
@@ -12,6 +13,7 @@ use crate::{
         DOCKER_CONTENT_DIGEST, DOCKER_UPLOAD_UUID, Error, Registry, blob_ownership::BlobOwnership,
         blob_store, metadata_store::Error as MetadataError,
     },
+    util::sha256::finalize_digest,
 };
 
 pub enum StartUploadResponse {
@@ -84,7 +86,125 @@ fn patch_upload_headers(
     headers
 }
 
+async fn hash_upload_stream<S>(mut stream: S, content_length: u64) -> Result<Digest, Error>
+where
+    S: AsyncRead + Unpin,
+{
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0_u8; 64 * 1024];
+    let mut read = 0_u64;
+
+    loop {
+        let bytes_read = stream
+            .read(&mut buffer)
+            .await
+            .map_err(|e| blob_store::Error::UploadBodyRead(e.to_string()))?;
+        if bytes_read == 0 {
+            break;
+        }
+
+        let bytes_read_u64 = u64::try_from(bytes_read).map_err(blob_store::Error::from)?;
+        read = read
+            .checked_add(bytes_read_u64)
+            .ok_or(blob_store::Error::UploadBodySize {
+                expected: content_length,
+                actual: u64::MAX,
+            })?;
+        if read > content_length {
+            return Err(blob_store::Error::UploadBodySize {
+                expected: content_length,
+                actual: read,
+            }
+            .into());
+        }
+
+        hasher.update(&buffer[..bytes_read]);
+    }
+
+    if read != content_length {
+        return Err(blob_store::Error::UploadBodySize {
+            expected: content_length,
+            actual: read,
+        }
+        .into());
+    }
+
+    Ok(finalize_digest(hasher))
+}
+
 impl Registry {
+    async fn complete_existing_upload<S>(
+        &self,
+        namespace: &Namespace,
+        digest: &Digest,
+        content_length: u64,
+        stream: &mut S,
+    ) -> Result<bool, Error>
+    where
+        S: AsyncRead + Unpin,
+    {
+        let guard = self.metadata_store.acquire_blob_data_lock(digest).await?;
+        let blob_exists = self.blob_store.size(digest).await.is_ok();
+
+        if !blob_exists {
+            let lock_valid = guard.is_valid();
+            guard.release().await;
+            if !lock_valid {
+                return Err(MetadataError::Lock(
+                    "lock invalidated during upload completion".into(),
+                )
+                .into());
+            }
+            return Ok(false);
+        }
+
+        let result = async {
+            let upload_digest = hash_upload_stream(stream, content_length).await?;
+            if &upload_digest != digest {
+                warn!("Expected digest '{digest}', got '{upload_digest}'");
+                return Err(Error::DigestInvalid);
+            }
+
+            BlobOwnership::new(self.metadata_store.as_ref())
+                .grant(namespace, digest)
+                .await
+        }
+        .await;
+        let lock_valid = guard.is_valid();
+        guard.release().await;
+
+        result?;
+        if !lock_valid {
+            return Err(
+                MetadataError::Lock("lock invalidated during upload completion".into()).into(),
+            );
+        }
+
+        Ok(true)
+    }
+
+    async fn finish_completed_upload(
+        &self,
+        actor: Option<EventActor>,
+        namespace: &Namespace,
+        session_key: &str,
+        digest: &Digest,
+    ) -> CompleteUploadResponse {
+        if let Err(error) = self.upload_store.delete(namespace, session_key).await {
+            warn!("Failed to delete completed upload state: {error}");
+        }
+
+        let repository = self.repository_name_for(namespace);
+        let event = Event::new(EventKind::BlobPush, namespace.to_string(), repository)
+            .digest(Some(digest.to_string()))
+            .actor(actor);
+
+        CompleteUploadResponse {
+            headers: blob_location_headers(namespace, digest),
+            events: vec![event],
+        }
+    }
+
     #[instrument]
     pub async fn start_upload(
         &self,
@@ -171,6 +291,17 @@ impl Registry {
             Err(e) => return Err(e.into()),
         };
 
+        let mut stream = stream;
+        if !append
+            && self
+                .complete_existing_upload(namespace, digest, content_length, &mut stream)
+                .await?
+        {
+            return Ok(self
+                .finish_completed_upload(actor, namespace, &session_key, digest)
+                .await);
+        }
+
         let (upload_digest, _) = self
             .upload_store
             .write(
@@ -214,19 +345,9 @@ impl Registry {
             );
         }
 
-        if let Err(error) = self.upload_store.delete(namespace, &session_key).await {
-            warn!("Failed to delete completed upload state: {error}");
-        }
-
-        let repository = self.repository_name_for(namespace);
-        let event = Event::new(EventKind::BlobPush, namespace.to_string(), repository)
-            .digest(Some(digest.to_string()))
-            .actor(actor);
-
-        Ok(CompleteUploadResponse {
-            headers: blob_location_headers(namespace, digest),
-            events: vec![event],
-        })
+        Ok(self
+            .finish_completed_upload(actor, namespace, &session_key, digest)
+            .await)
     }
 
     #[instrument]
@@ -286,6 +407,10 @@ mod tests {
     }
 
     struct CompleteFailingUploadStore {
+        inner: Arc<dyn UploadStore>,
+    }
+
+    struct WriteFailingUploadStore {
         inner: Arc<dyn UploadStore>,
     }
 
@@ -385,6 +510,58 @@ mod tests {
         ) -> Result<Digest, blob_store::Error> {
             Err(blob_store::Error::StorageBackend(
                 "complete should not be called for existing blob data".to_string(),
+            ))
+        }
+
+        async fn delete(&self, namespace: &str, uuid: &str) -> Result<(), blob_store::Error> {
+            self.inner.delete(namespace, uuid).await
+        }
+    }
+
+    #[async_trait]
+    impl UploadStore for WriteFailingUploadStore {
+        async fn list(
+            &self,
+            namespace: &str,
+            n: u16,
+            continuation_token: Option<String>,
+        ) -> Result<(Vec<String>, Option<String>), blob_store::Error> {
+            self.inner.list(namespace, n, continuation_token).await
+        }
+
+        async fn create(&self, namespace: &str, uuid: &str) -> Result<String, blob_store::Error> {
+            self.inner.create(namespace, uuid).await
+        }
+
+        async fn write(
+            &self,
+            _namespace: &str,
+            _uuid: &str,
+            _stream: BoxedReader,
+            _content_length: u64,
+            _append: bool,
+        ) -> Result<(Digest, u64), blob_store::Error> {
+            Err(blob_store::Error::StorageBackend(
+                "write should not be called for monolithic existing blob upload".to_string(),
+            ))
+        }
+
+        async fn summary(
+            &self,
+            namespace: &str,
+            uuid: &str,
+        ) -> Result<UploadSummary, blob_store::Error> {
+            self.inner.summary(namespace, uuid).await
+        }
+
+        async fn complete(
+            &self,
+            _namespace: &str,
+            _uuid: &str,
+            _digest: Option<&Digest>,
+        ) -> Result<Digest, blob_store::Error> {
+            Err(blob_store::Error::StorageBackend(
+                "complete should not be called for monolithic existing blob upload".to_string(),
             ))
         }
 
@@ -670,6 +847,63 @@ mod tests {
             .unwrap();
 
         assert_eq!(registry.blob_store.read(&digest).await.unwrap(), content);
+        assert!(
+            BlobOwnership::new(registry.metadata_store.as_ref())
+                .can_read(second_namespace, &digest)
+                .await
+                .unwrap()
+        );
+        assert!(
+            registry
+                .upload_store
+                .summary(second_namespace, &session_id.to_string())
+                .await
+                .is_err()
+        );
+
+        test_case.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn test_complete_upload_hashes_existing_blob_without_upload_storage_write() {
+        let test_case = FSRegistryTestCase::new();
+        let registry = create_test_registry(
+            RegistryTestCase::blob_store(&test_case),
+            Arc::new(WriteFailingUploadStore {
+                inner: test_case.upload_store(),
+            }),
+            None,
+            test_case.metadata_store(),
+        );
+        let first_namespace = &Namespace::new("test-repo/first").unwrap();
+        let second_namespace = &Namespace::new("test-repo/second").unwrap();
+        let content = b"shared monolithic upload content";
+        let digest = registry.blob_store.create(content).await.unwrap();
+
+        BlobOwnership::new(registry.metadata_store.as_ref())
+            .grant(first_namespace, &digest)
+            .await
+            .unwrap();
+
+        let session_id = Uuid::new_v4();
+        registry
+            .upload_store
+            .create(second_namespace, &session_id.to_string())
+            .await
+            .unwrap();
+
+        registry
+            .complete_upload(
+                None,
+                second_namespace,
+                session_id,
+                &digest,
+                content.len() as u64,
+                Cursor::new(content),
+            )
+            .await
+            .unwrap();
+
         assert!(
             BlobOwnership::new(registry.metadata_store.as_ref())
                 .can_read(second_namespace, &digest)
