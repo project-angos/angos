@@ -1,0 +1,24 @@
+[server]
+bind_address = "0.0.0.0"
+port = 8000
+
+[global]
+# 307 temporary redirections are not defined in the OCI spec, so zb don't (seems to) support 307 it.
+enable_blob_redirect = false
+enable_manifest_redirect = false
+
+[blob_store.s3]
+access_key_id = "root"
+secret_key = "roottoor"
+endpoint = "http://127.0.0.1:9000"
+bucket = "registry"
+region = "region"
+multipart_copy_threshold = "5GiB"
+multipart_copy_chunk_size = "100MiB"
+multipart_copy_jobs = 10
+multipart_uniform_parts = true
+
+[global.access_policy]
+default_allow = true
+
+[repository."conformance"]

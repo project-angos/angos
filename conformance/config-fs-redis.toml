@@ -1,0 +1,19 @@
+[server]
+bind_address = "0.0.0.0"
+port = 8000
+
+[blob_store.fs]
+root_dir = "./conformance/fs-redis-data"
+
+[metadata_store.fs]
+root_dir = "./conformance/fs-redis-data"
+
+[metadata_store.fs.lock_strategy.redis]
+url = "redis://127.0.0.1:6379"
+ttl = 30
+key_prefix = "angos-fs-redis-lock-"
+
+[global.access_policy]
+default_allow = true
+
+[repository."conformance"]
