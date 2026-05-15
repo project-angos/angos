@@ -165,9 +165,15 @@ impl Backend {
             }
             sent = new_sent;
             if tx.send(buf.split().freeze()).await.is_err() {
-                return Err(Error::StorageBackend(
-                    "upload task failed to receive data".to_string(),
-                ));
+                return match upload_handle.await {
+                    Ok(Ok(_etag)) => Err(Error::StorageBackend(
+                        "upload task stopped before receiving complete body".to_string(),
+                    )),
+                    Ok(Err(error)) => Err(error.into()),
+                    Err(join_error) => Err(self
+                        .handle_nonuniform_upload_task_failure(name, uuid, &ctx, join_error)
+                        .await),
+                };
             }
         }
         drop(tx);

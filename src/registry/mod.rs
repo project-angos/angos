@@ -51,7 +51,7 @@ use crate::{
     registry::{
         blob_ownership::BlobOwnership,
         blob_store::{BlobStore, Error as BlobStoreError, PresignedBlobStore, UploadStore},
-        metadata_store::MetadataStore,
+        metadata_store::{Error as MetadataError, MetadataStore},
         task_queue::TaskQueue,
     },
 };
@@ -209,6 +209,22 @@ impl Registry {
     }
 
     async fn delete_blob_data_if_unreferenced(&self, digest: &Digest) -> Result<(), Error> {
+        let guard = self.metadata_store.acquire_blob_data_lock(digest).await?;
+        let result = self.delete_blob_data_if_unreferenced_locked(digest).await;
+        let lock_valid = guard.is_valid();
+        guard.release().await;
+
+        result?;
+        if !lock_valid {
+            return Err(
+                MetadataError::Lock("lock invalidated during blob data deletion".into()).into(),
+            );
+        }
+
+        Ok(())
+    }
+
+    async fn delete_blob_data_if_unreferenced_locked(&self, digest: &Digest) -> Result<(), Error> {
         let ownership = BlobOwnership::new(self.metadata_store.as_ref());
         if ownership.has_any_reference(digest).await? {
             return Ok(());

@@ -13,7 +13,7 @@ use crate::{
             BlobIndex, BlobIndexOperation, Error, LinkMetadata, LinkOperation, LockConfig,
             LockStrategy, MetadataStore,
             link_kind::LinkKind,
-            lock::{self, LockBackend, MemoryBackend},
+            lock::{self, LockBackend, LockGuard, MemoryBackend},
             lock_ops::LockOps,
             referrer_resolver::resolve_referrer_descriptor,
             transaction,
@@ -303,6 +303,10 @@ impl MetadataStore for Backend {
         }
 
         Ok(())
+    }
+
+    async fn acquire_blob_data_lock(&self, digest: &Digest) -> Result<LockGuard, Error> {
+        self.lock.acquire(&[format!("blob-data:{digest}")]).await
     }
 
     #[instrument(skip(self))]

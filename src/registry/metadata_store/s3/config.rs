@@ -26,8 +26,10 @@ pub struct BackendConfig {
     /// - `delete_if_match`: `DeleteObject` with If-Match: <etag> (atomic lock release)
     ///
     /// When set, the startup probe is skipped entirely and your declared values are used.
-    /// When absent, the probe runs automatically if `lock_strategy = "s3"` to auto-detect
-    /// capabilities (and capabilities default to all-false for other lock strategies).
+    /// When absent, the probe runs automatically for S3 metadata storage to auto-detect
+    /// capabilities. With `lock_strategy = "memory"` or `"redis"`, set every flag to
+    /// `false` to skip the probe and force blob-index updates through the configured
+    /// lock backend instead of S3 CAS.
     ///
     /// Set explicitly to avoid startup latency from probing, or to handle S3-compatible
     /// providers where probe results may be inaccurate. Both `put_if_none_match` and

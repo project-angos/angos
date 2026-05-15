@@ -1164,6 +1164,48 @@ async fn test_probe_idempotent_back_to_back() {
 }
 
 #[tokio::test]
+async fn test_has_blob_references_ignores_empty_cas_shards() {
+    let config = test_config();
+    let backend = Backend::new(
+        &config,
+        Some(ConditionalCapabilities {
+            put_if_none_match: true,
+            put_if_match: true,
+            delete_if_match: false,
+        }),
+    )
+    .unwrap();
+
+    let digest =
+        Digest::from_str("sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee")
+            .unwrap();
+    let link = LinkKind::Blob(digest.clone());
+
+    backend
+        .update_blob_index_cas(
+            "empty-cas-shard",
+            &digest,
+            &[
+                BlobIndexOperation::Insert(link.clone()),
+                BlobIndexOperation::Remove(link),
+            ],
+        )
+        .await
+        .unwrap();
+
+    assert!(
+        !backend.has_blob_references_impl(&digest).await.unwrap(),
+        "empty CAS shards must not keep blob data alive"
+    );
+
+    backend
+        .store
+        .delete_prefix(&config.key_prefix)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
 async fn test_lock_coordinator_blob_index_update_uses_blob_lock() {
     let config = test_config();
     let backend = Backend::new(&config, None).unwrap();

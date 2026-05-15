@@ -246,7 +246,11 @@ impl S3RegistryTestCase {
                     access_time_debounce_secs: 0,
                     capabilities: None,
                 },
-                None,
+                Some(metadata_store::ConditionalCapabilities {
+                    put_if_none_match: true,
+                    put_if_match: true,
+                    delete_if_match: false,
+                }),
             )
             .unwrap(),
         );

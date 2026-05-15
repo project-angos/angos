@@ -17,6 +17,7 @@ pub fn error_to_response(error: &Error, request_id: Option<&String>) -> Response
         .header(CONTENT_TYPE, "application/json")
         .body(ResponseBody::Fixed(Full::new(body)))
         .unwrap_or_else(|_| fallback_500());
+    response.extensions_mut().insert(error.to_string());
 
     if matches!(error, Error::Unauthorized(_)) {
         response.headers_mut().insert(

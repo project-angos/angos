@@ -14,7 +14,7 @@ use crate::{
         DOCKER_CONTENT_DIGEST, Error, Registry, Repository,
         blob_ownership::BlobOwnership,
         blob_store::{BoxedReader, UploadStore},
-        metadata_store::{MetadataStore, link_kind::LinkKind},
+        metadata_store::{Error as MetadataError, MetadataStore, link_kind::LinkKind},
         task_queue,
     },
 };
@@ -321,22 +321,33 @@ impl Registry {
 
     #[instrument]
     pub async fn delete_blob(&self, namespace: &Namespace, digest: &Digest) -> Result<(), Error> {
-        let ownership = BlobOwnership::new(self.metadata_store.as_ref());
-        let links = ownership.references(namespace, digest).await?;
+        let guard = self.metadata_store.acquire_blob_data_lock(digest).await?;
+        let result = async {
+            let ownership = BlobOwnership::new(self.metadata_store.as_ref());
+            let links = ownership.references(namespace, digest).await?;
 
-        if links.is_empty() {
-            return Err(Error::BlobUnknown);
+            if links.is_empty() {
+                return Err(Error::BlobUnknown);
+            }
+
+            if has_non_ownership_reference(&links, digest) {
+                return Err(Error::BlobReferenced);
+            }
+
+            ownership
+                .revoke(namespace, digest, LinkKind::Blob(digest.clone()))
+                .await?;
+
+            self.delete_blob_data_if_unreferenced_locked(digest).await
         }
+        .await;
+        let lock_valid = guard.is_valid();
+        guard.release().await;
 
-        if has_non_ownership_reference(&links, digest) {
-            return Err(Error::BlobReferenced);
+        result?;
+        if !lock_valid {
+            return Err(MetadataError::Lock("lock invalidated during blob deletion".into()).into());
         }
-
-        ownership
-            .revoke(namespace, digest, LinkKind::Blob(digest.clone()))
-            .await?;
-
-        self.delete_blob_data_if_unreferenced(digest).await?;
 
         Ok(())
     }
@@ -382,7 +393,7 @@ impl Registry {
 
 #[cfg(test)]
 mod tests {
-    use std::io::Cursor;
+    use std::{io::Cursor, time::Duration};
 
     use hyper::header::{ACCEPT_RANGES, CONTENT_LENGTH, CONTENT_RANGE, LOCATION};
     use tokio::io::AsyncReadExt;
@@ -652,6 +663,45 @@ mod tests {
             registry.delete_blob(second, &digest).await.unwrap();
 
             assert!(registry.blob_store.read(&digest).await.is_err());
+            test_case.cleanup().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn delete_blob_waits_for_blob_data_lock_before_reclaiming_data() {
+        for test_case in backends() {
+            let registry = test_case.registry();
+            let first = &Namespace::new("test-repo/first").unwrap();
+            let second = &Namespace::new("test-repo/second").unwrap();
+            let content = b"shared blob content";
+            let digest = registry.blob_store.create(content).await.unwrap();
+            let ownership = BlobOwnership::new(registry.metadata_store.as_ref());
+
+            ownership.grant(first, &digest).await.unwrap();
+
+            let guard = registry
+                .metadata_store
+                .acquire_blob_data_lock(&digest)
+                .await
+                .unwrap();
+            let delete = registry.delete_blob(first, &digest);
+            tokio::pin!(delete);
+
+            tokio::select! {
+                result = &mut delete => {
+                    panic!("delete completed while blob data lock was held: {result:?}");
+                }
+                () = tokio::time::sleep(Duration::from_millis(25)) => {}
+            }
+
+            ownership.grant(second, &digest).await.unwrap();
+            guard.release().await;
+            delete.await.unwrap();
+
+            assert_eq!(registry.blob_store.read(&digest).await.unwrap(), content);
+            assert!(!ownership.can_read(first, &digest).await.unwrap());
+            assert!(ownership.can_read(second, &digest).await.unwrap());
+
             test_case.cleanup().await;
         }
     }

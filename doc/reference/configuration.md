@@ -189,7 +189,7 @@ The link cache reduces S3 round-trips for repeated tag/layer reads. The access t
 
 #### Conditional Capabilities (`metadata_store.s3.capabilities`)
 
-When using S3 as the metadata store, you can declare which conditional write operations your S3-compatible provider supports. This avoids a startup probe and allows optimization of certain operations.
+When using S3 as the metadata store, you can declare which conditional write operations your S3-compatible provider supports. This avoids a startup probe and allows Angos to use optimistic blob-index updates when the provider supports them.
 
 | Option              | Type | Default | Description                                                                                                 |
 |---------------------|------|---------|-------------------------------------------------------------------------------------------------------------|
@@ -198,9 +198,11 @@ When using S3 as the metadata store, you can declare which conditional write ope
 | `delete_if_match`   | bool | -       | S3 supports `DeleteObject` with `If-Match: <etag>` (conditional delete, reject if ETag mismatch)          |
 
 **Probe behavior:**
-- The probe runs only when `lock_strategy = "s3"` (the only strategy that depends on conditional ops). For `lock_strategy = "memory"` or `"redis"`, no probe runs and `capabilities` is unused.
+- The probe runs for S3 metadata storage when `capabilities` is omitted.
 - When `capabilities` is explicitly configured for an `s3` lock strategy, the startup probe is skipped. Declared values are validated against the lock strategy's requirements (`put_if_none_match` and `put_if_match`).
-- When `capabilities` is omitted for an `s3` lock strategy, the probe runs at startup (and on each config reload that has no cached value); probed values are cached for subsequent reloads.
+- When `capabilities` is omitted, the probe runs at startup (and on each config reload that has no cached value); probed values are cached for subsequent reloads.
+- With `lock_strategy = "memory"` or `"redis"`, detected conditional writes are used only for blob-index shard updates. Link updates still use the configured lock backend.
+- To avoid S3 CAS entirely with `lock_strategy = "memory"` or `"redis"`, explicitly set all three capability flags to `false`.
 
 **Example with explicit capabilities (AWS S3):**
 ```toml
@@ -210,7 +212,7 @@ put_if_match = true
 delete_if_match = true
 ```
 
-**Example with explicit capabilities (minimal, memory locking):**
+**Example disabling S3 CAS with memory locking:**
 ```toml
 [metadata_store.s3]
 lock_strategy = "memory"
@@ -231,7 +233,8 @@ delete_if_match = false
 - `lock_strategy` selects the coordinator: `"s3"` selects the CAS coordinator (which uses S3 conditional writes for all coordination); `"redis"` and `"memory"` select the lock coordinator with the corresponding lock backend.
 - The CAS coordinator requires `put_if_none_match` and `put_if_match` from the provider; startup fails if either is missing under `lock_strategy = "s3"`.
 - `delete_if_match` is optional within the CAS coordinator. When available, its internal S3 lock uses race-free conditional release. When absent, release falls back to plain delete (functional but race-prone under contention).
-- Capabilities are not consulted under `lock_strategy = "memory"` or `"redis"`, the lock coordinator runs entirely on the configured lock backend.
+- Under `lock_strategy = "memory"` or `"redis"`, `put_if_none_match` and `put_if_match` let Angos update blob-index shards with optimistic concurrency while the lock coordinator still protects link metadata.
+- Declaring all capability flags as `false` keeps blob-index updates on the configured lock backend. This is valid for `lock_strategy = "memory"` or `"redis"`, but not for `lock_strategy = "s3"`.
 
 > **Warning:** Setting `access_time_debounce_secs = 0` with S3 lock strategy causes every manifest pull to perform a full lock-acquire → read → write → release cycle via S3 API. At scale with many concurrent pulls, this adds significant latency and S3 API costs. Keep the default value of 60 or higher for S3-locked deployments, or disable access time tracking entirely if not needed for retention policies.
 
@@ -247,7 +250,7 @@ Multi-replica deployments require a distributed lock backend. The `lock_strategy
 | redis | Yes | Yes |
 | s3 | Yes | No |
 
-> **Note:** `lock_strategy = "s3"` selects the CAS-based coordinator and requires the provider to support `put_if_none_match` and `put_if_match`; startup fails fast if either is missing. `lock_strategy = "memory"` and `"redis"` select the lock coordinator and do not depend on conditional capabilities.
+> **Note:** `lock_strategy = "s3"` selects the CAS-based coordinator and requires the provider to support `put_if_none_match` and `put_if_match`; startup fails fast if either is missing. `lock_strategy = "memory"` and `"redis"` select the lock coordinator, but Angos still uses conditional writes for blob-index shard updates when available.
 
 **Memory** (default) — in-process locks, suitable for single-instance deployments only:
 

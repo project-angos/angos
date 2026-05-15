@@ -140,9 +140,39 @@ impl Backend {
             }
             sent += u64::try_from(n)?;
             if tx.send(buf.split().freeze()).await.is_err() {
-                return Err(Error::StorageBackend(
-                    "upload task failed to receive data".to_string(),
-                ));
+                return match upload_handle.await {
+                    Ok(Ok(_etag)) => Err(Error::StorageBackend(
+                        "upload task stopped before receiving complete body".to_string(),
+                    )),
+                    Ok(Err(error)) => Err(error.into()),
+                    Err(join_error) => {
+                        let kind = if join_error.is_panic() {
+                            "panicked"
+                        } else if join_error.is_cancelled() {
+                            "was cancelled"
+                        } else {
+                            "failed unexpectedly"
+                        };
+                        error!(
+                            "uniform upload task {kind} for '{name}/{uuid}'; aborting multipart upload {upload_id}: {join_error}",
+                            upload_id = ctx.upload_id,
+                        );
+                        if let Err(abort_err) = self
+                            .store
+                            .abort_multipart_upload(ctx.upload_path, ctx.upload_id)
+                            .await
+                        {
+                            warn!(
+                                "abort_multipart_upload failed during cleanup of '{name}/{uuid}': {abort_err}"
+                            );
+                        }
+                        self.evict_upload_id(ctx.upload_path).await;
+                        self.evict_upload_state(name, uuid).await;
+                        Err(Error::StorageBackend(format!(
+                            "upload task {kind}: {join_error}"
+                        )))
+                    }
+                };
             }
         }
 

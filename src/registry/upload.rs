@@ -10,7 +10,7 @@ use crate::{
     oci::{Digest, Namespace},
     registry::{
         DOCKER_CONTENT_DIGEST, DOCKER_UPLOAD_UUID, Error, Registry, blob_ownership::BlobOwnership,
-        blob_store,
+        blob_store, metadata_store::Error as MetadataError,
     },
 };
 
@@ -187,12 +187,25 @@ impl Registry {
             return Err(Error::DigestInvalid);
         }
 
-        self.upload_store
-            .complete(namespace, &session_key, Some(digest))
-            .await?;
-        BlobOwnership::new(self.metadata_store.as_ref())
-            .grant(namespace, digest)
-            .await?;
+        let guard = self.metadata_store.acquire_blob_data_lock(digest).await?;
+        let result = async {
+            self.upload_store
+                .complete(namespace, &session_key, Some(digest))
+                .await?;
+            BlobOwnership::new(self.metadata_store.as_ref())
+                .grant(namespace, digest)
+                .await
+        }
+        .await;
+        let lock_valid = guard.is_valid();
+        guard.release().await;
+
+        result?;
+        if !lock_valid {
+            return Err(
+                MetadataError::Lock("lock invalidated during upload completion".into()).into(),
+            );
+        }
 
         if let Err(error) = self.upload_store.delete(namespace, &session_key).await {
             warn!("Failed to delete completed upload state: {error}");

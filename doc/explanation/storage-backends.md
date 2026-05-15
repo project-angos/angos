@@ -225,7 +225,7 @@ retry_delay_ms = 50    # Delay between retries (default: 50)
 
 ### With S3 + Redis
 
-Selecting `lock_strategy = "redis"` activates the lock coordinator with Redis as the distributed lock backend. The S3 provider's conditional capabilities are not consulted in this mode — Redis handles all serialization regardless of what the provider supports.
+Selecting `lock_strategy = "redis"` activates the lock coordinator with Redis as the distributed lock backend. When the S3 provider supports conditional writes, Angos still uses them for blob-index shard updates; Redis remains responsible for link metadata serialization. To force all metadata write coordination through Redis, explicitly set every `[metadata_store.s3.capabilities]` flag to `false`.
 
 ```toml
 [blob_store.s3]

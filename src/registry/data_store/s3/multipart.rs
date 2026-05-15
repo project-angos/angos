@@ -11,7 +11,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
-use super::{Backend, channel_body::ChannelBody};
+use super::{Backend, channel_body::ChannelBody, s3_error_message};
 
 /// A single part that has been successfully uploaded as part of a multipart upload.
 ///
@@ -45,7 +45,7 @@ impl Backend {
             .key(&key)
             .send()
             .await
-            .map_err(|e| IoError::other(e.to_string()))?;
+            .map_err(|e| IoError::other(s3_error_message(&e.into_service_error())))?;
 
         res.upload_id
             .ok_or_else(|| IoError::other("upload_id not found in response"))
@@ -71,7 +71,7 @@ impl Backend {
             .body(ByteStream::from(body))
             .send()
             .await
-            .map_err(|e| IoError::other(e.to_string()))?;
+            .map_err(|e| IoError::other(s3_error_message(&e.into_service_error())))?;
 
         Ok(res.e_tag.unwrap_or_default())
     }
@@ -104,7 +104,7 @@ impl Backend {
         let response = req
             .send()
             .await
-            .map_err(|e| IoError::other(e.to_string()))?;
+            .map_err(|e| IoError::other(s3_error_message(&e.into_service_error())))?;
 
         response
             .copy_part_result
@@ -146,7 +146,7 @@ impl Backend {
             .multipart_upload(completed)
             .send()
             .await
-            .map_err(|e| IoError::other(e.to_string()))?;
+            .map_err(|e| IoError::other(s3_error_message(&e.into_service_error())))?;
 
         Ok(())
     }
@@ -178,7 +178,7 @@ impl Backend {
             .body(body)
             .send()
             .await
-            .map_err(|e| IoError::other(e.to_string()))?;
+            .map_err(|e| IoError::other(s3_error_message(&e.into_service_error())))?;
 
         Ok(res.e_tag.unwrap_or_default())
     }
@@ -193,7 +193,7 @@ impl Backend {
             .upload_id(upload_id)
             .send()
             .await
-            .map_err(|e| IoError::other(e.to_string()))?;
+            .map_err(|e| IoError::other(s3_error_message(&e.into_service_error())))?;
 
         Ok(())
     }
@@ -219,7 +219,7 @@ impl Backend {
         let response = req
             .send()
             .await
-            .map_err(|e| IoError::other(e.to_string()))?;
+            .map_err(|e| IoError::other(s3_error_message(&e.into_service_error())))?;
 
         let mut uploads = Vec::new();
         for upload in response.uploads.unwrap_or_default() {
@@ -311,7 +311,7 @@ impl Backend {
             let response = req
                 .send()
                 .await
-                .map_err(|e| IoError::other(e.to_string()))?;
+                .map_err(|e| IoError::other(s3_error_message(&e.into_service_error())))?;
 
             for part in response.parts.unwrap_or_default() {
                 if let (Some(part_number), Some(e_tag), Some(size)) =

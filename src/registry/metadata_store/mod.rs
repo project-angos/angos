@@ -29,7 +29,7 @@ pub use blob_index::{BlobIndex, BlobIndexOperation};
 pub use capabilities::ConditionalCapabilities;
 pub use config::MetadataStoreConfig;
 pub use link_metadata::LinkMetadata;
-pub use lock::{LockStrategy, redis::LockConfig};
+pub use lock::{LockGuard, LockStrategy, redis::LockConfig};
 pub use transaction::{LinkOperation, ResolvedCreate, ResolvedDelete, Transaction};
 
 use crate::registry::metadata_store::link_kind::LinkKind;
@@ -123,6 +123,8 @@ pub trait MetadataStore: Send + Sync {
         digest: &Digest,
         operation: BlobIndexOperation,
     ) -> Result<(), Error>;
+
+    async fn acquire_blob_data_lock(&self, digest: &Digest) -> Result<LockGuard, Error>;
 
     async fn read_link(
         &self,

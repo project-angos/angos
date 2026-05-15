@@ -219,20 +219,48 @@ impl Backend {
 
     pub async fn has_blob_references_impl(&self, digest: &Digest) -> Result<bool, Error> {
         let refs_dir = path_builder::blob_index_refs_dir(digest);
-        let (_, objects, _) = self
-            .store
-            .list_prefixes(&refs_dir, "/", 1, None, None)
-            .await?;
+        let mut found_shards = false;
+        let mut continuation_token = None;
 
-        if !objects.is_empty() {
-            return Ok(true);
+        loop {
+            let (_, objects, next_token) = self
+                .store
+                .list_prefixes(&refs_dir, "/", 1000, continuation_token, None)
+                .await?;
+
+            if !objects.is_empty() {
+                found_shards = true;
+            }
+
+            for object in objects {
+                let shard_path = format!("{refs_dir}/{object}");
+                match self.store.read(&shard_path).await {
+                    Ok(data) => {
+                        let links = serde_json::from_slice::<HashSet<LinkKind>>(&data)?;
+                        if !links.is_empty() {
+                            return Ok(true);
+                        }
+                    }
+                    Err(e) if e.kind() == ErrorKind::NotFound => {}
+                    Err(e) => return Err(e.into()),
+                }
+            }
+
+            continuation_token = next_token;
+            if continuation_token.is_none() {
+                break;
+            }
+        }
+
+        if found_shards {
+            return Ok(false);
         }
 
         let legacy_path = path_builder::blob_index_path(digest);
         match self.store.read(&legacy_path).await {
             Ok(data) => {
                 let blob_index: BlobIndex = serde_json::from_slice(&data)?;
-                Ok(!blob_index.namespace.is_empty())
+                Ok(blob_index.namespace.values().any(|links| !links.is_empty()))
             }
             Err(e) if e.kind() == ErrorKind::NotFound => Ok(false),
             Err(e) => Err(e.into()),
