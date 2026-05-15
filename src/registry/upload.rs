@@ -189,9 +189,16 @@ impl Registry {
 
         let guard = self.metadata_store.acquire_blob_data_lock(digest).await?;
         let result = async {
-            self.upload_store
-                .complete(namespace, &session_key, Some(digest))
-                .await?;
+            match self.blob_store.size(digest).await {
+                Ok(_) => {}
+                Err(blob_store::Error::BlobNotFound | blob_store::Error::ReferenceNotFound) => {
+                    self.upload_store
+                        .complete(namespace, &session_key, Some(digest))
+                        .await?;
+                }
+                Err(error) => return Err(Error::from(error)),
+            }
+
             BlobOwnership::new(self.metadata_store.as_ref())
                 .grant(namespace, digest)
                 .await
@@ -278,6 +285,10 @@ mod tests {
         inner: Arc<dyn UploadStore>,
     }
 
+    struct CompleteFailingUploadStore {
+        inner: Arc<dyn UploadStore>,
+    }
+
     #[async_trait]
     impl UploadStore for DeleteFailingUploadStore {
         async fn list(
@@ -327,6 +338,58 @@ mod tests {
             Err(blob_store::Error::StorageBackend(
                 "delete failed".to_string(),
             ))
+        }
+    }
+
+    #[async_trait]
+    impl UploadStore for CompleteFailingUploadStore {
+        async fn list(
+            &self,
+            namespace: &str,
+            n: u16,
+            continuation_token: Option<String>,
+        ) -> Result<(Vec<String>, Option<String>), blob_store::Error> {
+            self.inner.list(namespace, n, continuation_token).await
+        }
+
+        async fn create(&self, namespace: &str, uuid: &str) -> Result<String, blob_store::Error> {
+            self.inner.create(namespace, uuid).await
+        }
+
+        async fn write(
+            &self,
+            namespace: &str,
+            uuid: &str,
+            stream: BoxedReader,
+            content_length: u64,
+            append: bool,
+        ) -> Result<(Digest, u64), blob_store::Error> {
+            self.inner
+                .write(namespace, uuid, stream, content_length, append)
+                .await
+        }
+
+        async fn summary(
+            &self,
+            namespace: &str,
+            uuid: &str,
+        ) -> Result<UploadSummary, blob_store::Error> {
+            self.inner.summary(namespace, uuid).await
+        }
+
+        async fn complete(
+            &self,
+            _namespace: &str,
+            _uuid: &str,
+            _digest: Option<&Digest>,
+        ) -> Result<Digest, blob_store::Error> {
+            Err(blob_store::Error::StorageBackend(
+                "complete should not be called for existing blob data".to_string(),
+            ))
+        }
+
+        async fn delete(&self, namespace: &str, uuid: &str) -> Result<(), blob_store::Error> {
+            self.inner.delete(namespace, uuid).await
         }
     }
 
@@ -554,6 +617,74 @@ mod tests {
             registry.blob_store.read(&expected_digest).await.unwrap(),
             content
         );
+    }
+
+    #[tokio::test]
+    async fn test_complete_upload_reuses_existing_blob_data() {
+        let test_case = FSRegistryTestCase::new();
+        let registry = create_test_registry(
+            RegistryTestCase::blob_store(&test_case),
+            Arc::new(CompleteFailingUploadStore {
+                inner: test_case.upload_store(),
+            }),
+            None,
+            test_case.metadata_store(),
+        );
+        let first_namespace = &Namespace::new("test-repo/first").unwrap();
+        let second_namespace = &Namespace::new("test-repo/second").unwrap();
+        let content = b"shared upload content";
+        let digest = registry.blob_store.create(content).await.unwrap();
+
+        BlobOwnership::new(registry.metadata_store.as_ref())
+            .grant(first_namespace, &digest)
+            .await
+            .unwrap();
+
+        let session_id = Uuid::new_v4();
+        registry
+            .upload_store
+            .create(second_namespace, &session_id.to_string())
+            .await
+            .unwrap();
+        registry
+            .patch_upload(
+                second_namespace,
+                session_id,
+                None,
+                content.len() as u64,
+                Cursor::new(content),
+            )
+            .await
+            .unwrap();
+
+        registry
+            .complete_upload(
+                None,
+                second_namespace,
+                session_id,
+                &digest,
+                0,
+                Cursor::new(Vec::new()),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(registry.blob_store.read(&digest).await.unwrap(), content);
+        assert!(
+            BlobOwnership::new(registry.metadata_store.as_ref())
+                .can_read(second_namespace, &digest)
+                .await
+                .unwrap()
+        );
+        assert!(
+            registry
+                .upload_store
+                .summary(second_namespace, &session_id.to_string())
+                .await
+                .is_err()
+        );
+
+        test_case.cleanup().await;
     }
 
     #[tokio::test]
