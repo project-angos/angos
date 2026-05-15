@@ -12,9 +12,12 @@ use crate::{
     registry::metadata_store::{
         Error,
         lock::{LockBackend, LockGuard, metrics::lock_metrics},
+        simple_jitter,
     },
     timing::elapsed_ms,
 };
+
+const MAX_RETRY_DELAY_MS: u64 = 1000;
 
 // ARGV[1] = instance_id, ARGV[2] = ttl
 const ACQUIRE_SCRIPT: &str = r"
@@ -135,6 +138,13 @@ impl RedisBackend {
 
         (handle, stop_notify)
     }
+
+    fn retry_delay(&self, attempt: u32) -> Duration {
+        let base_ms = self.retry_delay_ms.saturating_mul(1u64 << attempt.min(6));
+        let capped_ms = base_ms.min(MAX_RETRY_DELAY_MS);
+        let jitter = simple_jitter(capped_ms / 2);
+        Duration::from_millis(capped_ms.saturating_add(jitter))
+    }
 }
 
 pub struct RedisGuard {
@@ -179,7 +189,6 @@ impl LockBackend for RedisBackend {
             .map(|k| format!("{}{}", self.key_prefix, k))
             .collect();
         let mut retries = self.max_retries;
-        let retry_delay = Duration::from_millis(self.retry_delay_ms);
 
         loop {
             let mut conn = self
@@ -250,9 +259,10 @@ impl LockBackend for RedisBackend {
             }
 
             retries -= 1;
+            let attempt = self.max_retries - retries;
             lock_metrics().retries.with_label_values(&["redis"]).inc();
             debug!("Lock busy, retrying... ({} attempts left)", retries);
-            tokio::time::sleep(retry_delay).await;
+            tokio::time::sleep(self.retry_delay(attempt)).await;
         }
     }
 }

@@ -265,7 +265,7 @@ url = "redis://redis:6379"
 ttl = 10                    # Lock timeout in seconds
 key_prefix = "locks"        # Optional prefix
 max_retries = 100           # Retry attempts
-retry_delay_ms = 10         # Delay between retries
+retry_delay_ms = 10         # Initial retry delay; retries back off up to 1s with jitter
 ```
 
 **Legacy form:** The `[metadata_store.*.redis]` table (e.g., `[metadata_store.fs.redis]`) is still accepted for backward compatibility and is equivalent to `[metadata_store.*.lock_strategy.redis]`. New configurations should use the `lock_strategy` form.

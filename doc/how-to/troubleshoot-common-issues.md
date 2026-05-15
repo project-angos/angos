@@ -273,8 +273,9 @@ sudo chown -R $(id -u):$(id -g) /data/registry
    ttl = 10
    ```
 
-2. Increase TTL if operations take longer
-3. Check for stuck processes
+2. For high contention, increase `max_retries` and `retry_delay_ms`. Redis retries use exponential backoff capped at 1s, plus jitter.
+3. Increase TTL if operations take longer
+4. Check for stuck processes
 
 **Solutions for S3 locking**:
 1. Stale locks under the `_locks/` prefix are automatically recovered after TTL expiry

@@ -8,6 +8,8 @@ use crate::{
     registry::metadata_store::lock::{LockBackend, RedisBackend, redis::LockConfig},
 };
 
+use super::MAX_RETRY_DELAY_MS;
+
 const REDIS_URL: &str = "redis://localhost:6379/2";
 
 fn make_config(prefix: &str) -> LockConfig {
@@ -315,4 +317,64 @@ async fn test_stress_100_locks_no_resource_leak() {
         remaining, 0,
         "All Redis keys must be cleaned up after 100 sequential acquire-drop cycles"
     );
+}
+
+#[tokio::test]
+async fn test_default_retry_budget_waits_past_short_contention() {
+    metrics_provider::init_for_tests();
+    let id = Uuid::new_v4().to_string();
+    let prefix = format!("test_default_retry_budget_{id}_");
+    let config = LockConfig {
+        url: REDIS_URL.to_owned(),
+        ttl: 5,
+        key_prefix: prefix,
+        ..LockConfig::default()
+    };
+
+    let backend = RedisBackend::new(&config).expect("Failed to create RedisBackend");
+    let contending_backend = RedisBackend::new(&config).expect("Failed to create RedisBackend");
+    let key = "shared".to_string();
+
+    let guard = backend
+        .acquire(std::slice::from_ref(&key))
+        .await
+        .expect("Failed to acquire initial lock");
+
+    let waiter = tokio::spawn(async move { contending_backend.acquire(&[key]).await });
+
+    tokio::time::sleep(Duration::from_millis(1_200)).await;
+    guard.release().await;
+
+    let reacquired = waiter
+        .await
+        .expect("waiter task panicked")
+        .expect("contended lock should be acquired after release");
+    reacquired.release().await;
+}
+
+#[test]
+fn test_retry_delay_uses_capped_exponential_backoff_with_jitter() {
+    let config = LockConfig {
+        url: REDIS_URL.to_owned(),
+        ttl: 30,
+        key_prefix: "test_retry_delay_".to_owned(),
+        max_retries: 100,
+        retry_delay_ms: 10,
+    };
+    let backend = RedisBackend::new(&config).expect("Failed to create RedisBackend");
+
+    let first = backend.retry_delay(0).as_millis();
+    assert!((10..15).contains(&first));
+
+    let sixth = backend.retry_delay(6).as_millis();
+    assert!((640..960).contains(&sixth));
+
+    let config = LockConfig {
+        retry_delay_ms: 50,
+        ..config
+    };
+    let backend = RedisBackend::new(&config).expect("Failed to create RedisBackend");
+    let capped = backend.retry_delay(6).as_millis();
+    let max = u128::from(MAX_RETRY_DELAY_MS + MAX_RETRY_DELAY_MS / 2);
+    assert!((u128::from(MAX_RETRY_DELAY_MS)..max).contains(&capped));
 }

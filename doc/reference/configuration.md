@@ -308,7 +308,7 @@ ttl = 10
 | `ttl`            | usize  | required | Lock TTL in seconds          |
 | `key_prefix`     | string | -        | Prefix for lock keys         |
 | `max_retries`    | u32    | `100`    | Max lock acquisition retries |
-| `retry_delay_ms` | u64    | `10`     | Delay between retries        |
+| `retry_delay_ms` | u64    | `10`     | Initial retry delay in milliseconds. Retries use exponential backoff capped at 1s, plus jitter |
 
 > **Legacy form:** The `[metadata_store.*.redis]` table (e.g., `[metadata_store.s3.redis]`) is still accepted for backward compatibility and is equivalent to `[metadata_store.*.lock_strategy.redis]`. New configurations should use the `lock_strategy` form. Both forms cannot be set simultaneously.
 
