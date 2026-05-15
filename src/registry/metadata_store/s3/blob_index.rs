@@ -225,7 +225,7 @@ impl Backend {
         loop {
             let (_, objects, next_token) = self
                 .store
-                .list_prefixes(&refs_dir, "/", 1000, continuation_token, None)
+                .list_prefixes(&refs_dir, "/", 1, continuation_token, None)
                 .await?;
 
             if !objects.is_empty() {

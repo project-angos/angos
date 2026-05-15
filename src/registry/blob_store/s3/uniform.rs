@@ -83,31 +83,20 @@ impl Backend {
         uuid: &str,
         upload_path: &str,
         append: bool,
-    ) -> Result<(String, Vec<UploadedPart>), Error> {
+    ) -> Result<(Option<String>, Vec<UploadedPart>), Error> {
         if append {
-            if let Some(S3UploadState {
-                multipart_upload_id: Some(id),
-                parts,
-                ..
-            }) = self.retrieve_cached_upload_state(name, uuid).await
-            {
-                return Ok((id, parts));
+            if let Some(state) = self.retrieve_cached_upload_state(name, uuid).await {
+                return Ok((state.multipart_upload_id, state.parts));
             }
-            let id = if let Some(id) = self.get_or_search_upload_id(upload_path).await? {
-                id
-            } else {
-                let id = self.store.create_multipart_upload(upload_path).await?;
-                self.cache_upload_id(upload_path, &id).await;
-                id
+            let Some(id) = self.get_or_search_upload_id(upload_path).await? else {
+                return Ok((None, Vec::new()));
             };
             let parts = self.store.list_parts(upload_path, &id).await?;
-            Ok((id, parts))
+            Ok((Some(id), parts))
         } else {
             self.evict_upload_id(upload_path).await;
             self.store.abort_pending_uploads(upload_path).await?;
-            let id = self.store.create_multipart_upload(upload_path).await?;
-            self.cache_upload_id(upload_path, &id).await;
-            Ok((id, Vec::new()))
+            Ok((None, Vec::new()))
         }
     }
 
@@ -235,7 +224,7 @@ impl Backend {
 
         let upload_path = path_builder::upload_path(name, uuid);
 
-        let (upload_id, part_list) = self
+        let (mut upload_id, part_list) = self
             .resolve_uniform_state(name, uuid, &upload_path, append)
             .await?;
 
@@ -255,12 +244,19 @@ impl Backend {
         let remainder = available % self.multipart_part_size;
 
         for _ in 0..full_parts {
+            let upload_id = if let Some(id) = &upload_id {
+                id
+            } else {
+                let id = self.store.create_multipart_upload(&upload_path).await?;
+                self.cache_upload_id(&upload_path, &id).await;
+                upload_id.insert(id)
+            };
             self.stream_part(
                 name,
                 uuid,
                 ChunkContext {
                     upload_path: &upload_path,
-                    upload_id: &upload_id,
+                    upload_id,
                     part_number: uploaded_parts,
                     size: self.multipart_part_size,
                 },
@@ -350,18 +346,56 @@ impl Backend {
     ) -> Result<Digest, Error> {
         let key = path_builder::upload_path(name, uuid);
 
-        let Ok(Some(upload_id)) = self.get_or_search_upload_id(&key).await else {
-            return Err(Error::UploadNotFound);
-        };
-
-        let mut parts = if let Some(cached) = self.retrieve_cached_upload_state(name, uuid).await {
-            cached.parts
-        } else {
-            self.store.list_parts(&key, &upload_id).await?
+        let cached = self.retrieve_cached_upload_state(name, uuid).await;
+        let (upload_id, mut parts) = match cached {
+            Some(S3UploadState {
+                multipart_upload_id: Some(id),
+                parts,
+                ..
+            }) => (Some(id), parts),
+            _ => match self.get_or_search_upload_id(&key).await? {
+                Some(id) => {
+                    let parts = self.store.list_parts(&key, &id).await?;
+                    (Some(id), parts)
+                }
+                None => (None, Vec::new()),
+            },
         };
         let mut size: u64 = parts.iter().map(|p| p.size).sum();
 
         let source_key = path_builder::upload_staged_container_path(name, uuid, size);
+
+        if upload_id.is_none() {
+            match self.store.object_size(&source_key).await {
+                Ok(staged_size) => {
+                    size += staged_size;
+                    let digest = digest
+                        .cloned()
+                        .unwrap_or(self.load_hasher(name, uuid, size).await?.digest());
+                    let blob_path = path_builder::blob_path(&digest);
+                    self.store.copy_object(&source_key, &blob_path).await?;
+                    self.evict_upload_state(name, uuid).await;
+                    let key = path_builder::upload_container_path(name, uuid);
+                    self.store.delete_prefix(&key).await?;
+                    return Ok(digest);
+                }
+                Err(e) if e.kind() == io::ErrorKind::NotFound && size == 0 => {
+                    let digest = digest
+                        .cloned()
+                        .unwrap_or(self.load_hasher(name, uuid, size).await?.digest());
+                    let blob_path = path_builder::blob_path(&digest);
+                    self.store.put_object(&blob_path, Bytes::new()).await?;
+                    self.evict_upload_state(name, uuid).await;
+                    let key = path_builder::upload_container_path(name, uuid);
+                    self.store.delete_prefix(&key).await?;
+                    return Ok(digest);
+                }
+                Err(e) if e.kind() == io::ErrorKind::NotFound => return Err(Error::UploadNotFound),
+                Err(e) => return Err(e.into()),
+            }
+        }
+
+        let upload_id = upload_id.expect("upload_id checked above");
 
         if let Ok(staged_size) = self.store.object_size(&source_key).await {
             let part_number = next_part_number(parts.len())?;

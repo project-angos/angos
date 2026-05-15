@@ -192,6 +192,13 @@ pub trait LockOps: Send + Sync {
     where
         Self: Sized;
 
+    fn lock_key_for_blob_index(_namespace: &str, digest: &Digest) -> String
+    where
+        Self: Sized,
+    {
+        format!("blob:{digest}")
+    }
+
     /// Apply the accumulated blob-index operations after `apply_link_operations`
     /// completes and before the distributed lock is released.
     ///
@@ -277,14 +284,14 @@ pub trait LockOps: Send + Sync {
         for (create_data, delete_data) in prelock_results {
             if let Some(op) = create_data {
                 lock_keys.push(Self::lock_key_for_link(namespace, &op.link));
-                lock_keys.push(format!("blob:{}", op.target));
+                lock_keys.push(Self::lock_key_for_blob_index(namespace, &op.target));
                 if let Some(ref old) = op.old_target {
-                    lock_keys.push(format!("blob:{old}"));
+                    lock_keys.push(Self::lock_key_for_blob_index(namespace, old));
                 }
                 creates.push(op);
             } else if let Some((link, Some(meta), referrer)) = delete_data {
                 lock_keys.push(Self::lock_key_for_link(namespace, &link));
-                lock_keys.push(format!("blob:{}", meta.target));
+                lock_keys.push(Self::lock_key_for_blob_index(namespace, &meta.target));
                 deletes.push(ResolvedDelete {
                     link,
                     target: meta.target,

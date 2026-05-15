@@ -454,7 +454,10 @@ impl WriteCoordinator for LockCoordinator {
                 .await;
         }
 
-        let guard = self.lock.acquire(&[format!("blob:{digest}")]).await?;
+        let guard = self
+            .lock
+            .acquire(&[format!("{namespace}:blob:{digest}")])
+            .await?;
 
         let result = backend
             .update_blob_index_shard(namespace, digest, &[operation])
