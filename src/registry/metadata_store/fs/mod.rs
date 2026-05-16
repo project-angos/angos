@@ -19,7 +19,7 @@ use crate::{
             LockStrategy, MetadataStore,
             link_kind::LinkKind,
             lock::{self, LockBackend, LockGuard, MemoryBackend},
-            lock_ops::LockOps,
+            lock_ops::{LockOps, blob_index_lock_key, link_lock_key},
             referrer_resolver::resolve_referrer_descriptor,
             transaction,
         },
@@ -228,7 +228,7 @@ impl Backend {
         digest: &Digest,
         blob_index: &BlobIndex,
     ) -> Result<(), Error> {
-        let guard = self.lock.acquire(&[format!("blob:{digest}")]).await?;
+        let guard = self.lock.acquire(&[blob_index_lock_key(digest)]).await?;
         let result = self
             .migrate_legacy_blob_index_data_locked(digest, blob_index)
             .await;
@@ -641,7 +641,7 @@ impl MetadataStore for Backend {
         digest: &Digest,
         operation: BlobIndexOperation,
     ) -> Result<(), Error> {
-        let lock_keys = [format!("blob:{digest}")];
+        let lock_keys = [blob_index_lock_key(digest)];
         let guard = self.lock.acquire(&lock_keys).await?;
 
         let mut pending_blob_ops: HashMap<Digest, Vec<BlobIndexOperation>> = HashMap::new();
@@ -692,7 +692,7 @@ impl MetadataStore for Backend {
         update_access_time: bool,
     ) -> Result<LinkMetadata, Error> {
         if update_access_time {
-            let guard = self.lock.acquire(&[link.to_string()]).await?;
+            let guard = self.lock.acquire(&[link_lock_key(namespace, link)]).await?;
             let link_data = self.read_link_reference(namespace, link).await?.accessed();
             if !guard.is_valid() {
                 return Err(Error::Lock(
@@ -748,10 +748,6 @@ impl LockOps for Backend {
         self.store.delete_dir(&path).await?;
         let _ = self.store.delete_empty_parent_dirs(&path).await;
         Ok(())
-    }
-
-    fn lock_key_for_link(_namespace: &str, link: &LinkKind) -> String {
-        link.to_string()
     }
 
     async fn apply_pending_blob_index_ops(

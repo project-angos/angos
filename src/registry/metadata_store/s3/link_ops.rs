@@ -129,14 +129,6 @@ impl LockOps for Backend {
         Ok(())
     }
 
-    fn lock_key_for_link(namespace: &str, link: &LinkKind) -> String {
-        format!("{namespace}:{link}")
-    }
-
-    fn lock_key_for_blob_index(namespace: &str, digest: &Digest) -> String {
-        format!("{namespace}:blob:{digest}")
-    }
-
     async fn cache_put(&self, namespace: &str, link: &LinkKind, metadata: &LinkMetadata) {
         if self.link_cache_ttl == 0 {
             return;

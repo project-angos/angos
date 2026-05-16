@@ -11,7 +11,7 @@ use tokio::sync::Mutex;
 use tracing::warn;
 
 use super::Backend;
-use crate::registry::metadata_store::link_kind::LinkKind;
+use crate::registry::metadata_store::{link_kind::LinkKind, lock_ops::link_lock_key};
 
 #[derive(Clone)]
 pub(super) struct AccessTimeWriter {
@@ -26,7 +26,7 @@ impl AccessTimeWriter {
     }
 
     pub(super) async fn record(&self, namespace: &str, link: &LinkKind) {
-        let key = format!("{namespace}:{link}");
+        let key = link_lock_key(namespace, link);
         self.pending
             .lock()
             .await
