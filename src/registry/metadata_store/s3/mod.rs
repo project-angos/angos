@@ -355,6 +355,20 @@ impl MetadataStore for Backend {
             .await
     }
 
+    #[instrument(skip(self))]
+    async fn migrate_blob_index(&self, digest: &Digest) -> Result<(), Error> {
+        self.migrate_blob_index_layout(digest).await
+    }
+
+    #[instrument(skip(self))]
+    async fn migrate_namespace_registry(&self) -> Result<(), Error> {
+        self.rebuild_namespace_registry().await?;
+        self.store
+            .delete(&path_builder::namespace_registry_path())
+            .await?;
+        Ok(())
+    }
+
     async fn acquire_blob_data_lock(&self, digest: &Digest) -> Result<LockGuard, Error> {
         self.coordinator.acquire_blob_data_lock(digest).await
     }

@@ -15,7 +15,7 @@ use crate::{
             LockStrategy, ResolvedCreate, ResolvedDelete,
             link_kind::LinkKind,
             lock::{self, LockBackend, LockGuard, MemoryBackend, S3LockBackend},
-            lock_ops::LockOps,
+            lock_ops::{LockOps, blob_index_lock_key, link_lock_key},
             simple_jitter, transaction,
         },
         path_builder,
@@ -95,7 +95,7 @@ impl CasCoordinator {
                 let link = match op {
                     LinkOperation::Create { link, .. } | LinkOperation::Delete { link, .. } => link,
                 };
-                format!("{namespace}:{link}")
+                link_lock_key(namespace, link)
             })
             .collect();
         lock_keys.sort();
@@ -240,11 +240,10 @@ impl WriteCoordinator for CasCoordinator {
             pending_blob_ops.entry(digest).or_default().extend(ops);
         }
 
-        join_all(
-            pending_blob_ops
-                .iter()
-                .map(|(digest, ops)| backend.update_blob_index_cas(namespace, digest, ops)),
-        )
+        join_all(pending_blob_ops.iter().map(|(digest, ops)| async move {
+            backend.migrate_blob_index_layout(digest).await?;
+            backend.update_blob_index_cas(namespace, digest, ops).await
+        }))
         .await
         .into_iter()
         .collect::<Result<Vec<_>, _>>()?;
@@ -264,6 +263,7 @@ impl WriteCoordinator for CasCoordinator {
         digest: &Digest,
         operation: BlobIndexOperation,
     ) -> Result<(), Error> {
+        backend.migrate_blob_index_layout(digest).await?;
         backend
             .update_blob_index_cas(namespace, digest, &[operation])
             .await
@@ -449,19 +449,21 @@ impl WriteCoordinator for LockCoordinator {
         operation: BlobIndexOperation,
     ) -> Result<(), Error> {
         if backend.conditional_capabilities.supports_cas() {
+            backend.migrate_blob_index_layout(digest).await?;
             return backend
                 .update_blob_index_cas(namespace, digest, &[operation])
                 .await;
         }
 
-        let guard = self
-            .lock
-            .acquire(&[format!("{namespace}:blob:{digest}")])
-            .await?;
+        let guard = self.lock.acquire(&[blob_index_lock_key(digest)]).await?;
 
-        let result = backend
-            .update_blob_index_shard(namespace, digest, &[operation])
-            .await;
+        let result = async {
+            backend.migrate_blob_index_layout(digest).await?;
+            backend
+                .update_blob_index_shard(namespace, digest, &[operation])
+                .await
+        }
+        .await;
 
         let lock_valid = guard.is_valid();
         guard.release().await;
@@ -544,7 +546,7 @@ impl WriteCoordinator for LockCoordinator {
         namespace: &str,
         link: &LinkKind,
     ) -> Result<LinkMetadata, Error> {
-        let guard = self.lock.acquire(&[format!("{namespace}:{link}")]).await?;
+        let guard = self.lock.acquire(&[link_lock_key(namespace, link)]).await?;
         let link_data = backend
             .read_link_reference(namespace, link)
             .await?
@@ -569,7 +571,7 @@ impl WriteCoordinator for LockCoordinator {
         namespace: &str,
         link: &LinkKind,
     ) -> Result<(), Error> {
-        let guard = self.lock.acquire(&[format!("{namespace}:{link}")]).await?;
+        let guard = self.lock.acquire(&[link_lock_key(namespace, link)]).await?;
         let link_data = backend
             .read_link_reference(namespace, link)
             .await?

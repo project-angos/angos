@@ -124,6 +124,17 @@ pub trait MetadataStore: Send + Sync {
         operation: BlobIndexOperation,
     ) -> Result<(), Error>;
 
+    async fn migrate_blob_index(&self, digest: &Digest) -> Result<(), Error> {
+        match self.read_blob_index(digest).await {
+            Ok(_) | Err(Error::ReferenceNotFound) => Ok(()),
+            Err(error) => Err(error),
+        }
+    }
+
+    async fn migrate_namespace_registry(&self) -> Result<(), Error> {
+        Ok(())
+    }
+
     async fn acquire_blob_data_lock(&self, digest: &Digest) -> Result<LockGuard, Error>;
 
     async fn read_link(

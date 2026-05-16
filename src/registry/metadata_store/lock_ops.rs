@@ -11,6 +11,16 @@ use crate::{
     },
 };
 
+/// Lock key for namespace-scoped link metadata.
+pub fn link_lock_key(namespace: &str, link: &LinkKind) -> String {
+    format!("{namespace}:{link}")
+}
+
+/// Lock key for the global blob-index record for a digest.
+pub fn blob_index_lock_key(digest: &Digest) -> String {
+    format!("blob:{digest}")
+}
+
 /// Shared result type for the lock-validation step.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ValidationResult {
@@ -155,8 +165,6 @@ pub fn build_delete_ops(
 /// - `read_link_reference`: how a link is fetched from storage.
 /// - `write_link_reference`: how a link is persisted to storage.
 /// - `delete_link_reference`: how a link is removed from storage.
-/// - `lock_key_for_link`: how a link name is formatted as a distributed-lock
-///   key (FS uses bare `link.to_string()`, S3 prefixes with `{namespace}:`).
 /// - `cache_put` / `cache_invalidate`: cache integration (no-op default for FS).
 /// - `apply_pending_blob_index_ops`: how accumulated blob-index operations are
 ///   flushed after `apply_link_operations` completes.
@@ -186,17 +194,18 @@ pub trait LockOps: Send + Sync {
     async fn delete_link_reference(&self, namespace: &str, link: &LinkKind) -> Result<(), Error>;
 
     /// Format a lock key for the given `link` within `namespace`.
-    ///
-    /// FS omits the namespace prefix; S3 includes it.
     fn lock_key_for_link(namespace: &str, link: &LinkKind) -> String
     where
-        Self: Sized;
+        Self: Sized,
+    {
+        link_lock_key(namespace, link)
+    }
 
     fn lock_key_for_blob_index(_namespace: &str, digest: &Digest) -> String
     where
         Self: Sized,
     {
-        format!("blob:{digest}")
+        blob_index_lock_key(digest)
     }
 
     /// Apply the accumulated blob-index operations after `apply_link_operations`
@@ -232,9 +241,10 @@ pub trait LockOps: Send + Sync {
     /// `deletes` are empty there is nothing to do and the caller should return
     /// early.
     ///
-    /// Lock keys include both link names and `blob:{digest}` for every target
-    /// digest. This ensures blob index updates (which perform read-modify-write
-    /// on per-digest files) are serialized across concurrent `update_links` calls.
+    /// Lock keys include namespace-scoped link keys and `blob:{digest}` for
+    /// every target digest. This ensures blob index updates (which perform
+    /// read-modify-write on per-digest records) are serialized across
+    /// concurrent `update_links` calls.
     async fn prelock_resolve_operations(
         &self,
         namespace: &str,
@@ -545,13 +555,6 @@ mod tests {
             Ok(())
         }
 
-        fn lock_key_for_link(namespace: &str, link: &LinkKind) -> String
-        where
-            Self: Sized,
-        {
-            format!("{namespace}:{link}")
-        }
-
         async fn apply_pending_blob_index_ops(
             &self,
             _namespace: &str,
@@ -559,6 +562,78 @@ mod tests {
         ) -> Result<(), Error> {
             Ok(())
         }
+    }
+
+    #[test]
+    fn shared_lock_key_builder_scopes_links_but_not_blob_indexes() {
+        let target = digest("aa");
+        let namespace = "team/app";
+        let link = LinkKind::Tag("latest".to_string());
+
+        assert_eq!(link_lock_key(namespace, &link), "team/app:tag:latest");
+        assert_eq!(blob_index_lock_key(&target), format!("blob:{target}"));
+    }
+
+    #[test]
+    fn filesystem_and_s3_backends_share_lock_key_intent() {
+        let target = digest("bb");
+        let namespace = "team/app";
+        let link = LinkKind::Digest(target.clone());
+
+        let expected_link_key = link_lock_key(namespace, &link);
+        let expected_blob_index_key = blob_index_lock_key(&target);
+
+        assert_eq!(
+            <crate::registry::metadata_store::fs::Backend as LockOps>::lock_key_for_link(
+                namespace, &link,
+            ),
+            expected_link_key
+        );
+        assert_eq!(
+            <crate::registry::metadata_store::s3::Backend as LockOps>::lock_key_for_link(
+                namespace, &link,
+            ),
+            expected_link_key
+        );
+        assert_eq!(
+            <crate::registry::metadata_store::fs::Backend as LockOps>::lock_key_for_blob_index(
+                namespace, &target,
+            ),
+            expected_blob_index_key
+        );
+        assert_eq!(
+            <crate::registry::metadata_store::s3::Backend as LockOps>::lock_key_for_blob_index(
+                "other/team",
+                &target,
+            ),
+            expected_blob_index_key
+        );
+    }
+
+    #[tokio::test]
+    async fn prelock_scopes_link_keys_by_namespace_but_keeps_blob_index_key_global() {
+        let backend = MockBackend::new();
+        let target = digest("cc");
+        let link = LinkKind::Tag("stable".to_string());
+        let ops = vec![LinkOperation::Create {
+            link: link.clone(),
+            target: target.clone(),
+            referrer: None,
+            media_type: None,
+            descriptor: None,
+        }];
+
+        let (_, _, first_keys) = backend.prelock_resolve_operations("team/first", &ops).await;
+        let (_, _, second_keys) = backend
+            .prelock_resolve_operations("team/second", &ops)
+            .await;
+
+        assert!(first_keys.contains(&link_lock_key("team/first", &link)));
+        assert!(second_keys.contains(&link_lock_key("team/second", &link)));
+
+        let blob_key = blob_index_lock_key(&target);
+        assert!(first_keys.contains(&blob_key));
+        assert!(second_keys.contains(&blob_key));
     }
 
     #[tokio::test]

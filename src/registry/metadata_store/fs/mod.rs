@@ -1,9 +1,14 @@
-use std::{collections::HashMap, path::PathBuf, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    io::ErrorKind,
+    path::PathBuf,
+    sync::Arc,
+};
 
 use async_trait::async_trait;
 use futures_util::stream::{self, StreamExt};
-use serde::Deserialize;
-use tracing::{debug, info, instrument};
+use serde::{Deserialize, Serialize};
+use tracing::{debug, info, instrument, warn};
 
 use crate::{
     oci::{Descriptor, Digest},
@@ -14,7 +19,7 @@ use crate::{
             LockStrategy, MetadataStore,
             link_kind::LinkKind,
             lock::{self, LockBackend, LockGuard, MemoryBackend},
-            lock_ops::LockOps,
+            lock_ops::{LockOps, blob_index_lock_key, link_lock_key},
             referrer_resolver::resolve_referrer_descriptor,
             transaction,
         },
@@ -80,6 +85,11 @@ impl From<BackendConfig> for data_store::fs::BackendConfig {
 pub struct Backend {
     store: data_store::fs::Backend,
     lock: Arc<dyn LockBackend + Send + Sync>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct NamespaceRegistry {
+    namespaces: Vec<String>,
 }
 
 impl Backend {
@@ -152,6 +162,299 @@ impl Backend {
         repositories.sort();
         repositories
     }
+
+    fn decode_blob_index_shard_namespace(file_name: &str) -> String {
+        file_name
+            .strip_suffix(".json")
+            .unwrap_or(file_name)
+            .replace("%2F", "/")
+            .replace("%25", "%")
+    }
+
+    async fn read_blob_index_shards(&self, digest: &Digest) -> Result<Option<BlobIndex>, Error> {
+        let refs_dir = path_builder::blob_index_refs_dir(digest);
+        let mut entries = self.store.list_dir(&refs_dir).await?;
+        entries.sort();
+
+        if entries.is_empty() {
+            return Ok(None);
+        }
+
+        let shard_results = stream::iter(entries.into_iter().map(|entry| {
+            let shard_path = format!("{refs_dir}/{entry}");
+            async move {
+                match self.store.read(&shard_path).await {
+                    Ok(data) => {
+                        let links = serde_json::from_slice::<HashSet<LinkKind>>(&data)?;
+                        if links.is_empty() {
+                            Ok(None)
+                        } else {
+                            Ok(Some((
+                                Self::decode_blob_index_shard_namespace(&entry),
+                                links,
+                            )))
+                        }
+                    }
+                    Err(e) if e.kind() == ErrorKind::NotFound => Ok(None),
+                    Err(e) => Err(Error::from(e)),
+                }
+            }
+        }))
+        .buffer_unordered(10)
+        .collect::<Vec<Result<Option<(String, HashSet<LinkKind>)>, Error>>>()
+        .await;
+
+        let mut index = BlobIndex::default();
+        for result in shard_results {
+            if let Some((namespace, links)) = result? {
+                index.namespace.insert(namespace, links);
+            }
+        }
+
+        Ok(Some(index))
+    }
+
+    async fn read_legacy_blob_index(&self, digest: &Digest) -> Result<Option<BlobIndex>, Error> {
+        let path = path_builder::blob_index_path(digest);
+        match self.store.read_to_string(&path).await {
+            Ok(content) => Ok(Some(serde_json::from_str::<BlobIndex>(&content)?)),
+            Err(e) if e.kind() == ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(Error::from(e)),
+        }
+    }
+
+    async fn migrate_legacy_blob_index_data(
+        &self,
+        digest: &Digest,
+        blob_index: &BlobIndex,
+    ) -> Result<(), Error> {
+        let guard = self.lock.acquire(&[blob_index_lock_key(digest)]).await?;
+        let result = self
+            .migrate_legacy_blob_index_data_locked(digest, blob_index)
+            .await;
+        let lock_valid = guard.is_valid();
+        guard.release().await;
+
+        result?;
+        if !lock_valid {
+            return Err(Error::Lock(
+                "lock invalidated during blob index layout migration".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    async fn migrate_legacy_blob_index_data_locked(
+        &self,
+        digest: &Digest,
+        blob_index: &BlobIndex,
+    ) -> Result<(), Error> {
+        for (namespace, links) in &blob_index.namespace {
+            let operations: Vec<BlobIndexOperation> = links
+                .iter()
+                .map(|link| BlobIndexOperation::Insert(link.clone()))
+                .collect();
+            self.update_blob_index_shard(namespace, digest, &operations)
+                .await?;
+        }
+
+        let legacy_path = path_builder::blob_index_path(digest);
+        self.store.delete(&legacy_path).await?;
+        let _ = self.store.delete_empty_parent_dirs(&legacy_path).await;
+        Ok(())
+    }
+
+    async fn migrate_blob_index_layout(&self, digest: &Digest) -> Result<(), Error> {
+        let Some(blob_index) = self.read_legacy_blob_index(digest).await? else {
+            return Ok(());
+        };
+
+        self.migrate_legacy_blob_index_data(digest, &blob_index)
+            .await?;
+        info!(
+            "Migrated legacy filesystem blob index for '{digest}' ({} namespaces)",
+            blob_index.namespace.len()
+        );
+        Ok(())
+    }
+
+    async fn update_blob_index_shard(
+        &self,
+        namespace: &str,
+        digest: &Digest,
+        operations: &[BlobIndexOperation],
+    ) -> Result<(), Error> {
+        let shard_path = path_builder::blob_index_shard_path(digest, namespace);
+        let mut links: HashSet<LinkKind> = match self.store.read(&shard_path).await {
+            Ok(data) => serde_json::from_slice(&data).unwrap_or_default(),
+            Err(e) if e.kind() == ErrorKind::NotFound => HashSet::new(),
+            Err(e) => return Err(Error::from(e)),
+        };
+
+        for operation in operations {
+            match operation {
+                BlobIndexOperation::Insert(link) => {
+                    links.insert(link.clone());
+                }
+                BlobIndexOperation::Remove(link) => {
+                    links.remove(link);
+                }
+            }
+        }
+
+        if links.is_empty() {
+            self.store.delete(&shard_path).await?;
+            let _ = self.store.delete_empty_parent_dirs(&shard_path).await;
+        } else {
+            let content = serde_json::to_vec(&links)?;
+            self.store.write(&shard_path, &content).await?;
+        }
+
+        Ok(())
+    }
+
+    async fn read_namespace_registry(&self) -> Result<Option<NamespaceRegistry>, Error> {
+        let shard_dir = path_builder::namespace_registry_shard_dir();
+        let mut entries = self.store.list_dir(&shard_dir).await?;
+        entries.sort();
+
+        if entries.is_empty() {
+            let path = path_builder::namespace_registry_path();
+            return match self.store.read(&path).await {
+                Ok(data) => match serde_json::from_slice::<NamespaceRegistry>(&data) {
+                    Ok(registry) => Ok(Some(registry)),
+                    Err(error) => {
+                        warn!("Corrupt filesystem namespace registry, will rebuild: {error}");
+                        Ok(None)
+                    }
+                },
+                Err(e) if e.kind() == ErrorKind::NotFound => Ok(None),
+                Err(e) => Err(Error::from(e)),
+            };
+        }
+
+        let shard_results = stream::iter(entries.into_iter().map(|entry| {
+            let shard_path = format!("{shard_dir}/{entry}");
+            async move {
+                match self.store.read(&shard_path).await {
+                    Ok(data) => match serde_json::from_slice::<NamespaceRegistry>(&data) {
+                        Ok(registry) => Ok(registry.namespaces),
+                        Err(error) => {
+                            warn!(
+                                "Corrupt filesystem namespace registry shard '{shard_path}', ignoring: {error}"
+                            );
+                            Ok(Vec::new())
+                        }
+                    },
+                    Err(e) if e.kind() == ErrorKind::NotFound => Ok(Vec::new()),
+                    Err(e) => Err(Error::from(e)),
+                }
+            }
+        }))
+        .buffer_unordered(10)
+        .collect::<Vec<Result<Vec<String>, Error>>>()
+        .await;
+
+        let mut namespaces = Vec::new();
+        for result in shard_results {
+            namespaces.extend(result?);
+        }
+        namespaces.sort();
+        namespaces.dedup();
+
+        Ok(Some(NamespaceRegistry { namespaces }))
+    }
+
+    async fn rebuild_namespace_registry(&self) -> Result<(), Error> {
+        let base_path = path_builder::repository_dir();
+        let mut namespaces = self.collect_repositories(base_path).await;
+        namespaces.dedup();
+
+        let mut shards: HashMap<String, Vec<String>> = HashMap::new();
+        for namespace in namespaces {
+            let shard_key = path_builder::namespace_shard_key(&namespace);
+            shards.entry(shard_key).or_default().push(namespace);
+        }
+
+        for (shard_key, mut shard_namespaces) in shards {
+            shard_namespaces.sort();
+            shard_namespaces.dedup();
+            self.process_namespace_shard(&shard_key, &shard_namespaces)
+                .await?;
+        }
+
+        Ok(())
+    }
+
+    async fn process_namespace_shard(
+        &self,
+        shard_key: &str,
+        shard_namespaces: &[String],
+    ) -> Result<(), Error> {
+        let guard = self
+            .lock
+            .acquire(&[format!("namespace_registry_shard_{shard_key}")])
+            .await?;
+
+        let registry = NamespaceRegistry {
+            namespaces: shard_namespaces.to_vec(),
+        };
+        let content = serde_json::to_vec(&registry)?;
+        let path = format!(
+            "{}/{shard_key}.json",
+            path_builder::namespace_registry_shard_dir()
+        );
+        let result = self.store.write(&path, &content).await.map_err(Error::from);
+
+        let lock_valid = guard.is_valid();
+        guard.release().await;
+
+        result?;
+        if !lock_valid {
+            return Err(Error::Lock(
+                "lock invalidated during namespace registry rebuild".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    async fn register_namespace(&self, namespace: &str) -> Result<(), Error> {
+        let shard_key = path_builder::namespace_shard_key(namespace);
+        let path = path_builder::namespace_registry_shard_path(namespace);
+        let guard = self
+            .lock
+            .acquire(&[format!("namespace_registry_shard_{shard_key}")])
+            .await?;
+
+        let mut registry = match self.store.read(&path).await {
+            Ok(data) => serde_json::from_slice::<NamespaceRegistry>(&data).unwrap_or_default(),
+            Err(e) if e.kind() == ErrorKind::NotFound => NamespaceRegistry::default(),
+            Err(e) => {
+                guard.release().await;
+                return Err(Error::from(e));
+            }
+        };
+
+        if let Err(pos) = registry.namespaces.binary_search(&namespace.to_string()) {
+            registry.namespaces.insert(pos, namespace.to_string());
+            let content = serde_json::to_vec(&registry)?;
+            if let Err(error) = self.store.write(&path, &content).await {
+                guard.release().await;
+                return Err(Error::from(error));
+            }
+        }
+
+        let lock_valid = guard.is_valid();
+        guard.release().await;
+
+        if !lock_valid {
+            return Err(Error::Lock(
+                "lock invalidated during namespace registry update".into(),
+            ));
+        }
+
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -162,10 +465,14 @@ impl MetadataStore for Backend {
         n: u16,
         last: Option<String>,
     ) -> Result<(Vec<String>, Option<String>), Error> {
-        let base_path = path_builder::repository_dir();
-
-        let mut repositories = self.collect_repositories(base_path).await;
-        repositories.dedup();
+        let repositories = if let Some(registry) = self.read_namespace_registry().await? {
+            registry.namespaces
+        } else {
+            let base_path = path_builder::repository_dir();
+            let mut repositories = self.collect_repositories(base_path).await;
+            repositories.dedup();
+            repositories
+        };
 
         Ok(pagination::paginate(&repositories, n, last.as_deref()))
     }
@@ -267,11 +574,65 @@ impl MetadataStore for Backend {
 
     #[instrument(skip(self))]
     async fn read_blob_index(&self, digest: &Digest) -> Result<BlobIndex, Error> {
-        let path = path_builder::blob_index_path(digest);
-        let content = self.store.read_to_string(&path).await?;
+        if let Some(index) = self.read_blob_index_shards(digest).await? {
+            if index.namespace.is_empty() {
+                return Err(Error::ReferenceNotFound);
+            }
+            return Ok(index);
+        }
 
-        let index = serde_json::from_str(&content)?;
+        let Some(index) = self.read_legacy_blob_index(digest).await? else {
+            return Err(Error::ReferenceNotFound);
+        };
+
+        self.migrate_legacy_blob_index_data(digest, &index).await?;
+        info!(
+            "Migrated legacy filesystem blob index for '{digest}' ({} namespaces)",
+            index.namespace.len()
+        );
+
         Ok(index)
+    }
+
+    #[instrument(skip(self))]
+    async fn has_blob_references(&self, digest: &Digest) -> Result<bool, Error> {
+        if let Some(index) = self.read_blob_index_shards(digest).await? {
+            return Ok(index.namespace.values().any(|links| !links.is_empty()));
+        }
+
+        let Some(index) = self.read_legacy_blob_index(digest).await? else {
+            return Ok(false);
+        };
+        Ok(index.namespace.values().any(|links| !links.is_empty()))
+    }
+
+    #[instrument(skip(self))]
+    async fn read_blob_index_namespace(
+        &self,
+        namespace: &str,
+        digest: &Digest,
+    ) -> Result<HashSet<LinkKind>, Error> {
+        let shard_path = path_builder::blob_index_shard_path(digest, namespace);
+        match self.store.read(&shard_path).await {
+            Ok(data) => {
+                let links = serde_json::from_slice::<HashSet<LinkKind>>(&data)?;
+                if links.is_empty() {
+                    Err(Error::ReferenceNotFound)
+                } else {
+                    Ok(links)
+                }
+            }
+            Err(e) if e.kind() == ErrorKind::NotFound => {
+                let blob_index = self.read_blob_index(digest).await?;
+                blob_index
+                    .namespace
+                    .get(namespace)
+                    .cloned()
+                    .filter(|links| !links.is_empty())
+                    .ok_or(Error::ReferenceNotFound)
+            }
+            Err(e) => Err(Error::from(e)),
+        }
     }
 
     async fn update_blob_index(
@@ -280,7 +641,7 @@ impl MetadataStore for Backend {
         digest: &Digest,
         operation: BlobIndexOperation,
     ) -> Result<(), Error> {
-        let lock_keys = [format!("blob:{digest}")];
+        let lock_keys = [blob_index_lock_key(digest)];
         let guard = self.lock.acquire(&lock_keys).await?;
 
         let mut pending_blob_ops: HashMap<Digest, Vec<BlobIndexOperation>> = HashMap::new();
@@ -305,6 +666,20 @@ impl MetadataStore for Backend {
         Ok(())
     }
 
+    #[instrument(skip(self))]
+    async fn migrate_blob_index(&self, digest: &Digest) -> Result<(), Error> {
+        self.migrate_blob_index_layout(digest).await
+    }
+
+    #[instrument(skip(self))]
+    async fn migrate_namespace_registry(&self) -> Result<(), Error> {
+        self.rebuild_namespace_registry().await?;
+        let legacy_path = path_builder::namespace_registry_path();
+        self.store.delete(&legacy_path).await?;
+        let _ = self.store.delete_empty_parent_dirs(&legacy_path).await;
+        Ok(())
+    }
+
     async fn acquire_blob_data_lock(&self, digest: &Digest) -> Result<LockGuard, Error> {
         self.lock.acquire(&[format!("blob-data:{digest}")]).await
     }
@@ -317,7 +692,7 @@ impl MetadataStore for Backend {
         update_access_time: bool,
     ) -> Result<LinkMetadata, Error> {
         if update_access_time {
-            let guard = self.lock.acquire(&[link.to_string()]).await?;
+            let guard = self.lock.acquire(&[link_lock_key(namespace, link)]).await?;
             let link_data = self.read_link_reference(namespace, link).await?.accessed();
             if !guard.is_valid() {
                 return Err(Error::Lock(
@@ -375,47 +750,24 @@ impl LockOps for Backend {
         Ok(())
     }
 
-    fn lock_key_for_link(_namespace: &str, link: &LinkKind) -> String {
-        link.to_string()
-    }
-
     async fn apply_pending_blob_index_ops(
         &self,
         namespace: &str,
         pending_blob_ops: HashMap<Digest, Vec<BlobIndexOperation>>,
     ) -> Result<(), Error> {
         for (digest, ops) in &pending_blob_ops {
-            let path = path_builder::blob_index_path(digest);
-
-            let mut blob_index = match self.store.read_to_string(&path).await.map_err(Error::from) {
-                Ok(content) => serde_json::from_str::<BlobIndex>(&content)?,
-                Err(Error::ReferenceNotFound) => BlobIndex::default(),
-                Err(e) => Err(e)?,
-            };
-
-            let mut ns_links = blob_index.namespace.remove(namespace).unwrap_or_default();
-            for op in ops {
-                match op {
-                    BlobIndexOperation::Insert(link) => {
-                        ns_links.insert(link.clone());
-                    }
-                    BlobIndexOperation::Remove(link) => {
-                        ns_links.remove(link);
-                    }
-                }
+            if let Some(legacy_index) = self.read_legacy_blob_index(digest).await? {
+                self.migrate_legacy_blob_index_data_locked(digest, &legacy_index)
+                    .await?;
             }
-            if !ns_links.is_empty() {
-                blob_index.namespace.insert(namespace.to_string(), ns_links);
-            }
+            self.update_blob_index_shard(namespace, digest, ops).await?;
+        }
+        Ok(())
+    }
 
-            if blob_index.namespace.is_empty() {
-                debug!("Deleting no longer referenced blob index: {digest}");
-                self.store.delete(&path).await?;
-                let _ = self.store.delete_empty_parent_dirs(&path).await;
-            } else {
-                let content = serde_json::to_string(&blob_index)?;
-                self.store.write(&path, content.as_bytes()).await?;
-            }
+    async fn after_update(&self, namespace: &str, had_creates: bool) -> Result<(), Error> {
+        if had_creates && let Err(error) = self.register_namespace(namespace).await {
+            warn!(namespace, error = %error, "Failed to register filesystem namespace");
         }
         Ok(())
     }
@@ -423,7 +775,7 @@ impl LockOps for Backend {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::{collections::HashSet, sync::Arc};
 
     use futures_util::future::join_all;
     use tempfile::TempDir;
@@ -500,5 +852,109 @@ mod tests {
 
         let blob_index = backend.read_blob_index(&digest).await.unwrap();
         assert_eq!(blob_index.namespace.len(), 32);
+    }
+
+    #[tokio::test]
+    async fn update_blob_index_writes_namespace_shard_not_legacy_index() {
+        metrics_provider::init_for_tests();
+
+        let temp_dir = TempDir::new().unwrap();
+        let backend = Backend::new(&BackendConfig {
+            root_dir: temp_dir.path().to_string_lossy().into_owned(),
+            ..BackendConfig::default()
+        })
+        .unwrap();
+
+        let digest = sha256::digest(b"sharded fs blob index");
+        let namespace = "test/repo";
+        let link = LinkKind::Layer(digest.clone());
+        backend
+            .update_blob_index(namespace, &digest, BlobIndexOperation::Insert(link.clone()))
+            .await
+            .unwrap();
+
+        let shard_path = path_builder::blob_index_shard_path(&digest, namespace);
+        let links: HashSet<LinkKind> =
+            serde_json::from_slice(&backend.store.read(&shard_path).await.unwrap()).unwrap();
+        assert!(links.contains(&link));
+
+        let legacy_path = path_builder::blob_index_path(&digest);
+        assert_eq!(
+            backend.store.read(&legacy_path).await.unwrap_err().kind(),
+            ErrorKind::NotFound
+        );
+    }
+
+    #[tokio::test]
+    async fn read_blob_index_migrates_legacy_index_to_namespace_shard() {
+        metrics_provider::init_for_tests();
+
+        let temp_dir = TempDir::new().unwrap();
+        let backend = Backend::new(&BackendConfig {
+            root_dir: temp_dir.path().to_string_lossy().into_owned(),
+            ..BackendConfig::default()
+        })
+        .unwrap();
+
+        let digest = sha256::digest(b"legacy fs blob index");
+        let namespace = "legacy/repo";
+        let link = LinkKind::Config(digest.clone());
+        let mut blob_index = BlobIndex::default();
+        blob_index
+            .namespace
+            .insert(namespace.to_string(), HashSet::from([link.clone()]));
+
+        let legacy_path = path_builder::blob_index_path(&digest);
+        backend
+            .store
+            .write(&legacy_path, &serde_json::to_vec(&blob_index).unwrap())
+            .await
+            .unwrap();
+
+        let migrated = backend.read_blob_index(&digest).await.unwrap();
+        assert_eq!(migrated.namespace, blob_index.namespace);
+        assert_eq!(
+            backend.store.read(&legacy_path).await.unwrap_err().kind(),
+            ErrorKind::NotFound
+        );
+
+        let shard_path = path_builder::blob_index_shard_path(&digest, namespace);
+        let links: HashSet<LinkKind> =
+            serde_json::from_slice(&backend.store.read(&shard_path).await.unwrap()).unwrap();
+        assert!(links.contains(&link));
+    }
+
+    #[tokio::test]
+    async fn update_links_registers_namespace_in_sharded_registry() {
+        metrics_provider::init_for_tests();
+
+        let temp_dir = TempDir::new().unwrap();
+        let backend = Backend::new(&BackendConfig {
+            root_dir: temp_dir.path().to_string_lossy().into_owned(),
+            ..BackendConfig::default()
+        })
+        .unwrap();
+
+        let digest = sha256::digest(b"namespace registry fs");
+        let namespace = "catalog/repo";
+        let link = LinkKind::Digest(digest.clone());
+        backend
+            .update_links(
+                namespace,
+                &[LinkOperation::Create {
+                    link,
+                    target: digest,
+                    referrer: None,
+                    media_type: None,
+                    descriptor: None,
+                }],
+            )
+            .await
+            .unwrap();
+
+        let shard_path = path_builder::namespace_registry_shard_path(namespace);
+        let registry: NamespaceRegistry =
+            serde_json::from_slice(&backend.store.read(&shard_path).await.unwrap()).unwrap();
+        assert_eq!(registry.namespaces, vec![namespace.to_string()]);
     }
 }
