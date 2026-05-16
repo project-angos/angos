@@ -30,6 +30,9 @@
     "@docusaurus/module-type-aliases": "^3.10.1",
     "@docusaurus/types": "^3.10.1"
   },
+  "overrides": {
+    "serialize-javascript": "^7.0.5"
+  },
   "browserslist": {
     "production": [
       ">0.5%",
