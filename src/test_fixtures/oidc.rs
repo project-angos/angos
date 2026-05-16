@@ -22,11 +22,10 @@ fn generate_key() -> OidcKey {
     let kp = KeyPair::generate().expect("rcgen ECDSA key generation");
     let pem = kp.serialize_pem();
 
-    // `public_key_der()` returns the SPKI (SubjectPublicKeyInfo) DER encoding.
-    // Parse it with p256 to obtain the uncompressed EC point, then split into
+    // Parse the SPKI public key with p256 to obtain the uncompressed EC point, then split into
     // the 32-byte X and Y coordinates for the JWK.
-    let spki = kp.public_key_der();
-    let public_key = PublicKey::from_public_key_der(&spki).expect("valid P-256 SPKI");
+    let public_key =
+        PublicKey::from_public_key_pem(&kp.public_key_pem()).expect("valid P-256 SPKI public key");
     let point = public_key.to_encoded_point(false); // uncompressed: 0x04 || X || Y
     let x = point.x().expect("uncompressed point has x coordinate");
     let y = point.y().expect("uncompressed point has y coordinate");
