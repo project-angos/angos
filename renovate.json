@@ -11,6 +11,7 @@
   "prConcurrentLimit": 5,
   "prHourlyLimit": 2,
   "minimumReleaseAge": "3 days",
+  "separateMajorMinor": false,
   "rebaseWhen": "behind-base-branch",
   "lockFileMaintenance": {
     "enabled": true,
@@ -23,47 +24,36 @@
   },
   "packageRules": [
     {
-      "description": "Website (Docusaurus): group every dependency into one PR. npm install + npm dedupe run automatically; transitive overrides in package.json are honored.",
-      "matchManagers": ["npm"],
-      "matchFileNames": ["website/package.json"],
-      "groupName": "website dependencies",
-      "groupSlug": "website-deps",
+      "description": "Default group: everything not matched by a more specific rule below (e.g. Rust/cargo).",
+      "matchPackageNames": ["*"],
+      "groupName": "angos-core",
+      "groupSlug": "angos-core",
+      "commitMessageTopic": "angos-core dependencies",
+      "semanticCommitType": "chore",
+      "semanticCommitScope": "deps",
+      "rangeStrategy": "bump"
+    },
+    {
+      "description": "UI (SvelteKit): group every dependency under ui/ into one PR.",
+      "matchFileNames": ["ui/**"],
+      "groupName": "angos-ui",
+      "groupSlug": "angos-ui",
+      "commitMessageTopic": "angos-ui dependencies",
+      "semanticCommitType": "chore",
+      "semanticCommitScope": "ui",
+      "rangeStrategy": "bump",
+      "postUpdateOptions": ["npmDedupe"]
+    },
+    {
+      "description": "Website (Docusaurus): group every dependency under website/ into one PR.",
+      "matchFileNames": ["website/**"],
+      "groupName": "website",
+      "groupSlug": "website",
       "commitMessageTopic": "website dependencies",
       "semanticCommitType": "chore",
       "semanticCommitScope": "website",
       "rangeStrategy": "bump",
-      "postUpdateOptions": ["npmDedupe"],
-      "lockFileMaintenance": {
-        "enabled": true
-      }
-    },
-    {
-      "description": "UI (SvelteKit): group every dependency into one PR. npm install + npm dedupe run automatically; the cookie override is preserved.",
-      "matchManagers": ["npm"],
-      "matchFileNames": ["ui/package.json"],
-      "groupName": "ui dependencies",
-      "groupSlug": "ui-deps",
-      "commitMessageTopic": "ui dependencies",
-      "semanticCommitType": "chore",
-      "semanticCommitScope": "ui",
-      "rangeStrategy": "bump",
-      "postUpdateOptions": ["npmDedupe"],
-      "lockFileMaintenance": {
-        "enabled": true
-      }
-    },
-    {
-      "description": "Rust core crate: group every cargo dependency into one PR. Renovate updates Cargo.lock automatically by running `cargo update -p <crate>` for each bumped package.",
-      "matchManagers": ["cargo"],
-      "groupName": "rust dependencies",
-      "groupSlug": "rust-deps",
-      "commitMessageTopic": "rust dependencies",
-      "semanticCommitType": "chore",
-      "semanticCommitScope": "deps",
-      "rangeStrategy": "bump",
-      "lockFileMaintenance": {
-        "enabled": true
-      }
+      "postUpdateOptions": ["npmDedupe"]
     },
     {
       "description": "GitHub Actions: keep workflow action versions current in a single PR.",
