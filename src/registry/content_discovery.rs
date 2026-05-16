@@ -1,12 +1,11 @@
-use std::collections::HashMap;
-
-use hyper::header::{CONTENT_TYPE, LINK};
 use serde::Serialize;
 use tracing::instrument;
 
+use hyper::header::LINK;
+
 use crate::{
     oci::{Descriptor, Digest, Namespace, OCI_MANIFEST_SCHEMA_VERSION},
-    registry::{APPLICATION_JSON, Error, JsonResponse, Registry},
+    registry::{APPLICATION_JSON, Error, HeaderMap, JsonResponse, Registry, ResponseHeaders},
 };
 
 const OCI_FILTERS_APPLIED: &str = "OCI-Filters-Applied";
@@ -41,20 +40,25 @@ struct TagsBody<'a> {
     tags: Vec<String>,
 }
 
-fn referrers_headers(artifact_type_filtered: bool) -> HashMap<&'static str, String> {
-    let mut headers = HashMap::from([(CONTENT_TYPE.as_str(), OCI_INDEX_MEDIA_TYPE.to_string())]);
+fn referrers_headers(artifact_type_filtered: bool) -> HeaderMap {
+    let headers = ResponseHeaders::new().content_type(OCI_INDEX_MEDIA_TYPE);
     if artifact_type_filtered {
-        headers.insert(OCI_FILTERS_APPLIED, "artifactType".to_string());
+        headers
+            .with(OCI_FILTERS_APPLIED, "artifactType")
+            .into_inner()
+    } else {
+        headers.into_inner()
     }
-    headers
 }
 
-fn paginated_json_headers(link: Option<&str>) -> HashMap<&'static str, String> {
-    let mut headers = HashMap::from([(CONTENT_TYPE.as_str(), APPLICATION_JSON.to_string())]);
-    if let Some(link) = link {
-        headers.insert(LINK.as_str(), format!("<{link}>; rel=\"next\""));
+fn paginated_json_headers(link: Option<&str>) -> HeaderMap {
+    let headers = ResponseHeaders::new().content_type(APPLICATION_JSON);
+    match link {
+        Some(link) => headers
+            .with(LINK.as_str(), format!("<{link}>; rel=\"next\""))
+            .into_inner(),
+        None => headers.into_inner(),
     }
-    headers
 }
 
 impl Registry {

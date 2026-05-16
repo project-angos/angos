@@ -1,6 +1,3 @@
-use std::collections::HashMap;
-
-use hyper::header::{CONTENT_LENGTH, LOCATION, RANGE};
 use sha2::{Digest as ShaDigest, Sha256};
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tracing::{instrument, warn};
@@ -10,80 +7,62 @@ use crate::{
     event_webhook::event::{Event, EventActor, EventKind},
     oci::{Digest, Namespace},
     registry::{
-        DOCKER_CONTENT_DIGEST, DOCKER_UPLOAD_UUID, Error, Registry, blob_ownership::BlobOwnership,
-        blob_store, metadata_store::Error as MetadataError,
+        DOCKER_UPLOAD_UUID, Error, HeaderMap, Registry, ResponseHeaders,
+        blob_ownership::BlobOwnership, blob_store, metadata_store::Error as MetadataError,
     },
     util::sha256::finalize_digest,
 };
 
 pub enum StartUploadResponse {
-    ExistingBlob {
-        headers: HashMap<&'static str, String>,
-    },
-    Session {
-        headers: HashMap<&'static str, String>,
-    },
+    ExistingBlob { headers: HeaderMap },
+    Session { headers: HeaderMap },
 }
 
 pub struct GetUploadResponse {
-    pub headers: HashMap<&'static str, String>,
+    pub headers: HeaderMap,
 }
 
 pub struct PatchUploadResponse {
-    pub headers: HashMap<&'static str, String>,
+    pub headers: HeaderMap,
 }
 
 pub struct CompleteUploadResponse {
-    pub headers: HashMap<&'static str, String>,
+    pub headers: HeaderMap,
     pub events: Vec<Event>,
 }
 
 /// Headers for a completed-blob response (used by `StartUpload` when the digest
 /// already exists, and by `CompleteUpload` when the upload finishes).
-fn blob_location_headers(namespace: &Namespace, digest: &Digest) -> HashMap<&'static str, String> {
-    HashMap::from([
-        (LOCATION.as_str(), format!("/v2/{namespace}/blobs/{digest}")),
-        (DOCKER_CONTENT_DIGEST, digest.to_string()),
-    ])
+fn blob_location_headers(namespace: &Namespace, digest: &Digest) -> HeaderMap {
+    ResponseHeaders::new()
+        .location(format!("/v2/{namespace}/blobs/{digest}"))
+        .docker_content_digest(digest)
+        .into_inner()
 }
 
-fn upload_session_headers(
-    namespace: &Namespace,
-    session_uuid: &str,
-) -> HashMap<&'static str, String> {
-    HashMap::from([
-        (
-            LOCATION.as_str(),
-            format!("/v2/{namespace}/blobs/uploads/{session_uuid}"),
-        ),
-        (RANGE.as_str(), "0-0".to_string()),
-        (DOCKER_UPLOAD_UUID, session_uuid.to_string()),
-    ])
+fn upload_session_headers(namespace: &Namespace, session_uuid: &str) -> HeaderMap {
+    ResponseHeaders::new()
+        .location(format!("/v2/{namespace}/blobs/uploads/{session_uuid}"))
+        .range("0-0")
+        .with(DOCKER_UPLOAD_UUID, session_uuid)
+        .into_inner()
 }
 
-fn upload_status_headers(
-    namespace: &Namespace,
-    session_id: &str,
-    range_max: u64,
-) -> HashMap<&'static str, String> {
-    HashMap::from([
-        (
-            LOCATION.as_str(),
-            format!("/v2/{namespace}/blobs/uploads/{session_id}"),
-        ),
-        (RANGE.as_str(), format!("0-{range_max}")),
-        (DOCKER_UPLOAD_UUID, session_id.to_string()),
-    ])
+fn upload_status_headers(namespace: &Namespace, session_id: &str, range_max: u64) -> HeaderMap {
+    ResponseHeaders::new()
+        .location(format!("/v2/{namespace}/blobs/uploads/{session_id}"))
+        .range(format!("0-{range_max}"))
+        .with(DOCKER_UPLOAD_UUID, session_id)
+        .into_inner()
 }
 
-fn patch_upload_headers(
-    namespace: &Namespace,
-    session_id: &str,
-    range_max: u64,
-) -> HashMap<&'static str, String> {
-    let mut headers = upload_status_headers(namespace, session_id, range_max);
-    headers.insert(CONTENT_LENGTH.as_str(), "0".to_string());
-    headers
+fn patch_upload_headers(namespace: &Namespace, session_id: &str, range_max: u64) -> HeaderMap {
+    ResponseHeaders::new()
+        .location(format!("/v2/{namespace}/blobs/uploads/{session_id}"))
+        .range(format!("0-{range_max}"))
+        .with(DOCKER_UPLOAD_UUID, session_id)
+        .content_length(0)
+        .into_inner()
 }
 
 async fn hash_upload_stream<S>(mut stream: S, content_length: u64) -> Result<Digest, Error>

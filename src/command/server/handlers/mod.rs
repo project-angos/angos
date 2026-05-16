@@ -2,7 +2,10 @@ use std::collections::HashMap;
 
 use hyper::{Response, StatusCode};
 
-use crate::command::server::{error::Error, response_body::ResponseBody};
+use crate::{
+    command::server::{ServerContext, error::Error, response_body::ResponseBody},
+    event_webhook::event::Event,
+};
 
 pub mod blob;
 pub mod content_discovery;
@@ -21,4 +24,26 @@ pub fn build_response(
         builder = builder.header(name, value);
     }
     Ok(builder.body(body)?)
+}
+
+pub type EventfulResponse = (Response<ResponseBody>, Vec<Event>);
+
+pub fn build_event_response(
+    status: StatusCode,
+    headers: HashMap<&'static str, String>,
+    events: Vec<Event>,
+) -> Result<EventfulResponse, Error> {
+    Ok((
+        build_response(status, headers, ResponseBody::empty())?,
+        events,
+    ))
+}
+
+pub async fn dispatch_eventful(
+    context: &ServerContext,
+    response: EventfulResponse,
+) -> Result<Response<ResponseBody>, Error> {
+    let (response, events) = response;
+    context.dispatch_events(&events).await?;
+    Ok(response)
 }

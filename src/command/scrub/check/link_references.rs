@@ -44,37 +44,9 @@ impl LinkReferencesChecker {
         let content = self.blob_store.read(revision).await?;
         let manifest = parse_manifest_digests(&content, None)?;
 
-        if let Some(config) = &manifest.config {
-            self.ensure_referenced_by(
-                namespace,
-                &LinkKind::Config(config.clone()),
-                config,
-                revision,
-                sink,
-            )
-            .await?;
-        }
-
-        for layer in &manifest.layers {
-            self.ensure_referenced_by(
-                namespace,
-                &LinkKind::Layer(layer.clone()),
-                layer,
-                revision,
-                sink,
-            )
-            .await?;
-        }
-
-        for child in &manifest.manifests {
-            self.ensure_referenced_by(
-                namespace,
-                &LinkKind::Manifest(revision.clone(), child.clone()),
-                child,
-                revision,
-                sink,
-            )
-            .await?;
+        for (link, target) in manifest.referenced_links_for_revision(revision) {
+            self.ensure_referenced_by(namespace, &link, &target, revision, sink)
+                .await?;
         }
 
         Ok(())

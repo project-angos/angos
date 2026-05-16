@@ -1,9 +1,6 @@
-use std::{
-    collections::{HashMap, HashSet},
-    sync::Arc,
-};
+use std::{collections::HashSet, sync::Arc};
 
-use hyper::header::{ACCEPT_RANGES, CONTENT_LENGTH, CONTENT_RANGE, LOCATION};
+use hyper::header::{ACCEPT_RANGES, CONTENT_RANGE};
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tracing::{debug, info, instrument, warn};
 use uuid::Uuid;
@@ -11,7 +8,7 @@ use uuid::Uuid;
 use crate::{
     oci::{Digest, Namespace},
     registry::{
-        DOCKER_CONTENT_DIGEST, Error, Registry, Repository,
+        Error, HeaderMap, Registry, Repository, ResponseHeaders,
         blob_ownership::BlobOwnership,
         blob_store::{BoxedReader, UploadStore},
         metadata_store::{Error as MetadataError, MetadataStore, link_kind::LinkKind},
@@ -27,20 +24,20 @@ pub enum BlobRange {
 
 pub enum GetBlobResponse {
     Redirect {
-        headers: HashMap<&'static str, String>,
+        headers: HeaderMap,
     },
     Reader {
-        headers: HashMap<&'static str, String>,
+        headers: HeaderMap,
         body: BoxedReader,
     },
     RangedReader {
-        headers: HashMap<&'static str, String>,
+        headers: HeaderMap,
         body: BoxedReader,
     },
 }
 
 pub struct HeadBlobResponse {
-    pub headers: HashMap<&'static str, String>,
+    pub headers: HeaderMap,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -91,38 +88,38 @@ fn resolve_blob_range(
     }))
 }
 
-fn head_blob_headers(digest: &Digest, size: u64) -> HashMap<&'static str, String> {
-    HashMap::from([
-        (DOCKER_CONTENT_DIGEST, digest.to_string()),
-        (CONTENT_LENGTH.as_str(), size.to_string()),
-    ])
+fn head_blob_headers(digest: &Digest, size: u64) -> HeaderMap {
+    ResponseHeaders::new()
+        .docker_content_digest(digest)
+        .content_length(size)
+        .into_inner()
 }
 
-fn get_blob_headers(digest: &Digest, total_length: u64) -> HashMap<&'static str, String> {
-    HashMap::from([
-        (DOCKER_CONTENT_DIGEST, digest.to_string()),
-        (ACCEPT_RANGES.as_str(), "bytes".to_string()),
-        (CONTENT_LENGTH.as_str(), total_length.to_string()),
-    ])
+fn get_blob_headers(digest: &Digest, total_length: u64) -> HeaderMap {
+    ResponseHeaders::new()
+        .docker_content_digest(digest)
+        .with(ACCEPT_RANGES.as_str(), "bytes")
+        .content_length(total_length)
+        .into_inner()
 }
 
-fn get_blob_range_headers(digest: &Digest, range: ResolvedRange) -> HashMap<&'static str, String> {
-    HashMap::from([
-        (DOCKER_CONTENT_DIGEST, digest.to_string()),
-        (ACCEPT_RANGES.as_str(), "bytes".to_string()),
-        (CONTENT_LENGTH.as_str(), range.length.to_string()),
-        (
+fn get_blob_range_headers(digest: &Digest, range: ResolvedRange) -> HeaderMap {
+    ResponseHeaders::new()
+        .docker_content_digest(digest)
+        .with(ACCEPT_RANGES.as_str(), "bytes")
+        .content_length(range.length)
+        .with(
             CONTENT_RANGE.as_str(),
             format!("bytes {}-{}/{}", range.start, range.end, range.total_length),
-        ),
-    ])
+        )
+        .into_inner()
 }
 
-fn get_blob_redirect_headers(url: String, digest: &Digest) -> HashMap<&'static str, String> {
-    HashMap::from([
-        (LOCATION.as_str(), url),
-        (DOCKER_CONTENT_DIGEST, digest.to_string()),
-    ])
+fn get_blob_redirect_headers(url: String, digest: &Digest) -> HeaderMap {
+    ResponseHeaders::new()
+        .location(url)
+        .docker_content_digest(digest)
+        .into_inner()
 }
 
 fn has_non_ownership_reference(links: &HashSet<LinkKind>, digest: &Digest) -> bool {

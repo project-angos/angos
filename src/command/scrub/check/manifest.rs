@@ -11,11 +11,7 @@ use crate::{
         executor::ActionSink,
     },
     oci::Digest,
-    registry::{
-        blob_store::BlobStore,
-        metadata_store::{MetadataStore, link_kind::LinkKind},
-        parse_manifest_digests,
-    },
+    registry::{blob_store::BlobStore, metadata_store::MetadataStore, parse_manifest_digests},
 };
 
 pub struct ManifestChecker {
@@ -43,48 +39,8 @@ impl ManifestChecker {
         let content = self.blob_store.read(revision).await?;
         let manifest = parse_manifest_digests(&content, None)?;
 
-        for layer in &manifest.layers {
-            ensure_link(
-                &self.metadata_store,
-                namespace,
-                &LinkKind::Layer(layer.clone()),
-                layer,
-                sink,
-            )
-            .await?;
-        }
-
-        if let Some(config) = &manifest.config {
-            ensure_link(
-                &self.metadata_store,
-                namespace,
-                &LinkKind::Config(config.clone()),
-                config,
-                sink,
-            )
-            .await?;
-        }
-
-        if let Some(subject) = &manifest.subject {
-            ensure_link(
-                &self.metadata_store,
-                namespace,
-                &LinkKind::Referrer(subject.clone(), revision.clone()),
-                revision,
-                sink,
-            )
-            .await?;
-        }
-
-        for child in &manifest.manifests {
-            ensure_link(
-                &self.metadata_store,
-                namespace,
-                &LinkKind::Manifest(revision.clone(), child.clone()),
-                child,
-                sink,
-            )
-            .await?;
+        for (link, target) in manifest.links_for_revision(revision) {
+            ensure_link(&self.metadata_store, namespace, &link, &target, sink).await?;
         }
 
         Ok(())
@@ -104,7 +60,7 @@ impl NamespaceChecker for ManifestChecker {
         while let Some(revision) = revisions.next().await {
             let revision = revision?;
             if let Err(e) = self.repair_manifest_links(namespace, &revision, sink).await {
-                error!("Failed to check tag from '{namespace}' (revision '{revision}'): {e}");
+                error!("Failed to check revision from '{namespace}' (revision '{revision}'): {e}");
             }
         }
 
@@ -119,7 +75,7 @@ mod tests {
         command::scrub::executor::Executor,
         oci::Namespace,
         registry::{
-            metadata_store::MetadataStoreExt,
+            metadata_store::{MetadataStoreExt, link_kind::LinkKind},
             test_utils::{self, NoopMultipart, backends},
         },
     };

@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use hyper::{Response, StatusCode, body::Incoming, http::request::Parts};
 use tokio::io::AsyncRead;
 
@@ -5,11 +7,11 @@ use crate::{
     command::server::{
         ServerContext,
         error::Error,
-        handlers::build_response,
+        handlers::{EventfulResponse, build_event_response, build_response, dispatch_eventful},
         request::{RequestHeaders, incoming_into_async_read},
         response_body::ResponseBody,
     },
-    event_webhook::event::{Event, EventActor},
+    event_webhook::event::EventActor,
     identity::ClientIdentity,
     oci::{Namespace, Reference},
     registry::GetManifestResponse,
@@ -68,7 +70,7 @@ pub async fn handle_put_manifest<S>(
     mime_type: String,
     body_stream: S,
     identity: &ClientIdentity,
-) -> Result<(Response<ResponseBody>, Vec<Event>), Error>
+) -> Result<EventfulResponse, Error>
 where
     S: AsyncRead + Unpin + Send,
 {
@@ -78,9 +80,7 @@ where
         .accept_put_manifest(actor, namespace, reference, mime_type, body_stream)
         .await?;
 
-    let http_response =
-        build_response(StatusCode::CREATED, response.headers, ResponseBody::empty())?;
-    Ok((http_response, response.events))
+    build_event_response(StatusCode::CREATED, response.headers, response.events)
 }
 
 pub async fn handle_delete_manifest(
@@ -88,17 +88,14 @@ pub async fn handle_delete_manifest(
     namespace: &Namespace,
     reference: Reference,
     identity: &ClientIdentity,
-) -> Result<(Response<ResponseBody>, Vec<Event>), Error> {
+) -> Result<EventfulResponse, Error> {
     let actor = Some(EventActor::from(identity.clone()));
     let response = context
         .registry
         .delete_manifest(actor, namespace, &reference)
         .await?;
 
-    let http_response = Response::builder()
-        .status(StatusCode::ACCEPTED)
-        .body(ResponseBody::empty())?;
-    Ok((http_response, response.events))
+    build_event_response(StatusCode::ACCEPTED, HashMap::new(), response.events)
 }
 
 pub async fn dispatch_get_manifest(
@@ -142,18 +139,19 @@ pub async fn dispatch_put_manifest(
 
     let body_stream = incoming_into_async_read(incoming);
 
-    let (response, events) = handle_put_manifest(
+    dispatch_eventful(
         context,
-        namespace,
-        reference,
-        mime_type,
-        body_stream,
-        identity,
+        handle_put_manifest(
+            context,
+            namespace,
+            reference,
+            mime_type,
+            body_stream,
+            identity,
+        )
+        .await?,
     )
-    .await?;
-
-    context.dispatch_events(&events).await?;
-    Ok(response)
+    .await
 }
 
 pub async fn dispatch_delete_manifest(
@@ -162,9 +160,9 @@ pub async fn dispatch_delete_manifest(
     reference: Reference,
     identity: &ClientIdentity,
 ) -> Result<Response<ResponseBody>, Error> {
-    let (response, events) =
-        handle_delete_manifest(context, namespace, reference, identity).await?;
-
-    context.dispatch_events(&events).await?;
-    Ok(response)
+    dispatch_eventful(
+        context,
+        handle_delete_manifest(context, namespace, reference, identity).await?,
+    )
+    .await
 }
