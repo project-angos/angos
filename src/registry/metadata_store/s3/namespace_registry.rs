@@ -1,19 +1,19 @@
-use std::{collections::HashMap, io::ErrorKind};
+use std::io::ErrorKind;
 
 use bytes::Bytes;
 use futures_util::stream::{self, StreamExt};
 use tracing::warn;
 
 use super::Backend;
-use crate::registry::{metadata_store::Error, path_builder};
-
-#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
-pub struct NamespaceRegistry {
-    pub namespaces: Vec<String>,
-}
+use crate::registry::{
+    metadata_store::{Error, sharded},
+    path_builder,
+};
 
 impl Backend {
-    pub async fn read_namespace_registry(&self) -> Result<Option<NamespaceRegistry>, Error> {
+    pub async fn read_namespace_registry(
+        &self,
+    ) -> Result<Option<sharded::NamespaceRegistry>, Error> {
         // Read sharded format: list all shard files under _registry/ns/ and merge
         let shard_dir = path_builder::namespace_registry_shard_dir();
         let mut all_namespaces = Vec::new();
@@ -35,16 +35,18 @@ impl Backend {
                     let shard_path = format!("{shard_dir}/{obj}");
                     async move {
                         match self.store.read(&shard_path).await {
-                            Ok(data) => match serde_json::from_slice::<NamespaceRegistry>(&data) {
-                                Ok(registry) => Ok(registry.namespaces),
-                                Err(_) => Ok(Vec::new()),
-                            },
+                            Ok(data) => {
+                                match serde_json::from_slice::<sharded::NamespaceRegistry>(&data) {
+                                    Ok(registry) => Ok(registry.namespaces),
+                                    Err(_) => Ok(Vec::new()),
+                                }
+                            }
                             Err(e) if e.kind() == ErrorKind::NotFound => Ok(Vec::new()),
                             Err(e) => Err(Error::from(e)),
                         }
                     }
                 }))
-                .buffer_unordered(10)
+                .buffer_unordered(sharded::SHARD_READ_CONCURRENCY)
                 .collect()
                 .await;
 
@@ -74,25 +76,18 @@ impl Backend {
             };
         }
 
-        all_namespaces.sort();
-        all_namespaces.dedup();
-        Ok(Some(NamespaceRegistry {
+        let all_namespaces = sharded::normalize_namespaces(all_namespaces);
+        Ok(Some(sharded::NamespaceRegistry {
             namespaces: all_namespaces,
         }))
     }
 
     pub async fn rebuild_namespace_registry(&self) -> Result<(), Error> {
         let repo_dir = path_builder::repository_dir();
-        let mut namespaces = self.collect_namespaces(repo_dir, "").await?;
-        namespaces.sort();
-        namespaces.dedup();
+        let namespaces = self.collect_namespaces(repo_dir, "").await?;
+        let namespaces = sharded::normalize_namespaces(namespaces);
 
-        // Group namespaces by shard key
-        let mut shards: HashMap<String, Vec<String>> = HashMap::new();
-        for ns in &namespaces {
-            let key = path_builder::namespace_shard_key(ns);
-            shards.entry(key).or_default().push(ns.clone());
-        }
+        let shards = sharded::group_namespaces_by_shard(namespaces);
 
         // Write each shard
         for (shard_key, shard_namespaces) in &shards {
@@ -108,9 +103,7 @@ impl Backend {
         shard_key: &str,
         shard_namespaces: &[String],
     ) -> Result<(), Error> {
-        let registry = NamespaceRegistry {
-            namespaces: shard_namespaces.to_vec(),
-        };
+        let registry = sharded::registry_for_namespaces(shard_namespaces);
         let content = Bytes::from(serde_json::to_vec(&registry)?);
         let path = format!(
             "{}/{shard_key}.json",

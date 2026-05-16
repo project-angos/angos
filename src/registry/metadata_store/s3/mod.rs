@@ -21,7 +21,7 @@ use crate::{
         metadata_store::{
             BlobIndex, BlobIndexOperation, ConditionalCapabilities, Error, LinkMetadata,
             LinkOperation, LockGuard, LockStrategy, MetadataStore, link_kind::LinkKind,
-            lock_ops::LockOps, referrer_resolver::resolve_referrer_descriptor,
+            lock_ops::LockOps, referrer_resolver::resolve_referrer_descriptor, simple_jitter,
         },
         pagination, path_builder,
     },
@@ -56,6 +56,12 @@ pub struct Backend {
 }
 
 const MAX_BLOB_INDEX_CAS_RETRIES: u32 = 20;
+const CAS_RETRY_BASE_MS: u64 = 50;
+
+pub async fn sleep_cas_retry(attempt: u32) {
+    let max_ms = CAS_RETRY_BASE_MS.saturating_mul(1u64 << attempt.min(4));
+    tokio::time::sleep(Duration::from_millis(simple_jitter(max_ms))).await;
+}
 
 impl Backend {
     /// Create a new S3 metadata-store backend.

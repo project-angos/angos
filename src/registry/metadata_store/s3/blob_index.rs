@@ -1,17 +1,15 @@
-use std::{collections::HashSet, io::ErrorKind, time::Duration};
+use std::{collections::HashSet, io::ErrorKind};
 
 use bytes::Bytes;
 use futures_util::stream::{self, StreamExt};
 use tracing::{debug, info, instrument, warn};
 
-use super::Backend;
+use super::{Backend, sleep_cas_retry};
 use crate::{
     oci::Digest,
     registry::{
         data_store,
-        metadata_store::{
-            BlobIndex, BlobIndexOperation, Error, link_kind::LinkKind, simple_jitter,
-        },
+        metadata_store::{BlobIndex, BlobIndexOperation, Error, link_kind::LinkKind, sharded},
         path_builder,
     },
 };
@@ -41,16 +39,7 @@ impl Backend {
                 Err(e) => return Err(Error::from(e)),
             };
 
-            for op in operations {
-                match op {
-                    BlobIndexOperation::Insert(link) => {
-                        links.insert(link.clone());
-                    }
-                    BlobIndexOperation::Remove(link) => {
-                        links.remove(link);
-                    }
-                }
-            }
+            sharded::apply_blob_index_operations(&mut links, operations);
 
             // Write the shard back with CAS. Empty shards are written rather than
             // deleted to avoid a race where a concurrent writer creates a new entry
@@ -78,8 +67,7 @@ impl Backend {
                         attempt,
                         "Blob index shard CAS conflict, retrying"
                     );
-                    let max_ms = 50u64.saturating_mul(1u64 << attempt.min(4));
-                    tokio::time::sleep(Duration::from_millis(simple_jitter(max_ms))).await;
+                    sleep_cas_retry(attempt).await;
                 }
                 Err(e) => return Err(Error::StorageBackend(e.to_string())),
             }
@@ -121,11 +109,7 @@ impl Backend {
                     match self.store.read(&shard_path).await {
                         Ok(data) => {
                             if let Ok(links) = serde_json::from_slice::<HashSet<LinkKind>>(&data) {
-                                let namespace = obj
-                                    .strip_suffix(".json")
-                                    .unwrap_or(&obj)
-                                    .replace("%2F", "/")
-                                    .replace("%25", "%");
+                                let namespace = sharded::decode_blob_index_shard_namespace(&obj);
                                 if !links.is_empty() {
                                     return Ok(Some((namespace, links)));
                                 }
@@ -137,15 +121,17 @@ impl Backend {
                     }
                 }
             }))
-            .buffer_unordered(10)
+            .buffer_unordered(sharded::SHARD_READ_CONCURRENCY)
             .collect::<Vec<Result<Option<(String, HashSet<LinkKind>)>, Error>>>()
             .await;
 
-            for result in shard_results {
-                if let Some((namespace, links)) = result? {
-                    index.namespace.insert(namespace, links);
-                }
-            }
+            let shards = shard_results
+                .into_iter()
+                .filter_map(Result::transpose)
+                .collect::<Result<Vec<_>, _>>()?;
+            index
+                .namespace
+                .extend(sharded::collect_blob_index_shards(shards).namespace);
 
             continuation_token = next_token;
             if continuation_token.is_none() {
@@ -190,20 +176,11 @@ impl Backend {
         match self.store.read(&shard_path).await {
             Ok(data) => {
                 let links = serde_json::from_slice::<HashSet<LinkKind>>(&data)?;
-                if links.is_empty() {
-                    Err(Error::ReferenceNotFound)
-                } else {
-                    Ok(links)
-                }
+                sharded::non_empty_links_or_not_found(links)
             }
             Err(e) if e.kind() == ErrorKind::NotFound => {
                 let blob_index = self.read_blob_index_impl(digest).await?;
-                blob_index
-                    .namespace
-                    .get(namespace)
-                    .cloned()
-                    .filter(|links| !links.is_empty())
-                    .ok_or(Error::ReferenceNotFound)
+                sharded::namespace_links_from_index(&blob_index, namespace)
             }
             Err(e) => Err(e.into()),
         }
@@ -252,7 +229,7 @@ impl Backend {
         match self.store.read(&legacy_path).await {
             Ok(data) => {
                 let blob_index: BlobIndex = serde_json::from_slice(&data)?;
-                Ok(blob_index.namespace.values().any(|links| !links.is_empty()))
+                Ok(sharded::blob_index_has_references(&blob_index))
             }
             Err(e) if e.kind() == ErrorKind::NotFound => Ok(false),
             Err(e) => Err(e.into()),
@@ -273,16 +250,7 @@ impl Backend {
             Err(e) => return Err(e.into()),
         };
 
-        for operation in operations {
-            match operation {
-                BlobIndexOperation::Insert(link) => {
-                    links.insert(link.clone());
-                }
-                BlobIndexOperation::Remove(link) => {
-                    links.remove(link);
-                }
-            }
-        }
+        sharded::apply_blob_index_operations(&mut links, operations);
 
         if links.is_empty() {
             self.store.delete(&shard_path).await?;

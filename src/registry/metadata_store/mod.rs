@@ -1,6 +1,7 @@
 mod blob_index;
 mod capabilities;
 mod error;
+mod sharded;
 
 use std::{
     collections::{HashSet, hash_map::RandomState},

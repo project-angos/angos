@@ -7,7 +7,7 @@ use crate::{
     oci::Digest,
     registry::metadata_store::{
         BlobIndexOperation, Error, LinkMetadata, LinkOperation, ResolvedCreate, ResolvedDelete,
-        link_kind::LinkKind,
+        link_kind::LinkKind, lock::LockBackend,
     },
 };
 
@@ -19,6 +19,28 @@ pub fn link_lock_key(namespace: &str, link: &LinkKind) -> String {
 /// Lock key for the global blob-index record for a digest.
 pub fn blob_index_lock_key(digest: &Digest) -> String {
     format!("blob:{digest}")
+}
+
+pub async fn with_validated_lock<T, F, Fut>(
+    lock: &(dyn LockBackend + Send + Sync),
+    keys: &[String],
+    invalid_message: &'static str,
+    operation: F,
+) -> Result<T, Error>
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = Result<T, Error>>,
+{
+    let guard = lock.acquire(keys).await?;
+    let result = operation().await;
+    let lock_valid = guard.is_valid();
+    guard.release().await;
+
+    let value = result?;
+    if !lock_valid {
+        return Err(Error::Lock(invalid_message.to_string()));
+    }
+    Ok(value)
 }
 
 /// Shared result type for the lock-validation step.

@@ -1,5 +1,6 @@
 mod cache;
 mod cleanup;
+mod multipart_helpers;
 mod nonuniform;
 #[cfg(test)]
 pub mod tests;

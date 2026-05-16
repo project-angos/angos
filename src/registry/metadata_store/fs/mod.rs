@@ -7,7 +7,7 @@ use std::{
 
 use async_trait::async_trait;
 use futures_util::stream::{self, StreamExt};
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use tracing::{debug, info, instrument, warn};
 
 use crate::{
@@ -19,8 +19,9 @@ use crate::{
             LockStrategy, MetadataStore,
             link_kind::LinkKind,
             lock::{self, LockBackend, LockGuard, MemoryBackend},
-            lock_ops::{LockOps, blob_index_lock_key, link_lock_key},
+            lock_ops::{LockOps, blob_index_lock_key, link_lock_key, with_validated_lock},
             referrer_resolver::resolve_referrer_descriptor,
+            sharded::{self, NamespaceRegistry},
             transaction,
         },
         pagination, path_builder,
@@ -85,11 +86,6 @@ impl From<BackendConfig> for data_store::fs::BackendConfig {
 pub struct Backend {
     store: data_store::fs::Backend,
     lock: Arc<dyn LockBackend + Send + Sync>,
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-struct NamespaceRegistry {
-    namespaces: Vec<String>,
 }
 
 impl Backend {
@@ -163,14 +159,6 @@ impl Backend {
         repositories
     }
 
-    fn decode_blob_index_shard_namespace(file_name: &str) -> String {
-        file_name
-            .strip_suffix(".json")
-            .unwrap_or(file_name)
-            .replace("%2F", "/")
-            .replace("%25", "%")
-    }
-
     async fn read_blob_index_shards(&self, digest: &Digest) -> Result<Option<BlobIndex>, Error> {
         let refs_dir = path_builder::blob_index_refs_dir(digest);
         let mut entries = self.store.list_dir(&refs_dir).await?;
@@ -190,7 +178,7 @@ impl Backend {
                             Ok(None)
                         } else {
                             Ok(Some((
-                                Self::decode_blob_index_shard_namespace(&entry),
+                                sharded::decode_blob_index_shard_namespace(&entry),
                                 links,
                             )))
                         }
@@ -200,18 +188,16 @@ impl Backend {
                 }
             }
         }))
-        .buffer_unordered(10)
+        .buffer_unordered(sharded::SHARD_READ_CONCURRENCY)
         .collect::<Vec<Result<Option<(String, HashSet<LinkKind>)>, Error>>>()
         .await;
 
-        let mut index = BlobIndex::default();
-        for result in shard_results {
-            if let Some((namespace, links)) = result? {
-                index.namespace.insert(namespace, links);
-            }
-        }
+        let shards = shard_results
+            .into_iter()
+            .filter_map(Result::transpose)
+            .collect::<Result<Vec<_>, _>>()?;
 
-        Ok(Some(index))
+        Ok(Some(sharded::collect_blob_index_shards(shards)))
     }
 
     async fn read_legacy_blob_index(&self, digest: &Digest) -> Result<Option<BlobIndex>, Error> {
@@ -228,20 +214,14 @@ impl Backend {
         digest: &Digest,
         blob_index: &BlobIndex,
     ) -> Result<(), Error> {
-        let guard = self.lock.acquire(&[blob_index_lock_key(digest)]).await?;
-        let result = self
-            .migrate_legacy_blob_index_data_locked(digest, blob_index)
-            .await;
-        let lock_valid = guard.is_valid();
-        guard.release().await;
-
-        result?;
-        if !lock_valid {
-            return Err(Error::Lock(
-                "lock invalidated during blob index layout migration".into(),
-            ));
-        }
-        Ok(())
+        let lock_keys = [blob_index_lock_key(digest)];
+        with_validated_lock(
+            &*self.lock,
+            &lock_keys,
+            "lock invalidated during blob index layout migration",
+            || self.migrate_legacy_blob_index_data_locked(digest, blob_index),
+        )
+        .await
     }
 
     async fn migrate_legacy_blob_index_data_locked(
@@ -291,16 +271,7 @@ impl Backend {
             Err(e) => return Err(Error::from(e)),
         };
 
-        for operation in operations {
-            match operation {
-                BlobIndexOperation::Insert(link) => {
-                    links.insert(link.clone());
-                }
-                BlobIndexOperation::Remove(link) => {
-                    links.remove(link);
-                }
-            }
-        }
+        sharded::apply_blob_index_operations(&mut links, operations);
 
         if links.is_empty() {
             self.store.delete(&shard_path).await?;
@@ -351,7 +322,7 @@ impl Backend {
                 }
             }
         }))
-        .buffer_unordered(10)
+        .buffer_unordered(sharded::SHARD_READ_CONCURRENCY)
         .collect::<Vec<Result<Vec<String>, Error>>>()
         .await;
 
@@ -359,8 +330,7 @@ impl Backend {
         for result in shard_results {
             namespaces.extend(result?);
         }
-        namespaces.sort();
-        namespaces.dedup();
+        let namespaces = sharded::normalize_namespaces(namespaces);
 
         Ok(Some(NamespaceRegistry { namespaces }))
     }
@@ -370,15 +340,9 @@ impl Backend {
         let mut namespaces = self.collect_repositories(base_path).await;
         namespaces.dedup();
 
-        let mut shards: HashMap<String, Vec<String>> = HashMap::new();
-        for namespace in namespaces {
-            let shard_key = path_builder::namespace_shard_key(&namespace);
-            shards.entry(shard_key).or_default().push(namespace);
-        }
+        let shards = sharded::group_namespaces_by_shard(namespaces);
 
-        for (shard_key, mut shard_namespaces) in shards {
-            shard_namespaces.sort();
-            shard_namespaces.dedup();
+        for (shard_key, shard_namespaces) in shards {
             self.process_namespace_shard(&shard_key, &shard_namespaces)
                 .await?;
         }
@@ -391,69 +355,49 @@ impl Backend {
         shard_key: &str,
         shard_namespaces: &[String],
     ) -> Result<(), Error> {
-        let guard = self
-            .lock
-            .acquire(&[format!("namespace_registry_shard_{shard_key}")])
-            .await?;
-
-        let registry = NamespaceRegistry {
-            namespaces: shard_namespaces.to_vec(),
-        };
-        let content = serde_json::to_vec(&registry)?;
-        let path = format!(
-            "{}/{shard_key}.json",
-            path_builder::namespace_registry_shard_dir()
-        );
-        let result = self.store.write(&path, &content).await.map_err(Error::from);
-
-        let lock_valid = guard.is_valid();
-        guard.release().await;
-
-        result?;
-        if !lock_valid {
-            return Err(Error::Lock(
-                "lock invalidated during namespace registry rebuild".into(),
-            ));
-        }
-        Ok(())
+        let lock_keys = [format!("namespace_registry_shard_{shard_key}")];
+        with_validated_lock(
+            &*self.lock,
+            &lock_keys,
+            "lock invalidated during namespace registry rebuild",
+            || async {
+                let registry = sharded::registry_for_namespaces(shard_namespaces);
+                let content = serde_json::to_vec(&registry)?;
+                let path = format!(
+                    "{}/{shard_key}.json",
+                    path_builder::namespace_registry_shard_dir()
+                );
+                self.store.write(&path, &content).await.map_err(Error::from)
+            },
+        )
+        .await
     }
 
     async fn register_namespace(&self, namespace: &str) -> Result<(), Error> {
         let shard_key = path_builder::namespace_shard_key(namespace);
         let path = path_builder::namespace_registry_shard_path(namespace);
-        let guard = self
-            .lock
-            .acquire(&[format!("namespace_registry_shard_{shard_key}")])
-            .await?;
+        let lock_keys = [format!("namespace_registry_shard_{shard_key}")];
+        with_validated_lock(
+            &*self.lock,
+            &lock_keys,
+            "lock invalidated during namespace registry update",
+            || async {
+                let mut registry = match self.store.read(&path).await {
+                    Ok(data) => {
+                        serde_json::from_slice::<NamespaceRegistry>(&data).unwrap_or_default()
+                    }
+                    Err(e) if e.kind() == ErrorKind::NotFound => NamespaceRegistry::default(),
+                    Err(e) => return Err(Error::from(e)),
+                };
 
-        let mut registry = match self.store.read(&path).await {
-            Ok(data) => serde_json::from_slice::<NamespaceRegistry>(&data).unwrap_or_default(),
-            Err(e) if e.kind() == ErrorKind::NotFound => NamespaceRegistry::default(),
-            Err(e) => {
-                guard.release().await;
-                return Err(Error::from(e));
-            }
-        };
-
-        if let Err(pos) = registry.namespaces.binary_search(&namespace.to_string()) {
-            registry.namespaces.insert(pos, namespace.to_string());
-            let content = serde_json::to_vec(&registry)?;
-            if let Err(error) = self.store.write(&path, &content).await {
-                guard.release().await;
-                return Err(Error::from(error));
-            }
-        }
-
-        let lock_valid = guard.is_valid();
-        guard.release().await;
-
-        if !lock_valid {
-            return Err(Error::Lock(
-                "lock invalidated during namespace registry update".into(),
-            ));
-        }
-
-        Ok(())
+                if sharded::insert_sorted_unique(&mut registry.namespaces, namespace) {
+                    let content = serde_json::to_vec(&registry)?;
+                    self.store.write(&path, &content).await?;
+                }
+                Ok(())
+            },
+        )
+        .await
     }
 }
 
@@ -616,20 +560,11 @@ impl MetadataStore for Backend {
         match self.store.read(&shard_path).await {
             Ok(data) => {
                 let links = serde_json::from_slice::<HashSet<LinkKind>>(&data)?;
-                if links.is_empty() {
-                    Err(Error::ReferenceNotFound)
-                } else {
-                    Ok(links)
-                }
+                sharded::non_empty_links_or_not_found(links)
             }
             Err(e) if e.kind() == ErrorKind::NotFound => {
                 let blob_index = self.read_blob_index(digest).await?;
-                blob_index
-                    .namespace
-                    .get(namespace)
-                    .cloned()
-                    .filter(|links| !links.is_empty())
-                    .ok_or(Error::ReferenceNotFound)
+                sharded::namespace_links_from_index(&blob_index, namespace)
             }
             Err(e) => Err(Error::from(e)),
         }
@@ -642,28 +577,21 @@ impl MetadataStore for Backend {
         operation: BlobIndexOperation,
     ) -> Result<(), Error> {
         let lock_keys = [blob_index_lock_key(digest)];
-        let guard = self.lock.acquire(&lock_keys).await?;
-
-        let mut pending_blob_ops: HashMap<Digest, Vec<BlobIndexOperation>> = HashMap::new();
-        pending_blob_ops
-            .entry(digest.clone())
-            .or_default()
-            .push(operation);
-        let result = self
-            .apply_pending_blob_index_ops(namespace, pending_blob_ops)
-            .await;
-
-        let lock_valid = guard.is_valid();
-        guard.release().await;
-
-        result?;
-        if !lock_valid {
-            return Err(Error::Lock(
-                "lock invalidated during blob index update".into(),
-            ));
-        }
-
-        Ok(())
+        with_validated_lock(
+            &*self.lock,
+            &lock_keys,
+            "lock invalidated during blob index update",
+            || async {
+                let mut pending_blob_ops: HashMap<Digest, Vec<BlobIndexOperation>> = HashMap::new();
+                pending_blob_ops
+                    .entry(digest.clone())
+                    .or_default()
+                    .push(operation);
+                self.apply_pending_blob_index_ops(namespace, pending_blob_ops)
+                    .await
+            },
+        )
+        .await
     }
 
     #[instrument(skip(self))]
@@ -692,17 +620,19 @@ impl MetadataStore for Backend {
         update_access_time: bool,
     ) -> Result<LinkMetadata, Error> {
         if update_access_time {
-            let guard = self.lock.acquire(&[link_lock_key(namespace, link)]).await?;
-            let link_data = self.read_link_reference(namespace, link).await?.accessed();
-            if !guard.is_valid() {
-                return Err(Error::Lock(
-                    "lock invalidated during access time update".into(),
-                ));
-            }
-            self.write_link_reference(namespace, link, &link_data)
-                .await?;
-            guard.release().await;
-            Ok(link_data)
+            let lock_keys = [link_lock_key(namespace, link)];
+            with_validated_lock(
+                &*self.lock,
+                &lock_keys,
+                "lock invalidated during access time update",
+                || async {
+                    let link_data = self.read_link_reference(namespace, link).await?.accessed();
+                    self.write_link_reference(namespace, link, &link_data)
+                        .await?;
+                    Ok(link_data)
+                },
+            )
+            .await
         } else {
             self.read_link_reference(namespace, link).await
         }
