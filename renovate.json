@@ -1,46 +1,83 @@
 {
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
-  "extends": ["config:recommended"],
-  "labels": ["dependencies"],
-  "packageRules": [
-    {
-      "description": "Group all Rust dependencies",
-      "matchManagers": ["cargo"],
-      "groupName": "rust dependencies"
-    },
-    {
-      "description": "Group Docusaurus dependencies",
-      "matchManagers": ["npm"],
-      "matchFileNames": ["website/package.json"],
-      "matchPackagePatterns": ["^@docusaurus/"],
-      "groupName": "docusaurus"
-    },
-    {
-      "description": "Group React dependencies for website",
-      "matchManagers": ["npm"],
-      "matchFileNames": ["website/package.json"],
-      "matchPackageNames": ["react", "react-dom", "@mdx-js/react"],
-      "groupName": "website react"
-    },
-    {
-      "description": "Group Svelte/SvelteKit dependencies",
-      "matchManagers": ["npm"],
-      "matchFileNames": ["ui/package.json"],
-      "matchPackagePatterns": ["^@sveltejs/", "^svelte"],
-      "groupName": "svelte"
-    },
-    {
-      "description": "Group Vite dependencies for UI",
-      "matchManagers": ["npm"],
-      "matchFileNames": ["ui/package.json"],
-      "matchPackageNames": ["vite", "typescript"],
-      "groupName": "ui build tools"
-    }
+  "extends": [
+    "config:recommended",
+    ":semanticCommits",
+    ":dependencyDashboard"
   ],
+  "labels": ["dependencies"],
+  "timezone": "Europe/Paris",
+  "schedule": ["before 5am on monday"],
+  "prConcurrentLimit": 5,
+  "prHourlyLimit": 2,
+  "minimumReleaseAge": "3 days",
+  "rebaseWhen": "behind-base-branch",
   "lockFileMaintenance": {
-    "enabled": true
+    "enabled": true,
+    "schedule": ["before 5am on monday"]
   },
   "vulnerabilityAlerts": {
-    "labels": ["security"]
-  }
+    "labels": ["security", "dependencies"],
+    "minimumReleaseAge": null,
+    "schedule": ["at any time"]
+  },
+  "packageRules": [
+    {
+      "description": "Website (Docusaurus): group every dependency into one PR. npm install + npm dedupe run automatically; transitive overrides in package.json are honored.",
+      "matchManagers": ["npm"],
+      "matchFileNames": ["website/package.json"],
+      "groupName": "website dependencies",
+      "groupSlug": "website-deps",
+      "commitMessageTopic": "website dependencies",
+      "semanticCommitType": "chore",
+      "semanticCommitScope": "website",
+      "rangeStrategy": "bump",
+      "postUpdateOptions": ["npmDedupe"],
+      "lockFileMaintenance": {
+        "enabled": true
+      }
+    },
+    {
+      "description": "UI (SvelteKit): group every dependency into one PR. npm install + npm dedupe run automatically; the cookie override is preserved.",
+      "matchManagers": ["npm"],
+      "matchFileNames": ["ui/package.json"],
+      "groupName": "ui dependencies",
+      "groupSlug": "ui-deps",
+      "commitMessageTopic": "ui dependencies",
+      "semanticCommitType": "chore",
+      "semanticCommitScope": "ui",
+      "rangeStrategy": "bump",
+      "postUpdateOptions": ["npmDedupe"],
+      "lockFileMaintenance": {
+        "enabled": true
+      }
+    },
+    {
+      "description": "Rust core crate: group every cargo dependency into one PR. Renovate updates Cargo.lock automatically by running `cargo update -p <crate>` for each bumped package.",
+      "matchManagers": ["cargo"],
+      "groupName": "rust dependencies",
+      "groupSlug": "rust-deps",
+      "commitMessageTopic": "rust dependencies",
+      "semanticCommitType": "chore",
+      "semanticCommitScope": "deps",
+      "rangeStrategy": "bump",
+      "lockFileMaintenance": {
+        "enabled": true
+      }
+    },
+    {
+      "description": "GitHub Actions: keep workflow action versions current in a single PR.",
+      "matchManagers": ["github-actions"],
+      "groupName": "github actions",
+      "groupSlug": "github-actions",
+      "commitMessageTopic": "github actions",
+      "semanticCommitType": "chore",
+      "semanticCommitScope": "ci"
+    },
+    {
+      "description": "Hold back major bumps for 7 days to let ecosystems stabilize.",
+      "matchUpdateTypes": ["major"],
+      "minimumReleaseAge": "7 days"
+    }
+  ]
 }
