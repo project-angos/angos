@@ -26,6 +26,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - Auth-webhook transport failures surface as errors instead of silent denials.
 - Webhook retries are capped at 16 with saturating backoff arithmetic.
 - The S3 shard-key hash uses SHA-256, so shard placement is stable across processes and builds.
+- Filesystem metadata now uses the same sharded blob-index and namespace-registry layout as S3, and scrub migrates legacy filesystem and S3 metadata files to the sharded layout.
 - The Redis client reuses a multiplexed connection across operations and backs off on lock contention.
 - UI, documentation-website and Rust dependencies upgraded.
 
