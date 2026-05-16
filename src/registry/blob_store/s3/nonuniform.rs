@@ -1,4 +1,4 @@
-use std::io::Cursor;
+use std::io::{Cursor, Error as IoError};
 
 use bytes::{Bytes, BytesMut};
 use tokio::{
@@ -38,6 +38,8 @@ struct BufferContext<'a> {
     pending_size: u64,
 }
 
+type StreamingUploadHandle = AbortOnDropHandle<Result<String, IoError>>;
+
 impl Backend {
     pub async fn resolve_nonuniform_state(
         &self,
@@ -73,6 +75,26 @@ impl Backend {
         }
     }
 
+    fn spawn_nonuniform_upload_part(
+        &self,
+        ctx: &FlushContext<'_>,
+    ) -> (mpsc::Sender<Bytes>, StreamingUploadHandle) {
+        let (tx, rx) = mpsc::channel::<Bytes>(FRAME_BUFFER_CAPACITY);
+
+        let store = self.store.clone();
+        let upload_path = ctx.upload_path.to_string();
+        let upload_id = ctx.upload_id.to_string();
+        let part_number = ctx.part_number;
+        let available = ctx.available;
+        let upload_handle = AbortOnDropHandle::new(tokio::spawn(async move {
+            store
+                .upload_part_streaming(&upload_path, &upload_id, part_number, available, rx)
+                .await
+        }));
+
+        (tx, upload_handle)
+    }
+
     async fn flush_pending_as_part(
         &self,
         name: &str,
@@ -90,23 +112,7 @@ impl Backend {
         };
 
         let mut hashing_reader = HashingReader::with_hasher(combined, hasher);
-
-        let (tx, rx) = mpsc::channel::<Bytes>(FRAME_BUFFER_CAPACITY);
-
-        let store = self.store.clone();
-        let upload_path_owned = ctx.upload_path.to_string();
-        let upload_id_owned = ctx.upload_id.to_string();
-        let upload_handle = AbortOnDropHandle::new(tokio::spawn(async move {
-            store
-                .upload_part_streaming(
-                    &upload_path_owned,
-                    &upload_id_owned,
-                    ctx.part_number,
-                    ctx.available,
-                    rx,
-                )
-                .await
-        }));
+        let (tx, upload_handle) = self.spawn_nonuniform_upload_part(&ctx);
 
         let mut buf = BytesMut::with_capacity(FRAME_SIZE);
         let mut sent = 0;

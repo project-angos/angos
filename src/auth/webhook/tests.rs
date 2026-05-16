@@ -899,7 +899,7 @@ async fn webhook_authorization_succeeds_despite_cache_store_error() {
 async fn test_authorize_timeout_does_not_cache_and_retries() {
     let slow_server = MockServer::start().await;
     Mock::given(method("GET"))
-        .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_millis(2000)))
+        .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(2)))
         .expect(1)
         .mount(&slow_server)
         .await;
