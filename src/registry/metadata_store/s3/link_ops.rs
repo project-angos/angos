@@ -166,6 +166,10 @@ impl LockOps for Backend {
         namespace: &str,
         pending_blob_ops: HashMap<Digest, Vec<BlobIndexOperation>>,
     ) -> Result<(), Error> {
+        for digest in pending_blob_ops.keys() {
+            self.migrate_blob_index_layout(digest).await?;
+        }
+
         if self.conditional_capabilities.supports_cas() {
             join_all(
                 pending_blob_ops

@@ -171,16 +171,8 @@ impl Backend {
         };
         let blob_index: BlobIndex = serde_json::from_slice(&data).map_err(Error::from)?;
 
-        // Migrate: write shards, then delete legacy file
-        for (namespace, links) in &blob_index.namespace {
-            let ops: Vec<BlobIndexOperation> = links
-                .iter()
-                .map(|link| BlobIndexOperation::Insert(link.clone()))
-                .collect();
-            self.update_blob_index_shard(namespace, digest, &ops)
-                .await?;
-        }
-        self.store.delete(&legacy_path).await?;
+        self.migrate_legacy_blob_index_data(digest, &blob_index)
+            .await?;
         info!(
             "Migrated legacy blob index for '{digest}' ({} namespaces)",
             blob_index.namespace.len()
@@ -299,6 +291,49 @@ impl Backend {
             self.store.put_object(&shard_path, content).await?;
         }
 
+        Ok(())
+    }
+
+    async fn migrate_legacy_blob_index_data(
+        &self,
+        digest: &Digest,
+        blob_index: &BlobIndex,
+    ) -> Result<(), Error> {
+        for (namespace, links) in &blob_index.namespace {
+            let operations: Vec<BlobIndexOperation> = links
+                .iter()
+                .map(|link| BlobIndexOperation::Insert(link.clone()))
+                .collect();
+
+            if self.conditional_capabilities.supports_cas() {
+                self.update_blob_index_cas(namespace, digest, &operations)
+                    .await?;
+            } else {
+                self.update_blob_index_shard(namespace, digest, &operations)
+                    .await?;
+            }
+        }
+
+        let legacy_path = path_builder::blob_index_path(digest);
+        self.store.delete(&legacy_path).await?;
+        Ok(())
+    }
+
+    pub async fn migrate_blob_index_layout(&self, digest: &Digest) -> Result<(), Error> {
+        let legacy_path = path_builder::blob_index_path(digest);
+        let data = match self.store.read(&legacy_path).await {
+            Ok(data) => data,
+            Err(e) if e.kind() == ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(e.into()),
+        };
+        let blob_index: BlobIndex = serde_json::from_slice(&data).map_err(Error::from)?;
+
+        self.migrate_legacy_blob_index_data(digest, &blob_index)
+            .await?;
+        info!(
+            "Migrated legacy blob index for '{digest}' ({} namespaces)",
+            blob_index.namespace.len()
+        );
         Ok(())
     }
 }

@@ -7,7 +7,7 @@ use super::command::Options;
 use crate::{
     command::scrub::{
         check::{
-            BlobChecker, LinkReferencesChecker, ManifestChecker, MediaTypeChecker,
+            BlobChecker, LayoutChecker, LinkReferencesChecker, ManifestChecker, MediaTypeChecker,
             MultipartChecker, NamespaceChecker, RetentionChecker, TagChecker, UploadChecker,
         },
         error::Error,
@@ -90,6 +90,10 @@ pub fn namespace_checkers(
     }
 
     Ok(checkers)
+}
+
+pub fn layout_checker(blob_store: &Arc<dyn BlobStore>) -> LayoutChecker {
+    LayoutChecker::new(blob_store.clone())
 }
 
 pub fn blob_checker(

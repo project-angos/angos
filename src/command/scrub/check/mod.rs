@@ -1,4 +1,5 @@
 mod blob;
+mod layout;
 mod link_references;
 mod link_repair;
 pub mod list_all;
@@ -11,6 +12,7 @@ mod upload;
 
 use async_trait::async_trait;
 pub use blob::BlobChecker;
+pub use layout::LayoutChecker;
 pub use link_references::LinkReferencesChecker;
 pub use link_repair::ensure_link;
 pub use manifest::ManifestChecker;

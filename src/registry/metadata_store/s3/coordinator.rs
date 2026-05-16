@@ -240,11 +240,10 @@ impl WriteCoordinator for CasCoordinator {
             pending_blob_ops.entry(digest).or_default().extend(ops);
         }
 
-        join_all(
-            pending_blob_ops
-                .iter()
-                .map(|(digest, ops)| backend.update_blob_index_cas(namespace, digest, ops)),
-        )
+        join_all(pending_blob_ops.iter().map(|(digest, ops)| async move {
+            backend.migrate_blob_index_layout(digest).await?;
+            backend.update_blob_index_cas(namespace, digest, ops).await
+        }))
         .await
         .into_iter()
         .collect::<Result<Vec<_>, _>>()?;
@@ -264,6 +263,7 @@ impl WriteCoordinator for CasCoordinator {
         digest: &Digest,
         operation: BlobIndexOperation,
     ) -> Result<(), Error> {
+        backend.migrate_blob_index_layout(digest).await?;
         backend
             .update_blob_index_cas(namespace, digest, &[operation])
             .await
@@ -449,6 +449,7 @@ impl WriteCoordinator for LockCoordinator {
         operation: BlobIndexOperation,
     ) -> Result<(), Error> {
         if backend.conditional_capabilities.supports_cas() {
+            backend.migrate_blob_index_layout(digest).await?;
             return backend
                 .update_blob_index_cas(namespace, digest, &[operation])
                 .await;
@@ -459,9 +460,13 @@ impl WriteCoordinator for LockCoordinator {
             .acquire(&[format!("{namespace}:blob:{digest}")])
             .await?;
 
-        let result = backend
-            .update_blob_index_shard(namespace, digest, &[operation])
-            .await;
+        let result = async {
+            backend.migrate_blob_index_layout(digest).await?;
+            backend
+                .update_blob_index_shard(namespace, digest, &[operation])
+                .await
+        }
+        .await;
 
         let lock_valid = guard.is_valid();
         guard.release().await;

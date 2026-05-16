@@ -7,6 +7,8 @@ use crate::{oci::Digest, registry::metadata_store::link_kind::LinkKind};
 /// Checkers produce `Action` values via their `ActionSink`; the `Executor`
 /// applies them (or skips them in dry-run mode) in one place.
 pub enum Action {
+    MigrateNamespaceRegistry,
+    MigrateBlobIndex(Digest),
     DeleteOrphanBlob(Digest),
     RemoveBlobIndexLink {
         namespace: String,
@@ -52,6 +54,12 @@ pub enum Action {
 impl fmt::Display for Action {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Action::MigrateNamespaceRegistry => {
+                write!(f, "migrate namespace registry layout")
+            }
+            Action::MigrateBlobIndex(digest) => {
+                write!(f, "migrate blob index layout for '{digest}'")
+            }
             Action::DeleteOrphanBlob(digest) => {
                 write!(f, "delete orphan blob '{digest}'")
             }

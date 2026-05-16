@@ -8,7 +8,10 @@ use crate::{
     command::{
         bootstrap,
         scrub::{
-            check::{BlobChecker, MultipartChecker, NamespaceChecker, StoreChecker, list_all},
+            check::{
+                BlobChecker, LayoutChecker, MultipartChecker, NamespaceChecker, StoreChecker,
+                list_all,
+            },
             error::Error,
             executor::{ActionSink, DryRunSink, Executor},
             setup,
@@ -58,6 +61,7 @@ pub struct Options {
 pub struct Command {
     metadata_store: Arc<dyn MetadataStore + Send + Sync>,
     namespace_checkers: Vec<Box<dyn NamespaceChecker>>,
+    layout_checker: LayoutChecker,
     blob_checker: Option<BlobChecker>,
     multipart_checker: Option<MultipartChecker>,
     sink: Box<dyn ActionSink + Send>,
@@ -84,6 +88,7 @@ impl Command {
             &metadata_store,
             &repositories,
         )?;
+        let layout_checker = setup::layout_checker(&blob_handles.blob_store);
         let blob_checker = setup::blob_checker(options, &blob_handles.blob_store, &metadata_store);
         let multipart_checker =
             setup::multipart_checker(options, blob_handles.multipart_cleanup.clone())?;
@@ -103,6 +108,7 @@ impl Command {
         Ok(Self {
             metadata_store,
             namespace_checkers,
+            layout_checker,
             blob_checker,
             multipart_checker,
             sink,
@@ -110,10 +116,18 @@ impl Command {
     }
 
     pub async fn run(&mut self) -> Result<(), Error> {
+        self.migrate_storage_layout().await?;
         self.scrub_metadata().await?;
         self.scrub_blobs().await?;
         self.scrub_multipart_uploads().await?;
 
+        Ok(())
+    }
+
+    async fn migrate_storage_layout(&mut self) -> Result<(), Error> {
+        if let Err(e) = self.layout_checker.check_all(self.sink.as_mut()).await {
+            tracing::warn!("Storage layout migration checker failed: {e}");
+        }
         Ok(())
     }
 

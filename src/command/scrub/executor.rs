@@ -87,6 +87,12 @@ impl ActionSink for Executor {
         info!("{action}");
 
         match action {
+            Action::MigrateNamespaceRegistry => {
+                self.metadata_store.migrate_namespace_registry().await?;
+            }
+            Action::MigrateBlobIndex(digest) => {
+                self.metadata_store.migrate_blob_index(&digest).await?;
+            }
             Action::DeleteOrphanBlob(digest) => {
                 self.blob_store.delete(&digest).await?;
             }
