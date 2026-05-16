@@ -13,6 +13,8 @@ pub enum Error {
     Initialization(String),
     #[error("blob unknown to registry")]
     BlobUnknown,
+    #[error("blob is still referenced")]
+    BlobReferenced,
     #[error("blob upload unknown to registry")]
     BlobUploadUnknown,
     #[error("provided digest did not match uploaded content")]
@@ -83,6 +85,9 @@ impl From<blob_store::Error> for Error {
             blob_store::Error::UploadNotFound => Error::BlobUploadUnknown,
             blob_store::Error::BlobNotFound => Error::BlobUnknown,
             blob_store::Error::ReferenceNotFound => Error::ManifestBlobUnknown,
+            blob_store::Error::UploadBodyRead(_) | blob_store::Error::UploadBodySize { .. } => {
+                Error::RangeNotSatisfiable
+            }
             _ => Error::Internal(format!("Data store error during operations: {error}")),
         }
     }
@@ -182,6 +187,19 @@ mod tests {
     }
 
     #[test]
+    fn from_blob_store_routes_upload_body_errors() {
+        let read_err: Error = blob_store::Error::UploadBodyRead("reset".to_string()).into();
+        assert!(matches!(read_err, Error::RangeNotSatisfiable));
+
+        let size_err: Error = blob_store::Error::UploadBodySize {
+            expected: 10,
+            actual: 8,
+        }
+        .into();
+        assert!(matches!(size_err, Error::RangeNotSatisfiable));
+    }
+
+    #[test]
     fn from_blob_store_catch_all_produces_internal() {
         let err: Error = blob_store::Error::StorageBackend("backend down".to_string()).into();
         assert!(matches!(err, Error::Internal(_)));
@@ -215,6 +233,10 @@ mod tests {
     #[test]
     fn display_strings_match_legacy_values() {
         assert_eq!(Error::BlobUnknown.to_string(), "blob unknown to registry");
+        assert_eq!(
+            Error::BlobReferenced.to_string(),
+            "blob is still referenced"
+        );
         assert_eq!(
             Error::BlobUploadUnknown.to_string(),
             "blob upload unknown to registry"

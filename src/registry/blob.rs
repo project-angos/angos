@@ -1,4 +1,7 @@
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 
 use hyper::header::{ACCEPT_RANGES, CONTENT_LENGTH, CONTENT_RANGE, LOCATION};
 use tokio::io::{AsyncRead, AsyncReadExt};
@@ -9,10 +12,9 @@ use crate::{
     oci::{Digest, Namespace},
     registry::{
         DOCKER_CONTENT_DIGEST, Error, Registry, Repository,
+        blob_ownership::BlobOwnership,
         blob_store::{BoxedReader, UploadStore},
-        metadata_store::{
-            self, BlobIndexOperation, MetadataStore, MetadataStoreExt, link_kind::LinkKind,
-        },
+        metadata_store::{Error as MetadataError, MetadataStore, link_kind::LinkKind},
         task_queue,
     },
 };
@@ -123,28 +125,13 @@ fn get_blob_redirect_headers(url: String, digest: &Digest) -> HashMap<&'static s
     ])
 }
 
-impl Registry {
-    async fn check_blob_namespace_access(
-        &self,
-        namespace: &Namespace,
-        digest: &Digest,
-    ) -> Result<(), Error> {
-        match self.metadata_store.read_blob_index(digest).await {
-            Ok(blob_index) => {
-                if blob_index.namespace.contains_key(namespace.as_ref()) {
-                    Ok(())
-                } else {
-                    Err(Error::BlobUnknown)
-                }
-            }
-            Err(metadata_store::Error::ReferenceNotFound) => Ok(()),
-            Err(e) => {
-                warn!("Failed to read blob index for {digest}: {e}");
-                Err(e.into())
-            }
-        }
-    }
+fn has_non_ownership_reference(links: &HashSet<LinkKind>, digest: &Digest) -> bool {
+    links
+        .iter()
+        .any(|link| !matches!(link, LinkKind::Blob(link_digest) if link_digest == digest))
+}
 
+impl Registry {
     #[instrument(skip(repository))]
     pub async fn head_blob(
         &self,
@@ -153,29 +140,55 @@ impl Registry {
         namespace: &Namespace,
         digest: &Digest,
     ) -> Result<HeadBlobResponse, Error> {
-        if !repository.is_pull_through() {
-            self.check_blob_namespace_access(namespace, digest).await?;
+        let has_access = BlobOwnership::new(self.metadata_store.as_ref())
+            .can_read(namespace, digest)
+            .await?;
+
+        if !repository.is_pull_through() && !has_access {
+            return Err(Error::BlobUnknown);
         }
 
-        let blob = self.blob_store.size(digest).await;
-
-        match blob {
-            Ok(size) => Ok(HeadBlobResponse {
-                headers: head_blob_headers(digest, size),
-            }),
-            Err(_) if repository.is_pull_through() => {
-                let (digest, size) = repository
-                    .head_blob(accepted_types, namespace, digest)
-                    .await?;
-                Ok(HeadBlobResponse {
-                    headers: head_blob_headers(&digest, size),
-                })
-            }
-            Err(e) => {
-                warn!("Blob with digest {digest} not found: {e}");
-                Err(Error::BlobUnknown)
+        if has_access {
+            match self.blob_store.size(digest).await {
+                Ok(size) => {
+                    return Ok(HeadBlobResponse {
+                        headers: head_blob_headers(digest, size),
+                    });
+                }
+                Err(error) if !repository.is_pull_through() => {
+                    warn!("Blob with digest {digest} not found: {error}");
+                    return Err(Error::BlobUnknown);
+                }
+                Err(_) => {}
             }
         }
+
+        if repository.is_pull_through() {
+            let (digest, size) = repository
+                .head_blob(accepted_types, namespace, digest)
+                .await?;
+            Ok(HeadBlobResponse {
+                headers: head_blob_headers(&digest, size),
+            })
+        } else {
+            Err(Error::BlobUnknown)
+        }
+    }
+
+    async fn try_get_owned_local_blob(
+        &self,
+        namespace: &Namespace,
+        digest: &Digest,
+        range: Option<BlobRange>,
+    ) -> Result<Option<GetBlobResponse>, Error> {
+        if !BlobOwnership::new(self.metadata_store.as_ref())
+            .can_read(namespace, digest)
+            .await?
+        {
+            return Ok(None);
+        }
+
+        self.get_local_blob(digest, range).await.map(Some)
     }
 
     #[instrument(skip(upload_engine, stream))]
@@ -215,12 +228,8 @@ impl Registry {
         Self::copy_blob(upload_store, stream, &namespace, &digest)
             .await
             .map_err(|e| task_queue::Error::TaskExecution(e.to_string()))?;
-        metadata_store
-            .update_blob_index(
-                namespace.as_ref(),
-                &digest,
-                BlobIndexOperation::Insert(LinkKind::Layer(digest.clone())),
-            )
+        BlobOwnership::new(metadata_store.as_ref())
+            .grant(&namespace, &digest)
             .await
             .map_err(|e| task_queue::Error::TaskExecution(e.to_string()))?;
         info!("Caching of {digest} completed");
@@ -236,17 +245,15 @@ impl Registry {
         digest: &Digest,
         range: Option<BlobRange>,
     ) -> Result<GetBlobResponse, Error> {
-        if !repository.is_pull_through() {
-            self.check_blob_namespace_access(namespace, digest).await?;
-        }
-
-        match self.get_local_blob(digest, range).await {
-            Ok(response) => return Ok(response),
-            Err(_) if !repository.is_pull_through() => {
-                warn!("Blob not found locally: {digest}");
-                return Err(Error::BlobUnknown);
-            }
-            Err(_) => {}
+        match self
+            .try_get_owned_local_blob(namespace, digest, range)
+            .await
+        {
+            Ok(Some(response)) => return Ok(response),
+            Ok(None) if !repository.is_pull_through() => return Err(Error::BlobUnknown),
+            Ok(None) => {}
+            Err(Error::BlobUnknown) if repository.is_pull_through() => {}
+            Err(error) => return Err(error),
         }
 
         if range.is_some() {
@@ -314,39 +321,32 @@ impl Registry {
 
     #[instrument]
     pub async fn delete_blob(&self, namespace: &Namespace, digest: &Digest) -> Result<(), Error> {
-        let mut tx = self.metadata_store.begin_transaction(namespace);
-        tx.delete_link(&LinkKind::Layer(digest.clone()));
-        tx.delete_link(&LinkKind::Config(digest.clone()));
+        let guard = self.metadata_store.acquire_blob_data_lock(digest).await?;
+        let result = async {
+            let ownership = BlobOwnership::new(self.metadata_store.as_ref());
+            let links = ownership.references(namespace, digest).await?;
 
-        if let Err(error) = tx.commit().await {
-            warn!("Failed to delete blob links: {error}");
-        }
-
-        if let Ok(blob_index) = self.metadata_store.read_blob_index(digest).await
-            && let Some(links) = blob_index.namespace.get(namespace.as_ref())
-        {
-            for link in links {
-                if let Err(error) = self
-                    .metadata_store
-                    .update_blob_index(
-                        namespace.as_ref(),
-                        digest,
-                        BlobIndexOperation::Remove(link.clone()),
-                    )
-                    .await
-                {
-                    warn!("Failed to remove blob index entry: {error}");
-                }
+            if links.is_empty() {
+                return Err(Error::BlobUnknown);
             }
+
+            if has_non_ownership_reference(&links, digest) {
+                return Err(Error::BlobReferenced);
+            }
+
+            ownership
+                .revoke(namespace, digest, LinkKind::Blob(digest.clone()))
+                .await?;
+
+            self.delete_blob_data_if_unreferenced_locked(digest).await
         }
+        .await;
+        let lock_valid = guard.is_valid();
+        guard.release().await;
 
-        let should_delete = match self.metadata_store.read_blob_index(digest).await {
-            Ok(blob_index) => blob_index.namespace.is_empty(),
-            Err(_) => true,
-        };
-
-        if should_delete && let Err(error) = self.blob_store.delete(digest).await {
-            warn!("Failed to delete blob data: {error}");
+        result?;
+        if !lock_valid {
+            return Err(MetadataError::Lock("lock invalidated during blob deletion".into()).into());
         }
 
         Ok(())
@@ -366,13 +366,18 @@ impl Registry {
     ) -> Result<GetBlobResponse, Error> {
         let repository = self.get_repository_for_namespace(namespace)?;
 
-        if !repository.is_pull_through() {
-            self.check_blob_namespace_access(namespace, digest).await?;
+        let has_access = BlobOwnership::new(self.metadata_store.as_ref())
+            .can_read(namespace, digest)
+            .await?;
+
+        if !repository.is_pull_through() && !has_access {
+            return Err(Error::BlobUnknown);
         }
 
         if range.is_none()
             && self.enable_blob_redirect
-            && (!repository.is_pull_through() || self.blob_store.size(digest).await.is_ok())
+            && has_access
+            && self.blob_store.size(digest).await.is_ok()
             && let Some(presigned) = &self.presigned_blob_store
             && let Ok(Some(presigned_url)) = presigned.url(digest, None).await
         {
@@ -388,7 +393,7 @@ impl Registry {
 
 #[cfg(test)]
 mod tests {
-    use std::io::Cursor;
+    use std::{io::Cursor, time::Duration};
 
     use hyper::header::{ACCEPT_RANGES, CONTENT_LENGTH, CONTENT_RANGE, LOCATION};
     use tokio::io::AsyncReadExt;
@@ -398,6 +403,7 @@ mod tests {
         oci::Namespace,
         registry::{
             DOCKER_CONTENT_DIGEST,
+            metadata_store::MetadataStoreExt,
             test_utils::{backends, create_test_blob},
         },
         util::sha256,
@@ -455,6 +461,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn get_blob_rejects_local_blob_without_namespace_ownership() {
+        for test_case in backends() {
+            let registry = test_case.registry();
+            let namespace = &Namespace::new("test-repo").unwrap();
+            let content = b"unowned blob content";
+            let digest = registry.blob_store.create(content).await.unwrap();
+            let repository = registry.get_repository_for_namespace(namespace).unwrap();
+
+            let head_result = registry
+                .head_blob(repository, &[], namespace, &digest)
+                .await;
+            assert!(matches!(head_result, Err(Error::BlobUnknown)));
+
+            let get_result = registry
+                .get_blob(repository, &[], namespace, &digest, None)
+                .await;
+            assert!(matches!(get_result, Err(Error::BlobUnknown)));
+
+            test_case.cleanup().await;
+        }
+    }
+
+    #[tokio::test]
     async fn test_get_blob_with_range() {
         for test_case in backends() {
             let registry = test_case.registry();
@@ -498,30 +527,11 @@ mod tests {
             let namespace = &Namespace::new("test-repo").unwrap();
             let content = b"test blob content";
 
-            let (digest, _) = create_test_blob(registry, namespace, content).await;
-
-            let layer_link = LinkKind::Layer(digest.clone());
-            let config_link = LinkKind::Config(digest.clone());
-
-            let mut tx = registry.metadata_store.begin_transaction(namespace);
-            tx.create_link(&layer_link, &digest).add();
-            tx.create_link(&config_link, &digest).add();
-            tx.commit().await.unwrap();
-
-            assert!(
-                registry
-                    .metadata_store
-                    .read_link(namespace, &layer_link, false)
-                    .await
-                    .is_ok()
-            );
-            assert!(
-                registry
-                    .metadata_store
-                    .read_link(namespace, &config_link, false)
-                    .await
-                    .is_ok()
-            );
+            let digest = registry.blob_store.create(content).await.unwrap();
+            BlobOwnership::new(registry.metadata_store.as_ref())
+                .grant(namespace, &digest)
+                .await
+                .unwrap();
 
             let blob_index = registry
                 .metadata_store
@@ -530,25 +540,186 @@ mod tests {
                 .unwrap();
             assert!(blob_index.namespace.contains_key(namespace.as_ref()));
             let namespace_links = blob_index.namespace.get(namespace.as_ref()).unwrap();
-            assert!(namespace_links.contains(&layer_link));
-            assert!(namespace_links.contains(&config_link));
+            assert!(namespace_links.contains(&LinkKind::Blob(digest.clone())));
 
             registry.delete_blob(namespace, &digest).await.unwrap();
 
+            assert!(registry.blob_store.read(&digest).await.is_err());
             assert!(
                 registry
                     .metadata_store
-                    .read_link(namespace, &layer_link, false)
+                    .read_blob_index(&digest)
                     .await
                     .is_err()
             );
+            test_case.cleanup().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn delete_blob_rejects_manifest_referenced_blob() {
+        for test_case in backends() {
+            let registry = test_case.registry();
+            let namespace = &Namespace::new("test-repo").unwrap();
+            let content = b"referenced blob content";
+            let digest = registry.blob_store.create(content).await.unwrap();
+            let link = LinkKind::Config(digest.clone());
+
+            let mut tx = registry.metadata_store.begin_transaction(namespace);
+            tx.create_link(&link, &digest)
+                .with_referrer(&sha256::digest(b"manifest"))
+                .add();
+            tx.commit().await.unwrap();
+
+            let result = registry.delete_blob(namespace, &digest).await;
+            assert!(matches!(result, Err(Error::BlobReferenced)));
+
+            let stored_content = registry.blob_store.read(&digest).await.unwrap();
+            assert_eq!(stored_content, content);
             assert!(
                 registry
                     .metadata_store
-                    .read_link(namespace, &config_link, false)
+                    .read_link(namespace, &link, false)
                     .await
-                    .is_err()
+                    .is_ok()
             );
+            test_case.cleanup().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn delete_blob_rejects_all_metadata_references() {
+        for test_case in backends() {
+            let registry = test_case.registry();
+            let namespace = &Namespace::new("test-repo").unwrap();
+            let parent = sha256::digest(b"index manifest");
+            let subject = sha256::digest(b"subject manifest");
+
+            let cases = [
+                LinkKind::Digest(sha256::digest(b"digest reference")),
+                LinkKind::Tag("latest".to_string()),
+                LinkKind::Layer(sha256::digest(b"layer reference")),
+                LinkKind::Config(sha256::digest(b"config reference")),
+                LinkKind::Manifest(parent.clone(), sha256::digest(b"child manifest")),
+                LinkKind::Referrer(subject, sha256::digest(b"referrer manifest")),
+            ];
+
+            for link in cases {
+                let content = format!("content for {link}").into_bytes();
+                let digest = registry.blob_store.create(&content).await.unwrap();
+                BlobOwnership::new(registry.metadata_store.as_ref())
+                    .grant(namespace, &digest)
+                    .await
+                    .unwrap();
+
+                let mut tx = registry.metadata_store.begin_transaction(namespace);
+                let builder = tx.create_link(&retarget_link(&link, &digest), &digest);
+                if let LinkKind::Manifest(parent, _) = &link {
+                    builder.with_referrer(parent).add();
+                } else {
+                    builder.add();
+                }
+                tx.commit().await.unwrap();
+
+                let result = registry.delete_blob(namespace, &digest).await;
+                assert!(matches!(result, Err(Error::BlobReferenced)));
+                assert_eq!(registry.blob_store.read(&digest).await.unwrap(), content);
+            }
+
+            test_case.cleanup().await;
+        }
+    }
+
+    fn retarget_link(link: &LinkKind, digest: &Digest) -> LinkKind {
+        match link {
+            LinkKind::Digest(_) => LinkKind::Digest(digest.clone()),
+            LinkKind::Layer(_) => LinkKind::Layer(digest.clone()),
+            LinkKind::Config(_) => LinkKind::Config(digest.clone()),
+            LinkKind::Manifest(parent, _) => LinkKind::Manifest(parent.clone(), digest.clone()),
+            LinkKind::Referrer(subject, _) => LinkKind::Referrer(subject.clone(), digest.clone()),
+            LinkKind::Blob(_) | LinkKind::Tag(_) => link.clone(),
+        }
+    }
+
+    #[tokio::test]
+    async fn delete_blob_keeps_data_owned_by_other_namespace() {
+        for test_case in backends() {
+            let registry = test_case.registry();
+            let first = &Namespace::new("test-repo/first").unwrap();
+            let second = &Namespace::new("test-repo/second").unwrap();
+            let content = b"shared blob content";
+            let digest = registry.blob_store.create(content).await.unwrap();
+            let ownership = BlobOwnership::new(registry.metadata_store.as_ref());
+
+            ownership.grant(first, &digest).await.unwrap();
+            ownership.grant(second, &digest).await.unwrap();
+
+            registry.delete_blob(first, &digest).await.unwrap();
+
+            assert_eq!(registry.blob_store.read(&digest).await.unwrap(), content);
+            assert!(!ownership.can_read(first, &digest).await.unwrap());
+            assert!(ownership.can_read(second, &digest).await.unwrap());
+
+            registry.delete_blob(second, &digest).await.unwrap();
+
+            assert!(registry.blob_store.read(&digest).await.is_err());
+            test_case.cleanup().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn delete_blob_waits_for_blob_data_lock_before_reclaiming_data() {
+        for test_case in backends() {
+            let registry = test_case.registry();
+            let first = &Namespace::new("test-repo/first").unwrap();
+            let second = &Namespace::new("test-repo/second").unwrap();
+            let content = b"shared blob content";
+            let digest = registry.blob_store.create(content).await.unwrap();
+            let ownership = BlobOwnership::new(registry.metadata_store.as_ref());
+
+            ownership.grant(first, &digest).await.unwrap();
+
+            let guard = registry
+                .metadata_store
+                .acquire_blob_data_lock(&digest)
+                .await
+                .unwrap();
+            let delete = registry.delete_blob(first, &digest);
+            tokio::pin!(delete);
+
+            tokio::select! {
+                result = &mut delete => {
+                    panic!("delete completed while blob data lock was held: {result:?}");
+                }
+                () = tokio::time::sleep(Duration::from_millis(25)) => {}
+            }
+
+            ownership.grant(second, &digest).await.unwrap();
+            guard.release().await;
+            delete.await.unwrap();
+
+            assert_eq!(registry.blob_store.read(&digest).await.unwrap(), content);
+            assert!(!ownership.can_read(first, &digest).await.unwrap());
+            assert!(ownership.can_read(second, &digest).await.unwrap());
+
+            test_case.cleanup().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn delete_blob_rejects_unowned_blob() {
+        for test_case in backends() {
+            let registry = test_case.registry();
+            let namespace = &Namespace::new("test-repo").unwrap();
+            let content = b"unowned delete content";
+            let digest = registry.blob_store.create(content).await.unwrap();
+
+            let result = registry.delete_blob(namespace, &digest).await;
+            assert!(matches!(result, Err(Error::BlobUnknown)));
+
+            let stored_content = registry.blob_store.read(&digest).await.unwrap();
+            assert_eq!(stored_content, content);
+
             test_case.cleanup().await;
         }
     }
@@ -600,7 +771,7 @@ mod tests {
                 .await
                 .unwrap();
             let namespace_links = blob_index.namespace.get(namespace.as_ref()).unwrap();
-            assert!(namespace_links.contains(&LinkKind::Layer(digest.clone())));
+            assert!(namespace_links.contains(&LinkKind::Blob(digest.clone())));
 
             let repository = registry.get_repository_for_namespace(&namespace).unwrap();
             let response = registry

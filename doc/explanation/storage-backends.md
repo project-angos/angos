@@ -225,7 +225,7 @@ retry_delay_ms = 50    # Delay between retries (default: 50)
 
 ### With S3 + Redis
 
-Selecting `lock_strategy = "redis"` activates the lock coordinator with Redis as the distributed lock backend. The S3 provider's conditional capabilities are not consulted in this mode — Redis handles all serialization regardless of what the provider supports.
+Selecting `lock_strategy = "redis"` activates the lock coordinator with Redis as the distributed lock backend. When the S3 provider supports conditional writes, Angos still uses them for blob-index shard updates; Redis remains responsible for link metadata serialization. To force all metadata write coordination through Redis, explicitly set every `[metadata_store.s3.capabilities]` flag to `false`.
 
 ```toml
 [blob_store.s3]
@@ -265,7 +265,7 @@ url = "redis://redis:6379"
 ttl = 10                    # Lock timeout in seconds
 key_prefix = "locks"        # Optional prefix
 max_retries = 100           # Retry attempts
-retry_delay_ms = 10         # Delay between retries
+retry_delay_ms = 10         # Initial retry delay; retries back off up to 1s with jitter
 ```
 
 **Legacy form:** The `[metadata_store.*.redis]` table (e.g., `[metadata_store.fs.redis]`) is still accepted for backward compatibility and is equivalent to `[metadata_store.*.lock_strategy.redis]`. New configurations should use the `lock_strategy` form.
@@ -516,6 +516,11 @@ v2/blobs/sha256/ab/cdef.../refs/team%2Fbackend.json
 ```
 
 The namespace is percent-encoded in the filename (`/` → `%2F`, `%` → `%25`) to avoid ambiguity.
+
+Blob indexes separate metadata cleanup from blob data deletion. Manifest deletion removes manifest
+links and may reclaim the manifest body itself, but config and layer blobs are retained while they
+are still owned by a namespace. Explicit blob deletion refuses digests that are still referenced by
+manifests; once the remaining references are gone, the final delete removes the shared blob data.
 
 **Benefits:**
 

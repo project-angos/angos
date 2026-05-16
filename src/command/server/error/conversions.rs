@@ -16,6 +16,11 @@ impl From<registry::Error> for Error {
         match error {
             registry::Error::Initialization(msg) => Error::Initialization(msg),
             registry::Error::BlobUnknown => oci_error(StatusCode::NOT_FOUND, "BLOB_UNKNOWN", None),
+            registry::Error::BlobReferenced => oci_error(
+                StatusCode::METHOD_NOT_ALLOWED,
+                "DENIED",
+                Some(error.to_string()),
+            ),
             registry::Error::BlobUploadUnknown => {
                 oci_error(StatusCode::NOT_FOUND, "BLOB_UPLOAD_UNKNOWN", None)
             }

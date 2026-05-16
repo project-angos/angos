@@ -3,7 +3,7 @@ mod capabilities;
 mod error;
 
 use std::{
-    collections::hash_map::RandomState,
+    collections::{HashSet, hash_map::RandomState},
     hash::{BuildHasher, Hasher},
 };
 
@@ -29,7 +29,7 @@ pub use blob_index::{BlobIndex, BlobIndexOperation};
 pub use capabilities::ConditionalCapabilities;
 pub use config::MetadataStoreConfig;
 pub use link_metadata::LinkMetadata;
-pub use lock::{LockStrategy, redis::LockConfig};
+pub use lock::{LockGuard, LockStrategy, redis::LockConfig};
 pub use transaction::{LinkOperation, ResolvedCreate, ResolvedDelete, Transaction};
 
 use crate::registry::metadata_store::link_kind::LinkKind;
@@ -95,12 +95,36 @@ pub trait MetadataStore: Send + Sync {
 
     async fn read_blob_index(&self, digest: &Digest) -> Result<BlobIndex, Error>;
 
+    async fn has_blob_references(&self, digest: &Digest) -> Result<bool, Error> {
+        match self.read_blob_index(digest).await {
+            Ok(blob_index) => Ok(!blob_index.namespace.is_empty()),
+            Err(Error::ReferenceNotFound) => Ok(false),
+            Err(error) => Err(error),
+        }
+    }
+
+    async fn read_blob_index_namespace(
+        &self,
+        namespace: &str,
+        digest: &Digest,
+    ) -> Result<HashSet<LinkKind>, Error> {
+        let blob_index = self.read_blob_index(digest).await?;
+        blob_index
+            .namespace
+            .get(namespace)
+            .cloned()
+            .filter(|links| !links.is_empty())
+            .ok_or(Error::ReferenceNotFound)
+    }
+
     async fn update_blob_index(
         &self,
         namespace: &str,
         digest: &Digest,
         operation: BlobIndexOperation,
     ) -> Result<(), Error>;
+
+    async fn acquire_blob_data_lock(&self, digest: &Digest) -> Result<LockGuard, Error>;
 
     async fn read_link(
         &self,

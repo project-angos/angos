@@ -20,8 +20,8 @@ use crate::{
         data_store,
         metadata_store::{
             BlobIndex, BlobIndexOperation, ConditionalCapabilities, Error, LinkMetadata,
-            LinkOperation, LockStrategy, MetadataStore, link_kind::LinkKind, lock_ops::LockOps,
-            referrer_resolver::resolve_referrer_descriptor,
+            LinkOperation, LockGuard, LockStrategy, MetadataStore, link_kind::LinkKind,
+            lock_ops::LockOps, referrer_resolver::resolve_referrer_descriptor,
         },
         pagination, path_builder,
     },
@@ -46,6 +46,7 @@ pub struct Backend {
     pub store: data_store::s3::Backend,
     cache: Option<Arc<Cache>>,
     link_cache_ttl: u64,
+    conditional_capabilities: ConditionalCapabilities,
     access_time_writer: Option<access_time::AccessTimeWriter>,
     coordinator: Arc<dyn WriteCoordinator>,
     pub known_namespaces: Arc<Mutex<HashSet<String>>>,
@@ -59,16 +60,15 @@ const MAX_BLOB_INDEX_CAS_RETRIES: u32 = 20;
 impl Backend {
     /// Create a new S3 metadata-store backend.
     ///
-    /// `conditional` carries the capabilities used by the CAS coordinator when the
-    /// operator selects `lock_strategy = "s3"`. Pass `None` to assume all capabilities
-    /// are present for the S3 lock strategy and none for other strategies, or
-    /// `Some(caps)` with the result of `probe_conditional_capabilities`.
+    /// `conditional` carries the detected S3 conditional-write capabilities.
+    /// They are required by the CAS coordinator when the operator selects
+    /// `lock_strategy = "s3"` and are also used by lock-coordinator backends
+    /// to make blob-index shard updates optimistic when the provider supports it.
     ///
     /// `lock_strategy` drives coordinator selection: `"s3"` selects the CAS coordinator
     /// (which requires `put_if_none_match` and `put_if_match`; `delete_if_match` is
     /// propagated to the internal S3 lock for release safety), while `"redis"` and
     /// `"memory"` select the lock coordinator with the corresponding lock backend.
-    /// Capabilities are not consulted outside the S3 lock strategy.
     pub fn new(
         config: &BackendConfig,
         conditional: Option<ConditionalCapabilities>,
@@ -116,6 +116,7 @@ impl Backend {
                 store: store.clone(),
                 cache: None,
                 link_cache_ttl: config.link_cache_ttl,
+                conditional_capabilities: caps.clone(),
                 access_time_writer: access_time_writer.clone(),
                 coordinator: coordinator.clone(),
                 known_namespaces: Arc::new(Mutex::new(HashSet::new())),
@@ -142,6 +143,7 @@ impl Backend {
             store,
             cache: None,
             link_cache_ttl: config.link_cache_ttl,
+            conditional_capabilities: caps,
             access_time_writer,
             coordinator,
             known_namespaces: Arc::new(Mutex::new(HashSet::new())),
@@ -328,6 +330,20 @@ impl MetadataStore for Backend {
     }
 
     #[instrument(skip(self))]
+    async fn has_blob_references(&self, digest: &Digest) -> Result<bool, Error> {
+        self.has_blob_references_impl(digest).await
+    }
+
+    #[instrument(skip(self))]
+    async fn read_blob_index_namespace(
+        &self,
+        namespace: &str,
+        digest: &Digest,
+    ) -> Result<HashSet<LinkKind>, Error> {
+        self.read_blob_index_namespace_impl(namespace, digest).await
+    }
+
+    #[instrument(skip(self))]
     async fn update_blob_index(
         &self,
         namespace: &str,
@@ -337,6 +353,10 @@ impl MetadataStore for Backend {
         self.coordinator
             .update_blob_index(self, namespace, digest, operation)
             .await
+    }
+
+    async fn acquire_blob_data_lock(&self, digest: &Digest) -> Result<LockGuard, Error> {
+        self.coordinator.acquire_blob_data_lock(digest).await
     }
 
     #[instrument(skip(self))]

@@ -127,12 +127,19 @@ async fn handle_request(
     };
 
     if status.is_server_error() {
-        error!("{log}");
+        error!(error = %error_for_log(&response), "{log}");
     } else {
         info!("{log}");
     }
 
     Ok(response)
+}
+
+fn error_for_log(response: &Response<ResponseBody>) -> &str {
+    response
+        .extensions()
+        .get::<String>()
+        .map_or("unknown", String::as_str)
 }
 
 /// Extracts the `OpenTelemetry` trace ID from the given tracing span.

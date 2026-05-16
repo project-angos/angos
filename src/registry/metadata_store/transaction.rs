@@ -42,8 +42,8 @@ pub const MAX_UPDATE_RETRIES: u32 = 10;
 ///
 /// The differences between the filesystem and S3 lock-coordinator paths flow
 /// through the two extension points on `L`:
-/// - [`LockOps::apply_pending_blob_index_ops`] — FS performs per-operation
-///   sequential writes; S3 performs per-digest concurrent updates.
+/// - [`LockOps::apply_pending_blob_index_ops`] — FS applies per-digest writes;
+///   S3 performs per-digest concurrent updates.
 /// - [`LockOps::after_update`] — S3 registers the namespace; FS is a no-op.
 ///
 /// # Errors

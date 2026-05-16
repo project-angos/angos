@@ -57,7 +57,6 @@ impl Backend {
         Ok(())
     }
 
-    #[cfg(test)]
     pub async fn delete(&self, path: &str) -> Result<(), std::io::Error> {
         let full_path = self.full_path(path);
         match fs::remove_file(&full_path).await {

@@ -4,11 +4,14 @@ use bytes::{Bytes, BytesMut};
 use tokio::{
     io::{AsyncRead, AsyncReadExt},
     sync::mpsc,
+    task::JoinError,
 };
 use tokio_util::task::AbortOnDropHandle;
 use tracing::{error, instrument, warn};
 
-use super::{Backend, FRAME_SIZE, MIN_PART_SIZE, S3UploadState, UploadedPart};
+use super::{
+    Backend, FRAME_BUFFER_CAPACITY, FRAME_SIZE, MIN_PART_SIZE, S3UploadState, UploadedPart,
+};
 use crate::{
     oci::Digest,
     registry::{
@@ -75,6 +78,36 @@ impl Backend {
         }
     }
 
+    async fn handle_nonuniform_upload_task_failure(
+        &self,
+        name: &str,
+        uuid: &str,
+        ctx: &FlushContext<'_>,
+        join_error: JoinError,
+    ) -> Error {
+        let kind = if join_error.is_panic() {
+            "panicked"
+        } else if join_error.is_cancelled() {
+            "was cancelled"
+        } else {
+            "failed unexpectedly"
+        };
+        error!(
+            "nonuniform upload task {kind} for '{name}/{uuid}'; aborting multipart upload {upload_id}: {join_error}",
+            upload_id = ctx.upload_id,
+        );
+        if let Err(abort_err) = self
+            .store
+            .abort_multipart_upload(ctx.upload_path, ctx.upload_id)
+            .await
+        {
+            warn!("abort_multipart_upload failed during cleanup of '{name}/{uuid}': {abort_err}");
+        }
+        self.evict_upload_id(ctx.upload_path).await;
+        self.evict_upload_state(name, uuid).await;
+        Error::StorageBackend(format!("upload task {kind}: {join_error}"))
+    }
+
     async fn flush_pending_as_part(
         &self,
         name: &str,
@@ -93,7 +126,7 @@ impl Backend {
 
         let mut hashing_reader = HashingReader::with_hasher(combined, hasher);
 
-        let (tx, rx) = mpsc::channel::<Bytes>(32);
+        let (tx, rx) = mpsc::channel::<Bytes>(FRAME_BUFFER_CAPACITY);
 
         let store = self.store.clone();
         let upload_path_owned = ctx.upload_path.to_string();
@@ -111,52 +144,60 @@ impl Backend {
         }));
 
         let mut buf = BytesMut::with_capacity(FRAME_SIZE);
+        let mut sent = 0;
         loop {
             buf.clear();
-            let n = hashing_reader.read_buf(&mut buf).await?;
+            let n = hashing_reader
+                .read_buf(&mut buf)
+                .await
+                .map_err(|e| Error::UploadBodyRead(e.to_string()))?;
             if n == 0 {
                 break;
             }
+            let new_sent = sent + u64::try_from(n)?;
+            if new_sent > ctx.available {
+                warn!(
+                    "upload body size mismatch for '{name}/{uuid}': expected {} bytes, read {new_sent}",
+                    ctx.available,
+                );
+                return Err(Error::UploadBodySize {
+                    expected: ctx.available,
+                    actual: new_sent,
+                });
+            }
+            sent = new_sent;
             if tx.send(buf.split().freeze()).await.is_err() {
-                return Err(Error::StorageBackend(
-                    "upload task failed to receive data".to_string(),
-                ));
+                return match upload_handle.await {
+                    Ok(Ok(_etag)) => Err(Error::StorageBackend(
+                        "upload task stopped before receiving complete body".to_string(),
+                    )),
+                    Ok(Err(error)) => Err(error.into()),
+                    Err(join_error) => Err(self
+                        .handle_nonuniform_upload_task_failure(name, uuid, &ctx, join_error)
+                        .await),
+                };
             }
         }
         drop(tx);
-        // Routine S3/upload errors are propagated without aborting the multipart session so
-        // the client can retry via a subsequent PATCH using the same upload UUID.  Panic or
-        // cancellation of the spawned task puts the session in an unknown state, so we abort
-        // the multipart upload and evict cached state to prevent poisoning future retries.
+        if sent != ctx.available {
+            warn!(
+                "upload body size mismatch for '{name}/{uuid}': expected {} bytes, read {sent}",
+                ctx.available,
+            );
+            return Err(Error::UploadBodySize {
+                expected: ctx.available,
+                actual: sent,
+            });
+        }
+
+        // Storage errors keep the multipart session retryable; task failure leaves state unknown.
         match upload_handle.await {
             Ok(Ok(_etag)) => {}
             Ok(Err(e)) => return Err(e.into()),
             Err(join_error) => {
-                let kind = if join_error.is_panic() {
-                    "panicked"
-                } else if join_error.is_cancelled() {
-                    "was cancelled"
-                } else {
-                    "failed unexpectedly"
-                };
-                error!(
-                    "nonuniform upload task {kind} for '{name}/{uuid}'; aborting multipart upload {upload_id}: {join_error}",
-                    upload_id = ctx.upload_id,
-                );
-                if let Err(abort_err) = self
-                    .store
-                    .abort_multipart_upload(ctx.upload_path, ctx.upload_id)
-                    .await
-                {
-                    warn!(
-                        "abort_multipart_upload failed during cleanup of '{name}/{uuid}': {abort_err}"
-                    );
-                }
-                self.evict_upload_id(ctx.upload_path).await;
-                self.evict_upload_state(name, uuid).await;
-                return Err(Error::StorageBackend(format!(
-                    "upload task {kind}: {join_error}"
-                )));
+                return Err(self
+                    .handle_nonuniform_upload_task_failure(name, uuid, &ctx, join_error)
+                    .await);
             }
         }
 
@@ -184,10 +225,19 @@ impl Backend {
         let hasher = self.load_hasher(name, uuid, logical_offset).await?;
 
         let mut buf = pending_bytes;
+        let original_len = buf.len();
         let mut hashing_reader = HashingReader::with_hasher(stream, hasher);
-        hashing_reader.read_to_end(&mut buf).await?;
+        hashing_reader
+            .read_to_end(&mut buf)
+            .await
+            .map_err(|e| Error::UploadBodyRead(e.to_string()))?;
 
         let new_logical = ctx.uploaded_size + u64::try_from(buf.len())?;
+        if buf.len() == original_len {
+            let digest = hashing_reader.digest();
+            return Ok((digest, new_logical));
+        }
+
         self.store
             .put_object(ctx.pending_path, Bytes::from(buf))
             .await?;

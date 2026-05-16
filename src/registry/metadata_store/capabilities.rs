@@ -5,8 +5,9 @@ use serde::{Deserialize, Serialize};
 /// Granular S3 conditional operation capabilities.
 ///
 /// Each field corresponds to a distinct HTTP conditional header that the S3-compatible
-/// provider may or may not support. Configure these explicitly in `[metadata_store.s3.capabilities]`
-/// to skip the startup probe, or omit to auto-detect when using `lock_strategy = "s3"`.
+/// provider may or may not support. Configure these explicitly in
+/// `[metadata_store.s3.capabilities]` to skip the startup probe, or omit them
+/// to auto-detect support when using S3 metadata storage.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct ConditionalCapabilities {
     /// `PutObject` with `If-None-Match: *` — create-only, reject if object exists.

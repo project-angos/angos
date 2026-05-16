@@ -133,6 +133,10 @@ impl LockOps for Backend {
         format!("{namespace}:{link}")
     }
 
+    fn lock_key_for_blob_index(namespace: &str, digest: &Digest) -> String {
+        format!("{namespace}:blob:{digest}")
+    }
+
     async fn cache_put(&self, namespace: &str, link: &LinkKind, metadata: &LinkMetadata) {
         if self.link_cache_ttl == 0 {
             return;
@@ -153,23 +157,34 @@ impl LockOps for Backend {
 
     /// Applies blob-index operations concurrently, one task per digest.
     ///
-    /// Each digest's shard is updated via an unconditional read-modify-write
-    /// (`update_blob_index_shard`). Cross-call updates to the same digest are
-    /// serialized by the `blob:{digest}` lock key acquired before this method
-    /// is called.
+    /// CAS-capable providers use optimistic shard updates so concurrent
+    /// ownership grants and manifest link writes cannot overwrite each other.
+    /// Providers without conditional writes fall back to the lock-protected
+    /// read-modify-write path.
     async fn apply_pending_blob_index_ops(
         &self,
         namespace: &str,
         pending_blob_ops: HashMap<Digest, Vec<BlobIndexOperation>>,
     ) -> Result<(), Error> {
-        join_all(
-            pending_blob_ops
-                .iter()
-                .map(|(digest, ops)| self.update_blob_index_shard(namespace, digest, ops)),
-        )
-        .await
-        .into_iter()
-        .collect::<Result<Vec<_>, _>>()?;
+        if self.conditional_capabilities.supports_cas() {
+            join_all(
+                pending_blob_ops
+                    .iter()
+                    .map(|(digest, ops)| self.update_blob_index_cas(namespace, digest, ops)),
+            )
+            .await
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()?;
+        } else {
+            join_all(
+                pending_blob_ops
+                    .iter()
+                    .map(|(digest, ops)| self.update_blob_index_shard(namespace, digest, ops)),
+            )
+            .await
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()?;
+        }
         Ok(())
     }
 

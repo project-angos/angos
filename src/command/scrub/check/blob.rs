@@ -85,6 +85,12 @@ impl BlobChecker {
         link: &LinkKind,
         sink: &mut (dyn ActionSink + Send),
     ) {
+        if let LinkKind::Blob(owned_digest) = link
+            && owned_digest == blob
+        {
+            return;
+        }
+
         if self
             .metadata_store
             .read_link(namespace, link, false)
@@ -273,6 +279,42 @@ mod tests {
                 final_refs < initial_refs,
                 "Invalid blob index entry should be removed. Before: {initial_refs}, After: {final_refs}"
             );
+            test_case.cleanup().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn test_cleanup_preserves_explicit_blob_ownership() {
+        for test_case in backends() {
+            let namespace = &Namespace::new("test-repo/app").unwrap();
+            let metadata_store = test_case.metadata_store();
+            let blob_store = test_case.blob_store();
+
+            let blob_digest = blob_store.create(b"owned content").await.unwrap();
+            let ownership_link = LinkKind::Blob(blob_digest.clone());
+            metadata_store
+                .update_blob_index(
+                    namespace,
+                    &blob_digest,
+                    BlobIndexOperation::Insert(ownership_link.clone()),
+                )
+                .await
+                .unwrap();
+
+            let checker = BlobChecker::new(blob_store.clone(), metadata_store.clone());
+            let mut executor = Executor::new(
+                blob_store.clone(),
+                metadata_store.clone(),
+                test_case.upload_store(),
+                noop_multipart(),
+            );
+
+            checker.check_all(&mut executor).await.unwrap();
+
+            let blob_index = metadata_store.read_blob_index(&blob_digest).await.unwrap();
+            let links = blob_index.namespace.get(namespace.as_ref()).unwrap();
+            assert!(links.contains(&ownership_link));
+            assert!(blob_store.read(&blob_digest).await.is_ok());
             test_case.cleanup().await;
         }
     }

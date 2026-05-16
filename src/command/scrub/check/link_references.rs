@@ -158,7 +158,8 @@ mod tests {
         registry::{
             Registry,
             metadata_store::{
-                BlobIndex, BlobIndexOperation, LinkMetadata, LinkOperation, MetadataStoreExt,
+                BlobIndex, BlobIndexOperation, LinkMetadata, LinkOperation, LockGuard,
+                MetadataStoreExt,
             },
             test_utils::{self, FSRegistryTestCase, NoopMultipart, RegistryTestCase, backends},
         },
@@ -450,6 +451,13 @@ mod tests {
             _operation: BlobIndexOperation,
         ) -> Result<(), metadata_store::Error> {
             unimplemented!()
+        }
+
+        async fn acquire_blob_data_lock(
+            &self,
+            _digest: &Digest,
+        ) -> Result<LockGuard, metadata_store::Error> {
+            Ok(LockGuard::sync(Box::new(())))
         }
 
         async fn read_link(

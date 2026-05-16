@@ -123,6 +123,13 @@ pub fn link_path(link: &LinkKind, namespace: &str) -> String {
 
 pub fn link_container_path(link: &LinkKind, namespace: &str) -> String {
     match link {
+        LinkKind::Blob(digest) => {
+            format!(
+                "{REPOS_ROOT}/{namespace}/_blobs/{}/{}",
+                digest.algorithm(),
+                digest.hash()
+            )
+        }
         LinkKind::Tag(tag) => {
             format!("{REPOS_ROOT}/{namespace}/_manifests/tags/{tag}/current")
         }
@@ -235,6 +242,16 @@ mod tests {
     #[test]
     fn test_link_paths() {
         let digest = Digest::Sha256("digest123".into());
+
+        let blob = LinkKind::Blob(digest.clone());
+        assert_eq!(
+            link_path(&blob, "ns"),
+            "v2/repositories/ns/_blobs/sha256/digest123/link"
+        );
+        assert_eq!(
+            link_container_path(&blob, "ns"),
+            "v2/repositories/ns/_blobs/sha256/digest123"
+        );
 
         let tag = LinkKind::Tag("v1.0".to_string());
         assert_eq!(

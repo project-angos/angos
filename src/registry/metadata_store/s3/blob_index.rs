@@ -189,6 +189,84 @@ impl Backend {
         Ok(blob_index)
     }
 
+    pub async fn read_blob_index_namespace_impl(
+        &self,
+        namespace: &str,
+        digest: &Digest,
+    ) -> Result<HashSet<LinkKind>, Error> {
+        let shard_path = path_builder::blob_index_shard_path(digest, namespace);
+        match self.store.read(&shard_path).await {
+            Ok(data) => {
+                let links = serde_json::from_slice::<HashSet<LinkKind>>(&data)?;
+                if links.is_empty() {
+                    Err(Error::ReferenceNotFound)
+                } else {
+                    Ok(links)
+                }
+            }
+            Err(e) if e.kind() == ErrorKind::NotFound => {
+                let blob_index = self.read_blob_index_impl(digest).await?;
+                blob_index
+                    .namespace
+                    .get(namespace)
+                    .cloned()
+                    .filter(|links| !links.is_empty())
+                    .ok_or(Error::ReferenceNotFound)
+            }
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    pub async fn has_blob_references_impl(&self, digest: &Digest) -> Result<bool, Error> {
+        let refs_dir = path_builder::blob_index_refs_dir(digest);
+        let mut found_shards = false;
+        let mut continuation_token = None;
+
+        loop {
+            let (_, objects, next_token) = self
+                .store
+                .list_prefixes(&refs_dir, "/", 1, continuation_token, None)
+                .await?;
+
+            if !objects.is_empty() {
+                found_shards = true;
+            }
+
+            for object in objects {
+                let shard_path = format!("{refs_dir}/{object}");
+                match self.store.read(&shard_path).await {
+                    Ok(data) => {
+                        let links = serde_json::from_slice::<HashSet<LinkKind>>(&data)?;
+                        if !links.is_empty() {
+                            return Ok(true);
+                        }
+                    }
+                    Err(e) if e.kind() == ErrorKind::NotFound => {}
+                    Err(e) => return Err(e.into()),
+                }
+            }
+
+            continuation_token = next_token;
+            if continuation_token.is_none() {
+                break;
+            }
+        }
+
+        if found_shards {
+            return Ok(false);
+        }
+
+        let legacy_path = path_builder::blob_index_path(digest);
+        match self.store.read(&legacy_path).await {
+            Ok(data) => {
+                let blob_index: BlobIndex = serde_json::from_slice(&data)?;
+                Ok(blob_index.namespace.values().any(|links| !links.is_empty()))
+            }
+            Err(e) if e.kind() == ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(e.into()),
+        }
+    }
+
     /// Unconditional read-modify-write on a namespace shard (caller must hold lock).
     pub async fn update_blob_index_shard(
         &self,

@@ -8,7 +8,11 @@ use std::{
 use super::*;
 use crate::{
     cache, metrics_provider,
-    registry::metadata_store::{LinkOperation, MetadataStore},
+    registry::metadata_store::{
+        LinkOperation, MetadataStore,
+        lock::{LockBackend, MemoryBackend},
+        lock_ops::LockOps,
+    },
     secret::Secret,
 };
 
@@ -1158,6 +1162,91 @@ async fn test_probe_idempotent_back_to_back() {
         second.unwrap(),
         "Probe must return consistent capabilities across successive invocations"
     );
+}
+
+#[tokio::test]
+async fn test_has_blob_references_ignores_empty_cas_shards() {
+    let config = test_config();
+    let backend = Backend::new(
+        &config,
+        Some(ConditionalCapabilities {
+            put_if_none_match: true,
+            put_if_match: true,
+            delete_if_match: false,
+        }),
+    )
+    .unwrap();
+
+    let digest =
+        Digest::from_str("sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee")
+            .unwrap();
+    let link = LinkKind::Blob(digest.clone());
+
+    backend
+        .update_blob_index_cas(
+            "empty-cas-shard",
+            &digest,
+            &[
+                BlobIndexOperation::Insert(link.clone()),
+                BlobIndexOperation::Remove(link),
+            ],
+        )
+        .await
+        .unwrap();
+
+    assert!(
+        !backend.has_blob_references_impl(&digest).await.unwrap(),
+        "empty CAS shards must not keep blob data alive"
+    );
+
+    backend
+        .store
+        .delete_prefix(&config.key_prefix)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn test_lock_coordinator_blob_index_update_uses_blob_lock() {
+    let config = test_config();
+    let backend = Backend::new(&config, None).unwrap();
+    let lock = Arc::new(MemoryBackend::new());
+    let coordinator = super::coordinator::LockCoordinator { lock: lock.clone() };
+
+    let digest =
+        Digest::from_str("sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff")
+            .unwrap();
+    let namespace = "locked-blob-index";
+    let lock_key = Backend::lock_key_for_blob_index(namespace, &digest);
+    let guard = lock.acquire(&[lock_key]).await.unwrap();
+
+    let task_backend = backend.clone();
+    let task_digest = digest.clone();
+    let handle = tokio::spawn(async move {
+        coordinator
+            .update_blob_index(
+                &task_backend,
+                namespace,
+                &task_digest,
+                BlobIndexOperation::Insert(LinkKind::Blob(task_digest.clone())),
+            )
+            .await
+    });
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(
+        !handle.is_finished(),
+        "blob index update must wait for the blob lock"
+    );
+
+    guard.release().await;
+    handle.await.unwrap().unwrap();
+
+    backend
+        .store
+        .delete_prefix(&config.key_prefix)
+        .await
+        .unwrap();
 }
 
 /// When the configured bucket does not exist the probe must return an error

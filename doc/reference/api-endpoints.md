@@ -31,7 +31,8 @@ HEAD /v2/{namespace}/blobs/{digest}
 GET  /v2/{namespace}/blobs/{digest}
 ```
 
-Check existence or download a blob by digest.
+Check existence or download a blob by digest. A blob is visible only within namespaces that own it;
+a digest that exists in storage but is not linked to the requested namespace returns `BLOB_UNKNOWN`.
 
 `GET` supports a single byte range through the `Range` header:
 
@@ -50,7 +51,10 @@ Range requests for pull-through repositories are supported only after the blob i
 DELETE /v2/{namespace}/blobs/{digest}
 ```
 
-Delete a blob.
+Delete a blob owned by the namespace. If the digest is still referenced by manifest metadata in
+that namespace, Angos returns `DENIED` and leaves the blob unchanged. After those references are
+removed, deleting the blob removes that namespace's ownership; the underlying blob data is removed
+only when no namespace references the digest.
 
 ### Blob Upload
 
@@ -61,7 +65,8 @@ POST /v2/{namespace}/blobs/uploads/
 Start a new blob upload. Returns `202 Accepted` with `Location` header.
 
 Query parameters:
-- `digest` - Complete upload in single request (monolithic)
+- `digest` - Return the existing blob only when the requested namespace already owns it; otherwise
+  start a new upload session.
 - `mount` - Mount blob from another repository
 
 ```
@@ -101,13 +106,19 @@ Check existence or download a manifest. `{reference}` can be a tag or digest.
 PUT /v2/{namespace}/manifests/{reference}
 ```
 
-Push a manifest. Manifest bodies larger than `global.max_manifest_size` are rejected with `MANIFEST_INVALID`.
+Push a manifest. Manifest bodies larger than `global.max_manifest_size` are rejected with
+`MANIFEST_INVALID`. Config, layer, and child manifest digests referenced by the manifest must
+already exist and be readable in the namespace; missing references are rejected with
+`MANIFEST_BLOB_UNKNOWN`. Subject digests used for referrers are not required to exist.
 
 ```
 DELETE /v2/{namespace}/manifests/{reference}
 ```
 
-Delete a manifest by tag or digest.
+Delete a manifest by tag or digest. Deleting by tag removes only that tag. Deleting by digest also
+removes tags pointing at the digest and removes the manifest body when no remaining namespace
+references it. Config and layer blobs remain owned by the namespace until they are deleted through
+the blob endpoint or scrubbed as orphans.
 
 ### Tags
 
@@ -378,6 +389,7 @@ Errors follow OCI Distribution error format:
 | `BLOB_UPLOAD_INVALID` | 400          | Invalid upload            |
 | `BLOB_UPLOAD_UNKNOWN` | 404          | Upload session not found  |
 | `DIGEST_INVALID`      | 400          | Invalid digest format     |
+| `MANIFEST_BLOB_UNKNOWN` | 404        | Manifest reference is missing |
 | `MANIFEST_INVALID`    | 400          | Invalid manifest content  |
 | `MANIFEST_UNKNOWN`    | 404          | Manifest does not exist   |
 | `NAME_INVALID`        | 400          | Invalid repository name   |
@@ -386,5 +398,5 @@ Errors follow OCI Distribution error format:
 | `TAG_INVALID`         | 400          | Invalid tag               |
 | `TAG_IMMUTABLE`       | 409          | Tag cannot be overwritten |
 | `UNAUTHORIZED`        | 401          | Authentication required   |
-| `DENIED`              | 403          | Access denied by policy   |
+| `DENIED`              | 403 or 405   | Access denied by policy, or blob is still referenced |
 | `UNSUPPORTED`         | 415          | Unsupported operation     |

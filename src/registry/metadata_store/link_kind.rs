@@ -6,6 +6,7 @@ use crate::oci::{Digest, Reference};
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
 pub enum LinkKind {
+    Blob(Digest),
     Tag(String),
     Digest(Digest),
     Layer(Digest),
@@ -33,6 +34,7 @@ impl LinkKind {
 impl Display for LinkKind {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            LinkKind::Blob(d) => write!(f, "blob:{d}"),
             LinkKind::Tag(s) => write!(f, "tag:{s}"),
             LinkKind::Digest(d) => write!(f, "digest:{d}"),
             LinkKind::Layer(d) => write!(f, "layer:{d}"),
@@ -79,6 +81,11 @@ mod tests {
     }
 
     #[test]
+    fn is_tracked_returns_false_for_blob() {
+        assert!(!LinkKind::Blob(sha("aabb")).is_tracked());
+    }
+
+    #[test]
     fn is_tracked_returns_false_for_tag() {
         assert!(!LinkKind::Tag("latest".to_string()).is_tracked());
     }
@@ -97,6 +104,12 @@ mod tests {
     fn display_tag_has_tag_prefix() {
         let s = LinkKind::Tag("v1.0.0".to_string()).to_string();
         assert_eq!(s, "tag:v1.0.0");
+    }
+
+    #[test]
+    fn display_blob_has_blob_prefix() {
+        let s = LinkKind::Blob(sha("aabb")).to_string();
+        assert!(s.starts_with("blob:sha256:"));
     }
 
     #[test]

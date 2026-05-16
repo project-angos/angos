@@ -3,6 +3,7 @@ use std::{collections::HashMap, fmt::Debug, sync::Arc};
 use tracing::instrument;
 
 pub mod blob;
+pub mod blob_ownership;
 pub mod blob_store;
 pub mod content_discovery;
 pub mod data_store;
@@ -46,10 +47,11 @@ pub use crate::policy::AccessPolicy;
 use crate::{
     cache,
     configuration::RegexPattern,
-    oci::{Namespace, namespace_belongs_to},
+    oci::{Digest, Namespace, namespace_belongs_to},
     registry::{
-        blob_store::{BlobStore, PresignedBlobStore, UploadStore},
-        metadata_store::MetadataStore,
+        blob_ownership::BlobOwnership,
+        blob_store::{BlobStore, Error as BlobStoreError, PresignedBlobStore, UploadStore},
+        metadata_store::{Error as MetadataError, MetadataStore},
         task_queue::TaskQueue,
     },
 };
@@ -204,5 +206,35 @@ impl Registry {
         self.get_repository_for_namespace(namespace)
             .map(|r| r.name.clone())
             .unwrap_or_default()
+    }
+
+    async fn delete_blob_data_if_unreferenced(&self, digest: &Digest) -> Result<(), Error> {
+        let guard = self.metadata_store.acquire_blob_data_lock(digest).await?;
+        let result = self.delete_blob_data_if_unreferenced_locked(digest).await;
+        let lock_valid = guard.is_valid();
+        guard.release().await;
+
+        result?;
+        if !lock_valid {
+            return Err(
+                MetadataError::Lock("lock invalidated during blob data deletion".into()).into(),
+            );
+        }
+
+        Ok(())
+    }
+
+    async fn delete_blob_data_if_unreferenced_locked(&self, digest: &Digest) -> Result<(), Error> {
+        let ownership = BlobOwnership::new(self.metadata_store.as_ref());
+        if ownership.has_any_reference(digest).await? {
+            return Ok(());
+        }
+
+        match self.blob_store.delete(digest).await {
+            Ok(()) | Err(BlobStoreError::BlobNotFound | BlobStoreError::ReferenceNotFound) => {
+                Ok(())
+            }
+            Err(error) => Err(error.into()),
+        }
     }
 }

@@ -13,7 +13,7 @@ use crate::{
             BlobIndex, BlobIndexOperation, Error, LinkMetadata, LinkOperation, LockConfig,
             LockStrategy, MetadataStore,
             link_kind::LinkKind,
-            lock::{self, LockBackend, MemoryBackend},
+            lock::{self, LockBackend, LockGuard, MemoryBackend},
             lock_ops::LockOps,
             referrer_resolver::resolve_referrer_descriptor,
             transaction,
@@ -111,8 +111,6 @@ impl Backend {
 
         Ok(Self { store, lock })
     }
-
-    //
 
     #[instrument(skip(self))]
     async fn collect_repositories(&self, base_path: &str) -> Vec<String> {
@@ -282,38 +280,33 @@ impl MetadataStore for Backend {
         digest: &Digest,
         operation: BlobIndexOperation,
     ) -> Result<(), Error> {
-        let path = path_builder::blob_index_path(digest);
+        let lock_keys = [format!("blob:{digest}")];
+        let guard = self.lock.acquire(&lock_keys).await?;
 
-        let mut blob_index = match self.store.read_to_string(&path).await.map_err(Error::from) {
-            Ok(content) => serde_json::from_str::<BlobIndex>(&content)?,
-            Err(Error::ReferenceNotFound) => BlobIndex::default(),
-            Err(e) => Err(e)?,
-        };
+        let mut pending_blob_ops: HashMap<Digest, Vec<BlobIndexOperation>> = HashMap::new();
+        pending_blob_ops
+            .entry(digest.clone())
+            .or_default()
+            .push(operation);
+        let result = self
+            .apply_pending_blob_index_ops(namespace, pending_blob_ops)
+            .await;
 
-        let mut ns_links = blob_index.namespace.remove(namespace).unwrap_or_default();
-        match operation {
-            BlobIndexOperation::Insert(link) => {
-                ns_links.insert(link);
-            }
-            BlobIndexOperation::Remove(link) => {
-                ns_links.remove(&link);
-            }
-        }
-        if !ns_links.is_empty() {
-            blob_index.namespace.insert(namespace.to_string(), ns_links);
-        }
+        let lock_valid = guard.is_valid();
+        guard.release().await;
 
-        if blob_index.namespace.is_empty() {
-            debug!("Deleting no longer referenced Blob: {digest}");
-            let container = path_builder::blob_container_dir(digest);
-            self.store.delete_dir(&container).await?;
-            let _ = self.store.delete_empty_parent_dirs(&container).await;
-        } else {
-            let content = serde_json::to_string(&blob_index)?;
-            self.store.write(&path, content.as_bytes()).await?;
+        result?;
+        if !lock_valid {
+            return Err(Error::Lock(
+                "lock invalidated during blob index update".into(),
+            ));
         }
 
         Ok(())
+    }
+
+    async fn acquire_blob_data_lock(&self, digest: &Digest) -> Result<LockGuard, Error> {
+        self.lock.acquire(&[format!("blob-data:{digest}")]).await
     }
 
     #[instrument(skip(self))]
@@ -386,24 +379,126 @@ impl LockOps for Backend {
         link.to_string()
     }
 
-    /// Applies blob-index operations sequentially.
-    ///
-    /// Blob index updates for different digests are independent (each digest
-    /// has its own file). Updates for the same digest within this call are
-    /// grouped by the `pending_blob_ops` `HashMap`. Cross-call updates to the
-    /// same digest are serialized by the `blob:{digest}` lock key acquired
-    /// before this method is called.
     async fn apply_pending_blob_index_ops(
         &self,
         namespace: &str,
         pending_blob_ops: HashMap<Digest, Vec<BlobIndexOperation>>,
     ) -> Result<(), Error> {
         for (digest, ops) in &pending_blob_ops {
+            let path = path_builder::blob_index_path(digest);
+
+            let mut blob_index = match self.store.read_to_string(&path).await.map_err(Error::from) {
+                Ok(content) => serde_json::from_str::<BlobIndex>(&content)?,
+                Err(Error::ReferenceNotFound) => BlobIndex::default(),
+                Err(e) => Err(e)?,
+            };
+
+            let mut ns_links = blob_index.namespace.remove(namespace).unwrap_or_default();
             for op in ops {
-                self.update_blob_index(namespace, digest, op.clone())
-                    .await?;
+                match op {
+                    BlobIndexOperation::Insert(link) => {
+                        ns_links.insert(link.clone());
+                    }
+                    BlobIndexOperation::Remove(link) => {
+                        ns_links.remove(link);
+                    }
+                }
+            }
+            if !ns_links.is_empty() {
+                blob_index.namespace.insert(namespace.to_string(), ns_links);
+            }
+
+            if blob_index.namespace.is_empty() {
+                debug!("Deleting no longer referenced blob index: {digest}");
+                self.store.delete(&path).await?;
+                let _ = self.store.delete_empty_parent_dirs(&path).await;
+            } else {
+                let content = serde_json::to_string(&blob_index)?;
+                self.store.write(&path, content.as_bytes()).await?;
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use futures_util::future::join_all;
+    use tempfile::TempDir;
+
+    use super::*;
+    use crate::{metrics_provider, util::sha256};
+
+    #[tokio::test]
+    async fn removing_last_blob_index_reference_keeps_blob_data() {
+        metrics_provider::init_for_tests();
+
+        let temp_dir = TempDir::new().unwrap();
+        let backend = Backend::new(&BackendConfig {
+            root_dir: temp_dir.path().to_string_lossy().into_owned(),
+            ..BackendConfig::default()
+        })
+        .unwrap();
+
+        let content = b"blob-content";
+        let digest = sha256::digest(content);
+        let blob_path = path_builder::blob_path(&digest);
+        backend.store.write(&blob_path, content).await.unwrap();
+
+        let link = LinkKind::Layer(digest.clone());
+        backend
+            .update_blob_index(
+                "test/repo",
+                &digest,
+                BlobIndexOperation::Insert(link.clone()),
+            )
+            .await
+            .unwrap();
+        backend
+            .update_blob_index("test/repo", &digest, BlobIndexOperation::Remove(link))
+            .await
+            .unwrap();
+
+        let stored_content = backend.store.read(&blob_path).await.unwrap();
+        assert_eq!(stored_content, content);
+        assert!(matches!(
+            backend.read_blob_index(&digest).await,
+            Err(Error::ReferenceNotFound)
+        ));
+    }
+
+    #[tokio::test]
+    async fn concurrent_blob_index_updates_preserve_all_namespaces() {
+        metrics_provider::init_for_tests();
+
+        let temp_dir = TempDir::new().unwrap();
+        let backend = Arc::new(
+            Backend::new(&BackendConfig {
+                root_dir: temp_dir.path().to_string_lossy().into_owned(),
+                ..BackendConfig::default()
+            })
+            .unwrap(),
+        );
+
+        let digest = sha256::digest(b"shared blob");
+        let updates = (0..32).map(|index| {
+            let backend = Arc::clone(&backend);
+            let digest = digest.clone();
+            async move {
+                let namespace = format!("test/repo-{index}");
+                let link = LinkKind::Blob(digest.clone());
+                backend
+                    .update_blob_index(&namespace, &digest, BlobIndexOperation::Insert(link))
+                    .await
+                    .unwrap();
+            }
+        });
+
+        join_all(updates).await;
+
+        let blob_index = backend.read_blob_index(&digest).await.unwrap();
+        assert_eq!(blob_index.namespace.len(), 32);
     }
 }

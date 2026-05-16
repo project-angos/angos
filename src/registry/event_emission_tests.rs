@@ -25,10 +25,11 @@ use crate::{
         dispatcher::EventDispatcher,
         event::EventKind,
     },
-    oci::{Namespace, Reference},
+    oci::{Digest, Namespace, Reference},
     registry::{
         Registry, blob_store, data_store, metadata_store, test_utils::create_test_registry,
     },
+    util::sha256,
 };
 
 // ---------------------------------------------------------------------------
@@ -99,15 +100,41 @@ fn build_dispatcher_for_server(server_uri: &str) -> EventDispatcher {
     EventDispatcher::new(webhooks).expect("dispatcher build")
 }
 
+async fn upload_blob(registry: &Registry, namespace: &Namespace, content: &[u8]) -> Digest {
+    let session_id = Uuid::new_v4();
+    registry
+        .upload_store
+        .create(namespace, &session_id.to_string())
+        .await
+        .unwrap();
+
+    let body = content.to_vec();
+    let digest = sha256::digest(&body);
+    registry
+        .complete_upload(
+            None,
+            namespace,
+            session_id,
+            &digest,
+            body.len() as u64,
+            Cursor::new(body),
+        )
+        .await
+        .unwrap();
+    digest
+}
+
 /// Minimal valid OCI manifest bytes and its media-type string.
-fn test_manifest_bytes() -> (Vec<u8>, String) {
+async fn test_manifest_bytes(registry: &Registry, namespace: &Namespace) -> (Vec<u8>, String) {
+    let config_content = b"{}";
+    let config_digest = upload_blob(registry, namespace, config_content).await;
     let manifest = json!({
         "schemaVersion": 2,
         "mediaType": "application/vnd.oci.image.manifest.v1+json",
         "config": {
             "mediaType": "application/vnd.oci.image.config.v1+json",
-            "digest": "sha256:44136fa355ba77b9ad7b81f7bfce9497e04fd69e0c5e9a0e2d0a9a8f3f0a0e00",
-            "size": 2
+            "digest": config_digest,
+            "size": config_content.len()
         },
         "layers": []
     });
@@ -126,7 +153,7 @@ fn test_manifest_bytes() -> (Vec<u8>, String) {
 async fn tag_push_emits_manifest_push_and_tag_create_events() {
     let fixture = FsRegistryFixture::new();
     let namespace = Namespace::new("test-repo").unwrap();
-    let (manifest_bytes, mime_type) = test_manifest_bytes();
+    let (manifest_bytes, mime_type) = test_manifest_bytes(&fixture.registry, &namespace).await;
 
     let response = fixture
         .registry
@@ -172,7 +199,7 @@ async fn tag_push_emits_manifest_push_and_tag_create_events() {
 async fn digest_push_suppresses_tag_create_event() {
     let fixture = FsRegistryFixture::new();
     let namespace = Namespace::new("test-repo").unwrap();
-    let (manifest_bytes, mime_type) = test_manifest_bytes();
+    let (manifest_bytes, mime_type) = test_manifest_bytes(&fixture.registry, &namespace).await;
 
     // First push with a tag to obtain the digest.
     let tag_response = fixture
@@ -233,7 +260,7 @@ async fn digest_push_suppresses_tag_create_event() {
 async fn tag_delete_emits_manifest_delete_and_tag_delete_events() {
     let fixture = FsRegistryFixture::new();
     let namespace = Namespace::new("test-repo").unwrap();
-    let (manifest_bytes, mime_type) = test_manifest_bytes();
+    let (manifest_bytes, mime_type) = test_manifest_bytes(&fixture.registry, &namespace).await;
 
     fixture
         .registry
@@ -282,7 +309,7 @@ async fn tag_delete_emits_manifest_delete_and_tag_delete_events() {
 async fn digest_delete_suppresses_tag_delete_event() {
     let fixture = FsRegistryFixture::new();
     let namespace = Namespace::new("test-repo").unwrap();
-    let (manifest_bytes, mime_type) = test_manifest_bytes();
+    let (manifest_bytes, mime_type) = test_manifest_bytes(&fixture.registry, &namespace).await;
 
     let push = fixture
         .registry
@@ -337,7 +364,7 @@ async fn digest_delete_suppresses_tag_delete_event() {
 async fn tag_push_event_payload_has_all_required_fields() {
     let fixture = FsRegistryFixture::new();
     let namespace = Namespace::new("test-repo").unwrap();
-    let (manifest_bytes, mime_type) = test_manifest_bytes();
+    let (manifest_bytes, mime_type) = test_manifest_bytes(&fixture.registry, &namespace).await;
 
     let before = Utc::now();
     let response = fixture
@@ -406,7 +433,7 @@ async fn tag_push_events_delivered_to_webhook_endpoint() {
     let dispatcher = build_dispatcher_for_server(&server.uri());
     let fixture = FsRegistryFixture::new();
     let namespace = Namespace::new("test-repo").unwrap();
-    let (manifest_bytes, mime_type) = test_manifest_bytes();
+    let (manifest_bytes, mime_type) = test_manifest_bytes(&fixture.registry, &namespace).await;
 
     let response = fixture
         .registry
@@ -444,7 +471,7 @@ async fn tag_push_events_delivered_to_webhook_endpoint() {
 async fn digest_push_events_delivered_to_webhook_endpoint() {
     let fixture = FsRegistryFixture::new();
     let namespace = Namespace::new("test-repo").unwrap();
-    let (manifest_bytes, mime_type) = test_manifest_bytes();
+    let (manifest_bytes, mime_type) = test_manifest_bytes(&fixture.registry, &namespace).await;
 
     // Seed push to get a concrete digest.
     let seed = fixture

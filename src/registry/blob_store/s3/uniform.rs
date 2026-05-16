@@ -16,7 +16,7 @@ use crate::{
         blob_store::{
             Error, UploadSummary,
             hashing_reader::HashingReader,
-            s3::{Backend, FRAME_SIZE, S3UploadState, UploadedPart},
+            s3::{Backend, FRAME_BUFFER_CAPACITY, FRAME_SIZE, S3UploadState, UploadedPart},
             sha256_ext::Sha256Ext,
         },
         path_builder,
@@ -83,31 +83,20 @@ impl Backend {
         uuid: &str,
         upload_path: &str,
         append: bool,
-    ) -> Result<(String, Vec<UploadedPart>), Error> {
+    ) -> Result<(Option<String>, Vec<UploadedPart>), Error> {
         if append {
-            if let Some(S3UploadState {
-                multipart_upload_id: Some(id),
-                parts,
-                ..
-            }) = self.retrieve_cached_upload_state(name, uuid).await
-            {
-                return Ok((id, parts));
+            if let Some(state) = self.retrieve_cached_upload_state(name, uuid).await {
+                return Ok((state.multipart_upload_id, state.parts));
             }
-            let id = if let Some(id) = self.get_or_search_upload_id(upload_path).await? {
-                id
-            } else {
-                let id = self.store.create_multipart_upload(upload_path).await?;
-                self.cache_upload_id(upload_path, &id).await;
-                id
+            let Some(id) = self.get_or_search_upload_id(upload_path).await? else {
+                return Ok((None, Vec::new()));
             };
             let parts = self.store.list_parts(upload_path, &id).await?;
-            Ok((id, parts))
+            Ok((Some(id), parts))
         } else {
             self.evict_upload_id(upload_path).await;
             self.store.abort_pending_uploads(upload_path).await?;
-            let id = self.store.create_multipart_upload(upload_path).await?;
-            self.cache_upload_id(upload_path, &id).await;
-            Ok((id, Vec::new()))
+            Ok((None, Vec::new()))
         }
     }
 
@@ -118,7 +107,7 @@ impl Backend {
         ctx: ChunkContext<'_>,
         reader: &mut HashingReader<impl AsyncRead + Unpin + Send + Sync>,
     ) -> Result<(), Error> {
-        let (tx, rx) = mpsc::channel::<Bytes>(32);
+        let (tx, rx) = mpsc::channel::<Bytes>(FRAME_BUFFER_CAPACITY);
 
         let store = self.store.clone();
         let upload_path = ctx.upload_path.to_string();
@@ -140,9 +129,39 @@ impl Backend {
             }
             sent += u64::try_from(n)?;
             if tx.send(buf.split().freeze()).await.is_err() {
-                return Err(Error::StorageBackend(
-                    "upload task failed to receive data".to_string(),
-                ));
+                return match upload_handle.await {
+                    Ok(Ok(_etag)) => Err(Error::StorageBackend(
+                        "upload task stopped before receiving complete body".to_string(),
+                    )),
+                    Ok(Err(error)) => Err(error.into()),
+                    Err(join_error) => {
+                        let kind = if join_error.is_panic() {
+                            "panicked"
+                        } else if join_error.is_cancelled() {
+                            "was cancelled"
+                        } else {
+                            "failed unexpectedly"
+                        };
+                        error!(
+                            "uniform upload task {kind} for '{name}/{uuid}'; aborting multipart upload {upload_id}: {join_error}",
+                            upload_id = ctx.upload_id,
+                        );
+                        if let Err(abort_err) = self
+                            .store
+                            .abort_multipart_upload(ctx.upload_path, ctx.upload_id)
+                            .await
+                        {
+                            warn!(
+                                "abort_multipart_upload failed during cleanup of '{name}/{uuid}': {abort_err}"
+                            );
+                        }
+                        self.evict_upload_id(ctx.upload_path).await;
+                        self.evict_upload_state(name, uuid).await;
+                        Err(Error::StorageBackend(format!(
+                            "upload task {kind}: {join_error}"
+                        )))
+                    }
+                };
             }
         }
 
@@ -197,9 +216,15 @@ impl Backend {
         content_length: u64,
         append: bool,
     ) -> Result<(Digest, u64), Error> {
+        if append && content_length == 0 {
+            let state = self.get_upload_state_uniform(name, uuid).await?;
+            let digest = self.load_hasher(name, uuid, state.size).await?.digest();
+            return Ok((digest, state.size));
+        }
+
         let upload_path = path_builder::upload_path(name, uuid);
 
-        let (upload_id, part_list) = self
+        let (mut upload_id, part_list) = self
             .resolve_uniform_state(name, uuid, &upload_path, append)
             .await?;
 
@@ -219,12 +244,19 @@ impl Backend {
         let remainder = available % self.multipart_part_size;
 
         for _ in 0..full_parts {
+            let upload_id = if let Some(id) = &upload_id {
+                id
+            } else {
+                let id = self.store.create_multipart_upload(&upload_path).await?;
+                self.cache_upload_id(&upload_path, &id).await;
+                upload_id.insert(id)
+            };
             self.stream_part(
                 name,
                 uuid,
                 ChunkContext {
                     upload_path: &upload_path,
-                    upload_id: &upload_id,
+                    upload_id,
                     part_number: uploaded_parts,
                     size: self.multipart_part_size,
                 },
@@ -314,18 +346,56 @@ impl Backend {
     ) -> Result<Digest, Error> {
         let key = path_builder::upload_path(name, uuid);
 
-        let Ok(Some(upload_id)) = self.get_or_search_upload_id(&key).await else {
-            return Err(Error::UploadNotFound);
-        };
-
-        let mut parts = if let Some(cached) = self.retrieve_cached_upload_state(name, uuid).await {
-            cached.parts
-        } else {
-            self.store.list_parts(&key, &upload_id).await?
+        let cached = self.retrieve_cached_upload_state(name, uuid).await;
+        let (upload_id, mut parts) = match cached {
+            Some(S3UploadState {
+                multipart_upload_id: Some(id),
+                parts,
+                ..
+            }) => (Some(id), parts),
+            _ => match self.get_or_search_upload_id(&key).await? {
+                Some(id) => {
+                    let parts = self.store.list_parts(&key, &id).await?;
+                    (Some(id), parts)
+                }
+                None => (None, Vec::new()),
+            },
         };
         let mut size: u64 = parts.iter().map(|p| p.size).sum();
 
         let source_key = path_builder::upload_staged_container_path(name, uuid, size);
+
+        if upload_id.is_none() {
+            match self.store.object_size(&source_key).await {
+                Ok(staged_size) => {
+                    size += staged_size;
+                    let digest = digest
+                        .cloned()
+                        .unwrap_or(self.load_hasher(name, uuid, size).await?.digest());
+                    let blob_path = path_builder::blob_path(&digest);
+                    self.store.copy_object(&source_key, &blob_path).await?;
+                    self.evict_upload_state(name, uuid).await;
+                    let key = path_builder::upload_container_path(name, uuid);
+                    self.store.delete_prefix(&key).await?;
+                    return Ok(digest);
+                }
+                Err(e) if e.kind() == io::ErrorKind::NotFound && size == 0 => {
+                    let digest = digest
+                        .cloned()
+                        .unwrap_or(self.load_hasher(name, uuid, size).await?.digest());
+                    let blob_path = path_builder::blob_path(&digest);
+                    self.store.put_object(&blob_path, Bytes::new()).await?;
+                    self.evict_upload_state(name, uuid).await;
+                    let key = path_builder::upload_container_path(name, uuid);
+                    self.store.delete_prefix(&key).await?;
+                    return Ok(digest);
+                }
+                Err(e) if e.kind() == io::ErrorKind::NotFound => return Err(Error::UploadNotFound),
+                Err(e) => return Err(e.into()),
+            }
+        }
+
+        let upload_id = upload_id.expect("upload_id checked above");
 
         if let Ok(staged_size) = self.store.object_size(&source_key).await {
             let part_number = next_part_number(parts.len())?;

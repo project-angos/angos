@@ -14,7 +14,7 @@ use crate::{
             BlobIndexOperation, ConditionalCapabilities, Error, LinkMetadata, LinkOperation,
             LockStrategy, ResolvedCreate, ResolvedDelete,
             link_kind::LinkKind,
-            lock::{self, LockBackend, MemoryBackend, S3LockBackend},
+            lock::{self, LockBackend, LockGuard, MemoryBackend, S3LockBackend},
             lock_ops::LockOps,
             simple_jitter, transaction,
         },
@@ -38,6 +38,8 @@ pub trait WriteCoordinator: Send + Sync + std::fmt::Debug {
         digest: &Digest,
         operation: BlobIndexOperation,
     ) -> Result<(), Error>;
+
+    async fn acquire_blob_data_lock(&self, digest: &Digest) -> Result<LockGuard, Error>;
 
     async fn register_namespace(&self, backend: &Backend, namespace: &str) -> Result<(), Error>;
 
@@ -267,6 +269,10 @@ impl WriteCoordinator for CasCoordinator {
             .await
     }
 
+    async fn acquire_blob_data_lock(&self, digest: &Digest) -> Result<LockGuard, Error> {
+        self.lock.acquire(&[format!("blob-data:{digest}")]).await
+    }
+
     #[instrument(name = "register_namespace_cas", skip(self, backend))]
     async fn register_namespace(&self, backend: &Backend, namespace: &str) -> Result<(), Error> {
         let path = path_builder::namespace_registry_shard_path(namespace);
@@ -442,9 +448,36 @@ impl WriteCoordinator for LockCoordinator {
         digest: &Digest,
         operation: BlobIndexOperation,
     ) -> Result<(), Error> {
-        backend
+        if backend.conditional_capabilities.supports_cas() {
+            return backend
+                .update_blob_index_cas(namespace, digest, &[operation])
+                .await;
+        }
+
+        let guard = self
+            .lock
+            .acquire(&[format!("{namespace}:blob:{digest}")])
+            .await?;
+
+        let result = backend
             .update_blob_index_shard(namespace, digest, &[operation])
-            .await
+            .await;
+
+        let lock_valid = guard.is_valid();
+        guard.release().await;
+
+        result?;
+        if !lock_valid {
+            return Err(Error::Lock(
+                "lock invalidated during blob index update".into(),
+            ));
+        }
+
+        Ok(())
+    }
+
+    async fn acquire_blob_data_lock(&self, digest: &Digest) -> Result<LockGuard, Error> {
+        self.lock.acquire(&[format!("blob-data:{digest}")]).await
     }
 
     #[instrument(name = "register_namespace_locked", skip(self, backend))]

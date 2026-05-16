@@ -17,7 +17,7 @@ use tokio::io::{AsyncRead, AsyncReadExt};
 
 use crate::registry::data_store::{
     Error,
-    s3::{Backend, UploadedPart},
+    s3::{Backend, UploadedPart, s3_error_message},
 };
 
 /// Result of a `get_object` request, exposing only what callers need without
@@ -47,7 +47,7 @@ fn classify_conditional_put_error(error: &(impl ProvideErrorMetadata + Display))
     if is_conditional_write_conflict(error) {
         Error::PreconditionFailed
     } else {
-        Error::Io(error.to_string())
+        Error::Io(s3_error_message(error))
     }
 }
 
@@ -132,7 +132,7 @@ impl Backend {
                 if service_error.is_no_such_key() {
                     IoError::new(ErrorKind::NotFound, "object not found")
                 } else {
-                    IoError::other(service_error.to_string())
+                    IoError::other(s3_error_message(&service_error))
                 }
             });
         self.record_io_result(&result);
@@ -164,7 +164,7 @@ impl Backend {
             .key(&key)
             .send()
             .await
-            .map_err(|e| IoError::other(e.to_string()))
+            .map_err(|e| IoError::other(s3_error_message(&e.into_service_error())))
             .map(|_| ());
         self.record_io_result(&result);
         result
@@ -184,7 +184,7 @@ impl Backend {
                 .set_continuation_token(continuation_token)
                 .send()
                 .await
-                .map_err(|e| IoError::other(e.to_string()))?;
+                .map_err(|e| IoError::other(s3_error_message(&e.into_service_error())))?;
 
             let keys = build_object_identifiers(res.contents.unwrap_or_default())?;
 
@@ -217,7 +217,7 @@ impl Backend {
             .delete(delete)
             .send()
             .await
-            .map_err(|e| IoError::other(e.to_string()))?;
+            .map_err(|e| IoError::other(s3_error_message(&e.into_service_error())))?;
 
         if let Some(err) = aggregate_batch_delete_errors(&result.errors.unwrap_or_default()) {
             return Err(err);
@@ -242,7 +242,7 @@ impl Backend {
                 if service_error.is_not_found() {
                     IoError::new(ErrorKind::NotFound, "object not found")
                 } else {
-                    IoError::other(service_error.to_string())
+                    IoError::other(s3_error_message(&service_error))
                 }
             });
         self.record_io_result(&result);
@@ -270,7 +270,7 @@ impl Backend {
             if service_error.is_no_such_key() {
                 IoError::new(ErrorKind::NotFound, "object not found")
             } else {
-                IoError::other(service_error.to_string())
+                IoError::other(s3_error_message(&service_error))
             }
         });
         self.record_io_result(&result);
@@ -365,7 +365,7 @@ impl Backend {
                 if is_conditional_write_conflict(&service_err) {
                     Error::PreconditionFailed
                 } else {
-                    Error::Io(service_err.to_string())
+                    Error::Io(s3_error_message(&service_err))
                 }
             });
         self.record_data_result(&result);
@@ -384,7 +384,7 @@ impl Backend {
             .body(ByteStream::from(data.into()))
             .send()
             .await
-            .map_err(|e| IoError::other(e.to_string()))
+            .map_err(|e| IoError::other(s3_error_message(&e.into_service_error())))
             .map(|_| ());
         self.record_io_result(&result);
         result
@@ -401,7 +401,7 @@ impl Backend {
             .key(&key)
             .send()
             .await
-            .map_err(|e| IoError::other(e.to_string()))
+            .map_err(|e| IoError::other(s3_error_message(&e.into_service_error())))
             .map(|_| ());
         self.record_io_result(&result);
         result
@@ -429,7 +429,7 @@ impl Backend {
             .copy_source(format!("{}/{}", self.bucket, source_key))
             .send()
             .await
-            .map_err(|e| IoError::other(e.to_string()))
+            .map_err(|e| IoError::other(s3_error_message(&e.into_service_error())))
             .map(|_| ());
         self.record_io_result(&result);
         result
