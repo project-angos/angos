@@ -2,9 +2,9 @@ use std::io::ErrorKind;
 
 use tracing::{info, warn};
 
-use crate::registry::{
-    data_store,
-    metadata_store::{ConditionalCapabilities, Error},
+use crate::{
+    registry::metadata_store::{ConditionalCapabilities, Error},
+    s3_client,
 };
 
 /// RAII guard that warns if dropped while still armed.
@@ -47,7 +47,7 @@ impl Drop for ProbeGuard {
 /// Returns the probed capabilities. The caller is responsible for failing startup
 /// if any required capability is absent.
 pub async fn probe_conditional_capabilities(
-    store: &data_store::s3::Backend,
+    store: &s3_client::Backend,
 ) -> Result<ConditionalCapabilities, Error> {
     let probe_key = format!("_angos_probe_{}", uuid::Uuid::new_v4());
     probe_conditional_capabilities_with_key(store, &probe_key).await
@@ -58,7 +58,7 @@ pub async fn probe_conditional_capabilities(
 /// Exposed as `pub(super)` so tests can pass a known key and verify cleanup
 /// without having to discover the UUID-suffixed key after the fact.
 pub(super) async fn probe_conditional_capabilities_with_key(
-    store: &data_store::s3::Backend,
+    store: &s3_client::Backend,
     probe_key: &str,
 ) -> Result<ConditionalCapabilities, Error> {
     let content: &[u8] = b"probe";
@@ -73,7 +73,7 @@ pub(super) async fn probe_conditional_capabilities_with_key(
 
     // Test If-None-Match: * — expect 412 because the object already exists.
     let put_if_none_match = match store.put_object_if_not_exists(probe_key, content).await {
-        Err(data_store::Error::PreconditionFailed) => true,
+        Err(s3_client::Error::PreconditionFailed) => true,
         Ok(_) => {
             warn!(
                 "conditional probe: If-None-Match: * was accepted on existing key; provider does not enforce it"
@@ -97,7 +97,7 @@ pub(super) async fn probe_conditional_capabilities_with_key(
                 store
                     .put_object_if_match(probe_key, "\"bogus\"", b"fail".to_vec())
                     .await,
-                Err(data_store::Error::PreconditionFailed)
+                Err(s3_client::Error::PreconditionFailed)
             );
             correct && bogus_rejected
         }
@@ -119,7 +119,7 @@ pub(super) async fn probe_conditional_capabilities_with_key(
             // the object, the correct-ETag attempt below will hit NotFound and correct=false.
             let bogus_rejected = matches!(
                 store.delete_if_match(probe_key, "\"bogus\"").await,
-                Err(data_store::Error::PreconditionFailed)
+                Err(s3_client::Error::PreconditionFailed)
             );
             let correct = store.delete_if_match(probe_key, &etag).await.is_ok();
             bogus_rejected && correct

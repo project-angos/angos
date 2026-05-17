@@ -13,56 +13,66 @@ use crate::registry::{
             test_datastore_upload_operations,
         },
     },
+    fs_ops::{
+        atomic_write, prune_empty_ancestors, remove_dir_all_if_exists, remove_file_if_exists,
+    },
     test_utils::FSRegistryTestCase,
 };
 
 #[tokio::test]
 async fn test_write_and_read_file() {
     let t = FSRegistryTestCase::new();
-    let backend = t.blob_store();
 
-    let test_path = "test_file.txt";
-    let test_content = b"Hello, world!";
-
-    backend.store.write(test_path, test_content).await.unwrap();
-
-    let full_path = t.temp_dir().path().join(test_path);
-    assert!(full_path.exists());
-
-    let content = fs::read(&full_path).await.unwrap();
-    assert_eq!(content, test_content);
-
-    let test_string = "Hello world!";
-    backend
-        .store
-        .write(test_path, test_string.as_bytes())
+    let test_path = t.temp_dir().path().join("test_file.txt");
+    atomic_write(&test_path, b"Hello, world!", false)
         .await
         .unwrap();
-    let string_content = fs::read_to_string(&full_path).await.unwrap();
-    assert_eq!(string_content, test_string);
+
+    let content = fs::read(&test_path).await.unwrap();
+    assert_eq!(content, b"Hello, world!");
+
+    atomic_write(&test_path, b"Hello world!", false)
+        .await
+        .unwrap();
+    let string_content = fs::read_to_string(&test_path).await.unwrap();
+    assert_eq!(string_content, "Hello world!");
 }
 
 #[tokio::test]
-async fn test_delete_empty_parent_dirs() {
+async fn test_prune_empty_ancestors() {
     let t = FSRegistryTestCase::new();
-    let backend = t.blob_store();
+    let root = t.temp_dir().path().to_path_buf();
 
-    let nested_path = "a/b/c/d";
-    let test_file_path = "a/b/c/d/test.txt";
+    let nested_dir = root.join("a/b/c/d");
+    let test_file = nested_dir.join("test.txt");
 
-    backend.store.write(test_file_path, b"test").await.unwrap();
+    atomic_write(&test_file, b"test", false).await.unwrap();
 
-    backend.store.delete(test_file_path).await.unwrap();
+    remove_file_if_exists(&test_file).await.unwrap();
+    remove_dir_all_if_exists(&nested_dir).await.unwrap();
+    prune_empty_ancestors(&nested_dir, &root, 4).await.unwrap();
 
-    backend.store.delete_dir(nested_path).await.unwrap();
-    backend
-        .store
-        .delete_empty_parent_dirs(nested_path)
-        .await
-        .unwrap();
+    assert!(!root.join("a/b/c").exists());
+    assert!(!root.join("a/b").exists());
+    assert!(!root.join("a").exists());
+}
 
-    let full_path = t.temp_dir().path().join(nested_path);
-    assert!(!full_path.exists());
+#[tokio::test]
+async fn test_prune_empty_ancestors_respects_max_levels() {
+    let t = FSRegistryTestCase::new();
+    let root = t.temp_dir().path().to_path_buf();
+
+    let nested_dir = root.join("a/b/c/d");
+    let test_file = nested_dir.join("test.txt");
+
+    atomic_write(&test_file, b"test", false).await.unwrap();
+    remove_file_if_exists(&test_file).await.unwrap();
+    remove_dir_all_if_exists(&nested_dir).await.unwrap();
+
+    // Only ascend one level: `c` gets removed, `b` survives.
+    prune_empty_ancestors(&nested_dir, &root, 1).await.unwrap();
+    assert!(!root.join("a/b/c").exists());
+    assert!(root.join("a/b").exists());
 }
 
 #[tokio::test]

@@ -2,16 +2,19 @@
 pub mod tests;
 
 use std::{
-    fmt,
-    fmt::{Debug, Formatter},
+    fmt::{self, Debug, Formatter},
     io::{self, ErrorKind, SeekFrom},
     path::{Path, PathBuf},
 };
 
 use async_trait::async_trait;
 use chrono::{DateTime, Duration, Utc};
+use serde::Deserialize;
 use sha2::{Digest as Sha256Digest, Sha256};
-use tokio::io::{AsyncRead, AsyncSeekExt};
+use tokio::{
+    fs,
+    io::{AsyncRead, AsyncSeekExt, copy},
+};
 use tracing::{error, info, instrument};
 
 use crate::{
@@ -21,13 +24,25 @@ use crate::{
             BlobStore, BoxedReader, Error, MultipartCleanup, OrphanMultipartUpload, UploadStore,
             UploadSummary, hashing_reader::HashingReader, sha256_ext::Sha256Ext,
         },
-        data_store, pagination, path_builder,
+        fs_ops::{
+            atomic_write, ensure_parent_dir, list_dir_or_empty, prune_empty_ancestors,
+            remove_dir_all_if_exists,
+        },
+        pagination, path_builder,
     },
 };
 
+#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
+pub struct BackendConfig {
+    pub root_dir: String,
+    #[serde(default)]
+    pub sync_to_disk: bool,
+}
+
 #[derive(Clone)]
 pub struct Backend {
-    store: data_store::fs::Backend,
+    root: PathBuf,
+    sync_to_disk: bool,
 }
 
 impl Debug for Backend {
@@ -37,11 +52,16 @@ impl Debug for Backend {
 }
 
 impl Backend {
-    pub fn new(config: &data_store::fs::BackendConfig) -> Self {
+    pub fn new(config: &BackendConfig) -> Self {
         info!("Using filesystem blob-store backend");
         Self {
-            store: data_store::fs::Backend::new(config),
+            root: PathBuf::from(&config.root_dir),
+            sync_to_disk: config.sync_to_disk,
         }
+    }
+
+    fn full_path(&self, path: &str) -> PathBuf {
+        self.root.join(path)
     }
 
     async fn save_hasher(
@@ -52,19 +72,19 @@ impl Backend {
         state: &[u8],
     ) -> Result<(), Error> {
         let state_path = path_builder::upload_hash_context_path(name, uuid, "sha256", offset);
-        self.store.write(&state_path, state).await?;
+        atomic_write(&self.full_path(&state_path), state, self.sync_to_disk).await?;
         Ok(())
     }
 
     async fn load_hasher(&self, name: &str, uuid: &str, offset: u64) -> Result<Sha256, Error> {
         let hash_state_path = path_builder::upload_hash_context_path(name, uuid, "sha256", offset);
-        let state = self.store.read(&hash_state_path).await?;
+        let state = fs::read(self.full_path(&hash_state_path)).await?;
         Sha256::from_state(&state)
     }
 
     async fn file_size_or_err(&self, path: &str, not_found: Error) -> Result<u64, Error> {
-        match self.store.file_size(path).await {
-            Ok(size) => Ok(size),
+        match fs::metadata(self.full_path(path)).await {
+            Ok(meta) => Ok(meta.len()),
             Err(e) if e.kind() == ErrorKind::NotFound => Err(not_found),
             Err(e) => Err(e.into()),
         }
@@ -79,29 +99,17 @@ impl BlobStore for Backend {
         n: u16,
         continuation_token: Option<String>,
     ) -> Result<(Vec<Digest>, Option<String>), Error> {
-        let path = PathBuf::new()
-            .join(path_builder::blobs_root_dir())
-            .join("sha256")
-            .to_string_lossy()
-            .to_string();
-
-        let all_prefixes = self.store.list_dir(&path).await?;
-
+        let blobs_dir = self
+            .full_path(path_builder::blobs_root_dir())
+            .join("sha256");
+        let all_prefixes = list_dir_or_empty(&blobs_dir).await?;
         let mut digests = Vec::new();
-
         for prefix in all_prefixes {
-            let blob_path = PathBuf::from(&path)
-                .join(&prefix)
-                .to_string_lossy()
-                .to_string();
-
-            let all_digests = self.store.list_dir(&blob_path).await?;
-
-            for digest in all_digests {
+            let prefix_dir = blobs_dir.join(&prefix);
+            for digest in list_dir_or_empty(&prefix_dir).await? {
                 digests.push(Digest::Sha256(digest.into()));
             }
         }
-
         Ok(pagination::paginate(
             &digests,
             n,
@@ -114,23 +122,24 @@ impl BlobStore for Backend {
         let mut hasher = Sha256::new();
         hasher.update(content);
         let digest = hasher.digest();
-
-        let blob_path = path_builder::blob_path(&digest);
-        self.store.write(&blob_path, content).await?;
-
+        atomic_write(
+            &self.full_path(&path_builder::blob_path(&digest)),
+            content,
+            self.sync_to_disk,
+        )
+        .await?;
         Ok(digest)
     }
 
     #[instrument(skip(self))]
     async fn read(&self, digest: &Digest) -> Result<Vec<u8>, Error> {
-        let path = path_builder::blob_path(digest);
-        Ok(self.store.read(&path).await?)
+        Ok(fs::read(self.full_path(&path_builder::blob_path(digest))).await?)
     }
 
     #[instrument(skip(self))]
     async fn size(&self, digest: &Digest) -> Result<u64, Error> {
-        let path = path_builder::blob_path(digest);
-        Ok(self.file_size_or_err(&path, Error::BlobNotFound).await?)
+        self.file_size_or_err(&path_builder::blob_path(digest), Error::BlobNotFound)
+            .await
     }
 
     #[instrument(skip(self))]
@@ -139,27 +148,26 @@ impl BlobStore for Backend {
         digest: &Digest,
         start_offset: Option<u64>,
     ) -> Result<(BoxedReader, u64), Error> {
-        let path = path_builder::blob_path(digest);
-        let mut file = match self.store.open_file(&path).await {
+        let path = self.full_path(&path_builder::blob_path(digest));
+        let mut file = match fs::File::open(&path).await {
             Ok(file) => file,
             Err(e) if e.kind() == ErrorKind::NotFound => return Err(Error::BlobNotFound),
             Err(e) => return Err(e.into()),
         };
-
         let size = file.metadata().await?.len();
-
         if let Some(offset) = start_offset {
             file.seek(SeekFrom::Start(offset)).await?;
         }
-
         Ok((Box::new(file), size))
     }
 
     #[instrument(skip(self))]
     async fn delete(&self, digest: &Digest) -> Result<(), Error> {
-        let path = path_builder::blob_container_dir(digest);
-        self.store.delete_dir(&path).await?;
-        let _ = self.store.delete_empty_parent_dirs(&path).await;
+        let path = self.full_path(&path_builder::blob_container_dir(digest));
+        remove_dir_all_if_exists(&path).await?;
+        // Tidy up the two-character shard parent (`<algo>/<prefix>`); stop at
+        // the `blobs/<algo>` level which is shared across all blobs.
+        let _ = prune_empty_ancestors(&path, &self.root, 2).await;
         Ok(())
     }
 }
@@ -173,9 +181,8 @@ impl UploadStore for Backend {
         n: u16,
         continuation_token: Option<String>,
     ) -> Result<(Vec<String>, Option<String>), Error> {
-        let path = path_builder::uploads_root_dir(namespace);
-        let uploads = self.store.list_dir(&path).await?;
-
+        let path = self.full_path(&path_builder::uploads_root_dir(namespace));
+        let uploads = list_dir_or_empty(&path).await?;
         Ok(pagination::paginate(
             &uploads,
             n,
@@ -185,13 +192,16 @@ impl UploadStore for Backend {
 
     #[instrument(skip(self))]
     async fn create(&self, name: &str, uuid: &str) -> Result<String, Error> {
-        let content_path = path_builder::upload_path(name, uuid);
-        self.store.write(&content_path, &[]).await?;
+        let content_path = self.full_path(&path_builder::upload_path(name, uuid));
+        atomic_write(&content_path, &[], self.sync_to_disk).await?;
 
-        let date_path = path_builder::upload_start_date_path(name, uuid);
-        self.store
-            .write(&date_path, Utc::now().to_rfc3339().as_bytes())
-            .await?;
+        let date_path = self.full_path(&path_builder::upload_start_date_path(name, uuid));
+        atomic_write(
+            &date_path,
+            Utc::now().to_rfc3339().as_bytes(),
+            self.sync_to_disk,
+        )
+        .await?;
 
         let state = Sha256::new().serialized_state();
         self.save_hasher(name, uuid, 0, &state).await?;
@@ -209,25 +219,33 @@ impl UploadStore for Backend {
         append: bool,
     ) -> Result<(Digest, u64), Error> {
         let upload_size = if append {
-            let path = path_builder::upload_path(name, uuid);
-            self.file_size_or_err(&path, Error::UploadNotFound).await?
+            self.file_size_or_err(
+                &path_builder::upload_path(name, uuid),
+                Error::UploadNotFound,
+            )
+            .await?
         } else {
             0
         };
 
-        let file_path = path_builder::upload_path(name, uuid);
+        let file_path = self.full_path(&path_builder::upload_path(name, uuid));
+        ensure_parent_dir(&file_path).await?;
         let mut file = if append {
-            self.store.open_file_append(&file_path).await
+            fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&file_path)
+                .await
         } else {
-            self.store.create_file(&file_path).await
+            fs::File::create(&file_path).await
         }
-        .map_err(|e| classify_open_error(e, Path::new(&file_path)))?;
+        .map_err(|e| classify_open_error(e, &file_path))?;
         file.seek(SeekFrom::Start(upload_size)).await?;
 
         let hasher = self.load_hasher(name, uuid, upload_size).await?;
         let mut reader = HashingReader::with_hasher(stream, hasher);
 
-        let written = tokio::io::copy(&mut reader, &mut file).await?;
+        let written = copy(&mut reader, &mut file).await?;
         let total_size = upload_size + written;
         let digest = reader.digest();
 
@@ -239,11 +257,15 @@ impl UploadStore for Backend {
 
     #[instrument(skip(self))]
     async fn summary(&self, name: &str, uuid: &str) -> Result<UploadSummary, Error> {
-        let path = path_builder::upload_path(name, uuid);
-        let size = self.file_size_or_err(&path, Error::UploadNotFound).await?;
+        let size = self
+            .file_size_or_err(
+                &path_builder::upload_path(name, uuid),
+                Error::UploadNotFound,
+            )
+            .await?;
 
-        let date = path_builder::upload_start_date_path(name, uuid);
-        let date_str = self.store.read_to_string(&date).await.unwrap_or_default();
+        let date_path = self.full_path(&path_builder::upload_start_date_path(name, uuid));
+        let date_str = fs::read_to_string(&date_path).await.unwrap_or_default();
         let started_at = DateTime::parse_from_rfc3339(&date_str)
             .ok()
             .unwrap_or_default() // Fallbacks to epoch
@@ -259,8 +281,12 @@ impl UploadStore for Backend {
         uuid: &str,
         digest: Option<&Digest>,
     ) -> Result<Digest, Error> {
-        let path = path_builder::upload_path(name, uuid);
-        let size = self.file_size_or_err(&path, Error::UploadNotFound).await?;
+        let size = self
+            .file_size_or_err(
+                &path_builder::upload_path(name, uuid),
+                Error::UploadNotFound,
+            )
+            .await?;
 
         let digest = if let Some(digest) = digest {
             digest.clone()
@@ -268,22 +294,23 @@ impl UploadStore for Backend {
             self.load_hasher(name, uuid, size).await?.digest()
         };
 
-        let upload_path = path_builder::upload_path(name, uuid);
-        let blob_path = path_builder::blob_path(&digest);
-        self.store.rename(&upload_path, &blob_path).await?;
+        let upload_path = self.full_path(&path_builder::upload_path(name, uuid));
+        let blob_path = self.full_path(&path_builder::blob_path(&digest));
+        ensure_parent_dir(&blob_path).await?;
+        fs::rename(upload_path, blob_path).await?;
 
-        let path = path_builder::upload_container_path(name, uuid);
-        self.store.delete_dir(&path).await?;
-        let _ = self.store.delete_empty_parent_dirs(&path).await;
+        let container = self.full_path(&path_builder::upload_container_path(name, uuid));
+        remove_dir_all_if_exists(&container).await?;
+        let _ = prune_empty_ancestors(&container, &self.root, 2).await;
 
         Ok(digest)
     }
 
     #[instrument(skip(self))]
     async fn delete(&self, name: &str, uuid: &str) -> Result<(), Error> {
-        let path = path_builder::upload_container_path(name, uuid);
-        self.store.delete_dir(&path).await?;
-        self.store.delete_empty_parent_dirs(&path).await?;
+        let container = self.full_path(&path_builder::upload_container_path(name, uuid));
+        remove_dir_all_if_exists(&container).await?;
+        let _ = prune_empty_ancestors(&container, &self.root, 2).await;
         Ok(())
     }
 }

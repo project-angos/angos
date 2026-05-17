@@ -11,15 +11,13 @@ use uuid::Uuid;
 
 use super::{RecoveryOutcome, S3LockBackend, S3LockConfig, S3LockPayload};
 use crate::{
-    metrics_provider,
-    registry::{data_store, metadata_store::lock::LockBackend},
-    secret::Secret,
+    metrics_provider, registry::metadata_store::lock::LockBackend, s3_client, secret::Secret,
 };
 
-fn test_store(prefix: &str) -> Arc<data_store::s3::Backend> {
+fn test_store(prefix: &str) -> Arc<s3_client::Backend> {
     metrics_provider::init_for_tests();
     let run_id = Uuid::new_v4();
-    let config = data_store::s3::BackendConfig {
+    let config = s3_client::BackendConfig {
         access_key_id: Secret::new("root".to_string()),
         secret_key: Secret::new("roottoor".to_string()),
         endpoint: "http://127.0.0.1:9000".to_string(),
@@ -28,10 +26,10 @@ fn test_store(prefix: &str) -> Arc<data_store::s3::Backend> {
         key_prefix: format!("{prefix}{run_id}_"),
         ..Default::default()
     };
-    Arc::new(data_store::s3::Backend::new(&config).unwrap())
+    Arc::new(s3_client::Backend::new(&config).unwrap())
 }
 
-fn test_backend(store: Arc<data_store::s3::Backend>) -> S3LockBackend {
+fn test_backend(store: Arc<s3_client::Backend>) -> S3LockBackend {
     S3LockBackend::new(
         store,
         &S3LockConfig {

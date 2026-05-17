@@ -6,9 +6,10 @@ use tracing::info;
 use crate::{
     cache::Cache,
     registry::{
-        blob_store, data_store, metadata_store,
+        blob_store, metadata_store,
         metadata_store::{ConditionalCapabilities, Error, LockStrategy, MetadataStore},
     },
+    s3_client,
 };
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq)]
@@ -59,7 +60,7 @@ impl MetadataStoreConfig {
                  Configuration::resolve_metadata_config before probe"
             ),
             MetadataStoreConfig::S3(config) => {
-                let store = data_store::s3::Backend::new(&config.to_data_store_config())
+                let store = s3_client::Backend::new(&config.to_data_store_config())
                     .map_err(|e| Error::StorageBackend(e.to_string()))?;
                 let caps = metadata_store::s3::probe_conditional_capabilities(&store).await?;
                 if matches!(config.lock_strategy, LockStrategy::S3(_)) && !caps.supports_cas() {
@@ -191,7 +192,7 @@ mod tests {
 
     #[test]
     fn test_from_blob_store_fs_copies_paths_and_sync() {
-        let blob = blob_store::BlobStorageConfig::FS(data_store::fs::BackendConfig {
+        let blob = blob_store::BlobStorageConfig::FS(blob_store::fs::BackendConfig {
             root_dir: "/var/lib/registry".to_string(),
             sync_to_disk: true,
         });
@@ -208,7 +209,7 @@ mod tests {
 
     #[test]
     fn test_from_blob_store_s3_copies_credentials_and_bucket() {
-        let blob = blob_store::BlobStorageConfig::S3(data_store::s3::BackendConfig {
+        let blob = blob_store::BlobStorageConfig::S3(s3_client::BackendConfig {
             bucket: "test-bucket".to_string(),
             region: "us-east-1".to_string(),
             endpoint: "http://localhost:9000".to_string(),

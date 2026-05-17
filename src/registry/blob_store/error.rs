@@ -2,11 +2,11 @@ use std::{fmt, io, num::TryFromIntError, string::FromUtf8Error};
 
 use sha2::digest::common::hazmat::DeserializeStateError;
 
-use crate::{oci, registry::data_store};
+use crate::{oci, s3_client};
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Error {
-    DataStore(data_store::Error),
+    DataStore(s3_client::Error),
     HashSerialization(String),
     JSONSerialization(String),
     StorageBackend(String),
@@ -40,10 +40,10 @@ impl fmt::Display for Error {
     }
 }
 
-impl From<data_store::Error> for Error {
-    fn from(err: data_store::Error) -> Self {
+impl From<s3_client::Error> for Error {
+    fn from(err: s3_client::Error) -> Self {
         match err {
-            data_store::Error::NotFound(_) => Error::ReferenceNotFound,
+            s3_client::Error::NotFound(_) => Error::ReferenceNotFound,
             _ => Error::DataStore(err),
         }
     }
@@ -108,7 +108,7 @@ mod tests {
         assert_eq!(
             format!(
                 "{}",
-                Error::DataStore(data_store::Error::Io("IO error".to_string()))
+                Error::DataStore(s3_client::Error::Io("IO error".to_string()))
             ),
             "Data store error: IO error: IO error"
         );
@@ -156,7 +156,7 @@ mod tests {
     #[test]
     fn test_from_data_store_error_not_found() {
         assert_eq!(
-            Error::from(data_store::Error::NotFound("test.txt".to_string())),
+            Error::from(s3_client::Error::NotFound("test.txt".to_string())),
             Error::ReferenceNotFound
         );
     }
@@ -164,7 +164,7 @@ mod tests {
     #[test]
     fn test_from_data_store_error_other() {
         assert!(matches!(
-            Error::from(data_store::Error::Io("test".to_string())),
+            Error::from(s3_client::Error::Io("test".to_string())),
             Error::DataStore(_)
         ));
     }

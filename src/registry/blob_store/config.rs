@@ -4,10 +4,10 @@ use serde::Deserialize;
 
 use crate::{
     cache::Cache,
-    registry::{
-        blob_store::{BlobStore, Error, MultipartCleanup, PresignedBlobStore, UploadStore, fs, s3},
-        data_store,
+    registry::blob_store::{
+        BlobStore, Error, MultipartCleanup, PresignedBlobStore, UploadStore, fs, s3,
     },
+    s3_client,
 };
 
 pub struct BlobStoreHandles {
@@ -21,14 +21,14 @@ pub struct BlobStoreHandles {
 #[allow(clippy::large_enum_variant)]
 pub enum BlobStorageConfig {
     #[serde(rename = "fs")]
-    FS(data_store::fs::BackendConfig),
+    FS(fs::BackendConfig),
     #[serde(rename = "s3")]
-    S3(data_store::s3::BackendConfig),
+    S3(s3_client::BackendConfig),
 }
 
 impl Default for BlobStorageConfig {
     fn default() -> Self {
-        BlobStorageConfig::FS(data_store::fs::BackendConfig::default())
+        BlobStorageConfig::FS(fs::BackendConfig::default())
     }
 }
 
@@ -67,12 +67,12 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
-    use crate::{registry::data_store, secret::Secret};
+    use crate::secret::Secret;
 
     #[tokio::test]
     async fn fs_backend_provides_multipart_cleanup() {
         let temp_dir = TempDir::new().unwrap();
-        let config = BlobStorageConfig::FS(data_store::fs::BackendConfig {
+        let config = BlobStorageConfig::FS(fs::BackendConfig {
             root_dir: temp_dir.path().to_string_lossy().to_string(),
             sync_to_disk: false,
         });
@@ -88,7 +88,7 @@ mod tests {
 
     #[test]
     fn s3_backend_provides_multipart_cleanup() {
-        let config = BlobStorageConfig::S3(data_store::s3::BackendConfig {
+        let config = BlobStorageConfig::S3(s3_client::BackendConfig {
             endpoint: "http://127.0.0.1:9000".to_string(),
             region: "us-east-1".to_string(),
             bucket: "test-bucket".to_string(),

@@ -12,9 +12,10 @@ use crate::{
     policy::{AccessMode, AccessPolicyConfig, RetentionPolicy, RetentionPolicyConfig, SystemClock},
     registry::{
         blob_store::{self, BlobStore, PresignedBlobStore, UploadStore},
-        data_store, metadata_store,
+        metadata_store,
         metadata_store::{MetadataStore, MetadataStoreExt, link_kind::LinkKind},
     },
+    s3_client,
     secret::Secret,
 };
 
@@ -140,7 +141,7 @@ impl FSRegistryTestCase {
         let path = temp_dir.path().to_string_lossy().to_string();
 
         let blob_store = Arc::new(blob_store::fs::Backend::new(
-            &data_store::fs::BackendConfig {
+            &blob_store::fs::BackendConfig {
                 root_dir: path.clone(),
                 sync_to_disk: false,
             },
@@ -217,7 +218,7 @@ impl S3RegistryTestCase {
         let key_prefix = format!("test-{}", Uuid::new_v4());
 
         let blob_store = Arc::new(
-            blob_store::s3::Backend::new(&data_store::s3::BackendConfig {
+            blob_store::s3::Backend::new(&s3_client::BackendConfig {
                 access_key_id: Secret::new("root".to_string()),
                 secret_key: Secret::new("roottoor".to_string()),
                 endpoint: "http://127.0.0.1:9000".to_string(),

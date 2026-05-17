@@ -1,5 +1,11 @@
+use std::borrow::Cow;
+
 use chrono::{DateTime, Utc};
-use quick_xml::{Reader, events::Event};
+use quick_xml::{
+    Reader,
+    escape::unescape,
+    events::{BytesCData, BytesText, Event},
+};
 
 use super::ops::UploadedPart;
 
@@ -132,17 +138,17 @@ fn local_tag(name: &[u8]) -> Tag {
     }
 }
 
-fn text_value(text: &quick_xml::events::BytesText<'_>) -> Result<String, String> {
+fn text_value(text: &BytesText<'_>) -> Result<String, String> {
     let decoded = text.decode().map_err(|e| e.to_string())?;
-    quick_xml::escape::unescape(&decoded)
-        .map(std::borrow::Cow::into_owned)
+    unescape(&decoded)
+        .map(Cow::into_owned)
         .map_err(|e| e.to_string())
 }
 
-fn cdata_value(cdata: &quick_xml::events::BytesCData<'_>) -> Result<String, String> {
+fn cdata_value(cdata: &BytesCData<'_>) -> Result<String, String> {
     cdata
         .decode()
-        .map(std::borrow::Cow::into_owned)
+        .map(Cow::into_owned)
         .map_err(|e| e.to_string())
 }
 

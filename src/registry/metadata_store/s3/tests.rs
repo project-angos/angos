@@ -1072,7 +1072,7 @@ async fn test_read_link_with_access_time_debounce_uses_cache() {
 #[tokio::test]
 async fn test_probe_conditional_capabilities() {
     let config = test_config();
-    let store = data_store::s3::Backend::new(&data_store::s3::BackendConfig {
+    let store = s3_client::Backend::new(&s3_client::BackendConfig {
         access_key_id: config.access_key_id.clone(),
         secret_key: config.secret_key.clone(),
         endpoint: config.endpoint.clone(),
@@ -1102,7 +1102,7 @@ async fn test_probe_conditional_capabilities() {
 #[tokio::test]
 async fn test_probe_cleanup_removes_probe_object() {
     let config = test_config();
-    let store = data_store::s3::Backend::new(&data_store::s3::BackendConfig {
+    let store = s3_client::Backend::new(&s3_client::BackendConfig {
         access_key_id: config.access_key_id.clone(),
         secret_key: config.secret_key.clone(),
         endpoint: config.endpoint.clone(),
@@ -1139,7 +1139,7 @@ async fn test_probe_cleanup_removes_probe_object() {
 #[tokio::test]
 async fn test_probe_idempotent_back_to_back() {
     let config = test_config();
-    let store = data_store::s3::Backend::new(&data_store::s3::BackendConfig {
+    let store = s3_client::Backend::new(&s3_client::BackendConfig {
         access_key_id: config.access_key_id.clone(),
         secret_key: config.secret_key.clone(),
         endpoint: config.endpoint.clone(),
@@ -1255,7 +1255,7 @@ async fn test_lock_coordinator_blob_index_update_uses_blob_lock() {
 #[tokio::test]
 async fn test_probe_with_nonexistent_bucket_returns_err() {
     let config = test_config();
-    let store = data_store::s3::Backend::new(&data_store::s3::BackendConfig {
+    let store = s3_client::Backend::new(&s3_client::BackendConfig {
         access_key_id: config.access_key_id.clone(),
         secret_key: config.secret_key.clone(),
         endpoint: config.endpoint.clone(),

@@ -1,10 +1,10 @@
 use std::fmt;
 
-use crate::{oci, registry::data_store};
+use crate::{oci, s3_client};
 
 #[derive(Debug, PartialEq)]
 pub enum Error {
-    DataStore(data_store::Error),
+    DataStore(s3_client::Error),
     Lock(String),
     InvalidData(String),
     StorageBackend(String),
@@ -25,11 +25,11 @@ impl fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
-impl From<data_store::Error> for Error {
-    fn from(err: data_store::Error) -> Self {
+impl From<s3_client::Error> for Error {
+    fn from(err: s3_client::Error) -> Self {
         match err {
-            data_store::Error::NotFound(_) => Error::ReferenceNotFound,
-            data_store::Error::PreconditionFailed => Error::Lock("Precondition failed".to_string()),
+            s3_client::Error::NotFound(_) => Error::ReferenceNotFound,
+            s3_client::Error::PreconditionFailed => Error::Lock("Precondition failed".to_string()),
             _ => Error::DataStore(err),
         }
     }

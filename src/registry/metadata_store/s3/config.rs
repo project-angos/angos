@@ -1,10 +1,8 @@
 use serde::{Deserialize, Deserializer};
 
 use crate::{
-    registry::{
-        data_store,
-        metadata_store::{ConditionalCapabilities, LockConfig, LockStrategy, lock},
-    },
+    registry::metadata_store::{ConditionalCapabilities, LockConfig, LockStrategy, lock},
+    s3_client,
     secret::Secret,
 };
 
@@ -108,8 +106,8 @@ pub(super) fn default_access_time_debounce() -> u64 {
 }
 
 impl BackendConfig {
-    pub fn to_data_store_config(&self) -> data_store::s3::BackendConfig {
-        data_store::s3::BackendConfig {
+    pub fn to_data_store_config(&self) -> s3_client::BackendConfig {
+        s3_client::BackendConfig {
             access_key_id: self.access_key_id.clone(),
             secret_key: self.secret_key.clone(),
             endpoint: self.endpoint.clone(),
@@ -123,8 +121,8 @@ impl BackendConfig {
     pub fn to_lock_store_config(
         &self,
         lock_config: &lock::s3::S3LockConfig,
-    ) -> data_store::s3::BackendConfig {
-        data_store::s3::BackendConfig {
+    ) -> s3_client::BackendConfig {
+        s3_client::BackendConfig {
             operation_timeout_secs: lock_config.operation_timeout_secs,
             operation_attempt_timeout_secs: lock_config.operation_attempt_timeout_secs,
             max_attempts: lock_config.max_attempts,

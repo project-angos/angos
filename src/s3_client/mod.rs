@@ -1,31 +1,27 @@
-//! S3-compatible data store backend.
+//! S3-compatible storage client.
 //!
-//! The module is the single seam between the registry and "the wire": all
-//! `reqwest`, `hmac`, `sha2`, `quick_xml` and other HTTP/S3 implementation
-//! details live behind `client`, `xml` and `ops`. Anything exported from this
-//! module is intentionally framework-neutral (`Bytes`, `io::Error`, the
-//! registry-level `Error` and a handful of plain-data record types).
+//! This module is the single seam between the rest of the crate and "the
+//! wire": all `reqwest`, `hmac`, `sha2`, `quick_xml` and other HTTP/S3
+//! implementation details live behind `client`, `xml` and `ops`. Anything
+//! exported from this module is intentionally framework-neutral (`Bytes`,
+//! `io::Error`, the storage-level [`Error`] and a handful of plain-data record
+//! types).
 
-use std::{
-    fmt::Display,
-    io::{Error as IoError, ErrorKind},
-};
+use std::io;
 
 use bytesize::ByteSize;
 
-use crate::{circuit_breaker::CircuitBreaker, registry::data_store::Error};
+use crate::circuit_breaker::CircuitBreaker;
 
 mod client;
 mod config;
+mod error;
 mod ops;
 mod xml;
 
 pub use config::BackendConfig;
+pub use error::Error;
 pub use ops::UploadedPart;
-
-pub(crate) fn s3_error_message(error: &impl Display) -> String {
-    error.to_string()
-}
 
 #[derive(Clone, Debug)]
 pub struct Backend {
@@ -70,15 +66,15 @@ impl Backend {
         })
     }
 
-    pub fn check_circuit_breaker(&self) -> Result<(), IoError> {
+    pub fn check_circuit_breaker(&self) -> Result<(), io::Error> {
         self.circuit_breaker.check()?;
         Ok(())
     }
 
-    pub fn record_io_result<T>(&self, result: &Result<T, IoError>) {
+    pub fn record_io_result<T>(&self, result: &Result<T, io::Error>) {
         match result {
             Ok(_) => self.circuit_breaker.record_success(),
-            Err(e) if e.kind() == ErrorKind::NotFound => self.circuit_breaker.record_success(),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => self.circuit_breaker.record_success(),
             Err(_) => self.circuit_breaker.record_failure(),
         }
     }
@@ -105,8 +101,8 @@ impl Backend {
 mod tests {
     use bytes::Bytes;
 
-    use super::*;
-    use crate::{registry::data_store::s3::ops::aggregate_batch_delete_errors, secret::Secret};
+    use super::{ops::aggregate_batch_delete_errors, *};
+    use crate::secret::Secret;
 
     fn test_config(overrides: impl FnOnce(&mut BackendConfig)) -> BackendConfig {
         let mut config = BackendConfig {
@@ -142,7 +138,7 @@ mod tests {
     #[test]
     fn test_new_multipart_copy_chunk_size_too_large() {
         let result = Backend::new(&test_config(|c| {
-            c.multipart_copy_chunk_size = ByteSize::gib(6)
+            c.multipart_copy_chunk_size = ByteSize::gib(6);
         }));
         assert!(matches!(result, Err(Error::Configuration(_))));
     }
@@ -150,7 +146,7 @@ mod tests {
     #[test]
     fn test_new_multipart_copy_chunk_size_too_small() {
         let result = Backend::new(&test_config(|c| {
-            c.multipart_copy_chunk_size = ByteSize::mib(4)
+            c.multipart_copy_chunk_size = ByteSize::mib(4);
         }));
         assert!(matches!(result, Err(Error::Configuration(_))));
     }

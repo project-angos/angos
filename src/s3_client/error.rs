@@ -1,4 +1,4 @@
-use std::fmt;
+use std::{fmt, io};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Error {
@@ -23,9 +23,9 @@ impl fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
-impl From<std::io::Error> for Error {
-    fn from(err: std::io::Error) -> Self {
-        if err.kind() == std::io::ErrorKind::NotFound {
+impl From<io::Error> for Error {
+    fn from(err: io::Error) -> Self {
+        if err.kind() == io::ErrorKind::NotFound {
             Error::NotFound(err.to_string())
         } else {
             Error::Io(err.to_string())
@@ -41,8 +41,6 @@ impl From<serde_json::Error> for Error {
 
 #[cfg(test)]
 mod tests {
-    use std::io;
-
     use super::*;
 
     #[test]

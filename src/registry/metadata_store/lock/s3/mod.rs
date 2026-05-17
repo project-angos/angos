@@ -19,7 +19,6 @@ use tracing::{debug, warn};
 
 use crate::{
     registry::{
-        data_store,
         metadata_store::{
             Error,
             lock::{LockBackend, LockGuard, metrics::lock_metrics},
@@ -27,6 +26,7 @@ use crate::{
         },
         path_builder,
     },
+    s3_client,
     timing::elapsed_ms,
 };
 
@@ -153,7 +153,7 @@ impl S3LockPayload {
 
 #[derive(Debug, Clone)]
 pub struct S3LockBackend {
-    store: Arc<data_store::s3::Backend>,
+    store: Arc<s3_client::Backend>,
     instance_id: String,
     ttl_secs: u64,
     max_hold_secs: u64,
@@ -164,7 +164,7 @@ pub struct S3LockBackend {
 
 impl S3LockBackend {
     pub fn new(
-        store: Arc<data_store::s3::Backend>,
+        store: Arc<s3_client::Backend>,
         config: &S3LockConfig,
         supports_conditional_delete: bool,
     ) -> Result<Self, Error> {
@@ -272,7 +272,7 @@ impl S3LockBackend {
             .await
         {
             Ok(etag) => Ok(etag),
-            Err(data_store::Error::PreconditionFailed) => Ok(None),
+            Err(s3_client::Error::PreconditionFailed) => Ok(None),
             Err(e) => Err(Error::StorageBackend(e.to_string())),
         }
     }
@@ -354,7 +354,7 @@ impl S3LockBackend {
                     .inc();
                 RecoveryOutcome::Acquired(new_etag)
             }
-            Err(data_store::Error::PreconditionFailed) => {
+            Err(s3_client::Error::PreconditionFailed) => {
                 lock_metrics()
                     .recoveries
                     .with_label_values(&["s3", "failed"])
@@ -459,7 +459,7 @@ enum HeartbeatPathResult {
 
 async fn run_heartbeat_tick(
     paths: &[String],
-    store: &data_store::s3::Backend,
+    store: &s3_client::Backend,
     instance_id: &str,
     ttl_secs: u64,
     tick_deadline: Duration,
@@ -529,7 +529,7 @@ async fn run_heartbeat_tick(
 }
 
 async fn heartbeat_tick_path(
-    store: &data_store::s3::Backend,
+    store: &s3_client::Backend,
     path: &str,
     instance_id: &str,
     ttl_secs: u64,
@@ -557,7 +557,7 @@ async fn heartbeat_tick_path(
                 debug!(path, "Refreshed S3 lock heartbeat");
                 return HeartbeatPathResult::Ok(new_etag);
             }
-            Err(data_store::Error::PreconditionFailed) => {
+            Err(s3_client::Error::PreconditionFailed) => {
                 warn!(
                     path,
                     "Lock ETag changed, ownership lost, stopping heartbeat"
@@ -617,7 +617,7 @@ async fn heartbeat_tick_path(
             debug!(path, "Refreshed S3 lock heartbeat");
             HeartbeatPathResult::Ok(new_etag)
         }
-        Err(data_store::Error::PreconditionFailed) => {
+        Err(s3_client::Error::PreconditionFailed) => {
             warn!(
                 path,
                 "Lock ETag changed, ownership lost, stopping heartbeat"
@@ -635,7 +635,7 @@ async fn release_guard(
     valid: Arc<AtomicBool>,
     paths: Vec<String>,
     etag_cache: Arc<RwLock<HashMap<String, String>>>,
-    store: Arc<data_store::s3::Backend>,
+    store: Arc<s3_client::Backend>,
     instance_id: String,
     supports_conditional_delete: bool,
 ) {
@@ -662,7 +662,7 @@ async fn release_guard(
 }
 
 async fn release_lock_path(
-    store: Arc<data_store::s3::Backend>,
+    store: Arc<s3_client::Backend>,
     path: String,
     instance_id: String,
     cached_etag: Option<String>,
@@ -674,7 +674,7 @@ async fn release_lock_path(
     if supports_conditional_delete && let Some(etag) = cached_etag {
         match store.delete_if_match(&path, &etag).await {
             Ok(()) => {}
-            Err(data_store::Error::PreconditionFailed) => {
+            Err(s3_client::Error::PreconditionFailed) => {
                 debug!(
                     path,
                     "Lock ETag changed during release, another instance owns it"
@@ -692,7 +692,7 @@ async fn release_lock_path(
                 if supports_conditional_delete && let Some(etag) = etag {
                     match store.delete_if_match(&path, &etag).await {
                         Ok(()) => {}
-                        Err(data_store::Error::PreconditionFailed) => {
+                        Err(s3_client::Error::PreconditionFailed) => {
                             debug!(
                                 path,
                                 "Lock ETag changed during release, another instance owns it"

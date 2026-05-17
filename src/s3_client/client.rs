@@ -10,6 +10,7 @@ use std::{
     borrow::Cow,
     fmt::{self, Debug, Display, Formatter, Write},
     future::Future,
+    io,
     sync::Arc,
     time::Duration,
 };
@@ -29,6 +30,7 @@ use reqwest::{
 };
 use sha2::Sha256;
 use smallvec::SmallVec;
+use tokio::time::timeout;
 use url::Url;
 
 use super::BackendConfig;
@@ -72,7 +74,7 @@ pub struct S3Response {
 }
 
 /// An S3-level error. Used internally; the operations layer maps it onto
-/// `io::Error` or the registry's `data_store::Error` before crossing the
+/// `io::Error` or the registry's `s3_client::Error` before crossing the
 /// module boundary.
 #[derive(Debug, Clone)]
 pub struct S3Error {
@@ -185,8 +187,7 @@ pub enum RequestBody<S> {
 }
 
 /// Stream type alias used by streaming uploads.
-pub type ByteStream =
-    Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send + Unpin + 'static>;
+pub type ByteStream = Box<dyn Stream<Item = Result<Bytes, io::Error>> + Send + Unpin + 'static>;
 
 /// Options selecting per-request behaviour. Both flags default to `false`.
 #[derive(Clone, Copy, Default)]
@@ -347,7 +348,7 @@ impl S3Client {
         stream: S,
     ) -> Result<S3Response, S3Error>
     where
-        S: Stream<Item = Result<Bytes, std::io::Error>> + Send + Unpin + 'static,
+        S: Stream<Item = Result<Bytes, io::Error>> + Send + Unpin + 'static,
     {
         let fut = async {
             let response = self
@@ -368,7 +369,7 @@ impl S3Client {
             }
             collect_full_response(response).await
         };
-        tokio::time::timeout(self.operation_timeout, fut)
+        timeout(self.operation_timeout, fut)
             .await
             .map_err(|_| S3Error::timeout(self.operation_timeout))?
     }
@@ -465,7 +466,7 @@ impl S3Client {
             }
             unreachable!("attempt loop always returns");
         };
-        tokio::time::timeout(self.operation_timeout, fut)
+        timeout(self.operation_timeout, fut)
             .await
             .map_err(|_| S3Error::timeout(self.operation_timeout))?
     }
@@ -479,7 +480,7 @@ impl S3Client {
         body: RequestBody<S>,
     ) -> Result<Response, S3Error>
     where
-        S: Stream<Item = Result<Bytes, std::io::Error>> + Send + 'static,
+        S: Stream<Item = Result<Bytes, io::Error>> + Send + 'static,
     {
         let now = Utc::now();
         let amz_date = now.format("%Y%m%dT%H%M%SZ").to_string();

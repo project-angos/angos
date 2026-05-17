@@ -26,9 +26,7 @@ use crate::{
         event::EventKind,
     },
     oci::{Digest, Namespace, Reference},
-    registry::{
-        Registry, blob_store, data_store, metadata_store, test_utils::create_test_registry,
-    },
+    registry::{Registry, blob_store, metadata_store, test_utils::create_test_registry},
     util::sha256,
 };
 
@@ -47,7 +45,7 @@ impl FsRegistryFixture {
         let path = temp_dir.path().to_string_lossy().to_string();
 
         let blob_store = Arc::new(blob_store::fs::Backend::new(
-            &data_store::fs::BackendConfig {
+            &blob_store::fs::BackendConfig {
                 root_dir: path.clone(),
                 sync_to_disk: false,
             },

@@ -213,9 +213,9 @@ mod tests {
 
     #[test]
     fn classify_upload_keeps_on_data_store_error() {
-        use crate::registry::data_store;
+        use crate::s3_client;
         let verdict = classify_upload(
-            Err(&blob_store::Error::DataStore(data_store::Error::Io(
+            Err(&blob_store::Error::DataStore(s3_client::Error::Io(
                 "timeout".to_string(),
             ))),
             Duration::hours(1),

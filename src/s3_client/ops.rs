@@ -11,25 +11,30 @@
 //! "collect-the-whole-thing" wrappers stream into a single `Bytes` allocation
 //! sized from the `Content-Length` header so there is no resize churn.
 
-use std::io::{Error as IoError, ErrorKind};
+use std::{io, time::Duration};
 
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use futures_util::{StreamExt, TryStreamExt, stream};
-use reqwest::{Method, header::HeaderMap};
+use reqwest::{
+    Method,
+    header::{HeaderMap, HeaderName},
+};
 use serde::{Deserialize, Serialize};
-use tokio::{io::AsyncRead, sync::mpsc};
+use tokio::{
+    io::{AsyncRead, AsyncReadExt},
+    sync::mpsc,
+};
 use tokio_util::io::StreamReader;
 
 use super::{
-    Backend,
+    Backend, Error,
     client::{
         QueryParam, S3Error, SendOpts, content_length as parse_content_length, content_md5_base64,
         copy_source, header_string, insert_header, last_modified, range_header,
     },
-    s3_error_message, xml,
+    xml,
 };
-use crate::registry::data_store::Error;
 
 const MAX_MULTIPART_COPY_PARTS: u32 = 10_000;
 const STREAM_BODY_PREALLOC_CAP: usize = 8 * 1024 * 1024;
@@ -62,11 +67,11 @@ pub struct MultipartUpload {
 // ─── object-level CRUD ────────────────────────────────────────────────────
 
 impl Backend {
-    pub async fn read(&self, path: &str) -> Result<Vec<u8>, IoError> {
+    pub async fn read(&self, path: &str) -> Result<Vec<u8>, io::Error> {
         self.read_with_metadata(path).await.map(|(body, _, _)| body)
     }
 
-    pub async fn read_with_etag(&self, path: &str) -> Result<(Vec<u8>, Option<String>), IoError> {
+    pub async fn read_with_etag(&self, path: &str) -> Result<(Vec<u8>, Option<String>), io::Error> {
         self.read_with_metadata(path)
             .await
             .map(|(body, etag, _)| (body, etag))
@@ -75,7 +80,7 @@ impl Backend {
     pub async fn read_with_metadata(
         &self,
         path: &str,
-    ) -> Result<(Vec<u8>, Option<String>, Option<DateTime<Utc>>), IoError> {
+    ) -> Result<(Vec<u8>, Option<String>, Option<DateTime<Utc>>), io::Error> {
         self.check_circuit_breaker()?;
         let key = self.full_key(path);
 
@@ -101,7 +106,7 @@ impl Backend {
         result
     }
 
-    pub async fn object_size(&self, path: &str) -> Result<u64, IoError> {
+    pub async fn object_size(&self, path: &str) -> Result<u64, io::Error> {
         self.check_circuit_breaker()?;
         let key = self.full_key(path);
 
@@ -116,7 +121,7 @@ impl Backend {
             )
             .await
             .map_err(|e| map_get_error(&e))
-            .and_then(|response| parse_content_length(&response.headers).map_err(IoError::other));
+            .and_then(|response| parse_content_length(&response.headers).map_err(io::Error::other));
         self.record_io_result(&result);
         result
     }
@@ -125,7 +130,7 @@ impl Backend {
         &self,
         path: &str,
         offset: Option<u64>,
-    ) -> Result<GetObjectResult, IoError> {
+    ) -> Result<GetObjectResult, io::Error> {
         self.check_circuit_breaker()?;
         let key = self.full_key(path);
         let headers = offset.map(range_header).unwrap_or_default();
@@ -144,8 +149,8 @@ impl Backend {
             .and_then(|v| v.to_str().ok())
             .unwrap_or("0")
             .parse::<u64>()
-            .map_err(|e| IoError::other(format!("invalid S3 content-length: {e}")))?;
-        let reader = StreamReader::new(response.bytes_stream().map_err(IoError::other));
+            .map_err(|e| io::Error::other(format!("invalid S3 content-length: {e}")))?;
+        let reader = StreamReader::new(response.bytes_stream().map_err(io::Error::other));
 
         Ok(GetObjectResult {
             body: Box::new(reader),
@@ -157,8 +162,7 @@ impl Backend {
         &self,
         path: &str,
         offset: Option<u64>,
-    ) -> Result<Vec<u8>, IoError> {
-        use tokio::io::AsyncReadExt;
+    ) -> Result<Vec<u8>, io::Error> {
         let mut res = self.get_object(path, offset).await?;
         let capacity = usize::try_from(res.content_length)
             .unwrap_or(STREAM_BODY_PREALLOC_CAP)
@@ -168,7 +172,7 @@ impl Backend {
         Ok(buf)
     }
 
-    pub async fn put_object(&self, path: &str, data: impl Into<Bytes>) -> Result<(), IoError> {
+    pub async fn put_object(&self, path: &str, data: impl Into<Bytes>) -> Result<(), io::Error> {
         self.check_circuit_breaker()?;
         let key = self.full_key(path);
 
@@ -189,7 +193,7 @@ impl Backend {
         result
     }
 
-    pub async fn delete(&self, path: &str) -> Result<(), IoError> {
+    pub async fn delete(&self, path: &str) -> Result<(), io::Error> {
         self.check_circuit_breaker()?;
         let key = self.full_key(path);
 
@@ -210,7 +214,7 @@ impl Backend {
     }
 
     /// Alias kept for symmetry with the upload-side `delete_object` callers.
-    pub async fn delete_object(&self, path: &str) -> Result<(), IoError> {
+    pub async fn delete_object(&self, path: &str) -> Result<(), io::Error> {
         self.delete(path).await
     }
 
@@ -285,7 +289,7 @@ impl Backend {
         result
     }
 
-    pub async fn copy_object(&self, source: &str, destination: &str) -> Result<(), IoError> {
+    pub async fn copy_object(&self, source: &str, destination: &str) -> Result<(), io::Error> {
         let source_size = self.object_size(source).await?;
         if source_size <= self.multipart_copy_threshold {
             self.copy_object_single(source, destination).await
@@ -295,13 +299,13 @@ impl Backend {
         }
     }
 
-    async fn copy_object_single(&self, source: &str, destination: &str) -> Result<(), IoError> {
+    async fn copy_object_single(&self, source: &str, destination: &str) -> Result<(), io::Error> {
         let destination_key = self.full_key(destination);
         let headers = single_header(
             "x-amz-copy-source",
             &copy_source(&self.encoded_bucket, &self.full_key(source)),
         )
-        .map_err(|e| IoError::other(e.to_string()))?;
+        .map_err(|e| io::Error::other(e.to_string()))?;
 
         let result = self
             .s3_client
@@ -326,7 +330,7 @@ impl Backend {
         source: &str,
         destination: &str,
         source_size: u64,
-    ) -> Result<(), IoError> {
+    ) -> Result<(), io::Error> {
         let upload_id = self.create_multipart_upload(destination).await?;
         let result = match self
             .copy_object_multipart_parts(source, destination, &upload_id, source_size)
@@ -350,7 +354,7 @@ impl Backend {
         destination: &str,
         upload_id: &str,
         source_size: u64,
-    ) -> Result<Vec<UploadedPart>, IoError> {
+    ) -> Result<Vec<UploadedPart>, io::Error> {
         let ranges = copy_part_ranges(source_size, self.multipart_copy_chunk_size)?;
         let mut parts = stream::iter(ranges)
             .map(|range| async move {
@@ -363,7 +367,7 @@ impl Backend {
                         Some(format!("bytes={}-{}", range.start, range.end)),
                     )
                     .await?;
-                Ok::<_, IoError>(UploadedPart {
+                Ok::<_, io::Error>(UploadedPart {
                     part_number: range.part_number,
                     e_tag,
                     size: range.end - range.start + 1,
@@ -376,7 +380,7 @@ impl Backend {
         Ok(parts)
     }
 
-    pub async fn delete_prefix(&self, prefix: &str) -> Result<(), IoError> {
+    pub async fn delete_prefix(&self, prefix: &str) -> Result<(), io::Error> {
         let full_prefix = self.full_key(prefix);
         let mut continuation_token = None;
         loop {
@@ -392,13 +396,13 @@ impl Backend {
         }
     }
 
-    async fn delete_batch(&self, objects: Vec<String>) -> Result<(), IoError> {
+    async fn delete_batch(&self, objects: Vec<String>) -> Result<(), io::Error> {
         if objects.is_empty() {
             return Ok(());
         }
         let body = Bytes::from(xml::delete_objects_xml(&objects));
         let headers = single_header("content-md5", &content_md5_base64(&body))
-            .map_err(|e| IoError::other(e.to_string()))?;
+            .map_err(|e| io::Error::other(e.to_string()))?;
 
         let response = self
             .s3_client
@@ -413,7 +417,7 @@ impl Backend {
             .await
             .map_err(|e| io_other(&e))?;
 
-        let parsed = xml::parse_delete_objects(&response.body).map_err(IoError::other)?;
+        let parsed = xml::parse_delete_objects(&response.body).map_err(io::Error::other)?;
         let errors: Vec<_> = parsed
             .errors
             .into_iter()
@@ -436,7 +440,7 @@ impl Backend {
         continuation_token: Option<String>,
         delimiter: Option<&str>,
         start_after: Option<String>,
-    ) -> Result<xml::ListObjectsV2Output, IoError> {
+    ) -> Result<xml::ListObjectsV2Output, io::Error> {
         let mut query = vec![
             QueryParam::new("list-type", "2"),
             QueryParam::new("prefix", full_prefix),
@@ -463,7 +467,7 @@ impl Backend {
             )
             .await
             .map_err(|e| io_other(&e))?;
-        xml::parse_list_objects_v2(&response.body).map_err(IoError::other)
+        xml::parse_list_objects_v2(&response.body).map_err(io::Error::other)
     }
 
     pub async fn list_prefixes(
@@ -473,7 +477,7 @@ impl Backend {
         max_keys: u16,
         continuation_token: Option<String>,
         start_after: Option<String>,
-    ) -> Result<(Vec<String>, Vec<String>, Option<String>), IoError> {
+    ) -> Result<(Vec<String>, Vec<String>, Option<String>), io::Error> {
         self.check_circuit_breaker()?;
         let full_prefix = ensure_trailing_slash(self.full_key(path));
         let full_start_after = start_after.map(|s| format!("{full_prefix}{s}{delimiter}"));
@@ -516,7 +520,7 @@ impl Backend {
         path: &str,
         max_keys: u16,
         continuation_token: Option<String>,
-    ) -> Result<(Vec<String>, Option<String>), IoError> {
+    ) -> Result<(Vec<String>, Option<String>), io::Error> {
         let full_prefix = ensure_trailing_slash(self.full_key(path));
         let res = self
             .list_objects_v2_raw(&full_prefix, max_keys, continuation_token, None, None)
@@ -539,7 +543,7 @@ impl Backend {
 // ─── multipart uploads ────────────────────────────────────────────────────
 
 impl Backend {
-    pub async fn create_multipart_upload(&self, path: &str) -> Result<String, IoError> {
+    pub async fn create_multipart_upload(&self, path: &str) -> Result<String, io::Error> {
         let key = self.full_key(path);
         let response = self
             .s3_client
@@ -552,7 +556,7 @@ impl Backend {
             )
             .await
             .map_err(|e| io_other(&e))?;
-        xml::parse_create_multipart_upload(&response.body).map_err(IoError::other)
+        xml::parse_create_multipart_upload(&response.body).map_err(io::Error::other)
     }
 
     pub async fn upload_part(
@@ -561,7 +565,7 @@ impl Backend {
         upload_id: &str,
         part_number: u32,
         body: Bytes,
-    ) -> Result<String, IoError> {
+    ) -> Result<String, io::Error> {
         let key = self.full_key(path);
         let response = self
             .s3_client
@@ -588,12 +592,12 @@ impl Backend {
         part_number: u32,
         content_length: u64,
         rx: mpsc::Receiver<Bytes>,
-    ) -> Result<String, IoError> {
+    ) -> Result<String, io::Error> {
         let key = self.full_key(path);
         let body_stream = stream::unfold(rx, |mut rx| async {
             rx.recv()
                 .await
-                .map(|bytes| (Ok::<Bytes, IoError>(bytes), rx))
+                .map(|bytes| (Ok::<Bytes, io::Error>(bytes), rx))
         });
         let response = self
             .s3_client
@@ -617,20 +621,20 @@ impl Backend {
         upload_id: &str,
         part_number: u32,
         range: Option<String>,
-    ) -> Result<String, IoError> {
+    ) -> Result<String, io::Error> {
         let destination_key = self.full_key(destination);
         let mut headers = single_header(
             "x-amz-copy-source",
             &copy_source(&self.encoded_bucket, &self.full_key(source)),
         )
-        .map_err(|e| IoError::other(e.to_string()))?;
+        .map_err(|e| io::Error::other(e.to_string()))?;
         if let Some(range) = range {
             insert_header(
                 &mut headers,
-                reqwest::header::HeaderName::from_static("x-amz-copy-source-range"),
+                HeaderName::from_static("x-amz-copy-source-range"),
                 &range,
             )
-            .map_err(|e| IoError::other(e.to_string()))?;
+            .map_err(|e| io::Error::other(e.to_string()))?;
         }
 
         let response = self
@@ -646,7 +650,7 @@ impl Backend {
             )
             .await
             .map_err(|e| io_other(&e))?;
-        xml::parse_upload_part_copy(&response.body).map_err(IoError::other)
+        xml::parse_upload_part_copy(&response.body).map_err(io::Error::other)
     }
 
     pub async fn complete_multipart_upload(
@@ -654,7 +658,7 @@ impl Backend {
         path: &str,
         upload_id: &str,
         parts: &[UploadedPart],
-    ) -> Result<(), IoError> {
+    ) -> Result<(), io::Error> {
         let key = self.full_key(path);
         let body = Bytes::from(xml::complete_multipart_upload_xml(parts));
         self.s3_client
@@ -673,7 +677,11 @@ impl Backend {
             .map_err(|e| io_other(&e))
     }
 
-    pub async fn abort_multipart_upload(&self, path: &str, upload_id: &str) -> Result<(), IoError> {
+    pub async fn abort_multipart_upload(
+        &self,
+        path: &str,
+        upload_id: &str,
+    ) -> Result<(), io::Error> {
         let key = self.full_key(path);
         self.s3_client
             .send_empty(
@@ -693,7 +701,7 @@ impl Backend {
         prefix: Option<&str>,
         key_marker: Option<&str>,
         upload_id_marker: Option<&str>,
-    ) -> Result<(Vec<MultipartUpload>, Option<String>, Option<String>), IoError> {
+    ) -> Result<(Vec<MultipartUpload>, Option<String>, Option<String>), io::Error> {
         let mut query = vec![QueryParam::marker("uploads")];
         if let Some(prefix) = prefix {
             query.push(QueryParam::new("prefix", self.full_key(prefix)));
@@ -716,7 +724,7 @@ impl Backend {
             )
             .await
             .map_err(|e| io_other(&e))?;
-        let parsed = xml::parse_list_multipart_uploads(&response.body).map_err(IoError::other)?;
+        let parsed = xml::parse_list_multipart_uploads(&response.body).map_err(io::Error::other)?;
 
         let uploads = parsed
             .uploads
@@ -742,7 +750,10 @@ impl Backend {
         Ok((uploads, next_key, next_upload))
     }
 
-    pub async fn search_multipart_upload_id(&self, path: &str) -> Result<Option<String>, IoError> {
+    pub async fn search_multipart_upload_id(
+        &self,
+        path: &str,
+    ) -> Result<Option<String>, io::Error> {
         let mut key_marker: Option<String> = None;
         let mut upload_id_marker: Option<String> = None;
         loop {
@@ -764,7 +775,7 @@ impl Backend {
         }
     }
 
-    pub async fn abort_pending_uploads(&self, path: &str) -> Result<(), IoError> {
+    pub async fn abort_pending_uploads(&self, path: &str) -> Result<(), io::Error> {
         while let Some(upload_id) = self.search_multipart_upload_id(path).await? {
             self.abort_multipart_upload(path, &upload_id).await?;
         }
@@ -775,7 +786,7 @@ impl Backend {
         &self,
         path: &str,
         upload_id: &str,
-    ) -> Result<Vec<UploadedPart>, IoError> {
+    ) -> Result<Vec<UploadedPart>, io::Error> {
         let key = self.full_key(path);
         let mut parts = Vec::new();
         let mut part_number_marker: Option<u32> = None;
@@ -796,7 +807,7 @@ impl Backend {
                 )
                 .await
                 .map_err(|e| io_other(&e))?;
-            let parsed = xml::parse_list_parts(&response.body).map_err(IoError::other)?;
+            let parsed = xml::parse_list_parts(&response.body).map_err(io::Error::other)?;
             parts.extend(parsed.parts);
             if parsed.is_truncated {
                 part_number_marker = parsed.next_part_number_marker;
@@ -817,21 +828,21 @@ impl Backend {
     pub async fn generate_presigned_url(
         &self,
         path: &str,
-        expires_in: std::time::Duration,
+        expires_in: Duration,
         response_content_type: Option<&str>,
-    ) -> Result<String, IoError> {
+    ) -> Result<String, io::Error> {
         let key = self.full_key(path);
         self.s3_client
             .presigned_get_url(&key, expires_in, response_content_type)
-            .map_err(|e| IoError::other(e.to_string()))
+            .map_err(|e| io::Error::other(e.to_string()))
     }
 }
 
 // ─── helpers ──────────────────────────────────────────────────────────────
 
-pub(super) fn aggregate_batch_delete_errors(errors: &[String]) -> Option<IoError> {
+pub(super) fn aggregate_batch_delete_errors(errors: &[String]) -> Option<io::Error> {
     (!errors.is_empty())
-        .then(|| IoError::other(format!("batch delete errors: {}", errors.join("; "))))
+        .then(|| io::Error::other(format!("batch delete errors: {}", errors.join("; "))))
 }
 
 struct CopyPartRange {
@@ -847,14 +858,14 @@ struct CopyPartRanges {
     part_number: u32,
 }
 
-fn copy_part_ranges(size: u64, chunk_size: u64) -> Result<CopyPartRanges, IoError> {
+fn copy_part_ranges(size: u64, chunk_size: u64) -> Result<CopyPartRanges, io::Error> {
     if chunk_size == 0 {
-        return Err(IoError::other(
+        return Err(io::Error::other(
             "multipart copy chunk size must be greater than 0",
         ));
     }
     if size.div_ceil(chunk_size) > u64::from(MAX_MULTIPART_COPY_PARTS) {
-        return Err(IoError::other(format!(
+        return Err(io::Error::other(format!(
             "multipart copy requires more than {MAX_MULTIPART_COPY_PARTS} parts"
         )));
     }
@@ -884,11 +895,11 @@ impl Iterator for CopyPartRanges {
     }
 }
 
-fn map_get_error(error: &S3Error) -> IoError {
+fn map_get_error(error: &S3Error) -> io::Error {
     if error.is_not_found() {
-        IoError::new(ErrorKind::NotFound, "object not found")
+        io::Error::new(io::ErrorKind::NotFound, "object not found")
     } else {
-        IoError::other(s3_error_message(error))
+        io::Error::other(error.to_string())
     }
 }
 
@@ -896,21 +907,17 @@ fn classify_conditional_error(error: &S3Error) -> Error {
     if error.is_conditional_conflict() {
         Error::PreconditionFailed
     } else {
-        Error::Io(s3_error_message(error))
+        Error::Io(error.to_string())
     }
 }
 
-fn io_other(error: &S3Error) -> IoError {
-    IoError::other(s3_error_message(error))
+fn io_other(error: &S3Error) -> io::Error {
+    io::Error::other(error.to_string())
 }
 
 fn single_header(name: &'static str, value: &str) -> Result<HeaderMap, S3Error> {
     let mut headers = HeaderMap::new();
-    insert_header(
-        &mut headers,
-        reqwest::header::HeaderName::from_static(name),
-        value,
-    )?;
+    insert_header(&mut headers, HeaderName::from_static(name), value)?;
     Ok(headers)
 }
 
@@ -938,7 +945,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        registry::data_store::s3::{Backend, BackendConfig, client::content_md5_base64},
+        s3_client::{Backend, BackendConfig, client::content_md5_base64},
         secret::Secret,
     };
 

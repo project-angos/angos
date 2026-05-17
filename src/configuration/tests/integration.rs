@@ -5,7 +5,7 @@ use crate::{
     cache,
     configuration::{Configuration, Error, ServerConfig},
     policy::AccessMode,
-    registry::{blob_store, data_store, metadata_store},
+    registry::{blob_store, metadata_store},
 };
 
 #[test]
@@ -53,7 +53,7 @@ fn test_storage_field_backward_compatibility() {
     let config = Configuration::load_from_str(config).unwrap();
 
     // Should parse 'storage' as 'blob_store'
-    let expected = blob_store::BlobStorageConfig::FS(data_store::fs::BackendConfig {
+    let expected = blob_store::BlobStorageConfig::FS(blob_store::fs::BackendConfig {
         root_dir: "/data/registry".to_string(),
         sync_to_disk: false,
     });
