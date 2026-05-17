@@ -1,21 +1,23 @@
-use std::io::Cursor;
+use std::io::{Cursor, Error as IoError};
 
 use bytes::{Bytes, BytesMut};
 use tokio::{
     io::{AsyncRead, AsyncReadExt},
     sync::mpsc,
-    task::JoinError,
 };
 use tokio_util::task::AbortOnDropHandle;
-use tracing::{error, instrument, warn};
+use tracing::{instrument, warn};
 
+use super::multipart_helpers::{
+    UploadMode, next_part_number, uploaded_size as total_uploaded_size,
+};
 use super::{
     Backend, FRAME_BUFFER_CAPACITY, FRAME_SIZE, MIN_PART_SIZE, S3UploadState, UploadedPart,
 };
 use crate::{
     oci::Digest,
     registry::{
-        blob_store::{Error, hashing_reader::HashingReader, sha256_ext::Sha256Ext},
+        blob_store::{Error, hashing_reader::HashingReader},
         path_builder,
     },
 };
@@ -36,6 +38,8 @@ struct BufferContext<'a> {
     pending_size: u64,
 }
 
+type StreamingUploadHandle = AbortOnDropHandle<Result<String, IoError>>;
+
 impl Backend {
     pub async fn resolve_nonuniform_state(
         &self,
@@ -50,18 +54,11 @@ impl Backend {
             ..
         }) = self.retrieve_cached_upload_state(name, uuid).await
         {
-            let uploaded: u64 = parts.iter().map(|p| p.size).sum();
+            let uploaded = total_uploaded_size(&parts);
             return Ok((id, parts, uploaded, pending_size));
         }
-        let id = if let Some(id) = self.get_or_search_upload_id(&upload_path).await? {
-            id
-        } else {
-            let id = self.store.create_multipart_upload(&upload_path).await?;
-            self.cache_upload_id(&upload_path, &id).await;
-            id
-        };
-        let parts = self.store.list_parts(&upload_path, &id).await?;
-        let uploaded: u64 = parts.iter().map(|p| p.size).sum();
+        let (id, parts) = self.ensure_multipart_upload(&upload_path).await?;
+        let uploaded = total_uploaded_size(&parts);
         let pending_path = path_builder::upload_patch_pending_path(name, uuid);
         let pending = self.store.object_size(&pending_path).await.unwrap_or(0);
         Ok((id, parts, uploaded, pending))
@@ -78,34 +75,24 @@ impl Backend {
         }
     }
 
-    async fn handle_nonuniform_upload_task_failure(
+    fn spawn_nonuniform_upload_part(
         &self,
-        name: &str,
-        uuid: &str,
         ctx: &FlushContext<'_>,
-        join_error: JoinError,
-    ) -> Error {
-        let kind = if join_error.is_panic() {
-            "panicked"
-        } else if join_error.is_cancelled() {
-            "was cancelled"
-        } else {
-            "failed unexpectedly"
-        };
-        error!(
-            "nonuniform upload task {kind} for '{name}/{uuid}'; aborting multipart upload {upload_id}: {join_error}",
-            upload_id = ctx.upload_id,
-        );
-        if let Err(abort_err) = self
-            .store
-            .abort_multipart_upload(ctx.upload_path, ctx.upload_id)
-            .await
-        {
-            warn!("abort_multipart_upload failed during cleanup of '{name}/{uuid}': {abort_err}");
-        }
-        self.evict_upload_id(ctx.upload_path).await;
-        self.evict_upload_state(name, uuid).await;
-        Error::StorageBackend(format!("upload task {kind}: {join_error}"))
+    ) -> (mpsc::Sender<Bytes>, StreamingUploadHandle) {
+        let (tx, rx) = mpsc::channel::<Bytes>(FRAME_BUFFER_CAPACITY);
+
+        let store = self.store.clone();
+        let upload_path = ctx.upload_path.to_string();
+        let upload_id = ctx.upload_id.to_string();
+        let part_number = ctx.part_number;
+        let available = ctx.available;
+        let upload_handle = AbortOnDropHandle::new(tokio::spawn(async move {
+            store
+                .upload_part_streaming(&upload_path, &upload_id, part_number, available, rx)
+                .await
+        }));
+
+        (tx, upload_handle)
     }
 
     async fn flush_pending_as_part(
@@ -125,23 +112,7 @@ impl Backend {
         };
 
         let mut hashing_reader = HashingReader::with_hasher(combined, hasher);
-
-        let (tx, rx) = mpsc::channel::<Bytes>(FRAME_BUFFER_CAPACITY);
-
-        let store = self.store.clone();
-        let upload_path_owned = ctx.upload_path.to_string();
-        let upload_id_owned = ctx.upload_id.to_string();
-        let upload_handle = AbortOnDropHandle::new(tokio::spawn(async move {
-            store
-                .upload_part_streaming(
-                    &upload_path_owned,
-                    &upload_id_owned,
-                    ctx.part_number,
-                    ctx.available,
-                    rx,
-                )
-                .await
-        }));
+        let (tx, upload_handle) = self.spawn_nonuniform_upload_part(&ctx);
 
         let mut buf = BytesMut::with_capacity(FRAME_SIZE);
         let mut sent = 0;
@@ -173,7 +144,14 @@ impl Backend {
                     )),
                     Ok(Err(error)) => Err(error.into()),
                     Err(join_error) => Err(self
-                        .handle_nonuniform_upload_task_failure(name, uuid, &ctx, join_error)
+                        .handle_upload_task_failure(
+                            UploadMode::Nonuniform,
+                            name,
+                            uuid,
+                            ctx.upload_path,
+                            ctx.upload_id,
+                            join_error,
+                        )
                         .await),
                 };
             }
@@ -196,7 +174,14 @@ impl Backend {
             Ok(Err(e)) => return Err(e.into()),
             Err(join_error) => {
                 return Err(self
-                    .handle_nonuniform_upload_task_failure(name, uuid, &ctx, join_error)
+                    .handle_upload_task_failure(
+                        UploadMode::Nonuniform,
+                        name,
+                        uuid,
+                        ctx.upload_path,
+                        ctx.upload_id,
+                        join_error,
+                    )
                     .await);
             }
         }
@@ -313,15 +298,9 @@ impl Backend {
 
         let upload_path = path_builder::upload_path(name, uuid);
 
-        let (multipart_upload_id, parts) =
-            if let Some(upload_id) = self.get_or_search_upload_id(&upload_path).await? {
-                let parts = self.store.list_parts(&upload_path, &upload_id).await?;
-                (Some(upload_id), parts)
-            } else {
-                (None, Vec::new())
-            };
+        let (multipart_upload_id, parts) = self.discover_multipart_upload(&upload_path).await?;
 
-        let uploaded: u64 = parts.iter().map(|p| p.size).sum();
+        let uploaded = total_uploaded_size(&parts);
 
         let pending_path = path_builder::upload_patch_pending_path(name, uuid);
         let pending_size = self.store.object_size(&pending_path).await.unwrap_or(0);
@@ -344,17 +323,18 @@ impl Backend {
         digest: Option<&Digest>,
     ) -> Result<Digest, Error> {
         let upload_path = path_builder::upload_path(name, uuid);
-        let upload_id = self
-            .get_or_search_upload_id(&upload_path)
-            .await?
-            .ok_or(Error::UploadNotFound)?;
-
-        let mut parts = if let Some(cached) = self.retrieve_cached_upload_state(name, uuid).await {
-            cached.parts
+        let (upload_id, mut parts) = if let Some(S3UploadState {
+            multipart_upload_id: Some(upload_id),
+            parts,
+            ..
+        }) = self.retrieve_cached_upload_state(name, uuid).await
+        {
+            (upload_id, parts)
         } else {
-            self.store.list_parts(&upload_path, &upload_id).await?
+            let (upload_id, parts) = self.discover_multipart_upload(&upload_path).await?;
+            (upload_id.ok_or(Error::UploadNotFound)?, parts)
         };
-        let mut uploaded_size: u64 = parts.iter().map(|p| p.size).sum();
+        let mut uploaded_size = total_uploaded_size(&parts);
 
         let pending_path = path_builder::upload_patch_pending_path(name, uuid);
         let pending_size = self.store.object_size(&pending_path).await.unwrap_or(0);
@@ -378,22 +358,19 @@ impl Backend {
             uploaded_size += pending_size;
         }
 
-        let digest = digest
-            .cloned()
-            .unwrap_or(self.load_hasher(name, uuid, uploaded_size).await?.digest());
-
-        self.store
-            .complete_multipart_upload(&upload_path, &upload_id, &parts)
+        let digest = self
+            .resolve_upload_digest(name, uuid, uploaded_size, digest)
             .await?;
 
-        self.evict_upload_id(&upload_path).await;
-        self.evict_upload_state(name, uuid).await;
-
-        let blob_path = path_builder::blob_path(&digest);
-        self.store.copy_object(&upload_path, &blob_path).await?;
-
-        let container = path_builder::upload_container_path(name, uuid);
-        self.store.delete_prefix(&container).await?;
+        self.complete_multipart_upload_and_store(
+            &upload_path,
+            &upload_id,
+            &parts,
+            name,
+            uuid,
+            &digest,
+        )
+        .await?;
 
         Ok(digest)
     }
@@ -406,17 +383,9 @@ fn should_flush_pending(pending_size: u64, content_length: u64, min_part_size: u
     pending_size + content_length >= min_part_size
 }
 
-/// Returns the 1-based S3 part number for the next part to upload, given the
-/// number of parts already completed. Errors only if `completed_parts + 1`
-/// overflows `u32` — practically unreachable since S3 caps part counts at
-/// `10_000`, but propagated cleanly to keep the call path panic-free.
-fn next_part_number(completed_parts: usize) -> Result<u32, Error> {
-    Ok(u32::try_from(completed_parts + 1)?)
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{next_part_number, should_flush_pending};
+    use super::should_flush_pending;
 
     const MIN: u64 = 5 * 1024 * 1024;
 
@@ -451,22 +420,5 @@ mod tests {
     fn flushes_when_pending_and_content_together_reach_threshold() {
         let half = MIN / 2;
         assert!(should_flush_pending(half, MIN - half, MIN));
-    }
-
-    // --- next_part_number ---
-
-    #[test]
-    fn first_part_when_no_parts_uploaded() {
-        assert_eq!(next_part_number(0).unwrap(), 1);
-    }
-
-    #[test]
-    fn second_part_after_one_uploaded() {
-        assert_eq!(next_part_number(1).unwrap(), 2);
-    }
-
-    #[test]
-    fn part_number_increments_with_part_count() {
-        assert_eq!(next_part_number(9).unwrap(), 10);
     }
 }

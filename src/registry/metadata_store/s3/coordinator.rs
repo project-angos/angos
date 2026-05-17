@@ -1,11 +1,11 @@
-use std::{collections::HashMap, io::ErrorKind, sync::Arc, time::Duration};
+use std::{collections::HashMap, io::ErrorKind, sync::Arc};
 
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures_util::future::join_all;
 use tracing::{debug, info, instrument, warn};
 
-use super::{Backend, MAX_BLOB_INDEX_CAS_RETRIES, config::BackendConfig};
+use super::{Backend, MAX_BLOB_INDEX_CAS_RETRIES, config::BackendConfig, sleep_cas_retry};
 use crate::{
     oci::Digest,
     registry::{
@@ -15,8 +15,8 @@ use crate::{
             LockStrategy, ResolvedCreate, ResolvedDelete,
             link_kind::LinkKind,
             lock::{self, LockBackend, LockGuard, MemoryBackend, S3LockBackend},
-            lock_ops::{LockOps, blob_index_lock_key, link_lock_key},
-            simple_jitter, transaction,
+            lock_ops::{LockOps, blob_index_lock_key, link_lock_key, with_validated_lock},
+            sharded, transaction,
         },
         path_builder,
     },
@@ -280,32 +280,25 @@ impl WriteCoordinator for CasCoordinator {
         for attempt in 0..MAX_BLOB_INDEX_CAS_RETRIES {
             let (mut registry, etag) = match backend.store.read_with_etag(&path).await {
                 Ok((data, etag)) => {
-                    match serde_json::from_slice::<super::namespace_registry::NamespaceRegistry>(
-                        &data,
-                    ) {
+                    match serde_json::from_slice::<sharded::NamespaceRegistry>(&data) {
                         Ok(r) => (r, etag),
-                        Err(_) => (
-                            super::namespace_registry::NamespaceRegistry::default(),
-                            etag,
-                        ),
+                        Err(_) => (sharded::NamespaceRegistry::default(), etag),
                     }
                 }
-                Err(e) if e.kind() == ErrorKind::NotFound => (
-                    super::namespace_registry::NamespaceRegistry::default(),
-                    None,
-                ),
+                Err(e) if e.kind() == ErrorKind::NotFound => {
+                    (sharded::NamespaceRegistry::default(), None)
+                }
                 Err(e) => return Err(Error::from(e)),
             };
 
-            let Err(pos) = registry.namespaces.binary_search(&namespace.to_string()) else {
+            if !sharded::insert_sorted_unique(&mut registry.namespaces, namespace) {
                 backend
                     .known_namespaces
                     .lock()
                     .await
                     .insert(namespace.to_string());
                 return Ok(());
-            };
-            registry.namespaces.insert(pos, namespace.to_string());
+            }
 
             let content = Bytes::from(serde_json::to_vec(&registry)?);
             let write_result = if let Some(ref etag) = etag {
@@ -336,8 +329,7 @@ impl WriteCoordinator for CasCoordinator {
                         namespace,
                         attempt, "Namespace registry shard CAS conflict, retrying"
                     );
-                    let max_ms = 50u64.saturating_mul(1u64 << attempt.min(4));
-                    tokio::time::sleep(Duration::from_millis(simple_jitter(max_ms))).await;
+                    sleep_cas_retry(attempt).await;
                 }
                 Err(e) => return Err(Error::StorageBackend(e.to_string())),
             }
@@ -455,27 +447,19 @@ impl WriteCoordinator for LockCoordinator {
                 .await;
         }
 
-        let guard = self.lock.acquire(&[blob_index_lock_key(digest)]).await?;
-
-        let result = async {
-            backend.migrate_blob_index_layout(digest).await?;
-            backend
-                .update_blob_index_shard(namespace, digest, &[operation])
-                .await
-        }
-        .await;
-
-        let lock_valid = guard.is_valid();
-        guard.release().await;
-
-        result?;
-        if !lock_valid {
-            return Err(Error::Lock(
-                "lock invalidated during blob index update".into(),
-            ));
-        }
-
-        Ok(())
+        let lock_keys = [blob_index_lock_key(digest)];
+        with_validated_lock(
+            &*self.lock,
+            &lock_keys,
+            "lock invalidated during blob index update",
+            || async {
+                backend.migrate_blob_index_layout(digest).await?;
+                backend
+                    .update_blob_index_shard(namespace, digest, &[operation])
+                    .await
+            },
+        )
+        .await
     }
 
     async fn acquire_blob_data_lock(&self, digest: &Digest) -> Result<LockGuard, Error> {
@@ -487,32 +471,31 @@ impl WriteCoordinator for LockCoordinator {
         let shard_key = path_builder::namespace_shard_key(namespace);
         let path = path_builder::namespace_registry_shard_path(namespace);
         let lock_key = format!("namespace_registry_shard_{shard_key}");
-        let guard = self.lock.acquire(&[lock_key]).await?;
+        let lock_keys = [lock_key];
 
-        let mut registry = match backend.store.read(&path).await {
-            Ok(data) => {
-                serde_json::from_slice::<super::namespace_registry::NamespaceRegistry>(&data)
-                    .unwrap_or_default()
-            }
-            Err(e) if e.kind() == ErrorKind::NotFound => {
-                super::namespace_registry::NamespaceRegistry::default()
-            }
-            Err(e) => {
-                guard.release().await;
-                return Err(Error::from(e));
-            }
-        };
+        with_validated_lock(
+            &*self.lock,
+            &lock_keys,
+            "lock invalidated during namespace registry update",
+            || async {
+                let mut registry = match backend.store.read(&path).await {
+                    Ok(data) => serde_json::from_slice::<sharded::NamespaceRegistry>(&data)
+                        .unwrap_or_default(),
+                    Err(e) if e.kind() == ErrorKind::NotFound => {
+                        sharded::NamespaceRegistry::default()
+                    }
+                    Err(e) => return Err(Error::from(e)),
+                };
 
-        if let Err(pos) = registry.namespaces.binary_search(&namespace.to_string()) {
-            registry.namespaces.insert(pos, namespace.to_string());
-            let content = Bytes::from(serde_json::to_vec(&registry)?);
-            if let Err(e) = backend.store.put_object(&path, content).await {
-                guard.release().await;
-                return Err(e.into());
-            }
-        }
+                if sharded::insert_sorted_unique(&mut registry.namespaces, namespace) {
+                    let content = Bytes::from(serde_json::to_vec(&registry)?);
+                    backend.store.put_object(&path, content).await?;
+                }
+                Ok(())
+            },
+        )
+        .await?;
 
-        guard.release().await;
         backend
             .known_namespaces
             .lock()
@@ -533,10 +516,17 @@ impl WriteCoordinator for LockCoordinator {
         content: Bytes,
     ) -> Result<(), Error> {
         let lock_key = format!("namespace_registry_shard_{shard_key}");
-        let guard = self.lock.acquire(&[lock_key]).await?;
-        backend.store.put_object(path, content).await?;
-        guard.release().await;
-        Ok(())
+        let lock_keys = [lock_key];
+        with_validated_lock(
+            &*self.lock,
+            &lock_keys,
+            "lock invalidated during namespace registry rebuild",
+            move || async move {
+                backend.store.put_object(path, content).await?;
+                Ok(())
+            },
+        )
+        .await
     }
 
     #[instrument(name = "touch_link_access_time_locked", skip(self, backend))]
@@ -546,21 +536,24 @@ impl WriteCoordinator for LockCoordinator {
         namespace: &str,
         link: &LinkKind,
     ) -> Result<LinkMetadata, Error> {
-        let guard = self.lock.acquire(&[link_lock_key(namespace, link)]).await?;
-        let link_data = backend
-            .read_link_reference(namespace, link)
-            .await?
-            .accessed();
-        if !guard.is_valid() {
-            return Err(Error::Lock(
-                "lock invalidated during access time update".into(),
-            ));
-        }
-        backend
-            .write_link_reference(namespace, link, &link_data)
-            .await?;
+        let lock_keys = [link_lock_key(namespace, link)];
+        let link_data = with_validated_lock(
+            &*self.lock,
+            &lock_keys,
+            "lock invalidated during access time update",
+            || async {
+                let link_data = backend
+                    .read_link_reference(namespace, link)
+                    .await?
+                    .accessed();
+                backend
+                    .write_link_reference(namespace, link, &link_data)
+                    .await?;
+                Ok(link_data)
+            },
+        )
+        .await?;
         backend.cache_put(namespace, link, &link_data).await;
-        guard.release().await;
         Ok(link_data)
     }
 
@@ -571,21 +564,22 @@ impl WriteCoordinator for LockCoordinator {
         namespace: &str,
         link: &LinkKind,
     ) -> Result<(), Error> {
-        let guard = self.lock.acquire(&[link_lock_key(namespace, link)]).await?;
-        let link_data = backend
-            .read_link_reference(namespace, link)
-            .await?
-            .accessed();
-        if !guard.is_valid() {
-            return Err(Error::Lock(
-                "lock invalidated during access time flush".into(),
-            ));
-        }
-        backend
-            .write_link_reference(namespace, link, &link_data)
-            .await?;
-        guard.release().await;
-        Ok(())
+        let lock_keys = [link_lock_key(namespace, link)];
+        with_validated_lock(
+            &*self.lock,
+            &lock_keys,
+            "lock invalidated during access time flush",
+            || async {
+                let link_data = backend
+                    .read_link_reference(namespace, link)
+                    .await?
+                    .accessed();
+                backend
+                    .write_link_reference(namespace, link, &link_data)
+                    .await
+            },
+        )
+        .await
     }
 }
 

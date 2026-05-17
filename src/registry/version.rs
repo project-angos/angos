@@ -1,13 +1,13 @@
-use std::collections::HashMap;
+use crate::registry::{HeaderMap, ResponseHeaders};
 
 pub const DOCKER_DISTRIBUTION_API_VERSION: &str = "Docker-Distribution-API-Version";
 pub const X_POWERED_BY: &str = "X-Powered-By";
 
-pub fn api_version_response() -> HashMap<&'static str, String> {
-    HashMap::from([
-        (DOCKER_DISTRIBUTION_API_VERSION, "registry/2.0".to_string()),
-        (X_POWERED_BY, "Angos".to_string()),
-    ])
+pub fn api_version_response() -> HeaderMap {
+    ResponseHeaders::new()
+        .with(DOCKER_DISTRIBUTION_API_VERSION, "registry/2.0")
+        .with(X_POWERED_BY, "Angos")
+        .into_inner()
 }
 
 #[cfg(test)]

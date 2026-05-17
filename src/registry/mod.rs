@@ -11,6 +11,7 @@ mod error;
 #[cfg(test)]
 mod event_emission_tests;
 mod ext;
+mod headers;
 pub mod manifest;
 pub mod metadata_store;
 pub mod pagination;
@@ -24,6 +25,7 @@ pub mod version;
 
 pub use blob::{BlobRange, GetBlobResponse};
 pub use error::Error;
+pub use headers::{HeaderMap, ResponseHeaders};
 pub use manifest::{GetManifestResponse, ParsedManifestDigests, parse_manifest_digests};
 pub use repository::Repository;
 pub use upload::StartUploadResponse;

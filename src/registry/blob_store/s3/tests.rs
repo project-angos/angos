@@ -5,6 +5,10 @@ use chrono::Duration;
 use sha2::{Digest as ShaDigest, Sha256};
 use uuid::Uuid;
 
+use super::{
+    UploadedPart,
+    multipart_helpers::{next_part_number, uploaded_size},
+};
 use crate::{
     registry::{
         blob_store::{
@@ -22,6 +26,38 @@ use crate::{
     },
     secret::Secret,
 };
+
+#[test]
+fn first_part_when_no_parts_uploaded() {
+    assert_eq!(next_part_number(0).unwrap(), 1);
+}
+
+#[test]
+fn second_part_after_one_uploaded() {
+    assert_eq!(next_part_number(1).unwrap(), 2);
+}
+
+#[test]
+fn part_number_increments_with_part_count() {
+    assert_eq!(next_part_number(9).unwrap(), 10);
+}
+
+#[test]
+fn uploaded_size_sums_completed_parts() {
+    let parts = vec![
+        UploadedPart {
+            part_number: 1,
+            e_tag: "first".to_string(),
+            size: 5,
+        },
+        UploadedPart {
+            part_number: 2,
+            e_tag: "second".to_string(),
+            size: 8,
+        },
+    ];
+    assert_eq!(uploaded_size(&parts), 13);
+}
 
 struct UniformTestCase {
     key_prefix: String,

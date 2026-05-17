@@ -3,7 +3,7 @@ use tracing::warn;
 use super::response::ManifestMeta;
 use crate::{
     oci::{Digest, Manifest},
-    registry::Error,
+    registry::{Error, metadata_store::link_kind::LinkKind},
 };
 
 pub struct ParsedManifestDigests {
@@ -11,6 +11,40 @@ pub struct ParsedManifestDigests {
     pub config: Option<Digest>,
     pub layers: Vec<Digest>,
     pub manifests: Vec<Digest>,
+}
+
+impl ParsedManifestDigests {
+    pub fn links_for_revision(&self, revision: &Digest) -> Vec<(LinkKind, Digest)> {
+        let mut links = self.referenced_links_for_revision(revision);
+
+        if let Some(subject) = &self.subject {
+            links.push((
+                LinkKind::Referrer(subject.clone(), revision.clone()),
+                revision.clone(),
+            ));
+        }
+
+        links
+    }
+
+    pub fn referenced_links_for_revision(&self, revision: &Digest) -> Vec<(LinkKind, Digest)> {
+        let config = self
+            .config
+            .iter()
+            .map(|digest| (LinkKind::Config(digest.clone()), digest.clone()));
+        let layers = self
+            .layers
+            .iter()
+            .map(|digest| (LinkKind::Layer(digest.clone()), digest.clone()));
+        let manifests = self.manifests.iter().map(|digest| {
+            (
+                LinkKind::Manifest(revision.clone(), digest.clone()),
+                digest.clone(),
+            )
+        });
+
+        config.chain(layers).chain(manifests).collect()
+    }
 }
 
 fn validate_media_type_match(

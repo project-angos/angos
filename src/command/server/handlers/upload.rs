@@ -6,11 +6,11 @@ use crate::{
     command::server::{
         ServerContext,
         error::Error,
-        handlers::build_response,
+        handlers::{EventfulResponse, build_event_response, build_response, dispatch_eventful},
         request::{RequestHeaders, incoming_into_async_read},
         response_body::ResponseBody,
     },
-    event_webhook::event::{Event, EventActor},
+    event_webhook::event::EventActor,
     identity::ClientIdentity,
     oci::{Digest, Namespace},
     registry::StartUploadResponse,
@@ -78,7 +78,7 @@ pub async fn handle_put_upload<S>(
     content_length: u64,
     body_reader: S,
     identity: &ClientIdentity,
-) -> Result<(Response<ResponseBody>, Vec<Event>), Error>
+) -> Result<EventfulResponse, Error>
 where
     S: AsyncRead + Unpin + Send + Sync + 'static,
 {
@@ -88,9 +88,7 @@ where
         .complete_upload(actor, namespace, uuid, digest, content_length, body_reader)
         .await?;
 
-    let http_response =
-        build_response(StatusCode::CREATED, response.headers, ResponseBody::empty())?;
-    Ok((http_response, response.events))
+    build_event_response(StatusCode::CREATED, response.headers, response.events)
 }
 
 pub async fn handle_delete_upload(
@@ -143,17 +141,18 @@ pub async fn dispatch_put_upload(
     let content_length = headers.content_length()?.unwrap_or(0);
     let body_stream = incoming_into_async_read(incoming);
 
-    let (response, events) = handle_put_upload(
+    dispatch_eventful(
         context,
-        namespace,
-        uuid,
-        &digest,
-        content_length,
-        body_stream,
-        identity,
+        handle_put_upload(
+            context,
+            namespace,
+            uuid,
+            &digest,
+            content_length,
+            body_stream,
+            identity,
+        )
+        .await?,
     )
-    .await?;
-
-    context.dispatch_events(&events).await?;
-    Ok(response)
+    .await
 }

@@ -8,8 +8,11 @@ use tokio::{
     sync::mpsc,
 };
 use tokio_util::task::AbortOnDropHandle;
-use tracing::{error, instrument, warn};
+use tracing::instrument;
 
+use super::multipart_helpers::{
+    UploadMode, next_part_number, uploaded_size as total_uploaded_size,
+};
 use crate::{
     oci::Digest,
     registry::{
@@ -88,11 +91,7 @@ impl Backend {
             if let Some(state) = self.retrieve_cached_upload_state(name, uuid).await {
                 return Ok((state.multipart_upload_id, state.parts));
             }
-            let Some(id) = self.get_or_search_upload_id(upload_path).await? else {
-                return Ok((None, Vec::new()));
-            };
-            let parts = self.store.list_parts(upload_path, &id).await?;
-            Ok((Some(id), parts))
+            self.discover_multipart_upload(upload_path).await
         } else {
             self.evict_upload_id(upload_path).await;
             self.store.abort_pending_uploads(upload_path).await?;
@@ -134,33 +133,16 @@ impl Backend {
                         "upload task stopped before receiving complete body".to_string(),
                     )),
                     Ok(Err(error)) => Err(error.into()),
-                    Err(join_error) => {
-                        let kind = if join_error.is_panic() {
-                            "panicked"
-                        } else if join_error.is_cancelled() {
-                            "was cancelled"
-                        } else {
-                            "failed unexpectedly"
-                        };
-                        error!(
-                            "uniform upload task {kind} for '{name}/{uuid}'; aborting multipart upload {upload_id}: {join_error}",
-                            upload_id = ctx.upload_id,
-                        );
-                        if let Err(abort_err) = self
-                            .store
-                            .abort_multipart_upload(ctx.upload_path, ctx.upload_id)
-                            .await
-                        {
-                            warn!(
-                                "abort_multipart_upload failed during cleanup of '{name}/{uuid}': {abort_err}"
-                            );
-                        }
-                        self.evict_upload_id(ctx.upload_path).await;
-                        self.evict_upload_state(name, uuid).await;
-                        Err(Error::StorageBackend(format!(
-                            "upload task {kind}: {join_error}"
-                        )))
-                    }
+                    Err(join_error) => Err(self
+                        .handle_upload_task_failure(
+                            UploadMode::Uniform,
+                            name,
+                            uuid,
+                            ctx.upload_path,
+                            ctx.upload_id,
+                            join_error,
+                        )
+                        .await),
                 };
             }
         }
@@ -177,33 +159,16 @@ impl Backend {
         match upload_handle.await {
             Ok(Ok(_etag)) => Ok(()),
             Ok(Err(e)) => Err(e.into()),
-            Err(join_error) => {
-                let kind = if join_error.is_panic() {
-                    "panicked"
-                } else if join_error.is_cancelled() {
-                    "was cancelled"
-                } else {
-                    "failed unexpectedly"
-                };
-                error!(
-                    "uniform upload task {kind} for '{name}/{uuid}'; aborting multipart upload {upload_id}: {join_error}",
-                    upload_id = ctx.upload_id,
-                );
-                if let Err(abort_err) = self
-                    .store
-                    .abort_multipart_upload(ctx.upload_path, ctx.upload_id)
-                    .await
-                {
-                    warn!(
-                        "abort_multipart_upload failed during cleanup of '{name}/{uuid}': {abort_err}"
-                    );
-                }
-                self.evict_upload_id(ctx.upload_path).await;
-                self.evict_upload_state(name, uuid).await;
-                Err(Error::StorageBackend(format!(
-                    "upload task {kind}: {join_error}"
-                )))
-            }
+            Err(join_error) => Err(self
+                .handle_upload_task_failure(
+                    UploadMode::Uniform,
+                    name,
+                    uuid,
+                    ctx.upload_path,
+                    ctx.upload_id,
+                    join_error,
+                )
+                .await),
         }
     }
 
@@ -228,7 +193,7 @@ impl Backend {
             .resolve_uniform_state(name, uuid, &upload_path, append)
             .await?;
 
-        let mut uploaded_size: u64 = part_list.iter().map(|p| p.size).sum();
+        let mut uploaded_size = total_uploaded_size(&part_list);
         let mut uploaded_parts = next_part_number(part_list.len())?;
 
         let staged = self.load_staged_chunk(name, uuid, uploaded_size).await?;
@@ -312,15 +277,9 @@ impl Backend {
 
         let key = path_builder::upload_path(name, uuid);
 
-        let (multipart_upload_id, parts) =
-            if let Some(upload_id) = self.get_or_search_upload_id(&key).await? {
-                let parts = self.store.list_parts(&key, &upload_id).await?;
-                (Some(upload_id), parts)
-            } else {
-                (None, Vec::new())
-            };
+        let (multipart_upload_id, parts) = self.discover_multipart_upload(&key).await?;
 
-        let mut size: u64 = parts.iter().map(|p| p.size).sum();
+        let mut size = total_uploaded_size(&parts);
 
         let staged_path = path_builder::upload_staged_container_path(name, uuid, size);
         if let Ok(staged_size) = self.store.object_size(&staged_path).await {
@@ -353,15 +312,9 @@ impl Backend {
                 parts,
                 ..
             }) => (Some(id), parts),
-            _ => match self.get_or_search_upload_id(&key).await? {
-                Some(id) => {
-                    let parts = self.store.list_parts(&key, &id).await?;
-                    (Some(id), parts)
-                }
-                None => (None, Vec::new()),
-            },
+            _ => self.discover_multipart_upload(&key).await?,
         };
-        let mut size: u64 = parts.iter().map(|p| p.size).sum();
+        let mut size = total_uploaded_size(&parts);
 
         let source_key = path_builder::upload_staged_container_path(name, uuid, size);
 
@@ -369,25 +322,14 @@ impl Backend {
             match self.store.object_size(&source_key).await {
                 Ok(staged_size) => {
                     size += staged_size;
-                    let digest = digest
-                        .cloned()
-                        .unwrap_or(self.load_hasher(name, uuid, size).await?.digest());
-                    let blob_path = path_builder::blob_path(&digest);
-                    self.store.copy_object(&source_key, &blob_path).await?;
-                    self.evict_upload_state(name, uuid).await;
-                    let key = path_builder::upload_container_path(name, uuid);
-                    self.store.delete_prefix(&key).await?;
+                    let digest = self.resolve_upload_digest(name, uuid, size, digest).await?;
+                    self.copy_staged_object_to_blob_and_cleanup(&source_key, name, uuid, &digest)
+                        .await?;
                     return Ok(digest);
                 }
                 Err(e) if e.kind() == io::ErrorKind::NotFound && size == 0 => {
-                    let digest = digest
-                        .cloned()
-                        .unwrap_or(self.load_hasher(name, uuid, size).await?.digest());
-                    let blob_path = path_builder::blob_path(&digest);
-                    self.store.put_object(&blob_path, Bytes::new()).await?;
-                    self.evict_upload_state(name, uuid).await;
-                    let key = path_builder::upload_container_path(name, uuid);
-                    self.store.delete_prefix(&key).await?;
+                    let digest = self.resolve_upload_digest(name, uuid, size, digest).await?;
+                    self.put_empty_blob_and_cleanup(name, uuid, &digest).await?;
                     return Ok(digest);
                 }
                 Err(e) if e.kind() == io::ErrorKind::NotFound => return Err(Error::UploadNotFound),
@@ -411,21 +353,10 @@ impl Backend {
             size += staged_size;
         }
 
-        let digest = digest.cloned();
-        let digest = digest.unwrap_or(self.load_hasher(name, uuid, size).await?.digest());
+        let digest = self.resolve_upload_digest(name, uuid, size, digest).await?;
 
-        self.store
-            .complete_multipart_upload(&key, &upload_id, &parts)
+        self.complete_multipart_upload_and_store(&key, &upload_id, &parts, name, uuid, &digest)
             .await?;
-
-        self.evict_upload_id(&key).await;
-        self.evict_upload_state(name, uuid).await;
-
-        let blob_path = path_builder::blob_path(&digest);
-        self.store.copy_object(&key, &blob_path).await?;
-
-        let key = path_builder::upload_container_path(name, uuid);
-        self.store.delete_prefix(&key).await?;
 
         Ok(digest)
     }
@@ -443,31 +374,5 @@ impl Backend {
             .unwrap_or_else(|_| Utc::now().fixed_offset())
             .with_timezone(&Utc);
         Ok(UploadSummary { size, started_at })
-    }
-}
-
-/// Returns the 1-based part number for the next part to upload, given the
-/// number of parts already completed.  S3 part numbers start at 1.
-fn next_part_number(completed_parts: usize) -> Result<u32, Error> {
-    Ok(u32::try_from(completed_parts + 1)?)
-}
-
-#[cfg(test)]
-mod tests {
-    use crate::registry::blob_store::s3::uniform::next_part_number;
-
-    #[test]
-    fn first_part_when_no_parts_uploaded() {
-        assert_eq!(next_part_number(0).unwrap(), 1);
-    }
-
-    #[test]
-    fn second_part_after_one_uploaded() {
-        assert_eq!(next_part_number(1).unwrap(), 2);
-    }
-
-    #[test]
-    fn part_number_increments_with_part_count() {
-        assert_eq!(next_part_number(9).unwrap(), 10);
     }
 }

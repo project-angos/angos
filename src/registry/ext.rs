@@ -1,7 +1,6 @@
 use std::collections::HashMap;
 
 use chrono::{DateTime, Utc};
-use hyper::header::CONTENT_TYPE;
 use serde::Serialize;
 use tracing::instrument;
 
@@ -12,13 +11,15 @@ use crate::{
         Platform as OciPlatform, namespace_belongs_to,
     },
     registry::{
-        APPLICATION_JSON, Error, JsonResponse, Registry, metadata_store::link_kind::LinkKind,
-        pagination::collect_all_pages,
+        APPLICATION_JSON, Error, HeaderMap, JsonResponse, Registry, ResponseHeaders,
+        metadata_store::link_kind::LinkKind, pagination::collect_all_pages,
     },
 };
 
-fn json_headers() -> HashMap<&'static str, String> {
-    HashMap::from([(CONTENT_TYPE.as_str(), APPLICATION_JSON.to_string())])
+fn json_headers() -> HeaderMap {
+    ResponseHeaders::new()
+        .content_type(APPLICATION_JSON)
+        .into_inner()
 }
 
 #[derive(Serialize, Debug)]

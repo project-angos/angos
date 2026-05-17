@@ -202,8 +202,8 @@ mod tests {
 
         let options = Options {
             dry_run: true,
-            uploads: Some(humantime::Duration::from(std::time::Duration::from_secs(
-                3600,
+            uploads: Some(humantime::Duration::from(std::time::Duration::from_hours(
+                1,
             ))),
             multipart: None,
             tags: true,
