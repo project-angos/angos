@@ -933,39 +933,33 @@ fn test_new_with_invalid_ca_bundle() {
 }
 
 #[test]
-fn test_new_with_certificate_only_ignored() {
-    let config = RegistryClientConfig {
-        url: "https://example.com".to_string(),
-        max_redirect: 5,
-        server_ca_bundle: None,
-        client_certificate: Some("/path/to/cert.pem".to_string()),
-        client_private_key: None,
-        username: None,
-        password: None,
-    };
-
-    let cache = cache::Config::Memory.to_backend().unwrap();
-    let result = RegistryClient::new(&config, cache);
-
-    assert!(result.is_ok());
+fn test_registry_client_config_cert_without_key_rejected_at_deserialize() {
+    let toml = r#"
+        url = "https://example.com"
+        client_certificate = "/path/to/cert.pem"
+    "#;
+    let result: Result<RegistryClientConfig, _> = toml::from_str(toml);
+    assert!(result.is_err());
+    let msg = result.unwrap_err().to_string();
+    assert!(
+        msg.contains("both client_certificate and client_private_key are required for mTLS"),
+        "unexpected error: {msg}"
+    );
 }
 
 #[test]
-fn test_new_with_private_key_only_ignored() {
-    let config = RegistryClientConfig {
-        url: "https://example.com".to_string(),
-        max_redirect: 5,
-        server_ca_bundle: None,
-        client_certificate: None,
-        client_private_key: Some("/path/to/key.pem".to_string()),
-        username: None,
-        password: None,
-    };
-
-    let cache = cache::Config::Memory.to_backend().unwrap();
-    let result = RegistryClient::new(&config, cache);
-
-    assert!(result.is_ok());
+fn test_registry_client_config_key_without_cert_rejected_at_deserialize() {
+    let toml = r#"
+        url = "https://example.com"
+        client_private_key = "/path/to/key.pem"
+    "#;
+    let result: Result<RegistryClientConfig, _> = toml::from_str(toml);
+    assert!(result.is_err());
+    let msg = result.unwrap_err().to_string();
+    assert!(
+        msg.contains("both client_certificate and client_private_key are required for mTLS"),
+        "unexpected error: {msg}"
+    );
 }
 
 #[test]

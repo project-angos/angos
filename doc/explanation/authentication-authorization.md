@@ -76,8 +76,13 @@ When a client presents a certificate:
 [server.tls]
 server_certificate_bundle = "/tls/server.crt"
 server_private_key = "/tls/server.key"
-client_ca_bundle = "/tls/client-ca.crt"  # Enables mTLS
+client_ca_bundle = "/tls/client-ca.crt"
+# "optional": accept connections with or without a cert (default when client_ca_bundle is set).
+# "required": reject connections that do not present a valid client cert at the TLS layer.
+client_auth = "required"
 ```
+
+See [Configure mTLS](../how-to/configure-mtls.md) for the full `client_auth` mode reference.
 
 **Identity fields:**
 - `identity.certificate.common_names`

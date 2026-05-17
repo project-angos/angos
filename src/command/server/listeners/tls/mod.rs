@@ -16,7 +16,7 @@ use crate::command::server::{
     error::Error,
     listeners::{Connector, HandshakeResult, accept_loop},
 };
-pub use crate::configuration::listeners::{ServerTlsConfig, TlsListenerConfig};
+pub use crate::configuration::listeners::{ClientAuth, ServerTlsConfig, TlsListenerConfig};
 
 fn load_certificate_bundle(
     path: &Path,
@@ -36,7 +36,10 @@ fn load_private_key(path: &Path, description: &str) -> Result<PrivateKeyDer<'sta
         .map_err(|e| Error::Initialization(format!("Failed to build {description}: {e}")))
 }
 
-fn build_client_verifier(client_ca_bundle: &Path) -> Result<Arc<dyn ClientCertVerifier>, Error> {
+fn build_client_verifier(
+    client_ca_bundle: &Path,
+    mode: ClientAuth,
+) -> Result<Arc<dyn ClientCertVerifier>, Error> {
     let client_certs = load_certificate_bundle(client_ca_bundle, "client certificates bundle")?;
 
     let mut client_cert_store = RootCertStore::empty();
@@ -48,14 +51,21 @@ fn build_client_verifier(client_ca_bundle: &Path) -> Result<Arc<dyn ClientCertVe
         })?;
     }
 
-    WebPkiClientVerifier::builder(Arc::new(client_cert_store))
-        .allow_unauthenticated()
-        .build()
-        .map_err(|e| {
-            Error::Initialization(format!(
-                "Failed to create TLS client certificate verifier: {e}"
-            ))
-        })
+    let builder = WebPkiClientVerifier::builder(Arc::new(client_cert_store));
+
+    let verifier = match mode {
+        // Accept anonymous clients alongside clients with a valid cert; policy can gate on identity.
+        ClientAuth::Optional => builder.allow_unauthenticated(),
+        ClientAuth::Required => builder,
+    }
+    .build()
+    .map_err(|e| {
+        Error::Initialization(format!(
+            "Failed to create TLS client certificate verifier: {e}"
+        ))
+    })?;
+
+    Ok(verifier)
 }
 
 struct TlsConnector<'a> {
@@ -153,7 +163,7 @@ impl TlsListener {
         Ok(())
     }
 
-    fn build_tls_acceptor(tls_config: &ServerTlsConfig) -> Result<TlsAcceptor, Error> {
+    pub fn build_tls_acceptor(tls_config: &ServerTlsConfig) -> Result<TlsAcceptor, Error> {
         debug!("Detected TLS configuration");
         let server_certs = load_certificate_bundle(
             &tls_config.server_certificate_bundle,
@@ -161,14 +171,17 @@ impl TlsListener {
         )?;
         let server_key = load_private_key(&tls_config.server_private_key, "server private key")?;
 
-        let server_config = if let Some(client_ca_bundle) = tls_config.client_ca_bundle.as_ref() {
-            debug!("Client CA bundle detected");
-            let client_cert_verifier = build_client_verifier(client_ca_bundle)?;
+        let server_config = if let Some(ca_bundle) = tls_config.client_ca_bundle.as_ref() {
+            debug!(
+                "Client CA bundle detected (client_auth = {:?})",
+                tls_config.client_auth
+            );
+            let client_cert_verifier = build_client_verifier(ca_bundle, tls_config.client_auth)?;
             rustls::ServerConfig::builder()
                 .with_client_cert_verifier(client_cert_verifier)
                 .with_single_cert(server_certs, server_key)
         } else {
-            debug!("No client CA bundle detected");
+            debug!("No client CA bundle detected; client_auth setting is ignored");
             rustls::ServerConfig::builder()
                 .with_no_client_auth()
                 .with_single_cert(server_certs, server_key)

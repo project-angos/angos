@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use crate::{
     auth::oidc,
     cache,
+    configuration::listeners::ClientAuth,
     configuration::{Configuration, Error, ServerConfig},
     policy::AccessMode,
     registry::{blob_store, metadata_store},
@@ -308,6 +309,8 @@ fn test_tls_config_with_client_ca() {
                 tls_config.tls.client_ca_bundle,
                 Some(PathBuf::from("ca.pem"))
             );
+            // When client_auth is omitted, it defaults to Optional for backwards compatibility.
+            assert_eq!(tls_config.tls.client_auth, ClientAuth::Optional);
         }
         ServerConfig::Insecure(_) => panic!("Expected TLS server config"),
     }
