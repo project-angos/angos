@@ -76,8 +76,13 @@ When a client presents a certificate:
 [server.tls]
 server_certificate_bundle = "/tls/server.crt"
 server_private_key = "/tls/server.key"
-client_ca_bundle = "/tls/client-ca.crt"  # Enables mTLS
+client_ca_bundle = "/tls/client-ca.crt"
+# "optional": accept connections with or without a cert (default when client_ca_bundle is set).
+# "required": reject connections that do not present a valid client cert at the TLS layer.
+client_auth = "required"
 ```
+
+See [Configure mTLS](../how-to/configure-mtls.md) for the full `client_auth` mode reference.
 
 **Identity fields:**
 - `identity.certificate.common_names`
@@ -145,8 +150,8 @@ sequenceDiagram
     Policy-->>Registry: Allow/Deny
 
     opt Webhook configured
-        Registry->>Webhook: POST <configured webhook URL>
-        Webhook-->>Registry: 2xx (allow) or other (deny)
+        Registry->>Webhook: GET <configured webhook URL>
+        Webhook-->>Registry: 2xx (allow) or 401/403 (deny) or 429/5xx (unavailable)
     end
 
     Registry-->>Client: Response
@@ -292,9 +297,10 @@ sequenceDiagram
 - Identity context (username, certificate info)
 
 **Response interpretation:**
-- 2xx → Allow
-- Any other status → Deny
-- Timeout/transport error → Deny (fail-closed). Distinguishable from explicit deny on dashboards via the `webhook_authorization_requests_total{result="transport_error"}` metric label; the cache is not updated so the deny is not pinned past recovery.
+- 2xx → Allow (cached)
+- 401 or 403 → Explicit deny (cached)
+- 429, 5xx, or other non-2xx → Unavailable: fail closed for this request, not cached; the next request re-probes the webhook. Visible as `result="unavailable"` on `webhook_authorization_requests_total`.
+- Timeout/transport error → Unavailable (fail-closed, not cached). Distinguishable from HTTP unavailability via `result="transport_error"` on the same metric.
 
 ---
 
@@ -304,7 +310,7 @@ sequenceDiagram
 
 - No policies = no access
 - Webhook timeout = denied (authorization is a security gate; an unreachable gate cannot make an allow decision)
-- CEL evaluation error = rule skipped (continues evaluation)
+- CEL evaluation error = request denied (fail-closed)
 
 ### Token Validation
 

@@ -1,7 +1,7 @@
 use std::{sync::Arc, time::Duration};
 
 use hyper::http::{HeaderMap, request::Parts};
-use reqwest::Client;
+use reqwest::{Client, StatusCode};
 use tracing::warn;
 
 use crate::{
@@ -103,12 +103,32 @@ impl WebhookAuthorizer {
 
         match send_result {
             Ok(resp) => {
-                let allowed = resp.status().is_success();
-                self.record_outcome(if allowed { "allow" } else { "deny" });
-                if let Ok(cache_key) = &cache_key {
-                    self.cache_outcome(cache_key, allowed).await;
+                let status = resp.status();
+                if status.is_success() {
+                    self.record_outcome("allow");
+                    if let Ok(cache_key) = &cache_key {
+                        self.cache_outcome(cache_key, true).await;
+                    }
+                    Ok(true)
+                } else if status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN {
+                    // 401/403 are explicit deny decisions, safe to cache.
+                    self.record_outcome("deny");
+                    if let Ok(cache_key) = &cache_key {
+                        self.cache_outcome(cache_key, false).await;
+                    }
+                    Ok(false)
+                } else {
+                    // Do not cache: a transient outage must not pin denials.
+                    warn!(
+                        "Webhook '{}' returned unavailable status {status}; failing closed without caching",
+                        self.name
+                    );
+                    self.record_outcome("unavailable");
+                    Err(Error::Unauthorized(format!(
+                        "authorization webhook '{}' returned status {status}",
+                        self.name
+                    )))
                 }
-                Ok(allowed)
             }
             Err(e) => {
                 // Webhook unreachable: fail closed and surface the transport cause.

@@ -41,7 +41,22 @@ port = 8000
 server_certificate_bundle = "/tls/server-certificate.pem"
 server_private_key = "/tls/server-private-key.pem"
 client_ca_bundle = "/tls/client-ca-bundle.pem"
+# Controls how the server treats client certificates when client_ca_bundle is set:
+# "optional"  — clients may connect with or without a cert (cert identity is used in policy when present).
+# "required"  — the TLS handshake fails unless the client presents a cert signed by client_ca_bundle.
+client_auth = "required"
 ```
+
+### `client_auth` modes
+
+`client_auth` is only meaningful when `client_ca_bundle` is set. When no `client_ca_bundle` is configured, no client authentication occurs and `client_auth` is ignored.
+
+| Mode | Behavior |
+|---|---|
+| `"optional"` (default) | Clients may connect with or without a certificate. Certificate identity is available in access policy when a cert is presented. Use this when mTLS is one of several accepted auth methods. |
+| `"required"` | The TLS handshake is rejected unless the client presents a certificate signed by a CA in `client_ca_bundle`. Use this when mTLS is the only acceptable authentication method. |
+
+`client_auth = "required"` requires `client_ca_bundle` to be set; the configuration is rejected at startup otherwise. When `client_auth` is omitted, it defaults to `"optional"` (existing configs with only `client_ca_bundle` keep their previous behavior).
 
 ### Step 3: Restart the Registry
 
@@ -180,7 +195,17 @@ docker pull registry.example.com/test/alpine:latest
 
 ### Scenario 1: Certificate Required
 
-All clients must present a valid certificate:
+All clients must present a valid certificate. Use `client_auth = "required"` to enforce this at the TLS layer — the connection is rejected before any application logic runs:
+
+```toml
+[server.tls]
+server_certificate_bundle = "/tls/server-certificate.pem"
+server_private_key = "/tls/server-private-key.pem"
+client_ca_bundle = "/tls/client-ca-bundle.pem"
+client_auth = "required"
+```
+
+You can additionally enforce specific certificate attributes in access policy:
 
 ```toml
 [global.access_policy]

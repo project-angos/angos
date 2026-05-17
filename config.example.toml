@@ -8,6 +8,10 @@ port = 8000
 server_certificate_bundle = "tls.d/server-ca-bundle.pem"
 server_private_key = "tls.d/server-private-key.pem"
 client_ca_bundle   = "tls.d/client-ca-bundle.pem"
+# client_auth controls how the server treats client certificates (only meaningful when client_ca_bundle is set).
+# "optional" (default)  — clients may present a cert signed by client_ca_bundle, but may also connect without one.
+# "required"            — a valid client cert is mandatory; the TLS handshake fails without one.
+client_auth = "required"
 
 # Global configuration options
 [global]

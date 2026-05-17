@@ -85,9 +85,12 @@ impl AuthMiddleware for OidcValidator {
 
         match self.validate_token(&token).await {
             Ok(claims) => {
+                // Do not log the full claims map: it contains user/CI metadata.
+                let subject = claims.claims.get("sub").and_then(|v| v.as_str());
+                let issuer = claims.claims.get("iss").and_then(|v| v.as_str());
                 debug!(
-                    "Successfully validated OIDC token for provider '{}' with claims: {:?}",
-                    self.provider_name, claims
+                    "OIDC token validated for provider '{}' (type='{}', sub={:?}, iss={:?})",
+                    claims.provider_name, claims.provider_type, subject, issuer
                 );
                 identity.oidc = Some(claims);
                 Ok(AuthResult::Authenticated)

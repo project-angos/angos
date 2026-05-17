@@ -17,8 +17,8 @@ Delegate access control decisions to an external HTTP service for maximum flexib
 
 1. Client makes a request to the registry
 2. Registry sends request context to webhook via HTTP GET
-3. Webhook returns 2xx to allow, any other status to deny
-4. Registry proceeds or rejects based on response
+3. Webhook response is classified into three buckets (see table below)
+4. Registry proceeds or rejects based on classification
 
 ```mermaid
 sequenceDiagram
@@ -35,14 +35,28 @@ sequenceDiagram
     else CEL passes
         R->>W: GET /authorize
         alt 2xx response
-            W-->>R: Allow
+            W-->>R: Allow (cached)
             R-->>C: 200 OK
-        else Non-2xx response
-            W-->>R: Deny
+        else 401 or 403
+            W-->>R: Explicit deny (cached)
+            R-->>C: 403 Forbidden
+        else 429, 5xx, or other non-2xx
+            W-->>R: Unavailable — fail closed, not cached
             R-->>C: 403 Forbidden
         end
     end
 ```
+
+### Response Classification
+
+| Status              | Decision       | Cached? |
+|---------------------|----------------|---------|
+| 2xx                 | Allow          | Yes     |
+| 401, 403            | Explicit deny  | Yes     |
+| 429, 5xx, other 4xx | Unavailable    | No      |
+| Transport error     | Unavailable    | No      |
+
+Unavailable responses fail the in-flight request closed but do not write to the cache, so the next request re-probes the webhook. As soon as the webhook returns 2xx or 401/403, normal caching resumes.
 
 ---
 
@@ -296,7 +310,21 @@ sum(rate(webhook_authorization_requests_total[5m]))
 
 # Webhook latency
 histogram_quantile(0.95, rate(webhook_authorization_duration_seconds_bucket[5m]))
+
+# Webhook unavailability rate (429, 5xx, and other non-2xx/non-401/403 responses)
+rate(webhook_authorization_requests_total{result="unavailable"}[5m])
 ```
+
+The `result` label values on `webhook_authorization_requests_total` are:
+
+| Value            | Meaning                                                          |
+|------------------|------------------------------------------------------------------|
+| `allow`          | Webhook returned 2xx; decision cached                            |
+| `deny`           | Webhook returned 401 or 403; explicit denial cached              |
+| `unavailable`    | Webhook returned 429, 5xx, or other non-decision status; not cached |
+| `transport_error`| Network/TLS failure reaching the webhook; not cached             |
+| `cached_allow`   | Decision served from cache (allow)                               |
+| `cached_deny`    | Decision served from cache (deny)                                |
 
 ---
 

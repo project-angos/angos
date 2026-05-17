@@ -41,16 +41,51 @@ fn parse_header<T: std::str::FromStr>(
         .ok_or(Error::Unsupported)
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[serde(try_from = "RegistryClientConfigFields")]
 pub struct RegistryClientConfig {
     pub url: String,
-    #[serde(default = "RegistryClientConfig::default_max_redirect")]
     pub max_redirect: u8,
     pub server_ca_bundle: Option<String>,
+    /// Note: named `client_certificate` (without `_bundle`) to match the existing config key;
+    /// renaming would break operator configs.
     pub client_certificate: Option<String>,
     pub client_private_key: Option<String>,
     pub username: Option<String>,
     pub password: Option<Secret<String>>,
+}
+
+#[derive(Deserialize)]
+struct RegistryClientConfigFields {
+    url: String,
+    #[serde(default = "RegistryClientConfig::default_max_redirect")]
+    max_redirect: u8,
+    server_ca_bundle: Option<String>,
+    client_certificate: Option<String>,
+    client_private_key: Option<String>,
+    username: Option<String>,
+    password: Option<Secret<String>>,
+}
+
+impl TryFrom<RegistryClientConfigFields> for RegistryClientConfig {
+    type Error = String;
+
+    fn try_from(fields: RegistryClientConfigFields) -> Result<Self, Self::Error> {
+        if fields.client_certificate.is_some() != fields.client_private_key.is_some() {
+            return Err(
+                "both client_certificate and client_private_key are required for mTLS".to_string(),
+            );
+        }
+        Ok(Self {
+            url: fields.url,
+            max_redirect: fields.max_redirect,
+            server_ca_bundle: fields.server_ca_bundle,
+            client_certificate: fields.client_certificate,
+            client_private_key: fields.client_private_key,
+            username: fields.username,
+            password: fields.password,
+        })
+    }
 }
 
 impl RegistryClientConfig {

@@ -38,11 +38,56 @@ pub struct TlsListenerConfig {
     pub tls: ServerTlsConfig,
 }
 
+/// Whether client certificates are accepted or required at the TLS handshake.
+///
+/// Only meaningful when `client_ca_bundle` is set; ignored otherwise.
+/// See `doc/how-to/configure-mtls.md` for the trade-off between modes.
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ClientAuth {
+    /// Accept both authenticated clients (cert validates against `client_ca_bundle`)
+    /// and anonymous clients (no cert presented). Policy can gate on cert identity.
+    #[default]
+    Optional,
+    /// Reject the TLS handshake unless the client presents a cert that validates
+    /// against `client_ca_bundle`.
+    Required,
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq)]
+#[serde(try_from = "ServerTlsConfigFields")]
 pub struct ServerTlsConfig {
     pub server_certificate_bundle: PathBuf,
     pub server_private_key: PathBuf,
     pub client_ca_bundle: Option<PathBuf>,
+    pub client_auth: ClientAuth,
+}
+
+#[derive(Deserialize)]
+struct ServerTlsConfigFields {
+    server_certificate_bundle: PathBuf,
+    server_private_key: PathBuf,
+    client_ca_bundle: Option<PathBuf>,
+    #[serde(default)]
+    client_auth: ClientAuth,
+}
+
+impl TryFrom<ServerTlsConfigFields> for ServerTlsConfig {
+    type Error = String;
+
+    fn try_from(fields: ServerTlsConfigFields) -> Result<Self, Self::Error> {
+        if fields.client_auth == ClientAuth::Required && fields.client_ca_bundle.is_none() {
+            return Err(
+                "client_auth = \"required\" requires client_ca_bundle to be set".to_string(),
+            );
+        }
+        Ok(Self {
+            server_certificate_bundle: fields.server_certificate_bundle,
+            server_private_key: fields.server_private_key,
+            client_ca_bundle: fields.client_ca_bundle,
+            client_auth: fields.client_auth,
+        })
+    }
 }
 
 impl ListenerBaseConfig {

@@ -284,7 +284,7 @@ Claims: repository=myorg/myrepo, ref=refs/heads/main, actor=username
 **Policy not matching:**
 - Always check `identity.oidc != null` first
 - Use bracket notation for claims: `identity.oidc.claims["claim"]`
-- Check claim values in debug logs
+- Check the policy module's debug logs (`RUST_LOG=angos::policy=debug`) to see how CEL rules evaluate against the stored `identity.oidc.claims` map; the OIDC auth log only emits provider name/type and the `sub`/`iss` claims to avoid leaking user/CI metadata
 
 **Network errors:**
 - Ensure the registry can reach `token.actions.githubusercontent.com` for JWKS
