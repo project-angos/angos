@@ -6,11 +6,11 @@ pub mod blob;
 pub mod blob_ownership;
 pub mod blob_store;
 pub mod content_discovery;
-pub mod data_store;
 mod error;
 #[cfg(test)]
 mod event_emission_tests;
 mod ext;
+mod fs_ops;
 mod headers;
 pub mod manifest;
 pub mod metadata_store;

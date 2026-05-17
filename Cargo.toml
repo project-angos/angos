@@ -13,7 +13,6 @@ arc-swap = "1.9.1"
 argh = "0.1.19"
 argon2 = "0.5.3"
 async-trait = "0.1.89"
-aws-sdk-s3 = { version = "1.132.0" }
 base64 = "0.22.1"
 bytes = "1.11.1"
 bytesize = { version = "2.3.1", features = ["serde"] }
@@ -28,13 +27,16 @@ humantime = "2.3"
 hyper = { version = "1.9" , features = ["full"]}
 hyper-util = { version = "0.1.20", features = ["tokio", "server-graceful"] }
 jsonwebtoken = { version = "10.4.0", features = ["aws_lc_rs"] }
+md-5 = "0.11"
 mime_guess = "2.0.5"
 notify = "8.2"
 opentelemetry = "0.32.0"
 opentelemetry_sdk = { version = "0.32.0", features = ["rt-tokio", "metrics"] }
 opentelemetry-otlp = { version = "0.32.0" , features = ["grpc-tonic"]}
 parking_lot = "0.12.5"
+password-hash = { version = "0.5", features = ["getrandom"] }
 prometheus = "0.14"
+quick-xml = "0.38"
 redis = { version = "1.2.1", features = ["tokio-comp"] }
 regex = "1.12.3"
 reqwest = { version = "0.13.3", default-features = false, features = ["rustls", "stream", "json"] }
@@ -46,6 +48,7 @@ serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
 serde_urlencoded = "0.7.1"
 sha2 = "0.11.0"
+smallvec = "1.15"
 tempfile = "3.27"
 thiserror = "2.0.18"
 tokio = { version = "1.52.3", features = ["full", "tracing"] }

@@ -8,12 +8,16 @@ use std::{
 use async_trait::async_trait;
 use futures_util::stream::{self, StreamExt};
 use serde::Deserialize;
+use tokio::fs;
 use tracing::{debug, info, instrument, warn};
 
 use crate::{
     oci::{Descriptor, Digest},
     registry::{
-        data_store,
+        fs_ops::{
+            atomic_write, list_dir_or_empty, prune_empty_ancestors, remove_dir_all_if_exists,
+            remove_file_if_exists,
+        },
         metadata_store::{
             BlobIndex, BlobIndexOperation, Error, LinkMetadata, LinkOperation, LockConfig,
             LockStrategy, MetadataStore,
@@ -73,28 +77,16 @@ impl<'de> Deserialize<'de> for BackendConfig {
     }
 }
 
-impl From<BackendConfig> for data_store::fs::BackendConfig {
-    fn from(config: BackendConfig) -> Self {
-        Self {
-            root_dir: config.root_dir,
-            sync_to_disk: config.sync_to_disk,
-        }
-    }
-}
-
 #[derive(Clone)]
 pub struct Backend {
-    store: data_store::fs::Backend,
+    root: PathBuf,
+    sync_to_disk: bool,
     lock: Arc<dyn LockBackend + Send + Sync>,
 }
 
 impl Backend {
     pub fn new(config: &BackendConfig) -> Result<Self, Error> {
         info!("Using filesystem metadata-store backend");
-        let store = data_store::fs::Backend::new(&data_store::fs::BackendConfig {
-            root_dir: config.root_dir.clone(),
-            sync_to_disk: config.sync_to_disk,
-        });
 
         let lock: Arc<dyn LockBackend + Send + Sync> = match &config.lock_strategy {
             LockStrategy::Redis(redis_config) => {
@@ -115,7 +107,15 @@ impl Backend {
             }
         };
 
-        Ok(Self { store, lock })
+        Ok(Self {
+            root: PathBuf::from(&config.root_dir),
+            sync_to_disk: config.sync_to_disk,
+            lock,
+        })
+    }
+
+    fn full_path(&self, path: &str) -> PathBuf {
+        self.root.join(path)
     }
 
     #[instrument(skip(self))]
@@ -124,7 +124,7 @@ impl Backend {
         let mut repositories = Vec::new();
 
         while let Some(current_path) = path_stack.pop() {
-            if let Ok(entries) = self.store.list_dir(&current_path).await {
+            if let Ok(entries) = list_dir_or_empty(&self.full_path(&current_path)).await {
                 for entry in entries {
                     let path = if current_path.ends_with('/') {
                         format!("{current_path}{entry}")
@@ -161,7 +161,7 @@ impl Backend {
 
     async fn read_blob_index_shards(&self, digest: &Digest) -> Result<Option<BlobIndex>, Error> {
         let refs_dir = path_builder::blob_index_refs_dir(digest);
-        let mut entries = self.store.list_dir(&refs_dir).await?;
+        let mut entries = list_dir_or_empty(&self.full_path(&refs_dir)).await?;
         entries.sort();
 
         if entries.is_empty() {
@@ -171,7 +171,7 @@ impl Backend {
         let shard_results = stream::iter(entries.into_iter().map(|entry| {
             let shard_path = format!("{refs_dir}/{entry}");
             async move {
-                match self.store.read(&shard_path).await {
+                match fs::read(self.full_path(&shard_path)).await {
                     Ok(data) => {
                         let links = serde_json::from_slice::<HashSet<LinkKind>>(&data)?;
                         if links.is_empty() {
@@ -202,7 +202,7 @@ impl Backend {
 
     async fn read_legacy_blob_index(&self, digest: &Digest) -> Result<Option<BlobIndex>, Error> {
         let path = path_builder::blob_index_path(digest);
-        match self.store.read_to_string(&path).await {
+        match fs::read_to_string(self.full_path(&path)).await {
             Ok(content) => Ok(Some(serde_json::from_str::<BlobIndex>(&content)?)),
             Err(e) if e.kind() == ErrorKind::NotFound => Ok(None),
             Err(e) => Err(Error::from(e)),
@@ -238,9 +238,9 @@ impl Backend {
                 .await?;
         }
 
-        let legacy_path = path_builder::blob_index_path(digest);
-        self.store.delete(&legacy_path).await?;
-        let _ = self.store.delete_empty_parent_dirs(&legacy_path).await;
+        let legacy_path = self.full_path(&path_builder::blob_index_path(digest));
+        remove_file_if_exists(&legacy_path).await?;
+        let _ = prune_empty_ancestors(&legacy_path, &self.root, 3).await;
         Ok(())
     }
 
@@ -265,7 +265,7 @@ impl Backend {
         operations: &[BlobIndexOperation],
     ) -> Result<(), Error> {
         let shard_path = path_builder::blob_index_shard_path(digest, namespace);
-        let mut links: HashSet<LinkKind> = match self.store.read(&shard_path).await {
+        let mut links: HashSet<LinkKind> = match fs::read(self.full_path(&shard_path)).await {
             Ok(data) => serde_json::from_slice(&data).unwrap_or_default(),
             Err(e) if e.kind() == ErrorKind::NotFound => HashSet::new(),
             Err(e) => return Err(Error::from(e)),
@@ -274,11 +274,12 @@ impl Backend {
         sharded::apply_blob_index_operations(&mut links, operations);
 
         if links.is_empty() {
-            self.store.delete(&shard_path).await?;
-            let _ = self.store.delete_empty_parent_dirs(&shard_path).await;
+            let abs = self.full_path(&shard_path);
+            remove_file_if_exists(&abs).await?;
+            let _ = prune_empty_ancestors(&abs, &self.root, 3).await;
         } else {
             let content = serde_json::to_vec(&links)?;
-            self.store.write(&shard_path, &content).await?;
+            atomic_write(&self.full_path(&shard_path), &content, self.sync_to_disk).await?;
         }
 
         Ok(())
@@ -286,12 +287,12 @@ impl Backend {
 
     async fn read_namespace_registry(&self) -> Result<Option<NamespaceRegistry>, Error> {
         let shard_dir = path_builder::namespace_registry_shard_dir();
-        let mut entries = self.store.list_dir(&shard_dir).await?;
+        let mut entries = list_dir_or_empty(&self.full_path(&shard_dir)).await?;
         entries.sort();
 
         if entries.is_empty() {
             let path = path_builder::namespace_registry_path();
-            return match self.store.read(&path).await {
+            return match fs::read(self.full_path(&path)).await {
                 Ok(data) => match serde_json::from_slice::<NamespaceRegistry>(&data) {
                     Ok(registry) => Ok(Some(registry)),
                     Err(error) => {
@@ -307,7 +308,7 @@ impl Backend {
         let shard_results = stream::iter(entries.into_iter().map(|entry| {
             let shard_path = format!("{shard_dir}/{entry}");
             async move {
-                match self.store.read(&shard_path).await {
+                match fs::read(self.full_path(&shard_path)).await {
                     Ok(data) => match serde_json::from_slice::<NamespaceRegistry>(&data) {
                         Ok(registry) => Ok(registry.namespaces),
                         Err(error) => {
@@ -367,7 +368,9 @@ impl Backend {
                     "{}/{shard_key}.json",
                     path_builder::namespace_registry_shard_dir()
                 );
-                self.store.write(&path, &content).await.map_err(Error::from)
+                atomic_write(&self.full_path(&path), &content, self.sync_to_disk)
+                    .await
+                    .map_err(Error::from)
             },
         )
         .await
@@ -382,7 +385,7 @@ impl Backend {
             &lock_keys,
             "lock invalidated during namespace registry update",
             || async {
-                let mut registry = match self.store.read(&path).await {
+                let mut registry = match fs::read(self.full_path(&path)).await {
                     Ok(data) => {
                         serde_json::from_slice::<NamespaceRegistry>(&data).unwrap_or_default()
                     }
@@ -392,7 +395,7 @@ impl Backend {
 
                 if sharded::insert_sorted_unique(&mut registry.namespaces, namespace) {
                     let content = serde_json::to_vec(&registry)?;
-                    self.store.write(&path, &content).await?;
+                    atomic_write(&self.full_path(&path), &content, self.sync_to_disk).await?;
                 }
                 Ok(())
             },
@@ -430,7 +433,7 @@ impl MetadataStore for Backend {
     ) -> Result<(Vec<String>, Option<String>), Error> {
         let path = path_builder::manifest_tags_dir(namespace);
         debug!("Listing tags in path: {path}");
-        let mut tags = self.store.list_dir(&path).await?;
+        let mut tags = list_dir_or_empty(&self.full_path(&path)).await?;
         tags.sort();
 
         Ok(pagination::paginate(&tags, n, last.as_deref()))
@@ -447,7 +450,7 @@ impl MetadataStore for Backend {
             "{}/sha256",
             path_builder::manifest_referrers_dir(namespace, digest)
         );
-        let all_manifest = self.store.list_dir(&path).await?;
+        let all_manifest = list_dir_or_empty(&self.full_path(&path)).await?;
 
         let digest_entries: Vec<Digest> = all_manifest
             .into_iter()
@@ -463,7 +466,7 @@ impl MetadataStore for Backend {
                         manifest_digest,
                         artifact_type,
                         |link| async move { self.read_link_reference(namespace, &link).await },
-                        |path| async move { self.store.read(&path).await },
+                        |path| async move { fs::read(self.full_path(&path)).await },
                     )
                     .await
                 }
@@ -482,7 +485,7 @@ impl MetadataStore for Backend {
             "{}/sha256",
             path_builder::manifest_referrers_dir(namespace, subject)
         );
-        match self.store.list_dir(&path).await {
+        match list_dir_or_empty(&self.full_path(&path)).await {
             Ok(entries) => Ok(!entries.is_empty()),
             Err(_) => Ok(false),
         }
@@ -496,7 +499,7 @@ impl MetadataStore for Backend {
     ) -> Result<(Vec<Digest>, Option<String>), Error> {
         let path = path_builder::manifest_revisions_link_root_dir(namespace, "sha256");
 
-        let all_revisions = self.store.list_dir(&path).await?;
+        let all_revisions = list_dir_or_empty(&self.full_path(&path)).await?;
         let mut revisions = Vec::new();
 
         for revision in all_revisions {
@@ -512,7 +515,7 @@ impl MetadataStore for Backend {
 
     async fn count_manifests(&self, namespace: &str) -> Result<usize, Error> {
         let path = path_builder::manifest_revisions_link_root_dir(namespace, "sha256");
-        let revisions = self.store.list_dir(&path).await?;
+        let revisions = list_dir_or_empty(&self.full_path(&path)).await?;
         Ok(revisions.len())
     }
 
@@ -557,7 +560,7 @@ impl MetadataStore for Backend {
         digest: &Digest,
     ) -> Result<HashSet<LinkKind>, Error> {
         let shard_path = path_builder::blob_index_shard_path(digest, namespace);
-        match self.store.read(&shard_path).await {
+        match fs::read(self.full_path(&shard_path)).await {
             Ok(data) => {
                 let links = serde_json::from_slice::<HashSet<LinkKind>>(&data)?;
                 sharded::non_empty_links_or_not_found(links)
@@ -602,9 +605,9 @@ impl MetadataStore for Backend {
     #[instrument(skip(self))]
     async fn migrate_namespace_registry(&self) -> Result<(), Error> {
         self.rebuild_namespace_registry().await?;
-        let legacy_path = path_builder::namespace_registry_path();
-        self.store.delete(&legacy_path).await?;
-        let _ = self.store.delete_empty_parent_dirs(&legacy_path).await;
+        let legacy_path = self.full_path(&path_builder::namespace_registry_path());
+        remove_file_if_exists(&legacy_path).await?;
+        let _ = prune_empty_ancestors(&legacy_path, &self.root, 3).await;
         Ok(())
     }
 
@@ -656,7 +659,7 @@ impl LockOps for Backend {
         link: &LinkKind,
     ) -> Result<LinkMetadata, Error> {
         let link_path = path_builder::link_path(link, namespace);
-        let data = self.store.read(&link_path).await?;
+        let data = fs::read(self.full_path(&link_path)).await?;
         LinkMetadata::from_bytes(data)
     }
 
@@ -668,15 +671,20 @@ impl LockOps for Backend {
     ) -> Result<(), Error> {
         let link_path = path_builder::link_path(link, namespace);
         let serialized_link_data = serde_json::to_vec(metadata)?;
-        self.store.write(&link_path, &serialized_link_data).await?;
+        atomic_write(
+            &self.full_path(&link_path),
+            &serialized_link_data,
+            self.sync_to_disk,
+        )
+        .await?;
         Ok(())
     }
 
     async fn delete_link_reference(&self, namespace: &str, link: &LinkKind) -> Result<(), Error> {
-        let path = path_builder::link_container_path(link, namespace);
-        debug!("Deleting link at path: {path}");
-        self.store.delete_dir(&path).await?;
-        let _ = self.store.delete_empty_parent_dirs(&path).await;
+        let path = self.full_path(&path_builder::link_container_path(link, namespace));
+        debug!("Deleting link at path: {}", path.display());
+        remove_dir_all_if_exists(&path).await?;
+        let _ = prune_empty_ancestors(&path, &self.root, 4).await;
         Ok(())
     }
 
@@ -727,7 +735,13 @@ mod tests {
         let content = b"blob-content";
         let digest = sha256::digest(content);
         let blob_path = path_builder::blob_path(&digest);
-        backend.store.write(&blob_path, content).await.unwrap();
+        atomic_write(
+            &backend.root.join(&blob_path),
+            content,
+            backend.sync_to_disk,
+        )
+        .await
+        .unwrap();
 
         let link = LinkKind::Layer(digest.clone());
         backend
@@ -743,7 +757,7 @@ mod tests {
             .await
             .unwrap();
 
-        let stored_content = backend.store.read(&blob_path).await.unwrap();
+        let stored_content = fs::read(backend.root.join(&blob_path)).await.unwrap();
         assert_eq!(stored_content, content);
         assert!(matches!(
             backend.read_blob_index(&digest).await,
@@ -805,12 +819,16 @@ mod tests {
 
         let shard_path = path_builder::blob_index_shard_path(&digest, namespace);
         let links: HashSet<LinkKind> =
-            serde_json::from_slice(&backend.store.read(&shard_path).await.unwrap()).unwrap();
+            serde_json::from_slice(&fs::read(backend.root.join(&shard_path)).await.unwrap())
+                .unwrap();
         assert!(links.contains(&link));
 
         let legacy_path = path_builder::blob_index_path(&digest);
         assert_eq!(
-            backend.store.read(&legacy_path).await.unwrap_err().kind(),
+            fs::read(backend.root.join(&legacy_path))
+                .await
+                .unwrap_err()
+                .kind(),
             ErrorKind::NotFound
         );
     }
@@ -835,22 +853,28 @@ mod tests {
             .insert(namespace.to_string(), HashSet::from([link.clone()]));
 
         let legacy_path = path_builder::blob_index_path(&digest);
-        backend
-            .store
-            .write(&legacy_path, &serde_json::to_vec(&blob_index).unwrap())
-            .await
-            .unwrap();
+        atomic_write(
+            &backend.root.join(&legacy_path),
+            &serde_json::to_vec(&blob_index).unwrap(),
+            backend.sync_to_disk,
+        )
+        .await
+        .unwrap();
 
         let migrated = backend.read_blob_index(&digest).await.unwrap();
         assert_eq!(migrated.namespace, blob_index.namespace);
         assert_eq!(
-            backend.store.read(&legacy_path).await.unwrap_err().kind(),
+            fs::read(backend.root.join(&legacy_path))
+                .await
+                .unwrap_err()
+                .kind(),
             ErrorKind::NotFound
         );
 
         let shard_path = path_builder::blob_index_shard_path(&digest, namespace);
         let links: HashSet<LinkKind> =
-            serde_json::from_slice(&backend.store.read(&shard_path).await.unwrap()).unwrap();
+            serde_json::from_slice(&fs::read(backend.root.join(&shard_path)).await.unwrap())
+                .unwrap();
         assert!(links.contains(&link));
     }
 
@@ -884,7 +908,8 @@ mod tests {
 
         let shard_path = path_builder::namespace_registry_shard_path(namespace);
         let registry: NamespaceRegistry =
-            serde_json::from_slice(&backend.store.read(&shard_path).await.unwrap()).unwrap();
+            serde_json::from_slice(&fs::read(backend.root.join(&shard_path)).await.unwrap())
+                .unwrap();
         assert_eq!(registry.namespaces, vec![namespace.to_string()]);
     }
 }

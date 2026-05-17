@@ -17,7 +17,6 @@ use crate::{
     cache::Cache,
     oci::{Descriptor, Digest},
     registry::{
-        data_store,
         metadata_store::{
             BlobIndex, BlobIndexOperation, ConditionalCapabilities, Error, LinkMetadata,
             LinkOperation, LockGuard, LockStrategy, MetadataStore, link_kind::LinkKind,
@@ -25,6 +24,7 @@ use crate::{
         },
         pagination, path_builder,
     },
+    s3_client,
 };
 
 mod access_time;
@@ -43,7 +43,7 @@ pub use probe::probe_conditional_capabilities;
 
 #[derive(Clone)]
 pub struct Backend {
-    pub store: data_store::s3::Backend,
+    pub store: s3_client::Backend,
     cache: Option<Arc<Cache>>,
     link_cache_ttl: u64,
     conditional_capabilities: ConditionalCapabilities,
@@ -80,7 +80,7 @@ impl Backend {
         conditional: Option<ConditionalCapabilities>,
     ) -> Result<Self, Error> {
         info!("Using S3 metadata-store backend");
-        let store = data_store::s3::Backend::new(&config.to_data_store_config())?;
+        let store = s3_client::Backend::new(&config.to_data_store_config())?;
 
         let caps = conditional.unwrap_or_else(|| {
             if matches!(config.lock_strategy, LockStrategy::S3(_)) {

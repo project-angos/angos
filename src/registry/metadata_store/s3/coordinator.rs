@@ -9,7 +9,6 @@ use super::{Backend, MAX_BLOB_INDEX_CAS_RETRIES, config::BackendConfig, sleep_ca
 use crate::{
     oci::Digest,
     registry::{
-        data_store,
         metadata_store::{
             BlobIndexOperation, ConditionalCapabilities, Error, LinkMetadata, LinkOperation,
             LockStrategy, ResolvedCreate, ResolvedDelete,
@@ -20,6 +19,7 @@ use crate::{
         },
         path_builder,
     },
+    s3_client,
 };
 
 #[async_trait]
@@ -324,7 +324,7 @@ impl WriteCoordinator for CasCoordinator {
                         .insert(namespace.to_string());
                     return Ok(());
                 }
-                Err(data_store::Error::PreconditionFailed) => {
+                Err(s3_client::Error::PreconditionFailed) => {
                     debug!(
                         namespace,
                         attempt, "Namespace registry shard CAS conflict, retrying"
@@ -373,7 +373,7 @@ impl WriteCoordinator for CasCoordinator {
         };
         match write_result {
             Ok(()) => {}
-            Err(data_store::Error::PreconditionFailed) => {
+            Err(s3_client::Error::PreconditionFailed) => {
                 debug!(
                     shard_key,
                     "Namespace registry shard rebuild lost CAS race; concurrent write wins"
@@ -599,7 +599,7 @@ pub(super) fn build_coordinator(
             }
             info!("Using CAS coordinator with S3 lock for S3 metadata-store");
             let lock_store = Arc::new(
-                data_store::s3::Backend::new(&config.to_lock_store_config(s3_lock_config))
+                s3_client::Backend::new(&config.to_lock_store_config(s3_lock_config))
                     .map_err(|e| Error::Lock(format!("Failed to initialize S3 lock store: {e}")))?,
             );
             let lock = Arc::new(

@@ -21,9 +21,10 @@ use crate::{
                 test_datastore_list_uploads, test_datastore_upload_operations,
             },
         },
-        data_store, path_builder,
+        path_builder,
         test_utils::S3RegistryTestCase,
     },
+    s3_client,
     secret::Secret,
 };
 
@@ -67,7 +68,7 @@ struct UniformTestCase {
 impl UniformTestCase {
     fn new() -> Self {
         let key_prefix = format!("test-uniform-{}", Uuid::new_v4());
-        let store = blob_store::s3::Backend::new(&data_store::s3::BackendConfig {
+        let store = blob_store::s3::Backend::new(&s3_client::BackendConfig {
             access_key_id: Secret::new("root".to_string()),
             secret_key: Secret::new("roottoor".to_string()),
             endpoint: "http://127.0.0.1:9000".to_string(),

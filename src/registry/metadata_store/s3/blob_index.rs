@@ -8,10 +8,10 @@ use super::{Backend, sleep_cas_retry};
 use crate::{
     oci::Digest,
     registry::{
-        data_store,
         metadata_store::{BlobIndex, BlobIndexOperation, Error, link_kind::LinkKind, sharded},
         path_builder,
     },
+    s3_client,
 };
 
 impl Backend {
@@ -60,7 +60,7 @@ impl Backend {
 
             match write_result {
                 Ok(()) => return Ok(()),
-                Err(data_store::Error::PreconditionFailed) => {
+                Err(s3_client::Error::PreconditionFailed) => {
                     debug!(
                         digest = %digest,
                         namespace,

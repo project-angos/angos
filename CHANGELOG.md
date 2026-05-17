@@ -28,6 +28,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - The S3 shard-key hash uses SHA-256, so shard placement is stable across processes and builds.
 - Filesystem metadata now uses the same sharded blob-index and namespace-registry layout as S3, and scrub migrates legacy filesystem and S3 metadata files to the sharded layout.
 - The Redis client reuses a multiplexed connection across operations and backs off on lock contention.
+- The S3 backend now uses a custom HTTP client in place of the AWS SDK: focused retry / timeout / signing tailored to the operations the registry actually issues, smaller binary, and no AWS SDK transitive dependencies.
+- Filesystem cleanup of empty ancestor directories is depth-bounded (2 levels for blob shards, 3 for index and namespace-registry shards, 4 for link containers) and rooted-subtree guarded; a misshaped path can never walk above the configured root.
 - UI, documentation-website and Rust dependencies upgraded.
 
 #### Performance

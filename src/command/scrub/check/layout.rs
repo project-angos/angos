@@ -58,7 +58,7 @@ mod tests {
     async fn layout_checker_emits_namespace_and_blob_migration_actions() {
         let temp_dir = TempDir::new().unwrap();
         let blob_store = Arc::new(blob_store::fs::Backend::new(
-            &crate::registry::data_store::fs::BackendConfig {
+            &crate::registry::blob_store::fs::BackendConfig {
                 root_dir: temp_dir.path().to_string_lossy().into_owned(),
                 sync_to_disk: false,
             },

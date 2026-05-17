@@ -9,12 +9,12 @@ use super::Backend;
 use crate::{
     oci::Digest,
     registry::{
-        data_store,
         metadata_store::{
             BlobIndexOperation, Error, LinkMetadata, link_kind::LinkKind, lock_ops::LockOps,
         },
         path_builder,
     },
+    s3_client,
 };
 
 impl Backend {
@@ -88,7 +88,7 @@ impl Backend {
             .await
         {
             Ok(_) => Ok(true),
-            Err(data_store::Error::PreconditionFailed) => Ok(false),
+            Err(s3_client::Error::PreconditionFailed) => Ok(false),
             Err(e) => Err(Error::StorageBackend(e.to_string())),
         }
     }

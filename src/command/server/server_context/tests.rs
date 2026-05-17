@@ -879,7 +879,8 @@ async fn test_shutdown_flushes_pending_access_times() {
     use crate::{
         oci::Digest,
         registry::{
-            RegistryConfig, blob_store,
+            RegistryConfig,
+            blob_store::{self, fs},
             metadata_store::{
                 LinkOperation, MetadataStore,
                 link_kind::LinkKind,
@@ -907,11 +908,10 @@ async fn test_shutdown_flushes_pending_access_times() {
     let metadata_backend = S3MetadataBackend::new(&s3_config, None).unwrap();
     let metadata_store: Arc<dyn MetadataStore + Send + Sync> = Arc::new(metadata_backend);
 
-    let blob_store_config =
-        blob_store::BlobStorageConfig::FS(crate::registry::data_store::fs::BackendConfig {
-            root_dir: "/tmp/test-blobs-shutdown-flush".to_string(),
-            ..Default::default()
-        });
+    let blob_store_config = blob_store::BlobStorageConfig::FS(fs::BackendConfig {
+        root_dir: "/tmp/test-blobs-shutdown-flush".to_string(),
+        ..Default::default()
+    });
     let blob_handles = blob_store_config.to_backend(None).unwrap();
 
     let registry_config = RegistryConfig::default()

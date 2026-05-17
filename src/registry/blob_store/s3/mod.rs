@@ -21,7 +21,7 @@ use sha2::{Digest as ShaDigestTrait, Sha256};
 use tokio::io::AsyncRead;
 use tracing::{debug, info, instrument};
 
-pub use crate::registry::data_store::s3::UploadedPart;
+pub use crate::s3_client::UploadedPart;
 use crate::{
     cache::Cache,
     oci::Digest,
@@ -30,8 +30,9 @@ use crate::{
             BlobStore, BoxedReader, Error, PresignedBlobStore, UploadStore, UploadSummary,
             sha256_ext::Sha256Ext,
         },
-        data_store, pagination, path_builder,
+        pagination, path_builder,
     },
+    s3_client,
 };
 
 pub const MIN_PART_SIZE: u64 = 5 * 1024 * 1024;
@@ -50,7 +51,7 @@ pub struct S3UploadState {
 
 #[derive(Clone)]
 pub struct Backend {
-    pub store: data_store::s3::Backend,
+    pub store: s3_client::Backend,
     multipart_part_size: u64,
     uniform_parts: bool,
     cache: Option<Arc<Cache>>,
@@ -63,10 +64,10 @@ impl Debug for Backend {
 }
 
 impl Backend {
-    pub fn new(config: &data_store::s3::BackendConfig) -> Result<Self, Error> {
+    pub fn new(config: &s3_client::BackendConfig) -> Result<Self, Error> {
         info!("Using S3 blob-store backend");
         let multipart_part_size = config.multipart_part_size.as_u64();
-        let store = data_store::s3::Backend::new(config)?;
+        let store = s3_client::Backend::new(config)?;
 
         Ok(Self {
             store,
