@@ -25,6 +25,9 @@ impl CelRule {
     ///
     /// Returns an error string describing the parse failure.
     pub fn compile(source: &str) -> Result<Self, String> {
+        if source.trim().is_empty() {
+            return Err("CEL rule cannot be empty".to_string());
+        }
         Program::compile(source)
             .map(|program| Self(Arc::new(program)))
             .map_err(|e| format!("Failed to compile CEL rule '{source}': {e}"))
@@ -54,8 +57,10 @@ impl<'de> Deserialize<'de> for CelRule {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::policy::{AccessPolicyConfig, RetentionPolicyConfig};
+    use cel_interpreter::{Context, ExecutionError};
+    use serde::de::DeserializeOwned;
+
+    use crate::policy::{AccessPolicyConfig, CelRule, RetentionPolicyConfig};
 
     #[test]
     fn valid_cel_rule_compiles() {
@@ -107,21 +112,39 @@ mod tests {
         );
     }
 
-    // cel_interpreter (via the underlying antlr4rust parser) panics on an
-    // empty source string rather than returning a parse error.  This is a
-    // known limitation of the upstream library: the ANTLR-generated parser
-    // hits an `unreachable!()` branch when the token stream is empty.
-    // The test documents this behaviour so a future library upgrade that
-    // converts the panic into an Err is detected immediately.
     #[test]
-    #[should_panic(expected = "internal error: entered unreachable code")]
-    fn empty_expression_panics_in_upstream_parser() {
-        let _ = CelRule::compile("");
+    fn empty_cel_rule_fails_compile() {
+        assert!(CelRule::compile("").is_err());
     }
 
-    // The cel_interpreter library is lazy about variable resolution: it does
-    // not check whether identifiers exist at compile time.  An expression
-    // referencing an undeclared variable compiles without error.
+    #[test]
+    fn whitespace_only_cel_rule_fails_compile() {
+        assert!(CelRule::compile("   \n\t  ").is_err());
+    }
+
+    fn assert_empty_rule_fails_at_deserialize<C: DeserializeOwned>() {
+        let toml = r#"rules = [""]"#;
+        let result: Result<C, _> = toml::from_str(toml);
+        let msg = result
+            .err()
+            .expect("empty CEL rule must fail at deserialization")
+            .to_string();
+        assert!(
+            msg.contains("empty"),
+            "error should mention empty, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn empty_access_policy_cel_rule_fails_at_deserialize() {
+        assert_empty_rule_fails_at_deserialize::<AccessPolicyConfig>();
+    }
+
+    #[test]
+    fn empty_retention_policy_cel_rule_fails_at_deserialize() {
+        assert_empty_rule_fails_at_deserialize::<RetentionPolicyConfig>();
+    }
+
     #[test]
     fn undefined_variable_compiles_lazily() {
         assert!(
@@ -130,9 +153,6 @@ mod tests {
         );
     }
 
-    // Variable resolution errors surface at execute time, not compile time.
-    // This test pins the runtime error variant so a change in error-reporting
-    // behaviour is caught by CI.
     #[test]
     fn undefined_variable_fails_at_execute_time() {
         let rule =

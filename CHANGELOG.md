@@ -22,6 +22,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - Server errors return the OCI `INTERNAL_ERROR` code in JSON responses.
 - Non-boolean CEL access-policy rule results are fail-closed in both `allow` and `deny` modes.
 - Access-policy CEL runtime evaluation errors are now fail-closed: a DENY rule that throws at request time denies the request instead of falling through to default-allow.
+- Empty or whitespace-only CEL rules now fail with a clear configuration error at load time instead of panicking the process.
 - Configuration is fully validated at load time (URLs, Redis cache URLs, Argon2 hashes, CEL rules, sampling rates, webhook refs, regexes, listener timeouts); invalid values now fail at startup with a clear error instead of later at runtime.
 - OIDC providers are tried in deterministic order, and the `mTLS` `auth_method` label is preserved when basic auth also succeeds.
 - Auth-webhook transport failures surface as errors instead of silent denials.

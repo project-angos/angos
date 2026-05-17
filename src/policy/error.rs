@@ -40,7 +40,11 @@ pub struct PolicyError {
 impl fmt::Display for PolicyError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self.rule_index {
-            Some(idx) => write!(f, "access policy rule {idx} evaluation failed: {}", self.message),
+            Some(idx) => write!(
+                f,
+                "access policy rule {idx} evaluation failed: {}",
+                self.message
+            ),
             None => write!(f, "access policy evaluation failed: {}", self.message),
         }
     }
