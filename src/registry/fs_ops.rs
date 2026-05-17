@@ -45,11 +45,7 @@ pub async fn atomic_write(path: &Path, data: &[u8], sync_to_disk: bool) -> io::R
 /// The bounded depth and the strict `starts_with(root)` guard exist to make
 /// this safe to call with any path that originated inside `root`: even with a
 /// pathological `start` we cannot walk above the bucket or run away.
-pub async fn prune_empty_ancestors(
-    start: &Path,
-    root: &Path,
-    max_levels: u8,
-) -> io::Result<()> {
+pub async fn prune_empty_ancestors(start: &Path, root: &Path, max_levels: u8) -> io::Result<()> {
     let mut current = start.parent();
     for _ in 0..max_levels {
         let Some(parent) = current else { break };
