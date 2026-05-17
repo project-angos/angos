@@ -94,18 +94,19 @@ Between registry and upstream registries:
 
 Angos implements fail-closed authorization for critical security decisions:
 
-| Scenario                            | Behavior                           |
-|-------------------------------------|------------------------------------|
-| No policies defined                 | Access denied (fail-closed)        |
-| No authentication provided          | Proceeds as anonymous identity     |
-| Webhook timeout (`required` policy) | Access denied (fail-closed)        |
-| Webhook timeout (`optional` policy) | Access continues (best-effort)     |
-| Webhook not configured              | Not evaluated, access continues    |
-| Invalid mTLS certificate            | TLS handshake fails                |
-| Invalid OIDC token                  | 401 Unauthorized (fail-closed)     |
-| Invalid Basic Auth password         | 401 Unauthorized (fail-closed)     |
-| CEL evaluation error                | Access denied (fail-closed)        |
-| CEL non-boolean result (any mode)   | Access denied (fail-closed)        |
+| Scenario                            | Behavior                                |
+|-------------------------------------|-----------------------------------------|
+| No policies defined                 | Access denied (fail-closed)             |
+| No authentication provided          | Proceeds as anonymous identity          |
+| Webhook timeout (`required` policy) | Access denied (fail-closed), not cached |
+| Webhook timeout (`optional` policy) | Access continues (best-effort)          |
+| Webhook 429 / 5xx                   | Access denied (fail-closed), not cached |
+| Webhook not configured              | Not evaluated, access continues         |
+| Invalid mTLS certificate            | TLS handshake fails                     |
+| Invalid OIDC token                  | 401 Unauthorized (fail-closed)          |
+| Invalid Basic Auth password         | 401 Unauthorized (fail-closed)          |
+| CEL evaluation error                | Access denied (fail-closed)             |
+| CEL non-boolean result (any mode)   | Access denied (fail-closed)             |
 
 **Important:** Without authentication, requests proceed with an anonymous identity. Without access policies, the default behavior is to deny access (`default = "deny"`). To allow anonymous reads, you must explicitly configure access policies with appropriate rules.
 

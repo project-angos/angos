@@ -1,6 +1,9 @@
 use std::{fs, path::PathBuf, str::FromStr, sync::Arc, time::Duration};
 
-use hyper::{HeaderMap, Method, http::request::Builder};
+use hyper::{
+    HeaderMap, Method,
+    http::request::{Builder, Parts},
+};
 use reqwest::Client;
 use url::Url;
 use wiremock::{
@@ -837,6 +840,111 @@ async fn test_authorize_does_not_cache_transport_errors() {
         Ok(true),
         "second call must reach the live server, not return a cached denial"
     );
+}
+
+fn build_webhook_against(mock_server: &MockServer) -> WebhookAuthorizer {
+    let mut config = build_test_config(Url::parse(&mock_server.uri()).unwrap(), None, None, None);
+    config.auth = None;
+    let cache = cache::Config::Memory.to_backend().unwrap();
+    build_test_webhook("test".to_string(), config, cache).unwrap()
+}
+
+fn empty_request_parts() -> Parts {
+    let (parts, ()) = Builder::new()
+        .uri("https://example.com/v2/")
+        .body(())
+        .unwrap()
+        .into_parts();
+    parts
+}
+
+// Webhook returns `status` exactly once (the mock's `expect(1)` enforces it).
+// First call must return Ok(false); second call must hit the cache and return
+// Ok(false) without re-contacting the webhook.
+async fn assert_cacheable_explicit_deny(status: u16) {
+    let mock_server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(status))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let webhook = build_webhook_against(&mock_server);
+    let action = Action::ApiVersion;
+    let identity = ClientIdentity::new(None);
+    let parts = empty_request_parts();
+
+    assert_eq!(
+        webhook.authorize(&action, &identity, &parts).await,
+        Ok(false),
+        "status {status} must be an explicit deny"
+    );
+    assert_eq!(
+        webhook.authorize(&action, &identity, &parts).await,
+        Ok(false),
+        "second call must be served from cache"
+    );
+}
+
+// Webhook returns `status` once, then 200 on every subsequent call. First call
+// must return Err (unavailable, not cached); second call must reach the webhook
+// again and be allowed.
+async fn assert_unavailable_not_cached(status: u16) {
+    let mock_server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(status))
+        .up_to_n_times(1)
+        .mount(&mock_server)
+        .await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&mock_server)
+        .await;
+
+    let webhook = build_webhook_against(&mock_server);
+    let action = Action::ApiVersion;
+    let identity = ClientIdentity::new(None);
+    let parts = empty_request_parts();
+
+    assert!(
+        webhook.authorize(&action, &identity, &parts).await.is_err(),
+        "status {status} must return Err, not Ok(false)"
+    );
+    assert_eq!(
+        webhook.authorize(&action, &identity, &parts).await,
+        Ok(true),
+        "after status {status} the next call must reach the webhook again and be allowed"
+    );
+}
+
+#[tokio::test]
+async fn test_authorize_403_is_explicit_deny_and_cacheable() {
+    assert_cacheable_explicit_deny(403).await;
+}
+
+#[tokio::test]
+async fn test_authorize_401_is_explicit_deny_and_cacheable() {
+    assert_cacheable_explicit_deny(401).await;
+}
+
+#[tokio::test]
+async fn test_authorize_500_is_unavailable_and_not_cached() {
+    assert_unavailable_not_cached(500).await;
+}
+
+#[tokio::test]
+async fn test_authorize_503_is_unavailable_and_not_cached() {
+    assert_unavailable_not_cached(503).await;
+}
+
+#[tokio::test]
+async fn test_authorize_429_is_unavailable_and_not_cached() {
+    assert_unavailable_not_cached(429).await;
+}
+
+#[tokio::test]
+async fn test_authorize_404_is_unavailable_and_not_cached() {
+    assert_unavailable_not_cached(404).await;
 }
 
 // Build a Config with non-default timeout_ms or cache_ttl.

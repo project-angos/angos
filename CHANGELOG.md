@@ -26,6 +26,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - Configuration is fully validated at load time (URLs, Redis cache URLs, Argon2 hashes, CEL rules, sampling rates, webhook refs, regexes, listener timeouts); invalid values now fail at startup with a clear error instead of later at runtime.
 - OIDC providers are tried in deterministic order, and the `mTLS` `auth_method` label is preserved when basic auth also succeeds.
 - Auth-webhook transport failures surface as errors instead of silent denials.
+- Webhook authorization responses with status 429 or 5xx no longer pin denials in the decision cache; only explicit 2xx and 401/403 outcomes are cached, and unavailable responses re-probe the webhook on the next request.
 - Webhook retries are capped at 16 with saturating backoff arithmetic.
 - The S3 shard-key hash uses SHA-256, so shard placement is stable across processes and builds.
 - Filesystem metadata now uses the same sharded blob-index and namespace-registry layout as S3, and scrub migrates legacy filesystem and S3 metadata files to the sharded layout.

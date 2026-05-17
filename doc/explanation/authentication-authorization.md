@@ -145,8 +145,8 @@ sequenceDiagram
     Policy-->>Registry: Allow/Deny
 
     opt Webhook configured
-        Registry->>Webhook: POST <configured webhook URL>
-        Webhook-->>Registry: 2xx (allow) or other (deny)
+        Registry->>Webhook: GET <configured webhook URL>
+        Webhook-->>Registry: 2xx (allow) or 401/403 (deny) or 429/5xx (unavailable)
     end
 
     Registry-->>Client: Response
@@ -292,9 +292,10 @@ sequenceDiagram
 - Identity context (username, certificate info)
 
 **Response interpretation:**
-- 2xx → Allow
-- Any other status → Deny
-- Timeout/transport error → Deny (fail-closed). Distinguishable from explicit deny on dashboards via the `webhook_authorization_requests_total{result="transport_error"}` metric label; the cache is not updated so the deny is not pinned past recovery.
+- 2xx → Allow (cached)
+- 401 or 403 → Explicit deny (cached)
+- 429, 5xx, or other non-2xx → Unavailable: fail closed for this request, not cached; the next request re-probes the webhook. Visible as `result="unavailable"` on `webhook_authorization_requests_total`.
+- Timeout/transport error → Unavailable (fail-closed, not cached). Distinguishable from HTTP unavailability via `result="transport_error"` on the same metric.
 
 ---
 
