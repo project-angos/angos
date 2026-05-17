@@ -304,7 +304,7 @@ sequenceDiagram
 
 - No policies = no access
 - Webhook timeout = denied (authorization is a security gate; an unreachable gate cannot make an allow decision)
-- CEL evaluation error = rule skipped (continues evaluation)
+- CEL evaluation error = request denied (fail-closed)
 
 ### Token Validation
 

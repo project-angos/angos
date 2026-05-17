@@ -28,7 +28,7 @@ use cel_interpreter::{Context, Value};
 use serde::{Deserialize, Serialize, Serializer};
 use tracing::{debug, warn};
 
-use super::{CelRule, Error, clock::Clock};
+use crate::policy::{CelRule, Error, clock::Clock};
 
 /// Configuration for retention policies.
 #[derive(Clone, Debug, Default, Deserialize)]

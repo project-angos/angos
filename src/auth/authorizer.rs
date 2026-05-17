@@ -2,7 +2,7 @@ use std::{collections::HashMap, fmt, path::PathBuf, sync::Arc};
 
 use hyper::http::request::Parts;
 use reqwest::Client;
-use tracing::{debug, info, instrument};
+use tracing::{debug, info, instrument, warn};
 
 use crate::{
     auth::webhook::{self, WebhookAuthorizer},
@@ -12,7 +12,7 @@ use crate::{
     http_client::HttpClientBuilder,
     identity::{Action, ClientIdentity},
     oci::{Namespace, Reference},
-    policy::AccessMode,
+    policy::{AccessMode, PolicyDecision},
     registry::{AccessPolicy, Registry},
 };
 
@@ -145,9 +145,17 @@ impl Authorizer {
         registry: &Registry,
     ) -> Result<(), Error> {
         debug!("Evaluating global access policy");
-        if self.global_access_policy.evaluate(action, identity) != Ok(true) {
-            log_denial("global policy", identity);
-            return Err(Error::Unauthorized(ACCESS_DENIED.to_string()));
+        match self.global_access_policy.evaluate(action, identity) {
+            PolicyDecision::Allow => {}
+            PolicyDecision::Deny => {
+                log_denial("global policy", identity);
+                return Err(Error::Unauthorized(ACCESS_DENIED.to_string()));
+            }
+            PolicyDecision::Indeterminate(err) => {
+                warn!("Global access policy indeterminate, denying: {err}");
+                log_denial("global policy (indeterminate)", identity);
+                return Err(Error::Unauthorized(ACCESS_DENIED.to_string()));
+            }
         }
 
         if let Some(namespace) = action.get_namespace() {
@@ -195,14 +203,28 @@ impl Authorizer {
             ))
         })?;
 
-        if let Some(ref access_policy) = auth_repo.access_policy
-            && access_policy.evaluate(action, identity) != Ok(true)
-        {
-            log_denial(
-                &format!("repository '{}' policy", repository.name),
-                identity,
-            );
-            return Err(Error::Unauthorized(ACCESS_DENIED.to_string()));
+        if let Some(ref access_policy) = auth_repo.access_policy {
+            match access_policy.evaluate(action, identity) {
+                PolicyDecision::Allow => {}
+                PolicyDecision::Deny => {
+                    log_denial(
+                        &format!("repository '{}' policy", repository.name),
+                        identity,
+                    );
+                    return Err(Error::Unauthorized(ACCESS_DENIED.to_string()));
+                }
+                PolicyDecision::Indeterminate(err) => {
+                    warn!(
+                        "Repository '{}' access policy indeterminate, denying: {err}",
+                        repository.name
+                    );
+                    log_denial(
+                        &format!("repository '{}' policy (indeterminate)", repository.name),
+                        identity,
+                    );
+                    return Err(Error::Unauthorized(ACCESS_DENIED.to_string()));
+                }
+            }
         }
 
         self.check_immutable_tag(repository.name.as_str(), action)?;
@@ -923,9 +945,8 @@ mod tests {
     // Global deny policy rejects every request regardless of action.
     //
     // The `[global.access_policy]` block with `default = "deny"` and no allow-rules
-    // causes `AccessPolicy::evaluate` to return `Ok(false)` for all identities.
-    // `authorize_request` must short-circuit before consulting any webhook or
-    // repository.
+    // causes `AccessPolicy::evaluate` to return `PolicyDecision::Deny` for all identities.
+    // `authorize_request` must short-circuit before consulting any webhook or repository.
     #[tokio::test]
     async fn global_deny_policy_rejects_all_requests() {
         use crate::command::server::Error as ServerError;
@@ -1160,6 +1181,42 @@ mod tests {
         assert!(
             result.is_err(),
             "an unreachable webhook must produce Err (fail-closed), not Ok; got: {result:?}"
+        );
+    }
+
+    // A global allow-mode policy whose DENY rule throws at runtime must deny the
+    // request.  Previously the evaluation error was swallowed and the default
+    // allow was returned.
+    #[tokio::test]
+    async fn indeterminate_global_policy_denies_request() {
+        use crate::command::server::Error as ServerError;
+
+        let config = load_config(
+            r#"
+            [global.access_policy]
+            default = "allow"
+            rules = ["nonexistent_var"]
+        "#,
+        );
+
+        let cache = cache::Config::Memory.to_backend().unwrap();
+        let authorizer = Authorizer::new(&config, &cache).unwrap();
+        let registry = create_pull_through_registry(&config).await;
+
+        let identity = ClientIdentity::new(None);
+        let (parts, ()) = hyper::Request::builder()
+            .uri("/v2/")
+            .body(())
+            .unwrap()
+            .into_parts();
+
+        let result = authorizer
+            .authorize_request(&Action::ApiVersion, &identity, &parts, &registry)
+            .await;
+
+        assert!(
+            matches!(result, Err(ServerError::Unauthorized(_))),
+            "an indeterminate global policy must deny the request, got: {result:?}"
         );
     }
 }
