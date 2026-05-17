@@ -9,7 +9,9 @@
 
 use std::sync::LazyLock;
 
-use rcgen::{BasicConstraints, CertificateParams, DistinguishedName, DnType, IsCa, KeyPair};
+use rcgen::{
+    BasicConstraints, CertificateParams, DistinguishedName, DnType, IsCa, Issuer, KeyPair,
+};
 
 struct WebhookFixtures {
     ca_bundle: String,
@@ -26,6 +28,7 @@ static FIXTURES: LazyLock<WebhookFixtures> = LazyLock::new(|| {
     ca_dn.push(DnType::CommonName, "Server CA");
     ca_params.distinguished_name = ca_dn;
     let ca_cert = ca_params.self_signed(&ca_kp).expect("ca self-sign");
+    let ca_issuer = Issuer::from_params(&ca_params, &ca_kp);
 
     // Server leaf (CN=example.com, SAN=example.com), signed by the CA
     let leaf_kp = KeyPair::generate().expect("leaf key");
@@ -35,7 +38,7 @@ static FIXTURES: LazyLock<WebhookFixtures> = LazyLock::new(|| {
     leaf_dn.push(DnType::CommonName, "example.com");
     leaf_params.distinguished_name = leaf_dn;
     let leaf_cert = leaf_params
-        .signed_by(&leaf_kp, &ca_cert, &ca_kp)
+        .signed_by(&leaf_kp, &ca_issuer)
         .expect("ca-signed leaf");
 
     // Bundle = leaf || CA, matching the previous static layout.
