@@ -104,7 +104,7 @@ mod tests {
     use crate::{
         oci::{Digest, Namespace},
         registry::{
-            metadata_store::{MetadataStoreExt, link_kind::LinkKind},
+            metadata_store::{LinkOperation, link_kind::LinkKind},
             test_utils::backends,
         },
     };
@@ -119,10 +119,16 @@ mod tests {
             let (digest, _) =
                 crate::registry::test_utils::create_test_blob(registry, namespace, b"manifest")
                     .await;
-            let mut tx = metadata_store.begin_transaction(namespace);
-            tx.create_link(&LinkKind::Digest(digest.clone()), &digest)
-                .add();
-            tx.commit().await.unwrap();
+            metadata_store
+                .update_links(
+                    namespace,
+                    &[LinkOperation::create(
+                        LinkKind::Digest(digest.clone()),
+                        digest.clone(),
+                    )],
+                )
+                .await
+                .unwrap();
 
             let mut stream = revisions(&metadata_store, namespace);
             let mut collected: Vec<Digest> = Vec::new();
@@ -145,10 +151,16 @@ mod tests {
             let (digest, _) =
                 crate::registry::test_utils::create_test_blob(registry, namespace, b"manifest")
                     .await;
-            let mut tx = metadata_store.begin_transaction(namespace);
-            tx.create_link(&LinkKind::Digest(digest.clone()), &digest)
-                .add();
-            tx.commit().await.unwrap();
+            metadata_store
+                .update_links(
+                    namespace,
+                    &[LinkOperation::create(
+                        LinkKind::Digest(digest.clone()),
+                        digest.clone(),
+                    )],
+                )
+                .await
+                .unwrap();
 
             let mut stream = namespaces(&metadata_store);
             let mut collected: Vec<String> = Vec::new();

@@ -151,7 +151,7 @@ mod tests {
     use crate::{
         oci::{Namespace, Reference},
         registry::{
-            metadata_store::{MetadataStoreExt, link_kind::LinkKind},
+            metadata_store::{LinkOperation, link_kind::LinkKind},
             test_utils::{backends, create_test_blob},
         },
     };
@@ -188,12 +188,17 @@ mod tests {
             let test_content = b"test content";
             let test_digest = registry.blob_store.create(test_content).await.unwrap();
             let tags = ["latest", "v1.0", "v2.0"];
-            let mut tx = registry.metadata_store.begin_transaction(namespace);
-            for tag in tags {
-                tx.create_link(&LinkKind::Tag(tag.to_string()), &test_digest)
-                    .add();
-            }
-            tx.commit().await.unwrap();
+            let ops: Vec<LinkOperation> = tags
+                .iter()
+                .map(|&tag| {
+                    LinkOperation::create(LinkKind::Tag(tag.to_string()), test_digest.clone())
+                })
+                .collect();
+            registry
+                .metadata_store
+                .update_links(namespace, &ops)
+                .await
+                .unwrap();
 
             let (tags, token) = registry
                 .list_tag_entries(namespace, None, None)
@@ -261,8 +266,6 @@ mod tests {
     // exactly once.
     #[tokio::test]
     async fn list_catalog_entries_continuation_token_round_trip() {
-        use crate::registry::metadata_store::MetadataStoreExt;
-
         // Use only the FS backend — this tests pagination logic, not backend specifics.
         let test_case = crate::registry::test_utils::FSRegistryTestCase::new();
         let registry = test_case.registry();
@@ -280,10 +283,17 @@ mod tests {
 
         for ns_str in &namespaces {
             let ns = Namespace::new(ns_str).unwrap();
-            let mut tx = registry.metadata_store.begin_transaction(&ns);
-            tx.create_link(&LinkKind::Tag("latest".to_string()), &digest)
-                .add();
-            tx.commit().await.unwrap();
+            registry
+                .metadata_store
+                .update_links(
+                    &ns,
+                    &[LinkOperation::create(
+                        LinkKind::Tag("latest".to_string()),
+                        digest.clone(),
+                    )],
+                )
+                .await
+                .unwrap();
         }
 
         // Fetch 2 at a time and collect all namespaces.
@@ -373,10 +383,17 @@ mod tests {
                 base_manifest_digest.clone(),
                 referrer_manifest_digest.clone(),
             );
-            let mut tx = registry.metadata_store.begin_transaction(namespace);
-            tx.create_link(&referrer_link, &referrer_manifest_digest)
-                .add();
-            tx.commit().await.unwrap();
+            registry
+                .metadata_store
+                .update_links(
+                    namespace,
+                    &[LinkOperation::create(
+                        referrer_link,
+                        referrer_manifest_digest.clone(),
+                    )],
+                )
+                .await
+                .unwrap();
 
             let referrers = registry
                 .metadata_store

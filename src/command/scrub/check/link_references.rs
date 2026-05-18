@@ -131,7 +131,6 @@ mod tests {
             Registry,
             metadata_store::{
                 BlobIndex, BlobIndexOperation, LinkMetadata, LinkOperation, LockGuard,
-                MetadataStoreExt,
             },
             test_utils::{self, FSRegistryTestCase, NoopMultipart, RegistryTestCase, backends},
         },
@@ -187,14 +186,26 @@ mod tests {
             .await
             .unwrap();
 
-        let mut tx = metadata_store.begin_transaction(namespace);
-        tx.create_link(&LinkKind::Digest(manifest_digest.clone()), &manifest_digest)
-            .add();
-        tx.create_link(&LinkKind::Config(config_digest.clone()), &config_digest)
-            .add();
-        tx.create_link(&LinkKind::Layer(layer_digest.clone()), &layer_digest)
-            .add();
-        tx.commit().await.unwrap();
+        metadata_store
+            .update_links(
+                namespace,
+                &[
+                    LinkOperation::create(
+                        LinkKind::Digest(manifest_digest.clone()),
+                        manifest_digest.clone(),
+                    ),
+                    LinkOperation::create(
+                        LinkKind::Config(config_digest.clone()),
+                        config_digest.clone(),
+                    ),
+                    LinkOperation::create(
+                        LinkKind::Layer(layer_digest.clone()),
+                        layer_digest.clone(),
+                    ),
+                ],
+            )
+            .await
+            .unwrap();
 
         (manifest_digest, config_digest, layer_digest)
     }
@@ -330,10 +341,16 @@ mod tests {
                 .await
                 .unwrap();
 
-            let mut tx = metadata_store.begin_transaction(namespace);
-            tx.create_link(&LinkKind::Digest(manifest_digest.clone()), &manifest_digest)
-                .add();
-            tx.commit().await.unwrap();
+            metadata_store
+                .update_links(
+                    namespace,
+                    &[LinkOperation::create(
+                        LinkKind::Digest(manifest_digest.clone()),
+                        manifest_digest.clone(),
+                    )],
+                )
+                .await
+                .unwrap();
 
             let checker = LinkReferencesChecker::new(blob_store.clone(), metadata_store.clone());
             let mut sink: Vec<Action> = Vec::new();

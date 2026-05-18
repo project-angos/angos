@@ -1,8 +1,9 @@
+pub mod link_plan;
 mod parse;
 mod response;
 
 use futures_util::StreamExt;
-pub use parse::{ParsedManifestDigests, parse_manifest_digests};
+pub use parse::parse_manifest_digests;
 use parse::{manifest_meta_from_body, parse_and_validate_manifest};
 pub use response::{
     DeleteManifestResponse, GetManifestResponse, HeadManifestResponse, PutManifestResponse,
@@ -21,11 +22,46 @@ use crate::{
         DOCKER_CONTENT_DIGEST, Error, Registry, Repository,
         blob_ownership::BlobOwnership,
         blob_store::Error as BlobStoreError,
-        metadata_store::{MetadataStoreExt, link_kind::LinkKind},
+        metadata_store::{MetadataStore, link_kind::LinkKind},
         pagination::collect_all_pages,
     },
     util::sha256,
 };
+
+/// Returns the `LinkKind::Tag` entries in `namespace` that currently point at
+/// `digest`. Uses only the metadata store — no blob reads.
+pub async fn find_tags_pointing_at(
+    metadata_store: &(dyn MetadataStore + Send + Sync),
+    namespace: &str,
+    digest: &Digest,
+) -> Result<Vec<LinkKind>, Error> {
+    let all_tags = collect_all_pages(|marker| async move {
+        metadata_store.list_tags(namespace, 100, marker).await
+    })
+    .await?;
+
+    let matching = futures_util::stream::iter(all_tags)
+        .map(|tag| async move {
+            let result = metadata_store
+                .read_link(namespace, &LinkKind::Tag(tag.clone()), false)
+                .await;
+            (tag, result)
+        })
+        .buffer_unordered(20)
+        .filter_map(|(tag, result)| async move {
+            if let Ok(metadata) = result
+                && &metadata.target == digest
+            {
+                Some(LinkKind::Tag(tag))
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>()
+        .await;
+
+    Ok(matching)
+}
 
 pub const DEFAULT_MAX_MANIFEST_SIZE_BYTES: usize = 5 * 1024 * 1024;
 
@@ -295,55 +331,21 @@ impl Registry {
         }
 
         let digest = self.blob_store.create(body).await?;
-        let mut tx = self.metadata_store.begin_transaction(namespace);
 
         let effective_media_type = content_type
             .cloned()
             .or_else(|| manifest.media_type.clone());
 
-        tx.create_link(&LinkKind::Digest(digest.clone()), &digest)
-            .with_optional_media_type(effective_media_type.as_deref())
-            .add();
-
-        if let Reference::Tag(tag) = reference {
-            tx.create_link(&LinkKind::Tag(tag.clone()), &digest)
-                .with_optional_media_type(effective_media_type.as_deref())
-                .add();
-        }
-
-        if let Some(subject) = &manifest.subject {
-            let referrer_link = LinkKind::Referrer(subject.digest.clone(), digest.clone());
-            if let Some(descriptor) = manifest.take_descriptor(digest.clone(), body.len() as u64) {
-                tx.create_link(&referrer_link, &digest)
-                    .with_descriptor(descriptor)
-                    .add();
-            } else {
-                tx.create_link(&referrer_link, &digest).add();
-            }
-        }
-
-        if let Some(config) = manifest.config {
-            tx.create_link(&LinkKind::Config(config.digest.clone()), &config.digest)
-                .with_referrer(&digest)
-                .add();
-        }
-
-        for layer in manifest.layers {
-            tx.create_link(&LinkKind::Layer(layer.digest.clone()), &layer.digest)
-                .with_referrer(&digest)
-                .add();
-        }
-
-        for child in manifest.manifests {
-            tx.create_link(
-                &LinkKind::Manifest(digest.clone(), child.digest.clone()),
-                &child.digest,
-            )
-            .with_referrer(&digest)
-            .add();
-        }
-
-        tx.commit().await?;
+        let ops = link_plan::push(
+            &mut manifest,
+            &digest,
+            reference,
+            effective_media_type.as_deref(),
+            body.len() as u64,
+        );
+        self.metadata_store
+            .update_links(namespace.as_ref(), &ops)
+            .await?;
 
         let subject = manifest.subject.map(|s| s.digest);
 
@@ -397,40 +399,6 @@ impl Registry {
         }
     }
 
-    async fn find_tags_pointing_at(
-        &self,
-        namespace: &Namespace,
-        digest: &Digest,
-    ) -> Result<Vec<LinkKind>, Error> {
-        let all_tags = collect_all_pages(|marker| async move {
-            self.metadata_store.list_tags(namespace, 100, marker).await
-        })
-        .await?;
-
-        let matching = futures_util::stream::iter(all_tags)
-            .map(|tag| async move {
-                let result = self
-                    .metadata_store
-                    .read_link(namespace, &LinkKind::Tag(tag.clone()), false)
-                    .await;
-                (tag, result)
-            })
-            .buffer_unordered(20)
-            .filter_map(|(tag, result)| async move {
-                if let Ok(metadata) = result
-                    && &metadata.target == digest
-                {
-                    Some(LinkKind::Tag(tag))
-                } else {
-                    None
-                }
-            })
-            .collect::<Vec<_>>()
-            .await;
-
-        Ok(matching)
-    }
-
     #[instrument(skip(actor))]
     pub async fn delete_manifest(
         &self,
@@ -438,45 +406,24 @@ impl Registry {
         namespace: &Namespace,
         reference: &Reference,
     ) -> Result<DeleteManifestResponse, Error> {
-        let mut tx = self.metadata_store.begin_transaction(namespace);
+        let ops = if let Reference::Digest(digest) = reference {
+            let tags =
+                find_tags_pointing_at(self.metadata_store.as_ref(), namespace.as_ref(), digest)
+                    .await?;
+            let manifest = self
+                .blob_store
+                .read(digest)
+                .await
+                .ok()
+                .and_then(|content| Manifest::from_slice(&content).ok());
+            link_plan::delete(reference, manifest.as_ref(), &tags)
+        } else {
+            link_plan::delete(reference, None, &[])
+        };
 
-        match reference {
-            Reference::Tag(tag) => {
-                tx.delete_link(&LinkKind::Tag(tag.clone()));
-            }
-            Reference::Digest(digest) => {
-                tx.delete_link(&LinkKind::Digest(digest.clone()));
-
-                for link in self.find_tags_pointing_at(namespace, digest).await? {
-                    tx.delete_link(&link);
-                }
-
-                if let Ok(content) = self.blob_store.read(digest).await
-                    && let Ok(manifest) = Manifest::from_slice(&content)
-                {
-                    if let Some(subject) = manifest.subject {
-                        tx.delete_link(&LinkKind::Referrer(subject.digest, digest.clone()));
-                    }
-
-                    if let Some(config) = manifest.config {
-                        tx.delete_link_with_referrer(&LinkKind::Config(config.digest), digest);
-                    }
-
-                    for layer in manifest.layers {
-                        tx.delete_link_with_referrer(&LinkKind::Layer(layer.digest), digest);
-                    }
-
-                    for child in manifest.manifests {
-                        tx.delete_link_with_referrer(
-                            &LinkKind::Manifest(digest.clone(), child.digest),
-                            digest,
-                        );
-                    }
-                }
-            }
-        }
-
-        tx.commit().await?;
+        self.metadata_store
+            .update_links(namespace.as_ref(), &ops)
+            .await?;
 
         if let Reference::Digest(digest) = reference {
             self.delete_blob_data_if_unreferenced(digest).await?;

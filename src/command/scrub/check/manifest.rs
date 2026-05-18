@@ -75,7 +75,7 @@ mod tests {
         command::scrub::executor::Executor,
         oci::Namespace,
         registry::{
-            metadata_store::{MetadataStoreExt, link_kind::LinkKind},
+            metadata_store::{LinkOperation, link_kind::LinkKind},
             test_utils::{self, NoopMultipart, backends},
         },
     };
@@ -118,10 +118,16 @@ mod tests {
                 .await
                 .unwrap();
 
-            let mut tx = metadata_store.begin_transaction(namespace);
-            tx.create_link(&LinkKind::Digest(manifest_digest.clone()), &manifest_digest)
-                .add();
-            tx.commit().await.unwrap();
+            metadata_store
+                .update_links(
+                    namespace,
+                    &[LinkOperation::create(
+                        LinkKind::Digest(manifest_digest.clone()),
+                        manifest_digest.clone(),
+                    )],
+                )
+                .await
+                .unwrap();
 
             let mut executor = Executor::new(
                 blob_store.clone(),

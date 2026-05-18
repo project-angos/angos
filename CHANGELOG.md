@@ -37,6 +37,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - The S3 backend now uses a custom HTTP client in place of the AWS SDK: focused retry / timeout / signing tailored to the operations the registry actually issues, smaller binary, and no AWS SDK transitive dependencies.
 - Filesystem cleanup of empty ancestor directories is depth-bounded (2 levels for blob shards, 3 for index and namespace-registry shards, 4 for link containers) and rooted-subtree guarded; a misshaped path can never walk above the configured root.
 - UI, documentation-website and Rust dependencies upgraded.
+- Scrub's orphan manifest deletion now plans link operations through the same `link_plan::delete` primitive used by the runtime write path, eliminating divergence between scrub and runtime decisions about which links to remove. As a consequence, scrub also removes any tag links still pointing at an orphaned manifest digest (previously left dangling).
+- Scrub's orphan manifest deletion tolerates manifest blobs that fail to parse: it removes the digest link (and any tags pointing at it) so the next pass can clean up the dangling config/layer/child links. Blob-read failures are still surfaced so operators notice broken storage.
+- Overlapping repository prefixes (e.g. `team` and `team/app`) are rejected at startup rather than resolved non-deterministically at runtime.
 
 #### Performance
 
@@ -57,6 +60,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- Scrub's orphan manifest deletion now uses `delete_with_referrer` for tracked links (config, layer, child-manifest), preventing spurious link removal for blobs still referenced by other manifests.
 - Hardened S3 uploads and blob-index locking against contention and partial-failure scenarios.
 - Failed upload cleanups no longer abort the client request; orphaned S3 probe objects are surfaced via warning instead of silently leaking.
 - Multipart uploads and parts are aborted on drop or panic, so failed uploads don't leave orphans on S3.

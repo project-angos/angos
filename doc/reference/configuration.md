@@ -376,6 +376,8 @@ must be set.
 
 ## Repository (`repository."<namespace>"`)
 
+Repository namespace keys must not overlap: a key like `team` and a key like `team/app` are considered overlapping because one is a namespace-prefix of the other. The registry rejects this configuration at startup.
+
 | Option                      | Type     | Default  | Description                     |
 |-----------------------------|----------|----------|---------------------------------|
 | `immutable_tags`            | bool     | inherits | Override global immutable tags  |

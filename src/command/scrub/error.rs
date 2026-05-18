@@ -1,5 +1,7 @@
 use crate::{
-    cache, policy,
+    cache,
+    command::bootstrap::Error as BootstrapError,
+    policy,
     registry::{self, blob_store, metadata_store},
 };
 
@@ -65,15 +67,16 @@ impl From<registry::Error> for Error {
     }
 }
 
-impl From<crate::command::bootstrap::Error> for Error {
-    fn from(e: crate::command::bootstrap::Error) -> Self {
+impl From<BootstrapError> for Error {
+    fn from(e: BootstrapError) -> Self {
         match e {
-            crate::command::bootstrap::Error::BlobStore(inner) => Error::BlobStore(inner),
-            crate::command::bootstrap::Error::MetadataStore(inner) => Error::MetadataStore(inner),
-            crate::command::bootstrap::Error::Cache(inner) => Error::Cache(inner),
-            crate::command::bootstrap::Error::Repository { name, source } => Error::Initialization(
-                format!("Failed to initialize repository '{name}': {source}"),
-            ),
+            BootstrapError::BlobStore(inner) => Error::BlobStore(inner),
+            BootstrapError::MetadataStore(inner) => Error::MetadataStore(inner),
+            BootstrapError::Cache(inner) => Error::Cache(inner),
+            BootstrapError::Repository { name, source } => Error::Initialization(format!(
+                "Failed to initialize repository '{name}': {source}"
+            )),
+            BootstrapError::Overlap(inner) => Error::Initialization(inner.to_string()),
         }
     }
 }

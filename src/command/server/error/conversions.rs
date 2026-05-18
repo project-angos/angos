@@ -82,6 +82,7 @@ impl From<bootstrap::Error> for Error {
             bootstrap::Error::Repository { name, source } => Error::Initialization(format!(
                 "Failed to initialize repository '{name}': {source}"
             )),
+            bootstrap::Error::Overlap(inner) => Error::Initialization(inner.to_string()),
         }
     }
 }

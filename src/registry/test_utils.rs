@@ -13,7 +13,8 @@ use crate::{
     registry::{
         blob_store::{self, BlobStore, PresignedBlobStore, UploadStore},
         metadata_store,
-        metadata_store::{MetadataStore, MetadataStoreExt, link_kind::LinkKind},
+        metadata_store::{LinkOperation, MetadataStore, link_kind::LinkKind},
+        repository_resolver::RepositoryResolver,
     },
     s3_client,
     secret::Secret,
@@ -52,7 +53,10 @@ pub fn create_test_registry(
     presigned_blob_store: Option<Arc<dyn PresignedBlobStore>>,
     metadata_store: Arc<dyn MetadataStore + Send + Sync>,
 ) -> Registry {
-    let repositories_config = create_test_repositories();
+    let resolver = Arc::new(
+        RepositoryResolver::new(create_test_repositories())
+            .expect("test repositories must not have overlapping prefixes"),
+    );
     let global = GlobalConfig::default();
 
     let config = RegistryConfig::default()
@@ -69,7 +73,7 @@ pub fn create_test_registry(
         upload_store,
         presigned_blob_store,
         metadata_store,
-        repositories_config,
+        resolver,
         config,
     )
     .unwrap()
@@ -84,10 +88,17 @@ pub async fn create_test_blob(
 
     let tag_link = LinkKind::Tag("latest".to_string());
     let layer_link = LinkKind::Layer(digest.clone());
-    let mut tx = registry.metadata_store.begin_transaction(namespace);
-    tx.create_link(&tag_link, &digest).add();
-    tx.create_link(&layer_link, &digest).add();
-    tx.commit().await.unwrap();
+    registry
+        .metadata_store
+        .update_links(
+            namespace,
+            &[
+                LinkOperation::create(tag_link.clone(), digest.clone()),
+                LinkOperation::create(layer_link.clone(), digest.clone()),
+            ],
+        )
+        .await
+        .unwrap();
 
     let blob_index = registry
         .metadata_store
@@ -175,7 +186,10 @@ impl FSRegistryTestCase {
     }
 
     pub fn set_repositories(&mut self, repositories: Arc<HashMap<String, Repository>>) {
-        self.registry.repositories = repositories;
+        self.registry.resolver = Arc::new(
+            RepositoryResolver::new(repositories)
+                .expect("test repositories must not have overlapping prefixes"),
+        );
     }
 
     pub fn blob_store(&self) -> &blob_store::fs::Backend {

@@ -25,7 +25,7 @@ use crate::{
     metrics_provider,
     oci::{Namespace, Reference},
     policy::AccessPolicyConfig,
-    registry::{Registry, RegistryConfig, Repository},
+    registry::{Registry, RegistryConfig, Repository, repository_resolver::RepositoryResolver},
     secret::Secret,
 };
 
@@ -144,7 +144,10 @@ pub async fn create_test_registry(config: &Configuration) -> Registry {
         .unwrap();
         repositories_map.insert(name.clone(), repo);
     }
-    let repositories = Arc::new(repositories_map);
+    let resolver = Arc::new(
+        RepositoryResolver::new(Arc::new(repositories_map))
+            .expect("test repositories must not have overlapping prefixes"),
+    );
 
     let registry_config = RegistryConfig::default()
         .update_pull_time(config.global.update_pull_time)
@@ -160,7 +163,7 @@ pub async fn create_test_registry(config: &Configuration) -> Registry {
         blob_handles.upload_store,
         blob_handles.presigned_store,
         metadata_store,
-        repositories,
+        resolver,
         registry_config,
     )
     .unwrap()
@@ -922,13 +925,12 @@ async fn test_shutdown_flushes_pending_access_times() {
         .global_immutable_tags(false)
         .global_immutable_tags_exclusions(Vec::new());
 
-    let repositories = Arc::new(HashMap::new());
     let registry = Registry::new(
         blob_handles.blob_store,
         blob_handles.upload_store,
         blob_handles.presigned_store,
         metadata_store.clone(),
-        repositories,
+        Arc::new(RepositoryResolver::new(Arc::new(HashMap::new())).unwrap()),
         registry_config,
     )
     .unwrap();

@@ -185,10 +185,10 @@ impl LockOps for Backend {
     }
 
     /// Registers the namespace in the namespace registry after a successful
-    /// transaction that included create operations.
+    /// `update_links` run that included create operations.
     ///
     /// Failure to register is non-fatal: the error is logged at `warn` level
-    /// and `Ok(())` is returned so the transaction result is not affected.
+    /// and `Ok(())` is returned so the overall result is not affected.
     async fn after_update(&self, namespace: &str, had_creates: bool) -> Result<(), Error> {
         if had_creates && let Err(e) = self.register_namespace(namespace).await {
             warn!(namespace, error = %e, "Failed to register namespace");

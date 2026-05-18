@@ -147,7 +147,7 @@ mod tests {
         command::scrub::{action::Action, executor::Executor},
         oci::Namespace,
         registry::{
-            metadata_store::MetadataStoreExt,
+            metadata_store::LinkOperation,
             test_utils::{self, NoopMultipart, backends},
         },
     };
@@ -192,12 +192,22 @@ mod tests {
                 .await
                 .unwrap();
 
-            let mut tx = metadata_store.begin_transaction(namespace);
-            tx.create_link(&LinkKind::Digest(manifest_digest.clone()), &manifest_digest)
-                .add();
-            tx.create_link(&LinkKind::Tag("latest".to_string()), &manifest_digest)
-                .add();
-            tx.commit().await.unwrap();
+            metadata_store
+                .update_links(
+                    namespace,
+                    &[
+                        LinkOperation::create(
+                            LinkKind::Digest(manifest_digest.clone()),
+                            manifest_digest.clone(),
+                        ),
+                        LinkOperation::create(
+                            LinkKind::Tag("latest".to_string()),
+                            manifest_digest.clone(),
+                        ),
+                    ],
+                )
+                .await
+                .unwrap();
 
             let digest_link = metadata_store
                 .read_link(namespace, &LinkKind::Digest(manifest_digest.clone()), false)
@@ -261,14 +271,24 @@ mod tests {
                 .await
                 .unwrap();
 
-            let mut tx = metadata_store.begin_transaction(namespace);
-            tx.create_link(&LinkKind::Digest(manifest_digest.clone()), &manifest_digest)
-                .with_media_type(media_type)
-                .add();
-            tx.create_link(&LinkKind::Tag("latest".to_string()), &manifest_digest)
-                .with_media_type(media_type)
-                .add();
-            tx.commit().await.unwrap();
+            metadata_store
+                .update_links(
+                    namespace,
+                    &[
+                        LinkOperation::create_with_media_type(
+                            LinkKind::Digest(manifest_digest.clone()),
+                            manifest_digest.clone(),
+                            Some(media_type.to_string()),
+                        ),
+                        LinkOperation::create_with_media_type(
+                            LinkKind::Tag("latest".to_string()),
+                            manifest_digest.clone(),
+                            Some(media_type.to_string()),
+                        ),
+                    ],
+                )
+                .await
+                .unwrap();
 
             let checker = MediaTypeChecker::new(blob_store.clone(), metadata_store.clone());
             let mut sink: Vec<Action> = Vec::new();
@@ -319,12 +339,22 @@ mod tests {
                 .await
                 .unwrap();
 
-            let mut tx = metadata_store.begin_transaction(namespace);
-            tx.create_link(&LinkKind::Digest(manifest_digest.clone()), &manifest_digest)
-                .add();
-            tx.create_link(&LinkKind::Tag("latest".to_string()), &manifest_digest)
-                .add();
-            tx.commit().await.unwrap();
+            metadata_store
+                .update_links(
+                    namespace,
+                    &[
+                        LinkOperation::create(
+                            LinkKind::Digest(manifest_digest.clone()),
+                            manifest_digest.clone(),
+                        ),
+                        LinkOperation::create(
+                            LinkKind::Tag("latest".to_string()),
+                            manifest_digest.clone(),
+                        ),
+                    ],
+                )
+                .await
+                .unwrap();
 
             let checker = MediaTypeChecker::new(blob_store.clone(), metadata_store.clone());
             let mut sink: Vec<Action> = Vec::new();

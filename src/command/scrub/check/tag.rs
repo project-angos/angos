@@ -74,7 +74,7 @@ mod tests {
         command::scrub::executor::Executor,
         oci::Namespace,
         registry::{
-            metadata_store::MetadataStoreExt,
+            metadata_store::LinkOperation,
             test_utils::{self, NoopMultipart, backends},
         },
     };
@@ -90,10 +90,16 @@ mod tests {
             let (blob_digest, _) =
                 test_utils::create_test_blob(registry, namespace, b"test manifest content").await;
 
-            let mut tx = metadata_store.begin_transaction(namespace);
-            tx.create_link(&LinkKind::Tag(tag_name.to_string()), &blob_digest)
-                .add();
-            tx.commit().await.unwrap();
+            metadata_store
+                .update_links(
+                    namespace,
+                    &[LinkOperation::create(
+                        LinkKind::Tag(tag_name.to_string()),
+                        blob_digest.clone(),
+                    )],
+                )
+                .await
+                .unwrap();
 
             let mut executor = Executor::new(
                 test_case.blob_store(),
@@ -129,11 +135,19 @@ mod tests {
             let (blob_digest, _) =
                 test_utils::create_test_blob(registry, namespace, b"test manifest").await;
 
-            let mut tx = metadata_store.begin_transaction(namespace);
-            tx.delete_link(&LinkKind::Digest(blob_digest.clone()));
-            tx.create_link(&LinkKind::Tag("v1.0.0".to_string()), &blob_digest)
-                .add();
-            tx.commit().await.unwrap();
+            metadata_store
+                .update_links(
+                    namespace,
+                    &[
+                        LinkOperation::delete(LinkKind::Digest(blob_digest.clone())),
+                        LinkOperation::create(
+                            LinkKind::Tag("v1.0.0".to_string()),
+                            blob_digest.clone(),
+                        ),
+                    ],
+                )
+                .await
+                .unwrap();
 
             let mut executor = Executor::new(
                 blob_store.clone(),

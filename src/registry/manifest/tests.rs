@@ -10,7 +10,7 @@ use crate::{
     oci::Namespace,
     registry::{
         Error, Registry,
-        metadata_store::link_kind::LinkKind,
+        metadata_store::{LinkOperation, link_kind::LinkKind},
         test_utils::{FSRegistryTestCase, RegistryTestCase, backends},
     },
     util::sha256,
@@ -1556,12 +1556,17 @@ async fn test_head_manifest_fallback_without_media_type() {
 
         let digest = registry.blob_store.create(&content).await.unwrap();
 
-        let mut tx = registry.metadata_store.begin_transaction(namespace);
-        tx.create_link(&LinkKind::Digest(digest.clone()), &digest)
-            .add();
-        tx.create_link(&LinkKind::Tag("latest".to_string()), &digest)
-            .add();
-        tx.commit().await.unwrap();
+        registry
+            .metadata_store
+            .update_links(
+                namespace,
+                &[
+                    LinkOperation::create(LinkKind::Digest(digest.clone()), digest.clone()),
+                    LinkOperation::create(LinkKind::Tag("latest".to_string()), digest.clone()),
+                ],
+            )
+            .await
+            .unwrap();
 
         let link_meta = registry
             .metadata_store
@@ -1850,12 +1855,17 @@ async fn test_handle_get_manifest_redirect_fallback_without_media_type() {
 
         let digest = registry.blob_store.create(&content).await.unwrap();
 
-        let mut tx = registry.metadata_store.begin_transaction(namespace);
-        tx.create_link(&LinkKind::Digest(digest.clone()), &digest)
-            .add();
-        tx.create_link(&LinkKind::Tag("latest".to_string()), &digest)
-            .add();
-        tx.commit().await.unwrap();
+        registry
+            .metadata_store
+            .update_links(
+                namespace,
+                &[
+                    LinkOperation::create(LinkKind::Digest(digest.clone()), digest.clone()),
+                    LinkOperation::create(LinkKind::Tag("latest".to_string()), digest.clone()),
+                ],
+            )
+            .await
+            .unwrap();
 
         let response = registry
             .resolve_get_manifest(

@@ -14,7 +14,7 @@ use crate::{
     oci::Digest,
     registry::{
         blob_store::BlobStore,
-        metadata_store::{self, BlobIndex, MetadataStore, link_kind::LinkKind},
+        metadata_store::{BlobIndex, Error as MetadataError, MetadataStore, link_kind::LinkKind},
     },
 };
 
@@ -29,15 +29,12 @@ async fn classify_blob(
     metadata_store: &Arc<dyn MetadataStore + Send + Sync>,
     blob: &Digest,
 ) -> Result<BlobVerdict, Error> {
-    let blob_index = match metadata_store.read_blob_index(blob).await {
-        Ok(index) => index,
-        Err(metadata_store::Error::ReferenceNotFound) => return Ok(BlobVerdict::Orphan),
-        Err(e) => return Err(e.into()),
-    };
-    if blob_index.namespace.is_empty() {
-        return Ok(BlobVerdict::Orphan);
+    match metadata_store.read_blob_index(blob).await {
+        Ok(index) if index.namespace.is_empty() => Ok(BlobVerdict::Orphan),
+        Ok(index) => Ok(BlobVerdict::Referenced(index)),
+        Err(MetadataError::ReferenceNotFound) => Ok(BlobVerdict::Orphan),
+        Err(e) => Err(e.into()),
     }
-    Ok(BlobVerdict::Referenced(blob_index))
 }
 
 pub struct BlobChecker {

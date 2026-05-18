@@ -393,6 +393,7 @@ mod tests {
         cache,
         configuration::Configuration,
         identity::{ClientCertificate, OidcClaims},
+        registry::{RegistryConfig, Repository, repository_resolver::RepositoryResolver},
         test_fixtures::configuration::{load_config, minimal_config, try_load_config},
     };
 
@@ -783,10 +784,6 @@ mod tests {
     }
 
     async fn create_pull_through_registry(config: &Configuration) -> Registry {
-        use std::{collections::HashMap, sync::Arc};
-
-        use crate::registry::{RegistryConfig, Repository};
-
         let blob_handles = config.blob_store.to_backend(None).unwrap();
         let (metadata_store, _) = config
             .resolve_metadata_config()
@@ -807,7 +804,10 @@ mod tests {
             .unwrap();
             repositories_map.insert(name.clone(), repo);
         }
-        let repositories = Arc::new(repositories_map);
+        let resolver = Arc::new(
+            RepositoryResolver::new(Arc::new(repositories_map))
+                .expect("test repositories must not have overlapping prefixes"),
+        );
 
         let registry_config = RegistryConfig::default()
             .update_pull_time(config.global.update_pull_time)
@@ -823,7 +823,7 @@ mod tests {
             blob_handles.upload_store,
             blob_handles.presigned_store,
             metadata_store,
-            repositories,
+            resolver,
             registry_config,
         )
         .unwrap()
