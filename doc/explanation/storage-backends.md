@@ -587,7 +587,10 @@ invocation — omitting it means stale shards accumulate indefinitely.
 
 Blob ownership markers (`LinkKind::Blob`) are intentionally retained until the
 client issues an explicit `DELETE /v2/<name>/blobs/<digest>`. They are not
-removed when a namespace's manifests are deleted.
+removed when a namespace's manifests are deleted. When scrub detects that a
+referenced blob's backing bytes are absent, however, the entire blob-index entry
+— including any ownership markers — is purged, so runtime `can_read` no longer
+reports the blob as accessible.
 
 ### Caching
 
