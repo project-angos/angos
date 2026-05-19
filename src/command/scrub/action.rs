@@ -26,6 +26,11 @@ pub enum Action {
         target: Digest,
         referrer: Digest,
     },
+    RemoveReferrer {
+        namespace: String,
+        link: LinkKind,
+        referrer: Digest,
+    },
     SetMediaType {
         namespace: String,
         link: LinkKind,
@@ -48,6 +53,11 @@ pub enum Action {
     DeleteExpiredUpload {
         namespace: String,
         uuid: String,
+    },
+    DeleteOrphanReferrer {
+        namespace: String,
+        subject: Digest,
+        referrer: Digest,
     },
 }
 
@@ -94,6 +104,16 @@ impl fmt::Display for Action {
                     "add referrer {referrer} to link {link} in namespace '{namespace}'"
                 )
             }
+            Action::RemoveReferrer {
+                namespace,
+                link,
+                referrer,
+            } => {
+                write!(
+                    f,
+                    "remove referrer {referrer} from link {link} in namespace '{namespace}'"
+                )
+            }
             Action::SetMediaType {
                 namespace,
                 media_type,
@@ -116,6 +136,16 @@ impl fmt::Display for Action {
             }
             Action::DeleteExpiredUpload { namespace, uuid } => {
                 write!(f, "delete expired upload '{namespace}/{uuid}'")
+            }
+            Action::DeleteOrphanReferrer {
+                namespace,
+                subject,
+                referrer,
+            } => {
+                write!(
+                    f,
+                    "delete orphan referrer '{namespace}': subject {subject} <- {referrer}"
+                )
             }
         }
     }

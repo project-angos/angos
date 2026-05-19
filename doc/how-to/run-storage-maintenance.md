@@ -27,17 +27,18 @@ The `scrub` command runs as a **separate periodic process** that operates alongs
 
 The `scrub` command performs various maintenance operations. Each check must be explicitly enabled:
 
-| Flag                          | Description                                             |
-|-------------------------------|---------------------------------------------------------|
-| `-t, --tags`                  | Check and fix invalid tag references                    |
-| `-m, --manifests`             | Check and fix manifest inconsistencies                  |
-| `-b, --blobs`                 | Check for orphaned or corrupted blobs                   |
-| `-r, --retention`             | Enforce retention policies (delete expired manifests)   |
-| `-u, --uploads <duration>`    | Remove incomplete uploads older than duration           |
-| `-p, --multipart <duration>`  | Cleanup orphan S3 multipart uploads older than duration |
-| `-l, --links`                 | Fix links format inconsistencies                        |
-| `-M, --media-types`           | Backfill missing `media_type` on manifest links         |
-| `-d, --dry-run`               | Preview changes without applying them                   |
+| Flag                          | Description                                                                                        |
+|-------------------------------|----------------------------------------------------------------------------------------------------|
+| `-t, --tags`                  | Check and fix tag references; remove tags whose target manifest blob is missing                    |
+| `-m, --manifests`             | Check and fix manifest inconsistencies                                                             |
+| `-b, --blobs`                 | Check for orphaned or corrupted blobs; prune stale blob-index entries for deleted namespaces       |
+| `-r, --retention`             | Enforce retention policies (delete expired manifests)                                              |
+| `-u, --uploads <duration>`    | Check upload sessions: remove broken or partial state and uploads older than the given duration    |
+| `-p, --multipart <duration>`  | Cleanup orphan S3 multipart uploads older than duration                                            |
+| `-l, --links`                 | Fix links format inconsistencies; remove revisions whose manifest blob is missing; prune phantom referrer back-links |
+| `-M, --media-types`           | Backfill missing `media_type` on manifest links; remove revisions whose manifest blob is missing   |
+| `-R, --referrers`             | Check for and remove orphan referrer links whose referrer manifest is no longer a current revision |
+| `-d, --dry-run`               | Preview changes without applying them                                                              |
 
 ---
 
@@ -96,6 +97,27 @@ RUST_LOG=info ./angos -c config.toml scrub --tags --manifests --blobs --retentio
 # Weekly on Sunday at 2 AM
 0 2 * * 0 /usr/bin/angos -c /etc/registry/config.toml scrub --tags --manifests --blobs --retention
 ```
+
+### Recommended Flags for Periodic Maintenance
+
+Always include `-b` (`--blobs`) in scheduled scrub jobs. The blob index records
+which namespaces reference each blob; its per-namespace shard files
+(`refs/<namespace>.json`) are only pruned when `-b` runs. Without it, shards
+for deleted namespaces accumulate indefinitely.
+
+Blob ownership markers are kept until the client issues an explicit
+`DELETE /v2/<name>/blobs/<digest>` request; scrub does not remove them when
+a namespace's manifests are deleted. This reflects the OCI blob lifecycle and
+is not a leak.
+
+Upload session cleanup is gated behind `-u <duration>`; without that flag,
+neither obsolete nor broken upload state is touched. Pass `-u` to schedules
+that should reclaim that storage.
+
+Namespace-registry convergence (removal of fully-emptied namespaces) happens
+during scrub's always-on layout migration and requires no additional flag;
+the namespace name remains visible to `_catalog` clients between deletes and
+the next scrub run.
 
 ### Systemd Timer
 
@@ -214,7 +236,7 @@ See [Configure Retention Policies](configure-retention-policies.md) for detailed
 | Tagged manifest   | Doesn't match any retention rule |
 | Untagged manifest | Doesn't match any retention rule |
 | Blob              | Not referenced by any manifest   |
-| Upload            | Incomplete/abandoned             |
+| Upload            | With `-u`: broken/incomplete session or older than the timeout    |
 
 ### Protected Items
 

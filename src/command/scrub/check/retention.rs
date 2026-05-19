@@ -1,9 +1,9 @@
-use std::{collections::HashMap, sync::Arc};
+use std::{cmp::Reverse, sync::Arc};
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use futures_util::{StreamExt, future::join_all};
-use tracing::debug;
+use tracing::{debug, error};
 
 use crate::{
     command::scrub::{
@@ -12,12 +12,13 @@ use crate::{
         error::Error,
         executor::ActionSink,
     },
-    oci::{Digest, namespace_belongs_to},
+    oci::Digest,
     policy::{EpochSeconds, ManifestImage, RetentionPolicy},
     registry::{
+        Repository,
         metadata_store::{BlobIndex, LinkMetadata, MetadataStore, link_kind::LinkKind},
         pagination::collect_all_pages,
-        repository::Repository,
+        repository_resolver::RepositoryResolver,
     },
 };
 
@@ -28,7 +29,7 @@ struct TagWithMetadata {
 
 pub struct RetentionChecker {
     metadata_store: Arc<dyn MetadataStore + Send + Sync>,
-    repositories: Arc<HashMap<String, Repository>>,
+    resolver: Arc<RepositoryResolver>,
     global_retention_policy: Option<Arc<RetentionPolicy>>,
 }
 
@@ -143,12 +144,12 @@ fn decide_orphan_fate(
 impl RetentionChecker {
     pub fn new(
         metadata_store: Arc<dyn MetadataStore + Send + Sync>,
-        repositories: Arc<HashMap<String, Repository>>,
+        resolver: Arc<RepositoryResolver>,
         global_retention_policy: Option<Arc<RetentionPolicy>>,
     ) -> Self {
         Self {
             metadata_store,
-            repositories,
+            resolver,
             global_retention_policy,
         }
     }
@@ -234,7 +235,7 @@ impl RetentionChecker {
 
     fn rank_by<K: Ord>(tags: &[TagWithMetadata], key: impl Fn(&LinkMetadata) -> K) -> Vec<String> {
         let mut indices: Vec<usize> = (0..tags.len()).collect();
-        indices.sort_by_cached_key(|&i| std::cmp::Reverse(key(&tags[i].metadata)));
+        indices.sort_by_cached_key(|&i| Reverse(key(&tags[i].metadata)));
         indices.iter().map(|&i| tags[i].name.clone()).collect()
     }
 
@@ -289,13 +290,6 @@ impl RetentionChecker {
         self.evaluate_retention_policies(namespace, &tag.name, &manifest, last_pushed, last_pulled)
     }
 
-    fn find_repository_for_namespace(&self, namespace: &str) -> Option<&Repository> {
-        self.repositories
-            .iter()
-            .find(|(repository_name, _)| namespace_belongs_to(namespace, repository_name))
-            .map(|(_, repository)| repository)
-    }
-
     fn evaluate_retention_policies(
         &self,
         namespace: &str,
@@ -311,7 +305,7 @@ impl RetentionChecker {
             last_pulled,
         )?;
         let repo = check_repo_policy(
-            self.find_repository_for_namespace(namespace),
+            self.resolver.resolve(namespace),
             manifest,
             last_pushed,
             last_pulled,
@@ -344,8 +338,12 @@ impl RetentionChecker {
         let mut revisions = list_all::revisions(&self.metadata_store, namespace);
         while let Some(digest) = revisions.next().await {
             let digest = digest?;
-            self.process_orphan_revision(namespace, &digest, last_pushed, last_pulled, sink)
-                .await?;
+            if let Err(e) = self
+                .process_orphan_revision(namespace, &digest, last_pushed, last_pulled, sink)
+                .await
+            {
+                error!("Failed to check revision from '{namespace}' (revision '{digest}'): {e}");
+            }
         }
 
         Ok(())
@@ -379,7 +377,7 @@ impl RetentionChecker {
             is_protected,
             has_tags,
             metadata.as_ref(),
-            self.find_repository_for_namespace(namespace),
+            self.resolver.resolve(namespace),
             self.global_retention_policy.as_deref(),
             last_pushed,
             last_pulled,
@@ -447,10 +445,9 @@ mod tests {
         oci::{Digest, Namespace},
         policy::{CelRule, RetentionPolicy, RetentionPolicyConfig, SystemClock},
         registry::{
-            metadata_store::{
-                LockStrategy, MetadataStoreExt,
-                fs::{Backend as FsMetadataStore, BackendConfig as FsMetadataConfig},
-            },
+            blob_store::{BlobStore, UploadStore},
+            metadata_store::LinkOperation,
+            repository_resolver::RepositoryResolver,
             test_utils::{self, NoopMultipart, backends},
         },
     };
@@ -478,28 +475,10 @@ mod tests {
         }
     }
 
-    fn make_checker_with_repos(
-        repositories: Arc<HashMap<String, crate::registry::Repository>>,
-    ) -> RetentionChecker {
-        use tempfile::TempDir;
-        let dir = TempDir::new().unwrap();
-        let path = dir.path().to_string_lossy().to_string();
-        std::mem::forget(dir);
-        let metadata_store = Arc::new(
-            FsMetadataStore::new(&FsMetadataConfig {
-                root_dir: path,
-                sync_to_disk: false,
-                lock_strategy: LockStrategy::Memory,
-            })
-            .unwrap(),
-        );
-        RetentionChecker::new(metadata_store, repositories, None)
-    }
-
     fn make_executor(
-        blob_store: Arc<dyn crate::registry::blob_store::BlobStore + Send + Sync>,
+        blob_store: Arc<dyn BlobStore + Send + Sync>,
         metadata_store: Arc<dyn MetadataStore + Send + Sync>,
-        upload_store: Arc<dyn crate::registry::blob_store::UploadStore>,
+        upload_store: Arc<dyn UploadStore>,
     ) -> Executor {
         Executor::new(
             blob_store,
@@ -507,6 +486,60 @@ mod tests {
             upload_store,
             Arc::new(NoopMultipart),
         )
+    }
+
+    async fn setup_index_scenario(
+        metadata_store: &Arc<dyn MetadataStore + Send + Sync>,
+        namespace: &str,
+        index_digest: &Digest,
+        child_digest: &Digest,
+    ) {
+        metadata_store
+            .update_links(
+                namespace,
+                &[
+                    LinkOperation::create(
+                        LinkKind::Digest(child_digest.clone()),
+                        child_digest.clone(),
+                    ),
+                    LinkOperation::create(
+                        LinkKind::Digest(index_digest.clone()),
+                        index_digest.clone(),
+                    ),
+                    LinkOperation::create(
+                        LinkKind::Tag("latest".to_string()),
+                        index_digest.clone(),
+                    ),
+                    LinkOperation::create(
+                        LinkKind::Manifest(index_digest.clone(), child_digest.clone()),
+                        child_digest.clone(),
+                    ),
+                ],
+            )
+            .await
+            .unwrap();
+    }
+
+    async fn teardown_index_scenario(
+        metadata_store: &Arc<dyn MetadataStore + Send + Sync>,
+        namespace: &str,
+        index_digest: Digest,
+        child_digest: &Digest,
+    ) {
+        metadata_store
+            .update_links(
+                namespace,
+                &[
+                    LinkOperation::delete(LinkKind::Tag("latest".to_string())),
+                    LinkOperation::delete(LinkKind::Manifest(
+                        index_digest.clone(),
+                        child_digest.clone(),
+                    )),
+                    LinkOperation::delete(LinkKind::Digest(index_digest)),
+                ],
+            )
+            .await
+            .unwrap();
     }
 
     // --- rank_by ---
@@ -588,37 +621,6 @@ mod tests {
         assert_eq!(last_pulled[0], "b");
     }
 
-    // --- find_repository_for_namespace ---
-
-    #[test]
-    fn find_repository_for_namespace_exact_match() {
-        let repos = test_utils::create_test_repositories();
-        let checker = make_checker_with_repos(repos);
-
-        let found = checker.find_repository_for_namespace("test-repo");
-        assert!(found.is_some());
-        assert_eq!(found.unwrap().name, "test-repo");
-    }
-
-    #[test]
-    fn find_repository_for_namespace_prefix_match() {
-        let repos = test_utils::create_test_repositories();
-        let checker = make_checker_with_repos(repos);
-
-        let found = checker.find_repository_for_namespace("test-repo/images/app");
-        assert!(found.is_some());
-        assert_eq!(found.unwrap().name, "test-repo");
-    }
-
-    #[test]
-    fn find_repository_for_namespace_unknown_returns_none() {
-        let repos = test_utils::create_test_repositories();
-        let checker = make_checker_with_repos(repos);
-
-        let found = checker.find_repository_for_namespace("completely-different");
-        assert!(found.is_none());
-    }
-
     const TEST_MANIFEST: &[u8] = br#"{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{"mediaType":"application/vnd.oci.image.config.v1+json","digest":"sha256:0000000000000000000000000000000000000000000000000000000000000000","size":0},"layers":[]}"#;
 
     const TEST_INDEX: &[u8] = br#"{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[{"mediaType":"application/vnd.oci.image.manifest.v1+json","digest":"sha256:1fc08b525237c75b560cf0b8ab766fc363d4e5ff1537f4f3ae28a49ade78938b","size":0}]}"#;
@@ -633,10 +635,16 @@ mod tests {
             let (blob_digest, _) =
                 test_utils::create_test_blob(registry, namespace, b"test manifest").await;
 
-            let mut tx = metadata_store.begin_transaction(namespace);
-            tx.create_link(&LinkKind::Tag("v1.0.0".to_string()), &blob_digest)
-                .add();
-            tx.commit().await.unwrap();
+            metadata_store
+                .update_links(
+                    namespace,
+                    &[LinkOperation::create(
+                        LinkKind::Tag("v1.0.0".to_string()),
+                        blob_digest.clone(),
+                    )],
+                )
+                .await
+                .unwrap();
 
             let retention_config = RetentionPolicyConfig {
                 rules: vec![CelRule::compile("top_pushed(10)").unwrap()],
@@ -647,9 +655,12 @@ mod tests {
                 Arc::new(SystemClock),
             ));
 
-            let repositories = test_utils::create_test_repositories();
+            let resolver = Arc::new(
+                RepositoryResolver::new(test_utils::create_test_repositories())
+                    .expect("test repositories must not have overlapping prefixes"),
+            );
             let scrubber =
-                RetentionChecker::new(metadata_store.clone(), repositories, Some(retention_policy));
+                RetentionChecker::new(metadata_store.clone(), resolver, Some(retention_policy));
 
             let mut executor = make_executor(
                 test_case.blob_store(),
@@ -677,13 +688,22 @@ mod tests {
             let (blob_digest, _) =
                 test_utils::create_test_blob(registry, namespace, b"test manifest").await;
 
-            let mut tx = metadata_store.begin_transaction(namespace);
-            tx.create_link(&LinkKind::Tag("any-tag".to_string()), &blob_digest)
-                .add();
-            tx.commit().await.unwrap();
+            metadata_store
+                .update_links(
+                    namespace,
+                    &[LinkOperation::create(
+                        LinkKind::Tag("any-tag".to_string()),
+                        blob_digest.clone(),
+                    )],
+                )
+                .await
+                .unwrap();
 
-            let repositories = test_utils::create_test_repositories();
-            let scrubber = RetentionChecker::new(metadata_store.clone(), repositories, None);
+            let resolver = Arc::new(
+                RepositoryResolver::new(test_utils::create_test_repositories())
+                    .expect("test repositories must not have overlapping prefixes"),
+            );
+            let scrubber = RetentionChecker::new(metadata_store.clone(), resolver, None);
 
             let mut executor = make_executor(
                 test_case.blob_store(),
@@ -710,10 +730,16 @@ mod tests {
 
             let digest = blob_store.create(TEST_MANIFEST).await.unwrap();
 
-            let mut tx = metadata_store.begin_transaction(namespace);
-            tx.create_link(&LinkKind::Digest(digest.clone()), &digest)
-                .add();
-            tx.commit().await.unwrap();
+            metadata_store
+                .update_links(
+                    namespace,
+                    &[LinkOperation::create(
+                        LinkKind::Digest(digest.clone()),
+                        digest.clone(),
+                    )],
+                )
+                .await
+                .unwrap();
 
             let policy = Arc::new(RetentionPolicy::new(
                 &RetentionPolicyConfig {
@@ -727,14 +753,14 @@ mod tests {
                 test_case.metadata_store(),
                 test_case.upload_store(),
             );
-            RetentionChecker::new(
-                metadata_store.clone(),
-                test_utils::create_test_repositories(),
-                Some(policy),
-            )
-            .check(namespace, &mut executor)
-            .await
-            .unwrap();
+            let resolver = Arc::new(
+                RepositoryResolver::new(test_utils::create_test_repositories())
+                    .expect("test repositories must not have overlapping prefixes"),
+            );
+            RetentionChecker::new(metadata_store.clone(), resolver, Some(policy))
+                .check(namespace, &mut executor)
+                .await
+                .unwrap();
 
             assert!(
                 metadata_store
@@ -755,24 +781,30 @@ mod tests {
 
             let digest = blob_store.create(TEST_MANIFEST).await.unwrap();
 
-            let mut tx = metadata_store.begin_transaction(namespace);
-            tx.create_link(&LinkKind::Digest(digest.clone()), &digest)
-                .add();
-            tx.commit().await.unwrap();
+            metadata_store
+                .update_links(
+                    namespace,
+                    &[LinkOperation::create(
+                        LinkKind::Digest(digest.clone()),
+                        digest.clone(),
+                    )],
+                )
+                .await
+                .unwrap();
 
             let mut executor = make_executor(
                 test_case.blob_store(),
                 test_case.metadata_store(),
                 test_case.upload_store(),
             );
-            RetentionChecker::new(
-                metadata_store.clone(),
-                test_utils::create_test_repositories(),
-                None,
-            )
-            .check(namespace, &mut executor)
-            .await
-            .unwrap();
+            let resolver = Arc::new(
+                RepositoryResolver::new(test_utils::create_test_repositories())
+                    .expect("test repositories must not have overlapping prefixes"),
+            );
+            RetentionChecker::new(metadata_store.clone(), resolver, None)
+                .check(namespace, &mut executor)
+                .await
+                .unwrap();
 
             assert!(
                 metadata_store
@@ -794,19 +826,7 @@ mod tests {
             let child_digest = blob_store.create(TEST_MANIFEST).await.unwrap();
             let index_digest = blob_store.create(TEST_INDEX).await.unwrap();
 
-            let mut tx = metadata_store.begin_transaction(namespace);
-            tx.create_link(&LinkKind::Digest(child_digest.clone()), &child_digest)
-                .add();
-            tx.create_link(&LinkKind::Digest(index_digest.clone()), &index_digest)
-                .add();
-            tx.create_link(&LinkKind::Tag("latest".to_string()), &index_digest)
-                .add();
-            tx.create_link(
-                &LinkKind::Manifest(index_digest.clone(), child_digest.clone()),
-                &child_digest,
-            )
-            .add();
-            tx.commit().await.unwrap();
+            setup_index_scenario(&metadata_store, namespace, &index_digest, &child_digest).await;
 
             let policy = Arc::new(RetentionPolicy::new(
                 &RetentionPolicyConfig {
@@ -820,14 +840,14 @@ mod tests {
                 test_case.metadata_store(),
                 test_case.upload_store(),
             );
-            RetentionChecker::new(
-                metadata_store.clone(),
-                test_utils::create_test_repositories(),
-                Some(policy.clone()),
-            )
-            .check(namespace, &mut executor)
-            .await
-            .unwrap();
+            let resolver = Arc::new(
+                RepositoryResolver::new(test_utils::create_test_repositories())
+                    .expect("test repositories must not have overlapping prefixes"),
+            );
+            RetentionChecker::new(metadata_store.clone(), resolver, Some(policy.clone()))
+                .check(namespace, &mut executor)
+                .await
+                .unwrap();
 
             assert!(
                 metadata_store
@@ -836,28 +856,21 @@ mod tests {
                     .is_ok()
             );
 
-            let mut tx = metadata_store.begin_transaction(namespace);
-            tx.delete_link(&LinkKind::Tag("latest".to_string()));
-            tx.delete_link(&LinkKind::Manifest(
-                index_digest.clone(),
-                child_digest.clone(),
-            ));
-            tx.delete_link(&LinkKind::Digest(index_digest));
-            tx.commit().await.unwrap();
+            teardown_index_scenario(&metadata_store, namespace, index_digest, &child_digest).await;
 
             let mut executor2 = make_executor(
                 test_case.blob_store(),
                 test_case.metadata_store(),
                 test_case.upload_store(),
             );
-            RetentionChecker::new(
-                metadata_store.clone(),
-                test_utils::create_test_repositories(),
-                Some(policy),
-            )
-            .check(namespace, &mut executor2)
-            .await
-            .unwrap();
+            let resolver2 = Arc::new(
+                RepositoryResolver::new(test_utils::create_test_repositories())
+                    .expect("test repositories must not have overlapping prefixes"),
+            );
+            RetentionChecker::new(metadata_store.clone(), resolver2, Some(policy))
+                .check(namespace, &mut executor2)
+                .await
+                .unwrap();
 
             assert!(
                 metadata_store
@@ -879,10 +892,16 @@ mod tests {
         let (blob_digest, _) =
             test_utils::create_test_blob(registry, namespace, b"test manifest").await;
 
-        let mut tx = metadata_store.begin_transaction(namespace);
-        tx.create_link(&LinkKind::Tag("v0.0.1".to_string()), &blob_digest)
-            .add();
-        tx.commit().await.unwrap();
+        metadata_store
+            .update_links(
+                namespace,
+                &[LinkOperation::create(
+                    LinkKind::Tag("v0.0.1".to_string()),
+                    blob_digest.clone(),
+                )],
+            )
+            .await
+            .unwrap();
 
         let policy = Arc::new(RetentionPolicy::new(
             &RetentionPolicyConfig {
@@ -891,11 +910,11 @@ mod tests {
             Arc::new(SystemClock),
         ));
 
-        let scrubber = RetentionChecker::new(
-            metadata_store.clone(),
-            test_utils::create_test_repositories(),
-            Some(policy),
+        let resolver = Arc::new(
+            RepositoryResolver::new(test_utils::create_test_repositories())
+                .expect("test repositories must not have overlapping prefixes"),
         );
+        let scrubber = RetentionChecker::new(metadata_store.clone(), resolver, Some(policy));
 
         let mut sink: Vec<Action> = Vec::new();
         scrubber.check(namespace, &mut sink).await.unwrap();
@@ -913,6 +932,73 @@ mod tests {
             "Vec sink must not delete the tag"
         );
         test_case.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn retention_checker_continues_after_missing_blob_in_one_revision() {
+        for test_case in backends() {
+            let namespace = "test-repo/app";
+            let blob_store = test_case.blob_store();
+            let metadata_store = test_case.metadata_store();
+
+            // First revision: write blob, then delete it so the executor encounters a missing blob.
+            let digest_missing = blob_store.create(TEST_MANIFEST).await.unwrap();
+            metadata_store
+                .update_links(
+                    namespace,
+                    &[LinkOperation::create(
+                        LinkKind::Digest(digest_missing.clone()),
+                        digest_missing.clone(),
+                    )],
+                )
+                .await
+                .unwrap();
+            blob_store.delete(&digest_missing).await.unwrap();
+
+            // Second revision: healthy manifest blob with a digest link.
+            let digest_healthy = blob_store.create(TEST_INDEX).await.unwrap();
+            metadata_store
+                .update_links(
+                    namespace,
+                    &[LinkOperation::create(
+                        LinkKind::Digest(digest_healthy.clone()),
+                        digest_healthy.clone(),
+                    )],
+                )
+                .await
+                .unwrap();
+
+            let policy = Arc::new(RetentionPolicy::new(
+                &RetentionPolicyConfig {
+                    rules: vec![CelRule::compile("image.tag != null").unwrap()],
+                },
+                Arc::new(SystemClock),
+            ));
+
+            let mut executor = make_executor(
+                test_case.blob_store(),
+                test_case.metadata_store(),
+                test_case.upload_store(),
+            );
+            let resolver = Arc::new(
+                RepositoryResolver::new(test_utils::create_test_repositories())
+                    .expect("test repositories must not have overlapping prefixes"),
+            );
+            RetentionChecker::new(metadata_store.clone(), resolver, Some(policy))
+                .check(namespace, &mut executor)
+                .await
+                .unwrap();
+
+            // The healthy revision must be cleaned up — the broken one did not block the loop.
+            assert!(
+                metadata_store
+                    .read_link(namespace, &LinkKind::Digest(digest_healthy), false)
+                    .await
+                    .is_err(),
+                "healthy revision after the broken one must still be processed"
+            );
+            test_case.cleanup().await;
+        }
     }
 
     fn make_manifest(tag: &str) -> ManifestImage {
@@ -956,8 +1042,8 @@ mod tests {
         assert_eq!(result, PolicyDecision::Delete);
     }
 
-    fn make_repo(name: &str, rules: Vec<CelRule>) -> crate::registry::Repository {
-        crate::registry::Repository {
+    fn make_repo(name: &str, rules: Vec<CelRule>) -> Repository {
+        Repository {
             name: name.to_string(),
             upstreams: Vec::new(),
             retention_policy: RetentionPolicy::new(

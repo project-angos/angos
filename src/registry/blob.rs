@@ -400,7 +400,7 @@ mod tests {
         oci::Namespace,
         registry::{
             DOCKER_CONTENT_DIGEST,
-            metadata_store::MetadataStoreExt,
+            metadata_store::LinkOperation,
             test_utils::{backends, create_test_blob},
         },
         util::sha256,
@@ -562,11 +562,18 @@ mod tests {
             let digest = registry.blob_store.create(content).await.unwrap();
             let link = LinkKind::Config(digest.clone());
 
-            let mut tx = registry.metadata_store.begin_transaction(namespace);
-            tx.create_link(&link, &digest)
-                .with_referrer(&sha256::digest(b"manifest"))
-                .add();
-            tx.commit().await.unwrap();
+            registry
+                .metadata_store
+                .update_links(
+                    namespace,
+                    &[LinkOperation::create_with_referrer(
+                        link.clone(),
+                        digest.clone(),
+                        sha256::digest(b"manifest"),
+                    )],
+                )
+                .await
+                .unwrap();
 
             let result = registry.delete_blob(namespace, &digest).await;
             assert!(matches!(result, Err(Error::BlobReferenced)));
@@ -609,14 +616,17 @@ mod tests {
                     .await
                     .unwrap();
 
-                let mut tx = registry.metadata_store.begin_transaction(namespace);
-                let builder = tx.create_link(&retarget_link(&link, &digest), &digest);
-                if let LinkKind::Manifest(parent, _) = &link {
-                    builder.with_referrer(parent).add();
+                let retargeted = retarget_link(&link, &digest);
+                let op = if let LinkKind::Manifest(parent, _) = &link {
+                    LinkOperation::create_with_referrer(retargeted, digest.clone(), parent.clone())
                 } else {
-                    builder.add();
-                }
-                tx.commit().await.unwrap();
+                    LinkOperation::create(retargeted, digest.clone())
+                };
+                registry
+                    .metadata_store
+                    .update_links(namespace, &[op])
+                    .await
+                    .unwrap();
 
                 let result = registry.delete_blob(namespace, &digest).await;
                 assert!(matches!(result, Err(Error::BlobReferenced)));

@@ -1,18 +1,18 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::{
     command::scrub::{action::Action, error::Error},
-    oci::Digest,
+    oci::{Manifest, Reference},
     registry::{
-        ParsedManifestDigests,
-        blob_store::{BlobStore, MultipartCleanup, OrphanMultipartUpload, UploadStore},
+        blob_store::{self, BlobStore, MultipartCleanup, OrphanMultipartUpload, UploadStore},
+        manifest::{find_tags_pointing_at, link_plan},
         metadata_store::{
-            BlobIndexOperation, MetadataStore, MetadataStoreExt, link_kind::LinkKind,
+            BlobIndexOperation, Error as MetadataStoreError, LinkOperation, MetadataStore,
+            link_kind::LinkKind,
         },
-        parse_manifest_digests,
     },
 };
 
@@ -20,30 +20,6 @@ use crate::{
 #[async_trait]
 pub trait ActionSink: Send {
     async fn apply(&mut self, action: Action) -> Result<(), Error>;
-}
-
-/// Returns the `LinkKind`s that must be deleted to remove a manifest from a
-/// namespace. Pure: no I/O, no state. Each entry corresponds to a
-/// `LinkOperation::Delete` with no referrer when applied to a transaction.
-///
-/// Order is fixed: config (if present), layers, child manifests, subject's
-/// referrer back-link (if present), then the manifest's own digest link.
-fn build_delete_transaction(manifest: &ParsedManifestDigests, digest: &Digest) -> Vec<LinkKind> {
-    let mut links = Vec::new();
-    if let Some(config) = &manifest.config {
-        links.push(LinkKind::Config(config.clone()));
-    }
-    for layer in &manifest.layers {
-        links.push(LinkKind::Layer(layer.clone()));
-    }
-    for child in &manifest.manifests {
-        links.push(LinkKind::Manifest(digest.clone(), child.clone()));
-    }
-    if let Some(subject) = &manifest.subject {
-        links.push(LinkKind::Referrer(subject.clone(), digest.clone()));
-    }
-    links.push(LinkKind::Digest(digest.clone()));
-    links
 }
 
 /// Logs actions as dry-run without applying any mutations to storage.
@@ -83,6 +59,7 @@ impl Executor {
 
 #[async_trait]
 impl ActionSink for Executor {
+    #[allow(clippy::too_many_lines)]
     async fn apply(&mut self, action: Action) -> Result<(), Error> {
         info!("{action}");
 
@@ -94,7 +71,34 @@ impl ActionSink for Executor {
                 self.metadata_store.migrate_blob_index(&digest).await?;
             }
             Action::DeleteOrphanBlob(digest) => {
-                self.blob_store.delete(&digest).await?;
+                let guard = self.metadata_store.acquire_blob_data_lock(&digest).await?;
+
+                let has_references = self.metadata_store.has_blob_references(&digest).await;
+                let delete_result = match has_references {
+                    Err(e) => Err(e.into()),
+                    Ok(true) => {
+                        info!("skipping orphan blob deletion: reference appeared for {digest}");
+                        Ok(())
+                    }
+                    Ok(false) => match self.blob_store.delete(&digest).await {
+                        Ok(())
+                        | Err(
+                            blob_store::Error::BlobNotFound | blob_store::Error::ReferenceNotFound,
+                        ) => Ok(()),
+                        Err(e) => Err(Error::from(e)),
+                    },
+                };
+
+                let lock_valid = guard.is_valid();
+                guard.release().await;
+                delete_result?;
+
+                if !lock_valid {
+                    return Err(MetadataStoreError::Lock(
+                        "lock invalidated during orphan blob deletion".into(),
+                    )
+                    .into());
+                }
             }
             Action::RemoveBlobIndexLink {
                 namespace,
@@ -110,9 +114,9 @@ impl ActionSink for Executor {
                 link,
                 target,
             } => {
-                let mut tx = self.metadata_store.begin_transaction(&namespace);
-                tx.create_link(&link, &target).add();
-                tx.commit().await?;
+                self.metadata_store
+                    .update_links(&namespace, &[LinkOperation::create(link, target)])
+                    .await?;
             }
             Action::AddReferrer {
                 namespace,
@@ -120,11 +124,12 @@ impl ActionSink for Executor {
                 target,
                 referrer,
             } => {
-                let mut tx = self.metadata_store.begin_transaction(&namespace);
-                tx.create_link(&link, &target)
-                    .with_referrer(&referrer)
-                    .add();
-                tx.commit().await?;
+                self.metadata_store
+                    .update_links(
+                        &namespace,
+                        &[LinkOperation::create_with_referrer(link, target, referrer)],
+                    )
+                    .await?;
             }
             Action::SetMediaType {
                 namespace,
@@ -133,11 +138,16 @@ impl ActionSink for Executor {
                 media_type,
                 ..
             } => {
-                let mut tx = self.metadata_store.begin_transaction(&namespace);
-                tx.create_link(&link, &target)
-                    .with_media_type(&media_type)
-                    .add();
-                tx.commit().await?;
+                self.metadata_store
+                    .update_links(
+                        &namespace,
+                        &[LinkOperation::create_with_media_type(
+                            link,
+                            target,
+                            Some(media_type),
+                        )],
+                    )
+                    .await?;
             }
             Action::AbortMultipartUpload { key, upload_id } => {
                 self.multipart_cleanup
@@ -145,22 +155,52 @@ impl ActionSink for Executor {
                     .await?;
             }
             Action::DeleteTag { namespace, tag } => {
-                let mut tx = self.metadata_store.begin_transaction(&namespace);
-                tx.delete_link(&LinkKind::Tag(tag));
-                tx.commit().await?;
+                self.metadata_store
+                    .update_links(&namespace, &[LinkOperation::delete(LinkKind::Tag(tag))])
+                    .await?;
             }
             Action::DeleteOrphanManifest { namespace, digest } => {
-                let content = self.blob_store.read(&digest).await?;
-                let manifest = parse_manifest_digests(&content, None)?;
-
-                let mut tx = self.metadata_store.begin_transaction(&namespace);
-                for link in build_delete_transaction(&manifest, &digest) {
-                    tx.delete_link(&link);
-                }
-                tx.commit().await?;
+                let manifest = match self.blob_store.read(&digest).await {
+                    Ok(content) => Manifest::from_slice(&content).ok(),
+                    Err(blob_store::Error::BlobNotFound | blob_store::Error::ReferenceNotFound) => {
+                        warn!(
+                            "Manifest blob missing for {digest}, proceeding with metadata-only deletion"
+                        );
+                        None
+                    }
+                    Err(e) => return Err(Error::from(e)),
+                };
+                let tags = find_tags_pointing_at(self.metadata_store.as_ref(), &namespace, &digest)
+                    .await?;
+                let ops = link_plan::delete(&Reference::Digest(digest), manifest.as_ref(), &tags);
+                self.metadata_store.update_links(&namespace, &ops).await?;
             }
             Action::DeleteExpiredUpload { namespace, uuid } => {
                 self.upload_store.delete(&namespace, &uuid).await?;
+            }
+            Action::DeleteOrphanReferrer {
+                namespace,
+                subject,
+                referrer,
+            } => {
+                self.metadata_store
+                    .update_links(
+                        &namespace,
+                        &[LinkOperation::delete(LinkKind::Referrer(subject, referrer))],
+                    )
+                    .await?;
+            }
+            Action::RemoveReferrer {
+                namespace,
+                link,
+                referrer,
+            } => {
+                self.metadata_store
+                    .update_links(
+                        &namespace,
+                        &[LinkOperation::delete_with_referrer(link, referrer)],
+                    )
+                    .await?;
             }
         }
 
@@ -187,7 +227,10 @@ mod tests {
     use super::*;
     use crate::{
         oci::Digest,
-        registry::test_utils::{NoopMultipart, backends},
+        registry::{
+            metadata_store::{LinkOperation, link_kind::LinkKind},
+            test_utils::{NoopMultipart, backends},
+        },
     };
 
     #[tokio::test]
@@ -242,6 +285,324 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn executor_delete_orphan_manifest_missing_blob_still_removes_digest_link() {
+        for test_case in backends() {
+            let blob_store = test_case.blob_store();
+            let metadata_store = test_case.metadata_store();
+            let upload_store = test_case.upload_store();
+
+            let namespace = "test-repo/app";
+
+            // Write manifest blob and create a digest link, then delete the blob.
+            let content = b"orphan manifest content for missing-blob test";
+            let digest = blob_store.create(content).await.unwrap();
+            metadata_store
+                .update_links(
+                    namespace,
+                    &[LinkOperation::create(
+                        LinkKind::Digest(digest.clone()),
+                        digest.clone(),
+                    )],
+                )
+                .await
+                .unwrap();
+            blob_store.delete(&digest).await.unwrap();
+
+            let mut executor = Executor::new(
+                blob_store.clone(),
+                metadata_store.clone(),
+                upload_store,
+                Arc::new(NoopMultipart),
+            );
+
+            executor
+                .apply(Action::DeleteOrphanManifest {
+                    namespace: namespace.to_string(),
+                    digest: digest.clone(),
+                })
+                .await
+                .unwrap();
+
+            assert!(
+                metadata_store
+                    .read_link(namespace, &LinkKind::Digest(digest.clone()), false)
+                    .await
+                    .is_err(),
+                "digest link must be removed even when the blob is missing"
+            );
+            test_case.cleanup().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn executor_delete_orphan_manifest_missing_blob_removes_tag_link() {
+        for test_case in backends() {
+            let blob_store = test_case.blob_store();
+            let metadata_store = test_case.metadata_store();
+            let upload_store = test_case.upload_store();
+
+            let namespace = "test-repo/app";
+
+            let content = b"orphan manifest with tag - missing blob";
+            let digest = blob_store.create(content).await.unwrap();
+            metadata_store
+                .update_links(
+                    namespace,
+                    &[
+                        LinkOperation::create(LinkKind::Digest(digest.clone()), digest.clone()),
+                        LinkOperation::create(
+                            LinkKind::Tag("dangling".to_string()),
+                            digest.clone(),
+                        ),
+                    ],
+                )
+                .await
+                .unwrap();
+            blob_store.delete(&digest).await.unwrap();
+
+            let mut executor = Executor::new(
+                blob_store.clone(),
+                metadata_store.clone(),
+                upload_store,
+                Arc::new(NoopMultipart),
+            );
+
+            executor
+                .apply(Action::DeleteOrphanManifest {
+                    namespace: namespace.to_string(),
+                    digest: digest.clone(),
+                })
+                .await
+                .unwrap();
+
+            assert!(
+                metadata_store
+                    .read_link(namespace, &LinkKind::Tag("dangling".to_string()), false)
+                    .await
+                    .is_err(),
+                "tag link pointing at missing-blob digest must be removed"
+            );
+            test_case.cleanup().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn executor_delete_orphan_blob_takes_blob_data_lock() {
+        for test_case in backends() {
+            let blob_store = test_case.blob_store();
+            let metadata_store = test_case.metadata_store();
+            let upload_store = test_case.upload_store();
+
+            let content = b"blob with no ownership entry";
+            let digest = blob_store.create(content).await.unwrap();
+
+            let mut executor = Executor::new(
+                blob_store.clone(),
+                metadata_store,
+                upload_store,
+                Arc::new(NoopMultipart),
+            );
+
+            executor
+                .apply(Action::DeleteOrphanBlob(digest.clone()))
+                .await
+                .unwrap();
+
+            assert!(
+                blob_store.read(&digest).await.is_err(),
+                "unreferenced blob must be deleted"
+            );
+            test_case.cleanup().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn executor_delete_orphan_blob_skips_when_reference_appears_between_classification_and_apply()
+     {
+        for test_case in backends() {
+            let blob_store = test_case.blob_store();
+            let metadata_store = test_case.metadata_store();
+            let upload_store = test_case.upload_store();
+
+            let content = b"blob that got ownership just in time";
+            let digest = blob_store.create(content).await.unwrap();
+
+            metadata_store
+                .update_blob_index(
+                    "test-repo/app",
+                    &digest,
+                    BlobIndexOperation::Insert(LinkKind::Blob(digest.clone())),
+                )
+                .await
+                .unwrap();
+
+            let mut executor = Executor::new(
+                blob_store.clone(),
+                metadata_store,
+                upload_store,
+                Arc::new(NoopMultipart),
+            );
+
+            executor
+                .apply(Action::DeleteOrphanBlob(digest.clone()))
+                .await
+                .unwrap();
+
+            assert!(
+                blob_store.read(&digest).await.is_ok(),
+                "blob with a reference must not be deleted"
+            );
+            test_case.cleanup().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn executor_delete_orphan_referrer_removes_referrer_link() {
+        for test_case in backends() {
+            let blob_store = test_case.blob_store();
+            let metadata_store = test_case.metadata_store();
+            let upload_store = test_case.upload_store();
+
+            let namespace = "test-repo/referrer-exec";
+
+            let subject_digest = blob_store
+                .create(b"subject for referrer exec")
+                .await
+                .unwrap();
+            let referrer_digest = blob_store
+                .create(b"referrer for referrer exec")
+                .await
+                .unwrap();
+
+            metadata_store
+                .update_links(
+                    namespace,
+                    &[
+                        LinkOperation::create(
+                            LinkKind::Digest(subject_digest.clone()),
+                            subject_digest.clone(),
+                        ),
+                        LinkOperation::create(
+                            LinkKind::Referrer(subject_digest.clone(), referrer_digest.clone()),
+                            referrer_digest.clone(),
+                        ),
+                    ],
+                )
+                .await
+                .unwrap();
+
+            assert!(
+                metadata_store
+                    .read_link(
+                        namespace,
+                        &LinkKind::Referrer(subject_digest.clone(), referrer_digest.clone()),
+                        false,
+                    )
+                    .await
+                    .is_ok(),
+                "Referrer link must exist before applying the action"
+            );
+
+            let mut executor = Executor::new(
+                blob_store.clone(),
+                metadata_store.clone(),
+                upload_store,
+                Arc::new(NoopMultipart),
+            );
+
+            executor
+                .apply(Action::DeleteOrphanReferrer {
+                    namespace: namespace.to_string(),
+                    subject: subject_digest.clone(),
+                    referrer: referrer_digest.clone(),
+                })
+                .await
+                .unwrap();
+
+            assert!(
+                metadata_store
+                    .read_link(
+                        namespace,
+                        &LinkKind::Referrer(subject_digest.clone(), referrer_digest.clone()),
+                        false,
+                    )
+                    .await
+                    .is_err(),
+                "Referrer link must be removed after applying the action"
+            );
+            test_case.cleanup().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn executor_remove_referrer_cascades_to_link_delete_when_referenced_by_becomes_empty() {
+        for test_case in backends() {
+            let blob_store = test_case.blob_store();
+            let metadata_store = test_case.metadata_store();
+            let upload_store = test_case.upload_store();
+
+            let namespace = "test-repo/remove-referrer-cascade";
+
+            // Create a layer blob and the corresponding layer link with exactly
+            // one phantom referrer so referenced_by = {phantom}.
+            let layer_content = b"layer content for cascade test";
+            let layer_digest = blob_store.create(layer_content).await.unwrap();
+            let phantom_digest = Digest::from_str(
+                "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+            )
+            .unwrap();
+
+            metadata_store
+                .update_links(
+                    namespace,
+                    &[LinkOperation::create_with_referrer(
+                        LinkKind::Layer(layer_digest.clone()),
+                        layer_digest.clone(),
+                        phantom_digest.clone(),
+                    )],
+                )
+                .await
+                .unwrap();
+
+            // Confirm the layer link exists with the phantom referrer.
+            let before = metadata_store
+                .read_link(namespace, &LinkKind::Layer(layer_digest.clone()), false)
+                .await
+                .unwrap();
+            assert!(
+                before.referenced_by.contains(&phantom_digest),
+                "phantom referrer must be present before the action"
+            );
+
+            let mut executor = Executor::new(
+                blob_store.clone(),
+                metadata_store.clone(),
+                upload_store,
+                Arc::new(NoopMultipart),
+            );
+
+            executor
+                .apply(Action::RemoveReferrer {
+                    namespace: namespace.to_string(),
+                    link: LinkKind::Layer(layer_digest.clone()),
+                    referrer: phantom_digest.clone(),
+                })
+                .await
+                .unwrap();
+
+            // After removing the only referrer the link itself must be gone.
+            assert!(
+                metadata_store
+                    .read_link(namespace, &LinkKind::Layer(layer_digest.clone()), false,)
+                    .await
+                    .is_err(),
+                "layer link must be removed when referenced_by becomes empty"
+            );
+            test_case.cleanup().await;
+        }
+    }
+
+    #[tokio::test]
     async fn vec_sink_captures_actions_without_io() {
         let digest = Digest::from_str(
             "sha256:0000000000000000000000000000000000000000000000000000000000000000",
@@ -262,56 +623,5 @@ mod tests {
         assert_eq!(sink.len(), 2);
         assert!(matches!(sink[0], Action::DeleteOrphanBlob(_)));
         assert!(matches!(sink[1], Action::DeleteExpiredUpload { .. }));
-    }
-
-    fn dummy_digest(byte: u8) -> Digest {
-        let hex = format!("{byte:02x}").repeat(32);
-        Digest::from_str(&format!("sha256:{hex}")).unwrap()
-    }
-
-    #[test]
-    fn build_delete_transaction_emits_only_self_link_for_minimal_manifest() {
-        let manifest = ParsedManifestDigests {
-            subject: None,
-            config: None,
-            layers: vec![],
-            manifests: vec![],
-        };
-        let digest = dummy_digest(0xaa);
-
-        let links = build_delete_transaction(&manifest, &digest);
-
-        assert_eq!(links.len(), 1);
-        assert!(matches!(&links[0], LinkKind::Digest(d) if d == &digest));
-    }
-
-    #[test]
-    fn build_delete_transaction_includes_config_layers_children_and_subject() {
-        let digest = dummy_digest(0xff);
-        let config_digest = dummy_digest(0x01);
-        let layer_a = dummy_digest(0x02);
-        let layer_b = dummy_digest(0x03);
-        let child = dummy_digest(0x04);
-        let subject = dummy_digest(0x05);
-
-        let manifest = ParsedManifestDigests {
-            subject: Some(subject.clone()),
-            config: Some(config_digest.clone()),
-            layers: vec![layer_a.clone(), layer_b.clone()],
-            manifests: vec![child.clone()],
-        };
-
-        let links = build_delete_transaction(&manifest, &digest);
-
-        // Order: config, layers (in input order), child manifests, subject referrer, self.
-        assert_eq!(links.len(), 6);
-        assert!(matches!(&links[0], LinkKind::Config(d) if d == &config_digest));
-        assert!(matches!(&links[1], LinkKind::Layer(d) if d == &layer_a));
-        assert!(matches!(&links[2], LinkKind::Layer(d) if d == &layer_b));
-        assert!(
-            matches!(&links[3], LinkKind::Manifest(parent, c) if parent == &digest && c == &child)
-        );
-        assert!(matches!(&links[4], LinkKind::Referrer(s, r) if s == &subject && r == &digest));
-        assert!(matches!(&links[5], LinkKind::Digest(d) if d == &digest));
     }
 }

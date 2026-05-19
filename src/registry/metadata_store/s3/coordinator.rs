@@ -15,7 +15,7 @@ use crate::{
             link_kind::LinkKind,
             lock::{self, LockBackend, LockGuard, MemoryBackend, S3LockBackend},
             lock_ops::{LockOps, blob_index_lock_key, link_lock_key, with_validated_lock},
-            sharded, transaction,
+            sharded, update_links,
         },
         path_builder,
     },
@@ -429,7 +429,7 @@ impl WriteCoordinator for LockCoordinator {
         namespace: &str,
         operations: &[LinkOperation],
     ) -> Result<(), Error> {
-        transaction::run_link_transaction(backend, &*self.lock, namespace, operations).await
+        update_links::run_update_links(backend, &*self.lock, namespace, operations).await
     }
 
     #[instrument(name = "update_blob_index_locked", skip(self, backend))]

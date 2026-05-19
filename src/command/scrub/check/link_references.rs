@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use futures_util::StreamExt;
-use tracing::{debug, error};
+use tracing::{debug, error, warn};
 
 use crate::{
     command::scrub::{
@@ -13,7 +13,7 @@ use crate::{
     },
     oci::Digest,
     registry::{
-        blob_store::BlobStore,
+        blob_store::{self, BlobStore},
         metadata_store::{self, MetadataStore, link_kind::LinkKind},
         parse_manifest_digests,
     },
@@ -41,7 +41,20 @@ impl LinkReferencesChecker {
         revision: &Digest,
         sink: &mut (dyn ActionSink + Send),
     ) -> Result<(), Error> {
-        let content = self.blob_store.read(revision).await?;
+        let content = match self.blob_store.read(revision).await {
+            Ok(content) => content,
+            Err(blob_store::Error::BlobNotFound | blob_store::Error::ReferenceNotFound) => {
+                warn!("Manifest blob missing for revision {revision}; removing revision link");
+                return sink
+                    .apply(Action::DeleteOrphanManifest {
+                        namespace: namespace.to_string(),
+                        digest: revision.clone(),
+                    })
+                    .await;
+            }
+            Err(e) => return Err(e.into()),
+        };
+
         let manifest = parse_manifest_digests(&content, None)?;
 
         for (link, target) in manifest.referenced_links_for_revision(revision) {
@@ -52,26 +65,13 @@ impl LinkReferencesChecker {
         Ok(())
     }
 
-    /// Returns `true` only when the link exists but its `referenced_by` set is
-    /// missing `referrer` — the back-link is absent and must be added.
+    /// Ensures the back-link from `link` to `referrer` is present, and prunes
+    /// any entries in `link`'s `referenced_by` set that no longer have a
+    /// corresponding `LinkKind::Digest` revision link in the namespace.
     ///
-    /// A `ReferenceNotFound` error means the link itself does not exist, so
-    /// there is nothing to update; orphan-link cleanup handles that case in a
-    /// separate scrub stage.
-    async fn needs_referrer_update(
-        &self,
-        namespace: &str,
-        link: &LinkKind,
-        referrer: &Digest,
-    ) -> Result<bool, Error> {
-        match self.metadata_store.read_link(namespace, link, false).await {
-            Ok(metadata) if metadata.referenced_by.contains(referrer) => Ok(false),
-            Ok(_) => Ok(true),
-            Err(metadata_store::Error::ReferenceNotFound) => Ok(false),
-            Err(e) => Err(e.into()),
-        }
-    }
-
+    /// A link with an entirely-phantom `referenced_by` that is unreachable from
+    /// the current revision graph is not visited by this method; that case is
+    /// left to future enhancements.
     pub async fn ensure_referenced_by(
         &self,
         namespace: &str,
@@ -80,10 +80,13 @@ impl LinkReferencesChecker {
         referrer: &Digest,
         sink: &mut (dyn ActionSink + Send),
     ) -> Result<(), Error> {
-        if self
-            .needs_referrer_update(namespace, link, referrer)
-            .await?
-        {
+        let metadata = match self.metadata_store.read_link(namespace, link, false).await {
+            Ok(m) => m,
+            Err(metadata_store::Error::ReferenceNotFound) => return Ok(()),
+            Err(e) => return Err(e.into()),
+        };
+
+        if !metadata.referenced_by.contains(referrer) {
             sink.apply(Action::AddReferrer {
                 namespace: namespace.to_string(),
                 link: link.clone(),
@@ -92,6 +95,29 @@ impl LinkReferencesChecker {
             })
             .await?;
         }
+
+        for stale in &metadata.referenced_by {
+            if stale == referrer {
+                continue;
+            }
+            match self
+                .metadata_store
+                .read_link(namespace, &LinkKind::Digest(stale.clone()), false)
+                .await
+            {
+                Ok(_) => {}
+                Err(metadata_store::Error::ReferenceNotFound) => {
+                    sink.apply(Action::RemoveReferrer {
+                        namespace: namespace.to_string(),
+                        link: link.clone(),
+                        referrer: stale.clone(),
+                    })
+                    .await?;
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
+
         Ok(())
     }
 }
@@ -131,7 +157,6 @@ mod tests {
             Registry,
             metadata_store::{
                 BlobIndex, BlobIndexOperation, LinkMetadata, LinkOperation, LockGuard,
-                MetadataStoreExt,
             },
             test_utils::{self, FSRegistryTestCase, NoopMultipart, RegistryTestCase, backends},
         },
@@ -187,14 +212,26 @@ mod tests {
             .await
             .unwrap();
 
-        let mut tx = metadata_store.begin_transaction(namespace);
-        tx.create_link(&LinkKind::Digest(manifest_digest.clone()), &manifest_digest)
-            .add();
-        tx.create_link(&LinkKind::Config(config_digest.clone()), &config_digest)
-            .add();
-        tx.create_link(&LinkKind::Layer(layer_digest.clone()), &layer_digest)
-            .add();
-        tx.commit().await.unwrap();
+        metadata_store
+            .update_links(
+                namespace,
+                &[
+                    LinkOperation::create(
+                        LinkKind::Digest(manifest_digest.clone()),
+                        manifest_digest.clone(),
+                    ),
+                    LinkOperation::create(
+                        LinkKind::Config(config_digest.clone()),
+                        config_digest.clone(),
+                    ),
+                    LinkOperation::create(
+                        LinkKind::Layer(layer_digest.clone()),
+                        layer_digest.clone(),
+                    ),
+                ],
+            )
+            .await
+            .unwrap();
 
         (manifest_digest, config_digest, layer_digest)
     }
@@ -330,10 +367,16 @@ mod tests {
                 .await
                 .unwrap();
 
-            let mut tx = metadata_store.begin_transaction(namespace);
-            tx.create_link(&LinkKind::Digest(manifest_digest.clone()), &manifest_digest)
-                .add();
-            tx.commit().await.unwrap();
+            metadata_store
+                .update_links(
+                    namespace,
+                    &[LinkOperation::create(
+                        LinkKind::Digest(manifest_digest.clone()),
+                        manifest_digest.clone(),
+                    )],
+                )
+                .await
+                .unwrap();
 
             let checker = LinkReferencesChecker::new(blob_store.clone(), metadata_store.clone());
             let mut sink: Vec<Action> = Vec::new();
@@ -352,6 +395,87 @@ mod tests {
             assert!(
                 matches!(config_result, Err(metadata_store::Error::ReferenceNotFound)),
                 "Config link should still not exist after check"
+            );
+            test_case.cleanup().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn link_references_checker_emits_delete_orphan_manifest_when_blob_missing() {
+        for test_case in backends() {
+            let namespace = &Namespace::new("test-repo/missing-blob").unwrap();
+            let registry = test_case.registry();
+            let metadata_store = test_case.metadata_store();
+            let blob_store = test_case.blob_store();
+
+            let (manifest_digest, _, _) = create_manifest_scenario(
+                registry,
+                &metadata_store,
+                &blob_store,
+                namespace,
+                b"config for missing-blob",
+                b"layer for missing-blob",
+            )
+            .await;
+
+            blob_store.delete(&manifest_digest).await.unwrap();
+
+            let checker = LinkReferencesChecker::new(blob_store.clone(), metadata_store.clone());
+            let mut executor = noop_executor(
+                blob_store.clone(),
+                metadata_store.clone(),
+                test_case.upload_store(),
+            );
+            checker.check(namespace, &mut executor).await.unwrap();
+
+            assert!(
+                metadata_store
+                    .read_link(namespace, &LinkKind::Digest(manifest_digest.clone()), false,)
+                    .await
+                    .is_err(),
+                "revision link must be removed when its manifest blob is missing"
+            );
+            test_case.cleanup().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn link_references_checker_dry_run_captures_delete_orphan_manifest() {
+        for test_case in backends() {
+            let namespace = &Namespace::new("test-repo/missing-blob-dry").unwrap();
+            let registry = test_case.registry();
+            let metadata_store = test_case.metadata_store();
+            let blob_store = test_case.blob_store();
+
+            let (manifest_digest, _, _) = create_manifest_scenario(
+                registry,
+                &metadata_store,
+                &blob_store,
+                namespace,
+                b"config for dry-run missing",
+                b"layer for dry-run missing",
+            )
+            .await;
+
+            blob_store.delete(&manifest_digest).await.unwrap();
+
+            let checker = LinkReferencesChecker::new(blob_store.clone(), metadata_store.clone());
+            let mut sink: Vec<Action> = Vec::new();
+            checker.check(namespace, &mut sink).await.unwrap();
+
+            assert!(
+                sink.iter().any(|a| matches!(
+                    a,
+                    Action::DeleteOrphanManifest { digest, .. } if *digest == manifest_digest
+                )),
+                "Vec sink must capture DeleteOrphanManifest action"
+            );
+            assert!(
+                metadata_store
+                    .read_link(namespace, &LinkKind::Digest(manifest_digest.clone()), false,)
+                    .await
+                    .is_ok(),
+                "revision link must not be touched under Vec sink"
             );
             test_case.cleanup().await;
         }
@@ -479,5 +603,205 @@ mod tests {
             matches!(result, Err(Error::MetadataStore(_))),
             "StorageBackend error must propagate as Error::MetadataStore, got: {result:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn link_references_checker_prunes_phantom_referrer_from_layer() {
+        for test_case in backends() {
+            let namespace = &Namespace::new("test-repo/prune-phantom").unwrap();
+            let registry = test_case.registry();
+            let metadata_store = test_case.metadata_store();
+            let blob_store = test_case.blob_store();
+
+            let (manifest_digest, _config_digest, layer_digest) = create_manifest_scenario(
+                registry,
+                &metadata_store,
+                &blob_store,
+                namespace,
+                b"config for prune-phantom",
+                b"layer for prune-phantom",
+            )
+            .await;
+
+            // Inject a phantom referrer: a digest that has no Digest link.
+            let phantom = Digest::Sha256(
+                "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee".into(),
+            );
+            metadata_store
+                .update_links(
+                    namespace,
+                    &[LinkOperation::create_with_referrer(
+                        LinkKind::Layer(layer_digest.clone()),
+                        layer_digest.clone(),
+                        phantom.clone(),
+                    )],
+                )
+                .await
+                .unwrap();
+
+            // Confirm the phantom was injected.
+            let before = metadata_store
+                .read_link(namespace, &LinkKind::Layer(layer_digest.clone()), false)
+                .await
+                .unwrap();
+            assert!(
+                before.referenced_by.contains(&phantom),
+                "phantom referrer must be present before check"
+            );
+
+            let checker = LinkReferencesChecker::new(blob_store.clone(), metadata_store.clone());
+            let mut executor = noop_executor(
+                blob_store.clone(),
+                metadata_store.clone(),
+                test_case.upload_store(),
+            );
+            checker.check(namespace, &mut executor).await.unwrap();
+
+            let after = metadata_store
+                .read_link(namespace, &LinkKind::Layer(layer_digest.clone()), false)
+                .await
+                .unwrap();
+            assert!(
+                !after.referenced_by.contains(&phantom),
+                "phantom referrer must be removed after check"
+            );
+            assert!(
+                after.referenced_by.contains(&manifest_digest),
+                "real referrer must be retained after check"
+            );
+            test_case.cleanup().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn link_references_checker_keeps_existing_valid_referrers() {
+        for test_case in backends() {
+            let namespace = &Namespace::new("test-repo/keep-valid").unwrap();
+            let registry = test_case.registry();
+            let metadata_store = test_case.metadata_store();
+            let blob_store = test_case.blob_store();
+
+            // Build two independent manifests that share the same layer content,
+            // giving the layer link two real referrers A and B.
+            let (manifest_a, _config_a, layer_digest) = create_manifest_scenario(
+                registry,
+                &metadata_store,
+                &blob_store,
+                namespace,
+                b"config for keep-valid A",
+                b"shared layer for keep-valid",
+            )
+            .await;
+            let (manifest_b, _config_b, _) = create_manifest_scenario(
+                registry,
+                &metadata_store,
+                &blob_store,
+                namespace,
+                b"config for keep-valid B",
+                b"shared layer for keep-valid",
+            )
+            .await;
+
+            // Establish both referrers on the layer link.
+            metadata_store
+                .update_links(
+                    namespace,
+                    &[
+                        LinkOperation::create_with_referrer(
+                            LinkKind::Layer(layer_digest.clone()),
+                            layer_digest.clone(),
+                            manifest_a.clone(),
+                        ),
+                        LinkOperation::create_with_referrer(
+                            LinkKind::Layer(layer_digest.clone()),
+                            layer_digest.clone(),
+                            manifest_b.clone(),
+                        ),
+                    ],
+                )
+                .await
+                .unwrap();
+
+            let checker = LinkReferencesChecker::new(blob_store.clone(), metadata_store.clone());
+            let mut executor = noop_executor(
+                blob_store.clone(),
+                metadata_store.clone(),
+                test_case.upload_store(),
+            );
+            checker.check(namespace, &mut executor).await.unwrap();
+
+            let after = metadata_store
+                .read_link(namespace, &LinkKind::Layer(layer_digest.clone()), false)
+                .await
+                .unwrap();
+            assert!(
+                after.referenced_by.contains(&manifest_a),
+                "referrer A must be retained"
+            );
+            assert!(
+                after.referenced_by.contains(&manifest_b),
+                "referrer B must be retained"
+            );
+            test_case.cleanup().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn link_references_checker_dry_run_captures_remove_referrer() {
+        for test_case in backends() {
+            let namespace = &Namespace::new("test-repo/dry-remove").unwrap();
+            let registry = test_case.registry();
+            let metadata_store = test_case.metadata_store();
+            let blob_store = test_case.blob_store();
+
+            let (_manifest_digest, _config_digest, layer_digest) = create_manifest_scenario(
+                registry,
+                &metadata_store,
+                &blob_store,
+                namespace,
+                b"config for dry-remove",
+                b"layer for dry-remove",
+            )
+            .await;
+
+            // Inject a phantom referrer.
+            let phantom = Digest::Sha256(
+                "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff".into(),
+            );
+            metadata_store
+                .update_links(
+                    namespace,
+                    &[LinkOperation::create_with_referrer(
+                        LinkKind::Layer(layer_digest.clone()),
+                        layer_digest.clone(),
+                        phantom.clone(),
+                    )],
+                )
+                .await
+                .unwrap();
+
+            let checker = LinkReferencesChecker::new(blob_store.clone(), metadata_store.clone());
+            let mut sink: Vec<Action> = Vec::new();
+            checker.check(namespace, &mut sink).await.unwrap();
+
+            assert!(
+                sink.iter().any(|a| matches!(
+                    a,
+                    Action::RemoveReferrer { referrer, .. } if *referrer == phantom
+                )),
+                "Vec sink must capture a RemoveReferrer action for the phantom"
+            );
+
+            // On-disk state must be unchanged under a Vec sink.
+            let unchanged = metadata_store
+                .read_link(namespace, &LinkKind::Layer(layer_digest.clone()), false)
+                .await
+                .unwrap();
+            assert!(
+                unchanged.referenced_by.contains(&phantom),
+                "on-disk referenced_by must be unchanged under Vec sink"
+            );
+            test_case.cleanup().await;
+        }
     }
 }

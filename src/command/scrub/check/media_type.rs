@@ -11,9 +11,9 @@ use crate::{
         error::Error,
         executor::ActionSink,
     },
-    oci::{Digest, Manifest},
+    oci::Manifest,
     registry::{
-        blob_store::BlobStore,
+        blob_store::{self, BlobStore},
         metadata_store::{MetadataStore, link_kind::LinkKind},
     },
 };
@@ -51,7 +51,34 @@ impl MediaTypeChecker {
             return Ok(());
         }
 
-        let media_type = self.read_media_type(&metadata.target).await?;
+        let content = match self.blob_store.read(&metadata.target).await {
+            Ok(content) => content,
+            Err(blob_store::Error::BlobNotFound | blob_store::Error::ReferenceNotFound) => {
+                warn!(
+                    "Manifest blob missing for {display_name} ({}); removing revision link",
+                    metadata.target
+                );
+                return sink
+                    .apply(Action::DeleteOrphanManifest {
+                        namespace: namespace.to_string(),
+                        digest: metadata.target,
+                    })
+                    .await;
+            }
+            Err(e) => return Err(e.into()),
+        };
+
+        let media_type = match serde_json::from_slice::<Manifest>(&content) {
+            Ok(manifest) => manifest.media_type,
+            Err(e) => {
+                warn!(
+                    "Failed to deserialize manifest for {}: {e}",
+                    metadata.target
+                );
+                None
+            }
+        };
+
         let Some(media_type) = media_type else {
             debug!("{display_name} has no media_type in manifest, skipping");
             return Ok(());
@@ -93,17 +120,6 @@ impl MediaTypeChecker {
             }
         }
         Ok(())
-    }
-
-    async fn read_media_type(&self, digest: &Digest) -> Result<Option<String>, Error> {
-        let content = self.blob_store.read(digest).await?;
-        match serde_json::from_slice::<Manifest>(&content) {
-            Ok(manifest) => Ok(manifest.media_type),
-            Err(e) => {
-                warn!("Failed to deserialize manifest for {digest}: {e}");
-                Ok(None)
-            }
-        }
     }
 }
 
@@ -147,7 +163,7 @@ mod tests {
         command::scrub::{action::Action, executor::Executor},
         oci::Namespace,
         registry::{
-            metadata_store::MetadataStoreExt,
+            metadata_store::LinkOperation,
             test_utils::{self, NoopMultipart, backends},
         },
     };
@@ -192,12 +208,22 @@ mod tests {
                 .await
                 .unwrap();
 
-            let mut tx = metadata_store.begin_transaction(namespace);
-            tx.create_link(&LinkKind::Digest(manifest_digest.clone()), &manifest_digest)
-                .add();
-            tx.create_link(&LinkKind::Tag("latest".to_string()), &manifest_digest)
-                .add();
-            tx.commit().await.unwrap();
+            metadata_store
+                .update_links(
+                    namespace,
+                    &[
+                        LinkOperation::create(
+                            LinkKind::Digest(manifest_digest.clone()),
+                            manifest_digest.clone(),
+                        ),
+                        LinkOperation::create(
+                            LinkKind::Tag("latest".to_string()),
+                            manifest_digest.clone(),
+                        ),
+                    ],
+                )
+                .await
+                .unwrap();
 
             let digest_link = metadata_store
                 .read_link(namespace, &LinkKind::Digest(manifest_digest.clone()), false)
@@ -261,14 +287,24 @@ mod tests {
                 .await
                 .unwrap();
 
-            let mut tx = metadata_store.begin_transaction(namespace);
-            tx.create_link(&LinkKind::Digest(manifest_digest.clone()), &manifest_digest)
-                .with_media_type(media_type)
-                .add();
-            tx.create_link(&LinkKind::Tag("latest".to_string()), &manifest_digest)
-                .with_media_type(media_type)
-                .add();
-            tx.commit().await.unwrap();
+            metadata_store
+                .update_links(
+                    namespace,
+                    &[
+                        LinkOperation::create_with_media_type(
+                            LinkKind::Digest(manifest_digest.clone()),
+                            manifest_digest.clone(),
+                            Some(media_type.to_string()),
+                        ),
+                        LinkOperation::create_with_media_type(
+                            LinkKind::Tag("latest".to_string()),
+                            manifest_digest.clone(),
+                            Some(media_type.to_string()),
+                        ),
+                    ],
+                )
+                .await
+                .unwrap();
 
             let checker = MediaTypeChecker::new(blob_store.clone(), metadata_store.clone());
             let mut sink: Vec<Action> = Vec::new();
@@ -319,12 +355,22 @@ mod tests {
                 .await
                 .unwrap();
 
-            let mut tx = metadata_store.begin_transaction(namespace);
-            tx.create_link(&LinkKind::Digest(manifest_digest.clone()), &manifest_digest)
-                .add();
-            tx.create_link(&LinkKind::Tag("latest".to_string()), &manifest_digest)
-                .add();
-            tx.commit().await.unwrap();
+            metadata_store
+                .update_links(
+                    namespace,
+                    &[
+                        LinkOperation::create(
+                            LinkKind::Digest(manifest_digest.clone()),
+                            manifest_digest.clone(),
+                        ),
+                        LinkOperation::create(
+                            LinkKind::Tag("latest".to_string()),
+                            manifest_digest.clone(),
+                        ),
+                    ],
+                )
+                .await
+                .unwrap();
 
             let checker = MediaTypeChecker::new(blob_store.clone(), metadata_store.clone());
             let mut sink: Vec<Action> = Vec::new();
@@ -344,6 +390,216 @@ mod tests {
                 sink.iter()
                     .any(|a| matches!(a, Action::SetMediaType { .. })),
                 "Vec sink must capture SetMediaType actions"
+            );
+            test_case.cleanup().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn media_type_checker_emits_delete_orphan_manifest_when_revision_blob_missing() {
+        for test_case in backends() {
+            let namespace = &Namespace::new("test-repo/mt-missing-rev").unwrap();
+            let registry = test_case.registry();
+            let metadata_store = test_case.metadata_store();
+            let blob_store = test_case.blob_store();
+
+            let media_type = "application/vnd.oci.image.manifest.v1+json";
+
+            let (config_digest, _) =
+                test_utils::create_test_blob(registry, namespace, b"config for mt-missing-rev")
+                    .await;
+
+            let manifest_content = format!(
+                r#"{{
+                "schemaVersion": 2,
+                "mediaType": "{media_type}",
+                "config": {{
+                    "mediaType": "application/vnd.oci.image.config.v1+json",
+                    "digest": "{config_digest}",
+                    "size": 123
+                }},
+                "layers": []
+            }}"#
+            );
+
+            let manifest_digest = blob_store
+                .create(manifest_content.as_bytes())
+                .await
+                .unwrap();
+
+            metadata_store
+                .update_links(
+                    namespace,
+                    &[LinkOperation::create(
+                        LinkKind::Digest(manifest_digest.clone()),
+                        manifest_digest.clone(),
+                    )],
+                )
+                .await
+                .unwrap();
+
+            blob_store.delete(&manifest_digest).await.unwrap();
+
+            let checker = MediaTypeChecker::new(blob_store.clone(), metadata_store.clone());
+            let mut executor = Executor::new(
+                blob_store.clone(),
+                metadata_store.clone(),
+                test_case.upload_store(),
+                std::sync::Arc::new(NoopMultipart),
+            );
+            checker.check(namespace, &mut executor).await.unwrap();
+
+            assert!(
+                metadata_store
+                    .read_link(namespace, &LinkKind::Digest(manifest_digest.clone()), false,)
+                    .await
+                    .is_err(),
+                "revision link must be removed when manifest blob is missing"
+            );
+            test_case.cleanup().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn media_type_checker_emits_delete_orphan_manifest_when_tag_target_blob_missing() {
+        for test_case in backends() {
+            let namespace = &Namespace::new("test-repo/mt-missing-tag").unwrap();
+            let registry = test_case.registry();
+            let metadata_store = test_case.metadata_store();
+            let blob_store = test_case.blob_store();
+
+            let media_type = "application/vnd.oci.image.manifest.v1+json";
+
+            let (config_digest, _) =
+                test_utils::create_test_blob(registry, namespace, b"config for mt-missing-tag")
+                    .await;
+
+            let manifest_content = format!(
+                r#"{{
+                "schemaVersion": 2,
+                "mediaType": "{media_type}",
+                "config": {{
+                    "mediaType": "application/vnd.oci.image.config.v1+json",
+                    "digest": "{config_digest}",
+                    "size": 123
+                }},
+                "layers": []
+            }}"#
+            );
+
+            let manifest_digest = blob_store
+                .create(manifest_content.as_bytes())
+                .await
+                .unwrap();
+
+            metadata_store
+                .update_links(
+                    namespace,
+                    &[
+                        LinkOperation::create(
+                            LinkKind::Digest(manifest_digest.clone()),
+                            manifest_digest.clone(),
+                        ),
+                        LinkOperation::create(
+                            LinkKind::Tag("dangling-mt".to_string()),
+                            manifest_digest.clone(),
+                        ),
+                    ],
+                )
+                .await
+                .unwrap();
+
+            blob_store.delete(&manifest_digest).await.unwrap();
+
+            let checker = MediaTypeChecker::new(blob_store.clone(), metadata_store.clone());
+            let mut executor = Executor::new(
+                blob_store.clone(),
+                metadata_store.clone(),
+                test_case.upload_store(),
+                std::sync::Arc::new(NoopMultipart),
+            );
+            checker.check(namespace, &mut executor).await.unwrap();
+
+            assert!(
+                metadata_store
+                    .read_link(namespace, &LinkKind::Digest(manifest_digest.clone()), false,)
+                    .await
+                    .is_err(),
+                "digest revision link must be removed when manifest blob is missing"
+            );
+            assert!(
+                metadata_store
+                    .read_link(namespace, &LinkKind::Tag("dangling-mt".to_string()), false,)
+                    .await
+                    .is_err(),
+                "tag link must be removed when target manifest blob is missing"
+            );
+            test_case.cleanup().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn media_type_checker_dry_run_captures_delete_orphan_manifest() {
+        for test_case in backends() {
+            let namespace = &Namespace::new("test-repo/mt-dry-missing").unwrap();
+            let registry = test_case.registry();
+            let metadata_store = test_case.metadata_store();
+            let blob_store = test_case.blob_store();
+
+            let media_type = "application/vnd.oci.image.manifest.v1+json";
+
+            let (config_digest, _) =
+                test_utils::create_test_blob(registry, namespace, b"config for mt-dry-missing")
+                    .await;
+
+            let manifest_content = format!(
+                r#"{{
+                "schemaVersion": 2,
+                "mediaType": "{media_type}",
+                "config": {{
+                    "mediaType": "application/vnd.oci.image.config.v1+json",
+                    "digest": "{config_digest}",
+                    "size": 123
+                }},
+                "layers": []
+            }}"#
+            );
+
+            let manifest_digest = blob_store
+                .create(manifest_content.as_bytes())
+                .await
+                .unwrap();
+
+            metadata_store
+                .update_links(
+                    namespace,
+                    &[LinkOperation::create(
+                        LinkKind::Digest(manifest_digest.clone()),
+                        manifest_digest.clone(),
+                    )],
+                )
+                .await
+                .unwrap();
+
+            blob_store.delete(&manifest_digest).await.unwrap();
+
+            let checker = MediaTypeChecker::new(blob_store.clone(), metadata_store.clone());
+            let mut sink: Vec<Action> = Vec::new();
+            checker.check(namespace, &mut sink).await.unwrap();
+
+            assert!(
+                sink.iter().any(|a| matches!(
+                    a,
+                    Action::DeleteOrphanManifest { digest, .. } if *digest == manifest_digest
+                )),
+                "Vec sink must capture DeleteOrphanManifest action"
+            );
+            assert!(
+                metadata_store
+                    .read_link(namespace, &LinkKind::Digest(manifest_digest.clone()), false,)
+                    .await
+                    .is_ok(),
+                "revision link must not be touched under Vec sink"
             );
             test_case.cleanup().await;
         }

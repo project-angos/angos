@@ -557,6 +557,8 @@ The registry is:
 - **O(1) list performance** — Instead of O(n) tree walk, `list_namespaces` becomes a single file read.
 - **No background jobs** — The registry is built on demand, not via a separate garbage collector or background process.
 
+The registry is append-only at runtime: namespaces are added when their first link is written, but never removed by the delete path. Periodic `angos scrub` rebuilds the registry by re-walking storage, so a namespace whose last artifact is deleted disappears from `list_namespaces` on the next scrub run. Between server-driven deletes and the next scrub, the `_catalog` endpoint may continue to return the namespace name. Because namespace names are stable identifiers rather than a count of live artifacts, clients that probe per-namespace before assuming content exists are unaffected.
+
 #### Legacy Blob Index Migration
 
 Angos deployed before version v1.1.0 used a single `index.json` file per blob. This is automatically migrated to the sharded format on first read with no manual intervention:
@@ -568,6 +570,29 @@ Angos deployed before version v1.1.0 used a single `index.json` file per blob. T
 5. Subsequent reads use the sharded format
 
 The migration is transparent and happens exactly once per blob. You can verify migration progress by monitoring S3 operations or checking logs for "Migrated legacy blob index" messages.
+
+#### Blob Index Convergence
+
+The blob index is the cross-namespace map of which namespaces reference each
+blob. It is stored per-blob, sharded by namespace under
+`v2/blobs/<algo>/<prefix>/<hash>/refs/<safe_ns>.json`.
+
+The write path adds entries on push and removes them on successful delete.
+Mid-flight failures or out-of-band edits can leave stale entries pointing to
+namespaces that no longer exist.
+
+Periodic `angos scrub -b` reconciles every blob-index entry against
+`MetadataStore::read_link`. Entries that fail the probe are removed, and a
+shard whose entries all disappear is itself deleted. The empty `refs/`
+directory is pruned too. This convergence only runs when `-b` is part of the
+invocation — omitting it means stale shards accumulate indefinitely.
+
+Blob ownership markers (`LinkKind::Blob`) are intentionally retained until the
+client issues an explicit `DELETE /v2/<name>/blobs/<digest>`. They are not
+removed when a namespace's manifests are deleted. When scrub detects that a
+referenced blob's backing bytes are absent, however, the entire blob-index entry
+— including any ownership markers — is purged, so runtime `can_read` no longer
+reports the blob as accessible.
 
 ### Caching
 

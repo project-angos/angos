@@ -3,10 +3,11 @@ use std::{collections::HashMap, sync::Arc};
 use crate::{
     cache::{self, Cache},
     registry::{
-        Repository,
+        self, Repository,
         blob_store::{self, BlobStoreHandles},
-        metadata_store::{ConditionalCapabilities, MetadataStore, MetadataStoreConfig},
+        metadata_store::{self, ConditionalCapabilities, MetadataStore, MetadataStoreConfig},
         repository,
+        repository_resolver::{OverlapError, RepositoryResolver},
     },
 };
 
@@ -21,14 +22,16 @@ pub enum Error {
     #[error("failed to initialize blob store: {0}")]
     BlobStore(blob_store::Error),
     #[error("failed to initialize metadata store: {0}")]
-    MetadataStore(#[from] crate::registry::metadata_store::Error),
+    MetadataStore(#[from] metadata_store::Error),
     #[error("failed to initialize cache: {0}")]
     Cache(#[from] cache::Error),
     #[error("failed to initialize repository '{name}': {source}")]
     Repository {
         name: String,
-        source: Box<crate::registry::Error>,
+        source: Box<registry::Error>,
     },
+    #[error("repository configuration is invalid: {0}")]
+    Overlap(#[from] OverlapError),
 }
 
 impl From<blob_store::Error> for Error {
@@ -84,7 +87,7 @@ pub async fn repositories(
     configs: &HashMap<String, repository::Config>,
     auth_cache: &Arc<Cache>,
     max_manifest_size_bytes: usize,
-) -> Result<Arc<HashMap<String, Repository>>, Error> {
+) -> Result<Arc<RepositoryResolver>, Error> {
     let mut map = HashMap::with_capacity(configs.len());
     for (name, config) in configs {
         map.insert(
@@ -92,7 +95,8 @@ pub async fn repositories(
             repository(name, config, auth_cache, max_manifest_size_bytes).await?,
         );
     }
-    Ok(Arc::new(map))
+    let resolver = RepositoryResolver::new(Arc::new(map))?;
+    Ok(Arc::new(resolver))
 }
 
 #[cfg(test)]
@@ -101,7 +105,7 @@ mod tests {
     use crate::{
         cache,
         policy::{AccessMode, AccessPolicyConfig},
-        registry::manifest::DEFAULT_MAX_MANIFEST_SIZE_BYTES,
+        registry::{manifest::DEFAULT_MAX_MANIFEST_SIZE_BYTES, repository},
     };
 
     #[test]
@@ -139,6 +143,35 @@ mod tests {
         let result = repositories(&configs, &cache, DEFAULT_MAX_MANIFEST_SIZE_BYTES).await;
         assert!(result.is_ok());
         assert_eq!(result.unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn repositories_overlapping_prefixes_fails() {
+        let mut configs = HashMap::new();
+        configs.insert(
+            "team".to_string(),
+            repository::Config {
+                access_policy: AccessPolicyConfig {
+                    default: AccessMode::Allow,
+                    ..AccessPolicyConfig::default()
+                },
+                ..repository::Config::default()
+            },
+        );
+        configs.insert(
+            "team/app".to_string(),
+            repository::Config {
+                access_policy: AccessPolicyConfig {
+                    default: AccessMode::Allow,
+                    ..AccessPolicyConfig::default()
+                },
+                ..repository::Config::default()
+            },
+        );
+        let cache = auth_cache(&cache::Config::Memory).unwrap();
+        let result = repositories(&configs, &cache, DEFAULT_MAX_MANIFEST_SIZE_BYTES).await;
+        assert!(result.is_err());
+        assert!(matches!(result.unwrap_err(), Error::Overlap(_)));
     }
 
     #[test]

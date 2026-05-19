@@ -190,8 +190,8 @@ pub fn build_delete_ops(
 /// - `cache_put` / `cache_invalidate`: cache integration (no-op default for FS).
 /// - `apply_pending_blob_index_ops`: how accumulated blob-index operations are
 ///   flushed after `apply_link_operations` completes.
-/// - `after_update`: optional hook called after a successful transaction; S3
-///   uses this to register the namespace, FS does nothing.
+/// - `after_update`: optional hook called after a successful `update_links`
+///   run; S3 uses it to register the namespace, FS does nothing.
 ///
 /// The shared pre-lock / under-lock / apply helpers are provided as default
 /// methods so each backend only needs to implement the storage primitives.
@@ -241,10 +241,10 @@ pub trait LockOps: Send + Sync {
         pending_blob_ops: HashMap<Digest, Vec<BlobIndexOperation>>,
     ) -> Result<(), Error>;
 
-    /// Hook called after a successful transaction, outside the lock.
+    /// Hook called after a successful `update_links` run, outside the lock.
     ///
     /// S3 uses this to register the namespace in the namespace registry when
-    /// creates were part of the transaction. FS does nothing. The default
+    /// creates were part of the operation set. FS does nothing. The default
     /// implementation is a no-op that always returns `Ok(())`.
     async fn after_update(&self, _namespace: &str, _had_creates: bool) -> Result<(), Error> {
         Ok(())

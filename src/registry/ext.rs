@@ -253,13 +253,13 @@ fn parent_refs_for(
 impl Registry {
     #[instrument(skip(self))]
     pub async fn get_repositories_info(&self) -> Result<JsonResponse, Error> {
-        let mut repositories = Vec::with_capacity(self.repositories.len());
+        let mut repositories = Vec::with_capacity(self.resolver.len());
 
-        for name in self.repositories.keys() {
+        for name in self.resolver.keys() {
             let namespaces = self.list_repository_namespaces(name).await?;
             let config = self.get_repository_config(name);
             repositories.push(RepositoryInfo {
-                name: name.clone(),
+                name: name.to_string(),
                 namespace_count: namespaces.len(),
                 pull_through_cache: config.pull_through_cache,
                 immutable_tags: config.immutable_tags,
@@ -369,7 +369,7 @@ impl Registry {
     fn get_repository_config(&self, name: &str) -> RepositoryConfig {
         let global_exclusions = || self.global_immutable_tags_exclusions.clone();
 
-        let Some(repo) = self.repositories.get(name) else {
+        let Some(repo) = self.resolver.get(name) else {
             return RepositoryConfig {
                 pull_through_cache: false,
                 upstream_urls: Vec::new(),
@@ -526,7 +526,7 @@ impl Registry {
     }
 
     async fn list_repository_namespaces(&self, repository: &str) -> Result<Vec<String>, Error> {
-        if !self.repositories.contains_key(repository) {
+        if !self.resolver.contains_key(repository) {
             return Err(Error::NameUnknown);
         }
 

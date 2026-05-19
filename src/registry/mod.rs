@@ -1,4 +1,4 @@
-use std::{collections::HashMap, fmt::Debug, sync::Arc};
+use std::{collections::HashMap, fmt, sync::Arc};
 
 use tracing::instrument;
 
@@ -17,6 +17,7 @@ pub mod metadata_store;
 pub mod pagination;
 mod path_builder;
 pub mod repository;
+pub mod repository_resolver;
 pub mod task_queue;
 #[cfg(test)]
 pub mod test_utils;
@@ -26,7 +27,7 @@ pub mod version;
 pub use blob::{BlobRange, GetBlobResponse};
 pub use error::Error;
 pub use headers::{HeaderMap, ResponseHeaders};
-pub use manifest::{GetManifestResponse, ParsedManifestDigests, parse_manifest_digests};
+pub use manifest::{GetManifestResponse, parse_manifest_digests};
 pub use repository::Repository;
 pub use upload::StartUploadResponse;
 
@@ -49,11 +50,12 @@ pub use crate::policy::AccessPolicy;
 use crate::{
     cache,
     configuration::RegexPattern,
-    oci::{Digest, Namespace, namespace_belongs_to},
+    oci::{Digest, Namespace},
     registry::{
         blob_ownership::BlobOwnership,
         blob_store::{BlobStore, Error as BlobStoreError, PresignedBlobStore, UploadStore},
         metadata_store::{Error as MetadataError, MetadataStore},
+        repository_resolver::RepositoryResolver,
         task_queue::TaskQueue,
     },
 };
@@ -126,7 +128,7 @@ pub struct Registry {
     upload_store: Arc<dyn UploadStore>,
     presigned_blob_store: Option<Arc<dyn PresignedBlobStore>>,
     metadata_store: Arc<dyn MetadataStore + Send + Sync>,
-    repositories: Arc<HashMap<String, Repository>>,
+    resolver: Arc<RepositoryResolver>,
     enable_blob_redirect: bool,
     enable_manifest_redirect: bool,
     update_pull_time: bool,
@@ -136,8 +138,8 @@ pub struct Registry {
     max_manifest_size_bytes: usize,
 }
 
-impl Debug for Registry {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Debug for Registry {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Registry").finish()
     }
 }
@@ -148,7 +150,7 @@ impl Registry {
         upload_store,
         presigned_blob_store,
         metadata_store,
-        repositories,
+        resolver,
         config
     ))]
     pub fn new(
@@ -156,7 +158,7 @@ impl Registry {
         upload_store: Arc<dyn UploadStore>,
         presigned_blob_store: Option<Arc<dyn PresignedBlobStore>>,
         metadata_store: Arc<dyn MetadataStore>,
-        repositories: Arc<HashMap<String, Repository>>,
+        resolver: Arc<RepositoryResolver>,
         config: RegistryConfig,
     ) -> Result<Self, Error> {
         let res = Self {
@@ -167,7 +169,7 @@ impl Registry {
             upload_store,
             presigned_blob_store,
             metadata_store,
-            repositories,
+            resolver,
             task_queue: TaskQueue::new(config.concurrent_cache_jobs)?,
             global_immutable_tags: config.global_immutable_tags,
             global_immutable_tags_exclusions: config.global_immutable_tags_exclusions,
@@ -194,11 +196,7 @@ impl Registry {
         &self,
         namespace: &Namespace,
     ) -> Result<&Repository, Error> {
-        self.repositories
-            .iter()
-            .find(|(name, _)| namespace_belongs_to(namespace.as_ref(), name))
-            .map(|(_, repository)| repository)
-            .ok_or(Error::NameUnknown)
+        self.resolver.resolve(namespace).ok_or(Error::NameUnknown)
     }
 
     /// Resolves the configured repository name for a namespace, or empty string

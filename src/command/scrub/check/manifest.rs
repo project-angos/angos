@@ -11,7 +11,11 @@ use crate::{
         executor::ActionSink,
     },
     oci::Digest,
-    registry::{blob_store::BlobStore, metadata_store::MetadataStore, parse_manifest_digests},
+    registry::{
+        blob_store::BlobStore,
+        metadata_store::{MetadataStore, link_kind::LinkKind},
+        parse_manifest_digests,
+    },
 };
 
 pub struct ManifestChecker {
@@ -36,6 +40,15 @@ impl ManifestChecker {
         revision: &Digest,
         sink: &mut (dyn ActionSink + Send),
     ) -> Result<(), Error> {
+        ensure_link(
+            &self.metadata_store,
+            namespace,
+            &LinkKind::Digest(revision.clone()),
+            revision,
+            sink,
+        )
+        .await?;
+
         let content = self.blob_store.read(revision).await?;
         let manifest = parse_manifest_digests(&content, None)?;
 
@@ -70,12 +83,14 @@ impl NamespaceChecker for ManifestChecker {
 
 #[cfg(test)]
 mod tests {
+    use std::str::FromStr;
+
     use super::*;
     use crate::{
-        command::scrub::executor::Executor,
+        command::scrub::{action::Action, executor::Executor},
         oci::Namespace,
         registry::{
-            metadata_store::{MetadataStoreExt, link_kind::LinkKind},
+            metadata_store::{LinkOperation, link_kind::LinkKind},
             test_utils::{self, NoopMultipart, backends},
         },
     };
@@ -118,10 +133,16 @@ mod tests {
                 .await
                 .unwrap();
 
-            let mut tx = metadata_store.begin_transaction(namespace);
-            tx.create_link(&LinkKind::Digest(manifest_digest.clone()), &manifest_digest)
-                .add();
-            tx.commit().await.unwrap();
+            metadata_store
+                .update_links(
+                    namespace,
+                    &[LinkOperation::create(
+                        LinkKind::Digest(manifest_digest.clone()),
+                        manifest_digest.clone(),
+                    )],
+                )
+                .await
+                .unwrap();
 
             let mut executor = Executor::new(
                 blob_store.clone(),
@@ -143,6 +164,191 @@ mod tests {
 
             assert!(config_link.is_ok());
             assert!(layer_link.is_ok());
+            test_case.cleanup().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn manifest_checker_repairs_digest_link_with_mismatched_target() {
+        for test_case in backends() {
+            let namespace = &Namespace::new("test-repo/digest-repair").unwrap();
+            let registry = test_case.registry();
+            let metadata_store = test_case.metadata_store();
+            let blob_store = test_case.blob_store();
+
+            let (config_digest, _) =
+                test_utils::create_test_blob(registry, namespace, b"config for digest repair")
+                    .await;
+            let (layer_digest, _) =
+                test_utils::create_test_blob(registry, namespace, b"layer for digest repair").await;
+
+            let manifest_content = format!(
+                r#"{{
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "config": {{
+                "mediaType": "application/vnd.oci.image.config.v1+json",
+                "digest": "{config_digest}",
+                "size": 123
+            }},
+            "layers": [
+                {{
+                    "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+                    "digest": "{layer_digest}",
+                    "size": 456
+                }}
+            ]
+        }}"#
+            );
+
+            let manifest_digest = blob_store
+                .create(manifest_content.as_bytes())
+                .await
+                .unwrap();
+
+            metadata_store
+                .update_links(
+                    namespace,
+                    &[LinkOperation::create(
+                        LinkKind::Digest(manifest_digest.clone()),
+                        manifest_digest.clone(),
+                    )],
+                )
+                .await
+                .unwrap();
+
+            let wrong_digest = Digest::from_str(
+                "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            )
+            .unwrap();
+
+            metadata_store
+                .update_links(
+                    namespace,
+                    &[LinkOperation::create(
+                        LinkKind::Digest(manifest_digest.clone()),
+                        wrong_digest,
+                    )],
+                )
+                .await
+                .unwrap();
+
+            let mut executor = Executor::new(
+                blob_store.clone(),
+                metadata_store.clone(),
+                test_case.upload_store(),
+                std::sync::Arc::new(NoopMultipart),
+            );
+
+            let scrubber = ManifestChecker::new(blob_store.clone(), metadata_store.clone());
+            scrubber.check(namespace, &mut executor).await.unwrap();
+
+            let link_meta = metadata_store
+                .read_link(namespace, &LinkKind::Digest(manifest_digest.clone()), false)
+                .await
+                .unwrap();
+
+            assert_eq!(
+                link_meta.target, manifest_digest,
+                "revision link target must be corrected back to the path digest"
+            );
+            test_case.cleanup().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn manifest_checker_emits_recreate_link_action_for_target_mismatch_in_dry_run() {
+        for test_case in backends() {
+            let namespace = &Namespace::new("test-repo/digest-dry-run").unwrap();
+            let registry = test_case.registry();
+            let metadata_store = test_case.metadata_store();
+            let blob_store = test_case.blob_store();
+
+            let (config_digest, _) =
+                test_utils::create_test_blob(registry, namespace, b"config for dry-run check")
+                    .await;
+            let (layer_digest, _) =
+                test_utils::create_test_blob(registry, namespace, b"layer for dry-run check").await;
+
+            let manifest_content = format!(
+                r#"{{
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "config": {{
+                "mediaType": "application/vnd.oci.image.config.v1+json",
+                "digest": "{config_digest}",
+                "size": 123
+            }},
+            "layers": [
+                {{
+                    "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+                    "digest": "{layer_digest}",
+                    "size": 456
+                }}
+            ]
+        }}"#
+            );
+
+            let manifest_digest = blob_store
+                .create(manifest_content.as_bytes())
+                .await
+                .unwrap();
+
+            metadata_store
+                .update_links(
+                    namespace,
+                    &[LinkOperation::create(
+                        LinkKind::Digest(manifest_digest.clone()),
+                        manifest_digest.clone(),
+                    )],
+                )
+                .await
+                .unwrap();
+
+            let wrong_digest = Digest::from_str(
+                "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            )
+            .unwrap();
+
+            metadata_store
+                .update_links(
+                    namespace,
+                    &[LinkOperation::create(
+                        LinkKind::Digest(manifest_digest.clone()),
+                        wrong_digest.clone(),
+                    )],
+                )
+                .await
+                .unwrap();
+
+            let mut sink: Vec<Action> = Vec::new();
+            let scrubber = ManifestChecker::new(blob_store.clone(), metadata_store.clone());
+            scrubber.check(namespace, &mut sink).await.unwrap();
+
+            let has_recreate = sink.iter().any(|a| {
+                matches!(
+                    a,
+                    Action::RecreateLink {
+                        link: LinkKind::Digest(d),
+                        target: t,
+                        ..
+                    } if d == &manifest_digest && t == &manifest_digest
+                )
+            });
+            assert!(
+                has_recreate,
+                "sink must contain RecreateLink for the corrupted revision digest link"
+            );
+
+            let stored_meta = metadata_store
+                .read_link(namespace, &LinkKind::Digest(manifest_digest.clone()), false)
+                .await
+                .unwrap();
+
+            assert_eq!(
+                stored_meta.target, wrong_digest,
+                "Vec sink must not mutate storage"
+            );
             test_case.cleanup().await;
         }
     }

@@ -1,16 +1,11 @@
-//! Transaction builder and lock-coordinated executor for `update_links`.
+//! Lock-coordinated engine for `update_links`.
 //!
-//! The public face of this module is [`Transaction`] (obtained via
-//! [`MetadataStoreExt::begin_transaction`]) and its associated builder
-//! [`CreateLinkBuilder`]. The [`run_link_transaction`] function is the shared
-//! distributed-lock engine used by the filesystem and S3 lock-coordinator
-//! backends.
-//!
-//! Both the filesystem and S3 (lock-coordinator) backends delegate their
-//! `update_links` implementation to [`run_link_transaction`]. The differences
-//! between the two paths — how blob-index operations are applied, and whether
-//! a namespace registration hook is needed — are expressed through the two
-//! extension methods added to [`LockOps`]:
+//! The [`run_update_links`] function is the shared distributed-lock engine
+//! used by the filesystem and S3 lock-coordinator backends. Both delegate their
+//! `update_links` implementation here. The differences between the two paths —
+//! how blob-index operations are applied, and whether a namespace registration
+//! hook is needed — are expressed through the two extension methods on
+//! [`LockOps`]:
 //! [`apply_pending_blob_index_ops`](LockOps::apply_pending_blob_index_ops) and
 //! [`after_update`](LockOps::after_update).
 //!
@@ -22,7 +17,7 @@ use std::collections::HashMap;
 use crate::{
     oci::{Descriptor, Digest},
     registry::metadata_store::{
-        Error, MetadataStore,
+        Error,
         link_kind::LinkKind,
         lock::LockBackend,
         lock_ops::{LockOps, ValidationResult},
@@ -51,7 +46,7 @@ pub const MAX_UPDATE_RETRIES: u32 = 10;
 /// Returns `Error::Lock` when the retry count is exhausted or when the lock is
 /// invalidated by a heartbeat failure. Propagates any storage error from the
 /// underlying reads, writes, or blob-index updates.
-pub async fn run_link_transaction<L: LockOps>(
+pub async fn run_update_links<L: LockOps>(
     backend: &L,
     lock: &(dyn LockBackend + Send + Sync),
     namespace: &str,
@@ -175,107 +170,72 @@ pub enum LinkOperation {
     },
 }
 
-pub struct Transaction<'a> {
-    store: &'a (dyn MetadataStore + Send + Sync),
-    namespace: String,
-    operations: Vec<LinkOperation>,
-}
-
-/// Builder for a single `Create` link operation within a [`Transaction`].
-///
-/// Obtain one via [`Transaction::create_link`] and finalize it by calling [`add`](Self::add).
-pub struct CreateLinkBuilder<'tx, 'store: 'tx> {
-    tx: &'tx mut Transaction<'store>,
-    link: LinkKind,
-    target: Digest,
-    referrer: Option<Digest>,
-    media_type: Option<String>,
-    descriptor: Option<Descriptor>,
-}
-
-impl<'tx, 'store: 'tx> CreateLinkBuilder<'tx, 'store> {
-    /// Associates a referrer digest with this link.
-    pub fn with_referrer(mut self, referrer: &Digest) -> Self {
-        self.referrer = Some(referrer.clone());
-        self
-    }
-
-    /// Associates a media type with this link.
-    pub fn with_media_type(mut self, media_type: &str) -> Self {
-        self.media_type = Some(media_type.to_string());
-        self
-    }
-
-    /// Associates a media type with this link when `media_type` is `Some`.
-    pub fn with_optional_media_type(self, media_type: Option<&str>) -> Self {
-        match media_type {
-            Some(mt) => self.with_media_type(mt),
-            None => self,
-        }
-    }
-
-    /// Associates an OCI descriptor with this link.
-    pub fn with_descriptor(mut self, descriptor: Descriptor) -> Self {
-        self.descriptor = Some(descriptor);
-        self
-    }
-
-    /// Appends the operation to the enclosing transaction.
-    pub fn add(self) {
-        self.tx.operations.push(LinkOperation::Create {
-            link: self.link,
-            target: self.target,
-            referrer: self.referrer,
-            media_type: self.media_type,
-            descriptor: self.descriptor.map(Box::new),
-        });
-    }
-}
-
-impl<'store> Transaction<'store> {
-    pub fn new(store: &'store (dyn MetadataStore + Send + Sync), namespace: String) -> Self {
-        Transaction {
-            store,
-            namespace,
-            operations: Vec::new(),
-        }
-    }
-
-    pub fn create_link<'tx>(
-        &'tx mut self,
-        link: &LinkKind,
-        target: &Digest,
-    ) -> CreateLinkBuilder<'tx, 'store> {
-        CreateLinkBuilder {
-            tx: self,
-            link: link.clone(),
-            target: target.clone(),
+impl LinkOperation {
+    /// Creates a link with no referrer, media type, or descriptor.
+    pub fn create(link: LinkKind, target: Digest) -> Self {
+        Self::Create {
+            link,
+            target,
             referrer: None,
             media_type: None,
             descriptor: None,
         }
     }
 
-    pub fn delete_link(&mut self, link: &LinkKind) {
-        self.operations.push(LinkOperation::Delete {
-            link: link.clone(),
-            referrer: None,
-        });
-    }
-
-    pub fn delete_link_with_referrer(&mut self, link: &LinkKind, referrer: &Digest) {
-        self.operations.push(LinkOperation::Delete {
-            link: link.clone(),
-            referrer: Some(referrer.clone()),
-        });
-    }
-
-    pub async fn commit(self) -> Result<(), Error> {
-        if self.operations.is_empty() {
-            return Ok(());
+    /// Creates a link carrying a parent `referrer` digest.
+    pub fn create_with_referrer(link: LinkKind, target: Digest, referrer: Digest) -> Self {
+        Self::Create {
+            link,
+            target,
+            referrer: Some(referrer),
+            media_type: None,
+            descriptor: None,
         }
-        self.store
-            .update_links(&self.namespace, &self.operations)
-            .await
+    }
+
+    /// Creates a link carrying an optional `media_type`.
+    pub fn create_with_media_type(
+        link: LinkKind,
+        target: Digest,
+        media_type: Option<String>,
+    ) -> Self {
+        Self::Create {
+            link,
+            target,
+            referrer: None,
+            media_type,
+            descriptor: None,
+        }
+    }
+
+    /// Creates a link carrying a pre-computed `Descriptor` (referrer index entry).
+    pub fn create_with_descriptor(
+        link: LinkKind,
+        target: Digest,
+        descriptor: Box<Descriptor>,
+    ) -> Self {
+        Self::Create {
+            link,
+            target,
+            referrer: None,
+            media_type: None,
+            descriptor: Some(descriptor),
+        }
+    }
+
+    /// Deletes a link with no referrer qualification.
+    pub fn delete(link: LinkKind) -> Self {
+        Self::Delete {
+            link,
+            referrer: None,
+        }
+    }
+
+    /// Deletes a link qualified by a parent `referrer` digest.
+    pub fn delete_with_referrer(link: LinkKind, referrer: Digest) -> Self {
+        Self::Delete {
+            link,
+            referrer: Some(referrer),
+        }
     }
 }

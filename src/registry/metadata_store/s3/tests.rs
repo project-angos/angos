@@ -1272,3 +1272,32 @@ async fn test_probe_with_nonexistent_bucket_returns_err() {
         "Probe against a non-existent bucket must return Err, got: {result:?}"
     );
 }
+
+#[tokio::test]
+async fn test_rebuild_namespace_registry_includes_upload_only_namespace() {
+    let config = test_config();
+    let backend = Backend::new(&config, None).unwrap();
+    let namespace = "upload-only-ns/repo";
+    let uuid = uuid::Uuid::new_v4().to_string();
+
+    let upload_data_path = path_builder::upload_path(namespace, &uuid);
+    backend
+        .store
+        .put_object(&upload_data_path, bytes::Bytes::from_static(b"partial"))
+        .await
+        .unwrap();
+
+    backend.rebuild_namespace_registry().await.unwrap();
+
+    let (namespaces, _) = backend.list_namespaces(100, None).await.unwrap();
+    assert!(
+        namespaces.contains(&namespace.to_string()),
+        "list_namespaces must include a namespace that has only an _uploads artifact; got: {namespaces:?}"
+    );
+
+    backend
+        .store
+        .delete_prefix(&config.key_prefix)
+        .await
+        .unwrap();
+}

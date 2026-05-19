@@ -4,6 +4,24 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- New `scrub --referrers` flag: checks every revision in each namespace and removes any referrer link whose referrer manifest no longer has a current digest revision link, preventing ghost descriptors from appearing in the OCI Referrers API response.
+
+### Fixed
+
+- Scrub now flushes the metadata store's access-time buffer at exit so retention timestamps are persisted across runs on the S3 backend.
+- Scrub `--links` now prunes stale entries in a tracked link's `referenced_by` set whose corresponding revision no longer exists, preventing phantom parent digests from accumulating indefinitely. When removing the last referrer causes `referenced_by` to become empty the link and its blob-index entry are also removed, reclaiming storage.
+- Scrub `--links` and `--media-types` now remove revision links whose underlying manifest blob is permanently missing from storage, rather than silently skipping them on every run. A `DeleteOrphanManifest` action cascades to remove the digest link and every tag pointing at that digest; transient storage errors are still propagated so operators notice backend failures.
+- Scrub `--tags` now removes tags whose target manifest blob is missing from storage, rather than silently converging them to self-consistent but permanently broken metadata. A single `DeleteOrphanManifest` action per affected digest cascades to remove both the digest revision link and every tag link pointing at the same digest.
+- Scrub `-r` no longer aborts the entire namespace when one orphan manifest's blob is missing or unreadable: a legitimately absent blob is handled gracefully (metadata links are still removed), a transient storage error retries on the next run, and a failure on any single revision no longer prevents subsequent revisions in the same namespace from being processed.
+- Scrub orphan-blob deletion now acquires the blob-data lock and re-checks ownership before deleting, preventing a concurrent upload from losing its bytes when scrub classifies the blob as orphan between the upload hashing step and the ownership grant.
+- Scrub on S3 now converges namespaces whose only artifact is an upload session (e.g. a client that crashed mid-push): the namespace registry tree walk includes any namespace that has an underscore-prefixed child, matching filesystem backend behaviour. Such namespaces are now visible to `UploadChecker` and their stale bytes are cleaned up by `scrub --uploads`.
+- Scrub `-b` now purges all blob-index entries (including ownership markers) for any blob whose backing bytes are absent, so runtime `can_read` no longer reports such blobs as accessible to clients.
+- Scrub `-m` now validates that each revision's digest link points back at the revision's own digest, and rewrites the link when a mismatch is found. The check runs before the manifest blob is read, so a corrupt link is repaired even when its blob is unreachable.
+
 ## [1.2.0]
 
 ### Added
@@ -37,6 +55,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - The S3 backend now uses a custom HTTP client in place of the AWS SDK: focused retry / timeout / signing tailored to the operations the registry actually issues, smaller binary, and no AWS SDK transitive dependencies.
 - Filesystem cleanup of empty ancestor directories is depth-bounded (2 levels for blob shards, 3 for index and namespace-registry shards, 4 for link containers) and rooted-subtree guarded; a misshaped path can never walk above the configured root.
 - UI, documentation-website and Rust dependencies upgraded.
+- Scrub's orphan manifest deletion now plans link operations through the same `link_plan::delete` primitive used by the runtime write path, eliminating divergence between scrub and runtime decisions about which links to remove. As a consequence, scrub also removes any tag links still pointing at an orphaned manifest digest (previously left dangling).
+- Scrub's orphan manifest deletion tolerates manifest blobs that fail to parse: it removes the digest link (and any tags pointing at it) so the next pass can clean up the dangling config/layer/child links. Blob-read failures are still surfaced so operators notice broken storage.
+- Overlapping repository prefixes (e.g. `team` and `team/app`) are rejected at startup rather than resolved non-deterministically at runtime.
 
 #### Performance
 
@@ -57,6 +78,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- Scrub's orphan manifest deletion now uses `delete_with_referrer` for tracked links (config, layer, child-manifest), preventing spurious link removal for blobs still referenced by other manifests.
 - Hardened S3 uploads and blob-index locking against contention and partial-failure scenarios.
 - Failed upload cleanups no longer abort the client request; orphaned S3 probe objects are surfaced via warning instead of silently leaking.
 - Multipart uploads and parts are aborted on drop or panic, so failed uploads don't leave orphans on S3.

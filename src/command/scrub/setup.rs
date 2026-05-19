@@ -1,4 +1,4 @@
-use std::{collections::HashMap, sync::Arc};
+use std::sync::Arc;
 
 use chrono::Duration;
 use tracing::info;
@@ -8,16 +8,17 @@ use crate::{
     command::scrub::{
         check::{
             BlobChecker, LayoutChecker, LinkReferencesChecker, ManifestChecker, MediaTypeChecker,
-            MultipartChecker, NamespaceChecker, RetentionChecker, TagChecker, UploadChecker,
+            MultipartChecker, NamespaceChecker, ReferrerChecker, RetentionChecker, TagChecker,
+            UploadChecker,
         },
         error::Error,
     },
     configuration::Configuration,
     policy::{RetentionPolicy, RetentionPolicyConfig, SystemClock},
     registry::{
-        Repository,
         blob_store::{BlobStore, MultipartCleanup, UploadStore},
         metadata_store::MetadataStore,
+        repository_resolver::RepositoryResolver,
     },
 };
 
@@ -38,7 +39,7 @@ pub fn namespace_checkers(
     blob_store: &Arc<dyn BlobStore>,
     upload_store: &Arc<dyn UploadStore>,
     metadata_store: &Arc<dyn MetadataStore + Send + Sync>,
-    repositories: &Arc<HashMap<String, Repository>>,
+    resolver: &Arc<RepositoryResolver>,
 ) -> Result<Vec<Box<dyn NamespaceChecker>>, Error> {
     let mut checkers: Vec<Box<dyn NamespaceChecker>> = Vec::new();
 
@@ -46,7 +47,7 @@ pub fn namespace_checkers(
         let policy = global_retention_policy(&config.global.retention_policy);
         checkers.push(Box::new(RetentionChecker::new(
             metadata_store.clone(),
-            repositories.clone(),
+            resolver.clone(),
             policy,
         )));
     }
@@ -65,7 +66,10 @@ pub fn namespace_checkers(
     }
 
     if options.tags {
-        checkers.push(Box::new(TagChecker::new(metadata_store.clone())));
+        checkers.push(Box::new(TagChecker::new(
+            blob_store.clone(),
+            metadata_store.clone(),
+        )));
     }
 
     if options.manifests {
@@ -87,6 +91,10 @@ pub fn namespace_checkers(
             blob_store.clone(),
             metadata_store.clone(),
         )));
+    }
+
+    if options.referrers {
+        checkers.push(Box::new(ReferrerChecker::new(metadata_store.clone())));
     }
 
     Ok(checkers)

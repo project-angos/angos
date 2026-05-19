@@ -21,7 +21,7 @@ pub mod lock;
 pub mod lock_ops;
 pub mod referrer_resolver;
 pub mod s3;
-pub mod transaction;
+pub mod update_links;
 
 #[cfg(test)]
 mod tests;
@@ -31,7 +31,7 @@ pub use capabilities::ConditionalCapabilities;
 pub use config::MetadataStoreConfig;
 pub use link_metadata::LinkMetadata;
 pub use lock::{LockGuard, LockStrategy, redis::LockConfig};
-pub use transaction::{LinkOperation, ResolvedCreate, ResolvedDelete, Transaction};
+pub use update_links::{LinkOperation, ResolvedCreate, ResolvedDelete};
 
 use crate::registry::metadata_store::link_kind::LinkKind;
 
@@ -49,16 +49,6 @@ pub fn simple_jitter(max_ms: u64) -> u64 {
         return 0;
     }
     RandomState::new().build_hasher().finish() % max_ms
-}
-
-pub trait MetadataStoreExt {
-    fn begin_transaction(&self, namespace: &str) -> Transaction<'_>;
-}
-
-impl MetadataStoreExt for dyn MetadataStore + Send + Sync {
-    fn begin_transaction(&self, namespace: &str) -> Transaction<'_> {
-        Transaction::new(self, namespace.to_string())
-    }
 }
 
 #[async_trait]

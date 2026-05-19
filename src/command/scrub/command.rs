@@ -56,6 +56,9 @@ pub struct Options {
     #[argh(switch, short = 'M')]
     /// backfill missing `media_type` on manifest links
     pub media_types: bool,
+    #[argh(switch, short = 'R')]
+    /// check for and remove orphan referrer links whose referrer manifest is no longer a current revision
+    pub referrers: bool,
 }
 
 pub struct Command {
@@ -120,7 +123,7 @@ impl Command {
         self.scrub_metadata().await?;
         self.scrub_blobs().await?;
         self.scrub_multipart_uploads().await?;
-
+        self.metadata_store.flush_access_times().await;
         Ok(())
     }
 
@@ -212,6 +215,7 @@ mod tests {
             retention: true,
             links: false,
             media_types: false,
+            referrers: false,
         };
 
         let command = Command::new(&options, &config).await;

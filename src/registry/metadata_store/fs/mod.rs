@@ -26,7 +26,7 @@ use crate::{
             lock_ops::{LockOps, blob_index_lock_key, link_lock_key, with_validated_lock},
             referrer_resolver::resolve_referrer_descriptor,
             sharded::{self, NamespaceRegistry},
-            transaction,
+            update_links,
         },
         pagination, path_builder,
     },
@@ -647,7 +647,7 @@ impl MetadataStore for Backend {
         namespace: &str,
         operations: &[LinkOperation],
     ) -> Result<(), Error> {
-        transaction::run_link_transaction(self, &*self.lock, namespace, operations).await
+        update_links::run_update_links(self, &*self.lock, namespace, operations).await
     }
 }
 
