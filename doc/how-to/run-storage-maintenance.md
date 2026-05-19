@@ -35,8 +35,8 @@ The `scrub` command performs various maintenance operations. Each check must be 
 | `-r, --retention`             | Enforce retention policies (delete expired manifests)                                              |
 | `-u, --uploads <duration>`    | Remove incomplete uploads older than duration                                                      |
 | `-p, --multipart <duration>`  | Cleanup orphan S3 multipart uploads older than duration                                            |
-| `-l, --links`                 | Fix links format inconsistencies                                                                   |
-| `-M, --media-types`           | Backfill missing `media_type` on manifest links                                                    |
+| `-l, --links`                 | Fix links format inconsistencies; remove revisions whose manifest blob is missing                  |
+| `-M, --media-types`           | Backfill missing `media_type` on manifest links; remove revisions whose manifest blob is missing   |
 | `-R, --referrers`             | Check for and remove orphan referrer links whose referrer manifest is no longer a current revision |
 | `-d, --dry-run`               | Preview changes without applying them                                                              |
 

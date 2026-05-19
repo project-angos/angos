@@ -12,6 +12,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- Scrub `--links` and `--media-types` now remove revision links whose underlying manifest blob is permanently missing from storage, rather than silently skipping them on every run. A `DeleteOrphanManifest` action cascades to remove the digest link and every tag pointing at that digest; transient storage errors are still propagated so operators notice backend failures.
 - Scrub `--tags` now removes tags whose target manifest blob is missing from storage, rather than silently converging them to self-consistent but permanently broken metadata. A single `DeleteOrphanManifest` action per affected digest cascades to remove both the digest revision link and every tag link pointing at the same digest.
 - Scrub `-r` no longer aborts the entire namespace when one orphan manifest's blob is missing or unreadable: a legitimately absent blob is handled gracefully (metadata links are still removed), a transient storage error retries on the next run, and a failure on any single revision no longer prevents subsequent revisions in the same namespace from being processed.
 - Scrub orphan-blob deletion now acquires the blob-data lock and re-checks ownership before deleting, preventing a concurrent upload from losing its bytes when scrub classifies the blob as orphan between the upload hashing step and the ownership grant.

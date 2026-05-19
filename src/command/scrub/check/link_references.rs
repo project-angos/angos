@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use futures_util::StreamExt;
-use tracing::{debug, error};
+use tracing::{debug, error, warn};
 
 use crate::{
     command::scrub::{
@@ -13,7 +13,7 @@ use crate::{
     },
     oci::Digest,
     registry::{
-        blob_store::BlobStore,
+        blob_store::{self, BlobStore},
         metadata_store::{self, MetadataStore, link_kind::LinkKind},
         parse_manifest_digests,
     },
@@ -41,7 +41,20 @@ impl LinkReferencesChecker {
         revision: &Digest,
         sink: &mut (dyn ActionSink + Send),
     ) -> Result<(), Error> {
-        let content = self.blob_store.read(revision).await?;
+        let content = match self.blob_store.read(revision).await {
+            Ok(content) => content,
+            Err(blob_store::Error::BlobNotFound | blob_store::Error::ReferenceNotFound) => {
+                warn!("Manifest blob missing for revision {revision}; removing revision link");
+                return sink
+                    .apply(Action::DeleteOrphanManifest {
+                        namespace: namespace.to_string(),
+                        digest: revision.clone(),
+                    })
+                    .await;
+            }
+            Err(e) => return Err(e.into()),
+        };
+
         let manifest = parse_manifest_digests(&content, None)?;
 
         for (link, target) in manifest.referenced_links_for_revision(revision) {
@@ -369,6 +382,95 @@ mod tests {
             assert!(
                 matches!(config_result, Err(metadata_store::Error::ReferenceNotFound)),
                 "Config link should still not exist after check"
+            );
+            test_case.cleanup().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn link_references_checker_emits_delete_orphan_manifest_when_blob_missing() {
+        for test_case in backends() {
+            let namespace = &Namespace::new("test-repo/missing-blob").unwrap();
+            let registry = test_case.registry();
+            let metadata_store = test_case.metadata_store();
+            let blob_store = test_case.blob_store();
+
+            let (manifest_digest, _, _) = create_manifest_scenario(
+                registry,
+                &metadata_store,
+                &blob_store,
+                namespace,
+                b"config for missing-blob",
+                b"layer for missing-blob",
+            )
+            .await;
+
+            blob_store.delete(&manifest_digest).await.unwrap();
+
+            let checker = LinkReferencesChecker::new(blob_store.clone(), metadata_store.clone());
+            let mut executor = noop_executor(
+                blob_store.clone(),
+                metadata_store.clone(),
+                test_case.upload_store(),
+            );
+            checker.check(namespace, &mut executor).await.unwrap();
+
+            assert!(
+                metadata_store
+                    .read_link(
+                        namespace,
+                        &LinkKind::Digest(manifest_digest.clone()),
+                        false,
+                    )
+                    .await
+                    .is_err(),
+                "revision link must be removed when its manifest blob is missing"
+            );
+            test_case.cleanup().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn link_references_checker_dry_run_captures_delete_orphan_manifest() {
+        for test_case in backends() {
+            let namespace = &Namespace::new("test-repo/missing-blob-dry").unwrap();
+            let registry = test_case.registry();
+            let metadata_store = test_case.metadata_store();
+            let blob_store = test_case.blob_store();
+
+            let (manifest_digest, _, _) = create_manifest_scenario(
+                registry,
+                &metadata_store,
+                &blob_store,
+                namespace,
+                b"config for dry-run missing",
+                b"layer for dry-run missing",
+            )
+            .await;
+
+            blob_store.delete(&manifest_digest).await.unwrap();
+
+            let checker = LinkReferencesChecker::new(blob_store.clone(), metadata_store.clone());
+            let mut sink: Vec<Action> = Vec::new();
+            checker.check(namespace, &mut sink).await.unwrap();
+
+            assert!(
+                sink.iter().any(|a| matches!(
+                    a,
+                    Action::DeleteOrphanManifest { digest, .. } if *digest == manifest_digest
+                )),
+                "Vec sink must capture DeleteOrphanManifest action"
+            );
+            assert!(
+                metadata_store
+                    .read_link(
+                        namespace,
+                        &LinkKind::Digest(manifest_digest.clone()),
+                        false,
+                    )
+                    .await
+                    .is_ok(),
+                "revision link must not be touched under Vec sink"
             );
             test_case.cleanup().await;
         }
