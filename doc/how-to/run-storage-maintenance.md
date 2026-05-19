@@ -100,20 +100,24 @@ RUST_LOG=info ./angos -c config.toml scrub --tags --manifests --blobs --retentio
 
 ### Recommended Flags for Periodic Maintenance
 
-Always include `-b` (`--blobs`) in scheduled scrub jobs. The blob index is a
-cross-namespace map that records which namespaces reference each blob; its
-per-namespace shard files (`refs/<namespace>.json`) are only pruned when `-b`
-runs. Without it, shards for namespaces that have since been deleted accumulate
-indefinitely on both S3 and filesystem storage.
+Always include `-b` (`--blobs`) in scheduled scrub jobs. The blob index records
+which namespaces reference each blob; its per-namespace shard files
+(`refs/<namespace>.json`) are only pruned when `-b` runs. Without it, shards
+for deleted namespaces accumulate indefinitely.
 
-Blob ownership markers are intentionally kept until the client issues an
-explicit `DELETE /v2/<name>/blobs/<digest>` request. Scrub does not remove
-them when a namespace's manifests are deleted — this reflects the OCI blob
-lifecycle and is not a leak.
+Blob ownership markers are kept until the client issues an explicit
+`DELETE /v2/<name>/blobs/<digest>` request; scrub does not remove them when
+a namespace's manifests are deleted. This reflects the OCI blob lifecycle and
+is not a leak.
 
 Upload session cleanup is gated behind `-u <duration>`; without that flag,
 neither obsolete nor broken upload state is touched. Pass `-u` to schedules
 that should reclaim that storage.
+
+Namespace-registry convergence (removal of fully-emptied namespaces) happens
+during scrub's always-on layout migration and requires no additional flag;
+the namespace name remains visible to `_catalog` clients between deletes and
+the next scrub run.
 
 ### Systemd Timer
 

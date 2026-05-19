@@ -557,6 +557,8 @@ The registry is:
 - **O(1) list performance** — Instead of O(n) tree walk, `list_namespaces` becomes a single file read.
 - **No background jobs** — The registry is built on demand, not via a separate garbage collector or background process.
 
+The registry is append-only at runtime: namespaces are added when their first link is written, but never removed by the delete path. Periodic `angos scrub` rebuilds the registry by re-walking storage, so a namespace whose last artifact is deleted disappears from `list_namespaces` on the next scrub run. Between server-driven deletes and the next scrub, the `_catalog` endpoint may continue to return the namespace name. Because namespace names are stable identifiers rather than a count of live artifacts, clients that probe per-namespace before assuming content exists are unaffected.
+
 #### Legacy Blob Index Migration
 
 Angos deployed before version v1.1.0 used a single `index.json` file per blob. This is automatically migrated to the sharded format on first read with no manual intervention:

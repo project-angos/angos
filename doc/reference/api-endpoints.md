@@ -144,6 +144,8 @@ Query parameters:
 - `n` - Maximum number of results
 - `last` - Pagination marker
 
+The returned names reflect the namespace registry as of the last scrub run. A namespace emptied by a delete may briefly remain listed until the next `angos scrub` rebuilds the registry.
+
 ### Referrers
 
 ```
