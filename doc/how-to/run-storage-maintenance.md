@@ -29,7 +29,7 @@ The `scrub` command performs various maintenance operations. Each check must be 
 
 | Flag                          | Description                                                                                        |
 |-------------------------------|----------------------------------------------------------------------------------------------------|
-| `-t, --tags`                  | Check and fix invalid tag references                                                               |
+| `-t, --tags`                  | Check and fix tag references; remove tags whose target manifest blob is missing                    |
 | `-m, --manifests`             | Check and fix manifest inconsistencies                                                             |
 | `-b, --blobs`                 | Check for orphaned or corrupted blobs                                                              |
 | `-r, --retention`             | Enforce retention policies (delete expired manifests)                                              |

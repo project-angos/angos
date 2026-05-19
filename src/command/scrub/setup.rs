@@ -66,7 +66,10 @@ pub fn namespace_checkers(
     }
 
     if options.tags {
-        checkers.push(Box::new(TagChecker::new(metadata_store.clone())));
+        checkers.push(Box::new(TagChecker::new(
+            blob_store.clone(),
+            metadata_store.clone(),
+        )));
     }
 
     if options.manifests {
