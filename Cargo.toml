@@ -31,7 +31,8 @@ tempfile = "3.27"
 thiserror = "2.0.18"
 tokio = "1.52.3"
 tokio-util = { version = "0.7.18", features = ["io-util"] }
-tracing = "0.1.44"
+tracing = "0.1"
+tracing-opentelemetry = "0.33"
 url = "2.5.8"
 uuid = { version = "1.23.4", features = ["v4"] }
 wiremock = "0.6.5"
@@ -101,7 +102,7 @@ tokio-rustls = "0.26.4"
 tokio-util = { workspace = true, features = ["rt"] }
 toml = "1.1.2"
 tracing = { workspace = true }
-tracing-opentelemetry = { git = "https://github.com/tokio-rs/tracing-opentelemetry", rev = "1d5422f1f37932fd65e434da618b305d4c94ee9c" }
+tracing-opentelemetry = { workspace = true }
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"] }
 url = { workspace = true, features = ["serde"] }
 uuid = { workspace = true, features = ["serde"] }
