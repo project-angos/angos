@@ -49,6 +49,11 @@ pub enum Action {
         namespace: String,
         uuid: String,
     },
+    DeleteOrphanReferrer {
+        namespace: String,
+        subject: Digest,
+        referrer: Digest,
+    },
 }
 
 impl fmt::Display for Action {
@@ -116,6 +121,16 @@ impl fmt::Display for Action {
             }
             Action::DeleteExpiredUpload { namespace, uuid } => {
                 write!(f, "delete expired upload '{namespace}/{uuid}'")
+            }
+            Action::DeleteOrphanReferrer {
+                namespace,
+                subject,
+                referrer,
+            } => {
+                write!(
+                    f,
+                    "delete orphan referrer '{namespace}': subject {subject} <- {referrer}"
+                )
             }
         }
     }

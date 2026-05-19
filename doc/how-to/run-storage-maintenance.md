@@ -27,17 +27,18 @@ The `scrub` command runs as a **separate periodic process** that operates alongs
 
 The `scrub` command performs various maintenance operations. Each check must be explicitly enabled:
 
-| Flag                          | Description                                             |
-|-------------------------------|---------------------------------------------------------|
-| `-t, --tags`                  | Check and fix invalid tag references                    |
-| `-m, --manifests`             | Check and fix manifest inconsistencies                  |
-| `-b, --blobs`                 | Check for orphaned or corrupted blobs                   |
-| `-r, --retention`             | Enforce retention policies (delete expired manifests)   |
-| `-u, --uploads <duration>`    | Remove incomplete uploads older than duration           |
-| `-p, --multipart <duration>`  | Cleanup orphan S3 multipart uploads older than duration |
-| `-l, --links`                 | Fix links format inconsistencies                        |
-| `-M, --media-types`           | Backfill missing `media_type` on manifest links         |
-| `-d, --dry-run`               | Preview changes without applying them                   |
+| Flag                          | Description                                                                                        |
+|-------------------------------|----------------------------------------------------------------------------------------------------|
+| `-t, --tags`                  | Check and fix invalid tag references                                                               |
+| `-m, --manifests`             | Check and fix manifest inconsistencies                                                             |
+| `-b, --blobs`                 | Check for orphaned or corrupted blobs                                                              |
+| `-r, --retention`             | Enforce retention policies (delete expired manifests)                                              |
+| `-u, --uploads <duration>`    | Remove incomplete uploads older than duration                                                      |
+| `-p, --multipart <duration>`  | Cleanup orphan S3 multipart uploads older than duration                                            |
+| `-l, --links`                 | Fix links format inconsistencies                                                                   |
+| `-M, --media-types`           | Backfill missing `media_type` on manifest links                                                    |
+| `-R, --referrers`             | Check for and remove orphan referrer links whose referrer manifest is no longer a current revision |
+| `-d, --dry-run`               | Preview changes without applying them                                                              |
 
 ---
 

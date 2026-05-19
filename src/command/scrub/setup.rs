@@ -8,7 +8,8 @@ use crate::{
     command::scrub::{
         check::{
             BlobChecker, LayoutChecker, LinkReferencesChecker, ManifestChecker, MediaTypeChecker,
-            MultipartChecker, NamespaceChecker, RetentionChecker, TagChecker, UploadChecker,
+            MultipartChecker, NamespaceChecker, ReferrerChecker, RetentionChecker, TagChecker,
+            UploadChecker,
         },
         error::Error,
     },
@@ -87,6 +88,10 @@ pub fn namespace_checkers(
             blob_store.clone(),
             metadata_store.clone(),
         )));
+    }
+
+    if options.referrers {
+        checkers.push(Box::new(ReferrerChecker::new(metadata_store.clone())));
     }
 
     Ok(checkers)

@@ -73,17 +73,18 @@ The scrub command performs storage maintenance and integrity checks. You must sp
 
 **Options:**
 
-| Option                    | Short  | Description                                                                |
-|---------------------------|--------|----------------------------------------------------------------------------|
-| `--dry-run`               | `-d`   | Preview what would be removed without making changes                       |
-| `--uploads <duration>`    | `-u`   | Check for incomplete uploads older than duration (e.g., `1h`, `30m`, `2d`) |
-| `--multipart <duration>`  | `-p`   | Cleanup orphan S3 multipart uploads older than duration (S3 only)          |
-| `--tags`                  | `-t`   | Check for invalid tag digests                                              |
-| `--manifests`             | `-m`   | Check for manifest inconsistencies                                         |
-| `--blobs`                 | `-b`   | Check for blob inconsistencies and corruption                              |
-| `--retention`             | `-r`   | Enforce retention policies                                                 |
-| `--links`                 | `-l`   | Fix links format inconsistencies (migration/repair)                        |
-| `--media-types`           | `-M`   | Backfill missing `media_type` on manifest links                            |
+| Option                    | Short  | Description                                                                                        |
+|---------------------------|--------|----------------------------------------------------------------------------------------------------|
+| `--dry-run`               | `-d`   | Preview what would be removed without making changes                                               |
+| `--uploads <duration>`    | `-u`   | Check for incomplete uploads older than duration (e.g., `1h`, `30m`, `2d`)                         |
+| `--multipart <duration>`  | `-p`   | Cleanup orphan S3 multipart uploads older than duration (S3 only)                                  |
+| `--tags`                  | `-t`   | Check for invalid tag digests                                                                      |
+| `--manifests`             | `-m`   | Check for manifest inconsistencies                                                                 |
+| `--blobs`                 | `-b`   | Check for blob inconsistencies and corruption                                                      |
+| `--retention`             | `-r`   | Enforce retention policies                                                                         |
+| `--links`                 | `-l`   | Fix links format inconsistencies (migration/repair)                                                |
+| `--media-types`           | `-M`   | Backfill missing `media_type` on manifest links                                                    |
+| `--referrers`             | `-R`   | Check for and remove orphan referrer links whose referrer manifest is no longer a current revision |
 
 **Examples:**
 

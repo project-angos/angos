@@ -181,6 +181,18 @@ impl ActionSink for Executor {
             Action::DeleteExpiredUpload { namespace, uuid } => {
                 self.upload_store.delete(&namespace, &uuid).await?;
             }
+            Action::DeleteOrphanReferrer {
+                namespace,
+                subject,
+                referrer,
+            } => {
+                self.metadata_store
+                    .update_links(
+                        &namespace,
+                        &[LinkOperation::delete(LinkKind::Referrer(subject, referrer))],
+                    )
+                    .await?;
+            }
         }
 
         Ok(())
@@ -433,6 +445,78 @@ mod tests {
             assert!(
                 blob_store.read(&digest).await.is_ok(),
                 "blob with a reference must not be deleted"
+            );
+            test_case.cleanup().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn executor_delete_orphan_referrer_removes_referrer_link() {
+        for test_case in backends() {
+            let blob_store = test_case.blob_store();
+            let metadata_store = test_case.metadata_store();
+            let upload_store = test_case.upload_store();
+
+            let namespace = "test-repo/referrer-exec";
+
+            let subject_digest = blob_store.create(b"subject for referrer exec").await.unwrap();
+            let referrer_digest = blob_store.create(b"referrer for referrer exec").await.unwrap();
+
+            metadata_store
+                .update_links(
+                    namespace,
+                    &[
+                        LinkOperation::create(
+                            LinkKind::Digest(subject_digest.clone()),
+                            subject_digest.clone(),
+                        ),
+                        LinkOperation::create(
+                            LinkKind::Referrer(subject_digest.clone(), referrer_digest.clone()),
+                            referrer_digest.clone(),
+                        ),
+                    ],
+                )
+                .await
+                .unwrap();
+
+            assert!(
+                metadata_store
+                    .read_link(
+                        namespace,
+                        &LinkKind::Referrer(subject_digest.clone(), referrer_digest.clone()),
+                        false,
+                    )
+                    .await
+                    .is_ok(),
+                "Referrer link must exist before applying the action"
+            );
+
+            let mut executor = Executor::new(
+                blob_store.clone(),
+                metadata_store.clone(),
+                upload_store,
+                Arc::new(NoopMultipart),
+            );
+
+            executor
+                .apply(Action::DeleteOrphanReferrer {
+                    namespace: namespace.to_string(),
+                    subject: subject_digest.clone(),
+                    referrer: referrer_digest.clone(),
+                })
+                .await
+                .unwrap();
+
+            assert!(
+                metadata_store
+                    .read_link(
+                        namespace,
+                        &LinkKind::Referrer(subject_digest.clone(), referrer_digest.clone()),
+                        false,
+                    )
+                    .await
+                    .is_err(),
+                "Referrer link must be removed after applying the action"
             );
             test_case.cleanup().await;
         }
