@@ -1,13 +1,13 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::{
     command::scrub::{action::Action, error::Error},
     oci::{Manifest, Reference},
     registry::{
-        blob_store::{BlobStore, MultipartCleanup, OrphanMultipartUpload, UploadStore},
+        blob_store::{self, BlobStore, MultipartCleanup, OrphanMultipartUpload, UploadStore},
         manifest::{find_tags_pointing_at, link_plan},
         metadata_store::{BlobIndexOperation, LinkOperation, MetadataStore, link_kind::LinkKind},
     },
@@ -129,8 +129,17 @@ impl ActionSink for Executor {
                     .await?;
             }
             Action::DeleteOrphanManifest { namespace, digest } => {
-                let content = self.blob_store.read(&digest).await?;
-                let manifest = Manifest::from_slice(&content).ok();
+                let manifest = match self.blob_store.read(&digest).await {
+                    Ok(content) => Manifest::from_slice(&content).ok(),
+                    Err(
+                        blob_store::Error::BlobNotFound
+                        | blob_store::Error::ReferenceNotFound,
+                    ) => {
+                        warn!("Manifest blob missing for {digest}, proceeding with metadata-only deletion");
+                        None
+                    }
+                    Err(e) => return Err(Error::from(e)),
+                };
                 let tags = find_tags_pointing_at(self.metadata_store.as_ref(), &namespace, &digest)
                     .await?;
                 let ops = link_plan::delete(&Reference::Digest(digest), manifest.as_ref(), &tags);
@@ -164,7 +173,10 @@ mod tests {
     use super::*;
     use crate::{
         oci::Digest,
-        registry::test_utils::{NoopMultipart, backends},
+        registry::{
+            metadata_store::{LinkOperation, link_kind::LinkKind},
+            test_utils::{NoopMultipart, backends},
+        },
     };
 
     #[tokio::test]
@@ -213,6 +225,111 @@ mod tests {
             assert!(
                 blob_store.read(&orphan_digest).await.is_err(),
                 "real-run must delete the blob"
+            );
+            test_case.cleanup().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn executor_delete_orphan_manifest_missing_blob_still_removes_digest_link() {
+        for test_case in backends() {
+            let blob_store = test_case.blob_store();
+            let metadata_store = test_case.metadata_store();
+            let upload_store = test_case.upload_store();
+
+            let namespace = "test-repo/app";
+
+            // Write manifest blob and create a digest link, then delete the blob.
+            let content = b"orphan manifest content for missing-blob test";
+            let digest = blob_store.create(content).await.unwrap();
+            metadata_store
+                .update_links(
+                    namespace,
+                    &[LinkOperation::create(
+                        LinkKind::Digest(digest.clone()),
+                        digest.clone(),
+                    )],
+                )
+                .await
+                .unwrap();
+            blob_store.delete(&digest).await.unwrap();
+
+            let mut executor = Executor::new(
+                blob_store.clone(),
+                metadata_store.clone(),
+                upload_store,
+                Arc::new(NoopMultipart),
+            );
+
+            executor
+                .apply(Action::DeleteOrphanManifest {
+                    namespace: namespace.to_string(),
+                    digest: digest.clone(),
+                })
+                .await
+                .unwrap();
+
+            assert!(
+                metadata_store
+                    .read_link(namespace, &LinkKind::Digest(digest.clone()), false)
+                    .await
+                    .is_err(),
+                "digest link must be removed even when the blob is missing"
+            );
+            test_case.cleanup().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn executor_delete_orphan_manifest_missing_blob_removes_tag_link() {
+        for test_case in backends() {
+            let blob_store = test_case.blob_store();
+            let metadata_store = test_case.metadata_store();
+            let upload_store = test_case.upload_store();
+
+            let namespace = "test-repo/app";
+
+            let content = b"orphan manifest with tag - missing blob";
+            let digest = blob_store.create(content).await.unwrap();
+            metadata_store
+                .update_links(
+                    namespace,
+                    &[
+                        LinkOperation::create(
+                            LinkKind::Digest(digest.clone()),
+                            digest.clone(),
+                        ),
+                        LinkOperation::create(
+                            LinkKind::Tag("dangling".to_string()),
+                            digest.clone(),
+                        ),
+                    ],
+                )
+                .await
+                .unwrap();
+            blob_store.delete(&digest).await.unwrap();
+
+            let mut executor = Executor::new(
+                blob_store.clone(),
+                metadata_store.clone(),
+                upload_store,
+                Arc::new(NoopMultipart),
+            );
+
+            executor
+                .apply(Action::DeleteOrphanManifest {
+                    namespace: namespace.to_string(),
+                    digest: digest.clone(),
+                })
+                .await
+                .unwrap();
+
+            assert!(
+                metadata_store
+                    .read_link(namespace, &LinkKind::Tag("dangling".to_string()), false)
+                    .await
+                    .is_err(),
+                "tag link pointing at missing-blob digest must be removed"
             );
             test_case.cleanup().await;
         }

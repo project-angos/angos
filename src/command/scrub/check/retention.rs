@@ -3,7 +3,7 @@ use std::{cmp::Reverse, sync::Arc};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use futures_util::{StreamExt, future::join_all};
-use tracing::debug;
+use tracing::{debug, error};
 
 use crate::{
     command::scrub::{
@@ -338,8 +338,12 @@ impl RetentionChecker {
         let mut revisions = list_all::revisions(&self.metadata_store, namespace);
         while let Some(digest) = revisions.next().await {
             let digest = digest?;
-            self.process_orphan_revision(namespace, &digest, last_pushed, last_pulled, sink)
-                .await?;
+            if let Err(e) = self
+                .process_orphan_revision(namespace, &digest, last_pushed, last_pulled, sink)
+                .await
+            {
+                error!("Failed to check revision from '{namespace}' (revision '{digest}'): {e}");
+            }
         }
 
         Ok(())
@@ -928,6 +932,73 @@ mod tests {
             "Vec sink must not delete the tag"
         );
         test_case.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn retention_checker_continues_after_missing_blob_in_one_revision() {
+        for test_case in backends() {
+            let namespace = "test-repo/app";
+            let blob_store = test_case.blob_store();
+            let metadata_store = test_case.metadata_store();
+
+            // First revision: write blob, then delete it so the executor encounters a missing blob.
+            let digest_missing = blob_store.create(TEST_MANIFEST).await.unwrap();
+            metadata_store
+                .update_links(
+                    namespace,
+                    &[LinkOperation::create(
+                        LinkKind::Digest(digest_missing.clone()),
+                        digest_missing.clone(),
+                    )],
+                )
+                .await
+                .unwrap();
+            blob_store.delete(&digest_missing).await.unwrap();
+
+            // Second revision: healthy manifest blob with a digest link.
+            let digest_healthy = blob_store.create(TEST_INDEX).await.unwrap();
+            metadata_store
+                .update_links(
+                    namespace,
+                    &[LinkOperation::create(
+                        LinkKind::Digest(digest_healthy.clone()),
+                        digest_healthy.clone(),
+                    )],
+                )
+                .await
+                .unwrap();
+
+            let policy = Arc::new(RetentionPolicy::new(
+                &RetentionPolicyConfig {
+                    rules: vec![CelRule::compile("image.tag != null").unwrap()],
+                },
+                Arc::new(SystemClock),
+            ));
+
+            let mut executor = make_executor(
+                test_case.blob_store(),
+                test_case.metadata_store(),
+                test_case.upload_store(),
+            );
+            let resolver = Arc::new(
+                RepositoryResolver::new(test_utils::create_test_repositories())
+                    .expect("test repositories must not have overlapping prefixes"),
+            );
+            RetentionChecker::new(metadata_store.clone(), resolver, Some(policy))
+                .check(namespace, &mut executor)
+                .await
+                .unwrap();
+
+            // The healthy revision must be cleaned up — the broken one did not block the loop.
+            assert!(
+                metadata_store
+                    .read_link(namespace, &LinkKind::Digest(digest_healthy), false)
+                    .await
+                    .is_err(),
+                "healthy revision after the broken one must still be processed"
+            );
+            test_case.cleanup().await;
+        }
     }
 
     fn make_manifest(tag: &str) -> ManifestImage {
