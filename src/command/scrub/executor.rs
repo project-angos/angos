@@ -9,7 +9,10 @@ use crate::{
     registry::{
         blob_store::{self, BlobStore, MultipartCleanup, OrphanMultipartUpload, UploadStore},
         manifest::{find_tags_pointing_at, link_plan},
-        metadata_store::{BlobIndexOperation, LinkOperation, MetadataStore, link_kind::LinkKind},
+        metadata_store::{
+            BlobIndexOperation, Error as MetadataStoreError, LinkOperation, MetadataStore,
+            link_kind::LinkKind,
+        },
     },
 };
 
@@ -56,6 +59,7 @@ impl Executor {
 
 #[async_trait]
 impl ActionSink for Executor {
+    #[allow(clippy::too_many_lines)]
     async fn apply(&mut self, action: Action) -> Result<(), Error> {
         info!("{action}");
 
@@ -67,7 +71,36 @@ impl ActionSink for Executor {
                 self.metadata_store.migrate_blob_index(&digest).await?;
             }
             Action::DeleteOrphanBlob(digest) => {
-                self.blob_store.delete(&digest).await?;
+                let guard = self.metadata_store.acquire_blob_data_lock(&digest).await?;
+
+                let has_references = self.metadata_store.has_blob_references(&digest).await;
+                let delete_result = match has_references {
+                    Err(e) => Err(e.into()),
+                    Ok(true) => {
+                        info!("skipping orphan blob deletion: reference appeared for {digest}");
+                        Ok(())
+                    }
+                    Ok(false) => match self.blob_store.delete(&digest).await {
+                        Ok(())
+                        | Err(
+                            blob_store::Error::BlobNotFound | blob_store::Error::ReferenceNotFound,
+                        ) => Ok(()),
+                        Err(e) => Err(Error::from(e)),
+                    },
+                };
+
+                let lock_valid = guard.is_valid();
+                guard.release().await;
+                delete_result?;
+
+                if !lock_valid {
+                    return Err(
+                        MetadataStoreError::Lock(
+                            "lock invalidated during orphan blob deletion".into(),
+                        )
+                        .into(),
+                    );
+                }
             }
             Action::RemoveBlobIndexLink {
                 namespace,
@@ -330,6 +363,76 @@ mod tests {
                     .await
                     .is_err(),
                 "tag link pointing at missing-blob digest must be removed"
+            );
+            test_case.cleanup().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn executor_delete_orphan_blob_takes_blob_data_lock() {
+        for test_case in backends() {
+            let blob_store = test_case.blob_store();
+            let metadata_store = test_case.metadata_store();
+            let upload_store = test_case.upload_store();
+
+            let content = b"blob with no ownership entry";
+            let digest = blob_store.create(content).await.unwrap();
+
+            let mut executor = Executor::new(
+                blob_store.clone(),
+                metadata_store,
+                upload_store,
+                Arc::new(NoopMultipart),
+            );
+
+            executor
+                .apply(Action::DeleteOrphanBlob(digest.clone()))
+                .await
+                .unwrap();
+
+            assert!(
+                blob_store.read(&digest).await.is_err(),
+                "unreferenced blob must be deleted"
+            );
+            test_case.cleanup().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn executor_delete_orphan_blob_skips_when_reference_appears_between_classification_and_apply(
+    ) {
+        for test_case in backends() {
+            let blob_store = test_case.blob_store();
+            let metadata_store = test_case.metadata_store();
+            let upload_store = test_case.upload_store();
+
+            let content = b"blob that got ownership just in time";
+            let digest = blob_store.create(content).await.unwrap();
+
+            metadata_store
+                .update_blob_index(
+                    "test-repo/app",
+                    &digest,
+                    BlobIndexOperation::Insert(LinkKind::Blob(digest.clone())),
+                )
+                .await
+                .unwrap();
+
+            let mut executor = Executor::new(
+                blob_store.clone(),
+                metadata_store,
+                upload_store,
+                Arc::new(NoopMultipart),
+            );
+
+            executor
+                .apply(Action::DeleteOrphanBlob(digest.clone()))
+                .await
+                .unwrap();
+
+            assert!(
+                blob_store.read(&digest).await.is_ok(),
+                "blob with a reference must not be deleted"
             );
             test_case.cleanup().await;
         }
