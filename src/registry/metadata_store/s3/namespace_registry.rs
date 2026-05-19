@@ -145,11 +145,9 @@ impl Backend {
                 let mut children = Vec::new();
                 for entry in &prefixes {
                     if entry.starts_with('_') {
-                        if entry == "_manifests" {
-                            let namespace = prefix.strip_suffix('/').unwrap_or(&prefix);
-                            if !namespace.is_empty() {
-                                namespaces.push(namespace.to_string());
-                            }
+                        let namespace = prefix.strip_suffix('/').unwrap_or(&prefix);
+                        if !namespace.is_empty() {
+                            namespaces.push(namespace.to_string());
                         }
                         continue;
                     }
