@@ -94,12 +94,10 @@ impl ActionSink for Executor {
                 delete_result?;
 
                 if !lock_valid {
-                    return Err(
-                        MetadataStoreError::Lock(
-                            "lock invalidated during orphan blob deletion".into(),
-                        )
-                        .into(),
-                    );
+                    return Err(MetadataStoreError::Lock(
+                        "lock invalidated during orphan blob deletion".into(),
+                    )
+                    .into());
                 }
             }
             Action::RemoveBlobIndexLink {
@@ -164,11 +162,10 @@ impl ActionSink for Executor {
             Action::DeleteOrphanManifest { namespace, digest } => {
                 let manifest = match self.blob_store.read(&digest).await {
                     Ok(content) => Manifest::from_slice(&content).ok(),
-                    Err(
-                        blob_store::Error::BlobNotFound
-                        | blob_store::Error::ReferenceNotFound,
-                    ) => {
-                        warn!("Manifest blob missing for {digest}, proceeding with metadata-only deletion");
+                    Err(blob_store::Error::BlobNotFound | blob_store::Error::ReferenceNotFound) => {
+                        warn!(
+                            "Manifest blob missing for {digest}, proceeding with metadata-only deletion"
+                        );
                         None
                     }
                     Err(e) => return Err(Error::from(e)),
@@ -352,10 +349,7 @@ mod tests {
                 .update_links(
                     namespace,
                     &[
-                        LinkOperation::create(
-                            LinkKind::Digest(digest.clone()),
-                            digest.clone(),
-                        ),
+                        LinkOperation::create(LinkKind::Digest(digest.clone()), digest.clone()),
                         LinkOperation::create(
                             LinkKind::Tag("dangling".to_string()),
                             digest.clone(),
@@ -423,8 +417,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn executor_delete_orphan_blob_skips_when_reference_appears_between_classification_and_apply(
-    ) {
+    async fn executor_delete_orphan_blob_skips_when_reference_appears_between_classification_and_apply()
+     {
         for test_case in backends() {
             let blob_store = test_case.blob_store();
             let metadata_store = test_case.metadata_store();
@@ -471,8 +465,14 @@ mod tests {
 
             let namespace = "test-repo/referrer-exec";
 
-            let subject_digest = blob_store.create(b"subject for referrer exec").await.unwrap();
-            let referrer_digest = blob_store.create(b"referrer for referrer exec").await.unwrap();
+            let subject_digest = blob_store
+                .create(b"subject for referrer exec")
+                .await
+                .unwrap();
+            let referrer_digest = blob_store
+                .create(b"referrer for referrer exec")
+                .await
+                .unwrap();
 
             metadata_store
                 .update_links(
@@ -566,11 +566,7 @@ mod tests {
 
             // Confirm the layer link exists with the phantom referrer.
             let before = metadata_store
-                .read_link(
-                    namespace,
-                    &LinkKind::Layer(layer_digest.clone()),
-                    false,
-                )
+                .read_link(namespace, &LinkKind::Layer(layer_digest.clone()), false)
                 .await
                 .unwrap();
             assert!(
@@ -597,11 +593,7 @@ mod tests {
             // After removing the only referrer the link itself must be gone.
             assert!(
                 metadata_store
-                    .read_link(
-                        namespace,
-                        &LinkKind::Layer(layer_digest.clone()),
-                        false,
-                    )
+                    .read_link(namespace, &LinkKind::Layer(layer_digest.clone()), false,)
                     .await
                     .is_err(),
                 "layer link must be removed when referenced_by becomes empty"

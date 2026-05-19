@@ -207,9 +207,12 @@ mod tests {
             let metadata_store = test_case.metadata_store();
             let blob_store = test_case.blob_store();
 
-            let (blob_digest, _) =
-                test_utils::create_test_blob(registry, namespace, b"manifest for missing-blob test")
-                    .await;
+            let (blob_digest, _) = test_utils::create_test_blob(
+                registry,
+                namespace,
+                b"manifest for missing-blob test",
+            )
+            .await;
 
             metadata_store
                 .update_links(
@@ -260,7 +263,10 @@ mod tests {
             let blob_store = test_case.blob_store();
 
             // Write the blob and manually create digest + tag links so both are present.
-            let blob_digest = blob_store.create(b"manifest for dry-run test").await.unwrap();
+            let blob_digest = blob_store
+                .create(b"manifest for dry-run test")
+                .await
+                .unwrap();
             metadata_store
                 .update_links(
                     namespace,

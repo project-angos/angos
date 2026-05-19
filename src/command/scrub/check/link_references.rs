@@ -430,11 +430,7 @@ mod tests {
 
             assert!(
                 metadata_store
-                    .read_link(
-                        namespace,
-                        &LinkKind::Digest(manifest_digest.clone()),
-                        false,
-                    )
+                    .read_link(namespace, &LinkKind::Digest(manifest_digest.clone()), false,)
                     .await
                     .is_err(),
                 "revision link must be removed when its manifest blob is missing"
@@ -476,11 +472,7 @@ mod tests {
             );
             assert!(
                 metadata_store
-                    .read_link(
-                        namespace,
-                        &LinkKind::Digest(manifest_digest.clone()),
-                        false,
-                    )
+                    .read_link(namespace, &LinkKind::Digest(manifest_digest.clone()), false,)
                     .await
                     .is_ok(),
                 "revision link must not be touched under Vec sink"

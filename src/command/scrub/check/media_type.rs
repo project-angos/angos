@@ -71,7 +71,10 @@ impl MediaTypeChecker {
         let media_type = match serde_json::from_slice::<Manifest>(&content) {
             Ok(manifest) => manifest.media_type,
             Err(e) => {
-                warn!("Failed to deserialize manifest for {}: {e}", metadata.target);
+                warn!(
+                    "Failed to deserialize manifest for {}: {e}",
+                    metadata.target
+                );
                 None
             }
         };
@@ -118,7 +121,6 @@ impl MediaTypeChecker {
         }
         Ok(())
     }
-
 }
 
 #[async_trait]
@@ -449,11 +451,7 @@ mod tests {
 
             assert!(
                 metadata_store
-                    .read_link(
-                        namespace,
-                        &LinkKind::Digest(manifest_digest.clone()),
-                        false,
-                    )
+                    .read_link(namespace, &LinkKind::Digest(manifest_digest.clone()), false,)
                     .await
                     .is_err(),
                 "revision link must be removed when manifest blob is missing"
@@ -524,22 +522,14 @@ mod tests {
 
             assert!(
                 metadata_store
-                    .read_link(
-                        namespace,
-                        &LinkKind::Digest(manifest_digest.clone()),
-                        false,
-                    )
+                    .read_link(namespace, &LinkKind::Digest(manifest_digest.clone()), false,)
                     .await
                     .is_err(),
                 "digest revision link must be removed when manifest blob is missing"
             );
             assert!(
                 metadata_store
-                    .read_link(
-                        namespace,
-                        &LinkKind::Tag("dangling-mt".to_string()),
-                        false,
-                    )
+                    .read_link(namespace, &LinkKind::Tag("dangling-mt".to_string()), false,)
                     .await
                     .is_err(),
                 "tag link must be removed when target manifest blob is missing"
@@ -606,11 +596,7 @@ mod tests {
             );
             assert!(
                 metadata_store
-                    .read_link(
-                        namespace,
-                        &LinkKind::Digest(manifest_digest.clone()),
-                        false,
-                    )
+                    .read_link(namespace, &LinkKind::Digest(manifest_digest.clone()), false,)
                     .await
                     .is_ok(),
                 "revision link must not be touched under Vec sink"

@@ -77,9 +77,7 @@ impl NamespaceChecker for ReferrerChecker {
                 .check_referrers_for_revision(namespace, &revision, sink)
                 .await
             {
-                error!(
-                    "Failed to check referrers for '{namespace}' (revision '{revision}'): {e}"
-                );
+                error!("Failed to check referrers for '{namespace}' (revision '{revision}'): {e}");
             }
         }
 
@@ -173,13 +171,8 @@ mod tests {
                 .await
                 .unwrap();
 
-            let referrer_digest = push_referrer_link(
-                &metadata_store,
-                &blob_store,
-                namespace,
-                &subject_digest,
-            )
-            .await;
+            let referrer_digest =
+                push_referrer_link(&metadata_store, &blob_store, namespace, &subject_digest).await;
 
             // Verify the Referrer link exists.
             assert!(
@@ -249,13 +242,8 @@ mod tests {
                 .await
                 .unwrap();
 
-            let _referrer_digest = push_referrer_link(
-                &metadata_store,
-                &blob_store,
-                namespace,
-                &subject_digest,
-            )
-            .await;
+            let _referrer_digest =
+                push_referrer_link(&metadata_store, &blob_store, namespace, &subject_digest).await;
 
             let checker = ReferrerChecker::new(metadata_store.clone());
             let mut sink: Vec<Action> = Vec::new();
@@ -288,13 +276,8 @@ mod tests {
                 .await
                 .unwrap();
 
-            let referrer_digest = push_referrer_link(
-                &metadata_store,
-                &blob_store,
-                namespace,
-                &subject_digest,
-            )
-            .await;
+            let referrer_digest =
+                push_referrer_link(&metadata_store, &blob_store, namespace, &subject_digest).await;
 
             // Create orphan state.
             metadata_store

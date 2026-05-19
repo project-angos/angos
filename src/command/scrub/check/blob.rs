@@ -63,23 +63,21 @@ impl BlobChecker {
             BlobVerdict::Orphan => {
                 sink.apply(Action::DeleteOrphanBlob(blob.clone())).await?;
             }
-            BlobVerdict::Referenced(blob_index) => {
-                match self.blob_store.size(blob).await {
-                    Ok(_) => {
-                        for (namespace, references) in blob_index.namespace {
-                            for link in references {
-                                self.probe_and_cleanup_link(&namespace, blob, &link, sink)
-                                    .await;
-                            }
+            BlobVerdict::Referenced(blob_index) => match self.blob_store.size(blob).await {
+                Ok(_) => {
+                    for (namespace, references) in blob_index.namespace {
+                        for link in references {
+                            self.probe_and_cleanup_link(&namespace, blob, &link, sink)
+                                .await;
                         }
                     }
-                    Err(blob_store::Error::BlobNotFound | blob_store::Error::ReferenceNotFound) => {
-                        warn!("Blob {blob} has no bytes but index has entries; purging stale index");
-                        self.purge_blob_index(blob, blob_index, sink).await;
-                    }
-                    Err(e) => return Err(e.into()),
                 }
-            }
+                Err(blob_store::Error::BlobNotFound | blob_store::Error::ReferenceNotFound) => {
+                    warn!("Blob {blob} has no bytes but index has entries; purging stale index");
+                    self.purge_blob_index(blob, blob_index, sink).await;
+                }
+                Err(e) => return Err(e.into()),
+            },
         }
         Ok(())
     }

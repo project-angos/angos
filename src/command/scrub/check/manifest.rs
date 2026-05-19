@@ -177,7 +177,8 @@ mod tests {
             let blob_store = test_case.blob_store();
 
             let (config_digest, _) =
-                test_utils::create_test_blob(registry, namespace, b"config for digest repair").await;
+                test_utils::create_test_blob(registry, namespace, b"config for digest repair")
+                    .await;
             let (layer_digest, _) =
                 test_utils::create_test_blob(registry, namespace, b"layer for digest repair").await;
 
@@ -243,11 +244,7 @@ mod tests {
             scrubber.check(namespace, &mut executor).await.unwrap();
 
             let link_meta = metadata_store
-                .read_link(
-                    namespace,
-                    &LinkKind::Digest(manifest_digest.clone()),
-                    false,
-                )
+                .read_link(namespace, &LinkKind::Digest(manifest_digest.clone()), false)
                 .await
                 .unwrap();
 
@@ -268,7 +265,8 @@ mod tests {
             let blob_store = test_case.blob_store();
 
             let (config_digest, _) =
-                test_utils::create_test_blob(registry, namespace, b"config for dry-run check").await;
+                test_utils::create_test_blob(registry, namespace, b"config for dry-run check")
+                    .await;
             let (layer_digest, _) =
                 test_utils::create_test_blob(registry, namespace, b"layer for dry-run check").await;
 
@@ -343,11 +341,7 @@ mod tests {
             );
 
             let stored_meta = metadata_store
-                .read_link(
-                    namespace,
-                    &LinkKind::Digest(manifest_digest.clone()),
-                    false,
-                )
+                .read_link(namespace, &LinkKind::Digest(manifest_digest.clone()), false)
                 .await
                 .unwrap();
 
