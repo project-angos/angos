@@ -569,6 +569,26 @@ Angos deployed before version v1.1.0 used a single `index.json` file per blob. T
 
 The migration is transparent and happens exactly once per blob. You can verify migration progress by monitoring S3 operations or checking logs for "Migrated legacy blob index" messages.
 
+#### Blob Index Convergence
+
+The blob index is the cross-namespace map of which namespaces reference each
+blob. It is stored per-blob, sharded by namespace under
+`v2/blobs/<algo>/<prefix>/<hash>/refs/<safe_ns>.json`.
+
+The write path adds entries on push and removes them on successful delete.
+Mid-flight failures or out-of-band edits can leave stale entries pointing to
+namespaces that no longer exist.
+
+Periodic `angos scrub -b` reconciles every blob-index entry against
+`MetadataStore::read_link`. Entries that fail the probe are removed, and a
+shard whose entries all disappear is itself deleted. The empty `refs/`
+directory is pruned too. This convergence only runs when `-b` is part of the
+invocation — omitting it means stale shards accumulate indefinitely.
+
+Blob ownership markers (`LinkKind::Blob`) are intentionally retained until the
+client issues an explicit `DELETE /v2/<name>/blobs/<digest>`. They are not
+removed when a namespace's manifests are deleted.
+
 ### Caching
 
 Token and key caching reduces external requests:

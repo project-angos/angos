@@ -31,7 +31,7 @@ The `scrub` command performs various maintenance operations. Each check must be 
 |-------------------------------|----------------------------------------------------------------------------------------------------|
 | `-t, --tags`                  | Check and fix tag references; remove tags whose target manifest blob is missing                    |
 | `-m, --manifests`             | Check and fix manifest inconsistencies                                                             |
-| `-b, --blobs`                 | Check for orphaned or corrupted blobs                                                              |
+| `-b, --blobs`                 | Check for orphaned or corrupted blobs; prune stale blob-index entries for deleted namespaces       |
 | `-r, --retention`             | Enforce retention policies (delete expired manifests)                                              |
 | `-u, --uploads <duration>`    | Remove incomplete uploads older than duration                                                      |
 | `-p, --multipart <duration>`  | Cleanup orphan S3 multipart uploads older than duration                                            |
@@ -97,6 +97,19 @@ RUST_LOG=info ./angos -c config.toml scrub --tags --manifests --blobs --retentio
 # Weekly on Sunday at 2 AM
 0 2 * * 0 /usr/bin/angos -c /etc/registry/config.toml scrub --tags --manifests --blobs --retention
 ```
+
+### Recommended Flags for Periodic Maintenance
+
+Always include `-b` (`--blobs`) in scheduled scrub jobs. The blob index is a
+cross-namespace map that records which namespaces reference each blob; its
+per-namespace shard files (`refs/<namespace>.json`) are only pruned when `-b`
+runs. Without it, shards for namespaces that have since been deleted accumulate
+indefinitely on both S3 and filesystem storage.
+
+Blob ownership markers are intentionally kept until the client issues an
+explicit `DELETE /v2/<name>/blobs/<digest>` request. Scrub does not remove
+them when a namespace's manifests are deleted — this reflects the OCI blob
+lifecycle and is not a leak.
 
 ### Systemd Timer
 
