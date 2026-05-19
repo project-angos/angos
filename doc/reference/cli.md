@@ -76,7 +76,7 @@ The scrub command performs storage maintenance and integrity checks. You must sp
 | Option                    | Short  | Description                                                                                        |
 |---------------------------|--------|----------------------------------------------------------------------------------------------------|
 | `--dry-run`               | `-d`   | Preview what would be removed without making changes                                               |
-| `--uploads <duration>`    | `-u`   | Check for incomplete uploads older than duration (e.g., `1h`, `30m`, `2d`)                         |
+| `--uploads <duration>`    | `-u`   | Check upload sessions: remove broken or partial state and uploads older than the given duration (e.g., `1h`, `30m`, `2d`) |
 | `--multipart <duration>`  | `-p`   | Cleanup orphan S3 multipart uploads older than duration (S3 only)                                  |
 | `--tags`                  | `-t`   | Check and fix tag references; remove tags whose target manifest blob is missing                    |
 | `--manifests`             | `-m`   | Check for manifest inconsistencies                                                                 |

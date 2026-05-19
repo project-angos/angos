@@ -32,9 +32,7 @@ fn classify_upload(
 ) -> UploadVerdict {
     match summary {
         Ok(s) if now.signed_duration_since(s.started_at) > timeout => UploadVerdict::DeleteObsolete,
-        // Upload is healthy and within the timeout window.
         Ok(_) => UploadVerdict::Keep,
-        // Deterministic broken state: missing or corrupted summary.
         Err(
             blob_store::Error::UploadNotFound
             | blob_store::Error::ReferenceNotFound
@@ -43,7 +41,6 @@ fn classify_upload(
             | blob_store::Error::HashSerialization(_)
             | blob_store::Error::JSONSerialization(_),
         ) => UploadVerdict::DeleteInconsistent,
-        // Likely transient error (S3 throttle, network blip) — do not delete; retry on next run.
         Err(_) => UploadVerdict::Keep,
     }
 }
@@ -142,7 +139,6 @@ mod tests {
     fn classify_upload_keeps_recent_upload() {
         let timeout = Duration::hours(1);
         let now = fixed_now();
-        // Started 30 minutes ago — well within the timeout.
         let summary = summary_started_at(1800);
         let verdict = classify_upload(Ok(&summary), timeout, now);
         assert!(matches!(verdict, UploadVerdict::Keep));
@@ -152,7 +148,6 @@ mod tests {
     fn classify_upload_deletes_obsolete_upload() {
         let timeout = Duration::hours(1);
         let now = fixed_now();
-        // Started 2 hours ago — past the timeout.
         let summary = summary_started_at(7200);
         let verdict = classify_upload(Ok(&summary), timeout, now);
         assert!(matches!(verdict, UploadVerdict::DeleteObsolete));
@@ -162,7 +157,6 @@ mod tests {
     fn classify_upload_keeps_upload_at_exact_boundary() {
         let timeout = Duration::hours(1);
         let now = fixed_now();
-        // Started exactly timeout seconds ago — boundary case uses `>`, not `>=`.
         let summary = summary_started_at(3600);
         let verdict = classify_upload(Ok(&summary), timeout, now);
         assert!(matches!(verdict, UploadVerdict::Keep));
@@ -200,7 +194,6 @@ mod tests {
 
     #[test]
     fn classify_upload_keeps_on_storage_backend_error() {
-        // Transient S3 / network error must not cause deletion.
         let verdict = classify_upload(
             Err(&blob_store::Error::StorageBackend(
                 "S3 throttle".to_string(),

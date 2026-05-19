@@ -33,7 +33,7 @@ The `scrub` command performs various maintenance operations. Each check must be 
 | `-m, --manifests`             | Check and fix manifest inconsistencies                                                             |
 | `-b, --blobs`                 | Check for orphaned or corrupted blobs; prune stale blob-index entries for deleted namespaces       |
 | `-r, --retention`             | Enforce retention policies (delete expired manifests)                                              |
-| `-u, --uploads <duration>`    | Remove incomplete uploads older than duration                                                      |
+| `-u, --uploads <duration>`    | Check upload sessions: remove broken or partial state and uploads older than the given duration    |
 | `-p, --multipart <duration>`  | Cleanup orphan S3 multipart uploads older than duration                                            |
 | `-l, --links`                 | Fix links format inconsistencies; remove revisions whose manifest blob is missing; prune phantom referrer back-links |
 | `-M, --media-types`           | Backfill missing `media_type` on manifest links; remove revisions whose manifest blob is missing   |
@@ -110,6 +110,10 @@ Blob ownership markers are intentionally kept until the client issues an
 explicit `DELETE /v2/<name>/blobs/<digest>` request. Scrub does not remove
 them when a namespace's manifests are deleted — this reflects the OCI blob
 lifecycle and is not a leak.
+
+Upload session cleanup is gated behind `-u <duration>`; without that flag,
+neither obsolete nor broken upload state is touched. Pass `-u` to schedules
+that should reclaim that storage.
 
 ### Systemd Timer
 
@@ -228,7 +232,7 @@ See [Configure Retention Policies](configure-retention-policies.md) for detailed
 | Tagged manifest   | Doesn't match any retention rule |
 | Untagged manifest | Doesn't match any retention rule |
 | Blob              | Not referenced by any manifest   |
-| Upload            | Incomplete/abandoned             |
+| Upload            | With `-u`: broken/incomplete session or older than the timeout    |
 
 ### Protected Items
 
