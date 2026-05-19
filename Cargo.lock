@@ -3150,8 +3150,8 @@ dependencies = [
 
 [[package]]
 name = "tracing-opentelemetry"
-version = "0.32.1"
-source = "git+https://github.com/tokio-rs/tracing-opentelemetry?rev=44521fa43c79989cdfb5b7244d5f1afadef6dd7e#44521fa43c79989cdfb5b7244d5f1afadef6dd7e"
+version = "0.33.0"
+source = "git+https://github.com/tokio-rs/tracing-opentelemetry?rev=1d5422f1f37932fd65e434da618b305d4c94ee9c#1d5422f1f37932fd65e434da618b305d4c94ee9c"
 dependencies = [
  "js-sys",
  "opentelemetry",
