@@ -82,7 +82,7 @@ The scrub command performs storage maintenance and integrity checks. You must sp
 | `--manifests`             | `-m`   | Check for manifest inconsistencies                                                                 |
 | `--blobs`                 | `-b`   | Check for blob inconsistencies and corruption                                                      |
 | `--retention`             | `-r`   | Enforce retention policies                                                                         |
-| `--links`                 | `-l`   | Fix links format inconsistencies; remove revisions whose manifest blob is missing                  |
+| `--links`                 | `-l`   | Fix links format inconsistencies; remove revisions whose manifest blob is missing; prune phantom referrer back-links |
 | `--media-types`           | `-M`   | Backfill missing `media_type` on manifest links; remove revisions whose manifest blob is missing   |
 | `--referrers`             | `-R`   | Check for and remove orphan referrer links whose referrer manifest is no longer a current revision |
 

@@ -26,6 +26,11 @@ pub enum Action {
         target: Digest,
         referrer: Digest,
     },
+    RemoveReferrer {
+        namespace: String,
+        link: LinkKind,
+        referrer: Digest,
+    },
     SetMediaType {
         namespace: String,
         link: LinkKind,
@@ -97,6 +102,16 @@ impl fmt::Display for Action {
                 write!(
                     f,
                     "add referrer {referrer} to link {link} in namespace '{namespace}'"
+                )
+            }
+            Action::RemoveReferrer {
+                namespace,
+                link,
+                referrer,
+            } => {
+                write!(
+                    f,
+                    "remove referrer {referrer} from link {link} in namespace '{namespace}'"
                 )
             }
             Action::SetMediaType {

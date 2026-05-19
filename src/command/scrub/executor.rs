@@ -193,6 +193,18 @@ impl ActionSink for Executor {
                     )
                     .await?;
             }
+            Action::RemoveReferrer {
+                namespace,
+                link,
+                referrer,
+            } => {
+                self.metadata_store
+                    .update_links(
+                        &namespace,
+                        &[LinkOperation::delete_with_referrer(link, referrer)],
+                    )
+                    .await?;
+            }
         }
 
         Ok(())
@@ -517,6 +529,82 @@ mod tests {
                     .await
                     .is_err(),
                 "Referrer link must be removed after applying the action"
+            );
+            test_case.cleanup().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn executor_remove_referrer_cascades_to_link_delete_when_referenced_by_becomes_empty() {
+        for test_case in backends() {
+            let blob_store = test_case.blob_store();
+            let metadata_store = test_case.metadata_store();
+            let upload_store = test_case.upload_store();
+
+            let namespace = "test-repo/remove-referrer-cascade";
+
+            // Create a layer blob and the corresponding layer link with exactly
+            // one phantom referrer so referenced_by = {phantom}.
+            let layer_content = b"layer content for cascade test";
+            let layer_digest = blob_store.create(layer_content).await.unwrap();
+            let phantom_digest = Digest::from_str(
+                "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+            )
+            .unwrap();
+
+            metadata_store
+                .update_links(
+                    namespace,
+                    &[LinkOperation::create_with_referrer(
+                        LinkKind::Layer(layer_digest.clone()),
+                        layer_digest.clone(),
+                        phantom_digest.clone(),
+                    )],
+                )
+                .await
+                .unwrap();
+
+            // Confirm the layer link exists with the phantom referrer.
+            let before = metadata_store
+                .read_link(
+                    namespace,
+                    &LinkKind::Layer(layer_digest.clone()),
+                    false,
+                )
+                .await
+                .unwrap();
+            assert!(
+                before.referenced_by.contains(&phantom_digest),
+                "phantom referrer must be present before the action"
+            );
+
+            let mut executor = Executor::new(
+                blob_store.clone(),
+                metadata_store.clone(),
+                upload_store,
+                Arc::new(NoopMultipart),
+            );
+
+            executor
+                .apply(Action::RemoveReferrer {
+                    namespace: namespace.to_string(),
+                    link: LinkKind::Layer(layer_digest.clone()),
+                    referrer: phantom_digest.clone(),
+                })
+                .await
+                .unwrap();
+
+            // After removing the only referrer the link itself must be gone.
+            assert!(
+                metadata_store
+                    .read_link(
+                        namespace,
+                        &LinkKind::Layer(layer_digest.clone()),
+                        false,
+                    )
+                    .await
+                    .is_err(),
+                "layer link must be removed when referenced_by becomes empty"
             );
             test_case.cleanup().await;
         }
