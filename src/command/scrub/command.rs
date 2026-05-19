@@ -123,7 +123,7 @@ impl Command {
         self.scrub_metadata().await?;
         self.scrub_blobs().await?;
         self.scrub_multipart_uploads().await?;
-
+        self.metadata_store.flush_access_times().await;
         Ok(())
     }
 
