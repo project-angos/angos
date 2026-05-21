@@ -227,6 +227,34 @@ histogram_quantile(0.95, sum by (webhook, le) (rate(event_webhook_delivery_durat
 
 ---
 
+## Job Queue Metrics
+
+Published only when `[global.job_queue]` is configured. See
+[Enable Durable Cache Jobs](../how-to/durable-cache-jobs.md).
+
+### angos_job_queue_pending
+
+Jobs currently pending in the queue. Suitable for KEDA-style autoscaling of
+`angos worker` pods. Refreshed by a background ticker on every server replica.
+
+| Type  | Labels  |
+|-------|---------|
+| Gauge | `queue` |
+
+### angos_job_queue_enqueued_total
+
+Total jobs submitted to the queue.
+
+| Type    | Labels             |
+|---------|--------------------|
+| Counter | `queue`, `dedup`   |
+
+**Labels:**
+- `queue`: queue name (currently always `cache`)
+- `dedup`: `hit` when a duplicate `lock_key` was suppressed, otherwise `miss`
+
+---
+
 ## Example Prometheus Configuration
 
 ```yaml

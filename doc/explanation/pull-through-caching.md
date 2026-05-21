@@ -331,6 +331,9 @@ Without Redis, tokens are cached in-memory per-instance.
 max_concurrent_cache_jobs = 8  # Parallel upstream fetches
 ```
 
+For multi-replica deployments, see [Enable Durable Cache Jobs](../how-to/durable-cache-jobs.md)
+to route cache-fill work through a shared queue drained by `angos worker`.
+
 ### Timeouts
 
 ```toml

@@ -144,6 +144,38 @@ spec:
 
 ---
 
+### worker
+
+Process durable background jobs from the job queue (currently the pull-through
+cache queue).
+
+```bash
+angos worker [options]
+angos -c /etc/registry/config.toml worker
+```
+
+Requires `[global.job_queue]` to be configured in `config.toml`. Run at least
+one `angos worker` alongside `angos server` whenever durable jobs are
+enabled — the server only enqueues jobs; it does not process them. The worker
+hot-reloads `config.toml` just like `angos server`: changes to
+`[global.job_queue]`, `[repository.*]`, `[blob_store.*]`, or
+`[metadata_store.*]` take effect at the next claim; in-flight jobs always
+finish on the components they started with.
+
+**Options:**
+
+| Option | Default | Description |
+|---|---|---|
+| `--poll-interval <duration>` | `1s` | Idle sleep between claim attempts when the queue is empty. |
+
+**Example:**
+
+```bash
+angos -c config.toml worker
+```
+
+---
+
 ### argon
 
 Generate Argon2 password hashes for basic authentication.

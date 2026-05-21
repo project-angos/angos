@@ -64,6 +64,41 @@ When omitted, the server runs without TLS (insecure).
 
 `max_manifest_size` must be greater than zero.
 
+### Durable Job Queue (`global.job_queue`)
+
+Optional. When present, pull-through cache-fill tasks are written to persistent
+storage instead of running in-process. `angos server` enqueues jobs on cache
+miss and publishes the queue-depth gauge on `/metrics`; one or more
+`angos worker` processes must be running to actually drain the queue. When the
+section is absent, the existing in-process `TaskQueue` is used unchanged.
+Exactly one of `[global.job_queue.fs]` or `[global.job_queue.s3]` must be
+defined to choose the backend.
+
+| Option | Type | Default | Description |
+|---|---|---|---|
+| `default_lease_ttl_secs` | u64 | `30` | Worker lease TTL in seconds. |
+| `pending_refresh_interval_secs` | u64 | `15` | How often the server refreshes the `angos_job_queue_pending` gauge. |
+
+#### Filesystem backend (`global.job_queue.fs`)
+
+| Option | Type | Default | Description |
+|---|---|---|---|
+| `root_dir` | string | required | Directory for job envelopes. Must be on POSIX or NFSv4 with working `O_EXCL`. |
+
+#### S3 backend (`global.job_queue.s3`)
+
+| Option | Type | Default | Description |
+|---|---|---|---|
+| `bucket` | string | required | S3 bucket for job envelopes. |
+| `prefix` | string | `"_jobs"` | Key prefix inside the bucket. |
+| `endpoint` | string | required | S3 endpoint URL. |
+| `region` | string | `"us-east-1"` | AWS region. |
+| `access_key_id` | string | required | AWS access key ID. |
+| `secret_key` | string | required | AWS secret key. |
+
+See [Enable Durable Cache Jobs](../how-to/durable-cache-jobs.md) for a full
+setup guide including `angos worker` invocation and KEDA autoscaling.
+
 ### Global Access Policy (`global.access_policy`)
 
 | Option          | Type     | Default | Description                        |

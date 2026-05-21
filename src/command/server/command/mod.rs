@@ -4,19 +4,24 @@ use std::{
 };
 
 use argh::FromArgs;
+use tokio::time::timeout;
+use tokio_util::{sync::CancellationToken, task::TaskTracker};
 use tracing::warn;
 
-use super::{
-    ServerContext,
-    listeners::{
-        insecure::InsecureListener,
-        tls::{ServerTlsConfig, TlsListener},
-    },
-};
 use crate::{
-    command::server::error::Error,
+    command::server::{
+        ServerContext,
+        error::Error,
+        listeners::{
+            insecure::InsecureListener,
+            tls::{ServerTlsConfig, TlsListener},
+        },
+    },
     configuration::{Configuration, ServerConfig},
-    registry::metadata_store::ConditionalCapabilities,
+    registry::{
+        cache_job_handler::CACHE_QUEUE, job_store::durable::pending_refresh_loop,
+        metadata_store::ConditionalCapabilities,
+    },
 };
 
 mod notifier;
@@ -35,15 +40,23 @@ pub enum ServiceListener {
 )]
 pub struct Options {}
 
+/// Background ticker that publishes `angos_job_queue_pending` on `/metrics`.
+struct PendingRefreshTask {
+    shutdown: CancellationToken,
+    tracker: TaskTracker,
+}
+
 pub struct Command {
     listener: ServiceListener,
     cached_capabilities: Arc<Mutex<Option<ConditionalCapabilities>>>,
+    /// `None` when `[global.job_queue]` is not configured.
+    pending_refresh: Option<PendingRefreshTask>,
 }
 
 impl Command {
     pub async fn new(config: &Configuration) -> Result<Command, Error> {
         let cached_capabilities = Arc::new(Mutex::new(None));
-        let registry = setup::build_registry(config, &cached_capabilities).await?;
+        let (registry, pending) = setup::build_registry(config, &cached_capabilities).await?;
         let context = ServerContext::new(config, registry)?;
 
         let listener = match &config.server {
@@ -55,14 +68,35 @@ impl Command {
             }
         };
 
+        let pending_refresh = pending.map(|refresh| {
+            let shutdown = CancellationToken::new();
+            let tracker = TaskTracker::new();
+            tracker.spawn(pending_refresh_loop(
+                refresh.store,
+                CACHE_QUEUE.to_string(),
+                refresh.interval,
+                shutdown.clone(),
+            ));
+            PendingRefreshTask { shutdown, tracker }
+        });
+
         Ok(Command {
             listener,
             cached_capabilities,
+            pending_refresh,
         })
     }
 
     pub async fn notify_config_change(&self, config: &Configuration) -> Result<(), Error> {
-        let registry = setup::build_registry(config, &self.cached_capabilities).await?;
+        let (registry, pending) = setup::build_registry(config, &self.cached_capabilities).await?;
+
+        if pending.is_some() != self.pending_refresh.is_some() {
+            warn!(
+                "Enabling or disabling [global.job_queue] at runtime is not supported; \
+                 restart angos for the new configuration to take effect."
+            );
+        }
+
         let context = ServerContext::new(config, registry)?;
 
         match (&self.listener, &config.server) {
@@ -107,10 +141,18 @@ impl Command {
         }
     }
 
-    pub async fn shutdown_with_timeout(&self, timeout: Duration) {
+    pub async fn shutdown_with_timeout(&self, grace: Duration) {
         match &self.listener {
-            ServiceListener::Insecure(listener) => listener.shutdown_with_timeout(timeout).await,
-            ServiceListener::Secure(listener) => listener.shutdown_with_timeout(timeout).await,
+            ServiceListener::Insecure(listener) => listener.shutdown_with_timeout(grace).await,
+            ServiceListener::Secure(listener) => listener.shutdown_with_timeout(grace).await,
+        }
+
+        if let Some(refresh) = &self.pending_refresh {
+            refresh.shutdown.cancel();
+            refresh.tracker.close();
+            if timeout(grace, refresh.tracker.wait()).await.is_err() {
+                warn!("Pending-gauge ticker did not stop within shutdown grace period");
+            }
         }
     }
 

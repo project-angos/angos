@@ -14,7 +14,7 @@ use tracing::{error, info, warn};
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
 
 use crate::{
-    command::{argon, scrub, server},
+    command::{argon, scrub, server, worker},
     configuration::{Configuration, ObservabilityConfig, watcher::ConfigWatcher},
     metrics_provider::initialize_metrics,
 };
@@ -111,6 +111,7 @@ enum SubCommand {
     Argon(argon::Options),
     Scrub(scrub::Options),
     Serve(server::Options),
+    Worker(worker::Options),
 }
 
 fn main() {
@@ -177,6 +178,15 @@ async fn run_command(cli_args: GlobalArguments, config: Configuration) {
                 1
             }
         },
+        SubCommand::Worker(worker_options) => {
+            match run_worker(&cli_args.config, worker_options, config).await {
+                Ok(()) => 0,
+                Err(err) => {
+                    error!("Worker error: {err}");
+                    1
+                }
+            }
+        }
     };
 
     if let Some(provider) = tracer_provider
@@ -193,6 +203,29 @@ async fn run_command(cli_args: GlobalArguments, config: Configuration) {
 async fn run_scrub(options: scrub::Options, config: Configuration) -> Result<(), scrub::Error> {
     let mut scrub = scrub::Command::new(&options, &config).await?;
     scrub.run().await
+}
+
+async fn run_worker(
+    config_path: &str,
+    worker_options: worker::Options,
+    config: Configuration,
+) -> Result<(), worker::Error> {
+    let worker = Arc::new(worker::Command::new(&worker_options, &config).await?);
+
+    let Ok(_watcher) = ConfigWatcher::new(config_path, worker.clone()) else {
+        error!("Failed to start configuration watcher");
+        exit(1);
+    };
+
+    tokio::select! {
+        () = worker.run() => Ok(()),
+        () = shutdown_signal() => {
+            info!("Shutdown signal received, draining in-flight jobs");
+            worker.shutdown_with_timeout(Duration::from_secs(30)).await;
+            info!("Graceful shutdown complete");
+            Ok(())
+        }
+    }
 }
 
 async fn run_server(options: GlobalArguments, config: Configuration) -> Result<(), server::Error> {

@@ -1,13 +1,13 @@
 use std::sync::OnceLock;
 
 use prometheus::{
-    Encoder, HistogramVec, IntCounterVec, IntGauge, Registry as PrometheusRegistry, TextEncoder,
-    register_histogram_vec_with_registry, register_int_counter_vec_with_registry,
-    register_int_gauge_with_registry,
+    Encoder, HistogramVec, IntCounterVec, IntGauge, IntGaugeVec, Registry as PrometheusRegistry,
+    TextEncoder, register_histogram_vec_with_registry, register_int_counter_vec_with_registry,
+    register_int_gauge_vec_with_registry, register_int_gauge_with_registry,
 };
 use tracing::error;
 
-use crate::registry::{Error, metadata_store::lock::metrics::LockMetrics};
+use crate::registry::Error;
 
 static METRICS: OnceLock<MetricsProvider> = OnceLock::new();
 
@@ -55,87 +55,167 @@ pub struct MetricsProvider {
     pub metric_http_request_duration: HistogramVec,
     pub metric_http_request_in_flight: IntGauge,
     pub auth_attempts: IntCounterVec,
-    pub locks: LockMetrics,
+    pub lock_acquisition_duration: HistogramVec,
+    pub lock_acquisitions: IntCounterVec,
+    pub lock_retries: IntCounterVec,
+    pub lock_invalidations: IntCounterVec,
+    pub lock_recoveries: IntCounterVec,
+    pub job_queue_pending: IntGaugeVec,
+    pub job_queue_enqueued_total: IntCounterVec,
 }
 
-struct HttpMetrics {
-    total: IntCounterVec,
-    duration: HistogramVec,
-    in_flight: IntGauge,
-}
-
-fn register_http_metrics(registry: &PrometheusRegistry) -> Result<HttpMetrics, Error> {
-    let total = register_int_counter_vec_with_registry!(
-        "http_requests_total",
-        "Total number of HTTP requests made.",
-        &["method", "route", "status"],
-        registry
-    )
-    .map_err(|error| {
-        error!("Unable to create http_requests_total metric: {error}");
-        Error::Initialization(String::from("Unable to create http_requests_total metric"))
-    })?;
-
-    let duration = register_histogram_vec_with_registry!(
-        "http_request_duration_ms",
-        "The HTTP request latencies in milliseconds.",
-        &["method", "route"],
-        registry
-    )
-    .map_err(|error| {
-        error!("Unable to create http_request_duration metric: {error}");
-        Error::Initialization(String::from(
-            "Unable to create http_request_duration metric",
-        ))
-    })?;
-
-    let in_flight = register_int_gauge_with_registry!(
-        "http_requests_in_flight",
-        "The current number of in-flight HTTP requests.",
-        registry
-    )
-    .map_err(|error| {
-        error!("Unable to create http_requests_in_flight metric: {error}");
-        Error::Initialization(String::from(
-            "Unable to create http_requests_in_flight metric",
-        ))
-    })?;
-
-    Ok(HttpMetrics {
-        total,
-        duration,
-        in_flight,
-    })
-}
-
-fn register_auth_metrics(registry: &PrometheusRegistry) -> Result<IntCounterVec, Error> {
-    register_int_counter_vec_with_registry!(
-        "auth_attempts_total",
-        "Total number of authentication attempts",
-        &["method", "result"],
-        registry
-    )
-    .map_err(|error| {
-        error!("Unable to create auth_attempts_total metric: {error}");
-        Error::Initialization(String::from("Unable to create auth_attempts_total metric"))
-    })
+/// Map a Prometheus registration failure to an `Error::Initialization`,
+/// emitting a `tracing::error` with the metric name first.
+fn register_err(name: &'static str) -> impl FnOnce(prometheus::Error) -> Error {
+    move |error| {
+        error!("Unable to create {name} metric: {error}");
+        Error::Initialization(format!("Unable to create {name} metric"))
+    }
 }
 
 impl MetricsProvider {
     pub fn new() -> Result<Self, Error> {
         let registry = PrometheusRegistry::new();
-        let http = register_http_metrics(&registry)?;
-        let auth_attempts = register_auth_metrics(&registry)?;
-        let locks = crate::registry::metadata_store::lock::metrics::register(&registry)?;
+
+        let metric_http_request_total = Self::build_http_request_total(&registry)?;
+        let metric_http_request_duration = Self::build_http_request_duration(&registry)?;
+        let metric_http_request_in_flight = Self::build_http_request_in_flight(&registry)?;
+        let auth_attempts = Self::build_auth_attempts(&registry)?;
+        let lock_acquisition_duration = Self::build_lock_acquisition_duration(&registry)?;
+        let lock_acquisitions = Self::build_lock_acquisitions(&registry)?;
+        let lock_retries = Self::build_lock_retries(&registry)?;
+        let lock_invalidations = Self::build_lock_invalidations(&registry)?;
+        let lock_recoveries = Self::build_lock_recoveries(&registry)?;
+        let job_queue_pending = Self::build_job_queue_pending(&registry)?;
+        let job_queue_enqueued_total = Self::build_job_queue_enqueued_total(&registry)?;
 
         Ok(Self {
             registry,
-            metric_http_request_total: http.total,
-            metric_http_request_duration: http.duration,
-            metric_http_request_in_flight: http.in_flight,
+            metric_http_request_total,
+            metric_http_request_duration,
+            metric_http_request_in_flight,
             auth_attempts,
-            locks,
+            lock_acquisition_duration,
+            lock_acquisitions,
+            lock_retries,
+            lock_invalidations,
+            lock_recoveries,
+            job_queue_pending,
+            job_queue_enqueued_total,
         })
+    }
+
+    fn build_http_request_total(registry: &PrometheusRegistry) -> Result<IntCounterVec, Error> {
+        register_int_counter_vec_with_registry!(
+            "http_requests_total",
+            "Total number of HTTP requests made.",
+            &["method", "route", "status"],
+            registry
+        )
+        .map_err(register_err("http_requests_total"))
+    }
+
+    fn build_http_request_duration(registry: &PrometheusRegistry) -> Result<HistogramVec, Error> {
+        register_histogram_vec_with_registry!(
+            "http_request_duration_ms",
+            "The HTTP request latencies in milliseconds.",
+            &["method", "route"],
+            registry
+        )
+        .map_err(register_err("http_request_duration_ms"))
+    }
+
+    fn build_http_request_in_flight(registry: &PrometheusRegistry) -> Result<IntGauge, Error> {
+        register_int_gauge_with_registry!(
+            "http_requests_in_flight",
+            "The current number of in-flight HTTP requests.",
+            registry
+        )
+        .map_err(register_err("http_requests_in_flight"))
+    }
+
+    fn build_auth_attempts(registry: &PrometheusRegistry) -> Result<IntCounterVec, Error> {
+        register_int_counter_vec_with_registry!(
+            "auth_attempts_total",
+            "Total number of authentication attempts",
+            &["method", "result"],
+            registry
+        )
+        .map_err(register_err("auth_attempts_total"))
+    }
+
+    fn build_lock_acquisition_duration(
+        registry: &PrometheusRegistry,
+    ) -> Result<HistogramVec, Error> {
+        register_histogram_vec_with_registry!(
+            "lock_acquisition_duration_ms",
+            "Lock acquisition duration in milliseconds",
+            &["backend"],
+            registry
+        )
+        .map_err(register_err("lock_acquisition_duration_ms"))
+    }
+
+    fn build_lock_acquisitions(registry: &PrometheusRegistry) -> Result<IntCounterVec, Error> {
+        register_int_counter_vec_with_registry!(
+            "lock_acquisitions_total",
+            "Total lock acquisition attempts",
+            &["backend", "result"],
+            registry
+        )
+        .map_err(register_err("lock_acquisitions_total"))
+    }
+
+    fn build_lock_retries(registry: &PrometheusRegistry) -> Result<IntCounterVec, Error> {
+        register_int_counter_vec_with_registry!(
+            "lock_retries_total",
+            "Total lock acquisition retries",
+            &["backend"],
+            registry
+        )
+        .map_err(register_err("lock_retries_total"))
+    }
+
+    fn build_lock_invalidations(registry: &PrometheusRegistry) -> Result<IntCounterVec, Error> {
+        register_int_counter_vec_with_registry!(
+            "lock_invalidations_total",
+            "Total lock invalidations",
+            &["backend", "reason"],
+            registry
+        )
+        .map_err(register_err("lock_invalidations_total"))
+    }
+
+    fn build_lock_recoveries(registry: &PrometheusRegistry) -> Result<IntCounterVec, Error> {
+        register_int_counter_vec_with_registry!(
+            "lock_recoveries_total",
+            "Total stale lock recovery attempts",
+            &["backend", "result"],
+            registry
+        )
+        .map_err(register_err("lock_recoveries_total"))
+    }
+
+    fn build_job_queue_pending(registry: &PrometheusRegistry) -> Result<IntGaugeVec, Error> {
+        register_int_gauge_vec_with_registry!(
+            "angos_job_queue_pending",
+            "Number of jobs currently pending in the queue",
+            &["queue"],
+            registry
+        )
+        .map_err(register_err("angos_job_queue_pending"))
+    }
+
+    fn build_job_queue_enqueued_total(
+        registry: &PrometheusRegistry,
+    ) -> Result<IntCounterVec, Error> {
+        register_int_counter_vec_with_registry!(
+            "angos_job_queue_enqueued_total",
+            "Total jobs submitted to the queue",
+            &["queue", "dedup"],
+            registry
+        )
+        .map_err(register_err("angos_job_queue_enqueued_total"))
     }
 
     pub fn gather(&self) -> Result<(String, Vec<u8>), Error> {
@@ -150,7 +230,7 @@ impl MetricsProvider {
 }
 
 #[cfg(test)]
-pub(crate) fn init_for_tests() {
+pub fn init_for_tests() {
     // Ignore the already-initialized error — tests run in parallel and share one process.
     let _ = initialize_metrics();
 }

@@ -83,6 +83,9 @@ impl From<bootstrap::Error> for Error {
                 "Failed to initialize repository '{name}': {source}"
             )),
             bootstrap::Error::Overlap(inner) => Error::Initialization(inner.to_string()),
+            bootstrap::Error::JobQueue(inner) => {
+                Error::Initialization(format!("Failed to initialize job queue: {inner}"))
+            }
         }
     }
 }

@@ -4,11 +4,14 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## 1.2.0 [Unreleased]
 
 ### Added
 
 - New `scrub --referrers` flag: checks every revision in each namespace and removes any referrer link whose referrer manifest no longer has a current digest revision link, preventing ghost descriptors from appearing in the OCI Referrers API response.
+- Durable cache jobs: optional `[global.job_queue]` section routes pull-through cache-fill jobs through a persistent filesystem or S3 store (per-key leases with heartbeat, exponential backoff, dead-letter on max-attempts). `angos server` enqueues jobs and publishes the `angos_job_queue_pending` gauge on `/metrics`; the new `angos worker` subcommand drains the queue. When the section is omitted the existing in-process `TaskQueue` is used unchanged. Documented in `doc/how-to/durable-cache-jobs.md` with a commented block in `config.example.toml`.
+- Maximum manifest body size enforcement.
+- Warning log when a listener flips between insecure and TLS during configuration hot-reload.
 
 ### Fixed
 
@@ -21,13 +24,6 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - Scrub on S3 now converges namespaces whose only artifact is an upload session (e.g. a client that crashed mid-push): the namespace registry tree walk includes any namespace that has an underscore-prefixed child, matching filesystem backend behaviour. Such namespaces are now visible to `UploadChecker` and their stale bytes are cleaned up by `scrub --uploads`.
 - Scrub `-b` now purges all blob-index entries (including ownership markers) for any blob whose backing bytes are absent, so runtime `can_read` no longer reports such blobs as accessible to clients.
 - Scrub `-m` now validates that each revision's digest link points back at the revision's own digest, and rewrites the link when a mismatch is found. The check runs before the manifest blob is read, so a corrupt link is repaired even when its blob is unreachable.
-
-## [1.2.0]
-
-### Added
-
-- Maximum manifest body size enforcement.
-- Warning log when a listener flips between insecure and TLS during configuration hot-reload.
 
 ### Changed
 

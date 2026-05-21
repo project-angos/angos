@@ -19,6 +19,27 @@ max_concurrent_requests = 4
 max_concurrent_cache_jobs = 4
 update_pull_time = false
 
+# Optional: Durable job queue for pull-through cache-fill tasks.
+# When omitted, cache-fill jobs run in-process via the legacy TaskQueue.
+# Pick exactly one of the backend sub-tables ([global.job_queue.fs] or
+# [global.job_queue.s3]) to enable durable mode. With durable mode the server
+# only enqueues jobs and publishes the pending gauge; run `angos worker`
+# in addition to `angos server` to actually drain the queue.
+#[global.job_queue]
+#default_lease_ttl_secs = 30          # worker lease TTL
+#pending_refresh_interval_secs = 15   # how often the server refreshes the pending gauge
+#
+#[global.job_queue.fs]                # pick one: filesystem backend
+#root_dir = "/var/lib/angos/jobs"     # must be on POSIX or NFSv4 with O_EXCL
+#
+#[global.job_queue.s3]                # pick one: S3 backend
+#bucket = "angos-jobs"                # S3 bucket for job envelopes
+#prefix = "_jobs"                     # key prefix inside the bucket (default "_jobs")
+#endpoint = "https://<s3-endpoint>"
+#region = "us-east-1"                 # default "us-east-1"
+#access_key_id = "<key-id>"
+#secret_key = "<secret-key>"
+
 # Optional: Global access policy that applies to all repositories
 # If not defined, repositories without specific policies will deny access
 #[global.access_policy]

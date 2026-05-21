@@ -58,6 +58,7 @@ toml = "1.1.2"
 tracing = "0.1.44"
 tracing-opentelemetry = { git = "https://github.com/tokio-rs/tracing-opentelemetry", rev = "44521fa43c79989cdfb5b7244d5f1afadef6dd7e" }
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"] }
+ulid = "1.2"
 url = { version = "2.5.8", features = ["serde"] }
 uuid = { version = "1.23.1", features = ["v4", "serde"] }
 x509-parser = "0.18.1"

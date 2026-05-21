@@ -70,13 +70,14 @@ impl TaskQueue {
         });
     }
 
-    #[cfg(test)]
-    fn active_task_count(&self) -> usize {
+    /// Number of tasks currently registered in the active set, including ones
+    /// still waiting on a permit and ones executing their future.
+    pub fn active_task_count(&self) -> usize {
         self.active_tasks.lock().len()
     }
 
-    #[cfg(test)]
-    fn is_active(&self, reference: &str) -> bool {
+    /// Returns `true` when a task with this `reference` is currently active.
+    pub fn is_active(&self, reference: &str) -> bool {
         self.active_tasks.lock().contains(reference)
     }
 }

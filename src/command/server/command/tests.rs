@@ -1,6 +1,6 @@
 use std::{
     collections::HashMap,
-    sync::{Arc, Mutex, Once},
+    sync::{Arc, Mutex, Once, PoisonError},
 };
 
 use tempfile::TempDir;
@@ -379,9 +379,9 @@ async fn test_build_registry_preserves_registry_error_details() {
     );
 
     let config = Configuration::load_from_str(&toml).unwrap();
-    let result = setup::build_registry(&config, &Arc::new(Mutex::new(None))).await;
-
-    let error = result.expect_err("registry build should fail");
+    let Err(error) = setup::build_registry(&config, &Arc::new(Mutex::new(None))).await else {
+        panic!("registry build should fail");
+    };
     assert!(
         error.to_string().contains(
             "task pool error during operations: failed to initialize task queue: max_concurrent_cache_jobs must be greater than 0"
@@ -441,7 +441,7 @@ async fn test_service_listener_enum_variants() {
         panic!("Expected insecure config")
     };
 
-    let registry = setup::build_registry(&config, &Arc::new(Mutex::new(None)))
+    let (registry, _) = setup::build_registry(&config, &Arc::new(Mutex::new(None)))
         .await
         .unwrap();
     let context = ServerContext::new(&config, registry).unwrap();
@@ -948,9 +948,7 @@ fn test_poisoned_capabilities_mutex_recovers_without_crash() {
     );
 
     // The recovery pattern used in build_metadata_store must not panic.
-    let guard = lock
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let guard = lock.lock().unwrap_or_else(PoisonError::into_inner);
     assert!(
         guard.is_none(),
         "recovered guard must yield the original None value"
