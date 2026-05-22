@@ -62,6 +62,7 @@ pub struct MetricsProvider {
     pub lock_recoveries: IntCounterVec,
     pub job_queue_pending: IntGaugeVec,
     pub job_queue_enqueued_total: IntCounterVec,
+    pub job_queue_enqueue_failures_total: IntCounterVec,
 }
 
 /// Map a Prometheus registration failure to an `Error::Initialization`,
@@ -88,6 +89,8 @@ impl MetricsProvider {
         let lock_recoveries = Self::build_lock_recoveries(&registry)?;
         let job_queue_pending = Self::build_job_queue_pending(&registry)?;
         let job_queue_enqueued_total = Self::build_job_queue_enqueued_total(&registry)?;
+        let job_queue_enqueue_failures_total =
+            Self::build_job_queue_enqueue_failures_total(&registry)?;
 
         Ok(Self {
             registry,
@@ -102,6 +105,7 @@ impl MetricsProvider {
             lock_recoveries,
             job_queue_pending,
             job_queue_enqueued_total,
+            job_queue_enqueue_failures_total,
         })
     }
 
@@ -216,6 +220,18 @@ impl MetricsProvider {
             registry
         )
         .map_err(register_err("angos_job_queue_enqueued_total"))
+    }
+
+    fn build_job_queue_enqueue_failures_total(
+        registry: &PrometheusRegistry,
+    ) -> Result<IntCounterVec, Error> {
+        register_int_counter_vec_with_registry!(
+            "angos_job_queue_enqueue_failures_total",
+            "Total enqueue attempts that did not land on the queue (envelope build or storage error)",
+            &["queue"],
+            registry
+        )
+        .map_err(register_err("angos_job_queue_enqueue_failures_total"))
     }
 
     pub fn gather(&self) -> Result<(String, Vec<u8>), Error> {

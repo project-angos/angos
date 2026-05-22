@@ -8,7 +8,6 @@ use async_trait::async_trait;
 use chrono::{Duration as ChronoDuration, Utc};
 use serde::{Deserialize, Serialize};
 use tracing::debug;
-use uuid::Uuid;
 
 use crate::{
     registry::{
@@ -29,6 +28,12 @@ pub struct BackendConfig {
     pub region: String,
     pub access_key_id: Secret<String>,
     pub secret_key: Secret<String>,
+    /// Whether the storage service honors `DELETE` with `If-Match: <etag>`.
+    /// Defaults to `true` (AWS S3, R2, GCS, modern `MinIO`). Set to `false` on
+    /// endpoints without conditional delete; release then falls back to an
+    /// unconditional `DELETE` with a small race window during lease theft.
+    #[serde(default = "default_delete_if_match")]
+    pub delete_if_match: bool,
 }
 
 fn default_prefix() -> String {
@@ -37,6 +42,10 @@ fn default_prefix() -> String {
 
 fn default_region() -> String {
     "us-east-1".to_string()
+}
+
+fn default_delete_if_match() -> bool {
+    true
 }
 
 /// Lease file payload stored in S3 at `_jobs/leases/<lock_key_encoded>.json`.
@@ -56,6 +65,7 @@ struct LeaseFile {
 /// - `delete` / `delete_if_match` for release
 pub struct Backend {
     backend: Arc<s3_client::Backend>,
+    delete_if_match: bool,
 }
 
 impl Backend {
@@ -73,6 +83,7 @@ impl Backend {
             .map_err(|e| Error::Initialization(e.to_string()))?;
         Ok(Self {
             backend: Arc::new(backend),
+            delete_if_match: config.delete_if_match,
         })
     }
 
@@ -92,7 +103,7 @@ impl Backend {
                     // Vanished between the failed put_object_if_not_exists and
                     // now; retry the initial create.
                     return match self.backend.put_object_if_not_exists(&key, data).await {
-                        Ok(etag) => Ok(Some(etag.unwrap_or_else(|| Uuid::new_v4().to_string()))),
+                        Ok(etag) => Ok(Some(require_etag(etag)?)),
                         Err(s3_client::Error::PreconditionFailed) => Ok(None),
                         Err(e) => Err(Error::Storage(format!("retry create lease failed: {e}"))),
                     };
@@ -124,7 +135,7 @@ impl Backend {
             .put_object_if_match(&key, &stale_etag, data)
             .await
         {
-            Ok(new_etag) => Ok(Some(new_etag.unwrap_or_else(|| Uuid::new_v4().to_string()))),
+            Ok(new_etag) => Ok(Some(require_etag(new_etag)?)),
             Err(s3_client::Error::PreconditionFailed) => Ok(None),
             Err(e) => Err(Error::Storage(format!("steal lease failed: {e}"))),
         }
@@ -145,6 +156,10 @@ fn serialize_lease(worker_id: &str, ttl_secs: u64) -> Result<Vec<u8>, Error> {
         ttl_secs,
     })
     .map_err(|e| Error::Storage(format!("lease serialization failed: {e}")))
+}
+
+fn require_etag(etag: Option<String>) -> Result<String, Error> {
+    etag.ok_or_else(|| Error::Storage("S3 PUT response is missing an ETag".to_string()))
 }
 
 #[async_trait]
@@ -200,7 +215,7 @@ impl JobStore for Backend {
         let key = path_builder::job_lease_path(lock_key);
         let data = serialize_lease(worker_id, ttl_secs)?;
         match self.backend.put_object_if_not_exists(&key, data).await {
-            Ok(etag) => Ok(Some(etag.unwrap_or_else(|| Uuid::new_v4().to_string()))),
+            Ok(etag) => Ok(Some(require_etag(etag)?)),
             Err(s3_client::Error::PreconditionFailed) => {
                 self.try_steal_stale_lease(lock_key, worker_id, ttl_secs)
                     .await
@@ -236,12 +251,21 @@ impl JobStore for Backend {
         }
     }
 
-    async fn remove_lease(&self, lock_key: &str, _token: &str) -> Result<(), Error> {
+    async fn remove_lease(&self, lock_key: &str, token: &str) -> Result<(), Error> {
         let key = path_builder::job_lease_path(lock_key);
-        match self.backend.delete(&key).await {
-            Ok(()) => Ok(()),
-            Err(e) if e.kind() == ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(Error::Storage(format!("failed to delete lease: {e}"))),
+        if self.delete_if_match {
+            // ETag mismatch means another worker already stole the lease;
+            // treat as success rather than failing the completing worker.
+            match self.backend.delete_if_match(&key, token).await {
+                Ok(()) | Err(s3_client::Error::PreconditionFailed) => Ok(()),
+                Err(e) => Err(Error::Storage(format!("failed to delete lease: {e}"))),
+            }
+        } else {
+            match self.backend.delete(&key).await {
+                Ok(()) => Ok(()),
+                Err(e) if e.kind() == ErrorKind::NotFound => Ok(()),
+                Err(e) => Err(Error::Storage(format!("failed to delete lease: {e}"))),
+            }
         }
     }
 
@@ -399,6 +423,7 @@ mod tests {
         (
             Arc::new(Backend {
                 backend: raw.clone(),
+                delete_if_match: true,
             }),
             raw,
         )
@@ -426,10 +451,16 @@ mod tests {
             .claim_one("cache")
             .await
             .expect("claim_one")
+            .claimed
             .expect("Some");
         consumer.complete(claimed).await.expect("complete");
         assert!(
-            consumer.claim_one("cache").await.expect("claim").is_none(),
+            consumer
+                .claim_one("cache")
+                .await
+                .expect("claim")
+                .claimed
+                .is_none(),
             "queue must be empty after complete"
         );
     }
@@ -464,6 +495,7 @@ mod tests {
             .claim_one("cache")
             .await
             .expect("claim after stale")
+            .claimed
             .expect("Some");
         consumer.complete(claimed).await.expect("complete");
     }

@@ -166,7 +166,7 @@ finish on the components they started with.
 
 | Option | Default | Description |
 |---|---|---|
-| `--poll-interval <duration>` | `1s` | Idle sleep between claim attempts when the queue is empty. |
+| `--poll-interval <duration>` | `1s` | Minimum idle sleep between claim attempts. When the queue contains only backed-off envelopes, the worker extends the wait up to the soonest `not_before` (capped at 1 minute, or `--poll-interval` if it is larger). |
 
 **Example:**
 

@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use ulid::Ulid;
 
 pub mod durable;
@@ -24,12 +24,25 @@ pub enum Error {
 /// durable mode; omit the section to keep the legacy in-process `TaskQueue`.
 #[derive(Clone, Debug, Deserialize)]
 pub struct JobQueueConfig {
-    #[serde(default = "default_lease_ttl_secs")]
+    #[serde(
+        default = "default_lease_ttl_secs",
+        deserialize_with = "deserialize_lease_ttl_secs"
+    )]
     pub default_lease_ttl_secs: u64,
     #[serde(default = "default_pending_refresh_interval_secs")]
     pub pending_refresh_interval_secs: u64,
     #[serde(flatten)]
     pub backend: JobQueueBackend,
+}
+
+fn deserialize_lease_ttl_secs<'de, D: Deserializer<'de>>(deserializer: D) -> Result<u64, D::Error> {
+    let value = u64::deserialize(deserializer)?;
+    if value < 9 {
+        return Err(serde::de::Error::custom(
+            "default_lease_ttl_secs must be at least 9 (heartbeat runs at ttl/3)",
+        ));
+    }
+    Ok(value)
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -113,6 +126,15 @@ pub trait JobQueue: Send + Sync {
 
 /// Executor for a single job kind. Returns a stringified error on failure;
 /// the queue runtime turns that into a retry or dead-letter outcome.
+///
+/// # Idempotency
+///
+/// Implementations **must** be idempotent. Lease release and pending-entry
+/// removal happen in two separate storage ops at the end of `complete`, and a
+/// crash (or a stolen lease after heartbeat loss) can leave the pending entry
+/// behind. A subsequent worker will then re-execute the same envelope; the
+/// handler is responsible for detecting "already done" and returning `Ok(())`
+/// in that case.
 #[async_trait]
 pub trait JobHandler: Send + Sync {
     async fn execute(&self, envelope: &JobEnvelope) -> Result<(), String>;

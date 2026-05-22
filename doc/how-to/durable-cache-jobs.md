@@ -48,11 +48,11 @@ volume (e.g. NFSv4 with working `O_EXCL`).
 
 ```toml
 [global]
-max_concurrent_cache_jobs = 4   # unchanged; still bounds the in-process TaskQueue
-                                # when job_queue is omitted
+max_concurrent_cache_jobs = 4   # also bounds the number of jobs each `angos worker`
+                                # processes in parallel
 
 [global.job_queue]
-default_lease_ttl_secs = 30          # per-job worker lease TTL in seconds
+default_lease_ttl_secs = 30          # per-job worker lease TTL in seconds (min 9)
 pending_refresh_interval_secs = 15   # how often the server refreshes the pending gauge
 
 [global.job_queue.fs]
@@ -70,7 +70,7 @@ Use this for multi-node deployments or when blob storage is already on S3.
 
 ```toml
 [global.job_queue]
-default_lease_ttl_secs = 30
+default_lease_ttl_secs = 30          # min 9
 pending_refresh_interval_secs = 15   # keep at 15 or higher on S3 to avoid
                                      # excessive LIST requests
 
@@ -91,8 +91,9 @@ A durable-queue deployment needs both subcommands:
   and publishes the queue-depth gauge on `/metrics`. It does **not** process
   jobs itself.
 - `angos worker` polls the queue, fetches blobs from upstream, and writes them
-  into the shared blob/metadata store. Run at least one worker; multiple
-  workers safely share the queue thanks to per-`lock_key` leases.
+  into the shared blob/metadata store. Each worker processes up to
+  `max_concurrent_cache_jobs` jobs in parallel; multiple workers safely share
+  the queue thanks to per-`lock_key` leases. Run at least one.
 
 Both subcommands hot-reload `config.toml` on disk: changes to
 `[global.job_queue]`, `[repository.*]`, `[blob_store.*]`, or
@@ -103,7 +104,7 @@ finish on the components they started with.
 
 | Flag                         | Default | Description                                              |
 |------------------------------|---------|----------------------------------------------------------|
-| `--poll-interval <duration>` | `1s`    | Idle wait between claim attempts when the queue is empty. |
+| `--poll-interval <duration>` | `1s`    | Minimum wait between claim attempts when no ready job is found. If the queue contains only backed-off envelopes, the worker extends the wait up to the soonest `not_before` (capped at 1 minute, or `--poll-interval` if it is larger) to avoid polling-storm cost. |
 
 ### Example: server + worker pods
 
@@ -142,6 +143,14 @@ on the volume. Single-host POSIX filesystems (ext4, XFS, tmpfs) and NFSv4 with
 working locking are supported. NFSv3 with broken `O_EXCL` is not. If you need
 multi-host FS workers, use the S3 backend.
 
+**S3 backend requirements:** Lease ownership is tracked via the `ETag` header
+returned by the storage service on `PUT`. S3-compatible endpoints that strip
+`ETag` from PUT responses are not supported; lease creation fails loudly with
+`S3 PUT response is missing an ETag` rather than silently dropping jobs.
+Lease release uses `DELETE` with `If-Match: <etag>` on services that support
+it (the default); set `delete_if_match = false` on endpoints without
+conditional delete to fall back to an unconditional `DELETE`.
+
 **S3 LIST cost:** Each enqueue scans `_jobs/pending/cache/` for duplicate
 `lock_key`s. At the default `pending_refresh_interval_secs = 15` and with N
 serve replicas each doing their own scan, total LIST rate is roughly `miss_rate
@@ -150,5 +159,6 @@ with thousands of pending jobs remain cheap. Do not set
 `pending_refresh_interval_secs` below 5 on S3.
 
 **Backoff schedule:** Failed jobs are retried with exponential backoff:
-`min(60s × 2^attempts, 1h)`. With the default 5-attempt budget a job can
-retry for up to ~2 hours before dead-lettering.
+`min(1 min × 2^attempts, 10 min)`. With the default 5-attempt budget a job
+retries 4 times with delays of 2, 4, 8 and 10 minutes (24 minutes total)
+before being moved to the dead-letter queue.

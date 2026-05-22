@@ -6,6 +6,7 @@ use tracing::{debug, info, instrument, warn};
 use uuid::Uuid;
 
 use crate::{
+    metrics_provider::metrics_provider,
     oci::{Digest, Namespace},
     registry::{
         Error, HeaderMap, Registry, Repository, ResponseHeaders,
@@ -273,8 +274,8 @@ impl Registry {
     }
 
     /// Fire-and-forget enqueue of a pull-through cache-fill job. A failure is
-    /// logged but never bubbles up so a scheduling glitch cannot degrade the
-    /// client response.
+    /// logged and counted on `angos_job_queue_enqueue_failures_total` but never
+    /// bubbles up, so a scheduling glitch cannot degrade the client response.
     async fn dispatch_cache_fill(&self, namespace: &Namespace, digest: &Digest) {
         let payload = CacheFetchBlobPayload {
             namespace: namespace.to_string(),
@@ -289,11 +290,19 @@ impl Registry {
             Ok(envelope) => envelope,
             Err(e) => {
                 warn!("Failed to build cache job envelope for {digest}: {e}");
+                metrics_provider()
+                    .job_queue_enqueue_failures_total
+                    .with_label_values(&[CACHE_QUEUE])
+                    .inc();
                 return;
             }
         };
         if let Err(e) = self.cache_queue.enqueue(envelope).await {
             warn!("Failed to enqueue cache job for {digest}: {e}");
+            metrics_provider()
+                .job_queue_enqueue_failures_total
+                .with_label_values(&[CACHE_QUEUE])
+                .inc();
         }
     }
 

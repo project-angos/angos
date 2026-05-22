@@ -56,7 +56,7 @@ pub async fn run_once(
     handler: &dyn JobHandler,
     queue: &str,
 ) -> Result<bool, Error> {
-    match consumer.claim_one(queue).await? {
+    match consumer.claim_one(queue).await?.claimed {
         None => Ok(false),
         Some(claimed) => {
             execute_one(consumer, handler, claimed).await;

@@ -5,7 +5,7 @@ use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use tokio::{
     select, spawn,
     task::JoinHandle,
-    time::{MissedTickBehavior, interval, sleep},
+    time::{MissedTickBehavior, interval},
 };
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
@@ -31,6 +31,33 @@ pub struct ClaimedJob {
 pub enum FailOutcome {
     Retried { next_at: DateTime<Utc> },
     MovedToDeadLetter,
+}
+
+/// Outcome of a single `claim_one` attempt. `claimed` is `Some` when a job was
+/// leased; otherwise `next_ready` carries the soonest `not_before` observed
+/// across the scan so the caller can sleep until then rather than polling at
+/// full cadence through unchanged backed-off envelopes.
+#[derive(Debug)]
+pub struct ClaimOutcome {
+    pub claimed: Option<ClaimedJob>,
+    pub next_ready: Option<DateTime<Utc>>,
+}
+
+impl ClaimOutcome {
+    /// How long the caller should idle before the next `claim_one` attempt.
+    /// When only backed-off envelopes were seen, the sleep extends to the
+    /// soonest `not_before`, clamped to `[poll_interval, max(poll_interval, 1 min)]`
+    /// so the worker stops re-reading unchanged envelopes every tick while
+    /// still picking up newly-enqueued ready jobs promptly.
+    pub fn idle_sleep(&self, poll_interval: Duration) -> Duration {
+        let max_sleep = poll_interval.max(Duration::from_mins(1));
+        self.next_ready.map_or(poll_interval, |t| {
+            (t - Utc::now())
+                .to_std()
+                .unwrap_or_default()
+                .clamp(poll_interval, max_sleep)
+        })
+    }
 }
 
 /// Producer-side `JobQueue` backed by a `JobStore`. `enqueue` performs a
@@ -88,10 +115,12 @@ impl DurableJobConsumer {
 
     /// Claim the next available job from `queue`. Walks pending envelopes in
     /// ascending ULID order (oldest first), skips any still in backoff, then
-    /// creates the lease atomically. Returns `None` when no candidate is
-    /// ready or every ready one is leased by another worker.
-    pub async fn claim_one(&self, queue: &str) -> Result<Option<ClaimedJob>, Error> {
+    /// creates the lease atomically. When no claim is made, `next_ready` on
+    /// the returned outcome is the soonest `not_before` observed during the
+    /// scan, so the caller can sleep until then.
+    pub async fn claim_one(&self, queue: &str) -> Result<ClaimOutcome, Error> {
         let now = Utc::now();
+        let mut next_ready: Option<DateTime<Utc>> = None;
         for id in self.store.list_pending(queue, MAX_SCAN).await? {
             let envelope = match self.store.read_pending(queue, &id).await {
                 Ok(e) => e,
@@ -99,6 +128,10 @@ impl DurableJobConsumer {
                 Err(e) => return Err(e),
             };
             if envelope.not_before > now {
+                next_ready = Some(
+                    next_ready
+                        .map_or(envelope.not_before, |t| t.min(envelope.not_before)),
+                );
                 continue;
             }
             if let Some(token) = self
@@ -106,13 +139,19 @@ impl DurableJobConsumer {
                 .try_create_lease(&envelope.lock_key, &self.worker_id, self.lease_ttl_secs)
                 .await?
             {
-                return Ok(Some(ClaimedJob {
-                    envelope,
-                    lease_token: token,
-                }));
+                return Ok(ClaimOutcome {
+                    claimed: Some(ClaimedJob {
+                        envelope,
+                        lease_token: token,
+                    }),
+                    next_ready: None,
+                });
             }
         }
-        Ok(None)
+        Ok(ClaimOutcome {
+            claimed: None,
+            next_ready,
+        })
     }
 
     /// Spawn a heartbeat task that refreshes the lease for `claimed` every
@@ -130,7 +169,7 @@ impl DurableJobConsumer {
         let ttl_secs = self.lease_ttl_secs;
         let lock_key = claimed.envelope.lock_key.clone();
         let mut current_token = claimed.lease_token.clone();
-        let tick = Duration::from_secs((ttl_secs / 3).max(1));
+        let tick = Duration::from_secs(ttl_secs / 3);
 
         spawn(async move {
             // `interval` fires immediately on first tick; consume it so the
@@ -168,9 +207,11 @@ impl DurableJobConsumer {
     }
 
     pub async fn complete(&self, claimed: ClaimedJob) -> Result<(), Error> {
-        // Order matters: remove the lease first so another worker doesn't see
-        // a dangling pending entry, then remove pending. A crash between the
-        // two is safe — the next worker re-checks blob ownership.
+        // The lease drops first, then the pending entry. Between the two,
+        // another worker may briefly observe the pending entry and claim a
+        // fresh lease — `JobHandler` implementations MUST therefore be
+        // idempotent. A crash between the two ops is equivalent and is
+        // covered by the same idempotency contract.
         self.store
             .remove_lease(&claimed.envelope.lock_key, &claimed.lease_token)
             .await?;
@@ -218,32 +259,40 @@ impl DurableJobConsumer {
     }
 }
 
-/// Exponential backoff for retry delays: `min(60s * 2^n, 1h)`. `n = 0` means
-/// "first failure". Capped at 1 h so the shift cannot overflow.
+/// Exponential backoff for retry delays: `min(1 min * 2^n, 10 min)`. `n = 0`
+/// means "first failure". The shift is bounded so it cannot overflow.
 pub fn backoff(n: u32) -> Duration {
-    Duration::from_mins(1 << n.min(6)).min(Duration::from_hours(1))
+    Duration::from_mins(1 << n.min(4)).min(Duration::from_mins(10))
 }
 
-/// Refresh `angos_job_queue_pending` for `queue` on every `interval` tick,
-/// until `shutdown` is cancelled.
+/// Refresh `angos_job_queue_pending` for `queue` on every `period` tick,
+/// until `shutdown` is cancelled. Uses `tokio::time::interval` so the cadence
+/// stays fixed across slow `count_pending` calls; missed ticks are coalesced
+/// rather than catching up.
 pub async fn pending_refresh_loop(
     store: Arc<dyn JobStore>,
     queue: String,
-    interval: Duration,
+    period: Duration,
     shutdown: CancellationToken,
 ) {
+    let mut timer = interval(period);
+    timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    // Consume the immediate first tick so the first refresh happens after `period`.
+    timer.tick().await;
+
     loop {
         select! {
             () = shutdown.cancelled() => return,
-            () = sleep(interval) => match store.count_pending(&queue).await {
-                Ok(count) => {
-                    metrics_provider()
-                        .job_queue_pending
-                        .with_label_values(&[queue.as_str()])
-                        .set(i64::try_from(count).unwrap_or(i64::MAX));
-                }
-                Err(e) => debug!(queue = %queue, error = %e, "Failed to refresh pending gauge"),
-            },
+            _ = timer.tick() => {}
+        }
+        match store.count_pending(&queue).await {
+            Ok(count) => {
+                metrics_provider()
+                    .job_queue_pending
+                    .with_label_values(&[queue.as_str()])
+                    .set(i64::try_from(count).unwrap_or(i64::MAX));
+            }
+            Err(e) => debug!(queue = %queue, error = %e, "Failed to refresh pending gauge"),
         }
     }
 }
@@ -255,10 +304,11 @@ mod tests {
     use super::backoff;
 
     #[test]
-    fn backoff_doubles_each_attempt_then_caps_at_one_hour() {
+    fn backoff_doubles_each_attempt_then_caps_at_ten_minutes() {
         assert_eq!(backoff(0), Duration::from_mins(1));
         assert_eq!(backoff(1), Duration::from_mins(2));
-        assert_eq!(backoff(6), Duration::from_hours(1));
-        assert_eq!(backoff(100), Duration::from_hours(1));
+        assert_eq!(backoff(3), Duration::from_mins(8));
+        assert_eq!(backoff(4), Duration::from_mins(10));
+        assert_eq!(backoff(100), Duration::from_mins(10));
     }
 }

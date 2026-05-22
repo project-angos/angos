@@ -39,6 +39,7 @@ update_pull_time = false
 #region = "us-east-1"                 # default "us-east-1"
 #access_key_id = "<key-id>"
 #secret_key = "<secret-key>"
+#delete_if_match = true               # set false on endpoints without conditional DELETE
 
 # Optional: Global access policy that applies to all repositories
 # If not defined, repositories without specific policies will deny access

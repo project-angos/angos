@@ -327,10 +327,12 @@ impl JobStore for Backend {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::{sync::Arc, time::Duration};
 
     use chrono::Utc;
     use tempfile::TempDir;
+    use tokio::time::timeout;
+    use tokio_util::sync::CancellationToken;
     use ulid::Ulid;
 
     use super::*;
@@ -338,7 +340,7 @@ mod tests {
         metrics_provider,
         registry::job_store::{
             JobEnvelope, JobQueue,
-            durable::{DurableJobConsumer, DurableJobQueue, FailOutcome},
+            durable::{ClaimedJob, DurableJobConsumer, DurableJobQueue, FailOutcome},
         },
     };
 
@@ -373,6 +375,7 @@ mod tests {
             .claim_one("cache")
             .await
             .expect("claim_one")
+            .claimed
             .expect("Some");
         assert_eq!(claimed.envelope.lock_key, "cache.ns:sha256:aaa");
         consumer.complete(claimed).await.expect("complete");
@@ -381,6 +384,7 @@ mod tests {
                 .claim_one("cache")
                 .await
                 .expect("claim_one")
+                .claimed
                 .is_none(),
             "queue must be empty after complete"
         );
@@ -407,12 +411,14 @@ mod tests {
             .claim_one("cache")
             .await
             .expect("claim 1")
+            .claimed
             .expect("Some");
         assert!(
             consumer
                 .claim_one("cache")
                 .await
                 .expect("claim 2")
+                .claimed
                 .is_none(),
             "second claim on same lock_key must be None while first lease is held"
         );
@@ -446,6 +452,7 @@ mod tests {
             .claim_one("cache")
             .await
             .expect("claim after stale")
+            .claimed
             .expect("Some");
         assert_eq!(claimed.envelope.lock_key, "cache.ns:sha256:stale");
         consumer.complete(claimed).await.expect("complete");
@@ -468,6 +475,7 @@ mod tests {
             .claim_one("cache")
             .await
             .expect("claim")
+            .claimed
             .expect("Some");
         let id = claimed.envelope.id.clone();
 
@@ -501,6 +509,7 @@ mod tests {
             .claim_one("cache")
             .await
             .expect("claim")
+            .claimed
             .expect("Some");
         let id = claimed.envelope.id.clone();
 
@@ -532,5 +541,28 @@ mod tests {
             .await
             .expect("enqueue 2");
         assert_eq!(before, store.count_pending("cache").await.expect("count"));
+    }
+
+    /// Heartbeat against a non-existent lease file fails every tick; after
+    /// `MAX_HEARTBEAT_FAILURES` consecutive failures the cancellation token
+    /// must fire so `execute_one` can abort the job.
+    #[tokio::test]
+    async fn heartbeat_failures_cancel_lease_lost_token() {
+        let dir = TempDir::new().expect("temp dir");
+        let store = make_store(&dir);
+        // ttl_secs=3 → heartbeat ticks at 1 s; three consecutive failures
+        // (lease file never existed) cancel the token within ~3 s.
+        let consumer = DurableJobConsumer::new(store, 3, "test-worker".to_string());
+        let claimed = ClaimedJob {
+            envelope: dummy_envelope("cache.no-lease"),
+            lease_token: "stale-token".to_string(),
+        };
+        let lease_lost = CancellationToken::new();
+        let hb = consumer.spawn_heartbeat(&claimed, lease_lost.clone());
+
+        timeout(Duration::from_secs(6), lease_lost.cancelled())
+            .await
+            .expect("lease_lost must be cancelled within 6s");
+        let _ = hb.await;
     }
 }

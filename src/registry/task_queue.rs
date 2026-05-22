@@ -293,21 +293,23 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn max_concurrent_jobs_limits_running_tasks() {
+        // A shared `Notify` keeps the test independent of which submission
+        // wins the permit race — `notify_one` always wakes the task that
+        // currently holds the permit.
         let queue = TaskQueue::new(1).expect("failed to build TaskQueue");
         let counter = Arc::new(AtomicUsize::new(0));
-        let (first_tx, first_rx) = oneshot::channel::<()>();
-        let (second_tx, second_rx) = oneshot::channel::<()>();
+        let gate = Arc::new(Notify::new());
 
-        queue.submit("ref-first", gated_task(&counter, first_rx));
-        queue.submit("ref-second", gated_task(&counter, second_rx));
+        queue.submit("ref-first", notify_task(&counter, gate.clone()));
+        queue.submit("ref-second", notify_task(&counter, gate.clone()));
 
         assert!(wait_until_async(|| counter.load(Ordering::SeqCst) == 1).await);
         assert_eq!(queue.active_task_count(), 2);
 
-        let _ = first_tx.send(());
+        gate.notify_one();
         assert!(wait_until_async(|| counter.load(Ordering::SeqCst) == 2).await);
 
-        let _ = second_tx.send(());
+        gate.notify_one();
         assert!(wait_until_async(|| queue.active_task_count() == 0).await);
     }
 

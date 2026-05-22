@@ -6,6 +6,7 @@ use async_trait::async_trait;
 use humantime::Duration as HumanDuration;
 use tokio::{
     select,
+    sync::Semaphore,
     time::{sleep, timeout},
 };
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
@@ -53,6 +54,7 @@ pub struct Command {
     poll_interval: Duration,
     shutdown: CancellationToken,
     in_flight: TaskTracker,
+    permits: Arc<Semaphore>,
 }
 
 struct Components {
@@ -62,12 +64,14 @@ struct Components {
 
 impl Command {
     pub async fn new(options: &Options, config: &Configuration) -> Result<Self, Error> {
+        let concurrency = config.global.max_concurrent_cache_jobs.max(1);
         Ok(Self {
             inner: ArcSwap::from_pointee(Components::build(config).await?),
             queue: options.queue.clone(),
             poll_interval: *options.poll_interval,
             shutdown: CancellationToken::new(),
             in_flight: TaskTracker::new(),
+            permits: Arc::new(Semaphore::new(concurrency)),
         })
     }
 
@@ -84,6 +88,17 @@ impl Command {
 
     pub async fn run(&self) {
         loop {
+            let permit = select! {
+                () = self.shutdown.cancelled() => {
+                    debug!("Worker poll loop stopping");
+                    return;
+                }
+                acquired = self.permits.clone().acquire_owned() => match acquired {
+                    Ok(p) => p,
+                    Err(_) => return,
+                }
+            };
+
             let snapshot = self.inner.load_full();
             select! {
                 () = self.shutdown.cancelled() => {
@@ -95,14 +110,16 @@ impl Command {
                         error!("claim_one failed: {e}");
                         sleep(self.poll_interval).await;
                     }
-                    Ok(None) => sleep(self.poll_interval).await,
-                    Ok(Some(claimed)) => {
-                        let consumer = snapshot.consumer.clone();
-                        let handler = snapshot.handler.clone();
-                        let handle = self.in_flight.spawn(async move {
-                            execute_one(consumer.as_ref(), handler.as_ref(), claimed).await;
-                        });
-                        let _ = handle.await;
+                    Ok(outcome) => match outcome.claimed {
+                        None => sleep(outcome.idle_sleep(self.poll_interval)).await,
+                        Some(claimed) => {
+                            let consumer = snapshot.consumer.clone();
+                            let handler = snapshot.handler.clone();
+                            self.in_flight.spawn(async move {
+                                execute_one(consumer.as_ref(), handler.as_ref(), claimed).await;
+                                drop(permit);
+                            });
+                        }
                     }
                 }
             }

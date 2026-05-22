@@ -51,7 +51,7 @@ When omitted, the server runs without TLS (insecure).
 | Option                      | Type     | Default  | Description                                 |
 |-----------------------------|----------|----------|---------------------------------------------|
 | `max_concurrent_requests`   | usize    | `64`     | Tokio worker threads (see Performance Tuning) |
-| `max_concurrent_cache_jobs` | usize    | `4`      | Maximum concurrent cache jobs (minimum `1`) |
+| `max_concurrent_cache_jobs` | usize    | `4`      | Maximum concurrent cache jobs (minimum `1`). With `[global.job_queue]` enabled, also bounds the number of jobs each `angos worker` processes in parallel. |
 | `max_manifest_size`         | string   | `"5MiB"` | Maximum manifest body size accepted from clients or upstream registries |
 | `update_pull_time`          | bool     | `false`  | Track pull times for retention policies     |
 | `enable_redirect`           | bool     | —        | **Deprecated.** Fallback for both fields below when unset. |
@@ -76,7 +76,7 @@ defined to choose the backend.
 
 | Option | Type | Default | Description |
 |---|---|---|---|
-| `default_lease_ttl_secs` | u64 | `30` | Worker lease TTL in seconds. |
+| `default_lease_ttl_secs` | u64 | `30` | Worker lease TTL in seconds. Must be at least `9` (the heartbeat runs at `ttl/3`). |
 | `pending_refresh_interval_secs` | u64 | `15` | How often the server refreshes the `angos_job_queue_pending` gauge. |
 
 #### Filesystem backend (`global.job_queue.fs`)
@@ -95,6 +95,7 @@ defined to choose the backend.
 | `region` | string | `"us-east-1"` | AWS region. |
 | `access_key_id` | string | required | AWS access key ID. |
 | `secret_key` | string | required | AWS secret key. |
+| `delete_if_match` | bool | `true` | Whether the storage service honors `DELETE` with `If-Match: <etag>`. Set to `false` on S3-compatible endpoints without conditional delete; release then falls back to an unconditional `DELETE`. |
 
 See [Enable Durable Cache Jobs](../how-to/durable-cache-jobs.md) for a full
 setup guide including `angos worker` invocation and KEDA autoscaling.
