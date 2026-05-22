@@ -128,10 +128,8 @@ impl DurableJobConsumer {
                 Err(e) => return Err(e),
             };
             if envelope.not_before > now {
-                next_ready = Some(
-                    next_ready
-                        .map_or(envelope.not_before, |t| t.min(envelope.not_before)),
-                );
+                next_ready =
+                    Some(next_ready.map_or(envelope.not_before, |t| t.min(envelope.not_before)));
                 continue;
             }
             if let Some(token) = self
