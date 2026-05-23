@@ -134,6 +134,16 @@ pub fn job_failed_path(queue: &str, id: &str) -> String {
     format!("{JOBS_ROOT}/failed/{queue}/{id}.json")
 }
 
+/// Path to the `lock_key` → `storage_key` dedup index file. Each pending
+/// envelope has at most one such file alongside it; `find_pending_with_lock_key`
+/// reads it for an O(1) lookup instead of scanning all pending bodies.
+pub fn job_lock_key_index_path(queue: &str, lock_key: &str) -> String {
+    format!(
+        "{JOBS_ROOT}/index/{queue}/{}.json",
+        encode_job_lock_key(lock_key)
+    )
+}
+
 /// Percent-encode characters that are unsafe as a filesystem filename or as
 /// part of an S3 key path component, so a `lock_key` lands on the same path
 /// regardless of backend.
@@ -364,6 +374,10 @@ mod tests {
         assert_eq!(
             job_lease_path("cache.ns:sha256:abc"),
             "_jobs/leases/cache.ns%3Asha256%3Aabc.json"
+        );
+        assert_eq!(
+            job_lock_key_index_path("cache", "cache.ns:sha256:abc"),
+            "_jobs/index/cache/cache.ns%3Asha256%3Aabc.json"
         );
     }
 

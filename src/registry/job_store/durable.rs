@@ -225,6 +225,16 @@ impl DurableJobConsumer {
             .await?;
         self.store
             .remove_pending(&claimed.envelope.queue, &claimed.storage_key)
+            .await?;
+        // Drop the dedup index *after* the pending file is gone. A concurrent
+        // retry that already re-pointed the index at a fresher envelope is
+        // detected by the conditional check inside the backend.
+        self.store
+            .remove_lock_key_index_if_matches(
+                &claimed.envelope.queue,
+                &claimed.envelope.lock_key,
+                &claimed.storage_key,
+            )
             .await
     }
 

@@ -227,6 +227,33 @@ pub fn pending_ready_cutoff_prefix(horizon_secs: u64) -> String {
     format!("{millis:016x}")
 }
 
+/// On-disk shape of the per-`lock_key` dedup index file written alongside
+/// every pending envelope. Holds the `storage_key` of the most-recent
+/// pending file for this `lock_key`, which lets `find_pending_with_lock_key`
+/// do an O(1) `HEAD <pending>` instead of LIST-scanning bodies.
+///
+/// The index is best-effort: a crash between writing the pending file and
+/// writing the index leaves no index (next enqueue dedup-misses, spurious
+/// duplicate eventually idempotently handled). A crash between deleting the
+/// pending file and the index leaves an orphan index; the next enqueue
+/// detects this via the absent pending and self-heals.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct LockKeyIndex {
+    pub storage_key: String,
+}
+
+pub fn serialize_lock_key_index(storage_key: &str) -> Result<Vec<u8>, Error> {
+    serde_json::to_vec(&LockKeyIndex {
+        storage_key: storage_key.to_string(),
+    })
+    .map_err(|e| Error::Storage(format!("failed to serialize lock-key index: {e}")))
+}
+
+pub fn parse_lock_key_index(bytes: &[u8]) -> Result<LockKeyIndex, Error> {
+    serde_json::from_slice(bytes)
+        .map_err(|e| Error::Storage(format!("failed to parse lock-key index: {e}")))
+}
+
 /// On-disk shape of a dead-letter record.
 #[derive(Debug, Serialize)]
 struct DeadLetterRecord<'a> {
@@ -316,9 +343,15 @@ pub trait JobStore: Send + Sync {
     /// the horizon, so cost is bounded regardless of total queue depth.
     async fn count_pending(&self, queue: &str, ready_horizon_secs: u64) -> Result<u64, Error>;
 
-    /// `true` when any pending job in `queue` carries `lock_key`. Scans at
-    /// most [`MAX_SCAN`] envelopes; this is best-effort dedup, not a
-    /// correctness primitive.
+    /// `true` when any pending job in `queue` carries `lock_key`. Best-effort
+    /// dedup, not a correctness primitive — the lease is the actual
+    /// concurrency lock.
+    ///
+    /// FS and S3 override this with an O(1) implementation backed by the
+    /// per-`lock_key` index file written alongside each pending envelope
+    /// (see [`LockKeyIndex`]). The default impl below scans up to
+    /// [`MAX_SCAN`] bodies and is provided only as a correctness fallback
+    /// for future backends without an index.
     async fn find_pending_with_lock_key(&self, queue: &str, lock_key: &str) -> Result<bool, Error> {
         for storage_key in self.list_pending(queue, MAX_SCAN).await? {
             match self.read_pending(queue, &storage_key).await {
@@ -329,6 +362,17 @@ pub trait JobStore: Send + Sync {
         }
         Ok(false)
     }
+
+    /// Delete the dedup index for `lock_key` iff it still references
+    /// `storage_key`. Called by `complete` and (implicitly by) `move_to_failed`
+    /// so a concurrent retry that updated the index isn't accidentally
+    /// discarded. A missing or non-matching index is treated as success.
+    async fn remove_lock_key_index_if_matches(
+        &self,
+        queue: &str,
+        lock_key: &str,
+        storage_key: &str,
+    ) -> Result<(), Error>;
 }
 
 #[cfg(test)]

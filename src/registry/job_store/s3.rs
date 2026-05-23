@@ -7,13 +7,14 @@ use std::{
 use async_trait::async_trait;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use serde::{Deserialize, Serialize};
-use tracing::debug;
+use tracing::{debug, warn};
 
 use crate::{
     registry::{
         job_store::{
             Error, JobEnvelope, JobStore, MAX_REPORTED_PENDING, STORAGE_KEY_PREFIX_LEN,
-            make_storage_key, pending_ready_cutoff_prefix, serialize_dead_letter,
+            make_storage_key, parse_lock_key_index, pending_ready_cutoff_prefix,
+            serialize_dead_letter, serialize_lock_key_index,
         },
         path_builder,
     },
@@ -181,6 +182,26 @@ impl JobStore for Backend {
             .put_object(&key, data)
             .await
             .map_err(|e| s3_io_to_job_err(&e))?;
+        // Best-effort dedup index refresh after the pending file lands.
+        // Failure here merely weakens dedup (next enqueue may create a
+        // duplicate, which the lease + idempotency contract handles).
+        let index_path = path_builder::job_lock_key_index_path(queue, &envelope.lock_key);
+        match serialize_lock_key_index(&storage_key) {
+            Ok(index_bytes) => {
+                if let Err(e) = self.backend.put_object(&index_path, index_bytes).await {
+                    warn!(
+                        lock_key = envelope.lock_key.as_str(),
+                        error = %e,
+                        "Failed to write S3 lock-key index"
+                    );
+                }
+            }
+            Err(e) => warn!(
+                lock_key = envelope.lock_key.as_str(),
+                error = %e,
+                "Failed to serialize lock-key index"
+            ),
+        }
         Ok(storage_key)
     }
 
@@ -290,7 +311,88 @@ impl JobStore for Backend {
             .put_object(&failed_key, data)
             .await
             .map_err(|e| s3_io_to_job_err(&e))?;
-        self.remove_pending(queue, storage_key).await
+        self.remove_pending(queue, storage_key).await?;
+        // Drop the dedup index only if it still references this storage key —
+        // a concurrent retry may have re-pointed it at a fresher envelope.
+        self.remove_lock_key_index_if_matches(queue, &envelope.lock_key, storage_key)
+            .await
+    }
+
+    /// O(1) dedup check backed by the per-`lock_key` index object. If the
+    /// index references a `storage_key` that no longer exists (left over by
+    /// a crash mid-`complete`/`move_to_failed`), the orphan is deleted and
+    /// the check reports no-pending so the next enqueue proceeds.
+    async fn find_pending_with_lock_key(&self, queue: &str, lock_key: &str) -> Result<bool, Error> {
+        let index_path = path_builder::job_lock_key_index_path(queue, lock_key);
+        let data = match self.backend.read(&index_path).await {
+            Ok(d) => d,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(e) => return Err(Error::Storage(format!("read lock-key index: {e}"))),
+        };
+        let index = parse_lock_key_index(&data)?;
+
+        let pending_key = path_builder::job_pending_path(queue, &index.storage_key);
+        match self.backend.object_size(&pending_key).await {
+            Ok(_) => Ok(true),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // Orphan: pending vanished but index lingers. Clear it.
+                if let Err(remove_err) = self.backend.delete(&index_path).await {
+                    warn!(
+                        lock_key,
+                        error = %remove_err,
+                        "Failed to remove orphan lock-key index"
+                    );
+                }
+                Ok(false)
+            }
+            Err(e) => Err(Error::Storage(format!(
+                "HEAD pending via lock-key index: {e}"
+            ))),
+        }
+    }
+
+    async fn remove_lock_key_index_if_matches(
+        &self,
+        queue: &str,
+        lock_key: &str,
+        storage_key: &str,
+    ) -> Result<(), Error> {
+        let index_path = path_builder::job_lock_key_index_path(queue, lock_key);
+        // Read body + etag so we can do a conditional delete and avoid a TOCTOU
+        // against a concurrent retry that re-pointed the index.
+        let (data, etag) = match self.backend.read_with_etag(&index_path).await {
+            Ok(r) => r,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => {
+                warn!(lock_key, error = %e, "Failed to read lock-key index before remove");
+                return Ok(());
+            }
+        };
+        match parse_lock_key_index(&data) {
+            Ok(index) if index.storage_key == storage_key => {}
+            Ok(_) => return Ok(()), // index points elsewhere; leave it
+            Err(_) => {}             // corrupt — fall through and delete
+        }
+
+        if let Some(etag) = etag {
+            match self.backend.delete_if_match(&index_path, &etag).await {
+                Ok(()) | Err(s3_client::Error::PreconditionFailed) => Ok(()),
+                Err(e) => {
+                    warn!(lock_key, error = %e, "Failed conditional delete of lock-key index");
+                    Ok(())
+                }
+            }
+        } else {
+            // Endpoint didn't return ETag — fall back to unconditional delete.
+            match self.backend.delete(&index_path).await {
+                Ok(()) => Ok(()),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(e) => {
+                    warn!(lock_key, error = %e, "Failed to delete lock-key index");
+                    Ok(())
+                }
+            }
+        }
     }
 
     async fn count_pending(&self, queue: &str, ready_horizon_secs: u64) -> Result<u64, Error> {
@@ -305,7 +407,7 @@ impl JobStore for Backend {
                 .await
                 .map_err(|e| s3_io_to_job_err(&e))?;
             for k in &keys {
-                if !Path::new(k).extension().is_some_and(|ext| ext == "json") {
+                if Path::new(k).extension().is_none_or(|ext| ext != "json") {
                     continue;
                 }
                 // S3 LIST returns keys in lexicographic order; the storage-key

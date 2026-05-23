@@ -15,7 +15,8 @@ use crate::registry::{
     fs_ops,
     job_store::{
         Error, JobEnvelope, JobStore, MAX_REPORTED_PENDING, STORAGE_KEY_PREFIX_LEN,
-        make_storage_key, pending_ready_cutoff_prefix, serialize_dead_letter,
+        make_storage_key, parse_lock_key_index, pending_ready_cutoff_prefix,
+        serialize_dead_letter, serialize_lock_key_index,
     },
     path_builder,
 };
@@ -76,6 +77,29 @@ impl Backend {
     fn failed_path(&self, queue: &str, storage_key: &str) -> PathBuf {
         self.root_dir
             .join(path_builder::job_failed_path(queue, storage_key))
+    }
+
+    fn lock_key_index_path(&self, queue: &str, lock_key: &str) -> PathBuf {
+        self.root_dir
+            .join(path_builder::job_lock_key_index_path(queue, lock_key))
+    }
+
+    /// Best-effort upsert of the dedup index pointing at `storage_key`.
+    /// Failures are logged and swallowed: the pending file is already on disk,
+    /// and a missing index only weakens dedup (next enqueue may produce a
+    /// duplicate, which the lease + idempotency contract handles).
+    async fn upsert_lock_key_index(&self, queue: &str, lock_key: &str, storage_key: &str) {
+        let path = self.lock_key_index_path(queue, lock_key);
+        let data = match serialize_lock_key_index(storage_key) {
+            Ok(d) => d,
+            Err(e) => {
+                warn!(lock_key, error = %e, "Failed to serialize lock-key index");
+                return;
+            }
+        };
+        if let Err(e) = fs_ops::atomic_write(&path, &data, false).await {
+            warn!(lock_key, error = %e, "Failed to write lock-key index");
+        }
     }
 
     /// Write a new lease file using `create_new` atomicity. Returns the new
@@ -182,6 +206,11 @@ impl JobStore for Backend {
         fs_ops::atomic_write(&path, &data, false)
             .await
             .map_err(|e| Error::Storage(format!("failed to write pending job: {e}")))?;
+        // Refresh dedup index *after* the pending file lands. A crash here
+        // weakens dedup (a future enqueue may create a duplicate), never
+        // strengthens it (we never claim dedup without backing pending).
+        self.upsert_lock_key_index(queue, &envelope.lock_key, &storage_key)
+            .await;
         Ok(storage_key)
     }
 
@@ -320,7 +349,83 @@ impl JobStore for Backend {
         fs_ops::atomic_write(&failed_path, &data, false)
             .await
             .map_err(|e| Error::Storage(format!("failed to write dead-letter: {e}")))?;
-        self.remove_pending(queue, storage_key).await
+        self.remove_pending(queue, storage_key).await?;
+        // Drop the dedup index only if it still references this storage key —
+        // a concurrent retry may have re-pointed it at a fresher envelope.
+        self.remove_lock_key_index_if_matches(queue, &envelope.lock_key, storage_key)
+            .await
+    }
+
+    /// O(1) dedup check backed by the per-`lock_key` index file. The index
+    /// references a `storage_key`; if that pending file no longer exists the
+    /// index is an orphan (left over by a crash mid-`complete`/`move_to_failed`)
+    /// — delete it and report no-pending, so the next enqueue can proceed.
+    async fn find_pending_with_lock_key(&self, queue: &str, lock_key: &str) -> Result<bool, Error> {
+        let index_path = self.lock_key_index_path(queue, lock_key);
+        let data = match fs::read(&index_path).await {
+            Ok(d) => d,
+            Err(e) if e.kind() == ErrorKind::NotFound => return Ok(false),
+            Err(e) => {
+                return Err(Error::Storage(format!(
+                    "failed to read lock-key index: {e}"
+                )));
+            }
+        };
+        let index = parse_lock_key_index(&data)?;
+
+        let pending_path = self.pending_path(queue, &index.storage_key);
+        match fs::metadata(&pending_path).await {
+            Ok(_) => Ok(true),
+            Err(e) if e.kind() == ErrorKind::NotFound => {
+                // Orphan: pending vanished but index lingers. Clear it so the
+                // caller proceeds as a dedup miss.
+                if let Err(remove_err) = fs::remove_file(&index_path).await
+                    && remove_err.kind() != ErrorKind::NotFound
+                {
+                    warn!(
+                        lock_key,
+                        error = %remove_err,
+                        "Failed to remove orphan lock-key index"
+                    );
+                }
+                Ok(false)
+            }
+            Err(e) => Err(Error::Storage(format!(
+                "failed to stat pending file via lock-key index: {e}"
+            ))),
+        }
+    }
+
+    async fn remove_lock_key_index_if_matches(
+        &self,
+        queue: &str,
+        lock_key: &str,
+        storage_key: &str,
+    ) -> Result<(), Error> {
+        let path = self.lock_key_index_path(queue, lock_key);
+        match fs::read(&path).await {
+            Ok(data) => match parse_lock_key_index(&data) {
+                Ok(index) if index.storage_key == storage_key => {}
+                Ok(_) => return Ok(()), // index now points elsewhere; leave it
+                Err(_) => {} // corrupt — fall through and delete
+            },
+            Err(e) if e.kind() == ErrorKind::NotFound => return Ok(()),
+            Err(e) => {
+                warn!(lock_key, error = %e, "Failed to read lock-key index before remove");
+                return Ok(());
+            }
+        }
+        // Best-effort: a race that re-wrote the index between our check and
+        // this unlink, or an unrelated I/O blip, is fine — the next enqueue
+        // either dedups against the new index or self-heals the orphan.
+        match fs::remove_file(&path).await {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == ErrorKind::NotFound => Ok(()),
+            Err(e) => {
+                warn!(lock_key, error = %e, "Failed to remove lock-key index");
+                Ok(())
+            }
+        }
     }
 
     async fn count_pending(&self, queue: &str, ready_horizon_secs: u64) -> Result<u64, Error> {
@@ -335,7 +440,7 @@ impl JobStore for Backend {
         let cutoff_prefix = pending_ready_cutoff_prefix(ready_horizon_secs);
         let mut count: u64 = 0;
         for name in &entries {
-            if !Path::new(name).extension().is_some_and(|ext| ext == "json") {
+            if Path::new(name).extension().is_none_or(|ext| ext != "json") {
                 continue;
             }
             if let Some(p) = name.get(..STORAGE_KEY_PREFIX_LEN)
@@ -644,6 +749,212 @@ mod tests {
         assert!(
             diff < 2,
             "next_ready ({next}) must match scheduled time ({scheduled}); diff={diff}ms"
+        );
+    }
+
+    /// `find_pending_with_lock_key` must succeed without reading any pending
+    /// envelope body: an enqueue under a very deep queue is a single index
+    /// HEAD, not a scan. We verify this indirectly by tampering with all the
+    /// pending bodies after the index is written — if the dedup path read
+    /// any body it would fail (or at least return the wrong answer).
+    #[tokio::test]
+    async fn dedup_lookup_does_not_read_pending_bodies() {
+        let dir = TempDir::new().expect("temp dir");
+        let store = make_store(&dir);
+
+        let env = dummy_envelope("cache.ns:sha256:nobody-reads-this");
+        store
+            .put_pending("cache", &env, Utc::now())
+            .await
+            .expect("put");
+
+        // Corrupt the pending body. If dedup ever reads it, parsing would
+        // fail and the test would surface that — both as a hard error and
+        // by the dedup returning false.
+        let pending_path = store.pending_path("cache", &{
+            let now = Utc::now();
+            make_storage_key(now, &env.id)
+        });
+        // Reuse the actual filename we just wrote (the millis prefix is
+        // approximate above) — list the directory and find our entry.
+        let queue_dir = store.pending_dir("cache");
+        let entries = tokio::fs::read_dir(&queue_dir)
+            .await
+            .expect("read pending dir");
+        let mut entries = entries;
+        while let Some(entry) = entries.next_entry().await.expect("next entry") {
+            tokio::fs::write(entry.path(), b"NOT VALID JSON, ANYWHERE")
+                .await
+                .expect("corrupt pending");
+        }
+        let _ = pending_path; // suppress unused if path heuristic changed
+
+        // Dedup should still report a hit — purely from the index file.
+        assert!(
+            store
+                .find_pending_with_lock_key("cache", "cache.ns:sha256:nobody-reads-this")
+                .await
+                .expect("dedup"),
+            "find_pending_with_lock_key must succeed via the index, not the body"
+        );
+    }
+
+    /// A crash mid-`complete` could leave an orphan index pointing at a
+    /// pending file that no longer exists. The next `find_pending_with_lock_key`
+    /// must detect the orphan, delete the stale index, and report no-pending
+    /// so the next enqueue can proceed.
+    #[tokio::test]
+    async fn orphan_index_is_self_healed_on_next_lookup() {
+        let dir = TempDir::new().expect("temp dir");
+        let store = make_store(&dir);
+        let lock_key = "cache.ns:sha256:orphan";
+
+        // Hand-craft an orphan: write the index pointing at a non-existent
+        // pending file. (This is the on-disk shape after a crash between
+        // remove_pending and remove_lock_key_index_if_matches.)
+        let storage_key = make_storage_key(Utc::now(), "phantom-id");
+        let index_path = store.lock_key_index_path("cache", lock_key);
+        let data = crate::registry::job_store::serialize_lock_key_index(&storage_key)
+            .expect("serialize");
+        fs_ops::atomic_write(&index_path, &data, false)
+            .await
+            .expect("write index");
+        assert!(index_path.exists(), "fixture: index file must exist");
+
+        // First lookup detects the orphan and reports no-pending.
+        let hit = store
+            .find_pending_with_lock_key("cache", lock_key)
+            .await
+            .expect("lookup");
+        assert!(!hit, "orphan index must not register as a dedup hit");
+
+        // And the index file must be gone now (self-healed).
+        assert!(
+            !index_path.exists(),
+            "orphan index must be deleted after detection"
+        );
+    }
+
+    /// After a retry, the dedup index must point at the *new* storage key
+    /// (the one with the bumped `not_before`), not the now-deleted old one.
+    /// Otherwise the next enqueue would either dedup-miss (creating a
+    /// duplicate) or treat the live entry as an orphan.
+    #[tokio::test]
+    async fn retry_updates_lock_key_index_to_new_storage_key() {
+        let dir = TempDir::new().expect("temp dir");
+        let store = make_store(&dir);
+        let consumer = make_consumer(store.clone());
+        let lock_key = "cache.ns:sha256:retry-index";
+
+        let mut env = dummy_envelope(lock_key);
+        env.max_attempts = 3;
+        store
+            .put_pending("cache", &env, Utc::now())
+            .await
+            .expect("put");
+
+        let claimed = consumer
+            .claim_one("cache")
+            .await
+            .expect("claim")
+            .claimed
+            .expect("Some");
+        let old_storage_key = claimed.storage_key.clone();
+
+        assert!(matches!(
+            consumer.fail(claimed, "boom").await.expect("fail"),
+            FailOutcome::Retried { .. }
+        ));
+
+        // Only one pending file remains — the new one.
+        let pending = store.list_pending("cache", 10).await.expect("list");
+        assert_eq!(pending.len(), 1);
+        let new_storage_key = &pending[0];
+        assert_ne!(new_storage_key, &old_storage_key);
+
+        // Read the index and confirm it now points at the new storage key.
+        let index_path = store.lock_key_index_path("cache", lock_key);
+        let data = tokio::fs::read(&index_path).await.expect("read index");
+        let index = crate::registry::job_store::parse_lock_key_index(&data).expect("parse");
+        assert_eq!(&index.storage_key, new_storage_key);
+
+        // And dedup still works through the index.
+        assert!(
+            store
+                .find_pending_with_lock_key("cache", lock_key)
+                .await
+                .expect("dedup"),
+            "dedup must still hit after retry"
+        );
+    }
+
+    /// On `complete`, the dedup index must be removed so the next enqueue for
+    /// the same `lock_key` proceeds (no false dedup against a finished job).
+    #[tokio::test]
+    async fn complete_removes_lock_key_index() {
+        let dir = TempDir::new().expect("temp dir");
+        let store = make_store(&dir);
+        let consumer = make_consumer(store.clone());
+        let lock_key = "cache.ns:sha256:complete-clears-index";
+
+        let env = dummy_envelope(lock_key);
+        store
+            .put_pending("cache", &env, Utc::now())
+            .await
+            .expect("put");
+
+        let claimed = consumer
+            .claim_one("cache")
+            .await
+            .expect("claim")
+            .claimed
+            .expect("Some");
+        consumer.complete(claimed).await.expect("complete");
+
+        assert!(
+            !store.lock_key_index_path("cache", lock_key).exists(),
+            "index must be removed on complete"
+        );
+        assert!(
+            !store
+                .find_pending_with_lock_key("cache", lock_key)
+                .await
+                .expect("dedup"),
+            "no dedup hit after complete"
+        );
+    }
+
+    /// On dead-letter, the dedup index must also be removed: any future
+    /// re-enqueue for the same `lock_key` should not be falsely deduplicated
+    /// against a job that exhausted its retry budget.
+    #[tokio::test]
+    async fn dead_letter_removes_lock_key_index() {
+        let dir = TempDir::new().expect("temp dir");
+        let store = make_store(&dir);
+        let consumer = make_consumer(store.clone());
+        let lock_key = "cache.ns:sha256:dlq-clears-index";
+
+        let mut env = dummy_envelope(lock_key);
+        env.max_attempts = 1;
+        store
+            .put_pending("cache", &env, Utc::now())
+            .await
+            .expect("put");
+
+        let claimed = consumer
+            .claim_one("cache")
+            .await
+            .expect("claim")
+            .claimed
+            .expect("Some");
+        assert!(matches!(
+            consumer.fail(claimed, "final").await.expect("fail"),
+            FailOutcome::MovedToDeadLetter
+        ));
+
+        assert!(
+            !store.lock_key_index_path("cache", lock_key).exists(),
+            "index must be removed on DLQ"
         );
     }
 
