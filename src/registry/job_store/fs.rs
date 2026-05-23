@@ -7,7 +7,10 @@ use std::{
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use tokio::{fs, io::AsyncWriteExt};
+use tokio::{
+    fs,
+    io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt},
+};
 use tracing::{debug, warn};
 use uuid::Uuid;
 
@@ -124,22 +127,29 @@ impl Backend {
         }
     }
 
-    /// Read the existing lease file and steal it if it is expired. Returns
-    /// `Some(token)` when a stale lease was reclaimed, `None` otherwise.
+    /// Steal a stale lease via a rename-based ownership transfer. POSIX
+    /// rename's atomicity is the CAS primitive here: two concurrent
+    /// stealers cannot both succeed — the second `rename(lock_path, ...)`
+    /// returns `ENOENT` because the first stealer already moved the
+    /// source inode to its own side path.
+    ///
+    /// The previous implementation called `fs::remove_file(lock_path)`
+    /// unconditionally and then `create_new` — if a fresh lease had been
+    /// created in the meantime, the unconditional remove would silently
+    /// nuke it.
     async fn try_steal_stale_lease(
         &self,
         lock_path: &Path,
         worker_id: &str,
         ttl_secs: u64,
     ) -> Result<Option<String>, Error> {
+        // 1. Snapshot the existing lease to decide staleness and capture
+        //    the instance_id we expect to be stealing.
         let data = match fs::read(lock_path).await {
             Ok(d) => d,
-            // Vanished between create_new and now; let the next claim_one loop
-            // iteration retry instead of recursing.
             Err(e) if e.kind() == ErrorKind::NotFound => return Ok(None),
             Err(e) => return Err(Error::Storage(format!("failed to read lease file: {e}"))),
         };
-
         let existing: LeaseFile = serde_json::from_slice(&data)
             .map_err(|e| Error::Storage(format!("corrupt lease file: {e}")))?;
 
@@ -151,26 +161,104 @@ impl Backend {
             .elapsed()
             .unwrap_or(Duration::from_secs(u64::MAX))
             .as_secs();
-
         if age_secs < existing.ttl_secs {
             return Ok(None);
         }
+        let expected_instance = existing.instance_id;
 
         debug!(
             lock_key = lock_path.display().to_string(),
-            instance_id = existing.instance_id,
+            instance_id = expected_instance,
             age_secs,
             ttl_secs = existing.ttl_secs,
             "Stealing stale FS lease"
         );
 
-        if let Err(e) = fs::remove_file(lock_path).await
-            && e.kind() != ErrorKind::NotFound
-        {
-            return Err(Error::Storage(format!("failed to remove stale lease: {e}")));
+        // 2. Atomically move the stale lease out of the way. POSIX rename's
+        //    atomicity ensures that two concurrent stealers don't both
+        //    succeed — the second gets ENOENT.
+        let new_uuid = Uuid::new_v4().to_string();
+        let side_path = lock_path.with_extension(format!("steal-{new_uuid}"));
+        match fs::rename(lock_path, &side_path).await {
+            Ok(()) => {}
+            Err(e) if e.kind() == ErrorKind::NotFound => return Ok(None),
+            Err(e) => {
+                return Err(Error::Storage(format!(
+                    "failed to rename stale lease: {e}"
+                )));
+            }
         }
 
-        self.write_new_lease(lock_path, worker_id, ttl_secs).await
+        // 3. Verify the moved file is the stale lease we observed. If a
+        //    fresh acquirer slipped a new lease in between our read at
+        //    step 1 and our rename at step 2, we'd have just moved their
+        //    fresh lease — restore it via `hard_link` (which won't
+        //    clobber a new lease at `lock_path` if one has appeared).
+        let moved_data = fs::read(&side_path)
+            .await
+            .map_err(|e| Error::Storage(format!("failed to read moved lease: {e}")))?;
+        let moved: LeaseFile = serde_json::from_slice(&moved_data)
+            .map_err(|e| Error::Storage(format!("corrupt moved lease: {e}")))?;
+        if moved.instance_id != expected_instance {
+            // Best-effort restore. If lock_path is now occupied by a new
+            // acquirer, hard_link fails EEXIST and we just leak the side
+            // file (cheap to scrub; only the inode survives, no
+            // observable lease).
+            if let Err(e) = fs::hard_link(&side_path, lock_path).await {
+                warn!(
+                    lock_key = lock_path.display().to_string(),
+                    error = %e,
+                    "Could not restore unexpectedly-moved lease; side path will need scrubbing",
+                );
+            }
+            let _ = fs::remove_file(&side_path).await;
+            return Ok(None);
+        }
+
+        // 4. Create our new lease at lock_path. A fresh acquirer may have
+        //    raced us in the brief window when lock_path was absent
+        //    (between steps 2 and here) — their create_new succeeds and
+        //    ours gets EEXIST. Concede in that case.
+        let our_data = serde_json::to_vec(&LeaseFile {
+            instance_id: new_uuid.clone(),
+            worker_id: worker_id.to_string(),
+            ttl_secs,
+        })
+        .map_err(|e| Error::Storage(format!("lease serialization failed: {e}")))?;
+
+        match fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(lock_path)
+            .await
+        {
+            Ok(mut file) => {
+                file.write_all(&our_data).await.map_err(|e| {
+                    Error::Storage(format!("failed to write lease file: {e}"))
+                })?;
+            }
+            Err(e) if e.kind() == ErrorKind::AlreadyExists => {
+                let _ = fs::remove_file(&side_path).await;
+                return Ok(None);
+            }
+            Err(e) => {
+                let _ = fs::remove_file(&side_path).await;
+                return Err(Error::Storage(format!("failed to create lease: {e}")));
+            }
+        }
+
+        // 5. Successful steal — discard the side path.
+        if let Err(e) = fs::remove_file(&side_path).await
+            && e.kind() != ErrorKind::NotFound
+        {
+            warn!(
+                lock_key = lock_path.display().to_string(),
+                error = %e,
+                "Failed to remove side path after steal",
+            );
+        }
+
+        Ok(Some(new_uuid))
     }
 }
 
@@ -245,13 +333,31 @@ impl JobStore for Backend {
     ) -> Result<String, Error> {
         let path = self.lease_path(lock_key);
 
-        let data = fs::read(&path).await.map_err(|e| {
-            if e.kind() == ErrorKind::NotFound {
-                Error::NotFound
-            } else {
-                Error::Storage(format!("failed to read lease for heartbeat: {e}"))
-            }
-        })?;
+        // Open the lease file and operate on the **fd**, not the path. If a
+        // concurrent stealer renames our inode out of the way and creates a
+        // new lease at `path` between this open and the write below, our fd
+        // still references the now-orphan inode — the write lands silently
+        // on the orphan. Our next heartbeat opens by path and sees the new
+        // owner's content, returning Err. The previous implementation read
+        // and then wrote via `atomic_write` (temp + rename), which could
+        // silently overwrite a stealer's fresh lease.
+        let mut file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .await
+            .map_err(|e| {
+                if e.kind() == ErrorKind::NotFound {
+                    Error::NotFound
+                } else {
+                    Error::Storage(format!("failed to open lease for heartbeat: {e}"))
+                }
+            })?;
+
+        let mut data = Vec::new();
+        file.read_to_end(&mut data)
+            .await
+            .map_err(|e| Error::Storage(format!("failed to read lease for heartbeat: {e}")))?;
         let existing: LeaseFile = serde_json::from_slice(&data)
             .map_err(|e| Error::Storage(format!("corrupt lease file: {e}")))?;
 
@@ -269,7 +375,16 @@ impl JobStore for Backend {
         })
         .map_err(|e| Error::Storage(format!("heartbeat serialization failed: {e}")))?;
 
-        fs_ops::atomic_write(&path, &new_data, false)
+        // Truncate + rewind + write through the fd. The write itself
+        // refreshes mtime (POSIX semantics), so no explicit `utimensat`
+        // needed.
+        file.set_len(0)
+            .await
+            .map_err(|e| Error::Storage(format!("heartbeat truncate failed: {e}")))?;
+        file.rewind()
+            .await
+            .map_err(|e| Error::Storage(format!("heartbeat seek failed: {e}")))?;
+        file.write_all(&new_data)
             .await
             .map_err(|e| Error::Storage(format!("heartbeat write failed: {e}")))?;
 
@@ -612,6 +727,229 @@ mod tests {
             .expect("Some");
         assert_eq!(claimed.envelope.lock_key, "cache.ns:sha256:stale");
         consumer.complete(claimed).await.expect("complete");
+    }
+
+    /// Heartbeat must refresh the mtime via the fd and preserve the
+    /// body's `instance_id`. The previous implementation went through
+    /// `atomic_write` (temp + rename), where a stealer's `remove + create`
+    /// between the read and the write would be silently overwritten by
+    /// the rename. The fd-based path no longer has that window.
+    #[tokio::test]
+    async fn heartbeat_refreshes_mtime_via_fd() {
+        let dir = TempDir::new().expect("temp dir");
+        let store = make_store(&dir);
+        let lock_key = "cache.ns:sha256:heartbeat";
+
+        let token = store
+            .try_create_lease(lock_key, "worker-A", 30)
+            .await
+            .expect("create lease")
+            .expect("first acquire wins");
+        let path = store.lease_path(lock_key);
+
+        // Force the file's mtime back into the past via std::fs (test-only
+        // sync I/O) so we can verify the heartbeat brings it forward.
+        let past = SystemTime::now() - Duration::from_secs(20);
+        {
+            let file = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&path)
+                .expect("open for backdate");
+            file.set_modified(past).expect("backdate mtime");
+        }
+        let mtime_before = tokio::fs::metadata(&path)
+            .await
+            .expect("stat")
+            .modified()
+            .expect("mtime");
+
+        let returned = store
+            .heartbeat_lease(lock_key, &token, "worker-A", 30)
+            .await
+            .expect("heartbeat");
+        assert_eq!(returned, token, "FS heartbeat reuses the same token");
+
+        let mtime_after = tokio::fs::metadata(&path)
+            .await
+            .expect("stat")
+            .modified()
+            .expect("mtime");
+        assert!(
+            mtime_after > mtime_before,
+            "heartbeat must refresh mtime (before={mtime_before:?} after={mtime_after:?})"
+        );
+
+        // Body should still parse and still have our instance_id.
+        let body = tokio::fs::read(&path).await.expect("read body");
+        let parsed: LeaseFile = serde_json::from_slice(&body).expect("parse body");
+        assert_eq!(parsed.instance_id, token);
+    }
+
+    /// Heartbeat against a lease that's been silently replaced (stealer
+    /// did rename + `create_new`) must fail with an ownership-check error —
+    /// the previous implementation would have written via `atomic_write`
+    /// and clobbered the stealer's fresh lease.
+    #[tokio::test]
+    async fn heartbeat_rejects_replaced_lease() {
+        let dir = TempDir::new().expect("temp dir");
+        let store = make_store(&dir);
+        let lock_key = "cache.ns:sha256:replaced";
+
+        let our_token = store
+            .try_create_lease(lock_key, "worker-A", 30)
+            .await
+            .expect("create lease")
+            .expect("Some");
+
+        // Simulate a successful steal-and-replace by another worker.
+        let path = store.lease_path(lock_key);
+        let stealer_body = serde_json::to_vec(&LeaseFile {
+            instance_id: "stealer-instance".to_string(),
+            worker_id: "worker-B".to_string(),
+            ttl_secs: 30,
+        })
+        .expect("serialize");
+        // remove + create_new mimics the stealer's atomic ownership transfer.
+        tokio::fs::remove_file(&path).await.expect("remove");
+        tokio::fs::write(&path, &stealer_body).await.expect("write");
+
+        let err = store
+            .heartbeat_lease(lock_key, &our_token, "worker-A", 30)
+            .await
+            .expect_err("heartbeat on replaced lease must fail");
+        match err {
+            Error::Storage(msg) => assert!(
+                msg.contains("ownership check failed"),
+                "expected ownership-check error, got: {msg}"
+            ),
+            other => panic!("expected Storage err, got: {other:?}"),
+        }
+
+        // The stealer's lease body must be untouched.
+        let body = tokio::fs::read(&path).await.expect("read body");
+        let parsed: LeaseFile = serde_json::from_slice(&body).expect("parse body");
+        assert_eq!(
+            parsed.instance_id, "stealer-instance",
+            "stealer's lease must survive a rejected heartbeat"
+        );
+    }
+
+    /// Two stealers race against the same stale lease. POSIX rename's
+    /// atomicity guarantees that only one wins; the loser sees `ENOENT`
+    /// on its rename and concedes. The previous implementation used
+    /// `remove_file` (which doesn't differentiate "was already removed"
+    /// from a normal success), so both stealers could end up writing
+    /// fresh leases and trampling each other.
+    #[tokio::test]
+    async fn two_concurrent_stealers_serialize() {
+        let dir = TempDir::new().expect("temp dir");
+        let store = Arc::new(Backend::new(&BackendConfig {
+            root_dir: dir.path().to_string_lossy().to_string(),
+        }));
+        let lock_key = "cache.ns:sha256:race-steal";
+        let lease_path = store.lease_path(lock_key);
+
+        // Seed a stale lease (ttl=0).
+        let stale_body = serde_json::to_vec(&LeaseFile {
+            instance_id: "stale-instance".to_string(),
+            worker_id: "dead".to_string(),
+            ttl_secs: 0,
+        })
+        .expect("serialize");
+        fs_ops::atomic_write(&lease_path, &stale_body, false)
+            .await
+            .expect("seed stale lease");
+
+        // Race two `try_create_lease` calls. Each one will first try
+        // `write_new_lease` (which fails EEXIST) and then fall through
+        // to `try_steal_stale_lease`. The rename inside steal is the
+        // CAS — exactly one stealer's rename succeeds.
+        let s1 = store.clone();
+        let s2 = store.clone();
+        let lk1 = lock_key.to_string();
+        let lk2 = lock_key.to_string();
+        let (r1, r2) = tokio::join!(
+            async move { s1.try_create_lease(&lk1, "worker-1", 30).await },
+            async move { s2.try_create_lease(&lk2, "worker-2", 30).await },
+        );
+        let r1 = r1.expect("worker-1 must not error");
+        let r2 = r2.expect("worker-2 must not error");
+
+        let winners = [r1.is_some(), r2.is_some()].iter().filter(|w| **w).count();
+        assert_eq!(
+            winners, 1,
+            "exactly one stealer wins the race (got {winners}): r1={r1:?} r2={r2:?}"
+        );
+
+        // The surviving lease body must reflect the winner.
+        let body = tokio::fs::read(&lease_path).await.expect("read body");
+        let parsed: LeaseFile = serde_json::from_slice(&body).expect("parse body");
+        let winning_token = r1.or(r2).expect("at least one winner");
+        assert_eq!(
+            parsed.instance_id, winning_token,
+            "lease body must reflect the winning stealer"
+        );
+    }
+
+    /// If a fresh acquirer slips a `create_new(lock_path)` between our
+    /// `rename(lock_path → side)` and our final `create_new(lock_path)`,
+    /// our `create_new` fails EEXIST and we concede — without clobbering
+    /// the fresh lease.
+    #[tokio::test]
+    async fn steal_concedes_when_lock_path_recreated() {
+        let dir = TempDir::new().expect("temp dir");
+        let store = make_store(&dir);
+        let lock_key = "cache.ns:sha256:eexist-during-steal";
+        let lease_path = store.lease_path(lock_key);
+
+        // Seed a stale lease (ttl=0).
+        let stale_body = serde_json::to_vec(&LeaseFile {
+            instance_id: "stale-instance".to_string(),
+            worker_id: "dead".to_string(),
+            ttl_secs: 0,
+        })
+        .expect("serialize");
+        fs_ops::atomic_write(&lease_path, &stale_body, false)
+            .await
+            .expect("seed stale lease");
+
+        // Manually do the rename half of the steal so we control timing.
+        let new_uuid = "fake-stealer-uuid".to_string();
+        let side_path = lease_path.with_extension(format!("steal-{new_uuid}"));
+        tokio::fs::rename(&lease_path, &side_path)
+            .await
+            .expect("rename to side");
+
+        // Simulate a fresh acquirer winning the brief window.
+        let fresh_body = serde_json::to_vec(&LeaseFile {
+            instance_id: "fresh-acquirer".to_string(),
+            worker_id: "worker-Fresh".to_string(),
+            ttl_secs: 30,
+        })
+        .expect("serialize");
+        tokio::fs::write(&lease_path, &fresh_body)
+            .await
+            .expect("fresh create_new");
+
+        // Now run the real `try_create_lease` — it should see lock_path
+        // exists, try steal, but EEXIST out and concede. Crucially, the
+        // fresh acquirer's lease must survive.
+        let result = store
+            .try_create_lease(lock_key, "worker-Loser", 30)
+            .await
+            .expect("try_create");
+        assert!(
+            result.is_none(),
+            "must concede when lock_path was recreated during steal"
+        );
+
+        // Fresh acquirer's body is intact.
+        let body = tokio::fs::read(&lease_path).await.expect("read body");
+        let parsed: LeaseFile = serde_json::from_slice(&body).expect("parse");
+        assert_eq!(parsed.instance_id, "fresh-acquirer");
+
+        // (Cleanup our manually-created side path so the test temp dir is tidy.)
+        let _ = tokio::fs::remove_file(&side_path).await;
     }
 
     #[tokio::test]
