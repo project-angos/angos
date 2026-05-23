@@ -578,10 +578,7 @@ mod tests {
                 .expect("write stub");
         }
         // Horizon doesn't matter here — every stub is scheduled at "now".
-        let count = store
-            .count_pending("cache", 600)
-            .await
-            .expect("count");
+        let count = store.count_pending("cache", 600).await.expect("count");
         assert_eq!(count, MAX_REPORTED_PENDING);
     }
 
@@ -616,10 +613,7 @@ mod tests {
                 .expect("write future");
         }
 
-        let count = store
-            .count_pending("cache", 60)
-            .await
-            .expect("count");
+        let count = store.count_pending("cache", 60).await.expect("count");
         assert_eq!(count, 2, "only the ready envelopes must be counted");
     }
 

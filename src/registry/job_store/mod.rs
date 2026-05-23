@@ -221,7 +221,8 @@ pub const MAX_REPORTED_PENDING: u64 = 10_000;
 /// `horizon_secs` is sourced from
 /// [`JobQueueConfig::pending_ready_horizon_secs`].
 pub fn pending_ready_cutoff_prefix(horizon_secs: u64) -> String {
-    let cutoff = Utc::now() + chrono::Duration::seconds(i64::try_from(horizon_secs).unwrap_or(i64::MAX));
+    let cutoff =
+        Utc::now() + chrono::Duration::seconds(i64::try_from(horizon_secs).unwrap_or(i64::MAX));
     let millis = u64::try_from(cutoff.timestamp_millis()).unwrap_or(u64::MAX);
     format!("{millis:016x}")
 }
