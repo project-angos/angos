@@ -13,8 +13,8 @@ use tracing::warn;
 use crate::registry::{
     job_store::{
         Error, JobEnvelope, JobStore, MAX_REPORTED_PENDING, STORAGE_KEY_PREFIX_LEN,
-        make_storage_key, parse_lock_key_index, pending_ready_cutoff_prefix,
-        serialize_dead_letter, serialize_lock_key_index,
+        make_storage_key, parse_lock_key_index, pending_ready_cutoff_prefix, serialize_dead_letter,
+        serialize_lock_key_index,
     },
     path_builder,
 };
@@ -111,11 +111,7 @@ impl JobStore for Backend {
             .await
     }
 
-    async fn find_pending_with_lock_key(
-        &self,
-        queue: &str,
-        lock_key: &str,
-    ) -> Result<bool, Error> {
+    async fn find_pending_with_lock_key(&self, queue: &str, lock_key: &str) -> Result<bool, Error> {
         let index_path = path_builder::job_lock_key_index_path(queue, lock_key);
         let data = match self.store.get(&index_path).await {
             Ok(d) => d,

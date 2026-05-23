@@ -12,9 +12,7 @@ use bytesize::ByteSize;
 use tokio::{io::AsyncReadExt, sync::mpsc};
 use uuid::Uuid;
 
-use crate::{
-    ConditionalStore, Error, MultipartStore, ObjectStore, PresignedStore, s3::Backend,
-};
+use crate::{ConditionalStore, Error, MultipartStore, ObjectStore, PresignedStore, s3::Backend};
 
 fn backend() -> Option<Backend> {
     let config = S3Config {
@@ -41,10 +39,7 @@ fn backend() -> Option<Backend> {
 /// skip the test.
 async fn minio_reachable(backend: &Backend) -> bool {
     let probe_key = format!("__probe__/{}", Uuid::new_v4());
-    matches!(
-        backend.head(&probe_key).await,
-        Ok(_) | Err(Error::NotFound),
-    )
+    matches!(backend.head(&probe_key).await, Ok(_) | Err(Error::NotFound),)
 }
 
 macro_rules! require_minio {
@@ -111,7 +106,10 @@ async fn delete_prefix_clears_subtree() {
         .await
         .map(|p| (p.items, p.next_token))
         .unwrap();
-    assert!(objects.is_empty(), "prefix must be empty after delete_prefix");
+    assert!(
+        objects.is_empty(),
+        "prefix must be empty after delete_prefix"
+    );
 }
 
 #[tokio::test]
@@ -141,10 +139,7 @@ async fn list_children_separates_sub_prefixes_from_objects() {
         .await
         .unwrap();
 
-    let page = store
-        .list_children(&prefix, 100, None, None)
-        .await
-        .unwrap();
+    let page = store.list_children(&prefix, 100, None, None).await.unwrap();
     assert_eq!(page.sub_prefixes, vec!["sub".to_string()]);
     assert_eq!(page.objects, vec!["a".to_string()]);
 }
@@ -237,8 +232,16 @@ async fn multipart_round_trip_assembles_object() {
         .unwrap();
 
     let parts = vec![
-        crate::Part { part_number: 1, etag: etag1, size: data.len() as u64 },
-        crate::Part { part_number: 2, etag: etag2, size: tail.len() as u64 },
+        crate::Part {
+            part_number: 1,
+            etag: etag1,
+            size: data.len() as u64,
+        },
+        crate::Part {
+            part_number: 2,
+            etag: etag2,
+            size: tail.len() as u64,
+        },
     ];
     store.complete_multipart(&key, &id, &parts).await.unwrap();
 

@@ -9,21 +9,19 @@ use super::{
     UploadedPart,
     multipart_helpers::{next_part_number, uploaded_size},
 };
-use crate::{
-    registry::{
-        blob_store::{
-            self, MultipartCleanup, OrphanMultipartUpload,
-            sha256_ext::Sha256Ext,
-            tests::{
-                test_build_blob_reader_returns_size,
-                test_build_blob_reader_with_offset_returns_full_size,
-                test_datastore_blob_operations, test_datastore_list_blobs,
-                test_datastore_list_uploads, test_datastore_upload_operations,
-            },
+use crate::registry::{
+    blob_store::{
+        self, MultipartCleanup, OrphanMultipartUpload,
+        sha256_ext::Sha256Ext,
+        tests::{
+            test_build_blob_reader_returns_size,
+            test_build_blob_reader_with_offset_returns_full_size, test_datastore_blob_operations,
+            test_datastore_list_blobs, test_datastore_list_uploads,
+            test_datastore_upload_operations,
         },
-        path_builder,
-        test_utils::S3RegistryTestCase,
     },
+    path_builder,
+    test_utils::S3RegistryTestCase,
 };
 use angos_s3_client as s3_client;
 

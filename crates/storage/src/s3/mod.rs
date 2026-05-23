@@ -273,7 +273,10 @@ impl PresignedStore for Backend {
         ttl: Duration,
         content_type: Option<&str>,
     ) -> Result<String, Error> {
-        Ok(self.client.generate_presigned_url(key, ttl, content_type).await?)
+        Ok(self
+            .client
+            .generate_presigned_url(key, ttl, content_type)
+            .await?)
     }
 }
 

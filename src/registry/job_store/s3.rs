@@ -162,11 +162,14 @@ impl BackendConfig {
                 // `true` (the AWS S3 / R2 / GCS / modern MinIO baseline). The
                 // metadata-store probe machinery isn't replicated here; if you
                 // need auto-detection, set `capabilities` explicitly.
-                let caps = self.capabilities.clone().unwrap_or(ConditionalCapabilities {
-                    put_if_none_match: true,
-                    put_if_match: true,
-                    delete_if_match: true,
-                });
+                let caps = self
+                    .capabilities
+                    .clone()
+                    .unwrap_or(ConditionalCapabilities {
+                        put_if_none_match: true,
+                        put_if_match: true,
+                        delete_if_match: true,
+                    });
                 if !caps.supports_cas() {
                     return Err(Error::Initialization(format!(
                         "S3 lock strategy requires If-None-Match and If-Match support, \

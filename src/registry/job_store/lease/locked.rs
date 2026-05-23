@@ -264,8 +264,13 @@ impl LeaseBackend for Backend {
         let release_token = token;
         let release_fn = move || -> Pin<Box<dyn Future<Output = ()> + Send>> {
             Box::pin(async move {
-                release_once(&*release_store, &*release_lock, &release_lock_key, &release_token)
-                    .await;
+                release_once(
+                    &*release_store,
+                    &*release_lock,
+                    &release_lock_key,
+                    &release_token,
+                )
+                .await;
             })
         };
 

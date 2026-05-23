@@ -15,11 +15,11 @@ use crate::{
     metrics_provider,
     registry::{
         job_store::{
-            JobEnvelope, JobQueue, JobStore, MAX_REPORTED_PENDING, make_storage_key,
-            parse_lock_key_index, parse_not_before, serialize_lock_key_index,
+            JobEnvelope, JobQueue, JobStore, MAX_REPORTED_PENDING,
             durable::{DurableJobConsumer, DurableJobQueue, FailOutcome},
             lease::{self, LeaseBackend},
             locked::Backend,
+            make_storage_key, parse_lock_key_index, parse_not_before, serialize_lock_key_index,
         },
         metadata_store::lock::{LockBackend, MemoryBackend},
         path_builder,
@@ -67,7 +67,12 @@ fn dummy_envelope(lock_key: &str) -> JobEnvelope {
 }
 
 fn make_consumer(h: &Harness) -> DurableJobConsumer {
-    DurableJobConsumer::new(h.store.clone(), h.leases.clone(), 30, "test-worker".to_string())
+    DurableJobConsumer::new(
+        h.store.clone(),
+        h.leases.clone(),
+        30,
+        "test-worker".to_string(),
+    )
 }
 
 // =========================================================================
@@ -255,7 +260,10 @@ async fn future_storage_key_yields_next_ready_without_claiming() {
     );
     let next = outcome.next_ready.expect("next_ready must be set");
     let diff = (scheduled - next).num_milliseconds().abs();
-    assert!(diff < 2, "next_ready ({next}) must match scheduled ({scheduled})");
+    assert!(
+        diff < 2,
+        "next_ready ({next}) must match scheduled ({scheduled})"
+    );
 }
 
 // =========================================================================
@@ -506,5 +514,8 @@ async fn enqueue_dedup_skips_existing_lock_key() {
         .enqueue(dummy_envelope("cache.ns:sha256:dup"))
         .await
         .expect("enqueue 2");
-    assert_eq!(before, h.store.count_pending("cache", 600).await.expect("count"));
+    assert_eq!(
+        before,
+        h.store.count_pending("cache", 600).await.expect("count")
+    );
 }

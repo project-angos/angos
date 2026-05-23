@@ -209,9 +209,10 @@ mod tests {
             "fresh lock_key must be claimable",
         );
 
-        let index_path = dir
-            .path()
-            .join(path_builder::job_lock_key_index_path("cache", &env.lock_key));
+        let index_path = dir.path().join(path_builder::job_lock_key_index_path(
+            "cache",
+            &env.lock_key,
+        ));
         let raw = tokio::fs::read(&index_path).await.expect("read index");
         assert!(!raw.is_empty(), "index file must have content");
 

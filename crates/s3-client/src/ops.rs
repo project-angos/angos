@@ -147,8 +147,7 @@ impl Backend {
             .await
             .map_err(|e| map_get_error(&e))
             .and_then(|response| {
-                let size =
-                    parse_content_length(&response.headers).map_err(io::Error::other)?;
+                let size = parse_content_length(&response.headers).map_err(io::Error::other)?;
                 Ok((
                     size,
                     header_string(&response.headers, "etag"),

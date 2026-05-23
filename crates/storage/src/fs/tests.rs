@@ -24,7 +24,10 @@ async fn builder_requires_root_dir() {
 async fn put_then_get_round_trips() {
     let dir = TempDir::new().unwrap();
     let store = backend(&dir);
-    store.put("a/b/c", Bytes::from_static(b"hello")).await.unwrap();
+    store
+        .put("a/b/c", Bytes::from_static(b"hello"))
+        .await
+        .unwrap();
     assert_eq!(store.get("a/b/c").await.unwrap(), b"hello");
 }
 
@@ -48,7 +51,10 @@ async fn delete_prefix_removes_subtree() {
     let dir = TempDir::new().unwrap();
     let store = backend(&dir);
     store.put("a/1", Bytes::from_static(b"x")).await.unwrap();
-    store.put("a/sub/2", Bytes::from_static(b"y")).await.unwrap();
+    store
+        .put("a/sub/2", Bytes::from_static(b"y"))
+        .await
+        .unwrap();
     store.put("b/3", Bytes::from_static(b"z")).await.unwrap();
 
     store.delete_prefix("a").await.unwrap();
@@ -87,7 +93,10 @@ async fn head_missing_key_returns_not_found() {
 async fn get_stream_reports_total_size_not_remaining() {
     let dir = TempDir::new().unwrap();
     let store = backend(&dir);
-    store.put("k", Bytes::from_static(b"0123456789")).await.unwrap();
+    store
+        .put("k", Bytes::from_static(b"0123456789"))
+        .await
+        .unwrap();
 
     let (mut body, total) = store.get_stream("k", Some(3)).await.unwrap();
     assert_eq!(total, 10);
@@ -123,7 +132,10 @@ async fn list_returns_prefix_relative_keys() {
     let dir = TempDir::new().unwrap();
     let store = backend(&dir);
     store.put("ns/a", Bytes::from_static(b"x")).await.unwrap();
-    store.put("ns/sub/b", Bytes::from_static(b"y")).await.unwrap();
+    store
+        .put("ns/sub/b", Bytes::from_static(b"y"))
+        .await
+        .unwrap();
 
     let page = store.list("ns", 10, None).await.unwrap();
     assert_eq!(page.items, vec!["a".to_string(), "sub/b".to_string()]);
@@ -150,8 +162,14 @@ async fn list_children_separates_directories_from_objects() {
     let dir = TempDir::new().unwrap();
     let store = backend(&dir);
     store.put("ns/a", Bytes::from_static(b"x")).await.unwrap();
-    store.put("ns/sub/b", Bytes::from_static(b"y")).await.unwrap();
-    store.put("ns/sub/c", Bytes::from_static(b"z")).await.unwrap();
+    store
+        .put("ns/sub/b", Bytes::from_static(b"y"))
+        .await
+        .unwrap();
+    store
+        .put("ns/sub/c", Bytes::from_static(b"z"))
+        .await
+        .unwrap();
     store.put("ns/d", Bytes::from_static(b"w")).await.unwrap();
 
     let page = store.list_children("ns", 10, None, None).await.unwrap();
@@ -178,7 +196,10 @@ async fn list_children_respects_start_after() {
 async fn copy_duplicates_object() {
     let dir = TempDir::new().unwrap();
     let store = backend(&dir);
-    store.put("src", Bytes::from_static(b"payload")).await.unwrap();
+    store
+        .put("src", Bytes::from_static(b"payload"))
+        .await
+        .unwrap();
     store.copy("src", "dst/copied").await.unwrap();
     assert_eq!(store.get("src").await.unwrap(), b"payload");
     assert_eq!(store.get("dst/copied").await.unwrap(), b"payload");
@@ -192,6 +213,9 @@ async fn sync_to_disk_flag_does_not_change_observable_behaviour() {
         .sync_to_disk(true)
         .build()
         .unwrap();
-    store.put("k", Bytes::from_static(b"durable")).await.unwrap();
+    store
+        .put("k", Bytes::from_static(b"durable"))
+        .await
+        .unwrap();
     assert_eq!(store.get("k").await.unwrap(), b"durable");
 }

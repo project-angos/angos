@@ -54,7 +54,9 @@ async fn fresh_acquire_returns_a_guard() {
 
     // Body must exist on disk now.
     assert!(
-        raw.head(&path_builder::job_lease_path(lock_key)).await.is_ok(),
+        raw.head(&path_builder::job_lease_path(lock_key))
+            .await
+            .is_ok(),
         "lease body must exist after acquire",
     );
     guard.release().await;
