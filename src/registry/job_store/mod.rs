@@ -288,6 +288,11 @@ pub trait JobStore: Send + Sync {
     /// for subsequent [`read_pending`] / [`remove_pending`] /
     /// [`move_to_failed`] operations.
     ///
+    /// **Does not** touch the per-`lock_key` dedup index. Producers follow
+    /// up with [`try_claim_lock_key`] (CAS-create, fails on race); retries
+    /// follow up with [`refresh_lock_key_index`] (unconditional, the worker
+    /// already holds the lease and is the unique writer).
+    ///
     /// On retry, the consumer writes a *new* file at a later `not_before` and
     /// deletes the old one; envelope identity (`envelope.id`) stays stable
     /// across retries but the storage key changes.
@@ -368,6 +373,34 @@ pub trait JobStore: Send + Sync {
     /// so a concurrent retry that updated the index isn't accidentally
     /// discarded. A missing or non-matching index is treated as success.
     async fn remove_lock_key_index_if_matches(
+        &self,
+        queue: &str,
+        lock_key: &str,
+        storage_key: &str,
+    ) -> Result<(), Error>;
+
+    /// Atomically create the per-`lock_key` dedup index pointing at
+    /// `storage_key`. Returns `Ok(true)` when the index was created (this
+    /// caller won the race against any concurrent producer); `Ok(false)`
+    /// when an index already exists.
+    ///
+    /// Producers use this to resolve enqueue races: two replicas may both
+    /// observe no dedup index in [`find_pending_with_lock_key`], both write
+    /// their pending file, and then race here. The loser is responsible for
+    /// removing the pending file it wrote (otherwise a spurious duplicate
+    /// would sit on the queue and force a wasted idempotent re-execution).
+    async fn try_claim_lock_key(
+        &self,
+        queue: &str,
+        lock_key: &str,
+        storage_key: &str,
+    ) -> Result<bool, Error>;
+
+    /// Unconditionally point the per-`lock_key` dedup index at `storage_key`.
+    /// Used by the retry path: the worker already holds the lease for
+    /// `lock_key`, so it is the unique writer and no race against producers
+    /// can swing the index away during the retry rewrite.
+    async fn refresh_lock_key_index(
         &self,
         queue: &str,
         lock_key: &str,

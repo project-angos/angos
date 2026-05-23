@@ -78,27 +78,58 @@ impl DurableJobQueue {
 #[async_trait]
 impl JobQueue for DurableJobQueue {
     async fn enqueue(&self, envelope: JobEnvelope) -> Result<(), Error> {
-        let already_pending = self
+        // Fast path: an index already exists for this lock_key (and points
+        // at a still-pending file — `find_pending_with_lock_key` self-heals
+        // orphans). No need to write anything.
+        if self
             .store
             .find_pending_with_lock_key(&envelope.queue, &envelope.lock_key)
             .await
-            .unwrap_or(false);
+            .unwrap_or(false)
+        {
+            metrics_provider()
+                .job_queue_enqueued_total
+                .with_label_values(&[envelope.queue.as_str(), "hit"])
+                .inc();
+            return Ok(());
+        }
 
-        let dedup = if already_pending { "hit" } else { "miss" };
+        // Slow path: write the pending file then try to atomically claim the
+        // lock-key index. The CAS-create resolves enqueue races between
+        // replicas: two replicas may both observe no index and both write
+        // their pending files, but only one wins the claim. The loser then
+        // cleans up its pending file so the queue doesn't carry a spurious
+        // duplicate.
+        let storage_key = self
+            .store
+            .put_pending(&envelope.queue, &envelope, Utc::now())
+            .await?;
+
+        let won = self
+            .store
+            .try_claim_lock_key(&envelope.queue, &envelope.lock_key, &storage_key)
+            .await?;
+
+        let dedup = if won { "miss" } else { "hit" };
         metrics_provider()
             .job_queue_enqueued_total
             .with_label_values(&[envelope.queue.as_str(), dedup])
             .inc();
 
-        // The pending gauge is refreshed by the server's ticker; updating it
-        // here would issue a LIST on every miss, which is expensive on S3.
-        if already_pending {
-            return Ok(());
+        if !won
+            && let Err(e) = self
+                .store
+                .remove_pending(&envelope.queue, &storage_key)
+                .await
+        {
+            warn!(
+                lock_key = envelope.lock_key.as_str(),
+                error = %e,
+                "Failed to clean up duplicate pending after enqueue race"
+            );
         }
-        self.store
-            .put_pending(&envelope.queue, &envelope, Utc::now())
-            .await
-            .map(|_| ())
+
+        Ok(())
     }
 }
 
@@ -271,8 +302,16 @@ impl DurableJobConsumer {
             ..envelope
         };
 
-        self.store
+        // The worker holds the lease for `lock_key`, so it is the unique
+        // writer here — `refresh_lock_key_index` is unconditional. Producers
+        // racing this retry will dedup against the new storage_key once we
+        // publish it, or against the old one before we do (both are correct).
+        let new_storage_key = self
+            .store
             .put_pending(&updated.queue, &updated, next_at)
+            .await?;
+        self.store
+            .refresh_lock_key_index(&updated.queue, &updated.lock_key, &new_storage_key)
             .await?;
         self.store
             .remove_pending(&updated.queue, &storage_key)

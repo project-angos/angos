@@ -182,26 +182,6 @@ impl JobStore for Backend {
             .put_object(&key, data)
             .await
             .map_err(|e| s3_io_to_job_err(&e))?;
-        // Best-effort dedup index refresh after the pending file lands.
-        // Failure here merely weakens dedup (next enqueue may create a
-        // duplicate, which the lease + idempotency contract handles).
-        let index_path = path_builder::job_lock_key_index_path(queue, &envelope.lock_key);
-        match serialize_lock_key_index(&storage_key) {
-            Ok(index_bytes) => {
-                if let Err(e) = self.backend.put_object(&index_path, index_bytes).await {
-                    warn!(
-                        lock_key = envelope.lock_key.as_str(),
-                        error = %e,
-                        "Failed to write S3 lock-key index"
-                    );
-                }
-            }
-            Err(e) => warn!(
-                lock_key = envelope.lock_key.as_str(),
-                error = %e,
-                "Failed to serialize lock-key index"
-            ),
-        }
         Ok(storage_key)
     }
 
@@ -393,6 +373,35 @@ impl JobStore for Backend {
                 }
             }
         }
+    }
+
+    async fn try_claim_lock_key(
+        &self,
+        queue: &str,
+        lock_key: &str,
+        storage_key: &str,
+    ) -> Result<bool, Error> {
+        let path = path_builder::job_lock_key_index_path(queue, lock_key);
+        let data = serialize_lock_key_index(storage_key)?;
+        match self.backend.put_object_if_not_exists(&path, data).await {
+            Ok(_) => Ok(true),
+            Err(s3_client::Error::PreconditionFailed) => Ok(false),
+            Err(e) => Err(Error::Storage(format!("try_claim_lock_key: {e}"))),
+        }
+    }
+
+    async fn refresh_lock_key_index(
+        &self,
+        queue: &str,
+        lock_key: &str,
+        storage_key: &str,
+    ) -> Result<(), Error> {
+        let path = path_builder::job_lock_key_index_path(queue, lock_key);
+        let data = serialize_lock_key_index(storage_key)?;
+        self.backend
+            .put_object(&path, data)
+            .await
+            .map_err(|e| s3_io_to_job_err(&e))
     }
 
     async fn count_pending(&self, queue: &str, ready_horizon_secs: u64) -> Result<u64, Error> {

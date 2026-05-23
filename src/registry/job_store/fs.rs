@@ -84,23 +84,6 @@ impl Backend {
             .join(path_builder::job_lock_key_index_path(queue, lock_key))
     }
 
-    /// Best-effort upsert of the dedup index pointing at `storage_key`.
-    /// Failures are logged and swallowed: the pending file is already on disk,
-    /// and a missing index only weakens dedup (next enqueue may produce a
-    /// duplicate, which the lease + idempotency contract handles).
-    async fn upsert_lock_key_index(&self, queue: &str, lock_key: &str, storage_key: &str) {
-        let path = self.lock_key_index_path(queue, lock_key);
-        let data = match serialize_lock_key_index(storage_key) {
-            Ok(d) => d,
-            Err(e) => {
-                warn!(lock_key, error = %e, "Failed to serialize lock-key index");
-                return;
-            }
-        };
-        if let Err(e) = fs_ops::atomic_write(&path, &data, false).await {
-            warn!(lock_key, error = %e, "Failed to write lock-key index");
-        }
-    }
 
     /// Write a new lease file using `create_new` atomicity. Returns the new
     /// instance id on success, or `Ok(None)` when the file already exists.
@@ -206,11 +189,6 @@ impl JobStore for Backend {
         fs_ops::atomic_write(&path, &data, false)
             .await
             .map_err(|e| Error::Storage(format!("failed to write pending job: {e}")))?;
-        // Refresh dedup index *after* the pending file lands. A crash here
-        // weakens dedup (a future enqueue may create a duplicate), never
-        // strengthens it (we never claim dedup without backing pending).
-        self.upsert_lock_key_index(queue, &envelope.lock_key, &storage_key)
-            .await;
         Ok(storage_key)
     }
 
@@ -426,6 +404,52 @@ impl JobStore for Backend {
                 Ok(())
             }
         }
+    }
+
+    /// Atomic CAS-create of the dedup index. Uses `OpenOptions::create_new`
+    /// (the same `O_EXCL` primitive the lease backend uses) so two racing
+    /// producers cannot both claim the same `lock_key`.
+    async fn try_claim_lock_key(
+        &self,
+        queue: &str,
+        lock_key: &str,
+        storage_key: &str,
+    ) -> Result<bool, Error> {
+        let path = self.lock_key_index_path(queue, lock_key);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)
+                .await
+                .map_err(|e| Error::Storage(format!("create index dir: {e}")))?;
+        }
+        let data = serialize_lock_key_index(storage_key)?;
+        match fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&path)
+            .await
+        {
+            Ok(mut file) => {
+                file.write_all(&data)
+                    .await
+                    .map_err(|e| Error::Storage(format!("write lock-key index: {e}")))?;
+                Ok(true)
+            }
+            Err(e) if e.kind() == ErrorKind::AlreadyExists => Ok(false),
+            Err(e) => Err(Error::Storage(format!("create lock-key index: {e}"))),
+        }
+    }
+
+    async fn refresh_lock_key_index(
+        &self,
+        queue: &str,
+        lock_key: &str,
+        storage_key: &str,
+    ) -> Result<(), Error> {
+        let path = self.lock_key_index_path(queue, lock_key);
+        let data = serialize_lock_key_index(storage_key)?;
+        fs_ops::atomic_write(&path, &data, false)
+            .await
+            .map_err(|e| Error::Storage(format!("refresh lock-key index: {e}")))
     }
 
     async fn count_pending(&self, queue: &str, ready_horizon_secs: u64) -> Result<u64, Error> {
@@ -755,48 +779,107 @@ mod tests {
     /// `find_pending_with_lock_key` must succeed without reading any pending
     /// envelope body: an enqueue under a very deep queue is a single index
     /// HEAD, not a scan. We verify this indirectly by tampering with all the
-    /// pending bodies after the index is written — if the dedup path read
+    /// pending bodies after the index is claimed — if the dedup path read
     /// any body it would fail (or at least return the wrong answer).
     #[tokio::test]
     async fn dedup_lookup_does_not_read_pending_bodies() {
         let dir = TempDir::new().expect("temp dir");
         let store = make_store(&dir);
+        let lock_key = "cache.ns:sha256:nobody-reads-this";
 
-        let env = dummy_envelope("cache.ns:sha256:nobody-reads-this");
-        store
+        let env = dummy_envelope(lock_key);
+        let storage_key = store
             .put_pending("cache", &env, Utc::now())
             .await
             .expect("put");
+        assert!(
+            store
+                .try_claim_lock_key("cache", lock_key, &storage_key)
+                .await
+                .expect("claim"),
+            "fresh lock_key must be claimable"
+        );
 
-        // Corrupt the pending body. If dedup ever reads it, parsing would
-        // fail and the test would surface that — both as a hard error and
-        // by the dedup returning false.
-        let pending_path = store.pending_path("cache", &{
-            let now = Utc::now();
-            make_storage_key(now, &env.id)
-        });
-        // Reuse the actual filename we just wrote (the millis prefix is
-        // approximate above) — list the directory and find our entry.
+        // Corrupt every pending body. If dedup ever reads a body, parsing
+        // would fail and the test would surface that — both as a hard error
+        // and by the dedup returning false.
         let queue_dir = store.pending_dir("cache");
-        let entries = tokio::fs::read_dir(&queue_dir)
+        let mut entries = tokio::fs::read_dir(&queue_dir)
             .await
             .expect("read pending dir");
-        let mut entries = entries;
         while let Some(entry) = entries.next_entry().await.expect("next entry") {
             tokio::fs::write(entry.path(), b"NOT VALID JSON, ANYWHERE")
                 .await
                 .expect("corrupt pending");
         }
-        let _ = pending_path; // suppress unused if path heuristic changed
 
         // Dedup should still report a hit — purely from the index file.
         assert!(
             store
-                .find_pending_with_lock_key("cache", "cache.ns:sha256:nobody-reads-this")
+                .find_pending_with_lock_key("cache", lock_key)
                 .await
                 .expect("dedup"),
             "find_pending_with_lock_key must succeed via the index, not the body"
         );
+    }
+
+    /// Two replicas concurrently enqueue the same `lock_key` and both miss
+    /// in the dedup-index lookup. They both write their pending file, then
+    /// race on `try_claim_lock_key`. Exactly one wins; the loser is
+    /// responsible for cleaning up its pending file so the queue carries
+    /// no spurious duplicate.
+    #[tokio::test]
+    async fn try_claim_lock_key_resolves_enqueue_race() {
+        let dir = TempDir::new().expect("temp dir");
+        let store = make_store(&dir);
+        let lock_key = "cache.ns:sha256:race";
+
+        let env1 = dummy_envelope(lock_key);
+        let env2 = dummy_envelope(lock_key);
+        let key1 = store
+            .put_pending("cache", &env1, Utc::now())
+            .await
+            .expect("put1");
+        let key2 = store
+            .put_pending("cache", &env2, Utc::now())
+            .await
+            .expect("put2");
+        assert_ne!(key1, key2, "distinct envelope ids → distinct storage keys");
+
+        // Replica 1 wins the claim.
+        assert!(
+            store
+                .try_claim_lock_key("cache", lock_key, &key1)
+                .await
+                .expect("claim1"),
+            "first claim wins"
+        );
+        // Replica 2's CAS fails.
+        assert!(
+            !store
+                .try_claim_lock_key("cache", lock_key, &key2)
+                .await
+                .expect("claim2"),
+            "second claim must lose"
+        );
+
+        // Replica 2 cleans up the pending file it wrote (this is what
+        // `DurableJobQueue::enqueue` does on race-loss).
+        store
+            .remove_pending("cache", &key2)
+            .await
+            .expect("remove loser");
+
+        // Only the winner's pending remains; the index points at it.
+        let pending = store.list_pending("cache", 10).await.expect("list");
+        assert_eq!(pending, vec![key1.clone()]);
+
+        let data = tokio::fs::read(store.lock_key_index_path("cache", lock_key))
+            .await
+            .expect("read index");
+        let index =
+            crate::registry::job_store::parse_lock_key_index(&data).expect("parse index");
+        assert_eq!(index.storage_key, key1);
     }
 
     /// A crash mid-`complete` could leave an orphan index pointing at a
@@ -898,10 +981,19 @@ mod tests {
         let lock_key = "cache.ns:sha256:complete-clears-index";
 
         let env = dummy_envelope(lock_key);
-        store
+        let storage_key = store
             .put_pending("cache", &env, Utc::now())
             .await
             .expect("put");
+        assert!(
+            store
+                .try_claim_lock_key("cache", lock_key, &storage_key)
+                .await
+                .expect("claim index"),
+            "fresh lock_key must be claimable"
+        );
+        let index_path = store.lock_key_index_path("cache", lock_key);
+        assert!(index_path.exists(), "fixture: index must exist before complete");
 
         let claimed = consumer
             .claim_one("cache")
@@ -912,7 +1004,7 @@ mod tests {
         consumer.complete(claimed).await.expect("complete");
 
         assert!(
-            !store.lock_key_index_path("cache", lock_key).exists(),
+            !index_path.exists(),
             "index must be removed on complete"
         );
         assert!(
@@ -936,10 +1028,19 @@ mod tests {
 
         let mut env = dummy_envelope(lock_key);
         env.max_attempts = 1;
-        store
+        let storage_key = store
             .put_pending("cache", &env, Utc::now())
             .await
             .expect("put");
+        assert!(
+            store
+                .try_claim_lock_key("cache", lock_key, &storage_key)
+                .await
+                .expect("claim index"),
+            "fresh lock_key must be claimable"
+        );
+        let index_path = store.lock_key_index_path("cache", lock_key);
+        assert!(index_path.exists(), "fixture: index must exist before DLQ");
 
         let claimed = consumer
             .claim_one("cache")
@@ -953,7 +1054,7 @@ mod tests {
         ));
 
         assert!(
-            !store.lock_key_index_path("cache", lock_key).exists(),
+            !index_path.exists(),
             "index must be removed on DLQ"
         );
     }
