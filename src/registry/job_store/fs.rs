@@ -1,7 +1,6 @@
 use std::{
     io::ErrorKind,
     path::{Path, PathBuf},
-    time::{Duration, SystemTime},
 };
 
 use async_trait::async_trait;
@@ -30,9 +29,20 @@ pub struct BackendConfig {
 }
 
 /// On-disk payload for a lease file at `_jobs/leases/<lock_key>.json`.
+///
+/// Staleness is driven by `refreshed_at` in the body. We could read mtime
+/// off the inode instead, but the body keeps both backends (FS + S3)
+/// symmetric and avoids any future issues if the storage layer's mtime
+/// behaviour changes (e.g. shared NFS mounts with skewed clocks).
+/// `refreshed_at` is rewritten on every create/heartbeat/steal.
 #[derive(Serialize, Deserialize)]
 struct LeaseFile {
     instance_id: String,
+    /// Wall-clock instant the body was last written. Pre-fix leases without
+    /// this field deserialize to `MIN_UTC` (immediately stealable), which is
+    /// the safe default during the transitional window.
+    #[serde(default)]
+    refreshed_at: DateTime<Utc>,
     worker_id: String,
     ttl_secs: u64,
 }
@@ -105,6 +115,7 @@ impl Backend {
         let instance_id = Uuid::new_v4().to_string();
         let data = serde_json::to_vec(&LeaseFile {
             instance_id: instance_id.clone(),
+            refreshed_at: Utc::now(),
             worker_id: worker_id.to_string(),
             ttl_secs,
         })
@@ -153,15 +164,13 @@ impl Backend {
         let existing: LeaseFile = serde_json::from_slice(&data)
             .map_err(|e| Error::Storage(format!("corrupt lease file: {e}")))?;
 
-        let mtime = fs::metadata(lock_path)
-            .await
-            .and_then(|m| m.modified())
-            .unwrap_or(SystemTime::UNIX_EPOCH);
-        let age_secs = mtime
-            .elapsed()
-            .unwrap_or(Duration::from_secs(u64::MAX))
-            .as_secs();
-        if age_secs < existing.ttl_secs {
+        // Staleness is driven by the body's `refreshed_at`, not the inode's
+        // mtime — keeps both backends symmetric and avoids any future
+        // surprises from shared-storage mounts where mtime may be skewed
+        // or coarsened.
+        let age = Utc::now() - existing.refreshed_at;
+        let ttl = chrono::Duration::seconds(i64::try_from(existing.ttl_secs).unwrap_or(i64::MAX));
+        if age < ttl {
             return Ok(None);
         }
         let expected_instance = existing.instance_id;
@@ -169,7 +178,7 @@ impl Backend {
         debug!(
             lock_key = lock_path.display().to_string(),
             instance_id = expected_instance,
-            age_secs,
+            age_secs = age.num_seconds(),
             ttl_secs = existing.ttl_secs,
             "Stealing stale FS lease"
         );
@@ -221,6 +230,7 @@ impl Backend {
         //    ours gets EEXIST. Concede in that case.
         let our_data = serde_json::to_vec(&LeaseFile {
             instance_id: new_uuid.clone(),
+            refreshed_at: Utc::now(),
             worker_id: worker_id.to_string(),
             ttl_secs,
         })
@@ -370,6 +380,7 @@ impl JobStore for Backend {
 
         let new_data = serde_json::to_vec(&LeaseFile {
             instance_id: token.to_string(),
+            refreshed_at: Utc::now(),
             worker_id: worker_id.to_string(),
             ttl_secs,
         })
@@ -708,9 +719,11 @@ mod tests {
             .await
             .expect("put");
 
-        // ttl=0 makes the lease immediately expired regardless of timing.
+        // ttl=0 + refreshed_at in the past makes the lease immediately
+        // expired regardless of timing.
         let data = serde_json::to_vec(&LeaseFile {
             instance_id: "stale-instance".to_string(),
+            refreshed_at: Utc::now() - chrono::Duration::seconds(60),
             worker_id: "dead-worker".to_string(),
             ttl_secs: 0,
         })
@@ -729,13 +742,56 @@ mod tests {
         consumer.complete(claimed).await.expect("complete");
     }
 
-    /// Heartbeat must refresh the mtime via the fd and preserve the
-    /// body's `instance_id`. The previous implementation went through
+    /// Staleness is body-driven: a lease whose `refreshed_at` is past
+    /// `ttl_secs` ago must be stealable even when the *file's* mtime is
+    /// fresh. We seed a lease with a current mtime (via `atomic_write`)
+    /// but a stale `refreshed_at` in the body, then verify the steal
+    /// goes through.
+    #[tokio::test]
+    async fn stale_lease_detected_via_body_refreshed_at_not_mtime() {
+        let dir = TempDir::new().expect("temp dir");
+        let store = make_store(&dir);
+        let consumer = make_consumer(store.clone());
+
+        let env = dummy_envelope("cache.ns:sha256:body-driven-stale");
+        store
+            .put_pending("cache", &env, Utc::now())
+            .await
+            .expect("put");
+
+        // Body says we were last refreshed an hour ago, ttl_secs=30 → stale.
+        // But the file's mtime is "now" because we just wrote it.
+        let stale_body = serde_json::to_vec(&LeaseFile {
+            instance_id: "ancient-instance".to_string(),
+            refreshed_at: Utc::now() - chrono::Duration::seconds(3600),
+            worker_id: "long-gone".to_string(),
+            ttl_secs: 30,
+        })
+        .expect("serialize");
+        fs_ops::atomic_write(&store.lease_path(&env.lock_key), &stale_body, false)
+            .await
+            .expect("write body-stale lease");
+
+        // The mtime is fresh; only the body's refreshed_at says "stale."
+        // Steal must still succeed.
+        let claimed = consumer
+            .claim_one("cache")
+            .await
+            .expect("claim")
+            .claimed
+            .expect("Some — body refreshed_at must drive staleness");
+        assert_eq!(claimed.envelope.lock_key, "cache.ns:sha256:body-driven-stale");
+        consumer.complete(claimed).await.expect("complete");
+    }
+
+    /// Heartbeat must refresh the body's `refreshed_at` so future
+    /// stealers don't consider the lease stale, and preserve the body's
+    /// `instance_id`. The previous implementation went through
     /// `atomic_write` (temp + rename), where a stealer's `remove + create`
     /// between the read and the write would be silently overwritten by
     /// the rename. The fd-based path no longer has that window.
     #[tokio::test]
-    async fn heartbeat_refreshes_mtime_via_fd() {
+    async fn heartbeat_refreshes_body_refreshed_at() {
         let dir = TempDir::new().expect("temp dir");
         let store = make_store(&dir);
         let lock_key = "cache.ns:sha256:heartbeat";
@@ -747,21 +803,19 @@ mod tests {
             .expect("first acquire wins");
         let path = store.lease_path(lock_key);
 
-        // Force the file's mtime back into the past via std::fs (test-only
-        // sync I/O) so we can verify the heartbeat brings it forward.
-        let past = SystemTime::now() - Duration::from_secs(20);
-        {
-            let file = std::fs::OpenOptions::new()
-                .write(true)
-                .open(&path)
-                .expect("open for backdate");
-            file.set_modified(past).expect("backdate mtime");
-        }
-        let mtime_before = tokio::fs::metadata(&path)
+        // Backdate the body's refreshed_at so we can verify the heartbeat
+        // advances it.
+        let past = Utc::now() - chrono::Duration::seconds(20);
+        let backdated = serde_json::to_vec(&LeaseFile {
+            instance_id: token.clone(),
+            refreshed_at: past,
+            worker_id: "worker-A".to_string(),
+            ttl_secs: 30,
+        })
+        .expect("serialize");
+        fs_ops::atomic_write(&path, &backdated, false)
             .await
-            .expect("stat")
-            .modified()
-            .expect("mtime");
+            .expect("backdate body");
 
         let returned = store
             .heartbeat_lease(lock_key, &token, "worker-A", 30)
@@ -769,20 +823,14 @@ mod tests {
             .expect("heartbeat");
         assert_eq!(returned, token, "FS heartbeat reuses the same token");
 
-        let mtime_after = tokio::fs::metadata(&path)
-            .await
-            .expect("stat")
-            .modified()
-            .expect("mtime");
-        assert!(
-            mtime_after > mtime_before,
-            "heartbeat must refresh mtime (before={mtime_before:?} after={mtime_after:?})"
-        );
-
-        // Body should still parse and still have our instance_id.
         let body = tokio::fs::read(&path).await.expect("read body");
         let parsed: LeaseFile = serde_json::from_slice(&body).expect("parse body");
         assert_eq!(parsed.instance_id, token);
+        assert!(
+            parsed.refreshed_at > past,
+            "heartbeat must advance refreshed_at (was {past}, now {})",
+            parsed.refreshed_at
+        );
     }
 
     /// Heartbeat against a lease that's been silently replaced (stealer
@@ -805,6 +853,7 @@ mod tests {
         let path = store.lease_path(lock_key);
         let stealer_body = serde_json::to_vec(&LeaseFile {
             instance_id: "stealer-instance".to_string(),
+            refreshed_at: Utc::now(),
             worker_id: "worker-B".to_string(),
             ttl_secs: 30,
         })
@@ -849,9 +898,10 @@ mod tests {
         let lock_key = "cache.ns:sha256:race-steal";
         let lease_path = store.lease_path(lock_key);
 
-        // Seed a stale lease (ttl=0).
+        // Seed a stale lease (ttl=0 + refreshed_at in the past).
         let stale_body = serde_json::to_vec(&LeaseFile {
             instance_id: "stale-instance".to_string(),
+            refreshed_at: Utc::now() - chrono::Duration::seconds(60),
             worker_id: "dead".to_string(),
             ttl_secs: 0,
         })
@@ -902,9 +952,10 @@ mod tests {
         let lock_key = "cache.ns:sha256:eexist-during-steal";
         let lease_path = store.lease_path(lock_key);
 
-        // Seed a stale lease (ttl=0).
+        // Seed a stale lease (ttl=0 + refreshed_at in the past).
         let stale_body = serde_json::to_vec(&LeaseFile {
             instance_id: "stale-instance".to_string(),
+            refreshed_at: Utc::now() - chrono::Duration::seconds(60),
             worker_id: "dead".to_string(),
             ttl_secs: 0,
         })
@@ -923,6 +974,7 @@ mod tests {
         // Simulate a fresh acquirer winning the brief window.
         let fresh_body = serde_json::to_vec(&LeaseFile {
             instance_id: "fresh-acquirer".to_string(),
+            refreshed_at: Utc::now(),
             worker_id: "worker-Fresh".to_string(),
             ttl_secs: 30,
         })

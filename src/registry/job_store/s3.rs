@@ -53,10 +53,21 @@ fn default_delete_if_match() -> bool {
 }
 
 /// Lease file payload stored in S3 at `_jobs/leases/<lock_key_encoded>.json`.
-/// Lease expiry is driven by the S3 `Last-Modified` header; `worker_id` is kept
-/// for diagnostics only.
+///
+/// Staleness is driven by `refreshed_at` in the body, *not* the S3
+/// `Last-Modified` response header. Some S3-compatible endpoints strip
+/// `Last-Modified` from `PUT` responses; relying on the body lets us steal
+/// stale leases on those services too. `refreshed_at` is rewritten on every
+/// successful create/heartbeat/steal — so it tracks the worker-asserted
+/// freshness, matching what the heartbeat loop already implicitly relies on.
+/// `worker_id` is kept for diagnostics only.
 #[derive(Serialize, Deserialize)]
 struct LeaseFile {
+    /// Wall-clock instant the body was last written. Pre-fix leases without
+    /// this field deserialize to `MIN_UTC` (immediately stealable), which is
+    /// the safe default during the transitional window.
+    #[serde(default)]
+    refreshed_at: DateTime<Utc>,
     worker_id: String,
     ttl_secs: u64,
 }
@@ -100,27 +111,29 @@ impl Backend {
         let key = path_builder::job_lease_path(lock_key);
         let data = serialize_lease(worker_id, ttl_secs)?;
 
-        let (existing_bytes, etag, last_modified) =
-            match self.backend.read_with_metadata(&key).await {
-                Ok(r) => r,
-                Err(e) if e.kind() == ErrorKind::NotFound => {
-                    // Vanished between the failed put_object_if_not_exists and
-                    // now; retry the initial create.
-                    return match self.backend.put_object_if_not_exists(&key, data).await {
-                        Ok(etag) => Ok(Some(require_etag(etag)?)),
-                        Err(s3_client::Error::PreconditionFailed) => Ok(None),
-                        Err(e) => Err(Error::Storage(format!("retry create lease failed: {e}"))),
-                    };
-                }
-                Err(e) => return Err(Error::Storage(format!("failed to read lease: {e}"))),
-            };
+        // Staleness is driven by the body's `refreshed_at`, not the S3
+        // `Last-Modified` header — some S3-compatible endpoints strip
+        // `Last-Modified` from `PUT` responses and would otherwise leave
+        // crashed leases stuck forever.
+        let (existing_bytes, etag) = match self.backend.read_with_etag(&key).await {
+            Ok(r) => r,
+            Err(e) if e.kind() == ErrorKind::NotFound => {
+                // Vanished between the failed put_object_if_not_exists and
+                // now; retry the initial create.
+                return match self.backend.put_object_if_not_exists(&key, data).await {
+                    Ok(etag) => Ok(Some(require_etag(etag)?)),
+                    Err(s3_client::Error::PreconditionFailed) => Ok(None),
+                    Err(e) => Err(Error::Storage(format!("retry create lease failed: {e}"))),
+                };
+            }
+            Err(e) => return Err(Error::Storage(format!("failed to read lease: {e}"))),
+        };
 
         let existing: LeaseFile = serde_json::from_slice(&existing_bytes)
             .map_err(|e| Error::Storage(format!("corrupt lease: {e}")))?;
 
-        let last_modified = last_modified.unwrap_or_else(Utc::now);
         let ttl = ChronoDuration::seconds(existing.ttl_secs.min(3600).cast_signed());
-        if Utc::now() <= last_modified + ttl {
+        if Utc::now() <= existing.refreshed_at + ttl {
             return Ok(None);
         }
 
@@ -131,6 +144,7 @@ impl Backend {
         debug!(
             lock_key,
             worker_id = existing.worker_id,
+            refreshed_at = %existing.refreshed_at,
             "Stealing stale S3 lease"
         );
 
@@ -156,6 +170,7 @@ fn s3_io_to_job_err(e: &IoError) -> Error {
 
 fn serialize_lease(worker_id: &str, ttl_secs: u64) -> Result<Vec<u8>, Error> {
     serde_json::to_vec(&LeaseFile {
+        refreshed_at: Utc::now(),
         worker_id: worker_id.to_string(),
         ttl_secs,
     })
@@ -612,8 +627,9 @@ mod tests {
             .await
             .expect("put");
 
-        // 3-second TTL relies on the S3 LastModified header to drive expiry.
+        // 3-second TTL with refreshed_at set 10s ago → body-driven staleness.
         let data = serde_json::to_vec(&LeaseFile {
+            refreshed_at: Utc::now() - chrono::Duration::seconds(10),
             worker_id: "dead-worker".to_string(),
             ttl_secs: 3,
         })
