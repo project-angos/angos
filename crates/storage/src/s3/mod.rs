@@ -31,11 +31,15 @@ impl Builder {
 
     /// The underlying S3 HTTP client. Construct it with
     /// `angos_s3_client::Backend::new(&config)` and pass it in here.
+    #[must_use]
     pub fn client(mut self, client: Arc<S3Backend>) -> Self {
         self.client = Some(client);
         self
     }
 
+    /// # Errors
+    /// Returns [`Error::Backend`] when [`client`](Self::client) was never
+    /// called.
     pub fn build(self) -> Result<Backend, Error> {
         let client = self
             .client
@@ -51,6 +55,7 @@ pub struct Backend {
 }
 
 impl Backend {
+    #[must_use]
     pub fn builder() -> Builder {
         Builder::new()
     }

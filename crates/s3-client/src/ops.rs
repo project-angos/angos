@@ -67,16 +67,24 @@ pub struct MultipartUpload {
 // ─── object-level CRUD ────────────────────────────────────────────────────
 
 impl Backend {
+    /// # Errors
+    /// Forwards [`io::Error`] from the underlying `GET`: HTTP failures,
+    /// S3 protocol errors (404 ⇒ `NotFound`), or a tripped circuit breaker.
     pub async fn read(&self, path: &str) -> Result<Vec<u8>, io::Error> {
         self.read_with_metadata(path).await.map(|(body, _, _)| body)
     }
 
+    /// # Errors
+    /// Same as [`read`](Self::read).
     pub async fn read_with_etag(&self, path: &str) -> Result<(Vec<u8>, Option<String>), io::Error> {
         self.read_with_metadata(path)
             .await
             .map(|(body, etag, _)| (body, etag))
     }
 
+    /// # Errors
+    /// Forwards [`io::Error`] from the underlying `GET`: HTTP failures,
+    /// S3 protocol errors (404 ⇒ `NotFound`), or a tripped circuit breaker.
     pub async fn read_with_metadata(
         &self,
         path: &str,
@@ -106,12 +114,20 @@ impl Backend {
         result
     }
 
+    /// # Errors
+    /// Forwards [`io::Error`] from the underlying `HEAD`: HTTP failures,
+    /// S3 protocol errors (404 ⇒ `NotFound`), or a tripped circuit breaker.
     pub async fn object_size(&self, path: &str) -> Result<u64, io::Error> {
         self.head_object(path).await.map(|(size, _, _)| size)
     }
 
     /// Single HEAD request returning size, `ETag`, and last-modified together
     /// — avoids a redundant follow-up `GET` when the caller needs all three.
+    ///
+    /// # Errors
+    /// Forwards [`io::Error`] from the underlying `HEAD`: HTTP failures,
+    /// S3 protocol errors (404 ⇒ `NotFound`), missing/unparseable
+    /// `Content-Length`, or a tripped circuit breaker.
     pub async fn head_object(
         &self,
         path: &str,
@@ -143,6 +159,10 @@ impl Backend {
         result
     }
 
+    /// # Errors
+    /// Forwards [`io::Error`] from the underlying streaming `GET`: HTTP
+    /// failures, S3 protocol errors (404 ⇒ `NotFound`), missing or invalid
+    /// `Content-Length`, or a tripped circuit breaker.
     pub async fn get_object(
         &self,
         path: &str,
@@ -175,6 +195,9 @@ impl Backend {
         })
     }
 
+    /// # Errors
+    /// Same as [`get_object`](Self::get_object), plus [`io::Error`] from
+    /// draining the body stream into memory.
     pub async fn get_object_body(
         &self,
         path: &str,
@@ -189,6 +212,9 @@ impl Backend {
         Ok(buf)
     }
 
+    /// # Errors
+    /// Forwards [`io::Error`] from the underlying `PUT`: HTTP failures,
+    /// S3 protocol errors, or a tripped circuit breaker.
     pub async fn put_object(&self, path: &str, data: impl Into<Bytes>) -> Result<(), io::Error> {
         self.check_circuit_breaker()?;
         let key = self.full_key(path);
@@ -210,6 +236,10 @@ impl Backend {
         result
     }
 
+    /// # Errors
+    /// Forwards [`io::Error`] from the underlying `DELETE`: HTTP failures,
+    /// S3 protocol errors, or a tripped circuit breaker. Missing objects
+    /// are returned as `NotFound`.
     pub async fn delete(&self, path: &str) -> Result<(), io::Error> {
         self.check_circuit_breaker()?;
         let key = self.full_key(path);
@@ -231,10 +261,17 @@ impl Backend {
     }
 
     /// Alias kept for symmetry with the upload-side `delete_object` callers.
+    ///
+    /// # Errors
+    /// Same as [`delete`](Self::delete).
     pub async fn delete_object(&self, path: &str) -> Result<(), io::Error> {
         self.delete(path).await
     }
 
+    /// # Errors
+    /// Returns [`Error::PreconditionFailed`] when an object already exists
+    /// at `path`; otherwise forwards HTTP / S3 protocol errors as
+    /// [`Error::Io`].
     pub async fn put_object_if_not_exists(
         &self,
         path: &str,
@@ -244,6 +281,10 @@ impl Backend {
             .await
     }
 
+    /// # Errors
+    /// Returns [`Error::PreconditionFailed`] when the stored object's
+    /// `ETag` doesn't match `etag`; otherwise forwards HTTP / S3 protocol
+    /// errors as [`Error::Io`].
     pub async fn put_object_if_match(
         &self,
         path: &str,
@@ -254,6 +295,10 @@ impl Backend {
             .await
     }
 
+    /// # Errors
+    /// Returns [`Error::PreconditionFailed`] when the stored object's
+    /// `ETag` doesn't match `etag`; otherwise forwards HTTP / S3 protocol
+    /// errors as [`Error::Io`].
     pub async fn delete_if_match(&self, path: &str, etag: &str) -> Result<(), Error> {
         self.check_circuit_breaker()
             .map_err(|e| Error::Io(e.to_string()))?;
@@ -306,6 +351,10 @@ impl Backend {
         result
     }
 
+    /// # Errors
+    /// Forwards [`io::Error`] from the underlying single-shot or multipart
+    /// copy: HTTP failures, S3 protocol errors (including 404 on the
+    /// source), or a tripped circuit breaker.
     pub async fn copy_object(&self, source: &str, destination: &str) -> Result<(), io::Error> {
         let source_size = self.object_size(source).await?;
         if source_size <= self.multipart_copy_threshold {
@@ -397,6 +446,10 @@ impl Backend {
         Ok(parts)
     }
 
+    /// # Errors
+    /// Forwards [`io::Error`] from any of the paginated `LIST` or batch
+    /// `DELETE` calls. A non-empty `<Error>` list in a batch response is
+    /// joined into a single [`io::Error::other`].
     pub async fn delete_prefix(&self, prefix: &str) -> Result<(), io::Error> {
         let full_prefix = self.full_key(prefix);
         let mut continuation_token = None;
@@ -450,6 +503,9 @@ impl Backend {
 // ─── listing ──────────────────────────────────────────────────────────────
 
 impl Backend {
+    /// # Errors
+    /// Forwards [`io::Error`] from the underlying `ListObjectsV2` request
+    /// or XML body parse failures.
     pub async fn list_objects_v2_raw(
         &self,
         full_prefix: &str,
@@ -487,6 +543,9 @@ impl Backend {
         xml::parse_list_objects_v2(&response.body).map_err(io::Error::other)
     }
 
+    /// # Errors
+    /// Forwards [`io::Error`] from [`list_objects_v2_raw`](Self::list_objects_v2_raw)
+    /// or a tripped circuit breaker.
     pub async fn list_prefixes(
         &self,
         path: &str,
@@ -532,6 +591,9 @@ impl Backend {
         Ok((prefixes, objects, next_token))
     }
 
+    /// # Errors
+    /// Forwards [`io::Error`] from
+    /// [`list_objects_v2_raw`](Self::list_objects_v2_raw).
     pub async fn list_objects(
         &self,
         path: &str,
@@ -560,6 +622,9 @@ impl Backend {
 // ─── multipart uploads ────────────────────────────────────────────────────
 
 impl Backend {
+    /// # Errors
+    /// Forwards [`io::Error`] from the underlying `CreateMultipartUpload`
+    /// request or XML body parse failures.
     pub async fn create_multipart_upload(&self, path: &str) -> Result<String, io::Error> {
         let key = self.full_key(path);
         let response = self
@@ -576,6 +641,8 @@ impl Backend {
         xml::parse_create_multipart_upload(&response.body).map_err(io::Error::other)
     }
 
+    /// # Errors
+    /// Forwards [`io::Error`] from the underlying `UploadPart` request.
     pub async fn upload_part(
         &self,
         path: &str,
@@ -602,6 +669,10 @@ impl Backend {
     /// Streams a multipart part from an mpsc channel into reqwest's HTTP body.
     /// With the blob-store defaults, memory in flight per streaming part is
     /// bounded by `FRAME_BUFFER_CAPACITY * FRAME_SIZE` plus reqwest/hyper buffers.
+    ///
+    /// # Errors
+    /// Forwards [`io::Error`] from the underlying streaming `UploadPart`
+    /// request.
     pub async fn upload_part_streaming(
         &self,
         path: &str,
@@ -631,6 +702,9 @@ impl Backend {
         Ok(header_string(&response.headers, "etag").unwrap_or_default())
     }
 
+    /// # Errors
+    /// Forwards [`io::Error`] from the underlying `UploadPartCopy` request
+    /// or XML body parse failures.
     pub async fn upload_part_copy(
         &self,
         source: &str,
@@ -670,6 +744,10 @@ impl Backend {
         xml::parse_upload_part_copy(&response.body).map_err(io::Error::other)
     }
 
+    /// # Errors
+    /// Forwards [`io::Error`] from the underlying
+    /// `CompleteMultipartUpload` request, including S3-embedded `<Error>`
+    /// bodies (200-with-error responses).
     pub async fn complete_multipart_upload(
         &self,
         path: &str,
@@ -694,6 +772,9 @@ impl Backend {
             .map_err(|e| io_other(&e))
     }
 
+    /// # Errors
+    /// Forwards [`io::Error`] from the underlying `AbortMultipartUpload`
+    /// request.
     pub async fn abort_multipart_upload(
         &self,
         path: &str,
@@ -713,6 +794,9 @@ impl Backend {
             .map_err(|e| io_other(&e))
     }
 
+    /// # Errors
+    /// Forwards [`io::Error`] from the underlying `ListMultipartUploads`
+    /// request or XML body parse failures.
     pub async fn list_multipart_uploads(
         &self,
         prefix: Option<&str>,
@@ -767,6 +851,9 @@ impl Backend {
         Ok((uploads, next_key, next_upload))
     }
 
+    /// # Errors
+    /// Forwards [`io::Error`] from the paginated
+    /// [`list_multipart_uploads`](Self::list_multipart_uploads) calls.
     pub async fn search_multipart_upload_id(
         &self,
         path: &str,
@@ -792,6 +879,8 @@ impl Backend {
         }
     }
 
+    /// # Errors
+    /// Forwards [`io::Error`] from the listing or abort sub-requests.
     pub async fn abort_pending_uploads(&self, path: &str) -> Result<(), io::Error> {
         while let Some(upload_id) = self.search_multipart_upload_id(path).await? {
             self.abort_multipart_upload(path, &upload_id).await?;
@@ -799,6 +888,9 @@ impl Backend {
         Ok(())
     }
 
+    /// # Errors
+    /// Forwards [`io::Error`] from any of the paginated `ListParts`
+    /// requests or XML body parse failures.
     pub async fn list_parts(
         &self,
         path: &str,
@@ -842,6 +934,9 @@ impl Backend {
         clippy::unused_async,
         reason = "async signature matches the rest of the Backend public surface"
     )]
+    /// # Errors
+    /// Returns [`io::Error::other`] when `SigV4` signing fails (e.g.
+    /// invalid credential characters); no network call is made.
     pub async fn generate_presigned_url(
         &self,
         path: &str,

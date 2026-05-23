@@ -38,6 +38,7 @@ impl Builder {
     }
 
     /// Directory under which all object keys are resolved. Required.
+    #[must_use]
     pub fn root_dir(mut self, root: impl Into<PathBuf>) -> Self {
         self.root = Some(root.into());
         self
@@ -45,11 +46,15 @@ impl Builder {
 
     /// When `true`, every write `fsync`s before the temp-file rename. Adds
     /// durability at the cost of a syscall per write.
+    #[must_use]
     pub fn sync_to_disk(mut self, sync: bool) -> Self {
         self.sync_to_disk = sync;
         self
     }
 
+    /// # Errors
+    /// Returns [`Error::Backend`] when [`root_dir`](Self::root_dir) was
+    /// never called.
     pub fn build(self) -> Result<Backend, Error> {
         let root = self
             .root
@@ -69,6 +74,7 @@ pub struct Backend {
 }
 
 impl Backend {
+    #[must_use]
     pub fn builder() -> Builder {
         Builder::new()
     }

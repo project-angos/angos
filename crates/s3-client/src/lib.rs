@@ -36,6 +36,12 @@ pub struct Backend {
 }
 
 impl Backend {
+    /// Build a new backend from `config`.
+    ///
+    /// # Errors
+    /// Returns [`Error::Configuration`] when multipart sizing constraints
+    /// (part size ≥ 5 MiB, copy chunk size between 5 MiB and 5 GiB) are
+    /// violated, or when the underlying HTTP client fails to initialise.
     pub fn new(config: &BackendConfig) -> Result<Self, Error> {
         if config.multipart_part_size < ByteSize::mib(5) {
             return Err(Error::Configuration(
@@ -67,6 +73,11 @@ impl Backend {
         })
     }
 
+    /// Short-circuit if the breaker is currently open.
+    ///
+    /// # Errors
+    /// Returns an [`io::Error`] with [`io::ErrorKind::Other`] when the
+    /// circuit breaker has tripped on repeated upstream failures.
     pub fn check_circuit_breaker(&self) -> Result<(), io::Error> {
         self.circuit_breaker.check()?;
         Ok(())
@@ -89,6 +100,7 @@ impl Backend {
         }
     }
 
+    #[must_use]
     pub fn full_key(&self, path: &str) -> String {
         if self.key_prefix.is_empty() {
             path.to_string()
