@@ -23,6 +23,7 @@ RUN if [ "$TARGETARCH" = "amd64" ] ; then export TOOLCHAIN="x86_64-unknown-linux
     rustup target add "$TOOLCHAIN"
 
 COPY Cargo.toml Cargo.lock build.rs ./
+COPY crates ./crates
 COPY src ./src
 COPY ui ./ui
 
