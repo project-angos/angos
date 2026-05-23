@@ -211,7 +211,7 @@ impl Components {
 
 #[cfg(test)]
 mod tests {
-    use super::{claim_error_backoff, CLAIM_ERROR_BACKOFF_CAP};
+    use super::{CLAIM_ERROR_BACKOFF_CAP, claim_error_backoff};
     use std::time::Duration;
 
     #[test]

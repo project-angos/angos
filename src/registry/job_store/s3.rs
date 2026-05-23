@@ -366,7 +366,7 @@ impl JobStore for Backend {
         match parse_lock_key_index(&data) {
             Ok(index) if index.storage_key == storage_key => {}
             Ok(_) => return Ok(()), // index points elsewhere; leave it
-            Err(_) => {}             // corrupt — fall through and delete
+            Err(_) => {}            // corrupt — fall through and delete
         }
 
         if let Some(etag) = etag {

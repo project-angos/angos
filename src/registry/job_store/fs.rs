@@ -17,8 +17,8 @@ use crate::registry::{
     fs_ops,
     job_store::{
         Error, JobEnvelope, JobStore, MAX_REPORTED_PENDING, STORAGE_KEY_PREFIX_LEN,
-        make_storage_key, parse_lock_key_index, pending_ready_cutoff_prefix,
-        serialize_dead_letter, serialize_lock_key_index,
+        make_storage_key, parse_lock_key_index, pending_ready_cutoff_prefix, serialize_dead_letter,
+        serialize_lock_key_index,
     },
     path_builder,
 };
@@ -96,7 +96,6 @@ impl Backend {
         self.root_dir
             .join(path_builder::job_lock_key_index_path(queue, lock_key))
     }
-
 
     /// Write a new lease file using `create_new` atomicity. Returns the new
     /// instance id on success, or `Ok(None)` when the file already exists.
@@ -192,9 +191,7 @@ impl Backend {
             Ok(()) => {}
             Err(e) if e.kind() == ErrorKind::NotFound => return Ok(None),
             Err(e) => {
-                return Err(Error::Storage(format!(
-                    "failed to rename stale lease: {e}"
-                )));
+                return Err(Error::Storage(format!("failed to rename stale lease: {e}")));
             }
         }
 
@@ -243,9 +240,9 @@ impl Backend {
             .await
         {
             Ok(mut file) => {
-                file.write_all(&our_data).await.map_err(|e| {
-                    Error::Storage(format!("failed to write lease file: {e}"))
-                })?;
+                file.write_all(&our_data)
+                    .await
+                    .map_err(|e| Error::Storage(format!("failed to write lease file: {e}")))?;
             }
             Err(e) if e.kind() == ErrorKind::AlreadyExists => {
                 let _ = fs::remove_file(&side_path).await;
@@ -511,7 +508,7 @@ impl JobStore for Backend {
             Ok(data) => match parse_lock_key_index(&data) {
                 Ok(index) if index.storage_key == storage_key => {}
                 Ok(_) => return Ok(()), // index now points elsewhere; leave it
-                Err(_) => {} // corrupt — fall through and delete
+                Err(_) => {}            // corrupt — fall through and delete
             },
             Err(e) if e.kind() == ErrorKind::NotFound => return Ok(()),
             Err(e) => {
@@ -780,7 +777,10 @@ mod tests {
             .expect("claim")
             .claimed
             .expect("Some — body refreshed_at must drive staleness");
-        assert_eq!(claimed.envelope.lock_key, "cache.ns:sha256:body-driven-stale");
+        assert_eq!(
+            claimed.envelope.lock_key,
+            "cache.ns:sha256:body-driven-stale"
+        );
         consumer.complete(claimed).await.expect("complete");
     }
 
@@ -1267,8 +1267,7 @@ mod tests {
         let data = tokio::fs::read(store.lock_key_index_path("cache", lock_key))
             .await
             .expect("read index");
-        let index =
-            crate::registry::job_store::parse_lock_key_index(&data).expect("parse index");
+        let index = crate::registry::job_store::parse_lock_key_index(&data).expect("parse index");
         assert_eq!(index.storage_key, key1);
     }
 
@@ -1287,8 +1286,8 @@ mod tests {
         // remove_pending and remove_lock_key_index_if_matches.)
         let storage_key = make_storage_key(Utc::now(), "phantom-id");
         let index_path = store.lock_key_index_path("cache", lock_key);
-        let data = crate::registry::job_store::serialize_lock_key_index(&storage_key)
-            .expect("serialize");
+        let data =
+            crate::registry::job_store::serialize_lock_key_index(&storage_key).expect("serialize");
         fs_ops::atomic_write(&index_path, &data, false)
             .await
             .expect("write index");
@@ -1383,7 +1382,10 @@ mod tests {
             "fresh lock_key must be claimable"
         );
         let index_path = store.lock_key_index_path("cache", lock_key);
-        assert!(index_path.exists(), "fixture: index must exist before complete");
+        assert!(
+            index_path.exists(),
+            "fixture: index must exist before complete"
+        );
 
         let claimed = consumer
             .claim_one("cache")
@@ -1393,10 +1395,7 @@ mod tests {
             .expect("Some");
         consumer.complete(claimed).await.expect("complete");
 
-        assert!(
-            !index_path.exists(),
-            "index must be removed on complete"
-        );
+        assert!(!index_path.exists(), "index must be removed on complete");
         assert!(
             !store
                 .find_pending_with_lock_key("cache", lock_key)
@@ -1443,10 +1442,7 @@ mod tests {
             FailOutcome::MovedToDeadLetter
         ));
 
-        assert!(
-            !index_path.exists(),
-            "index must be removed on DLQ"
-        );
+        assert!(!index_path.exists(), "index must be removed on DLQ");
     }
 
     #[tokio::test]
