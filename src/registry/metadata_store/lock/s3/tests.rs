@@ -10,16 +10,15 @@ use chrono::Utc;
 use uuid::Uuid;
 
 use super::{RecoveryOutcome, S3LockBackend, S3LockConfig, S3LockPayload};
-use crate::{
-    metrics_provider, registry::metadata_store::lock::LockBackend, s3_client, secret::Secret,
-};
+use crate::{metrics_provider, registry::metadata_store::lock::LockBackend};
+use angos_s3_client as s3_client;
 
 fn test_store(prefix: &str) -> Arc<s3_client::Backend> {
     metrics_provider::init_for_tests();
     let run_id = Uuid::new_v4();
     let config = s3_client::BackendConfig {
-        access_key_id: Secret::new("root".to_string()),
-        secret_key: Secret::new("roottoor".to_string()),
+        access_key_id: "root".to_string(),
+        secret_key: "roottoor".to_string(),
         endpoint: "http://127.0.0.1:9000".to_string(),
         bucket: "registry".to_string(),
         region: "us-east-1".to_string(),

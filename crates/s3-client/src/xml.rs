@@ -7,7 +7,7 @@ use quick_xml::{
     events::{BytesCData, BytesText, Event},
 };
 
-use super::ops::UploadedPart;
+use crate::ops::UploadedPart;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct S3ErrorBody {

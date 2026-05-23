@@ -1,6 +1,7 @@
 use std::fmt;
 
-use crate::{oci, s3_client};
+use crate::oci;
+use angos_s3_client as s3_client;
 
 #[derive(Debug, PartialEq)]
 pub enum Error {

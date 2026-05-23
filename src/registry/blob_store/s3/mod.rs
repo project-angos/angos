@@ -21,7 +21,6 @@ use sha2::{Digest as ShaDigestTrait, Sha256};
 use tokio::io::AsyncRead;
 use tracing::{debug, info, instrument};
 
-pub use crate::s3_client::UploadedPart;
 use crate::{
     cache::Cache,
     oci::Digest,
@@ -32,8 +31,9 @@ use crate::{
         },
         pagination, path_builder,
     },
-    s3_client,
 };
+use angos_s3_client as s3_client;
+pub use angos_s3_client::UploadedPart;
 
 pub const MIN_PART_SIZE: u64 = 5 * 1024 * 1024;
 pub const FRAME_SIZE: usize = 1024 * 1024;

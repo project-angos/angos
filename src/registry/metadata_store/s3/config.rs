@@ -2,9 +2,9 @@ use serde::{Deserialize, Deserializer};
 
 use crate::{
     registry::metadata_store::{ConditionalCapabilities, LockConfig, LockStrategy, lock},
-    s3_client,
     secret::Secret,
 };
+use angos_s3_client as s3_client;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct BackendConfig {
@@ -108,8 +108,8 @@ pub(super) fn default_access_time_debounce() -> u64 {
 impl BackendConfig {
     pub fn to_data_store_config(&self) -> s3_client::BackendConfig {
         s3_client::BackendConfig {
-            access_key_id: self.access_key_id.clone(),
-            secret_key: self.secret_key.clone(),
+            access_key_id: self.access_key_id.expose().clone(),
+            secret_key: self.secret_key.expose().clone(),
             endpoint: self.endpoint.clone(),
             bucket: self.bucket.clone(),
             region: self.region.clone(),

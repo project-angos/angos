@@ -24,7 +24,6 @@ use crate::{
         },
         pagination, path_builder,
     },
-    s3_client,
 };
 
 mod access_time;
@@ -38,6 +37,7 @@ mod probe;
 #[cfg(test)]
 mod tests;
 
+use angos_s3_client as s3_client;
 use coordinator::WriteCoordinator;
 pub use probe::probe_conditional_capabilities;
 

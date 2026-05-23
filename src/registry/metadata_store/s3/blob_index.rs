@@ -11,8 +11,8 @@ use crate::{
         metadata_store::{BlobIndex, BlobIndexOperation, Error, link_kind::LinkKind, sharded},
         path_builder,
     },
-    s3_client,
 };
+use angos_s3_client as s3_client;
 
 impl Backend {
     /// Applies a batch of blob index operations for a single digest using optimistic

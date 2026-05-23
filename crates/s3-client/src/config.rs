@@ -1,13 +1,17 @@
 use bytesize::ByteSize;
 use serde::Deserialize;
 
-use crate::secret::Secret;
-
+/// Transport-level configuration for the S3 backend.
+///
+/// `access_key_id` and `secret_key` are plain `String`s here. Application
+/// layers that want debug-redaction or zeroize-on-drop semantics should keep
+/// their own secret-wrapper type and call `.expose()` (or equivalent) when
+/// building this config — this crate is a transport, not a security layer.
 #[derive(Clone, Debug, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct BackendConfig {
-    pub access_key_id: Secret<String>,
-    pub secret_key: Secret<String>,
+    pub access_key_id: String,
+    pub secret_key: String,
     pub endpoint: String,
     pub bucket: String,
     pub region: String,
@@ -25,8 +29,8 @@ pub struct BackendConfig {
 impl Default for BackendConfig {
     fn default() -> Self {
         Self {
-            access_key_id: Secret::new(String::new()),
-            secret_key: Secret::new(String::new()),
+            access_key_id: String::new(),
+            secret_key: String::new(),
             endpoint: String::new(),
             bucket: String::new(),
             region: String::new(),

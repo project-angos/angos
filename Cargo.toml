@@ -1,3 +1,6 @@
+[workspace]
+members = ["crates/s3-client", "crates/storage"]
+
 [package]
 name = "angos"
 version = "1.2.0"
@@ -9,6 +12,7 @@ codegen-units = 1
 lto = "fat"
 
 [dependencies]
+angos-s3-client = { path = "crates/s3-client" }
 arc-swap = "1.9.1"
 argh = "0.1.19"
 argon2 = "0.5.3"

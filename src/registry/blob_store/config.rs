@@ -7,8 +7,8 @@ use crate::{
     registry::blob_store::{
         BlobStore, Error, MultipartCleanup, PresignedBlobStore, UploadStore, fs, s3,
     },
-    s3_client,
 };
+use angos_s3_client as s3_client;
 
 pub struct BlobStoreHandles {
     pub blob_store: Arc<dyn BlobStore>,
@@ -67,7 +67,6 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
-    use crate::secret::Secret;
 
     #[tokio::test]
     async fn fs_backend_provides_multipart_cleanup() {
@@ -92,8 +91,8 @@ mod tests {
             endpoint: "http://127.0.0.1:9000".to_string(),
             region: "us-east-1".to_string(),
             bucket: "test-bucket".to_string(),
-            access_key_id: Secret::new("minioadmin".to_string()),
-            secret_key: Secret::new("minioadmin".to_string()),
+            access_key_id: "minioadmin".to_string(),
+            secret_key: "minioadmin".to_string(),
             ..Default::default()
         });
 

@@ -18,9 +18,9 @@ use crate::{
         },
         path_builder,
     },
-    s3_client,
     secret::Secret,
 };
+use angos_s3_client as s3_client;
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct BackendConfig {
@@ -86,8 +86,8 @@ pub struct Backend {
 impl Backend {
     pub fn new(config: &BackendConfig) -> Result<Self, Error> {
         let backend_config = s3_client::BackendConfig {
-            access_key_id: config.access_key_id.clone(),
-            secret_key: config.secret_key.clone(),
+            access_key_id: config.access_key_id.expose().clone(),
+            secret_key: config.secret_key.expose().clone(),
             endpoint: config.endpoint.clone(),
             bucket: config.bucket.clone(),
             region: config.region.clone(),
@@ -494,10 +494,9 @@ mod tests {
             repository::{Config as RepositoryConfig, RegistryClientConfig},
             repository_resolver::RepositoryResolver,
         },
-        s3_client::{Backend as S3Backend, BackendConfig as S3BackendConfig},
-        secret::Secret,
         util::sha256,
     };
+    use angos_s3_client::{Backend as S3Backend, BackendConfig as S3BackendConfig};
 
     const REPO_NAME: &str = "local";
     const NAMESPACE: &str = "local/cache-ns";
@@ -561,8 +560,8 @@ mod tests {
     fn test_store_with_backend(prefix: &str) -> (Arc<Backend>, Arc<S3Backend>) {
         metrics_provider::init_for_tests();
         let config = S3BackendConfig {
-            access_key_id: Secret::new("root".to_string()),
-            secret_key: Secret::new("roottoor".to_string()),
+            access_key_id: "root".to_string(),
+            secret_key: "roottoor".to_string(),
             endpoint: "http://127.0.0.1:9000".to_string(),
             bucket: "registry".to_string(),
             region: "us-east-1".to_string(),

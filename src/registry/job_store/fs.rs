@@ -617,9 +617,9 @@ mod tests {
     use crate::{
         metrics_provider,
         registry::job_store::{
-            JobEnvelope, JobQueue,
+            JobEnvelope, JobQueue, MAX_REPORTED_PENDING,
             durable::{ClaimedJob, DurableJobConsumer, DurableJobQueue, FailOutcome},
-            parse_not_before,
+            make_storage_key, parse_not_before,
         },
     };
 
@@ -1082,7 +1082,6 @@ mod tests {
     /// time-prefixed for *now* so they fall inside the readiness window.
     #[tokio::test]
     async fn count_pending_saturates_at_cap() {
-        use crate::registry::job_store::{MAX_REPORTED_PENDING, make_storage_key};
         let dir = TempDir::new().expect("temp dir");
         let store = make_store(&dir);
         let queue_dir = store.pending_dir("cache");
@@ -1106,7 +1105,6 @@ mod tests {
     /// contribute to the autoscaler gauge.
     #[tokio::test]
     async fn count_pending_excludes_envelopes_past_readiness_horizon() {
-        use crate::registry::job_store::make_storage_key;
         let dir = TempDir::new().expect("temp dir");
         let store = make_store(&dir);
         let queue_dir = store.pending_dir("cache");

@@ -2,10 +2,8 @@ use std::io::ErrorKind;
 
 use tracing::{info, warn};
 
-use crate::{
-    registry::metadata_store::{ConditionalCapabilities, Error},
-    s3_client,
-};
+use crate::registry::metadata_store::{ConditionalCapabilities, Error};
+use angos_s3_client as s3_client;
 
 /// RAII guard that warns if dropped while still armed.
 ///

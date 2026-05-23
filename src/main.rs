@@ -21,7 +21,6 @@ use crate::{
 
 mod auth;
 mod cache;
-mod circuit_breaker;
 mod command;
 mod configuration;
 mod event_webhook;
@@ -32,7 +31,6 @@ mod oci;
 mod policy;
 mod registry;
 pub mod registry_client;
-mod s3_client;
 mod secret;
 mod timing;
 mod util;

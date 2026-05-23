@@ -15,6 +15,7 @@ use crate::{
     },
     secret::Secret,
 };
+use angos_s3_client as s3_client;
 
 fn test_config() -> BackendConfig {
     metrics_provider::init_for_tests();
@@ -1073,8 +1074,8 @@ async fn test_read_link_with_access_time_debounce_uses_cache() {
 async fn test_probe_conditional_capabilities() {
     let config = test_config();
     let store = s3_client::Backend::new(&s3_client::BackendConfig {
-        access_key_id: config.access_key_id.clone(),
-        secret_key: config.secret_key.clone(),
+        access_key_id: config.access_key_id.expose().clone(),
+        secret_key: config.secret_key.expose().clone(),
         endpoint: config.endpoint.clone(),
         bucket: config.bucket.clone(),
         region: config.region.clone(),
@@ -1103,8 +1104,8 @@ async fn test_probe_conditional_capabilities() {
 async fn test_probe_cleanup_removes_probe_object() {
     let config = test_config();
     let store = s3_client::Backend::new(&s3_client::BackendConfig {
-        access_key_id: config.access_key_id.clone(),
-        secret_key: config.secret_key.clone(),
+        access_key_id: config.access_key_id.expose().clone(),
+        secret_key: config.secret_key.expose().clone(),
         endpoint: config.endpoint.clone(),
         bucket: config.bucket.clone(),
         region: config.region.clone(),
@@ -1140,8 +1141,8 @@ async fn test_probe_cleanup_removes_probe_object() {
 async fn test_probe_idempotent_back_to_back() {
     let config = test_config();
     let store = s3_client::Backend::new(&s3_client::BackendConfig {
-        access_key_id: config.access_key_id.clone(),
-        secret_key: config.secret_key.clone(),
+        access_key_id: config.access_key_id.expose().clone(),
+        secret_key: config.secret_key.expose().clone(),
         endpoint: config.endpoint.clone(),
         bucket: config.bucket.clone(),
         region: config.region.clone(),
@@ -1256,8 +1257,8 @@ async fn test_lock_coordinator_blob_index_update_uses_blob_lock() {
 async fn test_probe_with_nonexistent_bucket_returns_err() {
     let config = test_config();
     let store = s3_client::Backend::new(&s3_client::BackendConfig {
-        access_key_id: config.access_key_id.clone(),
-        secret_key: config.secret_key.clone(),
+        access_key_id: config.access_key_id.expose().clone(),
+        secret_key: config.secret_key.expose().clone(),
         endpoint: config.endpoint.clone(),
         bucket: "angos-probe-nonexistent-bucket-xyzzy".to_string(),
         region: config.region.clone(),

@@ -14,8 +14,8 @@ use crate::{
         },
         path_builder,
     },
-    s3_client,
 };
+use angos_s3_client as s3_client;
 
 impl Backend {
     pub fn cache_key(namespace: &str, link: &LinkKind) -> String {

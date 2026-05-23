@@ -27,7 +27,7 @@ use tokio::{
 };
 use tokio_util::io::StreamReader;
 
-use super::{
+use crate::{
     Backend, Error,
     client::{
         QueryParam, S3Error, SendOpts, content_length as parse_content_length, content_md5_base64,
@@ -107,6 +107,15 @@ impl Backend {
     }
 
     pub async fn object_size(&self, path: &str) -> Result<u64, io::Error> {
+        self.head_object(path).await.map(|(size, _, _)| size)
+    }
+
+    /// Single HEAD request returning size, `ETag`, and last-modified together
+    /// — avoids a redundant follow-up `GET` when the caller needs all three.
+    pub async fn head_object(
+        &self,
+        path: &str,
+    ) -> Result<(u64, Option<String>, Option<DateTime<Utc>>), io::Error> {
         self.check_circuit_breaker()?;
         let key = self.full_key(path);
 
@@ -121,7 +130,15 @@ impl Backend {
             )
             .await
             .map_err(|e| map_get_error(&e))
-            .and_then(|response| parse_content_length(&response.headers).map_err(io::Error::other));
+            .and_then(|response| {
+                let size =
+                    parse_content_length(&response.headers).map_err(io::Error::other)?;
+                Ok((
+                    size,
+                    header_string(&response.headers, "etag"),
+                    last_modified(&response.headers),
+                ))
+            });
         self.record_io_result(&result);
         result
     }
@@ -433,7 +450,7 @@ impl Backend {
 // ─── listing ──────────────────────────────────────────────────────────────
 
 impl Backend {
-    pub(super) async fn list_objects_v2_raw(
+    pub async fn list_objects_v2_raw(
         &self,
         full_prefix: &str,
         max_keys: u16,
@@ -840,7 +857,7 @@ impl Backend {
 
 // ─── helpers ──────────────────────────────────────────────────────────────
 
-pub(super) fn aggregate_batch_delete_errors(errors: &[String]) -> Option<io::Error> {
+pub fn aggregate_batch_delete_errors(errors: &[String]) -> Option<io::Error> {
     (!errors.is_empty())
         .then(|| io::Error::other(format!("batch delete errors: {}", errors.join("; "))))
 }
@@ -944,17 +961,14 @@ mod tests {
     };
 
     use super::*;
-    use crate::{
-        s3_client::{Backend, BackendConfig, client::content_md5_base64},
-        secret::Secret,
-    };
+    use crate::{BackendConfig, client::content_md5_base64};
 
     const MIB: u64 = 1024 * 1024;
 
     fn test_config(endpoint: String) -> BackendConfig {
         BackendConfig {
-            access_key_id: Secret::new("key".to_string()),
-            secret_key: Secret::new("secret".to_string()),
+            access_key_id: "key".to_string(),
+            secret_key: "secret".to_string(),
             endpoint,
             bucket: "test-bucket".to_string(),
             region: "us-east-1".to_string(),

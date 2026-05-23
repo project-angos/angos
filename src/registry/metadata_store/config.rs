@@ -9,8 +9,9 @@ use crate::{
         blob_store, metadata_store,
         metadata_store::{ConditionalCapabilities, Error, LockStrategy, MetadataStore},
     },
-    s3_client,
+    secret::Secret,
 };
+use angos_s3_client as s3_client;
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq)]
 #[allow(clippy::large_enum_variant)]
@@ -44,8 +45,8 @@ impl MetadataStoreConfig {
                     bucket: config.bucket.clone(),
                     region: config.region.clone(),
                     endpoint: config.endpoint.clone(),
-                    access_key_id: config.access_key_id.clone(),
-                    secret_key: config.secret_key.clone(),
+                    access_key_id: Secret::new(config.access_key_id.clone()),
+                    secret_key: Secret::new(config.secret_key.clone()),
                     key_prefix: config.key_prefix.clone(),
                     ..Default::default()
                 })
@@ -126,7 +127,7 @@ impl MetadataStoreConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::secret::Secret;
+    use crate::{registry::metadata_store::lock::s3::S3LockConfig, secret::Secret};
 
     fn s3_config_with_lock_strategy(lock_strategy: LockStrategy) -> MetadataStoreConfig {
         MetadataStoreConfig::S3(metadata_store::s3::BackendConfig {
@@ -145,8 +146,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_probe_s3_lock_strategy_detects_minio_capabilities() {
-        use crate::registry::metadata_store::lock::s3::S3LockConfig;
-
         let config = s3_config_with_lock_strategy(LockStrategy::S3(S3LockConfig::default()));
         let result = config.probe().await;
         assert!(
@@ -213,8 +212,8 @@ mod tests {
             bucket: "test-bucket".to_string(),
             region: "us-east-1".to_string(),
             endpoint: "http://localhost:9000".to_string(),
-            access_key_id: Secret::new("key".to_string()),
-            secret_key: Secret::new("secret".to_string()),
+            access_key_id: "key".to_string(),
+            secret_key: "secret".to_string(),
             key_prefix: "foo".to_string(),
             ..Default::default()
         });

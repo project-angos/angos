@@ -19,8 +19,8 @@ use crate::{
         },
         path_builder,
     },
-    s3_client,
 };
+use angos_s3_client as s3_client;
 
 #[async_trait]
 pub trait WriteCoordinator: Send + Sync + std::fmt::Debug {

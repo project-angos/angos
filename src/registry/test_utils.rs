@@ -16,9 +16,9 @@ use crate::{
         metadata_store::{LinkOperation, MetadataStore, link_kind::LinkKind},
         repository_resolver::RepositoryResolver,
     },
-    s3_client,
     secret::Secret,
 };
+use angos_s3_client as s3_client;
 
 pub fn create_test_repositories() -> Arc<HashMap<String, Repository>> {
     metrics_provider::init_for_tests();
@@ -233,8 +233,8 @@ impl S3RegistryTestCase {
 
         let blob_store = Arc::new(
             blob_store::s3::Backend::new(&s3_client::BackendConfig {
-                access_key_id: Secret::new("root".to_string()),
-                secret_key: Secret::new("roottoor".to_string()),
+                access_key_id: "root".to_string(),
+                secret_key: "roottoor".to_string(),
                 endpoint: "http://127.0.0.1:9000".to_string(),
                 region: "region".to_string(),
                 bucket: "registry".to_string(),
