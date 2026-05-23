@@ -5,13 +5,16 @@ use std::{
 };
 
 use async_trait::async_trait;
-use chrono::{Duration as ChronoDuration, Utc};
+use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use serde::{Deserialize, Serialize};
 use tracing::debug;
 
 use crate::{
     registry::{
-        job_store::{Error, JobEnvelope, JobStore, serialize_dead_letter},
+        job_store::{
+            Error, JobEnvelope, JobStore, MAX_REPORTED_PENDING, STORAGE_KEY_PREFIX_LEN,
+            make_storage_key, pending_ready_cutoff_prefix, serialize_dead_letter,
+        },
         path_builder,
     },
     s3_client,
@@ -167,19 +170,24 @@ impl JobStore for Backend {
     async fn put_pending(
         &self,
         queue: &str,
-        id: &str,
         envelope: &JobEnvelope,
-    ) -> Result<(), Error> {
-        let key = path_builder::job_pending_path(queue, id);
+        not_before: DateTime<Utc>,
+    ) -> Result<String, Error> {
+        let storage_key = make_storage_key(not_before, &envelope.id);
+        let key = path_builder::job_pending_path(queue, &storage_key);
         let data = serde_json::to_vec(envelope)
             .map_err(|e| Error::Storage(format!("envelope serialization failed: {e}")))?;
         self.backend
             .put_object(&key, data)
             .await
-            .map_err(|e| s3_io_to_job_err(&e))
+            .map_err(|e| s3_io_to_job_err(&e))?;
+        Ok(storage_key)
     }
 
     async fn list_pending(&self, queue: &str, n: u16) -> Result<Vec<String>, Error> {
+        // S3 LIST returns keys in lexicographic order. Storage keys start
+        // with a fixed-width hex unix-millis prefix, so this is also
+        // `not_before` order without any extra sort.
         let prefix = format!("{}/", path_builder::job_pending_dir(queue));
         let (all_keys, _next_token) = self
             .backend
@@ -195,8 +203,8 @@ impl JobStore for Backend {
             .collect())
     }
 
-    async fn read_pending(&self, queue: &str, id: &str) -> Result<JobEnvelope, Error> {
-        let key = path_builder::job_pending_path(queue, id);
+    async fn read_pending(&self, queue: &str, storage_key: &str) -> Result<JobEnvelope, Error> {
+        let key = path_builder::job_pending_path(queue, storage_key);
         let data = self
             .backend
             .read(&key)
@@ -242,8 +250,8 @@ impl JobStore for Backend {
         }
     }
 
-    async fn remove_pending(&self, queue: &str, id: &str) -> Result<(), Error> {
-        let key = path_builder::job_pending_path(queue, id);
+    async fn remove_pending(&self, queue: &str, storage_key: &str) -> Result<(), Error> {
+        let key = path_builder::job_pending_path(queue, storage_key);
         match self.backend.delete(&key).await {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == ErrorKind::NotFound => Ok(()),
@@ -272,21 +280,22 @@ impl JobStore for Backend {
     async fn move_to_failed(
         &self,
         queue: &str,
-        id: &str,
+        storage_key: &str,
         envelope: &JobEnvelope,
         last_error: &str,
     ) -> Result<(), Error> {
         let data = serialize_dead_letter(envelope, last_error)?;
-        let failed_key = path_builder::job_failed_path(queue, id);
+        let failed_key = path_builder::job_failed_path(queue, storage_key);
         self.backend
             .put_object(&failed_key, data)
             .await
             .map_err(|e| s3_io_to_job_err(&e))?;
-        self.remove_pending(queue, id).await
+        self.remove_pending(queue, storage_key).await
     }
 
-    async fn count_pending(&self, queue: &str) -> Result<u64, Error> {
+    async fn count_pending(&self, queue: &str, ready_horizon_secs: u64) -> Result<u64, Error> {
         let prefix = format!("{}/", path_builder::job_pending_dir(queue));
+        let cutoff_prefix = pending_ready_cutoff_prefix(ready_horizon_secs);
         let mut count: u64 = 0;
         let mut token: Option<String> = None;
         loop {
@@ -295,10 +304,24 @@ impl JobStore for Backend {
                 .list_objects(&prefix, 1000, token)
                 .await
                 .map_err(|e| s3_io_to_job_err(&e))?;
-            count += keys
-                .iter()
-                .filter(|k| Path::new(k).extension().is_some_and(|ext| ext == "json"))
-                .count() as u64;
+            for k in &keys {
+                if !Path::new(k).extension().is_some_and(|ext| ext == "json") {
+                    continue;
+                }
+                // S3 LIST returns keys in lexicographic order; the storage-key
+                // prefix is `not_before` in fixed-width hex, so the first key
+                // whose prefix is past the readiness cutoff terminates the
+                // count — every later key is even further in the future.
+                if let Some(p) = k.get(..STORAGE_KEY_PREFIX_LEN)
+                    && p > cutoff_prefix.as_str()
+                {
+                    return Ok(count.min(MAX_REPORTED_PENDING));
+                }
+                count += 1;
+                if count >= MAX_REPORTED_PENDING {
+                    return Ok(MAX_REPORTED_PENDING);
+                }
+            }
             match next {
                 Some(t) => token = Some(t),
                 None => return Ok(count),
@@ -311,6 +334,7 @@ impl JobStore for Backend {
 mod tests {
     use std::{collections::HashMap, sync::Arc, time::Duration};
 
+    use chrono::Utc;
     use tokio::{io::AsyncReadExt, time::sleep};
     use uuid::Uuid;
 
@@ -473,7 +497,7 @@ mod tests {
         let env = JobEnvelope::new("cache", "test.noop", "cache.ns:sha256:s3stale", &())
             .expect("envelope");
         store
-            .put_pending("cache", &env.id, &env)
+            .put_pending("cache", &env, Utc::now())
             .await
             .expect("put");
 
@@ -559,7 +583,7 @@ mod tests {
 
         // Exactly one envelope must be pending in S3.
         let pending_count = store
-            .count_pending("cache")
+            .count_pending("cache", 600)
             .await
             .expect("count_pending after enqueue");
         assert_eq!(pending_count, 1, "exactly one pending envelope expected");
@@ -589,7 +613,7 @@ mod tests {
 
         // Pending queue must be empty.
         let remaining = store
-            .count_pending("cache")
+            .count_pending("cache", 600)
             .await
             .expect("count_pending after worker");
         assert_eq!(remaining, 0, "pending queue must be empty after completion");

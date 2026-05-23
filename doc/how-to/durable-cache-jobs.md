@@ -54,6 +54,7 @@ max_concurrent_cache_jobs = 4   # also bounds the number of jobs each `angos wor
 [global.job_queue]
 default_lease_ttl_secs = 30          # per-job worker lease TTL in seconds (min 9)
 pending_refresh_interval_secs = 15   # how often the server refreshes the pending gauge
+pending_ready_horizon_secs = 600     # only jobs ready within this many seconds count toward the gauge
 
 [global.job_queue.fs]
 root_dir = "/var/lib/angos/jobs"     # must be writable by every server and worker replica
@@ -73,6 +74,7 @@ Use this for multi-node deployments or when blob storage is already on S3.
 default_lease_ttl_secs = 30          # min 9
 pending_refresh_interval_secs = 15   # keep at 15 or higher on S3 to avoid
                                      # excessive LIST requests
+pending_ready_horizon_secs = 600     # autoscaler gauge horizon
 
 [global.job_queue.s3]
 bucket = "angos-jobs"
@@ -124,7 +126,7 @@ configured the server publishes:
 
 | Metric | Type | Labels | Description |
 |---|---|---|---|
-| `angos_job_queue_pending` | Gauge | `queue` | Jobs currently pending. Refreshed by a background ticker; use this for KEDA autoscaling. |
+| `angos_job_queue_pending` | Gauge | `queue` | Pending jobs ready within the configured readiness horizon (`pending_ready_horizon_secs`, default 600 s). Refreshed by a background ticker; use this for KEDA autoscaling. Saturates at 10 000 (read as "≥ 10 000") to cap S3 `LIST` cost per refresh. |
 | `angos_job_queue_enqueued_total` | Counter | `queue`, `dedup` | Jobs submitted. `dedup="hit"` means a duplicate `lock_key` was suppressed. |
 
 `angos worker` has no HTTP listener and therefore exposes no metrics of its
@@ -134,9 +136,18 @@ lease-lost) are emitted via structured logs and keyed on `lock_key`.
 ## Operational notes
 
 **Dead-letter queue:** Jobs that exhaust their retry budget (5 attempts) are
-moved to `_jobs/failed/cache/<id>.json` (FS) or the equivalent S3 key.
-Inspect them with `cat`/`jq` to diagnose persistent failures. Requeue
-manually by moving the file back to `_jobs/pending/cache/`.
+moved to `_jobs/failed/cache/<storage_key>.json` (FS) or the equivalent S3
+key. The `storage_key` is `<16-hex unix-millis>-<uuid>` — the millis prefix is
+the `not_before` of the last retry, the UUID is the envelope id. Inspect with
+`cat`/`jq` to diagnose persistent failures.
+
+To requeue manually, move the file back into `_jobs/pending/cache/`. The
+filename's millis prefix continues to drive scheduling, so to force immediate
+re-execution rename the file with a zero prefix:
+`0000000000000000-<uuid>.json`. A worker will pick it up on the next poll
+(envelope `attempts` and `max_attempts` are preserved as-is, so a job that
+already hit the retry ceiling will still go straight to DLQ on first failure
+unless you also edit the body).
 
 **FS backend on shared storage:** The FS backend requires `O_EXCL` to be atomic
 on the volume. Single-host POSIX filesystems (ext4, XFS, tmpfs) and NFSv4 with
@@ -155,8 +166,12 @@ conditional delete to fall back to an unconditional `DELETE`.
 `lock_key`s. At the default `pending_refresh_interval_secs = 15` and with N
 serve replicas each doing their own scan, total LIST rate is roughly `miss_rate
 × N` calls/s. A `ListObjectsV2` returns up to 1000 keys per call, so queues
-with thousands of pending jobs remain cheap. Do not set
-`pending_refresh_interval_secs` below 5 on S3.
+with thousands of pending jobs remain cheap. The pending-gauge ticker stops
+paginating as soon as it crosses either threshold: the readiness horizon
+(first key whose storage-key prefix is past `now + pending_ready_horizon_secs`)
+or the 10 000-entry saturation cap. Both bound the per-tick cost regardless
+of queue depth. `pending_refresh_interval_secs` is enforced to be ≥ 5 at
+config load (sub-5s ticks induce LIST storms on S3).
 
 **Backoff schedule:** Failed jobs are retried with exponential backoff:
 `min(1 min × 2^attempts, 10 min)`. With the default 5-attempt budget a job

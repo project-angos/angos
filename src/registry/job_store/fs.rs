@@ -5,6 +5,7 @@ use std::{
 };
 
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use tokio::{fs, io::AsyncWriteExt};
 use tracing::{debug, warn};
@@ -12,7 +13,10 @@ use uuid::Uuid;
 
 use crate::registry::{
     fs_ops,
-    job_store::{Error, JobEnvelope, JobStore, serialize_dead_letter},
+    job_store::{
+        Error, JobEnvelope, JobStore, MAX_REPORTED_PENDING, STORAGE_KEY_PREFIX_LEN,
+        make_storage_key, pending_ready_cutoff_prefix, serialize_dead_letter,
+    },
     path_builder,
 };
 
@@ -34,10 +38,13 @@ struct LeaseFile {
 /// Layout under `root_dir`:
 /// ```text
 /// _jobs/
-///   pending/<queue>/<ulid>.json
+///   pending/<queue>/<storage_key>.json
 ///   leases/<lock_key_encoded>.json
-///   failed/<queue>/<ulid>.json
+///   failed/<queue>/<storage_key>.json
 /// ```
+///
+/// Storage keys have the form `<16-hex unix-millis>-<uuid>`; lexicographic
+/// sort on filenames is therefore the same as sorting by `not_before`.
 ///
 /// Lease creation uses `OpenOptions::create_new` for atomic exclusivity.
 /// Stale leases are detected via `mtime + ttl < now` and stolen by removing
@@ -57,17 +64,18 @@ impl Backend {
         self.root_dir.join(path_builder::job_pending_dir(queue))
     }
 
-    fn pending_path(&self, queue: &str, id: &str) -> PathBuf {
+    fn pending_path(&self, queue: &str, storage_key: &str) -> PathBuf {
         self.root_dir
-            .join(path_builder::job_pending_path(queue, id))
+            .join(path_builder::job_pending_path(queue, storage_key))
     }
 
     fn lease_path(&self, lock_key: &str) -> PathBuf {
         self.root_dir.join(path_builder::job_lease_path(lock_key))
     }
 
-    fn failed_path(&self, queue: &str, id: &str) -> PathBuf {
-        self.root_dir.join(path_builder::job_failed_path(queue, id))
+    fn failed_path(&self, queue: &str, storage_key: &str) -> PathBuf {
+        self.root_dir
+            .join(path_builder::job_failed_path(queue, storage_key))
     }
 
     /// Write a new lease file using `create_new` atomicity. Returns the new
@@ -164,15 +172,17 @@ impl JobStore for Backend {
     async fn put_pending(
         &self,
         queue: &str,
-        id: &str,
         envelope: &JobEnvelope,
-    ) -> Result<(), Error> {
-        let path = self.pending_path(queue, id);
+        not_before: DateTime<Utc>,
+    ) -> Result<String, Error> {
+        let storage_key = make_storage_key(not_before, &envelope.id);
+        let path = self.pending_path(queue, &storage_key);
         let data = serde_json::to_vec(envelope)
             .map_err(|e| Error::Storage(format!("envelope serialization failed: {e}")))?;
         fs_ops::atomic_write(&path, &data, false)
             .await
-            .map_err(|e| Error::Storage(format!("failed to write pending job: {e}")))
+            .map_err(|e| Error::Storage(format!("failed to write pending job: {e}")))?;
+        Ok(storage_key)
     }
 
     async fn list_pending(&self, queue: &str, n: u16) -> Result<Vec<String>, Error> {
@@ -181,7 +191,8 @@ impl JobStore for Backend {
             .await
             .map_err(|e| Error::Storage(format!("failed to list pending: {e}")))?;
 
-        // ULID filenames sort lexicographically by creation time.
+        // Storage keys start with a fixed-width hex unix-millis prefix, so
+        // lexicographic sort matches `not_before` order.
         entries.sort();
 
         Ok(entries
@@ -192,8 +203,8 @@ impl JobStore for Backend {
             .collect())
     }
 
-    async fn read_pending(&self, queue: &str, id: &str) -> Result<JobEnvelope, Error> {
-        let path = self.pending_path(queue, id);
+    async fn read_pending(&self, queue: &str, storage_key: &str) -> Result<JobEnvelope, Error> {
+        let path = self.pending_path(queue, storage_key);
         let data = fs::read(&path).await.map_err(|e| {
             if e.kind() == ErrorKind::NotFound {
                 Error::NotFound
@@ -258,8 +269,8 @@ impl JobStore for Backend {
         Ok(token.to_string())
     }
 
-    async fn remove_pending(&self, queue: &str, id: &str) -> Result<(), Error> {
-        let path = self.pending_path(queue, id);
+    async fn remove_pending(&self, queue: &str, storage_key: &str) -> Result<(), Error> {
+        let path = self.pending_path(queue, storage_key);
         match fs::remove_file(&path).await {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == ErrorKind::NotFound => Ok(()),
@@ -300,28 +311,44 @@ impl JobStore for Backend {
     async fn move_to_failed(
         &self,
         queue: &str,
-        id: &str,
+        storage_key: &str,
         envelope: &JobEnvelope,
         last_error: &str,
     ) -> Result<(), Error> {
         let data = serialize_dead_letter(envelope, last_error)?;
-        let failed_path = self.failed_path(queue, id);
+        let failed_path = self.failed_path(queue, storage_key);
         fs_ops::atomic_write(&failed_path, &data, false)
             .await
             .map_err(|e| Error::Storage(format!("failed to write dead-letter: {e}")))?;
-        self.remove_pending(queue, id).await
+        self.remove_pending(queue, storage_key).await
     }
 
-    async fn count_pending(&self, queue: &str) -> Result<u64, Error> {
+    async fn count_pending(&self, queue: &str, ready_horizon_secs: u64) -> Result<u64, Error> {
         let dir = self.pending_dir(queue);
-        let entries = fs_ops::list_dir_or_empty(&dir)
+        let mut entries = fs_ops::list_dir_or_empty(&dir)
             .await
             .map_err(|e| Error::Storage(format!("failed to count pending: {e}")))?;
-        let count = entries
-            .iter()
-            .filter(|name| Path::new(name).extension().is_some_and(|ext| ext == "json"))
-            .count();
-        Ok(count as u64)
+        // Sort so the cutoff early-exit is correct: storage keys start with a
+        // fixed-width hex unix-millis prefix, so lexicographic sort == time order.
+        entries.sort();
+
+        let cutoff_prefix = pending_ready_cutoff_prefix(ready_horizon_secs);
+        let mut count: u64 = 0;
+        for name in &entries {
+            if !Path::new(name).extension().is_some_and(|ext| ext == "json") {
+                continue;
+            }
+            if let Some(p) = name.get(..STORAGE_KEY_PREFIX_LEN)
+                && p > cutoff_prefix.as_str()
+            {
+                break;
+            }
+            count += 1;
+            if count >= MAX_REPORTED_PENDING {
+                break;
+            }
+        }
+        Ok(count.min(MAX_REPORTED_PENDING))
     }
 }
 
@@ -333,7 +360,6 @@ mod tests {
     use tempfile::TempDir;
     use tokio::time::timeout;
     use tokio_util::sync::CancellationToken;
-    use ulid::Ulid;
 
     use super::*;
     use crate::{
@@ -341,6 +367,7 @@ mod tests {
         registry::job_store::{
             JobEnvelope, JobQueue,
             durable::{ClaimedJob, DurableJobConsumer, DurableJobQueue, FailOutcome},
+            parse_not_before,
         },
     };
 
@@ -396,14 +423,14 @@ mod tests {
         let store = make_store(&dir);
         let consumer = make_consumer(store.clone());
 
-        let mut env = dummy_envelope("cache.ns:sha256:shared");
+        let env1 = dummy_envelope("cache.ns:sha256:shared");
+        let env2 = dummy_envelope("cache.ns:sha256:shared");
         store
-            .put_pending("cache", &env.id, &env)
+            .put_pending("cache", &env1, Utc::now())
             .await
             .expect("put 1");
-        env.id = Ulid::new().to_string();
         store
-            .put_pending("cache", &env.id, &env)
+            .put_pending("cache", &env2, Utc::now())
             .await
             .expect("put 2");
 
@@ -433,7 +460,7 @@ mod tests {
 
         let env = dummy_envelope("cache.ns:sha256:stale");
         store
-            .put_pending("cache", &env.id, &env)
+            .put_pending("cache", &env, Utc::now())
             .await
             .expect("put");
 
@@ -467,7 +494,7 @@ mod tests {
         let mut env = dummy_envelope("cache.ns:sha256:retry");
         env.max_attempts = 3;
         store
-            .put_pending("cache", &env.id, &env)
+            .put_pending("cache", &env, Utc::now())
             .await
             .expect("put");
 
@@ -477,19 +504,26 @@ mod tests {
             .expect("claim")
             .claimed
             .expect("Some");
-        let id = claimed.envelope.id.clone();
 
         assert!(matches!(
             consumer.fail(claimed, "boom").await.expect("fail"),
             FailOutcome::Retried { .. }
         ));
 
+        // Retry lands at a brand-new storage key with the bumped not_before
+        // encoded in its prefix. Find it through list_pending so the test
+        // doesn't have to know the new key shape.
+        let pending = store.list_pending("cache", 10).await.expect("list");
+        assert_eq!(pending.len(), 1, "exactly one retry envelope expected");
+        let storage_key = &pending[0];
+        let not_before = parse_not_before(storage_key).expect("parse prefix");
+        assert!(not_before > Utc::now(), "retry must be backed off");
+
         let updated = store
-            .read_pending("cache", &id)
+            .read_pending("cache", storage_key)
             .await
             .expect("read updated");
         assert_eq!(updated.attempts, 1);
-        assert!(updated.not_before > Utc::now());
     }
 
     #[tokio::test]
@@ -501,7 +535,7 @@ mod tests {
         let mut env = dummy_envelope("cache.ns:sha256:dl");
         env.max_attempts = 1;
         store
-            .put_pending("cache", &env.id, &env)
+            .put_pending("cache", &env, Utc::now())
             .await
             .expect("put");
 
@@ -511,17 +545,112 @@ mod tests {
             .expect("claim")
             .claimed
             .expect("Some");
-        let id = claimed.envelope.id.clone();
+        let storage_key = claimed.storage_key.clone();
 
         assert!(matches!(
             consumer.fail(claimed, "final error").await.expect("fail"),
             FailOutcome::MovedToDeadLetter
         ));
         assert!(matches!(
-            store.read_pending("cache", &id).await,
+            store.read_pending("cache", &storage_key).await,
             Err(Error::NotFound)
         ));
-        assert!(store.failed_path("cache", &id).exists());
+        assert!(store.failed_path("cache", &storage_key).exists());
+    }
+
+    /// `count_pending` must saturate at `MAX_REPORTED_PENDING` so the
+    /// autoscaler gauge has a bounded cost ceiling. All stub files are
+    /// time-prefixed for *now* so they fall inside the readiness window.
+    #[tokio::test]
+    async fn count_pending_saturates_at_cap() {
+        use crate::registry::job_store::{MAX_REPORTED_PENDING, make_storage_key};
+        let dir = TempDir::new().expect("temp dir");
+        let store = make_store(&dir);
+        let queue_dir = store.pending_dir("cache");
+        tokio::fs::create_dir_all(&queue_dir)
+            .await
+            .expect("mkdir pending dir");
+        let now = Utc::now();
+        for i in 0..(MAX_REPORTED_PENDING + 5) {
+            let key = make_storage_key(now, &format!("stub-{i}"));
+            tokio::fs::write(queue_dir.join(format!("{key}.json")), b"{}")
+                .await
+                .expect("write stub");
+        }
+        // Horizon doesn't matter here — every stub is scheduled at "now".
+        let count = store
+            .count_pending("cache", 600)
+            .await
+            .expect("count");
+        assert_eq!(count, MAX_REPORTED_PENDING);
+    }
+
+    /// `count_pending` reports only envelopes ready within the supplied
+    /// readiness horizon. Envelopes scheduled past that horizon don't
+    /// contribute to the autoscaler gauge.
+    #[tokio::test]
+    async fn count_pending_excludes_envelopes_past_readiness_horizon() {
+        use crate::registry::job_store::make_storage_key;
+        let dir = TempDir::new().expect("temp dir");
+        let store = make_store(&dir);
+        let queue_dir = store.pending_dir("cache");
+        tokio::fs::create_dir_all(&queue_dir)
+            .await
+            .expect("mkdir pending dir");
+
+        let now = Utc::now();
+        // Two ready envelopes (not_before <= now).
+        for i in 0..2 {
+            let key = make_storage_key(now, &format!("ready-{i}"));
+            tokio::fs::write(queue_dir.join(format!("{key}.json")), b"{}")
+                .await
+                .expect("write ready");
+        }
+        // Two envelopes scheduled an hour out, well past our 60-second
+        // horizon below.
+        let far_future = now + chrono::Duration::hours(1);
+        for i in 0..2 {
+            let key = make_storage_key(far_future, &format!("future-{i}"));
+            tokio::fs::write(queue_dir.join(format!("{key}.json")), b"{}")
+                .await
+                .expect("write future");
+        }
+
+        let count = store
+            .count_pending("cache", 60)
+            .await
+            .expect("count");
+        assert_eq!(count, 2, "only the ready envelopes must be counted");
+    }
+
+    /// A pending envelope whose storage-key prefix is in the future must
+    /// surface as `next_ready` without being claimed. Verifies the
+    /// filename-prefix-only path in `claim_one`.
+    #[tokio::test]
+    async fn future_storage_key_yields_next_ready_without_claiming() {
+        let dir = TempDir::new().expect("temp dir");
+        let store = make_store(&dir);
+        let consumer = make_consumer(store.clone());
+
+        let env = dummy_envelope("cache.ns:sha256:future");
+        let scheduled = Utc::now() + chrono::Duration::seconds(3600);
+        store
+            .put_pending("cache", &env, scheduled)
+            .await
+            .expect("put");
+
+        let outcome = consumer.claim_one("cache").await.expect("claim");
+        assert!(
+            outcome.claimed.is_none(),
+            "future-scheduled job must not be claimed"
+        );
+        let next = outcome.next_ready.expect("next_ready must be set");
+        // Tolerate millisecond rounding through the hex prefix encoding.
+        let diff = (scheduled - next).num_milliseconds().abs();
+        assert!(
+            diff < 2,
+            "next_ready ({next}) must match scheduled time ({scheduled}); diff={diff}ms"
+        );
     }
 
     #[tokio::test]
@@ -535,12 +664,15 @@ mod tests {
             .enqueue(dummy_envelope("cache.ns:sha256:dup"))
             .await
             .expect("enqueue 1");
-        let before = store.count_pending("cache").await.expect("count");
+        let before = store.count_pending("cache", 600).await.expect("count");
         queue
             .enqueue(dummy_envelope("cache.ns:sha256:dup"))
             .await
             .expect("enqueue 2");
-        assert_eq!(before, store.count_pending("cache").await.expect("count"));
+        assert_eq!(
+            before,
+            store.count_pending("cache", 600).await.expect("count")
+        );
     }
 
     /// Heartbeat against a non-existent lease file fails every tick; after
@@ -555,6 +687,7 @@ mod tests {
         let consumer = DurableJobConsumer::new(store, 3, "test-worker".to_string());
         let claimed = ClaimedJob {
             envelope: dummy_envelope("cache.no-lease"),
+            storage_key: "no-storage-key".to_string(),
             lease_token: "stale-token".to_string(),
         };
         let lease_lost = CancellationToken::new();

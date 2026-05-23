@@ -234,8 +234,22 @@ Published only when `[global.job_queue]` is configured. See
 
 ### angos_job_queue_pending
 
-Jobs currently pending in the queue. Suitable for KEDA-style autoscaling of
-`angos worker` pods. Refreshed by a background ticker on every server replica.
+Pending jobs that are **ready for handling within the readiness horizon**
+(`not_before ≤ now + pending_ready_horizon_secs`, default 600 seconds).
+Suitable for KEDA-style autoscaling of `angos worker` pods. Refreshed by a
+background ticker on every server replica.
+
+Envelopes backed off further into the future are deliberately excluded so the
+gauge tracks *actionable* work — spinning up workers for jobs that won't be
+claimable for an hour wastes capacity. Tune `pending_ready_horizon_secs`
+(under `[global.job_queue]`) to give your autoscaler enough lead time to spin
+up replicas before the work becomes ready.
+
+The gauge **saturates at 10 000**: any value at the cap should be read as
+"≥ 10 000". Combined with the readiness-horizon filter, this bounds the S3
+`LIST` cost per refresh tick to ~10 paginated calls regardless of queue depth.
+KEDA's `ScaledObject` only needs ordinal granularity above its scale-to-max
+threshold, which is normally well below this cap.
 
 | Type  | Labels  |
 |-------|---------|

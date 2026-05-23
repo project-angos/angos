@@ -12,7 +12,7 @@ use tracing::{debug, warn};
 
 use crate::{
     metrics_provider::metrics_provider,
-    registry::job_store::{Error, JobEnvelope, JobQueue, JobStore, MAX_SCAN},
+    registry::job_store::{Error, JobEnvelope, JobQueue, JobStore, MAX_SCAN, parse_not_before},
 };
 
 /// Consecutive heartbeat failures tolerated before the lease is treated as
@@ -22,9 +22,12 @@ const MAX_HEARTBEAT_FAILURES: u32 = 3;
 
 /// A job claimed by a worker, ready to execute. `lease_token` is an
 /// opaque backend-specific identifier used to refresh or release the lease.
+/// `storage_key` identifies the pending file the envelope was loaded from;
+/// `complete`/`fail` need it to delete or rewrite that file.
 #[derive(Debug)]
 pub struct ClaimedJob {
     pub envelope: JobEnvelope,
+    pub storage_key: String,
     pub lease_token: String,
 }
 
@@ -93,8 +96,9 @@ impl JobQueue for DurableJobQueue {
             return Ok(());
         }
         self.store
-            .put_pending(&envelope.queue, &envelope.id, &envelope)
+            .put_pending(&envelope.queue, &envelope, Utc::now())
             .await
+            .map(|_| ())
     }
 }
 
@@ -113,25 +117,30 @@ impl DurableJobConsumer {
         }
     }
 
-    /// Claim the next available job from `queue`. Walks pending envelopes in
-    /// ascending ULID order (oldest first), skips any still in backoff, then
-    /// creates the lease atomically. When no claim is made, `next_ready` on
-    /// the returned outcome is the soonest `not_before` observed during the
-    /// scan, so the caller can sleep until then.
+    /// Claim the next available job from `queue`. Walks pending storage keys
+    /// in ascending order (`list_pending` returns them sorted by the hex
+    /// unix-millis prefix, i.e. by `not_before`). Stops at the first key whose
+    /// prefix is in the future without reading its body — the prefix is the
+    /// authoritative readiness signal. When no claim is made, `next_ready`
+    /// carries that first future instant so the caller can sleep until then.
     pub async fn claim_one(&self, queue: &str) -> Result<ClaimOutcome, Error> {
         let now = Utc::now();
         let mut next_ready: Option<DateTime<Utc>> = None;
-        for id in self.store.list_pending(queue, MAX_SCAN).await? {
-            let envelope = match self.store.read_pending(queue, &id).await {
+        for storage_key in self.store.list_pending(queue, MAX_SCAN).await? {
+            // Read the readiness time off the filename; never GET the body for
+            // a backed-off entry. A missing/malformed prefix falls through to
+            // the body read so legacy keys (if any) still work.
+            if let Some(not_before) = parse_not_before(&storage_key)
+                && not_before > now
+            {
+                next_ready = Some(next_ready.map_or(not_before, |t| t.min(not_before)));
+                break;
+            }
+            let envelope = match self.store.read_pending(queue, &storage_key).await {
                 Ok(e) => e,
                 Err(Error::NotFound) => continue,
                 Err(e) => return Err(e),
             };
-            if envelope.not_before > now {
-                next_ready =
-                    Some(next_ready.map_or(envelope.not_before, |t| t.min(envelope.not_before)));
-                continue;
-            }
             if let Some(token) = self
                 .store
                 .try_create_lease(&envelope.lock_key, &self.worker_id, self.lease_ttl_secs)
@@ -140,6 +149,7 @@ impl DurableJobConsumer {
                 return Ok(ClaimOutcome {
                     claimed: Some(ClaimedJob {
                         envelope,
+                        storage_key,
                         lease_token: token,
                     }),
                     next_ready: None,
@@ -214,15 +224,21 @@ impl DurableJobConsumer {
             .remove_lease(&claimed.envelope.lock_key, &claimed.lease_token)
             .await?;
         self.store
-            .remove_pending(&claimed.envelope.queue, &claimed.envelope.id)
+            .remove_pending(&claimed.envelope.queue, &claimed.storage_key)
             .await
     }
 
     /// Record a failure. The job is either re-queued with backoff or moved to
-    /// the dead-letter store when its retry budget is exhausted.
+    /// the dead-letter store when its retry budget is exhausted. On retry the
+    /// envelope is rewritten to a *new* storage key encoding the bumped
+    /// `not_before`; the previous key is deleted afterwards. A crash between
+    /// the two writes re-runs the previous envelope at its old (already
+    /// elapsed) `not_before`, which the handler-side idempotency contract
+    /// already covers.
     pub async fn fail(&self, claimed: ClaimedJob, err: &str) -> Result<FailOutcome, Error> {
         let ClaimedJob {
             envelope,
+            storage_key,
             lease_token,
         } = claimed;
         let new_attempts = envelope.attempts.saturating_add(1);
@@ -232,7 +248,7 @@ impl DurableJobConsumer {
                 .remove_lease(&envelope.lock_key, &lease_token)
                 .await?;
             self.store
-                .move_to_failed(&envelope.queue, &envelope.id, &envelope, err)
+                .move_to_failed(&envelope.queue, &storage_key, &envelope, err)
                 .await?;
             return Ok(FailOutcome::MovedToDeadLetter);
         }
@@ -242,12 +258,14 @@ impl DurableJobConsumer {
 
         let updated = JobEnvelope {
             attempts: new_attempts,
-            not_before: next_at,
             ..envelope
         };
 
         self.store
-            .put_pending(&updated.queue, &updated.id, &updated)
+            .put_pending(&updated.queue, &updated, next_at)
+            .await?;
+        self.store
+            .remove_pending(&updated.queue, &storage_key)
             .await?;
         self.store
             .remove_lease(&updated.lock_key, &lease_token)
@@ -267,10 +285,14 @@ pub fn backoff(n: u32) -> Duration {
 /// until `shutdown` is cancelled. Uses `tokio::time::interval` so the cadence
 /// stays fixed across slow `count_pending` calls; missed ticks are coalesced
 /// rather than catching up.
+///
+/// `ready_horizon_secs` is forwarded to `count_pending`: only envelopes ready
+/// within that window contribute to the gauge.
 pub async fn pending_refresh_loop(
     store: Arc<dyn JobStore>,
     queue: String,
     period: Duration,
+    ready_horizon_secs: u64,
     shutdown: CancellationToken,
 ) {
     let mut timer = interval(period);
@@ -283,7 +305,7 @@ pub async fn pending_refresh_loop(
             () = shutdown.cancelled() => return,
             _ = timer.tick() => {}
         }
-        match store.count_pending(&queue).await {
+        match store.count_pending(&queue, ready_horizon_secs).await {
             Ok(count) => {
                 metrics_provider()
                     .job_queue_pending

@@ -20,6 +20,7 @@ use crate::{
 pub struct PendingGaugeRefresh {
     pub store: Arc<dyn JobStore>,
     pub interval: Duration,
+    pub ready_horizon_secs: u64,
 }
 
 pub async fn build_metadata_store(
@@ -85,6 +86,7 @@ pub async fn build_registry(
         Some(PendingGaugeRefresh {
             store,
             interval: Duration::from_secs(jq_config.pending_refresh_interval_secs),
+            ready_horizon_secs: jq_config.pending_ready_horizon_secs,
         })
     } else {
         None

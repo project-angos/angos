@@ -75,6 +75,7 @@ impl Command {
                 refresh.store,
                 CACHE_QUEUE.to_string(),
                 refresh.interval,
+                refresh.ready_horizon_secs,
                 shutdown.clone(),
             ));
             PendingRefreshTask { shutdown, tracker }

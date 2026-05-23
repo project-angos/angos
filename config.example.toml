@@ -28,6 +28,7 @@ update_pull_time = false
 #[global.job_queue]
 #default_lease_ttl_secs = 30          # worker lease TTL
 #pending_refresh_interval_secs = 15   # how often the server refreshes the pending gauge
+#pending_ready_horizon_secs = 600     # only count jobs ready within this many seconds toward the autoscaler gauge
 #
 #[global.job_queue.fs]                # pick one: filesystem backend
 #root_dir = "/var/lib/angos/jobs"     # must be on POSIX or NFSv4 with O_EXCL

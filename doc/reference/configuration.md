@@ -77,7 +77,8 @@ defined to choose the backend.
 | Option | Type | Default | Description |
 |---|---|---|---|
 | `default_lease_ttl_secs` | u64 | `30` | Worker lease TTL in seconds. Must be at least `9` (the heartbeat runs at `ttl/3`). |
-| `pending_refresh_interval_secs` | u64 | `15` | How often the server refreshes the `angos_job_queue_pending` gauge. |
+| `pending_refresh_interval_secs` | u64 | `15` | How often the server refreshes the `angos_job_queue_pending` gauge. Must be at least `5` (sub-5s ticks induce LIST storms on S3). |
+| `pending_ready_horizon_secs` | u64 | `600` | Readiness horizon for the `angos_job_queue_pending` gauge. Only envelopes whose `not_before` falls within `[..., now + horizon]` are counted. Set comfortably larger than your worker pod startup time so KEDA has lead time to scale up before the work becomes claimable. |
 
 #### Filesystem backend (`global.job_queue.fs`)
 
