@@ -25,6 +25,7 @@ name = "angos"
 version = "1.2.0"
 dependencies = [
  "angos-s3-client",
+ "angos-storage",
  "arc-swap",
  "argh",
  "argon2",

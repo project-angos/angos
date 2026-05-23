@@ -1,5 +1,4 @@
 use tokio::select;
-use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
 #[cfg(test)]
@@ -9,23 +8,23 @@ use crate::registry::job_store::{
     durable::{ClaimedJob, DurableJobConsumer, FailOutcome},
 };
 
-/// Execute one claimed job: spawn the heartbeat, run the handler, then either
-/// complete, fail (with retry or dead-letter), or release on lease loss.
+/// Execute one claimed job: observe the lease's lost-token alongside the
+/// handler future, then complete, fail (with retry or dead-letter), or
+/// abort on lease loss. The heartbeat is internal to the lease guard held
+/// in `claimed.lease`; it stops automatically when the guard is consumed
+/// by `complete`/`fail` or dropped on the lease-lost branch.
 pub async fn execute_one(
     consumer: &DurableJobConsumer,
     handler: &dyn JobHandler,
     claimed: ClaimedJob,
 ) {
-    let lease_cancel = CancellationToken::new();
-    let hb = consumer.spawn_heartbeat(&claimed, lease_cancel.clone());
     let lock_key = claimed.envelope.lock_key.clone();
+    let lease_lost = claimed.lease.lost_token();
 
     let handler_result = select! {
         result = handler.execute(&claimed.envelope) => Some(result),
-        () = lease_cancel.cancelled() => None,
+        () = lease_lost.cancelled() => None,
     };
-    lease_cancel.cancel();
-    let _ = hb.await;
 
     match handler_result {
         None => warn!(lock_key, "Lease lost during execution; aborting"),
@@ -76,9 +75,9 @@ mod tests {
         command::worker::runner::run_once,
         metrics_provider,
         registry::job_store::{
-            JobEnvelope, JobHandler, JobQueue,
+            JobBackends, JobEnvelope, JobHandler, JobQueue,
             durable::{DurableJobConsumer, DurableJobQueue},
-            fs::{Backend, BackendConfig},
+            fs::BackendConfig,
         },
     };
 
@@ -91,15 +90,19 @@ mod tests {
         }
     }
 
-    fn make_store(dir: &TempDir) -> Arc<Backend> {
-        Arc::new(Backend::new(&BackendConfig {
+    fn make_backends(dir: &TempDir) -> JobBackends {
+        BackendConfig {
             root_dir: dir.path().to_string_lossy().to_string(),
-        }))
+            ..BackendConfig::default()
+        }
+        .to_backends()
+        .expect("build")
     }
 
-    fn make_consumer(store: Arc<Backend>) -> Arc<DurableJobConsumer> {
+    fn make_consumer(backends: &JobBackends) -> Arc<DurableJobConsumer> {
         Arc::new(DurableJobConsumer::new(
-            store,
+            backends.store.clone(),
+            backends.leases.clone(),
             30,
             "test-worker".to_string(),
         ))
@@ -109,7 +112,8 @@ mod tests {
     async fn run_once_returns_false_on_empty_queue() {
         metrics_provider::init_for_tests();
         let dir = TempDir::new().expect("temp dir");
-        let consumer = make_consumer(make_store(&dir));
+        let backends = make_backends(&dir);
+        let consumer = make_consumer(&backends);
         let found = run_once(&consumer, &OkHandler, "cache")
             .await
             .expect("run_once");
@@ -120,9 +124,9 @@ mod tests {
     async fn run_once_processes_one_job() {
         metrics_provider::init_for_tests();
         let dir = TempDir::new().expect("temp dir");
-        let store = make_store(&dir);
-        let queue = DurableJobQueue::new(store.clone());
-        let consumer = make_consumer(store);
+        let backends = make_backends(&dir);
+        let queue = DurableJobQueue::new(backends.store.clone());
+        let consumer = make_consumer(&backends);
 
         queue
             .enqueue(

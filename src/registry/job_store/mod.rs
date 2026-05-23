@@ -1,13 +1,18 @@
-use std::sync::Arc;
+use std::{future::Future, sync::Arc};
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Deserializer, Serialize};
 use uuid::Uuid;
 
+use crate::registry::metadata_store::lock::LockBackend;
+
+pub mod conditional;
 pub mod durable;
 pub mod fs;
 pub mod in_process;
+pub mod lease;
+pub mod locked;
 pub mod s3;
 
 #[derive(Debug, thiserror::Error)]
@@ -18,6 +23,47 @@ pub enum Error {
     Storage(String),
     #[error("not found")]
     NotFound,
+}
+
+impl From<angos_storage::Error> for Error {
+    fn from(error: angos_storage::Error) -> Self {
+        match error {
+            angos_storage::Error::NotFound => Error::NotFound,
+            other => Error::Storage(other.to_string()),
+        }
+    }
+}
+
+/// Wrap `operation` in `lock.acquire(keys) → operation → guard.is_valid → release`.
+/// Returns [`Error::Storage`] when the guard is invalidated mid-operation
+/// (heartbeat failure on a distributed lock), translating the metadata-store
+/// lock error space into the job-store one.
+///
+/// Shared by `locked::Backend` (dedup index) and `lease::locked::Backend`
+/// (lease body) so the acquire/validate/release ceremony lives in one place.
+pub async fn with_lock<T, F, Fut>(
+    lock: &(dyn LockBackend + Send + Sync),
+    keys: &[String],
+    invalid_message: &'static str,
+    operation: F,
+) -> Result<T, Error>
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = Result<T, Error>>,
+{
+    let guard = lock
+        .acquire(keys)
+        .await
+        .map_err(|e| Error::Storage(format!("lock acquire failed: {e}")))?;
+    let result = operation().await;
+    let lock_valid = guard.is_valid();
+    guard.release().await;
+
+    let value = result?;
+    if !lock_valid {
+        return Err(Error::Storage(invalid_message.to_string()));
+    }
+    Ok(value)
 }
 
 /// Durable job-queue configuration. Setting `[global.job_queue]` always selects
@@ -78,11 +124,20 @@ pub enum JobQueueBackend {
     S3(s3::BackendConfig),
 }
 
+/// Storage + lease pair produced by [`JobQueueConfig::to_backends`]. Held
+/// as `Arc`s so producers (which only need `store`) and consumers (which
+/// need both) can share the same handles without re-instantiating.
+#[derive(Clone)]
+pub struct JobBackends {
+    pub store: Arc<dyn JobStore>,
+    pub leases: Arc<dyn lease::LeaseBackend>,
+}
+
 impl JobQueueConfig {
-    pub fn to_backend(&self) -> Result<Arc<dyn JobStore>, Error> {
+    pub fn to_backends(&self) -> Result<JobBackends, Error> {
         match &self.backend {
-            JobQueueBackend::Fs(config) => Ok(Arc::new(fs::Backend::new(config))),
-            JobQueueBackend::S3(config) => Ok(Arc::new(s3::Backend::new(config)?)),
+            JobQueueBackend::Fs(config) => config.to_backends(),
+            JobQueueBackend::S3(config) => config.to_backends(),
         }
     }
 }
@@ -272,9 +327,9 @@ pub fn serialize_dead_letter(envelope: &JobEnvelope, last_error: &str) -> Result
     .map_err(|e| Error::Storage(format!("failed to serialize dead-letter: {e}")))
 }
 
-/// Storage interface for the durable claim/heartbeat/retry logic. Backends
-/// (`fs` and `s3`) implement the storage mechanics only — no claim algorithm
-/// lives here.
+/// Storage interface for the durable claim/retry logic. Backends (`fs` and
+/// `s3`) implement the storage mechanics only — no claim algorithm lives
+/// here, and the lease lifecycle lives behind [`lease::LeaseBackend`].
 ///
 /// **Storage keys.** Pending and failed entries are addressed by *storage
 /// keys* (filename stems) that encode `not_before` as a sortable hex
@@ -310,29 +365,7 @@ pub trait JobStore: Send + Sync {
 
     async fn read_pending(&self, queue: &str, storage_key: &str) -> Result<JobEnvelope, Error>;
 
-    /// Attempt to create a lease atomically (`create-if-not-exists`). Returns
-    /// `Some(token)` when the lease was created (or an expired one was stolen);
-    /// `None` when another worker holds a valid lease for `lock_key`.
-    async fn try_create_lease(
-        &self,
-        lock_key: &str,
-        worker_id: &str,
-        ttl_secs: u64,
-    ) -> Result<Option<String>, Error>;
-
-    /// Refresh the expiry on an existing lease, returning a new lease token.
-    async fn heartbeat_lease(
-        &self,
-        lock_key: &str,
-        token: &str,
-        worker_id: &str,
-        ttl_secs: u64,
-    ) -> Result<String, Error>;
-
     async fn remove_pending(&self, queue: &str, storage_key: &str) -> Result<(), Error>;
-
-    /// Remove a lease, but only when the stored token matches.
-    async fn remove_lease(&self, lock_key: &str, token: &str) -> Result<(), Error>;
 
     async fn move_to_failed(
         &self,

@@ -194,8 +194,10 @@ impl Components {
             ))
         })?;
 
+        let backends = jq_config.to_backends()?;
         let consumer = Arc::new(DurableJobConsumer::new(
-            jq_config.to_backend()?,
+            backends.store,
+            backends.leases,
             jq_config.default_lease_ttl_secs,
             Uuid::new_v4().to_string(),
         ));

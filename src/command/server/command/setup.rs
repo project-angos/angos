@@ -81,10 +81,11 @@ pub async fn build_registry(
     // them) and surface the pending count on this server's /metrics for
     // autoscaling.
     let pending = if let Some(jq_config) = &config.global.job_queue {
-        let store = jq_config.to_backend().map_err(bootstrap::Error::from)?;
-        registry_config = registry_config.job_queue(Arc::new(DurableJobQueue::new(store.clone())));
+        let backends = jq_config.to_backends().map_err(bootstrap::Error::from)?;
+        registry_config =
+            registry_config.job_queue(Arc::new(DurableJobQueue::new(backends.store.clone())));
         Some(PendingGaugeRefresh {
-            store,
+            store: backends.store,
             interval: Duration::from_secs(jq_config.pending_refresh_interval_secs),
             ready_horizon_secs: jq_config.pending_ready_horizon_secs,
         })

@@ -1,46 +1,68 @@
-use std::{
-    io::{Error as IoError, ErrorKind},
-    path::Path,
-    sync::Arc,
-};
+//! TOML config + factory for S3-backed job queues.
+//!
+//! Picks the [`JobStore`] + [`LeaseBackend`] pair based on `lock_strategy`:
+//!
+//! - `LockStrategy::S3(_)` (default): use [`conditional::Backend`] +
+//!   [`lease::conditional::Backend`]. Requires `If-None-Match` / `If-Match`
+//!   support on the provider.
+//! - `LockStrategy::Redis(_)` / `LockStrategy::Memory`: fall back to
+//!   [`locked::Backend`] + [`lease::locked::Backend`] over the same S3
+//!   `ObjectStore`, with the lock backend providing atomicity. Use these
+//!   on S3-compatible providers that don't honour the conditional headers.
 
-use async_trait::async_trait;
-use chrono::{DateTime, Duration as ChronoDuration, Utc};
-use serde::{Deserialize, Serialize};
-use tracing::{debug, warn};
+use std::sync::Arc;
+
+use serde::{Deserialize, Deserializer};
+use tracing::info;
 
 use crate::{
     registry::{
         job_store::{
-            Error, JobEnvelope, JobStore, MAX_REPORTED_PENDING, STORAGE_KEY_PREFIX_LEN,
-            make_storage_key, parse_lock_key_index, pending_ready_cutoff_prefix,
-            serialize_dead_letter, serialize_lock_key_index,
+            Error, JobBackends, JobStore, conditional,
+            lease::{self, LeaseBackend},
+            locked,
         },
-        path_builder,
+        metadata_store::{
+            ConditionalCapabilities, LockConfig, LockStrategy,
+            lock::{self, LockBackend, MemoryBackend, s3::S3LockConfig},
+        },
     },
     secret::Secret,
 };
-use angos_s3_client as s3_client;
+use angos_s3_client::{Backend as S3HttpBackend, BackendConfig as S3HttpConfig};
+use angos_storage::{ConditionalStore, ObjectStore, s3::Backend as StorageBackend};
 
-#[derive(Clone, Debug, Deserialize)]
+/// S3 job-queue configuration. Field shape matches
+/// [`crate::registry::metadata_store::s3::BackendConfig`] so operators see
+/// the same keys in both `[metadata_store.s3]` and `[global.job_queue.s3]`.
+#[derive(Clone, Debug, PartialEq)]
 pub struct BackendConfig {
-    pub bucket: String,
-    #[serde(default = "default_prefix")]
-    pub prefix: String,
-    pub endpoint: String,
-    #[serde(default = "default_region")]
-    pub region: String,
     pub access_key_id: Secret<String>,
     pub secret_key: Secret<String>,
-    /// Whether the storage service honors `DELETE` with `If-Match: <etag>`.
-    /// Defaults to `true` (AWS S3, R2, GCS, modern `MinIO`). Set to `false` on
-    /// endpoints without conditional delete; release then falls back to an
-    /// unconditional `DELETE` with a small race window during lease theft.
-    #[serde(default = "default_delete_if_match")]
-    pub delete_if_match: bool,
+    pub endpoint: String,
+    pub bucket: String,
+    pub region: String,
+    pub key_prefix: String,
+    /// Coordination strategy. `S3` (default) uses S3 conditional writes
+    /// for both [`JobStore`] primitives and lease lifecycle. `Redis` /
+    /// `Memory` fall back to `locked::Backend` + `lease::locked::Backend`,
+    /// useful on S3-compatible providers without `If-Match` / `If-None-Match`
+    /// support. Mirrors the `[metadata_store.s3.lock_strategy]` shape.
+    pub lock_strategy: LockStrategy,
+    /// Explicitly declared S3 conditional-operation capabilities, matching
+    /// the `[metadata_store.s3.capabilities]` shape. Only consulted on the
+    /// CAS path (`lock_strategy = "s3"`):
+    /// - `put_if_none_match` and `put_if_match` are required and validated
+    ///   at startup; defaults are `true` under `S3` strategy.
+    /// - `delete_if_match` selects whether lease release uses conditional
+    ///   delete (defaults to `true`); set `false` on endpoints that ignore
+    ///   `If-Match` on `DELETE`.
+    ///
+    /// Ignored when `lock_strategy` is `redis` or `memory`.
+    pub capabilities: Option<ConditionalCapabilities>,
 }
 
-fn default_prefix() -> String {
+fn default_key_prefix() -> String {
     "_jobs".to_string()
 }
 
@@ -48,422 +70,172 @@ fn default_region() -> String {
     "us-east-1".to_string()
 }
 
-fn default_delete_if_match() -> bool {
-    true
+impl Default for BackendConfig {
+    fn default() -> Self {
+        Self {
+            access_key_id: Secret::new(String::new()),
+            secret_key: Secret::new(String::new()),
+            endpoint: String::new(),
+            bucket: String::new(),
+            region: default_region(),
+            key_prefix: default_key_prefix(),
+            lock_strategy: LockStrategy::S3(S3LockConfig::default()),
+            capabilities: None,
+        }
+    }
 }
 
-/// Lease file payload stored in S3 at `_jobs/leases/<lock_key_encoded>.json`.
-///
-/// Staleness is driven by `refreshed_at` in the body, *not* the S3
-/// `Last-Modified` response header. Some S3-compatible endpoints strip
-/// `Last-Modified` from `PUT` responses; relying on the body lets us steal
-/// stale leases on those services too. `refreshed_at` is rewritten on every
-/// successful create/heartbeat/steal — so it tracks the worker-asserted
-/// freshness, matching what the heartbeat loop already implicitly relies on.
-/// `worker_id` is kept for diagnostics only.
-#[derive(Serialize, Deserialize)]
-struct LeaseFile {
-    /// Wall-clock instant the body was last written. Pre-fix leases without
-    /// this field deserialize to `MIN_UTC` (immediately stealable), which is
-    /// the safe default during the transitional window.
-    #[serde(default)]
-    refreshed_at: DateTime<Utc>,
-    worker_id: String,
-    ttl_secs: u64,
-}
+impl<'de> Deserialize<'de> for BackendConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct Raw {
+            access_key_id: Secret<String>,
+            secret_key: Secret<String>,
+            endpoint: String,
+            bucket: String,
+            #[serde(default = "default_region")]
+            region: String,
+            #[serde(default = "default_key_prefix")]
+            key_prefix: String,
+            #[serde(default)]
+            redis: Option<LockConfig>,
+            #[serde(default)]
+            lock_strategy: Option<LockStrategy>,
+            #[serde(default)]
+            capabilities: Option<ConditionalCapabilities>,
+        }
 
-/// S3-backed `JobStore`.
-///
-/// Uses the same CAS primitives as the S3 lock backend:
-/// - `put_object_if_not_exists` for atomic lease creation
-/// - `put_object_if_match` for lease heartbeat and theft
-/// - `delete` / `delete_if_match` for release
-pub struct Backend {
-    backend: Arc<s3_client::Backend>,
-    delete_if_match: bool,
-}
+        let raw = Raw::deserialize(deserializer)?;
 
-impl Backend {
-    pub fn new(config: &BackendConfig) -> Result<Self, Error> {
-        let backend_config = s3_client::BackendConfig {
-            access_key_id: config.access_key_id.expose().clone(),
-            secret_key: config.secret_key.expose().clone(),
-            endpoint: config.endpoint.clone(),
-            bucket: config.bucket.clone(),
-            region: config.region.clone(),
-            key_prefix: config.prefix.clone(),
-            ..Default::default()
+        // S3 storage with no explicit strategy defaults to `S3` (CAS); the
+        // shared helper handles the `Some/Some` conflict and the
+        // `None/Some(redis)` shorthand.
+        let lock_strategy = if raw.lock_strategy.is_none() && raw.redis.is_none() {
+            LockStrategy::S3(S3LockConfig::default())
+        } else {
+            lock::resolve_lock_strategy(raw.lock_strategy, raw.redis, true)?
         };
-        let backend = s3_client::Backend::new(&backend_config)
-            .map_err(|e| Error::Initialization(e.to_string()))?;
-        Ok(Self {
-            backend: Arc::new(backend),
-            delete_if_match: config.delete_if_match,
+
+        Ok(BackendConfig {
+            access_key_id: raw.access_key_id,
+            secret_key: raw.secret_key,
+            endpoint: raw.endpoint,
+            bucket: raw.bucket,
+            region: raw.region,
+            key_prefix: raw.key_prefix,
+            lock_strategy,
+            capabilities: raw.capabilities,
         })
     }
+}
 
-    async fn try_steal_stale_lease(
-        &self,
-        lock_key: &str,
-        worker_id: &str,
-        ttl_secs: u64,
-    ) -> Result<Option<String>, Error> {
-        let key = path_builder::job_lease_path(lock_key);
-        let data = serialize_lease(worker_id, ttl_secs)?;
-
-        // Staleness is driven by the body's `refreshed_at`, not the S3
-        // `Last-Modified` header — some S3-compatible endpoints strip
-        // `Last-Modified` from `PUT` responses and would otherwise leave
-        // crashed leases stuck forever.
-        let (existing_bytes, etag) = match self.backend.read_with_etag(&key).await {
-            Ok(r) => r,
-            Err(e) if e.kind() == ErrorKind::NotFound => {
-                // Vanished between the failed put_object_if_not_exists and
-                // now; retry the initial create.
-                return match self.backend.put_object_if_not_exists(&key, data).await {
-                    Ok(etag) => Ok(Some(require_etag(etag)?)),
-                    Err(s3_client::Error::PreconditionFailed) => Ok(None),
-                    Err(e) => Err(Error::Storage(format!("retry create lease failed: {e}"))),
-                };
-            }
-            Err(e) => return Err(Error::Storage(format!("failed to read lease: {e}"))),
-        };
-
-        let existing: LeaseFile = serde_json::from_slice(&existing_bytes)
-            .map_err(|e| Error::Storage(format!("corrupt lease: {e}")))?;
-
-        let ttl = ChronoDuration::seconds(existing.ttl_secs.min(3600).cast_signed());
-        if Utc::now() <= existing.refreshed_at + ttl {
-            return Ok(None);
+impl BackendConfig {
+    fn to_data_store_config(&self) -> S3HttpConfig {
+        S3HttpConfig {
+            access_key_id: self.access_key_id.expose().clone(),
+            secret_key: self.secret_key.expose().clone(),
+            endpoint: self.endpoint.clone(),
+            bucket: self.bucket.clone(),
+            region: self.region.clone(),
+            key_prefix: self.key_prefix.clone(),
+            ..Default::default()
         }
+    }
 
-        let Some(stale_etag) = etag else {
-            return Ok(None);
-        };
-
-        debug!(
-            lock_key,
-            worker_id = existing.worker_id,
-            refreshed_at = %existing.refreshed_at,
-            "Stealing stale S3 lease"
+    /// Build the storage + lease backends for this S3 deployment.
+    pub fn to_backends(&self) -> Result<JobBackends, Error> {
+        let http = S3HttpBackend::new(&self.to_data_store_config())
+            .map_err(|e| Error::Initialization(e.to_string()))?;
+        let storage = Arc::new(
+            StorageBackend::builder()
+                .client(Arc::new(http))
+                .build()
+                .map_err(|e| Error::Initialization(e.to_string()))?,
         );
 
-        match self
-            .backend
-            .put_object_if_match(&key, &stale_etag, data)
-            .await
-        {
-            Ok(new_etag) => Ok(Some(require_etag(new_etag)?)),
-            Err(s3_client::Error::PreconditionFailed) => Ok(None),
-            Err(e) => Err(Error::Storage(format!("steal lease failed: {e}"))),
+        match &self.lock_strategy {
+            LockStrategy::S3(_) => {
+                // Under the CAS strategy, default missing capability flags to
+                // `true` (the AWS S3 / R2 / GCS / modern MinIO baseline). The
+                // metadata-store probe machinery isn't replicated here; if you
+                // need auto-detection, set `capabilities` explicitly.
+                let caps = self.capabilities.clone().unwrap_or(ConditionalCapabilities {
+                    put_if_none_match: true,
+                    put_if_match: true,
+                    delete_if_match: true,
+                });
+                if !caps.supports_cas() {
+                    return Err(Error::Initialization(format!(
+                        "S3 lock strategy requires If-None-Match and If-Match support, \
+                         but capabilities declare put_if_none_match={}, put_if_match={}. \
+                         Use lock_strategy = redis or lock_strategy = memory instead.",
+                        caps.put_if_none_match, caps.put_if_match
+                    )));
+                }
+                info!("Using S3 CAS coordination for S3 job queue");
+                let conditional_store: Arc<dyn ConditionalStore> = storage;
+                let store: Arc<dyn JobStore> = Arc::new(
+                    conditional::Backend::builder()
+                        .store(conditional_store.clone())
+                        .build()?,
+                );
+                let leases: Arc<dyn LeaseBackend> = Arc::new(
+                    lease::conditional::Backend::builder()
+                        .store(conditional_store)
+                        .delete_if_match(caps.delete_if_match)
+                        .build()?,
+                );
+                Ok(JobBackends { store, leases })
+            }
+            LockStrategy::Redis(redis_config) => {
+                info!("Using Redis lock coordination for S3 job queue");
+                let lock_backend = lock::RedisBackend::new(redis_config).map_err(|e| {
+                    Error::Initialization(format!("Failed to initialize Redis lock store: {e}"))
+                })?;
+                build_lock_coordinated(storage, Arc::new(lock_backend))
+            }
+            LockStrategy::Memory => {
+                info!("Using in-memory lock coordination for S3 job queue");
+                build_lock_coordinated(storage, Arc::new(MemoryBackend::new()))
+            }
         }
     }
 }
 
-fn s3_io_to_job_err(e: &IoError) -> Error {
-    if e.kind() == ErrorKind::NotFound {
-        Error::NotFound
-    } else {
-        Error::Storage(e.to_string())
-    }
-}
-
-fn serialize_lease(worker_id: &str, ttl_secs: u64) -> Result<Vec<u8>, Error> {
-    serde_json::to_vec(&LeaseFile {
-        refreshed_at: Utc::now(),
-        worker_id: worker_id.to_string(),
-        ttl_secs,
-    })
-    .map_err(|e| Error::Storage(format!("lease serialization failed: {e}")))
-}
-
-fn require_etag(etag: Option<String>) -> Result<String, Error> {
-    etag.ok_or_else(|| Error::Storage("S3 PUT response is missing an ETag".to_string()))
-}
-
-#[async_trait]
-impl JobStore for Backend {
-    async fn put_pending(
-        &self,
-        queue: &str,
-        envelope: &JobEnvelope,
-        not_before: DateTime<Utc>,
-    ) -> Result<String, Error> {
-        let storage_key = make_storage_key(not_before, &envelope.id);
-        let key = path_builder::job_pending_path(queue, &storage_key);
-        let data = serde_json::to_vec(envelope)
-            .map_err(|e| Error::Storage(format!("envelope serialization failed: {e}")))?;
-        self.backend
-            .put_object(&key, data)
-            .await
-            .map_err(|e| s3_io_to_job_err(&e))?;
-        Ok(storage_key)
-    }
-
-    async fn list_pending(&self, queue: &str, n: u16) -> Result<Vec<String>, Error> {
-        // S3 LIST returns keys in lexicographic order. Storage keys start
-        // with a fixed-width hex unix-millis prefix, so this is also
-        // `not_before` order without any extra sort.
-        let prefix = format!("{}/", path_builder::job_pending_dir(queue));
-        let (all_keys, _next_token) = self
-            .backend
-            .list_objects(&prefix, 1000, None)
-            .await
-            .map_err(|e| s3_io_to_job_err(&e))?;
-
-        Ok(all_keys
-            .into_iter()
-            .filter(|name| Path::new(name).extension().is_some_and(|ext| ext == "json"))
-            .take(n as usize)
-            .filter_map(|name| name.strip_suffix(".json").map(str::to_string))
-            .collect())
-    }
-
-    async fn read_pending(&self, queue: &str, storage_key: &str) -> Result<JobEnvelope, Error> {
-        let key = path_builder::job_pending_path(queue, storage_key);
-        let data = self
-            .backend
-            .read(&key)
-            .await
-            .map_err(|e| s3_io_to_job_err(&e))?;
-        serde_json::from_slice(&data)
-            .map_err(|e| Error::Storage(format!("failed to parse envelope: {e}")))
-    }
-
-    async fn try_create_lease(
-        &self,
-        lock_key: &str,
-        worker_id: &str,
-        ttl_secs: u64,
-    ) -> Result<Option<String>, Error> {
-        let key = path_builder::job_lease_path(lock_key);
-        let data = serialize_lease(worker_id, ttl_secs)?;
-        match self.backend.put_object_if_not_exists(&key, data).await {
-            Ok(etag) => Ok(Some(require_etag(etag)?)),
-            Err(s3_client::Error::PreconditionFailed) => {
-                self.try_steal_stale_lease(lock_key, worker_id, ttl_secs)
-                    .await
-            }
-            Err(e) => Err(Error::Storage(format!("failed to create lease: {e}"))),
-        }
-    }
-
-    async fn heartbeat_lease(
-        &self,
-        lock_key: &str,
-        token: &str,
-        worker_id: &str,
-        ttl_secs: u64,
-    ) -> Result<String, Error> {
-        let key = path_builder::job_lease_path(lock_key);
-        let data = serialize_lease(worker_id, ttl_secs)?;
-        match self.backend.put_object_if_match(&key, token, data).await {
-            Ok(new_etag) => Ok(new_etag.unwrap_or_else(|| token.to_string())),
-            Err(s3_client::Error::PreconditionFailed) => Err(Error::Storage(
-                "heartbeat failed: lease ownership changed".to_string(),
-            )),
-            Err(e) => Err(Error::Storage(format!("heartbeat S3 error: {e}"))),
-        }
-    }
-
-    async fn remove_pending(&self, queue: &str, storage_key: &str) -> Result<(), Error> {
-        let key = path_builder::job_pending_path(queue, storage_key);
-        match self.backend.delete(&key).await {
-            Ok(()) => Ok(()),
-            Err(e) if e.kind() == ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(Error::Storage(format!("failed to delete pending: {e}"))),
-        }
-    }
-
-    async fn remove_lease(&self, lock_key: &str, token: &str) -> Result<(), Error> {
-        let key = path_builder::job_lease_path(lock_key);
-        if self.delete_if_match {
-            // ETag mismatch means another worker already stole the lease;
-            // treat as success rather than failing the completing worker.
-            match self.backend.delete_if_match(&key, token).await {
-                Ok(()) | Err(s3_client::Error::PreconditionFailed) => Ok(()),
-                Err(e) => Err(Error::Storage(format!("failed to delete lease: {e}"))),
-            }
-        } else {
-            match self.backend.delete(&key).await {
-                Ok(()) => Ok(()),
-                Err(e) if e.kind() == ErrorKind::NotFound => Ok(()),
-                Err(e) => Err(Error::Storage(format!("failed to delete lease: {e}"))),
-            }
-        }
-    }
-
-    async fn move_to_failed(
-        &self,
-        queue: &str,
-        storage_key: &str,
-        envelope: &JobEnvelope,
-        last_error: &str,
-    ) -> Result<(), Error> {
-        let data = serialize_dead_letter(envelope, last_error)?;
-        let failed_key = path_builder::job_failed_path(queue, storage_key);
-        self.backend
-            .put_object(&failed_key, data)
-            .await
-            .map_err(|e| s3_io_to_job_err(&e))?;
-        self.remove_pending(queue, storage_key).await?;
-        // Drop the dedup index only if it still references this storage key —
-        // a concurrent retry may have re-pointed it at a fresher envelope.
-        self.remove_lock_key_index_if_matches(queue, &envelope.lock_key, storage_key)
-            .await
-    }
-
-    /// O(1) dedup check backed by the per-`lock_key` index object. If the
-    /// index references a `storage_key` that no longer exists (left over by
-    /// a crash mid-`complete`/`move_to_failed`), the orphan is deleted and
-    /// the check reports no-pending so the next enqueue proceeds.
-    async fn find_pending_with_lock_key(&self, queue: &str, lock_key: &str) -> Result<bool, Error> {
-        let index_path = path_builder::job_lock_key_index_path(queue, lock_key);
-        let data = match self.backend.read(&index_path).await {
-            Ok(d) => d,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-            Err(e) => return Err(Error::Storage(format!("read lock-key index: {e}"))),
-        };
-        let index = parse_lock_key_index(&data)?;
-
-        let pending_key = path_builder::job_pending_path(queue, &index.storage_key);
-        match self.backend.object_size(&pending_key).await {
-            Ok(_) => Ok(true),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                // Orphan: pending vanished but index lingers. Clear it.
-                if let Err(remove_err) = self.backend.delete(&index_path).await {
-                    warn!(
-                        lock_key,
-                        error = %remove_err,
-                        "Failed to remove orphan lock-key index"
-                    );
-                }
-                Ok(false)
-            }
-            Err(e) => Err(Error::Storage(format!(
-                "HEAD pending via lock-key index: {e}"
-            ))),
-        }
-    }
-
-    async fn remove_lock_key_index_if_matches(
-        &self,
-        queue: &str,
-        lock_key: &str,
-        storage_key: &str,
-    ) -> Result<(), Error> {
-        let index_path = path_builder::job_lock_key_index_path(queue, lock_key);
-        // Read body + etag so we can do a conditional delete and avoid a TOCTOU
-        // against a concurrent retry that re-pointed the index.
-        let (data, etag) = match self.backend.read_with_etag(&index_path).await {
-            Ok(r) => r,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-            Err(e) => {
-                warn!(lock_key, error = %e, "Failed to read lock-key index before remove");
-                return Ok(());
-            }
-        };
-        match parse_lock_key_index(&data) {
-            Ok(index) if index.storage_key == storage_key => {}
-            Ok(_) => return Ok(()), // index points elsewhere; leave it
-            Err(_) => {}            // corrupt — fall through and delete
-        }
-
-        if let Some(etag) = etag {
-            match self.backend.delete_if_match(&index_path, &etag).await {
-                Ok(()) | Err(s3_client::Error::PreconditionFailed) => Ok(()),
-                Err(e) => {
-                    warn!(lock_key, error = %e, "Failed conditional delete of lock-key index");
-                    Ok(())
-                }
-            }
-        } else {
-            // Endpoint didn't return ETag — fall back to unconditional delete.
-            match self.backend.delete(&index_path).await {
-                Ok(()) => Ok(()),
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-                Err(e) => {
-                    warn!(lock_key, error = %e, "Failed to delete lock-key index");
-                    Ok(())
-                }
-            }
-        }
-    }
-
-    async fn try_claim_lock_key(
-        &self,
-        queue: &str,
-        lock_key: &str,
-        storage_key: &str,
-    ) -> Result<bool, Error> {
-        let path = path_builder::job_lock_key_index_path(queue, lock_key);
-        let data = serialize_lock_key_index(storage_key)?;
-        match self.backend.put_object_if_not_exists(&path, data).await {
-            Ok(_) => Ok(true),
-            Err(s3_client::Error::PreconditionFailed) => Ok(false),
-            Err(e) => Err(Error::Storage(format!("try_claim_lock_key: {e}"))),
-        }
-    }
-
-    async fn refresh_lock_key_index(
-        &self,
-        queue: &str,
-        lock_key: &str,
-        storage_key: &str,
-    ) -> Result<(), Error> {
-        let path = path_builder::job_lock_key_index_path(queue, lock_key);
-        let data = serialize_lock_key_index(storage_key)?;
-        self.backend
-            .put_object(&path, data)
-            .await
-            .map_err(|e| s3_io_to_job_err(&e))
-    }
-
-    async fn count_pending(&self, queue: &str, ready_horizon_secs: u64) -> Result<u64, Error> {
-        let prefix = format!("{}/", path_builder::job_pending_dir(queue));
-        let cutoff_prefix = pending_ready_cutoff_prefix(ready_horizon_secs);
-        let mut count: u64 = 0;
-        let mut token: Option<String> = None;
-        loop {
-            let (keys, next) = self
-                .backend
-                .list_objects(&prefix, 1000, token)
-                .await
-                .map_err(|e| s3_io_to_job_err(&e))?;
-            for k in &keys {
-                if Path::new(k).extension().is_none_or(|ext| ext != "json") {
-                    continue;
-                }
-                // S3 LIST returns keys in lexicographic order; the storage-key
-                // prefix is `not_before` in fixed-width hex, so the first key
-                // whose prefix is past the readiness cutoff terminates the
-                // count — every later key is even further in the future.
-                if let Some(p) = k.get(..STORAGE_KEY_PREFIX_LEN)
-                    && p > cutoff_prefix.as_str()
-                {
-                    return Ok(count.min(MAX_REPORTED_PENDING));
-                }
-                count += 1;
-                if count >= MAX_REPORTED_PENDING {
-                    return Ok(MAX_REPORTED_PENDING);
-                }
-            }
-            match next {
-                Some(t) => token = Some(t),
-                None => return Ok(count),
-            }
-        }
-    }
+/// Build the lock-coordinated [`JobBackends`] over an S3 `ObjectStore` and
+/// a non-CAS [`LockBackend`].
+fn build_lock_coordinated(
+    storage: Arc<StorageBackend>,
+    lock: Arc<dyn LockBackend + Send + Sync>,
+) -> Result<JobBackends, Error> {
+    let object_store: Arc<dyn ObjectStore> = storage;
+    let store: Arc<dyn JobStore> = Arc::new(
+        locked::Backend::builder()
+            .store(object_store.clone())
+            .lock(lock.clone())
+            .build()?,
+    );
+    let leases: Arc<dyn LeaseBackend> = Arc::new(
+        lease::locked::Backend::builder()
+            .store(object_store)
+            .lock(lock)
+            .build()?,
+    );
+    Ok(JobBackends { store, leases })
 }
 
 #[cfg(test)]
 mod tests {
     use std::{collections::HashMap, sync::Arc, time::Duration};
 
+    use bytes::Bytes;
     use chrono::Utc;
+    use serde::Serialize;
     use tokio::{io::AsyncReadExt, time::sleep};
     use uuid::Uuid;
-
     use wiremock::{
         Mock, MockServer, ResponseTemplate,
         matchers::{method, path},
@@ -481,9 +253,10 @@ mod tests {
             blob_store::fs::{Backend as BlobBackend, BackendConfig as BlobBackendConfig},
             cache_job_handler::CacheJobHandler,
             job_store::{
-                JobEnvelope, JobQueue, JobStore,
+                JobBackends, JobEnvelope, JobQueue, JobStore,
+                conditional::Backend,
                 durable::{DurableJobConsumer, DurableJobQueue},
-                s3::{Backend, LeaseFile},
+                lease::{self, LeaseBackend},
             },
             manifest::DEFAULT_MAX_MANIFEST_SIZE_BYTES,
             metadata_store::{
@@ -496,10 +269,20 @@ mod tests {
         },
         util::sha256,
     };
-    use angos_s3_client::{Backend as S3Backend, BackendConfig as S3BackendConfig};
+    use angos_s3_client::{Backend as S3HttpBackend, BackendConfig as S3HttpConfig};
+    use angos_storage::{ConditionalStore, s3::Backend as StorageBackend};
 
     const REPO_NAME: &str = "local";
     const NAMESPACE: &str = "local/cache-ns";
+
+    /// Mirrors the body produced by `conditional::serialize_lease`. Re-defined
+    /// here (rather than re-exported) so test-only fixtures stay test-local.
+    #[derive(Serialize)]
+    struct LeaseFile {
+        refreshed_at: chrono::DateTime<Utc>,
+        worker_id: String,
+        ttl_secs: u64,
+    }
 
     fn make_fs_backends(path: &str) -> (Arc<BlobBackend>, Arc<MetaBackend>) {
         let blob = Arc::new(BlobBackend::new(&BlobBackendConfig {
@@ -554,12 +337,12 @@ mod tests {
         Arc::new(RepositoryResolver::new(Arc::new(map)).expect("resolver must build"))
     }
 
-    /// Build a raw `Backend` and a matching `s3::Backend` job-store that share
-    /// the same key prefix so the test can use `backend.delete_prefix` for
-    /// cleanup.
-    fn test_store_with_backend(prefix: &str) -> (Arc<Backend>, Arc<S3Backend>) {
+    /// Build the storage + lease backends and a sibling raw HTTP client
+    /// over the same key prefix so the test can `delete_prefix` for cleanup
+    /// and write fixtures directly into S3.
+    fn test_backends(prefix: &str) -> (JobBackends, Arc<S3HttpBackend>) {
         metrics_provider::init_for_tests();
-        let config = S3BackendConfig {
+        let config = S3HttpConfig {
             access_key_id: "root".to_string(),
             secret_key: "roottoor".to_string(),
             endpoint: "http://127.0.0.1:9000".to_string(),
@@ -568,25 +351,43 @@ mod tests {
             key_prefix: format!("{prefix}{}_", Uuid::new_v4()),
             ..Default::default()
         };
-        let raw = Arc::new(S3Backend::new(&config).expect("backend"));
-        (
-            Arc::new(Backend {
-                backend: raw.clone(),
-                delete_if_match: true,
-            }),
-            raw,
-        )
+        let http = Arc::new(S3HttpBackend::new(&config).expect("s3 client"));
+        let storage: Arc<dyn ConditionalStore> = Arc::new(
+            StorageBackend::builder()
+                .client(http.clone())
+                .build()
+                .expect("storage backend"),
+        );
+        let store: Arc<dyn JobStore> = Arc::new(
+            Backend::builder()
+                .store(storage.clone())
+                .build()
+                .expect("conditional backend"),
+        );
+        let leases: Arc<dyn LeaseBackend> = Arc::new(
+            lease::conditional::Backend::builder()
+                .store(storage)
+                .delete_if_match(true)
+                .build()
+                .expect("lease backend"),
+        );
+        (JobBackends { store, leases }, http)
     }
 
-    fn make_consumer(store: Arc<Backend>) -> DurableJobConsumer {
-        DurableJobConsumer::new(store, 30, "test-worker".to_string())
+    fn make_consumer(backends: &JobBackends) -> DurableJobConsumer {
+        DurableJobConsumer::new(
+            backends.store.clone(),
+            backends.leases.clone(),
+            30,
+            "test-worker".to_string(),
+        )
     }
 
     #[tokio::test]
     async fn s3_claim_and_complete() {
-        let (store, _) = test_store_with_backend("jq_claim_");
-        let queue = DurableJobQueue::new(store.clone());
-        let consumer = make_consumer(store);
+        let (backends, _) = test_backends("jq_claim_");
+        let queue = DurableJobQueue::new(backends.store.clone());
+        let consumer = make_consumer(&backends);
 
         queue
             .enqueue(
@@ -616,28 +417,30 @@ mod tests {
 
     #[tokio::test]
     async fn s3_stale_lease_recovery() {
-        let (store, _) = test_store_with_backend("jq_stale_");
-        let consumer = make_consumer(store.clone());
+        let (backends, http) = test_backends("jq_stale_");
+        let consumer = make_consumer(&backends);
 
         let env = JobEnvelope::new("cache", "test.noop", "cache.ns:sha256:s3stale", &())
             .expect("envelope");
-        store
+        backends
+            .store
             .put_pending("cache", &env, Utc::now())
             .await
             .expect("put");
 
         // 3-second TTL with refreshed_at set 10s ago → body-driven staleness.
-        let data = serde_json::to_vec(&LeaseFile {
+        let stale_body = serde_json::to_vec(&LeaseFile {
             refreshed_at: Utc::now() - chrono::Duration::seconds(10),
             worker_id: "dead-worker".to_string(),
             ttl_secs: 3,
         })
         .expect("serialize");
-        store
-            .backend
-            .put_object(&path_builder::job_lease_path(&env.lock_key), data)
-            .await
-            .expect("write stale lease");
+        http.put_object(
+            &path_builder::job_lease_path(&env.lock_key),
+            Bytes::from(stale_body),
+        )
+        .await
+        .expect("write stale lease");
 
         sleep(Duration::from_secs(4)).await;
 
@@ -650,8 +453,8 @@ mod tests {
         consumer.complete(claimed).await.expect("complete");
     }
 
-    /// Single-replica durable round-trip using `s3::Backend`. Blob and metadata
-    /// stores stay FS-backed in a tempdir; only the job queue uses S3.
+    /// Single-replica durable round-trip. Blob and metadata stores stay
+    /// FS-backed in a tempdir; only the job queue uses S3.
     #[tokio::test]
     async fn durable_cache_fill_round_trip_s3() {
         metrics_provider::init_for_tests();
@@ -674,8 +477,9 @@ mod tests {
         let dir = tempfile::TempDir::new().expect("tempdir");
         let (blob_backend, meta_backend) = make_fs_backends(&dir.path().to_string_lossy());
 
-        let (store, raw_backend) = test_store_with_backend("e2e_rtrip_");
-        let durable_queue: Arc<dyn JobQueue> = Arc::new(DurableJobQueue::new(store.clone()));
+        let (backends, http) = test_backends("e2e_rtrip_");
+        let durable_queue: Arc<dyn JobQueue> =
+            Arc::new(DurableJobQueue::new(backends.store.clone()));
 
         let resolver = make_resolver(make_pull_through_repository(&mock_server.uri()).await);
 
@@ -708,7 +512,8 @@ mod tests {
         }
 
         // Exactly one envelope must be pending in S3.
-        let pending_count = store
+        let pending_count = backends
+            .store
             .count_pending("cache", 600)
             .await
             .expect("count_pending after enqueue");
@@ -716,7 +521,8 @@ mod tests {
 
         // Build a consumer + handler and drive the worker once.
         let consumer = Arc::new(DurableJobConsumer::new(
-            store.clone(),
+            backends.store.clone(),
+            backends.leases.clone(),
             30,
             "e2e-worker".to_string(),
         ));
@@ -738,13 +544,14 @@ mod tests {
         );
 
         // Pending queue must be empty.
-        let remaining = store
+        let remaining = backends
+            .store
             .count_pending("cache", 600)
             .await
             .expect("count_pending after worker");
         assert_eq!(remaining, 0, "pending queue must be empty after completion");
 
         // Best-effort S3 cleanup so parallel test runs don't see stale state.
-        let _ = raw_backend.delete_prefix("_jobs/").await;
+        let _ = http.delete_prefix("_jobs/").await;
     }
 }
