@@ -883,6 +883,7 @@ struct ShutdownFlushHarness {
 }
 
 fn build_shutdown_flush_harness(unique_prefix: &str) -> ShutdownFlushHarness {
+    metrics_provider::init_for_tests();
     let s3_config = MetadataS3Config {
         connection: S3ConnectionConfig {
             access_key_id: Secret::new("root".to_string()),
