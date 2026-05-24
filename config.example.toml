@@ -31,7 +31,11 @@ update_pull_time = false
 #pending_ready_horizon_secs = 600     # only count jobs ready within this many seconds toward the autoscaler gauge
 #
 #[global.job_queue.fs]                # pick one: filesystem backend
-#root_dir = "/var/lib/angos/jobs"     # must be on POSIX or NFSv4 with O_EXCL
+#root_dir = "/var/lib/angos/jobs"     # must be writable by every server and worker replica
+#lock_strategy = "memory"             # default; single-process scope only.
+                                      # For multi-process pools sharing root_dir, configure
+                                      # [global.job_queue.fs.lock_strategy.redis] instead
+                                      # (see doc/how-to/durable-cache-jobs).
 #
 #[global.job_queue.s3]                # pick one: S3 backend
 #bucket = "angos-jobs"                # S3 bucket for job envelopes

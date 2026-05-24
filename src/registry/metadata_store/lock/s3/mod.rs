@@ -27,9 +27,9 @@ use crate::{
         },
         path_builder,
     },
-    s3_client,
     timing::elapsed_ms,
 };
+use angos_s3_client as s3_client;
 
 const MAX_LOCK_TTL_SECS: u64 = 3600;
 

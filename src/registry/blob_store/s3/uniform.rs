@@ -10,20 +10,25 @@ use tokio::{
 use tokio_util::task::AbortOnDropHandle;
 use tracing::instrument;
 
-use super::multipart_helpers::{
-    UploadMode, next_part_number, uploaded_size as total_uploaded_size,
-};
 use crate::{
     oci::Digest,
     registry::{
         blob_store::{
             Error, UploadSummary,
             hashing_reader::HashingReader,
-            s3::{Backend, FRAME_BUFFER_CAPACITY, FRAME_SIZE, S3UploadState, UploadedPart},
+            s3::{
+                Backend, FRAME_BUFFER_CAPACITY, FRAME_SIZE, S3UploadState,
+                multipart_helpers::{
+                    UploadMode, next_part_number, uploaded_size as total_uploaded_size,
+                },
+            },
             sha256_ext::Sha256Ext,
         },
         path_builder,
     },
+};
+use angos_storage::{
+    Error as StorageError, MultipartStore, ObjectStore, Part, UploadId, channel_stream,
 };
 
 struct ChunkContext<'a> {
@@ -43,7 +48,7 @@ impl Backend {
         offset: u64,
     ) -> Result<(), Error> {
         let key = path_builder::upload_staged_container_path(namespace, upload_id, offset);
-        self.store.put_object(&key, chunk).await?;
+        self.store.put(&key, chunk).await?;
         Ok(())
     }
 
@@ -55,9 +60,9 @@ impl Backend {
         offset: u64,
     ) -> Result<Vec<u8>, Error> {
         let key = path_builder::upload_staged_container_path(namespace, upload_id, offset);
-        match self.store.get_object_body(&key, None).await {
+        match self.store.get(&key).await {
             Ok(data) => Ok(data),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Vec::new()),
+            Err(StorageError::NotFound) => Ok(Vec::new()),
             Err(e) => Err(e.into()),
         }
     }
@@ -70,13 +75,13 @@ impl Backend {
         state: Vec<u8>,
     ) -> Result<(), Error> {
         let hash_state_path = path_builder::upload_hash_context_path(name, uuid, "sha256", offset);
-        self.store.put_object(&hash_state_path, state).await?;
+        self.store.put(&hash_state_path, Bytes::from(state)).await?;
         Ok(())
     }
 
     pub async fn load_hasher(&self, name: &str, uuid: &str, offset: u64) -> Result<Sha256, Error> {
         let hash_state_path = path_builder::upload_hash_context_path(name, uuid, "sha256", offset);
-        let state = self.store.get_object_body(&hash_state_path, None).await?;
+        let state = self.store.get(&hash_state_path).await?;
         Sha256::from_state(&state)
     }
 
@@ -86,7 +91,7 @@ impl Backend {
         uuid: &str,
         upload_path: &str,
         append: bool,
-    ) -> Result<(Option<String>, Vec<UploadedPart>), Error> {
+    ) -> Result<(Option<String>, Vec<Part>), Error> {
         if append {
             if let Some(state) = self.retrieve_cached_upload_state(name, uuid).await {
                 return Ok((state.multipart_upload_id, state.parts));
@@ -110,10 +115,17 @@ impl Backend {
 
         let store = self.store.clone();
         let upload_path = ctx.upload_path.to_string();
-        let upload_id = ctx.upload_id.to_string();
+        let upload_id_str = ctx.upload_id.to_string();
         let upload_handle = AbortOnDropHandle::new(tokio::spawn(async move {
+            let id = UploadId::new(&upload_id_str);
             store
-                .upload_part_streaming(&upload_path, &upload_id, ctx.part_number, ctx.size, rx)
+                .upload_part(
+                    &upload_path,
+                    &id,
+                    ctx.part_number,
+                    ctx.size,
+                    channel_stream(rx),
+                )
                 .await
         }));
 
@@ -212,7 +224,11 @@ impl Backend {
             let upload_id = if let Some(id) = &upload_id {
                 id
             } else {
-                let id = self.store.create_multipart_upload(&upload_path).await?;
+                let id = self
+                    .store
+                    .create_multipart(&upload_path)
+                    .await?
+                    .into_inner();
                 self.cache_upload_id(&upload_path, &id).await;
                 upload_id.insert(id)
             };
@@ -282,8 +298,8 @@ impl Backend {
         let mut size = total_uploaded_size(&parts);
 
         let staged_path = path_builder::upload_staged_container_path(name, uuid, size);
-        if let Ok(staged_size) = self.store.object_size(&staged_path).await {
-            size += staged_size;
+        if let Ok(meta) = self.store.head(&staged_path).await {
+            size += meta.size;
         }
 
         let state = S3UploadState {
@@ -319,35 +335,38 @@ impl Backend {
         let source_key = path_builder::upload_staged_container_path(name, uuid, size);
 
         if upload_id.is_none() {
-            match self.store.object_size(&source_key).await {
-                Ok(staged_size) => {
+            match self.store.head(&source_key).await {
+                Ok(meta) => {
+                    let staged_size = meta.size;
                     size += staged_size;
                     let digest = self.resolve_upload_digest(name, uuid, size, digest).await?;
                     self.copy_staged_object_to_blob_and_cleanup(&source_key, name, uuid, &digest)
                         .await?;
                     return Ok(digest);
                 }
-                Err(e) if e.kind() == io::ErrorKind::NotFound && size == 0 => {
+                Err(StorageError::NotFound) if size == 0 => {
                     let digest = self.resolve_upload_digest(name, uuid, size, digest).await?;
                     self.put_empty_blob_and_cleanup(name, uuid, &digest).await?;
                     return Ok(digest);
                 }
-                Err(e) if e.kind() == io::ErrorKind::NotFound => return Err(Error::UploadNotFound),
+                Err(StorageError::NotFound) => return Err(Error::UploadNotFound),
                 Err(e) => return Err(e.into()),
             }
         }
 
-        let upload_id = upload_id.expect("upload_id checked above");
+        let upload_id = upload_id.ok_or(Error::UploadNotFound)?;
 
-        if let Ok(staged_size) = self.store.object_size(&source_key).await {
+        if let Ok(meta) = self.store.head(&source_key).await {
+            let staged_size = meta.size;
             let part_number = next_part_number(parts.len())?;
-            let e_tag = self
+            let id = UploadId::new(&upload_id);
+            let etag = self
                 .store
-                .upload_part_copy(&source_key, &key, &upload_id, part_number, None)
+                .upload_part_copy(&source_key, &key, &id, part_number, None)
                 .await?;
-            parts.push(UploadedPart {
+            parts.push(Part {
                 part_number,
-                e_tag,
+                etag,
                 size: staged_size,
             });
             size += staged_size;
@@ -368,7 +387,7 @@ impl Backend {
         size: u64,
     ) -> Result<UploadSummary, Error> {
         let date_path = path_builder::upload_start_date_path(name, uuid);
-        let date_bytes = self.store.get_object_body(&date_path, None).await?;
+        let date_bytes = self.store.get(&date_path).await?;
         let date_str = String::from_utf8_lossy(&date_bytes);
         let started_at = DateTime::parse_from_rfc3339(&date_str)
             .unwrap_or_else(|_| Utc::now().fixed_offset())

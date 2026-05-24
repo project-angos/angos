@@ -182,19 +182,8 @@ pub fn build_delete_ops(
     plan
 }
 
-/// Abstracts the hook points that differ between FS and S3 backends:
-///
-/// - `read_link_reference`: how a link is fetched from storage.
-/// - `write_link_reference`: how a link is persisted to storage.
-/// - `delete_link_reference`: how a link is removed from storage.
-/// - `cache_put` / `cache_invalidate`: cache integration (no-op default for FS).
-/// - `apply_pending_blob_index_ops`: how accumulated blob-index operations are
-///   flushed after `apply_link_operations` completes.
-/// - `after_update`: optional hook called after a successful `update_links`
-///   run; S3 uses it to register the namespace, FS does nothing.
-///
-/// The shared pre-lock / under-lock / apply helpers are provided as default
-/// methods so each backend only needs to implement the storage primitives.
+/// Storage-primitive seam used by [`update_links::run_update_links`] to drive
+/// the lock-coordinated engine path. Implemented by `Backend`.
 #[async_trait]
 pub trait LockOps: Send + Sync {
     /// Read the stored [`LinkMetadata`] for `link` within `namespace`.
@@ -215,26 +204,9 @@ pub trait LockOps: Send + Sync {
     /// Remove the stored link for `link` within `namespace`.
     async fn delete_link_reference(&self, namespace: &str, link: &LinkKind) -> Result<(), Error>;
 
-    /// Format a lock key for the given `link` within `namespace`.
-    fn lock_key_for_link(namespace: &str, link: &LinkKind) -> String
-    where
-        Self: Sized,
-    {
-        link_lock_key(namespace, link)
-    }
-
-    fn lock_key_for_blob_index(_namespace: &str, digest: &Digest) -> String
-    where
-        Self: Sized,
-    {
-        blob_index_lock_key(digest)
-    }
-
-    /// Apply the accumulated blob-index operations after `apply_link_operations`
-    /// completes and before the distributed lock is released.
-    ///
-    /// FS applies one write per digest; S3 (lock coordinator) performs
-    /// per-digest concurrent updates via `update_blob_index_shard`.
+    /// Flush the accumulated blob-index operations after
+    /// `apply_link_operations` completes and before the distributed lock is
+    /// released.
     async fn apply_pending_blob_index_ops(
         &self,
         namespace: &str,
@@ -242,18 +214,15 @@ pub trait LockOps: Send + Sync {
     ) -> Result<(), Error>;
 
     /// Hook called after a successful `update_links` run, outside the lock.
-    ///
-    /// S3 uses this to register the namespace in the namespace registry when
-    /// creates were part of the operation set. FS does nothing. The default
-    /// implementation is a no-op that always returns `Ok(())`.
+    /// Default implementation is a no-op.
     async fn after_update(&self, _namespace: &str, _had_creates: bool) -> Result<(), Error> {
         Ok(())
     }
 
-    /// Store `metadata` in the link cache. No-op by default (FS has no cache).
+    /// Store `metadata` in the link cache. No-op by default.
     async fn cache_put(&self, _namespace: &str, _link: &LinkKind, _metadata: &LinkMetadata) {}
 
-    /// Evict `link` from the link cache. No-op by default (FS has no cache).
+    /// Evict `link` from the link cache. No-op by default.
     async fn cache_invalidate(&self, _namespace: &str, _link: &LinkKind) {}
 
     /// Reads every operation before acquiring locks, resolving current link
@@ -315,15 +284,15 @@ pub trait LockOps: Send + Sync {
 
         for (create_data, delete_data) in prelock_results {
             if let Some(op) = create_data {
-                lock_keys.push(Self::lock_key_for_link(namespace, &op.link));
-                lock_keys.push(Self::lock_key_for_blob_index(namespace, &op.target));
+                lock_keys.push(link_lock_key(namespace, &op.link));
+                lock_keys.push(blob_index_lock_key(&op.target));
                 if let Some(ref old) = op.old_target {
-                    lock_keys.push(Self::lock_key_for_blob_index(namespace, old));
+                    lock_keys.push(blob_index_lock_key(old));
                 }
                 creates.push(op);
             } else if let Some((link, Some(meta), referrer)) = delete_data {
-                lock_keys.push(Self::lock_key_for_link(namespace, &link));
-                lock_keys.push(Self::lock_key_for_blob_index(namespace, &meta.target));
+                lock_keys.push(link_lock_key(namespace, &link));
+                lock_keys.push(blob_index_lock_key(&meta.target));
                 deletes.push(ResolvedDelete {
                     link,
                     target: meta.target,
@@ -594,42 +563,6 @@ mod tests {
 
         assert_eq!(link_lock_key(namespace, &link), "team/app:tag:latest");
         assert_eq!(blob_index_lock_key(&target), format!("blob:{target}"));
-    }
-
-    #[test]
-    fn filesystem_and_s3_backends_share_lock_key_intent() {
-        let target = digest("bb");
-        let namespace = "team/app";
-        let link = LinkKind::Digest(target.clone());
-
-        let expected_link_key = link_lock_key(namespace, &link);
-        let expected_blob_index_key = blob_index_lock_key(&target);
-
-        assert_eq!(
-            <crate::registry::metadata_store::fs::Backend as LockOps>::lock_key_for_link(
-                namespace, &link,
-            ),
-            expected_link_key
-        );
-        assert_eq!(
-            <crate::registry::metadata_store::s3::Backend as LockOps>::lock_key_for_link(
-                namespace, &link,
-            ),
-            expected_link_key
-        );
-        assert_eq!(
-            <crate::registry::metadata_store::fs::Backend as LockOps>::lock_key_for_blob_index(
-                namespace, &target,
-            ),
-            expected_blob_index_key
-        );
-        assert_eq!(
-            <crate::registry::metadata_store::s3::Backend as LockOps>::lock_key_for_blob_index(
-                "other/team",
-                &target,
-            ),
-            expected_blob_index_key
-        );
     }
 
     #[tokio::test]

@@ -10,7 +10,7 @@
 //! (the "unit-test pivot" path), which avoids the need to stand up a full
 //! `ServerContext` or HTTP listener while still covering the suppression logic.
 
-use std::{io::Cursor, sync::Arc};
+use std::{collections::HashMap, io::Cursor, sync::Arc};
 
 use chrono::Utc;
 use serde_json::json;
@@ -44,20 +44,22 @@ impl FsRegistryFixture {
         let temp_dir = TempDir::new().expect("tempdir");
         let path = temp_dir.path().to_string_lossy().to_string();
 
-        let blob_store = Arc::new(blob_store::fs::Backend::new(
-            &blob_store::fs::BackendConfig {
+        let blob_store = Arc::new(
+            blob_store::fs::Backend::new(&blob_store::fs::BackendConfig {
                 root_dir: path.clone(),
                 sync_to_disk: false,
-            },
-        ));
+            })
+            .unwrap(),
+        );
 
         let metadata_store_backend = Arc::new(
-            metadata_store::fs::Backend::new(&metadata_store::fs::BackendConfig {
+            metadata_store::fs::BackendConfig {
                 root_dir: path,
                 sync_to_disk: false,
                 lock_strategy: metadata_store::LockStrategy::Memory,
-            })
-            .unwrap(),
+            }
+            .to_backend()
+            .expect("fs metadata backend"),
         );
 
         let registry = create_test_registry(
@@ -77,8 +79,6 @@ impl FsRegistryFixture {
 /// Build an `EventDispatcher` wired to a wiremock server and subscribing to
 /// all manifest and tag event kinds.
 fn build_dispatcher_for_server(server_uri: &str) -> EventDispatcher {
-    use std::collections::HashMap;
-
     let config = EventWebhookConfig {
         url: Url::parse(server_uri).unwrap(),
         policy: DeliveryPolicy::Required,

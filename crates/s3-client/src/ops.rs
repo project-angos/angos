@@ -15,19 +15,16 @@ use std::{io, time::Duration};
 
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
-use futures_util::{StreamExt, TryStreamExt, stream};
+use futures_util::{Stream, StreamExt, TryStreamExt, stream};
 use reqwest::{
     Method,
     header::{HeaderMap, HeaderName},
 };
 use serde::{Deserialize, Serialize};
-use tokio::{
-    io::{AsyncRead, AsyncReadExt},
-    sync::mpsc,
-};
+use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio_util::io::StreamReader;
 
-use super::{
+use crate::{
     Backend, Error,
     client::{
         QueryParam, S3Error, SendOpts, content_length as parse_content_length, content_md5_base64,
@@ -67,16 +64,24 @@ pub struct MultipartUpload {
 // ─── object-level CRUD ────────────────────────────────────────────────────
 
 impl Backend {
+    /// # Errors
+    /// Forwards [`io::Error`] from the underlying `GET`: HTTP failures,
+    /// S3 protocol errors (404 ⇒ `NotFound`), or a tripped circuit breaker.
     pub async fn read(&self, path: &str) -> Result<Vec<u8>, io::Error> {
         self.read_with_metadata(path).await.map(|(body, _, _)| body)
     }
 
+    /// # Errors
+    /// Same as [`read`](Self::read).
     pub async fn read_with_etag(&self, path: &str) -> Result<(Vec<u8>, Option<String>), io::Error> {
         self.read_with_metadata(path)
             .await
             .map(|(body, etag, _)| (body, etag))
     }
 
+    /// # Errors
+    /// Forwards [`io::Error`] from the underlying `GET`: HTTP failures,
+    /// S3 protocol errors (404 ⇒ `NotFound`), or a tripped circuit breaker.
     pub async fn read_with_metadata(
         &self,
         path: &str,
@@ -106,7 +111,24 @@ impl Backend {
         result
     }
 
+    /// # Errors
+    /// Forwards [`io::Error`] from the underlying `HEAD`: HTTP failures,
+    /// S3 protocol errors (404 ⇒ `NotFound`), or a tripped circuit breaker.
     pub async fn object_size(&self, path: &str) -> Result<u64, io::Error> {
+        self.head_object(path).await.map(|(size, _, _)| size)
+    }
+
+    /// Single HEAD request returning size, `ETag`, and last-modified together
+    /// — avoids a redundant follow-up `GET` when the caller needs all three.
+    ///
+    /// # Errors
+    /// Forwards [`io::Error`] from the underlying `HEAD`: HTTP failures,
+    /// S3 protocol errors (404 ⇒ `NotFound`), missing/unparseable
+    /// `Content-Length`, or a tripped circuit breaker.
+    pub async fn head_object(
+        &self,
+        path: &str,
+    ) -> Result<(u64, Option<String>, Option<DateTime<Utc>>), io::Error> {
         self.check_circuit_breaker()?;
         let key = self.full_key(path);
 
@@ -121,11 +143,22 @@ impl Backend {
             )
             .await
             .map_err(|e| map_get_error(&e))
-            .and_then(|response| parse_content_length(&response.headers).map_err(io::Error::other));
+            .and_then(|response| {
+                let size = parse_content_length(&response.headers).map_err(io::Error::other)?;
+                Ok((
+                    size,
+                    header_string(&response.headers, "etag"),
+                    last_modified(&response.headers),
+                ))
+            });
         self.record_io_result(&result);
         result
     }
 
+    /// # Errors
+    /// Forwards [`io::Error`] from the underlying streaming `GET`: HTTP
+    /// failures, S3 protocol errors (404 ⇒ `NotFound`), missing or invalid
+    /// `Content-Length`, or a tripped circuit breaker.
     pub async fn get_object(
         &self,
         path: &str,
@@ -158,6 +191,9 @@ impl Backend {
         })
     }
 
+    /// # Errors
+    /// Same as [`get_object`](Self::get_object), plus [`io::Error`] from
+    /// draining the body stream into memory.
     pub async fn get_object_body(
         &self,
         path: &str,
@@ -172,6 +208,9 @@ impl Backend {
         Ok(buf)
     }
 
+    /// # Errors
+    /// Forwards [`io::Error`] from the underlying `PUT`: HTTP failures,
+    /// S3 protocol errors, or a tripped circuit breaker.
     pub async fn put_object(&self, path: &str, data: impl Into<Bytes>) -> Result<(), io::Error> {
         self.check_circuit_breaker()?;
         let key = self.full_key(path);
@@ -193,6 +232,10 @@ impl Backend {
         result
     }
 
+    /// # Errors
+    /// Forwards [`io::Error`] from the underlying `DELETE`: HTTP failures,
+    /// S3 protocol errors, or a tripped circuit breaker. Missing objects
+    /// are returned as `NotFound`.
     pub async fn delete(&self, path: &str) -> Result<(), io::Error> {
         self.check_circuit_breaker()?;
         let key = self.full_key(path);
@@ -214,10 +257,17 @@ impl Backend {
     }
 
     /// Alias kept for symmetry with the upload-side `delete_object` callers.
+    ///
+    /// # Errors
+    /// Same as [`delete`](Self::delete).
     pub async fn delete_object(&self, path: &str) -> Result<(), io::Error> {
         self.delete(path).await
     }
 
+    /// # Errors
+    /// Returns [`Error::PreconditionFailed`] when an object already exists
+    /// at `path`; otherwise forwards HTTP / S3 protocol errors as
+    /// [`Error::Io`].
     pub async fn put_object_if_not_exists(
         &self,
         path: &str,
@@ -227,6 +277,10 @@ impl Backend {
             .await
     }
 
+    /// # Errors
+    /// Returns [`Error::PreconditionFailed`] when the stored object's
+    /// `ETag` doesn't match `etag`; otherwise forwards HTTP / S3 protocol
+    /// errors as [`Error::Io`].
     pub async fn put_object_if_match(
         &self,
         path: &str,
@@ -237,6 +291,10 @@ impl Backend {
             .await
     }
 
+    /// # Errors
+    /// Returns [`Error::PreconditionFailed`] when the stored object's
+    /// `ETag` doesn't match `etag`; otherwise forwards HTTP / S3 protocol
+    /// errors as [`Error::Io`].
     pub async fn delete_if_match(&self, path: &str, etag: &str) -> Result<(), Error> {
         self.check_circuit_breaker()
             .map_err(|e| Error::Io(e.to_string()))?;
@@ -289,6 +347,10 @@ impl Backend {
         result
     }
 
+    /// # Errors
+    /// Forwards [`io::Error`] from the underlying single-shot or multipart
+    /// copy: HTTP failures, S3 protocol errors (including 404 on the
+    /// source), or a tripped circuit breaker.
     pub async fn copy_object(&self, source: &str, destination: &str) -> Result<(), io::Error> {
         let source_size = self.object_size(source).await?;
         if source_size <= self.multipart_copy_threshold {
@@ -380,6 +442,10 @@ impl Backend {
         Ok(parts)
     }
 
+    /// # Errors
+    /// Forwards [`io::Error`] from any of the paginated `LIST` or batch
+    /// `DELETE` calls. A non-empty `<Error>` list in a batch response is
+    /// joined into a single [`io::Error::other`].
     pub async fn delete_prefix(&self, prefix: &str) -> Result<(), io::Error> {
         let full_prefix = self.full_key(prefix);
         let mut continuation_token = None;
@@ -433,7 +499,10 @@ impl Backend {
 // ─── listing ──────────────────────────────────────────────────────────────
 
 impl Backend {
-    pub(super) async fn list_objects_v2_raw(
+    /// # Errors
+    /// Forwards [`io::Error`] from the underlying `ListObjectsV2` request
+    /// or XML body parse failures.
+    pub async fn list_objects_v2_raw(
         &self,
         full_prefix: &str,
         max_keys: u16,
@@ -470,6 +539,9 @@ impl Backend {
         xml::parse_list_objects_v2(&response.body).map_err(io::Error::other)
     }
 
+    /// # Errors
+    /// Forwards [`io::Error`] from [`list_objects_v2_raw`](Self::list_objects_v2_raw)
+    /// or a tripped circuit breaker.
     pub async fn list_prefixes(
         &self,
         path: &str,
@@ -515,6 +587,9 @@ impl Backend {
         Ok((prefixes, objects, next_token))
     }
 
+    /// # Errors
+    /// Forwards [`io::Error`] from
+    /// [`list_objects_v2_raw`](Self::list_objects_v2_raw).
     pub async fn list_objects(
         &self,
         path: &str,
@@ -543,6 +618,9 @@ impl Backend {
 // ─── multipart uploads ────────────────────────────────────────────────────
 
 impl Backend {
+    /// # Errors
+    /// Forwards [`io::Error`] from the underlying `CreateMultipartUpload`
+    /// request or XML body parse failures.
     pub async fn create_multipart_upload(&self, path: &str) -> Result<String, io::Error> {
         let key = self.full_key(path);
         let response = self
@@ -559,6 +637,8 @@ impl Backend {
         xml::parse_create_multipart_upload(&response.body).map_err(io::Error::other)
     }
 
+    /// # Errors
+    /// Forwards [`io::Error`] from the underlying `UploadPart` request.
     pub async fn upload_part(
         &self,
         path: &str,
@@ -582,23 +662,26 @@ impl Backend {
         Ok(header_string(&response.headers, "etag").unwrap_or_default())
     }
 
-    /// Streams a multipart part from an mpsc channel into reqwest's HTTP body.
-    /// With the blob-store defaults, memory in flight per streaming part is
-    /// bounded by `FRAME_BUFFER_CAPACITY * FRAME_SIZE` plus reqwest/hyper buffers.
-    pub async fn upload_part_streaming(
+    /// Streams a multipart part from a byte stream into reqwest's HTTP body.
+    /// The body is signed as `UNSIGNED-PAYLOAD` (no full-payload SHA256 over
+    /// chunks); use [`upload_part`](Backend::upload_part) when the payload is
+    /// already in memory and signed integrity is desired.
+    ///
+    /// # Errors
+    /// Forwards [`io::Error`] from the underlying streaming `UploadPart`
+    /// request.
+    pub async fn upload_part_streaming<S>(
         &self,
         path: &str,
         upload_id: &str,
         part_number: u32,
         content_length: u64,
-        rx: mpsc::Receiver<Bytes>,
-    ) -> Result<String, io::Error> {
+        body: S,
+    ) -> Result<String, io::Error>
+    where
+        S: Stream<Item = Result<Bytes, io::Error>> + Send + Unpin + 'static,
+    {
         let key = self.full_key(path);
-        let body_stream = stream::unfold(rx, |mut rx| async {
-            rx.recv()
-                .await
-                .map(|bytes| (Ok::<Bytes, io::Error>(bytes), rx))
-        });
         let response = self
             .s3_client
             .send_streaming_body(
@@ -607,13 +690,16 @@ impl Backend {
                 part_query(upload_id, part_number),
                 HeaderMap::new(),
                 content_length,
-                Box::pin(body_stream),
+                body,
             )
             .await
             .map_err(|e| io_other(&e))?;
         Ok(header_string(&response.headers, "etag").unwrap_or_default())
     }
 
+    /// # Errors
+    /// Forwards [`io::Error`] from the underlying `UploadPartCopy` request
+    /// or XML body parse failures.
     pub async fn upload_part_copy(
         &self,
         source: &str,
@@ -653,6 +739,10 @@ impl Backend {
         xml::parse_upload_part_copy(&response.body).map_err(io::Error::other)
     }
 
+    /// # Errors
+    /// Forwards [`io::Error`] from the underlying
+    /// `CompleteMultipartUpload` request, including S3-embedded `<Error>`
+    /// bodies (200-with-error responses).
     pub async fn complete_multipart_upload(
         &self,
         path: &str,
@@ -677,6 +767,9 @@ impl Backend {
             .map_err(|e| io_other(&e))
     }
 
+    /// # Errors
+    /// Forwards [`io::Error`] from the underlying `AbortMultipartUpload`
+    /// request.
     pub async fn abort_multipart_upload(
         &self,
         path: &str,
@@ -696,6 +789,9 @@ impl Backend {
             .map_err(|e| io_other(&e))
     }
 
+    /// # Errors
+    /// Forwards [`io::Error`] from the underlying `ListMultipartUploads`
+    /// request or XML body parse failures.
     pub async fn list_multipart_uploads(
         &self,
         prefix: Option<&str>,
@@ -750,38 +846,9 @@ impl Backend {
         Ok((uploads, next_key, next_upload))
     }
 
-    pub async fn search_multipart_upload_id(
-        &self,
-        path: &str,
-    ) -> Result<Option<String>, io::Error> {
-        let mut key_marker: Option<String> = None;
-        let mut upload_id_marker: Option<String> = None;
-        loop {
-            let (uploads, next_key, next_upload_id) = self
-                .list_multipart_uploads(
-                    Some(path),
-                    key_marker.as_deref(),
-                    upload_id_marker.as_deref(),
-                )
-                .await?;
-            if let Some(found) = uploads.into_iter().find(|u| u.key == path) {
-                return Ok(Some(found.upload_id));
-            }
-            if next_key.is_none() {
-                return Ok(None);
-            }
-            key_marker = next_key;
-            upload_id_marker = next_upload_id;
-        }
-    }
-
-    pub async fn abort_pending_uploads(&self, path: &str) -> Result<(), io::Error> {
-        while let Some(upload_id) = self.search_multipart_upload_id(path).await? {
-            self.abort_multipart_upload(path, &upload_id).await?;
-        }
-        Ok(())
-    }
-
+    /// # Errors
+    /// Forwards [`io::Error`] from any of the paginated `ListParts`
+    /// requests or XML body parse failures.
     pub async fn list_parts(
         &self,
         path: &str,
@@ -825,6 +892,9 @@ impl Backend {
         clippy::unused_async,
         reason = "async signature matches the rest of the Backend public surface"
     )]
+    /// # Errors
+    /// Returns [`io::Error::other`] when `SigV4` signing fails (e.g.
+    /// invalid credential characters); no network call is made.
     pub async fn generate_presigned_url(
         &self,
         path: &str,
@@ -840,7 +910,7 @@ impl Backend {
 
 // ─── helpers ──────────────────────────────────────────────────────────────
 
-pub(super) fn aggregate_batch_delete_errors(errors: &[String]) -> Option<io::Error> {
+pub fn aggregate_batch_delete_errors(errors: &[String]) -> Option<io::Error> {
     (!errors.is_empty())
         .then(|| io::Error::other(format!("batch delete errors: {}", errors.join("; "))))
 }
@@ -944,17 +1014,14 @@ mod tests {
     };
 
     use super::*;
-    use crate::{
-        s3_client::{Backend, BackendConfig, client::content_md5_base64},
-        secret::Secret,
-    };
+    use crate::{BackendConfig, client::content_md5_base64};
 
     const MIB: u64 = 1024 * 1024;
 
     fn test_config(endpoint: String) -> BackendConfig {
         BackendConfig {
-            access_key_id: Secret::new("key".to_string()),
-            secret_key: Secret::new("secret".to_string()),
+            access_key_id: "key".to_string(),
+            secret_key: "secret".to_string(),
             endpoint,
             bucket: "test-bucket".to_string(),
             region: "us-east-1".to_string(),
@@ -1125,13 +1192,13 @@ mod tests {
             .await;
 
         let backend = Backend::new(&test_config(server.uri())).unwrap();
-        let (tx, rx) = mpsc::channel(2);
-        tx.send(Bytes::from_static(b"hello ")).await.unwrap();
-        tx.send(Bytes::from_static(b"world")).await.unwrap();
-        drop(tx);
+        let body = stream::iter([
+            Ok::<Bytes, io::Error>(Bytes::from_static(b"hello ")),
+            Ok::<Bytes, io::Error>(Bytes::from_static(b"world")),
+        ]);
 
         let etag = backend
-            .upload_part_streaming("test/file.txt", "upload-id", 1, 11, rx)
+            .upload_part_streaming("test/file.txt", "upload-id", 1, 11, body)
             .await
             .unwrap();
 

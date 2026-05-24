@@ -113,6 +113,7 @@ impl NamespaceChecker for UploadChecker {
 
 #[cfg(test)]
 mod tests {
+    use angos_s3_client as s3_client;
     use chrono::TimeZone;
 
     use super::*;
@@ -206,7 +207,6 @@ mod tests {
 
     #[test]
     fn classify_upload_keeps_on_data_store_error() {
-        use crate::s3_client;
         let verdict = classify_upload(
             Err(&blob_store::Error::DataStore(s3_client::Error::Io(
                 "timeout".to_string(),

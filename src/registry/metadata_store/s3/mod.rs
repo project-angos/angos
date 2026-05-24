@@ -1,89 +1,39 @@
-use std::{
-    collections::HashSet,
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    },
-    time::Duration,
-};
+use std::sync::Arc;
 
-use async_trait::async_trait;
-pub use config::BackendConfig;
-use futures_util::stream::{self, StreamExt};
-use tokio::sync::Mutex;
-use tracing::{debug, info, instrument, warn};
+use tracing::{info, warn};
 
 use crate::{
     cache::Cache,
-    oci::{Descriptor, Digest},
-    registry::{
-        metadata_store::{
-            BlobIndex, BlobIndexOperation, ConditionalCapabilities, Error, LinkMetadata,
-            LinkOperation, LockGuard, LockStrategy, MetadataStore, link_kind::LinkKind,
-            lock_ops::LockOps, referrer_resolver::resolve_referrer_descriptor, simple_jitter,
-        },
-        pagination, path_builder,
+    registry::metadata_store::{
+        Backend, ConditionalCapabilities, Error, LockStrategy,
+        backend::Coordinator,
+        lock::{self, MemoryBackend, S3LockBackend},
     },
-    s3_client,
 };
+use angos_s3_client as s3_client;
+use angos_storage::s3::Backend as StorageS3Backend;
 
-mod access_time;
-mod blob_index;
-mod config;
-mod coordinator;
-mod link_ops;
-mod namespace_registry;
+pub mod config;
 mod probe;
 
-#[cfg(test)]
-mod tests;
-
-use coordinator::WriteCoordinator;
+pub use config::BackendConfig;
 pub use probe::probe_conditional_capabilities;
 
-#[derive(Clone)]
-pub struct Backend {
-    pub store: s3_client::Backend,
-    cache: Option<Arc<Cache>>,
-    link_cache_ttl: u64,
-    conditional_capabilities: ConditionalCapabilities,
-    access_time_writer: Option<access_time::AccessTimeWriter>,
-    coordinator: Arc<dyn WriteCoordinator>,
-    pub known_namespaces: Arc<Mutex<HashSet<String>>>,
-    // Held for Drop side-effect: signals the flush task to exit when the last Backend is dropped.
-    #[allow(dead_code)]
-    flush_handle: Option<Arc<access_time::FlushHandle>>,
-}
-
-const MAX_BLOB_INDEX_CAS_RETRIES: u32 = 20;
-const CAS_RETRY_BASE_MS: u64 = 50;
-
-pub async fn sleep_cas_retry(attempt: u32) {
-    let max_ms = CAS_RETRY_BASE_MS.saturating_mul(1u64 << attempt.min(4));
-    tokio::time::sleep(Duration::from_millis(simple_jitter(max_ms))).await;
-}
-
-impl Backend {
-    /// Create a new S3 metadata-store backend.
+impl BackendConfig {
+    /// Build the unified metadata-store backend for an S3 deployment.
     ///
-    /// `conditional` carries the detected S3 conditional-write capabilities.
-    /// They are required by the CAS coordinator when the operator selects
-    /// `lock_strategy = "s3"` and are also used by lock-coordinator backends
-    /// to make blob-index shard updates optimistic when the provider supports it.
-    ///
-    /// `lock_strategy` drives coordinator selection: `"s3"` selects the CAS coordinator
-    /// (which requires `put_if_none_match` and `put_if_match`; `delete_if_match` is
-    /// propagated to the internal S3 lock for release safety), while `"redis"` and
-    /// `"memory"` select the lock coordinator with the corresponding lock backend.
-    pub fn new(
-        config: &BackendConfig,
+    /// `conditional` carries the detected (or explicitly declared) S3
+    /// conditional-write capabilities. When `None` the capabilities are
+    /// derived from the configured `lock_strategy`.
+    pub fn to_backend(
+        &self,
         conditional: Option<ConditionalCapabilities>,
-    ) -> Result<Self, Error> {
+        cache: Option<Arc<Cache>>,
+    ) -> Result<Backend, Error> {
         info!("Using S3 metadata-store backend");
-        let store = s3_client::Backend::new(&config.to_data_store_config())?;
 
         let caps = conditional.unwrap_or_else(|| {
-            if matches!(config.lock_strategy, LockStrategy::S3(_)) {
+            if matches!(self.lock_strategy, LockStrategy::S3(_)) {
                 ConditionalCapabilities {
                     put_if_none_match: true,
                     put_if_match: true,
@@ -94,10 +44,7 @@ impl Backend {
             }
         });
 
-        let coordinator = coordinator::build_coordinator(config, &caps)?;
-
-        if config.access_time_debounce_secs == 0
-            && matches!(config.lock_strategy, LockStrategy::S3(_))
+        if self.access_time_debounce_secs == 0 && matches!(self.lock_strategy, LockStrategy::S3(_))
         {
             warn!(
                 "access_time_debounce_secs is 0 with S3 lock strategy; \
@@ -107,329 +54,66 @@ impl Backend {
             );
         }
 
-        let access_time_writer = if config.access_time_debounce_secs > 0 {
-            Some(access_time::AccessTimeWriter::new())
-        } else {
-            None
-        };
+        let http = s3_client::Backend::new(&self.connection.to_client_config())?;
+        let storage = Arc::new(StorageS3Backend::builder().client(Arc::new(http)).build()?);
 
-        let flush_handle = if config.access_time_debounce_secs > 0 {
-            let shutdown = Arc::new(AtomicBool::new(false));
-            let shutdown_flag = shutdown.clone();
-            let interval = Duration::from_secs(config.access_time_debounce_secs);
-
-            let flush_backend = Self {
-                store: store.clone(),
-                cache: None,
-                link_cache_ttl: config.link_cache_ttl,
-                conditional_capabilities: caps.clone(),
-                access_time_writer: access_time_writer.clone(),
-                coordinator: coordinator.clone(),
-                known_namespaces: Arc::new(Mutex::new(HashSet::new())),
-                flush_handle: None,
-            };
-
-            tokio::spawn(async move {
-                loop {
-                    tokio::time::sleep(interval).await;
-                    if shutdown_flag.load(Ordering::Acquire) {
-                        flush_backend.flush_access_times().await;
-                        return;
-                    }
-                    flush_backend.flush_access_times().await;
+        let coordinator = match &self.lock_strategy {
+            LockStrategy::S3(s3_lock_config) => {
+                if !caps.supports_cas() {
+                    return Err(Error::Lock(format!(
+                        "S3 lock strategy requires If-None-Match and If-Match support, \
+                         but provider has put_if_none_match={}, put_if_match={}. \
+                         Use lock_strategy = redis or lock_strategy = memory instead.",
+                        caps.put_if_none_match, caps.put_if_match
+                    )));
                 }
-            });
-
-            Some(Arc::new(access_time::FlushHandle { shutdown }))
-        } else {
-            None
-        };
-
-        let backend = Self {
-            store,
-            cache: None,
-            link_cache_ttl: config.link_cache_ttl,
-            conditional_capabilities: caps,
-            access_time_writer,
-            coordinator,
-            known_namespaces: Arc::new(Mutex::new(HashSet::new())),
-            flush_handle,
-        };
-
-        Ok(backend)
-    }
-
-    pub fn with_cache(mut self, cache: Arc<Cache>) -> Self {
-        self.cache = Some(cache);
-        self
-    }
-}
-
-#[async_trait]
-impl MetadataStore for Backend {
-    #[instrument(skip(self))]
-    async fn list_namespaces(
-        &self,
-        n: u16,
-        last: Option<String>,
-    ) -> Result<(Vec<String>, Option<String>), Error> {
-        debug!("Fetching {n} namespace(s) with continuation token: {last:?}");
-
-        let namespaces = if let Some(registry) = self.read_namespace_registry().await? {
-            registry.namespaces
-        } else {
-            info!("Namespace registry not found, rebuilding from S3 tree walk");
-            self.rebuild_namespace_registry().await?;
-            self.read_namespace_registry()
-                .await?
-                .map(|r| r.namespaces)
-                .unwrap_or_default()
-        };
-
-        {
-            let mut cache = self.known_namespaces.lock().await;
-            cache.extend(namespaces.iter().cloned());
-        }
-
-        Ok(pagination::paginate_sorted(&namespaces, n, last.as_deref()))
-    }
-
-    #[instrument(skip(self))]
-    async fn list_tags(
-        &self,
-        namespace: &str,
-        n: u16,
-        last: Option<String>,
-    ) -> Result<(Vec<String>, Option<String>), Error> {
-        debug!("Listing {n} tag(s) for namespace '{namespace}' starting with last '{last:?}'");
-        let tags_dir = path_builder::manifest_tags_dir(namespace);
-
-        let (tags, _, next_token) = self
-            .store
-            .list_prefixes(&tags_dir, "/", n, None, last)
-            .await?;
-
-        let continuation = if next_token.is_some() {
-            tags.last().cloned()
-        } else {
-            None
-        };
-
-        Ok((tags, continuation))
-    }
-
-    #[instrument(skip(self))]
-    async fn list_referrers(
-        &self,
-        namespace: &str,
-        digest: &Digest,
-        artifact_type: Option<String>,
-    ) -> Result<Vec<Descriptor>, Error> {
-        let referrers_dir = path_builder::manifest_referrers_dir(namespace, digest);
-
-        let mut referrers = Vec::new();
-        let mut continuation_token = None;
-
-        loop {
-            let (objects, next_token) = self
-                .store
-                .list_objects(&referrers_dir, 100, continuation_token)
-                .await?;
-
-            let digest_entries: Vec<Digest> = objects
-                .iter()
-                .filter_map(|key| {
-                    let parts: Vec<&str> = key.split('/').collect();
-                    if parts.len() < 2 || parts[0] != "sha256" {
-                        return None;
-                    }
-                    Some(Digest::Sha256(parts[1].into()))
-                })
-                .collect();
-
-            let results: Vec<Option<Descriptor>> = stream::iter(digest_entries)
-                .map(|manifest_digest| {
-                    let artifact_type = artifact_type.as_ref();
-                    async move {
-                        resolve_referrer_descriptor(
-                            digest,
-                            manifest_digest,
-                            artifact_type,
-                            |link| async move { self.read_link_reference(namespace, &link).await },
-                            |path| async move { self.store.read(&path).await },
+                info!("Using CAS coordinator with S3 lock for S3 metadata-store");
+                let lock_http = s3_client::Backend::new(&self.to_lock_store_config(s3_lock_config))
+                    .map_err(|e| Error::Lock(format!("Failed to initialize S3 lock store: {e}")))?;
+                let lock =
+                    Arc::new(
+                        S3LockBackend::new(
+                            Arc::new(lock_http),
+                            s3_lock_config,
+                            caps.delete_if_match,
                         )
-                        .await
-                    }
+                        .map_err(|e| {
+                            Error::Lock(format!("Failed to initialize S3 lock store: {e}"))
+                        })?,
+                    );
+                Arc::new(Coordinator::Cas {
+                    store: storage,
+                    lock,
                 })
-                .buffer_unordered(10)
-                .collect()
-                .await;
-
-            referrers.extend(results.into_iter().flatten());
-
-            continuation_token = next_token;
-            if continuation_token.is_none() {
-                break;
             }
-        }
-
-        referrers.sort_by(|a, b| a.digest.cmp(&b.digest));
-        Ok(referrers)
-    }
-
-    async fn has_referrers(&self, namespace: &str, subject: &Digest) -> Result<bool, Error> {
-        let referrers_dir = path_builder::manifest_referrers_dir(namespace, subject);
-
-        let (objects, _) = self.store.list_objects(&referrers_dir, 1, None).await?;
-
-        Ok(!objects.is_empty())
-    }
-
-    async fn list_revisions(
-        &self,
-        namespace: &str,
-        n: u16,
-        continuation_token: Option<String>,
-    ) -> Result<(Vec<Digest>, Option<String>), Error> {
-        debug!(
-            "Fetching {n} revision(s) for namespace '{namespace}' with continuation token: {continuation_token:?}"
-        );
-        let revisions_dir = path_builder::manifest_revisions_link_root_dir(namespace, "sha256");
-
-        let (prefixes, _, next_last) = self
-            .store
-            .list_prefixes(&revisions_dir, "/", n, continuation_token, None)
-            .await?;
-
-        let mut revisions = Vec::new();
-        for key in prefixes {
-            revisions.push(Digest::Sha256(key.into()));
-        }
-
-        Ok((revisions, next_last))
-    }
-
-    async fn count_manifests(&self, namespace: &str) -> Result<usize, Error> {
-        let revisions_dir = path_builder::manifest_revisions_link_root_dir(namespace, "sha256");
-        let mut count = 0;
-        let mut continuation_token = None;
-
-        loop {
-            let (prefixes, _, next_token) = self
-                .store
-                .list_prefixes(&revisions_dir, "/", 1000, continuation_token, None)
-                .await?;
-
-            count += prefixes.len();
-            continuation_token = next_token;
-            if continuation_token.is_none() {
-                break;
+            LockStrategy::Redis(redis_config) => {
+                info!("Using Redis lock store for S3 metadata-store");
+                let lock = lock::RedisBackend::new(redis_config).map_err(|e| {
+                    Error::Lock(format!("Failed to initialize Redis lock store: {e}"))
+                })?;
+                Arc::new(Coordinator::Locked {
+                    store: storage,
+                    lock: Arc::new(lock),
+                })
             }
-        }
-
-        Ok(count)
-    }
-
-    #[instrument(skip(self))]
-    async fn read_blob_index(&self, digest: &Digest) -> Result<BlobIndex, Error> {
-        self.read_blob_index_impl(digest).await
-    }
-
-    #[instrument(skip(self))]
-    async fn has_blob_references(&self, digest: &Digest) -> Result<bool, Error> {
-        self.has_blob_references_impl(digest).await
-    }
-
-    #[instrument(skip(self))]
-    async fn read_blob_index_namespace(
-        &self,
-        namespace: &str,
-        digest: &Digest,
-    ) -> Result<HashSet<LinkKind>, Error> {
-        self.read_blob_index_namespace_impl(namespace, digest).await
-    }
-
-    #[instrument(skip(self))]
-    async fn update_blob_index(
-        &self,
-        namespace: &str,
-        digest: &Digest,
-        operation: BlobIndexOperation,
-    ) -> Result<(), Error> {
-        self.coordinator
-            .update_blob_index(self, namespace, digest, operation)
-            .await
-    }
-
-    #[instrument(skip(self))]
-    async fn migrate_blob_index(&self, digest: &Digest) -> Result<(), Error> {
-        self.migrate_blob_index_layout(digest).await
-    }
-
-    #[instrument(skip(self))]
-    async fn migrate_namespace_registry(&self) -> Result<(), Error> {
-        self.rebuild_namespace_registry().await?;
-        self.store
-            .delete(&path_builder::namespace_registry_path())
-            .await?;
-        Ok(())
-    }
-
-    async fn acquire_blob_data_lock(&self, digest: &Digest) -> Result<LockGuard, Error> {
-        self.coordinator.acquire_blob_data_lock(digest).await
-    }
-
-    #[instrument(skip(self))]
-    async fn read_link(
-        &self,
-        namespace: &str,
-        link: &LinkKind,
-        update_access_time: bool,
-    ) -> Result<LinkMetadata, Error> {
-        if update_access_time {
-            if let Some(writer) = &self.access_time_writer {
-                let link_data = if let Some(cached) = self.cache_get(namespace, link).await {
-                    cached
-                } else {
-                    let data = self.read_link_reference(namespace, link).await?;
-                    self.cache_put(namespace, link, &data).await;
-                    data
-                };
-                writer.record(namespace, link).await;
-                Ok(link_data)
-            } else {
-                self.coordinator
-                    .touch_link_access_time(self, namespace, link)
-                    .await
+            LockStrategy::Memory => {
+                info!("Using in-memory lock store for S3 metadata-store");
+                Arc::new(Coordinator::Locked {
+                    store: storage,
+                    lock: Arc::new(MemoryBackend::new()),
+                })
             }
-        } else {
-            if let Some(cached) = self.cache_get(namespace, link).await {
-                return Ok(cached);
-            }
-            let link_data = self.read_link_reference(namespace, link).await?;
-            self.cache_put(namespace, link, &link_data).await;
-            Ok(link_data)
-        }
-    }
+        };
 
-    #[instrument(skip(self))]
-    async fn update_links(
-        &self,
-        namespace: &str,
-        operations: &[LinkOperation],
-    ) -> Result<(), Error> {
-        if operations.is_empty() {
-            return Ok(());
+        let mut builder = Backend::builder()
+            .coordinator(coordinator)
+            .link_cache_ttl(self.link_cache_ttl)
+            .access_time_debounce_secs(self.access_time_debounce_secs);
+
+        if let Some(c) = cache {
+            builder = builder.cache(c);
         }
 
-        self.coordinator
-            .update_links(self, namespace, operations)
-            .await
-    }
-
-    async fn flush_access_times(&self) {
-        if let Some(writer) = &self.access_time_writer {
-            writer.flush(self).await;
-        }
+        builder.build()
     }
 }

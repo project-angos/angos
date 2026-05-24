@@ -33,7 +33,7 @@ use smallvec::SmallVec;
 use tokio::time::timeout;
 use url::Url;
 
-use super::BackendConfig;
+use crate::BackendConfig;
 
 const SERVICE: &str = "s3";
 const SIGNING_ALGORITHM: &str = "AWS4-HMAC-SHA256";
@@ -280,8 +280,8 @@ impl S3Client {
             host,
             bucket: config.bucket.clone(),
             encoded_bucket: encode_bucket(&config.bucket),
-            access_key_id: config.access_key_id.expose().clone(),
-            secret_key: config.secret_key.expose().clone(),
+            access_key_id: config.access_key_id.clone(),
+            secret_key: config.secret_key.clone(),
             region: config.region.clone(),
             operation_timeout: Duration::from_secs(config.operation_timeout_secs),
             operation_attempt_timeout: Duration::from_secs(config.operation_attempt_timeout_secs),
@@ -930,12 +930,11 @@ async fn read_response_prefix(response: Response, limit: usize) -> Bytes {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::secret::Secret;
 
     fn test_client() -> S3Client {
         S3Client::new(&BackendConfig {
-            access_key_id: Secret::new("AKIDEXAMPLE".to_string()),
-            secret_key: Secret::new("wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY".to_string()),
+            access_key_id: "AKIDEXAMPLE".to_string(),
+            secret_key: "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY".to_string(),
             endpoint: "https://s3.amazonaws.com".to_string(),
             bucket: "examplebucket".to_string(),
             region: "us-east-1".to_string(),
@@ -985,8 +984,8 @@ mod tests {
     #[test]
     fn request_target_preserves_endpoint_base_path_once() {
         let client = S3Client::new(&BackendConfig {
-            access_key_id: Secret::new("key".to_string()),
-            secret_key: Secret::new("secret".to_string()),
+            access_key_id: "key".to_string(),
+            secret_key: "secret".to_string(),
             endpoint: "https://object.example.com/base/".to_string(),
             bucket: "bucket".to_string(),
             region: "us-east-1".to_string(),

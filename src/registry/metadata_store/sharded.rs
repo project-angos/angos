@@ -109,7 +109,3 @@ pub fn namespace_links_from_index(
         .filter(|links| !links.is_empty())
         .ok_or(Error::ReferenceNotFound)
 }
-
-pub fn blob_index_has_references(index: &BlobIndex) -> bool {
-    index.namespace.values().any(|links| !links.is_empty())
-}

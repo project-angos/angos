@@ -43,8 +43,10 @@ Pick exactly one backend sub-table — `[global.job_queue.fs]` or
 
 ### Filesystem backend
 
-Use this for a single-host deployment or when workers share a POSIX-compatible
-volume (e.g. NFSv4 with working `O_EXCL`).
+Use this for a single-host deployment or when servers and workers share a
+filesystem volume. Multi-process pools (multiple `angos server` or
+`angos worker` replicas sharing one `root_dir`) additionally need
+`lock_strategy.redis` — see below.
 
 ```toml
 [global]
@@ -58,12 +60,20 @@ pending_ready_horizon_secs = 600     # only jobs ready within this many seconds 
 
 [global.job_queue.fs]
 root_dir = "/var/lib/angos/jobs"     # must be writable by every server and worker replica
+# lock_strategy defaults to "memory" (single-process scope only). For
+# multi-process pools sharing root_dir, replace it with the Redis sub-table:
+#
+# [global.job_queue.fs.lock_strategy.redis]
+# url = "redis://localhost:6379"
+# ttl = 30
 ```
 
-> **Note:** The FS backend uses `O_EXCL` for lease atomicity. This works
-> correctly on local POSIX filesystems and NFSv4 mounts with functional locking.
-> Old NFSv3 mounts with broken `O_EXCL` are not supported; use the S3 backend
-> instead.
+> **Note:** Lease coordination is delegated to the configured `lock_strategy`,
+> not to any filesystem-level primitive. The default `"memory"` strategy only
+> coordinates within a single process — a second `angos server` or
+> `angos worker` pointed at the same `root_dir` will race. Multi-process pools
+> must configure `lock_strategy.redis`. The S3 lock strategy used by the S3
+> metadata store is rejected for the FS job store.
 
 ### S3 backend
 
@@ -149,10 +159,13 @@ re-execution rename the file with a zero prefix:
 already hit the retry ceiling will still go straight to DLQ on first failure
 unless you also edit the body).
 
-**FS backend on shared storage:** The FS backend requires `O_EXCL` to be atomic
-on the volume. Single-host POSIX filesystems (ext4, XFS, tmpfs) and NFSv4 with
-working locking are supported. NFSv3 with broken `O_EXCL` is not. If you need
-multi-host FS workers, use the S3 backend.
+**FS backend on shared storage:** Lease coordination is provided by the
+configured `lock_strategy`, not by the filesystem. A shared volume only needs
+to be writable by every replica and to support atomic rename within a
+directory. Multi-process pools require `lock_strategy.redis`; the default 
+`lock_strategy = "memory"` does not coordinate across processes even
+on a shared mount. If you do not want to run Redis, use the S3 backend
+instead.
 
 **S3 backend requirements:** Lease ownership is tracked via the `ETag` header
 returned by the storage service on `PUT`. S3-compatible endpoints that strip

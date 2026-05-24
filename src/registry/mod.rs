@@ -11,7 +11,6 @@ mod error;
 #[cfg(test)]
 mod event_emission_tests;
 mod ext;
-mod fs_ops;
 mod headers;
 pub mod job_store;
 pub mod manifest;
@@ -20,6 +19,7 @@ pub mod pagination;
 mod path_builder;
 pub mod repository;
 pub mod repository_resolver;
+pub mod s3_connection;
 pub mod task_queue;
 #[cfg(test)]
 pub mod test_utils;

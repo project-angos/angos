@@ -24,6 +24,8 @@ dependencies = [
 name = "angos"
 version = "1.2.0"
 dependencies = [
+ "angos-s3-client",
+ "angos-storage",
  "arc-swap",
  "argh",
  "argon2",
@@ -80,6 +82,54 @@ dependencies = [
  "wiremock",
  "x509-parser",
  "zeroize",
+]
+
+[[package]]
+name = "angos-s3-client"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "base64",
+ "bytes",
+ "bytesize",
+ "chrono",
+ "futures-util",
+ "hex",
+ "hmac 0.13.0",
+ "md-5",
+ "parking_lot",
+ "quick-xml",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "smallvec",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "url",
+ "wiremock",
+]
+
+[[package]]
+name = "angos-storage"
+version = "0.1.0"
+dependencies = [
+ "angos-s3-client",
+ "async-trait",
+ "bytes",
+ "bytesize",
+ "chrono",
+ "futures-util",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "uuid",
 ]
 
 [[package]]

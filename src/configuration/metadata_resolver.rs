@@ -108,9 +108,12 @@ mod tests {
         let resolved = config.resolve_metadata_config();
         match resolved {
             MetadataStoreConfig::S3(s3_config) => {
-                assert_eq!(s3_config.bucket, "metadata-bucket");
-                assert_eq!(s3_config.region, "eu-west-1");
-                assert_eq!(s3_config.endpoint, "https://metadata.example.com");
+                assert_eq!(s3_config.connection.bucket, "metadata-bucket");
+                assert_eq!(s3_config.connection.region, "eu-west-1");
+                assert_eq!(
+                    s3_config.connection.endpoint,
+                    "https://metadata.example.com"
+                );
             }
             other => panic!("expected explicit S3 metadata config, got {other:?}"),
         }
@@ -140,12 +143,12 @@ mod tests {
         let resolved = config.resolve_metadata_config();
         match resolved {
             MetadataStoreConfig::S3(s3_config) => {
-                assert_eq!(s3_config.bucket, "my-bucket");
-                assert_eq!(s3_config.region, "us-east-1");
-                assert_eq!(s3_config.endpoint, "https://s3.example.com");
-                assert_eq!(s3_config.access_key_id.expose(), "key123");
-                assert_eq!(s3_config.secret_key.expose(), "secret456");
-                assert_eq!(s3_config.key_prefix, "prefix/");
+                assert_eq!(s3_config.connection.bucket, "my-bucket");
+                assert_eq!(s3_config.connection.region, "us-east-1");
+                assert_eq!(s3_config.connection.endpoint, "https://s3.example.com");
+                assert_eq!(s3_config.connection.access_key_id.expose(), "key123");
+                assert_eq!(s3_config.connection.secret_key.expose(), "secret456");
+                assert_eq!(s3_config.connection.key_prefix, "prefix/");
             }
             other => panic!("expected S3 metadata config from Inherit, got {other:?}"),
         }

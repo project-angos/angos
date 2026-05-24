@@ -84,19 +84,27 @@ defined to choose the backend.
 
 | Option | Type | Default | Description |
 |---|---|---|---|
-| `root_dir` | string | required | Directory for job envelopes. Must be on POSIX or NFSv4 with working `O_EXCL`. |
+| `root_dir` | string | required | Directory for job envelopes. |
+| `lock_strategy` | string/table | `"memory"` | Lock backend used to coordinate lease and dedup-index writes: `"memory"` (single-process), or `[lock_strategy.redis]` (multi-process). S3 locking not supported. Mirrors the `[metadata_store.fs.lock_strategy]` shape. |
+
+> **Note:** Default `lock_strategy = "memory"` only coordinates workers in the same process. Multi-replica `angos worker` deployments against a shared mount must set `[lock_strategy.redis]`; without it, two replicas can hold the same lease concurrently.
 
 #### S3 backend (`global.job_queue.s3`)
 
+Field shape matches `[metadata_store.s3]` so the same keys (`access_key_id`, `secret_key`, `endpoint`, `bucket`, `region`, `key_prefix`, `lock_strategy`, `capabilities`) work in both sections.
+
 | Option | Type | Default | Description |
 |---|---|---|---|
-| `bucket` | string | required | S3 bucket for job envelopes. |
-| `prefix` | string | `"_jobs"` | Key prefix inside the bucket. |
-| `endpoint` | string | required | S3 endpoint URL. |
-| `region` | string | `"us-east-1"` | AWS region. |
 | `access_key_id` | string | required | AWS access key ID. |
 | `secret_key` | string | required | AWS secret key. |
-| `delete_if_match` | bool | `true` | Whether the storage service honors `DELETE` with `If-Match: <etag>`. Set to `false` on S3-compatible endpoints without conditional delete; release then falls back to an unconditional `DELETE`. |
+| `endpoint` | string | required | S3 endpoint URL. |
+| `bucket` | string | required | S3 bucket for job envelopes. |
+| `region` | string | `"us-east-1"` | AWS region. |
+| `key_prefix` | string | `"_jobs"` | Key prefix inside the bucket. |
+| `lock_strategy` | string/table | `"s3"` | Coordination strategy: `"s3"` (CAS via S3 conditional writes, default), `"memory"`, or `[lock_strategy.redis]`. Use `redis` / `memory` on S3-compatible providers that don't honor `If-None-Match` / `If-Match`. |
+| `capabilities` | table | auto | Explicitly declared conditional-operation capabilities (`put_if_none_match`, `put_if_match`, `delete_if_match`). Only consulted under `lock_strategy = "s3"`; defaults to all-true. Set `delete_if_match = false` on providers that ignore `If-Match` on `DELETE` (release then falls back to unconditional `DELETE` with a small race window during lease theft). |
+
+> **Note:** `lock_strategy = "s3"` requires `capabilities.put_if_none_match` and `capabilities.put_if_match` to be `true`; startup fails fast otherwise. Switch to `"memory"` / `[lock_strategy.redis]` to coordinate over the underlying [`LockBackend`] instead of S3 CAS.
 
 See [Enable Durable Cache Jobs](../how-to/durable-cache-jobs.md) for a full
 setup guide including `angos worker` invocation and KEDA autoscaling.

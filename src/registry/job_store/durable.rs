@@ -3,8 +3,7 @@ use std::{sync::Arc, time::Duration};
 use async_trait::async_trait;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use tokio::{
-    select, spawn,
-    task::JoinHandle,
+    select,
     time::{MissedTickBehavior, interval},
 };
 use tokio_util::sync::CancellationToken;
@@ -12,23 +11,21 @@ use tracing::{debug, warn};
 
 use crate::{
     metrics_provider::metrics_provider,
-    registry::job_store::{Error, JobEnvelope, JobQueue, JobStore, MAX_SCAN, parse_not_before},
+    registry::job_store::{
+        Error, JobEnvelope, JobQueue, JobStore, MAX_SCAN,
+        lease::{LeaseBackend, LeaseGuard},
+        parse_not_before,
+    },
 };
 
-/// Consecutive heartbeat failures tolerated before the lease is treated as
-/// lost. Combined with the `ttl / 3` tick this gives roughly one TTL window of
-/// grace before the worker bails out.
-const MAX_HEARTBEAT_FAILURES: u32 = 3;
-
-/// A job claimed by a worker, ready to execute. `lease_token` is an
-/// opaque backend-specific identifier used to refresh or release the lease.
-/// `storage_key` identifies the pending file the envelope was loaded from;
-/// `complete`/`fail` need it to delete or rewrite that file.
-#[derive(Debug)]
+/// A job claimed by a worker, ready to execute. `lease` keeps the lease
+/// alive via an internal heartbeat and releases it on `complete`/`fail`
+/// (or `Drop`); `storage_key` identifies the pending file the envelope was
+/// loaded from so `complete`/`fail` can delete or rewrite that file.
 pub struct ClaimedJob {
     pub envelope: JobEnvelope,
     pub storage_key: String,
-    pub lease_token: String,
+    pub lease: LeaseGuard,
 }
 
 pub enum FailOutcome {
@@ -40,7 +37,6 @@ pub enum FailOutcome {
 /// leased; otherwise `next_ready` carries the soonest `not_before` observed
 /// across the scan so the caller can sleep until then rather than polling at
 /// full cadence through unchanged backed-off envelopes.
-#[derive(Debug)]
 pub struct ClaimOutcome {
     pub claimed: Option<ClaimedJob>,
     pub next_ready: Option<DateTime<Utc>>,
@@ -135,14 +131,21 @@ impl JobQueue for DurableJobQueue {
 
 pub struct DurableJobConsumer {
     store: Arc<dyn JobStore>,
+    leases: Arc<dyn LeaseBackend>,
     worker_id: String,
     lease_ttl_secs: u64,
 }
 
 impl DurableJobConsumer {
-    pub fn new(store: Arc<dyn JobStore>, lease_ttl_secs: u64, worker_id: String) -> Self {
+    pub fn new(
+        store: Arc<dyn JobStore>,
+        leases: Arc<dyn LeaseBackend>,
+        lease_ttl_secs: u64,
+        worker_id: String,
+    ) -> Self {
         Self {
             store,
+            leases,
             worker_id,
             lease_ttl_secs,
         }
@@ -172,16 +175,16 @@ impl DurableJobConsumer {
                 Err(Error::NotFound) => continue,
                 Err(e) => return Err(e),
             };
-            if let Some(token) = self
-                .store
-                .try_create_lease(&envelope.lock_key, &self.worker_id, self.lease_ttl_secs)
+            if let Some(lease) = self
+                .leases
+                .try_acquire(&envelope.lock_key, &self.worker_id, self.lease_ttl_secs)
                 .await?
             {
                 return Ok(ClaimOutcome {
                     claimed: Some(ClaimedJob {
                         envelope,
                         storage_key,
-                        lease_token: token,
+                        lease,
                     }),
                     next_ready: None,
                 });
@@ -193,79 +196,26 @@ impl DurableJobConsumer {
         })
     }
 
-    /// Spawn a heartbeat task that refreshes the lease for `claimed` every
-    /// `ttl_secs / 3` seconds. After [`MAX_HEARTBEAT_FAILURES`] consecutive
-    /// failures the task cancels `lease_lost` so the main worker loop can
-    /// abort the job. The caller must cancel `lease_lost` on normal completion
-    /// to stop the heartbeat.
-    pub fn spawn_heartbeat(
-        &self,
-        claimed: &ClaimedJob,
-        lease_lost: CancellationToken,
-    ) -> JoinHandle<()> {
-        let store = self.store.clone();
-        let worker_id = self.worker_id.clone();
-        let ttl_secs = self.lease_ttl_secs;
-        let lock_key = claimed.envelope.lock_key.clone();
-        let mut current_token = claimed.lease_token.clone();
-        let tick = Duration::from_secs(ttl_secs / 3);
-
-        spawn(async move {
-            // `interval` fires immediately on first tick; consume it so the
-            // first heartbeat happens after `tick`, not at t=0.
-            let mut timer = interval(tick);
-            timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
-            timer.tick().await;
-
-            let mut consecutive_failures: u32 = 0;
-            loop {
-                select! {
-                    () = lease_lost.cancelled() => return,
-                    _ = timer.tick() => {}
-                }
-                match store
-                    .heartbeat_lease(&lock_key, &current_token, &worker_id, ttl_secs)
-                    .await
-                {
-                    Ok(new_token) => {
-                        consecutive_failures = 0;
-                        current_token = new_token;
-                    }
-                    Err(e) => {
-                        consecutive_failures = consecutive_failures.saturating_add(1);
-                        warn!(lock_key, error = %e, consecutive_failures, "Lease heartbeat failed");
-                        if consecutive_failures >= MAX_HEARTBEAT_FAILURES {
-                            warn!(lock_key, "Too many heartbeat failures, marking lease lost");
-                            lease_lost.cancel();
-                            return;
-                        }
-                    }
-                }
-            }
-        })
-    }
-
     pub async fn complete(&self, claimed: ClaimedJob) -> Result<(), Error> {
         // The lease drops first, then the pending entry. Between the two,
         // another worker may briefly observe the pending entry and claim a
         // fresh lease — `JobHandler` implementations MUST therefore be
         // idempotent. A crash between the two ops is equivalent and is
         // covered by the same idempotency contract.
+        let ClaimedJob {
+            envelope,
+            storage_key,
+            lease,
+        } = claimed;
+        lease.release().await;
         self.store
-            .remove_lease(&claimed.envelope.lock_key, &claimed.lease_token)
-            .await?;
-        self.store
-            .remove_pending(&claimed.envelope.queue, &claimed.storage_key)
+            .remove_pending(&envelope.queue, &storage_key)
             .await?;
         // Drop the dedup index *after* the pending file is gone. A concurrent
         // retry that already re-pointed the index at a fresher envelope is
         // detected by the conditional check inside the backend.
         self.store
-            .remove_lock_key_index_if_matches(
-                &claimed.envelope.queue,
-                &claimed.envelope.lock_key,
-                &claimed.storage_key,
-            )
+            .remove_lock_key_index_if_matches(&envelope.queue, &envelope.lock_key, &storage_key)
             .await
     }
 
@@ -280,14 +230,12 @@ impl DurableJobConsumer {
         let ClaimedJob {
             envelope,
             storage_key,
-            lease_token,
+            lease,
         } = claimed;
         let new_attempts = envelope.attempts.saturating_add(1);
 
         if new_attempts >= envelope.max_attempts {
-            self.store
-                .remove_lease(&envelope.lock_key, &lease_token)
-                .await?;
+            lease.release().await;
             self.store
                 .move_to_failed(&envelope.queue, &storage_key, &envelope, err)
                 .await?;
@@ -316,9 +264,7 @@ impl DurableJobConsumer {
         self.store
             .remove_pending(&updated.queue, &storage_key)
             .await?;
-        self.store
-            .remove_lease(&updated.lock_key, &lease_token)
-            .await?;
+        lease.release().await;
 
         Ok(FailOutcome::Retried { next_at })
     }
