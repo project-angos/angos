@@ -1,8 +1,7 @@
 //! Integration tests for the S3 backend. These talk to a live `MinIO`
 //! instance at `127.0.0.1:9000` — the same convention the rest of the angos
-//! workspace uses for S3 integration tests. They are skipped automatically
-//! when the endpoint is unreachable so a hot `cargo test --workspace` still
-//! passes on developer machines without `MinIO` running.
+//! workspace uses for S3 integration tests. `MinIO` is expected to be
+//! running; tests fail loudly otherwise.
 
 use std::{sync::Arc, time::Duration};
 
@@ -17,7 +16,7 @@ use crate::{
     s3::Backend,
 };
 
-fn backend() -> Option<Backend> {
+fn backend() -> Backend {
     let config = S3Config {
         access_key_id: "root".to_string(),
         secret_key: "roottoor".to_string(),
@@ -32,30 +31,8 @@ fn backend() -> Option<Backend> {
         multipart_part_size: ByteSize::mib(5),
         ..Default::default()
     };
-    let client = Arc::new(S3Backend::new(&config).ok()?);
-    Backend::builder().client(client).build().ok()
-}
-
-/// Probe the configured endpoint by issuing a `HEAD` on a key that almost
-/// certainly doesn't exist. Returns `true` when `MinIO` is reachable and
-/// responding (either with the object or `NotFound`), `false` when we should
-/// skip the test.
-async fn minio_reachable(backend: &Backend) -> bool {
-    let probe_key = format!("__probe__/{}", Uuid::new_v4());
-    matches!(backend.head(&probe_key).await, Ok(_) | Err(Error::NotFound),)
-}
-
-macro_rules! require_minio {
-    ($store:ident) => {
-        let Some($store) = backend() else {
-            eprintln!("skipping S3 test: backend builder failed");
-            return;
-        };
-        if !minio_reachable(&$store).await {
-            eprintln!("skipping S3 test: MinIO at 127.0.0.1:9000 unreachable");
-            return;
-        }
-    };
+    let client = Arc::new(S3Backend::new(&config).expect("s3 client"));
+    Backend::builder().client(client).build().expect("backend")
 }
 
 #[tokio::test]
@@ -66,7 +43,7 @@ async fn builder_requires_client() {
 
 #[tokio::test]
 async fn put_then_get_round_trips() {
-    require_minio!(store);
+    let store = backend();
     store
         .put("rt/key", Bytes::from_static(b"hello"))
         .await
@@ -76,14 +53,14 @@ async fn put_then_get_round_trips() {
 
 #[tokio::test]
 async fn get_missing_key_returns_not_found() {
-    require_minio!(store);
+    let store = backend();
     let key = format!("missing/{}", Uuid::new_v4());
     assert_eq!(store.get(&key).await.unwrap_err(), Error::NotFound);
 }
 
 #[tokio::test]
 async fn head_reports_size_and_etag() {
-    require_minio!(store);
+    let store = backend();
     store
         .put("hd/k", Bytes::from_static(b"abcdef"))
         .await
@@ -95,7 +72,7 @@ async fn head_reports_size_and_etag() {
 
 #[tokio::test]
 async fn delete_prefix_clears_subtree() {
-    require_minio!(store);
+    let store = backend();
     let prefix = format!("dp/{}", Uuid::new_v4());
     for k in ["a", "b/c", "b/d"] {
         store
@@ -117,7 +94,7 @@ async fn delete_prefix_clears_subtree() {
 
 #[tokio::test]
 async fn get_stream_reports_total_size_not_remaining() {
-    require_minio!(store);
+    let store = backend();
     store
         .put("st/k", Bytes::from_static(b"0123456789"))
         .await
@@ -131,7 +108,7 @@ async fn get_stream_reports_total_size_not_remaining() {
 
 #[tokio::test]
 async fn list_children_separates_sub_prefixes_from_objects() {
-    require_minio!(store);
+    let store = backend();
     let prefix = format!("lc/{}", Uuid::new_v4());
     store
         .put(&format!("{prefix}/a"), Bytes::from_static(b"x"))
@@ -149,7 +126,7 @@ async fn list_children_separates_sub_prefixes_from_objects() {
 
 #[tokio::test]
 async fn put_if_absent_rejects_existing_key() {
-    require_minio!(store);
+    let store = backend();
     let key = format!("cas/absent/{}", Uuid::new_v4());
     store
         .put_if_absent(&key, Bytes::from_static(b"first"))
@@ -166,7 +143,7 @@ async fn put_if_absent_rejects_existing_key() {
 
 #[tokio::test]
 async fn put_if_match_rejects_stale_etag() {
-    require_minio!(store);
+    let store = backend();
     let key = format!("cas/match/{}", Uuid::new_v4());
     let etag = store
         .put_if_absent(&key, Bytes::from_static(b"v1"))
@@ -194,7 +171,7 @@ async fn delete_if_match_succeeds_with_current_etag() {
     // not asserted here — older S3-compatible providers don't enforce
     // `DeleteObject + If-Match`. Capability detection belongs in the consumer
     // layer (see `metadata_store::s3::probe::probe_conditional_capabilities`).
-    require_minio!(store);
+    let store = backend();
     let key = format!("cas/del/{}", Uuid::new_v4());
     let etag = store
         .put_if_absent(&key, Bytes::from_static(b"v"))
@@ -207,7 +184,7 @@ async fn delete_if_match_succeeds_with_current_etag() {
 
 #[tokio::test]
 async fn multipart_round_trip_assembles_object() {
-    require_minio!(store);
+    let store = backend();
     let key = format!("mp/{}", Uuid::new_v4());
     let id = store.create_multipart(&key).await.unwrap();
 
@@ -256,7 +233,7 @@ async fn multipart_round_trip_assembles_object() {
 
 #[tokio::test]
 async fn presign_get_returns_a_url() {
-    require_minio!(store);
+    let store = backend();
     let url = store
         .presign_get("blob/x", Duration::from_mins(1), None)
         .await
@@ -269,7 +246,7 @@ async fn presign_get_returns_a_url() {
 
 #[tokio::test]
 async fn search_multipart_upload_id_finds_active_upload() {
-    require_minio!(store);
+    let store = backend();
     let prefix = format!("search-mp/{}", Uuid::new_v4());
     let key = format!("{prefix}/obj");
 
@@ -288,7 +265,7 @@ async fn search_multipart_upload_id_finds_active_upload() {
 
 #[tokio::test]
 async fn search_multipart_upload_id_returns_none_when_absent() {
-    require_minio!(store);
+    let store = backend();
     let key = format!("search-mp-absent/{}", Uuid::new_v4());
     let result = store.search_multipart_upload_id(&key).await.unwrap();
     assert!(result.is_none());
@@ -296,7 +273,7 @@ async fn search_multipart_upload_id_returns_none_when_absent() {
 
 #[tokio::test]
 async fn abort_pending_uploads_removes_all_sessions() {
-    require_minio!(store);
+    let store = backend();
     let prefix = format!("abort-pending/{}", Uuid::new_v4());
     let key = format!("{prefix}/obj");
 

@@ -939,7 +939,7 @@ async fn test_shutdown_flushes_pending_access_times() {
     // shutdown_with_timeout() must flush the S3 metadata backend's buffered
     // access-time writes before returning. With access_time_debounce_secs > 0
     // those writes sit in a background loop and would be lost on a naïve
-    // shutdown. Requires MinIO on http://127.0.0.1:9000.
+    // shutdown.
     let unique_prefix = format!("test-shutdown-flush-{}", Uuid::new_v4());
     let ShutdownFlushHarness {
         registry,
