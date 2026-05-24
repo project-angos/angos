@@ -1,16 +1,16 @@
 //! Lock-coordinated engine for `update_links`.
 //!
-//! The [`run_update_links`] function is the shared distributed-lock engine
-//! used by the filesystem and S3 lock-coordinator backends. Both delegate their
-//! `update_links` implementation here. The differences between the two paths —
-//! how blob-index operations are applied, and whether a namespace registration
-//! hook is needed — are expressed through the two extension methods on
-//! [`LockOps`]:
+//! [`run_update_links`] is the distributed-lock engine the `Backend` uses when
+//! its `Coordinator` is `Locked` (FS, S3+Redis, S3+memory). The points where
+//! a backend may diverge — how blob-index operations are applied, and whether
+//! a namespace registration hook is needed — are expressed through two
+//! extension methods on [`LockOps`]:
 //! [`apply_pending_blob_index_ops`](LockOps::apply_pending_blob_index_ops) and
 //! [`after_update`](LockOps::after_update).
 //!
-//! `CasCoordinator::update_links` (the S3 optimistic-CAS path) is a
-//! fundamentally different algorithm and is **not** handled here.
+//! The CAS-first path (`Backend::update_links_cas`, used when the
+//! `Coordinator` is `Cas`) is a fundamentally different algorithm and is
+//! **not** handled here.
 
 use std::collections::HashMap;
 

@@ -13,6 +13,7 @@ pub use error::Error;
 
 use crate::oci::{Descriptor, Digest};
 
+pub mod backend;
 mod config;
 pub mod fs;
 pub mod link_kind;
@@ -26,6 +27,7 @@ pub mod update_links;
 #[cfg(test)]
 mod tests;
 
+pub use backend::Backend;
 pub use blob_index::{BlobIndex, BlobIndexOperation};
 pub use capabilities::ConditionalCapabilities;
 pub use config::MetadataStoreConfig;

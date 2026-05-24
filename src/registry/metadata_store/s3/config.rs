@@ -97,11 +97,11 @@ impl<'de> Deserialize<'de> for BackendConfig {
     }
 }
 
-pub(super) fn default_link_cache_ttl() -> u64 {
+fn default_link_cache_ttl() -> u64 {
     30
 }
 
-pub(super) fn default_access_time_debounce() -> u64 {
+fn default_access_time_debounce() -> u64 {
     60
 }
 

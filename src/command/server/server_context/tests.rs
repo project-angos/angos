@@ -885,9 +885,7 @@ async fn test_shutdown_flushes_pending_access_times() {
             RegistryConfig,
             blob_store::{self, fs},
             metadata_store::{
-                LinkOperation, MetadataStore,
-                link_kind::LinkKind,
-                s3::{Backend as S3MetadataBackend, BackendConfig},
+                LinkOperation, MetadataStore, link_kind::LinkKind, s3::BackendConfig,
             },
         },
     };
@@ -908,7 +906,9 @@ async fn test_shutdown_flushes_pending_access_times() {
         capabilities: None,
     };
 
-    let metadata_backend = S3MetadataBackend::new(&s3_config, None).unwrap();
+    let metadata_backend = s3_config
+        .to_backend(None, None)
+        .expect("s3 metadata backend");
     let metadata_store: Arc<dyn MetadataStore + Send + Sync> = Arc::new(metadata_backend);
 
     let blob_store_config = blob_store::BlobStorageConfig::FS(fs::BackendConfig {

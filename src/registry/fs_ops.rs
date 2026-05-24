@@ -95,6 +95,7 @@ pub async fn remove_dir_all_if_exists(path: &Path) -> io::Result<()> {
 }
 
 /// Removes `path` (a regular file). A missing path counts as success.
+#[cfg(test)]
 pub async fn remove_file_if_exists(path: &Path) -> io::Result<()> {
     match fs::remove_file(path).await {
         Ok(()) => Ok(()),

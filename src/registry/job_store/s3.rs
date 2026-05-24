@@ -263,8 +263,7 @@ mod tests {
             },
             manifest::DEFAULT_MAX_MANIFEST_SIZE_BYTES,
             metadata_store::{
-                LockStrategy,
-                fs::{Backend as MetaBackend, BackendConfig as MetaBackendConfig},
+                Backend as MetaBackend, LockStrategy, fs::BackendConfig as MetaBackendConfig,
             },
             path_builder,
             repository::{Config as RepositoryConfig, RegistryClientConfig},
@@ -293,11 +292,12 @@ mod tests {
             sync_to_disk: false,
         }));
         let meta = Arc::new(
-            MetaBackend::new(&MetaBackendConfig {
+            MetaBackendConfig {
                 root_dir: path.to_string(),
                 sync_to_disk: false,
                 lock_strategy: LockStrategy::Memory,
-            })
+            }
+            .to_backend()
             .expect("fs metadata backend"),
         );
         (blob, meta)

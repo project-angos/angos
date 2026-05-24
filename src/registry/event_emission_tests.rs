@@ -52,12 +52,13 @@ impl FsRegistryFixture {
         ));
 
         let metadata_store_backend = Arc::new(
-            metadata_store::fs::Backend::new(&metadata_store::fs::BackendConfig {
+            metadata_store::fs::BackendConfig {
                 root_dir: path,
                 sync_to_disk: false,
                 lock_strategy: metadata_store::LockStrategy::Memory,
-            })
-            .unwrap(),
+            }
+            .to_backend()
+            .expect("fs metadata backend"),
         );
 
         let registry = create_test_registry(
