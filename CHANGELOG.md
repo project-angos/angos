@@ -54,6 +54,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - Scrub's orphan manifest deletion now plans link operations through the same `link_plan::delete` primitive used by the runtime write path, eliminating divergence between scrub and runtime decisions about which links to remove. As a consequence, scrub also removes any tag links still pointing at an orphaned manifest digest (previously left dangling).
 - Scrub's orphan manifest deletion tolerates manifest blobs that fail to parse: it removes the digest link (and any tags pointing at it) so the next pass can clean up the dangling config/layer/child links. Blob-read failures are still surfaced so operators notice broken storage.
 - Overlapping repository prefixes (e.g. `team` and `team/app`) are rejected at startup rather than resolved non-deterministically at runtime.
+- `blob_store` backends (S3 and FS) now route all storage primitives through the shared `angos-storage` capability traits instead of calling `angos-s3-client` and `tokio::fs` directly. On-disk layout is unchanged. `fs::BlobStore::read` on a missing blob now consistently returns `BlobNotFound` (previously `ReferenceNotFound`), aligning FS with the S3 backend and with `size`/`reader` on the same backend.
+- The cached `S3UploadState.parts` wire format (cache key `upload_state:<ns>:<uuid>`) switched from `angos_s3_client::UploadedPart` to `angos_storage::Part`, renaming `e_tag` to `etag` (serialized transparently as a plain string). Pre-upgrade entries using the `e_tag` key deserialize transparently via a serde alias, so the upgrade is wire-compatible; the `list_parts` re-discovery fallback only triggers on genuinely corrupt cache entries.
 
 #### Performance
 

@@ -15,16 +15,13 @@ use std::{io, time::Duration};
 
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
-use futures_util::{StreamExt, TryStreamExt, stream};
+use futures_util::{Stream, StreamExt, TryStreamExt, stream};
 use reqwest::{
     Method,
     header::{HeaderMap, HeaderName},
 };
 use serde::{Deserialize, Serialize};
-use tokio::{
-    io::{AsyncRead, AsyncReadExt},
-    sync::mpsc,
-};
+use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio_util::io::StreamReader;
 
 use crate::{
@@ -665,27 +662,26 @@ impl Backend {
         Ok(header_string(&response.headers, "etag").unwrap_or_default())
     }
 
-    /// Streams a multipart part from an mpsc channel into reqwest's HTTP body.
-    /// With the blob-store defaults, memory in flight per streaming part is
-    /// bounded by `FRAME_BUFFER_CAPACITY * FRAME_SIZE` plus reqwest/hyper buffers.
+    /// Streams a multipart part from a byte stream into reqwest's HTTP body.
+    /// The body is signed as `UNSIGNED-PAYLOAD` (no full-payload SHA256 over
+    /// chunks); use [`upload_part`](Backend::upload_part) when the payload is
+    /// already in memory and signed integrity is desired.
     ///
     /// # Errors
     /// Forwards [`io::Error`] from the underlying streaming `UploadPart`
     /// request.
-    pub async fn upload_part_streaming(
+    pub async fn upload_part_streaming<S>(
         &self,
         path: &str,
         upload_id: &str,
         part_number: u32,
         content_length: u64,
-        rx: mpsc::Receiver<Bytes>,
-    ) -> Result<String, io::Error> {
+        body: S,
+    ) -> Result<String, io::Error>
+    where
+        S: Stream<Item = Result<Bytes, io::Error>> + Send + Unpin + 'static,
+    {
         let key = self.full_key(path);
-        let body_stream = stream::unfold(rx, |mut rx| async {
-            rx.recv()
-                .await
-                .map(|bytes| (Ok::<Bytes, io::Error>(bytes), rx))
-        });
         let response = self
             .s3_client
             .send_streaming_body(
@@ -694,7 +690,7 @@ impl Backend {
                 part_query(upload_id, part_number),
                 HeaderMap::new(),
                 content_length,
-                Box::pin(body_stream),
+                body,
             )
             .await
             .map_err(|e| io_other(&e))?;
@@ -848,43 +844,6 @@ impl Backend {
             (None, None)
         };
         Ok((uploads, next_key, next_upload))
-    }
-
-    /// # Errors
-    /// Forwards [`io::Error`] from the paginated
-    /// [`list_multipart_uploads`](Self::list_multipart_uploads) calls.
-    pub async fn search_multipart_upload_id(
-        &self,
-        path: &str,
-    ) -> Result<Option<String>, io::Error> {
-        let mut key_marker: Option<String> = None;
-        let mut upload_id_marker: Option<String> = None;
-        loop {
-            let (uploads, next_key, next_upload_id) = self
-                .list_multipart_uploads(
-                    Some(path),
-                    key_marker.as_deref(),
-                    upload_id_marker.as_deref(),
-                )
-                .await?;
-            if let Some(found) = uploads.into_iter().find(|u| u.key == path) {
-                return Ok(Some(found.upload_id));
-            }
-            if next_key.is_none() {
-                return Ok(None);
-            }
-            key_marker = next_key;
-            upload_id_marker = next_upload_id;
-        }
-    }
-
-    /// # Errors
-    /// Forwards [`io::Error`] from the listing or abort sub-requests.
-    pub async fn abort_pending_uploads(&self, path: &str) -> Result<(), io::Error> {
-        while let Some(upload_id) = self.search_multipart_upload_id(path).await? {
-            self.abort_multipart_upload(path, &upload_id).await?;
-        }
-        Ok(())
     }
 
     /// # Errors
@@ -1233,13 +1192,13 @@ mod tests {
             .await;
 
         let backend = Backend::new(&test_config(server.uri())).unwrap();
-        let (tx, rx) = mpsc::channel(2);
-        tx.send(Bytes::from_static(b"hello ")).await.unwrap();
-        tx.send(Bytes::from_static(b"world")).await.unwrap();
-        drop(tx);
+        let body = stream::iter([
+            Ok::<Bytes, io::Error>(Bytes::from_static(b"hello ")),
+            Ok::<Bytes, io::Error>(Bytes::from_static(b"world")),
+        ]);
 
         let etag = backend
-            .upload_part_streaming("test/file.txt", "upload-id", 1, 11, rx)
+            .upload_part_streaming("test/file.txt", "upload-id", 1, 11, body)
             .await
             .unwrap();
 

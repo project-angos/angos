@@ -12,7 +12,10 @@ use bytesize::ByteSize;
 use tokio::{io::AsyncReadExt, sync::mpsc};
 use uuid::Uuid;
 
-use crate::{ConditionalStore, Error, MultipartStore, ObjectStore, PresignedStore, s3::Backend};
+use crate::{
+    ConditionalStore, Error, MultipartStore, ObjectStore, PresignedStore, channel_stream,
+    s3::Backend,
+};
 
 fn backend() -> Option<Backend> {
     let config = S3Config {
@@ -218,7 +221,7 @@ async fn multipart_round_trip_assembles_object() {
     tx1.send(Bytes::from(data.clone())).await.unwrap();
     drop(tx1);
     let etag1 = store
-        .upload_part_streaming(&key, &id, 1, data.len() as u64, rx1)
+        .upload_part(&key, &id, 1, data.len() as u64, channel_stream(rx1))
         .await
         .unwrap();
 
@@ -227,7 +230,7 @@ async fn multipart_round_trip_assembles_object() {
     tx2.send(Bytes::from_static(tail)).await.unwrap();
     drop(tx2);
     let etag2 = store
-        .upload_part_streaming(&key, &id, 2, tail.len() as u64, rx2)
+        .upload_part(&key, &id, 2, tail.len() as u64, channel_stream(rx2))
         .await
         .unwrap();
 
@@ -262,4 +265,65 @@ async fn presign_get_returns_a_url() {
         url.contains("blob/x") && url.contains("X-Amz-Signature"),
         "expected a SigV4 presigned URL, got: {url}",
     );
+}
+
+#[tokio::test]
+async fn search_multipart_upload_id_finds_active_upload() {
+    require_minio!(store);
+    let prefix = format!("search-mp/{}", Uuid::new_v4());
+    let key = format!("{prefix}/obj");
+
+    let created_id = store.create_multipart(&key).await.unwrap();
+    let found = store
+        .search_multipart_upload_id(&key)
+        .await
+        .unwrap()
+        .expect("upload we just created must be found");
+    assert_eq!(found, created_id);
+
+    // Clean up.
+    store.abort_multipart(&key, &created_id).await.unwrap();
+    store.delete_prefix(&prefix).await.unwrap();
+}
+
+#[tokio::test]
+async fn search_multipart_upload_id_returns_none_when_absent() {
+    require_minio!(store);
+    let key = format!("search-mp-absent/{}", Uuid::new_v4());
+    let result = store.search_multipart_upload_id(&key).await.unwrap();
+    assert!(result.is_none());
+}
+
+#[tokio::test]
+async fn abort_pending_uploads_removes_all_sessions() {
+    require_minio!(store);
+    let prefix = format!("abort-pending/{}", Uuid::new_v4());
+    let key = format!("{prefix}/obj");
+
+    // Create two upload sessions for the same key.
+    let id1 = store.create_multipart(&key).await.unwrap();
+    let id2 = store.create_multipart(&key).await.unwrap();
+    // Confirm both are visible.
+    assert!(
+        store
+            .search_multipart_upload_id(&key)
+            .await
+            .unwrap()
+            .is_some()
+    );
+
+    store.abort_pending_uploads(&key).await.unwrap();
+
+    // Neither session should remain.
+    assert!(
+        store
+            .search_multipart_upload_id(&key)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    // Cleanup; ids are already aborted so ignore errors.
+    let _ = store.abort_multipart(&key, &id1).await;
+    let _ = store.abort_multipart(&key, &id2).await;
+    store.delete_prefix(&prefix).await.unwrap();
 }

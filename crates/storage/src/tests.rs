@@ -15,11 +15,13 @@ use std::{
 use async_trait::async_trait;
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
+use futures_util::StreamExt;
 use tokio::sync::mpsc;
 
 use crate::{
-    BoxedReader, ChildrenPage, ConditionalStore, Error, Etag, MultipartPage, MultipartStore,
-    MultipartUpload, ObjectMeta, ObjectStore, Page, Part, PresignedStore, UploadId,
+    BoxedReader, ByteStream, ChildrenPage, ConditionalStore, Error, Etag, MultipartPage,
+    MultipartStore, MultipartUpload, ObjectMeta, ObjectStore, Page, Part, PresignedStore, UploadId,
+    channel_stream,
 };
 
 /// State for a single in-progress multipart upload in the mock.
@@ -49,9 +51,31 @@ impl MockState {
     }
 }
 
-#[derive(Default)]
 struct MockBackend {
     state: Mutex<MockState>,
+    /// When `Some(n)`, `list_multipart_uploads` returns at most `n` uploads
+    /// per page and emits a `next_key_marker` so callers must paginate.
+    multipart_page_size: Option<usize>,
+}
+
+impl Default for MockBackend {
+    fn default() -> Self {
+        Self {
+            state: Mutex::new(MockState::default()),
+            multipart_page_size: None,
+        }
+    }
+}
+
+impl MockBackend {
+    /// Create a backend that returns at most `page_size` uploads per
+    /// `list_multipart_uploads` call, forcing callers to page through results.
+    fn with_multipart_page_size(page_size: usize) -> Self {
+        Self {
+            state: Mutex::new(MockState::default()),
+            multipart_page_size: Some(page_size),
+        }
+    }
 }
 
 #[async_trait]
@@ -233,16 +257,17 @@ impl MultipartStore for MockBackend {
         Ok(id)
     }
 
-    async fn upload_part_streaming(
+    async fn upload_part(
         &self,
         key: &str,
         id: &UploadId,
         part_number: u32,
         _content_length: u64,
-        mut rx: mpsc::Receiver<Bytes>,
+        mut body: ByteStream,
     ) -> Result<Etag, Error> {
         let mut buf = Vec::new();
-        while let Some(chunk) = rx.recv().await {
+        while let Some(chunk) = body.next().await {
+            let chunk = chunk.map_err(|e| Error::Backend(e.to_string()))?;
             buf.extend_from_slice(&chunk);
         }
         let mut state = self.state.lock().unwrap();
@@ -310,11 +335,11 @@ impl MultipartStore for MockBackend {
     async fn list_multipart_uploads(
         &self,
         prefix: Option<&str>,
-        _key_marker: Option<&str>,
+        key_marker: Option<&str>,
         _upload_id_marker: Option<&str>,
     ) -> Result<MultipartPage, Error> {
         let state = self.state.lock().unwrap();
-        let uploads: Vec<MultipartUpload> = state
+        let mut uploads: Vec<MultipartUpload> = state
             .multipart
             .iter()
             .filter(|((k, _), _)| prefix.is_none_or(|p| k.starts_with(p)))
@@ -324,9 +349,29 @@ impl MultipartStore for MockBackend {
                 initiated_at: session.initiated_at,
             })
             .collect();
+        uploads.sort_by(|a, b| a.key.cmp(&b.key));
+
+        // Apply key_marker cursor: skip entries whose key is <= marker.
+        if let Some(marker) = key_marker {
+            uploads.retain(|u| u.key.as_str() > marker);
+        }
+
+        // Apply optional page size limit.
+        let next_key_marker = if let Some(limit) = self.multipart_page_size {
+            if uploads.len() > limit {
+                let last_key = uploads[limit - 1].key.clone();
+                uploads.truncate(limit);
+                Some(last_key)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
         Ok(MultipartPage {
             uploads,
-            next_key_marker: None,
+            next_key_marker,
             next_upload_id_marker: None,
         })
     }
@@ -573,7 +618,7 @@ async fn multipart_round_trip_assembles_object_from_parts() {
     tx1.send(Bytes::from_static(b"hello ")).await.unwrap();
     drop(tx1);
     let etag1 = store
-        .upload_part_streaming("blob", &id, 1, 6, rx1)
+        .upload_part("blob", &id, 1, 6, channel_stream(rx1))
         .await
         .unwrap();
 
@@ -581,7 +626,7 @@ async fn multipart_round_trip_assembles_object_from_parts() {
     tx2.send(Bytes::from_static(b"world")).await.unwrap();
     drop(tx2);
     let etag2 = store
-        .upload_part_streaming("blob", &id, 2, 5, rx2)
+        .upload_part("blob", &id, 2, 5, channel_stream(rx2))
         .await
         .unwrap();
 
@@ -624,6 +669,90 @@ async fn list_multipart_uploads_filters_by_prefix() {
         .unwrap();
     assert_eq!(page.uploads.len(), 1);
     assert_eq!(page.uploads[0].key, "repo-a/blob");
+}
+
+// =========================================================================
+// MultipartStore default methods: search_multipart_upload_id /
+// abort_pending_uploads
+// =========================================================================
+
+#[tokio::test]
+async fn search_multipart_upload_id_finds_active_upload() {
+    let store = Arc::new(MockBackend::default());
+    let key = "repo/blob";
+    let created_id = store.create_multipart(key).await.unwrap();
+
+    let found = store
+        .search_multipart_upload_id(key)
+        .await
+        .unwrap()
+        .expect("upload we just created must be found");
+    assert_eq!(found, created_id);
+
+    store.abort_multipart(key, &created_id).await.unwrap();
+}
+
+#[tokio::test]
+async fn search_multipart_upload_id_returns_none_when_absent() {
+    let store = Arc::new(MockBackend::default());
+    let result = store
+        .search_multipart_upload_id("no/such/key")
+        .await
+        .unwrap();
+    assert!(result.is_none());
+}
+
+/// The target key appears on the second page of `list_multipart_uploads`.
+/// `search_multipart_upload_id` must follow the pagination cursor until it
+/// finds the key rather than giving up after the first page.
+#[tokio::test]
+async fn search_multipart_upload_id_follows_pagination_to_second_page() {
+    // Page size of 1 forces the second key onto its own page.
+    let store = Arc::new(MockBackend::with_multipart_page_size(1));
+
+    // "repo/aaa" sorts before "repo/zzz"; with page_size=1 the first page
+    // only contains "repo/aaa", so "repo/zzz" lives on page 2.
+    let _id_first = store.create_multipart("repo/aaa").await.unwrap();
+    let id_second = store.create_multipart("repo/zzz").await.unwrap();
+
+    let found = store
+        .search_multipart_upload_id("repo/zzz")
+        .await
+        .unwrap()
+        .expect("key on second page must still be found");
+    assert_eq!(found, id_second);
+}
+
+#[tokio::test]
+async fn abort_pending_uploads_clears_multiple_sessions_for_same_key() {
+    let store = Arc::new(MockBackend::default());
+    let key = "repo/obj";
+
+    let id1 = store.create_multipart(key).await.unwrap();
+    let id2 = store.create_multipart(key).await.unwrap();
+
+    // Both sessions must be visible before aborting.
+    assert!(
+        store
+            .search_multipart_upload_id(key)
+            .await
+            .unwrap()
+            .is_some()
+    );
+
+    store.abort_pending_uploads(key).await.unwrap();
+
+    // Neither session should remain.
+    assert!(
+        store
+            .search_multipart_upload_id(key)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    // Aborting already-gone ids must not error (idempotent).
+    store.abort_multipart(key, &id1).await.unwrap();
+    store.abort_multipart(key, &id2).await.unwrap();
 }
 
 // =========================================================================

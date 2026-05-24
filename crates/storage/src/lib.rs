@@ -38,7 +38,7 @@ use tokio::io::AsyncRead;
 
 pub use crate::conditional::ConditionalStore;
 pub use crate::error::Error;
-pub use crate::multipart::MultipartStore;
+pub use crate::multipart::{ByteStream, MultipartStore, channel_stream};
 pub use crate::object::ObjectStore;
 pub use crate::presigned::PresignedStore;
 pub use crate::types::{

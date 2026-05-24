@@ -12,11 +12,10 @@ use std::{sync::Arc, time::Duration};
 use angos_s3_client::{Backend as S3Backend, UploadedPart};
 use async_trait::async_trait;
 use bytes::Bytes;
-use tokio::sync::mpsc;
 
 use crate::{
-    BoxedReader, ChildrenPage, ConditionalStore, Error, Etag, MultipartPage, MultipartStore,
-    MultipartUpload, ObjectMeta, ObjectStore, Page, Part, PresignedStore, UploadId,
+    BoxedReader, ByteStream, ChildrenPage, ConditionalStore, Error, Etag, MultipartPage,
+    MultipartStore, MultipartUpload, ObjectMeta, ObjectStore, Page, Part, PresignedStore, UploadId,
 };
 
 /// Builder for [`Backend`].
@@ -187,17 +186,17 @@ impl MultipartStore for Backend {
         Ok(UploadId::new(id))
     }
 
-    async fn upload_part_streaming(
+    async fn upload_part(
         &self,
         key: &str,
         id: &UploadId,
         part_number: u32,
         content_length: u64,
-        rx: mpsc::Receiver<Bytes>,
+        body: ByteStream,
     ) -> Result<Etag, Error> {
         let etag = self
             .client
-            .upload_part_streaming(key, id.as_str(), part_number, content_length, rx)
+            .upload_part_streaming(key, id.as_str(), part_number, content_length, body)
             .await?;
         Ok(Etag::new(etag))
     }

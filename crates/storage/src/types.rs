@@ -70,9 +70,16 @@ impl Display for UploadId {
 ///
 /// `part_number` is 1-based and dense within a single upload; gaps cause
 /// `complete_multipart` to fail.
+///
+/// The `etag` field accepts the legacy key `e_tag` on deserialisation (written
+/// by binaries before the `angos_s3_client::UploadedPart` → `angos_storage::Part`
+/// rename) so in-flight cache entries survive an upgrade without paying the
+/// `list_parts` re-discovery cost. On serialisation the canonical key `etag`
+/// is always written.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct Part {
     pub part_number: u32,
+    #[serde(alias = "e_tag")]
     pub etag: Etag,
     pub size: u64,
 }
@@ -185,6 +192,41 @@ mod tests {
         let json = serde_json::to_string(&part).expect("serialize");
         let parsed: Part = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(parsed, part);
+    }
+
+    #[test]
+    fn part_deserializes_legacy_e_tag_key() {
+        // Legacy cache entries (written before the
+        // `angos_s3_client::UploadedPart` → `angos_storage::Part` rename) use
+        // the key `e_tag`. The `#[serde(alias = "e_tag")]` on `Part::etag`
+        // ensures those entries round-trip without triggering a `list_parts`
+        // re-discovery pass.
+        let legacy_json = r#"{"part_number": 1, "e_tag": "abc", "size": 5}"#;
+        let part: Part = serde_json::from_str(legacy_json).expect("deserialize legacy shape");
+        assert_eq!(part.etag.as_str(), "abc");
+        assert_eq!(part.part_number, 1);
+        assert_eq!(part.size, 5);
+    }
+
+    #[test]
+    fn part_serializes_with_canonical_etag_key() {
+        // Confirm that fresh writes use `etag`, not the legacy `e_tag`, so the
+        // new canonical key is what gets stored in the cache post-upgrade.
+        let part = Part {
+            part_number: 1,
+            etag: Etag::new("abc"),
+            size: 5,
+        };
+        let value = serde_json::to_value(&part).expect("serialize");
+        assert!(
+            value.get("etag").is_some(),
+            "expected canonical key `etag` in serialized output"
+        );
+        assert!(
+            value.get("e_tag").is_none(),
+            "legacy key `e_tag` must not appear in serialized output"
+        );
+        assert_eq!(value["etag"], "abc");
     }
 
     #[test]

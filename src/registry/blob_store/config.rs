@@ -36,7 +36,7 @@ impl BlobStorageConfig {
     pub fn to_backend(&self, cache: Option<Arc<Cache>>) -> Result<BlobStoreHandles, Error> {
         match self {
             BlobStorageConfig::FS(config) => {
-                let backend = Arc::new(fs::Backend::new(config));
+                let backend = Arc::new(fs::Backend::new(config)?);
                 Ok(BlobStoreHandles {
                     blob_store: backend.clone(),
                     upload_store: backend.clone(),

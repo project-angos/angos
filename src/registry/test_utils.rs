@@ -19,6 +19,7 @@ use crate::{
     secret::Secret,
 };
 use angos_s3_client as s3_client;
+use angos_storage::ObjectStore;
 
 pub fn create_test_repositories() -> Arc<HashMap<String, Repository>> {
     metrics_provider::init_for_tests();
@@ -151,12 +152,13 @@ impl FSRegistryTestCase {
         let temp_dir = TempDir::new().expect("Failed to create temp dir for FSBackendConfig");
         let path = temp_dir.path().to_string_lossy().to_string();
 
-        let blob_store = Arc::new(blob_store::fs::Backend::new(
-            &blob_store::fs::BackendConfig {
+        let blob_store = Arc::new(
+            blob_store::fs::Backend::new(&blob_store::fs::BackendConfig {
                 root_dir: path.clone(),
                 sync_to_disk: false,
-            },
-        ));
+            })
+            .unwrap(),
+        );
 
         let metadata_store = Arc::new(
             metadata_store::fs::BackendConfig {

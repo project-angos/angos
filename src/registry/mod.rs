@@ -11,7 +11,6 @@ mod error;
 #[cfg(test)]
 mod event_emission_tests;
 mod ext;
-mod fs_ops;
 mod headers;
 pub mod job_store;
 pub mod manifest;

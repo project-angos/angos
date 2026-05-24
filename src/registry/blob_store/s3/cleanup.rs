@@ -2,11 +2,11 @@ use async_trait::async_trait;
 use chrono::{DateTime, Duration, Utc};
 use tracing::instrument;
 
-use super::Backend;
 use crate::registry::{
-    blob_store::{Error, MultipartCleanup, OrphanMultipartUpload},
+    blob_store::{Error, MultipartCleanup, OrphanMultipartUpload, s3::Backend},
     path_builder,
 };
+use angos_storage::{MultipartStore, ObjectStore, UploadId};
 
 /// Inverse of [`path_builder::upload_path`]: parses
 /// `v2/repositories/{namespace}/_uploads/{uuid}/data` into `(namespace, uuid)`.
@@ -41,12 +41,12 @@ impl MultipartCleanup for Backend {
         let mut upload_id_marker: Option<String> = None;
 
         loop {
-            let (uploads, next_key, next_upload_id) = self
+            let page = self
                 .store
                 .list_multipart_uploads(None, key_marker.as_deref(), upload_id_marker.as_deref())
                 .await?;
 
-            for upload in uploads {
+            for upload in page.uploads {
                 if !is_orphan(upload.initiated_at, now, timeout) {
                     continue;
                 }
@@ -54,20 +54,20 @@ impl MultipartCleanup for Backend {
                     continue;
                 };
                 let startedat_path = path_builder::upload_start_date_path(namespace, uuid);
-                if self.store.object_size(&startedat_path).await.is_ok() {
+                if self.store.head(&startedat_path).await.is_ok() {
                     continue;
                 }
                 orphans.push(OrphanMultipartUpload {
                     key: upload.key,
-                    upload_id: upload.upload_id,
+                    upload_id: upload.upload_id.into_inner(),
                 });
             }
 
-            if next_key.is_none() {
+            if page.next_key_marker.is_none() {
                 break;
             }
-            key_marker = next_key;
-            upload_id_marker = next_upload_id;
+            key_marker = page.next_key_marker;
+            upload_id_marker = page.next_upload_id_marker;
         }
 
         Ok(orphans)
@@ -77,8 +77,9 @@ impl MultipartCleanup for Backend {
         &self,
         upload: &OrphanMultipartUpload,
     ) -> Result<(), Error> {
+        let id = UploadId::new(&upload.upload_id);
         self.store
-            .abort_multipart_upload(&upload.key, &upload.upload_id)
+            .abort_multipart(&upload.key, &id)
             .await
             .map_err(Error::from)
     }

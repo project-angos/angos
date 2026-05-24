@@ -287,10 +287,13 @@ mod tests {
     }
 
     fn make_fs_backends(path: &str) -> (Arc<BlobBackend>, Arc<MetaBackend>) {
-        let blob = Arc::new(BlobBackend::new(&BlobBackendConfig {
-            root_dir: path.to_string(),
-            sync_to_disk: false,
-        }));
+        let blob = Arc::new(
+            BlobBackend::new(&BlobBackendConfig {
+                root_dir: path.to_string(),
+                sync_to_disk: false,
+            })
+            .unwrap(),
+        );
         let meta = Arc::new(
             MetaBackendConfig {
                 root_dir: path.to_string(),

@@ -1,6 +1,7 @@
-use std::io::{Cursor, Error as IoError};
+use std::io::Cursor;
 
 use bytes::{Bytes, BytesMut};
+use futures_util::stream;
 use tokio::{
     io::{AsyncRead, AsyncReadExt},
     sync::mpsc,
@@ -8,18 +9,24 @@ use tokio::{
 use tokio_util::task::AbortOnDropHandle;
 use tracing::{instrument, warn};
 
-use super::multipart_helpers::{
-    UploadMode, next_part_number, uploaded_size as total_uploaded_size,
-};
-use super::{
-    Backend, FRAME_BUFFER_CAPACITY, FRAME_SIZE, MIN_PART_SIZE, S3UploadState, UploadedPart,
-};
 use crate::{
     oci::Digest,
     registry::{
-        blob_store::{Error, hashing_reader::HashingReader},
+        blob_store::{
+            Error,
+            hashing_reader::HashingReader,
+            s3::{
+                Backend, FRAME_BUFFER_CAPACITY, FRAME_SIZE, MIN_PART_SIZE, S3UploadState,
+                multipart_helpers::{
+                    UploadMode, next_part_number, uploaded_size as total_uploaded_size,
+                },
+            },
+        },
         path_builder,
     },
+};
+use angos_storage::{
+    Error as StorageError, Etag, MultipartStore, ObjectStore, Part, UploadId, channel_stream,
 };
 
 struct FlushContext<'a> {
@@ -38,14 +45,14 @@ struct BufferContext<'a> {
     pending_size: u64,
 }
 
-type StreamingUploadHandle = AbortOnDropHandle<Result<String, IoError>>;
+type StreamingUploadHandle = AbortOnDropHandle<Result<Etag, StorageError>>;
 
 impl Backend {
     pub async fn resolve_nonuniform_state(
         &self,
         name: &str,
         uuid: &str,
-    ) -> Result<(String, Vec<UploadedPart>, u64, u64), Error> {
+    ) -> Result<(String, Vec<Part>, u64, u64), Error> {
         let upload_path = path_builder::upload_path(name, uuid);
         if let Some(S3UploadState {
             multipart_upload_id: Some(id),
@@ -60,16 +67,13 @@ impl Backend {
         let (id, parts) = self.ensure_multipart_upload(&upload_path).await?;
         let uploaded = total_uploaded_size(&parts);
         let pending_path = path_builder::upload_patch_pending_path(name, uuid);
-        let pending = self.store.object_size(&pending_path).await.unwrap_or(0);
+        let pending = self.store.head(&pending_path).await.map_or(0, |m| m.size);
         Ok((id, parts, uploaded, pending))
     }
 
     async fn load_pending_bytes(&self, pending_path: &str, pending_size: u64) -> Vec<u8> {
         if pending_size > 0 {
-            self.store
-                .get_object_body(pending_path, None)
-                .await
-                .unwrap_or_default()
+            self.store.get(pending_path).await.unwrap_or_default()
         } else {
             Vec::new()
         }
@@ -83,12 +87,19 @@ impl Backend {
 
         let store = self.store.clone();
         let upload_path = ctx.upload_path.to_string();
-        let upload_id = ctx.upload_id.to_string();
+        let upload_id_str = ctx.upload_id.to_string();
         let part_number = ctx.part_number;
         let available = ctx.available;
         let upload_handle = AbortOnDropHandle::new(tokio::spawn(async move {
+            let id = UploadId::new(&upload_id_str);
             store
-                .upload_part_streaming(&upload_path, &upload_id, part_number, available, rx)
+                .upload_part(
+                    &upload_path,
+                    &id,
+                    part_number,
+                    available,
+                    channel_stream(rx),
+                )
                 .await
         }));
 
@@ -187,7 +198,7 @@ impl Backend {
         }
 
         if ctx.pending_size > 0 {
-            self.store.delete_object(ctx.pending_path).await?;
+            self.store.delete(ctx.pending_path).await?;
         }
 
         let new_size = ctx.uploaded_size + ctx.available;
@@ -223,9 +234,7 @@ impl Backend {
             return Ok((digest, new_logical));
         }
 
-        self.store
-            .put_object(ctx.pending_path, Bytes::from(buf))
-            .await?;
+        self.store.put(ctx.pending_path, Bytes::from(buf)).await?;
 
         self.save_hasher(name, uuid, new_logical, hashing_reader.serialized_state())
             .await?;
@@ -303,7 +312,7 @@ impl Backend {
         let uploaded = total_uploaded_size(&parts);
 
         let pending_path = path_builder::upload_patch_pending_path(name, uuid);
-        let pending_size = self.store.object_size(&pending_path).await.unwrap_or(0);
+        let pending_size = self.store.head(&pending_path).await.map_or(0, |m| m.size);
 
         let state = S3UploadState {
             size: uploaded + pending_size,
@@ -337,22 +346,26 @@ impl Backend {
         let mut uploaded_size = total_uploaded_size(&parts);
 
         let pending_path = path_builder::upload_patch_pending_path(name, uuid);
-        let pending_size = self.store.object_size(&pending_path).await.unwrap_or(0);
+        let pending_size = self.store.head(&pending_path).await.map_or(0, |m| m.size);
         if pending_size > 0 {
-            let pending_data = self.store.get_object_body(&pending_path, None).await?;
+            let pending_data = self.store.get(&pending_path).await?;
             let next_part = next_part_number(parts.len())?;
-            let e_tag = self
+            let id = UploadId::new(&upload_id);
+            let data = Bytes::from(pending_data);
+            let len = u64::try_from(data.len())?;
+            let etag = self
                 .store
                 .upload_part(
                     &upload_path,
-                    &upload_id,
+                    &id,
                     next_part,
-                    Bytes::from(pending_data),
+                    len,
+                    Box::pin(stream::once(async move { Ok(data) })),
                 )
                 .await?;
-            parts.push(UploadedPart {
+            parts.push(Part {
                 part_number: next_part,
-                e_tag,
+                etag,
                 size: pending_size,
             });
             uploaded_size += pending_size;

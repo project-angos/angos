@@ -23,6 +23,12 @@ use tokio::{fs, io::AsyncSeekExt, task::spawn_blocking};
 
 use crate::{BoxedReader, ChildrenPage, Error, ObjectMeta, ObjectStore, Page};
 
+/// Page step used by [`Backend::list_all_children`] when draining all pages
+/// of a directory listing. 512 is large enough to complete most namespaces in
+/// a single round-trip while staying well within the OS read-dir buffer limits.
+/// It is an internal implementation detail and is not user-tuneable.
+const LIST_ALL_CHILDREN_PAGE_SIZE: u16 = 512;
+
 /// Builder for [`Backend`].
 pub struct Builder {
     root: Option<PathBuf>,
@@ -82,13 +88,143 @@ impl Backend {
     fn full_path(&self, key: &str) -> PathBuf {
         self.root.join(key)
     }
+
+    /// Atomically rename the object at `from_key` to `to_key`, creating
+    /// the destination's parent directories as needed.
+    ///
+    /// This is a zero-copy operation on the same filesystem. It is intentionally
+    /// not on the [`ObjectStore`] trait because S3 has no cheap rename.
+    ///
+    /// # Errors
+    /// Returns [`Error::NotFound`] when `from_key` does not exist.
+    pub async fn rename(&self, from_key: &str, to_key: &str) -> Result<(), Error> {
+        let from = self.full_path(from_key);
+        let to = self.full_path(to_key);
+        ensure_parent(&to).await?;
+        fs::rename(&from, &to).await?;
+        Ok(())
+    }
+
+    /// Open `key` for writing, optionally in append mode.
+    ///
+    /// When `append` is `true` the file is opened with `O_APPEND`; when
+    /// `false` the file is truncated and overwritten. The parent directory is
+    /// created if it does not exist.
+    ///
+    /// Returns the open file handle and the file's size **before** the open,
+    /// so callers that need to track the write offset can do so without a
+    /// separate `head` call.
+    ///
+    /// # Errors
+    /// Returns [`Error::NotFound`] when the file does not exist and `append`
+    /// is `true`.
+    pub async fn open_for_write(&self, key: &str, append: bool) -> Result<(fs::File, u64), Error> {
+        let path = self.full_path(key);
+        ensure_parent(&path).await?;
+        if append {
+            let file = fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+                .await
+                .map_err(|e| classify_open_error(&e, &path))?;
+            let size = file.metadata().await?.len();
+            Ok((file, size))
+        } else {
+            let file = fs::File::create(&path)
+                .await
+                .map_err(|e| classify_open_error(&e, &path))?;
+            Ok((file, 0))
+        }
+    }
+
+    /// Best-effort cleanup of empty ancestor directories after a leaf
+    /// deletion.
+    ///
+    /// Walks **at most `max_levels`** parents upward from the directory
+    /// component of `key`, removing each one only while it is empty. The
+    /// walk stops at the first non-empty parent, at `root_dir` (exclusive),
+    /// or as soon as it would leave the `root_dir` subtree.
+    ///
+    /// Errors are suppressed — this is a best-effort tidy-up, not a
+    /// load-bearing step.
+    pub async fn prune_empty_ancestors(&self, key: &str, max_levels: u8) {
+        let start = self.full_path(key);
+        let root = &self.root;
+        let mut current = start.parent();
+        for _ in 0..max_levels {
+            let Some(parent) = current else { break };
+            if parent == root || !parent.starts_with(root) {
+                break;
+            }
+            let Ok(mut entries) = fs::read_dir(parent).await else {
+                break;
+            };
+            match entries.next_entry().await {
+                Ok(Some(_)) | Err(_) => break,
+                Ok(None) => {}
+            }
+            // Race-safe: ENOTEMPTY means another writer recreated an entry.
+            if fs::remove_dir(parent).await.is_err() {
+                break;
+            }
+            current = parent.parent();
+        }
+    }
+
+    /// Enumerate every immediate child name under `prefix`, looping through
+    /// all pages internally until `next_token` is `None`.
+    ///
+    /// Returns separate lists of sub-prefix names and object names,
+    /// both sorted lexicographically. A missing or empty directory yields
+    /// empty lists without an error.
+    ///
+    /// Use this instead of a single `list_children` call whenever you need
+    /// complete enumeration and the number of children is unbounded.
+    ///
+    /// # Errors
+    /// Propagates any I/O error from the underlying directory reads.
+    pub async fn list_all_children(
+        &self,
+        prefix: &str,
+    ) -> Result<(Vec<String>, Vec<String>), Error> {
+        let mut all_sub_prefixes: Vec<String> = Vec::new();
+        let mut all_objects: Vec<String> = Vec::new();
+        let mut token: Option<String> = None;
+
+        loop {
+            let page = self
+                .list_children(prefix, LIST_ALL_CHILDREN_PAGE_SIZE, token, None)
+                .await?;
+            all_sub_prefixes.extend(page.sub_prefixes);
+            all_objects.extend(page.objects);
+            token = page.next_token;
+            if token.is_none() {
+                break;
+            }
+        }
+
+        all_sub_prefixes.sort();
+        all_objects.sort();
+        Ok((all_sub_prefixes, all_objects))
+    }
 }
 
+/// Create all parent directories of `path`.
 async fn ensure_parent(path: &Path) -> Result<(), Error> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).await?;
     }
     Ok(())
+}
+
+/// Map a file-open error to an [`Error`], logging the full path for diagnostics.
+fn classify_open_error(error: &io::Error, path: &Path) -> Error {
+    if error.kind() == ErrorKind::NotFound {
+        Error::NotFound
+    } else {
+        Error::Backend(format!("could not open {}: {error}", path.display()))
+    }
 }
 
 async fn atomic_write(target: &Path, data: Bytes, sync: bool) -> Result<(), Error> {
