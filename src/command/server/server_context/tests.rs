@@ -1,4 +1,4 @@
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{collections::HashMap, str::FromStr, sync::Arc, time::Duration};
 
 use argon2::{
     Algorithm, Argon2, Params, PasswordHasher, Version,
@@ -23,9 +23,18 @@ use crate::{
     },
     identity::{Action, ClientIdentity},
     metrics_provider,
-    oci::{Namespace, Reference},
+    oci::{Digest, Namespace, Reference},
     policy::AccessPolicyConfig,
-    registry::{Registry, RegistryConfig, Repository, repository_resolver::RepositoryResolver},
+    registry::{
+        Registry, RegistryConfig, Repository,
+        blob_store::{BlobStorageConfig, fs::BackendConfig as BlobFsConfig},
+        metadata_store::{
+            LinkOperation, LockStrategy, MetadataStore, link_kind::LinkKind,
+            s3::BackendConfig as MetadataS3Config,
+        },
+        repository_resolver::RepositoryResolver,
+        s3_connection::S3ConnectionConfig,
+    },
     secret::Secret,
 };
 
@@ -867,63 +876,39 @@ async fn test_server_context_shutdown_rejects_new_async_dispatches() {
     );
 }
 
-#[tokio::test]
-async fn test_shutdown_flushes_pending_access_times() {
-    // This test verifies that shutdown_with_timeout() flushes buffered access time
-    // writes from the S3 metadata backend before returning.
-    //
-    // When access_time_debounce_secs > 0, the S3 backend defers access time writes
-    // to a background loop. On shutdown, those pending writes would be lost unless
-    // shutdown_with_timeout() explicitly triggers a flush.
-    //
-    // Requires MinIO on http://127.0.0.1:9000 (run: docker-compose up -d)
-    use std::str::FromStr;
+struct ShutdownFlushHarness {
+    registry: Registry,
+    metadata_store: Arc<dyn MetadataStore + Send + Sync>,
+    namespace: String,
+}
 
-    use crate::{
-        oci::Digest,
-        registry::{
-            RegistryConfig,
-            blob_store::{self, fs},
-            metadata_store::{
-                LinkOperation, MetadataStore, link_kind::LinkKind, s3::BackendConfig,
-            },
+fn build_shutdown_flush_harness(unique_prefix: &str) -> ShutdownFlushHarness {
+    let s3_config = MetadataS3Config {
+        connection: S3ConnectionConfig {
+            access_key_id: Secret::new("root".to_string()),
+            secret_key: Secret::new("roottoor".to_string()),
+            endpoint: "http://127.0.0.1:9000".to_string(),
+            bucket: "registry".to_string(),
+            region: "region".to_string(),
+            key_prefix: unique_prefix.to_string(),
         },
-    };
-
-    let unique_prefix = format!("test-shutdown-flush-{}", Uuid::new_v4());
-    let namespace = format!("{unique_prefix}/myimage");
-
-    let s3_config = BackendConfig {
-        access_key_id: Secret::new("root".to_string()),
-        secret_key: Secret::new("roottoor".to_string()),
-        endpoint: "http://127.0.0.1:9000".to_string(),
-        bucket: "registry".to_string(),
-        region: "region".to_string(),
-        key_prefix: unique_prefix.clone(),
-        lock_strategy: crate::registry::metadata_store::LockStrategy::Memory,
+        lock_strategy: LockStrategy::Memory,
         link_cache_ttl: 0,
         access_time_debounce_secs: 3600,
         capabilities: None,
     };
+    let metadata_store: Arc<dyn MetadataStore + Send + Sync> = Arc::new(
+        s3_config
+            .to_backend(None, None)
+            .expect("s3 metadata backend"),
+    );
 
-    let metadata_backend = s3_config
-        .to_backend(None, None)
-        .expect("s3 metadata backend");
-    let metadata_store: Arc<dyn MetadataStore + Send + Sync> = Arc::new(metadata_backend);
-
-    let blob_store_config = blob_store::BlobStorageConfig::FS(fs::BackendConfig {
+    let blob_handles = BlobStorageConfig::FS(BlobFsConfig {
         root_dir: "/tmp/test-blobs-shutdown-flush".to_string(),
         ..Default::default()
-    });
-    let blob_handles = blob_store_config.to_backend(None).unwrap();
-
-    let registry_config = RegistryConfig::default()
-        .update_pull_time(false)
-        .enable_blob_redirect(false)
-        .enable_manifest_redirect(false)
-        .concurrent_cache_jobs(4)
-        .global_immutable_tags(false)
-        .global_immutable_tags_exclusions(Vec::new());
+    })
+    .to_backend(None)
+    .unwrap();
 
     let registry = Registry::new(
         blob_handles.blob_store,
@@ -931,9 +916,35 @@ async fn test_shutdown_flushes_pending_access_times() {
         blob_handles.presigned_store,
         metadata_store.clone(),
         Arc::new(RepositoryResolver::new(Arc::new(HashMap::new())).unwrap()),
-        registry_config,
+        RegistryConfig::default()
+            .update_pull_time(false)
+            .enable_blob_redirect(false)
+            .enable_manifest_redirect(false)
+            .concurrent_cache_jobs(4)
+            .global_immutable_tags(false)
+            .global_immutable_tags_exclusions(Vec::new()),
     )
     .unwrap();
+
+    ShutdownFlushHarness {
+        registry,
+        metadata_store,
+        namespace: format!("{unique_prefix}/myimage"),
+    }
+}
+
+#[tokio::test]
+async fn test_shutdown_flushes_pending_access_times() {
+    // shutdown_with_timeout() must flush the S3 metadata backend's buffered
+    // access-time writes before returning. With access_time_debounce_secs > 0
+    // those writes sit in a background loop and would be lost on a naïve
+    // shutdown. Requires MinIO on http://127.0.0.1:9000.
+    let unique_prefix = format!("test-shutdown-flush-{}", Uuid::new_v4());
+    let ShutdownFlushHarness {
+        registry,
+        metadata_store,
+        namespace,
+    } = build_shutdown_flush_harness(&unique_prefix);
 
     let digest =
         Digest::from_str("sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
@@ -947,7 +958,6 @@ async fn test_shutdown_flushes_pending_access_times() {
         descriptor: None,
     }];
     metadata_store.update_links(&namespace, &ops).await.unwrap();
-
     metadata_store
         .read_link(&namespace, &tag, true)
         .await
@@ -979,9 +989,8 @@ async fn test_shutdown_flushes_pending_access_times() {
         update_pull_time = false
         max_concurrent_cache_jobs = 10
     "#;
-    let config: crate::configuration::Configuration = toml::from_str(toml).unwrap();
+    let config: Configuration = toml::from_str(toml).unwrap();
     let context = ServerContext::new(&config, registry).unwrap();
-
     context.shutdown_with_timeout(Duration::from_secs(10)).await;
 
     let after = metadata_store

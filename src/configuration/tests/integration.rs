@@ -396,7 +396,7 @@ fn test_metadata_store_s3_with_redis() {
 
     match metadata_config {
         metadata_store::MetadataStoreConfig::S3(s3_config) => {
-            assert_eq!(s3_config.bucket, "metadata-bucket");
+            assert_eq!(s3_config.connection.bucket, "metadata-bucket");
             match &s3_config.lock_strategy {
                 metadata_store::LockStrategy::Redis(lock_config) => {
                     assert_eq!(lock_config.url, "redis://localhost:6379");
@@ -746,7 +746,7 @@ fn test_metadata_store_s3_lock_strategy_s3_defaults() {
 
     match metadata_config {
         metadata_store::MetadataStoreConfig::S3(s3_config) => {
-            assert_eq!(s3_config.bucket, "metadata-bucket");
+            assert_eq!(s3_config.connection.bucket, "metadata-bucket");
             match &s3_config.lock_strategy {
                 metadata_store::LockStrategy::S3(lock_config) => {
                     assert_eq!(lock_config.ttl_secs, 30);

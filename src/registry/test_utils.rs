@@ -15,10 +15,10 @@ use crate::{
         metadata_store,
         metadata_store::{LinkOperation, MetadataStore, link_kind::LinkKind},
         repository_resolver::RepositoryResolver,
+        s3_connection::S3ConnectionConfig,
     },
     secret::Secret,
 };
-use angos_s3_client as s3_client;
 use angos_storage::ObjectStore;
 
 pub fn create_test_repositories() -> Arc<HashMap<String, Repository>> {
@@ -235,29 +235,35 @@ impl S3RegistryTestCase {
         let key_prefix = format!("test-{}", Uuid::new_v4());
 
         let blob_store = Arc::new(
-            blob_store::s3::Backend::new(&s3_client::BackendConfig {
-                access_key_id: "root".to_string(),
-                secret_key: "roottoor".to_string(),
-                endpoint: "http://127.0.0.1:9000".to_string(),
-                region: "region".to_string(),
-                bucket: "registry".to_string(),
-                key_prefix: key_prefix.clone(),
-                multipart_copy_threshold: ByteSize::mib(5),
-                multipart_copy_chunk_size: ByteSize::mib(5),
-                multipart_part_size: ByteSize::mib(5),
-                ..Default::default()
+            blob_store::s3::Backend::new(&blob_store::s3::BackendConfig {
+                connection: S3ConnectionConfig {
+                    access_key_id: Secret::new("root".to_string()),
+                    secret_key: Secret::new("roottoor".to_string()),
+                    endpoint: "http://127.0.0.1:9000".to_string(),
+                    region: "region".to_string(),
+                    bucket: "registry".to_string(),
+                    key_prefix: key_prefix.clone(),
+                },
+                transport: blob_store::s3::TransportFields {
+                    multipart_copy_threshold: ByteSize::mib(5),
+                    multipart_copy_chunk_size: ByteSize::mib(5),
+                    multipart_part_size: ByteSize::mib(5),
+                    ..blob_store::s3::TransportFields::default()
+                },
             })
             .unwrap(),
         );
 
         let metadata_store = Arc::new(
             metadata_store::s3::BackendConfig {
-                access_key_id: Secret::new("root".to_string()),
-                secret_key: Secret::new("roottoor".to_string()),
-                endpoint: "http://127.0.0.1:9000".to_string(),
-                region: "region".to_string(),
-                bucket: "registry".to_string(),
-                key_prefix: key_prefix.clone(),
+                connection: S3ConnectionConfig {
+                    access_key_id: Secret::new("root".to_string()),
+                    secret_key: Secret::new("roottoor".to_string()),
+                    endpoint: "http://127.0.0.1:9000".to_string(),
+                    region: "region".to_string(),
+                    bucket: "registry".to_string(),
+                    key_prefix: key_prefix.clone(),
+                },
                 lock_strategy: metadata_store::LockStrategy::Memory,
                 link_cache_ttl: 0,
                 access_time_debounce_secs: 0,

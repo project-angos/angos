@@ -30,7 +30,7 @@ async fn test_rebuild_namespace_registry_includes_upload_only_namespace() {
 
     backend
         .store()
-        .delete_prefix(&config.key_prefix)
+        .delete_prefix(&config.connection.key_prefix)
         .await
         .unwrap();
 }
@@ -64,7 +64,7 @@ async fn test_list_namespaces_falls_back_to_legacy_namespace_registry() {
 
     backend
         .store()
-        .delete_prefix(&config.key_prefix)
+        .delete_prefix(&config.connection.key_prefix)
         .await
         .unwrap();
 }
@@ -121,7 +121,7 @@ async fn test_migrate_namespace_registry_rebuilds_shards_and_removes_legacy() {
 
     backend
         .store()
-        .delete_prefix(&config.key_prefix)
+        .delete_prefix(&config.connection.key_prefix)
         .await
         .unwrap();
 }

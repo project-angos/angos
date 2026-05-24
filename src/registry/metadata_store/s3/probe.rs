@@ -169,9 +169,12 @@ mod tests {
 
     use crate::{
         metrics_provider,
-        registry::metadata_store::{
-            LockStrategy,
-            s3::{BackendConfig, probe_conditional_capabilities},
+        registry::{
+            metadata_store::{
+                LockStrategy,
+                s3::{BackendConfig, probe_conditional_capabilities},
+            },
+            s3_connection::S3ConnectionConfig,
         },
         secret::Secret,
     };
@@ -183,12 +186,14 @@ mod tests {
     fn test_config() -> BackendConfig {
         metrics_provider::init_for_tests();
         BackendConfig {
-            access_key_id: Secret::new("root".to_string()),
-            secret_key: Secret::new("roottoor".to_string()),
-            endpoint: "http://127.0.0.1:9000".to_string(),
-            region: "region".to_string(),
-            bucket: "registry".to_string(),
-            key_prefix: format!("test-probe-{}", uuid::Uuid::new_v4()),
+            connection: S3ConnectionConfig {
+                access_key_id: Secret::new("root".to_string()),
+                secret_key: Secret::new("roottoor".to_string()),
+                endpoint: "http://127.0.0.1:9000".to_string(),
+                region: "region".to_string(),
+                bucket: "registry".to_string(),
+                key_prefix: format!("test-probe-{}", uuid::Uuid::new_v4()),
+            },
             lock_strategy: LockStrategy::Memory,
             link_cache_ttl: 0,
             access_time_debounce_secs: 0,
@@ -197,7 +202,7 @@ mod tests {
     }
 
     fn storage_for(config: &BackendConfig) -> StorageS3Backend {
-        let http = s3_client::Backend::new(&config.to_data_store_config()).unwrap();
+        let http = s3_client::Backend::new(&config.connection.to_client_config()).unwrap();
         StorageS3Backend::builder()
             .client(Arc::new(http))
             .build()
@@ -205,7 +210,7 @@ mod tests {
     }
 
     fn storage_for_bucket(config: &BackendConfig, bucket: &str) -> StorageS3Backend {
-        let mut cfg = config.to_data_store_config();
+        let mut cfg = config.connection.to_client_config();
         cfg.bucket = bucket.to_string();
         let http = s3_client::Backend::new(&cfg).unwrap();
         StorageS3Backend::builder()

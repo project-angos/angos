@@ -300,7 +300,7 @@ async fn test_has_blob_references_ignores_empty_cas_shards() {
 
     backend
         .store()
-        .delete_prefix(&config.key_prefix)
+        .delete_prefix(&config.connection.key_prefix)
         .await
         .unwrap();
 }

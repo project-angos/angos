@@ -19,6 +19,7 @@ pub mod pagination;
 mod path_builder;
 pub mod repository;
 pub mod repository_resolver;
+pub mod s3_connection;
 pub mod task_queue;
 #[cfg(test)]
 pub mod test_utils;

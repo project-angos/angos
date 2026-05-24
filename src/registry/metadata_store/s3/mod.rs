@@ -54,7 +54,7 @@ impl BackendConfig {
             );
         }
 
-        let http = s3_client::Backend::new(&self.to_data_store_config())?;
+        let http = s3_client::Backend::new(&self.connection.to_client_config())?;
         let storage = Arc::new(StorageS3Backend::builder().client(Arc::new(http)).build()?);
 
         let coordinator = match &self.lock_strategy {

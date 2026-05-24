@@ -26,10 +26,11 @@ use crate::{
             ConditionalCapabilities, LockConfig, LockStrategy,
             lock::{self, LockBackend, MemoryBackend, s3::S3LockConfig},
         },
+        s3_connection::S3ConnectionConfig,
     },
     secret::Secret,
 };
-use angos_s3_client::{Backend as S3HttpBackend, BackendConfig as S3HttpConfig};
+use angos_s3_client::Backend as S3HttpBackend;
 use angos_storage::{ConditionalStore, ObjectStore, s3::Backend as StorageBackend};
 
 /// S3 job-queue configuration. Field shape matches
@@ -37,12 +38,7 @@ use angos_storage::{ConditionalStore, ObjectStore, s3::Backend as StorageBackend
 /// the same keys in both `[metadata_store.s3]` and `[global.job_queue.s3]`.
 #[derive(Clone, Debug, PartialEq)]
 pub struct BackendConfig {
-    pub access_key_id: Secret<String>,
-    pub secret_key: Secret<String>,
-    pub endpoint: String,
-    pub bucket: String,
-    pub region: String,
-    pub key_prefix: String,
+    pub connection: S3ConnectionConfig,
     /// Coordination strategy. `S3` (default) uses S3 conditional writes
     /// for both [`JobStore`] primitives and lease lifecycle. `Redis` /
     /// `Memory` fall back to `locked::Backend` + `lease::locked::Backend`,
@@ -73,12 +69,10 @@ fn default_region() -> String {
 impl Default for BackendConfig {
     fn default() -> Self {
         Self {
-            access_key_id: Secret::new(String::new()),
-            secret_key: Secret::new(String::new()),
-            endpoint: String::new(),
-            bucket: String::new(),
-            region: default_region(),
-            key_prefix: default_key_prefix(),
+            connection: S3ConnectionConfig {
+                key_prefix: default_key_prefix(),
+                ..S3ConnectionConfig::default()
+            },
             lock_strategy: LockStrategy::S3(S3LockConfig::default()),
             capabilities: None,
         }
@@ -86,6 +80,9 @@ impl Default for BackendConfig {
 }
 
 impl<'de> Deserialize<'de> for BackendConfig {
+    // Custom impl because `lock_strategy` needs `lock::resolve_lock_strategy`
+    // and `key_prefix` must default to `"_jobs"` (not the empty string that
+    // `S3ConnectionConfig` gives) to preserve existing operator deployments.
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: Deserializer<'de>,
@@ -120,12 +117,14 @@ impl<'de> Deserialize<'de> for BackendConfig {
         };
 
         Ok(BackendConfig {
-            access_key_id: raw.access_key_id,
-            secret_key: raw.secret_key,
-            endpoint: raw.endpoint,
-            bucket: raw.bucket,
-            region: raw.region,
-            key_prefix: raw.key_prefix,
+            connection: S3ConnectionConfig {
+                access_key_id: raw.access_key_id,
+                secret_key: raw.secret_key,
+                endpoint: raw.endpoint,
+                bucket: raw.bucket,
+                region: raw.region,
+                key_prefix: raw.key_prefix,
+            },
             lock_strategy,
             capabilities: raw.capabilities,
         })
@@ -133,21 +132,9 @@ impl<'de> Deserialize<'de> for BackendConfig {
 }
 
 impl BackendConfig {
-    fn to_data_store_config(&self) -> S3HttpConfig {
-        S3HttpConfig {
-            access_key_id: self.access_key_id.expose().clone(),
-            secret_key: self.secret_key.expose().clone(),
-            endpoint: self.endpoint.clone(),
-            bucket: self.bucket.clone(),
-            region: self.region.clone(),
-            key_prefix: self.key_prefix.clone(),
-            ..Default::default()
-        }
-    }
-
     /// Build the storage + lease backends for this S3 deployment.
     pub fn to_backends(&self) -> Result<JobBackends, Error> {
-        let http = S3HttpBackend::new(&self.to_data_store_config())
+        let http = S3HttpBackend::new(&self.connection.to_client_config())
             .map_err(|e| Error::Initialization(e.to_string()))?;
         let storage = Arc::new(
             StorageBackend::builder()
@@ -268,14 +255,70 @@ mod tests {
             path_builder,
             repository::{Config as RepositoryConfig, RegistryClientConfig},
             repository_resolver::RepositoryResolver,
+            s3_connection::S3ConnectionConfig,
         },
+        secret::Secret,
         util::sha256,
     };
-    use angos_s3_client::{Backend as S3HttpBackend, BackendConfig as S3HttpConfig};
+    use angos_s3_client::Backend as S3HttpBackend;
     use angos_storage::{ConditionalStore, s3::Backend as StorageBackend};
 
     const REPO_NAME: &str = "local";
     const NAMESPACE: &str = "local/cache-ns";
+
+    /// `[global.job_queue.s3]` round-trip: flat TOML deserialises into a
+    /// `BackendConfig` whose `connection` carries the right values.
+    #[test]
+    fn s3_backend_config_toml_round_trip() {
+        let toml = r#"
+            access_key_id = "job-key"
+            secret_key    = "job-secret"
+            endpoint      = "https://jobs.s3.example.com"
+            bucket        = "jobs-bucket"
+            region        = "ap-southeast-1"
+            key_prefix    = "_custom"
+        "#;
+
+        let cfg: super::BackendConfig = toml::from_str(toml).expect("deserialize");
+        assert_eq!(cfg.connection.access_key_id.expose(), "job-key");
+        assert_eq!(cfg.connection.secret_key.expose(), "job-secret");
+        assert_eq!(cfg.connection.endpoint, "https://jobs.s3.example.com");
+        assert_eq!(cfg.connection.bucket, "jobs-bucket");
+        assert_eq!(cfg.connection.region, "ap-southeast-1");
+        assert_eq!(cfg.connection.key_prefix, "_custom");
+    }
+
+    /// Regression: omitting `key_prefix` in `[global.job_queue.s3]` must
+    /// resolve to `"_jobs"` (not the empty `S3ConnectionConfig` default) so
+    /// existing operator deployments are not broken.
+    #[test]
+    fn s3_backend_config_key_prefix_defaults_to_jobs_when_absent() {
+        let toml = r#"
+            access_key_id = "job-key"
+            secret_key    = "job-secret"
+            endpoint      = "https://jobs.s3.example.com"
+            bucket        = "jobs-bucket"
+            region        = "us-east-1"
+        "#;
+
+        let cfg: super::BackendConfig = toml::from_str(toml).expect("deserialize");
+        assert_eq!(cfg.connection.key_prefix, "_jobs");
+    }
+
+    /// Regression: omitting `region` falls back to `default_region()`
+    /// (`"us-east-1"`), preserving the behaviour from before consolidation.
+    #[test]
+    fn s3_backend_config_region_defaults_to_us_east_1_when_absent() {
+        let toml = r#"
+            access_key_id = "job-key"
+            secret_key    = "job-secret"
+            endpoint      = "https://jobs.s3.example.com"
+            bucket        = "jobs-bucket"
+        "#;
+
+        let cfg: super::BackendConfig = toml::from_str(toml).expect("deserialize");
+        assert_eq!(cfg.connection.region, "us-east-1");
+    }
 
     /// Mirrors the body produced by `conditional::serialize_lease`. Re-defined
     /// here (rather than re-exported) so test-only fixtures stay test-local.
@@ -348,16 +391,16 @@ mod tests {
     /// and write fixtures directly into S3.
     fn test_backends(prefix: &str) -> (JobBackends, Arc<S3HttpBackend>) {
         metrics_provider::init_for_tests();
-        let config = S3HttpConfig {
-            access_key_id: "root".to_string(),
-            secret_key: "roottoor".to_string(),
+        let connection = S3ConnectionConfig {
+            access_key_id: Secret::new("root".to_string()),
+            secret_key: Secret::new("roottoor".to_string()),
             endpoint: "http://127.0.0.1:9000".to_string(),
             bucket: "registry".to_string(),
             region: "us-east-1".to_string(),
             key_prefix: format!("{prefix}{}_", Uuid::new_v4()),
-            ..Default::default()
         };
-        let http = Arc::new(S3HttpBackend::new(&config).expect("s3 client"));
+        let transport = connection.to_client_config();
+        let http = Arc::new(S3HttpBackend::new(&transport).expect("s3 client"));
         let storage: Arc<dyn ConditionalStore> = Arc::new(
             StorageBackend::builder()
                 .client(http.clone())

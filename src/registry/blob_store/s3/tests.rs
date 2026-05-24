@@ -5,22 +5,25 @@ use chrono::Duration;
 use sha2::{Digest as ShaDigest, Sha256};
 use uuid::Uuid;
 
-use crate::registry::{
-    blob_store::{
-        self, BlobStore, MultipartCleanup, OrphanMultipartUpload, UploadStore,
-        s3::multipart_helpers::{next_part_number, uploaded_size},
-        sha256_ext::Sha256Ext,
-        tests::{
-            test_build_blob_reader_returns_size,
-            test_build_blob_reader_with_offset_returns_full_size, test_datastore_blob_operations,
-            test_datastore_list_blobs, test_datastore_list_uploads,
-            test_datastore_upload_operations,
+use crate::{
+    registry::{
+        blob_store::{
+            self, BlobStore, MultipartCleanup, OrphanMultipartUpload, UploadStore,
+            s3::multipart_helpers::{next_part_number, uploaded_size},
+            sha256_ext::Sha256Ext,
+            tests::{
+                test_build_blob_reader_returns_size,
+                test_build_blob_reader_with_offset_returns_full_size,
+                test_datastore_blob_operations, test_datastore_list_blobs,
+                test_datastore_list_uploads, test_datastore_upload_operations,
+            },
         },
+        path_builder,
+        s3_connection::S3ConnectionConfig,
+        test_utils::S3RegistryTestCase,
     },
-    path_builder,
-    test_utils::S3RegistryTestCase,
+    secret::Secret,
 };
-use angos_s3_client as s3_client;
 use angos_storage::{Etag, MultipartStore, ObjectStore, Part};
 
 #[test]
@@ -55,6 +58,54 @@ fn uploaded_size_sums_completed_parts() {
     assert_eq!(uploaded_size(&parts), 13);
 }
 
+/// `[blob_store.s3]` round-trip: flat TOML deserialises into both the
+/// embedded `S3ConnectionConfig` and the `TransportFields` knobs.
+#[test]
+fn s3_backend_config_toml_round_trip() {
+    let toml = r#"
+        access_key_id             = "blob-key"
+        secret_key                = "blob-secret"
+        endpoint                  = "https://blob.s3.example.com"
+        bucket                    = "blob-bucket"
+        region                    = "us-west-2"
+        key_prefix                = "_blobs"
+        multipart_part_size       = "50 MiB"
+        multipart_uniform_parts   = true
+        multipart_copy_threshold  = "5 GiB"
+        multipart_copy_chunk_size = "100 MiB"
+        multipart_copy_jobs       = 8
+    "#;
+
+    let cfg: blob_store::s3::BackendConfig = toml::from_str(toml).expect("deserialize");
+    assert_eq!(cfg.connection.access_key_id.expose(), "blob-key");
+    assert_eq!(cfg.connection.secret_key.expose(), "blob-secret");
+    assert_eq!(cfg.connection.endpoint, "https://blob.s3.example.com");
+    assert_eq!(cfg.connection.bucket, "blob-bucket");
+    assert_eq!(cfg.connection.region, "us-west-2");
+    assert_eq!(cfg.connection.key_prefix, "_blobs");
+    assert!(cfg.transport.multipart_uniform_parts);
+    assert_eq!(cfg.transport.multipart_copy_jobs, 8);
+}
+
+/// Regression for the previous behaviour where `[blob_store.s3]` silently
+/// defaulted `region` (and other connection fields) when missing. The
+/// documented schema lists every connection field as required.
+#[test]
+fn s3_backend_config_requires_region() {
+    let toml = r#"
+        access_key_id = "k"
+        secret_key    = "s"
+        endpoint      = "http://localhost:9000"
+        bucket        = "b"
+    "#;
+    let err =
+        toml::from_str::<blob_store::s3::BackendConfig>(toml).expect_err("region must be required");
+    assert!(
+        err.to_string().contains("region"),
+        "error should mention the missing `region` field, got: {err}"
+    );
+}
+
 struct UniformTestCase {
     key_prefix: String,
     store: blob_store::s3::Backend,
@@ -63,16 +114,20 @@ struct UniformTestCase {
 impl UniformTestCase {
     fn new() -> Self {
         let key_prefix = format!("test-uniform-{}", Uuid::new_v4());
-        let store = blob_store::s3::Backend::new(&s3_client::BackendConfig {
-            access_key_id: "root".to_string(),
-            secret_key: "roottoor".to_string(),
-            endpoint: "http://127.0.0.1:9000".to_string(),
-            region: "region".to_string(),
-            bucket: "registry".to_string(),
-            key_prefix: key_prefix.clone(),
-            multipart_part_size: ByteSize::mib(5),
-            multipart_uniform_parts: true,
-            ..Default::default()
+        let store = blob_store::s3::Backend::new(&blob_store::s3::BackendConfig {
+            connection: S3ConnectionConfig {
+                access_key_id: Secret::new("root".to_string()),
+                secret_key: Secret::new("roottoor".to_string()),
+                endpoint: "http://127.0.0.1:9000".to_string(),
+                region: "region".to_string(),
+                bucket: "registry".to_string(),
+                key_prefix: key_prefix.clone(),
+            },
+            transport: blob_store::s3::TransportFields {
+                multipart_part_size: ByteSize::mib(5),
+                multipart_uniform_parts: true,
+                ..blob_store::s3::TransportFields::default()
+            },
         })
         .unwrap();
         Self { key_prefix, store }

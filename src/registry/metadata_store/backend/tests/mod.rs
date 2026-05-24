@@ -16,6 +16,7 @@ use crate::{
             s3::BackendConfig,
         },
         path_builder,
+        s3_connection::S3ConnectionConfig,
     },
     secret::Secret,
 };
@@ -30,12 +31,14 @@ mod namespace_registry;
 pub fn test_config() -> BackendConfig {
     metrics_provider::init_for_tests();
     BackendConfig {
-        access_key_id: Secret::new("root".to_string()),
-        secret_key: Secret::new("roottoor".to_string()),
-        endpoint: "http://127.0.0.1:9000".to_string(),
-        region: "region".to_string(),
-        bucket: "registry".to_string(),
-        key_prefix: format!("test-backend-{}", uuid::Uuid::new_v4()),
+        connection: S3ConnectionConfig {
+            access_key_id: Secret::new("root".to_string()),
+            secret_key: Secret::new("roottoor".to_string()),
+            endpoint: "http://127.0.0.1:9000".to_string(),
+            region: "region".to_string(),
+            bucket: "registry".to_string(),
+            key_prefix: format!("test-backend-{}", uuid::Uuid::new_v4()),
+        },
         lock_strategy: LockStrategy::Memory,
         link_cache_ttl: 30,
         access_time_debounce_secs: 0,

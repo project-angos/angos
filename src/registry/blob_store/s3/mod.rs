@@ -14,6 +14,7 @@ use std::{
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use bytesize::ByteSize;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as ShaDigestTrait, Sha256};
@@ -29,9 +30,10 @@ use crate::{
             sha256_ext::Sha256Ext,
         },
         pagination, path_builder,
+        s3_connection::S3ConnectionConfig,
     },
 };
-use angos_s3_client as s3_client;
+use angos_s3_client::{self as s3_client, BackendConfig as S3TransportConfig};
 use angos_storage::{
     Error as StorageError, MultipartStore, ObjectStore, Part, PresignedStore,
     s3::Backend as StorageS3Backend,
@@ -40,6 +42,81 @@ use angos_storage::{
 pub const MIN_PART_SIZE: u64 = 5 * 1024 * 1024;
 pub const FRAME_SIZE: usize = 1024 * 1024;
 pub const FRAME_BUFFER_CAPACITY: usize = 8;
+
+/// Configuration for the S3 blob-store backend.
+///
+/// Connection fields (`access_key_id`, `secret_key`, `endpoint`, `bucket`,
+/// `region`, `key_prefix`) are embedded via `#[serde(flatten)]` so the
+/// operator TOML shape under `[blob_store.s3]` is flat. Connection fields
+/// are required (matching the documented schema); only `key_prefix` may be
+/// omitted. Transport fields each default through `TransportFields`'
+/// struct-level `#[serde(default)]`.
+#[derive(Clone, Debug, Default, PartialEq, Deserialize)]
+pub struct BackendConfig {
+    #[serde(flatten)]
+    pub connection: S3ConnectionConfig,
+    #[serde(flatten)]
+    pub transport: TransportFields,
+}
+
+/// Blob-store-specific transport knobs.
+///
+/// Mirrors the eight non-connection fields of [`S3TransportConfig`]. The
+/// duplication is intentional: the upstream struct mixes connection and
+/// transport in a single record, and the six credential/endpoint fields
+/// there are plain `String` (no debug redaction). Pulling out just the
+/// transport knobs lets the blob-store config use `Secret`-wrapped
+/// credentials via [`S3ConnectionConfig`] while still exposing the same
+/// flat TOML keys to operators. When a new transport knob is added in
+/// `angos_s3_client::BackendConfig`, mirror it here and in
+/// [`BackendConfig::to_transport_config`].
+#[derive(Clone, Debug, PartialEq, Deserialize)]
+#[serde(default)]
+pub struct TransportFields {
+    pub multipart_copy_threshold: ByteSize,
+    pub multipart_copy_chunk_size: ByteSize,
+    pub multipart_copy_jobs: usize,
+    pub multipart_part_size: ByteSize,
+    pub multipart_uniform_parts: bool,
+    pub operation_timeout_secs: u64,
+    pub operation_attempt_timeout_secs: u64,
+    pub max_attempts: u32,
+}
+
+impl Default for TransportFields {
+    fn default() -> Self {
+        let t = S3TransportConfig::default();
+        Self {
+            multipart_copy_threshold: t.multipart_copy_threshold,
+            multipart_copy_chunk_size: t.multipart_copy_chunk_size,
+            multipart_copy_jobs: t.multipart_copy_jobs,
+            multipart_part_size: t.multipart_part_size,
+            multipart_uniform_parts: t.multipart_uniform_parts,
+            operation_timeout_secs: t.operation_timeout_secs,
+            operation_attempt_timeout_secs: t.operation_attempt_timeout_secs,
+            max_attempts: t.max_attempts,
+        }
+    }
+}
+
+impl BackendConfig {
+    /// Build the transport-level config by merging connection fields with the
+    /// blob-store-specific multipart and retry settings.
+    pub fn to_transport_config(&self) -> S3TransportConfig {
+        let t = &self.transport;
+        S3TransportConfig {
+            multipart_copy_threshold: t.multipart_copy_threshold,
+            multipart_copy_chunk_size: t.multipart_copy_chunk_size,
+            multipart_copy_jobs: t.multipart_copy_jobs,
+            multipart_part_size: t.multipart_part_size,
+            multipart_uniform_parts: t.multipart_uniform_parts,
+            operation_timeout_secs: t.operation_timeout_secs,
+            operation_attempt_timeout_secs: t.operation_attempt_timeout_secs,
+            max_attempts: t.max_attempts,
+            ..self.connection.to_client_config()
+        }
+    }
+}
 
 /// S3-internal upload state, cached between `write_upload` calls to avoid
 /// redundant round-trips to the S3 API.
@@ -66,16 +143,17 @@ impl Debug for Backend {
 }
 
 impl Backend {
-    pub fn new(config: &s3_client::BackendConfig) -> Result<Self, Error> {
+    pub fn new(config: &BackendConfig) -> Result<Self, Error> {
         info!("Using S3 blob-store backend");
-        let multipart_part_size = config.multipart_part_size.as_u64();
-        let http = s3_client::Backend::new(config)?;
+        let multipart_part_size = config.transport.multipart_part_size.as_u64();
+        let transport = config.to_transport_config();
+        let http = s3_client::Backend::new(&transport)?;
         let store = StorageS3Backend::builder().client(Arc::new(http)).build()?;
 
         Ok(Self {
             store,
             multipart_part_size,
-            uniform_parts: config.multipart_uniform_parts,
+            uniform_parts: config.transport.multipart_uniform_parts,
             cache: None,
         })
     }

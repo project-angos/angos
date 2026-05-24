@@ -32,7 +32,7 @@ async fn test_lock_coordinator_blob_index_update_uses_blob_lock() {
     // backend's blob-index update blocks until we release.
     let shared_lock = Arc::new(MemoryBackend::new());
 
-    let http = s3_client::Backend::new(&config.to_data_store_config()).unwrap();
+    let http = s3_client::Backend::new(&config.connection.to_client_config()).unwrap();
     let storage = Arc::new(
         StorageS3Backend::builder()
             .client(Arc::new(http))
@@ -83,7 +83,7 @@ async fn test_lock_coordinator_blob_index_update_uses_blob_lock() {
 
     backend
         .store()
-        .delete_prefix(&config.key_prefix)
+        .delete_prefix(&config.connection.key_prefix)
         .await
         .unwrap();
 }
@@ -93,7 +93,7 @@ async fn test_migrate_blob_index_layout_holds_blob_index_lock() {
     let config = test_config();
     let shared_lock = Arc::new(MemoryBackend::new());
 
-    let http = s3_client::Backend::new(&config.to_data_store_config()).unwrap();
+    let http = s3_client::Backend::new(&config.connection.to_client_config()).unwrap();
     let storage = Arc::new(
         StorageS3Backend::builder()
             .client(Arc::new(http))
@@ -139,7 +139,7 @@ async fn test_migrate_blob_index_layout_holds_blob_index_lock() {
 
     backend
         .store()
-        .delete_prefix(&config.key_prefix)
+        .delete_prefix(&config.connection.key_prefix)
         .await
         .unwrap();
 }
@@ -149,7 +149,7 @@ async fn test_update_blob_index_cas_legacy_holds_blob_index_lock_when_legacy_pre
     let config = test_config();
     let shared_lock = Arc::new(MemoryBackend::new());
 
-    let http = s3_client::Backend::new(&config.to_data_store_config()).unwrap();
+    let http = s3_client::Backend::new(&config.connection.to_client_config()).unwrap();
     let storage = Arc::new(
         StorageS3Backend::builder()
             .client(Arc::new(http))
@@ -227,7 +227,7 @@ async fn test_update_blob_index_cas_legacy_holds_blob_index_lock_when_legacy_pre
 
     backend
         .store()
-        .delete_prefix(&config.key_prefix)
+        .delete_prefix(&config.connection.key_prefix)
         .await
         .unwrap();
 }
@@ -237,7 +237,7 @@ async fn test_update_blob_index_cas_no_legacy_skips_blob_index_lock() {
     let config = test_config();
     let shared_lock = Arc::new(MemoryBackend::new());
 
-    let http = s3_client::Backend::new(&config.to_data_store_config()).unwrap();
+    let http = s3_client::Backend::new(&config.connection.to_client_config()).unwrap();
     let storage = Arc::new(
         StorageS3Backend::builder()
             .client(Arc::new(http))
@@ -293,7 +293,7 @@ async fn test_update_blob_index_cas_no_legacy_skips_blob_index_lock() {
 
     backend
         .store()
-        .delete_prefix(&config.key_prefix)
+        .delete_prefix(&config.connection.key_prefix)
         .await
         .unwrap();
 }

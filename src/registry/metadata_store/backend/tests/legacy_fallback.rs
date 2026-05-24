@@ -51,7 +51,7 @@ async fn test_read_blob_index_falls_back_to_legacy_when_no_shards() {
 
     backend
         .store()
-        .delete_prefix(&config.key_prefix)
+        .delete_prefix(&config.connection.key_prefix)
         .await
         .unwrap();
 }
@@ -90,7 +90,7 @@ async fn test_read_blob_index_namespace_falls_back_to_legacy() {
 
     backend
         .store()
-        .delete_prefix(&config.key_prefix)
+        .delete_prefix(&config.connection.key_prefix)
         .await
         .unwrap();
 }
@@ -117,7 +117,7 @@ async fn test_has_blob_references_sees_legacy() {
 
     backend
         .store()
-        .delete_prefix(&config.key_prefix)
+        .delete_prefix(&config.connection.key_prefix)
         .await
         .unwrap();
 }
@@ -167,7 +167,7 @@ async fn test_update_links_writes_to_legacy_when_present_locked() {
 
     backend
         .store()
-        .delete_prefix(&config.key_prefix)
+        .delete_prefix(&config.connection.key_prefix)
         .await
         .unwrap();
 }
@@ -215,7 +215,7 @@ async fn test_update_links_writes_to_legacy_when_present_cas() {
 
     backend
         .store()
-        .delete_prefix(&config.key_prefix)
+        .delete_prefix(&config.connection.key_prefix)
         .await
         .unwrap();
 }
@@ -266,7 +266,7 @@ async fn test_update_links_deletes_legacy_when_emptied() {
 
     backend
         .store()
-        .delete_prefix(&config.key_prefix)
+        .delete_prefix(&config.connection.key_prefix)
         .await
         .unwrap();
 }
@@ -307,7 +307,7 @@ async fn test_no_legacy_writes_still_use_shards() {
 
     backend
         .store()
-        .delete_prefix(&config.key_prefix)
+        .delete_prefix(&config.connection.key_prefix)
         .await
         .unwrap();
 }
@@ -415,7 +415,7 @@ async fn test_migrate_blob_index_layout_writes_shards_and_deletes_legacy() {
 
     backend
         .store()
-        .delete_prefix(&config.key_prefix)
+        .delete_prefix(&config.connection.key_prefix)
         .await
         .unwrap();
 }
