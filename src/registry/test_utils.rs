@@ -15,10 +15,11 @@ use crate::{
         metadata_store,
         metadata_store::{LinkOperation, MetadataStore, link_kind::LinkKind},
         repository_resolver::RepositoryResolver,
+        s3_connection::S3ConnectionConfig,
     },
-    s3_client,
     secret::Secret,
 };
+use angos_storage::ObjectStore;
 
 pub fn create_test_repositories() -> Arc<HashMap<String, Repository>> {
     metrics_provider::init_for_tests();
@@ -141,7 +142,7 @@ pub fn backends() -> Vec<Box<dyn RegistryTestCase>> {
 
 pub struct FSRegistryTestCase {
     blob_store: Arc<blob_store::fs::Backend>,
-    metadata_store: Arc<metadata_store::fs::Backend>,
+    metadata_store: Arc<metadata_store::Backend>,
     registry: Registry,
     temp_dir: TempDir,
 }
@@ -151,20 +152,22 @@ impl FSRegistryTestCase {
         let temp_dir = TempDir::new().expect("Failed to create temp dir for FSBackendConfig");
         let path = temp_dir.path().to_string_lossy().to_string();
 
-        let blob_store = Arc::new(blob_store::fs::Backend::new(
-            &blob_store::fs::BackendConfig {
+        let blob_store = Arc::new(
+            blob_store::fs::Backend::new(&blob_store::fs::BackendConfig {
                 root_dir: path.clone(),
                 sync_to_disk: false,
-            },
-        ));
+            })
+            .unwrap(),
+        );
 
         let metadata_store = Arc::new(
-            metadata_store::fs::Backend::new(&metadata_store::fs::BackendConfig {
+            metadata_store::fs::BackendConfig {
                 root_dir: path,
                 sync_to_disk: false,
                 lock_strategy: metadata_store::LockStrategy::Memory,
-            })
-            .unwrap(),
+            }
+            .to_backend()
+            .expect("fs metadata backend"),
         );
         let registry = create_test_registry(
             blob_store.clone(),
@@ -223,7 +226,7 @@ impl RegistryTestCase for FSRegistryTestCase {
 pub struct S3RegistryTestCase {
     key_prefix: String,
     s3_blob_store: Arc<blob_store::s3::Backend>,
-    s3_metadata_store: Arc<metadata_store::s3::Backend>,
+    s3_metadata_store: Arc<metadata_store::Backend>,
     s3_registry: Registry,
 }
 
@@ -232,42 +235,49 @@ impl S3RegistryTestCase {
         let key_prefix = format!("test-{}", Uuid::new_v4());
 
         let blob_store = Arc::new(
-            blob_store::s3::Backend::new(&s3_client::BackendConfig {
-                access_key_id: Secret::new("root".to_string()),
-                secret_key: Secret::new("roottoor".to_string()),
-                endpoint: "http://127.0.0.1:9000".to_string(),
-                region: "region".to_string(),
-                bucket: "registry".to_string(),
-                key_prefix: key_prefix.clone(),
-                multipart_copy_threshold: ByteSize::mib(5),
-                multipart_copy_chunk_size: ByteSize::mib(5),
-                multipart_part_size: ByteSize::mib(5),
-                ..Default::default()
-            })
-            .unwrap(),
-        );
-
-        let metadata_store = Arc::new(
-            metadata_store::s3::Backend::new(
-                &metadata_store::s3::BackendConfig {
+            blob_store::s3::Backend::new(&blob_store::s3::BackendConfig {
+                connection: S3ConnectionConfig {
                     access_key_id: Secret::new("root".to_string()),
                     secret_key: Secret::new("roottoor".to_string()),
                     endpoint: "http://127.0.0.1:9000".to_string(),
                     region: "region".to_string(),
                     bucket: "registry".to_string(),
                     key_prefix: key_prefix.clone(),
-                    lock_strategy: metadata_store::LockStrategy::Memory,
-                    link_cache_ttl: 0,
-                    access_time_debounce_secs: 0,
-                    capabilities: None,
                 },
+                transport: blob_store::s3::TransportFields {
+                    multipart_copy_threshold: ByteSize::mib(5),
+                    multipart_copy_chunk_size: ByteSize::mib(5),
+                    multipart_part_size: ByteSize::mib(5),
+                    ..blob_store::s3::TransportFields::default()
+                },
+            })
+            .unwrap(),
+        );
+
+        let metadata_store = Arc::new(
+            metadata_store::s3::BackendConfig {
+                connection: S3ConnectionConfig {
+                    access_key_id: Secret::new("root".to_string()),
+                    secret_key: Secret::new("roottoor".to_string()),
+                    endpoint: "http://127.0.0.1:9000".to_string(),
+                    region: "region".to_string(),
+                    bucket: "registry".to_string(),
+                    key_prefix: key_prefix.clone(),
+                },
+                lock_strategy: metadata_store::LockStrategy::Memory,
+                link_cache_ttl: 0,
+                access_time_debounce_secs: 0,
+                capabilities: None,
+            }
+            .to_backend(
                 Some(metadata_store::ConditionalCapabilities {
                     put_if_none_match: true,
                     put_if_match: true,
                     delete_if_match: false,
                 }),
+                None,
             )
-            .unwrap(),
+            .expect("s3 metadata backend"),
         );
 
         let registry = create_test_registry(

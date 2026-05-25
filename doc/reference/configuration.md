@@ -51,7 +51,7 @@ When omitted, the server runs without TLS (insecure).
 | Option                      | Type     | Default  | Description                                 |
 |-----------------------------|----------|----------|---------------------------------------------|
 | `max_concurrent_requests`   | usize    | `64`     | Tokio worker threads (see Performance Tuning) |
-| `max_concurrent_cache_jobs` | usize    | `4`      | Maximum concurrent cache jobs (minimum `1`) |
+| `max_concurrent_cache_jobs` | usize    | `4`      | Maximum concurrent cache jobs (minimum `1`). With `[global.job_queue]` enabled, also bounds the number of jobs each `angos worker` processes in parallel. |
 | `max_manifest_size`         | string   | `"5MiB"` | Maximum manifest body size accepted from clients or upstream registries |
 | `update_pull_time`          | bool     | `false`  | Track pull times for retention policies     |
 | `enable_redirect`           | bool     | —        | **Deprecated.** Fallback for both fields below when unset. |
@@ -63,6 +63,51 @@ When omitted, the server runs without TLS (insecure).
 | `event_webhooks`            | [string] | `[]`     | Event webhook names for all repositories    |
 
 `max_manifest_size` must be greater than zero.
+
+### Durable Job Queue (`global.job_queue`)
+
+Optional. When present, pull-through cache-fill tasks are written to persistent
+storage instead of running in-process. `angos server` enqueues jobs on cache
+miss and publishes the queue-depth gauge on `/metrics`; one or more
+`angos worker` processes must be running to actually drain the queue. When the
+section is absent, the existing in-process `TaskQueue` is used unchanged.
+Exactly one of `[global.job_queue.fs]` or `[global.job_queue.s3]` must be
+defined to choose the backend.
+
+| Option | Type | Default | Description |
+|---|---|---|---|
+| `default_lease_ttl_secs` | u64 | `30` | Worker lease TTL in seconds. Must be at least `9` (the heartbeat runs at `ttl/3`). |
+| `pending_refresh_interval_secs` | u64 | `15` | How often the server refreshes the `angos_job_queue_pending` gauge. Must be at least `5` (sub-5s ticks induce LIST storms on S3). |
+| `pending_ready_horizon_secs` | u64 | `600` | Readiness horizon for the `angos_job_queue_pending` gauge. Only envelopes whose `not_before` falls within `[..., now + horizon]` are counted. Set comfortably larger than your worker pod startup time so KEDA has lead time to scale up before the work becomes claimable. |
+
+#### Filesystem backend (`global.job_queue.fs`)
+
+| Option | Type | Default | Description |
+|---|---|---|---|
+| `root_dir` | string | required | Directory for job envelopes. |
+| `lock_strategy` | string/table | `"memory"` | Lock backend used to coordinate lease and dedup-index writes: `"memory"` (single-process), or `[lock_strategy.redis]` (multi-process). S3 locking not supported. Mirrors the `[metadata_store.fs.lock_strategy]` shape. |
+
+> **Note:** Default `lock_strategy = "memory"` only coordinates workers in the same process. Multi-replica `angos worker` deployments against a shared mount must set `[lock_strategy.redis]`; without it, two replicas can hold the same lease concurrently.
+
+#### S3 backend (`global.job_queue.s3`)
+
+Field shape matches `[metadata_store.s3]` so the same keys (`access_key_id`, `secret_key`, `endpoint`, `bucket`, `region`, `key_prefix`, `lock_strategy`, `capabilities`) work in both sections.
+
+| Option | Type | Default | Description |
+|---|---|---|---|
+| `access_key_id` | string | required | AWS access key ID. |
+| `secret_key` | string | required | AWS secret key. |
+| `endpoint` | string | required | S3 endpoint URL. |
+| `bucket` | string | required | S3 bucket for job envelopes. |
+| `region` | string | `"us-east-1"` | AWS region. |
+| `key_prefix` | string | `"_jobs"` | Key prefix inside the bucket. |
+| `lock_strategy` | string/table | `"s3"` | Coordination strategy: `"s3"` (CAS via S3 conditional writes, default), `"memory"`, or `[lock_strategy.redis]`. Use `redis` / `memory` on S3-compatible providers that don't honor `If-None-Match` / `If-Match`. |
+| `capabilities` | table | auto | Explicitly declared conditional-operation capabilities (`put_if_none_match`, `put_if_match`, `delete_if_match`). Only consulted under `lock_strategy = "s3"`; defaults to all-true. Set `delete_if_match = false` on providers that ignore `If-Match` on `DELETE` (release then falls back to unconditional `DELETE` with a small race window during lease theft). |
+
+> **Note:** `lock_strategy = "s3"` requires `capabilities.put_if_none_match` and `capabilities.put_if_match` to be `true`; startup fails fast otherwise. Switch to `"memory"` / `[lock_strategy.redis]` to coordinate over the underlying [`LockBackend`] instead of S3 CAS.
+
+See [Enable Durable Cache Jobs](../how-to/durable-cache-jobs.md) for a full
+setup guide including `angos worker` invocation and KEDA autoscaling.
 
 ### Global Access Policy (`global.access_policy`)
 

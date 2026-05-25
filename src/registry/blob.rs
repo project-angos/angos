@@ -6,13 +6,15 @@ use tracing::{debug, info, instrument, warn};
 use uuid::Uuid;
 
 use crate::{
+    metrics_provider::metrics_provider,
     oci::{Digest, Namespace},
     registry::{
         Error, HeaderMap, Registry, Repository, ResponseHeaders,
         blob_ownership::BlobOwnership,
         blob_store::{BoxedReader, UploadStore},
+        cache_job_handler::{CACHE_FETCH_BLOB_KIND, CACHE_QUEUE, CacheFetchBlobPayload},
+        job_store::JobEnvelope,
         metadata_store::{Error as MetadataError, MetadataStore, link_kind::LinkKind},
-        task_queue,
     },
 };
 
@@ -128,6 +130,26 @@ fn has_non_ownership_reference(links: &HashSet<LinkKind>, digest: &Digest) -> bo
         .any(|link| !matches!(link, LinkKind::Blob(link_digest) if link_digest == digest))
 }
 
+/// Fetch `stream` into the local blob store and record namespace ownership.
+///
+/// This is the single implementation of the pull-through cache-fill logic;
+/// both the in-process and durable backends call it.
+pub async fn cache_blob(
+    upload_store: Arc<dyn UploadStore>,
+    metadata_store: Arc<dyn MetadataStore>,
+    namespace: Namespace,
+    digest: Digest,
+    stream: BoxedReader,
+) -> Result<(), Error> {
+    debug!("Fetching blob: {digest}");
+    Registry::copy_blob(upload_store, stream, &namespace, &digest).await?;
+    BlobOwnership::new(metadata_store.as_ref())
+        .grant(&namespace, &digest)
+        .await?;
+    info!("Caching of {digest} completed");
+    Ok(())
+}
+
 impl Registry {
     #[instrument(skip(repository))]
     pub async fn head_blob(
@@ -190,7 +212,7 @@ impl Registry {
 
     #[instrument(skip(upload_engine, stream))]
     async fn copy_blob(
-        upload_engine: Arc<dyn UploadStore + Send + Sync>,
+        upload_engine: Arc<dyn UploadStore>,
         stream: impl AsyncRead + Send + Sync + Unpin + 'static,
         namespace: &Namespace,
         digest: &Digest,
@@ -211,25 +233,6 @@ impl Registry {
             return Err(error.into());
         }
 
-        Ok(())
-    }
-
-    async fn cache_blob(
-        upload_store: Arc<dyn UploadStore + Send + Sync>,
-        metadata_store: Arc<dyn MetadataStore + Send + Sync>,
-        stream: BoxedReader,
-        namespace: Namespace,
-        digest: Digest,
-    ) -> Result<(), task_queue::Error> {
-        debug!("Fetching blob: {digest}");
-        Self::copy_blob(upload_store, stream, &namespace, &digest)
-            .await
-            .map_err(|e| task_queue::Error::TaskExecution(e.to_string()))?;
-        BlobOwnership::new(metadata_store.as_ref())
-            .grant(&namespace, &digest)
-            .await
-            .map_err(|e| task_queue::Error::TaskExecution(e.to_string()))?;
-        info!("Caching of {digest} completed");
         Ok(())
     }
 
@@ -262,28 +265,45 @@ impl Registry {
             .get_blob(accepted_types, namespace, digest)
             .await?;
 
-        let (_, caching_stream) = repository
-            .get_blob(accepted_types, namespace, digest)
-            .await?;
-
-        let task_key = format!("{namespace}/{digest}");
-
-        self.task_queue.submit(
-            &task_key,
-            Self::cache_blob(
-                self.upload_store.clone(),
-                self.metadata_store.clone(),
-                caching_stream,
-                namespace.clone(),
-                digest.clone(),
-            ),
-        );
-        info!("Scheduled blob copy task '{task_key}'");
+        self.dispatch_cache_fill(namespace, digest).await;
 
         Ok(GetBlobResponse::Reader {
             headers: get_blob_headers(digest, total_length),
             body: client_stream,
         })
+    }
+
+    /// Fire-and-forget enqueue of a pull-through cache-fill job. A failure is
+    /// logged and counted on `angos_job_queue_enqueue_failures_total` but never
+    /// bubbles up, so a scheduling glitch cannot degrade the client response.
+    async fn dispatch_cache_fill(&self, namespace: &Namespace, digest: &Digest) {
+        let payload = CacheFetchBlobPayload {
+            namespace: namespace.to_string(),
+            digest: digest.to_string(),
+        };
+        let envelope = match JobEnvelope::new(
+            CACHE_QUEUE,
+            CACHE_FETCH_BLOB_KIND,
+            format!("{CACHE_QUEUE}.{namespace}:{digest}"),
+            &payload,
+        ) {
+            Ok(envelope) => envelope,
+            Err(e) => {
+                warn!("Failed to build cache job envelope for {digest}: {e}");
+                metrics_provider()
+                    .job_queue_enqueue_failures_total
+                    .with_label_values(&[CACHE_QUEUE])
+                    .inc();
+                return;
+            }
+        };
+        if let Err(e) = self.cache_queue.enqueue(envelope).await {
+            warn!("Failed to enqueue cache job for {digest}: {e}");
+            metrics_provider()
+                .job_queue_enqueue_failures_total
+                .with_label_values(&[CACHE_QUEUE])
+                .inc();
+        }
     }
 
     async fn get_local_blob(
@@ -762,12 +782,12 @@ mod tests {
             let digest = sha256::digest(content);
             let stream = Box::new(Cursor::new(content.to_vec()));
 
-            Registry::cache_blob(
+            cache_blob(
                 registry.upload_store.clone(),
                 registry.metadata_store.clone(),
-                stream,
                 namespace.clone(),
                 digest.clone(),
+                stream,
             )
             .await
             .unwrap();

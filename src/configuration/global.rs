@@ -4,6 +4,7 @@ use serde::Deserialize;
 use crate::{
     configuration::RegexPattern,
     policy::{AccessPolicyConfig, RetentionPolicyConfig},
+    registry::job_store::JobQueueConfig,
 };
 
 #[derive(Clone, Debug, Deserialize)]
@@ -33,6 +34,8 @@ pub struct GlobalConfig {
     pub authorization_webhook: Option<String>,
     #[serde(default)]
     pub event_webhooks: Vec<String>,
+    #[serde(default)]
+    pub job_queue: Option<JobQueueConfig>,
 }
 
 fn default_max_concurrent_requests() -> usize {
@@ -67,6 +70,7 @@ impl Default for GlobalConfig {
             immutable_tags_exclusions: Vec::new(),
             authorization_webhook: None,
             event_webhooks: Vec::new(),
+            job_queue: None,
         }
     }
 }

@@ -1,8 +1,10 @@
 use async_trait::async_trait;
 use tracing::error;
 
-use super::Command;
-use crate::configuration::{Configuration, listeners::ServerTlsConfig, watcher::ConfigNotifier};
+use crate::{
+    command::server::command::Command,
+    configuration::{Configuration, listeners::ServerTlsConfig, watcher::ConfigNotifier},
+};
 
 #[async_trait]
 impl ConfigNotifier for Command {

@@ -2,7 +2,9 @@ use std::{fmt, io, num::TryFromIntError, string::FromUtf8Error};
 
 use sha2::digest::common::hazmat::DeserializeStateError;
 
-use crate::{oci, s3_client};
+use crate::oci;
+use angos_s3_client as s3_client;
+use angos_storage::Error as StorageError;
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Error {
@@ -94,6 +96,36 @@ impl From<chrono::format::ParseError> for Error {
 impl From<oci::Error> for Error {
     fn from(e: oci::Error) -> Self {
         Error::InvalidFormat(e.to_string())
+    }
+}
+
+/// Blanket conversion from a storage-layer error into a blob-store error.
+///
+/// # Trap: `StorageError::NotFound` maps to `Error::ReferenceNotFound`
+///
+/// This mapping is intentionally conservative: it assumes the missing resource
+/// is a *reference* (manifest link, tag, etc.) because that is the most common
+/// hot path. It is **wrong** for blob and upload call sites, where the correct
+/// variants are [`Error::BlobNotFound`] and [`Error::UploadNotFound`]
+/// respectively.
+///
+/// Any call site that operates on blob or upload keys **must** intercept
+/// `StorageError::NotFound` explicitly before relying on `?` to reach this
+/// impl, otherwise the caller receives a misleading `ReferenceNotFound` error.
+/// Search for `StorageError::NotFound =>` in the blob-store modules to see how
+/// the correct pattern is applied.
+impl From<StorageError> for Error {
+    fn from(e: StorageError) -> Self {
+        match e {
+            // Fallback mapping — correct only for reference/manifest paths.
+            // Blob and upload call sites must match this variant explicitly
+            // before using `?`; see the doc comment on this impl for details.
+            StorageError::NotFound => Error::ReferenceNotFound,
+            StorageError::PreconditionFailed => {
+                Error::StorageBackend("Precondition failed".to_string())
+            }
+            StorageError::Backend(msg) => Error::StorageBackend(msg),
+        }
     }
 }
 
@@ -230,5 +262,35 @@ mod tests {
     fn test_from_oci_error() {
         let oci_error = oci::Error::InvalidDigest("bad".to_string());
         assert!(matches!(Error::from(oci_error), Error::InvalidFormat(_)));
+    }
+
+    #[test]
+    fn test_from_storage_error_not_found() {
+        // Verifies the *fallback* mapping documented on `impl From<StorageError>
+        // for Error`: `NotFound` converts to `ReferenceNotFound`, which is
+        // intentionally conservative and correct only for reference/manifest
+        // paths. Blob and upload call sites must intercept `StorageError::NotFound`
+        // explicitly before using `?` — see the doc comment on the impl for the
+        // full trap description.
+        assert_eq!(
+            Error::from(StorageError::NotFound),
+            Error::ReferenceNotFound
+        );
+    }
+
+    #[test]
+    fn test_from_storage_error_precondition_failed() {
+        assert!(matches!(
+            Error::from(StorageError::PreconditionFailed),
+            Error::StorageBackend(_)
+        ));
+    }
+
+    #[test]
+    fn test_from_storage_error_backend() {
+        assert!(matches!(
+            Error::from(StorageError::Backend("oops".to_string())),
+            Error::StorageBackend(_)
+        ));
     }
 }

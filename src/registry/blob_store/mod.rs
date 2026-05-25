@@ -115,6 +115,7 @@ mod tests {
 
     use chrono::Duration;
     use sha2::{Digest, Sha256};
+    use tokio::io::AsyncReadExt;
     use uuid::Uuid;
 
     use super::*;
@@ -239,8 +240,6 @@ mod tests {
     }
 
     pub async fn test_build_blob_reader_returns_size(store: &impl BlobStore) {
-        use tokio::io::AsyncReadExt;
-
         let test_content = b"blob reader size test content";
         let digest = store.create(test_content).await.unwrap();
 
@@ -254,8 +253,6 @@ mod tests {
 
     #[allow(clippy::cast_possible_truncation)]
     pub async fn test_build_blob_reader_with_offset_returns_full_size(store: &impl BlobStore) {
-        use tokio::io::AsyncReadExt;
-
         let test_content = b"offset blob reader content here";
         let digest = store.create(test_content).await.unwrap();
         let offset = 10u64;

@@ -1,6 +1,8 @@
 use std::fmt;
 
-use crate::{oci, s3_client};
+use crate::oci;
+use angos_s3_client as s3_client;
+use angos_storage::Error as StorageError;
 
 #[derive(Debug, PartialEq)]
 pub enum Error {
@@ -31,6 +33,16 @@ impl From<s3_client::Error> for Error {
             s3_client::Error::NotFound(_) => Error::ReferenceNotFound,
             s3_client::Error::PreconditionFailed => Error::Lock("Precondition failed".to_string()),
             _ => Error::DataStore(err),
+        }
+    }
+}
+
+impl From<StorageError> for Error {
+    fn from(err: StorageError) -> Self {
+        match err {
+            StorageError::NotFound => Error::ReferenceNotFound,
+            StorageError::PreconditionFailed => Error::Lock("Precondition failed".to_string()),
+            other @ StorageError::Backend(_) => Error::StorageBackend(other.to_string()),
         }
     }
 }

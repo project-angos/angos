@@ -559,17 +559,18 @@ The registry is:
 
 The registry is append-only at runtime: namespaces are added when their first link is written, but never removed by the delete path. Periodic `angos scrub` rebuilds the registry by re-walking storage, so a namespace whose last artifact is deleted disappears from `list_namespaces` on the next scrub run. Between server-driven deletes and the next scrub, the `_catalog` endpoint may continue to return the namespace name. Because namespace names are stable identifiers rather than a count of live artifacts, clients that probe per-namespace before assuming content exists are unaffected.
 
-#### Legacy Blob Index Migration
+#### Legacy Blob Index and Namespace Registry Migration
 
-Angos deployed before version v1.1.0 used a single `index.json` file per blob. This is automatically migrated to the sharded format on first read with no manual intervention:
+Two pre-existing legacy layouts can be encountered after upgrade: the per-blob `index.json` file written by Angos prior to v1.1.0, and the single-file `namespace_registry.json` that filesystem deployments used before this release. Both layouts continue to work at runtime without any migration step.
 
-1. Registry reads blob metadata and finds no sharded index files
-2. Falls back to reading the legacy `v2/blobs/{algorithm}/{hash_prefix}/{hash}/index.json`
-3. Writes each namespace's references to its own shard file
-4. Deletes the legacy `index.json`
-5. Subsequent reads use the sharded format
+Runtime reads consult the sharded layout first and fall back to the legacy file when no sharded entry covers the request. Writes follow the same per-blob rule: when a legacy `index.json` is present for a digest the runtime updates it in place (the legacy file stays the source of truth for that blob until scrub moves it), and only when no legacy file is present does a write create or update a sharded entry under `refs/{namespace}.json`. This is decided per blob, so different blobs in the same deployment can sit in different states. The namespace registry behaves the same way on reads — the sharded shards are consulted first and the legacy `namespace_registry.json` is read when no shards are present.
 
-The migration is transparent and happens exactly once per blob. You can verify migration progress by monitoring S3 operations or checking logs for "Migrated legacy blob index" messages.
+`angos scrub` is the only thing that actively rewrites legacy data into the sharded layout:
+
+- `angos scrub --blobs` rewrites each legacy `v2/blobs/{algorithm}/{hash_prefix}/{hash}/index.json` into per-namespace shards under `refs/{namespace}.json` and deletes the legacy file once the shards are written.
+- A regular `angos scrub` run rebuilds the namespace registry shards by re-walking storage and removes the legacy `namespace_registry.json`.
+
+The migration is idempotent — re-running scrub is safe and is a no-op for data that is already in the sharded layout.
 
 #### Blob Index Convergence
 

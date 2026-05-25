@@ -4,11 +4,14 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## 1.2.0 [Unreleased]
 
 ### Added
 
 - New `scrub --referrers` flag: checks every revision in each namespace and removes any referrer link whose referrer manifest no longer has a current digest revision link, preventing ghost descriptors from appearing in the OCI Referrers API response.
+- Durable cache jobs: optional `[global.job_queue]` section routes pull-through cache-fill jobs through a persistent filesystem or S3 store (per-key leases with heartbeat, exponential backoff, dead-letter on max-attempts). `angos server` enqueues jobs and publishes the `angos_job_queue_pending` gauge on `/metrics`; the new `angos worker` subcommand drains the queue. When the section is omitted the existing in-process `TaskQueue` is used unchanged. Documented in `doc/how-to/durable-cache-jobs.md` with a commented block in `config.example.toml`.
+- Maximum manifest body size enforcement.
+- Warning log when a listener flips between insecure and TLS during configuration hot-reload.
 
 ### Fixed
 
@@ -21,13 +24,6 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - Scrub on S3 now converges namespaces whose only artifact is an upload session (e.g. a client that crashed mid-push): the namespace registry tree walk includes any namespace that has an underscore-prefixed child, matching filesystem backend behaviour. Such namespaces are now visible to `UploadChecker` and their stale bytes are cleaned up by `scrub --uploads`.
 - Scrub `-b` now purges all blob-index entries (including ownership markers) for any blob whose backing bytes are absent, so runtime `can_read` no longer reports such blobs as accessible to clients.
 - Scrub `-m` now validates that each revision's digest link points back at the revision's own digest, and rewrites the link when a mismatch is found. The check runs before the manifest blob is read, so a corrupt link is repaired even when its blob is unreachable.
-
-## [1.2.0]
-
-### Added
-
-- Maximum manifest body size enforcement.
-- Warning log when a listener flips between insecure and TLS during configuration hot-reload.
 
 ### Changed
 
@@ -50,7 +46,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - Outbound `[registry_client]` blocks with a partial mTLS pair (`client_certificate` set without `client_private_key`, or vice versa) now fail at configuration load instead of silently disabling outbound client authentication.
 - Webhook retries are capped at 16 with saturating backoff arithmetic.
 - The S3 shard-key hash uses SHA-256, so shard placement is stable across processes and builds.
-- Filesystem metadata now uses the same sharded blob-index and namespace-registry layout as S3, and scrub migrates legacy filesystem and S3 metadata files to the sharded layout.
+- Filesystem metadata now uses the same sharded blob-index and namespace-registry layout as S3 for newly written data. Pre-existing legacy `index.json` and `namespace_registry.json` files keep working: runtime reads consult the sharded layout first and fall back to the legacy file, and writes are applied in place to a legacy file when one is present so the layout does not split mid-blob. There is no auto-migration on the hot path; only `scrub` (and only `scrub`) converts legacy data into the sharded layout and deletes the legacy file afterwards.
 - The Redis client reuses a multiplexed connection across operations and backs off on lock contention.
 - The S3 backend now uses a custom HTTP client in place of the AWS SDK: focused retry / timeout / signing tailored to the operations the registry actually issues, smaller binary, and no AWS SDK transitive dependencies.
 - Filesystem cleanup of empty ancestor directories is depth-bounded (2 levels for blob shards, 3 for index and namespace-registry shards, 4 for link containers) and rooted-subtree guarded; a misshaped path can never walk above the configured root.
@@ -58,6 +54,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - Scrub's orphan manifest deletion now plans link operations through the same `link_plan::delete` primitive used by the runtime write path, eliminating divergence between scrub and runtime decisions about which links to remove. As a consequence, scrub also removes any tag links still pointing at an orphaned manifest digest (previously left dangling).
 - Scrub's orphan manifest deletion tolerates manifest blobs that fail to parse: it removes the digest link (and any tags pointing at it) so the next pass can clean up the dangling config/layer/child links. Blob-read failures are still surfaced so operators notice broken storage.
 - Overlapping repository prefixes (e.g. `team` and `team/app`) are rejected at startup rather than resolved non-deterministically at runtime.
+- `blob_store` backends (S3 and FS) now route all storage primitives through the shared `angos-storage` capability traits instead of calling `angos-s3-client` and `tokio::fs` directly. On-disk layout is unchanged. `fs::BlobStore::read` on a missing blob now consistently returns `BlobNotFound` (previously `ReferenceNotFound`), aligning FS with the S3 backend and with `size`/`reader` on the same backend.
+- The cached `S3UploadState.parts` wire format (cache key `upload_state:<ns>:<uuid>`) switched from `angos_s3_client::UploadedPart` to `angos_storage::Part`, renaming `e_tag` to `etag` (serialized transparently as a plain string). Pre-upgrade entries using the `e_tag` key deserialize transparently via a serde alias, so the upgrade is wire-compatible; the `list_parts` re-discovery fallback only triggers on genuinely corrupt cache entries.
+- The six S3 connection fields (`access_key_id`, `secret_key`, `endpoint`, `bucket`, `region`, `key_prefix`) that were duplicated across `blob_store`, `metadata_store`, and `job_store` S3 configurations are now defined once in `registry::s3_connection::S3ConnectionConfig`. Credentials are wrapped in `Secret<String>` in all three module configs; the `blob_store` S3 path was the only one that previously stored credentials as plain `String` (via embedding `angos_s3_client::BackendConfig` directly), which meant debug output could expose them. The operator-visible TOML shape under `[blob_store.s3]`, `[metadata_store.s3]`, and `[global.job_queue.s3]` is unchanged, with one alignment: `[blob_store.s3]` now consistently requires the `region` key (matching the documented schema and the existing `[metadata_store.s3]` behaviour). Previously a missing `region` silently fell back to an empty string, which would then fail at runtime when the S3 client tried to sign a request.
 
 #### Performance
 

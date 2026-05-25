@@ -13,28 +13,35 @@ use bytesize::ByteSize;
 
 use crate::circuit_breaker::CircuitBreaker;
 
+mod circuit_breaker;
 mod client;
 mod config;
 mod error;
 mod ops;
 mod xml;
 
-pub use config::BackendConfig;
-pub use error::Error;
-pub use ops::UploadedPart;
+pub use crate::config::BackendConfig;
+pub use crate::error::Error;
+pub use crate::ops::UploadedPart;
 
 #[derive(Clone, Debug)]
 pub struct Backend {
-    pub(crate) s3_client: client::S3Client,
-    pub(crate) encoded_bucket: String,
-    pub(crate) key_prefix: String,
-    pub(crate) multipart_copy_threshold: u64,
-    pub(crate) multipart_copy_chunk_size: u64,
-    pub(crate) multipart_copy_jobs: usize,
-    pub(crate) circuit_breaker: CircuitBreaker,
+    pub s3_client: client::S3Client,
+    pub encoded_bucket: String,
+    pub key_prefix: String,
+    pub multipart_copy_threshold: u64,
+    pub multipart_copy_chunk_size: u64,
+    pub multipart_copy_jobs: usize,
+    pub circuit_breaker: CircuitBreaker,
 }
 
 impl Backend {
+    /// Build a new backend from `config`.
+    ///
+    /// # Errors
+    /// Returns [`Error::Configuration`] when multipart sizing constraints
+    /// (part size ≥ 5 MiB, copy chunk size between 5 MiB and 5 GiB) are
+    /// violated, or when the underlying HTTP client fails to initialise.
     pub fn new(config: &BackendConfig) -> Result<Self, Error> {
         if config.multipart_part_size < ByteSize::mib(5) {
             return Err(Error::Configuration(
@@ -66,6 +73,11 @@ impl Backend {
         })
     }
 
+    /// Short-circuit if the breaker is currently open.
+    ///
+    /// # Errors
+    /// Returns an [`io::Error`] with [`io::ErrorKind::Other`] when the
+    /// circuit breaker has tripped on repeated upstream failures.
     pub fn check_circuit_breaker(&self) -> Result<(), io::Error> {
         self.circuit_breaker.check()?;
         Ok(())
@@ -88,6 +100,7 @@ impl Backend {
         }
     }
 
+    #[must_use]
     pub fn full_key(&self, path: &str) -> String {
         if self.key_prefix.is_empty() {
             path.to_string()
@@ -102,12 +115,11 @@ mod tests {
     use bytes::Bytes;
 
     use super::{ops::aggregate_batch_delete_errors, *};
-    use crate::secret::Secret;
 
     fn test_config(overrides: impl FnOnce(&mut BackendConfig)) -> BackendConfig {
         let mut config = BackendConfig {
-            access_key_id: Secret::new("key".to_string()),
-            secret_key: Secret::new("secret".to_string()),
+            access_key_id: "key".to_string(),
+            secret_key: "secret".to_string(),
             endpoint: "http://localhost:9000".to_string(),
             bucket: "test".to_string(),
             region: "us-east-1".to_string(),
@@ -172,8 +184,8 @@ mod tests {
     #[tokio::test]
     async fn test_upload_part_returns_etag() {
         let config = test_config(|c| {
-            c.access_key_id = Secret::new("minioadmin".to_string());
-            c.secret_key = Secret::new("minioadmin".to_string());
+            c.access_key_id = "minioadmin".to_string();
+            c.secret_key = "minioadmin".to_string();
             c.bucket = "test-bucket".to_string();
         });
         let backend = Backend::new(&config).unwrap();
@@ -193,8 +205,8 @@ mod tests {
     #[tokio::test]
     async fn test_abort_multipart_upload() {
         let config = test_config(|c| {
-            c.access_key_id = Secret::new("minioadmin".to_string());
-            c.secret_key = Secret::new("minioadmin".to_string());
+            c.access_key_id = "minioadmin".to_string();
+            c.secret_key = "minioadmin".to_string();
             c.bucket = "test-bucket".to_string();
         });
         let backend = Backend::new(&config).unwrap();

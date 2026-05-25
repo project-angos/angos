@@ -7,7 +7,6 @@ use crate::{
     registry::blob_store::{
         BlobStore, Error, MultipartCleanup, PresignedBlobStore, UploadStore, fs, s3,
     },
-    s3_client,
 };
 
 pub struct BlobStoreHandles {
@@ -23,7 +22,7 @@ pub enum BlobStorageConfig {
     #[serde(rename = "fs")]
     FS(fs::BackendConfig),
     #[serde(rename = "s3")]
-    S3(s3_client::BackendConfig),
+    S3(s3::BackendConfig),
 }
 
 impl Default for BlobStorageConfig {
@@ -36,7 +35,7 @@ impl BlobStorageConfig {
     pub fn to_backend(&self, cache: Option<Arc<Cache>>) -> Result<BlobStoreHandles, Error> {
         match self {
             BlobStorageConfig::FS(config) => {
-                let backend = Arc::new(fs::Backend::new(config));
+                let backend = Arc::new(fs::Backend::new(config)?);
                 Ok(BlobStoreHandles {
                     blob_store: backend.clone(),
                     upload_store: backend.clone(),
@@ -67,6 +66,7 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
+    use crate::registry::s3_connection::S3ConnectionConfig;
     use crate::secret::Secret;
 
     #[tokio::test]
@@ -88,13 +88,16 @@ mod tests {
 
     #[test]
     fn s3_backend_provides_multipart_cleanup() {
-        let config = BlobStorageConfig::S3(s3_client::BackendConfig {
-            endpoint: "http://127.0.0.1:9000".to_string(),
-            region: "us-east-1".to_string(),
-            bucket: "test-bucket".to_string(),
-            access_key_id: Secret::new("minioadmin".to_string()),
-            secret_key: Secret::new("minioadmin".to_string()),
-            ..Default::default()
+        let config = BlobStorageConfig::S3(s3::BackendConfig {
+            connection: S3ConnectionConfig {
+                access_key_id: Secret::new("minioadmin".to_string()),
+                secret_key: Secret::new("minioadmin".to_string()),
+                endpoint: "http://127.0.0.1:9000".to_string(),
+                bucket: "test-bucket".to_string(),
+                region: "us-east-1".to_string(),
+                key_prefix: String::new(),
+            },
+            ..s3::BackendConfig::default()
         });
 
         let handles = config.to_backend(None).unwrap();

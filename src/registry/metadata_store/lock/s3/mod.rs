@@ -18,17 +18,18 @@ use serde::{Deserialize, Deserializer, Serialize};
 use tracing::{debug, warn};
 
 use crate::{
+    metrics_provider::metrics_provider,
     registry::{
         metadata_store::{
             Error,
-            lock::{LockBackend, LockGuard, metrics::lock_metrics},
+            lock::{LockBackend, LockGuard},
             simple_jitter,
         },
         path_builder,
     },
-    s3_client,
     timing::elapsed_ms,
 };
+use angos_s3_client as s3_client;
 
 const MAX_LOCK_TTL_SECS: u64 = 3600;
 
@@ -281,15 +282,15 @@ impl S3LockBackend {
         let (data, etag, last_modified) = match self.store.read_with_metadata(lock_path).await {
             Ok(result) => result,
             Err(e) if e.kind() == ErrorKind::NotFound => {
-                lock_metrics()
-                    .recoveries
+                metrics_provider()
+                    .lock_recoveries
                     .with_label_values(&["s3", "not_stale"])
                     .inc();
                 return RecoveryOutcome::Retry;
             }
             Err(e) => {
-                lock_metrics()
-                    .recoveries
+                metrics_provider()
+                    .lock_recoveries
                     .with_label_values(&["s3", "error"])
                     .inc();
                 return RecoveryOutcome::Error(e.to_string());
@@ -299,8 +300,8 @@ impl S3LockBackend {
         let payload: S3LockPayload = match serde_json::from_slice(&data) {
             Ok(p) => p,
             Err(e) => {
-                lock_metrics()
-                    .recoveries
+                metrics_provider()
+                    .lock_recoveries
                     .with_label_values(&["s3", "error"])
                     .inc();
                 return RecoveryOutcome::Error(format!("corrupt lock payload: {e}"));
@@ -309,8 +310,8 @@ impl S3LockBackend {
 
         let last_modified = last_modified.unwrap_or(payload.refreshed_at);
         if !payload.is_expired(last_modified) {
-            lock_metrics()
-                .recoveries
+            metrics_provider()
+                .lock_recoveries
                 .with_label_values(&["s3", "not_stale"])
                 .inc();
             return RecoveryOutcome::NotStale;
@@ -324,8 +325,8 @@ impl S3LockBackend {
         );
 
         let Some(etag) = etag else {
-            lock_metrics()
-                .recoveries
+            metrics_provider()
+                .lock_recoveries
                 .with_label_values(&["s3", "error"])
                 .inc();
             return RecoveryOutcome::Error("lock object missing ETag".to_string());
@@ -334,8 +335,8 @@ impl S3LockBackend {
         let payload = match self.make_payload() {
             Ok(p) => p,
             Err(e) => {
-                lock_metrics()
-                    .recoveries
+                metrics_provider()
+                    .lock_recoveries
                     .with_label_values(&["s3", "error"])
                     .inc();
                 return RecoveryOutcome::Error(e.to_string());
@@ -348,22 +349,22 @@ impl S3LockBackend {
             .await
         {
             Ok(new_etag) => {
-                lock_metrics()
-                    .recoveries
+                metrics_provider()
+                    .lock_recoveries
                     .with_label_values(&["s3", "acquired"])
                     .inc();
                 RecoveryOutcome::Acquired(new_etag)
             }
             Err(s3_client::Error::PreconditionFailed) => {
-                lock_metrics()
-                    .recoveries
+                metrics_provider()
+                    .lock_recoveries
                     .with_label_values(&["s3", "failed"])
                     .inc();
                 RecoveryOutcome::Failed
             }
             Err(e) => {
-                lock_metrics()
-                    .recoveries
+                metrics_provider()
+                    .lock_recoveries
                     .with_label_values(&["s3", "error"])
                     .inc();
                 RecoveryOutcome::Error(e.to_string())
@@ -412,8 +413,8 @@ impl S3LockBackend {
                         max_hold_secs,
                         "Lock held beyond maximum duration, invalidating"
                     );
-                    lock_metrics()
-                        .invalidations
+                    metrics_provider()
+                        .lock_invalidations
                         .with_label_values(&["s3", "max_hold"])
                         .inc();
                     valid.store(false, Ordering::Release);
@@ -433,8 +434,8 @@ impl S3LockBackend {
                 {
                     TickOutcome::Continue => {}
                     TickOutcome::Invalidate(reason) => {
-                        lock_metrics()
-                            .invalidations
+                        metrics_provider()
+                            .lock_invalidations
                             .with_label_values(&["s3", reason])
                             .inc();
                         valid.store(false, Ordering::Release);
@@ -986,35 +987,35 @@ impl LockBackend for S3LockBackend {
             };
             match round_result {
                 AcquireRoundOutcome::AllAcquired(etags) => {
-                    lock_metrics()
-                        .acquisition_duration
+                    metrics_provider()
+                        .lock_acquisition_duration
                         .with_label_values(&["s3"])
                         .observe(elapsed_ms(start));
-                    lock_metrics()
-                        .acquisitions
+                    metrics_provider()
+                        .lock_acquisitions
                         .with_label_values(&["s3", "success"])
                         .inc();
                     return Ok(self.make_guard(lock_paths, etags));
                 }
                 AcquireRoundOutcome::HardError(e) => {
-                    lock_metrics()
-                        .acquisition_duration
+                    metrics_provider()
+                        .lock_acquisition_duration
                         .with_label_values(&["s3"])
                         .observe(elapsed_ms(start));
-                    lock_metrics()
-                        .acquisitions
+                    metrics_provider()
+                        .lock_acquisitions
                         .with_label_values(&["s3", "error"])
                         .inc();
                     return Err(e);
                 }
                 AcquireRoundOutcome::RecoveryError { msg, to_release } => {
                     self.release_paths(&to_release).await;
-                    lock_metrics()
-                        .acquisition_duration
+                    metrics_provider()
+                        .lock_acquisition_duration
                         .with_label_values(&["s3"])
                         .observe(elapsed_ms(start));
-                    lock_metrics()
-                        .acquisitions
+                    metrics_provider()
+                        .lock_acquisitions
                         .with_label_values(&["s3", "error"])
                         .inc();
                     return Err(Error::StorageBackend(format!(
@@ -1030,12 +1031,12 @@ impl LockBackend for S3LockBackend {
                         self.release_paths(&recovered).await;
                     }
                     if retries == 0 {
-                        lock_metrics()
-                            .acquisition_duration
+                        metrics_provider()
+                            .lock_acquisition_duration
                             .with_label_values(&["s3"])
                             .observe(elapsed_ms(start));
-                        lock_metrics()
-                            .acquisitions
+                        metrics_provider()
+                            .lock_acquisitions
                             .with_label_values(&["s3", "timeout"])
                             .inc();
                         return Err(Error::Lock(format!(
@@ -1046,7 +1047,10 @@ impl LockBackend for S3LockBackend {
                     retries -= 1;
                     let attempt = self.max_retries - retries;
                     use_sequential = true;
-                    lock_metrics().retries.with_label_values(&["s3"]).inc();
+                    metrics_provider()
+                        .lock_retries
+                        .with_label_values(&["s3"])
+                        .inc();
                     debug!(retries_left = retries, "S3 lock busy, retrying...");
                     tokio::time::sleep(self.jittered_delay(attempt)).await;
                 }

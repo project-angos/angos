@@ -3,6 +3,7 @@ use crate::{oci::Digest, registry::metadata_store::link_kind::LinkKind, util::sh
 const BLOBS_ROOT: &str = "v2/blobs";
 const REPOS_ROOT: &str = "v2/repositories";
 const REGISTRY_ROOT: &str = "_registry";
+const JOBS_ROOT: &str = "_jobs";
 
 pub fn blobs_root_dir() -> &'static str {
     BLOBS_ROOT
@@ -115,6 +116,47 @@ pub fn manifest_referrers_dir(namespace: &str, subject: &Digest) -> String {
         subject.algorithm(),
         subject.hash()
     )
+}
+
+pub fn job_pending_dir(queue: &str) -> String {
+    format!("{JOBS_ROOT}/pending/{queue}")
+}
+
+pub fn job_pending_path(queue: &str, id: &str) -> String {
+    format!("{JOBS_ROOT}/pending/{queue}/{id}.json")
+}
+
+pub fn job_lease_path(lock_key: &str) -> String {
+    format!("{JOBS_ROOT}/leases/{}.json", encode_job_lock_key(lock_key))
+}
+
+pub fn job_failed_path(queue: &str, id: &str) -> String {
+    format!("{JOBS_ROOT}/failed/{queue}/{id}.json")
+}
+
+/// Path to the `lock_key` → `storage_key` dedup index file. Each pending
+/// envelope has at most one such file alongside it; `find_pending_with_lock_key`
+/// reads it for an O(1) lookup instead of scanning all pending bodies.
+pub fn job_lock_key_index_path(queue: &str, lock_key: &str) -> String {
+    format!(
+        "{JOBS_ROOT}/index/{queue}/{}.json",
+        encode_job_lock_key(lock_key)
+    )
+}
+
+/// Percent-encode characters that are unsafe as a filesystem filename or as
+/// part of an S3 key path component, so a `lock_key` lands on the same path
+/// regardless of backend.
+fn encode_job_lock_key(lock_key: &str) -> String {
+    lock_key
+        .chars()
+        .map(|c| match c {
+            '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => {
+                format!("%{:02X}", c as u32)
+            }
+            c => c.to_string(),
+        })
+        .collect()
 }
 
 pub fn link_path(link: &LinkKind, namespace: &str) -> String {
@@ -315,6 +357,27 @@ mod tests {
         assert_eq!(
             link_container_path(&manifest_link, "ns"),
             "v2/repositories/ns/_manifests/index/sha256/index123/sha256/child456"
+        );
+    }
+
+    #[test]
+    fn test_job_paths() {
+        assert_eq!(job_pending_dir("cache"), "_jobs/pending/cache");
+        assert_eq!(
+            job_pending_path("cache", "01HABCDE"),
+            "_jobs/pending/cache/01HABCDE.json"
+        );
+        assert_eq!(
+            job_failed_path("cache", "01HABCDE"),
+            "_jobs/failed/cache/01HABCDE.json"
+        );
+        assert_eq!(
+            job_lease_path("cache.ns:sha256:abc"),
+            "_jobs/leases/cache.ns%3Asha256%3Aabc.json"
+        );
+        assert_eq!(
+            job_lock_key_index_path("cache", "cache.ns:sha256:abc"),
+            "_jobs/index/cache/cache.ns%3Asha256%3Aabc.json"
         );
     }
 

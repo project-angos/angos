@@ -5,6 +5,7 @@ use crate::{
     registry::{
         self, Repository,
         blob_store::{self, BlobStoreHandles},
+        job_store,
         metadata_store::{self, ConditionalCapabilities, MetadataStore, MetadataStoreConfig},
         repository,
         repository_resolver::{OverlapError, RepositoryResolver},
@@ -16,7 +17,7 @@ use crate::{
 /// `blob_store::Error` does not implement `std::error::Error`, which is a
 /// prerequisite for `#[from]` in thiserror. A manual `From` impl is provided
 /// instead; `source()` cannot chain into `blob_store::Error` until that type
-/// is migrated (tracked in Epic 09).
+/// is migrated.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("failed to initialize blob store: {0}")]
@@ -32,6 +33,8 @@ pub enum Error {
     },
     #[error("repository configuration is invalid: {0}")]
     Overlap(#[from] OverlapError),
+    #[error("failed to initialize job queue: {0}")]
+    JobQueue(#[from] job_store::Error),
 }
 
 impl From<blob_store::Error> for Error {

@@ -317,22 +317,23 @@ The `--media-types` flag reads each manifest blob and writes its `media_type` in
 
 This is idempotent and safe to run multiple times.
 
-### Automatic Blob Index Migration
+### Blob Index and Namespace Registry Migration
 
-When the S3 backend reads blob metadata, it automatically migrates legacy single-file blob indexes (`index.json`) to the per-namespace shard format (`refs/{namespace}.json`). This migration is:
+Legacy single-file blob indexes (`index.json`) and the legacy unsharded `namespace_registry.json` keep working at runtime against both the S3 and filesystem backends. Reads consult the sharded layout first and fall back to the legacy file when no sharded entry exists, and writes are applied in place to a legacy file when one is present so the layout never splits mid-blob. Operators are **not** forced to run scrub just to keep serving traffic.
 
-- **Transparent** - Requires no operator action
-- **Idempotent** - Safe to run multiple times
-- **Crash-safe** - Shard files are written before the legacy file is deleted
+`scrub` is the only way to convert the on-disk layout from legacy to sharded:
 
-The `scrub --blobs` command triggers this migration as part of its normal blob iteration, making it an effective way to batch-migrate all legacy indexes:
+- `scrub --blobs` iterates every blob, rewrites each legacy `index.json` into per-namespace shards under `refs/{namespace}.json`, and deletes the legacy file once the shards are written.
+- A regular `scrub` run rebuilds the namespace registry shards by re-walking storage and deletes the legacy `namespace_registry.json`.
+
+Running scrub benefits operators who want the per-namespace shard layout's listing and concurrency characteristics for old blobs and namespaces; the runtime fallback is correct but does not gain the sharded layout's lock granularity or O(1) listing properties for entries that are still in legacy form. Operators with no legacy data on disk can skip this step.
 
 ```bash
-# Migrate all legacy blob indexes to the new shard format
+# Migrate legacy blob indexes and rebuild namespace registry shards
 ./angos -c config.toml scrub --blobs
 ```
 
-Running this once after upgrading will convert any remaining legacy `index.json` files to the sharded format automatically.
+This migration is **idempotent** — re-running scrub is safe and will simply skip data that is already in the sharded layout.
 
 ### Fix Links Format
 

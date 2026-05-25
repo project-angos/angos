@@ -5,19 +5,21 @@ use tracing::instrument;
 pub mod blob;
 pub mod blob_ownership;
 pub mod blob_store;
+pub mod cache_job_handler;
 pub mod content_discovery;
 mod error;
 #[cfg(test)]
 mod event_emission_tests;
 mod ext;
-mod fs_ops;
 mod headers;
+pub mod job_store;
 pub mod manifest;
 pub mod metadata_store;
 pub mod pagination;
 mod path_builder;
 pub mod repository;
 pub mod repository_resolver;
+pub mod s3_connection;
 pub mod task_queue;
 #[cfg(test)]
 pub mod test_utils;
@@ -54,6 +56,8 @@ use crate::{
     registry::{
         blob_ownership::BlobOwnership,
         blob_store::{BlobStore, Error as BlobStoreError, PresignedBlobStore, UploadStore},
+        cache_job_handler::CacheJobHandler,
+        job_store::{JobHandler, JobQueue, in_process::InProcessJobQueue},
         metadata_store::{Error as MetadataError, MetadataStore},
         repository_resolver::RepositoryResolver,
         task_queue::TaskQueue,
@@ -69,6 +73,10 @@ pub struct RegistryConfig {
     pub global_immutable_tags: bool,
     pub global_immutable_tags_exclusions: Vec<RegexPattern>,
     pub max_manifest_size_bytes: usize,
+    /// When set, the registry routes all cache-fill jobs through this queue
+    /// instead of the default in-process `TaskQueue`. The choice is made once
+    /// at startup; no runtime switching is possible.
+    pub job_queue: Option<Arc<dyn JobQueue>>,
 }
 
 impl Default for RegistryConfig {
@@ -81,6 +89,7 @@ impl Default for RegistryConfig {
             global_immutable_tags: false,
             global_immutable_tags_exclusions: Vec::new(),
             max_manifest_size_bytes: manifest::DEFAULT_MAX_MANIFEST_SIZE_BYTES,
+            job_queue: None,
         }
     }
 }
@@ -120,6 +129,11 @@ impl RegistryConfig {
         self.max_manifest_size_bytes = limit;
         self
     }
+
+    pub fn job_queue(mut self, queue: Arc<dyn JobQueue>) -> Self {
+        self.job_queue = Some(queue);
+        self
+    }
 }
 
 #[allow(clippy::struct_excessive_bools)]
@@ -127,12 +141,12 @@ pub struct Registry {
     blob_store: Arc<dyn BlobStore>,
     upload_store: Arc<dyn UploadStore>,
     presigned_blob_store: Option<Arc<dyn PresignedBlobStore>>,
-    metadata_store: Arc<dyn MetadataStore + Send + Sync>,
+    metadata_store: Arc<dyn MetadataStore>,
     resolver: Arc<RepositoryResolver>,
     enable_blob_redirect: bool,
     enable_manifest_redirect: bool,
     update_pull_time: bool,
-    task_queue: TaskQueue,
+    cache_queue: Arc<dyn JobQueue>,
     global_immutable_tags: bool,
     global_immutable_tags_exclusions: Vec<RegexPattern>,
     max_manifest_size_bytes: usize,
@@ -161,7 +175,19 @@ impl Registry {
         resolver: Arc<RepositoryResolver>,
         config: RegistryConfig,
     ) -> Result<Self, Error> {
-        let res = Self {
+        let cache_queue: Arc<dyn JobQueue> = if let Some(q) = config.job_queue {
+            q
+        } else {
+            let task_queue = Arc::new(TaskQueue::new(config.concurrent_cache_jobs)?);
+            let handler: Arc<dyn JobHandler> = Arc::new(CacheJobHandler::new(
+                resolver.clone(),
+                upload_store.clone(),
+                metadata_store.clone(),
+            ));
+            Arc::new(InProcessJobQueue::new(task_queue, handler))
+        };
+
+        Ok(Self {
             update_pull_time: config.update_pull_time,
             enable_blob_redirect: config.enable_blob_redirect,
             enable_manifest_redirect: config.enable_manifest_redirect,
@@ -170,13 +196,11 @@ impl Registry {
             presigned_blob_store,
             metadata_store,
             resolver,
-            task_queue: TaskQueue::new(config.concurrent_cache_jobs)?,
+            cache_queue,
             global_immutable_tags: config.global_immutable_tags,
             global_immutable_tags_exclusions: config.global_immutable_tags_exclusions,
             max_manifest_size_bytes: config.max_manifest_size_bytes,
-        };
-
-        Ok(res)
+        })
     }
 
     pub async fn flush_pending_writes(&self) {

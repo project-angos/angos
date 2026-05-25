@@ -5,14 +5,11 @@ use chrono::Duration;
 use sha2::{Digest as ShaDigest, Sha256};
 use uuid::Uuid;
 
-use super::{
-    UploadedPart,
-    multipart_helpers::{next_part_number, uploaded_size},
-};
 use crate::{
     registry::{
         blob_store::{
-            self, MultipartCleanup, OrphanMultipartUpload,
+            self, BlobStore, MultipartCleanup, OrphanMultipartUpload, UploadStore,
+            s3::multipart_helpers::{next_part_number, uploaded_size},
             sha256_ext::Sha256Ext,
             tests::{
                 test_build_blob_reader_returns_size,
@@ -22,11 +19,12 @@ use crate::{
             },
         },
         path_builder,
+        s3_connection::S3ConnectionConfig,
         test_utils::S3RegistryTestCase,
     },
-    s3_client,
     secret::Secret,
 };
+use angos_storage::{Etag, MultipartStore, ObjectStore, Part};
 
 #[test]
 fn first_part_when_no_parts_uploaded() {
@@ -46,18 +44,66 @@ fn part_number_increments_with_part_count() {
 #[test]
 fn uploaded_size_sums_completed_parts() {
     let parts = vec![
-        UploadedPart {
+        Part {
             part_number: 1,
-            e_tag: "first".to_string(),
+            etag: Etag::new("first"),
             size: 5,
         },
-        UploadedPart {
+        Part {
             part_number: 2,
-            e_tag: "second".to_string(),
+            etag: Etag::new("second"),
             size: 8,
         },
     ];
     assert_eq!(uploaded_size(&parts), 13);
+}
+
+/// `[blob_store.s3]` round-trip: flat TOML deserialises into both the
+/// embedded `S3ConnectionConfig` and the `TransportFields` knobs.
+#[test]
+fn s3_backend_config_toml_round_trip() {
+    let toml = r#"
+        access_key_id             = "blob-key"
+        secret_key                = "blob-secret"
+        endpoint                  = "https://blob.s3.example.com"
+        bucket                    = "blob-bucket"
+        region                    = "us-west-2"
+        key_prefix                = "_blobs"
+        multipart_part_size       = "50 MiB"
+        multipart_uniform_parts   = true
+        multipart_copy_threshold  = "5 GiB"
+        multipart_copy_chunk_size = "100 MiB"
+        multipart_copy_jobs       = 8
+    "#;
+
+    let cfg: blob_store::s3::BackendConfig = toml::from_str(toml).expect("deserialize");
+    assert_eq!(cfg.connection.access_key_id.expose(), "blob-key");
+    assert_eq!(cfg.connection.secret_key.expose(), "blob-secret");
+    assert_eq!(cfg.connection.endpoint, "https://blob.s3.example.com");
+    assert_eq!(cfg.connection.bucket, "blob-bucket");
+    assert_eq!(cfg.connection.region, "us-west-2");
+    assert_eq!(cfg.connection.key_prefix, "_blobs");
+    assert!(cfg.transport.multipart_uniform_parts);
+    assert_eq!(cfg.transport.multipart_copy_jobs, 8);
+}
+
+/// Regression for the previous behaviour where `[blob_store.s3]` silently
+/// defaulted `region` (and other connection fields) when missing. The
+/// documented schema lists every connection field as required.
+#[test]
+fn s3_backend_config_requires_region() {
+    let toml = r#"
+        access_key_id = "k"
+        secret_key    = "s"
+        endpoint      = "http://localhost:9000"
+        bucket        = "b"
+    "#;
+    let err =
+        toml::from_str::<blob_store::s3::BackendConfig>(toml).expect_err("region must be required");
+    assert!(
+        err.to_string().contains("region"),
+        "error should mention the missing `region` field, got: {err}"
+    );
 }
 
 struct UniformTestCase {
@@ -68,16 +114,20 @@ struct UniformTestCase {
 impl UniformTestCase {
     fn new() -> Self {
         let key_prefix = format!("test-uniform-{}", Uuid::new_v4());
-        let store = blob_store::s3::Backend::new(&s3_client::BackendConfig {
-            access_key_id: Secret::new("root".to_string()),
-            secret_key: Secret::new("roottoor".to_string()),
-            endpoint: "http://127.0.0.1:9000".to_string(),
-            region: "region".to_string(),
-            bucket: "registry".to_string(),
-            key_prefix: key_prefix.clone(),
-            multipart_part_size: ByteSize::mib(5),
-            multipart_uniform_parts: true,
-            ..Default::default()
+        let store = blob_store::s3::Backend::new(&blob_store::s3::BackendConfig {
+            connection: S3ConnectionConfig {
+                access_key_id: Secret::new("root".to_string()),
+                secret_key: Secret::new("roottoor".to_string()),
+                endpoint: "http://127.0.0.1:9000".to_string(),
+                region: "region".to_string(),
+                bucket: "registry".to_string(),
+                key_prefix: key_prefix.clone(),
+            },
+            transport: blob_store::s3::TransportFields {
+                multipart_part_size: ByteSize::mib(5),
+                multipart_uniform_parts: true,
+                ..blob_store::s3::TransportFields::default()
+            },
         })
         .unwrap();
         Self { key_prefix, store }
@@ -135,8 +185,6 @@ async fn test_blob_reader_with_offset_returns_full_size() {
 /// Tests multipart upload with staged chunks and S3 parts produces correct digest
 #[tokio::test]
 async fn test_multipart_upload_digest() {
-    use crate::registry::blob_store::UploadStore;
-
     let t = S3RegistryTestCase::new();
     let store: &dyn UploadStore = t.blob_store();
     let uuid = Uuid::new_v4().to_string();
@@ -172,8 +220,6 @@ async fn test_multipart_upload_digest() {
 
 #[tokio::test]
 async fn test_zero_length_nonuniform_write_keeps_digest_and_size() {
-    use crate::registry::blob_store::UploadStore;
-
     let t = S3RegistryTestCase::new();
     let store: &dyn UploadStore = t.blob_store();
     let uuid = Uuid::new_v4().to_string();
@@ -210,8 +256,6 @@ async fn test_zero_length_nonuniform_write_keeps_digest_and_size() {
 
 #[tokio::test]
 async fn test_zero_length_uniform_write_keeps_digest_and_size() {
-    use crate::registry::blob_store::UploadStore;
-
     let t = UniformTestCase::new();
     let store: &dyn UploadStore = &t.store;
     let uuid = Uuid::new_v4().to_string();
@@ -248,8 +292,6 @@ async fn test_zero_length_uniform_write_keeps_digest_and_size() {
 
 #[tokio::test]
 async fn test_nonuniform_write_rejects_short_body() {
-    use crate::registry::blob_store::UploadStore;
-
     let t = S3RegistryTestCase::new();
     let store: &dyn UploadStore = t.blob_store();
     let uuid = Uuid::new_v4().to_string();
@@ -280,8 +322,6 @@ async fn test_nonuniform_write_rejects_short_body() {
 
 #[tokio::test]
 async fn test_delete_prefix_removes_all_objects() {
-    use crate::registry::blob_store::UploadStore;
-
     let t = S3RegistryTestCase::new();
     let store: &dyn UploadStore = t.blob_store();
     let uuid = Uuid::new_v4().to_string();
@@ -315,8 +355,6 @@ async fn test_delete_prefix_removes_all_objects() {
 
 #[tokio::test]
 async fn test_delete_blob_removes_all_data() {
-    use crate::registry::blob_store::BlobStore;
-
     let t = S3RegistryTestCase::new();
     let store: &dyn BlobStore = t.blob_store();
 
@@ -336,8 +374,6 @@ async fn test_delete_blob_removes_all_data() {
 
 #[tokio::test]
 async fn test_delete_upload_cleans_all_artifacts() {
-    use crate::registry::blob_store::UploadStore;
-
     let t = S3RegistryTestCase::new();
     let backend = t.blob_store();
     let upload: &dyn UploadStore = backend;
@@ -358,11 +394,12 @@ async fn test_delete_upload_cleans_all_artifacts() {
         .unwrap();
 
     let container_prefix = path_builder::upload_container_path("ns", &uuid);
-    let (objects_before, _) = backend
+    let objects_before = backend
         .store
-        .list_objects(&container_prefix, 1000, None)
+        .list(&container_prefix, 1000, None)
         .await
-        .unwrap();
+        .unwrap()
+        .items;
     assert!(
         !objects_before.is_empty(),
         "Upload container should have objects before deletion"
@@ -370,11 +407,12 @@ async fn test_delete_upload_cleans_all_artifacts() {
 
     upload.delete("ns", &uuid).await.unwrap();
 
-    let (objects_after, _) = backend
+    let objects_after = backend
         .store
-        .list_objects(&container_prefix, 1000, None)
+        .list(&container_prefix, 1000, None)
         .await
-        .unwrap();
+        .unwrap()
+        .items;
     assert!(
         objects_after.is_empty(),
         "All objects under upload container should be removed after delete"
@@ -384,8 +422,6 @@ async fn test_delete_upload_cleans_all_artifacts() {
 
 #[tokio::test]
 async fn test_complete_upload_cleans_upload_container() {
-    use crate::registry::blob_store::{BlobStore, UploadStore};
-
     let t = S3RegistryTestCase::new();
     let backend = t.blob_store();
     let blob: &dyn BlobStore = backend;
@@ -416,11 +452,12 @@ async fn test_complete_upload_cleans_upload_container() {
     );
 
     let container_prefix = path_builder::upload_container_path("ns", &uuid);
-    let (objects_after, _) = backend
+    let objects_after = backend
         .store
-        .list_objects(&container_prefix, 1000, None)
+        .list(&container_prefix, 1000, None)
         .await
-        .unwrap();
+        .unwrap()
+        .items;
     assert!(
         objects_after.is_empty(),
         "Upload container should be cleaned up after complete"
@@ -431,8 +468,6 @@ async fn test_complete_upload_cleans_upload_container() {
 /// Uniform-mode single-part upload: data smaller than the 5 MiB part size
 #[tokio::test]
 async fn test_uniform_single_part_upload() {
-    use crate::registry::blob_store::UploadStore;
-
     let t = UniformTestCase::new();
     let store: &dyn UploadStore = &t.store;
     let uuid = Uuid::new_v4().to_string();
@@ -462,8 +497,6 @@ async fn test_uniform_single_part_upload() {
 /// Uniform-mode multi-part upload: 3 chunks totalling 12 MiB, requiring multiple S3 parts
 #[tokio::test]
 async fn test_uniform_multi_part_upload() {
-    use crate::registry::blob_store::UploadStore;
-
     let t = UniformTestCase::new();
     let store: &dyn UploadStore = &t.store;
     let uuid = Uuid::new_v4().to_string();
@@ -502,8 +535,6 @@ async fn test_uniform_multi_part_upload() {
 /// Uniform-mode `complete` removes all staging artifacts from the upload container
 #[tokio::test]
 async fn test_uniform_complete_cleans_artifacts() {
-    use crate::registry::blob_store::UploadStore;
-
     let t = UniformTestCase::new();
     let upload: &dyn UploadStore = &t.store;
     let uuid = Uuid::new_v4().to_string();
@@ -525,12 +556,13 @@ async fn test_uniform_complete_cleans_artifacts() {
     upload.complete("ns", &uuid, None).await.unwrap();
 
     let container_prefix = path_builder::upload_container_path("ns", &uuid);
-    let (objects_after, _) = t
+    let objects_after = t
         .store
         .store
-        .list_objects(&container_prefix, 1000, None)
+        .list(&container_prefix, 1000, None)
         .await
-        .unwrap();
+        .unwrap()
+        .items;
     assert!(
         objects_after.is_empty(),
         "Upload container should be empty after complete in uniform mode"
@@ -541,8 +573,6 @@ async fn test_uniform_complete_cleans_artifacts() {
 /// Uniform-mode round-trip: uploaded bytes are faithfully preserved through `read`
 #[tokio::test]
 async fn test_uniform_round_trip_integrity() {
-    use crate::registry::blob_store::{BlobStore, UploadStore};
-
     let t = UniformTestCase::new();
     let blob: &dyn BlobStore = &t.store;
     let upload: &dyn UploadStore = &t.store;
@@ -595,20 +625,16 @@ async fn test_cleanup_orphan_multipart_uploads_aborts_old_uploads() {
     let uuid = Uuid::new_v4().to_string();
     let upload_key = path_builder::upload_path("ns", &uuid);
 
-    backend
-        .store
-        .create_multipart_upload(&upload_key)
-        .await
-        .unwrap();
+    backend.store.create_multipart(&upload_key).await.unwrap();
 
     // Verify the upload is visible before cleanup.
-    let (uploads_before, _, _) = backend
+    let page_before = backend
         .store
         .list_multipart_uploads(None, None, None)
         .await
         .unwrap();
     assert!(
-        uploads_before.iter().any(|u| u.key == upload_key),
+        page_before.uploads.iter().any(|u| u.key == upload_key),
         "orphan upload should appear in list before cleanup"
     );
 
@@ -627,13 +653,13 @@ async fn test_cleanup_orphan_multipart_uploads_aborts_old_uploads() {
     }
 
     // The upload must no longer appear in the listing.
-    let (uploads_after, _, _) = backend
+    let page_after = backend
         .store
         .list_multipart_uploads(None, None, None)
         .await
         .unwrap();
     assert!(
-        !uploads_after.iter().any(|u| u.key == upload_key),
+        !page_after.uploads.iter().any(|u| u.key == upload_key),
         "orphan upload must be gone from the list after abort"
     );
     t.cleanup().await;
@@ -649,11 +675,7 @@ async fn test_list_orphan_multipart_uploads_does_not_modify_state() {
     let uuid = Uuid::new_v4().to_string();
     let upload_key = path_builder::upload_path("ns-dry", &uuid);
 
-    backend
-        .store
-        .create_multipart_upload(&upload_key)
-        .await
-        .unwrap();
+    backend.store.create_multipart(&upload_key).await.unwrap();
 
     // List with zero timeout: the just-created upload must appear as an orphan.
     let orphans = backend
@@ -666,26 +688,26 @@ async fn test_list_orphan_multipart_uploads_does_not_modify_state() {
     );
 
     // Re-list the raw multipart uploads: listing must not have modified state.
-    let (uploads_after, _, _) = backend
+    let page_after = backend
         .store
         .list_multipart_uploads(None, None, None)
         .await
         .unwrap();
     assert!(
-        uploads_after.iter().any(|u| u.key == upload_key),
+        page_after.uploads.iter().any(|u| u.key == upload_key),
         "listing orphans must not abort the upload; it must still appear in the listing"
     );
 
     // Clean up the lingering multipart upload so MinIO stays tidy.
-    let (pending, _, _) = backend
+    let pending = backend
         .store
         .list_multipart_uploads(None, None, None)
         .await
         .unwrap();
-    for upload in pending.into_iter().filter(|u| u.key == upload_key) {
+    for upload in pending.uploads.into_iter().filter(|u| u.key == upload_key) {
         let _ = backend
             .store
-            .abort_multipart_upload(&upload.key, &upload.upload_id)
+            .abort_multipart(&upload.key, &upload.upload_id)
             .await;
     }
     t.cleanup().await;

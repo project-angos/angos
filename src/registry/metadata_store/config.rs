@@ -6,11 +6,12 @@ use tracing::info;
 use crate::{
     cache::Cache,
     registry::{
-        blob_store, metadata_store,
-        metadata_store::{ConditionalCapabilities, Error, LockStrategy, MetadataStore},
+        blob_store,
+        metadata_store::{ConditionalCapabilities, Error, LockStrategy, MetadataStore, fs, s3},
     },
-    s3_client,
 };
+use angos_s3_client as s3_client;
+use angos_storage::s3::Backend as StorageS3Backend;
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq)]
 #[allow(clippy::large_enum_variant)]
@@ -23,16 +24,16 @@ pub enum MetadataStoreConfig {
     #[default]
     Inherit,
     #[serde(rename = "fs")]
-    FS(metadata_store::fs::BackendConfig),
+    FS(fs::BackendConfig),
     #[serde(rename = "s3")]
-    S3(metadata_store::s3::BackendConfig),
+    S3(s3::BackendConfig),
 }
 
 impl MetadataStoreConfig {
     pub fn from_blob_store(blob: &blob_store::BlobStorageConfig) -> Self {
         match blob {
             blob_store::BlobStorageConfig::FS(config) => {
-                MetadataStoreConfig::FS(metadata_store::fs::BackendConfig {
+                MetadataStoreConfig::FS(fs::BackendConfig {
                     root_dir: config.root_dir.clone(),
                     sync_to_disk: config.sync_to_disk,
                     ..Default::default()
@@ -40,13 +41,8 @@ impl MetadataStoreConfig {
             }
             blob_store::BlobStorageConfig::S3(config) => {
                 info!("Auto-configuring S3 metadata-store from blob-store");
-                MetadataStoreConfig::S3(metadata_store::s3::BackendConfig {
-                    bucket: config.bucket.clone(),
-                    region: config.region.clone(),
-                    endpoint: config.endpoint.clone(),
-                    access_key_id: config.access_key_id.clone(),
-                    secret_key: config.secret_key.clone(),
-                    key_prefix: config.key_prefix.clone(),
+                MetadataStoreConfig::S3(s3::BackendConfig {
+                    connection: config.connection.clone(),
                     ..Default::default()
                 })
             }
@@ -60,9 +56,15 @@ impl MetadataStoreConfig {
                  Configuration::resolve_metadata_config before probe"
             ),
             MetadataStoreConfig::S3(config) => {
-                let store = s3_client::Backend::new(&config.to_data_store_config())
+                let http = s3_client::Backend::new(&config.connection.to_client_config())
                     .map_err(|e| Error::StorageBackend(e.to_string()))?;
-                let caps = metadata_store::s3::probe_conditional_capabilities(&store).await?;
+                let storage = Arc::new(
+                    StorageS3Backend::builder()
+                        .client(Arc::new(http))
+                        .build()
+                        .map_err(|e| Error::StorageBackend(e.to_string()))?,
+                );
+                let caps = s3::probe_conditional_capabilities(storage.as_ref()).await?;
                 if matches!(config.lock_strategy, LockStrategy::S3(_)) && !caps.supports_cas() {
                     return Err(Error::Lock(format!(
                         "S3 lock strategy requires If-None-Match and If-Match support, \
@@ -92,9 +94,7 @@ impl MetadataStoreConfig {
                 "MetadataStoreConfig::Inherit must be resolved via \
                  Configuration::resolve_metadata_config before to_backend"
             ),
-            MetadataStoreConfig::FS(config) => {
-                Ok((Arc::new(metadata_store::fs::Backend::new(config)?), None))
-            }
+            MetadataStoreConfig::FS(config) => Ok((Arc::new(config.to_backend()?), None)),
             MetadataStoreConfig::S3(config) => {
                 let caps = match &config.capabilities {
                     Some(declared) => {
@@ -112,11 +112,7 @@ impl MetadataStoreConfig {
                     }
                     None => self.probe().await?,
                 };
-                let backend = metadata_store::s3::Backend::new(config, caps.clone())?;
-                let backend = match cache {
-                    Some(c) => backend.with_cache(c),
-                    None => backend,
-                };
+                let backend = config.to_backend(caps.clone(), cache)?;
                 Ok((Arc::new(backend), caps))
             }
         }
@@ -126,16 +122,23 @@ impl MetadataStoreConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::secret::Secret;
+    use crate::{
+        registry::{
+            blob_store, metadata_store::lock::s3::S3LockConfig, s3_connection::S3ConnectionConfig,
+        },
+        secret::Secret,
+    };
 
     fn s3_config_with_lock_strategy(lock_strategy: LockStrategy) -> MetadataStoreConfig {
-        MetadataStoreConfig::S3(metadata_store::s3::BackendConfig {
-            access_key_id: Secret::new("root".to_string()),
-            secret_key: Secret::new("roottoor".to_string()),
-            endpoint: "http://127.0.0.1:9000".to_string(),
-            bucket: "registry".to_string(),
-            region: "us-east-1".to_string(),
-            key_prefix: format!("probe-test-{}", uuid::Uuid::new_v4()),
+        MetadataStoreConfig::S3(s3::BackendConfig {
+            connection: S3ConnectionConfig {
+                access_key_id: Secret::new("root".to_string()),
+                secret_key: Secret::new("roottoor".to_string()),
+                endpoint: "http://127.0.0.1:9000".to_string(),
+                bucket: "registry".to_string(),
+                region: "us-east-1".to_string(),
+                key_prefix: format!("probe-test-{}", uuid::Uuid::new_v4()),
+            },
             lock_strategy,
             link_cache_ttl: 30,
             access_time_debounce_secs: 0,
@@ -145,8 +148,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_probe_s3_lock_strategy_detects_minio_capabilities() {
-        use crate::registry::metadata_store::lock::s3::S3LockConfig;
-
         let config = s3_config_with_lock_strategy(LockStrategy::S3(S3LockConfig::default()));
         let result = config.probe().await;
         assert!(
@@ -177,7 +178,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_probe_fs_config_is_noop() {
-        let config = MetadataStoreConfig::FS(metadata_store::fs::BackendConfig {
+        let config = MetadataStoreConfig::FS(fs::BackendConfig {
             root_dir: "/tmp/probe-test".to_string(),
             lock_strategy: LockStrategy::Memory,
             sync_to_disk: false,
@@ -209,23 +210,25 @@ mod tests {
 
     #[test]
     fn test_from_blob_store_s3_copies_credentials_and_bucket() {
-        let blob = blob_store::BlobStorageConfig::S3(s3_client::BackendConfig {
-            bucket: "test-bucket".to_string(),
-            region: "us-east-1".to_string(),
-            endpoint: "http://localhost:9000".to_string(),
-            access_key_id: Secret::new("key".to_string()),
-            secret_key: Secret::new("secret".to_string()),
-            key_prefix: "foo".to_string(),
-            ..Default::default()
+        let blob = blob_store::BlobStorageConfig::S3(blob_store::s3::BackendConfig {
+            connection: S3ConnectionConfig {
+                access_key_id: Secret::new("key".to_string()),
+                secret_key: Secret::new("secret".to_string()),
+                endpoint: "http://localhost:9000".to_string(),
+                bucket: "test-bucket".to_string(),
+                region: "us-east-1".to_string(),
+                key_prefix: "foo".to_string(),
+            },
+            ..blob_store::s3::BackendConfig::default()
         });
         match MetadataStoreConfig::from_blob_store(&blob) {
             MetadataStoreConfig::S3(c) => {
-                assert_eq!(c.bucket, "test-bucket");
-                assert_eq!(c.region, "us-east-1");
-                assert_eq!(c.endpoint, "http://localhost:9000");
-                assert_eq!(c.access_key_id.expose(), "key");
-                assert_eq!(c.secret_key.expose(), "secret");
-                assert_eq!(c.key_prefix, "foo");
+                assert_eq!(c.connection.bucket, "test-bucket");
+                assert_eq!(c.connection.region, "us-east-1");
+                assert_eq!(c.connection.endpoint, "http://localhost:9000");
+                assert_eq!(c.connection.access_key_id.expose(), "key");
+                assert_eq!(c.connection.secret_key.expose(), "secret");
+                assert_eq!(c.connection.key_prefix, "foo");
             }
             MetadataStoreConfig::Inherit | MetadataStoreConfig::FS(_) => {
                 panic!("expected S3 metadata config")
