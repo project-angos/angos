@@ -11,11 +11,11 @@ use crate::{
 };
 
 pub struct BlobOwnership<'a> {
-    metadata_store: &'a (dyn MetadataStore + Send + Sync),
+    metadata_store: &'a MetadataStore,
 }
 
 impl<'a> BlobOwnership<'a> {
-    pub fn new(metadata_store: &'a (dyn MetadataStore + Send + Sync)) -> Self {
+    pub fn new(metadata_store: &'a MetadataStore) -> Self {
         Self { metadata_store }
     }
 

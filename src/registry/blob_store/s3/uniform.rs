@@ -1,7 +1,6 @@
 use std::io::{self, Cursor, ErrorKind};
 
 use bytes::{Bytes, BytesMut};
-use chrono::{DateTime, Utc};
 use sha2::Sha256;
 use tokio::{
     io::{AsyncRead, AsyncReadExt},
@@ -14,12 +13,13 @@ use crate::{
     oci::Digest,
     registry::{
         blob_store::{
-            Error, UploadSummary,
+            Error,
             hashing_reader::HashingReader,
             s3::{
-                Backend, FRAME_BUFFER_CAPACITY, FRAME_SIZE, S3UploadState,
+                Backend, FRAME_BUFFER_CAPACITY, FRAME_SIZE,
                 multipart_helpers::{
-                    UploadMode, next_part_number, uploaded_size as total_uploaded_size,
+                    CompletionPlan, UploadMode, next_part_number,
+                    uploaded_size as total_uploaded_size,
                 },
             },
             sha256_ext::Sha256Ext,
@@ -93,12 +93,12 @@ impl Backend {
         append: bool,
     ) -> Result<(Option<String>, Vec<Part>), Error> {
         if append {
-            if let Some(state) = self.retrieve_cached_upload_state(name, uuid).await {
-                return Ok((state.multipart_upload_id, state.parts));
+            match self.read_session(name, uuid).await {
+                Ok(record) => Ok((record.multipart_upload_id, record.parts)),
+                Err(Error::UploadNotFound) => self.discover_multipart_upload(upload_path).await,
+                Err(e) => Err(e),
             }
-            self.discover_multipart_upload(upload_path).await
         } else {
-            self.evict_upload_id(upload_path).await;
             self.store.abort_pending_uploads(upload_path).await?;
             Ok((None, Vec::new()))
         }
@@ -194,9 +194,9 @@ impl Backend {
         append: bool,
     ) -> Result<(Digest, u64), Error> {
         if append && content_length == 0 {
-            let state = self.get_upload_state_uniform(name, uuid).await?;
-            let digest = self.load_hasher(name, uuid, state.size).await?.digest();
-            return Ok((digest, state.size));
+            let size = self.get_upload_size_uniform(name, uuid).await?;
+            let digest = self.load_hasher(name, uuid, size).await?.digest();
+            return Ok((digest, size));
         }
 
         let upload_path = path_builder::upload_path(name, uuid);
@@ -229,7 +229,6 @@ impl Backend {
                     .create_multipart(&upload_path)
                     .await?
                     .into_inner();
-                self.cache_upload_id(&upload_path, &id).await;
                 upload_id.insert(id)
             };
             self.stream_part(
@@ -282,53 +281,50 @@ impl Backend {
     }
 
     #[instrument(skip(self))]
-    pub async fn get_upload_state_uniform(
-        &self,
-        name: &str,
-        uuid: &str,
-    ) -> Result<S3UploadState, Error> {
-        if let Some(cached) = self.retrieve_cached_upload_state(name, uuid).await {
-            return Ok(cached);
-        }
+    pub async fn get_upload_size_uniform(&self, name: &str, uuid: &str) -> Result<u64, Error> {
+        let parts_size = match self.read_session(name, uuid).await {
+            Ok(record) => total_uploaded_size(&record.parts),
+            Err(Error::UploadNotFound) => {
+                let key = path_builder::upload_path(name, uuid);
+                let (_, parts) = self.discover_multipart_upload(&key).await?;
+                total_uploaded_size(&parts)
+            }
+            Err(e) => return Err(e),
+        };
 
-        let key = path_builder::upload_path(name, uuid);
-
-        let (multipart_upload_id, parts) = self.discover_multipart_upload(&key).await?;
-
-        let mut size = total_uploaded_size(&parts);
-
+        let mut size = parts_size;
         let staged_path = path_builder::upload_staged_container_path(name, uuid, size);
         if let Ok(meta) = self.store.head(&staged_path).await {
             size += meta.size;
         }
-
-        let state = S3UploadState {
-            size,
-            multipart_upload_id,
-            parts,
-            pending_size: 0,
-        };
-        self.cache_upload_state(name, uuid, &state).await;
-        Ok(state)
+        Ok(size)
     }
 
+    /// Prepare the uniform upload for the transactional commit step.
+    ///
+    /// Runs all S3-protocol work (flushing the staged remainder into the
+    /// multipart upload, then completing the multipart) so that the assembled
+    /// object lands at `upload_path`. Returns a [`CompletionPlan`] that tells
+    /// `complete_via_session` which `Mutation` to use in the engine
+    /// transaction (`Move` or `PutEmpty`).
+    ///
+    /// The upload-container cleanup is **not** performed here; it happens
+    /// after the transaction commits in `complete_via_session`.
     #[instrument(skip(self))]
-    pub async fn complete_upload_uniform(
+    pub async fn prepare_complete_upload_uniform(
         &self,
         name: &str,
         uuid: &str,
         digest: Option<&Digest>,
-    ) -> Result<Digest, Error> {
+    ) -> Result<CompletionPlan, Error> {
         let key = path_builder::upload_path(name, uuid);
 
-        let cached = self.retrieve_cached_upload_state(name, uuid).await;
-        let (upload_id, mut parts) = match cached {
-            Some(S3UploadState {
-                multipart_upload_id: Some(id),
-                parts,
-                ..
-            }) => (Some(id), parts),
-            _ => self.discover_multipart_upload(&key).await?,
+        let (upload_id, mut parts) = match self.read_session(name, uuid).await {
+            Ok(record) if record.multipart_upload_id.is_some() => {
+                (record.multipart_upload_id, record.parts)
+            }
+            Ok(_) | Err(Error::UploadNotFound) => self.discover_multipart_upload(&key).await?,
+            Err(e) => return Err(e),
         };
         let mut size = total_uploaded_size(&parts);
 
@@ -340,14 +336,14 @@ impl Backend {
                     let staged_size = meta.size;
                     size += staged_size;
                     let digest = self.resolve_upload_digest(name, uuid, size, digest).await?;
-                    self.copy_staged_object_to_blob_and_cleanup(&source_key, name, uuid, &digest)
-                        .await?;
-                    return Ok(digest);
+                    return Ok(CompletionPlan::Move {
+                        src: source_key,
+                        digest,
+                    });
                 }
                 Err(StorageError::NotFound) if size == 0 => {
                     let digest = self.resolve_upload_digest(name, uuid, size, digest).await?;
-                    self.put_empty_blob_and_cleanup(name, uuid, &digest).await?;
-                    return Ok(digest);
+                    return Ok(CompletionPlan::PutEmpty { digest });
                 }
                 Err(StorageError::NotFound) => return Err(Error::UploadNotFound),
                 Err(e) => return Err(e.into()),
@@ -374,24 +370,9 @@ impl Backend {
 
         let digest = self.resolve_upload_digest(name, uuid, size, digest).await?;
 
-        self.complete_multipart_upload_and_store(&key, &upload_id, &parts, name, uuid, &digest)
+        self.complete_multipart_upload(&key, &upload_id, &parts)
             .await?;
 
-        Ok(digest)
-    }
-
-    pub async fn build_upload_summary(
-        &self,
-        name: &str,
-        uuid: &str,
-        size: u64,
-    ) -> Result<UploadSummary, Error> {
-        let date_path = path_builder::upload_start_date_path(name, uuid);
-        let date_bytes = self.store.get(&date_path).await?;
-        let date_str = String::from_utf8_lossy(&date_bytes);
-        let started_at = DateTime::parse_from_rfc3339(&date_str)
-            .unwrap_or_else(|_| Utc::now().fixed_offset())
-            .with_timezone(&Utc);
-        Ok(UploadSummary { size, started_at })
+        Ok(CompletionPlan::Move { src: key, digest })
     }
 }

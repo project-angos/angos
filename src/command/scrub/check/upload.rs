@@ -119,10 +119,7 @@ mod tests {
     use super::*;
     use crate::{
         command::scrub::{action::Action, executor::Executor},
-        registry::{
-            blob_store,
-            test_utils::{NoopMultipart, backends},
-        },
+        registry::{blob_store, test_utils::backends},
     };
 
     fn fixed_now() -> DateTime<Utc> {
@@ -230,7 +227,6 @@ mod tests {
                 test_case.blob_store(),
                 test_case.metadata_store(),
                 upload_store.clone(),
-                std::sync::Arc::new(NoopMultipart),
             );
 
             let checker = UploadChecker::new(upload_store.clone(), Duration::zero());

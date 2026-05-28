@@ -1,6 +1,5 @@
 use std::fmt::{self, Display, Formatter};
 
-use bytes::Bytes;
 use tokio::task::JoinError;
 use tracing::{error, warn};
 
@@ -12,6 +11,24 @@ use crate::{
     },
 };
 use angos_storage::{MultipartStore, ObjectStore, Part, UploadId};
+
+/// Describes what the transactional step in `complete_via_session` must do
+/// after any S3-protocol multipart-complete has already run.
+///
+/// The `complete_upload_uniform` / `complete_upload_nonuniform` helpers return
+/// this value so that `complete_via_session` can build the single `Transaction`
+/// that atomically relocates the data and deletes the session record.
+pub enum CompletionPlan {
+    /// Move the object at `src` to the canonical blob path.
+    ///
+    /// Used when the data already exists as a single object (assembled
+    /// multipart or single staged chunk).
+    Move { src: String, digest: Digest },
+    /// Write an empty object to the canonical blob path.
+    ///
+    /// Used when the upload had zero bytes.
+    PutEmpty { digest: Digest },
+}
 
 #[derive(Debug, Clone, Copy)]
 pub enum UploadMode {
@@ -33,7 +50,12 @@ impl Backend {
         &self,
         upload_path: &str,
     ) -> Result<(Option<String>, Vec<Part>), Error> {
-        let Some(upload_id) = self.get_or_search_upload_id(upload_path).await? else {
+        let Some(upload_id) = self
+            .store
+            .search_multipart_upload_id(upload_path)
+            .await?
+            .map(UploadId::into_inner)
+        else {
             return Ok((None, Vec::new()));
         };
         let id = UploadId::new(&upload_id);
@@ -45,75 +67,48 @@ impl Backend {
         &self,
         upload_path: &str,
     ) -> Result<(String, Vec<Part>), Error> {
-        if let Some(upload_id) = self.get_or_search_upload_id(upload_path).await? {
+        if let Some(upload_id) = self
+            .store
+            .search_multipart_upload_id(upload_path)
+            .await?
+            .map(UploadId::into_inner)
+        {
             let id = UploadId::new(&upload_id);
             let parts = self.store.list_parts(upload_path, &id).await?;
             return Ok((upload_id, parts));
         }
 
         let upload_id = self.store.create_multipart(upload_path).await?.into_inner();
-        self.cache_upload_id(upload_path, &upload_id).await;
         Ok((upload_id, Vec::new()))
     }
 
-    pub async fn complete_multipart_upload_and_store(
+    /// Complete the S3 multipart upload, assembling the object at `upload_path`.
+    ///
+    /// This is the S3-protocol step that must run before the transactional
+    /// move. The assembled object lands at `upload_path`; callers then issue a
+    /// `Mutation::Move { src: upload_path, dst: blob_path }` inside a
+    /// `Transaction` to atomically relocate it and delete the session record.
+    pub async fn complete_multipart_upload(
         &self,
         upload_path: &str,
         upload_id: &str,
         parts: &[Part],
-        name: &str,
-        uuid: &str,
-        digest: &Digest,
     ) -> Result<(), Error> {
         let id = UploadId::new(upload_id);
         self.store
             .complete_multipart(upload_path, &id, parts)
             .await?;
-
-        self.evict_upload_id(upload_path).await;
-        self.evict_upload_state(name, uuid).await;
-
-        let blob_path = path_builder::blob_path(digest);
-        self.store.copy(upload_path, &blob_path).await?;
-
-        let container = path_builder::upload_container_path(name, uuid);
-        self.store.delete_prefix(&container).await?;
-
         Ok(())
     }
 
-    pub async fn copy_staged_object_to_blob_and_cleanup(
-        &self,
-        source_path: &str,
-        name: &str,
-        uuid: &str,
-        digest: &Digest,
-    ) -> Result<(), Error> {
-        let blob_path = path_builder::blob_path(digest);
-        self.store.copy(source_path, &blob_path).await?;
-
-        self.evict_upload_state(name, uuid).await;
-
+    /// Delete the staging container for a completed or aborted upload.
+    ///
+    /// Called after the engine transaction has committed the Move + Delete, so
+    /// the upload-container artifacts (hash-state files, pending chunks) can be
+    /// cleaned up without being in the critical path of atomicity.
+    pub async fn delete_upload_container(&self, name: &str, uuid: &str) -> Result<(), Error> {
         let container = path_builder::upload_container_path(name, uuid);
         self.store.delete_prefix(&container).await?;
-
-        Ok(())
-    }
-
-    pub async fn put_empty_blob_and_cleanup(
-        &self,
-        name: &str,
-        uuid: &str,
-        digest: &Digest,
-    ) -> Result<(), Error> {
-        let blob_path = path_builder::blob_path(digest);
-        self.store.put(&blob_path, Bytes::new()).await?;
-
-        self.evict_upload_state(name, uuid).await;
-
-        let container = path_builder::upload_container_path(name, uuid);
-        self.store.delete_prefix(&container).await?;
-
         Ok(())
     }
 
@@ -153,8 +148,6 @@ impl Backend {
         if let Err(abort_err) = self.store.abort_multipart(upload_path, &id).await {
             warn!("abort_multipart failed during cleanup of '{name}/{uuid}': {abort_err}");
         }
-        self.evict_upload_id(upload_path).await;
-        self.evict_upload_state(name, uuid).await;
         Error::StorageBackend(format!("upload task {kind}: {join_error}"))
     }
 }

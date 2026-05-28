@@ -1,9 +1,11 @@
 use cel_interpreter::SerializationError;
 use hyper::{header::InvalidHeaderValue, http::uri::InvalidUri};
 
+use angos_tx_engine::lock;
+
 use crate::{
     configuration, oci, policy,
-    registry::{blob_store, cache, metadata_store, task_queue},
+    registry::{blob_store, cache, metadata_store},
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -49,8 +51,9 @@ pub enum Error {
     Cache(#[from] cache::Error),
     #[error("metadata store error during operations: {0}")]
     MetadataStore(#[from] metadata_store::Error),
-    #[error("task pool error during operations: {0}")]
-    TaskQueue(#[from] task_queue::Error),
+    // `lock::Error` is routed through `MetadataStore`: every registry-level
+    // caller of `lock::with_lock` is doing metadata-store work, so the
+    // metadata-store variant is the right home.
     #[error("I/O error during operations: {0}")]
     Io(#[from] std::io::Error),
     #[error("HTTP error during operations: {0}")]
@@ -70,6 +73,12 @@ pub enum Error {
 // `policy::Error` routes to `Initialization` to preserve the prior behaviour.
 // A `#[from]` variant is not used here because the mapping is semantic, not
 // structural: all policy errors collapse into the string-carrying `Initialization`.
+impl From<lock::Error> for Error {
+    fn from(error: lock::Error) -> Self {
+        Error::MetadataStore(error.into())
+    }
+}
+
 impl From<policy::Error> for Error {
     fn from(error: policy::Error) -> Self {
         Error::Initialization(error.to_string())

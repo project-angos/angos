@@ -1,14 +1,14 @@
 use std::io::Cursor;
+use std::sync::Arc;
 
 use bytesize::ByteSize;
-use chrono::Duration;
 use sha2::{Digest as ShaDigest, Sha256};
 use uuid::Uuid;
 
 use crate::{
     registry::{
         blob_store::{
-            self, BlobStore, MultipartCleanup, OrphanMultipartUpload, UploadStore,
+            self, BlobStore, UploadStore,
             s3::multipart_helpers::{next_part_number, uploaded_size},
             sha256_ext::Sha256Ext,
             tests::{
@@ -20,11 +20,13 @@ use crate::{
         },
         path_builder,
         s3_connection::S3ConnectionConfig,
-        test_utils::S3RegistryTestCase,
+        test_utils::{S3RegistryTestCase, put_blob_direct},
     },
     secret::Secret,
 };
-use angos_storage::{Etag, MultipartStore, ObjectStore, Part};
+use angos_s3_client::Backend as S3HttpBackend;
+use angos_storage::{ConditionalStore, Etag, ObjectStore, Part, s3::Backend as StorageS3Backend};
+use angos_tx_engine::{executor::build_executor, lock::LockStrategy};
 
 #[test]
 fn first_part_when_no_parts_uploaded() {
@@ -114,7 +116,7 @@ struct UniformTestCase {
 impl UniformTestCase {
     fn new() -> Self {
         let key_prefix = format!("test-uniform-{}", Uuid::new_v4());
-        let store = blob_store::s3::Backend::new(&blob_store::s3::BackendConfig {
+        let config = blob_store::s3::BackendConfig {
             connection: S3ConnectionConfig {
                 access_key_id: Secret::new("root".to_string()),
                 secret_key: Secret::new("roottoor".to_string()),
@@ -128,8 +130,45 @@ impl UniformTestCase {
                 multipart_uniform_parts: true,
                 ..blob_store::s3::TransportFields::default()
             },
-        })
-        .unwrap();
+        };
+        let http = Arc::new(
+            S3HttpBackend::new(&config.connection.to_client_config()).expect("s3 http client"),
+        );
+        let raw_storage = Arc::new(
+            StorageS3Backend::builder()
+                .client(http)
+                .build()
+                .expect("s3 storage"),
+        );
+        let object_store: std::sync::Arc<dyn ObjectStore> = raw_storage.clone();
+        let conditional: std::sync::Arc<dyn ConditionalStore> = raw_storage;
+        let executor = build_executor(
+            object_store,
+            Some(conditional),
+            LockStrategy::Memory,
+            None,
+            false,
+            false,
+        )
+        .expect("s3 executor");
+        let store = blob_store::s3::Backend::builder()
+            .access_key_id(config.connection.access_key_id.clone())
+            .secret_key(config.connection.secret_key.clone())
+            .endpoint(&config.connection.endpoint)
+            .bucket(&config.connection.bucket)
+            .region(&config.connection.region)
+            .key_prefix(&config.connection.key_prefix)
+            .multipart_copy_threshold(config.transport.multipart_copy_threshold)
+            .multipart_copy_chunk_size(config.transport.multipart_copy_chunk_size)
+            .multipart_copy_jobs(config.transport.multipart_copy_jobs)
+            .multipart_part_size(config.transport.multipart_part_size)
+            .multipart_uniform_parts(config.transport.multipart_uniform_parts)
+            .operation_timeout_secs(config.transport.operation_timeout_secs)
+            .operation_attempt_timeout_secs(config.transport.operation_attempt_timeout_secs)
+            .max_attempts(config.transport.max_attempts)
+            .executor(executor)
+            .build()
+            .unwrap();
         Self { key_prefix, store }
     }
 
@@ -356,10 +395,11 @@ async fn test_delete_prefix_removes_all_objects() {
 #[tokio::test]
 async fn test_delete_blob_removes_all_data() {
     let t = S3RegistryTestCase::new();
-    let store: &dyn BlobStore = t.blob_store();
+    let backend = t.blob_store();
+    let store: &dyn BlobStore = backend;
 
     let content = b"blob content for delete test";
-    let digest = store.create(content).await.unwrap();
+    let digest = put_blob_direct(&backend.store, content).await;
 
     let read_result = store.read(&digest).await;
     assert!(read_result.is_ok(), "Blob should exist after creation");
@@ -607,108 +647,5 @@ async fn test_uniform_round_trip_integrity() {
         blob_data, expected_content,
         "Round-tripped blob content must exactly match the original upload"
     );
-    t.cleanup().await;
-}
-
-/// Creates a raw S3 multipart upload without a `startedat` marker, making it a
-/// genuine orphan from the registry's perspective.  With a zero timeout every
-/// upload satisfies `age >= 0`, so listing must return it and aborting must
-/// remove it.
-#[tokio::test]
-async fn test_cleanup_orphan_multipart_uploads_aborts_old_uploads() {
-    let t = S3RegistryTestCase::new();
-    let backend = t.blob_store();
-
-    // Build a key that parses correctly as an upload path so the orphan check
-    // proceeds past `parse_upload_key` — but deliberately omit the `startedat`
-    // object so the registry treats it as a leaked upload.
-    let uuid = Uuid::new_v4().to_string();
-    let upload_key = path_builder::upload_path("ns", &uuid);
-
-    backend.store.create_multipart(&upload_key).await.unwrap();
-
-    // Verify the upload is visible before cleanup.
-    let page_before = backend
-        .store
-        .list_multipart_uploads(None, None, None)
-        .await
-        .unwrap();
-    assert!(
-        page_before.uploads.iter().any(|u| u.key == upload_key),
-        "orphan upload should appear in list before cleanup"
-    );
-
-    // A zero timeout means every upload, no matter how fresh, satisfies `age >= 0`.
-    let orphans: Vec<OrphanMultipartUpload> = backend
-        .list_orphan_multipart_uploads(Duration::zero())
-        .await
-        .unwrap();
-    assert!(
-        !orphans.is_empty(),
-        "at least the orphan upload must appear in the listing"
-    );
-
-    for orphan in &orphans {
-        backend.abort_orphan_multipart_upload(orphan).await.unwrap();
-    }
-
-    // The upload must no longer appear in the listing.
-    let page_after = backend
-        .store
-        .list_multipart_uploads(None, None, None)
-        .await
-        .unwrap();
-    assert!(
-        !page_after.uploads.iter().any(|u| u.key == upload_key),
-        "orphan upload must be gone from the list after abort"
-    );
-    t.cleanup().await;
-}
-
-/// Listing orphans is pure observation — it must not modify state.  Not calling
-/// abort after listing is the structural equivalent of the old dry-run mode.
-#[tokio::test]
-async fn test_list_orphan_multipart_uploads_does_not_modify_state() {
-    let t = S3RegistryTestCase::new();
-    let backend = t.blob_store();
-
-    let uuid = Uuid::new_v4().to_string();
-    let upload_key = path_builder::upload_path("ns-dry", &uuid);
-
-    backend.store.create_multipart(&upload_key).await.unwrap();
-
-    // List with zero timeout: the just-created upload must appear as an orphan.
-    let orphans = backend
-        .list_orphan_multipart_uploads(Duration::zero())
-        .await
-        .unwrap();
-    assert!(
-        orphans.iter().any(|o| o.key == upload_key),
-        "orphan upload must appear in list"
-    );
-
-    // Re-list the raw multipart uploads: listing must not have modified state.
-    let page_after = backend
-        .store
-        .list_multipart_uploads(None, None, None)
-        .await
-        .unwrap();
-    assert!(
-        page_after.uploads.iter().any(|u| u.key == upload_key),
-        "listing orphans must not abort the upload; it must still appear in the listing"
-    );
-
-    // Clean up the lingering multipart upload so MinIO stays tidy.
-    let pending = backend
-        .store
-        .list_multipart_uploads(None, None, None)
-        .await
-        .unwrap();
-    for upload in pending.uploads.into_iter().filter(|u| u.key == upload_key) {
-        let _ = backend
-            .store
-            .abort_multipart(&upload.key, &upload.upload_id)
-            .await;
-    }
     t.cleanup().await;
 }

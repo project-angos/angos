@@ -1,7 +1,12 @@
 use hyper::StatusCode;
 
 use super::Error;
-use crate::{command::bootstrap, configuration, event_webhook, registry};
+use crate::{
+    command::bootstrap,
+    configuration::{self, registry_storage},
+    event_webhook, registry,
+    registry::blob_store,
+};
 
 fn oci_error(status_code: StatusCode, code: &'static str, msg: Option<String>) -> Error {
     Error::Custom {
@@ -76,6 +81,9 @@ impl From<bootstrap::Error> for Error {
             bootstrap::Error::MetadataStore(inner) => {
                 Error::Initialization(format!("Failed to initialize metadata store: {inner}"))
             }
+            bootstrap::Error::RegistryStorage(inner) => {
+                Error::Initialization(format!("Failed to initialize storage handles: {inner}"))
+            }
             bootstrap::Error::Cache(inner) => {
                 Error::Initialization(format!("Failed to initialize auth token cache: {inner}"))
             }
@@ -87,6 +95,18 @@ impl From<bootstrap::Error> for Error {
                 Error::Initialization(format!("Failed to initialize job queue: {inner}"))
             }
         }
+    }
+}
+
+impl From<registry_storage::Error> for Error {
+    fn from(e: registry_storage::Error) -> Self {
+        Error::Initialization(e.to_string())
+    }
+}
+
+impl From<blob_store::Error> for Error {
+    fn from(_: blob_store::Error) -> Self {
+        Error::Initialization("Failed to initialize blob store".to_string())
     }
 }
 

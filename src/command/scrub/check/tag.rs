@@ -19,13 +19,13 @@ use crate::{
 
 pub struct TagChecker {
     blob_store: Arc<dyn BlobStore + Send + Sync>,
-    metadata_store: Arc<dyn MetadataStore + Send + Sync>,
+    metadata_store: Arc<MetadataStore>,
 }
 
 impl TagChecker {
     pub fn new(
         blob_store: Arc<dyn BlobStore + Send + Sync>,
-        metadata_store: Arc<dyn MetadataStore + Send + Sync>,
+        metadata_store: Arc<MetadataStore>,
     ) -> Self {
         Self {
             blob_store,
@@ -102,7 +102,7 @@ mod tests {
         oci::Namespace,
         registry::{
             metadata_store::{LinkOperation, link_kind::LinkKind},
-            test_utils::{self, NoopMultipart, backends},
+            test_utils::{self, backends, put_blob_direct},
         },
     };
 
@@ -133,7 +133,6 @@ mod tests {
                 blob_store.clone(),
                 metadata_store.clone(),
                 test_case.upload_store(),
-                std::sync::Arc::new(NoopMultipart),
             );
 
             let scrubber = TagChecker::new(blob_store.clone(), metadata_store.clone());
@@ -181,7 +180,6 @@ mod tests {
                 blob_store.clone(),
                 metadata_store.clone(),
                 test_case.upload_store(),
-                std::sync::Arc::new(NoopMultipart),
             );
 
             let scrubber = TagChecker::new(blob_store.clone(), metadata_store.clone());
@@ -231,7 +229,6 @@ mod tests {
                 blob_store.clone(),
                 metadata_store.clone(),
                 test_case.upload_store(),
-                std::sync::Arc::new(NoopMultipart),
             );
 
             let scrubber = TagChecker::new(blob_store.clone(), metadata_store.clone());
@@ -263,10 +260,8 @@ mod tests {
             let blob_store = test_case.blob_store();
 
             // Write the blob and manually create digest + tag links so both are present.
-            let blob_digest = blob_store
-                .create(b"manifest for dry-run test")
-                .await
-                .unwrap();
+            let blob_digest =
+                put_blob_direct(metadata_store.store(), b"manifest for dry-run test").await;
             metadata_store
                 .update_links(
                     namespace,

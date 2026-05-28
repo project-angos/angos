@@ -8,7 +8,7 @@ use crate::{
     oci::{Digest, Namespace},
     registry::{
         DOCKER_UPLOAD_UUID, Error, HeaderMap, Registry, ResponseHeaders,
-        blob_ownership::BlobOwnership, blob_store, metadata_store::Error as MetadataError,
+        blob_ownership::BlobOwnership, blob_store,
     },
     util::sha256::finalize_digest,
 };
@@ -122,42 +122,19 @@ impl Registry {
     where
         S: AsyncRead + Unpin,
     {
-        let guard = self.metadata_store.acquire_blob_data_lock(digest).await?;
-        let blob_exists = self.blob_store.size(digest).await.is_ok();
-
-        if !blob_exists {
-            let lock_valid = guard.is_valid();
-            guard.release().await;
-            if !lock_valid {
-                return Err(MetadataError::Lock(
-                    "lock invalidated during upload completion".into(),
-                )
-                .into());
-            }
+        if self.blob_store.size(digest).await.is_err() {
             return Ok(false);
         }
 
-        let result = async {
-            let upload_digest = hash_upload_stream(stream, content_length).await?;
-            if &upload_digest != digest {
-                warn!("Expected digest '{digest}', got '{upload_digest}'");
-                return Err(Error::DigestInvalid);
-            }
-
-            BlobOwnership::new(self.metadata_store.as_ref())
-                .grant(namespace, digest)
-                .await
+        let upload_digest = hash_upload_stream(stream, content_length).await?;
+        if &upload_digest != digest {
+            warn!("Expected digest '{digest}', got '{upload_digest}'");
+            return Err(Error::DigestInvalid);
         }
-        .await;
-        let lock_valid = guard.is_valid();
-        guard.release().await;
 
-        result?;
-        if !lock_valid {
-            return Err(
-                MetadataError::Lock("lock invalidated during upload completion".into()).into(),
-            );
-        }
+        BlobOwnership::new(self.metadata_store.as_ref())
+            .grant(namespace, digest)
+            .await?;
 
         Ok(true)
     }
@@ -297,32 +274,19 @@ impl Registry {
             return Err(Error::DigestInvalid);
         }
 
-        let guard = self.metadata_store.acquire_blob_data_lock(digest).await?;
-        let result = async {
-            match self.blob_store.size(digest).await {
-                Ok(_) => {}
-                Err(blob_store::Error::BlobNotFound | blob_store::Error::ReferenceNotFound) => {
-                    self.upload_store
-                        .complete(namespace, &session_key, Some(digest))
-                        .await?;
-                }
-                Err(error) => return Err(Error::from(error)),
+        match self.blob_store.size(digest).await {
+            Ok(_) => {}
+            Err(blob_store::Error::BlobNotFound | blob_store::Error::ReferenceNotFound) => {
+                self.upload_store
+                    .complete(namespace, &session_key, Some(digest))
+                    .await?;
             }
-
-            BlobOwnership::new(self.metadata_store.as_ref())
-                .grant(namespace, digest)
-                .await
+            Err(error) => return Err(Error::from(error)),
         }
-        .await;
-        let lock_valid = guard.is_valid();
-        guard.release().await;
 
-        result?;
-        if !lock_valid {
-            return Err(
-                MetadataError::Lock("lock invalidated during upload completion".into()).into(),
-            );
-        }
+        BlobOwnership::new(self.metadata_store.as_ref())
+            .grant(namespace, digest)
+            .await?;
 
         Ok(self
             .finish_completed_upload(actor, namespace, &session_key, digest)
@@ -366,6 +330,8 @@ mod tests {
     use hyper::header::{LOCATION, RANGE};
     use uuid::Uuid;
 
+    use angos_tx_engine::transaction::Mutation;
+
     use crate::{
         event_webhook::event::EventKind,
         oci::{Digest, Namespace},
@@ -376,7 +342,10 @@ mod tests {
             blob_store::{BoxedReader, UploadStore, UploadSummary},
             metadata_store::link_kind::LinkKind,
             path_builder,
-            test_utils::{FSRegistryTestCase, RegistryTestCase, backends, create_test_registry},
+            test_utils::{
+                FSRegistryTestCase, RegistryTestCase, backends, create_test_registry,
+                put_blob_direct,
+            },
         },
         util::sha256,
     };
@@ -438,6 +407,17 @@ mod tests {
             self.inner.complete(namespace, uuid, digest).await
         }
 
+        async fn finalize_mutations(
+            &self,
+            namespace: &str,
+            uuid: &str,
+            expected_digest: Option<&Digest>,
+        ) -> Result<(Digest, Vec<Mutation>), blob_store::Error> {
+            self.inner
+                .finalize_mutations(namespace, uuid, expected_digest)
+                .await
+        }
+
         async fn delete(&self, _namespace: &str, _uuid: &str) -> Result<(), blob_store::Error> {
             Err(blob_store::Error::StorageBackend(
                 "delete failed".to_string(),
@@ -489,6 +469,17 @@ mod tests {
         ) -> Result<Digest, blob_store::Error> {
             Err(blob_store::Error::StorageBackend(
                 "complete should not be called for existing blob data".to_string(),
+            ))
+        }
+
+        async fn finalize_mutations(
+            &self,
+            _namespace: &str,
+            _uuid: &str,
+            _expected_digest: Option<&Digest>,
+        ) -> Result<(Digest, Vec<Mutation>), blob_store::Error> {
+            Err(blob_store::Error::StorageBackend(
+                "finalize_mutations should not be called for existing blob data".to_string(),
             ))
         }
 
@@ -544,6 +535,18 @@ mod tests {
             ))
         }
 
+        async fn finalize_mutations(
+            &self,
+            _namespace: &str,
+            _uuid: &str,
+            _expected_digest: Option<&Digest>,
+        ) -> Result<(Digest, Vec<Mutation>), blob_store::Error> {
+            Err(blob_store::Error::StorageBackend(
+                "finalize_mutations should not be called for monolithic existing blob upload"
+                    .to_string(),
+            ))
+        }
+
         async fn delete(&self, namespace: &str, uuid: &str) -> Result<(), blob_store::Error> {
             self.inner.delete(namespace, uuid).await
         }
@@ -568,7 +571,7 @@ mod tests {
                 StartUploadResponse::ExistingBlob { .. } => panic!("Expected Session response"),
             }
 
-            let digest = registry.blob_store.create(content).await.unwrap();
+            let digest = put_blob_direct(registry.metadata_store.store(), content).await;
             let response = registry
                 .start_upload(namespace, Some(digest.clone()))
                 .await
@@ -789,7 +792,7 @@ mod tests {
         let first_namespace = &Namespace::new("test-repo/first").unwrap();
         let second_namespace = &Namespace::new("test-repo/second").unwrap();
         let content = b"shared upload content";
-        let digest = registry.blob_store.create(content).await.unwrap();
+        let digest = put_blob_direct(registry.metadata_store.store(), content).await;
 
         BlobOwnership::new(registry.metadata_store.as_ref())
             .grant(first_namespace, &digest)
@@ -857,7 +860,7 @@ mod tests {
         let first_namespace = &Namespace::new("test-repo/first").unwrap();
         let second_namespace = &Namespace::new("test-repo/second").unwrap();
         let content = b"shared monolithic upload content";
-        let digest = registry.blob_store.create(content).await.unwrap();
+        let digest = put_blob_direct(registry.metadata_store.store(), content).await;
 
         BlobOwnership::new(registry.metadata_store.as_ref())
             .grant(first_namespace, &digest)
@@ -1152,14 +1155,16 @@ mod tests {
 
         assert_eq!(summary.size, content.len() as u64);
 
-        let hash_state_path = path_builder::upload_hash_context_path(
-            namespace,
-            &session_id.to_string(),
-            "sha256",
-            summary.size,
-        );
-        let full_path = test_case.temp_dir().path().join(&hash_state_path);
-        std::fs::write(&full_path, b"corrupted data").unwrap();
+        // Corrupt the session record's hash_context field so that
+        // `complete_upload` cannot reconstruct the final digest. On the
+        // engine path the hash state lives in the session JSON (not in a
+        // legacy `hashstates/sha256/<offset>` file).
+        let session_path = path_builder::upload_session_path(namespace, &session_id.to_string());
+        let session_file_path = test_case.temp_dir().path().join(&session_path);
+        let session_bytes = std::fs::read(&session_file_path).unwrap();
+        let mut session: serde_json::Value = serde_json::from_slice(&session_bytes).unwrap();
+        session["hash_context"] = serde_json::Value::String("not-valid-base64!!!".to_string());
+        std::fs::write(&session_file_path, serde_json::to_vec(&session).unwrap()).unwrap();
 
         let empty_stream = Cursor::new(Vec::new());
         let result = registry

@@ -1,13 +1,15 @@
 mod config;
 mod error;
 pub mod fs;
-mod hashing_reader;
+pub mod hashing_reader;
 pub mod s3;
-mod sha256_ext;
+pub mod sha256_ext;
+pub mod upload_session;
 
+use angos_tx_engine::transaction::Mutation;
 use async_trait::async_trait;
-use chrono::{DateTime, Duration, Utc};
-pub use config::{BlobStorageConfig, BlobStoreHandles};
+use chrono::{DateTime, Utc};
+pub use config::BlobStorageConfig;
 pub use error::Error;
 use tokio::io::AsyncRead;
 
@@ -29,8 +31,6 @@ pub trait BlobStore: Send + Sync {
         n: u16,
         continuation_token: Option<String>,
     ) -> Result<(Vec<Digest>, Option<String>), Error>;
-
-    async fn create(&self, content: &[u8]) -> Result<Digest, Error>;
 
     async fn read(&self, digest: &Digest) -> Result<Vec<u8>, Error>;
 
@@ -74,6 +74,19 @@ pub trait UploadStore: Send + Sync {
         digest: Option<&Digest>,
     ) -> Result<Digest, Error>;
 
+    /// Run backend-specific finalization side-effects (FS: nothing extra;
+    /// S3: `CompleteMultipartUpload`) and return the engine mutations that
+    /// atomically promote the staged bytes to `blob-data/<digest>` and delete
+    /// the upload-session record. The caller embeds these mutations in a
+    /// larger `Transaction`; the staged bytes sit at a well-known key until
+    /// the transaction commits the Move or scrub reclaims them.
+    async fn finalize_mutations(
+        &self,
+        namespace: &str,
+        uuid: &str,
+        expected_digest: Option<&Digest>,
+    ) -> Result<(Digest, Vec<Mutation>), Error>;
+
     async fn delete(&self, namespace: &str, uuid: &str) -> Result<(), Error>;
 }
 
@@ -86,35 +99,12 @@ pub trait PresignedBlobStore: Send + Sync {
     ) -> Result<Option<String>, Error>;
 }
 
-pub struct OrphanMultipartUpload {
-    pub key: String,
-    pub upload_id: String,
-}
-
-#[async_trait]
-pub trait MultipartCleanup: Send + Sync {
-    /// Lists multipart uploads that have exceeded `timeout` and are not
-    /// associated with a live upload session (i.e., the start-date marker is
-    /// gone).  Pure discovery — does not modify any state.
-    async fn list_orphan_multipart_uploads(
-        &self,
-        timeout: Duration,
-    ) -> Result<Vec<OrphanMultipartUpload>, Error>;
-
-    /// Aborts a single orphan upload previously returned by
-    /// `list_orphan_multipart_uploads`.
-    async fn abort_orphan_multipart_upload(
-        &self,
-        upload: &OrphanMultipartUpload,
-    ) -> Result<(), Error>;
-}
-
 #[cfg(test)]
 mod tests {
     use std::io::Cursor;
 
-    use chrono::Duration;
-    use sha2::{Digest, Sha256};
+    use chrono::{Duration, Utc};
+    use sha2::{Digest as Sha2Digest, Sha256};
     use tokio::io::AsyncReadExt;
     use uuid::Uuid;
 
@@ -177,7 +167,37 @@ mod tests {
         assert!(!uploads_after_complete.contains(&upload_to_complete.to_string()));
     }
 
-    pub async fn test_datastore_list_blobs(store: &impl BlobStore) {
+    /// Seed the backend with `content` at the canonical blob path by
+    /// driving the upload workflow (`create` → `write` → `complete`). This
+    /// mirrors how production creates blobs and replaces the previous
+    /// `BlobStore::create` shortcut.
+    async fn seed_blob<S>(store: &S, content: &[u8]) -> Digest
+    where
+        S: UploadStore + ?Sized,
+    {
+        let namespace = Namespace::new("test/setup").unwrap();
+        let uuid = Uuid::new_v4().to_string();
+        store.create(namespace.as_ref(), &uuid).await.unwrap();
+        store
+            .write(
+                namespace.as_ref(),
+                &uuid,
+                Box::new(Cursor::new(content.to_vec())),
+                content.len() as u64,
+                false,
+            )
+            .await
+            .unwrap();
+        store
+            .complete(namespace.as_ref(), &uuid, None)
+            .await
+            .unwrap()
+    }
+
+    pub async fn test_datastore_list_blobs<S>(store: &S)
+    where
+        S: BlobStore + UploadStore,
+    {
         let blob_contents = [
             b"aaa_content_1".to_vec(),
             b"bbb_content_2".to_vec(),
@@ -186,43 +206,46 @@ mod tests {
 
         let mut digests = Vec::new();
         for content in &blob_contents {
-            let digest = store.create(content).await.unwrap();
+            let digest = seed_blob(store, content).await;
             digests.push(digest);
         }
 
         // Test without pagination
-        let (blobs, _token) = store.list(10, None).await.unwrap();
+        let (blobs, _token) = BlobStore::list(store, 10, None).await.unwrap();
         assert!(blobs.len() >= blob_contents.len());
         for digest in &digests {
             assert!(blobs.contains(digest));
         }
 
         // Test pagination (2 items per page)
-        let (page1, token1) = store.list(2, None).await.unwrap();
+        let (page1, token1) = BlobStore::list(store, 2, None).await.unwrap();
         assert_eq!(page1.len(), 2);
         assert!(token1.is_some());
 
-        let (page2, token2) = store.list(2, token1).await.unwrap();
+        let (page2, token2) = BlobStore::list(store, 2, token1).await.unwrap();
         assert_eq!(page2.len(), 1);
         assert!(token2.is_none());
 
         // Test pagination (1 item per page)
-        let (page1, token1) = store.list(1, None).await.unwrap();
+        let (page1, token1) = BlobStore::list(store, 1, None).await.unwrap();
         assert_eq!(page1.len(), 1);
         assert!(token1.is_some());
 
-        let (page2, token2) = store.list(1, token1).await.unwrap();
+        let (page2, token2) = BlobStore::list(store, 1, token1).await.unwrap();
         assert_eq!(page2.len(), 1);
         assert!(token2.is_some());
 
-        let (page3, token3) = store.list(1, token2).await.unwrap();
+        let (page3, token3) = BlobStore::list(store, 1, token2).await.unwrap();
         assert_eq!(page3.len(), 1);
         assert!(token3.is_none());
     }
 
-    pub async fn test_datastore_blob_operations(store: &impl BlobStore) {
+    pub async fn test_datastore_blob_operations<S>(store: &S)
+    where
+        S: BlobStore + UploadStore,
+    {
         let test_content = b"Test blob content";
-        let digest = store.create(test_content).await.unwrap();
+        let digest = seed_blob(store, test_content).await;
 
         let retrieved_content = store.read(&digest).await.unwrap();
         assert_eq!(retrieved_content, test_content);
@@ -239,9 +262,12 @@ mod tests {
         assert_eq!(buffer, test_content);
     }
 
-    pub async fn test_build_blob_reader_returns_size(store: &impl BlobStore) {
+    pub async fn test_build_blob_reader_returns_size<S>(store: &S)
+    where
+        S: BlobStore + UploadStore,
+    {
         let test_content = b"blob reader size test content";
-        let digest = store.create(test_content).await.unwrap();
+        let digest = seed_blob(store, test_content).await;
 
         let (mut reader, size) = store.reader(&digest, None).await.unwrap();
         assert_eq!(size, test_content.len() as u64);
@@ -252,9 +278,12 @@ mod tests {
     }
 
     #[allow(clippy::cast_possible_truncation)]
-    pub async fn test_build_blob_reader_with_offset_returns_full_size(store: &impl BlobStore) {
+    pub async fn test_build_blob_reader_with_offset_returns_full_size<S>(store: &S)
+    where
+        S: BlobStore + UploadStore,
+    {
         let test_content = b"offset blob reader content here";
-        let digest = store.create(test_content).await.unwrap();
+        let digest = seed_blob(store, test_content).await;
         let offset = 10u64;
 
         let (mut reader, size) = store.reader(&digest, Some(offset)).await.unwrap();

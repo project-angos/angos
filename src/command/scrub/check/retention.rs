@@ -28,7 +28,7 @@ struct TagWithMetadata {
 }
 
 pub struct RetentionChecker {
-    metadata_store: Arc<dyn MetadataStore + Send + Sync>,
+    metadata_store: Arc<MetadataStore>,
     resolver: Arc<RepositoryResolver>,
     global_retention_policy: Option<Arc<RetentionPolicy>>,
 }
@@ -143,7 +143,7 @@ fn decide_orphan_fate(
 
 impl RetentionChecker {
     pub fn new(
-        metadata_store: Arc<dyn MetadataStore + Send + Sync>,
+        metadata_store: Arc<MetadataStore>,
         resolver: Arc<RepositoryResolver>,
         global_retention_policy: Option<Arc<RetentionPolicy>>,
     ) -> Self {
@@ -448,7 +448,7 @@ mod tests {
             blob_store::{BlobStore, UploadStore},
             metadata_store::LinkOperation,
             repository_resolver::RepositoryResolver,
-            test_utils::{self, NoopMultipart, backends},
+            test_utils::{self, backends, put_blob_direct},
         },
     };
 
@@ -477,19 +477,14 @@ mod tests {
 
     fn make_executor(
         blob_store: Arc<dyn BlobStore + Send + Sync>,
-        metadata_store: Arc<dyn MetadataStore + Send + Sync>,
+        metadata_store: Arc<MetadataStore>,
         upload_store: Arc<dyn UploadStore>,
     ) -> Executor {
-        Executor::new(
-            blob_store,
-            metadata_store,
-            upload_store,
-            Arc::new(NoopMultipart),
-        )
+        Executor::new(blob_store, metadata_store, upload_store)
     }
 
     async fn setup_index_scenario(
-        metadata_store: &Arc<dyn MetadataStore + Send + Sync>,
+        metadata_store: &Arc<MetadataStore>,
         namespace: &str,
         index_digest: &Digest,
         child_digest: &Digest,
@@ -521,7 +516,7 @@ mod tests {
     }
 
     async fn teardown_index_scenario(
-        metadata_store: &Arc<dyn MetadataStore + Send + Sync>,
+        metadata_store: &Arc<MetadataStore>,
         namespace: &str,
         index_digest: Digest,
         child_digest: &Digest,
@@ -725,10 +720,9 @@ mod tests {
     async fn test_orphan_manifest_deleted_with_policy() {
         for test_case in backends() {
             let namespace = "test-repo/app";
-            let blob_store = test_case.blob_store();
             let metadata_store = test_case.metadata_store();
 
-            let digest = blob_store.create(TEST_MANIFEST).await.unwrap();
+            let digest = put_blob_direct(metadata_store.store(), TEST_MANIFEST).await;
 
             metadata_store
                 .update_links(
@@ -776,10 +770,9 @@ mod tests {
     async fn test_orphan_manifest_kept_without_policy() {
         for test_case in backends() {
             let namespace = "test-repo/app";
-            let blob_store = test_case.blob_store();
             let metadata_store = test_case.metadata_store();
 
-            let digest = blob_store.create(TEST_MANIFEST).await.unwrap();
+            let digest = put_blob_direct(metadata_store.store(), TEST_MANIFEST).await;
 
             metadata_store
                 .update_links(
@@ -820,11 +813,10 @@ mod tests {
     async fn test_index_child_manifest_protected() {
         for test_case in backends() {
             let namespace = "test-repo/app";
-            let blob_store = test_case.blob_store();
             let metadata_store = test_case.metadata_store();
 
-            let child_digest = blob_store.create(TEST_MANIFEST).await.unwrap();
-            let index_digest = blob_store.create(TEST_INDEX).await.unwrap();
+            let child_digest = put_blob_direct(metadata_store.store(), TEST_MANIFEST).await;
+            let index_digest = put_blob_direct(metadata_store.store(), TEST_INDEX).await;
 
             setup_index_scenario(&metadata_store, namespace, &index_digest, &child_digest).await;
 
@@ -942,7 +934,7 @@ mod tests {
             let metadata_store = test_case.metadata_store();
 
             // First revision: write blob, then delete it so the executor encounters a missing blob.
-            let digest_missing = blob_store.create(TEST_MANIFEST).await.unwrap();
+            let digest_missing = put_blob_direct(metadata_store.store(), TEST_MANIFEST).await;
             metadata_store
                 .update_links(
                     namespace,
@@ -956,7 +948,7 @@ mod tests {
             blob_store.delete(&digest_missing).await.unwrap();
 
             // Second revision: healthy manifest blob with a digest link.
-            let digest_healthy = blob_store.create(TEST_INDEX).await.unwrap();
+            let digest_healthy = put_blob_direct(metadata_store.store(), TEST_INDEX).await;
             metadata_store
                 .update_links(
                     namespace,

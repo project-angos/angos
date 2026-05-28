@@ -8,15 +8,14 @@ use crate::{
     command::scrub::{
         check::{
             BlobChecker, LayoutChecker, LinkReferencesChecker, ManifestChecker, MediaTypeChecker,
-            MultipartChecker, NamespaceChecker, ReferrerChecker, RetentionChecker, TagChecker,
-            UploadChecker,
+            NamespaceChecker, ReferrerChecker, RetentionChecker, TagChecker, UploadChecker,
         },
         error::Error,
     },
     configuration::Configuration,
     policy::{RetentionPolicy, RetentionPolicyConfig, SystemClock},
     registry::{
-        blob_store::{BlobStore, MultipartCleanup, UploadStore},
+        blob_store::{BlobStore, UploadStore},
         metadata_store::MetadataStore,
         repository_resolver::RepositoryResolver,
     },
@@ -38,7 +37,7 @@ pub fn namespace_checkers(
     config: &Configuration,
     blob_store: &Arc<dyn BlobStore>,
     upload_store: &Arc<dyn UploadStore>,
-    metadata_store: &Arc<dyn MetadataStore + Send + Sync>,
+    metadata_store: &Arc<MetadataStore>,
     resolver: &Arc<RepositoryResolver>,
 ) -> Result<Vec<Box<dyn NamespaceChecker>>, Error> {
     let mut checkers: Vec<Box<dyn NamespaceChecker>> = Vec::new();
@@ -107,23 +106,11 @@ pub fn layout_checker(blob_store: &Arc<dyn BlobStore>) -> LayoutChecker {
 pub fn blob_checker(
     options: &Options,
     blob_store: &Arc<dyn BlobStore>,
-    metadata_store: &Arc<dyn MetadataStore + Send + Sync>,
+    metadata_store: &Arc<MetadataStore>,
 ) -> Option<BlobChecker> {
     options
         .blobs
         .then(|| BlobChecker::new(blob_store.clone(), metadata_store.clone()))
-}
-
-pub fn multipart_checker(
-    options: &Options,
-    cleanup: Arc<dyn MultipartCleanup + Send + Sync>,
-) -> Result<Option<MultipartChecker>, Error> {
-    let Some(multipart_timeout) = options.multipart else {
-        return Ok(None);
-    };
-    let multipart_timeout = Duration::from_std(multipart_timeout.into())
-        .map_err(|e| Error::Initialization(format!("Multipart timeout is invalid: {e}")))?;
-    Ok(Some(MultipartChecker::new(cleanup, multipart_timeout)))
 }
 
 #[cfg(test)]

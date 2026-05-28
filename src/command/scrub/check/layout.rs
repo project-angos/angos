@@ -51,20 +51,26 @@ impl StoreChecker for LayoutChecker {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::registry::blob_store::{self, BlobStore};
+    use crate::registry::{
+        blob_store,
+        test_utils::{build_test_fs_executor, put_blob_direct},
+    };
     use tempfile::TempDir;
 
     #[tokio::test]
     async fn layout_checker_emits_namespace_and_blob_migration_actions() {
         let temp_dir = TempDir::new().unwrap();
+        let root_dir = temp_dir.path().to_string_lossy().into_owned();
+        let executor = build_test_fs_executor(&root_dir, false);
         let blob_store = Arc::new(
-            blob_store::fs::Backend::new(&crate::registry::blob_store::fs::BackendConfig {
-                root_dir: temp_dir.path().to_string_lossy().into_owned(),
-                sync_to_disk: false,
-            })
-            .unwrap(),
+            blob_store::fs::Backend::builder()
+                .root_dir(&root_dir)
+                .sync_to_disk(false)
+                .executor(executor)
+                .build()
+                .unwrap(),
         );
-        let digest = blob_store.create(b"layout migration").await.unwrap();
+        let digest = put_blob_direct(&blob_store.store, b"layout migration").await;
 
         let checker = LayoutChecker::new(blob_store);
         let mut actions = Vec::new();

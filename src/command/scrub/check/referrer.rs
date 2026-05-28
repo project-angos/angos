@@ -16,11 +16,11 @@ use crate::{
 };
 
 pub struct ReferrerChecker {
-    metadata_store: Arc<dyn MetadataStore + Send + Sync>,
+    metadata_store: Arc<MetadataStore>,
 }
 
 impl ReferrerChecker {
-    pub fn new(metadata_store: Arc<dyn MetadataStore + Send + Sync>) -> Self {
+    pub fn new(metadata_store: Arc<MetadataStore>) -> Self {
         Self { metadata_store }
     }
 
@@ -93,13 +93,12 @@ mod tests {
         oci::{Descriptor, Digest, Namespace},
         registry::{
             metadata_store::{LinkOperation, link_kind::LinkKind},
-            test_utils::{NoopMultipart, backends},
+            test_utils::{backends, put_blob_direct},
         },
     };
 
     async fn push_referrer_link(
-        metadata_store: &Arc<dyn MetadataStore + Send + Sync>,
-        blob_store: &Arc<dyn crate::registry::blob_store::BlobStore>,
+        metadata_store: &Arc<MetadataStore>,
         namespace: &Namespace,
         subject: &Digest,
     ) -> Digest {
@@ -122,7 +121,7 @@ mod tests {
         );
 
         let manifest_bytes = manifest_content.as_bytes();
-        let manifest_digest = blob_store.create(manifest_bytes).await.unwrap();
+        let manifest_digest = put_blob_direct(metadata_store.store(), manifest_bytes).await;
 
         metadata_store
             .update_links(
@@ -159,7 +158,7 @@ mod tests {
             let metadata_store = test_case.metadata_store();
             let blob_store = test_case.blob_store();
 
-            let subject_digest = blob_store.create(b"subject manifest").await.unwrap();
+            let subject_digest = put_blob_direct(metadata_store.store(), b"subject manifest").await;
             metadata_store
                 .update_links(
                     namespace,
@@ -172,7 +171,7 @@ mod tests {
                 .unwrap();
 
             let referrer_digest =
-                push_referrer_link(&metadata_store, &blob_store, namespace, &subject_digest).await;
+                push_referrer_link(&metadata_store, namespace, &subject_digest).await;
 
             // Verify the Referrer link exists.
             assert!(
@@ -202,7 +201,6 @@ mod tests {
                 blob_store.clone(),
                 metadata_store.clone(),
                 test_case.upload_store(),
-                std::sync::Arc::new(NoopMultipart),
             );
 
             let checker = ReferrerChecker::new(metadata_store.clone());
@@ -228,9 +226,9 @@ mod tests {
         for test_case in backends() {
             let namespace = &Namespace::new("test-repo/referrer-present").unwrap();
             let metadata_store = test_case.metadata_store();
-            let blob_store = test_case.blob_store();
 
-            let subject_digest = blob_store.create(b"subject manifest v2").await.unwrap();
+            let subject_digest =
+                put_blob_direct(metadata_store.store(), b"subject manifest v2").await;
             metadata_store
                 .update_links(
                     namespace,
@@ -243,7 +241,7 @@ mod tests {
                 .unwrap();
 
             let _referrer_digest =
-                push_referrer_link(&metadata_store, &blob_store, namespace, &subject_digest).await;
+                push_referrer_link(&metadata_store, namespace, &subject_digest).await;
 
             let checker = ReferrerChecker::new(metadata_store.clone());
             let mut sink: Vec<Action> = Vec::new();
@@ -262,9 +260,9 @@ mod tests {
         for test_case in backends() {
             let namespace = &Namespace::new("test-repo/referrer-dryrun").unwrap();
             let metadata_store = test_case.metadata_store();
-            let blob_store = test_case.blob_store();
 
-            let subject_digest = blob_store.create(b"subject manifest dry").await.unwrap();
+            let subject_digest =
+                put_blob_direct(metadata_store.store(), b"subject manifest dry").await;
             metadata_store
                 .update_links(
                     namespace,
@@ -277,7 +275,7 @@ mod tests {
                 .unwrap();
 
             let referrer_digest =
-                push_referrer_link(&metadata_store, &blob_store, namespace, &subject_digest).await;
+                push_referrer_link(&metadata_store, namespace, &subject_digest).await;
 
             // Create orphan state.
             metadata_store

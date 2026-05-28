@@ -69,10 +69,6 @@ pub fn blob_container_dir(digest: &Digest) -> String {
     blob_dir(digest)
 }
 
-pub fn uploads_root_dir(namespace: &str) -> String {
-    format!("{REPOS_ROOT}/{namespace}/_uploads")
-}
-
 pub fn upload_container_path(namespace: &str, uuid: &str) -> String {
     format!("{REPOS_ROOT}/{namespace}/_uploads/{uuid}")
 }
@@ -94,12 +90,24 @@ pub fn upload_hash_context_path(
     format!("{REPOS_ROOT}/{namespace}/_uploads/{uuid}/hashstates/{algorithm}/{offset}")
 }
 
-pub fn upload_start_date_path(namespace: &str, uuid: &str) -> String {
-    format!("{REPOS_ROOT}/{namespace}/_uploads/{uuid}/startedat")
-}
-
 pub fn upload_patch_pending_path(namespace: &str, uuid: &str) -> String {
     format!("{REPOS_ROOT}/{namespace}/_uploads/{uuid}/patches/pending")
+}
+
+/// Path for a durable upload-session record written by the engine-backed
+/// upload path. Lives under `upload-sessions/` — a top-level prefix that does
+/// not collide with any canonical key family.
+///
+/// Format: `upload-sessions/<namespace>/<uuid>.json`
+pub fn upload_session_path(namespace: &str, uuid: &str) -> String {
+    format!("upload-sessions/{namespace}/{uuid}.json")
+}
+
+/// Prefix under which all upload sessions for a namespace are stored.
+///
+/// Used by `UploadStore::list` and the recovery sweeper to enumerate sessions.
+pub fn upload_sessions_namespace_prefix(namespace: &str) -> String {
+    format!("upload-sessions/{namespace}/")
 }
 
 pub fn manifest_revisions_link_root_dir(namespace: &str, algorithm: &str) -> String {
@@ -124,10 +132,6 @@ pub fn job_pending_dir(queue: &str) -> String {
 
 pub fn job_pending_path(queue: &str, id: &str) -> String {
     format!("{JOBS_ROOT}/pending/{queue}/{id}.json")
-}
-
-pub fn job_lease_path(lock_key: &str) -> String {
-    format!("{JOBS_ROOT}/leases/{}.json", encode_job_lock_key(lock_key))
 }
 
 pub fn job_failed_path(queue: &str, id: &str) -> String {
@@ -240,7 +244,6 @@ mod tests {
 
     #[test]
     fn test_upload_paths() {
-        assert_eq!(uploads_root_dir("ns"), "v2/repositories/ns/_uploads");
         assert_eq!(
             upload_container_path("ns", "uuid"),
             "v2/repositories/ns/_uploads/uuid"
@@ -256,10 +259,6 @@ mod tests {
         assert_eq!(
             upload_hash_context_path("ns", "uuid", "sha256", 0),
             "v2/repositories/ns/_uploads/uuid/hashstates/sha256/0"
-        );
-        assert_eq!(
-            upload_start_date_path("ns", "uuid"),
-            "v2/repositories/ns/_uploads/uuid/startedat"
         );
     }
 
@@ -370,10 +369,6 @@ mod tests {
         assert_eq!(
             job_failed_path("cache", "01HABCDE"),
             "_jobs/failed/cache/01HABCDE.json"
-        );
-        assert_eq!(
-            job_lease_path("cache.ns:sha256:abc"),
-            "_jobs/leases/cache.ns%3Asha256%3Aabc.json"
         );
         assert_eq!(
             job_lock_key_index_path("cache", "cache.ns:sha256:abc"),

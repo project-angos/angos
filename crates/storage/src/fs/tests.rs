@@ -206,7 +206,7 @@ async fn copy_duplicates_object() {
 }
 
 /// `list_all_children` must return every child even when the directory
-/// contains more entries than a single page (page_size=2 used internally
+/// contains more entries than a single page (`page_size=2` used internally
 /// to exercise the pagination loop).
 #[tokio::test]
 async fn list_all_children_returns_all_entries_across_pages() {

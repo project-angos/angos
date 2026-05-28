@@ -10,6 +10,10 @@ use hyper::{Request, header::HeaderMap};
 use uuid::Uuid;
 use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};
 
+use angos_s3_client::Backend as S3HttpBackend;
+use angos_storage::{ConditionalStore, ObjectStore, s3::Backend as StorageS3Backend};
+use angos_tx_engine::{executor::build_executor, lock::LockStrategy};
+
 use crate::{
     command::server::{
         error::Error,
@@ -28,10 +32,7 @@ use crate::{
     registry::{
         Registry, RegistryConfig, Repository,
         blob_store::{BlobStorageConfig, fs::BackendConfig as BlobFsConfig},
-        metadata_store::{
-            LinkOperation, LockStrategy, MetadataStore, link_kind::LinkKind,
-            s3::BackendConfig as MetadataS3Config,
-        },
+        metadata_store::{LinkOperation, MetadataStore, link_kind::LinkKind},
         repository_resolver::RepositoryResolver,
         s3_connection::S3ConnectionConfig,
     },
@@ -66,7 +67,6 @@ pub fn create_test_config_with(options: TestConfigOptions<'_>) -> Configuration 
 
         [global]
         update_pull_time = false
-        max_concurrent_cache_jobs = 10
     "#;
 
     let mut config: Configuration = toml::from_str(toml).unwrap();
@@ -126,20 +126,23 @@ fn create_minimal_config() -> Configuration {
 
         [global]
         update_pull_time = false
-        max_concurrent_cache_jobs = 10
     "#;
 
     toml::from_str(toml).unwrap()
 }
 
 pub async fn create_test_registry(config: &Configuration) -> Registry {
-    let blob_handles = config.blob_store.to_backend(None).unwrap();
-    let (metadata_store, _) = config
-        .resolve_metadata_config()
-        .to_backend(None)
-        .await
-        .unwrap();
+    let blob_handles = config.blob_store.to_backend().unwrap();
     let auth_cache = config.cache.to_backend().unwrap();
+    let storage_config = config.resolve_registry_storage();
+    let handles = storage_config.to_handles().await.unwrap();
+    let metadata_store = Arc::new(
+        MetadataStore::builder()
+            .store(handles.store)
+            .executor(handles.executor)
+            .build()
+            .unwrap(),
+    );
 
     let mut repositories_map = HashMap::new();
     for (name, repo_config) in &config.repository {
@@ -163,14 +166,13 @@ pub async fn create_test_registry(config: &Configuration) -> Registry {
         .enable_blob_redirect(config.global.resolved_enable_blob_redirect())
         .enable_manifest_redirect(config.global.resolved_enable_manifest_redirect())
         .max_manifest_size_bytes(config.global.max_manifest_size_bytes())
-        .concurrent_cache_jobs(config.global.max_concurrent_cache_jobs)
         .global_immutable_tags(config.global.immutable_tags)
         .global_immutable_tags_exclusions(config.global.immutable_tags_exclusions.clone());
 
     Registry::new(
-        blob_handles.blob_store,
-        blob_handles.upload_store,
-        blob_handles.presigned_store,
+        blob_handles.blob,
+        blob_handles.upload,
+        blob_handles.presigned,
         metadata_store,
         resolver,
         registry_config,
@@ -225,7 +227,6 @@ async fn test_server_context_new_with_basic_auth() {
 
         [global]
         update_pull_time = false
-        max_concurrent_cache_jobs = 10
 
         [auth.identity.testuser]
         username = "testuser"
@@ -258,7 +259,6 @@ async fn test_server_context_new_with_global_immutable_tags() {
 
         [global]
         update_pull_time = false
-        max_concurrent_cache_jobs = 10
         immutable_tags = true
         immutable_tags_exclusions = ["^latest$"]
     "#;
@@ -310,7 +310,6 @@ async fn test_authenticate_request_with_basic_auth() {
 
         [global]
         update_pull_time = false
-        max_concurrent_cache_jobs = 10
 
         [auth.identity.testuser]
         username = "testuser"
@@ -494,7 +493,6 @@ async fn test_authorize_request_with_global_policy() {
 
         [global]
         update_pull_time = false
-        max_concurrent_cache_jobs = 10
 
         [global.access_policy]
         default = "allow"
@@ -542,7 +540,6 @@ async fn test_server_context_new_with_event_webhooks() {
 
         [global]
         update_pull_time = false
-        max_concurrent_cache_jobs = 10
 
         [event_webhook.test_hook]
         url = "https://example.com/webhook"
@@ -583,7 +580,6 @@ async fn test_server_context_event_dispatcher_is_arc_cloneable() {
 
         [global]
         update_pull_time = false
-        max_concurrent_cache_jobs = 10
 
         [event_webhook.test_hook]
         url = "https://example.com/webhook"
@@ -648,7 +644,6 @@ async fn test_dispatch_event_delivers_to_webhook() {
 
         [global]
         update_pull_time = false
-        max_concurrent_cache_jobs = 10
         event_webhooks = ["test_hook"]
 
         [event_webhook.test_hook]
@@ -704,7 +699,6 @@ async fn test_dispatch_event_required_webhook_failure_returns_error() {
 
         [global]
         update_pull_time = false
-        max_concurrent_cache_jobs = 10
         event_webhooks = ["test_hook"]
 
         [event_webhook.test_hook]
@@ -771,7 +765,6 @@ async fn test_server_context_shutdown_drains_in_flight_async_delivery() {
 
         [global]
         update_pull_time = false
-        max_concurrent_cache_jobs = 10
         event_webhooks = ["slow_hook"]
 
         [event_webhook.slow_hook]
@@ -836,7 +829,6 @@ async fn test_server_context_shutdown_rejects_new_async_dispatches() {
 
         [global]
         update_pull_time = false
-        max_concurrent_cache_jobs = 10
 
         [event_webhook.async_hook]
         url = "{}"
@@ -878,29 +870,45 @@ async fn test_server_context_shutdown_rejects_new_async_dispatches() {
 
 struct ShutdownFlushHarness {
     registry: Registry,
-    metadata_store: Arc<dyn MetadataStore + Send + Sync>,
+    metadata_store: Arc<MetadataStore>,
     namespace: String,
 }
 
 fn build_shutdown_flush_harness(unique_prefix: &str) -> ShutdownFlushHarness {
     metrics_provider::init_for_tests();
-    let s3_config = MetadataS3Config {
-        connection: S3ConnectionConfig {
-            access_key_id: Secret::new("root".to_string()),
-            secret_key: Secret::new("roottoor".to_string()),
-            endpoint: "http://127.0.0.1:9000".to_string(),
-            bucket: "registry".to_string(),
-            region: "region".to_string(),
-            key_prefix: unique_prefix.to_string(),
-        },
-        lock_strategy: LockStrategy::Memory,
-        link_cache_ttl: 0,
-        access_time_debounce_secs: 3600,
-        capabilities: None,
+    let conn = S3ConnectionConfig {
+        access_key_id: Secret::new("root".to_string()),
+        secret_key: Secret::new("roottoor".to_string()),
+        endpoint: "http://127.0.0.1:9000".to_string(),
+        bucket: "registry".to_string(),
+        region: "region".to_string(),
+        key_prefix: unique_prefix.to_string(),
     };
-    let metadata_store: Arc<dyn MetadataStore + Send + Sync> = Arc::new(
-        s3_config
-            .to_backend(None, None)
+    let http = Arc::new(S3HttpBackend::new(&conn.to_client_config()).expect("s3 http client"));
+    let raw_storage = Arc::new(
+        StorageS3Backend::builder()
+            .client(http)
+            .build()
+            .expect("s3 storage"),
+    );
+    let object_store: Arc<dyn ObjectStore> = raw_storage.clone();
+    let cond_store: Arc<dyn ConditionalStore> = raw_storage;
+    let executor = build_executor(
+        object_store.clone(),
+        Some(cond_store),
+        LockStrategy::Memory,
+        None,
+        false,
+        false,
+    )
+    .expect("build executor");
+    let metadata_store: Arc<MetadataStore> = Arc::new(
+        MetadataStore::builder()
+            .store(object_store)
+            .executor(executor)
+            .access_time_debounce_secs(3600)
+            .link_cache_ttl(0)
+            .build()
             .expect("s3 metadata backend"),
     );
 
@@ -908,20 +916,19 @@ fn build_shutdown_flush_harness(unique_prefix: &str) -> ShutdownFlushHarness {
         root_dir: "/tmp/test-blobs-shutdown-flush".to_string(),
         ..Default::default()
     })
-    .to_backend(None)
+    .to_backend()
     .unwrap();
 
     let registry = Registry::new(
-        blob_handles.blob_store,
-        blob_handles.upload_store,
-        blob_handles.presigned_store,
+        blob_handles.blob,
+        blob_handles.upload,
+        blob_handles.presigned,
         metadata_store.clone(),
         Arc::new(RepositoryResolver::new(Arc::new(HashMap::new())).unwrap()),
         RegistryConfig::default()
             .update_pull_time(false)
             .enable_blob_redirect(false)
             .enable_manifest_redirect(false)
-            .concurrent_cache_jobs(4)
             .global_immutable_tags(false)
             .global_immutable_tags_exclusions(Vec::new()),
     )
@@ -988,7 +995,6 @@ async fn test_shutdown_flushes_pending_access_times() {
 
         [global]
         update_pull_time = false
-        max_concurrent_cache_jobs = 10
     "#;
     let config: Configuration = toml::from_str(toml).unwrap();
     let context = ServerContext::new(&config, registry).unwrap();

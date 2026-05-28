@@ -73,9 +73,6 @@ Run only specific checks:
 
 # Remove incomplete uploads older than 1 hour
 ./angos -c config.toml scrub --uploads 1h
-
-# Cleanup orphan S3 multipart uploads older than 24 hours
-./angos -c config.toml scrub --multipart 24h
 ```
 
 ### With Logging

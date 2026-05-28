@@ -8,6 +8,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
+- Stale lock objects under `_locks/` are reclaimed automatically by a periodic janitor running on every server and worker replica; no operator action is required.
 - New `scrub --referrers` flag: checks every revision in each namespace and removes any referrer link whose referrer manifest no longer has a current digest revision link, preventing ghost descriptors from appearing in the OCI Referrers API response.
 - Durable cache jobs: optional `[global.job_queue]` section routes pull-through cache-fill jobs through a persistent filesystem or S3 store (per-key leases with heartbeat, exponential backoff, dead-letter on max-attempts). `angos server` enqueues jobs and publishes the `angos_job_queue_pending` gauge on `/metrics`; the new `angos worker` subcommand drains the queue. When the section is omitted the existing in-process `TaskQueue` is used unchanged. Documented in `doc/how-to/durable-cache-jobs.md` with a commented block in `config.example.toml`.
 - Maximum manifest body size enforcement.
@@ -15,6 +16,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- Transactional-engine recovery is now race-free against the original owner and idempotent on replay, so a crashed write that another replica picks up cannot collide with the original or re-apply mutations that already landed.
 - Scrub now flushes the metadata store's access-time buffer at exit so retention timestamps are persisted across runs on the S3 backend.
 - Scrub `--links` now prunes stale entries in a tracked link's `referenced_by` set whose corresponding revision no longer exists, preventing phantom parent digests from accumulating indefinitely. When removing the last referrer causes `referenced_by` to become empty the link and its blob-index entry are also removed, reclaiming storage.
 - Scrub `--links` and `--media-types` now remove revision links whose underlying manifest blob is permanently missing from storage, rather than silently skipping them on every run. A `DeleteOrphanManifest` action cascades to remove the digest link and every tag pointing at that digest; transient storage errors are still propagated so operators notice backend failures.
@@ -27,6 +29,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Changed
 
+- The four registry subsystems (metadata, job, upload, and manifest stores) now execute their multi-step writes through a single transactional engine. The on-disk layout under existing key families is unchanged, but three new top-level prefixes appear in the configured storage — `tx-log/`, `tx-bodies/`, and `_locks/` — which operators should factor into bucket policies and lifecycle rules. A process crash mid-write either commits fully or rolls back fully, eliminating the "blob landed, links failed" orphan class; recovery and cleanup of intent records run automatically on every server and worker replica. See `doc/aip/transactional-engine.md` for the design.
+- The `[global.job_queue.s3]` `prefix` key was renamed to `key_prefix` for consistency with the other S3 configurations (`[blob_store.s3]`, `[metadata_store.s3]`). Operators upgrading from a configuration that uses the old `prefix` key must rename the field; otherwise the configured prefix is silently dropped and durable jobs land at the bucket root.
+- The `[global.job_queue]` `default_lease_ttl_secs` key has been removed; operators upgrading from a configuration that still sets it must drop the line. The per-`lock_key` execution lock TTL is now governed by the configured lock backend's settings (e.g. `S3LockConfig.ttl_secs` when `lock_strategy = "s3"`), so there is no longer a job-queue-level TTL knob.
 - Blob deletion follows the OCI distribution lifecycle, with blob ownership tracked independently from manifest references.
 - Manifests with missing blob or descriptor references are rejected at push time.
 - Stricter OCI semantics for blob range requests and request-header parsing.
@@ -74,6 +79,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 ### Removed
 
 - Deprecated fields removed from `config.example.toml`.
+- The `lease_*` keys under `[global.job_queue]` are gone along with the legacy lease subsystem they configured.
+- The `MultipartCleanup` trait and the `scrub multipart` check that consumed it. S3 multipart aborts are now handled inside `UploadChecker` (the existing `scrub --uploads` check), which calls `delete_via_session` to abort the multipart upload alongside the durable session record.
 
 ### Fixed
 

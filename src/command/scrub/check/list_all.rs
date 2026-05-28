@@ -18,7 +18,7 @@ const PAGE_SIZE: u16 = 100;
 pub type ResultStream<'a, T> = Pin<Box<dyn Stream<Item = Result<T, Error>> + Send + 'a>>;
 
 pub fn revisions<'a>(
-    metadata_store: &'a Arc<dyn MetadataStore + Send + Sync>,
+    metadata_store: &'a Arc<MetadataStore>,
     namespace: &'a str,
 ) -> ResultStream<'a, Digest> {
     Box::pin(paginated(move |marker| async move {
@@ -30,7 +30,7 @@ pub fn revisions<'a>(
 }
 
 pub fn tags<'a>(
-    metadata_store: &'a Arc<dyn MetadataStore + Send + Sync>,
+    metadata_store: &'a Arc<MetadataStore>,
     namespace: &'a str,
 ) -> ResultStream<'a, String> {
     Box::pin(paginated(move |marker| async move {
@@ -62,9 +62,7 @@ pub fn blobs(blob_store: &Arc<dyn BlobStore + Send + Sync>) -> ResultStream<'_, 
     }))
 }
 
-pub fn namespaces(
-    metadata_store: &Arc<dyn MetadataStore + Send + Sync>,
-) -> ResultStream<'_, String> {
+pub fn namespaces(metadata_store: &Arc<MetadataStore>) -> ResultStream<'_, String> {
     Box::pin(paginated(move |marker| async move {
         metadata_store
             .list_namespaces(PAGE_SIZE, marker)

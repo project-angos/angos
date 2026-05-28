@@ -16,9 +16,10 @@ use crate::{
             Error,
             hashing_reader::HashingReader,
             s3::{
-                Backend, FRAME_BUFFER_CAPACITY, FRAME_SIZE, MIN_PART_SIZE, S3UploadState,
+                Backend, FRAME_BUFFER_CAPACITY, FRAME_SIZE, MIN_PART_SIZE,
                 multipart_helpers::{
-                    UploadMode, next_part_number, uploaded_size as total_uploaded_size,
+                    CompletionPlan, UploadMode, next_part_number,
+                    uploaded_size as total_uploaded_size,
                 },
             },
         },
@@ -54,17 +55,14 @@ impl Backend {
         uuid: &str,
     ) -> Result<(String, Vec<Part>, u64, u64), Error> {
         let upload_path = path_builder::upload_path(name, uuid);
-        if let Some(S3UploadState {
-            multipart_upload_id: Some(id),
-            parts,
-            pending_size,
-            ..
-        }) = self.retrieve_cached_upload_state(name, uuid).await
-        {
-            let uploaded = total_uploaded_size(&parts);
-            return Ok((id, parts, uploaded, pending_size));
-        }
-        let (id, parts) = self.ensure_multipart_upload(&upload_path).await?;
+        let (id, parts) = match self.read_session(name, uuid).await {
+            Ok(record) => match record.multipart_upload_id {
+                Some(id) => (id, record.parts),
+                None => self.ensure_multipart_upload(&upload_path).await?,
+            },
+            Err(Error::UploadNotFound) => self.ensure_multipart_upload(&upload_path).await?,
+            Err(e) => return Err(e),
+        };
         let uploaded = total_uploaded_size(&parts);
         let pending_path = path_builder::upload_patch_pending_path(name, uuid);
         let pending = self.store.head(&pending_path).await.map_or(0, |m| m.size);
@@ -295,53 +293,34 @@ impl Backend {
         }
     }
 
+    /// Prepare the nonuniform upload for the transactional commit step.
+    ///
+    /// Flushes any pending buffered data as a final multipart part, then
+    /// completes the S3 multipart upload so the assembled object lands at
+    /// `upload_path`. Returns a [`CompletionPlan`] that tells
+    /// `complete_via_session` which `Mutation` to use in the engine
+    /// transaction (always `Move` for the nonuniform path).
+    ///
+    /// The upload-container cleanup is **not** performed here; it happens
+    /// after the transaction commits in `complete_via_session`.
     #[instrument(skip(self))]
-    pub async fn get_upload_state_nonuniform(
-        &self,
-        name: &str,
-        uuid: &str,
-    ) -> Result<S3UploadState, Error> {
-        if let Some(cached) = self.retrieve_cached_upload_state(name, uuid).await {
-            return Ok(cached);
-        }
-
-        let upload_path = path_builder::upload_path(name, uuid);
-
-        let (multipart_upload_id, parts) = self.discover_multipart_upload(&upload_path).await?;
-
-        let uploaded = total_uploaded_size(&parts);
-
-        let pending_path = path_builder::upload_patch_pending_path(name, uuid);
-        let pending_size = self.store.head(&pending_path).await.map_or(0, |m| m.size);
-
-        let state = S3UploadState {
-            size: uploaded + pending_size,
-            multipart_upload_id,
-            parts,
-            pending_size,
-        };
-        self.cache_upload_state(name, uuid, &state).await;
-        Ok(state)
-    }
-
-    #[instrument(skip(self))]
-    pub async fn complete_upload_nonuniform(
+    pub async fn prepare_complete_upload_nonuniform(
         &self,
         name: &str,
         uuid: &str,
         digest: Option<&Digest>,
-    ) -> Result<Digest, Error> {
+    ) -> Result<CompletionPlan, Error> {
         let upload_path = path_builder::upload_path(name, uuid);
-        let (upload_id, mut parts) = if let Some(S3UploadState {
-            multipart_upload_id: Some(upload_id),
-            parts,
-            ..
-        }) = self.retrieve_cached_upload_state(name, uuid).await
-        {
-            (upload_id, parts)
+        let session_upload = match self.read_session(name, uuid).await {
+            Ok(record) => record.multipart_upload_id.map(|id| (id, record.parts)),
+            Err(Error::UploadNotFound) => None,
+            Err(e) => return Err(e),
+        };
+        let (upload_id, mut parts) = if let Some(pair) = session_upload {
+            pair
         } else {
-            let (upload_id, parts) = self.discover_multipart_upload(&upload_path).await?;
-            (upload_id.ok_or(Error::UploadNotFound)?, parts)
+            let (id, parts) = self.discover_multipart_upload(&upload_path).await?;
+            (id.ok_or(Error::UploadNotFound)?, parts)
         };
         let mut uploaded_size = total_uploaded_size(&parts);
 
@@ -375,17 +354,13 @@ impl Backend {
             .resolve_upload_digest(name, uuid, uploaded_size, digest)
             .await?;
 
-        self.complete_multipart_upload_and_store(
-            &upload_path,
-            &upload_id,
-            &parts,
-            name,
-            uuid,
-            &digest,
-        )
-        .await?;
+        self.complete_multipart_upload(&upload_path, &upload_id, &parts)
+            .await?;
 
-        Ok(digest)
+        Ok(CompletionPlan::Move {
+            src: upload_path,
+            digest,
+        })
     }
 }
 

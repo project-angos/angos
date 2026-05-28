@@ -1,7 +1,6 @@
-mod cache;
-mod cleanup;
 mod multipart_helpers;
 mod nonuniform;
+pub mod session;
 #[cfg(test)]
 pub mod tests;
 mod uniform;
@@ -13,31 +12,29 @@ use std::{
 };
 
 use async_trait::async_trait;
-use bytes::Bytes;
 use bytesize::ByteSize;
-use chrono::Utc;
-use serde::{Deserialize, Serialize};
-use sha2::{Digest as ShaDigestTrait, Sha256};
 use tokio::io::AsyncRead;
 use tracing::{debug, info, instrument};
 
+use angos_tx_engine::{executor::TransactionExecutor, transaction::Mutation};
+
 use crate::{
-    cache::Cache,
     oci::Digest,
     registry::{
         blob_store::{
             BlobStore, BoxedReader, Error, PresignedBlobStore, UploadStore, UploadSummary,
-            sha256_ext::Sha256Ext,
         },
         pagination, path_builder,
         s3_connection::S3ConnectionConfig,
     },
 };
-use angos_s3_client::{self as s3_client, BackendConfig as S3TransportConfig};
+use angos_s3_client::{Backend as S3HttpBackend, BackendConfig as S3TransportConfig};
 use angos_storage::{
-    Error as StorageError, MultipartStore, ObjectStore, Part, PresignedStore,
-    s3::Backend as StorageS3Backend,
+    Error as StorageError, ObjectStore, PresignedStore, s3::Backend as StorageS3Backend,
 };
+use serde::Deserialize;
+
+use crate::secret::Secret;
 
 pub const MIN_PART_SIZE: u64 = 5 * 1024 * 1024;
 pub const FRAME_SIZE: usize = 1024 * 1024;
@@ -68,8 +65,8 @@ pub struct BackendConfig {
 /// transport knobs lets the blob-store config use `Secret`-wrapped
 /// credentials via [`S3ConnectionConfig`] while still exposing the same
 /// flat TOML keys to operators. When a new transport knob is added in
-/// `angos_s3_client::BackendConfig`, mirror it here and in
-/// [`BackendConfig::to_transport_config`].
+/// `angos_s3_client::BackendConfig`, mirror it here and add a corresponding
+/// builder method on [`BackendBuilder`].
 #[derive(Clone, Debug, PartialEq, Deserialize)]
 #[serde(default)]
 pub struct TransportFields {
@@ -99,68 +96,213 @@ impl Default for TransportFields {
     }
 }
 
-impl BackendConfig {
-    /// Build the transport-level config by merging connection fields with the
-    /// blob-store-specific multipart and retry settings.
-    pub fn to_transport_config(&self) -> S3TransportConfig {
-        let t = &self.transport;
-        S3TransportConfig {
-            multipart_copy_threshold: t.multipart_copy_threshold,
-            multipart_copy_chunk_size: t.multipart_copy_chunk_size,
-            multipart_copy_jobs: t.multipart_copy_jobs,
-            multipart_part_size: t.multipart_part_size,
-            multipart_uniform_parts: t.multipart_uniform_parts,
-            operation_timeout_secs: t.operation_timeout_secs,
-            operation_attempt_timeout_secs: t.operation_attempt_timeout_secs,
-            max_attempts: t.max_attempts,
-            ..self.connection.to_client_config()
-        }
-    }
-}
-
-/// S3-internal upload state, cached between `write_upload` calls to avoid
-/// redundant round-trips to the S3 API.
-#[derive(Debug, Serialize, Deserialize)]
-pub struct S3UploadState {
-    pub size: u64,
-    pub multipart_upload_id: Option<String>,
-    pub parts: Vec<Part>,
-    pub pending_size: u64,
-}
-
 #[derive(Clone)]
 pub struct Backend {
     pub store: StorageS3Backend,
-    multipart_part_size: u64,
-    uniform_parts: bool,
-    cache: Option<Arc<Cache>>,
+    pub multipart_part_size: u64,
+    pub uniform_parts: bool,
+    executor: Arc<dyn TransactionExecutor>,
 }
 
 impl Debug for Backend {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Backend").finish()
+        f.debug_struct("Backend").finish_non_exhaustive()
     }
 }
 
 impl Backend {
-    pub fn new(config: &BackendConfig) -> Result<Self, Error> {
-        info!("Using S3 blob-store backend");
-        let multipart_part_size = config.transport.multipart_part_size.as_u64();
-        let transport = config.to_transport_config();
-        let http = s3_client::Backend::new(&transport)?;
-        let store = StorageS3Backend::builder().client(Arc::new(http)).build()?;
-
-        Ok(Self {
-            store,
-            multipart_part_size,
-            uniform_parts: config.transport.multipart_uniform_parts,
-            cache: None,
-        })
+    pub fn builder() -> BackendBuilder {
+        BackendBuilder::default()
     }
 
-    pub fn with_cache(mut self, cache: Arc<Cache>) -> Self {
-        self.cache = Some(cache);
+    /// Return the transaction executor shared across all session operations.
+    pub fn executor(&self) -> &Arc<dyn TransactionExecutor> {
+        &self.executor
+    }
+}
+
+#[derive(Default)]
+pub struct BackendBuilder {
+    access_key_id: Option<Secret<String>>,
+    secret_key: Option<Secret<String>>,
+    endpoint: Option<String>,
+    bucket: Option<String>,
+    region: Option<String>,
+    key_prefix: Option<String>,
+    multipart_copy_threshold: Option<ByteSize>,
+    multipart_copy_chunk_size: Option<ByteSize>,
+    multipart_copy_jobs: Option<usize>,
+    multipart_part_size: Option<ByteSize>,
+    multipart_uniform_parts: Option<bool>,
+    operation_timeout_secs: Option<u64>,
+    operation_attempt_timeout_secs: Option<u64>,
+    max_attempts: Option<u32>,
+    executor: Option<Arc<dyn TransactionExecutor>>,
+}
+
+impl BackendBuilder {
+    #[must_use]
+    pub fn access_key_id(mut self, value: Secret<String>) -> Self {
+        self.access_key_id = Some(value);
         self
+    }
+
+    #[must_use]
+    pub fn secret_key(mut self, value: Secret<String>) -> Self {
+        self.secret_key = Some(value);
+        self
+    }
+
+    #[must_use]
+    pub fn endpoint(mut self, value: impl Into<String>) -> Self {
+        self.endpoint = Some(value.into());
+        self
+    }
+
+    #[must_use]
+    pub fn bucket(mut self, value: impl Into<String>) -> Self {
+        self.bucket = Some(value.into());
+        self
+    }
+
+    #[must_use]
+    pub fn region(mut self, value: impl Into<String>) -> Self {
+        self.region = Some(value.into());
+        self
+    }
+
+    #[must_use]
+    pub fn key_prefix(mut self, value: impl Into<String>) -> Self {
+        self.key_prefix = Some(value.into());
+        self
+    }
+
+    #[must_use]
+    pub fn multipart_copy_threshold(mut self, value: ByteSize) -> Self {
+        self.multipart_copy_threshold = Some(value);
+        self
+    }
+
+    #[must_use]
+    pub fn multipart_copy_chunk_size(mut self, value: ByteSize) -> Self {
+        self.multipart_copy_chunk_size = Some(value);
+        self
+    }
+
+    #[must_use]
+    pub fn multipart_copy_jobs(mut self, value: usize) -> Self {
+        self.multipart_copy_jobs = Some(value);
+        self
+    }
+
+    #[must_use]
+    pub fn multipart_part_size(mut self, value: ByteSize) -> Self {
+        self.multipart_part_size = Some(value);
+        self
+    }
+
+    #[must_use]
+    pub fn multipart_uniform_parts(mut self, value: bool) -> Self {
+        self.multipart_uniform_parts = Some(value);
+        self
+    }
+
+    #[must_use]
+    pub fn operation_timeout_secs(mut self, value: u64) -> Self {
+        self.operation_timeout_secs = Some(value);
+        self
+    }
+
+    #[must_use]
+    pub fn operation_attempt_timeout_secs(mut self, value: u64) -> Self {
+        self.operation_attempt_timeout_secs = Some(value);
+        self
+    }
+
+    #[must_use]
+    pub fn max_attempts(mut self, value: u32) -> Self {
+        self.max_attempts = Some(value);
+        self
+    }
+
+    #[must_use]
+    pub fn executor(mut self, executor: Arc<dyn TransactionExecutor>) -> Self {
+        self.executor = Some(executor);
+        self
+    }
+
+    pub fn build(self) -> Result<Backend, Error> {
+        info!("Using S3 blob-store backend");
+        let defaults = S3TransportConfig::default();
+
+        let access_key_id = self.access_key_id.ok_or_else(|| {
+            Error::StorageBackend("S3 blob-store builder requires access_key_id".into())
+        })?;
+        let secret_key = self.secret_key.ok_or_else(|| {
+            Error::StorageBackend("S3 blob-store builder requires secret_key".into())
+        })?;
+        let endpoint = self.endpoint.ok_or_else(|| {
+            Error::StorageBackend("S3 blob-store builder requires endpoint".into())
+        })?;
+        let bucket = self
+            .bucket
+            .ok_or_else(|| Error::StorageBackend("S3 blob-store builder requires bucket".into()))?;
+        let region = self
+            .region
+            .ok_or_else(|| Error::StorageBackend("S3 blob-store builder requires region".into()))?;
+        let key_prefix = self.key_prefix.unwrap_or_default();
+
+        let multipart_part_size = self
+            .multipart_part_size
+            .unwrap_or(defaults.multipart_part_size);
+        let multipart_uniform_parts = self
+            .multipart_uniform_parts
+            .unwrap_or(defaults.multipart_uniform_parts);
+
+        let transport = S3TransportConfig {
+            access_key_id: access_key_id.expose().clone(),
+            secret_key: secret_key.expose().clone(),
+            endpoint,
+            bucket,
+            region,
+            key_prefix,
+            multipart_copy_threshold: self
+                .multipart_copy_threshold
+                .unwrap_or(defaults.multipart_copy_threshold),
+            multipart_copy_chunk_size: self
+                .multipart_copy_chunk_size
+                .unwrap_or(defaults.multipart_copy_chunk_size),
+            multipart_copy_jobs: self
+                .multipart_copy_jobs
+                .unwrap_or(defaults.multipart_copy_jobs),
+            multipart_part_size,
+            multipart_uniform_parts,
+            operation_timeout_secs: self
+                .operation_timeout_secs
+                .unwrap_or(defaults.operation_timeout_secs),
+            operation_attempt_timeout_secs: self
+                .operation_attempt_timeout_secs
+                .unwrap_or(defaults.operation_attempt_timeout_secs),
+            max_attempts: self.max_attempts.unwrap_or(defaults.max_attempts),
+        };
+
+        let executor = self.executor.ok_or_else(|| {
+            Error::StorageBackend("S3 blob-store builder requires an executor".into())
+        })?;
+
+        let http =
+            S3HttpBackend::new(&transport).map_err(|e| Error::StorageBackend(e.to_string()))?;
+        let store = StorageS3Backend::builder()
+            .client(Arc::new(http))
+            .build()
+            .map_err(|e| Error::StorageBackend(e.to_string()))?;
+
+        Ok(Backend {
+            store,
+            multipart_part_size: multipart_part_size.as_u64(),
+            uniform_parts: multipart_uniform_parts,
+            executor,
+        })
     }
 }
 
@@ -211,20 +353,6 @@ impl BlobStore for Backend {
         ))
     }
 
-    #[instrument(skip(self, content))]
-    async fn create(&self, content: &[u8]) -> Result<Digest, Error> {
-        let mut hasher = Sha256::new();
-        hasher.update(content);
-        let digest = hasher.digest();
-
-        let blob_path = path_builder::blob_path(&digest);
-        self.store
-            .put(&blob_path, Bytes::copy_from_slice(content))
-            .await?;
-
-        Ok(digest)
-    }
-
     #[instrument(skip(self))]
     async fn read(&self, digest: &Digest) -> Result<Vec<u8>, Error> {
         let path = path_builder::blob_path(digest);
@@ -272,30 +400,13 @@ impl UploadStore for Backend {
         n: u16,
         continuation_token: Option<String>,
     ) -> Result<(Vec<String>, Option<String>), Error> {
-        debug!(
-            "Fetching {n} upload(s) for namespace '{namespace}' with continuation token: {continuation_token:?}"
-        );
-        let uploads_dir = path_builder::uploads_root_dir(namespace);
-
-        let page = self
-            .store
-            .list_children(&uploads_dir, n, continuation_token, None)
-            .await?;
-
-        Ok((page.sub_prefixes, page.next_token))
+        self.list_via_session(namespace, n, continuation_token)
+            .await
     }
 
     #[instrument(skip(self))]
     async fn create(&self, name: &str, uuid: &str) -> Result<String, Error> {
-        let date_path = path_builder::upload_start_date_path(name, uuid);
-        self.store
-            .put(&date_path, Bytes::from(Utc::now().to_rfc3339()))
-            .await?;
-
-        let state = Sha256::new().serialized_state();
-        self.save_hasher(name, uuid, 0, state).await?;
-
-        Ok(uuid.to_string())
+        self.create_via_session(name, uuid).await
     }
 
     #[instrument(skip(self, stream))]
@@ -307,27 +418,13 @@ impl UploadStore for Backend {
         content_length: u64,
         append: bool,
     ) -> Result<(Digest, u64), Error> {
-        let result = if self.uniform_parts {
-            self.write_upload_uniform(name, uuid, stream, content_length, append)
-                .await
-        } else {
-            self.write_upload_nonuniform(name, uuid, stream, content_length)
-                .await
-        };
-        if result.is_ok() {
-            self.evict_upload_state(name, uuid).await;
-        }
-        result
+        self.write_via_session(name, uuid, stream, content_length, append)
+            .await
     }
 
     #[instrument(skip(self))]
     async fn summary(&self, name: &str, uuid: &str) -> Result<UploadSummary, Error> {
-        let state = if self.uniform_parts {
-            self.get_upload_state_uniform(name, uuid).await?
-        } else {
-            self.get_upload_state_nonuniform(name, uuid).await?
-        };
-        self.build_upload_summary(name, uuid, state.size).await
+        self.summary_via_session(name, uuid).await
     }
 
     #[instrument(skip(self))]
@@ -337,23 +434,23 @@ impl UploadStore for Backend {
         uuid: &str,
         digest: Option<&Digest>,
     ) -> Result<Digest, Error> {
-        if self.uniform_parts {
-            self.complete_upload_uniform(name, uuid, digest).await
-        } else {
-            self.complete_upload_nonuniform(name, uuid, digest).await
-        }
+        self.complete_via_session(name, uuid, digest).await
+    }
+
+    #[instrument(skip(self))]
+    async fn finalize_mutations(
+        &self,
+        name: &str,
+        uuid: &str,
+        expected_digest: Option<&Digest>,
+    ) -> Result<(Digest, Vec<Mutation>), Error> {
+        self.finalize_mutations_via_session(name, uuid, expected_digest)
+            .await
     }
 
     #[instrument(skip(self))]
     async fn delete(&self, name: &str, uuid: &str) -> Result<(), Error> {
-        let upload_path = path_builder::upload_path(name, uuid);
-        self.evict_upload_id(&upload_path).await;
-        self.evict_upload_state(name, uuid).await;
-        self.store.abort_pending_uploads(&upload_path).await?;
-
-        let upload_container = path_builder::upload_container_path(name, uuid);
-        self.store.delete_prefix(&upload_container).await?;
-        Ok(())
+        self.delete_via_session(name, uuid).await
     }
 }
 

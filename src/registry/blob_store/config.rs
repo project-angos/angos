@@ -2,18 +2,18 @@ use std::sync::Arc;
 
 use serde::Deserialize;
 
-use crate::{
-    cache::Cache,
-    registry::blob_store::{
-        BlobStore, Error, MultipartCleanup, PresignedBlobStore, UploadStore, fs, s3,
-    },
+use angos_s3_client::Backend as S3HttpBackend;
+use angos_storage::{
+    ConditionalStore, ObjectStore, fs::Backend as StorageFsBackend, s3::Backend as StorageS3Backend,
 };
+use angos_tx_engine::{executor::build_executor, lock::LockStrategy};
+
+use crate::registry::blob_store::{BlobStore, Error, PresignedBlobStore, UploadStore, fs, s3};
 
 pub struct BlobStoreHandles {
-    pub blob_store: Arc<dyn BlobStore>,
-    pub upload_store: Arc<dyn UploadStore>,
-    pub presigned_store: Option<Arc<dyn PresignedBlobStore>>,
-    pub multipart_cleanup: Arc<dyn MultipartCleanup + Send + Sync>,
+    pub blob: Arc<dyn BlobStore>,
+    pub upload: Arc<dyn UploadStore>,
+    pub presigned: Option<Arc<dyn PresignedBlobStore>>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq)]
@@ -32,28 +32,98 @@ impl Default for BlobStorageConfig {
 }
 
 impl BlobStorageConfig {
-    pub fn to_backend(&self, cache: Option<Arc<Cache>>) -> Result<BlobStoreHandles, Error> {
+    /// Build the backend handles.
+    ///
+    /// For the FS backend the transaction executor is constructed via
+    /// `build_executor` with an in-process memory lock strategy. The backend
+    /// receives a shared `Arc<dyn TransactionExecutor>` so all concurrent
+    /// `complete` calls coordinate through the same lock.
+    ///
+    /// For S3, atomicity is provided by the S3 multipart API itself; no
+    /// additional lock executor is needed.
+    ///
+    /// Stale upload sessions (including their S3 multipart uploads) are reaped
+    /// by `scrub`'s `UploadChecker`, not by a background task.
+    pub fn to_backend(&self) -> Result<BlobStoreHandles, Error> {
         match self {
             BlobStorageConfig::FS(config) => {
-                let backend = Arc::new(fs::Backend::new(config)?);
+                let executor_storage: Arc<dyn ObjectStore> = Arc::new(
+                    StorageFsBackend::builder()
+                        .root_dir(&config.root_dir)
+                        .sync_to_disk(config.sync_to_disk)
+                        .build()
+                        .map_err(|e| Error::StorageBackend(e.to_string()))?,
+                );
+                let executor = build_executor(
+                    executor_storage,
+                    None,
+                    LockStrategy::Memory,
+                    None,
+                    false,
+                    false,
+                )
+                .map_err(|e| Error::StorageBackend(e.to_string()))?;
+
+                let backend = Arc::new(
+                    fs::Backend::builder()
+                        .root_dir(&config.root_dir)
+                        .sync_to_disk(config.sync_to_disk)
+                        .executor(executor)
+                        .build()?,
+                );
+
                 Ok(BlobStoreHandles {
-                    blob_store: backend.clone(),
-                    upload_store: backend.clone(),
-                    presigned_store: None,
-                    multipart_cleanup: backend,
+                    blob: backend.clone(),
+                    upload: backend,
+                    presigned: None,
                 })
             }
             BlobStorageConfig::S3(config) => {
-                let mut backend = s3::Backend::new(config)?;
-                if let Some(cache) = cache {
-                    backend = backend.with_cache(cache);
-                }
-                let backend = Arc::new(backend);
+                let http = S3HttpBackend::new(&config.connection.to_client_config())
+                    .map_err(|e| Error::StorageBackend(e.to_string()))?;
+                let raw_storage = Arc::new(
+                    StorageS3Backend::builder()
+                        .client(Arc::new(http))
+                        .build()
+                        .map_err(|e| Error::StorageBackend(e.to_string()))?,
+                );
+                let executor_store: Arc<dyn ObjectStore> = raw_storage.clone();
+                let conditional_store: Arc<dyn ConditionalStore> = raw_storage;
+                let executor = build_executor(
+                    executor_store,
+                    Some(conditional_store),
+                    LockStrategy::Memory,
+                    None,
+                    false,
+                    false,
+                )
+                .map_err(|e| Error::StorageBackend(e.to_string()))?;
+
+                let backend = Arc::new(
+                    s3::Backend::builder()
+                        .access_key_id(config.connection.access_key_id.clone())
+                        .secret_key(config.connection.secret_key.clone())
+                        .endpoint(&config.connection.endpoint)
+                        .bucket(&config.connection.bucket)
+                        .region(&config.connection.region)
+                        .key_prefix(&config.connection.key_prefix)
+                        .multipart_copy_threshold(config.transport.multipart_copy_threshold)
+                        .multipart_copy_chunk_size(config.transport.multipart_copy_chunk_size)
+                        .multipart_copy_jobs(config.transport.multipart_copy_jobs)
+                        .multipart_part_size(config.transport.multipart_part_size)
+                        .multipart_uniform_parts(config.transport.multipart_uniform_parts)
+                        .operation_timeout_secs(config.transport.operation_timeout_secs)
+                        .operation_attempt_timeout_secs(
+                            config.transport.operation_attempt_timeout_secs,
+                        )
+                        .max_attempts(config.transport.max_attempts)
+                        .executor(executor)
+                        .build()?,
+                );
                 Ok(BlobStoreHandles {
-                    blob_store: backend.clone(),
-                    upload_store: backend.clone(),
-                    presigned_store: Some(backend.clone() as Arc<dyn PresignedBlobStore>),
-                    multipart_cleanup: backend,
+                    blob: backend.clone(),
+                    upload: backend.clone(),
+                    presigned: Some(backend as Arc<dyn PresignedBlobStore>),
                 })
             }
         }
@@ -62,7 +132,6 @@ impl BlobStorageConfig {
 
 #[cfg(test)]
 mod tests {
-    use chrono::Duration;
     use tempfile::TempDir;
 
     use super::*;
@@ -70,24 +139,18 @@ mod tests {
     use crate::secret::Secret;
 
     #[tokio::test]
-    async fn fs_backend_provides_multipart_cleanup() {
+    async fn fs_backend_handles_build() {
         let temp_dir = TempDir::new().unwrap();
         let config = BlobStorageConfig::FS(fs::BackendConfig {
             root_dir: temp_dir.path().to_string_lossy().to_string(),
             sync_to_disk: false,
         });
 
-        let handles = config.to_backend(None).unwrap();
-        let orphans = handles
-            .multipart_cleanup
-            .list_orphan_multipart_uploads(Duration::hours(1))
-            .await
-            .unwrap();
-        assert!(orphans.is_empty());
+        assert!(config.to_backend().is_ok());
     }
 
     #[test]
-    fn s3_backend_provides_multipart_cleanup() {
+    fn s3_backend_handles_build() {
         let config = BlobStorageConfig::S3(s3::BackendConfig {
             connection: S3ConnectionConfig {
                 access_key_id: Secret::new("minioadmin".to_string()),
@@ -100,8 +163,7 @@ mod tests {
             ..s3::BackendConfig::default()
         });
 
-        let handles = config.to_backend(None).unwrap();
-        // Verifies the handle is present; no live S3 call needed.
-        let _ = handles.multipart_cleanup;
+        let handles = config.to_backend().unwrap();
+        assert!(handles.presigned.is_some());
     }
 }
