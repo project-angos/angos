@@ -122,21 +122,27 @@ impl Registry {
     where
         S: AsyncRead + Unpin,
     {
-        if self.blob_store.size(digest).await.is_err() {
-            return Ok(false);
+        let session = self.acquire_blob_data_lock(digest).await?;
+        let result = async {
+            if self.blob_store.size(digest).await.is_err() {
+                return Ok(false);
+            }
+
+            let upload_digest = hash_upload_stream(stream, content_length).await?;
+            if &upload_digest != digest {
+                warn!("Expected digest '{digest}', got '{upload_digest}'");
+                return Err(Error::DigestInvalid);
+            }
+
+            BlobOwnership::new(self.metadata_store.as_ref())
+                .grant(namespace, digest)
+                .await?;
+
+            Ok(true)
         }
-
-        let upload_digest = hash_upload_stream(stream, content_length).await?;
-        if &upload_digest != digest {
-            warn!("Expected digest '{digest}', got '{upload_digest}'");
-            return Err(Error::DigestInvalid);
-        }
-
-        BlobOwnership::new(self.metadata_store.as_ref())
-            .grant(namespace, digest)
-            .await?;
-
-        Ok(true)
+        .await;
+        session.release().await;
+        result
     }
 
     async fn finish_completed_upload(
@@ -271,19 +277,25 @@ impl Registry {
             return Err(Error::DigestInvalid);
         }
 
-        match self.blob_store.size(digest).await {
-            Ok(_) => {}
-            Err(blob_store::Error::BlobNotFound | blob_store::Error::ReferenceNotFound) => {
-                self.blob_store
-                    .complete_upload(namespace, &session_key, Some(digest))
-                    .await?;
+        let session = self.acquire_blob_data_lock(digest).await?;
+        let result = async {
+            match self.blob_store.size(digest).await {
+                Ok(_) => {}
+                Err(blob_store::Error::BlobNotFound | blob_store::Error::ReferenceNotFound) => {
+                    self.blob_store
+                        .complete_upload(namespace, &session_key, Some(digest))
+                        .await?;
+                }
+                Err(error) => return Err(Error::from(error)),
             }
-            Err(error) => return Err(Error::from(error)),
-        }
 
-        BlobOwnership::new(self.metadata_store.as_ref())
-            .grant(namespace, digest)
-            .await?;
+            BlobOwnership::new(self.metadata_store.as_ref())
+                .grant(namespace, digest)
+                .await
+        }
+        .await;
+        session.release().await;
+        result?;
 
         Ok(self
             .finish_completed_upload(actor, namespace, &session_key, digest)

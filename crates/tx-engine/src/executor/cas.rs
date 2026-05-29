@@ -10,7 +10,7 @@
 //! body differs → return `Error::PartialCommit` and preserve the intent for
 //! the recovery loop).
 
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -185,12 +185,17 @@ impl CasExecutor {
         }
     }
 
-    /// Verify the read set: re-read each key, hash the body, and return
-    /// `Conflict` if the hash differs from the one recorded at build time.
-    async fn prepare_reads(&self, tx: &Transaction) -> Result<(), Error> {
+    /// Verify the read set and capture each read key's live etag.
+    ///
+    /// Re-reads every read key, checks the content fingerprint recorded at
+    /// build time (returning [`Error::Conflict`] on mismatch or if the key has
+    /// vanished), and returns the live etag per key so the caller can turn
+    /// same-key mutations into compare-and-swap writes.
+    async fn prepare_reads(&self, tx: &Transaction) -> Result<HashMap<String, Etag>, Error> {
+        let mut etags = HashMap::with_capacity(tx.reads.len());
         for read in &tx.reads {
-            match self.store.get(&read.key).await {
-                Ok(body) => {
+            match self.store.get_with_etag(&read.key).await {
+                Ok((body, etag)) => {
                     let actual: [u8; 32] = Sha256::digest(&body).into();
                     if actual != read.fingerprint {
                         debug!(
@@ -199,6 +204,9 @@ impl CasExecutor {
                         );
                         return Err(Error::Conflict);
                     }
+                    if let Some(etag) = etag {
+                        etags.insert(read.key.clone(), etag);
+                    }
                 }
                 Err(StorageError::NotFound) => {
                     return Err(Error::Conflict);
@@ -206,7 +214,7 @@ impl CasExecutor {
                 Err(e) => return Err(Error::Storage(e)),
             }
         }
-        Ok(())
+        Ok(etags)
     }
 
     /// Apply all mutations in the intent.
@@ -285,6 +293,38 @@ impl CasExecutor {
         }
         Ok(())
     }
+}
+
+/// Promote same-key read-modify-write mutations to compare-and-swap writes and
+/// order them ahead of unconditional mutations.
+///
+/// `read_etags` maps each read key to the live etag captured at Prepare. Any
+/// `Put`/`Delete` that targets a read key and carries no explicit precondition
+/// is rewritten to require that etag, then stably moved to the front so a CAS
+/// failure aborts the transaction before any sibling mutation commits.
+fn apply_read_preconditions(records: &mut [MutationRecord], read_etags: &HashMap<String, Etag>) {
+    if read_etags.is_empty() {
+        return;
+    }
+    for record in records.iter_mut() {
+        match record {
+            MutationRecord::Put { key, expected, .. }
+            | MutationRecord::Delete { key, expected }
+                if expected.is_none() =>
+            {
+                if let Some(etag) = read_etags.get(key) {
+                    *expected = Some(etag.clone());
+                }
+            }
+            _ => {}
+        }
+    }
+    records.sort_by_key(|record| u8::from(!is_read_keyed(record, read_etags)));
+}
+
+/// `true` when any key the mutation touches was part of the read set.
+fn is_read_keyed(record: &MutationRecord, read_etags: &HashMap<String, Etag>) -> bool {
+    record.all_keys().any(|key| read_etags.contains_key(key))
 }
 
 /// Apply a single mutation using conditional storage operations, with
@@ -408,9 +448,17 @@ impl TransactionExecutor for CasExecutor {
     async fn execute(&self, tx: Transaction) -> Result<Outcome, Error> {
         let tx_id = Uuid::new_v4();
 
-        self.prepare_reads(&tx).await?;
+        let read_etags = self.prepare_reads(&tx).await?;
 
-        let mutation_records = stage_bodies(self.store.as_ref(), &tx, tx_id).await?;
+        let mut mutation_records = stage_bodies(self.store.as_ref(), &tx, tx_id).await?;
+
+        // Linearise read-modify-write: a mutation whose key was read becomes a
+        // compare-and-swap conditioned on the etag captured at Prepare, and is
+        // ordered ahead of unconditional mutations. A losing writer then fails
+        // its CAS before any sibling mutation commits, so the transaction rolls
+        // back cleanly (no mutation applied yet) and the caller's retry loop
+        // re-reads and converges — no lost update, no stuck partial intent.
+        apply_read_preconditions(&mut mutation_records, &read_etags);
 
         let read_records: Vec<ReadRecord> = tx
             .reads

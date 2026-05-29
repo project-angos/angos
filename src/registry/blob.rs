@@ -422,21 +422,67 @@ impl Registry {
 
 #[cfg(test)]
 mod tests {
-    use std::io::Cursor;
+    use std::{io::Cursor, time::Duration};
 
     use hyper::header::{ACCEPT_RANGES, CONTENT_LENGTH, CONTENT_RANGE, LOCATION};
-    use tokio::io::AsyncReadExt;
+    use tokio::{io::AsyncReadExt, time::sleep};
 
     use super::*;
     use crate::{
         oci::Namespace,
         registry::{
             DOCKER_CONTENT_DIGEST,
+            blob_ownership::BlobOwnership,
             metadata_store::LinkOperation,
             test_utils::{backends, create_test_blob, put_blob_direct},
         },
         util::sha256,
     };
+
+    /// A blob-data reclaim (`delete_blob` → `delete_blob_data_if_unreferenced`)
+    /// must take the `blob-data:{digest}` coarse lock before reading references
+    /// and deleting the bytes, so a concurrent reference grant cannot be missed.
+    /// Regression guard for the conformance `MANIFEST_BLOB_UNKNOWN` failure
+    /// caused by dropping that lock during the transactional-engine migration.
+    #[tokio::test]
+    async fn delete_blob_waits_for_blob_data_lock_before_reclaiming_data() {
+        for test_case in backends() {
+            let registry = test_case.registry();
+            let first = &Namespace::new("test-repo/first").unwrap();
+            let second = &Namespace::new("test-repo/second").unwrap();
+            let content = b"shared blob content";
+            let digest = put_blob_direct(registry.metadata_store.store(), content).await;
+            let ownership = BlobOwnership::new(registry.metadata_store.as_ref());
+
+            ownership.grant(first, &digest).await.unwrap();
+
+            // Hold the blob-data lock, then start a delete: it must block in
+            // `delete_blob_data_if_unreferenced` rather than reclaim the bytes.
+            let session = registry.acquire_blob_data_lock(&digest).await.unwrap();
+            let delete = registry.delete_blob(first, &digest);
+            tokio::pin!(delete);
+
+            tokio::select! {
+                result = &mut delete => {
+                    panic!("delete completed while blob-data lock was held: {result:?}");
+                }
+                () = sleep(Duration::from_millis(25)) => {}
+            }
+
+            // A second namespace grabs a reference while the delete is parked.
+            ownership.grant(second, &digest).await.unwrap();
+            session.release().await;
+            delete.await.unwrap();
+
+            // The data survives (still referenced by `second`); `first` lost its
+            // reference, `second` keeps it.
+            assert_eq!(registry.blob_store.read(&digest).await.unwrap(), content);
+            assert!(!ownership.can_read(first, &digest).await.unwrap());
+            assert!(ownership.can_read(second, &digest).await.unwrap());
+
+            test_case.cleanup().await;
+        }
+    }
 
     #[tokio::test]
     async fn test_head_blob() {

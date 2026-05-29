@@ -258,3 +258,30 @@ async fn sync_to_disk_flag_does_not_change_observable_behaviour() {
         .unwrap();
     assert_eq!(store.get("k").await.unwrap(), b"durable");
 }
+
+/// A stray atomic-write temporary sitting in a directory must never be
+/// surfaced by `list`/`list_children`. Regression guard for the conformance
+/// failure where a concurrent reader observed a 0-byte `.angos-write.*` temp
+/// in a `blob-index/.../refs/` dir and failed to JSON-parse it.
+#[tokio::test]
+async fn listings_skip_atomic_write_temporaries() {
+    use std::fs as stdfs;
+
+    let dir = TempDir::new().unwrap();
+    let store = backend(&dir);
+    store
+        .put("ns/real.json", Bytes::from_static(b"[]"))
+        .await
+        .unwrap();
+
+    // Simulate an in-flight atomic write: an empty temp file next to the real
+    // object, with the reserved prefix.
+    stdfs::write(dir.path().join("ns").join(".angos-write.deadbeef"), b"").unwrap();
+
+    let page = store.list("ns", 100, None).await.unwrap();
+    assert_eq!(page.items, vec!["real.json".to_string()]);
+
+    let children = store.list_children("ns", 100, None, None).await.unwrap();
+    assert_eq!(children.objects, vec!["real.json".to_string()]);
+    assert!(children.next_token.is_none());
+}

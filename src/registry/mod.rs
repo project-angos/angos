@@ -64,7 +64,10 @@ use crate::{
     },
 };
 use angos_storage::{MemoryObjectStore, ObjectStore};
-use angos_tx_engine::{executor::build_executor, lock::LockStrategy};
+use angos_tx_engine::{
+    executor::build_executor,
+    lock::{LockSession, LockStrategy},
+};
 
 #[allow(clippy::struct_excessive_bools)]
 pub struct RegistryConfig {
@@ -224,18 +227,42 @@ impl Registry {
             .unwrap_or_default()
     }
 
-    async fn delete_blob_data_if_unreferenced(&self, digest: &Digest) -> Result<(), Error> {
-        let ownership = BlobOwnership::new(self.metadata_store.as_ref());
-        if ownership.has_any_reference(digest).await? {
-            return Ok(());
-        }
+    /// Acquire the coarse `blob-data:{digest}` lock that serialises blob-data
+    /// creation (upload completion) against reclamation (unreferenced delete)
+    /// and against concurrent manifest pushes — which declare the same coarse
+    /// lock on their link transactions. Without it, a delete can reclaim a
+    /// content-addressed blob's bytes in the window between another repository
+    /// granting a reference and validating its manifest, surfacing as
+    /// `ManifestBlobUnknown`.
+    pub(crate) async fn acquire_blob_data_lock(
+        &self,
+        digest: &Digest,
+    ) -> Result<LockSession, Error> {
+        let keys = [format!("blob-data:{digest}")];
+        self.metadata_store
+            .executor()
+            .acquire(&keys)
+            .await
+            .map_err(|e| Error::Internal(format!("blob-data lock acquire failed: {e}")))
+    }
 
-        match self.blob_store.delete_blob(digest).await {
-            Ok(()) | Err(BlobStoreError::BlobNotFound | BlobStoreError::ReferenceNotFound) => {
-                Ok(())
+    async fn delete_blob_data_if_unreferenced(&self, digest: &Digest) -> Result<(), Error> {
+        let session = self.acquire_blob_data_lock(digest).await?;
+        let result = async {
+            let ownership = BlobOwnership::new(self.metadata_store.as_ref());
+            if ownership.has_any_reference(digest).await? {
+                return Ok(());
             }
-            Err(error) => Err(error.into()),
+            match self.blob_store.delete_blob(digest).await {
+                Ok(()) | Err(BlobStoreError::BlobNotFound | BlobStoreError::ReferenceNotFound) => {
+                    Ok(())
+                }
+                Err(error) => Err(error.into()),
+            }
         }
+        .await;
+        session.release().await;
+        result
     }
 }
 

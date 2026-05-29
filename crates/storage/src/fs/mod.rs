@@ -23,7 +23,7 @@ use std::{
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures_util::TryStreamExt;
-use tempfile::NamedTempFile;
+use tempfile::Builder as TempFileBuilder;
 use tokio::{
     fs,
     io::{AsyncSeekExt, AsyncWriteExt},
@@ -41,6 +41,13 @@ use crate::{
 /// a single round-trip while staying well within the OS read-dir buffer limits.
 /// It is an internal implementation detail and is not user-tuneable.
 const LIST_ALL_CHILDREN_PAGE_SIZE: u16 = 512;
+
+/// Filename prefix for the temp files [`atomic_write`] creates next to their
+/// target before the rename. These are an implementation detail of atomic
+/// writes and must never be surfaced as objects: a concurrent listing+read
+/// could otherwise observe a freshly-created, still-empty temp file and, for a
+/// JSON object key, fail to parse it. Listings skip any entry with this prefix.
+const ATOMIC_WRITE_TMP_PREFIX: &str = ".angos-write.";
 
 /// Builder for [`Backend`].
 pub struct Builder {
@@ -242,7 +249,9 @@ async fn atomic_write(target: &Path, data: Bytes, sync: bool) -> Result<(), Erro
     let parent = target.parent().unwrap_or_else(|| Path::new(".")).to_owned();
     let final_path = target.to_owned();
     spawn_blocking(move || -> io::Result<()> {
-        let mut temp = NamedTempFile::new_in(&parent)?;
+        let mut temp = TempFileBuilder::new()
+            .prefix(ATOMIC_WRITE_TMP_PREFIX)
+            .tempfile_in(&parent)?;
         temp.write_all(&data)?;
         if sync {
             temp.flush()?;
@@ -268,6 +277,11 @@ async fn read_dir_sorted(path: &Path) -> Result<Vec<(String, FileType)>, Error> 
         let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
             continue;
         };
+        // Never surface in-flight atomic-write temporaries as objects: a
+        // concurrent writer may have just created an empty temp file here.
+        if name.starts_with(ATOMIC_WRITE_TMP_PREFIX) {
+            continue;
+        }
         let file_type = entry.file_type().await?;
         entries.push((name, file_type));
     }
