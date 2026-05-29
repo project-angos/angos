@@ -1,12 +1,20 @@
 use std::{collections::HashMap, sync::Arc};
 
+use angos_storage::ObjectStore;
+use angos_tx_engine::{
+    ConditionalCapabilities,
+    executor::TransactionExecutor,
+    janitor::{BodyJanitor, LockJanitor},
+    recovery::RecoveryLoop,
+};
+use tokio_util::sync::CancellationToken;
+
 use crate::{
     cache::{self, Cache},
+    configuration::{RegistryStorageConfig, registry_storage},
     registry::{
-        self, Repository,
-        blob_store::{self, BlobStoreHandles},
-        job_store,
-        metadata_store::{self, ConditionalCapabilities, MetadataStore, MetadataStoreConfig},
+        self, Repository, blob_store, job_store,
+        metadata_store::{self, MetadataStore},
         repository,
         repository_resolver::{OverlapError, RepositoryResolver},
     },
@@ -24,6 +32,8 @@ pub enum Error {
     BlobStore(blob_store::Error),
     #[error("failed to initialize metadata store: {0}")]
     MetadataStore(#[from] metadata_store::Error),
+    #[error("failed to initialize storage handles: {0}")]
+    RegistryStorage(#[from] registry_storage::Error),
     #[error("failed to initialize cache: {0}")]
     Cache(#[from] cache::Error),
     #[error("failed to initialize repository '{name}': {source}")]
@@ -43,29 +53,74 @@ impl From<blob_store::Error> for Error {
     }
 }
 
-pub fn blob_stores(
-    config: &blob_store::BlobStorageConfig,
-    auth_cache: &Arc<Cache>,
-) -> Result<BlobStoreHandles, Error> {
-    config
-        .to_backend(Some(auth_cache.clone()))
-        .map_err(Error::from)
+/// Spawn the transactional-engine maintenance loops (recovery + body janitor
+/// + lock janitor).
+///
+/// These subsystems clean up the engine's `tx-log/`, `tx-bodies/`, and
+/// `_locks/` namespaces. They use the engine's default intervals (recovery:
+/// 30 s; body janitor: 5 min sweep, 1 h orphan age; lock janitor: 5 min
+/// sweep, 5 min orphan-age grace on top of each lock's own TTL) and shut down
+/// when `cancellation` fires. Spawning them is idempotent in effect, but
+/// should happen once per process per shared `ObjectStore`.
+///
+/// The recovery loop and lock janitor take their lock primitive and
+/// conditional store from `executor` so they coordinate through the same
+/// primitives the healthy path uses: recovery takes ownership of stale
+/// intents via the executor's lock and (on CAS deployments) replays with the
+/// executor's conditional store.
+pub fn spawn_engine_maintenance(
+    store: Arc<dyn ObjectStore>,
+    executor: &Arc<dyn TransactionExecutor>,
+    cancellation: CancellationToken,
+) {
+    let lock = executor.lock();
+    let conditional_store = executor.conditional_store();
+
+    let mut recovery_builder = RecoveryLoop::builder(store.clone())
+        .lock(lock)
+        .cancellation(cancellation.clone());
+    if let Some(cs) = conditional_store.clone() {
+        recovery_builder = recovery_builder.conditional_store(cs);
+    }
+    tokio::spawn(recovery_builder.build().run());
+
+    tokio::spawn(
+        BodyJanitor::builder(store.clone())
+            .cancellation(cancellation.clone())
+            .build()
+            .run(),
+    );
+
+    let mut lock_janitor_builder = LockJanitor::builder(store).cancellation(cancellation);
+    if let Some(cs) = conditional_store {
+        lock_janitor_builder = lock_janitor_builder.conditional_store(cs);
+    }
+    tokio::spawn(lock_janitor_builder.build().run());
 }
 
 pub async fn metadata_store(
-    config: &MetadataStoreConfig,
+    config: &RegistryStorageConfig,
     auth_cache: &Arc<Cache>,
-) -> Result<
-    (
-        Arc<dyn MetadataStore + Send + Sync>,
-        Option<ConditionalCapabilities>,
-    ),
-    Error,
-> {
-    config
-        .to_backend(Some(auth_cache.clone()))
-        .await
-        .map_err(Error::from)
+) -> Result<(Arc<MetadataStore>, Option<ConditionalCapabilities>), Error> {
+    let handles = config.to_handles().await?;
+
+    let s3_ttl = if let RegistryStorageConfig::S3(s3_cfg) = config {
+        (s3_cfg.link_cache_ttl, s3_cfg.access_time_debounce_secs)
+    } else {
+        (0, 0)
+    };
+
+    let mut builder = MetadataStore::builder()
+        .store(handles.store)
+        .executor(handles.executor)
+        .link_cache_ttl(s3_ttl.0)
+        .access_time_debounce_secs(s3_ttl.1);
+
+    // Wire in the auth cache for link-metadata caching (only meaningful on S3,
+    // where link_cache_ttl > 0 by default).
+    builder = builder.cache(auth_cache.clone());
+
+    Ok((Arc::new(builder.build()?), handles.capabilities))
 }
 
 pub fn auth_cache(config: &cache::Config) -> Result<Arc<Cache>, Error> {
@@ -107,6 +162,8 @@ mod tests {
     use super::*;
     use crate::{
         cache,
+        command::scrub::Error as ScrubError,
+        command::server::Error as ServerError,
         policy::{AccessMode, AccessPolicyConfig},
         registry::{manifest::DEFAULT_MAX_MANIFEST_SIZE_BYTES, repository},
     };
@@ -193,7 +250,6 @@ mod tests {
 
     #[test]
     fn error_into_scrub_error_blob_store_variant() {
-        use crate::command::scrub::Error as ScrubError;
         let bootstrap_err: Error = blob_store::Error::BlobNotFound.into();
         let scrub_err: ScrubError = bootstrap_err.into();
         assert!(matches!(scrub_err, ScrubError::BlobStore(_)));
@@ -201,7 +257,6 @@ mod tests {
 
     #[test]
     fn error_into_scrub_error_cache_variant() {
-        use crate::command::scrub::Error as ScrubError;
         let bootstrap_err: Error = cache::Error::Execution("x".to_string()).into();
         let scrub_err: ScrubError = bootstrap_err.into();
         assert!(matches!(scrub_err, ScrubError::Cache(_)));
@@ -209,7 +264,6 @@ mod tests {
 
     #[test]
     fn error_into_server_error_blob_store_variant() {
-        use crate::command::server::Error as ServerError;
         let bootstrap_err: Error = blob_store::Error::BlobNotFound.into();
         let server_err: ServerError = bootstrap_err.into();
         assert!(matches!(server_err, ServerError::Initialization(_)));

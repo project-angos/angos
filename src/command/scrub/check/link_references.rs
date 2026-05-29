@@ -13,22 +13,19 @@ use crate::{
     },
     oci::Digest,
     registry::{
-        blob_store::{self, BlobStore},
+        blob_store,
         metadata_store::{self, MetadataStore, link_kind::LinkKind},
         parse_manifest_digests,
     },
 };
 
 pub struct LinkReferencesChecker {
-    blob_store: Arc<dyn BlobStore + Send + Sync>,
-    metadata_store: Arc<dyn MetadataStore + Send + Sync>,
+    blob_store: Arc<blob_store::BlobStore>,
+    metadata_store: Arc<MetadataStore>,
 }
 
 impl LinkReferencesChecker {
-    pub fn new(
-        blob_store: Arc<dyn BlobStore + Send + Sync>,
-        metadata_store: Arc<dyn MetadataStore + Send + Sync>,
-    ) -> Self {
+    pub fn new(blob_store: Arc<blob_store::BlobStore>, metadata_store: Arc<MetadataStore>) -> Self {
         Self {
             blob_store,
             metadata_store,
@@ -147,38 +144,28 @@ impl NamespaceChecker for LinkReferencesChecker {
 
 #[cfg(test)]
 mod tests {
-    use async_trait::async_trait;
-
     use super::*;
+
     use crate::{
         command::scrub::{action::Action, executor::Executor},
-        oci::{Descriptor, Namespace},
+        oci::Namespace,
         registry::{
             Registry,
-            metadata_store::{
-                BlobIndex, BlobIndexOperation, LinkMetadata, LinkOperation, LockGuard,
-            },
-            test_utils::{self, FSRegistryTestCase, NoopMultipart, RegistryTestCase, backends},
+            metadata_store::{LinkOperation, link_kind::LinkKind},
+            test_utils::{self, FSRegistryTestCase, RegistryTestCase, backends, put_blob_direct},
         },
     };
 
     fn noop_executor(
-        blob_store: Arc<dyn BlobStore + Send + Sync>,
-        metadata_store: Arc<dyn MetadataStore + Send + Sync>,
-        upload_store: Arc<dyn crate::registry::blob_store::UploadStore>,
+        blob_store: Arc<blob_store::BlobStore>,
+        metadata_store: Arc<MetadataStore>,
     ) -> Executor {
-        Executor::new(
-            blob_store,
-            metadata_store,
-            upload_store,
-            std::sync::Arc::new(NoopMultipart),
-        )
+        Executor::new(blob_store, metadata_store)
     }
 
     async fn create_manifest_scenario(
         registry: &Registry,
-        metadata_store: &Arc<dyn MetadataStore + Send + Sync>,
-        blob_store: &Arc<dyn BlobStore>,
+        metadata_store: &Arc<MetadataStore>,
         namespace: &Namespace,
         config_content: &[u8],
         layer_content: &[u8],
@@ -207,10 +194,8 @@ mod tests {
         }}"#
         );
 
-        let manifest_digest = blob_store
-            .create(manifest_content.as_bytes())
-            .await
-            .unwrap();
+        let manifest_digest =
+            put_blob_direct(metadata_store.store(), manifest_content.as_bytes()).await;
 
         metadata_store
             .update_links(
@@ -247,7 +232,6 @@ mod tests {
             let (manifest_digest, config_digest, layer_digest) = create_manifest_scenario(
                 registry,
                 &metadata_store,
-                &blob_store,
                 namespace,
                 b"config content",
                 b"layer content",
@@ -265,11 +249,7 @@ mod tests {
 
             let checker = LinkReferencesChecker::new(blob_store.clone(), metadata_store.clone());
 
-            let mut executor = noop_executor(
-                blob_store.clone(),
-                metadata_store.clone(),
-                test_case.upload_store(),
-            );
+            let mut executor = noop_executor(blob_store.clone(), metadata_store.clone());
 
             checker.check(namespace, &mut executor).await.unwrap();
 
@@ -305,7 +285,6 @@ mod tests {
             let (_, config_digest, layer_digest) = create_manifest_scenario(
                 registry,
                 &metadata_store,
-                &blob_store,
                 namespace,
                 b"dry-run config",
                 b"dry-run layer",
@@ -362,10 +341,8 @@ mod tests {
             ]
         }"#;
 
-            let manifest_digest = blob_store
-                .create(manifest_content.as_bytes())
-                .await
-                .unwrap();
+            let manifest_digest =
+                put_blob_direct(metadata_store.store(), manifest_content.as_bytes()).await;
 
             metadata_store
                 .update_links(
@@ -411,21 +388,16 @@ mod tests {
             let (manifest_digest, _, _) = create_manifest_scenario(
                 registry,
                 &metadata_store,
-                &blob_store,
                 namespace,
                 b"config for missing-blob",
                 b"layer for missing-blob",
             )
             .await;
 
-            blob_store.delete(&manifest_digest).await.unwrap();
+            blob_store.delete_blob(&manifest_digest).await.unwrap();
 
             let checker = LinkReferencesChecker::new(blob_store.clone(), metadata_store.clone());
-            let mut executor = noop_executor(
-                blob_store.clone(),
-                metadata_store.clone(),
-                test_case.upload_store(),
-            );
+            let mut executor = noop_executor(blob_store.clone(), metadata_store.clone());
             checker.check(namespace, &mut executor).await.unwrap();
 
             assert!(
@@ -450,14 +422,13 @@ mod tests {
             let (manifest_digest, _, _) = create_manifest_scenario(
                 registry,
                 &metadata_store,
-                &blob_store,
                 namespace,
                 b"config for dry-run missing",
                 b"layer for dry-run missing",
             )
             .await;
 
-            blob_store.delete(&manifest_digest).await.unwrap();
+            blob_store.delete_blob(&manifest_digest).await.unwrap();
 
             let checker = LinkReferencesChecker::new(blob_store.clone(), metadata_store.clone());
             let mut sink: Vec<Action> = Vec::new();
@@ -481,119 +452,30 @@ mod tests {
         }
     }
 
-    // Stub used only to make read_link return a StorageBackend error.
-    struct ErroringMetadataStore;
-
-    #[async_trait]
-    impl MetadataStore for ErroringMetadataStore {
-        async fn list_namespaces(
-            &self,
-            _n: u16,
-            _last: Option<String>,
-        ) -> Result<(Vec<String>, Option<String>), metadata_store::Error> {
-            unimplemented!()
-        }
-
-        async fn list_tags(
-            &self,
-            _namespace: &str,
-            _n: u16,
-            _last: Option<String>,
-        ) -> Result<(Vec<String>, Option<String>), metadata_store::Error> {
-            unimplemented!()
-        }
-
-        async fn list_referrers(
-            &self,
-            _namespace: &str,
-            _digest: &Digest,
-            _artifact_type: Option<String>,
-        ) -> Result<Vec<Descriptor>, metadata_store::Error> {
-            unimplemented!()
-        }
-
-        async fn has_referrers(
-            &self,
-            _namespace: &str,
-            _subject: &Digest,
-        ) -> Result<bool, metadata_store::Error> {
-            unimplemented!()
-        }
-
-        async fn list_revisions(
-            &self,
-            _namespace: &str,
-            _n: u16,
-            _continuation_token: Option<String>,
-        ) -> Result<(Vec<Digest>, Option<String>), metadata_store::Error> {
-            unimplemented!()
-        }
-
-        async fn count_manifests(&self, _namespace: &str) -> Result<usize, metadata_store::Error> {
-            unimplemented!()
-        }
-
-        async fn read_blob_index(
-            &self,
-            _digest: &Digest,
-        ) -> Result<BlobIndex, metadata_store::Error> {
-            unimplemented!()
-        }
-
-        async fn update_blob_index(
-            &self,
-            _namespace: &str,
-            _digest: &Digest,
-            _operation: BlobIndexOperation,
-        ) -> Result<(), metadata_store::Error> {
-            unimplemented!()
-        }
-
-        async fn acquire_blob_data_lock(
-            &self,
-            _digest: &Digest,
-        ) -> Result<LockGuard, metadata_store::Error> {
-            Ok(LockGuard::sync(Box::new(())))
-        }
-
-        async fn read_link(
-            &self,
-            _namespace: &str,
-            _link: &LinkKind,
-            _update_access_time: bool,
-        ) -> Result<LinkMetadata, metadata_store::Error> {
-            Err(metadata_store::Error::StorageBackend(
-                "simulated failure".to_string(),
-            ))
-        }
-
-        async fn update_links(
-            &self,
-            _namespace: &str,
-            _operations: &[LinkOperation],
-        ) -> Result<(), metadata_store::Error> {
-            unimplemented!()
-        }
-    }
-
     #[tokio::test]
     async fn test_unexpected_error_is_propagated() {
+        // Build a real FS-backed metadata store; then corrupt the link file so
+        // that `read_link` fails with an `InvalidData` error, which propagates
+        // as `Error::MetadataStore`.
         let fs_case = FSRegistryTestCase::new();
-        let blob_store: Arc<dyn BlobStore + Send + Sync> = RegistryTestCase::blob_store(&fs_case);
-        let metadata_store: Arc<dyn MetadataStore + Send + Sync> =
-            std::sync::Arc::new(ErroringMetadataStore);
-
-        let checker = LinkReferencesChecker::new(blob_store, metadata_store);
+        let blob_store: Arc<blob_store::BlobStore> = RegistryTestCase::blob_store(&fs_case);
+        let metadata_store = RegistryTestCase::metadata_store(&fs_case);
 
         let namespace = "test-repo/error";
-        let target = Digest::Sha256(
-            "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc".into(),
-        );
+        let hash = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+        let target = Digest::Sha256(hash.into());
         let referrer = Digest::Sha256(
             "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd".into(),
         );
         let link = LinkKind::Config(target.clone());
 
+        // Compute the link file path directly (mirrors path_builder::link_path).
+        let rel_link_path = format!("v2/repositories/{namespace}/_config/sha256/{hash}/link");
+        let full_path = fs_case.temp_dir().path().join(&rel_link_path);
+        std::fs::create_dir_all(full_path.parent().unwrap()).unwrap();
+        std::fs::write(&full_path, b"not-valid-json").unwrap();
+
+        let checker = LinkReferencesChecker::new(blob_store, metadata_store);
         let mut sink: Vec<Action> = Vec::new();
         let result = checker
             .ensure_referenced_by(namespace, &link, &target, &referrer, &mut sink)
@@ -601,7 +483,7 @@ mod tests {
 
         assert!(
             matches!(result, Err(Error::MetadataStore(_))),
-            "StorageBackend error must propagate as Error::MetadataStore, got: {result:?}"
+            "parse error must propagate as Error::MetadataStore, got: {result:?}"
         );
     }
 
@@ -616,7 +498,6 @@ mod tests {
             let (manifest_digest, _config_digest, layer_digest) = create_manifest_scenario(
                 registry,
                 &metadata_store,
-                &blob_store,
                 namespace,
                 b"config for prune-phantom",
                 b"layer for prune-phantom",
@@ -650,11 +531,7 @@ mod tests {
             );
 
             let checker = LinkReferencesChecker::new(blob_store.clone(), metadata_store.clone());
-            let mut executor = noop_executor(
-                blob_store.clone(),
-                metadata_store.clone(),
-                test_case.upload_store(),
-            );
+            let mut executor = noop_executor(blob_store.clone(), metadata_store.clone());
             checker.check(namespace, &mut executor).await.unwrap();
 
             let after = metadata_store
@@ -686,7 +563,6 @@ mod tests {
             let (manifest_a, _config_a, layer_digest) = create_manifest_scenario(
                 registry,
                 &metadata_store,
-                &blob_store,
                 namespace,
                 b"config for keep-valid A",
                 b"shared layer for keep-valid",
@@ -695,7 +571,6 @@ mod tests {
             let (manifest_b, _config_b, _) = create_manifest_scenario(
                 registry,
                 &metadata_store,
-                &blob_store,
                 namespace,
                 b"config for keep-valid B",
                 b"shared layer for keep-valid",
@@ -723,11 +598,7 @@ mod tests {
                 .unwrap();
 
             let checker = LinkReferencesChecker::new(blob_store.clone(), metadata_store.clone());
-            let mut executor = noop_executor(
-                blob_store.clone(),
-                metadata_store.clone(),
-                test_case.upload_store(),
-            );
+            let mut executor = noop_executor(blob_store.clone(), metadata_store.clone());
             checker.check(namespace, &mut executor).await.unwrap();
 
             let after = metadata_store
@@ -757,7 +628,6 @@ mod tests {
             let (_manifest_digest, _config_digest, layer_digest) = create_manifest_scenario(
                 registry,
                 &metadata_store,
-                &blob_store,
                 namespace,
                 b"config for dry-remove",
                 b"layer for dry-remove",

@@ -152,7 +152,7 @@ mod tests {
         oci::{Namespace, Reference},
         registry::{
             metadata_store::{LinkOperation, link_kind::LinkKind},
-            test_utils::{backends, create_test_blob},
+            test_utils::{backends, create_test_blob, put_blob_direct},
         },
     };
 
@@ -186,7 +186,7 @@ mod tests {
             let namespace = &Namespace::new("test-repo").unwrap();
 
             let test_content = b"test content";
-            let test_digest = registry.blob_store.create(test_content).await.unwrap();
+            let test_digest = put_blob_direct(registry.metadata_store.store(), test_content).await;
             let tags = ["latest", "v1.0", "v2.0"];
             let ops: Vec<LinkOperation> = tags
                 .iter()
@@ -279,7 +279,7 @@ mod tests {
         ];
 
         let blob_content = b"pagination-test-blob";
-        let digest = registry.blob_store.create(blob_content).await.unwrap();
+        let digest = put_blob_direct(registry.metadata_store.store(), blob_content).await;
 
         for ns_str in &namespaces {
             let ns = Namespace::new(ns_str).unwrap();

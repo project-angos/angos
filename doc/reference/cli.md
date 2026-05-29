@@ -104,9 +104,6 @@ angos scrub --blobs
 # Remove incomplete uploads older than 1 hour
 angos scrub --uploads 1h
 
-# Cleanup orphan S3 multipart uploads older than 24 hours
-angos scrub --multipart 24h
-
 # Preview retention policy enforcement
 angos scrub --retention --dry-run
 

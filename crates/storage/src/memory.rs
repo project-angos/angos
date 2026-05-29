@@ -1,0 +1,642 @@
+//! In-process memory-backed [`ObjectStore`] and [`ConditionalStore`].
+//!
+//! Stores objects in a `HashMap<String, (Bytes, Etag)>` guarded by a `Mutex`.
+//! Every write generates a fresh monotonic etag so the store can also serve
+//! as a [`ConditionalStore`] for CAS-based testing and for in-process
+//! deployments that need the transactional engine's CAS executor.
+//!
+//! `get_stream` returns a cursor over an in-memory clone; `copy` clones the
+//! entry in-place (with a fresh etag).
+//!
+//! Intended for deployments that do not configure `[global.job_queue]` and for
+//! tests that need an object store without a filesystem or S3 dependency.
+
+use std::{
+    collections::HashMap,
+    io::Cursor,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
+};
+
+use async_trait::async_trait;
+use bytes::{Bytes, BytesMut};
+use futures_util::StreamExt;
+
+use crate::{
+    BoxedReader, ByteStream, ChildrenPage, ConditionalStore, Error, Etag, ObjectMeta, ObjectStore,
+    Page, SessionState, UploadSession, UploadSessionStore,
+};
+
+/// Inner shared state.
+struct Inner {
+    data: HashMap<String, (Bytes, Etag)>,
+}
+
+impl Inner {
+    fn new() -> Self {
+        Self {
+            data: HashMap::new(),
+        }
+    }
+}
+
+impl std::fmt::Debug for Inner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Inner")
+            .field("entry_count", &self.data.len())
+            .finish_non_exhaustive()
+    }
+}
+
+/// In-process [`ObjectStore`] backed by a `HashMap`.
+///
+/// All clones share the same underlying map. Safe to clone; the `Arc<Mutex<…>>`
+/// is shared across clones.
+///
+/// # Examples
+///
+/// ```rust
+/// use std::sync::Arc;
+/// use bytes::Bytes;
+/// use angos_storage::{ObjectStore, MemoryObjectStore};
+///
+/// # #[tokio::main]
+/// # async fn main() {
+/// let store = Arc::new(MemoryObjectStore::new());
+/// store.put("key", Bytes::from("hello")).await.unwrap();
+/// let body = store.get("key").await.unwrap();
+/// assert_eq!(body, b"hello");
+/// # }
+/// ```
+#[derive(Debug, Clone)]
+pub struct MemoryObjectStore {
+    inner: Arc<Mutex<Inner>>,
+    counter: Arc<AtomicU64>,
+}
+
+impl MemoryObjectStore {
+    /// Create a new, empty in-memory object store.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(Inner::new())),
+            counter: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn next_etag(&self) -> Etag {
+        let n = self.counter.fetch_add(1, Ordering::Relaxed);
+        Etag::new(format!("\"{n}\""))
+    }
+}
+
+impl Default for MemoryObjectStore {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[async_trait]
+impl ObjectStore for MemoryObjectStore {
+    async fn get(&self, key: &str) -> Result<Vec<u8>, Error> {
+        self.lock()
+            .data
+            .get(key)
+            .map(|(b, _)| b.to_vec())
+            .ok_or(Error::NotFound)
+    }
+
+    async fn get_stream(
+        &self,
+        key: &str,
+        offset: Option<u64>,
+    ) -> Result<(BoxedReader, u64), Error> {
+        let bytes = self
+            .lock()
+            .data
+            .get(key)
+            .map(|(b, _)| b.clone())
+            .ok_or(Error::NotFound)?;
+
+        let total = bytes.len() as u64;
+        let start = usize::try_from(offset.unwrap_or(0).min(total)).unwrap_or(usize::MAX);
+        let slice = bytes.slice(start..);
+        let reader: BoxedReader = Box::new(Cursor::new(slice));
+        Ok((reader, total))
+    }
+
+    async fn put(&self, key: &str, data: Bytes) -> Result<(), Error> {
+        let etag = self.next_etag();
+        self.lock().data.insert(key.to_string(), (data, etag));
+        Ok(())
+    }
+
+    async fn delete(&self, key: &str) -> Result<(), Error> {
+        self.lock().data.remove(key);
+        Ok(())
+    }
+
+    async fn delete_prefix(&self, prefix: &str) -> Result<(), Error> {
+        // Treat `prefix` as a directory boundary. If the prefix does not end
+        // with '/', only delete keys under `prefix/` (not keys that merely
+        // share a common string prefix, e.g. "jobs/cache" must not delete
+        // "jobs/cache_extra/foo").
+        let prefix_with_slash;
+        let effective_prefix: &str = if prefix.ends_with('/') {
+            prefix
+        } else {
+            prefix_with_slash = format!("{prefix}/");
+            &prefix_with_slash
+        };
+        let mut guard = self.lock();
+        guard.data.retain(|k, _| !k.starts_with(effective_prefix));
+        Ok(())
+    }
+
+    async fn head(&self, key: &str) -> Result<ObjectMeta, Error> {
+        self.lock()
+            .data
+            .get(key)
+            .map(|(b, e)| ObjectMeta {
+                size: b.len() as u64,
+                etag: Some(e.clone()),
+                last_modified: None,
+            })
+            .ok_or(Error::NotFound)
+    }
+
+    async fn list(
+        &self,
+        prefix: &str,
+        n: u16,
+        token: Option<String>,
+    ) -> Result<Page<String>, Error> {
+        let guard = self.lock();
+        let start_after = token.as_deref().unwrap_or("").to_string();
+
+        // Normalise the separator: if the prefix does not end with '/', strip the
+        // leading '/' from each suffix so callers get a clean relative name
+        // (matching the FS backend, which returns paths relative to the
+        // prefix-directory without a leading separator).
+        let sep_len = usize::from(!prefix.ends_with('/'));
+
+        // Collect and sort all keys matching the prefix, then paginate.
+        let mut keys: Vec<String> = guard
+            .data
+            .keys()
+            .filter(|k| {
+                k.starts_with(prefix)
+                    && k.len() > prefix.len()
+                    && (prefix.ends_with('/') || k.as_bytes().get(prefix.len()) == Some(&b'/'))
+            })
+            // Strip the prefix (and separator) so the result contains only the
+            // suffix (filename), matching the FS backend's convention.
+            .map(|k| k[prefix.len() + sep_len..].to_string())
+            .collect();
+        keys.sort_unstable();
+
+        let page_size = n as usize;
+        let mut items = Vec::with_capacity(page_size);
+        let mut next_token: Option<String> = None;
+
+        let relevant = keys
+            .into_iter()
+            .filter(|k| k.as_str() > start_after.as_str());
+
+        for key in relevant {
+            if items.len() >= page_size {
+                next_token = Some(items.last().cloned().unwrap_or_default());
+                break;
+            }
+            items.push(key);
+        }
+
+        Ok(Page { items, next_token })
+    }
+
+    async fn list_children(
+        &self,
+        prefix: &str,
+        n: u16,
+        token: Option<String>,
+        start_after: Option<String>,
+    ) -> Result<ChildrenPage, Error> {
+        let guard = self.lock();
+        let skip_before = token
+            .as_deref()
+            .or(start_after.as_deref())
+            .unwrap_or("")
+            .to_string();
+
+        let page_size = n as usize;
+        let mut sub_prefixes: std::collections::BTreeSet<String> =
+            std::collections::BTreeSet::new();
+        let mut objects: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+
+        // Ensure the effective prefix ends with '/' so child names are clean
+        // (matching the FS backend convention where prefix acts as a directory).
+        let prefix_with_slash;
+        let effective_prefix: &str = if prefix.ends_with('/') {
+            prefix
+        } else {
+            prefix_with_slash = format!("{prefix}/");
+            &prefix_with_slash
+        };
+
+        for key in guard
+            .data
+            .keys()
+            .filter(|k| k.starts_with(effective_prefix))
+        {
+            let rest = &key[effective_prefix.len()..];
+            if let Some(slash) = rest.find('/') {
+                let child = format!("{}/", &rest[..slash]);
+                if child.as_str() > skip_before.as_str() {
+                    sub_prefixes.insert(child);
+                }
+            } else {
+                let child = rest.to_string();
+                if child.as_str() > skip_before.as_str() {
+                    objects.insert(child);
+                }
+            }
+        }
+
+        // Merge and take up to `n` entries.
+        let total: Vec<_> = sub_prefixes
+            .iter()
+            .map(|s| (true, s.clone()))
+            .chain(objects.iter().map(|s| (false, s.clone())))
+            .take(page_size + 1)
+            .collect();
+
+        let truncated = total.len() > page_size;
+        let emit_count = if truncated { page_size } else { total.len() };
+
+        let mut result_sub: Vec<String> = Vec::new();
+        let mut result_obj: Vec<String> = Vec::new();
+        let mut last: Option<String> = None;
+
+        for (is_prefix, name) in total.into_iter().take(emit_count) {
+            last = Some(name.clone());
+            if is_prefix {
+                result_sub.push(name);
+            } else {
+                result_obj.push(name);
+            }
+        }
+
+        let next_token = if truncated { last } else { None };
+
+        Ok(ChildrenPage {
+            sub_prefixes: result_sub,
+            objects: result_obj,
+            next_token,
+        })
+    }
+
+    async fn copy(&self, source: &str, destination: &str) -> Result<(), Error> {
+        let bytes = self
+            .lock()
+            .data
+            .get(source)
+            .map(|(b, _)| b.clone())
+            .ok_or(Error::NotFound)?;
+        let etag = self.next_etag();
+        self.lock()
+            .data
+            .insert(destination.to_string(), (bytes, etag));
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl ConditionalStore for MemoryObjectStore {
+    async fn get_with_etag(&self, key: &str) -> Result<(Vec<u8>, Option<Etag>), Error> {
+        self.lock()
+            .data
+            .get(key)
+            .map(|(b, e)| (b.to_vec(), Some(e.clone())))
+            .ok_or(Error::NotFound)
+    }
+
+    async fn put_if_absent(&self, key: &str, data: Bytes) -> Result<Option<Etag>, Error> {
+        let etag = self.next_etag();
+        let mut guard = self.lock();
+        if guard.data.contains_key(key) {
+            return Err(Error::PreconditionFailed);
+        }
+        guard.data.insert(key.to_string(), (data, etag.clone()));
+        Ok(Some(etag))
+    }
+
+    async fn put_if_match(
+        &self,
+        key: &str,
+        etag: &Etag,
+        data: Bytes,
+    ) -> Result<Option<Etag>, Error> {
+        let new_etag = self.next_etag();
+        let mut guard = self.lock();
+        match guard.data.get(key) {
+            Some((_, current)) if current == etag => {
+                guard.data.insert(key.to_string(), (data, new_etag.clone()));
+                Ok(Some(new_etag))
+            }
+            Some(_) | None => Err(Error::PreconditionFailed),
+        }
+    }
+
+    async fn delete_if_match(&self, key: &str, etag: &Etag) -> Result<(), Error> {
+        let mut guard = self.lock();
+        match guard.data.get(key) {
+            Some((_, current)) if current == etag => {
+                guard.data.remove(key);
+                Ok(())
+            }
+            Some(_) => Err(Error::PreconditionFailed),
+            None => Ok(()),
+        }
+    }
+}
+
+#[async_trait]
+impl UploadSessionStore for MemoryObjectStore {
+    async fn create_upload(&self, key: &str) -> Result<UploadSession, Error> {
+        self.put(key, Bytes::new()).await?;
+        Ok(UploadSession {
+            key: key.to_string(),
+            uploaded_size: 0,
+            state: SessionState::Fs,
+        })
+    }
+
+    async fn write_upload(
+        &self,
+        session: &mut UploadSession,
+        _staging_key: &str,
+        mut body: ByteStream,
+        len: u64,
+    ) -> Result<(), Error> {
+        if len == 0 {
+            return Ok(());
+        }
+        let mut buf = BytesMut::with_capacity(usize::try_from(len).unwrap_or(0));
+        while let Some(chunk) = body.next().await {
+            let chunk = chunk.map_err(|e| Error::Backend(e.to_string()))?;
+            buf.extend_from_slice(&chunk);
+        }
+        let actual = u64::try_from(buf.len()).map_err(|e| Error::Backend(e.to_string()))?;
+        if actual != len {
+            return Err(Error::Backend(format!(
+                "memory upload-session short body: expected {len} bytes, got {actual}",
+            )));
+        }
+        let mut combined = self.get(&session.key).await.unwrap_or_default();
+        combined.extend_from_slice(&buf);
+        self.put(&session.key, Bytes::from(combined)).await?;
+        session.uploaded_size = session
+            .uploaded_size
+            .checked_add(actual)
+            .ok_or_else(|| Error::Backend("session size overflow".to_string()))?;
+        Ok(())
+    }
+
+    async fn complete_upload(
+        &self,
+        _session: UploadSession,
+        _staging_key: &str,
+    ) -> Result<(), Error> {
+        Ok(())
+    }
+
+    async fn abort_upload(&self, session: UploadSession, _staging_key: &str) -> Result<(), Error> {
+        self.delete(&session.key).await
+    }
+
+    async fn abort_pending_uploads(&self, _key: &str) -> Result<(), Error> {
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use bytes::Bytes;
+
+    use crate::memory::MemoryObjectStore;
+    use crate::{ConditionalStore, Etag, ObjectStore, Page};
+
+    fn store() -> MemoryObjectStore {
+        MemoryObjectStore::new()
+    }
+
+    #[tokio::test]
+    async fn put_and_get_roundtrip() {
+        let s = store();
+        s.put("k", Bytes::from("hello")).await.unwrap();
+        assert_eq!(s.get("k").await.unwrap(), b"hello");
+    }
+
+    #[tokio::test]
+    async fn get_missing_returns_not_found() {
+        let s = store();
+        assert!(matches!(s.get("absent").await, Err(crate::Error::NotFound)));
+    }
+
+    #[tokio::test]
+    async fn head_returns_size() {
+        let s = store();
+        s.put("k", Bytes::from("abcde")).await.unwrap();
+        let meta = s.head("k").await.unwrap();
+        assert_eq!(meta.size, 5);
+    }
+
+    #[tokio::test]
+    async fn head_missing_returns_not_found() {
+        let s = store();
+        assert!(matches!(
+            s.head("absent").await,
+            Err(crate::Error::NotFound)
+        ));
+    }
+
+    #[tokio::test]
+    async fn delete_removes_key() {
+        let s = store();
+        s.put("k", Bytes::from("v")).await.unwrap();
+        s.delete("k").await.unwrap();
+        assert!(matches!(s.get("k").await, Err(crate::Error::NotFound)));
+    }
+
+    #[tokio::test]
+    async fn delete_missing_is_ok() {
+        let s = store();
+        s.delete("absent").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn delete_prefix_removes_matching_keys() {
+        let s = store();
+        s.put("jobs/a", Bytes::from("1")).await.unwrap();
+        s.put("jobs/b", Bytes::from("2")).await.unwrap();
+        s.put("other/c", Bytes::from("3")).await.unwrap();
+
+        s.delete_prefix("jobs/").await.unwrap();
+
+        assert!(matches!(s.get("jobs/a").await, Err(crate::Error::NotFound)));
+        assert!(matches!(s.get("jobs/b").await, Err(crate::Error::NotFound)));
+        assert_eq!(s.get("other/c").await.unwrap(), b"3");
+    }
+
+    #[tokio::test]
+    async fn delete_prefix_empty_is_ok() {
+        let s = store();
+        s.delete_prefix("nonexistent/").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn list_returns_sorted_suffixes() {
+        let s = store();
+        s.put("dir/c.json", Bytes::from("3")).await.unwrap();
+        s.put("dir/a.json", Bytes::from("1")).await.unwrap();
+        s.put("dir/b.json", Bytes::from("2")).await.unwrap();
+        s.put("other/d.json", Bytes::from("4")).await.unwrap();
+
+        let page = s.list("dir/", 10, None).await.unwrap();
+        assert_eq!(page.items, vec!["a.json", "b.json", "c.json"]);
+        assert!(page.next_token.is_none());
+    }
+
+    #[tokio::test]
+    async fn list_paginates_with_token() {
+        let s = store();
+        for i in 0..5u8 {
+            s.put(&format!("p/{i:02}.json"), Bytes::from(vec![i]))
+                .await
+                .unwrap();
+        }
+
+        let page1 = s.list("p/", 2, None).await.unwrap();
+        assert_eq!(page1.items.len(), 2);
+        assert!(page1.next_token.is_some());
+
+        let page2 = s.list("p/", 2, page1.next_token).await.unwrap();
+        assert_eq!(page2.items.len(), 2);
+
+        let page3 = s.list("p/", 2, page2.next_token).await.unwrap();
+        assert_eq!(page3.items.len(), 1);
+        assert!(page3.next_token.is_none());
+    }
+
+    #[tokio::test]
+    async fn list_empty_prefix_returns_empty() {
+        let s = store();
+        let page: Page<String> = s.list("empty/", 10, None).await.unwrap();
+        assert!(page.items.is_empty());
+        assert!(page.next_token.is_none());
+    }
+
+    #[tokio::test]
+    async fn get_stream_with_offset() {
+        use tokio::io::AsyncReadExt;
+
+        let s = store();
+        s.put("k", Bytes::from("abcde")).await.unwrap();
+
+        let (mut reader, total) = s.get_stream("k", Some(2)).await.unwrap();
+        assert_eq!(total, 5);
+        let mut buf = Vec::new();
+        reader.read_to_end(&mut buf).await.unwrap();
+        assert_eq!(buf, b"cde");
+    }
+
+    #[tokio::test]
+    async fn copy_clones_object() {
+        let s = store();
+        s.put("src", Bytes::from("data")).await.unwrap();
+        s.copy("src", "dst").await.unwrap();
+        assert_eq!(s.get("dst").await.unwrap(), b"data");
+        assert_eq!(s.get("src").await.unwrap(), b"data");
+    }
+
+    #[tokio::test]
+    async fn copy_missing_source_returns_not_found() {
+        let s = store();
+        assert!(matches!(
+            s.copy("absent", "dst").await,
+            Err(crate::Error::NotFound)
+        ));
+    }
+
+    #[tokio::test]
+    async fn shared_clones_see_same_data() {
+        use std::sync::Arc;
+        let s = Arc::new(store());
+        let s2 = s.clone();
+        s.put("shared", Bytes::from("x")).await.unwrap();
+        assert_eq!(s2.get("shared").await.unwrap(), b"x");
+    }
+
+    #[tokio::test]
+    async fn head_returns_etag_that_changes_after_put() {
+        let s = store();
+        s.put("k", Bytes::from("v1")).await.unwrap();
+        let e1 = s.head("k").await.unwrap().etag.unwrap();
+        s.put("k", Bytes::from("v2")).await.unwrap();
+        let e2 = s.head("k").await.unwrap().etag.unwrap();
+        assert_ne!(e1, e2, "etag must change on overwrite");
+    }
+
+    #[tokio::test]
+    async fn put_if_absent_fails_when_present() {
+        let s = store();
+        s.put_if_absent("k", Bytes::from("v1")).await.unwrap();
+        let again = s.put_if_absent("k", Bytes::from("v2")).await;
+        assert!(matches!(again, Err(crate::Error::PreconditionFailed)));
+        assert_eq!(s.get("k").await.unwrap(), b"v1");
+    }
+
+    #[tokio::test]
+    async fn put_if_match_requires_current_etag() {
+        let s = store();
+        let etag = s
+            .put_if_absent("k", Bytes::from("v1"))
+            .await
+            .unwrap()
+            .unwrap();
+        let stale = Etag::new("\"stale\"".to_string());
+        assert!(matches!(
+            s.put_if_match("k", &stale, Bytes::from("nope")).await,
+            Err(crate::Error::PreconditionFailed)
+        ));
+        s.put_if_match("k", &etag, Bytes::from("v2")).await.unwrap();
+        assert_eq!(s.get("k").await.unwrap(), b"v2");
+    }
+
+    #[tokio::test]
+    async fn delete_if_match_requires_current_etag() {
+        let s = store();
+        let etag = s
+            .put_if_absent("k", Bytes::from("v"))
+            .await
+            .unwrap()
+            .unwrap();
+        let stale = Etag::new("\"stale\"".to_string());
+        assert!(matches!(
+            s.delete_if_match("k", &stale).await,
+            Err(crate::Error::PreconditionFailed)
+        ));
+        s.delete_if_match("k", &etag).await.unwrap();
+        assert!(matches!(s.get("k").await, Err(crate::Error::NotFound)));
+        // Missing key is idempotent success.
+        s.delete_if_match("k", &etag).await.unwrap();
+    }
+}

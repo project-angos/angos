@@ -278,7 +278,7 @@ fn test_typed_registry_variants_route_to_internal_server_error() {
             "I/O error during operations",
         ),
         (
-            registry::Error::MetadataStore(crate::registry::metadata_store::Error::Lock(
+            registry::Error::MetadataStore(crate::registry::metadata_store::Error::Coordination(
                 "redis unreachable".to_string(),
             )),
             "metadata store error during operations",

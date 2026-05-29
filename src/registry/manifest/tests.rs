@@ -10,8 +10,11 @@ use crate::{
     oci::Namespace,
     registry::{
         Error, Registry,
-        metadata_store::{LinkOperation, link_kind::LinkKind},
-        test_utils::{FSRegistryTestCase, RegistryTestCase, backends},
+        metadata_store::{self, LinkOperation, link_kind::LinkKind},
+        test_utils::{
+            FSRegistryTestCase, RegistryTestCase, backends, create_test_repositories,
+            put_blob_direct,
+        },
     },
     util::sha256,
 };
@@ -189,8 +192,8 @@ async fn create_test_manifest_with_subject(
 async fn upload_blob(registry: &Registry, namespace: &Namespace, content: &[u8]) -> Digest {
     let session_id = Uuid::new_v4();
     registry
-        .upload_store
-        .create(namespace, &session_id.to_string())
+        .blob_store
+        .create_upload(namespace, &session_id.to_string())
         .await
         .unwrap();
 
@@ -1111,7 +1114,7 @@ async fn test_handle_delete_manifest() {
 async fn test_pull_through_cache_optimization_impl(test_case: &mut FSRegistryTestCase) {
     let namespace = &Namespace::new("test-repo").unwrap();
 
-    let repositories = crate::registry::test_utils::create_test_repositories();
+    let repositories = create_test_repositories();
 
     test_case.set_repositories(repositories);
     let registry = test_case.registry();
@@ -1554,7 +1557,7 @@ async fn test_head_manifest_fallback_without_media_type() {
         let namespace = &Namespace::new("test-repo/head-fallback").unwrap();
         let (content, media_type) = create_test_manifest(registry, namespace).await;
 
-        let digest = registry.blob_store.create(&content).await.unwrap();
+        let digest = put_blob_direct(registry.metadata_store.store(), &content).await;
 
         registry
             .metadata_store
@@ -1853,7 +1856,7 @@ async fn test_handle_get_manifest_redirect_fallback_without_media_type() {
         let namespace = &Namespace::new("test-repo/redirect-fallback").unwrap();
         let (content, media_type) = create_test_manifest(registry, namespace).await;
 
-        let digest = registry.blob_store.create(&content).await.unwrap();
+        let digest = put_blob_direct(registry.metadata_store.store(), &content).await;
 
         registry
             .metadata_store
@@ -2033,4 +2036,135 @@ fn manifest_meta_from_body_errors_on_malformed_json() {
     let target = fixed_digest();
     let result = manifest_meta_from_body(&target, b"not json");
     assert!(result.is_err());
+}
+
+// ── Manifest write/delete path tests ──────────────────────────────────────────
+
+#[tokio::test]
+async fn store_manifest_writes_blob_and_links() {
+    let test_case = FSRegistryTestCase::new();
+    let registry = test_case.registry();
+    let namespace = Namespace::new("test-repo").unwrap();
+
+    let (manifest_bytes, media_type) = create_test_manifest(registry, &namespace).await;
+    let expected_digest = Digest::Sha256(sha256::hex(&manifest_bytes).into());
+
+    let response = registry
+        .put_manifest(
+            &namespace,
+            &Reference::Tag("v1".to_string()),
+            Some(&media_type),
+            &manifest_bytes,
+        )
+        .await
+        .unwrap();
+
+    let stored_digest = header_digest(&response.headers);
+    assert_eq!(stored_digest, expected_digest);
+
+    // The link should be readable via the metadata store.
+    let link = registry
+        .metadata_store
+        .read_link(namespace.as_ref(), &LinkKind::Tag("v1".to_string()), false)
+        .await
+        .unwrap();
+    assert_eq!(link.target, expected_digest);
+
+    // The blob-data should be retrievable via the blob store.
+    let body = registry.blob_store.read(&expected_digest).await.unwrap();
+    assert_eq!(body, manifest_bytes);
+
+    // Blob-index should record the namespace reference.
+    let blob_index = registry
+        .metadata_store
+        .read_blob_index(&expected_digest)
+        .await
+        .unwrap();
+    assert!(
+        blob_index.namespace.contains_key(namespace.as_ref()),
+        "blob-index must contain namespace after manifest push"
+    );
+}
+
+#[tokio::test]
+async fn store_manifest_is_idempotent() {
+    // Pushing the same manifest bytes twice must not fail: PutIfAbsent for
+    // blob-data is idempotent; link writes overwrite with the same data.
+    let test_case = FSRegistryTestCase::new();
+    let registry = test_case.registry();
+    let namespace = Namespace::new("test-repo").unwrap();
+
+    let (manifest_bytes, media_type) = create_test_manifest(registry, &namespace).await;
+
+    registry
+        .put_manifest(
+            &namespace,
+            &Reference::Tag("v1".to_string()),
+            Some(&media_type),
+            &manifest_bytes,
+        )
+        .await
+        .unwrap();
+
+    registry
+        .put_manifest(
+            &namespace,
+            &Reference::Tag("v1".to_string()),
+            Some(&media_type),
+            &manifest_bytes,
+        )
+        .await
+        .unwrap();
+
+    // Link and blob-index must still be consistent.
+    let digest = Digest::Sha256(sha256::hex(&manifest_bytes).into());
+    let link = registry
+        .metadata_store
+        .read_link(namespace.as_ref(), &LinkKind::Tag("v1".to_string()), false)
+        .await
+        .unwrap();
+    assert_eq!(link.target, digest);
+}
+
+#[tokio::test]
+async fn delete_manifest_removes_links_and_blob_data() {
+    let test_case = FSRegistryTestCase::new();
+    let registry = test_case.registry();
+    let namespace = Namespace::new("test-repo").unwrap();
+
+    let (manifest_bytes, media_type) = create_test_manifest(registry, &namespace).await;
+    let digest = Digest::Sha256(sha256::hex(&manifest_bytes).into());
+
+    registry
+        .put_manifest(
+            &namespace,
+            &Reference::Tag("v1".to_string()),
+            Some(&media_type),
+            &manifest_bytes,
+        )
+        .await
+        .unwrap();
+
+    // Verify it exists.
+    registry
+        .metadata_store
+        .read_link(namespace.as_ref(), &LinkKind::Tag("v1".to_string()), false)
+        .await
+        .unwrap();
+
+    // Delete by digest.
+    registry
+        .delete_manifest(None, &namespace, &Reference::Digest(digest.clone()))
+        .await
+        .unwrap();
+
+    // Link should be gone.
+    let result = registry
+        .metadata_store
+        .read_link(namespace.as_ref(), &LinkKind::Digest(digest.clone()), false)
+        .await;
+    assert!(
+        matches!(result, Err(metadata_store::Error::ReferenceNotFound)),
+        "digest link should be gone after delete, got: {result:?}"
+    );
 }

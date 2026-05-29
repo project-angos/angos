@@ -7,8 +7,8 @@ use crate::{
     command::scrub::{action::Action, error::Error},
     oci::{Manifest, Reference},
     registry::{
-        blob_store::{self, BlobStore, MultipartCleanup, OrphanMultipartUpload, UploadStore},
-        manifest::{find_tags_pointing_at, link_plan},
+        blob_store,
+        manifest::link_plan,
         metadata_store::{
             BlobIndexOperation, Error as MetadataStoreError, LinkOperation, MetadataStore,
             link_kind::LinkKind,
@@ -34,25 +34,17 @@ impl ActionSink for DryRunSink {
 }
 
 /// Applies scrub actions against live storage backends.
+#[allow(clippy::struct_field_names)]
 pub struct Executor {
-    blob_store: Arc<dyn BlobStore>,
-    metadata_store: Arc<dyn MetadataStore + Send + Sync>,
-    upload_store: Arc<dyn UploadStore>,
-    multipart_cleanup: Arc<dyn MultipartCleanup + Send + Sync>,
+    blob_store: Arc<blob_store::BlobStore>,
+    metadata_store: Arc<MetadataStore>,
 }
 
 impl Executor {
-    pub fn new(
-        blob_store: Arc<dyn BlobStore>,
-        metadata_store: Arc<dyn MetadataStore + Send + Sync>,
-        upload_store: Arc<dyn UploadStore>,
-        multipart_cleanup: Arc<dyn MultipartCleanup + Send + Sync>,
-    ) -> Self {
+    pub fn new(blob_store: Arc<blob_store::BlobStore>, metadata_store: Arc<MetadataStore>) -> Self {
         Self {
             blob_store,
             metadata_store,
-            upload_store,
-            multipart_cleanup,
         }
     }
 }
@@ -71,16 +63,29 @@ impl ActionSink for Executor {
                 self.metadata_store.migrate_blob_index(&digest).await?;
             }
             Action::DeleteOrphanBlob(digest) => {
-                let guard = self.metadata_store.acquire_blob_data_lock(&digest).await?;
-
-                let has_references = self.metadata_store.has_blob_references(&digest).await;
-                let delete_result = match has_references {
-                    Err(e) => Err(e.into()),
+                // Hold the `blob-data:{digest}` coarse lock — the same one
+                // manifest pushes and upload completions take — across the
+                // reference check and the data delete, so a reference that a
+                // concurrent push is granting cannot be missed and have its
+                // bytes reclaimed underneath it.
+                let keys = [format!("blob-data:{digest}")];
+                let session = self
+                    .metadata_store
+                    .executor()
+                    .acquire(&keys)
+                    .await
+                    .map_err(|e| {
+                        MetadataStoreError::Coordination(format!(
+                            "blob-data lock acquire failed: {e}"
+                        ))
+                    })?;
+                let result = match self.metadata_store.has_blob_references(&digest).await {
+                    Err(e) => Err(Error::from(e)),
                     Ok(true) => {
                         info!("skipping orphan blob deletion: reference appeared for {digest}");
                         Ok(())
                     }
-                    Ok(false) => match self.blob_store.delete(&digest).await {
+                    Ok(false) => match self.blob_store.delete_blob(&digest).await {
                         Ok(())
                         | Err(
                             blob_store::Error::BlobNotFound | blob_store::Error::ReferenceNotFound,
@@ -88,17 +93,8 @@ impl ActionSink for Executor {
                         Err(e) => Err(Error::from(e)),
                     },
                 };
-
-                let lock_valid = guard.is_valid();
-                guard.release().await;
-                delete_result?;
-
-                if !lock_valid {
-                    return Err(MetadataStoreError::Lock(
-                        "lock invalidated during orphan blob deletion".into(),
-                    )
-                    .into());
-                }
+                session.release().await;
+                result?;
             }
             Action::RemoveBlobIndexLink {
                 namespace,
@@ -149,11 +145,6 @@ impl ActionSink for Executor {
                     )
                     .await?;
             }
-            Action::AbortMultipartUpload { key, upload_id } => {
-                self.multipart_cleanup
-                    .abort_orphan_multipart_upload(&OrphanMultipartUpload { key, upload_id })
-                    .await?;
-            }
             Action::DeleteTag { namespace, tag } => {
                 self.metadata_store
                     .update_links(&namespace, &[LinkOperation::delete(LinkKind::Tag(tag))])
@@ -170,13 +161,15 @@ impl ActionSink for Executor {
                     }
                     Err(e) => return Err(Error::from(e)),
                 };
-                let tags = find_tags_pointing_at(self.metadata_store.as_ref(), &namespace, &digest)
+                let tags = self
+                    .metadata_store
+                    .find_tags_pointing_at(&namespace, &digest)
                     .await?;
                 let ops = link_plan::delete(&Reference::Digest(digest), manifest.as_ref(), &tags);
                 self.metadata_store.update_links(&namespace, &ops).await?;
             }
             Action::DeleteExpiredUpload { namespace, uuid } => {
-                self.upload_store.delete(&namespace, &uuid).await?;
+                self.blob_store.delete_upload(&namespace, &uuid).await?;
             }
             Action::DeleteOrphanReferrer {
                 namespace,
@@ -229,7 +222,7 @@ mod tests {
         oci::Digest,
         registry::{
             metadata_store::{LinkOperation, link_kind::LinkKind},
-            test_utils::{NoopMultipart, backends},
+            test_utils::{backends, put_blob_direct},
         },
     };
 
@@ -237,9 +230,10 @@ mod tests {
     async fn executor_dry_run_does_not_delete_blob() {
         for test_case in backends() {
             let blob_store = test_case.blob_store();
+            let metadata_store = test_case.metadata_store();
 
             let orphan_content = b"executor dry-run test";
-            let orphan_digest = blob_store.create(orphan_content).await.unwrap();
+            let orphan_digest = put_blob_direct(metadata_store.store(), orphan_content).await;
 
             let mut sink = DryRunSink;
             sink.apply(Action::DeleteOrphanBlob(orphan_digest.clone()))
@@ -259,17 +253,11 @@ mod tests {
         for test_case in backends() {
             let blob_store = test_case.blob_store();
             let metadata_store = test_case.metadata_store();
-            let upload_store = test_case.upload_store();
 
             let orphan_content = b"executor real-run test";
-            let orphan_digest = blob_store.create(orphan_content).await.unwrap();
+            let orphan_digest = put_blob_direct(metadata_store.store(), orphan_content).await;
 
-            let mut executor = Executor::new(
-                blob_store.clone(),
-                metadata_store,
-                upload_store,
-                Arc::new(NoopMultipart),
-            );
+            let mut executor = Executor::new(blob_store.clone(), metadata_store);
 
             executor
                 .apply(Action::DeleteOrphanBlob(orphan_digest.clone()))
@@ -289,13 +277,12 @@ mod tests {
         for test_case in backends() {
             let blob_store = test_case.blob_store();
             let metadata_store = test_case.metadata_store();
-            let upload_store = test_case.upload_store();
 
             let namespace = "test-repo/app";
 
             // Write manifest blob and create a digest link, then delete the blob.
             let content = b"orphan manifest content for missing-blob test";
-            let digest = blob_store.create(content).await.unwrap();
+            let digest = put_blob_direct(metadata_store.store(), content).await;
             metadata_store
                 .update_links(
                     namespace,
@@ -306,14 +293,9 @@ mod tests {
                 )
                 .await
                 .unwrap();
-            blob_store.delete(&digest).await.unwrap();
+            blob_store.delete_blob(&digest).await.unwrap();
 
-            let mut executor = Executor::new(
-                blob_store.clone(),
-                metadata_store.clone(),
-                upload_store,
-                Arc::new(NoopMultipart),
-            );
+            let mut executor = Executor::new(blob_store.clone(), metadata_store.clone());
 
             executor
                 .apply(Action::DeleteOrphanManifest {
@@ -339,12 +321,11 @@ mod tests {
         for test_case in backends() {
             let blob_store = test_case.blob_store();
             let metadata_store = test_case.metadata_store();
-            let upload_store = test_case.upload_store();
 
             let namespace = "test-repo/app";
 
             let content = b"orphan manifest with tag - missing blob";
-            let digest = blob_store.create(content).await.unwrap();
+            let digest = put_blob_direct(metadata_store.store(), content).await;
             metadata_store
                 .update_links(
                     namespace,
@@ -358,14 +339,9 @@ mod tests {
                 )
                 .await
                 .unwrap();
-            blob_store.delete(&digest).await.unwrap();
+            blob_store.delete_blob(&digest).await.unwrap();
 
-            let mut executor = Executor::new(
-                blob_store.clone(),
-                metadata_store.clone(),
-                upload_store,
-                Arc::new(NoopMultipart),
-            );
+            let mut executor = Executor::new(blob_store.clone(), metadata_store.clone());
 
             executor
                 .apply(Action::DeleteOrphanManifest {
@@ -391,17 +367,11 @@ mod tests {
         for test_case in backends() {
             let blob_store = test_case.blob_store();
             let metadata_store = test_case.metadata_store();
-            let upload_store = test_case.upload_store();
 
             let content = b"blob with no ownership entry";
-            let digest = blob_store.create(content).await.unwrap();
+            let digest = put_blob_direct(metadata_store.store(), content).await;
 
-            let mut executor = Executor::new(
-                blob_store.clone(),
-                metadata_store,
-                upload_store,
-                Arc::new(NoopMultipart),
-            );
+            let mut executor = Executor::new(blob_store.clone(), metadata_store);
 
             executor
                 .apply(Action::DeleteOrphanBlob(digest.clone()))
@@ -422,10 +392,9 @@ mod tests {
         for test_case in backends() {
             let blob_store = test_case.blob_store();
             let metadata_store = test_case.metadata_store();
-            let upload_store = test_case.upload_store();
 
             let content = b"blob that got ownership just in time";
-            let digest = blob_store.create(content).await.unwrap();
+            let digest = put_blob_direct(metadata_store.store(), content).await;
 
             metadata_store
                 .update_blob_index(
@@ -436,12 +405,7 @@ mod tests {
                 .await
                 .unwrap();
 
-            let mut executor = Executor::new(
-                blob_store.clone(),
-                metadata_store,
-                upload_store,
-                Arc::new(NoopMultipart),
-            );
+            let mut executor = Executor::new(blob_store.clone(), metadata_store);
 
             executor
                 .apply(Action::DeleteOrphanBlob(digest.clone()))
@@ -461,18 +425,13 @@ mod tests {
         for test_case in backends() {
             let blob_store = test_case.blob_store();
             let metadata_store = test_case.metadata_store();
-            let upload_store = test_case.upload_store();
 
             let namespace = "test-repo/referrer-exec";
 
-            let subject_digest = blob_store
-                .create(b"subject for referrer exec")
-                .await
-                .unwrap();
-            let referrer_digest = blob_store
-                .create(b"referrer for referrer exec")
-                .await
-                .unwrap();
+            let subject_digest =
+                put_blob_direct(metadata_store.store(), b"subject for referrer exec").await;
+            let referrer_digest =
+                put_blob_direct(metadata_store.store(), b"referrer for referrer exec").await;
 
             metadata_store
                 .update_links(
@@ -503,12 +462,7 @@ mod tests {
                 "Referrer link must exist before applying the action"
             );
 
-            let mut executor = Executor::new(
-                blob_store.clone(),
-                metadata_store.clone(),
-                upload_store,
-                Arc::new(NoopMultipart),
-            );
+            let mut executor = Executor::new(blob_store.clone(), metadata_store.clone());
 
             executor
                 .apply(Action::DeleteOrphanReferrer {
@@ -539,14 +493,13 @@ mod tests {
         for test_case in backends() {
             let blob_store = test_case.blob_store();
             let metadata_store = test_case.metadata_store();
-            let upload_store = test_case.upload_store();
 
             let namespace = "test-repo/remove-referrer-cascade";
 
             // Create a layer blob and the corresponding layer link with exactly
             // one phantom referrer so referenced_by = {phantom}.
             let layer_content = b"layer content for cascade test";
-            let layer_digest = blob_store.create(layer_content).await.unwrap();
+            let layer_digest = put_blob_direct(metadata_store.store(), layer_content).await;
             let phantom_digest = Digest::from_str(
                 "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
             )
@@ -574,12 +527,7 @@ mod tests {
                 "phantom referrer must be present before the action"
             );
 
-            let mut executor = Executor::new(
-                blob_store.clone(),
-                metadata_store.clone(),
-                upload_store,
-                Arc::new(NoopMultipart),
-            );
+            let mut executor = Executor::new(blob_store.clone(), metadata_store.clone());
 
             executor
                 .apply(Action::RemoveReferrer {

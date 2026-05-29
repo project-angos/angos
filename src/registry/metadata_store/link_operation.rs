@@ -1,0 +1,97 @@
+//! Public link-mutation operation type.
+
+use crate::{
+    oci::{Descriptor, Digest},
+    registry::metadata_store::link_kind::LinkKind,
+};
+
+/// A single link mutation submitted to [`crate::registry::metadata_store::MetadataStore::update_links`].
+///
+/// The `Create` variant carries the target digest and optional referrer /
+/// media-type / descriptor metadata. The `Delete` variant carries an optional
+/// referrer qualification so tracked links (layers, configs) can decrement
+/// their reference count rather than being deleted outright.
+#[derive(Debug, Clone)]
+pub enum LinkOperation {
+    Create {
+        link: LinkKind,
+        target: Digest,
+        referrer: Option<Digest>,
+        media_type: Option<String>,
+        descriptor: Option<Box<Descriptor>>,
+    },
+    Delete {
+        link: LinkKind,
+        referrer: Option<Digest>,
+    },
+}
+
+impl LinkOperation {
+    /// Creates a link with no referrer, media type, or descriptor.
+    pub fn create(link: LinkKind, target: Digest) -> Self {
+        Self::Create {
+            link,
+            target,
+            referrer: None,
+            media_type: None,
+            descriptor: None,
+        }
+    }
+
+    /// Creates a link carrying a parent `referrer` digest.
+    pub fn create_with_referrer(link: LinkKind, target: Digest, referrer: Digest) -> Self {
+        Self::Create {
+            link,
+            target,
+            referrer: Some(referrer),
+            media_type: None,
+            descriptor: None,
+        }
+    }
+
+    /// Creates a link carrying an optional `media_type`.
+    pub fn create_with_media_type(
+        link: LinkKind,
+        target: Digest,
+        media_type: Option<String>,
+    ) -> Self {
+        Self::Create {
+            link,
+            target,
+            referrer: None,
+            media_type,
+            descriptor: None,
+        }
+    }
+
+    /// Creates a link carrying a pre-computed `Descriptor` (referrer index entry).
+    pub fn create_with_descriptor(
+        link: LinkKind,
+        target: Digest,
+        descriptor: Box<Descriptor>,
+    ) -> Self {
+        Self::Create {
+            link,
+            target,
+            referrer: None,
+            media_type: None,
+            descriptor: Some(descriptor),
+        }
+    }
+
+    /// Deletes a link with no referrer qualification.
+    pub fn delete(link: LinkKind) -> Self {
+        Self::Delete {
+            link,
+            referrer: None,
+        }
+    }
+
+    /// Deletes a link qualified by a parent `referrer` digest.
+    pub fn delete_with_referrer(link: LinkKind, referrer: Digest) -> Self {
+        Self::Delete {
+            link,
+            referrer: Some(referrer),
+        }
+    }
+}

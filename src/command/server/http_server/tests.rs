@@ -468,7 +468,6 @@ async fn bad_basic_auth_returns_http_401() {
 
         [global]
         update_pull_time = false
-        max_concurrent_cache_jobs = 10
 
         [global.access_policy]
         default = "allow"

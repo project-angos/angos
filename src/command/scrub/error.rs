@@ -1,3 +1,5 @@
+use angos_tx_engine::lock;
+
 use crate::{
     cache,
     command::bootstrap::Error as BootstrapError,
@@ -58,6 +60,12 @@ impl From<policy::Error> for Error {
     }
 }
 
+impl From<lock::Error> for Error {
+    fn from(e: lock::Error) -> Self {
+        Error::MetadataStore(e.into())
+    }
+}
+
 impl From<registry::Error> for Error {
     fn from(e: registry::Error) -> Self {
         match e {
@@ -78,6 +86,7 @@ impl From<BootstrapError> for Error {
             )),
             BootstrapError::Overlap(inner) => Error::Initialization(inner.to_string()),
             BootstrapError::JobQueue(inner) => Error::Initialization(inner.to_string()),
+            BootstrapError::RegistryStorage(inner) => Error::Initialization(inner.to_string()),
         }
     }
 }

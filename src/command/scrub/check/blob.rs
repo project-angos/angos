@@ -13,7 +13,7 @@ use crate::{
     },
     oci::Digest,
     registry::{
-        blob_store::{self, BlobStore},
+        blob_store,
         metadata_store::{BlobIndex, Error as MetadataError, MetadataStore, link_kind::LinkKind},
     },
 };
@@ -26,7 +26,7 @@ enum BlobVerdict {
 }
 
 async fn classify_blob(
-    metadata_store: &Arc<dyn MetadataStore + Send + Sync>,
+    metadata_store: &Arc<MetadataStore>,
     blob: &Digest,
 ) -> Result<BlobVerdict, Error> {
     match metadata_store.read_blob_index(blob).await {
@@ -38,15 +38,12 @@ async fn classify_blob(
 }
 
 pub struct BlobChecker {
-    blob_store: Arc<dyn BlobStore + Send + Sync>,
-    metadata_store: Arc<dyn MetadataStore + Send + Sync>,
+    blob_store: Arc<blob_store::BlobStore>,
+    metadata_store: Arc<MetadataStore>,
 }
 
 impl BlobChecker {
-    pub fn new(
-        blob_store: Arc<dyn BlobStore + Send + Sync>,
-        metadata_store: Arc<dyn MetadataStore + Send + Sync>,
-    ) -> Self {
+    pub fn new(blob_store: Arc<blob_store::BlobStore>, metadata_store: Arc<MetadataStore>) -> Self {
         Self {
             blob_store,
             metadata_store,
@@ -158,26 +155,24 @@ impl StoreChecker for BlobChecker {
 
 #[cfg(test)]
 mod tests {
-    use std::str::FromStr;
+    use std::{collections::HashSet, str::FromStr};
 
     use super::*;
     use crate::{
         command::scrub::{action::Action, executor::Executor},
         oci::{Digest, Namespace},
         registry::{
-            blob_store::MultipartCleanup,
             metadata_store::BlobIndexOperation,
-            test_utils::{self, NoopMultipart, backends},
+            test_utils::{self, backends, put_blob_direct},
         },
     };
 
     #[tokio::test]
     async fn classify_blob_returns_orphan_when_no_index_entry() {
         for test_case in backends() {
-            let blob_store = test_case.blob_store();
             let metadata_store = test_case.metadata_store();
 
-            let orphan_digest = blob_store.create(b"orphan content").await.unwrap();
+            let orphan_digest = put_blob_direct(metadata_store.store(), b"orphan content").await;
 
             let verdict = classify_blob(&metadata_store, &orphan_digest)
                 .await
@@ -193,13 +188,9 @@ mod tests {
     #[tokio::test]
     async fn classify_blob_returns_orphan_when_namespace_map_is_empty() {
         for test_case in backends() {
-            let blob_store = test_case.blob_store();
             let metadata_store = test_case.metadata_store();
 
-            let digest = blob_store
-                .create(b"content with empty index")
-                .await
-                .unwrap();
+            let digest = put_blob_direct(metadata_store.store(), b"content with empty index").await;
 
             // Insert then immediately remove the only link so the namespace map exists but is empty.
             let namespace = "test-repo/empty";
@@ -248,10 +239,6 @@ mod tests {
         }
     }
 
-    fn noop_multipart() -> std::sync::Arc<dyn MultipartCleanup + Send + Sync> {
-        std::sync::Arc::new(NoopMultipart)
-    }
-
     #[tokio::test]
     async fn test_cleanup_orphan_blobs_removes_invalid_index_entries() {
         for test_case in backends() {
@@ -283,16 +270,11 @@ mod tests {
             let initial_refs = blob_index_before
                 .namespace
                 .get(namespace.as_ref())
-                .map_or(0, std::collections::HashSet::len);
+                .map_or(0, HashSet::len);
 
             let checker = BlobChecker::new(blob_store.clone(), metadata_store.clone());
 
-            let mut executor = Executor::new(
-                blob_store.clone(),
-                metadata_store.clone(),
-                test_case.upload_store(),
-                noop_multipart(),
-            );
+            let mut executor = Executor::new(blob_store.clone(), metadata_store.clone());
 
             checker.check_all(&mut executor).await.unwrap();
 
@@ -301,7 +283,7 @@ mod tests {
             let final_refs = blob_index_after
                 .namespace
                 .get(namespace.as_ref())
-                .map_or(0, std::collections::HashSet::len);
+                .map_or(0, HashSet::len);
 
             assert!(
                 final_refs < initial_refs,
@@ -318,7 +300,7 @@ mod tests {
             let metadata_store = test_case.metadata_store();
             let blob_store = test_case.blob_store();
 
-            let blob_digest = blob_store.create(b"owned content").await.unwrap();
+            let blob_digest = put_blob_direct(metadata_store.store(), b"owned content").await;
             let ownership_link = LinkKind::Blob(blob_digest.clone());
             metadata_store
                 .update_blob_index(
@@ -330,12 +312,7 @@ mod tests {
                 .unwrap();
 
             let checker = BlobChecker::new(blob_store.clone(), metadata_store.clone());
-            let mut executor = Executor::new(
-                blob_store.clone(),
-                metadata_store.clone(),
-                test_case.upload_store(),
-                noop_multipart(),
-            );
+            let mut executor = Executor::new(blob_store.clone(), metadata_store.clone());
 
             checker.check_all(&mut executor).await.unwrap();
 
@@ -354,18 +331,13 @@ mod tests {
             let metadata_store = test_case.metadata_store();
 
             let orphan_content = b"orphan blob content";
-            let orphan_digest = blob_store.create(orphan_content).await.unwrap();
+            let orphan_digest = put_blob_direct(metadata_store.store(), orphan_content).await;
 
             assert!(blob_store.read(&orphan_digest).await.is_ok());
 
             let checker = BlobChecker::new(blob_store.clone(), metadata_store.clone());
 
-            let mut executor = Executor::new(
-                blob_store.clone(),
-                metadata_store,
-                test_case.upload_store(),
-                noop_multipart(),
-            );
+            let mut executor = Executor::new(blob_store.clone(), metadata_store);
 
             checker.check_all(&mut executor).await.unwrap();
 
@@ -384,7 +356,7 @@ mod tests {
             let metadata_store = test_case.metadata_store();
 
             let orphan_content = b"orphan blob content for dry run";
-            let orphan_digest = blob_store.create(orphan_content).await.unwrap();
+            let orphan_digest = put_blob_direct(metadata_store.store(), orphan_content).await;
 
             assert!(blob_store.read(&orphan_digest).await.is_ok());
 
@@ -429,12 +401,7 @@ mod tests {
                 .unwrap();
 
             let checker = BlobChecker::new(blob_store.clone(), metadata_store.clone());
-            let mut executor = Executor::new(
-                blob_store.clone(),
-                metadata_store.clone(),
-                test_case.upload_store(),
-                noop_multipart(),
-            );
+            let mut executor = Executor::new(blob_store.clone(), metadata_store.clone());
 
             checker
                 .check_blob(&phantom_digest, &mut executor)
@@ -450,7 +417,7 @@ mod tests {
                             || index
                                 .namespace
                                 .get(namespace.as_ref())
-                                .is_none_or(std::collections::HashSet::is_empty),
+                                .is_none_or(HashSet::is_empty),
                         "All ownership index entries must be purged when blob bytes are absent"
                     );
                 }
@@ -482,12 +449,7 @@ mod tests {
                 .unwrap();
 
             let checker = BlobChecker::new(blob_store.clone(), metadata_store.clone());
-            let mut executor = Executor::new(
-                blob_store.clone(),
-                metadata_store.clone(),
-                test_case.upload_store(),
-                noop_multipart(),
-            );
+            let mut executor = Executor::new(blob_store.clone(), metadata_store.clone());
 
             checker
                 .check_blob(&phantom_digest, &mut executor)
@@ -503,7 +465,7 @@ mod tests {
                             || index
                                 .namespace
                                 .get(namespace.as_ref())
-                                .is_none_or(std::collections::HashSet::is_empty),
+                                .is_none_or(HashSet::is_empty),
                         "Layer link index entry must be purged when blob bytes are absent"
                     );
                 }
@@ -571,7 +533,8 @@ mod tests {
             let metadata_store = test_case.metadata_store();
 
             // Write real bytes so size() returns Ok.
-            let blob_digest = blob_store.create(b"present blob content").await.unwrap();
+            let blob_digest =
+                put_blob_direct(metadata_store.store(), b"present blob content").await;
 
             // Seed the index with a stale Layer link that has no corresponding link file.
             let stale_layer_link = LinkKind::Layer(

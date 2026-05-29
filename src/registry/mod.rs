@@ -1,5 +1,6 @@
-use std::{collections::HashMap, fmt, sync::Arc};
+use std::{collections::HashMap, fmt, num::NonZeroUsize, sync::Arc, time::Duration};
 
+use tokio::time::sleep;
 use tracing::instrument;
 
 pub mod blob;
@@ -20,7 +21,6 @@ mod path_builder;
 pub mod repository;
 pub mod repository_resolver;
 pub mod s3_connection;
-pub mod task_queue;
 #[cfg(test)]
 pub mod test_utils;
 pub mod upload;
@@ -51,17 +51,22 @@ pub struct JsonResponse {
 pub use crate::policy::AccessPolicy;
 use crate::{
     cache,
-    configuration::RegexPattern,
+    command::worker::runner::execute_one,
+    configuration::{RegexPattern, global::DEFAULT_MAX_CONCURRENT_CACHE_JOBS},
     oci::{Digest, Namespace},
     registry::{
         blob_ownership::BlobOwnership,
-        blob_store::{BlobStore, Error as BlobStoreError, PresignedBlobStore, UploadStore},
-        cache_job_handler::CacheJobHandler,
-        job_store::{JobHandler, JobQueue, in_process::InProcessJobQueue},
-        metadata_store::{Error as MetadataError, MetadataStore},
+        blob_store::{BlobStore, Error as BlobStoreError},
+        cache_job_handler::{CACHE_QUEUE, CacheJobHandler},
+        job_store::{JobHandler, JobStore},
+        metadata_store::MetadataStore,
         repository_resolver::RepositoryResolver,
-        task_queue::TaskQueue,
     },
+};
+use angos_storage::{MemoryObjectStore, ObjectStore};
+use angos_tx_engine::{
+    executor::build_executor,
+    lock::{LockSession, LockStrategy},
 };
 
 #[allow(clippy::struct_excessive_bools)]
@@ -69,14 +74,18 @@ pub struct RegistryConfig {
     pub update_pull_time: bool,
     pub enable_blob_redirect: bool,
     pub enable_manifest_redirect: bool,
-    pub concurrent_cache_jobs: usize,
     pub global_immutable_tags: bool,
     pub global_immutable_tags_exclusions: Vec<RegexPattern>,
     pub max_manifest_size_bytes: usize,
-    /// When set, the registry routes all cache-fill jobs through this queue
-    /// instead of the default in-process `TaskQueue`. The choice is made once
-    /// at startup; no runtime switching is possible.
-    pub job_queue: Option<Arc<dyn JobQueue>>,
+    /// When set, the registry routes all cache-fill jobs through this
+    /// pre-built queue (typically the durable backend wired in `server setup`).
+    /// When absent, an engine-backed in-process queue is constructed
+    /// automatically. The choice is made once at startup; no runtime switching.
+    pub job_queue: Option<Arc<JobStore>>,
+    /// Number of in-process cache-fill jobs that may run in parallel. Only
+    /// consulted when `job_queue` is `None`; durable deployments use the
+    /// equivalent worker-side setting instead.
+    pub max_concurrent_cache_jobs: NonZeroUsize,
 }
 
 impl Default for RegistryConfig {
@@ -85,11 +94,11 @@ impl Default for RegistryConfig {
             update_pull_time: false,
             enable_blob_redirect: true,
             enable_manifest_redirect: true,
-            concurrent_cache_jobs: 4,
             global_immutable_tags: false,
             global_immutable_tags_exclusions: Vec::new(),
             max_manifest_size_bytes: manifest::DEFAULT_MAX_MANIFEST_SIZE_BYTES,
             job_queue: None,
+            max_concurrent_cache_jobs: DEFAULT_MAX_CONCURRENT_CACHE_JOBS,
         }
     }
 }
@@ -110,11 +119,6 @@ impl RegistryConfig {
         self
     }
 
-    pub fn concurrent_cache_jobs(mut self, jobs: usize) -> Self {
-        self.concurrent_cache_jobs = jobs;
-        self
-    }
-
     pub fn global_immutable_tags(mut self, enabled: bool) -> Self {
         self.global_immutable_tags = enabled;
         self
@@ -130,23 +134,26 @@ impl RegistryConfig {
         self
     }
 
-    pub fn job_queue(mut self, queue: Arc<dyn JobQueue>) -> Self {
+    pub fn job_queue(mut self, queue: Arc<JobStore>) -> Self {
         self.job_queue = Some(queue);
+        self
+    }
+
+    pub fn max_concurrent_cache_jobs(mut self, value: NonZeroUsize) -> Self {
+        self.max_concurrent_cache_jobs = value;
         self
     }
 }
 
 #[allow(clippy::struct_excessive_bools)]
 pub struct Registry {
-    blob_store: Arc<dyn BlobStore>,
-    upload_store: Arc<dyn UploadStore>,
-    presigned_blob_store: Option<Arc<dyn PresignedBlobStore>>,
-    metadata_store: Arc<dyn MetadataStore>,
+    blob_store: Arc<BlobStore>,
+    metadata_store: Arc<MetadataStore>,
     resolver: Arc<RepositoryResolver>,
     enable_blob_redirect: bool,
     enable_manifest_redirect: bool,
     update_pull_time: bool,
-    cache_queue: Arc<dyn JobQueue>,
+    cache_queue: Arc<JobStore>,
     global_immutable_tags: bool,
     global_immutable_tags_exclusions: Vec<RegexPattern>,
     max_manifest_size_bytes: usize,
@@ -159,32 +166,22 @@ impl fmt::Debug for Registry {
 }
 
 impl Registry {
-    #[instrument(skip(
-        blob_store,
-        upload_store,
-        presigned_blob_store,
-        metadata_store,
-        resolver,
-        config
-    ))]
+    #[instrument(skip(blob_store, metadata_store, resolver, config))]
     pub fn new(
-        blob_store: Arc<dyn BlobStore>,
-        upload_store: Arc<dyn UploadStore>,
-        presigned_blob_store: Option<Arc<dyn PresignedBlobStore>>,
-        metadata_store: Arc<dyn MetadataStore>,
+        blob_store: Arc<BlobStore>,
+        metadata_store: Arc<MetadataStore>,
         resolver: Arc<RepositoryResolver>,
         config: RegistryConfig,
     ) -> Result<Self, Error> {
-        let cache_queue: Arc<dyn JobQueue> = if let Some(q) = config.job_queue {
+        let cache_queue: Arc<JobStore> = if let Some(q) = config.job_queue {
             q
         } else {
-            let task_queue = Arc::new(TaskQueue::new(config.concurrent_cache_jobs)?);
-            let handler: Arc<dyn JobHandler> = Arc::new(CacheJobHandler::new(
-                resolver.clone(),
-                upload_store.clone(),
-                metadata_store.clone(),
-            ));
-            Arc::new(InProcessJobQueue::new(task_queue, handler))
+            build_in_process_queue(
+                &resolver,
+                &blob_store,
+                &metadata_store,
+                config.max_concurrent_cache_jobs,
+            )?
         };
 
         Ok(Self {
@@ -192,8 +189,6 @@ impl Registry {
             enable_blob_redirect: config.enable_blob_redirect,
             enable_manifest_redirect: config.enable_manifest_redirect,
             blob_store,
-            upload_store,
-            presigned_blob_store,
             metadata_store,
             resolver,
             cache_queue,
@@ -232,33 +227,100 @@ impl Registry {
             .unwrap_or_default()
     }
 
-    async fn delete_blob_data_if_unreferenced(&self, digest: &Digest) -> Result<(), Error> {
-        let guard = self.metadata_store.acquire_blob_data_lock(digest).await?;
-        let result = self.delete_blob_data_if_unreferenced_locked(digest).await;
-        let lock_valid = guard.is_valid();
-        guard.release().await;
-
-        result?;
-        if !lock_valid {
-            return Err(
-                MetadataError::Lock("lock invalidated during blob data deletion".into()).into(),
-            );
-        }
-
-        Ok(())
+    /// Acquire the coarse `blob-data:{digest}` lock that serialises blob-data
+    /// creation (upload completion) against reclamation (unreferenced delete)
+    /// and against concurrent manifest pushes — which declare the same coarse
+    /// lock on their link transactions. Without it, a delete can reclaim a
+    /// content-addressed blob's bytes in the window between another repository
+    /// granting a reference and validating its manifest, surfacing as
+    /// `ManifestBlobUnknown`.
+    pub(crate) async fn acquire_blob_data_lock(
+        &self,
+        digest: &Digest,
+    ) -> Result<LockSession, Error> {
+        let keys = [format!("blob-data:{digest}")];
+        self.metadata_store
+            .executor()
+            .acquire(&keys)
+            .await
+            .map_err(|e| Error::Internal(format!("blob-data lock acquire failed: {e}")))
     }
 
-    async fn delete_blob_data_if_unreferenced_locked(&self, digest: &Digest) -> Result<(), Error> {
-        let ownership = BlobOwnership::new(self.metadata_store.as_ref());
-        if ownership.has_any_reference(digest).await? {
-            return Ok(());
-        }
-
-        match self.blob_store.delete(digest).await {
-            Ok(()) | Err(BlobStoreError::BlobNotFound | BlobStoreError::ReferenceNotFound) => {
-                Ok(())
+    async fn delete_blob_data_if_unreferenced(&self, digest: &Digest) -> Result<(), Error> {
+        let session = self.acquire_blob_data_lock(digest).await?;
+        let result = async {
+            let ownership = BlobOwnership::new(self.metadata_store.as_ref());
+            if ownership.has_any_reference(digest).await? {
+                return Ok(());
             }
-            Err(error) => Err(error.into()),
+            match self.blob_store.delete_blob(digest).await {
+                Ok(()) | Err(BlobStoreError::BlobNotFound | BlobStoreError::ReferenceNotFound) => {
+                    Ok(())
+                }
+                Err(error) => Err(error.into()),
+            }
+        }
+        .await;
+        session.release().await;
+        result
+    }
+}
+
+/// Construct the in-process job queue used when `[global.job_queue]` is absent.
+///
+/// Builds an engine-backed [`JobStore`] over a [`MemoryObjectStore`] with a
+/// memory-backed lock and spawns a pool of `concurrency` claim-loop tasks.
+/// Jobs survive as long as the process is alive; they are not durable across
+/// restarts.
+///
+/// # Errors
+///
+/// Returns [`Error::Internal`] when the executor cannot be built (should never
+/// happen with `LockStrategy::Memory`).
+fn build_in_process_queue(
+    resolver: &Arc<RepositoryResolver>,
+    blob_store: &Arc<BlobStore>,
+    metadata_store: &Arc<MetadataStore>,
+    concurrency: NonZeroUsize,
+) -> Result<Arc<JobStore>, Error> {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(MemoryObjectStore::new());
+
+    let executor = build_executor(
+        object_store.clone(),
+        None,
+        LockStrategy::Memory,
+        None,
+        false,
+        false,
+    )
+    .map_err(|e| Error::Internal(format!("failed to build in-process job executor: {e}")))?;
+
+    let job_store: Arc<JobStore> = Arc::new(JobStore::new(object_store, executor, "in-process"));
+
+    let handler: Arc<dyn JobHandler> = Arc::new(CacheJobHandler::new(
+        resolver.clone(),
+        blob_store.clone(),
+        metadata_store.clone(),
+    ));
+
+    for _ in 0..concurrency.get() {
+        tokio::spawn(in_process_claim_loop(job_store.clone(), handler.clone()));
+    }
+
+    Ok(job_store)
+}
+
+/// Single claim-loop task for the in-process pool. Mirrors the per-worker
+/// loop in `command::worker::command::Command::run` but with a fixed 10 ms
+/// idle tick so small test suites stay snappy.
+async fn in_process_claim_loop(consumer: Arc<JobStore>, handler: Arc<dyn JobHandler>) {
+    loop {
+        match consumer.claim_one(CACHE_QUEUE).await {
+            Err(_) => sleep(Duration::from_millis(100)).await,
+            Ok(claim_outcome) => match claim_outcome.claimed {
+                None => sleep(claim_outcome.idle_sleep(Duration::from_millis(10))).await,
+                Some(claimed) => execute_one(consumer.as_ref(), handler.as_ref(), claimed).await,
+            },
         }
     }
 }

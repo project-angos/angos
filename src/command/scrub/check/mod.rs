@@ -5,7 +5,6 @@ mod link_repair;
 pub mod list_all;
 mod manifest;
 mod media_type;
-mod multipart;
 mod referrer;
 mod retention;
 mod tag;
@@ -18,7 +17,6 @@ pub use link_references::LinkReferencesChecker;
 pub use link_repair::ensure_link;
 pub use manifest::ManifestChecker;
 pub use media_type::MediaTypeChecker;
-pub use multipart::MultipartChecker;
 pub use referrer::ReferrerChecker;
 pub use retention::RetentionChecker;
 pub use tag::TagChecker;
@@ -39,8 +37,8 @@ pub trait NamespaceChecker: Send + Sync {
 
 /// A checker that operates across the entire store (not namespace-scoped).
 ///
-/// `BlobChecker` and `MultipartChecker` implement this trait because their
-/// work spans all blobs or all multipart uploads, not a single namespace.
+/// `BlobChecker` implements this trait because its work spans all blobs, not
+/// a single namespace.
 #[async_trait]
 pub trait StoreChecker: Send + Sync {
     async fn check_all(&self, sink: &mut (dyn ActionSink + Send)) -> Result<(), Error>;

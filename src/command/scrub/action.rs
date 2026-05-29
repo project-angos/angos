@@ -38,10 +38,6 @@ pub enum Action {
         media_type: String,
         display_name: String,
     },
-    AbortMultipartUpload {
-        key: String,
-        upload_id: String,
-    },
     DeleteTag {
         namespace: String,
         tag: String,
@@ -124,9 +120,6 @@ impl fmt::Display for Action {
                     f,
                     "set media_type '{media_type}' on {display_name} in namespace '{namespace}'"
                 )
-            }
-            Action::AbortMultipartUpload { key, .. } => {
-                write!(f, "abort orphan multipart upload {key}")
             }
             Action::DeleteTag { namespace, tag } => {
                 write!(f, "delete tag '{namespace}:{tag}' (policy)")

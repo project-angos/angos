@@ -8,6 +8,8 @@ use tokio::time::timeout;
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
 use tracing::warn;
 
+use angos_tx_engine::ConditionalCapabilities;
+
 use crate::{
     command::server::{
         ServerContext,
@@ -18,10 +20,7 @@ use crate::{
         },
     },
     configuration::{Configuration, ServerConfig},
-    registry::{
-        cache_job_handler::CACHE_QUEUE, job_store::durable::pending_refresh_loop,
-        metadata_store::ConditionalCapabilities,
-    },
+    registry::{cache_job_handler::CACHE_QUEUE, job_store::pending_refresh_loop},
 };
 
 mod notifier;
@@ -51,12 +50,21 @@ pub struct Command {
     cached_capabilities: Arc<Mutex<Option<ConditionalCapabilities>>>,
     /// `None` when `[global.job_queue]` is not configured.
     pending_refresh: Option<PendingRefreshTask>,
+    /// Cancellation token tied to the transactional-engine recovery loop and
+    /// body janitor. Fired on shutdown to stop both background tasks.
+    engine_maintenance: CancellationToken,
 }
 
 impl Command {
     pub async fn new(config: &Configuration) -> Result<Command, Error> {
         let cached_capabilities = Arc::new(Mutex::new(None));
-        let (registry, pending) = setup::build_registry(config, &cached_capabilities).await?;
+        let engine_maintenance = CancellationToken::new();
+        let (registry, pending) = setup::build_registry(
+            config,
+            &cached_capabilities,
+            Some(engine_maintenance.clone()),
+        )
+        .await?;
         let context = ServerContext::new(config, registry)?;
 
         let listener = match &config.server {
@@ -85,11 +93,13 @@ impl Command {
             listener,
             cached_capabilities,
             pending_refresh,
+            engine_maintenance,
         })
     }
 
     pub async fn notify_config_change(&self, config: &Configuration) -> Result<(), Error> {
-        let (registry, pending) = setup::build_registry(config, &self.cached_capabilities).await?;
+        let (registry, pending) =
+            setup::build_registry(config, &self.cached_capabilities, None).await?;
 
         if pending.is_some() != self.pending_refresh.is_some() {
             warn!(
@@ -155,6 +165,11 @@ impl Command {
                 warn!("Pending-gauge ticker did not stop within shutdown grace period");
             }
         }
+
+        // Stop the transactional-engine maintenance tasks. They drop on their
+        // own once cancelled; we do not need to await them under the grace
+        // window because their loops bail out immediately on cancellation.
+        self.engine_maintenance.cancel();
     }
 
     pub async fn run(&self) -> Result<(), Error> {

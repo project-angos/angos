@@ -7,11 +7,12 @@ use serde::{
 use tracing::warn;
 
 mod error;
-mod global;
+pub mod global;
 pub mod listeners;
 mod metadata_resolver;
 mod observability;
 pub mod regex_pattern;
+pub mod registry_storage;
 mod server;
 mod ui;
 pub mod watcher;
@@ -20,6 +21,7 @@ pub use error::Error;
 pub use global::GlobalConfig;
 pub use observability::ObservabilityConfig;
 pub use regex_pattern::RegexPattern;
+pub use registry_storage::RegistryStorageConfig;
 pub use server::ServerConfig;
 pub use ui::UiConfig;
 
@@ -30,7 +32,7 @@ use crate::{
     auth::{authenticator, webhook},
     cache,
     event_webhook::config::EventWebhookConfig,
-    registry::{blob_store, metadata_store, repository},
+    registry::{blob_store, repository},
 };
 
 #[derive(Clone, Debug)]
@@ -39,8 +41,8 @@ pub struct Configuration {
     pub global: GlobalConfig,
     pub ui: UiConfig,
     pub cache: cache::Config,
-    pub blob_store: blob_store::BlobStorageConfig,
-    pub metadata_store: metadata_store::MetadataStoreConfig,
+    pub blob_store: blob_store::BlobStoreConfig,
+    pub registry_storage: RegistryStorageConfig,
     pub auth: authenticator::AuthConfig,
     pub repository: HashMap<String, repository::Config>,
     pub event_webhook: HashMap<String, EventWebhookConfig>,
@@ -67,7 +69,7 @@ impl<'de> Deserialize<'de> for Configuration {
                 let mut ui = None;
                 let mut cache = None;
                 let mut blob_store = None;
-                let mut metadata_store = None;
+                let mut registry_storage = None;
                 let mut auth = None;
                 let mut repository = None;
                 let mut event_webhook = None;
@@ -85,7 +87,11 @@ impl<'de> Deserialize<'de> for Configuration {
                             assign_once(&mut blob_store, "blob_store", map.next_value()?)?;
                         }
                         "metadata_store" => {
-                            assign_once(&mut metadata_store, "metadata_store", map.next_value()?)?;
+                            assign_once(
+                                &mut registry_storage,
+                                "metadata_store",
+                                map.next_value()?,
+                            )?;
                         }
                         "auth" => assign_once(&mut auth, "auth", map.next_value()?)?,
                         "repository" => {
@@ -109,7 +115,7 @@ impl<'de> Deserialize<'de> for Configuration {
                     ui: ui.unwrap_or_default(),
                     cache: cache.unwrap_or_default(),
                     blob_store: blob_store.unwrap_or_default(),
-                    metadata_store: metadata_store.unwrap_or_default(),
+                    registry_storage: registry_storage.unwrap_or_default(),
                     auth: auth.unwrap_or_default(),
                     repository: repository.unwrap_or_default(),
                     event_webhook: event_webhook.unwrap_or_default(),

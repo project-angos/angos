@@ -12,21 +12,18 @@ use crate::{
         executor::ActionSink,
     },
     registry::{
-        blob_store::{self, BlobStore},
+        blob_store,
         metadata_store::{MetadataStore, link_kind::LinkKind},
     },
 };
 
 pub struct TagChecker {
-    blob_store: Arc<dyn BlobStore + Send + Sync>,
-    metadata_store: Arc<dyn MetadataStore + Send + Sync>,
+    blob_store: Arc<blob_store::BlobStore>,
+    metadata_store: Arc<MetadataStore>,
 }
 
 impl TagChecker {
-    pub fn new(
-        blob_store: Arc<dyn BlobStore + Send + Sync>,
-        metadata_store: Arc<dyn MetadataStore + Send + Sync>,
-    ) -> Self {
+    pub fn new(blob_store: Arc<blob_store::BlobStore>, metadata_store: Arc<MetadataStore>) -> Self {
         Self {
             blob_store,
             metadata_store,
@@ -102,7 +99,7 @@ mod tests {
         oci::Namespace,
         registry::{
             metadata_store::{LinkOperation, link_kind::LinkKind},
-            test_utils::{self, NoopMultipart, backends},
+            test_utils::{self, backends, put_blob_direct},
         },
     };
 
@@ -129,12 +126,7 @@ mod tests {
                 .await
                 .unwrap();
 
-            let mut executor = Executor::new(
-                blob_store.clone(),
-                metadata_store.clone(),
-                test_case.upload_store(),
-                std::sync::Arc::new(NoopMultipart),
-            );
+            let mut executor = Executor::new(blob_store.clone(), metadata_store.clone());
 
             let scrubber = TagChecker::new(blob_store.clone(), metadata_store.clone());
             scrubber.check(namespace, &mut executor).await.unwrap();
@@ -177,12 +169,7 @@ mod tests {
                 .await
                 .unwrap();
 
-            let mut executor = Executor::new(
-                blob_store.clone(),
-                metadata_store.clone(),
-                test_case.upload_store(),
-                std::sync::Arc::new(NoopMultipart),
-            );
+            let mut executor = Executor::new(blob_store.clone(), metadata_store.clone());
 
             let scrubber = TagChecker::new(blob_store.clone(), metadata_store.clone());
             scrubber.check(namespace, &mut executor).await.unwrap();
@@ -225,14 +212,9 @@ mod tests {
                 .await
                 .unwrap();
 
-            blob_store.delete(&blob_digest).await.unwrap();
+            blob_store.delete_blob(&blob_digest).await.unwrap();
 
-            let mut executor = Executor::new(
-                blob_store.clone(),
-                metadata_store.clone(),
-                test_case.upload_store(),
-                std::sync::Arc::new(NoopMultipart),
-            );
+            let mut executor = Executor::new(blob_store.clone(), metadata_store.clone());
 
             let scrubber = TagChecker::new(blob_store.clone(), metadata_store.clone());
             scrubber.check(namespace, &mut executor).await.unwrap();
@@ -263,10 +245,8 @@ mod tests {
             let blob_store = test_case.blob_store();
 
             // Write the blob and manually create digest + tag links so both are present.
-            let blob_digest = blob_store
-                .create(b"manifest for dry-run test")
-                .await
-                .unwrap();
+            let blob_digest =
+                put_blob_direct(metadata_store.store(), b"manifest for dry-run test").await;
             metadata_store
                 .update_links(
                     namespace,
@@ -284,7 +264,7 @@ mod tests {
                 .await
                 .unwrap();
 
-            blob_store.delete(&blob_digest).await.unwrap();
+            blob_store.delete_blob(&blob_digest).await.unwrap();
 
             let scrubber = TagChecker::new(blob_store.clone(), metadata_store.clone());
             let mut sink: Vec<Action> = Vec::new();

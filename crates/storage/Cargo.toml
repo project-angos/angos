@@ -16,7 +16,7 @@ serde = { version = "1.0.228", features = ["derive"] }
 tempfile = "3.27"
 thiserror = "2.0.18"
 tokio = { version = "1.52.3", features = ["fs", "io-util", "rt", "sync"] }
-tokio-util = { version = "0.7.18", features = ["io-util"] }
+tokio-util = { version = "0.7.18", features = ["io-util", "rt"] }
 tracing = "0.1.44"
 
 [dev-dependencies]

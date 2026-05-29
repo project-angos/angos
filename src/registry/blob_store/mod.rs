@@ -1,17 +1,47 @@
+//! Blob storage subsystem.
+//!
+//! Exposes a single unified [`BlobStore`] struct that carries an
+//! `Arc<dyn Storage>` (any [`ObjectStore`] + [`UploadSessionStore`]) plus
+//! an optional `Arc<dyn PresignedStore>` for presigning, an optional typed
+//! `Arc<StorageFsBackend>` for FS-specific tidy-up (empty-ancestor pruning),
+//! and the transaction executor used by the upload-session commit step. FS
+//! and S3 are wired through the same code path; the [`BlobStoreConfig`] enum
+//! only picks the underlying storage handles. All public methods live as
+//! inherent methods on `BlobStore` — no caller-facing trait split.
+
 mod config;
 mod error;
-pub mod fs;
-mod hashing_reader;
-pub mod s3;
-mod sha256_ext;
+pub mod hashing_reader;
+pub mod sha256_ext;
+pub mod upload_session;
 
-use async_trait::async_trait;
-use chrono::{DateTime, Duration, Utc};
-pub use config::{BlobStorageConfig, BlobStoreHandles};
-pub use error::Error;
+use std::{
+    fmt::{self, Debug, Formatter},
+    sync::Arc,
+    time::Duration,
+};
+
+use chrono::{DateTime, Utc};
 use tokio::io::AsyncRead;
+use tracing::{debug, instrument};
 
-use crate::oci::Digest;
+use angos_storage::{
+    Error as StorageError, ObjectStore, PresignedStore, fs::Backend as StorageFsBackend,
+};
+use angos_tx_engine::executor::TransactionExecutor;
+
+pub use angos_storage::UploadSessionStore;
+pub use config::BlobStoreConfig;
+// Inner config structs are only constructed by tests; production code builds
+// backends through `BlobStoreConfig`. Re-export them for test builds only.
+#[cfg(test)]
+pub use config::{FsBackendConfig, S3BackendConfig, TransportFields};
+pub use error::Error;
+
+use crate::{
+    oci::Digest,
+    registry::{pagination, path_builder},
+};
 
 pub type BoxedReader = Box<dyn AsyncRead + Unpin + Send + Sync>;
 
@@ -22,293 +52,201 @@ pub struct UploadSummary {
     pub started_at: DateTime<Utc>,
 }
 
-#[async_trait]
-pub trait BlobStore: Send + Sync {
-    async fn list(
+/// Combined supertrait every storage backend handed to [`BlobStore`] must
+/// satisfy: `ObjectStore` for the floor surface, `UploadSessionStore` for
+/// resumable streaming uploads.
+pub trait Storage: ObjectStore + UploadSessionStore + Send + Sync {}
+impl<T: ObjectStore + UploadSessionStore + Send + Sync + ?Sized> Storage for T {}
+
+#[derive(Clone)]
+pub struct BlobStore {
+    pub store: Arc<dyn Storage>,
+    pub presign: Option<Arc<dyn PresignedStore>>,
+    /// Typed FS handle used solely for `prune_empty_ancestors` on
+    /// upload-session complete/abort. `None` when the underlying storage
+    /// is not FS — pruning is meaningless on S3.
+    pub fs_prune: Option<Arc<StorageFsBackend>>,
+    executor: Arc<dyn TransactionExecutor>,
+}
+
+impl Debug for BlobStore {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.debug_struct("BlobStore").finish_non_exhaustive()
+    }
+}
+
+impl BlobStore {
+    pub fn builder() -> BlobStoreBuilder {
+        BlobStoreBuilder::default()
+    }
+
+    pub fn executor(&self) -> &Arc<dyn TransactionExecutor> {
+        &self.executor
+    }
+}
+
+#[derive(Default)]
+pub struct BlobStoreBuilder {
+    store: Option<Arc<dyn Storage>>,
+    presign: Option<Arc<dyn PresignedStore>>,
+    fs_prune: Option<Arc<StorageFsBackend>>,
+    executor: Option<Arc<dyn TransactionExecutor>>,
+}
+
+impl BlobStoreBuilder {
+    #[must_use]
+    pub fn store(mut self, store: Arc<dyn Storage>) -> Self {
+        self.store = Some(store);
+        self
+    }
+
+    #[must_use]
+    pub fn presign(mut self, presign: Arc<dyn PresignedStore>) -> Self {
+        self.presign = Some(presign);
+        self
+    }
+
+    /// Typed FS storage backend. Set this when the storage is FS so the
+    /// blob-store can call `prune_empty_ancestors` after upload-session
+    /// complete/abort. Leave unset for S3 or any other backend that
+    /// has no directory concept.
+    #[must_use]
+    pub fn fs_prune(mut self, fs: Arc<StorageFsBackend>) -> Self {
+        self.fs_prune = Some(fs);
+        self
+    }
+
+    #[must_use]
+    pub fn executor(mut self, executor: Arc<dyn TransactionExecutor>) -> Self {
+        self.executor = Some(executor);
+        self
+    }
+
+    pub fn build(self) -> Result<BlobStore, Error> {
+        let store = self
+            .store
+            .ok_or_else(|| Error::StorageBackend("blob_store builder requires a store".into()))?;
+        let executor = self.executor.ok_or_else(|| {
+            Error::StorageBackend("blob_store builder requires an executor".into())
+        })?;
+        Ok(BlobStore {
+            store,
+            presign: self.presign,
+            fs_prune: self.fs_prune,
+            executor,
+        })
+    }
+}
+
+// ─── blob CRUD (formerly `impl BlobStore`) ────────────────────────────────
+
+impl BlobStore {
+    #[instrument(skip(self))]
+    pub async fn list_blobs(
         &self,
         n: u16,
         continuation_token: Option<String>,
-    ) -> Result<(Vec<Digest>, Option<String>), Error>;
+    ) -> Result<(Vec<Digest>, Option<String>), Error> {
+        debug!("Fetching {n} blob(s) with continuation token: {continuation_token:?}");
+        let algorithm = "sha256";
+        let blob_prefix = format!("{}/{algorithm}/", path_builder::blobs_root_dir());
 
-    async fn create(&self, content: &[u8]) -> Result<Digest, Error>;
+        let mut all_blobs = Vec::new();
+        let mut list_continuation_token = None;
+        loop {
+            let page = self
+                .store
+                .list(&blob_prefix, 1000, list_continuation_token)
+                .await?;
+            for key in page.items {
+                let Some(key_without_data) = key.strip_suffix("/data") else {
+                    continue;
+                };
+                if let Some(slash_pos) = key_without_data.rfind('/') {
+                    let digest = &key_without_data[slash_pos + 1..];
+                    all_blobs.push(Digest::Sha256(digest.into()));
+                }
+            }
+            list_continuation_token = page.next_token;
+            if list_continuation_token.is_none() {
+                break;
+            }
+        }
 
-    async fn read(&self, digest: &Digest) -> Result<Vec<u8>, Error>;
+        Ok(pagination::paginate_sorted(
+            &all_blobs,
+            n,
+            continuation_token.as_deref(),
+        ))
+    }
 
-    async fn size(&self, digest: &Digest) -> Result<u64, Error>;
+    #[instrument(skip(self))]
+    pub async fn read(&self, digest: &Digest) -> Result<Vec<u8>, Error> {
+        let path = path_builder::blob_path(digest);
+        match self.store.get(&path).await {
+            Ok(data) => Ok(data),
+            Err(StorageError::NotFound) => Err(Error::BlobNotFound),
+            Err(e) => Err(e.into()),
+        }
+    }
 
-    async fn reader(
+    #[instrument(skip(self))]
+    pub async fn size(&self, digest: &Digest) -> Result<u64, Error> {
+        let path = path_builder::blob_path(digest);
+        match self.store.head(&path).await {
+            Ok(meta) => Ok(meta.size),
+            Err(StorageError::NotFound) => Err(Error::BlobNotFound),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    #[instrument(skip(self))]
+    pub async fn reader(
         &self,
         digest: &Digest,
         start_offset: Option<u64>,
-    ) -> Result<(BoxedReader, u64), Error>;
+    ) -> Result<(BoxedReader, u64), Error> {
+        let path = path_builder::blob_path(digest);
+        match self.store.get_stream(&path, start_offset).await {
+            Ok((reader, total)) => Ok((reader, total)),
+            Err(StorageError::NotFound) => Err(Error::BlobNotFound),
+            Err(e) => Err(e.into()),
+        }
+    }
 
-    async fn delete(&self, digest: &Digest) -> Result<(), Error>;
+    #[instrument(skip(self))]
+    pub async fn delete_blob(&self, digest: &Digest) -> Result<(), Error> {
+        let container = path_builder::blob_container_dir(digest);
+        self.store.delete_prefix(&container).await?;
+        if let Some(fs) = &self.fs_prune {
+            fs.prune_empty_ancestors(&container, 2).await;
+        }
+        Ok(())
+    }
 }
 
-#[async_trait]
-pub trait UploadStore: Send + Sync {
-    async fn list(
-        &self,
-        namespace: &str,
-        n: u16,
-        continuation_token: Option<String>,
-    ) -> Result<(Vec<String>, Option<String>), Error>;
+// ─── presigning (formerly `impl PresignedBlobStore`) ──────────────────────
 
-    async fn create(&self, namespace: &str, uuid: &str) -> Result<String, Error>;
-
-    async fn write(
-        &self,
-        namespace: &str,
-        uuid: &str,
-        stream: Box<dyn AsyncRead + Unpin + Send + Sync>,
-        content_length: u64,
-        append: bool,
-    ) -> Result<(Digest, u64), Error>;
-
-    async fn summary(&self, namespace: &str, uuid: &str) -> Result<UploadSummary, Error>;
-
-    async fn complete(
-        &self,
-        namespace: &str,
-        uuid: &str,
-        digest: Option<&Digest>,
-    ) -> Result<Digest, Error>;
-
-    async fn delete(&self, namespace: &str, uuid: &str) -> Result<(), Error>;
-}
-
-#[async_trait]
-pub trait PresignedBlobStore: Send + Sync {
-    async fn url(
+impl BlobStore {
+    /// Generate a presigned download URL for `digest` when the underlying
+    /// storage supports presigning. Returns `Ok(None)` when no presigning
+    /// backend was provided to the builder.
+    #[instrument(skip(self))]
+    pub async fn presigned_url(
         &self,
         digest: &Digest,
         content_type: Option<&str>,
-    ) -> Result<Option<String>, Error>;
-}
-
-pub struct OrphanMultipartUpload {
-    pub key: String,
-    pub upload_id: String,
-}
-
-#[async_trait]
-pub trait MultipartCleanup: Send + Sync {
-    /// Lists multipart uploads that have exceeded `timeout` and are not
-    /// associated with a live upload session (i.e., the start-date marker is
-    /// gone).  Pure discovery — does not modify any state.
-    async fn list_orphan_multipart_uploads(
-        &self,
-        timeout: Duration,
-    ) -> Result<Vec<OrphanMultipartUpload>, Error>;
-
-    /// Aborts a single orphan upload previously returned by
-    /// `list_orphan_multipart_uploads`.
-    async fn abort_orphan_multipart_upload(
-        &self,
-        upload: &OrphanMultipartUpload,
-    ) -> Result<(), Error>;
+    ) -> Result<Option<String>, Error> {
+        let Some(presign) = &self.presign else {
+            return Ok(None);
+        };
+        let path = path_builder::blob_path(digest);
+        let url = presign
+            .presign_get(&path, Duration::from_mins(30), content_type)
+            .await?;
+        Ok(Some(url))
+    }
 }
 
 #[cfg(test)]
-mod tests {
-    use std::io::Cursor;
-
-    use chrono::Duration;
-    use sha2::{Digest, Sha256};
-    use tokio::io::AsyncReadExt;
-    use uuid::Uuid;
-
-    use super::*;
-    use crate::{oci::Namespace, registry::blob_store::sha256_ext::Sha256Ext};
-
-    pub async fn test_datastore_list_uploads(store: &impl UploadStore) {
-        let namespace = &Namespace::new("test-repo").unwrap();
-
-        let upload_ids = ["upload1", "upload2", "upload3"];
-        for id in upload_ids {
-            store.create(namespace, id).await.unwrap();
-
-            let content = format!("Content for upload {id}").into_bytes();
-            store
-                .write(namespace, id, Box::new(Cursor::new(content)), 0, false)
-                .await
-                .unwrap();
-        }
-
-        // Verify we can list all uploads
-        let (uploads, _token) = store.list(namespace, 10, None).await.unwrap();
-        assert_eq!(uploads.len(), upload_ids.len());
-        for id in upload_ids {
-            assert!(uploads.contains(&id.to_string()));
-        }
-
-        // Test pagination (2 items per page)
-        let (page1, token1) = store.list(namespace, 2, None).await.unwrap();
-        assert_eq!(page1.len(), 2);
-        assert!(token1.is_some());
-
-        let (page2, token2) = store.list(namespace, 2, token1).await.unwrap();
-        assert_eq!(page2.len(), 1);
-        assert!(token2.is_none());
-
-        // Test pagination (1 item per page)
-        let (page1, token1) = store.list(namespace, 1, None).await.unwrap();
-        assert_eq!(page1.len(), 1);
-        assert!(token1.is_some());
-
-        let (page2, token2) = store.list(namespace, 1, token1).await.unwrap();
-        assert_eq!(page2.len(), 1);
-        assert!(token2.is_some());
-
-        let (page3, token3) = store.list(namespace, 1, token2).await.unwrap();
-        assert_eq!(page3.len(), 1);
-        assert!(token3.is_none());
-
-        // Test upload operations - verify we can complete an upload
-        let upload_to_complete = upload_ids[0];
-        store
-            .complete(namespace, upload_to_complete, None)
-            .await
-            .unwrap();
-
-        // The upload should be gone after completion
-        let (uploads_after_complete, _) = store.list(namespace, 10, None).await.unwrap();
-        assert_eq!(uploads_after_complete.len(), upload_ids.len() - 1);
-        assert!(!uploads_after_complete.contains(&upload_to_complete.to_string()));
-    }
-
-    pub async fn test_datastore_list_blobs(store: &impl BlobStore) {
-        let blob_contents = [
-            b"aaa_content_1".to_vec(),
-            b"bbb_content_2".to_vec(),
-            b"ccc_content_3".to_vec(),
-        ];
-
-        let mut digests = Vec::new();
-        for content in &blob_contents {
-            let digest = store.create(content).await.unwrap();
-            digests.push(digest);
-        }
-
-        // Test without pagination
-        let (blobs, _token) = store.list(10, None).await.unwrap();
-        assert!(blobs.len() >= blob_contents.len());
-        for digest in &digests {
-            assert!(blobs.contains(digest));
-        }
-
-        // Test pagination (2 items per page)
-        let (page1, token1) = store.list(2, None).await.unwrap();
-        assert_eq!(page1.len(), 2);
-        assert!(token1.is_some());
-
-        let (page2, token2) = store.list(2, token1).await.unwrap();
-        assert_eq!(page2.len(), 1);
-        assert!(token2.is_none());
-
-        // Test pagination (1 item per page)
-        let (page1, token1) = store.list(1, None).await.unwrap();
-        assert_eq!(page1.len(), 1);
-        assert!(token1.is_some());
-
-        let (page2, token2) = store.list(1, token1).await.unwrap();
-        assert_eq!(page2.len(), 1);
-        assert!(token2.is_some());
-
-        let (page3, token3) = store.list(1, token2).await.unwrap();
-        assert_eq!(page3.len(), 1);
-        assert!(token3.is_none());
-    }
-
-    pub async fn test_datastore_blob_operations(store: &impl BlobStore) {
-        let test_content = b"Test blob content";
-        let digest = store.create(test_content).await.unwrap();
-
-        let retrieved_content = store.read(&digest).await.unwrap();
-        assert_eq!(retrieved_content, test_content);
-
-        let size = store.size(&digest).await.unwrap();
-        assert_eq!(size, test_content.len() as u64);
-
-        // Test blob reader
-        let (mut reader, _) = store.reader(&digest, None).await.unwrap();
-        let mut buffer = Vec::new();
-        tokio::io::AsyncReadExt::read_to_end(&mut reader, &mut buffer)
-            .await
-            .unwrap();
-        assert_eq!(buffer, test_content);
-    }
-
-    pub async fn test_build_blob_reader_returns_size(store: &impl BlobStore) {
-        let test_content = b"blob reader size test content";
-        let digest = store.create(test_content).await.unwrap();
-
-        let (mut reader, size) = store.reader(&digest, None).await.unwrap();
-        assert_eq!(size, test_content.len() as u64);
-
-        let mut buffer = Vec::new();
-        reader.read_to_end(&mut buffer).await.unwrap();
-        assert_eq!(buffer, test_content);
-    }
-
-    #[allow(clippy::cast_possible_truncation)]
-    pub async fn test_build_blob_reader_with_offset_returns_full_size(store: &impl BlobStore) {
-        let test_content = b"offset blob reader content here";
-        let digest = store.create(test_content).await.unwrap();
-        let offset = 10u64;
-
-        let (mut reader, size) = store.reader(&digest, Some(offset)).await.unwrap();
-
-        // Should return the TOTAL blob size, not remaining size
-        assert_eq!(size, test_content.len() as u64);
-
-        let mut buffer = Vec::new();
-        reader.read_to_end(&mut buffer).await.unwrap();
-        assert_eq!(buffer, &test_content[offset as usize..]);
-    }
-
-    pub async fn test_datastore_upload_operations<S>(store: &S)
-    where
-        S: BlobStore + UploadStore,
-    {
-        let blob: &dyn BlobStore = store;
-        let upload: &dyn UploadStore = store;
-
-        let namespace = &Namespace::new("test-namespace").unwrap();
-        let uuid = Uuid::new_v4().to_string();
-
-        let upload_id = upload.create(namespace, &uuid).await.unwrap();
-        assert_eq!(upload_id, uuid);
-
-        let test_content = b"Test upload content";
-
-        let mut hasher = Sha256::new();
-        hasher.update(test_content);
-        let expected_digest = hasher.digest();
-
-        upload
-            .write(
-                namespace,
-                &uuid,
-                Box::new(Cursor::new(test_content.to_vec())),
-                test_content.len() as u64,
-                false,
-            )
-            .await
-            .unwrap();
-
-        let summary = upload.summary(namespace, &uuid).await.unwrap();
-        assert_eq!(summary.size, test_content.len() as u64);
-        assert!(Utc::now().signed_duration_since(summary.started_at) < Duration::hours(1));
-
-        let final_digest = upload.complete(namespace, &uuid, None).await.unwrap();
-        assert_eq!(final_digest, expected_digest);
-
-        let blob_content = blob.read(&final_digest).await.unwrap();
-        assert_eq!(blob_content, test_content);
-
-        // Test upload not found after completion
-        let upload_result = upload.summary(namespace, &uuid).await;
-        assert!(upload_result.is_err());
-    }
-}
+mod tests;

@@ -12,22 +12,19 @@ use crate::{
     },
     oci::Digest,
     registry::{
-        blob_store::BlobStore,
+        blob_store,
         metadata_store::{MetadataStore, link_kind::LinkKind},
         parse_manifest_digests,
     },
 };
 
 pub struct ManifestChecker {
-    blob_store: Arc<dyn BlobStore + Send + Sync>,
-    metadata_store: Arc<dyn MetadataStore + Send + Sync>,
+    blob_store: Arc<blob_store::BlobStore>,
+    metadata_store: Arc<MetadataStore>,
 }
 
 impl ManifestChecker {
-    pub fn new(
-        blob_store: Arc<dyn BlobStore + Send + Sync>,
-        metadata_store: Arc<dyn MetadataStore + Send + Sync>,
-    ) -> Self {
+    pub fn new(blob_store: Arc<blob_store::BlobStore>, metadata_store: Arc<MetadataStore>) -> Self {
         Self {
             blob_store,
             metadata_store,
@@ -91,7 +88,7 @@ mod tests {
         oci::Namespace,
         registry::{
             metadata_store::{LinkOperation, link_kind::LinkKind},
-            test_utils::{self, NoopMultipart, backends},
+            test_utils::{self, backends, put_blob_direct},
         },
     };
 
@@ -128,10 +125,8 @@ mod tests {
         }}"#
             );
 
-            let manifest_digest = blob_store
-                .create(manifest_content.as_bytes())
-                .await
-                .unwrap();
+            let manifest_digest =
+                put_blob_direct(metadata_store.store(), manifest_content.as_bytes()).await;
 
             metadata_store
                 .update_links(
@@ -144,12 +139,7 @@ mod tests {
                 .await
                 .unwrap();
 
-            let mut executor = Executor::new(
-                blob_store.clone(),
-                metadata_store.clone(),
-                test_case.upload_store(),
-                std::sync::Arc::new(NoopMultipart),
-            );
+            let mut executor = Executor::new(blob_store.clone(), metadata_store.clone());
 
             let scrubber = ManifestChecker::new(blob_store.clone(), metadata_store.clone());
             scrubber.check(namespace, &mut executor).await.unwrap();
@@ -201,10 +191,8 @@ mod tests {
         }}"#
             );
 
-            let manifest_digest = blob_store
-                .create(manifest_content.as_bytes())
-                .await
-                .unwrap();
+            let manifest_digest =
+                put_blob_direct(metadata_store.store(), manifest_content.as_bytes()).await;
 
             metadata_store
                 .update_links(
@@ -233,12 +221,7 @@ mod tests {
                 .await
                 .unwrap();
 
-            let mut executor = Executor::new(
-                blob_store.clone(),
-                metadata_store.clone(),
-                test_case.upload_store(),
-                std::sync::Arc::new(NoopMultipart),
-            );
+            let mut executor = Executor::new(blob_store.clone(), metadata_store.clone());
 
             let scrubber = ManifestChecker::new(blob_store.clone(), metadata_store.clone());
             scrubber.check(namespace, &mut executor).await.unwrap();
@@ -289,10 +272,8 @@ mod tests {
         }}"#
             );
 
-            let manifest_digest = blob_store
-                .create(manifest_content.as_bytes())
-                .await
-                .unwrap();
+            let manifest_digest =
+                put_blob_direct(metadata_store.store(), manifest_content.as_bytes()).await;
 
             metadata_store
                 .update_links(
