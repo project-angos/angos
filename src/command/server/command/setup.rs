@@ -66,7 +66,7 @@ pub async fn build_registry(
     engine_maintenance: Option<CancellationToken>,
 ) -> Result<(Registry, Option<PendingGaugeRefresh>), Error> {
     let auth_cache = bootstrap::auth_cache(&config.cache)?;
-    let blob_handles = config.blob_store.to_backend()?;
+    let blob_backend = Arc::new(config.blob_store.build_backend()?);
     let metadata_store = build_metadata_store(config, &auth_cache, cached_capabilities).await?;
     let max_manifest_size_bytes = config.global.max_manifest_size_bytes();
     let repositories =
@@ -120,15 +120,8 @@ pub async fn build_registry(
         bootstrap::spawn_engine_maintenance(handles.store, &handles.executor, token);
     }
 
-    let registry = Registry::new(
-        blob_handles.blob,
-        blob_handles.upload,
-        blob_handles.presigned,
-        metadata_store,
-        repositories,
-        registry_config,
-    )
-    .map_err(|e| Error::Initialization(e.to_string()))?;
+    let registry = Registry::new(blob_backend, metadata_store, repositories, registry_config)
+        .map_err(|e| Error::Initialization(e.to_string()))?;
 
     Ok((registry, pending))
 }

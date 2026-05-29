@@ -783,7 +783,7 @@ mod tests {
     }
 
     async fn create_pull_through_registry(config: &Configuration) -> Registry {
-        let blob_handles = config.blob_store.to_backend().unwrap();
+        let blob_backend = std::sync::Arc::new(config.blob_store.build_backend().unwrap());
         let auth_cache = config.cache.to_backend().unwrap();
         let storage_config = config.resolve_registry_storage();
         let handles = storage_config.to_handles().await.unwrap();
@@ -820,15 +820,7 @@ mod tests {
             .global_immutable_tags(config.global.immutable_tags)
             .global_immutable_tags_exclusions(config.global.immutable_tags_exclusions.clone());
 
-        Registry::new(
-            blob_handles.blob,
-            blob_handles.upload,
-            blob_handles.presigned,
-            metadata_store,
-            resolver,
-            registry_config,
-        )
-        .unwrap()
+        Registry::new(blob_backend, metadata_store, resolver, registry_config).unwrap()
     }
 
     #[tokio::test]

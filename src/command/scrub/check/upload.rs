@@ -12,7 +12,7 @@ use crate::{
         error::Error,
         executor::ActionSink,
     },
-    registry::blob_store::{self, UploadStore, UploadSummary},
+    registry::blob_store::{self, BlobStore, UploadSummary},
 };
 
 enum UploadVerdict {
@@ -46,14 +46,14 @@ fn classify_upload(
 }
 
 pub struct UploadChecker {
-    upload_store: Arc<dyn UploadStore>,
+    blob_store: Arc<BlobStore>,
     upload_timeout: Duration,
 }
 
 impl UploadChecker {
-    pub fn new(upload_store: Arc<dyn UploadStore>, upload_timeout: Duration) -> Self {
+    pub fn new(blob_store: Arc<BlobStore>, upload_timeout: Duration) -> Self {
         Self {
-            upload_store,
+            blob_store,
             upload_timeout,
         }
     }
@@ -65,7 +65,7 @@ impl UploadChecker {
         sink: &mut (dyn ActionSink + Send),
     ) -> Result<(), Error> {
         debug!("Checking upload '{namespace}/{uuid}'");
-        let summary = self.upload_store.summary(namespace, uuid).await;
+        let summary = self.blob_store.upload_summary(namespace, uuid).await;
         let verdict = classify_upload(summary.as_ref(), self.upload_timeout, Utc::now());
 
         match verdict {
@@ -99,7 +99,7 @@ impl NamespaceChecker for UploadChecker {
     ) -> Result<(), Error> {
         debug!("Checking uploads from namespace '{namespace}'");
 
-        let mut uploads = list_all::uploads(&self.upload_store, namespace);
+        let mut uploads = list_all::uploads(&self.blob_store, namespace);
         while let Some(uuid) = uploads.next().await {
             let uuid = uuid?;
             if let Err(e) = self.check_upload(namespace, &uuid, sink).await {
@@ -218,21 +218,20 @@ mod tests {
     async fn test_scrub_uploads_removes_obsolete() {
         for test_case in backends() {
             let namespace = "test-repo/app";
-            let upload_store = test_case.upload_store();
+            let blob_store = test_case.blob_store();
 
             let upload_uuid = uuid::Uuid::new_v4().to_string();
-            upload_store.create(namespace, &upload_uuid).await.unwrap();
+            blob_store
+                .create_upload(namespace, &upload_uuid)
+                .await
+                .unwrap();
 
-            let mut executor = Executor::new(
-                test_case.blob_store(),
-                test_case.metadata_store(),
-                upload_store.clone(),
-            );
+            let mut executor = Executor::new(blob_store.clone(), test_case.metadata_store());
 
-            let checker = UploadChecker::new(upload_store.clone(), Duration::zero());
+            let checker = UploadChecker::new(blob_store.clone(), Duration::zero());
             checker.check(namespace, &mut executor).await.unwrap();
 
-            let result = upload_store.summary(namespace, &upload_uuid).await;
+            let result = blob_store.upload_summary(namespace, &upload_uuid).await;
             assert!(result.is_err(), "Obsolete upload should be deleted");
             test_case.cleanup().await;
         }
@@ -242,12 +241,15 @@ mod tests {
     async fn test_scrub_uploads_keeps_recent() {
         for test_case in backends() {
             let namespace = "test-repo/app";
-            let upload_store = test_case.upload_store();
+            let blob_store = test_case.blob_store();
 
             let upload_uuid = uuid::Uuid::new_v4().to_string();
-            upload_store.create(namespace, &upload_uuid).await.unwrap();
+            blob_store
+                .create_upload(namespace, &upload_uuid)
+                .await
+                .unwrap();
 
-            let checker = UploadChecker::new(upload_store.clone(), Duration::days(1));
+            let checker = UploadChecker::new(blob_store.clone(), Duration::days(1));
             let mut sink: Vec<Action> = Vec::new();
             checker.check(namespace, &mut sink).await.unwrap();
 
@@ -256,7 +258,7 @@ mod tests {
                 "Recent upload must not produce any actions"
             );
 
-            let result = upload_store.summary(namespace, &upload_uuid).await;
+            let result = blob_store.upload_summary(namespace, &upload_uuid).await;
             assert!(result.is_ok(), "Recent upload should be kept");
             test_case.cleanup().await;
         }
@@ -266,12 +268,15 @@ mod tests {
     async fn test_scrub_uploads_dry_run() {
         for test_case in backends() {
             let namespace = "test-repo/app";
-            let upload_store = test_case.upload_store();
+            let blob_store = test_case.blob_store();
 
             let upload_uuid = uuid::Uuid::new_v4().to_string();
-            upload_store.create(namespace, &upload_uuid).await.unwrap();
+            blob_store
+                .create_upload(namespace, &upload_uuid)
+                .await
+                .unwrap();
 
-            let checker = UploadChecker::new(upload_store.clone(), Duration::zero());
+            let checker = UploadChecker::new(blob_store.clone(), Duration::zero());
             let mut sink: Vec<Action> = Vec::new();
             checker.check(namespace, &mut sink).await.unwrap();
 
@@ -281,7 +286,7 @@ mod tests {
                 "Vec sink must capture DeleteExpiredUpload action"
             );
 
-            let result = upload_store.summary(namespace, &upload_uuid).await;
+            let result = blob_store.upload_summary(namespace, &upload_uuid).await;
             assert!(result.is_ok(), "Vec sink must not delete the upload");
             test_case.cleanup().await;
         }

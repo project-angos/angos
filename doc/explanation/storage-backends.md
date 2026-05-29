@@ -348,17 +348,17 @@ sequenceDiagram
     participant Registry
     participant S3
 
-    Client->>Registry: PATCH (chunk 1)
+    Client->>Registry: PATCH (chunk 1, < 5 MiB)
+    Registry->>S3: PutObject (stage remainder)
+
+    Client->>Registry: PATCH (chunk 2, combined ≥ 5 MiB)
     Registry->>S3: InitiateMultipartUpload
     S3-->>Registry: Upload ID
-    Registry->>S3: UploadPart (streaming, chunk 1)
-    S3-->>Registry: ETag
-
-    Client->>Registry: PATCH (chunk 2)
-    Registry->>S3: UploadPart (streaming, chunk 2)
+    Registry->>S3: UploadPart (streaming)
     S3-->>Registry: ETag
 
     Client->>Registry: PUT (complete upload)
+    Registry->>S3: UploadPart (final staged remainder)
     Registry->>S3: CompleteMultipartUpload
     S3-->>Registry: Final blob
     Registry-->>Client: 201 Created
@@ -371,9 +371,9 @@ Configuration:
 multipart_uniform_parts = false  # Default
 ```
 
-Each `PATCH` streams directly into the multipart upload as an `UploadPart` — no intermediate objects, no assembly phase. Parts are uploaded with their known `Content-Length` from the HTTP request header and flow frame-by-frame from the client to S3 without buffering. Small `PATCH` requests (< 5 MiB) are accumulated in a pending buffer until they reach the S3 minimum part size.
+Each `PATCH` streams toward S3 with its known `Content-Length` from the HTTP request header, frame-by-frame without buffering the whole chunk. The multipart upload is opened **lazily**: bytes below the 5 MiB S3 minimum are parked at a per-session staging key and combined with the next `PATCH`, so a multipart session is created only once there are enough bytes to flush a part of at least 5 MiB. An upload whose total never reaches 5 MiB skips multipart entirely — `complete` promotes the staged object to the upload key with a single `CopyObject`.
 
-**Memory usage:** ~8 KiB per `PATCH` (a single streaming read frame). Small `PATCH` requests use up to 5 MiB for the pending buffer. Total memory is essentially constant regardless of blob size.
+**Memory usage:** bytes stream frame-by-frame, so memory is essentially constant regardless of blob size. The only buffered data is the sub-part remainder (< 5 MiB), which is parked in S3 between `PATCH` calls and re-read when the next chunk arrives.
 
 ### Uniform Upload Mode
 
@@ -386,6 +386,7 @@ sequenceDiagram
     participant S3
 
     Client->>Registry: PATCH (chunk 1)
+    Note over Registry,S3: stage bytes until ≥ multipart_part_size
     Registry->>S3: InitiateMultipartUpload
     S3-->>Registry: Upload ID
     Registry->>S3: UploadPart (exact multipart_part_size)
@@ -411,9 +412,9 @@ multipart_uniform_parts = true
 multipart_part_size = "50MiB"
 ```
 
-In this mode, a long-lived multipart upload is maintained across all `PATCH` requests. Each non-final part is exactly `multipart_part_size` bytes, and the final part may be smaller.
+In this mode the multipart upload is opened on the first full part and maintained across the remaining `PATCH` requests. Each non-final part is exactly `multipart_part_size` bytes, and the final part may be smaller.
 
-**Memory usage:** full parts stream to S3 in small read frames. Only the trailing staged chunk is buffered, and it is always smaller than `multipart_part_size`.
+**Memory usage:** full parts stream to S3 in small read frames; only the trailing sub-part remainder (smaller than `multipart_part_size`) is staged in S3 between calls.
 
 ### Related Configuration
 

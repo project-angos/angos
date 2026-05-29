@@ -197,7 +197,7 @@ impl Components {
         engine_maintenance: Option<CancellationToken>,
     ) -> Result<Self, Error> {
         let auth_cache = bootstrap::auth_cache(&config.cache)?;
-        let blob_handles = config.blob_store.to_backend()?;
+        let blob_backend = std::sync::Arc::new(config.blob_store.build_backend()?);
         let (metadata_store, _) =
             bootstrap::metadata_store(&config.resolve_registry_storage(), &auth_cache).await?;
         let repositories = bootstrap::repositories(
@@ -227,8 +227,7 @@ impl Components {
         let consumer = Arc::new(JobStore::new(storage.store, storage.executor, worker_id));
         let handler: Arc<dyn JobHandler> = Arc::new(CacheJobHandler::new(
             repositories,
-            blob_handles.upload,
-            blob_handles.blob,
+            blob_backend,
             metadata_store,
         ));
 

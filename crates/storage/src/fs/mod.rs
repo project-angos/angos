@@ -1,14 +1,18 @@
-//! Filesystem-backed [`ObjectStore`].
+//! Filesystem-backed [`ObjectStore`] and [`UploadSessionStore`].
 //!
 //! Maps the storage trait surface onto a directory tree rooted at `root_dir`:
 //! every object key becomes a relative path under the root. Writes are atomic
 //! (temp-file + rename) and `delete_prefix` walks the subtree. Listings sort
 //! lexicographically because `read_dir` returns entries in arbitrary order.
 //!
-//! Does **not** implement [`ConditionalStore`](crate::ConditionalStore) or
-//! [`MultipartStore`](crate::MultipartStore): on FS those concerns are handled
-//! one layer up via the metadata store's lock backend and the blob store's
-//! append-mode upload path. See `doc/storage-convergence.md`.
+//! Does **not** implement [`ConditionalStore`](crate::ConditionalStore): on
+//! FS conditional updates are handled one layer up via the metadata store's
+//! lock backend.
+//!
+//! Upload sessions use an append-mode file at the session's `key` — no
+//! staging artifacts, no multipart protocol. `complete_upload` is a no-op
+//! because the data is already at `key`; the caller's transactional move
+//! to the canonical location is the only finalisation step.
 
 use std::{
     fs::FileType,
@@ -18,10 +22,19 @@ use std::{
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use futures_util::TryStreamExt;
 use tempfile::NamedTempFile;
-use tokio::{fs, io::AsyncSeekExt, task::spawn_blocking};
+use tokio::{
+    fs,
+    io::{AsyncSeekExt, AsyncWriteExt},
+    task::spawn_blocking,
+};
+use tokio_util::io::StreamReader;
 
-use crate::{BoxedReader, ChildrenPage, Error, ObjectMeta, ObjectStore, Page};
+use crate::{
+    BoxedReader, ByteStream, ChildrenPage, Error, ObjectMeta, ObjectStore, Page, SessionState,
+    UploadSession, UploadSessionStore,
+};
 
 /// Page step used by [`Backend::list_all_children`] when draining all pages
 /// of a directory listing. 512 is large enough to complete most namespaces in
@@ -139,15 +152,13 @@ impl Backend {
     }
 
     /// Best-effort cleanup of empty ancestor directories after a leaf
-    /// deletion.
+    /// deletion. Walks at most `max_levels` parents upward; stops at the
+    /// first non-empty parent, at `root_dir` (exclusive), or as soon as it
+    /// would leave the `root_dir` subtree. Errors are suppressed.
     ///
-    /// Walks **at most `max_levels`** parents upward from the directory
-    /// component of `key`, removing each one only while it is empty. The
-    /// walk stops at the first non-empty parent, at `root_dir` (exclusive),
-    /// or as soon as it would leave the `root_dir` subtree.
-    ///
-    /// Errors are suppressed — this is a best-effort tidy-up, not a
-    /// load-bearing step.
+    /// Inherent (not trait-method) because directory pruning is meaningless
+    /// on S3 and the blob store's unified Backend never needs to call it
+    /// through the trait surface.
     pub async fn prune_empty_ancestors(&self, key: &str, max_levels: u8) {
         let start = self.full_path(key);
         let root = &self.root;
@@ -164,7 +175,6 @@ impl Backend {
                 Ok(Some(_)) | Err(_) => break,
                 Ok(None) => {}
             }
-            // Race-safe: ENOTEMPTY means another writer recreated an entry.
             if fs::remove_dir(parent).await.is_err() {
                 break;
             }
@@ -416,6 +426,88 @@ impl ObjectStore for Backend {
             self.sync_to_disk,
         )
         .await
+    }
+}
+
+#[async_trait]
+impl UploadSessionStore for Backend {
+    async fn create_upload(&self, key: &str) -> Result<UploadSession, Error> {
+        // Create the empty staging file so `write_upload` can re-open it in
+        // append mode without needing a separate "first write" path.
+        self.put(key, Bytes::new()).await?;
+        Ok(UploadSession {
+            key: key.to_string(),
+            uploaded_size: 0,
+            state: SessionState::Fs,
+        })
+    }
+
+    async fn write_upload(
+        &self,
+        session: &mut UploadSession,
+        _staging_key: &str,
+        body: ByteStream,
+        len: u64,
+    ) -> Result<(), Error> {
+        if !matches!(session.state, SessionState::Fs) {
+            return Err(Error::Backend(
+                "upload session is not an FS session".to_string(),
+            ));
+        }
+        if len == 0 {
+            return Ok(());
+        }
+        let (mut file, current) = self.open_for_write(&session.key, true).await?;
+        if current != session.uploaded_size {
+            return Err(Error::Backend(format!(
+                "fs upload-session offset drift: file has {current} bytes, session expected {}",
+                session.uploaded_size,
+            )));
+        }
+        let mut reader = StreamReader::new(body.map_err(io::Error::other));
+        let written = tokio::io::copy(&mut reader, &mut file).await?;
+        if written != len {
+            return Err(Error::Backend(format!(
+                "fs upload-session short body: expected {len} bytes, got {written}",
+            )));
+        }
+        file.flush().await?;
+        session.uploaded_size = session
+            .uploaded_size
+            .checked_add(written)
+            .ok_or_else(|| Error::Backend("session size overflow".to_string()))?;
+        Ok(())
+    }
+
+    async fn complete_upload(
+        &self,
+        session: UploadSession,
+        _staging_key: &str,
+    ) -> Result<(), Error> {
+        if !matches!(session.state, SessionState::Fs) {
+            return Err(Error::Backend(
+                "upload session is not an FS session".to_string(),
+            ));
+        }
+        // No-op: the data already lives at `session.key`. The caller's
+        // transactional move (Mutation::Move) promotes it to the canonical
+        // location.
+        Ok(())
+    }
+
+    async fn abort_upload(&self, session: UploadSession, _staging_key: &str) -> Result<(), Error> {
+        if !matches!(session.state, SessionState::Fs) {
+            return Err(Error::Backend(
+                "upload session is not an FS session".to_string(),
+            ));
+        }
+        self.delete(&session.key).await
+    }
+
+    async fn abort_pending_uploads(&self, _key: &str) -> Result<(), Error> {
+        // FS sessions have no out-of-band state — the staging file at `key`
+        // is the only artifact and `abort_upload` already covers it.
+        Ok(())
     }
 }
 

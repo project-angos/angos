@@ -94,7 +94,7 @@ fn create_config_with_repository() -> (Configuration, TempDir, TempDir) {
 #[test]
 fn test_build_blob_store_filesystem_success() {
     let (config, _blobs, _meta) = create_minimal_config();
-    let result = config.blob_store.to_backend();
+    let result = config.blob_store.build_backend();
 
     assert!(result.is_ok());
 }
@@ -436,7 +436,7 @@ async fn test_build_registry_components_integration() {
     let (config, _blobs, _meta) = create_config_with_repository();
 
     let auth_cache = bootstrap::auth_cache(&config.cache).unwrap();
-    let blob_handles = config.blob_store.to_backend().unwrap();
+    let blob_backend = std::sync::Arc::new(config.blob_store.build_backend().unwrap());
     let metadata_store =
         setup::build_metadata_store(&config, &auth_cache, &Arc::new(Mutex::new(None)))
             .await
@@ -456,14 +456,7 @@ async fn test_build_registry_components_integration() {
         .global_immutable_tags(config.global.immutable_tags)
         .global_immutable_tags_exclusions(config.global.immutable_tags_exclusions.clone());
 
-    let registry = Registry::new(
-        blob_handles.blob,
-        blob_handles.upload,
-        blob_handles.presigned,
-        metadata_store,
-        repositories,
-        registry_config,
-    );
+    let registry = Registry::new(blob_backend, metadata_store, repositories, registry_config);
 
     assert!(registry.is_ok());
 }

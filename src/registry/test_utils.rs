@@ -13,7 +13,7 @@ use crate::{
     oci::{Digest, Namespace},
     policy::{AccessMode, AccessPolicyConfig, RetentionPolicy, RetentionPolicyConfig, SystemClock},
     registry::{
-        blob_store::{self, BlobStore, PresignedBlobStore, UploadStore, sha256_ext::Sha256Ext},
+        blob_store::{self, sha256_ext::Sha256Ext},
         metadata_store::{LinkOperation, MetadataStore, link_kind::LinkKind},
         path_builder,
         repository_resolver::RepositoryResolver,
@@ -82,9 +82,7 @@ pub fn create_test_repositories() -> Arc<HashMap<String, Repository>> {
 }
 
 pub fn create_test_registry(
-    blob_store: Arc<dyn BlobStore + Send + Sync>,
-    upload_store: Arc<dyn UploadStore + Send + Sync>,
-    presigned_blob_store: Option<Arc<dyn PresignedBlobStore>>,
+    blob_store: Arc<blob_store::BlobStore>,
     metadata_store: Arc<MetadataStore>,
 ) -> Registry {
     let resolver = Arc::new(
@@ -101,15 +99,7 @@ pub fn create_test_registry(
         .global_immutable_tags(global.immutable_tags)
         .global_immutable_tags_exclusions(global.immutable_tags_exclusions.clone());
 
-    Registry::new(
-        blob_store,
-        upload_store,
-        presigned_blob_store,
-        metadata_store,
-        resolver,
-        config,
-    )
-    .unwrap()
+    Registry::new(blob_store, metadata_store, resolver, config).unwrap()
 }
 
 /// Write `content` directly at the canonical blob path via the underlying
@@ -180,8 +170,7 @@ pub async fn create_test_blob(
 #[async_trait::async_trait(?Send)]
 pub trait RegistryTestCase {
     fn registry(&self) -> &Registry;
-    fn blob_store(&self) -> Arc<dyn BlobStore>;
-    fn upload_store(&self) -> Arc<dyn UploadStore>;
+    fn blob_store(&self) -> Arc<blob_store::BlobStore>;
     fn metadata_store(&self) -> Arc<MetadataStore>;
     async fn cleanup(&self) {}
 }
@@ -194,7 +183,7 @@ pub fn backends() -> Vec<Box<dyn RegistryTestCase>> {
 }
 
 pub struct FSRegistryTestCase {
-    blob_store: Arc<blob_store::fs::Backend>,
+    blob_store: Arc<blob_store::BlobStore>,
     metadata_store: Arc<MetadataStore>,
     registry: Registry,
     temp_dir: TempDir,
@@ -205,19 +194,11 @@ impl FSRegistryTestCase {
         let temp_dir = TempDir::new().expect("Failed to create temp dir for FSBackendConfig");
         let path = temp_dir.path().to_string_lossy().to_string();
 
-        let config = blob_store::fs::BackendConfig {
+        let config = blob_store::BlobStoreConfig::FS(blob_store::FsBackendConfig {
             root_dir: path.clone(),
             sync_to_disk: false,
-        };
-        let executor = build_test_fs_executor(&config.root_dir, config.sync_to_disk);
-        let blob_store = Arc::new(
-            blob_store::fs::Backend::builder()
-                .root_dir(&config.root_dir)
-                .sync_to_disk(config.sync_to_disk)
-                .executor(executor)
-                .build()
-                .unwrap(),
-        );
+        });
+        let blob_store = Arc::new(config.build_backend().expect("fs blob backend"));
 
         let meta_executor = build_test_fs_executor(&path, false);
         let meta_storage: Arc<dyn ObjectStore> = Arc::new(
@@ -234,12 +215,7 @@ impl FSRegistryTestCase {
                 .build()
                 .expect("fs metadata backend"),
         );
-        let registry = create_test_registry(
-            blob_store.clone(),
-            blob_store.clone(),
-            None,
-            metadata_store.clone(),
-        );
+        let registry = create_test_registry(blob_store.clone(), metadata_store.clone());
 
         Self {
             blob_store,
@@ -260,10 +236,6 @@ impl FSRegistryTestCase {
         );
     }
 
-    pub fn blob_store(&self) -> &blob_store::fs::Backend {
-        &self.blob_store
-    }
-
     pub fn temp_dir(&self) -> &TempDir {
         &self.temp_dir
     }
@@ -275,11 +247,7 @@ impl RegistryTestCase for FSRegistryTestCase {
         &self.registry
     }
 
-    fn blob_store(&self) -> Arc<dyn BlobStore> {
-        self.blob_store.clone()
-    }
-
-    fn upload_store(&self) -> Arc<dyn UploadStore> {
+    fn blob_store(&self) -> Arc<blob_store::BlobStore> {
         self.blob_store.clone()
     }
 
@@ -288,51 +256,9 @@ impl RegistryTestCase for FSRegistryTestCase {
     }
 }
 
-/// Build an S3 `blob_store::Backend` with a memory-lock executor for tests.
-pub fn build_s3_blob_backend(config: &blob_store::s3::BackendConfig) -> blob_store::s3::Backend {
-    let http = Arc::new(
-        S3HttpBackend::new(&config.connection.to_client_config()).expect("s3 blob http client"),
-    );
-    let raw = Arc::new(
-        StorageS3Backend::builder()
-            .client(http)
-            .build()
-            .expect("s3 blob raw storage"),
-    );
-    let object_store: Arc<dyn ObjectStore> = raw.clone();
-    let conditional: Arc<dyn ConditionalStore> = raw;
-    let executor = build_executor(
-        object_store,
-        Some(conditional),
-        LockStrategy::Memory,
-        None,
-        false,
-        false,
-    )
-    .expect("s3 blob executor");
-    blob_store::s3::Backend::builder()
-        .access_key_id(config.connection.access_key_id.clone())
-        .secret_key(config.connection.secret_key.clone())
-        .endpoint(&config.connection.endpoint)
-        .bucket(&config.connection.bucket)
-        .region(&config.connection.region)
-        .key_prefix(&config.connection.key_prefix)
-        .multipart_copy_threshold(config.transport.multipart_copy_threshold)
-        .multipart_copy_chunk_size(config.transport.multipart_copy_chunk_size)
-        .multipart_copy_jobs(config.transport.multipart_copy_jobs)
-        .multipart_part_size(config.transport.multipart_part_size)
-        .multipart_uniform_parts(config.transport.multipart_uniform_parts)
-        .operation_timeout_secs(config.transport.operation_timeout_secs)
-        .operation_attempt_timeout_secs(config.transport.operation_attempt_timeout_secs)
-        .max_attempts(config.transport.max_attempts)
-        .executor(executor)
-        .build()
-        .expect("s3 blob backend")
-}
-
 pub struct S3RegistryTestCase {
     key_prefix: String,
-    s3_blob_store: Arc<blob_store::s3::Backend>,
+    s3_blob_store: Arc<blob_store::BlobStore>,
     s3_metadata_store: Arc<MetadataStore>,
     s3_registry: Registry,
 }
@@ -341,7 +267,7 @@ impl S3RegistryTestCase {
     pub fn new() -> Self {
         let key_prefix = format!("test-{}", Uuid::new_v4());
 
-        let s3_config = blob_store::s3::BackendConfig {
+        let s3_config = blob_store::S3BackendConfig {
             connection: S3ConnectionConfig {
                 access_key_id: Secret::new("root".to_string()),
                 secret_key: Secret::new("roottoor".to_string()),
@@ -350,14 +276,18 @@ impl S3RegistryTestCase {
                 bucket: "registry".to_string(),
                 key_prefix: key_prefix.clone(),
             },
-            transport: blob_store::s3::TransportFields {
+            transport: blob_store::TransportFields {
                 multipart_copy_threshold: ByteSize::mib(5),
                 multipart_copy_chunk_size: ByteSize::mib(5),
                 multipart_part_size: ByteSize::mib(5),
-                ..blob_store::s3::TransportFields::default()
+                ..blob_store::TransportFields::default()
             },
         };
-        let blob_store = Arc::new(build_s3_blob_backend(&s3_config));
+        let blob_store = Arc::new(
+            blob_store::BlobStoreConfig::S3(s3_config)
+                .build_backend()
+                .expect("s3 blob backend"),
+        );
 
         let meta_connection = S3ConnectionConfig {
             access_key_id: Secret::new("root".to_string()),
@@ -397,12 +327,7 @@ impl S3RegistryTestCase {
                 .expect("s3 metadata backend"),
         );
 
-        let registry = create_test_registry(
-            blob_store.clone(),
-            blob_store.clone(),
-            Some(blob_store.clone() as Arc<dyn PresignedBlobStore>),
-            metadata_store.clone(),
-        );
+        let registry = create_test_registry(blob_store.clone(), metadata_store.clone());
 
         Self {
             key_prefix,
@@ -410,10 +335,6 @@ impl S3RegistryTestCase {
             s3_metadata_store: metadata_store,
             s3_registry: registry,
         }
-    }
-
-    pub fn blob_store(&self) -> &blob_store::s3::Backend {
-        &self.s3_blob_store
     }
 }
 
@@ -436,11 +357,7 @@ impl RegistryTestCase for S3RegistryTestCase {
         &self.s3_registry
     }
 
-    fn blob_store(&self) -> Arc<dyn BlobStore> {
-        self.s3_blob_store.clone()
-    }
-
-    fn upload_store(&self) -> Arc<dyn UploadStore> {
+    fn blob_store(&self) -> Arc<blob_store::BlobStore> {
         self.s3_blob_store.clone()
     }
 

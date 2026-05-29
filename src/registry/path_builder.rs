@@ -77,19 +77,9 @@ pub fn upload_path(namespace: &str, uuid: &str) -> String {
     format!("{REPOS_ROOT}/{namespace}/_uploads/{uuid}/data")
 }
 
-pub fn upload_staged_container_path(namespace: &str, uuid: &str, offset: u64) -> String {
-    format!("{REPOS_ROOT}/{namespace}/_uploads/{uuid}/staged/{offset}")
-}
-
-pub fn upload_hash_context_path(
-    namespace: &str,
-    uuid: &str,
-    algorithm: &str,
-    offset: u64,
-) -> String {
-    format!("{REPOS_ROOT}/{namespace}/_uploads/{uuid}/hashstates/{algorithm}/{offset}")
-}
-
+/// Storage key used by the S3 backend to stash the per-session sub-part
+/// remainder between PATCH calls. Lives under the upload container so the
+/// regular container cleanup catches it.
 pub fn upload_patch_pending_path(namespace: &str, uuid: &str) -> String {
     format!("{REPOS_ROOT}/{namespace}/_uploads/{uuid}/patches/pending")
 }
@@ -105,7 +95,7 @@ pub fn upload_session_path(namespace: &str, uuid: &str) -> String {
 
 /// Prefix under which all upload sessions for a namespace are stored.
 ///
-/// Used by `UploadStore::list` and the recovery sweeper to enumerate sessions.
+/// Used by `BlobStore::list_uploads` and the recovery sweeper to enumerate sessions.
 pub fn upload_sessions_namespace_prefix(namespace: &str) -> String {
     format!("upload-sessions/{namespace}/")
 }
@@ -253,12 +243,8 @@ mod tests {
             "v2/repositories/ns/_uploads/uuid/data"
         );
         assert_eq!(
-            upload_staged_container_path("ns", "uuid", 0),
-            "v2/repositories/ns/_uploads/uuid/staged/0"
-        );
-        assert_eq!(
-            upload_hash_context_path("ns", "uuid", "sha256", 0),
-            "v2/repositories/ns/_uploads/uuid/hashstates/sha256/0"
+            upload_session_path("ns", "uuid"),
+            "upload-sessions/ns/uuid.json"
         );
     }
 

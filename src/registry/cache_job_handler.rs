@@ -10,7 +10,7 @@ use crate::{
     registry::{
         blob::cache_blob_mutations,
         blob_ownership::BlobOwnership,
-        blob_store::{BlobStore, UploadStore},
+        blob_store::BlobStore,
         job_store::{Error, JobEnvelope, JobHandler},
         metadata_store::MetadataStore,
         repository_resolver::RepositoryResolver,
@@ -33,21 +33,18 @@ pub struct CacheFetchBlobPayload {
 /// replicas can dedup the same miss safely.
 pub struct CacheJobHandler {
     resolver: Arc<RepositoryResolver>,
-    upload_store: Arc<dyn UploadStore>,
-    blob_store: Arc<dyn BlobStore>,
+    blob_store: Arc<BlobStore>,
     metadata_store: Arc<MetadataStore>,
 }
 
 impl CacheJobHandler {
     pub fn new(
         resolver: Arc<RepositoryResolver>,
-        upload_store: Arc<dyn UploadStore>,
-        blob_store: Arc<dyn BlobStore>,
+        blob_store: Arc<BlobStore>,
         metadata_store: Arc<MetadataStore>,
     ) -> Self {
         Self {
             resolver,
-            upload_store,
             blob_store,
             metadata_store,
         }
@@ -74,10 +71,6 @@ impl JobHandler for CacheJobHandler {
             .parse()
             .map_err(|e| Error::Storage(format!("invalid digest '{}': {e}", payload.digest)))?;
 
-        // The per-`lock_key` lock was acquired before `execute`, so no other
-        // worker is concurrently writing this blob — a positive ownership
-        // check means someone else already finished caching it. Return an
-        // empty transaction so `complete` runs only the queue cleanup.
         let already_owned = BlobOwnership::new(self.metadata_store.as_ref())
             .can_read(&namespace, &digest)
             .await
@@ -86,10 +79,6 @@ impl JobHandler for CacheJobHandler {
             return Ok(Transaction::builder().build());
         }
 
-        // Crash-resume short-circuit: canonical blob already sits at its
-        // canonical key (a prior attempt landed the upload but not the grant
-        // — or the multipart upload-id is no longer usable). Skip the
-        // upstream fetch and just grant ownership.
         if self.blob_store.size(&digest).await.is_ok() {
             let (reads, mutations) = self
                 .metadata_store
@@ -111,17 +100,18 @@ impl JobHandler for CacheJobHandler {
             ));
         }
 
-        let (_, stream) = repository
+        let (content_length, stream) = repository
             .get_blob(&[], &namespace, &digest)
             .await
             .map_err(|e| Error::Storage(e.to_string()))?;
 
         let (reads, mutations) = cache_blob_mutations(
-            self.upload_store.clone(),
+            self.blob_store.clone(),
             self.metadata_store.clone(),
             namespace,
             digest,
             stream,
+            content_length,
         )
         .await
         .map_err(|e| Error::Storage(e.to_string()))?;

@@ -13,22 +13,19 @@ use crate::{
     },
     oci::Digest,
     registry::{
-        blob_store::{self, BlobStore},
+        blob_store,
         metadata_store::{self, MetadataStore, link_kind::LinkKind},
         parse_manifest_digests,
     },
 };
 
 pub struct LinkReferencesChecker {
-    blob_store: Arc<dyn BlobStore + Send + Sync>,
+    blob_store: Arc<blob_store::BlobStore>,
     metadata_store: Arc<MetadataStore>,
 }
 
 impl LinkReferencesChecker {
-    pub fn new(
-        blob_store: Arc<dyn BlobStore + Send + Sync>,
-        metadata_store: Arc<MetadataStore>,
-    ) -> Self {
+    pub fn new(blob_store: Arc<blob_store::BlobStore>, metadata_store: Arc<MetadataStore>) -> Self {
         Self {
             blob_store,
             metadata_store,
@@ -160,11 +157,10 @@ mod tests {
     };
 
     fn noop_executor(
-        blob_store: Arc<dyn BlobStore + Send + Sync>,
+        blob_store: Arc<blob_store::BlobStore>,
         metadata_store: Arc<MetadataStore>,
-        upload_store: Arc<dyn crate::registry::blob_store::UploadStore>,
     ) -> Executor {
-        Executor::new(blob_store, metadata_store, upload_store)
+        Executor::new(blob_store, metadata_store)
     }
 
     async fn create_manifest_scenario(
@@ -253,11 +249,7 @@ mod tests {
 
             let checker = LinkReferencesChecker::new(blob_store.clone(), metadata_store.clone());
 
-            let mut executor = noop_executor(
-                blob_store.clone(),
-                metadata_store.clone(),
-                test_case.upload_store(),
-            );
+            let mut executor = noop_executor(blob_store.clone(), metadata_store.clone());
 
             checker.check(namespace, &mut executor).await.unwrap();
 
@@ -402,14 +394,10 @@ mod tests {
             )
             .await;
 
-            blob_store.delete(&manifest_digest).await.unwrap();
+            blob_store.delete_blob(&manifest_digest).await.unwrap();
 
             let checker = LinkReferencesChecker::new(blob_store.clone(), metadata_store.clone());
-            let mut executor = noop_executor(
-                blob_store.clone(),
-                metadata_store.clone(),
-                test_case.upload_store(),
-            );
+            let mut executor = noop_executor(blob_store.clone(), metadata_store.clone());
             checker.check(namespace, &mut executor).await.unwrap();
 
             assert!(
@@ -440,7 +428,7 @@ mod tests {
             )
             .await;
 
-            blob_store.delete(&manifest_digest).await.unwrap();
+            blob_store.delete_blob(&manifest_digest).await.unwrap();
 
             let checker = LinkReferencesChecker::new(blob_store.clone(), metadata_store.clone());
             let mut sink: Vec<Action> = Vec::new();
@@ -470,7 +458,7 @@ mod tests {
         // that `read_link` fails with an `InvalidData` error, which propagates
         // as `Error::MetadataStore`.
         let fs_case = FSRegistryTestCase::new();
-        let blob_store: Arc<dyn BlobStore + Send + Sync> = RegistryTestCase::blob_store(&fs_case);
+        let blob_store: Arc<blob_store::BlobStore> = RegistryTestCase::blob_store(&fs_case);
         let metadata_store = RegistryTestCase::metadata_store(&fs_case);
 
         let namespace = "test-repo/error";
@@ -543,11 +531,7 @@ mod tests {
             );
 
             let checker = LinkReferencesChecker::new(blob_store.clone(), metadata_store.clone());
-            let mut executor = noop_executor(
-                blob_store.clone(),
-                metadata_store.clone(),
-                test_case.upload_store(),
-            );
+            let mut executor = noop_executor(blob_store.clone(), metadata_store.clone());
             checker.check(namespace, &mut executor).await.unwrap();
 
             let after = metadata_store
@@ -614,11 +598,7 @@ mod tests {
                 .unwrap();
 
             let checker = LinkReferencesChecker::new(blob_store.clone(), metadata_store.clone());
-            let mut executor = noop_executor(
-                blob_store.clone(),
-                metadata_store.clone(),
-                test_case.upload_store(),
-            );
+            let mut executor = noop_executor(blob_store.clone(), metadata_store.clone());
             checker.check(namespace, &mut executor).await.unwrap();
 
             let after = metadata_store

@@ -21,10 +21,12 @@ use std::{
 };
 
 use async_trait::async_trait;
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
+use futures_util::StreamExt;
 
 use crate::{
-    BoxedReader, ChildrenPage, ConditionalStore, Error, Etag, ObjectMeta, ObjectStore, Page,
+    BoxedReader, ByteStream, ChildrenPage, ConditionalStore, Error, Etag, ObjectMeta, ObjectStore,
+    Page, SessionState, UploadSession, UploadSessionStore,
 };
 
 /// Inner shared state.
@@ -363,6 +365,65 @@ impl ConditionalStore for MemoryObjectStore {
             Some(_) => Err(Error::PreconditionFailed),
             None => Ok(()),
         }
+    }
+}
+
+#[async_trait]
+impl UploadSessionStore for MemoryObjectStore {
+    async fn create_upload(&self, key: &str) -> Result<UploadSession, Error> {
+        self.put(key, Bytes::new()).await?;
+        Ok(UploadSession {
+            key: key.to_string(),
+            uploaded_size: 0,
+            state: SessionState::Fs,
+        })
+    }
+
+    async fn write_upload(
+        &self,
+        session: &mut UploadSession,
+        _staging_key: &str,
+        mut body: ByteStream,
+        len: u64,
+    ) -> Result<(), Error> {
+        if len == 0 {
+            return Ok(());
+        }
+        let mut buf = BytesMut::with_capacity(usize::try_from(len).unwrap_or(0));
+        while let Some(chunk) = body.next().await {
+            let chunk = chunk.map_err(|e| Error::Backend(e.to_string()))?;
+            buf.extend_from_slice(&chunk);
+        }
+        let actual = u64::try_from(buf.len()).map_err(|e| Error::Backend(e.to_string()))?;
+        if actual != len {
+            return Err(Error::Backend(format!(
+                "memory upload-session short body: expected {len} bytes, got {actual}",
+            )));
+        }
+        let mut combined = self.get(&session.key).await.unwrap_or_default();
+        combined.extend_from_slice(&buf);
+        self.put(&session.key, Bytes::from(combined)).await?;
+        session.uploaded_size = session
+            .uploaded_size
+            .checked_add(actual)
+            .ok_or_else(|| Error::Backend("session size overflow".to_string()))?;
+        Ok(())
+    }
+
+    async fn complete_upload(
+        &self,
+        _session: UploadSession,
+        _staging_key: &str,
+    ) -> Result<(), Error> {
+        Ok(())
+    }
+
+    async fn abort_upload(&self, session: UploadSession, _staging_key: &str) -> Result<(), Error> {
+        self.delete(&session.key).await
+    }
+
+    async fn abort_pending_uploads(&self, _key: &str) -> Result<(), Error> {
+        Ok(())
     }
 }
 

@@ -15,9 +15,7 @@ use crate::{
     configuration::Configuration,
     policy::{RetentionPolicy, RetentionPolicyConfig, SystemClock},
     registry::{
-        blob_store::{BlobStore, UploadStore},
-        metadata_store::MetadataStore,
-        repository_resolver::RepositoryResolver,
+        blob_store, metadata_store::MetadataStore, repository_resolver::RepositoryResolver,
     },
 };
 
@@ -35,8 +33,7 @@ fn global_retention_policy(config: &RetentionPolicyConfig) -> Option<Arc<Retenti
 pub fn namespace_checkers(
     options: &Options,
     config: &Configuration,
-    blob_store: &Arc<dyn BlobStore>,
-    upload_store: &Arc<dyn UploadStore>,
+    blob_store: &Arc<blob_store::BlobStore>,
     metadata_store: &Arc<MetadataStore>,
     resolver: &Arc<RepositoryResolver>,
 ) -> Result<Vec<Box<dyn NamespaceChecker>>, Error> {
@@ -59,7 +56,7 @@ pub fn namespace_checkers(
             upload_timeout.num_seconds()
         );
         checkers.push(Box::new(UploadChecker::new(
-            upload_store.clone(),
+            blob_store.clone(),
             upload_timeout,
         )));
     }
@@ -99,13 +96,13 @@ pub fn namespace_checkers(
     Ok(checkers)
 }
 
-pub fn layout_checker(blob_store: &Arc<dyn BlobStore>) -> LayoutChecker {
+pub fn layout_checker(blob_store: &Arc<blob_store::BlobStore>) -> LayoutChecker {
     LayoutChecker::new(blob_store.clone())
 }
 
 pub fn blob_checker(
     options: &Options,
-    blob_store: &Arc<dyn BlobStore>,
+    blob_store: &Arc<blob_store::BlobStore>,
     metadata_store: &Arc<MetadataStore>,
 ) -> Option<BlobChecker> {
     options

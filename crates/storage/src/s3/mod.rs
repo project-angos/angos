@@ -4,28 +4,41 @@
 //! without depending on the HTTP/S3 layer directly. The wrapper translates
 //! `s3_client::Error` and `io::Error` into [`crate::Error`], adapts S3's
 //! flat/delimited listing modes to [`Page`](crate::Page) /
-//! [`ChildrenPage`](crate::ChildrenPage), and forwards every multipart and
+//! [`ChildrenPage`](crate::ChildrenPage), and forwards every conditional and
 //! presign operation through unchanged.
+//!
+//! The [`UploadSessionStore`](crate::UploadSessionStore) implementation lives
+//! in [`upload_session`].
+
+mod upload_session;
 
 use std::{sync::Arc, time::Duration};
 
-use angos_s3_client::{Backend as S3Backend, UploadedPart};
+use angos_s3_client::Backend as S3Backend;
 use async_trait::async_trait;
 use bytes::Bytes;
 
 use crate::{
-    BoxedReader, ByteStream, ChildrenPage, ConditionalStore, Error, Etag, MultipartPage,
-    MultipartStore, MultipartUpload, ObjectMeta, ObjectStore, Page, Part, PresignedStore, UploadId,
+    BoxedReader, ChildrenPage, ConditionalStore, Error, Etag, ObjectMeta, ObjectStore, Page,
+    PresignedStore,
 };
+
+pub const DEFAULT_PART_SIZE: u64 = 5 * 1024 * 1024;
 
 /// Builder for [`Backend`].
 pub struct Builder {
     client: Option<Arc<S3Backend>>,
+    part_size: u64,
+    uniform_parts: bool,
 }
 
 impl Builder {
     fn new() -> Self {
-        Self { client: None }
+        Self {
+            client: None,
+            part_size: DEFAULT_PART_SIZE,
+            uniform_parts: false,
+        }
     }
 
     /// The underlying S3 HTTP client. Construct it with
@@ -36,6 +49,26 @@ impl Builder {
         self
     }
 
+    /// Target part size for upload sessions (uniform mode) or minimum part
+    /// size before flushing (non-uniform mode). Defaults to 5 MiB — the
+    /// S3 minimum.
+    #[must_use]
+    pub fn part_size(mut self, size: u64) -> Self {
+        self.part_size = size;
+        self
+    }
+
+    /// `true` = uniform mode: each `write_upload` call emits as many parts
+    /// of exactly `part_size` bytes as fit, restaging the remainder.
+    /// `false` = non-uniform mode: each call emits at most one part of the
+    /// full available size, flushing only once the combined pending +
+    /// incoming bytes meet `part_size`. Defaults to non-uniform.
+    #[must_use]
+    pub fn uniform_parts(mut self, on: bool) -> Self {
+        self.uniform_parts = on;
+        self
+    }
+
     /// # Errors
     /// Returns [`Error::Backend`] when [`client`](Self::client) was never
     /// called.
@@ -43,36 +76,26 @@ impl Builder {
         let client = self
             .client
             .ok_or_else(|| Error::Backend("s3::Backend requires a client".to_string()))?;
-        Ok(Backend { client })
+        Ok(Backend {
+            client,
+            part_size: self.part_size,
+            uniform_parts: self.uniform_parts,
+        })
     }
 }
 
-/// S3 [`ObjectStore`] (+ conditional, multipart, presign) implementation.
+/// S3 [`ObjectStore`] (+ conditional, upload-session, presign) implementation.
 #[derive(Clone, Debug)]
 pub struct Backend {
-    client: Arc<S3Backend>,
+    pub client: Arc<S3Backend>,
+    pub part_size: u64,
+    pub uniform_parts: bool,
 }
 
 impl Backend {
     #[must_use]
     pub fn builder() -> Builder {
         Builder::new()
-    }
-}
-
-fn part_from_uploaded(part: UploadedPart) -> Part {
-    Part {
-        part_number: part.part_number,
-        etag: Etag::new(part.e_tag),
-        size: part.size,
-    }
-}
-
-fn uploaded_from_part(part: &Part) -> UploadedPart {
-    UploadedPart {
-        part_number: part.part_number,
-        e_tag: part.etag.as_str().to_string(),
-        size: part.size,
     }
 }
 
@@ -176,91 +199,6 @@ impl ConditionalStore for Backend {
 
     async fn delete_if_match(&self, key: &str, etag: &Etag) -> Result<(), Error> {
         Ok(self.client.delete_if_match(key, etag.as_str()).await?)
-    }
-}
-
-#[async_trait]
-impl MultipartStore for Backend {
-    async fn create_multipart(&self, key: &str) -> Result<UploadId, Error> {
-        let id = self.client.create_multipart_upload(key).await?;
-        Ok(UploadId::new(id))
-    }
-
-    async fn upload_part(
-        &self,
-        key: &str,
-        id: &UploadId,
-        part_number: u32,
-        content_length: u64,
-        body: ByteStream,
-    ) -> Result<Etag, Error> {
-        let etag = self
-            .client
-            .upload_part_streaming(key, id.as_str(), part_number, content_length, body)
-            .await?;
-        Ok(Etag::new(etag))
-    }
-
-    async fn upload_part_copy(
-        &self,
-        source: &str,
-        destination: &str,
-        id: &UploadId,
-        part_number: u32,
-        range: Option<String>,
-    ) -> Result<Etag, Error> {
-        let etag = self
-            .client
-            .upload_part_copy(source, destination, id.as_str(), part_number, range)
-            .await?;
-        Ok(Etag::new(etag))
-    }
-
-    async fn complete_multipart(
-        &self,
-        key: &str,
-        id: &UploadId,
-        parts: &[Part],
-    ) -> Result<(), Error> {
-        let uploaded: Vec<UploadedPart> = parts.iter().map(uploaded_from_part).collect();
-        Ok(self
-            .client
-            .complete_multipart_upload(key, id.as_str(), &uploaded)
-            .await?)
-    }
-
-    async fn abort_multipart(&self, key: &str, id: &UploadId) -> Result<(), Error> {
-        Ok(self.client.abort_multipart_upload(key, id.as_str()).await?)
-    }
-
-    async fn list_multipart_uploads(
-        &self,
-        prefix: Option<&str>,
-        key_marker: Option<&str>,
-        upload_id_marker: Option<&str>,
-    ) -> Result<MultipartPage, Error> {
-        let (uploads, next_key_marker, next_upload_id_marker) = self
-            .client
-            .list_multipart_uploads(prefix, key_marker, upload_id_marker)
-            .await?;
-        let uploads = uploads
-            .into_iter()
-            .map(|u| MultipartUpload {
-                key: u.key,
-                upload_id: UploadId::new(u.upload_id),
-                initiated_at: u.initiated_at,
-            })
-            .collect();
-        Ok(MultipartPage {
-            uploads,
-            next_key_marker,
-            next_upload_id_marker,
-        })
-    }
-
-    async fn list_parts(&self, key: &str, id: &UploadId) -> Result<Vec<Part>, Error> {
-        let parts = self.client.list_parts(key, id.as_str()).await?;
-        Ok(parts.into_iter().map(part_from_uploaded).collect())
     }
 }
 

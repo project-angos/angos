@@ -34,7 +34,7 @@ fn test_load_minimal_config() {
     assert_eq!(server_config.base.query_timeout_grace_period_secs.get(), 60);
 
     assert_eq!(config.cache, cache::Config::Memory);
-    assert_eq!(config.blob_store, blob_store::BlobStorageConfig::default());
+    assert_eq!(config.blob_store, blob_store::BlobStoreConfig::default());
 
     assert!(config.auth.identity.is_empty());
     assert!(config.repository.is_empty());
@@ -55,7 +55,7 @@ fn test_storage_field_backward_compatibility() {
     let config = Configuration::load_from_str(config).unwrap();
 
     // Should parse 'storage' as 'blob_store'
-    let expected = blob_store::BlobStorageConfig::FS(blob_store::fs::BackendConfig {
+    let expected = blob_store::BlobStoreConfig::FS(blob_store::FsBackendConfig {
         root_dir: "/data/registry".to_string(),
         sync_to_disk: false,
     });

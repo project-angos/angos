@@ -228,16 +228,14 @@ pub enum RegistryStorageConfig {
 
 impl RegistryStorageConfig {
     /// Build a `RegistryStorageConfig` that mirrors the given blob-store config.
-    pub fn from_blob_store(blob: &blob_store::BlobStorageConfig) -> Self {
+    pub fn from_blob_store(blob: &blob_store::BlobStoreConfig) -> Self {
         match blob {
-            blob_store::BlobStorageConfig::FS(config) => {
-                RegistryStorageConfig::FS(FsBackendConfig {
-                    root_dir: config.root_dir.clone(),
-                    sync_to_disk: config.sync_to_disk,
-                    ..Default::default()
-                })
-            }
-            blob_store::BlobStorageConfig::S3(config) => {
+            blob_store::BlobStoreConfig::FS(config) => RegistryStorageConfig::FS(FsBackendConfig {
+                root_dir: config.root_dir.clone(),
+                sync_to_disk: config.sync_to_disk,
+                ..Default::default()
+            }),
+            blob_store::BlobStoreConfig::S3(config) => {
                 info!("Auto-configuring S3 metadata-store from blob-store");
                 RegistryStorageConfig::S3(S3BackendConfig {
                     connection: config.connection.clone(),
@@ -470,7 +468,7 @@ mod tests {
 
     #[test]
     fn test_from_blob_store_fs_copies_paths_and_sync() {
-        let blob = blob_store::BlobStorageConfig::FS(blob_store::fs::BackendConfig {
+        let blob = blob_store::BlobStoreConfig::FS(blob_store::FsBackendConfig {
             root_dir: "/var/lib/registry".to_string(),
             sync_to_disk: true,
         });
@@ -487,7 +485,7 @@ mod tests {
 
     #[test]
     fn test_from_blob_store_s3_copies_credentials_and_bucket() {
-        let blob = blob_store::BlobStorageConfig::S3(blob_store::s3::BackendConfig {
+        let blob = blob_store::BlobStoreConfig::S3(blob_store::S3BackendConfig {
             connection: S3ConnectionConfig {
                 access_key_id: Secret::new("key".to_string()),
                 secret_key: Secret::new("secret".to_string()),
@@ -496,7 +494,7 @@ mod tests {
                 region: "us-east-1".to_string(),
                 key_prefix: "foo".to_string(),
             },
-            ..blob_store::s3::BackendConfig::default()
+            ..blob_store::S3BackendConfig::default()
         });
         match RegistryStorageConfig::from_blob_store(&blob) {
             RegistryStorageConfig::S3(c) => {

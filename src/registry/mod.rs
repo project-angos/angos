@@ -56,7 +56,7 @@ use crate::{
     oci::{Digest, Namespace},
     registry::{
         blob_ownership::BlobOwnership,
-        blob_store::{BlobStore, Error as BlobStoreError, PresignedBlobStore, UploadStore},
+        blob_store::{BlobStore, Error as BlobStoreError},
         cache_job_handler::{CACHE_QUEUE, CacheJobHandler},
         job_store::{JobHandler, JobStore},
         metadata_store::MetadataStore,
@@ -144,9 +144,7 @@ impl RegistryConfig {
 
 #[allow(clippy::struct_excessive_bools)]
 pub struct Registry {
-    blob_store: Arc<dyn BlobStore>,
-    upload_store: Arc<dyn UploadStore>,
-    presigned_blob_store: Option<Arc<dyn PresignedBlobStore>>,
+    blob_store: Arc<BlobStore>,
     metadata_store: Arc<MetadataStore>,
     resolver: Arc<RepositoryResolver>,
     enable_blob_redirect: bool,
@@ -165,18 +163,9 @@ impl fmt::Debug for Registry {
 }
 
 impl Registry {
-    #[instrument(skip(
-        blob_store,
-        upload_store,
-        presigned_blob_store,
-        metadata_store,
-        resolver,
-        config
-    ))]
+    #[instrument(skip(blob_store, metadata_store, resolver, config))]
     pub fn new(
-        blob_store: Arc<dyn BlobStore>,
-        upload_store: Arc<dyn UploadStore>,
-        presigned_blob_store: Option<Arc<dyn PresignedBlobStore>>,
+        blob_store: Arc<BlobStore>,
         metadata_store: Arc<MetadataStore>,
         resolver: Arc<RepositoryResolver>,
         config: RegistryConfig,
@@ -186,7 +175,6 @@ impl Registry {
         } else {
             build_in_process_queue(
                 &resolver,
-                &upload_store,
                 &blob_store,
                 &metadata_store,
                 config.max_concurrent_cache_jobs,
@@ -198,8 +186,6 @@ impl Registry {
             enable_blob_redirect: config.enable_blob_redirect,
             enable_manifest_redirect: config.enable_manifest_redirect,
             blob_store,
-            upload_store,
-            presigned_blob_store,
             metadata_store,
             resolver,
             cache_queue,
@@ -244,7 +230,7 @@ impl Registry {
             return Ok(());
         }
 
-        match self.blob_store.delete(digest).await {
+        match self.blob_store.delete_blob(digest).await {
             Ok(()) | Err(BlobStoreError::BlobNotFound | BlobStoreError::ReferenceNotFound) => {
                 Ok(())
             }
@@ -266,8 +252,7 @@ impl Registry {
 /// happen with `LockStrategy::Memory`).
 fn build_in_process_queue(
     resolver: &Arc<RepositoryResolver>,
-    upload_store: &Arc<dyn UploadStore>,
-    blob_store: &Arc<dyn BlobStore>,
+    blob_store: &Arc<BlobStore>,
     metadata_store: &Arc<MetadataStore>,
     concurrency: NonZeroUsize,
 ) -> Result<Arc<JobStore>, Error> {
@@ -285,12 +270,8 @@ fn build_in_process_queue(
 
     let job_store: Arc<JobStore> = Arc::new(JobStore::new(object_store, executor, "in-process"));
 
-    // Spawn `concurrency` claim-loop tasks. Each owns its own claim → execute
-    // cycle, so there is no need for a semaphore: the pool is the rate limit.
-    // Jobs keep draining until process exit.
     let handler: Arc<dyn JobHandler> = Arc::new(CacheJobHandler::new(
         resolver.clone(),
-        upload_store.clone(),
         blob_store.clone(),
         metadata_store.clone(),
     ));

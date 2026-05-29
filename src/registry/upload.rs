@@ -146,7 +146,7 @@ impl Registry {
         session_key: &str,
         digest: &Digest,
     ) -> CompleteUploadResponse {
-        if let Err(error) = self.upload_store.delete(namespace, session_key).await {
+        if let Err(error) = self.blob_store.delete_upload(namespace, session_key).await {
             warn!("Failed to delete completed upload state: {error}");
         }
 
@@ -179,7 +179,9 @@ impl Registry {
         }
 
         let session_uuid = Uuid::new_v4().to_string();
-        self.upload_store.create(namespace, &session_uuid).await?;
+        self.blob_store
+            .create_upload(namespace, &session_uuid)
+            .await?;
 
         Ok(StartUploadResponse::Session {
             headers: upload_session_headers(namespace, &session_uuid),
@@ -200,7 +202,10 @@ impl Registry {
     {
         let session_key = session_id.to_string();
 
-        let summary = self.upload_store.summary(namespace, &session_key).await?;
+        let summary = self
+            .blob_store
+            .upload_summary(namespace, &session_key)
+            .await?;
 
         if let Some(offset) = start_offset
             && offset != summary.size
@@ -209,14 +214,8 @@ impl Registry {
         }
 
         let (_, size) = self
-            .upload_store
-            .write(
-                namespace,
-                &session_key,
-                Box::new(stream),
-                content_length,
-                true,
-            )
+            .blob_store
+            .write_upload(namespace, &session_key, Box::new(stream), content_length)
             .await?;
 
         let range_max = size.saturating_sub(1);
@@ -241,14 +240,18 @@ impl Registry {
     {
         let session_key = session_id.to_string();
 
-        let append = match self.upload_store.summary(namespace, &session_key).await {
+        let has_prior_writes = match self
+            .blob_store
+            .upload_summary(namespace, &session_key)
+            .await
+        {
             Ok(summary) => summary.size > 0,
             Err(blob_store::Error::UploadNotFound) => false,
             Err(e) => return Err(e.into()),
         };
 
         let mut stream = stream;
-        if !append
+        if !has_prior_writes
             && self
                 .complete_existing_upload(namespace, digest, content_length, &mut stream)
                 .await?
@@ -259,14 +262,8 @@ impl Registry {
         }
 
         let (upload_digest, _) = self
-            .upload_store
-            .write(
-                namespace,
-                &session_key,
-                Box::new(stream),
-                content_length,
-                append,
-            )
+            .blob_store
+            .write_upload(namespace, &session_key, Box::new(stream), content_length)
             .await?;
 
         if &upload_digest != digest {
@@ -277,8 +274,8 @@ impl Registry {
         match self.blob_store.size(digest).await {
             Ok(_) => {}
             Err(blob_store::Error::BlobNotFound | blob_store::Error::ReferenceNotFound) => {
-                self.upload_store
-                    .complete(namespace, &session_key, Some(digest))
+                self.blob_store
+                    .complete_upload(namespace, &session_key, Some(digest))
                     .await?;
             }
             Err(error) => return Err(Error::from(error)),
@@ -300,7 +297,7 @@ impl Registry {
         session_id: Uuid,
     ) -> Result<(), Error> {
         let uuid = session_id.to_string();
-        self.upload_store.delete(namespace, &uuid).await?;
+        self.blob_store.delete_upload(namespace, &uuid).await?;
 
         Ok(())
     }
@@ -312,7 +309,7 @@ impl Registry {
         session_id: Uuid,
     ) -> Result<GetUploadResponse, Error> {
         let uuid = session_id.to_string();
-        let summary = self.upload_store.summary(namespace, &uuid).await?;
+        let summary = self.blob_store.upload_summary(namespace, &uuid).await?;
 
         let range_max = summary.size.saturating_sub(1);
 
@@ -327,10 +324,14 @@ mod tests {
     use std::{io::Cursor, sync::Arc};
 
     use async_trait::async_trait;
+    use bytes::Bytes;
     use hyper::header::{LOCATION, RANGE};
     use uuid::Uuid;
 
-    use angos_tx_engine::transaction::Mutation;
+    use angos_storage::{
+        BoxedReader as StorageBoxedReader, ByteStream, ChildrenPage, Error as StorageError,
+        ObjectMeta, ObjectStore, Page, UploadSession, UploadSessionStore,
+    };
 
     use crate::{
         event_webhook::event::EventKind,
@@ -339,7 +340,7 @@ mod tests {
             DOCKER_CONTENT_DIGEST, DOCKER_UPLOAD_UUID, Error, StartUploadResponse,
             blob_ownership::BlobOwnership,
             blob_store,
-            blob_store::{BoxedReader, UploadStore, UploadSummary},
+            blob_store::BlobStore,
             metadata_store::link_kind::LinkKind,
             path_builder,
             test_utils::{
@@ -350,206 +351,150 @@ mod tests {
         util::sha256,
     };
 
-    struct DeleteFailingUploadStore {
-        inner: Arc<dyn UploadStore>,
+    /// Which storage operation the [`FailingStorage`] wrapper turns into a
+    /// hard error. Everything else delegates to the inner backend untouched.
+    #[derive(Clone, Copy)]
+    enum FailOp {
+        /// Fail the session-record delete that backs `delete_upload` cleanup.
+        Delete,
+        /// Fail `complete_upload` — must never run on the existing-blob path.
+        CompleteUpload,
+        /// Fail `write_upload` — must never run on the monolithic existing-blob
+        /// path.
+        WriteUpload,
     }
 
-    struct CompleteFailingUploadStore {
-        inner: Arc<dyn UploadStore>,
+    /// Delegating [`Storage`] wrapper that injects a single failure at the
+    /// storage seam so upload fast-paths can be proven to avoid a given op.
+    struct FailingStorage {
+        inner: Arc<dyn blob_store::Storage>,
+        fail: FailOp,
     }
 
-    struct WriteFailingUploadStore {
-        inner: Arc<dyn UploadStore>,
-    }
-
-    #[async_trait]
-    impl UploadStore for DeleteFailingUploadStore {
-        async fn list(
-            &self,
-            namespace: &str,
-            n: u16,
-            continuation_token: Option<String>,
-        ) -> Result<(Vec<String>, Option<String>), blob_store::Error> {
-            self.inner.list(namespace, n, continuation_token).await
-        }
-
-        async fn create(&self, namespace: &str, uuid: &str) -> Result<String, blob_store::Error> {
-            self.inner.create(namespace, uuid).await
-        }
-
-        async fn write(
-            &self,
-            namespace: &str,
-            uuid: &str,
-            stream: BoxedReader,
-            content_length: u64,
-            append: bool,
-        ) -> Result<(Digest, u64), blob_store::Error> {
-            self.inner
-                .write(namespace, uuid, stream, content_length, append)
-                .await
-        }
-
-        async fn summary(
-            &self,
-            namespace: &str,
-            uuid: &str,
-        ) -> Result<UploadSummary, blob_store::Error> {
-            self.inner.summary(namespace, uuid).await
-        }
-
-        async fn complete(
-            &self,
-            namespace: &str,
-            uuid: &str,
-            digest: Option<&Digest>,
-        ) -> Result<Digest, blob_store::Error> {
-            self.inner.complete(namespace, uuid, digest).await
-        }
-
-        async fn finalize_mutations(
-            &self,
-            namespace: &str,
-            uuid: &str,
-            expected_digest: Option<&Digest>,
-        ) -> Result<(Digest, Vec<Mutation>), blob_store::Error> {
-            self.inner
-                .finalize_mutations(namespace, uuid, expected_digest)
-                .await
-        }
-
-        async fn delete(&self, _namespace: &str, _uuid: &str) -> Result<(), blob_store::Error> {
-            Err(blob_store::Error::StorageBackend(
-                "delete failed".to_string(),
-            ))
-        }
+    fn fail(message: &str) -> StorageError {
+        StorageError::Backend(message.to_string())
     }
 
     #[async_trait]
-    impl UploadStore for CompleteFailingUploadStore {
+    impl ObjectStore for FailingStorage {
+        async fn get(&self, key: &str) -> Result<Vec<u8>, StorageError> {
+            self.inner.get(key).await
+        }
+
+        async fn get_stream(
+            &self,
+            key: &str,
+            offset: Option<u64>,
+        ) -> Result<(StorageBoxedReader, u64), StorageError> {
+            self.inner.get_stream(key, offset).await
+        }
+
+        async fn put(&self, key: &str, data: Bytes) -> Result<(), StorageError> {
+            self.inner.put(key, data).await
+        }
+
+        async fn delete(&self, key: &str) -> Result<(), StorageError> {
+            if matches!(self.fail, FailOp::Delete) {
+                return Err(fail("delete failed"));
+            }
+            self.inner.delete(key).await
+        }
+
+        async fn delete_prefix(&self, prefix: &str) -> Result<(), StorageError> {
+            self.inner.delete_prefix(prefix).await
+        }
+
+        async fn head(&self, key: &str) -> Result<ObjectMeta, StorageError> {
+            self.inner.head(key).await
+        }
+
         async fn list(
             &self,
-            namespace: &str,
+            prefix: &str,
             n: u16,
-            continuation_token: Option<String>,
-        ) -> Result<(Vec<String>, Option<String>), blob_store::Error> {
-            self.inner.list(namespace, n, continuation_token).await
+            token: Option<String>,
+        ) -> Result<Page<String>, StorageError> {
+            self.inner.list(prefix, n, token).await
         }
 
-        async fn create(&self, namespace: &str, uuid: &str) -> Result<String, blob_store::Error> {
-            self.inner.create(namespace, uuid).await
-        }
-
-        async fn write(
+        async fn list_children(
             &self,
-            namespace: &str,
-            uuid: &str,
-            stream: BoxedReader,
-            content_length: u64,
-            append: bool,
-        ) -> Result<(Digest, u64), blob_store::Error> {
+            prefix: &str,
+            n: u16,
+            token: Option<String>,
+            start_after: Option<String>,
+        ) -> Result<ChildrenPage, StorageError> {
             self.inner
-                .write(namespace, uuid, stream, content_length, append)
+                .list_children(prefix, n, token, start_after)
                 .await
         }
 
-        async fn summary(
-            &self,
-            namespace: &str,
-            uuid: &str,
-        ) -> Result<UploadSummary, blob_store::Error> {
-            self.inner.summary(namespace, uuid).await
-        }
-
-        async fn complete(
-            &self,
-            _namespace: &str,
-            _uuid: &str,
-            _digest: Option<&Digest>,
-        ) -> Result<Digest, blob_store::Error> {
-            Err(blob_store::Error::StorageBackend(
-                "complete should not be called for existing blob data".to_string(),
-            ))
-        }
-
-        async fn finalize_mutations(
-            &self,
-            _namespace: &str,
-            _uuid: &str,
-            _expected_digest: Option<&Digest>,
-        ) -> Result<(Digest, Vec<Mutation>), blob_store::Error> {
-            Err(blob_store::Error::StorageBackend(
-                "finalize_mutations should not be called for existing blob data".to_string(),
-            ))
-        }
-
-        async fn delete(&self, namespace: &str, uuid: &str) -> Result<(), blob_store::Error> {
-            self.inner.delete(namespace, uuid).await
+        async fn copy(&self, source: &str, destination: &str) -> Result<(), StorageError> {
+            self.inner.copy(source, destination).await
         }
     }
 
     #[async_trait]
-    impl UploadStore for WriteFailingUploadStore {
-        async fn list(
+    impl UploadSessionStore for FailingStorage {
+        async fn create_upload(&self, key: &str) -> Result<UploadSession, StorageError> {
+            self.inner.create_upload(key).await
+        }
+
+        async fn write_upload(
             &self,
-            namespace: &str,
-            n: u16,
-            continuation_token: Option<String>,
-        ) -> Result<(Vec<String>, Option<String>), blob_store::Error> {
-            self.inner.list(namespace, n, continuation_token).await
+            session: &mut UploadSession,
+            staging_key: &str,
+            body: ByteStream,
+            len: u64,
+        ) -> Result<(), StorageError> {
+            if matches!(self.fail, FailOp::WriteUpload) {
+                return Err(fail(
+                    "write should not be called for monolithic existing blob upload",
+                ));
+            }
+            self.inner
+                .write_upload(session, staging_key, body, len)
+                .await
         }
 
-        async fn create(&self, namespace: &str, uuid: &str) -> Result<String, blob_store::Error> {
-            self.inner.create(namespace, uuid).await
-        }
-
-        async fn write(
+        async fn complete_upload(
             &self,
-            _namespace: &str,
-            _uuid: &str,
-            _stream: BoxedReader,
-            _content_length: u64,
-            _append: bool,
-        ) -> Result<(Digest, u64), blob_store::Error> {
-            Err(blob_store::Error::StorageBackend(
-                "write should not be called for monolithic existing blob upload".to_string(),
-            ))
+            session: UploadSession,
+            staging_key: &str,
+        ) -> Result<(), StorageError> {
+            if matches!(self.fail, FailOp::CompleteUpload) {
+                return Err(fail("complete should not be called for existing blob data"));
+            }
+            self.inner.complete_upload(session, staging_key).await
         }
 
-        async fn summary(
+        async fn abort_upload(
             &self,
-            namespace: &str,
-            uuid: &str,
-        ) -> Result<UploadSummary, blob_store::Error> {
-            self.inner.summary(namespace, uuid).await
+            session: UploadSession,
+            staging_key: &str,
+        ) -> Result<(), StorageError> {
+            self.inner.abort_upload(session, staging_key).await
         }
 
-        async fn complete(
-            &self,
-            _namespace: &str,
-            _uuid: &str,
-            _digest: Option<&Digest>,
-        ) -> Result<Digest, blob_store::Error> {
-            Err(blob_store::Error::StorageBackend(
-                "complete should not be called for monolithic existing blob upload".to_string(),
-            ))
+        async fn abort_pending_uploads(&self, key: &str) -> Result<(), StorageError> {
+            self.inner.abort_pending_uploads(key).await
         }
+    }
 
-        async fn finalize_mutations(
-            &self,
-            _namespace: &str,
-            _uuid: &str,
-            _expected_digest: Option<&Digest>,
-        ) -> Result<(Digest, Vec<Mutation>), blob_store::Error> {
-            Err(blob_store::Error::StorageBackend(
-                "finalize_mutations should not be called for monolithic existing blob upload"
-                    .to_string(),
-            ))
+    /// Rebuild `inner` with its storage seam wrapped so `fail` errors out,
+    /// reusing the same executor and FS-prune handle.
+    fn failing_blob_store(inner: &Arc<BlobStore>, fail: FailOp) -> Arc<BlobStore> {
+        let store: Arc<dyn blob_store::Storage> = Arc::new(FailingStorage {
+            inner: inner.store.clone(),
+            fail,
+        });
+        let mut builder = BlobStore::builder()
+            .store(store)
+            .executor(inner.executor().clone());
+        if let Some(fs) = inner.fs_prune.clone() {
+            builder = builder.fs_prune(fs);
         }
-
-        async fn delete(&self, namespace: &str, uuid: &str) -> Result<(), blob_store::Error> {
-            self.inner.delete(namespace, uuid).await
-        }
+        Arc::new(builder.build().expect("failing blob store"))
     }
 
     #[tokio::test]
@@ -621,8 +566,8 @@ mod tests {
             let session_id = Uuid::new_v4();
 
             registry
-                .upload_store
-                .create(namespace, &session_id.to_string())
+                .blob_store
+                .create_upload(namespace, &session_id.to_string())
                 .await
                 .unwrap();
 
@@ -654,8 +599,8 @@ mod tests {
             );
 
             let summary = registry
-                .upload_store
-                .summary(namespace, &session_id.to_string())
+                .blob_store
+                .upload_summary(namespace, &session_id.to_string())
                 .await
                 .unwrap();
             assert_eq!(
@@ -675,8 +620,8 @@ mod tests {
             let session_id = Uuid::new_v4();
 
             registry
-                .upload_store
-                .create(namespace, &session_id.to_string())
+                .blob_store
+                .create_upload(namespace, &session_id.to_string())
                 .await
                 .unwrap();
 
@@ -727,11 +672,7 @@ mod tests {
     async fn test_complete_upload_succeeds_when_cleanup_delete_fails() {
         let test_case = FSRegistryTestCase::new();
         let registry = create_test_registry(
-            RegistryTestCase::blob_store(&test_case),
-            Arc::new(DeleteFailingUploadStore {
-                inner: test_case.upload_store(),
-            }),
-            None,
+            failing_blob_store(&RegistryTestCase::blob_store(&test_case), FailOp::Delete),
             test_case.metadata_store(),
         );
         let namespace = &Namespace::new("test-repo").unwrap();
@@ -739,8 +680,8 @@ mod tests {
         let session_id = Uuid::new_v4();
 
         registry
-            .upload_store
-            .create(namespace, &session_id.to_string())
+            .blob_store
+            .create_upload(namespace, &session_id.to_string())
             .await
             .unwrap();
 
@@ -782,11 +723,10 @@ mod tests {
     async fn test_complete_upload_reuses_existing_blob_data() {
         let test_case = FSRegistryTestCase::new();
         let registry = create_test_registry(
-            RegistryTestCase::blob_store(&test_case),
-            Arc::new(CompleteFailingUploadStore {
-                inner: test_case.upload_store(),
-            }),
-            None,
+            failing_blob_store(
+                &RegistryTestCase::blob_store(&test_case),
+                FailOp::CompleteUpload,
+            ),
             test_case.metadata_store(),
         );
         let first_namespace = &Namespace::new("test-repo/first").unwrap();
@@ -801,8 +741,8 @@ mod tests {
 
         let session_id = Uuid::new_v4();
         registry
-            .upload_store
-            .create(second_namespace, &session_id.to_string())
+            .blob_store
+            .create_upload(second_namespace, &session_id.to_string())
             .await
             .unwrap();
         registry
@@ -837,8 +777,8 @@ mod tests {
         );
         assert!(
             registry
-                .upload_store
-                .summary(second_namespace, &session_id.to_string())
+                .blob_store
+                .upload_summary(second_namespace, &session_id.to_string())
                 .await
                 .is_err()
         );
@@ -850,11 +790,10 @@ mod tests {
     async fn test_complete_upload_hashes_existing_blob_without_upload_storage_write() {
         let test_case = FSRegistryTestCase::new();
         let registry = create_test_registry(
-            RegistryTestCase::blob_store(&test_case),
-            Arc::new(WriteFailingUploadStore {
-                inner: test_case.upload_store(),
-            }),
-            None,
+            failing_blob_store(
+                &RegistryTestCase::blob_store(&test_case),
+                FailOp::WriteUpload,
+            ),
             test_case.metadata_store(),
         );
         let first_namespace = &Namespace::new("test-repo/first").unwrap();
@@ -869,8 +808,8 @@ mod tests {
 
         let session_id = Uuid::new_v4();
         registry
-            .upload_store
-            .create(second_namespace, &session_id.to_string())
+            .blob_store
+            .create_upload(second_namespace, &session_id.to_string())
             .await
             .unwrap();
 
@@ -894,8 +833,8 @@ mod tests {
         );
         assert!(
             registry
-                .upload_store
-                .summary(second_namespace, &session_id.to_string())
+                .blob_store
+                .upload_summary(second_namespace, &session_id.to_string())
                 .await
                 .is_err()
         );
@@ -911,15 +850,15 @@ mod tests {
             let session_id = Uuid::new_v4();
 
             registry
-                .upload_store
-                .create(namespace, &session_id.to_string())
+                .blob_store
+                .create_upload(namespace, &session_id.to_string())
                 .await
                 .unwrap();
 
             assert!(
                 registry
-                    .upload_store
-                    .summary(namespace, &session_id.to_string())
+                    .blob_store
+                    .upload_summary(namespace, &session_id.to_string())
                     .await
                     .is_ok()
             );
@@ -928,8 +867,8 @@ mod tests {
 
             assert!(
                 registry
-                    .upload_store
-                    .summary(namespace, &session_id.to_string())
+                    .blob_store
+                    .upload_summary(namespace, &session_id.to_string())
                     .await
                     .is_err()
             );
@@ -946,8 +885,8 @@ mod tests {
             let session_id = Uuid::new_v4();
 
             registry
-                .upload_store
-                .create(namespace, &session_id.to_string())
+                .blob_store
+                .create_upload(namespace, &session_id.to_string())
                 .await
                 .unwrap();
 
@@ -983,8 +922,8 @@ mod tests {
             let session_id = Uuid::new_v4();
 
             registry
-                .upload_store
-                .create(namespace, &session_id.to_string())
+                .blob_store
+                .create_upload(namespace, &session_id.to_string())
                 .await
                 .unwrap();
 
@@ -1014,8 +953,8 @@ mod tests {
             let session_id = Uuid::new_v4();
 
             registry
-                .upload_store
-                .create(namespace, &session_id.to_string())
+                .blob_store
+                .create_upload(namespace, &session_id.to_string())
                 .await
                 .unwrap();
 
@@ -1049,21 +988,20 @@ mod tests {
             let content = b"hello world upload";
 
             registry
-                .upload_store
-                .create(namespace, &session_id.to_string())
+                .blob_store
+                .create_upload(namespace, &session_id.to_string())
                 .await
                 .unwrap();
 
             let stream: Box<dyn tokio::io::AsyncRead + Unpin + Send + Sync> =
                 Box::new(Cursor::new(content.to_vec()));
             let (digest, size) = registry
-                .upload_store
-                .write(
+                .blob_store
+                .write_upload(
                     namespace,
                     &session_id.to_string(),
                     stream,
                     content.len() as u64,
-                    false,
                 )
                 .await
                 .unwrap();
@@ -1072,8 +1010,8 @@ mod tests {
             assert_eq!(digest, sha256::digest(content));
 
             let summary = registry
-                .upload_store
-                .summary(namespace, &session_id.to_string())
+                .blob_store
+                .upload_summary(namespace, &session_id.to_string())
                 .await
                 .unwrap();
 
@@ -1091,14 +1029,14 @@ mod tests {
             let content = b"size check content";
 
             registry
-                .upload_store
-                .create(namespace, &session_id.to_string())
+                .blob_store
+                .create_upload(namespace, &session_id.to_string())
                 .await
                 .unwrap();
 
             let summary = registry
-                .upload_store
-                .summary(namespace, &session_id.to_string())
+                .blob_store
+                .upload_summary(namespace, &session_id.to_string())
                 .await
                 .unwrap();
             assert_eq!(summary.size, 0);
@@ -1106,20 +1044,19 @@ mod tests {
             let stream: Box<dyn tokio::io::AsyncRead + Unpin + Send + Sync> =
                 Box::new(Cursor::new(content.to_vec()));
             registry
-                .upload_store
-                .write(
+                .blob_store
+                .write_upload(
                     namespace,
                     &session_id.to_string(),
                     stream,
                     content.len() as u64,
-                    false,
                 )
                 .await
                 .unwrap();
 
             let summary = registry
-                .upload_store
-                .summary(namespace, &session_id.to_string())
+                .blob_store
+                .upload_summary(namespace, &session_id.to_string())
                 .await
                 .unwrap();
             assert_eq!(summary.size, content.len() as u64);
@@ -1136,8 +1073,8 @@ mod tests {
         let session_id = Uuid::new_v4();
 
         registry
-            .upload_store
-            .create(namespace, &session_id.to_string())
+            .blob_store
+            .create_upload(namespace, &session_id.to_string())
             .await
             .unwrap();
 
@@ -1148,8 +1085,8 @@ mod tests {
             .unwrap();
 
         let summary = registry
-            .upload_store
-            .summary(namespace, &session_id.to_string())
+            .blob_store
+            .upload_summary(namespace, &session_id.to_string())
             .await
             .unwrap();
 

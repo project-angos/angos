@@ -41,7 +41,7 @@ pub struct Configuration {
     pub global: GlobalConfig,
     pub ui: UiConfig,
     pub cache: cache::Config,
-    pub blob_store: blob_store::BlobStorageConfig,
+    pub blob_store: blob_store::BlobStoreConfig,
     pub registry_storage: RegistryStorageConfig,
     pub auth: authenticator::AuthConfig,
     pub repository: HashMap<String, repository::Config>,

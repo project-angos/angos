@@ -66,7 +66,7 @@ pub struct Command {
 impl Command {
     pub async fn new(options: &Options, config: &Configuration) -> Result<Self, Error> {
         let auth_cache = bootstrap::auth_cache(&config.cache)?;
-        let blob_handles = config.blob_store.to_backend()?;
+        let blob_backend = std::sync::Arc::new(config.blob_store.build_backend()?);
         let (metadata_store, _) =
             bootstrap::metadata_store(&config.resolve_registry_storage(), &auth_cache).await?;
         let repositories = bootstrap::repositories(
@@ -79,23 +79,18 @@ impl Command {
         let namespace_checkers = setup::namespace_checkers(
             options,
             config,
-            &blob_handles.blob,
-            &blob_handles.upload,
+            &blob_backend,
             &metadata_store,
             &repositories,
         )?;
-        let layout_checker = setup::layout_checker(&blob_handles.blob);
-        let blob_checker = setup::blob_checker(options, &blob_handles.blob, &metadata_store);
+        let layout_checker = setup::layout_checker(&blob_backend);
+        let blob_checker = setup::blob_checker(options, &blob_backend, &metadata_store);
 
         let sink: Box<dyn ActionSink + Send> = if options.dry_run {
             info!("Dry-run mode: no changes will be made to the storage");
             Box::new(DryRunSink)
         } else {
-            Box::new(Executor::new(
-                blob_handles.blob.clone(),
-                metadata_store.clone(),
-                blob_handles.upload.clone(),
-            ))
+            Box::new(Executor::new(blob_backend.clone(), metadata_store.clone()))
         };
 
         Ok(Self {

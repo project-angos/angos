@@ -13,7 +13,7 @@ use crate::{
     },
     oci::Digest,
     registry::{
-        blob_store::{self, BlobStore},
+        blob_store,
         metadata_store::{BlobIndex, Error as MetadataError, MetadataStore, link_kind::LinkKind},
     },
 };
@@ -38,15 +38,12 @@ async fn classify_blob(
 }
 
 pub struct BlobChecker {
-    blob_store: Arc<dyn BlobStore + Send + Sync>,
+    blob_store: Arc<blob_store::BlobStore>,
     metadata_store: Arc<MetadataStore>,
 }
 
 impl BlobChecker {
-    pub fn new(
-        blob_store: Arc<dyn BlobStore + Send + Sync>,
-        metadata_store: Arc<MetadataStore>,
-    ) -> Self {
+    pub fn new(blob_store: Arc<blob_store::BlobStore>, metadata_store: Arc<MetadataStore>) -> Self {
         Self {
             blob_store,
             metadata_store,
@@ -277,11 +274,7 @@ mod tests {
 
             let checker = BlobChecker::new(blob_store.clone(), metadata_store.clone());
 
-            let mut executor = Executor::new(
-                blob_store.clone(),
-                metadata_store.clone(),
-                test_case.upload_store(),
-            );
+            let mut executor = Executor::new(blob_store.clone(), metadata_store.clone());
 
             checker.check_all(&mut executor).await.unwrap();
 
@@ -319,11 +312,7 @@ mod tests {
                 .unwrap();
 
             let checker = BlobChecker::new(blob_store.clone(), metadata_store.clone());
-            let mut executor = Executor::new(
-                blob_store.clone(),
-                metadata_store.clone(),
-                test_case.upload_store(),
-            );
+            let mut executor = Executor::new(blob_store.clone(), metadata_store.clone());
 
             checker.check_all(&mut executor).await.unwrap();
 
@@ -348,8 +337,7 @@ mod tests {
 
             let checker = BlobChecker::new(blob_store.clone(), metadata_store.clone());
 
-            let mut executor =
-                Executor::new(blob_store.clone(), metadata_store, test_case.upload_store());
+            let mut executor = Executor::new(blob_store.clone(), metadata_store);
 
             checker.check_all(&mut executor).await.unwrap();
 
@@ -413,11 +401,7 @@ mod tests {
                 .unwrap();
 
             let checker = BlobChecker::new(blob_store.clone(), metadata_store.clone());
-            let mut executor = Executor::new(
-                blob_store.clone(),
-                metadata_store.clone(),
-                test_case.upload_store(),
-            );
+            let mut executor = Executor::new(blob_store.clone(), metadata_store.clone());
 
             checker
                 .check_blob(&phantom_digest, &mut executor)
@@ -465,11 +449,7 @@ mod tests {
                 .unwrap();
 
             let checker = BlobChecker::new(blob_store.clone(), metadata_store.clone());
-            let mut executor = Executor::new(
-                blob_store.clone(),
-                metadata_store.clone(),
-                test_case.upload_store(),
-            );
+            let mut executor = Executor::new(blob_store.clone(), metadata_store.clone());
 
             checker
                 .check_blob(&phantom_digest, &mut executor)

@@ -192,8 +192,8 @@ async fn create_test_manifest_with_subject(
 async fn upload_blob(registry: &Registry, namespace: &Namespace, content: &[u8]) -> Digest {
     let session_id = Uuid::new_v4();
     registry
-        .upload_store
-        .create(namespace, &session_id.to_string())
+        .blob_store
+        .create_upload(namespace, &session_id.to_string())
         .await
         .unwrap();
 

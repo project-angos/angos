@@ -8,15 +8,20 @@ use std::{sync::Arc, time::Duration};
 use angos_s3_client::{Backend as S3Backend, BackendConfig as S3Config};
 use bytes::Bytes;
 use bytesize::ByteSize;
-use tokio::{io::AsyncReadExt, sync::mpsc};
+use futures_util::stream;
+use tokio::io::AsyncReadExt;
 use uuid::Uuid;
 
 use crate::{
-    ConditionalStore, Error, MultipartStore, ObjectStore, PresignedStore, channel_stream,
-    s3::Backend,
+    ByteStream, ConditionalStore, Error, ObjectStore, PresignedStore, SessionState,
+    UploadSessionStore, s3::Backend,
 };
 
 fn backend() -> Backend {
+    backend_with(false, ByteSize::mib(5).as_u64())
+}
+
+fn backend_with(uniform_parts: bool, part_size: u64) -> Backend {
     let config = S3Config {
         access_key_id: "root".to_string(),
         secret_key: "roottoor".to_string(),
@@ -24,15 +29,22 @@ fn backend() -> Backend {
         bucket: "registry".to_string(),
         region: "us-east-1".to_string(),
         key_prefix: format!("storage-s3-tests/{}", Uuid::new_v4()),
-        // Keep multipart thresholds tight so the round-trip test can exercise
-        // it with a few KiB instead of GiBs.
         multipart_copy_threshold: ByteSize::mib(5),
         multipart_copy_chunk_size: ByteSize::mib(5),
-        multipart_part_size: ByteSize::mib(5),
+        multipart_part_size: ByteSize(part_size),
         ..Default::default()
     };
     let client = Arc::new(S3Backend::new(&config).expect("s3 client"));
-    Backend::builder().client(client).build().expect("backend")
+    Backend::builder()
+        .client(client)
+        .part_size(part_size)
+        .uniform_parts(uniform_parts)
+        .build()
+        .expect("backend")
+}
+
+fn frame(body: Vec<u8>) -> ByteStream {
+    Box::pin(stream::once(async move { Ok(Bytes::from(body)) }))
 }
 
 #[tokio::test]
@@ -81,13 +93,9 @@ async fn delete_prefix_clears_subtree() {
             .unwrap();
     }
     store.delete_prefix(&prefix).await.unwrap();
-    let (objects, _) = store
-        .list(&prefix, 10, None)
-        .await
-        .map(|p| (p.items, p.next_token))
-        .unwrap();
+    let page = store.list(&prefix, 10, None).await.unwrap();
     assert!(
-        objects.is_empty(),
+        page.items.is_empty(),
         "prefix must be empty after delete_prefix"
     );
 }
@@ -167,10 +175,6 @@ async fn put_if_match_rejects_stale_etag() {
 
 #[tokio::test]
 async fn delete_if_match_succeeds_with_current_etag() {
-    // Note: the negative case (bogus ETag must yield PreconditionFailed) is
-    // not asserted here — older S3-compatible providers don't enforce
-    // `DeleteObject + If-Match`. Capability detection belongs in the consumer
-    // layer (see `metadata_store::s3::probe::probe_conditional_capabilities`).
     let store = backend();
     let key = format!("cas/del/{}", Uuid::new_v4());
     let etag = store
@@ -182,53 +186,215 @@ async fn delete_if_match_succeeds_with_current_etag() {
     assert_eq!(store.get(&key).await.unwrap_err(), Error::NotFound);
 }
 
-#[tokio::test]
-async fn multipart_round_trip_assembles_object() {
-    let store = backend();
-    let key = format!("mp/{}", Uuid::new_v4());
-    let id = store.create_multipart(&key).await.unwrap();
+// ─── upload sessions ──────────────────────────────────────────────────────
 
-    // S3 minimum part size is 5 MiB except for the last part.
-    let mut data = vec![0u8; 5 * 1024 * 1024];
-    for (i, b) in data.iter_mut().enumerate() {
-        *b = u8::try_from(i % 251).unwrap_or(0);
+/// Uniform mode: each `write_upload` emits as many fixed-size parts as fit
+/// in the combined (staged + incoming) bytes, then restages the remainder.
+#[tokio::test]
+async fn upload_session_uniform_round_trip() {
+    let store = backend_with(true, 5 * 1024 * 1024);
+    let key = format!("up/uniform/{}", Uuid::new_v4());
+
+    let chunks: Vec<Vec<u8>> = vec![
+        vec![0x41; 2 * 1024 * 1024],
+        vec![0x42; 4 * 1024 * 1024],
+        vec![0x43; 6 * 1024 * 1024],
+    ];
+    let mut session = store.create_upload(&key).await.unwrap();
+    for chunk in &chunks {
+        let len = chunk.len() as u64;
+        store
+            .write_upload(
+                &mut session,
+                &format!("{key}.staged"),
+                frame(chunk.clone()),
+                len,
+            )
+            .await
+            .unwrap();
+    }
+    let total: u64 = chunks.iter().map(|c| c.len() as u64).sum();
+    assert_eq!(session.uploaded_size, total);
+    store
+        .complete_upload(session, &format!("{key}.staged"))
+        .await
+        .unwrap();
+    let assembled = store.get(&key).await.unwrap();
+    assert_eq!(assembled.len() as u64, total);
+    let mut expected = Vec::with_capacity(assembled.len());
+    for chunk in &chunks {
+        expected.extend_from_slice(chunk);
+    }
+    assert_eq!(assembled, expected);
+}
+
+/// Non-uniform mode: a single big write emits one part of the full size.
+#[tokio::test]
+async fn upload_session_nonuniform_single_part() {
+    let store = backend_with(false, 5 * 1024 * 1024);
+    let key = format!("up/nonuniform/{}", Uuid::new_v4());
+    let data: Vec<u8> = (0..6 * 1024 * 1024u32).map(|i| (i % 251) as u8).collect();
+
+    let mut session = store.create_upload(&key).await.unwrap();
+    let len = data.len() as u64;
+    store
+        .write_upload(
+            &mut session,
+            &format!("{key}.staged"),
+            frame(data.clone()),
+            len,
+        )
+        .await
+        .unwrap();
+    store
+        .complete_upload(session, &format!("{key}.staged"))
+        .await
+        .unwrap();
+    let assembled = store.get(&key).await.unwrap();
+    assert_eq!(assembled, data);
+}
+
+/// Non-uniform mode flushes at the S3 minimum part size (5 MiB), not at the
+/// configured part size (here 50 MiB). A single ~6 MiB write therefore emits
+/// one multipart part rather than restaging everything.
+#[tokio::test]
+async fn upload_session_nonuniform_flushes_at_min_part_size_not_configured_part_size() {
+    let store = backend_with(false, 50 * 1024 * 1024);
+    let key = format!("up/nonuniform-min/{}", Uuid::new_v4());
+    let data: Vec<u8> = (0..6 * 1024 * 1024u32).map(|i| (i % 251) as u8).collect();
+
+    let mut session = store.create_upload(&key).await.unwrap();
+    let len = data.len() as u64;
+    store
+        .write_upload(
+            &mut session,
+            &format!("{key}.staged"),
+            frame(data.clone()),
+            len,
+        )
+        .await
+        .unwrap();
+
+    match &session.state {
+        SessionState::S3 {
+            parts,
+            staged_size,
+            upload_id,
+        } => {
+            assert_eq!(parts.len(), 1, "the 6 MiB write must emit one part");
+            assert_eq!(*staged_size, 0, "nothing should be left staged");
+            assert!(upload_id.is_some(), "a multipart session must be open");
+        }
+        SessionState::Fs => panic!("expected an S3 session state"),
     }
 
-    let (tx1, rx1) = mpsc::channel(2);
-    tx1.send(Bytes::from(data.clone())).await.unwrap();
-    drop(tx1);
-    let etag1 = store
-        .upload_part(&key, &id, 1, data.len() as u64, channel_stream(rx1))
+    store
+        .complete_upload(session, &format!("{key}.staged"))
+        .await
+        .unwrap();
+    let assembled = store.get(&key).await.unwrap();
+    assert_eq!(assembled, data);
+}
+
+/// Small upload that never crosses the multipart threshold: `complete_upload`
+/// promotes the staging key to the canonical key without ever creating a
+/// multipart session.
+#[tokio::test]
+async fn upload_session_small_upload_takes_singleshot_path() {
+    let store = backend_with(false, 5 * 1024 * 1024);
+    let key = format!("up/small/{}", Uuid::new_v4());
+    let mut session = store.create_upload(&key).await.unwrap();
+    store
+        .write_upload(
+            &mut session,
+            &format!("{key}.staged"),
+            frame(b"hello".to_vec()),
+            5,
+        )
+        .await
+        .unwrap();
+    store
+        .complete_upload(session, &format!("{key}.staged"))
+        .await
+        .unwrap();
+    assert_eq!(store.get(&key).await.unwrap(), b"hello");
+}
+
+/// Zero-byte upload: `complete_upload` puts an empty object at `key`.
+#[tokio::test]
+async fn upload_session_complete_with_no_writes_creates_empty_object() {
+    let store = backend();
+    let key = format!("up/empty/{}", Uuid::new_v4());
+    let session = store.create_upload(&key).await.unwrap();
+    store
+        .complete_upload(session, &format!("{key}.staged"))
+        .await
+        .unwrap();
+    assert_eq!(store.get(&key).await.unwrap(), b"");
+}
+
+/// Sessions are the handle: serialise, restart, resume.
+#[tokio::test]
+async fn upload_session_resumes_after_serde_round_trip() {
+    let store = backend_with(true, 5 * 1024 * 1024);
+    let key = format!("up/resume/{}", Uuid::new_v4());
+    let mut session = store.create_upload(&key).await.unwrap();
+    let head = vec![0x55; 6 * 1024 * 1024];
+    store
+        .write_upload(
+            &mut session,
+            &format!("{key}.staged"),
+            frame(head.clone()),
+            head.len() as u64,
+        )
         .await
         .unwrap();
 
-    let tail = b"tail";
-    let (tx2, rx2) = mpsc::channel(2);
-    tx2.send(Bytes::from_static(tail)).await.unwrap();
-    drop(tx2);
-    let etag2 = store
-        .upload_part(&key, &id, 2, tail.len() as u64, channel_stream(rx2))
+    let bytes = serde_json::to_vec(&session).unwrap();
+    let mut session: crate::UploadSession = serde_json::from_slice(&bytes).unwrap();
+
+    let tail = vec![0x66; 512 * 1024];
+    store
+        .write_upload(
+            &mut session,
+            &format!("{key}.staged"),
+            frame(tail.clone()),
+            tail.len() as u64,
+        )
         .await
         .unwrap();
+    store
+        .complete_upload(session, &format!("{key}.staged"))
+        .await
+        .unwrap();
+    let assembled = store.get(&key).await.unwrap();
+    let mut expected = head;
+    expected.extend_from_slice(&tail);
+    assert_eq!(assembled, expected);
+}
 
-    let parts = vec![
-        crate::Part {
-            part_number: 1,
-            etag: etag1,
-            size: data.len() as u64,
-        },
-        crate::Part {
-            part_number: 2,
-            etag: etag2,
-            size: tail.len() as u64,
-        },
-    ];
-    store.complete_multipart(&key, &id, &parts).await.unwrap();
+/// `abort_pending_uploads` clears every in-flight multipart session at `key`,
+/// including those the engine has lost track of.
+#[tokio::test]
+async fn upload_session_abort_pending_removes_orphans() {
+    let store = backend();
+    let prefix = format!("up/abort/{}", Uuid::new_v4());
+    let key = format!("{prefix}/obj");
 
-    let fetched = store.get(&key).await.unwrap();
-    assert_eq!(fetched.len(), data.len() + tail.len());
-    assert_eq!(&fetched[..data.len()], data.as_slice());
-    assert_eq!(&fetched[data.len()..], tail);
+    // Manually start two multipart uploads at the same key so we have
+    // something to clean up.
+    store.client.create_multipart_upload(&key).await.unwrap();
+    store.client.create_multipart_upload(&key).await.unwrap();
+
+    store.abort_pending_uploads(&key).await.unwrap();
+
+    let (remaining, _, _) = store
+        .client
+        .list_multipart_uploads(Some(&key), None, None)
+        .await
+        .unwrap();
+    assert!(remaining.iter().all(|u| u.key != key));
+    store.delete_prefix(&prefix).await.unwrap();
 }
 
 #[tokio::test]
@@ -242,65 +408,4 @@ async fn presign_get_returns_a_url() {
         url.contains("blob/x") && url.contains("X-Amz-Signature"),
         "expected a SigV4 presigned URL, got: {url}",
     );
-}
-
-#[tokio::test]
-async fn search_multipart_upload_id_finds_active_upload() {
-    let store = backend();
-    let prefix = format!("search-mp/{}", Uuid::new_v4());
-    let key = format!("{prefix}/obj");
-
-    let created_id = store.create_multipart(&key).await.unwrap();
-    let found = store
-        .search_multipart_upload_id(&key)
-        .await
-        .unwrap()
-        .expect("upload we just created must be found");
-    assert_eq!(found, created_id);
-
-    // Clean up.
-    store.abort_multipart(&key, &created_id).await.unwrap();
-    store.delete_prefix(&prefix).await.unwrap();
-}
-
-#[tokio::test]
-async fn search_multipart_upload_id_returns_none_when_absent() {
-    let store = backend();
-    let key = format!("search-mp-absent/{}", Uuid::new_v4());
-    let result = store.search_multipart_upload_id(&key).await.unwrap();
-    assert!(result.is_none());
-}
-
-#[tokio::test]
-async fn abort_pending_uploads_removes_all_sessions() {
-    let store = backend();
-    let prefix = format!("abort-pending/{}", Uuid::new_v4());
-    let key = format!("{prefix}/obj");
-
-    // Create two upload sessions for the same key.
-    let id1 = store.create_multipart(&key).await.unwrap();
-    let id2 = store.create_multipart(&key).await.unwrap();
-    // Confirm both are visible.
-    assert!(
-        store
-            .search_multipart_upload_id(&key)
-            .await
-            .unwrap()
-            .is_some()
-    );
-
-    store.abort_pending_uploads(&key).await.unwrap();
-
-    // Neither session should remain.
-    assert!(
-        store
-            .search_multipart_upload_id(&key)
-            .await
-            .unwrap()
-            .is_none()
-    );
-    // Cleanup; ids are already aborted so ignore errors.
-    let _ = store.abort_multipart(&key, &id1).await;
-    let _ = store.abort_multipart(&key, &id2).await;
-    store.delete_prefix(&prefix).await.unwrap();
 }

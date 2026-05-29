@@ -17,7 +17,7 @@ use crate::{
     registry::{
         Error, HeaderMap, Registry, Repository, ResponseHeaders,
         blob_ownership::BlobOwnership,
-        blob_store::{BoxedReader, UploadStore},
+        blob_store::{BlobStore, BoxedReader},
         cache_job_handler::{CACHE_FETCH_BLOB_KIND, CACHE_QUEUE, CacheFetchBlobPayload},
         job_store::JobEnvelope,
         metadata_store::{MetadataStore, link_kind::LinkKind},
@@ -146,20 +146,23 @@ fn has_non_ownership_reference(links: &HashSet<LinkKind>, digest: &Digest) -> bo
 /// completed. A crash before the returned mutations are applied leaves these
 /// artifacts for scrub to reclaim.
 pub async fn cache_blob_mutations(
-    upload_store: Arc<dyn UploadStore>,
+    blob_store: Arc<BlobStore>,
     metadata_store: Arc<MetadataStore>,
     namespace: Namespace,
     digest: Digest,
     stream: BoxedReader,
+    content_length: u64,
 ) -> Result<(Vec<Read>, Vec<Mutation>), Error> {
     debug!("Fetching blob: {digest}");
     let session_id = Uuid::new_v4().to_string();
-    upload_store.create(namespace.as_ref(), &session_id).await?;
-    upload_store
-        .write(namespace.as_ref(), &session_id, stream, 0, false)
+    blob_store
+        .create_upload(namespace.as_ref(), &session_id)
         .await?;
-    let (_, mut mutations) = upload_store
-        .finalize_mutations(namespace.as_ref(), &session_id, Some(&digest))
+    blob_store
+        .write_upload(namespace.as_ref(), &session_id, stream, content_length)
+        .await?;
+    let (_, mut mutations) = blob_store
+        .finalize_upload_mutations(namespace.as_ref(), &session_id, Some(&digest))
         .await?;
     let (reads, mut grant_mutations) = metadata_store
         .build_grant_mutations(namespace.as_ref(), &digest)
@@ -174,18 +177,20 @@ pub async fn cache_blob_mutations(
 /// transaction; this wrapper exists for the rare non-handler caller (tests).
 #[cfg(test)]
 pub async fn cache_blob(
-    upload_store: Arc<dyn UploadStore>,
+    blob_store: Arc<BlobStore>,
     metadata_store: Arc<MetadataStore>,
     namespace: Namespace,
     digest: Digest,
     stream: BoxedReader,
+    content_length: u64,
 ) -> Result<(), Error> {
     let (reads, mutations) = cache_blob_mutations(
-        upload_store,
+        blob_store,
         metadata_store.clone(),
         namespace,
         digest.clone(),
         stream,
+        content_length,
     )
     .await?;
     metadata_store
@@ -403,8 +408,7 @@ impl Registry {
             && self.enable_blob_redirect
             && has_access
             && self.blob_store.size(digest).await.is_ok()
-            && let Some(presigned) = &self.presigned_blob_store
-            && let Ok(Some(presigned_url)) = presigned.url(digest, None).await
+            && let Ok(Some(presigned_url)) = self.blob_store.presigned_url(digest, None).await
         {
             return Ok(GetBlobResponse::Redirect {
                 headers: get_blob_redirect_headers(presigned_url, digest),
@@ -730,11 +734,12 @@ mod tests {
             let stream = Box::new(Cursor::new(content.to_vec()));
 
             cache_blob(
-                registry.upload_store.clone(),
+                registry.blob_store.clone(),
                 registry.metadata_store.clone(),
                 namespace.clone(),
                 digest.clone(),
                 stream,
+                content.len() as u64,
             )
             .await
             .unwrap();

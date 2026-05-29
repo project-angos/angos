@@ -12,22 +12,19 @@ use crate::{
     },
     oci::Digest,
     registry::{
-        blob_store::BlobStore,
+        blob_store,
         metadata_store::{MetadataStore, link_kind::LinkKind},
         parse_manifest_digests,
     },
 };
 
 pub struct ManifestChecker {
-    blob_store: Arc<dyn BlobStore + Send + Sync>,
+    blob_store: Arc<blob_store::BlobStore>,
     metadata_store: Arc<MetadataStore>,
 }
 
 impl ManifestChecker {
-    pub fn new(
-        blob_store: Arc<dyn BlobStore + Send + Sync>,
-        metadata_store: Arc<MetadataStore>,
-    ) -> Self {
+    pub fn new(blob_store: Arc<blob_store::BlobStore>, metadata_store: Arc<MetadataStore>) -> Self {
         Self {
             blob_store,
             metadata_store,
@@ -142,11 +139,7 @@ mod tests {
                 .await
                 .unwrap();
 
-            let mut executor = Executor::new(
-                blob_store.clone(),
-                metadata_store.clone(),
-                test_case.upload_store(),
-            );
+            let mut executor = Executor::new(blob_store.clone(), metadata_store.clone());
 
             let scrubber = ManifestChecker::new(blob_store.clone(), metadata_store.clone());
             scrubber.check(namespace, &mut executor).await.unwrap();
@@ -228,11 +221,7 @@ mod tests {
                 .await
                 .unwrap();
 
-            let mut executor = Executor::new(
-                blob_store.clone(),
-                metadata_store.clone(),
-                test_case.upload_store(),
-            );
+            let mut executor = Executor::new(blob_store.clone(), metadata_store.clone());
 
             let scrubber = ManifestChecker::new(blob_store.clone(), metadata_store.clone());
             scrubber.check(namespace, &mut executor).await.unwrap();

@@ -339,8 +339,8 @@ impl Registry {
     #[instrument(skip(self))]
     pub async fn get_uploads_info(&self, namespace: &Namespace) -> Result<JsonResponse, Error> {
         let uuids = collect_all_pages(|token| async move {
-            self.upload_store
-                .list(namespace, 1000, token)
+            self.blob_store
+                .list_uploads(namespace, 1000, token)
                 .await
                 .map_err(Error::from)
         })
@@ -348,7 +348,7 @@ impl Registry {
 
         let mut all_uploads = Vec::new();
         for uuid in uuids {
-            if let Ok(summary) = self.upload_store.summary(namespace, &uuid).await {
+            if let Ok(summary) = self.blob_store.upload_summary(namespace, &uuid).await {
                 all_uploads.push(UploadEntry {
                     uuid,
                     size: summary.size,
@@ -492,8 +492,8 @@ impl Registry {
 
     async fn count_uploads(&self, namespace: &Namespace) -> Result<usize, Error> {
         let uploads = collect_all_pages(|token| async move {
-            self.upload_store
-                .list(namespace, 1000, token)
+            self.blob_store
+                .list_uploads(namespace, 1000, token)
                 .await
                 .map_err(Error::from)
         })

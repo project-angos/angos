@@ -439,9 +439,9 @@ impl Registry {
             .await
             .ok()?;
         let media_type = link.media_type?;
-        let presigned = self.presigned_blob_store.as_ref()?;
-        let presigned_url = presigned
-            .url(&link.target, Some(media_type.as_str()))
+        let presigned_url = self
+            .blob_store
+            .presigned_url(&link.target, Some(media_type.as_str()))
             .await
             .ok()??;
 
@@ -491,9 +491,9 @@ impl Registry {
         // lacks media_type), fall back to redirecting after reading the full blob.
         // Remove this block once all links have been re-pushed.
         if self.enable_manifest_redirect
-            && let Some(presigned) = &self.presigned_blob_store
-            && let Ok(Some(presigned_url)) = presigned
-                .url(&manifest.digest, manifest.media_type.as_deref())
+            && let Ok(Some(presigned_url)) = self
+                .blob_store
+                .presigned_url(&manifest.digest, manifest.media_type.as_deref())
                 .await
         {
             return Ok(GetManifestResponse::Redirect {

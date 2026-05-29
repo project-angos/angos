@@ -49,18 +49,13 @@ impl FsRegistryFixture {
         let temp_dir = TempDir::new().expect("tempdir");
         let path = temp_dir.path().to_string_lossy().to_string();
 
-        let fs_config = blob_store::fs::BackendConfig {
-            root_dir: path.clone(),
-            sync_to_disk: false,
-        };
-        let executor = build_test_fs_executor(&fs_config.root_dir, fs_config.sync_to_disk);
         let blob_store = Arc::new(
-            blob_store::fs::Backend::builder()
-                .root_dir(&fs_config.root_dir)
-                .sync_to_disk(fs_config.sync_to_disk)
-                .executor(executor)
-                .build()
-                .unwrap(),
+            blob_store::BlobStoreConfig::FS(blob_store::FsBackendConfig {
+                root_dir: path.clone(),
+                sync_to_disk: false,
+            })
+            .build_backend()
+            .unwrap(),
         );
 
         let meta_executor = build_test_fs_executor(&path, false);
@@ -79,12 +74,7 @@ impl FsRegistryFixture {
                 .expect("fs metadata backend"),
         );
 
-        let registry = create_test_registry(
-            blob_store.clone(),
-            blob_store.clone(),
-            None,
-            metadata_store_backend,
-        );
+        let registry = create_test_registry(blob_store, metadata_store_backend);
 
         Self {
             registry,
@@ -118,8 +108,8 @@ fn build_dispatcher_for_server(server_uri: &str) -> EventDispatcher {
 async fn upload_blob(registry: &Registry, namespace: &Namespace, content: &[u8]) -> Digest {
     let session_id = Uuid::new_v4();
     registry
-        .upload_store
-        .create(namespace, &session_id.to_string())
+        .blob_store
+        .create_upload(namespace, &session_id.to_string())
         .await
         .unwrap();
 

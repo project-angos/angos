@@ -445,7 +445,7 @@ mod tests {
         oci::{Digest, Namespace},
         policy::{CelRule, RetentionPolicy, RetentionPolicyConfig, SystemClock},
         registry::{
-            blob_store::{BlobStore, UploadStore},
+            blob_store,
             metadata_store::LinkOperation,
             repository_resolver::RepositoryResolver,
             test_utils::{self, backends, put_blob_direct},
@@ -476,11 +476,10 @@ mod tests {
     }
 
     fn make_executor(
-        blob_store: Arc<dyn BlobStore + Send + Sync>,
+        blob_store: Arc<blob_store::BlobStore>,
         metadata_store: Arc<MetadataStore>,
-        upload_store: Arc<dyn UploadStore>,
     ) -> Executor {
-        Executor::new(blob_store, metadata_store, upload_store)
+        Executor::new(blob_store, metadata_store)
     }
 
     async fn setup_index_scenario(
@@ -657,11 +656,7 @@ mod tests {
             let scrubber =
                 RetentionChecker::new(metadata_store.clone(), resolver, Some(retention_policy));
 
-            let mut executor = make_executor(
-                test_case.blob_store(),
-                test_case.metadata_store(),
-                test_case.upload_store(),
-            );
+            let mut executor = make_executor(test_case.blob_store(), test_case.metadata_store());
             scrubber.check(namespace, &mut executor).await.unwrap();
 
             let tag_link = metadata_store
@@ -700,11 +695,7 @@ mod tests {
             );
             let scrubber = RetentionChecker::new(metadata_store.clone(), resolver, None);
 
-            let mut executor = make_executor(
-                test_case.blob_store(),
-                test_case.metadata_store(),
-                test_case.upload_store(),
-            );
+            let mut executor = make_executor(test_case.blob_store(), test_case.metadata_store());
             scrubber.check(namespace, &mut executor).await.unwrap();
 
             let tag_link = metadata_store
@@ -742,11 +733,7 @@ mod tests {
                 Arc::new(SystemClock),
             ));
 
-            let mut executor = make_executor(
-                test_case.blob_store(),
-                test_case.metadata_store(),
-                test_case.upload_store(),
-            );
+            let mut executor = make_executor(test_case.blob_store(), test_case.metadata_store());
             let resolver = Arc::new(
                 RepositoryResolver::new(test_utils::create_test_repositories())
                     .expect("test repositories must not have overlapping prefixes"),
@@ -785,11 +772,7 @@ mod tests {
                 .await
                 .unwrap();
 
-            let mut executor = make_executor(
-                test_case.blob_store(),
-                test_case.metadata_store(),
-                test_case.upload_store(),
-            );
+            let mut executor = make_executor(test_case.blob_store(), test_case.metadata_store());
             let resolver = Arc::new(
                 RepositoryResolver::new(test_utils::create_test_repositories())
                     .expect("test repositories must not have overlapping prefixes"),
@@ -827,11 +810,7 @@ mod tests {
                 Arc::new(SystemClock),
             ));
 
-            let mut executor = make_executor(
-                test_case.blob_store(),
-                test_case.metadata_store(),
-                test_case.upload_store(),
-            );
+            let mut executor = make_executor(test_case.blob_store(), test_case.metadata_store());
             let resolver = Arc::new(
                 RepositoryResolver::new(test_utils::create_test_repositories())
                     .expect("test repositories must not have overlapping prefixes"),
@@ -850,11 +829,7 @@ mod tests {
 
             teardown_index_scenario(&metadata_store, namespace, index_digest, &child_digest).await;
 
-            let mut executor2 = make_executor(
-                test_case.blob_store(),
-                test_case.metadata_store(),
-                test_case.upload_store(),
-            );
+            let mut executor2 = make_executor(test_case.blob_store(), test_case.metadata_store());
             let resolver2 = Arc::new(
                 RepositoryResolver::new(test_utils::create_test_repositories())
                     .expect("test repositories must not have overlapping prefixes"),
@@ -945,7 +920,7 @@ mod tests {
                 )
                 .await
                 .unwrap();
-            blob_store.delete(&digest_missing).await.unwrap();
+            blob_store.delete_blob(&digest_missing).await.unwrap();
 
             // Second revision: healthy manifest blob with a digest link.
             let digest_healthy = put_blob_direct(metadata_store.store(), TEST_INDEX).await;
@@ -967,11 +942,7 @@ mod tests {
                 Arc::new(SystemClock),
             ));
 
-            let mut executor = make_executor(
-                test_case.blob_store(),
-                test_case.metadata_store(),
-                test_case.upload_store(),
-            );
+            let mut executor = make_executor(test_case.blob_store(), test_case.metadata_store());
             let resolver = Arc::new(
                 RepositoryResolver::new(test_utils::create_test_repositories())
                     .expect("test repositories must not have overlapping prefixes"),

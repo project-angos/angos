@@ -31,7 +31,7 @@ use crate::{
     policy::AccessPolicyConfig,
     registry::{
         Registry, RegistryConfig, Repository,
-        blob_store::{BlobStorageConfig, fs::BackendConfig as BlobFsConfig},
+        blob_store::{BlobStoreConfig, FsBackendConfig as BlobFsConfig},
         metadata_store::{LinkOperation, MetadataStore, link_kind::LinkKind},
         repository_resolver::RepositoryResolver,
         s3_connection::S3ConnectionConfig,
@@ -132,7 +132,7 @@ fn create_minimal_config() -> Configuration {
 }
 
 pub async fn create_test_registry(config: &Configuration) -> Registry {
-    let blob_handles = config.blob_store.to_backend().unwrap();
+    let blob_backend = std::sync::Arc::new(config.blob_store.build_backend().unwrap());
     let auth_cache = config.cache.to_backend().unwrap();
     let storage_config = config.resolve_registry_storage();
     let handles = storage_config.to_handles().await.unwrap();
@@ -169,15 +169,7 @@ pub async fn create_test_registry(config: &Configuration) -> Registry {
         .global_immutable_tags(config.global.immutable_tags)
         .global_immutable_tags_exclusions(config.global.immutable_tags_exclusions.clone());
 
-    Registry::new(
-        blob_handles.blob,
-        blob_handles.upload,
-        blob_handles.presigned,
-        metadata_store,
-        resolver,
-        registry_config,
-    )
-    .unwrap()
+    Registry::new(blob_backend, metadata_store, resolver, registry_config).unwrap()
 }
 
 pub fn create_test_event() -> Event {
@@ -912,17 +904,17 @@ fn build_shutdown_flush_harness(unique_prefix: &str) -> ShutdownFlushHarness {
             .expect("s3 metadata backend"),
     );
 
-    let blob_handles = BlobStorageConfig::FS(BlobFsConfig {
-        root_dir: "/tmp/test-blobs-shutdown-flush".to_string(),
-        ..Default::default()
-    })
-    .to_backend()
-    .unwrap();
+    let blob_backend = Arc::new(
+        BlobStoreConfig::FS(BlobFsConfig {
+            root_dir: "/tmp/test-blobs-shutdown-flush".to_string(),
+            ..Default::default()
+        })
+        .build_backend()
+        .unwrap(),
+    );
 
     let registry = Registry::new(
-        blob_handles.blob,
-        blob_handles.upload,
-        blob_handles.presigned,
+        blob_backend,
         metadata_store.clone(),
         Arc::new(RepositoryResolver::new(Arc::new(HashMap::new())).unwrap()),
         RegistryConfig::default()

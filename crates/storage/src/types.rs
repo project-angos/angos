@@ -38,52 +38,6 @@ impl Display for Etag {
     }
 }
 
-/// Identifier for a multipart upload session (S3 `UploadId`). Opaque to
-/// consumers; only the backend that issued it can interpret it.
-#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct UploadId(String);
-
-impl UploadId {
-    pub fn new(value: impl Into<String>) -> Self {
-        Self(value.into())
-    }
-
-    #[must_use]
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-
-    #[must_use]
-    pub fn into_inner(self) -> String {
-        self.0
-    }
-}
-
-impl Display for UploadId {
-    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        Display::fmt(&self.0, f)
-    }
-}
-
-/// A single completed part of a multipart upload.
-///
-/// `part_number` is 1-based and dense within a single upload; gaps cause
-/// `complete_multipart` to fail.
-///
-/// The `etag` field accepts the legacy key `e_tag` on deserialisation (written
-/// by binaries before the `angos_s3_client::UploadedPart` → `angos_storage::Part`
-/// rename) so in-flight cache entries survive an upgrade without paying the
-/// `list_parts` re-discovery cost. On serialisation the canonical key `etag`
-/// is always written.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct Part {
-    pub part_number: u32,
-    #[serde(alias = "e_tag")]
-    pub etag: Etag,
-    pub size: u64,
-}
-
 /// Metadata for a single stored object, returned by `ObjectStore::head`.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ObjectMeta {
@@ -115,36 +69,13 @@ pub struct ChildrenPage {
     pub next_token: Option<String>,
 }
 
-/// Summary of one in-progress multipart upload, returned by
-/// `MultipartStore::list_multipart_uploads`.
-#[derive(Clone, Debug, PartialEq)]
-pub struct MultipartUpload {
-    pub key: String,
-    pub upload_id: UploadId,
-    pub initiated_at: DateTime<Utc>,
-}
-
-/// One page of results from `MultipartStore::list_multipart_uploads`.
-///
-/// S3 paginates multipart-upload listings with two markers (the next key and
-/// the next upload-id within that key); both must be passed back to the next
-/// call to resume. `None` on either marker means the listing is complete.
-#[derive(Clone, Debug, PartialEq)]
-pub struct MultipartPage {
-    pub uploads: Vec<MultipartUpload>,
-    pub next_key_marker: Option<String>,
-    pub next_upload_id_marker: Option<String>,
-}
-
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
 
     use chrono::{TimeZone, Utc};
 
-    use crate::types::{
-        ChildrenPage, Etag, MultipartPage, MultipartUpload, ObjectMeta, Page, Part, UploadId,
-    };
+    use crate::types::{ChildrenPage, Etag, ObjectMeta, Page};
 
     #[test]
     fn etag_round_trips_through_string() {
@@ -171,62 +102,6 @@ mod tests {
         map.insert(Etag::new("b"), 2);
         assert_eq!(map.get(&Etag::new("a")), Some(&1));
         assert_eq!(map.get(&Etag::new("c")), None);
-    }
-
-    #[test]
-    fn upload_id_serializes_transparently_as_string() {
-        let id = UploadId::new("upload-xyz");
-        let json = serde_json::to_string(&id).expect("serialize");
-        assert_eq!(json, "\"upload-xyz\"");
-        let round_trip: UploadId = serde_json::from_str(&json).expect("deserialize");
-        assert_eq!(round_trip, id);
-    }
-
-    #[test]
-    fn part_round_trips_through_json() {
-        let part = Part {
-            part_number: 7,
-            etag: Etag::new("\"part-etag\""),
-            size: 1024,
-        };
-        let json = serde_json::to_string(&part).expect("serialize");
-        let parsed: Part = serde_json::from_str(&json).expect("deserialize");
-        assert_eq!(parsed, part);
-    }
-
-    #[test]
-    fn part_deserializes_legacy_e_tag_key() {
-        // Legacy cache entries (written before the
-        // `angos_s3_client::UploadedPart` → `angos_storage::Part` rename) use
-        // the key `e_tag`. The `#[serde(alias = "e_tag")]` on `Part::etag`
-        // ensures those entries round-trip without triggering a `list_parts`
-        // re-discovery pass.
-        let legacy_json = r#"{"part_number": 1, "e_tag": "abc", "size": 5}"#;
-        let part: Part = serde_json::from_str(legacy_json).expect("deserialize legacy shape");
-        assert_eq!(part.etag.as_str(), "abc");
-        assert_eq!(part.part_number, 1);
-        assert_eq!(part.size, 5);
-    }
-
-    #[test]
-    fn part_serializes_with_canonical_etag_key() {
-        // Confirm that fresh writes use `etag`, not the legacy `e_tag`, so the
-        // new canonical key is what gets stored in the cache post-upgrade.
-        let part = Part {
-            part_number: 1,
-            etag: Etag::new("abc"),
-            size: 5,
-        };
-        let value = serde_json::to_value(&part).expect("serialize");
-        assert!(
-            value.get("etag").is_some(),
-            "expected canonical key `etag` in serialized output"
-        );
-        assert!(
-            value.get("e_tag").is_none(),
-            "legacy key `e_tag` must not appear in serialized output"
-        );
-        assert_eq!(value["etag"], "abc");
     }
 
     #[test]
@@ -262,22 +137,5 @@ mod tests {
         assert_eq!(page.sub_prefixes, vec!["sub/".to_string()]);
         assert_eq!(page.objects, vec!["leaf.json".to_string()]);
         assert!(page.next_token.is_none());
-    }
-
-    #[test]
-    fn multipart_page_carries_dual_markers() {
-        let when = Utc.timestamp_opt(1_700_000_000, 0).unwrap();
-        let page = MultipartPage {
-            uploads: vec![MultipartUpload {
-                key: "k".to_string(),
-                upload_id: UploadId::new("u"),
-                initiated_at: when,
-            }],
-            next_key_marker: Some("k2".to_string()),
-            next_upload_id_marker: Some("u2".to_string()),
-        };
-        assert_eq!(page.uploads.len(), 1);
-        assert_eq!(page.next_key_marker.as_deref(), Some("k2"));
-        assert_eq!(page.next_upload_id_marker.as_deref(), Some("u2"));
     }
 }

@@ -13,21 +13,18 @@ use crate::{
     },
     oci::Manifest,
     registry::{
-        blob_store::{self, BlobStore},
+        blob_store,
         metadata_store::{MetadataStore, link_kind::LinkKind},
     },
 };
 
 pub struct MediaTypeChecker {
-    blob_store: Arc<dyn BlobStore + Send + Sync>,
+    blob_store: Arc<blob_store::BlobStore>,
     metadata_store: Arc<MetadataStore>,
 }
 
 impl MediaTypeChecker {
-    pub fn new(
-        blob_store: Arc<dyn BlobStore + Send + Sync>,
-        metadata_store: Arc<MetadataStore>,
-    ) -> Self {
+    pub fn new(blob_store: Arc<blob_store::BlobStore>, metadata_store: Arc<MetadataStore>) -> Self {
         Self {
             blob_store,
             metadata_store,
@@ -229,11 +226,7 @@ mod tests {
                 .unwrap();
             assert!(digest_link.media_type.is_none());
 
-            let mut executor = Executor::new(
-                blob_store.clone(),
-                metadata_store.clone(),
-                test_case.upload_store(),
-            );
+            let mut executor = Executor::new(blob_store.clone(), metadata_store.clone());
 
             let checker = MediaTypeChecker::new(blob_store.clone(), metadata_store.clone());
             checker.check(namespace, &mut executor).await.unwrap();
@@ -429,14 +422,10 @@ mod tests {
                 .await
                 .unwrap();
 
-            blob_store.delete(&manifest_digest).await.unwrap();
+            blob_store.delete_blob(&manifest_digest).await.unwrap();
 
             let checker = MediaTypeChecker::new(blob_store.clone(), metadata_store.clone());
-            let mut executor = Executor::new(
-                blob_store.clone(),
-                metadata_store.clone(),
-                test_case.upload_store(),
-            );
+            let mut executor = Executor::new(blob_store.clone(), metadata_store.clone());
             checker.check(namespace, &mut executor).await.unwrap();
 
             assert!(
@@ -497,14 +486,10 @@ mod tests {
                 .await
                 .unwrap();
 
-            blob_store.delete(&manifest_digest).await.unwrap();
+            blob_store.delete_blob(&manifest_digest).await.unwrap();
 
             let checker = MediaTypeChecker::new(blob_store.clone(), metadata_store.clone());
-            let mut executor = Executor::new(
-                blob_store.clone(),
-                metadata_store.clone(),
-                test_case.upload_store(),
-            );
+            let mut executor = Executor::new(blob_store.clone(), metadata_store.clone());
             checker.check(namespace, &mut executor).await.unwrap();
 
             assert!(
@@ -566,7 +551,7 @@ mod tests {
                 .await
                 .unwrap();
 
-            blob_store.delete(&manifest_digest).await.unwrap();
+            blob_store.delete_blob(&manifest_digest).await.unwrap();
 
             let checker = MediaTypeChecker::new(blob_store.clone(), metadata_store.clone());
             let mut sink: Vec<Action> = Vec::new();
