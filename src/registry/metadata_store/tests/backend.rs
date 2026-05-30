@@ -5,6 +5,7 @@ use angos_storage::s3::Backend as StorageS3Backend;
 use angos_tx_engine::{
     executor::locked::LockedExecutor,
     lock::{primitive::Lock, storage::memory::MemoryLockStorage},
+    store::Store,
 };
 
 use super::{legacy_blob_index_with, put_legacy_index, test_config};
@@ -32,9 +33,15 @@ fn make_backend(storage: Arc<StorageS3Backend>) -> MetadataStore {
             .build()
             .unwrap(),
     );
+    let facade = Arc::new(
+        Store::builder()
+            .object(storage)
+            .executor(executor)
+            .build()
+            .unwrap(),
+    );
     MetadataStore::builder()
-        .store(storage)
-        .executor(executor)
+        .store(facade)
         .link_cache_ttl(0)
         .access_time_debounce_secs(0)
         .build()

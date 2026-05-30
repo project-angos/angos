@@ -344,6 +344,7 @@ mod tests {
         BoxedReader as StorageBoxedReader, ByteStream, ChildrenPage, Error as StorageError,
         ObjectMeta, ObjectStore, Page, UploadSession, UploadSessionStore,
     };
+    use angos_tx_engine::store::Store;
 
     use crate::{
         event_webhook::event::EventKind,
@@ -351,7 +352,6 @@ mod tests {
         registry::{
             DOCKER_CONTENT_DIGEST, DOCKER_UPLOAD_UUID, Error, StartUploadResponse,
             blob_ownership::BlobOwnership,
-            blob_store,
             blob_store::BlobStore,
             metadata_store::link_kind::LinkKind,
             path_builder,
@@ -376,10 +376,12 @@ mod tests {
         WriteUpload,
     }
 
-    /// Delegating [`Storage`] wrapper that injects a single failure at the
-    /// storage seam so upload fast-paths can be proven to avoid a given op.
+    /// Delegating storage wrapper that injects a single failure at the storage
+    /// seam so upload fast-paths can be proven to avoid a given op. Wraps an
+    /// `UploadSessionStore` (which is also an `ObjectStore`), so it can stand in
+    /// for both seams of the [`Store`] façade.
     struct FailingStorage {
-        inner: Arc<dyn blob_store::Storage>,
+        inner: Arc<dyn UploadSessionStore>,
         fail: FailOp,
     }
 
@@ -494,19 +496,33 @@ mod tests {
     }
 
     /// Rebuild `inner` with its storage seam wrapped so `fail` errors out,
-    /// reusing the same executor and FS-prune handle.
+    /// reusing the same upload backend and executor.
     fn failing_blob_store(inner: &Arc<BlobStore>, fail: FailOp) -> Arc<BlobStore> {
-        let store: Arc<dyn blob_store::Storage> = Arc::new(FailingStorage {
-            inner: inner.store.clone(),
+        let upload = inner
+            .store
+            .upload_store()
+            .expect("blob store always has an upload-session store")
+            .clone();
+        let failing = Arc::new(FailingStorage {
+            inner: upload,
             fail,
         });
-        let mut builder = BlobStore::builder()
-            .store(store)
-            .executor(inner.executor().clone());
-        if let Some(fs) = inner.fs_prune.clone() {
-            builder = builder.fs_prune(fs);
-        }
-        Arc::new(builder.build().expect("failing blob store"))
+        let object: Arc<dyn ObjectStore> = failing.clone();
+        let upload_store: Arc<dyn UploadSessionStore> = failing;
+        let facade = Arc::new(
+            Store::builder()
+                .object(object)
+                .upload(upload_store)
+                .executor(inner.store.executor().clone())
+                .build()
+                .expect("failing store façade"),
+        );
+        Arc::new(
+            BlobStore::builder()
+                .store(facade)
+                .build()
+                .expect("failing blob store"),
+        )
     }
 
     #[tokio::test]

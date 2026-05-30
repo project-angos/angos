@@ -1,11 +1,9 @@
 use std::{collections::HashMap, sync::Arc};
 
-use angos_storage::ObjectStore;
 use angos_tx_engine::{
-    ConditionalCapabilities,
-    executor::TransactionExecutor,
     janitor::{BodyJanitor, LockJanitor},
     recovery::RecoveryLoop,
+    store::Store,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -68,15 +66,13 @@ impl From<blob_store::Error> for Error {
 /// primitives the healthy path uses: recovery takes ownership of stale
 /// intents via the executor's lock and (on CAS deployments) replays with the
 /// executor's conditional store.
-pub fn spawn_engine_maintenance(
-    store: Arc<dyn ObjectStore>,
-    executor: &Arc<dyn TransactionExecutor>,
-    cancellation: CancellationToken,
-) {
+pub fn spawn_engine_maintenance(store: &Store, cancellation: CancellationToken) {
+    let object = store.object_store().clone();
+    let executor = store.executor();
     let lock = executor.lock();
     let conditional_store = executor.conditional_store();
 
-    let mut recovery_builder = RecoveryLoop::builder(store.clone())
+    let mut recovery_builder = RecoveryLoop::builder(object.clone())
         .lock(lock)
         .cancellation(cancellation.clone());
     if let Some(cs) = conditional_store.clone() {
@@ -85,13 +81,13 @@ pub fn spawn_engine_maintenance(
     tokio::spawn(recovery_builder.build().run());
 
     tokio::spawn(
-        BodyJanitor::builder(store.clone())
+        BodyJanitor::builder(object.clone())
             .cancellation(cancellation.clone())
             .build()
             .run(),
     );
 
-    let mut lock_janitor_builder = LockJanitor::builder(store).cancellation(cancellation);
+    let mut lock_janitor_builder = LockJanitor::builder(object).cancellation(cancellation);
     if let Some(cs) = conditional_store {
         lock_janitor_builder = lock_janitor_builder.conditional_store(cs);
     }
@@ -101,8 +97,8 @@ pub fn spawn_engine_maintenance(
 pub async fn metadata_store(
     config: &RegistryStorageConfig,
     auth_cache: &Arc<Cache>,
-) -> Result<(Arc<MetadataStore>, Option<ConditionalCapabilities>), Error> {
-    let handles = config.to_handles().await?;
+) -> Result<Arc<MetadataStore>, Error> {
+    let store = config.build_store().await?;
 
     let s3_ttl = if let RegistryStorageConfig::S3(s3_cfg) = config {
         (s3_cfg.link_cache_ttl, s3_cfg.access_time_debounce_secs)
@@ -111,8 +107,7 @@ pub async fn metadata_store(
     };
 
     let mut builder = MetadataStore::builder()
-        .store(handles.store)
-        .executor(handles.executor)
+        .store(store)
         .link_cache_ttl(s3_ttl.0)
         .access_time_debounce_secs(s3_ttl.1);
 
@@ -120,7 +115,7 @@ pub async fn metadata_store(
     // where link_cache_ttl > 0 by default).
     builder = builder.cache(auth_cache.clone());
 
-    Ok((Arc::new(builder.build()?), handles.capabilities))
+    Ok(Arc::new(builder.build()?))
 }
 
 pub fn auth_cache(config: &cache::Config) -> Result<Arc<Cache>, Error> {

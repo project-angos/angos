@@ -28,6 +28,7 @@ use angos_storage::{
 use angos_tx_engine::{
     executor::{TransactionExecutor, build_executor, locked::LockedExecutor},
     lock::{LockStrategy, primitive::Lock, storage::memory::MemoryLockStorage},
+    store::Store,
 };
 
 /// Build an in-process `LockedExecutor` suitable for unit tests.
@@ -51,6 +52,29 @@ pub fn build_test_fs_executor(root_dir: &str, sync_to_disk: bool) -> Arc<dyn Tra
             .lock(lock)
             .build()
             .expect("test executor"),
+    )
+}
+
+/// Wrap an object store + executor into a cache-less [`MetadataStore`] for
+/// tests (link cache and access-time debounce both disabled).
+fn metadata_store_over(
+    object: Arc<dyn ObjectStore>,
+    executor: Arc<dyn TransactionExecutor>,
+) -> Arc<MetadataStore> {
+    let facade = Arc::new(
+        Store::builder()
+            .object(object)
+            .executor(executor)
+            .build()
+            .expect("test store façade"),
+    );
+    Arc::new(
+        MetadataStore::builder()
+            .store(facade)
+            .link_cache_ttl(0)
+            .access_time_debounce_secs(0)
+            .build()
+            .expect("test metadata backend"),
     )
 }
 
@@ -109,7 +133,7 @@ pub fn create_test_registry(
 /// shortcut. Seeds blob bytes without invoking the upload state machine
 /// (no upload-session record, no namespace required) — which matches the
 /// legacy `BlobStore::create` semantics most closely.
-pub async fn put_blob_direct(store: &dyn ObjectStore, content: &[u8]) -> Digest {
+pub async fn put_blob_direct(store: &Store, content: &[u8]) -> Digest {
     let mut hasher = Sha256::new();
     hasher.update(content);
     let digest = hasher.digest();
@@ -208,13 +232,7 @@ impl FSRegistryTestCase {
                 .build()
                 .expect("fs metadata storage"),
         );
-        let metadata_store = Arc::new(
-            MetadataStore::builder()
-                .store(meta_storage)
-                .executor(meta_executor)
-                .build()
-                .expect("fs metadata backend"),
-        );
+        let metadata_store = metadata_store_over(meta_storage, meta_executor);
         let registry = create_test_registry(blob_store.clone(), metadata_store.clone());
 
         Self {
@@ -267,15 +285,17 @@ impl S3RegistryTestCase {
     pub fn new() -> Self {
         let key_prefix = format!("test-{}", Uuid::new_v4());
 
+        let connection = S3ConnectionConfig {
+            access_key_id: Secret::new("root".to_string()),
+            secret_key: Secret::new("roottoor".to_string()),
+            endpoint: "http://127.0.0.1:9000".to_string(),
+            region: "region".to_string(),
+            bucket: "registry".to_string(),
+            key_prefix: key_prefix.clone(),
+        };
+
         let s3_config = blob_store::S3BackendConfig {
-            connection: S3ConnectionConfig {
-                access_key_id: Secret::new("root".to_string()),
-                secret_key: Secret::new("roottoor".to_string()),
-                endpoint: "http://127.0.0.1:9000".to_string(),
-                region: "region".to_string(),
-                bucket: "registry".to_string(),
-                key_prefix: key_prefix.clone(),
-            },
+            connection: connection.clone(),
             transport: blob_store::TransportFields {
                 multipart_copy_threshold: ByteSize::mib(5),
                 multipart_copy_chunk_size: ByteSize::mib(5),
@@ -289,20 +309,11 @@ impl S3RegistryTestCase {
                 .expect("s3 blob backend"),
         );
 
-        let meta_connection = S3ConnectionConfig {
-            access_key_id: Secret::new("root".to_string()),
-            secret_key: Secret::new("roottoor".to_string()),
-            endpoint: "http://127.0.0.1:9000".to_string(),
-            region: "region".to_string(),
-            bucket: "registry".to_string(),
-            key_prefix: key_prefix.clone(),
-        };
-        let meta_http = Arc::new(
-            S3HttpBackend::new(&meta_connection.to_client_config()).expect("s3 http client"),
-        );
+        let meta_http =
+            Arc::new(S3HttpBackend::new(&connection.to_client_config()).expect("s3 http client"));
         let meta_raw_storage = Arc::new(
             StorageS3Backend::builder()
-                .client(meta_http.clone())
+                .client(meta_http)
                 .build()
                 .expect("s3 metadata storage"),
         );
@@ -317,15 +328,7 @@ impl S3RegistryTestCase {
             false,
         )
         .expect("s3 metadata executor");
-        let metadata_store = Arc::new(
-            MetadataStore::builder()
-                .store(meta_object_store)
-                .executor(meta_executor)
-                .link_cache_ttl(0)
-                .access_time_debounce_secs(0)
-                .build()
-                .expect("s3 metadata backend"),
-        );
+        let metadata_store = metadata_store_over(meta_object_store, meta_executor);
 
         let registry = create_test_registry(blob_store.clone(), metadata_store.clone());
 
@@ -334,19 +337,6 @@ impl S3RegistryTestCase {
             s3_blob_store: blob_store,
             s3_metadata_store: metadata_store,
             s3_registry: registry,
-        }
-    }
-}
-
-impl S3RegistryTestCase {
-    pub async fn cleanup(&self) {
-        if let Err(e) = self
-            .s3_blob_store
-            .store
-            .delete_prefix(&self.key_prefix)
-            .await
-        {
-            println!("Warning: Failed to clean up S3RegistryTestCase data: {e:?}");
         }
     }
 }
@@ -366,6 +356,13 @@ impl RegistryTestCase for S3RegistryTestCase {
     }
 
     async fn cleanup(&self) {
-        S3RegistryTestCase::cleanup(self).await;
+        if let Err(e) = self
+            .s3_blob_store
+            .store
+            .delete_prefix(&self.key_prefix)
+            .await
+        {
+            println!("Warning: Failed to clean up S3RegistryTestCase data: {e:?}");
+        }
     }
 }

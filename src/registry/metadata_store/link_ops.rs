@@ -13,10 +13,11 @@ use bytes::Bytes;
 use futures_util::future::join_all;
 use tracing::warn;
 
-use angos_storage::{Error as StorageError, ObjectStore};
 use angos_tx_engine::{
+    StorageError,
     error::Error as TxError,
     executor::{DEFAULT_RETRY_BUDGET, execute_with_retry_payload},
+    store::Store,
     transaction::{Mutation, Transaction, TransactionBuilder},
 };
 
@@ -91,7 +92,7 @@ pub fn tx_error_to_meta(err: TxError) -> Error {
 /// Routing: if a legacy `index.json` exists it is the write target; otherwise
 /// the per-namespace shard is used.
 pub async fn append_shard_for_digest(
-    store: &dyn ObjectStore,
+    store: &Store,
     namespace: &str,
     digest: &Digest,
     ops: &[BlobIndexOperation],
@@ -586,7 +587,7 @@ fn ops_for_digest<'a>(
 
 /// Check whether the shard for `namespace` will be empty after applying `ops`.
 async fn shard_will_be_empty(
-    store: &dyn ObjectStore,
+    store: &Store,
     namespace: &str,
     ops: &[BlobIndexOperation],
     shard_path: &str,
@@ -621,7 +622,7 @@ async fn shard_will_be_empty(
 /// Return `true` when any namespace other than `our_namespace` has a live
 /// shard entry in the refs directory.
 async fn any_other_namespace_references_blob(
-    store: &dyn ObjectStore,
+    store: &Store,
     our_namespace: &str,
     refs_prefix: &str,
 ) -> Result<bool, Error> {

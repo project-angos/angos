@@ -4,7 +4,7 @@ use sha2::digest::common::hazmat::DeserializeStateError;
 
 use crate::oci;
 use angos_s3_client as s3_client;
-use angos_storage::Error as StorageError;
+use angos_tx_engine::StorageError;
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Error {

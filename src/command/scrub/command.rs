@@ -67,7 +67,7 @@ impl Command {
     pub async fn new(options: &Options, config: &Configuration) -> Result<Self, Error> {
         let auth_cache = bootstrap::auth_cache(&config.cache)?;
         let blob_backend = std::sync::Arc::new(config.blob_store.build_backend()?);
-        let (metadata_store, _) =
+        let metadata_store =
             bootstrap::metadata_store(&config.resolve_registry_storage(), &auth_cache).await?;
         let repositories = bootstrap::repositories(
             &config.repository,

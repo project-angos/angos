@@ -79,6 +79,7 @@ mod tests {
     use angos_tx_engine::{
         executor::build_executor,
         lock::{LockSession, LockStrategy},
+        store::Store,
         transaction::Transaction,
     };
 
@@ -113,7 +114,14 @@ mod tests {
             false,
         )
         .expect("build executor");
-        Arc::new(JobStore::new(storage, executor, "test-worker"))
+        let facade = Arc::new(
+            Store::builder()
+                .object(storage)
+                .executor(executor)
+                .build()
+                .expect("store façade"),
+        );
+        Arc::new(JobStore::new(facade, "test-worker"))
     }
 
     #[tokio::test]

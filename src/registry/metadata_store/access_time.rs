@@ -12,11 +12,8 @@ use futures_util::stream::{self, StreamExt};
 use tokio::{spawn, sync::Mutex, time::sleep};
 use tracing::warn;
 
-use angos_storage::Error as StorageError;
 use angos_tx_engine::{
-    error::Error as TxError,
-    executor::{DEFAULT_RETRY_BUDGET, execute_with_retry},
-    transaction::{Mutation, Transaction},
+    error::Error as TxError, executor::DEFAULT_RETRY_BUDGET, transaction::Mutation,
 };
 
 use crate::registry::{
@@ -111,33 +108,35 @@ impl MetadataStore {
         link: &LinkKind,
     ) -> Result<(), Error> {
         let link_path = path_builder::link_path(link, namespace);
-        execute_with_retry(
-            self.executor(),
-            || async {
-                let data = match self.store().get(&link_path).await {
-                    Ok(d) => d,
-                    Err(StorageError::NotFound) => return Ok(Transaction::builder().build()),
-                    Err(e) => return Err(TxError::Storage(e)),
-                };
-                let raw = Bytes::from(data.clone());
-                let link_data = LinkMetadata::from_bytes(data)
-                    .map_err(|e| TxError::Build(e.to_string()))?
-                    .accessed();
-                let serialized =
-                    Bytes::from(serde_json::to_vec(&link_data).map_err(TxError::Serde)?);
-                Ok(Transaction::builder()
-                    .read(link_path.clone(), raw)
-                    .mutation(Mutation::Put {
-                        key: link_path.clone(),
-                        body: serialized,
-                        expected: None,
-                    })
-                    .build())
-            },
-            DEFAULT_RETRY_BUDGET,
-        )
-        .await
-        .map(|_| ())
-        .map_err(tx_error_to_meta)
+        let keys = [link_path.clone()];
+        self.store()
+            .update(
+                &keys,
+                |snaps| {
+                    let link_path = link_path.clone();
+                    async move {
+                        let snap = &snaps[0];
+                        // Link vanished: nothing to stamp. An empty mutation set
+                        // commits a no-op transaction.
+                        if !snap.present {
+                            return Ok(Vec::new());
+                        }
+                        let link_data = LinkMetadata::from_bytes(snap.body.to_vec())
+                            .map_err(|e| TxError::Build(e.to_string()))?
+                            .accessed();
+                        let serialized =
+                            Bytes::from(serde_json::to_vec(&link_data).map_err(TxError::Serde)?);
+                        Ok(vec![Mutation::Put {
+                            key: link_path,
+                            body: serialized,
+                            expected: None,
+                        }])
+                    }
+                },
+                DEFAULT_RETRY_BUDGET,
+            )
+            .await
+            .map(|_| ())
+            .map_err(tx_error_to_meta)
     }
 }

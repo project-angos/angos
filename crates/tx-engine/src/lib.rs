@@ -21,7 +21,16 @@ pub mod janitor;
 pub mod lock;
 pub mod probe;
 pub mod recovery;
+pub mod store;
 pub mod transaction;
+
+// Storage value types re-exported so subsystems depend on `tx-engine` alone
+// and never import `angos_storage` directly. The `Store` façade in
+// [`store`] is the seam through which all storage access flows.
+pub use angos_storage::{
+    BoxedReader, ByteStream, ChildrenPage, Error as StorageError, Etag, ObjectMeta, Page,
+    UploadSession,
+};
 
 /// Granular S3 conditional operation capabilities.
 ///

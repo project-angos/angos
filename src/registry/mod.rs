@@ -67,6 +67,7 @@ use angos_storage::{MemoryObjectStore, ObjectStore};
 use angos_tx_engine::{
     executor::build_executor,
     lock::{LockSession, LockStrategy},
+    store::Store,
 };
 
 #[allow(clippy::struct_excessive_bools)]
@@ -295,7 +296,14 @@ fn build_in_process_queue(
     )
     .map_err(|e| Error::Internal(format!("failed to build in-process job executor: {e}")))?;
 
-    let job_store: Arc<JobStore> = Arc::new(JobStore::new(object_store, executor, "in-process"));
+    let store = Arc::new(
+        Store::builder()
+            .object(object_store)
+            .executor(executor)
+            .build()
+            .map_err(|e| Error::Internal(format!("failed to build in-process job store: {e}")))?,
+    );
+    let job_store: Arc<JobStore> = Arc::new(JobStore::new(store, "in-process"));
 
     let handler: Arc<dyn JobHandler> = Arc::new(CacheJobHandler::new(
         resolver.clone(),

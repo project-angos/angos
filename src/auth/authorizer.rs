@@ -786,14 +786,8 @@ mod tests {
         let blob_backend = std::sync::Arc::new(config.blob_store.build_backend().unwrap());
         let auth_cache = config.cache.to_backend().unwrap();
         let storage_config = config.resolve_registry_storage();
-        let handles = storage_config.to_handles().await.unwrap();
-        let metadata_store = Arc::new(
-            MetadataStore::builder()
-                .store(handles.store)
-                .executor(handles.executor)
-                .build()
-                .unwrap(),
-        );
+        let handles = storage_config.build_store().await.unwrap();
+        let metadata_store = Arc::new(MetadataStore::builder().store(handles).build().unwrap());
 
         let mut repositories_map = HashMap::new();
         for (name, repo_config) in &config.repository {

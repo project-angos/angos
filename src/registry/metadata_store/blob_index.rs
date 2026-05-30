@@ -3,9 +3,10 @@
 use std::collections::{HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
+use tracing::instrument;
 
-use angos_storage::Error as StorageError;
 use angos_tx_engine::{
+    StorageError,
     error::Error as TxError,
     executor::{DEFAULT_RETRY_BUDGET, execute_with_retry},
     transaction::{Mutation, Read, Transaction},
@@ -38,24 +39,31 @@ pub enum BlobIndexOperation {
 impl MetadataStore {
     /// Update the blob-index shard for `digest` in `namespace`.
     ///
-    /// Reads the current shard state, applies `operations`, and submits a
+    /// Reads the current shard state, applies `operation`, and submits a
     /// `Transaction` through the stored executor. Retries on `Conflict` or
     /// `Precondition` up to [`DEFAULT_RETRY_BUDGET`] times.
-    pub async fn update_blob_index_batch(
+    #[instrument(skip(self))]
+    pub async fn update_blob_index(
         &self,
         namespace: &str,
         digest: &Digest,
-        operations: &[BlobIndexOperation],
+        operation: BlobIndexOperation,
     ) -> Result<(), Error> {
+        let operations = [operation];
         execute_with_retry(
             self.executor(),
             || async {
                 let store = self.store_arc();
                 let builder = Transaction::builder();
-                let builder =
-                    append_shard_for_digest(store.as_ref(), namespace, digest, operations, builder)
-                        .await
-                        .map_err(|e| TxError::Storage(StorageError::Backend(e.to_string())))?;
+                let builder = append_shard_for_digest(
+                    store.as_ref(),
+                    namespace,
+                    digest,
+                    &operations,
+                    builder,
+                )
+                .await
+                .map_err(|e| TxError::Storage(StorageError::Backend(e.to_string())))?;
                 Ok(builder.build())
             },
             DEFAULT_RETRY_BUDGET,
@@ -71,7 +79,7 @@ impl MetadataStore {
     /// The caller embeds these in a larger transaction (typically the cache
     /// job handler merging the grant with the upload promotion and queue
     /// cleanup). On `Conflict` the caller propagates the error; in-place CAS
-    /// retry is the responsibility of [`Self::update_blob_index_batch`].
+    /// retry is the responsibility of [`Self::update_blob_index`].
     pub async fn build_grant_mutations(
         &self,
         namespace: &str,

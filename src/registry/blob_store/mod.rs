@@ -1,13 +1,14 @@
 //! Blob storage subsystem.
 //!
 //! Exposes a single unified [`BlobStore`] struct that carries an
-//! `Arc<dyn Storage>` (any [`ObjectStore`] + [`UploadSessionStore`]) plus
-//! an optional `Arc<dyn PresignedStore>` for presigning, an optional typed
-//! `Arc<StorageFsBackend>` for FS-specific tidy-up (empty-ancestor pruning),
-//! and the transaction executor used by the upload-session commit step. FS
-//! and S3 are wired through the same code path; the [`BlobStoreConfig`] enum
-//! only picks the underlying storage handles. All public methods live as
-//! inherent methods on `BlobStore` — no caller-facing trait split.
+//! `Arc<Store>` storage façade. The façade bundles the object store, the
+//! upload-session store (resumable streaming uploads + finalization), the
+//! optional presign backend, the optional FS-prune backend, and the
+//! transaction executor used by the upload-promotion transaction. FS and S3
+//! are wired through the same code path; the [`BlobStoreConfig`] enum only
+//! picks the underlying storage handles the façade is built from. All public
+//! methods live as inherent methods on `BlobStore` — no caller-facing trait
+//! split.
 
 mod config;
 mod error;
@@ -25,12 +26,8 @@ use chrono::{DateTime, Utc};
 use tokio::io::AsyncRead;
 use tracing::{debug, instrument};
 
-use angos_storage::{
-    Error as StorageError, ObjectStore, PresignedStore, fs::Backend as StorageFsBackend,
-};
-use angos_tx_engine::executor::TransactionExecutor;
+use angos_tx_engine::{StorageError, store::Store};
 
-pub use angos_storage::UploadSessionStore;
 pub use config::BlobStoreConfig;
 // Inner config structs are only constructed by tests; production code builds
 // backends through `BlobStoreConfig`. Re-export them for test builds only.
@@ -52,21 +49,13 @@ pub struct UploadSummary {
     pub started_at: DateTime<Utc>,
 }
 
-/// Combined supertrait every storage backend handed to [`BlobStore`] must
-/// satisfy: `ObjectStore` for the floor surface, `UploadSessionStore` for
-/// resumable streaming uploads.
-pub trait Storage: ObjectStore + UploadSessionStore + Send + Sync {}
-impl<T: ObjectStore + UploadSessionStore + Send + Sync + ?Sized> Storage for T {}
-
 #[derive(Clone)]
 pub struct BlobStore {
-    pub store: Arc<dyn Storage>,
-    pub presign: Option<Arc<dyn PresignedStore>>,
-    /// Typed FS handle used solely for `prune_empty_ancestors` on
-    /// upload-session complete/abort. `None` when the underlying storage
-    /// is not FS — pruning is meaningless on S3.
-    pub fs_prune: Option<Arc<StorageFsBackend>>,
-    executor: Arc<dyn TransactionExecutor>,
+    /// Storage façade: object reads/writes, the upload lifecycle (including
+    /// finalization), presigning, and FS-ancestor pruning all flow through
+    /// here. The façade owns the executor used by the upload-promotion
+    /// transaction.
+    pub store: Arc<Store>,
 }
 
 impl Debug for BlobStore {
@@ -79,46 +68,19 @@ impl BlobStore {
     pub fn builder() -> BlobStoreBuilder {
         BlobStoreBuilder::default()
     }
-
-    pub fn executor(&self) -> &Arc<dyn TransactionExecutor> {
-        &self.executor
-    }
 }
 
 #[derive(Default)]
 pub struct BlobStoreBuilder {
-    store: Option<Arc<dyn Storage>>,
-    presign: Option<Arc<dyn PresignedStore>>,
-    fs_prune: Option<Arc<StorageFsBackend>>,
-    executor: Option<Arc<dyn TransactionExecutor>>,
+    store: Option<Arc<Store>>,
 }
 
 impl BlobStoreBuilder {
+    /// Set the storage façade (required). Build it with the upload-session
+    /// store enabled (and, where applicable, presign and FS-prune backends).
     #[must_use]
-    pub fn store(mut self, store: Arc<dyn Storage>) -> Self {
+    pub fn store(mut self, store: Arc<Store>) -> Self {
         self.store = Some(store);
-        self
-    }
-
-    #[must_use]
-    pub fn presign(mut self, presign: Arc<dyn PresignedStore>) -> Self {
-        self.presign = Some(presign);
-        self
-    }
-
-    /// Typed FS storage backend. Set this when the storage is FS so the
-    /// blob-store can call `prune_empty_ancestors` after upload-session
-    /// complete/abort. Leave unset for S3 or any other backend that
-    /// has no directory concept.
-    #[must_use]
-    pub fn fs_prune(mut self, fs: Arc<StorageFsBackend>) -> Self {
-        self.fs_prune = Some(fs);
-        self
-    }
-
-    #[must_use]
-    pub fn executor(mut self, executor: Arc<dyn TransactionExecutor>) -> Self {
-        self.executor = Some(executor);
         self
     }
 
@@ -126,15 +88,7 @@ impl BlobStoreBuilder {
         let store = self
             .store
             .ok_or_else(|| Error::StorageBackend("blob_store builder requires a store".into()))?;
-        let executor = self.executor.ok_or_else(|| {
-            Error::StorageBackend("blob_store builder requires an executor".into())
-        })?;
-        Ok(BlobStore {
-            store,
-            presign: self.presign,
-            fs_prune: self.fs_prune,
-            executor,
-        })
+        Ok(BlobStore { store })
     }
 }
 
@@ -218,9 +172,7 @@ impl BlobStore {
     pub async fn delete_blob(&self, digest: &Digest) -> Result<(), Error> {
         let container = path_builder::blob_container_dir(digest);
         self.store.delete_prefix(&container).await?;
-        if let Some(fs) = &self.fs_prune {
-            fs.prune_empty_ancestors(&container, 2).await;
-        }
+        self.store.prune_empty_ancestors(&container, 2).await;
         Ok(())
     }
 }
@@ -237,14 +189,12 @@ impl BlobStore {
         digest: &Digest,
         content_type: Option<&str>,
     ) -> Result<Option<String>, Error> {
-        let Some(presign) = &self.presign else {
-            return Ok(None);
-        };
         let path = path_builder::blob_path(digest);
-        let url = presign
-            .presign_get(&path, Duration::from_mins(30), content_type)
+        let url = self
+            .store
+            .presigned_get(&path, Duration::from_mins(30), content_type)
             .await?;
-        Ok(Some(url))
+        Ok(url)
     }
 }
 

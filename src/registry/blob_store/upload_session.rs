@@ -27,8 +27,7 @@ use tokio::io::AsyncRead;
 use tracing::instrument;
 use uuid::Uuid;
 
-use angos_storage::{Error as StorageError, UploadSession};
-use angos_tx_engine::transaction::{Mutation, Transaction};
+use angos_tx_engine::{StorageError, UploadSession, transaction::Mutation};
 
 use crate::{
     oci::Digest,
@@ -237,6 +236,10 @@ impl BlobStore {
 
     /// Finish the upload and atomically relocate the data to the canonical
     /// blob path while deleting the session record.
+    ///
+    /// Delegates the two-phase finalization (backend completion + the
+    /// promoting `Move`+`Delete` transaction) to the engine's
+    /// [`Store::finalize_upload`](angos_tx_engine::store::Store::finalize_upload).
     #[instrument(skip(self))]
     pub async fn complete_upload(
         &self,
@@ -244,15 +247,14 @@ impl BlobStore {
         uuid: &str,
         digest: Option<&Digest>,
     ) -> Result<Digest, Error> {
-        let (final_digest, mutations) = self
-            .finalize_upload_mutations(namespace, uuid, digest)
-            .await?;
-        let mut builder = Transaction::builder();
-        for m in mutations {
-            builder = builder.mutation(m);
-        }
-        self.executor()
-            .execute(builder.build())
+        let record = self.read_session(namespace, uuid).await?;
+        let final_digest = resolve_digest(&record, digest)?;
+        let staging_key = path_builder::upload_patch_pending_path(namespace, uuid);
+        let session_key = path_builder::upload_session_path(namespace, uuid);
+        let blob_key = path_builder::blob_path(&final_digest);
+
+        self.store
+            .finalize_upload(record.session, &staging_key, &blob_key, &session_key)
             .await
             .map_err(|e| Error::StorageBackend(e.to_string()))?;
 
@@ -260,9 +262,7 @@ impl BlobStore {
         // because failure here does not affect correctness.
         let container = path_builder::upload_container_path(namespace, uuid);
         let _ = self.store.delete_prefix(&container).await;
-        if let Some(fs) = &self.fs_prune {
-            fs.prune_empty_ancestors(&container, 2).await;
-        }
+        self.store.prune_empty_ancestors(&container, 2).await;
         Ok(final_digest)
     }
 
@@ -284,9 +284,7 @@ impl BlobStore {
         }
         let container = path_builder::upload_container_path(namespace, uuid);
         self.store.delete_prefix(&container).await?;
-        if let Some(fs) = &self.fs_prune {
-            fs.prune_empty_ancestors(&container, 2).await;
-        }
+        self.store.prune_empty_ancestors(&container, 2).await;
         Ok(())
     }
 }

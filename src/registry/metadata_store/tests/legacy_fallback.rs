@@ -13,7 +13,7 @@ use crate::{
         path_builder,
     },
 };
-use angos_storage::Error as StorageError;
+use angos_tx_engine::StorageError;
 
 fn cas_test_backend(config: &TestS3Config) -> crate::registry::metadata_store::MetadataStore {
     let mut cfg = config.clone();

@@ -9,6 +9,7 @@ use angos_storage::{MemoryObjectStore, ObjectStore, fs::Backend as StorageFsBack
 use angos_tx_engine::{
     executor::locked::LockedExecutor,
     lock::{primitive::Lock, storage::memory::MemoryLockStorage},
+    store::Store,
     transaction::Transaction,
 };
 
@@ -57,7 +58,14 @@ fn build_harness(raw: Arc<dyn ObjectStore>) -> Harness {
             .build()
             .expect("executor"),
     );
-    let store = Arc::new(JobStore::new(raw.clone(), executor, "test-worker"));
+    let facade = Arc::new(
+        Store::builder()
+            .object(raw.clone())
+            .executor(executor)
+            .build()
+            .expect("store façade"),
+    );
+    let store = Arc::new(JobStore::new(facade, "test-worker"));
     Harness { store, raw }
 }
 

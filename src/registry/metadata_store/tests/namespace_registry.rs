@@ -1,6 +1,6 @@
 use bytes::Bytes;
 
-use angos_storage::Error as StorageError;
+use angos_tx_engine::StorageError;
 
 use super::test_config;
 use crate::registry::metadata_store::sharded::NamespaceRegistry;

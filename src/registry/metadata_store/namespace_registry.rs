@@ -2,9 +2,8 @@ use bytes::Bytes;
 use futures_util::stream::{self, StreamExt};
 use tracing::warn;
 
-use angos_storage::Error as StorageError;
-
 use angos_tx_engine::{
+    StorageError,
     error::Error as TxError,
     executor::{DEFAULT_RETRY_BUDGET, execute_with_retry},
     transaction::{Mutation, Transaction},

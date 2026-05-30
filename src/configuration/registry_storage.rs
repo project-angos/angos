@@ -14,6 +14,7 @@ use angos_tx_engine::{
         LockStrategy, resolve_lock_strategy, storage::redis::RedisLockStorageConfig as LockConfig,
     },
     probe::probe_conditional_capabilities,
+    store::Store,
 };
 
 use crate::registry::{blob_store, s3_connection::S3ConnectionConfig};
@@ -25,7 +26,7 @@ use crate::registry::{blob_store, s3_connection::S3ConnectionConfig};
 /// [`RegistryStorageConfig`].
 ///
 /// This is intentionally narrower than the metadata-store error type:
-/// `RegistryStorageConfig::to_handles` and `RegistryStorageConfig::probe`
+/// `RegistryStorageConfig::build_store` and `RegistryStorageConfig::probe`
 /// don't perform any metadata-store-specific work, so they don't borrow
 /// that subsystem's error vocabulary.
 #[derive(Debug, thiserror::Error)]
@@ -181,30 +182,10 @@ fn default_access_time_debounce() -> u64 {
 
 // ── RegistryStorageConfig ─────────────────────────────────────────────────────
 
-/// Shared storage handles built once at startup and consumed by both the
-/// metadata store and the job store.
-///
-/// Fields:
-/// - `store`: backing `ObjectStore` used for reads, lists, heads, and
-///   uncoordinated writes.
-/// - `executor`: the transactional executor wired into both subsystems.
-///   Callers that need the underlying lock or conditional store (for example,
-///   to wire the recovery loop and lock janitor) fetch them through
-///   [`TransactionExecutor::lock`](angos_tx_engine::executor::TransactionExecutor::lock)
-///   and
-///   [`TransactionExecutor::conditional_store`](angos_tx_engine::executor::TransactionExecutor::conditional_store).
-/// - `capabilities`: detected or declared S3 conditional-write capabilities;
-///   `None` for FS backends.
-pub struct StorageHandles {
-    pub store: Arc<dyn ObjectStore>,
-    pub executor: Arc<dyn TransactionExecutor>,
-    pub capabilities: Option<ConditionalCapabilities>,
-}
-
 /// Unified storage configuration for both the metadata store and the job store.
 ///
 /// Both subsystems share the same `ObjectStore` and `TransactionExecutor` pair
-/// built once at startup via [`RegistryStorageConfig::to_handles`].
+/// built once at startup via [`RegistryStorageConfig::build_store`].
 ///
 /// The operator-facing TOML key remains `[metadata_store]` (with `.fs` or
 /// `.s3` sub-tables). The `Inherit` variant is the default and resolves to
@@ -215,7 +196,7 @@ pub enum RegistryStorageConfig {
     /// Inherit blob-store credentials and root path.
     ///
     /// Resolved via [`crate::configuration::Configuration::resolve_registry_storage`]
-    /// before reaching [`RegistryStorageConfig::to_handles`] or
+    /// before reaching [`RegistryStorageConfig::build_store`] or
     /// [`RegistryStorageConfig::probe`].
     /// Reaching either method with this variant is a programming error.
     #[default]
@@ -278,19 +259,24 @@ impl RegistryStorageConfig {
         }
     }
 
-    /// Build the shared storage handles used by both the metadata store and the
-    /// job store.
+    /// Build the [`Store`] façade shared by the metadata store, the job store,
+    /// and the engine-maintenance loops.
     ///
-    /// Returns a [`StorageHandles`] bundle. See its docs for the role of each
-    /// field.
+    /// For S3 without operator-declared capabilities this probes the endpoint
+    /// to configure the executor. Server callers that want to memoize the probe
+    /// across hot-reloads should resolve capabilities up front (see
+    /// `setup::build_metadata_store`) and inject them into the config so this
+    /// path skips the probe.
     #[allow(clippy::too_many_lines)]
-    pub async fn to_handles(&self) -> Result<StorageHandles, Error> {
-        match self {
-            RegistryStorageConfig::Inherit => Err(Error::Coordination(
-                "RegistryStorageConfig::Inherit reached to_handles(); callers must \
-                 resolve via Configuration::resolve_registry_storage first"
-                    .to_string(),
-            )),
+    pub async fn build_store(&self) -> Result<Arc<Store>, Error> {
+        let (object, executor): (Arc<dyn ObjectStore>, Arc<dyn TransactionExecutor>) = match self {
+            RegistryStorageConfig::Inherit => {
+                return Err(Error::Coordination(
+                    "RegistryStorageConfig::Inherit reached build_store(); callers must \
+                     resolve via Configuration::resolve_registry_storage first"
+                        .to_string(),
+                ));
+            }
             RegistryStorageConfig::FS(config) => {
                 if matches!(config.lock_strategy, LockStrategy::S3(_)) {
                     return Err(Error::Coordination(
@@ -301,14 +287,14 @@ impl RegistryStorageConfig {
                     "Using filesystem storage backend with lock_strategy={:?}",
                     config.lock_strategy
                 );
-                let store: Arc<dyn ObjectStore> = Arc::new(
+                let object: Arc<dyn ObjectStore> = Arc::new(
                     StorageFsBackend::builder()
                         .root_dir(&config.root_dir)
                         .sync_to_disk(config.sync_to_disk)
                         .build()?,
                 );
                 let executor = build_executor(
-                    store.clone(),
+                    object.clone(),
                     None,
                     config.lock_strategy.clone(),
                     None,
@@ -316,11 +302,7 @@ impl RegistryStorageConfig {
                     false,
                 )
                 .map_err(|e| Error::Coordination(e.to_string()))?;
-                Ok(StorageHandles {
-                    store,
-                    executor,
-                    capabilities: None,
-                })
+                (object, executor)
             }
             RegistryStorageConfig::S3(config) => {
                 info!(
@@ -344,11 +326,11 @@ impl RegistryStorageConfig {
                     None => self.probe().await?,
                 };
 
-                let caps_resolved = caps.clone().unwrap_or_default();
+                let caps_resolved = caps.unwrap_or_default();
 
                 let http = S3HttpBackend::new(&config.connection.to_client_config())?;
                 let backend = Arc::new(StorageS3Backend::builder().client(Arc::new(http)).build()?);
-                let store: Arc<dyn ObjectStore> = backend.clone();
+                let object: Arc<dyn ObjectStore> = backend.clone();
                 let conditional_store: Arc<dyn ConditionalStore> = backend;
 
                 let s3_lock_client = match &config.lock_strategy {
@@ -376,7 +358,7 @@ impl RegistryStorageConfig {
                 };
 
                 let executor = build_executor(
-                    store.clone(),
+                    object.clone(),
                     Some(conditional_store),
                     config.lock_strategy.clone(),
                     s3_lock_client,
@@ -385,13 +367,17 @@ impl RegistryStorageConfig {
                 )
                 .map_err(|e| Error::Coordination(e.to_string()))?;
 
-                Ok(StorageHandles {
-                    store,
-                    executor,
-                    capabilities: caps,
-                })
+                (object, executor)
             }
-        }
+        };
+
+        Ok(Arc::new(
+            Store::builder()
+                .object(object)
+                .executor(executor)
+                .build()
+                .map_err(|e| Error::Coordination(e.to_string()))?,
+        ))
     }
 }
 

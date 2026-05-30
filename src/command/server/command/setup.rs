@@ -29,26 +29,33 @@ pub async fn build_metadata_store(
 ) -> Result<Arc<MetadataStore>, Error> {
     let mut storage_config = config.resolve_registry_storage();
 
-    if let RegistryStorageConfig::S3(ref mut backend_config) = storage_config
-        && backend_config.capabilities.is_none()
-    {
-        let guard = cached_capabilities
+    // Resolve S3 conditional-write capabilities once and memoize them so a
+    // config hot-reload rebuilds the metadata store without re-probing the
+    // endpoint. Operator-declared capabilities skip this entirely. Injecting
+    // the resolved value into the config means `build_store` won't re-probe.
+    if matches!(&storage_config, RegistryStorageConfig::S3(b) if b.capabilities.is_none()) {
+        let cached = cached_capabilities
             .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        if guard.is_some() {
-            backend_config.capabilities.clone_from(&guard);
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        let caps = if let Some(caps) = cached {
+            caps
+        } else {
+            let probed = storage_config.probe().await.map_err(Error::from)?;
+            let resolved = probed.unwrap_or_default();
+            *cached_capabilities
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner) = Some(resolved.clone());
+            resolved
+        };
+        if let RegistryStorageConfig::S3(ref mut backend_config) = storage_config {
+            backend_config.capabilities = Some(caps);
         }
     }
 
-    let (store, caps) = bootstrap::metadata_store(&storage_config, cache)
+    bootstrap::metadata_store(&storage_config, cache)
         .await
-        .map_err(Error::from)?;
-
-    *cached_capabilities
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner) = caps;
-
-    Ok(store)
+        .map_err(Error::from)
 }
 
 /// Build the runtime `Registry`. When `[global.job_queue]` selects a durable
@@ -91,18 +98,14 @@ pub async fn build_registry(
     // store the metadata/job paths use.
     let storage_config = config.resolve_registry_storage();
     let maintenance_handles = if engine_maintenance.is_some() || config.global.job_queue.is_some() {
-        Some(storage_config.to_handles().await?)
+        Some(storage_config.build_store().await?)
     } else {
         None
     };
 
     let pending = if let Some(jq_config) = &config.global.job_queue {
         if let Some(handles) = maintenance_handles.as_ref() {
-            let job_store: Arc<JobStore> = Arc::new(JobStore::new(
-                handles.store.clone(),
-                handles.executor.clone(),
-                "server",
-            ));
+            let job_store: Arc<JobStore> = Arc::new(JobStore::new(handles.clone(), "server"));
             registry_config = registry_config.job_queue(job_store.clone());
             Some(PendingGaugeRefresh {
                 store: job_store,
@@ -117,7 +120,7 @@ pub async fn build_registry(
     };
 
     if let (Some(token), Some(handles)) = (engine_maintenance, maintenance_handles) {
-        bootstrap::spawn_engine_maintenance(handles.store, &handles.executor, token);
+        bootstrap::spawn_engine_maintenance(&handles, token);
     }
 
     let registry = Registry::new(blob_backend, metadata_store, repositories, registry_config)

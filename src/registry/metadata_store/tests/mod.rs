@@ -15,7 +15,9 @@ use chrono::{Duration, Utc};
 
 use angos_s3_client::Backend as S3HttpBackend;
 use angos_storage::{ConditionalStore, ObjectStore, s3::Backend as StorageS3Backend};
-use angos_tx_engine::{ConditionalCapabilities, executor::build_executor, lock::LockStrategy};
+use angos_tx_engine::{
+    ConditionalCapabilities, executor::build_executor, lock::LockStrategy, store::Store,
+};
 
 use crate::{
     cache::Cache,
@@ -47,19 +49,16 @@ impl TestS3Config {
         &self,
         conditional: Option<ConditionalCapabilities>,
         cache: Option<Arc<Cache>>,
-    ) -> Result<MetadataStore, crate::registry::metadata_store::Error> {
+    ) -> Result<MetadataStore, Error> {
         let http = Arc::new(
-            S3HttpBackend::new(&self.connection.to_client_config()).map_err(|e| {
-                crate::registry::metadata_store::Error::StorageBackend(e.to_string())
-            })?,
+            S3HttpBackend::new(&self.connection.to_client_config())
+                .map_err(|e| Error::StorageBackend(e.to_string()))?,
         );
         let raw_storage = Arc::new(
             StorageS3Backend::builder()
                 .client(http.clone())
                 .build()
-                .map_err(|e| {
-                    crate::registry::metadata_store::Error::StorageBackend(e.to_string())
-                })?,
+                .map_err(|e| Error::StorageBackend(e.to_string()))?,
         );
         let object_store: Arc<dyn ObjectStore> = raw_storage.clone();
         let cond_store: Arc<dyn ConditionalStore> = raw_storage;
@@ -67,9 +66,8 @@ impl TestS3Config {
         let caps = conditional.unwrap_or_default();
         let s3_lock_client = match &self.lock_strategy {
             LockStrategy::S3(cfg) => Some(Arc::new(
-                S3HttpBackend::new(&self.connection.to_lock_client_config(cfg)).map_err(|e| {
-                    crate::registry::metadata_store::Error::Coordination(e.to_string())
-                })?,
+                S3HttpBackend::new(&self.connection.to_lock_client_config(cfg))
+                    .map_err(|e| Error::Coordination(e.to_string()))?,
             )),
             _ => None,
         };
@@ -82,13 +80,19 @@ impl TestS3Config {
             caps.delete_if_match,
             caps.supports_cas(),
         )
-        .map_err(|e| crate::registry::metadata_store::Error::Coordination(e.to_string()))?;
+        .map_err(|e| Error::Coordination(e.to_string()))?;
 
+        let facade = Arc::new(
+            Store::builder()
+                .object(object_store)
+                .executor(executor)
+                .build()
+                .map_err(|e| Error::Coordination(e.to_string()))?,
+        );
         let mut builder = MetadataStore::builder()
             .link_cache_ttl(self.link_cache_ttl)
             .access_time_debounce_secs(self.access_time_debounce_secs)
-            .store(object_store)
-            .executor(executor);
+            .store(facade);
 
         if let Some(c) = cache {
             builder = builder.cache(c);

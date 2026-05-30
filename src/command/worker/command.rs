@@ -198,7 +198,7 @@ impl Components {
     ) -> Result<Self, Error> {
         let auth_cache = bootstrap::auth_cache(&config.cache)?;
         let blob_backend = std::sync::Arc::new(config.blob_store.build_backend()?);
-        let (metadata_store, _) =
+        let metadata_store =
             bootstrap::metadata_store(&config.resolve_registry_storage(), &auth_cache).await?;
         let repositories = bootstrap::repositories(
             &config.repository,
@@ -215,16 +215,16 @@ impl Components {
 
         let worker_id = Uuid::new_v4().to_string();
         let storage_config = config.resolve_registry_storage();
-        let storage = storage_config.to_handles().await?;
+        let storage = storage_config.build_store().await?;
 
         // Spawn the engine maintenance loops once per worker process so any
         // crashed-mid-Apply transactions are recovered and orphan body
         // staging is reaped.
         if let Some(token) = engine_maintenance {
-            bootstrap::spawn_engine_maintenance(storage.store.clone(), &storage.executor, token);
+            bootstrap::spawn_engine_maintenance(&storage, token);
         }
 
-        let consumer = Arc::new(JobStore::new(storage.store, storage.executor, worker_id));
+        let consumer = Arc::new(JobStore::new(storage, worker_id));
         let handler: Arc<dyn JobHandler> = Arc::new(CacheJobHandler::new(
             repositories,
             blob_backend,

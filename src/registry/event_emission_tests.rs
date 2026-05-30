@@ -20,6 +20,7 @@ use uuid::Uuid;
 use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};
 
 use angos_storage::{ObjectStore, fs::Backend as StorageFsBackend};
+use angos_tx_engine::store::Store;
 
 use crate::{
     event_webhook::{
@@ -66,10 +67,16 @@ impl FsRegistryFixture {
                 .build()
                 .expect("fs metadata storage"),
         );
+        let meta_facade = Arc::new(
+            Store::builder()
+                .object(meta_storage)
+                .executor(meta_executor)
+                .build()
+                .expect("fs metadata store façade"),
+        );
         let metadata_store_backend = Arc::new(
             metadata_store::MetadataStore::builder()
-                .store(meta_storage)
-                .executor(meta_executor)
+                .store(meta_facade)
                 .build()
                 .expect("fs metadata backend"),
         );

@@ -10,10 +10,10 @@ use futures_util::stream::{self, StreamExt};
 use tracing::{debug, info, instrument, warn};
 
 use angos_tx_engine::{
+    StorageError,
     error::Error as TxError,
-    executor::{
-        DEFAULT_RETRY_BUDGET, TransactionExecutor, execute_with_retry, execute_with_retry_payload,
-    },
+    executor::{DEFAULT_RETRY_BUDGET, TransactionExecutor, execute_with_retry},
+    store::Store,
     transaction::{Mutation, Transaction},
 };
 
@@ -22,8 +22,6 @@ use crate::{
     oci::{Descriptor, Digest},
     registry::{pagination, pagination::collect_all_pages, path_builder},
 };
-
-use angos_storage::{Error as StorageError, ObjectStore};
 
 mod access_time;
 mod blob_index;
@@ -61,10 +59,9 @@ use sharded::{
 
 #[derive(Clone)]
 pub struct MetadataStore {
-    /// Unconditional object store used for all reads and writes.
-    object_store: Arc<dyn ObjectStore>,
-    /// Transaction executor — all coordinated writes go through this.
-    executor: Arc<dyn TransactionExecutor>,
+    /// Storage façade: reads, read-for-update, and coordinated writes all flow
+    /// through here. Owns the object store and the transaction executor.
+    store: Arc<Store>,
     cache: Option<Arc<Cache>>,
     link_cache_ttl: u64,
     access_time_writer: Option<AccessTimeWriter>,
@@ -73,8 +70,7 @@ pub struct MetadataStore {
 }
 
 pub struct Builder {
-    object_store: Option<Arc<dyn ObjectStore>>,
-    executor: Option<Arc<dyn TransactionExecutor>>,
+    store: Option<Arc<Store>>,
     cache: Option<Arc<Cache>>,
     link_cache_ttl: u64,
     access_time_debounce_secs: u64,
@@ -83,27 +79,19 @@ pub struct Builder {
 impl Builder {
     fn new() -> Self {
         Self {
-            object_store: None,
-            executor: None,
+            store: None,
             cache: None,
             link_cache_ttl: 30,
             access_time_debounce_secs: 0,
         }
     }
 
-    /// Set the plain object store (required).
-    pub fn store(mut self, store: Arc<dyn ObjectStore>) -> Self {
-        self.object_store = Some(store);
-        self
-    }
-
-    /// Set the transaction executor (required).
+    /// Set the storage façade (required).
     ///
-    /// The executor encapsulates the CAS-vs-Locked decision. Construct it in
-    /// the factory (e.g. `CasExecutor` for S3 with CAS, `LockedExecutor` for
-    /// FS or S3 without CAS), then inject it here.
-    pub fn executor(mut self, executor: Arc<dyn TransactionExecutor>) -> Self {
-        self.executor = Some(executor);
+    /// The façade carries both the object store used for reads and the
+    /// transaction executor that encapsulates the CAS-vs-Locked decision.
+    pub fn store(mut self, store: Arc<Store>) -> Self {
+        self.store = Some(store);
         self
     }
 
@@ -123,12 +111,9 @@ impl Builder {
     }
 
     pub fn build(self) -> Result<MetadataStore, Error> {
-        let object_store = self
-            .object_store
+        let store = self
+            .store
             .ok_or_else(|| Error::Coordination("MetadataStore requires a store".to_string()))?;
-        let executor = self
-            .executor
-            .ok_or_else(|| Error::Coordination("MetadataStore requires an executor".to_string()))?;
 
         let (access_time_writer, flush_handle) = if self.access_time_debounce_secs > 0 {
             let writer = AccessTimeWriter::new();
@@ -136,8 +121,7 @@ impl Builder {
             let interval = Duration::from_secs(self.access_time_debounce_secs);
 
             let flush_backend = MetadataStore {
-                object_store: object_store.clone(),
-                executor: executor.clone(),
+                store: store.clone(),
                 cache: None,
                 link_cache_ttl: self.link_cache_ttl,
                 access_time_writer: Some(writer.clone()),
@@ -152,8 +136,7 @@ impl Builder {
         };
 
         Ok(MetadataStore {
-            object_store,
-            executor,
+            store,
             cache: self.cache,
             link_cache_ttl: self.link_cache_ttl,
             access_time_writer,
@@ -167,18 +150,20 @@ impl MetadataStore {
         Builder::new()
     }
 
-    pub fn store(&self) -> &dyn ObjectStore {
-        self.object_store.as_ref()
+    /// Returns the storage façade used for all reads and coordinated writes.
+    pub fn store(&self) -> &Store {
+        self.store.as_ref()
     }
 
-    /// Returns the `Arc<dyn ObjectStore>` for the underlying store.
-    pub fn store_arc(&self) -> Arc<dyn ObjectStore> {
-        self.object_store.clone()
+    /// Returns an owned handle to the storage façade, for closures and helpers
+    /// that need to capture it across `await` points.
+    pub fn store_arc(&self) -> Arc<Store> {
+        self.store.clone()
     }
 
     /// Returns the transaction executor.
     pub fn executor(&self) -> &dyn TransactionExecutor {
-        self.executor.as_ref()
+        self.store.executor().as_ref()
     }
 
     // ── Cache helpers ─────────────────────────────────────────────────────
@@ -554,17 +539,6 @@ impl MetadataStore {
     }
 
     #[instrument(skip(self))]
-    pub async fn update_blob_index(
-        &self,
-        namespace: &str,
-        digest: &Digest,
-        operation: BlobIndexOperation,
-    ) -> Result<(), Error> {
-        self.update_blob_index_batch(namespace, digest, &[operation])
-            .await
-    }
-
-    #[instrument(skip(self))]
     pub async fn migrate_blob_index(&self, digest: &Digest) -> Result<(), Error> {
         let legacy_path = path_builder::blob_index_path(digest);
 
@@ -705,39 +679,38 @@ impl MetadataStore {
         link: &LinkKind,
     ) -> Result<LinkMetadata, Error> {
         let link_path = path_builder::link_path(link, namespace);
+        let keys = [link_path.clone()];
 
-        let (_, link_data) = execute_with_retry_payload(
-            self.executor(),
-            || async {
-                let data = match self.store().get(&link_path).await {
-                    Ok(d) => d,
-                    Err(StorageError::NotFound) => {
-                        return Err(TxError::Storage(StorageError::NotFound));
+        let (_, link_data) = self
+            .store()
+            .update_with_payload(
+                &keys,
+                |snaps| {
+                    let link_path = link_path.clone();
+                    async move {
+                        let snap = &snaps[0];
+                        if !snap.present {
+                            return Err(TxError::Storage(StorageError::NotFound));
+                        }
+                        let link_data = LinkMetadata::from_bytes(snap.body.to_vec())
+                            .map_err(|e| TxError::Build(e.to_string()))?
+                            .accessed();
+                        let serialized =
+                            Bytes::from(serde_json::to_vec(&link_data).map_err(TxError::Serde)?);
+                        Ok((
+                            vec![Mutation::Put {
+                                key: link_path,
+                                body: serialized,
+                                expected: None,
+                            }],
+                            link_data,
+                        ))
                     }
-                    Err(e) => return Err(TxError::Storage(e)),
-                };
-                let raw = Bytes::from(data.clone());
-                let link_data = LinkMetadata::from_bytes(data)
-                    .map_err(|e| TxError::Build(e.to_string()))?
-                    .accessed();
-                let serialized =
-                    Bytes::from(serde_json::to_vec(&link_data).map_err(TxError::Serde)?);
-                Ok((
-                    Transaction::builder()
-                        .read(link_path.clone(), raw)
-                        .mutation(Mutation::Put {
-                            key: link_path.clone(),
-                            body: serialized,
-                            expected: None,
-                        })
-                        .build(),
-                    link_data,
-                ))
-            },
-            DEFAULT_RETRY_BUDGET,
-        )
-        .await
-        .map_err(tx_error_to_meta)?;
+                },
+                DEFAULT_RETRY_BUDGET,
+            )
+            .await
+            .map_err(tx_error_to_meta)?;
 
         Ok(link_data)
     }

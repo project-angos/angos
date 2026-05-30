@@ -1,5 +1,6 @@
 //! [`JobStore`] — unified job-queue storage, producer, and consumer backed by
-//! an [`ObjectStore`] and a [`TransactionExecutor`].
+//! a storage façade (`Store`) carrying the object store and transaction
+//! executor.
 //!
 //! All write operations that require atomicity (enqueue dedup, complete,
 //! fail/retry, dead-letter) are handled by the transaction engine and never
@@ -25,11 +26,11 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 use uuid::Uuid;
 
-use angos_storage::{Error as StorageError, ObjectStore};
 use angos_tx_engine::{
+    StorageError,
     error::Error as TxError,
-    executor::TransactionExecutor,
     lock::{Error as LockError, LockSession},
+    store::Store,
     transaction::{Mutation, Read, Transaction},
 };
 
@@ -399,8 +400,7 @@ fn tx_error_to_job(err: TxError) -> Error {
 /// log entries from `claim_one`; supply an empty string or any identifier when
 /// constructing for producer-only use.
 pub struct JobStore {
-    store: Arc<dyn ObjectStore>,
-    executor: Arc<dyn TransactionExecutor>,
+    store: Arc<Store>,
     worker_id: String,
 }
 
@@ -410,14 +410,9 @@ impl JobStore {
     /// `worker_id` is a structured-log tag that makes concurrent workers'
     /// `claim_one` actions distinguishable in aggregated logs. Pass an empty
     /// string for producer-only instances.
-    pub fn new(
-        store: Arc<dyn ObjectStore>,
-        executor: Arc<dyn TransactionExecutor>,
-        worker_id: impl Into<String>,
-    ) -> Self {
+    pub fn new(store: Arc<Store>, worker_id: impl Into<String>) -> Self {
         Self {
             store,
-            executor,
             worker_id: worker_id.into(),
         }
     }
@@ -518,7 +513,7 @@ impl JobStore {
                         expected: None,
                     })
                     .build();
-                match self.executor.execute(tx).await {
+                match self.store.execute(tx).await {
                     Ok(_) | Err(TxError::Conflict | TxError::Precondition) => Ok(false),
                     Err(e) => {
                         warn!(
@@ -610,7 +605,7 @@ impl JobStore {
 
         // A `Conflict` or `Precondition` here means another replica won the
         // race — treat as a dedup hit, not an error.
-        match self.executor.execute(tx).await {
+        match self.store.execute(tx).await {
             Ok(_) => {
                 metrics_provider()
                     .job_queue_enqueued_total
@@ -658,7 +653,8 @@ impl JobStore {
                 Err(e) => return Err(e),
             };
             if let Some(session) = self
-                .executor
+                .store
+                .executor()
                 .try_acquire(&[job_lock_key(&envelope.lock_key)])
                 .await
                 .map_err(tx_error_to_job)?
@@ -742,7 +738,7 @@ impl JobStore {
             }
         }
 
-        let result = self.executor.execute(tx).await;
+        let result = self.store.execute(tx).await;
         session.release().await;
         result.map(|_| ()).map_err(tx_error_to_job)
     }
@@ -821,7 +817,7 @@ impl JobStore {
             })
             .build();
 
-        let result = self.executor.execute(tx).await;
+        let result = self.store.execute(tx).await;
         session.release().await;
         result.map_err(tx_error_to_job)?;
 
@@ -876,7 +872,7 @@ impl JobStore {
             }
         }
 
-        let result = self.executor.execute(tx_builder.build()).await;
+        let result = self.store.execute(tx_builder.build()).await;
         session.release().await;
         result.map_err(tx_error_to_job)?;
 

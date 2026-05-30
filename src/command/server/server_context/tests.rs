@@ -12,7 +12,7 @@ use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};
 
 use angos_s3_client::Backend as S3HttpBackend;
 use angos_storage::{ConditionalStore, ObjectStore, s3::Backend as StorageS3Backend};
-use angos_tx_engine::{executor::build_executor, lock::LockStrategy};
+use angos_tx_engine::{executor::build_executor, lock::LockStrategy, store::Store};
 
 use crate::{
     command::server::{
@@ -135,14 +135,8 @@ pub async fn create_test_registry(config: &Configuration) -> Registry {
     let blob_backend = std::sync::Arc::new(config.blob_store.build_backend().unwrap());
     let auth_cache = config.cache.to_backend().unwrap();
     let storage_config = config.resolve_registry_storage();
-    let handles = storage_config.to_handles().await.unwrap();
-    let metadata_store = Arc::new(
-        MetadataStore::builder()
-            .store(handles.store)
-            .executor(handles.executor)
-            .build()
-            .unwrap(),
-    );
+    let store = storage_config.build_store().await.unwrap();
+    let metadata_store = Arc::new(MetadataStore::builder().store(store).build().unwrap());
 
     let mut repositories_map = HashMap::new();
     for (name, repo_config) in &config.repository {
@@ -894,10 +888,16 @@ fn build_shutdown_flush_harness(unique_prefix: &str) -> ShutdownFlushHarness {
         false,
     )
     .expect("build executor");
+    let facade = Arc::new(
+        Store::builder()
+            .object(object_store)
+            .executor(executor)
+            .build()
+            .expect("s3 metadata store façade"),
+    );
     let metadata_store: Arc<MetadataStore> = Arc::new(
         MetadataStore::builder()
-            .store(object_store)
-            .executor(executor)
+            .store(facade)
             .access_time_debounce_secs(3600)
             .link_cache_ttl(0)
             .build()

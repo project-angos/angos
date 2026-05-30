@@ -13,7 +13,7 @@ use tokio::{
     task::JoinHandle,
 };
 
-use angos_storage::ByteStream;
+use angos_tx_engine::ByteStream;
 
 use crate::{
     oci,
