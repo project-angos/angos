@@ -335,12 +335,12 @@ fn is_read_keyed(record: &MutationRecord, read_etags: &HashMap<String, Etag>) ->
 /// stale-stamp recovery for the `PreconditionFailed` case.
 ///
 /// This is the idempotent variant used both by the CAS executor's partial-commit
-/// handler and by the `RecoveryLoop`'s replay path. It mirrors the semantics
-/// described in the AIP design: on `PreconditionFailed`, compare the live
-/// body's SHA-256 hash against the staged body. A match means the healthy-path
-/// write already landed (stale stamp); the mutation is treated as applied and
-/// `Ok(None)` is returned. A mismatch means true contention: `Err(Error::PartialCommit)`
-/// is returned so the caller stops replay and leaves the intent for the next sweep.
+/// handler and by the `RecoveryLoop`'s replay path. On `PreconditionFailed`,
+/// compare the live body's SHA-256 hash against the staged body. A match means
+/// the healthy-path write already landed (a stale progress stamp); the mutation
+/// is treated as applied and `Ok(None)` is returned. A mismatch means true
+/// contention: `Err(Error::PartialCommit)` is returned so the caller stops
+/// replay and leaves the intent for the next sweep.
 ///
 /// # Errors
 ///

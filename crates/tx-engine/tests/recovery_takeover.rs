@@ -1,6 +1,6 @@
 //! Recovery takeover and conditional-replay tests.
 //!
-//! Covers the Phase 3 correctness invariants:
+//! Covers the recovery-takeover and conditional-replay correctness invariants:
 //!
 //! 1. Two concurrent recovery loops sharing the same lock primitive must
 //!    serialise their apply on a stale intent — at most one of them gets to
