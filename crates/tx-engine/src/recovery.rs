@@ -13,7 +13,7 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
-use angos_storage::{ConditionalStore, Error as StorageError, Etag, ObjectStore};
+use angos_storage::{ConditionalStore, Error as StorageError, ObjectStore};
 
 use crate::{
     error::Error,
@@ -321,29 +321,24 @@ impl RecoveryLoop {
         intent: &mut IntentRecord,
         idx: usize,
     ) -> Result<(), StorageError> {
-        if matches!(
-            intent.progress.get(idx),
-            Some(MutationProgress::Applied { .. })
-        ) {
+        if matches!(intent.progress.get(idx), Some(MutationProgress::Applied)) {
             return Ok(());
         }
 
         let mutation = intent.mutations[idx].clone();
-        let stamp_etag = if let Some(cs) = &self.conditional_store {
+        if let Some(cs) = &self.conditional_store {
             apply_cas_idempotent(cs.as_ref(), &mutation)
                 .await
                 .map_err(|e| match e {
                     Error::PartialCommit => StorageError::PreconditionFailed,
                     Error::Storage(s) => s,
                     other => StorageError::Backend(other.to_string()),
-                })?
+                })?;
         } else {
             apply_mutation_unconditional(self.store.as_ref(), &mutation).await?;
-            None
-        };
+        }
 
-        self.stamp_progress_during_recovery(intent, idx, stamp_etag)
-            .await
+        self.stamp_progress_during_recovery(intent, idx).await
     }
 
     /// Mirror the executors' stamp pattern: mark the slot `Applied` and re-PUT
@@ -352,9 +347,8 @@ impl RecoveryLoop {
         &self,
         intent: &mut IntentRecord,
         idx: usize,
-        etag: Option<Etag>,
     ) -> Result<(), StorageError> {
-        intent.mark_applied(idx, etag);
+        intent.mark_applied(idx);
         let body = match serde_json::to_vec(intent) {
             Ok(b) => b,
             Err(e) => {

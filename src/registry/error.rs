@@ -52,7 +52,7 @@ pub enum Error {
     #[error("metadata store error during operations: {0}")]
     MetadataStore(#[from] metadata_store::Error),
     // `lock::Error` is routed through `MetadataStore`: every registry-level
-    // caller of `lock::with_lock` is doing metadata-store work, so the
+    // caller of the lock primitive is doing metadata-store work, so the
     // metadata-store variant is the right home.
     #[error("I/O error during operations: {0}")]
     Io(#[from] std::io::Error),

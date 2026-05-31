@@ -208,10 +208,7 @@ async fn concurrent_recovery_loops_apply_each_mutation_exactly_once() {
             },
         ],
         coarse_lock_keys: vec![],
-        progress: vec![
-            MutationProgress::Applied { etag: None },
-            MutationProgress::Pending,
-        ],
+        progress: vec![MutationProgress::Applied, MutationProgress::Pending],
     };
     inner
         .put(
@@ -292,10 +289,7 @@ async fn already_applied_mutations_are_skipped() {
             },
         ],
         coarse_lock_keys: vec![],
-        progress: vec![
-            MutationProgress::Applied { etag: None },
-            MutationProgress::Pending,
-        ],
+        progress: vec![MutationProgress::Applied, MutationProgress::Pending],
     };
     store
         .put(
@@ -387,10 +381,7 @@ async fn cas_recovery_treats_stale_etag_with_matching_body_as_applied() {
             },
         ],
         coarse_lock_keys: vec![],
-        progress: vec![
-            MutationProgress::Applied { etag: None },
-            MutationProgress::Pending,
-        ],
+        progress: vec![MutationProgress::Applied, MutationProgress::Pending],
     };
     store
         .put(
@@ -479,10 +470,7 @@ async fn cas_recovery_stops_on_true_contention() {
             },
         ],
         coarse_lock_keys: vec![],
-        progress: vec![
-            MutationProgress::Applied { etag: None },
-            MutationProgress::Pending,
-        ],
+        progress: vec![MutationProgress::Applied, MutationProgress::Pending],
     };
     store
         .put(

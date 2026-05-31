@@ -242,9 +242,7 @@ impl LockedExecutor {
             let mutation = intent.mutations[idx].clone();
             match self.apply_mutation(&mutation, idx).await {
                 Ok(()) => {
-                    if let Err(stamp_err) =
-                        stamp_progress(self.store.as_ref(), intent, idx, None).await
-                    {
+                    if let Err(stamp_err) = stamp_progress(self.store.as_ref(), intent, idx).await {
                         warn!(
                             tx_id = %tx_id,
                             idx,

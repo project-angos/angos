@@ -1,26 +1,27 @@
 //! Distributed-lock primitive for the transaction engine.
 //!
 //! The single concrete type is [`Lock`]. Callers never see a RAII guard:
-//! they invoke [`with_lock`] with the keys to lock and a closure that runs
-//! under the lock; the helper acquires the lock, runs the closure, then
-//! releases the lock — always on the calling task's own call path. A
-//! background heartbeat task refreshes the lock TTL and fires the session's
-//! [`CancellationToken`] when ownership is lost, causing [`with_lock`] to
-//! surface [`Error::Invalidated`] at the next await point.
+//! they call [`Lock::acquire`] (blocking retry) or [`Lock::try_acquire`]
+//! (non-blocking, single attempt) with the keys to lock, run their work, then
+//! await [`LockSession::release`] — always on the calling task's own call
+//! path. A background heartbeat task refreshes the lock TTL and fires the
+//! session's [`CancellationToken`] when ownership is lost, so a caller racing
+//! its operation against [`LockSession::cancellation`] can short-circuit to
+//! [`Error::Invalidated`] at the next await point.
 //!
 //! ## Lifetime contract
 //!
-//! - **Release**: [`with_lock`] always awaits [`LockSession::release`]
-//!   before returning — on the calling task's own call path. If the
-//!   [`with_lock`] future is itself dropped before `release` runs (outer
-//!   task cancellation), [`LockSession::Drop`] best-effort spawns the
-//!   async release on the current Tokio runtime so the remote lock is
-//!   freed promptly instead of waiting on TTL. The spawn is
+//! - **Release**: the happy path awaits [`LockSession::release`] on the
+//!   calling task's own call path. If the session is instead dropped before
+//!   `release` runs (outer task cancellation), [`LockSession::Drop`]
+//!   best-effort spawns the async release on the current Tokio runtime so the
+//!   remote lock is freed promptly instead of waiting on TTL. The spawn is
 //!   fire-and-forget; if no runtime is available the lock expires via TTL.
-//! - **Heartbeat failure**: the heartbeat task fires a [`CancellationToken`]
-//!   when the heartbeat tick fails (ownership lost, refresh failed, max hold
-//!   exceeded). [`with_lock`] races the operation against this token and
-//!   short-circuits to [`Error::Invalidated`] at the next await point.
+//! - **Heartbeat failure**: the heartbeat task fires the
+//!   [`CancellationToken`] when the heartbeat tick fails (ownership lost,
+//!   refresh failed, max hold exceeded). Callers that race their operation
+//!   against the token short-circuit to [`Error::Invalidated`] at the next
+//!   await point.
 //!
 //! ## Storage flavours
 //!
@@ -78,18 +79,17 @@ type AsyncReleaseFn = Box<dyn FnOnce() -> Pin<Box<dyn Future<Output = ()> + Send
 
 /// Opaque bookkeeping returned by [`Lock::acquire`].
 ///
-/// Backends construct one of these from their `acquire` impl and
-/// [`with_lock`] consumes it; nothing else should reach for `release` /
-/// `cancellation` directly.
+/// Backends construct one of these from their `acquire` impl; callers consume
+/// it by awaiting [`release`](Self::release) and nothing else should reach for
+/// `release` / `cancellation` directly.
 ///
 /// **Release contract:** the happy path runs through
-/// [`release`](Self::release), which [`with_lock`] awaits on the
-/// calling task's call path before returning. [`Drop`] is a best-effort
-/// fallback that fires when the [`with_lock`] future itself is dropped
-/// (outer task cancellation): it aborts the heartbeat synchronously and
-/// spawns the async release on the current Tokio runtime so the remote
-/// lock is freed without waiting on TTL. If no runtime is available the
-/// remote lock expires via the backend's TTL.
+/// [`release`](Self::release), awaited on the calling task's call path before
+/// returning. [`Drop`] is a best-effort fallback that fires when the session is
+/// dropped without an explicit release (outer task cancellation): it aborts the
+/// heartbeat synchronously and spawns the async release on the current Tokio
+/// runtime so the remote lock is freed without waiting on TTL. If no runtime is
+/// available the remote lock expires via the backend's TTL.
 pub struct LockSession {
     sync_guard: Option<Box<dyn Send>>,
     async_release: Option<AsyncReleaseFn>,

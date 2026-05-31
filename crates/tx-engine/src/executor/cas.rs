@@ -121,12 +121,9 @@ impl CasExecutor {
 
     /// Apply a single mutation using conditional storage operations.
     ///
-    /// Returns `Ok(Some(etag))` when a conditional `put_if_match` /
-    /// `put_if_absent` returned a fresh etag for the new object, `Ok(None)`
-    /// when no etag is available (unconditional put, delete, copy, move, or
-    /// a backend that did not surface an etag), or
-    /// `Err(Error::Precondition)` when an etag precondition was not met.
-    async fn apply_mutation_cas(&self, mutation: &MutationRecord) -> Result<Option<Etag>, Error> {
+    /// Returns `Ok(())` on success, or `Err(Error::Precondition)` when an etag
+    /// precondition was not met.
+    async fn apply_mutation_cas(&self, mutation: &MutationRecord) -> Result<(), Error> {
         match mutation {
             MutationRecord::Put {
                 key,
@@ -137,31 +134,28 @@ impl CasExecutor {
                 let body = self.store.get(body_ref).await?;
                 let body_bytes = Bytes::from(body);
                 if let Some(etag) = expected {
-                    let new_etag = self
-                        .store
+                    self.store
                         .put_if_match(key, etag, body_bytes)
                         .await
                         .map_err(|e| match e {
                             StorageError::PreconditionFailed => Error::Precondition,
                             other => Error::Storage(other),
                         })?;
-                    Ok(new_etag)
                 } else {
                     self.store.put(key, body_bytes).await?;
-                    Ok(None)
                 }
+                Ok(())
             }
             MutationRecord::PutIfAbsent { key, body_ref, .. } => {
                 let body = self.store.get(body_ref).await?;
-                let new_etag = self
-                    .store
+                self.store
                     .put_if_absent(key, Bytes::from(body))
                     .await
                     .map_err(|e| match e {
                         StorageError::PreconditionFailed => Error::Precondition,
                         other => Error::Storage(other),
                     })?;
-                Ok(new_etag)
+                Ok(())
             }
             MutationRecord::Delete { key, expected, .. } => {
                 if let Some(etag) = expected {
@@ -175,16 +169,16 @@ impl CasExecutor {
                 } else {
                     self.store.delete(key).await?;
                 }
-                Ok(None)
+                Ok(())
             }
             MutationRecord::Copy { src, dst, .. } => {
                 self.store.copy(src, dst).await?;
-                Ok(None)
+                Ok(())
             }
             MutationRecord::Move { src, dst, .. } => {
                 self.store.copy(src, dst).await?;
                 self.store.delete(src).await?;
-                Ok(None)
+                Ok(())
             }
         }
     }
@@ -240,10 +234,8 @@ impl CasExecutor {
         for idx in 0..intent.mutations.len() {
             let mutation = intent.mutations[idx].clone();
             match self.apply_mutation_cas(&mutation).await {
-                Ok(etag) => {
-                    if let Err(stamp_err) =
-                        stamp_progress(self.store.as_ref(), intent, idx, etag).await
-                    {
+                Ok(()) => {
+                    if let Err(stamp_err) = stamp_progress(self.store.as_ref(), intent, idx).await {
                         warn!(
                             tx_id = %tx_id,
                             idx,
@@ -258,12 +250,12 @@ impl CasExecutor {
                         // Applied). Apply the stale-stamp recovery heuristic:
                         // compare the live body against the staged body.
                         match apply_cas_idempotent(self.store.as_ref(), &mutation).await {
-                            Ok(etag) => {
+                            Ok(()) => {
                                 // Live body matches staged body — the
                                 // healthy-path write landed without its stamp.
                                 // Stamp and continue forward.
                                 if let Err(stamp_err) =
-                                    stamp_progress(self.store.as_ref(), intent, idx, etag).await
+                                    stamp_progress(self.store.as_ref(), intent, idx).await
                                 {
                                     warn!(
                                         tx_id = %tx_id,
@@ -338,19 +330,19 @@ fn is_read_keyed(record: &MutationRecord, read_etags: &HashMap<String, Etag>) ->
 /// handler and by the `RecoveryLoop`'s replay path. On `PreconditionFailed`,
 /// compare the live body's SHA-256 hash against the staged body. A match means
 /// the healthy-path write already landed (a stale progress stamp); the mutation
-/// is treated as applied and `Ok(None)` is returned. A mismatch means true
+/// is treated as applied and `Ok(())` is returned. A mismatch means true
 /// contention: `Err(Error::PartialCommit)` is returned so the caller stops
 /// replay and leaves the intent for the next sweep.
 ///
 /// # Errors
 ///
 /// Returns `Err(Error::PartialCommit)` on true contention (live body ≠ staged
-/// body), `Err(Error::Storage(...))` on hard storage errors, or `Ok(Some(etag))`
-/// / `Ok(None)` on success.
+/// body), `Err(Error::Storage(...))` on hard storage errors, or `Ok(())` when
+/// the mutation is applied (or was already applied).
 pub async fn apply_cas_idempotent(
     store: &dyn ConditionalStore,
     mutation: &MutationRecord,
-) -> Result<Option<Etag>, Error> {
+) -> Result<(), Error> {
     match mutation {
         MutationRecord::Put {
             key,
@@ -359,19 +351,19 @@ pub async fn apply_cas_idempotent(
         } => {
             let body = match store.get(body_ref).await {
                 Ok(b) => b,
-                Err(StorageError::NotFound) => return Ok(None),
+                Err(StorageError::NotFound) => return Ok(()),
                 Err(e) => return Err(Error::Storage(e)),
             };
             let body_bytes = Bytes::from(body);
             let Some(etag) = expected else {
                 store.put(key, body_bytes).await.map_err(Error::Storage)?;
-                return Ok(None);
+                return Ok(());
             };
             match store.put_if_match(key, etag, body_bytes.clone()).await {
-                Ok(new_etag) => Ok(new_etag),
+                Ok(_) => Ok(()),
                 Err(StorageError::PreconditionFailed) => {
                     if live_body_matches(store, key, &body_bytes).await? {
-                        Ok(None)
+                        Ok(())
                     } else {
                         Err(Error::PartialCommit)
                     }
@@ -382,34 +374,33 @@ pub async fn apply_cas_idempotent(
         MutationRecord::PutIfAbsent { key, body_ref } => {
             let body = match store.get(body_ref).await {
                 Ok(b) => b,
-                Err(StorageError::NotFound) => return Ok(None),
+                Err(StorageError::NotFound) => return Ok(()),
                 Err(e) => return Err(Error::Storage(e)),
             };
             match store.put_if_absent(key, Bytes::from(body)).await {
-                Ok(new_etag) => Ok(new_etag),
-                Err(StorageError::PreconditionFailed) => Ok(None),
+                Ok(_) | Err(StorageError::PreconditionFailed) => Ok(()),
                 Err(e) => Err(Error::Storage(e)),
             }
         }
         MutationRecord::Delete { key, expected } => match expected {
             Some(etag) => match store.delete_if_match(key, etag).await {
-                Ok(()) | Err(StorageError::PreconditionFailed) => Ok(None),
+                Ok(()) | Err(StorageError::PreconditionFailed) => Ok(()),
                 Err(e) => Err(Error::Storage(e)),
             },
             None => match store.delete(key).await {
-                Ok(()) | Err(StorageError::NotFound) => Ok(None),
+                Ok(()) | Err(StorageError::NotFound) => Ok(()),
                 Err(e) => Err(Error::Storage(e)),
             },
         },
         MutationRecord::Copy { src, dst } => {
             store.copy(src, dst).await.map_err(Error::Storage)?;
-            Ok(None)
+            Ok(())
         }
         MutationRecord::Move { src, dst } => {
             common::move_idempotent(store, src, dst)
                 .await
                 .map_err(Error::Storage)?;
-            Ok(None)
+            Ok(())
         }
     }
 }

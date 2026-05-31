@@ -11,7 +11,7 @@ use angos_storage::ObjectStore;
 
 use crate::{
     error::Error,
-    intent::{IntentRecord, MutationRecord},
+    intent::{IntentRecord, MutationRecord, body_ref_key},
     transaction::{Mutation, Transaction},
 };
 
@@ -30,7 +30,7 @@ pub async fn write_intent(store: &dyn ObjectStore, intent: &IntentRecord) -> Res
     Ok(())
 }
 
-/// Mark mutation `idx` as `Applied { etag }` and re-PUT the intent record.
+/// Mark mutation `idx` as `Applied` and re-PUT the intent record.
 ///
 /// # Errors
 ///
@@ -39,9 +39,8 @@ pub async fn stamp_progress(
     store: &dyn ObjectStore,
     intent: &mut IntentRecord,
     idx: usize,
-    etag: Option<angos_storage::Etag>,
 ) -> Result<(), Error> {
-    intent.mark_applied(idx, etag);
+    intent.mark_applied(idx);
     write_intent(store, intent).await
 }
 
@@ -64,7 +63,7 @@ pub async fn stage_bodies(
                 body,
                 expected,
             } => {
-                let body_ref = format!(".tx-bodies/{tx_id}/{idx}");
+                let body_ref = body_ref_key(tx_id, idx);
                 store
                     .put(&body_ref, body.clone())
                     .await
@@ -76,7 +75,7 @@ pub async fn stage_bodies(
                 }
             }
             Mutation::PutIfAbsent { key, body } => {
-                let body_ref = format!(".tx-bodies/{tx_id}/{idx}");
+                let body_ref = body_ref_key(tx_id, idx);
                 store
                     .put(&body_ref, body.clone())
                     .await

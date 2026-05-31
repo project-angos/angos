@@ -402,7 +402,7 @@ async fn recovery_replays_fully_stamped_intent() {
             expected: None,
         }],
         coarse_lock_keys: vec![],
-        progress: vec![MutationProgress::Applied { etag: None }],
+        progress: vec![MutationProgress::Applied],
     };
     inner
         .put(
@@ -656,7 +656,7 @@ async fn progress_vector_reflects_apply_state_locked() {
         assert_eq!(intent.progress.len(), 3);
         for (idx, p) in intent.progress.iter().enumerate() {
             assert!(
-                matches!(p, MutationProgress::Applied { .. }),
+                matches!(p, MutationProgress::Applied),
                 "progress[{idx}] expected Applied, got {p:?}"
             );
         }
@@ -693,10 +693,7 @@ async fn progress_vector_reflects_apply_state_locked() {
         let _ = executor.execute(tx).await;
         let intent = read_only_intent(&inner).await;
         assert_eq!(intent.progress.len(), 3);
-        assert!(matches!(
-            intent.progress[0],
-            MutationProgress::Applied { .. }
-        ));
+        assert!(matches!(intent.progress[0], MutationProgress::Applied));
         assert!(matches!(intent.progress[1], MutationProgress::Pending));
         assert!(matches!(intent.progress[2], MutationProgress::Pending));
     }
@@ -740,7 +737,7 @@ async fn progress_vector_reflects_apply_state_cas() {
         assert_eq!(intent.progress.len(), 3);
         for (idx, p) in intent.progress.iter().enumerate() {
             assert!(
-                matches!(p, MutationProgress::Applied { .. }),
+                matches!(p, MutationProgress::Applied),
                 "progress[{idx}] expected Applied, got {p:?}"
             );
         }
@@ -775,10 +772,7 @@ async fn progress_vector_reflects_apply_state_cas() {
         let _ = executor.execute(tx).await;
         let intent = read_only_intent(&inner).await;
         assert_eq!(intent.progress.len(), 3);
-        assert!(matches!(
-            intent.progress[0],
-            MutationProgress::Applied { .. }
-        ));
+        assert!(matches!(intent.progress[0], MutationProgress::Applied));
         assert!(matches!(intent.progress[1], MutationProgress::Pending));
         assert!(matches!(intent.progress[2], MutationProgress::Pending));
     }

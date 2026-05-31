@@ -2,15 +2,14 @@
 //!
 //! [`Lock`] is the single concrete lock type for the transaction engine.
 //! Callers acquire it via [`Lock::acquire`] (blocking retry) or
-//! [`Lock::try_acquire`] (non-blocking, single attempt). The higher-level
-//! [`with_lock`] free function is the recommended entry point for simple
-//! use cases.
+//! [`Lock::try_acquire`] (non-blocking, single attempt), both of which return
+//! a [`LockSession`]; the session is released with [`LockSession::release`].
 //!
 //! A background heartbeat refreshes the TTL at `ttl_secs/3` intervals.
 //! When the heartbeat detects ownership loss (`ETag` mismatch on refresh) or
-//! exhausts its retry budget, it fires the session's [`CancellationToken`].
-//! [`with_lock`] races the user operation against this token and surfaces
-//! [`Error::Invalidated`] when the token fires first.
+//! exhausts its retry budget, it fires the session's [`CancellationToken`], so
+//! a caller racing its operation against [`LockSession::cancellation`] can
+//! observe the loss at its next await point.
 //!
 //! ## Stale-lock recovery
 //!
@@ -24,14 +23,13 @@
 use std::{
     collections::HashMap,
     fmt::Debug,
-    future::Future,
     sync::{Arc, RwLock},
     time::{Duration, Instant},
 };
 
 use chrono::Utc;
 use tokio::{
-    pin, select, spawn,
+    spawn,
     task::JoinHandle,
     time::{Instant as TokioInstant, MissedTickBehavior, interval, sleep, timeout},
 };
@@ -731,47 +729,4 @@ enum AcquireAllOutcome {
     Acquired(HashMap<String, Option<String>>),
     HardError(Error),
     Retry { acquired: Vec<String> },
-}
-
-// ─── with_lock free function ──────────────────────────────────────────────────
-
-/// Run `operation` while holding the lock for `keys`.
-///
-/// The operation is raced against the lock's heartbeat-loss signal: if the
-/// heartbeat detects the lock is no longer held, the in-flight operation is
-/// dropped at its next await point and `with_lock` returns
-/// `Err(E::from(Error::Invalidated))`.
-///
-/// On normal completion the operation's result is returned unchanged.
-/// In both cases, [`LockSession::release`] is awaited on the calling
-/// task's call path — no fire-and-forget background release.
-///
-/// # Errors
-///
-/// Returns `Err(E::from(Error::Invalidated))` when the heartbeat fires before
-/// the operation completes. Returns any error produced by `acquire` or by the
-/// `operation` closure.
-pub async fn with_lock<T, E, F, Fut>(lock: &Lock, keys: &[String], operation: F) -> Result<T, E>
-where
-    E: From<Error>,
-    F: FnOnce() -> Fut,
-    Fut: Future<Output = Result<T, E>>,
-{
-    let session = lock.acquire(keys).await?;
-    let cancellation = session.cancellation();
-    let operation_fut = operation();
-    pin!(operation_fut);
-
-    let outcome = select! {
-        biased;
-        () = cancellation.cancelled() => None,
-        result = &mut operation_fut => Some(result),
-    };
-
-    session.release().await;
-
-    match outcome {
-        Some(result) => result,
-        None => Err(Error::Invalidated.into()),
-    }
 }

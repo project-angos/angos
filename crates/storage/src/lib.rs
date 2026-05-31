@@ -11,7 +11,7 @@
 //!   Every backend implements this.
 //! - [`ConditionalStore`] — CAS extension: `put_if_absent`, `put_if_match`,
 //!   `delete_if_match`. S3 implements this; FS does not (consumers fall
-//!   back to the transactional engine's `Lock` primitive via `with_lock`).
+//!   back to the transactional engine's `Lock` primitive).
 //! - [`PresignedStore`] — signed download URLs. Only S3 implements this.
 //!
 //! # Backends

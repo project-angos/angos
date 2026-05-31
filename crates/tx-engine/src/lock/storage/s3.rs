@@ -67,12 +67,6 @@ impl S3LockStorage {
             supports_conditional_delete,
         }
     }
-
-    /// Return the storage path for a given logical lock key.
-    #[must_use]
-    pub fn path_for(key: &str) -> String {
-        lock_path(key)
-    }
 }
 
 #[async_trait]

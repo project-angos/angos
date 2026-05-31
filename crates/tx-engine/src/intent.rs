@@ -72,12 +72,23 @@ impl MutationRecord {
 ///
 /// Parallel to `IntentRecord::mutations`: one entry per mutation. `Pending`
 /// means the mutation has not yet been confirmed applied; `Applied` means
-/// the engine observed a successful apply and (on CAS) optionally records
-/// the resulting etag.
+/// the engine observed a successful apply. Only the discriminant matters:
+/// recovery and `any_applied` inspect `Applied` to decide replay-forward vs
+/// rollback and to skip already-applied slots, but the value carries no
+/// payload.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum MutationProgress {
     Pending,
-    Applied { etag: Option<Etag> },
+    Applied,
+}
+
+/// Staging key for the body of mutation `idx` in transaction `id`.
+///
+/// Single source of truth for the `.tx-bodies/<tx-id>/<idx>` shape, shared by
+/// [`IntentRecord::body_ref`] and the body-staging path in the executors.
+#[must_use]
+pub fn body_ref_key(id: Uuid, idx: usize) -> String {
+    format!(".tx-bodies/{id}/{idx}")
 }
 
 /// A read dependency recorded in an intent.
@@ -109,9 +120,9 @@ pub struct IntentRecord {
     pub coarse_lock_keys: Vec<String>,
     /// Per-mutation apply progress, length-matched to `mutations`. Initialised
     /// to `Pending` for every mutation when the intent is first written and
-    /// stamped to `Applied { etag }` after each successful apply. Recovery
-    /// uses this vector to decide replay-forward vs rollback (any `Applied`
-    /// entry implies the transaction is committed).
+    /// stamped to `Applied` after each successful apply. Recovery uses this
+    /// vector to decide replay-forward vs rollback (any `Applied` entry implies
+    /// the transaction is committed).
     pub progress: Vec<MutationProgress>,
 }
 
@@ -131,7 +142,7 @@ impl IntentRecord {
     /// Return the staging key for mutation body at index `idx`.
     #[must_use]
     pub fn body_ref(&self, idx: usize) -> String {
-        format!(".tx-bodies/{}/{}", self.id, idx)
+        body_ref_key(self.id, idx)
     }
 
     /// Returns `true` if the owner's heartbeat is considered stale.
@@ -147,13 +158,13 @@ impl IntentRecord {
     pub fn any_applied(&self) -> bool {
         self.progress
             .iter()
-            .any(|p| matches!(p, MutationProgress::Applied { .. }))
+            .any(|p| matches!(p, MutationProgress::Applied))
     }
 
-    /// Record that mutation `idx` has been applied, optionally with the etag
-    /// produced by the apply call. A no-op (with a warning) when `idx` is
-    /// out of range, defending against a malformed intent without panicking.
-    pub fn mark_applied(&mut self, idx: usize, etag: Option<Etag>) {
+    /// Record that mutation `idx` has been applied. A no-op (with a warning)
+    /// when `idx` is out of range, defending against a malformed intent without
+    /// panicking.
+    pub fn mark_applied(&mut self, idx: usize) {
         if idx >= self.progress.len() {
             warn!(
                 tx_id = %self.id,
@@ -163,7 +174,7 @@ impl IntentRecord {
             );
             return;
         }
-        self.progress[idx] = MutationProgress::Applied { etag };
+        self.progress[idx] = MutationProgress::Applied;
     }
 }
 
@@ -171,8 +182,6 @@ impl IntentRecord {
 mod tests {
     use chrono::Utc;
     use uuid::Uuid;
-
-    use angos_storage::Etag;
 
     use crate::intent::{IntentRecord, MutationProgress, MutationRecord};
 
@@ -197,13 +206,10 @@ mod tests {
 
     #[test]
     fn progress_round_trips_through_serde() {
-        let etag = Etag::new("\"abc\"");
         let intent = sample_intent(vec![
             MutationProgress::Pending,
-            MutationProgress::Applied {
-                etag: Some(etag.clone()),
-            },
-            MutationProgress::Applied { etag: None },
+            MutationProgress::Applied,
+            MutationProgress::Applied,
         ]);
         let json = serde_json::to_vec(&intent).expect("serialise");
         let back: IntentRecord = serde_json::from_slice(&json).expect("deserialise");
@@ -213,22 +219,16 @@ mod tests {
     #[test]
     fn mark_applied_sets_correct_slot() {
         let mut intent = sample_intent(vec![MutationProgress::Pending; 3]);
-        let etag = Etag::new("\"xyz\"");
-        intent.mark_applied(1, Some(etag.clone()));
+        intent.mark_applied(1);
         assert_eq!(intent.progress[0], MutationProgress::Pending);
-        assert_eq!(
-            intent.progress[1],
-            MutationProgress::Applied {
-                etag: Some(etag.clone())
-            }
-        );
+        assert_eq!(intent.progress[1], MutationProgress::Applied);
         assert_eq!(intent.progress[2], MutationProgress::Pending);
     }
 
     #[test]
     fn mark_applied_out_of_range_is_a_no_op() {
         let mut intent = sample_intent(vec![MutationProgress::Pending; 2]);
-        intent.mark_applied(5, None);
+        intent.mark_applied(5);
         assert!(
             intent
                 .progress
@@ -244,7 +244,7 @@ mod tests {
 
         let intent = sample_intent(vec![
             MutationProgress::Pending,
-            MutationProgress::Applied { etag: None },
+            MutationProgress::Applied,
             MutationProgress::Pending,
         ]);
         assert!(intent.any_applied());

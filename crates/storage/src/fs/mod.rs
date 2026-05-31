@@ -111,53 +111,29 @@ impl Backend {
         self.root.join(key)
     }
 
-    /// Atomically rename the object at `from_key` to `to_key`, creating
-    /// the destination's parent directories as needed.
-    ///
-    /// This is a zero-copy operation on the same filesystem. It is intentionally
-    /// not on the [`ObjectStore`] trait because S3 has no cheap rename.
-    ///
-    /// # Errors
-    /// Returns [`Error::NotFound`] when `from_key` does not exist.
-    pub async fn rename(&self, from_key: &str, to_key: &str) -> Result<(), Error> {
-        let from = self.full_path(from_key);
-        let to = self.full_path(to_key);
-        ensure_parent(&to).await?;
-        fs::rename(&from, &to).await?;
-        Ok(())
-    }
-
-    /// Open `key` for writing, optionally in append mode.
-    ///
-    /// When `append` is `true` the file is opened with `O_APPEND`; when
-    /// `false` the file is truncated and overwritten. The parent directory is
-    /// created if it does not exist.
+    /// Open `key` for writing in append mode (`O_APPEND`), creating the file
+    /// and its parent directory if they do not exist.
     ///
     /// Returns the open file handle and the file's size **before** the open,
-    /// so callers that need to track the write offset can do so without a
-    /// separate `head` call.
+    /// so the upload session can verify its tracked offset without a separate
+    /// `head` call.
+    ///
+    /// Private: this is an upload-session implementation detail, not part of
+    /// the [`ObjectStore`] trait surface.
     ///
     /// # Errors
-    /// Returns [`Error::NotFound`] when the file does not exist and `append`
-    /// is `true`.
-    pub async fn open_for_write(&self, key: &str, append: bool) -> Result<(fs::File, u64), Error> {
+    /// Returns [`Error::Backend`] when the file cannot be opened.
+    async fn open_for_append(&self, key: &str) -> Result<(fs::File, u64), Error> {
         let path = self.full_path(key);
         ensure_parent(&path).await?;
-        if append {
-            let file = fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&path)
-                .await
-                .map_err(|e| classify_open_error(&e, &path))?;
-            let size = file.metadata().await?.len();
-            Ok((file, size))
-        } else {
-            let file = fs::File::create(&path)
-                .await
-                .map_err(|e| classify_open_error(&e, &path))?;
-            Ok((file, 0))
-        }
+        let file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .await
+            .map_err(|e| classify_open_error(&e, &path))?;
+        let size = file.metadata().await?.len();
+        Ok((file, size))
     }
 
     /// Best-effort cleanup of empty ancestor directories after a leaf
@@ -518,7 +494,7 @@ impl ObjectStore for Backend {
         if len == 0 {
             return Ok(());
         }
-        let (mut file, current) = self.open_for_write(&session.key, true).await?;
+        let (mut file, current) = self.open_for_append(&session.key).await?;
         if current != session.uploaded_size {
             return Err(Error::Backend(format!(
                 "fs upload-session offset drift: file has {current} bytes, session expected {}",
