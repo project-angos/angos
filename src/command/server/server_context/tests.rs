@@ -12,7 +12,7 @@ use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};
 
 use angos_s3_client::Backend as S3HttpBackend;
 use angos_storage::{ConditionalStore, ObjectStore, s3::Backend as StorageS3Backend};
-use angos_tx_engine::{executor::build_executor, lock::LockStrategy, store::Store};
+use angos_tx_engine::{executor::build_executor, lock::LockStrategy};
 
 use crate::{
     command::server::{
@@ -35,6 +35,7 @@ use crate::{
         metadata_store::{LinkOperation, MetadataStore, link_kind::LinkKind},
         repository_resolver::RepositoryResolver,
         s3_connection::S3ConnectionConfig,
+        test_utils::build_store,
     },
     secret::Secret,
 };
@@ -888,13 +889,7 @@ fn build_shutdown_flush_harness(unique_prefix: &str) -> ShutdownFlushHarness {
         false,
     )
     .expect("build executor");
-    let facade = Arc::new(
-        Store::builder()
-            .object(object_store)
-            .executor(executor)
-            .build()
-            .expect("s3 metadata store façade"),
-    );
+    let facade = build_store(object_store, executor);
     let metadata_store: Arc<MetadataStore> = Arc::new(
         MetadataStore::builder()
             .store(facade)

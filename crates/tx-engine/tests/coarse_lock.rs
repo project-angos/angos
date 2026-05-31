@@ -11,24 +11,16 @@ use bytes::Bytes;
 use tokio::sync::Barrier;
 use tokio::time::sleep;
 
-use angos_storage::{ConditionalStore, MemoryObjectStore, ObjectStore};
+use angos_storage::{MemoryObjectStore, ObjectStore};
 
 use angos_tx_engine::{
-    executor::{TransactionExecutor, cas::CasExecutor, locked::LockedExecutor},
-    lock::{primitive::Lock, storage::memory::MemoryLockStorage},
+    executor::TransactionExecutor,
     transaction::{Mutation, Transaction},
 };
 
-const COARSE_KEY: &str = "blob-data:dummy";
+mod common;
 
-fn make_lock() -> Arc<Lock> {
-    Arc::new(
-        Lock::builder()
-            .storage(Arc::new(MemoryLockStorage::new()))
-            .build()
-            .expect("Lock builder"),
-    )
-}
+const COARSE_KEY: &str = "blob-data:dummy";
 
 fn tx_delete() -> Transaction {
     Transaction::builder()
@@ -101,26 +93,14 @@ where
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn coarse_lock_serialises_under_locked_executor() {
     let store = Arc::new(MemoryObjectStore::new());
-    let executor = Arc::new(
-        LockedExecutor::builder()
-            .store(store as Arc<dyn ObjectStore>)
-            .lock(make_lock())
-            .build()
-            .expect("LockedExecutor builder"),
-    );
+    let executor = common::locked_executor(store, common::memory_lock());
     assert_coarse_lock_serialises(executor).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn coarse_lock_serialises_under_cas_executor() {
     let store = Arc::new(MemoryObjectStore::new());
-    let executor = Arc::new(
-        CasExecutor::builder()
-            .store(store as Arc<dyn ConditionalStore>)
-            .lock(make_lock())
-            .build()
-            .expect("CasExecutor builder"),
-    );
+    let executor = common::cas_executor(store, common::memory_lock());
     assert_coarse_lock_serialises(executor).await;
 }
 
@@ -130,14 +110,8 @@ async fn coarse_lock_serialises_under_cas_executor() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cas_executor_holds_coarse_lock_across_apply() {
     let store = Arc::new(MemoryObjectStore::new());
-    let lock = make_lock();
-    let executor = Arc::new(
-        CasExecutor::builder()
-            .store(store.clone() as Arc<dyn ConditionalStore>)
-            .lock(lock.clone())
-            .build()
-            .expect("CasExecutor builder"),
-    );
+    let lock = common::memory_lock();
+    let executor = common::cas_executor(store.clone(), lock.clone());
 
     // Pre-acquire the coarse key from outside the executor so the in-flight
     // transaction must wait. If the CAS executor neglected to acquire it,

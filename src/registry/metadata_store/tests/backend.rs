@@ -2,11 +2,6 @@ use std::{str::FromStr, sync::Arc};
 
 use angos_s3_client as s3_client;
 use angos_storage::s3::Backend as StorageS3Backend;
-use angos_tx_engine::{
-    executor::locked::LockedExecutor,
-    lock::{primitive::Lock, storage::memory::MemoryLockStorage},
-    store::Store,
-};
 
 use super::{legacy_blob_index_with, put_legacy_index, test_config};
 use crate::{
@@ -14,38 +9,13 @@ use crate::{
     registry::{
         metadata_store::{BlobIndex, BlobIndexOperation, MetadataStore, link_kind::LinkKind},
         path_builder,
+        test_utils::{locked_executor_over, metadata_store_over},
     },
 };
 
 /// Build a backend using a shared in-memory lock over the given storage.
-fn make_backend(storage: Arc<StorageS3Backend>) -> MetadataStore {
-    let shared_lock = Arc::new(
-        Lock::builder()
-            .storage(Arc::new(MemoryLockStorage::new()))
-            .build()
-            .expect("lock"),
-    );
-
-    let executor = Arc::new(
-        LockedExecutor::builder()
-            .store(storage.clone())
-            .lock(shared_lock)
-            .build()
-            .unwrap(),
-    );
-    let facade = Arc::new(
-        Store::builder()
-            .object(storage)
-            .executor(executor)
-            .build()
-            .unwrap(),
-    );
-    MetadataStore::builder()
-        .store(facade)
-        .link_cache_ttl(0)
-        .access_time_debounce_secs(0)
-        .build()
-        .unwrap()
+fn make_backend(storage: Arc<StorageS3Backend>) -> Arc<MetadataStore> {
+    metadata_store_over(storage.clone(), locked_executor_over(storage))
 }
 
 /// Verify that a blob-index update applies the operation correctly to a legacy

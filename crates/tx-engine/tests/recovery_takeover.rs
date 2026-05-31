@@ -41,12 +41,13 @@ use angos_storage::{
 
 use angos_tx_engine::{
     error::Error as TxError,
-    executor::{TransactionExecutor, cas::CasExecutor},
+    executor::TransactionExecutor,
     intent::{IntentRecord, MutationProgress, MutationRecord},
-    lock::{primitive::Lock, storage::memory::MemoryLockStorage},
     recovery::RecoveryLoop,
     transaction::{Mutation, Transaction},
 };
+
+mod common;
 
 /// Wrapper that counts `put` calls per key. Used to prove a recovery
 /// mutation applied at most once across two racing sweeps.
@@ -122,15 +123,6 @@ impl ObjectStore for PutCountingStore {
     }
 }
 
-fn make_lock() -> Arc<Lock> {
-    Arc::new(
-        Lock::builder()
-            .storage(Arc::new(MemoryLockStorage::new()))
-            .build()
-            .expect("lock builder"),
-    )
-}
-
 /// Two recovery loops on the same backing store and the same `Arc<Lock>` race
 /// to take over a stale intent. The intent has one mutation marked `Applied`
 /// (so recovery enters replay-forward) and one `Pending` mutation that writes
@@ -140,7 +132,7 @@ fn make_lock() -> Arc<Lock> {
 async fn concurrent_recovery_loops_apply_each_mutation_exactly_once() {
     let inner = Arc::new(MemoryObjectStore::new());
     let counting = Arc::new(PutCountingStore::new(inner.clone(), "race/dst"));
-    let lock = make_lock();
+    let lock = common::memory_lock();
 
     let tx_id = Uuid::new_v4();
     inner
@@ -217,7 +209,7 @@ async fn concurrent_recovery_loops_apply_each_mutation_exactly_once() {
 #[tokio::test(flavor = "multi_thread")]
 async fn already_applied_mutations_are_skipped() {
     let store = Arc::new(MemoryObjectStore::new());
-    let lock = make_lock();
+    let lock = common::memory_lock();
 
     // Pre-write a sentinel at key 0; recovery must not overwrite it.
     store
@@ -301,7 +293,7 @@ async fn already_applied_mutations_are_skipped() {
 #[tokio::test(flavor = "multi_thread")]
 async fn cas_recovery_treats_stale_etag_with_matching_body_as_applied() {
     let store = Arc::new(MemoryObjectStore::new());
-    let lock = make_lock();
+    let lock = common::memory_lock();
 
     // Land the final body at the destination first; capture its etag (different
     // from any "stale" etag we record in the intent).
@@ -400,7 +392,7 @@ async fn cas_recovery_treats_stale_etag_with_matching_body_as_applied() {
 #[tokio::test(flavor = "multi_thread")]
 async fn cas_recovery_stops_on_true_contention() {
     let store = Arc::new(MemoryObjectStore::new());
-    let lock = make_lock();
+    let lock = common::memory_lock();
 
     // Live body at the destination has different content from the staged body.
     let _live_etag = store
@@ -500,7 +492,7 @@ async fn cas_recovery_stops_on_true_contention() {
 #[tokio::test]
 async fn cas_executor_stale_stamp_mid_apply_continues_and_commits() {
     let store = Arc::new(MemoryObjectStore::new());
-    let lock = make_lock();
+    let lock = common::memory_lock();
 
     // mutation[0]: unconditional Put — will succeed normally.
     // mutation[1]: conditional Put with a stale etag — will return
@@ -519,11 +511,7 @@ async fn cas_executor_stale_stamp_mid_apply_continues_and_commits() {
 
     let stale_etag = Etag::new("\"stale-etag-never-matches\"");
 
-    let executor = CasExecutor::builder()
-        .store(store.clone() as Arc<dyn ConditionalStore>)
-        .lock(lock)
-        .build()
-        .expect("executor");
+    let executor = common::cas_executor(store.clone(), lock);
 
     let tx = Transaction::builder()
         .mutation(Mutation::Put {
@@ -564,7 +552,7 @@ async fn cas_executor_stale_stamp_mid_apply_continues_and_commits() {
 #[tokio::test]
 async fn cas_executor_true_contention_mid_apply_leaves_intent() {
     let store = Arc::new(MemoryObjectStore::new());
-    let lock = make_lock();
+    let lock = common::memory_lock();
 
     // Pre-land mutation[1]'s destination with a *different* body from what
     // the transaction will stage — this is true contention.
@@ -577,11 +565,7 @@ async fn cas_executor_true_contention_mid_apply_leaves_intent() {
     let stale_etag = Etag::new("\"stale-etag-never-matches\"");
     let our_staged_body = Bytes::from_static(b"our-staged-body");
 
-    let executor = CasExecutor::builder()
-        .store(store.clone() as Arc<dyn ConditionalStore>)
-        .lock(lock)
-        .build()
-        .expect("executor");
+    let executor = common::cas_executor(store.clone(), lock);
 
     let tx = Transaction::builder()
         .mutation(Mutation::Put {

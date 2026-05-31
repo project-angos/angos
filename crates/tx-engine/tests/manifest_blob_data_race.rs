@@ -21,25 +21,17 @@ use bytes::Bytes;
 use tokio::sync::Barrier;
 use tokio::time::sleep;
 
-use angos_storage::{ConditionalStore, MemoryObjectStore, ObjectStore};
+use angos_storage::{MemoryObjectStore, ObjectStore};
 
 use angos_tx_engine::{
-    executor::{TransactionExecutor, cas::CasExecutor},
-    lock::{primitive::Lock, storage::memory::MemoryLockStorage},
+    executor::TransactionExecutor,
     transaction::{Mutation, Transaction},
 };
 
+mod common;
+
 const BLOB_KEY: &str = "blob-data/sha256:dead";
 const COARSE_KEY: &str = "blob-data:sha256:dead";
-
-fn make_lock() -> Arc<Lock> {
-    Arc::new(
-        Lock::builder()
-            .storage(Arc::new(MemoryLockStorage::new()))
-            .build()
-            .expect("Lock builder"),
-    )
-}
 
 fn push_tx(body: Bytes) -> Transaction {
     Transaction::builder()
@@ -94,14 +86,8 @@ fn push_and_delete_declare_matching_coarse_lock() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cas_executor_serialises_push_and_delete() {
     let store = Arc::new(MemoryObjectStore::new());
-    let lock = make_lock();
-    let executor = Arc::new(
-        CasExecutor::builder()
-            .store(store.clone() as Arc<dyn ConditionalStore>)
-            .lock(lock.clone())
-            .build()
-            .expect("CasExecutor builder"),
-    );
+    let lock = common::memory_lock();
+    let executor = common::cas_executor(store.clone(), lock.clone());
 
     // Hold the coarse lock from outside so the in-flight push must wait.
     let held = lock
@@ -146,14 +132,8 @@ async fn cas_executor_serialises_push_and_delete() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_push_and_delete_converge_to_consistent_state() {
     let store = Arc::new(MemoryObjectStore::new());
-    let lock = make_lock();
-    let executor = Arc::new(
-        CasExecutor::builder()
-            .store(store.clone() as Arc<dyn ConditionalStore>)
-            .lock(lock)
-            .build()
-            .expect("CasExecutor builder"),
-    );
+    let lock = common::memory_lock();
+    let executor = common::cas_executor(store.clone(), lock);
 
     let barrier = Arc::new(Barrier::new(2));
 

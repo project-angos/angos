@@ -19,12 +19,13 @@ use angos_storage::{
 };
 
 use angos_tx_engine::{
-    executor::{TransactionExecutor, cas::CasExecutor, locked::LockedExecutor},
+    executor::TransactionExecutor,
     intent::{MutationProgress, MutationRecord},
-    lock::{primitive::Lock, storage::memory::MemoryLockStorage},
     recovery::RecoveryLoop,
     transaction::{Mutation, Transaction},
 };
+
+mod common;
 
 // ──────────────────────────────────────────────────────────────────────────────
 // CrashingStore: wraps MemoryObjectStore and fails on a specific write call number
@@ -183,12 +184,7 @@ async fn assert_no_prefix_inner(store: &MemoryObjectStore, prefix: &str) {
 /// the same ownership-takeover code path production uses; the lock is
 /// uncontended in these single-process scenarios.
 async fn run_recovery(inner: Arc<MemoryObjectStore>) {
-    let lock = Arc::new(
-        Lock::builder()
-            .storage(Arc::new(MemoryLockStorage::new()))
-            .build()
-            .unwrap(),
-    );
+    let lock = common::memory_lock();
     let recovery = RecoveryLoop::builder(inner as Arc<dyn ObjectStore>)
         .lock(lock)
         .interval(std::time::Duration::from_hours(1))
@@ -230,17 +226,8 @@ async fn crash_before_intent() {
     // Write 0 = body staging; write 1 = intent PUT (which we crash on).
     let crashing = Arc::new(CrashingStore::new(inner.clone(), 1));
 
-    let lock = Arc::new(
-        Lock::builder()
-            .storage(Arc::new(MemoryLockStorage::new()))
-            .build()
-            .unwrap(),
-    );
-    let executor = LockedExecutor::builder()
-        .store(crashing.clone() as Arc<dyn ObjectStore>)
-        .lock(lock)
-        .build()
-        .expect("executor builder");
+    let lock = common::memory_lock();
+    let executor = common::locked_executor(crashing.clone(), lock);
 
     let tx = Transaction::builder()
         .mutation(Mutation::Put {
@@ -280,17 +267,8 @@ async fn crash_after_intent_before_apply() {
     // Crash on write 2.
     let crashing = Arc::new(CrashingStore::new(inner.clone(), 2));
 
-    let lock = Arc::new(
-        Lock::builder()
-            .storage(Arc::new(MemoryLockStorage::new()))
-            .build()
-            .unwrap(),
-    );
-    let executor = LockedExecutor::builder()
-        .store(crashing.clone() as Arc<dyn ObjectStore>)
-        .lock(lock)
-        .build()
-        .expect("executor builder");
+    let lock = common::memory_lock();
+    let executor = common::locked_executor(crashing.clone(), lock);
 
     let tx = Transaction::builder()
         .mutation(Mutation::Put {
@@ -327,17 +305,8 @@ async fn crash_during_reap() {
     // stamp=3, reap bodies delete_prefix=4.
     let crashing = Arc::new(CrashingStore::new(inner.clone(), 4));
 
-    let lock = Arc::new(
-        Lock::builder()
-            .storage(Arc::new(MemoryLockStorage::new()))
-            .build()
-            .unwrap(),
-    );
-    let executor = LockedExecutor::builder()
-        .store(crashing.clone() as Arc<dyn ObjectStore>)
-        .lock(lock)
-        .build()
-        .expect("executor builder");
+    let lock = common::memory_lock();
+    let executor = common::locked_executor(crashing.clone(), lock);
 
     let tx = Transaction::builder()
         .mutation(Mutation::Put {
@@ -465,17 +434,8 @@ async fn manifest_push_crash_mid_apply_recovery_converges() {
         let inner = Arc::new(MemoryObjectStore::new());
         let crashing = Arc::new(CrashingStore::new(inner.clone(), crash_on));
 
-        let lock = Arc::new(
-            Lock::builder()
-                .storage(Arc::new(MemoryLockStorage::new()))
-                .build()
-                .unwrap(),
-        );
-        let executor = LockedExecutor::builder()
-            .store(crashing.clone() as Arc<dyn ObjectStore>)
-            .lock(lock)
-            .build()
-            .expect("executor builder");
+        let lock = common::memory_lock();
+        let executor = common::locked_executor(crashing.clone(), lock);
 
         let tx = Transaction::builder()
             .mutation(Mutation::PutIfAbsent {
@@ -558,17 +518,8 @@ async fn progress_vector_reflects_apply_state_locked() {
     {
         let inner = Arc::new(MemoryObjectStore::new());
         let crashing = Arc::new(CrashingStore::new_permanent_from(inner.clone(), 10));
-        let lock = Arc::new(
-            Lock::builder()
-                .storage(Arc::new(MemoryLockStorage::new()))
-                .build()
-                .unwrap(),
-        );
-        let executor = LockedExecutor::builder()
-            .store(crashing.clone() as Arc<dyn ObjectStore>)
-            .lock(lock)
-            .build()
-            .expect("executor builder");
+        let lock = common::memory_lock();
+        let executor = common::locked_executor(crashing.clone(), lock);
 
         let tx = Transaction::builder()
             .mutation(Mutation::Put {
@@ -606,17 +557,8 @@ async fn progress_vector_reflects_apply_state_locked() {
     {
         let inner = Arc::new(MemoryObjectStore::new());
         let crashing = Arc::new(CrashingStore::new_permanent_from(inner.clone(), 6));
-        let lock = Arc::new(
-            Lock::builder()
-                .storage(Arc::new(MemoryLockStorage::new()))
-                .build()
-                .unwrap(),
-        );
-        let executor = LockedExecutor::builder()
-            .store(crashing.clone() as Arc<dyn ObjectStore>)
-            .lock(lock)
-            .build()
-            .expect("executor builder");
+        let lock = common::memory_lock();
+        let executor = common::locked_executor(crashing.clone(), lock);
 
         let tx = Transaction::builder()
             .mutation(Mutation::Put {
@@ -660,17 +602,8 @@ async fn progress_vector_reflects_apply_state_cas() {
     {
         let inner = Arc::new(MemoryObjectStore::new());
         let crashing = Arc::new(CrashingStore::new_permanent_from(inner.clone(), 10));
-        let lock = Arc::new(
-            Lock::builder()
-                .storage(Arc::new(MemoryLockStorage::new()))
-                .build()
-                .unwrap(),
-        );
-        let executor = CasExecutor::builder()
-            .store(crashing.clone() as Arc<dyn ConditionalStore>)
-            .lock(lock)
-            .build()
-            .expect("executor builder");
+        let lock = common::memory_lock();
+        let executor = common::cas_executor(crashing.clone(), lock);
 
         let tx = Transaction::builder()
             .mutation(Mutation::Put {
@@ -706,17 +639,8 @@ async fn progress_vector_reflects_apply_state_cas() {
     {
         let inner = Arc::new(MemoryObjectStore::new());
         let crashing = Arc::new(CrashingStore::new_permanent_from(inner.clone(), 6));
-        let lock = Arc::new(
-            Lock::builder()
-                .storage(Arc::new(MemoryLockStorage::new()))
-                .build()
-                .unwrap(),
-        );
-        let executor = CasExecutor::builder()
-            .store(crashing.clone() as Arc<dyn ConditionalStore>)
-            .lock(lock)
-            .build()
-            .expect("executor builder");
+        let lock = common::memory_lock();
+        let executor = common::cas_executor(crashing.clone(), lock);
 
         let tx = Transaction::builder()
             .mutation(Mutation::Put {

@@ -15,9 +15,7 @@ use chrono::{Duration, Utc};
 
 use angos_s3_client::Backend as S3HttpBackend;
 use angos_storage::{ConditionalStore, ObjectStore, s3::Backend as StorageS3Backend};
-use angos_tx_engine::{
-    ConditionalCapabilities, executor::build_executor, lock::LockStrategy, store::Store,
-};
+use angos_tx_engine::{ConditionalCapabilities, executor::build_executor, lock::LockStrategy};
 
 use crate::{
     cache::Cache,
@@ -30,7 +28,7 @@ use crate::{
         },
         path_builder,
         s3_connection::S3ConnectionConfig,
-        test_utils::{backends, put_blob_direct},
+        test_utils::{backends, build_store, put_blob_direct},
     },
     secret::Secret,
 };
@@ -82,13 +80,7 @@ impl TestS3Config {
         )
         .map_err(|e| Error::Coordination(e.to_string()))?;
 
-        let facade = Arc::new(
-            Store::builder()
-                .object(object_store)
-                .executor(executor)
-                .build()
-                .map_err(|e| Error::Coordination(e.to_string()))?,
-        );
+        let facade = build_store(object_store, executor);
         let mut builder = MetadataStore::builder()
             .link_cache_ttl(self.link_cache_ttl)
             .access_time_debounce_secs(self.access_time_debounce_secs)

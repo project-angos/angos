@@ -13,15 +13,16 @@ use std::sync::Arc;
 use bytes::Bytes;
 use tokio::runtime::Runtime;
 
-use angos_storage::{ConditionalStore, Error as StorageError, MemoryObjectStore, ObjectStore};
+use angos_storage::{Error as StorageError, MemoryObjectStore, ObjectStore};
 
 use angos_tx_engine::{
-    executor::{TransactionExecutor, cas::CasExecutor, locked::LockedExecutor},
+    executor::TransactionExecutor,
     intent::MutationProgress,
-    lock::{primitive::Lock, storage::memory::MemoryLockStorage},
     recovery::RecoveryLoop,
     transaction::{Mutation, Transaction},
 };
+
+mod common;
 
 // Helper: assert no orphan keys under a prefix.
 async fn assert_no_prefix(store: &MemoryObjectStore, prefix: &str) {
@@ -40,17 +41,7 @@ async fn assert_no_prefix(store: &MemoryObjectStore, prefix: &str) {
 #[tokio::test(flavor = "multi_thread")]
 async fn committed_mutations_are_visible_locked() {
     let store = Arc::new(MemoryObjectStore::new());
-    let lock = Arc::new(
-        Lock::builder()
-            .storage(Arc::new(MemoryLockStorage::new()))
-            .build()
-            .unwrap(),
-    );
-    let executor = LockedExecutor::builder()
-        .store(store.clone() as Arc<dyn ObjectStore>)
-        .lock(lock)
-        .build()
-        .expect("executor builder");
+    let executor = common::locked_executor(store.clone(), common::memory_lock());
 
     let tx = Transaction::builder()
         .mutation(Mutation::Put {
@@ -77,17 +68,7 @@ async fn committed_mutations_are_visible_locked() {
 #[tokio::test(flavor = "multi_thread")]
 async fn no_orphans_after_commit_locked() {
     let store = Arc::new(MemoryObjectStore::new());
-    let lock = Arc::new(
-        Lock::builder()
-            .storage(Arc::new(MemoryLockStorage::new()))
-            .build()
-            .unwrap(),
-    );
-    let executor = LockedExecutor::builder()
-        .store(store.clone() as Arc<dyn ObjectStore>)
-        .lock(lock)
-        .build()
-        .expect("executor builder");
+    let executor = common::locked_executor(store.clone(), common::memory_lock());
 
     let tx = Transaction::builder()
         .mutation(Mutation::Put {
@@ -107,17 +88,7 @@ async fn no_orphans_after_commit_locked() {
 #[tokio::test(flavor = "multi_thread")]
 async fn committed_mutations_are_visible_cas() {
     let store = Arc::new(MemoryObjectStore::new());
-    let lock = Arc::new(
-        Lock::builder()
-            .storage(Arc::new(MemoryLockStorage::new()))
-            .build()
-            .expect("lock"),
-    );
-    let executor = CasExecutor::builder()
-        .store(store.clone() as Arc<dyn ConditionalStore>)
-        .lock(lock)
-        .build()
-        .expect("executor builder");
+    let executor = common::cas_executor(store.clone(), common::memory_lock());
 
     let tx = Transaction::builder()
         .mutation(Mutation::Put {
@@ -146,12 +117,6 @@ async fn committed_mutations_are_visible_cas() {
 #[tokio::test(flavor = "multi_thread")]
 async fn delete_mutation_removes_key() {
     let store = Arc::new(MemoryObjectStore::new());
-    let lock = Arc::new(
-        Lock::builder()
-            .storage(Arc::new(MemoryLockStorage::new()))
-            .build()
-            .unwrap(),
-    );
 
     // Pre-populate.
     store
@@ -159,11 +124,7 @@ async fn delete_mutation_removes_key() {
         .await
         .unwrap();
 
-    let executor = LockedExecutor::builder()
-        .store(store.clone() as Arc<dyn ObjectStore>)
-        .lock(lock)
-        .build()
-        .expect("executor builder");
+    let executor = common::locked_executor(store.clone(), common::memory_lock());
 
     let tx = Transaction::builder()
         .mutation(Mutation::Delete {
@@ -186,23 +147,13 @@ async fn delete_mutation_removes_key() {
 #[tokio::test(flavor = "multi_thread")]
 async fn move_mutation_relocates_body_locked() {
     let store = Arc::new(MemoryObjectStore::new());
-    let lock = Arc::new(
-        Lock::builder()
-            .storage(Arc::new(MemoryLockStorage::new()))
-            .build()
-            .unwrap(),
-    );
 
     store
         .put("staging/blob", Bytes::from_static(b"blob-body"))
         .await
         .unwrap();
 
-    let executor = LockedExecutor::builder()
-        .store(store.clone() as Arc<dyn ObjectStore>)
-        .lock(lock)
-        .build()
-        .expect("executor builder");
+    let executor = common::locked_executor(store.clone(), common::memory_lock());
 
     let tx = Transaction::builder()
         .mutation(Mutation::Move {
@@ -225,23 +176,13 @@ async fn move_mutation_relocates_body_locked() {
 #[tokio::test(flavor = "multi_thread")]
 async fn move_mutation_relocates_body_cas() {
     let store = Arc::new(MemoryObjectStore::new());
-    let lock = Arc::new(
-        Lock::builder()
-            .storage(Arc::new(MemoryLockStorage::new()))
-            .build()
-            .unwrap(),
-    );
 
     store
         .put("staging/blob", Bytes::from_static(b"blob-body"))
         .await
         .unwrap();
 
-    let executor = CasExecutor::builder()
-        .store(store.clone() as Arc<dyn ConditionalStore>)
-        .lock(lock)
-        .build()
-        .expect("executor builder");
+    let executor = common::cas_executor(store.clone(), common::memory_lock());
 
     let tx = Transaction::builder()
         .mutation(Mutation::Move {
@@ -265,23 +206,13 @@ async fn move_mutation_relocates_body_cas() {
 #[tokio::test(flavor = "multi_thread")]
 async fn copy_mutation_propagates_body() {
     let store = Arc::new(MemoryObjectStore::new());
-    let lock = Arc::new(
-        Lock::builder()
-            .storage(Arc::new(MemoryLockStorage::new()))
-            .build()
-            .unwrap(),
-    );
 
     store
         .put("src/blob", Bytes::from_static(b"blob-body"))
         .await
         .unwrap();
 
-    let executor = LockedExecutor::builder()
-        .store(store.clone() as Arc<dyn ObjectStore>)
-        .lock(lock)
-        .build()
-        .expect("executor builder");
+    let executor = common::locked_executor(store.clone(), common::memory_lock());
 
     let tx = Transaction::builder()
         .mutation(Mutation::Copy {
@@ -331,14 +262,8 @@ async fn recovery_loop_cleans_stale_intent() {
 
     // Run one sweep, wiring an uncontended lock so the path under test
     // exercises the production ownership-takeover code.
-    let recovery_lock = Arc::new(
-        Lock::builder()
-            .storage(Arc::new(MemoryLockStorage::new()))
-            .build()
-            .unwrap(),
-    );
     let recovery = RecoveryLoop::builder(store.clone() as Arc<dyn ObjectStore>)
-        .lock(recovery_lock)
+        .lock(common::memory_lock())
         .cancellation(cancel.clone())
         .interval(std::time::Duration::from_hours(1)) // Only sweep on demand.
         .build();
@@ -365,19 +290,7 @@ async fn recovery_loop_cleans_stale_intent() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_disjoint_transactions_all_commit() {
     let store = Arc::new(MemoryObjectStore::new());
-    let lock = Arc::new(
-        Lock::builder()
-            .storage(Arc::new(MemoryLockStorage::new()))
-            .build()
-            .unwrap(),
-    );
-    let executor = Arc::new(
-        LockedExecutor::builder()
-            .store(store.clone() as Arc<dyn ObjectStore>)
-            .lock(lock)
-            .build()
-            .expect("executor builder"),
-    );
+    let executor = common::locked_executor(store.clone(), common::memory_lock());
 
     let mut handles = Vec::new();
     for i in 0..8u32 {

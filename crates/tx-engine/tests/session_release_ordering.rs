@@ -25,30 +25,19 @@ use angos_tx_engine::{
         DEFAULT_RETRY_BUDGET, Outcome, TransactionExecutor, execute_with_retry,
         locked::LockedExecutor,
     },
-    lock::{
-        primitive::Lock,
-        storage::{LockStorage, memory::MemoryLockStorage},
-    },
     transaction::{Mutation, Transaction},
 };
+
+mod common;
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Helpers
 // ──────────────────────────────────────────────────────────────────────────────
 
-fn build_executor(
-    store: Arc<dyn ObjectStore>,
-    lock_storage: Arc<dyn LockStorage>,
-) -> LockedExecutor {
-    let lock = Arc::new(
-        Lock::builder()
-            .storage(lock_storage)
-            .build()
-            .expect("Lock builder"),
-    );
+fn build_executor(store: Arc<dyn ObjectStore>) -> LockedExecutor {
     LockedExecutor::builder()
         .store(store)
-        .lock(lock)
+        .lock(common::memory_lock())
         .build()
         .expect("LockedExecutor builder")
 }
@@ -91,8 +80,7 @@ async fn keys_are_held(executor: &LockedExecutor, keys: &[String]) -> bool {
 #[tokio::test]
 async fn caller_session_released_after_successful_execute_with_retry() {
     let store: Arc<dyn ObjectStore> = Arc::new(MemoryObjectStore::new());
-    let lock_storage: Arc<dyn LockStorage> = Arc::new(MemoryLockStorage::new());
-    let executor = build_executor(store.clone(), lock_storage.clone());
+    let executor = build_executor(store.clone());
 
     let caller_keys = vec!["job:lock_key:demo".to_string()];
 
@@ -137,8 +125,7 @@ async fn caller_session_survives_conflict_exhaust() {
     let mem = MemoryObjectStore::new();
     mem.put("dep", Bytes::from_static(b"body")).await.unwrap();
     let store: Arc<dyn ObjectStore> = Arc::new(mem);
-    let lock_storage: Arc<dyn LockStorage> = Arc::new(MemoryLockStorage::new());
-    let executor = build_executor(store.clone(), lock_storage.clone());
+    let executor = build_executor(store.clone());
 
     let caller_keys = vec!["job:lock_key:conflict".to_string()];
     let session = executor
@@ -189,8 +176,7 @@ async fn caller_session_survives_conflict_exhaust() {
 async fn intent_log_reaped_before_execute_with_retry_returns() {
     let store = Arc::new(MemoryObjectStore::new());
     let store_dyn: Arc<dyn ObjectStore> = store.clone();
-    let lock_storage: Arc<dyn LockStorage> = Arc::new(MemoryLockStorage::new());
-    let executor = build_executor(store_dyn, lock_storage);
+    let executor = build_executor(store_dyn);
 
     let caller_keys = vec!["job:lock_key:reap".to_string()];
     let session = executor
@@ -225,8 +211,7 @@ async fn intent_log_reaped_before_execute_with_retry_returns() {
 #[tokio::test]
 async fn explicit_release_deletes_lock_object() {
     let store: Arc<dyn ObjectStore> = Arc::new(MemoryObjectStore::new());
-    let lock_storage: Arc<dyn LockStorage> = Arc::new(MemoryLockStorage::new());
-    let executor = build_executor(store, lock_storage);
+    let executor = build_executor(store);
 
     let caller_keys = vec!["job:lock_key:delete-probe".to_string()];
     let session = executor
@@ -262,8 +247,7 @@ async fn explicit_release_deletes_lock_object() {
 #[tokio::test]
 async fn executor_execute_never_releases_caller_session() {
     let store: Arc<dyn ObjectStore> = Arc::new(MemoryObjectStore::new());
-    let lock_storage: Arc<dyn LockStorage> = Arc::new(MemoryLockStorage::new());
-    let executor = build_executor(store.clone(), lock_storage.clone());
+    let executor = build_executor(store.clone());
 
     let caller_keys = vec!["job:lock_key:never-touched".to_string()];
     let session = executor

@@ -6,18 +6,14 @@ use chrono::{TimeZone as _, Utc};
 use tempfile::TempDir;
 
 use angos_storage::{MemoryObjectStore, ObjectStore, fs::Backend as StorageFsBackend};
-use angos_tx_engine::{
-    executor::locked::LockedExecutor,
-    lock::{primitive::Lock, storage::memory::MemoryLockStorage},
-    store::Store,
-    transaction::Transaction,
-};
+use angos_tx_engine::transaction::Transaction;
 
 use crate::registry::job_store::{
     FailOutcome, JobEnvelope, JobQueueConfig, JobStore, MAX_REPORTED_PENDING,
     STORAGE_KEY_PREFIX_LEN, backoff, make_storage_key, parse_lock_key_index, parse_not_before,
     serialize_lock_key_index,
 };
+use crate::registry::test_utils::{build_store, locked_executor_over};
 use crate::{metrics_provider, registry::path_builder};
 
 struct Harness {
@@ -45,26 +41,7 @@ fn harness_memory() -> Harness {
 }
 
 fn build_harness(raw: Arc<dyn ObjectStore>) -> Harness {
-    let lock: Arc<Lock> = Arc::new(
-        Lock::builder()
-            .storage(Arc::new(MemoryLockStorage::new()))
-            .build()
-            .expect("lock"),
-    );
-    let executor = Arc::new(
-        LockedExecutor::builder()
-            .store(raw.clone())
-            .lock(lock)
-            .build()
-            .expect("executor"),
-    );
-    let facade = Arc::new(
-        Store::builder()
-            .object(raw.clone())
-            .executor(executor)
-            .build()
-            .expect("store façade"),
-    );
+    let facade = build_store(raw.clone(), locked_executor_over(raw.clone()));
     let store = Arc::new(JobStore::new(facade, "test-worker"));
     Harness { store, raw }
 }

@@ -20,7 +20,6 @@ use uuid::Uuid;
 use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};
 
 use angos_storage::{ObjectStore, fs::Backend as StorageFsBackend};
-use angos_tx_engine::store::Store;
 
 use crate::{
     event_webhook::{
@@ -30,8 +29,8 @@ use crate::{
     },
     oci::{Digest, Namespace, Reference},
     registry::{
-        Registry, blob_store, metadata_store,
-        test_utils::{build_test_fs_executor, create_test_registry},
+        Registry, blob_store,
+        test_utils::{build_test_fs_executor, create_test_registry, metadata_store_over},
     },
     util::sha256,
 };
@@ -59,7 +58,6 @@ impl FsRegistryFixture {
             .unwrap(),
         );
 
-        let meta_executor = build_test_fs_executor(&path, false);
         let meta_storage: Arc<dyn ObjectStore> = Arc::new(
             StorageFsBackend::builder()
                 .root_dir(&path)
@@ -67,19 +65,8 @@ impl FsRegistryFixture {
                 .build()
                 .expect("fs metadata storage"),
         );
-        let meta_facade = Arc::new(
-            Store::builder()
-                .object(meta_storage)
-                .executor(meta_executor)
-                .build()
-                .expect("fs metadata store façade"),
-        );
-        let metadata_store_backend = Arc::new(
-            metadata_store::MetadataStore::builder()
-                .store(meta_facade)
-                .build()
-                .expect("fs metadata backend"),
-        );
+        let metadata_store_backend =
+            metadata_store_over(meta_storage, build_test_fs_executor(&path, false));
 
         let registry = create_test_registry(blob_store, metadata_store_backend);
 

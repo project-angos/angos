@@ -31,7 +31,29 @@ use angos_tx_engine::{
     store::Store,
 };
 
-/// Build an in-process `LockedExecutor` suitable for unit tests.
+/// Build a fresh in-memory lock primitive for tests.
+pub fn memory_lock() -> Arc<Lock> {
+    Arc::new(
+        Lock::builder()
+            .storage(Arc::new(MemoryLockStorage::new()))
+            .build()
+            .expect("test lock"),
+    )
+}
+
+/// Build an in-process `LockedExecutor` over `store`, serialising on a fresh
+/// in-memory lock.
+pub fn locked_executor_over(store: Arc<dyn ObjectStore>) -> Arc<dyn TransactionExecutor> {
+    Arc::new(
+        LockedExecutor::builder()
+            .store(store)
+            .lock(memory_lock())
+            .build()
+            .expect("test executor"),
+    )
+}
+
+/// Build an in-process FS-backed `LockedExecutor` suitable for unit tests.
 pub fn build_test_fs_executor(root_dir: &str, sync_to_disk: bool) -> Arc<dyn TransactionExecutor> {
     let store = Arc::new(
         StorageFsBackend::builder()
@@ -40,37 +62,32 @@ pub fn build_test_fs_executor(root_dir: &str, sync_to_disk: bool) -> Arc<dyn Tra
             .build()
             .expect("test fs store"),
     );
-    let lock = Arc::new(
-        Lock::builder()
-            .storage(Arc::new(MemoryLockStorage::new()))
-            .build()
-            .expect("test lock"),
-    );
-    Arc::new(
-        LockedExecutor::builder()
-            .store(store)
-            .lock(lock)
-            .build()
-            .expect("test executor"),
-    )
+    locked_executor_over(store)
 }
 
-/// Wrap an object store + executor into a cache-less [`MetadataStore`] for
-/// tests (link cache and access-time debounce both disabled).
-fn metadata_store_over(
+/// Wrap an object store + executor into a [`Store`] façade for tests.
+pub fn build_store(
     object: Arc<dyn ObjectStore>,
     executor: Arc<dyn TransactionExecutor>,
-) -> Arc<MetadataStore> {
-    let facade = Arc::new(
+) -> Arc<Store> {
+    Arc::new(
         Store::builder()
             .object(object)
             .executor(executor)
             .build()
             .expect("test store façade"),
-    );
+    )
+}
+
+/// Wrap an object store + executor into a cache-less [`MetadataStore`] for
+/// tests (link cache and access-time debounce both disabled).
+pub fn metadata_store_over(
+    object: Arc<dyn ObjectStore>,
+    executor: Arc<dyn TransactionExecutor>,
+) -> Arc<MetadataStore> {
     Arc::new(
         MetadataStore::builder()
-            .store(facade)
+            .store(build_store(object, executor))
             .link_cache_ttl(0)
             .access_time_debounce_secs(0)
             .build()
