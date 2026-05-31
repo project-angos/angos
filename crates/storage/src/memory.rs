@@ -12,10 +12,10 @@
 //! tests that need an object store without a filesystem or S3 dependency.
 
 use std::{
-    collections::HashMap,
+    collections::{BTreeSet, HashMap},
     io::Cursor,
     sync::{
-        Arc, Mutex,
+        Arc, Mutex, MutexGuard, PoisonError,
         atomic::{AtomicU64, Ordering},
     },
 };
@@ -86,10 +86,8 @@ impl MemoryObjectStore {
         }
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
-        self.inner
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    fn lock(&self) -> MutexGuard<'_, Inner> {
+        self.inner.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     fn next_etag(&self) -> Etag {
@@ -237,9 +235,8 @@ impl ObjectStore for MemoryObjectStore {
             .to_string();
 
         let page_size = n as usize;
-        let mut sub_prefixes: std::collections::BTreeSet<String> =
-            std::collections::BTreeSet::new();
-        let mut objects: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        let mut sub_prefixes: BTreeSet<String> = BTreeSet::new();
+        let mut objects: BTreeSet<String> = BTreeSet::new();
 
         // Ensure the effective prefix ends with '/' so child names are clean
         // (matching the FS backend convention where prefix acts as a directory).
@@ -431,7 +428,10 @@ impl ConditionalStore for MemoryObjectStore {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use bytes::Bytes;
+    use tokio::io::AsyncReadExt;
 
     use crate::memory::MemoryObjectStore;
     use crate::{ConditionalStore, Etag, ObjectStore, Page};
@@ -548,8 +548,6 @@ mod tests {
 
     #[tokio::test]
     async fn get_stream_with_offset() {
-        use tokio::io::AsyncReadExt;
-
         let s = store();
         s.put("k", Bytes::from("abcde")).await.unwrap();
 
@@ -580,7 +578,6 @@ mod tests {
 
     #[tokio::test]
     async fn shared_clones_see_same_data() {
-        use std::sync::Arc;
         let s = Arc::new(store());
         let s2 = s.clone();
         s.put("shared", Bytes::from("x")).await.unwrap();

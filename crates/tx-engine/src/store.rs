@@ -538,13 +538,17 @@ impl StoreBuilder {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use std::sync::Arc;
 
-    use angos_storage::MemoryObjectStore;
+    use bytes::Bytes;
+
+    use angos_storage::{Error as StorageError, MemoryObjectStore};
 
     use crate::{
         executor::locked::LockedExecutor,
         lock::{primitive::Lock, storage::memory::MemoryLockStorage},
+        store::Store,
+        transaction::{Mutation, Transaction},
     };
 
     fn store_over(backend: Arc<MemoryObjectStore>) -> Store {

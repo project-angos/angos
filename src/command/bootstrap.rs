@@ -154,13 +154,15 @@ pub async fn repositories(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use std::collections::HashMap;
+
     use crate::{
         cache,
+        command::bootstrap::{self, Error, auth_cache, repositories},
         command::scrub::Error as ScrubError,
         command::server::Error as ServerError,
         policy::{AccessMode, AccessPolicyConfig},
-        registry::{manifest::DEFAULT_MAX_MANIFEST_SIZE_BYTES, repository},
+        registry::{blob_store, manifest::DEFAULT_MAX_MANIFEST_SIZE_BYTES, repository},
     };
 
     #[test]
@@ -180,7 +182,7 @@ mod tests {
             ..repository::Config::default()
         };
         let cache = auth_cache(&cache::Config::Memory).unwrap();
-        let result = repository(
+        let result = bootstrap::repository(
             "test-repo",
             &repo_config,
             &cache,

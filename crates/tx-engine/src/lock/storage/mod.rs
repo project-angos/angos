@@ -22,7 +22,7 @@ pub mod redis;
 use std::fmt::Debug;
 
 use async_trait::async_trait;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::lock::Error;
@@ -44,7 +44,7 @@ impl LockBody {
     #[must_use]
     pub fn is_expired(&self, last_modified: Option<DateTime<Utc>>) -> bool {
         let reference = last_modified.unwrap_or(self.refreshed_at);
-        let expiry = reference + chrono::Duration::seconds(self.ttl_secs.min(3600).cast_signed());
+        let expiry = reference + Duration::seconds(self.ttl_secs.min(3600).cast_signed());
         Utc::now() > expiry
     }
 }
