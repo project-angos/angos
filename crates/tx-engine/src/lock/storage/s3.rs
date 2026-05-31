@@ -1,6 +1,6 @@
 //! S3 lock storage.
 //!
-//! Writes lock objects at `_locks/<shard>/<key>` on the configured S3 client,
+//! Writes lock objects at `.tx-locks/<shard>/<key>` on the configured S3 client,
 //! using `put_if_not_exists` for `put_if_absent` and `put_if_match` for
 //! heartbeat refresh. Conditional delete is supported when the underlying S3
 //! provider advertises `If-Match` on DELETE.
@@ -27,7 +27,7 @@ fn shard_prefix(key: &str) -> String {
 #[must_use]
 pub fn lock_path(key: &str) -> String {
     let shard = shard_prefix(key);
-    format!("_locks/{shard}/{key}")
+    format!(".tx-locks/{shard}/{key}")
 }
 
 /// S3-backed lock storage.

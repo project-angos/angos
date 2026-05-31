@@ -5,7 +5,7 @@
 //!
 //! - Every committed transaction's mutations are visible in the store.
 //! - Every uncommitted transaction's mutations are absent from the store.
-//! - No orphan objects remain in `tx-log/` or `tx-bodies/` after the recovery
+//! - No orphan objects remain in `.tx-log/` or `.tx-bodies/` after the recovery
 //!   loop has run a sweep.
 
 use std::sync::Arc;
@@ -64,7 +64,7 @@ async fn committed_mutations_are_visible_locked() {
     assert_eq!(b, b"world");
 }
 
-/// After a committed transaction, no orphan tx-log or tx-bodies entries remain.
+/// After a committed transaction, no orphan .tx-log or .tx-bodies entries remain.
 #[tokio::test(flavor = "multi_thread")]
 async fn no_orphans_after_commit_locked() {
     let store = Arc::new(MemoryObjectStore::new());
@@ -80,8 +80,8 @@ async fn no_orphans_after_commit_locked() {
 
     executor.execute(tx).await.expect("execute must succeed");
 
-    assert_no_prefix(&store, "tx-log/").await;
-    assert_no_prefix(&store, "tx-bodies/").await;
+    assert_no_prefix(&store, ".tx-log/").await;
+    assert_no_prefix(&store, ".tx-bodies/").await;
 }
 
 /// CAS executor: committed mutations are visible and no orphans remain.
@@ -109,8 +109,8 @@ async fn committed_mutations_are_visible_cas() {
     assert_eq!(a, b"value-a");
     assert_eq!(b, b"value-b");
 
-    assert_no_prefix(&store, "tx-log/").await;
-    assert_no_prefix(&store, "tx-bodies/").await;
+    assert_no_prefix(&store, ".tx-log/").await;
+    assert_no_prefix(&store, ".tx-bodies/").await;
 }
 
 /// Delete mutations remove the target key.
@@ -242,7 +242,7 @@ async fn recovery_loop_cleans_stale_intent() {
         reads: vec![],
         mutations: vec![angos_tx_engine::intent::MutationRecord::Put {
             key: "recovery/key".to_owned(),
-            body_ref: format!("tx-bodies/{tx_id}/0"),
+            body_ref: format!(".tx-bodies/{tx_id}/0"),
             expected: None,
         }],
         coarse_lock_keys: vec![],
@@ -251,12 +251,15 @@ async fn recovery_loop_cleans_stale_intent() {
 
     // Write the body and intent.
     store
-        .put(&format!("tx-bodies/{tx_id}/0"), Bytes::from_static(b"body"))
+        .put(
+            &format!(".tx-bodies/{tx_id}/0"),
+            Bytes::from_static(b"body"),
+        )
         .await
         .unwrap();
     let intent_json = serde_json::to_vec(&intent).unwrap();
     store
-        .put(&format!("tx-log/{tx_id}.json"), Bytes::from(intent_json))
+        .put(&format!(".tx-log/{tx_id}.json"), Bytes::from(intent_json))
         .await
         .unwrap();
 
@@ -272,8 +275,8 @@ async fn recovery_loop_cleans_stale_intent() {
 
     // After recovery: the stale intent and its bodies should be gone (rolled back
     // because no mutations were applied) and the canonical key must be written.
-    assert_no_prefix(&store, "tx-log/").await;
-    assert_no_prefix(&store, "tx-bodies/").await;
+    assert_no_prefix(&store, ".tx-log/").await;
+    assert_no_prefix(&store, ".tx-bodies/").await;
     // The intent had no Applied progress entries, so it was rolled back —
     // the key must NOT exist.
     let result = store.get("recovery/key").await;

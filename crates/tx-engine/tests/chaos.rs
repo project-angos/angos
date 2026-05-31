@@ -192,11 +192,11 @@ async fn run_recovery(inner: Arc<MemoryObjectStore>) {
     recovery.sweep().await;
 }
 
-/// Backdate every intent under `tx-log/` so the recovery loop treats it as stale.
+/// Backdate every intent under `.tx-log/` so the recovery loop treats it as stale.
 async fn backdate_intents(inner: &MemoryObjectStore) {
-    let suffixes = inner.list("tx-log/", 100, None).await.unwrap().items;
+    let suffixes = inner.list(".tx-log/", 100, None).await.unwrap().items;
     for suffix in &suffixes {
-        let key = format!("tx-log/{suffix}");
+        let key = format!(".tx-log/{suffix}");
         if let Ok(body) = inner.get(&key).await
             && let Ok(mut record) =
                 serde_json::from_slice::<angos_tx_engine::intent::IntentRecord>(&body)
@@ -290,8 +290,8 @@ async fn crash_after_intent_before_apply() {
     run_recovery(inner.clone()).await;
 
     // After recovery: no orphans.
-    assert_no_prefix_inner(&inner, "tx-log/").await;
-    assert_no_prefix_inner(&inner, "tx-bodies/").await;
+    assert_no_prefix_inner(&inner, ".tx-log/").await;
+    assert_no_prefix_inner(&inner, ".tx-bodies/").await;
 }
 
 /// Injecting a crash during Reap (after all mutations are applied) does not
@@ -324,8 +324,8 @@ async fn crash_during_reap() {
 
     run_recovery(inner.clone()).await;
 
-    assert_no_prefix_inner(&inner, "tx-log/").await;
-    assert_no_prefix_inner(&inner, "tx-bodies/").await;
+    assert_no_prefix_inner(&inner, ".tx-log/").await;
+    assert_no_prefix_inner(&inner, ".tx-bodies/").await;
 }
 
 /// An intent with at least one `Applied` progress slot is fully committed;
@@ -346,7 +346,7 @@ async fn recovery_replays_fully_stamped_intent() {
     // the same as the staged bytes here, so replay is a no-op observationally.
     inner
         .put(
-            &format!("tx-bodies/{tx_id}/0"),
+            &format!(".tx-bodies/{tx_id}/0"),
             Bytes::from_static(b"already-there"),
         )
         .await
@@ -360,7 +360,7 @@ async fn recovery_replays_fully_stamped_intent() {
         reads: vec![],
         mutations: vec![MutationRecord::Put {
             key: "stamped/key".to_owned(),
-            body_ref: format!("tx-bodies/{tx_id}/0"),
+            body_ref: format!(".tx-bodies/{tx_id}/0"),
             expected: None,
         }],
         coarse_lock_keys: vec![],
@@ -368,7 +368,7 @@ async fn recovery_replays_fully_stamped_intent() {
     };
     inner
         .put(
-            &format!("tx-log/{tx_id}.json"),
+            &format!(".tx-log/{tx_id}.json"),
             Bytes::from(serde_json::to_vec(&intent).unwrap()),
         )
         .await
@@ -377,7 +377,7 @@ async fn recovery_replays_fully_stamped_intent() {
     run_recovery(inner.clone()).await;
 
     // Intent reaped; canonical key intact.
-    assert_no_prefix_inner(&inner, "tx-log/").await;
+    assert_no_prefix_inner(&inner, ".tx-log/").await;
     let body = inner
         .get("stamped/key")
         .await
@@ -408,7 +408,7 @@ fn backend_error_is_not_not_found() {
 /// Invariants verified:
 /// 1. For crash points before the intent lands (writes 0–3): no canonical keys
 ///    are present after recovery — the transaction was never committed.
-/// 2. For all crash points: the recovery loop leaves no tx-log/ orphans.
+/// 2. For all crash points: the recovery loop leaves no .tx-log/ orphans.
 #[tokio::test(flavor = "multi_thread")]
 async fn manifest_push_crash_mid_apply_recovery_converges() {
     // Keys that mirror the manifest-engine transaction shape.
@@ -477,8 +477,8 @@ async fn manifest_push_crash_mid_apply_recovery_converges() {
             );
         }
 
-        // Invariant 2: recovery always cleans tx-log/ orphans.
-        assert_no_prefix_inner(&inner, "tx-log/").await;
+        // Invariant 2: recovery always cleans .tx-log/ orphans.
+        assert_no_prefix_inner(&inner, ".tx-log/").await;
     }
 }
 
@@ -486,17 +486,17 @@ async fn manifest_push_crash_mid_apply_recovery_converges() {
 // Progress-vector invariants under both executors
 // ──────────────────────────────────────────────────────────────────────────────
 
-/// Read the (only) intent under `tx-log/` directly, bypassing the recovery
+/// Read the (only) intent under `.tx-log/` directly, bypassing the recovery
 /// loop, and return its parsed form.
 async fn read_only_intent(inner: &MemoryObjectStore) -> angos_tx_engine::intent::IntentRecord {
-    let suffixes = inner.list("tx-log/", 100, None).await.unwrap().items;
+    let suffixes = inner.list(".tx-log/", 100, None).await.unwrap().items;
     assert_eq!(
         suffixes.len(),
         1,
-        "expected exactly one tx-log entry, got {suffixes:?}"
+        "expected exactly one .tx-log entry, got {suffixes:?}"
     );
     let body = inner
-        .get(&format!("tx-log/{}", suffixes[0]))
+        .get(&format!(".tx-log/{}", suffixes[0]))
         .await
         .expect("intent must still be present");
     serde_json::from_slice(&body).expect("intent must parse")

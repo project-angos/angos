@@ -23,7 +23,7 @@ pub enum Error {
 
     /// A CAS transaction was partially committed (at least one mutation landed)
     /// but a subsequent mutation encountered true contention: the live body does
-    /// not match the staged body. The intent is left in `tx-log/` for the
+    /// not match the staged body. The intent is left in `.tx-log/` for the
     /// recovery loop to converge.
     #[error("partial commit: true contention on a mid-apply mutation")]
     PartialCommit,

@@ -67,7 +67,7 @@ pub enum Mutation {
     /// Server-side copy from `src` to `dst`.
     ///
     /// The engine calls `ObjectStore::copy`. Neither end of the copy is
-    /// held in `tx-bodies`; this is intended for promoting staged data
+    /// held in `.tx-bodies`; this is intended for promoting staged data
     /// (already in the store) to its canonical location.
     Copy { src: String, dst: String },
 

@@ -229,7 +229,7 @@ impl CasExecutor {
     ///   healthy-path write already landed without its stamp. The slot is
     ///   marked `Applied` and the loop continues to the next mutation.
     /// - If the live body does not match, this is true contention. The intent
-    ///   is left in `tx-log/` for the recovery loop and
+    ///   is left in `.tx-log/` for the recovery loop and
     ///   `Err(Error::PartialCommit)` is returned so the caller skips `reap`.
     async fn apply_all(&self, intent: &mut IntentRecord) -> Result<(), Error> {
         let tx_id = intent.id;
@@ -503,7 +503,7 @@ impl TransactionExecutor for CasExecutor {
         // Only reap when the apply path completed cleanly (all mutations
         // landed) or failed in a way that still left the intent in a consistent
         // state. `PartialCommit` means the intent was partially applied and
-        // true contention stopped the loop — the intent MUST stay in `tx-log/`
+        // true contention stopped the loop — the intent MUST stay in `.tx-log/`
         // so the recovery loop can converge it.
         let is_partial_commit = matches!(apply_result, Err(Error::PartialCommit));
         if !is_partial_commit {

@@ -22,7 +22,7 @@
 //! 6. When mutation[0] lands and is stamped, then mutation[1] returns
 //!    `PreconditionFailed` with a live body that does NOT match (true
 //!    contention), the executor returns `Error::PartialCommit` and preserves
-//!    the intent in `tx-log/` for the recovery loop.
+//!    the intent in `.tx-log/` for the recovery loop.
 
 use std::sync::{
     Arc,
@@ -137,14 +137,14 @@ async fn concurrent_recovery_loops_apply_each_mutation_exactly_once() {
     let tx_id = Uuid::new_v4();
     inner
         .put(
-            &format!("tx-bodies/{tx_id}/0"),
+            &format!(".tx-bodies/{tx_id}/0"),
             Bytes::from_static(b"sibling-body"),
         )
         .await
         .unwrap();
     inner
         .put(
-            &format!("tx-bodies/{tx_id}/1"),
+            &format!(".tx-bodies/{tx_id}/1"),
             Bytes::from_static(b"staged-body"),
         )
         .await
@@ -160,12 +160,12 @@ async fn concurrent_recovery_loops_apply_each_mutation_exactly_once() {
             // enters replay-forward.
             MutationRecord::PutIfAbsent {
                 key: "race/sibling".to_string(),
-                body_ref: format!("tx-bodies/{tx_id}/0"),
+                body_ref: format!(".tx-bodies/{tx_id}/0"),
             },
             // Pending mutation under test.
             MutationRecord::Put {
                 key: "race/dst".to_string(),
-                body_ref: format!("tx-bodies/{tx_id}/1"),
+                body_ref: format!(".tx-bodies/{tx_id}/1"),
                 expected: None,
             },
         ],
@@ -177,7 +177,7 @@ async fn concurrent_recovery_loops_apply_each_mutation_exactly_once() {
     };
     inner
         .put(
-            &format!("tx-log/{tx_id}.json"),
+            &format!(".tx-log/{tx_id}.json"),
             Bytes::from(serde_json::to_vec(&intent).unwrap()),
         )
         .await
@@ -223,14 +223,14 @@ async fn already_applied_mutations_are_skipped() {
     let tx_id = Uuid::new_v4();
     store
         .put(
-            &format!("tx-bodies/{tx_id}/0"),
+            &format!(".tx-bodies/{tx_id}/0"),
             Bytes::from_static(b"would-overwrite-sentinel"),
         )
         .await
         .unwrap();
     store
         .put(
-            &format!("tx-bodies/{tx_id}/1"),
+            &format!(".tx-bodies/{tx_id}/1"),
             Bytes::from_static(b"pending-body"),
         )
         .await
@@ -244,12 +244,12 @@ async fn already_applied_mutations_are_skipped() {
         mutations: vec![
             MutationRecord::Put {
                 key: "applied/k0".to_string(),
-                body_ref: format!("tx-bodies/{tx_id}/0"),
+                body_ref: format!(".tx-bodies/{tx_id}/0"),
                 expected: None,
             },
             MutationRecord::Put {
                 key: "applied/k1".to_string(),
-                body_ref: format!("tx-bodies/{tx_id}/1"),
+                body_ref: format!(".tx-bodies/{tx_id}/1"),
                 expected: None,
             },
         ],
@@ -261,7 +261,7 @@ async fn already_applied_mutations_are_skipped() {
     };
     store
         .put(
-            &format!("tx-log/{tx_id}.json"),
+            &format!(".tx-log/{tx_id}.json"),
             Bytes::from(serde_json::to_vec(&intent).unwrap()),
         )
         .await
@@ -303,11 +303,11 @@ async fn cas_recovery_treats_stale_etag_with_matching_body_as_applied() {
         .expect("seed dst")
         .expect("etag");
 
-    // Stage the same body in tx-bodies (so its sha256 matches the live body).
+    // Stage the same body in .tx-bodies (so its sha256 matches the live body).
     let tx_id = Uuid::new_v4();
     store
         .put(
-            &format!("tx-bodies/{tx_id}/0"),
+            &format!(".tx-bodies/{tx_id}/0"),
             Bytes::from_static(b"final-body"),
         )
         .await
@@ -316,7 +316,7 @@ async fn cas_recovery_treats_stale_etag_with_matching_body_as_applied() {
     // so its replay is a CAS no-op.
     store
         .put(
-            &format!("tx-bodies/{tx_id}/1"),
+            &format!(".tx-bodies/{tx_id}/1"),
             Bytes::from_static(b"sibling"),
         )
         .await
@@ -340,11 +340,11 @@ async fn cas_recovery_treats_stale_etag_with_matching_body_as_applied() {
         mutations: vec![
             MutationRecord::PutIfAbsent {
                 key: "cas/sibling".to_string(),
-                body_ref: format!("tx-bodies/{tx_id}/1"),
+                body_ref: format!(".tx-bodies/{tx_id}/1"),
             },
             MutationRecord::Put {
                 key: "cas/dst".to_string(),
-                body_ref: format!("tx-bodies/{tx_id}/0"),
+                body_ref: format!(".tx-bodies/{tx_id}/0"),
                 expected: Some(stale_etag),
             },
         ],
@@ -356,7 +356,7 @@ async fn cas_recovery_treats_stale_etag_with_matching_body_as_applied() {
     };
     store
         .put(
-            &format!("tx-log/{tx_id}.json"),
+            &format!(".tx-log/{tx_id}.json"),
             Bytes::from(serde_json::to_vec(&intent).unwrap()),
         )
         .await
@@ -377,7 +377,7 @@ async fn cas_recovery_treats_stale_etag_with_matching_body_as_applied() {
     assert_eq!(body, b"final-body");
     assert!(
         store
-            .list("tx-log/", 10, None)
+            .list(".tx-log/", 10, None)
             .await
             .unwrap()
             .items
@@ -404,7 +404,7 @@ async fn cas_recovery_stops_on_true_contention() {
     let tx_id = Uuid::new_v4();
     store
         .put(
-            &format!("tx-bodies/{tx_id}/0"),
+            &format!(".tx-bodies/{tx_id}/0"),
             Bytes::from_static(b"our-staged-body"),
         )
         .await
@@ -412,7 +412,7 @@ async fn cas_recovery_stops_on_true_contention() {
     // Sibling already-applied so replay_forward runs.
     store
         .put(
-            &format!("tx-bodies/{tx_id}/1"),
+            &format!(".tx-bodies/{tx_id}/1"),
             Bytes::from_static(b"sibling"),
         )
         .await
@@ -432,11 +432,11 @@ async fn cas_recovery_stops_on_true_contention() {
         mutations: vec![
             MutationRecord::PutIfAbsent {
                 key: "cas/sibling".to_string(),
-                body_ref: format!("tx-bodies/{tx_id}/1"),
+                body_ref: format!(".tx-bodies/{tx_id}/1"),
             },
             MutationRecord::Put {
                 key: "cas/dst".to_string(),
-                body_ref: format!("tx-bodies/{tx_id}/0"),
+                body_ref: format!(".tx-bodies/{tx_id}/0"),
                 expected: Some(stale_etag),
             },
         ],
@@ -448,7 +448,7 @@ async fn cas_recovery_stops_on_true_contention() {
     };
     store
         .put(
-            &format!("tx-log/{tx_id}.json"),
+            &format!(".tx-log/{tx_id}.json"),
             Bytes::from(serde_json::to_vec(&intent).unwrap()),
         )
         .await
@@ -466,7 +466,7 @@ async fn cas_recovery_stops_on_true_contention() {
     // place for the next sweep.
     let body = store.get("cas/dst").await.expect("dst still present");
     assert_eq!(body, b"someone-elses-body");
-    let logs = store.list("tx-log/", 10, None).await.unwrap().items;
+    let logs = store.list(".tx-log/", 10, None).await.unwrap().items;
     assert_eq!(
         logs.len(),
         1,
@@ -536,8 +536,8 @@ async fn cas_executor_stale_stamp_mid_apply_continues_and_commits() {
     store.get("exec/dst0").await.expect("dst0 present");
     store.get("exec/dst1").await.expect("dst1 present");
 
-    // Intent must have been reaped (no tx-log/ entries).
-    let logs = store.list("tx-log/", 10, None).await.unwrap().items;
+    // Intent must have been reaped (no .tx-log/ entries).
+    let logs = store.list(".tx-log/", 10, None).await.unwrap().items;
     assert!(
         logs.is_empty(),
         "intent must be reaped after successful commit: {logs:?}"
@@ -547,7 +547,7 @@ async fn cas_executor_stale_stamp_mid_apply_continues_and_commits() {
 /// Executor-path: mutation[0] lands and is stamped `Applied`. mutation[1]
 /// returns `PreconditionFailed` and the live body at the destination does NOT
 /// match the staged body (true contention). The executor must return
-/// `Error::PartialCommit` and leave the intent in `tx-log/` for the recovery
+/// `Error::PartialCommit` and leave the intent in `.tx-log/` for the recovery
 /// loop.
 #[tokio::test]
 async fn cas_executor_true_contention_mid_apply_leaves_intent() {
@@ -591,7 +591,7 @@ async fn cas_executor_true_contention_mid_apply_leaves_intent() {
     assert_eq!(body, b"someone-elses-body");
 
     // Intent must NOT have been reaped — recovery must be able to converge it.
-    let logs = store.list("tx-log/", 10, None).await.unwrap().items;
+    let logs = store.list(".tx-log/", 10, None).await.unwrap().items;
     assert_eq!(
         logs.len(),
         1,

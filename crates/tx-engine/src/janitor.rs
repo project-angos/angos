@@ -1,8 +1,8 @@
 //! Janitors that reap engine bookkeeping prefixes:
 //!
-//! - [`BodyJanitor`] sweeps `tx-bodies/<tx-id>/` prefixes whose intent never
-//!   landed in `tx-log/`, bounded by an age threshold.
-//! - [`LockJanitor`] sweeps `_locks/` for lock objects whose declared TTL has
+//! - [`BodyJanitor`] sweeps `.tx-bodies/<tx-id>/` prefixes whose intent never
+//!   landed in `.tx-log/`, bounded by an age threshold.
+//! - [`LockJanitor`] sweeps `.tx-locks/` for lock objects whose declared TTL has
 //!   elapsed by more than `orphan_age` — the cold-key counterpart to the lock
 //!   primitive's acquire-path stale-lock recovery.
 
@@ -27,8 +27,8 @@ pub const DEFAULT_ORPHAN_AGE_SECS: u64 = 3600; // 1 hour
 
 /// Orphan-body janitor.
 ///
-/// On each tick, lists `tx-bodies/` children and for each `tx-id` prefix
-/// that has no corresponding `tx-log/<tx-id>.json` and whose UUID timestamp
+/// On each tick, lists `.tx-bodies/` children and for each `tx-id` prefix
+/// that has no corresponding `.tx-log/<tx-id>.json` and whose UUID timestamp
 /// indicates it is older than the configured age, deletes the entire prefix.
 ///
 /// Constructed via [`BodyJanitor::builder`].
@@ -126,13 +126,13 @@ impl BodyJanitor {
         }
     }
 
-    /// Run a single sweep of `tx-bodies/`.
+    /// Run a single sweep of `.tx-bodies/`.
     pub async fn sweep(&self) {
         let mut token: Option<String> = None;
         loop {
             match self
                 .store
-                .list_children("tx-bodies/", 100, token.clone(), None)
+                .list_children(".tx-bodies/", 100, token.clone(), None)
                 .await
             {
                 Ok(page) => {
@@ -145,19 +145,19 @@ impl BodyJanitor {
                     token = page.next_token;
                 }
                 Err(e) => {
-                    warn!(error = %e, "BodyJanitor: failed to list tx-bodies/");
+                    warn!(error = %e, "BodyJanitor: failed to list .tx-bodies/");
                     break;
                 }
             }
         }
     }
 
-    /// Examine one `tx-bodies/<tx-id>/` prefix. Delete it if the tx-id
+    /// Examine one `.tx-bodies/<tx-id>/` prefix. Delete it if the tx-id
     /// corresponds to a v4 UUID that is old enough and has no live intent.
     async fn process_prefix(&self, sub_prefix: &str) {
-        // sub_prefix is like "tx-bodies/<tx-id>/" — extract the UUID.
+        // sub_prefix is like ".tx-bodies/<tx-id>/" — extract the UUID.
         let tx_id_str = sub_prefix
-            .trim_start_matches("tx-bodies/")
+            .trim_start_matches(".tx-bodies/")
             .trim_end_matches('/');
 
         let Ok(tx_id) = tx_id_str.parse::<Uuid>() else {
@@ -168,7 +168,7 @@ impl BodyJanitor {
         // Age estimation: v4 UUIDs are random but we can use object head for
         // last-modified. Fall back to skipping if head is unavailable.
         // Simpler: check whether the intent exists first.
-        let intent_key = format!("tx-log/{tx_id}.json");
+        let intent_key = format!(".tx-log/{tx_id}.json");
         match self.store.head(&intent_key).await {
             Ok(_) => {
                 // Intent exists — not an orphan; the owner or recovery will reap.
@@ -245,12 +245,12 @@ impl BodyJanitor {
 /// janitor reclaims it.
 pub const DEFAULT_LOCK_ORPHAN_AGE_SECS: u64 = 300; // 5 minutes
 
-/// Default page size when listing `_locks/`.
+/// Default page size when listing `.tx-locks/`.
 const LOCK_LIST_PAGE_SIZE: u16 = 100;
 
 /// Orphan-lock janitor.
 ///
-/// On each tick, paginates through `_locks/` and for each lock object whose
+/// On each tick, paginates through `.tx-locks/` and for each lock object whose
 /// body has expired (TTL elapsed against the server-assigned `last_modified`
 /// when available, falling back to the embedded `refreshed_at`) by more than
 /// the configured `orphan_age`, deletes it.
@@ -372,18 +372,18 @@ impl LockJanitor {
         }
     }
 
-    /// Run a single sweep of `_locks/`.
+    /// Run a single sweep of `.tx-locks/`.
     pub async fn sweep(&self) {
         let mut token: Option<String> = None;
         loop {
             match self
                 .store
-                .list("_locks/", LOCK_LIST_PAGE_SIZE, token.clone())
+                .list(".tx-locks/", LOCK_LIST_PAGE_SIZE, token.clone())
                 .await
             {
                 Ok(page) => {
                     for suffix in &page.items {
-                        let key = format!("_locks/{suffix}");
+                        let key = format!(".tx-locks/{suffix}");
                         self.process_key(&key).await;
                     }
                     if page.next_token.is_none() {
@@ -392,7 +392,7 @@ impl LockJanitor {
                     token = page.next_token;
                 }
                 Err(e) => {
-                    warn!(error = %e, "LockJanitor: failed to list _locks/");
+                    warn!(error = %e, "LockJanitor: failed to list .tx-locks/");
                     break;
                 }
             }
@@ -493,7 +493,7 @@ mod tests {
     use crate::lock::storage::LockBody;
 
     fn lock_key(suffix: &str) -> String {
-        format!("_locks/{suffix}")
+        format!(".tx-locks/{suffix}")
     }
 
     async fn write_lock(store: &MemoryObjectStore, suffix: &str, body: &LockBody) {

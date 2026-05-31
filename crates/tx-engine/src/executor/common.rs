@@ -45,7 +45,7 @@ pub async fn stamp_progress(
     write_intent(store, intent).await
 }
 
-/// Stage `Put`/`PutIfAbsent` bodies at `tx-bodies/<tx_id>/<idx>` and return
+/// Stage `Put`/`PutIfAbsent` bodies at `.tx-bodies/<tx_id>/<idx>` and return
 /// the matching [`MutationRecord`]s for the intent.
 ///
 /// # Errors
@@ -64,7 +64,7 @@ pub async fn stage_bodies(
                 body,
                 expected,
             } => {
-                let body_ref = format!("tx-bodies/{tx_id}/{idx}");
+                let body_ref = format!(".tx-bodies/{tx_id}/{idx}");
                 store
                     .put(&body_ref, body.clone())
                     .await
@@ -76,7 +76,7 @@ pub async fn stage_bodies(
                 }
             }
             Mutation::PutIfAbsent { key, body } => {
-                let body_ref = format!("tx-bodies/{tx_id}/{idx}");
+                let body_ref = format!(".tx-bodies/{tx_id}/{idx}");
                 store
                     .put(&body_ref, body.clone())
                     .await

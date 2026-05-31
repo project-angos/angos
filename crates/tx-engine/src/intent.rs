@@ -1,12 +1,12 @@
 //! On-disk shape of a transaction intent record.
 //!
-//! An intent record is written to `tx-log/<tx-id>.json` before any canonical
+//! An intent record is written to `.tx-log/<tx-id>.json` before any canonical
 //! keys are mutated. It is the linearisation point: once this write succeeds,
 //! the transaction WILL be observed (either by the owning worker finishing
 //! Apply/Reap, or by the recovery loop replaying it).
 //!
 //! Body bytes for `Put` and `PutIfAbsent` mutations are staged at
-//! `tx-bodies/<tx-id>/<idx>` *before* the intent PUT, so the intent JSON
+//! `.tx-bodies/<tx-id>/<idx>` *before* the intent PUT, so the intent JSON
 //! stays small (KB-scale). The `body_ref` field records where to find the
 //! bytes during Apply and recovery.
 
@@ -81,7 +81,7 @@ pub struct ReadRecord {
     pub fingerprint: String,
 }
 
-/// The complete intent record written to `tx-log/<tx-id>.json`.
+/// The complete intent record written to `.tx-log/<tx-id>.json`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IntentRecord {
     /// Unique transaction identifier.
@@ -111,19 +111,19 @@ impl IntentRecord {
     /// Return the object key under which this intent is stored.
     #[must_use]
     pub fn log_key(&self) -> String {
-        format!("tx-log/{}.json", self.id)
+        format!(".tx-log/{}.json", self.id)
     }
 
-    /// Return the `tx-bodies` prefix for mutation body staging.
+    /// Return the `.tx-bodies` prefix for mutation body staging.
     #[must_use]
     pub fn bodies_prefix(&self) -> String {
-        format!("tx-bodies/{}/", self.id)
+        format!(".tx-bodies/{}/", self.id)
     }
 
     /// Return the staging key for mutation body at index `idx`.
     #[must_use]
     pub fn body_ref(&self, idx: usize) -> String {
-        format!("tx-bodies/{}/{}", self.id, idx)
+        format!(".tx-bodies/{}/{}", self.id, idx)
     }
 
     /// Returns `true` if the owner's heartbeat is considered stale.

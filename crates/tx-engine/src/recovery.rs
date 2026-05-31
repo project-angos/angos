@@ -1,4 +1,4 @@
-//! Recovery loop: periodically scans `tx-log/` and replays or rolls back
+//! Recovery loop: periodically scans `.tx-log/` and replays or rolls back
 //! intents whose owner's heartbeat has gone stale.
 
 use std::sync::Arc;
@@ -26,7 +26,7 @@ use crate::{
 ///
 /// On each tick the loop:
 ///
-/// 1. Lists all entries under `tx-log/`.
+/// 1. Lists all entries under `.tx-log/`.
 /// 2. Deserialises each intent; skips intents whose owner's heartbeat is fresh.
 /// 3. For stale intents:
 ///    - Acquires the intent's lock set (so a still-alive owner cannot race the
@@ -173,16 +173,16 @@ impl RecoveryLoop {
         }
     }
 
-    /// Run a single sweep: list `tx-log/`, process each intent.
+    /// Run a single sweep: list `.tx-log/`, process each intent.
     pub async fn sweep(&self) {
         let mut token: Option<String> = None;
         loop {
-            match self.store.list("tx-log/", 100, token.clone()).await {
+            match self.store.list(".tx-log/", 100, token.clone()).await {
                 Ok(page) => {
                     for suffix in page.items {
                         // `list` returns keys relative to the prefix; reconstruct
                         // the full key so `get`/`delete` resolve correctly.
-                        let key = format!("tx-log/{suffix}");
+                        let key = format!(".tx-log/{suffix}");
                         self.process_intent(&key).await;
                     }
                     if page.next_token.is_none() {
@@ -191,7 +191,7 @@ impl RecoveryLoop {
                     token = page.next_token;
                 }
                 Err(e) => {
-                    warn!(error = %e, "RecoveryLoop: failed to list tx-log/, will retry next tick");
+                    warn!(error = %e, "RecoveryLoop: failed to list .tx-log/, will retry next tick");
                     break;
                 }
             }

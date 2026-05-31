@@ -31,7 +31,7 @@
 //! |---|---|---|
 //! | `memory` | [`MemoryLockStorage`] | In-process; single-process only (default for FS deployments) |
 //! | `redis`  | [`RedisLockStorage`] | Feature `redis`; suitable for FS stores under heavy load |
-//! | `s3`     | [`S3LockStorage`] | CAS-capable S3; uses `_locks/<shard>/<key>` objects |
+//! | `s3`     | [`S3LockStorage`] | CAS-capable S3; uses `.tx-locks/<shard>/<key>` objects |
 
 use std::{
     collections::hash_map::RandomState,

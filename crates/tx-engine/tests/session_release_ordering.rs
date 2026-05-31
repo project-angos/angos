@@ -9,7 +9,7 @@
 //! - A caller holding a session across `execute_with_retry` releases it after
 //!   the transaction commits.
 //! - The lock object is removed from lock storage after the explicit release.
-//! - Release happens after the intent log is reaped (no orphaned tx-log keys).
+//! - Release happens after the intent log is reaped (no orphaned .tx-log keys).
 //! - The session survives a `Conflict`-exhausted retry loop and can still be
 //!   released cleanly.
 
@@ -192,15 +192,15 @@ async fn intent_log_reaped_before_execute_with_retry_returns() {
     .await;
     assert!(result.is_ok());
 
-    let stale = store.list("tx-log/", 100, None).await.unwrap().items;
+    let stale = store.list(".tx-log/", 100, None).await.unwrap().items;
     assert!(
         stale.is_empty(),
         "intent log must be reaped before execute_with_retry returns: {stale:?}"
     );
-    let stale_bodies = store.list("tx-bodies/", 100, None).await.unwrap().items;
+    let stale_bodies = store.list(".tx-bodies/", 100, None).await.unwrap().items;
     assert!(
         stale_bodies.is_empty(),
-        "tx-bodies must be reaped before execute_with_retry returns: {stale_bodies:?}"
+        ".tx-bodies must be reaped before execute_with_retry returns: {stale_bodies:?}"
     );
 
     session.release().await;

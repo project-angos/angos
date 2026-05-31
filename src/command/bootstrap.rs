@@ -54,8 +54,8 @@ impl From<blob_store::Error> for Error {
 /// Spawn the transactional-engine maintenance loops (recovery + body janitor
 /// + lock janitor).
 ///
-/// These subsystems clean up the engine's `tx-log/`, `tx-bodies/`, and
-/// `_locks/` namespaces. They use the engine's default intervals (recovery:
+/// These subsystems clean up the engine's `.tx-log/`, `.tx-bodies/`, and
+/// `.tx-locks/` namespaces. They use the engine's default intervals (recovery:
 /// 30 s; body janitor: 5 min sweep, 1 h orphan age; lock janitor: 5 min
 /// sweep, 5 min orphan-age grace on top of each lock's own TTL) and shut down
 /// when `cancellation` fires. Spawning them is idempotent in effect, but

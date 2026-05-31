@@ -27,7 +27,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::lock::Error;
 
-/// Serialized body of a lock object stored at `_locks/<shard>/<key>`.
+/// Serialized body of a lock object stored at `.tx-locks/<shard>/<key>`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LockBody {
     /// Wall-clock time this payload was last written. Used as a fallback when
