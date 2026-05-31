@@ -19,7 +19,7 @@
 use std::{
     fs::FileType,
     io::{self, ErrorKind, SeekFrom, Write},
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
 };
 
 use async_trait::async_trait;
@@ -170,12 +170,23 @@ impl Backend {
     /// [`Backend::delete_prefix`] invokes it for callers; nothing outside this
     /// module triggers it directly.
     async fn prune_empty_ancestors(&self, key: &str) {
-        let start = self.full_path(key);
-        let root = &self.root;
+        // Lexically resolve `.`/`..` BEFORE touching the filesystem. `full_path`
+        // does a bare `root.join(key)`, and `Path::starts_with` is purely
+        // lexical — it does not collapse `..`. Without normalization a key like
+        // `a/../../x` yields ancestor paths that still contain `..`, slip past a
+        // `starts_with(root)` guard, and resolve at syscall time to a directory
+        // *above* the configured root, where `remove_dir` could delete it.
+        let root = normalize_lexical(&self.root);
+        let start = normalize_lexical(&self.full_path(key));
+        // Refuse to touch anything that does not lie strictly under the root.
+        if !start.starts_with(&root) || start == root {
+            return;
+        }
         let mut current = start.parent();
         while let Some(parent) = current {
             // The store root is the ceiling: never remove it or anything above.
-            if parent == root || !parent.starts_with(root) {
+            // Both paths are normalized, so this comparison is `..`-proof.
+            if parent == root || !parent.starts_with(&root) {
                 break;
             }
             let Ok(mut entries) = fs::read_dir(parent).await else {
@@ -229,6 +240,33 @@ impl Backend {
         all_objects.sort();
         Ok((all_sub_prefixes, all_objects))
     }
+}
+
+/// Resolve `.` and `..` components purely lexically, with no I/O.
+///
+/// Unlike [`Path::canonicalize`] this performs no syscalls, follows no
+/// symlinks, and does not require the path to exist — it is a pure string-level
+/// collapse used to make ancestor pruning escape-proof. `Prefix`/`RootDir`
+/// components are preserved, `.` is dropped, `..` pops the last `Normal`
+/// component (but never the leading prefix/root), and `Normal` components are
+/// pushed. A `..` that would climb above the prefix/root is simply ignored, so
+/// the result can never lexically escape the path's own anchor.
+fn normalize_lexical(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(_) | Component::RootDir => out.push(component.as_os_str()),
+            Component::CurDir => {}
+            // Pop only a real path segment; never climb past the prefix/root anchor.
+            Component::ParentDir => {
+                if matches!(out.components().next_back(), Some(Component::Normal(_))) {
+                    out.pop();
+                }
+            }
+            Component::Normal(part) => out.push(part),
+        }
+    }
+    out
 }
 
 /// Create all parent directories of `path`.

@@ -111,6 +111,62 @@ async fn delete_prefix_stops_pruning_at_first_non_empty_ancestor() {
     assert!(dir.path().join("shard/aa").exists());
 }
 
+/// A `..`-bearing key whose ancestors resolve *above* the store root must
+/// never let pruning touch anything outside the root. `prune_empty_ancestors`
+/// must lexically collapse the path before any `read_dir`/`remove_dir`, so a
+/// crafted escape resolves to "not under root" and prunes nothing. Regression
+/// guard for the lexical-`starts_with` hole that let `remove_dir` delete an
+/// empty directory sitting next to the configured root.
+#[tokio::test]
+async fn prune_empty_ancestors_refuses_to_escape_root_via_dotdot() {
+    use std::fs as stdfs;
+
+    let dir = TempDir::new().unwrap();
+    // The store root is a *sub*directory of the tempdir, so a sibling dir can
+    // sit outside the root yet still inside the tempdir we control.
+    let root = dir.path().join("root");
+    stdfs::create_dir(&root).unwrap();
+    let outside = dir.path().join("outside");
+    stdfs::create_dir(&outside).unwrap();
+
+    let store = Backend::builder()
+        .root_dir(&root)
+        .build()
+        .expect("backend must build");
+
+    // `root.join("../outside/leaf")` resolves at syscall time to
+    // `<tmp>/outside/leaf`; its parent is the empty `<tmp>/outside`, which the
+    // old lexical guard would have happily `remove_dir`'d.
+    store.prune_empty_ancestors("../outside/leaf").await;
+
+    assert!(
+        outside.exists(),
+        "pruning must never remove a directory outside the configured root"
+    );
+    assert!(root.exists(), "the store root itself must survive");
+}
+
+/// Companion to the escape guard: a normal nested key (no `.`/`..`) must still
+/// have its now-empty in-root ancestors pruned exactly as before — the fix
+/// changes nothing for well-formed keys.
+#[tokio::test]
+async fn prune_empty_ancestors_still_collapses_normal_in_root_chain() {
+    let dir = TempDir::new().unwrap();
+    let store = backend(&dir);
+
+    // Build an empty chain `p/q/r` with no leaf left behind, then prune from a
+    // would-be leaf inside it.
+    std::fs::create_dir_all(dir.path().join("p/q/r")).unwrap();
+
+    store.prune_empty_ancestors("p/q/r/leaf").await;
+
+    assert!(
+        !dir.path().join("p").exists(),
+        "empty in-root ancestors must still be pruned for normal keys"
+    );
+    assert!(dir.path().exists(), "the store root is never removed");
+}
+
 #[tokio::test]
 async fn head_reports_size_and_mtime() {
     let dir = TempDir::new().unwrap();
