@@ -8,7 +8,7 @@ use std::future::Future;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use tracing::debug;
+use tracing::{debug, info};
 use uuid::Uuid;
 
 use angos_storage::{ConditionalStore, ObjectStore};
@@ -230,6 +230,17 @@ pub fn build_executor(
     s3_lock_delete_if_match: bool,
     supports_cas: bool,
 ) -> Result<Arc<dyn TransactionExecutor>, Error> {
+    // Capture a stable label for the lock-object backend before the match
+    // below moves `lock_strategy`. Logged alongside the executor choice so
+    // operators are not misled into reading the lock strategy as the
+    // coordination path: both executors share this backend.
+    let lock_backend = match &lock_strategy {
+        LockStrategy::Memory => "memory",
+        #[cfg(feature = "redis")]
+        LockStrategy::Redis(_) => "redis",
+        LockStrategy::S3(_) => "s3",
+    };
+
     // Each arm yields the lock-object storage plus a `LockBuilder` primed with
     // the per-strategy tuning carried in the strategy config. The tuning is
     // threaded directly into the builder (never stored as a Config field), and
@@ -280,6 +291,10 @@ pub fn build_executor(
             .lock(lock)
             .build()
             .map_err(|e| Error::Build(format!("failed to build CAS executor: {e}")))?;
+        info!(
+            executor = "cas",
+            lock_backend, "transactional engine executor selected"
+        );
         return Ok(Arc::new(exec));
     }
 
@@ -288,5 +303,9 @@ pub fn build_executor(
         .lock(lock)
         .build()
         .map_err(|e| Error::Build(format!("failed to build locked executor: {e}")))?;
+    info!(
+        executor = "locked",
+        lock_backend, "transactional engine executor selected"
+    );
     Ok(Arc::new(exec))
 }
