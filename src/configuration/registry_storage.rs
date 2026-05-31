@@ -333,7 +333,7 @@ impl RegistryStorageConfig {
                 let object: Arc<dyn ObjectStore> = backend.clone();
                 let conditional_store: Arc<dyn ConditionalStore> = backend;
 
-                let s3_lock_client = match &config.lock_strategy {
+                let s3_lock_store: Option<Arc<dyn ConditionalStore>> = match &config.lock_strategy {
                     LockStrategy::S3(s3_lock_config) => {
                         if !caps_resolved.supports_cas() {
                             return Err(Error::Coordination(format!(
@@ -343,16 +343,16 @@ impl RegistryStorageConfig {
                                 caps_resolved.put_if_none_match, caps_resolved.put_if_match
                             )));
                         }
-                        Some(Arc::new(
-                            S3HttpBackend::new(
-                                &config.connection.to_lock_client_config(s3_lock_config),
-                            )
-                            .map_err(|e| {
-                                Error::Coordination(format!(
-                                    "Failed to initialize S3 lock client: {e}"
-                                ))
-                            })?,
-                        ))
+                        let lock_http = S3HttpBackend::new(
+                            &config.connection.to_lock_client_config(s3_lock_config),
+                        )
+                        .map_err(|e| {
+                            Error::Coordination(format!("Failed to initialize S3 lock client: {e}"))
+                        })?;
+                        let lock_backend = StorageS3Backend::builder()
+                            .client(Arc::new(lock_http))
+                            .build()?;
+                        Some(Arc::new(lock_backend))
                     }
                     LockStrategy::Redis(_) | LockStrategy::Memory => None,
                 };
@@ -361,7 +361,7 @@ impl RegistryStorageConfig {
                     object.clone(),
                     Some(conditional_store),
                     config.lock_strategy.clone(),
-                    s3_lock_client,
+                    s3_lock_store,
                     caps_resolved.delete_if_match,
                     caps_resolved.supports_cas(),
                 )

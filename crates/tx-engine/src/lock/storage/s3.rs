@@ -1,22 +1,25 @@
 //! S3 lock storage.
 //!
-//! Writes lock objects at `.tx-locks/<shard>/<key>` on the configured S3 client,
-//! using `put_if_not_exists` for `put_if_absent` and `put_if_match` for
-//! heartbeat refresh. Conditional delete is supported when the underlying S3
-//! provider advertises `If-Match` on DELETE.
+//! Writes lock objects at `.tx-locks/<shard>/<key>` on a
+//! [`ConditionalStore`](angos_storage::ConditionalStore) backend, using
+//! `put_if_absent` for atomic acquire and `put_if_match` for heartbeat refresh.
+//! Conditional delete is supported when the underlying provider advertises
+//! `If-Match` on DELETE.
 
-use std::{fmt::Debug, io::ErrorKind, sync::Arc};
+use std::{fmt::Debug, sync::Arc};
 
 use async_trait::async_trait;
+use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use sha2::{Digest as ShaDigest, Sha256};
 use tracing::warn;
+
+use angos_storage::{ConditionalStore, Error as StorageError, Etag, ObjectStore};
 
 use crate::lock::{
     Error,
     storage::{DeleteIfMatchOutcome, LockStorage, PutIfAbsentOutcome, PutIfMatchOutcome},
 };
-use angos_s3_client as s3_client;
 
 fn shard_prefix(key: &str) -> String {
     let hash = Sha256::digest(key.as_bytes());
@@ -32,15 +35,15 @@ pub fn lock_path(key: &str) -> String {
 
 /// S3-backed lock storage.
 ///
-/// Uses `put_if_not_exists` for atomic acquire and `put_if_match` for
-/// heartbeat refresh. Conditional delete is used for release when
-/// `supports_conditional_delete` is `true`; otherwise a plain delete is
-/// used with an ownership check first.
+/// Uses `put_if_absent` for atomic acquire and `put_if_match` for heartbeat
+/// refresh. Conditional delete is used for release when
+/// `supports_conditional_delete` is `true`; otherwise a plain delete is used
+/// with an ownership check first.
 ///
 /// Constructed via [`S3LockStorage::new`].
 #[derive(Clone)]
 pub struct S3LockStorage {
-    store: Arc<s3_client::Backend>,
+    store: Arc<dyn ConditionalStore>,
     supports_conditional_delete: bool,
 }
 
@@ -56,9 +59,9 @@ impl Debug for S3LockStorage {
 }
 
 impl S3LockStorage {
-    /// Construct an `S3LockStorage` from an existing S3 client backend.
+    /// Construct an `S3LockStorage` from an existing conditional store.
     #[must_use]
-    pub fn new(store: Arc<s3_client::Backend>, supports_conditional_delete: bool) -> Self {
+    pub fn new(store: Arc<dyn ConditionalStore>, supports_conditional_delete: bool) -> Self {
         Self {
             store,
             supports_conditional_delete,
@@ -76,9 +79,9 @@ impl S3LockStorage {
 impl LockStorage for S3LockStorage {
     async fn put_if_absent(&self, key: &str, body: Vec<u8>) -> Result<PutIfAbsentOutcome, Error> {
         let path = lock_path(key);
-        match self.store.put_object_if_not_exists(&path, body).await {
-            Ok(etag) => Ok(PutIfAbsentOutcome::Created(etag)),
-            Err(s3_client::Error::PreconditionFailed) => Ok(PutIfAbsentOutcome::AlreadyExists),
+        match self.store.put_if_absent(&path, Bytes::from(body)).await {
+            Ok(etag) => Ok(PutIfAbsentOutcome::Created(etag.map(Etag::into_inner))),
+            Err(StorageError::PreconditionFailed) => Ok(PutIfAbsentOutcome::AlreadyExists),
             Err(e) => Err(Error::StorageBackend(e.to_string())),
         }
     }
@@ -90,13 +93,14 @@ impl LockStorage for S3LockStorage {
         body: Vec<u8>,
     ) -> Result<PutIfMatchOutcome, Error> {
         let path = lock_path(key);
+        let etag = Etag::new(expected_etag);
         match self
             .store
-            .put_object_if_match(&path, expected_etag, body)
+            .put_if_match(&path, &etag, Bytes::from(body))
             .await
         {
-            Ok(new_etag) => Ok(PutIfMatchOutcome::Updated(new_etag)),
-            Err(s3_client::Error::PreconditionFailed) => Ok(PutIfMatchOutcome::Mismatch),
+            Ok(new_etag) => Ok(PutIfMatchOutcome::Updated(new_etag.map(Etag::into_inner))),
+            Err(StorageError::PreconditionFailed) => Ok(PutIfMatchOutcome::Mismatch),
             Err(e) => Err(Error::StorageBackend(e.to_string())),
         }
     }
@@ -106,18 +110,19 @@ impl LockStorage for S3LockStorage {
         key: &str,
     ) -> Result<(Vec<u8>, Option<String>, Option<DateTime<Utc>>), Error> {
         let path = lock_path(key);
-        match self.store.read_with_metadata(&path).await {
-            Ok((body, etag, last_modified)) => Ok((body, etag, last_modified)),
-            Err(e) if e.kind() == ErrorKind::NotFound => Err(Error::NotFound),
+        match self.store.get_with_metadata(&path).await {
+            Ok((body, etag, last_modified)) => {
+                Ok((body, etag.map(Etag::into_inner), last_modified))
+            }
+            Err(StorageError::NotFound) => Err(Error::NotFound),
             Err(e) => Err(Error::StorageBackend(e.to_string())),
         }
     }
 
     async fn delete(&self, key: &str) -> Result<(), Error> {
         let path = lock_path(key);
-        match self.store.delete(&path).await {
-            Ok(()) => Ok(()),
-            Err(e) if e.kind() == ErrorKind::NotFound => Ok(()),
+        match ObjectStore::delete(self.store.as_ref(), &path).await {
+            Ok(()) | Err(StorageError::NotFound) => Ok(()),
             Err(e) => {
                 warn!(key, error = %e, "S3LockStorage: delete failed");
                 Err(Error::StorageBackend(e.to_string()))
@@ -135,9 +140,10 @@ impl LockStorage for S3LockStorage {
             return Ok(DeleteIfMatchOutcome::Deleted);
         }
         let path = lock_path(key);
-        match self.store.delete_if_match(&path, expected_etag).await {
-            Err(s3_client::Error::PreconditionFailed) => Ok(DeleteIfMatchOutcome::Mismatch),
-            Ok(()) | Err(s3_client::Error::NotFound(_)) => Ok(DeleteIfMatchOutcome::Deleted),
+        let etag = Etag::new(expected_etag);
+        match self.store.delete_if_match(&path, &etag).await {
+            Err(StorageError::PreconditionFailed) => Ok(DeleteIfMatchOutcome::Mismatch),
+            Ok(()) | Err(StorageError::NotFound) => Ok(DeleteIfMatchOutcome::Deleted),
             Err(e) => Err(Error::StorageBackend(e.to_string())),
         }
     }

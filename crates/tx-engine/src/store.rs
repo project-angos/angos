@@ -4,8 +4,9 @@
 //! [`ObjectStore`], plus optional upload-session and presign capabilities)
 //! together with the [`TransactionExecutor`] that commits
 //! coordinated writes. Subsystems (`metadata_store`, `blob_store`,
-//! `job_store`) hold a single `Arc<Store>` and never reach for `angos_storage`
-//! or `angos_s3_client` directly.
+//! `job_store`) hold a single `Arc<Store>` for their per-operation storage
+//! access; the concrete backends are constructed from `angos_storage` at the
+//! configuration seam.
 //!
 //! The façade stays domain-agnostic: it speaks only `String` keys and `Bytes`
 //! bodies. Registry domain types (`Digest`, `LinkKind`, OCI hashing, serde)

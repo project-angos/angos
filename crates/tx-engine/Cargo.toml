@@ -7,7 +7,6 @@ edition = "2024"
 pedantic = { level = "warn", priority = -1 }
 
 [dependencies]
-angos-s3-client = { path = "../s3-client" }
 angos-storage = { path = "../storage" }
 async-trait = "0.1.89"
 bytes = "1.11.1"

@@ -137,7 +137,6 @@ dependencies = [
 name = "angos-tx-engine"
 version = "0.1.0"
 dependencies = [
- "angos-s3-client",
  "angos-storage",
  "async-trait",
  "bytes",

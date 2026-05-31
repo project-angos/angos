@@ -62,11 +62,16 @@ impl TestS3Config {
         let cond_store: Arc<dyn ConditionalStore> = raw_storage;
 
         let caps = conditional.unwrap_or_default();
-        let s3_lock_client = match &self.lock_strategy {
-            LockStrategy::S3(cfg) => Some(Arc::new(
-                S3HttpBackend::new(&self.connection.to_lock_client_config(cfg))
-                    .map_err(|e| Error::Coordination(e.to_string()))?,
-            )),
+        let s3_lock_store: Option<Arc<dyn ConditionalStore>> = match &self.lock_strategy {
+            LockStrategy::S3(cfg) => {
+                let lock_http = S3HttpBackend::new(&self.connection.to_lock_client_config(cfg))
+                    .map_err(|e| Error::Coordination(e.to_string()))?;
+                let lock_backend = StorageS3Backend::builder()
+                    .client(Arc::new(lock_http))
+                    .build()
+                    .map_err(|e| Error::StorageBackend(e.to_string()))?;
+                Some(Arc::new(lock_backend))
+            }
             _ => None,
         };
 
@@ -74,7 +79,7 @@ impl TestS3Config {
             object_store.clone(),
             Some(cond_store),
             self.lock_strategy.clone(),
-            s3_lock_client,
+            s3_lock_store,
             caps.delete_if_match,
             caps.supports_cas(),
         )

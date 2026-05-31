@@ -32,6 +32,7 @@ use std::{collections::HashSet, io, sync::Arc, time::Duration};
 use angos_s3_client::{Backend as S3Backend, UploadedPart};
 use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
+use chrono::{DateTime, Utc};
 use futures_util::{StreamExt, stream};
 use tokio::{
     io::{AsyncRead, AsyncReadExt},
@@ -459,6 +460,14 @@ impl ConditionalStore for Backend {
     async fn get_with_etag(&self, key: &str) -> Result<(Vec<u8>, Option<Etag>), Error> {
         let (body, etag) = self.client.read_with_etag(key).await?;
         Ok((body, etag.map(Etag::new)))
+    }
+
+    async fn get_with_metadata(
+        &self,
+        key: &str,
+    ) -> Result<(Vec<u8>, Option<Etag>, Option<DateTime<Utc>>), Error> {
+        let (body, etag, last_modified) = self.client.read_with_metadata(key).await?;
+        Ok((body, etag.map(Etag::new), last_modified))
     }
 
     async fn put_if_absent(&self, key: &str, data: Bytes) -> Result<Option<Etag>, Error> {

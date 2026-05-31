@@ -24,9 +24,11 @@ pub mod recovery;
 pub mod store;
 pub mod transaction;
 
-// Storage value types re-exported so subsystems depend on `tx-engine` alone
-// and never import `angos_storage` directly. The `Store` façade in
-// [`store`] is the seam through which all storage access flows.
+// Storage value types re-exported for convenience, so call sites that already
+// hold a `tx-engine` handle can name these types without a second `use`. The
+// store traits and backends (`ObjectStore`, `ConditionalStore`, the S3/FS/memory
+// backends) are obtained from `angos_storage` directly; the `Store` façade in
+// [`store`] is the seam through which a subsystem's storage access flows.
 pub use angos_storage::{
     BoxedReader, ByteStream, ChildrenPage, Error as StorageError, Etag, MultipartUploadPage,
     ObjectMeta, Page, PendingMultipartUpload, UploadSession,

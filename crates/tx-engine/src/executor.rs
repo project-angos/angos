@@ -11,7 +11,6 @@ use async_trait::async_trait;
 use tracing::debug;
 use uuid::Uuid;
 
-use angos_s3_client::Backend as S3HttpBackend;
 use angos_storage::{ConditionalStore, ObjectStore};
 
 #[cfg(feature = "redis")]
@@ -206,9 +205,10 @@ where
 ///   [`LockedExecutor`]. The caller is responsible for probing conditional
 ///   capabilities (via [`crate::probe::probe_conditional_capabilities`]) and
 ///   setting `supports_cas` accordingly before calling this function.
-/// - For [`LockStrategy::S3`] the caller must provide `s3_lock_client` (an
-///   HTTP client tuned for short-lived lock requests; subsystems already
-///   build one for their data store and can hand the same client in).
+/// - For [`LockStrategy::S3`] the caller must provide `s3_lock_store` (a
+///   [`ConditionalStore`] tuned for short-lived lock requests; subsystems
+///   build one for their data store and can wrap the lock-tuned client the
+///   same way).
 ///
 /// Returns the constructed `Arc<dyn TransactionExecutor>`. Callers that need
 /// the lock primitive or conditional store (for example, to wire the
@@ -219,14 +219,14 @@ where
 /// # Errors
 ///
 /// Returns [`Error::Build`] when `LockStrategy::S3` is selected without an
-/// `s3_lock_client`, when the `redis` feature is not enabled and Redis is
+/// `s3_lock_store`, when the `redis` feature is not enabled and Redis is
 /// selected, or when the underlying lock or executor builder rejects its
 /// inputs.
 pub fn build_executor(
     store: Arc<dyn ObjectStore>,
     conditional: Option<Arc<dyn ConditionalStore>>,
     lock_strategy: LockStrategy,
-    s3_lock_client: Option<Arc<S3HttpBackend>>,
+    s3_lock_store: Option<Arc<dyn ConditionalStore>>,
     s3_lock_delete_if_match: bool,
     supports_cas: bool,
 ) -> Result<Arc<dyn TransactionExecutor>, Error> {
@@ -254,11 +254,11 @@ pub fn build_executor(
                 .retry_delay_ms(config.retry_delay_ms)
         }
         LockStrategy::S3(config) => {
-            let client = s3_lock_client.ok_or_else(|| {
-                Error::Build("S3 lock strategy requires an S3 HTTP client".to_string())
+            let lock_store = s3_lock_store.ok_or_else(|| {
+                Error::Build("S3 lock strategy requires an S3 conditional store".to_string())
             })?;
             let storage: Arc<dyn LockStorage> =
-                Arc::new(S3LockStorage::new(client, s3_lock_delete_if_match));
+                Arc::new(S3LockStorage::new(lock_store, s3_lock_delete_if_match));
             Lock::builder()
                 .storage(storage)
                 .ttl_secs(config.ttl_secs)
