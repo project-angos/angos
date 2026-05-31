@@ -193,6 +193,19 @@ pub struct LinksTxExtras<'a> {
     /// per-namespace shard becomes empty, no other namespace references the
     /// blob, and the blob currently exists.
     pub blob_data_delete_if_unreferenced: Option<&'a Digest>,
+    /// Direct blob-index shard operations for `digest` in the current
+    /// namespace, applied alongside (or instead of) the operations derived
+    /// from link deletes. `delete_blob` uses this to revoke its ownership
+    /// entry (`Remove(Blob(digest))`), which lives purely in the shard and has
+    /// no backing link reference, so the conditional blob-data delete above can
+    /// fire from the same transaction.
+    pub blob_index_ops: Option<(&'a Digest, Vec<BlobIndexOperation>)>,
+    /// When `true`, the planner omits the `blob-data:{digest}` coarse lock from
+    /// the transaction even though it emits the conditional blob-data delete.
+    /// `delete_blob` sets this because it already holds that same coarse lock
+    /// for the whole revoke-and-reclaim critical section; the engine lock is
+    /// not reentrant, so re-declaring it here would self-deadlock.
+    pub caller_holds_blob_data_lock: bool,
     /// When `true`, the planner unconditionally registers the namespace on
     /// success (used by `store_manifest`). Otherwise registration happens only
     /// when at least one `Create` op was processed.
@@ -273,7 +286,8 @@ impl MetadataStore {
 
                 let had_creates = prelock_results.iter().any(|(c, _)| c.is_some());
                 let has_extras = extras.blob_data_put.is_some()
-                    || extras.blob_data_delete_if_unreferenced.is_some();
+                    || extras.blob_data_delete_if_unreferenced.is_some()
+                    || extras.blob_index_ops.is_some();
 
                 // Empty no-op short-circuit: no creates, every delete target
                 // already missing, and no extras to apply.
@@ -329,6 +343,16 @@ impl MetadataStore {
                 let mut pending_blob_ops: HashMap<Digest, Vec<BlobIndexOperation>> = HashMap::new();
                 let mut written_links: Vec<(LinkKind, LinkMetadata)> = Vec::new();
                 let mut deleted_links: Vec<LinkKind> = Vec::new();
+
+                // Seed direct blob-index ops (e.g. `delete_blob`'s ownership
+                // revoke) so the conditional blob-data delete and the shard
+                // mutations below treat them like link-derived ops.
+                if let Some((digest, ops)) = &extras.blob_index_ops {
+                    pending_blob_ops
+                        .entry((*digest).clone())
+                        .or_default()
+                        .extend(ops.iter().cloned());
+                }
 
                 // Blob-data Put first when present (manifest bytes are
                 // content-addressed, so the order doesn't matter — colocating
@@ -521,12 +545,15 @@ impl MetadataStore {
                 }
 
                 if let Some(digest) = include_blob_delete {
-                    builder = builder
-                        .mutation(Mutation::Delete {
-                            key: path_builder::blob_path(digest),
-                            expected: None,
-                        })
-                        .coarse_lock(format!("blob-data:{digest}"));
+                    builder = builder.mutation(Mutation::Delete {
+                        key: path_builder::blob_path(digest),
+                        expected: None,
+                    });
+                    // Skip the engine coarse lock when the caller already holds
+                    // it (`delete_blob`); the lock is not reentrant.
+                    if !extras.caller_holds_blob_data_lock {
+                        builder = builder.coarse_lock(format!("blob-data:{digest}"));
+                    }
                 }
 
                 Ok((

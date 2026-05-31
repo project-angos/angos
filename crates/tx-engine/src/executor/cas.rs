@@ -500,13 +500,14 @@ impl TransactionExecutor for CasExecutor {
 
         let apply_result = self.apply_all(&mut intent).await;
 
-        // Only reap when the apply path completed cleanly (all mutations
-        // landed) or failed in a way that still left the intent in a consistent
-        // state. `PartialCommit` means the intent was partially applied and
-        // true contention stopped the loop — the intent MUST stay in `.tx-log/`
-        // so the recovery loop can converge it.
-        let is_partial_commit = matches!(apply_result, Err(Error::PartialCommit));
-        if !is_partial_commit {
+        // Reap only when the transaction either fully committed or applied
+        // nothing. Once any mutation has applied, preserve the intent for
+        // recovery so the loop can replay-forward idempotently and converge;
+        // reaping here would orphan the partial canonical write. This subsumes
+        // the `PartialCommit` case (which always implies `any_applied`). On the
+        // `Precondition` + nothing-applied path `apply_all` already rolled back,
+        // so reaping deleted objects here is a harmless no-op.
+        if apply_result.is_ok() || !intent.any_applied() {
             reap(self.store.as_ref(), &intent).await;
         }
 

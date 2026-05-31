@@ -482,6 +482,80 @@ async fn manifest_push_crash_mid_apply_recovery_converges() {
     }
 }
 
+/// A transient (non-permanent) storage error mid-Apply, after at least one
+/// mutation has been applied and stamped, must NOT cause the executor to reap
+/// the intent. Reaping would delete the staged bodies + intent and orphan the
+/// partial canonical write, breaking the all-or-nothing guarantee. The intent
+/// must survive so the recovery loop can replay-forward and converge.
+#[tokio::test(flavor = "multi_thread")]
+async fn partial_apply_error_preserves_intent_for_recovery() {
+    let inner = Arc::new(MemoryObjectStore::new());
+
+    // Two-mutation Put transaction. Write sequence for the Locked executor:
+    //   write 0: body staging for mutation 0
+    //   write 1: body staging for mutation 1
+    //   write 2: intent PUT
+    //   write 3: Apply mutation 0 (Put k0)
+    //   write 4: stamp_progress (intent re-PUT marking mutation 0 Applied)
+    //   write 5: Apply mutation 1 (Put k1)  ← crash here (transient)
+    // Crashing on write 5 fails the second apply put after mutation 0 has
+    // applied and stamped. Being non-permanent, the later reap writes would
+    // succeed — which is exactly the scenario the buggy unconditional reap
+    // mishandled.
+    let crashing = Arc::new(CrashingStore::new(inner.clone(), 5));
+
+    let lock = common::memory_lock();
+    let executor = common::locked_executor(crashing.clone(), lock);
+
+    let tx = Transaction::builder()
+        .mutation(Mutation::Put {
+            key: "partial/k0".to_owned(),
+            body: Bytes::from_static(b"body-0"),
+            expected: None,
+        })
+        .mutation(Mutation::Put {
+            key: "partial/k1".to_owned(),
+            body: Bytes::from_static(b"body-1"),
+            expected: None,
+        })
+        .build();
+
+    let result = executor.execute(tx).await;
+    assert!(
+        result.is_err(),
+        "execute must surface the injected mid-Apply error"
+    );
+
+    // With the fix, the intent survives (any mutation applied → no reap).
+    // Without the fix it would have been reaped, making recovery impossible.
+    let intents = inner.list(".tx-log/", 100, None).await.unwrap().items;
+    assert_eq!(
+        intents.len(),
+        1,
+        "intent must survive a partial-apply error so recovery can converge"
+    );
+
+    // Backdate + run recovery; it replays-forward idempotently.
+    backdate_intents(&inner).await;
+    run_recovery(inner.clone()).await;
+
+    // Both canonical keys present with correct bodies.
+    let b0 = inner
+        .get("partial/k0")
+        .await
+        .expect("k0 must be present after recovery");
+    assert_eq!(b0, b"body-0");
+    let b1 = inner
+        .get("partial/k1")
+        .await
+        .expect("k1 must be present after recovery");
+    assert_eq!(b1, b"body-1");
+
+    // No orphans: recovery reaped the intent and staged bodies.
+    assert_no_prefix_inner(&inner, ".tx-log/").await;
+    assert_no_prefix_inner(&inner, ".tx-bodies/").await;
+}
+
 // ──────────────────────────────────────────────────────────────────────────────
 // Progress-vector invariants under both executors
 // ──────────────────────────────────────────────────────────────────────────────

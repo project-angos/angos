@@ -24,6 +24,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - Scrub `-r` no longer aborts the entire namespace when one orphan manifest's blob is missing or unreadable: a legitimately absent blob is handled gracefully (metadata links are still removed), a transient storage error retries on the next run, and a failure on any single revision no longer prevents subsequent revisions in the same namespace from being processed.
 - Scrub orphan-blob deletion now acquires the blob-data lock and re-checks ownership before deleting, preventing a concurrent upload from losing its bytes when scrub classifies the blob as orphan between the upload hashing step and the ownership grant.
 - Scrub on S3 now converges namespaces whose only artifact is an upload session (e.g. a client that crashed mid-push): the namespace registry tree walk includes any namespace that has an underscore-prefixed child, matching filesystem backend behaviour. Such namespaces are now visible to `UploadChecker` and their stale bytes are cleaned up by `scrub --uploads`.
+- As part of the upload-session rework, `scrub --uploads` now also aborts the in-flight S3 multipart upload recorded in a stale session — not just the metadata-layer session artifacts — so an abandoned upload no longer leaves behind an orphan multipart that only `scrub --multipart` could reap.
 - Scrub `-b` now purges all blob-index entries (including ownership markers) for any blob whose backing bytes are absent, so runtime `can_read` no longer reports such blobs as accessible to clients.
 - Scrub `-m` now validates that each revision's digest link points back at the revision's own digest, and rewrites the link when a mismatch is found. The check runs before the manifest blob is read, so a corrupt link is repaired even when its blob is unreachable.
 
@@ -81,7 +82,6 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 - Deprecated fields removed from `config.example.toml`.
 - The `lease_*` keys under `[global.job_queue]` are gone along with the legacy lease subsystem they configured.
-- The `MultipartCleanup` trait and the `scrub multipart` check that consumed it. S3 multipart aborts are now handled inside `UploadChecker` (the existing `scrub --uploads` check), which calls `delete_via_session` to abort the multipart upload alongside the durable session record.
 
 ### Fixed
 

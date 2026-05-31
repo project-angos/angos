@@ -505,14 +505,18 @@ impl JobStore {
                 // one-mutation engine transaction whose Read fingerprint validates
                 // the index hasn't been refreshed by a concurrent enqueue between
                 // our GET and the apply. If it has, the engine returns Conflict —
-                // we don't delete the fresh index.
-                let tx = Transaction::builder()
-                    .read(index_path.clone(), Bytes::from(data.clone()))
-                    .mutation(Mutation::Delete {
-                        key: index_path,
-                        expected: None,
-                    })
-                    .build();
+                // we don't delete the fresh index. Passing the index's own
+                // `storage_key` as the target makes the conditional delete fire
+                // for this orphan while reusing the shared fingerprint guard.
+                let (read, delete) = Self::conditional_index_delete(
+                    index_path,
+                    &data,
+                    &index.storage_key,
+                    &index.storage_key,
+                );
+                let mut tx = Transaction::builder().build();
+                tx.reads.extend(read);
+                tx.mutations.extend(delete);
                 match self.store.execute(tx).await {
                     Ok(_) | Err(TxError::Conflict | TxError::Precondition) => Ok(false),
                     Err(e) => {
@@ -549,6 +553,40 @@ impl JobStore {
 
     pub async fn get_raw(&self, key: &str) -> Result<Vec<u8>, Error> {
         self.store.get(key).await.map_err(Error::from)
+    }
+
+    /// Build the read dependency and conditional `Delete` that retire a
+    /// per-`lock_key` dedup index, but only when the index still points at
+    /// `target_storage_key`.
+    ///
+    /// `index_storage_key` / `index_body` are the parsed `storage_key` and the
+    /// raw bytes of the current index (as returned by
+    /// [`Self::get_lock_key_index_raw`]). When the index points elsewhere the
+    /// returned pair is empty and the caller leaves the index untouched.
+    ///
+    /// The `Read` carries a fingerprint of `index_body`, so an index refreshed
+    /// by a concurrent enqueue between the read and the apply turns the delete
+    /// into a no-op conflict rather than clobbering the fresh index. Three
+    /// call sites fold this into their own transactions: the orphan self-heal
+    /// in `find_pending_with_lock_key`, `complete`, and `fail_dead_letter`.
+    fn conditional_index_delete(
+        index_path: String,
+        index_body: &[u8],
+        index_storage_key: &str,
+        target_storage_key: &str,
+    ) -> (Option<Read>, Option<Mutation>) {
+        if index_storage_key != target_storage_key {
+            return (None, None);
+        }
+        let read = Read {
+            key: index_path.clone(),
+            fingerprint: Sha256::digest(index_body).into(),
+        };
+        let delete = Mutation::Delete {
+            key: index_path,
+            expected: None,
+        };
+        (Some(read), Some(delete))
     }
 
     // -----------------------------------------------------------------------
@@ -710,20 +748,21 @@ impl JobStore {
 
         // We hold the execution lock, so no concurrent worker can swing the
         // index. The conditional read is a belt-and-braces guard that costs
-        // one HEAD; if the index points elsewhere we leave it alone.
-        match self.store.get(&index_path).await {
+        // one HEAD; if the index points elsewhere we leave it alone. A corrupt
+        // index cannot be matched or fingerprinted, so we delete it
+        // unconditionally — safe because we are the unique writer here.
+        match self.get_raw(&index_path).await {
             Ok(body) => match parse_lock_key_index(&body) {
-                Ok(index) if index.storage_key == storage_key => {
-                    tx.reads.push(Read {
-                        key: index_path.clone(),
-                        fingerprint: Sha256::digest(&body).into(),
-                    });
-                    tx.mutations.push(Mutation::Delete {
-                        key: index_path,
-                        expected: None,
-                    });
+                Ok(index) => {
+                    let (read, delete) = Self::conditional_index_delete(
+                        index_path,
+                        &body,
+                        &index.storage_key,
+                        &storage_key,
+                    );
+                    tx.reads.extend(read);
+                    tx.mutations.extend(delete);
                 }
-                Ok(_) => {}
                 Err(_) => {
                     tx.mutations.push(Mutation::Delete {
                         key: index_path,
@@ -731,10 +770,10 @@ impl JobStore {
                     });
                 }
             },
-            Err(StorageError::NotFound) => {}
+            Err(Error::NotFound) => {}
             Err(e) => {
                 session.release().await;
-                return Err(Error::from(e));
+                return Err(e);
             }
         }
 
@@ -839,7 +878,7 @@ impl JobStore {
 
         let failed_body = Bytes::from(serialize_dead_letter(&envelope, err)?);
 
-        let mut tx_builder = Transaction::builder()
+        let mut tx = Transaction::builder()
             .mutation(Mutation::Put {
                 key: failed_path,
                 body: failed_body,
@@ -848,7 +887,8 @@ impl JobStore {
             .mutation(Mutation::Delete {
                 key: pending_path,
                 expected: None,
-            });
+            })
+            .build();
 
         // Conditionally include the index delete: only when the index still
         // points at our storage_key. Read the index to get the fingerprint.
@@ -857,22 +897,24 @@ impl JobStore {
             .get_lock_key_index_raw(&envelope.queue, &envelope.lock_key)
             .await
         {
-            Ok(Some((sk, body))) if sk == storage_key => {
-                tx_builder = tx_builder
-                    .read(index_path.clone(), Bytes::from(body))
-                    .mutation(Mutation::Delete {
-                        key: index_path,
-                        expected: None,
-                    });
+            Ok(Some((index_storage_key, body))) => {
+                let (read, delete) = Self::conditional_index_delete(
+                    index_path,
+                    &body,
+                    &index_storage_key,
+                    &storage_key,
+                );
+                tx.reads.extend(read);
+                tx.mutations.extend(delete);
             }
-            Ok(_) => {}
+            Ok(None) => {}
             Err(e) => {
                 session.release().await;
                 return Err(e);
             }
         }
 
-        let result = self.store.execute(tx_builder.build()).await;
+        let result = self.store.execute(tx).await;
         session.release().await;
         result.map_err(tx_error_to_job)?;
 

@@ -9,10 +9,16 @@ use crate::{
     registry::blob_store::MultipartCleanup,
 };
 
-/// Store-wide checker that aborts orphaned S3 multipart uploads — in-flight
-/// uploads older than `timeout` with no live session backing them. This is the
-/// backend-level counterpart to [`UploadChecker`](super::UploadChecker), which
-/// only reaps the metadata-layer session artifacts.
+/// Store-wide, backend-level sweep that lists raw orphan S3 multipart uploads —
+/// in-flight uploads older than `timeout` with no recoverable session record
+/// behind them (e.g. a crash between opening the multipart and persisting its
+/// id, or pre-migration orphans) — and aborts them.
+///
+/// This is complementary to [`UploadChecker`](super::UploadChecker)
+/// (`scrub --uploads`), which reaps live upload-session containers and aborts
+/// their associated multipart via the persisted session record. Because
+/// `UploadChecker` can only act on uploads that have a session record, this
+/// checker is what catches multipart uploads that have no such record.
 pub struct MultipartChecker {
     cleanup: Arc<dyn MultipartCleanup + Send + Sync>,
     timeout: Duration,

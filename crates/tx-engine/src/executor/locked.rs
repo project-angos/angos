@@ -248,7 +248,14 @@ impl TransactionExecutor for LockedExecutor {
         }
 
         let apply_result = self.apply_all(&mut intent).await;
-        reap(self.store.as_ref(), &intent).await;
+
+        // Reap only when the transaction either fully committed or applied
+        // nothing. Once any mutation has applied, preserve the intent for
+        // recovery so the loop can replay-forward idempotently and converge;
+        // reaping here would orphan the partial canonical write.
+        if apply_result.is_ok() || !intent.any_applied() {
+            reap(self.store.as_ref(), &intent).await;
+        }
         session.release().await;
 
         apply_result?;

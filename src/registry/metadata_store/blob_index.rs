@@ -17,7 +17,7 @@ use crate::{
     registry::metadata_store::{
         Error, MetadataStore,
         link_kind::LinkKind,
-        link_ops::{append_shard_for_digest, tx_error_to_meta},
+        link_ops::{LinksTxExtras, append_shard_for_digest, tx_error_to_meta},
     },
 };
 
@@ -97,5 +97,30 @@ impl MetadataStore {
         .await?;
         let tx = builder.build();
         Ok((tx.reads, tx.mutations))
+    }
+
+    /// Revoke `namespace`'s ownership of `digest` and, in the same atomic
+    /// transaction, delete the blob-data when no remaining namespace holds a
+    /// reference. Mirrors `delete_manifest`: both express the shard-entry
+    /// removal and the conditional blob-data reclaim as a single link
+    /// transaction, so a crash cannot orphan the blob bytes. The
+    /// `blob-data:{digest}` coarse lock declared by the planner serialises this
+    /// against concurrent manifest pushes referencing the same
+    /// content-addressed digest.
+    pub async fn revoke_blob_ownership(
+        &self,
+        namespace: &str,
+        digest: &Digest,
+    ) -> Result<(), Error> {
+        let extras = LinksTxExtras {
+            blob_index_ops: Some((
+                digest,
+                vec![BlobIndexOperation::Remove(LinkKind::Blob(digest.clone()))],
+            )),
+            blob_data_delete_if_unreferenced: Some(digest),
+            caller_holds_blob_data_lock: true,
+            ..LinksTxExtras::default()
+        };
+        self.execute_links_tx(namespace, &[], extras).await
     }
 }

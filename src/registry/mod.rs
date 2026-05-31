@@ -55,8 +55,7 @@ use crate::{
     configuration::{RegexPattern, global::DEFAULT_MAX_CONCURRENT_CACHE_JOBS},
     oci::{Digest, Namespace},
     registry::{
-        blob_ownership::BlobOwnership,
-        blob_store::{BlobStore, Error as BlobStoreError},
+        blob_store::BlobStore,
         cache_job_handler::{CACHE_QUEUE, CacheJobHandler},
         job_store::{JobHandler, JobStore},
         metadata_store::MetadataStore,
@@ -235,35 +234,13 @@ impl Registry {
     /// content-addressed blob's bytes in the window between another repository
     /// granting a reference and validating its manifest, surfacing as
     /// `ManifestBlobUnknown`.
-    pub(crate) async fn acquire_blob_data_lock(
-        &self,
-        digest: &Digest,
-    ) -> Result<LockSession, Error> {
+    pub async fn acquire_blob_data_lock(&self, digest: &Digest) -> Result<LockSession, Error> {
         let keys = [format!("blob-data:{digest}")];
         self.metadata_store
             .executor()
             .acquire(&keys)
             .await
             .map_err(|e| Error::Internal(format!("blob-data lock acquire failed: {e}")))
-    }
-
-    async fn delete_blob_data_if_unreferenced(&self, digest: &Digest) -> Result<(), Error> {
-        let session = self.acquire_blob_data_lock(digest).await?;
-        let result = async {
-            let ownership = BlobOwnership::new(self.metadata_store.as_ref());
-            if ownership.has_any_reference(digest).await? {
-                return Ok(());
-            }
-            match self.blob_store.delete_blob(digest).await {
-                Ok(()) | Err(BlobStoreError::BlobNotFound | BlobStoreError::ReferenceNotFound) => {
-                    Ok(())
-                }
-                Err(error) => Err(error.into()),
-            }
-        }
-        .await;
-        session.release().await;
-        result
     }
 }
 

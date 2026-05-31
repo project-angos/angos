@@ -21,6 +21,8 @@ impl MetadataStore {
         let extras = LinksTxExtras {
             blob_data_put: Some((digest, Bytes::from(manifest_bytes.to_vec()))),
             blob_data_delete_if_unreferenced: None,
+            blob_index_ops: None,
+            caller_holds_blob_data_lock: false,
             force_register_namespace: true,
         };
         self.execute_links_tx(namespace, operations, extras).await
@@ -38,6 +40,8 @@ impl MetadataStore {
         let extras = LinksTxExtras {
             blob_data_put: None,
             blob_data_delete_if_unreferenced: Some(digest),
+            blob_index_ops: None,
+            caller_holds_blob_data_lock: false,
             force_register_namespace: false,
         };
         self.execute_links_tx(namespace, operations, extras).await

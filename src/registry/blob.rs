@@ -375,11 +375,20 @@ impl Registry {
             return Err(Error::BlobReferenced);
         }
 
-        ownership
-            .revoke(namespace, digest, LinkKind::Blob(digest.clone()))
-            .await?;
-
-        self.delete_blob_data_if_unreferenced(digest).await
+        // Hold the coarse `blob-data:{digest}` lock across the converged revoke
+        // + conditional-reclaim transaction. The transaction is crash-atomic on
+        // its own, but the lock is what serialises it against the upload `grant`
+        // path (which records ownership in the shard without a transactional
+        // coarse lock), so a concurrent reference grant cannot be missed during
+        // the unreferenced check.
+        let session = self.acquire_blob_data_lock(digest).await?;
+        let result = self
+            .metadata_store
+            .revoke_blob_ownership(namespace.as_ref(), digest)
+            .await
+            .map_err(Error::from);
+        session.release().await;
+        result
     }
 
     /// Resolves a blob GET request to either a presigned redirect URL or a stream.
@@ -439,9 +448,9 @@ mod tests {
         util::sha256,
     };
 
-    /// A blob-data reclaim (`delete_blob` → `delete_blob_data_if_unreferenced`)
-    /// must take the `blob-data:{digest}` coarse lock before reading references
-    /// and deleting the bytes, so a concurrent reference grant cannot be missed.
+    /// `delete_blob` must hold the `blob-data:{digest}` coarse lock across its
+    /// revoke-and-reclaim transaction, so a concurrent reference grant cannot be
+    /// missed while the unreferenced check and the blob-data delete are decided.
     /// Regression guard for the conformance `MANIFEST_BLOB_UNKNOWN` failure
     /// caused by dropping that lock during the transactional-engine migration.
     #[tokio::test]
@@ -456,8 +465,8 @@ mod tests {
 
             ownership.grant(first, &digest).await.unwrap();
 
-            // Hold the blob-data lock, then start a delete: it must block in
-            // `delete_blob_data_if_unreferenced` rather than reclaim the bytes.
+            // Hold the blob-data lock, then start a delete: it must block on
+            // the lock rather than reclaim the bytes.
             let session = registry.acquire_blob_data_lock(&digest).await.unwrap();
             let delete = registry.delete_blob(first, &digest);
             tokio::pin!(delete);
