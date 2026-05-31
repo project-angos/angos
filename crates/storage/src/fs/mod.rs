@@ -1,8 +1,10 @@
-//! Filesystem-backed [`ObjectStore`] and [`UploadSessionStore`].
+//! Filesystem-backed [`ObjectStore`] (including its upload-session methods).
 //!
 //! Maps the storage trait surface onto a directory tree rooted at `root_dir`:
 //! every object key becomes a relative path under the root. Writes are atomic
-//! (temp-file + rename) and `delete_prefix` walks the subtree. Listings sort
+//! (temp-file + rename) and `delete_prefix` walks the subtree, then prunes any
+//! ancestor directories it leaves empty — an FS-only concern (S3 has no
+//! directories) that stays internal to this backend. Listings sort
 //! lexicographically because `read_dir` returns entries in arbitrary order.
 //!
 //! Does **not** implement [`ConditionalStore`](crate::ConditionalStore): on
@@ -33,7 +35,7 @@ use tokio_util::io::StreamReader;
 
 use crate::{
     BoxedReader, ByteStream, ChildrenPage, Error, ObjectMeta, ObjectStore, Page, SessionState,
-    UploadSession, UploadSessionStore,
+    UploadSession,
 };
 
 /// Page step used by [`Backend::list_all_children`] when draining all pages
@@ -159,25 +161,27 @@ impl Backend {
     }
 
     /// Best-effort cleanup of empty ancestor directories after a leaf
-    /// deletion. Walks at most `max_levels` parents upward; stops at the
-    /// first non-empty parent, at `root_dir` (exclusive), or as soon as it
-    /// would leave the `root_dir` subtree. Errors are suppressed.
+    /// deletion. Walks parents upward until it reaches the first non-empty
+    /// parent or `root_dir` (exclusive) — the store root is the only ceiling.
+    /// Errors are suppressed.
     ///
-    /// Inherent (not trait-method) because directory pruning is meaningless
-    /// on S3 and the blob store's unified Backend never needs to call it
-    /// through the trait surface.
-    pub async fn prune_empty_ancestors(&self, key: &str, max_levels: u8) {
+    /// Private: empty-directory pruning is an FS implementation detail with no
+    /// meaning on S3, so it never crosses the [`ObjectStore`] trait surface.
+    /// [`Backend::delete_prefix`] invokes it for callers; nothing outside this
+    /// module triggers it directly.
+    async fn prune_empty_ancestors(&self, key: &str) {
         let start = self.full_path(key);
         let root = &self.root;
         let mut current = start.parent();
-        for _ in 0..max_levels {
-            let Some(parent) = current else { break };
+        while let Some(parent) = current {
+            // The store root is the ceiling: never remove it or anything above.
             if parent == root || !parent.starts_with(root) {
                 break;
             }
             let Ok(mut entries) = fs::read_dir(parent).await else {
                 break;
             };
+            // Stop at the first non-empty parent (or any read error).
             match entries.next_entry().await {
                 Ok(Some(_)) | Err(_) => break,
                 Ok(None) => {}
@@ -349,14 +353,20 @@ impl ObjectStore for Backend {
         // Directory → recursive remove; file → unlink; missing → success.
         match fs::metadata(&path).await {
             Ok(meta) if meta.is_dir() => match fs::remove_dir_all(&path).await {
-                Ok(()) => Ok(()),
-                Err(e) if e.kind() == ErrorKind::NotFound => Ok(()),
-                Err(e) => Err(e.into()),
+                Ok(()) => {}
+                Err(e) if e.kind() == ErrorKind::NotFound => {}
+                Err(e) => return Err(e.into()),
             },
-            Ok(_) => self.delete(prefix).await,
-            Err(e) if e.kind() == ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(e.into()),
+            Ok(_) => self.delete(prefix).await?,
+            Err(e) if e.kind() == ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
         }
+        // Removing the subtree may have emptied its parent shard directories;
+        // tidy them up to the store root so deletions don't leave hollow
+        // scaffolding behind. This is an FS-only concern, kept internal to the
+        // backend.
+        self.prune_empty_ancestors(prefix).await;
+        Ok(())
     }
 
     async fn head(&self, key: &str) -> Result<ObjectMeta, Error> {
@@ -441,10 +451,9 @@ impl ObjectStore for Backend {
         )
         .await
     }
-}
 
-#[async_trait]
-impl UploadSessionStore for Backend {
+    // ── Upload sessions ─────────────────────────────────────────────────────
+
     async fn create_upload(&self, key: &str) -> Result<UploadSession, Error> {
         // Create the empty staging file so `write_upload` can re-open it in
         // append mode without needing a separate "first write" path.

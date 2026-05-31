@@ -3,8 +3,8 @@
 //! Exposes a single unified [`BlobStore`] struct that carries an
 //! `Arc<Store>` storage façade. The façade bundles the object store, the
 //! upload-session store (resumable streaming uploads + finalization), the
-//! optional presign backend, the optional FS-prune backend, and the
-//! transaction executor used by the upload-promotion transaction. FS and S3
+//! optional presign backend, and the transaction executor used by the
+//! upload-promotion transaction. FS and S3
 //! are wired through the same code path; the [`BlobStoreConfig`] enum only
 //! picks the underlying storage handles the façade is built from. All public
 //! methods live as inherent methods on `BlobStore` — no caller-facing trait
@@ -54,9 +54,9 @@ pub struct UploadSummary {
 #[derive(Clone)]
 pub struct BlobStore {
     /// Storage façade: object reads/writes, the upload lifecycle (including
-    /// finalization), presigning, and FS-ancestor pruning all flow through
-    /// here. The façade owns the executor used by the upload-promotion
-    /// transaction.
+    /// finalization), and presigning all flow through here. The façade owns the
+    /// executor used by the upload-promotion transaction. (On FS, the backend
+    /// prunes its own empty ancestor directories on delete — callers don't.)
     pub store: Arc<Store>,
 }
 
@@ -79,7 +79,7 @@ pub struct BlobStoreBuilder {
 
 impl BlobStoreBuilder {
     /// Set the storage façade (required). Build it with the upload-session
-    /// store enabled (and, where applicable, presign and FS-prune backends).
+    /// store enabled (and, where applicable, the presign backend).
     #[must_use]
     pub fn store(mut self, store: Arc<Store>) -> Self {
         self.store = Some(store);
@@ -174,7 +174,6 @@ impl BlobStore {
     pub async fn delete_blob(&self, digest: &Digest) -> Result<(), Error> {
         let container = path_builder::blob_container_dir(digest);
         self.store.delete_prefix(&container).await?;
-        self.store.prune_empty_ancestors(&container, 2).await;
         Ok(())
     }
 }

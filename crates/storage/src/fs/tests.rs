@@ -72,6 +72,46 @@ async fn delete_prefix_on_missing_prefix_is_success() {
 }
 
 #[tokio::test]
+async fn delete_prefix_prunes_empty_ancestors_up_to_root() {
+    let dir = TempDir::new().unwrap();
+    let store = backend(&dir);
+    store
+        .put("x/y/z/data", Bytes::from_static(b"v"))
+        .await
+        .unwrap();
+
+    store.delete_prefix("x/y/z").await.unwrap();
+
+    // The whole now-empty chain collapses, but the store root survives.
+    assert!(
+        !dir.path().join("x").exists(),
+        "empty ancestors must be pruned"
+    );
+    assert!(dir.path().exists(), "the store root is never removed");
+}
+
+#[tokio::test]
+async fn delete_prefix_stops_pruning_at_first_non_empty_ancestor() {
+    let dir = TempDir::new().unwrap();
+    let store = backend(&dir);
+    store
+        .put("shard/aa/blob1/data", Bytes::from_static(b"1"))
+        .await
+        .unwrap();
+    store
+        .put("shard/aa/blob2/data", Bytes::from_static(b"2"))
+        .await
+        .unwrap();
+
+    store.delete_prefix("shard/aa/blob1").await.unwrap();
+
+    // `shard/aa` still holds `blob2`, so pruning halts there.
+    assert!(!dir.path().join("shard/aa/blob1").exists());
+    assert_eq!(store.get("shard/aa/blob2/data").await.unwrap(), b"2");
+    assert!(dir.path().join("shard/aa").exists());
+}
+
+#[tokio::test]
 async fn head_reports_size_and_mtime() {
     let dir = TempDir::new().unwrap();
     let store = backend(&dir);

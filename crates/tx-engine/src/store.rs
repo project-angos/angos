@@ -1,8 +1,8 @@
 //! Storage façade — the single seam subsystems use for storage.
 //!
 //! [`Store`] composes the storage handles a subsystem needs (the floor
-//! [`ObjectStore`], plus optional upload-session, presign, and FS-prune
-//! capabilities) together with the [`TransactionExecutor`] that commits
+//! [`ObjectStore`], plus optional upload-session and presign capabilities)
+//! together with the [`TransactionExecutor`] that commits
 //! coordinated writes. Subsystems (`metadata_store`, `blob_store`,
 //! `job_store`) hold a single `Arc<Store>` and never reach for `angos_storage`
 //! or `angos_s3_client` directly.
@@ -30,8 +30,7 @@ use bytes::Bytes;
 
 use angos_storage::{
     BoxedReader, ByteStream, ChildrenPage, Error as StorageError, MultipartUploadPage, ObjectMeta,
-    ObjectStore, Page, PresignedStore, UploadSession, UploadSessionStore,
-    fs::Backend as StorageFsBackend,
+    ObjectStore, Page, PresignedStore, UploadSession,
 };
 
 use crate::{
@@ -63,9 +62,7 @@ pub struct Snapshot {
 #[derive(Clone)]
 pub struct Store {
     object: Arc<dyn ObjectStore>,
-    upload: Option<Arc<dyn UploadSessionStore>>,
     presign: Option<Arc<dyn PresignedStore>>,
-    fs_prune: Option<Arc<StorageFsBackend>>,
     executor: Arc<dyn TransactionExecutor>,
 }
 
@@ -91,18 +88,11 @@ impl Store {
     }
 
     /// The floor object store. Escape hatch for code that must hand an
-    /// `Arc<dyn ObjectStore>` to a helper (e.g. concurrent buffered reads).
+    /// `Arc<dyn ObjectStore>` to a helper (e.g. concurrent buffered reads, or
+    /// test wrappers that intercept the storage seam).
     #[must_use]
     pub fn object_store(&self) -> &Arc<dyn ObjectStore> {
         &self.object
-    }
-
-    /// The upload-session store, when one was wired. Escape hatch for code that
-    /// must hand an `Arc<dyn UploadSessionStore>` to a helper (e.g. test
-    /// wrappers that intercept the upload seam).
-    #[must_use]
-    pub fn upload_store(&self) -> Option<&Arc<dyn UploadSessionStore>> {
-        self.upload.as_ref()
     }
 
     // ── Reads (passthrough; surface `StorageError::NotFound` directly) ──────
@@ -367,9 +357,9 @@ impl Store {
     ///
     /// # Errors
     ///
-    /// [`StorageError::Backend`] when no upload-session store was wired.
+    /// Any backend failure starting the session.
     pub async fn create_upload(&self, key: &str) -> Result<UploadSession, StorageError> {
-        self.upload()?.create_upload(key).await
+        self.object.create_upload(key).await
     }
 
     /// Stream `len` bytes from `body` into `session`, parking sub-part
@@ -377,7 +367,7 @@ impl Store {
     ///
     /// # Errors
     ///
-    /// [`StorageError::Backend`] when no upload-session store was wired.
+    /// Any backend failure writing the chunk.
     pub async fn write_upload(
         &self,
         session: &mut UploadSession,
@@ -385,7 +375,7 @@ impl Store {
         body: ByteStream,
         len: u64,
     ) -> Result<(), StorageError> {
-        self.upload()?
+        self.object
             .write_upload(session, staged_dir, body, len)
             .await
     }
@@ -395,22 +385,22 @@ impl Store {
     ///
     /// # Errors
     ///
-    /// [`StorageError::Backend`] when no upload-session store was wired.
+    /// Any backend failure aborting the session.
     pub async fn abort_upload(
         &self,
         session: UploadSession,
         staged_dir: &str,
     ) -> Result<(), StorageError> {
-        self.upload()?.abort_upload(session, staged_dir).await
+        self.object.abort_upload(session, staged_dir).await
     }
 
     /// Best-effort abort of any in-flight backend upload state for `key`.
     ///
     /// # Errors
     ///
-    /// [`StorageError::Backend`] when no upload-session store was wired.
+    /// Any backend failure during the abort.
     pub async fn abort_pending_uploads(&self, key: &str) -> Result<(), StorageError> {
-        self.upload()?.abort_pending_uploads(key).await
+        self.object.abort_pending_uploads(key).await
     }
 
     /// List in-flight multipart uploads store-wide, one page at a time
@@ -421,14 +411,13 @@ impl Store {
     ///
     /// # Errors
     ///
-    /// [`StorageError::Backend`] when no upload-session store was wired, or any
-    /// backend listing failure.
+    /// Any backend listing failure.
     pub async fn list_multipart_uploads(
         &self,
         key_marker: Option<&str>,
         upload_id_marker: Option<&str>,
     ) -> Result<MultipartUploadPage, StorageError> {
-        self.upload()?
+        self.object
             .list_multipart_uploads(key_marker, upload_id_marker)
             .await
     }
@@ -437,14 +426,13 @@ impl Store {
     ///
     /// # Errors
     ///
-    /// [`StorageError::Backend`] when no upload-session store was wired, or any
-    /// backend abort failure.
+    /// Any backend abort failure.
     pub async fn abort_multipart_upload(
         &self,
         key: &str,
         upload_id: &str,
     ) -> Result<(), StorageError> {
-        self.upload()?.abort_multipart_upload(key, upload_id).await
+        self.object.abort_multipart_upload(key, upload_id).await
     }
 
     /// Run only the backend completion step (S3 multipart-complete; FS no-op)
@@ -459,14 +447,13 @@ impl Store {
     ///
     /// # Errors
     ///
-    /// [`StorageError::Backend`] when no upload-session store was wired, or any
-    /// backend completion failure.
+    /// Any backend completion failure.
     pub async fn complete_upload(
         &self,
         session: UploadSession,
         staged_dir: &str,
     ) -> Result<(), StorageError> {
-        self.upload()?.complete_upload(session, staged_dir).await
+        self.object.complete_upload(session, staged_dir).await
     }
 
     // ── Presign / prune ──────────────────────────────────────────────────────
@@ -494,47 +481,23 @@ impl Store {
     pub fn supports_presign(&self) -> bool {
         self.presign.is_some()
     }
-
-    /// Prune now-empty ancestor directories of `key`, up to `max_levels`
-    /// levels. No-op unless an FS-prune backend is wired (S3 has no directory
-    /// concept).
-    pub async fn prune_empty_ancestors(&self, key: &str, max_levels: u8) {
-        if let Some(fs) = &self.fs_prune {
-            fs.prune_empty_ancestors(key, max_levels).await;
-        }
-    }
-
-    fn upload(&self) -> Result<&Arc<dyn UploadSessionStore>, StorageError> {
-        self.upload
-            .as_ref()
-            .ok_or_else(|| StorageError::Backend("upload-session store not configured".into()))
-    }
 }
 
-/// Builder for [`Store`]. `store` and `executor` are required; the upload,
-/// presign, and FS-prune capabilities are optional and reflect what the
-/// underlying backend supports.
+/// Builder for [`Store`]. `object` and `executor` are required; the presign
+/// capability is optional and reflects what the underlying backend supports.
 #[derive(Default)]
 pub struct StoreBuilder {
     object: Option<Arc<dyn ObjectStore>>,
-    upload: Option<Arc<dyn UploadSessionStore>>,
     presign: Option<Arc<dyn PresignedStore>>,
-    fs_prune: Option<Arc<StorageFsBackend>>,
     executor: Option<Arc<dyn TransactionExecutor>>,
 }
 
 impl StoreBuilder {
-    /// Set the floor object store (required).
+    /// Set the floor object store (required). [`ObjectStore`] carries the
+    /// upload-session lifecycle too, so this single handle wires both.
     #[must_use]
     pub fn object(mut self, object: Arc<dyn ObjectStore>) -> Self {
         self.object = Some(object);
-        self
-    }
-
-    /// Set the upload-session store. Enables the upload lifecycle methods.
-    #[must_use]
-    pub fn upload(mut self, upload: Arc<dyn UploadSessionStore>) -> Self {
-        self.upload = Some(upload);
         self
     }
 
@@ -542,13 +505,6 @@ impl StoreBuilder {
     #[must_use]
     pub fn presign(mut self, presign: Arc<dyn PresignedStore>) -> Self {
         self.presign = Some(presign);
-        self
-    }
-
-    /// Set the typed FS backend used for [`Store::prune_empty_ancestors`].
-    #[must_use]
-    pub fn fs_prune(mut self, fs_prune: Arc<StorageFsBackend>) -> Self {
-        self.fs_prune = Some(fs_prune);
         self
     }
 
@@ -573,9 +529,7 @@ impl StoreBuilder {
             .ok_or_else(|| Error::Build("Store requires an executor".to_string()))?;
         Ok(Store {
             object,
-            upload: self.upload,
             presign: self.presign,
-            fs_prune: self.fs_prune,
             executor,
         })
     }
@@ -607,8 +561,7 @@ mod tests {
                 .expect("executor"),
         );
         Store::builder()
-            .object(backend.clone())
-            .upload(backend)
+            .object(backend)
             .executor(executor)
             .build()
             .expect("store")

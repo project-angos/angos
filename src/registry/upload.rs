@@ -342,7 +342,7 @@ mod tests {
 
     use angos_storage::{
         BoxedReader as StorageBoxedReader, ByteStream, ChildrenPage, Error as StorageError,
-        MultipartUploadPage, ObjectMeta, ObjectStore, Page, UploadSession, UploadSessionStore,
+        MultipartUploadPage, ObjectMeta, ObjectStore, Page, UploadSession,
     };
     use angos_tx_engine::store::Store;
 
@@ -377,11 +377,11 @@ mod tests {
     }
 
     /// Delegating storage wrapper that injects a single failure at the storage
-    /// seam so upload fast-paths can be proven to avoid a given op. Wraps an
-    /// `UploadSessionStore` (which is also an `ObjectStore`), so it can stand in
-    /// for both seams of the [`Store`] façade.
+    /// seam so upload fast-paths can be proven to avoid a given op. Wraps the
+    /// [`ObjectStore`] (whose surface now includes the upload-session methods),
+    /// so it stands in for the whole storage seam of the [`Store`] façade.
     struct FailingStorage {
-        inner: Arc<dyn UploadSessionStore>,
+        inner: Arc<dyn ObjectStore>,
         fail: FailOp,
     }
 
@@ -446,10 +446,7 @@ mod tests {
         async fn copy(&self, source: &str, destination: &str) -> Result<(), StorageError> {
             self.inner.copy(source, destination).await
         }
-    }
 
-    #[async_trait]
-    impl UploadSessionStore for FailingStorage {
         async fn create_upload(&self, key: &str) -> Result<UploadSession, StorageError> {
             self.inner.create_upload(key).await
         }
@@ -516,21 +513,14 @@ mod tests {
     /// Rebuild `inner` with its storage seam wrapped so `fail` errors out,
     /// reusing the same upload backend and executor.
     fn failing_blob_store(inner: &Arc<BlobStore>, fail: FailOp) -> Arc<BlobStore> {
-        let upload = inner
-            .store
-            .upload_store()
-            .expect("blob store always has an upload-session store")
-            .clone();
+        let object = inner.store.object_store().clone();
         let failing = Arc::new(FailingStorage {
-            inner: upload,
+            inner: object,
             fail,
         });
-        let object: Arc<dyn ObjectStore> = failing.clone();
-        let upload_store: Arc<dyn UploadSessionStore> = failing;
         let facade = Arc::new(
             Store::builder()
-                .object(object)
-                .upload(upload_store)
+                .object(failing)
                 .executor(inner.store.executor().clone())
                 .build()
                 .expect("failing store façade"),

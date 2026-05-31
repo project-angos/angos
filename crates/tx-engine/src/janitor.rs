@@ -485,8 +485,8 @@ mod tests {
     use chrono::{Duration as ChronoDuration, Utc};
 
     use angos_storage::{
-        BoxedReader, ChildrenPage, ConditionalStore, Error as StorageError, Etag,
-        MemoryObjectStore, ObjectMeta, ObjectStore, Page,
+        BoxedReader, ByteStream, ChildrenPage, ConditionalStore, Error as StorageError, Etag,
+        MemoryObjectStore, ObjectMeta, ObjectStore, Page, UploadSession,
     };
 
     use crate::janitor::LockJanitor;
@@ -649,6 +649,44 @@ mod tests {
         }
         async fn copy(&self, source: &str, destination: &str) -> Result<(), StorageError> {
             self.inner.copy(source, destination).await
+        }
+
+        // Upload-session methods pass straight through — this double only
+        // races the conditional-delete seam.
+        async fn create_upload(&self, key: &str) -> Result<UploadSession, StorageError> {
+            self.inner.create_upload(key).await
+        }
+
+        async fn write_upload(
+            &self,
+            session: &mut UploadSession,
+            staged_dir: &str,
+            body: ByteStream,
+            len: u64,
+        ) -> Result<(), StorageError> {
+            self.inner
+                .write_upload(session, staged_dir, body, len)
+                .await
+        }
+
+        async fn complete_upload(
+            &self,
+            session: UploadSession,
+            staged_dir: &str,
+        ) -> Result<(), StorageError> {
+            self.inner.complete_upload(session, staged_dir).await
+        }
+
+        async fn abort_upload(
+            &self,
+            session: UploadSession,
+            staged_dir: &str,
+        ) -> Result<(), StorageError> {
+            self.inner.abort_upload(session, staged_dir).await
+        }
+
+        async fn abort_pending_uploads(&self, key: &str) -> Result<(), StorageError> {
+            self.inner.abort_pending_uploads(key).await
         }
     }
 

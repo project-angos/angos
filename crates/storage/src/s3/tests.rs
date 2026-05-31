@@ -13,8 +13,7 @@ use tokio::io::AsyncReadExt;
 use uuid::Uuid;
 
 use crate::{
-    ByteStream, ConditionalStore, Error, ObjectStore, PresignedStore, SessionState,
-    UploadSessionStore, s3::Backend,
+    ByteStream, ConditionalStore, Error, ObjectStore, PresignedStore, SessionState, s3::Backend,
 };
 
 fn backend() -> Backend {

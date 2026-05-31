@@ -4,8 +4,8 @@
 //! `[blob_store.fs]` or `[blob_store.s3]`. It selects which storage
 //! backend to instantiate, but the resulting [`BlobStore`] is the same
 //! unified type regardless — each arm only wires the capabilities its
-//! backend supports (FS prunes empty ancestors; S3 presigns) into the
-//! shared `Arc<Store>` façade the `BlobStore` wraps.
+//! backend supports (S3 presigns and runs CAS; FS needs no extra wiring) into
+//! the shared `Arc<Store>` façade the `BlobStore` wraps.
 
 use std::sync::Arc;
 
@@ -93,14 +93,14 @@ impl BlobStoreConfig {
     /// Build the unified [`Backend`].
     ///
     /// For FS the transaction executor is constructed with an in-process
-    /// memory lock strategy and the typed FS handle is stashed for
-    /// ancestor-pruning calls. For S3 the storage backend is also wired
-    /// as a `ConditionalStore` for the CAS executor and as a
-    /// `PresignedStore` for download URLs.
+    /// memory lock strategy; the backend tidies its own empty directories on
+    /// delete, so no extra handle is wired for that. For S3 the storage
+    /// backend is also wired as a `ConditionalStore` for the CAS executor and
+    /// as a `PresignedStore` for download URLs.
     pub fn build_backend(&self) -> Result<BlobStore, Error> {
-        // Each arm wires the capabilities its backend supports (FS prunes empty
-        // ancestors; S3 presigns and runs CAS); the façade build and BlobStore
-        // wrap are shared.
+        // Each arm wires the capabilities its backend supports (S3 presigns and
+        // runs CAS; FS needs neither — it prunes its own empty ancestors on
+        // delete); the façade build and BlobStore wrap are shared.
         let builder = match self {
             BlobStoreConfig::FS(config) => {
                 let raw = Arc::new(
@@ -113,11 +113,7 @@ impl BlobStoreConfig {
                 let executor =
                     build_executor(raw.clone(), None, LockStrategy::Memory, None, false, false)
                         .map_err(|e| Error::StorageBackend(e.to_string()))?;
-                Store::builder()
-                    .object(raw.clone())
-                    .upload(raw.clone())
-                    .fs_prune(raw)
-                    .executor(executor)
+                Store::builder().object(raw).executor(executor)
             }
             BlobStoreConfig::S3(config) => {
                 let transport = S3TransportConfig {
@@ -153,7 +149,6 @@ impl BlobStoreConfig {
                 .map_err(|e| Error::StorageBackend(e.to_string()))?;
                 Store::builder()
                     .object(raw.clone())
-                    .upload(raw.clone())
                     .presign(raw)
                     .executor(executor)
             }

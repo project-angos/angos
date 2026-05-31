@@ -2,19 +2,16 @@
 //!
 //! Exercises every trait via the in-memory backend so the tests double as a
 //! worked example of what a real backend impl looks like, and verify that
-//! the traits are object-safe (`Arc<dyn ObjectStore>`) and that supertrait
-//! bounds compose (`ConditionalStore: ObjectStore`,
-//! `UploadSessionStore: ObjectStore`).
+//! the traits are object-safe (`Arc<dyn ObjectStore>`) and that the
+//! `ConditionalStore: ObjectStore` supertrait bound composes. The
+//! upload-session methods are part of `ObjectStore` itself.
 
 use std::{sync::Arc, time::Duration};
 
 use bytes::Bytes;
 use futures_util::stream;
 
-use crate::{
-    ConditionalStore, Error, Etag, MemoryObjectStore, ObjectStore, PresignedStore,
-    UploadSessionStore,
-};
+use crate::{ConditionalStore, Error, Etag, MemoryObjectStore, ObjectStore, PresignedStore};
 
 // Memory backend doesn't presign — provide a trivial stub for the test that
 // needs to assert object safety of `PresignedStore`.
@@ -224,7 +221,7 @@ async fn delete_if_match_rejects_stale_etag_but_treats_missing_as_success() {
 }
 
 // =========================================================================
-// UploadSessionStore
+// Upload sessions (ObjectStore methods)
 // =========================================================================
 
 fn one_frame(body: &'static [u8]) -> crate::ByteStream {
@@ -233,7 +230,7 @@ fn one_frame(body: &'static [u8]) -> crate::ByteStream {
 
 #[tokio::test]
 async fn upload_session_round_trip_creates_object_at_key() {
-    let store: Arc<dyn UploadSessionStore> = backend();
+    let store: Arc<dyn ObjectStore> = backend();
     let mut session = store.create_upload("blob").await.unwrap();
     store
         .write_upload(&mut session, "blob.staged", one_frame(b"hello "), 6)
@@ -250,7 +247,7 @@ async fn upload_session_round_trip_creates_object_at_key() {
 
 #[tokio::test]
 async fn upload_session_survives_round_trip_through_serde() {
-    let store: Arc<dyn UploadSessionStore> = backend();
+    let store: Arc<dyn ObjectStore> = backend();
     let mut session = store.create_upload("blob").await.unwrap();
     store
         .write_upload(&mut session, "blob.staged", one_frame(b"hello "), 6)
@@ -271,7 +268,7 @@ async fn upload_session_survives_round_trip_through_serde() {
 
 #[tokio::test]
 async fn upload_session_abort_leaves_no_object() {
-    let store: Arc<dyn UploadSessionStore> = backend();
+    let store: Arc<dyn ObjectStore> = backend();
     let mut session = store.create_upload("blob").await.unwrap();
     store
         .write_upload(&mut session, "blob.staged", one_frame(b"partial"), 7)
@@ -283,7 +280,7 @@ async fn upload_session_abort_leaves_no_object() {
 
 #[tokio::test]
 async fn upload_session_complete_with_no_writes_creates_empty_object() {
-    let store: Arc<dyn UploadSessionStore> = backend();
+    let store: Arc<dyn ObjectStore> = backend();
     let session = store.create_upload("blob").await.unwrap();
     store.complete_upload(session, "blob.staged").await.unwrap();
     assert_eq!(store.get("blob").await.unwrap(), b"");

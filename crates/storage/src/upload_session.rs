@@ -1,4 +1,6 @@
-//! Resumable, streaming upload sessions on top of [`ObjectStore`].
+//! Session value types for the resumable, streaming upload primitive on
+//! [`ObjectStore`](crate::ObjectStore). The trait methods live on `ObjectStore`
+//! itself; this module owns only the values they exchange.
 //!
 //! A session is a single serialisable [`UploadSession`] value owned by the
 //! caller. The backend mutates it in place; the caller persists it (in
@@ -13,16 +15,15 @@
 
 use std::{io, pin::Pin};
 
-use async_trait::async_trait;
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use futures_util::{Stream, stream};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
-use crate::{error::Error, object::ObjectStore, types::Etag};
+use crate::types::Etag;
 
-/// Boxed byte stream consumed by [`UploadSessionStore::write_upload`].
+/// Boxed byte stream consumed by [`ObjectStore::write_upload`](crate::ObjectStore::write_upload).
 ///
 /// `'static` and `Send`, so it can be shipped across `tokio::spawn` boundaries
 /// and stored in handles. The stream yields chunks as `Result<Bytes, io::Error>`
@@ -50,11 +51,11 @@ pub struct Part {
 /// Resumable upload session. Carries every piece of state required for the
 /// backend to continue the upload after a process crash.
 ///
-/// Sessions are produced by [`UploadSessionStore::create_upload`], mutated
-/// in place by [`UploadSessionStore::write_upload`], and consumed by
-/// [`UploadSessionStore::complete_upload`] or
-/// [`UploadSessionStore::abort_upload`]. Persist via the standard `serde`
-/// machinery between calls.
+/// Sessions are produced by [`ObjectStore::create_upload`](crate::ObjectStore::create_upload),
+/// mutated in place by [`ObjectStore::write_upload`](crate::ObjectStore::write_upload), and
+/// consumed by [`ObjectStore::complete_upload`](crate::ObjectStore::complete_upload) or
+/// [`ObjectStore::abort_upload`](crate::ObjectStore::abort_upload). Persist via the standard
+/// `serde` machinery between calls.
 ///
 /// The sub-part remainder's storage key is **not** persisted here: the
 /// caller passes it explicitly on every [`Self`]-mutating trait method so
@@ -89,8 +90,8 @@ pub enum SessionState {
 }
 
 /// An in-flight S3 multipart upload discovered by
-/// [`UploadSessionStore::list_multipart_uploads`]. Backends without a
-/// multipart protocol (FS, memory) never produce these.
+/// [`ObjectStore::list_multipart_uploads`](crate::ObjectStore::list_multipart_uploads).
+/// Backends without a multipart protocol (FS, memory) never produce these.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PendingMultipartUpload {
     /// Object key the multipart upload targets.
@@ -102,8 +103,8 @@ pub struct PendingMultipartUpload {
     pub initiated_at: DateTime<Utc>,
 }
 
-/// One page of [`UploadSessionStore::list_multipart_uploads`]. When both
-/// markers are `None` the listing is exhausted.
+/// One page of [`ObjectStore::list_multipart_uploads`](crate::ObjectStore::list_multipart_uploads).
+/// When both markers are `None` the listing is exhausted.
 #[derive(Clone, Debug, Default)]
 pub struct MultipartUploadPage {
     pub uploads: Vec<PendingMultipartUpload>,
@@ -111,73 +112,9 @@ pub struct MultipartUploadPage {
     pub next_upload_id_marker: Option<String>,
 }
 
-/// Upload-session extension to [`ObjectStore`].
-///
-/// Provides a single resumable, streaming upload primitive that both FS
-/// (append-mode file) and S3 (multipart protocol) implement, hiding the S3
-/// multipart wire protocol (parts and upload IDs) from consumers.
-///
-/// Consumers store the [`UploadSession`] returned by [`Self::create_upload`]
-/// in a durable record (typically alongside their own per-session metadata),
-/// pass it back into [`Self::write_upload`] on every chunk, and finally
-/// pass it (by value) to [`Self::complete_upload`] or
-/// [`Self::abort_upload`]. After [`Self::complete_upload`] returns, the
-/// assembled object exists at `session.key` and is visible via the regular
-/// [`ObjectStore`] read methods.
-#[async_trait]
-pub trait UploadSessionStore: ObjectStore {
-    /// Begin a fresh upload at `key`.
-    async fn create_upload(&self, key: &str) -> Result<UploadSession, Error>;
-
-    /// Stream `body` (exactly `len` bytes) into `session`. `staged_dir` is
-    /// the directory under which the backend parks per-offset sub-part
-    /// remainders (`<staged_dir>/<offset>`, S3 only; FS ignores it). The
-    /// session is mutated in place; the caller re-serialises the new state
-    /// after the call returns. Bodies are streamed end-to-end — backends
-    /// never buffer the full payload.
-    async fn write_upload(
-        &self,
-        session: &mut UploadSession,
-        staged_dir: &str,
-        body: ByteStream,
-        len: u64,
-    ) -> Result<(), Error>;
-
-    /// Finalise the session. After Ok, the assembled object exists at
-    /// `session.key` (an empty object when no bytes were written) and is
-    /// visible via the regular `ObjectStore` read methods. The caller is
-    /// responsible for moving it to its canonical location. `staged_dir` is
-    /// the per-offset staging directory (see [`Self::write_upload`]).
-    async fn complete_upload(&self, session: UploadSession, staged_dir: &str) -> Result<(), Error>;
-
-    /// Discard the session and any backend state it owns without producing
-    /// an object. `staged_dir` is the per-offset staging directory.
-    async fn abort_upload(&self, session: UploadSession, staged_dir: &str) -> Result<(), Error>;
-
-    /// Best-effort: abort any in-flight backend state that may exist for
-    /// `key` outside the session-tracking path. On S3 this walks pending
-    /// multipart uploads and aborts each one; on FS it is a no-op.
-    async fn abort_pending_uploads(&self, key: &str) -> Result<(), Error>;
-
-    /// List in-flight multipart uploads store-wide, one page at a time.
-    /// `key_marker`/`upload_id_marker` continue a previous page; pass `None`
-    /// for both to start. This is a raw primitive — orphan detection (age
-    /// thresholds, live-session checks) is the caller's responsibility.
-    ///
-    /// Defaults to an empty page: backends without a multipart protocol (FS,
-    /// memory) have no in-flight uploads to report.
-    async fn list_multipart_uploads(
-        &self,
-        _key_marker: Option<&str>,
-        _upload_id_marker: Option<&str>,
-    ) -> Result<MultipartUploadPage, Error> {
-        Ok(MultipartUploadPage::default())
-    }
-
-    /// Abort a single in-flight multipart upload identified by `key` and
-    /// `upload_id`. Defaults to a no-op for backends without a multipart
-    /// protocol.
-    async fn abort_multipart_upload(&self, _key: &str, _upload_id: &str) -> Result<(), Error> {
-        Ok(())
-    }
-}
+// The upload-session methods (`create_upload`, `write_upload`,
+// `complete_upload`, `abort_upload`, `abort_pending_uploads`,
+// `list_multipart_uploads`, `abort_multipart_upload`) are part of the
+// [`ObjectStore`](crate::ObjectStore) trait itself — there is no separate
+// upload-store trait. This module owns only the session *value* types those
+// methods exchange.

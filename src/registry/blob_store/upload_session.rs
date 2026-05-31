@@ -17,14 +17,16 @@
 //!   offset, superseded as the upload advances.
 //!
 //! Backend-specific upload mechanics (FS append, S3 multipart) are
-//! encapsulated inside [`UploadSessionStore`]; this module never sees them.
+//! encapsulated inside the storage backend's upload-session methods; this
+//! module never sees them.
 //! Session metadata is reconstructed by reading the per-file artifacts through
 //! the engine [`Store`](angos_tx_engine::store::Store), never from a single
 //! JSON blob.
 //!
 //! `complete` is two-phase:
-//! 1. [`UploadSessionStore::complete_upload`] runs (S3 multipart-complete
-//!    on S3; no-op on FS) so the assembled object lands at `upload_path`.
+//! 1. [`Store::complete_upload`](angos_tx_engine::store::Store::complete_upload)
+//!    runs (S3 multipart-complete on S3; no-op on FS) so the assembled object
+//!    lands at `upload_path`.
 //! 2. A single engine `Transaction` atomically moves the assembled object to
 //!    its canonical blob path and deletes the per-file session artifacts.
 
@@ -74,8 +76,8 @@ pub struct UploadSessionRecord {
     /// after a crash without re-reading the uploaded bytes.
     pub hash_context: Vec<u8>,
     /// Opaque backend-managed upload state, read from the `session` file.
-    /// Mutated in place by every `UploadSessionStore::write_upload` call and
-    /// re-serialised back to that file.
+    /// Mutated in place by every `write_upload` call and re-serialised back to
+    /// that file.
     pub session: UploadSession,
 }
 
@@ -383,7 +385,6 @@ impl BlobStore {
         // because failure here does not affect correctness.
         let container = path_builder::upload_container_path(namespace, uuid);
         let _ = self.store.delete_prefix(&container).await;
-        self.store.prune_empty_ancestors(&container, 2).await;
         Ok(final_digest)
     }
 
@@ -400,7 +401,6 @@ impl BlobStore {
 
         let container = path_builder::upload_container_path(namespace, uuid);
         self.store.delete_prefix(&container).await?;
-        self.store.prune_empty_ancestors(&container, 2).await;
         Ok(())
     }
 }

@@ -26,7 +26,7 @@ use futures_util::StreamExt;
 
 use crate::{
     BoxedReader, ByteStream, ChildrenPage, ConditionalStore, Error, Etag, ObjectMeta, ObjectStore,
-    Page, SessionState, UploadSession, UploadSessionStore,
+    Page, SessionState, UploadSession,
 };
 
 /// Inner shared state.
@@ -316,60 +316,9 @@ impl ObjectStore for MemoryObjectStore {
             .insert(destination.to_string(), (bytes, etag));
         Ok(())
     }
-}
 
-#[async_trait]
-impl ConditionalStore for MemoryObjectStore {
-    async fn get_with_etag(&self, key: &str) -> Result<(Vec<u8>, Option<Etag>), Error> {
-        self.lock()
-            .data
-            .get(key)
-            .map(|(b, e)| (b.to_vec(), Some(e.clone())))
-            .ok_or(Error::NotFound)
-    }
+    // ── Upload sessions ─────────────────────────────────────────────────────
 
-    async fn put_if_absent(&self, key: &str, data: Bytes) -> Result<Option<Etag>, Error> {
-        let etag = self.next_etag();
-        let mut guard = self.lock();
-        if guard.data.contains_key(key) {
-            return Err(Error::PreconditionFailed);
-        }
-        guard.data.insert(key.to_string(), (data, etag.clone()));
-        Ok(Some(etag))
-    }
-
-    async fn put_if_match(
-        &self,
-        key: &str,
-        etag: &Etag,
-        data: Bytes,
-    ) -> Result<Option<Etag>, Error> {
-        let new_etag = self.next_etag();
-        let mut guard = self.lock();
-        match guard.data.get(key) {
-            Some((_, current)) if current == etag => {
-                guard.data.insert(key.to_string(), (data, new_etag.clone()));
-                Ok(Some(new_etag))
-            }
-            Some(_) | None => Err(Error::PreconditionFailed),
-        }
-    }
-
-    async fn delete_if_match(&self, key: &str, etag: &Etag) -> Result<(), Error> {
-        let mut guard = self.lock();
-        match guard.data.get(key) {
-            Some((_, current)) if current == etag => {
-                guard.data.remove(key);
-                Ok(())
-            }
-            Some(_) => Err(Error::PreconditionFailed),
-            None => Ok(()),
-        }
-    }
-}
-
-#[async_trait]
-impl UploadSessionStore for MemoryObjectStore {
     async fn create_upload(&self, key: &str) -> Result<UploadSession, Error> {
         self.put(key, Bytes::new()).await?;
         Ok(UploadSession {
@@ -428,6 +377,56 @@ impl UploadSessionStore for MemoryObjectStore {
 
     // `list_multipart_uploads` / `abort_multipart_upload` use the trait's
     // empty/no-op defaults: the memory backend has no multipart protocol.
+}
+
+#[async_trait]
+impl ConditionalStore for MemoryObjectStore {
+    async fn get_with_etag(&self, key: &str) -> Result<(Vec<u8>, Option<Etag>), Error> {
+        self.lock()
+            .data
+            .get(key)
+            .map(|(b, e)| (b.to_vec(), Some(e.clone())))
+            .ok_or(Error::NotFound)
+    }
+
+    async fn put_if_absent(&self, key: &str, data: Bytes) -> Result<Option<Etag>, Error> {
+        let etag = self.next_etag();
+        let mut guard = self.lock();
+        if guard.data.contains_key(key) {
+            return Err(Error::PreconditionFailed);
+        }
+        guard.data.insert(key.to_string(), (data, etag.clone()));
+        Ok(Some(etag))
+    }
+
+    async fn put_if_match(
+        &self,
+        key: &str,
+        etag: &Etag,
+        data: Bytes,
+    ) -> Result<Option<Etag>, Error> {
+        let new_etag = self.next_etag();
+        let mut guard = self.lock();
+        match guard.data.get(key) {
+            Some((_, current)) if current == etag => {
+                guard.data.insert(key.to_string(), (data, new_etag.clone()));
+                Ok(Some(new_etag))
+            }
+            Some(_) | None => Err(Error::PreconditionFailed),
+        }
+    }
+
+    async fn delete_if_match(&self, key: &str, etag: &Etag) -> Result<(), Error> {
+        let mut guard = self.lock();
+        match guard.data.get(key) {
+            Some((_, current)) if current == etag => {
+                guard.data.remove(key);
+                Ok(())
+            }
+            Some(_) => Err(Error::PreconditionFailed),
+            None => Ok(()),
+        }
+    }
 }
 
 #[cfg(test)]
