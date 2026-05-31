@@ -459,7 +459,7 @@ impl UploadSessionStore for Backend {
     async fn write_upload(
         &self,
         session: &mut UploadSession,
-        _staging_key: &str,
+        _staged_dir: &str,
         body: ByteStream,
         len: u64,
     ) -> Result<(), Error> {
@@ -496,7 +496,7 @@ impl UploadSessionStore for Backend {
     async fn complete_upload(
         &self,
         session: UploadSession,
-        _staging_key: &str,
+        _staged_dir: &str,
     ) -> Result<(), Error> {
         if !matches!(session.state, SessionState::Fs) {
             return Err(Error::Backend(
@@ -509,7 +509,7 @@ impl UploadSessionStore for Backend {
         Ok(())
     }
 
-    async fn abort_upload(&self, session: UploadSession, _staging_key: &str) -> Result<(), Error> {
+    async fn abort_upload(&self, session: UploadSession, _staged_dir: &str) -> Result<(), Error> {
         if !matches!(session.state, SessionState::Fs) {
             return Err(Error::Backend(
                 "upload session is not an FS session".to_string(),
@@ -523,6 +523,9 @@ impl UploadSessionStore for Backend {
         // is the only artifact and `abort_upload` already covers it.
         Ok(())
     }
+
+    // `list_multipart_uploads` / `abort_multipart_upload` use the trait's
+    // empty/no-op defaults: FS has no multipart protocol.
 }
 
 #[cfg(test)]

@@ -13,6 +13,7 @@
 mod config;
 mod error;
 pub mod hashing_reader;
+mod multipart_cleanup;
 pub mod sha256_ext;
 pub mod upload_session;
 
@@ -34,6 +35,7 @@ pub use config::BlobStoreConfig;
 #[cfg(test)]
 pub use config::{FsBackendConfig, S3BackendConfig, TransportFields};
 pub use error::Error;
+pub use multipart_cleanup::{MultipartCleanup, OrphanMultipartUpload};
 
 use crate::{
     oci::Digest,

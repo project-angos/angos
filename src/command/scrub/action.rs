@@ -55,6 +55,10 @@ pub enum Action {
         subject: Digest,
         referrer: Digest,
     },
+    AbortMultipartUpload {
+        key: String,
+        upload_id: String,
+    },
 }
 
 impl fmt::Display for Action {
@@ -139,6 +143,9 @@ impl fmt::Display for Action {
                     f,
                     "delete orphan referrer '{namespace}': subject {subject} <- {referrer}"
                 )
+            }
+            Action::AbortMultipartUpload { key, upload_id } => {
+                write!(f, "abort orphan multipart upload '{key}' ({upload_id})")
             }
         }
     }

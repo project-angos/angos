@@ -8,7 +8,10 @@ use crate::{
     command::{
         bootstrap,
         scrub::{
-            check::{BlobChecker, LayoutChecker, NamespaceChecker, StoreChecker, list_all},
+            check::{
+                BlobChecker, LayoutChecker, MultipartChecker, NamespaceChecker, StoreChecker,
+                list_all,
+            },
             error::Error,
             executor::{ActionSink, DryRunSink, Executor},
             setup,
@@ -32,6 +35,9 @@ pub struct Options {
     #[argh(option, short = 'u')]
     /// check for obsolete uploads with specified timeout
     pub uploads: Option<humantime::Duration>,
+    #[argh(option, short = 'p')]
+    /// abort orphan S3 multipart uploads older than the specified timeout
+    pub multipart: Option<humantime::Duration>,
     #[argh(switch, short = 't')]
     /// check for invalid tag digests
     pub tags: bool,
@@ -60,6 +66,7 @@ pub struct Command {
     namespace_checkers: Vec<Box<dyn NamespaceChecker>>,
     layout_checker: LayoutChecker,
     blob_checker: Option<BlobChecker>,
+    multipart_checker: Option<MultipartChecker>,
     sink: Box<dyn ActionSink + Send>,
 }
 
@@ -85,6 +92,7 @@ impl Command {
         )?;
         let layout_checker = setup::layout_checker(&blob_backend);
         let blob_checker = setup::blob_checker(options, &blob_backend, &metadata_store);
+        let multipart_checker = setup::multipart_checker(options, &blob_backend)?;
 
         let sink: Box<dyn ActionSink + Send> = if options.dry_run {
             info!("Dry-run mode: no changes will be made to the storage");
@@ -98,6 +106,7 @@ impl Command {
             namespace_checkers,
             layout_checker,
             blob_checker,
+            multipart_checker,
             sink,
         })
     }
@@ -106,6 +115,7 @@ impl Command {
         self.migrate_storage_layout().await?;
         self.scrub_metadata().await?;
         self.scrub_blobs().await?;
+        self.scrub_multipart_uploads().await?;
         self.metadata_store.flush_access_times().await;
         Ok(())
     }
@@ -138,6 +148,15 @@ impl Command {
             && let Err(e) = checker.check_all(self.sink.as_mut()).await
         {
             tracing::warn!("Blob scrub checker failed: {e}");
+        }
+        Ok(())
+    }
+
+    async fn scrub_multipart_uploads(&mut self) -> Result<(), Error> {
+        if let Some(checker) = &self.multipart_checker
+            && let Err(e) = checker.check_all(self.sink.as_mut()).await
+        {
+            tracing::warn!("Multipart scrub checker failed: {e}");
         }
         Ok(())
     }
@@ -183,6 +202,7 @@ mod tests {
             uploads: Some(humantime::Duration::from(std::time::Duration::from_hours(
                 1,
             ))),
+            multipart: None,
             tags: true,
             manifests: true,
             blobs: true,

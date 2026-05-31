@@ -654,7 +654,7 @@ The transactional engine consolidates multi-step storage writes behind single at
 |---|---|
 | Metadata store | `MetadataStore::update_links` — link writes and blob-index shard read-modify-write submitted as one transaction. |
 | Job store | `JobStore::enqueue`, `JobStore::complete`, and `JobStore::fail` — lock release and pending/index deletes are atomic, closing the crash window that existed on the legacy path. |
-| Upload store | Blob upload sessions persisted at `upload-sessions/<namespace>/<uuid>.json`; `complete` copies the staged blob to its canonical key through the engine. |
+| Upload store | Blob upload sessions persisted as per-file artifacts under `v2/repositories/<namespace>/_uploads/<uuid>/` (`session`, `startedat`, `hashstates/sha256/<offset>`, `data`); `complete` runs an engine transaction that moves the staged blob to its canonical key and deletes the session-record files. |
 | Manifest store | `Registry::store_manifest` and `Registry::delete_manifest` — blob write, link writes, and blob-index mutations expressed as one transaction, making the "blob landed, links failed" orphan class structurally impossible. |
 
 The CAS-vs-Lock executor choice happens once inside the engine factory based on the configured `lock_strategy` and detected S3 capabilities; subsystems never see it. The on-disk layout matches the legacy path key-for-key.

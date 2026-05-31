@@ -46,7 +46,8 @@ pub use crate::object::ObjectStore;
 pub use crate::presigned::PresignedStore;
 pub use crate::types::{ChildrenPage, Etag, ObjectMeta, Page};
 pub use crate::upload_session::{
-    ByteStream, Part, SessionState, UploadSession, UploadSessionStore, channel_stream,
+    ByteStream, MultipartUploadPage, Part, PendingMultipartUpload, SessionState, UploadSession,
+    UploadSessionStore, channel_stream,
 };
 
 /// Boxed `AsyncRead` returned by [`ObjectStore::get_stream`]. Matches the

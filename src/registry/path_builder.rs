@@ -69,6 +69,12 @@ pub fn blob_container_dir(digest: &Digest) -> String {
     blob_dir(digest)
 }
 
+/// Root directory holding every upload container for a namespace. Used to
+/// enumerate the namespace's active sessions (one child directory per UUID).
+pub fn uploads_root_dir(namespace: &str) -> String {
+    format!("{REPOS_ROOT}/{namespace}/_uploads")
+}
+
 pub fn upload_container_path(namespace: &str, uuid: &str) -> String {
     format!("{REPOS_ROOT}/{namespace}/_uploads/{uuid}")
 }
@@ -77,27 +83,45 @@ pub fn upload_path(namespace: &str, uuid: &str) -> String {
     format!("{REPOS_ROOT}/{namespace}/_uploads/{uuid}/data")
 }
 
-/// Storage key used by the S3 backend to stash the per-session sub-part
-/// remainder between PATCH calls. Lives under the upload container so the
-/// regular container cleanup catches it.
-pub fn upload_patch_pending_path(namespace: &str, uuid: &str) -> String {
-    format!("{REPOS_ROOT}/{namespace}/_uploads/{uuid}/patches/pending")
+/// Directory under which the S3 backend stages the multipart sub-part
+/// remainder between PATCH calls, one file per offset
+/// (`_uploads/<uuid>/staged/<offset>`). The backend appends the byte offset;
+/// the directory lives under the upload container so the regular container
+/// cleanup catches every staged file.
+pub fn upload_staged_dir(namespace: &str, uuid: &str) -> String {
+    format!("{REPOS_ROOT}/{namespace}/_uploads/{uuid}/staged")
 }
 
-/// Path for a durable upload-session record written by the engine-backed
-/// upload path. Lives under `upload-sessions/` — a top-level prefix that does
-/// not collide with any canonical key family.
-///
-/// Format: `upload-sessions/<namespace>/<uuid>.json`
-pub fn upload_session_path(namespace: &str, uuid: &str) -> String {
-    format!("upload-sessions/{namespace}/{uuid}.json")
+/// Directory holding the SHA-256 hasher-state checkpoints for an upload, one
+/// file per offset. Used to enumerate checkpoints and pick the most recent.
+pub fn upload_hash_context_dir(namespace: &str, uuid: &str, algorithm: &str) -> String {
+    format!("{REPOS_ROOT}/{namespace}/_uploads/{uuid}/hashstates/{algorithm}")
 }
 
-/// Prefix under which all upload sessions for a namespace are stored.
-///
-/// Used by `BlobStore::list_uploads` and the recovery sweeper to enumerate sessions.
-pub fn upload_sessions_namespace_prefix(namespace: &str) -> String {
-    format!("upload-sessions/{namespace}/")
+/// Serialised SHA-256 hasher state after consuming the upload's bytes up to
+/// `offset`. One file per checkpoint offset, allowing hash resumption after a
+/// crash without re-reading the uploaded bytes.
+pub fn upload_hash_context_path(
+    namespace: &str,
+    uuid: &str,
+    algorithm: &str,
+    offset: u64,
+) -> String {
+    format!("{REPOS_ROOT}/{namespace}/_uploads/{uuid}/hashstates/{algorithm}/{offset}")
+}
+
+/// RFC3339 timestamp marking when the upload session was created. Used for
+/// age-based orphan detection during scrub.
+pub fn upload_start_date_path(namespace: &str, uuid: &str) -> String {
+    format!("{REPOS_ROOT}/{namespace}/_uploads/{uuid}/startedat")
+}
+
+/// Opaque backend-managed [`UploadSession`] persisted as JSON so an in-flight
+/// upload (notably the S3 multipart upload id and its parts list) survives a
+/// process crash. Lives under the upload container alongside the other
+/// per-session artifacts.
+pub fn upload_session_state_path(namespace: &str, uuid: &str) -> String {
+    format!("{REPOS_ROOT}/{namespace}/_uploads/{uuid}/session")
 }
 
 pub fn manifest_revisions_link_root_dir(namespace: &str, algorithm: &str) -> String {
@@ -242,9 +266,22 @@ mod tests {
             upload_path("ns", "uuid"),
             "v2/repositories/ns/_uploads/uuid/data"
         );
+        assert_eq!(uploads_root_dir("ns"), "v2/repositories/ns/_uploads");
         assert_eq!(
-            upload_session_path("ns", "uuid"),
-            "upload-sessions/ns/uuid.json"
+            upload_staged_dir("ns", "uuid"),
+            "v2/repositories/ns/_uploads/uuid/staged"
+        );
+        assert_eq!(
+            upload_hash_context_path("ns", "uuid", "sha256", 42),
+            "v2/repositories/ns/_uploads/uuid/hashstates/sha256/42"
+        );
+        assert_eq!(
+            upload_start_date_path("ns", "uuid"),
+            "v2/repositories/ns/_uploads/uuid/startedat"
+        );
+        assert_eq!(
+            upload_session_state_path("ns", "uuid"),
+            "v2/repositories/ns/_uploads/uuid/session"
         );
     }
 

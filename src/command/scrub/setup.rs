@@ -8,7 +8,8 @@ use crate::{
     command::scrub::{
         check::{
             BlobChecker, LayoutChecker, LinkReferencesChecker, ManifestChecker, MediaTypeChecker,
-            NamespaceChecker, ReferrerChecker, RetentionChecker, TagChecker, UploadChecker,
+            MultipartChecker, NamespaceChecker, ReferrerChecker, RetentionChecker, TagChecker,
+            UploadChecker,
         },
         error::Error,
     },
@@ -108,6 +109,25 @@ pub fn blob_checker(
     options
         .blobs
         .then(|| BlobChecker::new(blob_store.clone(), metadata_store.clone()))
+}
+
+pub fn multipart_checker(
+    options: &Options,
+    blob_store: &Arc<blob_store::BlobStore>,
+) -> Result<Option<MultipartChecker>, Error> {
+    let Some(multipart_timeout) = options.multipart else {
+        return Ok(None);
+    };
+    let multipart_timeout = Duration::from_std(multipart_timeout.into())
+        .map_err(|e| Error::Initialization(format!("Multipart timeout is invalid: {e}")))?;
+    info!(
+        "Multipart cleanup timeout set to {} second(s)",
+        multipart_timeout.num_seconds()
+    );
+    Ok(Some(MultipartChecker::new(
+        blob_store.clone(),
+        multipart_timeout,
+    )))
 }
 
 #[cfg(test)]

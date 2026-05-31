@@ -28,8 +28,8 @@ pub mod transaction;
 // and never import `angos_storage` directly. The `Store` façade in
 // [`store`] is the seam through which all storage access flows.
 pub use angos_storage::{
-    BoxedReader, ByteStream, ChildrenPage, Error as StorageError, Etag, ObjectMeta, Page,
-    UploadSession,
+    BoxedReader, ByteStream, ChildrenPage, Error as StorageError, Etag, MultipartUploadPage,
+    ObjectMeta, Page, PendingMultipartUpload, UploadSession,
 };
 
 /// Granular S3 conditional operation capabilities.

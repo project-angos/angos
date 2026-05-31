@@ -382,7 +382,7 @@ impl UploadSessionStore for MemoryObjectStore {
     async fn write_upload(
         &self,
         session: &mut UploadSession,
-        _staging_key: &str,
+        _staged_dir: &str,
         mut body: ByteStream,
         len: u64,
     ) -> Result<(), Error> {
@@ -413,18 +413,21 @@ impl UploadSessionStore for MemoryObjectStore {
     async fn complete_upload(
         &self,
         _session: UploadSession,
-        _staging_key: &str,
+        _staged_dir: &str,
     ) -> Result<(), Error> {
         Ok(())
     }
 
-    async fn abort_upload(&self, session: UploadSession, _staging_key: &str) -> Result<(), Error> {
+    async fn abort_upload(&self, session: UploadSession, _staged_dir: &str) -> Result<(), Error> {
         self.delete(&session.key).await
     }
 
     async fn abort_pending_uploads(&self, _key: &str) -> Result<(), Error> {
         Ok(())
     }
+
+    // `list_multipart_uploads` / `abort_multipart_upload` use the trait's
+    // empty/no-op defaults: the memory backend has no multipart protocol.
 }
 
 #[cfg(test)]

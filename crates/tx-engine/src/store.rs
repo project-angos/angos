@@ -15,9 +15,9 @@
 //!
 //! Plain reads, non-transactional writes, and the upload primitives return
 //! [`StorageError`] so callers keep matching [`StorageError::NotFound`]
-//! directly. The coordinated helpers — [`Store::update`],
-//! [`Store::update_with_payload`], and [`Store::finalize_upload`] — return the
-//! engine [`Error`] (carrying `Conflict`/`Precondition`).
+//! directly. The coordinated helpers — [`Store::update`] and
+//! [`Store::update_with_payload`] — return the engine [`Error`] (carrying
+//! `Conflict`/`Precondition`).
 
 use std::{fmt, future::Future, sync::Arc, time::Duration};
 
@@ -25,8 +25,9 @@ use bytes::Bytes;
 use tracing::debug;
 
 use angos_storage::{
-    BoxedReader, ByteStream, ChildrenPage, Error as StorageError, ObjectMeta, ObjectStore, Page,
-    PresignedStore, UploadSession, UploadSessionStore, fs::Backend as StorageFsBackend,
+    BoxedReader, ByteStream, ChildrenPage, Error as StorageError, MultipartUploadPage, ObjectMeta,
+    ObjectStore, Page, PresignedStore, UploadSession, UploadSessionStore,
+    fs::Backend as StorageFsBackend,
 };
 
 use crate::{
@@ -355,7 +356,7 @@ impl Store {
     }
 
     /// Stream `len` bytes from `body` into `session`, parking sub-part
-    /// remainders at `staging_key` (S3 only). The session is mutated in place.
+    /// remainders at `staged_dir` (S3 only). The session is mutated in place.
     ///
     /// # Errors
     ///
@@ -363,12 +364,12 @@ impl Store {
     pub async fn write_upload(
         &self,
         session: &mut UploadSession,
-        staging_key: &str,
+        staged_dir: &str,
         body: ByteStream,
         len: u64,
     ) -> Result<(), StorageError> {
         self.upload()?
-            .write_upload(session, staging_key, body, len)
+            .write_upload(session, staged_dir, body, len)
             .await
     }
 
@@ -381,9 +382,9 @@ impl Store {
     pub async fn abort_upload(
         &self,
         session: UploadSession,
-        staging_key: &str,
+        staged_dir: &str,
     ) -> Result<(), StorageError> {
-        self.upload()?.abort_upload(session, staging_key).await
+        self.upload()?.abort_upload(session, staged_dir).await
     }
 
     /// Best-effort abort of any in-flight backend upload state for `key`.
@@ -395,11 +396,49 @@ impl Store {
         self.upload()?.abort_pending_uploads(key).await
     }
 
+    /// List in-flight multipart uploads store-wide, one page at a time
+    /// (`key_marker`/`upload_id_marker` continue a prior page; `None` starts).
+    ///
+    /// A raw primitive: orphan detection (age thresholds, live-session checks)
+    /// is the caller's job. FS/memory backends return an empty page.
+    ///
+    /// # Errors
+    ///
+    /// [`StorageError::Backend`] when no upload-session store was wired, or any
+    /// backend listing failure.
+    pub async fn list_multipart_uploads(
+        &self,
+        key_marker: Option<&str>,
+        upload_id_marker: Option<&str>,
+    ) -> Result<MultipartUploadPage, StorageError> {
+        self.upload()?
+            .list_multipart_uploads(key_marker, upload_id_marker)
+            .await
+    }
+
+    /// Abort a single in-flight multipart upload by `key` + `upload_id`.
+    ///
+    /// # Errors
+    ///
+    /// [`StorageError::Backend`] when no upload-session store was wired, or any
+    /// backend abort failure.
+    pub async fn abort_multipart_upload(
+        &self,
+        key: &str,
+        upload_id: &str,
+    ) -> Result<(), StorageError> {
+        self.upload()?.abort_multipart_upload(key, upload_id).await
+    }
+
     /// Run only the backend completion step (S3 multipart-complete; FS no-op)
-    /// so the assembled object lands at `session.key`. Promotion to the
-    /// canonical path is left to the caller — used when those mutations must be
-    /// merged into a larger transaction (e.g. upload promotion + blob-index
-    /// grant). For the standalone case prefer [`Store::finalize_upload`].
+    /// so the assembled object lands at `session.key`.
+    ///
+    /// This is a primitive: promotion to the canonical path and deletion of
+    /// any session-record keys are left to the caller, which composes them
+    /// into an engine [`Transaction`] (via [`Store::execute`]) so the moves
+    /// and deletes commit atomically — often merged with other mutations
+    /// (e.g. a blob-index grant). The upload-session orchestration that drives
+    /// this lives in the registry, not the engine.
     ///
     /// # Errors
     ///
@@ -408,43 +447,9 @@ impl Store {
     pub async fn complete_upload(
         &self,
         session: UploadSession,
-        staging_key: &str,
+        staged_dir: &str,
     ) -> Result<(), StorageError> {
-        self.upload()?.complete_upload(session, staging_key).await
-    }
-
-    /// Two-phase upload finalization: run the backend completion step so the
-    /// assembled object lands at `session.key`, then atomically `Move` it to
-    /// `dst_key` and `Delete` the session record at `session_record_key` in a
-    /// single engine transaction.
-    ///
-    /// # Errors
-    ///
-    /// - [`Error::Storage`] wrapping [`StorageError::Backend`] when no
-    ///   upload-session store was wired, or any backend completion failure.
-    /// - Any [`Error`] from the promoting transaction.
-    pub async fn finalize_upload(
-        &self,
-        session: UploadSession,
-        staging_key: &str,
-        dst_key: &str,
-        session_record_key: &str,
-    ) -> Result<Outcome, Error> {
-        let upload = self.upload()?;
-        let src_key = session.key.clone();
-        upload.complete_upload(session, staging_key).await?;
-
-        let tx = Transaction::builder()
-            .mutation(Mutation::Move {
-                src: src_key,
-                dst: dst_key.to_string(),
-            })
-            .mutation(Mutation::Delete {
-                key: session_record_key.to_string(),
-                expected: None,
-            })
-            .build();
-        self.executor.execute(tx).await
+        self.upload()?.complete_upload(session, staged_dir).await
     }
 
     // ── Presign / prune ──────────────────────────────────────────────────────
@@ -683,7 +688,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn finalize_upload_promotes_and_deletes_session() {
+    async fn complete_upload_then_promote_and_delete_via_transaction() {
         let backend = Arc::new(MemoryObjectStore::new());
         let store = store_over(backend);
 
@@ -694,15 +699,28 @@ mod tests {
             .await
             .expect("session record");
 
+        // Primitive: backend completion lands the assembled object at the
+        // session key. The caller (registry) then composes the promotion and
+        // record cleanup into a single engine transaction.
         store
-            .finalize_upload(
-                session,
-                "staging/u1",
-                "blob-data/abc",
-                "upload-sessions/u1.json",
+            .complete_upload(session, "staging/u1")
+            .await
+            .expect("complete");
+        store
+            .execute(
+                Transaction::builder()
+                    .mutation(Mutation::Move {
+                        src: "upload/u1".to_string(),
+                        dst: "blob-data/abc".to_string(),
+                    })
+                    .mutation(Mutation::Delete {
+                        key: "upload-sessions/u1.json".to_string(),
+                        expected: None,
+                    })
+                    .build(),
             )
             .await
-            .expect("finalize");
+            .expect("promote");
 
         // Assembled object promoted to the canonical key…
         assert!(store.get("blob-data/abc").await.is_ok());

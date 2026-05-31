@@ -342,7 +342,7 @@ mod tests {
 
     use angos_storage::{
         BoxedReader as StorageBoxedReader, ByteStream, ChildrenPage, Error as StorageError,
-        ObjectMeta, ObjectStore, Page, UploadSession, UploadSessionStore,
+        MultipartUploadPage, ObjectMeta, ObjectStore, Page, UploadSession, UploadSessionStore,
     };
     use angos_tx_engine::store::Store;
 
@@ -457,7 +457,7 @@ mod tests {
         async fn write_upload(
             &self,
             session: &mut UploadSession,
-            staging_key: &str,
+            staged_dir: &str,
             body: ByteStream,
             len: u64,
         ) -> Result<(), StorageError> {
@@ -467,31 +467,49 @@ mod tests {
                 ));
             }
             self.inner
-                .write_upload(session, staging_key, body, len)
+                .write_upload(session, staged_dir, body, len)
                 .await
         }
 
         async fn complete_upload(
             &self,
             session: UploadSession,
-            staging_key: &str,
+            staged_dir: &str,
         ) -> Result<(), StorageError> {
             if matches!(self.fail, FailOp::CompleteUpload) {
                 return Err(fail("complete should not be called for existing blob data"));
             }
-            self.inner.complete_upload(session, staging_key).await
+            self.inner.complete_upload(session, staged_dir).await
         }
 
         async fn abort_upload(
             &self,
             session: UploadSession,
-            staging_key: &str,
+            staged_dir: &str,
         ) -> Result<(), StorageError> {
-            self.inner.abort_upload(session, staging_key).await
+            self.inner.abort_upload(session, staged_dir).await
         }
 
         async fn abort_pending_uploads(&self, key: &str) -> Result<(), StorageError> {
             self.inner.abort_pending_uploads(key).await
+        }
+
+        async fn list_multipart_uploads(
+            &self,
+            key_marker: Option<&str>,
+            upload_id_marker: Option<&str>,
+        ) -> Result<MultipartUploadPage, StorageError> {
+            self.inner
+                .list_multipart_uploads(key_marker, upload_id_marker)
+                .await
+        }
+
+        async fn abort_multipart_upload(
+            &self,
+            key: &str,
+            upload_id: &str,
+        ) -> Result<(), StorageError> {
+            self.inner.abort_multipart_upload(key, upload_id).await
         }
     }
 
@@ -1120,16 +1138,22 @@ mod tests {
 
         assert_eq!(summary.size, content.len() as u64);
 
-        // Corrupt the session record's hash_context field so that
-        // `complete_upload` cannot reconstruct the final digest. On the
-        // engine path the hash state lives in the session JSON (not in a
-        // legacy `hashstates/sha256/<offset>` file).
-        let session_path = path_builder::upload_session_path(namespace, &session_id.to_string());
-        let session_file_path = test_case.temp_dir().path().join(&session_path);
-        let session_bytes = std::fs::read(&session_file_path).unwrap();
-        let mut session: serde_json::Value = serde_json::from_slice(&session_bytes).unwrap();
-        session["hash_context"] = serde_json::Value::String("not-valid-base64!!!".to_string());
-        std::fs::write(&session_file_path, serde_json::to_vec(&session).unwrap()).unwrap();
+        // Corrupt every `hashstates/sha256/<offset>` checkpoint so that
+        // `complete_upload` cannot reconstruct the final digest from the
+        // persisted hasher state.
+        let hashstates_dir =
+            test_case
+                .temp_dir()
+                .path()
+                .join(path_builder::upload_hash_context_dir(
+                    namespace,
+                    &session_id.to_string(),
+                    "sha256",
+                ));
+        for entry in std::fs::read_dir(&hashstates_dir).unwrap() {
+            let checkpoint = entry.unwrap().path();
+            std::fs::write(&checkpoint, b"not-a-valid-hasher-state").unwrap();
+        }
 
         let empty_stream = Cursor::new(Vec::new());
         let result = registry

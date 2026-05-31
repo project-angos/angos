@@ -7,7 +7,7 @@ use crate::{
     command::scrub::{action::Action, error::Error},
     oci::{Manifest, Reference},
     registry::{
-        blob_store,
+        blob_store::{self, MultipartCleanup},
         manifest::link_plan,
         metadata_store::{
             BlobIndexOperation, Error as MetadataStoreError, LinkOperation, MetadataStore,
@@ -193,6 +193,14 @@ impl ActionSink for Executor {
                         &namespace,
                         &[LinkOperation::delete_with_referrer(link, referrer)],
                     )
+                    .await?;
+            }
+            Action::AbortMultipartUpload { key, upload_id } => {
+                self.blob_store
+                    .abort_orphan_multipart_upload(&blob_store::OrphanMultipartUpload {
+                        key,
+                        upload_id,
+                    })
                     .await?;
             }
         }

@@ -32,8 +32,8 @@ use tokio::{
 use tokio_util::{io::StreamReader, task::AbortOnDropHandle};
 
 use crate::{
-    ByteStream, Error, Etag, Part, SessionState, UploadSession, UploadSessionStore, channel_stream,
-    s3::Backend,
+    ByteStream, Error, Etag, MultipartUploadPage, Part, PendingMultipartUpload, SessionState,
+    UploadSession, UploadSessionStore, channel_stream, s3::Backend,
 };
 
 const FRAME_SIZE: usize = 1024 * 1024;
@@ -74,6 +74,14 @@ fn next_part_number(parts: &[Part]) -> Result<u32, Error> {
     u32::try_from(parts.len() + 1).map_err(|e| Error::Backend(e.to_string()))
 }
 
+/// Storage key for the sub-part remainder staged at `offset` bytes under
+/// `staged_dir` (the `<staged_dir>/<offset>` layout). `offset` is the
+/// session's `uploaded_size` at the moment the remainder was written, so the
+/// next call recomputes the same key for read-back.
+fn staged_key(staged_dir: &str, offset: u64) -> String {
+    format!("{staged_dir}/{offset}")
+}
+
 #[async_trait]
 impl UploadSessionStore for Backend {
     async fn create_upload(&self, key: &str) -> Result<UploadSession, Error> {
@@ -91,7 +99,7 @@ impl UploadSessionStore for Backend {
     async fn write_upload(
         &self,
         session: &mut UploadSession,
-        staging_key: &str,
+        staged_dir: &str,
         body: ByteStream,
         len: u64,
     ) -> Result<(), Error> {
@@ -100,8 +108,12 @@ impl UploadSessionStore for Backend {
         }
         let staged_size = s3_state(&session.state)?.2;
 
-        let staging = staging_key.to_string();
-        let staged_bytes = load_staged(&self.client, &staging, staged_size).await?;
+        // The current remainder (if any) sits at `<staged_dir>/<offset>` where
+        // `offset` is the session's `uploaded_size` — the value at the time the
+        // previous call staged it, before this chunk is counted.
+        let read_offset = session.uploaded_size;
+        let read_key = staged_key(staged_dir, read_offset);
+        let staged_bytes = load_staged(&self.client, &read_key, staged_size).await?;
         let staged_len =
             u64::try_from(staged_bytes.len()).map_err(|e| Error::Backend(e.to_string()))?;
 
@@ -144,7 +156,12 @@ impl UploadSessionStore for Backend {
             });
         }
 
-        // Persist or drop the staging key based on what's left.
+        // The new remainder is staged at the post-write offset; the previous
+        // staged file (at `read_offset`) is removed once superseded, so at most
+        // one staged file exists per session.
+        let write_offset = read_offset
+            .checked_add(len)
+            .ok_or_else(|| Error::Backend("session size overflow".to_string()))?;
         let (_, _, staged_size_field) = s3_state_mut(&mut session.state)?;
         if restaged > 0 {
             let mut remainder = Vec::with_capacity(
@@ -161,40 +178,42 @@ impl UploadSessionStore for Backend {
                     "short read while restaging: expected {restaged}, got {actual}",
                 )));
             }
+            let write_key = staged_key(staged_dir, write_offset);
             self.client
-                .put_object(&staging, Bytes::from(remainder))
+                .put_object(&write_key, Bytes::from(remainder))
                 .await?;
+            if staged_len > 0 {
+                let _ = self.client.delete(&read_key).await;
+            }
             *staged_size_field = restaged;
         } else if staged_len > 0 {
-            let _ = self.client.delete(&staging).await;
+            let _ = self.client.delete(&read_key).await;
             *staged_size_field = 0;
         }
 
-        session.uploaded_size = session
-            .uploaded_size
-            .checked_add(len)
-            .ok_or_else(|| Error::Backend("session size overflow".to_string()))?;
+        session.uploaded_size = write_offset;
         Ok(())
     }
 
     async fn complete_upload(
         &self,
         mut session: UploadSession,
-        staging_key: &str,
+        staged_dir: &str,
     ) -> Result<(), Error> {
         let (upload_id_opt, _, staged_size) = s3_state(&session.state)?;
         let upload_id_opt = upload_id_opt.clone();
-        let staging = staging_key.to_string();
+        // The final remainder sits at the last write offset == `uploaded_size`.
+        let read_key = staged_key(staged_dir, session.uploaded_size);
 
         match (upload_id_opt, staged_size) {
             (None, 0) => {
                 self.client.put_object(&session.key, Bytes::new()).await?;
             }
             (None, _) => {
-                // Small upload — promote the staging key to the canonical key
-                // and clean up.
-                self.client.copy_object(&staging, &session.key).await?;
-                let _ = self.client.delete(&staging).await;
+                // Small upload — promote the staged remainder to the canonical
+                // key and clean up.
+                self.client.copy_object(&read_key, &session.key).await?;
+                let _ = self.client.delete(&read_key).await;
             }
             (Some(upload_id), staged) => {
                 if staged > 0 {
@@ -202,7 +221,7 @@ impl UploadSessionStore for Backend {
                         let (_, parts, _) = s3_state(&session.state)?;
                         next_part_number(parts)?
                     };
-                    let data = self.client.read(&staging).await?;
+                    let data = self.client.read(&read_key).await?;
                     let len =
                         u64::try_from(data.len()).map_err(|e| Error::Backend(e.to_string()))?;
                     let body = Bytes::from(data);
@@ -224,7 +243,7 @@ impl UploadSessionStore for Backend {
                         size: len,
                     });
                     *staged_field = 0;
-                    let _ = self.client.delete(&staging).await;
+                    let _ = self.client.delete(&read_key).await;
                 }
 
                 let (_, parts, _) = s3_state(&session.state)?;
@@ -245,12 +264,13 @@ impl UploadSessionStore for Backend {
         Ok(())
     }
 
-    async fn abort_upload(&self, session: UploadSession, staging_key: &str) -> Result<(), Error> {
+    async fn abort_upload(&self, session: UploadSession, staged_dir: &str) -> Result<(), Error> {
         let (upload_id_opt, _, _) = s3_state(&session.state)?;
         if let Some(id) = upload_id_opt {
             let _ = self.client.abort_multipart_upload(&session.key, id).await;
         }
-        let _ = self.client.delete(staging_key).await;
+        let read_key = staged_key(staged_dir, session.uploaded_size);
+        let _ = self.client.delete(&read_key).await;
         Ok(())
     }
 
@@ -280,6 +300,36 @@ impl UploadSessionStore for Backend {
             }
         }
         Ok(())
+    }
+
+    async fn list_multipart_uploads(
+        &self,
+        key_marker: Option<&str>,
+        upload_id_marker: Option<&str>,
+    ) -> Result<MultipartUploadPage, Error> {
+        let (uploads, next_key_marker, next_upload_id_marker) = self
+            .client
+            .list_multipart_uploads(None, key_marker, upload_id_marker)
+            .await?;
+        Ok(MultipartUploadPage {
+            uploads: uploads
+                .into_iter()
+                .map(|u| PendingMultipartUpload {
+                    key: u.key,
+                    upload_id: u.upload_id,
+                    initiated_at: u.initiated_at,
+                })
+                .collect(),
+            next_key_marker,
+            next_upload_id_marker,
+        })
+    }
+
+    async fn abort_multipart_upload(&self, key: &str, upload_id: &str) -> Result<(), Error> {
+        self.client
+            .abort_multipart_upload(key, upload_id)
+            .await
+            .map_err(Error::from)
     }
 }
 
