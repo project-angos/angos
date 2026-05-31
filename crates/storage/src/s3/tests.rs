@@ -253,13 +253,87 @@ async fn upload_session_nonuniform_single_part() {
     assert_eq!(assembled, data);
 }
 
-/// Non-uniform mode flushes at the S3 minimum part size (5 MiB), not at the
-/// configured part size (here 50 MiB). A single ~6 MiB write therefore emits
-/// one multipart part rather than restaging everything.
+/// Non-uniform mode flushes at the operator-configured `part_size`, not at the
+/// S3 5 MiB floor. With `part_size = 8 MiB`, a ~6 MiB write must emit ZERO
+/// parts (everything stays staged); only once the combined bytes reach
+/// `part_size` does exactly one part get emitted.
 #[tokio::test]
-async fn upload_session_nonuniform_flushes_at_min_part_size_not_configured_part_size() {
-    let store = backend_with(false, 50 * 1024 * 1024);
-    let key = format!("up/nonuniform-min/{}", Uuid::new_v4());
+async fn upload_session_nonuniform_flushes_at_configured_part_size_not_min() {
+    const PART_SIZE: u64 = 8 * 1024 * 1024;
+    let store = backend_with(false, PART_SIZE);
+    let key = format!("up/nonuniform-cfg/{}", Uuid::new_v4());
+    let staged_dir = format!("{key}.staged");
+
+    // ~6 MiB: above the 5 MiB S3 floor but below the 8 MiB configured
+    // threshold. Nothing may flush; it all stays staged.
+    let first: Vec<u8> = (0..6 * 1024 * 1024u32).map(|i| (i % 251) as u8).collect();
+    let mut session = store.create_upload(&key).await.unwrap();
+    let first_len = first.len() as u64;
+    store
+        .write_upload(&mut session, &staged_dir, frame(first.clone()), first_len)
+        .await
+        .unwrap();
+
+    match &session.state {
+        SessionState::S3 {
+            parts,
+            staged_size,
+            upload_id,
+        } => {
+            assert_eq!(
+                parts.len(),
+                0,
+                "6 MiB < 8 MiB part_size: no part may be emitted yet"
+            );
+            assert_eq!(
+                *staged_size, first_len,
+                "all bytes must remain staged below the configured threshold"
+            );
+            assert!(
+                upload_id.is_none(),
+                "no multipart session should open before the first flush"
+            );
+        }
+        SessionState::Fs => panic!("expected an S3 session state"),
+    }
+
+    // A second ~3 MiB write pushes the combined total (~9 MiB) over the 8 MiB
+    // threshold, so exactly one part is emitted and the surplus is restaged.
+    let second: Vec<u8> = (0..3 * 1024 * 1024u32).map(|i| (i % 251) as u8).collect();
+    let second_len = second.len() as u64;
+    store
+        .write_upload(&mut session, &staged_dir, frame(second.clone()), second_len)
+        .await
+        .unwrap();
+
+    match &session.state {
+        SessionState::S3 {
+            parts, upload_id, ..
+        } => {
+            assert_eq!(
+                parts.len(),
+                1,
+                "crossing part_size must emit exactly one part"
+            );
+            assert!(upload_id.is_some(), "a multipart session must now be open");
+        }
+        SessionState::Fs => panic!("expected an S3 session state"),
+    }
+
+    store.complete_upload(session, &staged_dir).await.unwrap();
+    let assembled = store.get(&key).await.unwrap();
+    let mut expected = first;
+    expected.extend_from_slice(&second);
+    assert_eq!(assembled, expected);
+}
+
+/// Regression guard for the default config: with `part_size = 5 MiB`
+/// (== the S3 floor), non-uniform mode still flushes a ~6 MiB write into one
+/// part with nothing left staged, exactly as before the threshold fix.
+#[tokio::test]
+async fn upload_session_nonuniform_default_still_flushes_at_5_mib() {
+    let store = backend_with(false, 5 * 1024 * 1024);
+    let key = format!("up/nonuniform-default/{}", Uuid::new_v4());
     let data: Vec<u8> = (0..6 * 1024 * 1024u32).map(|i| (i % 251) as u8).collect();
 
     let mut session = store.create_upload(&key).await.unwrap();

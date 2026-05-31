@@ -239,11 +239,15 @@ impl ObjectStore for Backend {
 
         let available = staged_len + len;
 
+        // Non-uniform mode flushes once the combined bytes reach the
+        // operator-configured `part_size`, but never below the S3 5 MiB floor
+        // (a smaller non-final `UploadPart` would be rejected).
+        let nonuniform_threshold = self.part_size.max(MIN_PART_SIZE);
         let (parts_to_emit, emit_size, restaged) = if self.uniform_parts {
             let part_size = self.part_size;
             let full = available / part_size;
             (full, part_size, available - full * part_size)
-        } else if available >= MIN_PART_SIZE {
+        } else if available >= nonuniform_threshold {
             (1u64, available, 0u64)
         } else {
             (0u64, 0u64, available)
