@@ -27,6 +27,10 @@ use angos_storage::Etag;
 #[serde(tag = "op")]
 pub enum MutationRecord {
     /// Write `body_ref` to `key`.
+    ///
+    /// `expected` is honored by both executors: the CAS executor via
+    /// `put_if_match`, and the Locked executor via a HEAD + `ETag` comparison
+    /// under the lock.
     Put {
         key: String,
         body_ref: String,
@@ -35,6 +39,10 @@ pub enum MutationRecord {
     /// Write `body_ref` to `key` only if the key is absent.
     PutIfAbsent { key: String, body_ref: String },
     /// Delete `key`.
+    ///
+    /// `expected` is honored by both executors: the CAS executor via
+    /// `delete_if_match`, and the Locked executor via a HEAD + `ETag` comparison
+    /// under the lock.
     Delete { key: String, expected: Option<Etag> },
     /// Server-side copy from `src` to `dst`.
     Copy { src: String, dst: String },

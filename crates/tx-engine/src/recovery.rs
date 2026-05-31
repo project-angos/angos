@@ -17,9 +17,10 @@ use angos_storage::{ConditionalStore, Error as StorageError, Etag, ObjectStore};
 
 use crate::{
     error::Error,
-    executor::cas::apply_cas_idempotent,
+    executor::{cas::apply_cas_idempotent, common},
     intent::{IntentRecord, MutationProgress, MutationRecord},
     lock::primitive::Lock,
+    transaction::lock_key_set,
 };
 
 /// Periodic recovery loop.
@@ -121,21 +122,19 @@ impl RecoveryLoopBuilder {
 /// lock keys, sorted and de-duplicated. Matches what `Transaction::lock_set`
 /// produces from the original `Transaction`.
 fn intent_lock_set(intent: &IntentRecord) -> Vec<String> {
-    let mut keys: Vec<String> = intent
-        .reads
-        .iter()
-        .map(|r| r.key.clone())
-        .chain(
-            intent
-                .mutations
-                .iter()
-                .flat_map(|m| m.all_keys().map(ToOwned::to_owned)),
-        )
-        .chain(intent.coarse_lock_keys.iter().cloned())
-        .collect();
-    keys.sort();
-    keys.dedup();
-    keys
+    lock_key_set(
+        intent
+            .reads
+            .iter()
+            .map(|r| r.key.clone())
+            .chain(
+                intent
+                    .mutations
+                    .iter()
+                    .flat_map(|m| m.all_keys().map(ToOwned::to_owned)),
+            )
+            .chain(intent.coarse_lock_keys.iter().cloned()),
+    )
 }
 
 impl RecoveryLoop {
@@ -286,49 +285,20 @@ impl RecoveryLoop {
     }
 
     /// Roll back a transaction that has no applied mutations.
+    ///
+    /// Delegates to the shared [`common::rollback`] so the recovery and
+    /// healthy-path cleanup stay in lock-step.
     async fn rollback(&self, intent: &IntentRecord) {
-        let prefix = intent.bodies_prefix();
-        if let Err(e) = self.store.delete_prefix(&prefix).await {
-            warn!(
-                tx_id = %intent.id,
-                prefix,
-                error = %e,
-                "RecoveryLoop: rollback failed to delete body staging"
-            );
-        }
-        if let Err(e) = self.store.delete(&intent.log_key()).await {
-            warn!(
-                tx_id = %intent.id,
-                key = intent.log_key(),
-                error = %e,
-                "RecoveryLoop: rollback failed to delete intent"
-            );
-        }
+        common::rollback(self.store.as_ref(), intent).await;
     }
 
     /// Reap a fully-applied transaction.
     ///
-    /// If deleting the body prefix fails the intent log is left intact so
-    /// this sweep can be retried on the next tick.
+    /// Delegates to the shared [`common::reap`]: deletes the body staging
+    /// prefix first, leaving the intent log intact for a later sweep if that
+    /// delete fails.
     async fn reap(&self, intent: &IntentRecord) {
-        let prefix = intent.bodies_prefix();
-        if let Err(e) = self.store.delete_prefix(&prefix).await {
-            warn!(
-                tx_id = %intent.id,
-                prefix,
-                error = %e,
-                "RecoveryLoop: reap failed to delete body staging; will retry next sweep"
-            );
-            return;
-        }
-        if let Err(e) = self.store.delete(&intent.log_key()).await {
-            warn!(
-                tx_id = %intent.id,
-                key = intent.log_key(),
-                error = %e,
-                "RecoveryLoop: reap failed to delete intent"
-            );
-        }
+        common::reap(self.store.as_ref(), intent).await;
     }
 
     /// Apply a single mutation during recovery.
@@ -437,12 +407,6 @@ async fn apply_mutation_unconditional(
             Err(e) => Err(e),
         },
         MutationRecord::Copy { src, dst, .. } => store.copy(src, dst).await,
-        MutationRecord::Move { src, dst, .. } => {
-            store.copy(src, dst).await?;
-            match store.delete(src).await {
-                Ok(()) | Err(StorageError::NotFound) => Ok(()),
-                Err(e) => Err(e),
-            }
-        }
+        MutationRecord::Move { src, dst, .. } => common::move_idempotent(store, src, dst).await,
     }
 }

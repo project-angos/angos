@@ -230,25 +230,46 @@ pub fn build_executor(
     s3_lock_delete_if_match: bool,
     supports_cas: bool,
 ) -> Result<Arc<dyn TransactionExecutor>, Error> {
-    let lock_storage: Arc<dyn LockStorage> = match lock_strategy {
-        LockStrategy::Memory => Arc::new(MemoryLockStorage::new()),
+    // Each arm yields the lock-object storage plus a `LockBuilder` primed with
+    // the per-strategy tuning carried in the strategy config. The tuning is
+    // threaded directly into the builder (never stored as a Config field), and
+    // the Lock is built once after the match.
+    let lock_builder = match lock_strategy {
+        LockStrategy::Memory => {
+            let storage: Arc<dyn LockStorage> = Arc::new(MemoryLockStorage::new());
+            // Memory backend: keep builder defaults.
+            Lock::builder().storage(storage)
+        }
         #[cfg(feature = "redis")]
         LockStrategy::Redis(config) => {
-            let s = RedisLockStorage::new(&config)
-                .map_err(|e| Error::Build(format!("failed to build Redis lock storage: {e}")))?;
-            Arc::new(s)
+            let storage: Arc<dyn LockStorage> =
+                Arc::new(RedisLockStorage::new(&config).map_err(|e| {
+                    Error::Build(format!("failed to build Redis lock storage: {e}"))
+                })?);
+            // Redis TTL is enforced natively by the storage; only the retry
+            // tuning is threaded into the lock primitive.
+            Lock::builder()
+                .storage(storage)
+                .max_retries(config.max_retries)
+                .retry_delay_ms(config.retry_delay_ms)
         }
-        LockStrategy::S3(_) => {
+        LockStrategy::S3(config) => {
             let client = s3_lock_client.ok_or_else(|| {
                 Error::Build("S3 lock strategy requires an S3 HTTP client".to_string())
             })?;
-            Arc::new(S3LockStorage::new(client, s3_lock_delete_if_match))
+            let storage: Arc<dyn LockStorage> =
+                Arc::new(S3LockStorage::new(client, s3_lock_delete_if_match));
+            Lock::builder()
+                .storage(storage)
+                .ttl_secs(config.ttl_secs)
+                .max_retries(config.max_retries)
+                .retry_delay_ms(config.retry_delay_ms)
+                .max_hold_secs(config.max_hold_secs)
         }
     };
 
     let lock = Arc::new(
-        Lock::builder()
-            .storage(lock_storage)
+        lock_builder
             .build()
             .map_err(|e| Error::Build(format!("failed to build lock: {e}")))?,
     );

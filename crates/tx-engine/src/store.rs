@@ -19,10 +19,14 @@
 //! [`Store::update_with_payload`] — return the engine [`Error`] (carrying
 //! `Conflict`/`Precondition`).
 
-use std::{fmt, future::Future, sync::Arc, time::Duration};
+use std::{
+    fmt,
+    future::Future,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
 use bytes::Bytes;
-use tracing::debug;
 
 use angos_storage::{
     BoxedReader, ByteStream, ChildrenPage, Error as StorageError, MultipartUploadPage, ObjectMeta,
@@ -32,7 +36,7 @@ use angos_storage::{
 
 use crate::{
     error::Error,
-    executor::{Outcome, TransactionExecutor},
+    executor::{Outcome, TransactionExecutor, execute_with_retry_payload},
     transaction::{Mutation, Transaction},
 };
 
@@ -305,10 +309,16 @@ impl Store {
     /// # Errors
     ///
     /// See [`Store::update`].
+    ///
+    /// # Panics
+    ///
+    /// Panics only if the internal mutex guarding `map` is poisoned. The mutex
+    /// is created locally, never shared, and the guard is dropped before any
+    /// `.await`, so poisoning cannot occur in practice.
     pub async fn update_with_payload<F, Fut, T>(
         &self,
         keys: &[String],
-        mut map: F,
+        map: F,
         max_attempts: u32,
     ) -> Result<(Outcome, T), Error>
     where
@@ -316,8 +326,17 @@ impl Store {
         Fut: Future<Output = Result<(Vec<Mutation>, T), Error>> + Send,
         T: Send,
     {
-        let mut attempts = 0u32;
-        loop {
+        // `execute_with_retry_payload` takes a `FnMut() -> Fut` whose `Fut`
+        // must not borrow the closure's captures. The caller's `map` needs
+        // `&mut`, which would make the build closure `FnMut` and let that
+        // mutable borrow escape into the returned future. Sharing `map` through
+        // a `Mutex` lets the closure capture it by shared reference (so it is
+        // `Fn`); `&Mutex<F>` is `Send + Sync` when `F: Send`, so the future
+        // still satisfies the helper's `Fut: Send` bound. The lock guard is
+        // dropped before the `.await`, so it is never held across a suspension
+        // point.
+        let map = Mutex::new(map);
+        let build = || async {
             let snaps = self.read_many_for_update(keys).await?;
             let mut builder = Transaction::builder();
             for snap in &snaps {
@@ -329,19 +348,17 @@ impl Store {
                     builder = builder.read(snap.key.clone(), snap.body.clone());
                 }
             }
-            let (mutations, payload) = map(snaps).await?;
+            let map_fut = {
+                let mut map = map.lock().expect("update map closure is never poisoned");
+                map(snaps)
+            };
+            let (mutations, payload) = map_fut.await?;
             for mutation in mutations {
                 builder = builder.mutation(mutation);
             }
-            match self.executor.execute(builder.build()).await {
-                Ok(outcome) => return Ok((outcome, payload)),
-                Err(Error::Conflict | Error::Precondition) if attempts < max_attempts => {
-                    debug!(attempts, max_attempts, "read-for-update conflict, retrying");
-                    attempts += 1;
-                }
-                Err(e) => return Err(e),
-            }
-        }
+            Ok((builder.build(), payload))
+        };
+        execute_with_retry_payload(self.executor.as_ref(), build, max_attempts).await
     }
 
     // ── Upload lifecycle ─────────────────────────────────────────────────────

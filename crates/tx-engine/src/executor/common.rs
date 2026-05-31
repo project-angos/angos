@@ -104,6 +104,30 @@ pub async fn stage_bodies(
     Ok(records)
 }
 
+/// Apply a `Move` idempotently: copy `src` to `dst`, then delete `src`
+/// tolerating a missing source.
+///
+/// Shared by the replay-forward paths (the CAS idempotent applier and the
+/// unconditional recovery applier) so the idempotent Move shape stays in
+/// lock-step. The `copy` still propagates errors; only a `NotFound` on the
+/// source delete is swallowed so re-application after a partial Move converges.
+///
+/// # Errors
+///
+/// Returns the underlying [`angos_storage::Error`] from `copy`, or from
+/// `delete` when it fails with anything other than `NotFound`.
+pub async fn move_idempotent(
+    store: &dyn ObjectStore,
+    src: &str,
+    dst: &str,
+) -> Result<(), angos_storage::Error> {
+    store.copy(src, dst).await?;
+    match store.delete(src).await {
+        Ok(()) | Err(angos_storage::Error::NotFound) => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
 /// Reap a committed transaction: delete body staging objects, then the intent
 /// log entry.
 ///

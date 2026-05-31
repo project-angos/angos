@@ -180,10 +180,7 @@ pub struct S3LockConfig {
         deserialize_with = "deserialize_retry_delay_ms"
     )]
     pub retry_delay_ms: u64,
-    #[serde(
-        default = "S3LockConfig::default_max_hold_secs",
-        deserialize_with = "deserialize_max_hold_secs"
-    )]
+    #[serde(default = "S3LockConfig::default_max_hold_secs")]
     pub max_hold_secs: u64,
     /// Timeout (seconds) for a single storage operation. Defaults to 15.
     #[serde(default = "S3LockConfig::default_operation_timeout_secs")]
@@ -213,18 +210,6 @@ fn deserialize_retry_delay_ms<'de, D: serde::Deserializer<'de>>(
     if value < 1 {
         return Err(serde::de::Error::custom(
             "retry_delay_ms must be at least 1",
-        ));
-    }
-    Ok(value)
-}
-
-fn deserialize_max_hold_secs<'de, D: serde::Deserializer<'de>>(
-    deserializer: D,
-) -> Result<u64, D::Error> {
-    let value = u64::deserialize(deserializer)?;
-    if value < 10 {
-        return Err(serde::de::Error::custom(
-            "max_hold_secs must be at least 10",
         ));
     }
     Ok(value)
@@ -323,7 +308,22 @@ pub fn resolve_lock_strategy<E: serde::de::Error>(
     }
 }
 
-/// Returns a random number in `[0, max_ms)` for use as retry-loop jitter.
+/// Returns a pseudo-random number in `[0, max_ms)` for use as retry-loop
+/// jitter.
+///
+/// This intentionally avoids any RNG dependency: it seeds a fresh
+/// [`RandomState`] and reads its hasher's initial state as an entropy source.
+///
+/// # Entropy caveat
+///
+/// The standard library does **not** guarantee that `RandomState` is seeded
+/// from a high-quality entropy source, nor that successive `RandomState`
+/// instances yield independent or uniformly-distributed seeds — the seeding
+/// strategy is an unspecified implementation detail that may change between
+/// releases and platforms. This is therefore **not** a cryptographic RNG and
+/// must not be relied upon for anything beyond best-effort retry-loop jitter,
+/// whose only purpose is to spread out contended retries. Correctness never
+/// depends on the value's quality.
 #[must_use]
 pub fn simple_jitter(max_ms: u64) -> u64 {
     if max_ms == 0 {

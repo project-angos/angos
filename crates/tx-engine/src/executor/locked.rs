@@ -1,9 +1,16 @@
 //! Locked executor: acquires distributed locks on the full key set, writes the
-//! intent, applies mutations with unconditional `put`/`delete`, then reaps.
+//! intent, applies mutations under the lock, then reaps.
 //!
 //! Works on any `ObjectStore` backend (FS or S3) because it never calls
-//! conditional operations. Deadlock-freedom is guaranteed by acquiring all
-//! locks in sorted order before any write.
+//! backend-native conditional operations; instead it enforces a mutation's
+//! `expected` `ETag` itself by HEAD-comparing the stored `ETag` under the lock
+//! before writing. Deadlock-freedom is guaranteed by acquiring all locks in
+//! sorted order before any write.
+//!
+//! NOTE: Both executors now honor `expected`. The CAS executor uses
+//! backend-native conditional primitives (`put_if_match`/`delete_if_match`);
+//! the Locked executor performs an explicit HEAD + `ETag` comparison under the
+//! lock, mirroring CAS semantics.
 
 use std::sync::Arc;
 
@@ -14,7 +21,7 @@ use sha2::{Digest as _, Sha256};
 use tracing::{debug, warn};
 use uuid::Uuid;
 
-use angos_storage::{ConditionalStore, Error as StorageError, ObjectStore};
+use angos_storage::{ConditionalStore, Error as StorageError, Etag, ObjectStore};
 
 use crate::{
     error::Error,
@@ -86,8 +93,12 @@ impl LockedExecutorBuilder {
     /// Returns [`Error::Build`] if `store` or `lock` was not provided.
     pub fn build(self) -> Result<LockedExecutor, Error> {
         Ok(LockedExecutor {
-            store: self.store.ok_or(Error::Build("store".to_string()))?,
-            lock: self.lock.ok_or(Error::Build("lock".to_string()))?,
+            store: self
+                .store
+                .ok_or_else(|| Error::Build("executor requires a store".to_string()))?,
+            lock: self
+                .lock
+                .ok_or_else(|| Error::Build("executor requires a lock".to_string()))?,
             ttl_secs: self.ttl_secs.unwrap_or(DEFAULT_INTENT_TTL_SECS),
         })
     }
@@ -100,10 +111,26 @@ impl LockedExecutor {
         LockedExecutorBuilder::default()
     }
 
-    /// Apply a single mutation unconditionally (under the pre-acquired lock).
+    /// Apply a single mutation under the pre-acquired lock.
+    ///
+    /// `expected` is honored here: for a conditional `Put` or `Delete`, the
+    /// stored `ETag` is fetched via HEAD under the lock and compared to the
+    /// expected [`Etag`], mirroring the CAS executor's `put_if_match` /
+    /// `delete_if_match` semantics. (See module docs.)
     async fn apply_mutation(&self, mutation: &MutationRecord, idx: usize) -> Result<(), Error> {
         match mutation {
-            MutationRecord::Put { key, body_ref, .. } => {
+            MutationRecord::Put {
+                key,
+                body_ref,
+                expected,
+            } => {
+                if let Some(etag) = expected {
+                    // Conditional put: require the stored object to currently
+                    // match `etag`. Missing key, ETag mismatch, or a backend
+                    // that cannot surface an ETag => Precondition (no write),
+                    // matching `put_if_match`.
+                    self.check_expected_match(key, etag).await?;
+                }
                 let body = self.store.get(body_ref).await?;
                 self.store.put(key, Bytes::from(body)).await?;
                 Ok(())
@@ -126,7 +153,21 @@ impl LockedExecutor {
                     Err(e) => Err(Error::Storage(e)),
                 }
             }
-            MutationRecord::Delete { key, .. } => {
+            MutationRecord::Delete { key, expected } => {
+                if let Some(etag) = expected {
+                    // Conditional delete: ETag mismatch => Precondition; a
+                    // missing key is a no-op success, matching
+                    // `delete_if_match`.
+                    match self.store.head(key).await {
+                        Ok(meta) => {
+                            if meta.etag.as_ref() != Some(etag) {
+                                return Err(Error::Precondition);
+                            }
+                        }
+                        Err(StorageError::NotFound) => return Ok(()),
+                        Err(e) => return Err(Error::Storage(e)),
+                    }
+                }
                 self.store.delete(key).await?;
                 Ok(())
             }
@@ -139,6 +180,27 @@ impl LockedExecutor {
                 self.store.delete(src).await?;
                 Ok(())
             }
+        }
+    }
+
+    /// Return `Ok(())` only if `key` currently exists and its stored `ETag`
+    /// equals `expected`. Otherwise return [`Error::Precondition`] without
+    /// touching the object.
+    ///
+    /// A missing key, an `ETag` mismatch, or a backend that does not surface an
+    /// `ETag` on HEAD all fail conservatively as a precondition failure, mirroring
+    /// the CAS executor's `put_if_match` behaviour.
+    async fn check_expected_match(&self, key: &str, expected: &Etag) -> Result<(), Error> {
+        match self.store.head(key).await {
+            Ok(meta) => {
+                if meta.etag.as_ref() == Some(expected) {
+                    Ok(())
+                } else {
+                    Err(Error::Precondition)
+                }
+            }
+            Err(StorageError::NotFound) => Err(Error::Precondition),
+            Err(e) => Err(Error::Storage(e)),
         }
     }
 
@@ -285,7 +347,7 @@ mod tests {
 
     use bytes::Bytes;
 
-    use angos_storage::{MemoryObjectStore, ObjectStore};
+    use angos_storage::{Etag, MemoryObjectStore, ObjectStore};
 
     use crate::{
         error::Error,
@@ -397,5 +459,72 @@ mod tests {
             .await
             .expect("existing key still present");
         assert_eq!(body.as_slice(), b"bytes", "original body must be untouched");
+    }
+
+    #[tokio::test]
+    async fn put_with_stale_expected_returns_precondition_and_leaves_object() {
+        let store = Arc::new(MemoryObjectStore::new());
+        // Seed an object so it has a real (current) ETag.
+        store
+            .put("k1", Bytes::from_static(b"original"))
+            .await
+            .unwrap();
+        let executor = make_executor(Arc::clone(&store));
+
+        // A conditional put against a stale ETag must fail and not write.
+        let stale = Etag::new("\"stale-etag\"");
+        let tx = Transaction::builder()
+            .mutation(Mutation::Put {
+                key: "k1".to_string(),
+                body: Bytes::from_static(b"new"),
+                expected: Some(stale),
+            })
+            .build();
+
+        let result: Result<Outcome, Error> = executor.execute(tx).await;
+        assert!(
+            matches!(result, Err(Error::Precondition)),
+            "stale expected etag on Put should return Precondition, got: {result:?}"
+        );
+
+        // The existing object must be untouched.
+        let body = store.get("k1").await.expect("k1 still present");
+        assert_eq!(
+            body.as_slice(),
+            b"original",
+            "existing object must be untouched on precondition failure"
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_with_stale_expected_returns_precondition_and_leaves_object() {
+        let store = Arc::new(MemoryObjectStore::new());
+        store
+            .put("k1", Bytes::from_static(b"original"))
+            .await
+            .unwrap();
+        let executor = make_executor(Arc::clone(&store));
+
+        let stale = Etag::new("\"stale-etag\"");
+        let tx = Transaction::builder()
+            .mutation(Mutation::Delete {
+                key: "k1".to_string(),
+                expected: Some(stale),
+            })
+            .build();
+
+        let result: Result<Outcome, Error> = executor.execute(tx).await;
+        assert!(
+            matches!(result, Err(Error::Precondition)),
+            "stale expected etag on Delete should return Precondition, got: {result:?}"
+        );
+
+        // The object must still be present.
+        let body = store.get("k1").await.expect("k1 still present");
+        assert_eq!(
+            body.as_slice(),
+            b"original",
+            "existing object must survive a failed conditional delete"
+        );
     }
 }

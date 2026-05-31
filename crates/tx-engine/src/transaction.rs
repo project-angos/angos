@@ -40,9 +40,9 @@ pub struct Read {
 pub enum Mutation {
     /// Write `body` to `key`, replacing any existing object.
     ///
-    /// When `expected` is `Some`, the executor verifies the current etag
-    /// matches before writing (CAS path). Under the Locked executor the field
-    /// is informational and the write is unconditional.
+    /// When `expected` is `Some`, both executors verify the current etag
+    /// matches before writing: the CAS executor via `put_if_match`, and the
+    /// Locked executor via a HEAD + `ETag` comparison under the lock.
     Put {
         key: String,
         body: Bytes,
@@ -58,10 +58,11 @@ pub enum Mutation {
 
     /// Delete `key`.
     ///
-    /// When `expected` is `Some`, the CAS executor uses `delete_if_match`
-    /// to prevent deleting an object whose etag has changed since the
-    /// transaction was built. The Locked executor ignores the field and
-    /// issues an unconditional delete under the key's lock.
+    /// When `expected` is `Some`, both executors prevent deleting an object
+    /// whose etag has changed since the transaction was built: the CAS executor
+    /// uses `delete_if_match`, and the Locked executor performs a HEAD + `ETag`
+    /// comparison under the key's lock (a missing key is treated as a no-op
+    /// success in both cases).
     Delete { key: String, expected: Option<Etag> },
 
     /// Server-side copy from `src` to `dst`.
@@ -127,6 +128,21 @@ pub struct Transaction {
     pub coarse_lock_keys: Vec<String>,
 }
 
+/// Collect an iterator of lock keys into a sorted, de-duplicated set.
+///
+/// This is the single authoritative "shape" for every lock-set derivation
+/// (reads ∪ mutation keys ∪ coarse lock keys). Each caller builds its own key
+/// iterator — the families differ ([`Transaction`]/[`Read`]/[`Mutation`] here,
+/// the `IntentRecord`/`ReadRecord`/`MutationRecord` family in recovery) — then
+/// passes it here so the result stays byte-identical across call sites.
+#[must_use]
+pub fn lock_key_set(keys: impl Iterator<Item = String>) -> Vec<String> {
+    let mut keys: Vec<String> = keys.collect();
+    keys.sort();
+    keys.dedup();
+    keys
+}
+
 impl Transaction {
     /// Return a builder for constructing a `Transaction`.
     #[must_use]
@@ -154,20 +170,17 @@ impl Transaction {
     /// (reads ∪ mutations ∪ coarse lock keys), sorted and de-duplicated.
     #[must_use]
     pub fn lock_set(&self) -> Vec<String> {
-        let mut keys: Vec<String> = self
-            .reads
-            .iter()
-            .map(|r| r.key.clone())
-            .chain(
-                self.mutations
-                    .iter()
-                    .flat_map(|m| m.all_keys().map(ToOwned::to_owned)),
-            )
-            .chain(self.coarse_lock_keys.iter().cloned())
-            .collect();
-        keys.sort();
-        keys.dedup();
-        keys
+        lock_key_set(
+            self.reads
+                .iter()
+                .map(|r| r.key.clone())
+                .chain(
+                    self.mutations
+                        .iter()
+                        .flat_map(|m| m.all_keys().map(ToOwned::to_owned)),
+                )
+                .chain(self.coarse_lock_keys.iter().cloned()),
+        )
     }
 }
 

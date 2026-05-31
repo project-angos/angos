@@ -24,7 +24,7 @@ use angos_storage::{ConditionalStore, Error as StorageError, Etag};
 use crate::{
     error::Error,
     executor::{
-        Outcome, TransactionExecutor,
+        Outcome, TransactionExecutor, common,
         common::{reap, rollback, stage_bodies, stamp_progress, write_intent},
     },
     intent::{DEFAULT_INTENT_TTL_SECS, IntentRecord, MutationProgress, MutationRecord, ReadRecord},
@@ -101,8 +101,12 @@ impl CasExecutorBuilder {
     /// Returns [`Error::Build`] if `store` or `lock` was not provided.
     pub fn build(self) -> Result<CasExecutor, Error> {
         Ok(CasExecutor {
-            store: self.store.ok_or(Error::Build("store".to_string()))?,
-            lock: self.lock.ok_or(Error::Build("lock".to_string()))?,
+            store: self.store.ok_or_else(|| {
+                Error::Build("CasExecutor requires a conditional store".to_string())
+            })?,
+            lock: self
+                .lock
+                .ok_or_else(|| Error::Build("CasExecutor requires a lock".to_string()))?,
             ttl_secs: self.ttl_secs.unwrap_or(DEFAULT_INTENT_TTL_SECS),
         })
     }
@@ -402,11 +406,10 @@ pub async fn apply_cas_idempotent(
             Ok(None)
         }
         MutationRecord::Move { src, dst } => {
-            store.copy(src, dst).await.map_err(Error::Storage)?;
-            match store.delete(src).await {
-                Ok(()) | Err(StorageError::NotFound) => Ok(None),
-                Err(e) => Err(Error::Storage(e)),
-            }
+            common::move_idempotent(store, src, dst)
+                .await
+                .map_err(Error::Storage)?;
+            Ok(None)
         }
     }
 }
