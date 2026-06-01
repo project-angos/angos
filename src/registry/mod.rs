@@ -234,11 +234,12 @@ impl Registry {
     /// content-addressed blob's bytes in the window between another repository
     /// granting a reference and validating its manifest, surfacing as
     /// `ManifestBlobUnknown`.
+    ///
+    /// Delegates to [`MetadataStore::acquire_blob_data_lock`], the canonical
+    /// home for the key string and the lock domain (the metadata executor).
     pub async fn acquire_blob_data_lock(&self, digest: &Digest) -> Result<LockSession, Error> {
-        let keys = [format!("blob-data:{digest}")];
         self.metadata_store
-            .executor()
-            .acquire(&keys)
+            .acquire_blob_data_lock(digest)
             .await
             .map_err(|e| Error::Internal(format!("blob-data lock acquire failed: {e}")))
     }

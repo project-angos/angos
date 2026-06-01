@@ -17,7 +17,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 ### Changed
 
 - The storage layer now uses a single resumable streaming upload capability in place of the previous multipart-based one, and in-flight upload sessions do not survive the upgrade (clients retry and `scrub --uploads` reaps the stale staging artifacts).
-- The four registry subsystems (metadata, job, upload, and manifest stores) now write atomically through a single transactional engine, adding three new top-level prefixes — `.tx-log/`, `.tx-bodies/`, and `.tx-locks/`, that operators should factor into bucket policies. A `_jobs/` prefix is also added when the durable job queue (`[global.job_queue]`) is enabled.
+- The four registry subsystems (metadata, job, upload, and manifest stores) now write atomically through a single transactional-engine design instantiated per subsystem, each with its own lock domain (metadata and job share one instance; the blob store and the in-process job queue each have their own), adding three new top-level prefixes — `.tx-log/`, `.tx-bodies/`, and `.tx-locks/`, that operators should factor into bucket policies. A `_jobs/` prefix is also added when the durable job queue (`[global.job_queue]`) is enabled.
 - Blob deletion follows the OCI distribution lifecycle, with blob ownership tracked independently from manifest references.
 - Manifests with missing blob or descriptor references are rejected at push time.
 - Stricter OCI semantics for blob range requests and request-header parsing.

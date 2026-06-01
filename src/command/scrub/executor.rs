@@ -9,10 +9,7 @@ use crate::{
     registry::{
         blob_store::{self, MultipartCleanup},
         manifest::link_plan,
-        metadata_store::{
-            BlobIndexOperation, Error as MetadataStoreError, LinkOperation, MetadataStore,
-            link_kind::LinkKind,
-        },
+        metadata_store::{BlobIndexOperation, LinkOperation, MetadataStore, link_kind::LinkKind},
     },
 };
 
@@ -68,17 +65,7 @@ impl ActionSink for Executor {
                 // reference check and the data delete, so a reference that a
                 // concurrent push is granting cannot be missed and have its
                 // bytes reclaimed underneath it.
-                let keys = [format!("blob-data:{digest}")];
-                let session = self
-                    .metadata_store
-                    .executor()
-                    .acquire(&keys)
-                    .await
-                    .map_err(|e| {
-                        MetadataStoreError::Coordination(format!(
-                            "blob-data lock acquire failed: {e}"
-                        ))
-                    })?;
+                let session = self.metadata_store.acquire_blob_data_lock(&digest).await?;
                 let result = match self.metadata_store.has_blob_references(&digest).await {
                     Err(e) => Err(Error::from(e)),
                     Ok(true) => {

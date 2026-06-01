@@ -648,7 +648,7 @@ Without Redis, cache is in-memory per-instance.
 
 ## Transactional Engine
 
-The transactional engine consolidates multi-step storage writes behind single atomic `Transaction` objects and is always active. The four subsystems it covers are:
+The transactional engine is a single design — an abstraction that consolidates multi-step storage writes behind single atomic `Transaction` objects — that each subsystem instantiates over its own store with its own lock domain; it is always active. Blob-bytes operations that span the blob store serialize via a `blob-data:{digest}` coarse lock taken on the metadata engine, the single lock domain shared by every blob-data participant. The four subsystems it covers are:
 
 | Subsystem | Description |
 |---|---|

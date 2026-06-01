@@ -13,6 +13,7 @@ use angos_tx_engine::{
     StorageError,
     error::Error as TxError,
     executor::{DEFAULT_RETRY_BUDGET, TransactionExecutor, execute_with_retry},
+    lock::LockSession,
     store::Store,
     transaction::{Mutation, Transaction},
 };
@@ -52,6 +53,16 @@ use sharded::{
     SHARD_READ_CONCURRENCY, apply_blob_index_operations, collect_blob_index_shards,
     decode_blob_index_shard_namespace, namespace_links_from_index, non_empty_links_or_not_found,
 };
+
+/// Canonical key for the coarse `blob-data:{digest}` lock.
+///
+/// This is the single source of truth for the lock string. Both the directly
+/// acquired lock ([`MetadataStore::acquire_blob_data_lock`]) and the
+/// transaction-level `coarse_lock(...)` declarations in `link_ops` build their
+/// key here, so the two can never drift out of sync.
+pub fn blob_data_lock_key(digest: &Digest) -> String {
+    format!("blob-data:{digest}")
+}
 
 // ───────────────────────────────────────────────────────────────────────────
 // MetadataStore (concrete implementation)
@@ -164,6 +175,26 @@ impl MetadataStore {
     /// Returns the transaction executor.
     pub fn executor(&self) -> &dyn TransactionExecutor {
         self.store.executor().as_ref()
+    }
+
+    /// Acquire the coarse [`blob_data_lock_key`] lock for `digest`.
+    ///
+    /// The lock lives on the METADATA executor — the single lock domain for
+    /// blob-data — even though the bytes guarded by it may actually be mutated
+    /// on the separate BLOB engine (the metadata and blob subsystems each
+    /// instantiate their own engine with its own lock domain). Anchoring the
+    /// lock here is deliberate: it is the one executor that every blob-data
+    /// participant agrees on, so that manifest pushes (which declare the same
+    /// key via `coarse_lock` on their metadata transaction), upload completion,
+    /// and reclamation/scrub all serialize on the same key/executor. Routing
+    /// every acquisition through this method keeps the lock/engine pairing from
+    /// drifting across the production call sites.
+    pub async fn acquire_blob_data_lock(&self, digest: &Digest) -> Result<LockSession, Error> {
+        let keys = [blob_data_lock_key(digest)];
+        self.executor()
+            .acquire(&keys)
+            .await
+            .map_err(|e| Error::Coordination(format!("blob-data lock acquire failed: {e}")))
     }
 
     // ── Cache helpers ─────────────────────────────────────────────────────

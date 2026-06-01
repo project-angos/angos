@@ -26,7 +26,7 @@ use crate::{
     registry::{
         metadata_store::{
             BlobIndex, BlobIndexOperation, Error, LinkMetadata, LinkOperation, MetadataStore,
-            link_kind::LinkKind, sharded::apply_blob_index_operations,
+            blob_data_lock_key, link_kind::LinkKind, sharded::apply_blob_index_operations,
         },
         path_builder,
     },
@@ -368,7 +368,7 @@ impl MetadataStore {
                         // Serialise against a concurrent manifest-delete on the
                         // same digest under the CAS executor (which takes no
                         // working-set lock).
-                        .coarse_lock(format!("blob-data:{blob_digest}"));
+                        .coarse_lock(blob_data_lock_key(blob_digest));
                 }
 
                 // Process creates.
@@ -552,7 +552,7 @@ impl MetadataStore {
                     // Skip the engine coarse lock when the caller already holds
                     // it (`delete_blob`); the lock is not reentrant.
                     if !extras.caller_holds_blob_data_lock {
-                        builder = builder.coarse_lock(format!("blob-data:{digest}"));
+                        builder = builder.coarse_lock(blob_data_lock_key(digest));
                     }
                 }
 
