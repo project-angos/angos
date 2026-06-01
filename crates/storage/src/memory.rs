@@ -26,7 +26,7 @@ use futures_util::StreamExt;
 
 use crate::{
     BoxedReader, ByteStream, ChildrenPage, ConditionalStore, Error, Etag, ObjectMeta, ObjectStore,
-    Page, SessionState, UploadSession,
+    Page, SessionState, UploadSession, object::dir_prefix,
 };
 
 /// Inner shared state.
@@ -143,19 +143,19 @@ impl ObjectStore for MemoryObjectStore {
     }
 
     async fn delete_prefix(&self, prefix: &str) -> Result<(), Error> {
-        // Treat `prefix` as a directory boundary. If the prefix does not end
-        // with '/', only delete keys under `prefix/` (not keys that merely
-        // share a common string prefix, e.g. "jobs/cache" must not delete
-        // "jobs/cache_extra/foo").
-        let prefix_with_slash;
-        let effective_prefix: &str = if prefix.ends_with('/') {
-            prefix
-        } else {
-            prefix_with_slash = format!("{prefix}/");
-            &prefix_with_slash
-        };
+        // Treat `prefix` as a directory boundary (see `dir_prefix`): a
+        // non-empty prefix is normalised to `prefix/` so keys that merely share
+        // a common string prefix survive (e.g. "jobs/cache" must not delete
+        // "jobs/cache_extra/foo"). An empty prefix is a no-op — it must not
+        // delete every object.
+        let effective_prefix = dir_prefix(prefix);
+        if effective_prefix.is_empty() {
+            return Ok(());
+        }
         let mut guard = self.lock();
-        guard.data.retain(|k, _| !k.starts_with(effective_prefix));
+        guard
+            .data
+            .retain(|k, _| !k.starts_with(effective_prefix.as_ref()));
         Ok(())
     }
 
@@ -502,6 +502,38 @@ mod tests {
     async fn delete_prefix_empty_is_ok() {
         let s = store();
         s.delete_prefix("nonexistent/").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn delete_prefix_is_directory_scoped_not_string_prefix() {
+        // Regression: a non-slash prefix is a directory boundary, so a sibling
+        // that merely shares a string prefix must survive.
+        let s = store();
+        s.put("a/b/1", Bytes::from("1")).await.unwrap();
+        s.put("a/b/c/2", Bytes::from("2")).await.unwrap();
+        s.put("a/bc/3", Bytes::from("3")).await.unwrap();
+
+        s.delete_prefix("a/b").await.unwrap();
+
+        assert!(matches!(s.get("a/b/1").await, Err(crate::Error::NotFound)));
+        assert!(matches!(
+            s.get("a/b/c/2").await,
+            Err(crate::Error::NotFound)
+        ));
+        assert_eq!(s.get("a/bc/3").await.unwrap(), b"3");
+    }
+
+    #[tokio::test]
+    async fn delete_prefix_empty_prefix_is_noop() {
+        // An empty prefix must not wipe the entire store.
+        let s = store();
+        s.put("a/1", Bytes::from("1")).await.unwrap();
+        s.put("b/1", Bytes::from("2")).await.unwrap();
+
+        s.delete_prefix("").await.unwrap();
+
+        assert_eq!(s.get("a/1").await.unwrap(), b"1");
+        assert_eq!(s.get("b/1").await.unwrap(), b"2");
     }
 
     #[tokio::test]

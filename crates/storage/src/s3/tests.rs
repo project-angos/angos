@@ -100,6 +100,38 @@ async fn delete_prefix_clears_subtree() {
 }
 
 #[tokio::test]
+async fn delete_prefix_is_directory_scoped_not_string_prefix() {
+    // Regression for the data-loss bug: forwarding a raw (non-slash) prefix to
+    // the list-prefix delete wiped keys that merely shared a string prefix.
+    // `delete_prefix("<root>/v1")` must delete `<root>/v1/...` but never
+    // `<root>/v1-rc/...`.
+    let store = backend();
+    let root = format!("dps/{}", Uuid::new_v4());
+    for k in ["v1/1", "v1/c/2", "v1-rc/3"] {
+        store
+            .put(&format!("{root}/{k}"), Bytes::from_static(b"x"))
+            .await
+            .unwrap();
+    }
+
+    store.delete_prefix(&format!("{root}/v1")).await.unwrap();
+
+    assert_eq!(
+        store.get(&format!("{root}/v1/1")).await.unwrap_err(),
+        Error::NotFound
+    );
+    assert_eq!(
+        store.get(&format!("{root}/v1/c/2")).await.unwrap_err(),
+        Error::NotFound
+    );
+    assert_eq!(
+        store.get(&format!("{root}/v1-rc/3")).await.unwrap(),
+        b"x",
+        "sibling sharing a string prefix must survive"
+    );
+}
+
+#[tokio::test]
 async fn get_stream_reports_total_size_not_remaining() {
     let store = backend();
     store

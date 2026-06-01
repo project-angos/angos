@@ -43,7 +43,7 @@ use tokio_util::{io::StreamReader, task::AbortOnDropHandle};
 use crate::{
     BoxedReader, ByteStream, ChildrenPage, ConditionalStore, Error, Etag, MultipartUploadPage,
     ObjectMeta, ObjectStore, Page, Part, PendingMultipartUpload, PresignedStore, SessionState,
-    UploadSession, channel_stream,
+    UploadSession, channel_stream, object::dir_prefix,
 };
 
 pub const DEFAULT_PART_SIZE: u64 = 5 * 1024 * 1024;
@@ -156,7 +156,15 @@ impl ObjectStore for Backend {
     }
 
     async fn delete_prefix(&self, prefix: &str) -> Result<(), Error> {
-        Ok(self.client.delete_prefix(prefix).await?)
+        // Normalise to a directory boundary (see `dir_prefix`) so the underlying
+        // raw list-prefix delete cannot wipe keys that merely share a string
+        // prefix (e.g. "tags/v1" must not delete "tags/v1-rc/..."). An empty
+        // prefix is a no-op — it must not delete every object under the bucket.
+        let effective_prefix = dir_prefix(prefix);
+        if effective_prefix.is_empty() {
+            return Ok(());
+        }
+        Ok(self.client.delete_prefix(effective_prefix.as_ref()).await?)
     }
 
     async fn head(&self, key: &str) -> Result<ObjectMeta, Error> {

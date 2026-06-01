@@ -1,3 +1,5 @@
+use std::borrow::Cow;
+
 use async_trait::async_trait;
 use bytes::Bytes;
 
@@ -7,6 +9,24 @@ use crate::{
     types::{ChildrenPage, ObjectMeta, Page},
     upload_session::{ByteStream, MultipartUploadPage, UploadSession},
 };
+
+/// Normalise `prefix` to a directory boundary for [`ObjectStore::delete_prefix`].
+///
+/// A non-empty prefix that does not already end with `/` gets one appended so
+/// the delete is scoped to the directory `prefix/` and never matches a key that
+/// merely shares a string prefix (e.g. `tags/v1` becomes `tags/v1/`, which does
+/// not affect `tags/v1-rc/...`). An empty prefix and a prefix that already ends
+/// with `/` are returned unchanged.
+///
+/// Backends share this so their `delete_prefix` semantics agree byte-for-byte.
+#[must_use]
+pub fn dir_prefix(prefix: &str) -> Cow<'_, str> {
+    if prefix.is_empty() || prefix.ends_with('/') {
+        Cow::Borrowed(prefix)
+    } else {
+        Cow::Owned(format!("{prefix}/"))
+    }
+}
 
 /// Universal object-storage floor.
 ///
@@ -18,9 +38,9 @@ use crate::{
 ///
 /// # Idempotency
 ///
-/// `delete` and `delete_prefix` are idempotent: deleting a missing key or
-/// empty prefix counts as success. `get` and `head` on a missing key return
-/// [`Error::NotFound`].
+/// `delete` and `delete_prefix` are idempotent: deleting a missing key or a
+/// prefix with nothing under it counts as success. `get` and `head` on a
+/// missing key return [`Error::NotFound`].
 #[async_trait]
 pub trait ObjectStore: Send + Sync {
     /// Read the full object body into memory.
@@ -38,8 +58,17 @@ pub trait ObjectStore: Send + Sync {
     /// Delete `key`. Missing key counts as success.
     async fn delete(&self, key: &str) -> Result<(), Error>;
 
-    /// Delete every object whose key starts with `prefix`. Empty prefix
-    /// counts as success.
+    /// Delete every object under the directory `prefix`.
+    ///
+    /// The prefix is treated as a directory boundary: a non-empty prefix is
+    /// normalised to a trailing `/` (see [`dir_prefix`]), then every object
+    /// whose key sits under that directory is removed. A key that merely shares
+    /// a string prefix is never affected — `delete_prefix("tags/v1")` deletes
+    /// `tags/v1/...` but leaves `tags/v1-rc/...` untouched.
+    ///
+    /// A prefix with nothing under it counts as success. An empty prefix is a
+    /// no-op (it is never normalised to the store root, so it cannot delete
+    /// every object).
     async fn delete_prefix(&self, prefix: &str) -> Result<(), Error>;
 
     /// Return the object's size and (when available) `ETag` and

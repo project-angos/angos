@@ -35,7 +35,7 @@ use tokio_util::io::StreamReader;
 
 use crate::{
     BoxedReader, ByteStream, ChildrenPage, Error, ObjectMeta, ObjectStore, Page, SessionState,
-    UploadSession,
+    UploadSession, object::dir_prefix,
 };
 
 /// Page step used by [`Backend::list_all_children`] when draining all pages
@@ -363,6 +363,11 @@ impl ObjectStore for Backend {
     }
 
     async fn delete_prefix(&self, prefix: &str) -> Result<(), Error> {
+        // An empty prefix is a no-op (see `dir_prefix`): it must not be
+        // resolved to the store root and recursively wipe every object.
+        if dir_prefix(prefix).is_empty() {
+            return Ok(());
+        }
         let path = self.full_path(prefix);
         // Directory → recursive remove; file → unlink; missing → success.
         match fs::metadata(&path).await {

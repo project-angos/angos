@@ -70,6 +70,40 @@ async fn delete_prefix_removes_matching_keys_only() {
 }
 
 #[tokio::test]
+async fn delete_prefix_is_directory_scoped_not_string_prefix() {
+    // Regression for the data-loss bug: a non-slash prefix is a directory
+    // boundary, so it must delete keys *under* the directory but never a
+    // sibling that merely shares a string prefix
+    // (`tags/v1` must not affect `tags/v1-rc/...`).
+    let store: Arc<dyn ObjectStore> = backend();
+    store.put("a/b/1", Bytes::from_static(b"x")).await.unwrap();
+    store
+        .put("a/b/c/2", Bytes::from_static(b"y"))
+        .await
+        .unwrap();
+    store.put("a/bc/3", Bytes::from_static(b"z")).await.unwrap();
+
+    store.delete_prefix("a/b").await.unwrap();
+
+    assert_eq!(store.get("a/b/1").await.unwrap_err(), Error::NotFound);
+    assert_eq!(store.get("a/b/c/2").await.unwrap_err(), Error::NotFound);
+    assert_eq!(store.get("a/bc/3").await.unwrap(), b"z");
+}
+
+#[tokio::test]
+async fn delete_prefix_empty_prefix_is_noop() {
+    // An empty prefix must not be treated as the store root and wipe everything.
+    let store: Arc<dyn ObjectStore> = backend();
+    store.put("a/1", Bytes::from_static(b"x")).await.unwrap();
+    store.put("b/1", Bytes::from_static(b"y")).await.unwrap();
+
+    store.delete_prefix("").await.unwrap();
+
+    assert_eq!(store.get("a/1").await.unwrap(), b"x");
+    assert_eq!(store.get("b/1").await.unwrap(), b"y");
+}
+
+#[tokio::test]
 async fn head_returns_size_and_etag() {
     let store: Arc<dyn ObjectStore> = backend();
     store.put("k", Bytes::from_static(b"abcdef")).await.unwrap();
