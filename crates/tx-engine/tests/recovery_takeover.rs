@@ -32,6 +32,7 @@ use std::sync::{
 use async_trait::async_trait;
 use bytes::Bytes;
 use chrono::{Duration as ChronoDuration, Utc};
+use tokio::sync::Notify;
 use uuid::Uuid;
 
 use angos_storage::{
@@ -623,4 +624,219 @@ async fn cas_executor_true_contention_mid_apply_leaves_intent() {
         1,
         "intent must be preserved for recovery on true contention: {logs:?}"
     );
+}
+
+/// Store wrapper that blocks the canonical Apply `put` of one specific key
+/// until the test releases a gate, and counts how many times that key is
+/// written. Used to hold a `LockedExecutor::execute()` in-flight, mid-Apply,
+/// while it still owns the working-set lock.
+#[derive(Debug)]
+struct GatedStore {
+    inner: Arc<MemoryObjectStore>,
+    target_key: String,
+    /// Fired by the wrapper once the gated `put` is reached (owner is now
+    /// in-flight mid-Apply, still holding the lock).
+    reached: Arc<Notify>,
+    /// Awaited by the wrapper; the test fires it to let the owner proceed.
+    gate: Arc<Notify>,
+    target_puts: AtomicUsize,
+}
+
+impl GatedStore {
+    fn new(inner: Arc<MemoryObjectStore>, target_key: impl Into<String>) -> Self {
+        Self {
+            inner,
+            target_key: target_key.into(),
+            reached: Arc::new(Notify::new()),
+            gate: Arc::new(Notify::new()),
+            target_puts: AtomicUsize::new(0),
+        }
+    }
+
+    fn target_put_count(&self) -> usize {
+        self.target_puts.load(Ordering::Acquire)
+    }
+}
+
+#[async_trait]
+impl ObjectStore for GatedStore {
+    async fn get(&self, key: &str) -> Result<Vec<u8>, StorageError> {
+        self.inner.get(key).await
+    }
+    async fn get_stream(
+        &self,
+        key: &str,
+        offset: Option<u64>,
+    ) -> Result<(BoxedReader, u64), StorageError> {
+        self.inner.get_stream(key, offset).await
+    }
+    async fn put(&self, key: &str, data: Bytes) -> Result<(), StorageError> {
+        if key == self.target_key {
+            // Signal we have reached the gated write, then block until released.
+            // Count the write only after the gate opens so a count of 1 proves
+            // the owner — and only the owner — applied the mutation.
+            self.reached.notify_one();
+            self.gate.notified().await;
+            self.target_puts.fetch_add(1, Ordering::AcqRel);
+        }
+        self.inner.put(key, data).await
+    }
+    async fn delete(&self, key: &str) -> Result<(), StorageError> {
+        self.inner.delete(key).await
+    }
+    async fn delete_prefix(&self, prefix: &str) -> Result<(), StorageError> {
+        self.inner.delete_prefix(prefix).await
+    }
+    async fn head(&self, key: &str) -> Result<ObjectMeta, StorageError> {
+        self.inner.head(key).await
+    }
+    async fn list(
+        &self,
+        prefix: &str,
+        n: u16,
+        token: Option<String>,
+    ) -> Result<Page<String>, StorageError> {
+        self.inner.list(prefix, n, token).await
+    }
+    async fn list_children(
+        &self,
+        prefix: &str,
+        n: u16,
+        token: Option<String>,
+        start_after: Option<String>,
+    ) -> Result<ChildrenPage, StorageError> {
+        self.inner
+            .list_children(prefix, n, token, start_after)
+            .await
+    }
+    async fn copy(&self, source: &str, destination: &str) -> Result<(), StorageError> {
+        self.inner.copy(source, destination).await
+    }
+    async fn create_upload(&self, key: &str) -> Result<UploadSession, StorageError> {
+        self.inner.create_upload(key).await
+    }
+    async fn write_upload(
+        &self,
+        session: &mut UploadSession,
+        staged_dir: &str,
+        body: ByteStream,
+        len: u64,
+    ) -> Result<(), StorageError> {
+        self.inner
+            .write_upload(session, staged_dir, body, len)
+            .await
+    }
+    async fn complete_upload(
+        &self,
+        session: UploadSession,
+        staged_dir: &str,
+    ) -> Result<(), StorageError> {
+        self.inner.complete_upload(session, staged_dir).await
+    }
+    async fn abort_upload(
+        &self,
+        session: UploadSession,
+        staged_dir: &str,
+    ) -> Result<(), StorageError> {
+        self.inner.abort_upload(session, staged_dir).await
+    }
+    async fn abort_pending_uploads(&self, key: &str) -> Result<(), StorageError> {
+        self.inner.abort_pending_uploads(key).await
+    }
+}
+
+/// Live owner vs recovery sweep: while a `LockedExecutor::execute()` is blocked
+/// mid-Apply and still holds the working-set lock, a `RecoveryLoop::sweep()`
+/// over the same store and the same `Arc<Lock>` must NOT take over the (already
+/// stale) intent — its `try_acquire(intent_lock_set)` loses to the in-flight
+/// owner. The mutation applies exactly once and recovery leaves no orphans.
+///
+/// This exercises the "race-free against the original owner" guarantee with a
+/// genuinely in-flight owner, not the post-`execute()` crash model the other
+/// recovery tests use.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn live_owner_blocks_recovery_takeover_apply_exactly_once() {
+    let inner = Arc::new(MemoryObjectStore::new());
+    let gated = Arc::new(GatedStore::new(inner.clone(), "live/dst"));
+    // One shared lock primitive so the owner and recovery contend on the same
+    // working-set lock — exactly the production wiring on a single replica's
+    // store, and equivalent to the cross-replica lock-object race.
+    let lock = common::memory_lock();
+
+    // Executor intent TTL of 0 makes the in-flight intent immediately stale, so
+    // the recovery sweep reaches its `try_acquire(lock_set)` while the owner is
+    // still holding the lock — the precise window under test.
+    let executor = Arc::new(
+        angos_tx_engine::executor::locked::LockedExecutor::builder()
+            .store(gated.clone() as Arc<dyn ObjectStore>)
+            .lock(lock.clone())
+            .ttl_secs(0)
+            .build()
+            .expect("LockedExecutor builder"),
+    );
+
+    let tx = Transaction::builder()
+        .mutation(Mutation::Put {
+            key: "live/dst".to_owned(),
+            body: Bytes::from_static(b"owner-body"),
+            expected: None,
+        })
+        .build();
+
+    // Spawn the owner; it will block inside the gated `put("live/dst")`.
+    let owner = {
+        let executor = executor.clone();
+        tokio::spawn(async move { executor.execute(tx).await })
+    };
+
+    // Wait until the owner is parked at the gate (holding the lock, intent
+    // written and already stale).
+    gated.reached.notified().await;
+
+    // Sanity: the intent is on disk and stale; the owner has not yet applied.
+    let logs = inner.list(".tx-log/", 10, None).await.unwrap().items;
+    assert_eq!(logs.len(), 1, "owner must have written its intent: {logs:?}");
+    assert_eq!(
+        gated.target_put_count(),
+        0,
+        "owner must still be blocked before the gated apply"
+    );
+
+    // Run recovery over the same store + same lock while the owner holds it.
+    let recovery = RecoveryLoop::builder(gated.clone() as Arc<dyn ObjectStore>)
+        .lock(lock.clone())
+        .interval(std::time::Duration::from_hours(1))
+        .build();
+    recovery.sweep().await;
+
+    // Recovery must not have applied anything: it could not take the lock.
+    assert_eq!(
+        gated.target_put_count(),
+        0,
+        "recovery must not apply while the live owner holds the working-set lock"
+    );
+    assert!(
+        inner.get("live/dst").await.is_err(),
+        "no double-apply: dst must not exist until the owner proceeds"
+    );
+
+    // Release the gate; let the owner finish.
+    gated.gate.notify_one();
+    let outcome = owner.await.expect("owner task joined");
+    assert!(outcome.is_ok(), "owner must commit: {outcome:?}");
+
+    // Exactly one apply of the canonical key, by the owner.
+    assert_eq!(
+        gated.target_put_count(),
+        1,
+        "the mutation must apply exactly once"
+    );
+    let body = inner.get("live/dst").await.expect("dst written by owner");
+    assert_eq!(body, b"owner-body");
+
+    // The owner reaped its own intent + bodies; nothing left for recovery.
+    let logs = inner.list(".tx-log/", 10, None).await.unwrap().items;
+    assert!(logs.is_empty(), "no orphan .tx-log/ objects: {logs:?}");
+    let bodies = inner.list(".tx-bodies/", 10, None).await.unwrap().items;
+    assert!(bodies.is_empty(), "no orphan .tx-bodies/ objects: {bodies:?}");
 }

@@ -146,3 +146,138 @@ impl LockStorage for S3LockStorage {
         "s3"
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use angos_storage::MemoryObjectStore;
+
+    use super::S3LockStorage;
+    use crate::lock::{
+        Error,
+        storage::{DeleteIfMatchOutcome, LockStorage, PutIfAbsentOutcome, PutIfMatchOutcome},
+    };
+
+    /// `MemoryObjectStore` implements `ConditionalStore`, so it stands in for a
+    /// CAS-capable S3 backend with no live infrastructure.
+    fn storage() -> S3LockStorage {
+        S3LockStorage::new(Arc::new(MemoryObjectStore::new()), true)
+    }
+
+    #[tokio::test]
+    async fn put_if_absent_created_then_already_exists() {
+        let s = storage();
+
+        let first = s.put_if_absent("k", b"body-1".to_vec()).await.unwrap();
+        assert!(
+            matches!(first, PutIfAbsentOutcome::Created(Some(_))),
+            "first put_if_absent must create and return an ETag"
+        );
+
+        let second = s.put_if_absent("k", b"body-2".to_vec()).await.unwrap();
+        assert!(
+            matches!(second, PutIfAbsentOutcome::AlreadyExists),
+            "a second put_if_absent on the same key must report AlreadyExists"
+        );
+    }
+
+    #[tokio::test]
+    async fn put_if_match_updates_on_matching_etag_and_mismatches_on_stale() {
+        let s = storage();
+
+        let PutIfAbsentOutcome::Created(Some(etag)) =
+            s.put_if_absent("k", b"v1".to_vec()).await.unwrap()
+        else {
+            panic!("expected Created with an ETag");
+        };
+
+        let updated = s.put_if_match("k", &etag, b"v2".to_vec()).await.unwrap();
+        let new_etag = match updated {
+            PutIfMatchOutcome::Updated(Some(e)) => e,
+            other => panic!("expected Updated(Some(etag)), got {}", outcome_kind(&other)),
+        };
+        assert_ne!(new_etag, etag, "a successful put_if_match must rotate the ETag");
+
+        // The original (now stale) ETag must mismatch.
+        let stale = s.put_if_match("k", &etag, b"v3".to_vec()).await.unwrap();
+        assert!(
+            matches!(stale, PutIfMatchOutcome::Mismatch),
+            "put_if_match against a stale ETag must report Mismatch"
+        );
+    }
+
+    fn outcome_kind(o: &PutIfMatchOutcome) -> &'static str {
+        match o {
+            PutIfMatchOutcome::Updated(_) => "Updated",
+            PutIfMatchOutcome::Mismatch => "Mismatch",
+        }
+    }
+
+    #[tokio::test]
+    async fn get_with_etag_returns_body_and_etag_and_not_found_when_absent() {
+        let s = storage();
+
+        let absent = s.get_with_etag("missing").await;
+        assert!(
+            matches!(absent, Err(Error::NotFound)),
+            "get_with_etag on an absent key must be NotFound"
+        );
+
+        let PutIfAbsentOutcome::Created(Some(etag)) =
+            s.put_if_absent("k", b"the-body".to_vec()).await.unwrap()
+        else {
+            panic!("expected Created with an ETag");
+        };
+
+        let (body, read_etag, _last_modified) = s.get_with_etag("k").await.unwrap();
+        assert_eq!(body, b"the-body");
+        assert_eq!(
+            read_etag,
+            Some(etag),
+            "get_with_etag must surface the same ETag the put returned"
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_if_match_deletes_on_match_and_mismatches_on_stale() {
+        let s = storage();
+
+        let PutIfAbsentOutcome::Created(Some(etag)) =
+            s.put_if_absent("k", b"v1".to_vec()).await.unwrap()
+        else {
+            panic!("expected Created with an ETag");
+        };
+
+        // Rotate the live ETag so the original is stale.
+        let PutIfMatchOutcome::Updated(Some(_new_etag)) =
+            s.put_if_match("k", &etag, b"v2".to_vec()).await.unwrap()
+        else {
+            panic!("expected Updated");
+        };
+
+        // Deleting with the now-stale ETag must mismatch and leave the object.
+        let stale = s.delete_if_match("k", &etag).await.unwrap();
+        assert!(
+            matches!(stale, DeleteIfMatchOutcome::Mismatch),
+            "delete_if_match against a stale ETag must report Mismatch"
+        );
+        assert!(
+            s.get_with_etag("k").await.is_ok(),
+            "a mismatched conditional delete must leave the object in place"
+        );
+
+        // Delete with the current ETag succeeds, then the key is gone.
+        let (_body, current_etag, _) = s.get_with_etag("k").await.unwrap();
+        let current_etag = current_etag.expect("etag present");
+        let deleted = s.delete_if_match("k", &current_etag).await.unwrap();
+        assert!(
+            matches!(deleted, DeleteIfMatchOutcome::Deleted),
+            "delete_if_match against the current ETag must delete"
+        );
+        assert!(
+            matches!(s.get_with_etag("k").await, Err(Error::NotFound)),
+            "the key must be gone after a successful conditional delete"
+        );
+    }
+}

@@ -730,3 +730,610 @@ enum AcquireAllOutcome {
     HardError(Error),
     Retry { acquired: Vec<String> },
 }
+
+// ─── tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        collections::HashMap,
+        sync::{
+            Arc, Mutex, RwLock,
+            atomic::{AtomicU64, AtomicUsize, Ordering},
+        },
+        time::Duration,
+    };
+
+    use async_trait::async_trait;
+    use chrono::{Duration as ChronoDuration, Utc};
+
+    use super::{
+        HeartbeatOutcome, Lock, PathTickOutcome, heartbeat_tick_path, run_heartbeat_tick,
+    };
+    use crate::lock::{
+        Error,
+        storage::{
+            DeleteIfMatchOutcome, LockBody, LockStorage, PutIfAbsentOutcome, PutIfMatchOutcome,
+        },
+    };
+
+    /// What a single `put_if_match` call on the fake should return.
+    #[derive(Clone, Copy)]
+    enum PutMatchScript {
+        /// Succeed and hand back the next rotated `ETag`.
+        Updated,
+        /// Report an `ETag` mismatch (ownership lost / takeover race lost).
+        Mismatch,
+        /// A transient hard error (counts against the heartbeat failure budget).
+        Failure,
+    }
+
+    /// What a single `get_with_etag` call on the fake should return.
+    #[derive(Clone, Copy)]
+    enum GetScript {
+        /// Return a stored body whose `refreshed_at` makes it expired.
+        Expired,
+        /// Return a stored body that is still fresh.
+        Fresh,
+        /// Return a stored body but with no `ETag` (forces `etag_unavailable`).
+        FreshNoEtag,
+        /// Return a stored, expired body but with no `ETag` (recover path can't fence).
+        ExpiredNoEtag,
+        /// Key is gone.
+        NotFound,
+        /// Transient hard error.
+        Failure,
+    }
+
+    /// Scriptable [`LockStorage`] double.
+    ///
+    /// Every conditional method consults a pre-loaded script field; `ETag`s are
+    /// minted from a monotonically-increasing counter so a healthy refresh
+    /// visibly advances the cached `ETag`. The `put_if_absent` path is driven by
+    /// a separate flag so acquire / `try_acquire` scenarios are independent of
+    /// the heartbeat scripts.
+    #[derive(Default)]
+    struct FakeLockStorage {
+        next_etag: AtomicU64,
+        put_match: Mutex<Option<PutMatchScript>>,
+        get: Mutex<Option<GetScript>>,
+        /// When set, `put_if_absent` reports `AlreadyExists`; otherwise `Created`.
+        put_absent_exists: Mutex<bool>,
+        /// When set, `put_if_absent` returns a hard error.
+        put_absent_error: Mutex<bool>,
+        put_match_calls: AtomicUsize,
+        delete_if_match_calls: AtomicUsize,
+        delete_calls: AtomicUsize,
+        /// Last `delete_if_match` etag, for assertions.
+        last_delete_etag: Mutex<Option<String>>,
+        /// When set, `delete_if_match` reports a mismatch.
+        delete_mismatch: Mutex<bool>,
+    }
+
+    impl std::fmt::Debug for FakeLockStorage {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("FakeLockStorage").finish_non_exhaustive()
+        }
+    }
+
+    impl FakeLockStorage {
+        fn arc() -> Arc<Self> {
+            Arc::new(Self::default())
+        }
+
+        fn mint_etag(&self) -> String {
+            let v = self.next_etag.fetch_add(1, Ordering::Relaxed);
+            format!("\"etag-{v}\"")
+        }
+
+        fn set_put_match(&self, script: PutMatchScript) {
+            *self.put_match.lock().unwrap() = Some(script);
+        }
+
+        fn set_get(&self, script: GetScript) {
+            *self.get.lock().unwrap() = Some(script);
+        }
+
+        fn set_put_absent_exists(&self, exists: bool) {
+            *self.put_absent_exists.lock().unwrap() = exists;
+        }
+
+        fn body_bytes(expired: bool) -> Vec<u8> {
+            let refreshed_at = if expired {
+                Utc::now() - ChronoDuration::seconds(120)
+            } else {
+                Utc::now()
+            };
+            let body = LockBody {
+                refreshed_at,
+                ttl_secs: 30,
+            };
+            serde_json::to_vec(&body).unwrap()
+        }
+    }
+
+    #[async_trait]
+    impl LockStorage for FakeLockStorage {
+        async fn put_if_absent(
+            &self,
+            _key: &str,
+            _body: Vec<u8>,
+        ) -> Result<PutIfAbsentOutcome, Error> {
+            if *self.put_absent_error.lock().unwrap() {
+                return Err(Error::StorageBackend("injected put_if_absent error".into()));
+            }
+            if *self.put_absent_exists.lock().unwrap() {
+                Ok(PutIfAbsentOutcome::AlreadyExists)
+            } else {
+                Ok(PutIfAbsentOutcome::Created(Some(self.mint_etag())))
+            }
+        }
+
+        async fn put_if_match(
+            &self,
+            _key: &str,
+            _expected_etag: &str,
+            _body: Vec<u8>,
+        ) -> Result<PutIfMatchOutcome, Error> {
+            self.put_match_calls.fetch_add(1, Ordering::Relaxed);
+            match self.put_match.lock().unwrap().expect("put_match script set") {
+                PutMatchScript::Updated => Ok(PutIfMatchOutcome::Updated(Some(self.mint_etag()))),
+                PutMatchScript::Mismatch => Ok(PutIfMatchOutcome::Mismatch),
+                PutMatchScript::Failure => {
+                    Err(Error::StorageBackend("injected put_if_match error".into()))
+                }
+            }
+        }
+
+        async fn get_with_etag(
+            &self,
+            _key: &str,
+        ) -> Result<(Vec<u8>, Option<String>, Option<chrono::DateTime<Utc>>), Error> {
+            match self.get.lock().unwrap().expect("get script set") {
+                GetScript::Expired => {
+                    Ok((Self::body_bytes(true), Some(self.mint_etag()), None))
+                }
+                GetScript::Fresh => Ok((Self::body_bytes(false), Some(self.mint_etag()), None)),
+                GetScript::FreshNoEtag => Ok((Self::body_bytes(false), None, None)),
+                GetScript::ExpiredNoEtag => Ok((Self::body_bytes(true), None, None)),
+                GetScript::NotFound => Err(Error::NotFound),
+                GetScript::Failure => {
+                    Err(Error::StorageBackend("injected get_with_etag error".into()))
+                }
+            }
+        }
+
+        async fn delete(&self, _key: &str) -> Result<(), Error> {
+            self.delete_calls.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+
+        async fn delete_if_match(
+            &self,
+            _key: &str,
+            expected_etag: &str,
+        ) -> Result<DeleteIfMatchOutcome, Error> {
+            self.delete_if_match_calls.fetch_add(1, Ordering::Relaxed);
+            *self.last_delete_etag.lock().unwrap() = Some(expected_etag.to_string());
+            if *self.delete_mismatch.lock().unwrap() {
+                Ok(DeleteIfMatchOutcome::Mismatch)
+            } else {
+                Ok(DeleteIfMatchOutcome::Deleted)
+            }
+        }
+
+        fn label(&self) -> &'static str {
+            "fake"
+        }
+    }
+
+    fn lock_with(storage: Arc<FakeLockStorage>) -> Lock {
+        Lock::builder()
+            .storage(storage)
+            .ttl_secs(9)
+            .max_hold_secs(9)
+            .max_retries(2)
+            .build()
+            .expect("lock builder")
+    }
+
+    fn cache(entries: &[(&str, Option<&str>)]) -> Arc<RwLock<HashMap<String, Option<String>>>> {
+        let map: HashMap<String, Option<String>> = entries
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), v.map(ToString::to_string)))
+            .collect();
+        Arc::new(RwLock::new(map))
+    }
+
+    // ─── heartbeat_tick_path ───────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn tick_path_fast_path_mismatch_invalidates_ownership_lost() {
+        let storage = FakeLockStorage::arc();
+        storage.set_put_match(PutMatchScript::Mismatch);
+
+        let outcome =
+            heartbeat_tick_path(storage.as_ref(), "k", 9, Some("\"cached\"".to_string())).await;
+
+        assert!(
+            matches!(outcome, PathTickOutcome::Invalidate("ownership_lost")),
+            "a put_if_match Mismatch on the cached ETag must invalidate as ownership_lost"
+        );
+    }
+
+    #[tokio::test]
+    async fn tick_path_fast_path_updated_advances_etag() {
+        let storage = FakeLockStorage::arc();
+        storage.set_put_match(PutMatchScript::Updated);
+
+        let outcome =
+            heartbeat_tick_path(storage.as_ref(), "k", 9, Some("\"cached\"".to_string())).await;
+
+        match outcome {
+            PathTickOutcome::Updated(Some(new_etag)) => {
+                assert_ne!(new_etag, "\"cached\"", "healthy refresh must rotate the ETag");
+            }
+            other => panic!("expected Updated(new_etag), got a different outcome: {}", outcome_name(&other)),
+        }
+    }
+
+    #[tokio::test]
+    async fn tick_path_slow_path_not_found_invalidates_file_disappeared() {
+        let storage = FakeLockStorage::arc();
+        storage.set_get(GetScript::NotFound);
+
+        // No cached ETag → slow path re-reads via get_with_etag, which is NotFound.
+        let outcome = heartbeat_tick_path(storage.as_ref(), "k", 9, None).await;
+
+        assert!(
+            matches!(outcome, PathTickOutcome::Invalidate("file_disappeared")),
+            "a missing lock object on the slow path must invalidate as file_disappeared"
+        );
+    }
+
+    #[tokio::test]
+    async fn tick_path_slow_path_no_etag_invalidates_etag_unavailable() {
+        let storage = FakeLockStorage::arc();
+        storage.set_get(GetScript::FreshNoEtag);
+
+        let outcome = heartbeat_tick_path(storage.as_ref(), "k", 9, None).await;
+
+        assert!(
+            matches!(outcome, PathTickOutcome::Invalidate("etag_unavailable")),
+            "an ETag-less backend on the slow path cannot safely refresh; must invalidate"
+        );
+    }
+
+    #[tokio::test]
+    async fn tick_path_fast_path_storage_error_is_failure() {
+        let storage = FakeLockStorage::arc();
+        storage.set_put_match(PutMatchScript::Failure);
+
+        let outcome =
+            heartbeat_tick_path(storage.as_ref(), "k", 9, Some("\"cached\"".to_string())).await;
+
+        assert!(
+            matches!(outcome, PathTickOutcome::Failure),
+            "a transient put_if_match error is a Failure (budgeted), not an invalidation"
+        );
+    }
+
+    fn outcome_name(o: &PathTickOutcome) -> &'static str {
+        match o {
+            PathTickOutcome::Updated(_) => "Updated",
+            PathTickOutcome::Invalidate(_) => "Invalidate",
+            PathTickOutcome::Failure => "Failure",
+        }
+    }
+
+    // ─── run_heartbeat_tick (failure budget) ───────────────────────────────
+
+    #[tokio::test]
+    async fn run_tick_single_failure_does_not_cancel() {
+        let storage = FakeLockStorage::arc();
+        storage.set_put_match(PutMatchScript::Failure);
+        let etag_cache = cache(&[("k", Some("\"cached\""))]);
+        let mut consecutive = 0u32;
+
+        let outcome = run_heartbeat_tick(
+            &["k".to_string()],
+            storage.as_ref(),
+            9,
+            Duration::from_secs(3),
+            &etag_cache,
+            &mut consecutive,
+            "fake",
+        )
+        .await;
+
+        assert!(
+            matches!(outcome, HeartbeatOutcome::Continue),
+            "a single transient failure must not cancel"
+        );
+        assert_eq!(consecutive, 1, "the failure must be counted in the budget");
+        // The cache entry is cleared so the next tick takes the slow re-read path.
+        assert!(
+            etag_cache.read().unwrap().get("k").unwrap().is_none(),
+            "a failed tick clears the cached ETag"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_tick_failures_escalate_after_one_ttl() {
+        let storage = FakeLockStorage::arc();
+        storage.set_put_match(PutMatchScript::Failure);
+        let etag_cache = cache(&[("k", Some("\"cached\""))]);
+        let mut consecutive = 0u32;
+
+        // ttl=9, tick=3 ⇒ ticks_per_ttl = 9 / 3 = 3 consecutive failures escalate.
+        // The cache only holds a cached ETag on the first tick; thereafter the
+        // slow path re-reads via get_with_etag, so prime that script too.
+        storage.set_get(GetScript::Failure);
+
+        let paths = ["k".to_string()];
+        let tick = Duration::from_secs(3);
+
+        let o1 = run_heartbeat_tick(
+            &paths, storage.as_ref(), 9, tick, &etag_cache, &mut consecutive, "fake",
+        )
+        .await;
+        assert!(matches!(o1, HeartbeatOutcome::Continue));
+        let o2 = run_heartbeat_tick(
+            &paths, storage.as_ref(), 9, tick, &etag_cache, &mut consecutive, "fake",
+        )
+        .await;
+        assert!(matches!(o2, HeartbeatOutcome::Continue));
+        let o3 = run_heartbeat_tick(
+            &paths, storage.as_ref(), 9, tick, &etag_cache, &mut consecutive, "fake",
+        )
+        .await;
+
+        assert!(
+            matches!(o3, HeartbeatOutcome::Invalidate("heartbeat_failure")),
+            "consecutive failures spanning one TTL must escalate to heartbeat_failure"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_tick_success_resets_failure_counter() {
+        let storage = FakeLockStorage::arc();
+        let etag_cache = cache(&[("k", Some("\"cached\""))]);
+        let mut consecutive = 2u32;
+
+        storage.set_put_match(PutMatchScript::Updated);
+        let outcome = run_heartbeat_tick(
+            &["k".to_string()],
+            storage.as_ref(),
+            9,
+            Duration::from_secs(3),
+            &etag_cache,
+            &mut consecutive,
+            "fake",
+        )
+        .await;
+
+        assert!(matches!(outcome, HeartbeatOutcome::Continue));
+        assert_eq!(consecutive, 0, "a healthy tick resets the failure budget");
+        assert!(
+            etag_cache.read().unwrap().get("k").unwrap().is_some(),
+            "a healthy tick advances the cached ETag"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_tick_mismatch_invalidates_immediately() {
+        let storage = FakeLockStorage::arc();
+        storage.set_put_match(PutMatchScript::Mismatch);
+        let etag_cache = cache(&[("k", Some("\"cached\""))]);
+        let mut consecutive = 0u32;
+
+        let outcome = run_heartbeat_tick(
+            &["k".to_string()],
+            storage.as_ref(),
+            9,
+            Duration::from_secs(3),
+            &etag_cache,
+            &mut consecutive,
+            "fake",
+        )
+        .await;
+
+        assert!(
+            matches!(outcome, HeartbeatOutcome::Invalidate("ownership_lost")),
+            "ownership loss must short-circuit the tick regardless of the failure budget"
+        );
+    }
+
+    // ─── try_recover_stale ─────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn recover_stale_claims_expired_lock_when_race_won() {
+        let storage = FakeLockStorage::arc();
+        storage.set_get(GetScript::Expired);
+        storage.set_put_match(PutMatchScript::Updated);
+        let lock = lock_with(storage);
+
+        let result = lock.try_recover_stale("k").await.expect("no hard error");
+        assert!(
+            matches!(result, Some(Some(_))),
+            "an expired lock won via put_if_match must be claimed with a fresh ETag"
+        );
+    }
+
+    #[tokio::test]
+    async fn recover_stale_returns_none_when_not_expired() {
+        let storage = FakeLockStorage::arc();
+        storage.set_get(GetScript::Fresh);
+        let lock = lock_with(storage.clone());
+
+        let result = lock.try_recover_stale("k").await.expect("no hard error");
+        assert!(result.is_none(), "a fresh lock must not be recovered");
+        assert_eq!(
+            storage.put_match_calls.load(Ordering::Relaxed),
+            0,
+            "a fresh lock must not attempt a conditional replace"
+        );
+    }
+
+    #[tokio::test]
+    async fn recover_stale_returns_none_when_put_if_match_loses_race() {
+        let storage = FakeLockStorage::arc();
+        storage.set_get(GetScript::Expired);
+        storage.set_put_match(PutMatchScript::Mismatch);
+        let lock = lock_with(storage);
+
+        let result = lock.try_recover_stale("k").await.expect("no hard error");
+        assert!(
+            result.is_none(),
+            "losing the put_if_match race (another replica recovered first) returns None"
+        );
+    }
+
+    #[tokio::test]
+    async fn recover_stale_returns_none_when_key_absent() {
+        let storage = FakeLockStorage::arc();
+        storage.set_get(GetScript::NotFound);
+        let lock = lock_with(storage);
+
+        let result = lock.try_recover_stale("k").await.expect("no hard error");
+        assert!(result.is_none(), "a vanished key has nothing to recover");
+    }
+
+    #[tokio::test]
+    async fn recover_stale_errors_when_expired_but_no_etag() {
+        let storage = FakeLockStorage::arc();
+        storage.set_get(GetScript::ExpiredNoEtag);
+        let lock = lock_with(storage);
+
+        let result = lock.try_recover_stale("k").await;
+        assert!(
+            matches!(result, Err(Error::InvalidData(_))),
+            "an expired lock with no ETag cannot be fenced; recovery must error"
+        );
+    }
+
+    // ─── acquire / try_acquire ─────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn try_acquire_created_returns_session() {
+        let storage = FakeLockStorage::arc();
+        storage.set_put_absent_exists(false);
+        let lock = lock_with(storage);
+
+        let session = lock
+            .try_acquire(&["k".to_string()])
+            .await
+            .expect("no hard error");
+        assert!(session.is_some(), "an absent key must yield a session");
+        session.unwrap().release().await;
+    }
+
+    #[tokio::test]
+    async fn try_acquire_contended_fresh_returns_none() {
+        let storage = FakeLockStorage::arc();
+        storage.set_put_absent_exists(true);
+        storage.set_get(GetScript::Fresh);
+        let lock = lock_with(storage);
+
+        let session = lock
+            .try_acquire(&["k".to_string()])
+            .await
+            .expect("no hard error");
+        assert!(
+            session.is_none(),
+            "a held, non-expired lock must yield None from try_acquire"
+        );
+    }
+
+    #[tokio::test]
+    async fn try_acquire_contended_expired_recovers() {
+        let storage = FakeLockStorage::arc();
+        storage.set_put_absent_exists(true);
+        storage.set_get(GetScript::Expired);
+        storage.set_put_match(PutMatchScript::Updated);
+        let lock = lock_with(storage);
+
+        let session = lock
+            .try_acquire(&["k".to_string()])
+            .await
+            .expect("no hard error");
+        assert!(
+            session.is_some(),
+            "an expired lock must be recovered and acquired"
+        );
+        session.unwrap().release().await;
+    }
+
+    #[tokio::test]
+    async fn acquire_errors_after_max_retries_when_held() {
+        let storage = FakeLockStorage::arc();
+        storage.set_put_absent_exists(true);
+        storage.set_get(GetScript::Fresh);
+        // max_retries=2, retry_delay_ms=1 keeps the loop fast.
+        let lock = Lock::builder()
+            .storage(storage)
+            .ttl_secs(9)
+            .max_hold_secs(9)
+            .max_retries(2)
+            .retry_delay_ms(1)
+            .build()
+            .expect("lock builder");
+
+        let result = lock.acquire(&["k".to_string()]).await;
+        assert!(
+            matches!(result, Err(Error::Lock(_))),
+            "a continuously-held lock must error after the retry budget is exhausted"
+        );
+    }
+
+    // ─── release ───────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn release_uses_delete_if_match_with_cached_etag() {
+        let storage = FakeLockStorage::arc();
+        storage.set_put_absent_exists(false);
+        let lock = lock_with(storage.clone());
+
+        let session = lock
+            .try_acquire(&["k".to_string()])
+            .await
+            .expect("no hard error")
+            .expect("session");
+        session.release().await;
+
+        assert_eq!(
+            storage.delete_if_match_calls.load(Ordering::Relaxed),
+            1,
+            "release must use the conditional delete fast path with the cached ETag"
+        );
+        let used = storage.last_delete_etag.lock().unwrap().clone();
+        assert!(
+            used.is_some_and(|e| e.starts_with("\"etag-")),
+            "release must pass the ETag minted at acquire time"
+        );
+    }
+
+    #[tokio::test]
+    async fn release_is_idempotent_when_already_gone() {
+        let storage = FakeLockStorage::arc();
+        storage.set_put_absent_exists(false);
+        // delete_if_match reports Mismatch (someone else owns / it's gone); the
+        // release must complete without panicking and not fall through to a
+        // second hard delete.
+        *storage.delete_mismatch.lock().unwrap() = true;
+        let lock = lock_with(storage.clone());
+
+        let session = lock
+            .try_acquire(&["k".to_string()])
+            .await
+            .expect("no hard error")
+            .expect("session");
+        session.release().await;
+
+        assert_eq!(
+            storage.delete_calls.load(Ordering::Relaxed),
+            0,
+            "a Mismatch on the conditional delete must not escalate to a plain delete"
+        );
+    }
+}
