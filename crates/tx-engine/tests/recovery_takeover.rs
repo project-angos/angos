@@ -26,12 +26,12 @@
 
 use std::sync::{
     Arc,
-    atomic::{AtomicUsize, Ordering},
+    atomic::{AtomicU64, AtomicUsize, Ordering},
 };
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use chrono::{Duration as ChronoDuration, Utc};
+use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use tokio::sync::Notify;
 use uuid::Uuid;
 
@@ -44,6 +44,11 @@ use angos_tx_engine::{
     error::Error as TxError,
     executor::TransactionExecutor,
     intent::{IntentRecord, MutationProgress, MutationRecord},
+    lock::{
+        Error as LockError,
+        primitive::Lock,
+        storage::{DeleteIfMatchOutcome, LockStorage, PutIfAbsentOutcome, PutIfMatchOutcome},
+    },
     recovery::RecoveryLoop,
     transaction::{Mutation, Transaction},
 };
@@ -795,7 +800,11 @@ async fn live_owner_blocks_recovery_takeover_apply_exactly_once() {
 
     // Sanity: the intent is on disk and stale; the owner has not yet applied.
     let logs = inner.list(".tx-log/", 10, None).await.unwrap().items;
-    assert_eq!(logs.len(), 1, "owner must have written its intent: {logs:?}");
+    assert_eq!(
+        logs.len(),
+        1,
+        "owner must have written its intent: {logs:?}"
+    );
     assert_eq!(
         gated.target_put_count(),
         0,
@@ -838,5 +847,175 @@ async fn live_owner_blocks_recovery_takeover_apply_exactly_once() {
     let logs = inner.list(".tx-log/", 10, None).await.unwrap().items;
     assert!(logs.is_empty(), "no orphan .tx-log/ objects: {logs:?}");
     let bodies = inner.list(".tx-bodies/", 10, None).await.unwrap().items;
-    assert!(bodies.is_empty(), "no orphan .tx-bodies/ objects: {bodies:?}");
+    assert!(
+        bodies.is_empty(),
+        "no orphan .tx-bodies/ objects: {bodies:?}"
+    );
+}
+
+/// Lock storage that hands out a fresh `ETag` on acquire but then reports a
+/// `Mismatch` on every heartbeat `put_if_match` — i.e. it simulates a peer
+/// having taken over the lock object. The first heartbeat tick therefore fires
+/// the session's cancellation token with `ownership_lost`.
+#[derive(Debug)]
+struct OwnershipLostLockStorage {
+    next_etag: AtomicU64,
+}
+
+impl OwnershipLostLockStorage {
+    fn new() -> Self {
+        Self {
+            next_etag: AtomicU64::new(0),
+        }
+    }
+
+    fn mint_etag(&self) -> String {
+        let v = self.next_etag.fetch_add(1, Ordering::Relaxed);
+        format!("\"etag-{v}\"")
+    }
+}
+
+#[async_trait]
+impl LockStorage for OwnershipLostLockStorage {
+    async fn put_if_absent(
+        &self,
+        _key: &str,
+        _body: Vec<u8>,
+    ) -> Result<PutIfAbsentOutcome, LockError> {
+        // Acquire always succeeds with a real ETag so the heartbeat takes the
+        // fast (cached-ETag) path on its first tick.
+        Ok(PutIfAbsentOutcome::Created(Some(self.mint_etag())))
+    }
+
+    async fn put_if_match(
+        &self,
+        _key: &str,
+        _expected_etag: &str,
+        _body: Vec<u8>,
+    ) -> Result<PutIfMatchOutcome, LockError> {
+        // Every heartbeat refresh observes a changed ETag → ownership lost.
+        Ok(PutIfMatchOutcome::Mismatch)
+    }
+
+    async fn get_with_etag(
+        &self,
+        _key: &str,
+    ) -> Result<(Vec<u8>, Option<String>, Option<DateTime<Utc>>), LockError> {
+        Err(LockError::NotFound)
+    }
+
+    async fn delete(&self, _key: &str) -> Result<(), LockError> {
+        Ok(())
+    }
+
+    async fn delete_if_match(
+        &self,
+        _key: &str,
+        _expected_etag: &str,
+    ) -> Result<DeleteIfMatchOutcome, LockError> {
+        Ok(DeleteIfMatchOutcome::Deleted)
+    }
+
+    fn label(&self) -> &'static str {
+        "ownership-lost"
+    }
+}
+
+/// Fix: `LockedExecutor::execute` must fence Apply against lock-loss. While the
+/// executor is parked mid-Apply on the gated first write, the heartbeat fires
+/// the session's cancellation token (`ownership_lost`). The select in `execute`
+/// must abort Apply with `Error::Conflict` (retryable) and must NOT let the
+/// remaining gated mutation land — otherwise the original owner could keep
+/// writing while a takeover replica also writes (split-brain).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn locked_executor_aborts_apply_on_lock_loss_conflict() {
+    let inner = Arc::new(MemoryObjectStore::new());
+    // Gate the SECOND mutation's canonical write. The first mutation lands
+    // normally; the executor then parks on `gate/blocked`, holding the lock,
+    // while the heartbeat fires ownership_lost.
+    let gated = Arc::new(GatedStore::new(inner.clone(), "gate/blocked"));
+
+    // ttl_secs = 9 ⇒ heartbeat tick at ~3s. The first tick observes a Mismatch
+    // (ownership lost) and cancels the session while we are parked at the gate.
+    let lock = Arc::new(
+        Lock::builder()
+            .storage(Arc::new(OwnershipLostLockStorage::new()))
+            .ttl_secs(9)
+            .max_hold_secs(9)
+            .build()
+            .expect("lock builder"),
+    );
+
+    let executor = Arc::new(
+        angos_tx_engine::executor::locked::LockedExecutor::builder()
+            .store(gated.clone() as Arc<dyn ObjectStore>)
+            .lock(lock)
+            .build()
+            .expect("LockedExecutor builder"),
+    );
+
+    let tx = Transaction::builder()
+        .mutation(Mutation::Put {
+            key: "gate/first".to_owned(),
+            body: Bytes::from_static(b"first-body"),
+            expected: None,
+        })
+        .mutation(Mutation::Put {
+            key: "gate/blocked".to_owned(),
+            body: Bytes::from_static(b"blocked-body"),
+            expected: None,
+        })
+        .build();
+
+    let runner = {
+        let executor = executor.clone();
+        tokio::spawn(async move { executor.execute(tx).await })
+    };
+
+    // Wait until the executor is parked at the gated second write (first
+    // mutation already applied, lock still held).
+    gated.reached.notified().await;
+    assert_eq!(
+        gated.target_put_count(),
+        0,
+        "the gated mutation must not have landed before cancellation"
+    );
+
+    // The executor returns once the heartbeat (~3s) cancels the session. The
+    // dropped `apply_all` future never reaches `put` past the gate, so the
+    // gated mutation never lands. Use a generous timeout to absorb the ~3s tick.
+    let result = tokio::time::timeout(std::time::Duration::from_secs(30), runner)
+        .await
+        .expect("execute must return after heartbeat cancellation, not hang")
+        .expect("execute task joined");
+
+    assert!(
+        matches!(result, Err(TxError::Conflict)),
+        "lock loss mid-apply must abort with Conflict, got: {result:?}"
+    );
+
+    // The gated mutation never landed: dropping the apply future cancelled the
+    // in-flight write before it could pass the gate.
+    assert_eq!(
+        gated.target_put_count(),
+        0,
+        "the remaining mutation must not be applied after lock loss"
+    );
+    assert!(
+        inner.get("gate/blocked").await.is_err(),
+        "the gated key must not exist after a fenced abort"
+    );
+
+    // The intent is left in place for recovery on a mid-apply abort.
+    let logs = inner.list(".tx-log/", 10, None).await.unwrap().items;
+    assert_eq!(
+        logs.len(),
+        1,
+        "a mid-apply abort must preserve the intent for recovery: {logs:?}"
+    );
+
+    // Release the gate so the parked `put` task (if any reference remains) can
+    // unwind cleanly; the future was already dropped, so this is a no-op safety
+    // valve.
+    gated.gate.notify_one();
 }

@@ -197,7 +197,10 @@ mod tests {
             PutIfMatchOutcome::Updated(Some(e)) => e,
             other => panic!("expected Updated(Some(etag)), got {}", outcome_kind(&other)),
         };
-        assert_ne!(new_etag, etag, "a successful put_if_match must rotate the ETag");
+        assert_ne!(
+            new_etag, etag,
+            "a successful put_if_match must rotate the ETag"
+        );
 
         // The original (now stale) ETag must mismatch.
         let stale = s.put_if_match("k", &etag, b"v3".to_vec()).await.unwrap();

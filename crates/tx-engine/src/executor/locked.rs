@@ -17,6 +17,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use bytes::Bytes;
 use sha2::{Digest as _, Sha256};
+use tokio::select;
 use tracing::{debug, warn};
 use uuid::Uuid;
 
@@ -294,10 +295,29 @@ impl TransactionExecutor for LockedExecutor {
             return Err(e);
         }
 
-        let apply_result = self.apply_all(&mut intent).await;
+        // Fence Apply against lock-loss: the heartbeat fires the session's
+        // cancellation token when ownership is lost (ETag mismatch on refresh)
+        // or `max_hold_secs` is exceeded. Racing `apply_all` against the token
+        // and dropping the future on cancellation stops any further mutations,
+        // so the original owner cannot keep writing while a takeover replica
+        // also writes (split-brain). The abort is reported as `Error::Conflict`
+        // because the caller's retry loop (`execute_with_retry[_payload]`)
+        // retries on `Conflict | Precondition`, re-running the whole
+        // transaction under a freshly-acquired lock.
+        //
+        // (The CAS executor needs no such fence: it holds no working-set lock
+        // and applies via conditional ops, so a lost lock cannot cause an
+        // unconditional overwrite.)
+        let cancelled = session.cancellation();
+        let apply_result = select! {
+            biased;
+            () = cancelled.cancelled() => Err(Error::Conflict),
+            result = self.apply_all(&mut intent) => result,
+        };
 
         // Reap only when the transaction either fully committed or applied
-        // nothing (see `common::finish`).
+        // nothing (see `common::finish`). On a mid-apply abort the intent is
+        // left in place for recovery.
         finish(self.store.as_ref(), &apply_result, &intent).await;
         session.release().await;
 

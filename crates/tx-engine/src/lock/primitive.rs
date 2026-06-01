@@ -28,6 +28,7 @@ use std::{
 };
 
 use chrono::Utc;
+use futures_util::future::join_all;
 use tokio::{
     spawn,
     task::JoinHandle,
@@ -498,37 +499,56 @@ async fn run_heartbeat_tick(
 ) -> HeartbeatOutcome {
     let mut had_failure = false;
 
-    for path in paths {
-        let cached_etag = etag_cache
+    // Snapshot each path's cached ETag up front (one short read-lock hold), then
+    // refresh ALL paths concurrently within a single tick budget. A sequential
+    // refresh could take up to N·tick_deadline wall-clock per tick for N keys,
+    // which under a short TTL lets a peer's stale-lock recovery reclaim a
+    // still-held lock and split ownership. Running them concurrently keeps the
+    // wall-clock per tick at ≈ one `tick_deadline` regardless of key count.
+    let cached_etags: Vec<Option<String>> = {
+        let cache = etag_cache
             .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(path)
-            .and_then(Option::as_ref)
-            .cloned();
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        paths
+            .iter()
+            .map(|path| cache.get(path).and_then(Option::as_ref).cloned())
+            .collect()
+    };
 
-        let outcome = timeout(
-            tick_deadline,
-            heartbeat_tick_path(storage, path, ttl_secs, cached_etag),
-        )
-        .await;
-
-        let path_outcome = match outcome {
-            Err(_) => {
-                warn!(path, "Lock heartbeat: tick timed out");
-                PathTickOutcome::Failure
+    let path_outcomes: Vec<PathTickOutcome> = join_all(paths.iter().zip(cached_etags).map(
+        |(path, cached_etag)| async move {
+            match timeout(
+                tick_deadline,
+                heartbeat_tick_path(storage, path, ttl_secs, cached_etag),
+            )
+            .await
+            {
+                Err(_) => {
+                    warn!(path, "Lock heartbeat: tick timed out");
+                    PathTickOutcome::Failure
+                }
+                Ok(p) => p,
             }
-            Ok(p) => p,
-        };
+        },
+    ))
+    .await;
 
+    // Fold the results after the join (no lock held across an await). Any
+    // `Invalidate` wins; the first such path in `paths` order is chosen so the
+    // reported reason is deterministic.
+    let mut invalidate_reason: Option<&'static str> = None;
+    for (path, path_outcome) in paths.iter().zip(path_outcomes) {
         match path_outcome {
             PathTickOutcome::Updated(new_etag) => {
-                let mut cache = etag_cache
+                etag_cache
                     .write()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                cache.insert(path.clone(), new_etag);
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .insert(path.clone(), new_etag);
             }
             PathTickOutcome::Invalidate(reason) => {
-                return HeartbeatOutcome::Invalidate(reason);
+                if invalidate_reason.is_none() {
+                    invalidate_reason = Some(reason);
+                }
             }
             PathTickOutcome::Failure => {
                 etag_cache
@@ -538,6 +558,10 @@ async fn run_heartbeat_tick(
                 had_failure = true;
             }
         }
+    }
+
+    if let Some(reason) = invalidate_reason {
+        return HeartbeatOutcome::Invalidate(reason);
     }
 
     if had_failure {
@@ -746,10 +770,9 @@ mod tests {
 
     use async_trait::async_trait;
     use chrono::{Duration as ChronoDuration, Utc};
+    use tokio::sync::Barrier;
 
-    use super::{
-        HeartbeatOutcome, Lock, PathTickOutcome, heartbeat_tick_path, run_heartbeat_tick,
-    };
+    use super::{HeartbeatOutcome, Lock, PathTickOutcome, heartbeat_tick_path, run_heartbeat_tick};
     use crate::lock::{
         Error,
         storage::{
@@ -876,7 +899,12 @@ mod tests {
             _body: Vec<u8>,
         ) -> Result<PutIfMatchOutcome, Error> {
             self.put_match_calls.fetch_add(1, Ordering::Relaxed);
-            match self.put_match.lock().unwrap().expect("put_match script set") {
+            match self
+                .put_match
+                .lock()
+                .unwrap()
+                .expect("put_match script set")
+            {
                 PutMatchScript::Updated => Ok(PutIfMatchOutcome::Updated(Some(self.mint_etag()))),
                 PutMatchScript::Mismatch => Ok(PutIfMatchOutcome::Mismatch),
                 PutMatchScript::Failure => {
@@ -890,9 +918,7 @@ mod tests {
             _key: &str,
         ) -> Result<(Vec<u8>, Option<String>, Option<chrono::DateTime<Utc>>), Error> {
             match self.get.lock().unwrap().expect("get script set") {
-                GetScript::Expired => {
-                    Ok((Self::body_bytes(true), Some(self.mint_etag()), None))
-                }
+                GetScript::Expired => Ok((Self::body_bytes(true), Some(self.mint_etag()), None)),
                 GetScript::Fresh => Ok((Self::body_bytes(false), Some(self.mint_etag()), None)),
                 GetScript::FreshNoEtag => Ok((Self::body_bytes(false), None, None)),
                 GetScript::ExpiredNoEtag => Ok((Self::body_bytes(true), None, None)),
@@ -971,9 +997,15 @@ mod tests {
 
         match outcome {
             PathTickOutcome::Updated(Some(new_etag)) => {
-                assert_ne!(new_etag, "\"cached\"", "healthy refresh must rotate the ETag");
+                assert_ne!(
+                    new_etag, "\"cached\"",
+                    "healthy refresh must rotate the ETag"
+                );
             }
-            other => panic!("expected Updated(new_etag), got a different outcome: {}", outcome_name(&other)),
+            other => panic!(
+                "expected Updated(new_etag), got a different outcome: {}",
+                outcome_name(&other)
+            ),
         }
     }
 
@@ -1074,17 +1106,35 @@ mod tests {
         let tick = Duration::from_secs(3);
 
         let o1 = run_heartbeat_tick(
-            &paths, storage.as_ref(), 9, tick, &etag_cache, &mut consecutive, "fake",
+            &paths,
+            storage.as_ref(),
+            9,
+            tick,
+            &etag_cache,
+            &mut consecutive,
+            "fake",
         )
         .await;
         assert!(matches!(o1, HeartbeatOutcome::Continue));
         let o2 = run_heartbeat_tick(
-            &paths, storage.as_ref(), 9, tick, &etag_cache, &mut consecutive, "fake",
+            &paths,
+            storage.as_ref(),
+            9,
+            tick,
+            &etag_cache,
+            &mut consecutive,
+            "fake",
         )
         .await;
         assert!(matches!(o2, HeartbeatOutcome::Continue));
         let o3 = run_heartbeat_tick(
-            &paths, storage.as_ref(), 9, tick, &etag_cache, &mut consecutive, "fake",
+            &paths,
+            storage.as_ref(),
+            9,
+            tick,
+            &etag_cache,
+            &mut consecutive,
+            "fake",
         )
         .await;
 
@@ -1334,6 +1384,135 @@ mod tests {
             storage.delete_calls.load(Ordering::Relaxed),
             0,
             "a Mismatch on the conditional delete must not escalate to a plain delete"
+        );
+    }
+
+    // ─── run_heartbeat_tick (concurrent refresh) ───────────────────────────
+
+    /// [`LockStorage`] double that records the maximum number of `put_if_match`
+    /// calls that were ever simultaneously in-flight.
+    ///
+    /// Each call increments an in-flight counter, then awaits a [`Barrier`]
+    /// sized to the number of paths. The barrier only releases once every path's
+    /// call has arrived, so a sequential refresh (one call at a time) would
+    /// deadlock-stall and time out, whereas a concurrent refresh sails through.
+    /// The observed peak therefore equals the barrier width when (and only when)
+    /// the refreshes truly overlap. Determinism comes from the barrier rather
+    /// than any wall-clock sleep.
+    struct ConcurrencyRecordingStorage {
+        next_etag: AtomicU64,
+        in_flight: AtomicUsize,
+        max_in_flight: AtomicUsize,
+        barrier: Barrier,
+    }
+
+    impl std::fmt::Debug for ConcurrencyRecordingStorage {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("ConcurrencyRecordingStorage")
+                .finish_non_exhaustive()
+        }
+    }
+
+    impl ConcurrencyRecordingStorage {
+        fn arc(width: usize) -> Arc<Self> {
+            Arc::new(Self {
+                next_etag: AtomicU64::new(0),
+                in_flight: AtomicUsize::new(0),
+                max_in_flight: AtomicUsize::new(0),
+                barrier: Barrier::new(width),
+            })
+        }
+
+        fn mint_etag(&self) -> String {
+            let v = self.next_etag.fetch_add(1, Ordering::Relaxed);
+            format!("\"etag-{v}\"")
+        }
+    }
+
+    #[async_trait]
+    impl LockStorage for ConcurrencyRecordingStorage {
+        async fn put_if_absent(
+            &self,
+            _key: &str,
+            _body: Vec<u8>,
+        ) -> Result<PutIfAbsentOutcome, Error> {
+            Ok(PutIfAbsentOutcome::Created(Some(self.mint_etag())))
+        }
+
+        async fn put_if_match(
+            &self,
+            _key: &str,
+            _expected_etag: &str,
+            _body: Vec<u8>,
+        ) -> Result<PutIfMatchOutcome, Error> {
+            let now = self.in_flight.fetch_add(1, Ordering::AcqRel) + 1;
+            self.max_in_flight.fetch_max(now, Ordering::AcqRel);
+            // Block until every concurrent refresh has arrived. A sequential
+            // caller never reaches the barrier width, so overlap is required.
+            self.barrier.wait().await;
+            self.in_flight.fetch_sub(1, Ordering::AcqRel);
+            Ok(PutIfMatchOutcome::Updated(Some(self.mint_etag())))
+        }
+
+        async fn get_with_etag(
+            &self,
+            _key: &str,
+        ) -> Result<(Vec<u8>, Option<String>, Option<chrono::DateTime<Utc>>), Error> {
+            Err(Error::NotFound)
+        }
+
+        async fn delete(&self, _key: &str) -> Result<(), Error> {
+            Ok(())
+        }
+
+        async fn delete_if_match(
+            &self,
+            _key: &str,
+            _expected_etag: &str,
+        ) -> Result<DeleteIfMatchOutcome, Error> {
+            Ok(DeleteIfMatchOutcome::Deleted)
+        }
+
+        fn label(&self) -> &'static str {
+            "concurrency-recording"
+        }
+    }
+
+    #[tokio::test]
+    async fn run_tick_refreshes_paths_concurrently() {
+        let paths: Vec<String> = (0..4).map(|i| format!("k{i}")).collect();
+        let storage = ConcurrencyRecordingStorage::arc(paths.len());
+        let etag_cache = cache(&[
+            ("k0", Some("\"c0\"")),
+            ("k1", Some("\"c1\"")),
+            ("k2", Some("\"c2\"")),
+            ("k3", Some("\"c3\"")),
+        ]);
+        let mut consecutive = 0u32;
+
+        let outcome = run_heartbeat_tick(
+            &paths,
+            storage.as_ref(),
+            9,
+            // A short per-path deadline: a sequential refresh that stalls on the
+            // barrier would time out long before all paths ran, so the only way
+            // every path succeeds is genuine overlap.
+            Duration::from_secs(3),
+            &etag_cache,
+            &mut consecutive,
+            "concurrency-recording",
+        )
+        .await;
+
+        assert!(
+            matches!(outcome, HeartbeatOutcome::Continue),
+            "all paths refreshed successfully within one tick budget"
+        );
+        assert_eq!(consecutive, 0, "a fully-healthy tick resets the budget");
+        assert_eq!(
+            storage.max_in_flight.load(Ordering::Acquire),
+            paths.len(),
+            "all path refreshes must run concurrently within one tick budget"
         );
     }
 }
