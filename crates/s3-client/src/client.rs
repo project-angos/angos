@@ -189,7 +189,7 @@ pub enum RequestBody<S> {
 /// Stream type alias used by streaming uploads.
 pub type ByteStream = Box<dyn Stream<Item = Result<Bytes, io::Error>> + Send + Unpin + 'static>;
 
-/// Options selecting per-request behaviour. Both flags default to `false`.
+/// Options selecting per-request behaviour. All flags default to `false`.
 #[derive(Clone, Copy, Default)]
 pub struct SendOpts {
     /// Some S3-compatible servers return HTTP 200 with an `<Error>` document
@@ -197,6 +197,14 @@ pub struct SendOpts {
     /// the response body is inspected and a successful HTTP status is
     /// converted into an [`S3Error`] if an embedded error is found.
     pub check_embedded_error: bool,
+    /// Whether the request mutates state in a way that is unsafe to replay
+    /// blindly (conditional writes/deletes, `CompleteMultipartUpload`). When
+    /// set, the retry path does NOT retry on a status-less (transport) error
+    /// — the request may already have landed on the server, so a blind replay
+    /// could observe a false `PreconditionFailed`. Explicit retryable HTTP
+    /// statuses (5xx / throttle) are still retried, because such a response
+    /// proves the server did not apply the request.
+    pub non_idempotent: bool,
 }
 
 #[derive(Clone)]
@@ -301,7 +309,7 @@ impl S3Client {
         body: Bytes,
         opts: SendOpts,
     ) -> Result<S3Response, S3Error> {
-        self.run_with_retries(|| async {
+        self.run_with_retries(opts.non_idempotent, || async {
             let response = self
                 .dispatch(
                     method.clone(),
@@ -382,7 +390,7 @@ impl S3Client {
         query: Vec<QueryParam>,
         headers: HeaderMap,
     ) -> Result<Response, S3Error> {
-        self.run_with_retries(|| async {
+        self.run_with_retries(false, || async {
             let response = self
                 .dispatch(
                     method.clone(),
@@ -450,7 +458,11 @@ impl S3Client {
         Ok(url)
     }
 
-    async fn run_with_retries<R, F, Fut>(&self, mut request: F) -> Result<R, S3Error>
+    async fn run_with_retries<R, F, Fut>(
+        &self,
+        non_idempotent: bool,
+        mut request: F,
+    ) -> Result<R, S3Error>
     where
         F: FnMut() -> Fut,
         Fut: Future<Output = Result<R, S3Error>>,
@@ -460,7 +472,15 @@ impl S3Client {
             for attempt in 1..=attempts {
                 match request().await {
                     Ok(value) => return Ok(value),
-                    Err(error) if is_retryable_error(&error) && attempt < attempts => {}
+                    // A non-idempotent request is not retried on a status-less
+                    // (transport) error: the outcome is ambiguous because the
+                    // request may already have landed. An explicit retryable
+                    // HTTP status is still retried — the server then proved it
+                    // did not apply the request.
+                    Err(error)
+                        if is_retryable_error(&error)
+                            && !(non_idempotent && error.status.is_none())
+                            && attempt < attempts => {}
                     Err(error) => return Err(error),
                 }
             }
