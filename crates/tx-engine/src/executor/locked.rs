@@ -16,7 +16,6 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use chrono::Utc;
 use sha2::{Digest as _, Sha256};
 use tracing::{debug, warn};
 use uuid::Uuid;
@@ -27,9 +26,9 @@ use crate::{
     error::Error,
     executor::{
         Outcome, TransactionExecutor,
-        common::{reap, stage_bodies, stamp_progress, write_intent},
+        common::{build_intent, finish, stage_bodies, stamp_progress, write_intent},
     },
-    intent::{DEFAULT_INTENT_TTL_SECS, IntentRecord, MutationProgress, MutationRecord, ReadRecord},
+    intent::{DEFAULT_INTENT_TTL_SECS, IntentRecord, MutationRecord},
     lock::{LockSession, primitive::Lock},
     transaction::Transaction,
 };
@@ -274,15 +273,6 @@ impl TransactionExecutor for LockedExecutor {
         // Stage bodies before acquiring the lock so lock hold time is minimal.
         let mutation_records = stage_bodies(self.store.as_ref(), &tx, tx_id).await?;
 
-        let read_records: Vec<ReadRecord> = tx
-            .reads
-            .iter()
-            .map(|r| ReadRecord {
-                key: r.key.clone(),
-                fingerprint: hex::encode(r.fingerprint),
-            })
-            .collect();
-
         // Acquire the engine's own locks in sorted order (deadlock-free).
         let session = self.lock.acquire(&lock_set).await.map_err(Error::Lock)?;
 
@@ -292,16 +282,13 @@ impl TransactionExecutor for LockedExecutor {
             return Err(e);
         }
 
-        let progress = vec![MutationProgress::Pending; mutation_records.len()];
-        let mut intent = IntentRecord {
-            id: tx_id,
-            created_at: Utc::now(),
-            ttl_secs: self.ttl_secs,
-            reads: read_records,
-            mutations: mutation_records,
-            coarse_lock_keys: tx.coarse_lock_keys.clone(),
-            progress,
-        };
+        let mut intent = build_intent(
+            tx_id,
+            self.ttl_secs,
+            &tx.reads,
+            mutation_records,
+            tx.coarse_lock_keys.clone(),
+        );
         if let Err(e) = write_intent(self.store.as_ref(), &intent).await {
             session.release().await;
             return Err(e);
@@ -310,12 +297,8 @@ impl TransactionExecutor for LockedExecutor {
         let apply_result = self.apply_all(&mut intent).await;
 
         // Reap only when the transaction either fully committed or applied
-        // nothing. Once any mutation has applied, preserve the intent for
-        // recovery so the loop can replay-forward idempotently and converge;
-        // reaping here would orphan the partial canonical write.
-        if apply_result.is_ok() || !intent.any_applied() {
-            reap(self.store.as_ref(), &intent).await;
-        }
+        // nothing (see `common::finish`).
+        finish(self.store.as_ref(), &apply_result, &intent).await;
         session.release().await;
 
         apply_result?;

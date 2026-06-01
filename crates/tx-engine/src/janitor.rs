@@ -10,10 +10,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::{Duration as ChronoDuration, Utc};
-use tokio::{
-    select,
-    time::{MissedTickBehavior, interval},
-};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
@@ -21,6 +17,7 @@ use uuid::Uuid;
 use angos_storage::{ConditionalStore, Error as StorageError, ObjectStore};
 
 use crate::lock::storage::LockBody;
+use crate::periodic::run_periodic;
 
 /// Default age after which an orphan body prefix is eligible for deletion.
 pub const DEFAULT_ORPHAN_AGE_SECS: u64 = 3600; // 1 hour
@@ -109,21 +106,10 @@ impl BodyJanitor {
 
     /// Run the janitor until the cancellation token fires.
     pub async fn run(self) {
-        let mut ticker = interval(self.interval);
-        ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
-
-        loop {
-            select! {
-                biased;
-                () = self.cancellation.cancelled() => {
-                    debug!("BodyJanitor: cancellation received, stopping");
-                    return;
-                }
-                _ = ticker.tick() => {
-                    self.sweep().await;
-                }
-            }
-        }
+        run_periodic(self.interval, &self.cancellation, "BodyJanitor", || {
+            self.sweep()
+        })
+        .await;
     }
 
     /// Run a single sweep of `.tx-bodies/`.
@@ -355,21 +341,10 @@ impl LockJanitor {
 
     /// Run the janitor until the cancellation token fires.
     pub async fn run(self) {
-        let mut ticker = interval(self.interval);
-        ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
-
-        loop {
-            select! {
-                biased;
-                () = self.cancellation.cancelled() => {
-                    debug!("LockJanitor: cancellation received, stopping");
-                    return;
-                }
-                _ = ticker.tick() => {
-                    self.sweep().await;
-                }
-            }
-        }
+        run_periodic(self.interval, &self.cancellation, "LockJanitor", || {
+            self.sweep()
+        })
+        .await;
     }
 
     /// Run a single sweep of `.tx-locks/`.

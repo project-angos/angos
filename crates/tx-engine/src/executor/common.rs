@@ -5,14 +5,15 @@
 //! executor) — both traits are supertraits of `ObjectStore`.
 
 use bytes::Bytes;
+use chrono::Utc;
 use tracing::warn;
 
 use angos_storage::ObjectStore;
 
 use crate::{
     error::Error,
-    intent::{IntentRecord, MutationRecord, body_ref_key},
-    transaction::{Mutation, Transaction},
+    intent::{IntentRecord, MutationProgress, MutationRecord, ReadRecord, body_ref_key},
+    transaction::{Mutation, Read, Transaction},
 };
 
 use uuid::Uuid;
@@ -103,6 +104,38 @@ pub async fn stage_bodies(
     Ok(records)
 }
 
+/// Assemble the [`IntentRecord`] written at the Commit-intent stage.
+///
+/// Folds in the read-records mapping (each [`Read`]'s key plus its hex-encoded
+/// fingerprint) and initialises a `Pending` progress slot per mutation. Shared
+/// by both executors so the intent literal lives once.
+#[must_use]
+pub fn build_intent(
+    tx_id: Uuid,
+    ttl_secs: u64,
+    reads: &[Read],
+    mutations: Vec<MutationRecord>,
+    coarse_lock_keys: Vec<String>,
+) -> IntentRecord {
+    let read_records: Vec<ReadRecord> = reads
+        .iter()
+        .map(|r| ReadRecord {
+            key: r.key.clone(),
+            fingerprint: hex::encode(r.fingerprint),
+        })
+        .collect();
+    let progress = vec![MutationProgress::Pending; mutations.len()];
+    IntentRecord {
+        id: tx_id,
+        created_at: Utc::now(),
+        ttl_secs,
+        reads: read_records,
+        mutations,
+        coarse_lock_keys,
+        progress,
+    }
+}
+
 /// Apply a `Move` idempotently: copy `src` to `dst`, then delete `src`
 /// tolerating a missing source.
 ///
@@ -127,52 +160,95 @@ pub async fn move_idempotent(
     }
 }
 
+/// Which cleanup path is running, selecting the warn labels and the
+/// prefix-delete-failure behaviour for [`cleanup`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CleanupMode {
+    /// Committed transaction. If the body-prefix delete fails the intent log is
+    /// left intact so the recovery loop can retry the full reap on the next
+    /// sweep (early return before deleting the log entry).
+    Reap,
+    /// Failed transaction with no applied mutations. A body-prefix delete
+    /// failure is warned but cleanup proceeds to delete the intent log entry.
+    Rollback,
+}
+
+/// Delete a transaction's staged body objects, then its intent log entry.
+///
+/// `mode` selects the warn labels and the prefix-delete-failure behaviour:
+/// see [`CleanupMode`].
+async fn cleanup(store: &dyn ObjectStore, intent: &IntentRecord, mode: CleanupMode) {
+    let prefix = intent.bodies_prefix();
+    if let Err(e) = store.delete_prefix(&prefix).await {
+        match mode {
+            CleanupMode::Reap => {
+                warn!(
+                    tx_id = %intent.id,
+                    prefix,
+                    error = %e,
+                    "Reap: failed to delete body staging objects; intent left for recovery"
+                );
+                return;
+            }
+            CleanupMode::Rollback => {
+                warn!(
+                    tx_id = %intent.id,
+                    prefix,
+                    error = %e,
+                    "Rollback: failed to delete body staging objects"
+                );
+            }
+        }
+    }
+    let log_key = intent.log_key();
+    if let Err(e) = store.delete(&log_key).await {
+        match mode {
+            CleanupMode::Reap => warn!(
+                tx_id = %intent.id,
+                key = log_key,
+                error = %e,
+                "Reap: failed to delete intent log entry"
+            ),
+            CleanupMode::Rollback => warn!(
+                tx_id = %intent.id,
+                key = log_key,
+                error = %e,
+                "Rollback: failed to delete intent log entry"
+            ),
+        }
+    }
+}
+
 /// Reap a committed transaction: delete body staging objects, then the intent
 /// log entry.
 ///
 /// If deleting the body prefix fails the intent log is left intact so the
 /// recovery loop can retry the full reap on the next sweep.
 pub async fn reap(store: &dyn ObjectStore, intent: &IntentRecord) {
-    let prefix = intent.bodies_prefix();
-    if let Err(e) = store.delete_prefix(&prefix).await {
-        warn!(
-            tx_id = %intent.id,
-            prefix,
-            error = %e,
-            "Reap: failed to delete body staging objects; intent left for recovery"
-        );
-        return;
-    }
-    let log_key = intent.log_key();
-    if let Err(e) = store.delete(&log_key).await {
-        warn!(
-            tx_id = %intent.id,
-            key = log_key,
-            error = %e,
-            "Reap: failed to delete intent log entry"
-        );
-    }
+    cleanup(store, intent, CleanupMode::Reap).await;
 }
 
 /// Roll back a failed transaction: delete staged body objects and the intent
 /// log entry.
 pub async fn rollback(store: &dyn ObjectStore, intent: &IntentRecord) {
-    let prefix = intent.bodies_prefix();
-    if let Err(e) = store.delete_prefix(&prefix).await {
-        warn!(
-            tx_id = %intent.id,
-            prefix,
-            error = %e,
-            "Rollback: failed to delete body staging objects"
-        );
-    }
-    let log_key = intent.log_key();
-    if let Err(e) = store.delete(&log_key).await {
-        warn!(
-            tx_id = %intent.id,
-            key = log_key,
-            error = %e,
-            "Rollback: failed to delete intent log entry"
-        );
+    cleanup(store, intent, CleanupMode::Rollback).await;
+}
+
+/// Run the Apply-stage reap gate shared by both executors.
+///
+/// Reap only when the transaction either fully committed (`apply_result` is
+/// `Ok`) or applied nothing (`!intent.any_applied()`). Once any mutation has
+/// applied but the transaction did not finish, the intent is preserved so the
+/// recovery loop can replay-forward idempotently and converge; reaping here
+/// would orphan the partial canonical write. On the `Precondition` +
+/// nothing-applied path the executor has already rolled back, so reaping
+/// deleted objects here is a harmless no-op.
+pub async fn finish(
+    store: &dyn ObjectStore,
+    apply_result: &Result<(), Error>,
+    intent: &IntentRecord,
+) {
+    if apply_result.is_ok() || !intent.any_applied() {
+        reap(store, intent).await;
     }
 }

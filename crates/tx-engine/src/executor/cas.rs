@@ -3,8 +3,9 @@
 //! `PreconditionFailed` when no mutations have been applied yet.
 //!
 //! When a CAS precondition fails after at least one mutation has already been
-//! applied (partial-commit case), the executor uses `apply_cas_idempotent` —
-//! the same stale-stamp recovery logic the `RecoveryLoop` uses — to distinguish
+//! applied (partial-commit case), the executor uses `apply_cas` in
+//! `Reconcile` mode — the same stale-stamp recovery logic the `RecoveryLoop`
+//! uses — to distinguish
 //! between a healthy-path write that landed without its stamp (the live body
 //! matches the staged body → stamp and continue) versus true contention (live
 //! body differs → return `Error::PartialCommit` and preserve the intent for
@@ -14,7 +15,6 @@ use std::{collections::HashMap, sync::Arc};
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use chrono::Utc;
 use sha2::{Digest as _, Sha256};
 use tracing::{debug, warn};
 use uuid::Uuid;
@@ -25,9 +25,9 @@ use crate::{
     error::Error,
     executor::{
         Outcome, TransactionExecutor, common,
-        common::{reap, rollback, stage_bodies, stamp_progress, write_intent},
+        common::{build_intent, finish, rollback, stage_bodies, stamp_progress, write_intent},
     },
-    intent::{DEFAULT_INTENT_TTL_SECS, IntentRecord, MutationProgress, MutationRecord, ReadRecord},
+    intent::{DEFAULT_INTENT_TTL_SECS, IntentRecord, MutationRecord},
     lock::{LockSession, primitive::Lock},
     transaction::Transaction,
 };
@@ -119,70 +119,6 @@ impl CasExecutor {
         CasExecutorBuilder::default()
     }
 
-    /// Apply a single mutation using conditional storage operations.
-    ///
-    /// Returns `Ok(())` on success, or `Err(Error::Precondition)` when an etag
-    /// precondition was not met.
-    async fn apply_mutation_cas(&self, mutation: &MutationRecord) -> Result<(), Error> {
-        match mutation {
-            MutationRecord::Put {
-                key,
-                body_ref,
-                expected,
-                ..
-            } => {
-                let body = self.store.get(body_ref).await?;
-                let body_bytes = Bytes::from(body);
-                if let Some(etag) = expected {
-                    self.store
-                        .put_if_match(key, etag, body_bytes)
-                        .await
-                        .map_err(|e| match e {
-                            StorageError::PreconditionFailed => Error::Precondition,
-                            other => Error::Storage(other),
-                        })?;
-                } else {
-                    self.store.put(key, body_bytes).await?;
-                }
-                Ok(())
-            }
-            MutationRecord::PutIfAbsent { key, body_ref, .. } => {
-                let body = self.store.get(body_ref).await?;
-                self.store
-                    .put_if_absent(key, Bytes::from(body))
-                    .await
-                    .map_err(|e| match e {
-                        StorageError::PreconditionFailed => Error::Precondition,
-                        other => Error::Storage(other),
-                    })?;
-                Ok(())
-            }
-            MutationRecord::Delete { key, expected, .. } => {
-                if let Some(etag) = expected {
-                    self.store
-                        .delete_if_match(key, etag)
-                        .await
-                        .map_err(|e| match e {
-                            StorageError::PreconditionFailed => Error::Precondition,
-                            other => Error::Storage(other),
-                        })?;
-                } else {
-                    self.store.delete(key).await?;
-                }
-                Ok(())
-            }
-            MutationRecord::Copy { src, dst, .. } => {
-                self.store.copy(src, dst).await?;
-                Ok(())
-            }
-            MutationRecord::Move { src, dst, .. } => {
-                self.store.copy(src, dst).await?;
-                self.store.delete(src).await?;
-                Ok(())
-            }
-        }
-    }
-
     /// Verify the read set and capture each read key's live etag.
     ///
     /// Re-reads every read key, checks the content fingerprint recorded at
@@ -233,7 +169,7 @@ impl CasExecutor {
         let tx_id = intent.id;
         for idx in 0..intent.mutations.len() {
             let mutation = intent.mutations[idx].clone();
-            match self.apply_mutation_cas(&mutation).await {
+            match apply_cas(self.store.as_ref(), &mutation, CasApplyMode::Abort).await {
                 Ok(()) => {
                     if let Err(stamp_err) = stamp_progress(self.store.as_ref(), intent, idx).await {
                         warn!(
@@ -249,7 +185,9 @@ impl CasExecutor {
                         // The transaction is committed (at least one slot is
                         // Applied). Apply the stale-stamp recovery heuristic:
                         // compare the live body against the staged body.
-                        match apply_cas_idempotent(self.store.as_ref(), &mutation).await {
+                        match apply_cas(self.store.as_ref(), &mutation, CasApplyMode::Reconcile)
+                            .await
+                        {
                             Ok(()) => {
                                 // Live body matches staged body — the
                                 // healthy-path write landed without its stamp.
@@ -323,12 +261,37 @@ fn is_read_keyed(record: &MutationRecord, read_etags: &HashMap<String, Etag>) ->
     record.all_keys().any(|key| read_etags.contains_key(key))
 }
 
-/// Apply a single mutation using conditional storage operations, with
-/// stale-stamp recovery for the `PreconditionFailed` case.
+/// Per-key precondition-failure semantics for [`apply_cas`].
 ///
-/// This is the idempotent variant used both by the CAS executor's partial-commit
-/// handler and by the `RecoveryLoop`'s replay path. On `PreconditionFailed`,
-/// compare the live body's SHA-256 hash against the staged body. A match means
+/// The op dispatch (`put`/`put_if_match`/`put_if_absent`/`delete`/
+/// `delete_if_match`/`copy`/`move`) is identical across both modes; only the
+/// handling of a `PreconditionFailed` (and a vanished staged body or a missing
+/// delete target) differs, which is what this mode selects.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CasApplyMode {
+    /// Healthy-path apply. A `PreconditionFailed` is a hard failure
+    /// (`Err(Error::Precondition)`) and a vanished staged body or a missing
+    /// delete target propagates as a storage error.
+    Abort,
+    /// Recovery reconcile / replay-forward path. A `PreconditionFailed` on a
+    /// body write triggers a live-vs-staged hash compare (match => already
+    /// applied `Ok(())`; mismatch => `Err(Error::PartialCommit)`); a
+    /// `PreconditionFailed` on `put_if_absent`/`delete_if_match`, a vanished
+    /// staged body, and a missing delete target are all treated as
+    /// already-applied `Ok(())`.
+    Reconcile,
+}
+
+/// Apply a single mutation using conditional storage operations.
+///
+/// The op dispatch is shared by the CAS executor's healthy apply path
+/// ([`CasApplyMode::Abort`]) and by both the CAS executor's partial-commit
+/// handler and the `RecoveryLoop`'s replay path ([`CasApplyMode::Reconcile`]);
+/// `mode` selects the per-key precondition-failure semantics (see
+/// [`CasApplyMode`]).
+///
+/// In `Reconcile` mode, on a `PreconditionFailed` for a conditional `Put` the
+/// live body's SHA-256 hash is compared against the staged body. A match means
 /// the healthy-path write already landed (a stale progress stamp); the mutation
 /// is treated as applied and `Ok(())` is returned. A mismatch means true
 /// contention: `Err(Error::PartialCommit)` is returned so the caller stops
@@ -336,12 +299,14 @@ fn is_read_keyed(record: &MutationRecord, read_etags: &HashMap<String, Etag>) ->
 ///
 /// # Errors
 ///
-/// Returns `Err(Error::PartialCommit)` on true contention (live body ≠ staged
-/// body), `Err(Error::Storage(...))` on hard storage errors, or `Ok(())` when
-/// the mutation is applied (or was already applied).
-pub async fn apply_cas_idempotent(
+/// In `Abort` mode, returns `Err(Error::Precondition)` when an etag
+/// precondition was not met. In `Reconcile` mode, returns
+/// `Err(Error::PartialCommit)` on true contention (live body ≠ staged body).
+/// Either mode returns `Err(Error::Storage(...))` on hard storage errors.
+pub async fn apply_cas(
     store: &dyn ConditionalStore,
     mutation: &MutationRecord,
+    mode: CasApplyMode,
 ) -> Result<(), Error> {
     match mutation {
         MutationRecord::Put {
@@ -349,46 +314,53 @@ pub async fn apply_cas_idempotent(
             body_ref,
             expected,
         } => {
-            let body = match store.get(body_ref).await {
-                Ok(b) => b,
-                Err(StorageError::NotFound) => return Ok(()),
-                Err(e) => return Err(Error::Storage(e)),
+            let Some(body_bytes) = stage_body(store, body_ref, mode).await? else {
+                return Ok(());
             };
-            let body_bytes = Bytes::from(body);
             let Some(etag) = expected else {
                 store.put(key, body_bytes).await.map_err(Error::Storage)?;
                 return Ok(());
             };
             match store.put_if_match(key, etag, body_bytes.clone()).await {
                 Ok(_) => Ok(()),
-                Err(StorageError::PreconditionFailed) => {
-                    if live_body_matches(store, key, &body_bytes).await? {
-                        Ok(())
-                    } else {
-                        Err(Error::PartialCommit)
+                Err(StorageError::PreconditionFailed) => match mode {
+                    CasApplyMode::Abort => Err(Error::Precondition),
+                    CasApplyMode::Reconcile => {
+                        if live_body_matches(store, key, &body_bytes).await? {
+                            Ok(())
+                        } else {
+                            Err(Error::PartialCommit)
+                        }
                     }
-                }
+                },
                 Err(e) => Err(Error::Storage(e)),
             }
         }
         MutationRecord::PutIfAbsent { key, body_ref } => {
-            let body = match store.get(body_ref).await {
-                Ok(b) => b,
-                Err(StorageError::NotFound) => return Ok(()),
-                Err(e) => return Err(Error::Storage(e)),
+            let Some(body_bytes) = stage_body(store, body_ref, mode).await? else {
+                return Ok(());
             };
-            match store.put_if_absent(key, Bytes::from(body)).await {
-                Ok(_) | Err(StorageError::PreconditionFailed) => Ok(()),
+            match store.put_if_absent(key, body_bytes).await {
+                Ok(_) => Ok(()),
+                Err(StorageError::PreconditionFailed) => match mode {
+                    CasApplyMode::Abort => Err(Error::Precondition),
+                    CasApplyMode::Reconcile => Ok(()),
+                },
                 Err(e) => Err(Error::Storage(e)),
             }
         }
         MutationRecord::Delete { key, expected } => match expected {
             Some(etag) => match store.delete_if_match(key, etag).await {
-                Ok(()) | Err(StorageError::PreconditionFailed) => Ok(()),
+                Ok(()) => Ok(()),
+                Err(StorageError::PreconditionFailed) => match mode {
+                    CasApplyMode::Abort => Err(Error::Precondition),
+                    CasApplyMode::Reconcile => Ok(()),
+                },
                 Err(e) => Err(Error::Storage(e)),
             },
             None => match store.delete(key).await {
-                Ok(()) | Err(StorageError::NotFound) => Ok(()),
+                Ok(()) => Ok(()),
+                Err(StorageError::NotFound) if mode == CasApplyMode::Reconcile => Ok(()),
                 Err(e) => Err(Error::Storage(e)),
             },
         },
@@ -396,12 +368,40 @@ pub async fn apply_cas_idempotent(
             store.copy(src, dst).await.map_err(Error::Storage)?;
             Ok(())
         }
-        MutationRecord::Move { src, dst } => {
-            common::move_idempotent(store, src, dst)
+        MutationRecord::Move { src, dst } => match mode {
+            CasApplyMode::Abort => {
+                store.copy(src, dst).await.map_err(Error::Storage)?;
+                store.delete(src).await.map_err(Error::Storage)?;
+                Ok(())
+            }
+            CasApplyMode::Reconcile => common::move_idempotent(store, src, dst)
                 .await
-                .map_err(Error::Storage)?;
-            Ok(())
-        }
+                .map_err(Error::Storage),
+        },
+    }
+}
+
+/// Fetch the staged body for a `Put`/`PutIfAbsent`.
+///
+/// Returns `Ok(Some(bytes))` with the staged body, or `Ok(None)` when the body
+/// is gone and the mutation should be skipped (only in [`CasApplyMode::Reconcile`],
+/// where a vanished staged body means the canonical write already landed and the
+/// prefix was reaped). In [`CasApplyMode::Abort`] a missing body propagates as a
+/// storage error.
+///
+/// # Errors
+///
+/// Returns `Err(Error::Storage(...))` on a hard storage error (and, in
+/// `Abort` mode, on a `NotFound` for the staged body).
+async fn stage_body(
+    store: &dyn ConditionalStore,
+    body_ref: &str,
+    mode: CasApplyMode,
+) -> Result<Option<Bytes>, Error> {
+    match store.get(body_ref).await {
+        Ok(body) => Ok(Some(Bytes::from(body))),
+        Err(StorageError::NotFound) if mode == CasApplyMode::Reconcile => Ok(None),
+        Err(e) => Err(Error::Storage(e)),
     }
 }
 
@@ -454,15 +454,6 @@ impl TransactionExecutor for CasExecutor {
         // re-reads and converges — no lost update, no stuck partial intent.
         apply_read_preconditions(&mut mutation_records, &read_etags);
 
-        let read_records: Vec<ReadRecord> = tx
-            .reads
-            .iter()
-            .map(|r| ReadRecord {
-                key: r.key.clone(),
-                fingerprint: hex::encode(r.fingerprint),
-            })
-            .collect();
-
         // CAS executor takes no transaction-scoped lock for its working set.
         // When the caller declares coarse lock keys (e.g. `blob-data:{digest}`),
         // acquire only those, hold across Apply, release at Reap.
@@ -475,16 +466,13 @@ impl TransactionExecutor for CasExecutor {
             Some(self.lock.acquire(&keys).await.map_err(Error::Lock)?)
         };
 
-        let progress = vec![MutationProgress::Pending; mutation_records.len()];
-        let mut intent = IntentRecord {
-            id: tx_id,
-            created_at: Utc::now(),
-            ttl_secs: self.ttl_secs,
-            reads: read_records,
-            mutations: mutation_records,
-            coarse_lock_keys: tx.coarse_lock_keys.clone(),
-            progress,
-        };
+        let mut intent = build_intent(
+            tx_id,
+            self.ttl_secs,
+            &tx.reads,
+            mutation_records,
+            tx.coarse_lock_keys.clone(),
+        );
         if let Err(e) = write_intent(self.store.as_ref(), &intent).await {
             if let Some(session) = coarse_session {
                 session.release().await;
@@ -495,15 +483,11 @@ impl TransactionExecutor for CasExecutor {
         let apply_result = self.apply_all(&mut intent).await;
 
         // Reap only when the transaction either fully committed or applied
-        // nothing. Once any mutation has applied, preserve the intent for
-        // recovery so the loop can replay-forward idempotently and converge;
-        // reaping here would orphan the partial canonical write. This subsumes
-        // the `PartialCommit` case (which always implies `any_applied`). On the
-        // `Precondition` + nothing-applied path `apply_all` already rolled back,
-        // so reaping deleted objects here is a harmless no-op.
-        if apply_result.is_ok() || !intent.any_applied() {
-            reap(self.store.as_ref(), &intent).await;
-        }
+        // nothing (see `common::finish`). This subsumes the `PartialCommit`
+        // case (which always implies `any_applied`); on the `Precondition` +
+        // nothing-applied path `apply_all` already rolled back, so reaping
+        // here is a harmless no-op.
+        finish(self.store.as_ref(), &apply_result, &intent).await;
 
         if let Some(session) = coarse_session {
             session.release().await;

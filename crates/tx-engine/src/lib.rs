@@ -19,6 +19,7 @@ pub mod executor;
 pub mod intent;
 pub mod janitor;
 pub mod lock;
+pub mod periodic;
 pub mod probe;
 pub mod recovery;
 pub mod store;

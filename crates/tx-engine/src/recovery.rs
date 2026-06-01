@@ -6,10 +6,6 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use chrono::Utc;
-use tokio::{
-    select,
-    time::{MissedTickBehavior, interval},
-};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
@@ -17,9 +13,13 @@ use angos_storage::{ConditionalStore, Error as StorageError, ObjectStore};
 
 use crate::{
     error::Error,
-    executor::{cas::apply_cas_idempotent, common},
+    executor::{
+        cas::{CasApplyMode, apply_cas},
+        common,
+    },
     intent::{IntentRecord, MutationProgress, MutationRecord},
     lock::primitive::Lock,
+    periodic::run_periodic,
     transaction::lock_key_set,
 };
 
@@ -155,21 +155,10 @@ impl RecoveryLoop {
 
     /// Run the recovery loop until the cancellation token is fired.
     pub async fn run(self) {
-        let mut ticker = interval(self.interval);
-        ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
-
-        loop {
-            select! {
-                biased;
-                () = self.cancellation.cancelled() => {
-                    debug!("RecoveryLoop: cancellation received, stopping");
-                    return;
-                }
-                _ = ticker.tick() => {
-                    self.sweep().await;
-                }
-            }
-        }
+        run_periodic(self.interval, &self.cancellation, "RecoveryLoop", || {
+            self.sweep()
+        })
+        .await;
     }
 
     /// Run a single sweep: list `.tx-log/`, process each intent.
@@ -327,7 +316,7 @@ impl RecoveryLoop {
 
         let mutation = intent.mutations[idx].clone();
         if let Some(cs) = &self.conditional_store {
-            apply_cas_idempotent(cs.as_ref(), &mutation)
+            apply_cas(cs.as_ref(), &mutation, CasApplyMode::Reconcile)
                 .await
                 .map_err(|e| match e {
                     Error::PartialCommit => StorageError::PreconditionFailed,
