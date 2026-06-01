@@ -321,12 +321,12 @@ Lock operations emit Prometheus metrics for observability. Key metrics to monito
 
 - `lock_acquisition_duration_ms` — Histogram of lock acquisition times (e.g., p99 > 500ms indicates S3 latency degradation)
 - `lock_retries_total` — Counter of lock acquisition retries (e.g., rising rate indicates lock contention)
-- `lock_invalidations_total{reason="heartbeat_failure"}` — Stale heartbeat failures (e.g., indicates S3 connectivity issues). Redis additionally reports `reason="connect_failure"` (heartbeat task could not open a connection) and `reason="refresh_failure"` (refresh script errored)
+- `lock_invalidations_total{reason="heartbeat_failure"}` — Heartbeat failures that exhausted the retry budget (e.g., indicates connectivity issues between the registry and the lock store). The heartbeat path is backend-agnostic, so both S3 and Redis report `heartbeat_failure`.
 - `lock_recoveries_total` — Counter of stale lock recovery attempts (e.g., indicates crashed instances)
 
 For multi-instance deployments, alert on:
 - **High `lock_retries_total` rate**: Rising retry rate during normal operation suggests lock contention and may indicate insufficient `max_retries` or `retry_delay_ms` tuning.
-- **`lock_invalidations_total{reason="heartbeat_failure"}`** (or, for Redis, `reason="connect_failure"` / `reason="refresh_failure"`): Heartbeat-side failures suggest network or backend issues between the registry and the lock store. Consider checking connectivity, network quality, and lock timeout settings. A single failed tick now cancels the in-flight operation, so transient blips are visible here where they previously were absorbed.
+- **`lock_invalidations_total{reason="heartbeat_failure"}`**: Heartbeat-side failures suggest network or backend issues between the registry and the lock store. Consider checking connectivity, network quality, and lock timeout settings. Heartbeat failures must accumulate past a budget — roughly one TTL of slack — before the in-flight operation is cancelled, so an isolated blip is absorbed rather than surfaced here.
 - **High `lock_acquisition_duration_ms` p99**: Persistent p99 latency > expected S3 latency may indicate saturation or regional latency issues.
 
 See the [configuration reference](../reference/configuration.md#prometheus-metrics) for the full metrics list.
@@ -659,4 +659,4 @@ The transactional engine is a single design — an abstraction that consolidates
 
 The CAS-vs-Lock executor choice happens once inside the engine factory based on the configured `lock_strategy` and detected S3 capabilities; subsystems never see it. The on-disk key layout is unchanged from a non-transactional deployment.
 
-The engine keeps three reserved prefixes: `.tx-log/` holds the transaction journal, `.tx-bodies/` holds staged object bodies, and `.tx-locks/` holds lock objects. Recovery runs automatically and needs no operator configuration. Every server and worker replica runs a recovery loop that completes or rolls back any transaction interrupted by a crash. A body janitor reaps orphaned staged bodies under `.tx-bodies/` once they exceed a TTL, and a lock janitor reclaims cold lock objects under `.tx-locks/` once they exceed their TTL plus a grace period. All three run on a periodic sweep, roughly every five minutes.
+The engine keeps three reserved prefixes: `.tx-log/` holds the transaction journal, `.tx-bodies/` holds staged object bodies, and `.tx-locks/` holds lock objects. Recovery runs automatically and needs no operator configuration. Every server and worker replica runs a recovery loop that completes or rolls back any transaction interrupted by a crash. A body janitor reaps orphaned staged bodies under `.tx-bodies/` once they exceed a TTL, and a lock janitor reclaims cold lock objects under `.tx-locks/` once they exceed their TTL plus a grace period. The recovery loop sweeps every 30 seconds; the body and lock janitors sweep every five minutes.

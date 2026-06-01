@@ -316,7 +316,7 @@ retry_delay_ms = 50
 
 The S3 lock implementation uses a heartbeat to keep locks alive. Once acquired, a background task automatically renews the lock at regular intervals of `ttl_secs / 3`. For example, with the default `ttl_secs = 30`, the heartbeat runs every 10 seconds. This allows the lock to remain valid beyond the initial TTL as long as the lock-holder remains alive. If a lock-holder crashes, other instances must wait for the full `ttl_secs` duration before the lock becomes available for recovery.
 
-Transient heartbeat failures (connect errors, refresh timeouts, network blips) accumulate up to a small budget — roughly one TTL of slack — before cancelling the in-flight operation. Authoritative signals cancel immediately: S3 reports `ownership_lost`, `etag_unavailable`, `file_disappeared`, or `max_hold`; Redis reports `ownership_lost` (refresh script detected the key was overwritten). When the budget is exhausted, S3 emits `heartbeat_failure` and Redis emits `connect_failure` or `refresh_failure` to flag the cancellation as transient-failure-driven rather than authoritative.
+Transient heartbeat failures (connect errors, refresh timeouts, network blips) accumulate up to a small budget — roughly one TTL of slack — before cancelling the in-flight operation. Authoritative signals cancel immediately: S3 reports `ownership_lost`, `etag_unavailable`, `file_disappeared`, or `max_hold_exceeded`; Redis reports `ownership_lost` (refresh script detected the key was overwritten). When the budget is exhausted, the heartbeat emits `heartbeat_failure` for both backends to flag the cancellation as transient-failure-driven rather than authoritative.
 
 Locks are released as part of the operation flow: a successful operation releases its lock before returning. If the surrounding request or task is cancelled mid-operation, a best-effort background release fires on the current Tokio runtime so the remote lock is freed promptly without waiting on TTL. The fallback applies only when a runtime is still available; during process shutdown the lock expires via `ttl_secs`.
 
@@ -491,7 +491,7 @@ Angos emits Prometheus metrics on the `/metrics` endpoint. The following metrics
 - `backend`: `s3`, `redis`, `memory`
 - `result` (acquisitions): `success`, `timeout`, `error`
 - `result` (recoveries): `acquired`, `not_stale`, `failed`, `error`
-- `reason` (invalidations): `ownership_lost`, `max_hold`, `heartbeat_failure`, `etag_unavailable`, `file_disappeared`, `connect_failure`, `refresh_failure` (the last two are Redis-only; S3 reports heartbeat-side failures as `heartbeat_failure`)
+- `reason` (invalidations): `ownership_lost`, `max_hold_exceeded`, `heartbeat_failure`, `etag_unavailable`, `file_disappeared` (both S3 and Redis report heartbeat-side failures as `heartbeat_failure`)
 
 ---
 
