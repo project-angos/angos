@@ -59,7 +59,10 @@ pub struct Page<T> {
 /// One page of results from a hierarchical listing (`ObjectStore::list_children`).
 ///
 /// `sub_prefixes` contains the immediate sub-prefix names (the "subdirectories"
-/// directly under the requested prefix). `objects` contains any keys sitting
+/// directly under the requested prefix). Each name is **bare**: the delimiter
+/// (trailing `/`) is stripped, so a key `prefix/v1/foo` yields the sub-prefix
+/// `v1`, not `v1/`. All backends honour this so consumers can treat the names
+/// identically regardless of backend. `objects` contains any keys sitting
 /// directly at the requested prefix level with no further `/` separator.
 /// `next_token` follows the same semantics as `Page::next_token`.
 #[derive(Clone, Debug, PartialEq)]
@@ -130,11 +133,11 @@ mod tests {
     #[test]
     fn children_page_separates_sub_prefixes_from_objects() {
         let page = ChildrenPage {
-            sub_prefixes: vec!["sub/".to_string()],
+            sub_prefixes: vec!["sub".to_string()],
             objects: vec!["leaf.json".to_string()],
             next_token: None,
         };
-        assert_eq!(page.sub_prefixes, vec!["sub/".to_string()]);
+        assert_eq!(page.sub_prefixes, vec!["sub".to_string()]);
         assert_eq!(page.objects, vec!["leaf.json".to_string()]);
         assert!(page.next_token.is_none());
     }

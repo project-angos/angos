@@ -154,7 +154,7 @@ async fn list_children_separates_sub_prefixes_from_objects() {
         .unwrap();
     let page = store.list_children("ns/", 100, None, None).await.unwrap();
     assert_eq!(page.objects, vec!["a".to_string()]);
-    assert_eq!(page.sub_prefixes, vec!["sub/".to_string()]);
+    assert_eq!(page.sub_prefixes, vec!["sub".to_string()]);
 }
 
 #[tokio::test]

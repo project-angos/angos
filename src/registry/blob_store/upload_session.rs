@@ -220,11 +220,9 @@ impl BlobStore {
         let mut token = None;
         loop {
             let page = self.store.list_children(&root, 1000, token, None).await?;
-            uuids.extend(
-                page.sub_prefixes
-                    .iter()
-                    .map(|child| child.trim_end_matches('/').to_owned()),
-            );
+            // Sub-prefix names are bare per the `ChildrenPage` contract, so the
+            // upload UUIDs can be taken directly.
+            uuids.extend(page.sub_prefixes);
             match page.next_token {
                 Some(t) => token = Some(t),
                 None => break,

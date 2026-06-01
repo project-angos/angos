@@ -255,7 +255,12 @@ impl ObjectStore for MemoryObjectStore {
         {
             let rest = &key[effective_prefix.len()..];
             if let Some(slash) = rest.find('/') {
-                let child = format!("{}/", &rest[..slash]);
+                // Emit the bare sub-prefix name (no trailing slash) so the
+                // memory backend matches the fs and s3 backends and the
+                // `ChildrenPage::sub_prefixes` contract. The bare form is used
+                // consistently for the `skip_before` comparison and, via the
+                // merged page below, for the next continuation token.
+                let child = rest[..slash].to_string();
                 if child.as_str() > skip_before.as_str() {
                     sub_prefixes.insert(child);
                 }
@@ -568,6 +573,39 @@ mod tests {
         let page3 = s.list("p/", 2, page2.next_token).await.unwrap();
         assert_eq!(page3.items.len(), 1);
         assert!(page3.next_token.is_none());
+    }
+
+    #[tokio::test]
+    async fn list_children_paginates_sub_prefixes_with_bare_names() {
+        // Regression: sub-prefix names must be bare (no trailing slash) and the
+        // bare form must drive both the `start_after` filter and the next-page
+        // continuation token so pagination stays correct end-to-end.
+        let s = store();
+        for name in ["v1", "v2", "v3", "v4"] {
+            s.put(&format!("ns/{name}/manifest"), Bytes::from("x"))
+                .await
+                .unwrap();
+        }
+
+        let page1 = s.list_children("ns/", 2, None, None).await.unwrap();
+        assert_eq!(page1.sub_prefixes, vec!["v1".to_string(), "v2".to_string()]);
+        assert_eq!(page1.next_token.as_deref(), Some("v2"));
+
+        let page2 = s
+            .list_children("ns/", 2, page1.next_token, None)
+            .await
+            .unwrap();
+        assert_eq!(page2.sub_prefixes, vec!["v3".to_string(), "v4".to_string()]);
+        assert!(page2.next_token.is_none());
+
+        // A caller-supplied `start_after` of a bare sub-prefix name resumes
+        // after that name with bare names.
+        let after = s
+            .list_children("ns/", 10, None, Some("v2".to_string()))
+            .await
+            .unwrap();
+        assert_eq!(after.sub_prefixes, vec!["v3".to_string(), "v4".to_string()]);
+        assert!(after.next_token.is_none());
     }
 
     #[tokio::test]
