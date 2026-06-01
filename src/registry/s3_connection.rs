@@ -16,8 +16,9 @@ use angos_tx_engine::lock::S3LockConfig;
 /// All credential, endpoint, bucket and region fields are required when this
 /// type is deserialized via `#[serde(flatten)]`; `key_prefix` is the only
 /// optional field and defaults to the empty string. Modules that need their
-/// own per-section defaults (e.g. `job_store`'s `key_prefix = "_jobs"`)
-/// implement a custom `Deserialize` and provide their own field defaults.
+/// own per-section defaults implement a custom `Deserialize` and provide their
+/// own field defaults. (The job store has no S3 config of its own — it inherits
+/// the `[metadata_store]` backend and writes under a hardcoded `_jobs/` prefix.)
 #[derive(Clone, Debug, Default, PartialEq, Deserialize)]
 pub struct S3ConnectionConfig {
     pub access_key_id: Secret<String>,

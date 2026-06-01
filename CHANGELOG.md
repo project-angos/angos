@@ -10,16 +10,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 - Stale lock objects under `.tx-locks/` are reclaimed automatically by a periodic janitor running on every server and worker replica; no operator action is required.
 - New `scrub --referrers` flag: checks every revision in each namespace and removes any referrer link whose referrer manifest no longer has a current digest revision link, preventing ghost descriptors from appearing in the OCI Referrers API response.
-- Durable cache jobs: optional `[global.job_queue]` section routes pull-through cache-fill jobs through a persistent filesystem or S3 store (per-key leases with heartbeat, exponential backoff, dead-letter on max-attempts). `angos server` enqueues jobs and publishes the `angos_job_queue_pending` gauge on `/metrics`; the new `angos worker` subcommand drains the queue. When the section is omitted the existing in-process `TaskQueue` is used unchanged. Documented in `doc/how-to/durable-cache-jobs.md` with a commented block in `config.example.toml`.
+- Durable cache jobs: the optional `[global.job_queue]` section makes pull-through cache-fill jobs survive restarts by persisting them in the backend configured for `[metadata_store]` (filesystem or S3); the new `angos worker` subcommand drains the queue while `angos server` enqueues jobs and publishes the `angos_job_queue_pending` gauge on `/metrics`.
 - Maximum manifest body size enforcement.
 - Warning log when a listener flips between insecure and TLS during configuration hot-reload.
 
 ### Changed
 
 - The storage layer now uses a single resumable streaming upload capability in place of the previous multipart-based one, and in-flight upload sessions do not survive the upgrade (clients retry and `scrub --uploads` reaps the stale staging artifacts).
-- The four registry subsystems (metadata, job, upload, and manifest stores) now write atomically through a single transactional engine, adding three new top-level prefixes — `.tx-log/`, `.tx-bodies/`, and `.tx-locks/` — that operators should factor into bucket policies.
-- The `[global.job_queue.s3]` `prefix` key was renamed to `key_prefix`, and operators must rename the field in their configuration.
-- The `[global.job_queue]` `default_lease_ttl_secs` key has been removed, and operators must drop the line from their configuration.
+- The four registry subsystems (metadata, job, upload, and manifest stores) now write atomically through a single transactional engine, adding three new top-level prefixes — `.tx-log/`, `.tx-bodies/`, and `.tx-locks/`, that operators should factor into bucket policies. A `_jobs/` prefix is also added when the durable job queue (`[global.job_queue]`) is enabled.
 - Blob deletion follows the OCI distribution lifecycle, with blob ownership tracked independently from manifest references.
 - Manifests with missing blob or descriptor references are rejected at push time.
 - Stricter OCI semantics for blob range requests and request-header parsing.
@@ -66,7 +64,6 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 ### Removed
 
 - Deprecated fields removed from `config.example.toml`.
-- The `lease_*` keys under `[global.job_queue]` are gone along with the legacy lease subsystem they configured.
 
 ### Fixed
 

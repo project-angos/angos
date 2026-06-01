@@ -77,29 +77,16 @@ root_dir = "./data-angos"
 
 # Optional: Durable job queue for pull-through cache-fill tasks.
 # When omitted, jobs run in-process over an in-memory store (not durable across
-# restarts). Pick exactly one of the backend sub-tables ([global.job_queue.fs]
-# or [global.job_queue.s3]) to enable durable mode. With durable mode the server
-# only enqueues jobs and publishes the pending gauge; run `angos worker`
-# in addition to `angos server` to actually drain the queue.
+# restarts). Adding this section makes jobs durable; the server only enqueues
+# jobs and publishes the pending gauge, so run `angos worker` in addition to
+# `angos server` to actually drain the queue.
+# The queue has no backend of its own: jobs are stored in the backend configured
+# for [metadata_store] (filesystem or S3) under a hardcoded `_jobs/` prefix, and
+# the lock strategy is inherited from [metadata_store]. Only the two tunables
+# below are accepted here.
 #[global.job_queue]
-#pending_refresh_interval_secs = 15   # how often the server refreshes the pending gauge
+#pending_refresh_interval_secs = 15   # how often the server refreshes the pending gauge (minimum 5)
 #pending_ready_horizon_secs = 600     # only count jobs ready within this many seconds toward the autoscaler gauge
-
-#[global.job_queue.fs]                # pick one: filesystem backend
-#root_dir = "/var/lib/angos/jobs"     # must be writable by every server and worker replica
-#lock_strategy = "memory"             # default; single-process scope only.
-                                      # For multi-process pools sharing root_dir, configure
-                                      # [global.job_queue.fs.lock_strategy.redis] instead
-                                      # (see doc/how-to/durable-cache-jobs).
-
-#[global.job_queue.s3]                # pick one: S3 backend
-#bucket = "angos-jobs"                # S3 bucket for job envelopes
-#key_prefix = "_jobs"                 # key prefix inside the bucket (default "_jobs")
-#endpoint = "https://<s3-endpoint>"
-#region = "us-east-1"                 # default "us-east-1"
-#access_key_id = "<key-id>"
-#secret_key = "<secret-key>"
-#delete_if_match = true               # set false on endpoints without conditional DELETE
 
 [observability.tracing]
 endpoint = "http://127.0.0.1:4317"

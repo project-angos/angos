@@ -72,41 +72,20 @@ miss and publishes the queue-depth gauge on `/metrics`; one or more
 `angos worker` processes must be running to actually drain the queue. When the
 section is absent, jobs run in-process over an in-memory store (not durable
 across restarts).
-Exactly one of `[global.job_queue.fs]` or `[global.job_queue.s3]` must be
-defined to choose the backend.
+
+The queue does not have its own storage backend. Durable jobs are written to
+the **same backend configured for `[metadata_store]`** (filesystem or S3,
+whichever metadata uses), under a hardcoded top-level `_jobs/` prefix; the lock
+strategy is likewise inherited from `[metadata_store]`. There is therefore no
+job-queue-level backend, credential, prefix, or lock-strategy setting — the
+section accepts only the two tunables below.
 
 | Option | Type | Default | Description |
 |---|---|---|---|
 | `pending_refresh_interval_secs` | u64 | `15` | How often the server refreshes the `angos_job_queue_pending` gauge. Must be at least `5` (sub-5s ticks induce LIST storms on S3). |
 | `pending_ready_horizon_secs` | u64 | `600` | Readiness horizon for the `angos_job_queue_pending` gauge. Only envelopes whose `not_before` falls within `[..., now + horizon]` are counted. Set comfortably larger than your worker pod startup time so KEDA has lead time to scale up before the work becomes claimable. |
 
-> **Per-`lock_key` execution TTL is governed by the lock backend.** A worker that claims a job holds the configured `[lock_strategy.*]` lock for the duration of execution; the TTL on the lock object (`[lock_strategy.redis].ttl`, `[lock_strategy.s3].ttl_secs`) is what bounds how long another worker has to wait if the holder dies mid-job. Transient heartbeat failures (connect or refresh errors) tolerate a small budget — roughly one TTL of slack — before cancelling the job, so a brief network blip does not waste in-progress work; authoritative signals (ownership loss, max-hold expiry, missing lock object) cancel immediately.
-
-#### Filesystem backend (`global.job_queue.fs`)
-
-| Option | Type | Default | Description |
-|---|---|---|---|
-| `root_dir` | string | required | Directory for job envelopes. |
-| `lock_strategy` | string/table | `"memory"` | Lock backend used both to serialise dedup-index writes and to hold the per-`lock_key` execution lock: `"memory"` (single-process), or `[lock_strategy.redis]` (multi-process). S3 locking not supported. Mirrors the `[metadata_store.fs.lock_strategy]` shape. |
-
-> **Note:** Default `lock_strategy = "memory"` only coordinates workers in the same process. Multi-replica `angos worker` deployments against a shared mount must set `[lock_strategy.redis]`; without it, two replicas can claim the same job concurrently.
-
-#### S3 backend (`global.job_queue.s3`)
-
-Field shape matches `[metadata_store.s3]` so the same keys (`access_key_id`, `secret_key`, `endpoint`, `bucket`, `region`, `key_prefix`, `lock_strategy`, `capabilities`) work in both sections.
-
-| Option | Type | Default | Description |
-|---|---|---|---|
-| `access_key_id` | string | required | AWS access key ID. |
-| `secret_key` | string | required | AWS secret key. |
-| `endpoint` | string | required | S3 endpoint URL. |
-| `bucket` | string | required | S3 bucket for job envelopes. |
-| `region` | string | `"us-east-1"` | AWS region. |
-| `key_prefix` | string | `"_jobs"` | Key prefix inside the bucket. |
-| `lock_strategy` | string/table | `"s3"` | Coordination strategy: `"s3"` (CAS via S3 conditional writes, default), `"memory"`, or `[lock_strategy.redis]`. Use `redis` / `memory` on S3-compatible providers that don't honor `If-None-Match` / `If-Match`. |
-| `capabilities` | table | all-false | Explicitly declared conditional-operation capabilities (`put_if_none_match`, `put_if_match`, `delete_if_match`). Only consulted under `lock_strategy = "s3"`. The job-queue has no startup probe, so without an explicit declaration the lock strategy is rejected at startup. Set `put_if_none_match = true` and `put_if_match = true` once you've confirmed your provider honours them; add `delete_if_match = true` for race-free lock release, or leave it `false` on providers that ignore `If-Match` on `DELETE` (release then falls back to unconditional `DELETE` with a small race window during lock takeover). |
-
-> **Note:** `lock_strategy = "s3"` requires `capabilities.put_if_none_match` and `capabilities.put_if_match` to be `true`; startup fails fast otherwise. Switch to `"memory"` / `[lock_strategy.redis]` to use Redis or in-process lock storage instead of S3 CAS.
+> **Per-`lock_key` execution TTL is governed by the lock backend.** A worker that claims a job holds the lock configured under `[metadata_store]` for the duration of execution; the TTL on the lock object (`[metadata_store.fs.lock_strategy.redis].ttl`, `[metadata_store.s3.lock_strategy.s3].ttl_secs`) is what bounds how long another worker has to wait if the holder dies mid-job. Transient heartbeat failures (connect or refresh errors) tolerate a small budget — roughly one TTL of slack — before cancelling the job, so a brief network blip does not waste in-progress work; authoritative signals (ownership loss, max-hold expiry, missing lock object) cancel immediately.
 
 See [Enable Durable Cache Jobs](../how-to/durable-cache-jobs.md) for a full
 setup guide including `angos worker` invocation and KEDA autoscaling.
