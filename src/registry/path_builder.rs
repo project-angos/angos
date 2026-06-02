@@ -83,15 +83,6 @@ pub fn upload_path(namespace: &str, uuid: &str) -> String {
     format!("{REPOS_ROOT}/{namespace}/_uploads/{uuid}/data")
 }
 
-/// Directory under which the S3 backend stages the multipart sub-part
-/// remainder between PATCH calls, one file per offset
-/// (`_uploads/<uuid>/staged/<offset>`). The backend appends the byte offset;
-/// the directory lives under the upload container so the regular container
-/// cleanup catches every staged file.
-pub fn upload_staged_dir(namespace: &str, uuid: &str) -> String {
-    format!("{REPOS_ROOT}/{namespace}/_uploads/{uuid}/staged")
-}
-
 /// Directory holding the SHA-256 hasher-state checkpoints for an upload, one
 /// file per offset. Used to enumerate checkpoints and pick the most recent.
 pub fn upload_hash_context_dir(namespace: &str, uuid: &str, algorithm: &str) -> String {
@@ -114,14 +105,6 @@ pub fn upload_hash_context_path(
 /// age-based orphan detection during scrub.
 pub fn upload_start_date_path(namespace: &str, uuid: &str) -> String {
     format!("{REPOS_ROOT}/{namespace}/_uploads/{uuid}/startedat")
-}
-
-/// Opaque backend-managed [`UploadSession`] persisted as JSON so an in-flight
-/// upload (notably the S3 multipart upload id and its parts list) survives a
-/// process crash. Lives under the upload container alongside the other
-/// per-session artifacts.
-pub fn upload_session_state_path(namespace: &str, uuid: &str) -> String {
-    format!("{REPOS_ROOT}/{namespace}/_uploads/{uuid}/session")
 }
 
 pub fn manifest_revisions_link_root_dir(namespace: &str, algorithm: &str) -> String {
@@ -268,20 +251,12 @@ mod tests {
         );
         assert_eq!(uploads_root_dir("ns"), "v2/repositories/ns/_uploads");
         assert_eq!(
-            upload_staged_dir("ns", "uuid"),
-            "v2/repositories/ns/_uploads/uuid/staged"
-        );
-        assert_eq!(
             upload_hash_context_path("ns", "uuid", "sha256", 42),
             "v2/repositories/ns/_uploads/uuid/hashstates/sha256/42"
         );
         assert_eq!(
             upload_start_date_path("ns", "uuid"),
             "v2/repositories/ns/_uploads/uuid/startedat"
-        );
-        assert_eq!(
-            upload_session_state_path("ns", "uuid"),
-            "v2/repositories/ns/_uploads/uuid/session"
         );
     }
 

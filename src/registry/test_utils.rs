@@ -65,7 +65,9 @@ pub fn build_test_fs_executor(root_dir: &str, sync_to_disk: bool) -> Arc<dyn Tra
     locked_executor_over(store)
 }
 
-/// Wrap an object store + executor into a [`Store`] façade for tests.
+/// Wrap an object store + executor into a [`Store`] façade for tests. The
+/// store handle is an [`ObjectStore`] (the CRUD floor plus the upload-session
+/// lifecycle), matching the façade's composed surface.
 pub fn build_store(
     object: Arc<dyn ObjectStore>,
     executor: Arc<dyn TransactionExecutor>,

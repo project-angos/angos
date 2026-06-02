@@ -269,6 +269,8 @@ impl RegistryStorageConfig {
     /// path skips the probe.
     #[allow(clippy::too_many_lines)]
     pub async fn build_store(&self) -> Result<Arc<Store>, Error> {
+        // A single `ObjectStore` handle backs both the `Store` façade (CRUD plus
+        // the upload-session lifecycle) and the executor.
         let (object, executor): (Arc<dyn ObjectStore>, Arc<dyn TransactionExecutor>) = match self {
             RegistryStorageConfig::Inherit => {
                 return Err(Error::Coordination(

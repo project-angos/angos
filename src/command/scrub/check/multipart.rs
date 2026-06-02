@@ -10,15 +10,16 @@ use crate::{
 };
 
 /// Store-wide, backend-level sweep that lists raw orphan S3 multipart uploads —
-/// in-flight uploads older than `timeout` with no recoverable session record
-/// behind them (e.g. a crash between opening the multipart and persisting its
-/// id, or pre-migration orphans) — and aborts them.
+/// in-flight uploads older than `timeout` whose upload session is no longer
+/// live (the `startedat` marker is gone) — and aborts them via the keyed
+/// `abort_upload`.
 ///
-/// This is complementary to the `UploadChecker`
-/// (`scrub --uploads`), which reaps live upload-session containers and aborts
-/// their associated multipart via the persisted session record. Because
-/// `UploadChecker` can only act on uploads that have a session record, this
-/// checker is what catches multipart uploads that have no such record.
+/// This is complementary to the `UploadChecker` (`scrub --uploads`), which
+/// reaps live upload-session containers (those that still have a `startedat`
+/// marker) and aborts their backend state. Because `UploadChecker` can only act
+/// on uploads that still have a session marker, this checker is what catches
+/// multipart uploads left behind with no marker (e.g. a crash between opening
+/// the multipart and writing the marker, or pre-existing orphans).
 pub struct MultipartChecker {
     cleanup: Arc<dyn MultipartCleanup + Send + Sync>,
     timeout: Duration,

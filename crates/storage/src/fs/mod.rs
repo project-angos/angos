@@ -1,4 +1,4 @@
-//! Filesystem-backed [`ObjectStore`] (including its upload-session methods).
+//! Filesystem-backed [`ObjectStore`], including the upload-session methods.
 //!
 //! Maps the storage trait surface onto a directory tree rooted at `root_dir`:
 //! every object key becomes a relative path under the root. Writes are atomic
@@ -11,10 +11,10 @@
 //! FS conditional updates are handled one layer up via the metadata store's
 //! lock backend.
 //!
-//! Upload sessions use an append-mode file at the session's `key` — no
-//! staging artifacts, no multipart protocol. `complete_upload` is a no-op
-//! because the data is already at `key`; the caller's transactional move
-//! to the canonical location is the only finalisation step.
+//! Uploads use an append-mode file at the upload `key` — no staging artifacts,
+//! no multipart protocol, no caller-held session. `complete_upload` is a no-op
+//! because the data is already at `key`; the caller's transactional move to the
+//! canonical location is the only finalisation step.
 
 use std::{
     fs::FileType,
@@ -34,8 +34,7 @@ use tokio::{
 use tokio_util::io::StreamReader;
 
 use crate::{
-    BoxedReader, ByteStream, ChildrenPage, Error, ObjectMeta, ObjectStore, Page, SessionState,
-    UploadSession, object::dir_prefix,
+    BoxedReader, ByteStream, ChildrenPage, Error, ObjectMeta, ObjectStore, Page, object::dir_prefix,
 };
 
 /// Page step used by [`Backend::list_all_children`] when draining all pages
@@ -115,11 +114,11 @@ impl Backend {
     /// and its parent directory if they do not exist.
     ///
     /// Returns the open file handle and the file's size **before** the open,
-    /// so the upload session can verify its tracked offset without a separate
-    /// `head` call.
+    /// so the upload can report its new total size without a separate `head`
+    /// call.
     ///
-    /// Private: this is an upload-session implementation detail, not part of
-    /// the [`ObjectStore`] trait surface.
+    /// Private: this is an upload implementation detail, not part of the
+    /// [`ObjectStore`] trait surface.
     ///
     /// # Errors
     /// Returns [`Error::Backend`] when the file cannot be opened.
@@ -471,89 +470,51 @@ impl ObjectStore for Backend {
         .await
     }
 
-    // ── Upload sessions ─────────────────────────────────────────────────────
-
-    async fn create_upload(&self, key: &str) -> Result<UploadSession, Error> {
-        // Create the empty staging file so `write_upload` can re-open it in
-        // append mode without needing a separate "first write" path.
-        self.put(key, Bytes::new()).await?;
-        Ok(UploadSession {
-            key: key.to_string(),
-            uploaded_size: 0,
-            state: SessionState::Fs,
-        })
+    async fn create_upload(&self, key: &str) -> Result<(), Error> {
+        // Create/truncate the staging file at `key` so a re-`create` at a reused
+        // key starts from an empty file and `write_upload` can re-open it in
+        // append mode.
+        self.put(key, Bytes::new()).await
     }
 
-    async fn write_upload(
-        &self,
-        session: &mut UploadSession,
-        _staged_dir: &str,
-        body: ByteStream,
-        len: u64,
-    ) -> Result<(), Error> {
-        if !matches!(session.state, SessionState::Fs) {
-            return Err(Error::Backend(
-                "upload session is not an FS session".to_string(),
-            ));
-        }
+    async fn write_upload(&self, key: &str, body: ByteStream, len: u64) -> Result<u64, Error> {
+        let (mut file, current) = self.open_for_append(key).await?;
         if len == 0 {
-            return Ok(());
-        }
-        let (mut file, current) = self.open_for_append(&session.key).await?;
-        if current != session.uploaded_size {
-            return Err(Error::Backend(format!(
-                "fs upload-session offset drift: file has {current} bytes, session expected {}",
-                session.uploaded_size,
-            )));
+            return Ok(current);
         }
         let mut reader = StreamReader::new(body.map_err(io::Error::other));
         let written = tokio::io::copy(&mut reader, &mut file).await?;
         if written != len {
             return Err(Error::Backend(format!(
-                "fs upload-session short body: expected {len} bytes, got {written}",
+                "fs upload short body: expected {len} bytes, got {written}",
             )));
         }
         file.flush().await?;
-        session.uploaded_size = session
-            .uploaded_size
+        current
             .checked_add(written)
-            .ok_or_else(|| Error::Backend("session size overflow".to_string()))?;
-        Ok(())
+            .ok_or_else(|| Error::Backend("upload size overflow".to_string()))
     }
 
-    async fn complete_upload(
-        &self,
-        session: UploadSession,
-        _staged_dir: &str,
-    ) -> Result<(), Error> {
-        if !matches!(session.state, SessionState::Fs) {
-            return Err(Error::Backend(
-                "upload session is not an FS session".to_string(),
-            ));
+    async fn complete_upload(&self, key: &str) -> Result<(), Error> {
+        // Ensure the staging file exists (an upload completed with no writes
+        // still produces an empty object at `key`), then no-op: the data already
+        // lives at `key`. The caller's transactional move (Mutation::Move)
+        // promotes it to the canonical location.
+        match self.head(key).await {
+            Ok(_) => Ok(()),
+            Err(Error::NotFound) => self.put(key, Bytes::new()).await,
+            Err(e) => Err(e),
         }
-        // No-op: the data already lives at `session.key`. The caller's
-        // transactional move (Mutation::Move) promotes it to the canonical
-        // location.
-        Ok(())
     }
 
-    async fn abort_upload(&self, session: UploadSession, _staged_dir: &str) -> Result<(), Error> {
-        if !matches!(session.state, SessionState::Fs) {
-            return Err(Error::Backend(
-                "upload session is not an FS session".to_string(),
-            ));
-        }
-        self.delete(&session.key).await
+    async fn abort_upload(&self, key: &str) -> Result<(), Error> {
+        // The staging file at `key` is the only artifact; deleting it is
+        // idempotent (missing file counts as success).
+        self.delete(key).await
     }
 
-    async fn abort_pending_uploads(&self, _key: &str) -> Result<(), Error> {
-        // FS sessions have no out-of-band state — the staging file at `key`
-        // is the only artifact and `abort_upload` already covers it.
-        Ok(())
-    }
-
-    // `list_multipart_uploads` / `abort_multipart_upload` use the trait's
-    // empty/no-op defaults: FS has no multipart protocol.
+    // `list_multipart_uploads` uses the trait's empty default: FS has no
+    // multipart protocol.
 }
 
 #[cfg(test)]

@@ -342,7 +342,7 @@ mod tests {
 
     use angos_storage::{
         BoxedReader as StorageBoxedReader, ByteStream, ChildrenPage, Error as StorageError,
-        MultipartUploadPage, ObjectMeta, ObjectStore, Page, UploadSession,
+        MultipartUploadPage, ObjectMeta, ObjectStore, Page,
     };
     use angos_tx_engine::store::Store;
 
@@ -377,9 +377,9 @@ mod tests {
     }
 
     /// Delegating storage wrapper that injects a single failure at the storage
-    /// seam so upload fast-paths can be proven to avoid a given op. Wraps the
-    /// [`ObjectStore`] (whose surface now includes the upload-session methods),
-    /// so it stands in for the whole storage seam of the [`Store`] façade.
+    /// seam so upload fast-paths can be proven to avoid a given op. Wraps an
+    /// [`ObjectStore`] (the CRUD floor plus the upload-session methods), so it
+    /// stands in for the whole storage seam of the [`Store`] façade.
     struct FailingStorage {
         inner: Arc<dyn ObjectStore>,
         fail: FailOp,
@@ -447,48 +447,33 @@ mod tests {
             self.inner.copy(source, destination).await
         }
 
-        async fn create_upload(&self, key: &str) -> Result<UploadSession, StorageError> {
+        async fn create_upload(&self, key: &str) -> Result<(), StorageError> {
             self.inner.create_upload(key).await
         }
 
         async fn write_upload(
             &self,
-            session: &mut UploadSession,
-            staged_dir: &str,
+            key: &str,
             body: ByteStream,
             len: u64,
-        ) -> Result<(), StorageError> {
+        ) -> Result<u64, StorageError> {
             if matches!(self.fail, FailOp::WriteUpload) {
                 return Err(fail(
                     "write should not be called for monolithic existing blob upload",
                 ));
             }
-            self.inner
-                .write_upload(session, staged_dir, body, len)
-                .await
+            self.inner.write_upload(key, body, len).await
         }
 
-        async fn complete_upload(
-            &self,
-            session: UploadSession,
-            staged_dir: &str,
-        ) -> Result<(), StorageError> {
+        async fn complete_upload(&self, key: &str) -> Result<(), StorageError> {
             if matches!(self.fail, FailOp::CompleteUpload) {
                 return Err(fail("complete should not be called for existing blob data"));
             }
-            self.inner.complete_upload(session, staged_dir).await
+            self.inner.complete_upload(key).await
         }
 
-        async fn abort_upload(
-            &self,
-            session: UploadSession,
-            staged_dir: &str,
-        ) -> Result<(), StorageError> {
-            self.inner.abort_upload(session, staged_dir).await
-        }
-
-        async fn abort_pending_uploads(&self, key: &str) -> Result<(), StorageError> {
-            self.inner.abort_pending_uploads(key).await
+        async fn abort_upload(&self, key: &str) -> Result<(), StorageError> {
+            self.inner.abort_upload(key).await
         }
 
         async fn list_multipart_uploads(
@@ -499,14 +484,6 @@ mod tests {
             self.inner
                 .list_multipart_uploads(key_marker, upload_id_marker)
                 .await
-        }
-
-        async fn abort_multipart_upload(
-            &self,
-            key: &str,
-            upload_id: &str,
-        ) -> Result<(), StorageError> {
-            self.inner.abort_multipart_upload(key, upload_id).await
         }
     }
 

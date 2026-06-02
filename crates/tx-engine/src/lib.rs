@@ -32,7 +32,7 @@ pub mod transaction;
 // [`store`] is the seam through which a subsystem's storage access flows.
 pub use angos_storage::{
     BoxedReader, ByteStream, ChildrenPage, Error as StorageError, Etag, MultipartUploadPage,
-    ObjectMeta, Page, PendingMultipartUpload, UploadSession,
+    ObjectMeta, Page, PendingMultipartUpload,
 };
 
 /// Granular S3 conditional operation capabilities.

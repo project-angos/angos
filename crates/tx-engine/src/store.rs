@@ -1,9 +1,9 @@
 //! Storage façade — the single seam subsystems use for storage.
 //!
-//! [`Store`] composes the storage handles a subsystem needs (the floor
-//! [`ObjectStore`], plus optional upload-session and presign capabilities)
-//! together with the [`TransactionExecutor`] that commits
-//! coordinated writes. Subsystems (`metadata_store`, `blob_store`,
+//! [`Store`] composes the storage handles a subsystem needs (an
+//! [`ObjectStore`] — the CRUD floor plus the upload-session lifecycle — plus
+//! an optional presign capability) together with the [`TransactionExecutor`]
+//! that commits coordinated writes. Subsystems (`metadata_store`, `blob_store`,
 //! `job_store`) hold a single `Arc<Store>` for their per-operation storage
 //! access; the concrete backends are constructed from `angos_storage` at the
 //! configuration seam.
@@ -31,7 +31,7 @@ use bytes::Bytes;
 
 use angos_storage::{
     BoxedReader, ByteStream, ChildrenPage, Error as StorageError, MultipartUploadPage, ObjectMeta,
-    ObjectStore, Page, PresignedStore, UploadSession,
+    ObjectStore, Page, PresignedStore,
 };
 
 use crate::{
@@ -88,9 +88,10 @@ impl Store {
         &self.executor
     }
 
-    /// The floor object store. Escape hatch for code that must hand an
-    /// `Arc<dyn ObjectStore>` to a helper (e.g. concurrent buffered reads, or
-    /// test wrappers that intercept the storage seam).
+    /// The composed object store. Escape hatch for code that must hand an
+    /// `Arc<dyn ObjectStore>` to a helper (e.g. concurrent buffered reads, the
+    /// upload-session lifecycle, or test wrappers that intercept the storage
+    /// seam).
     #[must_use]
     pub fn object_store(&self) -> &Arc<dyn ObjectStore> {
         &self.object
@@ -354,54 +355,38 @@ impl Store {
 
     // ── Upload lifecycle ─────────────────────────────────────────────────────
 
-    /// Begin a fresh upload at `key`.
+    /// Begin/clear a fresh upload at `key` (discards any leaked prior upload).
     ///
     /// # Errors
     ///
-    /// Any backend failure starting the session.
-    pub async fn create_upload(&self, key: &str) -> Result<UploadSession, StorageError> {
+    /// Any backend failure starting the upload.
+    pub async fn create_upload(&self, key: &str) -> Result<(), StorageError> {
         self.object.create_upload(key).await
     }
 
-    /// Stream `len` bytes from `body` into `session`, parking sub-part
-    /// remainders at `staged_dir` (S3 only). The session is mutated in place.
+    /// Append `len` bytes from `body` to the upload at `key`. Returns the new
+    /// total uploaded size.
     ///
     /// # Errors
     ///
     /// Any backend failure writing the chunk.
     pub async fn write_upload(
         &self,
-        session: &mut UploadSession,
-        staged_dir: &str,
+        key: &str,
         body: ByteStream,
         len: u64,
-    ) -> Result<(), StorageError> {
-        self.object
-            .write_upload(session, staged_dir, body, len)
-            .await
+    ) -> Result<u64, StorageError> {
+        self.object.write_upload(key, body, len).await
     }
 
-    /// Discard `session` and any backend state it owns without producing an
-    /// object.
+    /// Discard the upload at `key` and any backend state it owns without
+    /// producing an object. Idempotent.
     ///
     /// # Errors
     ///
-    /// Any backend failure aborting the session.
-    pub async fn abort_upload(
-        &self,
-        session: UploadSession,
-        staged_dir: &str,
-    ) -> Result<(), StorageError> {
-        self.object.abort_upload(session, staged_dir).await
-    }
-
-    /// Best-effort abort of any in-flight backend upload state for `key`.
-    ///
-    /// # Errors
-    ///
-    /// Any backend failure during the abort.
-    pub async fn abort_pending_uploads(&self, key: &str) -> Result<(), StorageError> {
-        self.object.abort_pending_uploads(key).await
+    /// Any backend failure aborting the upload.
+    pub async fn abort_upload(&self, key: &str) -> Result<(), StorageError> {
+        self.object.abort_upload(key).await
     }
 
     /// List in-flight multipart uploads store-wide, one page at a time
@@ -423,38 +408,21 @@ impl Store {
             .await
     }
 
-    /// Abort a single in-flight multipart upload by `key` + `upload_id`.
-    ///
-    /// # Errors
-    ///
-    /// Any backend abort failure.
-    pub async fn abort_multipart_upload(
-        &self,
-        key: &str,
-        upload_id: &str,
-    ) -> Result<(), StorageError> {
-        self.object.abort_multipart_upload(key, upload_id).await
-    }
-
     /// Run only the backend completion step (S3 multipart-complete; FS no-op)
-    /// so the assembled object lands at `session.key`.
+    /// so the assembled object lands at `key`.
     ///
     /// This is a primitive: promotion to the canonical path and deletion of
     /// any session-record keys are left to the caller, which composes them
     /// into an engine [`Transaction`] (via [`Store::execute`]) so the moves
     /// and deletes commit atomically — often merged with other mutations
-    /// (e.g. a blob-index grant). The upload-session orchestration that drives
-    /// this lives in the registry, not the engine.
+    /// (e.g. a blob-index grant). The upload orchestration that drives this
+    /// lives in the registry, not the engine.
     ///
     /// # Errors
     ///
     /// Any backend completion failure.
-    pub async fn complete_upload(
-        &self,
-        session: UploadSession,
-        staged_dir: &str,
-    ) -> Result<(), StorageError> {
-        self.object.complete_upload(session, staged_dir).await
+    pub async fn complete_upload(&self, key: &str) -> Result<(), StorageError> {
+        self.object.complete_upload(key).await
     }
 
     // ── Presign / prune ──────────────────────────────────────────────────────
@@ -494,8 +462,8 @@ pub struct StoreBuilder {
 }
 
 impl StoreBuilder {
-    /// Set the floor object store (required). [`ObjectStore`] carries the
-    /// upload-session lifecycle too, so this single handle wires both.
+    /// Set the object store (required). [`ObjectStore`] carries both the CRUD
+    /// floor and the upload-session lifecycle, so this single handle wires both.
     #[must_use]
     pub fn object(mut self, object: Arc<dyn ObjectStore>) -> Self {
         self.object = Some(object);
@@ -668,19 +636,16 @@ mod tests {
         let store = store_over(backend);
 
         // Stand in for a session record + an assembled upload object.
-        let session = store.create_upload("upload/u1").await.expect("create");
+        store.create_upload("upload/u1").await.expect("create");
         store
             .put("upload-sessions/u1.json", Bytes::from_static(b"{}"))
             .await
             .expect("session record");
 
         // Primitive: backend completion lands the assembled object at the
-        // session key. The caller (registry) then composes the promotion and
+        // upload key. The caller (registry) then composes the promotion and
         // record cleanup into a single engine transaction.
-        store
-            .complete_upload(session, "staging/u1")
-            .await
-            .expect("complete");
+        store.complete_upload("upload/u1").await.expect("complete");
         store
             .execute(
                 Transaction::builder()

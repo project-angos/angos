@@ -1,12 +1,13 @@
 //! Orphan multipart-upload detection and cleanup orchestration.
 //!
-//! This is registry-domain logic layered on the engine's raw multipart
+//! This is registry-domain logic layered on the engine's raw upload
 //! *primitives* ([`Store::list_multipart_uploads`](angos_tx_engine::store::Store::list_multipart_uploads)
-//! and [`Store::abort_multipart_upload`](angos_tx_engine::store::Store::abort_multipart_upload)):
+//! and the keyed [`Store::abort_upload`](angos_tx_engine::store::Store::abort_upload)):
 //! it walks in-flight multipart uploads, applies an age threshold, and skips
 //! any upload that still has a live session (its `startedat` marker exists).
 //! The engine stays oblivious to upload-session semantics; the policy lives
-//! here.
+//! here. An orphan is cleaned with `abort_upload(key)`, which aborts every
+//! in-flight multipart at the key and removes any staged remainder.
 
 use async_trait::async_trait;
 use chrono::{DateTime, Duration, Utc};
@@ -110,8 +111,11 @@ impl MultipartCleanup for BlobStore {
         &self,
         upload: &OrphanMultipartUpload,
     ) -> Result<(), Error> {
+        // `abort_upload` is keyed: it aborts every in-flight multipart at the
+        // key and removes any staged remainder, subsuming the per-upload-id
+        // abort.
         self.store
-            .abort_multipart_upload(&upload.key, &upload.upload_id)
+            .abort_upload(&upload.key)
             .await
             .map_err(Error::from)
     }

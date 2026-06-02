@@ -1,4 +1,4 @@
-//! Durable upload-session state and the orchestration that drives it.
+//! Durable upload progress and the orchestration that drives it.
 //!
 //! Upload metadata that must survive a process crash is persisted as a set of
 //! transparent files under the per-upload container
@@ -8,25 +8,25 @@
 //!   age-based orphan detection.
 //! - `hashstates/sha256/<offset>` — the serialised SHA-256 hasher state after
 //!   consuming the upload's bytes up to `<offset>`, so the hash computation can
-//!   resume after a crash without re-reading the uploaded bytes.
-//! - `session` — the opaque backend-managed [`UploadSession`] (JSON), carrying
-//!   the S3 multipart upload id and parts list so an in-flight multipart upload
-//!   survives a restart.
+//!   resume after a crash without re-reading the uploaded bytes. The highest
+//!   checkpoint offset is also the authoritative record of how many bytes have
+//!   been consumed, so the upload's size is recovered from it on resume.
 //! - `data` — the assembled upload bytes (FS append target / S3 multipart key).
 //! - `staged/<offset>` — S3-only multipart sub-part remainder, one file per
 //!   offset, superseded as the upload advances.
 //!
-//! Backend-specific upload mechanics (FS append, S3 multipart) are
-//! encapsulated inside the storage backend's upload-session methods; this
-//! module never sees them.
-//! Session metadata is reconstructed by reading the per-file artifacts through
-//! the engine [`Store`](angos_tx_engine::store::Store), never from a single
-//! JSON blob.
+//! Backend-specific upload mechanics (FS append, S3 multipart) are encapsulated
+//! inside the storage backend's keyed [`ObjectStore`] upload methods; this
+//! module never sees them. There is no persisted opaque session value — the S3 backend
+//! recovers its multipart state from S3 itself on each call, so the upload is
+//! addressed purely by its `data` key. Upload progress (size, hash) is the
+//! blob store's concern and is reconstructed by reading the per-file artifacts
+//! through the engine [`Store`](angos_tx_engine::store::Store).
 //!
 //! `complete` is two-phase:
 //! 1. [`Store::complete_upload`](angos_tx_engine::store::Store::complete_upload)
-//!    runs (S3 multipart-complete on S3; no-op on FS) so the assembled object
-//!    lands at `upload_path`.
+//!    runs (S3 multipart-complete on S3; no-op finalize on FS) so the assembled
+//!    object lands at `upload_path`.
 //! 2. A single engine `Transaction` atomically moves the assembled object to
 //!    its canonical blob path and deletes the per-file session artifacts.
 
@@ -37,7 +37,7 @@ use tokio::io::AsyncRead;
 use tracing::instrument;
 
 use angos_tx_engine::{
-    StorageError, UploadSession,
+    StorageError,
     transaction::{Mutation, Transaction},
 };
 
@@ -57,7 +57,7 @@ use crate::{
 /// (`hashstates/<HASH_ALGORITHM>/<offset>`).
 const HASH_ALGORITHM: &str = "sha256";
 
-/// In-memory reconstruction of an upload session, assembled from the
+/// In-memory reconstruction of an upload's progress, assembled from the
 /// per-file artifacts under the upload container. The `session_id` equals the
 /// upload `uuid` so the existing `(namespace, uuid)` addressing maps 1:1
 /// without introducing a new ID space.
@@ -75,10 +75,9 @@ pub struct UploadSessionRecord {
     /// `hashstates/sha256/<offset>` checkpoint. Resumes the hash computation
     /// after a crash without re-reading the uploaded bytes.
     pub hash_context: Vec<u8>,
-    /// Opaque backend-managed upload state, read from the `session` file.
-    /// Mutated in place by every `write_upload` call and re-serialised back to
-    /// that file.
-    pub session: UploadSession,
+    /// Number of bytes consumed so far, recovered from the highest hasher-state
+    /// checkpoint offset (the cumulative bytes hashed equals the bytes written).
+    pub uploaded_size: u64,
 }
 
 impl BlobStore {
@@ -87,45 +86,29 @@ impl BlobStore {
         namespace: &str,
         uuid: &str,
     ) -> Result<UploadSessionRecord, Error> {
-        let session_key = path_builder::upload_session_state_path(namespace, uuid);
-        let session = match self.store.get(&session_key).await {
-            Ok(data) => serde_json::from_slice::<UploadSession>(&data).map_err(Error::from)?,
-            Err(StorageError::NotFound) => return Err(Error::UploadNotFound),
-            Err(e) => return Err(e.into()),
-        };
-
         let started_at = self.read_start_date(namespace, uuid).await?;
-        let hash_context = self.read_hash_context(namespace, uuid).await?;
+        let (hash_context, uploaded_size) = self.read_hash_context(namespace, uuid).await?;
 
         Ok(UploadSessionRecord {
             session_id: uuid.to_string(),
             namespace: namespace.to_string(),
             started_at,
             hash_context,
-            session,
+            uploaded_size,
         })
     }
 
-    /// Persist the opaque backend session, the activity timestamp, and the
-    /// hasher-state checkpoint for `record` to their respective per-file
-    /// artifacts under the upload container.
+    /// Persist the activity timestamp and the hasher-state checkpoint for
+    /// `record` to their respective per-file artifacts under the upload
+    /// container.
     async fn write_session(&self, record: &UploadSessionRecord) -> Result<(), Error> {
         let namespace = &record.namespace;
         let uuid = &record.session_id;
 
-        let session_key = path_builder::upload_session_state_path(namespace, uuid);
-        let body = serde_json::to_vec(&record.session).map_err(Error::from)?;
-        self.store.put(&session_key, Bytes::from(body)).await?;
-
         self.write_start_date(namespace, uuid, record.started_at)
             .await?;
-        self.write_hash_context(
-            namespace,
-            uuid,
-            record.session.uploaded_size,
-            &record.hash_context,
-        )
-        .await?;
+        self.write_hash_context(namespace, uuid, record.uploaded_size, &record.hash_context)
+            .await?;
         Ok(())
     }
 
@@ -156,8 +139,12 @@ impl BlobStore {
 
     /// Read the highest-offset `hashstates/sha256/<offset>` checkpoint. The
     /// offset is the cumulative number of bytes hashed, so the maximum offset
-    /// is the most recent state.
-    async fn read_hash_context(&self, namespace: &str, uuid: &str) -> Result<Vec<u8>, Error> {
+    /// is both the most recent hasher state and the bytes consumed so far.
+    async fn read_hash_context(
+        &self,
+        namespace: &str,
+        uuid: &str,
+    ) -> Result<(Vec<u8>, u64), Error> {
         let dir = format!(
             "{}/",
             path_builder::upload_hash_context_dir(namespace, uuid, HASH_ALGORITHM)
@@ -188,7 +175,7 @@ impl BlobStore {
         };
         let key = path_builder::upload_hash_context_path(namespace, uuid, HASH_ALGORITHM, offset);
         match self.store.get(&key).await {
-            Ok(data) => Ok(data),
+            Ok(data) => Ok((data, offset)),
             Err(StorageError::NotFound) => Err(Error::UploadNotFound),
             Err(e) => Err(e.into()),
         }
@@ -240,18 +227,17 @@ impl BlobStore {
     #[instrument(skip(self))]
     pub async fn create_upload(&self, namespace: &str, uuid: &str) -> Result<String, Error> {
         let upload_path = path_builder::upload_path(namespace, uuid);
-        // Clear any leaked multipart session at this key from a previous run.
-        self.store.abort_pending_uploads(&upload_path).await?;
+        // Begin/clear a fresh upload at the data key (clears any leaked prior
+        // multipart and staged remainder).
+        self.store.create_upload(&upload_path).await?;
 
-        let session = self.store.create_upload(&upload_path).await?;
         let hash_context = Sha256::new().serialized_state();
-
         let record = UploadSessionRecord {
             session_id: uuid.to_string(),
             namespace: namespace.to_string(),
             started_at: Utc::now(),
             hash_context,
-            session,
+            uploaded_size: 0,
         };
         self.write_session(&record).await?;
         Ok(uuid.to_string())
@@ -269,39 +255,35 @@ impl BlobStore {
 
         if content_length == 0 {
             let digest = Sha256::from_state(&record.hash_context)?.digest();
-            return Ok((digest, record.session.uploaded_size));
+            return Ok((digest, record.uploaded_size));
         }
 
         let hasher = Sha256::from_state(&record.hash_context)?;
         let hashing_reader = HashingReader::with_hasher(stream, hasher);
         let (body_stream, finish) = hashing_stream(hashing_reader, content_length);
 
-        let staged_dir = path_builder::upload_staged_dir(namespace, uuid);
+        let upload_path = path_builder::upload_path(namespace, uuid);
         let write_result = self
             .store
-            .write_upload(
-                &mut record.session,
-                &staged_dir,
-                body_stream,
-                content_length,
-            )
+            .write_upload(&upload_path, body_stream, content_length)
             .await;
         let final_state = finish
             .await
             .map_err(|e| Error::StorageBackend(e.to_string()))?;
         // Hash-task errors (typically UploadBodySize) win over the storage
         // error they triggered.
-        let final_state = match (write_result, final_state) {
-            (Ok(()), Ok(state)) => state,
+        let (final_state, new_size) = match (write_result, final_state) {
+            (Ok(size), Ok(state)) => (state, size),
             (_, Err(e)) => return Err(e),
             (Err(e), Ok(_)) => return Err(e.into()),
         };
 
         record.hash_context = final_state.serialized;
+        record.uploaded_size = new_size;
         record.started_at = Utc::now();
         self.write_session(&record).await?;
 
-        Ok((final_state.digest, record.session.uploaded_size))
+        Ok((final_state.digest, new_size))
     }
 
     #[instrument(skip(self))]
@@ -312,7 +294,7 @@ impl BlobStore {
     ) -> Result<UploadSummary, Error> {
         let record = self.read_session(namespace, uuid).await?;
         Ok(UploadSummary {
-            size: record.session.uploaded_size,
+            size: record.uploaded_size,
             started_at: record.started_at,
         })
     }
@@ -328,13 +310,10 @@ impl BlobStore {
         expected_digest: Option<&Digest>,
     ) -> Result<(Digest, Vec<Mutation>), Error> {
         let record = self.read_session(namespace, uuid).await?;
-        let upload_key = record.session.key.clone();
+        let upload_key = path_builder::upload_path(namespace, uuid);
 
         let digest = resolve_digest(&record, expected_digest)?;
-        let staged_dir = path_builder::upload_staged_dir(namespace, uuid);
-        self.store
-            .complete_upload(record.session, &staged_dir)
-            .await?;
+        self.store.complete_upload(&upload_key).await?;
         let blob_key = path_builder::blob_path(&digest);
 
         let mut mutations = vec![Mutation::Move {
@@ -390,12 +369,10 @@ impl BlobStore {
     /// staged bytes. Idempotent.
     #[instrument(skip(self))]
     pub async fn delete_upload(&self, namespace: &str, uuid: &str) -> Result<(), Error> {
-        let staged_dir = path_builder::upload_staged_dir(namespace, uuid);
-        if let Ok(record) = self.read_session(namespace, uuid).await {
-            let _ = self.store.abort_upload(record.session, &staged_dir).await;
-        }
         let upload_path = path_builder::upload_path(namespace, uuid);
-        let _ = self.store.abort_pending_uploads(&upload_path).await;
+        // Discard the upload and all backend state it owns (in-progress
+        // multipart(s) and any staged remainder on S3; the staging file on FS).
+        let _ = self.store.abort_upload(&upload_path).await;
 
         let container = path_builder::upload_container_path(namespace, uuid);
         self.store.delete_prefix(&container).await?;
@@ -406,13 +383,10 @@ impl BlobStore {
 /// The per-file session artifacts deleted atomically by the finalization
 /// transaction. The bulk staging artifacts (`data`, `staged/`, the
 /// `hashstates/` tree) are swept best-effort afterwards via `delete_prefix`;
-/// only the metadata files that mark the session as live are removed in the
+/// only the metadata file that marks the session as live is removed in the
 /// transaction.
 fn session_record_keys(namespace: &str, uuid: &str) -> Vec<String> {
-    vec![
-        path_builder::upload_session_state_path(namespace, uuid),
-        path_builder::upload_start_date_path(namespace, uuid),
-    ]
+    vec![path_builder::upload_start_date_path(namespace, uuid)]
 }
 
 fn resolve_digest(

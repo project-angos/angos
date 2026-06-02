@@ -5,10 +5,11 @@
 //!
 //! - [`ObjectStore`] — universal floor: object CRUD, prefix-batch delete,
 //!   head, two listing modes (flat-recursive and one-level-children),
-//!   server-side copy, and the resumable streaming upload-session primitive
+//!   server-side copy, and the keyed, append-only streaming upload primitive
 //!   (FS opens an append-mode file; S3 wraps its native multipart-upload
-//!   protocol, hiding the wire details — upload IDs, parts — from callers).
-//!   Every backend implements this.
+//!   protocol, hiding the wire details — upload IDs, parts, staged remainders —
+//!   from callers, recovering them from S3 on each call). Every backend
+//!   implements this.
 //! - [`ConditionalStore`] — CAS extension: `put_if_absent`, `put_if_match`,
 //!   `delete_if_match`. S3 implements this; FS does not (consumers fall
 //!   back to the transactional engine's `Lock` primitive).
@@ -17,8 +18,8 @@
 //! # Backends
 //!
 //! - [`fs::Backend`] — [`ObjectStore`] on top of `tokio::fs`.
-//! - [`s3::Backend`] — [`ObjectStore`] + [`ConditionalStore`] +
-//!   [`PresignedStore`] wrapping [`angos_s3_client::Backend`].
+//! - [`s3::Backend`] — [`ObjectStore`] + [`ConditionalStore`]
+//!   + [`PresignedStore`] wrapping [`angos_s3_client::Backend`].
 
 mod conditional;
 mod error;
@@ -43,8 +44,7 @@ pub use crate::object::ObjectStore;
 pub use crate::presigned::PresignedStore;
 pub use crate::types::{ChildrenPage, Etag, ObjectMeta, Page};
 pub use crate::upload_session::{
-    ByteStream, MultipartUploadPage, Part, PendingMultipartUpload, SessionState, UploadSession,
-    channel_stream,
+    ByteStream, MultipartUploadPage, PendingMultipartUpload, channel_stream,
 };
 
 /// Boxed `AsyncRead` returned by [`ObjectStore::get_stream`]. Matches the

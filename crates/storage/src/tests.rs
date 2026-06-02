@@ -4,7 +4,7 @@
 //! worked example of what a real backend impl looks like, and verify that
 //! the traits are object-safe (`Arc<dyn ObjectStore>`) and that the
 //! `ConditionalStore: ObjectStore` supertrait bound composes. The
-//! upload-session methods are part of `ObjectStore` itself.
+//! upload-session methods live on `ObjectStore`.
 
 use std::{sync::Arc, time::Duration};
 
@@ -255,7 +255,7 @@ async fn delete_if_match_rejects_stale_etag_but_treats_missing_as_success() {
 }
 
 // =========================================================================
-// Upload sessions (ObjectStore methods)
+// Uploads (ObjectStore upload methods)
 // =========================================================================
 
 fn one_frame(body: &'static [u8]) -> crate::ByteStream {
@@ -263,60 +263,62 @@ fn one_frame(body: &'static [u8]) -> crate::ByteStream {
 }
 
 #[tokio::test]
-async fn upload_session_round_trip_creates_object_at_key() {
+async fn upload_round_trip_creates_object_at_key() {
     let store: Arc<dyn ObjectStore> = backend();
-    let mut session = store.create_upload("blob").await.unwrap();
-    store
-        .write_upload(&mut session, "blob.staged", one_frame(b"hello "), 6)
+    store.create_upload("blob").await.unwrap();
+    assert_eq!(
+        store
+            .write_upload("blob", one_frame(b"hello "), 6)
+            .await
+            .unwrap(),
+        6
+    );
+    let total = store
+        .write_upload("blob", one_frame(b"world"), 5)
         .await
         .unwrap();
-    store
-        .write_upload(&mut session, "blob.staged", one_frame(b"world"), 5)
-        .await
-        .unwrap();
-    assert_eq!(session.uploaded_size, 11);
-    store.complete_upload(session, "blob.staged").await.unwrap();
+    assert_eq!(total, 11);
+    store.complete_upload("blob").await.unwrap();
     assert_eq!(store.get("blob").await.unwrap(), b"hello world");
 }
 
 #[tokio::test]
-async fn upload_session_survives_round_trip_through_serde() {
+async fn upload_resumes_across_independent_calls() {
+    // Uploads are keyed — there is no caller-held handle, so a second batch of
+    // writes addressed at the same key picks up where the first left off.
     let store: Arc<dyn ObjectStore> = backend();
-    let mut session = store.create_upload("blob").await.unwrap();
+    store.create_upload("blob").await.unwrap();
     store
-        .write_upload(&mut session, "blob.staged", one_frame(b"hello "), 6)
+        .write_upload("blob", one_frame(b"hello "), 6)
         .await
         .unwrap();
 
-    // Persist + reload — the session is the handle.
-    let serialised = serde_json::to_string(&session).unwrap();
-    let mut session: crate::UploadSession = serde_json::from_str(&serialised).unwrap();
-
-    store
-        .write_upload(&mut session, "blob.staged", one_frame(b"world"), 5)
+    let total = store
+        .write_upload("blob", one_frame(b"world"), 5)
         .await
         .unwrap();
-    store.complete_upload(session, "blob.staged").await.unwrap();
+    assert_eq!(total, 11);
+    store.complete_upload("blob").await.unwrap();
     assert_eq!(store.get("blob").await.unwrap(), b"hello world");
 }
 
 #[tokio::test]
-async fn upload_session_abort_leaves_no_object() {
+async fn upload_abort_leaves_no_object() {
     let store: Arc<dyn ObjectStore> = backend();
-    let mut session = store.create_upload("blob").await.unwrap();
+    store.create_upload("blob").await.unwrap();
     store
-        .write_upload(&mut session, "blob.staged", one_frame(b"partial"), 7)
+        .write_upload("blob", one_frame(b"partial"), 7)
         .await
         .unwrap();
-    store.abort_upload(session, "blob.staged").await.unwrap();
+    store.abort_upload("blob").await.unwrap();
     assert_eq!(store.get("blob").await.unwrap_err(), Error::NotFound);
 }
 
 #[tokio::test]
-async fn upload_session_complete_with_no_writes_creates_empty_object() {
+async fn upload_complete_with_no_writes_creates_empty_object() {
     let store: Arc<dyn ObjectStore> = backend();
-    let session = store.create_upload("blob").await.unwrap();
-    store.complete_upload(session, "blob.staged").await.unwrap();
+    store.create_upload("blob").await.unwrap();
+    store.complete_upload("blob").await.unwrap();
     assert_eq!(store.get("blob").await.unwrap(), b"");
 }
 

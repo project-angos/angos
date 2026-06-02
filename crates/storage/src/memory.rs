@@ -26,7 +26,7 @@ use futures_util::StreamExt;
 
 use crate::{
     BoxedReader, ByteStream, ChildrenPage, ConditionalStore, Error, Etag, ObjectMeta, ObjectStore,
-    Page, SessionState, UploadSession, object::dir_prefix,
+    Page, object::dir_prefix,
 };
 
 /// Inner shared state.
@@ -319,26 +319,16 @@ impl ObjectStore for MemoryObjectStore {
         Ok(())
     }
 
-    // ── Upload sessions ─────────────────────────────────────────────────────
-
-    async fn create_upload(&self, key: &str) -> Result<UploadSession, Error> {
-        self.put(key, Bytes::new()).await?;
-        Ok(UploadSession {
-            key: key.to_string(),
-            uploaded_size: 0,
-            state: SessionState::Fs,
-        })
+    async fn create_upload(&self, key: &str) -> Result<(), Error> {
+        // Truncate any prior content at `key` so a re-`create` starts empty.
+        self.put(key, Bytes::new()).await
     }
 
-    async fn write_upload(
-        &self,
-        session: &mut UploadSession,
-        _staged_dir: &str,
-        mut body: ByteStream,
-        len: u64,
-    ) -> Result<(), Error> {
+    async fn write_upload(&self, key: &str, mut body: ByteStream, len: u64) -> Result<u64, Error> {
+        let mut combined = self.get(key).await.unwrap_or_default();
+        let current = u64::try_from(combined.len()).map_err(|e| Error::Backend(e.to_string()))?;
         if len == 0 {
-            return Ok(());
+            return Ok(current);
         }
         let mut buf = BytesMut::with_capacity(usize::try_from(len).unwrap_or(0));
         while let Some(chunk) = body.next().await {
@@ -348,37 +338,33 @@ impl ObjectStore for MemoryObjectStore {
         let actual = u64::try_from(buf.len()).map_err(|e| Error::Backend(e.to_string()))?;
         if actual != len {
             return Err(Error::Backend(format!(
-                "memory upload-session short body: expected {len} bytes, got {actual}",
+                "memory upload short body: expected {len} bytes, got {actual}",
             )));
         }
-        let mut combined = self.get(&session.key).await.unwrap_or_default();
         combined.extend_from_slice(&buf);
-        self.put(&session.key, Bytes::from(combined)).await?;
-        session.uploaded_size = session
-            .uploaded_size
+        self.put(key, Bytes::from(combined)).await?;
+        current
             .checked_add(actual)
-            .ok_or_else(|| Error::Backend("session size overflow".to_string()))?;
-        Ok(())
+            .ok_or_else(|| Error::Backend("upload size overflow".to_string()))
     }
 
-    async fn complete_upload(
-        &self,
-        _session: UploadSession,
-        _staged_dir: &str,
-    ) -> Result<(), Error> {
-        Ok(())
+    async fn complete_upload(&self, key: &str) -> Result<(), Error> {
+        // Ensure the object exists (an upload completed with no writes still
+        // produces an empty object at `key`); otherwise no-op — the data already
+        // lives at `key`.
+        if self.lock().data.contains_key(key) {
+            Ok(())
+        } else {
+            self.put(key, Bytes::new()).await
+        }
     }
 
-    async fn abort_upload(&self, session: UploadSession, _staged_dir: &str) -> Result<(), Error> {
-        self.delete(&session.key).await
+    async fn abort_upload(&self, key: &str) -> Result<(), Error> {
+        self.delete(key).await
     }
 
-    async fn abort_pending_uploads(&self, _key: &str) -> Result<(), Error> {
-        Ok(())
-    }
-
-    // `list_multipart_uploads` / `abort_multipart_upload` use the trait's
-    // empty/no-op defaults: the memory backend has no multipart protocol.
+    // `list_multipart_uploads` uses the trait's empty default: the memory
+    // backend has no multipart protocol.
 }
 
 #[async_trait]

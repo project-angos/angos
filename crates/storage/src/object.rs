@@ -7,7 +7,7 @@ use crate::{
     BoxedReader,
     error::Error,
     types::{ChildrenPage, ObjectMeta, Page},
-    upload_session::{ByteStream, MultipartUploadPage, UploadSession},
+    upload_session::{ByteStream, MultipartUploadPage},
 };
 
 /// Normalise `prefix` to a directory boundary for [`ObjectStore::delete_prefix`].
@@ -33,14 +33,36 @@ pub fn dir_prefix(prefix: &str) -> Cow<'_, str> {
 /// Every storage backend implements this. Both FS and S3 can express every
 /// operation here: object CRUD, prefix-batch delete, head metadata, two
 /// listing modes (flat-recursive and one-level-children, separator hard-coded
-/// to `/`), and the resumable [`UploadSession`] primitive (FS appends to a
-/// file; S3 drives its native multipart protocol, hidden from consumers).
+/// to `/`), and the keyed, append-only upload primitive (FS appends to a file;
+/// S3 drives its native multipart protocol, hidden from consumers).
 ///
 /// # Idempotency
 ///
 /// `delete` and `delete_prefix` are idempotent: deleting a missing key or a
 /// prefix with nothing under it counts as success. `get` and `head` on a
 /// missing key return [`Error::NotFound`].
+///
+/// # Uploads
+///
+/// A single append-only upload primitive that both FS (append-mode file) and
+/// S3 (multipart protocol) implement, hiding the S3 multipart wire details
+/// (parts, upload IDs, staged remainders) from consumers. Every upload is
+/// addressed solely by its `key`; there is no caller-held session value. The
+/// caller drives an upload by calling [`ObjectStore::create_upload`] once,
+/// [`ObjectStore::write_upload`] per chunk, and finally
+/// [`ObjectStore::complete_upload`] or [`ObjectStore::abort_upload`]. After
+/// `complete_upload`, the assembled object is visible via the read methods at
+/// `key`.
+///
+/// The S3 backend recovers all multipart state (the in-flight upload id, the
+/// committed parts, and the staged sub-part remainder) from S3 itself on every
+/// call, so nothing has to be persisted by the caller between calls. The staged
+/// remainder lives at a `staged/<offset>` child of the upload key's container —
+/// the backend derives that location from `key` alone (it replaces `key`'s
+/// final path segment with `staged/<offset>`, where `offset` is the number of
+/// bytes already committed to parts). This mirrors the historical
+/// `.../_uploads/<uuid>/staged/<offset>` layout so it stays backward
+/// compatible.
 #[async_trait]
 pub trait ObjectStore: Send + Sync {
     /// Read the full object body into memory.
@@ -102,48 +124,27 @@ pub trait ObjectStore: Send + Sync {
     /// source size and backend-specific thresholds.
     async fn copy(&self, source: &str, destination: &str) -> Result<(), Error>;
 
-    // ── Upload sessions ─────────────────────────────────────────────────────
-    //
-    // A single resumable, streaming upload primitive that both FS (append-mode
-    // file) and S3 (multipart protocol) implement, hiding the S3 multipart wire
-    // details (parts, upload IDs) from consumers. Callers store the
-    // [`UploadSession`] returned by `create_upload`, pass it back into
-    // `write_upload` on every chunk, and finally hand it to `complete_upload`
-    // or `abort_upload`. After `complete_upload`, the assembled object is
-    // visible via the regular read methods above.
+    /// Begin/clear a fresh upload at `key`. Idempotent: discards any leaked
+    /// prior in-progress upload at `key` (so re-`create`ing at a reused key
+    /// starts clean). Lazy — no backend round-trip is required until the first
+    /// write.
+    async fn create_upload(&self, key: &str) -> Result<(), Error>;
 
-    /// Begin a fresh upload at `key`.
-    async fn create_upload(&self, key: &str) -> Result<UploadSession, Error>;
+    /// Append `body` (exactly `len` bytes) to the upload at `key`. Returns the
+    /// new total uploaded size. Streamed end-to-end — backends never buffer the
+    /// full payload. Append-only.
+    async fn write_upload(&self, key: &str, body: ByteStream, len: u64) -> Result<u64, Error>;
 
-    /// Stream `body` (exactly `len` bytes) into `session`. `staged_dir` is
-    /// the directory under which the backend parks per-offset sub-part
-    /// remainders (`<staged_dir>/<offset>`, S3 only; FS ignores it). The
-    /// session is mutated in place; the caller re-serialises the new state
-    /// after the call returns. Bodies are streamed end-to-end — backends
-    /// never buffer the full payload.
-    async fn write_upload(
-        &self,
-        session: &mut UploadSession,
-        staged_dir: &str,
-        body: ByteStream,
-        len: u64,
-    ) -> Result<(), Error>;
+    /// Finalise the upload at `key`: the assembled object becomes visible at
+    /// `key` via the read methods (an empty object when nothing was written).
+    /// The caller is responsible for moving it to its eventual canonical
+    /// location.
+    async fn complete_upload(&self, key: &str) -> Result<(), Error>;
 
-    /// Finalise the session. After Ok, the assembled object exists at
-    /// `session.key` (an empty object when no bytes were written) and is
-    /// visible via the regular read methods. The caller is responsible for
-    /// moving it to its canonical location. `staged_dir` is the per-offset
-    /// staging directory (see [`Self::write_upload`]).
-    async fn complete_upload(&self, session: UploadSession, staged_dir: &str) -> Result<(), Error>;
-
-    /// Discard the session and any backend state it owns without producing
-    /// an object. `staged_dir` is the per-offset staging directory.
-    async fn abort_upload(&self, session: UploadSession, staged_dir: &str) -> Result<(), Error>;
-
-    /// Best-effort: abort any in-flight backend state that may exist for
-    /// `key` outside the session-tracking path. On S3 this walks pending
-    /// multipart uploads and aborts each one; on FS it is a no-op.
-    async fn abort_pending_uploads(&self, key: &str) -> Result<(), Error>;
+    /// Discard the upload at `key` and all backend state it owns (in-progress
+    /// multipart(s) for `key` on S3, plus any staged remainder). Idempotent
+    /// (missing state counts as success).
+    async fn abort_upload(&self, key: &str) -> Result<(), Error>;
 
     /// List in-flight multipart uploads store-wide, one page at a time.
     /// `key_marker`/`upload_id_marker` continue a previous page; pass `None`
@@ -158,12 +159,5 @@ pub trait ObjectStore: Send + Sync {
         _upload_id_marker: Option<&str>,
     ) -> Result<MultipartUploadPage, Error> {
         Ok(MultipartUploadPage::default())
-    }
-
-    /// Abort a single in-flight multipart upload identified by `key` and
-    /// `upload_id`. Defaults to a no-op for backends without a multipart
-    /// protocol.
-    async fn abort_multipart_upload(&self, _key: &str, _upload_id: &str) -> Result<(), Error> {
-        Ok(())
     }
 }
