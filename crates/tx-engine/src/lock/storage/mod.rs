@@ -24,6 +24,7 @@ use std::fmt::Debug;
 use async_trait::async_trait;
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
 use crate::lock::Error;
 
@@ -35,6 +36,17 @@ pub struct LockBody {
     pub refreshed_at: DateTime<Utc>,
     /// TTL in seconds declared by the holder.
     pub ttl_secs: u64,
+    /// Per-write random nonce that makes every serialized lock body globally
+    /// unique. After a conditional write returns an ambiguous (status-less)
+    /// transport error, [`S3LockStorage`](s3::S3LockStorage) reads the object
+    /// back and treats a byte-for-byte match as proof that *its own* write
+    /// landed despite the lost acknowledgement — rather than a competitor's
+    /// identical-looking body. The nonce is what makes that comparison
+    /// collision-free. `#[serde(default)]` keeps lock objects written before
+    /// this field existed readable: they deserialize to the nil UUID, which
+    /// never matches a freshly minted nonce.
+    #[serde(default)]
+    pub writer_nonce: Uuid,
 }
 
 impl LockBody {

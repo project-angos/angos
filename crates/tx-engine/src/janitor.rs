@@ -458,6 +458,7 @@ mod tests {
     use async_trait::async_trait;
     use bytes::Bytes;
     use chrono::{Duration as ChronoDuration, Utc};
+    use uuid::Uuid;
 
     use angos_storage::{
         BoxedReader, ByteStream, ChildrenPage, ConditionalStore, Error as StorageError, Etag,
@@ -480,6 +481,7 @@ mod tests {
         LockBody {
             refreshed_at: Utc::now() - ChronoDuration::minutes(10),
             ttl_secs: 30,
+            writer_nonce: Uuid::new_v4(),
         }
     }
 
@@ -487,6 +489,7 @@ mod tests {
         LockBody {
             refreshed_at: Utc::now(),
             ttl_secs: 30,
+            writer_nonce: Uuid::new_v4(),
         }
     }
 

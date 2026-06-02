@@ -36,6 +36,7 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
+use uuid::Uuid;
 
 use crate::lock::{
     Error, LockSession,
@@ -187,6 +188,7 @@ impl Lock {
         let body = LockBody {
             refreshed_at: Utc::now(),
             ttl_secs: self.ttl_secs,
+            writer_nonce: Uuid::new_v4(),
         };
         serde_json::to_vec(&body)
             .map_err(|e| Error::InvalidData(format!("lock body serialization failed: {e}")))
@@ -595,6 +597,7 @@ async fn heartbeat_tick_path(
         let body = LockBody {
             refreshed_at: Utc::now(),
             ttl_secs,
+            writer_nonce: Uuid::new_v4(),
         };
         serde_json::to_vec(&body).map_err(|e| e.to_string())
     };
@@ -769,6 +772,7 @@ mod tests {
     use async_trait::async_trait;
     use chrono::{Duration as ChronoDuration, Utc};
     use tokio::sync::Barrier;
+    use uuid::Uuid;
 
     use super::{HeartbeatOutcome, Lock, PathTickOutcome, heartbeat_tick_path, run_heartbeat_tick};
     use crate::lock::{
@@ -868,6 +872,7 @@ mod tests {
             let body = LockBody {
                 refreshed_at,
                 ttl_secs: 30,
+                writer_nonce: Uuid::new_v4(),
             };
             serde_json::to_vec(&body).unwrap()
         }
