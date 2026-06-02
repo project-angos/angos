@@ -33,7 +33,7 @@
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use sha2::{Digest as _, Sha256};
-use tokio::io::AsyncRead;
+use tokio::{io::AsyncRead, try_join};
 use tracing::instrument;
 
 use angos_tx_engine::{
@@ -86,8 +86,13 @@ impl BlobStore {
         namespace: &str,
         uuid: &str,
     ) -> Result<UploadSessionRecord, Error> {
-        let started_at = self.read_start_date(namespace, uuid).await?;
-        let (hash_context, uploaded_size) = self.read_hash_context(namespace, uuid).await?;
+        // The start-date read and the hash-context read (itself a LIST + GET)
+        // are independent, so issue them concurrently to save a serial S3
+        // round-trip on every session read (every PATCH/finalize).
+        let (started_at, (hash_context, uploaded_size)) = try_join!(
+            self.read_start_date(namespace, uuid),
+            self.read_hash_context(namespace, uuid),
+        )?;
 
         Ok(UploadSessionRecord {
             session_id: uuid.to_string(),
@@ -105,10 +110,13 @@ impl BlobStore {
         let namespace = &record.namespace;
         let uuid = &record.session_id;
 
-        self.write_start_date(namespace, uuid, record.started_at)
-            .await?;
-        self.write_hash_context(namespace, uuid, record.uploaded_size, &record.hash_context)
-            .await?;
+        // The two artifacts live at distinct keys and do not depend on each
+        // other, so persist them concurrently to save a serial S3 round-trip on
+        // every session write.
+        try_join!(
+            self.write_start_date(namespace, uuid, record.started_at),
+            self.write_hash_context(namespace, uuid, record.uploaded_size, &record.hash_context),
+        )?;
         Ok(())
     }
 
