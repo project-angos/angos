@@ -1,8 +1,8 @@
 [server]
 bind_address = "0.0.0.0"
 port = 8000
-#query_timeout_secs = 3600
-#query_timeout_grace_period_secs = 60
+#query_timeout = 3600
+#query_timeout_grace_period = 60
 
 [server.tls]
 server_certificate_bundle = "tls.d/server-ca-bundle.pem"

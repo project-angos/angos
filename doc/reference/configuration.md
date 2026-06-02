@@ -29,10 +29,10 @@ TLS certificate files are also automatically reloaded when they change.
 |-----------------------------------|--------------|----------|----------------------------------------------------|
 | `bind_address`                    | string       | required | Address to bind (e.g., `"0.0.0.0"`, `"127.0.0.1"`) |
 | `port`                            | u16          | `8000`   | Port number                                        |
-| `query_timeout_secs`              | non-zero u64 | `3600`   | Query timeout in seconds                           |
-| `query_timeout_grace_period_secs` | non-zero u64 | `60`     | Grace period for queries in seconds                |
+| `query_timeout`                   | non-zero u64 | `3600`   | Query timeout in seconds                           |
+| `query_timeout_grace_period`      | non-zero u64 | `60`     | Grace period for queries in seconds                |
 
-Timeout values must be greater than zero. The older unsuffixed names are still accepted for compatibility, but new configuration should use the `_secs` names.
+Timeout values must be greater than zero.
 
 ### TLS (`server.tls`)
 

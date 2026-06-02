@@ -10,13 +10,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 - Stale lock objects under `.tx-locks/` are reclaimed automatically by a periodic janitor running on every server and worker replica; no operator action is required.
 - New `scrub --referrers` flag: checks every revision in each namespace and removes any referrer link whose referrer manifest no longer has a current digest revision link, preventing ghost descriptors from appearing in the OCI Referrers API response.
-- Durable cache jobs: the optional `[global.job_queue]` section makes pull-through cache-fill jobs survive restarts by persisting them in the backend configured for `[metadata_store]` (filesystem or S3); the new `angos worker` subcommand drains the queue while `angos server` enqueues jobs and publishes the `angos_job_queue_pending` gauge on `/metrics`.
+- Durable cache jobs: the optional `[global.job_queue]` section persists pull-through cache-fill jobs in the `[metadata_store]` backend so they survive restarts, drained by the new `angos worker` subcommand.
 - Maximum manifest body size enforcement.
 - Warning log when a listener flips between insecure and TLS during configuration hot-reload.
 
 ### Changed
 
-- The storage layer now uses a single resumable streaming upload capability in place of the previous multipart-based one, and in-flight upload sessions do not survive the upgrade (clients retry and `scrub --uploads` reaps the stale staging artifacts).
+- Blob upload sessions now use a single resumable streaming upload in place of the previous multipart-based protocol, and in-flight sessions do not survive the upgrade (clients retry and `scrub --uploads` reaps the stale staging artifacts).
 - The four registry subsystems (metadata, job, upload, and manifest stores) now write atomically through a single transactional-engine design instantiated per subsystem, each with its own lock domain (metadata and job share one instance; the blob store and the in-process job queue each have their own), adding three new top-level prefixes — `.tx-log/`, `.tx-bodies/`, and `.tx-locks/`, that operators should factor into bucket policies. A `_jobs/` prefix is also added when the durable job queue (`[global.job_queue]`) is enabled.
 - Blob deletion follows the OCI distribution lifecycle, with blob ownership tracked independently from manifest references.
 - Manifests with missing blob or descriptor references are rejected at push time.
@@ -28,8 +28,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - Non-boolean CEL access-policy rule results are fail-closed in both `allow` and `deny` modes.
 - Access-policy CEL runtime evaluation errors are now fail-closed: a DENY rule that throws at request time denies the request instead of falling through to default-allow.
 - Empty or whitespace-only CEL rules now fail with a clear configuration error at load time instead of panicking the process.
-- Configuration is fully validated at load time (URLs, Redis cache URLs, Argon2 hashes, CEL rules, sampling rates, webhook refs, regexes, listener timeouts); invalid values now fail at startup with a clear error instead of later at runtime.
-- OIDC providers are tried in deterministic order, and the `mTLS` `auth_method` label is preserved when basic auth also succeeds.
+- Configuration is fully validated at load time (URLs, Redis cache URLs, Argon2 hashes, CEL rules, sampling rates, webhook refs, regexes, listener timeouts); invalid values now fail at startup with a clear error instead of later at runtime.- OIDC providers are tried in deterministic order, and the `mTLS` `auth_method` label is preserved when basic auth also succeeds.
 - Auth-webhook transport failures surface as errors instead of silent denials.
 - Webhook authorization responses with status 429 or 5xx no longer pin denials in the decision cache; only explicit 2xx and 401/403 outcomes are cached, and unavailable responses re-probe the webhook on the next request.
 - OIDC authentication debug logs no longer include the full token claims map; only provider name/type and the `sub`/`iss` claims are logged to avoid leaking user/CI metadata at `debug` level.
@@ -40,7 +39,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - Filesystem metadata now uses the same sharded blob-index and namespace-registry layout as S3, while pre-existing legacy `index.json` and `namespace_registry.json` files keep working and only `scrub` migrates them to the sharded layout.
 - The Redis client reuses a multiplexed connection across operations and backs off on lock contention.
 - The S3 backend now uses a custom HTTP client in place of the AWS SDK: focused retry / timeout / signing tailored to the operations the registry actually issues, smaller binary, and no AWS SDK transitive dependencies.
-- Filesystem cleanup of empty ancestor directories is depth-bounded (2 levels for blob shards, 3 for index and namespace-registry shards, 4 for link containers) and rooted-subtree guarded; a misshaped path can never walk above the configured root.
+- Filesystem cleanup of empty ancestor directories walks up from a deleted leaf, removing empty parents until the first non-empty directory or the store root, and is rooted-subtree guarded; a misshaped path can never walk above the configured root.
 - UI, documentation-website and Rust dependencies upgraded.
 - Scrub's orphan manifest deletion now plans link operations through the runtime write path's `link_plan::delete` primitive, so it also removes any tag links still pointing at an orphaned manifest digest (previously left dangling).
 - Scrub's orphan manifest deletion now tolerates manifest blobs that fail to parse by removing the digest link (and any tags pointing at it) while still surfacing blob-read failures so operators notice broken storage.
@@ -50,7 +49,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 #### Performance
 
-- Uniform S3 multipart uploads are streamed end-to-end; large-blob copies use S3 multipart copy.
+- Uniform S3 object writes are streamed end-to-end through S3's multipart API; large-blob copies use S3 multipart copy.
 - Blob-index lock contention reduced; ownership checks and GC cleanup no longer read the full index, and redundant writes are skipped.
 - Filesystem metadata link locks now include namespace, reducing unrelated repository contention while blob-index locks stay digest-global across metadata backends.
 - Existing blob data is reused on upload completion; empty / zero-byte rewrites are skipped on both uniform and nonuniform paths.

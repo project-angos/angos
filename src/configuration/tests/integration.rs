@@ -30,8 +30,8 @@ fn test_load_minimal_config() {
     let bind_address = server_config.base.bind_address.to_string();
     assert_eq!(bind_address, "0.0.0.0".to_string());
     assert_eq!(server_config.base.port, 8000);
-    assert_eq!(server_config.base.query_timeout_secs.get(), 3600);
-    assert_eq!(server_config.base.query_timeout_grace_period_secs.get(), 60);
+    assert_eq!(server_config.base.query_timeout.get(), 3600);
+    assert_eq!(server_config.base.query_timeout_grace_period.get(), 60);
 
     assert_eq!(config.cache, cache::Config::Memory);
     assert_eq!(config.blob_store, blob_store::BlobStoreConfig::default());
@@ -320,8 +320,8 @@ fn test_insecure_config_with_custom_port() {
     [server]
     bind_address = "127.0.0.1"
     port = 9000
-    query_timeout_secs = 7200
-    query_timeout_grace_period_secs = 120
+    query_timeout = 7200
+    query_timeout_grace_period = 120
     "#;
 
     let config = Configuration::load_from_str(config).unwrap();
@@ -329,11 +329,8 @@ fn test_insecure_config_with_custom_port() {
         ServerConfig::Insecure(insecure_config) => {
             assert_eq!(insecure_config.base.bind_address.to_string(), "127.0.0.1");
             assert_eq!(insecure_config.base.port, 9000);
-            assert_eq!(insecure_config.base.query_timeout_secs.get(), 7200);
-            assert_eq!(
-                insecure_config.base.query_timeout_grace_period_secs.get(),
-                120
-            );
+            assert_eq!(insecure_config.base.query_timeout.get(), 7200);
+            assert_eq!(insecure_config.base.query_timeout_grace_period.get(), 120);
         }
         ServerConfig::Tls(_) => panic!("Expected Insecure server config"),
     }

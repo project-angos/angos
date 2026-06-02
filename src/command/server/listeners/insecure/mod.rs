@@ -45,8 +45,8 @@ impl InsecureListener {
             SocketAddr::new(server_config.base.bind_address, server_config.base.port);
 
         let timeouts = [
-            Duration::from_secs(server_config.base.query_timeout_secs.get()),
-            Duration::from_secs(server_config.base.query_timeout_grace_period_secs.get()),
+            Duration::from_secs(server_config.base.query_timeout.get()),
+            Duration::from_secs(server_config.base.query_timeout_grace_period.get()),
         ];
 
         Self {
