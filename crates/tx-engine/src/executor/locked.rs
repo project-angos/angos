@@ -18,7 +18,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use sha2::{Digest as _, Sha256};
 use tokio::select;
-use tracing::{debug, warn};
+use tracing::debug;
 use uuid::Uuid;
 
 use angos_storage::{ConditionalStore, Error as StorageError, Etag, ObjectStore};
@@ -27,7 +27,7 @@ use crate::{
     error::Error,
     executor::{
         Outcome, TransactionExecutor,
-        common::{build_intent, finish, stage_bodies, stamp_progress, write_intent},
+        common::{build_intent, finish, stage_bodies, stamp_applied, write_intent},
     },
     intent::{DEFAULT_INTENT_TTL_SECS, IntentRecord, MutationRecord},
     lock::{LockSession, primitive::Lock},
@@ -237,20 +237,10 @@ impl LockedExecutor {
     /// Returns `Ok(())` on success or `Err` on the first hard error.
     /// The caller is responsible for releasing the lock session in both cases.
     async fn apply_all(&self, intent: &mut IntentRecord) -> Result<(), Error> {
-        let tx_id = intent.id;
         for idx in 0..intent.mutations.len() {
             let mutation = intent.mutations[idx].clone();
             match self.apply_mutation(&mutation, idx).await {
-                Ok(()) => {
-                    if let Err(stamp_err) = stamp_progress(self.store.as_ref(), intent, idx).await {
-                        warn!(
-                            tx_id = %tx_id,
-                            idx,
-                            error = %stamp_err,
-                            "Failed to stamp mutation progress; recovery will re-apply idempotently"
-                        );
-                    }
-                }
+                Ok(()) => stamp_applied(self.store.as_ref(), intent, idx).await,
                 Err(e) => return Err(e),
             }
         }

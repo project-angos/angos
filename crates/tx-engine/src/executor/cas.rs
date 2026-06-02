@@ -25,11 +25,14 @@ use crate::{
     error::Error,
     executor::{
         Outcome, TransactionExecutor, common,
-        common::{build_intent, finish, rollback, stage_bodies, stamp_progress, write_intent},
+        common::{
+            build_intent, finish, rollback, stage_bodies, stamp_applied, stamp_progress,
+            write_intent,
+        },
     },
     intent::{DEFAULT_INTENT_TTL_SECS, IntentRecord, MutationRecord},
     lock::{LockSession, primitive::Lock},
-    transaction::Transaction,
+    transaction::{Transaction, lock_key_set},
 };
 
 /// CAS-mode executor.
@@ -170,16 +173,7 @@ impl CasExecutor {
         for idx in 0..intent.mutations.len() {
             let mutation = intent.mutations[idx].clone();
             match apply_cas(self.store.as_ref(), &mutation, CasApplyMode::Abort).await {
-                Ok(()) => {
-                    if let Err(stamp_err) = stamp_progress(self.store.as_ref(), intent, idx).await {
-                        warn!(
-                            tx_id = %tx_id,
-                            idx,
-                            error = %stamp_err,
-                            "Failed to stamp mutation progress; recovery will re-apply idempotently"
-                        );
-                    }
-                }
+                Ok(()) => stamp_applied(self.store.as_ref(), intent, idx).await,
                 Err(Error::Precondition) => {
                     if intent.any_applied() {
                         // The transaction is committed (at least one slot is
@@ -460,9 +454,7 @@ impl TransactionExecutor for CasExecutor {
         let coarse_session = if tx.coarse_lock_keys.is_empty() {
             None
         } else {
-            let mut keys = tx.coarse_lock_keys.clone();
-            keys.sort();
-            keys.dedup();
+            let keys = lock_key_set(tx.coarse_lock_keys.iter().cloned());
             Some(self.lock.acquire(&keys).await.map_err(Error::Lock)?)
         };
 

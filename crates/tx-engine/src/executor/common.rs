@@ -45,6 +45,21 @@ pub async fn stamp_progress(
     write_intent(store, intent).await
 }
 
+/// Mark mutation `idx` `Applied` and re-PUT the intent, warning (not failing)
+/// when the stamp write fails — the recovery loop re-applies idempotently if a
+/// stamp is lost. Shared by both executors' per-mutation apply loops.
+pub async fn stamp_applied(store: &dyn ObjectStore, intent: &mut IntentRecord, idx: usize) {
+    let tx_id = intent.id;
+    if let Err(stamp_err) = stamp_progress(store, intent, idx).await {
+        warn!(
+            tx_id = %tx_id,
+            idx,
+            error = %stamp_err,
+            "Failed to stamp mutation progress; recovery will re-apply idempotently"
+        );
+    }
+}
+
 /// Stage `Put`/`PutIfAbsent` bodies at `.tx-bodies/<tx_id>/<idx>` and return
 /// the matching [`MutationRecord`]s for the intent.
 ///
