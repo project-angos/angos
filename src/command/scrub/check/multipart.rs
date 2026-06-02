@@ -14,7 +14,7 @@ use crate::{
 /// behind them (e.g. a crash between opening the multipart and persisting its
 /// id, or pre-migration orphans) — and aborts them.
 ///
-/// This is complementary to [`UploadChecker`](super::UploadChecker)
+/// This is complementary to the `UploadChecker`
 /// (`scrub --uploads`), which reaps live upload-session containers and aborts
 /// their associated multipart via the persisted session record. Because
 /// `UploadChecker` can only act on uploads that have a session record, this

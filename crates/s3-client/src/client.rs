@@ -628,11 +628,11 @@ impl S3Client {
                 + canonical_hash.len()
                 + 3,
         );
-        write!(
+        // Writing to a `String` is infallible; discard the always-`Ok` result.
+        let _ = write!(
             string_to_sign,
             "{SIGNING_ALGORITHM}\n{amz_date}\n{credential_scope}\n{canonical_hash}"
-        )
-        .expect("writing to a String cannot fail");
+        );
         let signing_key = self.signing_key(date)?;
         Ok(hex::encode(hmac_sha256(
             &signing_key,
@@ -669,10 +669,11 @@ impl S3Client {
 
 pub fn range_header(offset: u64) -> HeaderMap {
     let mut headers = HeaderMap::new();
-    headers.insert(
-        RANGE,
-        HeaderValue::from_str(&format!("bytes={offset}-")).expect("range header is ASCII"),
-    );
+    // `bytes={offset}-` is always valid ASCII; skip the header on the impossible
+    // parse error rather than panicking.
+    if let Ok(value) = HeaderValue::from_str(&format!("bytes={offset}-")) {
+        headers.insert(RANGE, value);
+    }
     headers
 }
 

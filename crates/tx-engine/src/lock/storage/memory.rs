@@ -13,7 +13,7 @@
 use std::{
     collections::HashMap,
     fmt::Debug,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, PoisonError},
 };
 
 use async_trait::async_trait;
@@ -72,10 +72,7 @@ impl MemoryLockStorage {
 #[async_trait]
 impl LockStorage for MemoryLockStorage {
     async fn put_if_absent(&self, key: &str, body: Vec<u8>) -> Result<PutIfAbsentOutcome, Error> {
-        let mut inner = self
-            .inner
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut inner = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
         if inner.entries.contains_key(key) {
             return Ok(PutIfAbsentOutcome::AlreadyExists);
         }
@@ -93,10 +90,7 @@ impl LockStorage for MemoryLockStorage {
         expected_etag: &str,
         body: Vec<u8>,
     ) -> Result<PutIfMatchOutcome, Error> {
-        let mut inner = self
-            .inner
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut inner = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
         match inner.entries.get(key) {
             None => return Ok(PutIfMatchOutcome::Mismatch),
             Some(entry) => {
@@ -118,10 +112,7 @@ impl LockStorage for MemoryLockStorage {
         &self,
         key: &str,
     ) -> Result<(Vec<u8>, Option<String>, Option<DateTime<Utc>>), Error> {
-        let inner = self
-            .inner
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let inner = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
         match inner.entries.get(key) {
             None => Err(Error::NotFound),
             Some(entry) => {
@@ -132,10 +123,7 @@ impl LockStorage for MemoryLockStorage {
     }
 
     async fn delete(&self, key: &str) -> Result<(), Error> {
-        let mut inner = self
-            .inner
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut inner = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
         inner.entries.remove(key);
         Ok(())
     }
@@ -145,10 +133,7 @@ impl LockStorage for MemoryLockStorage {
         key: &str,
         expected_etag: &str,
     ) -> Result<DeleteIfMatchOutcome, Error> {
-        let mut inner = self
-            .inner
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut inner = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
         match inner.entries.get(key) {
             None => Ok(DeleteIfMatchOutcome::Deleted),
             Some(entry) => {

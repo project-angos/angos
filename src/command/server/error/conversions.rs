@@ -1,8 +1,7 @@
 use hyper::StatusCode;
 
-use super::Error;
 use crate::{
-    command::bootstrap,
+    command::{bootstrap, server::error::Error},
     configuration::{self, registry_storage},
     event_webhook, registry,
     registry::blob_store,

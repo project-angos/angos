@@ -12,9 +12,11 @@ use reqwest::Client;
 use serde::Deserialize;
 use tracing::debug;
 
-use super::{AuthMiddleware, AuthResult};
 use crate::{
-    auth::oidc::provider::{generic, github},
+    auth::{
+        AuthMiddleware, AuthResult,
+        oidc::provider::{generic, github},
+    },
     cache::Cache,
     command::server::{Error, RequestHeaders},
     identity::{ClientIdentity, OidcClaims},

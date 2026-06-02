@@ -3,7 +3,7 @@ use http_body_util::Full;
 use hyper::{Response, StatusCode, header::CONTENT_TYPE};
 use rust_embed::Embed;
 
-use super::{error::Error, response_body::ResponseBody};
+use crate::command::server::{error::Error, response_body::ResponseBody};
 
 #[derive(Embed)]
 #[folder = "ui/build"]

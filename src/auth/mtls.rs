@@ -5,8 +5,8 @@ use hyper::http::request::Parts;
 use tracing::{debug, error, instrument};
 use x509_parser::{certificate::X509Certificate, prelude::FromDer};
 
-use super::{AuthMiddleware, AuthResult};
 use crate::{
+    auth::{AuthMiddleware, AuthResult},
     command::server::Error,
     identity::{ClientCertificate, ClientIdentity},
 };

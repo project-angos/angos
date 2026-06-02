@@ -23,7 +23,7 @@
 use std::{
     collections::HashMap,
     fmt::Debug,
-    sync::{Arc, RwLock},
+    sync::{Arc, PoisonError, RwLock},
     time::{Duration, Instant},
 };
 
@@ -506,9 +506,7 @@ async fn run_heartbeat_tick(
     // still-held lock and split ownership. Running them concurrently keeps the
     // wall-clock per tick at ≈ one `tick_deadline` regardless of key count.
     let cached_etags: Vec<Option<String>> = {
-        let cache = etag_cache
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let cache = etag_cache.read().unwrap_or_else(PoisonError::into_inner);
         paths
             .iter()
             .map(|path| cache.get(path).and_then(Option::as_ref).cloned())
@@ -542,7 +540,7 @@ async fn run_heartbeat_tick(
             PathTickOutcome::Updated(new_etag) => {
                 etag_cache
                     .write()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .unwrap_or_else(PoisonError::into_inner)
                     .insert(path.clone(), new_etag);
             }
             PathTickOutcome::Invalidate(reason) => {
@@ -553,7 +551,7 @@ async fn run_heartbeat_tick(
             PathTickOutcome::Failure => {
                 etag_cache
                     .write()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .unwrap_or_else(PoisonError::into_inner)
                     .insert(path.clone(), None);
                 had_failure = true;
             }
@@ -688,7 +686,7 @@ async fn release_session(
     for path in &paths {
         let cached_etag = etag_cache
             .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .unwrap_or_else(PoisonError::into_inner)
             .get(path)
             .and_then(Option::as_ref)
             .cloned();

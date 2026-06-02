@@ -23,7 +23,7 @@
 use std::{
     fmt,
     future::Future,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, PoisonError},
     time::Duration,
 };
 
@@ -340,7 +340,7 @@ impl Store {
                 }
             }
             let map_fut = {
-                let mut map = map.lock().expect("update map closure is never poisoned");
+                let mut map = map.lock().unwrap_or_else(PoisonError::into_inner);
                 map(snaps)
             };
             let (mutations, payload) = map_fut.await?;

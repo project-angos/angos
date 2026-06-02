@@ -18,11 +18,14 @@ use tokio::{
 use tracing::{Span, debug, error, info, instrument};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
-use super::{dispatch::dispatch_request, error_to_response};
 use crate::{
     auth::PeerCertificate,
     command::server::{
-        ServerContext, error::Error as ServerError, response_body::ResponseBody, router,
+        ServerContext,
+        error::Error as ServerError,
+        http_server::{dispatch::dispatch_request, error_to_response},
+        response_body::ResponseBody,
+        router,
     },
     identity::Action,
     metrics_provider::{InFlightGuard, metrics_provider},

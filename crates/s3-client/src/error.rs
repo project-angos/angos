@@ -4,7 +4,6 @@ use std::{fmt, io};
 pub enum Error {
     Configuration(String),
     Io(String),
-    Serialization(String),
     NotFound(String),
     PreconditionFailed,
 }
@@ -14,7 +13,6 @@ impl fmt::Display for Error {
         match self {
             Error::Configuration(msg) => write!(f, "Configuration error: {msg}"),
             Error::Io(e) => write!(f, "IO error: {e}"),
-            Error::Serialization(e) => write!(f, "Serialization error: {e}"),
             Error::NotFound(e) => write!(f, "Not found: {e}"),
             Error::PreconditionFailed => write!(f, "Precondition failed"),
         }
@@ -33,12 +31,6 @@ impl From<io::Error> for Error {
     }
 }
 
-impl From<serde_json::Error> for Error {
-    fn from(err: serde_json::Error) -> Self {
-        Error::Serialization(err.to_string())
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -52,10 +44,6 @@ mod tests {
         assert_eq!(
             format!("{}", Error::Io("disk full".to_string())),
             "IO error: disk full"
-        );
-        assert_eq!(
-            format!("{}", Error::Serialization("invalid JSON".to_string())),
-            "Serialization error: invalid JSON"
         );
         assert_eq!(
             format!("{}", Error::NotFound("file.txt".to_string())),
@@ -79,12 +67,5 @@ mod tests {
         let io_err = io::Error::new(io::ErrorKind::PermissionDenied, "access denied");
         let err: Error = io_err.into();
         assert!(matches!(err, Error::Io(_)));
-    }
-
-    #[test]
-    fn test_from_serde_json_error() {
-        let json_err = serde_json::from_str::<serde_json::Value>("{invalid}").unwrap_err();
-        let err: Error = json_err.into();
-        assert!(matches!(err, Error::Serialization(_)));
     }
 }

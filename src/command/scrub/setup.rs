@@ -3,7 +3,6 @@ use std::sync::Arc;
 use chrono::Duration;
 use tracing::info;
 
-use super::command::Options;
 use crate::{
     command::scrub::{
         check::{
@@ -11,6 +10,7 @@ use crate::{
             MultipartChecker, NamespaceChecker, ReferrerChecker, RetentionChecker, TagChecker,
             UploadChecker,
         },
+        command::Options,
         error::Error,
     },
     configuration::Configuration,

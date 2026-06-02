@@ -1,5 +1,4 @@
-use super::Configuration;
-use crate::configuration::RegistryStorageConfig;
+use crate::configuration::{Configuration, RegistryStorageConfig};
 
 impl Configuration {
     pub fn resolve_registry_storage(&self) -> RegistryStorageConfig {

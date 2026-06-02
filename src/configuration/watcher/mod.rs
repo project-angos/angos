@@ -14,8 +14,7 @@ use notify::{Event, RecursiveMode, Watcher};
 use tokio::{sync::mpsc, time::timeout};
 use tracing::{debug, error, info, warn};
 
-use super::{Configuration, Error, ServerConfig};
-use crate::configuration::listeners::ServerTlsConfig;
+use crate::configuration::{Configuration, Error, ServerConfig, listeners::ServerTlsConfig};
 
 /// Window during which filesystem events are coalesced into a single reload.
 /// Editors typically emit several `Modify`/`Create`/`Remove` events per save

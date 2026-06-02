@@ -6,16 +6,16 @@ use sha2::{Digest as Sha256Digest, Sha256};
 use tempfile::TempDir;
 use uuid::Uuid;
 
-use super::*;
 use crate::{
     configuration::GlobalConfig,
     metrics_provider,
     oci::{Digest, Namespace},
     policy::{AccessMode, AccessPolicyConfig, RetentionPolicy, RetentionPolicyConfig, SystemClock},
     registry::{
+        Registry, RegistryConfig, Repository,
         blob_store::{self, sha256_ext::Sha256Ext},
         metadata_store::{LinkOperation, MetadataStore, link_kind::LinkKind},
-        path_builder,
+        path_builder, repository,
         repository_resolver::RepositoryResolver,
         s3_connection::S3ConnectionConfig,
     },
