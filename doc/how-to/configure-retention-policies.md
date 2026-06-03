@@ -255,7 +255,7 @@ RUST_LOG=info ./angos scrub --retention --dry-run
 ### List Current Manifests
 
 ```bash
-curl http://localhost:8000/v2/_ext/myrepo/myimage/_revisions | jq
+curl http://localhost:8000/_ext/myrepo/myimage/_revisions | jq
 ```
 
 ---

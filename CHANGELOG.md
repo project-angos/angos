@@ -17,6 +17,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 ### Changed
 
 - Blob upload sessions now use a single resumable streaming upload in place of the previous multipart-based protocol, and in-flight sessions do not survive the upgrade (clients retry and `scrub --uploads` reaps the stale staging artifacts).
+- The angos extension API — the `_repositories`, `_namespaces`, `_revisions`, and `_uploads` discovery endpoints, plus the new `_jobs` admin endpoints moved from the `/v2/_ext/...` prefix to the top-level `/_ext/...` prefix, so `/v2` now serves only OCI Distribution Spec routes. This is breaking for clients of the `/v2/_ext/...` endpoints shipped in v1.1.1; update them to the `/_ext/...` paths.
 - The four registry subsystems (metadata, job, upload, and manifest stores) now write atomically through a single transactional-engine design instantiated per subsystem, each with its own lock domain (metadata and job share one instance; the blob store and the in-process job queue each have their own), adding three new top-level prefixes — `.tx-log/`, `.tx-bodies/`, and `.tx-locks/`, that operators should factor into bucket policies. A `_jobs/` prefix is also added when the durable job queue (`[global.job_queue]`) is enabled.
 - Blob deletion follows the OCI distribution lifecycle, with blob ownership tracked independently from manifest references.
 - Manifests with missing blob or descriptor references are rejected at push time.
