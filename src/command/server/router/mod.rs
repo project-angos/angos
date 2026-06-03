@@ -35,9 +35,15 @@ pub fn parse(method: &Method, uri: &Uri) -> Option<Action> {
         _ => {}
     }
 
+    // Angos-specific extension API lives at the top level so `/v2` stays purely
+    // OCI. Unknown `_ext` paths return `None` (404) rather than falling back to
+    // the UI-asset handler below.
+    if let Some(ext_path) = path.strip_prefix("/_ext/") {
+        return try_parse_extension(method, ext_path, params);
+    }
+
     if let Some(api_path) = path.strip_prefix("/v2/") {
-        return try_parse_extension(method, api_path, params)
-            .or_else(|| try_parse_upload(method, api_path, params))
+        return try_parse_upload(method, api_path, params)
             .or_else(|| try_find_blobs(method, api_path))
             .or_else(|| try_find_manifests(method, api_path))
             .or_else(|| try_find_referrers(method, api_path, params))
@@ -98,47 +104,42 @@ fn parse_jobs_pagination(params: Option<&str>) -> (Option<u16>, Option<String>) 
     (query.n, query.after)
 }
 
+/// Parse the angos-specific extension API routes. `path` is relative to the
+/// top-level `/_ext/` prefix (already stripped by the caller).
+///
+/// Routes are grouped by method, then by endpoint. Within `GET`, the bare
+/// listings (`_repositories`, `_jobs`, `_jobs/failed`) are matched before the
+/// namespace-suffixed routes. Job storage keys are a single path segment
+/// (`<hex-millis>-<uuid>`, no `/`), so a segment containing `/` is rejected by
+/// [`is_job_key`].
 fn try_parse_extension(method: &Method, path: &str, params: Option<&str>) -> Option<Action> {
-    let path = path.strip_prefix("_ext/")?;
-
-    // Job-queue administration spans GET (list), POST (retry) and DELETE
-    // (delete), so it is matched before the GET-only registry-extension routes.
-    if let Some(action) = try_parse_jobs(method, path, params) {
-        return Some(action);
-    }
-
-    if *method != Method::GET {
-        return None;
-    }
-
-    if path == "_repositories" {
-        return Some(Action::ListRepositories);
-    }
-
-    if let Some(repository_str) = path.strip_suffix("/_namespaces") {
-        let repository = Namespace::new(repository_str).ok()?;
-        return Some(Action::ListNamespaces { repository });
-    }
-
-    if let Some(namespace_str) = path.strip_suffix("/_revisions") {
-        let namespace = Namespace::new(namespace_str).ok()?;
-        return Some(Action::ListRevisions { namespace });
-    }
-
-    if let Some(namespace_str) = path.strip_suffix("/_uploads") {
-        let namespace = Namespace::new(namespace_str).ok()?;
-        return Some(Action::ListUploads { namespace });
-    }
-
-    None
-}
-
-/// Parse the `_jobs` administration routes (relative to the `_ext/` prefix).
-/// Storage keys are a single path segment (`<hex-millis>-<uuid>`, no `/`), so a
-/// segment containing `/` is rejected. Specific routes are matched before the
-/// bare listing.
-fn try_parse_jobs(method: &Method, path: &str, params: Option<&str>) -> Option<Action> {
     match *method {
+        Method::GET => match path {
+            "_repositories" => Some(Action::ListRepositories),
+            "_jobs" => {
+                let (n, after) = parse_jobs_pagination(params);
+                Some(Action::ListJobs { n, after })
+            }
+            "_jobs/failed" => {
+                let (n, after) = parse_jobs_pagination(params);
+                Some(Action::ListFailedJobs { n, after })
+            }
+            _ => {
+                if let Some(repository_str) = path.strip_suffix("/_namespaces") {
+                    let repository = Namespace::new(repository_str).ok()?;
+                    return Some(Action::ListNamespaces { repository });
+                }
+                if let Some(namespace_str) = path.strip_suffix("/_revisions") {
+                    let namespace = Namespace::new(namespace_str).ok()?;
+                    return Some(Action::ListRevisions { namespace });
+                }
+                if let Some(namespace_str) = path.strip_suffix("/_uploads") {
+                    let namespace = Namespace::new(namespace_str).ok()?;
+                    return Some(Action::ListUploads { namespace });
+                }
+                None
+            }
+        },
         Method::POST => path
             .strip_prefix("_jobs/failed/")
             .and_then(|rest| rest.strip_suffix("/retry"))
@@ -159,17 +160,6 @@ fn try_parse_jobs(method: &Method, path: &str, params: Option<&str>) -> Option<A
                     state: JobState::Pending,
                     storage_key: key.to_string(),
                 })
-        }
-        Method::GET => {
-            if path == "_jobs/failed" {
-                let (n, after) = parse_jobs_pagination(params);
-                return Some(Action::ListFailedJobs { n, after });
-            }
-            if path == "_jobs" {
-                let (n, after) = parse_jobs_pagination(params);
-                return Some(Action::ListJobs { n, after });
-            }
-            None
         }
         _ => None,
     }

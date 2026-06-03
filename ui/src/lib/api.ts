@@ -170,19 +170,19 @@ async function postAction(url: string): Promise<string | null> {
 }
 
 export async function fetchRepositories(): Promise<FetchResult<RepositoriesResponse>> {
-	return fetchJson<RepositoriesResponse>('/v2/_ext/_repositories');
+	return fetchJson<RepositoriesResponse>('/_ext/_repositories');
 }
 
 export async function fetchNamespaces(repository: string): Promise<FetchResult<NamespacesResponse>> {
-	return fetchJson<NamespacesResponse>(`/v2/_ext/${repository}/_namespaces`);
+	return fetchJson<NamespacesResponse>(`/_ext/${repository}/_namespaces`);
 }
 
 export async function fetchRevisions(namespace: string): Promise<FetchResult<RevisionsResponse>> {
-	return fetchJson<RevisionsResponse>(`/v2/_ext/${namespace}/_revisions`);
+	return fetchJson<RevisionsResponse>(`/_ext/${namespace}/_revisions`);
 }
 
 export async function fetchUploads(namespace: string): Promise<FetchResult<UploadsResponse>> {
-	return fetchJson<UploadsResponse>(`/v2/_ext/${namespace}/_uploads`);
+	return fetchJson<UploadsResponse>(`/_ext/${namespace}/_uploads`);
 }
 
 function jobsQuery(n: number, after?: string): string {
@@ -194,19 +194,19 @@ function jobsQuery(n: number, after?: string): string {
 }
 
 export async function fetchJobs(n = 100, after?: string): Promise<FetchResult<JobsResponse>> {
-	return fetchJson<JobsResponse>(`/v2/_ext/_jobs?${jobsQuery(n, after)}`);
+	return fetchJson<JobsResponse>(`/_ext/_jobs?${jobsQuery(n, after)}`);
 }
 
 export async function fetchFailedJobs(n = 100, after?: string): Promise<FetchResult<FailedJobsResponse>> {
-	return fetchJson<FailedJobsResponse>(`/v2/_ext/_jobs/failed?${jobsQuery(n, after)}`);
+	return fetchJson<FailedJobsResponse>(`/_ext/_jobs/failed?${jobsQuery(n, after)}`);
 }
 
 export async function retryJob(storageKey: string): Promise<string | null> {
-	return postAction(`/v2/_ext/_jobs/failed/${storageKey}/retry`);
+	return postAction(`/_ext/_jobs/failed/${storageKey}/retry`);
 }
 
 export async function deleteJob(state: JobState, storageKey: string): Promise<string | null> {
-	return deleteResource(`/v2/_ext/_jobs/${state}/${storageKey}`);
+	return deleteResource(`/_ext/_jobs/${state}/${storageKey}`);
 }
 
 export interface ManifestResult {

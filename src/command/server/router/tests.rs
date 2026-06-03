@@ -810,7 +810,7 @@ fn test_parse_ui_asset_post_not_allowed() {
 #[test]
 fn test_parse_list_revisions() {
     let method = Method::GET;
-    let uri: Uri = "/v2/_ext/myrepo/app/_revisions".parse().unwrap();
+    let uri: Uri = "/_ext/myrepo/app/_revisions".parse().unwrap();
     let route = parse(&method, &uri);
     if let Some(Action::ListRevisions { namespace }) = route {
         assert_eq!(namespace, "myrepo/app");
@@ -822,7 +822,7 @@ fn test_parse_list_revisions() {
 #[test]
 fn test_parse_list_revisions_simple_namespace() {
     let method = Method::GET;
-    let uri: Uri = "/v2/_ext/library/_revisions".parse().unwrap();
+    let uri: Uri = "/_ext/library/_revisions".parse().unwrap();
     let route = parse(&method, &uri);
     if let Some(Action::ListRevisions { namespace }) = route {
         assert_eq!(namespace, "library");
@@ -834,7 +834,7 @@ fn test_parse_list_revisions_simple_namespace() {
 #[test]
 fn test_parse_list_revisions_nested_namespace() {
     let method = Method::GET;
-    let uri: Uri = "/v2/_ext/org/team/project/_revisions".parse().unwrap();
+    let uri: Uri = "/_ext/org/team/project/_revisions".parse().unwrap();
     let route = parse(&method, &uri);
     if let Some(Action::ListRevisions { namespace }) = route {
         assert_eq!(namespace, "org/team/project");
@@ -846,7 +846,7 @@ fn test_parse_list_revisions_nested_namespace() {
 #[test]
 fn test_parse_list_revisions_post_not_allowed() {
     let method = Method::POST;
-    let uri: Uri = "/v2/_ext/myrepo/_revisions".parse().unwrap();
+    let uri: Uri = "/_ext/myrepo/_revisions".parse().unwrap();
     let route = parse(&method, &uri);
     assert!(route.is_none());
 }
@@ -854,7 +854,7 @@ fn test_parse_list_revisions_post_not_allowed() {
 #[test]
 fn test_parse_list_namespaces() {
     let method = Method::GET;
-    let uri: Uri = "/v2/_ext/myrepo/_namespaces".parse().unwrap();
+    let uri: Uri = "/_ext/myrepo/_namespaces".parse().unwrap();
     let route = parse(&method, &uri);
     if let Some(Action::ListNamespaces { repository }) = route {
         assert_eq!(repository, "myrepo");
@@ -866,7 +866,7 @@ fn test_parse_list_namespaces() {
 #[test]
 fn test_parse_list_namespaces_nested() {
     let method = Method::GET;
-    let uri: Uri = "/v2/_ext/org/team/_namespaces".parse().unwrap();
+    let uri: Uri = "/_ext/org/team/_namespaces".parse().unwrap();
     let route = parse(&method, &uri);
     if let Some(Action::ListNamespaces { repository }) = route {
         assert_eq!(repository, "org/team");
@@ -878,7 +878,7 @@ fn test_parse_list_namespaces_nested() {
 #[test]
 fn test_parse_list_namespaces_invalid_repository_returns_none() {
     let method = Method::GET;
-    let uri: Uri = "/v2/_ext/INVALID/_namespaces".parse().unwrap();
+    let uri: Uri = "/_ext/INVALID/_namespaces".parse().unwrap();
     let route = parse(&method, &uri);
     assert!(route.is_none());
 }
@@ -886,7 +886,7 @@ fn test_parse_list_namespaces_invalid_repository_returns_none() {
 #[test]
 fn test_parse_list_namespaces_post_not_allowed() {
     let method = Method::POST;
-    let uri: Uri = "/v2/_ext/myrepo/_namespaces".parse().unwrap();
+    let uri: Uri = "/_ext/myrepo/_namespaces".parse().unwrap();
     let route = parse(&method, &uri);
     assert!(route.is_none());
 }
@@ -895,7 +895,7 @@ fn test_parse_list_namespaces_post_not_allowed() {
 
 #[test]
 fn test_parse_list_jobs() {
-    let route = parse(&Method::GET, &"/v2/_ext/_jobs".parse().unwrap());
+    let route = parse(&Method::GET, &"/_ext/_jobs".parse().unwrap());
     assert!(matches!(
         route,
         Some(Action::ListJobs {
@@ -907,10 +907,7 @@ fn test_parse_list_jobs() {
 
 #[test]
 fn test_parse_list_jobs_with_pagination() {
-    let route = parse(
-        &Method::GET,
-        &"/v2/_ext/_jobs?n=10&after=abc".parse().unwrap(),
-    );
+    let route = parse(&Method::GET, &"/_ext/_jobs?n=10&after=abc".parse().unwrap());
     match route {
         Some(Action::ListJobs { n, after }) => {
             assert_eq!(n, Some(10));
@@ -922,7 +919,7 @@ fn test_parse_list_jobs_with_pagination() {
 
 #[test]
 fn test_parse_list_failed_jobs() {
-    let route = parse(&Method::GET, &"/v2/_ext/_jobs/failed".parse().unwrap());
+    let route = parse(&Method::GET, &"/_ext/_jobs/failed".parse().unwrap());
     assert!(matches!(
         route,
         Some(Action::ListFailedJobs {
@@ -936,7 +933,7 @@ fn test_parse_list_failed_jobs() {
 fn test_parse_retry_job() {
     let route = parse(
         &Method::POST,
-        &"/v2/_ext/_jobs/failed/0000018b-abc/retry".parse().unwrap(),
+        &"/_ext/_jobs/failed/0000018b-abc/retry".parse().unwrap(),
     );
     match route {
         Some(Action::RetryJob { storage_key }) => {
@@ -950,7 +947,7 @@ fn test_parse_retry_job() {
 fn test_parse_delete_failed_job() {
     let route = parse(
         &Method::DELETE,
-        &"/v2/_ext/_jobs/failed/0000018b-abc".parse().unwrap(),
+        &"/_ext/_jobs/failed/0000018b-abc".parse().unwrap(),
     );
     match route {
         Some(Action::DeleteJob { state, storage_key }) => {
@@ -965,7 +962,7 @@ fn test_parse_delete_failed_job() {
 fn test_parse_delete_pending_job() {
     let route = parse(
         &Method::DELETE,
-        &"/v2/_ext/_jobs/pending/0000018b-abc".parse().unwrap(),
+        &"/_ext/_jobs/pending/0000018b-abc".parse().unwrap(),
     );
     match route {
         Some(Action::DeleteJob { state, storage_key }) => {
@@ -978,17 +975,14 @@ fn test_parse_delete_pending_job() {
 
 #[test]
 fn test_parse_jobs_rejects_post_on_listing() {
-    let route = parse(&Method::POST, &"/v2/_ext/_jobs".parse().unwrap());
+    let route = parse(&Method::POST, &"/_ext/_jobs".parse().unwrap());
     assert!(route.is_none());
 }
 
 #[test]
 fn test_parse_jobs_rejects_key_with_slash() {
     // A storage key is a single path segment; a nested path must not match.
-    let route = parse(
-        &Method::DELETE,
-        &"/v2/_ext/_jobs/failed/a/b".parse().unwrap(),
-    );
+    let route = parse(&Method::DELETE, &"/_ext/_jobs/failed/a/b".parse().unwrap());
     assert!(route.is_none());
 }
 
@@ -996,7 +990,7 @@ fn test_parse_jobs_rejects_key_with_slash() {
 fn test_parse_retry_requires_retry_suffix() {
     let route = parse(
         &Method::POST,
-        &"/v2/_ext/_jobs/failed/0000018b-abc".parse().unwrap(),
+        &"/_ext/_jobs/failed/0000018b-abc".parse().unwrap(),
     );
     assert!(route.is_none());
 }
