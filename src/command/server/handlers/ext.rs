@@ -5,6 +5,7 @@ use crate::{
         ServerContext, error::Error, handlers::build_response, response_body::ResponseBody,
     },
     oci::Namespace,
+    registry::job_store::JobState,
 };
 
 pub async fn handle_list_repositories(
@@ -56,4 +57,55 @@ pub async fn handle_list_uploads(
         response.headers,
         ResponseBody::fixed(response.body),
     )
+}
+
+pub async fn handle_list_jobs(
+    context: &ServerContext,
+    n: Option<u16>,
+    after: Option<String>,
+) -> Result<Response<ResponseBody>, Error> {
+    let response = context.registry.get_jobs_info(n, after).await?;
+
+    build_response(
+        StatusCode::OK,
+        response.headers,
+        ResponseBody::fixed(response.body),
+    )
+}
+
+pub async fn handle_list_failed_jobs(
+    context: &ServerContext,
+    n: Option<u16>,
+    after: Option<String>,
+) -> Result<Response<ResponseBody>, Error> {
+    let response = context.registry.get_failed_jobs_info(n, after).await?;
+
+    build_response(
+        StatusCode::OK,
+        response.headers,
+        ResponseBody::fixed(response.body),
+    )
+}
+
+pub async fn handle_retry_job(
+    context: &ServerContext,
+    storage_key: &str,
+) -> Result<Response<ResponseBody>, Error> {
+    context.registry.retry_failed_job(storage_key).await?;
+
+    Ok(Response::builder()
+        .status(StatusCode::NO_CONTENT)
+        .body(ResponseBody::empty())?)
+}
+
+pub async fn handle_delete_job(
+    context: &ServerContext,
+    state: JobState,
+    storage_key: &str,
+) -> Result<Response<ResponseBody>, Error> {
+    context.registry.delete_job(state, storage_key).await?;
+
+    Ok(Response::builder()
+        .status(StatusCode::NO_CONTENT)
+        .body(ResponseBody::empty())?)
 }

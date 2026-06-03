@@ -178,6 +178,39 @@ rules = [
 
 ---
 
+## Job Queue Administration
+
+The durable cache-fill job queue is exposed through four extension actions:
+`list-jobs` and `list-failed-jobs` (read the pending and dead-letter
+partitions) and `retry-job` and `delete-job` (mutate them). These are **not**
+covered by the generic `list-*` browsing rule above — they are deliberately
+separate action names so you can gate job administration behind higher
+privilege than ordinary catalogue browsing.
+
+Grant them only to operators:
+
+```toml
+[global.access_policy]
+default = "deny"
+rules = [
+  # Anyone authenticated may browse the catalogue and uploads…
+  "identity.username != null && request.action in ['list-repositories', 'list-namespaces', 'list-tags', 'list-uploads']",
+
+  # …but only admins may inspect or mutate the durable job queue.
+  "identity.username == 'admin' && request.action in ['list-jobs', 'list-failed-jobs', 'retry-job', 'delete-job']",
+
+  # Normal pull traffic.
+  "identity.username != null && request.action in ['get-manifest', 'get-blob']",
+]
+```
+
+With `default = "deny"`, the job actions are denied for every caller that does
+not match the admin rule — including unauthenticated requests and the Web UI's
+own browsing identity. The UI's **Jobs** page only renders successfully for
+identities the policy admits.
+
+---
+
 ## Mixed Authentication
 
 Combine different authentication methods:
@@ -309,6 +342,10 @@ RUST_LOG=angos::registry::access_policy=debug \
 | `list-namespaces`   | Extension: list namespaces in a repo |
 | `list-revisions`    | Extension: list manifest revisions   |
 | `list-uploads`      | Extension: list uploads in progress  |
+| `list-jobs`         | Extension: list pending/in-flight jobs |
+| `list-failed-jobs`  | Extension: list dead-letter jobs     |
+| `retry-job`         | Extension: requeue a dead-letter job |
+| `delete-job`        | Extension: delete a pending/failed job |
 | `ui-asset`          | UI static assets                     |
 | `ui-config`         | UI configuration                     |
 

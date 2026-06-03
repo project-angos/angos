@@ -274,6 +274,28 @@ Do not use `request.action.startsWith('get-')` for anonymous access. This includ
 `get-api-version`, which causes Docker to skip sending credentials on all requests.
 :::
 
+### Privileged Job Administration
+
+The durable job-queue actions — `list-jobs`, `list-failed-jobs`, `retry-job`
+and `delete-job` — carry their own action names precisely so they can be gated
+above ordinary read traffic. They are intentionally excluded from broad
+`list-*` allow rules; grant them to operators explicitly:
+
+```toml
+rules = [
+  # Browsing is fine for any authenticated user…
+  "identity.username != null && request.action in ['list-tags', 'list-repositories']",
+
+  # …job inspection and mutation is admin-only.
+  "identity.username == 'admin' && request.action in ['list-jobs', 'list-failed-jobs', 'retry-job', 'delete-job']",
+]
+```
+
+Because the queue holds cache-fill work items and the mutations requeue or
+delete them, treat these actions as a privileged surface: under a fail-closed
+`default = "deny"` policy they are denied to anyone the admin rule does not
+match.
+
 ---
 
 ## Webhook Integration

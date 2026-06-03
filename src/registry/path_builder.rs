@@ -131,6 +131,10 @@ pub fn job_pending_path(queue: &str, id: &str) -> String {
     format!("{JOBS_ROOT}/pending/{queue}/{id}.json")
 }
 
+pub fn job_failed_dir(queue: &str) -> String {
+    format!("{JOBS_ROOT}/failed/{queue}")
+}
+
 pub fn job_failed_path(queue: &str, id: &str) -> String {
     format!("{JOBS_ROOT}/failed/{queue}/{id}.json")
 }

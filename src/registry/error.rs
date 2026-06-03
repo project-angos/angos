@@ -5,7 +5,7 @@ use angos_tx_engine::lock;
 
 use crate::{
     configuration, oci, policy,
-    registry::{blob_store, cache, metadata_store},
+    registry::{blob_store, cache, job_store, metadata_store},
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -41,6 +41,10 @@ pub enum Error {
     Unsupported,
     #[error("range not satisfiable")]
     RangeNotSatisfiable,
+    #[error("resource not found")]
+    NotFound,
+    #[error("{0}")]
+    Conflict(String),
     #[error("internal server error: {0}")]
     Internal(String),
 
@@ -82,6 +86,17 @@ impl From<lock::Error> for Error {
 impl From<policy::Error> for Error {
     fn from(error: policy::Error) -> Self {
         Error::Initialization(error.to_string())
+    }
+}
+
+// `job_store::Error` routes by variant: a missing record is a `404`, every
+// other failure (storage, initialisation) is an opaque `500`.
+impl From<job_store::Error> for Error {
+    fn from(error: job_store::Error) -> Self {
+        match error {
+            job_store::Error::NotFound => Error::NotFound,
+            other => Error::Internal(other.to_string()),
+        }
     }
 }
 

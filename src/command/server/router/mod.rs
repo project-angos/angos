@@ -7,6 +7,7 @@ use uuid::Uuid;
 use crate::{
     identity::Action,
     oci::{Digest, Namespace, Reference},
+    registry::job_store::JobState,
 };
 
 fn parse_query<T: DeserializeOwned + Default>(params: &str) -> T {
@@ -35,7 +36,7 @@ pub fn parse(method: &Method, uri: &Uri) -> Option<Action> {
     }
 
     if let Some(api_path) = path.strip_prefix("/v2/") {
-        return try_parse_extension(method, api_path)
+        return try_parse_extension(method, api_path, params)
             .or_else(|| try_parse_upload(method, api_path, params))
             .or_else(|| try_find_blobs(method, api_path))
             .or_else(|| try_find_manifests(method, api_path))
@@ -86,12 +87,29 @@ fn parse_pagination(params: Option<&str>) -> (Option<u16>, Option<String>) {
     (query.n, query.last)
 }
 
-fn try_parse_extension(method: &Method, path: &str) -> Option<Action> {
+#[derive(Deserialize, Default)]
+struct JobsPaginationQuery {
+    n: Option<u16>,
+    after: Option<String>,
+}
+
+fn parse_jobs_pagination(params: Option<&str>) -> (Option<u16>, Option<String>) {
+    let query: JobsPaginationQuery = params.map(parse_query).unwrap_or_default();
+    (query.n, query.after)
+}
+
+fn try_parse_extension(method: &Method, path: &str, params: Option<&str>) -> Option<Action> {
+    let path = path.strip_prefix("_ext/")?;
+
+    // Job-queue administration spans GET (list), POST (retry) and DELETE
+    // (delete), so it is matched before the GET-only registry-extension routes.
+    if let Some(action) = try_parse_jobs(method, path, params) {
+        return Some(action);
+    }
+
     if *method != Method::GET {
         return None;
     }
-
-    let path = path.strip_prefix("_ext/")?;
 
     if path == "_repositories" {
         return Some(Action::ListRepositories);
@@ -113,6 +131,53 @@ fn try_parse_extension(method: &Method, path: &str) -> Option<Action> {
     }
 
     None
+}
+
+/// Parse the `_jobs` administration routes (relative to the `_ext/` prefix).
+/// Storage keys are a single path segment (`<hex-millis>-<uuid>`, no `/`), so a
+/// segment containing `/` is rejected. Specific routes are matched before the
+/// bare listing.
+fn try_parse_jobs(method: &Method, path: &str, params: Option<&str>) -> Option<Action> {
+    match *method {
+        Method::POST => path
+            .strip_prefix("_jobs/failed/")
+            .and_then(|rest| rest.strip_suffix("/retry"))
+            .filter(|key| is_job_key(key))
+            .map(|key| Action::RetryJob {
+                storage_key: key.to_string(),
+            }),
+        Method::DELETE => {
+            if let Some(key) = path.strip_prefix("_jobs/failed/").filter(|k| is_job_key(k)) {
+                return Some(Action::DeleteJob {
+                    state: JobState::Failed,
+                    storage_key: key.to_string(),
+                });
+            }
+            path.strip_prefix("_jobs/pending/")
+                .filter(|k| is_job_key(k))
+                .map(|key| Action::DeleteJob {
+                    state: JobState::Pending,
+                    storage_key: key.to_string(),
+                })
+        }
+        Method::GET => {
+            if path == "_jobs/failed" {
+                let (n, after) = parse_jobs_pagination(params);
+                return Some(Action::ListFailedJobs { n, after });
+            }
+            if path == "_jobs" {
+                let (n, after) = parse_jobs_pagination(params);
+                return Some(Action::ListJobs { n, after });
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+/// A job storage key is a single non-empty path segment.
+fn is_job_key(key: &str) -> bool {
+    !key.is_empty() && !key.contains('/')
 }
 
 fn try_parse_upload(method: &Method, path: &str, params: Option<&str>) -> Option<Action> {

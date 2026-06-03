@@ -28,6 +28,7 @@
 			</a>
 			<nav>
 				<a href="{base}/">Repositories</a>
+				<a href="{base}/jobs">Jobs</a>
 			</nav>
 		</div>
 		<ThemeSwitcher />

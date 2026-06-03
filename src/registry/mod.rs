@@ -62,12 +62,7 @@ use crate::{
         repository_resolver::RepositoryResolver,
     },
 };
-use angos_storage::{MemoryObjectStore, ObjectStore};
-use angos_tx_engine::{
-    executor::build_executor,
-    lock::{LockSession, LockStrategy},
-    store::Store,
-};
+use angos_tx_engine::lock::LockSession;
 
 #[allow(clippy::struct_excessive_bools)]
 pub struct RegistryConfig {
@@ -181,7 +176,7 @@ impl Registry {
                 &blob_store,
                 &metadata_store,
                 config.max_concurrent_cache_jobs,
-            )?
+            )
         };
 
         Ok(Self {
@@ -247,40 +242,28 @@ impl Registry {
 
 /// Construct the in-process job queue used when `[global.job_queue]` is absent.
 ///
-/// Builds an engine-backed [`JobStore`] over a [`MemoryObjectStore`] with a
-/// memory-backed lock and spawns a pool of `concurrency` claim-loop tasks.
-/// Jobs survive as long as the process is alive; they are not durable across
-/// restarts.
-///
-/// # Errors
-///
-/// Returns [`Error::Internal`] when the executor cannot be built (should never
-/// happen with `LockStrategy::Memory`).
+/// Builds a [`JobStore`] over the registry's **shared** object store and
+/// executor (via `blob_store.store`) and spawns a pool of `concurrency`
+/// claim-loop tasks that drain it in-process. Sharing the backend is required
+/// for correctness: cache-fill jobs commit a transaction that moves staged
+/// upload bytes into blob-data and grants metadata references, which only
+/// resolves against the store where those bytes live. Jobs are therefore
+/// persisted under the shared store's `_jobs/` prefix (and are picked back up
+/// by the claim loops after a restart) rather than discarded.
 fn build_in_process_queue(
     resolver: &Arc<RepositoryResolver>,
     blob_store: &Arc<BlobStore>,
     metadata_store: &Arc<MetadataStore>,
     concurrency: NonZeroUsize,
-) -> Result<Arc<JobStore>, Error> {
-    let object_store: Arc<dyn ObjectStore> = Arc::new(MemoryObjectStore::new());
-
-    let executor = build_executor(
-        object_store.clone(),
-        None,
-        LockStrategy::Memory,
-        None,
-        false,
-        false,
-    )
-    .map_err(|e| Error::Internal(format!("failed to build in-process job executor: {e}")))?;
-
-    let store = Arc::new(
-        Store::builder()
-            .object(object_store)
-            .executor(executor)
-            .build()
-            .map_err(|e| Error::Internal(format!("failed to build in-process job store: {e}")))?,
-    );
+) -> Arc<JobStore> {
+    // Share the registry's object store and transaction executor (the same
+    // handle the blob/metadata stores use). The cache-fill handler stages bytes
+    // into the blob store and returns a transaction that moves them into
+    // blob-data and grants metadata references; that transaction must commit
+    // against the backend where the bytes were staged. A private object store
+    // here would make those mutations fail with `NotFound`
+    // (see doc/reviews/20260603-in-process-cache-fill-broken.md).
+    let store = Arc::clone(&blob_store.store);
     let job_store: Arc<JobStore> = Arc::new(JobStore::new(store, "in-process"));
 
     let handler: Arc<dyn JobHandler> = Arc::new(CacheJobHandler::new(
@@ -293,7 +276,7 @@ fn build_in_process_queue(
         tokio::spawn(in_process_claim_loop(job_store.clone(), handler.clone()));
     }
 
-    Ok(job_store)
+    job_store
 }
 
 /// Single claim-loop task for the in-process pool. Mirrors the per-worker

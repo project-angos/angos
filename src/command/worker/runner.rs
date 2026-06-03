@@ -3,7 +3,7 @@ use tracing::{error, info, warn};
 
 #[cfg(test)]
 use crate::registry::job_store::Error;
-use crate::registry::job_store::{ClaimedJob, FailOutcome, JobHandler, JobStore};
+use crate::registry::job_store::{ClaimedJob, CompleteOutcome, FailOutcome, JobHandler, JobStore};
 
 /// Execute one claimed job: observe the lock session's cancellation
 /// token alongside the handler future, then complete, fail (with retry
@@ -23,8 +23,14 @@ pub async fn execute_one(consumer: &JobStore, handler: &dyn JobHandler, claimed:
     match handler_result {
         None => warn!(lock_key, "Lock lost during execution; aborting"),
         Some(Ok(tx)) => match consumer.complete(claimed, tx).await {
-            Ok(()) => info!(lock_key, "Job completed successfully"),
-            Err(e) => error!(lock_key, error = %e, "Failed to complete job"),
+            Ok(CompleteOutcome::Completed) => info!(lock_key, "Job completed successfully"),
+            Ok(CompleteOutcome::FailedOver(FailOutcome::Retried { next_at })) => {
+                warn!(lock_key, %next_at, "Commit failed; job scheduled for retry");
+            }
+            Ok(CompleteOutcome::FailedOver(FailOutcome::MovedToDeadLetter)) => {
+                warn!(lock_key, "Commit failed; job moved to dead-letter");
+            }
+            Err(e) => error!(lock_key, error = %e, "Failed to complete or fail job"),
         },
         Some(Err(err)) => {
             warn!(lock_key, error = %err, "Job handler returned error");
