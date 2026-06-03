@@ -2,7 +2,6 @@ pub mod link_plan;
 mod parse;
 mod response;
 
-use futures_util::StreamExt;
 pub use parse::parse_manifest_digests;
 use parse::{manifest_meta_from_body, parse_and_validate_manifest};
 pub use response::{
@@ -19,49 +18,11 @@ use crate::{
     event_webhook::event::{Event, EventActor, EventKind},
     oci::{Digest, Manifest, Namespace, Reference},
     registry::{
-        DOCKER_CONTENT_DIGEST, Error, Registry, Repository,
-        blob_ownership::BlobOwnership,
-        blob_store::Error as BlobStoreError,
-        metadata_store::{MetadataStore, link_kind::LinkKind},
-        pagination::collect_all_pages,
+        DOCKER_CONTENT_DIGEST, Error, Registry, Repository, blob_ownership::BlobOwnership,
+        blob_store::Error as BlobStoreError, metadata_store::link_kind::LinkKind,
     },
     util::sha256,
 };
-
-/// Returns the `LinkKind::Tag` entries in `namespace` that currently point at
-/// `digest`. Uses only the metadata store — no blob reads.
-pub async fn find_tags_pointing_at(
-    metadata_store: &(dyn MetadataStore + Send + Sync),
-    namespace: &str,
-    digest: &Digest,
-) -> Result<Vec<LinkKind>, Error> {
-    let all_tags = collect_all_pages(|marker| async move {
-        metadata_store.list_tags(namespace, 100, marker).await
-    })
-    .await?;
-
-    let matching = futures_util::stream::iter(all_tags)
-        .map(|tag| async move {
-            let result = metadata_store
-                .read_link(namespace, &LinkKind::Tag(tag.clone()), false)
-                .await;
-            (tag, result)
-        })
-        .buffer_unordered(20)
-        .filter_map(|(tag, result)| async move {
-            if let Ok(metadata) = result
-                && &metadata.target == digest
-            {
-                Some(LinkKind::Tag(tag))
-            } else {
-                None
-            }
-        })
-        .collect::<Vec<_>>()
-        .await;
-
-    Ok(matching)
-}
 
 pub const DEFAULT_MAX_MANIFEST_SIZE_BYTES: usize = 5 * 1024 * 1024;
 
@@ -330,27 +291,26 @@ impl Registry {
                 .await?;
         }
 
-        let digest = self.blob_store.create(body).await?;
-
         let effective_media_type = content_type
             .cloned()
             .or_else(|| manifest.media_type.clone());
 
         let ops = link_plan::push(
             &mut manifest,
-            &digest,
+            &computed_digest,
             reference,
             effective_media_type.as_deref(),
             body.len() as u64,
         );
+
         self.metadata_store
-            .update_links(namespace.as_ref(), &ops)
+            .store_manifest(namespace.as_ref(), &computed_digest, body, &ops)
             .await?;
 
         let subject = manifest.subject.map(|s| s.digest);
 
         Ok(PutManifestResponse {
-            headers: put_manifest_headers(namespace, reference, &digest, subject.as_ref()),
+            headers: put_manifest_headers(namespace, reference, &computed_digest, subject.as_ref()),
             events: Vec::new(),
         })
     }
@@ -407,9 +367,10 @@ impl Registry {
         reference: &Reference,
     ) -> Result<DeleteManifestResponse, Error> {
         let ops = if let Reference::Digest(digest) = reference {
-            let tags =
-                find_tags_pointing_at(self.metadata_store.as_ref(), namespace.as_ref(), digest)
-                    .await?;
+            let tags = self
+                .metadata_store
+                .find_tags_pointing_at(namespace.as_ref(), digest)
+                .await?;
             let manifest = self
                 .blob_store
                 .read(digest)
@@ -421,12 +382,14 @@ impl Registry {
             link_plan::delete(reference, None, &[])
         };
 
-        self.metadata_store
-            .update_links(namespace.as_ref(), &ops)
-            .await?;
-
         if let Reference::Digest(digest) = reference {
-            self.delete_blob_data_if_unreferenced(digest).await?;
+            self.metadata_store
+                .delete_manifest(namespace.as_ref(), digest, &ops)
+                .await?;
+        } else {
+            self.metadata_store
+                .update_links(namespace.as_ref(), &ops)
+                .await?;
         }
 
         let repository = self.repository_name_for(namespace);
@@ -476,9 +439,9 @@ impl Registry {
             .await
             .ok()?;
         let media_type = link.media_type?;
-        let presigned = self.presigned_blob_store.as_ref()?;
-        let presigned_url = presigned
-            .url(&link.target, Some(media_type.as_str()))
+        let presigned_url = self
+            .blob_store
+            .presigned_url(&link.target, Some(media_type.as_str()))
             .await
             .ok()??;
 
@@ -528,9 +491,9 @@ impl Registry {
         // lacks media_type), fall back to redirecting after reading the full blob.
         // Remove this block once all links have been re-pushed.
         if self.enable_manifest_redirect
-            && let Some(presigned) = &self.presigned_blob_store
-            && let Ok(Some(presigned_url)) = presigned
-                .url(&manifest.digest, manifest.media_type.as_deref())
+            && let Ok(Some(presigned_url)) = self
+                .blob_store
+                .presigned_url(&manifest.digest, manifest.media_type.as_deref())
                 .await
         {
             return Ok(GetManifestResponse::Redirect {

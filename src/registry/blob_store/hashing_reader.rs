@@ -4,10 +4,23 @@ use std::{
     task::{Context, Poll},
 };
 
+use bytes::{Bytes, BytesMut};
+use futures_util::stream;
 use sha2::{Digest, Sha256};
-use tokio::io::{AsyncRead, ReadBuf};
+use tokio::{
+    io::{AsyncRead, AsyncReadExt, ReadBuf},
+    sync::mpsc,
+    task::JoinHandle,
+};
 
-use crate::{oci, registry::blob_store::sha256_ext::Sha256Ext};
+use angos_tx_engine::ByteStream;
+
+use crate::{
+    oci,
+    registry::blob_store::{Error, sha256_ext::Sha256Ext},
+};
+
+const READ_FRAME_SIZE: usize = 1024 * 1024;
 
 pub struct HashingReader<R> {
     inner: R,
@@ -43,6 +56,82 @@ impl<R: AsyncRead + Unpin> AsyncRead for HashingReader<R> {
         }
         poll
     }
+}
+
+/// Final hash state surfaced once the hashing reader has been fully drained.
+pub struct FinalHashState {
+    pub digest: oci::Digest,
+    pub serialized: Vec<u8>,
+}
+
+/// Drive a [`HashingReader`] in a background task, surfacing its bytes as a
+/// [`ByteStream`] for the storage backend to consume and resolving to the
+/// final hasher state via the returned join handle once exactly
+/// `content_length` bytes have been read.
+///
+/// Bytes are framed in 1 MiB chunks shipped over an mpsc channel; the body
+/// never sits whole in memory regardless of `content_length`.
+pub fn hashing_stream<R>(
+    reader: HashingReader<R>,
+    content_length: u64,
+) -> (ByteStream, JoinHandle<Result<FinalHashState, Error>>)
+where
+    R: AsyncRead + Unpin + Send + 'static,
+{
+    let (tx, rx) = mpsc::channel::<Result<Bytes, io::Error>>(8);
+    let handle = tokio::spawn(async move {
+        let mut reader = reader;
+        let mut sent: u64 = 0;
+        let mut buf = BytesMut::with_capacity(READ_FRAME_SIZE);
+        while sent < content_length {
+            let want = (content_length - sent).min(READ_FRAME_SIZE as u64);
+            buf.clear();
+            let n = {
+                let mut limited = (&mut reader).take(want);
+                limited.read_buf(&mut buf).await
+            };
+            match n {
+                Ok(0) => {
+                    let _ = tx
+                        .send(Err(io::Error::new(
+                            io::ErrorKind::UnexpectedEof,
+                            format!(
+                                "short upload body: expected {content_length} bytes, got {sent}"
+                            ),
+                        )))
+                        .await;
+                    return Err(Error::UploadBodySize {
+                        expected: content_length,
+                        actual: sent,
+                    });
+                }
+                Ok(n) => {
+                    sent = sent
+                        .checked_add(
+                            u64::try_from(n).map_err(|e| Error::InvalidFormat(e.to_string()))?,
+                        )
+                        .ok_or_else(|| Error::StorageBackend("size overflow".into()))?;
+                    if tx.send(Ok(buf.split().freeze())).await.is_err() {
+                        break;
+                    }
+                }
+                Err(e) => {
+                    let _ = tx.send(Err(io::Error::other(e.to_string()))).await;
+                    return Err(Error::UploadBodyRead(e.to_string()));
+                }
+            }
+        }
+        drop(tx);
+        Ok(FinalHashState {
+            digest: reader.digest(),
+            serialized: reader.serialized_state(),
+        })
+    });
+
+    let body: ByteStream = Box::pin(stream::unfold(rx, |mut rx| async move {
+        rx.recv().await.map(|item| (item, rx))
+    }));
+    (body, handle)
 }
 
 #[cfg(test)]

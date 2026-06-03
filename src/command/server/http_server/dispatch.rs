@@ -3,9 +3,17 @@ use std::{net::SocketAddr, sync::Arc};
 use hyper::{Method, Request, Response, body::Incoming, http::request::Parts};
 use tracing::instrument;
 
-use super::observability::{handle_healthz, handle_metrics, handle_readyz, handle_ui_config};
 use crate::{
-    command::server::{ServerContext, error::Error, handlers, response_body::ResponseBody, ui},
+    command::server::{
+        ServerContext,
+        error::Error,
+        handlers,
+        http_server::observability::{
+            handle_healthz, handle_metrics, handle_readyz, handle_ui_config,
+        },
+        response_body::ResponseBody,
+        ui,
+    },
     identity::{Action, ClientIdentity},
 };
 

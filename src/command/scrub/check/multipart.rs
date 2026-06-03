@@ -6,9 +6,20 @@ use tracing::info;
 
 use crate::{
     command::scrub::{action::Action, check::StoreChecker, error::Error, executor::ActionSink},
-    registry::blob_store::{self, MultipartCleanup},
+    registry::blob_store::MultipartCleanup,
 };
 
+/// Store-wide, backend-level sweep that lists raw orphan S3 multipart uploads —
+/// in-flight uploads older than `timeout` whose upload session is no longer
+/// live (the `startedat` marker is gone) — and aborts them via the keyed
+/// `abort_upload`.
+///
+/// This is complementary to the `UploadChecker` (`scrub --uploads`), which
+/// reaps live upload-session containers (those that still have a `startedat`
+/// marker) and aborts their backend state. Because `UploadChecker` can only act
+/// on uploads that still have a session marker, this checker is what catches
+/// multipart uploads left behind with no marker (e.g. a crash between opening
+/// the multipart and writing the marker, or pre-existing orphans).
 pub struct MultipartChecker {
     cleanup: Arc<dyn MultipartCleanup + Send + Sync>,
     timeout: Duration,
@@ -27,7 +38,7 @@ impl StoreChecker for MultipartChecker {
             .cleanup
             .list_orphan_multipart_uploads(self.timeout)
             .await
-            .map_err(|e: blob_store::Error| Error::from(e))?;
+            .map_err(Error::from)?;
         let count = orphans.len();
         for orphan in &orphans {
             sink.apply(Action::AbortMultipartUpload {
@@ -36,15 +47,11 @@ impl StoreChecker for MultipartChecker {
             })
             .await?;
         }
-        info!("Cleaned up {count} orphan multipart upload(s)");
+        info!("Found {count} orphan multipart upload(s)");
         Ok(())
     }
 }
 
-// Full integration coverage for `MultipartCleanup` (orphan abort, listing)
-// lives in `src/registry/blob_store/s3/tests.rs` where a real MinIO
-// bucket is available.  The tests below cover the pure `MultipartChecker`
-// layer: construction and delegation.
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
@@ -52,10 +59,7 @@ mod tests {
     use async_trait::async_trait;
 
     use super::*;
-    use crate::{
-        command::scrub::{action::Action, executor::Executor},
-        registry::{blob_store::OrphanMultipartUpload, test_utils::backends},
-    };
+    use crate::registry::blob_store::{self, OrphanMultipartUpload};
 
     struct SpyCleanup {
         list_called_timeout_secs: AtomicI64,
@@ -123,31 +127,6 @@ mod tests {
             sink.iter()
                 .all(|a| matches!(a, Action::AbortMultipartUpload { .. }))
         );
-    }
-
-    #[tokio::test]
-    async fn check_all_aborts_orphans_when_executor_used() {
-        let spy = SpyCleanup::new(vec!["ns/_uploads/uuid1/data", "ns/_uploads/uuid2/data"]);
-        let checker = MultipartChecker::new(spy.clone(), Duration::hours(2));
-
-        // Use the first available test backend just for stores; only
-        // multipart_cleanup is exercised in this test.
-        let test_case = backends().into_iter().next().unwrap();
-        let mut executor = Executor::new(
-            test_case.blob_store(),
-            test_case.metadata_store(),
-            test_case.upload_store(),
-            spy.clone(),
-        );
-
-        checker.check_all(&mut executor).await.unwrap();
-
-        assert_eq!(
-            spy.abort_call_count.load(Ordering::SeqCst),
-            2,
-            "abort must be called once per orphan"
-        );
-        test_case.cleanup().await;
     }
 
     #[tokio::test]

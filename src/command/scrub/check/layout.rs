@@ -11,7 +11,7 @@ use crate::{
         error::Error,
         executor::ActionSink,
     },
-    registry::blob_store::BlobStore,
+    registry::blob_store,
 };
 
 /// Migrates metadata layout documents that scrub can discover safely.
@@ -20,11 +20,11 @@ use crate::{
 /// only enumerates registry-wide subjects and emits ordinary scrub actions so
 /// dry-run and real runs keep the same control flow as consistency repairs.
 pub struct LayoutChecker {
-    blob_store: Arc<dyn BlobStore + Send + Sync>,
+    blob_store: Arc<blob_store::BlobStore>,
 }
 
 impl LayoutChecker {
-    pub fn new(blob_store: Arc<dyn BlobStore + Send + Sync>) -> Self {
+    pub fn new(blob_store: Arc<blob_store::BlobStore>) -> Self {
         Self { blob_store }
     }
 }
@@ -51,20 +51,22 @@ impl StoreChecker for LayoutChecker {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::registry::blob_store::{self, BlobStore};
+    use crate::registry::{blob_store, test_utils::put_blob_direct};
     use tempfile::TempDir;
 
     #[tokio::test]
     async fn layout_checker_emits_namespace_and_blob_migration_actions() {
         let temp_dir = TempDir::new().unwrap();
+        let root_dir = temp_dir.path().to_string_lossy().into_owned();
         let blob_store = Arc::new(
-            blob_store::fs::Backend::new(&crate::registry::blob_store::fs::BackendConfig {
-                root_dir: temp_dir.path().to_string_lossy().into_owned(),
+            blob_store::BlobStoreConfig::FS(blob_store::FsBackendConfig {
+                root_dir,
                 sync_to_disk: false,
             })
+            .build_backend()
             .unwrap(),
         );
-        let digest = blob_store.create(b"layout migration").await.unwrap();
+        let digest = put_blob_direct(blob_store.store.as_ref(), b"layout migration").await;
 
         let checker = LayoutChecker::new(blob_store);
         let mut actions = Vec::new();

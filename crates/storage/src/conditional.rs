@@ -1,5 +1,6 @@
 use async_trait::async_trait;
 use bytes::Bytes;
+use chrono::{DateTime, Utc};
 
 use crate::{error::Error, object::ObjectStore, types::Etag};
 
@@ -19,6 +20,23 @@ pub trait ConditionalStore: ObjectStore {
     /// Read the object body together with its `ETag`. The `ETag` is `None`
     /// when the backend does not surface one for this object.
     async fn get_with_etag(&self, key: &str) -> Result<(Vec<u8>, Option<Etag>), Error>;
+
+    /// Read the object body together with its `ETag` and the server-assigned
+    /// `last_modified` timestamp in a single round trip.
+    ///
+    /// This is the read the lock primitive needs: it must obtain body, etag,
+    /// and the server timestamp from one request (a follow-up `head` would be a
+    /// second round trip and open a TOCTOU window). The default implementation
+    /// delegates to [`get_with_etag`](Self::get_with_etag) and reports `None`
+    /// for `last_modified`; backends that surface a server timestamp (the S3
+    /// backend) override it to return the real value.
+    async fn get_with_metadata(
+        &self,
+        key: &str,
+    ) -> Result<(Vec<u8>, Option<Etag>, Option<DateTime<Utc>>), Error> {
+        let (body, etag) = self.get_with_etag(key).await?;
+        Ok((body, etag, None))
+    }
 
     /// Atomic create-if-absent. Returns the new `ETag` on success (when the
     /// backend surfaces one) or [`Error::PreconditionFailed`] if `key`

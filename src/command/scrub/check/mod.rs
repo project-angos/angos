@@ -40,7 +40,7 @@ pub trait NamespaceChecker: Send + Sync {
 /// A checker that operates across the entire store (not namespace-scoped).
 ///
 /// `BlobChecker` and `MultipartChecker` implement this trait because their
-/// work spans all blobs or all multipart uploads, not a single namespace.
+/// work spans the whole store, not a single namespace.
 #[async_trait]
 pub trait StoreChecker: Send + Sync {
     async fn check_all(&self, sink: &mut (dyn ActionSink + Send)) -> Result<(), Error>;

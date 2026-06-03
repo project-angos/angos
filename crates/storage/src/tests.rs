@@ -1,403 +1,24 @@
 //! Integration tests for the storage trait surface.
 //!
-//! Exercises every trait via a minimal in-memory mock backend. The tests
-//! double as a worked example of what a real backend impl looks like and
-//! verify that the traits are object-safe (`Arc<dyn ObjectStore>`) and that
-//! the supertrait bounds compose (`ConditionalStore: ObjectStore`).
+//! Exercises every trait via the in-memory backend so the tests double as a
+//! worked example of what a real backend impl looks like, and verify that
+//! the traits are object-safe (`Arc<dyn ObjectStore>`) and that the
+//! `ConditionalStore: ObjectStore` supertrait bound composes. The
+//! upload-session methods live on `ObjectStore`.
 
-use std::{
-    collections::HashMap,
-    io::Cursor,
-    sync::{Arc, Mutex},
-    time::Duration,
-};
+use std::{sync::Arc, time::Duration};
 
-use async_trait::async_trait;
 use bytes::Bytes;
-use chrono::{DateTime, Utc};
-use futures_util::StreamExt;
-use tokio::sync::mpsc;
+use futures_util::stream;
 
-use crate::{
-    BoxedReader, ByteStream, ChildrenPage, ConditionalStore, Error, Etag, MultipartPage,
-    MultipartStore, MultipartUpload, ObjectMeta, ObjectStore, Page, Part, PresignedStore, UploadId,
-    channel_stream,
-};
+use crate::{ConditionalStore, Error, Etag, MemoryObjectStore, ObjectStore, PresignedStore};
 
-/// State for a single in-progress multipart upload in the mock.
-#[derive(Default)]
-struct MultipartSession {
-    parts: HashMap<u32, Bytes>,
-    initiated_at: DateTime<Utc>,
-}
+// Memory backend doesn't presign — provide a trivial stub for the test that
+// needs to assert object safety of `PresignedStore`.
+struct PresignStub;
 
-#[derive(Default)]
-struct MockState {
-    objects: HashMap<String, (Bytes, Etag)>,
-    next_etag: u64,
-    multipart: HashMap<(String, UploadId), MultipartSession>,
-    next_upload: u64,
-}
-
-impl MockState {
-    fn new_etag(&mut self) -> Etag {
-        self.next_etag += 1;
-        Etag::new(format!("\"etag-{}\"", self.next_etag))
-    }
-
-    fn new_upload_id(&mut self) -> UploadId {
-        self.next_upload += 1;
-        UploadId::new(format!("upload-{}", self.next_upload))
-    }
-}
-
-struct MockBackend {
-    state: Mutex<MockState>,
-    /// When `Some(n)`, `list_multipart_uploads` returns at most `n` uploads
-    /// per page and emits a `next_key_marker` so callers must paginate.
-    multipart_page_size: Option<usize>,
-}
-
-impl Default for MockBackend {
-    fn default() -> Self {
-        Self {
-            state: Mutex::new(MockState::default()),
-            multipart_page_size: None,
-        }
-    }
-}
-
-impl MockBackend {
-    /// Create a backend that returns at most `page_size` uploads per
-    /// `list_multipart_uploads` call, forcing callers to page through results.
-    fn with_multipart_page_size(page_size: usize) -> Self {
-        Self {
-            state: Mutex::new(MockState::default()),
-            multipart_page_size: Some(page_size),
-        }
-    }
-}
-
-#[async_trait]
-impl ObjectStore for MockBackend {
-    async fn get(&self, key: &str) -> Result<Vec<u8>, Error> {
-        let state = self.state.lock().unwrap();
-        state
-            .objects
-            .get(key)
-            .map(|(data, _)| data.to_vec())
-            .ok_or(Error::NotFound)
-    }
-
-    async fn get_stream(
-        &self,
-        key: &str,
-        offset: Option<u64>,
-    ) -> Result<(BoxedReader, u64), Error> {
-        let data = self.get(key).await?;
-        let total = data.len() as u64;
-        let start =
-            usize::try_from(offset.unwrap_or(0)).map_err(|e| Error::Backend(e.to_string()))?;
-        let body: BoxedReader = Box::new(Cursor::new(data[start.min(data.len())..].to_vec()));
-        Ok((body, total))
-    }
-
-    async fn put(&self, key: &str, data: Bytes) -> Result<(), Error> {
-        let mut state = self.state.lock().unwrap();
-        let etag = state.new_etag();
-        state.objects.insert(key.to_string(), (data, etag));
-        Ok(())
-    }
-
-    async fn delete(&self, key: &str) -> Result<(), Error> {
-        self.state.lock().unwrap().objects.remove(key);
-        Ok(())
-    }
-
-    async fn delete_prefix(&self, prefix: &str) -> Result<(), Error> {
-        let mut state = self.state.lock().unwrap();
-        state.objects.retain(|k, _| !k.starts_with(prefix));
-        Ok(())
-    }
-
-    async fn head(&self, key: &str) -> Result<ObjectMeta, Error> {
-        let state = self.state.lock().unwrap();
-        let (data, etag) = state.objects.get(key).ok_or(Error::NotFound)?;
-        Ok(ObjectMeta {
-            size: data.len() as u64,
-            etag: Some(etag.clone()),
-            last_modified: None,
-        })
-    }
-
-    async fn list(
-        &self,
-        prefix: &str,
-        n: u16,
-        token: Option<String>,
-    ) -> Result<Page<String>, Error> {
-        let state = self.state.lock().unwrap();
-        let mut keys: Vec<String> = state
-            .objects
-            .keys()
-            .filter(|k| k.starts_with(prefix))
-            .cloned()
-            .collect();
-        keys.sort();
-        let start = token.as_deref().map_or(0, |t| {
-            keys.iter()
-                .position(|k| k.as_str() > t)
-                .unwrap_or(keys.len())
-        });
-        let end = (start + n as usize).min(keys.len());
-        let items: Vec<String> = keys[start..end].to_vec();
-        let next_token = (end < keys.len()).then(|| items.last().cloned().unwrap_or_default());
-        Ok(Page { items, next_token })
-    }
-
-    async fn list_children(
-        &self,
-        prefix: &str,
-        _n: u16,
-        _token: Option<String>,
-        _start_after: Option<String>,
-    ) -> Result<ChildrenPage, Error> {
-        let state = self.state.lock().unwrap();
-        let mut sub_prefixes = Vec::new();
-        let mut objects = Vec::new();
-        for key in state.objects.keys() {
-            let Some(rest) = key.strip_prefix(prefix) else {
-                continue;
-            };
-            if let Some(slash) = rest.find('/') {
-                let sub = rest[..slash].to_string();
-                if !sub_prefixes.contains(&sub) {
-                    sub_prefixes.push(sub);
-                }
-            } else {
-                objects.push(rest.to_string());
-            }
-        }
-        sub_prefixes.sort();
-        objects.sort();
-        Ok(ChildrenPage {
-            sub_prefixes,
-            objects,
-            next_token: None,
-        })
-    }
-
-    async fn copy(&self, source: &str, destination: &str) -> Result<(), Error> {
-        let data = self.get(source).await?;
-        self.put(destination, Bytes::from(data)).await
-    }
-}
-
-#[async_trait]
-impl ConditionalStore for MockBackend {
-    async fn get_with_etag(&self, key: &str) -> Result<(Vec<u8>, Option<Etag>), Error> {
-        let state = self.state.lock().unwrap();
-        let (data, etag) = state.objects.get(key).ok_or(Error::NotFound)?;
-        Ok((data.to_vec(), Some(etag.clone())))
-    }
-
-    async fn put_if_absent(&self, key: &str, data: Bytes) -> Result<Option<Etag>, Error> {
-        let mut state = self.state.lock().unwrap();
-        if state.objects.contains_key(key) {
-            return Err(Error::PreconditionFailed);
-        }
-        let etag = state.new_etag();
-        state.objects.insert(key.to_string(), (data, etag.clone()));
-        Ok(Some(etag))
-    }
-
-    async fn put_if_match(
-        &self,
-        key: &str,
-        etag: &Etag,
-        data: Bytes,
-    ) -> Result<Option<Etag>, Error> {
-        let mut state = self.state.lock().unwrap();
-        let current = state.objects.get(key).ok_or(Error::NotFound)?;
-        if &current.1 != etag {
-            return Err(Error::PreconditionFailed);
-        }
-        let new_etag = state.new_etag();
-        state
-            .objects
-            .insert(key.to_string(), (data, new_etag.clone()));
-        Ok(Some(new_etag))
-    }
-
-    async fn delete_if_match(&self, key: &str, etag: &Etag) -> Result<(), Error> {
-        let mut state = self.state.lock().unwrap();
-        match state.objects.get(key) {
-            Some((_, current)) if current == etag => {
-                state.objects.remove(key);
-                Ok(())
-            }
-            Some(_) => Err(Error::PreconditionFailed),
-            None => Ok(()),
-        }
-    }
-}
-
-#[async_trait]
-impl MultipartStore for MockBackend {
-    async fn create_multipart(&self, key: &str) -> Result<UploadId, Error> {
-        let mut state = self.state.lock().unwrap();
-        let id = state.new_upload_id();
-        state.multipart.insert(
-            (key.to_string(), id.clone()),
-            MultipartSession {
-                parts: HashMap::new(),
-                initiated_at: Utc::now(),
-            },
-        );
-        Ok(id)
-    }
-
-    async fn upload_part(
-        &self,
-        key: &str,
-        id: &UploadId,
-        part_number: u32,
-        _content_length: u64,
-        mut body: ByteStream,
-    ) -> Result<Etag, Error> {
-        let mut buf = Vec::new();
-        while let Some(chunk) = body.next().await {
-            let chunk = chunk.map_err(|e| Error::Backend(e.to_string()))?;
-            buf.extend_from_slice(&chunk);
-        }
-        let mut state = self.state.lock().unwrap();
-        let session = state
-            .multipart
-            .get_mut(&(key.to_string(), id.clone()))
-            .ok_or(Error::NotFound)?;
-        session.parts.insert(part_number, Bytes::from(buf));
-        Ok(state.new_etag())
-    }
-
-    async fn upload_part_copy(
-        &self,
-        source: &str,
-        destination: &str,
-        id: &UploadId,
-        part_number: u32,
-        _range: Option<String>,
-    ) -> Result<Etag, Error> {
-        let data = self.get(source).await?;
-        let mut state = self.state.lock().unwrap();
-        let session = state
-            .multipart
-            .get_mut(&(destination.to_string(), id.clone()))
-            .ok_or(Error::NotFound)?;
-        session.parts.insert(part_number, Bytes::from(data));
-        Ok(state.new_etag())
-    }
-
-    async fn complete_multipart(
-        &self,
-        key: &str,
-        id: &UploadId,
-        parts: &[Part],
-    ) -> Result<(), Error> {
-        let mut state = self.state.lock().unwrap();
-        let session = state
-            .multipart
-            .remove(&(key.to_string(), id.clone()))
-            .ok_or(Error::NotFound)?;
-        let mut assembled = Vec::new();
-        for part in parts {
-            let chunk = session
-                .parts
-                .get(&part.part_number)
-                .ok_or(Error::NotFound)?;
-            assembled.extend_from_slice(chunk);
-        }
-        let etag = state.new_etag();
-        state
-            .objects
-            .insert(key.to_string(), (Bytes::from(assembled), etag));
-        Ok(())
-    }
-
-    async fn abort_multipart(&self, key: &str, id: &UploadId) -> Result<(), Error> {
-        self.state
-            .lock()
-            .unwrap()
-            .multipart
-            .remove(&(key.to_string(), id.clone()));
-        Ok(())
-    }
-
-    async fn list_multipart_uploads(
-        &self,
-        prefix: Option<&str>,
-        key_marker: Option<&str>,
-        _upload_id_marker: Option<&str>,
-    ) -> Result<MultipartPage, Error> {
-        let state = self.state.lock().unwrap();
-        let mut uploads: Vec<MultipartUpload> = state
-            .multipart
-            .iter()
-            .filter(|((k, _), _)| prefix.is_none_or(|p| k.starts_with(p)))
-            .map(|((k, id), session)| MultipartUpload {
-                key: k.clone(),
-                upload_id: id.clone(),
-                initiated_at: session.initiated_at,
-            })
-            .collect();
-        uploads.sort_by(|a, b| a.key.cmp(&b.key));
-
-        // Apply key_marker cursor: skip entries whose key is <= marker.
-        if let Some(marker) = key_marker {
-            uploads.retain(|u| u.key.as_str() > marker);
-        }
-
-        // Apply optional page size limit.
-        let next_key_marker = if let Some(limit) = self.multipart_page_size {
-            if uploads.len() > limit {
-                let last_key = uploads[limit - 1].key.clone();
-                uploads.truncate(limit);
-                Some(last_key)
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-
-        Ok(MultipartPage {
-            uploads,
-            next_key_marker,
-            next_upload_id_marker: None,
-        })
-    }
-
-    async fn list_parts(&self, key: &str, id: &UploadId) -> Result<Vec<Part>, Error> {
-        let state = self.state.lock().unwrap();
-        let session = state
-            .multipart
-            .get(&(key.to_string(), id.clone()))
-            .ok_or(Error::NotFound)?;
-        let mut parts: Vec<Part> = session
-            .parts
-            .iter()
-            .map(|(n, data)| Part {
-                part_number: *n,
-                etag: Etag::new(format!("\"part-{n}\"")),
-                size: data.len() as u64,
-            })
-            .collect();
-        parts.sort_by_key(|p| p.part_number);
-        Ok(parts)
-    }
-}
-
-#[async_trait]
-impl PresignedStore for MockBackend {
+#[async_trait::async_trait]
+impl PresignedStore for PresignStub {
     async fn presign_get(
         &self,
         key: &str,
@@ -408,8 +29,8 @@ impl PresignedStore for MockBackend {
     }
 }
 
-fn backend() -> Arc<MockBackend> {
-    Arc::new(MockBackend::default())
+fn backend() -> Arc<MemoryObjectStore> {
+    Arc::new(MemoryObjectStore::new())
 }
 
 // =========================================================================
@@ -432,7 +53,6 @@ async fn get_missing_key_returns_not_found() {
 #[tokio::test]
 async fn delete_is_idempotent_on_missing_key() {
     let store: Arc<dyn ObjectStore> = backend();
-    // Two deletes in a row must both succeed.
     store.delete("ghost").await.unwrap();
     store.delete("ghost").await.unwrap();
 }
@@ -447,6 +67,40 @@ async fn delete_prefix_removes_matching_keys_only() {
     assert_eq!(store.get("a/1").await.unwrap_err(), Error::NotFound);
     assert_eq!(store.get("a/2").await.unwrap_err(), Error::NotFound);
     assert_eq!(store.get("b/1").await.unwrap(), b"z");
+}
+
+#[tokio::test]
+async fn delete_prefix_is_directory_scoped_not_string_prefix() {
+    // Regression for the data-loss bug: a non-slash prefix is a directory
+    // boundary, so it must delete keys *under* the directory but never a
+    // sibling that merely shares a string prefix
+    // (`tags/v1` must not affect `tags/v1-rc/...`).
+    let store: Arc<dyn ObjectStore> = backend();
+    store.put("a/b/1", Bytes::from_static(b"x")).await.unwrap();
+    store
+        .put("a/b/c/2", Bytes::from_static(b"y"))
+        .await
+        .unwrap();
+    store.put("a/bc/3", Bytes::from_static(b"z")).await.unwrap();
+
+    store.delete_prefix("a/b").await.unwrap();
+
+    assert_eq!(store.get("a/b/1").await.unwrap_err(), Error::NotFound);
+    assert_eq!(store.get("a/b/c/2").await.unwrap_err(), Error::NotFound);
+    assert_eq!(store.get("a/bc/3").await.unwrap(), b"z");
+}
+
+#[tokio::test]
+async fn delete_prefix_empty_prefix_is_noop() {
+    // An empty prefix must not be treated as the store root and wipe everything.
+    let store: Arc<dyn ObjectStore> = backend();
+    store.put("a/1", Bytes::from_static(b"x")).await.unwrap();
+    store.put("b/1", Bytes::from_static(b"y")).await.unwrap();
+
+    store.delete_prefix("").await.unwrap();
+
+    assert_eq!(store.get("a/1").await.unwrap(), b"x");
+    assert_eq!(store.get("b/1").await.unwrap(), b"y");
 }
 
 #[tokio::test]
@@ -467,10 +121,7 @@ async fn get_stream_reports_total_size_not_remaining() {
         .await
         .unwrap();
     let (mut body, total) = store.get_stream("k", Some(3)).await.unwrap();
-    assert_eq!(
-        total, 10,
-        "total size must be reported, not the post-offset remainder"
-    );
+    assert_eq!(total, 10);
     let mut buf = Vec::new();
     body.read_to_end(&mut buf).await.unwrap();
     assert_eq!(buf, b"3456789");
@@ -479,12 +130,12 @@ async fn get_stream_reports_total_size_not_remaining() {
 #[tokio::test]
 async fn list_paginates_in_sorted_order() {
     let store: Arc<dyn ObjectStore> = backend();
-    for k in ["a", "c", "b"] {
+    for k in ["dir/a", "dir/c", "dir/b"] {
         store.put(k, Bytes::from_static(b"x")).await.unwrap();
     }
-    let page = store.list("", 2, None).await.unwrap();
+    let page = store.list("dir/", 2, None).await.unwrap();
     assert_eq!(page.items, vec!["a".to_string(), "b".to_string()]);
-    let page2 = store.list("", 2, page.next_token).await.unwrap();
+    let page2 = store.list("dir/", 2, page.next_token).await.unwrap();
     assert_eq!(page2.items, vec!["c".to_string()]);
     assert!(page2.next_token.is_none());
 }
@@ -577,7 +228,6 @@ async fn put_if_match_rejects_stale_etag() {
         .put_if_match("k", &etag, Bytes::from_static(b"v2"))
         .await
         .unwrap();
-    // Reusing the original etag must now fail.
     assert_eq!(
         store
             .put_if_match("k", &etag, Bytes::from_static(b"v3"))
@@ -601,167 +251,84 @@ async fn delete_if_match_rejects_stale_etag_but_treats_missing_as_success() {
         Error::PreconditionFailed
     );
     store.delete_if_match("k", &etag).await.unwrap();
-    // Missing object: success.
     store.delete_if_match("k", &etag).await.unwrap();
 }
 
 // =========================================================================
-// MultipartStore
+// Uploads (ObjectStore upload methods)
 // =========================================================================
 
+fn one_frame(body: &'static [u8]) -> crate::ByteStream {
+    Box::pin(stream::once(async move { Ok(Bytes::from_static(body)) }))
+}
+
 #[tokio::test]
-async fn multipart_round_trip_assembles_object_from_parts() {
-    let store: Arc<dyn MultipartStore> = backend();
-    let id = store.create_multipart("blob").await.unwrap();
-
-    let (tx1, rx1) = mpsc::channel(2);
-    tx1.send(Bytes::from_static(b"hello ")).await.unwrap();
-    drop(tx1);
-    let etag1 = store
-        .upload_part("blob", &id, 1, 6, channel_stream(rx1))
+async fn upload_round_trip_creates_object_at_key() {
+    let store: Arc<dyn ObjectStore> = backend();
+    store.create_upload("blob").await.unwrap();
+    assert_eq!(
+        store
+            .write_upload("blob", one_frame(b"hello "), 6)
+            .await
+            .unwrap(),
+        6
+    );
+    let total = store
+        .write_upload("blob", one_frame(b"world"), 5)
         .await
         .unwrap();
-
-    let (tx2, rx2) = mpsc::channel(2);
-    tx2.send(Bytes::from_static(b"world")).await.unwrap();
-    drop(tx2);
-    let etag2 = store
-        .upload_part("blob", &id, 2, 5, channel_stream(rx2))
-        .await
-        .unwrap();
-
-    let parts = vec![
-        Part {
-            part_number: 1,
-            etag: etag1,
-            size: 6,
-        },
-        Part {
-            part_number: 2,
-            etag: etag2,
-            size: 5,
-        },
-    ];
-    store.complete_multipart("blob", &id, &parts).await.unwrap();
-
+    assert_eq!(total, 11);
+    store.complete_upload("blob").await.unwrap();
     assert_eq!(store.get("blob").await.unwrap(), b"hello world");
 }
 
 #[tokio::test]
-async fn abort_multipart_discards_session() {
-    let store: Arc<dyn MultipartStore> = backend();
-    let id = store.create_multipart("blob").await.unwrap();
-    store.abort_multipart("blob", &id).await.unwrap();
-    assert_eq!(
-        store.list_parts("blob", &id).await.unwrap_err(),
-        Error::NotFound
-    );
-}
-
-#[tokio::test]
-async fn list_multipart_uploads_filters_by_prefix() {
-    let store: Arc<dyn MultipartStore> = backend();
-    let _id_a = store.create_multipart("repo-a/blob").await.unwrap();
-    let _id_b = store.create_multipart("repo-b/blob").await.unwrap();
-    let page = store
-        .list_multipart_uploads(Some("repo-a/"), None, None)
+async fn upload_resumes_across_independent_calls() {
+    // Uploads are keyed — there is no caller-held handle, so a second batch of
+    // writes addressed at the same key picks up where the first left off.
+    let store: Arc<dyn ObjectStore> = backend();
+    store.create_upload("blob").await.unwrap();
+    store
+        .write_upload("blob", one_frame(b"hello "), 6)
         .await
         .unwrap();
-    assert_eq!(page.uploads.len(), 1);
-    assert_eq!(page.uploads[0].key, "repo-a/blob");
-}
 
-// =========================================================================
-// MultipartStore default methods: search_multipart_upload_id /
-// abort_pending_uploads
-// =========================================================================
-
-#[tokio::test]
-async fn search_multipart_upload_id_finds_active_upload() {
-    let store = Arc::new(MockBackend::default());
-    let key = "repo/blob";
-    let created_id = store.create_multipart(key).await.unwrap();
-
-    let found = store
-        .search_multipart_upload_id(key)
-        .await
-        .unwrap()
-        .expect("upload we just created must be found");
-    assert_eq!(found, created_id);
-
-    store.abort_multipart(key, &created_id).await.unwrap();
-}
-
-#[tokio::test]
-async fn search_multipart_upload_id_returns_none_when_absent() {
-    let store = Arc::new(MockBackend::default());
-    let result = store
-        .search_multipart_upload_id("no/such/key")
+    let total = store
+        .write_upload("blob", one_frame(b"world"), 5)
         .await
         .unwrap();
-    assert!(result.is_none());
+    assert_eq!(total, 11);
+    store.complete_upload("blob").await.unwrap();
+    assert_eq!(store.get("blob").await.unwrap(), b"hello world");
 }
 
-/// The target key appears on the second page of `list_multipart_uploads`.
-/// `search_multipart_upload_id` must follow the pagination cursor until it
-/// finds the key rather than giving up after the first page.
 #[tokio::test]
-async fn search_multipart_upload_id_follows_pagination_to_second_page() {
-    // Page size of 1 forces the second key onto its own page.
-    let store = Arc::new(MockBackend::with_multipart_page_size(1));
-
-    // "repo/aaa" sorts before "repo/zzz"; with page_size=1 the first page
-    // only contains "repo/aaa", so "repo/zzz" lives on page 2.
-    let _id_first = store.create_multipart("repo/aaa").await.unwrap();
-    let id_second = store.create_multipart("repo/zzz").await.unwrap();
-
-    let found = store
-        .search_multipart_upload_id("repo/zzz")
+async fn upload_abort_leaves_no_object() {
+    let store: Arc<dyn ObjectStore> = backend();
+    store.create_upload("blob").await.unwrap();
+    store
+        .write_upload("blob", one_frame(b"partial"), 7)
         .await
-        .unwrap()
-        .expect("key on second page must still be found");
-    assert_eq!(found, id_second);
+        .unwrap();
+    store.abort_upload("blob").await.unwrap();
+    assert_eq!(store.get("blob").await.unwrap_err(), Error::NotFound);
 }
 
 #[tokio::test]
-async fn abort_pending_uploads_clears_multiple_sessions_for_same_key() {
-    let store = Arc::new(MockBackend::default());
-    let key = "repo/obj";
-
-    let id1 = store.create_multipart(key).await.unwrap();
-    let id2 = store.create_multipart(key).await.unwrap();
-
-    // Both sessions must be visible before aborting.
-    assert!(
-        store
-            .search_multipart_upload_id(key)
-            .await
-            .unwrap()
-            .is_some()
-    );
-
-    store.abort_pending_uploads(key).await.unwrap();
-
-    // Neither session should remain.
-    assert!(
-        store
-            .search_multipart_upload_id(key)
-            .await
-            .unwrap()
-            .is_none()
-    );
-    // Aborting already-gone ids must not error (idempotent).
-    store.abort_multipart(key, &id1).await.unwrap();
-    store.abort_multipart(key, &id2).await.unwrap();
+async fn upload_complete_with_no_writes_creates_empty_object() {
+    let store: Arc<dyn ObjectStore> = backend();
+    store.create_upload("blob").await.unwrap();
+    store.complete_upload("blob").await.unwrap();
+    assert_eq!(store.get("blob").await.unwrap(), b"");
 }
 
 // =========================================================================
-// PresignedStore
+// PresignedStore (object-safety smoke test)
 // =========================================================================
 
 #[tokio::test]
 async fn presign_get_returns_a_url() {
-    let store: Arc<dyn PresignedStore> = backend();
+    let store: Arc<dyn PresignedStore> = Arc::new(PresignStub);
     let url = store
         .presign_get("blob/x", Duration::from_mins(1), None)
         .await

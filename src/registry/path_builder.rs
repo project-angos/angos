@@ -69,6 +69,8 @@ pub fn blob_container_dir(digest: &Digest) -> String {
     blob_dir(digest)
 }
 
+/// Root directory holding every upload container for a namespace. Used to
+/// enumerate the namespace's active sessions (one child directory per UUID).
 pub fn uploads_root_dir(namespace: &str) -> String {
     format!("{REPOS_ROOT}/{namespace}/_uploads")
 }
@@ -81,10 +83,15 @@ pub fn upload_path(namespace: &str, uuid: &str) -> String {
     format!("{REPOS_ROOT}/{namespace}/_uploads/{uuid}/data")
 }
 
-pub fn upload_staged_container_path(namespace: &str, uuid: &str, offset: u64) -> String {
-    format!("{REPOS_ROOT}/{namespace}/_uploads/{uuid}/staged/{offset}")
+/// Directory holding the SHA-256 hasher-state checkpoints for an upload, one
+/// file per offset. Used to enumerate checkpoints and pick the most recent.
+pub fn upload_hash_context_dir(namespace: &str, uuid: &str, algorithm: &str) -> String {
+    format!("{REPOS_ROOT}/{namespace}/_uploads/{uuid}/hashstates/{algorithm}")
 }
 
+/// Serialised SHA-256 hasher state after consuming the upload's bytes up to
+/// `offset`. One file per checkpoint offset, allowing hash resumption after a
+/// crash without re-reading the uploaded bytes.
 pub fn upload_hash_context_path(
     namespace: &str,
     uuid: &str,
@@ -94,12 +101,10 @@ pub fn upload_hash_context_path(
     format!("{REPOS_ROOT}/{namespace}/_uploads/{uuid}/hashstates/{algorithm}/{offset}")
 }
 
+/// RFC3339 timestamp marking when the upload session was created. Used for
+/// age-based orphan detection during scrub.
 pub fn upload_start_date_path(namespace: &str, uuid: &str) -> String {
     format!("{REPOS_ROOT}/{namespace}/_uploads/{uuid}/startedat")
-}
-
-pub fn upload_patch_pending_path(namespace: &str, uuid: &str) -> String {
-    format!("{REPOS_ROOT}/{namespace}/_uploads/{uuid}/patches/pending")
 }
 
 pub fn manifest_revisions_link_root_dir(namespace: &str, algorithm: &str) -> String {
@@ -124,10 +129,6 @@ pub fn job_pending_dir(queue: &str) -> String {
 
 pub fn job_pending_path(queue: &str, id: &str) -> String {
     format!("{JOBS_ROOT}/pending/{queue}/{id}.json")
-}
-
-pub fn job_lease_path(lock_key: &str) -> String {
-    format!("{JOBS_ROOT}/leases/{}.json", encode_job_lock_key(lock_key))
 }
 
 pub fn job_failed_path(queue: &str, id: &str) -> String {
@@ -240,7 +241,6 @@ mod tests {
 
     #[test]
     fn test_upload_paths() {
-        assert_eq!(uploads_root_dir("ns"), "v2/repositories/ns/_uploads");
         assert_eq!(
             upload_container_path("ns", "uuid"),
             "v2/repositories/ns/_uploads/uuid"
@@ -249,13 +249,10 @@ mod tests {
             upload_path("ns", "uuid"),
             "v2/repositories/ns/_uploads/uuid/data"
         );
+        assert_eq!(uploads_root_dir("ns"), "v2/repositories/ns/_uploads");
         assert_eq!(
-            upload_staged_container_path("ns", "uuid", 0),
-            "v2/repositories/ns/_uploads/uuid/staged/0"
-        );
-        assert_eq!(
-            upload_hash_context_path("ns", "uuid", "sha256", 0),
-            "v2/repositories/ns/_uploads/uuid/hashstates/sha256/0"
+            upload_hash_context_path("ns", "uuid", "sha256", 42),
+            "v2/repositories/ns/_uploads/uuid/hashstates/sha256/42"
         );
         assert_eq!(
             upload_start_date_path("ns", "uuid"),
@@ -370,10 +367,6 @@ mod tests {
         assert_eq!(
             job_failed_path("cache", "01HABCDE"),
             "_jobs/failed/cache/01HABCDE.json"
-        );
-        assert_eq!(
-            job_lease_path("cache.ns:sha256:abc"),
-            "_jobs/leases/cache.ns%3Asha256%3Aabc.json"
         );
         assert_eq!(
             job_lock_key_index_path("cache", "cache.ns:sha256:abc"),

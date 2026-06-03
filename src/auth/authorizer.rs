@@ -380,6 +380,7 @@ fn lookup_webhook(
 mod tests {
     use std::{
         io::{self, Write},
+        str::FromStr,
         sync::{Arc, Mutex},
     };
 
@@ -391,9 +392,14 @@ mod tests {
     use super::*;
     use crate::{
         cache,
+        command::server::Error as ServerError,
         configuration::Configuration,
         identity::{ClientCertificate, OidcClaims},
-        registry::{RegistryConfig, Repository, repository_resolver::RepositoryResolver},
+        oci::{Digest, Namespace, Reference},
+        registry::{
+            RegistryConfig, Repository, metadata_store::MetadataStore,
+            repository_resolver::RepositoryResolver,
+        },
         test_fixtures::configuration::{load_config, minimal_config, try_load_config},
     };
 
@@ -687,13 +693,6 @@ mod tests {
 
     #[test]
     fn test_check_immutable_tag_returns_conflict_for_tagged_putmanifest() {
-        use std::str::FromStr;
-
-        use crate::{
-            command::server::Error,
-            oci::{Namespace, Reference},
-        };
-
         let config = load_config(
             r#"
             immutable_tags = true
@@ -713,8 +712,8 @@ mod tests {
 
         let result = authorizer.check_immutable_tag("myrepo", &action);
 
-        let Err(Error::Conflict(msg)) = result else {
-            panic!("expected Err(Error::Conflict(_)), got: {result:?}");
+        let Err(ServerError::Conflict(msg)) = result else {
+            panic!("expected Err(ServerError::Conflict(_)), got: {result:?}");
         };
         assert!(
             msg.contains("v1.0.0") && msg.contains("immutable"),
@@ -784,13 +783,11 @@ mod tests {
     }
 
     async fn create_pull_through_registry(config: &Configuration) -> Registry {
-        let blob_handles = config.blob_store.to_backend(None).unwrap();
-        let (metadata_store, _) = config
-            .resolve_metadata_config()
-            .to_backend(None)
-            .await
-            .unwrap();
+        let blob_backend = std::sync::Arc::new(config.blob_store.build_backend().unwrap());
         let auth_cache = config.cache.to_backend().unwrap();
+        let storage_config = config.resolve_registry_storage();
+        let handles = storage_config.build_store().await.unwrap();
+        let metadata_store = Arc::new(MetadataStore::builder().store(handles).build().unwrap());
 
         let mut repositories_map = HashMap::new();
         for (name, repo_config) in &config.repository {
@@ -814,27 +811,14 @@ mod tests {
             .enable_blob_redirect(config.global.resolved_enable_blob_redirect())
             .enable_manifest_redirect(config.global.resolved_enable_manifest_redirect())
             .max_manifest_size_bytes(config.global.max_manifest_size_bytes())
-            .concurrent_cache_jobs(config.global.max_concurrent_cache_jobs)
             .global_immutable_tags(config.global.immutable_tags)
             .global_immutable_tags_exclusions(config.global.immutable_tags_exclusions.clone());
 
-        Registry::new(
-            blob_handles.blob_store,
-            blob_handles.upload_store,
-            blob_handles.presigned_store,
-            metadata_store,
-            resolver,
-            registry_config,
-        )
-        .unwrap()
+        Registry::new(blob_backend, metadata_store, resolver, registry_config).unwrap()
     }
 
     #[tokio::test]
     async fn test_pull_through_repo_allows_delete_manifest() {
-        use std::str::FromStr;
-
-        use crate::oci::{Namespace, Reference};
-
         let config = create_pull_through_config();
         let cache = cache::Config::Memory.to_backend().unwrap();
         let authorizer = Authorizer::new(&config, &cache).unwrap();
@@ -865,10 +849,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_pull_through_repo_allows_delete_blob() {
-        use std::str::FromStr;
-
-        use crate::oci::{Digest, Namespace};
-
         let config = create_pull_through_config();
         let cache = cache::Config::Memory.to_backend().unwrap();
         let authorizer = Authorizer::new(&config, &cache).unwrap();
@@ -899,10 +879,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_pull_through_repo_blocks_push_operations() {
-        use std::str::FromStr;
-
-        use crate::oci::{Namespace, Reference};
-
         let config = create_pull_through_config();
         let cache = cache::Config::Memory.to_backend().unwrap();
         let authorizer = Authorizer::new(&config, &cache).unwrap();
@@ -949,8 +925,6 @@ mod tests {
     // `authorize_request` must short-circuit before consulting any webhook or repository.
     #[tokio::test]
     async fn global_deny_policy_rejects_all_requests() {
-        use crate::command::server::Error as ServerError;
-
         let config = load_config(
             r#"
             [global.access_policy]
@@ -1030,8 +1004,6 @@ mod tests {
     // Global allow policy + global webhook returning 403 → request denied.
     #[tokio::test]
     async fn global_webhook_path_deny_when_webhook_returns_403() {
-        use crate::command::server::Error as ServerError;
-
         let mock_server = MockServer::start().await;
         Mock::given(method("GET"))
             .respond_with(ResponseTemplate::new(403))
@@ -1098,8 +1070,6 @@ mod tests {
     // applied implicitly (allow here).
     #[tokio::test]
     async fn authorize_request_unknown_namespace_is_allowed_under_allow_policy() {
-        use crate::oci::Namespace;
-
         let config = load_config(
             r#"
             [global.access_policy]
@@ -1141,8 +1111,6 @@ mod tests {
     // This distinguishes a transport failure from an explicit deny on dashboards.
     #[tokio::test]
     async fn webhook_unreachable_fails_closed() {
-        use crate::oci::Namespace;
-
         let config = load_config(
             r#"
             [global.access_policy]

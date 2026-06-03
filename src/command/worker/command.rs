@@ -1,4 +1,4 @@
-use std::{sync::Arc, time::Duration};
+use std::{num::NonZeroUsize, sync::Arc, time::Duration};
 
 use arc_swap::ArcSwap;
 use argh::FromArgs;
@@ -6,7 +6,6 @@ use async_trait::async_trait;
 use humantime::Duration as HumanDuration;
 use tokio::{
     select,
-    sync::Semaphore,
     time::{sleep, timeout},
 };
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
@@ -21,7 +20,7 @@ use crate::{
     configuration::{Configuration, listeners::ServerTlsConfig, watcher::ConfigNotifier},
     registry::{
         cache_job_handler::{CACHE_QUEUE, CacheJobHandler},
-        job_store::{self, JobHandler, durable::DurableJobConsumer},
+        job_store::{self, JobHandler, JobStore},
     },
 };
 
@@ -65,94 +64,109 @@ pub struct Options {
 /// atomically on configuration reload; in-flight jobs always finish on the
 /// components they started with.
 pub struct Command {
-    inner: ArcSwap<Components>,
+    inner: Arc<ArcSwap<Components>>,
     queue: String,
     poll_interval: Duration,
+    concurrency: NonZeroUsize,
     shutdown: CancellationToken,
-    in_flight: TaskTracker,
-    permits: Arc<Semaphore>,
+    workers: TaskTracker,
+    /// Cancellation token tied to the transactional-engine recovery loop and
+    /// body janitor. Fired on shutdown to stop both background tasks.
+    engine_maintenance: CancellationToken,
 }
 
 struct Components {
-    consumer: Arc<DurableJobConsumer>,
+    consumer: Arc<JobStore>,
     handler: Arc<dyn JobHandler>,
 }
 
 impl Command {
     pub async fn new(options: &Options, config: &Configuration) -> Result<Self, Error> {
-        let concurrency = config.global.max_concurrent_cache_jobs.max(1);
+        let engine_maintenance = CancellationToken::new();
         Ok(Self {
-            inner: ArcSwap::from_pointee(Components::build(config).await?),
+            inner: Arc::new(ArcSwap::from_pointee(
+                Components::build(config, Some(engine_maintenance.clone())).await?,
+            )),
             queue: options.queue.clone(),
             poll_interval: *options.poll_interval,
+            concurrency: config.global.max_concurrent_cache_jobs,
             shutdown: CancellationToken::new(),
-            in_flight: TaskTracker::new(),
-            permits: Arc::new(Semaphore::new(concurrency)),
+            workers: TaskTracker::new(),
+            engine_maintenance,
         })
     }
 
-    /// Cancel the poll loop and wait up to `grace` for in-flight jobs to
-    /// finish. Surviving tasks are dropped on process exit; the durable
-    /// queue's lease TTL guarantees re-claim by another worker.
+    /// Cancel the worker pool and wait up to `grace` for tasks to finish.
+    /// Surviving tasks are dropped on process exit; the durable queue's lease
+    /// TTL guarantees re-claim by another worker.
     pub async fn shutdown_with_timeout(&self, grace: Duration) {
         self.shutdown.cancel();
-        self.in_flight.close();
-        if timeout(grace, self.in_flight.wait()).await.is_err() {
-            warn!("Worker did not drain in-flight jobs within shutdown grace period");
+        self.workers.close();
+        if timeout(grace, self.workers.wait()).await.is_err() {
+            warn!("Worker pool did not drain within shutdown grace period");
         }
+        // Stop the transactional-engine maintenance tasks alongside the worker
+        // pool so they don't outlive the process's storage handles.
+        self.engine_maintenance.cancel();
     }
 
+    /// Spawn `concurrency` claim-loop tasks and wait for them to finish.
+    /// Returns when every worker observes the shutdown signal and exits.
     pub async fn run(&self) {
-        // Exponential backoff on consecutive `claim_one` errors so a worker
-        // pointed at a broken backend idles instead of hammering it at 1Hz.
-        // Any successful `claim_one` (claimed *or* empty) resets the counter —
-        // both prove the backend is responsive.
-        let mut consecutive_claim_errors: u32 = 0;
-        loop {
-            let permit = select! {
-                () = self.shutdown.cancelled() => {
-                    debug!("Worker poll loop stopping");
-                    return;
-                }
-                acquired = self.permits.clone().acquire_owned() => match acquired {
-                    Ok(p) => p,
-                    Err(_) => return,
-                }
-            };
+        for _ in 0..self.concurrency.get() {
+            let inner = Arc::clone(&self.inner);
+            let queue = self.queue.clone();
+            let poll_interval = self.poll_interval;
+            let shutdown = self.shutdown.clone();
+            self.workers.spawn(async move {
+                worker_loop(inner, queue, poll_interval, shutdown).await;
+            });
+        }
+        self.workers.close();
+        self.workers.wait().await;
+    }
+}
 
-            let snapshot = self.inner.load_full();
-            select! {
-                () = self.shutdown.cancelled() => {
-                    debug!("Worker poll loop stopping");
-                    return;
+/// Single claim-loop task. Owns its own exponential-backoff counter so a
+/// transient backend outage doesn't make every worker hammer the storage
+/// in lockstep.
+async fn worker_loop(
+    inner: Arc<ArcSwap<Components>>,
+    queue: String,
+    poll_interval: Duration,
+    shutdown: CancellationToken,
+) {
+    let mut consecutive_claim_errors: u32 = 0;
+    loop {
+        let snapshot = inner.load_full();
+        select! {
+            () = shutdown.cancelled() => {
+                debug!("Worker poll loop stopping");
+                return;
+            }
+            result = snapshot.consumer.claim_one(&queue) => match result {
+                Err(e) => {
+                    let backoff = claim_error_backoff(poll_interval, consecutive_claim_errors);
+                    consecutive_claim_errors = consecutive_claim_errors.saturating_add(1);
+                    error!(
+                        error = %e,
+                        consecutive_failures = consecutive_claim_errors,
+                        backoff_secs = backoff.as_secs(),
+                        "claim_one failed; backing off",
+                    );
+                    sleep(backoff).await;
                 }
-                result = snapshot.consumer.claim_one(&self.queue) => match result {
-                    Err(e) => {
-                        let backoff = claim_error_backoff(
-                            self.poll_interval,
-                            consecutive_claim_errors,
-                        );
-                        consecutive_claim_errors = consecutive_claim_errors.saturating_add(1);
-                        error!(
-                            error = %e,
-                            consecutive_failures = consecutive_claim_errors,
-                            backoff_secs = backoff.as_secs(),
-                            "claim_one failed; backing off",
-                        );
-                        sleep(backoff).await;
-                    }
-                    Ok(outcome) => {
-                        consecutive_claim_errors = 0;
-                        match outcome.claimed {
-                            None => sleep(outcome.idle_sleep(self.poll_interval)).await,
-                            Some(claimed) => {
-                                let consumer = snapshot.consumer.clone();
-                                let handler = snapshot.handler.clone();
-                                self.in_flight.spawn(async move {
-                                    execute_one(consumer.as_ref(), handler.as_ref(), claimed).await;
-                                    drop(permit);
-                                });
-                            }
+                Ok(outcome) => {
+                    consecutive_claim_errors = 0;
+                    match outcome.claimed {
+                        None => sleep(outcome.idle_sleep(poll_interval)).await,
+                        Some(claimed) => {
+                            execute_one(
+                                snapshot.consumer.as_ref(),
+                                snapshot.handler.as_ref(),
+                                claimed,
+                            )
+                            .await;
                         }
                     }
                 }
@@ -164,7 +178,9 @@ impl Command {
 #[async_trait]
 impl ConfigNotifier for Command {
     async fn notify_config_change(&self, config: &Configuration) {
-        match Components::build(config).await {
+        // The engine maintenance tasks were spawned by the initial bootstrap;
+        // hot reloads do not respawn them.
+        match Components::build(config, None).await {
             Ok(components) => self.inner.store(Arc::new(components)),
             Err(e) => error!("Failed to apply worker configuration: {e}"),
         }
@@ -176,11 +192,14 @@ impl ConfigNotifier for Command {
 }
 
 impl Components {
-    async fn build(config: &Configuration) -> Result<Self, Error> {
+    async fn build(
+        config: &Configuration,
+        engine_maintenance: Option<CancellationToken>,
+    ) -> Result<Self, Error> {
         let auth_cache = bootstrap::auth_cache(&config.cache)?;
-        let blob_handles = bootstrap::blob_stores(&config.blob_store, &auth_cache)?;
-        let (metadata_store, _) =
-            bootstrap::metadata_store(&config.resolve_metadata_config(), &auth_cache).await?;
+        let blob_backend = std::sync::Arc::new(config.blob_store.build_backend()?);
+        let metadata_store =
+            bootstrap::metadata_store(&config.resolve_registry_storage(), &auth_cache).await?;
         let repositories = bootstrap::repositories(
             &config.repository,
             &auth_cache,
@@ -188,22 +207,27 @@ impl Components {
         )
         .await?;
 
-        let jq_config = config.global.job_queue.as_ref().ok_or_else(|| {
+        let _jq_config = config.global.job_queue.as_ref().ok_or_else(|| {
             bootstrap::Error::JobQueue(job_store::Error::Initialization(
                 "[global.job_queue] is required for the worker subcommand".to_string(),
             ))
         })?;
 
-        let backends = jq_config.to_backends()?;
-        let consumer = Arc::new(DurableJobConsumer::new(
-            backends.store,
-            backends.leases,
-            jq_config.default_lease_ttl_secs,
-            Uuid::new_v4().to_string(),
-        ));
+        let worker_id = Uuid::new_v4().to_string();
+        let storage_config = config.resolve_registry_storage();
+        let storage = storage_config.build_store().await?;
+
+        // Spawn the engine maintenance loops once per worker process so any
+        // crashed-mid-Apply transactions are recovered and orphan body
+        // staging is reaped.
+        if let Some(token) = engine_maintenance {
+            bootstrap::spawn_engine_maintenance(&storage, token);
+        }
+
+        let consumer = Arc::new(JobStore::new(storage, worker_id));
         let handler: Arc<dyn JobHandler> = Arc::new(CacheJobHandler::new(
             repositories,
-            blob_handles.upload_store,
+            blob_backend,
             metadata_store,
         ));
 

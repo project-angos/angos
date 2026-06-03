@@ -11,11 +11,11 @@ use crate::{
 };
 
 pub struct BlobOwnership<'a> {
-    metadata_store: &'a (dyn MetadataStore + Send + Sync),
+    metadata_store: &'a MetadataStore,
 }
 
 impl<'a> BlobOwnership<'a> {
-    pub fn new(metadata_store: &'a (dyn MetadataStore + Send + Sync)) -> Self {
+    pub fn new(metadata_store: &'a MetadataStore) -> Self {
         Self { metadata_store }
     }
 
@@ -42,18 +42,6 @@ impl<'a> BlobOwnership<'a> {
         }
     }
 
-    pub async fn revoke(
-        &self,
-        namespace: &Namespace,
-        digest: &Digest,
-        link: LinkKind,
-    ) -> Result<(), Error> {
-        self.metadata_store
-            .update_blob_index(namespace.as_ref(), digest, BlobIndexOperation::Remove(link))
-            .await
-            .map_err(Error::from)
-    }
-
     pub async fn references(
         &self,
         namespace: &Namespace,
@@ -68,12 +56,5 @@ impl<'a> BlobOwnership<'a> {
             Err(MetadataError::ReferenceNotFound) => Ok(HashSet::new()),
             Err(error) => Err(error.into()),
         }
-    }
-
-    pub async fn has_any_reference(&self, digest: &Digest) -> Result<bool, Error> {
-        self.metadata_store
-            .has_blob_references(digest)
-            .await
-            .map_err(Error::from)
     }
 }

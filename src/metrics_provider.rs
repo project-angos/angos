@@ -1,5 +1,6 @@
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
+use angos_tx_engine::lock::metrics::{LockMetrics, set_lock_metrics};
 use prometheus::{
     Encoder, HistogramVec, IntCounterVec, IntGauge, IntGaugeVec, Registry as PrometheusRegistry,
     TextEncoder, register_histogram_vec_with_registry, register_int_counter_vec_with_registry,
@@ -13,13 +14,61 @@ static METRICS: OnceLock<MetricsProvider> = OnceLock::new();
 
 /// Initializes the metrics provider at startup.
 ///
-/// Must be called once before any code that records a metric runs. Returns
-/// `Err` if metric registration fails or if called more than once.
+/// Must be called once before any code that records a metric runs. Also
+/// installs the lock-metrics sink in `angos-tx-engine` so the lock backends
+/// (which live in the engine crate but have no `metrics_provider` access)
+/// can record observations into the same prometheus registry.
+///
+/// Returns `Err` if metric registration fails or if called more than once.
 pub fn initialize_metrics() -> Result<(), Error> {
     let provider = MetricsProvider::new()?;
     METRICS
         .set(provider)
-        .map_err(|_| Error::Initialization("metrics provider already initialized".to_string()))
+        .map_err(|_| Error::Initialization("metrics provider already initialized".to_string()))?;
+    set_lock_metrics(Arc::new(PrometheusLockMetrics))
+        .map_err(|_| Error::Initialization("lock metrics sink already installed".to_string()))
+}
+
+/// Adapter implementing [`LockMetrics`] over the process-wide
+/// [`MetricsProvider`]. Carries no state of its own — each call fetches the
+/// `'static` provider and increments / observes against the prometheus vecs.
+struct PrometheusLockMetrics;
+
+impl LockMetrics for PrometheusLockMetrics {
+    fn observe_acquisition_duration(&self, backend: &str, ms: f64) {
+        metrics_provider()
+            .lock_acquisition_duration
+            .with_label_values(&[backend])
+            .observe(ms);
+    }
+
+    fn record_acquisition(&self, backend: &str, outcome: &str) {
+        metrics_provider()
+            .lock_acquisitions
+            .with_label_values(&[backend, outcome])
+            .inc();
+    }
+
+    fn record_invalidation(&self, backend: &str, reason: &str) {
+        metrics_provider()
+            .lock_invalidations
+            .with_label_values(&[backend, reason])
+            .inc();
+    }
+
+    fn record_retry(&self, backend: &str) {
+        metrics_provider()
+            .lock_retries
+            .with_label_values(&[backend])
+            .inc();
+    }
+
+    fn record_recovery(&self, backend: &str, outcome: &str) {
+        metrics_provider()
+            .lock_recoveries
+            .with_label_values(&[backend, outcome])
+            .inc();
+    }
 }
 
 /// Returns a reference to the initialized metrics provider.

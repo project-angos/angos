@@ -72,6 +72,102 @@ async fn delete_prefix_on_missing_prefix_is_success() {
 }
 
 #[tokio::test]
+async fn delete_prefix_prunes_empty_ancestors_up_to_root() {
+    let dir = TempDir::new().unwrap();
+    let store = backend(&dir);
+    store
+        .put("x/y/z/data", Bytes::from_static(b"v"))
+        .await
+        .unwrap();
+
+    store.delete_prefix("x/y/z").await.unwrap();
+
+    // The whole now-empty chain collapses, but the store root survives.
+    assert!(
+        !dir.path().join("x").exists(),
+        "empty ancestors must be pruned"
+    );
+    assert!(dir.path().exists(), "the store root is never removed");
+}
+
+#[tokio::test]
+async fn delete_prefix_stops_pruning_at_first_non_empty_ancestor() {
+    let dir = TempDir::new().unwrap();
+    let store = backend(&dir);
+    store
+        .put("shard/aa/blob1/data", Bytes::from_static(b"1"))
+        .await
+        .unwrap();
+    store
+        .put("shard/aa/blob2/data", Bytes::from_static(b"2"))
+        .await
+        .unwrap();
+
+    store.delete_prefix("shard/aa/blob1").await.unwrap();
+
+    // `shard/aa` still holds `blob2`, so pruning halts there.
+    assert!(!dir.path().join("shard/aa/blob1").exists());
+    assert_eq!(store.get("shard/aa/blob2/data").await.unwrap(), b"2");
+    assert!(dir.path().join("shard/aa").exists());
+}
+
+/// A `..`-bearing key whose ancestors resolve *above* the store root must
+/// never let pruning touch anything outside the root. `prune_empty_ancestors`
+/// must lexically collapse the path before any `read_dir`/`remove_dir`, so a
+/// crafted escape resolves to "not under root" and prunes nothing. Regression
+/// guard for the lexical-`starts_with` hole that let `remove_dir` delete an
+/// empty directory sitting next to the configured root.
+#[tokio::test]
+async fn prune_empty_ancestors_refuses_to_escape_root_via_dotdot() {
+    use std::fs as stdfs;
+
+    let dir = TempDir::new().unwrap();
+    // The store root is a *sub*directory of the tempdir, so a sibling dir can
+    // sit outside the root yet still inside the tempdir we control.
+    let root = dir.path().join("root");
+    stdfs::create_dir(&root).unwrap();
+    let outside = dir.path().join("outside");
+    stdfs::create_dir(&outside).unwrap();
+
+    let store = Backend::builder()
+        .root_dir(&root)
+        .build()
+        .expect("backend must build");
+
+    // `root.join("../outside/leaf")` resolves at syscall time to
+    // `<tmp>/outside/leaf`; its parent is the empty `<tmp>/outside`, which the
+    // old lexical guard would have happily `remove_dir`'d.
+    store.prune_empty_ancestors("../outside/leaf").await;
+
+    assert!(
+        outside.exists(),
+        "pruning must never remove a directory outside the configured root"
+    );
+    assert!(root.exists(), "the store root itself must survive");
+}
+
+/// Companion to the escape guard: a normal nested key (no `.`/`..`) must still
+/// have its now-empty in-root ancestors pruned exactly as before — the fix
+/// changes nothing for well-formed keys.
+#[tokio::test]
+async fn prune_empty_ancestors_still_collapses_normal_in_root_chain() {
+    let dir = TempDir::new().unwrap();
+    let store = backend(&dir);
+
+    // Build an empty chain `p/q/r` with no leaf left behind, then prune from a
+    // would-be leaf inside it.
+    std::fs::create_dir_all(dir.path().join("p/q/r")).unwrap();
+
+    store.prune_empty_ancestors("p/q/r/leaf").await;
+
+    assert!(
+        !dir.path().join("p").exists(),
+        "empty in-root ancestors must still be pruned for normal keys"
+    );
+    assert!(dir.path().exists(), "the store root is never removed");
+}
+
+#[tokio::test]
 async fn head_reports_size_and_mtime() {
     let dir = TempDir::new().unwrap();
     let store = backend(&dir);
@@ -206,7 +302,7 @@ async fn copy_duplicates_object() {
 }
 
 /// `list_all_children` must return every child even when the directory
-/// contains more entries than a single page (page_size=2 used internally
+/// contains more entries than a single page (`page_size=2` used internally
 /// to exercise the pagination loop).
 #[tokio::test]
 async fn list_all_children_returns_all_entries_across_pages() {
@@ -257,4 +353,31 @@ async fn sync_to_disk_flag_does_not_change_observable_behaviour() {
         .await
         .unwrap();
     assert_eq!(store.get("k").await.unwrap(), b"durable");
+}
+
+/// A stray atomic-write temporary sitting in a directory must never be
+/// surfaced by `list`/`list_children`. Regression guard for the conformance
+/// failure where a concurrent reader observed a 0-byte `.angos-write.*` temp
+/// in a `blob-index/.../refs/` dir and failed to JSON-parse it.
+#[tokio::test]
+async fn listings_skip_atomic_write_temporaries() {
+    use std::fs as stdfs;
+
+    let dir = TempDir::new().unwrap();
+    let store = backend(&dir);
+    store
+        .put("ns/real.json", Bytes::from_static(b"[]"))
+        .await
+        .unwrap();
+
+    // Simulate an in-flight atomic write: an empty temp file next to the real
+    // object, with the reserved prefix.
+    stdfs::write(dir.path().join("ns").join(".angos-write.deadbeef"), b"").unwrap();
+
+    let page = store.list("ns", 100, None).await.unwrap();
+    assert_eq!(page.items, vec!["real.json".to_string()]);
+
+    let children = store.list_children("ns", 100, None, None).await.unwrap();
+    assert_eq!(children.objects, vec!["real.json".to_string()]);
+    assert!(children.next_token.is_none());
 }

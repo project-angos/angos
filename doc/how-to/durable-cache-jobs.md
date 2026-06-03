@@ -6,17 +6,18 @@ title: "Enable Durable Cache Jobs"
 
 # Enable Durable Cache Jobs
 
-By default, pull-through cache-fill tasks run in-process: when a client requests
-a blob that is not yet locally cached, Angos streams it from upstream to the
-client and simultaneously spawns an in-process task to write a local copy.
-That task lives in memory so it is lost on restart, cannot be observed by an
-external autoscaler, and deduplication only works within a single process.
+Pull-through cache-fill tasks always go through the engine-backed job queue.
+By default (when `[global.job_queue]` is absent) jobs are stored in-process
+memory: a client request enqueues a cache-fill job, an in-process worker drains
+it immediately, and the queue is discarded on restart. Deduplication within a
+single process is guaranteed, but the queue cannot be observed externally.
 
-Durable cache jobs replace that in-process task with a record written to
-persistent storage (filesystem or S3). Jobs are processed by the `angos worker`
-subcommand, which you must run alongside `angos server` for cache-fill work to
-actually happen. `angos server` only enqueues jobs and publishes the queue
-depth gauge for autoscaling.
+Adding `[global.job_queue]` makes the queue durable: instead of in-memory,
+jobs are stored in the **same backend you configured for `[metadata_store]`**
+(filesystem or S3, whichever metadata uses), under a hardcoded `_jobs/` prefix.
+Jobs survive restarts, can be shared across replicas, and are drained by one or
+more `angos worker` subcommands that you run alongside `angos server`. The code
+path is identical in both modes; only the storage backing changes.
 
 ## When should I use this?
 
@@ -29,24 +30,21 @@ Enable durable cache jobs when:
   based on queue depth (the `angos_job_queue_pending` Prometheus gauge served
   by `/metrics` on the server's listener).
 - You want cache-fill work to survive a server restart rather than being
-  silently dropped.
+  discarded.
 
-For a single-node deployment where in-process caching is working well there is
-no need to change anything; the legacy path continues to work unchanged.
+For a single-node deployment where in-process caching is sufficient there is no
+need to configure `[global.job_queue]`; jobs run in-process at full speed
+without any filesystem or network I/O for the queue layer.
 
 ## Configuration
 
-Add a `[global.job_queue]` section to `config.toml`:
-
-Pick exactly one backend sub-table — `[global.job_queue.fs]` or
-`[global.job_queue.s3]`.
-
-### Filesystem backend
-
-Use this for a single-host deployment or when servers and workers share a
-filesystem volume. Multi-process pools (multiple `angos server` or
-`angos worker` replicas sharing one `root_dir`) additionally need
-`lock_strategy.redis` — see below.
+The queue has no storage backend of its own. Durable jobs are written to the
+**same backend you already configured for `[metadata_store]`** — filesystem or
+S3 — under a hardcoded top-level `_jobs/` prefix, and the per-`lock_key`
+execution lock uses the lock strategy inherited from `[metadata_store]`. There
+is no `[global.job_queue.fs]` or `[global.job_queue.s3]` sub-table: enabling the
+queue is just a matter of adding `[global.job_queue]`, which accepts only the
+two tunables below.
 
 ```toml
 [global]
@@ -54,46 +52,18 @@ max_concurrent_cache_jobs = 4   # also bounds the number of jobs each `angos wor
                                 # processes in parallel
 
 [global.job_queue]
-default_lease_ttl_secs = 30          # per-job worker lease TTL in seconds (min 9)
-pending_refresh_interval_secs = 15   # how often the server refreshes the pending gauge
+pending_refresh_interval_secs = 15   # how often the server refreshes the pending gauge (minimum 5)
 pending_ready_horizon_secs = 600     # only jobs ready within this many seconds count toward the gauge
-
-[global.job_queue.fs]
-root_dir = "/var/lib/angos/jobs"     # must be writable by every server and worker replica
-# lock_strategy defaults to "memory" (single-process scope only). For
-# multi-process pools sharing root_dir, replace it with the Redis sub-table:
-#
-# [global.job_queue.fs.lock_strategy.redis]
-# url = "redis://localhost:6379"
-# ttl = 30
 ```
 
-> **Note:** Lease coordination is delegated to the configured `lock_strategy`,
-> not to any filesystem-level primitive. The default `"memory"` strategy only
-> coordinates within a single process — a second `angos server` or
-> `angos worker` pointed at the same `root_dir` will race. Multi-process pools
-> must configure `lock_strategy.redis`. The S3 lock strategy used by the S3
-> metadata store is rejected for the FS job store.
-
-### S3 backend
-
-Use this for multi-node deployments or when blob storage is already on S3.
-
-```toml
-[global.job_queue]
-default_lease_ttl_secs = 30          # min 9
-pending_refresh_interval_secs = 15   # keep at 15 or higher on S3 to avoid
-                                     # excessive LIST requests
-pending_ready_horizon_secs = 600     # autoscaler gauge horizon
-
-[global.job_queue.s3]
-bucket = "angos-jobs"
-prefix = "_jobs"
-endpoint = "https://<s3-compatible-endpoint>"
-region = "us-east-1"
-access_key_id = "<key-id>"
-secret_key = "<secret-key>"
-```
+> **Note:** Because storage is inherited from `[metadata_store]`, multi-process
+> pools (multiple `angos server` or `angos worker` replicas) need a
+> multi-process-safe lock strategy on the metadata store — `lock_strategy.redis`
+> for the filesystem backend, or the default `lock_strategy = "s3"` for the S3
+> backend. The default `"memory"` lock strategy only coordinates workers within
+> a single process, so a second replica would race. See
+> [the configuration reference](../reference/configuration.md) for the
+> `[metadata_store]` lock options.
 
 ## Running the worker
 
@@ -105,7 +75,8 @@ A durable-queue deployment needs both subcommands:
 - `angos worker` polls the queue, fetches blobs from upstream, and writes them
   into the shared blob/metadata store. Each worker processes up to
   `max_concurrent_cache_jobs` jobs in parallel; multiple workers safely share
-  the queue thanks to per-`lock_key` leases. Run at least one.
+  the queue thanks to a per-`lock_key` execution lock held on the lock strategy
+  inherited from `[metadata_store]`. Run at least one.
 
 Both subcommands hot-reload `config.toml` on disk: changes to
 `[global.job_queue]`, `[repository.*]`, `[blob_store.*]`, or
@@ -114,9 +85,10 @@ finish on the components they started with.
 
 ### Worker subcommand options
 
-| Flag                         | Default | Description                                              |
-|------------------------------|---------|----------------------------------------------------------|
-| `--poll-interval <duration>` | `1s`    | Minimum wait between claim attempts when no ready job is found. If the queue contains only backed-off envelopes, the worker extends the wait up to the soonest `not_before` (capped at 1 minute, or `--poll-interval` if it is larger) to avoid polling-storm cost. |
+| Flag                         | Default   | Description                                            |
+|------------------------------|-----------|--------------------------------------------------------|
+| `--queue <name>`             | `"cache"` | Queue to drain. The only queue currently produced is `cache` (pull-through cache-fill), so this rarely needs changing. |
+| `--poll-interval <duration>` | `1s`      | Minimum wait between claim attempts when no ready job is found. If the queue contains only backed-off envelopes, the worker extends the wait up to the soonest `not_before` (capped at 1 minute, or `--poll-interval` if it is larger) to avoid polling-storm cost. |
 
 ### Example: server + worker pods
 
@@ -140,8 +112,8 @@ configured the server publishes:
 | `angos_job_queue_enqueued_total` | Counter | `queue`, `dedup` | Jobs submitted. `dedup="hit"` means a duplicate `lock_key` was suppressed. |
 
 `angos worker` has no HTTP listener and therefore exposes no metrics of its
-own; per-execution diagnostics (claim, success, retry, dead-letter,
-lease-lost) are emitted via structured logs and keyed on `lock_key`.
+own; per-execution diagnostics (claim, success, retry, dead-letter, lock-lost)
+are emitted via structured logs and keyed on `lock_key`.
 
 ## Operational notes
 
@@ -159,21 +131,24 @@ re-execution rename the file with a zero prefix:
 already hit the retry ceiling will still go straight to DLQ on first failure
 unless you also edit the body).
 
-**FS backend on shared storage:** Lease coordination is provided by the
-configured `lock_strategy`, not by the filesystem. A shared volume only needs
-to be writable by every replica and to support atomic rename within a
-directory. Multi-process pools require `lock_strategy.redis`; the default 
-`lock_strategy = "memory"` does not coordinate across processes even
-on a shared mount. If you do not want to run Redis, use the S3 backend
+**Filesystem metadata store on shared storage:** When `[metadata_store]` uses
+the filesystem backend, worker coordination is provided by its configured
+`lock_strategy`, not by the filesystem. A shared volume only needs to be
+writable by every replica and to support atomic rename within a directory.
+Multi-process pools require `[metadata_store.fs.lock_strategy.redis]`; the
+default `lock_strategy = "memory"` does not coordinate across processes even on
+a shared mount. If you do not want to run Redis, use the S3 metadata backend
 instead.
 
-**S3 backend requirements:** Lease ownership is tracked via the `ETag` header
-returned by the storage service on `PUT`. S3-compatible endpoints that strip
-`ETag` from PUT responses are not supported; lease creation fails loudly with
-`S3 PUT response is missing an ETag` rather than silently dropping jobs.
-Lease release uses `DELETE` with `If-Match: <etag>` on services that support
-it (the default); set `delete_if_match = false` on endpoints without
-conditional delete to fall back to an unconditional `DELETE`.
+**S3 metadata store requirements:** When `[metadata_store]` uses the S3 backend
+with the default `lock_strategy = "s3"`, the per-`lock_key` execution lock is
+held on an S3 object backed by conditional writes — the provider must support
+`put_if_none_match` and `put_if_match`. Endpoints that strip `ETag` from PUT
+responses are not supported; angos fails fast at startup rather than silently
+dropping jobs. Lock release uses `DELETE` with `If-Match: <etag>` on services
+that support it (the default); set `delete_if_match = false` under
+`[metadata_store.s3]` on endpoints without conditional delete to fall back to
+an unconditional `DELETE`.
 
 **S3 LIST cost:** Each enqueue scans `_jobs/pending/cache/` for duplicate
 `lock_key`s. At the default `pending_refresh_interval_secs = 15` and with N
@@ -190,3 +165,15 @@ config load (sub-5s ticks induce LIST storms on S3).
 `min(1 min × 2^attempts, 10 min)`. With the default 5-attempt budget a job
 retries 4 times with delays of 2, 4, 8 and 10 minutes (24 minutes total)
 before being moved to the dead-letter queue.
+
+**Transactional engine path:** All writes — enqueue, complete, retry, and
+dead-letter — are routed through the transactional engine regardless of the
+metadata-store backend. On `complete`, the handler's work-product mutations (for
+`cache.fetch_blob`: `Move` of staged bytes to the canonical blob path,
+`Delete` of the upload-session record, and the per-namespace blob-index
+grant) are merged with the pending and dedup-index deletes into one engine
+transaction. The worker releases the per-`lock_key` execution lock right
+after that transaction settles, so the work commit and the queue cleanup
+land atomically and the next worker can claim the same `lock_key` without
+waiting on TTL. The on-disk layout under `_jobs/pending/`, `_jobs/failed/`, and
+`_jobs/index/` is identical for both the filesystem and S3 backends.

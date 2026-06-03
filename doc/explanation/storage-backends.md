@@ -268,8 +268,6 @@ max_retries = 100           # Retry attempts
 retry_delay_ms = 10         # Initial retry delay; retries back off up to 1s with jitter
 ```
 
-**Legacy form:** The `[metadata_store.*.redis]` table (e.g., `[metadata_store.fs.redis]`) is still accepted for backward compatibility and is equivalent to `[metadata_store.*.lock_strategy.redis]`. New configurations should use the `lock_strategy` form.
-
 ### S3 Locking
 
 Available only when using S3 for metadata (not supported with filesystem metadata stores). Uses conditional writes (`If-None-Match: *`) to implement distributed locks directly in the S3 bucket, eliminating the need for Redis. Stale locks are automatically recovered after TTL expiry.
@@ -283,7 +281,7 @@ max_retries = 100           # Acquisition retry attempts
 retry_delay_ms = 50         # Delay between retries (minimum: 1)
 ```
 
-The heartbeat interval is automatically calculated as `ttl_secs / 3`. For example, with the default `ttl_secs = 30`, heartbeats occur every 10 seconds. The minimum `ttl_secs` value is 9 seconds, resulting in a minimum heartbeat interval of 3 seconds.
+The heartbeat interval is automatically calculated as `ttl_secs / 3`. For example, with the default `ttl_secs = 30`, heartbeats occur every 10 seconds. The minimum `ttl_secs` value is 9 seconds, resulting in a minimum heartbeat interval of 3 seconds. Transient heartbeat failures (connect errors, refresh timeouts) accumulate up to a small budget — roughly one TTL of slack — before cancelling the in-flight operation, so a short network blip does not kill in-progress work. Authoritative signals (ownership loss, max-hold expiry, missing lock object) cancel immediately.
 
 :::note
 The S3 provider must support conditional writes. Angos probes for this capability at startup and fails fast if it is not available.
@@ -323,12 +321,12 @@ Lock operations emit Prometheus metrics for observability. Key metrics to monito
 
 - `lock_acquisition_duration_ms` — Histogram of lock acquisition times (e.g., p99 > 500ms indicates S3 latency degradation)
 - `lock_retries_total` — Counter of lock acquisition retries (e.g., rising rate indicates lock contention)
-- `lock_invalidations_total{reason="heartbeat_failure"}` — Stale heartbeat failures (e.g., indicates S3 connectivity issues)
+- `lock_invalidations_total{reason="heartbeat_failure"}` — Heartbeat failures that exhausted the retry budget (e.g., indicates connectivity issues between the registry and the lock store). The heartbeat path is backend-agnostic, so both S3 and Redis report `heartbeat_failure`.
 - `lock_recoveries_total` — Counter of stale lock recovery attempts (e.g., indicates crashed instances)
 
 For multi-instance deployments, alert on:
 - **High `lock_retries_total` rate**: Rising retry rate during normal operation suggests lock contention and may indicate insufficient `max_retries` or `retry_delay_ms` tuning.
-- **`lock_invalidations_total{reason="heartbeat_failure"}`**: Heartbeat failures suggest network issues between the registry and S3. Consider checking S3 connectivity, network quality, and lock timeout settings.
+- **`lock_invalidations_total{reason="heartbeat_failure"}`**: Heartbeat-side failures suggest network or backend issues between the registry and the lock store. Consider checking connectivity, network quality, and lock timeout settings. Heartbeat failures must accumulate past a budget — roughly one TTL of slack — before the in-flight operation is cancelled, so an isolated blip is absorbed rather than surfaced here.
 - **High `lock_acquisition_duration_ms` p99**: Persistent p99 latency > expected S3 latency may indicate saturation or regional latency issues.
 
 See the [configuration reference](../reference/configuration.md#prometheus-metrics) for the full metrics list.
@@ -350,17 +348,17 @@ sequenceDiagram
     participant Registry
     participant S3
 
-    Client->>Registry: PATCH (chunk 1)
+    Client->>Registry: PATCH (chunk 1, < 5 MiB)
+    Registry->>S3: PutObject (stage remainder)
+
+    Client->>Registry: PATCH (chunk 2, combined ≥ 5 MiB)
     Registry->>S3: InitiateMultipartUpload
     S3-->>Registry: Upload ID
-    Registry->>S3: UploadPart (streaming, chunk 1)
-    S3-->>Registry: ETag
-
-    Client->>Registry: PATCH (chunk 2)
-    Registry->>S3: UploadPart (streaming, chunk 2)
+    Registry->>S3: UploadPart (streaming)
     S3-->>Registry: ETag
 
     Client->>Registry: PUT (complete upload)
+    Registry->>S3: UploadPart (final staged remainder)
     Registry->>S3: CompleteMultipartUpload
     S3-->>Registry: Final blob
     Registry-->>Client: 201 Created
@@ -373,9 +371,9 @@ Configuration:
 multipart_uniform_parts = false  # Default
 ```
 
-Each `PATCH` streams directly into the multipart upload as an `UploadPart` — no intermediate objects, no assembly phase. Parts are uploaded with their known `Content-Length` from the HTTP request header and flow frame-by-frame from the client to S3 without buffering. Small `PATCH` requests (< 5 MiB) are accumulated in a pending buffer until they reach the S3 minimum part size.
+Each `PATCH` streams toward S3 with its known `Content-Length` from the HTTP request header, frame-by-frame without buffering the whole chunk. The multipart upload is opened **lazily**: bytes below the 5 MiB S3 minimum are parked at a per-session staging key and combined with the next `PATCH`, so a multipart session is created only once there are enough bytes to flush a part of at least 5 MiB. An upload whose total never reaches 5 MiB skips multipart entirely — `complete` promotes the staged object to the upload key with a single `CopyObject`.
 
-**Memory usage:** ~8 KiB per `PATCH` (a single streaming read frame). Small `PATCH` requests use up to 5 MiB for the pending buffer. Total memory is essentially constant regardless of blob size.
+**Memory usage:** bytes stream frame-by-frame, so memory is essentially constant regardless of blob size. The only buffered data is the sub-part remainder (< 5 MiB), which is parked in S3 between `PATCH` calls and re-read when the next chunk arrives.
 
 ### Uniform Upload Mode
 
@@ -388,6 +386,7 @@ sequenceDiagram
     participant S3
 
     Client->>Registry: PATCH (chunk 1)
+    Note over Registry,S3: stage bytes until ≥ multipart_part_size
     Registry->>S3: InitiateMultipartUpload
     S3-->>Registry: Upload ID
     Registry->>S3: UploadPart (exact multipart_part_size)
@@ -413,9 +412,9 @@ multipart_uniform_parts = true
 multipart_part_size = "50MiB"
 ```
 
-In this mode, a long-lived multipart upload is maintained across all `PATCH` requests. Each non-final part is exactly `multipart_part_size` bytes, and the final part may be smaller.
+In this mode the multipart upload is opened on the first full part and maintained across the remaining `PATCH` requests. Each non-final part is exactly `multipart_part_size` bytes, and the final part may be smaller.
 
-**Memory usage:** full parts stream to S3 in small read frames. Only the trailing staged chunk is buffered, and it is always smaller than `multipart_part_size`.
+**Memory usage:** full parts stream to S3 in small read frames; only the trailing sub-part remainder (smaller than `multipart_part_size`) is staged in S3 between calls.
 
 ### Related Configuration
 
@@ -646,3 +645,18 @@ Without Redis, cache is in-memory per-instance.
 | Cost (small scale) | ✅             | ❌               |
 | Cost (large scale) | ❌             | ✅               |
 | Unlimited storage  | ❌             | ✅               |
+
+## Transactional Engine
+
+The transactional engine is a single design — an abstraction that consolidates multi-step storage writes behind single atomic `Transaction` objects — that each subsystem instantiates over its own store with its own lock domain; it is always active. Blob-bytes operations that span the blob store serialize via a `blob-data:{digest}` coarse lock taken on the metadata engine, the single lock domain shared by every blob-data participant. The four subsystems it covers are:
+
+| Subsystem | Description |
+|---|---|
+| Metadata store | `MetadataStore::update_links` — link writes and blob-index shard read-modify-write submitted as one transaction. |
+| Job store | `JobStore::enqueue`, `JobStore::complete`, and `JobStore::fail` — lock release and pending/index deletes commit atomically as one transaction. |
+| Upload store | Blob upload sessions persisted as per-file artifacts under `v2/repositories/<namespace>/_uploads/<uuid>/` (`session`, `startedat`, `hashstates/sha256/<offset>`, `data`); `complete` runs an engine transaction that moves the staged blob to its canonical key and deletes the session-record files. |
+| Manifest store | `Registry::store_manifest` and `Registry::delete_manifest` — blob write, link writes, and blob-index mutations expressed as one transaction, making the "blob landed, links failed" orphan class structurally impossible. |
+
+The CAS-vs-Lock executor choice happens once inside the engine factory based on the configured `lock_strategy` and detected S3 capabilities; subsystems never see it. The on-disk key layout is unchanged from a non-transactional deployment.
+
+The engine keeps three reserved prefixes: `.tx-log/` holds the transaction journal, `.tx-bodies/` holds staged object bodies, and `.tx-locks/` holds lock objects. Recovery runs automatically and needs no operator configuration. Every server and worker replica runs a recovery loop that completes or rolls back any transaction interrupted by a crash. A body janitor reaps orphaned staged bodies under `.tx-bodies/` once they exceed a TTL, and a lock janitor reclaims cold lock objects under `.tx-locks/` once they exceed their TTL plus a grace period. The recovery loop sweeps every 30 seconds; the body and lock janitors sweep every five minutes.

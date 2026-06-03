@@ -3,13 +3,15 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
+use angos_tx_engine::transaction::Transaction;
+
 use crate::{
     oci::{Digest, Namespace},
     registry::{
-        blob::cache_blob,
+        blob::cache_blob_mutations,
         blob_ownership::BlobOwnership,
-        blob_store::UploadStore,
-        job_store::{JobEnvelope, JobHandler},
+        blob_store::BlobStore,
+        job_store::{Error, JobEnvelope, JobHandler},
         metadata_store::MetadataStore,
         repository_resolver::RepositoryResolver,
     },
@@ -31,19 +33,19 @@ pub struct CacheFetchBlobPayload {
 /// replicas can dedup the same miss safely.
 pub struct CacheJobHandler {
     resolver: Arc<RepositoryResolver>,
-    upload_store: Arc<dyn UploadStore>,
-    metadata_store: Arc<dyn MetadataStore>,
+    blob_store: Arc<BlobStore>,
+    metadata_store: Arc<MetadataStore>,
 }
 
 impl CacheJobHandler {
     pub fn new(
         resolver: Arc<RepositoryResolver>,
-        upload_store: Arc<dyn UploadStore>,
-        metadata_store: Arc<dyn MetadataStore>,
+        blob_store: Arc<BlobStore>,
+        metadata_store: Arc<MetadataStore>,
     ) -> Self {
         Self {
             resolver,
-            upload_store,
+            blob_store,
             metadata_store,
         }
     }
@@ -51,57 +53,69 @@ impl CacheJobHandler {
 
 #[async_trait]
 impl JobHandler for CacheJobHandler {
-    async fn execute(&self, envelope: &JobEnvelope) -> Result<(), String> {
+    async fn execute(&self, envelope: &JobEnvelope) -> Result<Transaction, Error> {
         if envelope.kind != CACHE_FETCH_BLOB_KIND {
-            return Err(format!(
+            return Err(Error::Storage(format!(
                 "unsupported job kind '{}'; expected '{CACHE_FETCH_BLOB_KIND}'",
                 envelope.kind,
-            ));
+            )));
         }
         let payload: CacheFetchBlobPayload = serde_json::from_value(envelope.payload.clone())
-            .map_err(|e| format!("failed to deserialize job payload: {e}"))?;
+            .map_err(|e| Error::Storage(format!("failed to deserialize job payload: {e}")))?;
 
-        let namespace = Namespace::new(&payload.namespace)
-            .map_err(|e| format!("invalid namespace '{}': {e}", payload.namespace))?;
+        let namespace = Namespace::new(&payload.namespace).map_err(|e| {
+            Error::Storage(format!("invalid namespace '{}': {e}", payload.namespace))
+        })?;
         let digest: Digest = payload
             .digest
             .parse()
-            .map_err(|e| format!("invalid digest '{}': {e}", payload.digest))?;
+            .map_err(|e| Error::Storage(format!("invalid digest '{}': {e}", payload.digest)))?;
 
-        // The lease was acquired before `execute`, so no other worker is
-        // concurrently writing this blob — a positive ownership check means
-        // someone else already finished caching it.
         let already_owned = BlobOwnership::new(self.metadata_store.as_ref())
             .can_read(&namespace, &digest)
             .await
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| Error::Storage(e.to_string()))?;
         if already_owned {
-            return Ok(());
+            return Ok(Transaction::builder().build());
+        }
+
+        if self.blob_store.size(&digest).await.is_ok() {
+            let (reads, mutations) = self
+                .metadata_store
+                .build_grant_mutations(namespace.as_ref(), &digest)
+                .await
+                .map_err(|e| Error::Storage(e.to_string()))?;
+            return Ok(Transaction::from_parts(reads, mutations));
         }
 
         let Some(repository) = self.resolver.resolve(&namespace) else {
-            return Err(format!(
+            return Err(Error::Storage(format!(
                 "no repository configured for namespace '{namespace}'"
-            ));
+            )));
         };
 
         if !repository.is_pull_through() {
-            return Err("repository is not a pull-through proxy".to_string());
+            return Err(Error::Storage(
+                "repository is not a pull-through proxy".to_string(),
+            ));
         }
 
-        let (_, stream) = repository
+        let (content_length, stream) = repository
             .get_blob(&[], &namespace, &digest)
             .await
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| Error::Storage(e.to_string()))?;
 
-        cache_blob(
-            self.upload_store.clone(),
+        let (reads, mutations) = cache_blob_mutations(
+            self.blob_store.clone(),
             self.metadata_store.clone(),
             namespace,
             digest,
             stream,
+            content_length,
         )
         .await
-        .map_err(|e| e.to_string())
+        .map_err(|e| Error::Storage(e.to_string()))?;
+
+        Ok(Transaction::from_parts(reads, mutations))
     }
 }

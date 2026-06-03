@@ -36,7 +36,7 @@ pub struct Options {
     /// check for obsolete uploads with specified timeout
     pub uploads: Option<humantime::Duration>,
     #[argh(option, short = 'p')]
-    /// cleanup orphan S3 multipart uploads older than specified timeout
+    /// abort orphan S3 multipart uploads older than the specified timeout
     pub multipart: Option<humantime::Duration>,
     #[argh(switch, short = 't')]
     /// check for invalid tag digests
@@ -62,7 +62,7 @@ pub struct Options {
 }
 
 pub struct Command {
-    metadata_store: Arc<dyn MetadataStore + Send + Sync>,
+    metadata_store: Arc<MetadataStore>,
     namespace_checkers: Vec<Box<dyn NamespaceChecker>>,
     layout_checker: LayoutChecker,
     blob_checker: Option<BlobChecker>,
@@ -73,9 +73,9 @@ pub struct Command {
 impl Command {
     pub async fn new(options: &Options, config: &Configuration) -> Result<Self, Error> {
         let auth_cache = bootstrap::auth_cache(&config.cache)?;
-        let blob_handles = bootstrap::blob_stores(&config.blob_store, &auth_cache)?;
-        let (metadata_store, _) =
-            bootstrap::metadata_store(&config.resolve_metadata_config(), &auth_cache).await?;
+        let blob_backend = Arc::new(config.blob_store.build_backend()?);
+        let metadata_store =
+            bootstrap::metadata_store(&config.resolve_registry_storage(), &auth_cache).await?;
         let repositories = bootstrap::repositories(
             &config.repository,
             &auth_cache,
@@ -86,26 +86,19 @@ impl Command {
         let namespace_checkers = setup::namespace_checkers(
             options,
             config,
-            &blob_handles.blob_store,
-            &blob_handles.upload_store,
+            &blob_backend,
             &metadata_store,
             &repositories,
         )?;
-        let layout_checker = setup::layout_checker(&blob_handles.blob_store);
-        let blob_checker = setup::blob_checker(options, &blob_handles.blob_store, &metadata_store);
-        let multipart_checker =
-            setup::multipart_checker(options, blob_handles.multipart_cleanup.clone())?;
+        let layout_checker = setup::layout_checker(&blob_backend);
+        let blob_checker = setup::blob_checker(options, &blob_backend, &metadata_store);
+        let multipart_checker = setup::multipart_checker(options, &blob_backend)?;
 
         let sink: Box<dyn ActionSink + Send> = if options.dry_run {
             info!("Dry-run mode: no changes will be made to the storage");
             Box::new(DryRunSink)
         } else {
-            Box::new(Executor::new(
-                blob_handles.blob_store.clone(),
-                metadata_store.clone(),
-                blob_handles.upload_store.clone(),
-                blob_handles.multipart_cleanup,
-            ))
+            Box::new(Executor::new(blob_backend.clone(), metadata_store.clone()))
         };
 
         Ok(Self {
@@ -160,8 +153,10 @@ impl Command {
     }
 
     async fn scrub_multipart_uploads(&mut self) -> Result<(), Error> {
-        if let Some(checker) = &self.multipart_checker {
-            checker.check_all(self.sink.as_mut()).await?;
+        if let Some(checker) = &self.multipart_checker
+            && let Err(e) = checker.check_all(self.sink.as_mut()).await
+        {
+            tracing::warn!("Multipart scrub checker failed: {e}");
         }
         Ok(())
     }
@@ -194,7 +189,6 @@ mod tests {
 
             [global]
             update_pull_time = false
-            max_concurrent_cache_jobs = 10
 
             [global.retention_policy]
             rules = []
@@ -225,6 +219,5 @@ mod tests {
         // retention, uploads, tags, manifests = 4 namespace checkers
         assert_eq!(cmd.namespace_checkers.len(), 4);
         assert!(cmd.blob_checker.is_some());
-        assert!(cmd.multipart_checker.is_none());
     }
 }

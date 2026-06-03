@@ -308,7 +308,10 @@ impl Backend {
                 &key,
                 Vec::new(),
                 headers,
-                SendOpts::default(),
+                SendOpts {
+                    non_idempotent: true,
+                    ..SendOpts::default()
+                },
             )
             .await
             .map(|_| ())
@@ -338,7 +341,10 @@ impl Backend {
                 Vec::new(),
                 headers,
                 data,
-                SendOpts::default(),
+                SendOpts {
+                    non_idempotent: true,
+                    ..SendOpts::default()
+                },
             )
             .await
             .map(|response| header_string(&response.headers, "etag"))
@@ -378,6 +384,7 @@ impl Backend {
                 headers,
                 SendOpts {
                     check_embedded_error: true,
+                    ..SendOpts::default()
                 },
             )
             .await
@@ -732,6 +739,7 @@ impl Backend {
                 headers,
                 SendOpts {
                     check_embedded_error: true,
+                    ..SendOpts::default()
                 },
             )
             .await
@@ -760,6 +768,7 @@ impl Backend {
                 body,
                 SendOpts {
                     check_embedded_error: true,
+                    non_idempotent: true,
                 },
             )
             .await
@@ -1032,6 +1041,17 @@ mod tests {
         }
     }
 
+    /// Like [`test_config`] but with a short per-attempt timeout so a delayed
+    /// mock response yields a status-less (transport) `S3Error` quickly. The
+    /// generous operation-level timeout leaves room for the full retry budget.
+    fn fast_retry_config(endpoint: String) -> BackendConfig {
+        BackendConfig {
+            operation_timeout_secs: 30,
+            operation_attempt_timeout_secs: 1,
+            ..test_config(endpoint)
+        }
+    }
+
     fn create_multipart_upload_response() -> ResponseTemplate {
         ResponseTemplate::new(200).set_body_string(
             r#"<InitiateMultipartUploadResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
@@ -1237,5 +1257,116 @@ mod tests {
             .await
             .unwrap_err();
         assert!(error.to_string().contains("AccessDenied"));
+    }
+
+    // The transport (status-less) error is simulated by a mock that delays its
+    // response past the per-attempt timeout: reqwest's per-request timeout
+    // produces a `reqwest::Error` whose `status()` is `None`, which maps to an
+    // `S3Error` with `status: None` — the same shape as a connection reset or a
+    // read timeout after the request was sent.
+
+    #[tokio::test]
+    async fn conditional_put_not_retried_on_transport_error() {
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .and(path("/test-bucket/object"))
+            .respond_with(ResponseTemplate::new(201).set_delay(Duration::from_secs(5)))
+            .mount(&server)
+            .await;
+
+        let backend = Backend::new(&fast_retry_config(server.uri())).unwrap();
+        let error = backend
+            .put_object_if_not_exists("object", Bytes::from_static(b"body"))
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, Error::Io(_)));
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(
+            requests.len(),
+            1,
+            "a non-idempotent conditional PUT must make exactly one attempt on a transport error"
+        );
+    }
+
+    #[tokio::test]
+    async fn conditional_put_retried_on_retryable_status() {
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .and(path("/test-bucket/object"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&server)
+            .await;
+
+        let backend = Backend::new(&test_config(server.uri())).unwrap();
+        let error = backend
+            .put_object_if_not_exists("object", Bytes::from_static(b"body"))
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, Error::Io(_)));
+        let requests = server.received_requests().await.unwrap();
+        assert!(
+            requests.len() > 1,
+            "a non-idempotent conditional PUT must still retry on a retryable HTTP status, got {} attempts",
+            requests.len()
+        );
+    }
+
+    #[tokio::test]
+    async fn complete_multipart_upload_not_retried_on_transport_error() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/test-bucket/object"))
+            .and(query_param("uploadId", "upload-id"))
+            .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(5)))
+            .mount(&server)
+            .await;
+
+        let backend = Backend::new(&fast_retry_config(server.uri())).unwrap();
+        let error = backend
+            .complete_multipart_upload(
+                "object",
+                "upload-id",
+                &[UploadedPart {
+                    part_number: 1,
+                    e_tag: r#""etag""#.to_string(),
+                    size: 5,
+                }],
+            )
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(
+            requests.len(),
+            1,
+            "CompleteMultipartUpload must make exactly one attempt on a transport error"
+        );
+    }
+
+    #[tokio::test]
+    async fn put_object_retried_on_transport_error() {
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .and(path("/test-bucket/object"))
+            .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(5)))
+            .mount(&server)
+            .await;
+
+        let backend = Backend::new(&fast_retry_config(server.uri())).unwrap();
+        let error = backend
+            .put_object("object", Bytes::from_static(b"body"))
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+        let requests = server.received_requests().await.unwrap();
+        assert!(
+            requests.len() > 1,
+            "an idempotent PUT must still retry on a transport error, got {} attempts",
+            requests.len()
+        );
     }
 }

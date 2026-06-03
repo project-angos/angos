@@ -278,7 +278,7 @@ sudo chown -R $(id -u):$(id -g) /data/registry
 4. Check for stuck processes
 
 **Solutions for S3 locking**:
-1. Stale locks under the `_locks/` prefix are automatically recovered after TTL expiry
+1. Stale locks under the `.tx-locks/` prefix are automatically recovered after TTL expiry
 2. If operations take longer than the TTL, increase `ttl_secs` (minimum: 9):
    ```toml
    [metadata_store.s3.lock_strategy.s3]

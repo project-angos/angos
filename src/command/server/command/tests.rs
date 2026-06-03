@@ -3,6 +3,7 @@ use std::{
     sync::{Arc, Mutex, Once, PoisonError},
 };
 
+use angos_tx_engine::ConditionalCapabilities;
 use tempfile::TempDir;
 
 use crate::{
@@ -18,10 +19,7 @@ use crate::{
     },
     configuration::{self, Configuration, ServerConfig},
     policy::{AccessMode, AccessPolicyConfig, CelRule},
-    registry::{
-        Registry, RegistryConfig, manifest::DEFAULT_MAX_MANIFEST_SIZE_BYTES,
-        metadata_store::ConditionalCapabilities, repository,
-    },
+    registry::{Registry, RegistryConfig, manifest::DEFAULT_MAX_MANIFEST_SIZE_BYTES, repository},
     secret::Secret,
 };
 
@@ -56,7 +54,6 @@ fn create_minimal_config() -> (Configuration, TempDir, TempDir) {
 
         [global]
         update_pull_time = false
-        max_concurrent_cache_jobs = 10
     "#,
         blobs = blobs.path().display(),
         meta = meta.path().display(),
@@ -83,7 +80,6 @@ fn create_config_with_repository() -> (Configuration, TempDir, TempDir) {
 
         [global]
         update_pull_time = false
-        max_concurrent_cache_jobs = 10
 
         [repository.test-repo.access_policy]
         default = "allow"
@@ -98,8 +94,7 @@ fn create_config_with_repository() -> (Configuration, TempDir, TempDir) {
 #[test]
 fn test_build_blob_store_filesystem_success() {
     let (config, _blobs, _meta) = create_minimal_config();
-    let auth_cache = bootstrap::auth_cache(&config.cache).unwrap();
-    let result = bootstrap::blob_stores(&config.blob_store, &auth_cache);
+    let result = config.blob_store.build_backend();
 
     assert!(result.is_ok());
 }
@@ -134,7 +129,6 @@ async fn test_build_metadata_store_with_explicit_config() {
 
         [global]
         update_pull_time = false
-        max_concurrent_cache_jobs = 10
     "#,
         blobs = blobs.path().display(),
         meta = meta.path().display(),
@@ -307,7 +301,7 @@ async fn test_build_repositories_multiple() {
 #[tokio::test]
 async fn test_build_registry_minimal_config() {
     let (config, _blobs, _meta) = create_minimal_config();
-    let result = setup::build_registry(&config, &Arc::new(Mutex::new(None))).await;
+    let result = setup::build_registry(&config, &Arc::new(Mutex::new(None)), None).await;
 
     assert!(result.is_ok());
 }
@@ -315,7 +309,7 @@ async fn test_build_registry_minimal_config() {
 #[tokio::test]
 async fn test_build_registry_with_repositories() {
     let (config, _blobs, _meta) = create_config_with_repository();
-    let result = setup::build_registry(&config, &Arc::new(Mutex::new(None))).await;
+    let result = setup::build_registry(&config, &Arc::new(Mutex::new(None)), None).await;
 
     assert!(result.is_ok());
 }
@@ -340,54 +334,15 @@ async fn test_build_registry_with_update_pull_time() {
 
         [global]
         update_pull_time = true
-        max_concurrent_cache_jobs = 20
     "#,
         blobs = blobs.path().display(),
         meta = meta.path().display(),
     );
 
     let config = Configuration::load_from_str(&toml).unwrap();
-    let result = setup::build_registry(&config, &Arc::new(Mutex::new(None))).await;
+    let result = setup::build_registry(&config, &Arc::new(Mutex::new(None)), None).await;
 
     assert!(result.is_ok());
-}
-
-#[tokio::test]
-async fn test_build_registry_preserves_registry_error_details() {
-    let blobs = TempDir::new().unwrap();
-    let meta = TempDir::new().unwrap();
-    let toml = format!(
-        r#"
-        [blob_store.fs]
-        root_dir = "{blobs}"
-
-        [metadata_store.fs]
-        root_dir = "{meta}"
-
-        [cache.memory]
-
-        [server]
-        bind_address = "127.0.0.1"
-        port = 8080
-
-        [global]
-        update_pull_time = false
-        max_concurrent_cache_jobs = 0
-    "#,
-        blobs = blobs.path().display(),
-        meta = meta.path().display(),
-    );
-
-    let config = Configuration::load_from_str(&toml).unwrap();
-    let Err(error) = setup::build_registry(&config, &Arc::new(Mutex::new(None))).await else {
-        panic!("registry build should fail");
-    };
-    assert!(
-        error.to_string().contains(
-            "task pool error during operations: failed to initialize task queue: max_concurrent_cache_jobs must be greater than 0"
-        ),
-        "error should preserve registry failure details, got: {error}"
-    );
 }
 
 #[tokio::test]
@@ -441,7 +396,7 @@ async fn test_service_listener_enum_variants() {
         panic!("Expected insecure config")
     };
 
-    let (registry, _) = setup::build_registry(&config, &Arc::new(Mutex::new(None)))
+    let (registry, _) = setup::build_registry(&config, &Arc::new(Mutex::new(None)), None)
         .await
         .unwrap();
     let context = ServerContext::new(&config, registry).unwrap();
@@ -481,7 +436,7 @@ async fn test_build_registry_components_integration() {
     let (config, _blobs, _meta) = create_config_with_repository();
 
     let auth_cache = bootstrap::auth_cache(&config.cache).unwrap();
-    let blob_handles = bootstrap::blob_stores(&config.blob_store, &auth_cache).unwrap();
+    let blob_backend = std::sync::Arc::new(config.blob_store.build_backend().unwrap());
     let metadata_store =
         setup::build_metadata_store(&config, &auth_cache, &Arc::new(Mutex::new(None)))
             .await
@@ -498,18 +453,10 @@ async fn test_build_registry_components_integration() {
         .update_pull_time(config.global.update_pull_time)
         .enable_blob_redirect(config.global.resolved_enable_blob_redirect())
         .enable_manifest_redirect(config.global.resolved_enable_manifest_redirect())
-        .concurrent_cache_jobs(config.global.max_concurrent_cache_jobs)
         .global_immutable_tags(config.global.immutable_tags)
         .global_immutable_tags_exclusions(config.global.immutable_tags_exclusions.clone());
 
-    let registry = Registry::new(
-        blob_handles.blob_store,
-        blob_handles.upload_store,
-        blob_handles.presigned_store,
-        metadata_store,
-        repositories,
-        registry_config,
-    );
+    let registry = Registry::new(blob_backend, metadata_store, repositories, registry_config);
 
     assert!(registry.is_ok());
 }
@@ -571,7 +518,6 @@ fn create_config_with_webhook(url: &str) -> (Configuration, TempDir, TempDir) {
 
         [global]
         update_pull_time = false
-        max_concurrent_cache_jobs = 10
         event_webhooks = ["test_hook"]
 
         [event_webhook.test_hook]
@@ -604,7 +550,6 @@ fn create_config_with_two_webhooks(url_a: &str, url_b: &str) -> (Configuration, 
 
         [global]
         update_pull_time = false
-        max_concurrent_cache_jobs = 10
         event_webhooks = ["hook_a", "hook_b"]
 
         [event_webhook.hook_a]
@@ -888,7 +833,6 @@ fn create_tls_config() -> (
 
         [global]
         update_pull_time = false
-        max_concurrent_cache_jobs = 10
     "#,
         blobs = blobs.path().display(),
         meta = meta.path().display(),

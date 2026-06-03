@@ -26,6 +26,7 @@ version = "1.2.0"
 dependencies = [
  "angos-s3-client",
  "angos-storage",
+ "angos-tx-engine",
  "arc-swap",
  "argh",
  "argon2",
@@ -88,7 +89,6 @@ dependencies = [
 name = "angos-s3-client"
 version = "0.1.0"
 dependencies = [
- "async-trait",
  "base64",
  "bytes",
  "bytesize",
@@ -101,10 +101,8 @@ dependencies = [
  "quick-xml",
  "reqwest",
  "serde",
- "serde_json",
  "sha2 0.11.0",
  "smallvec",
- "thiserror 2.0.18",
  "tokio",
  "tokio-util",
  "tracing",
@@ -125,6 +123,27 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "angos-tx-engine"
+version = "0.1.0"
+dependencies = [
+ "angos-storage",
+ "async-trait",
+ "bytes",
+ "chrono",
+ "futures-util",
+ "hex",
+ "redis",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
  "thiserror 2.0.18",
  "tokio",
  "tokio-util",

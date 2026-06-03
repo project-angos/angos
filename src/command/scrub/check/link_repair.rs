@@ -9,7 +9,7 @@ use crate::{
 };
 
 pub async fn ensure_link(
-    metadata_store: &Arc<dyn MetadataStore + Send + Sync>,
+    metadata_store: &Arc<MetadataStore>,
     namespace: &str,
     link: &LinkKind,
     expected_target: &Digest,

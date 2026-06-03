@@ -50,6 +50,15 @@ impl CircuitBreaker {
         }
     }
 
+    /// Gate a request against the breaker.
+    ///
+    /// Returns `Ok(())` while closed (below the failure threshold). Once open,
+    /// requests are rejected until the cooldown elapses, after which the breaker
+    /// goes *half-open*: exactly one probe request is admitted per cooldown
+    /// window. The probe's outcome (`record_success` closes the breaker,
+    /// `record_failure` re-arms it) decides what happens next; concurrent
+    /// callers during the probe are rejected, avoiding a thundering herd against
+    /// a backend that may still be down.
     pub fn check(&self) -> Result<(), CircuitBreakerError> {
         let failures = self.consecutive_failures.load(Ordering::Acquire);
         if failures < CIRCUIT_BREAKER_THRESHOLD {
@@ -60,13 +69,29 @@ impl CircuitBreaker {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
-        if now.saturating_sub(opened_at) >= CIRCUIT_BREAKER_COOLDOWN_SECS {
-            return Ok(());
-        }
-        Err(CircuitBreakerError {
+        let rejected = || CircuitBreakerError {
             failures,
             cooldown_secs: CIRCUIT_BREAKER_COOLDOWN_SECS,
-        })
+        };
+        if now.saturating_sub(opened_at) < CIRCUIT_BREAKER_COOLDOWN_SECS {
+            return Err(rejected());
+        }
+        // Half-open: the cooldown has elapsed. Admit a single probe per window
+        // instead of releasing every waiting caller at once. The caller that
+        // wins the CAS advances `opened_at` to now and becomes the probe;
+        // concurrent callers either lose the CAS or read the advanced timestamp
+        // (cooldown no longer elapsed) and are rejected. A probe that never
+        // reports a result is superseded by the next caller after another
+        // cooldown, so the breaker cannot wedge half-open.
+        if self
+            .opened_at_epoch_secs
+            .compare_exchange(opened_at, now, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            Ok(())
+        } else {
+            Err(rejected())
+        }
     }
 
     pub fn record_success(&self) {
@@ -323,5 +348,99 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Helper: open the breaker and rewind `opened_at` so the cooldown reads as
+    /// elapsed, leaving the breaker half-open ready to admit one probe.
+    fn open_and_elapse_cooldown() -> CircuitBreaker {
+        let cb = CircuitBreaker::new();
+        for _ in 0..CIRCUIT_BREAKER_THRESHOLD {
+            cb.record_failure();
+        }
+        cb.opened_at_epoch_secs.store(
+            cb.opened_at_epoch_secs
+                .load(Ordering::Acquire)
+                .saturating_sub(CIRCUIT_BREAKER_COOLDOWN_SECS + 1),
+            Ordering::Release,
+        );
+        cb
+    }
+
+    #[test]
+    fn half_open_rejects_second_caller_until_next_cooldown() {
+        let cb = open_and_elapse_cooldown();
+        assert!(
+            cb.check().is_ok(),
+            "first caller after cooldown is admitted as the probe"
+        );
+        assert!(
+            cb.check().is_err(),
+            "a second caller in the same half-open window must be rejected (no herd)"
+        );
+    }
+
+    #[test]
+    fn half_open_admits_exactly_one_concurrent_probe() {
+        // Many callers race check() at the moment the cooldown elapses; exactly
+        // one must be admitted (the probe), the rest rejected.
+        for _ in 0..100 {
+            let cb = open_and_elapse_cooldown();
+            let admitted = Arc::new(AtomicU32::new(0));
+            let handles: Vec<_> = (0..32)
+                .map(|_| {
+                    let cb = cb.clone();
+                    let admitted = Arc::clone(&admitted);
+                    thread::spawn(move || {
+                        if cb.check().is_ok() {
+                            admitted.fetch_add(1, Ordering::AcqRel);
+                        }
+                    })
+                })
+                .collect();
+            for h in handles {
+                h.join().unwrap();
+            }
+            assert_eq!(
+                admitted.load(Ordering::Acquire),
+                1,
+                "exactly one probe must be admitted per cooldown window"
+            );
+        }
+    }
+
+    #[test]
+    fn half_open_probe_failure_re_arms_then_next_window_admits_again() {
+        let cb = open_and_elapse_cooldown();
+        assert!(cb.check().is_ok(), "probe admitted");
+
+        // The probe fails: the breaker must re-arm and reject further callers.
+        cb.record_failure();
+        assert!(
+            cb.check().is_err(),
+            "after a failed probe the breaker re-opens for another cooldown"
+        );
+
+        // Once the new cooldown elapses, a fresh probe is admitted.
+        cb.opened_at_epoch_secs.store(
+            cb.opened_at_epoch_secs
+                .load(Ordering::Acquire)
+                .saturating_sub(CIRCUIT_BREAKER_COOLDOWN_SECS + 1),
+            Ordering::Release,
+        );
+        assert!(
+            cb.check().is_ok(),
+            "a fresh probe is admitted after the next cooldown elapses"
+        );
+    }
+
+    #[test]
+    fn half_open_probe_success_closes_breaker() {
+        let cb = open_and_elapse_cooldown();
+        assert!(cb.check().is_ok(), "probe admitted");
+
+        // The probe succeeds: the breaker closes and admits everyone again.
+        cb.record_success();
+        assert!(cb.check().is_ok(), "closed breaker admits the next caller");
+        assert!(cb.check().is_ok(), "and the one after that");
     }
 }

@@ -9,14 +9,16 @@ use serde::Deserialize;
 
 use crate::secret::Secret;
 use angos_s3_client::BackendConfig as S3TransportConfig;
+use angos_tx_engine::lock::S3LockConfig;
 
 /// Connection-level parameters for an S3-compatible backend.
 ///
 /// All credential, endpoint, bucket and region fields are required when this
 /// type is deserialized via `#[serde(flatten)]`; `key_prefix` is the only
 /// optional field and defaults to the empty string. Modules that need their
-/// own per-section defaults (e.g. `job_store`'s `key_prefix = "_jobs"`)
-/// implement a custom `Deserialize` and provide their own field defaults.
+/// own per-section defaults implement a custom `Deserialize` and provide their
+/// own field defaults. (The job store has no S3 config of its own — it inherits
+/// the `[metadata_store]` backend and writes under a hardcoded `_jobs/` prefix.)
 #[derive(Clone, Debug, Default, PartialEq, Deserialize)]
 pub struct S3ConnectionConfig {
     pub access_key_id: Secret<String>,
@@ -44,6 +46,25 @@ impl S3ConnectionConfig {
             region: self.region.clone(),
             key_prefix: self.key_prefix.clone(),
             ..S3TransportConfig::default()
+        }
+    }
+
+    /// Produce a transport-level [`S3TransportConfig`] tuned for the per-
+    /// `lock_key` execution lock: same connection/credentials/bucket as
+    /// [`Self::to_client_config`], but with the three timing fields
+    /// (`operation_timeout_secs`, `operation_attempt_timeout_secs`,
+    /// `max_attempts`) taken from `lock_config`.
+    ///
+    /// Lock ops want tighter timeouts than blob/metadata ops so a single
+    /// stuck request can't consume the entire heartbeat interval; this
+    /// helper is the single source of truth for that tuning, shared by
+    /// the metadata-store and job-store S3 backends.
+    pub fn to_lock_client_config(&self, lock_config: &S3LockConfig) -> S3TransportConfig {
+        S3TransportConfig {
+            operation_timeout_secs: lock_config.operation_timeout_secs,
+            operation_attempt_timeout_secs: lock_config.operation_attempt_timeout_secs,
+            max_attempts: lock_config.max_attempts,
+            ..self.to_client_config()
         }
     }
 }

@@ -8,15 +8,17 @@ use std::{sync::Arc, time::Duration};
 use angos_s3_client::{Backend as S3Backend, BackendConfig as S3Config};
 use bytes::Bytes;
 use bytesize::ByteSize;
-use tokio::{io::AsyncReadExt, sync::mpsc};
+use futures_util::stream;
+use tokio::io::AsyncReadExt;
 use uuid::Uuid;
 
-use crate::{
-    ConditionalStore, Error, MultipartStore, ObjectStore, PresignedStore, channel_stream,
-    s3::Backend,
-};
+use crate::{ByteStream, ConditionalStore, Error, ObjectStore, PresignedStore, s3::Backend};
 
 fn backend() -> Backend {
+    backend_with(false, ByteSize::mib(5).as_u64())
+}
+
+fn backend_with(uniform_parts: bool, part_size: u64) -> Backend {
     let config = S3Config {
         access_key_id: "root".to_string(),
         secret_key: "roottoor".to_string(),
@@ -24,15 +26,22 @@ fn backend() -> Backend {
         bucket: "registry".to_string(),
         region: "us-east-1".to_string(),
         key_prefix: format!("storage-s3-tests/{}", Uuid::new_v4()),
-        // Keep multipart thresholds tight so the round-trip test can exercise
-        // it with a few KiB instead of GiBs.
         multipart_copy_threshold: ByteSize::mib(5),
         multipart_copy_chunk_size: ByteSize::mib(5),
-        multipart_part_size: ByteSize::mib(5),
+        multipart_part_size: ByteSize(part_size),
         ..Default::default()
     };
     let client = Arc::new(S3Backend::new(&config).expect("s3 client"));
-    Backend::builder().client(client).build().expect("backend")
+    Backend::builder()
+        .client(client)
+        .part_size(part_size)
+        .uniform_parts(uniform_parts)
+        .build()
+        .expect("backend")
+}
+
+fn frame(body: Vec<u8>) -> ByteStream {
+    Box::pin(stream::once(async move { Ok(Bytes::from(body)) }))
 }
 
 #[tokio::test]
@@ -81,14 +90,42 @@ async fn delete_prefix_clears_subtree() {
             .unwrap();
     }
     store.delete_prefix(&prefix).await.unwrap();
-    let (objects, _) = store
-        .list(&prefix, 10, None)
-        .await
-        .map(|p| (p.items, p.next_token))
-        .unwrap();
+    let page = store.list(&prefix, 10, None).await.unwrap();
     assert!(
-        objects.is_empty(),
+        page.items.is_empty(),
         "prefix must be empty after delete_prefix"
+    );
+}
+
+#[tokio::test]
+async fn delete_prefix_is_directory_scoped_not_string_prefix() {
+    // Regression for the data-loss bug: forwarding a raw (non-slash) prefix to
+    // the list-prefix delete wiped keys that merely shared a string prefix.
+    // `delete_prefix("<root>/v1")` must delete `<root>/v1/...` but never
+    // `<root>/v1-rc/...`.
+    let store = backend();
+    let root = format!("dps/{}", Uuid::new_v4());
+    for k in ["v1/1", "v1/c/2", "v1-rc/3"] {
+        store
+            .put(&format!("{root}/{k}"), Bytes::from_static(b"x"))
+            .await
+            .unwrap();
+    }
+
+    store.delete_prefix(&format!("{root}/v1")).await.unwrap();
+
+    assert_eq!(
+        store.get(&format!("{root}/v1/1")).await.unwrap_err(),
+        Error::NotFound
+    );
+    assert_eq!(
+        store.get(&format!("{root}/v1/c/2")).await.unwrap_err(),
+        Error::NotFound
+    );
+    assert_eq!(
+        store.get(&format!("{root}/v1-rc/3")).await.unwrap(),
+        b"x",
+        "sibling sharing a string prefix must survive"
     );
 }
 
@@ -167,10 +204,6 @@ async fn put_if_match_rejects_stale_etag() {
 
 #[tokio::test]
 async fn delete_if_match_succeeds_with_current_etag() {
-    // Note: the negative case (bogus ETag must yield PreconditionFailed) is
-    // not asserted here — older S3-compatible providers don't enforce
-    // `DeleteObject + If-Match`. Capability detection belongs in the consumer
-    // layer (see `metadata_store::s3::probe::probe_conditional_capabilities`).
     let store = backend();
     let key = format!("cas/del/{}", Uuid::new_v4());
     let etag = store
@@ -182,53 +215,305 @@ async fn delete_if_match_succeeds_with_current_etag() {
     assert_eq!(store.get(&key).await.unwrap_err(), Error::NotFound);
 }
 
-#[tokio::test]
-async fn multipart_round_trip_assembles_object() {
-    let store = backend();
-    let key = format!("mp/{}", Uuid::new_v4());
-    let id = store.create_multipart(&key).await.unwrap();
+// ─── uploads ──────────────────────────────────────────────────────────────
 
-    // S3 minimum part size is 5 MiB except for the last part.
-    let mut data = vec![0u8; 5 * 1024 * 1024];
-    for (i, b) in data.iter_mut().enumerate() {
-        *b = u8::try_from(i % 251).unwrap_or(0);
+/// The staging container for an upload key: its final path segment replaced
+/// with `staged`. Mirrors the backend's internal derivation so tests can probe
+/// the staged remainder.
+fn staged_key(key: &str, offset: u64) -> String {
+    let container = match key.rfind('/') {
+        Some(idx) => format!("{}/staged", &key[..idx]),
+        None => "staged".to_string(),
+    };
+    format!("{container}/{offset}")
+}
+
+/// Number of committed parts for the in-flight multipart upload at `key`, or 0
+/// when no multipart upload is open.
+async fn committed_part_count(store: &Backend, key: &str) -> usize {
+    let (uploads, _, _) = store
+        .client
+        .list_multipart_uploads(Some(key), None, None)
+        .await
+        .unwrap();
+    match uploads.into_iter().find(|u| u.key == key) {
+        Some(u) => store
+            .client
+            .list_parts(key, &u.upload_id)
+            .await
+            .unwrap()
+            .len(),
+        None => 0,
     }
+}
 
-    let (tx1, rx1) = mpsc::channel(2);
-    tx1.send(Bytes::from(data.clone())).await.unwrap();
-    drop(tx1);
-    let etag1 = store
-        .upload_part(&key, &id, 1, data.len() as u64, channel_stream(rx1))
+/// Whether an in-flight multipart upload exists at `key`.
+async fn has_open_multipart(store: &Backend, key: &str) -> bool {
+    let (uploads, _, _) = store
+        .client
+        .list_multipart_uploads(Some(key), None, None)
         .await
         .unwrap();
+    uploads.into_iter().any(|u| u.key == key)
+}
 
-    let tail = b"tail";
-    let (tx2, rx2) = mpsc::channel(2);
-    tx2.send(Bytes::from_static(tail)).await.unwrap();
-    drop(tx2);
-    let etag2 = store
-        .upload_part(&key, &id, 2, tail.len() as u64, channel_stream(rx2))
-        .await
-        .unwrap();
+/// Uniform mode: each `write_upload` emits as many fixed-size parts as fit
+/// in the combined (staged + incoming) bytes, then restages the remainder.
+#[tokio::test]
+async fn upload_uniform_round_trip() {
+    let store = backend_with(true, 5 * 1024 * 1024);
+    let key = format!("up/uniform/{}/data", Uuid::new_v4());
 
-    let parts = vec![
-        crate::Part {
-            part_number: 1,
-            etag: etag1,
-            size: data.len() as u64,
-        },
-        crate::Part {
-            part_number: 2,
-            etag: etag2,
-            size: tail.len() as u64,
-        },
+    let chunks: Vec<Vec<u8>> = vec![
+        vec![0x41; 2 * 1024 * 1024],
+        vec![0x42; 4 * 1024 * 1024],
+        vec![0x43; 6 * 1024 * 1024],
     ];
-    store.complete_multipart(&key, &id, &parts).await.unwrap();
+    store.create_upload(&key).await.unwrap();
+    let mut total = 0u64;
+    for chunk in &chunks {
+        let len = chunk.len() as u64;
+        total = store
+            .write_upload(&key, frame(chunk.clone()), len)
+            .await
+            .unwrap();
+    }
+    let expected_total: u64 = chunks.iter().map(|c| c.len() as u64).sum();
+    assert_eq!(total, expected_total);
+    store.complete_upload(&key).await.unwrap();
+    let assembled = store.get(&key).await.unwrap();
+    assert_eq!(assembled.len() as u64, expected_total);
+    let mut expected = Vec::with_capacity(assembled.len());
+    for chunk in &chunks {
+        expected.extend_from_slice(chunk);
+    }
+    assert_eq!(assembled, expected);
+}
 
-    let fetched = store.get(&key).await.unwrap();
-    assert_eq!(fetched.len(), data.len() + tail.len());
-    assert_eq!(&fetched[..data.len()], data.as_slice());
-    assert_eq!(&fetched[data.len()..], tail);
+/// Non-uniform mode: a single big write emits one part of the full size.
+#[tokio::test]
+async fn upload_nonuniform_single_part() {
+    let store = backend_with(false, 5 * 1024 * 1024);
+    let key = format!("up/nonuniform/{}/data", Uuid::new_v4());
+    let data: Vec<u8> = (0..6 * 1024 * 1024u32).map(|i| (i % 251) as u8).collect();
+
+    store.create_upload(&key).await.unwrap();
+    let len = data.len() as u64;
+    store
+        .write_upload(&key, frame(data.clone()), len)
+        .await
+        .unwrap();
+    store.complete_upload(&key).await.unwrap();
+    let assembled = store.get(&key).await.unwrap();
+    assert_eq!(assembled, data);
+}
+
+/// Non-uniform mode flushes at the operator-configured `part_size`, not at the
+/// S3 5 MiB floor. With `part_size = 8 MiB`, a ~6 MiB write must emit ZERO
+/// parts (everything stays staged); only once the combined bytes reach
+/// `part_size` does exactly one part get emitted.
+#[tokio::test]
+async fn upload_nonuniform_flushes_at_configured_part_size_not_min() {
+    const PART_SIZE: u64 = 8 * 1024 * 1024;
+    let store = backend_with(false, PART_SIZE);
+    let key = format!("up/nonuniform-cfg/{}/data", Uuid::new_v4());
+
+    // ~6 MiB: above the 5 MiB S3 floor but below the 8 MiB configured
+    // threshold. Nothing may flush; it all stays staged.
+    let first: Vec<u8> = (0..6 * 1024 * 1024u32).map(|i| (i % 251) as u8).collect();
+    store.create_upload(&key).await.unwrap();
+    let first_len = first.len() as u64;
+    let total = store
+        .write_upload(&key, frame(first.clone()), first_len)
+        .await
+        .unwrap();
+    assert_eq!(
+        total, first_len,
+        "total tracks staged bytes below the threshold"
+    );
+
+    assert_eq!(
+        committed_part_count(&store, &key).await,
+        0,
+        "6 MiB < 8 MiB part_size: no part may be emitted yet"
+    );
+    assert_eq!(
+        store
+            .client
+            .object_size(&staged_key(&key, 0))
+            .await
+            .unwrap(),
+        first_len,
+        "all bytes must remain staged below the configured threshold"
+    );
+    assert!(
+        !has_open_multipart(&store, &key).await,
+        "no multipart upload should open before the first flush"
+    );
+
+    // A second ~3 MiB write pushes the combined total (~9 MiB) over the 8 MiB
+    // threshold, so exactly one part is emitted and the surplus is restaged.
+    let second: Vec<u8> = (0..3 * 1024 * 1024u32).map(|i| (i % 251) as u8).collect();
+    let second_len = second.len() as u64;
+    store
+        .write_upload(&key, frame(second.clone()), second_len)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        committed_part_count(&store, &key).await,
+        1,
+        "crossing part_size must emit exactly one part"
+    );
+    assert!(
+        has_open_multipart(&store, &key).await,
+        "a multipart upload must now be open"
+    );
+
+    store.complete_upload(&key).await.unwrap();
+    let assembled = store.get(&key).await.unwrap();
+    let mut expected = first;
+    expected.extend_from_slice(&second);
+    assert_eq!(assembled, expected);
+}
+
+/// Regression guard for the default config: with `part_size = 5 MiB`
+/// (== the S3 floor), non-uniform mode still flushes a ~6 MiB write into one
+/// part with nothing left staged, exactly as before the threshold fix.
+#[tokio::test]
+async fn upload_nonuniform_default_still_flushes_at_5_mib() {
+    let store = backend_with(false, 5 * 1024 * 1024);
+    let key = format!("up/nonuniform-default/{}/data", Uuid::new_v4());
+    let data: Vec<u8> = (0..6 * 1024 * 1024u32).map(|i| (i % 251) as u8).collect();
+
+    store.create_upload(&key).await.unwrap();
+    let len = data.len() as u64;
+    store
+        .write_upload(&key, frame(data.clone()), len)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        committed_part_count(&store, &key).await,
+        1,
+        "the 6 MiB write must emit one part"
+    );
+    // The single emitted part holds the whole 6 MiB, so the staged remainder at
+    // that offset must be absent (nothing left staged).
+    assert_eq!(
+        store
+            .client
+            .object_size(&staged_key(&key, len))
+            .await
+            .unwrap_err()
+            .kind(),
+        std::io::ErrorKind::NotFound,
+        "nothing should be left staged"
+    );
+    assert!(
+        has_open_multipart(&store, &key).await,
+        "a multipart upload must be open"
+    );
+
+    store.complete_upload(&key).await.unwrap();
+    let assembled = store.get(&key).await.unwrap();
+    assert_eq!(assembled, data);
+}
+
+/// Small upload that never crosses the multipart threshold: `complete_upload`
+/// promotes the staging key to the canonical key without ever creating a
+/// multipart upload.
+#[tokio::test]
+async fn upload_small_upload_takes_singleshot_path() {
+    let store = backend_with(false, 5 * 1024 * 1024);
+    let key = format!("up/small/{}/data", Uuid::new_v4());
+    store.create_upload(&key).await.unwrap();
+    store
+        .write_upload(&key, frame(b"hello".to_vec()), 5)
+        .await
+        .unwrap();
+    assert!(
+        !has_open_multipart(&store, &key).await,
+        "small upload must not open a multipart upload"
+    );
+    store.complete_upload(&key).await.unwrap();
+    assert_eq!(store.get(&key).await.unwrap(), b"hello");
+}
+
+/// Zero-byte upload: `complete_upload` puts an empty object at `key`.
+#[tokio::test]
+async fn upload_complete_with_no_writes_creates_empty_object() {
+    let store = backend();
+    let key = format!("up/empty/{}/data", Uuid::new_v4());
+    store.create_upload(&key).await.unwrap();
+    store.complete_upload(&key).await.unwrap();
+    assert_eq!(store.get(&key).await.unwrap(), b"");
+}
+
+/// Keyless recovery: a write followed by an independent write at the same key
+/// resumes from the recovered parts + staged remainder, with no caller state.
+#[tokio::test]
+async fn upload_resumes_from_recovered_state() {
+    let store = backend_with(true, 5 * 1024 * 1024);
+    let key = format!("up/resume/{}/data", Uuid::new_v4());
+    store.create_upload(&key).await.unwrap();
+    let head = vec![0x55; 6 * 1024 * 1024];
+    store
+        .write_upload(&key, frame(head.clone()), head.len() as u64)
+        .await
+        .unwrap();
+
+    // No handle is threaded — the next call recovers state from S3 by key.
+    let tail = vec![0x66; 512 * 1024];
+    let total = store
+        .write_upload(&key, frame(tail.clone()), tail.len() as u64)
+        .await
+        .unwrap();
+    assert_eq!(total, (head.len() + tail.len()) as u64);
+    store.complete_upload(&key).await.unwrap();
+    let assembled = store.get(&key).await.unwrap();
+    let mut expected = head;
+    expected.extend_from_slice(&tail);
+    assert_eq!(assembled, expected);
+}
+
+/// `abort_upload` clears every in-flight multipart upload at `key`, including
+/// those started out-of-band, plus any staged remainder.
+#[tokio::test]
+async fn upload_abort_removes_orphans_and_staged() {
+    let store = backend();
+    let prefix = format!("up/abort/{}", Uuid::new_v4());
+    let key = format!("{prefix}/data");
+
+    // Manually start two multipart uploads at the same key, and stage a
+    // remainder, so we have something to clean up.
+    store.client.create_multipart_upload(&key).await.unwrap();
+    store.client.create_multipart_upload(&key).await.unwrap();
+    store
+        .client
+        .put_object(&staged_key(&key, 0), Bytes::from_static(b"leftover"))
+        .await
+        .unwrap();
+
+    store.abort_upload(&key).await.unwrap();
+
+    let (remaining, _, _) = store
+        .client
+        .list_multipart_uploads(Some(&key), None, None)
+        .await
+        .unwrap();
+    assert!(remaining.iter().all(|u| u.key != key));
+    assert_eq!(
+        store
+            .client
+            .object_size(&staged_key(&key, 0))
+            .await
+            .unwrap_err()
+            .kind(),
+        std::io::ErrorKind::NotFound,
+        "staged remainder must be deleted by abort"
+    );
+    store.delete_prefix(&prefix).await.unwrap();
 }
 
 #[tokio::test]
@@ -242,65 +527,4 @@ async fn presign_get_returns_a_url() {
         url.contains("blob/x") && url.contains("X-Amz-Signature"),
         "expected a SigV4 presigned URL, got: {url}",
     );
-}
-
-#[tokio::test]
-async fn search_multipart_upload_id_finds_active_upload() {
-    let store = backend();
-    let prefix = format!("search-mp/{}", Uuid::new_v4());
-    let key = format!("{prefix}/obj");
-
-    let created_id = store.create_multipart(&key).await.unwrap();
-    let found = store
-        .search_multipart_upload_id(&key)
-        .await
-        .unwrap()
-        .expect("upload we just created must be found");
-    assert_eq!(found, created_id);
-
-    // Clean up.
-    store.abort_multipart(&key, &created_id).await.unwrap();
-    store.delete_prefix(&prefix).await.unwrap();
-}
-
-#[tokio::test]
-async fn search_multipart_upload_id_returns_none_when_absent() {
-    let store = backend();
-    let key = format!("search-mp-absent/{}", Uuid::new_v4());
-    let result = store.search_multipart_upload_id(&key).await.unwrap();
-    assert!(result.is_none());
-}
-
-#[tokio::test]
-async fn abort_pending_uploads_removes_all_sessions() {
-    let store = backend();
-    let prefix = format!("abort-pending/{}", Uuid::new_v4());
-    let key = format!("{prefix}/obj");
-
-    // Create two upload sessions for the same key.
-    let id1 = store.create_multipart(&key).await.unwrap();
-    let id2 = store.create_multipart(&key).await.unwrap();
-    // Confirm both are visible.
-    assert!(
-        store
-            .search_multipart_upload_id(&key)
-            .await
-            .unwrap()
-            .is_some()
-    );
-
-    store.abort_pending_uploads(&key).await.unwrap();
-
-    // Neither session should remain.
-    assert!(
-        store
-            .search_multipart_upload_id(&key)
-            .await
-            .unwrap()
-            .is_none()
-    );
-    // Cleanup; ids are already aborted so ignore errors.
-    let _ = store.abort_multipart(&key, &id1).await;
-    let _ = store.abort_multipart(&key, &id2).await;
-    store.delete_prefix(&prefix).await.unwrap();
 }

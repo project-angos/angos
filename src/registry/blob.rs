@@ -1,9 +1,15 @@
 use std::{collections::HashSet, sync::Arc};
 
 use hyper::header::{ACCEPT_RANGES, CONTENT_RANGE};
-use tokio::io::{AsyncRead, AsyncReadExt};
-use tracing::{debug, info, instrument, warn};
+use tokio::io::AsyncReadExt;
+#[cfg(test)]
+use tracing::info;
+use tracing::{debug, instrument, warn};
 use uuid::Uuid;
+
+#[cfg(test)]
+use angos_tx_engine::transaction::Transaction;
+use angos_tx_engine::transaction::{Mutation, Read};
 
 use crate::{
     metrics_provider::metrics_provider,
@@ -11,10 +17,10 @@ use crate::{
     registry::{
         Error, HeaderMap, Registry, Repository, ResponseHeaders,
         blob_ownership::BlobOwnership,
-        blob_store::{BoxedReader, UploadStore},
+        blob_store::{BlobStore, BoxedReader},
         cache_job_handler::{CACHE_FETCH_BLOB_KIND, CACHE_QUEUE, CacheFetchBlobPayload},
         job_store::JobEnvelope,
-        metadata_store::{Error as MetadataError, MetadataStore, link_kind::LinkKind},
+        metadata_store::{MetadataStore, link_kind::LinkKind},
     },
 };
 
@@ -130,22 +136,68 @@ fn has_non_ownership_reference(links: &HashSet<LinkKind>, digest: &Digest) -> bo
         .any(|link| !matches!(link, LinkKind::Blob(link_digest) if link_digest == digest))
 }
 
-/// Fetch `stream` into the local blob store and record namespace ownership.
+/// Stream `stream` into an upload staging slot and return the engine reads +
+/// mutations that, when committed, atomically promote the staged bytes to
+/// `blob-data/<digest>`, delete the upload-session record, and grant
+/// `namespace` ownership of the blob.
 ///
-/// This is the single implementation of the pull-through cache-fill logic;
-/// both the in-process and durable backends call it.
-pub async fn cache_blob(
-    upload_store: Arc<dyn UploadStore>,
-    metadata_store: Arc<dyn MetadataStore>,
+/// **Side-effects already taken** when this returns: the upload-staging
+/// objects are written, and on the S3 backend the multipart upload has been
+/// completed. A crash before the returned mutations are applied leaves these
+/// artifacts for scrub to reclaim.
+pub async fn cache_blob_mutations(
+    blob_store: Arc<BlobStore>,
+    metadata_store: Arc<MetadataStore>,
     namespace: Namespace,
     digest: Digest,
     stream: BoxedReader,
-) -> Result<(), Error> {
+    content_length: u64,
+) -> Result<(Vec<Read>, Vec<Mutation>), Error> {
     debug!("Fetching blob: {digest}");
-    Registry::copy_blob(upload_store, stream, &namespace, &digest).await?;
-    BlobOwnership::new(metadata_store.as_ref())
-        .grant(&namespace, &digest)
+    let session_id = Uuid::new_v4().to_string();
+    blob_store
+        .create_upload(namespace.as_ref(), &session_id)
         .await?;
+    blob_store
+        .write_upload(namespace.as_ref(), &session_id, stream, content_length)
+        .await?;
+    let (_, mut mutations) = blob_store
+        .finalize_upload_mutations(namespace.as_ref(), &session_id, Some(&digest))
+        .await?;
+    let (reads, mut grant_mutations) = metadata_store
+        .build_grant_mutations(namespace.as_ref(), &digest)
+        .await?;
+    mutations.append(&mut grant_mutations);
+    Ok((reads, mutations))
+}
+
+/// Fetch `stream` into the local blob store and record namespace ownership
+/// as a single committed transaction. The handler path uses
+/// [`cache_blob_mutations`] directly and merges the result into a larger
+/// transaction; this wrapper exists for the rare non-handler caller (tests).
+#[cfg(test)]
+pub async fn cache_blob(
+    blob_store: Arc<BlobStore>,
+    metadata_store: Arc<MetadataStore>,
+    namespace: Namespace,
+    digest: Digest,
+    stream: BoxedReader,
+    content_length: u64,
+) -> Result<(), Error> {
+    let (reads, mutations) = cache_blob_mutations(
+        blob_store,
+        metadata_store.clone(),
+        namespace,
+        digest.clone(),
+        stream,
+        content_length,
+    )
+    .await?;
+    metadata_store
+        .executor()
+        .execute(Transaction::from_parts(reads, mutations))
+        .await
+        .map_err(|e| Error::Internal(format!("cache_blob transaction failed: {e}")))?;
     info!("Caching of {digest} completed");
     Ok(())
 }
@@ -208,32 +260,6 @@ impl Registry {
         }
 
         self.get_local_blob(digest, range).await.map(Some)
-    }
-
-    #[instrument(skip(upload_engine, stream))]
-    async fn copy_blob(
-        upload_engine: Arc<dyn UploadStore>,
-        stream: impl AsyncRead + Send + Sync + Unpin + 'static,
-        namespace: &Namespace,
-        digest: &Digest,
-    ) -> Result<(), Error> {
-        let session_id = Uuid::new_v4().to_string();
-
-        upload_engine.create(namespace, &session_id).await?;
-
-        upload_engine
-            .write(namespace, &session_id, Box::new(stream), 0, false)
-            .await?;
-
-        if let Err(error) = upload_engine
-            .complete(namespace, &session_id, Some(digest))
-            .await
-        {
-            debug!("Failed to complete upload: {error}");
-            return Err(error.into());
-        }
-
-        Ok(())
     }
 
     #[instrument(skip(repository))]
@@ -338,35 +364,31 @@ impl Registry {
 
     #[instrument]
     pub async fn delete_blob(&self, namespace: &Namespace, digest: &Digest) -> Result<(), Error> {
-        let guard = self.metadata_store.acquire_blob_data_lock(digest).await?;
-        let result = async {
-            let ownership = BlobOwnership::new(self.metadata_store.as_ref());
-            let links = ownership.references(namespace, digest).await?;
+        let ownership = BlobOwnership::new(self.metadata_store.as_ref());
+        let links = ownership.references(namespace, digest).await?;
 
-            if links.is_empty() {
-                return Err(Error::BlobUnknown);
-            }
-
-            if has_non_ownership_reference(&links, digest) {
-                return Err(Error::BlobReferenced);
-            }
-
-            ownership
-                .revoke(namespace, digest, LinkKind::Blob(digest.clone()))
-                .await?;
-
-            self.delete_blob_data_if_unreferenced_locked(digest).await
-        }
-        .await;
-        let lock_valid = guard.is_valid();
-        guard.release().await;
-
-        result?;
-        if !lock_valid {
-            return Err(MetadataError::Lock("lock invalidated during blob deletion".into()).into());
+        if links.is_empty() {
+            return Err(Error::BlobUnknown);
         }
 
-        Ok(())
+        if has_non_ownership_reference(&links, digest) {
+            return Err(Error::BlobReferenced);
+        }
+
+        // Hold the coarse `blob-data:{digest}` lock across the converged revoke
+        // + conditional-reclaim transaction. The transaction is crash-atomic on
+        // its own, but the lock is what serialises it against the upload `grant`
+        // path (which records ownership in the shard without a transactional
+        // coarse lock), so a concurrent reference grant cannot be missed during
+        // the unreferenced check.
+        let session = self.acquire_blob_data_lock(digest).await?;
+        let result = self
+            .metadata_store
+            .revoke_blob_ownership(namespace.as_ref(), digest)
+            .await
+            .map_err(Error::from);
+        session.release().await;
+        result
     }
 
     /// Resolves a blob GET request to either a presigned redirect URL or a stream.
@@ -395,8 +417,7 @@ impl Registry {
             && self.enable_blob_redirect
             && has_access
             && self.blob_store.size(digest).await.is_ok()
-            && let Some(presigned) = &self.presigned_blob_store
-            && let Ok(Some(presigned_url)) = presigned.url(digest, None).await
+            && let Ok(Some(presigned_url)) = self.blob_store.presigned_url(digest, None).await
         {
             return Ok(GetBlobResponse::Redirect {
                 headers: get_blob_redirect_headers(presigned_url, digest),
@@ -413,18 +434,64 @@ mod tests {
     use std::{io::Cursor, time::Duration};
 
     use hyper::header::{ACCEPT_RANGES, CONTENT_LENGTH, CONTENT_RANGE, LOCATION};
-    use tokio::io::AsyncReadExt;
+    use tokio::{io::AsyncReadExt, time::sleep};
 
     use super::*;
     use crate::{
         oci::Namespace,
         registry::{
             DOCKER_CONTENT_DIGEST,
+            blob_ownership::BlobOwnership,
             metadata_store::LinkOperation,
-            test_utils::{backends, create_test_blob},
+            test_utils::{backends, create_test_blob, put_blob_direct},
         },
         util::sha256,
     };
+
+    /// `delete_blob` must hold the `blob-data:{digest}` coarse lock across its
+    /// revoke-and-reclaim transaction, so a concurrent reference grant cannot be
+    /// missed while the unreferenced check and the blob-data delete are decided.
+    /// Regression guard for the conformance `MANIFEST_BLOB_UNKNOWN` failure
+    /// caused by dropping that lock during the transactional-engine migration.
+    #[tokio::test]
+    async fn delete_blob_waits_for_blob_data_lock_before_reclaiming_data() {
+        for test_case in backends() {
+            let registry = test_case.registry();
+            let first = &Namespace::new("test-repo/first").unwrap();
+            let second = &Namespace::new("test-repo/second").unwrap();
+            let content = b"shared blob content";
+            let digest = put_blob_direct(registry.metadata_store.store(), content).await;
+            let ownership = BlobOwnership::new(registry.metadata_store.as_ref());
+
+            ownership.grant(first, &digest).await.unwrap();
+
+            // Hold the blob-data lock, then start a delete: it must block on
+            // the lock rather than reclaim the bytes.
+            let session = registry.acquire_blob_data_lock(&digest).await.unwrap();
+            let delete = registry.delete_blob(first, &digest);
+            tokio::pin!(delete);
+
+            tokio::select! {
+                result = &mut delete => {
+                    panic!("delete completed while blob-data lock was held: {result:?}");
+                }
+                () = sleep(Duration::from_millis(25)) => {}
+            }
+
+            // A second namespace grabs a reference while the delete is parked.
+            ownership.grant(second, &digest).await.unwrap();
+            session.release().await;
+            delete.await.unwrap();
+
+            // The data survives (still referenced by `second`); `first` lost its
+            // reference, `second` keeps it.
+            assert_eq!(registry.blob_store.read(&digest).await.unwrap(), content);
+            assert!(!ownership.can_read(first, &digest).await.unwrap());
+            assert!(ownership.can_read(second, &digest).await.unwrap());
+
+            test_case.cleanup().await;
+        }
+    }
 
     #[tokio::test]
     async fn test_head_blob() {
@@ -483,7 +550,7 @@ mod tests {
             let registry = test_case.registry();
             let namespace = &Namespace::new("test-repo").unwrap();
             let content = b"unowned blob content";
-            let digest = registry.blob_store.create(content).await.unwrap();
+            let digest = put_blob_direct(registry.metadata_store.store(), content).await;
             let repository = registry.get_repository_for_namespace(namespace).unwrap();
 
             let head_result = registry
@@ -544,7 +611,7 @@ mod tests {
             let namespace = &Namespace::new("test-repo").unwrap();
             let content = b"test blob content";
 
-            let digest = registry.blob_store.create(content).await.unwrap();
+            let digest = put_blob_direct(registry.metadata_store.store(), content).await;
             BlobOwnership::new(registry.metadata_store.as_ref())
                 .grant(namespace, &digest)
                 .await
@@ -579,7 +646,7 @@ mod tests {
             let registry = test_case.registry();
             let namespace = &Namespace::new("test-repo").unwrap();
             let content = b"referenced blob content";
-            let digest = registry.blob_store.create(content).await.unwrap();
+            let digest = put_blob_direct(registry.metadata_store.store(), content).await;
             let link = LinkKind::Config(digest.clone());
 
             registry
@@ -630,7 +697,7 @@ mod tests {
 
             for link in cases {
                 let content = format!("content for {link}").into_bytes();
-                let digest = registry.blob_store.create(&content).await.unwrap();
+                let digest = put_blob_direct(registry.metadata_store.store(), &content).await;
                 BlobOwnership::new(registry.metadata_store.as_ref())
                     .grant(namespace, &digest)
                     .await
@@ -675,7 +742,7 @@ mod tests {
             let first = &Namespace::new("test-repo/first").unwrap();
             let second = &Namespace::new("test-repo/second").unwrap();
             let content = b"shared blob content";
-            let digest = registry.blob_store.create(content).await.unwrap();
+            let digest = put_blob_direct(registry.metadata_store.store(), content).await;
             let ownership = BlobOwnership::new(registry.metadata_store.as_ref());
 
             ownership.grant(first, &digest).await.unwrap();
@@ -695,51 +762,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn delete_blob_waits_for_blob_data_lock_before_reclaiming_data() {
-        for test_case in backends() {
-            let registry = test_case.registry();
-            let first = &Namespace::new("test-repo/first").unwrap();
-            let second = &Namespace::new("test-repo/second").unwrap();
-            let content = b"shared blob content";
-            let digest = registry.blob_store.create(content).await.unwrap();
-            let ownership = BlobOwnership::new(registry.metadata_store.as_ref());
-
-            ownership.grant(first, &digest).await.unwrap();
-
-            let guard = registry
-                .metadata_store
-                .acquire_blob_data_lock(&digest)
-                .await
-                .unwrap();
-            let delete = registry.delete_blob(first, &digest);
-            tokio::pin!(delete);
-
-            tokio::select! {
-                result = &mut delete => {
-                    panic!("delete completed while blob data lock was held: {result:?}");
-                }
-                () = tokio::time::sleep(Duration::from_millis(25)) => {}
-            }
-
-            ownership.grant(second, &digest).await.unwrap();
-            guard.release().await;
-            delete.await.unwrap();
-
-            assert_eq!(registry.blob_store.read(&digest).await.unwrap(), content);
-            assert!(!ownership.can_read(first, &digest).await.unwrap());
-            assert!(ownership.can_read(second, &digest).await.unwrap());
-
-            test_case.cleanup().await;
-        }
-    }
-
-    #[tokio::test]
     async fn delete_blob_rejects_unowned_blob() {
         for test_case in backends() {
             let registry = test_case.registry();
             let namespace = &Namespace::new("test-repo").unwrap();
             let content = b"unowned delete content";
-            let digest = registry.blob_store.create(content).await.unwrap();
+            let digest = put_blob_direct(registry.metadata_store.store(), content).await;
 
             let result = registry.delete_blob(namespace, &digest).await;
             assert!(matches!(result, Err(Error::BlobUnknown)));
@@ -747,28 +775,6 @@ mod tests {
             let stored_content = registry.blob_store.read(&digest).await.unwrap();
             assert_eq!(stored_content, content);
 
-            test_case.cleanup().await;
-        }
-    }
-
-    #[tokio::test]
-    async fn test_copy_blob() {
-        for test_case in backends() {
-            let registry = test_case.registry();
-            let namespace = &Namespace::new("test-repo").unwrap();
-            let content = b"test blob content";
-
-            let (digest, _) = create_test_blob(registry, namespace, content).await;
-
-            let stream = Cursor::new(content.to_vec());
-            let upload_engine = registry.upload_store.clone();
-
-            Registry::copy_blob(upload_engine, stream, namespace, &digest)
-                .await
-                .unwrap();
-
-            let stored_content = registry.blob_store.read(&digest).await.unwrap();
-            assert_eq!(stored_content, content);
             test_case.cleanup().await;
         }
     }
@@ -783,11 +789,12 @@ mod tests {
             let stream = Box::new(Cursor::new(content.to_vec()));
 
             cache_blob(
-                registry.upload_store.clone(),
+                registry.blob_store.clone(),
                 registry.metadata_store.clone(),
                 namespace.clone(),
                 digest.clone(),
                 stream,
+                content.len() as u64,
             )
             .await
             .unwrap();

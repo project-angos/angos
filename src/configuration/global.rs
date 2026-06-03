@@ -1,5 +1,7 @@
+use std::num::NonZeroUsize;
+
 use bytesize::ByteSize;
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer, de::Error as _};
 
 use crate::{
     configuration::RegexPattern,
@@ -7,12 +9,20 @@ use crate::{
     registry::job_store::JobQueueConfig,
 };
 
+/// Default cap on concurrent in-process cache-fill jobs. Evaluated at
+/// compile time: any failure would be a const-eval error at build time, never
+/// a runtime panic.
+pub const DEFAULT_MAX_CONCURRENT_CACHE_JOBS: NonZeroUsize = NonZeroUsize::new(4).unwrap();
+
 #[derive(Clone, Debug, Deserialize)]
 pub struct GlobalConfig {
     #[serde(default = "default_max_concurrent_requests")]
     pub max_concurrent_requests: usize,
-    #[serde(default = "default_max_concurrent_cache_jobs")]
-    pub max_concurrent_cache_jobs: usize,
+    #[serde(
+        default = "default_max_concurrent_cache_jobs",
+        deserialize_with = "deserialize_max_concurrent_cache_jobs"
+    )]
+    pub max_concurrent_cache_jobs: NonZeroUsize,
     #[serde(default = "default_max_manifest_size")]
     pub max_manifest_size: ByteSize,
     #[serde(default = "default_update_pull_time")]
@@ -42,8 +52,17 @@ fn default_max_concurrent_requests() -> usize {
     64
 }
 
-fn default_max_concurrent_cache_jobs() -> usize {
-    4
+fn default_max_concurrent_cache_jobs() -> NonZeroUsize {
+    DEFAULT_MAX_CONCURRENT_CACHE_JOBS
+}
+
+fn deserialize_max_concurrent_cache_jobs<'de, D>(deserializer: D) -> Result<NonZeroUsize, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = usize::deserialize(deserializer)?;
+    NonZeroUsize::new(value)
+        .ok_or_else(|| D::Error::custom("max_concurrent_cache_jobs must be > 0"))
 }
 
 fn default_max_manifest_size() -> ByteSize {
@@ -95,6 +114,8 @@ impl GlobalConfig {
 
 #[cfg(test)]
 mod tests {
+    use std::num::NonZeroUsize;
+
     use bytesize::ByteSize;
 
     use crate::configuration::GlobalConfig;
@@ -104,7 +125,7 @@ mod tests {
         let config = GlobalConfig::default();
 
         assert_eq!(config.max_concurrent_requests, 64);
-        assert_eq!(config.max_concurrent_cache_jobs, 4);
+        assert_eq!(config.max_concurrent_cache_jobs.get(), 4);
         assert_eq!(config.max_manifest_size, ByteSize::mib(5));
         assert!(!config.update_pull_time);
         assert!(!config.immutable_tags);
@@ -128,7 +149,10 @@ mod tests {
         .unwrap();
 
         assert_eq!(config.max_concurrent_requests, 10);
-        assert_eq!(config.max_concurrent_cache_jobs, 8);
+        assert_eq!(
+            config.max_concurrent_cache_jobs,
+            NonZeroUsize::new(8).unwrap()
+        );
         assert_eq!(config.max_manifest_size, ByteSize::mib(7));
         assert!(config.update_pull_time);
         assert!(config.immutable_tags);
@@ -136,6 +160,12 @@ mod tests {
         assert_eq!(config.immutable_tags_exclusions[0].as_source(), "latest");
         assert_eq!(config.immutable_tags_exclusions[1].as_source(), "dev");
         assert_eq!(config.authorization_webhook.as_deref(), Some("my-webhook"));
+    }
+
+    #[test]
+    fn max_concurrent_cache_jobs_zero_is_rejected() {
+        let result = toml::from_str::<GlobalConfig>("max_concurrent_cache_jobs = 0\n");
+        assert!(result.is_err(), "zero must be rejected at deserialization");
     }
 
     #[test]

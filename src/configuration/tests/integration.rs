@@ -1,12 +1,14 @@
 use std::path::PathBuf;
 
+use angos_tx_engine::lock::LockStrategy;
+
 use crate::{
     auth::oidc,
     cache,
     configuration::listeners::ClientAuth,
-    configuration::{Configuration, Error, ServerConfig},
+    configuration::{Configuration, Error, RegistryStorageConfig, ServerConfig},
     policy::AccessMode,
-    registry::{blob_store, metadata_store},
+    registry::blob_store,
 };
 
 #[test]
@@ -19,7 +21,6 @@ fn test_load_minimal_config() {
     let config = Configuration::load_from_str(config).unwrap();
 
     assert_eq!(config.global.max_concurrent_requests, 64);
-    assert_eq!(config.global.max_concurrent_cache_jobs, 4);
     assert!(!config.global.update_pull_time);
 
     let ServerConfig::Insecure(server_config) = config.server else {
@@ -29,11 +30,11 @@ fn test_load_minimal_config() {
     let bind_address = server_config.base.bind_address.to_string();
     assert_eq!(bind_address, "0.0.0.0".to_string());
     assert_eq!(server_config.base.port, 8000);
-    assert_eq!(server_config.base.query_timeout_secs.get(), 3600);
-    assert_eq!(server_config.base.query_timeout_grace_period_secs.get(), 60);
+    assert_eq!(server_config.base.query_timeout.get(), 3600);
+    assert_eq!(server_config.base.query_timeout_grace_period.get(), 60);
 
     assert_eq!(config.cache, cache::Config::Memory);
-    assert_eq!(config.blob_store, blob_store::BlobStorageConfig::default());
+    assert_eq!(config.blob_store, blob_store::BlobStoreConfig::default());
 
     assert!(config.auth.identity.is_empty());
     assert!(config.repository.is_empty());
@@ -54,17 +55,14 @@ fn test_storage_field_backward_compatibility() {
     let config = Configuration::load_from_str(config).unwrap();
 
     // Should parse 'storage' as 'blob_store'
-    let expected = blob_store::BlobStorageConfig::FS(blob_store::fs::BackendConfig {
+    let expected = blob_store::BlobStoreConfig::FS(blob_store::FsBackendConfig {
         root_dir: "/data/registry".to_string(),
         sync_to_disk: false,
     });
     assert_eq!(config.blob_store, expected);
 
     // No explicit metadata_store section — field must be Inherit
-    assert_eq!(
-        config.metadata_store,
-        metadata_store::MetadataStoreConfig::Inherit
-    );
+    assert_eq!(config.registry_storage, RegistryStorageConfig::Inherit);
 }
 
 #[test]
@@ -119,8 +117,8 @@ fn test_metadata_store_explicit_config_not_overridden() {
     let config = Configuration::load_from_str(config).unwrap();
 
     // Should keep the explicitly configured FS metadata store
-    match config.metadata_store {
-        metadata_store::MetadataStoreConfig::FS(config) => {
+    match config.registry_storage {
+        RegistryStorageConfig::FS(config) => {
             assert_eq!(config.root_dir, "/custom/metadata/path");
         }
         _ => panic!("Expected explicitly configured FS metadata store to be preserved"),
@@ -322,8 +320,8 @@ fn test_insecure_config_with_custom_port() {
     [server]
     bind_address = "127.0.0.1"
     port = 9000
-    query_timeout_secs = 7200
-    query_timeout_grace_period_secs = 120
+    query_timeout = 7200
+    query_timeout_grace_period = 120
     "#;
 
     let config = Configuration::load_from_str(config).unwrap();
@@ -331,11 +329,8 @@ fn test_insecure_config_with_custom_port() {
         ServerConfig::Insecure(insecure_config) => {
             assert_eq!(insecure_config.base.bind_address.to_string(), "127.0.0.1");
             assert_eq!(insecure_config.base.port, 9000);
-            assert_eq!(insecure_config.base.query_timeout_secs.get(), 7200);
-            assert_eq!(
-                insecure_config.base.query_timeout_grace_period_secs.get(),
-                120
-            );
+            assert_eq!(insecure_config.base.query_timeout.get(), 7200);
+            assert_eq!(insecure_config.base.query_timeout_grace_period.get(), 120);
         }
         ServerConfig::Tls(_) => panic!("Expected Insecure server config"),
     }
@@ -392,21 +387,20 @@ fn test_metadata_store_s3_with_redis() {
     "#;
 
     let config = Configuration::load_from_str(config).unwrap();
-    let metadata_config = config.resolve_metadata_config();
+    let metadata_config = config.resolve_registry_storage();
 
     match metadata_config {
-        metadata_store::MetadataStoreConfig::S3(s3_config) => {
+        RegistryStorageConfig::S3(s3_config) => {
             assert_eq!(s3_config.connection.bucket, "metadata-bucket");
             match &s3_config.lock_strategy {
-                metadata_store::LockStrategy::Redis(lock_config) => {
+                LockStrategy::Redis(lock_config) => {
                     assert_eq!(lock_config.url, "redis://localhost:6379");
                     assert_eq!(lock_config.ttl, 30);
                 }
                 other => panic!("Expected Redis lock strategy, got {other:?}"),
             }
         }
-        metadata_store::MetadataStoreConfig::Inherit
-        | metadata_store::MetadataStoreConfig::FS(_) => {
+        RegistryStorageConfig::Inherit | RegistryStorageConfig::FS(_) => {
             panic!("Expected S3 metadata store config")
         }
     }
@@ -427,21 +421,20 @@ fn test_metadata_store_fs_with_redis() {
     "#;
 
     let config = Configuration::load_from_str(config).unwrap();
-    let metadata_config = config.resolve_metadata_config();
+    let metadata_config = config.resolve_registry_storage();
 
     match metadata_config {
-        metadata_store::MetadataStoreConfig::FS(fs_config) => {
+        RegistryStorageConfig::FS(fs_config) => {
             assert_eq!(fs_config.root_dir, "/data/metadata");
             match &fs_config.lock_strategy {
-                metadata_store::LockStrategy::Redis(lock_config) => {
+                LockStrategy::Redis(lock_config) => {
                     assert_eq!(lock_config.url, "redis://localhost:6379");
                     assert_eq!(lock_config.ttl, 30);
                 }
                 other => panic!("Expected Redis lock strategy, got {other:?}"),
             }
         }
-        metadata_store::MetadataStoreConfig::Inherit
-        | metadata_store::MetadataStoreConfig::S3(_) => {
+        RegistryStorageConfig::Inherit | RegistryStorageConfig::S3(_) => {
             panic!("Expected FS metadata store config")
         }
     }
@@ -742,13 +735,13 @@ fn test_metadata_store_s3_lock_strategy_s3_defaults() {
     "#;
 
     let config = Configuration::load_from_str(config).unwrap();
-    let metadata_config = config.resolve_metadata_config();
+    let metadata_config = config.resolve_registry_storage();
 
     match metadata_config {
-        metadata_store::MetadataStoreConfig::S3(s3_config) => {
+        RegistryStorageConfig::S3(s3_config) => {
             assert_eq!(s3_config.connection.bucket, "metadata-bucket");
             match &s3_config.lock_strategy {
-                metadata_store::LockStrategy::S3(lock_config) => {
+                LockStrategy::S3(lock_config) => {
                     assert_eq!(lock_config.ttl_secs, 30);
                     assert_eq!(lock_config.max_retries, 100);
                     assert_eq!(lock_config.retry_delay_ms, 50);
@@ -756,8 +749,7 @@ fn test_metadata_store_s3_lock_strategy_s3_defaults() {
                 other => panic!("Expected S3 lock strategy, got {other:?}"),
             }
         }
-        metadata_store::MetadataStoreConfig::Inherit
-        | metadata_store::MetadataStoreConfig::FS(_) => {
+        RegistryStorageConfig::Inherit | RegistryStorageConfig::FS(_) => {
             panic!("Expected S3 metadata store config")
         }
     }
@@ -790,19 +782,18 @@ fn test_metadata_store_s3_lock_strategy_s3_custom_values() {
     "#;
 
     let config = Configuration::load_from_str(config).unwrap();
-    let metadata_config = config.resolve_metadata_config();
+    let metadata_config = config.resolve_registry_storage();
 
     match metadata_config {
-        metadata_store::MetadataStoreConfig::S3(s3_config) => match &s3_config.lock_strategy {
-            metadata_store::LockStrategy::S3(lock_config) => {
+        RegistryStorageConfig::S3(s3_config) => match &s3_config.lock_strategy {
+            LockStrategy::S3(lock_config) => {
                 assert_eq!(lock_config.ttl_secs, 60);
                 assert_eq!(lock_config.max_retries, 50);
                 assert_eq!(lock_config.retry_delay_ms, 100);
             }
             other => panic!("Expected S3 lock strategy, got {other:?}"),
         },
-        metadata_store::MetadataStoreConfig::Inherit
-        | metadata_store::MetadataStoreConfig::FS(_) => {
+        RegistryStorageConfig::Inherit | RegistryStorageConfig::FS(_) => {
             panic!("Expected S3 metadata store config")
         }
     }
@@ -831,21 +822,17 @@ fn test_metadata_store_s3_lock_strategy_memory() {
     "#;
 
     let config = Configuration::load_from_str(config).unwrap();
-    let metadata_config = config.resolve_metadata_config();
+    let metadata_config = config.resolve_registry_storage();
 
     match metadata_config {
-        metadata_store::MetadataStoreConfig::S3(s3_config) => {
+        RegistryStorageConfig::S3(s3_config) => {
             assert!(
-                matches!(
-                    s3_config.lock_strategy,
-                    metadata_store::LockStrategy::Memory
-                ),
+                matches!(s3_config.lock_strategy, LockStrategy::Memory),
                 "Expected Memory lock strategy, got {:?}",
                 s3_config.lock_strategy
             );
         }
-        metadata_store::MetadataStoreConfig::Inherit
-        | metadata_store::MetadataStoreConfig::FS(_) => {
+        RegistryStorageConfig::Inherit | RegistryStorageConfig::FS(_) => {
             panic!("Expected S3 metadata store config")
         }
     }

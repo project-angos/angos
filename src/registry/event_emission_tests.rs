@@ -19,6 +19,8 @@ use url::Url;
 use uuid::Uuid;
 use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};
 
+use angos_storage::{ObjectStore, fs::Backend as StorageFsBackend};
+
 use crate::{
     event_webhook::{
         config::{DeliveryPolicy, EventWebhookConfig},
@@ -26,7 +28,10 @@ use crate::{
         event::EventKind,
     },
     oci::{Digest, Namespace, Reference},
-    registry::{Registry, blob_store, metadata_store, test_utils::create_test_registry},
+    registry::{
+        Registry, blob_store,
+        test_utils::{build_test_fs_executor, create_test_registry, metadata_store_over},
+    },
     util::sha256,
 };
 
@@ -45,29 +50,25 @@ impl FsRegistryFixture {
         let path = temp_dir.path().to_string_lossy().to_string();
 
         let blob_store = Arc::new(
-            blob_store::fs::Backend::new(&blob_store::fs::BackendConfig {
+            blob_store::BlobStoreConfig::FS(blob_store::FsBackendConfig {
                 root_dir: path.clone(),
                 sync_to_disk: false,
             })
+            .build_backend()
             .unwrap(),
         );
 
-        let metadata_store_backend = Arc::new(
-            metadata_store::fs::BackendConfig {
-                root_dir: path,
-                sync_to_disk: false,
-                lock_strategy: metadata_store::LockStrategy::Memory,
-            }
-            .to_backend()
-            .expect("fs metadata backend"),
+        let meta_storage: Arc<dyn ObjectStore> = Arc::new(
+            StorageFsBackend::builder()
+                .root_dir(&path)
+                .sync_to_disk(false)
+                .build()
+                .expect("fs metadata storage"),
         );
+        let metadata_store_backend =
+            metadata_store_over(meta_storage, build_test_fs_executor(&path, false));
 
-        let registry = create_test_registry(
-            blob_store.clone(),
-            blob_store.clone(),
-            None,
-            metadata_store_backend,
-        );
+        let registry = create_test_registry(blob_store, metadata_store_backend);
 
         Self {
             registry,
@@ -101,8 +102,8 @@ fn build_dispatcher_for_server(server_uri: &str) -> EventDispatcher {
 async fn upload_blob(registry: &Registry, namespace: &Namespace, content: &[u8]) -> Digest {
     let session_id = Uuid::new_v4();
     registry
-        .upload_store
-        .create(namespace, &session_id.to_string())
+        .blob_store
+        .create_upload(namespace, &session_id.to_string())
         .await
         .unwrap();
 
