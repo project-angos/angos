@@ -17,7 +17,7 @@
 //! canonical location is the only finalisation step.
 
 use std::{
-    fs::FileType,
+    fs::{File, FileType},
     io::{self, ErrorKind, SeekFrom, Write},
     path::{Component, Path, PathBuf},
 };
@@ -461,13 +461,47 @@ impl ObjectStore for Backend {
     }
 
     async fn copy(&self, source: &str, destination: &str) -> Result<(), Error> {
-        let data = fs::read(self.full_path(source)).await?;
-        atomic_write(
-            &self.full_path(destination),
-            Bytes::from(data),
-            self.sync_to_disk,
-        )
+        let src = self.full_path(source);
+        let dst = self.full_path(destination);
+        ensure_parent(&dst).await?;
+        let parent = dst.parent().unwrap_or_else(|| Path::new(".")).to_owned();
+        let sync = self.sync_to_disk;
+        // Stream src -> temp -> atomic rename. `std::io::copy` uses a small
+        // internal buffer, so the object body is never held in memory in full
+        // (a multi-GB blob would otherwise spike RSS by its whole size).
+        match spawn_blocking(move || -> io::Result<()> {
+            let mut reader = File::open(&src)?;
+            let mut temp = TempFileBuilder::new()
+                .prefix(ATOMIC_WRITE_TMP_PREFIX)
+                .tempfile_in(&parent)?;
+            io::copy(&mut reader, temp.as_file_mut())?;
+            if sync {
+                temp.as_file().sync_all()?;
+            }
+            temp.persist(&dst).map_err(|e| e.error)?;
+            Ok(())
+        })
         .await
+        {
+            Ok(result) => result.map_err(Error::from),
+            Err(e) => Err(Error::Backend(format!("copy task panicked: {e}"))),
+        }
+    }
+
+    async fn move_object(&self, source: &str, destination: &str) -> Result<(), Error> {
+        let src = self.full_path(source);
+        let dst = self.full_path(destination);
+        ensure_parent(&dst).await?;
+        // Same-filesystem rename is atomic and O(1) in memory — the staging
+        // upload and its canonical blob-data location live under the same root,
+        // so this is the common path and avoids copying the bytes at all.
+        if fs::rename(&src, &dst).await.is_ok() {
+            return Ok(());
+        }
+        // Rename can fail across filesystems (`EXDEV`) or transiently; fall back
+        // to the (streamed) copy + delete that the trait default would do.
+        self.copy(source, destination).await?;
+        self.delete(source).await
     }
 
     async fn create_upload(&self, key: &str) -> Result<(), Error> {

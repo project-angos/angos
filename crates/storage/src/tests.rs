@@ -169,6 +169,18 @@ async fn copy_duplicates_object_under_new_key() {
     assert_eq!(store.get("src").await.unwrap(), b"payload");
 }
 
+#[tokio::test]
+async fn move_object_relocates_and_removes_source() {
+    let store: Arc<dyn ObjectStore> = backend();
+    store
+        .put("mv-src", Bytes::from_static(b"payload"))
+        .await
+        .unwrap();
+    store.move_object("mv-src", "mv-dst").await.unwrap();
+    assert_eq!(store.get("mv-dst").await.unwrap(), b"payload");
+    assert!(matches!(store.head("mv-src").await, Err(Error::NotFound)));
+}
+
 // =========================================================================
 // ConditionalStore
 // =========================================================================

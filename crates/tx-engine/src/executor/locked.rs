@@ -176,8 +176,7 @@ impl LockedExecutor {
                 Ok(())
             }
             MutationRecord::Move { src, dst, .. } => {
-                self.store.copy(src, dst).await?;
-                self.store.delete(src).await?;
+                self.store.move_object(src, dst).await?;
                 Ok(())
             }
         }
