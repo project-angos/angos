@@ -7,6 +7,7 @@ use uuid::Uuid;
 use crate::{
     identity::Action,
     oci::{Digest, Namespace, Reference},
+    registry::job_store::JobState,
 };
 
 fn parse_query<T: DeserializeOwned + Default>(params: &str) -> T {
@@ -34,9 +35,15 @@ pub fn parse(method: &Method, uri: &Uri) -> Option<Action> {
         _ => {}
     }
 
+    // Angos-specific extension API lives at the top level so `/v2` stays purely
+    // OCI. Unknown `_ext` paths return `None` (404) rather than falling back to
+    // the UI-asset handler below.
+    if let Some(ext_path) = path.strip_prefix("/_ext/") {
+        return try_parse_extension(method, ext_path, params);
+    }
+
     if let Some(api_path) = path.strip_prefix("/v2/") {
-        return try_parse_extension(method, api_path)
-            .or_else(|| try_parse_upload(method, api_path, params))
+        return try_parse_upload(method, api_path, params)
             .or_else(|| try_find_blobs(method, api_path))
             .or_else(|| try_find_manifests(method, api_path))
             .or_else(|| try_find_referrers(method, api_path, params))
@@ -86,33 +93,81 @@ fn parse_pagination(params: Option<&str>) -> (Option<u16>, Option<String>) {
     (query.n, query.last)
 }
 
-fn try_parse_extension(method: &Method, path: &str) -> Option<Action> {
-    if *method != Method::GET {
-        return None;
+#[derive(Deserialize, Default)]
+struct JobsPaginationQuery {
+    n: Option<u16>,
+    after: Option<String>,
+}
+
+fn parse_jobs_pagination(params: Option<&str>) -> (Option<u16>, Option<String>) {
+    let query: JobsPaginationQuery = params.map(parse_query).unwrap_or_default();
+    (query.n, query.after)
+}
+
+/// Parse the angos-specific extension API routes. `path` is relative to the
+/// top-level `/_ext/` prefix (already stripped by the caller).
+///
+/// Routes are grouped by method, then by endpoint. Within `GET`, the bare
+/// listings (`_repositories`, `_jobs`, `_jobs/failed`) are matched before the
+/// namespace-suffixed routes. Job storage keys are a single path segment
+/// (`<hex-millis>-<uuid>`, no `/`), so a segment containing `/` is rejected by
+/// [`is_job_key`].
+fn try_parse_extension(method: &Method, path: &str, params: Option<&str>) -> Option<Action> {
+    match *method {
+        Method::GET => match path {
+            "_repositories" => Some(Action::ListRepositories),
+            "_jobs" => {
+                let (n, after) = parse_jobs_pagination(params);
+                Some(Action::ListJobs { n, after })
+            }
+            "_jobs/failed" => {
+                let (n, after) = parse_jobs_pagination(params);
+                Some(Action::ListFailedJobs { n, after })
+            }
+            _ => {
+                if let Some(repository_str) = path.strip_suffix("/_namespaces") {
+                    let repository = Namespace::new(repository_str).ok()?;
+                    return Some(Action::ListNamespaces { repository });
+                }
+                if let Some(namespace_str) = path.strip_suffix("/_revisions") {
+                    let namespace = Namespace::new(namespace_str).ok()?;
+                    return Some(Action::ListRevisions { namespace });
+                }
+                if let Some(namespace_str) = path.strip_suffix("/_uploads") {
+                    let namespace = Namespace::new(namespace_str).ok()?;
+                    return Some(Action::ListUploads { namespace });
+                }
+                None
+            }
+        },
+        Method::POST => path
+            .strip_prefix("_jobs/failed/")
+            .and_then(|rest| rest.strip_suffix("/retry"))
+            .filter(|key| is_job_key(key))
+            .map(|key| Action::RetryJob {
+                storage_key: key.to_string(),
+            }),
+        Method::DELETE => {
+            if let Some(key) = path.strip_prefix("_jobs/failed/").filter(|k| is_job_key(k)) {
+                return Some(Action::DeleteJob {
+                    state: JobState::Failed,
+                    storage_key: key.to_string(),
+                });
+            }
+            path.strip_prefix("_jobs/pending/")
+                .filter(|k| is_job_key(k))
+                .map(|key| Action::DeleteJob {
+                    state: JobState::Pending,
+                    storage_key: key.to_string(),
+                })
+        }
+        _ => None,
     }
+}
 
-    let path = path.strip_prefix("_ext/")?;
-
-    if path == "_repositories" {
-        return Some(Action::ListRepositories);
-    }
-
-    if let Some(repository_str) = path.strip_suffix("/_namespaces") {
-        let repository = Namespace::new(repository_str).ok()?;
-        return Some(Action::ListNamespaces { repository });
-    }
-
-    if let Some(namespace_str) = path.strip_suffix("/_revisions") {
-        let namespace = Namespace::new(namespace_str).ok()?;
-        return Some(Action::ListRevisions { namespace });
-    }
-
-    if let Some(namespace_str) = path.strip_suffix("/_uploads") {
-        let namespace = Namespace::new(namespace_str).ok()?;
-        return Some(Action::ListUploads { namespace });
-    }
-
-    None
+/// A job storage key is a single non-empty path segment.
+fn is_job_key(key: &str) -> bool {
+    !key.is_empty() && !key.contains('/')
 }
 
 fn try_parse_upload(method: &Method, path: &str, params: Option<&str>) -> Option<Action> {

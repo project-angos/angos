@@ -9,7 +9,6 @@ use crate::{
     oci::{Digest, Namespace},
     registry::{
         blob::cache_blob_mutations,
-        blob_ownership::BlobOwnership,
         blob_store::BlobStore,
         job_store::{Error, JobEnvelope, JobHandler},
         metadata_store::MetadataStore,
@@ -29,8 +28,9 @@ pub struct CacheFetchBlobPayload {
 }
 
 /// Pulls a blob from the upstream registry and writes it to the local blob
-/// store. Skips the fetch when the blob is already locally owned, so multiple
-/// replicas can dedup the same miss safely.
+/// store. Skips the upstream fetch when the bytes are already present locally
+/// (granting this namespace a reference instead), so concurrent fills of the
+/// same blob dedup safely; otherwise it fetches and stores the bytes.
 pub struct CacheJobHandler {
     resolver: Arc<RepositoryResolver>,
     blob_store: Arc<BlobStore>,
@@ -71,14 +71,12 @@ impl JobHandler for CacheJobHandler {
             .parse()
             .map_err(|e| Error::Storage(format!("invalid digest '{}': {e}", payload.digest)))?;
 
-        let already_owned = BlobOwnership::new(self.metadata_store.as_ref())
-            .can_read(&namespace, &digest)
-            .await
-            .map_err(|e| Error::Storage(e.to_string()))?;
-        if already_owned {
-            return Ok(Transaction::builder().build());
-        }
-
+        // Bytes already present locally (cached by this or another namespace):
+        // grant this namespace a reference without re-fetching. Gate on *byte
+        // presence*, not on a `can_read` ownership link: a manifest pull records
+        // the layer's ownership link before its bytes are fetched, so a
+        // link-only short-circuit here would skip the fetch and the blob would
+        // never be cached (see doc/reviews/20260603-in-process-cache-fill-broken.md).
         if self.blob_store.size(&digest).await.is_ok() {
             let (reads, mutations) = self
                 .metadata_store

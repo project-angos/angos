@@ -12,9 +12,15 @@ use crate::{
     },
     registry::{
         APPLICATION_JSON, Error, HeaderMap, JsonResponse, Registry, ResponseHeaders,
+        cache_job_handler::CACHE_QUEUE, job_store, job_store::JobState,
         metadata_store::link_kind::LinkKind, pagination::collect_all_pages,
     },
 };
+
+/// Default page size for the durable job-queue listing endpoints when the
+/// client supplies no `?n=`. Bounded so an admin scan reads at most this many
+/// envelope bodies per request.
+const DEFAULT_JOBS_PAGE: u16 = 100;
 
 fn json_headers() -> HeaderMap {
     ResponseHeaders::new()
@@ -129,6 +135,49 @@ struct UploadEntry {
 struct UploadsBody {
     name: String,
     uploads: Vec<UploadEntry>,
+}
+
+/// A pending (or in-flight) durable job. `storage_key` is the opaque-to-the-UI
+/// address used by the retry/delete mutations; `not_before` is decoded from the
+/// key's time prefix so the UI can label backed-off retries.
+#[derive(Serialize, Debug)]
+struct JobEntry {
+    storage_key: String,
+    id: String,
+    kind: String,
+    lock_key: String,
+    attempts: u32,
+    max_attempts: u32,
+    created_at: DateTime<Utc>,
+    not_before: DateTime<Utc>,
+}
+
+#[derive(Serialize, Debug)]
+struct JobsBody {
+    jobs: Vec<JobEntry>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    next: Option<String>,
+}
+
+/// A dead-letter (exhausted-retry) job, carrying the failure reason and instant.
+#[derive(Serialize, Debug)]
+struct FailedJobEntry {
+    storage_key: String,
+    id: String,
+    kind: String,
+    lock_key: String,
+    attempts: u32,
+    max_attempts: u32,
+    created_at: DateTime<Utc>,
+    failed_at: DateTime<Utc>,
+    last_error: String,
+}
+
+#[derive(Serialize, Debug)]
+struct FailedJobsBody {
+    failed: Vec<FailedJobEntry>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    next: Option<String>,
 }
 
 struct RepositoryConfig {
@@ -364,6 +413,116 @@ impl Registry {
                 uploads: all_uploads,
             })?,
         })
+    }
+
+    /// One keyset page of pending/in-flight durable jobs. `after` is the plain
+    /// storage key from a previous page's `next` (non-opaque). Each row reads
+    /// the envelope body; a row deleted mid-scan is silently skipped.
+    #[instrument(skip(self))]
+    pub async fn get_jobs_info(
+        &self,
+        n: Option<u16>,
+        after: Option<String>,
+    ) -> Result<JsonResponse, Error> {
+        let n = n.unwrap_or(DEFAULT_JOBS_PAGE);
+        let (keys, next) = self
+            .cache_queue
+            .list_pending_page(CACHE_QUEUE, n, after.as_deref())
+            .await?;
+
+        let mut jobs = Vec::with_capacity(keys.len());
+        for storage_key in keys {
+            match self
+                .cache_queue
+                .read_pending(CACHE_QUEUE, &storage_key)
+                .await
+            {
+                Ok(envelope) => {
+                    let not_before =
+                        job_store::parse_not_before(&storage_key).unwrap_or(envelope.created_at);
+                    jobs.push(JobEntry {
+                        storage_key,
+                        id: envelope.id,
+                        kind: envelope.kind,
+                        lock_key: envelope.lock_key,
+                        attempts: envelope.attempts,
+                        max_attempts: envelope.max_attempts,
+                        created_at: envelope.created_at,
+                        not_before,
+                    });
+                }
+                Err(job_store::Error::NotFound) => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
+
+        Ok(JsonResponse {
+            headers: json_headers(),
+            body: serde_json::to_vec(&JobsBody { jobs, next })?,
+        })
+    }
+
+    /// One keyset page of dead-letter (exhausted-retry) jobs. See
+    /// [`Self::get_jobs_info`] for the cursor and skip semantics.
+    #[instrument(skip(self))]
+    pub async fn get_failed_jobs_info(
+        &self,
+        n: Option<u16>,
+        after: Option<String>,
+    ) -> Result<JsonResponse, Error> {
+        let n = n.unwrap_or(DEFAULT_JOBS_PAGE);
+        let (keys, next) = self
+            .cache_queue
+            .list_failed_page(CACHE_QUEUE, n, after.as_deref())
+            .await?;
+
+        let mut failed = Vec::with_capacity(keys.len());
+        for storage_key in keys {
+            match self
+                .cache_queue
+                .read_failed(CACHE_QUEUE, &storage_key)
+                .await
+            {
+                Ok(record) => failed.push(FailedJobEntry {
+                    storage_key,
+                    id: record.envelope.id,
+                    kind: record.envelope.kind,
+                    lock_key: record.envelope.lock_key,
+                    attempts: record.envelope.attempts,
+                    max_attempts: record.envelope.max_attempts,
+                    created_at: record.envelope.created_at,
+                    failed_at: record.failed_at,
+                    last_error: record.last_error,
+                }),
+                Err(job_store::Error::NotFound) => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
+
+        Ok(JsonResponse {
+            headers: json_headers(),
+            body: serde_json::to_vec(&FailedJobsBody { failed, next })?,
+        })
+    }
+
+    /// Requeue a dead-letter job (attempts reset to zero). Delegates to the
+    /// durable queue; a stale key surfaces as [`Error::NotFound`] (404).
+    #[instrument(skip(self))]
+    pub async fn retry_failed_job(&self, storage_key: &str) -> Result<(), Error> {
+        self.cache_queue
+            .retry_failed(CACHE_QUEUE, storage_key)
+            .await
+            .map_err(Error::from)
+    }
+
+    /// Delete a job in the given partition. A stale key surfaces as
+    /// [`Error::NotFound`] (404).
+    #[instrument(skip(self))]
+    pub async fn delete_job(&self, state: JobState, storage_key: &str) -> Result<(), Error> {
+        self.cache_queue
+            .delete_job(CACHE_QUEUE, state, storage_key)
+            .await
+            .map_err(Error::from)
     }
 
     fn get_repository_config(&self, name: &str) -> RepositoryConfig {

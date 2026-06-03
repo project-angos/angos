@@ -57,6 +57,10 @@ impl From<registry::Error> for Error {
             registry::Error::RangeNotSatisfiable => {
                 oci_error(StatusCode::RANGE_NOT_SATISFIABLE, "SIZE_INVALID", None)
             }
+            registry::Error::NotFound => oci_error(StatusCode::NOT_FOUND, "NOT_FOUND", None),
+            registry::Error::Conflict(msg) => {
+                oci_error(StatusCode::CONFLICT, "CONFLICT", Some(msg))
+            }
             registry::Error::Internal(msg) => oci_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "INTERNAL_ERROR",

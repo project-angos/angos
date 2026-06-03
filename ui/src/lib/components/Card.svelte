@@ -16,7 +16,7 @@
 	{#if title || headerActions}
 		<div class="card-header">
 			{#if title}
-				<h3>{title}{#if count !== undefined} ({count}){/if}</h3>
+				<h3>{title}{#if count !== undefined} &nbsp ({count}){/if}</h3>
 			{/if}
 			{#if headerActions}
 				<div class="header-actions">

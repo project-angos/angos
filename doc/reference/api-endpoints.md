@@ -161,12 +161,14 @@ Query parameters:
 
 ## Extension API (not part of the OCI specification)
 
-Base path: `/v2/_ext/`
+Base path: `/_ext/`
+
+> **Migration note:** These endpoints moved from `/v2/_ext/` to the top-level `/_ext/` prefix in 1.2.0, so `/v2` is reserved for the OCI Distribution API. Clients written against v1.1.1 must update any `/v2/_ext/...` paths to `/_ext/...`.
 
 ### List Repositories
 
 ```
-GET /v2/_ext/_repositories
+GET /_ext/_repositories
 ```
 
 List all configured repositories with namespace counts.
@@ -188,7 +190,7 @@ List all configured repositories with namespace counts.
 ### List Namespaces
 
 ```
-GET /v2/_ext/{repository}/_namespaces
+GET /_ext/{repository}/_namespaces
 ```
 
 List namespaces within a repository.
@@ -209,7 +211,7 @@ List namespaces within a repository.
 ### List Revisions
 
 ```
-GET /v2/_ext/{namespace}/_revisions
+GET /_ext/{namespace}/_revisions
 ```
 
 List all manifest revisions with tags and parent relationships.
@@ -233,7 +235,7 @@ List all manifest revisions with tags and parent relationships.
 ### List Uploads
 
 ```
-GET /v2/_ext/{namespace}/_uploads
+GET /_ext/{namespace}/_uploads
 ```
 
 List blob uploads in progress.

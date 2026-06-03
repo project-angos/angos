@@ -364,8 +364,7 @@ pub async fn apply_cas(
         }
         MutationRecord::Move { src, dst } => match mode {
             CasApplyMode::Abort => {
-                store.copy(src, dst).await.map_err(Error::Storage)?;
-                store.delete(src).await.map_err(Error::Storage)?;
+                store.move_object(src, dst).await.map_err(Error::Storage)?;
                 Ok(())
             }
             CasApplyMode::Reconcile => common::move_idempotent(store, src, dst)

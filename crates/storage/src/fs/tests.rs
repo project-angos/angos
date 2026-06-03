@@ -301,6 +301,26 @@ async fn copy_duplicates_object() {
     assert_eq!(store.get("dst/copied").await.unwrap(), b"payload");
 }
 
+/// `move_object` relocates the object (creating the destination's parent) and
+/// removes the source. On the filesystem backend this is a same-FS `rename`, so
+/// the body is never read into memory — the correctness contract is the same as
+/// the trait default's copy + delete.
+#[tokio::test]
+async fn move_object_relocates_and_removes_source() {
+    let dir = TempDir::new().unwrap();
+    let store = backend(&dir);
+    store
+        .put("src", Bytes::from_static(b"payload"))
+        .await
+        .unwrap();
+    store.move_object("src", "blob-data/moved").await.unwrap();
+    assert_eq!(store.get("blob-data/moved").await.unwrap(), b"payload");
+    assert!(
+        matches!(store.head("src").await, Err(Error::NotFound)),
+        "source must be gone after move",
+    );
+}
+
 /// `list_all_children` must return every child even when the directory
 /// contains more entries than a single page (`page_size=2` used internally
 /// to exercise the pagination loop).

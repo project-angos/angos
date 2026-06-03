@@ -261,7 +261,7 @@ aws s3 ls s3://my-bucket --summarize --recursive
 Count manifests:
 
 ```bash
-curl http://localhost:8000/v2/_ext/_repositories | jq
+curl http://localhost:8000/_ext/_repositories | jq
 ```
 
 ---

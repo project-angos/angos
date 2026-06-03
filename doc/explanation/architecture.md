@@ -44,7 +44,7 @@ Built on Hyper for high-performance async I/O:
 
 Parses incoming requests and maps them to operations:
 - OCI Distribution Specification v1.1 endpoints
-- Extension API endpoints (`/v2/_ext/`)
+- Extension API endpoints (`/_ext/`)
 - Health and metrics endpoints
 - Web UI routes
 

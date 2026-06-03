@@ -1,7 +1,10 @@
 use serde::Serialize;
 use uuid::Uuid;
 
-use crate::oci::{Digest, Namespace, Reference};
+use crate::{
+    oci::{Digest, Namespace, Reference},
+    registry::job_store::JobState,
+};
 
 /// Action represents a parsed HTTP request: both the domain operation (for CEL policies)
 /// and the routing information (for handler dispatch).
@@ -153,6 +156,36 @@ pub enum Action {
     ListNamespaces {
         repository: Namespace,
     },
+    /// List pending/in-flight durable jobs. Distinct action name so operators
+    /// can gate job administration behind higher privilege than registry reads.
+    #[serde(rename = "list-jobs")]
+    ListJobs {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        n: Option<u16>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        after: Option<String>,
+    },
+    #[serde(rename = "list-failed-jobs")]
+    ListFailedJobs {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        n: Option<u16>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        after: Option<String>,
+    },
+    /// Requeue a dead-letter job. `storage_key` is HTTP routing only — excluded
+    /// from the CEL payload like other addressing fields.
+    #[serde(rename = "retry-job")]
+    RetryJob {
+        #[serde(skip)]
+        storage_key: String,
+    },
+    #[serde(rename = "delete-job")]
+    DeleteJob {
+        #[serde(skip)]
+        state: JobState,
+        #[serde(skip)]
+        storage_key: String,
+    },
 }
 
 struct ActionData<'a> {
@@ -200,6 +233,10 @@ impl Action {
             Action::ListUploads { .. } => "list-uploads",
             Action::ListRepositories => "list-repositories",
             Action::ListNamespaces { .. } => "list-namespaces",
+            Action::ListJobs { .. } => "list-jobs",
+            Action::ListFailedJobs { .. } => "list-failed-jobs",
+            Action::RetryJob { .. } => "retry-job",
+            Action::DeleteJob { .. } => "delete-job",
         }
     }
 
@@ -214,7 +251,16 @@ impl Action {
             | Action::ApiVersion
             | Action::ListCatalog { .. }
             | Action::ListRepositories
-            | Action::ListNamespaces { .. } => ActionData::none(),
+            | Action::ListNamespaces { .. }
+            | Action::ListJobs { .. }
+            | Action::ListFailedJobs { .. } => ActionData::none(),
+
+            // Job mutations carry no namespace/digest, but flag `is_push` so they
+            // are treated as state-changing for any write-sensitive policy logic.
+            Action::RetryJob { .. } | Action::DeleteJob { .. } => ActionData {
+                is_push: true,
+                ..ActionData::none()
+            },
 
             Action::ListTags { namespace, .. }
             | Action::GetUpload { namespace, .. }

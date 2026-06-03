@@ -623,6 +623,17 @@ mod tests {
         assert_eq!(s.get("src").await.unwrap(), b"data");
     }
 
+    /// Exercises the trait-default `move_object` (copy + delete) — the memory
+    /// backend does not override it.
+    #[tokio::test]
+    async fn move_object_relocates_and_removes_source() {
+        let s = store();
+        s.put("src", Bytes::from("data")).await.unwrap();
+        s.move_object("src", "dst").await.unwrap();
+        assert_eq!(s.get("dst").await.unwrap(), b"data");
+        assert!(matches!(s.head("src").await, Err(crate::Error::NotFound)));
+    }
+
     #[tokio::test]
     async fn copy_missing_source_returns_not_found() {
         let s = store();

@@ -6,12 +6,12 @@ use chrono::{TimeZone as _, Utc};
 use tempfile::TempDir;
 
 use angos_storage::{MemoryObjectStore, ObjectStore, fs::Backend as StorageFsBackend};
-use angos_tx_engine::transaction::Transaction;
+use angos_tx_engine::transaction::{Mutation, Transaction};
 
 use crate::registry::job_store::{
-    FailOutcome, JobEnvelope, JobQueueConfig, JobStore, MAX_REPORTED_PENDING,
-    STORAGE_KEY_PREFIX_LEN, backoff, make_storage_key, parse_lock_key_index, parse_not_before,
-    serialize_lock_key_index,
+    CompleteOutcome, FailOutcome, JobEnvelope, JobQueueConfig, JobState, JobStore,
+    MAX_REPORTED_PENDING, STORAGE_KEY_PREFIX_LEN, backoff, make_storage_key, parse_lock_key_index,
+    parse_not_before, serialize_dead_letter, serialize_lock_key_index,
 };
 use crate::registry::test_utils::{build_store, locked_executor_over};
 use crate::{metrics_provider, registry::path_builder};
@@ -431,6 +431,312 @@ async fn concurrent_enqueue_dedup() {
 #[tokio::test]
 async fn concurrent_enqueue_dedup_memory() {
     run_concurrent_enqueue_dedup(harness_memory()).await;
+}
+
+// =========================================================================
+// complete() commit-failure fail-over (no hot loop)
+// =========================================================================
+
+/// When the work-product commit fails, `complete` must fail the job over
+/// (retry/dead-letter) rather than returning an error that leaves the pending
+/// file re-claimable forever. Regression test for the in-process cache-fill
+/// hot loop (doc/reviews/20260603-in-process-cache-fill-broken.md).
+async fn run_complete_commit_failure_fails_job_over(h: Harness) {
+    h.store
+        .enqueue(dummy_envelope("cache.ns:sha256:commitfail"))
+        .await
+        .expect("enqueue");
+    let claimed = h
+        .store
+        .claim_one("cache")
+        .await
+        .expect("claim")
+        .claimed
+        .expect("Some");
+    let original_key = claimed.storage_key.clone();
+
+    // Seed a key, then hand `complete` a work-product transaction whose
+    // `PutIfAbsent` on that key is guaranteed to fail (the key already exists),
+    // forcing the merged commit to abort.
+    let collide_key = "collide-key";
+    h.raw
+        .put(collide_key, Bytes::from_static(b"x"))
+        .await
+        .expect("seed collide key");
+    let handler_tx = Transaction::builder()
+        .mutation(Mutation::PutIfAbsent {
+            key: collide_key.to_string(),
+            body: Bytes::from_static(b"y"),
+        })
+        .build();
+
+    let outcome = h
+        .store
+        .complete(claimed, handler_tx)
+        .await
+        .expect("complete returns an outcome, not an error");
+    assert!(
+        matches!(
+            outcome,
+            CompleteOutcome::FailedOver(FailOutcome::Retried { .. })
+        ),
+        "a commit failure must fail the job over to a backed-off retry",
+    );
+
+    // The job is re-queued (with backoff and a bumped attempt count) under a new
+    // storage key — not deleted, and not left at the original key to be
+    // re-claimed immediately.
+    let pending = h.store.list_pending("cache", 10).await.expect("list");
+    assert_eq!(
+        pending.len(),
+        1,
+        "job must be re-queued after commit failure"
+    );
+    assert_ne!(
+        pending[0], original_key,
+        "retry must use a new backed-off storage key",
+    );
+    let env = h
+        .store
+        .read_pending("cache", &pending[0])
+        .await
+        .expect("read requeued envelope");
+    assert_eq!(env.attempts, 1, "attempt count bumped on fail-over");
+}
+
+#[tokio::test]
+async fn complete_commit_failure_fails_job_over() {
+    let dir = TempDir::new().expect("temp dir");
+    run_complete_commit_failure_fails_job_over(harness(&dir)).await;
+}
+
+#[tokio::test]
+async fn complete_commit_failure_fails_job_over_memory() {
+    run_complete_commit_failure_fails_job_over(harness_memory()).await;
+}
+
+// =========================================================================
+// Keyset pagination + administrative mutations
+// =========================================================================
+
+async fn run_list_pending_page_is_keyset_ordered(h: Harness) {
+    for i in 0..5 {
+        h.store
+            .enqueue(dummy_envelope(&format!("cache.ns:sha256:page-{i}")))
+            .await
+            .expect("enqueue");
+    }
+
+    let mut seen: Vec<String> = Vec::new();
+    let mut after: Option<String> = None;
+    loop {
+        let (keys, next) = h
+            .store
+            .list_pending_page("cache", 2, after.as_deref())
+            .await
+            .expect("page");
+        assert!(keys.len() <= 2, "page must not exceed n");
+        seen.extend(keys.iter().cloned());
+        match next {
+            Some(cursor) => {
+                assert_eq!(
+                    Some(&cursor),
+                    keys.last(),
+                    "cursor must be the last key of the page"
+                );
+                after = Some(cursor);
+            }
+            None => break,
+        }
+    }
+
+    assert_eq!(seen.len(), 5, "every envelope is paged exactly once");
+    let mut ordered = seen.clone();
+    ordered.sort();
+    ordered.dedup();
+    assert_eq!(
+        ordered, seen,
+        "keys are returned ascending with no duplicates"
+    );
+}
+
+async fn run_retry_failed_resets_attempts(h: Harness) {
+    // Seed a dead-letter record carrying a non-zero attempt count so the reset
+    // is observable.
+    let mut env = dummy_envelope("cache.ns:sha256:retry-failed");
+    env.attempts = 3;
+    let key = make_storage_key(Utc::now(), &env.id);
+    let body = serialize_dead_letter(&env, "boom").expect("serialize");
+    h.raw
+        .put(
+            &path_builder::job_failed_path("cache", &key),
+            Bytes::from(body),
+        )
+        .await
+        .expect("seed failed");
+
+    let record = h
+        .store
+        .read_failed("cache", &key)
+        .await
+        .expect("read failed");
+    assert_eq!(record.last_error, "boom");
+    assert_eq!(record.envelope.attempts, 3);
+
+    h.store.retry_failed("cache", &key).await.expect("retry");
+
+    assert!(
+        matches!(
+            h.store.read_failed("cache", &key).await,
+            Err(crate::registry::job_store::Error::NotFound)
+        ),
+        "failed record is consumed by retry",
+    );
+
+    let (pending, _) = h
+        .store
+        .list_pending_page("cache", 10, None)
+        .await
+        .expect("list pending");
+    assert_eq!(pending.len(), 1, "exactly one requeued envelope");
+    let restored = h
+        .store
+        .read_pending("cache", &pending[0])
+        .await
+        .expect("read pending");
+    assert_eq!(restored.attempts, 0, "retry resets attempts to zero");
+    assert_eq!(restored.lock_key, "cache.ns:sha256:retry-failed");
+
+    assert!(
+        matches!(
+            h.store.retry_failed("cache", &key).await,
+            Err(crate::registry::job_store::Error::NotFound)
+        ),
+        "retrying a consumed key is a stale 404",
+    );
+}
+
+async fn run_delete_failed_record(h: Harness) {
+    let env = dummy_envelope("cache.ns:sha256:del-failed");
+    let key = make_storage_key(Utc::now(), &env.id);
+    let body = serialize_dead_letter(&env, "boom").expect("serialize");
+    h.raw
+        .put(
+            &path_builder::job_failed_path("cache", &key),
+            Bytes::from(body),
+        )
+        .await
+        .expect("seed failed");
+
+    h.store
+        .delete_job("cache", JobState::Failed, &key)
+        .await
+        .expect("delete");
+    assert!(matches!(
+        h.store.read_failed("cache", &key).await,
+        Err(crate::registry::job_store::Error::NotFound)
+    ));
+    assert!(
+        matches!(
+            h.store.delete_job("cache", JobState::Failed, &key).await,
+            Err(crate::registry::job_store::Error::NotFound)
+        ),
+        "deleting a consumed key is a stale 404",
+    );
+}
+
+async fn run_delete_pending_removes_record_and_index(h: Harness) {
+    let lock_key = "cache.ns:sha256:del-pending";
+    h.store
+        .enqueue(dummy_envelope(lock_key))
+        .await
+        .expect("enqueue");
+    assert!(
+        h.store
+            .find_pending_with_lock_key("cache", lock_key)
+            .await
+            .expect("find"),
+        "enqueue establishes the dedup index",
+    );
+
+    let (pending, _) = h
+        .store
+        .list_pending_page("cache", 10, None)
+        .await
+        .expect("list");
+    assert_eq!(pending.len(), 1);
+    let key = pending[0].clone();
+
+    h.store
+        .delete_job("cache", JobState::Pending, &key)
+        .await
+        .expect("delete");
+
+    let (after, _) = h
+        .store
+        .list_pending_page("cache", 10, None)
+        .await
+        .expect("list");
+    assert!(after.is_empty(), "pending file removed");
+    assert!(
+        !h.store
+            .find_pending_with_lock_key("cache", lock_key)
+            .await
+            .expect("find"),
+        "dedup index is removed alongside the pending file",
+    );
+
+    assert!(
+        matches!(
+            h.store.delete_job("cache", JobState::Pending, &key).await,
+            Err(crate::registry::job_store::Error::NotFound)
+        ),
+        "deleting a consumed key is a stale 404",
+    );
+}
+
+#[tokio::test]
+async fn list_pending_page_is_keyset_ordered() {
+    let dir = TempDir::new().expect("temp dir");
+    run_list_pending_page_is_keyset_ordered(harness(&dir)).await;
+}
+
+#[tokio::test]
+async fn list_pending_page_is_keyset_ordered_memory() {
+    run_list_pending_page_is_keyset_ordered(harness_memory()).await;
+}
+
+#[tokio::test]
+async fn retry_failed_resets_attempts() {
+    let dir = TempDir::new().expect("temp dir");
+    run_retry_failed_resets_attempts(harness(&dir)).await;
+}
+
+#[tokio::test]
+async fn retry_failed_resets_attempts_memory() {
+    run_retry_failed_resets_attempts(harness_memory()).await;
+}
+
+#[tokio::test]
+async fn delete_failed_record() {
+    let dir = TempDir::new().expect("temp dir");
+    run_delete_failed_record(harness(&dir)).await;
+}
+
+#[tokio::test]
+async fn delete_failed_record_memory() {
+    run_delete_failed_record(harness_memory()).await;
+}
+
+#[tokio::test]
+async fn delete_pending_removes_record_and_index() {
+    let dir = TempDir::new().expect("temp dir");
+    run_delete_pending_removes_record_and_index(harness(&dir)).await;
+}
+
+#[tokio::test]
+async fn delete_pending_removes_record_and_index_memory() {
+    run_delete_pending_removes_record_and_index(harness_memory()).await;
 }
 
 // =========================================================================
