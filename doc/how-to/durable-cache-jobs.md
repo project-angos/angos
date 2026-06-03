@@ -161,14 +161,6 @@ or the 10 000-entry saturation cap. Both bound the per-tick cost regardless
 of queue depth. `pending_refresh_interval_secs` is enforced to be ≥ 5 at
 config load (sub-5s ticks induce LIST storms on S3).
 
-**Upgrade cleanup:** Earlier Angos releases wrote a per-job lease body file
-under the `_jobs/leases/` prefix for every active job. This release does not
-write or read those files; the per-`lock_key` execution lock now lives at
-whatever path the `[metadata_store]` lock strategy uses. Any files left at the
-old `_jobs/leases/` prefix after upgrade are inert and can be deleted (relative
-to the metadata-store root: `rm -rf _jobs/leases/` on FS, or a bulk delete of
-the `_jobs/leases/` prefix on S3) to reclaim storage.
-
 **Backoff schedule:** Failed jobs are retried with exponential backoff:
 `min(1 min × 2^attempts, 10 min)`. With the default 5-attempt budget a job
 retries 4 times with delays of 2, 4, 8 and 10 minutes (24 minutes total)
