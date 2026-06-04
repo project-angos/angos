@@ -132,12 +132,41 @@ pub async fn push_manifest(
         None => Reference::Digest(digest.clone()),
     };
     let location = downstream.get_manifest_path("", namespace, &reference);
+
+    // 3a. HEAD-before-PUT (bandwidth optimization, NOT loop prevention — the
+    //     receiver-side no-op dispatch gate breaks cycles; this just avoids one
+    //     wasted PUT once converged). Probe the target reference: if the
+    //     downstream already resolves it to THIS digest, it is converged, so skip
+    //     the manifest PUT. For a subject-bearing manifest we still run the
+    //     referrers fallback below (it is idempotent and we cannot observe the
+    //     downstream's `OCI-Subject` indexing without the PUT response).
+    let already_present = downstream
+        .head_manifest(&[], &location)
+        .await
+        .is_ok_and(|(_, downstream_digest, _)| &downstream_digest == digest);
+
+    if already_present {
+        info!(
+            namespace,
+            %digest,
+            ?tag,
+            "Downstream already holds this manifest; skipping PUT (converged)"
+        );
+        if parsed.subject.is_some() {
+            push_referrers_fallback(
+                downstream, namespace, digest, &parsed, &body, origin, source_ts,
+            )
+            .await?;
+        }
+        return Ok(PushOutcome::Pushed);
+    }
+
     let result = downstream
         .put_manifest(&location, media_type, body.clone(), origin, source_ts)
         .await
         .map_err(Error::Registry)?;
 
-    // 3a. LWW loss: the downstream already holds a strictly-newer copy. This is
+    // 3c. LWW loss: the downstream already holds a strictly-newer copy. This is
     //     convergence, not failure — drop the push (and skip the referrers
     //     fallback, which would re-push a superseded artifact).
     if result.superseded {
@@ -804,6 +833,141 @@ mod tests {
         // `.expect(1)` (verified on drop) only matches when both headers are
         // present with the expected values; a missing/wrong header => no match
         // => the PUT would 404 and the push would error.
+        drop(mock_server);
+    }
+
+    #[tokio::test]
+    async fn push_manifest_skips_put_when_downstream_already_converged() {
+        // HEAD-before-PUT optimization: when the downstream already resolves the
+        // target tag to THIS digest, the manifest PUT is skipped. Mount ONLY a
+        // HEAD returning the matching digest; deliberately mount NO manifest PUT
+        // mock, so a wrongly-issued PUT would 404 and fail the push.
+        crate::metrics_provider::init_for_tests();
+        let mock_server = MockServer::start().await;
+        let dir = TempDir::new().unwrap();
+        let (blob_store, store) = test_blob_store(dir.path().to_str().unwrap());
+        let (manifest_digest, manifest_bytes) = seed_blobless_manifest(&store).await;
+
+        Mock::given(method("HEAD"))
+            .and(path(format!("/v2/{NAMESPACE}/manifests/v1")))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header(DOCKER_CONTENT_DIGEST, manifest_digest.to_string().as_str())
+                    .insert_header("Content-Length", manifest_bytes.len().to_string().as_str()),
+            )
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        push_manifest(
+            &downstream_client(&mock_server.uri()),
+            &blob_store,
+            NAMESPACE,
+            &manifest_digest,
+            Some("application/vnd.oci.image.manifest.v1+json"),
+            Some("v1"),
+            manifest_bytes,
+            4,
+            None,
+            None,
+        )
+        .await
+        .expect("a converged downstream must skip the PUT and succeed");
+
+        // No PUT mock exists; `.expect(1)` on the HEAD (verified on drop) proves
+        // the probe ran and the absence of an error proves no PUT was attempted.
+        drop(mock_server);
+    }
+
+    #[tokio::test]
+    async fn push_manifest_puts_when_downstream_holds_a_different_digest() {
+        // HEAD returns a DIFFERENT digest (tag moved / divergence): the PUT must
+        // still run so LWW on the receiver can arbitrate.
+        crate::metrics_provider::init_for_tests();
+        let mock_server = MockServer::start().await;
+        let dir = TempDir::new().unwrap();
+        let (blob_store, store) = test_blob_store(dir.path().to_str().unwrap());
+        let (manifest_digest, manifest_bytes) = seed_blobless_manifest(&store).await;
+
+        let other_digest =
+            "sha256:1111111111111111111111111111111111111111111111111111111111111111";
+        Mock::given(method("HEAD"))
+            .and(path(format!("/v2/{NAMESPACE}/manifests/v1")))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header(DOCKER_CONTENT_DIGEST, other_digest)
+                    .insert_header("Content-Length", "2"),
+            )
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path(format!("/v2/{NAMESPACE}/manifests/v1")))
+            .respond_with(
+                ResponseTemplate::new(201)
+                    .insert_header(DOCKER_CONTENT_DIGEST, manifest_digest.to_string().as_str()),
+            )
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        push_manifest(
+            &downstream_client(&mock_server.uri()),
+            &blob_store,
+            NAMESPACE,
+            &manifest_digest,
+            Some("application/vnd.oci.image.manifest.v1+json"),
+            Some("v1"),
+            manifest_bytes,
+            4,
+            None,
+            None,
+        )
+        .await
+        .expect("a divergent downstream digest must still PUT");
+
+        // `.expect(1)` on the PUT (verified on drop) proves the PUT ran.
+        drop(mock_server);
+    }
+
+    #[tokio::test]
+    async fn push_manifest_puts_when_downstream_head_returns_404() {
+        // HEAD-before-PUT must fail OPEN: when the target reference does not exist
+        // downstream (HEAD 404 — the common first-replication case), `is_ok_and`
+        // is false, so the manifest PUT still runs. Mount NO HEAD mock, so wiremock
+        // answers HEAD with a default 404; mount the PUT with `.expect(1)`.
+        crate::metrics_provider::init_for_tests();
+        let mock_server = MockServer::start().await;
+        let dir = TempDir::new().unwrap();
+        let (blob_store, store) = test_blob_store(dir.path().to_str().unwrap());
+        let (manifest_digest, manifest_bytes) = seed_blobless_manifest(&store).await;
+
+        Mock::given(method("PUT"))
+            .and(path(format!("/v2/{NAMESPACE}/manifests/v1")))
+            .respond_with(
+                ResponseTemplate::new(201)
+                    .insert_header(DOCKER_CONTENT_DIGEST, manifest_digest.to_string().as_str()),
+            )
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        push_manifest(
+            &downstream_client(&mock_server.uri()),
+            &blob_store,
+            NAMESPACE,
+            &manifest_digest,
+            Some("application/vnd.oci.image.manifest.v1+json"),
+            Some("v1"),
+            manifest_bytes,
+            4,
+            None,
+            None,
+        )
+        .await
+        .expect("a 404 HEAD must fall through to the PUT");
+
+        // `.expect(1)` on the PUT (verified on drop) proves the probe failed open
+        // and the PUT ran.
         drop(mock_server);
     }
 

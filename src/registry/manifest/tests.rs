@@ -2502,3 +2502,476 @@ async fn replication_superseded_maps_to_distinct_oci_code() {
         conflict_json["errors"][0]["code"]
     );
 }
+
+#[cfg(test)]
+mod noop_suppression_tests {
+    //! No-op suppression (loop prevention): an inbound manifest write that does
+    //! not change local state must NOT be re-dispatched for replication. These
+    //! tests drive `accept_put_manifest` / `delete_manifest` against a
+    //! self-contained FS/in-memory registry whose single downstream lets
+    //! `dispatch_replication` enqueue, then assert on the pending replication
+    //! queue depth. The harness shares one `Store` between the blob store,
+    //! metadata store, and a caller-held `JobStore` so `create_test_manifest`
+    //! (which uploads via the registry) and the queue count both observe the
+    //! same backend; no drain is spawned, so enqueued jobs persist for counting.
+
+    use std::{collections::HashMap, io::Cursor, sync::Arc};
+
+    use tempfile::TempDir;
+
+    use angos_storage::{ObjectStore, fs::Backend as StorageFsBackend};
+    use angos_tx_engine::transaction::Transaction;
+
+    use crate::{
+        cache,
+        oci::{Digest, Namespace, Reference},
+        policy::{RetentionPolicy, RetentionPolicyConfig, SystemClock},
+        registry::{
+            Registry, RegistryConfig, Repository,
+            blob_store::BlobStore,
+            job_store::JobStore,
+            manifest::DEFAULT_MAX_MANIFEST_SIZE_BYTES,
+            metadata_store::MetadataStore,
+            repository_resolver::RepositoryResolver,
+            test_utils::{build_store, build_test_fs_executor},
+        },
+        registry_client::RegistryClient,
+        replication::{REPLICATION_QUEUE, ReplicationDownstream, ReplicationMode},
+        util::sha256,
+    };
+
+    use super::{create_test_manifest, manifest_with_references, upload_blob};
+
+    const REPO: &str = "nginx";
+    const NAMESPACE: &str = "nginx";
+    const DOWNSTREAM: &str = "eu-region";
+    const LOCAL_INSTANCE: &str = "instance-local";
+
+    fn downstream_client() -> Arc<RegistryClient> {
+        let backend = cache::Config::Memory.to_backend().unwrap();
+        Arc::new(
+            RegistryClient::builder()
+                .url("https://unused.test".to_string())
+                .client(reqwest::Client::new())
+                .cache(backend)
+                .max_manifest_size_bytes(DEFAULT_MAX_MANIFEST_SIZE_BYTES)
+                .build()
+                .unwrap(),
+        )
+    }
+
+    fn repository_with_downstream() -> Repository {
+        Repository {
+            name: REPO.to_string(),
+            upstreams: Vec::new(),
+            replication: vec![
+                ReplicationDownstream::builder()
+                    .name(DOWNSTREAM.to_string())
+                    .registry_client(downstream_client())
+                    .mode(ReplicationMode::EventReconcile)
+                    .namespace_filter(Vec::new())
+                    .max_concurrent_pushes(4)
+                    .build()
+                    .unwrap(),
+            ],
+            retention_policy: RetentionPolicy::new(
+                &RetentionPolicyConfig::default(),
+                Arc::new(SystemClock),
+            ),
+            immutable_tags: false,
+            immutable_tags_exclusions: Vec::new(),
+        }
+    }
+
+    /// Build a `Registry` whose blob store, metadata store, and a caller-held
+    /// `JobStore` all share one FS-backed `Store`, carrying a single
+    /// event+reconcile downstream so `dispatch_replication` enqueues.
+    fn build_registry(root: &str) -> (Registry, Arc<JobStore>) {
+        crate::metrics_provider::init_for_tests();
+        let object: Arc<dyn ObjectStore> =
+            Arc::new(StorageFsBackend::builder().root_dir(root).build().unwrap());
+        let executor = build_test_fs_executor(root, false);
+        let store = build_store(object, executor);
+        let metadata_store = Arc::new(
+            MetadataStore::builder()
+                .store(store.clone())
+                .link_cache_ttl(0)
+                .access_time_debounce_secs(0)
+                .build()
+                .unwrap(),
+        );
+        let blob_store = Arc::new(BlobStore::builder().store(store.clone()).build().unwrap());
+
+        let mut repositories = HashMap::new();
+        repositories.insert(REPO.to_string(), repository_with_downstream());
+        let resolver = Arc::new(RepositoryResolver::new(Arc::new(repositories)).unwrap());
+
+        // A bare JobStore over the shared store persists (and lets us count)
+        // enqueued envelopes; no drain is spawned, so nothing consumes them.
+        let job_store: Arc<JobStore> = Arc::new(JobStore::new(store, "test"));
+
+        let config = RegistryConfig::default()
+            .instance_id(LOCAL_INSTANCE.to_string())
+            .job_queue(job_store.clone());
+        let registry = Registry::new(blob_store, metadata_store, resolver, config).unwrap();
+        (registry, job_store)
+    }
+
+    async fn pending(job_store: &JobStore) -> u64 {
+        job_store.count_pending(REPLICATION_QUEUE, 0).await.unwrap()
+    }
+
+    /// Drain (claim + complete) one pending replication job, clearing its
+    /// `lock_key` dedup index. Pending pushes for the same tag coalesce on that
+    /// index (a tag's pending push is replaced, not duplicated, while still
+    /// pending), so draining between two genuine changes lets the second one
+    /// re-enqueue rather than dedup away — isolating the dispatch GATE under test
+    /// from the queue's (correct) coalescing.
+    async fn drain_one(job_store: &JobStore) {
+        let claimed = job_store
+            .claim_one(REPLICATION_QUEUE)
+            .await
+            .unwrap()
+            .claimed
+            .expect("expected one claimable job");
+        job_store
+            .complete(claimed, Transaction::builder().build())
+            .await
+            .unwrap();
+    }
+
+    /// Build a second, distinct manifest (a different layer => a different
+    /// digest) so a tag can be moved from one digest to another. Uploads the
+    /// referenced blobs into the registry first so the push validates.
+    async fn create_second_manifest(
+        registry: &Registry,
+        namespace: &Namespace,
+    ) -> (Vec<u8>, String) {
+        let config_content = br#"{"architecture":"arm64","os":"linux"}"#;
+        let layer_content = b"a different layer content";
+        let config_digest = upload_blob(registry, namespace, config_content).await;
+        let layer_digest = upload_blob(registry, namespace, layer_content).await;
+        manifest_with_references(
+            &config_digest,
+            config_content.len(),
+            &layer_digest,
+            layer_content.len(),
+        )
+    }
+
+    /// A tagged push that MOVES the tag to a new digest enqueues one push job;
+    /// re-asserting the SAME tag->digest (an inbound replicated bounce) enqueues
+    /// nothing.
+    #[tokio::test]
+    async fn tagged_push_dispatches_only_when_tag_moves() {
+        let dir = TempDir::new().unwrap();
+        let (registry, job_store) = build_registry(dir.path().to_str().unwrap());
+        let namespace = Namespace::new(NAMESPACE).unwrap();
+        let tag = "latest";
+
+        let (content_a, media_type) = create_test_manifest(&registry, &namespace).await;
+
+        // First push: tag is absent => state changes => one job enqueued.
+        registry
+            .accept_put_manifest(
+                None,
+                None,
+                None,
+                &namespace,
+                Reference::Tag(tag.to_string()),
+                media_type.clone(),
+                Cursor::new(content_a.clone()),
+            )
+            .await
+            .expect("first tag push");
+        assert_eq!(
+            pending(&job_store).await,
+            1,
+            "a first tag push (tag absent) must enqueue one job"
+        );
+
+        // Drain that job so the tag's dedup index clears; otherwise a still-
+        // pending push for the same tag coalesces and would mask the gate.
+        drain_one(&job_store).await;
+        assert_eq!(pending(&job_store).await, 0, "queue drained");
+
+        // Re-assert the SAME tag->digest: a converged replay => no new job, even
+        // with the queue empty (the gate, not the dedup index, suppresses it).
+        registry
+            .accept_put_manifest(
+                None,
+                Some("instance-b".to_string()),
+                None,
+                &namespace,
+                Reference::Tag(tag.to_string()),
+                media_type.clone(),
+                Cursor::new(content_a.clone()),
+            )
+            .await
+            .expect("re-assert same tag->digest");
+        assert_eq!(
+            pending(&job_store).await,
+            0,
+            "re-asserting the same tag->digest must enqueue nothing (no-op replay)"
+        );
+
+        // Move the tag to a DIFFERENT digest: state changes => one new job.
+        let (content_b, media_type_b) = create_second_manifest(&registry, &namespace).await;
+        registry
+            .accept_put_manifest(
+                None,
+                None,
+                None,
+                &namespace,
+                Reference::Tag(tag.to_string()),
+                media_type_b,
+                Cursor::new(content_b),
+            )
+            .await
+            .expect("move tag to a new digest");
+        assert_eq!(
+            pending(&job_store).await,
+            1,
+            "moving the tag to a new digest must enqueue a job"
+        );
+    }
+
+    /// A first-time digest push enqueues one job; re-pushing the same
+    /// (already-present) revision enqueues nothing (an A<->B digest bounce must
+    /// not loop).
+    #[tokio::test]
+    async fn digest_push_dispatches_only_when_revision_is_new() {
+        let dir = TempDir::new().unwrap();
+        let (registry, job_store) = build_registry(dir.path().to_str().unwrap());
+        let namespace = Namespace::new(NAMESPACE).unwrap();
+
+        let (content, media_type) = create_test_manifest(&registry, &namespace).await;
+        let digest = Digest::Sha256(sha256::hex(&content).into());
+
+        // First digest push: revision absent => one job.
+        registry
+            .accept_put_manifest(
+                None,
+                None,
+                None,
+                &namespace,
+                Reference::Digest(digest.clone()),
+                media_type.clone(),
+                Cursor::new(content.clone()),
+            )
+            .await
+            .expect("first digest push");
+        assert_eq!(
+            pending(&job_store).await,
+            1,
+            "a first-time digest push must enqueue one job"
+        );
+
+        // Re-push the SAME revision: content-addressed no-op => no new job.
+        registry
+            .accept_put_manifest(
+                None,
+                Some("instance-b".to_string()),
+                None,
+                &namespace,
+                Reference::Digest(digest),
+                media_type,
+                Cursor::new(content),
+            )
+            .await
+            .expect("re-push same revision");
+        assert_eq!(
+            pending(&job_store).await,
+            1,
+            "re-pushing an already-present revision must enqueue nothing"
+        );
+    }
+
+    /// Deleting an existing tag enqueues a delete job; deleting an absent tag
+    /// enqueues nothing.
+    #[tokio::test]
+    async fn tag_delete_dispatches_only_when_something_was_removed() {
+        let dir = TempDir::new().unwrap();
+        let (registry, job_store) = build_registry(dir.path().to_str().unwrap());
+        let namespace = Namespace::new(NAMESPACE).unwrap();
+        let tag = "latest";
+
+        let (content, media_type) = create_test_manifest(&registry, &namespace).await;
+        registry
+            .accept_put_manifest(
+                None,
+                None,
+                None,
+                &namespace,
+                Reference::Tag(tag.to_string()),
+                media_type,
+                Cursor::new(content),
+            )
+            .await
+            .expect("seed tag push");
+        let baseline = pending(&job_store).await;
+
+        // Delete the existing tag: removed something => one delete job.
+        registry
+            .delete_manifest(
+                None,
+                None,
+                None,
+                &namespace,
+                &Reference::Tag(tag.to_string()),
+            )
+            .await
+            .expect("delete existing tag");
+        assert_eq!(
+            pending(&job_store).await,
+            baseline + 1,
+            "deleting an existing tag must enqueue one delete job"
+        );
+
+        // Delete an ABSENT tag (defensive gate): nothing removed => no new job.
+        let after_delete = pending(&job_store).await;
+        let _ = registry
+            .delete_manifest(
+                None,
+                Some("instance-b".to_string()),
+                None,
+                &namespace,
+                &Reference::Tag("does-not-exist".to_string()),
+            )
+            .await;
+        assert_eq!(
+            pending(&job_store).await,
+            after_delete,
+            "deleting an absent tag must enqueue nothing (no-op delete)"
+        );
+    }
+
+    /// The dispatch gate is replication-only: a no-op tag replay (same
+    /// tag->digest) still emits the webhook Events (`ManifestPush` +
+    /// `TagCreate`) even though it enqueues no replication job.
+    #[tokio::test]
+    async fn noop_push_still_emits_webhook_events() {
+        use crate::event_webhook::event::EventKind;
+
+        let dir = TempDir::new().unwrap();
+        let (registry, job_store) = build_registry(dir.path().to_str().unwrap());
+        let namespace = Namespace::new(NAMESPACE).unwrap();
+        let tag = "latest";
+
+        let (content, media_type) = create_test_manifest(&registry, &namespace).await;
+        registry
+            .accept_put_manifest(
+                None,
+                None,
+                None,
+                &namespace,
+                Reference::Tag(tag.to_string()),
+                media_type.clone(),
+                Cursor::new(content.clone()),
+            )
+            .await
+            .expect("seed tag push");
+        let baseline = pending(&job_store).await;
+
+        // Re-assert the same tag->digest: a no-op replay for replication, but the
+        // events must still fire for observers.
+        let response = registry
+            .accept_put_manifest(
+                None,
+                Some("instance-b".to_string()),
+                None,
+                &namespace,
+                Reference::Tag(tag.to_string()),
+                media_type,
+                Cursor::new(content),
+            )
+            .await
+            .expect("re-assert same tag->digest");
+
+        assert_eq!(
+            pending(&job_store).await,
+            baseline,
+            "the no-op replay must NOT enqueue a replication job"
+        );
+        assert!(
+            response
+                .events
+                .iter()
+                .any(|e| e.kind == EventKind::ManifestPush),
+            "a no-op push must still emit ManifestPush"
+        );
+        assert!(
+            response
+                .events
+                .iter()
+                .any(|e| e.kind == EventKind::TagCreate),
+            "a no-op tag push must still emit TagCreate"
+        );
+    }
+
+    /// Mesh-convergence simulation: model node C in an A -> B -> C -> A cycle.
+    /// The write originated at A, so it carries `origin = instance-a` (a FOREIGN
+    /// origin that passes C's self-origin guard — that guard only drops C's own
+    /// id). Once C has converged (the inbound write matches local state), C must
+    /// NOT re-dispatch the write back toward A. This is the property that breaks
+    /// a 3+-node cycle whose loop does not pass through the original author, which
+    /// the self-origin guard alone cannot terminate. The first foreign-origin push
+    /// (state changes) DOES dispatch (C must still forward a genuine update around
+    /// the ring); the converged replay does not.
+    #[tokio::test]
+    async fn foreign_origin_noop_breaks_mesh_cycle() {
+        let dir = TempDir::new().unwrap();
+        let (registry, job_store) = build_registry(dir.path().to_str().unwrap());
+        let namespace = Namespace::new(NAMESPACE).unwrap();
+        let tag = "latest";
+        let origin_a = Some("instance-a".to_string());
+
+        let (content, media_type) = create_test_manifest(&registry, &namespace).await;
+
+        // First hop into C: A's write arrives (tag absent) => state changes => C
+        // forwards it onward (one job), continuing the ring.
+        registry
+            .accept_put_manifest(
+                None,
+                origin_a.clone(),
+                None,
+                &namespace,
+                Reference::Tag(tag.to_string()),
+                media_type.clone(),
+                Cursor::new(content.clone()),
+            )
+            .await
+            .expect("first foreign-origin push");
+        assert_eq!(
+            pending(&job_store).await,
+            1,
+            "a genuine foreign-origin update must still be forwarded around the ring"
+        );
+
+        // Drain so the tag's dedup index clears, isolating the gate from queue
+        // coalescing for the replay below.
+        drain_one(&job_store).await;
+        assert_eq!(pending(&job_store).await, 0, "queue drained");
+
+        // The same A-originated write comes back around the cycle (origin still
+        // instance-a, which passes C's self-origin guard). C has already
+        // converged, so it must drop it: the cycle terminates here.
+        registry
+            .accept_put_manifest(
+                None,
+                origin_a,
+                None,
+                &namespace,
+                Reference::Tag(tag.to_string()),
+                media_type,
+                Cursor::new(content),
+            )
+            .await
+            .expect("converged foreign-origin replay");
+        assert_eq!(
+            pending(&job_store).await,
+            0,
+            "a converged foreign-origin replay must NOT be re-dispatched (cycle broken)"
+        );
+    }
+}
