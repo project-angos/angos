@@ -85,6 +85,7 @@ The scrub command performs storage maintenance and integrity checks. You must sp
 | `--links`                 | `-l`   | Fix links format inconsistencies; remove revisions whose manifest blob is missing; prune phantom referrer back-links |
 | `--media-types`           | `-M`   | Backfill missing `media_type` on manifest links; remove revisions whose manifest blob is missing   |
 | `--referrers`             | `-R`   | Check for and remove orphan referrer links whose referrer manifest is no longer a current revision |
+| `--replicate`             |        | Reconcile every replicated namespace against all its configured downstreams, enqueuing a replication push for each diverging or downstream-missing tag (monotonic-add only; never deletes). Combine with `--dry-run` to preview. See [Configure Replication](../how-to/configure-replication.md). |
 
 **Examples:**
 
@@ -109,6 +110,12 @@ angos scrub --multipart 24h
 
 # Preview retention policy enforcement
 angos scrub --retention --dry-run
+
+# Preview replication reconciliation (enqueues nothing)
+angos scrub --replicate --dry-run
+
+# Reconcile every replicated repository with its downstreams
+angos scrub --replicate
 
 # Run with verbose logging
 RUST_LOG=info angos scrub -t -m -b -r
@@ -146,8 +153,9 @@ spec:
 
 ### worker
 
-Process durable background jobs from the job queue (currently the pull-through
-cache queue).
+Process durable background jobs from the job queue. The default queue is the
+pull-through cache queue; `angos worker --queue replication` drains the
+replication queue instead.
 
 ```bash
 angos worker [options]

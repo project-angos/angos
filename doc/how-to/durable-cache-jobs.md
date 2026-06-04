@@ -6,18 +6,24 @@ title: "Enable Durable Cache Jobs"
 
 # Enable Durable Cache Jobs
 
-Pull-through cache-fill tasks always go through the engine-backed job queue.
-By default (when `[global.job_queue]` is absent) jobs are stored in-process
-memory: a client request enqueues a cache-fill job, an in-process worker drains
-it immediately, and the queue is discarded on restart. Deduplication within a
-single process is guaranteed, but the queue cannot be observed externally.
+Pull-through cache-fill tasks always go through the engine-backed job queue, and
+that queue is **persistent in both modes**: jobs are written to the configured
+object store under a hardcoded `_jobs/` prefix and survive a restart. What
+`[global.job_queue]` changes is *who drains the queue* and how it scales — not
+whether jobs are durable.
 
-Adding `[global.job_queue]` makes the queue durable: instead of in-memory,
-jobs are stored in the **same backend you configured for `[metadata_store]`**
-(filesystem or S3, whichever metadata uses), under a hardcoded `_jobs/` prefix.
-Jobs survive restarts, can be shared across replicas, and are drained by one or
-more `angos worker` subcommands that you run alongside `angos server`. The code
-path is identical in both modes; only the storage backing changes.
+By default (when `[global.job_queue]` is absent) the `angos server` process
+drains the queue itself, in-process: a client request enqueues a cache-fill job
+and an in-process claim loop runs it. Pending jobs persist to the store and are
+picked back up after a restart, but there is no cross-replica coordination and
+no externally observable queue-depth gauge.
+
+Adding `[global.job_queue]` switches draining to one or more separate `angos
+worker` processes that you run alongside `angos server`, and turns on the
+queue-depth gauge for autoscaling. Durable jobs are stored in the **same backend
+you configured for `[metadata_store]`** (filesystem or S3), under the same
+`_jobs/` prefix. The code path is identical in both modes; only who drains the
+queue and how those drainers coordinate changes.
 
 ## When should I use this?
 
@@ -29,12 +35,13 @@ Enable durable cache jobs when:
 - You want KEDA or another external autoscaler to scale `angos worker` pods
   based on queue depth (the `angos_job_queue_pending` Prometheus gauge served
   by `/metrics` on the server's listener).
-- You want cache-fill work to survive a server restart rather than being
-  discarded.
+- You want cache-fill work drained by dedicated `angos worker` processes,
+  decoupled from — and scaled independently of — the request-serving
+  `angos server` processes.
 
-For a single-node deployment where in-process caching is sufficient there is no
-need to configure `[global.job_queue]`; jobs run in-process at full speed
-without any filesystem or network I/O for the queue layer.
+For a single-node deployment, in-process draining is sufficient and you do not
+need `[global.job_queue]`; jobs still persist under `_jobs/` (so they survive a
+restart), but the server drains them itself rather than a separate worker.
 
 ## Configuration
 

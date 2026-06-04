@@ -7,8 +7,8 @@ use crate::{
     command::scrub::{
         check::{
             BlobChecker, LayoutChecker, LinkReferencesChecker, ManifestChecker, MediaTypeChecker,
-            MultipartChecker, NamespaceChecker, ReferrerChecker, RetentionChecker, TagChecker,
-            UploadChecker,
+            MultipartChecker, NamespaceChecker, ReferrerChecker, ReplicationChecker,
+            RetentionChecker, TagChecker, UploadChecker,
         },
         command::Options,
         error::Error,
@@ -92,6 +92,15 @@ pub fn namespace_checkers(
 
     if options.referrers {
         checkers.push(Box::new(ReferrerChecker::new(metadata_store.clone())));
+    }
+
+    if options.replicate {
+        checkers.push(Box::new(
+            ReplicationChecker::builder()
+                .metadata_store(metadata_store.clone())
+                .resolver(resolver.clone())
+                .build()?,
+        ));
     }
 
     Ok(checkers)

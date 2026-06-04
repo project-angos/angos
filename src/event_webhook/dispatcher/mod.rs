@@ -7,6 +7,7 @@ use std::{
     time::Duration,
 };
 
+use async_trait::async_trait;
 use bytes::Bytes;
 use hmac::{Hmac, KeyInit, Mac};
 use prometheus::{HistogramVec, IntCounterVec, register_histogram_vec, register_int_counter_vec};
@@ -14,17 +15,20 @@ use reqwest::Client;
 use sha2::Sha256;
 use tokio::{sync::Mutex, task::JoinSet};
 use tracing::warn;
+use url::Url;
 
 #[cfg(test)]
 mod tests;
 
 use crate::{
+    configuration::RegexPattern,
     event_webhook::{
-        Error,
+        Error, EventSubscriber,
         config::{DeliveryPolicy, EventWebhookConfig},
         event::{Event, EventKind},
     },
     http_client::HttpClientBuilder,
+    secret::Secret,
 };
 
 static DELIVERY_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
@@ -53,15 +57,20 @@ pub struct EventDispatcher {
 
 struct WebhookEndpoint {
     client: Client,
-    config: Arc<EventWebhookConfig>,
+    url: Url,
+    policy: DeliveryPolicy,
+    token: Option<Secret<String>>,
+    max_retries: u32,
+    events: Vec<EventKind>,
+    repository_filter: Option<Vec<RegexPattern>>,
 }
 
 impl WebhookEndpoint {
     fn matches_event(&self, event_kind: &EventKind, repository: &str) -> bool {
-        if !self.config.events.contains(event_kind) {
+        if !self.events.contains(event_kind) {
             return false;
         }
-        match &self.config.repository_filter {
+        match &self.repository_filter {
             None => true,
             Some(filters) => filters.iter().any(|p| p.is_match(repository)),
         }
@@ -70,8 +79,8 @@ impl WebhookEndpoint {
     fn build_request<'a>(&'a self, body: Bytes, event_kind_header: &'a str) -> DeliveryRequest<'a> {
         DeliveryRequest {
             client: &self.client,
-            url: self.config.url.as_str(),
-            token: self.config.token.as_ref().map(|t| t.expose().as_str()),
+            url: self.url.as_str(),
+            token: self.token.as_ref().map(|t| t.expose().as_str()),
             body,
             event_kind_header,
         }
@@ -215,34 +224,8 @@ fn backoff_for_attempt(attempt: u32) -> Duration {
 }
 
 impl EventDispatcher {
-    pub fn new(webhooks: HashMap<String, EventWebhookConfig>) -> Result<Self, Error> {
-        let mut endpoints = HashMap::with_capacity(webhooks.len());
-
-        for (name, config) in webhooks {
-            let client = HttpClientBuilder::new()
-                .rustls_tls()
-                .timeout(Duration::from_millis(config.timeout_ms))
-                .build()
-                .map_err(|e| {
-                    Error::Initialization(format!(
-                        "Failed to create HTTP client for webhook '{name}': {e}"
-                    ))
-                })?;
-
-            endpoints.insert(
-                name,
-                WebhookEndpoint {
-                    client,
-                    config: Arc::new(config),
-                },
-            );
-        }
-
-        Ok(Self {
-            endpoints,
-            shutdown: Arc::new(AtomicBool::new(false)),
-            in_flight: Arc::new(Mutex::new(JoinSet::new())),
-        })
+    pub fn builder() -> EventDispatcherBuilder {
+        EventDispatcherBuilder::default()
     }
 
     pub async fn shutdown_with_timeout(&self, timeout: Duration) {
@@ -276,11 +259,11 @@ impl EventDispatcher {
         let mut in_flight_guard = self.in_flight.lock().await;
         in_flight_guard.spawn(deliver_async(DeliveryJob {
             client: endpoint.client.clone(),
-            url: endpoint.config.url.to_string(),
-            token: endpoint.config.token.as_ref().map(|t| t.expose().clone()),
+            url: endpoint.url.to_string(),
+            token: endpoint.token.as_ref().map(|t| t.expose().clone()),
             body,
             event_kind_header: event_kind_header.to_string(),
-            max_retries: endpoint.config.max_retries,
+            max_retries: endpoint.max_retries,
             name: name.to_string(),
         }));
         true
@@ -294,7 +277,7 @@ impl EventDispatcher {
         event_kind_header: &str,
     ) -> Result<(), Error> {
         let req = endpoint.build_request(body, event_kind_header);
-        send_and_record(&req, endpoint.config.max_retries, name)
+        send_and_record(&req, endpoint.max_retries, name)
             .await
             .map_err(|e| Error::Dispatch(format!("Webhook '{name}' failed: {e}")))
     }
@@ -307,7 +290,7 @@ impl EventDispatcher {
         event_kind_header: &str,
     ) {
         let req = endpoint.build_request(body, event_kind_header);
-        if let Err(e) = send_and_record(&req, endpoint.config.max_retries, name).await {
+        if let Err(e) = send_and_record(&req, endpoint.max_retries, name).await {
             warn!("Optional webhook '{name}' failed: {e}");
         }
     }
@@ -319,7 +302,7 @@ impl EventDispatcher {
         body: Bytes,
         event_kind_header: &str,
     ) -> Result<bool, Error> {
-        match endpoint.config.policy {
+        match endpoint.policy {
             DeliveryPolicy::Async => Ok(self
                 .send_async(name, endpoint, body, event_kind_header)
                 .await),
@@ -359,5 +342,66 @@ impl EventDispatcher {
         }
 
         Ok(())
+    }
+}
+
+#[async_trait]
+impl EventSubscriber for EventDispatcher {
+    async fn on_event(&self, event: &Event) -> Result<(), Error> {
+        self.dispatch(event).await
+    }
+
+    async fn shutdown_with_timeout(&self, timeout: Duration) {
+        EventDispatcher::shutdown_with_timeout(self, timeout).await;
+    }
+}
+
+#[derive(Default)]
+pub struct EventDispatcherBuilder {
+    webhooks: HashMap<String, EventWebhookConfig>,
+}
+
+impl EventDispatcherBuilder {
+    /// Set the full webhook map (name → config). Each config is resolved into
+    /// the endpoint's individual fields at [`build`](Self::build) time.
+    #[must_use]
+    pub fn webhooks(mut self, webhooks: HashMap<String, EventWebhookConfig>) -> Self {
+        self.webhooks = webhooks;
+        self
+    }
+
+    pub fn build(self) -> Result<EventDispatcher, Error> {
+        let mut endpoints = HashMap::with_capacity(self.webhooks.len());
+
+        for (name, config) in self.webhooks {
+            let client = HttpClientBuilder::new()
+                .rustls_tls()
+                .timeout(Duration::from_millis(config.timeout_ms))
+                .build()
+                .map_err(|e| {
+                    Error::Initialization(format!(
+                        "Failed to create HTTP client for webhook '{name}': {e}"
+                    ))
+                })?;
+
+            endpoints.insert(
+                name,
+                WebhookEndpoint {
+                    client,
+                    url: config.url,
+                    policy: config.policy,
+                    token: config.token,
+                    max_retries: config.max_retries,
+                    events: config.events,
+                    repository_filter: config.repository_filter,
+                },
+            );
+        }
+
+        Ok(EventDispatcher {
+            endpoints,
+            shutdown: Arc::new(AtomicBool::new(false)),
+            in_flight: Arc::new(Mutex::new(JoinSet::new())),
+        })
     }
 }

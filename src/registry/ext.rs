@@ -426,17 +426,13 @@ impl Registry {
     ) -> Result<JsonResponse, Error> {
         let n = n.unwrap_or(DEFAULT_JOBS_PAGE);
         let (keys, next) = self
-            .cache_queue
+            .job_queue
             .list_pending_page(CACHE_QUEUE, n, after.as_deref())
             .await?;
 
         let mut jobs = Vec::with_capacity(keys.len());
         for storage_key in keys {
-            match self
-                .cache_queue
-                .read_pending(CACHE_QUEUE, &storage_key)
-                .await
-            {
+            match self.job_queue.read_pending(CACHE_QUEUE, &storage_key).await {
                 Ok(envelope) => {
                     let not_before =
                         job_store::parse_not_before(&storage_key).unwrap_or(envelope.created_at);
@@ -472,17 +468,13 @@ impl Registry {
     ) -> Result<JsonResponse, Error> {
         let n = n.unwrap_or(DEFAULT_JOBS_PAGE);
         let (keys, next) = self
-            .cache_queue
+            .job_queue
             .list_failed_page(CACHE_QUEUE, n, after.as_deref())
             .await?;
 
         let mut failed = Vec::with_capacity(keys.len());
         for storage_key in keys {
-            match self
-                .cache_queue
-                .read_failed(CACHE_QUEUE, &storage_key)
-                .await
-            {
+            match self.job_queue.read_failed(CACHE_QUEUE, &storage_key).await {
                 Ok(record) => failed.push(FailedJobEntry {
                     storage_key,
                     id: record.envelope.id,
@@ -509,7 +501,7 @@ impl Registry {
     /// durable queue; a stale key surfaces as [`Error::NotFound`] (404).
     #[instrument(skip(self))]
     pub async fn retry_failed_job(&self, storage_key: &str) -> Result<(), Error> {
-        self.cache_queue
+        self.job_queue
             .retry_failed(CACHE_QUEUE, storage_key)
             .await
             .map_err(Error::from)
@@ -519,7 +511,7 @@ impl Registry {
     /// [`Error::NotFound`] (404).
     #[instrument(skip(self))]
     pub async fn delete_job(&self, state: JobState, storage_key: &str) -> Result<(), Error> {
-        self.cache_queue
+        self.job_queue
             .delete_job(CACHE_QUEUE, state, storage_key)
             .await
             .map_err(Error::from)

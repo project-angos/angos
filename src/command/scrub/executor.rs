@@ -5,11 +5,17 @@ use tracing::{info, warn};
 
 use crate::{
     command::scrub::{action::Action, error::Error},
+    metrics_provider::metrics_provider,
     oci::{Manifest, Reference},
     registry::{
         blob_store::{self, MultipartCleanup},
+        job_store::JobStore,
         manifest::link_plan,
         metadata_store::{BlobIndexOperation, LinkOperation, MetadataStore, link_kind::LinkKind},
+    },
+    replication::{
+        REPLICATION_DELETE_MANIFEST_KIND, REPLICATION_PUSH_MANIFEST_KIND, ReplicationPushPayload,
+        build_envelope,
     },
 };
 
@@ -35,14 +41,112 @@ impl ActionSink for DryRunSink {
 pub struct Executor {
     blob_store: Arc<blob_store::BlobStore>,
     metadata_store: Arc<MetadataStore>,
+    job_store: Arc<JobStore>,
 }
 
 impl Executor {
+    /// Starts building an executor from individual resolved fields.
+    #[must_use]
+    pub fn builder() -> ExecutorBuilder {
+        ExecutorBuilder::default()
+    }
+
+    /// Thin helper routing through [`Executor::builder`] for tests that do not
+    /// exercise replication. Synthesizes a `JobStore` over the metadata store's
+    /// `Store` façade so all required fields are present and the build cannot fail.
+    #[cfg(test)]
+    #[must_use]
     pub fn new(blob_store: Arc<blob_store::BlobStore>, metadata_store: Arc<MetadataStore>) -> Self {
-        Self {
+        let job_store = Arc::new(JobStore::new(metadata_store.store_arc(), "scrub-test"));
+        Self::builder()
+            .blob_store(blob_store)
+            .metadata_store(metadata_store)
+            .job_store(job_store)
+            .build()
+            .expect("blob_store, metadata_store and job_store provided")
+    }
+
+    /// Builds the SAME envelope shape (queue, kind, `lock_key`) as the event path
+    /// and lands it on the durable replication queue, so a reconcile-discovered
+    /// divergence coalesces with a pending event-path job on `enqueue`. Records
+    /// the `replication_reconcile_total` outcome (`enqueued` / `failed`).
+    async fn enqueue_replication(&self, payload: ReplicationPushPayload) -> Result<(), Error> {
+        let envelope = build_envelope(&payload).map_err(|e| {
+            metrics_provider()
+                .replication_reconcile_total
+                .with_label_values(&["failed"])
+                .inc();
+            Error::Initialization(format!("failed to build replication envelope: {e}"))
+        })?;
+        self.job_store.enqueue(envelope).await.map_err(|e| {
+            metrics_provider()
+                .replication_reconcile_total
+                .with_label_values(&["failed"])
+                .inc();
+            Error::Initialization(format!("failed to enqueue replication job: {e}"))
+        })?;
+        metrics_provider()
+            .replication_reconcile_total
+            .with_label_values(&["enqueued"])
+            .inc();
+        Ok(())
+    }
+}
+
+/// Builder for [`Executor`] taking individual resolved fields.
+///
+/// `blob_store`, `metadata_store` and `job_store` are all required.
+#[allow(clippy::struct_field_names)]
+#[derive(Default)]
+pub struct ExecutorBuilder {
+    blob_store: Option<Arc<blob_store::BlobStore>>,
+    metadata_store: Option<Arc<MetadataStore>>,
+    job_store: Option<Arc<JobStore>>,
+}
+
+impl ExecutorBuilder {
+    /// Blob store the executor reads/deletes blobs through (required).
+    #[must_use]
+    pub fn blob_store(mut self, blob_store: Arc<blob_store::BlobStore>) -> Self {
+        self.blob_store = Some(blob_store);
+        self
+    }
+
+    /// Metadata store the executor mutates links through (required).
+    #[must_use]
+    pub fn metadata_store(mut self, metadata_store: Arc<MetadataStore>) -> Self {
+        self.metadata_store = Some(metadata_store);
+        self
+    }
+
+    /// Producer queue replication enqueue actions are landed on (required).
+    #[must_use]
+    pub fn job_store(mut self, job_store: Arc<JobStore>) -> Self {
+        self.job_store = Some(job_store);
+        self
+    }
+
+    /// Builds the [`Executor`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Initialization`] when a required field is missing.
+    pub fn build(self) -> Result<Executor, Error> {
+        let blob_store = self.blob_store.ok_or_else(|| {
+            Error::Initialization("executor builder requires a blob_store".into())
+        })?;
+        let metadata_store = self.metadata_store.ok_or_else(|| {
+            Error::Initialization("executor builder requires a metadata_store".into())
+        })?;
+        let job_store = self
+            .job_store
+            .ok_or_else(|| Error::Initialization("executor builder requires a job_store".into()))?;
+
+        Ok(Executor {
             blob_store,
             metadata_store,
-        }
+            job_store,
+        })
     }
 }
 
@@ -189,6 +293,40 @@ impl ActionSink for Executor {
                         upload_id,
                     })
                     .await?;
+            }
+            Action::EnqueueReplicationPush {
+                downstream,
+                namespace,
+                tag,
+                digest,
+            } => {
+                self.enqueue_replication(ReplicationPushPayload {
+                    downstream,
+                    namespace,
+                    tag: Some(tag),
+                    digest: Some(digest.to_string()),
+                    kind: REPLICATION_PUSH_MANIFEST_KIND.to_string(),
+                    origin: None,
+                    source_ts: None,
+                })
+                .await?;
+            }
+            Action::EnqueueReplicationDelete {
+                downstream,
+                namespace,
+                tag,
+            } => {
+                // A tag delete keys off the tag; the receiver needs no digest.
+                self.enqueue_replication(ReplicationPushPayload {
+                    downstream,
+                    namespace,
+                    tag: Some(tag),
+                    digest: None,
+                    kind: REPLICATION_DELETE_MANIFEST_KIND.to_string(),
+                    origin: None,
+                    source_ts: None,
+                })
+                .await?;
             }
         }
 

@@ -59,9 +59,30 @@ pub enum Action {
         key: String,
         upload_id: String,
     },
+    /// Enqueue a replication push job for a tag that diverges from (or is
+    /// absent on) a downstream. Applied by the `Executor` via `JobStore::enqueue`
+    /// — never an inline network push (so scrub-discovered divergences get the
+    /// same durable retry/backoff/coalescing as the event path).
+    EnqueueReplicationPush {
+        downstream: String,
+        namespace: String,
+        tag: String,
+        digest: Digest,
+    },
+    /// Enqueue a replication delete job for a tag that exists on a downstream but
+    /// not locally. Reconciliation is a FULL MIRROR with local authoritative, so
+    /// a downstream-only tag (e.g. one pushed directly to the downstream
+    /// out-of-band) is removed. Applied by the `Executor` via `JobStore::enqueue`,
+    /// like [`Action::EnqueueReplicationPush`].
+    EnqueueReplicationDelete {
+        downstream: String,
+        namespace: String,
+        tag: String,
+    },
 }
 
 impl fmt::Display for Action {
+    #[allow(clippy::too_many_lines)]
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Action::MigrateNamespaceRegistry => {
@@ -146,6 +167,27 @@ impl fmt::Display for Action {
             }
             Action::AbortMultipartUpload { key, upload_id } => {
                 write!(f, "abort orphan multipart upload '{key}' ({upload_id})")
+            }
+            Action::EnqueueReplicationPush {
+                downstream,
+                namespace,
+                tag,
+                digest,
+            } => {
+                write!(
+                    f,
+                    "enqueue replication push of '{namespace}:{tag}' ({digest}) to downstream '{downstream}'"
+                )
+            }
+            Action::EnqueueReplicationDelete {
+                downstream,
+                namespace,
+                tag,
+            } => {
+                write!(
+                    f,
+                    "enqueue replication delete of '{namespace}:{tag}' on downstream '{downstream}'"
+                )
             }
         }
     }

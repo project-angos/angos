@@ -2,7 +2,8 @@ pub mod link_plan;
 mod parse;
 mod response;
 
-pub use parse::parse_manifest_digests;
+use chrono::{DateTime, Utc};
+pub use parse::{ParsedManifestDigests, parse_manifest_digests};
 use parse::{manifest_meta_from_body, parse_and_validate_manifest};
 pub use response::{
     DeleteManifestResponse, GetManifestResponse, HeadManifestResponse, PutManifestResponse,
@@ -18,9 +19,12 @@ use crate::{
     event_webhook::event::{Event, EventActor, EventKind},
     oci::{Digest, Manifest, Namespace, Reference},
     registry::{
-        DOCKER_CONTENT_DIGEST, Error, Registry, Repository, blob_ownership::BlobOwnership,
-        blob_store::Error as BlobStoreError, metadata_store::link_kind::LinkKind,
+        DOCKER_CONTENT_DIGEST, Error, Registry, Repository,
+        blob_ownership::BlobOwnership,
+        blob_store::Error as BlobStoreError,
+        metadata_store::{Error as MetadataStoreError, link_kind::LinkKind},
     },
+    replication::{REPLICATION_DELETE_MANIFEST_KIND, REPLICATION_PUSH_MANIFEST_KIND},
     util::sha256,
 };
 
@@ -33,13 +37,16 @@ fn manifest_event(
     digest: Option<String>,
     reference: &Reference,
     actor: Option<EventActor>,
+    origin: Option<String>,
 ) -> Event {
     Event::new(kind, namespace.to_string(), repository)
         .digest(digest)
         .reference(Some(reference.to_string()))
         .actor(actor)
+        .origin(origin)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn tag_event(
     kind: EventKind,
     namespace: &Namespace,
@@ -48,12 +55,14 @@ fn tag_event(
     reference: &Reference,
     tag: &str,
     actor: Option<EventActor>,
+    origin: Option<String>,
 ) -> Event {
     Event::new(kind, namespace.to_string(), repository)
         .digest(digest)
         .reference(Some(reference.to_string()))
         .tag(Some(tag.to_string()))
         .actor(actor)
+        .origin(origin)
 }
 
 impl Registry {
@@ -363,9 +372,14 @@ impl Registry {
     pub async fn delete_manifest(
         &self,
         actor: Option<EventActor>,
+        origin: Option<String>,
+        source_ts: Option<DateTime<Utc>>,
         namespace: &Namespace,
         reference: &Reference,
     ) -> Result<DeleteManifestResponse, Error> {
+        self.check_lww_not_superseded(namespace, reference, source_ts)
+            .await?;
+
         let ops = if let Reference::Digest(digest) = reference {
             let tags = self
                 .metadata_store
@@ -405,6 +419,7 @@ impl Registry {
             digest_str.clone(),
             reference,
             actor.clone(),
+            origin.clone(),
         )];
 
         if let Reference::Tag(tag) = reference {
@@ -416,8 +431,25 @@ impl Registry {
                 reference,
                 tag,
                 actor,
+                origin.clone(),
             ));
         }
+
+        // For a tag delete the receiver keys off `payload.tag`, so no digest is
+        // resolved or carried. For a digest delete the digest IS the reference,
+        // so it is dispatched as `Some`.
+        let (tag, dispatch_digest) = match reference {
+            Reference::Tag(tag) => (Some(tag.as_str()), None),
+            Reference::Digest(digest) => (None, Some(digest)),
+        };
+        self.dispatch_replication(
+            namespace,
+            REPLICATION_DELETE_MANIFEST_KIND,
+            tag,
+            dispatch_digest,
+            origin,
+        )
+        .await;
 
         Ok(DeleteManifestResponse { events })
     }
@@ -511,11 +543,70 @@ impl Registry {
         })
     }
 
+    /// Last-writer-wins guard for a replication-originated tag write.
+    ///
+    /// LWW applies only when the request carries a `source_ts` (i.e. it is a
+    /// replication push/delete, not a genuine client write) and the reference is
+    /// a tag (digest references are content-addressed, so there is no conflict to
+    /// resolve). When the local tag currently resolves to a `created_at` that is
+    /// strictly newer than the incoming `source_ts`, the local copy wins and the
+    /// write is rejected with [`Error::ReplicationSuperseded`] — a 409 carrying a
+    /// distinct OCI code so the sender treats it as convergence rather than a
+    /// retryable conflict. A local tag with no recorded `created_at` is treated
+    /// as oldest and never blocks the incoming write.
+    async fn check_lww_not_superseded(
+        &self,
+        namespace: &Namespace,
+        reference: &Reference,
+        source_ts: Option<DateTime<Utc>>,
+    ) -> Result<(), Error> {
+        let Some(source_ts) = source_ts else {
+            return Ok(());
+        };
+        let Reference::Tag(tag) = reference else {
+            return Ok(());
+        };
+
+        // Distinguish a genuinely-absent tag from a transient read failure. A
+        // missing tag means nothing supersedes the incoming write, so we proceed.
+        // Any other error (storage/coordination/deserialization) must NOT silently
+        // disable LWW — collapsing those to "no local tag" would let an older
+        // replicated write overwrite a strictly-newer local tag during a backend
+        // hiccup. Surface them so the replicated write is refused and the sender
+        // retries instead of overwriting.
+        let local_created_at = match self
+            .metadata_store
+            .read_link(namespace, &LinkKind::Tag(tag.clone()), false)
+            .await
+        {
+            Ok(link) => link.created_at,
+            Err(MetadataStoreError::ReferenceNotFound) => None,
+            Err(err) => return Err(Error::from(err)),
+        };
+
+        // No local tag, or no recorded creation time: nothing supersedes the
+        // incoming write.
+        let Some(local_created_at) = local_created_at else {
+            return Ok(());
+        };
+
+        if local_created_at > source_ts {
+            return Err(Error::ReplicationSuperseded(format!(
+                "local tag '{tag}' (created {local_created_at}) is newer than the replicated source ({source_ts})"
+            )));
+        }
+
+        Ok(())
+    }
+
     /// Reads the body stream, calls `put_manifest`, and returns the domain response.
+    #[allow(clippy::too_many_arguments)]
     #[instrument(skip(self, body_stream, actor))]
     pub async fn accept_put_manifest<S>(
         &self,
         actor: Option<EventActor>,
+        origin: Option<String>,
+        source_ts: Option<DateTime<Utc>>,
         namespace: &Namespace,
         reference: Reference,
         mime_type: String,
@@ -524,6 +615,9 @@ impl Registry {
     where
         S: AsyncRead + Unpin + Send,
     {
+        self.check_lww_not_superseded(namespace, &reference, source_ts)
+            .await?;
+
         let limit = self.max_manifest_size_bytes;
         let mut request_body = Vec::new();
         let mut limited_body = body_stream.take(limit as u64 + 1);
@@ -553,6 +647,7 @@ impl Registry {
             digest_str.clone(),
             &reference,
             actor.clone(),
+            origin.clone(),
         ));
 
         if let Reference::Tag(tag) = &reference {
@@ -560,11 +655,30 @@ impl Registry {
                 EventKind::TagCreate,
                 namespace,
                 repository,
-                digest_str,
+                digest_str.clone(),
                 &reference,
                 tag,
                 actor,
+                origin.clone(),
             ));
+        }
+
+        // Enqueue replication for the stored manifest. The `Docker-Content-Digest`
+        // header is the canonical stored digest (`digest.to_string()`), so it
+        // round-trips back into a `Digest`.
+        if let Some(digest) = digest_str.as_deref().and_then(|d| d.parse::<Digest>().ok()) {
+            let tag = match &reference {
+                Reference::Tag(tag) => Some(tag.as_str()),
+                Reference::Digest(_) => None,
+            };
+            self.dispatch_replication(
+                namespace,
+                REPLICATION_PUSH_MANIFEST_KIND,
+                tag,
+                Some(&digest),
+                origin,
+            )
+            .await;
         }
 
         Ok(response)

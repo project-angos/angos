@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 
+use chrono::{DateTime, Utc};
 use hyper::{Response, StatusCode, body::Incoming, http::request::Parts};
 use tokio::io::AsyncRead;
 
@@ -63,6 +64,7 @@ pub async fn handle_get_manifest(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn handle_put_manifest<S>(
     context: &ServerContext,
     namespace: &Namespace,
@@ -70,6 +72,8 @@ pub async fn handle_put_manifest<S>(
     mime_type: String,
     body_stream: S,
     identity: &ClientIdentity,
+    origin: Option<String>,
+    source_ts: Option<DateTime<Utc>>,
 ) -> Result<EventfulResponse, Error>
 where
     S: AsyncRead + Unpin + Send,
@@ -77,7 +81,15 @@ where
     let actor = Some(EventActor::from(identity.clone()));
     let response = context
         .registry
-        .accept_put_manifest(actor, namespace, reference, mime_type, body_stream)
+        .accept_put_manifest(
+            actor,
+            origin,
+            source_ts,
+            namespace,
+            reference,
+            mime_type,
+            body_stream,
+        )
         .await?;
 
     build_event_response(StatusCode::CREATED, response.headers, response.events)
@@ -88,11 +100,13 @@ pub async fn handle_delete_manifest(
     namespace: &Namespace,
     reference: Reference,
     identity: &ClientIdentity,
+    origin: Option<String>,
+    source_ts: Option<DateTime<Utc>>,
 ) -> Result<EventfulResponse, Error> {
     let actor = Some(EventActor::from(identity.clone()));
     let response = context
         .registry
-        .delete_manifest(actor, namespace, &reference)
+        .delete_manifest(actor, origin, source_ts, namespace, &reference)
         .await?;
 
     build_event_response(StatusCode::ACCEPTED, HashMap::new(), response.events)
@@ -136,6 +150,8 @@ pub async fn dispatch_put_manifest(
     let mime_type = headers.content_type()?.ok_or(Error::BadRequest(
         "No Content-Type header provided".to_string(),
     ))?;
+    let origin = headers.origin();
+    let source_ts = headers.source_timestamp();
 
     let body_stream = incoming_into_async_read(incoming);
 
@@ -148,6 +164,8 @@ pub async fn dispatch_put_manifest(
             mime_type,
             body_stream,
             identity,
+            origin,
+            source_ts,
         )
         .await?,
     )
@@ -156,13 +174,18 @@ pub async fn dispatch_put_manifest(
 
 pub async fn dispatch_delete_manifest(
     context: &ServerContext,
+    parts: &Parts,
     namespace: &Namespace,
     reference: Reference,
     identity: &ClientIdentity,
 ) -> Result<Response<ResponseBody>, Error> {
+    let headers = RequestHeaders::new(&parts.headers);
+    let origin = headers.origin();
+    let source_ts = headers.source_timestamp();
+
     dispatch_eventful(
         context,
-        handle_delete_manifest(context, namespace, reference, identity).await?,
+        handle_delete_manifest(context, namespace, reference, identity, origin, source_ts).await?,
     )
     .await
 }

@@ -264,8 +264,100 @@ Total jobs submitted to the queue.
 | Counter | `queue`, `dedup`   |
 
 **Labels:**
-- `queue`: queue name (currently always `cache`)
+- `queue`: queue name (e.g. `cache`, `replication`)
 - `dedup`: `hit` when a duplicate `lock_key` was suppressed, otherwise `miss`
+
+---
+
+### angos_job_queue_enqueue_failures_total
+
+Total enqueue attempts that did not land on the queue (envelope build or storage error).
+
+| Type    | Labels  |
+|---------|---------|
+| Counter | `queue` |
+
+**Labels:**
+- `queue`: queue name (e.g. `cache`, `replication`)
+
+---
+
+## Replication Metrics
+
+These metrics are always registered. The `angos_job_queue_pending{queue="replication"}`
+gauge (above) reports replication backlog depth; the metrics below cover push
+outcomes, staleness, and scrub reconciliation. See
+[Bi-Directional Replication](../explanation/replication.md).
+
+### angos_replication_push_total
+
+Total replication pushes to a downstream, by outcome.
+
+| Type    | Labels                  |
+|---------|-------------------------|
+| Counter | `downstream`, `outcome` |
+
+**Labels:**
+- `downstream`: the configured downstream `name`
+- `outcome`: `pushed` (manifest/blobs transferred), `superseded` (downstream already held a newer copy — last-writer-wins, counted as success), or `failed` (the push errored and the job will retry)
+
+**Example:**
+```promql
+# Push rate by downstream and outcome
+sum by (downstream, outcome) (rate(angos_replication_push_total[5m]))
+
+# Replication failure rate
+sum by (downstream) (rate(angos_replication_push_total{outcome="failed"}[5m]))
+```
+
+### angos_replication_last_success_timestamp_seconds
+
+Unix timestamp (seconds) of the last successful or superseded replication push per downstream. Use it to detect a stalled downstream.
+
+| Type  | Labels       |
+|-------|--------------|
+| Gauge | `downstream` |
+
+**Example:**
+```promql
+# Seconds since the last successful push (staleness) per downstream
+time() - angos_replication_last_success_timestamp_seconds
+```
+
+### angos_replication_reconcile_total
+
+Replication reconcile enqueues emitted by `angos scrub --replicate`, by outcome.
+
+| Type    | Labels    |
+|---------|-----------|
+| Counter | `outcome` |
+
+**Labels:**
+- `outcome`: `enqueued` (a divergence was enqueued for push) or `failed` (the envelope build or enqueue errored)
+
+**Example:**
+```promql
+# Reconcile enqueue rate by outcome
+sum by (outcome) (rate(angos_replication_reconcile_total[5m]))
+```
+
+### Replication Backlog
+
+Replication shares the durable job queue, so backlog depth is reported by
+`angos_job_queue_pending{queue="replication"}` (see [Job Queue Metrics](#job-queue-metrics)).
+
+```promql
+# Pending replication pushes
+angos_job_queue_pending{queue="replication"}
+```
+
+A deep replication queue is the normal state during a downstream outage and does
+**not** affect `/readyz`. Alert on sustained backlog or staleness instead:
+
+```promql
+# Replication stale for over 10 minutes
+(time() - angos_replication_last_success_timestamp_seconds) > 600
+```
 
 ---
 

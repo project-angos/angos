@@ -1,4 +1,5 @@
 use base64::{Engine, prelude::BASE64_STANDARD};
+use chrono::{TimeZone, Utc};
 use hyper::{
     Request,
     header::{
@@ -10,6 +11,7 @@ use hyper::{
 use crate::{
     command::server::{error::Error, request::RequestHeaders, response_body::ResponseBody},
     registry::BlobRange,
+    replication::{X_ANGOS_ORIGIN, X_ANGOS_SOURCE_TIMESTAMP},
 };
 
 #[test]
@@ -658,4 +660,112 @@ fn test_content_type_valid() {
         content_type,
         Some("application/vnd.oci.image.manifest.v1+json".to_string())
     );
+}
+
+#[test]
+fn test_origin_present() {
+    let request = Request::builder()
+        .header(X_ANGOS_ORIGIN, "instance-abc")
+        .body(())
+        .unwrap();
+    let (parts, ()) = request.into_parts();
+
+    let origin = RequestHeaders::new(&parts.headers).origin();
+    assert_eq!(origin, Some("instance-abc".to_string()));
+}
+
+#[test]
+fn test_origin_trims_whitespace() {
+    let request = Request::builder()
+        .header(X_ANGOS_ORIGIN, "  instance-abc  ")
+        .body(())
+        .unwrap();
+    let (parts, ()) = request.into_parts();
+
+    let origin = RequestHeaders::new(&parts.headers).origin();
+    assert_eq!(origin, Some("instance-abc".to_string()));
+}
+
+#[test]
+fn test_origin_missing() {
+    let request = Request::builder().body(()).unwrap();
+    let (parts, ()) = request.into_parts();
+
+    let origin = RequestHeaders::new(&parts.headers).origin();
+    assert_eq!(origin, None);
+}
+
+#[test]
+fn test_origin_empty_is_none() {
+    let request = Request::builder()
+        .header(X_ANGOS_ORIGIN, "   ")
+        .body(())
+        .unwrap();
+    let (parts, ()) = request.into_parts();
+
+    let origin = RequestHeaders::new(&parts.headers).origin();
+    assert_eq!(origin, None);
+}
+
+#[test]
+fn test_source_timestamp_present() {
+    let request = Request::builder()
+        .header(X_ANGOS_SOURCE_TIMESTAMP, "2026-06-03T12:00:00Z")
+        .body(())
+        .unwrap();
+    let (parts, ()) = request.into_parts();
+
+    let source_ts = RequestHeaders::new(&parts.headers).source_timestamp();
+    assert_eq!(
+        source_ts,
+        Some(Utc.with_ymd_and_hms(2026, 6, 3, 12, 0, 0).unwrap())
+    );
+}
+
+#[test]
+fn test_source_timestamp_with_offset_normalises_to_utc() {
+    let request = Request::builder()
+        .header(X_ANGOS_SOURCE_TIMESTAMP, "  2026-06-03T14:00:00+02:00  ")
+        .body(())
+        .unwrap();
+    let (parts, ()) = request.into_parts();
+
+    let source_ts = RequestHeaders::new(&parts.headers).source_timestamp();
+    assert_eq!(
+        source_ts,
+        Some(Utc.with_ymd_and_hms(2026, 6, 3, 12, 0, 0).unwrap())
+    );
+}
+
+#[test]
+fn test_source_timestamp_missing() {
+    let request = Request::builder().body(()).unwrap();
+    let (parts, ()) = request.into_parts();
+
+    let source_ts = RequestHeaders::new(&parts.headers).source_timestamp();
+    assert_eq!(source_ts, None);
+}
+
+#[test]
+fn test_source_timestamp_empty_is_none() {
+    let request = Request::builder()
+        .header(X_ANGOS_SOURCE_TIMESTAMP, "   ")
+        .body(())
+        .unwrap();
+    let (parts, ()) = request.into_parts();
+
+    let source_ts = RequestHeaders::new(&parts.headers).source_timestamp();
+    assert_eq!(source_ts, None);
+}
+
+#[test]
+fn test_source_timestamp_garbage_is_none() {
+    let request = Request::builder()
+        .header(X_ANGOS_SOURCE_TIMESTAMP, "not-a-timestamp")
+        .body(())
+        .unwrap();
+    let (parts, ()) = request.into_parts();
+
+    let source_ts = RequestHeaders::new(&parts.headers).source_timestamp();
+    assert_eq!(source_ts, None);
 }

@@ -1,21 +1,22 @@
-use std::time::Duration;
+use std::{io::Cursor, time::Duration};
 
 use futures_util::future::join_all;
 use url::Url;
 use wiremock::{
     Mock, MockServer, Request, ResponseTemplate,
-    matchers::{header, method, path, query_param},
+    matchers::{body_bytes, header, method, path, query_param},
 };
 
 use crate::{
     cache,
     oci::{Digest, Namespace, Reference},
-    registry::{DOCKER_CONTENT_DIGEST, Error},
+    registry::{DOCKER_CONTENT_DIGEST, Error, OCI_SUBJECT},
     registry_client::{
-        RegistryClient, RegistryClientConfig,
+        DeleteManifestOutcome, RegistryClient, RegistryClientConfig,
         auth::{token_cache_key, token_index_cache_key},
         get_upstream_namespace,
     },
+    replication::{REPLICATION_SUPERSEDED_CODE, X_ANGOS_ORIGIN, X_ANGOS_SOURCE_TIMESTAMP},
     secret::Secret,
 };
 
@@ -979,4 +980,392 @@ fn test_new_with_both_certificate_and_key_invalid_files() {
 
     assert!(result.is_err());
     assert!(matches!(result.unwrap_err(), Error::Initialization(_)));
+}
+
+/// Builds a no-auth client pointed at `mock_server` (the common setup for the
+/// write/discovery wiremock tests below).
+fn client_for(mock_server: &MockServer) -> RegistryClient {
+    let config = RegistryClientConfig {
+        url: mock_server.uri(),
+        max_redirect: 5,
+        server_ca_bundle: None,
+        client_certificate: None,
+        client_private_key: None,
+        username: None,
+        password: None,
+    };
+    let cache = cache::Config::Memory.to_backend().unwrap();
+    RegistryClient::new(&config, cache).unwrap()
+}
+
+#[tokio::test]
+async fn test_blob_upload_sequence() {
+    let mock_server = MockServer::start().await;
+    let content = b"replicated blob content";
+    let digest = "sha256:1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef";
+    let session_path = "/v2/test/blobs/uploads/session-1";
+
+    // start_upload: POST returns the session Location.
+    Mock::given(method("POST"))
+        .and(path("/v2/test/blobs/uploads/"))
+        .respond_with(
+            ResponseTemplate::new(202).insert_header("Location", format!("{session_path}?state=a")),
+        )
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    // patch_upload: PATCH streams the chunk, returns the next Location.
+    Mock::given(method("PATCH"))
+        .and(path(session_path))
+        .and(body_bytes(content.to_vec()))
+        .respond_with(
+            ResponseTemplate::new(202).insert_header("Location", format!("{session_path}?state=b")),
+        )
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    // complete_upload: PUT with the digest query parameter.
+    Mock::given(method("PUT"))
+        .and(path(session_path))
+        .and(query_param("digest", digest))
+        .respond_with(ResponseTemplate::new(201))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let client = client_for(&mock_server);
+    let start_url = client.get_uploads_start_path("", "test");
+    assert_eq!(
+        start_url,
+        format!("{}/v2/test/blobs/uploads/", mock_server.uri())
+    );
+
+    let session_url = client.start_upload(&start_url).await.unwrap();
+    assert_eq!(
+        session_url,
+        format!("{}{session_path}?state=a", mock_server.uri())
+    );
+
+    let next_url = client
+        .patch_upload(
+            &session_url,
+            content.len() as u64,
+            Cursor::new(content.to_vec()),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        next_url,
+        format!("{}{session_path}?state=b", mock_server.uri())
+    );
+
+    client
+        .complete_upload(&next_url, &Digest::try_from(digest).unwrap())
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn test_put_manifest_with_oci_subject() {
+    let mock_server = MockServer::start().await;
+    let manifest = br#"{"schemaVersion":2}"#;
+    let digest = "sha256:abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890";
+    let subject = "sha256:1111111111111111111111111111111111111111111111111111111111111111";
+    let media_type = "application/vnd.oci.image.manifest.v1+json";
+
+    Mock::given(method("PUT"))
+        .and(path("/v2/test/manifests/latest"))
+        .and(header("Content-Type", media_type))
+        .and(body_bytes(manifest.to_vec()))
+        .respond_with(
+            ResponseTemplate::new(201)
+                .insert_header(DOCKER_CONTENT_DIGEST, digest)
+                .insert_header(OCI_SUBJECT, subject),
+        )
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let client = client_for(&mock_server);
+    let location = client.get_manifest_path("", "test", &Reference::Tag("latest".to_string()));
+
+    let result = client
+        .put_manifest(&location, Some(media_type), manifest.to_vec(), None, None)
+        .await
+        .unwrap();
+
+    assert_eq!(result.digest, Some(Digest::try_from(digest).unwrap()));
+    assert_eq!(result.subject, Some(subject.to_string()));
+    assert!(!result.superseded);
+}
+
+#[tokio::test]
+async fn test_put_manifest_without_oci_subject() {
+    let mock_server = MockServer::start().await;
+    let manifest = br#"{"schemaVersion":2}"#;
+    let digest = "sha256:abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890";
+    let media_type = "application/vnd.docker.distribution.manifest.v2+json";
+
+    Mock::given(method("PUT"))
+        .and(path("/v2/test/manifests/v1"))
+        .respond_with(ResponseTemplate::new(201).insert_header(DOCKER_CONTENT_DIGEST, digest))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let client = client_for(&mock_server);
+    let location = client.get_manifest_path("", "test", &Reference::Tag("v1".to_string()));
+
+    let result = client
+        .put_manifest(&location, Some(media_type), manifest.to_vec(), None, None)
+        .await
+        .unwrap();
+
+    assert_eq!(result.digest, Some(Digest::try_from(digest).unwrap()));
+    assert!(
+        result.subject.is_none(),
+        "OCI-1.0 downstream must not report an OCI-Subject header"
+    );
+    assert!(!result.superseded);
+}
+
+#[tokio::test]
+async fn test_put_manifest_stamps_replication_headers() {
+    let mock_server = MockServer::start().await;
+    let manifest = br#"{"schemaVersion":2}"#;
+    let digest = "sha256:abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890";
+    let media_type = "application/vnd.docker.distribution.manifest.v2+json";
+
+    Mock::given(method("PUT"))
+        .and(path("/v2/test/manifests/v1"))
+        .and(header(X_ANGOS_ORIGIN, "instance-a"))
+        .and(header(X_ANGOS_SOURCE_TIMESTAMP, "2026-06-03T00:00:00Z"))
+        .respond_with(ResponseTemplate::new(201).insert_header(DOCKER_CONTENT_DIGEST, digest))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let client = client_for(&mock_server);
+    let location = client.get_manifest_path("", "test", &Reference::Tag("v1".to_string()));
+
+    client
+        .put_manifest(
+            &location,
+            Some(media_type),
+            manifest.to_vec(),
+            Some("instance-a"),
+            Some("2026-06-03T00:00:00Z"),
+        )
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn test_put_manifest_superseded_409() {
+    let mock_server = MockServer::start().await;
+    let body = serde_json::json!({ "errors": [{ "code": REPLICATION_SUPERSEDED_CODE }] });
+
+    Mock::given(method("PUT"))
+        .and(path("/v2/test/manifests/v1"))
+        .respond_with(ResponseTemplate::new(409).set_body_json(body))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let client = client_for(&mock_server);
+    let location = client.get_manifest_path("", "test", &Reference::Tag("v1".to_string()));
+
+    let result = client
+        .put_manifest(
+            &location,
+            Some("application/json"),
+            b"{}".to_vec(),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    assert!(result.superseded, "an LWW-superseded 409 sets superseded");
+    assert!(result.digest.is_none());
+}
+
+#[tokio::test]
+async fn test_put_manifest_non_superseded_409_is_error() {
+    let mock_server = MockServer::start().await;
+    let body = serde_json::json!({ "errors": [{ "code": "CONFLICT" }] });
+
+    Mock::given(method("PUT"))
+        .and(path("/v2/test/manifests/v1"))
+        .respond_with(ResponseTemplate::new(409).set_body_json(body))
+        .mount(&mock_server)
+        .await;
+
+    let client = client_for(&mock_server);
+    let location = client.get_manifest_path("", "test", &Reference::Tag("v1".to_string()));
+
+    let result = client
+        .put_manifest(
+            &location,
+            Some("application/json"),
+            b"{}".to_vec(),
+            None,
+            None,
+        )
+        .await;
+    assert!(matches!(result, Err(Error::Internal(_))));
+}
+
+#[tokio::test]
+async fn test_delete_manifest_superseded_409() {
+    let mock_server = MockServer::start().await;
+    let body = serde_json::json!({ "errors": [{ "code": REPLICATION_SUPERSEDED_CODE }] });
+
+    Mock::given(method("DELETE"))
+        .and(path("/v2/test/manifests/v1"))
+        .respond_with(ResponseTemplate::new(409).set_body_json(body))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let client = client_for(&mock_server);
+    let location = client.get_manifest_path("", "test", &Reference::Tag("v1".to_string()));
+
+    let outcome = client.delete_manifest(&location, None, None).await.unwrap();
+    assert_eq!(outcome, DeleteManifestOutcome::Superseded);
+}
+
+#[tokio::test]
+async fn test_delete_manifest() {
+    let mock_server = MockServer::start().await;
+    let digest = "sha256:fedcba0987654321fedcba0987654321fedcba0987654321fedcba0987654321";
+
+    Mock::given(method("DELETE"))
+        .and(path(format!("/v2/test/manifests/{digest}")))
+        .respond_with(ResponseTemplate::new(202))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let client = client_for(&mock_server);
+    let location = client.get_manifest_path(
+        "",
+        "test",
+        &Reference::Digest(Digest::try_from(digest).unwrap()),
+    );
+
+    let outcome = client.delete_manifest(&location, None, None).await.unwrap();
+    assert_eq!(outcome, DeleteManifestOutcome::Deleted);
+}
+
+#[tokio::test]
+async fn test_delete_manifest_surfaces_error_status() {
+    let mock_server = MockServer::start().await;
+
+    Mock::given(method("DELETE"))
+        .and(path("/v2/test/manifests/latest"))
+        .respond_with(ResponseTemplate::new(404))
+        .mount(&mock_server)
+        .await;
+
+    let client = client_for(&mock_server);
+    let location = client.get_manifest_path("", "test", &Reference::Tag("latest".to_string()));
+
+    let result = client.delete_manifest(&location, None, None).await;
+    assert!(matches!(result, Err(Error::Internal(_))));
+}
+
+#[test]
+fn test_get_tags_list_path() {
+    let config = RegistryClientConfig {
+        url: "https://example.com".to_string(),
+        max_redirect: 5,
+        server_ca_bundle: None,
+        client_certificate: None,
+        client_private_key: None,
+        username: None,
+        password: None,
+    };
+    let cache = cache::Config::Memory.to_backend().unwrap();
+    let client = RegistryClient::new(&config, cache).unwrap();
+
+    let path = client.get_tags_list_path("local", "local/repo");
+    assert_eq!(path, "https://example.com/v2/repo/tags/list");
+}
+
+#[tokio::test]
+async fn test_list_tags_single_page() {
+    let mock_server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/v2/test/tags/list"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "name": "test",
+            "tags": ["v1", "v2", "v3"],
+        })))
+        .mount(&mock_server)
+        .await;
+
+    let client = client_for(&mock_server);
+    let location = client.get_tags_list_path("", "test");
+
+    let tags = client.list_tags(&location).await.unwrap();
+    assert_eq!(tags, vec!["v1", "v2", "v3"]);
+}
+
+#[tokio::test]
+async fn test_list_tags_follows_pagination() {
+    let mock_server = MockServer::start().await;
+
+    // Page 1 (no `last`): returns the first tag and a Link rel="next".
+    Mock::given(method("GET"))
+        .and(path("/v2/test/tags/list"))
+        .and(query_param("n", "1"))
+        .and(query_param("last", "a"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({ "tags": ["b"] })),
+        )
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/v2/test/tags/list"))
+        .and(query_param("n", "1"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("Link", "</v2/test/tags/list?n=1&last=a>; rel=\"next\"")
+                .set_body_json(serde_json::json!({ "tags": ["a"] })),
+        )
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let client = client_for(&mock_server);
+    let location = format!("{}/v2/test/tags/list?n=1", mock_server.uri());
+
+    let tags = client.list_tags(&location).await.unwrap();
+    assert_eq!(
+        tags,
+        vec!["a", "b"],
+        "tags from both pages must be returned"
+    );
+    drop(mock_server);
+}
+
+#[tokio::test]
+async fn test_list_tags_absent_repo_returns_empty() {
+    let mock_server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/v2/missing/tags/list"))
+        .respond_with(ResponseTemplate::new(404))
+        .mount(&mock_server)
+        .await;
+
+    let client = client_for(&mock_server);
+    let location = client.get_tags_list_path("", "missing");
+
+    let tags = client.list_tags(&location).await.unwrap();
+    assert!(tags.is_empty(), "a 404 repo must yield an empty tag list");
 }

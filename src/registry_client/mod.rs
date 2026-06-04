@@ -3,6 +3,7 @@ mod tests;
 
 mod auth;
 mod upstream_url;
+mod write;
 
 use std::{io, path::Path, sync::Arc, time::Duration};
 
@@ -17,6 +18,8 @@ use tokio::{io::AsyncReadExt, sync::Mutex};
 use tokio_util::io::StreamReader;
 use tracing::{info, warn};
 pub use upstream_url::get_upstream_namespace;
+
+pub use crate::registry_client::write::{DeleteManifestOutcome, PutManifestResult};
 
 use crate::{
     cache::Cache,
@@ -105,25 +108,21 @@ pub struct RegistryClient {
 }
 
 impl RegistryClient {
-    /// Creates a registry client for one upstream registry.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when TLS files cannot be loaded or the HTTP client cannot be built.
-    pub fn new(config: &RegistryClientConfig, cache: Arc<Cache>) -> Result<Self, Error> {
-        Self::new_with_manifest_size_limit(config, cache, DEFAULT_MAX_MANIFEST_SIZE_BYTES)
+    /// Starts building a registry client from individual resolved fields.
+    #[must_use]
+    pub fn builder() -> RegistryClientBuilder {
+        RegistryClientBuilder::default()
     }
 
-    /// Creates a registry client with a custom manifest body size limit.
+    /// Resolves the HTTP client and basic-auth credentials from a parsed
+    /// [`RegistryClientConfig`].
     ///
-    /// # Errors
-    ///
-    /// Returns an error when TLS files cannot be loaded or the HTTP client cannot be built.
-    pub fn new_with_manifest_size_limit(
+    /// Shared by [`RegistryClient::new`] / [`RegistryClient::new_with_manifest_size_limit`]
+    /// and by in-crate callers that build via [`RegistryClient::builder`] directly
+    /// (e.g. replication downstream resolution).
+    pub(crate) fn resolve_config_fields(
         config: &RegistryClientConfig,
-        cache: Arc<Cache>,
-        max_manifest_size_bytes: usize,
-    ) -> Result<Self, Error> {
+    ) -> Result<(Client, Option<(String, String)>), Error> {
         let client = HttpClientBuilder::new()
             .rustls_tls()
             .redirect(reqwest::redirect::Policy::limited(
@@ -148,14 +147,43 @@ impl RegistryClient {
             _ => None,
         };
 
-        Ok(Self {
-            url: config.url.clone(),
-            client,
-            basic_auth,
-            cache,
-            token_refresh: Mutex::new(()),
-            max_manifest_size_bytes,
-        })
+        Ok((client, basic_auth))
+    }
+
+    /// Creates a registry client for one upstream registry.
+    ///
+    /// Thin internal helper over [`RegistryClient::builder`]; resolves the HTTP
+    /// client and credentials from `config`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when TLS files cannot be loaded or the HTTP client cannot be built.
+    pub fn new(config: &RegistryClientConfig, cache: Arc<Cache>) -> Result<Self, Error> {
+        Self::new_with_manifest_size_limit(config, cache, DEFAULT_MAX_MANIFEST_SIZE_BYTES)
+    }
+
+    /// Creates a registry client with a custom manifest body size limit.
+    ///
+    /// Thin internal helper over [`RegistryClient::builder`]; resolves the HTTP
+    /// client and credentials from `config`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when TLS files cannot be loaded or the HTTP client cannot be built.
+    pub fn new_with_manifest_size_limit(
+        config: &RegistryClientConfig,
+        cache: Arc<Cache>,
+        max_manifest_size_bytes: usize,
+    ) -> Result<Self, Error> {
+        let (client, basic_auth) = Self::resolve_config_fields(config)?;
+
+        Self::builder()
+            .url(config.url.clone())
+            .client(client)
+            .basic_auth(basic_auth)
+            .cache(cache)
+            .max_manifest_size_bytes(max_manifest_size_bytes)
+            .build()
     }
 
     async fn query(
@@ -388,5 +416,84 @@ impl RegistryClient {
         }
 
         Ok((media_type, digest, content))
+    }
+}
+
+/// Builder for [`RegistryClient`] taking individual resolved fields.
+///
+/// `url`, `client` and `cache` are required; `basic_auth` defaults to none and
+/// `max_manifest_size_bytes` defaults to [`DEFAULT_MAX_MANIFEST_SIZE_BYTES`].
+#[derive(Default)]
+pub struct RegistryClientBuilder {
+    url: Option<String>,
+    client: Option<Client>,
+    basic_auth: Option<(String, String)>,
+    cache: Option<Arc<Cache>>,
+    max_manifest_size_bytes: Option<usize>,
+}
+
+impl RegistryClientBuilder {
+    /// Base URL of the remote registry (required).
+    #[must_use]
+    pub fn url(mut self, url: String) -> Self {
+        self.url = Some(url);
+        self
+    }
+
+    /// Pre-built HTTP client carrying the resolved TLS/redirect/timeout policy
+    /// (required).
+    #[must_use]
+    pub fn client(mut self, client: Client) -> Self {
+        self.client = Some(client);
+        self
+    }
+
+    /// Optional resolved basic-auth credentials (`username`, `password`).
+    #[must_use]
+    pub fn basic_auth(mut self, basic_auth: Option<(String, String)>) -> Self {
+        self.basic_auth = basic_auth;
+        self
+    }
+
+    /// Shared token/auth cache (required).
+    #[must_use]
+    pub fn cache(mut self, cache: Arc<Cache>) -> Self {
+        self.cache = Some(cache);
+        self
+    }
+
+    /// Maximum manifest body size accepted from the remote registry.
+    #[must_use]
+    pub fn max_manifest_size_bytes(mut self, max_manifest_size_bytes: usize) -> Self {
+        self.max_manifest_size_bytes = Some(max_manifest_size_bytes);
+        self
+    }
+
+    /// Builds the [`RegistryClient`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Initialization`] when a required field is missing.
+    pub fn build(self) -> Result<RegistryClient, Error> {
+        let url = self.url.ok_or_else(|| {
+            Error::Initialization("registry_client builder requires a url".into())
+        })?;
+        let client = self.client.ok_or_else(|| {
+            Error::Initialization("registry_client builder requires a client".into())
+        })?;
+        let cache = self.cache.ok_or_else(|| {
+            Error::Initialization("registry_client builder requires a cache".into())
+        })?;
+
+        Ok(RegistryClient {
+            url,
+            client,
+            basic_auth: self.basic_auth,
+            cache,
+            token_refresh: Mutex::new(()),
+            max_manifest_size_bytes: self
+                .max_manifest_size_bytes
+                .unwrap_or(DEFAULT_MAX_MANIFEST_SIZE_BYTES),
+        })
     }
 }

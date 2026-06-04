@@ -574,12 +574,11 @@ async fn test_hot_reload_adds_webhook_via_command() {
     let command = Command::new(&config).await.unwrap();
 
     assert!(
-        command
+        !command
             .as_insecure()
             .unwrap()
             .current_context()
-            .event_dispatcher()
-            .is_none()
+            .has_event_subscribers()
     );
 
     let (new_config, _new_blobs, _new_meta) =
@@ -591,8 +590,7 @@ async fn test_hot_reload_adds_webhook_via_command() {
             .as_insecure()
             .unwrap()
             .current_context()
-            .event_dispatcher()
-            .is_some()
+            .has_event_subscribers()
     );
 }
 
@@ -606,20 +604,18 @@ async fn test_hot_reload_removes_webhook_via_command() {
             .as_insecure()
             .unwrap()
             .current_context()
-            .event_dispatcher()
-            .is_some()
+            .has_event_subscribers()
     );
 
     let (new_config, _new_blobs, _new_meta) = create_minimal_config();
     command.notify_config_change(&new_config).await.unwrap();
 
     assert!(
-        command
+        !command
             .as_insecure()
             .unwrap()
             .current_context()
-            .event_dispatcher()
-            .is_none()
+            .has_event_subscribers()
     );
 }
 

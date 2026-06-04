@@ -22,6 +22,7 @@ use crate::{
         cache_job_handler::{CACHE_QUEUE, CacheJobHandler},
         job_store::{self, JobHandler, JobStore},
     },
+    replication::{REPLICATION_QUEUE, ReplicationJobHandler},
 };
 
 fn default_queue() -> String {
@@ -83,13 +84,21 @@ struct Components {
 impl Command {
     pub async fn new(options: &Options, config: &Configuration) -> Result<Self, Error> {
         let engine_maintenance = CancellationToken::new();
+        // Worker concurrency follows the bound queue: the replication queue uses
+        // `max_concurrent_replication_jobs`; every other queue (default `cache`)
+        // uses `max_concurrent_cache_jobs`.
+        let concurrency = if options.queue == REPLICATION_QUEUE {
+            config.global.max_concurrent_replication_jobs
+        } else {
+            config.global.max_concurrent_cache_jobs
+        };
         Ok(Self {
             inner: Arc::new(ArcSwap::from_pointee(
-                Components::build(config, Some(engine_maintenance.clone())).await?,
+                Components::build(config, &options.queue, Some(engine_maintenance.clone())).await?,
             )),
             queue: options.queue.clone(),
             poll_interval: *options.poll_interval,
-            concurrency: config.global.max_concurrent_cache_jobs,
+            concurrency,
             shutdown: CancellationToken::new(),
             workers: TaskTracker::new(),
             engine_maintenance,
@@ -180,7 +189,7 @@ impl ConfigNotifier for Command {
     async fn notify_config_change(&self, config: &Configuration) {
         // The engine maintenance tasks were spawned by the initial bootstrap;
         // hot reloads do not respawn them.
-        match Components::build(config, None).await {
+        match Components::build(config, &self.queue, None).await {
             Ok(components) => self.inner.store(Arc::new(components)),
             Err(e) => error!("Failed to apply worker configuration: {e}"),
         }
@@ -194,6 +203,7 @@ impl ConfigNotifier for Command {
 impl Components {
     async fn build(
         config: &Configuration,
+        queue: &str,
         engine_maintenance: Option<CancellationToken>,
     ) -> Result<Self, Error> {
         let auth_cache = bootstrap::auth_cache(&config.cache)?;
@@ -225,11 +235,26 @@ impl Components {
         }
 
         let consumer = Arc::new(JobStore::new(storage, worker_id));
-        let handler: Arc<dyn JobHandler> = Arc::new(CacheJobHandler::new(
-            repositories,
-            blob_backend,
-            metadata_store,
-        ));
+        // Bind the handler to the queue this worker drains. The replication queue
+        // reads local manifest/blob bytes and pushes them to each downstream
+        // `RegistryClient`; every other queue (default `cache`) fills blobs from
+        // upstreams. Self-origin changes are filtered at the enqueue boundary.
+        let handler: Arc<dyn JobHandler> = if queue == REPLICATION_QUEUE {
+            Arc::new(
+                ReplicationJobHandler::builder()
+                    .resolver(repositories)
+                    .blob_store(blob_backend)
+                    .metadata_store(metadata_store)
+                    .build()
+                    .map_err(bootstrap::Error::JobQueue)?,
+            )
+        } else {
+            Arc::new(CacheJobHandler::new(
+                repositories,
+                blob_backend,
+                metadata_store,
+            ))
+        };
 
         Ok(Self { consumer, handler })
     }

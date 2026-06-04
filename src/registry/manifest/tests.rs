@@ -560,7 +560,13 @@ async fn test_delete_manifest() {
 
         // Test delete manifest by tag
         registry
-            .delete_manifest(None, namespace, &Reference::Tag(tag.to_string()))
+            .delete_manifest(
+                None,
+                None,
+                None,
+                namespace,
+                &Reference::Tag(tag.to_string()),
+            )
             .await
             .unwrap();
 
@@ -581,6 +587,8 @@ async fn test_delete_manifest() {
         // Test delete manifest by digest
         registry
             .delete_manifest(
+                None,
+                None,
                 None,
                 namespace,
                 &Reference::Digest(header_digest(&response.headers)),
@@ -651,7 +659,13 @@ async fn delete_manifest_then_delete_uploaded_blobs() {
         assert!(matches!(layer_result, Err(Error::BlobReferenced)));
 
         registry
-            .delete_manifest(None, namespace, &Reference::Digest(manifest_digest.clone()))
+            .delete_manifest(
+                None,
+                None,
+                None,
+                namespace,
+                &Reference::Digest(manifest_digest.clone()),
+            )
             .await
             .unwrap();
 
@@ -846,6 +860,8 @@ async fn accept_put_manifest_rejects_body_above_limit() {
     let err = registry
         .accept_put_manifest(
             None,
+            None,
+            None,
             namespace,
             Reference::Tag("latest".to_string()),
             "application/vnd.oci.image.manifest.v1+json".to_string(),
@@ -1038,6 +1054,8 @@ async fn test_handle_put_manifest() {
         let response = registry
             .accept_put_manifest(
                 None,
+                None,
+                None,
                 namespace,
                 Reference::Tag(tag.to_string()),
                 media_type.clone(),
@@ -1091,7 +1109,13 @@ async fn test_handle_delete_manifest() {
             .unwrap();
 
         registry
-            .delete_manifest(None, namespace, &Reference::Tag(tag.to_string()))
+            .delete_manifest(
+                None,
+                None,
+                None,
+                namespace,
+                &Reference::Tag(tag.to_string()),
+            )
             .await
             .unwrap();
 
@@ -1203,6 +1227,8 @@ async fn test_delete_manifest_by_digest_removes_multiple_tags() {
         registry
             .delete_manifest(
                 None,
+                None,
+                None,
                 namespace,
                 &Reference::Digest(header_digest(&response.headers)),
             )
@@ -1294,6 +1320,8 @@ async fn test_delete_manifest_by_digest_preserves_unrelated_tags() {
 
         registry
             .delete_manifest(
+                None,
+                None,
                 None,
                 namespace,
                 &Reference::Digest(header_digest(&response_a.headers)),
@@ -1390,6 +1418,8 @@ async fn test_delete_manifest_with_many_tags() {
 
         registry
             .delete_manifest(
+                None,
+                None,
                 None,
                 namespace,
                 &Reference::Digest(header_digest(&response_a.headers)),
@@ -1626,12 +1656,20 @@ async fn test_delete_manifest_no_tags_by_digest() {
             .unwrap();
 
         registry
-            .delete_manifest(None, namespace, &Reference::Tag("temp".to_string()))
+            .delete_manifest(
+                None,
+                None,
+                None,
+                namespace,
+                &Reference::Tag("temp".to_string()),
+            )
             .await
             .unwrap();
 
         registry
             .delete_manifest(
+                None,
+                None,
                 None,
                 namespace,
                 &Reference::Digest(header_digest(&response.headers)),
@@ -2154,7 +2192,13 @@ async fn delete_manifest_removes_links_and_blob_data() {
 
     // Delete by digest.
     registry
-        .delete_manifest(None, &namespace, &Reference::Digest(digest.clone()))
+        .delete_manifest(
+            None,
+            None,
+            None,
+            &namespace,
+            &Reference::Digest(digest.clone()),
+        )
         .await
         .unwrap();
 
@@ -2166,5 +2210,295 @@ async fn delete_manifest_removes_links_and_blob_data() {
     assert!(
         matches!(result, Err(metadata_store::Error::ReferenceNotFound)),
         "digest link should be gone after delete, got: {result:?}"
+    );
+}
+
+// --- Receiver-side last-writer-wins (LWW) ------------------------------------
+//
+// FS-backed and env-independent: a replication push/delete carrying a
+// `source_ts` OLDER than the local tag's `created_at` is rejected with the
+// distinct `REPLICATION_SUPERSEDED` 409; a newer (or absent local) source_ts is
+// accepted; a write with no source_ts skips LWW entirely (genuine client write).
+
+async fn seed_tag(registry: &Registry, namespace: &Namespace, tag: &str) -> (Vec<u8>, String) {
+    let (content, media_type) = create_test_manifest(registry, namespace).await;
+    registry
+        .accept_put_manifest(
+            None,
+            None,
+            None,
+            namespace,
+            Reference::Tag(tag.to_string()),
+            media_type.clone(),
+            Cursor::new(content.clone()),
+        )
+        .await
+        .expect("seed tag push");
+    (content, media_type)
+}
+
+async fn local_created_at(
+    registry: &Registry,
+    namespace: &Namespace,
+    tag: &str,
+) -> chrono::DateTime<chrono::Utc> {
+    registry
+        .metadata_store
+        .read_link(namespace.as_ref(), &LinkKind::Tag(tag.to_string()), false)
+        .await
+        .expect("read seeded tag link")
+        .created_at
+        .expect("seeded tag has created_at")
+}
+
+#[tokio::test]
+async fn accept_put_manifest_rejects_lww_older_source_ts() {
+    let test_case = FSRegistryTestCase::new();
+    let registry = test_case.registry();
+    let namespace = &Namespace::new("lww-repo").unwrap();
+    let tag = "latest";
+
+    let (content, media_type) = seed_tag(registry, namespace, tag).await;
+    let created_at = local_created_at(registry, namespace, tag).await;
+    let older = created_at - chrono::Duration::seconds(60);
+
+    let result = registry
+        .accept_put_manifest(
+            None,
+            Some("instance-b".to_string()),
+            Some(older),
+            namespace,
+            Reference::Tag(tag.to_string()),
+            media_type,
+            Cursor::new(content),
+        )
+        .await
+        .err();
+
+    assert!(
+        matches!(result, Some(Error::ReplicationSuperseded(_))),
+        "older source_ts must be superseded by the newer local tag, got: {result:?}"
+    );
+}
+
+#[tokio::test]
+async fn accept_put_manifest_accepts_lww_newer_source_ts() {
+    let test_case = FSRegistryTestCase::new();
+    let registry = test_case.registry();
+    let namespace = &Namespace::new("lww-repo").unwrap();
+    let tag = "latest";
+
+    let (content, media_type) = seed_tag(registry, namespace, tag).await;
+    let created_at = local_created_at(registry, namespace, tag).await;
+    let newer = created_at + chrono::Duration::seconds(60);
+
+    registry
+        .accept_put_manifest(
+            None,
+            Some("instance-b".to_string()),
+            Some(newer),
+            namespace,
+            Reference::Tag(tag.to_string()),
+            media_type,
+            Cursor::new(content),
+        )
+        .await
+        .expect("newer source_ts must win over the older local tag");
+}
+
+#[tokio::test]
+async fn accept_put_manifest_accepts_lww_equal_source_ts() {
+    // Tie-break: an incoming source_ts EXACTLY equal to the local tag's
+    // created_at must NOT be superseded. LWW uses a strict `>` so equal
+    // timestamps converge rather than ping-pong (A<->B alternately rejecting
+    // identical-timestamp writes). Pins the boundary against a regression to
+    // `>=`.
+    let test_case = FSRegistryTestCase::new();
+    let registry = test_case.registry();
+    let namespace = &Namespace::new("lww-repo").unwrap();
+    let tag = "latest";
+
+    let (content, media_type) = seed_tag(registry, namespace, tag).await;
+    let created_at = local_created_at(registry, namespace, tag).await;
+
+    registry
+        .accept_put_manifest(
+            None,
+            Some("instance-b".to_string()),
+            Some(created_at),
+            namespace,
+            Reference::Tag(tag.to_string()),
+            media_type,
+            Cursor::new(content),
+        )
+        .await
+        .expect("equal source_ts must converge (not be superseded)");
+}
+
+#[tokio::test]
+async fn accept_put_manifest_accepts_lww_when_local_absent() {
+    let test_case = FSRegistryTestCase::new();
+    let registry = test_case.registry();
+    let namespace = &Namespace::new("lww-repo").unwrap();
+    let tag = "fresh";
+
+    // No prior local tag: LWW must never block a first write.
+    let (content, media_type) = create_test_manifest(registry, namespace).await;
+    let very_old = chrono::Utc::now() - chrono::Duration::days(3650);
+
+    registry
+        .accept_put_manifest(
+            None,
+            Some("instance-b".to_string()),
+            Some(very_old),
+            namespace,
+            Reference::Tag(tag.to_string()),
+            media_type,
+            Cursor::new(content),
+        )
+        .await
+        .expect("absent local tag must accept any source_ts");
+}
+
+#[tokio::test]
+async fn accept_put_manifest_without_source_ts_skips_lww() {
+    let test_case = FSRegistryTestCase::new();
+    let registry = test_case.registry();
+    let namespace = &Namespace::new("lww-repo").unwrap();
+    let tag = "latest";
+
+    let (content, media_type) = seed_tag(registry, namespace, tag).await;
+
+    // A genuine client write (no source_ts) must overwrite regardless of the
+    // local tag's age.
+    registry
+        .accept_put_manifest(
+            None,
+            None,
+            None,
+            namespace,
+            Reference::Tag(tag.to_string()),
+            media_type,
+            Cursor::new(content),
+        )
+        .await
+        .expect("client write (no source_ts) must skip LWW");
+}
+
+#[tokio::test]
+async fn accept_put_manifest_digest_reference_skips_lww() {
+    let test_case = FSRegistryTestCase::new();
+    let registry = test_case.registry();
+    let namespace = &Namespace::new("lww-repo").unwrap();
+
+    let (content, media_type) = create_test_manifest(registry, namespace).await;
+    let digest = Digest::Sha256(sha256::hex(&content).into());
+    let very_old = chrono::Utc::now() - chrono::Duration::days(3650);
+
+    // Digest references are content-addressed: LWW never applies even with an
+    // ancient source_ts.
+    registry
+        .accept_put_manifest(
+            None,
+            Some("instance-b".to_string()),
+            Some(very_old),
+            namespace,
+            Reference::Digest(digest),
+            media_type,
+            Cursor::new(content),
+        )
+        .await
+        .expect("digest reference must skip LWW");
+}
+
+#[tokio::test]
+async fn delete_manifest_rejects_lww_older_source_ts() {
+    let test_case = FSRegistryTestCase::new();
+    let registry = test_case.registry();
+    let namespace = &Namespace::new("lww-repo").unwrap();
+    let tag = "latest";
+
+    seed_tag(registry, namespace, tag).await;
+    let created_at = local_created_at(registry, namespace, tag).await;
+    let older = created_at - chrono::Duration::seconds(60);
+
+    let result = registry
+        .delete_manifest(
+            None,
+            Some("instance-b".to_string()),
+            Some(older),
+            namespace,
+            &Reference::Tag(tag.to_string()),
+        )
+        .await
+        .err();
+
+    assert!(
+        matches!(result, Some(Error::ReplicationSuperseded(_))),
+        "older source_ts delete must be superseded, got: {result:?}"
+    );
+
+    // The local tag must still resolve (the delete was rejected).
+    registry
+        .metadata_store
+        .read_link(namespace.as_ref(), &LinkKind::Tag(tag.to_string()), false)
+        .await
+        .expect("tag must survive a superseded delete");
+}
+
+#[tokio::test]
+async fn delete_manifest_accepts_lww_newer_source_ts() {
+    let test_case = FSRegistryTestCase::new();
+    let registry = test_case.registry();
+    let namespace = &Namespace::new("lww-repo").unwrap();
+    let tag = "latest";
+
+    seed_tag(registry, namespace, tag).await;
+    let created_at = local_created_at(registry, namespace, tag).await;
+    let newer = created_at + chrono::Duration::seconds(60);
+
+    registry
+        .delete_manifest(
+            None,
+            Some("instance-b".to_string()),
+            Some(newer),
+            namespace,
+            &Reference::Tag(tag.to_string()),
+        )
+        .await
+        .expect("newer source_ts delete must win");
+
+    let result = registry
+        .metadata_store
+        .read_link(namespace.as_ref(), &LinkKind::Tag(tag.to_string()), false)
+        .await;
+    assert!(
+        matches!(result, Err(metadata_store::Error::ReferenceNotFound)),
+        "tag must be gone after an accepted delete, got: {result:?}"
+    );
+}
+
+#[tokio::test]
+async fn replication_superseded_maps_to_distinct_oci_code() {
+    use crate::command::server::Error as ServerError;
+    use crate::replication::REPLICATION_SUPERSEDED_CODE;
+
+    let superseded: ServerError = Error::ReplicationSuperseded("newer".to_string()).into();
+    let conflict: ServerError = Error::Conflict("immutable".to_string()).into();
+
+    // Both are 409, but the OCI codes differ so the sender can disambiguate.
+    assert_eq!(superseded.status_code(), hyper::StatusCode::CONFLICT);
+    assert_eq!(conflict.status_code(), hyper::StatusCode::CONFLICT);
+
+    let superseded_json = superseded.as_json(None);
+    let conflict_json = conflict.as_json(None);
+    assert_eq!(
+        superseded_json["errors"][0]["code"],
+        REPLICATION_SUPERSEDED_CODE
+    );
+    assert_eq!(conflict_json["errors"][0]["code"], "CONFLICT");
+    assert_ne!(
+        superseded_json["errors"][0]["code"],
+        conflict_json["errors"][0]["code"]
     );
 }

@@ -17,6 +17,7 @@ client_auth = "required"
 [global]
 max_concurrent_requests = 4
 max_concurrent_cache_jobs = 4
+max_concurrent_replication_jobs = 4   # worker concurrency for replication jobs (must be > 0)
 update_pull_time = false
 
 # Optional: Global access policy that applies to all repositories
@@ -88,6 +89,12 @@ root_dir = "./data-angos"
 #pending_refresh_interval_secs = 15   # how often the server refreshes the pending gauge (minimum 5)
 #pending_ready_horizon_secs = 600     # only count jobs ready within this many seconds toward the autoscaler gauge
 
+# Replication: the global knob lives in [global] above (max_concurrent_replication_jobs);
+# per-repository downstreams are declared under
+# [[repository."<name>".downstream]] (see below). Replication backlog is observable
+# via the `angos_job_queue_pending{queue="replication"}` Prometheus gauge — it does
+# NOT affect /readyz (a deep queue is the normal state during a downstream outage).
+
 [observability.tracing]
 endpoint = "http://127.0.0.1:4317"
 sampling_rate = 1.0
@@ -143,6 +150,25 @@ password = "$argon2id$v=19$m=16,t=2,p=1$MTIzNDU2Nzg$lurg6dYCXXrJP3zaFwu35w" # te
 
 [repository."nginx".access_policy]
 default = "allow"
+
+# Optional: Replicate this repository to one or more downstream registries.
+# Each downstream mirrors local mutations (manifest push, manifest/tag
+# delete) and/or is reconciled by `angos scrub --replicate`. Declare one
+# array-of-tables entry per downstream (shape mirrors [[repository.X.upstream]]).
+#[[repository."nginx".downstream]]
+#name = "eu-region"                    # local identifier for this downstream
+#url = "https://angos-eu.example.com"
+#username = "replicator"
+#password = "..."
+#mode = "event+reconcile"              # "event+reconcile" | "event-only" | "reconcile-only"
+#namespace_filter = ["^nginx/.*"]      # optional list of regex patterns; empty = match all
+#max_concurrent_pushes = 4             # optional; per-manifest blob fan-out for this downstream (default 4)
+#prune = false                         # if true, scrub --replicate DELETES downstream tags absent locally
+                                       # (authoritative one-way mirror only; leave false for active-active peers)
+# Optional mTLS to the downstream (both required together):
+#server_ca_bundle = "tls.d/downstream-ca-bundle.pem"
+#client_certificate = "tls.d/replicator-cert.pem"
+#client_private_key = "tls.d/replicator-key.pem"
 
 [repository."test".access_policy]
 default = "deny"

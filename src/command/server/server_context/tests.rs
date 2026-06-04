@@ -22,7 +22,6 @@ use crate::{
     configuration::Configuration,
     event_webhook::{
         config::EventWebhookConfig,
-        dispatcher::EventDispatcher,
         event::{Event, EventKind},
     },
     identity::{Action, ClientIdentity},
@@ -177,6 +176,7 @@ pub fn create_test_event() -> Event {
         reference: Some("sha256:abc123".to_string()),
         tag: None,
         actor: None,
+        origin: None,
         repository: "test-repo".to_string(),
     }
 }
@@ -538,7 +538,7 @@ async fn test_server_context_new_with_event_webhooks() {
     let registry = create_test_registry(&config).await;
     let context = ServerContext::new(&config, registry).unwrap();
 
-    assert!(context.event_dispatcher().is_some());
+    assert!(context.has_event_subscribers());
 }
 
 #[tokio::test]
@@ -547,40 +547,7 @@ async fn test_server_context_new_without_event_webhooks() {
     let registry = create_test_registry(&config).await;
     let context = ServerContext::new(&config, registry).unwrap();
 
-    assert!(context.event_dispatcher().is_none());
-}
-
-#[tokio::test]
-async fn test_server_context_event_dispatcher_is_arc_cloneable() {
-    let toml = r#"
-        [blob_store.fs]
-        root_dir = "/tmp/test"
-
-        [metadata_store.fs]
-        root_dir = "/tmp/test"
-
-        [cache.memory]
-
-        [server]
-        bind_address = "0.0.0.0"
-        port = 8000
-
-        [global]
-        update_pull_time = false
-
-        [event_webhook.test_hook]
-        url = "https://example.com/webhook"
-        policy = "optional"
-        events = ["manifest.push"]
-    "#;
-
-    let config: Configuration = toml::from_str(toml).unwrap();
-    let registry = create_test_registry(&config).await;
-    let context = ServerContext::new(&config, registry).unwrap();
-
-    let dispatcher: Arc<EventDispatcher> = context.event_dispatcher().unwrap();
-    let cloned = dispatcher.clone();
-    assert!(Arc::strong_count(&cloned) >= 2);
+    assert!(!context.has_event_subscribers());
 }
 
 #[tokio::test]
@@ -598,6 +565,7 @@ async fn test_dispatch_event_with_no_dispatcher() {
         reference: Some("sha256:abc123".to_string()),
         tag: None,
         actor: None,
+        origin: None,
         repository: "test-repo".to_string(),
     };
 
@@ -654,6 +622,7 @@ async fn test_dispatch_event_delivers_to_webhook() {
         reference: Some("sha256:abc123".to_string()),
         tag: None,
         actor: None,
+        origin: None,
         repository: "test-repo".to_string(),
     };
 
@@ -709,6 +678,7 @@ async fn test_dispatch_event_required_webhook_failure_returns_error() {
         reference: Some("sha256:abc123".to_string()),
         tag: None,
         actor: None,
+        origin: None,
         repository: "test-repo".to_string(),
     };
 
@@ -722,7 +692,7 @@ async fn test_server_context_shutdown_with_no_dispatcher() {
     let registry = create_test_registry(&config).await;
     let context = ServerContext::new(&config, registry).unwrap();
 
-    assert!(context.event_dispatcher().is_none());
+    assert!(!context.has_event_subscribers());
     context.shutdown_with_timeout(Duration::from_secs(10)).await;
 }
 
@@ -775,6 +745,7 @@ async fn test_server_context_shutdown_drains_in_flight_async_delivery() {
         reference: Some("sha256:abc123".to_string()),
         tag: None,
         actor: None,
+        origin: None,
         repository: "test-repo".to_string(),
     };
 
@@ -840,6 +811,7 @@ async fn test_server_context_shutdown_rejects_new_async_dispatches() {
         reference: Some("sha256:abc123".to_string()),
         tag: None,
         actor: None,
+        origin: None,
         repository: "test-repo".to_string(),
     };
 
@@ -1058,4 +1030,121 @@ fn test_resolve_client_ip_x_forwarded_for_takes_precedence() {
         resolve_client_ip(&headers),
         Some("192.168.1.100".to_string())
     );
+}
+
+/// Subscriber that records every event it receives and optionally fails on a
+/// specific event id (used to reproduce the batch short-circuit bug).
+struct RecordingSubscriber {
+    seen: std::sync::Mutex<Vec<Uuid>>,
+    fail_on: Option<Uuid>,
+}
+
+impl RecordingSubscriber {
+    fn new(fail_on: Option<Uuid>) -> Self {
+        Self {
+            seen: std::sync::Mutex::new(Vec::new()),
+            fail_on,
+        }
+    }
+
+    fn seen_ids(&self) -> Vec<Uuid> {
+        self.seen.lock().unwrap().clone()
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::event_webhook::EventSubscriber for RecordingSubscriber {
+    async fn on_event(&self, event: &Event) -> Result<(), crate::event_webhook::Error> {
+        self.seen.lock().unwrap().push(event.id);
+        if self.fail_on == Some(event.id) {
+            return Err(crate::event_webhook::Error::Dispatch(
+                "intentional test failure".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    async fn shutdown_with_timeout(&self, _timeout: Duration) {}
+}
+
+fn make_event(id: Uuid) -> Event {
+    Event {
+        id,
+        timestamp: Utc::now(),
+        kind: EventKind::ManifestPush,
+        namespace: "test/repo".to_string(),
+        digest: Some("sha256:abc123".to_string()),
+        reference: Some("sha256:abc123".to_string()),
+        tag: None,
+        actor: None,
+        origin: None,
+        repository: "test-repo".to_string(),
+    }
+}
+
+#[tokio::test]
+async fn dispatch_events_first_failure_does_not_abort_batch() {
+    // Regression: a failing first event must NOT short-circuit the batch; every
+    // subsequent event still has to be delivered to the subscriber.
+    let config = create_minimal_config();
+    let registry = create_test_registry(&config).await;
+    let mut context = ServerContext::new(&config, registry).unwrap();
+
+    let first = Uuid::new_v4();
+    let second = Uuid::new_v4();
+    let third = Uuid::new_v4();
+
+    let subscriber = Arc::new(RecordingSubscriber::new(Some(first)));
+    context.set_subscribers(vec![subscriber.clone()]);
+
+    let events = vec![make_event(first), make_event(second), make_event(third)];
+    let result = context.dispatch_events(&events).await;
+
+    // The Required-style failure surfaces overall...
+    assert!(result.is_err(), "a delivery failure must surface overall");
+    // ...but every event was still attempted (bug fixed).
+    assert_eq!(
+        subscriber.seen_ids(),
+        vec![first, second, third],
+        "all events must be delivered even when the first one fails"
+    );
+}
+
+#[tokio::test]
+async fn dispatch_events_fans_out_to_all_subscribers() {
+    // Every subscriber receives every event, even if one of them fails.
+    let config = create_minimal_config();
+    let registry = create_test_registry(&config).await;
+    let mut context = ServerContext::new(&config, registry).unwrap();
+
+    let event_id = Uuid::new_v4();
+    let failing = Arc::new(RecordingSubscriber::new(Some(event_id)));
+    let healthy = Arc::new(RecordingSubscriber::new(None));
+    context.set_subscribers(vec![failing.clone(), healthy.clone()]);
+
+    let result = context.dispatch_event(&make_event(event_id)).await;
+
+    assert!(result.is_err(), "a failing subscriber surfaces overall");
+    assert_eq!(failing.seen_ids(), vec![event_id]);
+    assert_eq!(
+        healthy.seen_ids(),
+        vec![event_id],
+        "a healthy subscriber must still receive the event"
+    );
+}
+
+#[tokio::test]
+async fn dispatch_events_all_success_returns_ok() {
+    let config = create_minimal_config();
+    let registry = create_test_registry(&config).await;
+    let mut context = ServerContext::new(&config, registry).unwrap();
+
+    let subscriber = Arc::new(RecordingSubscriber::new(None));
+    context.set_subscribers(vec![subscriber.clone()]);
+
+    let events = vec![make_event(Uuid::new_v4()), make_event(Uuid::new_v4())];
+    let result = context.dispatch_events(&events).await;
+
+    assert!(result.is_ok());
+    assert_eq!(subscriber.seen_ids().len(), 2);
 }

@@ -5,6 +5,7 @@ use crate::{
     configuration::{self, registry_storage},
     event_webhook, registry,
     registry::blob_store,
+    replication::REPLICATION_SUPERSEDED_CODE,
 };
 
 fn oci_error(status_code: StatusCode, code: &'static str, msg: Option<String>) -> Error {
@@ -60,6 +61,9 @@ impl From<registry::Error> for Error {
             registry::Error::NotFound => oci_error(StatusCode::NOT_FOUND, "NOT_FOUND", None),
             registry::Error::Conflict(msg) => {
                 oci_error(StatusCode::CONFLICT, "CONFLICT", Some(msg))
+            }
+            registry::Error::ReplicationSuperseded(msg) => {
+                oci_error(StatusCode::CONFLICT, REPLICATION_SUPERSEDED_CODE, Some(msg))
             }
             registry::Error::Internal(msg) => oci_error(
                 StatusCode::INTERNAL_SERVER_ERROR,

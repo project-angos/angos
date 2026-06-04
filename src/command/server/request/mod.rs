@@ -1,6 +1,7 @@
 use std::{cmp::Ordering, io, sync::LazyLock};
 
 use base64::{Engine, prelude::BASE64_STANDARD};
+use chrono::{DateTime, Utc};
 use futures_util::TryStreamExt;
 use http_body_util::BodyExt;
 use hyper::{
@@ -12,7 +13,11 @@ use regex::Regex;
 use tokio::io::AsyncRead;
 use tokio_util::io::StreamReader;
 
-use crate::{command::server::error::Error, registry::BlobRange};
+use crate::{
+    command::server::error::Error,
+    registry::BlobRange,
+    replication::{X_ANGOS_ORIGIN, X_ANGOS_SOURCE_TIMESTAMP},
+};
 
 static START_END_RANGE_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^(?:bytes=)?(?P<start>\d+)-(?P<end>\d+)?$").unwrap());
@@ -109,6 +114,33 @@ impl<'a> RequestHeaders<'a> {
             .map_err(|error| Error::BadRequest(format!("Invalid Content-Type header: {error}")))?;
 
         Ok(Some(content_type.to_string()))
+    }
+
+    pub fn origin(&self) -> Option<String> {
+        let value = self.headers.get(X_ANGOS_ORIGIN)?.to_str().ok()?.trim();
+        (!value.is_empty()).then(|| value.to_string())
+    }
+
+    /// Reads the `X-Angos-Source-Timestamp` header and parses it as an RFC 3339
+    /// instant for receiver-side last-writer-wins.
+    ///
+    /// Returns `None` for a missing, empty, or unparseable value. A malformed
+    /// timestamp must never fail the request: it simply disables LWW for this
+    /// write (the change is applied as a normal client write).
+    pub fn source_timestamp(&self) -> Option<DateTime<Utc>> {
+        let value = self
+            .headers
+            .get(X_ANGOS_SOURCE_TIMESTAMP)?
+            .to_str()
+            .ok()?
+            .trim();
+        if value.is_empty() {
+            return None;
+        }
+
+        DateTime::parse_from_rfc3339(value)
+            .ok()
+            .map(|dt| dt.with_timezone(&Utc))
     }
 
     pub fn range(&self, header: HeaderName) -> Result<Option<(u64, Option<u64>)>, Error> {

@@ -17,6 +17,16 @@ pub fn namespace_registry_path() -> String {
     format!("{REGISTRY_ROOT}/namespaces.json")
 }
 
+/// Path to the persisted, per-deployment instance identifier. Generated once on
+/// first boot and read back on every subsequent start so replication can stamp
+/// and filter its own origin.
+///
+/// Consumed by `MetadataStore::get_or_init_instance_id`, which the server setup
+/// calls to thread the instance-id into the registry.
+pub fn instance_id_path() -> String {
+    format!("{REGISTRY_ROOT}/instance_id")
+}
+
 pub fn namespace_registry_shard_dir() -> String {
     format!("{REGISTRY_ROOT}/ns")
 }
@@ -376,6 +386,11 @@ mod tests {
             job_lock_key_index_path("cache", "cache.ns:sha256:abc"),
             "_jobs/index/cache/cache.ns%3Asha256%3Aabc.json"
         );
+    }
+
+    #[test]
+    fn test_instance_id_path() {
+        assert_eq!(instance_id_path(), "_registry/instance_id");
     }
 
     #[test]

@@ -52,6 +52,7 @@ When omitted, the server runs without TLS (insecure).
 |-----------------------------|----------|----------|---------------------------------------------|
 | `max_concurrent_requests`   | usize    | `64`     | Tokio worker threads (see Performance Tuning) |
 | `max_concurrent_cache_jobs` | usize    | `4`      | Maximum concurrent cache jobs (minimum `1`). With `[global.job_queue]` enabled, also bounds the number of jobs each `angos worker` processes in parallel. |
+| `max_concurrent_replication_jobs` | non-zero usize | `4` | Concurrency for replication jobs (minimum `1`). Bounds how many replication pushes each `angos worker` (or the in-process drain) handles in parallel. |
 | `max_manifest_size`         | string   | `"5MiB"` | Maximum manifest body size accepted from clients or upstream registries |
 | `update_pull_time`          | bool     | `false`  | Track pull times for retention policies     |
 | `enable_redirect`           | bool     | —        | **Deprecated.** Fallback for both fields below when unset. |
@@ -426,6 +427,31 @@ Array of upstream registries for pull-through cache.
 | `client_private_key` | string | -        | Client key for mTLS               |
 | `username`           | string | -        | Basic auth username               |
 | `password`           | string | -        | Basic auth password               |
+
+### Downstream (`repository."<namespace>".downstream`)
+
+Array of downstream registries to which this repository's mutations are replicated. See [Configure Replication](../how-to/configure-replication.md).
+
+| Option                  | Type     | Default            | Description                                                              |
+|-------------------------|----------|--------------------|--------------------------------------------------------------------------|
+| `name`                  | string   | required           | Local identifier for this downstream (logs, `downstream` metric label)   |
+| `url`                   | string   | required           | Downstream registry base URL                                             |
+| `mode`                  | string   | `"event+reconcile"` | `"event+reconcile"`, `"event-only"`, or `"reconcile-only"`              |
+| `namespace_filter`      | [string] | `[]` (all)         | Regex patterns; a namespace replicates here only if it matches one       |
+| `max_concurrent_pushes` | usize    | `4`                | Concurrent blob pushes per manifest for this downstream                  |
+| `max_redirect`          | u8       | `5`                | Maximum redirects to follow                                              |
+| `username`              | string   | -                  | Basic auth username                                                      |
+| `password`              | string   | -                  | Basic auth password                                                      |
+| `server_ca_bundle`      | string   | -                  | CA bundle for downstream TLS verification                               |
+| `client_certificate`    | string   | -                  | Client certificate for mTLS (requires `client_private_key`)             |
+| `client_private_key`    | string   | -                  | Client key for mTLS (requires `client_certificate`)                     |
+
+`mode` values:
+- `event+reconcile` (default): push on every local mutation **and** include in `angos scrub --replicate`.
+- `event-only`: push on local mutations; excluded from scrub reconciliation.
+- `reconcile-only`: excluded from live pushes; mirrored only via `angos scrub --replicate`.
+
+If either `client_certificate` or `client_private_key` is set, both must be set.
 
 ### Access Policy (`repository."<namespace>".access_policy`)
 

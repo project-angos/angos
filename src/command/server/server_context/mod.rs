@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 use hyper::http::request::Parts;
 use tracing::instrument;
@@ -7,7 +7,7 @@ use crate::{
     auth::{Authenticator, Authorizer},
     command::server::error::Error,
     configuration::Configuration,
-    event_webhook::{dispatcher::EventDispatcher, event::Event},
+    event_webhook::{EventSubscriber, dispatcher::EventDispatcher, event::Event},
     identity::{Action, ClientIdentity},
     oci::{Namespace, Reference},
     registry::Registry,
@@ -16,7 +16,7 @@ use crate::{
 pub struct ServerContext {
     authenticator: Arc<Authenticator>,
     authorizer: Arc<Authorizer>,
-    event_dispatcher: Option<Arc<EventDispatcher>>,
+    subscribers: Vec<Arc<dyn EventSubscriber>>,
     pub registry: Registry,
     pub enable_ui: bool,
     pub ui_name: String,
@@ -33,26 +33,34 @@ impl ServerContext {
         let authenticator = Arc::new(Authenticator::new(config, &cache)?);
         let authorizer = Arc::new(Authorizer::new(config, &cache)?);
 
-        let event_dispatcher = if config.event_webhook.is_empty() {
-            None
-        } else {
-            let dispatcher = EventDispatcher::new(config.event_webhook.clone())?;
-            Some(Arc::new(dispatcher))
-        };
+        let mut subscribers: Vec<Arc<dyn EventSubscriber>> = Vec::new();
+        if !config.event_webhook.is_empty() {
+            let dispatcher = EventDispatcher::builder()
+                .webhooks(config.event_webhook.clone())
+                .build()?;
+            subscribers.push(Arc::new(dispatcher));
+        }
 
         Ok(Self {
             authenticator,
             authorizer,
-            event_dispatcher,
+            subscribers,
             registry,
             enable_ui: config.ui.enabled,
             ui_name: config.ui.name.clone(),
         })
     }
 
+    /// Whether any event subscriber (e.g. the HTTP webhook dispatcher) is wired.
     #[cfg(test)]
-    pub fn event_dispatcher(&self) -> Option<Arc<EventDispatcher>> {
-        self.event_dispatcher.clone()
+    pub fn has_event_subscribers(&self) -> bool {
+        !self.subscribers.is_empty()
+    }
+
+    /// Replace the registered subscribers (tests only).
+    #[cfg(test)]
+    pub fn set_subscribers(&mut self, subscribers: Vec<Arc<dyn EventSubscriber>>) {
+        self.subscribers = subscribers;
     }
 
     #[instrument(skip(self, parts))]
@@ -96,24 +104,55 @@ impl ServerContext {
         }
     }
 
+    /// Fan a single event out to every subscriber.
+    ///
+    /// Each subscriber applies its own delivery policy internally (the HTTP
+    /// webhook dispatcher handles Required/Optional/Async per webhook). One
+    /// subscriber failing does not skip the others; the first error is returned
+    /// after all subscribers have been attempted.
     pub async fn dispatch_event(&self, event: &Event) -> Result<(), Error> {
-        if let Some(dispatcher) = &self.event_dispatcher {
-            dispatcher.dispatch(event).await?;
+        let mut first_error: Option<Error> = None;
+        for subscriber in &self.subscribers {
+            if let Err(error) = subscriber.on_event(event).await
+                && first_error.is_none()
+            {
+                first_error = Some(error.into());
+            }
         }
-        Ok(())
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
     }
 
+    /// Deliver a batch of events, fanning each out to every subscriber.
+    ///
+    /// Unlike a short-circuiting loop, this attempts **every** event against
+    /// **every** subscriber even if an earlier delivery fails, so a single
+    /// failing event (or subscriber) never aborts the rest of the batch. The
+    /// first error encountered is returned once all deliveries have been
+    /// attempted, preserving the externally-observable contract that a
+    /// Required-webhook failure surfaces overall while Optional/Async failures
+    /// are logged inside the subscriber.
     pub async fn dispatch_events(&self, events: &[Event]) -> Result<(), Error> {
+        let mut first_error: Option<Error> = None;
         for event in events {
-            self.dispatch_event(event).await?;
+            if let Err(error) = self.dispatch_event(event).await
+                && first_error.is_none()
+            {
+                first_error = Some(error);
+            }
         }
-        Ok(())
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
     }
 
-    pub async fn shutdown_with_timeout(&self, timeout: std::time::Duration) {
+    pub async fn shutdown_with_timeout(&self, timeout: Duration) {
         self.registry.flush_pending_writes().await;
-        if let Some(dispatcher) = &self.event_dispatcher {
-            dispatcher.shutdown_with_timeout(timeout).await;
+        for subscriber in &self.subscribers {
+            subscriber.shutdown_with_timeout(timeout).await;
         }
     }
 }

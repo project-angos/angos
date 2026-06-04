@@ -1,4 +1,4 @@
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{collections::HashMap, time::Duration};
 
 use chrono::Utc;
 use reqwest::Client;
@@ -18,7 +18,10 @@ use crate::{
 pub const TEST_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub fn build_dispatcher(webhooks: HashMap<String, EventWebhookConfig>) -> EventDispatcher {
-    EventDispatcher::new(webhooks).expect("dispatcher should build in tests")
+    EventDispatcher::builder()
+        .webhooks(webhooks)
+        .build()
+        .expect("dispatcher should build in tests")
 }
 
 pub fn create_test_event() -> Event {
@@ -31,6 +34,7 @@ pub fn create_test_event() -> Event {
         reference: Some("sha256:abc123".to_string()),
         tag: Some("latest".to_string()),
         actor: None,
+        origin: None,
         repository: "docker-hub".to_string(),
     }
 }
@@ -53,7 +57,12 @@ pub fn create_test_config(
 pub fn build_endpoint(config: EventWebhookConfig) -> WebhookEndpoint {
     WebhookEndpoint {
         client: Client::new(),
-        config: Arc::new(config),
+        url: config.url,
+        policy: config.policy,
+        token: config.token,
+        max_retries: config.max_retries,
+        events: config.events,
+        repository_filter: config.repository_filter,
     }
 }
 

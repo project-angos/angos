@@ -12,12 +12,19 @@ use crate::{
     policy::{AccessPolicyConfig, RetentionPolicy, RetentionPolicyConfig, SystemClock},
     registry::{Error, blob_store::BoxedReader},
     registry_client::RegistryClient,
+    replication::{ReplicationDownstream, ReplicationDownstreamConfig},
 };
+
+/// Fallback per-manifest blob-push concurrency (4) used when a downstream omits
+/// `max_concurrent_pushes`.
+const DEFAULT_MAX_CONCURRENT_PUSHES: usize = 4;
 
 #[derive(Clone, Debug, Default, Deserialize)]
 pub struct Config {
     #[serde(default)]
     pub upstream: Vec<RegistryClientConfig>,
+    #[serde(default)]
+    pub downstream: Vec<ReplicationDownstreamConfig>,
     #[serde(default)]
     pub access_policy: AccessPolicyConfig,
     #[serde(default)]
@@ -34,6 +41,10 @@ pub struct Config {
 pub struct Repository {
     pub name: String,
     pub upstreams: Vec<RegistryClient>,
+    /// Configured replication downstreams, read by the event-path enqueue
+    /// (`dispatch_replication`), the job handler, and the scrub reconciliation
+    /// checker.
+    pub replication: Vec<ReplicationDownstream>,
     pub retention_policy: RetentionPolicy,
     pub immutable_tags: bool,
     pub immutable_tags_exclusions: Vec<RegexPattern>,
@@ -81,16 +92,63 @@ impl Repository {
             task::spawn_blocking(move || {
                 let mut upstreams = Vec::new();
                 for config in &upstream_configs {
-                    upstreams.push(RegistryClient::new_with_manifest_size_limit(
-                        config,
-                        Arc::clone(&cache),
-                        max_manifest_size_bytes,
-                    )?);
+                    let (client, basic_auth) = RegistryClient::resolve_config_fields(config)?;
+                    upstreams.push(
+                        RegistryClient::builder()
+                            .url(config.url.clone())
+                            .client(client)
+                            .basic_auth(basic_auth)
+                            .cache(Arc::clone(&cache))
+                            .max_manifest_size_bytes(max_manifest_size_bytes)
+                            .build()?,
+                    );
                 }
                 Ok::<_, Error>(upstreams)
             })
             .await
             .map_err(|e| Error::Internal(format!("Failed to initialize upstream clients: {e}")))??
+        };
+
+        let replication = if config.downstream.is_empty() {
+            Vec::new()
+        } else {
+            let downstream_configs = config.downstream.clone();
+            let cache = Arc::clone(cache);
+            task::spawn_blocking(move || {
+                let mut downstreams = Vec::new();
+                for config in &downstream_configs {
+                    let client_config = config.to_registry_client_config();
+                    let (client, basic_auth) =
+                        RegistryClient::resolve_config_fields(&client_config)?;
+                    let registry_client = RegistryClient::builder()
+                        .url(client_config.url)
+                        .client(client)
+                        .basic_auth(basic_auth)
+                        .cache(Arc::clone(&cache))
+                        .max_manifest_size_bytes(max_manifest_size_bytes)
+                        .build()?;
+                    downstreams.push(
+                        ReplicationDownstream::builder()
+                            .name(config.name.clone())
+                            .registry_client(Arc::new(registry_client))
+                            .mode(config.mode)
+                            .namespace_filter(config.namespace_filter.clone())
+                            .max_concurrent_pushes(
+                                config
+                                    .max_concurrent_pushes
+                                    .unwrap_or(DEFAULT_MAX_CONCURRENT_PUSHES),
+                            )
+                            .prune(config.prune)
+                            .build()
+                            .map_err(|e| Error::Initialization(e.to_string()))?,
+                    );
+                }
+                Ok::<_, Error>(downstreams)
+            })
+            .await
+            .map_err(|e| {
+                Error::Internal(format!("Failed to initialize downstream clients: {e}"))
+            })??
         };
 
         let retention_policy =
@@ -99,6 +157,7 @@ impl Repository {
         Ok(Self {
             name: name.to_string(),
             upstreams,
+            replication,
             retention_policy,
             immutable_tags: config.immutable_tags,
             immutable_tags_exclusions: config.immutable_tags_exclusions.clone(),

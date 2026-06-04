@@ -81,6 +81,16 @@ Proxies requests to upstream registries:
 - Immutable tag optimization
 - Fallback to multiple upstreams
 
+### Replication
+
+Mirrors local mutations *out* to downstream registries (the outbound counterpart of the pull-through cache):
+- Per-repository downstream lists, event-driven on manifest push/delete
+- Rides the durable job queue for retry, coalescing, and restart survival
+- Loop prevention via origin propagation; last-writer-wins tag conflict resolution
+- On-demand reconciliation via `angos scrub --replicate`
+
+See [Bi-Directional Replication](replication.md) for the full model.
+
 ### Storage Layer
 
 Abstracted storage backends:

@@ -120,6 +120,26 @@ removes tags pointing at the digest and removes the manifest body when no remain
 references it. Config and layer blobs remain owned by the namespace until they are deleted through
 the blob endpoint or scrubbed as orphans.
 
+#### Replication request headers
+
+Manifest `PUT` and `DELETE` accept two optional replication headers, set automatically by Angos when
+mirroring a change to a configured downstream (they are not used by ordinary clients):
+
+| Header                     | Value                          | Purpose                                                                 |
+|----------------------------|--------------------------------|-------------------------------------------------------------------------|
+| `X-Angos-Origin`           | originating instance-id        | Loop prevention — propagated verbatim across hops; the receiver drops a change whose origin is itself. |
+| `X-Angos-Source-Timestamp` | event timestamp (RFC 3339)     | Last-writer-wins — for a **tag** reference the receiver compares it against the local tag's creation time and rejects the write with `409 REPLICATION_SUPERSEDED` when the local copy is strictly newer. |
+
+Last-writer-wins applies only to tag references (digest references are content-addressed, so there is
+nothing to resolve) and only when `X-Angos-Source-Timestamp` is present and parses as RFC 3339. A
+missing, empty, or malformed timestamp simply disables LWW for that request — the write is applied as
+an ordinary client write rather than failing. A local tag with no recorded creation time is treated as
+oldest and never blocks the incoming write.
+
+A `409 REPLICATION_SUPERSEDED` is convergence, not failure: the sender treats it as success and
+completes the replication job. It is distinct on the wire from the immutable-tag `409 CONFLICT`, which
+surfaces so the job retries or dead-letters.
+
 ### Tags
 
 ```
@@ -400,7 +420,8 @@ Errors follow OCI Distribution error format:
 | `NAME_UNKNOWN`        | 404          | Repository not found      |
 | `SIZE_INVALID`        | 400          | Size mismatch             |
 | `TAG_INVALID`         | 400          | Invalid tag               |
-| `TAG_IMMUTABLE`       | 409          | Tag cannot be overwritten |
+| `CONFLICT`            | 409          | Write rejected, for example, an immutable tag cannot be overwritten |
+| `REPLICATION_SUPERSEDED` | 409       | Replication write rejected by last-writer-wins (the local copy is strictly newer) |
 | `UNAUTHORIZED`        | 401          | Authentication required   |
 | `DENIED`              | 403 or 405   | Access denied by policy, or blob is still referenced |
 | `UNSUPPORTED`         | 415          | Unsupported operation     |

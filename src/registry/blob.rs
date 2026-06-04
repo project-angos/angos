@@ -1,5 +1,6 @@
 use std::{collections::HashSet, sync::Arc};
 
+use chrono::Utc;
 use hyper::header::{ACCEPT_RANGES, CONTENT_RANGE};
 use tokio::io::AsyncReadExt;
 #[cfg(test)]
@@ -22,6 +23,7 @@ use crate::{
         job_store::JobEnvelope,
         metadata_store::{MetadataStore, link_kind::LinkKind},
     },
+    replication::{REPLICATION_QUEUE, ReplicationPushPayload, build_envelope, loop_filter},
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -323,12 +325,96 @@ impl Registry {
                 return;
             }
         };
-        if let Err(e) = self.cache_queue.enqueue(envelope).await {
+        if let Err(e) = self.job_queue.enqueue(envelope).await {
             warn!("Failed to enqueue cache job for {digest}: {e}");
             metrics_provider()
                 .job_queue_enqueue_failures_total
                 .with_label_values(&[CACHE_QUEUE])
                 .inc();
+        }
+    }
+
+    /// Fire-and-forget enqueue of replication push/delete jobs for a local
+    /// mutation, one per matching downstream. Mirrors [`Self::dispatch_cache_fill`]:
+    /// failures are logged and counted on `angos_job_queue_enqueue_failures_total`
+    /// but never bubble up, so a scheduling glitch cannot fail the client's write.
+    ///
+    /// Loop prevention runs BEFORE any enqueue: a job whose `origin` is this
+    /// instance (self-bounce) or a known downstream (downstream-bounce) is
+    /// dropped wholesale via [`loop_filter`]. The outgoing `origin` is the
+    /// inbound origin propagated verbatim, or — for a fresh local change — this
+    /// instance's own id.
+    pub(crate) async fn dispatch_replication(
+        &self,
+        namespace: &Namespace,
+        kind: &str,
+        tag: Option<&str>,
+        digest: Option<&Digest>,
+        origin: Option<String>,
+    ) {
+        let Some(repository) = self.resolver.resolve(namespace) else {
+            return;
+        };
+
+        // Known downstream instance-ids are not discovered yet (there is no
+        // handshake), so this is always empty and the self-origin guard inside
+        // `loop_filter` is what actually prevents A<->B loops today. The
+        // receiver-side `known_instance_ids` guard remains the seam for a future
+        // handshake; once per-downstream ids exist, the filter must run INSIDE
+        // the per-downstream loop below (filtering over the union here would
+        // over-suppress a mesh — an event whose origin is downstream X would be
+        // wrongly dropped for unrelated downstream Y).
+        let known: HashSet<String> = HashSet::new();
+
+        if !loop_filter(origin.as_deref(), &self.instance_id, &known) {
+            return;
+        }
+
+        // Propagate the inbound origin verbatim; a fresh local change is tagged
+        // with this instance's own id so downstream hops can detect loops.
+        let origin_id = origin.unwrap_or_else(|| self.instance_id.clone());
+        let source_ts = Utc::now().to_rfc3339();
+
+        for downstream in &repository.replication {
+            if !downstream.mode.enqueues_on_event()
+                || !downstream.matches_namespace(namespace.as_ref())
+            {
+                continue;
+            }
+
+            let payload = ReplicationPushPayload {
+                downstream: downstream.name.clone(),
+                namespace: namespace.to_string(),
+                tag: tag.map(str::to_string),
+                digest: digest.map(ToString::to_string),
+                kind: kind.to_string(),
+                origin: Some(origin_id.clone()),
+                source_ts: Some(source_ts.clone()),
+            };
+            let envelope = match build_envelope(&payload) {
+                Ok(envelope) => envelope,
+                Err(e) => {
+                    warn!(
+                        "Failed to build replication job envelope for {}: {e}",
+                        downstream.name
+                    );
+                    metrics_provider()
+                        .job_queue_enqueue_failures_total
+                        .with_label_values(&[REPLICATION_QUEUE])
+                        .inc();
+                    continue;
+                }
+            };
+            if let Err(e) = self.job_queue.enqueue(envelope).await {
+                warn!(
+                    "Failed to enqueue replication job for {}: {e}",
+                    downstream.name
+                );
+                metrics_provider()
+                    .job_queue_enqueue_failures_total
+                    .with_label_values(&[REPLICATION_QUEUE])
+                    .inc();
+            }
         }
     }
 
@@ -1331,5 +1417,334 @@ mod tests {
         let headers = get_blob_redirect_headers("https://cdn/blob".to_string(), &digest);
         assert_eq!(headers[LOCATION.as_str()], "https://cdn/blob");
         assert_eq!(headers[DOCKER_CONTENT_DIGEST], digest.to_string());
+    }
+}
+
+#[cfg(test)]
+mod dispatch_replication_tests {
+    use std::{collections::HashMap, sync::Arc};
+
+    use tempfile::TempDir;
+
+    use angos_storage::{ObjectStore, fs::Backend as StorageFsBackend};
+
+    use chrono::DateTime;
+    use regex::Regex;
+
+    use crate::{
+        cache,
+        oci::{Digest, Namespace},
+        policy::{RetentionPolicy, RetentionPolicyConfig, SystemClock},
+        registry::{
+            Registry, RegistryConfig, Repository,
+            blob_store::BlobStore,
+            job_store::JobStore,
+            metadata_store::MetadataStore,
+            repository_resolver::RepositoryResolver,
+            test_utils::{build_store, build_test_fs_executor},
+        },
+        registry_client::RegistryClient,
+        replication::{
+            REPLICATION_PUSH_MANIFEST_KIND, REPLICATION_QUEUE, ReplicationDownstream,
+            ReplicationMode, ReplicationPushPayload,
+        },
+    };
+
+    const REPO: &str = "nginx";
+    const NAMESPACE: &str = "nginx";
+    const DOWNSTREAM: &str = "eu-region";
+    const LOCAL_INSTANCE: &str = "instance-local";
+    const SAMPLE_DIGEST: &str =
+        "sha256:1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef";
+
+    fn downstream_client() -> Arc<RegistryClient> {
+        let backend = cache::Config::Memory.to_backend().unwrap();
+        Arc::new(
+            RegistryClient::builder()
+                .url("https://unused.test".to_string())
+                .client(reqwest::Client::new())
+                .cache(backend)
+                .max_manifest_size_bytes(crate::registry::manifest::DEFAULT_MAX_MANIFEST_SIZE_BYTES)
+                .build()
+                .unwrap(),
+        )
+    }
+
+    /// Build a repository carrying exactly one downstream with the given mode and
+    /// (optional) namespace filter.
+    fn repository_with(mode: ReplicationMode, namespace_filter: Vec<Regex>) -> Repository {
+        Repository {
+            name: REPO.to_string(),
+            upstreams: Vec::new(),
+            replication: vec![
+                ReplicationDownstream::builder()
+                    .name(DOWNSTREAM.to_string())
+                    .registry_client(downstream_client())
+                    .mode(mode)
+                    .namespace_filter(namespace_filter)
+                    .max_concurrent_pushes(4)
+                    .build()
+                    .unwrap(),
+            ],
+            retention_policy: RetentionPolicy::new(
+                &RetentionPolicyConfig::default(),
+                Arc::new(SystemClock),
+            ),
+            immutable_tags: false,
+            immutable_tags_exclusions: Vec::new(),
+        }
+    }
+
+    fn repository_with_downstream() -> Repository {
+        repository_with(ReplicationMode::EventReconcile, Vec::new())
+    }
+
+    /// Build a `Registry` over an FS/in-memory store whose shared job store is a
+    /// caller-held `JobStore` (so the test can `count_pending`), carrying the
+    /// supplied repository and a known local instance-id.
+    fn build_registry_with(root: &str, repository: Repository) -> (Registry, Arc<JobStore>) {
+        let object: Arc<dyn ObjectStore> =
+            Arc::new(StorageFsBackend::builder().root_dir(root).build().unwrap());
+        let executor = build_test_fs_executor(root, false);
+        let store = build_store(object, executor);
+        let metadata_store = Arc::new(
+            MetadataStore::builder()
+                .store(store.clone())
+                .link_cache_ttl(0)
+                .access_time_debounce_secs(0)
+                .build()
+                .unwrap(),
+        );
+        let blob_store = Arc::new(BlobStore::builder().store(store.clone()).build().unwrap());
+
+        let mut repositories = HashMap::new();
+        repositories.insert(REPO.to_string(), repository);
+        let resolver = Arc::new(RepositoryResolver::new(Arc::new(repositories)).unwrap());
+
+        // No drain spawned: a bare JobStore over the shared store just persists
+        // (and lets us count) enqueued envelopes. This test asserts enqueue only.
+        let job_store: Arc<JobStore> = Arc::new(JobStore::new(store, "test"));
+
+        let config = RegistryConfig::default()
+            .instance_id(LOCAL_INSTANCE.to_string())
+            .job_queue(job_store.clone());
+        let registry = Registry::new(blob_store, metadata_store, resolver, config).unwrap();
+
+        (registry, job_store)
+    }
+
+    /// Read the single pending replication envelope and decode its payload.
+    /// Panics if there is not exactly one pending job on the queue.
+    async fn sole_pending_payload(job_store: &JobStore) -> ReplicationPushPayload {
+        let keys = job_store.list_pending(REPLICATION_QUEUE, 16).await.unwrap();
+        assert_eq!(
+            keys.len(),
+            1,
+            "expected exactly one pending replication job"
+        );
+        let envelope = job_store
+            .read_pending(REPLICATION_QUEUE, &keys[0])
+            .await
+            .unwrap();
+        assert_eq!(envelope.queue, REPLICATION_QUEUE);
+        serde_json::from_value(envelope.payload).expect("decode ReplicationPushPayload")
+    }
+
+    /// Build a `Registry` over an FS/in-memory store whose shared job store is a
+    /// caller-held `JobStore` (so the test can `count_pending`), with one
+    /// `event+reconcile` downstream and a known local instance-id.
+    fn build_registry(root: &str) -> (Registry, Arc<JobStore>) {
+        build_registry_with(root, repository_with_downstream())
+    }
+
+    /// A fresh local change (no inbound origin) enqueues exactly one push job on
+    /// the replication queue for the single matching downstream.
+    #[tokio::test]
+    async fn dispatch_replication_enqueues_for_matching_downstream() {
+        crate::metrics_provider::init_for_tests();
+        let dir = TempDir::new().unwrap();
+        let (registry, job_store) = build_registry(dir.path().to_str().unwrap());
+
+        let namespace = Namespace::new(NAMESPACE).unwrap();
+        let digest: Digest = SAMPLE_DIGEST.parse().unwrap();
+
+        registry
+            .dispatch_replication(
+                &namespace,
+                REPLICATION_PUSH_MANIFEST_KIND,
+                Some("v1"),
+                Some(&digest),
+                None,
+            )
+            .await;
+
+        assert_eq!(
+            job_store.count_pending(REPLICATION_QUEUE, 0).await.unwrap(),
+            1,
+            "a fresh local change must enqueue one push job"
+        );
+    }
+
+    /// A job whose inbound origin equals this instance is a self-bounce and is
+    /// dropped by the loop filter BEFORE any enqueue.
+    #[tokio::test]
+    async fn dispatch_replication_drops_self_origin_loop() {
+        crate::metrics_provider::init_for_tests();
+        let dir = TempDir::new().unwrap();
+        let (registry, job_store) = build_registry(dir.path().to_str().unwrap());
+
+        let namespace = Namespace::new(NAMESPACE).unwrap();
+        let digest: Digest = SAMPLE_DIGEST.parse().unwrap();
+
+        registry
+            .dispatch_replication(
+                &namespace,
+                REPLICATION_PUSH_MANIFEST_KIND,
+                Some("v1"),
+                Some(&digest),
+                Some(LOCAL_INSTANCE.to_string()),
+            )
+            .await;
+
+        assert_eq!(
+            job_store.count_pending(REPLICATION_QUEUE, 0).await.unwrap(),
+            0,
+            "a self-origin job must be dropped before enqueue"
+        );
+    }
+
+    /// A fresh local push enqueues a job whose payload carries the correct
+    /// downstream/namespace/tag/digest/kind, this instance's own id as `origin`,
+    /// and a populated `source_ts`.
+    #[tokio::test]
+    async fn dispatch_replication_payload_is_well_formed() {
+        crate::metrics_provider::init_for_tests();
+        let dir = TempDir::new().unwrap();
+        let (registry, job_store) = build_registry(dir.path().to_str().unwrap());
+
+        let namespace = Namespace::new(NAMESPACE).unwrap();
+        let digest: Digest = SAMPLE_DIGEST.parse().unwrap();
+
+        registry
+            .dispatch_replication(
+                &namespace,
+                REPLICATION_PUSH_MANIFEST_KIND,
+                Some("v1"),
+                Some(&digest),
+                None,
+            )
+            .await;
+
+        let payload = sole_pending_payload(&job_store).await;
+        assert_eq!(payload.downstream, DOWNSTREAM);
+        assert_eq!(payload.namespace, NAMESPACE);
+        assert_eq!(payload.tag.as_deref(), Some("v1"));
+        assert_eq!(payload.digest.as_deref(), Some(SAMPLE_DIGEST));
+        assert_eq!(payload.kind, REPLICATION_PUSH_MANIFEST_KIND);
+        assert_eq!(
+            payload.origin.as_deref(),
+            Some(LOCAL_INSTANCE),
+            "a fresh local change stamps this instance's own id as origin"
+        );
+        let source_ts = payload.source_ts.expect("source_ts must be present");
+        assert!(
+            DateTime::parse_from_rfc3339(&source_ts).is_ok(),
+            "source_ts must be a valid RFC 3339 timestamp; got {source_ts}"
+        );
+    }
+
+    /// A push carrying a foreign inbound origin (some other instance's id) is
+    /// kept by the loop filter, and that origin is propagated verbatim onto the
+    /// enqueued payload — it is NOT overwritten with the local instance's id.
+    #[tokio::test]
+    async fn dispatch_replication_propagates_foreign_origin_verbatim() {
+        crate::metrics_provider::init_for_tests();
+        let dir = TempDir::new().unwrap();
+        let (registry, job_store) = build_registry(dir.path().to_str().unwrap());
+
+        let namespace = Namespace::new(NAMESPACE).unwrap();
+        let digest: Digest = SAMPLE_DIGEST.parse().unwrap();
+
+        registry
+            .dispatch_replication(
+                &namespace,
+                REPLICATION_PUSH_MANIFEST_KIND,
+                Some("v1"),
+                Some(&digest),
+                Some("instance-foreign".to_string()),
+            )
+            .await;
+
+        let payload = sole_pending_payload(&job_store).await;
+        assert_eq!(
+            payload.origin.as_deref(),
+            Some("instance-foreign"),
+            "a foreign inbound origin must be propagated verbatim, not overwritten"
+        );
+    }
+
+    /// A `reconcile-only` downstream is excluded from the event path: a local
+    /// push enqueues nothing.
+    #[tokio::test]
+    async fn dispatch_replication_skips_reconcile_only_downstream() {
+        crate::metrics_provider::init_for_tests();
+        let dir = TempDir::new().unwrap();
+        let (registry, job_store) = build_registry_with(
+            dir.path().to_str().unwrap(),
+            repository_with(ReplicationMode::ReconcileOnly, Vec::new()),
+        );
+
+        let namespace = Namespace::new(NAMESPACE).unwrap();
+        let digest: Digest = SAMPLE_DIGEST.parse().unwrap();
+
+        registry
+            .dispatch_replication(
+                &namespace,
+                REPLICATION_PUSH_MANIFEST_KIND,
+                Some("v1"),
+                Some(&digest),
+                None,
+            )
+            .await;
+
+        assert_eq!(
+            job_store.count_pending(REPLICATION_QUEUE, 0).await.unwrap(),
+            0,
+            "a reconcile-only downstream must not enqueue on the event path"
+        );
+    }
+
+    /// A downstream whose `namespace_filter` excludes the mutated namespace
+    /// enqueues nothing on the event path.
+    #[tokio::test]
+    async fn dispatch_replication_skips_non_matching_namespace_filter() {
+        crate::metrics_provider::init_for_tests();
+        let dir = TempDir::new().unwrap();
+        let (registry, job_store) = build_registry_with(
+            dir.path().to_str().unwrap(),
+            repository_with(
+                ReplicationMode::EventReconcile,
+                vec![Regex::new("^other/.*").unwrap()],
+            ),
+        );
+
+        let namespace = Namespace::new(NAMESPACE).unwrap();
+        let digest: Digest = SAMPLE_DIGEST.parse().unwrap();
+
+        registry
+            .dispatch_replication(
+                &namespace,
+                REPLICATION_PUSH_MANIFEST_KIND,
+                Some("v1"),
+                Some(&digest),
+                None,
+            )
+            .await;
+
+        assert_eq!(
+            job_store.count_pending(REPLICATION_QUEUE, 0).await.unwrap(),
+            0,
+            "a downstream whose filter excludes the namespace must not enqueue"
+        );
     }
 }

@@ -115,6 +115,7 @@ pub fn create_test_repositories() -> Arc<HashMap<String, Repository>> {
         Repository {
             name: "test-repo".to_string(),
             upstreams: Vec::new(),
+            replication: Vec::new(),
             retention_policy: RetentionPolicy::new(&config.retention_policy, Arc::new(SystemClock)),
             immutable_tags: config.immutable_tags,
             immutable_tags_exclusions: config.immutable_tags_exclusions,
@@ -199,6 +200,7 @@ pub async fn create_test_blob(
     let repository = Repository {
         name: "test-repo".to_string(),
         upstreams: Vec::new(),
+        replication: Vec::new(),
         retention_policy: RetentionPolicy::new(
             &RetentionPolicyConfig { rules: Vec::new() },
             Arc::new(SystemClock),

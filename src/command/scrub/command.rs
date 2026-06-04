@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use argh::FromArgs;
 use futures_util::StreamExt;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::{
     command::{
@@ -16,9 +16,16 @@ use crate::{
             executor::{ActionSink, DryRunSink, Executor},
             setup,
         },
+        worker::runner::execute_one,
     },
     configuration::Configuration,
-    registry::metadata_store::MetadataStore,
+    registry::{
+        blob_store::BlobStore,
+        job_store::{JobHandler, JobStore},
+        metadata_store::MetadataStore,
+        repository_resolver::RepositoryResolver,
+    },
+    replication::{REPLICATION_QUEUE, ReplicationJobHandler},
 };
 
 #[derive(FromArgs, PartialEq, Debug)]
@@ -59,6 +66,9 @@ pub struct Options {
     #[argh(switch, short = 'R')]
     /// check for and remove orphan referrer links whose referrer manifest is no longer a current revision
     pub referrers: bool,
+    #[argh(switch)]
+    /// reconcile every replicated namespace with all its downstreams, enqueuing a replication push for each diverging or downstream-missing tag (monotonic-add only; never deletes)
+    pub replicate: bool,
 }
 
 pub struct Command {
@@ -68,6 +78,21 @@ pub struct Command {
     blob_checker: Option<BlobChecker>,
     multipart_checker: Option<MultipartChecker>,
     sink: Box<dyn ActionSink + Send>,
+    /// When `--replicate` runs outside dry-run, the enqueued replication jobs are
+    /// drained in-process (no running worker is assumed): every job that is ready
+    /// is claimed, and a job whose push succeeds converges within this invocation.
+    /// A job whose push transiently fails is rescheduled with backoff onto the
+    /// durable queue and left for a worker or a later `scrub` run — so a transient
+    /// failure does not necessarily converge here. `None` disables the drain
+    /// (dry-run, or `--replicate` absent).
+    replication_drain: Option<ReplicationDrain>,
+}
+
+/// Consumer queue + handler used to drain replication jobs enqueued by the
+/// reconciliation checker, within the scrub CLI run.
+struct ReplicationDrain {
+    consumer: Arc<JobStore>,
+    handler: Arc<dyn JobHandler>,
 }
 
 impl Command {
@@ -94,11 +119,32 @@ impl Command {
         let blob_checker = setup::blob_checker(options, &blob_backend, &metadata_store);
         let multipart_checker = setup::multipart_checker(options, &blob_backend)?;
 
+        // The reconciliation checker emits `EnqueueReplicationPush` actions that the
+        // `Executor` lands on a durable queue; share one `Arc<JobStore>` as both the
+        // producer (Executor enqueue) and the consumer (end-of-run drain) over the
+        // metadata store's `Store` façade. Building the queue is cheap, so a
+        // non-dry-run `Executor` always owns one; the drain is only wired when
+        // reconcile actually enqueues (`--replicate`).
+        let mut replication_drain: Option<ReplicationDrain> = None;
         let sink: Box<dyn ActionSink + Send> = if options.dry_run {
             info!("Dry-run mode: no changes will be made to the storage");
             Box::new(DryRunSink)
         } else {
-            Box::new(Executor::new(blob_backend.clone(), metadata_store.clone()))
+            let job_store = Arc::new(JobStore::new(metadata_store.store_arc(), "scrub"));
+            let executor = Executor::builder()
+                .blob_store(blob_backend.clone())
+                .metadata_store(metadata_store.clone())
+                .job_store(job_store.clone())
+                .build()?;
+            if options.replicate {
+                replication_drain = Some(Self::build_replication_drain(
+                    job_store,
+                    &blob_backend,
+                    &metadata_store,
+                    &repositories,
+                )?);
+            }
+            Box::new(executor)
         };
 
         Ok(Self {
@@ -108,6 +154,34 @@ impl Command {
             blob_checker,
             multipart_checker,
             sink,
+            replication_drain,
+        })
+    }
+
+    /// Builds the consumer queue + handler used to drain reconcile-enqueued
+    /// replication jobs in-process during the CLI run (jobs whose push succeeds
+    /// converge here; a transiently-failing push is rescheduled onto the durable
+    /// queue for a worker or a later `scrub` run).
+    ///
+    /// Reconcile-enqueued payloads carry `origin = None`, so the defensive loop
+    /// filter always lets them through.
+    fn build_replication_drain(
+        consumer: Arc<JobStore>,
+        blob_store: &Arc<BlobStore>,
+        metadata_store: &Arc<MetadataStore>,
+        resolver: &Arc<RepositoryResolver>,
+    ) -> Result<ReplicationDrain, Error> {
+        let handler = ReplicationJobHandler::builder()
+            .resolver(resolver.clone())
+            .blob_store(blob_store.clone())
+            .metadata_store(metadata_store.clone())
+            .build()
+            .map_err(|e| {
+                Error::Initialization(format!("failed to build replication handler: {e}"))
+            })?;
+        Ok(ReplicationDrain {
+            consumer,
+            handler: Arc::new(handler),
         })
     }
 
@@ -116,6 +190,7 @@ impl Command {
         self.scrub_metadata().await?;
         self.scrub_blobs().await?;
         self.scrub_multipart_uploads().await?;
+        self.drain_replication_jobs().await;
         self.metadata_store.flush_access_times().await;
         Ok(())
     }
@@ -159,6 +234,37 @@ impl Command {
             tracing::warn!("Multipart scrub checker failed: {e}");
         }
         Ok(())
+    }
+
+    /// Drains the replication jobs the reconciliation checker enqueued. No-op
+    /// unless `--replicate` ran outside dry-run. Each cycle claims one ready job
+    /// and drives it through `execute_one`: a job whose push succeeds converges
+    /// here, while one whose push transiently fails is failed-over (rescheduled
+    /// with backoff onto the durable queue for a worker or a later `scrub` run).
+    /// The loop ends when the queue has no claimable (ready) job left — so jobs
+    /// already backed off for a future time are intentionally not awaited.
+    async fn drain_replication_jobs(&mut self) {
+        let Some(drain) = &self.replication_drain else {
+            return;
+        };
+
+        info!("Draining enqueued replication jobs to convergence");
+        let mut drained: u64 = 0;
+        loop {
+            let outcome = match drain.consumer.claim_one(REPLICATION_QUEUE).await {
+                Ok(outcome) => outcome,
+                Err(e) => {
+                    warn!("Failed to claim a replication job during drain: {e}");
+                    break;
+                }
+            };
+            let Some(claimed) = outcome.claimed else {
+                break;
+            };
+            execute_one(&drain.consumer, drain.handler.as_ref(), claimed).await;
+            drained += 1;
+        }
+        info!("Replication drain complete: processed {drained} job(s)");
     }
 }
 
@@ -210,6 +316,7 @@ mod tests {
             links: false,
             media_types: false,
             referrers: false,
+            replicate: false,
         };
 
         let command = Command::new(&options, &config).await;

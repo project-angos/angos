@@ -113,8 +113,10 @@ async fn dispatch_route<'a>(
             namespace,
             reference,
         } => {
-            handlers::manifest::dispatch_delete_manifest(context, &namespace, reference, identity)
-                .await
+            handlers::manifest::dispatch_delete_manifest(
+                context, parts, &namespace, reference, identity,
+            )
+            .await
         }
         Action::GetReferrer {
             namespace,

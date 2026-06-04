@@ -14,6 +14,10 @@ use crate::{
 /// a runtime panic.
 pub const DEFAULT_MAX_CONCURRENT_CACHE_JOBS: NonZeroUsize = NonZeroUsize::new(4).unwrap();
 
+/// Default replication-worker concurrency. Mirrors
+/// [`DEFAULT_MAX_CONCURRENT_CACHE_JOBS`]; `unwrap` is const-evaluated.
+pub const DEFAULT_MAX_CONCURRENT_REPLICATION_JOBS: NonZeroUsize = NonZeroUsize::new(4).unwrap();
+
 #[derive(Clone, Debug, Deserialize)]
 pub struct GlobalConfig {
     #[serde(default = "default_max_concurrent_requests")]
@@ -23,6 +27,14 @@ pub struct GlobalConfig {
         deserialize_with = "deserialize_max_concurrent_cache_jobs"
     )]
     pub max_concurrent_cache_jobs: NonZeroUsize,
+    // Concurrency for the replication queue, consumed by both the in-process
+    // drain and `angos worker --queue replication`. Mirrors
+    // `max_concurrent_cache_jobs` (sibling worker-concurrency knob).
+    #[serde(
+        default = "default_max_concurrent_replication_jobs",
+        deserialize_with = "deserialize_max_concurrent_replication_jobs"
+    )]
+    pub max_concurrent_replication_jobs: NonZeroUsize,
     #[serde(default = "default_max_manifest_size")]
     pub max_manifest_size: ByteSize,
     #[serde(default = "default_update_pull_time")]
@@ -65,6 +77,21 @@ where
         .ok_or_else(|| D::Error::custom("max_concurrent_cache_jobs must be > 0"))
 }
 
+fn default_max_concurrent_replication_jobs() -> NonZeroUsize {
+    DEFAULT_MAX_CONCURRENT_REPLICATION_JOBS
+}
+
+fn deserialize_max_concurrent_replication_jobs<'de, D>(
+    deserializer: D,
+) -> Result<NonZeroUsize, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = usize::deserialize(deserializer)?;
+    NonZeroUsize::new(value)
+        .ok_or_else(|| D::Error::custom("max_concurrent_replication_jobs must be > 0"))
+}
+
 fn default_max_manifest_size() -> ByteSize {
     ByteSize::mib(5)
 }
@@ -78,6 +105,7 @@ impl Default for GlobalConfig {
         GlobalConfig {
             max_concurrent_requests: default_max_concurrent_requests(),
             max_concurrent_cache_jobs: default_max_concurrent_cache_jobs(),
+            max_concurrent_replication_jobs: default_max_concurrent_replication_jobs(),
             max_manifest_size: default_max_manifest_size(),
             update_pull_time: default_update_pull_time(),
             enable_redirect: None,
