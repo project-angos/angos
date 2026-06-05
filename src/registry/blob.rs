@@ -344,7 +344,7 @@ impl Registry {
     /// dropped wholesale via [`loop_filter`]. The outgoing `origin` is the
     /// inbound origin propagated verbatim, or — for a fresh local change — this
     /// instance's own id.
-    pub(crate) async fn dispatch_replication(
+    pub async fn dispatch_replication(
         &self,
         namespace: &Namespace,
         kind: &str,

@@ -117,11 +117,11 @@ impl Repository {
             task::spawn_blocking(move || {
                 let mut downstreams = Vec::new();
                 for config in &downstream_configs {
-                    let client_config = config.to_registry_client_config();
+                    let client_config = &config.client;
                     let (client, basic_auth) =
-                        RegistryClient::resolve_config_fields(&client_config)?;
+                        RegistryClient::resolve_config_fields(client_config)?;
                     let registry_client = RegistryClient::builder()
-                        .url(client_config.url)
+                        .url(client_config.url.clone())
                         .client(client)
                         .basic_auth(basic_auth)
                         .cache(Arc::clone(&cache))

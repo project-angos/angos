@@ -249,6 +249,7 @@ impl AccessPolicy {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::oci::{Digest, Namespace};
 
     fn rule(s: &str) -> CelRule {
         CelRule::compile(s).unwrap()
@@ -334,6 +335,65 @@ mod tests {
         };
 
         assert!(is_deny(&policy.evaluate(&action, &identity)));
+    }
+
+    /// Proves the cross-repo mount gating rules documented in the access-control
+    /// how-to. A cross-mount authorizes as the dedicated `mount-blob` action, so
+    /// a policy gates it with a plain `request.action == 'mount-blob'` rule —
+    /// independent of the `start-upload` rules that govern ordinary uploads.
+    #[test]
+    fn test_access_policy_gates_cross_repo_mount() {
+        let namespace = Namespace::new("team/app").unwrap();
+        let digest = Digest::try_from(
+            "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        )
+        .unwrap();
+
+        let normal_upload = Action::StartUpload {
+            namespace: namespace.clone(),
+            digest: None,
+        };
+        let mount = Action::MountBlob {
+            namespace,
+            digest,
+            from: Some(Namespace::new("team/base").unwrap()),
+        };
+        let anyone = ClientIdentity {
+            username: Some("alice".to_string()),
+            ..ClientIdentity::default()
+        };
+        let replicator = ClientIdentity {
+            id: Some("replicator".to_string()),
+            username: Some("svc".to_string()),
+            ..ClientIdentity::default()
+        };
+
+        // default-deny: any authenticated client may start a normal upload, but
+        // only `replicator` may mount an existing blob.
+        let replicator_only = AccessPolicy::new(AccessPolicyConfig {
+            default: AccessMode::Deny,
+            rules: vec![
+                rule("identity.username != null && request.action == 'start-upload'"),
+                rule("identity.id == 'replicator' && request.action == 'mount-blob'"),
+            ],
+        });
+        assert!(is_allow(&replicator_only.evaluate(&normal_upload, &anyone)));
+        assert!(is_deny(&replicator_only.evaluate(&mount, &anyone)));
+        assert!(is_allow(&replicator_only.evaluate(&mount, &replicator)));
+
+        // default-allow: deny a mount unless it is the replicator; ordinary
+        // uploads are untouched.
+        let deny_non_replicator = AccessPolicy::new(AccessPolicyConfig {
+            default: AccessMode::Allow,
+            rules: vec![rule(
+                "request.action == 'mount-blob' && identity.id != 'replicator'",
+            )],
+        });
+        assert!(is_allow(
+            &deny_non_replicator.evaluate(&normal_upload, &anyone)
+        ));
+        assert!(is_deny(&deny_non_replicator.evaluate(&mount, &anyone)));
+        assert!(is_allow(&deny_non_replicator.evaluate(&mount, &replicator)));
     }
 
     #[test]

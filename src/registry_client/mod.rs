@@ -120,7 +120,7 @@ impl RegistryClient {
     /// Shared by [`RegistryClient::new`] / [`RegistryClient::new_with_manifest_size_limit`]
     /// and by in-crate callers that build via [`RegistryClient::builder`] directly
     /// (e.g. replication downstream resolution).
-    pub(crate) fn resolve_config_fields(
+    pub fn resolve_config_fields(
         config: &RegistryClientConfig,
     ) -> Result<(Client, Option<(String, String)>), Error> {
         let client = HttpClientBuilder::new()

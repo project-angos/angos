@@ -9,6 +9,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 ### Added
 
 - Bi-directional replication mirrors manifest pushes and deletes to per-repository downstreams over the durable job queue, with on-demand full-mirror reconciliation via `scrub --replicate` (local authoritative: diverging or missing tags are pushed and downstream-only tags are deleted).
+- Cross-repository blob mount (`POST /v2/{ns}/blobs/uploads/?mount={digest}[&from={repo}]`) grants an already-present blob to the target namespace with no upload, which replication uses to skip re-uploading blobs a downstream already holds.
 
 ## 1.2.0 - 2026-06-03
 

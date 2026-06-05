@@ -21,7 +21,7 @@ use crate::{
     oci::{Digest, Reference},
     registry::{
         Error as RegistryError, ParsedManifestDigests, blob_store::BlobStore,
-        parse_manifest_digests,
+        metadata_store::MetadataStore, parse_manifest_digests,
     },
     registry_client::{DeleteManifestOutcome, RegistryClient},
     replication::Error,
@@ -79,11 +79,12 @@ pub enum PushOutcome {
 ///
 /// Returns [`Error::Registry`] when a local read fails or a downstream HTTP
 /// operation fails with anything other than an LWW-superseded 409.
-#[instrument(skip(downstream, blob_store, body))]
+#[instrument(skip(downstream, blob_store, metadata_store, body))]
 #[allow(clippy::too_many_arguments)]
 pub async fn push_manifest(
     downstream: &RegistryClient,
     blob_store: &Arc<BlobStore>,
+    metadata_store: &Arc<MetadataStore>,
     namespace: &str,
     digest: &Digest,
     media_type: Option<&str>,
@@ -103,6 +104,7 @@ pub async fn push_manifest(
         Box::pin(push_manifest(
             downstream,
             blob_store,
+            metadata_store,
             namespace,
             child,
             child_media_type.as_deref(),
@@ -119,6 +121,7 @@ pub async fn push_manifest(
     push_blobs(
         downstream,
         blob_store,
+        metadata_store,
         namespace,
         &parsed,
         max_concurrent_pushes,
@@ -219,6 +222,7 @@ async fn read_local_manifest(
 async fn push_blobs(
     downstream: &RegistryClient,
     blob_store: &Arc<BlobStore>,
+    metadata_store: &Arc<MetadataStore>,
     namespace: &str,
     parsed: &ParsedManifestDigests,
     max_concurrent_pushes: usize,
@@ -231,7 +235,9 @@ async fn push_blobs(
         .collect();
 
     stream::iter(blobs)
-        .map(|blob| async move { push_one_blob(downstream, blob_store, namespace, &blob).await })
+        .map(|blob| async move {
+            push_one_blob(downstream, blob_store, metadata_store, namespace, &blob).await
+        })
         .buffer_unordered(max_concurrent_pushes.max(1))
         .try_collect::<Vec<()>>()
         .await?;
@@ -239,10 +245,37 @@ async fn push_blobs(
     Ok(())
 }
 
-/// Transfers a single blob to the downstream if it is not already present.
+/// Picks a cross-repo blob-mount source for `digest`: a LOCAL namespace, other
+/// than the target, that already references the blob (per the blob index).
+///
+/// In a bidirectional mesh such a sibling is likely to hold the blob on the
+/// downstream too, making it a good `from` hint — a single mount POST then grants
+/// a reference with no body transfer. The candidate is only a hint: a wrong guess
+/// costs nothing but a fall-back to the full upload (the server answers `202` and
+/// opens a session). Returns `None` when no sibling references the blob (so no
+/// mount is attempted) and, fail-safe, on any blob-index read error — a missing
+/// optimization must never fail a push. The lexicographically smallest sibling is
+/// chosen so the `from` is deterministic.
+async fn mount_candidate(
+    metadata_store: &Arc<MetadataStore>,
+    namespace: &str,
+    digest: &Digest,
+) -> Option<String> {
+    let index = metadata_store.read_blob_index(digest).await.ok()?;
+    index
+        .namespace
+        .keys()
+        .filter(|ns| ns.as_str() != namespace)
+        .min()
+        .cloned()
+}
+
+/// Transfers a single blob to the downstream if it is not already present,
+/// attempting a cross-repo mount before a full upload.
 async fn push_one_blob(
     downstream: &RegistryClient,
     blob_store: &Arc<BlobStore>,
+    metadata_store: &Arc<MetadataStore>,
     namespace: &str,
     digest: &Digest,
 ) -> Result<(), Error> {
@@ -254,20 +287,63 @@ async fn push_one_blob(
         return Ok(());
     }
 
+    let start_location = downstream.get_uploads_start_path("", namespace);
+
+    // Cross-repo mount first: when a sibling local namespace references the blob
+    // it is likely present on the downstream under that repo, so a single mount
+    // POST may grant a reference with no body transfer. The mount is a pure
+    // optimization — a miss opens a session, and a rejection (the downstream's
+    // `mount-blob` policy denies it) falls through to a plain upload, so it can
+    // never fail the push.
+    if let Some(from) = mount_candidate(metadata_store, namespace, digest).await {
+        match downstream
+            .mount_blob(&start_location, digest, Some(&from))
+            .await
+        {
+            Ok(None) => {
+                info!(namespace, %digest, %from, "Mounted blob cross-repo on downstream (no transfer)");
+                return Ok(());
+            }
+            Ok(Some(session_url)) => {
+                return upload_into_session(
+                    downstream,
+                    blob_store,
+                    namespace,
+                    digest,
+                    &session_url,
+                )
+                .await;
+            }
+            Err(e) => {
+                debug!(namespace, %digest, "Cross-repo mount unavailable ({e}); uploading instead");
+            }
+        }
+    }
+
+    // No mount candidate, or the mount was rejected: open a plain upload session.
+    let session_url = downstream
+        .start_upload(&start_location)
+        .await
+        .map_err(Error::Registry)?;
+    upload_into_session(downstream, blob_store, namespace, digest, &session_url).await
+}
+
+/// Streams a local blob's bytes into an already-open upload session and finalizes
+/// it (`patch_upload` + `complete_upload`).
+async fn upload_into_session(
+    downstream: &RegistryClient,
+    blob_store: &Arc<BlobStore>,
+    namespace: &str,
+    digest: &Digest,
+    session_url: &str,
+) -> Result<(), Error> {
     let (reader, content_length) = blob_store.reader(digest, None).await.map_err(|e| {
         Error::Registry(RegistryError::Internal(format!(
             "failed to open local blob '{digest}': {e}"
         )))
     })?;
-
-    // No cross-repo mount: open a fresh session and stream.
-    let start_location = downstream.get_uploads_start_path("", namespace);
     let session_url = downstream
-        .start_upload(&start_location)
-        .await
-        .map_err(Error::Registry)?;
-    let session_url = downstream
-        .patch_upload(&session_url, content_length, reader)
+        .patch_upload(session_url, content_length, reader)
         .await
         .map_err(Error::Registry)?;
     downstream
@@ -450,7 +526,7 @@ mod tests {
     use tempfile::TempDir;
     use wiremock::{
         Mock, MockServer, Request, Respond, ResponseTemplate,
-        matchers::{header, method, path},
+        matchers::{header, method, path, query_param},
     };
 
     use angos_storage::{ObjectStore, fs::Backend as StorageFsBackend};
@@ -463,6 +539,7 @@ mod tests {
             DOCKER_CONTENT_DIGEST, OCI_SUBJECT,
             blob_store::BlobStore,
             manifest::DEFAULT_MAX_MANIFEST_SIZE_BYTES,
+            metadata_store::{BlobIndexOperation, MetadataStore, link_kind::LinkKind},
             test_utils::{build_store, build_test_fs_executor, put_blob_direct},
         },
         registry_client::RegistryClient,
@@ -486,13 +563,21 @@ mod tests {
             .unwrap()
     }
 
-    fn test_blob_store(root: &str) -> (Arc<BlobStore>, Arc<Store>) {
+    fn test_blob_store(root: &str) -> (Arc<BlobStore>, Arc<MetadataStore>, Arc<Store>) {
         let object: Arc<dyn ObjectStore> =
             Arc::new(StorageFsBackend::builder().root_dir(root).build().unwrap());
         let executor = build_test_fs_executor(root, false);
         let store = build_store(object, executor);
         let blob_store = Arc::new(BlobStore::builder().store(store.clone()).build().unwrap());
-        (blob_store, store)
+        let metadata_store = Arc::new(
+            MetadataStore::builder()
+                .store(store.clone())
+                .link_cache_ttl(0)
+                .access_time_debounce_secs(0)
+                .build()
+                .unwrap(),
+        );
+        (blob_store, metadata_store, store)
     }
 
     /// A wiremock responder that records the order in which the index vs. its
@@ -523,7 +608,7 @@ mod tests {
         crate::metrics_provider::init_for_tests();
         let mock_server = MockServer::start().await;
         let dir = TempDir::new().unwrap();
-        let (blob_store, store) = test_blob_store(dir.path().to_str().unwrap());
+        let (blob_store, metadata_store, store) = test_blob_store(dir.path().to_str().unwrap());
 
         // Subject digest the referrer manifest points at.
         let subject = put_blob_direct(&store, b"subject-bytes").await;
@@ -625,6 +710,7 @@ mod tests {
         push_manifest(
             &downstream_client(&mock_server.uri()),
             &blob_store,
+            &metadata_store,
             NAMESPACE,
             &manifest_digest,
             Some("application/vnd.oci.image.manifest.v1+json"),
@@ -647,7 +733,7 @@ mod tests {
         crate::metrics_provider::init_for_tests();
         let mock_server = MockServer::start().await;
         let dir = TempDir::new().unwrap();
-        let (blob_store, store) = test_blob_store(dir.path().to_str().unwrap());
+        let (blob_store, metadata_store, store) = test_blob_store(dir.path().to_str().unwrap());
 
         let subject = put_blob_direct(&store, b"subject-bytes").await;
         let manifest = json!({
@@ -679,6 +765,7 @@ mod tests {
         push_manifest(
             &downstream_client(&mock_server.uri()),
             &blob_store,
+            &metadata_store,
             NAMESPACE,
             &manifest_digest,
             Some("application/vnd.oci.image.manifest.v1+json"),
@@ -699,7 +786,7 @@ mod tests {
         crate::metrics_provider::init_for_tests();
         let mock_server = MockServer::start().await;
         let dir = TempDir::new().unwrap();
-        let (blob_store, store) = test_blob_store(dir.path().to_str().unwrap());
+        let (blob_store, metadata_store, store) = test_blob_store(dir.path().to_str().unwrap());
 
         // Child image manifest (no blobs, to keep the test focused on ordering).
         let child = json!({
@@ -757,6 +844,7 @@ mod tests {
         push_manifest(
             &downstream_client(&mock_server.uri()),
             &blob_store,
+            &metadata_store,
             NAMESPACE,
             &index_digest,
             Some("application/vnd.oci.image.index.v1+json"),
@@ -773,6 +861,207 @@ mod tests {
             child_at.load(Ordering::SeqCst) < index_at.load(Ordering::SeqCst),
             "child manifest must land before the parent index"
         );
+        drop(mock_server);
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn push_blob_mounts_cross_repo_when_sibling_namespace_holds_it() {
+        // A SIBLING namespace that already references both blobs locally; the
+        // pipeline offers it as the mount `from`.
+        const SIBLING: &str = "other/repo";
+
+        crate::metrics_provider::init_for_tests();
+        let mock_server = MockServer::start().await;
+        let dir = TempDir::new().unwrap();
+        let (blob_store, metadata_store, store) = test_blob_store(dir.path().to_str().unwrap());
+
+        // A config + layer blob referenced by a single image manifest.
+        let config = put_blob_direct(&store, br#"{"c":1}"#).await;
+        let layer = put_blob_direct(&store, b"layer-bytes").await;
+        let manifest = json!({
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "config": {
+                "mediaType": "application/vnd.oci.image.config.v1+json",
+                "digest": config.to_string(),
+                "size": 7,
+            },
+            "layers": [{
+                "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+                "digest": layer.to_string(),
+                "size": 11,
+            }],
+        });
+        let manifest_bytes = serde_json::to_vec(&manifest).unwrap();
+        let manifest_digest = put_blob_direct(&store, &manifest_bytes).await;
+
+        // Record the sibling's ownership of both blobs so a mount `from` exists.
+        for blob in [&config, &layer] {
+            metadata_store
+                .update_blob_index(
+                    SIBLING,
+                    blob,
+                    BlobIndexOperation::Insert(LinkKind::Blob((*blob).clone())),
+                )
+                .await
+                .unwrap();
+        }
+
+        // Both blobs missing in the TARGET namespace -> HEAD 404 -> mount attempt.
+        for blob in [&config, &layer] {
+            Mock::given(method("HEAD"))
+                .and(path(format!("/v2/{NAMESPACE}/blobs/{blob}")))
+                .respond_with(ResponseTemplate::new(404))
+                .mount(&mock_server)
+                .await;
+        }
+        // The mount POST carries `from=<sibling>` and is granted (201). NO
+        // PATCH/PUT upload is mounted, so a fall-back transfer would 404 and fail
+        // the push — proving the bytes were never streamed.
+        Mock::given(method("POST"))
+            .and(path(format!("/v2/{NAMESPACE}/blobs/uploads/")))
+            .and(query_param("from", SIBLING))
+            .respond_with(
+                ResponseTemplate::new(201)
+                    .insert_header("Location", format!("/v2/{NAMESPACE}/blobs/mounted")),
+            )
+            .expect(2)
+            .mount(&mock_server)
+            .await;
+        // The manifest itself still lands.
+        Mock::given(method("PUT"))
+            .and(path(format!("/v2/{NAMESPACE}/manifests/v1")))
+            .respond_with(
+                ResponseTemplate::new(201)
+                    .insert_header(DOCKER_CONTENT_DIGEST, manifest_digest.to_string().as_str()),
+            )
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        push_manifest(
+            &downstream_client(&mock_server.uri()),
+            &blob_store,
+            &metadata_store,
+            NAMESPACE,
+            &manifest_digest,
+            Some("application/vnd.oci.image.manifest.v1+json"),
+            Some("v1"),
+            manifest_bytes,
+            4,
+            None,
+            None,
+        )
+        .await
+        .expect("both blobs must mount cross-repo and the manifest must push");
+
+        // `.expect(2)` on the mount POST plus the absence of any PATCH/PUT upload
+        // mock proves both blobs were mounted with no body transfer.
+        drop(mock_server);
+    }
+
+    #[tokio::test]
+    async fn push_blob_falls_back_to_upload_when_mount_is_rejected() {
+        // A sibling references the blob, so a mount is attempted -- but the
+        // downstream rejects it (its `mount-blob` policy denies it). The pipeline
+        // must fall back to a normal upload rather than failing the push.
+        const SIBLING: &str = "other/repo";
+
+        crate::metrics_provider::init_for_tests();
+        let mock_server = MockServer::start().await;
+        let dir = TempDir::new().unwrap();
+        let (blob_store, metadata_store, store) = test_blob_store(dir.path().to_str().unwrap());
+
+        let config = put_blob_direct(&store, br#"{"c":1}"#).await;
+        let manifest = json!({
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "config": {
+                "mediaType": "application/vnd.oci.image.config.v1+json",
+                "digest": config.to_string(),
+                "size": 7,
+            },
+            "layers": [],
+        });
+        let manifest_bytes = serde_json::to_vec(&manifest).unwrap();
+        let manifest_digest = put_blob_direct(&store, &manifest_bytes).await;
+
+        metadata_store
+            .update_blob_index(
+                SIBLING,
+                &config,
+                BlobIndexOperation::Insert(LinkKind::Blob(config.clone())),
+            )
+            .await
+            .unwrap();
+
+        // Blob missing in the target -> HEAD 404 -> mount attempt.
+        Mock::given(method("HEAD"))
+            .and(path(format!("/v2/{NAMESPACE}/blobs/{config}")))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&mock_server)
+            .await;
+        // The upload POST: reject the mount (it carries `from`) with 403; open a
+        // normal session for the plain (no-`from`) fall-back POST. `.expect(2)`
+        // asserts both the mount attempt and the fall-back happen.
+        let session = format!("/v2/{NAMESPACE}/blobs/uploads/s");
+        Mock::given(method("POST"))
+            .and(path(format!("/v2/{NAMESPACE}/blobs/uploads/")))
+            .respond_with(move |req: &Request| {
+                if req.url.query_pairs().any(|(k, _)| k == "from") {
+                    ResponseTemplate::new(403)
+                } else {
+                    ResponseTemplate::new(202).insert_header("Location", session.as_str())
+                }
+            })
+            .expect(2)
+            .mount(&mock_server)
+            .await;
+        // The fall-back upload streams the bytes.
+        Mock::given(method("PATCH"))
+            .and(path(format!("/v2/{NAMESPACE}/blobs/uploads/s")))
+            .respond_with(
+                ResponseTemplate::new(202)
+                    .insert_header("Location", format!("/v2/{NAMESPACE}/blobs/uploads/s")),
+            )
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path(format!("/v2/{NAMESPACE}/blobs/uploads/s")))
+            .respond_with(ResponseTemplate::new(201))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path(format!("/v2/{NAMESPACE}/manifests/v1")))
+            .respond_with(
+                ResponseTemplate::new(201)
+                    .insert_header(DOCKER_CONTENT_DIGEST, manifest_digest.to_string().as_str()),
+            )
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        push_manifest(
+            &downstream_client(&mock_server.uri()),
+            &blob_store,
+            &metadata_store,
+            NAMESPACE,
+            &manifest_digest,
+            Some("application/vnd.oci.image.manifest.v1+json"),
+            Some("v1"),
+            manifest_bytes,
+            4,
+            None,
+            None,
+        )
+        .await
+        .expect("a rejected mount must fall back to a normal upload");
+
+        // The `.expect(1)` PATCH + PUT prove the bytes were uploaded after the
+        // mount was rejected.
         drop(mock_server);
     }
 
@@ -799,7 +1088,7 @@ mod tests {
         crate::metrics_provider::init_for_tests();
         let mock_server = MockServer::start().await;
         let dir = TempDir::new().unwrap();
-        let (blob_store, store) = test_blob_store(dir.path().to_str().unwrap());
+        let (blob_store, metadata_store, store) = test_blob_store(dir.path().to_str().unwrap());
         let (manifest_digest, manifest_bytes) = seed_blobless_manifest(&store).await;
 
         // The PUT must carry BOTH replication headers with the expected values.
@@ -818,6 +1107,7 @@ mod tests {
         push_manifest(
             &downstream_client(&mock_server.uri()),
             &blob_store,
+            &metadata_store,
             NAMESPACE,
             &manifest_digest,
             Some("application/vnd.oci.image.manifest.v1+json"),
@@ -845,7 +1135,7 @@ mod tests {
         crate::metrics_provider::init_for_tests();
         let mock_server = MockServer::start().await;
         let dir = TempDir::new().unwrap();
-        let (blob_store, store) = test_blob_store(dir.path().to_str().unwrap());
+        let (blob_store, metadata_store, store) = test_blob_store(dir.path().to_str().unwrap());
         let (manifest_digest, manifest_bytes) = seed_blobless_manifest(&store).await;
 
         Mock::given(method("HEAD"))
@@ -862,6 +1152,7 @@ mod tests {
         push_manifest(
             &downstream_client(&mock_server.uri()),
             &blob_store,
+            &metadata_store,
             NAMESPACE,
             &manifest_digest,
             Some("application/vnd.oci.image.manifest.v1+json"),
@@ -886,7 +1177,7 @@ mod tests {
         crate::metrics_provider::init_for_tests();
         let mock_server = MockServer::start().await;
         let dir = TempDir::new().unwrap();
-        let (blob_store, store) = test_blob_store(dir.path().to_str().unwrap());
+        let (blob_store, metadata_store, store) = test_blob_store(dir.path().to_str().unwrap());
         let (manifest_digest, manifest_bytes) = seed_blobless_manifest(&store).await;
 
         let other_digest =
@@ -913,6 +1204,7 @@ mod tests {
         push_manifest(
             &downstream_client(&mock_server.uri()),
             &blob_store,
+            &metadata_store,
             NAMESPACE,
             &manifest_digest,
             Some("application/vnd.oci.image.manifest.v1+json"),
@@ -938,7 +1230,7 @@ mod tests {
         crate::metrics_provider::init_for_tests();
         let mock_server = MockServer::start().await;
         let dir = TempDir::new().unwrap();
-        let (blob_store, store) = test_blob_store(dir.path().to_str().unwrap());
+        let (blob_store, metadata_store, store) = test_blob_store(dir.path().to_str().unwrap());
         let (manifest_digest, manifest_bytes) = seed_blobless_manifest(&store).await;
 
         Mock::given(method("PUT"))
@@ -954,6 +1246,7 @@ mod tests {
         push_manifest(
             &downstream_client(&mock_server.uri()),
             &blob_store,
+            &metadata_store,
             NAMESPACE,
             &manifest_digest,
             Some("application/vnd.oci.image.manifest.v1+json"),
@@ -976,7 +1269,7 @@ mod tests {
         crate::metrics_provider::init_for_tests();
         let mock_server = MockServer::start().await;
         let dir = TempDir::new().unwrap();
-        let (blob_store, store) = test_blob_store(dir.path().to_str().unwrap());
+        let (blob_store, metadata_store, store) = test_blob_store(dir.path().to_str().unwrap());
         let (manifest_digest, manifest_bytes) = seed_blobless_manifest(&store).await;
 
         // Downstream rejects with a 409 whose OCI code is the superseded code:
@@ -996,6 +1289,7 @@ mod tests {
         push_manifest(
             &downstream_client(&mock_server.uri()),
             &blob_store,
+            &metadata_store,
             NAMESPACE,
             &manifest_digest,
             Some("application/vnd.oci.image.manifest.v1+json"),
@@ -1016,7 +1310,7 @@ mod tests {
         crate::metrics_provider::init_for_tests();
         let mock_server = MockServer::start().await;
         let dir = TempDir::new().unwrap();
-        let (blob_store, store) = test_blob_store(dir.path().to_str().unwrap());
+        let (blob_store, metadata_store, store) = test_blob_store(dir.path().to_str().unwrap());
         let (manifest_digest, manifest_bytes) = seed_blobless_manifest(&store).await;
 
         // Downstream rejects with a 409 carrying the immutable-tag `CONFLICT`
@@ -1032,6 +1326,7 @@ mod tests {
         let result = push_manifest(
             &downstream_client(&mock_server.uri()),
             &blob_store,
+            &metadata_store,
             NAMESPACE,
             &manifest_digest,
             Some("application/vnd.oci.image.manifest.v1+json"),

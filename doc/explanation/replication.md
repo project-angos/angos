@@ -39,7 +39,7 @@ The push path is driven by **manifest mutations only**:
 - **Manifest push** (which also covers tag creation) enqueues a replication push.
 - **Manifest delete** (which also covers tag deletion) enqueues a replication delete.
 
-Blob uploads do **not** trigger replication on their own. Blobs are replicated as **dependencies of the manifest-push pipeline**: before pushing a manifest, the pipeline enumerates every blob and child manifest it references and ensures each is present on the downstream first. This keeps the downstream consistent -- a manifest never lands before the content it points to.
+Blob uploads do **not** trigger replication on their own. Blobs are replicated as **dependencies of the manifest-push pipeline**: before pushing a manifest, the pipeline enumerates every blob and child manifest it references and ensures each is present on the downstream first. This keeps the downstream consistent -- a manifest never lands before the content it points to. A missing blob is mounted cross-repository (no body transfer) when a sibling repository already holds it on the downstream, and only streamed when no such mount is possible.
 
 ### Multi-arch images and referrers
 

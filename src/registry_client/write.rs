@@ -231,17 +231,15 @@ impl RegistryClient {
             .map_err(|e| Error::Internal(format!("invalid Location header '{location}': {e}")))
     }
 
-    /// Starts a resumable blob upload session.
+    /// Starts a resumable blob upload session, returning its continuation URL.
     ///
-    /// Carries no `?mount=&from=`: cross-repo blob mount is not supported (the
-    /// server does not honor it). Returns the session continuation URL from the
-    /// `Location` response header — PATCH/PUT targets are server-assigned, not
-    /// synthesized.
+    /// The session continuation URLs (PATCH/PUT targets) come from the `Location`
+    /// response header — they are server-assigned, never synthesized.
     ///
     /// # Errors
     ///
-    /// Returns an error when the request fails, the server rejects access, or
-    /// the response omits the `Location` header / is not a success status.
+    /// Returns an error when the request fails, the server rejects access, or the
+    /// response omits the `Location` header / is not a success status.
     #[instrument(skip(self))]
     pub async fn start_upload(&self, location: &str) -> Result<String, Error> {
         let response = self
@@ -262,6 +260,59 @@ impl RegistryClient {
         }
 
         Self::parse_location(&response)
+    }
+
+    /// Attempts an OCI cross-repository blob mount.
+    ///
+    /// Appends `?mount=<digest>[&from=<repo>]` so the server can grant a reference
+    /// without a body transfer. The return distinguishes the two outcomes:
+    /// - `Ok(None)` — the mount was satisfied (`201 Created`); no transfer needed.
+    /// - `Ok(Some(session_url))` — the mount could not be satisfied (`202
+    ///   Accepted`); a session was opened and the caller uploads the bytes.
+    ///
+    /// Per the distribution spec a mount that cannot be satisfied degrades to a
+    /// normal upload rather than failing.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the request fails, the server rejects the mount, or a
+    /// session response omits the `Location` header / is not a success status.
+    #[instrument(skip(self))]
+    pub async fn mount_blob(
+        &self,
+        location: &str,
+        mount: &Digest,
+        from: Option<&str>,
+    ) -> Result<Option<String>, Error> {
+        let separator = if location.contains('?') { '&' } else { '?' };
+        let location = match from {
+            Some(from) => format!("{location}{separator}mount={mount}&from={from}"),
+            None => format!("{location}{separator}mount={mount}"),
+        };
+
+        let response = self
+            .send_body(
+                &Method::POST,
+                &location,
+                None,
+                Vec::new(),
+                ReplicationHeaders::default(),
+            )
+            .await?;
+
+        // 201 Created: the blob is already present downstream (mounted).
+        if response.status() == StatusCode::CREATED {
+            return Ok(None);
+        }
+
+        if !response.status().is_success() {
+            return Err(Error::Internal(format!(
+                "mount_blob failed with status {}",
+                response.status()
+            )));
+        }
+
+        Self::parse_location(&response).map(Some)
     }
 
     /// Streams a chunk to an in-progress upload session and returns the next

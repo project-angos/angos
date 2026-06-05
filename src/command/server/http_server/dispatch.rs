@@ -61,6 +61,11 @@ async fn dispatch_route<'a>(
         Action::StartUpload { namespace, digest } => {
             handlers::upload::handle_start_upload(context, &namespace, digest).await
         }
+        Action::MountBlob {
+            namespace,
+            digest,
+            from,
+        } => handlers::upload::handle_mount_blob(context, &namespace, digest, from).await,
         Action::GetUpload { namespace, uuid } => {
             handlers::upload::handle_get_upload(context, &namespace, uuid).await
         }

@@ -76,6 +76,26 @@ fn digest_from_params(params: Option<&str>) -> Option<Digest> {
         .and_then(|r| r.to_digest())
 }
 
+#[derive(Deserialize, Default)]
+struct MountQuery {
+    mount: Option<String>,
+    from: Option<String>,
+}
+
+/// Parses the OCI cross-repo blob-mount query parameters
+/// (`?mount=<digest>[&from=<repo>]`) into a `(mount, from)` pair.
+///
+/// Each is parsed independently; a missing or malformed value yields `None` for
+/// that slot. `mount` alone is enough to attempt a mount (a from-less request
+/// triggers automatic content discovery server-side); `from` without `mount` is
+/// inert.
+fn mount_from_params(params: Option<&str>) -> (Option<Digest>, Option<Namespace>) {
+    let query: MountQuery = params.map(parse_query).unwrap_or_default();
+    let mount = query.mount.as_ref().and_then(|d| d.parse().ok());
+    let from = query.from.as_ref().and_then(|f| Namespace::new(f).ok());
+    (mount, from)
+}
+
 #[derive(Deserialize, Debug, Default)]
 #[serde(rename_all = "camelCase")]
 struct ArtifactTypeQuery {
@@ -176,10 +196,22 @@ fn try_parse_upload(method: &Method, path: &str, params: Option<&str>) -> Option
         .or_else(|| path.strip_suffix("/blobs/uploads/"))
     {
         let namespace = Namespace::new(namespace_str).ok()?;
-        let digest = digest_from_params(params);
+        let (mount, from) = mount_from_params(params);
 
         return match *method {
-            Method::POST => Some(Action::StartUpload { namespace, digest }),
+            // `?mount=<digest>` routes to the dedicated cross-repo mount action;
+            // otherwise it is an ordinary upload start.
+            Method::POST => Some(match mount {
+                Some(digest) => Action::MountBlob {
+                    namespace,
+                    digest,
+                    from,
+                },
+                None => Action::StartUpload {
+                    namespace,
+                    digest: digest_from_params(params),
+                },
+            }),
             _ => None,
         };
     }

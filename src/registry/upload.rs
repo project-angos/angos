@@ -18,6 +18,24 @@ pub enum StartUploadResponse {
     Session { headers: HeaderMap },
 }
 
+/// An OCI cross-repository blob mount request
+/// (`POST /v2/<ns>/blobs/uploads/?mount=<digest>[&from=<repo>]`).
+///
+/// `digest` is the blob to mount into the target namespace. `from` is the source
+/// repository the client claims already holds it; it is optional:
+/// - **With `from`** the mount succeeds only when the blob is present AND readable
+///   from that repository.
+/// - **Without `from`** (automatic content discovery) the mount succeeds when the
+///   blob is present AND already referenced by *any* namespace.
+///
+/// Either way, a mount that cannot be satisfied falls back to a normal upload
+/// session rather than failing, per the distribution spec.
+#[derive(Debug)]
+pub struct BlobMount {
+    pub digest: Digest,
+    pub from: Option<Namespace>,
+}
+
 pub struct GetUploadResponse {
     pub headers: HeaderMap,
 }
@@ -167,6 +185,67 @@ impl Registry {
         }
     }
 
+    /// Attempts an OCI cross-repository blob mount.
+    ///
+    /// When the blob `mount.digest` is already stored AND mountable, the target
+    /// `namespace` is granted a reference and the completed-blob headers are
+    /// returned (the caller answers `201 Created` with no body transfer).
+    /// "Mountable" depends on the request:
+    /// - **`from` set** — the blob must be readable from that repository.
+    /// - **`from` unset** (automatic content discovery) — the blob must already be
+    ///   referenced by some namespace.
+    ///
+    /// Returns `Ok(None)` when the blob is absent or not mountable, so the caller
+    /// falls back to opening a normal upload session (`202 Accepted`) — the spec
+    /// requires a mount that cannot be satisfied to degrade to an ordinary upload
+    /// rather than fail.
+    async fn try_cross_repo_mount(
+        &self,
+        namespace: &Namespace,
+        mount: &BlobMount,
+    ) -> Result<Option<HeaderMap>, Error> {
+        if self.blob_store.size(&mount.digest).await.is_err() {
+            return Ok(None);
+        }
+
+        let ownership = BlobOwnership::new(self.metadata_store.as_ref());
+        let mountable = match &mount.from {
+            Some(from) => ownership.can_read(from, &mount.digest).await?,
+            // Automatic content discovery (no `from`): mount when the blob is
+            // known content (referenced by some namespace), not an orphan blob.
+            None => {
+                self.metadata_store
+                    .has_blob_references(&mount.digest)
+                    .await?
+            }
+        };
+        if !mountable {
+            return Ok(None);
+        }
+
+        ownership.grant(namespace, &mount.digest).await?;
+        Ok(Some(blob_location_headers(namespace, &mount.digest)))
+    }
+
+    /// Opens a fresh resumable upload session and returns its `202` headers.
+    async fn open_upload_session(
+        &self,
+        namespace: &Namespace,
+    ) -> Result<StartUploadResponse, Error> {
+        let session_uuid = Uuid::new_v4().to_string();
+        self.blob_store
+            .create_upload(namespace, &session_uuid)
+            .await?;
+
+        Ok(StartUploadResponse::Session {
+            headers: upload_session_headers(namespace, &session_uuid),
+        })
+    }
+
+    /// Starts an ordinary blob upload.
+    ///
+    /// When `digest` names a blob the namespace already owns, returns it with no
+    /// transfer (`ExistingBlob` → `201`); otherwise opens a session (`202`).
     #[instrument]
     pub async fn start_upload(
         &self,
@@ -184,14 +263,26 @@ impl Registry {
             });
         }
 
-        let session_uuid = Uuid::new_v4().to_string();
-        self.blob_store
-            .create_upload(namespace, &session_uuid)
-            .await?;
+        self.open_upload_session(namespace).await
+    }
 
-        Ok(StartUploadResponse::Session {
-            headers: upload_session_headers(namespace, &session_uuid),
-        })
+    /// Starts a cross-repository blob mount.
+    ///
+    /// When the mount can be satisfied, grants the namespace a reference with no
+    /// transfer (`ExistingBlob` → `201`); otherwise falls back to opening an
+    /// ordinary upload session (`202`) — a mount that cannot be satisfied must
+    /// degrade to an upload rather than fail.
+    #[instrument]
+    pub async fn mount_blob(
+        &self,
+        namespace: &Namespace,
+        mount: BlobMount,
+    ) -> Result<StartUploadResponse, Error> {
+        if let Some(headers) = self.try_cross_repo_mount(namespace, &mount).await? {
+            return Ok(StartUploadResponse::ExistingBlob { headers });
+        }
+
+        self.open_upload_session(namespace).await
     }
 
     #[instrument(skip(stream))]
@@ -350,7 +441,7 @@ mod tests {
         event_webhook::event::EventKind,
         oci::{Digest, Namespace},
         registry::{
-            DOCKER_CONTENT_DIGEST, DOCKER_UPLOAD_UUID, Error, StartUploadResponse,
+            BlobMount, DOCKER_CONTENT_DIGEST, DOCKER_UPLOAD_UUID, Error, StartUploadResponse,
             blob_ownership::BlobOwnership,
             blob_store::BlobStore,
             metadata_store::link_kind::LinkKind,
@@ -566,6 +657,190 @@ mod tests {
                 }
                 StartUploadResponse::Session { .. } => panic!("Expected Existing response"),
             }
+            test_case.cleanup().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn test_mount_blob_grants_and_returns_existing() {
+        for test_case in backends() {
+            let registry = test_case.registry();
+            let source = &Namespace::new("test-repo/source").unwrap();
+            let target = &Namespace::new("test-repo/target").unwrap();
+            let content = b"cross-repo mountable blob";
+
+            // The blob exists and is owned by `source` (but not yet by `target`).
+            let digest = put_blob_direct(registry.metadata_store.store(), content).await;
+            BlobOwnership::new(registry.metadata_store.as_ref())
+                .grant(source, &digest)
+                .await
+                .unwrap();
+
+            let mount = BlobMount {
+                digest: digest.clone(),
+                from: Some(source.clone()),
+            };
+            let response = registry.mount_blob(target, mount).await.unwrap();
+
+            // 201-equivalent: the mount granted `target` a reference with no
+            // transfer, so the existing-blob headers come back.
+            match response {
+                StartUploadResponse::ExistingBlob { headers } => {
+                    assert_eq!(headers[DOCKER_CONTENT_DIGEST], digest.to_string());
+                    assert_eq!(
+                        headers[LOCATION.as_str()],
+                        format!("/v2/{target}/blobs/{digest}")
+                    );
+                }
+                StartUploadResponse::Session { .. } => {
+                    panic!("Expected a mounted existing-blob response")
+                }
+            }
+
+            // The mount must have actually granted `target` ownership.
+            assert!(
+                BlobOwnership::new(registry.metadata_store.as_ref())
+                    .can_read(target, &digest)
+                    .await
+                    .unwrap(),
+                "mount must grant the target namespace a reference"
+            );
+            test_case.cleanup().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn test_mount_blob_falls_back_when_source_lacks_blob() {
+        for test_case in backends() {
+            let registry = test_case.registry();
+            let source = &Namespace::new("test-repo/source").unwrap();
+            let target = &Namespace::new("test-repo/target").unwrap();
+            let content = b"blob present but not owned by source";
+
+            // The blob bytes exist, but `source` was never granted a reference, so
+            // the mount cannot be satisfied and must fall back to a session.
+            let digest = put_blob_direct(registry.metadata_store.store(), content).await;
+
+            let mount = BlobMount {
+                digest: digest.clone(),
+                from: Some(source.clone()),
+            };
+            let response = registry.mount_blob(target, mount).await.unwrap();
+
+            match response {
+                StartUploadResponse::Session { headers } => {
+                    assert!(
+                        headers[LOCATION.as_str()]
+                            .starts_with(&format!("/v2/{target}/blobs/uploads/"))
+                    );
+                }
+                StartUploadResponse::ExistingBlob { .. } => {
+                    panic!("Expected a fall-back session when the source does not own the blob")
+                }
+            }
+
+            // The failed mount must NOT have granted `target` anything.
+            assert!(
+                !BlobOwnership::new(registry.metadata_store.as_ref())
+                    .can_read(target, &digest)
+                    .await
+                    .unwrap(),
+                "a failed mount must not grant the target namespace a reference"
+            );
+            test_case.cleanup().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn test_mount_blob_falls_back_when_blob_absent() {
+        use std::str::FromStr;
+
+        for test_case in backends() {
+            let registry = test_case.registry();
+            let source = &Namespace::new("test-repo/source").unwrap();
+            let target = &Namespace::new("test-repo/target").unwrap();
+
+            // The blob does not exist at all -> fall back to a session.
+            let absent = Digest::from_str(
+                "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+            )
+            .unwrap();
+            let mount = BlobMount {
+                digest: absent,
+                from: Some(source.clone()),
+            };
+            let response = registry.mount_blob(target, mount).await.unwrap();
+
+            assert!(
+                matches!(response, StartUploadResponse::Session { .. }),
+                "an absent blob must fall back to a normal upload session"
+            );
+            test_case.cleanup().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn test_mount_blob_automatic_grants_referenced_blob() {
+        for test_case in backends() {
+            let registry = test_case.registry();
+            let owner = &Namespace::new("test-repo/owner").unwrap();
+            let target = &Namespace::new("test-repo/target").unwrap();
+            let content = b"automatically discoverable blob";
+
+            // The blob is referenced by some namespace (owner), so a from-less
+            // mount can discover it automatically.
+            let digest = put_blob_direct(registry.metadata_store.store(), content).await;
+            BlobOwnership::new(registry.metadata_store.as_ref())
+                .grant(owner, &digest)
+                .await
+                .unwrap();
+
+            let mount = BlobMount {
+                digest: digest.clone(),
+                from: None,
+            };
+            let response = registry.mount_blob(target, mount).await.unwrap();
+
+            match response {
+                StartUploadResponse::ExistingBlob { headers } => {
+                    assert_eq!(headers[DOCKER_CONTENT_DIGEST], digest.to_string());
+                }
+                StartUploadResponse::Session { .. } => {
+                    panic!("automatic discovery must mount a referenced blob")
+                }
+            }
+            assert!(
+                BlobOwnership::new(registry.metadata_store.as_ref())
+                    .can_read(target, &digest)
+                    .await
+                    .unwrap(),
+                "automatic mount must grant the target namespace a reference"
+            );
+            test_case.cleanup().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn test_mount_blob_automatic_falls_back_for_unreferenced_blob() {
+        for test_case in backends() {
+            let registry = test_case.registry();
+            let target = &Namespace::new("test-repo/target").unwrap();
+            let content = b"orphan blob present but unreferenced";
+
+            // The blob bytes exist but no namespace references them, so automatic
+            // content discovery finds nothing and falls back to a session.
+            let digest = put_blob_direct(registry.metadata_store.store(), content).await;
+
+            let mount = BlobMount {
+                digest: digest.clone(),
+                from: None,
+            };
+            let response = registry.mount_blob(target, mount).await.unwrap();
+
+            assert!(
+                matches!(response, StartUploadResponse::Session { .. }),
+                "an unreferenced (orphan) blob must not be auto-mounted"
+            );
             test_case.cleanup().await;
         }
     }

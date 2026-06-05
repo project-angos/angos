@@ -311,6 +311,7 @@ impl ReplicationJobHandler {
             let outcome = pipeline::push_manifest(
                 registry_client,
                 &self.blob_store,
+                &self.metadata_store,
                 namespace.as_ref(),
                 &digest,
                 media_type.as_deref(),

@@ -32,7 +32,7 @@ pub use headers::{HeaderMap, ResponseHeaders};
 pub use manifest::ParsedManifestDigests;
 pub use manifest::{GetManifestResponse, parse_manifest_digests};
 pub use repository::Repository;
-pub use upload::StartUploadResponse;
+pub use upload::{BlobMount, StartUploadResponse};
 
 pub const DOCKER_CONTENT_DIGEST: &str = "Docker-Content-Digest";
 pub const DOCKER_UPLOAD_UUID: &str = "Docker-Upload-UUID";

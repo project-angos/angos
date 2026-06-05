@@ -1068,6 +1068,77 @@ async fn test_blob_upload_sequence() {
 }
 
 #[tokio::test]
+async fn test_mount_blob_returns_none_on_201() {
+    let mock_server = MockServer::start().await;
+    let digest = "sha256:1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef";
+
+    // The POST must carry the mount query; the server answers 201 (mounted).
+    Mock::given(method("POST"))
+        .and(path("/v2/target/blobs/uploads/"))
+        .and(query_param("mount", digest))
+        .and(query_param("from", "source"))
+        .respond_with(
+            ResponseTemplate::new(201)
+                .insert_header("Location", format!("/v2/target/blobs/{digest}")),
+        )
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let client = client_for(&mock_server);
+    let start_url = client.get_uploads_start_path("", "target");
+    let outcome = client
+        .mount_blob(
+            &start_url,
+            &Digest::try_from(digest).unwrap(),
+            Some("source"),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        outcome, None,
+        "a 201 to a mount request must report a mount (None — no transfer needed)"
+    );
+    drop(mock_server);
+}
+
+#[tokio::test]
+async fn test_mount_blob_falls_back_to_session_on_202() {
+    let mock_server = MockServer::start().await;
+    let digest = "sha256:1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef";
+    let session_path = "/v2/target/blobs/uploads/session-9";
+
+    // The server could not satisfy the mount and opened a session instead (202).
+    Mock::given(method("POST"))
+        .and(path("/v2/target/blobs/uploads/"))
+        .and(query_param("mount", digest))
+        .and(query_param("from", "source"))
+        .respond_with(ResponseTemplate::new(202).insert_header("Location", session_path))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let client = client_for(&mock_server);
+    let start_url = client.get_uploads_start_path("", "target");
+    let outcome = client
+        .mount_blob(
+            &start_url,
+            &Digest::try_from(digest).unwrap(),
+            Some("source"),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        outcome,
+        Some(format!("{}{session_path}", mock_server.uri())),
+        "a 202 to a mount request must fall back to a session with the continuation URL"
+    );
+    drop(mock_server);
+}
+
+#[tokio::test]
 async fn test_put_manifest_with_oci_subject() {
     let mock_server = MockServer::start().await;
     let manifest = br#"{"schemaVersion":2}"#;

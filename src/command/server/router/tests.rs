@@ -64,7 +64,10 @@ fn test_parse_start_upload() {
     let method = Method::POST;
     let uri: Uri = "/v2/myrepo/app/blobs/uploads".parse().unwrap();
     let route = parse(&method, &uri);
-    if let Some(Action::StartUpload { namespace, digest }) = route {
+    if let Some(Action::StartUpload {
+        namespace, digest, ..
+    }) = route
+    {
         assert_eq!(namespace, "myrepo/app");
         assert!(digest.is_none());
     } else {
@@ -77,7 +80,10 @@ fn test_parse_start_upload_with_trailing_slash() {
     let method = Method::POST;
     let uri: Uri = "/v2/myrepo/app/blobs/uploads/".parse().unwrap();
     let route = parse(&method, &uri);
-    if let Some(Action::StartUpload { namespace, digest }) = route {
+    if let Some(Action::StartUpload {
+        namespace, digest, ..
+    }) = route
+    {
         assert_eq!(namespace, "myrepo/app");
         assert!(digest.is_none());
     } else {
@@ -90,7 +96,10 @@ fn test_parse_start_upload_with_digest() {
     let method = Method::POST;
     let uri: Uri = "/v2/myrepo/app/blobs/uploads?digest=sha256:1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef".parse().unwrap();
     let route = parse(&method, &uri);
-    if let Some(Action::StartUpload { namespace, digest }) = route {
+    if let Some(Action::StartUpload {
+        namespace, digest, ..
+    }) = route
+    {
         assert_eq!(namespace, "myrepo/app");
         assert!(digest.is_some());
         assert_eq!(
@@ -99,6 +108,47 @@ fn test_parse_start_upload_with_digest() {
         );
     } else {
         panic!("Expected StartUpload route");
+    }
+}
+
+#[test]
+fn test_parse_mount_blob_with_from() {
+    let method = Method::POST;
+    let mount_digest = "sha256:1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef";
+    let uri: Uri =
+        format!("/v2/myrepo/target/blobs/uploads/?mount={mount_digest}&from=myrepo/source")
+            .parse()
+            .unwrap();
+    let route = parse(&method, &uri);
+    if let Some(Action::MountBlob {
+        namespace,
+        digest,
+        from,
+    }) = route
+    {
+        assert_eq!(namespace, "myrepo/target");
+        assert_eq!(digest.to_string(), mount_digest);
+        assert_eq!(from.unwrap(), "myrepo/source");
+    } else {
+        panic!("Expected MountBlob route");
+    }
+}
+
+#[test]
+fn test_parse_mount_blob_without_from() {
+    // `?mount=` without `?from=` still routes to `mount-blob`, with `from` unset
+    // (the server then attempts automatic content discovery).
+    let method = Method::POST;
+    let mount_digest = "sha256:1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef";
+    let uri: Uri = format!("/v2/myrepo/target/blobs/uploads/?mount={mount_digest}")
+        .parse()
+        .unwrap();
+    let route = parse(&method, &uri);
+    if let Some(Action::MountBlob { digest, from, .. }) = route {
+        assert_eq!(digest.to_string(), mount_digest);
+        assert!(from.is_none());
+    } else {
+        panic!("Expected MountBlob route");
     }
 }
 
@@ -603,7 +653,10 @@ fn test_try_parse_upload_start_post_method() {
     let path = "myrepo/app/blobs/uploads";
     let route = try_parse_upload(&method, path, None);
     assert!(route.is_some());
-    if let Some(Action::StartUpload { namespace, digest }) = route {
+    if let Some(Action::StartUpload {
+        namespace, digest, ..
+    }) = route
+    {
         assert_eq!(namespace, "myrepo/app");
         assert!(digest.is_none());
     } else {
@@ -626,14 +679,14 @@ fn test_try_parse_upload_start_no_slash() {
     // No-slash variant: /v2/foo/blobs/uploads → StartUpload for namespace "foo".
     let route = try_parse_upload(&method, "foo/blobs/uploads", None);
     assert!(
-        matches!(route, Some(Action::StartUpload { ref namespace, digest: None }) if namespace == "foo"),
+        matches!(route, Some(Action::StartUpload { ref namespace, digest: None, .. }) if namespace == "foo"),
         "no-slash variant must yield StartUpload with correct namespace"
     );
 
     // With-slash variant: /v2/foo/blobs/uploads/ → same result.
     let route = try_parse_upload(&method, "foo/blobs/uploads/", None);
     assert!(
-        matches!(route, Some(Action::StartUpload { ref namespace, digest: None }) if namespace == "foo"),
+        matches!(route, Some(Action::StartUpload { ref namespace, digest: None, .. }) if namespace == "foo"),
         "with-slash variant must yield StartUpload with correct namespace"
     );
 

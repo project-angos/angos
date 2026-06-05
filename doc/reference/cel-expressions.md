@@ -79,9 +79,12 @@ Information about the current request. Fields are present based on the action ty
 | `request.digest`        | string? | Blob/manifest digest                       |
 | `request.reference`     | string? | Tag or digest reference                    |
 | `request.uuid`          | string? | Upload session UUID                        |
+| `request.from`          | string? | Cross-repository mount source repository (`mount-blob` only) |
 | `request.n`             | int?    | Pagination limit                           |
 | `request.last`          | string? | Pagination marker                          |
 | `request.artifact_type` | string? | Referrer artifact type filter              |
+
+Optional `request` fields are **omitted** when unset (only `request.action` is always present), so test their presence with the `has()` macro rather than a null comparison: `has(request.from)` is safe, whereas `request.from != null` raises a "no such key" error (evaluated fail-closed) when the field is absent. Optional `identity` fields, by contrast, are present as `null`, so `identity.username != null` is correct there.
 
 ### Actions
 
@@ -91,6 +94,7 @@ Information about the current request. Fields are present based on the action ty
 | `metrics`           | Prometheus metrics endpoint  |
 | `get-api-version`   | API version check            |
 | `start-upload`      | Start blob upload            |
+| `mount-blob`        | Cross-repository blob mount (distinct from `start-upload`)            |
 | `update-upload`     | Continue chunked upload      |
 | `complete-upload`   | Complete upload              |
 | `get-upload`        | Get upload status            |

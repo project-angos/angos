@@ -13,7 +13,7 @@ use crate::{
     event_webhook::event::EventActor,
     identity::ClientIdentity,
     oci::{Digest, Namespace},
-    registry::StartUploadResponse,
+    registry::{BlobMount, StartUploadResponse},
 };
 
 pub async fn handle_start_upload(
@@ -22,7 +22,25 @@ pub async fn handle_start_upload(
     digest: Option<Digest>,
 ) -> Result<Response<ResponseBody>, Error> {
     let response = context.registry.start_upload(namespace, digest).await?;
+    upload_start_response(response)
+}
 
+pub async fn handle_mount_blob(
+    context: &ServerContext,
+    namespace: &Namespace,
+    digest: Digest,
+    from: Option<Namespace>,
+) -> Result<Response<ResponseBody>, Error> {
+    let response = context
+        .registry
+        .mount_blob(namespace, BlobMount { digest, from })
+        .await?;
+    upload_start_response(response)
+}
+
+/// Maps a [`StartUploadResponse`] to its HTTP response: an existing/mounted blob
+/// is `201 Created`, a fresh session is `202 Accepted`.
+fn upload_start_response(response: StartUploadResponse) -> Result<Response<ResponseBody>, Error> {
     match response {
         StartUploadResponse::ExistingBlob { headers } => {
             build_response(StatusCode::CREATED, headers, ResponseBody::empty())

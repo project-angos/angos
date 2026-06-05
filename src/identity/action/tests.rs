@@ -58,6 +58,14 @@ fn test_action_serialization_cel_compatibility() {
             },
         ),
         (
+            "mount-blob",
+            Action::MountBlob {
+                namespace: ns(),
+                digest: digest(),
+                from: None,
+            },
+        ),
+        (
             "get-upload",
             Action::GetUpload {
                 namespace: ns(),
@@ -252,7 +260,7 @@ fn test_get_digest() {
     assert_eq!(
         Action::StartUpload {
             namespace: ns(),
-            digest: Some(d.clone())
+            digest: Some(d.clone()),
         }
         .get_digest(),
         Some(&d)
@@ -260,10 +268,20 @@ fn test_get_digest() {
     assert_eq!(
         Action::StartUpload {
             namespace: ns(),
-            digest: None
+            digest: None,
         }
         .get_digest(),
         None
+    );
+    // A mount-blob action exposes its mount-source digest as the action digest.
+    assert_eq!(
+        Action::MountBlob {
+            namespace: ns(),
+            digest: d.clone(),
+            from: Some(ns()),
+        }
+        .get_digest(),
+        Some(&d)
     );
     assert_eq!(Action::ApiVersion.get_digest(), None);
 }
@@ -296,7 +314,15 @@ fn test_is_push() {
     assert!(
         Action::StartUpload {
             namespace: ns(),
-            digest: None
+            digest: None,
+        }
+        .is_push()
+    );
+    assert!(
+        Action::MountBlob {
+            namespace: ns(),
+            digest: digest(),
+            from: None,
         }
         .is_push()
     );

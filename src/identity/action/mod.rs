@@ -75,6 +75,17 @@ pub enum Action {
         #[serde(skip_serializing_if = "Option::is_none")]
         digest: Option<Digest>,
     },
+    /// Cross-repository blob mount (`POST .../blobs/uploads/?mount=<digest>`). A
+    /// distinct route and CEL action from `start-upload`, so a policy gates
+    /// mounts with a plain `request.action == 'mount-blob'` rule. `digest` is the
+    /// blob to mount; `from` is the optional source repository.
+    #[serde(rename = "mount-blob")]
+    MountBlob {
+        namespace: Namespace,
+        digest: Digest,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        from: Option<Namespace>,
+    },
     #[serde(rename = "get-upload")]
     GetUpload {
         namespace: Namespace,
@@ -219,6 +230,7 @@ impl Action {
             Action::ListCatalog { .. } => "list-catalog",
             Action::ListTags { .. } => "list-tags",
             Action::StartUpload { .. } => "start-upload",
+            Action::MountBlob { .. } => "mount-blob",
             Action::GetUpload { .. } => "get-upload",
             Action::PatchUpload { .. } => "update-upload",
             Action::PutUpload { .. } => "complete-upload",
@@ -286,6 +298,9 @@ impl Action {
             },
 
             Action::PutUpload {
+                namespace, digest, ..
+            }
+            | Action::MountBlob {
                 namespace, digest, ..
             } => ActionData {
                 namespace: Some(namespace),

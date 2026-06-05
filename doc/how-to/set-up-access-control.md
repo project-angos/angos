@@ -155,6 +155,45 @@ rules = [
 ]
 ```
 
+### Restrict cross-repository blob mount
+
+A cross-repository mount (`POST .../blobs/uploads/?mount={digest}[&from={repo}]`) grants the target
+namespace a reference to an existing blob based on the blob's presence, not on the caller's access to
+the source. A caller able to push to the target can therefore reference any blob it knows the digest
+of (with `from`, any blob readable from `{repo}`; without `from`, any blob referenced by any
+namespace) and then pull it from the target.
+
+A mount is its own route and CEL action, `mount-blob`, distinct from `start-upload`, so a policy
+gates it with a single `request.action == 'mount-blob'` rule -- independent of the rules governing
+ordinary uploads. Denying it rejects the mount request; Angos's own replication transparently falls
+back to a normal upload when a downstream denies the mount, so denying `mount-blob` never breaks
+replication.
+
+Restrict every mount to a trusted identity (for example the replicator), leaving ordinary uploads
+untouched. Under a `default = "deny"` policy, add an allow-rule for it:
+
+```toml
+[repository."app".access_policy]
+default = "deny"
+rules = [
+  # ...your usual allow-rules for pull, manifest push, start-upload...
+  "identity.id == 'replicator' && request.action == 'mount-blob'",
+]
+```
+
+Under a `default = "allow"` policy, deny it instead:
+
+```toml
+[repository."app".access_policy]
+default = "allow"
+rules = [
+  "request.action == 'mount-blob' && identity.id != 'replicator'",
+]
+```
+
+The `request.from` field (the mount source repository, present only on `mount-blob`) is available if
+you need to distinguish a scoped mount from a from-less one.
+
 ---
 
 ## Web UI Access
