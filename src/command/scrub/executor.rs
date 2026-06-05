@@ -307,7 +307,6 @@ impl ActionSink for Executor {
                     tag: Some(tag),
                     digest: Some(digest.to_string()),
                     kind: REPLICATION_PUSH_MANIFEST_KIND.to_string(),
-                    origin: None,
                     // The handler stamps source_ts from the resolved tag's
                     // created_at at execute time, so a reconcile push carries the
                     // same last-writer-wins version as the event path instead of
@@ -348,7 +347,6 @@ impl ActionSink for Executor {
                     tag: Some(tag),
                     digest: None,
                     kind: REPLICATION_DELETE_MANIFEST_KIND.to_string(),
-                    origin: None,
                     source_ts: Some(Utc::now().to_rfc3339()),
                 })
                 .await?;

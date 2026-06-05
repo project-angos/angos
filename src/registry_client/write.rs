@@ -27,7 +27,7 @@ use crate::{
     oci::Digest,
     registry::{DOCKER_CONTENT_DIGEST, Error, OCI_SUBJECT},
     registry_client::RegistryClient,
-    replication::{REPLICATION_SUPERSEDED_CODE, X_ANGOS_ORIGIN, X_ANGOS_SOURCE_TIMESTAMP},
+    replication::{REPLICATION_SUPERSEDED_CODE, X_ANGOS_SOURCE_TIMESTAMP},
 };
 
 /// Body of an OCI `GET /v2/<ns>/tags/list` response.
@@ -72,16 +72,6 @@ pub enum DeleteManifestOutcome {
     Superseded,
 }
 
-/// Replication headers stamped on an outgoing manifest write so the receiver can
-/// loop-filter (`X-Angos-Origin`) and apply last-writer-wins
-/// (`X-Angos-Source-Timestamp`). Both are `None` for ordinary (non-replication)
-/// requests.
-#[derive(Clone, Copy, Default)]
-struct ReplicationHeaders<'a> {
-    origin: Option<&'a str>,
-    source_ts: Option<&'a str>,
-}
-
 /// Reads the body of a `409` response and returns its first OCI error `code`,
 /// when the body is the standard `{"errors":[{"code":"..."}]}` envelope.
 ///
@@ -103,15 +93,15 @@ impl RegistryClient {
     /// Sends a request carrying a byte body, reusing the cached auth header and
     /// refreshing once on `401` (mirrors [`RegistryClient::query`]).
     ///
-    /// `repl` stamps the replication loop-prevention / LWW headers; pass
-    /// [`ReplicationHeaders::default`] for ordinary writes.
+    /// `source_ts` stamps the `X-Angos-Source-Timestamp` last-writer-wins header
+    /// when set; pass `None` for ordinary writes.
     async fn send_body(
         &self,
         method: &Method,
         location: &str,
         content_type: Option<&str>,
         body: Vec<u8>,
-        repl: ReplicationHeaders<'_>,
+        source_ts: Option<&str>,
     ) -> Result<Response, Error> {
         info!("Writing to upstream: {method} {location}");
 
@@ -123,7 +113,7 @@ impl RegistryClient {
                 content_type,
                 body.clone(),
                 cached_auth.as_deref(),
-                repl,
+                source_ts,
             )
             .await?;
 
@@ -132,7 +122,14 @@ impl RegistryClient {
                 .refresh_auth_header(&response, cached_auth.as_deref())
                 .await?;
             return self
-                .send_body_once(method, location, content_type, body, Some(&token), repl)
+                .send_body_once(
+                    method,
+                    location,
+                    content_type,
+                    body,
+                    Some(&token),
+                    source_ts,
+                )
                 .await;
         }
 
@@ -150,7 +147,7 @@ impl RegistryClient {
         content_type: Option<&str>,
         body: Vec<u8>,
         auth_header: Option<&str>,
-        repl: ReplicationHeaders<'_>,
+        source_ts: Option<&str>,
     ) -> Result<Response, Error> {
         let mut request = self
             .build_request(method, &[], location, auth_header)
@@ -158,10 +155,7 @@ impl RegistryClient {
         if let Some(content_type) = content_type {
             request = request.header(CONTENT_TYPE, content_type);
         }
-        if let Some(origin) = repl.origin {
-            request = request.header(X_ANGOS_ORIGIN, origin);
-        }
-        if let Some(source_ts) = repl.source_ts {
+        if let Some(source_ts) = source_ts {
             request = request.header(X_ANGOS_SOURCE_TIMESTAMP, source_ts);
         }
         request
@@ -243,13 +237,7 @@ impl RegistryClient {
     #[instrument(skip(self))]
     pub async fn start_upload(&self, location: &str) -> Result<String, Error> {
         let response = self
-            .send_body(
-                &Method::POST,
-                location,
-                None,
-                Vec::new(),
-                ReplicationHeaders::default(),
-            )
+            .send_body(&Method::POST, location, None, Vec::new(), None)
             .await?;
 
         if !response.status().is_success() {
@@ -291,13 +279,7 @@ impl RegistryClient {
         };
 
         let response = self
-            .send_body(
-                &Method::POST,
-                &location,
-                None,
-                Vec::new(),
-                ReplicationHeaders::default(),
-            )
+            .send_body(&Method::POST, &location, None, Vec::new(), None)
             .await?;
 
         // 201 Created: the blob is already present downstream (mounted).
@@ -365,13 +347,7 @@ impl RegistryClient {
         let location = format!("{session_url}{separator}digest={digest}");
 
         let response = self
-            .send_body(
-                &Method::PUT,
-                &location,
-                None,
-                Vec::new(),
-                ReplicationHeaders::default(),
-            )
+            .send_body(&Method::PUT, &location, None, Vec::new(), None)
             .await?;
 
         if !response.status().is_success() {
@@ -386,9 +362,8 @@ impl RegistryClient {
 
     /// Pushes a manifest by reference.
     ///
-    /// `origin` / `source_ts` stamp the `X-Angos-Origin` /
-    /// `X-Angos-Source-Timestamp` headers when set (a replication push); both are
-    /// `None` for an ordinary push.
+    /// `source_ts` stamps the `X-Angos-Source-Timestamp` header when set (a
+    /// replication push); it is `None` for an ordinary push.
     ///
     /// Surfaces the `OCI-Subject` response header so the pipeline can detect an
     /// OCI-1.0 downstream (no header on a subject-bearing manifest) and push the
@@ -412,17 +387,10 @@ impl RegistryClient {
         location: &str,
         content_type: Option<&str>,
         body: Vec<u8>,
-        origin: Option<&str>,
         source_ts: Option<&str>,
     ) -> Result<PutManifestResult, Error> {
         let response = self
-            .send_body(
-                &Method::PUT,
-                location,
-                content_type,
-                body,
-                ReplicationHeaders { origin, source_ts },
-            )
+            .send_body(&Method::PUT, location, content_type, body, source_ts)
             .await?;
 
         if response.status() == StatusCode::CONFLICT {
@@ -466,9 +434,8 @@ impl RegistryClient {
 
     /// Deletes a manifest by reference.
     ///
-    /// `origin` / `source_ts` stamp the `X-Angos-Origin` /
-    /// `X-Angos-Source-Timestamp` headers when set (a replication delete); both
-    /// are `None` for an ordinary delete.
+    /// `source_ts` stamps the `X-Angos-Source-Timestamp` header when set (a
+    /// replication delete); it is `None` for an ordinary delete.
     ///
     /// 409 disambiguation: a `409` whose OCI error `code` is
     /// [`REPLICATION_SUPERSEDED_CODE`] returns
@@ -484,17 +451,10 @@ impl RegistryClient {
     pub async fn delete_manifest(
         &self,
         location: &str,
-        origin: Option<&str>,
         source_ts: Option<&str>,
     ) -> Result<DeleteManifestOutcome, Error> {
         let response = self
-            .send_body(
-                &Method::DELETE,
-                location,
-                None,
-                Vec::new(),
-                ReplicationHeaders { origin, source_ts },
-            )
+            .send_body(&Method::DELETE, location, None, Vec::new(), source_ts)
             .await?;
 
         if response.status() == StatusCode::CONFLICT {

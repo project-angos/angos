@@ -90,11 +90,6 @@ pub struct RegistryConfig {
     /// Only consulted when `job_queue` is `None`; durable deployments drain the
     /// replication queue with `angos worker --queue replication` instead.
     pub max_concurrent_replication_jobs: NonZeroUsize,
-    /// This instance's own replication instance-id (the local origin tag).
-    /// Stamped on outgoing replication jobs and used by the loop filter to drop
-    /// self-bounces before they are enqueued. Resolved once at startup via
-    /// [`MetadataStore::get_or_init_instance_id`].
-    pub instance_id: String,
 }
 
 impl Default for RegistryConfig {
@@ -109,7 +104,6 @@ impl Default for RegistryConfig {
             job_queue: None,
             max_concurrent_cache_jobs: DEFAULT_MAX_CONCURRENT_CACHE_JOBS,
             max_concurrent_replication_jobs: DEFAULT_MAX_CONCURRENT_REPLICATION_JOBS,
-            instance_id: String::new(),
         }
     }
 }
@@ -159,11 +153,6 @@ impl RegistryConfig {
         self.max_concurrent_replication_jobs = value;
         self
     }
-
-    pub fn instance_id(mut self, instance_id: String) -> Self {
-        self.instance_id = instance_id;
-        self
-    }
 }
 
 #[allow(clippy::struct_excessive_bools)]
@@ -175,7 +164,6 @@ pub struct Registry {
     enable_manifest_redirect: bool,
     update_pull_time: bool,
     job_queue: Arc<JobStore>,
-    instance_id: String,
     global_immutable_tags: bool,
     global_immutable_tags_exclusions: Vec<RegexPattern>,
     max_manifest_size_bytes: usize,
@@ -215,7 +203,6 @@ impl Registry {
             metadata_store,
             resolver,
             job_queue,
-            instance_id: config.instance_id,
             global_immutable_tags: config.global_immutable_tags,
             global_immutable_tags_exclusions: config.global_immutable_tags_exclusions,
             max_manifest_size_bytes: config.max_manifest_size_bytes,
@@ -316,8 +303,8 @@ fn build_in_process_queue(
 
     // Replication handler over the same shared store: it reads local manifest /
     // blob bytes and pushes them to each downstream `RegistryClient`. Self-origin
-    // changes are filtered at the enqueue boundary; the downstream-bounce filter
-    // (known_instance_ids) stays empty until a future handshake populates it.
+    // changes are filtered at the enqueue boundary; receiver-side no-op
+    // suppression terminates any remaining mesh cycles.
     let replication_handler: Arc<dyn JobHandler> = Arc::new(
         ReplicationJobHandler::builder()
             .resolver(resolver.clone())
@@ -391,7 +378,6 @@ mod in_process_replication_tests {
     const NAMESPACE: &str = "nginx";
     const REPO: &str = "nginx";
     const DOWNSTREAM: &str = "eu-region";
-    const LOCAL_INSTANCE: &str = "instance-local";
 
     fn downstream_client(uri: &str) -> Arc<RegistryClient> {
         let backend = cache::Config::Memory.to_backend().unwrap();
@@ -457,7 +443,7 @@ mod in_process_replication_tests {
 
         // No `job_queue` => `build_in_process_queue` runs, spawning the
         // replication claim loops over the shared store.
-        let config = RegistryConfig::default().instance_id(LOCAL_INSTANCE.to_string());
+        let config = RegistryConfig::default();
         let registry =
             Registry::new(blob_store.clone(), metadata_store.clone(), resolver, config).unwrap();
 
@@ -582,7 +568,6 @@ mod in_process_replication_tests {
                 REPLICATION_PUSH_MANIFEST_KIND,
                 Some("v1"),
                 Some(&manifest_digest),
-                None,
             )
             .await;
 

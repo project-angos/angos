@@ -13,7 +13,7 @@
 //! Because the engine cannot roll back an HTTP PUT, the pipeline is idempotent
 //! (HEAD-before-PUT) per the at-least-once contract.
 
-use std::{collections::HashSet, sync::Arc};
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -66,9 +66,6 @@ pub struct ReplicationPushPayload {
     /// Job kind, mirrors the envelope `kind` (one of the `REPLICATION_*_KIND`
     /// consts) so a payload is self-describing for the scrub-side builder.
     pub kind: String,
-    /// Originating instance-id, propagated verbatim for loop prevention.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub origin: Option<String>,
     /// Event timestamp (RFC 3339) carried for receiver-side last-writer-wins.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_ts: Option<String>,
@@ -124,15 +121,12 @@ pub fn build_envelope(payload: &ReplicationPushPayload) -> Result<JobEnvelope, s
 
 /// Mirrors a local repository's state to a configured downstream.
 ///
-/// Holds resolved `Arc` dependencies plus the loop-prevention scalars; built via
+/// Holds resolved `Arc` dependencies only; built via
 /// [`ReplicationJobHandler::builder`] (no `new(config)` — refactor-rule 4).
 pub struct ReplicationJobHandler {
     resolver: Arc<RepositoryResolver>,
     blob_store: Arc<BlobStore>,
     metadata_store: Arc<MetadataStore>,
-    /// Known downstream instance-ids; an origin in this set is a downstream
-    /// bounce and is dropped.
-    known_instance_ids: HashSet<String>,
 }
 
 impl ReplicationJobHandler {
@@ -284,7 +278,6 @@ impl ReplicationJobHandler {
                 registry_client,
                 namespace.as_ref(),
                 &reference,
-                payload.origin.as_deref(),
                 payload.source_ts.as_deref(),
             )
             .await
@@ -333,7 +326,6 @@ impl ReplicationJobHandler {
                 payload.tag.as_deref(),
                 body,
                 max_concurrent_pushes,
-                payload.origin.as_deref(),
                 source_ts.as_deref(),
             )
             .await
@@ -363,23 +355,12 @@ impl JobHandler for ReplicationJobHandler {
         let payload: ReplicationPushPayload = serde_json::from_value(envelope.payload.clone())
             .map_err(|e| Error::Storage(format!("failed to deserialize job payload: {e}")))?;
 
-        // Defensive loop filter against KNOWN-DOWNSTREAM bounces only. Self-loops
-        // are filtered at the enqueue boundary (the event-path `dispatch_replication`
-        // and the HTTP receiver), which drop an inbound change whose origin already
-        // equals this instance BEFORE enqueue. An outbound push that a fresh local
-        // change enqueues carries this instance's own id as `origin` (it IS the
-        // original author), so dropping self-origin here would wrongly drop every
-        // legitimate outbound push. We therefore consult only the known-downstream
-        // set defensively. The wire-level `X-Angos-Origin` stamp is sourced from
-        // `payload.origin` (set at the enqueue boundary). Returns an empty
-        // Transaction (the queue still cleans the job up via `complete`).
-        if payload
-            .origin
-            .as_deref()
-            .is_some_and(|origin| self.known_instance_ids.contains(origin))
-        {
-            return Ok(Transaction::builder().build());
-        }
+        // Loop prevention runs at the enqueue boundary: the event-path
+        // `dispatch_replication` and the HTTP receiver drop an inbound change whose
+        // origin already equals this instance (self-bounce) before it is enqueued,
+        // and receiver-side no-op suppression breaks any remaining mesh cycles. A
+        // fresh local change legitimately carries this instance's own id as
+        // `origin`, so there is nothing for the handler itself to filter.
 
         // Run the whole push/delete attempt and record `failed` once on ANY Err
         // after the loop-filter — pre-flight (invalid namespace, missing
@@ -401,14 +382,12 @@ impl JobHandler for ReplicationJobHandler {
 
 /// Builder for [`ReplicationJobHandler`] taking individual resolved fields.
 ///
-/// `resolver`, `blob_store` and `metadata_store` are required;
-/// `known_instance_ids` defaults to empty.
+/// `resolver`, `blob_store` and `metadata_store` are all required.
 #[derive(Default)]
 pub struct ReplicationJobHandlerBuilder {
     resolver: Option<Arc<RepositoryResolver>>,
     blob_store: Option<Arc<BlobStore>>,
     metadata_store: Option<Arc<MetadataStore>>,
-    known_instance_ids: Option<HashSet<String>>,
 }
 
 impl ReplicationJobHandlerBuilder {
@@ -433,15 +412,6 @@ impl ReplicationJobHandlerBuilder {
         self
     }
 
-    /// Populates the downstream-bounce filter set; exercised by the handler
-    /// tests and used in production once downstream instance-ids are discovered.
-    #[allow(dead_code)]
-    #[must_use]
-    pub fn known_instance_ids(mut self, known_instance_ids: HashSet<String>) -> Self {
-        self.known_instance_ids = Some(known_instance_ids);
-        self
-    }
-
     /// Builds the [`ReplicationJobHandler`].
     ///
     /// # Errors
@@ -462,17 +432,13 @@ impl ReplicationJobHandlerBuilder {
             resolver,
             blob_store,
             metadata_store,
-            known_instance_ids: self.known_instance_ids.unwrap_or_default(),
         })
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        collections::{HashMap, HashSet},
-        sync::Arc,
-    };
+    use std::{collections::HashMap, sync::Arc};
 
     use serde_json::json;
     use tempfile::TempDir;
@@ -501,8 +467,7 @@ mod tests {
         registry_client::RegistryClient,
         replication::{
             REPLICATION_DELETE_MANIFEST_KIND, REPLICATION_PUSH_MANIFEST_KIND,
-            REPLICATION_SUPERSEDED_CODE, ReplicationDownstream, X_ANGOS_ORIGIN,
-            X_ANGOS_SOURCE_TIMESTAMP,
+            REPLICATION_SUPERSEDED_CODE, ReplicationDownstream, X_ANGOS_SOURCE_TIMESTAMP,
             handler::{
                 ReplicationJobHandler, ReplicationPushPayload, build_envelope, replication_lock_key,
             },
@@ -523,7 +488,6 @@ mod tests {
                     .to_string(),
             ),
             kind: REPLICATION_PUSH_MANIFEST_KIND.to_string(),
-            origin: Some("instance-a".to_string()),
             source_ts: Some("2026-06-03T00:00:00Z".to_string()),
         }
     }
@@ -771,59 +735,6 @@ mod tests {
         );
     }
 
-    /// The handler drops a job whose `origin` is a KNOWN-DOWNSTREAM instance-id
-    /// (a downstream-bounce; `known_instance_ids` is empty today and only
-    /// populated by a possible future handshake) and pushes nothing.
-    /// Self-origin is NOT dropped here — that is the enqueue-boundary's job; the
-    /// outbound payload a fresh local change enqueues legitimately carries this
-    /// instance's own id as `origin`.
-    #[tokio::test]
-    async fn execute_drops_known_downstream_origin_bounce() {
-        crate::metrics_provider::init_for_tests();
-        let dir = TempDir::new().unwrap();
-        let root = dir.path().to_str().unwrap();
-        let object: Arc<dyn ObjectStore> =
-            Arc::new(StorageFsBackend::builder().root_dir(root).build().unwrap());
-        let executor = build_test_fs_executor(root, false);
-        let store = build_store(object, executor);
-        let metadata_store = Arc::new(
-            MetadataStore::builder()
-                .store(store.clone())
-                .link_cache_ttl(0)
-                .access_time_debounce_secs(0)
-                .build()
-                .unwrap(),
-        );
-        let blob_store = Arc::new(BlobStore::builder().store(store.clone()).build().unwrap());
-
-        // Downstream points at an unreachable URL: if the loop filter fails to
-        // drop the job the handler would try to push and error.
-        let mut repositories = HashMap::new();
-        repositories.insert(
-            REPO.to_string(),
-            repository_with_downstream(downstream_client("http://127.0.0.1:1")),
-        );
-        let resolver = Arc::new(RepositoryResolver::new(Arc::new(repositories)).unwrap());
-
-        let mut known = HashSet::new();
-        known.insert("instance-a".to_string()); // == payload.origin
-
-        let handler = ReplicationJobHandler::builder()
-            .resolver(resolver)
-            .blob_store(blob_store)
-            .metadata_store(metadata_store)
-            .known_instance_ids(known)
-            .build()
-            .unwrap();
-
-        let envelope = build_envelope(&sample_payload()).unwrap();
-        let tx = handler.execute(&envelope).await.unwrap();
-        assert!(
-            tx.mutations.is_empty(),
-            "a known-downstream-origin bounce must be a no-op"
-        );
-    }
-
     #[tokio::test]
     async fn execute_pushes_manifest_with_head_before_put() {
         crate::metrics_provider::init_for_tests();
@@ -980,14 +891,13 @@ mod tests {
         handler.execute(&envelope).await.unwrap();
     }
 
-    /// End-to-end through `execute()`: the manifest PUT carries the propagated
-    /// `X-Angos-Origin` (the inbound origin, NOT the local instance id) and an
+    /// End-to-end through `execute()`: the manifest PUT carries an
     /// `X-Angos-Source-Timestamp` DERIVED from the resolved tag's `created_at` —
     /// NOT the (deliberately stale) payload timestamp. This pins that a coalesced
     /// push cannot ship a stale last-writer-wins version, plus the
     /// handler -> pipeline -> client header threading.
     #[tokio::test]
-    async fn execute_push_stamps_origin_and_resolved_source_timestamp() {
+    async fn execute_push_stamps_resolved_source_timestamp() {
         crate::metrics_provider::init_for_tests();
         let mock_server = MockServer::start().await;
 
@@ -1033,11 +943,10 @@ mod tests {
                 .mount(&mock_server)
                 .await;
         }
-        // The PUT must carry the propagated origin + source timestamp; if a
-        // header is absent or wrong, this mock does not match and the push fails.
+        // The PUT must carry the source timestamp; if the header is absent or
+        // wrong, this mock does not match and the push fails.
         Mock::given(method("PUT"))
             .and(path(format!("/v2/{NAMESPACE}/manifests/v1")))
-            .and(header(X_ANGOS_ORIGIN, "instance-a"))
             .and(header(X_ANGOS_SOURCE_TIMESTAMP, expected_ts.as_str()))
             .respond_with(
                 ResponseTemplate::new(201)
@@ -1061,9 +970,9 @@ mod tests {
             .build()
             .unwrap();
 
-        // `sample_payload()` carries origin = "instance-a" (a FOREIGN inbound
-        // origin) and a deliberately stale source_ts ("2026-06-03..."), which the
-        // handler must IGNORE in favour of the resolved tag's created_at.
+        // `sample_payload()` carries a deliberately stale source_ts
+        // ("2026-06-03..."), which the handler must IGNORE in favour of the
+        // resolved tag's created_at.
         let envelope = build_envelope(&sample_payload()).unwrap();
         handler.execute(&envelope).await.unwrap();
         // wiremock `.expect(1)` on the header-matched PUT is verified on drop.
@@ -1143,7 +1052,6 @@ mod tests {
             .unwrap();
 
         let mut payload = sample_payload();
-        payload.origin = None;
         payload.source_ts = None;
         let envelope = build_envelope(&payload).unwrap();
         handler.execute(&envelope).await.unwrap();
@@ -1589,8 +1497,6 @@ mod tests {
 
         let mut payload = sample_payload();
         payload.downstream = downstream.to_string();
-        // origin must NOT be a known downstream id, so the loop filter passes.
-        payload.origin = None;
         let envelope = build_envelope(&payload).unwrap();
         let tx = handler
             .execute(&envelope)

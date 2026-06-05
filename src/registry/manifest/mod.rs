@@ -37,16 +37,13 @@ fn manifest_event(
     digest: Option<String>,
     reference: &Reference,
     actor: Option<EventActor>,
-    origin: Option<String>,
 ) -> Event {
     Event::new(kind, namespace.to_string(), repository)
         .digest(digest)
         .reference(Some(reference.to_string()))
         .actor(actor)
-        .origin(origin)
 }
 
-#[allow(clippy::too_many_arguments)]
 fn tag_event(
     kind: EventKind,
     namespace: &Namespace,
@@ -55,14 +52,12 @@ fn tag_event(
     reference: &Reference,
     tag: &str,
     actor: Option<EventActor>,
-    origin: Option<String>,
 ) -> Event {
     Event::new(kind, namespace.to_string(), repository)
         .digest(digest)
         .reference(Some(reference.to_string()))
         .tag(Some(tag.to_string()))
         .actor(actor)
-        .origin(origin)
 }
 
 impl Registry {
@@ -372,7 +367,6 @@ impl Registry {
     pub async fn delete_manifest(
         &self,
         actor: Option<EventActor>,
-        origin: Option<String>,
         source_ts: Option<DateTime<Utc>>,
         namespace: &Namespace,
         reference: &Reference,
@@ -434,7 +428,6 @@ impl Registry {
             digest_str.clone(),
             reference,
             actor.clone(),
-            origin.clone(),
         )];
 
         if let Reference::Tag(tag) = reference {
@@ -446,7 +439,6 @@ impl Registry {
                 reference,
                 tag,
                 actor,
-                origin.clone(),
             ));
         }
 
@@ -466,7 +458,6 @@ impl Registry {
                 REPLICATION_DELETE_MANIFEST_KIND,
                 tag,
                 dispatch_digest,
-                origin,
             )
             .await;
         }
@@ -620,12 +611,10 @@ impl Registry {
     }
 
     /// Reads the body stream, calls `put_manifest`, and returns the domain response.
-    #[allow(clippy::too_many_arguments)]
     #[instrument(skip(self, body_stream, actor))]
     pub async fn accept_put_manifest<S>(
         &self,
         actor: Option<EventActor>,
-        origin: Option<String>,
         source_ts: Option<DateTime<Utc>>,
         namespace: &Namespace,
         reference: Reference,
@@ -679,7 +668,6 @@ impl Registry {
             digest_str.clone(),
             &reference,
             actor.clone(),
-            origin.clone(),
         ));
 
         if let Reference::Tag(tag) = &reference {
@@ -691,7 +679,6 @@ impl Registry {
                 &reference,
                 tag,
                 actor,
-                origin.clone(),
             ));
         }
 
@@ -737,7 +724,6 @@ impl Registry {
                     REPLICATION_PUSH_MANIFEST_KIND,
                     tag,
                     Some(&digest),
-                    origin,
                 )
                 .await;
             }

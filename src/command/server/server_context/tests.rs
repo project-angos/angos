@@ -176,7 +176,6 @@ pub fn create_test_event() -> Event {
         reference: Some("sha256:abc123".to_string()),
         tag: None,
         actor: None,
-        origin: None,
         repository: "test-repo".to_string(),
     }
 }
@@ -565,7 +564,6 @@ async fn test_dispatch_event_with_no_dispatcher() {
         reference: Some("sha256:abc123".to_string()),
         tag: None,
         actor: None,
-        origin: None,
         repository: "test-repo".to_string(),
     };
 
@@ -622,7 +620,6 @@ async fn test_dispatch_event_delivers_to_webhook() {
         reference: Some("sha256:abc123".to_string()),
         tag: None,
         actor: None,
-        origin: None,
         repository: "test-repo".to_string(),
     };
 
@@ -678,7 +675,6 @@ async fn test_dispatch_event_required_webhook_failure_returns_error() {
         reference: Some("sha256:abc123".to_string()),
         tag: None,
         actor: None,
-        origin: None,
         repository: "test-repo".to_string(),
     };
 
@@ -745,7 +741,6 @@ async fn test_server_context_shutdown_drains_in_flight_async_delivery() {
         reference: Some("sha256:abc123".to_string()),
         tag: None,
         actor: None,
-        origin: None,
         repository: "test-repo".to_string(),
     };
 
@@ -811,7 +806,6 @@ async fn test_server_context_shutdown_rejects_new_async_dispatches() {
         reference: Some("sha256:abc123".to_string()),
         tag: None,
         actor: None,
-        origin: None,
         repository: "test-repo".to_string(),
     };
 
@@ -1077,7 +1071,6 @@ fn make_event(id: Uuid) -> Event {
         reference: Some("sha256:abc123".to_string()),
         tag: None,
         actor: None,
-        origin: None,
         repository: "test-repo".to_string(),
     }
 }

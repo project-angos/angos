@@ -174,7 +174,6 @@ async fn tag_push_emits_manifest_push_and_tag_create_events() {
         .accept_put_manifest(
             None,
             None,
-            None,
             &namespace,
             Reference::Tag("latest".to_string()),
             mime_type,
@@ -223,7 +222,6 @@ async fn digest_push_suppresses_tag_create_event() {
         .accept_put_manifest(
             None,
             None,
-            None,
             &namespace,
             Reference::Tag("seed".to_string()),
             mime_type.clone(),
@@ -243,7 +241,6 @@ async fn digest_push_suppresses_tag_create_event() {
     let response = fixture
         .registry
         .accept_put_manifest(
-            None,
             None,
             None,
             &namespace,
@@ -287,7 +284,6 @@ async fn tag_delete_emits_manifest_delete_and_tag_delete_events() {
         .accept_put_manifest(
             None,
             None,
-            None,
             &namespace,
             Reference::Tag("v1".to_string()),
             mime_type,
@@ -299,7 +295,7 @@ async fn tag_delete_emits_manifest_delete_and_tag_delete_events() {
     let reference = Reference::Tag("v1".to_string());
     let response = fixture
         .registry
-        .delete_manifest(None, None, None, &namespace, &reference)
+        .delete_manifest(None, None, &namespace, &reference)
         .await
         .expect("delete_manifest");
 
@@ -338,7 +334,6 @@ async fn digest_delete_suppresses_tag_delete_event() {
         .accept_put_manifest(
             None,
             None,
-            None,
             &namespace,
             Reference::Tag("to-delete".to_string()),
             mime_type,
@@ -357,7 +352,7 @@ async fn digest_delete_suppresses_tag_delete_event() {
     let reference = Reference::Digest(digest);
     let response = fixture
         .registry
-        .delete_manifest(None, None, None, &namespace, &reference)
+        .delete_manifest(None, None, &namespace, &reference)
         .await
         .expect("delete_manifest");
 
@@ -394,7 +389,6 @@ async fn tag_push_event_payload_has_all_required_fields() {
     let response = fixture
         .registry
         .accept_put_manifest(
-            None,
             None,
             None,
             &namespace,
@@ -466,7 +460,6 @@ async fn tag_push_events_delivered_to_webhook_endpoint() {
         .accept_put_manifest(
             None,
             None,
-            None,
             &namespace,
             Reference::Tag("webhook-test".to_string()),
             mime_type,
@@ -507,7 +500,6 @@ async fn digest_push_events_delivered_to_webhook_endpoint() {
         .accept_put_manifest(
             None,
             None,
-            None,
             &namespace,
             Reference::Tag("seed2".to_string()),
             mime_type.clone(),
@@ -526,7 +518,6 @@ async fn digest_push_events_delivered_to_webhook_endpoint() {
     let response = fixture
         .registry
         .accept_put_manifest(
-            None,
             None,
             None,
             &namespace,
@@ -564,7 +555,6 @@ async fn digest_push_events_delivered_to_webhook_endpoint() {
 // ---------------------------------------------------------------------------
 
 const REPLICATION_REPO: &str = "test-repo";
-const REPLICATION_INSTANCE: &str = "instance-local";
 
 fn downstream_client() -> Arc<RegistryClient> {
     let backend = cache::Config::Memory.to_backend().unwrap();
@@ -642,9 +632,7 @@ impl ReplicationFixture {
 
         let job_store: Arc<JobStore> = Arc::new(JobStore::new(store, "test"));
 
-        let config = RegistryConfig::default()
-            .instance_id(REPLICATION_INSTANCE.to_string())
-            .job_queue(job_store.clone());
+        let config = RegistryConfig::default().job_queue(job_store.clone());
         let registry = Registry::new(blob_store, metadata_store, resolver, config).unwrap();
 
         Self {
@@ -672,54 +660,8 @@ async fn sole_pending_payload(job_store: &JobStore) -> ReplicationPushPayload {
     serde_json::from_value(envelope.payload).expect("decode ReplicationPushPayload")
 }
 
-/// A tagged manifest push to a namespace served by a matching `event+reconcile`
-/// downstream enqueues exactly one replication push job, and stamps this
-/// instance's id as the outgoing `origin` on the emitted events.
-#[tokio::test]
-async fn tag_push_enqueues_replication_job_and_stamps_origin() {
-    crate::metrics_provider::init_for_tests();
-    let fixture = ReplicationFixture::new();
-    let namespace = Namespace::new(REPLICATION_REPO).unwrap();
-    let (manifest_bytes, mime_type) = test_manifest_bytes(&fixture.registry, &namespace).await;
-
-    let response = fixture
-        .registry
-        .accept_put_manifest(
-            None,
-            Some(REPLICATION_INSTANCE.to_string()),
-            None,
-            &namespace,
-            Reference::Tag("latest".to_string()),
-            mime_type,
-            Cursor::new(manifest_bytes),
-        )
-        .await
-        .expect("accept_put_manifest");
-
-    // The inbound origin equals this instance, so the loop filter drops the job.
-    assert_eq!(
-        fixture
-            .job_store
-            .count_pending(REPLICATION_QUEUE, 0)
-            .await
-            .unwrap(),
-        0,
-        "a self-origin push must be dropped before enqueue"
-    );
-
-    // origin is propagated verbatim onto every emitted event.
-    assert!(
-        response
-            .events
-            .iter()
-            .all(|e| e.origin.as_deref() == Some(REPLICATION_INSTANCE)),
-        "every event must carry the propagated origin; got {:?}",
-        response.events
-    );
-}
-
-/// A fresh local tagged push (no inbound origin) enqueues one replication job and
-/// stamps this instance's own id as the events' `origin`.
+/// A fresh local tagged push enqueues one replication job for the matching
+/// `event+reconcile` downstream.
 #[tokio::test]
 async fn fresh_local_tag_push_enqueues_replication_job() {
     crate::metrics_provider::init_for_tests();
@@ -727,10 +669,9 @@ async fn fresh_local_tag_push_enqueues_replication_job() {
     let namespace = Namespace::new(REPLICATION_REPO).unwrap();
     let (manifest_bytes, mime_type) = test_manifest_bytes(&fixture.registry, &namespace).await;
 
-    let response = fixture
+    fixture
         .registry
         .accept_put_manifest(
-            None,
             None,
             None,
             &namespace,
@@ -751,82 +692,18 @@ async fn fresh_local_tag_push_enqueues_replication_job() {
         "a fresh local tagged push must enqueue exactly one replication job"
     );
 
-    // A fresh local change leaves no inbound origin on the events.
-    assert!(
-        response.events.iter().all(|e| e.origin.is_none()),
-        "a fresh local change must not stamp an inbound origin on events; got {:?}",
-        response.events
-    );
-
     // The enqueued payload describes a manifest-push to the configured downstream
-    // for the pushed tag, stamps this instance as the origin, and carries a
-    // populated source_ts. This proves the full handler -> accept_put_manifest ->
-    // dispatch_replication -> envelope path threads the right fields.
+    // for the pushed tag and carries a populated source_ts. This proves the full
+    // handler -> accept_put_manifest -> dispatch_replication -> envelope path
+    // threads the right fields.
     let payload = sole_pending_payload(&fixture.job_store).await;
     assert_eq!(payload.downstream, "eu-region");
     assert_eq!(payload.namespace, REPLICATION_REPO);
     assert_eq!(payload.tag.as_deref(), Some("latest"));
     assert_eq!(payload.kind, REPLICATION_PUSH_MANIFEST_KIND);
-    assert_eq!(
-        payload.origin.as_deref(),
-        Some(REPLICATION_INSTANCE),
-        "a fresh local change stamps this instance's own id as the payload origin"
-    );
     assert!(
         payload.source_ts.is_some(),
         "the payload must carry a source_ts for receiver-side LWW"
-    );
-}
-
-/// A tagged push carrying a foreign inbound origin enqueues exactly one job whose
-/// payload propagates that origin verbatim (not overwritten with the local id),
-/// and stamps the same foreign origin onto every emitted event.
-#[tokio::test]
-async fn foreign_origin_tag_push_propagates_origin_verbatim() {
-    crate::metrics_provider::init_for_tests();
-    let fixture = ReplicationFixture::new();
-    let namespace = Namespace::new(REPLICATION_REPO).unwrap();
-    let (manifest_bytes, mime_type) = test_manifest_bytes(&fixture.registry, &namespace).await;
-
-    let foreign = "instance-foreign";
-    let response = fixture
-        .registry
-        .accept_put_manifest(
-            None,
-            Some(foreign.to_string()),
-            None,
-            &namespace,
-            Reference::Tag("latest".to_string()),
-            mime_type,
-            Cursor::new(manifest_bytes),
-        )
-        .await
-        .expect("accept_put_manifest");
-
-    assert_eq!(
-        fixture
-            .job_store
-            .count_pending(REPLICATION_QUEUE, 0)
-            .await
-            .unwrap(),
-        1,
-        "a foreign-origin push (not self/known) must still enqueue one job"
-    );
-
-    let payload = sole_pending_payload(&fixture.job_store).await;
-    assert_eq!(
-        payload.origin.as_deref(),
-        Some(foreign),
-        "the foreign origin must be propagated verbatim onto the payload"
-    );
-
-    assert!(
-        response
-            .events
-            .iter()
-            .all(|e| e.origin.as_deref() == Some(foreign)),
-        "every event must carry the propagated foreign origin; got {:?}",
-        response.events
     );
 }
 
@@ -865,7 +742,6 @@ async fn tag_delete_enqueues_replication_delete_job() {
     fixture
         .registry
         .delete_manifest(
-            None,
             None,
             None,
             &namespace,

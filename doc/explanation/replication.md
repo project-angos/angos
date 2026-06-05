@@ -64,12 +64,9 @@ Because the queue is at-least-once, every replication push must be idempotent. T
 
 ## Loop Prevention
 
-In an active-active mesh, a push from A to B must not bounce back from B to A, and an A↔B↔C topology must not loop indefinitely. Two mechanisms prevent this:
+In an active-active mesh, a push from A to B must not bounce back from B to A, and an A↔B↔C topology must not loop indefinitely. Angos prevents this with **no-op suppression**: an instance re-dispatches a replication push or delete only when the inbound write actually **changed local state**.
 
-- **Instance identity.** Each Angos instance persists a stable UUID once at `_registry/instance_id` and reuses it across restarts.
-- **Origin propagation.** Every outgoing replication request carries an `X-Angos-Origin` header set to the **original author's** instance-id, propagated verbatim across every hop. The receiver records the change as originating from that instance.
-
-When a change arrives carrying an origin equal to the receiver's own instance-id, the receiver drops it before enqueueing a re-push. Because the origin is the original author -- not the immediate sender -- this also prevents loops in multi-hop meshes: a change authored by A and relayed A→B→C never circles back to A.
+When B receives A's push and applies it, B's tag genuinely moves, so B forwards the change onward. When that change circles back to a node that already holds it (the tag already resolves to that digest, or the deleted reference is already absent) the write is a no-op, so the node does **not** re-dispatch it and the cycle terminates. This holds for any topology, including 3+-node meshes whose cycle does not pass through the original author. (A transient failure to read the prior state fails open, meaning the change is re-dispatched, so a genuine change is never silently suppressed.)
 
 As a belt-and-suspenders measure, the push pipeline HEADs the manifest on the downstream before transferring the body; a matching digest means no transfer occurs.
 

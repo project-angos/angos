@@ -11,7 +11,7 @@ use hyper::{
 use crate::{
     command::server::{error::Error, request::RequestHeaders, response_body::ResponseBody},
     registry::BlobRange,
-    replication::{X_ANGOS_ORIGIN, X_ANGOS_SOURCE_TIMESTAMP},
+    replication::X_ANGOS_SOURCE_TIMESTAMP,
 };
 
 #[test]
@@ -660,51 +660,6 @@ fn test_content_type_valid() {
         content_type,
         Some("application/vnd.oci.image.manifest.v1+json".to_string())
     );
-}
-
-#[test]
-fn test_origin_present() {
-    let request = Request::builder()
-        .header(X_ANGOS_ORIGIN, "instance-abc")
-        .body(())
-        .unwrap();
-    let (parts, ()) = request.into_parts();
-
-    let origin = RequestHeaders::new(&parts.headers).origin();
-    assert_eq!(origin, Some("instance-abc".to_string()));
-}
-
-#[test]
-fn test_origin_trims_whitespace() {
-    let request = Request::builder()
-        .header(X_ANGOS_ORIGIN, "  instance-abc  ")
-        .body(())
-        .unwrap();
-    let (parts, ()) = request.into_parts();
-
-    let origin = RequestHeaders::new(&parts.headers).origin();
-    assert_eq!(origin, Some("instance-abc".to_string()));
-}
-
-#[test]
-fn test_origin_missing() {
-    let request = Request::builder().body(()).unwrap();
-    let (parts, ()) = request.into_parts();
-
-    let origin = RequestHeaders::new(&parts.headers).origin();
-    assert_eq!(origin, None);
-}
-
-#[test]
-fn test_origin_empty_is_none() {
-    let request = Request::builder()
-        .header(X_ANGOS_ORIGIN, "   ")
-        .body(())
-        .unwrap();
-    let (parts, ()) = request.into_parts();
-
-    let origin = RequestHeaders::new(&parts.headers).origin();
-    assert_eq!(origin, None);
 }
 
 #[test]

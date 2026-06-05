@@ -140,14 +140,13 @@ removes tags pointing at the digest and removes the manifest body when no remain
 references it. Config and layer blobs remain owned by the namespace until they are deleted through
 the blob endpoint or scrubbed as orphans.
 
-#### Replication request headers
+#### Replication request header
 
-Manifest `PUT` and `DELETE` accept two optional replication headers, set automatically by Angos when
-mirroring a change to a configured downstream (they are not used by ordinary clients):
+Manifest `PUT` and `DELETE` accept an optional replication header, set automatically by Angos when
+mirroring a change to a configured downstream (it is not used by ordinary clients):
 
 | Header                     | Value                          | Purpose                                                                 |
 |----------------------------|--------------------------------|-------------------------------------------------------------------------|
-| `X-Angos-Origin`           | originating instance-id        | Loop prevention — propagated verbatim across hops; the receiver drops a change whose origin is itself. |
 | `X-Angos-Source-Timestamp` | event timestamp (RFC 3339)     | Last-writer-wins — for a **tag** reference the receiver compares it against the local tag's creation time and rejects the write with `409 REPLICATION_SUPERSEDED` when the local copy is strictly newer. |
 
 Last-writer-wins applies only to tag references (digest references are content-addressed, so there is

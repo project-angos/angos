@@ -8,7 +8,6 @@ use std::{
 use bytes::Bytes;
 use futures_util::stream::{self, StreamExt};
 use tracing::{debug, info, instrument, warn};
-use uuid::Uuid;
 
 use angos_tx_engine::{
     StorageError,
@@ -196,54 +195,6 @@ impl MetadataStore {
             .acquire(&keys)
             .await
             .map_err(|e| Error::Coordination(format!("blob-data lock acquire failed: {e}")))
-    }
-
-    /// Return this deployment's persisted instance identifier, generating and
-    /// persisting one on first call.
-    ///
-    /// The id is stored at [`path_builder::instance_id_path`] as a raw UTF-8
-    /// UUID v4 string. On a fresh store the first caller wins the
-    /// [`Mutation::PutIfAbsent`] CAS and returns the value it generated; a
-    /// racing concurrent boot loses the CAS (surfaced as
-    /// [`TxError::Precondition`]/[`TxError::Conflict`]) and re-reads the winner's
-    /// id, so every caller — across boots and across racing boots — observes the
-    /// same stable id.
-    ///
-    /// Wired into server setup so the registry can stamp and filter its own
-    /// replication origin.
-    pub async fn get_or_init_instance_id(&self) -> Result<String, Error> {
-        let path = path_builder::instance_id_path();
-
-        match self.store().get(&path).await {
-            Ok(data) => {
-                return String::from_utf8(data)
-                    .map_err(|e| Error::InvalidData(format!("instance_id not valid UTF-8: {e}")));
-            }
-            Err(StorageError::NotFound) => {}
-            Err(e) => return Err(e.into()),
-        }
-
-        let new_id = Uuid::new_v4().to_string();
-        let tx = Transaction::builder()
-            .mutation(Mutation::PutIfAbsent {
-                key: path.clone(),
-                body: Bytes::from(new_id.clone().into_bytes()),
-            })
-            .build();
-
-        match self.store().execute(tx).await {
-            Ok(_) => Ok(new_id),
-            // A racing boot persisted its own id first: re-read and adopt it so
-            // both processes converge on the same value.
-            Err(TxError::Precondition | TxError::Conflict) => {
-                let data = self.store().get(&path).await?;
-                String::from_utf8(data)
-                    .map_err(|e| Error::InvalidData(format!("instance_id not valid UTF-8: {e}")))
-            }
-            Err(e) => Err(Error::Coordination(format!(
-                "failed to persist instance_id: {e}"
-            ))),
-        }
     }
 
     // ── Cache helpers ─────────────────────────────────────────────────────
@@ -799,37 +750,5 @@ impl MetadataStore {
         if let Some(writer) = &self.access_time_writer {
             writer.flush(self).await;
         }
-    }
-}
-
-#[cfg(test)]
-mod instance_id_tests {
-    use std::sync::Arc;
-
-    use angos_storage::MemoryObjectStore;
-    use uuid::Uuid;
-
-    use crate::registry::{
-        metadata_store::MetadataStore,
-        test_utils::{locked_executor_over, metadata_store_over},
-    };
-
-    fn in_memory_store() -> Arc<MetadataStore> {
-        let object = Arc::new(MemoryObjectStore::new());
-        let executor = locked_executor_over(object.clone());
-        metadata_store_over(object, executor)
-    }
-
-    #[tokio::test]
-    async fn get_or_init_instance_id_is_idempotent() {
-        let store = in_memory_store();
-
-        let first = store.get_or_init_instance_id().await.unwrap();
-        let second = store.get_or_init_instance_id().await.unwrap();
-
-        assert!(!first.is_empty());
-        assert_eq!(first, second, "repeat calls must return the same id");
-        // It is a parseable UUID.
-        assert!(Uuid::parse_str(&first).is_ok());
     }
 }

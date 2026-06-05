@@ -34,7 +34,6 @@ pub fn create_test_event() -> Event {
         reference: Some("sha256:abc123".to_string()),
         tag: Some("latest".to_string()),
         actor: None,
-        origin: None,
         repository: "docker-hub".to_string(),
     }
 }

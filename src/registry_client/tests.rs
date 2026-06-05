@@ -16,7 +16,7 @@ use crate::{
         auth::{token_cache_key, token_index_cache_key},
         get_upstream_namespace,
     },
-    replication::{REPLICATION_SUPERSEDED_CODE, X_ANGOS_ORIGIN, X_ANGOS_SOURCE_TIMESTAMP},
+    replication::{REPLICATION_SUPERSEDED_CODE, X_ANGOS_SOURCE_TIMESTAMP},
     secret::Secret,
 };
 
@@ -1163,7 +1163,7 @@ async fn test_put_manifest_with_oci_subject() {
     let location = client.get_manifest_path("", "test", &Reference::Tag("latest".to_string()));
 
     let result = client
-        .put_manifest(&location, Some(media_type), manifest.to_vec(), None, None)
+        .put_manifest(&location, Some(media_type), manifest.to_vec(), None)
         .await
         .unwrap();
 
@@ -1190,7 +1190,7 @@ async fn test_put_manifest_without_oci_subject() {
     let location = client.get_manifest_path("", "test", &Reference::Tag("v1".to_string()));
 
     let result = client
-        .put_manifest(&location, Some(media_type), manifest.to_vec(), None, None)
+        .put_manifest(&location, Some(media_type), manifest.to_vec(), None)
         .await
         .unwrap();
 
@@ -1211,7 +1211,6 @@ async fn test_put_manifest_stamps_replication_headers() {
 
     Mock::given(method("PUT"))
         .and(path("/v2/test/manifests/v1"))
-        .and(header(X_ANGOS_ORIGIN, "instance-a"))
         .and(header(X_ANGOS_SOURCE_TIMESTAMP, "2026-06-03T00:00:00Z"))
         .respond_with(ResponseTemplate::new(201).insert_header(DOCKER_CONTENT_DIGEST, digest))
         .expect(1)
@@ -1226,7 +1225,6 @@ async fn test_put_manifest_stamps_replication_headers() {
             &location,
             Some(media_type),
             manifest.to_vec(),
-            Some("instance-a"),
             Some("2026-06-03T00:00:00Z"),
         )
         .await
@@ -1249,13 +1247,7 @@ async fn test_put_manifest_superseded_409() {
     let location = client.get_manifest_path("", "test", &Reference::Tag("v1".to_string()));
 
     let result = client
-        .put_manifest(
-            &location,
-            Some("application/json"),
-            b"{}".to_vec(),
-            None,
-            None,
-        )
+        .put_manifest(&location, Some("application/json"), b"{}".to_vec(), None)
         .await
         .unwrap();
     assert!(result.superseded, "an LWW-superseded 409 sets superseded");
@@ -1277,13 +1269,7 @@ async fn test_put_manifest_non_superseded_409_is_error() {
     let location = client.get_manifest_path("", "test", &Reference::Tag("v1".to_string()));
 
     let result = client
-        .put_manifest(
-            &location,
-            Some("application/json"),
-            b"{}".to_vec(),
-            None,
-            None,
-        )
+        .put_manifest(&location, Some("application/json"), b"{}".to_vec(), None)
         .await;
     assert!(matches!(result, Err(Error::Internal(_))));
 }
@@ -1303,7 +1289,7 @@ async fn test_delete_manifest_superseded_409() {
     let client = client_for(&mock_server);
     let location = client.get_manifest_path("", "test", &Reference::Tag("v1".to_string()));
 
-    let outcome = client.delete_manifest(&location, None, None).await.unwrap();
+    let outcome = client.delete_manifest(&location, None).await.unwrap();
     assert_eq!(outcome, DeleteManifestOutcome::Superseded);
 }
 
@@ -1326,7 +1312,7 @@ async fn test_delete_manifest() {
         &Reference::Digest(Digest::try_from(digest).unwrap()),
     );
 
-    let outcome = client.delete_manifest(&location, None, None).await.unwrap();
+    let outcome = client.delete_manifest(&location, None).await.unwrap();
     assert_eq!(outcome, DeleteManifestOutcome::Deleted);
 }
 
@@ -1343,7 +1329,7 @@ async fn test_delete_manifest_surfaces_error_status() {
     let client = client_for(&mock_server);
     let location = client.get_manifest_path("", "test", &Reference::Tag("latest".to_string()));
 
-    let result = client.delete_manifest(&location, None, None).await;
+    let result = client.delete_manifest(&location, None).await;
     assert!(matches!(result, Err(Error::Internal(_))));
 }
 

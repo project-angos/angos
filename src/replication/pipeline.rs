@@ -69,11 +69,9 @@ pub enum PushOutcome {
 /// children. Referenced blobs are `head_blob`-probed and only transferred when
 /// absent; the per-manifest blob fan-out is bounded by `max_concurrent_pushes`.
 ///
-/// `origin` is forwarded verbatim as the `X-Angos-Origin` header value so a
-/// multi-hop mesh attributes the change to its original author, and `source_ts`
-/// is forwarded as the `X-Angos-Source-Timestamp` header so the receiver can
-/// apply last-writer-wins. Both are stamped on every outgoing `put_manifest`
-/// (the primary manifest and the referrers-fallback index).
+/// `source_ts` is forwarded as the `X-Angos-Source-Timestamp` header so the
+/// receiver can apply last-writer-wins; it is stamped on every outgoing
+/// `put_manifest` (the primary manifest and the referrers-fallback index).
 ///
 /// 409 disambiguation: when the downstream rejects the push by last-writer-wins
 /// (a `409` whose OCI code is the replication-superseded code, surfaced by the
@@ -105,7 +103,6 @@ pub async fn push_manifest(
     tag: Option<&str>,
     body: Vec<u8>,
     max_concurrent_pushes: usize,
-    origin: Option<&str>,
     source_ts: Option<&str>,
 ) -> Result<PushOutcome, Error> {
     let parsed = parse_manifest_digests(&body, media_type.map(ToString::to_string).as_ref())
@@ -125,7 +122,6 @@ pub async fn push_manifest(
             None,
             child_body,
             max_concurrent_pushes,
-            origin,
             source_ts,
         ))
         .await?;
@@ -170,16 +166,14 @@ pub async fn push_manifest(
             "Downstream already holds this manifest; skipping PUT (converged)"
         );
         if parsed.subject.is_some() {
-            push_referrers_fallback(
-                downstream, namespace, digest, &parsed, &body, origin, source_ts,
-            )
-            .await?;
+            push_referrers_fallback(downstream, namespace, digest, &parsed, &body, source_ts)
+                .await?;
         }
         return Ok(PushOutcome::Pushed);
     }
 
     let result = downstream
-        .put_manifest(&location, media_type, body.clone(), origin, source_ts)
+        .put_manifest(&location, media_type, body.clone(), source_ts)
         .await
         .map_err(Error::Registry)?;
 
@@ -201,10 +195,7 @@ pub async fn push_manifest(
     //    (no `OCI-Subject` response header) is not auto-indexed, so push the
     //    referrers fallback tag manifest. OCI-1.1 downstreams index it for free.
     if parsed.subject.is_some() && result.subject.is_none() {
-        push_referrers_fallback(
-            downstream, namespace, digest, &parsed, &body, origin, source_ts,
-        )
-        .await?;
+        push_referrers_fallback(downstream, namespace, digest, &parsed, &body, source_ts).await?;
     }
 
     Ok(PushOutcome::Pushed)
@@ -371,14 +362,12 @@ async fn upload_into_session(
 /// `manifests[]` enumerate the referrer descriptors. A pushing client must GET
 /// the existing index, append its own referrer descriptor, then PUT the merged
 /// index — so a second referrer of the same subject does not clobber the first.
-#[allow(clippy::too_many_arguments)]
 async fn push_referrers_fallback(
     downstream: &RegistryClient,
     namespace: &str,
     digest: &Digest,
     parsed: &ParsedManifestDigests,
     body: &[u8],
-    origin: Option<&str>,
     source_ts: Option<&str>,
 ) -> Result<(), Error> {
     let Some(subject) = &parsed.subject else {
@@ -428,13 +417,7 @@ async fn push_referrers_fallback(
     })?;
 
     downstream
-        .put_manifest(
-            &location,
-            Some(OCI_INDEX_MEDIA_TYPE),
-            index_body,
-            origin,
-            source_ts,
-        )
+        .put_manifest(&location, Some(OCI_INDEX_MEDIA_TYPE), index_body, source_ts)
         .await
         .map_err(Error::Registry)?;
     Ok(())
@@ -475,9 +458,8 @@ fn referrer_descriptor(referrer_digest: &Digest, body: &[u8]) -> Value {
 
 /// Deletes the manifest bound to `reference` on the downstream.
 ///
-/// `origin` / `source_ts` are stamped as the `X-Angos-Origin` /
-/// `X-Angos-Source-Timestamp` headers so the receiver can loop-filter and apply
-/// last-writer-wins.
+/// `source_ts` is stamped as the `X-Angos-Source-Timestamp` header so the
+/// receiver can apply last-writer-wins.
 ///
 /// 409 disambiguation: an LWW-loser 409 (the receiver's copy is strictly newer,
 /// surfaced by the client as [`DeleteManifestOutcome::Superseded`]) is treated
@@ -499,12 +481,11 @@ pub async fn delete_manifest(
     downstream: &RegistryClient,
     namespace: &str,
     reference: &Reference,
-    origin: Option<&str>,
     source_ts: Option<&str>,
 ) -> Result<PushOutcome, Error> {
     let location = downstream.get_manifest_path("", namespace, reference);
     let outcome = downstream
-        .delete_manifest(&location, origin, source_ts)
+        .delete_manifest(&location, source_ts)
         .await
         .map_err(Error::Registry)?;
     match outcome {
@@ -552,7 +533,7 @@ mod tests {
         },
         registry_client::RegistryClient,
         replication::{
-            REPLICATION_SUPERSEDED_CODE, X_ANGOS_ORIGIN, X_ANGOS_SOURCE_TIMESTAMP,
+            REPLICATION_SUPERSEDED_CODE, X_ANGOS_SOURCE_TIMESTAMP,
             pipeline::{delete_manifest, push_manifest},
         },
         util::sha256,
@@ -726,7 +707,6 @@ mod tests {
             manifest_bytes,
             4,
             None,
-            None,
         )
         .await
         .unwrap();
@@ -780,7 +760,6 @@ mod tests {
             Some("v1"),
             manifest_bytes,
             4,
-            None,
             None,
         )
         .await
@@ -859,7 +838,6 @@ mod tests {
             Some("v1"),
             index_bytes,
             4,
-            None,
             None,
         )
         .await
@@ -958,7 +936,6 @@ mod tests {
             Some("v1"),
             manifest_bytes,
             4,
-            None,
             None,
         )
         .await
@@ -1063,7 +1040,6 @@ mod tests {
             manifest_bytes,
             4,
             None,
-            None,
         )
         .await
         .expect("a rejected mount must fall back to a normal upload");
@@ -1092,17 +1068,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn push_manifest_stamps_origin_and_source_timestamp_headers() {
+    async fn push_manifest_stamps_source_timestamp_header() {
         crate::metrics_provider::init_for_tests();
         let mock_server = MockServer::start().await;
         let dir = TempDir::new().unwrap();
         let (blob_store, metadata_store, store) = test_blob_store(dir.path().to_str().unwrap());
         let (manifest_digest, manifest_bytes) = seed_blobless_manifest(&store).await;
 
-        // The PUT must carry BOTH replication headers with the expected values.
+        // The PUT must carry the source-timestamp header with the expected value.
         Mock::given(method("PUT"))
             .and(path(format!("/v2/{NAMESPACE}/manifests/v1")))
-            .and(header(X_ANGOS_ORIGIN, "instance-a"))
             .and(header(X_ANGOS_SOURCE_TIMESTAMP, "2026-06-03T00:00:00Z"))
             .respond_with(
                 ResponseTemplate::new(201)
@@ -1122,15 +1097,14 @@ mod tests {
             Some("v1"),
             manifest_bytes,
             4,
-            Some("instance-a"),
             Some("2026-06-03T00:00:00Z"),
         )
         .await
         .unwrap();
 
-        // `.expect(1)` (verified on drop) only matches when both headers are
-        // present with the expected values; a missing/wrong header => no match
-        // => the PUT would 404 and the push would error.
+        // `.expect(1)` (verified on drop) only matches when the header is present
+        // with the expected value; a missing/wrong header => no match => the PUT
+        // would 404 and the push would error.
         drop(mock_server);
     }
 
@@ -1167,7 +1141,6 @@ mod tests {
             Some("v1"),
             manifest_bytes,
             4,
-            None,
             None,
         )
         .await
@@ -1220,7 +1193,6 @@ mod tests {
             manifest_bytes,
             4,
             None,
-            None,
         )
         .await
         .expect("a divergent downstream digest must still PUT");
@@ -1261,7 +1233,6 @@ mod tests {
             Some("v1"),
             manifest_bytes,
             4,
-            None,
             None,
         )
         .await
@@ -1304,7 +1275,6 @@ mod tests {
             Some("v1"),
             manifest_bytes,
             4,
-            Some("instance-a"),
             Some("2026-06-03T00:00:00Z"),
         )
         .await
@@ -1342,7 +1312,6 @@ mod tests {
             manifest_bytes,
             4,
             None,
-            None,
         )
         .await;
         assert!(
@@ -1354,15 +1323,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn delete_manifest_stamps_headers_and_distinguishes_superseded() {
+    async fn delete_manifest_stamps_header_and_distinguishes_superseded() {
         crate::metrics_provider::init_for_tests();
         let mock_server = MockServer::start().await;
 
-        // A delete carrying both replication headers; respond with an
+        // A delete carrying the source-timestamp header; respond with an
         // LWW-superseded 409 => the pipeline treats it as success.
         Mock::given(method("DELETE"))
             .and(path(format!("/v2/{NAMESPACE}/manifests/v1")))
-            .and(header(X_ANGOS_ORIGIN, "instance-a"))
             .and(header(X_ANGOS_SOURCE_TIMESTAMP, "2026-06-03T00:00:00Z"))
             .respond_with(
                 ResponseTemplate::new(409)
@@ -1376,7 +1344,6 @@ mod tests {
             &downstream_client(&mock_server.uri()),
             NAMESPACE,
             &Reference::Tag("v1".to_string()),
-            Some("instance-a"),
             Some("2026-06-03T00:00:00Z"),
         )
         .await
@@ -1401,7 +1368,6 @@ mod tests {
             &downstream_client(&mock_server.uri()),
             NAMESPACE,
             &Reference::Tag("v1".to_string()),
-            None,
             None,
         )
         .await;

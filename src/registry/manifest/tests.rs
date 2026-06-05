@@ -560,13 +560,7 @@ async fn test_delete_manifest() {
 
         // Test delete manifest by tag
         registry
-            .delete_manifest(
-                None,
-                None,
-                None,
-                namespace,
-                &Reference::Tag(tag.to_string()),
-            )
+            .delete_manifest(None, None, namespace, &Reference::Tag(tag.to_string()))
             .await
             .unwrap();
 
@@ -587,7 +581,6 @@ async fn test_delete_manifest() {
         // Test delete manifest by digest
         registry
             .delete_manifest(
-                None,
                 None,
                 None,
                 namespace,
@@ -660,7 +653,6 @@ async fn delete_manifest_then_delete_uploaded_blobs() {
 
         registry
             .delete_manifest(
-                None,
                 None,
                 None,
                 namespace,
@@ -861,7 +853,6 @@ async fn accept_put_manifest_rejects_body_above_limit() {
         .accept_put_manifest(
             None,
             None,
-            None,
             namespace,
             Reference::Tag("latest".to_string()),
             "application/vnd.oci.image.manifest.v1+json".to_string(),
@@ -1055,7 +1046,6 @@ async fn test_handle_put_manifest() {
             .accept_put_manifest(
                 None,
                 None,
-                None,
                 namespace,
                 Reference::Tag(tag.to_string()),
                 media_type.clone(),
@@ -1109,13 +1099,7 @@ async fn test_handle_delete_manifest() {
             .unwrap();
 
         registry
-            .delete_manifest(
-                None,
-                None,
-                None,
-                namespace,
-                &Reference::Tag(tag.to_string()),
-            )
+            .delete_manifest(None, None, namespace, &Reference::Tag(tag.to_string()))
             .await
             .unwrap();
 
@@ -1228,7 +1212,6 @@ async fn test_delete_manifest_by_digest_removes_multiple_tags() {
             .delete_manifest(
                 None,
                 None,
-                None,
                 namespace,
                 &Reference::Digest(header_digest(&response.headers)),
             )
@@ -1320,7 +1303,6 @@ async fn test_delete_manifest_by_digest_preserves_unrelated_tags() {
 
         registry
             .delete_manifest(
-                None,
                 None,
                 None,
                 namespace,
@@ -1418,7 +1400,6 @@ async fn test_delete_manifest_with_many_tags() {
 
         registry
             .delete_manifest(
-                None,
                 None,
                 None,
                 namespace,
@@ -1656,19 +1637,12 @@ async fn test_delete_manifest_no_tags_by_digest() {
             .unwrap();
 
         registry
-            .delete_manifest(
-                None,
-                None,
-                None,
-                namespace,
-                &Reference::Tag("temp".to_string()),
-            )
+            .delete_manifest(None, None, namespace, &Reference::Tag("temp".to_string()))
             .await
             .unwrap();
 
         registry
             .delete_manifest(
-                None,
                 None,
                 None,
                 namespace,
@@ -2192,13 +2166,7 @@ async fn delete_manifest_removes_links_and_blob_data() {
 
     // Delete by digest.
     registry
-        .delete_manifest(
-            None,
-            None,
-            None,
-            &namespace,
-            &Reference::Digest(digest.clone()),
-        )
+        .delete_manifest(None, None, &namespace, &Reference::Digest(digest.clone()))
         .await
         .unwrap();
 
@@ -2224,7 +2192,6 @@ async fn seed_tag(registry: &Registry, namespace: &Namespace, tag: &str) -> (Vec
     let (content, media_type) = create_test_manifest(registry, namespace).await;
     registry
         .accept_put_manifest(
-            None,
             None,
             None,
             namespace,
@@ -2265,7 +2232,6 @@ async fn accept_put_manifest_rejects_lww_older_source_ts() {
     let result = registry
         .accept_put_manifest(
             None,
-            Some("instance-b".to_string()),
             Some(older),
             namespace,
             Reference::Tag(tag.to_string()),
@@ -2295,7 +2261,6 @@ async fn accept_put_manifest_accepts_lww_newer_source_ts() {
     registry
         .accept_put_manifest(
             None,
-            Some("instance-b".to_string()),
             Some(newer),
             namespace,
             Reference::Tag(tag.to_string()),
@@ -2324,7 +2289,6 @@ async fn accept_put_manifest_accepts_lww_equal_source_ts() {
     registry
         .accept_put_manifest(
             None,
-            Some("instance-b".to_string()),
             Some(created_at),
             namespace,
             Reference::Tag(tag.to_string()),
@@ -2349,7 +2313,6 @@ async fn accept_put_manifest_accepts_lww_when_local_absent() {
     registry
         .accept_put_manifest(
             None,
-            Some("instance-b".to_string()),
             Some(very_old),
             namespace,
             Reference::Tag(tag.to_string()),
@@ -2373,7 +2336,6 @@ async fn accept_put_manifest_without_source_ts_skips_lww() {
     // local tag's age.
     registry
         .accept_put_manifest(
-            None,
             None,
             None,
             namespace,
@@ -2400,7 +2362,6 @@ async fn accept_put_manifest_digest_reference_skips_lww() {
     registry
         .accept_put_manifest(
             None,
-            Some("instance-b".to_string()),
             Some(very_old),
             namespace,
             Reference::Digest(digest),
@@ -2425,7 +2386,6 @@ async fn delete_manifest_rejects_lww_older_source_ts() {
     let result = registry
         .delete_manifest(
             None,
-            Some("instance-b".to_string()),
             Some(older),
             namespace,
             &Reference::Tag(tag.to_string()),
@@ -2460,7 +2420,6 @@ async fn delete_manifest_accepts_lww_newer_source_ts() {
     registry
         .delete_manifest(
             None,
-            Some("instance-b".to_string()),
             Some(newer),
             namespace,
             &Reference::Tag(tag.to_string()),
@@ -2507,7 +2466,6 @@ async fn prune_delete_stamped_source_ts_suppressed_when_local_tag_newer_else_pro
     let result = registry
         .delete_manifest(
             None,
-            None,
             Some(reparsed),
             namespace,
             &Reference::Tag(tag.to_string()),
@@ -2534,7 +2492,6 @@ async fn prune_delete_stamped_source_ts_suppressed_when_local_tag_newer_else_pro
 
     registry
         .delete_manifest(
-            None,
             None,
             Some(reparsed),
             namespace,
@@ -2619,7 +2576,6 @@ mod noop_suppression_tests {
     const REPO: &str = "nginx";
     const NAMESPACE: &str = "nginx";
     const DOWNSTREAM: &str = "eu-region";
-    const LOCAL_INSTANCE: &str = "instance-local";
 
     fn downstream_client() -> Arc<RegistryClient> {
         let backend = cache::Config::Memory.to_backend().unwrap();
@@ -2684,9 +2640,7 @@ mod noop_suppression_tests {
         // enqueued envelopes; no drain is spawned, so nothing consumes them.
         let job_store: Arc<JobStore> = Arc::new(JobStore::new(store, "test"));
 
-        let config = RegistryConfig::default()
-            .instance_id(LOCAL_INSTANCE.to_string())
-            .job_queue(job_store.clone());
+        let config = RegistryConfig::default().job_queue(job_store.clone());
         let registry = Registry::new(blob_store, metadata_store, resolver, config).unwrap();
         (registry, job_store)
     }
@@ -2750,7 +2704,6 @@ mod noop_suppression_tests {
             .accept_put_manifest(
                 None,
                 None,
-                None,
                 &namespace,
                 Reference::Tag(tag.to_string()),
                 media_type.clone(),
@@ -2774,7 +2727,6 @@ mod noop_suppression_tests {
         registry
             .accept_put_manifest(
                 None,
-                Some("instance-b".to_string()),
                 None,
                 &namespace,
                 Reference::Tag(tag.to_string()),
@@ -2793,7 +2745,6 @@ mod noop_suppression_tests {
         let (content_b, media_type_b) = create_second_manifest(&registry, &namespace).await;
         registry
             .accept_put_manifest(
-                None,
                 None,
                 None,
                 &namespace,
@@ -2827,7 +2778,6 @@ mod noop_suppression_tests {
             .accept_put_manifest(
                 None,
                 None,
-                None,
                 &namespace,
                 Reference::Digest(digest.clone()),
                 media_type.clone(),
@@ -2845,7 +2795,6 @@ mod noop_suppression_tests {
         registry
             .accept_put_manifest(
                 None,
-                Some("instance-b".to_string()),
                 None,
                 &namespace,
                 Reference::Digest(digest),
@@ -2875,7 +2824,6 @@ mod noop_suppression_tests {
             .accept_put_manifest(
                 None,
                 None,
-                None,
                 &namespace,
                 Reference::Tag(tag.to_string()),
                 media_type,
@@ -2887,13 +2835,7 @@ mod noop_suppression_tests {
 
         // Delete the existing tag: removed something => one delete job.
         registry
-            .delete_manifest(
-                None,
-                None,
-                None,
-                &namespace,
-                &Reference::Tag(tag.to_string()),
-            )
+            .delete_manifest(None, None, &namespace, &Reference::Tag(tag.to_string()))
             .await
             .expect("delete existing tag");
         assert_eq!(
@@ -2907,7 +2849,6 @@ mod noop_suppression_tests {
         let _ = registry
             .delete_manifest(
                 None,
-                Some("instance-b".to_string()),
                 None,
                 &namespace,
                 &Reference::Tag("does-not-exist".to_string()),
@@ -2937,7 +2878,6 @@ mod noop_suppression_tests {
             .accept_put_manifest(
                 None,
                 None,
-                None,
                 &namespace,
                 Reference::Tag(tag.to_string()),
                 media_type.clone(),
@@ -2952,7 +2892,6 @@ mod noop_suppression_tests {
         let response = registry
             .accept_put_manifest(
                 None,
-                Some("instance-b".to_string()),
                 None,
                 &namespace,
                 Reference::Tag(tag.to_string()),
@@ -2980,72 +2919,6 @@ mod noop_suppression_tests {
                 .iter()
                 .any(|e| e.kind == EventKind::TagCreate),
             "a no-op tag push must still emit TagCreate"
-        );
-    }
-
-    /// Mesh-convergence simulation: model node C in an A -> B -> C -> A cycle.
-    /// The write originated at A, so it carries `origin = instance-a` (a FOREIGN
-    /// origin that passes C's self-origin guard — that guard only drops C's own
-    /// id). Once C has converged (the inbound write matches local state), C must
-    /// NOT re-dispatch the write back toward A. This is the property that breaks
-    /// a 3+-node cycle whose loop does not pass through the original author, which
-    /// the self-origin guard alone cannot terminate. The first foreign-origin push
-    /// (state changes) DOES dispatch (C must still forward a genuine update around
-    /// the ring); the converged replay does not.
-    #[tokio::test]
-    async fn foreign_origin_noop_breaks_mesh_cycle() {
-        let dir = TempDir::new().unwrap();
-        let (registry, job_store) = build_registry(dir.path().to_str().unwrap());
-        let namespace = Namespace::new(NAMESPACE).unwrap();
-        let tag = "latest";
-        let origin_a = Some("instance-a".to_string());
-
-        let (content, media_type) = create_test_manifest(&registry, &namespace).await;
-
-        // First hop into C: A's write arrives (tag absent) => state changes => C
-        // forwards it onward (one job), continuing the ring.
-        registry
-            .accept_put_manifest(
-                None,
-                origin_a.clone(),
-                None,
-                &namespace,
-                Reference::Tag(tag.to_string()),
-                media_type.clone(),
-                Cursor::new(content.clone()),
-            )
-            .await
-            .expect("first foreign-origin push");
-        assert_eq!(
-            pending(&job_store).await,
-            1,
-            "a genuine foreign-origin update must still be forwarded around the ring"
-        );
-
-        // Drain so the tag's dedup index clears, isolating the gate from queue
-        // coalescing for the replay below.
-        drain_one(&job_store).await;
-        assert_eq!(pending(&job_store).await, 0, "queue drained");
-
-        // The same A-originated write comes back around the cycle (origin still
-        // instance-a, which passes C's self-origin guard). C has already
-        // converged, so it must drop it: the cycle terminates here.
-        registry
-            .accept_put_manifest(
-                None,
-                origin_a,
-                None,
-                &namespace,
-                Reference::Tag(tag.to_string()),
-                media_type,
-                Cursor::new(content),
-            )
-            .await
-            .expect("converged foreign-origin replay");
-        assert_eq!(
-            pending(&job_store).await,
-            0,
-            "a converged foreign-origin replay must NOT be re-dispatched (cycle broken)"
         );
     }
 }

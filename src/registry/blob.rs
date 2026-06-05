@@ -23,7 +23,7 @@ use crate::{
         job_store::JobEnvelope,
         metadata_store::{MetadataStore, link_kind::LinkKind},
     },
-    replication::{REPLICATION_QUEUE, ReplicationPushPayload, build_envelope, loop_filter},
+    replication::{REPLICATION_QUEUE, ReplicationPushPayload, build_envelope},
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -339,40 +339,21 @@ impl Registry {
     /// failures are logged and counted on `angos_job_queue_enqueue_failures_total`
     /// but never bubble up, so a scheduling glitch cannot fail the client's write.
     ///
-    /// Loop prevention runs BEFORE any enqueue: a job whose `origin` is this
-    /// instance (self-bounce) or a known downstream (downstream-bounce) is
-    /// dropped wholesale via [`loop_filter`]. The outgoing `origin` is the
-    /// inbound origin propagated verbatim, or — for a fresh local change — this
-    /// instance's own id.
+    /// Loop prevention is the caller's job: the manifest mutation methods only
+    /// call this when the write actually changed local state (no-op suppression),
+    /// so a converged replay is never re-dispatched and every mesh cycle
+    /// terminates.
     pub async fn dispatch_replication(
         &self,
         namespace: &Namespace,
         kind: &str,
         tag: Option<&str>,
         digest: Option<&Digest>,
-        origin: Option<String>,
     ) {
         let Some(repository) = self.resolver.resolve(namespace) else {
             return;
         };
 
-        // Known downstream instance-ids are not discovered yet (there is no
-        // handshake), so this is always empty and the self-origin guard inside
-        // `loop_filter` is what actually prevents A<->B loops today. The
-        // receiver-side `known_instance_ids` guard remains the seam for a future
-        // handshake; once per-downstream ids exist, the filter must run INSIDE
-        // the per-downstream loop below (filtering over the union here would
-        // over-suppress a mesh — an event whose origin is downstream X would be
-        // wrongly dropped for unrelated downstream Y).
-        let known: HashSet<String> = HashSet::new();
-
-        if !loop_filter(origin.as_deref(), &self.instance_id, &known) {
-            return;
-        }
-
-        // Propagate the inbound origin verbatim; a fresh local change is tagged
-        // with this instance's own id so downstream hops can detect loops.
-        let origin_id = origin.unwrap_or_else(|| self.instance_id.clone());
         // The change timestamp for receiver-side last-writer-wins. It is
         // authoritative for a DELETE (the moment the delete happened); a PUSH
         // re-derives it from the resolved tag's created_at at execute time, so a
@@ -392,7 +373,6 @@ impl Registry {
                 tag: tag.map(str::to_string),
                 digest: digest.map(ToString::to_string),
                 kind: kind.to_string(),
-                origin: Some(origin_id.clone()),
                 source_ts: Some(source_ts.clone()),
             };
             let envelope = match build_envelope(&payload) {
@@ -1457,7 +1437,6 @@ mod dispatch_replication_tests {
     const REPO: &str = "nginx";
     const NAMESPACE: &str = "nginx";
     const DOWNSTREAM: &str = "eu-region";
-    const LOCAL_INSTANCE: &str = "instance-local";
     const SAMPLE_DIGEST: &str =
         "sha256:1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef";
 
@@ -1529,9 +1508,7 @@ mod dispatch_replication_tests {
         // (and lets us count) enqueued envelopes. This test asserts enqueue only.
         let job_store: Arc<JobStore> = Arc::new(JobStore::new(store, "test"));
 
-        let config = RegistryConfig::default()
-            .instance_id(LOCAL_INSTANCE.to_string())
-            .job_queue(job_store.clone());
+        let config = RegistryConfig::default().job_queue(job_store.clone());
         let registry = Registry::new(blob_store, metadata_store, resolver, config).unwrap();
 
         (registry, job_store)
@@ -1561,8 +1538,8 @@ mod dispatch_replication_tests {
         build_registry_with(root, repository_with_downstream())
     }
 
-    /// A fresh local change (no inbound origin) enqueues exactly one push job on
-    /// the replication queue for the single matching downstream.
+    /// A fresh local change enqueues exactly one push job on the replication
+    /// queue for the single matching downstream.
     #[tokio::test]
     async fn dispatch_replication_enqueues_for_matching_downstream() {
         crate::metrics_provider::init_for_tests();
@@ -1578,7 +1555,6 @@ mod dispatch_replication_tests {
                 REPLICATION_PUSH_MANIFEST_KIND,
                 Some("v1"),
                 Some(&digest),
-                None,
             )
             .await;
 
@@ -1589,37 +1565,8 @@ mod dispatch_replication_tests {
         );
     }
 
-    /// A job whose inbound origin equals this instance is a self-bounce and is
-    /// dropped by the loop filter BEFORE any enqueue.
-    #[tokio::test]
-    async fn dispatch_replication_drops_self_origin_loop() {
-        crate::metrics_provider::init_for_tests();
-        let dir = TempDir::new().unwrap();
-        let (registry, job_store) = build_registry(dir.path().to_str().unwrap());
-
-        let namespace = Namespace::new(NAMESPACE).unwrap();
-        let digest: Digest = SAMPLE_DIGEST.parse().unwrap();
-
-        registry
-            .dispatch_replication(
-                &namespace,
-                REPLICATION_PUSH_MANIFEST_KIND,
-                Some("v1"),
-                Some(&digest),
-                Some(LOCAL_INSTANCE.to_string()),
-            )
-            .await;
-
-        assert_eq!(
-            job_store.count_pending(REPLICATION_QUEUE, 0).await.unwrap(),
-            0,
-            "a self-origin job must be dropped before enqueue"
-        );
-    }
-
     /// A fresh local push enqueues a job whose payload carries the correct
-    /// downstream/namespace/tag/digest/kind, this instance's own id as `origin`,
-    /// and a populated `source_ts`.
+    /// downstream/namespace/tag/digest/kind and a populated `source_ts`.
     #[tokio::test]
     async fn dispatch_replication_payload_is_well_formed() {
         crate::metrics_provider::init_for_tests();
@@ -1635,7 +1582,6 @@ mod dispatch_replication_tests {
                 REPLICATION_PUSH_MANIFEST_KIND,
                 Some("v1"),
                 Some(&digest),
-                None,
             )
             .await;
 
@@ -1645,45 +1591,10 @@ mod dispatch_replication_tests {
         assert_eq!(payload.tag.as_deref(), Some("v1"));
         assert_eq!(payload.digest.as_deref(), Some(SAMPLE_DIGEST));
         assert_eq!(payload.kind, REPLICATION_PUSH_MANIFEST_KIND);
-        assert_eq!(
-            payload.origin.as_deref(),
-            Some(LOCAL_INSTANCE),
-            "a fresh local change stamps this instance's own id as origin"
-        );
         let source_ts = payload.source_ts.expect("source_ts must be present");
         assert!(
             DateTime::parse_from_rfc3339(&source_ts).is_ok(),
             "source_ts must be a valid RFC 3339 timestamp; got {source_ts}"
-        );
-    }
-
-    /// A push carrying a foreign inbound origin (some other instance's id) is
-    /// kept by the loop filter, and that origin is propagated verbatim onto the
-    /// enqueued payload — it is NOT overwritten with the local instance's id.
-    #[tokio::test]
-    async fn dispatch_replication_propagates_foreign_origin_verbatim() {
-        crate::metrics_provider::init_for_tests();
-        let dir = TempDir::new().unwrap();
-        let (registry, job_store) = build_registry(dir.path().to_str().unwrap());
-
-        let namespace = Namespace::new(NAMESPACE).unwrap();
-        let digest: Digest = SAMPLE_DIGEST.parse().unwrap();
-
-        registry
-            .dispatch_replication(
-                &namespace,
-                REPLICATION_PUSH_MANIFEST_KIND,
-                Some("v1"),
-                Some(&digest),
-                Some("instance-foreign".to_string()),
-            )
-            .await;
-
-        let payload = sole_pending_payload(&job_store).await;
-        assert_eq!(
-            payload.origin.as_deref(),
-            Some("instance-foreign"),
-            "a foreign inbound origin must be propagated verbatim, not overwritten"
         );
     }
 
@@ -1707,7 +1618,6 @@ mod dispatch_replication_tests {
                 REPLICATION_PUSH_MANIFEST_KIND,
                 Some("v1"),
                 Some(&digest),
-                None,
             )
             .await;
 
@@ -1741,7 +1651,6 @@ mod dispatch_replication_tests {
                 REPLICATION_PUSH_MANIFEST_KIND,
                 Some("v1"),
                 Some(&digest),
-                None,
             )
             .await;
 

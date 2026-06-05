@@ -79,13 +79,6 @@ pub async fn build_registry(
     let repositories =
         bootstrap::repositories(&config.repository, &auth_cache, max_manifest_size_bytes).await?;
 
-    // Resolve (or initialize-once) this instance's replication instance-id from
-    // the shared metadata store; stamped on outgoing replication jobs.
-    let instance_id = metadata_store
-        .get_or_init_instance_id()
-        .await
-        .map_err(|e| Error::Initialization(e.to_string()))?;
-
     let mut registry_config = RegistryConfig::default()
         .update_pull_time(config.global.update_pull_time)
         .enable_blob_redirect(config.global.resolved_enable_blob_redirect())
@@ -94,8 +87,7 @@ pub async fn build_registry(
         .global_immutable_tags(config.global.immutable_tags)
         .global_immutable_tags_exclusions(config.global.immutable_tags_exclusions.clone())
         .max_concurrent_cache_jobs(config.global.max_concurrent_cache_jobs)
-        .max_concurrent_replication_jobs(config.global.max_concurrent_replication_jobs)
-        .instance_id(instance_id);
+        .max_concurrent_replication_jobs(config.global.max_concurrent_replication_jobs);
 
     // When [global.job_queue] is present, route cache-fill jobs through the
     // durable backend (so they survive restarts and let `angos worker` drain

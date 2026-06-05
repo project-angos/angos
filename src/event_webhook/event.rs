@@ -64,8 +64,6 @@ pub struct Event {
     pub tag: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub actor: Option<EventActor>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub origin: Option<String>,
     pub repository: String,
 }
 
@@ -81,7 +79,6 @@ impl Event {
             reference: None,
             tag: None,
             actor: None,
-            origin: None,
         }
     }
 
@@ -102,15 +99,6 @@ impl Event {
 
     pub fn actor(mut self, actor: Option<EventActor>) -> Self {
         self.actor = actor;
-        self
-    }
-
-    /// Stamp the originating instance-id onto the event.
-    ///
-    /// Threaded through the manifest push/delete paths so replication can filter
-    /// and propagate the event's origin.
-    pub fn origin(mut self, origin: Option<String>) -> Self {
-        self.origin = origin;
         self
     }
 }
@@ -230,7 +218,6 @@ mod tests {
             reference: Some("sha256:abc123".to_string()),
             tag: Some("latest".to_string()),
             actor: Some(actor),
-            origin: None,
             repository: "docker-hub".to_string(),
         };
 
@@ -262,7 +249,6 @@ mod tests {
             reference: None,
             tag: None,
             actor: None,
-            origin: None,
             repository: "internal".to_string(),
         };
 
@@ -291,7 +277,6 @@ mod tests {
                 username: Some("ci-bot".to_string()),
                 client_ip: None,
             }),
-            origin: None,
             repository: "production".to_string(),
         };
 
@@ -300,30 +285,6 @@ mod tests {
         assert!(json["actor"].get("id").is_none());
         assert_eq!(json["actor"]["username"], "ci-bot");
         assert!(json["actor"].get("client_ip").is_none());
-    }
-
-    #[test]
-    fn event_origin_setter_and_conditional_serialization() {
-        // Absent by default: skipped from JSON.
-        let without = Event::new(
-            EventKind::ManifestPush,
-            "library/nginx".to_string(),
-            "docker-hub".to_string(),
-        );
-        assert_eq!(without.origin, None);
-        let json = serde_json::to_value(&without).unwrap();
-        assert!(json.get("origin").is_none());
-
-        // Present once set: serialized.
-        let with = Event::new(
-            EventKind::ManifestPush,
-            "library/nginx".to_string(),
-            "docker-hub".to_string(),
-        )
-        .origin(Some("instance-abc".to_string()));
-        assert_eq!(with.origin, Some("instance-abc".to_string()));
-        let json = serde_json::to_value(&with).unwrap();
-        assert_eq!(json["origin"], "instance-abc");
     }
 
     #[test]

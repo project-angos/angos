@@ -87,48 +87,12 @@ impl AuthMiddleware for MtlsValidator {
 
 #[cfg(test)]
 pub mod tests {
-    use std::{
-        io::{self, Write},
-        sync::{Arc, Mutex},
-    };
+    use std::sync::Arc;
 
     use hyper::{Request, StatusCode};
-    use tracing::Level;
-    use tracing_subscriber::fmt::{MakeWriter, format::FmtSpan};
 
     use super::*;
     use crate::test_fixtures::mtls::{cert_der, minimal_cert_der};
-
-    #[derive(Clone, Default)]
-    struct LogCapture(Arc<Mutex<Vec<u8>>>);
-
-    struct LogWriter(Arc<Mutex<Vec<u8>>>);
-
-    impl LogCapture {
-        fn contents(&self) -> String {
-            let bytes = self.0.lock().unwrap().clone();
-            String::from_utf8(bytes).unwrap()
-        }
-    }
-
-    impl Write for LogWriter {
-        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-            self.0.lock().unwrap().extend_from_slice(buf);
-            Ok(buf.len())
-        }
-
-        fn flush(&mut self) -> io::Result<()> {
-            Ok(())
-        }
-    }
-
-    impl<'a> MakeWriter<'a> for LogCapture {
-        type Writer = LogWriter;
-
-        fn make_writer(&'a self) -> Self::Writer {
-            LogWriter(Arc::clone(&self.0))
-        }
-    }
 
     #[tokio::test]
     async fn test_authenticate_no_certificate() {
