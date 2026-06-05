@@ -308,6 +308,10 @@ impl ActionSink for Executor {
                     digest: Some(digest.to_string()),
                     kind: REPLICATION_PUSH_MANIFEST_KIND.to_string(),
                     origin: None,
+                    // The handler stamps source_ts from the resolved tag's
+                    // created_at at execute time, so a reconcile push carries the
+                    // same last-writer-wins version as the event path instead of
+                    // overwriting the receiver unconditionally.
                     source_ts: None,
                 })
                 .await?;

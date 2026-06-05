@@ -16,7 +16,7 @@
 use std::{collections::HashSet, sync::Arc};
 
 use async_trait::async_trait;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use tracing::debug;
 
@@ -205,8 +205,10 @@ impl ReplicationJobHandler {
             .inc();
     }
 
-    /// Re-resolves the current local digest for a push payload: a tag is re-read
-    /// at execute-time (latest-wins); a tag-less job uses the payload digest.
+    /// Re-resolves the current local target for a push payload: a tag is re-read
+    /// at execute-time (latest-wins), returning both its digest and its
+    /// `created_at` (the local version timestamp); a tag-less job uses the
+    /// payload digest and has no timestamp.
     ///
     /// Returns `Ok(None)` when the tag no longer exists locally
     /// ([`MetadataStoreError::ReferenceNotFound`]): a coalesced push whose tag
@@ -217,14 +219,14 @@ impl ReplicationJobHandler {
         &self,
         namespace: &Namespace,
         payload: &ReplicationPushPayload,
-    ) -> Result<Option<Digest>, Error> {
+    ) -> Result<Option<(Digest, Option<DateTime<Utc>>)>, Error> {
         if let Some(tag) = &payload.tag {
             match self
                 .metadata_store
                 .read_link(namespace.as_ref(), &LinkKind::Tag(tag.clone()), false)
                 .await
             {
-                Ok(link) => Ok(Some(link.target)),
+                Ok(link) => Ok(Some((link.target, link.created_at))),
                 Err(MetadataStoreError::ReferenceNotFound) => Ok(None),
                 Err(e) => Err(Error::Storage(format!(
                     "failed to read tag '{tag}' in '{namespace}': {e}"
@@ -238,7 +240,7 @@ impl ReplicationJobHandler {
             })?;
             digest
                 .parse()
-                .map(Some)
+                .map(|digest| Some((digest, None)))
                 .map_err(|e| Error::Storage(format!("invalid digest '{digest}': {e}")))
         }
     }
@@ -293,7 +295,9 @@ impl ReplicationJobHandler {
             // references it — re-resolving the current digest gives latest-wins;
             // the pipeline HEAD-skips already-present blobs so a blob-only job is
             // a cheap superset of a manifest push).
-            let Some(digest) = self.resolve_current_digest(&namespace, payload).await? else {
+            let Some((digest, created_at)) =
+                self.resolve_current_digest(&namespace, payload).await?
+            else {
                 // The tag was deleted out from under this push (a coalesced push
                 // whose tag is gone): the system has already converged, so this
                 // is a no-op success — not a `pushed`/`superseded`/`failed`.
@@ -304,6 +308,17 @@ impl ReplicationJobHandler {
                 );
                 return Ok(());
             };
+            // Stamp the push with the resolved tag's own creation time so the
+            // receiver's last-writer-wins compares against the digest actually
+            // being sent. Re-deriving here (rather than trusting the payload)
+            // keeps both a COALESCED event push — which retains the first
+            // envelope's older timestamp while the digest is re-resolved to a
+            // newer one — and a RECONCILE push — which carries no timestamp —
+            // correctly ordered. A tag-less (by-digest) push is content-addressed
+            // and the receiver skips LWW, so its payload value is carried through.
+            let source_ts = created_at
+                .map(|ts| ts.to_rfc3339())
+                .or_else(|| payload.source_ts.clone());
             let body = self.blob_store.read(&digest).await.map_err(|e| {
                 Error::Storage(format!("failed to read local manifest '{digest}': {e}"))
             })?;
@@ -319,7 +334,7 @@ impl ReplicationJobHandler {
                 body,
                 max_concurrent_pushes,
                 payload.origin.as_deref(),
-                payload.source_ts.as_deref(),
+                source_ts.as_deref(),
             )
             .await
             .map_err(|e| Error::Storage(e.to_string()))?;
@@ -966,11 +981,13 @@ mod tests {
     }
 
     /// End-to-end through `execute()`: the manifest PUT carries the propagated
-    /// `X-Angos-Origin` (the inbound origin, NOT the local instance id) and the
-    /// `X-Angos-Source-Timestamp` taken verbatim from the job payload. This pins
-    /// the handler -> pipeline -> client header threading.
+    /// `X-Angos-Origin` (the inbound origin, NOT the local instance id) and an
+    /// `X-Angos-Source-Timestamp` DERIVED from the resolved tag's `created_at` —
+    /// NOT the (deliberately stale) payload timestamp. This pins that a coalesced
+    /// push cannot ship a stale last-writer-wins version, plus the
+    /// handler -> pipeline -> client header threading.
     #[tokio::test]
-    async fn execute_push_stamps_propagated_origin_and_source_timestamp() {
+    async fn execute_push_stamps_origin_and_resolved_source_timestamp() {
         crate::metrics_provider::init_for_tests();
         let mock_server = MockServer::start().await;
 
@@ -993,6 +1010,16 @@ mod tests {
         let (manifest_digest, config_digest, layer_digest) =
             seed_manifest(&store, &metadata_store).await;
 
+        // The handler must stamp the resolved tag's created_at, not the payload's
+        // stale source_ts ("2026-06-03..."). Read it back to assert the exact value.
+        let expected_ts = metadata_store
+            .read_link(NAMESPACE, &LinkKind::Tag("v1".to_string()), false)
+            .await
+            .unwrap()
+            .created_at
+            .unwrap()
+            .to_rfc3339();
+
         // Both blobs already present (200 on HEAD) -> the only mutating request
         // is the manifest PUT, which we match on the replication headers.
         for blob in [&config_digest, &layer_digest] {
@@ -1011,7 +1038,7 @@ mod tests {
         Mock::given(method("PUT"))
             .and(path(format!("/v2/{NAMESPACE}/manifests/v1")))
             .and(header(X_ANGOS_ORIGIN, "instance-a"))
-            .and(header(X_ANGOS_SOURCE_TIMESTAMP, "2026-06-03T00:00:00Z"))
+            .and(header(X_ANGOS_SOURCE_TIMESTAMP, expected_ts.as_str()))
             .respond_with(
                 ResponseTemplate::new(201)
                     .insert_header(DOCKER_CONTENT_DIGEST, manifest_digest.to_string().as_str()),
@@ -1035,10 +1062,91 @@ mod tests {
             .unwrap();
 
         // `sample_payload()` carries origin = "instance-a" (a FOREIGN inbound
-        // origin) and source_ts = "2026-06-03T00:00:00Z".
+        // origin) and a deliberately stale source_ts ("2026-06-03..."), which the
+        // handler must IGNORE in favour of the resolved tag's created_at.
         let envelope = build_envelope(&sample_payload()).unwrap();
         handler.execute(&envelope).await.unwrap();
         // wiremock `.expect(1)` on the header-matched PUT is verified on drop.
+        drop(mock_server);
+    }
+
+    /// A reconcile push enqueues with `origin = None` and `source_ts = None`. The
+    /// handler must still stamp the resolved tag's `created_at` so the receiver
+    /// runs last-writer-wins instead of overwriting the downstream unconditionally.
+    #[tokio::test]
+    async fn execute_reconcile_push_derives_source_timestamp_from_local_tag() {
+        crate::metrics_provider::init_for_tests();
+        let mock_server = MockServer::start().await;
+
+        let dir = TempDir::new().unwrap();
+        let root = dir.path().to_str().unwrap();
+        let object: Arc<dyn ObjectStore> =
+            Arc::new(StorageFsBackend::builder().root_dir(root).build().unwrap());
+        let executor = build_test_fs_executor(root, false);
+        let store = build_store(object, executor);
+        let metadata_store = Arc::new(
+            MetadataStore::builder()
+                .store(store.clone())
+                .link_cache_ttl(0)
+                .access_time_debounce_secs(0)
+                .build()
+                .unwrap(),
+        );
+        let blob_store = Arc::new(BlobStore::builder().store(store.clone()).build().unwrap());
+
+        let (manifest_digest, config_digest, layer_digest) =
+            seed_manifest(&store, &metadata_store).await;
+        let expected_ts = metadata_store
+            .read_link(NAMESPACE, &LinkKind::Tag("v1".to_string()), false)
+            .await
+            .unwrap()
+            .created_at
+            .unwrap()
+            .to_rfc3339();
+
+        for blob in [&config_digest, &layer_digest] {
+            Mock::given(method("HEAD"))
+                .and(path(format!("/v2/{NAMESPACE}/blobs/{blob}")))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .insert_header(DOCKER_CONTENT_DIGEST, blob.to_string().as_str())
+                        .insert_header("Content-Length", "10"),
+                )
+                .mount(&mock_server)
+                .await;
+        }
+        // Even with a None payload timestamp, the PUT must carry the resolved
+        // created_at; a missing/empty header would not match and the push fails.
+        Mock::given(method("PUT"))
+            .and(path(format!("/v2/{NAMESPACE}/manifests/v1")))
+            .and(header(X_ANGOS_SOURCE_TIMESTAMP, expected_ts.as_str()))
+            .respond_with(
+                ResponseTemplate::new(201)
+                    .insert_header(DOCKER_CONTENT_DIGEST, manifest_digest.to_string().as_str()),
+            )
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let mut repositories = HashMap::new();
+        repositories.insert(
+            REPO.to_string(),
+            repository_with_downstream(downstream_client(&mock_server.uri())),
+        );
+        let resolver = Arc::new(RepositoryResolver::new(Arc::new(repositories)).unwrap());
+
+        let handler = ReplicationJobHandler::builder()
+            .resolver(resolver)
+            .blob_store(blob_store)
+            .metadata_store(metadata_store)
+            .build()
+            .unwrap();
+
+        let mut payload = sample_payload();
+        payload.origin = None;
+        payload.source_ts = None;
+        let envelope = build_envelope(&payload).unwrap();
+        handler.execute(&envelope).await.unwrap();
         drop(mock_server);
     }
 

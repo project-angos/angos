@@ -373,6 +373,10 @@ impl Registry {
         // Propagate the inbound origin verbatim; a fresh local change is tagged
         // with this instance's own id so downstream hops can detect loops.
         let origin_id = origin.unwrap_or_else(|| self.instance_id.clone());
+        // The change timestamp for receiver-side last-writer-wins. It is
+        // authoritative for a DELETE (the moment the delete happened); a PUSH
+        // re-derives it from the resolved tag's created_at at execute time, so a
+        // coalesced push can never carry a stale timestamp.
         let source_ts = Utc::now().to_rfc3339();
 
         for downstream in &repository.replication {

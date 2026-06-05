@@ -80,8 +80,8 @@ Query parameters:
   back to a normal upload session (`202 Accepted`) — a mount request never fails for this reason.
 
   **Authorization.** A mount only grants a reference to a blob the caller could already read: the
-  server evaluates the caller's read access (`get-blob`) against the source namespace — the `from`
-  repository, or (for a from-less mount) a namespace that references the blob — and falls back to a
+  server evaluates the caller's read access (`get-blob`) against the source namespace (the `from`
+  repository, or for a `from`-less mount a namespace that references the blob) and falls back to a
   normal upload session when none is readable, so a mount never hands over a blob the caller could
   not otherwise pull. A mount is also its own route and CEL action, `mount-blob`, distinct from
   `start-upload`, so you can additionally restrict who may mount at all with a
