@@ -94,7 +94,7 @@ finish on the components they started with.
 
 | Flag                         | Default   | Description                                            |
 |------------------------------|-----------|--------------------------------------------------------|
-| `--queue <name>`             | `"cache"` | Queue to drain. The only queue currently produced is `cache` (pull-through cache-fill), so this rarely needs changing. |
+| `--queue <name>`             | `cache` and `replication` | Queue to drain. With no `--queue` the worker drains both the `cache` (pull-through cache-fill) and `replication` queues, each on its own pool. Repeatable (`--queue cache --queue replication`) to scale or isolate queues independently. |
 | `--poll-interval <duration>` | `1s`      | Minimum wait between claim attempts when no ready job is found. If the queue contains only backed-off envelopes, the worker extends the wait up to the soonest `not_before` (capped at 1 minute, or `--poll-interval` if it is larger) to avoid polling-storm cost. |
 
 ### Example: server + worker pods

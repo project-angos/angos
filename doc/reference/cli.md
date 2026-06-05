@@ -153,9 +153,10 @@ spec:
 
 ### worker
 
-Process durable background jobs from the job queue. The default queue is the
-pull-through cache queue; `angos worker --queue replication` drains the
-replication queue instead.
+Process durable background jobs from the job queue. With no `--queue` argument
+the worker drains **both** the pull-through cache queue and the replication
+queue, each on its own worker pool. Pass `--queue` (repeatable) to drain
+specific queues instead, e.g. `angos worker --queue replication`.
 
 ```bash
 angos worker [options]
@@ -174,6 +175,7 @@ finish on the components they started with.
 
 | Option | Default | Description |
 |---|---|---|
+| `--queue <name>` | `cache` and `replication` | Queue to drain. Repeatable (`--queue cache --queue replication`); each queue runs its own worker pool sized by `max_concurrent_cache_jobs` / `max_concurrent_replication_jobs`. |
 | `--poll-interval <duration>` | `1s` | Minimum idle sleep between claim attempts. When the queue contains only backed-off envelopes, the worker extends the wait up to the soonest `not_before` (capped at 1 minute, or `--poll-interval` if it is larger). |
 
 **Example:**

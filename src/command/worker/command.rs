@@ -1,4 +1,4 @@
-use std::{num::NonZeroUsize, sync::Arc, time::Duration};
+use std::{collections::HashSet, num::NonZeroUsize, sync::Arc, time::Duration};
 
 use arc_swap::ArcSwap;
 use argh::FromArgs;
@@ -12,6 +12,8 @@ use tokio_util::{sync::CancellationToken, task::TaskTracker};
 use tracing::{debug, error, warn};
 use uuid::Uuid;
 
+use angos_tx_engine::store::Store;
+
 use crate::{
     command::{
         bootstrap::{self, Error},
@@ -19,15 +21,14 @@ use crate::{
     },
     configuration::{Configuration, listeners::ServerTlsConfig, watcher::ConfigNotifier},
     registry::{
+        blob_store::BlobStore,
         cache_job_handler::{CACHE_QUEUE, CacheJobHandler},
         job_store::{self, JobHandler, JobStore},
+        metadata_store::MetadataStore,
+        repository_resolver::RepositoryResolver,
     },
     replication::{REPLICATION_QUEUE, ReplicationJobHandler},
 };
-
-fn default_queue() -> String {
-    CACHE_QUEUE.to_string()
-}
 
 /// Cap on the exponential backoff applied after consecutive `claim_one`
 /// errors. A worker pointed at a broken storage backend will idle here
@@ -53,22 +54,23 @@ fn claim_error_backoff(poll_interval: Duration, n: u32) -> Duration {
     description = "Process durable background jobs"
 )]
 pub struct Options {
-    /// queue to drain (default: "cache")
-    #[argh(option, default = "default_queue()")]
-    pub queue: String,
+    /// queue to drain; repeatable, e.g. `--queue cache --queue replication`.
+    /// Defaults to draining both the "cache" and "replication" queues, each on
+    /// its own worker pool.
+    #[argh(option)]
+    pub queue: Vec<String>,
     /// idle poll interval when the queue is empty
     #[argh(option, default = "HumanDuration::from(Duration::from_secs(1))")]
     pub poll_interval: HumanDuration,
 }
 
-/// Hot-reloadable worker subcommand. `consumer` and `handler` are swapped
-/// atomically on configuration reload; in-flight jobs always finish on the
-/// components they started with.
+/// Hot-reloadable worker subcommand draining one or more queues, each on its own
+/// worker pool. A queue's `consumer` and `handler` are swapped atomically on
+/// configuration reload; in-flight jobs always finish on the components they
+/// started with.
 pub struct Command {
-    inner: Arc<ArcSwap<Components>>,
-    queue: String,
+    queues: Vec<QueueRunner>,
     poll_interval: Duration,
-    concurrency: NonZeroUsize,
     shutdown: CancellationToken,
     workers: TaskTracker,
     /// Cancellation token tied to the transactional-engine recovery loop and
@@ -76,29 +78,68 @@ pub struct Command {
     engine_maintenance: CancellationToken,
 }
 
+/// One drained queue: its hot-swappable components plus the worker concurrency
+/// for that queue.
+struct QueueRunner {
+    inner: Arc<ArcSwap<Components>>,
+    queue: String,
+    concurrency: NonZeroUsize,
+}
+
 struct Components {
     consumer: Arc<JobStore>,
     handler: Arc<dyn JobHandler>,
 }
 
+/// Worker concurrency for `queue`: the replication queue uses
+/// `max_concurrent_replication_jobs`; every other queue (e.g. `cache`) uses
+/// `max_concurrent_cache_jobs`.
+fn queue_concurrency(config: &Configuration, queue: &str) -> NonZeroUsize {
+    if queue == REPLICATION_QUEUE {
+        config.global.max_concurrent_replication_jobs
+    } else {
+        config.global.max_concurrent_cache_jobs
+    }
+}
+
+/// The queues to drain: the repeatable `--queue` values de-duplicated, or --
+/// when none is passed -- both the `cache` and `replication` queues. Order is
+/// irrelevant; each queue runs an independent worker pool.
+fn resolve_queues(requested: &[String]) -> Vec<String> {
+    if requested.is_empty() {
+        return vec![CACHE_QUEUE.to_string(), REPLICATION_QUEUE.to_string()];
+    }
+    requested
+        .iter()
+        .cloned()
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect()
+}
+
 impl Command {
     pub async fn new(options: &Options, config: &Configuration) -> Result<Self, Error> {
         let engine_maintenance = CancellationToken::new();
-        // Worker concurrency follows the bound queue: the replication queue uses
-        // `max_concurrent_replication_jobs`; every other queue (default `cache`)
-        // uses `max_concurrent_cache_jobs`.
-        let concurrency = if options.queue == REPLICATION_QUEUE {
-            config.global.max_concurrent_replication_jobs
-        } else {
-            config.global.max_concurrent_cache_jobs
-        };
+        // The expensive, queue-independent context (storage, metadata/blob
+        // stores, repositories, engine maintenance) is built ONCE and shared by
+        // every drained queue; only the handler and a `JobStore` consumer differ
+        // per queue.
+        let context = WorkerContext::build(config, Some(engine_maintenance.clone())).await?;
+
+        let mut queues = Vec::new();
+        for queue in resolve_queues(&options.queue) {
+            let concurrency = queue_concurrency(config, &queue);
+            let components = context.components_for(&queue)?;
+            queues.push(QueueRunner {
+                inner: Arc::new(ArcSwap::from_pointee(components)),
+                queue,
+                concurrency,
+            });
+        }
+
         Ok(Self {
-            inner: Arc::new(ArcSwap::from_pointee(
-                Components::build(config, &options.queue, Some(engine_maintenance.clone())).await?,
-            )),
-            queue: options.queue.clone(),
+            queues,
             poll_interval: *options.poll_interval,
-            concurrency,
             shutdown: CancellationToken::new(),
             workers: TaskTracker::new(),
             engine_maintenance,
@@ -119,17 +160,20 @@ impl Command {
         self.engine_maintenance.cancel();
     }
 
-    /// Spawn `concurrency` claim-loop tasks and wait for them to finish.
-    /// Returns when every worker observes the shutdown signal and exits.
+    /// Spawn `concurrency` claim-loop tasks per drained queue and wait for them
+    /// to finish. Returns when every worker observes the shutdown signal and
+    /// exits.
     pub async fn run(&self) {
-        for _ in 0..self.concurrency.get() {
-            let inner = Arc::clone(&self.inner);
-            let queue = self.queue.clone();
-            let poll_interval = self.poll_interval;
-            let shutdown = self.shutdown.clone();
-            self.workers.spawn(async move {
-                worker_loop(inner, queue, poll_interval, shutdown).await;
-            });
+        for runner in &self.queues {
+            for _ in 0..runner.concurrency.get() {
+                let inner = Arc::clone(&runner.inner);
+                let queue = runner.queue.clone();
+                let poll_interval = self.poll_interval;
+                let shutdown = self.shutdown.clone();
+                self.workers.spawn(async move {
+                    worker_loop(inner, queue, poll_interval, shutdown).await;
+                });
+            }
         }
         self.workers.close();
         self.workers.wait().await;
@@ -189,9 +233,21 @@ impl ConfigNotifier for Command {
     async fn notify_config_change(&self, config: &Configuration) {
         // The engine maintenance tasks were spawned by the initial bootstrap;
         // hot reloads do not respawn them.
-        match Components::build(config, &self.queue, None).await {
-            Ok(components) => self.inner.store(Arc::new(components)),
-            Err(e) => error!("Failed to apply worker configuration: {e}"),
+        let context = match WorkerContext::build(config, None).await {
+            Ok(context) => context,
+            Err(e) => {
+                error!("Failed to rebuild worker context on reload: {e}");
+                return;
+            }
+        };
+        for runner in &self.queues {
+            match context.components_for(&runner.queue) {
+                Ok(components) => runner.inner.store(Arc::new(components)),
+                Err(e) => error!(
+                    "Failed to apply worker configuration for queue '{}': {e}",
+                    runner.queue
+                ),
+            }
         }
     }
 
@@ -200,14 +256,24 @@ impl ConfigNotifier for Command {
     }
 }
 
-impl Components {
+/// Queue-independent worker resources, built once and shared across every
+/// drained queue. Cloning the inner `Arc`s into each queue's handler/consumer is
+/// cheap, so draining N queues does not rebuild the metadata store, blob store,
+/// repositories, or storage N times.
+struct WorkerContext {
+    storage: Arc<Store>,
+    blob_store: Arc<BlobStore>,
+    metadata_store: Arc<MetadataStore>,
+    repositories: Arc<RepositoryResolver>,
+}
+
+impl WorkerContext {
     async fn build(
         config: &Configuration,
-        queue: &str,
         engine_maintenance: Option<CancellationToken>,
     ) -> Result<Self, Error> {
         let auth_cache = bootstrap::auth_cache(&config.cache)?;
-        let blob_backend = std::sync::Arc::new(config.blob_store.build_backend()?);
+        let blob_store = std::sync::Arc::new(config.blob_store.build_backend()?);
         let metadata_store =
             bootstrap::metadata_store(&config.resolve_registry_storage(), &auth_cache).await?;
         let repositories = bootstrap::repositories(
@@ -223,47 +289,84 @@ impl Components {
             ))
         })?;
 
-        let worker_id = Uuid::new_v4().to_string();
-        let storage_config = config.resolve_registry_storage();
-        let storage = storage_config.build_store().await?;
+        let storage = config.resolve_registry_storage().build_store().await?;
 
         // Spawn the engine maintenance loops once per worker process so any
         // crashed-mid-Apply transactions are recovered and orphan body
-        // staging is reaped.
+        // staging is reaped. The recovery loop is backend-wide, so one instance
+        // covers every queue this process drains.
         if let Some(token) = engine_maintenance {
             bootstrap::spawn_engine_maintenance(&storage, token);
         }
 
-        let consumer = Arc::new(JobStore::new(storage, worker_id));
-        // Bind the handler to the queue this worker drains. The replication queue
-        // reads local manifest/blob bytes and pushes them to each downstream
-        // `RegistryClient`; every other queue (default `cache`) fills blobs from
-        // upstreams. Self-origin changes are filtered at the enqueue boundary.
+        Ok(Self {
+            storage,
+            blob_store,
+            metadata_store,
+            repositories,
+        })
+    }
+
+    /// Build the [`Components`] for one queue: a fresh `JobStore` consumer over
+    /// the shared storage plus the handler bound to that queue. The replication
+    /// queue reads local manifest/blob bytes and pushes them to each downstream
+    /// `RegistryClient`; every other queue (e.g. `cache`) fills blobs from
+    /// upstreams.
+    fn components_for(&self, queue: &str) -> Result<Components, Error> {
+        let consumer = Arc::new(JobStore::new(
+            self.storage.clone(),
+            Uuid::new_v4().to_string(),
+        ));
         let handler: Arc<dyn JobHandler> = if queue == REPLICATION_QUEUE {
             Arc::new(
                 ReplicationJobHandler::builder()
-                    .resolver(repositories)
-                    .blob_store(blob_backend)
-                    .metadata_store(metadata_store)
+                    .resolver(self.repositories.clone())
+                    .blob_store(self.blob_store.clone())
+                    .metadata_store(self.metadata_store.clone())
                     .build()
                     .map_err(bootstrap::Error::JobQueue)?,
             )
         } else {
             Arc::new(CacheJobHandler::new(
-                repositories,
-                blob_backend,
-                metadata_store,
+                self.repositories.clone(),
+                self.blob_store.clone(),
+                self.metadata_store.clone(),
             ))
         };
 
-        Ok(Self { consumer, handler })
+        Ok(Components { consumer, handler })
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{CLAIM_ERROR_BACKOFF_CAP, claim_error_backoff};
-    use std::time::Duration;
+    use std::{collections::HashSet, time::Duration};
+
+    use super::{CLAIM_ERROR_BACKOFF_CAP, claim_error_backoff, resolve_queues};
+    use crate::{registry::cache_job_handler::CACHE_QUEUE, replication::REPLICATION_QUEUE};
+
+    #[test]
+    fn resolve_queues_defaults_to_cache_and_replication() {
+        assert_eq!(
+            resolve_queues(&[]),
+            vec![CACHE_QUEUE.to_string(), REPLICATION_QUEUE.to_string()]
+        );
+    }
+
+    #[test]
+    fn resolve_queues_dedups_requested_queues() {
+        let resolved: HashSet<String> = resolve_queues(&[
+            "replication".to_string(),
+            "cache".to_string(),
+            "replication".to_string(),
+        ])
+        .into_iter()
+        .collect();
+        assert_eq!(
+            resolved,
+            HashSet::from(["replication".to_string(), "cache".to_string()])
+        );
+    }
 
     #[test]
     fn backoff_doubles_with_consecutive_failures() {

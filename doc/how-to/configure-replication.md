@@ -76,13 +76,14 @@ With **no** `[global.job_queue]` section, the server drains the replication queu
 
 ### Separate Worker
 
-With `[global.job_queue]` configured, the server only enqueues jobs; you must run a worker to drain them:
+With `[global.job_queue]` configured, the server only enqueues jobs; you must run a worker to drain them. A bare `angos worker` drains **both** the replication and cache queues (each on its own pool); pass `--queue replication` to drain replication alone, for example to scale it independently:
 
 ```bash
-angos -c config.toml worker --queue replication
+angos -c config.toml worker                      # drains both cache and replication
+angos -c config.toml worker --queue replication  # replication only
 ```
 
-This is the multi-replica, horizontally-scalable configuration: draining is decoupled from serving and can be scaled independently. (Pending pushes persist under `_jobs/pending/replication/` and resume after a restart in both modes.) See [Enable Durable Cache Jobs](durable-cache-jobs.md) for the job-queue setup, KEDA autoscaling, and `angos worker` details. Run a separate worker (or worker pool) per queue you want drained.
+This is the multi-replica, horizontally-scalable configuration: draining is decoupled from serving and can be scaled independently. (Pending pushes persist under `_jobs/pending/replication/` and resume after a restart in both modes.) See [Enable Durable Cache Jobs](durable-cache-jobs.md) for the job-queue setup, KEDA autoscaling, and `angos worker` details.
 
 Because the queue is drained by separate processes, `[global.job_queue]` requires a **shared** metadata-store lock strategy (`[metadata_store.s3.lock_strategy.s3]` or a `[lock_strategy.redis]` table) so workers serialize on the same jobs; the default in-process `memory` lock is rejected at startup with this section. The in-process mode above (no `[global.job_queue]`) runs in a single process and works with any lock strategy.
 
@@ -123,8 +124,6 @@ docker push localhost:8000/nginx/app:v1
 # ... shortly after ...
 docker pull localhost:8001/nginx/app:v1   # served from B
 ```
-
-A ready-to-run version of this lives in `contrib/docker-compose/` (services `angos-a` and `angos-b`); see the `README.md` there.
 
 ## Reconcile on Demand
 
@@ -169,7 +168,7 @@ See [Metrics Reference](../reference/metrics.md) for the full list.
 **Pushes never reach the downstream:**
 - Confirm the downstream `url` is reachable from the source instance.
 - Verify the credential is authorized to push on the downstream (`put-manifest`, blob uploads).
-- If `[global.job_queue]` is configured, ensure an `angos worker --queue replication` is running -- the server only enqueues.
+- If `[global.job_queue]` is configured, ensure an `angos worker` is running (it drains the replication queue by default) -- the server only enqueues.
 
 **A tag does not overwrite on the downstream:**
 - The downstream copy may be newer (last-writer-wins): a `409 REPLICATION_SUPERSEDED` is convergence, not failure.
