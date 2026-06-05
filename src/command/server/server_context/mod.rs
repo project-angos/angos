@@ -10,7 +10,7 @@ use crate::{
     event_webhook::{EventSubscriber, dispatcher::EventDispatcher, event::Event},
     identity::{Action, ClientIdentity},
     oci::{Namespace, Reference},
-    registry::Registry,
+    registry::{BlobMount, Registry},
 };
 
 pub struct ServerContext {
@@ -88,6 +88,20 @@ impl ServerContext {
     ) -> Result<(), Error> {
         self.authorizer
             .authorize_request(route, identity, request, &self.registry)
+            .await
+    }
+
+    /// Whether `identity` may read the blob a cross-repo mount would copy, i.e.
+    /// the mount would not hand over bytes the caller could not otherwise read.
+    /// `false` means the caller must fall back to an ordinary upload session.
+    pub async fn authorize_mount_source(
+        &self,
+        mount: &BlobMount,
+        identity: &ClientIdentity,
+        request: &Parts,
+    ) -> Result<bool, Error> {
+        self.authorizer
+            .authorize_mount_source(mount, identity, request, &self.registry)
             .await
     }
 

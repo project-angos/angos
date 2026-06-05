@@ -70,21 +70,23 @@ Query parameters:
   start a new upload session.
 - `mount` (with optional `from`) - Cross-repository blob mount. `?mount={digest}` requests that an
   existing blob be referenced by the target namespace with no body transfer:
-  - With `from`: the mount succeeds when the blob exists and is readable from `{repository}`.
-  - Without `from` (automatic content discovery): the mount succeeds when the blob exists and is
-    already referenced by any namespace.
+  - With `from`: the mount succeeds when the blob exists, is held by `{repository}`, and the caller is
+    authorized to read it from there.
+  - Without `from` (automatic content discovery): the mount succeeds when the blob exists and the
+    caller is authorized to read it from a namespace that already references it.
 
   On success the server returns `201 Created` with the blob `Location`. When the blob cannot be
-  mounted (absent, or not readable from the named source), the server falls back to a normal upload
-  session (`202 Accepted`) — a mount request never fails for this reason.
+  mounted (absent, not held by the named source, or not readable by the caller), the server falls
+  back to a normal upload session (`202 Accepted`) — a mount request never fails for this reason.
 
-  **Authorization.** A mount grants the target namespace a reference based on the blob's presence,
-  not on the caller's access to the source — so a caller who may push to the target and knows a
-  digest can reference any blob that exists in the registry (with `from`) or that any namespace
-  references (without `from`), then pull it from the target. This is the OCI cross-mount model. A
-  mount is its own route and CEL action, `mount-blob`, distinct from `start-upload`. To restrict
-  mounts, add a `request.action == 'mount-blob'` rule to your `access_policy`; denying it rejects the
-  mount (Angos's replication falls back to a normal upload). See
+  **Authorization.** A mount only grants a reference to a blob the caller could already read: the
+  server evaluates the caller's read access (`get-blob`) against the source namespace — the `from`
+  repository, or (for a from-less mount) a namespace that references the blob — and falls back to a
+  normal upload session when none is readable, so a mount never hands over a blob the caller could
+  not otherwise pull. A mount is also its own route and CEL action, `mount-blob`, distinct from
+  `start-upload`, so you can additionally restrict who may mount at all with a
+  `request.action == 'mount-blob'` rule (denying it rejects the mount; Angos's replication falls back
+  to a normal upload). See
   [Restrict cross-repository blob mount](../how-to/set-up-access-control.md#restrict-cross-repository-blob-mount).
 
 ```

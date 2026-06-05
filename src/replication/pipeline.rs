@@ -31,6 +31,20 @@ use crate::{
 /// Media type of an OCI image index (the referrers fallback tag body).
 const OCI_INDEX_MEDIA_TYPE: &str = "application/vnd.oci.image.index.v1+json";
 
+/// Reads the `mediaType` field out of a JSON manifest body, when present.
+///
+/// Shared by [`read_local_manifest`], [`referrer_descriptor`], and the job
+/// handler (which derives the top-level manifest's media type from the body it
+/// already read), so the `serde_json` extraction lives in one place.
+#[must_use]
+pub fn media_type_of(body: &[u8]) -> Option<String> {
+    serde_json::from_slice::<Value>(body).ok().and_then(|v| {
+        v.get("mediaType")
+            .and_then(Value::as_str)
+            .map(ToString::to_string)
+    })
+}
+
 /// Outcome of a successful replication push or delete.
 ///
 /// Both arms are convergence (the system reached the intended state); the
@@ -208,13 +222,7 @@ async fn read_local_manifest(
     })?;
     // The blob body itself carries the manifest's `mediaType`; reading it back
     // out keeps the push self-contained without a metadata-store round-trip.
-    let media_type = serde_json::from_slice::<serde_json::Value>(&body)
-        .ok()
-        .and_then(|v| {
-            v.get("mediaType")
-                .and_then(|m| m.as_str())
-                .map(ToString::to_string)
-        });
+    let media_type = media_type_of(&body);
     Ok((media_type, body))
 }
 
@@ -454,13 +462,13 @@ fn referrer_descriptor(referrer_digest: &Digest, body: &[u8]) -> Value {
         "digest": referrer_digest.to_string(),
         "size": body.len(),
     });
-    if let Ok(parsed) = serde_json::from_slice::<Value>(body) {
-        if let Some(manifest_media_type) = parsed.get("mediaType").and_then(Value::as_str) {
-            descriptor["mediaType"] = json!(manifest_media_type);
-        }
-        if let Some(artifact_type) = parsed.get("artifactType").and_then(Value::as_str) {
-            descriptor["artifactType"] = json!(artifact_type);
-        }
+    if let Some(manifest_media_type) = media_type_of(body) {
+        descriptor["mediaType"] = json!(manifest_media_type);
+    }
+    if let Ok(parsed) = serde_json::from_slice::<Value>(body)
+        && let Some(artifact_type) = parsed.get("artifactType").and_then(Value::as_str)
+    {
+        descriptor["artifactType"] = json!(artifact_type);
     }
     descriptor
 }

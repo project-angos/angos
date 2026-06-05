@@ -118,8 +118,13 @@ impl RegistryClient {
     /// [`RegistryClientConfig`].
     ///
     /// Shared by [`RegistryClient::new`] / [`RegistryClient::new_with_manifest_size_limit`]
-    /// and by in-crate callers that build via [`RegistryClient::builder`] directly
+    /// and by callers that build via [`RegistryClient::builder`] directly
     /// (e.g. replication downstream resolution).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Initialization`] when the TLS files cannot be loaded or
+    /// the HTTP client cannot be built.
     pub fn resolve_config_fields(
         config: &RegistryClientConfig,
     ) -> Result<(Client, Option<(String, String)>), Error> {

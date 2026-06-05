@@ -27,14 +27,26 @@ pub async fn handle_start_upload(
 
 pub async fn handle_mount_blob(
     context: &ServerContext,
+    parts: &Parts,
     namespace: &Namespace,
     digest: Digest,
     from: Option<Namespace>,
+    identity: &ClientIdentity,
 ) -> Result<Response<ResponseBody>, Error> {
-    let response = context
-        .registry
-        .mount_blob(namespace, BlobMount { digest, from })
-        .await?;
+    let mount = BlobMount { digest, from };
+    // A mount grants the target a reference to an existing blob with no upload, so
+    // it must not hand the caller bytes they could not otherwise read. Authorize
+    // the caller against a namespace that holds the blob first; when none is
+    // readable, degrade to an ordinary upload session (an unsatisfiable mount
+    // falls back to 202) rather than leaking the blob.
+    let response = if context
+        .authorize_mount_source(&mount, identity, parts)
+        .await?
+    {
+        context.registry.mount_blob(namespace, mount).await?
+    } else {
+        context.registry.start_upload(namespace, None).await?
+    };
     upload_start_response(response)
 }
 

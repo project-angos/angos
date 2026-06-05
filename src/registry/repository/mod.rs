@@ -132,7 +132,14 @@ impl Repository {
                             .name(config.name.clone())
                             .registry_client(Arc::new(registry_client))
                             .mode(config.mode)
-                            .namespace_filter(config.namespace_filter.clone())
+                            .namespace_filter(
+                                config
+                                    .namespace_filter
+                                    .iter()
+                                    .cloned()
+                                    .map(RegexPattern::into_regex)
+                                    .collect(),
+                            )
                             .max_concurrent_pushes(
                                 config
                                     .max_concurrent_pushes

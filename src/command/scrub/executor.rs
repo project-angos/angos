@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use chrono::Utc;
 use tracing::{info, warn};
 
 use crate::{
@@ -317,6 +318,26 @@ impl ActionSink for Executor {
                 tag,
             } => {
                 // A tag delete keys off the tag; the receiver needs no digest.
+                //
+                // Stamp `source_ts` with the moment reconcile decided to prune,
+                // in the same RFC 3339 format as the event path, so the receiver
+                // runs last-writer-wins instead of deleting unconditionally: a
+                // downstream tag whose `created_at` is strictly newer than this
+                // timestamp is preserved (REPLICATION_SUPERSEDED) rather than
+                // destroyed.
+                //
+                // CAVEAT — prune is a ONE-WAY-MIRROR operation, not active-active
+                // safe. `source_ts` here is "now", which is necessarily later than
+                // any tag the downstream already held when reconcile listed it, so
+                // LWW only protects against a tag dated in the FUTURE relative to
+                // this decision (clock skew, or a tag pushed in the gap between the
+                // listing and the delete landing). It does NOT make prune safe on
+                // an active-active peer: a peer's legitimately-newer tag whose
+                // `created_at` predates this reconcile run still has
+                // `created_at < source_ts`, so it is deleted. Stamping `source_ts`
+                // is the correct, consistent guard (and removes the
+                // unconditional-bypass footgun), but `prune = true` must only be
+                // enabled for a downstream that is an authoritative one-way mirror.
                 self.enqueue_replication(ReplicationPushPayload {
                     downstream,
                     namespace,
@@ -324,7 +345,7 @@ impl ActionSink for Executor {
                     digest: None,
                     kind: REPLICATION_DELETE_MANIFEST_KIND.to_string(),
                     origin: None,
-                    source_ts: None,
+                    source_ts: Some(Utc::now().to_rfc3339()),
                 })
                 .await?;
             }
@@ -679,6 +700,59 @@ mod tests {
                     .is_err(),
                 "layer link must be removed when referenced_by becomes empty"
             );
+            test_case.cleanup().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn enqueue_replication_delete_stamps_source_ts_for_receiver_lww() {
+        use chrono::DateTime;
+
+        use crate::replication::{REPLICATION_DELETE_MANIFEST_KIND, REPLICATION_QUEUE};
+
+        for test_case in backends() {
+            let blob_store = test_case.blob_store();
+            let metadata_store = test_case.metadata_store();
+
+            let job_store = Arc::new(JobStore::new(metadata_store.store_arc(), "scrub-source-ts"));
+
+            let mut executor = Executor::builder()
+                .blob_store(blob_store)
+                .metadata_store(metadata_store)
+                .job_store(job_store.clone())
+                .build()
+                .unwrap();
+
+            executor
+                .apply(Action::EnqueueReplicationDelete {
+                    downstream: "mirror".to_string(),
+                    namespace: "ns/app".to_string(),
+                    tag: "stray".to_string(),
+                })
+                .await
+                .unwrap();
+
+            // Claim the enqueued job and inspect the on-queue payload: a prune
+            // delete MUST carry a valid RFC 3339 `source_ts` so the receiver runs
+            // last-writer-wins instead of deleting unconditionally.
+            let claimed = job_store
+                .claim_one(REPLICATION_QUEUE)
+                .await
+                .unwrap()
+                .claimed
+                .expect("a delete job must be enqueued");
+
+            assert_eq!(claimed.envelope.kind, REPLICATION_DELETE_MANIFEST_KIND);
+            let source_ts = claimed.envelope.payload.get("source_ts").cloned();
+            let source_ts = source_ts
+                .as_ref()
+                .and_then(serde_json::Value::as_str)
+                .expect("prune delete payload must carry a source_ts (not None)");
+            assert!(
+                DateTime::parse_from_rfc3339(source_ts).is_ok(),
+                "source_ts must be a valid RFC 3339 timestamp; got {source_ts}"
+            );
+
             test_case.cleanup().await;
         }
     }

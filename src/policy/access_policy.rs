@@ -396,6 +396,76 @@ mod tests {
         assert!(is_allow(&deny_non_replicator.evaluate(&mount, &replicator)));
     }
 
+    /// Proves a policy can scope a cross-repo mount by its SOURCE repository via
+    /// `request.from`. The mount source is surfaced as a plain string CEL
+    /// variable that is present only on a cross-repo (`from`-bearing) mount, so a
+    /// rule can allow mounts from a trusted source and refuse mounts from any
+    /// other — or, with `has(request.from)`, refuse from-less (auto-discovery)
+    /// mounts entirely.
+    #[test]
+    fn test_access_policy_gates_cross_repo_mount_by_source() {
+        let target = Namespace::new("team/app").unwrap();
+        let digest = Digest::try_from(
+            "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        )
+        .unwrap();
+
+        let from_trusted = Action::MountBlob {
+            namespace: target.clone(),
+            digest: digest.clone(),
+            from: Some(Namespace::new("team/base").unwrap()),
+        };
+        let from_untrusted = Action::MountBlob {
+            namespace: target.clone(),
+            digest: digest.clone(),
+            from: Some(Namespace::new("other/evil").unwrap()),
+        };
+        let no_from = Action::MountBlob {
+            namespace: target,
+            digest,
+            from: None,
+        };
+        let client = ClientIdentity {
+            username: Some("alice".to_string()),
+            ..ClientIdentity::default()
+        };
+
+        // default-deny: only mounts whose source is exactly `team/base` are
+        // permitted. The `has()` guard keeps the rule from raising "no such key"
+        // (fail-closed) on a from-less mount, where `request.from` is absent.
+        let only_from_trusted = AccessPolicy::new(AccessPolicyConfig {
+            default: AccessMode::Deny,
+            rules: vec![rule(
+                "request.action == 'mount-blob' && has(request.from) && request.from == 'team/base'",
+            )],
+        });
+        assert!(is_allow(
+            &only_from_trusted.evaluate(&from_trusted, &client)
+        ));
+        assert!(is_deny(
+            &only_from_trusted.evaluate(&from_untrusted, &client)
+        ));
+        // No `from`: `request.from` is absent, so the source check does not match
+        // and the default-deny stands.
+        assert!(is_deny(&only_from_trusted.evaluate(&no_from, &client)));
+
+        // default-allow: deny any mount whose source is the untrusted repo, while
+        // leaving trusted-source and from-less mounts permitted.
+        let deny_untrusted_source = AccessPolicy::new(AccessPolicyConfig {
+            default: AccessMode::Allow,
+            rules: vec![rule(
+                "request.action == 'mount-blob' && has(request.from) && request.from == 'other/evil'",
+            )],
+        });
+        assert!(is_allow(
+            &deny_untrusted_source.evaluate(&from_trusted, &client)
+        ));
+        assert!(is_deny(
+            &deny_untrusted_source.evaluate(&from_untrusted, &client)
+        ));
+        assert!(is_allow(&deny_untrusted_source.evaluate(&no_from, &client)));
+    }
+
     #[test]
     fn test_access_policy_default_toml_allow() {
         let config: AccessPolicyConfig = toml::from_str("default = \"allow\"").unwrap();

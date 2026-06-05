@@ -8,7 +8,7 @@ use crate::{
     oci::{Digest, Namespace},
     registry::{
         DOCKER_UPLOAD_UUID, Error, HeaderMap, Registry, ResponseHeaders,
-        blob_ownership::BlobOwnership, blob_store,
+        blob_ownership::BlobOwnership, blob_store, metadata_store::Error as MetadataError,
     },
     util::sha256::finalize_digest,
 };
@@ -225,6 +225,45 @@ impl Registry {
 
         ownership.grant(namespace, &mount.digest).await?;
         Ok(Some(blob_location_headers(namespace, &mount.digest)))
+    }
+
+    /// Source namespaces a cross-repo mount of `mount.digest` would draw the blob
+    /// from — the namespaces whose read policy must permit the caller before the
+    /// mount may grant a reference. Empty when the blob is absent locally or no
+    /// eligible namespace holds it, in which case the caller falls back to an
+    /// ordinary upload session.
+    ///
+    /// - **`from` set** — `[from]` when that repository owns the blob, else empty.
+    /// - **`from` unset** (automatic discovery) — every namespace that references
+    ///   the blob; the caller need only be authorized to read one of them.
+    pub async fn mount_source_candidates(
+        &self,
+        mount: &BlobMount,
+    ) -> Result<Vec<Namespace>, Error> {
+        if self.blob_store.size(&mount.digest).await.is_err() {
+            return Ok(Vec::new());
+        }
+
+        if let Some(from) = &mount.from {
+            let readable = BlobOwnership::new(self.metadata_store.as_ref())
+                .can_read(from, &mount.digest)
+                .await?;
+            return Ok(if readable {
+                vec![from.clone()]
+            } else {
+                Vec::new()
+            });
+        }
+
+        match self.metadata_store.read_blob_index(&mount.digest).await {
+            Ok(index) => Ok(index
+                .namespace
+                .into_keys()
+                .filter_map(|namespace| Namespace::new(&namespace).ok())
+                .collect()),
+            Err(MetadataError::ReferenceNotFound) => Ok(Vec::new()),
+            Err(error) => Err(error.into()),
+        }
     }
 
     /// Opens a fresh resumable upload session and returns its `202` headers.
@@ -841,6 +880,142 @@ mod tests {
                 matches!(response, StartUploadResponse::Session { .. }),
                 "an unreferenced (orphan) blob must not be auto-mounted"
             );
+            test_case.cleanup().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn mount_source_candidates_resolves_from_and_discovery() {
+        use std::str::FromStr;
+
+        for test_case in backends() {
+            let registry = test_case.registry();
+            let source = &Namespace::new("test-repo/source").unwrap();
+            let other = &Namespace::new("test-repo/other").unwrap();
+            let target = &Namespace::new("test-repo/target").unwrap();
+            let content = b"candidate resolution blob";
+
+            let digest = put_blob_direct(registry.metadata_store.store(), content).await;
+            let ownership = BlobOwnership::new(registry.metadata_store.as_ref());
+            ownership.grant(source, &digest).await.unwrap();
+            ownership.grant(other, &digest).await.unwrap();
+
+            // `from` set and owning the blob -> exactly that namespace.
+            let candidates = registry
+                .mount_source_candidates(&BlobMount {
+                    digest: digest.clone(),
+                    from: Some(source.clone()),
+                })
+                .await
+                .unwrap();
+            assert_eq!(candidates, vec![source.clone()]);
+
+            // `from` set but NOT owning the blob -> no candidate.
+            let candidates = registry
+                .mount_source_candidates(&BlobMount {
+                    digest: digest.clone(),
+                    from: Some(target.clone()),
+                })
+                .await
+                .unwrap();
+            assert!(candidates.is_empty());
+
+            // from-less discovery -> every namespace that references the blob.
+            let mut candidates = registry
+                .mount_source_candidates(&BlobMount {
+                    digest: digest.clone(),
+                    from: None,
+                })
+                .await
+                .unwrap();
+            candidates.sort();
+            assert_eq!(candidates, vec![other.clone(), source.clone()]);
+
+            // Absent blob -> no candidates.
+            let absent = Digest::from_str(
+                "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+            )
+            .unwrap();
+            let candidates = registry
+                .mount_source_candidates(&BlobMount {
+                    digest: absent,
+                    from: None,
+                })
+                .await
+                .unwrap();
+            assert!(candidates.is_empty());
+
+            test_case.cleanup().await;
+        }
+    }
+
+    // A cross-repo mount must not grant the caller a blob they cannot read from
+    // the source: authorization is checked against a namespace that holds the
+    // blob, for both an explicit `from` and from-less automatic discovery.
+    #[tokio::test]
+    async fn authorize_mount_source_requires_read_on_the_source() {
+        use hyper::Request;
+
+        use crate::{
+            auth::Authorizer, cache, identity::ClientIdentity,
+            test_fixtures::configuration::load_config,
+        };
+
+        for test_case in backends() {
+            let registry = test_case.registry();
+            let source = &Namespace::new("test-repo/source").unwrap();
+            let content = b"mount authorization blob";
+
+            let digest = put_blob_direct(registry.metadata_store.store(), content).await;
+            BlobOwnership::new(registry.metadata_store.as_ref())
+                .grant(source, &digest)
+                .await
+                .unwrap();
+
+            // Only identity id "reader" may read; everyone else is denied.
+            let config = load_config(
+                r#"
+                [global.access_policy]
+                default = "deny"
+                rules = ["identity.id == 'reader'"]
+
+                [repository."test-repo".access_policy]
+                default = "allow"
+            "#,
+            );
+            let cache = cache::Config::Memory.to_backend().unwrap();
+            let authorizer = Authorizer::new(&config, &cache).unwrap();
+
+            let (parts, ()) = Request::builder()
+                .uri("/v2/")
+                .body(())
+                .unwrap()
+                .into_parts();
+            let mut reader = ClientIdentity::new(None);
+            reader.id = Some("reader".to_string());
+            let stranger = ClientIdentity::new(None);
+
+            for from in [Some(source.clone()), None] {
+                let mount = BlobMount {
+                    digest: digest.clone(),
+                    from,
+                };
+                assert!(
+                    authorizer
+                        .authorize_mount_source(&mount, &reader, &parts, registry)
+                        .await
+                        .unwrap(),
+                    "a caller permitted to read the source must be allowed to mount"
+                );
+                assert!(
+                    !authorizer
+                        .authorize_mount_source(&mount, &stranger, &parts, registry)
+                        .await
+                        .unwrap(),
+                    "a caller denied read on the source must not be allowed to mount"
+                );
+            }
+
             test_case.cleanup().await;
         }
     }

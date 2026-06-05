@@ -307,7 +307,7 @@ impl ReplicationJobHandler {
             let body = self.blob_store.read(&digest).await.map_err(|e| {
                 Error::Storage(format!("failed to read local manifest '{digest}': {e}"))
             })?;
-            let media_type = media_type_of(&body);
+            let media_type = pipeline::media_type_of(&body);
             let outcome = pipeline::push_manifest(
                 registry_client,
                 &self.blob_store,
@@ -382,17 +382,6 @@ impl JobHandler for ReplicationJobHandler {
         // mutations still land atomically on `complete`.
         Ok(Transaction::builder().build())
     }
-}
-
-/// Reads the `mediaType` field out of a manifest body, if present.
-fn media_type_of(body: &[u8]) -> Option<String> {
-    serde_json::from_slice::<serde_json::Value>(body)
-        .ok()
-        .and_then(|v| {
-            v.get("mediaType")
-                .and_then(|m| m.as_str())
-                .map(ToString::to_string)
-        })
 }
 
 /// Builder for [`ReplicationJobHandler`] taking individual resolved fields.

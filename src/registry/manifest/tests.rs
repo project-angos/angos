@@ -2479,6 +2479,80 @@ async fn delete_manifest_accepts_lww_newer_source_ts() {
 }
 
 #[tokio::test]
+async fn prune_delete_stamped_source_ts_suppressed_when_local_tag_newer_else_proceeds() {
+    // Mirrors the scrub prune path end-to-end on the receiver: the reconcile
+    // executor stamps `source_ts = Utc::now().to_rfc3339()` on the delete payload;
+    // the pipeline forwards it as the RFC 3339 `X-Angos-Source-Timestamp` header;
+    // the receiver parses it back (`parse_from_rfc3339(..).with_timezone(&Utc)`)
+    // and feeds it to `delete_manifest`. A downstream tag whose `created_at` is
+    // strictly newer than the stamped instant is PRESERVED (REPLICATION_SUPERSEDED)
+    // instead of being deleted unconditionally; an older one proceeds.
+    let test_case = FSRegistryTestCase::new();
+    let registry = test_case.registry();
+    let namespace = &Namespace::new("prune-repo").unwrap();
+    let tag = "stray";
+
+    seed_tag(registry, namespace, tag).await;
+    let created_at = local_created_at(registry, namespace, tag).await;
+
+    // 1. Suppressed: the prune decision predates the (receiver-side) tag, so the
+    //    stamped source_ts is OLDER than the local `created_at`. Stamp -> string
+    //    -> reparse exactly as the wire path does.
+    let decided_before = created_at - chrono::Duration::seconds(60);
+    let stamped = decided_before.to_rfc3339();
+    let reparsed = chrono::DateTime::parse_from_rfc3339(&stamped)
+        .expect("stamped source_ts must be valid RFC 3339")
+        .with_timezone(&chrono::Utc);
+
+    let result = registry
+        .delete_manifest(
+            None,
+            None,
+            Some(reparsed),
+            namespace,
+            &Reference::Tag(tag.to_string()),
+        )
+        .await
+        .err();
+    assert!(
+        matches!(result, Some(Error::ReplicationSuperseded(_))),
+        "a prune delete must be suppressed when the downstream tag is strictly newer, got: {result:?}"
+    );
+    registry
+        .metadata_store
+        .read_link(namespace.as_ref(), &LinkKind::Tag(tag.to_string()), false)
+        .await
+        .expect("a superseded prune delete must preserve the downstream tag");
+
+    // 2. Proceeds: the prune decision is later than the tag, so the stamped
+    //    source_ts is NEWER than the local `created_at` and the delete applies.
+    let decided_after = created_at + chrono::Duration::seconds(60);
+    let stamped = decided_after.to_rfc3339();
+    let reparsed = chrono::DateTime::parse_from_rfc3339(&stamped)
+        .expect("stamped source_ts must be valid RFC 3339")
+        .with_timezone(&chrono::Utc);
+
+    registry
+        .delete_manifest(
+            None,
+            None,
+            Some(reparsed),
+            namespace,
+            &Reference::Tag(tag.to_string()),
+        )
+        .await
+        .expect("a prune delete must proceed when its source_ts is newer than the tag");
+    let result = registry
+        .metadata_store
+        .read_link(namespace.as_ref(), &LinkKind::Tag(tag.to_string()), false)
+        .await;
+    assert!(
+        matches!(result, Err(metadata_store::Error::ReferenceNotFound)),
+        "the downstream tag must be gone after an applied prune delete, got: {result:?}"
+    );
+}
+
+#[tokio::test]
 async fn replication_superseded_maps_to_distinct_oci_code() {
     use crate::command::server::Error as ServerError;
     use crate::replication::REPLICATION_SUPERSEDED_CODE;

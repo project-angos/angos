@@ -67,7 +67,11 @@ pub struct Options {
     /// check for and remove orphan referrer links whose referrer manifest is no longer a current revision
     pub referrers: bool,
     #[argh(switch)]
-    /// reconcile every replicated namespace with all its downstreams, enqueuing a replication push for each diverging or downstream-missing tag (monotonic-add only; never deletes)
+    /// reconcile every replicated namespace with all its downstreams; additive by
+    /// default (enqueues a replication push for each diverging or downstream-missing
+    /// tag), and for a downstream marked prune = true also enqueues a replication
+    /// delete for each downstream-only tag (one-way mirror; unsafe for active-active
+    /// peers)
     pub replicate: bool,
 }
 

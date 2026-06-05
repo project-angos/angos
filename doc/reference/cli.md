@@ -85,7 +85,7 @@ The scrub command performs storage maintenance and integrity checks. You must sp
 | `--links`                 | `-l`   | Fix links format inconsistencies; remove revisions whose manifest blob is missing; prune phantom referrer back-links |
 | `--media-types`           | `-M`   | Backfill missing `media_type` on manifest links; remove revisions whose manifest blob is missing   |
 | `--referrers`             | `-R`   | Check for and remove orphan referrer links whose referrer manifest is no longer a current revision |
-| `--replicate`             |        | Reconcile every replicated namespace against all its configured downstreams, enqueuing a replication push for each diverging or downstream-missing tag (monotonic-add only; never deletes). Combine with `--dry-run` to preview. See [Configure Replication](../how-to/configure-replication.md). |
+| `--replicate`             |        | Reconcile every replicated namespace against all its configured downstreams. By default reconciliation is additive: it enqueues a replication push for each diverging or downstream-missing tag and never deletes. A downstream marked `prune = true` is treated as an authoritative one-way mirror — reconciliation also enqueues a replication delete for each downstream-only tag, so prune is one-way-only by design and unsafe for active-active peers (even with receiver-side last-writer-wins it can remove a peer's newer tag). Combine with `--dry-run` to preview. See [Configure Replication](../how-to/configure-replication.md). |
 
 **Examples:**
 

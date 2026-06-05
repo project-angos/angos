@@ -13,7 +13,7 @@ use crate::{
     identity::{Action, ClientIdentity},
     oci::{Namespace, Reference},
     policy::{AccessMode, PolicyDecision},
-    registry::{AccessPolicy, Registry},
+    registry::{AccessPolicy, BlobMount, Registry},
 };
 
 const ACCESS_DENIED: &str = "Access denied";
@@ -175,6 +175,41 @@ impl Authorizer {
         }
 
         Ok(())
+    }
+
+    /// Whether `identity` may read `mount.digest` from at least one namespace that
+    /// already holds it — the precondition for granting a cross-repo blob mount.
+    ///
+    /// A mount grants the target a reference to an existing blob with no upload, so
+    /// without this check a caller permitted to mount into a namespace they control
+    /// could copy (and then read) any blob held by any other namespace, bypassing
+    /// that source's read policy. The candidate source namespaces are resolved and
+    /// the ordinary `get-blob` read-authorization chain is run against each;
+    /// `false` is returned when none are readable (or the mount has no source), so
+    /// the caller degrades to a normal upload session instead of leaking the blob.
+    #[instrument(skip(self, request, registry))]
+    pub async fn authorize_mount_source(
+        &self,
+        mount: &BlobMount,
+        identity: &ClientIdentity,
+        request: &Parts,
+        registry: &Registry,
+    ) -> Result<bool, Error> {
+        for source in registry.mount_source_candidates(mount).await? {
+            let action = Action::GetBlob {
+                namespace: source,
+                digest: mount.digest.clone(),
+            };
+            match self
+                .authorize_request(&action, identity, request, registry)
+                .await
+            {
+                Ok(()) => return Ok(true),
+                Err(Error::Unauthorized(_)) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(false)
     }
 
     async fn authorize_namespace_request(

@@ -158,18 +158,19 @@ rules = [
 ### Restrict cross-repository blob mount
 
 A cross-repository mount (`POST .../blobs/uploads/?mount={digest}[&from={repo}]`) grants the target
-namespace a reference to an existing blob based on the blob's presence, not on the caller's access to
-the source. A caller able to push to the target can therefore reference any blob it knows the digest
-of (with `from`, any blob readable from `{repo}`; without `from`, any blob referenced by any
-namespace) and then pull it from the target.
+namespace a reference to an existing blob with no upload. Angos grants it only when the caller is
+authorized to **read** the blob from a namespace that holds it -- the source repository named by
+`{repo}`, or (for a from-less mount) any namespace that references the blob. A caller who cannot read
+the source falls back to a normal upload instead, so a mount never hands over a blob the caller could
+not otherwise pull -- you do not have to write a policy to close that gap.
 
-A mount is its own route and CEL action, `mount-blob`, distinct from `start-upload`, so a policy
-gates it with a single `request.action == 'mount-blob'` rule -- independent of the rules governing
-ordinary uploads. Denying it rejects the mount request; Angos's own replication transparently falls
-back to a normal upload when a downstream denies the mount, so denying `mount-blob` never breaks
-replication.
+Beyond that source-read check, a mount is its own route and CEL action, `mount-blob`, distinct from
+`start-upload`, so a policy can restrict who may mount **at all** with a single
+`request.action == 'mount-blob'` rule -- independent of the rules governing ordinary uploads. Denying
+it rejects the mount request; Angos's own replication transparently falls back to a normal upload when
+a downstream denies the mount, so denying `mount-blob` never breaks replication.
 
-Restrict every mount to a trusted identity (for example the replicator), leaving ordinary uploads
+For example, restrict every mount to a trusted identity (the replicator), leaving ordinary uploads
 untouched. Under a `default = "deny"` policy, add an allow-rule for it:
 
 ```toml

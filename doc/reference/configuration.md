@@ -439,6 +439,7 @@ Array of downstream registries to which this repository's mutations are replicat
 | `mode`                  | string   | `"event+reconcile"` | `"event+reconcile"`, `"event-only"`, or `"reconcile-only"`              |
 | `namespace_filter`      | [string] | `[]` (all)         | Regex patterns; a namespace replicates here only if it matches one       |
 | `max_concurrent_pushes` | usize    | `4`                | Concurrent blob pushes per manifest for this downstream                  |
+| `prune`                 | bool     | `false`            | When `true`, reconciliation also deletes downstream-only tags — authoritative one-way mirror; unsafe for active-active peers |
 | `max_redirect`          | u8       | `5`                | Maximum redirects to follow                                              |
 | `username`              | string   | -                  | Basic auth username                                                      |
 | `password`              | string   | -                  | Basic auth password                                                      |

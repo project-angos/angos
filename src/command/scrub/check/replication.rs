@@ -19,9 +19,20 @@
 //! retry/backoff/dead-letter/coalescing as the event path, and the mutation
 //! applier stays free of network fan-out.
 //!
-//! This is destructive by design: a downstream-only tag is removed. When the
-//! downstream `list_tags` enumeration fails, the cleanup step is skipped for that
-//! downstream (a warning is logged) rather than aborting the run.
+//! Deletion is `prune`-gated and off by default: a downstream-only tag is removed
+//! only when the downstream is marked `prune = true`. When pruning is enabled and
+//! the downstream `list_tags` enumeration fails, the cleanup step is skipped for
+//! that downstream (a warning is logged) rather than aborting the run.
+//!
+//! `prune` is ONE-WAY-MIRROR-ONLY. The prune-delete action carries a `source_ts`
+//! stamped at the moment reconcile decides to delete, so the receiver runs
+//! last-writer-wins instead of deleting unconditionally; this guards against a
+//! downstream tag dated in the future relative to the decision (clock skew, or a
+//! tag pushed in the gap between the listing and the delete landing). It does NOT
+//! make prune safe for active-active: a peer's legitimately-newer tag whose
+//! `created_at` predates this reconcile run still has `created_at < source_ts`
+//! and IS deleted. Enable `prune = true` only for a downstream that is an
+//! authoritative one-way mirror.
 
 use std::{collections::HashSet, sync::Arc};
 
@@ -45,9 +56,10 @@ use crate::{
 };
 
 /// Reconciles every replicated namespace with all its downstreams by enqueuing a
-/// replication push for each diverging or downstream-missing tag, and a
-/// replication delete for each downstream-only tag (full mirror, local
-/// authoritative).
+/// replication push for each diverging or downstream-missing tag. For a downstream
+/// marked `prune = true` (an authoritative one-way mirror), it additionally
+/// enqueues a replication delete for each downstream-only tag; pruning is off by
+/// default.
 ///
 /// Holds only resolved `Arc` dependencies — no `*Config` field. Constructed
 /// exclusively via [`ReplicationChecker::builder`].
@@ -86,9 +98,10 @@ impl ReplicationChecker {
         }
     }
 
-    /// Reconciles one downstream against the local tag set (full mirror): emits an
-    /// `EnqueueReplicationPush` for every diverging or downstream-missing tag, and
-    /// an `EnqueueReplicationDelete` for every downstream-only tag.
+    /// Reconciles one downstream against the local tag set: emits an
+    /// `EnqueueReplicationPush` for every diverging or downstream-missing tag, and,
+    /// only when the downstream is marked `prune = true`, an
+    /// `EnqueueReplicationDelete` for every downstream-only tag.
     async fn reconcile_downstream(
         &self,
         downstream: &ReplicationDownstream,
@@ -138,9 +151,12 @@ impl ReplicationChecker {
         //    mirror (`prune = true`), enumerate its tag set and delete any tag
         //    absent locally. Skipped by default — for an active-active peer this
         //    would delete a peer's legitimately-newer tag that has not yet
-        //    replicated back, so absence-driven deletion is unsafe there. A
-        //    failed enumeration warns and skips cleanup for this downstream
-        //    rather than aborting the whole run.
+        //    replicated back, so absence-driven deletion is unsafe there. The
+        //    receiver runs LWW on the stamped `source_ts` (see `Executor`), which
+        //    only saves a future-dated downstream tag — it does NOT make prune
+        //    active-active safe (a peer's newer tag predating this run is still
+        //    deleted), so this is one-way-mirror-only. A failed enumeration warns
+        //    and skips cleanup for this downstream rather than aborting the run.
         if !downstream.prune {
             return Ok(());
         }
