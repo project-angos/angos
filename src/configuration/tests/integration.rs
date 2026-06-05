@@ -755,6 +755,102 @@ fn test_metadata_store_s3_lock_strategy_s3_defaults() {
     }
 }
 
+// A durable job queue ([global.job_queue]) drains across multiple processes, so
+// the per-job execution lock must be shared. An S3 blob store with no explicit
+// metadata-store lock strategy inherits the in-process `memory` lock, which
+// cannot serialize across processes — that combination must be rejected.
+#[test]
+fn job_queue_rejects_inherited_memory_lock_on_s3() {
+    let config = r#"
+    [server]
+    bind_address = "0.0.0.0"
+
+    [global.job_queue]
+
+    [blob_store.s3]
+    bucket = "blob-bucket"
+    region = "us-east-1"
+    endpoint = "https://s3.amazonaws.com"
+    access_key_id = "key"
+    secret_key = "secret"
+    "#;
+
+    let err = Configuration::load_from_str(config).unwrap_err();
+    let message = err.to_string();
+    assert!(
+        message.contains("memory") && message.contains("lock"),
+        "durable queue + inherited memory lock must be rejected, got: {message}"
+    );
+}
+
+#[test]
+fn job_queue_rejects_fs_memory_lock() {
+    let config = r#"
+    [server]
+    bind_address = "0.0.0.0"
+
+    [global.job_queue]
+
+    [blob_store.fs]
+    root_dir = "/data/blobs"
+    "#;
+
+    let err = Configuration::load_from_str(config).unwrap_err();
+    assert!(
+        err.to_string().contains("lock"),
+        "durable queue + FS memory lock must be rejected, got: {err}"
+    );
+}
+
+#[test]
+fn job_queue_allows_shared_s3_lock() {
+    let config = r#"
+    [server]
+    bind_address = "0.0.0.0"
+
+    [global.job_queue]
+
+    [blob_store.s3]
+    bucket = "blob-bucket"
+    region = "us-east-1"
+    endpoint = "https://s3.amazonaws.com"
+    access_key_id = "blob-key"
+    secret_key = "blob-secret"
+
+    [metadata_store.s3]
+    bucket = "metadata-bucket"
+    region = "us-east-1"
+    endpoint = "https://s3.amazonaws.com"
+    access_key_id = "key"
+    secret_key = "secret"
+
+    [metadata_store.s3.lock_strategy.s3]
+    "#;
+
+    assert!(
+        Configuration::load_from_str(config).is_ok(),
+        "durable queue with a shared S3 lock must be accepted"
+    );
+}
+
+// Without [global.job_queue] the queue drains in a single process, so the
+// in-process memory lock is sufficient and must be accepted.
+#[test]
+fn in_process_queue_allows_memory_lock() {
+    let config = r#"
+    [server]
+    bind_address = "0.0.0.0"
+
+    [blob_store.fs]
+    root_dir = "/data/blobs"
+    "#;
+
+    assert!(
+        Configuration::load_from_str(config).is_ok(),
+        "in-process queue with a memory lock must be accepted"
+    );
+}
+
 #[test]
 fn test_metadata_store_s3_lock_strategy_s3_custom_values() {
     let config = r#"

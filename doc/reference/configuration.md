@@ -81,6 +81,14 @@ strategy is likewise inherited from `[metadata_store]`. There is therefore no
 job-queue-level backend, credential, prefix, or lock-strategy setting — the
 section accepts only the two tunables below.
 
+> **A shared lock strategy is required.** The durable queue is drained by
+> separate processes, so the per-job execution lock must be shared across them.
+> The default in-process `memory` lock cannot coordinate across processes, so
+> `[global.job_queue]` combined with a `memory` lock strategy is **rejected at
+> startup**. Configure the metadata store with `[metadata_store.s3.lock_strategy.s3]`
+> (S3 CAS) or a `[lock_strategy.redis]` table, or omit `[global.job_queue]` to use
+> the single-process in-process queue.
+
 | Option | Type | Default | Description |
 |---|---|---|---|
 | `pending_refresh_interval_secs` | u64 | `15` | How often the server refreshes the `angos_job_queue_pending` gauge. Must be at least `5` (sub-5s ticks induce LIST storms on S3). |

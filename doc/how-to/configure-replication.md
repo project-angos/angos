@@ -84,6 +84,8 @@ angos -c config.toml worker --queue replication
 
 This is the multi-replica, horizontally-scalable configuration: draining is decoupled from serving and can be scaled independently. (Pending pushes persist under `_jobs/pending/replication/` and resume after a restart in both modes.) See [Enable Durable Cache Jobs](durable-cache-jobs.md) for the job-queue setup, KEDA autoscaling, and `angos worker` details. Run a separate worker (or worker pool) per queue you want drained.
 
+Because the queue is drained by separate processes, `[global.job_queue]` requires a **shared** metadata-store lock strategy (`[metadata_store.s3.lock_strategy.s3]` or a `[lock_strategy.redis]` table) so workers serialize on the same jobs; the default in-process `memory` lock is rejected at startup with this section. The in-process mode above (no `[global.job_queue]`) runs in a single process and works with any lock strategy.
+
 ## Two-Instance Active-Active Example
 
 Configure each instance with the other as a downstream for the same repository. With no `[global.job_queue]`, each server self-drains in-process -- no separate worker needed.
