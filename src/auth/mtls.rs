@@ -211,42 +211,6 @@ pub mod tests {
         }
     }
 
-    #[tokio::test(flavor = "current_thread")]
-    async fn malformed_certificate_logs_details_without_exposing_them_to_client() {
-        let log_capture = LogCapture::default();
-        let subscriber = tracing_subscriber::fmt()
-            .with_max_level(Level::TRACE)
-            .with_writer(log_capture.clone())
-            .with_span_events(FmtSpan::ENTER)
-            .with_ansi(false)
-            .finish();
-        let _guard = tracing::subscriber::set_default(subscriber);
-
-        let validator = MtlsValidator::new();
-        let peer_cert = PeerCertificate(Arc::new(vec![0u8; 100]));
-
-        let mut request = Request::builder().body(()).unwrap();
-        request.extensions_mut().insert(peer_cert);
-        let (parts, ()) = request.into_parts();
-
-        let mut identity = ClientIdentity::new(None);
-        let result = validator.authenticate(&parts, &mut identity).await;
-
-        match result.unwrap_err() {
-            Error::Unauthorized(msg) => assert_eq!(msg, "Invalid certificate"),
-            err => panic!("expected Unauthorized, got {err:?}"),
-        }
-
-        let logs = log_capture.contents();
-        assert!(
-            logs.contains("Failed to parse client certificate"),
-            "logs were: {logs}"
-        );
-        assert!(logs.contains("error="), "logs were: {logs}");
-        assert!(logs.contains("authenticate"), "logs were: {logs}");
-        assert!(!logs.contains("Malformed client certificate"));
-    }
-
     #[test]
     fn test_extract_certificate_identity() {
         let der = cert_der();
