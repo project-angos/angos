@@ -202,24 +202,36 @@ impl Registry {
     /// are gone), so the caller falls back to opening a normal upload session
     /// (`202 Accepted`) — the spec requires a mount that cannot be satisfied to
     /// degrade to an ordinary upload rather than fail.
+    ///
+    /// The entire size-check / `can_read` / `grant` sequence runs under the
+    /// `blob-data:{digest}` coarse lock, serializing it against a concurrent
+    /// `delete_blob` reclaim. Without the lock a delete could see no remaining
+    /// namespace references and reclaim the blob bytes between the size check
+    /// and the grant, leaving the target with a dangling reference.
     async fn try_cross_repo_mount(
         &self,
         namespace: &Namespace,
         mount: &BlobMount,
         source: &Namespace,
     ) -> Result<Option<HeaderMap>, Error> {
-        if self.blob_store.size(&mount.digest).await.is_err()
-            || !BlobOwnership::new(self.metadata_store.as_ref())
-                .can_read(source, &mount.digest)
-                .await?
-        {
-            return Ok(None);
-        }
+        let session = self.acquire_blob_data_lock(&mount.digest).await?;
+        let result = async {
+            if self.blob_store.size(&mount.digest).await.is_err()
+                || !BlobOwnership::new(self.metadata_store.as_ref())
+                    .can_read(source, &mount.digest)
+                    .await?
+            {
+                return Ok(None);
+            }
 
-        BlobOwnership::new(self.metadata_store.as_ref())
-            .grant(namespace, &mount.digest)
-            .await?;
-        Ok(Some(blob_location_headers(namespace, &mount.digest)))
+            BlobOwnership::new(self.metadata_store.as_ref())
+                .grant(namespace, &mount.digest)
+                .await?;
+            Ok(Some(blob_location_headers(namespace, &mount.digest)))
+        }
+        .await;
+        session.release().await;
+        result
     }
 
     /// Source namespaces a cross-repo mount of `mount.digest` would draw the blob
