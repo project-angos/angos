@@ -67,12 +67,11 @@ When omitted, the server runs without TLS (insecure).
 
 ### Durable Job Queue (`global.job_queue`)
 
-Optional. When present, pull-through cache-fill tasks are written to persistent
-storage instead of running in-process. `angos server` enqueues jobs on cache
-miss and publishes the queue-depth gauge on `/metrics`; one or more
-`angos worker` processes must be running to actually drain the queue. When the
-section is absent, jobs run in-process over an in-memory store (not durable
-across restarts).
+Optional. Controls where the job queue is drained. When absent (default),
+`angos server` drains the queue itself in-process. When present, `angos server`
+enqueues jobs and publishes the queue-depth gauge on `/metrics`, and one or
+more `angos worker` processes drain it. Either way, jobs persist under the
+`[metadata_store]` backend's `_jobs/` prefix and survive restarts.
 
 The queue does not have its own storage backend. Durable jobs are written to
 the **same backend configured for `[metadata_store]`** (filesystem or S3,

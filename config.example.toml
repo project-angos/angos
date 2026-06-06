@@ -77,10 +77,10 @@ root_dir = "./data-angos"
 #ttl = 30
 
 # Optional: Durable job queue for pull-through cache-fill tasks.
-# When omitted, jobs run in-process over an in-memory store (not durable across
-# restarts). Adding this section makes jobs durable; the server only enqueues
-# jobs and publishes the pending gauge, so run `angos worker` in addition to
-# `angos server` to actually drain the queue.
+# Jobs persist under the metadata_store's `_jobs/` prefix either way (survives
+# restarts). This section controls where the queue is drained: absent (default)
+# means `angos server` drains in-process; present means separate `angos worker`
+# processes drain it (requires a shared lock strategy).
 # The queue has no backend of its own: jobs are stored in the backend configured
 # for [metadata_store] (filesystem or S3) under a hardcoded `_jobs/` prefix, and
 # the lock strategy is inherited from [metadata_store]. Only the two tunables
