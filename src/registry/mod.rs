@@ -77,8 +77,8 @@ pub struct RegistryConfig {
     pub global_immutable_tags: bool,
     pub global_immutable_tags_exclusions: Vec<RegexPattern>,
     pub max_manifest_size_bytes: usize,
-    /// When set, the registry routes all cache-fill jobs through this
-    /// pre-built queue (typically the durable backend wired in `server setup`).
+    /// When set, the registry routes all cache-fill and replication jobs through
+    /// this pre-built queue (typically the durable backend wired in `server setup`).
     /// When absent, an engine-backed in-process queue is constructed
     /// automatically. The choice is made once at startup; no runtime switching.
     pub job_queue: Option<Arc<JobStore>>,

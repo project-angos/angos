@@ -29,7 +29,7 @@ use tempfile::Builder as TempFileBuilder;
 use tokio::{
     fs,
     io::{AsyncSeekExt, AsyncWriteExt},
-    task::spawn_blocking,
+    task::{spawn_blocking, yield_now},
 };
 use tokio_util::io::StreamReader;
 
@@ -276,6 +276,7 @@ async fn ensure_parent(path: &Path) -> Result<(), Error> {
                 if attempt >= ENSURE_PARENT_RETRIES {
                     return Err(backend_error("create_dir_all", parent, &e));
                 }
+                yield_now().await;
             }
         }
     }

@@ -13,6 +13,15 @@ use crate::{
     util::sha256::finalize_digest,
 };
 
+/// Maximum number of candidate namespaces checked during a from-less mount
+/// authorization. Referrers of a popular blob could number in the thousands;
+/// without a cap, a single public mount request triggers one CEL evaluation
+/// per candidate — an attacker-influenceable fan-out. The cap is fail-safe:
+/// if the caller holds access only to a namespace beyond this limit the mount
+/// is simply not granted and the client falls back to a normal upload session
+/// (202), which re-authorizes independently. No access is over-granted.
+const MAX_FROM_LESS_MOUNT_CANDIDATES: usize = 32;
+
 pub enum StartUploadResponse {
     ExistingBlob { headers: HeaderMap },
     Session { headers: HeaderMap },
@@ -262,9 +271,11 @@ impl Registry {
             });
         }
 
-        BlobOwnership::new(self.metadata_store.as_ref())
+        let mut candidates = BlobOwnership::new(self.metadata_store.as_ref())
             .referencing_namespaces(&mount.digest)
-            .await
+            .await?;
+        candidates.truncate(MAX_FROM_LESS_MOUNT_CANDIDATES);
+        Ok(candidates)
     }
 
     /// Opens a fresh resumable upload session and returns its `202` headers.

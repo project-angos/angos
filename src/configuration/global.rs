@@ -68,13 +68,24 @@ fn default_max_concurrent_cache_jobs() -> NonZeroUsize {
     DEFAULT_MAX_CONCURRENT_CACHE_JOBS
 }
 
-fn deserialize_max_concurrent_cache_jobs<'de, D>(deserializer: D) -> Result<NonZeroUsize, D::Error>
+/// Shared validation core for `NonZeroUsize` concurrency fields: deserializes
+/// a `usize` and rejects zero, naming the field in the error message.
+fn deserialize_positive_nonzero<'de, D>(
+    deserializer: D,
+    field: &str,
+) -> Result<NonZeroUsize, D::Error>
 where
     D: Deserializer<'de>,
 {
     let value = usize::deserialize(deserializer)?;
-    NonZeroUsize::new(value)
-        .ok_or_else(|| D::Error::custom("max_concurrent_cache_jobs must be > 0"))
+    NonZeroUsize::new(value).ok_or_else(|| D::Error::custom(format!("{field} must be > 0")))
+}
+
+fn deserialize_max_concurrent_cache_jobs<'de, D>(deserializer: D) -> Result<NonZeroUsize, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    deserialize_positive_nonzero(deserializer, "max_concurrent_cache_jobs")
 }
 
 fn default_max_concurrent_replication_jobs() -> NonZeroUsize {
@@ -87,9 +98,7 @@ fn deserialize_max_concurrent_replication_jobs<'de, D>(
 where
     D: Deserializer<'de>,
 {
-    let value = usize::deserialize(deserializer)?;
-    NonZeroUsize::new(value)
-        .ok_or_else(|| D::Error::custom("max_concurrent_replication_jobs must be > 0"))
+    deserialize_positive_nonzero(deserializer, "max_concurrent_replication_jobs")
 }
 
 fn default_max_manifest_size() -> ByteSize {

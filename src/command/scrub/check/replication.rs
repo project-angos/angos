@@ -110,7 +110,7 @@ impl ReplicationChecker {
         namespace: &str,
         local_tags: &[String],
         sink: &mut (dyn ActionSink + Send),
-    ) -> Result<(), Error> {
+    ) {
         // 1. Push: iterate the LOCAL tag set and probe each tag on the downstream
         //    with `head_manifest`; a diverging or missing tag needs a push.
         for tag in local_tags {
@@ -181,7 +181,7 @@ impl ReplicationChecker {
         //    deleted), so this is one-way-mirror-only. A failed enumeration warns
         //    and skips cleanup for this downstream rather than aborting the run.
         if !downstream.prune {
-            return Ok(());
+            return;
         }
 
         let location = downstream
@@ -194,7 +194,7 @@ impl ReplicationChecker {
                     "Failed to list tags on downstream '{}' for '{namespace}'; skipping cleanup: {e}",
                     downstream.name
                 );
-                return Ok(());
+                return;
             }
         };
 
@@ -219,8 +219,6 @@ impl ReplicationChecker {
                 );
             }
         }
-
-        Ok(())
     }
 }
 
@@ -255,7 +253,7 @@ impl NamespaceChecker for ReplicationChecker {
 
         for downstream in downstreams {
             self.reconcile_downstream(downstream, namespace, &local_tags, sink)
-                .await?;
+                .await;
         }
         Ok(())
     }

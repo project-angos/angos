@@ -273,7 +273,7 @@ impl WorkerContext {
         engine_maintenance: Option<CancellationToken>,
     ) -> Result<Self, Error> {
         let auth_cache = bootstrap::auth_cache(&config.cache)?;
-        let blob_store = std::sync::Arc::new(config.blob_store.build_backend()?);
+        let blob_store = Arc::new(config.blob_store.build_backend()?);
         let metadata_store =
             bootstrap::metadata_store(&config.resolve_registry_storage(), &auth_cache).await?;
         let repositories = bootstrap::repositories(

@@ -85,7 +85,8 @@ section accepts only the two tunables below.
 > The default in-process `memory` lock cannot coordinate across processes, so
 > `[global.job_queue]` combined with a `memory` lock strategy is **rejected at
 > startup**. Configure the metadata store with `[metadata_store.s3.lock_strategy.s3]`
-> (S3 CAS) or a `[lock_strategy.redis]` table, or omit `[global.job_queue]` to use
+> (S3 CAS) or `[metadata_store.s3.lock_strategy.redis]` / `[metadata_store.fs.lock_strategy.redis]`
+> (Redis), or omit `[global.job_queue]` to use
 > the single-process in-process queue.
 
 | Option | Type | Default | Description |

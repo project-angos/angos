@@ -30,6 +30,8 @@ use crate::{
 
 /// Media type of an OCI image index (the referrers fallback tag body).
 const OCI_INDEX_MEDIA_TYPE: &str = "application/vnd.oci.image.index.v1+json";
+/// Media type of an OCI image manifest (used as the default for referrer descriptors).
+const OCI_MANIFEST_MEDIA_TYPE: &str = "application/vnd.oci.image.manifest.v1+json";
 
 /// Outcome of a successful replication push or delete.
 ///
@@ -167,13 +169,13 @@ pub async fn push_manifest(
         return Ok(PushOutcome::Pushed);
     }
 
+    // The referrers fallback below borrows the manifest body, but only a
+    // subject-bearing manifest can reach it — retain a copy for that path alone
+    // and move the body straight into the PUT on the common (no-subject) path.
+    let fallback_body = parsed.subject.is_some().then(|| body.clone());
+
     let result = downstream
-        .put_manifest(
-            &location,
-            effective_media_type.as_deref(),
-            body.clone(),
-            source_ts,
-        )
+        .put_manifest(&location, effective_media_type.as_deref(), body, source_ts)
         .await
         .map_err(Error::Registry)?;
 
@@ -194,7 +196,8 @@ pub async fn push_manifest(
     // 4. Referrers fallback: a subject-bearing manifest on an OCI-1.0 downstream
     //    (no `OCI-Subject` response header) is not auto-indexed, so push the
     //    referrers fallback tag manifest. OCI-1.1 downstreams index it for free.
-    if parsed.subject.is_some() && result.subject.is_none() {
+    //    `fallback_body` is `Some` only when the manifest carries a subject.
+    if let Some(body) = fallback_body.filter(|_| result.subject.is_none()) {
         push_referrers_fallback(downstream, namespace, digest, &parsed, &body, source_ts).await?;
     }
 
@@ -453,7 +456,7 @@ async fn fetch_fallback_manifests(
 /// from the manifest body when present).
 fn referrer_descriptor(referrer_digest: &Digest, body: &[u8]) -> Value {
     let mut descriptor = json!({
-        "mediaType": OCI_INDEX_MEDIA_TYPE,
+        "mediaType": OCI_MANIFEST_MEDIA_TYPE,
         "digest": referrer_digest.to_string(),
         "size": body.len(),
     });
