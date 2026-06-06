@@ -187,43 +187,33 @@ impl Registry {
 
     /// Attempts an OCI cross-repository blob mount.
     ///
-    /// When the blob `mount.digest` is already stored AND mountable, the target
-    /// `namespace` is granted a reference and the completed-blob headers are
-    /// returned (the caller answers `201 Created` with no body transfer).
-    /// "Mountable" depends on the request:
-    /// - **`from` set** — the blob must be readable from that repository.
-    /// - **`from` unset** (automatic content discovery) — the blob must already be
-    ///   referenced by some namespace.
+    /// Mountability is anchored on [`mount_source_candidates`](Self::mount_source_candidates)
+    /// — the same set the authorization gate consults — so the two can never
+    /// disagree on which source namespaces a mount draws from. When that set is
+    /// non-empty the target `namespace` is granted a reference and the
+    /// completed-blob headers are returned (the caller answers `201 Created`
+    /// with no body transfer). The candidate set already encodes the request:
+    /// - **`from` set** — non-empty only when the blob is readable from that
+    ///   repository.
+    /// - **`from` unset** (automatic content discovery) — non-empty when the
+    ///   blob is already referenced by some namespace.
     ///
-    /// Returns `Ok(None)` when the blob is absent or not mountable, so the caller
-    /// falls back to opening a normal upload session (`202 Accepted`) — the spec
-    /// requires a mount that cannot be satisfied to degrade to an ordinary upload
-    /// rather than fail.
+    /// Returns `Ok(None)` when there are no candidates (blob absent or not
+    /// mountable), so the caller falls back to opening a normal upload session
+    /// (`202 Accepted`) — the spec requires a mount that cannot be satisfied to
+    /// degrade to an ordinary upload rather than fail.
     async fn try_cross_repo_mount(
         &self,
         namespace: &Namespace,
         mount: &BlobMount,
     ) -> Result<Option<HeaderMap>, Error> {
-        if self.blob_store.size(&mount.digest).await.is_err() {
+        if self.mount_source_candidates(mount).await?.is_empty() {
             return Ok(None);
         }
 
-        let ownership = BlobOwnership::new(self.metadata_store.as_ref());
-        let mountable = match &mount.from {
-            Some(from) => ownership.can_read(from, &mount.digest).await?,
-            // Automatic content discovery (no `from`): mount when the blob is
-            // known content (referenced by some namespace), not an orphan blob.
-            None => {
-                self.metadata_store
-                    .has_blob_references(&mount.digest)
-                    .await?
-            }
-        };
-        if !mountable {
-            return Ok(None);
-        }
-
-        ownership.grant(namespace, &mount.digest).await?;
+        BlobOwnership::new(self.metadata_store.as_ref())
+            .grant(namespace, &mount.digest)
+            .await?;
         Ok(Some(blob_location_headers(namespace, &mount.digest)))
     }
 
