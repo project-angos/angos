@@ -8,8 +8,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
-- Bi-directional replication mirrors manifest pushes and deletes to per-repository downstreams over the durable job queue, with on-demand reconciliation via `scrub --replicate` that pushes diverging or downstream-missing tags; downstream-only tags are deleted only for downstreams marked `prune = true` (one-way mirror, off by default).
+- Bi-directional replication mirrors manifest pushes and deletes to per-repository downstreams over the durable job queue, with on-demand reconciliation via `scrub --replicate`.
 - Cross-repository blob mount (`POST /v2/{namespace}/blobs/uploads/?mount={digest}[&from={repository}]`) grants an already-present blob to the target namespace with no upload, which replication uses to skip re-uploading blobs a downstream already holds.
+
+### Changed
+
+- A blob-upload `POST` carrying `?mount=<digest>` is now authorized as a distinct `mount-blob` action; a default-deny access policy must grant `mount-blob` for cross-repo mounts that previously evaluated as `start-upload`.
+- `angos worker` with no `--queue` now drains both the `cache` and `replication` queues; pass `--queue cache` to restore the previous cache-only default.
+- A `[global.job_queue]` configured with the in-process `memory` lock is now rejected at startup; set the metadata store's `lock_strategy` to `s3` or `redis`, or remove `[global.job_queue]` to use the in-process queue.
 
 ## 1.2.0 - 2026-06-03
 

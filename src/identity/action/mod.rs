@@ -39,6 +39,7 @@ use crate::{
 /// - `n`: Maximum number of results for pagination
 /// - `last`: Last result marker for pagination
 /// - `artifact_type`: Filter for referrer queries
+/// - `from`: Source repository of a cross-repo `mount-blob` (present only when the mount specifies `?from=`; test with `has(request.from)`)
 #[derive(Clone, Debug, Serialize)]
 #[serde(tag = "action", rename_all = "kebab-case")]
 pub enum Action {
