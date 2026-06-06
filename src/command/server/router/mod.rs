@@ -80,6 +80,7 @@ fn digest_from_params(params: Option<&str>) -> Option<Digest> {
 struct MountQuery {
     mount: Option<String>,
     from: Option<String>,
+    digest: Option<String>,
 }
 
 #[derive(Deserialize, Debug, Default)]
@@ -183,37 +184,36 @@ fn try_parse_upload(method: &Method, path: &str, params: Option<&str>) -> Option
     {
         let namespace = Namespace::new(namespace_str).ok()?;
 
-        return match *method {
-            // `?mount=<digest>` routes to the dedicated cross-repo mount action;
-            // otherwise it is an ordinary upload start.
-            Method::POST => {
-                let query: MountQuery = params.map(parse_query).unwrap_or_default();
-                match query.mount.as_ref().and_then(|d| d.parse().ok()) {
-                    Some(digest) => {
-                        // An explicit `?from=` that does not parse as a namespace
-                        // is rejected (an unmatched POST becomes a 400) rather than
-                        // silently dropped: degrading to a from-less auto-discovery
-                        // mount would widen the authorized source set a policy
-                        // author reasoned about. An absent `from` is the legitimate
-                        // auto-discovery case.
-                        let from = match query.from.as_deref() {
-                            Some(raw) => Some(Namespace::new(raw).ok()?),
-                            None => None,
-                        };
-                        Some(Action::MountBlob {
-                            namespace,
-                            digest,
-                            from,
-                        })
-                    }
-                    None => Some(Action::StartUpload {
-                        namespace,
-                        digest: digest_from_params(params),
-                    }),
-                }
-            }
-            _ => None,
+        if *method != Method::POST {
+            return None;
+        }
+        let query: MountQuery = params.map(parse_query).unwrap_or_default();
+
+        // A valid `?mount=<digest>` requests a cross-repo mount; anything else
+        // (including a malformed mount) is an ordinary upload start.
+        if let Some(value) = &query.mount
+            && let Ok(digest) = value.parse::<Digest>()
+        {
+            // A present-but-invalid `?from=` is rejected (the POST becomes a 400)
+            // rather than silently treated as from-less auto-discovery, which would
+            // widen the authorized source set.
+            let from = match &query.from {
+                Some(repo) => Some(Namespace::new(repo).ok()?),
+                None => None,
+            };
+            return Some(Action::MountBlob {
+                namespace,
+                digest,
+                from,
+            });
+        }
+
+        // Ordinary upload start, optionally monolithic via `?digest=`.
+        let digest = match &query.digest {
+            Some(value) => value.parse::<Digest>().ok(),
+            None => None,
         };
+        return Some(Action::StartUpload { namespace, digest });
     }
 
     let (namespace_str, uuid) = path.rsplit_once("/blobs/uploads/")?;
