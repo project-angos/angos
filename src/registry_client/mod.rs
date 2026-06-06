@@ -115,11 +115,11 @@ impl RegistryClient {
     }
 
     /// Resolves the HTTP client and basic-auth credentials from a parsed
-    /// [`RegistryClientConfig`].
+    /// [`RegistryClientConfig`] for repository setup.
     ///
-    /// Shared by [`RegistryClient::new`] / [`RegistryClient::new_with_manifest_size_limit`]
-    /// and by callers that build via [`RegistryClient::builder`] directly
-    /// (e.g. replication downstream resolution).
+    /// Used by callers that build via [`RegistryClient::builder`] directly
+    /// (e.g. replication downstream resolution) and reused by the test-only
+    /// `new` constructor.
     ///
     /// # Errors
     ///
@@ -155,7 +155,8 @@ impl RegistryClient {
         Ok((client, basic_auth))
     }
 
-    /// Creates a registry client for one upstream registry.
+    /// Creates a registry client for one upstream registry with the given
+    /// manifest body size limit.
     ///
     /// Thin internal helper over [`RegistryClient::builder`]; resolves the HTTP
     /// client and credentials from `config`.
@@ -163,19 +164,8 @@ impl RegistryClient {
     /// # Errors
     ///
     /// Returns an error when TLS files cannot be loaded or the HTTP client cannot be built.
-    pub fn new(config: &RegistryClientConfig, cache: Arc<Cache>) -> Result<Self, Error> {
-        Self::new_with_manifest_size_limit(config, cache, DEFAULT_MAX_MANIFEST_SIZE_BYTES)
-    }
-
-    /// Creates a registry client with a custom manifest body size limit.
-    ///
-    /// Thin internal helper over [`RegistryClient::builder`]; resolves the HTTP
-    /// client and credentials from `config`.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when TLS files cannot be loaded or the HTTP client cannot be built.
-    pub fn new_with_manifest_size_limit(
+    #[cfg(test)]
+    pub fn new(
         config: &RegistryClientConfig,
         cache: Arc<Cache>,
         max_manifest_size_bytes: usize,
