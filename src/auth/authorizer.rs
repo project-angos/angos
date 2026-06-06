@@ -185,8 +185,10 @@ impl Authorizer {
     /// could copy (and then read) any blob held by any other namespace, bypassing
     /// that source's read policy. The candidate source namespaces are resolved and
     /// the ordinary `get-blob` read-authorization chain is run against each;
-    /// `false` is returned when none are readable (or the mount has no source), so
-    /// the caller degrades to a normal upload session instead of leaking the blob.
+    /// `None` is returned when none are readable (or the mount has no source), so
+    /// the caller degrades to a normal upload session instead of leaking the blob;
+    /// otherwise the authorized source namespace is returned so the grant can be
+    /// conditioned on it rather than on an independently re-derived candidate set.
     #[instrument(skip(self, request, registry))]
     pub async fn authorize_mount_source(
         &self,
@@ -194,22 +196,22 @@ impl Authorizer {
         identity: &ClientIdentity,
         request: &Parts,
         registry: &Registry,
-    ) -> Result<bool, Error> {
+    ) -> Result<Option<Namespace>, Error> {
         for source in registry.mount_source_candidates(mount).await? {
             let action = Action::GetBlob {
-                namespace: source,
+                namespace: source.clone(),
                 digest: mount.digest.clone(),
             };
             match self
                 .authorize_request(&action, identity, request, registry)
                 .await
             {
-                Ok(()) => return Ok(true),
+                Ok(()) => return Ok(Some(source)),
                 Err(Error::Unauthorized(_)) => {}
                 Err(error) => return Err(error),
             }
         }
-        Ok(false)
+        Ok(None)
     }
 
     async fn authorize_namespace_request(

@@ -39,11 +39,14 @@ pub async fn handle_mount_blob(
     // the caller against a namespace that holds the blob first; when none is
     // readable, degrade to an ordinary upload session (an unsatisfiable mount
     // falls back to 202) rather than leaking the blob.
-    let response = if context
+    let response = if let Some(source) = context
         .authorize_mount_source(&mount, identity, parts)
         .await?
     {
-        context.registry.mount_blob(namespace, mount).await?
+        context
+            .registry
+            .mount_blob(namespace, mount, &source)
+            .await?
     } else {
         context.registry.start_upload(namespace, None).await?
     };

@@ -99,7 +99,7 @@ impl ServerContext {
         mount: &BlobMount,
         identity: &ClientIdentity,
         request: &Parts,
-    ) -> Result<bool, Error> {
+    ) -> Result<Option<Namespace>, Error> {
         self.authorizer
             .authorize_mount_source(mount, identity, request, &self.registry)
             .await

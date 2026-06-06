@@ -185,29 +185,34 @@ impl Registry {
         }
     }
 
-    /// Attempts an OCI cross-repository blob mount.
+    /// Attempts an OCI cross-repository blob mount, granting `namespace` a
+    /// reference to `mount.digest` drawn from `source`.
     ///
-    /// Mountability is anchored on [`mount_source_candidates`](Self::mount_source_candidates)
-    /// — the same set the authorization gate consults — so the two can never
-    /// disagree on which source namespaces a mount draws from. When that set is
-    /// non-empty the target `namespace` is granted a reference and the
-    /// completed-blob headers are returned (the caller answers `201 Created`
-    /// with no body transfer). The candidate set already encodes the request:
-    /// - **`from` set** — non-empty only when the blob is readable from that
-    ///   repository.
-    /// - **`from` unset** (automatic content discovery) — non-empty when the
-    ///   blob is already referenced by some namespace.
+    /// `source` is the namespace the caller was *authorized* to read the blob
+    /// from (resolved by the authorization gate from
+    /// [`mount_source_candidates`](Self::mount_source_candidates)). The grant
+    /// proceeds only when that same source still references the blob and its
+    /// bytes still exist — re-checked here rather than against an independently
+    /// re-derived candidate set, so concurrent index churn between authorization
+    /// and grant cannot mount from a source the caller was never authorized
+    /// against. On success the completed-blob headers are returned (the caller
+    /// answers `201 Created` with no body transfer).
     ///
-    /// Returns `Ok(None)` when there are no candidates (blob absent or not
-    /// mountable), so the caller falls back to opening a normal upload session
+    /// Returns `Ok(None)` when the source no longer holds the blob (or its bytes
+    /// are gone), so the caller falls back to opening a normal upload session
     /// (`202 Accepted`) — the spec requires a mount that cannot be satisfied to
     /// degrade to an ordinary upload rather than fail.
     async fn try_cross_repo_mount(
         &self,
         namespace: &Namespace,
         mount: &BlobMount,
+        source: &Namespace,
     ) -> Result<Option<HeaderMap>, Error> {
-        if self.mount_source_candidates(mount).await?.is_empty() {
+        if self.blob_store.size(&mount.digest).await.is_err()
+            || !BlobOwnership::new(self.metadata_store.as_ref())
+                .can_read(source, &mount.digest)
+                .await?
+        {
             return Ok(None);
         }
 
@@ -295,7 +300,9 @@ impl Registry {
         self.open_upload_session(namespace).await
     }
 
-    /// Starts a cross-repository blob mount.
+    /// Starts a cross-repository blob mount, granting `namespace` a reference to
+    /// `mount.digest` drawn from `source` (the namespace the caller was
+    /// authorized to read the blob from).
     ///
     /// When the mount can be satisfied, grants the namespace a reference with no
     /// transfer (`ExistingBlob` → `201`); otherwise falls back to opening an
@@ -306,8 +313,9 @@ impl Registry {
         &self,
         namespace: &Namespace,
         mount: BlobMount,
+        source: &Namespace,
     ) -> Result<StartUploadResponse, Error> {
-        if let Some(headers) = self.try_cross_repo_mount(namespace, &mount).await? {
+        if let Some(headers) = self.try_cross_repo_mount(namespace, &mount, source).await? {
             return Ok(StartUploadResponse::ExistingBlob { headers });
         }
 
@@ -709,7 +717,7 @@ mod tests {
                 digest: digest.clone(),
                 from: Some(source.clone()),
             };
-            let response = registry.mount_blob(target, mount).await.unwrap();
+            let response = registry.mount_blob(target, mount, source).await.unwrap();
 
             // 201-equivalent: the mount granted `target` a reference with no
             // transfer, so the existing-blob headers come back.
@@ -754,7 +762,7 @@ mod tests {
                 digest: digest.clone(),
                 from: Some(source.clone()),
             };
-            let response = registry.mount_blob(target, mount).await.unwrap();
+            let response = registry.mount_blob(target, mount, source).await.unwrap();
 
             match response {
                 StartUploadResponse::Session { headers } => {
@@ -798,7 +806,7 @@ mod tests {
                 digest: absent,
                 from: Some(source.clone()),
             };
-            let response = registry.mount_blob(target, mount).await.unwrap();
+            let response = registry.mount_blob(target, mount, source).await.unwrap();
 
             assert!(
                 matches!(response, StartUploadResponse::Session { .. }),
@@ -828,7 +836,7 @@ mod tests {
                 digest: digest.clone(),
                 from: None,
             };
-            let response = registry.mount_blob(target, mount).await.unwrap();
+            let response = registry.mount_blob(target, mount, owner).await.unwrap();
 
             match response {
                 StartUploadResponse::ExistingBlob { headers } => {
@@ -854,21 +862,66 @@ mod tests {
         for test_case in backends() {
             let registry = test_case.registry();
             let target = &Namespace::new("test-repo/target").unwrap();
+            let source = &Namespace::new("test-repo/source").unwrap();
             let content = b"orphan blob present but unreferenced";
 
-            // The blob bytes exist but no namespace references them, so automatic
-            // content discovery finds nothing and falls back to a session.
+            // The blob bytes exist but no namespace references them, so even the
+            // authorized source does not hold it and the mount falls back to a
+            // session.
             let digest = put_blob_direct(registry.metadata_store.store(), content).await;
 
             let mount = BlobMount {
                 digest: digest.clone(),
                 from: None,
             };
-            let response = registry.mount_blob(target, mount).await.unwrap();
+            let response = registry.mount_blob(target, mount, source).await.unwrap();
 
             assert!(
                 matches!(response, StartUploadResponse::Session { .. }),
                 "an unreferenced (orphan) blob must not be auto-mounted"
+            );
+            test_case.cleanup().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn test_mount_blob_grants_only_from_the_authorized_source() {
+        for test_case in backends() {
+            let registry = test_case.registry();
+            let owner = &Namespace::new("test-repo/owner").unwrap();
+            let authorized = &Namespace::new("test-repo/authorized").unwrap();
+            let target = &Namespace::new("test-repo/target").unwrap();
+            let content = b"held by owner, not by the authorized source";
+
+            // `owner` holds the blob; the source the caller was authorized against
+            // (`authorized`) does NOT. The grant is conditioned on the authorized
+            // source, so the mount must fall back rather than grant from `owner`
+            // (closes the authorize-then-grant TOCTOU).
+            let digest = put_blob_direct(registry.metadata_store.store(), content).await;
+            BlobOwnership::new(registry.metadata_store.as_ref())
+                .grant(owner, &digest)
+                .await
+                .unwrap();
+
+            let mount = BlobMount {
+                digest: digest.clone(),
+                from: None,
+            };
+            let response = registry
+                .mount_blob(target, mount, authorized)
+                .await
+                .unwrap();
+
+            assert!(
+                matches!(response, StartUploadResponse::Session { .. }),
+                "mount must fall back when the authorized source does not hold the blob"
+            );
+            assert!(
+                !BlobOwnership::new(registry.metadata_store.as_ref())
+                    .can_read(target, &digest)
+                    .await
+                    .unwrap(),
+                "target must not be granted a reference from an unauthorized source"
             );
             test_case.cleanup().await;
         }
@@ -994,14 +1047,16 @@ mod tests {
                     authorizer
                         .authorize_mount_source(&mount, &reader, &parts, registry)
                         .await
-                        .unwrap(),
+                        .unwrap()
+                        .is_some(),
                     "a caller permitted to read the source must be allowed to mount"
                 );
                 assert!(
-                    !authorizer
+                    authorizer
                         .authorize_mount_source(&mount, &stranger, &parts, registry)
                         .await
-                        .unwrap(),
+                        .unwrap()
+                        .is_none(),
                     "a caller denied read on the source must not be allowed to mount"
                 );
             }
