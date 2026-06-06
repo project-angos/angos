@@ -138,13 +138,23 @@ impl ReplicationChecker {
                 continue;
             }
 
-            sink.apply(Action::EnqueueReplicationPush {
-                downstream: downstream.name.clone(),
-                namespace: namespace.to_string(),
-                tag: tag.clone(),
-                digest: local,
-            })
-            .await?;
+            if let Err(e) = sink
+                .apply(Action::EnqueueReplicationPush {
+                    downstream: downstream.name.clone(),
+                    namespace: namespace.to_string(),
+                    tag: tag.clone(),
+                    digest: local,
+                })
+                .await
+            {
+                // A per-tag enqueue failure (e.g. a transient durable-queue write)
+                // must not abort the rest of the namespace. Reconcile is
+                // convergent: the next run re-enqueues whatever was missed.
+                warn!(
+                    "Failed to enqueue replication push for '{namespace}:{tag}' to downstream '{}'; continuing: {e}",
+                    downstream.name
+                );
+            }
         }
 
         // 2. Prune (opt-in): when this downstream is an authoritative one-way
@@ -178,12 +188,21 @@ impl ReplicationChecker {
             if local_set.contains(tag.as_str()) {
                 continue;
             }
-            sink.apply(Action::EnqueueReplicationDelete {
-                downstream: downstream.name.clone(),
-                namespace: namespace.to_string(),
-                tag,
-            })
-            .await?;
+            if let Err(e) = sink
+                .apply(Action::EnqueueReplicationDelete {
+                    downstream: downstream.name.clone(),
+                    namespace: namespace.to_string(),
+                    tag: tag.clone(),
+                })
+                .await
+            {
+                // As with the push loop above: a per-tag enqueue failure warns and
+                // continues so one flaky write does not skip the rest of the prune.
+                warn!(
+                    "Failed to enqueue replication delete for '{namespace}:{tag}' on downstream '{}'; continuing: {e}",
+                    downstream.name
+                );
+            }
         }
 
         Ok(())
@@ -274,6 +293,7 @@ impl ReplicationCheckerBuilder {
 mod tests {
     use std::{collections::HashMap, sync::Arc};
 
+    use async_trait::async_trait;
     use serde_json::json;
     use tempfile::TempDir;
     use wiremock::{
@@ -291,6 +311,7 @@ mod tests {
                 action::Action,
                 check::NamespaceChecker,
                 check::replication::ReplicationChecker,
+                error::Error,
                 executor::{ActionSink, Executor},
             },
             worker::runner::execute_one,
@@ -425,6 +446,134 @@ mod tests {
             Action::EnqueueReplicationPush { downstream, tag, digest, .. }
                 if downstream == DOWNSTREAM && tag == "v1" && *digest == manifest
         ));
+    }
+
+    /// An `ActionSink` that records every applied action and fails the first
+    /// `fail_first` of them, simulating a transient durable-queue enqueue error.
+    struct FlakySink {
+        attempted: Vec<Action>,
+        fail_first: usize,
+    }
+
+    #[async_trait]
+    impl ActionSink for FlakySink {
+        async fn apply(&mut self, action: Action) -> Result<(), Error> {
+            self.attempted.push(action);
+            if self.attempted.len() <= self.fail_first {
+                return Err(Error::Initialization("simulated enqueue failure".into()));
+            }
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn enqueue_failure_does_not_abort_remaining_tags() {
+        crate::metrics_provider::init_for_tests();
+        let (metadata_store, store, _dir) = fs_metadata_store();
+        let mock_server = MockServer::start().await;
+
+        // Local: two diverging tags (both missing on the downstream -> need push).
+        for tag in ["v1", "v2"] {
+            let body = format!("manifest-{tag}");
+            let manifest = put_blob_direct(&store, body.as_bytes()).await;
+            metadata_store
+                .update_links(
+                    NAMESPACE,
+                    &[LinkOperation::create(
+                        LinkKind::Tag(tag.to_string()),
+                        manifest,
+                    )],
+                )
+                .await
+                .unwrap();
+        }
+
+        // Every downstream HEAD is a 404 -> every local tag needs a push.
+        Mock::given(method("HEAD"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&mock_server)
+            .await;
+
+        let resolver = resolver_for(repository(
+            downstream_client(&mock_server.uri()),
+            ReplicationMode::EventReconcile,
+            false,
+        ));
+        let checker = ReplicationChecker::builder()
+            .metadata_store(metadata_store.clone())
+            .resolver(resolver)
+            .build()
+            .unwrap();
+
+        // The first enqueue fails; reconcile must still attempt the second tag
+        // rather than aborting the namespace.
+        let mut sink = FlakySink {
+            attempted: Vec::new(),
+            fail_first: 1,
+        };
+        checker.check(NAMESPACE, &mut sink).await.unwrap();
+
+        let attempted: Vec<&str> = sink
+            .attempted
+            .iter()
+            .filter_map(|a| match a {
+                Action::EnqueueReplicationPush { tag, .. } => Some(tag.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            attempted.contains(&"v1") && attempted.contains(&"v2"),
+            "both diverging tags must be attempted despite the first enqueue failing (got {attempted:?})"
+        );
+    }
+
+    #[tokio::test]
+    async fn prune_enqueue_failure_does_not_abort_remaining_deletes() {
+        crate::metrics_provider::init_for_tests();
+        let (metadata_store, _store, _dir) = fs_metadata_store();
+        let mock_server = MockServer::start().await;
+
+        // No local tags; the downstream holds two stray tags absent locally, so a
+        // prune downstream enqueues a delete for each.
+        Mock::given(method("GET"))
+            .and(path(format!("/v2/{NAMESPACE}/tags/list")))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({ "tags": ["stray1", "stray2"] })),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let resolver = resolver_for(repository(
+            downstream_client(&mock_server.uri()),
+            ReplicationMode::EventReconcile,
+            true,
+        ));
+        let checker = ReplicationChecker::builder()
+            .metadata_store(metadata_store.clone())
+            .resolver(resolver)
+            .build()
+            .unwrap();
+
+        // The first delete enqueue fails; the prune sweep must still attempt the
+        // second downstream-only tag rather than aborting.
+        let mut sink = FlakySink {
+            attempted: Vec::new(),
+            fail_first: 1,
+        };
+        checker.check(NAMESPACE, &mut sink).await.unwrap();
+
+        let deleted: Vec<&str> = sink
+            .attempted
+            .iter()
+            .filter_map(|a| match a {
+                Action::EnqueueReplicationDelete { tag, .. } => Some(tag.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            deleted.contains(&"stray1") && deleted.contains(&"stray2"),
+            "both downstream-only tags must be attempted despite the first delete enqueue failing (got {deleted:?})"
+        );
     }
 
     #[tokio::test]
