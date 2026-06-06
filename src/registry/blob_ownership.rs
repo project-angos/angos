@@ -57,4 +57,25 @@ impl<'a> BlobOwnership<'a> {
             Err(error) => Err(error.into()),
         }
     }
+
+    /// Every local namespace that holds a reference to `digest`, per the blob
+    /// index. Empty when no namespace references the blob (including a missing
+    /// index entry, `ReferenceNotFound`); other backend errors propagate. Index
+    /// keys that are not valid namespaces are skipped — a malformed key must not
+    /// fail an otherwise valid enumeration.
+    pub async fn referencing_namespaces(&self, digest: &Digest) -> Result<Vec<Namespace>, Error> {
+        let index = match self.metadata_store.read_blob_index(digest).await {
+            Ok(index) => index,
+            Err(MetadataError::ReferenceNotFound) => return Ok(Vec::new()),
+            Err(error) => return Err(error.into()),
+        };
+
+        let mut namespaces = Vec::with_capacity(index.namespace.len());
+        for key in index.namespace.into_keys() {
+            if let Ok(namespace) = Namespace::new(&key) {
+                namespaces.push(namespace);
+            }
+        }
+        Ok(namespaces)
+    }
 }

@@ -493,14 +493,17 @@ mod tests {
         );
     }
 
+    /// `components_for` binds the `cache` queue to a `CacheJobHandler` — the
+    /// mirror of `components_for_binds_replication_queue_to_replication_handler`.
+    /// The handler is an opaque `Arc<dyn JobHandler>` that can't be downcast, so
+    /// the binding is asserted BEHAVIOURALLY: a `replication.push_manifest`
+    /// envelope handed to the cache queue's handler must be rejected as an
+    /// unsupported kind. Only a `CacheJobHandler` rejects this kind; a
+    /// `ReplicationJobHandler` would accept it, so a wrong binding would fail.
     #[tokio::test]
-    async fn components_for_rejects_unknown_queue() {
+    async fn components_for_binds_cache_queue_to_cache_handler() {
         let (context, _dir) = worker_context();
 
-        // A `replication.push_manifest` envelope handed to the CACHE queue's
-        // handler must be rejected as an unsupported kind: only a
-        // `CacheJobHandler` rejects this kind; a `ReplicationJobHandler` would
-        // accept it.
         let replication_envelope = JobEnvelope::new(
             REPLICATION_QUEUE,
             REPLICATION_PUSH_MANIFEST_KIND,
@@ -517,12 +520,16 @@ mod tests {
             err.to_string().contains("unsupported job kind"),
             "cache queue bound to the wrong handler: {err}"
         );
+    }
 
-        // An unrecognized queue name (typo, wrong case, …) is rejected at
-        // startup rather than silently bound to the cache handler against a
-        // queue no producer ever enqueues to. The error must name the bad queue.
-        // `Components` is not `Debug`, so match the `Result` rather than
-        // `expect_err`.
+    /// An unrecognized queue name (typo, wrong case, …) is rejected rather than
+    /// silently bound to the cache handler against a queue no producer ever
+    /// enqueues to. The error must name the bad queue. `Components` is not
+    /// `Debug`, so match the `Result` rather than `expect_err`.
+    #[tokio::test]
+    async fn components_for_rejects_unknown_queue() {
+        let (context, _dir) = worker_context();
+
         let Err(err) = context.components_for("some-other-queue") else {
             panic!("an unknown queue must be rejected");
         };

@@ -122,7 +122,7 @@ pub fn build_envelope(payload: &ReplicationPushPayload) -> Result<JobEnvelope, s
 /// Mirrors a local repository's state to a configured downstream.
 ///
 /// Holds resolved `Arc` dependencies only; built via
-/// [`ReplicationJobHandler::builder`] (no `new(config)` — refactor-rule 4).
+/// [`ReplicationJobHandler::builder`] from individual fields (no `new(config)`).
 pub struct ReplicationJobHandler {
     resolver: Arc<RepositoryResolver>,
     blob_store: Arc<BlobStore>,

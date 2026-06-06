@@ -4,7 +4,7 @@ use futures_util::future::join_all;
 use url::Url;
 use wiremock::{
     Mock, MockServer, Request, ResponseTemplate,
-    matchers::{body_bytes, header, method, path, query_param},
+    matchers::{body_bytes, header, method, path, query_param, query_param_is_missing},
 };
 
 use crate::{
@@ -1088,6 +1088,42 @@ async fn test_blob_upload_sequence() {
 }
 
 #[tokio::test]
+async fn test_patch_upload_401_is_unauthorized_without_retry() {
+    // A streamed (single-use) PATCH body cannot be replayed, so a 401 must
+    // surface as Error::Unauthorized rather than triggering the byte-body
+    // refresh-and-retry path. `.expect(1)` (verified when the MockServer drops)
+    // proves exactly one PATCH was sent — i.e. no second attempt.
+    let mock_server = MockServer::start().await;
+    let content = b"replicated blob content";
+    let session_path = "/v2/test/blobs/uploads/session-1";
+
+    Mock::given(method("PATCH"))
+        .and(path(session_path))
+        .respond_with(ResponseTemplate::new(401))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let client = client_for(&mock_server);
+    let session_url = format!("{}{session_path}", mock_server.uri());
+
+    let result = client
+        .patch_upload(
+            &session_url,
+            content.len() as u64,
+            Cursor::new(content.to_vec()),
+        )
+        .await;
+
+    assert!(
+        matches!(result, Err(Error::Unauthorized(_))),
+        "a 401 on a streamed PATCH must be Error::Unauthorized (no replay), got {result:?}"
+    );
+    // Dropping the server here verifies `.expect(1)`: exactly one PATCH, no retry.
+    drop(mock_server);
+}
+
+#[tokio::test]
 async fn test_mount_blob_returns_none_on_201() {
     let mock_server = MockServer::start().await;
     let digest = "sha256:1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef";
@@ -1119,6 +1155,39 @@ async fn test_mount_blob_returns_none_on_201() {
     assert_eq!(
         outcome, None,
         "a 201 to a mount request must report a mount (None — no transfer needed)"
+    );
+    drop(mock_server);
+}
+
+#[tokio::test]
+async fn test_mount_blob_omits_from_when_none() {
+    let mock_server = MockServer::start().await;
+    let digest = "sha256:1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef";
+
+    // With from=None the POST carries a bare ?mount=<digest> and no &from=.
+    // The server answers 201 (mounted), identical to the from=Some success path.
+    Mock::given(method("POST"))
+        .and(path("/v2/target/blobs/uploads/"))
+        .and(query_param("mount", digest))
+        .and(query_param_is_missing("from"))
+        .respond_with(
+            ResponseTemplate::new(201)
+                .insert_header("Location", format!("/v2/target/blobs/{digest}")),
+        )
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let client = client_for(&mock_server);
+    let start_url = client.get_uploads_start_path("", "target");
+    let outcome = client
+        .mount_blob(&start_url, &Digest::try_from(digest).unwrap(), None)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        outcome, None,
+        "a 201 to a from=None mount request must report a mount (None — no transfer needed)"
     );
     drop(mock_server);
 }

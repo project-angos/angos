@@ -225,12 +225,12 @@ async fn test_hot_reload_updates_webhook_config() {
     let context_without_webhooks = create_test_server_context().await;
     let listener = InsecureListener::new(&listener_config, context_without_webhooks);
 
-    assert!(!listener.current_context().has_event_subscribers());
+    assert!(!listener.current_context().has_event_dispatcher());
 
     let context_with_webhooks = create_context_with_webhook("https://example.com/webhook").await;
     listener.notify_config_change(context_with_webhooks);
 
-    assert!(listener.current_context().has_event_subscribers());
+    assert!(listener.current_context().has_event_dispatcher());
 }
 
 #[tokio::test]
@@ -239,12 +239,12 @@ async fn test_hot_reload_removes_webhooks() {
     let context_with_webhooks = create_context_with_webhook("https://example.com/webhook").await;
     let listener = InsecureListener::new(&listener_config, context_with_webhooks);
 
-    assert!(listener.current_context().has_event_subscribers());
+    assert!(listener.current_context().has_event_dispatcher());
 
     let context_without_webhooks = create_test_server_context().await;
     listener.notify_config_change(context_without_webhooks);
 
-    assert!(!listener.current_context().has_event_subscribers());
+    assert!(!listener.current_context().has_event_dispatcher());
 }
 
 #[tokio::test]

@@ -578,7 +578,7 @@ async fn test_hot_reload_adds_webhook_via_command() {
             .as_insecure()
             .unwrap()
             .current_context()
-            .has_event_subscribers()
+            .has_event_dispatcher()
     );
 
     let (new_config, _new_blobs, _new_meta) =
@@ -590,7 +590,7 @@ async fn test_hot_reload_adds_webhook_via_command() {
             .as_insecure()
             .unwrap()
             .current_context()
-            .has_event_subscribers()
+            .has_event_dispatcher()
     );
 }
 
@@ -604,7 +604,7 @@ async fn test_hot_reload_removes_webhook_via_command() {
             .as_insecure()
             .unwrap()
             .current_context()
-            .has_event_subscribers()
+            .has_event_dispatcher()
     );
 
     let (new_config, _new_blobs, _new_meta) = create_minimal_config();
@@ -615,7 +615,7 @@ async fn test_hot_reload_removes_webhook_via_command() {
             .as_insecure()
             .unwrap()
             .current_context()
-            .has_event_subscribers()
+            .has_event_dispatcher()
     );
 }
 

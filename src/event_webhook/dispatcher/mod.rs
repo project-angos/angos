@@ -7,7 +7,6 @@ use std::{
     time::Duration,
 };
 
-use async_trait::async_trait;
 use bytes::Bytes;
 use hmac::{Hmac, KeyInit, Mac};
 use prometheus::{HistogramVec, IntCounterVec, register_histogram_vec, register_int_counter_vec};
@@ -23,7 +22,7 @@ mod tests;
 use crate::{
     configuration::RegexPattern,
     event_webhook::{
-        Error, EventSubscriber,
+        Error,
         config::{DeliveryPolicy, EventWebhookConfig},
         event::{Event, EventKind},
     },
@@ -342,17 +341,6 @@ impl EventDispatcher {
         }
 
         Ok(())
-    }
-}
-
-#[async_trait]
-impl EventSubscriber for EventDispatcher {
-    async fn on_event(&self, event: &Event) -> Result<(), Error> {
-        self.dispatch(event).await
-    }
-
-    async fn shutdown_with_timeout(&self, timeout: Duration) {
-        EventDispatcher::shutdown_with_timeout(self, timeout).await;
     }
 }
 

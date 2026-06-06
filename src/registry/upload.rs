@@ -8,7 +8,7 @@ use crate::{
     oci::{Digest, Namespace},
     registry::{
         DOCKER_UPLOAD_UUID, Error, HeaderMap, Registry, ResponseHeaders,
-        blob_ownership::BlobOwnership, blob_store, metadata_store::Error as MetadataError,
+        blob_ownership::BlobOwnership, blob_store,
     },
     util::sha256::finalize_digest,
 };
@@ -250,15 +250,9 @@ impl Registry {
             });
         }
 
-        match self.metadata_store.read_blob_index(&mount.digest).await {
-            Ok(index) => Ok(index
-                .namespace
-                .into_keys()
-                .filter_map(|namespace| Namespace::new(&namespace).ok())
-                .collect()),
-            Err(MetadataError::ReferenceNotFound) => Ok(Vec::new()),
-            Err(error) => Err(error.into()),
-        }
+        BlobOwnership::new(self.metadata_store.as_ref())
+            .referencing_namespaces(&mount.digest)
+            .await
     }
 
     /// Opens a fresh resumable upload session and returns its `202` headers.

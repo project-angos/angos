@@ -154,6 +154,7 @@ mod tests {
 
         assert_eq!(config.max_concurrent_requests, 64);
         assert_eq!(config.max_concurrent_cache_jobs.get(), 4);
+        assert_eq!(config.max_concurrent_replication_jobs.get(), 4);
         assert_eq!(config.max_manifest_size, ByteSize::mib(5));
         assert!(!config.update_pull_time);
         assert!(!config.immutable_tags);
@@ -167,6 +168,7 @@ mod tests {
             r#"
             max_concurrent_requests = 10
             max_concurrent_cache_jobs = 8
+            max_concurrent_replication_jobs = 6
             max_manifest_size = "7MiB"
             update_pull_time = true
             immutable_tags = true
@@ -181,6 +183,10 @@ mod tests {
             config.max_concurrent_cache_jobs,
             NonZeroUsize::new(8).unwrap()
         );
+        assert_eq!(
+            config.max_concurrent_replication_jobs,
+            NonZeroUsize::new(6).unwrap()
+        );
         assert_eq!(config.max_manifest_size, ByteSize::mib(7));
         assert!(config.update_pull_time);
         assert!(config.immutable_tags);
@@ -193,6 +199,12 @@ mod tests {
     #[test]
     fn max_concurrent_cache_jobs_zero_is_rejected() {
         let result = toml::from_str::<GlobalConfig>("max_concurrent_cache_jobs = 0\n");
+        assert!(result.is_err(), "zero must be rejected at deserialization");
+    }
+
+    #[test]
+    fn max_concurrent_replication_jobs_zero_is_rejected() {
+        let result = toml::from_str::<GlobalConfig>("max_concurrent_replication_jobs = 0\n");
         assert!(result.is_err(), "zero must be rejected at deserialization");
     }
 

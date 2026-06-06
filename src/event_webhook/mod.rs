@@ -1,9 +1,6 @@
 pub mod config;
 pub mod dispatcher;
 pub mod event;
-pub mod subscriber;
-
-pub use crate::event_webhook::subscriber::EventSubscriber;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {

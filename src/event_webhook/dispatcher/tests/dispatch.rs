@@ -9,7 +9,7 @@ use wiremock::{
 use super::common::{build_dispatcher, create_test_event, create_test_webhook_config};
 use crate::{
     configuration::RegexPattern,
-    event_webhook::{EventSubscriber, config::DeliveryPolicy, event::EventKind},
+    event_webhook::{config::DeliveryPolicy, event::EventKind},
 };
 
 #[test]
@@ -71,89 +71,6 @@ async fn dispatch_sends_post_with_json_body() {
     let dispatcher = build_dispatcher(webhooks);
     let result = dispatcher.dispatch(&event).await;
     assert!(result.is_ok());
-}
-
-#[tokio::test]
-async fn on_event_delivers_via_event_subscriber_path() {
-    // The EventDispatcher must deliver through the EventSubscriber::on_event
-    // trait method (the surface ServerContext uses), not only its inherent
-    // `dispatch`. This proves the trait delegation is wired correctly.
-    let server = MockServer::start().await;
-    let event = create_test_event();
-
-    Mock::given(method("POST"))
-        .respond_with(ResponseTemplate::new(200))
-        .expect(1)
-        .mount(&server)
-        .await;
-
-    let mut webhooks = HashMap::new();
-    webhooks.insert(
-        "subscriber-hook".to_string(),
-        create_test_webhook_config(&server.uri(), DeliveryPolicy::Required, None, 0),
-    );
-
-    let dispatcher = build_dispatcher(webhooks);
-    // Drive through the trait method explicitly.
-    let result = EventSubscriber::on_event(&dispatcher, &event).await;
-    assert!(
-        result.is_ok(),
-        "on_event must deliver the event via the EventSubscriber path"
-    );
-}
-
-#[tokio::test]
-async fn on_event_surfaces_required_webhook_failure() {
-    // A Required-policy webhook that returns 5xx must surface as an error from
-    // the EventSubscriber path (so ServerContext records it as the overall
-    // first error), preserving Required-vs-Optional semantics through the trait.
-    let server = MockServer::start().await;
-    let event = create_test_event();
-
-    Mock::given(method("POST"))
-        .respond_with(ResponseTemplate::new(500))
-        .mount(&server)
-        .await;
-
-    let mut webhooks = HashMap::new();
-    webhooks.insert(
-        "required-hook".to_string(),
-        create_test_webhook_config(&server.uri(), DeliveryPolicy::Required, None, 0),
-    );
-
-    let dispatcher = build_dispatcher(webhooks);
-    let result = EventSubscriber::on_event(&dispatcher, &event).await;
-    assert!(
-        result.is_err(),
-        "a Required webhook failure must surface through the EventSubscriber path"
-    );
-}
-
-#[tokio::test]
-async fn on_event_swallows_optional_webhook_failure() {
-    // An Optional-policy webhook failure must NOT surface through the
-    // EventSubscriber path (it is swallowed/logged inside the dispatcher), so it
-    // never aborts a batch in ServerContext.
-    let server = MockServer::start().await;
-    let event = create_test_event();
-
-    Mock::given(method("POST"))
-        .respond_with(ResponseTemplate::new(500))
-        .mount(&server)
-        .await;
-
-    let mut webhooks = HashMap::new();
-    webhooks.insert(
-        "optional-hook".to_string(),
-        create_test_webhook_config(&server.uri(), DeliveryPolicy::Optional, None, 0),
-    );
-
-    let dispatcher = build_dispatcher(webhooks);
-    let result = EventSubscriber::on_event(&dispatcher, &event).await;
-    assert!(
-        result.is_ok(),
-        "an Optional webhook failure must be swallowed by the EventSubscriber path"
-    );
 }
 
 #[tokio::test]

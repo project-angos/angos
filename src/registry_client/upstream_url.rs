@@ -5,6 +5,20 @@ use crate::{
     registry_client::RegistryClient,
 };
 
+/// Sentinel `local_name` meaning "do not rewrite the namespace": passed by the
+/// replication push path, where the downstream uses the SAME namespace as local
+/// (unlike the pull-mirror path, which strips a local repo-name prefix). It is
+/// the identity transform for [`get_upstream_namespace`].
+pub const NO_LOCAL_PREFIX: &str = "";
+
+/// Resolves the upstream namespace from a local repository reference by
+/// stripping the configured pull-mirror prefix.
+///
+/// `local_name` is the local repository name whose prefix the pull-mirror path
+/// strips off `upstream_name` (e.g. local `local/repo` -> upstream `repo`). When
+/// no prefix matches, `upstream_name` is returned unchanged. Pass
+/// [`NO_LOCAL_PREFIX`] to disable the rewrite entirely — the identity transform
+/// used by replication, which keeps the downstream namespace identical to local.
 #[must_use]
 pub fn get_upstream_namespace(local_name: &str, upstream_name: &str) -> String {
     upstream_name

@@ -20,10 +20,10 @@ use tracing::{debug, info, instrument, warn};
 use crate::{
     oci::{Digest, Reference},
     registry::{
-        Error as RegistryError, ParsedManifestDigests, blob_store::BlobStore,
-        metadata_store::MetadataStore, parse_manifest_digests,
+        Error as RegistryError, ParsedManifestDigests, blob_ownership::BlobOwnership,
+        blob_store::BlobStore, metadata_store::MetadataStore, parse_manifest_digests,
     },
-    registry_client::{DeleteManifestOutcome, RegistryClient},
+    registry_client::{DeleteManifestOutcome, NO_LOCAL_PREFIX, RegistryClient},
     replication::Error,
     util::sha256,
 };
@@ -137,7 +137,7 @@ pub async fn push_manifest(
         Some(tag) => Reference::Tag(tag.to_string()),
         None => Reference::Digest(digest.clone()),
     };
-    let location = downstream.get_manifest_path("", namespace, &reference);
+    let location = downstream.get_manifest_path(NO_LOCAL_PREFIX, namespace, &reference);
 
     // 3a. HEAD-before-PUT (bandwidth optimization, NOT loop prevention — the
     //     receiver-side no-op dispatch gate breaks cycles; this just avoids one
@@ -258,13 +258,15 @@ async fn mount_candidate(
     namespace: &str,
     digest: &Digest,
 ) -> Option<String> {
-    let index = metadata_store.read_blob_index(digest).await.ok()?;
-    index
-        .namespace
-        .keys()
-        .filter(|ns| ns.as_str() != namespace)
+    let candidates = BlobOwnership::new(metadata_store)
+        .referencing_namespaces(digest)
+        .await
+        .ok()?;
+    candidates
+        .into_iter()
+        .filter(|ns| ns.as_ref() != namespace)
         .min()
-        .cloned()
+        .map(|ns| ns.to_string())
 }
 
 /// Transfers a single blob to the downstream if it is not already present,
@@ -278,13 +280,13 @@ async fn push_one_blob(
 ) -> Result<(), Error> {
     // Belt-and-suspenders idempotency: skip the transfer when the downstream
     // already holds the bytes (HEAD-before-PUT).
-    let head_location = downstream.get_blob_path("", namespace, digest);
+    let head_location = downstream.get_blob_path(NO_LOCAL_PREFIX, namespace, digest);
     if downstream.head_blob(&[], &head_location).await.is_ok() {
         debug!(namespace, %digest, "Blob already present on downstream; skipping");
         return Ok(());
     }
 
-    let start_location = downstream.get_uploads_start_path("", namespace);
+    let start_location = downstream.get_uploads_start_path(NO_LOCAL_PREFIX, namespace);
 
     // Cross-repo mount first: when a sibling local namespace references the blob
     // it is likely present on the downstream under that repo, so a single mount
@@ -385,7 +387,7 @@ async fn push_referrers_fallback(
             "invalid referrers fallback tag '{fallback_tag}': {e}"
         )))
     })?;
-    let location = downstream.get_manifest_path("", namespace, &reference);
+    let location = downstream.get_manifest_path(NO_LOCAL_PREFIX, namespace, &reference);
 
     // GET the existing fallback index; a missing tag (404) starts fresh, a
     // transient failure propagates so the job retries. Any pre-existing referrer
@@ -493,7 +495,7 @@ pub async fn delete_manifest(
     reference: &Reference,
     source_ts: Option<&str>,
 ) -> Result<PushOutcome, Error> {
-    let location = downstream.get_manifest_path("", namespace, reference);
+    let location = downstream.get_manifest_path(NO_LOCAL_PREFIX, namespace, reference);
     let outcome = downstream
         .delete_manifest(&location, source_ts)
         .await

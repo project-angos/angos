@@ -53,6 +53,7 @@ use crate::{
         metadata_store::{MetadataStore, link_kind::LinkKind},
         repository_resolver::RepositoryResolver,
     },
+    registry_client::NO_LOCAL_PREFIX,
     replication::ReplicationDownstream,
 };
 
@@ -122,7 +123,7 @@ impl ReplicationChecker {
             // (5xx/timeout) is NOT absence, so skip the tag this pass rather than
             // enqueuing a spurious push — the next reconcile re-checks it.
             let location = downstream.registry_client.get_manifest_path(
-                "",
+                NO_LOCAL_PREFIX,
                 namespace,
                 &Reference::Tag(tag.clone()),
             );
@@ -183,7 +184,9 @@ impl ReplicationChecker {
             return Ok(());
         }
 
-        let location = downstream.registry_client.get_tags_list_path("", namespace);
+        let location = downstream
+            .registry_client
+            .get_tags_list_path(NO_LOCAL_PREFIX, namespace);
         let downstream_tags = match downstream.registry_client.list_tags(&location).await {
             Ok(tags) => tags,
             Err(e) => {

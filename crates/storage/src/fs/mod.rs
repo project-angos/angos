@@ -50,6 +50,14 @@ const LIST_ALL_CHILDREN_PAGE_SIZE: u16 = 512;
 /// JSON object key, fail to parse it. Listings skip any entry with this prefix.
 const ATOMIC_WRITE_TMP_PREFIX: &str = ".angos-write.";
 
+/// How many times [`ensure_parent`] retries a racing `create_dir_all`. Under
+/// concurrent transactions many tasks create sibling directories under a shared
+/// parent at once; on macOS/APFS the intermediate `mkdir` can transiently
+/// return EINVAL (os error 22) instead of EEXIST, so the recursive create fails
+/// even though the directory is moments from existing. A handful of retries
+/// resolves it once the contended intermediate is in place.
+const ENSURE_PARENT_RETRIES: u32 = 5;
+
 /// Builder for [`Backend`].
 pub struct Builder {
     root: Option<PathBuf>,
@@ -246,10 +254,31 @@ fn normalize_lexical(path: &Path) -> PathBuf {
 
 /// Create all parent directories of `path`.
 async fn ensure_parent(path: &Path) -> Result<(), Error> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).await?;
+    let Some(parent) = path.parent() else {
+        return Ok(());
+    };
+    // `create_dir_all` is idempotent (we only need the directory to exist), but
+    // it races under concurrent transactions: when many tasks create sibling
+    // directories under a shared parent at once, macOS/APFS can transiently
+    // return EINVAL for the intermediate `mkdir` instead of EEXIST, so the
+    // recursive create fails with the leaf uncreated. Retry, treating an
+    // already-present directory (a racing task won) as success; a real error
+    // (permission, bad path) still surfaces once the retries are exhausted.
+    let mut attempt = 0;
+    loop {
+        match fs::create_dir_all(parent).await {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                if fs::metadata(parent).await.is_ok_and(|m| m.is_dir()) {
+                    return Ok(());
+                }
+                attempt += 1;
+                if attempt >= ENSURE_PARENT_RETRIES {
+                    return Err(backend_error("create_dir_all", parent, &e));
+                }
+            }
+        }
     }
-    Ok(())
 }
 
 /// Map a file-open error to an [`Error`], logging the full path for diagnostics.
@@ -261,10 +290,23 @@ fn classify_open_error(error: &io::Error, path: &Path) -> Error {
     }
 }
 
+/// Map an io error from a named operation to an [`Error`], carrying the
+/// operation and path so a backend failure is diagnosable (a bare
+/// "Invalid argument (os error 22)" otherwise gives no hint which syscall on
+/// which path failed). Preserves the `NotFound` classification.
+fn backend_error(op: &str, path: &Path, error: &io::Error) -> Error {
+    if error.kind() == ErrorKind::NotFound {
+        Error::NotFound
+    } else {
+        Error::Backend(format!("{op} {}: {error}", path.display()))
+    }
+}
+
 async fn atomic_write(target: &Path, data: Bytes, sync: bool) -> Result<(), Error> {
     ensure_parent(target).await?;
     let parent = target.parent().unwrap_or_else(|| Path::new(".")).to_owned();
     let final_path = target.to_owned();
+    let label = target.to_owned();
     spawn_blocking(move || -> io::Result<()> {
         let mut temp = TempFileBuilder::new()
             .prefix(ATOMIC_WRITE_TMP_PREFIX)
@@ -278,7 +320,8 @@ async fn atomic_write(target: &Path, data: Bytes, sync: bool) -> Result<(), Erro
         Ok(())
     })
     .await
-    .map_err(|e| Error::Backend(format!("temp-write task panicked: {e}")))??;
+    .map_err(|e| Error::Backend(format!("temp-write task panicked: {e}")))?
+    .map_err(|e| backend_error("atomic_write", &label, &e))?;
     Ok(())
 }
 
@@ -466,6 +509,7 @@ impl ObjectStore for Backend {
         ensure_parent(&dst).await?;
         let parent = dst.parent().unwrap_or_else(|| Path::new(".")).to_owned();
         let sync = self.sync_to_disk;
+        let label = dst.clone();
         // Stream src -> temp -> atomic rename. `std::io::copy` uses a small
         // internal buffer, so the object body is never held in memory in full
         // (a multi-GB blob would otherwise spike RSS by its whole size).
@@ -483,7 +527,7 @@ impl ObjectStore for Backend {
         })
         .await
         {
-            Ok(result) => result.map_err(Error::from),
+            Ok(result) => result.map_err(|e| backend_error("copy", &label, &e)),
             Err(e) => Err(Error::Backend(format!("copy task panicked: {e}"))),
         }
     }

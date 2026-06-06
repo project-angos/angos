@@ -17,7 +17,7 @@ use serde::Deserialize;
 use tokio::{io::AsyncReadExt, sync::Mutex};
 use tokio_util::io::StreamReader;
 use tracing::{info, warn};
-pub use upstream_url::get_upstream_namespace;
+pub use upstream_url::{NO_LOCAL_PREFIX, get_upstream_namespace};
 
 pub use crate::registry_client::write::{DeleteManifestOutcome, PutManifestResult};
 

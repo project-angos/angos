@@ -537,7 +537,7 @@ async fn test_server_context_new_with_event_webhooks() {
     let registry = create_test_registry(&config).await;
     let context = ServerContext::new(&config, registry).unwrap();
 
-    assert!(context.has_event_subscribers());
+    assert!(context.has_event_dispatcher());
 }
 
 #[tokio::test]
@@ -546,7 +546,7 @@ async fn test_server_context_new_without_event_webhooks() {
     let registry = create_test_registry(&config).await;
     let context = ServerContext::new(&config, registry).unwrap();
 
-    assert!(!context.has_event_subscribers());
+    assert!(!context.has_event_dispatcher());
 }
 
 #[tokio::test]
@@ -688,7 +688,7 @@ async fn test_server_context_shutdown_with_no_dispatcher() {
     let registry = create_test_registry(&config).await;
     let context = ServerContext::new(&config, registry).unwrap();
 
-    assert!(!context.has_event_subscribers());
+    assert!(!context.has_event_dispatcher());
     context.shutdown_with_timeout(Duration::from_secs(10)).await;
 }
 
@@ -1026,41 +1026,6 @@ fn test_resolve_client_ip_x_forwarded_for_takes_precedence() {
     );
 }
 
-/// Subscriber that records every event it receives and optionally fails on a
-/// specific event id (used to reproduce the batch short-circuit bug).
-struct RecordingSubscriber {
-    seen: std::sync::Mutex<Vec<Uuid>>,
-    fail_on: Option<Uuid>,
-}
-
-impl RecordingSubscriber {
-    fn new(fail_on: Option<Uuid>) -> Self {
-        Self {
-            seen: std::sync::Mutex::new(Vec::new()),
-            fail_on,
-        }
-    }
-
-    fn seen_ids(&self) -> Vec<Uuid> {
-        self.seen.lock().unwrap().clone()
-    }
-}
-
-#[async_trait::async_trait]
-impl crate::event_webhook::EventSubscriber for RecordingSubscriber {
-    async fn on_event(&self, event: &Event) -> Result<(), crate::event_webhook::Error> {
-        self.seen.lock().unwrap().push(event.id);
-        if self.fail_on == Some(event.id) {
-            return Err(crate::event_webhook::Error::Dispatch(
-                "intentional test failure".to_string(),
-            ));
-        }
-        Ok(())
-    }
-
-    async fn shutdown_with_timeout(&self, _timeout: Duration) {}
-}
-
 fn make_event(id: Uuid) -> Event {
     Event {
         id,
@@ -1077,67 +1042,107 @@ fn make_event(id: Uuid) -> Event {
 
 #[tokio::test]
 async fn dispatch_events_first_failure_does_not_abort_batch() {
-    // Regression: a failing first event must NOT short-circuit the batch; every
-    // subsequent event still has to be delivered to the subscriber.
-    let config = create_minimal_config();
+    // Regression: a failing delivery must NOT short-circuit the batch; every
+    // subsequent event still has to be attempted. A Required webhook with
+    // max_retries = 0 fails each event in a single attempt, so the mock records
+    // exactly one POST per event.
+    let mock_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&mock_server)
+        .await;
+
+    let toml = format!(
+        r#"
+        [blob_store.fs]
+        root_dir = "/tmp/test"
+
+        [metadata_store.fs]
+        root_dir = "/tmp/test"
+
+        [cache.memory]
+
+        [server]
+        bind_address = "0.0.0.0"
+        port = 8000
+
+        [global]
+        update_pull_time = false
+        event_webhooks = ["test_hook"]
+
+        [event_webhook.test_hook]
+        url = "{}/webhook"
+        policy = "required"
+        max_retries = 0
+        events = ["manifest.push"]
+    "#,
+        mock_server.uri()
+    );
+
+    let config: Configuration = toml::from_str(&toml).unwrap();
     let registry = create_test_registry(&config).await;
-    let mut context = ServerContext::new(&config, registry).unwrap();
+    let context = ServerContext::new(&config, registry).unwrap();
 
-    let first = Uuid::new_v4();
-    let second = Uuid::new_v4();
-    let third = Uuid::new_v4();
-
-    let subscriber = Arc::new(RecordingSubscriber::new(Some(first)));
-    context.set_subscribers(vec![subscriber.clone()]);
-
-    let events = vec![make_event(first), make_event(second), make_event(third)];
+    let events = vec![
+        make_event(Uuid::new_v4()),
+        make_event(Uuid::new_v4()),
+        make_event(Uuid::new_v4()),
+    ];
     let result = context.dispatch_events(&events).await;
 
     // The Required-style failure surfaces overall...
     assert!(result.is_err(), "a delivery failure must surface overall");
-    // ...but every event was still attempted (bug fixed).
+    // ...but every event was still attempted (bug fixed): one POST per event.
+    let requests = mock_server.received_requests().await.unwrap();
     assert_eq!(
-        subscriber.seen_ids(),
-        vec![first, second, third],
-        "all events must be delivered even when the first one fails"
-    );
-}
-
-#[tokio::test]
-async fn dispatch_events_fans_out_to_all_subscribers() {
-    // Every subscriber receives every event, even if one of them fails.
-    let config = create_minimal_config();
-    let registry = create_test_registry(&config).await;
-    let mut context = ServerContext::new(&config, registry).unwrap();
-
-    let event_id = Uuid::new_v4();
-    let failing = Arc::new(RecordingSubscriber::new(Some(event_id)));
-    let healthy = Arc::new(RecordingSubscriber::new(None));
-    context.set_subscribers(vec![failing.clone(), healthy.clone()]);
-
-    let result = context.dispatch_event(&make_event(event_id)).await;
-
-    assert!(result.is_err(), "a failing subscriber surfaces overall");
-    assert_eq!(failing.seen_ids(), vec![event_id]);
-    assert_eq!(
-        healthy.seen_ids(),
-        vec![event_id],
-        "a healthy subscriber must still receive the event"
+        requests.len(),
+        3,
+        "all events must be attempted even when an earlier one fails"
     );
 }
 
 #[tokio::test]
 async fn dispatch_events_all_success_returns_ok() {
-    let config = create_minimal_config();
-    let registry = create_test_registry(&config).await;
-    let mut context = ServerContext::new(&config, registry).unwrap();
+    let mock_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&mock_server)
+        .await;
 
-    let subscriber = Arc::new(RecordingSubscriber::new(None));
-    context.set_subscribers(vec![subscriber.clone()]);
+    let toml = format!(
+        r#"
+        [blob_store.fs]
+        root_dir = "/tmp/test"
+
+        [metadata_store.fs]
+        root_dir = "/tmp/test"
+
+        [cache.memory]
+
+        [server]
+        bind_address = "0.0.0.0"
+        port = 8000
+
+        [global]
+        update_pull_time = false
+        event_webhooks = ["test_hook"]
+
+        [event_webhook.test_hook]
+        url = "{}/webhook"
+        policy = "required"
+        events = ["manifest.push"]
+    "#,
+        mock_server.uri()
+    );
+
+    let config: Configuration = toml::from_str(&toml).unwrap();
+    let registry = create_test_registry(&config).await;
+    let context = ServerContext::new(&config, registry).unwrap();
 
     let events = vec![make_event(Uuid::new_v4()), make_event(Uuid::new_v4())];
     let result = context.dispatch_events(&events).await;
 
     assert!(result.is_ok());
-    assert_eq!(subscriber.seen_ids().len(), 2);
+    let requests = mock_server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 2);
 }
