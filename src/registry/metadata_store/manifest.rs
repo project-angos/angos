@@ -2,6 +2,7 @@
 //! link-transaction planner in [`crate::registry::metadata_store::link_ops`].
 
 use bytes::Bytes;
+use chrono::{DateTime, Utc};
 
 use crate::{
     oci::Digest,
@@ -17,6 +18,7 @@ impl MetadataStore {
         digest: &Digest,
         manifest_bytes: &[u8],
         operations: &[LinkOperation],
+        created_at: Option<DateTime<Utc>>,
     ) -> Result<(), Error> {
         let extras = LinksTxExtras {
             blob_data_put: Some((digest, Bytes::from(manifest_bytes.to_vec()))),
@@ -24,6 +26,7 @@ impl MetadataStore {
             blob_index_ops: None,
             caller_holds_blob_data_lock: false,
             force_register_namespace: true,
+            created_at,
         };
         self.execute_links_tx(namespace, operations, extras).await
     }
@@ -43,6 +46,7 @@ impl MetadataStore {
             blob_index_ops: None,
             caller_holds_blob_data_lock: false,
             force_register_namespace: false,
+            created_at: None,
         };
         self.execute_links_tx(namespace, operations, extras).await
     }

@@ -81,6 +81,8 @@ LWW applies **only to tags** -- digest references are content-addressed and neve
 
 A genuine end-user write (one that arrives without an `X-Angos-Source-Timestamp` header) skips LWW entirely, so replication never interferes with direct pushes.
 
+LWW orders by the **originating author's write time**, not each receiver's clock: a replicated write persists the incoming `X-Angos-Source-Timestamp` as the tag's `LinkMetadata.created_at`, and re-dispatch re-derives the timestamp from it, so author time propagates verbatim across hops and multi-hop ordering is deterministic. (The author timestamp is also stored on the manifest *revision*, so a tag's and revision's `pushed_at` and retention age stay consistent across peers. One operational caveat: back-filling old history into a peer with a tight max-age retention policy can make it eligible for pruning on the next scrub, since age is measured from the author's push time, not the receive time.) The one remaining non-strictness is that the receiver's compare-then-write is not atomic, so two replicated writes to the same tag arriving together can both pass and the later commit wins -- the mesh still converges because re-replication re-arbitrates.
+
 ## Scrub Reconciliation
 
 The event path can miss changes -- an instance might be down when a mutation occurs, or two instances might drift after a long partition. The `angos scrub --replicate` command reconciles a divergence on demand:

@@ -2219,6 +2219,67 @@ async fn local_created_at(
 }
 
 #[tokio::test]
+async fn accept_put_manifest_stamps_created_at_from_source_ts() {
+    // A replicated write persists the incoming source_ts as the tag's
+    // created_at (author time), so LWW and retention track author time across
+    // hops rather than this receiver's clock.
+    let test_case = FSRegistryTestCase::new();
+    let registry = test_case.registry();
+    let namespace = &Namespace::new("lww-repo").unwrap();
+    let tag = "latest";
+
+    let (content, media_type) = create_test_manifest(registry, namespace).await;
+    let source_ts = chrono::Utc::now() - chrono::Duration::hours(3);
+
+    registry
+        .accept_put_manifest(
+            None,
+            Some(source_ts),
+            namespace,
+            Reference::Tag(tag.to_string()),
+            media_type,
+            Cursor::new(content),
+        )
+        .await
+        .expect("replicated push must store");
+
+    assert_eq!(
+        local_created_at(registry, namespace, tag).await,
+        source_ts,
+        "a replicated write must stamp created_at = source_ts (author time)"
+    );
+}
+
+#[tokio::test]
+async fn accept_put_manifest_without_source_ts_stamps_local_clock() {
+    // A genuine client write (no source_ts) stamps the receiver's clock, not an
+    // author time, so direct pushes are unaffected by the replication change.
+    let test_case = FSRegistryTestCase::new();
+    let registry = test_case.registry();
+    let namespace = &Namespace::new("lww-repo").unwrap();
+    let tag = "latest";
+
+    let before = chrono::Utc::now();
+    let (content, media_type) = create_test_manifest(registry, namespace).await;
+    registry
+        .accept_put_manifest(
+            None,
+            None,
+            namespace,
+            Reference::Tag(tag.to_string()),
+            media_type,
+            Cursor::new(content),
+        )
+        .await
+        .expect("client push must store");
+
+    assert!(
+        local_created_at(registry, namespace, tag).await >= before,
+        "a client write (no source_ts) must stamp the local clock"
+    );
+}
+
+#[tokio::test]
 async fn accept_put_manifest_rejects_lww_older_source_ts() {
     let test_case = FSRegistryTestCase::new();
     let registry = test_case.registry();

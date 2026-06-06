@@ -201,8 +201,15 @@ impl Registry {
             .get_manifest(accepted_types, namespace, &reference)
             .await?;
 
-        self.store_manifest(namespace, &reference, media_type.as_ref(), &content, false)
-            .await?;
+        self.store_manifest(
+            namespace,
+            &reference,
+            media_type.as_ref(),
+            &content,
+            false,
+            None,
+        )
+        .await?;
 
         Ok(ManifestBody {
             media_type,
@@ -256,6 +263,10 @@ impl Registry {
         })
     }
 
+    /// Convenience wrapper for a non-replication manifest store (no `source_ts`).
+    /// Production writes arrive through `accept_put_manifest`; this is retained
+    /// for tests that store a manifest directly.
+    #[cfg(test)]
     #[instrument(skip(body))]
     pub async fn put_manifest(
         &self,
@@ -264,7 +275,7 @@ impl Registry {
         content_type: Option<&String>,
         body: &[u8],
     ) -> Result<PutManifestResponse, Error> {
-        self.store_manifest(namespace, reference, content_type, body, true)
+        self.store_manifest(namespace, reference, content_type, body, true, None)
             .await
     }
 
@@ -275,6 +286,7 @@ impl Registry {
         content_type: Option<&String>,
         body: &[u8],
         validate_references: bool,
+        created_at: Option<DateTime<Utc>>,
     ) -> Result<PutManifestResponse, Error> {
         let mut manifest = parse_and_validate_manifest(body, content_type)?;
         let computed_digest = Digest::Sha256(sha256::hex(body).into());
@@ -308,7 +320,7 @@ impl Registry {
         );
 
         self.metadata_store
-            .store_manifest(namespace.as_ref(), &computed_digest, body, &ops)
+            .store_manifest(namespace.as_ref(), &computed_digest, body, &ops, created_at)
             .await?;
 
         let subject = manifest.subject.map(|s| s.digest);
@@ -584,6 +596,15 @@ impl Registry {
     /// distinct OCI code so the sender treats it as convergence rather than a
     /// retryable conflict. A local tag with no recorded `created_at` is treated
     /// as oldest and never blocks the incoming write.
+    ///
+    /// LWW orders by the originating author's write time: a replicated write
+    /// persists the incoming `source_ts` as the tag link's `created_at` (not this
+    /// receiver's clock), and the re-dispatch path re-derives `source_ts` from it,
+    /// so author time propagates verbatim across hops and multi-hop ordering is
+    /// deterministic. The one remaining non-strictness is that this read is not
+    /// atomic with the commit, so two replicated writes to the same tag arriving
+    /// together can both pass the gate and the later commit wins — the mesh still
+    /// converges because re-replication re-arbitrates.
     async fn check_lww_not_superseded(
         &self,
         namespace: &Namespace,
@@ -723,7 +744,14 @@ impl Registry {
         }
 
         let mut response = self
-            .put_manifest(namespace, &reference, Some(&mime_type), &request_body)
+            .store_manifest(
+                namespace,
+                &reference,
+                Some(&mime_type),
+                &request_body,
+                true,
+                source_ts,
+            )
             .await?;
 
         let repository = self.repository_name_for(namespace);

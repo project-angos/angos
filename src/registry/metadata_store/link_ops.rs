@@ -10,6 +10,7 @@
 use std::collections::{HashMap, HashSet};
 
 use bytes::Bytes;
+use chrono::{DateTime, Utc};
 use futures_util::future::join_all;
 use tracing::warn;
 
@@ -210,6 +211,12 @@ pub struct LinksTxExtras<'a> {
     /// success (used by `store_manifest`). Otherwise registration happens only
     /// when at least one `Create` op was processed.
     pub force_register_namespace: bool,
+    /// Creation timestamp for newly-written link metadata. `None` (the default,
+    /// used by `update_links`/`delete_manifest`) stamps the current time; a
+    /// replicated `store_manifest` passes the originating `source_ts` so a tag's
+    /// LWW timestamp and retention age track the author's write time, not this
+    /// receiver's clock.
+    pub created_at: Option<DateTime<Utc>>,
 }
 
 /// Data captured from a successful link-transaction attempt, used for
@@ -382,9 +389,12 @@ impl MetadataStore {
                     if link.is_tracked() && referrer.is_some() {
                         // Tracked link: merge referrer into existing or new metadata.
                         let mut metadata = link_cache.remove(*link).unwrap_or_else(|| {
-                            LinkMetadata::from_digest((*target).clone())
-                                .with_media_type((*media_type).clone())
-                                .with_descriptor(descriptor.as_ref().map(|b| b.as_ref().clone()))
+                            LinkMetadata::from_digest_at(
+                                (*target).clone(),
+                                extras.created_at.unwrap_or_else(Utc::now),
+                            )
+                            .with_media_type((*media_type).clone())
+                            .with_descriptor(descriptor.as_ref().map(|b| b.as_ref().clone()))
                         });
 
                         if let Some(manifest_digest) = referrer {
@@ -425,9 +435,12 @@ impl MetadataStore {
                             }
                         }
 
-                        let metadata = LinkMetadata::from_digest((*target).clone())
-                            .with_media_type((*media_type).clone())
-                            .with_descriptor(descriptor.as_ref().map(|b| b.as_ref().clone()));
+                        let metadata = LinkMetadata::from_digest_at(
+                            (*target).clone(),
+                            extras.created_at.unwrap_or_else(Utc::now),
+                        )
+                        .with_media_type((*media_type).clone())
+                        .with_descriptor(descriptor.as_ref().map(|b| b.as_ref().clone()));
                         let key = path_builder::link_path(link, namespace);
                         let body = serde_json::to_vec(&metadata)
                             .map(Bytes::from)
