@@ -114,18 +114,15 @@ impl RegistryClient {
         RegistryClientBuilder::default()
     }
 
-    /// Resolves the HTTP client and basic-auth credentials from a parsed
-    /// [`RegistryClientConfig`] for repository setup.
-    ///
-    /// Used by callers that build via [`RegistryClient::builder`] directly
-    /// (e.g. replication downstream resolution) and reused by the test-only
-    /// `new` constructor.
+    /// Resolves the HTTP client (TLS, redirects, timeout) and basic-auth
+    /// credentials from a parsed [`RegistryClientConfig`]. Internal helper for
+    /// [`RegistryClient::from_config`].
     ///
     /// # Errors
     ///
     /// Returns [`Error::Initialization`] when the TLS files cannot be loaded or
     /// the HTTP client cannot be built.
-    pub fn resolve_config_fields(
+    fn resolve_config_fields(
         config: &RegistryClientConfig,
     ) -> Result<(Client, Option<(String, String)>), Error> {
         let client = HttpClientBuilder::new()
@@ -155,17 +152,16 @@ impl RegistryClient {
         Ok((client, basic_auth))
     }
 
-    /// Creates a registry client for one upstream registry with the given
-    /// manifest body size limit.
-    ///
-    /// Thin internal helper over [`RegistryClient::builder`]; resolves the HTTP
-    /// client and credentials from `config`.
+    /// Builds a registry client from a parsed [`RegistryClientConfig`]: resolves
+    /// the HTTP client (TLS, redirects, timeout) and basic-auth credentials, then
+    /// runs the builder. The single construction path for upstreams, replication
+    /// downstreams, and tests.
     ///
     /// # Errors
     ///
-    /// Returns an error when TLS files cannot be loaded or the HTTP client cannot be built.
-    #[cfg(test)]
-    pub fn new(
+    /// Returns an error when TLS files cannot be loaded or the HTTP client cannot
+    /// be built.
+    pub fn from_config(
         config: &RegistryClientConfig,
         cache: Arc<Cache>,
         max_manifest_size_bytes: usize,

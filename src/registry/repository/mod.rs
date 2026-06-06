@@ -92,16 +92,11 @@ impl Repository {
             task::spawn_blocking(move || {
                 let mut upstreams = Vec::new();
                 for config in &upstream_configs {
-                    let (client, basic_auth) = RegistryClient::resolve_config_fields(config)?;
-                    upstreams.push(
-                        RegistryClient::builder()
-                            .url(config.url.clone())
-                            .client(client)
-                            .basic_auth(basic_auth)
-                            .cache(Arc::clone(&cache))
-                            .max_manifest_size_bytes(max_manifest_size_bytes)
-                            .build()?,
-                    );
+                    upstreams.push(RegistryClient::from_config(
+                        config,
+                        Arc::clone(&cache),
+                        max_manifest_size_bytes,
+                    )?);
                 }
                 Ok::<_, Error>(upstreams)
             })
@@ -117,16 +112,11 @@ impl Repository {
             task::spawn_blocking(move || {
                 let mut downstreams = Vec::new();
                 for config in &downstream_configs {
-                    let client_config = &config.client;
-                    let (client, basic_auth) =
-                        RegistryClient::resolve_config_fields(client_config)?;
-                    let registry_client = RegistryClient::builder()
-                        .url(client_config.url.clone())
-                        .client(client)
-                        .basic_auth(basic_auth)
-                        .cache(Arc::clone(&cache))
-                        .max_manifest_size_bytes(max_manifest_size_bytes)
-                        .build()?;
+                    let registry_client = RegistryClient::from_config(
+                        &config.client,
+                        Arc::clone(&cache),
+                        max_manifest_size_bytes,
+                    )?;
                     downstreams.push(
                         ReplicationDownstream::builder()
                             .name(config.name.clone())

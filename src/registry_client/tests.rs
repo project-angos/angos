@@ -55,7 +55,8 @@ fn test_get_manifest_path() {
     };
 
     let cache = cache::Config::Memory.to_backend().unwrap();
-    let upstream = RegistryClient::new(&config, cache, DEFAULT_MAX_MANIFEST_SIZE_BYTES).unwrap();
+    let upstream =
+        RegistryClient::from_config(&config, cache, DEFAULT_MAX_MANIFEST_SIZE_BYTES).unwrap();
 
     let repo_name = "local";
     let namespace = &Namespace::new("local/repo").unwrap();
@@ -78,7 +79,8 @@ fn test_get_blob_path() {
     };
 
     let cache = cache::Config::Memory.to_backend().unwrap();
-    let upstream = RegistryClient::new(&config, cache, DEFAULT_MAX_MANIFEST_SIZE_BYTES).unwrap();
+    let upstream =
+        RegistryClient::from_config(&config, cache, DEFAULT_MAX_MANIFEST_SIZE_BYTES).unwrap();
 
     let repo_name = "local";
     let namespace = &Namespace::new("local/repo").unwrap();
@@ -106,7 +108,8 @@ fn test_new_with_username_only() {
     };
 
     let cache = cache::Config::Memory.to_backend().unwrap();
-    let client = RegistryClient::new(&config, cache, DEFAULT_MAX_MANIFEST_SIZE_BYTES).unwrap();
+    let client =
+        RegistryClient::from_config(&config, cache, DEFAULT_MAX_MANIFEST_SIZE_BYTES).unwrap();
     assert!(client.basic_auth.is_none());
 }
 
@@ -123,7 +126,8 @@ fn test_new_with_password_only() {
     };
 
     let cache = cache::Config::Memory.to_backend().unwrap();
-    let client = RegistryClient::new(&config, cache, DEFAULT_MAX_MANIFEST_SIZE_BYTES).unwrap();
+    let client =
+        RegistryClient::from_config(&config, cache, DEFAULT_MAX_MANIFEST_SIZE_BYTES).unwrap();
     assert!(client.basic_auth.is_none());
 }
 
@@ -140,7 +144,8 @@ fn test_new_with_both_credentials() {
     };
 
     let cache = cache::Config::Memory.to_backend().unwrap();
-    let client = RegistryClient::new(&config, cache, DEFAULT_MAX_MANIFEST_SIZE_BYTES).unwrap();
+    let client =
+        RegistryClient::from_config(&config, cache, DEFAULT_MAX_MANIFEST_SIZE_BYTES).unwrap();
     assert!(client.basic_auth.is_some());
 }
 
@@ -170,7 +175,8 @@ async fn test_head_blob_success() {
     };
 
     let cache = cache::Config::Memory.to_backend().unwrap();
-    let client = RegistryClient::new(&config, cache, DEFAULT_MAX_MANIFEST_SIZE_BYTES).unwrap();
+    let client =
+        RegistryClient::from_config(&config, cache, DEFAULT_MAX_MANIFEST_SIZE_BYTES).unwrap();
 
     let result = client
         .head_blob(
@@ -206,7 +212,8 @@ async fn test_head_blob_not_found() {
     };
 
     let cache = cache::Config::Memory.to_backend().unwrap();
-    let client = RegistryClient::new(&config, cache, DEFAULT_MAX_MANIFEST_SIZE_BYTES).unwrap();
+    let client =
+        RegistryClient::from_config(&config, cache, DEFAULT_MAX_MANIFEST_SIZE_BYTES).unwrap();
 
     let result = client
         .head_blob(
@@ -249,7 +256,8 @@ async fn test_head_manifest_success() {
     };
 
     let cache = cache::Config::Memory.to_backend().unwrap();
-    let client = RegistryClient::new(&config, cache, DEFAULT_MAX_MANIFEST_SIZE_BYTES).unwrap();
+    let client =
+        RegistryClient::from_config(&config, cache, DEFAULT_MAX_MANIFEST_SIZE_BYTES).unwrap();
 
     let result = client
         .head_manifest(
@@ -299,7 +307,8 @@ async fn test_get_manifest_success() {
     };
 
     let cache = cache::Config::Memory.to_backend().unwrap();
-    let client = RegistryClient::new(&config, cache, DEFAULT_MAX_MANIFEST_SIZE_BYTES).unwrap();
+    let client =
+        RegistryClient::from_config(&config, cache, DEFAULT_MAX_MANIFEST_SIZE_BYTES).unwrap();
 
     let result = client
         .get_manifest(
@@ -349,7 +358,7 @@ async fn test_get_manifest_rejects_oversized_body() {
     };
 
     let cache = cache::Config::Memory.to_backend().unwrap();
-    let client = RegistryClient::new(&config, cache, 7).unwrap();
+    let client = RegistryClient::from_config(&config, cache, 7).unwrap();
 
     let result = client
         .get_manifest(
@@ -419,7 +428,8 @@ async fn test_bearer_authentication() {
     };
 
     let cache = cache::Config::Memory.to_backend().unwrap();
-    let client = RegistryClient::new(&config, cache, DEFAULT_MAX_MANIFEST_SIZE_BYTES).unwrap();
+    let client =
+        RegistryClient::from_config(&config, cache, DEFAULT_MAX_MANIFEST_SIZE_BYTES).unwrap();
 
     let result = client
         .get_manifest(
@@ -480,7 +490,8 @@ async fn test_cached_bearer_token_is_used() {
         password: None,
     };
 
-    let client = RegistryClient::new(&config, cache, DEFAULT_MAX_MANIFEST_SIZE_BYTES).unwrap();
+    let client =
+        RegistryClient::from_config(&config, cache, DEFAULT_MAX_MANIFEST_SIZE_BYTES).unwrap();
     let result = client.get_manifest(&[], &location).await;
 
     assert!(result.is_ok());
@@ -587,7 +598,8 @@ async fn test_bearer_tokens_are_cached_per_scope() {
     };
 
     let cache = cache::Config::Memory.to_backend().unwrap();
-    let client = RegistryClient::new(&config, cache, DEFAULT_MAX_MANIFEST_SIZE_BYTES).unwrap();
+    let client =
+        RegistryClient::from_config(&config, cache, DEFAULT_MAX_MANIFEST_SIZE_BYTES).unwrap();
 
     assert!(client.get_manifest(&[], &alpha_location).await.is_ok());
     assert!(client.get_manifest(&[], &beta_location).await.is_ok());
@@ -677,7 +689,8 @@ async fn test_expired_bearer_token_is_refetched() {
         password: None,
     };
 
-    let client = RegistryClient::new(&config, cache, DEFAULT_MAX_MANIFEST_SIZE_BYTES).unwrap();
+    let client =
+        RegistryClient::from_config(&config, cache, DEFAULT_MAX_MANIFEST_SIZE_BYTES).unwrap();
     let result = client.get_manifest(&[], &location).await;
 
     assert!(result.is_ok());
@@ -743,7 +756,8 @@ async fn test_concurrent_bearer_refresh_uses_single_token_exchange() {
     };
 
     let cache = cache::Config::Memory.to_backend().unwrap();
-    let client = RegistryClient::new(&config, cache, DEFAULT_MAX_MANIFEST_SIZE_BYTES).unwrap();
+    let client =
+        RegistryClient::from_config(&config, cache, DEFAULT_MAX_MANIFEST_SIZE_BYTES).unwrap();
     let results = join_all((0..10).map(|_| client.get_manifest(&[], &location))).await;
 
     assert!(results.iter().all(Result::is_ok));
@@ -789,7 +803,8 @@ async fn test_basic_authentication() {
     };
 
     let cache = cache::Config::Memory.to_backend().unwrap();
-    let client = RegistryClient::new(&config, cache, DEFAULT_MAX_MANIFEST_SIZE_BYTES).unwrap();
+    let client =
+        RegistryClient::from_config(&config, cache, DEFAULT_MAX_MANIFEST_SIZE_BYTES).unwrap();
 
     let result = client
         .get_manifest(
@@ -822,7 +837,8 @@ async fn test_forbidden_access() {
     };
 
     let cache = cache::Config::Memory.to_backend().unwrap();
-    let client = RegistryClient::new(&config, cache, DEFAULT_MAX_MANIFEST_SIZE_BYTES).unwrap();
+    let client =
+        RegistryClient::from_config(&config, cache, DEFAULT_MAX_MANIFEST_SIZE_BYTES).unwrap();
 
     let result = client
         .get_manifest(
@@ -858,7 +874,8 @@ async fn test_get_blob_success() {
     };
 
     let cache = cache::Config::Memory.to_backend().unwrap();
-    let client = RegistryClient::new(&config, cache, DEFAULT_MAX_MANIFEST_SIZE_BYTES).unwrap();
+    let client =
+        RegistryClient::from_config(&config, cache, DEFAULT_MAX_MANIFEST_SIZE_BYTES).unwrap();
 
     let result = client
         .get_blob(
@@ -900,7 +917,8 @@ async fn test_get_blob_not_found() {
     };
 
     let cache = cache::Config::Memory.to_backend().unwrap();
-    let client = RegistryClient::new(&config, cache, DEFAULT_MAX_MANIFEST_SIZE_BYTES).unwrap();
+    let client =
+        RegistryClient::from_config(&config, cache, DEFAULT_MAX_MANIFEST_SIZE_BYTES).unwrap();
 
     let result = client
         .get_blob(
@@ -929,7 +947,7 @@ fn test_new_with_invalid_ca_bundle() {
     };
 
     let cache = cache::Config::Memory.to_backend().unwrap();
-    let result = RegistryClient::new(&config, cache, DEFAULT_MAX_MANIFEST_SIZE_BYTES);
+    let result = RegistryClient::from_config(&config, cache, DEFAULT_MAX_MANIFEST_SIZE_BYTES);
 
     assert!(result.is_err());
     assert!(matches!(result.unwrap_err(), Error::Initialization(_)));
@@ -978,7 +996,7 @@ fn test_new_with_both_certificate_and_key_invalid_files() {
     };
 
     let cache = cache::Config::Memory.to_backend().unwrap();
-    let result = RegistryClient::new(&config, cache, DEFAULT_MAX_MANIFEST_SIZE_BYTES);
+    let result = RegistryClient::from_config(&config, cache, DEFAULT_MAX_MANIFEST_SIZE_BYTES);
 
     assert!(result.is_err());
     assert!(matches!(result.unwrap_err(), Error::Initialization(_)));
@@ -997,7 +1015,7 @@ fn client_for(mock_server: &MockServer) -> RegistryClient {
         password: None,
     };
     let cache = cache::Config::Memory.to_backend().unwrap();
-    RegistryClient::new(&config, cache, DEFAULT_MAX_MANIFEST_SIZE_BYTES).unwrap()
+    RegistryClient::from_config(&config, cache, DEFAULT_MAX_MANIFEST_SIZE_BYTES).unwrap()
 }
 
 #[tokio::test]
@@ -1413,7 +1431,8 @@ fn test_get_tags_list_path() {
         password: None,
     };
     let cache = cache::Config::Memory.to_backend().unwrap();
-    let client = RegistryClient::new(&config, cache, DEFAULT_MAX_MANIFEST_SIZE_BYTES).unwrap();
+    let client =
+        RegistryClient::from_config(&config, cache, DEFAULT_MAX_MANIFEST_SIZE_BYTES).unwrap();
 
     let path = client.get_tags_list_path("local", "local/repo");
     assert_eq!(path, "https://example.com/v2/repo/tags/list");
