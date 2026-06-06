@@ -32,6 +32,11 @@ pub enum Error {
     #[error("scrub initialization failed: {0}")]
     Initialization(String),
 
+    /// A replication-reconcile failure (envelope build or durable-queue enqueue)
+    /// raised mid-run, so it must not borrow the `Initialization` prefix.
+    #[error("scrub replication error: {0}")]
+    Replication(String),
+
     /// Wraps a `metadata_store::Error` with source preserved.
     #[error("scrub metadata store error: {0}")]
     MetadataStore(#[from] metadata_store::Error),
@@ -103,6 +108,15 @@ mod tests {
         assert_eq!(
             format!("{error}"),
             "scrub initialization failed: Some init error"
+        );
+    }
+
+    #[test]
+    fn replication_display_includes_prefix() {
+        let error = Error::Replication("failed to enqueue replication job".to_string());
+        assert_eq!(
+            format!("{error}"),
+            "scrub replication error: failed to enqueue replication job"
         );
     }
 

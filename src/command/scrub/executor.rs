@@ -77,14 +77,14 @@ impl Executor {
                 .replication_reconcile_total
                 .with_label_values(&["failed"])
                 .inc();
-            Error::Initialization(format!("failed to build replication envelope: {e}"))
+            Error::Replication(format!("failed to build replication envelope: {e}"))
         })?;
         self.job_store.enqueue(envelope).await.map_err(|e| {
             metrics_provider()
                 .replication_reconcile_total
                 .with_label_values(&["failed"])
                 .inc();
-            Error::Initialization(format!("failed to enqueue replication job: {e}"))
+            Error::Replication(format!("failed to enqueue replication job: {e}"))
         })?;
         metrics_provider()
             .replication_reconcile_total
