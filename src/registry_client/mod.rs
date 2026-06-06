@@ -360,7 +360,18 @@ impl RegistryClient {
         let response = self.query(&Method::HEAD, accepted_types, location).await?;
 
         if !response.status().is_success() {
-            return Err(Error::ManifestUnknown);
+            // A 404 means the manifest is genuinely absent; any other status is a
+            // transient/unexpected failure callers must be able to tell apart (the
+            // scrub reconcile treats a true 404 as "needs push" but skips the tag
+            // on a transient error).
+            return Err(if response.status() == StatusCode::NOT_FOUND {
+                Error::ManifestUnknown
+            } else {
+                Error::Internal(format!(
+                    "head_manifest: downstream returned status {}",
+                    response.status()
+                ))
+            });
         }
 
         let media_type = parse_header(&response, CONTENT_TYPE).ok();

@@ -49,6 +49,7 @@ use crate::{
     },
     oci::{Digest, Reference},
     registry::{
+        Error as RegistryError,
         metadata_store::{MetadataStore, link_kind::LinkKind},
         repository_resolver::RepositoryResolver,
     },
@@ -116,19 +117,30 @@ impl ReplicationChecker {
                 continue;
             };
 
-            // Downstream digest for this tag via OCI HEAD (Docker-Content-Digest);
-            // a missing tag (or HEAD failure) is treated as "needs push".
+            // Downstream digest for this tag via OCI HEAD (Docker-Content-Digest).
+            // A genuinely-absent tag (404) needs a push; a transient HEAD failure
+            // (5xx/timeout) is NOT absence, so skip the tag this pass rather than
+            // enqueuing a spurious push — the next reconcile re-checks it.
             let location = downstream.registry_client.get_manifest_path(
                 "",
                 namespace,
                 &Reference::Tag(tag.clone()),
             );
-            let downstream_digest = downstream
+            let downstream_digest = match downstream
                 .registry_client
                 .head_manifest(&[], &location)
                 .await
-                .ok()
-                .map(|(_, digest, _)| digest);
+            {
+                Ok((_, digest, _)) => Some(digest),
+                Err(RegistryError::ManifestUnknown) => None,
+                Err(e) => {
+                    debug!(
+                        "HEAD for '{namespace}:{tag}' on downstream '{}' failed transiently; skipping this pass: {e}",
+                        downstream.name
+                    );
+                    continue;
+                }
+            };
 
             if downstream_digest.as_ref() == Some(&local) {
                 debug!(
@@ -446,6 +458,55 @@ mod tests {
             Action::EnqueueReplicationPush { downstream, tag, digest, .. }
                 if downstream == DOWNSTREAM && tag == "v1" && *digest == manifest
         ));
+    }
+
+    #[tokio::test]
+    async fn transient_head_failure_skips_tag_without_enqueuing() {
+        crate::metrics_provider::init_for_tests();
+        let (metadata_store, store, _dir) = fs_metadata_store();
+        let mock_server = MockServer::start().await;
+
+        // Local: tag v1 -> manifest digest.
+        let manifest = put_blob_direct(&store, b"manifest-bytes").await;
+        metadata_store
+            .update_links(
+                NAMESPACE,
+                &[LinkOperation::create(
+                    LinkKind::Tag("v1".to_string()),
+                    manifest,
+                )],
+            )
+            .await
+            .unwrap();
+
+        // Downstream HEAD fails transiently (500). That is NOT a genuine absence,
+        // so the tag is skipped for this pass and no push is enqueued (a 404 would
+        // enqueue one — see enqueues_push_for_tag_missing_on_downstream).
+        Mock::given(method("HEAD"))
+            .and(path(format!("/v2/{NAMESPACE}/manifests/v1")))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&mock_server)
+            .await;
+
+        let resolver = resolver_for(repository(
+            downstream_client(&mock_server.uri()),
+            ReplicationMode::EventReconcile,
+            false,
+        ));
+        let checker = ReplicationChecker::builder()
+            .metadata_store(metadata_store.clone())
+            .resolver(resolver)
+            .build()
+            .unwrap();
+
+        let mut sink: Vec<Action> = Vec::new();
+        checker.check(NAMESPACE, &mut sink).await.unwrap();
+
+        assert!(
+            sink.is_empty(),
+            "a transient downstream HEAD failure must not enqueue a push, got {} action(s)",
+            sink.len()
+        );
     }
 
     /// An `ActionSink` that records every applied action and fails the first
