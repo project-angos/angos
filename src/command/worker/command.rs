@@ -326,12 +326,18 @@ impl WorkerContext {
                     .build()
                     .map_err(bootstrap::Error::JobQueue)?,
             )
-        } else {
+        } else if queue == CACHE_QUEUE {
             Arc::new(CacheJobHandler::new(
                 self.repositories.clone(),
                 self.blob_store.clone(),
                 self.metadata_store.clone(),
             ))
+        } else {
+            return Err(bootstrap::Error::JobQueue(
+                job_store::Error::Initialization(format!(
+                    "unknown queue '{queue}'; expected '{CACHE_QUEUE}' or '{REPLICATION_QUEUE}'"
+                )),
+            ));
         };
 
         Ok(Components { consumer, handler })
@@ -440,8 +446,7 @@ mod tests {
                 .unwrap(),
         );
         let blob_store = Arc::new(BlobStore::builder().store(storage.clone()).build().unwrap());
-        let repositories =
-            Arc::new(RepositoryResolver::new(Arc::new(HashMap::new())).unwrap());
+        let repositories = Arc::new(RepositoryResolver::new(Arc::new(HashMap::new())).unwrap());
 
         let context = WorkerContext {
             storage,
@@ -468,9 +473,13 @@ mod tests {
         // A `cache.fetch_blob` envelope handed to the REPLICATION queue's handler
         // must be rejected as an unsupported kind: only a `ReplicationJobHandler`
         // rejects this kind; a `CacheJobHandler` would accept it.
-        let cache_envelope =
-            JobEnvelope::new(CACHE_QUEUE, CACHE_FETCH_BLOB_KIND, "lock", &serde_json::json!({}))
-                .unwrap();
+        let cache_envelope = JobEnvelope::new(
+            CACHE_QUEUE,
+            CACHE_FETCH_BLOB_KIND,
+            "lock",
+            &serde_json::json!({}),
+        )
+        .unwrap();
         let replication_handler = context.components_for(REPLICATION_QUEUE).unwrap().handler;
         let err = replication_handler
             .execute(&cache_envelope)
@@ -483,7 +492,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn components_for_binds_other_queue_to_cache_handler() {
+    async fn components_for_rejects_unknown_queue() {
         let (context, _dir) = worker_context();
 
         // A `replication.push_manifest` envelope handed to the CACHE queue's
@@ -507,17 +516,17 @@ mod tests {
             "cache queue bound to the wrong handler: {err}"
         );
 
-        // An arbitrary non-replication queue name also resolves to the cache
-        // handler (the `else` branch), confirming the binding is "replication
-        // queue => replication handler, EVERYTHING ELSE => cache handler".
-        let other = context.components_for("some-other-queue").unwrap().handler;
-        let err = other
-            .execute(&replication_envelope)
-            .await
-            .expect_err("a non-replication queue must bind the cache handler");
+        // An unrecognized queue name (typo, wrong case, …) is rejected at
+        // startup rather than silently bound to the cache handler against a
+        // queue no producer ever enqueues to. The error must name the bad queue.
+        // `Components` is not `Debug`, so match the `Result` rather than
+        // `expect_err`.
+        let Err(err) = context.components_for("some-other-queue") else {
+            panic!("an unknown queue must be rejected");
+        };
         assert!(
-            err.to_string().contains("unsupported job kind"),
-            "a non-replication queue did not bind the cache handler: {err}"
+            err.to_string().contains("some-other-queue"),
+            "unknown-queue error did not name the bad queue: {err}"
         );
     }
 
