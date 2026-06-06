@@ -85,7 +85,7 @@ pub struct ReplicationPushPayload {
 /// (a degenerate payload) it falls back to an empty segment, which still yields
 /// a well-formed, namespace-scoped key.
 #[must_use]
-pub fn replication_lock_key(payload: &ReplicationPushPayload) -> String {
+fn replication_lock_key(payload: &ReplicationPushPayload) -> String {
     let op = if payload.kind == REPLICATION_DELETE_MANIFEST_KIND {
         "delete"
     } else {

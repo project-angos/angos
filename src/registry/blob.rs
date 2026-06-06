@@ -386,23 +386,19 @@ impl Registry {
                 kind: kind.to_string(),
                 source_ts: Some(source_ts.clone()),
             };
-            let envelope = match build_envelope(&payload) {
-                Ok(envelope) => envelope,
-                Err(e) => {
-                    warn!(
-                        "Failed to build replication job envelope for {}: {e}",
-                        downstream.name
-                    );
-                    metrics_provider()
-                        .job_queue_enqueue_failures_total
-                        .with_label_values(&[REPLICATION_QUEUE])
-                        .inc();
-                    continue;
-                }
+            // Build + enqueue as one fallible step so the warn + failure-metric
+            // path lives in a single place.
+            let outcome = match build_envelope(&payload) {
+                Ok(envelope) => self
+                    .job_queue
+                    .enqueue(envelope)
+                    .await
+                    .map_err(|e| e.to_string()),
+                Err(e) => Err(e.to_string()),
             };
-            if let Err(e) = self.job_queue.enqueue(envelope).await {
+            if let Err(error) = outcome {
                 warn!(
-                    "Failed to enqueue replication job for {}: {e}",
+                    "Failed to dispatch replication job for {}: {error}",
                     downstream.name
                 );
                 metrics_provider()

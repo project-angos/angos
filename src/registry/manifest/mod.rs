@@ -22,7 +22,7 @@ use crate::{
         DOCKER_CONTENT_DIGEST, Error, Registry, Repository,
         blob_ownership::BlobOwnership,
         blob_store::Error as BlobStoreError,
-        metadata_store::{Error as MetadataStoreError, link_kind::LinkKind},
+        metadata_store::{Error as MetadataStoreError, LinkMetadata, link_kind::LinkKind},
     },
     replication::{REPLICATION_DELETE_MANIFEST_KIND, REPLICATION_PUSH_MANIFEST_KIND},
     util::sha256,
@@ -386,27 +386,14 @@ impl Registry {
         self.check_lww_not_superseded(namespace, reference, source_ts)
             .await?;
 
-        // No-op suppression (loop prevention): record whether the reference
-        // existed locally BEFORE the delete. A replicated delete that finds
-        // nothing to remove (the ref was already absent) is a converged replay;
-        // re-dispatching it would keep a mesh cycle alive. (Client deletes of an
-        // absent ref usually 404 before reaching here, but gate defensively.)
-        // Only a genuinely-absent ref (ReferenceNotFound) counts as "nothing to
-        // delete". A transient read failure must NOT silently suppress a genuine
-        // delete, so it is treated as "existed" and falls through to dispatch.
-        //
-        // The read is gated on an event-enqueuing downstream matching this
-        // namespace: with nothing to dispatch the prior state is unused, so the
-        // gate short-circuits the `read_link` entirely. `existed_before` is then
-        // false, and the `if existed_before { dispatch_replication... }` below
-        // correctly skips — no downstream would enqueue anyway.
-        let existed_before = self.replicates_on_event(namespace)
-            && !matches!(
-                self.metadata_store
-                    .read_link(namespace, &LinkKind::from_reference(reference), false)
-                    .await,
-                Err(MetadataStoreError::ReferenceNotFound)
-            );
+        // No-op suppression: only re-dispatch a delete that actually removed
+        // something. `existed_before` is false for a genuinely-absent ref (a
+        // converged replay) or when replication is off; a transient read error
+        // counts as "existed" so a real delete is never suppressed.
+        let existed_before = match self.prior_link_if_replicated(namespace, reference).await {
+            None | Some(Err(MetadataStoreError::ReferenceNotFound)) => false,
+            Some(_) => true,
+        };
 
         let ops = if let Reference::Digest(digest) = reference {
             let tags = self
@@ -686,6 +673,30 @@ impl Registry {
         Ok(())
     }
 
+    /// The prior local link for `reference`, read only when an event-enqueuing
+    /// downstream matches `namespace`; `None` otherwise. The no-op-suppression
+    /// dispatch gates in `accept_put_manifest`/`delete_manifest` consume this
+    /// solely to decide whether to re-dispatch, so when no downstream would
+    /// enqueue the read is skipped entirely (restoring the replication-off cost).
+    /// A read error other than `ReferenceNotFound` is surfaced, not collapsed to
+    /// "absent", so a transient backend hiccup never silently suppresses a real
+    /// change.
+    async fn prior_link_if_replicated(
+        &self,
+        namespace: &Namespace,
+        reference: &Reference,
+    ) -> Option<Result<LinkMetadata, MetadataStoreError>> {
+        if self.replicates_on_event(namespace) {
+            Some(
+                self.metadata_store
+                    .read_link(namespace, &LinkKind::from_reference(reference), false)
+                    .await,
+            )
+        } else {
+            None
+        }
+    }
+
     /// Reads the body stream, calls `put_manifest`, and returns the domain response.
     #[instrument(skip(self, body_stream, actor))]
     pub async fn accept_put_manifest<S>(
@@ -703,30 +714,12 @@ impl Registry {
         self.check_lww_not_superseded(namespace, &reference, source_ts)
             .await?;
 
-        // No-op suppression (loop prevention): capture the PRIOR local state for
-        // this reference BEFORE the write so we can decide, after the write,
-        // whether local state actually changed. A re-asserted tag (same target)
-        // or an already-present revision is a converged replay; re-dispatching it
-        // would keep a 3+-node mesh cycle alive even though LWW has nothing to
-        // drop. This no-op suppression is now the sole terminator of 3+-node
-        // cycles. The result is interpreted per-reference below (tag target moved
-        // vs revision newly created).
-        //
-        // The read is SKIPPED entirely when no event-enqueuing downstream matches
-        // this namespace (replication off, or its filter excludes us): the prior
-        // state is consumed solely to gate dispatch, so with nothing to dispatch
-        // it is pure waste — skipping it restores the v1.2.0 cost for
-        // replication-disabled deployments. `None` therefore means "not read"
-        // and the post-write dispatch block below does not run.
-        let prior_link = if self.replicates_on_event(namespace) {
-            Some(
-                self.metadata_store
-                    .read_link(namespace, &LinkKind::from_reference(&reference), false)
-                    .await,
-            )
-        } else {
-            None
-        };
+        // No-op suppression: capture the PRIOR local state for this reference
+        // before the write, to decide afterward whether it actually changed (a
+        // re-asserted tag or already-present revision is a converged replay;
+        // re-dispatching it would keep a 3+-node mesh cycle alive). `None` means
+        // replication is off and the post-write dispatch block does not run.
+        let prior_link = self.prior_link_if_replicated(namespace, &reference).await;
 
         let limit = self.max_manifest_size_bytes;
         let mut request_body = Vec::new();
