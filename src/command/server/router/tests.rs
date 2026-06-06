@@ -153,6 +153,23 @@ fn test_parse_mount_blob_without_from() {
 }
 
 #[test]
+fn test_parse_mount_blob_with_malformed_from_is_rejected() {
+    // `?mount=<valid>&from=<malformed>` must NOT silently degrade to a from-less
+    // auto-discovery mount (which would widen the authorized source set). The
+    // route does not match, so `handle_unknown_route` turns the POST into a 400.
+    let mount_digest = "sha256:1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef";
+    let uri: Uri =
+        format!("/v2/myrepo/target/blobs/uploads/?mount={mount_digest}&from=Invalid")
+            .parse()
+            .unwrap();
+    let route = parse(&Method::POST, &uri);
+    assert!(
+        route.is_none(),
+        "a malformed ?from= must not route (POST -> 400), got: {route:?}"
+    );
+}
+
+#[test]
 fn test_parse_get_upload() {
     let method = Method::GET;
     let uuid = Uuid::new_v4();
