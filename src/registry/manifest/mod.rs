@@ -382,12 +382,19 @@ impl Registry {
         // Only a genuinely-absent ref (ReferenceNotFound) counts as "nothing to
         // delete". A transient read failure must NOT silently suppress a genuine
         // delete, so it is treated as "existed" and falls through to dispatch.
-        let existed_before = !matches!(
-            self.metadata_store
-                .read_link(namespace, &LinkKind::from_reference(reference), false)
-                .await,
-            Err(MetadataStoreError::ReferenceNotFound)
-        );
+        //
+        // The read is gated on an event-enqueuing downstream matching this
+        // namespace: with nothing to dispatch the prior state is unused, so the
+        // gate short-circuits the `read_link` entirely. `existed_before` is then
+        // false, and the `if existed_before { dispatch_replication... }` below
+        // correctly skips — no downstream would enqueue anyway.
+        let existed_before = self.replicates_on_event(namespace)
+            && !matches!(
+                self.metadata_store
+                    .read_link(namespace, &LinkKind::from_reference(reference), false)
+                    .await,
+                Err(MetadataStoreError::ReferenceNotFound)
+            );
 
         let ops = if let Reference::Digest(digest) = reference {
             let tags = self
@@ -635,10 +642,22 @@ impl Registry {
         // drop. This no-op suppression is now the sole terminator of 3+-node
         // cycles. The result is interpreted per-reference below (tag target moved
         // vs revision newly created).
-        let prior_link = self
-            .metadata_store
-            .read_link(namespace, &LinkKind::from_reference(&reference), false)
-            .await;
+        //
+        // The read is SKIPPED entirely when no event-enqueuing downstream matches
+        // this namespace (replication off, or its filter excludes us): the prior
+        // state is consumed solely to gate dispatch, so with nothing to dispatch
+        // it is pure waste — skipping it restores the v1.2.0 cost for
+        // replication-disabled deployments. `None` therefore means "not read"
+        // and the post-write dispatch block below does not run.
+        let prior_link = if self.replicates_on_event(namespace) {
+            Some(
+                self.metadata_store
+                    .read_link(namespace, &LinkKind::from_reference(&reference), false)
+                    .await,
+            )
+        } else {
+            None
+        };
 
         let limit = self.max_manifest_size_bytes;
         let mut request_body = Vec::new();
@@ -691,7 +710,10 @@ impl Registry {
         // Webhook events above are emitted unconditionally; only the replication
         // dispatch is gated, so observers still see every push while the mesh
         // stops re-propagating converged replays.
-        if let Some(digest) = digest_str.as_deref().and_then(|d| d.parse::<Digest>().ok()) {
+        if let (Some(prior_link), Some(digest)) = (
+            prior_link.as_ref(),
+            digest_str.as_deref().and_then(|d| d.parse::<Digest>().ok()),
+        ) {
             let (tag, changed) = match &reference {
                 // A tag push moves local state when the tag was absent OR pointed
                 // at a different digest. A tag re-asserted to the same digest is a
@@ -700,7 +722,7 @@ impl Registry {
                     // Changed unless the tag already pointed at this exact digest.
                     // A transient read failure (any non-Ok) must not silently
                     // suppress a genuine change, so it falls through to dispatch.
-                    let changed = !matches!(&prior_link, Ok(link) if link.target == digest);
+                    let changed = !matches!(prior_link, Ok(link) if link.target == digest);
                     (Some(tag.as_str()), changed)
                 }
                 // A digest push is content-addressed: it changes local state only

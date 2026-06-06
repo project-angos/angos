@@ -334,6 +334,21 @@ impl Registry {
         }
     }
 
+    /// True when a live mutation in `namespace` would enqueue at least one event
+    /// push — i.e. `dispatch_replication` has work. Gates the pre-write no-op-
+    /// suppression read so a replication-disabled (or namespace-non-matching)
+    /// deployment pays no extra metadata read.
+    pub fn replicates_on_event(&self, namespace: &Namespace) -> bool {
+        self.resolver
+            .resolve(namespace)
+            .is_some_and(|repository| {
+                repository
+                    .replication
+                    .iter()
+                    .any(|downstream| downstream.enqueues_for(namespace.as_ref()))
+            })
+    }
+
     /// Fire-and-forget enqueue of replication push/delete jobs for a local
     /// mutation, one per matching downstream. Mirrors [`Self::dispatch_cache_fill`]:
     /// failures are logged and counted on `angos_job_queue_enqueue_failures_total`
@@ -361,9 +376,7 @@ impl Registry {
         let source_ts = Utc::now().to_rfc3339();
 
         for downstream in &repository.replication {
-            if !downstream.mode.enqueues_on_event()
-                || !downstream.matches_namespace(namespace.as_ref())
-            {
+            if !downstream.enqueues_for(namespace.as_ref()) {
                 continue;
             }
 

@@ -72,6 +72,14 @@ impl ReplicationDownstream {
                 .iter()
                 .any(|pattern| pattern.is_match(namespace))
     }
+
+    /// True when a live mutation in `namespace` enqueues an event push to this
+    /// downstream — the exact per-downstream condition `dispatch_replication`
+    /// selects on.
+    #[must_use]
+    pub fn enqueues_for(&self, namespace: &str) -> bool {
+        self.mode.enqueues_on_event() && self.matches_namespace(namespace)
+    }
 }
 
 /// Builder for [`ReplicationDownstream`] taking individual resolved fields.
