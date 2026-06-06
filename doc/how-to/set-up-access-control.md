@@ -157,10 +157,10 @@ rules = [
 
 ### Restrict cross-repository blob mount
 
-A cross-repository mount (`POST .../blobs/uploads/?mount={digest}[&from={repo}]`) grants the target
+A cross-repository mount (`POST .../blobs/uploads/?mount={digest}[&from={repository}]`) grants the target
 namespace a reference to an existing blob with no upload. Angos grants it only when the caller is
 authorized to **read** the blob from a namespace that holds it -- the source repository named by
-`{repo}`, or (for a from-less mount) any namespace that references the blob. A caller who cannot read
+`{repository}`, or (for a from-less mount) any namespace that references the blob. A caller who cannot read
 the source falls back to a normal upload instead, so a mount never hands over a blob the caller could
 not otherwise pull -- you do not have to write a policy to close that gap.
 

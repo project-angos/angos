@@ -139,7 +139,11 @@ angos -c config.toml scrub --replicate
 
 By default reconciliation is **additive**: it pushes diverging or downstream-missing tags and never deletes. With `--dry-run` it previews the work without enqueuing anything: it lists an `EnqueueReplicationPush` for each diverging or downstream-missing tag and, for any downstream marked `prune = true`, an `EnqueueReplicationDelete` for each downstream-only tag.
 
-A downstream marked `prune = true` is treated as an **authoritative one-way mirror**: reconciliation also enumerates its tags (via the OCI `list-tags` endpoint) and deletes any that are absent locally, so it converges exactly to the local tag set. Pruning is **one-way-mirror-only**: enabling it on an active-active peer would delete a tag the peer authored that has not yet replicated back. The delete carries a `source_ts` so the receiver applies last-writer-wins rather than deleting unconditionally, but that only protects a downstream tag dated in the future relative to the reconcile decision — a peer's legitimately-newer tag whose `created_at` predates the reconcile run is still removed. Leave `prune = false` for active-active peers. Re-running is a no-op once converged (coalesced by the queue). Schedule it like any other maintenance task:
+A downstream marked `prune = true` is treated as an **authoritative one-way mirror**: reconciliation also enumerates its tags (via the OCI `list-tags` endpoint) and deletes any that are absent locally, so it converges exactly to the local tag set. Pruning is **one-way-mirror-only**: enabling it on an active-active peer would delete a tag the peer authored that has not yet replicated back.
+
+**Leave `prune = false` for active-active peers.** The delete does carry a `source_ts`, so the receiver applies last-writer-wins rather than deleting unconditionally. But that only protects a downstream tag dated in the future relative to the reconcile decision. A peer's legitimately-newer tag whose `created_at` predates the reconcile run is still removed.
+
+Re-running is a no-op once converged (coalesced by the queue). Schedule it like any other maintenance task:
 
 ```bash
 # Cron: reconcile every replicated repository nightly at 4 AM

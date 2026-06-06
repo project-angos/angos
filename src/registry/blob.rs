@@ -1484,7 +1484,7 @@ mod dispatch_replication_tests {
 
     /// Build a `Registry` over an FS/in-memory store whose shared job store is a
     /// caller-held `JobStore` (so the test can `count_pending`), carrying the
-    /// supplied repository and a known local instance-id.
+    /// supplied repository.
     fn build_registry_with(root: &str, repository: Repository) -> (Registry, Arc<JobStore>) {
         let object: Arc<dyn ObjectStore> =
             Arc::new(StorageFsBackend::builder().root_dir(root).build().unwrap());
@@ -1533,7 +1533,7 @@ mod dispatch_replication_tests {
 
     /// Build a `Registry` over an FS/in-memory store whose shared job store is a
     /// caller-held `JobStore` (so the test can `count_pending`), with one
-    /// `event+reconcile` downstream and a known local instance-id.
+    /// `event+reconcile` downstream.
     fn build_registry(root: &str) -> (Registry, Arc<JobStore>) {
         build_registry_with(root, repository_with_downstream())
     }

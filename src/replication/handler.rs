@@ -2,10 +2,10 @@
 //! push pipeline.
 //!
 //! Sibling of [`crate::registry::cache_job_handler::CacheJobHandler`]. The
-//! exemplar is constructed via `new(...)`; per refactor-rule 4 the new type
-//! exposes a `builder()` instead (resolved `Arc` deps + loop-prevention
-//! scalars), and kind-dispatch happens inside [`ReplicationJobHandler::execute`]
-//! exactly as the exemplar rejects unknown kinds.
+//! exemplar is constructed via `new(...)`; this type exposes a `builder()`
+//! instead (resolved `Arc` deps only), and kind-dispatch happens inside
+//! [`ReplicationJobHandler::execute`] exactly as the exemplar rejects unknown
+//! kinds.
 //!
 //! The handler returns an **empty** [`Transaction`] on success: the effect is an
 //! external, non-transactional HTTP push, blessed by the [`JobHandler`] trait
@@ -355,15 +355,15 @@ impl JobHandler for ReplicationJobHandler {
         let payload: ReplicationPushPayload = serde_json::from_value(envelope.payload.clone())
             .map_err(|e| Error::Storage(format!("failed to deserialize job payload: {e}")))?;
 
-        // Loop prevention runs at the enqueue boundary: the event-path
-        // `dispatch_replication` and the HTTP receiver drop an inbound change whose
-        // origin already equals this instance (self-bounce) before it is enqueued,
-        // and receiver-side no-op suppression breaks any remaining mesh cycles. A
-        // fresh local change legitimately carries this instance's own id as
-        // `origin`, so there is nothing for the handler itself to filter.
+        // Loop prevention is no-op suppression at the mutation boundary: the
+        // manifest mutation methods only call `dispatch_replication` when the write
+        // actually changed local state, so a converged replay (a tag re-asserted to
+        // the same digest, an already-present revision, a delete of an already-absent
+        // ref) is never re-dispatched and mesh cycles terminate. There is no origin
+        // filter and nothing for the handler itself to drop here.
 
         // Run the whole push/delete attempt and record `failed` once on ANY Err
-        // after the loop-filter — pre-flight (invalid namespace, missing
+        // from the attempt — pre-flight (invalid namespace, missing
         // downstream config), local-read (unreadable manifest blob), AND
         // downstream HTTP failures alike — so the documented
         // `replication_push_total{outcome="failed"}` failure-rate query also
@@ -979,7 +979,7 @@ mod tests {
         drop(mock_server);
     }
 
-    /// A reconcile push enqueues with `origin = None` and `source_ts = None`. The
+    /// A reconcile push enqueues with `source_ts = None`. The
     /// handler must still stamp the resolved tag's `created_at` so the receiver
     /// runs last-writer-wins instead of overwriting the downstream unconditionally.
     #[tokio::test]

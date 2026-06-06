@@ -167,8 +167,9 @@ impl Command {
     /// converge here; a transiently-failing push is rescheduled onto the durable
     /// queue for a worker or a later `scrub` run).
     ///
-    /// Reconcile-enqueued payloads carry `origin = None`, so the defensive loop
-    /// filter always lets them through.
+    /// Reconcile-enqueued pushes carry `source_ts = None`; the handler re-derives
+    /// `source_ts` from the resolved tag's `created_at`, so the receiver still runs
+    /// last-writer-wins.
     fn build_replication_drain(
         consumer: Arc<JobStore>,
         blob_store: &Arc<BlobStore>,

@@ -70,10 +70,12 @@ pub enum Action {
         digest: Digest,
     },
     /// Enqueue a replication delete job for a tag that exists on a downstream but
-    /// not locally. Reconciliation is a FULL MIRROR with local authoritative, so
-    /// a downstream-only tag (e.g. one pushed directly to the downstream
-    /// out-of-band) is removed. Applied by the `Executor` via `JobStore::enqueue`,
-    /// like [`Action::EnqueueReplicationPush`].
+    /// not locally. Emitted ONLY for a downstream marked `prune = true` (an
+    /// authoritative one-way mirror); pruning is OFF BY DEFAULT, because for an
+    /// active-active peer deleting a tag merely because it is absent locally would
+    /// destroy the peer's legitimately-newer tag that has not yet replicated back.
+    /// Applied by the `Executor` via `JobStore::enqueue`, like
+    /// [`Action::EnqueueReplicationPush`].
     EnqueueReplicationDelete {
         downstream: String,
         namespace: String,

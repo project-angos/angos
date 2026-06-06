@@ -631,9 +631,10 @@ impl Registry {
         // this reference BEFORE the write so we can decide, after the write,
         // whether local state actually changed. A re-asserted tag (same target)
         // or an already-present revision is a converged replay; re-dispatching it
-        // would keep a 3+-node mesh cycle alive even though the self-origin guard
-        // and LWW have nothing to drop. The result is interpreted per-reference
-        // below (tag target moved vs revision newly created).
+        // would keep a 3+-node mesh cycle alive even though LWW has nothing to
+        // drop. This no-op suppression is now the sole terminator of 3+-node
+        // cycles. The result is interpreted per-reference below (tag target moved
+        // vs revision newly created).
         let prior_link = self
             .metadata_store
             .read_link(namespace, &LinkKind::from_reference(&reference), false)

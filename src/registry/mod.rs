@@ -302,9 +302,9 @@ fn build_in_process_queue(
     }
 
     // Replication handler over the same shared store: it reads local manifest /
-    // blob bytes and pushes them to each downstream `RegistryClient`. Self-origin
-    // changes are filtered at the enqueue boundary; receiver-side no-op
-    // suppression terminates any remaining mesh cycles.
+    // blob bytes and pushes them to each downstream `RegistryClient`. Converged
+    // replays are suppressed sender-side — only state-changing writes dispatch,
+    // and receiver-side no-op suppression terminates any remaining mesh cycles.
     let replication_handler: Arc<dyn JobHandler> = Arc::new(
         ReplicationJobHandler::builder()
             .resolver(resolver.clone())

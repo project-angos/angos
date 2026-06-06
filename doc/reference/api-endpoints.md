@@ -66,8 +66,8 @@ Start a new blob upload. Returns `202 Accepted` with a `Location` header pointin
 session, or `201 Created` when the blob is already available (see `digest` / `mount` below).
 
 Query parameters:
-- `digest` - Return the existing blob only when the requested namespace already owns it; otherwise
-  start a new upload session.
+- `digest` - Return the existing blob (returns `201 Created`) only when the requested namespace
+  already owns it; otherwise start a new upload session.
 - `mount` (with optional `from`) - Cross-repository blob mount. `?mount={digest}` requests that an
   existing blob be referenced by the target namespace with no body transfer:
   - With `from`: the mount succeeds when the blob exists, is held by `{repository}`, and the caller is
