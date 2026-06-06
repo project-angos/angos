@@ -315,14 +315,13 @@ impl ReplicationJobHandler {
             let body = self.blob_store.read(&digest).await.map_err(|e| {
                 Error::Storage(format!("failed to read local manifest '{digest}': {e}"))
             })?;
-            let media_type = pipeline::media_type_of(&body);
             let outcome = pipeline::push_manifest(
                 registry_client,
                 &self.blob_store,
                 &self.metadata_store,
                 namespace.as_ref(),
                 &digest,
-                media_type.as_deref(),
+                None,
                 payload.tag.as_deref(),
                 body,
                 max_concurrent_pushes,

@@ -753,6 +753,11 @@ fn test_parse_manifest_digests() {
     let (content, media_type) = create_raw_test_manifest();
     let digests = parse_manifest_digests(&content, Some(&media_type)).unwrap();
 
+    assert_eq!(
+        digests.media_type.as_ref(),
+        Some(&media_type),
+        "the parse must surface the body's declared mediaType"
+    );
     assert!(digests.subject.is_none());
     assert_eq!(
         digests.config.unwrap().to_string(),

@@ -6,6 +6,9 @@ use crate::{
 };
 
 pub struct ParsedManifestDigests {
+    /// The manifest body's declared `mediaType`, surfaced from the single parse
+    /// so callers need not re-parse the body just to read it.
+    pub media_type: Option<String>,
     pub subject: Option<Digest>,
     pub config: Option<Digest>,
     pub layers: Vec<Digest>,
@@ -116,6 +119,7 @@ pub fn parse_manifest_digests(
         .collect::<Vec<_>>();
 
     Ok(ParsedManifestDigests {
+        media_type: manifest.media_type,
         subject,
         config,
         layers,

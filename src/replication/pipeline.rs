@@ -31,20 +31,6 @@ use crate::{
 /// Media type of an OCI image index (the referrers fallback tag body).
 const OCI_INDEX_MEDIA_TYPE: &str = "application/vnd.oci.image.index.v1+json";
 
-/// Reads the `mediaType` field out of a JSON manifest body, when present.
-///
-/// Shared by [`read_local_manifest`], [`referrer_descriptor`], and the job
-/// handler (which derives the top-level manifest's media type from the body it
-/// already read), so the `serde_json` extraction lives in one place.
-#[must_use]
-pub fn media_type_of(body: &[u8]) -> Option<String> {
-    serde_json::from_slice::<Value>(body).ok().and_then(|v| {
-        v.get("mediaType")
-            .and_then(Value::as_str)
-            .map(ToString::to_string)
-    })
-}
-
 /// Outcome of a successful replication push or delete.
 ///
 /// Both arms are convergence (the system reached the intended state); the
@@ -108,17 +94,24 @@ pub async fn push_manifest(
     let parsed = parse_manifest_digests(&body, media_type.map(ToString::to_string).as_ref())
         .map_err(Error::Registry)?;
 
+    // The PUT content type is the explicit `media_type` override when given, else
+    // the manifest body's own declared mediaType (surfaced by the parse above) —
+    // so the body is parsed once, not again via a separate read.
+    let effective_media_type = media_type
+        .map(ToString::to_string)
+        .or_else(|| parsed.media_type.clone());
+
     // 1. Recurse into child manifests FIRST (image index / manifest list). The
     //    parent index must not land on the downstream before its children.
     for child in &parsed.manifests {
-        let (child_media_type, child_body) = read_local_manifest(blob_store, child).await?;
+        let child_body = read_local_manifest(blob_store, child).await?;
         Box::pin(push_manifest(
             downstream,
             blob_store,
             metadata_store,
             namespace,
             child,
-            child_media_type.as_deref(),
+            None,
             None,
             child_body,
             max_concurrent_pushes,
@@ -173,7 +166,12 @@ pub async fn push_manifest(
     }
 
     let result = downstream
-        .put_manifest(&location, media_type, body.clone(), source_ts)
+        .put_manifest(
+            &location,
+            effective_media_type.as_deref(),
+            body.clone(),
+            source_ts,
+        )
         .await
         .map_err(Error::Registry)?;
 
@@ -201,20 +199,18 @@ pub async fn push_manifest(
     Ok(PushOutcome::Pushed)
 }
 
-/// Reads a local manifest body (stored as a blob) and its recorded media type.
+/// Reads a local manifest body (stored as a blob). The body carries the
+/// manifest's own `mediaType`, which `push_manifest` derives from its single
+/// parse, so this returns just the bytes.
 async fn read_local_manifest(
     blob_store: &Arc<BlobStore>,
     digest: &Digest,
-) -> Result<(Option<String>, Vec<u8>), Error> {
-    let body = blob_store.read(digest).await.map_err(|e| {
+) -> Result<Vec<u8>, Error> {
+    blob_store.read(digest).await.map_err(|e| {
         Error::Registry(RegistryError::Internal(format!(
             "failed to read local manifest blob '{digest}': {e}"
         )))
-    })?;
-    // The blob body itself carries the manifest's `mediaType`; reading it back
-    // out keeps the push self-contained without a metadata-store round-trip.
-    let media_type = media_type_of(&body);
-    Ok((media_type, body))
+    })
 }
 
 /// HEAD-before-PUT every referenced blob; transfer only the absent ones.
