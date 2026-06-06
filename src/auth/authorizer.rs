@@ -136,7 +136,7 @@ impl Authorizer {
         })
     }
 
-    #[instrument(skip(self, request, registry))]
+    #[instrument(skip(self, request, registry, identity))]
     pub async fn authorize_request(
         &self,
         action: &Action,
@@ -189,7 +189,7 @@ impl Authorizer {
     /// the caller degrades to a normal upload session instead of leaking the blob;
     /// otherwise the authorized source namespace is returned so the grant can be
     /// conditioned on it rather than on an independently re-derived candidate set.
-    #[instrument(skip(self, request, registry))]
+    #[instrument(skip(self, request, registry, identity))]
     pub async fn authorize_mount_source(
         &self,
         mount: &BlobMount,
