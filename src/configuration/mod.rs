@@ -225,8 +225,17 @@ fn validate_durable_queue_lock(config: &Configuration) -> Result<(), Error> {
     let lock_strategy = match config.resolve_registry_storage() {
         RegistryStorageConfig::FS(fs) => fs.lock_strategy,
         RegistryStorageConfig::S3(s3) => s3.lock_strategy,
-        // `resolve_registry_storage` always returns a concrete backend.
-        RegistryStorageConfig::Inherit => return Ok(()),
+        // Reaching this arm means the `resolve_registry_storage` invariant
+        // regressed (it must map `Inherit` to a concrete FS/S3 backend). Fail
+        // closed rather than silently skip the durable-queue lock check, which
+        // would let a multi-worker deployment run with a non-shared lock.
+        RegistryStorageConfig::Inherit => {
+            return Err(Error::InvalidFormat(
+                "[metadata_store] did not resolve to a concrete backend before \
+                 durable-queue lock validation"
+                    .to_string(),
+            ));
+        }
     };
     if matches!(lock_strategy, LockStrategy::Memory) {
         return Err(Error::InvalidFormat(
