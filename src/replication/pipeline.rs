@@ -143,9 +143,8 @@ pub async fn push_manifest(
     //     receiver-side no-op dispatch gate breaks cycles; this just avoids one
     //     wasted PUT once converged). Probe the target reference: if the
     //     downstream already resolves it to THIS digest, it is converged, so skip
-    //     the manifest PUT. For a subject-bearing manifest we still run the
-    //     referrers fallback below (it is idempotent and we cannot observe the
-    //     downstream's `OCI-Subject` indexing without the PUT response).
+    //     the manifest PUT (and the referrers fallback — see the converged
+    //     branch below).
     let already_present = downstream
         .head_manifest(&[], &location)
         .await
@@ -158,10 +157,13 @@ pub async fn push_manifest(
             ?tag,
             "Downstream already holds this manifest; skipping PUT (converged)"
         );
-        if parsed.subject.is_some() {
-            push_referrers_fallback(downstream, namespace, digest, &parsed, &body, source_ts)
-                .await?;
-        }
+        // No referrers fallback on the converged path. The original
+        // (non-converged) push already created the `<alg>-<hash>` fallback tag for
+        // an OCI-1.0 downstream (gated on the PUT's missing `OCI-Subject`), and an
+        // OCI-1.1 downstream auto-indexes the subject and never needs it. Re-running
+        // it on every converged re-run only re-merged a redundant index — and
+        // materialised a stray fallback tag on OCI-1.1 peers that already indexed
+        // the subject.
         return Ok(PushOutcome::Pushed);
     }
 
@@ -1263,6 +1265,72 @@ mod tests {
 
         // No PUT mock exists; `.expect(1)` on the HEAD (verified on drop) proves
         // the probe ran and the absence of an error proves no PUT was attempted.
+        drop(mock_server);
+    }
+
+    #[tokio::test]
+    async fn no_referrers_fallback_on_converged_path() {
+        // A subject-bearing manifest already converged on the downstream (HEAD
+        // matches THIS digest) must NOT re-push the referrers fallback: the
+        // original push created it for OCI-1.0, and OCI-1.1 auto-indexes. The
+        // fallback-tag PUT is mounted with expect(0), so any re-push fails the test.
+        crate::metrics_provider::init_for_tests();
+        let mock_server = MockServer::start().await;
+        let dir = TempDir::new().unwrap();
+        let (blob_store, metadata_store, store) = test_blob_store(dir.path().to_str().unwrap());
+
+        let subject = put_blob_direct(&store, b"subject-bytes").await;
+        // Config-less subject manifest, so the converged push has no referenced
+        // blob to probe; only the referrers fallback would (wrongly) re-run.
+        let manifest = json!({
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "layers": [],
+            "subject": {
+                "mediaType": "application/vnd.oci.image.manifest.v1+json",
+                "digest": subject.to_string(),
+                "size": 13,
+            },
+        });
+        let manifest_bytes = serde_json::to_vec(&manifest).unwrap();
+        let manifest_digest = put_blob_direct(&store, &manifest_bytes).await;
+
+        // The manifest is already converged: HEAD by tag resolves to THIS digest.
+        Mock::given(method("HEAD"))
+            .and(path(format!("/v2/{NAMESPACE}/manifests/v1")))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header(DOCKER_CONTENT_DIGEST, manifest_digest.to_string().as_str())
+                    .insert_header("Content-Length", manifest_bytes.len().to_string().as_str()),
+            )
+            .mount(&mock_server)
+            .await;
+
+        // The fallback tag must NOT be touched on the converged path.
+        let fallback_tag = format!("{}-{}", subject.algorithm(), subject.hash());
+        Mock::given(method("PUT"))
+            .and(path(format!("/v2/{NAMESPACE}/manifests/{fallback_tag}")))
+            .respond_with(ResponseTemplate::new(201))
+            .expect(0)
+            .mount(&mock_server)
+            .await;
+
+        push_manifest(
+            &downstream_client(&mock_server.uri()),
+            &blob_store,
+            &metadata_store,
+            NAMESPACE,
+            &manifest_digest,
+            Some("application/vnd.oci.image.manifest.v1+json"),
+            Some("v1"),
+            manifest_bytes,
+            4,
+            None,
+        )
+        .await
+        .expect("converged push must succeed");
+
+        // `.expect(0)` on the fallback PUT (no re-push on the converged path).
         drop(mock_server);
     }
 
