@@ -1139,6 +1139,72 @@ async fn test_mount_blob_falls_back_to_session_on_202() {
 }
 
 #[tokio::test]
+async fn test_mount_blob_rejects_mismatched_201_digest() {
+    let mock_server = MockServer::start().await;
+    let digest = "sha256:1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef";
+    let other_digest = "sha256:abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890";
+
+    // The server answers 201 but advertises a *different* digest than requested.
+    Mock::given(method("POST"))
+        .and(path("/v2/target/blobs/uploads/"))
+        .and(query_param("mount", digest))
+        .and(query_param("from", "source"))
+        .respond_with(ResponseTemplate::new(201).insert_header(DOCKER_CONTENT_DIGEST, other_digest))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let client = client_for(&mock_server);
+    let start_url = client.get_uploads_start_path("", "target");
+    let outcome = client
+        .mount_blob(
+            &start_url,
+            &Digest::try_from(digest).unwrap(),
+            Some("source"),
+        )
+        .await;
+
+    assert!(
+        outcome.is_err(),
+        "a 201 advertising a different digest must be rejected, got {outcome:?}"
+    );
+    drop(mock_server);
+}
+
+#[tokio::test]
+async fn test_mount_blob_accepts_matching_201_digest() {
+    let mock_server = MockServer::start().await;
+    let digest = "sha256:1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef";
+
+    // The server answers 201 and advertises the *same* digest that was requested.
+    Mock::given(method("POST"))
+        .and(path("/v2/target/blobs/uploads/"))
+        .and(query_param("mount", digest))
+        .and(query_param("from", "source"))
+        .respond_with(ResponseTemplate::new(201).insert_header(DOCKER_CONTENT_DIGEST, digest))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let client = client_for(&mock_server);
+    let start_url = client.get_uploads_start_path("", "target");
+    let outcome = client
+        .mount_blob(
+            &start_url,
+            &Digest::try_from(digest).unwrap(),
+            Some("source"),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        outcome, None,
+        "a 201 advertising the requested digest must report a mount (None — no transfer needed)"
+    );
+    drop(mock_server);
+}
+
+#[tokio::test]
 async fn test_put_manifest_with_oci_subject() {
     let mock_server = MockServer::start().await;
     let manifest = br#"{"schemaVersion":2}"#;

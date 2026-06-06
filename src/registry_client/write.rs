@@ -254,7 +254,9 @@ impl RegistryClient {
     ///
     /// Appends `?mount=<digest>[&from=<repo>]` so the server can grant a reference
     /// without a body transfer. The return distinguishes the two outcomes:
-    /// - `Ok(None)` — the mount was satisfied (`201 Created`); no transfer needed.
+    /// - `Ok(None)` — the mount was satisfied (`201 Created`); no transfer
+    ///   needed. When the `201` advertises a `Docker-Content-Digest` it is
+    ///   verified against the requested digest (a mismatch is an error).
     /// - `Ok(Some(session_url))` — the mount could not be satisfied (`202
     ///   Accepted`); a session was opened and the caller uploads the bytes.
     ///
@@ -282,8 +284,22 @@ impl RegistryClient {
             .send_body(&Method::POST, &location, None, Vec::new(), None)
             .await?;
 
-        // 201 Created: the blob is already present downstream (mounted).
+        // 201 Created: the blob is already present downstream (mounted). The
+        // digest header is optional, but if present it must name the requested
+        // blob — a different digest would falsely mark the blob converged.
         if response.status() == StatusCode::CREATED {
+            let advertised = response
+                .headers()
+                .get(DOCKER_CONTENT_DIGEST)
+                .and_then(|h| h.to_str().ok())
+                .and_then(|s| Digest::try_from(s).ok());
+            if let Some(advertised) = advertised
+                && &advertised != mount
+            {
+                return Err(Error::Internal(format!(
+                    "mount_blob: downstream returned 201 for digest {advertised}, expected {mount}"
+                )));
+            }
             return Ok(None);
         }
 
