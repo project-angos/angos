@@ -340,10 +340,24 @@ impl WorkerContext {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashSet, time::Duration};
+    use std::{collections::HashMap, collections::HashSet, sync::Arc, time::Duration};
 
-    use super::{CLAIM_ERROR_BACKOFF_CAP, claim_error_backoff, resolve_queues};
-    use crate::{registry::cache_job_handler::CACHE_QUEUE, replication::REPLICATION_QUEUE};
+    use tempfile::TempDir;
+
+    use angos_storage::{ObjectStore, fs::Backend as StorageFsBackend};
+
+    use super::{CLAIM_ERROR_BACKOFF_CAP, WorkerContext, claim_error_backoff, resolve_queues};
+    use crate::{
+        registry::{
+            blob_store::BlobStore,
+            cache_job_handler::{CACHE_FETCH_BLOB_KIND, CACHE_QUEUE},
+            job_store::JobEnvelope,
+            metadata_store::MetadataStore,
+            repository_resolver::RepositoryResolver,
+            test_utils::{build_store, build_test_fs_executor},
+        },
+        replication::{REPLICATION_PUSH_MANIFEST_KIND, REPLICATION_QUEUE},
+    };
 
     #[test]
     fn resolve_queues_defaults_to_cache_and_replication() {
@@ -401,5 +415,125 @@ mod tests {
         // then snaps down to the cap. No panic.
         let max_poll = Duration::MAX;
         assert_eq!(claim_error_backoff(max_poll, 6), CLAIM_ERROR_BACKOFF_CAP);
+    }
+
+    /// Builds a `WorkerContext` over FS-backed test stores by constructing the
+    /// struct literal DIRECTLY (same-module private access), bypassing
+    /// `WorkerContext::build` (which requires a `[global.job_queue]` config and
+    /// would trip `validate_durable_queue_lock`). The `TempDir` is returned so
+    /// the on-disk store outlives the context.
+    fn worker_context() -> (WorkerContext, TempDir) {
+        crate::metrics_provider::init_for_tests();
+        let dir = TempDir::new().unwrap();
+        let root = dir.path().to_str().unwrap();
+
+        let object: Arc<dyn ObjectStore> =
+            Arc::new(StorageFsBackend::builder().root_dir(root).build().unwrap());
+        let executor = build_test_fs_executor(root, false);
+        let storage = build_store(object, executor);
+        let metadata_store = Arc::new(
+            MetadataStore::builder()
+                .store(storage.clone())
+                .link_cache_ttl(0)
+                .access_time_debounce_secs(0)
+                .build()
+                .unwrap(),
+        );
+        let blob_store = Arc::new(BlobStore::builder().store(storage.clone()).build().unwrap());
+        let repositories =
+            Arc::new(RepositoryResolver::new(Arc::new(HashMap::new())).unwrap());
+
+        let context = WorkerContext {
+            storage,
+            blob_store,
+            metadata_store,
+            repositories,
+        };
+        (context, dir)
+    }
+
+    /// `components_for` binds the queue to its handler: the replication queue gets
+    /// a `ReplicationJobHandler`, every other queue (here `cache`) gets a
+    /// `CacheJobHandler`. The handler is an opaque `Arc<dyn JobHandler>` that
+    /// can't be downcast, so the binding is asserted BEHAVIOURALLY through each
+    /// handler's kind-dispatch: both handlers reject a foreign job kind with an
+    /// "unsupported job kind" error at the very first step of `execute`, before
+    /// touching the payload or any backend — so a wrong binding (a cache handler
+    /// where a replication handler was expected, or vice-versa) would NOT reject
+    /// the foreign kind and the assertion would fail.
+    #[tokio::test]
+    async fn components_for_binds_replication_queue_to_replication_handler() {
+        let (context, _dir) = worker_context();
+
+        // A `cache.fetch_blob` envelope handed to the REPLICATION queue's handler
+        // must be rejected as an unsupported kind: only a `ReplicationJobHandler`
+        // rejects this kind; a `CacheJobHandler` would accept it.
+        let cache_envelope =
+            JobEnvelope::new(CACHE_QUEUE, CACHE_FETCH_BLOB_KIND, "lock", &serde_json::json!({}))
+                .unwrap();
+        let replication_handler = context.components_for(REPLICATION_QUEUE).unwrap().handler;
+        let err = replication_handler
+            .execute(&cache_envelope)
+            .await
+            .expect_err("replication handler must reject a cache job kind");
+        assert!(
+            err.to_string().contains("unsupported job kind"),
+            "replication queue bound to the wrong handler: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn components_for_binds_other_queue_to_cache_handler() {
+        let (context, _dir) = worker_context();
+
+        // A `replication.push_manifest` envelope handed to the CACHE queue's
+        // handler must be rejected as an unsupported kind: only a
+        // `CacheJobHandler` rejects this kind; a `ReplicationJobHandler` would
+        // accept it.
+        let replication_envelope = JobEnvelope::new(
+            REPLICATION_QUEUE,
+            REPLICATION_PUSH_MANIFEST_KIND,
+            "lock",
+            &serde_json::json!({}),
+        )
+        .unwrap();
+        let cache_handler = context.components_for(CACHE_QUEUE).unwrap().handler;
+        let err = cache_handler
+            .execute(&replication_envelope)
+            .await
+            .expect_err("cache handler must reject a replication job kind");
+        assert!(
+            err.to_string().contains("unsupported job kind"),
+            "cache queue bound to the wrong handler: {err}"
+        );
+
+        // An arbitrary non-replication queue name also resolves to the cache
+        // handler (the `else` branch), confirming the binding is "replication
+        // queue => replication handler, EVERYTHING ELSE => cache handler".
+        let other = context.components_for("some-other-queue").unwrap().handler;
+        let err = other
+            .execute(&replication_envelope)
+            .await
+            .expect_err("a non-replication queue must bind the cache handler");
+        assert!(
+            err.to_string().contains("unsupported job kind"),
+            "a non-replication queue did not bind the cache handler: {err}"
+        );
+    }
+
+    /// `components_for` mints a FRESH `JobStore` consumer per call, each with its
+    /// own worker id (a fresh `Uuid`). The struct field is private, but two
+    /// consumers over the same shared storage are distinct `Arc`s — asserting the
+    /// pointers differ pins that the consumer is not accidentally shared/cached
+    /// across queues (each queue must drain on its own consumer).
+    #[tokio::test]
+    async fn components_for_mints_a_fresh_consumer_per_call() {
+        let (context, _dir) = worker_context();
+        let a = context.components_for(CACHE_QUEUE).unwrap().consumer;
+        let b = context.components_for(REPLICATION_QUEUE).unwrap().consumer;
+        assert!(
+            !Arc::ptr_eq(&a, &b),
+            "each queue must get its own JobStore consumer"
+        );
     }
 }

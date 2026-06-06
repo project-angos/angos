@@ -2724,6 +2724,11 @@ mod noop_suppression_tests {
 
         // Re-assert the SAME tag->digest: a converged replay => no new job, even
         // with the queue empty (the gate, not the dedup index, suppresses it).
+        // This per-node converged-replay drop is what terminates BOTH 2-node and
+        // N-node (3+) mesh cycles WITHOUT any origin tracking: each node refuses
+        // to re-dispatch a write that left its local state unchanged, so an
+        // inbound replicated bounce dies at every hop (the intent of the removed
+        // `foreign_origin_noop_breaks_mesh_cycle` test, preserved per-node).
         registry
             .accept_put_manifest(
                 None,
@@ -2791,7 +2796,22 @@ mod noop_suppression_tests {
             "a first-time digest push must enqueue one job"
         );
 
-        // Re-push the SAME revision: content-addressed no-op => no new job.
+        // Drain that job so its `lock_key` dedup index clears; otherwise the
+        // second enqueue would coalesce on the still-pending job and pending
+        // would stay 1 even if the no-op gate were removed — masking the gate.
+        drain_one(&job_store).await;
+        assert_eq!(pending(&job_store).await, 0, "queue drained");
+
+        // Re-push the SAME revision with the queue EMPTY: a content-addressed
+        // converged replay => the gate (prior_link.is_err() == false) suppresses
+        // the re-dispatch, so pending stays 0. A broken gate would freshly
+        // enqueue (no pending job to coalesce against) and pending would be 1.
+        // This per-node drop of an already-present revision is exactly what
+        // terminates BOTH 2-node and N-node (3+) mesh cycles WITHOUT any origin
+        // tracking: every node independently refuses to re-dispatch a write that
+        // did not change its local state, so the foreign-origin bounce dies at
+        // each hop (the intent of the removed `foreign_origin_noop_breaks_mesh_
+        // cycle` test, preserved per-node).
         registry
             .accept_put_manifest(
                 None,
@@ -2805,8 +2825,9 @@ mod noop_suppression_tests {
             .expect("re-push same revision");
         assert_eq!(
             pending(&job_store).await,
-            1,
-            "re-pushing an already-present revision must enqueue nothing"
+            0,
+            "re-pushing an already-present revision must enqueue nothing \
+             (the gate, not the dedup index, suppresses it)"
         );
     }
 
