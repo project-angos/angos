@@ -445,13 +445,13 @@ fn referrer_descriptor(referrer_digest: &Digest, body: &[u8]) -> Value {
         "digest": referrer_digest.to_string(),
         "size": body.len(),
     });
-    if let Some(manifest_media_type) = media_type_of(body) {
-        descriptor["mediaType"] = json!(manifest_media_type);
-    }
-    if let Ok(parsed) = serde_json::from_slice::<Value>(body)
-        && let Some(artifact_type) = parsed.get("artifactType").and_then(Value::as_str)
-    {
-        descriptor["artifactType"] = json!(artifact_type);
+    if let Ok(parsed) = serde_json::from_slice::<Value>(body) {
+        if let Some(media_type) = parsed.get("mediaType").and_then(Value::as_str) {
+            descriptor["mediaType"] = json!(media_type);
+        }
+        if let Some(artifact_type) = parsed.get("artifactType").and_then(Value::as_str) {
+            descriptor["artifactType"] = json!(artifact_type);
+        }
     }
     descriptor
 }

@@ -283,11 +283,13 @@ impl WorkerContext {
         )
         .await?;
 
-        let _jq_config = config.global.job_queue.as_ref().ok_or_else(|| {
-            bootstrap::Error::JobQueue(job_store::Error::Initialization(
-                "[global.job_queue] is required for the worker subcommand".to_string(),
-            ))
-        })?;
+        if config.global.job_queue.is_none() {
+            return Err(bootstrap::Error::JobQueue(
+                job_store::Error::Initialization(
+                    "[global.job_queue] is required for the worker subcommand".to_string(),
+                ),
+            ));
+        }
 
         let storage = config.resolve_registry_storage().build_store().await?;
 

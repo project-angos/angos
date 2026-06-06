@@ -339,14 +339,12 @@ impl Registry {
     /// suppression read so a replication-disabled (or namespace-non-matching)
     /// deployment pays no extra metadata read.
     pub fn replicates_on_event(&self, namespace: &Namespace) -> bool {
-        self.resolver
-            .resolve(namespace)
-            .is_some_and(|repository| {
-                repository
-                    .replication
-                    .iter()
-                    .any(|downstream| downstream.enqueues_for(namespace.as_ref()))
-            })
+        self.resolver.resolve(namespace).is_some_and(|repository| {
+            repository
+                .replication
+                .iter()
+                .any(|downstream| downstream.enqueues_for(namespace.as_ref()))
+        })
     }
 
     /// Fire-and-forget enqueue of replication push/delete jobs for a local

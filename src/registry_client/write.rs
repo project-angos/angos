@@ -89,6 +89,12 @@ async fn parse_oci_error_code(response: Response) -> Option<String> {
         .map(ToString::to_string)
 }
 
+/// Appends a query string to a URL, choosing '?' or '&' for the separator.
+fn append_query(base: &str, query: &str) -> String {
+    let separator = if base.contains('?') { '&' } else { '?' };
+    format!("{base}{separator}{query}")
+}
+
 impl RegistryClient {
     /// Sends a request carrying a byte body, reusing the cached auth header and
     /// refreshing once on `401` (mirrors [`RegistryClient::query`]).
@@ -274,11 +280,11 @@ impl RegistryClient {
         mount: &Digest,
         from: Option<&str>,
     ) -> Result<Option<String>, Error> {
-        let separator = if location.contains('?') { '&' } else { '?' };
-        let location = match from {
-            Some(from) => format!("{location}{separator}mount={mount}&from={from}"),
-            None => format!("{location}{separator}mount={mount}"),
+        let query = match from {
+            Some(from) => format!("mount={mount}&from={from}"),
+            None => format!("mount={mount}"),
         };
+        let location = append_query(location, &query);
 
         let response = self
             .send_body(&Method::POST, &location, None, Vec::new(), None)
@@ -359,8 +365,7 @@ impl RegistryClient {
     /// the response is not a success status.
     #[instrument(skip(self))]
     pub async fn complete_upload(&self, session_url: &str, digest: &Digest) -> Result<(), Error> {
-        let separator = if session_url.contains('?') { '&' } else { '?' };
-        let location = format!("{session_url}{separator}digest={digest}");
+        let location = append_query(session_url, &format!("digest={digest}"));
 
         let response = self
             .send_body(&Method::PUT, &location, None, Vec::new(), None)
