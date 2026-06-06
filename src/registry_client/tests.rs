@@ -1494,3 +1494,32 @@ async fn test_list_tags_absent_repo_returns_empty() {
     let tags = client.list_tags(&location).await.unwrap();
     assert!(tags.is_empty(), "a 404 repo must yield an empty tag list");
 }
+
+#[tokio::test]
+async fn list_tags_breaks_on_cyclic_next_link() {
+    // A downstream advertising a cyclic `Link: rel="next"` must not drive an
+    // unbounded request loop: the visited-page guard stops once a page URL
+    // repeats, returning the tags gathered so far rather than hanging.
+    let mock_server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/v2/test/tags/list"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({ "tags": ["a", "b"] }))
+                .insert_header("Link", "</v2/test/tags/list?last=z>; rel=\"next\""),
+        )
+        .expect(2)
+        .mount(&mock_server)
+        .await;
+
+    let client = client_for(&mock_server);
+    let tags = client
+        .list_tags(&client.get_tags_list_path("", "test"))
+        .await
+        .expect("cyclic pagination must terminate, not error");
+
+    // The base page and the single `?last=z` page are fetched, then the repeated
+    // `?last=z` breaks the loop — never an unbounded fetch (asserted by expect(2)).
+    assert_eq!(tags, vec!["a", "b", "a", "b"]);
+}

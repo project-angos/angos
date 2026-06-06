@@ -14,6 +14,8 @@
 //! replayed, so it attaches the cached token up front and surfaces a `401` as
 //! an error rather than retrying with a drained body.
 
+use std::collections::HashSet;
+
 use reqwest::{
     Body, Method, Response, StatusCode,
     header::{CONTENT_LENGTH, CONTENT_TYPE, LINK, LOCATION},
@@ -524,10 +526,30 @@ impl RegistryClient {
     /// (non-404) page is a non-success status / has an unparseable body.
     #[instrument(skip(self))]
     pub async fn list_tags(&self, location: &str) -> Result<Vec<String>, Error> {
+        // A downstream advertising a cyclic or non-terminating `Link: rel="next"`
+        // must not drive an unbounded request loop / `Vec` growth. `visited` stops
+        // an exact cycle (a repeated page URL) cleanly with the tags gathered so
+        // far; `MAX_PAGES` is a hard backstop against an endless stream of
+        // distinct pages.
+        const MAX_PAGES: usize = 10_000;
+
         let mut tags = Vec::new();
         let mut next = Some(location.to_string());
+        let mut visited = HashSet::new();
 
         while let Some(page_location) = next.take() {
+            if visited.len() >= MAX_PAGES {
+                return Err(Error::Internal(format!(
+                    "list_tags exceeded {MAX_PAGES} pages; downstream pagination does not terminate"
+                )));
+            }
+            if !visited.insert(page_location.clone()) {
+                // Already fetched this page: the downstream's `rel="next"` cycles.
+                // Stop with the tags gathered so far (a partial list only
+                // under-reconciles; it never deletes a tag that exists).
+                break;
+            }
+
             let response = self.query(&Method::GET, &[], &page_location).await?;
 
             if response.status() == StatusCode::NOT_FOUND {
