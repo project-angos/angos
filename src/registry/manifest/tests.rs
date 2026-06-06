@@ -2438,6 +2438,72 @@ async fn delete_manifest_accepts_lww_newer_source_ts() {
 }
 
 #[tokio::test]
+async fn delete_manifest_digest_rejects_lww_when_pointing_tag_newer() {
+    // A digest delete cascades to every tag pointing at the revision. A
+    // replicated delete whose source_ts predates a locally-newer tag pointing at
+    // that digest must be superseded: the tag, and the revision it references,
+    // survive — exactly as a tag delete would.
+    let test_case = FSRegistryTestCase::new();
+    let registry = test_case.registry();
+    let namespace = &Namespace::new("lww-repo").unwrap();
+    let tag = "latest";
+
+    let (content, _) = seed_tag(registry, namespace, tag).await;
+    let digest = Digest::Sha256(sha256::hex(&content).into());
+    let older = local_created_at(registry, namespace, tag).await - chrono::Duration::seconds(60);
+
+    let result = registry
+        .delete_manifest(None, Some(older), namespace, &Reference::Digest(digest.clone()))
+        .await
+        .err();
+
+    assert!(
+        matches!(result, Some(Error::ReplicationSuperseded(_))),
+        "digest delete older than a pointing tag must be superseded, got: {result:?}"
+    );
+
+    // The tag and the revision it points at must both survive the rejected delete.
+    registry
+        .metadata_store
+        .read_link(namespace.as_ref(), &LinkKind::Tag(tag.to_string()), false)
+        .await
+        .expect("pointing tag must survive a superseded digest delete");
+    registry
+        .metadata_store
+        .read_link(namespace.as_ref(), &LinkKind::Digest(digest), false)
+        .await
+        .expect("revision must survive a superseded digest delete");
+}
+
+#[tokio::test]
+async fn delete_manifest_digest_accepts_lww_when_newer_than_pointing_tags() {
+    // A replicated digest delete whose source_ts is newer than every pointing
+    // tag wins: the revision and its tags are removed.
+    let test_case = FSRegistryTestCase::new();
+    let registry = test_case.registry();
+    let namespace = &Namespace::new("lww-repo").unwrap();
+    let tag = "latest";
+
+    let (content, _) = seed_tag(registry, namespace, tag).await;
+    let digest = Digest::Sha256(sha256::hex(&content).into());
+    let newer = local_created_at(registry, namespace, tag).await + chrono::Duration::seconds(60);
+
+    registry
+        .delete_manifest(None, Some(newer), namespace, &Reference::Digest(digest))
+        .await
+        .expect("digest delete newer than every pointing tag must win");
+
+    let tag_result = registry
+        .metadata_store
+        .read_link(namespace.as_ref(), &LinkKind::Tag(tag.to_string()), false)
+        .await;
+    assert!(
+        matches!(tag_result, Err(metadata_store::Error::ReferenceNotFound)),
+        "pointing tag must be removed by an accepted digest delete, got: {tag_result:?}"
+    );
+}
+
+#[tokio::test]
 async fn prune_delete_stamped_source_ts_suppressed_when_local_tag_newer_else_proceeds() {
     // Mirrors the scrub prune path end-to-end on the receiver: the reconcile
     // executor stamps `source_ts = Utc::now().to_rfc3339()` on the delete payload;

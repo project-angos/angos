@@ -401,6 +401,18 @@ impl Registry {
                 .metadata_store
                 .find_tags_pointing_at(namespace.as_ref(), digest)
                 .await?;
+
+            // Receiver-side last-writer-wins for a replicated digest delete. The
+            // delete cascades to every tag pointing at the revision, so a tag
+            // re-pointed locally AFTER the delete was authored — and the revision
+            // it still references — must not be dropped by the older delete. Tag
+            // deletes are guarded by `check_lww_not_superseded` above; a genuine
+            // client delete carries no `source_ts` and skips this.
+            if let Some(source_ts) = source_ts {
+                self.check_digest_delete_not_superseded(namespace, &tags, source_ts)
+                    .await?;
+            }
+
             let manifest = self
                 .blob_store
                 .read(digest)
@@ -612,6 +624,42 @@ impl Registry {
             return Err(Error::ReplicationSuperseded(format!(
                 "local tag '{tag}' (created {local_created_at}) is newer than the replicated source ({source_ts})"
             )));
+        }
+
+        Ok(())
+    }
+
+    /// Last-writer-wins guard for a replication-originated *digest* delete.
+    ///
+    /// A digest delete cascades to every tag pointing at the revision, so a tag
+    /// re-pointed locally after the delete was authored — its `created_at`
+    /// strictly newer than the incoming `source_ts` — must not be dropped by the
+    /// older delete. When such a tag exists the local copy (and the revision it
+    /// still references) wins, and the whole delete is rejected with
+    /// [`Error::ReplicationSuperseded`] so the sender records convergence rather
+    /// than a retryable conflict. A tag with no recorded `created_at` is treated
+    /// as oldest and never blocks the delete; a transient read failure fails
+    /// closed (refuse the delete), matching `check_lww_not_superseded`.
+    async fn check_digest_delete_not_superseded(
+        &self,
+        namespace: &Namespace,
+        tags: &[LinkKind],
+        source_ts: DateTime<Utc>,
+    ) -> Result<(), Error> {
+        for tag in tags {
+            let created_at = match self.metadata_store.read_link(namespace, tag, false).await {
+                Ok(link) => link.created_at,
+                Err(MetadataStoreError::ReferenceNotFound) => continue,
+                Err(err) => return Err(Error::from(err)),
+            };
+            let Some(created_at) = created_at else {
+                continue;
+            };
+            if created_at > source_ts {
+                return Err(Error::ReplicationSuperseded(format!(
+                    "local {tag} (created {created_at}) is newer than the replicated digest delete ({source_ts})"
+                )));
+            }
         }
 
         Ok(())
