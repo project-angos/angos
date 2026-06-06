@@ -16,6 +16,7 @@
 
 use std::collections::HashSet;
 
+use bytes::Bytes;
 use reqwest::{
     Body, Method, Response, StatusCode,
     header::{CONTENT_LENGTH, CONTENT_TYPE, LINK, LOCATION},
@@ -113,6 +114,10 @@ impl RegistryClient {
     ) -> Result<Response, Error> {
         info!("Writing to upstream: {method} {location}");
 
+        // Keep the body for the cached-token attempt and a possible 401 retry
+        // without a deep copy: a `Bytes` clone is a refcount bump, not a re-alloc.
+        let body = Bytes::from(body);
+
         let cached_auth = self.cached_auth_header(location).await;
         let response = self
             .send_body_once(
@@ -153,7 +158,7 @@ impl RegistryClient {
         method: &Method,
         location: &str,
         content_type: Option<&str>,
-        body: Vec<u8>,
+        body: Bytes,
         auth_header: Option<&str>,
         source_ts: Option<&str>,
     ) -> Result<Response, Error> {
