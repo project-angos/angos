@@ -389,9 +389,10 @@ async fn push_referrers_fallback(
     })?;
     let location = downstream.get_manifest_path("", namespace, &reference);
 
-    // GET the existing fallback index; a missing/empty tag starts fresh. Any
-    // pre-existing referrer descriptors are preserved so this push only adds.
-    let mut manifests = fetch_fallback_manifests(downstream, &location).await;
+    // GET the existing fallback index; a missing tag (404) starts fresh, a
+    // transient failure propagates so the job retries. Any pre-existing referrer
+    // descriptors are preserved so this push only adds.
+    let mut manifests = fetch_fallback_manifests(downstream, &location).await?;
 
     // Descriptor for the referrer manifest just pushed.
     let referrer_digest = Digest::Sha256(sha256::hex(body).into());
@@ -424,16 +425,27 @@ async fn push_referrers_fallback(
 }
 
 /// GETs the existing referrers fallback index at `location` and returns its
-/// `manifests[]` descriptors, or an empty list when the tag is absent or the
-/// body cannot be parsed as an index.
-async fn fetch_fallback_manifests(downstream: &RegistryClient, location: &str) -> Vec<Value> {
-    let Ok((_, _, body)) = downstream.get_manifest(&[], location).await else {
-        return Vec::new();
+/// `manifests[]` descriptors.
+///
+/// A `404` (`ManifestUnknown`) means the fallback tag does not exist yet, so an
+/// empty list is returned and the caller starts fresh. Any other error — a
+/// transient `5xx`/timeout — is propagated so the caller retries instead of
+/// overwriting an existing index from an empty base and dropping every sibling
+/// referrer of the subject. A success whose body is not a parseable index yields
+/// an empty list (a malformed body would not change on retry).
+async fn fetch_fallback_manifests(
+    downstream: &RegistryClient,
+    location: &str,
+) -> Result<Vec<Value>, Error> {
+    let body = match downstream.get_manifest(&[], location).await {
+        Ok((_, _, body)) => body,
+        Err(RegistryError::ManifestUnknown) => return Ok(Vec::new()),
+        Err(e) => return Err(Error::Registry(e)),
     };
-    serde_json::from_slice::<Value>(&body)
+    Ok(serde_json::from_slice::<Value>(&body)
         .ok()
         .and_then(|v| v.get("manifests").and_then(Value::as_array).cloned())
-        .unwrap_or_default()
+        .unwrap_or_default())
 }
 
 /// Builds an OCI descriptor for a referrer manifest to embed in the fallback
@@ -713,6 +725,113 @@ mod tests {
 
         // `.expect(1)` on the primary manifest PUT + the fallback index PUT (with
         // the body assertion above) is verified on MockServer drop.
+        drop(mock_server);
+    }
+
+    #[tokio::test]
+    async fn referrers_fallback_propagates_transient_get_error_without_clobbering() {
+        // A transient (non-404) failure GETting the existing fallback index must
+        // NOT be treated as "tag absent -> start fresh": that would PUT an index
+        // built from an empty base and drop the subject's sibling referrers. The
+        // push must surface the error so the durable job retries.
+        crate::metrics_provider::init_for_tests();
+        let mock_server = MockServer::start().await;
+        let dir = TempDir::new().unwrap();
+        let (blob_store, metadata_store, store) = test_blob_store(dir.path().to_str().unwrap());
+
+        let subject = put_blob_direct(&store, b"subject-bytes").await;
+        let config = put_blob_direct(&store, br#"{"c":1}"#).await;
+        let manifest = json!({
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "config": {
+                "mediaType": "application/vnd.oci.image.config.v1+json",
+                "digest": config.to_string(),
+                "size": 7,
+            },
+            "layers": [],
+            "subject": {
+                "mediaType": "application/vnd.oci.image.manifest.v1+json",
+                "digest": subject.to_string(),
+                "size": 13,
+            },
+        });
+        let manifest_bytes = serde_json::to_vec(&manifest).unwrap();
+        let manifest_digest = put_blob_direct(&store, &manifest_bytes).await;
+
+        // Config blob missing on downstream -> upload runs.
+        Mock::given(method("HEAD"))
+            .and(path(format!("/v2/{NAMESPACE}/blobs/{config}")))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path(format!("/v2/{NAMESPACE}/blobs/uploads/")))
+            .respond_with(
+                ResponseTemplate::new(202)
+                    .insert_header("Location", format!("/v2/{NAMESPACE}/blobs/uploads/s")),
+            )
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("PATCH"))
+            .and(path(format!("/v2/{NAMESPACE}/blobs/uploads/s")))
+            .respond_with(
+                ResponseTemplate::new(202)
+                    .insert_header("Location", format!("/v2/{NAMESPACE}/blobs/uploads/s")),
+            )
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path(format!("/v2/{NAMESPACE}/blobs/uploads/s")))
+            .respond_with(ResponseTemplate::new(201))
+            .mount(&mock_server)
+            .await;
+
+        // Primary manifest PUT with NO `OCI-Subject` => OCI-1.0 => fallback runs.
+        Mock::given(method("PUT"))
+            .and(path(format!("/v2/{NAMESPACE}/manifests/v1")))
+            .respond_with(
+                ResponseTemplate::new(201)
+                    .insert_header(DOCKER_CONTENT_DIGEST, manifest_digest.to_string().as_str()),
+            )
+            .mount(&mock_server)
+            .await;
+
+        // The fallback index GET fails transiently (500): the merge-PUT must NOT
+        // be attempted and the push must surface the error.
+        let fallback_tag = format!("{}-{}", subject.algorithm(), subject.hash());
+        Mock::given(method("GET"))
+            .and(path(format!("/v2/{NAMESPACE}/manifests/{fallback_tag}")))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path(format!("/v2/{NAMESPACE}/manifests/{fallback_tag}")))
+            .respond_with(ResponseTemplate::new(201))
+            .expect(0)
+            .mount(&mock_server)
+            .await;
+
+        let result = push_manifest(
+            &downstream_client(&mock_server.uri()),
+            &blob_store,
+            &metadata_store,
+            NAMESPACE,
+            &manifest_digest,
+            Some("application/vnd.oci.image.manifest.v1+json"),
+            Some("v1"),
+            manifest_bytes,
+            4,
+            None,
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "a transient fallback-index GET error must fail the push so the job retries, got: {result:?}"
+        );
+
+        // `.expect(0)` on the fallback PUT (no clobbering write) is verified on drop.
         drop(mock_server);
     }
 

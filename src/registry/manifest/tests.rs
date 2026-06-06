@@ -2453,7 +2453,12 @@ async fn delete_manifest_digest_rejects_lww_when_pointing_tag_newer() {
     let older = local_created_at(registry, namespace, tag).await - chrono::Duration::seconds(60);
 
     let result = registry
-        .delete_manifest(None, Some(older), namespace, &Reference::Digest(digest.clone()))
+        .delete_manifest(
+            None,
+            Some(older),
+            namespace,
+            &Reference::Digest(digest.clone()),
+        )
         .await
         .err();
 
