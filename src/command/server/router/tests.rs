@@ -158,10 +158,9 @@ fn test_parse_mount_blob_with_malformed_from_is_rejected() {
     // auto-discovery mount (which would widen the authorized source set). The
     // route does not match, so `handle_unknown_route` turns the POST into a 400.
     let mount_digest = "sha256:1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef";
-    let uri: Uri =
-        format!("/v2/myrepo/target/blobs/uploads/?mount={mount_digest}&from=Invalid")
-            .parse()
-            .unwrap();
+    let uri: Uri = format!("/v2/myrepo/target/blobs/uploads/?mount={mount_digest}&from=Invalid")
+        .parse()
+        .unwrap();
     let route = parse(&Method::POST, &uri);
     assert!(
         route.is_none(),
