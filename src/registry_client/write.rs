@@ -376,6 +376,25 @@ impl RegistryClient {
         Ok(())
     }
 
+    /// Classifies a `409 Conflict` from a replication write. `Ok(())` means the
+    /// downstream rejected by last-writer-wins (OCI code
+    /// [`REPLICATION_SUPERSEDED_CODE`] — its copy is strictly newer), which the
+    /// caller maps to its own convergence outcome. Any other 409 (e.g. an
+    /// immutable-tag `CONFLICT`) returns [`Error`] so the job retries/dead-letters.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for any non-superseded 409.
+    async fn classify_conflict(response: Response, op: &str) -> Result<(), Error> {
+        match parse_oci_error_code(response).await.as_deref() {
+            Some(REPLICATION_SUPERSEDED_CODE) => Ok(()),
+            other => Err(Error::Internal(format!(
+                "{op} rejected with 409 (code {})",
+                other.unwrap_or("<none>")
+            ))),
+        }
+    }
+
     /// Pushes a manifest by reference.
     ///
     /// `source_ts` stamps the `X-Angos-Source-Timestamp` header when set (a
@@ -410,17 +429,12 @@ impl RegistryClient {
             .await?;
 
         if response.status() == StatusCode::CONFLICT {
-            return match parse_oci_error_code(response).await.as_deref() {
-                Some(REPLICATION_SUPERSEDED_CODE) => Ok(PutManifestResult {
-                    digest: None,
-                    subject: None,
-                    superseded: true,
-                }),
-                other => Err(Error::Internal(format!(
-                    "put_manifest rejected with 409 (code {})",
-                    other.unwrap_or("<none>")
-                ))),
-            };
+            Self::classify_conflict(response, "put_manifest").await?;
+            return Ok(PutManifestResult {
+                digest: None,
+                subject: None,
+                superseded: true,
+            });
         }
 
         if !response.status().is_success() {
@@ -474,13 +488,8 @@ impl RegistryClient {
             .await?;
 
         if response.status() == StatusCode::CONFLICT {
-            return match parse_oci_error_code(response).await.as_deref() {
-                Some(REPLICATION_SUPERSEDED_CODE) => Ok(DeleteManifestOutcome::Superseded),
-                other => Err(Error::Internal(format!(
-                    "delete_manifest rejected with 409 (code {})",
-                    other.unwrap_or("<none>")
-                ))),
-            };
+            Self::classify_conflict(response, "delete_manifest").await?;
+            return Ok(DeleteManifestOutcome::Superseded);
         }
 
         if !response.status().is_success() {
