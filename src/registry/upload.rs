@@ -18,8 +18,10 @@ use crate::{
 /// thousands; without a cap, a single public mount request would trigger one
 /// CEL evaluation per candidate — an attacker-influenceable fan-out. This cap
 /// bounds only that per-candidate authorization loop. The full referrer set is
-/// still read from the blob index and materialized into a Vec first; the cap is
-/// a `truncate` applied afterwards, so it does not bound that read or
+/// still read from the blob index and materialized into a Vec first; that Vec is
+/// then sorted and the cap is a `truncate` applied afterwards (so the kept
+/// candidates are the lexicographically-smallest `MAX_FROM_LESS_MOUNT_CANDIDATES`,
+/// deterministic across requests), so the cap does not bound that read or
 /// allocation. The cap is fail-safe: if the caller holds access only to a
 /// namespace beyond this limit the mount is simply not granted and the client
 /// falls back to a normal upload session (202), which re-authorizes
@@ -278,6 +280,11 @@ impl Registry {
         let mut candidates = BlobOwnership::new(self.metadata_store.as_ref())
             .referencing_namespaces(&mount.digest)
             .await?;
+        // Sort before truncating so the kept candidates are deterministic — the
+        // lexicographically-smallest MAX_FROM_LESS_MOUNT_CANDIDATES — rather than an
+        // arbitrary HashMap-ordered subset that varies per request and could let a
+        // given caller's mount authorize on one request and not another.
+        candidates.sort();
         candidates.truncate(MAX_FROM_LESS_MOUNT_CANDIDATES);
         Ok(candidates)
     }
@@ -985,14 +992,16 @@ mod tests {
             assert!(candidates.is_empty());
 
             // from-less discovery -> every namespace that references the blob.
-            let mut candidates = registry
+            // Production sorts before truncating, so the output is already in
+            // lexicographic order ("test-repo/other" < "test-repo/source");
+            // assert that directly (no in-test sort) to guard the determinism.
+            let candidates = registry
                 .mount_source_candidates(&BlobMount {
                     digest: digest.clone(),
                     from: None,
                 })
                 .await
                 .unwrap();
-            candidates.sort();
             assert_eq!(candidates, vec![other.clone(), source.clone()]);
 
             // Absent blob -> no candidates.
