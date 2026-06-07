@@ -474,7 +474,7 @@ mod tests {
     use angos_tx_engine::store::Store;
 
     use crate::{
-        cache,
+        cache, metrics_provider,
         oci::Digest,
         policy::{RetentionPolicy, RetentionPolicyConfig, SystemClock},
         registry::{
@@ -520,7 +520,7 @@ mod tests {
     /// callers read this before and after an action and assert the **delta** (an
     /// absolute would be polluted by other tests touching the same label set).
     fn push_total(downstream: &str, outcome: &str) -> u64 {
-        crate::metrics_provider::metrics_provider()
+        metrics_provider::metrics_provider()
             .replication_push_total
             .with_label_values(&[downstream, outcome])
             .get()
@@ -528,7 +528,7 @@ mod tests {
 
     /// Current value of `angos_replication_last_success_timestamp_seconds{downstream}`.
     fn last_success(downstream: &str) -> i64 {
-        crate::metrics_provider::metrics_provider()
+        metrics_provider::metrics_provider()
             .replication_last_success_timestamp
             .with_label_values(&[downstream])
             .get()
@@ -709,7 +709,7 @@ mod tests {
 
     #[tokio::test]
     async fn execute_rejects_unknown_kind() {
-        crate::metrics_provider::init_for_tests();
+        metrics_provider::init_for_tests();
         let dir = TempDir::new().unwrap();
         let root = dir.path().to_str().unwrap();
         let object: Arc<dyn ObjectStore> =
@@ -759,7 +759,7 @@ mod tests {
 
     #[tokio::test]
     async fn execute_pushes_manifest_with_head_before_put() {
-        crate::metrics_provider::init_for_tests();
+        metrics_provider::init_for_tests();
         let mock_server = MockServer::start().await;
 
         let dir = TempDir::new().unwrap();
@@ -849,7 +849,7 @@ mod tests {
 
     #[tokio::test]
     async fn execute_skips_blob_present_on_downstream() {
-        crate::metrics_provider::init_for_tests();
+        metrics_provider::init_for_tests();
         let mock_server = MockServer::start().await;
 
         let dir = TempDir::new().unwrap();
@@ -920,7 +920,7 @@ mod tests {
     /// handler -> pipeline -> client header threading.
     #[tokio::test]
     async fn execute_push_stamps_resolved_source_timestamp() {
-        crate::metrics_provider::init_for_tests();
+        metrics_provider::init_for_tests();
         let mock_server = MockServer::start().await;
 
         let dir = TempDir::new().unwrap();
@@ -1006,7 +1006,7 @@ mod tests {
     /// runs last-writer-wins instead of overwriting the downstream unconditionally.
     #[tokio::test]
     async fn execute_reconcile_push_derives_source_timestamp_from_local_tag() {
-        crate::metrics_provider::init_for_tests();
+        metrics_provider::init_for_tests();
         let mock_server = MockServer::start().await;
 
         let dir = TempDir::new().unwrap();
@@ -1085,7 +1085,7 @@ mod tests {
     /// queue retries / dead-letters the job — it MUST NOT be silently dropped.
     #[tokio::test]
     async fn execute_push_surfaces_immutable_conflict_409_as_error() {
-        crate::metrics_provider::init_for_tests();
+        metrics_provider::init_for_tests();
         let mock_server = MockServer::start().await;
 
         let dir = TempDir::new().unwrap();
@@ -1155,7 +1155,7 @@ mod tests {
     /// the job.
     #[tokio::test]
     async fn execute_push_treats_superseded_409_as_success() {
-        crate::metrics_provider::init_for_tests();
+        metrics_provider::init_for_tests();
         let mock_server = MockServer::start().await;
 
         let dir = TempDir::new().unwrap();
@@ -1224,7 +1224,7 @@ mod tests {
 
     #[tokio::test]
     async fn execute_delete_manifest_calls_downstream_delete() {
-        crate::metrics_provider::init_for_tests();
+        metrics_provider::init_for_tests();
         let mock_server = MockServer::start().await;
 
         Mock::given(method("DELETE"))
@@ -1337,7 +1337,7 @@ mod tests {
     /// and advances `replication_last_success_timestamp{..}` to a fresh value.
     #[tokio::test]
     async fn execute_push_records_pushed_metric_and_last_success() {
-        crate::metrics_provider::init_for_tests();
+        metrics_provider::init_for_tests();
         let downstream = "metric-pushed";
         let mock_server = MockServer::start().await;
         let (handler, config_digest, layer_digest, _dir) =
@@ -1386,7 +1386,7 @@ mod tests {
     /// is success).
     #[tokio::test]
     async fn execute_push_records_superseded_metric_and_last_success() {
-        crate::metrics_provider::init_for_tests();
+        metrics_provider::init_for_tests();
         let downstream = "metric-superseded";
         let mock_server = MockServer::start().await;
         let (handler, config_digest, layer_digest, _dir) =
@@ -1430,7 +1430,7 @@ mod tests {
     /// retries; it must not touch `pushed` or the last-success gauge.
     #[tokio::test]
     async fn execute_push_records_failed_metric_on_error() {
-        crate::metrics_provider::init_for_tests();
+        metrics_provider::init_for_tests();
         let downstream = "metric-failed";
         let mock_server = MockServer::start().await;
         let (handler, config_digest, layer_digest, _dir) =
@@ -1478,7 +1478,7 @@ mod tests {
     /// metric is recorded.
     #[tokio::test]
     async fn execute_push_with_deleted_tag_is_noop_success_records_no_failed() {
-        crate::metrics_provider::init_for_tests();
+        metrics_provider::init_for_tests();
         let downstream = "metric-deleted-tag";
 
         let dir = TempDir::new().unwrap();
@@ -1542,7 +1542,7 @@ mod tests {
 
     #[tokio::test]
     async fn execute_tagless_push_with_deleted_revision_is_noop_success() {
-        crate::metrics_provider::init_for_tests();
+        metrics_provider::init_for_tests();
         let downstream = "metric-deleted-revision";
 
         let dir = TempDir::new().unwrap();
