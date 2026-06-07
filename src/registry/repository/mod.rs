@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{collections::HashSet, sync::Arc};
 
 use serde::Deserialize;
 use tokio::task;
@@ -103,6 +103,27 @@ impl Repository {
             .await
             .map_err(|e| Error::Internal(format!("Failed to initialize upstream clients: {e}")))??
         };
+
+        // Validate downstream routing keys before building any client: `name` is the
+        // job lock_key segment and the per-downstream metrics label, so an empty or
+        // duplicate name silently coalesces two distinct targets into one. Reject at
+        // build time, mirroring how global config rejects invalid knobs.
+        let mut seen_names = HashSet::new();
+        for downstream in &config.downstream {
+            if downstream.name.is_empty() {
+                return Err(Error::Initialization(format!(
+                    "replication downstream in repository '{name}' has an empty name; \
+                     a non-empty name is required (it is the job routing key and metrics label)"
+                )));
+            }
+            if !seen_names.insert(downstream.name.as_str()) {
+                return Err(Error::Initialization(format!(
+                    "repository '{name}' has duplicate replication downstream name '{}'; \
+                     downstream names must be unique (they are the job routing key and metrics label)",
+                    downstream.name
+                )));
+            }
+        }
 
         let replication = if config.downstream.is_empty() {
             Vec::new()
@@ -254,6 +275,7 @@ mod tests {
             manifest::DEFAULT_MAX_MANIFEST_SIZE_BYTES,
             repository::{Config, RegistryClientConfig, Repository},
         },
+        replication::{ReplicationDownstreamConfig, ReplicationMode},
         test_fixtures::webhook::ca_bundle_pem,
     };
 
@@ -274,6 +296,17 @@ mod tests {
             client_private_key: None,
             username: None,
             password: None,
+        }
+    }
+
+    fn downstream_config(name: &str) -> ReplicationDownstreamConfig {
+        ReplicationDownstreamConfig {
+            name: name.to_string(),
+            client: registry_client_config("https://downstream.example.test".to_string()),
+            mode: ReplicationMode::default(),
+            namespace_filter: Vec::new(),
+            max_concurrent_pushes: None,
+            prune: false,
         }
     }
 
@@ -335,6 +368,51 @@ mod tests {
             .unwrap();
 
         assert!(!repo.is_pull_through());
+    }
+
+    #[tokio::test]
+    async fn duplicate_downstream_name_is_rejected() {
+        let cache = cache::Config::Memory.to_backend().unwrap();
+        let config = Config {
+            downstream: vec![downstream_config("eu"), downstream_config("eu")],
+            ..Default::default()
+        };
+
+        let error = Repository::new("repo", &config, &cache, DEFAULT_MAX_MANIFEST_SIZE_BYTES)
+            .await
+            .err()
+            .expect("duplicate downstream name must be rejected");
+
+        match error {
+            Error::Initialization(message) => {
+                assert!(message.contains("duplicate"), "message: {message}");
+                assert!(message.contains("eu"), "message: {message}");
+                assert!(message.contains("repo"), "message: {message}");
+            }
+            other => panic!("expected Error::Initialization, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn empty_downstream_name_is_rejected() {
+        let cache = cache::Config::Memory.to_backend().unwrap();
+        let config = Config {
+            downstream: vec![downstream_config("")],
+            ..Default::default()
+        };
+
+        let error = Repository::new("repo", &config, &cache, DEFAULT_MAX_MANIFEST_SIZE_BYTES)
+            .await
+            .err()
+            .expect("empty downstream name must be rejected");
+
+        match error {
+            Error::Initialization(message) => {
+                assert!(message.contains("empty name"), "message: {message}");
+                assert!(message.contains("repo"), "message: {message}");
+            }
+            other => panic!("expected Error::Initialization, got {other:?}"),
+        }
     }
 
     #[tokio::test]
