@@ -120,6 +120,8 @@ interface FailedJobsResponse {
 
 export type JobState = 'pending' | 'failed';
 
+export type JobQueue = 'cache' | 'replication';
+
 const MANIFEST_ACCEPT_HEADER = [
 	'application/vnd.oci.image.manifest.v1+json',
 	'application/vnd.docker.distribution.manifest.v2+json',
@@ -185,28 +187,40 @@ export async function fetchUploads(namespace: string): Promise<FetchResult<Uploa
 	return fetchJson<UploadsResponse>(`/_ext/${namespace}/_uploads`);
 }
 
-function jobsQuery(n: number, after?: string): string {
-	const params = new URLSearchParams({ n: String(n) });
+function jobsQuery(queue: JobQueue, n: number, after?: string): string {
+	const params = new URLSearchParams({ queue, n: String(n) });
 	if (after) {
 		params.set('after', after);
 	}
 	return params.toString();
 }
 
-export async function fetchJobs(n = 100, after?: string): Promise<FetchResult<JobsResponse>> {
-	return fetchJson<JobsResponse>(`/_ext/_jobs?${jobsQuery(n, after)}`);
+export async function fetchJobs(
+	queue: JobQueue,
+	n = 100,
+	after?: string
+): Promise<FetchResult<JobsResponse>> {
+	return fetchJson<JobsResponse>(`/_ext/_jobs?${jobsQuery(queue, n, after)}`);
 }
 
-export async function fetchFailedJobs(n = 100, after?: string): Promise<FetchResult<FailedJobsResponse>> {
-	return fetchJson<FailedJobsResponse>(`/_ext/_jobs/failed?${jobsQuery(n, after)}`);
+export async function fetchFailedJobs(
+	queue: JobQueue,
+	n = 100,
+	after?: string
+): Promise<FetchResult<FailedJobsResponse>> {
+	return fetchJson<FailedJobsResponse>(`/_ext/_jobs/failed?${jobsQuery(queue, n, after)}`);
 }
 
-export async function retryJob(storageKey: string): Promise<string | null> {
-	return postAction(`/_ext/_jobs/failed/${storageKey}/retry`);
+export async function retryJob(queue: JobQueue, storageKey: string): Promise<string | null> {
+	return postAction(`/_ext/_jobs/failed/${storageKey}/retry?queue=${queue}`);
 }
 
-export async function deleteJob(state: JobState, storageKey: string): Promise<string | null> {
-	return deleteResource(`/_ext/_jobs/${state}/${storageKey}`);
+export async function deleteJob(
+	queue: JobQueue,
+	state: JobState,
+	storageKey: string
+): Promise<string | null> {
+	return deleteResource(`/_ext/_jobs/${state}/${storageKey}?queue=${queue}`);
 }
 
 export interface ManifestResult {
