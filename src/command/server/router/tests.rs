@@ -1035,20 +1035,22 @@ fn test_parse_list_namespaces_post_not_allowed() {
 #[test]
 fn test_parse_list_jobs() {
     let route = parse(&Method::GET, &"/_ext/_jobs".parse().unwrap());
-    assert!(matches!(
-        route,
-        Some(Action::ListJobs {
-            n: None,
-            after: None
-        })
-    ));
+    match route {
+        Some(Action::ListJobs { queue, n, after }) => {
+            assert_eq!(queue, "cache");
+            assert_eq!(n, None);
+            assert_eq!(after, None);
+        }
+        other => panic!("expected ListJobs, got {other:?}"),
+    }
 }
 
 #[test]
 fn test_parse_list_jobs_with_pagination() {
     let route = parse(&Method::GET, &"/_ext/_jobs?n=10&after=abc".parse().unwrap());
     match route {
-        Some(Action::ListJobs { n, after }) => {
+        Some(Action::ListJobs { queue, n, after }) => {
+            assert_eq!(queue, "cache");
             assert_eq!(n, Some(10));
             assert_eq!(after.as_deref(), Some("abc"));
         }
@@ -1059,13 +1061,14 @@ fn test_parse_list_jobs_with_pagination() {
 #[test]
 fn test_parse_list_failed_jobs() {
     let route = parse(&Method::GET, &"/_ext/_jobs/failed".parse().unwrap());
-    assert!(matches!(
-        route,
-        Some(Action::ListFailedJobs {
-            n: None,
-            after: None
-        })
-    ));
+    match route {
+        Some(Action::ListFailedJobs { queue, n, after }) => {
+            assert_eq!(queue, "cache");
+            assert_eq!(n, None);
+            assert_eq!(after, None);
+        }
+        other => panic!("expected ListFailedJobs, got {other:?}"),
+    }
 }
 
 #[test]
@@ -1075,7 +1078,8 @@ fn test_parse_retry_job() {
         &"/_ext/_jobs/failed/0000018b-abc/retry".parse().unwrap(),
     );
     match route {
-        Some(Action::RetryJob { storage_key }) => {
+        Some(Action::RetryJob { queue, storage_key }) => {
+            assert_eq!(queue, "cache");
             assert_eq!(storage_key, "0000018b-abc");
         }
         other => panic!("expected RetryJob, got {other:?}"),
@@ -1089,7 +1093,12 @@ fn test_parse_delete_failed_job() {
         &"/_ext/_jobs/failed/0000018b-abc".parse().unwrap(),
     );
     match route {
-        Some(Action::DeleteJob { state, storage_key }) => {
+        Some(Action::DeleteJob {
+            queue,
+            state,
+            storage_key,
+        }) => {
+            assert_eq!(queue, "cache");
             assert_eq!(state, JobState::Failed);
             assert_eq!(storage_key, "0000018b-abc");
         }
@@ -1104,7 +1113,12 @@ fn test_parse_delete_pending_job() {
         &"/_ext/_jobs/pending/0000018b-abc".parse().unwrap(),
     );
     match route {
-        Some(Action::DeleteJob { state, storage_key }) => {
+        Some(Action::DeleteJob {
+            queue,
+            state,
+            storage_key,
+        }) => {
+            assert_eq!(queue, "cache");
             assert_eq!(state, JobState::Pending);
             assert_eq!(storage_key, "0000018b-abc");
         }
@@ -1132,4 +1146,49 @@ fn test_parse_retry_requires_retry_suffix() {
         &"/_ext/_jobs/failed/0000018b-abc".parse().unwrap(),
     );
     assert!(route.is_none());
+}
+
+#[test]
+fn test_parse_list_jobs_selects_replication_queue() {
+    let route = parse(
+        &Method::GET,
+        &"/_ext/_jobs?queue=replication".parse().unwrap(),
+    );
+    match route {
+        Some(Action::ListJobs { queue, .. }) => assert_eq!(queue, "replication"),
+        other => panic!("expected ListJobs, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_parse_delete_failed_job_selects_replication_queue() {
+    let route = parse(
+        &Method::DELETE,
+        &"/_ext/_jobs/failed/0000018b-abc?queue=replication"
+            .parse()
+            .unwrap(),
+    );
+    match route {
+        Some(Action::DeleteJob { queue, state, .. }) => {
+            assert_eq!(queue, "replication");
+            assert_eq!(state, JobState::Failed);
+        }
+        other => panic!("expected DeleteJob, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_parse_jobs_rejects_unknown_queue() {
+    // An explicit `?queue=` naming no known queue is a 400, not a silent
+    // default to the cache queue.
+    assert!(parse(&Method::GET, &"/_ext/_jobs?queue=bogus".parse().unwrap()).is_none());
+    assert!(
+        parse(
+            &Method::DELETE,
+            &"/_ext/_jobs/failed/0000018b-abc?queue=bogus"
+                .parse()
+                .unwrap(),
+        )
+        .is_none()
+    );
 }

@@ -7,7 +7,8 @@ use uuid::Uuid;
 use crate::{
     identity::Action,
     oci::{Digest, Namespace, Reference},
-    registry::job_store::JobState,
+    registry::{cache_job_handler::CACHE_QUEUE, job_store::JobState},
+    replication::REPLICATION_QUEUE,
 };
 
 fn parse_query<T: DeserializeOwned + Default>(params: &str) -> T {
@@ -104,14 +105,25 @@ fn parse_pagination(params: Option<&str>) -> (Option<u16>, Option<String>) {
 }
 
 #[derive(Deserialize, Default)]
-struct JobsPaginationQuery {
+struct JobsQuery {
     n: Option<u16>,
     after: Option<String>,
+    queue: Option<String>,
 }
 
-fn parse_jobs_pagination(params: Option<&str>) -> (Option<u16>, Option<String>) {
-    let query: JobsPaginationQuery = params.map(parse_query).unwrap_or_default();
-    (query.n, query.after)
+/// Parse the `?n=&after=&queue=` of a `_jobs` admin route. Returns `None` when
+/// `?queue=` names no known queue, so the route is rejected (400) rather than
+/// silently administering the wrong queue; an absent selector defaults to the
+/// cache queue, preserving the single-queue behavior from before the
+/// replication queue existed.
+fn parse_jobs_query(params: Option<&str>) -> Option<(Option<u16>, Option<String>, String)> {
+    let query: JobsQuery = params.map(parse_query).unwrap_or_default();
+    let queue = match query.queue.as_deref() {
+        None | Some(CACHE_QUEUE) => CACHE_QUEUE.to_string(),
+        Some(REPLICATION_QUEUE) => REPLICATION_QUEUE.to_string(),
+        Some(_) => return None,
+    };
+    Some((query.n, query.after, queue))
 }
 
 /// Parse the angos-specific extension API routes. `path` is relative to the
@@ -127,12 +139,12 @@ fn try_parse_extension(method: &Method, path: &str, params: Option<&str>) -> Opt
         Method::GET => match path {
             "_repositories" => Some(Action::ListRepositories),
             "_jobs" => {
-                let (n, after) = parse_jobs_pagination(params);
-                Some(Action::ListJobs { n, after })
+                let (n, after, queue) = parse_jobs_query(params)?;
+                Some(Action::ListJobs { queue, n, after })
             }
             "_jobs/failed" => {
-                let (n, after) = parse_jobs_pagination(params);
-                Some(Action::ListFailedJobs { n, after })
+                let (n, after, queue) = parse_jobs_query(params)?;
+                Some(Action::ListFailedJobs { queue, n, after })
             }
             _ => {
                 if let Some(repository_str) = path.strip_suffix("/_namespaces") {
@@ -150,26 +162,35 @@ fn try_parse_extension(method: &Method, path: &str, params: Option<&str>) -> Opt
                 None
             }
         },
-        Method::POST => path
-            .strip_prefix("_jobs/failed/")
-            .and_then(|rest| rest.strip_suffix("/retry"))
-            .filter(|key| is_job_key(key))
-            .map(|key| Action::RetryJob {
+        Method::POST => {
+            let key = path
+                .strip_prefix("_jobs/failed/")
+                .and_then(|rest| rest.strip_suffix("/retry"))
+                .filter(|key| is_job_key(key))?;
+            let (_, _, queue) = parse_jobs_query(params)?;
+            Some(Action::RetryJob {
+                queue,
                 storage_key: key.to_string(),
-            }),
+            })
+        }
         Method::DELETE => {
             if let Some(key) = path.strip_prefix("_jobs/failed/").filter(|k| is_job_key(k)) {
+                let (_, _, queue) = parse_jobs_query(params)?;
                 return Some(Action::DeleteJob {
+                    queue,
                     state: JobState::Failed,
                     storage_key: key.to_string(),
                 });
             }
-            path.strip_prefix("_jobs/pending/")
-                .filter(|k| is_job_key(k))
-                .map(|key| Action::DeleteJob {
-                    state: JobState::Pending,
-                    storage_key: key.to_string(),
-                })
+            let key = path
+                .strip_prefix("_jobs/pending/")
+                .filter(|k| is_job_key(k))?;
+            let (_, _, queue) = parse_jobs_query(params)?;
+            Some(Action::DeleteJob {
+                queue,
+                state: JobState::Pending,
+                storage_key: key.to_string(),
+            })
         }
         _ => None,
     }

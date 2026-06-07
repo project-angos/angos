@@ -83,6 +83,7 @@ Information about the current request. Fields are present based on the action ty
 | `request.n`             | int?    | Pagination limit                           |
 | `request.last`          | string? | Pagination marker                          |
 | `request.artifact_type` | string? | Referrer artifact type filter              |
+| `request.queue`         | string? | Durable queue for `_jobs` admin actions (`cache` or `replication`) |
 
 Optional `request` fields are **omitted** when unset (only `request.action` is always present), so test their presence with the `has()` macro rather than a null comparison: `has(request.from)` is safe, whereas `request.from != null` raises a "no such key" error (evaluated fail-closed) when the field is absent. Optional `identity` fields, by contrast, are present as `null`, so `identity.username != null` is correct there.
 

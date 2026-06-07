@@ -10,6 +10,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 - Bi-directional replication mirrors manifest pushes and deletes to per-repository downstreams over the durable job queue, with on-demand reconciliation via `scrub --replicate`.
 - Cross-repository blob mount (`POST /v2/{namespace}/blobs/uploads/?mount={digest}[&from={repository}]`) grants an already-present blob to the target namespace with no upload, which replication uses to skip re-uploading blobs a downstream already holds.
+- The `_jobs` admin API accepts `?queue=cache|replication` (default `cache`), so failed replication jobs can be listed, retried, and deleted like cache jobs.
 
 ### Changed
 

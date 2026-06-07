@@ -170,8 +170,11 @@ pub enum Action {
     },
     /// List pending/in-flight durable jobs. Distinct action name so operators
     /// can gate job administration behind higher privilege than registry reads.
+    /// `queue` (the `cache` or `replication` queue) is exposed to CEL so a
+    /// policy can gate replication-queue administration separately.
     #[serde(rename = "list-jobs")]
     ListJobs {
+        queue: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         n: Option<u16>,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -179,20 +182,24 @@ pub enum Action {
     },
     #[serde(rename = "list-failed-jobs")]
     ListFailedJobs {
+        queue: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         n: Option<u16>,
         #[serde(skip_serializing_if = "Option::is_none")]
         after: Option<String>,
     },
-    /// Requeue a dead-letter job. `storage_key` is HTTP routing only — excluded
-    /// from the CEL payload like other addressing fields.
+    /// Requeue a dead-letter job. `queue` is exposed to CEL (as for `list-jobs`);
+    /// `storage_key` is HTTP routing only — excluded from the CEL payload like
+    /// other addressing fields.
     #[serde(rename = "retry-job")]
     RetryJob {
+        queue: String,
         #[serde(skip)]
         storage_key: String,
     },
     #[serde(rename = "delete-job")]
     DeleteJob {
+        queue: String,
         #[serde(skip)]
         state: JobState,
         #[serde(skip)]

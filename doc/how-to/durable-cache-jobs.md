@@ -125,12 +125,15 @@ are emitted via structured logs and keyed on `lock_key`.
 ## Operational notes
 
 **Dead-letter queue:** Jobs that exhaust their retry budget (5 attempts) are
-moved to `_jobs/failed/cache/<storage_key>.json` (FS) or the equivalent S3
-key. The `storage_key` is `<16-hex unix-millis>-<uuid>` — the millis prefix is
-the `not_before` of the last retry, the UUID is the envelope id. Inspect with
-`cat`/`jq` to diagnose persistent failures.
+moved to `_jobs/failed/<queue>/<storage_key>.json` (FS) or the equivalent S3
+key — `_jobs/failed/cache/` for cache-fill jobs, `_jobs/failed/replication/`
+for replication jobs. The `storage_key` is `<16-hex unix-millis>-<uuid>` — the
+millis prefix is the `not_before` of the last retry, the UUID is the envelope
+id. Inspect with `cat`/`jq` to diagnose persistent failures. The `_jobs` admin
+API and UI list, retry, and delete failed jobs per queue, selected with
+`?queue=cache` (the default) or `?queue=replication`.
 
-To requeue manually, move the file back into `_jobs/pending/cache/`. The
+To requeue manually, move the file back into `_jobs/pending/<queue>/`. The
 filename's millis prefix continues to drive scheduling, so to force immediate
 re-execution rename the file with a zero prefix:
 `0000000000000000-<uuid>.json`. A worker will pick it up on the next poll
