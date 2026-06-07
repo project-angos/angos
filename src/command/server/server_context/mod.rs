@@ -74,7 +74,7 @@ impl ServerContext {
         Ok(identity)
     }
 
-    #[instrument(skip(self, request))]
+    #[instrument(skip(self, request, identity))]
     pub async fn authorize_request(
         &self,
         route: &Action,
