@@ -1527,6 +1527,27 @@ fn test_get_tags_list_path() {
     assert_eq!(path, "https://example.com/v2/repo/tags/list");
 }
 
+#[test]
+fn test_get_uploads_start_path_strips_local_prefix() {
+    let config = RegistryClientConfig {
+        url: "https://example.com".to_string(),
+        max_redirect: 5,
+        server_ca_bundle: None,
+        client_certificate: None,
+        client_private_key: None,
+        username: None,
+        password: None,
+    };
+    let cache = cache::Config::Memory.to_backend().unwrap();
+    let client =
+        RegistryClient::from_config(&config, cache, DEFAULT_MAX_MANIFEST_SIZE_BYTES).unwrap();
+
+    // The pull-mirror path strips the local repo-name prefix (unlike the
+    // NO_LOCAL_PREFIX identity path the replication write methods exercise).
+    let path = client.get_uploads_start_path("local", "local/repo");
+    assert_eq!(path, "https://example.com/v2/repo/blobs/uploads/");
+}
+
 #[tokio::test]
 async fn test_list_tags_single_page() {
     let mock_server = MockServer::start().await;
