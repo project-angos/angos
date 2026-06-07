@@ -160,13 +160,12 @@ pub async fn push_manifest(
             ?tag,
             "Downstream already holds this manifest; skipping PUT (converged)"
         );
-        // No referrers fallback on the converged path. The original
-        // (non-converged) push already created the `<alg>-<hash>` fallback tag for
-        // an OCI-1.0 downstream (gated on the PUT's missing `OCI-Subject`), and an
-        // OCI-1.1 downstream auto-indexes the subject and never needs it. Re-running
-        // it on every converged re-run only re-merged a redundant index — and
-        // materialised a stray fallback tag on OCI-1.1 peers that already indexed
-        // the subject.
+        // Skip the referrers fallback on the converged path. The fallback tag an
+        // OCI-1.0 downstream needs (`<alg>-<hash>`, gated on a missing
+        // `OCI-Subject`) is already present from the non-converged push, and an
+        // OCI-1.1 downstream auto-indexes the subject. Running it here only
+        // re-merges a redundant index and materialises a stray fallback tag on an
+        // OCI-1.1 peer that already indexes the subject.
         return Ok(PushOutcome::Pushed);
     }
 

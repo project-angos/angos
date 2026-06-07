@@ -333,7 +333,7 @@ Replication reconcile enqueues emitted by `angos scrub --replicate`, by outcome.
 | Counter | `outcome` |
 
 **Labels:**
-- `outcome`: `enqueued` (a divergence was enqueued for push) or `failed` (the envelope build or enqueue errored)
+- `outcome`: `enqueued` (a divergence was enqueued — a push, or a prune delete for a `prune = true` downstream) or `failed` (the envelope build or enqueue errored)
 
 **Example:**
 ```promql
