@@ -103,7 +103,11 @@ pub async fn push_manifest(
     // 1. Recurse into child manifests FIRST (image index / manifest list). The
     //    parent index must not land on the downstream before its children.
     for child in &parsed.manifests {
-        let child_body = read_local_manifest(blob_store, child).await?;
+        let child_body = blob_store.read(child).await.map_err(|e| {
+            Error::Registry(RegistryError::Internal(format!(
+                "failed to read local manifest blob '{child}': {e}"
+            )))
+        })?;
         Box::pin(push_manifest(
             downstream,
             blob_store,
@@ -199,20 +203,6 @@ pub async fn push_manifest(
     }
 
     Ok(PushOutcome::Pushed)
-}
-
-/// Reads a local manifest body (stored as a blob). The body carries the
-/// manifest's own `mediaType`, which `push_manifest` derives from its single
-/// parse, so this returns just the bytes.
-async fn read_local_manifest(
-    blob_store: &Arc<BlobStore>,
-    digest: &Digest,
-) -> Result<Vec<u8>, Error> {
-    blob_store.read(digest).await.map_err(|e| {
-        Error::Registry(RegistryError::Internal(format!(
-            "failed to read local manifest blob '{digest}': {e}"
-        )))
-    })
 }
 
 /// HEAD-before-PUT every referenced blob; transfer only the absent ones.
