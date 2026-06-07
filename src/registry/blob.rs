@@ -1418,6 +1418,7 @@ mod dispatch_replication_tests {
             Registry, RegistryConfig, Repository,
             blob_store::BlobStore,
             job_store::JobStore,
+            manifest::DEFAULT_MAX_MANIFEST_SIZE_BYTES,
             metadata_store::MetadataStore,
             repository_resolver::RepositoryResolver,
             test_utils::{build_store, build_test_fs_executor},
@@ -1442,7 +1443,7 @@ mod dispatch_replication_tests {
                 .url("https://unused.test".to_string())
                 .client(reqwest::Client::new())
                 .cache(backend)
-                .max_manifest_size_bytes(crate::registry::manifest::DEFAULT_MAX_MANIFEST_SIZE_BYTES)
+                .max_manifest_size_bytes(DEFAULT_MAX_MANIFEST_SIZE_BYTES)
                 .build()
                 .unwrap(),
         )

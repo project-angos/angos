@@ -366,13 +366,17 @@ mod in_process_replication_tests {
         registry::{
             DOCKER_CONTENT_DIGEST, Registry, RegistryConfig, Repository,
             blob_store::BlobStore,
+            job_store::JobStore,
             manifest::DEFAULT_MAX_MANIFEST_SIZE_BYTES,
             metadata_store::{LinkOperation, MetadataStore, link_kind::LinkKind},
             repository_resolver::RepositoryResolver,
             test_utils::{build_store, build_test_fs_executor, put_blob_direct},
         },
         registry_client::RegistryClient,
-        replication::{REPLICATION_PUSH_MANIFEST_KIND, ReplicationDownstream, ReplicationMode},
+        replication::{
+            REPLICATION_PUSH_MANIFEST_KIND, REPLICATION_QUEUE, ReplicationDownstream,
+            ReplicationMode,
+        },
     };
 
     const NAMESPACE: &str = "nginx";
@@ -590,8 +594,7 @@ mod in_process_replication_tests {
         .await
         .unwrap_or(false);
 
-        let inspector =
-            crate::registry::job_store::JobStore::new(Arc::clone(&blob_store.store), "inspector");
+        let inspector = JobStore::new(Arc::clone(&blob_store.store), "inspector");
 
         if !saw_put {
             let received = mock_server.received_requests().await.unwrap_or_default();
@@ -600,11 +603,11 @@ mod in_process_replication_tests {
                 .map(|r| format!("{} {}", r.method.as_str(), r.url.path()))
                 .collect();
             let pending = inspector
-                .count_pending(crate::replication::REPLICATION_QUEUE, 0)
+                .count_pending(REPLICATION_QUEUE, 0)
                 .await
                 .unwrap_or(u64::MAX);
             let failed = inspector
-                .list_failed_page(crate::replication::REPLICATION_QUEUE, 16, None)
+                .list_failed_page(REPLICATION_QUEUE, 16, None)
                 .await
                 .map_or(usize::MAX, |(keys, _)| keys.len());
             panic!(
@@ -619,7 +622,7 @@ mod in_process_replication_tests {
         let drained = timeout(Duration::from_secs(10), async {
             loop {
                 let pending = inspector
-                    .count_pending(crate::replication::REPLICATION_QUEUE, 0)
+                    .count_pending(REPLICATION_QUEUE, 0)
                     .await
                     .unwrap_or(u64::MAX);
                 if pending == 0 {
@@ -632,7 +635,7 @@ mod in_process_replication_tests {
         .unwrap_or(false);
 
         let failed = inspector
-            .list_failed_page(crate::replication::REPLICATION_QUEUE, 16, None)
+            .list_failed_page(REPLICATION_QUEUE, 16, None)
             .await
             .map_or(usize::MAX, |(keys, _)| keys.len());
         assert!(
