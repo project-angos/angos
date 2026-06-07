@@ -501,25 +501,31 @@ impl ObjectStore for Backend {
         ensure_parent(&dst).await?;
         let parent = dst.parent().unwrap_or_else(|| Path::new(".")).to_owned();
         let sync = self.sync_to_disk;
-        let label = dst.clone();
         // Stream src -> temp -> atomic rename. `std::io::copy` uses a small
         // internal buffer, so the object body is never held in memory in full
-        // (a multi-GB blob would otherwise spike RSS by its whole size).
-        match spawn_blocking(move || -> io::Result<()> {
-            let mut reader = File::open(&src)?;
+        // (a multi-GB blob would otherwise spike RSS by its whole size). Each
+        // step labels its error with the path it actually touched: a read
+        // failure names `src`, a write/persist failure names `dst`.
+        match spawn_blocking(move || -> Result<(), Error> {
+            let mut reader = File::open(&src).map_err(|e| backend_error("copy from", &src, &e))?;
             let mut temp = TempFileBuilder::new()
                 .prefix(ATOMIC_WRITE_TMP_PREFIX)
-                .tempfile_in(&parent)?;
-            io::copy(&mut reader, temp.as_file_mut())?;
+                .tempfile_in(&parent)
+                .map_err(|e| backend_error("copy to", &dst, &e))?;
+            io::copy(&mut reader, temp.as_file_mut())
+                .map_err(|e| backend_error("copy to", &dst, &e))?;
             if sync {
-                temp.as_file().sync_all()?;
+                temp.as_file()
+                    .sync_all()
+                    .map_err(|e| backend_error("copy to", &dst, &e))?;
             }
-            temp.persist(&dst).map_err(|e| e.error)?;
+            temp.persist(&dst)
+                .map_err(|e| backend_error("copy to", &dst, &e.error))?;
             Ok(())
         })
         .await
         {
-            Ok(result) => result.map_err(|e| backend_error("copy", &label, &e)),
+            Ok(result) => result,
             Err(e) => Err(Error::Backend(format!("copy task panicked: {e}"))),
         }
     }
