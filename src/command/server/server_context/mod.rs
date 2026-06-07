@@ -86,9 +86,11 @@ impl ServerContext {
             .await
     }
 
-    /// Whether `identity` may read the blob a cross-repo mount would copy, i.e.
-    /// the mount would not hand over bytes the caller could not otherwise read.
-    /// `false` means the caller must fall back to an ordinary upload session.
+    /// Resolves the source namespace `identity` is authorized to read a
+    /// cross-repo mount's blob from, i.e. a source whose bytes the caller could
+    /// already read. Returns `Some(namespace)` (the authorized source) when the
+    /// mount may proceed, or `None` when the caller must fall back to an ordinary
+    /// upload session.
     pub async fn authorize_mount_source(
         &self,
         mount: &BlobMount,
