@@ -447,7 +447,11 @@ impl Registry {
                 .await?;
         }
 
-        let repository = self.repository_name_for(namespace);
+        // Reuse the already-resolved repository instead of re-resolving via
+        // `repository_name_for`; `resolved_repository` is `Copy` and still in scope.
+        let repository = resolved_repository
+            .map(|r| r.name.clone())
+            .unwrap_or_default();
         let digest_str = match reference {
             Reference::Digest(d) => Some(d.to_string()),
             Reference::Tag(_) => None,
@@ -759,7 +763,11 @@ impl Registry {
             )
             .await?;
 
-        let repository = self.repository_name_for(namespace);
+        // Reuse the already-resolved repository instead of re-resolving via
+        // `repository_name_for`; `resolved_repository` is `Copy` and still in scope.
+        let repository = resolved_repository
+            .map(|r| r.name.clone())
+            .unwrap_or_default();
         let digest_str = response.headers.get(DOCKER_CONTENT_DIGEST).cloned();
 
         response.events.push(manifest_event(
