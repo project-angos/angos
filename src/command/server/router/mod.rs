@@ -14,6 +14,15 @@ fn parse_query<T: DeserializeOwned + Default>(params: &str) -> T {
     serde_urlencoded::from_str(params).unwrap_or_default()
 }
 
+/// Like [`parse_query`] but returns `None` when a value fails to deserialize
+/// (e.g. a malformed `?digest=`), so the caller can reject the route — the
+/// non-GET/HEAD 400 path in `handle_unknown_route` — instead of silently
+/// dropping the value. Other routes keep the lenient [`parse_query`] (e.g. a
+/// bad `?n=` is ignored).
+fn parse_query_strict<T: DeserializeOwned>(params: &str) -> Option<T> {
+    serde_urlencoded::from_str(params).ok()
+}
+
 /// Parses the HTTP method and URI into a registry `Action`.
 ///
 /// Returns `None` for paths that do not match any known route. Callers should
@@ -61,26 +70,20 @@ pub fn parse(method: &Method, uri: &Uri) -> Option<Action> {
 
 #[derive(Deserialize, Default)]
 struct DigestQuery {
-    digest: Option<String>,
-}
-
-impl DigestQuery {
-    fn to_digest(&self) -> Option<Digest> {
-        self.digest.as_ref().and_then(|d| d.parse().ok())
-    }
+    digest: Option<Digest>,
 }
 
 fn digest_from_params(params: Option<&str>) -> Option<Digest> {
     params
         .map(parse_query::<DigestQuery>)
-        .and_then(|r| r.to_digest())
+        .and_then(|q| q.digest)
 }
 
 #[derive(Deserialize, Default)]
 struct MountQuery {
     mount: Option<String>,
     from: Option<String>,
-    digest: Option<String>,
+    digest: Option<Digest>,
 }
 
 #[derive(Deserialize, Debug, Default)]
@@ -187,7 +190,14 @@ fn try_parse_upload(method: &Method, path: &str, params: Option<&str>) -> Option
         if *method != Method::POST {
             return None;
         }
-        let query: MountQuery = params.map(parse_query).unwrap_or_default();
+        // A present query is parsed strictly: a malformed `?digest=` fails
+        // deserialization -> `None` -> the POST becomes a 400 via
+        // `handle_unknown_route`, rather than silently starting a 202 session.
+        // A missing query is a plain upload-start session.
+        let query: MountQuery = match params {
+            Some(p) => parse_query_strict(p)?,
+            None => MountQuery::default(),
+        };
 
         // A valid `?mount=<digest>` requests a cross-repo mount; anything else
         // (including a malformed mount) is an ordinary upload start.
@@ -209,10 +219,7 @@ fn try_parse_upload(method: &Method, path: &str, params: Option<&str>) -> Option
         }
 
         // Ordinary upload start, optionally monolithic via `?digest=`.
-        let digest = match &query.digest {
-            Some(value) => value.parse::<Digest>().ok(),
-            None => None,
-        };
+        let digest = query.digest;
         return Some(Action::StartUpload { namespace, digest });
     }
 

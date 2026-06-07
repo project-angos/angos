@@ -169,6 +169,92 @@ fn test_parse_mount_blob_with_malformed_from_is_rejected() {
 }
 
 #[test]
+fn test_parse_start_upload_with_malformed_digest_is_rejected() {
+    // THE FIX: a present-but-malformed `?digest=` fails strict query parsing, so
+    // the route does not match and `handle_unknown_route` turns the POST into a
+    // 400 — rather than silently starting a 202 session that drops the digest.
+    let uri: Uri = "/v2/myrepo/app/blobs/uploads?digest=not-a-digest"
+        .parse()
+        .unwrap();
+    let route = parse(&Method::POST, &uri);
+    assert!(
+        route.is_none(),
+        "a malformed ?digest= must not start a session (POST -> 400), got: {route:?}"
+    );
+
+    // Same, with a trailing slash on the uploads path.
+    let uri: Uri = "/v2/myrepo/app/blobs/uploads/?digest=garbage"
+        .parse()
+        .unwrap();
+    let route = parse(&Method::POST, &uri);
+    assert!(
+        route.is_none(),
+        "a malformed ?digest= must not start a session (POST -> 400), got: {route:?}"
+    );
+}
+
+#[test]
+fn test_parse_start_upload_no_digest_is_session() {
+    // A missing query is a plain upload-start session (the absent-query branch
+    // alongside the malformed case above).
+    let uri: Uri = "/v2/myrepo/app/blobs/uploads".parse().unwrap();
+    let route = parse(&Method::POST, &uri);
+    if let Some(Action::StartUpload {
+        namespace, digest, ..
+    }) = route
+    {
+        assert_eq!(namespace, "myrepo/app");
+        assert!(digest.is_none());
+    } else {
+        panic!("Expected StartUpload route, got: {route:?}");
+    }
+}
+
+#[test]
+fn test_parse_mount_with_malformed_digest_is_rejected() {
+    // Edge case (accepted by design): combining a valid `?mount=` with a
+    // malformed `?digest=` fails strict parsing of the WHOLE MountQuery before
+    // the mount branch is reached, so the route does not match (POST -> 400).
+    // Unreachable by real clients — they never combine `?mount=` (cross-repo
+    // mount) with a monolithic `?digest=`.
+    let mount_digest = "sha256:1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef";
+    let uri: Uri = format!("/v2/myrepo/target/blobs/uploads/?mount={mount_digest}&digest=garbage")
+        .parse()
+        .unwrap();
+    let route = parse(&Method::POST, &uri);
+    assert!(
+        route.is_none(),
+        "a malformed ?digest= must poison the mount path too (POST -> 400), got: {route:?}"
+    );
+}
+
+#[test]
+fn test_parse_query_strict() {
+    // A malformed `?digest=` fails strict parsing -> None.
+    assert!(parse_query_strict::<MountQuery>("digest=not-a-digest").is_none());
+
+    // A valid `?digest=` parses into Some with the digest set.
+    let valid = "digest=sha256:1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef";
+    let query: MountQuery = parse_query_strict(valid).expect("a valid digest must parse strictly");
+    assert!(query.digest.is_some());
+    assert!(query.mount.is_none());
+    assert!(query.from.is_none());
+
+    // An empty query is Some(default) — all fields None.
+    let query: MountQuery = parse_query_strict("").expect("an empty query must parse strictly");
+    assert!(query.digest.is_none());
+    assert!(query.mount.is_none());
+    assert!(query.from.is_none());
+
+    // An unknown field is ignored by serde_urlencoded, so only the typed Digest
+    // can fail strict parsing: a bare `?n=` still yields Some.
+    let query: MountQuery = parse_query_strict("n=5").expect("an unknown field must be ignored");
+    assert!(query.digest.is_none());
+    assert!(query.mount.is_none());
+    assert!(query.from.is_none());
+}
+
+#[test]
 fn test_parse_get_upload() {
     let method = Method::GET;
     let uuid = Uuid::new_v4();
@@ -521,12 +607,13 @@ fn test_parse_invalid_uuid_in_upload_path() {
 }
 
 #[test]
-fn test_digest_query_from_params() {
-    let params = "digest=sha256:1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef";
-    let query: DigestQuery = parse_query(params);
-    assert!(query.digest.is_some());
+fn digest_from_params_parses_valid() {
+    let digest = digest_from_params(Some(
+        "digest=sha256:1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
+    ));
+    assert!(digest.is_some());
     assert_eq!(
-        query.digest.unwrap(),
+        digest.unwrap().to_string(),
         "sha256:1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef"
     );
 }
@@ -539,27 +626,10 @@ fn test_digest_query_from_empty_params() {
 }
 
 #[test]
-fn test_digest_query_to_digest_valid() {
-    let query = DigestQuery {
-        digest: Some(
-            "sha256:1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef".to_string(),
-        ),
-    };
-    let digest = query.to_digest();
-    assert!(digest.is_some());
-    assert_eq!(
-        digest.unwrap().to_string(),
-        "sha256:1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef"
-    );
-}
-
-#[test]
-fn test_digest_query_to_digest_invalid() {
-    let query = DigestQuery {
-        digest: Some("invalid-digest".to_string()),
-    };
-    let digest = query.to_digest();
-    assert!(digest.is_none());
+fn digest_from_params_drops_invalid() {
+    // A malformed `?digest=` is a Digest deserialize error; serde_urlencoded
+    // then collapses the whole DigestQuery to its default, so digest is None.
+    assert!(digest_from_params(Some("digest=invalid-digest")).is_none());
 }
 
 #[test]
