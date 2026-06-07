@@ -114,8 +114,7 @@ struct JobsQuery {
 /// Parse the `?n=&after=&queue=` of a `_jobs` admin route. Returns `None` when
 /// `?queue=` names no known queue, so the route is rejected (400) rather than
 /// silently administering the wrong queue; an absent selector defaults to the
-/// cache queue, preserving the single-queue behavior from before the
-/// replication queue existed.
+/// `cache` queue.
 fn parse_jobs_query(params: Option<&str>) -> Option<(Option<u16>, Option<String>, String)> {
     let query: JobsQuery = params.map(parse_query).unwrap_or_default();
     let queue = match query.queue.as_deref() {
