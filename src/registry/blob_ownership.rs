@@ -78,4 +78,29 @@ impl<'a> BlobOwnership<'a> {
         }
         Ok(namespaces)
     }
+
+    /// The lexicographically-smallest namespace that references `digest`,
+    /// excluding `exclude` — the cross-repo mount source the replication pipeline
+    /// offers. Takes the minimum by a streaming scan of the blob-index keys, so
+    /// the full referencing-namespace set is never materialised (unlike
+    /// [`Self::referencing_namespaces`]). Returns `None` when no other namespace
+    /// references the blob.
+    pub async fn smallest_referencing_namespace(
+        &self,
+        digest: &Digest,
+        exclude: &str,
+    ) -> Result<Option<Namespace>, Error> {
+        let index = match self.metadata_store.read_blob_index(digest).await {
+            Ok(index) => index,
+            Err(MetadataError::ReferenceNotFound) => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+
+        Ok(index
+            .namespace
+            .into_keys()
+            .filter(|key| key != exclude)
+            .filter_map(|key| Namespace::new(&key).ok())
+            .min())
+    }
 }

@@ -264,14 +264,11 @@ async fn mount_candidate(
     namespace: &str,
     digest: &Digest,
 ) -> Option<String> {
-    let candidates = BlobOwnership::new(metadata_store)
-        .referencing_namespaces(digest)
+    BlobOwnership::new(metadata_store)
+        .smallest_referencing_namespace(digest, namespace)
         .await
-        .ok()?;
-    candidates
-        .into_iter()
-        .filter(|ns| ns.as_ref() != namespace)
-        .min()
+        .ok()
+        .flatten()
         .map(|ns| ns.to_string())
 }
 
