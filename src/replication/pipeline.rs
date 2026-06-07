@@ -28,7 +28,6 @@ use crate::{
     },
     registry_client::{DeleteManifestOutcome, NO_LOCAL_PREFIX, RegistryClient},
     replication::Error,
-    util::sha256,
 };
 
 /// Outcome of a successful replication push or delete.
@@ -395,14 +394,15 @@ async fn push_referrers_fallback(
     // descriptors are preserved so this push only adds.
     let mut manifests = fetch_fallback_manifests(downstream, &location).await?;
 
-    // Descriptor for the referrer manifest just pushed.
-    let referrer_digest = Digest::Sha256(sha256::hex(body).into());
-    let descriptor = referrer_descriptor(&referrer_digest, body);
+    // Descriptor for the referrer manifest just pushed. `body`'s digest is the
+    // `digest` already resolved on the push path (the blob store is
+    // content-addressed), so reuse it rather than re-hashing the body.
+    let descriptor = referrer_descriptor(digest, body);
 
     // Dedup-merge by digest so a re-run is idempotent.
     let already_present = manifests
         .iter()
-        .any(|m| m.get("digest").and_then(Value::as_str) == Some(&referrer_digest.to_string()));
+        .any(|m| m.get("digest").and_then(Value::as_str) == Some(&digest.to_string()));
     if !already_present {
         manifests.push(descriptor);
     }
