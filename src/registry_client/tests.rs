@@ -1477,7 +1477,7 @@ async fn test_delete_manifest_surfaces_error_status() {
 
     Mock::given(method("DELETE"))
         .and(path("/v2/test/manifests/latest"))
-        .respond_with(ResponseTemplate::new(404))
+        .respond_with(ResponseTemplate::new(500))
         .mount(&mock_server)
         .await;
 
@@ -1486,6 +1486,26 @@ async fn test_delete_manifest_surfaces_error_status() {
 
     let result = client.delete_manifest(&location, None).await;
     assert!(matches!(result, Err(Error::Internal(_))));
+}
+
+#[tokio::test]
+async fn test_delete_manifest_absent_404_is_deleted() {
+    // An already-absent target (404) is convergence, not failure: a retried or
+    // already-converged replication delete must map to Deleted, never dead-letter.
+    let mock_server = MockServer::start().await;
+
+    Mock::given(method("DELETE"))
+        .and(path("/v2/test/manifests/gone"))
+        .respond_with(ResponseTemplate::new(404))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let client = client_for(&mock_server);
+    let location = client.get_manifest_path("", "test", &Reference::Tag("gone".to_string()));
+
+    let outcome = client.delete_manifest(&location, None).await.unwrap();
+    assert_eq!(outcome, DeleteManifestOutcome::Deleted);
 }
 
 #[test]

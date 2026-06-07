@@ -464,16 +464,21 @@ impl RegistryClient {
     /// `source_ts` stamps the `X-Angos-Source-Timestamp` header when set (a
     /// replication delete); it is `None` for an ordinary delete.
     ///
+    /// A `404` (the target is already absent) returns
+    /// [`DeleteManifestOutcome::Deleted`]: the delete is idempotent, so an
+    /// already-converged or retried delete is convergence, not failure.
+    ///
     /// 409 disambiguation: a `409` whose OCI error `code` is
     /// [`REPLICATION_SUPERSEDED_CODE`] returns
     /// [`DeleteManifestOutcome::Superseded`] (a last-writer-wins loss —
-    /// convergence). Any *other* 409 and every other non-2xx is returned as
-    /// [`Error`].
+    /// convergence). Any *other* 409 and every other non-2xx (except the `404`
+    /// above) is returned as [`Error`].
     ///
     /// # Errors
     ///
     /// Returns an error when the request fails, the server rejects access, or
-    /// the response is a non-2xx status other than an LWW-superseded 409.
+    /// the response is a non-2xx status other than a `404` or an LWW-superseded
+    /// 409.
     #[instrument(skip(self))]
     pub async fn delete_manifest(
         &self,
@@ -487,6 +492,13 @@ impl RegistryClient {
         if response.status() == StatusCode::CONFLICT {
             Self::classify_conflict(response, "delete_manifest").await?;
             return Ok(DeleteManifestOutcome::Superseded);
+        }
+
+        // An already-absent target is convergence, not failure: the delete is
+        // idempotent, so a retried, coalesced, or bounce-back delete whose target
+        // a prior attempt already removed must not error and dead-letter.
+        if response.status() == StatusCode::NOT_FOUND {
+            return Ok(DeleteManifestOutcome::Deleted);
         }
 
         if !response.status().is_success() {
