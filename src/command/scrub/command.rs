@@ -202,7 +202,7 @@ impl Command {
 
     async fn migrate_storage_layout(&mut self) -> Result<(), Error> {
         if let Err(e) = self.layout_checker.check_all(self.sink.as_mut()).await {
-            tracing::warn!("Storage layout migration checker failed: {e}");
+            warn!("Storage layout migration checker failed: {e}");
         }
         Ok(())
     }
@@ -216,7 +216,7 @@ impl Command {
                     .check(&namespace, self.sink.as_mut())
                     .await
                 {
-                    tracing::warn!("Scrub checker failed for namespace '{namespace}': {e}");
+                    warn!("Scrub checker failed for namespace '{namespace}': {e}");
                 }
             }
         }
@@ -227,7 +227,7 @@ impl Command {
         if let Some(checker) = &self.blob_checker
             && let Err(e) = checker.check_all(self.sink.as_mut()).await
         {
-            tracing::warn!("Blob scrub checker failed: {e}");
+            warn!("Blob scrub checker failed: {e}");
         }
         Ok(())
     }
@@ -236,7 +236,7 @@ impl Command {
         if let Some(checker) = &self.multipart_checker
             && let Err(e) = checker.check_all(self.sink.as_mut()).await
         {
-            tracing::warn!("Multipart scrub checker failed: {e}");
+            warn!("Multipart scrub checker failed: {e}");
         }
         Ok(())
     }
