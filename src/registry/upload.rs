@@ -13,13 +13,17 @@ use crate::{
     util::sha256::finalize_digest,
 };
 
-/// Maximum number of candidate namespaces checked during a from-less mount
-/// authorization. Referrers of a popular blob could number in the thousands;
-/// without a cap, a single public mount request triggers one CEL evaluation
-/// per candidate — an attacker-influenceable fan-out. The cap is fail-safe:
-/// if the caller holds access only to a namespace beyond this limit the mount
-/// is simply not granted and the client falls back to a normal upload session
-/// (202), which re-authorizes independently. No access is over-granted.
+/// Maximum number of candidate namespaces CEL-evaluated during a from-less
+/// mount authorization. Referrers of a popular blob could number in the
+/// thousands; without a cap, a single public mount request would trigger one
+/// CEL evaluation per candidate — an attacker-influenceable fan-out. This cap
+/// bounds only that per-candidate authorization loop. The full referrer set is
+/// still read from the blob index and materialized into a Vec first; the cap is
+/// a `truncate` applied afterwards, so it does not bound that read or
+/// allocation. The cap is fail-safe: if the caller holds access only to a
+/// namespace beyond this limit the mount is simply not granted and the client
+/// falls back to a normal upload session (202), which re-authorizes
+/// independently. No access is over-granted.
 const MAX_FROM_LESS_MOUNT_CANDIDATES: usize = 32;
 
 pub enum StartUploadResponse {
