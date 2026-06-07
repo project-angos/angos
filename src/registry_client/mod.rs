@@ -154,8 +154,8 @@ impl RegistryClient {
 
     /// Builds a registry client from a parsed [`RegistryClientConfig`]: resolves
     /// the HTTP client (TLS, redirects, timeout) and basic-auth credentials, then
-    /// runs the builder. The single construction path for upstreams, replication
-    /// downstreams, and tests.
+    /// runs the builder. The single production construction path for upstreams and
+    /// replication downstreams.
     ///
     /// # Errors
     ///
