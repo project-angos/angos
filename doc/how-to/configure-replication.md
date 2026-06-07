@@ -133,7 +133,7 @@ When the event path misses a change (an instance was down, or two instances drif
 # Preview the pushes that would be enqueued -- enqueues nothing
 angos -c config.toml scrub --replicate --dry-run
 
-# Enqueue (and, for an in-process queue, drain) the diverging tags
+# Enqueue the diverging tags (a standalone scrub drains them end-of-run)
 angos -c config.toml scrub --replicate
 ```
 
