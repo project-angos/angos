@@ -238,6 +238,8 @@ async fn push_blobs(
         .map(|blob| async move {
             push_one_blob(downstream, blob_store, metadata_store, namespace, &blob).await
         })
+        // 0 is impossible from config (rejected at parse); the `.max(1)` floor
+        // guards against a direct builder misuse so `buffer_unordered` is never 0.
         .buffer_unordered(max_concurrent_pushes.max(1))
         .try_collect::<Vec<()>>()
         .await?;

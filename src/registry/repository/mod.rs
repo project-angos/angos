@@ -1,4 +1,4 @@
-use std::{collections::HashSet, sync::Arc};
+use std::{collections::HashSet, num::NonZeroUsize, sync::Arc};
 
 use serde::Deserialize;
 use tokio::task;
@@ -154,7 +154,7 @@ impl Repository {
                             .max_concurrent_pushes(
                                 config
                                     .max_concurrent_pushes
-                                    .unwrap_or(DEFAULT_MAX_CONCURRENT_PUSHES),
+                                    .map_or(DEFAULT_MAX_CONCURRENT_PUSHES, NonZeroUsize::get),
                             )
                             .prune(config.prune)
                             .build()

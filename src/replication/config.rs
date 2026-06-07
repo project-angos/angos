@@ -1,3 +1,5 @@
+use std::num::NonZeroUsize;
+
 use serde::Deserialize;
 
 use crate::{
@@ -32,7 +34,7 @@ pub struct ReplicationDownstreamConfig {
     /// [`crate::replication::ReplicationDownstream`] is built.
     #[serde(default)]
     pub namespace_filter: Vec<RegexPattern>,
-    pub max_concurrent_pushes: Option<usize>,
+    pub max_concurrent_pushes: Option<NonZeroUsize>,
     /// When `true`, scrub reconciliation also deletes tags present on this
     /// downstream but absent locally (treats local as authoritative). Only safe
     /// for a one-way mirror that nothing else writes to; leave `false` for an
@@ -44,6 +46,8 @@ pub struct ReplicationDownstreamConfig {
 
 #[cfg(test)]
 mod tests {
+    use std::num::NonZeroUsize;
+
     use crate::replication::{ReplicationDownstreamConfig, ReplicationMode};
 
     #[test]
@@ -84,7 +88,7 @@ mod tests {
         assert_eq!(config.mode, ReplicationMode::EventOnly);
         assert_eq!(config.namespace_filter.len(), 1);
         assert_eq!(config.namespace_filter[0].as_source(), "^nginx/.*");
-        assert_eq!(config.max_concurrent_pushes, Some(8));
+        assert_eq!(config.max_concurrent_pushes, NonZeroUsize::new(8));
         assert_eq!(config.client.username.as_deref(), Some("replicator"));
         assert_eq!(config.client.password.as_ref().unwrap().expose(), "s3cret");
         assert!(config.prune);
@@ -100,5 +104,20 @@ mod tests {
             "#,
         );
         assert!(result.is_err(), "partial mTLS pairing must be rejected");
+    }
+
+    #[test]
+    fn downstream_config_rejects_zero_max_concurrent_pushes() {
+        let result: Result<ReplicationDownstreamConfig, _> = toml::from_str(
+            r#"
+            name = "eu-region"
+            url = "https://angos-eu.example.com"
+            max_concurrent_pushes = 0
+            "#,
+        );
+        assert!(
+            result.is_err(),
+            "max_concurrent_pushes = 0 must be rejected at parse time"
+        );
     }
 }

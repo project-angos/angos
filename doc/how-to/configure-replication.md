@@ -27,7 +27,7 @@ username = "replicator"
 password = "..."
 mode = "event+reconcile"              # "event+reconcile" | "event-only" | "reconcile-only"
 namespace_filter = ["^nginx/.*"]      # optional regex list; empty matches all namespaces
-max_concurrent_pushes = 4             # optional; per-manifest blob fan-out (default 4)
+max_concurrent_pushes = 4             # optional; per-manifest blob fan-out (positive integer, default 4)
 ```
 
 ### Downstream Options
@@ -38,7 +38,7 @@ max_concurrent_pushes = 4             # optional; per-manifest blob fan-out (def
 | `url` | string | required | Downstream registry base URL |
 | `mode` | string | `"event+reconcile"` | `"event+reconcile"`, `"event-only"`, or `"reconcile-only"` |
 | `namespace_filter` | [string] | `[]` (all) | Regex patterns; a namespace replicates to this downstream only if it matches one |
-| `max_concurrent_pushes` | usize | `4` | Concurrent blob pushes per manifest for this downstream |
+| `max_concurrent_pushes` | usize | `4` | Concurrent blob pushes per manifest for this downstream (positive integer, >= 1) |
 | `prune` | bool | `false` | When `true`, reconciliation also **deletes** tags present on this downstream but absent locally (authoritative one-way mirror). **Leave `false` for active-active peers** — see [Reconcile on Demand](#reconcile-on-demand). |
 | `username` / `password` | string | - | Basic auth for the downstream |
 | `max_redirect` | u8 | `5` | Maximum redirects to follow |

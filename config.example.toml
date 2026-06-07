@@ -162,7 +162,7 @@ default = "allow"
 #password = "..."
 #mode = "event+reconcile"              # "event+reconcile" | "event-only" | "reconcile-only"
 #namespace_filter = ["^nginx/.*"]      # optional list of regex patterns; empty = match all
-#max_concurrent_pushes = 4             # optional; per-manifest blob fan-out for this downstream (default 4)
+#max_concurrent_pushes = 4             # optional; per-manifest blob fan-out for this downstream (positive integer, default 4)
 #prune = false                         # if true, scrub --replicate DELETES downstream tags absent locally
                                        # (authoritative one-way mirror only; leave false for active-active peers)
 # Optional mTLS to the downstream (both required together):
