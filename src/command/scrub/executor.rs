@@ -73,25 +73,24 @@ impl Executor {
     /// the `replication_reconcile_total` outcome (`enqueued` / `failed`).
     async fn enqueue_replication(&self, payload: ReplicationPushPayload) -> Result<(), Error> {
         let envelope = build_envelope(&payload).map_err(|e| {
-            metrics_provider()
-                .replication_reconcile_total
-                .with_label_values(&["failed"])
-                .inc();
+            record_reconcile_outcome("failed");
             Error::Replication(format!("failed to build replication envelope: {e}"))
         })?;
         self.job_store.enqueue(envelope).await.map_err(|e| {
-            metrics_provider()
-                .replication_reconcile_total
-                .with_label_values(&["failed"])
-                .inc();
+            record_reconcile_outcome("failed");
             Error::Replication(format!("failed to enqueue replication job: {e}"))
         })?;
-        metrics_provider()
-            .replication_reconcile_total
-            .with_label_values(&["enqueued"])
-            .inc();
+        record_reconcile_outcome("enqueued");
         Ok(())
     }
+}
+
+/// Records a `replication_reconcile_total` outcome (`enqueued` / `failed`).
+fn record_reconcile_outcome(outcome: &str) {
+    metrics_provider()
+        .replication_reconcile_total
+        .with_label_values(&[outcome])
+        .inc();
 }
 
 /// Builder for [`Executor`] taking individual resolved fields.
