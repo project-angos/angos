@@ -411,10 +411,12 @@ async fn push_referrers_fallback(
         parsed.artifact_type.as_deref(),
     );
 
-    // Dedup-merge by digest so a re-run is idempotent.
+    // Dedup-merge by digest so a re-run is idempotent. Render the digest once
+    // rather than per scanned descriptor.
+    let digest_str = digest.to_string();
     let already_present = manifests
         .iter()
-        .any(|m| m.get("digest").and_then(Value::as_str) == Some(&digest.to_string()));
+        .any(|m| m.get("digest").and_then(Value::as_str) == Some(digest_str.as_str()));
     if !already_present {
         manifests.push(descriptor);
     }
