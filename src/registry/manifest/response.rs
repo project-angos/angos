@@ -32,6 +32,7 @@ pub struct HeadManifestResponse {
 
 pub struct PutManifestResponse {
     pub headers: HeaderMap,
+    pub digest: Digest,
     pub events: Vec<Event>,
 }
 

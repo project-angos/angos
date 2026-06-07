@@ -327,6 +327,7 @@ impl Registry {
 
         Ok(PutManifestResponse {
             headers: put_manifest_headers(namespace, reference, &computed_digest, subject.as_ref()),
+            digest: computed_digest,
             events: Vec::new(),
         })
     }
@@ -775,16 +776,15 @@ impl Registry {
 
         // Enqueue replication for the stored manifest, but ONLY when the write
         // actually changed local state (no-op suppression — see `prior_link`).
-        // The `Docker-Content-Digest` header is the canonical stored digest
-        // (`digest.to_string()`), so it round-trips back into a `Digest`.
+        // The canonical stored digest is read directly off `response.digest`
+        // (computed once by `store_manifest`) — no String->Digest re-parse of
+        // the `Docker-Content-Digest` header.
         //
         // Webhook events above are emitted unconditionally; only the replication
         // dispatch is gated, so observers still see every push while the mesh
         // stops re-propagating converged replays.
-        if let (Some(prior_link), Some(digest)) = (
-            prior_link.as_ref(),
-            digest_str.as_deref().and_then(|d| d.parse::<Digest>().ok()),
-        ) {
+        if let Some(prior_link) = prior_link.as_ref() {
+            let digest = &response.digest;
             let (tag, changed) = match &reference {
                 // A tag push moves local state when the tag was absent OR pointed
                 // at a different digest. A tag re-asserted to the same digest is a
@@ -793,7 +793,7 @@ impl Registry {
                     // Changed unless the tag already pointed at this exact digest.
                     // A transient read failure (any non-Ok) must not silently
                     // suppress a genuine change, so it falls through to dispatch.
-                    let changed = !matches!(prior_link, Ok(link) if link.target == digest);
+                    let changed = !matches!(prior_link, Ok(link) if link.target == *digest);
                     (Some(tag.as_str()), changed)
                 }
                 // A digest push is content-addressed: it changes local state only
@@ -818,7 +818,7 @@ impl Registry {
                     namespace,
                     REPLICATION_PUSH_MANIFEST_KIND,
                     tag,
-                    Some(&digest),
+                    Some(digest),
                 )
                 .await;
             }
