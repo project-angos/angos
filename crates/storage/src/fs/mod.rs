@@ -138,7 +138,7 @@ impl Backend {
             .append(true)
             .open(&path)
             .await
-            .map_err(|e| classify_open_error(&e, &path))?;
+            .map_err(|e| backend_error("could not open", &path, &e))?;
         let size = file.metadata().await?.len();
         Ok((file, size))
     }
@@ -279,15 +279,6 @@ async fn ensure_parent(path: &Path) -> Result<(), Error> {
                 yield_now().await;
             }
         }
-    }
-}
-
-/// Map a file-open error to an [`Error`], logging the full path for diagnostics.
-fn classify_open_error(error: &io::Error, path: &Path) -> Error {
-    if error.kind() == ErrorKind::NotFound {
-        Error::NotFound
-    } else {
-        Error::Backend(format!("could not open {}: {error}", path.display()))
     }
 }
 
