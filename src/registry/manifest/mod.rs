@@ -387,25 +387,34 @@ impl Registry {
         self.check_lww_not_superseded(namespace, reference, source_ts)
             .await?;
 
+        // A digest delete cascades to every tag pointing at the revision, so
+        // resolve those first: they feed both the no-op-suppression gate below
+        // and the LWW guard / link plan. A tag reference has no cascade.
+        let pointing_tags = if let Reference::Digest(digest) = reference {
+            self.metadata_store
+                .find_tags_pointing_at(namespace.as_ref(), digest)
+                .await?
+        } else {
+            Vec::new()
+        };
+
         // No-op suppression: only re-dispatch a delete that actually removed
-        // something. `existed_before` is false for a genuinely-absent ref (a
-        // converged replay) or when replication is off; a transient read error
-        // counts as "existed" so a real delete is never suppressed.
+        // something. The ref counts as absent (gate closed) only when the prior
+        // link is gone AND no tag still points at it — a digest delete that drops
+        // only cascade tag links (the revision link already absent) still changed
+        // local state. A transient read error counts as "existed" so a real
+        // delete is never suppressed; with replication off the gate is moot.
         let resolved_repository = self.resolver.resolve(namespace);
         let existed_before = match self
             .prior_link_if_replicated(resolved_repository, namespace, reference)
             .await
         {
-            None | Some(Err(MetadataStoreError::ReferenceNotFound)) => false,
+            None => false,
+            Some(Err(MetadataStoreError::ReferenceNotFound)) => !pointing_tags.is_empty(),
             Some(_) => true,
         };
 
         let ops = if let Reference::Digest(digest) = reference {
-            let tags = self
-                .metadata_store
-                .find_tags_pointing_at(namespace.as_ref(), digest)
-                .await?;
-
             // Receiver-side last-writer-wins for a replicated digest delete. The
             // delete cascades to every tag pointing at the revision, so a tag
             // re-pointed locally AFTER the delete was authored — and the revision
@@ -413,7 +422,7 @@ impl Registry {
             // deletes are guarded by `check_lww_not_superseded` above; a genuine
             // client delete carries no `source_ts` and skips this.
             if let Some(source_ts) = source_ts {
-                self.check_digest_delete_not_superseded(namespace, &tags, source_ts)
+                self.check_digest_delete_not_superseded(namespace, &pointing_tags, source_ts)
                     .await?;
             }
 
@@ -423,7 +432,7 @@ impl Registry {
                 .await
                 .ok()
                 .and_then(|content| Manifest::from_slice(&content).ok());
-            link_plan::delete(reference, manifest.as_ref(), &tags)
+            link_plan::delete(reference, manifest.as_ref(), &pointing_tags)
         } else {
             link_plan::delete(reference, None, &[])
         };

@@ -2699,7 +2699,7 @@ mod noop_suppression_tests {
             blob_store::BlobStore,
             job_store::JobStore,
             manifest::DEFAULT_MAX_MANIFEST_SIZE_BYTES,
-            metadata_store::MetadataStore,
+            metadata_store::{LinkOperation, MetadataStore, link_kind::LinkKind},
             repository_resolver::RepositoryResolver,
             test_utils::{build_store, build_test_fs_executor},
         },
@@ -3016,6 +3016,55 @@ mod noop_suppression_tests {
             pending(&job_store).await,
             after_delete,
             "deleting an absent tag must enqueue nothing (no-op delete)"
+        );
+    }
+
+    /// A digest delete that removes only cascade tag links — the revision link
+    /// already gone (an inconsistent local state) — still changed local state,
+    /// so it MUST re-dispatch: the suppression gate keys on the cascade tags,
+    /// not the revision link alone.
+    #[tokio::test]
+    async fn digest_delete_dispatches_when_only_cascade_tags_remain() {
+        let dir = TempDir::new().unwrap();
+        let (registry, job_store) = build_registry(dir.path().to_str().unwrap());
+        let namespace = Namespace::new(NAMESPACE).unwrap();
+
+        // Seed a tagged manifest (Digest + Tag links), then drain its push job.
+        let (content, media_type) = create_test_manifest(&registry, &namespace).await;
+        let digest = Digest::Sha256(sha256::hex(&content).into());
+        registry
+            .accept_put_manifest(
+                None,
+                None,
+                &namespace,
+                Reference::Tag("latest".to_string()),
+                media_type,
+                Cursor::new(content),
+            )
+            .await
+            .expect("seed tag push");
+        drain_one(&job_store).await;
+
+        // Force the inconsistent state: drop ONLY the revision link, leaving the
+        // tag still pointing at the now-link-less digest.
+        registry
+            .metadata_store
+            .update_links(
+                NAMESPACE,
+                &[LinkOperation::delete(LinkKind::Digest(digest.clone()))],
+            )
+            .await
+            .expect("drop the revision link");
+
+        let baseline = pending(&job_store).await;
+        registry
+            .delete_manifest(None, None, &namespace, &Reference::Digest(digest))
+            .await
+            .expect("digest delete");
+        assert_eq!(
+            pending(&job_store).await,
+            baseline + 1,
+            "a digest delete that drops only cascade tag links must enqueue a replication delete"
         );
     }
 
