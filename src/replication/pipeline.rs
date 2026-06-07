@@ -431,11 +431,14 @@ async fn push_referrers_fallback(
 /// `manifests[]` descriptors.
 ///
 /// A `404` (`ManifestUnknown`) means the fallback tag does not exist yet, so an
-/// empty list is returned and the caller starts fresh. Any other error — a
+/// empty list is returned and the caller starts fresh. Any other GET error — a
 /// transient `5xx`/timeout — is propagated so the caller retries instead of
 /// overwriting an existing index from an empty base and dropping every sibling
-/// referrer of the subject. A success whose body is not a parseable index yields
-/// an empty list (a malformed body would not change on retry).
+/// referrer of the subject. A `200` whose body is not a parseable image index
+/// (unparseable JSON, or a missing/non-array `manifests`) is an error too, not an
+/// empty base: starting fresh would clobber the existing referrers, so a corrupt
+/// downstream index is surfaced (the job retries / dead-letters) rather than
+/// silently overwritten.
 async fn fetch_fallback_manifests(
     downstream: &RegistryClient,
     location: &str,
@@ -445,10 +448,15 @@ async fn fetch_fallback_manifests(
         Err(RegistryError::ManifestUnknown) => return Ok(Vec::new()),
         Err(e) => return Err(Error::Registry(e)),
     };
-    Ok(serde_json::from_slice::<Value>(&body)
+    serde_json::from_slice::<Value>(&body)
         .ok()
         .and_then(|v| v.get("manifests").and_then(Value::as_array).cloned())
-        .unwrap_or_default())
+        .ok_or_else(|| {
+            Error::Registry(RegistryError::Internal(format!(
+                "downstream referrers fallback index at '{location}' is not a parseable image \
+                 index (missing or non-array `manifests`); refusing to overwrite it"
+            )))
+        })
 }
 
 /// Builds an OCI descriptor for a referrer manifest to embed in the fallback
@@ -834,6 +842,90 @@ mod tests {
         assert!(
             result.is_err(),
             "a transient fallback-index GET error must fail the push so the job retries, got: {result:?}"
+        );
+
+        // `.expect(0)` on the fallback PUT (no clobbering write) is verified on drop.
+        drop(mock_server);
+    }
+
+    #[tokio::test]
+    async fn referrers_fallback_errors_on_unparseable_index_without_clobbering() {
+        // A 200 whose body is not a usable image index (here: valid JSON with no
+        // `manifests` array) must NOT be treated as an empty base: rebuilding the
+        // index from empty and PUTting it would drop the subject's existing sibling
+        // referrers. The push must surface the error so the durable job retries /
+        // dead-letters rather than silently overwriting a corrupt downstream index.
+        metrics_provider::init_for_tests();
+        let mock_server = MockServer::start().await;
+        let dir = TempDir::new().unwrap();
+        let (blob_store, metadata_store, store) = test_blob_store(dir.path().to_str().unwrap());
+
+        let subject = put_blob_direct(&store, b"subject-bytes").await;
+        // Config-less subject manifest: only the primary manifest and the fallback
+        // are pushed (no blob upload to mock).
+        let manifest = json!({
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "layers": [],
+            "subject": {
+                "mediaType": "application/vnd.oci.image.manifest.v1+json",
+                "digest": subject.to_string(),
+                "size": 13,
+            },
+        });
+        let manifest_bytes = serde_json::to_vec(&manifest).unwrap();
+        let manifest_digest = put_blob_direct(&store, &manifest_bytes).await;
+
+        // Primary manifest PUT with NO `OCI-Subject` => OCI-1.0 => fallback runs.
+        Mock::given(method("PUT"))
+            .and(path(format!("/v2/{NAMESPACE}/manifests/v1")))
+            .respond_with(
+                ResponseTemplate::new(201)
+                    .insert_header(DOCKER_CONTENT_DIGEST, manifest_digest.to_string().as_str()),
+            )
+            .mount(&mock_server)
+            .await;
+
+        // The fallback index GET returns a 200 (with a valid Docker-Content-Digest,
+        // so the client accepts the response) whose body parses as JSON but has no
+        // `manifests` array — a corrupt/unexpected index. The merge-PUT must NOT run.
+        let fallback_tag = format!("{}-{}", subject.algorithm(), subject.hash());
+        Mock::given(method("GET"))
+            .and(path(format!("/v2/{NAMESPACE}/manifests/{fallback_tag}")))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header(DOCKER_CONTENT_DIGEST, manifest_digest.to_string().as_str())
+                    .set_body_json(json!({
+                        "schemaVersion": 2,
+                        "mediaType": OCI_INDEX_MEDIA_TYPE,
+                    })),
+            )
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path(format!("/v2/{NAMESPACE}/manifests/{fallback_tag}")))
+            .respond_with(ResponseTemplate::new(201))
+            .expect(0)
+            .mount(&mock_server)
+            .await;
+
+        let result = push_manifest(
+            &downstream_client(&mock_server.uri()),
+            &blob_store,
+            &metadata_store,
+            NAMESPACE,
+            &manifest_digest,
+            None,
+            Some("v1"),
+            manifest_bytes,
+            4,
+            None,
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "a malformed fallback index must fail the push so it is not overwritten, got: {result:?}"
         );
 
         // `.expect(0)` on the fallback PUT (no clobbering write) is verified on drop.
