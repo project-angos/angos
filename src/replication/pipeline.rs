@@ -402,8 +402,14 @@ async fn push_referrers_fallback(
 
     // Descriptor for the referrer manifest just pushed. `body`'s digest is the
     // `digest` already resolved on the push path (the blob store is
-    // content-addressed), so reuse it rather than re-hashing the body.
-    let descriptor = referrer_descriptor(digest, body);
+    // content-addressed), so reuse it rather than re-hashing the body; its
+    // media/artifact type come from the single parse, not a re-parse of `body`.
+    let descriptor = referrer_descriptor(
+        digest,
+        body.len(),
+        parsed.media_type.as_deref(),
+        parsed.artifact_type.as_deref(),
+    );
 
     // Dedup-merge by digest so a re-run is idempotent.
     let already_present = manifests
@@ -464,21 +470,23 @@ async fn fetch_fallback_manifests(
 }
 
 /// Builds an OCI descriptor for a referrer manifest to embed in the fallback
-/// index: `mediaType`, `digest`, `size`, and `artifactType` (carried through
-/// from the manifest body when present).
-fn referrer_descriptor(referrer_digest: &Digest, body: &[u8]) -> Value {
+/// index: `mediaType`, `digest`, `size`, and `artifactType`. `media_type` and
+/// `artifact_type` come from the referrer body's single `parse_manifest_digests`,
+/// so the descriptor is built without re-parsing the body; `media_type` defaults
+/// to the OCI image-manifest type when the body declared none.
+fn referrer_descriptor(
+    referrer_digest: &Digest,
+    size: usize,
+    media_type: Option<&str>,
+    artifact_type: Option<&str>,
+) -> Value {
     let mut descriptor = json!({
-        "mediaType": OCI_MANIFEST_MEDIA_TYPE,
+        "mediaType": media_type.unwrap_or(OCI_MANIFEST_MEDIA_TYPE),
         "digest": referrer_digest.to_string(),
-        "size": body.len(),
+        "size": size,
     });
-    if let Ok(parsed) = serde_json::from_slice::<Value>(body) {
-        if let Some(media_type) = parsed.get("mediaType").and_then(Value::as_str) {
-            descriptor["mediaType"] = json!(media_type);
-        }
-        if let Some(artifact_type) = parsed.get("artifactType").and_then(Value::as_str) {
-            descriptor["artifactType"] = json!(artifact_type);
-        }
+    if let Some(artifact_type) = artifact_type {
+        descriptor["artifactType"] = json!(artifact_type);
     }
     descriptor
 }

@@ -9,6 +9,9 @@ pub struct ParsedManifestDigests {
     /// The manifest body's declared `mediaType`, surfaced from the single parse
     /// so callers need not re-parse the body just to read it.
     pub media_type: Option<String>,
+    /// The manifest body's declared `artifactType`, surfaced from the same parse
+    /// so a referrer descriptor can be built without re-parsing the body.
+    pub artifact_type: Option<String>,
     pub subject: Option<Digest>,
     pub config: Option<Digest>,
     pub layers: Vec<Digest>,
@@ -120,6 +123,7 @@ pub fn parse_manifest_digests(
 
     Ok(ParsedManifestDigests {
         media_type: manifest.media_type,
+        artifact_type: manifest.artifact_type,
         subject,
         config,
         layers,
