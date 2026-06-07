@@ -5,7 +5,7 @@ mod auth;
 mod upstream_url;
 mod write;
 
-use std::{io, path::Path, sync::Arc, time::Duration};
+use std::{future::Future, io, path::Path, sync::Arc, time::Duration};
 
 use auth::token_index_cache_key;
 use futures_util::TryStreamExt;
@@ -185,18 +185,48 @@ impl RegistryClient {
     ) -> Result<Response, Error> {
         info!("Requesting from upstream: {location}");
 
+        self.send_with_auth_retry(location, |auth| async move {
+            self.send(method, accepted_types, location, auth.as_deref())
+                .await
+        })
+        .await
+    }
+
+    /// Runs the cached-token-then-single-refresh-retry orchestration shared by the
+    /// replayable-body requests ([`RegistryClient::query`] and
+    /// [`RegistryClient::send_body`]).
+    ///
+    /// `send_once` performs one attempt with the auth header it is handed
+    /// (ownership is passed in so the per-attempt future can outlive the call):
+    /// the cached header for the first attempt, then a freshly refreshed token for
+    /// the single retry. The closure may run twice, so it must clone any
+    /// captured-by-value request state (e.g. the byte body) inside itself.
+    ///
+    /// First attempt uses the cached header. On `401` the token is refreshed once
+    /// — `refresh_auth_header` is given the originally-attempted header so its
+    /// "another thread already refreshed" short-circuit still applies — and the
+    /// request is retried exactly once. A `403` maps to [`Error::Denied`]; any
+    /// other status is returned as `Ok` for the caller to classify.
+    ///
+    /// The single-use upload stream in [`RegistryClient::patch_upload`] cannot be
+    /// replayed and therefore does not go through this helper.
+    async fn send_with_auth_retry<F, Fut>(
+        &self,
+        location: &str,
+        send_once: F,
+    ) -> Result<Response, Error>
+    where
+        F: Fn(Option<String>) -> Fut,
+        Fut: Future<Output = Result<Response, Error>>,
+    {
         let cached_auth = self.cached_auth_header(location).await;
-        let response = self
-            .send(method, accepted_types, location, cached_auth.as_deref())
-            .await?;
+        let response = send_once(cached_auth.clone()).await?;
 
         if response.status() == StatusCode::UNAUTHORIZED {
             let token = self
                 .refresh_auth_header(&response, cached_auth.as_deref())
                 .await?;
-            return self
-                .send(method, accepted_types, location, Some(&token))
-                .await;
+            return send_once(Some(token)).await;
         }
 
         if response.status() == StatusCode::FORBIDDEN {

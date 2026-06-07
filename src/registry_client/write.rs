@@ -8,11 +8,12 @@
 //!
 //! Auth, token caching, TLS and the redirect/timeout policy are reused from the
 //! shared machinery on [`RegistryClient`]: byte-bodied requests go through
-//! [`RegistryClient::send_body`], which mirrors [`RegistryClient::query`]
-//! (cached token first, then a single refresh-and-retry on `401`). The
-//! single-use upload stream in [`RegistryClient::patch_upload`] cannot be
-//! replayed, so it attaches the cached token up front and surfaces a `401` as
-//! an error rather than retrying with a drained body.
+//! [`RegistryClient::send_body`], which shares [`RegistryClient::query`]'s
+//! cached-token-then-single-refresh-retry orchestration via
+//! [`RegistryClient::send_with_auth_retry`]. The single-use upload stream in
+//! [`RegistryClient::patch_upload`] cannot be replayed, so it attaches the
+//! cached token up front and surfaces a `401` as an error rather than retrying
+//! with a drained body.
 
 use std::collections::HashSet;
 
@@ -100,7 +101,7 @@ fn append_query(base: &str, query: &str) -> String {
 
 impl RegistryClient {
     /// Sends a request carrying a byte body, reusing the cached auth header and
-    /// refreshing once on `401` (mirrors [`RegistryClient::query`]).
+    /// refreshing once on `401` via [`RegistryClient::send_with_auth_retry`].
     ///
     /// `source_ts` stamps the `X-Angos-Source-Timestamp` last-writer-wins header
     /// when set; pass `None` for ordinary writes.
@@ -118,39 +119,23 @@ impl RegistryClient {
         // without a deep copy: a `Bytes` clone is a refcount bump, not a re-alloc.
         let body = Bytes::from(body);
 
-        let cached_auth = self.cached_auth_header(location).await;
-        let response = self
-            .send_body_once(
-                method,
-                location,
-                content_type,
-                body.clone(),
-                cached_auth.as_deref(),
-                source_ts,
-            )
-            .await?;
-
-        if response.status() == StatusCode::UNAUTHORIZED {
-            let token = self
-                .refresh_auth_header(&response, cached_auth.as_deref())
-                .await?;
-            return self
-                .send_body_once(
+        self.send_with_auth_retry(location, |auth| {
+            // `send_with_auth_retry` may invoke this twice (cached token, then a
+            // refreshed token on 401), so clone the refcounted body per attempt.
+            let body = body.clone();
+            async move {
+                self.send_body_once(
                     method,
                     location,
                     content_type,
                     body,
-                    Some(&token),
+                    auth.as_deref(),
                     source_ts,
                 )
-                .await;
-        }
-
-        if response.status() == StatusCode::FORBIDDEN {
-            return Err(Error::Denied("Access forbidden".to_string()));
-        }
-
-        Ok(response)
+                .await
+            }
+        })
+        .await
     }
 
     async fn send_body_once(
