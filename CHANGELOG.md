@@ -18,6 +18,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - `angos worker` with no `--queue` now drains both the `cache` and `replication` queues, so pass `--queue cache` to restore the previous cache-only default.
 - `angos worker` now rejects an unknown `--queue` value at startup.
 - A `[global.job_queue]` configured with the in-process `memory` lock is now rejected at startup, so set the metadata store's `lock_strategy` to `s3` or `redis`, or remove `[global.job_queue]` to use the in-process queue.
+- A blob-upload `POST` with a malformed `?digest=` now returns `400` instead of silently starting a `202` upload session that ignores the digest.
 
 ## 1.2.0 - 2026-06-03
 

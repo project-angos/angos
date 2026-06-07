@@ -1,6 +1,6 @@
 ---
 displayed_sidebar: howto
-sidebar_position: 11
+sidebar_position: 13
 title: "Configure Replication"
 ---
 
