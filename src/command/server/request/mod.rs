@@ -120,6 +120,12 @@ impl<'a> RequestHeaders<'a> {
     /// Returns `None` for a missing, empty, or unparseable value. A malformed
     /// timestamp must never fail the request: it simply disables LWW for this
     /// write (the change is applied as a normal client write).
+    ///
+    /// A future-dated value is clamped to the present. The header is
+    /// client-settable on any authorized write, and an unclamped future timestamp
+    /// would let a pusher pin a last-writer-wins win and durably postdate the
+    /// tag's stored `created_at`. A legitimate replication source stamps the
+    /// author's past write time, so the clamp is a no-op for it.
     pub fn source_timestamp(&self) -> Option<DateTime<Utc>> {
         let value = self
             .headers
@@ -131,9 +137,10 @@ impl<'a> RequestHeaders<'a> {
             return None;
         }
 
-        DateTime::parse_from_rfc3339(value)
-            .ok()
-            .map(|dt| dt.with_timezone(&Utc))
+        let parsed = DateTime::parse_from_rfc3339(value)
+            .ok()?
+            .with_timezone(&Utc);
+        Some(parsed.min(Utc::now()))
     }
 
     pub fn range(&self, header: HeaderName) -> Result<Option<(u64, Option<u64>)>, Error> {

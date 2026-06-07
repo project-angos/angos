@@ -724,3 +724,26 @@ fn test_source_timestamp_garbage_is_none() {
     let source_ts = RequestHeaders::new(&parts.headers).source_timestamp();
     assert_eq!(source_ts, None);
 }
+
+#[test]
+fn test_source_timestamp_future_is_clamped_to_now() {
+    // The header is client-settable; a future-dated value is clamped to the
+    // present so an authorized pusher cannot pin a last-writer-wins win or durably
+    // postdate the stored `created_at`.
+    let request = Request::builder()
+        .header(X_ANGOS_SOURCE_TIMESTAMP, "3000-01-01T00:00:00Z")
+        .body(())
+        .unwrap();
+    let (parts, ()) = request.into_parts();
+
+    let before = Utc::now();
+    let source_ts = RequestHeaders::new(&parts.headers)
+        .source_timestamp()
+        .expect("a parseable timestamp returns Some");
+    let after = Utc::now();
+
+    assert!(
+        source_ts >= before && source_ts <= after,
+        "a future source timestamp is clamped to ~now (got {source_ts}), not the future value"
+    );
+}
