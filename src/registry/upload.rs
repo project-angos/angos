@@ -340,10 +340,10 @@ impl Registry {
     pub async fn mount_blob(
         &self,
         namespace: &Namespace,
-        mount: BlobMount,
+        mount: &BlobMount,
         source: &Namespace,
     ) -> Result<StartUploadResponse, Error> {
-        if let Some(headers) = self.try_cross_repo_mount(namespace, &mount, source).await? {
+        if let Some(headers) = self.try_cross_repo_mount(namespace, mount, source).await? {
             return Ok(StartUploadResponse::ExistingBlob { headers });
         }
 
@@ -745,7 +745,7 @@ mod tests {
                 digest: digest.clone(),
                 from: Some(source.clone()),
             };
-            let response = registry.mount_blob(target, mount, source).await.unwrap();
+            let response = registry.mount_blob(target, &mount, source).await.unwrap();
 
             // 201-equivalent: the mount granted `target` a reference with no
             // transfer, so the existing-blob headers come back.
@@ -790,7 +790,7 @@ mod tests {
                 digest: digest.clone(),
                 from: Some(source.clone()),
             };
-            let response = registry.mount_blob(target, mount, source).await.unwrap();
+            let response = registry.mount_blob(target, &mount, source).await.unwrap();
 
             match response {
                 StartUploadResponse::Session { headers } => {
@@ -834,7 +834,7 @@ mod tests {
                 digest: absent,
                 from: Some(source.clone()),
             };
-            let response = registry.mount_blob(target, mount, source).await.unwrap();
+            let response = registry.mount_blob(target, &mount, source).await.unwrap();
 
             assert!(
                 matches!(response, StartUploadResponse::Session { .. }),
@@ -864,7 +864,7 @@ mod tests {
                 digest: digest.clone(),
                 from: None,
             };
-            let response = registry.mount_blob(target, mount, owner).await.unwrap();
+            let response = registry.mount_blob(target, &mount, owner).await.unwrap();
 
             match response {
                 StartUploadResponse::ExistingBlob { headers } => {
@@ -902,7 +902,7 @@ mod tests {
                 digest: digest.clone(),
                 from: None,
             };
-            let response = registry.mount_blob(target, mount, source).await.unwrap();
+            let response = registry.mount_blob(target, &mount, source).await.unwrap();
 
             assert!(
                 matches!(response, StartUploadResponse::Session { .. }),
@@ -936,7 +936,7 @@ mod tests {
                 from: None,
             };
             let response = registry
-                .mount_blob(target, mount, authorized)
+                .mount_blob(target, &mount, authorized)
                 .await
                 .unwrap();
 

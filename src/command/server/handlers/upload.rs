@@ -45,7 +45,7 @@ pub async fn handle_mount_blob(
     {
         context
             .registry
-            .mount_blob(namespace, mount, &source)
+            .mount_blob(namespace, &mount, &source)
             .await?
     } else {
         context.registry.start_upload(namespace, None).await?
