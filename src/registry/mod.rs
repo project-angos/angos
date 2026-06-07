@@ -1,6 +1,7 @@
 use std::{collections::HashMap, fmt, num::NonZeroUsize, sync::Arc, time::Duration};
 
-use tokio::time::sleep;
+use tokio::{select, time::sleep};
+use tokio_util::sync::CancellationToken;
 use tracing::instrument;
 
 pub mod blob;
@@ -164,6 +165,14 @@ pub struct Registry {
     enable_manifest_redirect: bool,
     update_pull_time: bool,
     job_queue: Arc<JobStore>,
+    /// Cancels the in-process claim loops (cache + replication) when this
+    /// `Registry` is dropped — on a hot-reload swap (the superseded `Registry`
+    /// is dropped once in-flight requests release it) or on server shutdown (the
+    /// server context is dropped) — so the loops stop polling the shared store
+    /// instead of leaking across reloads. `None` when a durable
+    /// `[global.job_queue]` is configured: there are no in-process loops, and
+    /// `angos worker` drains the queue and shuts down on its own token.
+    in_process_shutdown: Option<CancellationToken>,
     global_immutable_tags: bool,
     global_immutable_tags_exclusions: Vec<RegexPattern>,
     max_manifest_size_bytes: usize,
@@ -183,17 +192,19 @@ impl Registry {
         resolver: Arc<RepositoryResolver>,
         config: RegistryConfig,
     ) -> Result<Self, Error> {
-        let job_queue: Arc<JobStore> = if let Some(q) = config.job_queue {
-            q
-        } else {
-            build_in_process_queue(
-                &resolver,
-                &blob_store,
-                &metadata_store,
-                config.max_concurrent_cache_jobs,
-                config.max_concurrent_replication_jobs,
-            )?
-        };
+        let (job_queue, in_process_shutdown): (Arc<JobStore>, Option<CancellationToken>) =
+            if let Some(q) = config.job_queue {
+                (q, None)
+            } else {
+                let (q, shutdown) = build_in_process_queue(
+                    &resolver,
+                    &blob_store,
+                    &metadata_store,
+                    config.max_concurrent_cache_jobs,
+                    config.max_concurrent_replication_jobs,
+                )?;
+                (q, Some(shutdown))
+            };
 
         Ok(Self {
             update_pull_time: config.update_pull_time,
@@ -203,6 +214,7 @@ impl Registry {
             metadata_store,
             resolver,
             job_queue,
+            in_process_shutdown,
             global_immutable_tags: config.global_immutable_tags,
             global_immutable_tags_exclusions: config.global_immutable_tags_exclusions,
             max_manifest_size_bytes: config.max_manifest_size_bytes,
@@ -276,7 +288,7 @@ fn build_in_process_queue(
     metadata_store: &Arc<MetadataStore>,
     cache_concurrency: NonZeroUsize,
     replication_concurrency: NonZeroUsize,
-) -> Result<Arc<JobStore>, Error> {
+) -> Result<(Arc<JobStore>, CancellationToken), Error> {
     // Share the registry's object store and transaction executor (the same
     // handle the blob/metadata stores use). The cache-fill handler stages bytes
     // into the blob store and returns a transaction that moves them into
@@ -293,11 +305,15 @@ fn build_in_process_queue(
         metadata_store.clone(),
     ));
 
+    // One shared token cancels every loop when the owning `Registry` is dropped.
+    let shutdown = CancellationToken::new();
+
     for _ in 0..cache_concurrency.get() {
         tokio::spawn(in_process_claim_loop(
             job_store.clone(),
             cache_handler.clone(),
             CACHE_QUEUE,
+            shutdown.clone(),
         ));
     }
 
@@ -319,28 +335,53 @@ fn build_in_process_queue(
             job_store.clone(),
             replication_handler.clone(),
             REPLICATION_QUEUE,
+            shutdown.clone(),
         ));
     }
 
-    Ok(job_store)
+    Ok((job_store, shutdown))
 }
 
 /// Single claim-loop task for the in-process pool. Mirrors the per-worker
 /// loop in `command::worker::command::Command::run` but with a fixed 10 ms
 /// idle tick so small test suites stay snappy. `queue` selects which queue this
 /// loop drains (and `handler` must be the handler bound to that queue).
+///
+/// `shutdown` stops the loop when the owning `Registry` is dropped. Like
+/// `worker_loop`, the cancellation races only the claim — a job already claimed
+/// runs to completion before the loop exits — so cancellation skips claiming the
+/// next job rather than interrupting one mid-execute.
 async fn in_process_claim_loop(
     consumer: Arc<JobStore>,
     handler: Arc<dyn JobHandler>,
     queue: &'static str,
+    shutdown: CancellationToken,
 ) {
     loop {
-        match consumer.claim_one(queue).await {
-            Err(_) => sleep(Duration::from_millis(100)).await,
-            Ok(claim_outcome) => match claim_outcome.claimed {
-                None => sleep(claim_outcome.idle_sleep(Duration::from_millis(10))).await,
-                Some(claimed) => execute_one(consumer.as_ref(), handler.as_ref(), claimed).await,
+        select! {
+            () = shutdown.cancelled() => return,
+            outcome = consumer.claim_one(queue) => match outcome {
+                Err(_) => sleep(Duration::from_millis(100)).await,
+                Ok(claim_outcome) => match claim_outcome.claimed {
+                    None => sleep(claim_outcome.idle_sleep(Duration::from_millis(10))).await,
+                    Some(claimed) => {
+                        execute_one(consumer.as_ref(), handler.as_ref(), claimed).await;
+                    }
+                },
             },
+        }
+    }
+}
+
+impl Drop for Registry {
+    fn drop(&mut self) {
+        // Stop the in-process claim loops bound to this Registry. They each hold
+        // their own `Arc<JobStore>` clone, so dropping the Registry's handle does
+        // not stop them — only cancelling the shared token does. In-flight jobs
+        // are durable and claimed under a lease, so a job interrupted by runtime
+        // teardown is re-claimed after restart (at-least-once) rather than lost.
+        if let Some(shutdown) = &self.in_process_shutdown {
+            shutdown.cancel();
         }
     }
 }
