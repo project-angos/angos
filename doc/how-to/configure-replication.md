@@ -165,6 +165,8 @@ time() - angos_replication_last_success_timestamp_seconds
 angos_job_queue_pending{queue="replication"}
 ```
 
+`angos_job_queue_pending{queue="replication"}` is published only when `[global.job_queue]` is configured; the in-process self-drain mode used in the example above does not publish it. The `angos_replication_*` metrics are available in both modes.
+
 See [Metrics Reference](../reference/metrics.md) for the full list.
 
 ## Troubleshooting

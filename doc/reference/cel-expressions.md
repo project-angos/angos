@@ -114,6 +114,10 @@ Optional `request` fields are **omitted** when unset (only `request.action` is a
 | `list-namespaces`   | Extension: list namespaces   |
 | `list-revisions`    | Extension: list revisions    |
 | `list-uploads`      | Extension: list uploads      |
+| `list-jobs`         | Extension: list pending jobs |
+| `list-failed-jobs`  | Extension: list failed jobs  |
+| `retry-job`         | Extension: requeue a job     |
+| `delete-job`        | Extension: delete a job      |
 
 ---
 

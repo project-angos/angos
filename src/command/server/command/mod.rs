@@ -21,6 +21,7 @@ use crate::{
     },
     configuration::{Configuration, ServerConfig},
     registry::{cache_job_handler::CACHE_QUEUE, job_store::pending_refresh_loop},
+    replication::REPLICATION_QUEUE,
 };
 
 mod notifier;
@@ -39,7 +40,8 @@ pub enum ServiceListener {
 )]
 pub struct Options {}
 
-/// Background ticker that publishes `angos_job_queue_pending` on `/metrics`.
+/// Background tickers (one per drained queue: `cache` and `replication`) that
+/// publish `angos_job_queue_pending` on `/metrics`.
 struct PendingRefreshTask {
     shutdown: CancellationToken,
     tracker: TaskTracker,
@@ -79,13 +81,20 @@ impl Command {
         let pending_refresh = pending.map(|refresh| {
             let shutdown = CancellationToken::new();
             let tracker = TaskTracker::new();
-            tracker.spawn(pending_refresh_loop(
-                refresh.store,
-                CACHE_QUEUE.to_string(),
-                refresh.interval,
-                refresh.ready_horizon_secs,
-                shutdown.clone(),
-            ));
+            // Publish backlog depth for both drained queues. The server reads
+            // count_pending off the shared store regardless of which process
+            // drains, so `angos_job_queue_pending{queue="replication"}` is
+            // available whenever [global.job_queue] is configured, even though
+            // `angos worker` (not the server) drains the replication queue.
+            for queue in [CACHE_QUEUE, REPLICATION_QUEUE] {
+                tracker.spawn(pending_refresh_loop(
+                    refresh.store.clone(),
+                    queue.to_string(),
+                    refresh.interval,
+                    refresh.ready_horizon_secs,
+                    shutdown.clone(),
+                ));
+            }
             PendingRefreshTask { shutdown, tracker }
         });
 
