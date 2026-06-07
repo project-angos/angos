@@ -1,13 +1,13 @@
 use std::sync::Arc;
 
 use regex::Regex;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 
 use crate::{registry_client::RegistryClient, replication::Error};
 
 /// Whether a downstream participates in the event-driven push path, the scrub
 /// reconciliation path, or both.
-#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
 pub enum ReplicationMode {
     /// Push on local mutations and include in scrub reconciliation.
     #[default]
