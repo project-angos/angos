@@ -299,7 +299,7 @@ Total replication pushes to a downstream, by outcome.
 
 **Labels:**
 - `downstream`: the configured downstream `name`
-- `outcome`: `pushed` (manifest/blobs transferred), `superseded` (downstream already held a newer copy — last-writer-wins, counted as success), or `failed` (the push errored and the job will retry)
+- `outcome`: `pushed` (manifest/blobs transferred), `converged` (downstream already held this exact digest, so the PUT was skipped — nothing transferred), `superseded` (downstream already held a newer copy — last-writer-wins, counted as success), or `failed` (the push errored and the job will retry)
 
 **Example:**
 ```promql

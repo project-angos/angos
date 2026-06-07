@@ -39,8 +39,11 @@ use crate::{
 /// [`PushOutcome::Superseded`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PushOutcome {
-    /// The downstream accepted and applied the change.
+    /// The downstream accepted and applied the change (a PUT/DELETE was issued).
     Pushed,
+    /// The downstream already held this exact digest, so the PUT was skipped
+    /// (HEAD-before-PUT convergence). Nothing was transferred.
+    Converged,
     /// The downstream rejected the change by last-writer-wins; it already holds a
     /// strictly-newer copy, so the system has converged.
     Superseded,
@@ -160,7 +163,7 @@ pub async fn push_manifest(
             ?tag,
             "Downstream already holds this manifest; skipping PUT (converged)"
         );
-        return Ok(PushOutcome::Pushed);
+        return Ok(PushOutcome::Converged);
     }
 
     // The referrers fallback below borrows the manifest body, but only a
@@ -560,7 +563,7 @@ mod tests {
         registry_client::RegistryClient,
         replication::{
             REPLICATION_SUPERSEDED_CODE, X_ANGOS_SOURCE_TIMESTAMP,
-            pipeline::{delete_manifest, push_manifest},
+            pipeline::{PushOutcome, delete_manifest, push_manifest},
         },
         util::sha256,
     };
@@ -1348,7 +1351,7 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        push_manifest(
+        let outcome = push_manifest(
             &downstream_client(&mock_server.uri()),
             &blob_store,
             &metadata_store,
@@ -1362,6 +1365,11 @@ mod tests {
         )
         .await
         .expect("a converged downstream must skip the PUT and succeed");
+        assert_eq!(
+            outcome,
+            PushOutcome::Converged,
+            "a HEAD-matched skip must report Converged, not Pushed, so the metric distinguishes a no-op"
+        );
 
         // No PUT mock exists; `.expect(1)` on the HEAD (verified on drop) proves
         // the probe ran and the absence of an error proves no PUT was attempted.

@@ -165,12 +165,13 @@ impl ReplicationJobHandler {
     }
 
     /// Records the per-downstream replication metrics for a successful push or
-    /// delete: the `pushed` / `superseded` counter, and the last-success
-    /// timestamp gauge (both [`PushOutcome`] arms are convergence, so both set
-    /// the gauge to now).
+    /// delete: the `pushed` / `converged` / `superseded` counter, and the
+    /// last-success timestamp gauge (every [`PushOutcome`] is convergence, so all
+    /// set the gauge to now).
     fn record_success(downstream: &str, outcome: PushOutcome) {
         let outcome_label = match outcome {
             PushOutcome::Pushed => "pushed",
+            PushOutcome::Converged => "converged",
             PushOutcome::Superseded => "superseded",
         };
         metrics_provider()
