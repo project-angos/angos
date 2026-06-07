@@ -562,8 +562,10 @@ mod in_process_replication_tests {
 
         // Enqueue via the production event path; the in-process replication loop
         // claims and executes it asynchronously.
+        let repository = registry.resolver.resolve(&namespace);
         registry
             .dispatch_replication(
+                repository,
                 &namespace,
                 REPLICATION_PUSH_MANIFEST_KIND,
                 Some("v1"),

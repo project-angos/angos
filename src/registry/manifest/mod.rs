@@ -390,7 +390,11 @@ impl Registry {
         // something. `existed_before` is false for a genuinely-absent ref (a
         // converged replay) or when replication is off; a transient read error
         // counts as "existed" so a real delete is never suppressed.
-        let existed_before = match self.prior_link_if_replicated(namespace, reference).await {
+        let resolved_repository = self.resolver.resolve(namespace);
+        let existed_before = match self
+            .prior_link_if_replicated(resolved_repository, namespace, reference)
+            .await
+        {
             None | Some(Err(MetadataStoreError::ReferenceNotFound)) => false,
             Some(_) => true,
         };
@@ -472,6 +476,7 @@ impl Registry {
         // replication dispatch is gated.
         if existed_before {
             self.dispatch_replication(
+                resolved_repository,
                 namespace,
                 REPLICATION_DELETE_MANIFEST_KIND,
                 tag,
@@ -673,18 +678,22 @@ impl Registry {
     /// change.
     async fn prior_link_if_replicated(
         &self,
+        repository: Option<&Repository>,
         namespace: &Namespace,
         reference: &Reference,
     ) -> Option<Result<LinkMetadata, MetadataStoreError>> {
-        if self.replicates_on_event(namespace) {
-            Some(
-                self.metadata_store
-                    .read_link(namespace, &LinkKind::from_reference(reference), false)
-                    .await,
-            )
-        } else {
-            None
+        let repository = repository?;
+
+        for downstream in &repository.replication {
+            if downstream.enqueues_for(namespace.as_ref()) {
+                return Some(
+                    self.metadata_store
+                        .read_link(namespace, &LinkKind::from_reference(reference), false)
+                        .await,
+                );
+            }
         }
+        None
     }
 
     /// Reads the body stream, calls `put_manifest`, and returns the domain response.
@@ -709,7 +718,10 @@ impl Registry {
         // re-asserted tag or already-present revision is a converged replay;
         // re-dispatching it would keep a 3+-node mesh cycle alive). `None` means
         // replication is off and the post-write dispatch block does not run.
-        let prior_link = self.prior_link_if_replicated(namespace, &reference).await;
+        let resolved_repository = self.resolver.resolve(namespace);
+        let prior_link = self
+            .prior_link_if_replicated(resolved_repository, namespace, &reference)
+            .await;
 
         let limit = self.max_manifest_size_bytes;
         let mut request_body = Vec::new();
@@ -802,6 +814,7 @@ impl Registry {
 
             if changed {
                 self.dispatch_replication(
+                    resolved_repository,
                     namespace,
                     REPLICATION_PUSH_MANIFEST_KIND,
                     tag,
