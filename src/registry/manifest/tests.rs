@@ -3068,6 +3068,63 @@ mod noop_suppression_tests {
         );
     }
 
+    /// A digest delete of an already-absent revision (the revision link gone AND
+    /// no tag still pointing at it — the fully-converged state after a prior
+    /// delete) enqueues nothing: the negative side of the cascade-tags gate.
+    /// This is the digest bounce-back that terminates a delete cycle — once a
+    /// node has converged, it stops re-dispatching the delete.
+    #[tokio::test]
+    async fn digest_delete_suppressed_once_converged() {
+        let dir = TempDir::new().unwrap();
+        let (registry, job_store) = build_registry(dir.path().to_str().unwrap());
+        let namespace = Namespace::new(NAMESPACE).unwrap();
+
+        // Seed a tagged manifest (Digest + Tag links), then drain its push job.
+        let (content, media_type) = create_test_manifest(&registry, &namespace).await;
+        let digest = Digest::Sha256(sha256::hex(&content).into());
+        registry
+            .accept_put_manifest(
+                None,
+                None,
+                &namespace,
+                Reference::Tag("latest".to_string()),
+                media_type,
+                Cursor::new(content),
+            )
+            .await
+            .expect("seed tag push");
+        drain_one(&job_store).await;
+
+        // First digest delete: the revision exists and cascades to the `latest`
+        // tag, so it changed local state => one delete job. Drain it so the dedup
+        // index clears and cannot mask the gate on the second delete.
+        let baseline = pending(&job_store).await;
+        registry
+            .delete_manifest(None, None, &namespace, &Reference::Digest(digest.clone()))
+            .await
+            .expect("delete existing revision");
+        assert_eq!(
+            pending(&job_store).await,
+            baseline + 1,
+            "deleting an existing revision must enqueue one delete job"
+        );
+        drain_one(&job_store).await;
+
+        // Second digest delete with the queue EMPTY: the revision link is gone AND
+        // no tag points at the digest (the cascade removed `latest`), so
+        // `existed_before` is false and the gate suppresses the re-dispatch. A
+        // broken gate would freshly enqueue (nothing pending to coalesce against).
+        let after = pending(&job_store).await;
+        let _ = registry
+            .delete_manifest(None, None, &namespace, &Reference::Digest(digest))
+            .await;
+        assert_eq!(
+            pending(&job_store).await,
+            after,
+            "a converged digest delete (revision gone, no pointing tags) must enqueue nothing"
+        );
+    }
+
     /// The dispatch gate is replication-only: a no-op tag replay (same
     /// tag->digest) still emits the webhook Events (`ManifestPush` +
     /// `TagCreate`) even though it enqueues no replication job.
