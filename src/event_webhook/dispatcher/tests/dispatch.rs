@@ -13,7 +13,7 @@ use crate::{
 };
 
 #[test]
-fn event_dispatcher_new_constructs_from_configs() {
+fn event_dispatcher_builder_constructs_from_configs() {
     let mut webhooks = HashMap::new();
     webhooks.insert(
         "hook1".to_string(),
@@ -40,7 +40,7 @@ fn event_dispatcher_new_constructs_from_configs() {
 }
 
 #[test]
-fn event_dispatcher_new_empty_configs() {
+fn event_dispatcher_builder_empty_configs() {
     let webhooks = HashMap::new();
     let dispatcher = super::super::EventDispatcher::builder()
         .webhooks(webhooks)
