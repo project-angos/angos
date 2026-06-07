@@ -204,14 +204,16 @@ impl ReplicationJobHandler {
 
     /// Re-resolves the current local target for a push payload: a tag is re-read
     /// at execute-time (latest-wins), returning both its digest and its
-    /// `created_at` (the local version timestamp); a tag-less job uses the
-    /// payload digest and has no timestamp.
+    /// `created_at` (the local version timestamp); a tag-less job uses the payload
+    /// digest (content-addressed, so no timestamp) but still confirms the revision
+    /// link is present.
     ///
-    /// Returns `Ok(None)` when the tag no longer exists locally
-    /// ([`MetadataStoreError::ReferenceNotFound`]): a coalesced push whose tag
-    /// was deleted out from under it has already converged, so the caller treats
-    /// it as a no-op success rather than dead-lettering. Any other read error
-    /// still surfaces as `Err`.
+    /// Returns `Ok(None)` when the target no longer exists locally
+    /// ([`MetadataStoreError::ReferenceNotFound`]) — a tag deleted out from under a
+    /// coalesced push, or a by-digest revision deleted since the job was enqueued:
+    /// the system has already converged, so the caller treats it as a no-op success
+    /// rather than reading a now-absent manifest blob and dead-lettering. Any other
+    /// read error still surfaces as `Err`.
     async fn resolve_current_digest(
         &self,
         namespace: &Namespace,
@@ -230,15 +232,30 @@ impl ReplicationJobHandler {
                 ))),
             }
         } else {
-            let digest = payload.digest.as_deref().ok_or_else(|| {
+            let digest_str = payload.digest.as_deref().ok_or_else(|| {
                 Error::Storage(format!(
                     "tag-less push for '{namespace}' has no digest to resolve"
                 ))
             })?;
-            digest
+            let digest: Digest = digest_str
                 .parse()
-                .map(|digest| Some((digest, None)))
-                .map_err(|e| Error::Storage(format!("invalid digest '{digest}': {e}")))
+                .map_err(|e| Error::Storage(format!("invalid digest '{digest_str}': {e}")))?;
+            // Symmetric to the tag branch: a by-digest revision deleted out from
+            // under this push (a coalesced or retried job whose revision is gone)
+            // has already converged, so a missing revision link is a no-op success
+            // rather than a dead-letter on the subsequent blob read. A
+            // content-addressed digest carries no local version timestamp.
+            match self
+                .metadata_store
+                .read_link(namespace.as_ref(), &LinkKind::Digest(digest.clone()), false)
+                .await
+            {
+                Ok(_) => Ok(Some((digest, None))),
+                Err(MetadataStoreError::ReferenceNotFound) => Ok(None),
+                Err(e) => Err(Error::Storage(format!(
+                    "failed to read revision '{digest}' in '{namespace}': {e}"
+                ))),
+            }
         }
     }
 
@@ -294,13 +311,15 @@ impl ReplicationJobHandler {
             let Some((digest, created_at)) =
                 self.resolve_current_digest(&namespace, payload).await?
             else {
-                // The tag was deleted out from under this push (a coalesced push
-                // whose tag is gone): the system has already converged, so this
-                // is a no-op success — not a `pushed`/`superseded`/`failed`.
+                // The target was deleted out from under this push — a coalesced
+                // push whose tag is gone, or a by-digest revision deleted since the
+                // job was enqueued: the system has already converged, so this is a
+                // no-op success, not a `pushed`/`superseded`/`failed`.
                 debug!(
                     namespace = %namespace,
                     tag = ?payload.tag,
-                    "Push tag no longer exists locally; treating as converged no-op"
+                    digest = ?payload.digest,
+                    "Push target no longer exists locally; treating as converged no-op"
                 );
                 return Ok(());
             };
@@ -1504,6 +1523,73 @@ mod tests {
             .execute(&envelope)
             .await
             .expect("a deleted-tag push must be a converged no-op success");
+        assert!(
+            tx.mutations.is_empty(),
+            "a no-op push returns an empty transaction"
+        );
+        assert_eq!(
+            push_total(downstream, "failed"),
+            failed_before,
+            "a converged no-op must NOT increment the failed counter"
+        );
+        assert_eq!(
+            push_total(downstream, "pushed"),
+            pushed_before,
+            "a converged no-op must NOT increment the pushed counter"
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_tagless_push_with_deleted_revision_is_noop_success() {
+        crate::metrics_provider::init_for_tests();
+        let downstream = "metric-deleted-revision";
+
+        let dir = TempDir::new().unwrap();
+        let root = dir.path().to_str().unwrap();
+        let object: Arc<dyn ObjectStore> =
+            Arc::new(StorageFsBackend::builder().root_dir(root).build().unwrap());
+        let executor = build_test_fs_executor(root, false);
+        let store = build_store(object, executor);
+        let metadata_store = Arc::new(
+            MetadataStore::builder()
+                .store(store.clone())
+                .link_cache_ttl(0)
+                .access_time_debounce_secs(0)
+                .build()
+                .unwrap(),
+        );
+        let blob_store = Arc::new(BlobStore::builder().store(store.clone()).build().unwrap());
+
+        // No revision link seeded for the payload digest: `resolve_current_digest`
+        // reads `ReferenceNotFound` for the by-digest revision and short-circuits.
+        // The downstream points at an unreachable URL, so a wrongful push (or a
+        // blob read of the absent revision) would error instead of succeeding.
+        let mut repositories = HashMap::new();
+        repositories.insert(
+            REPO.to_string(),
+            repository_with_named_downstream(downstream, downstream_client("http://127.0.0.1:1")),
+        );
+        let resolver = Arc::new(RepositoryResolver::new(Arc::new(repositories)).unwrap());
+
+        let handler = ReplicationJobHandler::builder()
+            .resolver(resolver)
+            .blob_store(blob_store)
+            .metadata_store(metadata_store)
+            .build()
+            .unwrap();
+
+        let failed_before = push_total(downstream, "failed");
+        let pushed_before = push_total(downstream, "pushed");
+
+        // Tag-less push (by digest): no tag, only the payload digest.
+        let mut payload = sample_payload();
+        payload.downstream = downstream.to_string();
+        payload.tag = None;
+        let envelope = build_envelope(&payload).unwrap();
+        let tx = handler
+            .execute(&envelope)
+            .await
+            .expect("a deleted-revision by-digest push must be a converged no-op success");
         assert!(
             tx.mutations.is_empty(),
             "a no-op push returns an empty transaction"
