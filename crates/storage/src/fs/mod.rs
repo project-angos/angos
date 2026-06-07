@@ -138,7 +138,7 @@ impl Backend {
             .append(true)
             .open(&path)
             .await
-            .map_err(|e| backend_error("could not open", &path, &e))?;
+            .map_err(|e| backend_error("open", &path, &e))?;
         let size = file.metadata().await?.len();
         Ok((file, size))
     }
