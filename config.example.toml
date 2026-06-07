@@ -17,7 +17,7 @@ client_auth = "required"
 [global]
 max_concurrent_requests = 4
 max_concurrent_cache_jobs = 4
-max_concurrent_replication_jobs = 4   # worker concurrency for replication jobs (must be > 0)
+max_concurrent_replication_jobs = 4   # replication-job concurrency for angos worker and the in-process drain (must be > 0)
 update_pull_time = false
 
 # Optional: Global access policy that applies to all repositories
