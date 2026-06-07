@@ -4,12 +4,11 @@ use tracing::instrument;
 use hyper::header::LINK;
 
 use crate::{
-    oci::{Descriptor, Digest, Namespace, OCI_MANIFEST_SCHEMA_VERSION},
+    oci::{Descriptor, Digest, Namespace, OCI_INDEX_MEDIA_TYPE, OCI_MANIFEST_SCHEMA_VERSION},
     registry::{APPLICATION_JSON, Error, HeaderMap, JsonResponse, Registry, ResponseHeaders},
 };
 
 const OCI_FILTERS_APPLIED: &str = "OCI-Filters-Applied";
-const OCI_INDEX_MEDIA_TYPE: &str = "application/vnd.oci.image.index.v1+json";
 
 #[derive(Serialize, Debug)]
 #[serde(rename_all = "camelCase")]

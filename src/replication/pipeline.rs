@@ -18,7 +18,7 @@ use serde_json::{Value, json};
 use tracing::{debug, info, instrument, warn};
 
 use crate::{
-    oci::{Digest, Reference},
+    oci::{Digest, OCI_INDEX_MEDIA_TYPE, OCI_MANIFEST_MEDIA_TYPE, Reference},
     registry::{
         Error as RegistryError, ParsedManifestDigests,
         blob_ownership::BlobOwnership,
@@ -30,11 +30,6 @@ use crate::{
     replication::Error,
     util::sha256,
 };
-
-/// Media type of an OCI image index (the referrers fallback tag body).
-const OCI_INDEX_MEDIA_TYPE: &str = "application/vnd.oci.image.index.v1+json";
-/// Media type of an OCI image manifest (used as the default for referrer descriptors).
-const OCI_MANIFEST_MEDIA_TYPE: &str = "application/vnd.oci.image.manifest.v1+json";
 
 /// Outcome of a successful replication push or delete.
 ///
