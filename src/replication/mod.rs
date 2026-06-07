@@ -19,5 +19,4 @@ pub use crate::replication::handler::{
     REPLICATION_DELETE_MANIFEST_KIND, REPLICATION_PUSH_MANIFEST_KIND, REPLICATION_QUEUE,
     ReplicationJobHandler, ReplicationPushPayload, build_envelope,
 };
-pub use crate::replication::pipeline::PushOutcome;
 pub use crate::replication::wire::{REPLICATION_SUPERSEDED_CODE, X_ANGOS_SOURCE_TIMESTAMP};

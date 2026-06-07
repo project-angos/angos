@@ -31,7 +31,10 @@ use crate::{
         metadata_store::{Error as MetadataStoreError, MetadataStore, link_kind::LinkKind},
         repository_resolver::RepositoryResolver,
     },
-    replication::{PushOutcome, ReplicationDownstream, pipeline},
+    replication::{
+        ReplicationDownstream,
+        pipeline::{self, PushOutcome},
+    },
 };
 
 /// Single queue carrying every replication job; the downstream is encoded in the
