@@ -96,7 +96,7 @@ pub struct Command {
 /// reconciliation checker, within the scrub CLI run.
 struct ReplicationDrain {
     consumer: Arc<JobStore>,
-    handler: Arc<dyn JobHandler>,
+    handler: Box<dyn JobHandler>,
 }
 
 impl Command {
@@ -186,7 +186,7 @@ impl Command {
             })?;
         Ok(ReplicationDrain {
             consumer,
-            handler: Arc::new(handler),
+            handler: Box::new(handler),
         })
     }
 
