@@ -92,23 +92,6 @@ pub async fn push_manifest(
 ) -> Result<PushOutcome, Error> {
     let parsed = parse_manifest_digests(&body, media_type.as_ref()).map_err(Error::Registry)?;
 
-    // The PUT content type is the explicit `media_type` override when given, else
-    // the manifest body's own declared mediaType (surfaced by the parse above so
-    // the body is parsed once), else the type recorded on the local revision link
-    // when the manifest was stored. A body may legitimately omit `mediaType` while
-    // the original push carried it in the `Content-Type` header (which
-    // `store_manifest` records on the link), and the receiver rejects a manifest
-    // PUT that carries no `Content-Type` — so recovering it from the link keeps a
-    // body-typeless manifest replicable instead of stalling on a 400.
-    let effective_media_type = match media_type.or_else(|| parsed.media_type.clone()) {
-        Some(media_type) => Some(media_type),
-        None => metadata_store
-            .read_link(namespace, &LinkKind::Digest(digest.clone()), false)
-            .await
-            .ok()
-            .and_then(|link| link.media_type),
-    };
-
     // 1. Recurse into child manifests FIRST (image index / manifest list). The
     //    parent index must not land on the downstream before its children.
     for child in &parsed.manifests {
@@ -184,6 +167,24 @@ pub async fn push_manifest(
     // subject-bearing manifest can reach it — retain a copy for that path alone
     // and move the body straight into the PUT on the common (no-subject) path.
     let fallback_body = parsed.subject.is_some().then(|| body.clone());
+
+    // The PUT content type is the explicit `media_type` override when given, else
+    // the manifest body's own declared mediaType (surfaced by the parse above so
+    // the body is parsed once), else the type recorded on the local revision link
+    // when the manifest was stored. A body may legitimately omit `mediaType` while
+    // the original push carried it in the `Content-Type` header (which
+    // `store_manifest` records on the link), and the receiver rejects a manifest
+    // PUT that carries no `Content-Type` — so recovering it from the link keeps a
+    // body-typeless manifest replicable instead of stalling on a 400. Resolved
+    // here, after the converged-skip, so a skipped push never does the link read.
+    let effective_media_type = match media_type.or_else(|| parsed.media_type.clone()) {
+        Some(media_type) => Some(media_type),
+        None => metadata_store
+            .read_link(namespace, &LinkKind::Digest(digest.clone()), false)
+            .await
+            .ok()
+            .and_then(|link| link.media_type),
+    };
 
     let result = downstream
         .put_manifest(&location, effective_media_type.as_deref(), body, source_ts)
