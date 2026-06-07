@@ -87,21 +87,18 @@ pub async fn push_manifest(
     metadata_store: &Arc<MetadataStore>,
     namespace: &str,
     digest: &Digest,
-    media_type: Option<&str>,
+    media_type: Option<String>,
     tag: Option<&str>,
     body: Vec<u8>,
     max_concurrent_pushes: usize,
     source_ts: Option<&str>,
 ) -> Result<PushOutcome, Error> {
-    let parsed = parse_manifest_digests(&body, media_type.map(ToString::to_string).as_ref())
-        .map_err(Error::Registry)?;
+    let parsed = parse_manifest_digests(&body, media_type.as_ref()).map_err(Error::Registry)?;
 
     // The PUT content type is the explicit `media_type` override when given, else
     // the manifest body's own declared mediaType (surfaced by the parse above) —
     // so the body is parsed once, not again via a separate read.
-    let effective_media_type = media_type
-        .map(ToString::to_string)
-        .or_else(|| parsed.media_type.clone());
+    let effective_media_type = media_type.or_else(|| parsed.media_type.clone());
 
     // 1. Recurse into child manifests FIRST (image index / manifest list). The
     //    parent index must not land on the downstream before its children.
@@ -719,7 +716,7 @@ mod tests {
             &metadata_store,
             NAMESPACE,
             &manifest_digest,
-            Some("application/vnd.oci.image.manifest.v1+json"),
+            Some("application/vnd.oci.image.manifest.v1+json".to_string()),
             Some("v1"),
             manifest_bytes,
             4,
@@ -823,7 +820,7 @@ mod tests {
             &metadata_store,
             NAMESPACE,
             &manifest_digest,
-            Some("application/vnd.oci.image.manifest.v1+json"),
+            Some("application/vnd.oci.image.manifest.v1+json".to_string()),
             Some("v1"),
             manifest_bytes,
             4,
@@ -880,7 +877,7 @@ mod tests {
             &metadata_store,
             NAMESPACE,
             &manifest_digest,
-            Some("application/vnd.oci.image.manifest.v1+json"),
+            Some("application/vnd.oci.image.manifest.v1+json".to_string()),
             Some("v1"),
             manifest_bytes,
             4,
@@ -958,7 +955,7 @@ mod tests {
             &metadata_store,
             NAMESPACE,
             &index_digest,
-            Some("application/vnd.oci.image.index.v1+json"),
+            Some("application/vnd.oci.image.index.v1+json".to_string()),
             Some("v1"),
             index_bytes,
             4,
@@ -1056,7 +1053,7 @@ mod tests {
             &metadata_store,
             NAMESPACE,
             &manifest_digest,
-            Some("application/vnd.oci.image.manifest.v1+json"),
+            Some("application/vnd.oci.image.manifest.v1+json".to_string()),
             Some("v1"),
             manifest_bytes,
             4,
@@ -1159,7 +1156,7 @@ mod tests {
             &metadata_store,
             NAMESPACE,
             &manifest_digest,
-            Some("application/vnd.oci.image.manifest.v1+json"),
+            Some("application/vnd.oci.image.manifest.v1+json".to_string()),
             Some("v1"),
             manifest_bytes,
             4,
@@ -1217,7 +1214,7 @@ mod tests {
             &metadata_store,
             NAMESPACE,
             &manifest_digest,
-            Some("application/vnd.oci.image.manifest.v1+json"),
+            Some("application/vnd.oci.image.manifest.v1+json".to_string()),
             Some("v1"),
             manifest_bytes,
             4,
@@ -1261,7 +1258,7 @@ mod tests {
             &metadata_store,
             NAMESPACE,
             &manifest_digest,
-            Some("application/vnd.oci.image.manifest.v1+json"),
+            Some("application/vnd.oci.image.manifest.v1+json".to_string()),
             Some("v1"),
             manifest_bytes,
             4,
@@ -1328,7 +1325,7 @@ mod tests {
             &metadata_store,
             NAMESPACE,
             &manifest_digest,
-            Some("application/vnd.oci.image.manifest.v1+json"),
+            Some("application/vnd.oci.image.manifest.v1+json".to_string()),
             Some("v1"),
             manifest_bytes,
             4,
@@ -1378,7 +1375,7 @@ mod tests {
             &metadata_store,
             NAMESPACE,
             &manifest_digest,
-            Some("application/vnd.oci.image.manifest.v1+json"),
+            Some("application/vnd.oci.image.manifest.v1+json".to_string()),
             Some("v1"),
             manifest_bytes,
             4,
@@ -1419,7 +1416,7 @@ mod tests {
             &metadata_store,
             NAMESPACE,
             &manifest_digest,
-            Some("application/vnd.oci.image.manifest.v1+json"),
+            Some("application/vnd.oci.image.manifest.v1+json".to_string()),
             Some("v1"),
             manifest_bytes,
             4,
@@ -1461,7 +1458,7 @@ mod tests {
             &metadata_store,
             NAMESPACE,
             &manifest_digest,
-            Some("application/vnd.oci.image.manifest.v1+json"),
+            Some("application/vnd.oci.image.manifest.v1+json".to_string()),
             Some("v1"),
             manifest_bytes,
             4,
@@ -1497,7 +1494,7 @@ mod tests {
             &metadata_store,
             NAMESPACE,
             &manifest_digest,
-            Some("application/vnd.oci.image.manifest.v1+json"),
+            Some("application/vnd.oci.image.manifest.v1+json".to_string()),
             Some("v1"),
             manifest_bytes,
             4,
