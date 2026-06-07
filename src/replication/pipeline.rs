@@ -535,8 +535,8 @@ mod tests {
     use angos_tx_engine::store::Store;
 
     use crate::{
-        cache,
-        oci::{Digest, Reference},
+        cache, metrics_provider,
+        oci::{Digest, OCI_INDEX_MEDIA_TYPE, OCI_MANIFEST_MEDIA_TYPE, Reference},
         registry::{
             DOCKER_CONTENT_DIGEST, OCI_SUBJECT,
             blob_store::BlobStore,
@@ -609,7 +609,7 @@ mod tests {
     #[tokio::test]
     #[allow(clippy::too_many_lines)]
     async fn push_referrers_fallback_when_downstream_is_oci_1_0() {
-        crate::metrics_provider::init_for_tests();
+        metrics_provider::init_for_tests();
         let mock_server = MockServer::start().await;
         let dir = TempDir::new().unwrap();
         let (blob_store, metadata_store, store) = test_blob_store(dir.path().to_str().unwrap());
@@ -737,7 +737,7 @@ mod tests {
         // NOT be treated as "tag absent -> start fresh": that would PUT an index
         // built from an empty base and drop the subject's sibling referrers. The
         // push must surface the error so the durable job retries.
-        crate::metrics_provider::init_for_tests();
+        metrics_provider::init_for_tests();
         let mock_server = MockServer::start().await;
         let dir = TempDir::new().unwrap();
         let (blob_store, metadata_store, store) = test_blob_store(dir.path().to_str().unwrap());
@@ -840,7 +840,7 @@ mod tests {
 
     #[tokio::test]
     async fn no_referrers_fallback_when_downstream_indexes_subject() {
-        crate::metrics_provider::init_for_tests();
+        metrics_provider::init_for_tests();
         let mock_server = MockServer::start().await;
         let dir = TempDir::new().unwrap();
         let (blob_store, metadata_store, store) = test_blob_store(dir.path().to_str().unwrap());
@@ -892,7 +892,7 @@ mod tests {
 
     #[tokio::test]
     async fn index_lands_after_its_child_manifest() {
-        crate::metrics_provider::init_for_tests();
+        metrics_provider::init_for_tests();
         let mock_server = MockServer::start().await;
         let dir = TempDir::new().unwrap();
         let (blob_store, metadata_store, store) = test_blob_store(dir.path().to_str().unwrap());
@@ -979,7 +979,7 @@ mod tests {
         // pipeline offers it as the mount `from`.
         const SIBLING: &str = "other/repo";
 
-        crate::metrics_provider::init_for_tests();
+        metrics_provider::init_for_tests();
         let mock_server = MockServer::start().await;
         let dir = TempDir::new().unwrap();
         let (blob_store, metadata_store, store) = test_blob_store(dir.path().to_str().unwrap());
@@ -1075,7 +1075,7 @@ mod tests {
         // must fall back to a normal upload rather than failing the push.
         const SIBLING: &str = "other/repo";
 
-        crate::metrics_provider::init_for_tests();
+        metrics_provider::init_for_tests();
         let mock_server = MockServer::start().await;
         let dir = TempDir::new().unwrap();
         let (blob_store, metadata_store, store) = test_blob_store(dir.path().to_str().unwrap());
@@ -1191,7 +1191,7 @@ mod tests {
 
     #[tokio::test]
     async fn push_manifest_stamps_source_timestamp_header() {
-        crate::metrics_provider::init_for_tests();
+        metrics_provider::init_for_tests();
         let mock_server = MockServer::start().await;
         let dir = TempDir::new().unwrap();
         let (blob_store, metadata_store, store) = test_blob_store(dir.path().to_str().unwrap());
@@ -1236,7 +1236,7 @@ mod tests {
         // target tag to THIS digest, the manifest PUT is skipped. Mount ONLY a
         // HEAD returning the matching digest; deliberately mount NO manifest PUT
         // mock, so a wrongly-issued PUT would 404 and fail the push.
-        crate::metrics_provider::init_for_tests();
+        metrics_provider::init_for_tests();
         let mock_server = MockServer::start().await;
         let dir = TempDir::new().unwrap();
         let (blob_store, metadata_store, store) = test_blob_store(dir.path().to_str().unwrap());
@@ -1279,7 +1279,7 @@ mod tests {
         // matches THIS digest) must NOT re-push the referrers fallback: the
         // original push created it for OCI-1.0, and OCI-1.1 auto-indexes. The
         // fallback-tag PUT is mounted with expect(0), so any re-push fails the test.
-        crate::metrics_provider::init_for_tests();
+        metrics_provider::init_for_tests();
         let mock_server = MockServer::start().await;
         let dir = TempDir::new().unwrap();
         let (blob_store, metadata_store, store) = test_blob_store(dir.path().to_str().unwrap());
@@ -1343,7 +1343,7 @@ mod tests {
     async fn push_manifest_puts_when_downstream_holds_a_different_digest() {
         // HEAD returns a DIFFERENT digest (tag moved / divergence): the PUT must
         // still run so LWW on the receiver can arbitrate.
-        crate::metrics_provider::init_for_tests();
+        metrics_provider::init_for_tests();
         let mock_server = MockServer::start().await;
         let dir = TempDir::new().unwrap();
         let (blob_store, metadata_store, store) = test_blob_store(dir.path().to_str().unwrap());
@@ -1395,7 +1395,7 @@ mod tests {
         // downstream (HEAD 404 — the common first-replication case), `is_ok_and`
         // is false, so the manifest PUT still runs. Mount NO HEAD mock, so wiremock
         // answers HEAD with a default 404; mount the PUT with `.expect(1)`.
-        crate::metrics_provider::init_for_tests();
+        metrics_provider::init_for_tests();
         let mock_server = MockServer::start().await;
         let dir = TempDir::new().unwrap();
         let (blob_store, metadata_store, store) = test_blob_store(dir.path().to_str().unwrap());
@@ -1438,7 +1438,7 @@ mod tests {
         // top-level `mediaType`. Without recovering the type from the local
         // revision link, the PUT would carry NO `Content-Type` and the receiver
         // rejects it 400. Assert the PUT instead carries the link's stored type.
-        crate::metrics_provider::init_for_tests();
+        metrics_provider::init_for_tests();
         let mock_server = MockServer::start().await;
         let dir = TempDir::new().unwrap();
         let (blob_store, metadata_store, store) = test_blob_store(dir.path().to_str().unwrap());
@@ -1496,8 +1496,91 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn push_index_recovers_typeless_child_content_type_from_link() {
+        // The child-recursion counterpart of the test above: a CHILD manifest of
+        // an index may itself omit a top-level `mediaType`. The child is pushed
+        // by digest (before the parent index), with the production `None`
+        // override, so its PUT must carry the Content-Type recovered from the
+        // child's revision link — otherwise the receiver 400s and the index
+        // never lands.
+        metrics_provider::init_for_tests();
+        let mock_server = MockServer::start().await;
+        let dir = TempDir::new().unwrap();
+        let (blob_store, metadata_store, store) = test_blob_store(dir.path().to_str().unwrap());
+
+        // A typeless child manifest referenced by a (typed) image index.
+        let child = json!({ "schemaVersion": 2, "layers": [] });
+        let child_bytes = serde_json::to_vec(&child).unwrap();
+        let child_digest = put_blob_direct(&store, &child_bytes).await;
+        let index = json!({
+            "schemaVersion": 2,
+            "mediaType": OCI_INDEX_MEDIA_TYPE,
+            "manifests": [{
+                "mediaType": OCI_MANIFEST_MEDIA_TYPE,
+                "digest": child_digest.to_string(),
+                "size": child_bytes.len(),
+            }],
+        });
+        let index_bytes = serde_json::to_vec(&index).unwrap();
+        let index_digest = put_blob_direct(&store, &index_bytes).await;
+
+        // Seed ONLY the child's revision link with its stored media type.
+        metadata_store
+            .update_links(
+                NAMESPACE,
+                &[LinkOperation::create_with_media_type(
+                    LinkKind::Digest(child_digest.clone()),
+                    child_digest.clone(),
+                    Some(OCI_MANIFEST_MEDIA_TYPE.to_string()),
+                )],
+            )
+            .await
+            .unwrap();
+
+        // The child PUT (by digest) must carry the recovered Content-Type.
+        Mock::given(method("PUT"))
+            .and(path(format!("/v2/{NAMESPACE}/manifests/{child_digest}")))
+            .and(header("Content-Type", OCI_MANIFEST_MEDIA_TYPE))
+            .respond_with(
+                ResponseTemplate::new(201)
+                    .insert_header(DOCKER_CONTENT_DIGEST, child_digest.to_string().as_str()),
+            )
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+        // The parent index PUT (by tag) carries the index body's own mediaType.
+        Mock::given(method("PUT"))
+            .and(path(format!("/v2/{NAMESPACE}/manifests/v1")))
+            .and(header("Content-Type", OCI_INDEX_MEDIA_TYPE))
+            .respond_with(
+                ResponseTemplate::new(201)
+                    .insert_header(DOCKER_CONTENT_DIGEST, index_digest.to_string().as_str()),
+            )
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        push_manifest(
+            &downstream_client(&mock_server.uri()),
+            &blob_store,
+            &metadata_store,
+            NAMESPACE,
+            &index_digest,
+            None,
+            Some("v1"),
+            index_bytes,
+            4,
+            None,
+        )
+        .await
+        .expect("a typeless child must recover its Content-Type and the index must land");
+
+        drop(mock_server);
+    }
+
+    #[tokio::test]
     async fn push_manifest_treats_lww_superseded_409_as_success() {
-        crate::metrics_provider::init_for_tests();
+        metrics_provider::init_for_tests();
         let mock_server = MockServer::start().await;
         let dir = TempDir::new().unwrap();
         let (blob_store, metadata_store, store) = test_blob_store(dir.path().to_str().unwrap());
@@ -1537,7 +1620,7 @@ mod tests {
 
     #[tokio::test]
     async fn push_manifest_propagates_immutable_409_as_error() {
-        crate::metrics_provider::init_for_tests();
+        metrics_provider::init_for_tests();
         let mock_server = MockServer::start().await;
         let dir = TempDir::new().unwrap();
         let (blob_store, metadata_store, store) = test_blob_store(dir.path().to_str().unwrap());
@@ -1576,7 +1659,7 @@ mod tests {
 
     #[tokio::test]
     async fn delete_manifest_stamps_header_and_distinguishes_superseded() {
-        crate::metrics_provider::init_for_tests();
+        metrics_provider::init_for_tests();
         let mock_server = MockServer::start().await;
 
         // A delete carrying the source-timestamp header; respond with an
@@ -1606,7 +1689,7 @@ mod tests {
 
     #[tokio::test]
     async fn delete_manifest_propagates_non_superseded_409_as_error() {
-        crate::metrics_provider::init_for_tests();
+        metrics_provider::init_for_tests();
         let mock_server = MockServer::start().await;
 
         Mock::given(method("DELETE"))
