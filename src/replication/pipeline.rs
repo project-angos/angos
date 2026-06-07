@@ -155,26 +155,28 @@ pub async fn push_manifest(
     //     receiver-side no-op dispatch gate breaks cycles; this just avoids one
     //     wasted PUT once converged). Probe the target reference: if the
     //     downstream already resolves it to THIS digest, it is converged, so skip
-    //     the manifest PUT (and the referrers fallback — see the converged
-    //     branch below).
-    let already_present = downstream
-        .head_manifest(&[], &location)
-        .await
-        .is_ok_and(|(_, downstream_digest, _)| &downstream_digest == digest);
-
-    if already_present {
+    //     the manifest PUT.
+    //
+    //     Only a manifest WITHOUT a subject may take this skip. A subject-bearing
+    //     manifest must always run the PUT below, because the PUT's `OCI-Subject`
+    //     response is what tells us whether the downstream auto-indexed the
+    //     subject (OCI-1.1) or still needs the referrers fallback tag (OCI-1.0):
+    //     a converged primary does NOT imply the fallback landed — the original
+    //     push's fallback PUT can fail after the primary succeeded, and skipping
+    //     here would strand the referrer while the job reports success. The PUT is
+    //     idempotent and a referrer manifest is small, so re-issuing it is cheap.
+    if parsed.subject.is_none()
+        && downstream
+            .head_manifest(&[], &location)
+            .await
+            .is_ok_and(|(_, downstream_digest, _)| &downstream_digest == digest)
+    {
         info!(
             namespace,
             %digest,
             ?tag,
             "Downstream already holds this manifest; skipping PUT (converged)"
         );
-        // Skip the referrers fallback on the converged path. The fallback tag an
-        // OCI-1.0 downstream needs (`<alg>-<hash>`, gated on a missing
-        // `OCI-Subject`) is already present from the non-converged push, and an
-        // OCI-1.1 downstream auto-indexes the subject. Running it here only
-        // re-merges a redundant index and materialises a stray fallback tag on an
-        // OCI-1.1 peer that already indexes the subject.
         return Ok(PushOutcome::Pushed);
     }
 
@@ -1274,19 +1276,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn no_referrers_fallback_on_converged_path() {
-        // A subject-bearing manifest already converged on the downstream (HEAD
-        // matches THIS digest) must NOT re-push the referrers fallback: the
-        // original push created it for OCI-1.0, and OCI-1.1 auto-indexes. The
-        // fallback-tag PUT is mounted with expect(0), so any re-push fails the test.
+    async fn converged_subject_manifest_still_pushes_referrers_fallback() {
+        // A subject-bearing manifest the downstream ALREADY holds must NOT take
+        // the converged HEAD-skip. The original push's primary PUT can land while
+        // its referrers-fallback PUT fails transiently; a blanket converged-skip
+        // on the next attempt would then never retry the fallback, stranding the
+        // referrer while the job reports success. So the primary is re-PUT
+        // (idempotent) and, on an OCI-1.0 downstream (no `OCI-Subject` on the PUT
+        // response), the referrers fallback is re-pushed.
         metrics_provider::init_for_tests();
         let mock_server = MockServer::start().await;
         let dir = TempDir::new().unwrap();
         let (blob_store, metadata_store, store) = test_blob_store(dir.path().to_str().unwrap());
 
         let subject = put_blob_direct(&store, b"subject-bytes").await;
-        // Config-less subject manifest, so the converged push has no referenced
-        // blob to probe; only the referrers fallback would (wrongly) re-run.
+        // Config-less subject manifest, so the push has no referenced blob to
+        // probe; only the primary manifest and the referrers fallback are pushed.
         let manifest = json!({
             "schemaVersion": 2,
             "mediaType": "application/vnd.oci.image.manifest.v1+json",
@@ -1300,7 +1305,10 @@ mod tests {
         let manifest_bytes = serde_json::to_vec(&manifest).unwrap();
         let manifest_digest = put_blob_direct(&store, &manifest_bytes).await;
 
-        // The manifest is already converged: HEAD by tag resolves to THIS digest.
+        // The downstream already resolves the tag to THIS digest (the converged
+        // state a prior attempt's primary PUT left behind). A subject-bearing
+        // manifest bypasses the HEAD-skip, so the HEAD is never consulted; mounting
+        // it (no `.expect()`) documents the converged state without requiring it.
         Mock::given(method("HEAD"))
             .and(path(format!("/v2/{NAMESPACE}/manifests/v1")))
             .respond_with(
@@ -1311,12 +1319,30 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        // The fallback tag must NOT be touched on the converged path.
+        // The primary PUT is re-issued (idempotent) and returns NO `OCI-Subject`,
+        // i.e. an OCI-1.0 downstream that does not auto-index the subject.
+        Mock::given(method("PUT"))
+            .and(path(format!("/v2/{NAMESPACE}/manifests/v1")))
+            .respond_with(
+                ResponseTemplate::new(201)
+                    .insert_header(DOCKER_CONTENT_DIGEST, manifest_digest.to_string().as_str()),
+            )
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        // The referrers fallback index is fetched (absent -> 404 -> start fresh)
+        // and PUT — proving the fallback is not stranded by the converged primary.
         let fallback_tag = format!("{}-{}", subject.algorithm(), subject.hash());
+        Mock::given(method("GET"))
+            .and(path(format!("/v2/{NAMESPACE}/manifests/{fallback_tag}")))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&mock_server)
+            .await;
         Mock::given(method("PUT"))
             .and(path(format!("/v2/{NAMESPACE}/manifests/{fallback_tag}")))
             .respond_with(ResponseTemplate::new(201))
-            .expect(0)
+            .expect(1)
             .mount(&mock_server)
             .await;
 
@@ -1326,16 +1352,17 @@ mod tests {
             &metadata_store,
             NAMESPACE,
             &manifest_digest,
-            Some("application/vnd.oci.image.manifest.v1+json".to_string()),
+            None,
             Some("v1"),
             manifest_bytes,
             4,
             None,
         )
         .await
-        .expect("converged push must succeed");
+        .expect("a converged subject-bearing manifest must re-push the referrers fallback");
 
-        // `.expect(0)` on the fallback PUT (no re-push on the converged path).
+        // `.expect(1)` on both the primary PUT and the fallback PUT (verified on
+        // drop) proves the converged HEAD-skip was bypassed and the fallback ran.
         drop(mock_server);
     }
 
