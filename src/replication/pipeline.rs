@@ -20,7 +20,8 @@ use tracing::{debug, info, instrument, warn};
 use crate::{
     oci::{Digest, Reference},
     registry::{
-        Error as RegistryError, ParsedManifestDigests, blob_ownership::BlobOwnership,
+        Error as RegistryError, ParsedManifestDigests,
+        blob_ownership::BlobOwnership,
         blob_store::BlobStore,
         metadata_store::{MetadataStore, link_kind::LinkKind},
         parse_manifest_digests,
@@ -545,7 +546,9 @@ mod tests {
             DOCKER_CONTENT_DIGEST, OCI_SUBJECT,
             blob_store::BlobStore,
             manifest::DEFAULT_MAX_MANIFEST_SIZE_BYTES,
-            metadata_store::{BlobIndexOperation, LinkOperation, MetadataStore, link_kind::LinkKind},
+            metadata_store::{
+                BlobIndexOperation, LinkOperation, MetadataStore, link_kind::LinkKind,
+            },
             test_utils::{build_store, build_test_fs_executor, put_blob_direct},
         },
         registry_client::RegistryClient,
