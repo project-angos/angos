@@ -21,7 +21,9 @@ use crate::{
     oci::{Digest, Reference},
     registry::{
         Error as RegistryError, ParsedManifestDigests, blob_ownership::BlobOwnership,
-        blob_store::BlobStore, metadata_store::MetadataStore, parse_manifest_digests,
+        blob_store::BlobStore,
+        metadata_store::{MetadataStore, link_kind::LinkKind},
+        parse_manifest_digests,
     },
     registry_client::{DeleteManifestOutcome, NO_LOCAL_PREFIX, RegistryClient},
     replication::Error,
@@ -96,9 +98,21 @@ pub async fn push_manifest(
     let parsed = parse_manifest_digests(&body, media_type.as_ref()).map_err(Error::Registry)?;
 
     // The PUT content type is the explicit `media_type` override when given, else
-    // the manifest body's own declared mediaType (surfaced by the parse above) —
-    // so the body is parsed once, not again via a separate read.
-    let effective_media_type = media_type.or_else(|| parsed.media_type.clone());
+    // the manifest body's own declared mediaType (surfaced by the parse above so
+    // the body is parsed once), else the type recorded on the local revision link
+    // when the manifest was stored. A body may legitimately omit `mediaType` while
+    // the original push carried it in the `Content-Type` header (which
+    // `store_manifest` records on the link), and the receiver rejects a manifest
+    // PUT that carries no `Content-Type` — so recovering it from the link keeps a
+    // body-typeless manifest replicable instead of stalling on a 400.
+    let effective_media_type = match media_type.or_else(|| parsed.media_type.clone()) {
+        Some(media_type) => Some(media_type),
+        None => metadata_store
+            .read_link(namespace, &LinkKind::Digest(digest.clone()), false)
+            .await
+            .ok()
+            .and_then(|link| link.media_type),
+    };
 
     // 1. Recurse into child manifests FIRST (image index / manifest list). The
     //    parent index must not land on the downstream before its children.
@@ -531,7 +545,7 @@ mod tests {
             DOCKER_CONTENT_DIGEST, OCI_SUBJECT,
             blob_store::BlobStore,
             manifest::DEFAULT_MAX_MANIFEST_SIZE_BYTES,
-            metadata_store::{BlobIndexOperation, MetadataStore, link_kind::LinkKind},
+            metadata_store::{BlobIndexOperation, LinkOperation, MetadataStore, link_kind::LinkKind},
             test_utils::{build_store, build_test_fs_executor, put_blob_direct},
         },
         registry_client::RegistryClient,
@@ -1416,6 +1430,70 @@ mod tests {
 
         // `.expect(1)` on the PUT (verified on drop) proves the probe failed open
         // and the PUT ran.
+        drop(mock_server);
+    }
+
+    #[tokio::test]
+    async fn push_manifest_recovers_content_type_from_the_link_for_a_typeless_body() {
+        // Production always passes `None` as the media_type override (the handler
+        // reads only the blob body), and a manifest body may legitimately omit a
+        // top-level `mediaType`. Without recovering the type from the local
+        // revision link, the PUT would carry NO `Content-Type` and the receiver
+        // rejects it 400. Assert the PUT instead carries the link's stored type.
+        crate::metrics_provider::init_for_tests();
+        let mock_server = MockServer::start().await;
+        let dir = TempDir::new().unwrap();
+        let (blob_store, metadata_store, store) = test_blob_store(dir.path().to_str().unwrap());
+
+        // A body with NO top-level `mediaType`, so the parse surfaces `None`.
+        let manifest = json!({ "schemaVersion": 2, "layers": [] });
+        let manifest_bytes = serde_json::to_vec(&manifest).unwrap();
+        let manifest_digest = put_blob_direct(&store, &manifest_bytes).await;
+
+        // Seed the revision link with the type the original push carried in its
+        // `Content-Type` header (what `store_manifest` records on the link).
+        let media_type = "application/vnd.oci.image.manifest.v1+json";
+        metadata_store
+            .update_links(
+                NAMESPACE,
+                &[LinkOperation::create_with_media_type(
+                    LinkKind::Digest(manifest_digest.clone()),
+                    manifest_digest.clone(),
+                    Some(media_type.to_string()),
+                )],
+            )
+            .await
+            .unwrap();
+
+        // The PUT must carry the recovered Content-Type; without the link
+        // recovery the header is absent, this matcher never fires, and the
+        // `.expect(1)` fails on drop.
+        Mock::given(method("PUT"))
+            .and(path(format!("/v2/{NAMESPACE}/manifests/v1")))
+            .and(header("Content-Type", media_type))
+            .respond_with(
+                ResponseTemplate::new(201)
+                    .insert_header(DOCKER_CONTENT_DIGEST, manifest_digest.to_string().as_str()),
+            )
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        push_manifest(
+            &downstream_client(&mock_server.uri()),
+            &blob_store,
+            &metadata_store,
+            NAMESPACE,
+            &manifest_digest,
+            None,
+            Some("v1"),
+            manifest_bytes,
+            4,
+            None,
+        )
+        .await
+        .expect("a typeless body must recover its Content-Type from the revision link");
+
         drop(mock_server);
     }
 
