@@ -170,9 +170,9 @@ fn test_parse_mount_blob_with_malformed_from_is_rejected() {
 
 #[test]
 fn test_parse_start_upload_with_malformed_digest_is_rejected() {
-    // THE FIX: a present-but-malformed `?digest=` fails strict query parsing, so
-    // the route does not match and `handle_unknown_route` turns the POST into a
-    // 400 — rather than silently starting a 202 session that drops the digest.
+    // A present-but-malformed `?digest=` fails strict query parsing, so the route
+    // does not match and `handle_unknown_route` turns the POST into a 400 —
+    // rather than silently starting a 202 session that drops the digest.
     let uri: Uri = "/v2/myrepo/app/blobs/uploads?digest=not-a-digest"
         .parse()
         .unwrap();
