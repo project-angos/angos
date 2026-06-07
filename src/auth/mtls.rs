@@ -87,12 +87,105 @@ impl AuthMiddleware for MtlsValidator {
 
 #[cfg(test)]
 pub mod tests {
-    use std::sync::Arc;
+    use std::{
+        io::{self, Write},
+        sync::{Arc, Mutex},
+    };
 
     use hyper::{Request, StatusCode};
+    use tracing::Level;
+    use tracing_subscriber::fmt::MakeWriter;
 
     use super::*;
     use crate::test_fixtures::mtls::{cert_der, minimal_cert_der};
+
+    /// Collects tracing output into a shared buffer so a test can assert what
+    /// was emitted. Cloned per `make_writer` call; every clone appends to the
+    /// same buffer.
+    #[derive(Clone)]
+    struct LogCapture(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for LogCapture {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> MakeWriter<'a> for LogCapture {
+        type Writer = LogCapture;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// A malformed client certificate is logged server-side with the parse
+    /// error (for diagnostics) while the client only ever sees the generic
+    /// "Invalid certificate" — the internal detail must not leak into the
+    /// response. The current-thread runtime is built inside `with_default` so
+    /// the future runs on the thread the capturing subscriber is installed on.
+    ///
+    /// This is the ONLY test that drives `authenticate` to its
+    /// certificate-parse-error branch, and it must stay that way: `tracing`
+    /// caches callsite interest process-globally, so a second test hitting
+    /// that `error!` under a non-capturing subscriber could cache it as
+    /// "never" and make this log assertion flaky.
+    #[test]
+    fn malformed_certificate_is_logged_but_not_leaked_to_client() {
+        let buffer = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(Level::DEBUG)
+            .with_writer(LogCapture(Arc::clone(&buffer)))
+            .with_ansi(false)
+            .finish();
+
+        let result = tracing::subscriber::with_default(subscriber, || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .build()
+                .unwrap();
+            runtime.block_on(async {
+                let validator = MtlsValidator::new();
+                let peer_cert = PeerCertificate(Arc::new(vec![0u8; 100]));
+                let mut request = Request::builder().body(()).unwrap();
+                request.extensions_mut().insert(peer_cert);
+                let (parts, ()) = request.into_parts();
+                let mut identity = ClientIdentity::new(None);
+                validator.authenticate(&parts, &mut identity).await
+            })
+        });
+
+        // The client only ever sees the generic message; the raw parse error
+        // (e.g. "UnexpectedTag") must not leak into the response body.
+        match result.unwrap_err() {
+            Error::Unauthorized(msg) => {
+                assert_eq!(msg, "Invalid certificate");
+                let error = Error::Unauthorized(msg);
+                assert_eq!(error.status_code(), StatusCode::UNAUTHORIZED);
+                let body = error.as_json(None).to_string();
+                assert!(body.contains("Invalid certificate"));
+                assert!(
+                    !body.contains("UnexpectedTag"),
+                    "raw parse error leaked: {body}"
+                );
+                assert!(!body.contains("Malformed client certificate"));
+            }
+            err => panic!("expected Unauthorized, got {err:?}"),
+        }
+
+        // ...but the parse failure IS logged server-side for diagnostics.
+        let logs = String::from_utf8(buffer.lock().unwrap().clone()).unwrap();
+        assert!(
+            logs.contains("Failed to parse client certificate"),
+            "the parse error must be logged server-side; logs were: {logs}"
+        );
+        assert!(logs.contains("error="), "logs were: {logs}");
+        assert!(logs.contains("certificate_len="), "logs were: {logs}");
+    }
 
     #[tokio::test]
     async fn test_authenticate_no_certificate() {
@@ -145,34 +238,6 @@ pub mod tests {
         assert!(matches!(result.unwrap(), AuthResult::Authenticated));
         assert!(identity.certificate.common_names.is_empty());
         assert!(identity.certificate.organizations.is_empty());
-    }
-
-    #[tokio::test]
-    async fn test_authenticate_with_malformed_certificate() {
-        let validator = MtlsValidator::new();
-        let invalid_cert = vec![0u8; 100];
-        let peer_cert = PeerCertificate(Arc::new(invalid_cert));
-
-        let mut request = Request::builder().body(()).unwrap();
-        request.extensions_mut().insert(peer_cert);
-        let (parts, ()) = request.into_parts();
-
-        let mut identity = ClientIdentity::new(None);
-
-        let result = validator.authenticate(&parts, &mut identity).await;
-
-        assert!(result.is_err());
-        match result.unwrap_err() {
-            Error::Unauthorized(msg) => {
-                let error = Error::Unauthorized(msg);
-                assert_eq!(error.status_code(), StatusCode::UNAUTHORIZED);
-                let body = error.as_json(None).to_string();
-                assert!(body.contains("Invalid certificate"));
-                assert!(!body.contains("UnexpectedTag"));
-                assert!(!body.contains("Malformed client certificate"));
-            }
-            err => panic!("expected Unauthorized, got {err:?}"),
-        }
     }
 
     #[test]
