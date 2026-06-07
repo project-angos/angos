@@ -605,36 +605,34 @@ impl Registry {
             return Ok(());
         };
 
-        // Distinguish a genuinely-absent tag from a transient read failure. A
-        // missing tag means nothing supersedes the incoming write, so we proceed.
-        // Any other error (storage/coordination/deserialization) must NOT silently
-        // disable LWW — collapsing those to "no local tag" would let an older
-        // replicated write overwrite a strictly-newer local tag during a backend
-        // hiccup. Surface them so the replicated write is refused and the sender
-        // retries instead of overwriting.
-        let local_created_at = match self
-            .metadata_store
-            .read_link(namespace, &LinkKind::Tag(tag.clone()), false)
-            .await
+        if let Some(created_at) = self
+            .link_supersedes(namespace, &LinkKind::Tag(tag.clone()), source_ts)
+            .await?
         {
-            Ok(link) => link.created_at,
-            Err(MetadataStoreError::ReferenceNotFound) => None,
-            Err(err) => return Err(Error::from(err)),
-        };
-
-        // No local tag, or no recorded creation time: nothing supersedes the
-        // incoming write.
-        let Some(local_created_at) = local_created_at else {
-            return Ok(());
-        };
-
-        if local_created_at > source_ts {
             return Err(Error::ReplicationSuperseded(format!(
-                "local tag '{tag}' (created {local_created_at}) is newer than the replicated source ({source_ts})"
+                "local tag '{tag}' (created {created_at}) is newer than the replicated source ({source_ts})"
             )));
         }
 
         Ok(())
+    }
+
+    /// `Some(created_at)` iff the local link's recorded creation time strictly
+    /// supersedes `source_ts`; `None` when the link is absent, has no
+    /// `created_at`, or is older-or-equal. A non-`ReferenceNotFound` read error
+    /// fails closed (Err) so LWW is never silently disabled by a backend hiccup.
+    async fn link_supersedes(
+        &self,
+        namespace: &Namespace,
+        link: &LinkKind,
+        source_ts: DateTime<Utc>,
+    ) -> Result<Option<DateTime<Utc>>, Error> {
+        let created_at = match self.metadata_store.read_link(namespace, link, false).await {
+            Ok(link) => link.created_at,
+            Err(MetadataStoreError::ReferenceNotFound) => return Ok(None),
+            Err(err) => return Err(Error::from(err)),
+        };
+        Ok(created_at.filter(|c| *c > source_ts))
     }
 
     /// Last-writer-wins guard for a replication-originated *digest* delete.
@@ -655,15 +653,7 @@ impl Registry {
         source_ts: DateTime<Utc>,
     ) -> Result<(), Error> {
         for tag in tags {
-            let created_at = match self.metadata_store.read_link(namespace, tag, false).await {
-                Ok(link) => link.created_at,
-                Err(MetadataStoreError::ReferenceNotFound) => continue,
-                Err(err) => return Err(Error::from(err)),
-            };
-            let Some(created_at) = created_at else {
-                continue;
-            };
-            if created_at > source_ts {
+            if let Some(created_at) = self.link_supersedes(namespace, tag, source_ts).await? {
                 return Err(Error::ReplicationSuperseded(format!(
                     "local {tag} (created {created_at}) is newer than the replicated digest delete ({source_ts})"
                 )));
