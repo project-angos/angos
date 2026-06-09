@@ -69,8 +69,11 @@ impl Executor {
 
     /// Builds the SAME envelope shape (queue, kind, `lock_key`) as the event path
     /// and lands it on the durable replication queue, so a reconcile-discovered
-    /// divergence coalesces with a pending event-path job on `enqueue`. Records
-    /// the `replication_reconcile_total` outcome (`enqueued` / `failed`).
+    /// push coalesces with a pending event-path push on `enqueue`. Deletes key
+    /// per deletion event (the `source_ts` is part of their `lock_key`), so a
+    /// prune delete never coalesces with — and can never stale-out — a pending
+    /// event-path delete. Records the `replication_reconcile_total` outcome
+    /// (`enqueued` / `failed`).
     async fn enqueue_replication(&self, payload: ReplicationPushPayload) -> Result<(), Error> {
         let envelope = build_envelope(&payload).map_err(|e| {
             record_reconcile_outcome("failed");

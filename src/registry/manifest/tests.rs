@@ -3136,6 +3136,78 @@ mod noop_suppression_tests {
         );
     }
 
+    /// delete → re-push → delete again: the second delete is a DISTINCT
+    /// deletion event (newer `source_ts`) and must get its own job instead of
+    /// dedup-dropping into the still-pending first delete. A delete cannot
+    /// re-derive its timestamp at execute time (the link is gone), so the
+    /// coalesced older job would ship the stale timestamp, lose receiver-side
+    /// LWW against the in-between re-push, and leave the downstream tag alive
+    /// until a reconcile.
+    #[tokio::test]
+    async fn second_delete_after_repush_enqueues_its_own_job() {
+        let dir = TempDir::new().unwrap();
+        let (registry, job_store) = build_registry(dir.path().to_str().unwrap());
+        let namespace = Namespace::new(NAMESPACE).unwrap();
+        let tag = "latest";
+
+        let (content, media_type) = create_test_manifest(&registry, &namespace).await;
+        registry
+            .accept_put_manifest(
+                None,
+                None,
+                &namespace,
+                Reference::Tag(tag.to_string()),
+                media_type.clone(),
+                Cursor::new(content.clone()),
+            )
+            .await
+            .expect("seed tag push");
+        drain_one(&job_store).await;
+        assert_eq!(pending(&job_store).await, 0, "queue drained");
+
+        // First delete: one pending delete job (deliberately left pending).
+        registry
+            .delete_manifest(None, None, &namespace, &Reference::Tag(tag.to_string()))
+            .await
+            .expect("first delete");
+        assert_eq!(
+            pending(&job_store).await,
+            1,
+            "the first delete must enqueue one job"
+        );
+
+        // Re-create the tag: a state change => one push job.
+        registry
+            .accept_put_manifest(
+                None,
+                None,
+                &namespace,
+                Reference::Tag(tag.to_string()),
+                media_type,
+                Cursor::new(content),
+            )
+            .await
+            .expect("re-push tag");
+        assert_eq!(
+            pending(&job_store).await,
+            2,
+            "re-creating the tag must enqueue one push job"
+        );
+
+        // Second delete while the FIRST delete is still pending: a distinct
+        // deletion event => its own job, not a silent dedup-drop.
+        registry
+            .delete_manifest(None, None, &namespace, &Reference::Tag(tag.to_string()))
+            .await
+            .expect("second delete");
+        assert_eq!(
+            pending(&job_store).await,
+            3,
+            "the second delete must enqueue its own job (per-event lock key), \
+             not coalesce into the pending older delete"
+        );
+    }
+
     /// A digest delete that removes only cascade tag links — the revision link
     /// already gone (an inconsistent local state) — still changed local state,
     /// so it MUST re-dispatch: the suppression gate keys on the cascade tags,

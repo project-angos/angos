@@ -76,33 +76,47 @@ pub struct ReplicationPushPayload {
 
 /// Builds the per-job `lock_key` for a replication payload.
 ///
-/// Format: `{REPLICATION_QUEUE}.{op}.{downstream}:{namespace}:{tag_or_digest}`.
-/// `op` is `push` or `delete`, derived from the payload kind, so a pending push
-/// and a delete for the same tag never coalesce into one another (a delete that
-/// folded into a still-pending push would be silently lost). Pushes still
-/// coalesce with pushes and deletes with deletes. The event path and the scrub
-/// checker build the SAME key so a pending push and a reconcile-discovered
-/// divergence coalesce on `enqueue`.
+/// Format: `{REPLICATION_QUEUE}.{op}.{downstream}:{namespace}:{tag_or_digest}`,
+/// with `@{source_ts}` appended for deletes. `op` is `push` or `delete`,
+/// derived from the payload kind, so a pending push and a delete for the same
+/// tag never coalesce into one another (a delete that folded into a
+/// still-pending push would be silently lost). Pushes coalesce with pushes on
+/// the bare reference — the handler re-resolves the current digest AND
+/// re-derives `source_ts` from the live link at execute time, so a coalesced
+/// push always ships the latest state. A delete cannot re-derive (the link is
+/// gone): its payload `source_ts` is authoritative for receiver-side
+/// last-writer-wins, so the timestamp is part of the key and every distinct
+/// deletion EVENT gets its own job. Without it, delete(t2 pending) → push(t3)
+/// → delete(t4) dedup-drops t4 into the pending t2 job, which loses LWW
+/// against the t3 push and leaves the downstream tag alive. The event path and
+/// the scrub checker build the SAME key so identical pending work coalesces on
+/// `enqueue` (retries of one event, repeat scrub discoveries of one
+/// divergence).
 ///
 /// `tag_or_digest` is the tag when set, else the digest. When both are absent
 /// (a degenerate payload) it falls back to an empty segment, which still yields
 /// a well-formed, namespace-scoped key.
 #[must_use]
 fn replication_lock_key(payload: &ReplicationPushPayload) -> String {
-    let op = if payload.kind == REPLICATION_DELETE_MANIFEST_KIND {
-        "delete"
-    } else {
-        "push"
-    };
     let tag_or_digest = payload
         .tag
         .as_deref()
         .or(payload.digest.as_deref())
         .unwrap_or("");
-    format!(
-        "{REPLICATION_QUEUE}.{op}.{}:{}:{}",
-        payload.downstream, payload.namespace, tag_or_digest
-    )
+    if payload.kind == REPLICATION_DELETE_MANIFEST_KIND {
+        format!(
+            "{REPLICATION_QUEUE}.delete.{}:{}:{}@{}",
+            payload.downstream,
+            payload.namespace,
+            tag_or_digest,
+            payload.source_ts.as_deref().unwrap_or("")
+        )
+    } else {
+        format!(
+            "{REPLICATION_QUEUE}.push.{}:{}:{}",
+            payload.downstream, payload.namespace, tag_or_digest
+        )
+    }
 }
 
 /// Builds a [`JobEnvelope`] from a [`ReplicationPushPayload`].
@@ -577,12 +591,38 @@ mod tests {
         );
         assert_eq!(
             replication_lock_key(&delete),
-            "replication.delete.eu-region:nginx:v1"
+            "replication.delete.eu-region:nginx:v1@2026-06-03T00:00:00Z"
         );
         assert_ne!(
             replication_lock_key(&push),
             replication_lock_key(&delete),
             "a push and a delete for the same tag must not coalesce"
+        );
+    }
+
+    /// Two deletes of the same tag with different `source_ts` are distinct
+    /// deletion EVENTS and must NOT coalesce: a delete cannot re-derive its
+    /// timestamp at execute time, so dedup-dropping a later delete into a
+    /// pending older one would ship the stale timestamp, lose receiver-side
+    /// LWW against an in-between re-push, and leave the downstream tag alive
+    /// until a reconcile. Retries of the SAME event (same timestamp) still
+    /// coalesce.
+    #[test]
+    fn lock_key_separates_distinct_delete_events() {
+        let mut first = sample_payload();
+        first.kind = REPLICATION_DELETE_MANIFEST_KIND.to_string();
+        let mut second = first.clone();
+        second.source_ts = Some("2026-06-03T00:01:00Z".to_string());
+
+        assert_ne!(
+            replication_lock_key(&first),
+            replication_lock_key(&second),
+            "deletes with different source_ts must each get their own job"
+        );
+        assert_eq!(
+            replication_lock_key(&first),
+            replication_lock_key(&first.clone()),
+            "a retry of the same deletion event must still coalesce"
         );
     }
 

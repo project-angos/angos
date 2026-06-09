@@ -709,8 +709,8 @@ async fn fresh_local_tag_push_enqueues_replication_job() {
 
 /// A tagged manifest delete to a namespace served by a matching downstream
 /// enqueues a replication delete job. The manifest is seeded via the
-/// non-dispatching `put_manifest` so no prior job exists for the lock key (the
-/// queue dedups push+delete jobs that share a `downstream:namespace:tag` key).
+/// non-dispatching `put_manifest` so the delete's job is the only one enqueued
+/// and the pending count below isolates it.
 #[tokio::test]
 async fn tag_delete_enqueues_replication_delete_job() {
     crate::metrics_provider::init_for_tests();
