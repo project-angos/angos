@@ -640,13 +640,22 @@ impl Registry {
     /// supersedes `source_ts`; `None` when the link is absent, has no
     /// `created_at`, or is older-or-equal. A non-`ReferenceNotFound` read error
     /// fails closed (Err) so LWW is never silently disabled by a backend hiccup.
+    ///
+    /// Reads bypass the link cache: this is a correctness gate, not a serving
+    /// read, and on a multi-replica deployment the per-process cache can lag a
+    /// sibling replica's write by up to its TTL — letting an older replicated
+    /// write overwrite the newer tag.
     async fn link_supersedes(
         &self,
         namespace: &Namespace,
         link: &LinkKind,
         source_ts: DateTime<Utc>,
     ) -> Result<Option<DateTime<Utc>>, Error> {
-        let created_at = match self.metadata_store.read_link(namespace, link, false).await {
+        let created_at = match self
+            .metadata_store
+            .read_link_reference(namespace, link)
+            .await
+        {
             Ok(link) => link.created_at,
             Err(MetadataStoreError::ReferenceNotFound) => return Ok(None),
             Err(err) => return Err(Error::from(err)),
@@ -689,7 +698,9 @@ impl Registry {
     /// enqueue the read is skipped entirely (restoring the replication-off cost).
     /// A read error other than `ReferenceNotFound` is surfaced, not collapsed to
     /// "absent", so a transient backend hiccup never silently suppresses a real
-    /// change.
+    /// change. The read bypasses the link cache, like [`Self::link_supersedes`]:
+    /// a stale cached link on a multi-replica deployment could wrongly suppress
+    /// a genuine change, stranding the downstream until a reconcile.
     async fn prior_link_if_replicated(
         &self,
         repository: Option<&Repository>,
@@ -702,7 +713,7 @@ impl Registry {
             if downstream.enqueues_for(namespace.as_ref()) {
                 return Some(
                     self.metadata_store
-                        .read_link(namespace, &LinkKind::from_reference(reference), false)
+                        .read_link_reference(namespace, &LinkKind::from_reference(reference))
                         .await,
                 );
             }

@@ -2370,6 +2370,66 @@ async fn accept_put_manifest_accepts_lww_equal_source_ts() {
 }
 
 #[tokio::test]
+async fn accept_put_manifest_lww_reads_bypass_the_link_cache() {
+    // On a multi-replica deployment the per-process link cache can lag a
+    // sibling replica's write by up to its TTL. The LWW gate must read the
+    // BACKEND link, not the cached one: here the cache still holds the seeded
+    // (older) link while the store carries a sibling's newer one, and a
+    // replicated push older than the sibling write must be superseded — a
+    // cached read would see only the stale created_at and let it through.
+    let test_case = FSRegistryTestCase::with_link_cache_ttl(300);
+    let registry = test_case.registry();
+    let namespace = &Namespace::new("lww-repo").unwrap();
+    let tag = "latest";
+
+    let (content, media_type) = seed_tag(registry, namespace, tag).await;
+    let created_at = local_created_at(registry, namespace, tag).await;
+
+    // The seed write warmed the cache with the original created_at; assert it
+    // so the stale-cache scenario stays honest if the write path ever changes.
+    let store = test_case.metadata_store();
+    let link = LinkKind::Tag(tag.to_string());
+    let cached = store
+        .cache_get(namespace.as_ref(), &link)
+        .await
+        .expect("seed write must warm the link cache");
+    assert_eq!(cached.created_at, Some(created_at));
+
+    // A sibling replica moves the tag's created_at forward BEHIND this
+    // process's cache (direct store write, no cache_put/cache_invalidate).
+    let sibling_ts = created_at + chrono::Duration::seconds(120);
+    let mut sibling = store
+        .read_link_reference(namespace.as_ref(), &link)
+        .await
+        .expect("seeded tag link");
+    sibling.created_at = Some(sibling_ts);
+    store
+        .write_link_reference(namespace.as_ref(), &link, &sibling)
+        .await
+        .expect("sibling write behind the cache");
+
+    // Incoming replicated push: newer than the cached created_at, older than
+    // the sibling's. Only an uncached gate read sees the sibling and rejects.
+    let incoming = created_at + chrono::Duration::seconds(60);
+    let result = registry
+        .accept_put_manifest(
+            None,
+            Some(incoming),
+            namespace,
+            Reference::Tag(tag.to_string()),
+            media_type,
+            Cursor::new(content),
+        )
+        .await
+        .err();
+
+    assert!(
+        matches!(result, Some(Error::ReplicationSuperseded(_))),
+        "LWW must compare against the backend link, not the stale cached one, got: {result:?}"
+    );
+}
+
+#[tokio::test]
 async fn accept_put_manifest_accepts_lww_when_local_absent() {
     let test_case = FSRegistryTestCase::new();
     let registry = test_case.registry();

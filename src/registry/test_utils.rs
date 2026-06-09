@@ -7,6 +7,7 @@ use tempfile::TempDir;
 use uuid::Uuid;
 
 use crate::{
+    cache,
     configuration::GlobalConfig,
     metrics_provider,
     oci::{Digest, Namespace},
@@ -87,10 +88,22 @@ pub fn metadata_store_over(
     object: Arc<dyn ObjectStore>,
     executor: Arc<dyn TransactionExecutor>,
 ) -> Arc<MetadataStore> {
+    metadata_store_over_cached(object, executor, 0)
+}
+
+/// Like [`metadata_store_over`] but with a memory-backed link cache enabled at
+/// `link_cache_ttl_secs` (`0` keeps it disabled), for tests pinning which reads
+/// must bypass the per-process cache.
+pub fn metadata_store_over_cached(
+    object: Arc<dyn ObjectStore>,
+    executor: Arc<dyn TransactionExecutor>,
+    link_cache_ttl_secs: u64,
+) -> Arc<MetadataStore> {
     Arc::new(
         MetadataStore::builder()
             .store(build_store(object, executor))
-            .link_cache_ttl(0)
+            .cache(cache::Config::Memory.to_backend().expect("memory cache"))
+            .link_cache_ttl(link_cache_ttl_secs)
             .access_time_debounce_secs(0)
             .build()
             .expect("test metadata backend"),
@@ -236,6 +249,12 @@ pub struct FSRegistryTestCase {
 
 impl FSRegistryTestCase {
     pub fn new() -> Self {
+        Self::with_link_cache_ttl(0)
+    }
+
+    /// Like [`Self::new`] but with the per-process link cache enabled at
+    /// `link_cache_ttl_secs`, for tests pinning which reads must bypass it.
+    pub fn with_link_cache_ttl(link_cache_ttl_secs: u64) -> Self {
         let temp_dir = TempDir::new().expect("Failed to create temp dir for FSBackendConfig");
         let path = temp_dir.path().to_string_lossy().to_string();
 
@@ -253,7 +272,8 @@ impl FSRegistryTestCase {
                 .build()
                 .expect("fs metadata storage"),
         );
-        let metadata_store = metadata_store_over(meta_storage, meta_executor);
+        let metadata_store =
+            metadata_store_over_cached(meta_storage, meta_executor, link_cache_ttl_secs);
         let registry = create_test_registry(blob_store.clone(), metadata_store.clone());
 
         Self {
