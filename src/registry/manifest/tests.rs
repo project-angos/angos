@@ -1,4 +1,8 @@
-use std::{collections::HashMap, io::Cursor, slice};
+use std::{
+    collections::{HashMap, HashSet},
+    io::Cursor,
+    slice,
+};
 
 use futures_util::future::join_all;
 use hyper::header::{CONTENT_LENGTH, CONTENT_TYPE, LOCATION};
@@ -10,7 +14,7 @@ use crate::{
     oci::Namespace,
     registry::{
         Error, Registry,
-        metadata_store::{self, LinkOperation, link_kind::LinkKind},
+        metadata_store::{self, LinkMetadata, LinkOperation, link_kind::LinkKind},
         test_utils::{
             FSRegistryTestCase, RegistryTestCase, backends, create_test_repositories,
             put_blob_direct,
@@ -2500,6 +2504,59 @@ async fn delete_manifest_accepts_lww_newer_source_ts() {
     assert!(
         matches!(result, Err(metadata_store::Error::ReferenceNotFound)),
         "tag must be gone after an accepted delete, got: {result:?}"
+    );
+}
+
+#[tokio::test]
+async fn delete_manifest_not_superseded_when_local_tag_has_no_created_at() {
+    // A local tag link with no recorded `created_at` is treated as oldest, so a
+    // replicated delete is never superseded by it — even with a `source_ts` far in
+    // the past. `created_at` is never `None` through the stamping write path (it is
+    // always stamped to `now()` or the source timestamp), so the link is injected
+    // directly via `write_link_reference`, mirroring a legacy link written before
+    // the field existed.
+    let test_case = FSRegistryTestCase::new();
+    let registry = test_case.registry();
+    let namespace = &Namespace::new("lww-repo").unwrap();
+    let tag = "latest";
+
+    registry
+        .metadata_store
+        .write_link_reference(
+            namespace.as_ref(),
+            &LinkKind::Tag(tag.to_string()),
+            &LinkMetadata {
+                target: Digest::Sha256(sha256::hex(b"manifest-bytes").into()),
+                created_at: None,
+                accessed_at: None,
+                referenced_by: HashSet::new(),
+                media_type: None,
+                descriptor: None,
+            },
+        )
+        .await
+        .expect("seed a tag link with no created_at");
+
+    // An epoch source_ts that would lose last-writer-wins to ANY real created_at;
+    // with `created_at == None` the delete must still proceed (not superseded).
+    let ancient = chrono::DateTime::from_timestamp(0, 0).unwrap();
+    registry
+        .delete_manifest(
+            None,
+            Some(ancient),
+            namespace,
+            &Reference::Tag(tag.to_string()),
+        )
+        .await
+        .expect("a delete must not be superseded by a tag with no created_at");
+
+    let result = registry
+        .metadata_store
+        .read_link(namespace.as_ref(), &LinkKind::Tag(tag.to_string()), false)
+        .await;
+    assert!(
+        matches!(result, Err(metadata_store::Error::ReferenceNotFound)),
+        "tag must be gone after the non-superseded delete, got: {result:?}"
     );
 }
 

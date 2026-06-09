@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::{num::NonZeroUsize, path::PathBuf};
 
 use angos_tx_engine::lock::LockStrategy;
 
@@ -9,6 +9,7 @@ use crate::{
     configuration::{Configuration, Error, RegistryStorageConfig, ServerConfig},
     policy::AccessMode,
     registry::blob_store,
+    replication::ReplicationMode,
 };
 
 #[test]
@@ -208,6 +209,72 @@ fn test_repository_config() {
     assert_eq!(repo.immutable_tags_exclusions[0].as_source(), "dev");
     assert_eq!(repo.authorization_webhook.as_deref(), Some("repo-auth"));
     assert_eq!(repo.event_webhooks, ["repo-events"]);
+}
+
+#[test]
+fn test_repository_downstream_config() {
+    // End-to-end: a `[[repository.X.downstream]]` array-of-tables must parse
+    // through the full Configuration (the repository map visitor + the flattened
+    // RegistryClientConfig) and land its fields in `downstream[0].client`.
+    let config = r#"
+    [server]
+    bind_address = "0.0.0.0"
+
+    [[repository.myapp.downstream]]
+    name = "instance-b"
+    url = "https://angos-eu.example.com"
+    username = "replicator"
+    password = "s3cret"
+    mode = "event-only"
+    namespace_filter = ["^nginx/.*"]
+    max_concurrent_pushes = 8
+    prune = true
+    "#;
+
+    let config = Configuration::load_from_str(config).unwrap();
+    let repo = &config.repository["myapp"];
+    assert_eq!(repo.downstream.len(), 1);
+    let downstream = &repo.downstream[0];
+    assert_eq!(downstream.name, "instance-b");
+    // Flattened RegistryClientConfig fields.
+    assert_eq!(downstream.client.url, "https://angos-eu.example.com");
+    assert_eq!(downstream.client.username.as_deref(), Some("replicator"));
+    assert_eq!(
+        downstream
+            .client
+            .password
+            .as_ref()
+            .map(|p| p.expose().as_str()),
+        Some("s3cret")
+    );
+    // Replication-only fields.
+    assert_eq!(downstream.mode, ReplicationMode::EventOnly);
+    assert_eq!(downstream.namespace_filter.len(), 1);
+    assert_eq!(downstream.namespace_filter[0].as_source(), "^nginx/.*");
+    assert_eq!(downstream.max_concurrent_pushes, NonZeroUsize::new(8));
+    assert!(downstream.prune);
+}
+
+#[test]
+fn test_repository_downstream_rejects_partial_mtls() {
+    // The flattened RegistryClientConfig's mTLS-pairing validation must fire
+    // through the full Configuration parse too: a downstream supplying only
+    // `client_certificate` (no key) is rejected.
+    let config = r#"
+    [server]
+    bind_address = "0.0.0.0"
+
+    [[repository.myapp.downstream]]
+    name = "instance-b"
+    url = "https://angos-eu.example.com"
+    client_certificate = "cert.pem"
+    "#;
+
+    let result = Configuration::load_from_str(config);
+    assert!(
+        result.is_err(),
+        "partial mTLS in a downstream must be rejected at full-config parse"
+    );
 }
 
 #[test]

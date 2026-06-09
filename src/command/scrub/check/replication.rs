@@ -894,6 +894,61 @@ mod tests {
         assert!(sink.is_empty(), "event-only downstream must be skipped");
     }
 
+    #[tokio::test]
+    async fn enqueues_push_for_reconcile_only_downstream() {
+        // Symmetric to `skips_event_only_downstream`: a reconcile-only downstream
+        // DOES participate in reconciliation, so a tag missing on it enqueues a
+        // push.
+        crate::metrics_provider::init_for_tests();
+        let (metadata_store, store, _dir) = fs_metadata_store();
+        let mock_server = MockServer::start().await;
+
+        // Local: tag v1 -> manifest digest.
+        let manifest = put_blob_direct(&store, b"reconcile-only-bytes").await;
+        metadata_store
+            .update_links(
+                NAMESPACE,
+                &[LinkOperation::create(
+                    LinkKind::Tag("v1".to_string()),
+                    manifest.clone(),
+                )],
+            )
+            .await
+            .unwrap();
+
+        // Downstream: tag missing -> HEAD 404.
+        Mock::given(method("HEAD"))
+            .and(path(format!("/v2/{NAMESPACE}/manifests/v1")))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&mock_server)
+            .await;
+
+        let resolver = resolver_for(repository(
+            downstream_client(&mock_server.uri()),
+            ReplicationMode::ReconcileOnly,
+            false,
+        ));
+        let checker = ReplicationChecker::builder()
+            .metadata_store(metadata_store.clone())
+            .resolver(resolver)
+            .build()
+            .unwrap();
+
+        let mut sink: Vec<Action> = Vec::new();
+        checker.check(NAMESPACE, &mut sink).await.unwrap();
+
+        assert_eq!(
+            sink.len(),
+            1,
+            "reconcile-only downstream must reconcile a missing tag"
+        );
+        assert!(matches!(
+            &sink[0],
+            Action::EnqueueReplicationPush { downstream, tag, digest, .. }
+                if downstream == DOWNSTREAM && tag == "v1" && *digest == manifest
+        ));
+    }
+
     // ------------------------------------------------------------------
     // End-to-end (`angos scrub --replicate`)
     // ------------------------------------------------------------------
