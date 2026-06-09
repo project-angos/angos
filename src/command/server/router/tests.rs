@@ -1192,3 +1192,33 @@ fn test_parse_jobs_rejects_unknown_queue() {
         .is_none()
     );
 }
+
+#[test]
+fn test_parse_jobs_rejects_malformed_query_instead_of_defaulting_queue() {
+    // A malformed sibling value must NOT reset the whole query to its defaults:
+    // a lenient parse would turn `?queue=replication&n=abc` into the default
+    // `cache` queue and administer the wrong queue. Any bad value is a 400.
+    assert!(
+        parse(
+            &Method::GET,
+            &"/_ext/_jobs?queue=replication&n=abc".parse().unwrap(),
+        )
+        .is_none()
+    );
+    assert!(
+        parse(
+            &Method::GET,
+            &"/_ext/_jobs?queue=replication&n=99999999".parse().unwrap(),
+        )
+        .is_none()
+    );
+    assert!(
+        parse(
+            &Method::DELETE,
+            &"/_ext/_jobs/failed/0000018b-abc?queue=replication&n=abc"
+                .parse()
+                .unwrap(),
+        )
+        .is_none()
+    );
+}
