@@ -213,7 +213,16 @@ pub async fn push_manifest(
     //    referrers fallback tag manifest. OCI-1.1 downstreams index it for free.
     //    `fallback_body` is `Some` only when the manifest carries a subject.
     if let Some(body) = fallback_body.filter(|_| result.subject.is_none()) {
-        push_referrers_fallback(downstream, namespace, digest, &parsed, &body, source_ts).await?;
+        push_referrers_fallback(
+            downstream,
+            metadata_store,
+            namespace,
+            digest,
+            &parsed,
+            &body,
+            source_ts,
+        )
+        .await?;
     }
 
     Ok(PushOutcome::Pushed)
@@ -367,6 +376,7 @@ async fn upload_into_session(
 /// index — so a second referrer of the same subject does not clobber the first.
 async fn push_referrers_fallback(
     downstream: &RegistryClient,
+    metadata_store: &Arc<MetadataStore>,
     namespace: &str,
     digest: &Digest,
     parsed: &ParsedManifestDigests,
@@ -392,10 +402,56 @@ async fn push_referrers_fallback(
     })?;
     let location = downstream.get_manifest_path(NO_LOCAL_PREFIX, namespace, &reference);
 
+    // Serialize the GET→merge→PUT below across concurrent replication jobs.
+    // Two referrers of the same subject are distinct jobs (distinct job
+    // `lock_key`s, so the queue runs them concurrently) merging into the same
+    // fallback tag: unserialized, both read the same base index and the loser's
+    // descriptor vanishes from the winner's PUT. The lock lives on the metadata
+    // executor — the lock domain every drain of this store (server in-process
+    // queue, `angos worker`, scrub) shares. It cannot cover an unrelated sender
+    // registry pushing to the same downstream; that residual race needs
+    // conditional-request support on the downstream.
+    let lock_keys = [referrers_fallback_lock_key(namespace, subject)];
+    let session = metadata_store
+        .executor()
+        .acquire(&lock_keys)
+        .await
+        .map_err(|e| {
+            Error::Registry(RegistryError::Internal(format!(
+                "referrers fallback lock acquire failed for '{fallback_tag}': {e}"
+            )))
+        })?;
+    let result =
+        merge_referrers_fallback(downstream, &location, digest, parsed, body, source_ts).await;
+    session.release().await;
+    result
+}
+
+/// Lock key serializing the fallback-index read-modify-write for one subject.
+///
+/// Deliberately downstream-agnostic — same-subject merges to two different
+/// downstreams also serialize — because the critical section is two short HTTP
+/// calls and a per-downstream key would thread the downstream name through the
+/// pipeline for contention that never matters in practice.
+fn referrers_fallback_lock_key(namespace: &str, subject: &Digest) -> String {
+    format!("replication-referrers:{namespace}:{subject}")
+}
+
+/// The locked critical section of [`push_referrers_fallback`]: fetches the
+/// downstream's current fallback index, appends this referrer's descriptor when
+/// absent, and PUTs the merged index back.
+async fn merge_referrers_fallback(
+    downstream: &RegistryClient,
+    location: &str,
+    digest: &Digest,
+    parsed: &ParsedManifestDigests,
+    body: &[u8],
+    source_ts: Option<&str>,
+) -> Result<(), Error> {
     // GET the existing fallback index; a missing tag (404) starts fresh, a
     // transient failure propagates so the job retries. Any pre-existing referrer
     // descriptors are preserved so this push only adds.
-    let mut manifests = fetch_fallback_manifests(downstream, &location).await?;
+    let mut manifests = fetch_fallback_manifests(downstream, location).await?;
 
     // Descriptor for the referrer manifest just pushed. `body`'s digest is the
     // `digest` already resolved on the push path (the blob store is
@@ -430,7 +486,7 @@ async fn push_referrers_fallback(
     })?;
 
     downstream
-        .put_manifest(&location, Some(OCI_INDEX_MEDIA_TYPE), index_body, source_ts)
+        .put_manifest(location, Some(OCI_INDEX_MEDIA_TYPE), index_body, source_ts)
         .await
         .map_err(Error::Registry)?;
     Ok(())
@@ -541,7 +597,7 @@ pub async fn delete_manifest(
 #[cfg(test)]
 mod tests {
     use std::sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
     };
 
@@ -940,6 +996,136 @@ mod tests {
         );
 
         // `.expect(0)` on the fallback PUT (no clobbering write) is verified on drop.
+        drop(mock_server);
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn concurrent_same_subject_referrers_merge_without_lost_update() {
+        // Two referrers of the same subject are distinct jobs with distinct job
+        // `lock_key`s, so the queue runs them concurrently — and both
+        // GET→merge→PUT the same fallback tag. The store lock inside
+        // `push_referrers_fallback` serializes the merges; without it both reads
+        // see the same base index and one descriptor vanishes from the final PUT.
+        metrics_provider::init_for_tests();
+        let mock_server = MockServer::start().await;
+        let dir = TempDir::new().unwrap();
+        let (blob_store, metadata_store, store) = test_blob_store(dir.path().to_str().unwrap());
+
+        let subject = put_blob_direct(&store, b"subject-bytes").await;
+        let referrer = |name: &str| {
+            json!({
+                "schemaVersion": 2,
+                "mediaType": "application/vnd.oci.image.manifest.v1+json",
+                "layers": [],
+                "annotations": { "org.example.ref": name },
+                "subject": {
+                    "mediaType": "application/vnd.oci.image.manifest.v1+json",
+                    "digest": subject.to_string(),
+                    "size": 13,
+                },
+            })
+        };
+        let bytes_a = serde_json::to_vec(&referrer("a")).unwrap();
+        let bytes_b = serde_json::to_vec(&referrer("b")).unwrap();
+        let digest_a = put_blob_direct(&store, &bytes_a).await;
+        let digest_b = put_blob_direct(&store, &bytes_b).await;
+
+        // Primary manifest PUTs: NO `OCI-Subject` => OCI-1.0 => fallback runs.
+        for (tag, digest) in [("v1", &digest_a), ("v2", &digest_b)] {
+            Mock::given(method("PUT"))
+                .and(path(format!("/v2/{NAMESPACE}/manifests/{tag}")))
+                .respond_with(
+                    ResponseTemplate::new(201)
+                        .insert_header(DOCKER_CONTENT_DIGEST, digest.to_string().as_str()),
+                )
+                .expect(1)
+                .mount(&mock_server)
+                .await;
+        }
+
+        // A stateful fallback tag endpoint: GET serves whatever the last PUT
+        // stored (404 before the first), like a real registry, so the second
+        // merge only sees the first descriptor if the merges serialized.
+        let fallback_tag = format!("{}-{}", subject.algorithm(), subject.hash());
+        let stored: Arc<Mutex<Vec<serde_json::Value>>> = Arc::new(Mutex::new(Vec::new()));
+        let get_stored = stored.clone();
+        let get_digest = subject.to_string();
+        Mock::given(method("GET"))
+            .and(path(format!("/v2/{NAMESPACE}/manifests/{fallback_tag}")))
+            .respond_with(move |_: &Request| {
+                let manifests = get_stored.lock().unwrap();
+                if manifests.is_empty() {
+                    ResponseTemplate::new(404)
+                } else {
+                    ResponseTemplate::new(200)
+                        .insert_header(DOCKER_CONTENT_DIGEST, get_digest.as_str())
+                        .set_body_json(json!({
+                            "schemaVersion": 2,
+                            "mediaType": OCI_INDEX_MEDIA_TYPE,
+                            "manifests": manifests.clone(),
+                        }))
+                }
+            })
+            .mount(&mock_server)
+            .await;
+        let put_stored = stored.clone();
+        let put_digest = subject.to_string();
+        Mock::given(method("PUT"))
+            .and(path(format!("/v2/{NAMESPACE}/manifests/{fallback_tag}")))
+            .respond_with(move |request: &Request| {
+                let index: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+                *put_stored.lock().unwrap() = index["manifests"].as_array().unwrap().clone();
+                ResponseTemplate::new(201)
+                    .insert_header(DOCKER_CONTENT_DIGEST, put_digest.as_str())
+            })
+            .expect(2)
+            .mount(&mock_server)
+            .await;
+
+        let client = downstream_client(&mock_server.uri());
+        let (a, b) = tokio::join!(
+            push_manifest(
+                &client,
+                &blob_store,
+                &metadata_store,
+                NAMESPACE,
+                &digest_a,
+                None,
+                Some("v1"),
+                bytes_a,
+                4,
+                None,
+            ),
+            push_manifest(
+                &client,
+                &blob_store,
+                &metadata_store,
+                NAMESPACE,
+                &digest_b,
+                None,
+                Some("v2"),
+                bytes_b,
+                4,
+                None,
+            ),
+        );
+        a.unwrap();
+        b.unwrap();
+
+        let merged: Vec<String> = stored
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|m| m["digest"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(
+            merged.len(),
+            2,
+            "both referrer descriptors must survive the merge, got: {merged:?}"
+        );
+        assert!(merged.contains(&digest_a.to_string()));
+        assert!(merged.contains(&digest_b.to_string()));
         drop(mock_server);
     }
 
