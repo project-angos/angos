@@ -825,7 +825,7 @@ fn test_metadata_store_s3_lock_strategy_s3_defaults() {
 // A durable job queue ([global.job_queue]) drains across multiple processes, so
 // the per-job execution lock must be shared. An S3 blob store with no explicit
 // metadata-store lock strategy inherits the in-process `memory` lock, which
-// cannot serialize across processes — that combination must be rejected.
+// cannot serialize across processes: that combination must be rejected.
 #[test]
 fn job_queue_rejects_inherited_memory_lock_on_s3() {
     let config = r#"

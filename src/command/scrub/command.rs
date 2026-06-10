@@ -87,7 +87,7 @@ pub struct Command {
     /// drained in-process (no running worker is assumed): every job that is ready
     /// is claimed, and a job whose push succeeds converges within this invocation.
     /// A job whose push transiently fails is rescheduled with backoff onto the
-    /// durable queue and left for a worker or a later `scrub` run — so a transient
+    /// durable queue and left for a worker or a later `scrub` run, so a transient
     /// failure does not necessarily converge here. `None` disables the drain
     /// (dry-run, or `--replicate` absent).
     replication_drain: Option<ReplicationDrain>,
@@ -96,8 +96,8 @@ pub struct Command {
 /// Consumer queue + handler used to drain replication jobs enqueued by the
 /// reconciliation checker, within the scrub CLI run. `concurrency`
 /// (`[global] max_concurrent_replication_jobs`) bounds the parallel claim
-/// loops, matching the worker and in-process drains — a cold-mirror reconcile
-/// would otherwise push one tag at a time.
+/// loops, matching the worker and in-process drains (a cold-mirror reconcile
+/// would otherwise push one tag at a time).
 struct ReplicationDrain {
     consumer: Arc<JobStore>,
     handler: Box<dyn JobHandler>,
@@ -260,7 +260,7 @@ impl Command {
     /// whose push succeeds converges here, while one whose push transiently
     /// fails is failed-over (rescheduled with backoff onto the durable queue
     /// for a worker or a later `scrub` run). A loop ends when the queue has no
-    /// claimable (ready) job left — so jobs already backed off for a future
+    /// claimable (ready) job left, so jobs already backed off for a future
     /// time are intentionally not awaited.
     async fn drain_replication_jobs(&mut self) {
         let Some(drain) = &self.replication_drain else {

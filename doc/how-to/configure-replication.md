@@ -39,7 +39,7 @@ max_concurrent_pushes = 4             # optional; per-manifest blob fan-out (pos
 | `mode` | string | `"event+reconcile"` | `"event+reconcile"`, `"event-only"`, or `"reconcile-only"` |
 | `namespace_filter` | [string] | `[]` (all) | Regex patterns; a namespace replicates to this downstream only if it matches one |
 | `max_concurrent_pushes` | usize | `4` | Concurrent blob pushes per manifest for this downstream (positive integer, >= 1) |
-| `prune` | bool | `false` | When `true`, reconciliation also **deletes** tags present on this downstream but absent locally (authoritative one-way mirror). **Leave `false` for active-active peers** — see [Reconcile on Demand](#reconcile-on-demand). |
+| `prune` | bool | `false` | When `true`, reconciliation also **deletes** tags present on this downstream but absent locally (authoritative one-way mirror). **Leave `false` for active-active peers**; see [Reconcile on Demand](#reconcile-on-demand). |
 | `username` / `password` | string | - | Basic auth for the downstream |
 | `max_redirect` | u8 | `5` | Maximum redirects to follow |
 | `server_ca_bundle` | string | - | CA bundle to verify the downstream's TLS certificate |
@@ -74,7 +74,7 @@ How replication work is drained depends on `[global.job_queue]`:
 
 ### In-Process (server self-drains)
 
-With **no** `[global.job_queue]` section, the server drains the replication queue itself, in-process. This is the simplest setup -- run only `angos server` on each instance -- and is ideal for a single-instance or demo deployment. Jobs still persist to the configured fs/S3 store (under `_jobs/`) and resume after a restart; what you give up versus a separate worker is cross-replica coordination and the queue-depth gauge, not durability.
+With **no** `[global.job_queue]` section, the server drains the replication queue itself, in-process. This is the simplest setup (run only `angos server` on each instance) and is ideal for a single-instance or demo deployment. Jobs still persist to the configured fs/S3 store (under `_jobs/`) and resume after a restart; what you give up versus a separate worker is cross-replica coordination and the queue-depth gauge, not durability.
 
 ### Separate Worker
 
@@ -91,7 +91,7 @@ Because the queue is drained by separate processes, `[global.job_queue]` require
 
 ## Two-Instance Active-Active Example
 
-Configure each instance with the other as a downstream for the same repository. With no `[global.job_queue]`, each server self-drains in-process -- no separate worker needed.
+Configure each instance with the other as a downstream for the same repository. With no `[global.job_queue]`, each server self-drains in-process; no separate worker is needed.
 
 **Instance A** (`config-a.toml`):
 
@@ -132,7 +132,7 @@ docker pull localhost:8001/nginx/app:v1   # served from B
 When the event path misses a change (an instance was down, or two instances drifted after a partition), reconcile explicitly:
 
 ```bash
-# Preview the pushes that would be enqueued -- enqueues nothing
+# Preview the pushes that would be enqueued; enqueues nothing
 angos -c config.toml scrub --replicate --dry-run
 
 # Enqueue the diverging tags (a standalone scrub drains them end-of-run)
@@ -167,7 +167,7 @@ time() - angos_replication_last_success_timestamp_seconds
 angos_job_queue_pending{queue="replication"}
 ```
 
-`angos_replication_push_total` and `angos_replication_last_success_timestamp_seconds` increment in the process that drains the replication queue. In the in-process self-drain mode used in the example above, that is the server, so both appear on the server's `/metrics` — alert on the staleness query in this mode. When `[global.job_queue]` is configured, `angos worker` drains the queue, and the worker exposes no HTTP listener, so the push and staleness metrics are not scrapeable in that mode. Monitor the backlog instead: the server publishes `angos_job_queue_pending{queue="replication"}` only when `[global.job_queue]` is configured.
+`angos_replication_push_total` and `angos_replication_last_success_timestamp_seconds` increment in the process that drains the replication queue. In the in-process self-drain mode used in the example above, that is the server, so both appear on the server's `/metrics`; alert on the staleness query in this mode. When `[global.job_queue]` is configured, `angos worker` drains the queue, and the worker exposes no HTTP listener, so the push and staleness metrics are not scrapeable in that mode. Monitor the backlog instead: the server publishes `angos_job_queue_pending{queue="replication"}` only when `[global.job_queue]` is configured.
 
 See [Metrics Reference](../reference/metrics.md) for the full list.
 
@@ -176,11 +176,11 @@ See [Metrics Reference](../reference/metrics.md) for the full list.
 **Pushes never reach the downstream:**
 - Confirm the downstream `url` is reachable from the source instance.
 - Verify the credential is authorized to push on the downstream (`put-manifest`, blob uploads).
-- If `[global.job_queue]` is configured, ensure an `angos worker` is running (it drains the replication queue by default) -- the server only enqueues.
+- If `[global.job_queue]` is configured, ensure an `angos worker` is running (it drains the replication queue by default); the server only enqueues.
 
 **A tag does not overwrite on the downstream:**
 - The downstream copy may be newer (last-writer-wins): a `409 REPLICATION_SUPERSEDED` is convergence, not failure.
-- The downstream tag may be immutable: a `409 CONFLICT` surfaces and the job retries -- relax immutability or pick a different tag.
+- The downstream tag may be immutable: a `409 CONFLICT` surfaces and the job retries; relax immutability or pick a different tag.
 
 **Reconciliation reports nothing to do but instances differ:**
 - Confirm the downstream's `mode` includes reconciliation (`event+reconcile` or `reconcile-only`).

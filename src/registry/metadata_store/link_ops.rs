@@ -229,7 +229,7 @@ struct LinksTxCaptured {
     /// Links that were fully removed.
     deleted_links: Vec<LinkKind>,
     /// Prior target per `Create` op's link (`None` = the link did not exist),
-    /// read by the committed attempt — see [`LinksCommit::prior_targets`].
+    /// read by the committed attempt (see [`LinksCommit::prior_targets`]).
     prior_targets: Vec<(LinkKind, Option<Digest>)>,
     had_creates: bool,
 }
@@ -238,7 +238,7 @@ struct LinksTxCaptured {
 ///
 /// The transaction's retry loop re-reads each `Create` op's current target on
 /// every attempt and conflicts (retries) when it moved, so the value here is
-/// the state the commit was actually validated against — unlike a separate
+/// the state the commit was actually validated against. Unlike a separate
 /// pre-write read, it cannot be stale by an arbitrary interleaved writer.
 /// `accept_put_manifest` derives its no-op-suppression `changed` gate from it.
 #[derive(Default)]

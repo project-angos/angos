@@ -59,14 +59,14 @@ pub enum PushOutcome {
 ///
 /// `source_ts` is forwarded as the `X-Angos-Source-Timestamp` header so the
 /// receiver can apply last-writer-wins; it is stamped on the primary manifest
-/// PUT only. The referrers-fallback index PUT is deliberately timestamp-less —
+/// PUT only. The referrers-fallback index PUT is deliberately timestamp-less:
 /// the fallback tag is a merged set, not an LWW register (see
 /// [`push_referrers_fallback`]).
 ///
 /// 409 disambiguation: when the downstream rejects the push by last-writer-wins
 /// (a `409` whose OCI code is the replication-superseded code, surfaced by the
 /// client as `PutManifestResult { superseded: true, .. }`) the push is treated
-/// as **success** — the downstream already holds a strictly-newer copy, so the
+/// as **success**: the downstream already holds a strictly-newer copy, so the
 /// system has converged. The handler then completes the job rather than
 /// retrying. Any *other* downstream error (including a different 409, e.g. an
 /// immutable-tag conflict) propagates as [`Error::Registry`] so the job
@@ -139,7 +139,7 @@ pub async fn push_manifest(
     };
     let location = downstream.get_manifest_path(NO_LOCAL_PREFIX, namespace, &reference);
 
-    // 3a. HEAD-before-PUT (bandwidth optimization, NOT loop prevention — the
+    // 3a. HEAD-before-PUT (bandwidth optimization, NOT loop prevention: the
     //     receiver-side no-op dispatch gate breaks cycles; this just avoids one
     //     wasted PUT once converged). Probe the target reference: if the
     //     downstream already resolves it to THIS digest, it is converged, so skip
@@ -149,7 +149,7 @@ pub async fn push_manifest(
     //     manifest must always run the PUT below, because the PUT's `OCI-Subject`
     //     response is what tells us whether the downstream auto-indexed the
     //     subject (OCI-1.1) or still needs the referrers fallback tag (OCI-1.0):
-    //     a converged primary does NOT imply the fallback landed — the original
+    //     a converged primary does NOT imply the fallback landed: the original
     //     push's fallback PUT can fail after the primary succeeded, and skipping
     //     here would strand the referrer while the job reports success. The PUT is
     //     idempotent and a referrer manifest is small, so re-issuing it is cheap.
@@ -169,7 +169,7 @@ pub async fn push_manifest(
     }
 
     // The referrers fallback below borrows the manifest body, but only a
-    // subject-bearing manifest can reach it — retain a copy for that path alone
+    // subject-bearing manifest can reach it, so retain a copy for that path alone
     // and move the body straight into the PUT on the common (no-subject) path.
     let fallback_body = parsed.subject.is_some().then(|| body.clone());
 
@@ -179,7 +179,7 @@ pub async fn push_manifest(
     // when the manifest was stored. A body may legitimately omit `mediaType` while
     // the original push carried it in the `Content-Type` header (which
     // `store_manifest` records on the link), and the receiver rejects a manifest
-    // PUT that carries no `Content-Type` — so recovering it from the link keeps a
+    // PUT that carries no `Content-Type`, so recovering it from the link keeps a
     // body-typeless manifest replicable instead of stalling on a 400. Resolved
     // here, after the converged-skip, so a skipped push never does the link read.
     let effective_media_type = match media_type.or_else(|| parsed.media_type.clone()) {
@@ -197,7 +197,7 @@ pub async fn push_manifest(
         .map_err(Error::Registry)?;
 
     // 3c. LWW loss: the downstream already holds a strictly-newer copy. This is
-    //     convergence, not failure — drop the push (and skip the referrers
+    //     convergence, not failure: drop the push (and skip the referrers
     //     fallback, which would re-push a superseded artifact).
     if result.superseded {
         info!(
@@ -267,12 +267,12 @@ async fn push_blobs(
 /// than the target, that already references the blob (per the blob index).
 ///
 /// In a bidirectional mesh such a sibling is likely to hold the blob on the
-/// downstream too, making it a good `from` hint — a single mount POST then grants
+/// downstream too, making it a good `from` hint: a single mount POST then grants
 /// a reference with no body transfer. The candidate is only a hint: a wrong guess
 /// costs nothing but a fall-back to the full upload (the server answers `202` and
 /// opens a session). Returns `None` when no sibling references the blob (so no
-/// mount is attempted) and, fail-safe, on any blob-index read error — a missing
-/// optimization must never fail a push. The lexicographically smallest sibling is
+/// mount is attempted) and, fail-safe, on any blob-index read error (a missing
+/// optimization must never fail a push). The lexicographically smallest sibling is
 /// chosen so the `from` is deterministic.
 async fn mount_candidate(
     metadata_store: &Arc<MetadataStore>,
@@ -309,7 +309,7 @@ async fn push_one_blob(
     // Cross-repo mount first: when a sibling local namespace references the blob
     // it is likely present on the downstream under that repo, so a single mount
     // POST may grant a reference with no body transfer. The mount is a pure
-    // optimization — a miss opens a session, and a rejection (the downstream's
+    // optimization: a miss opens a session, and a rejection (the downstream's
     // `mount-blob` policy denies it) falls through to a plain upload, so it can
     // never fail the push.
     if let Some(from) = mount_candidate(metadata_store, namespace, digest).await {
@@ -379,11 +379,11 @@ async fn upload_into_session(
 /// `<alg>-<hash>` of the SUBJECT digest holds an image **index** whose
 /// `manifests[]` enumerate the referrer descriptors. A pushing client must GET
 /// the existing index, append its own referrer descriptor, then PUT the merged
-/// index — so a second referrer of the same subject does not clobber the first.
+/// index, so a second referrer of the same subject does not clobber the first.
 ///
 /// The fallback PUT carries NO `source_ts`: the fallback tag is a merged SET,
-/// not a last-writer-wins register, so it must never lose an LWW comparison —
-/// a `409 REPLICATION_SUPERSEDED` here would silently drop the just-merged
+/// not a last-writer-wins register, so it must never lose an LWW comparison.
+/// A `409 REPLICATION_SUPERSEDED` here would silently drop the just-merged
 /// descriptor while the job reports success (a stranded referrer).
 async fn push_referrers_fallback(
     downstream: &RegistryClient,
@@ -417,7 +417,7 @@ async fn push_referrers_fallback(
     // `lock_key`s, so the queue runs them concurrently) merging into the same
     // fallback tag: unserialized, both read the same base index and the loser's
     // descriptor vanishes from the winner's PUT. The lock lives on the metadata
-    // executor — the lock domain every drain of this store (server in-process
+    // executor, the lock domain every drain of this store (server in-process
     // queue, `angos worker`, scrub) shares. It cannot cover an unrelated sender
     // registry pushing to the same downstream; that residual race needs
     // conditional-request support on the downstream.
@@ -438,8 +438,8 @@ async fn push_referrers_fallback(
 
 /// Lock key serializing the fallback-index read-modify-write for one subject.
 ///
-/// Deliberately downstream-agnostic — same-subject merges to two different
-/// downstreams also serialize — because the critical section is two short HTTP
+/// Deliberately downstream-agnostic (same-subject merges to two different
+/// downstreams also serialize) because the critical section is two short HTTP
 /// calls and a per-downstream key would thread the downstream name through the
 /// pipeline for contention that never matters in practice.
 fn referrers_fallback_lock_key(namespace: &str, subject: &Digest) -> String {
@@ -507,8 +507,8 @@ async fn merge_referrers_fallback(
 /// `manifests[]` descriptors.
 ///
 /// A `404` (`ManifestUnknown`) means the fallback tag does not exist yet, so an
-/// empty list is returned and the caller starts fresh. Any other GET error — a
-/// transient `5xx`/timeout — is propagated so the caller retries instead of
+/// empty list is returned and the caller starts fresh. Any other GET error (a
+/// transient `5xx`/timeout) is propagated so the caller retries instead of
 /// overwriting an existing index from an empty base and dropping every sibling
 /// referrer of the subject. A `200` whose body is not a parseable image index
 /// (unparseable JSON, or a missing/non-array `manifests`) is an error too, not an
@@ -567,7 +567,7 @@ fn referrer_descriptor(
 ///
 /// 409 disambiguation: an LWW-loser 409 (the receiver's copy is strictly newer,
 /// surfaced by the client as [`DeleteManifestOutcome::Superseded`]) is treated
-/// as **success** — convergence, not failure. Any *other* downstream error
+/// as **success** (convergence, not failure). Any *other* downstream error
 /// (including an immutable-tag conflict 409) propagates as [`Error::Registry`]
 /// so the job retries/dead-letters.
 ///
@@ -768,7 +768,7 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        // The primary manifest PUT by tag — NO `OCI-Subject` header => OCI-1.0
+        // The primary manifest PUT by tag: NO `OCI-Subject` header => OCI-1.0
         // downstream => fallback expected.
         Mock::given(method("PUT"))
             .and(path(format!("/v2/{NAMESPACE}/manifests/v1")))
@@ -1061,7 +1061,7 @@ mod tests {
 
         // The fallback index GET returns a 200 (with a valid Docker-Content-Digest,
         // so the client accepts the response) whose body parses as JSON but has no
-        // `manifests` array — a corrupt/unexpected index. The merge-PUT must NOT run.
+        // `manifests` array (a corrupt/unexpected index). The merge-PUT must NOT run.
         let fallback_tag = format!("{}-{}", subject.algorithm(), subject.hash());
         Mock::given(method("GET"))
             .and(path(format!("/v2/{NAMESPACE}/manifests/{fallback_tag}")))
@@ -1109,7 +1109,7 @@ mod tests {
     #[allow(clippy::too_many_lines)]
     async fn concurrent_same_subject_referrers_merge_without_lost_update() {
         // Two referrers of the same subject are distinct jobs with distinct job
-        // `lock_key`s, so the queue runs them concurrently — and both
+        // `lock_key`s, so the queue runs them concurrently, and both
         // GET→merge→PUT the same fallback tag. The store lock inside
         // `push_referrers_fallback` serializes the merges; without it both reads
         // see the same base index and one descriptor vanishes from the final PUT.
@@ -1422,7 +1422,7 @@ mod tests {
         }
         // The mount POST carries `from=<sibling>` and is granted (201). NO
         // PATCH/PUT upload is mounted, so a fall-back transfer would 404 and fail
-        // the push — proving the bytes were never streamed.
+        // the push, proving the bytes were never streamed.
         Mock::given(method("POST"))
             .and(path(format!("/v2/{NAMESPACE}/blobs/uploads/")))
             .and(query_param("from", SIBLING))
@@ -1466,7 +1466,7 @@ mod tests {
 
     #[tokio::test]
     async fn push_blob_falls_back_to_upload_when_mount_is_rejected() {
-        // A sibling references the blob, so a mount is attempted -- but the
+        // A sibling references the blob, so a mount is attempted, but the
         // downstream rejects it (its `mount-blob` policy denies it). The pipeline
         // must fall back to a normal upload rather than failing the push.
         const SIBLING: &str = "other/repo";
@@ -1878,7 +1878,7 @@ mod tests {
             .await;
 
         // The referrers fallback index is fetched (absent -> 404 -> start fresh)
-        // and PUT — proving the fallback is not stranded by the converged primary.
+        // and PUT, proving the fallback is not stranded by the converged primary.
         let fallback_tag = format!("{}-{}", subject.algorithm(), subject.hash());
         Mock::given(method("GET"))
             .and(path(format!("/v2/{NAMESPACE}/manifests/{fallback_tag}")))
@@ -1965,7 +1965,7 @@ mod tests {
     #[tokio::test]
     async fn push_manifest_puts_when_downstream_head_returns_404() {
         // HEAD-before-PUT must fail OPEN: when the target reference does not exist
-        // downstream (HEAD 404 — the common first-replication case), `is_ok_and`
+        // downstream (HEAD 404, the common first-replication case), `is_ok_and`
         // is false, so the manifest PUT still runs. Mount NO HEAD mock, so wiremock
         // answers HEAD with a default 404; mount the PUT with `.expect(1)`.
         metrics_provider::init_for_tests();
@@ -2074,7 +2074,7 @@ mod tests {
         // an index may itself omit a top-level `mediaType`. The child is pushed
         // by digest (before the parent index), with the production `None`
         // override, so its PUT must carry the Content-Type recovered from the
-        // child's revision link — otherwise the receiver 400s and the index
+        // child's revision link. Otherwise the receiver 400s and the index
         // never lands.
         metrics_provider::init_for_tests();
         let mock_server = MockServer::start().await;

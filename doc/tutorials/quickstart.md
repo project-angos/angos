@@ -11,7 +11,7 @@ Get Angos running and push your first container image in under 5 minutes.
 ## What You'll Learn
 
 By the end of this tutorial, you will:
-- Run a Angos server
+- Run an Angos server
 - Push a container image to your registry
 - Pull the image back
 

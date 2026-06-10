@@ -60,8 +60,8 @@ pub enum Action {
         upload_id: String,
     },
     /// Enqueue a replication push job for a tag that diverges from (or is
-    /// absent on) a downstream. Applied by the `Executor` via `JobStore::enqueue`
-    /// — never an inline network push (so scrub-discovered divergences get the
+    /// absent on) a downstream. Applied by the `Executor` via `JobStore::enqueue`,
+    /// never an inline network push (so scrub-discovered divergences get the
     /// same durable retry/backoff/coalescing as the event path).
     EnqueueReplicationPush {
         downstream: String,

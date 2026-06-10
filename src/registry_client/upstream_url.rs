@@ -17,7 +17,7 @@ pub const NO_LOCAL_PREFIX: &str = "";
 /// `local_name` is the local repository name whose prefix the pull-mirror path
 /// strips off `upstream_name` (e.g. local `local/repo` -> upstream `repo`). When
 /// no prefix matches, `upstream_name` is returned unchanged. Pass
-/// [`NO_LOCAL_PREFIX`] to disable the rewrite entirely — the identity transform
+/// [`NO_LOCAL_PREFIX`] to disable the rewrite entirely: the identity transform
 /// used by replication, which keeps the downstream namespace identical to local.
 #[must_use]
 pub fn get_upstream_namespace(local_name: &str, upstream_name: &str) -> String {

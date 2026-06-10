@@ -1,4 +1,4 @@
-//! [`ReplicationChecker`] — the scrub reconciliation pass.
+//! [`ReplicationChecker`]: the scrub reconciliation pass.
 //!
 //! For every namespace and every configured downstream, the checker:
 //!
@@ -63,7 +63,7 @@ use crate::{
 /// enqueues a replication delete for each downstream-only tag; pruning is off by
 /// default.
 ///
-/// Holds only resolved `Arc` dependencies — no `*Config` field. Constructed
+/// Holds only resolved `Arc` dependencies, no `*Config` field. Constructed
 /// exclusively via [`ReplicationChecker::builder`].
 pub struct ReplicationChecker {
     metadata_store: Arc<MetadataStore>,
@@ -125,7 +125,7 @@ impl ReplicationChecker {
             // Downstream digest for this tag via OCI HEAD (Docker-Content-Digest).
             // A genuinely-absent tag (404) needs a push; any other HEAD failure
             // (auth rejection, 5xx, timeout) is NOT absence, so skip the tag this
-            // pass rather than enqueuing a spurious push — the next reconcile
+            // pass rather than enqueuing a spurious push. The next reconcile
             // re-checks it. Skips are counted: each records a
             // `replication_reconcile_total{outcome="skipped"}` and the loop warns
             // once per downstream below, so a persistent failure (e.g. bad
@@ -183,8 +183,8 @@ impl ReplicationChecker {
 
         // One warn per downstream per pass (not per tag, so a dead downstream
         // with thousands of tags does not flood the log): probe failures left
-        // these tags unreconciled, and if they persist — bad credentials being
-        // the canonical case — this downstream converges on nothing.
+        // these tags unreconciled, and if they persist (bad credentials being
+        // the canonical case) this downstream converges on nothing.
         if skipped > 0 {
             warn!(
                 "Skipped {skipped} of {} tag(s) of '{namespace}' on downstream '{}': the downstream \
@@ -196,11 +196,11 @@ impl ReplicationChecker {
 
         // 2. Prune (opt-in): when this downstream is an authoritative one-way
         //    mirror (`prune = true`), enumerate its tag set and delete any tag
-        //    absent locally. Skipped by default — for an active-active peer this
+        //    absent locally. Skipped by default: for an active-active peer this
         //    would delete a peer's legitimately-newer tag that has not yet
         //    replicated back, so absence-driven deletion is unsafe there. The
         //    receiver runs LWW on the stamped `source_ts` (see `Executor`), which
-        //    only saves a future-dated downstream tag — it does NOT make prune
+        //    only saves a future-dated downstream tag: it does NOT make prune
         //    active-active safe (a peer's newer tag predating this run is still
         //    deleted), so this is one-way-mirror-only. A failed enumeration warns
         //    and skips cleanup for this downstream rather than aborting the run.
@@ -222,7 +222,7 @@ impl ReplicationChecker {
             }
         };
 
-        // Every local tag counts — including ones whose digest read failed
+        // Every local tag counts, including ones whose digest read failed
         // (`None`): prune must never delete a tag that exists locally.
         let local_set: HashSet<&str> = local_tags.iter().map(|(tag, _)| tag.as_str()).collect();
         for tag in downstream_tags {
@@ -260,7 +260,7 @@ impl NamespaceChecker for ReplicationChecker {
         };
 
         // Nothing to reconcile when no participating downstream exists for this
-        // namespace — skip the (potentially large) tag listing entirely.
+        // namespace: skip the (potentially large) tag listing entirely.
         let downstreams: Vec<&ReplicationDownstream> = repository
             .replication
             .iter()
@@ -271,7 +271,7 @@ impl NamespaceChecker for ReplicationChecker {
         }
 
         // Local tag set, collected AND digest-resolved once, shared across every
-        // downstream — per-downstream resolution would cost O(downstreams × tags)
+        // downstream. Per-downstream resolution would cost O(downstreams × tags)
         // metadata reads. A tag whose link read fails resolves to `None`: the
         // push loop skips it, but it stays in the list so prune still counts it
         // as local (a transient read failure must never delete a live tag).
@@ -384,7 +384,7 @@ mod tests {
     const DOWNSTREAM: &str = "eu-region";
 
     /// Build a single FS-backed metadata store (no S3 backend, so the test runs
-    /// in any environment — mirrors the handler tests). Returns the store
+    /// in any environment, mirroring the handler tests). Returns the store
     /// façade too so callers can seed manifest blobs.
     fn fs_metadata_store() -> (Arc<MetadataStore>, Arc<Store>, TempDir) {
         let dir = TempDir::new().unwrap();
@@ -515,7 +515,7 @@ mod tests {
 
         // Downstream HEAD fails transiently (500). That is NOT a genuine absence,
         // so the tag is skipped for this pass and no push is enqueued (a 404 would
-        // enqueue one — see enqueues_push_for_tag_missing_on_downstream).
+        // enqueue one: see enqueues_push_for_tag_missing_on_downstream).
         Mock::given(method("HEAD"))
             .and(path(format!("/v2/{NAMESPACE}/manifests/v1")))
             .respond_with(ResponseTemplate::new(500))
@@ -910,7 +910,7 @@ mod tests {
     #[tokio::test]
     async fn unreadable_local_tag_is_skipped_but_never_pruned() {
         // A local tag whose link read fails resolves to no digest: the push
-        // loop skips it, but it MUST still count as local for prune — a
+        // loop skips it, but it MUST still count as local for prune: a
         // transient (or corrupt-link) read failure must never delete a live
         // downstream tag.
         metrics_provider::init_for_tests();
@@ -1201,7 +1201,7 @@ mod tests {
         ));
 
         // One `Arc<JobStore>` as both producer (executor enqueue) and consumer
-        // (drain), over the same `Store` façade — mirrors `Command::new`.
+        // (drain), over the same `Store` façade, mirroring `Command::new`.
         let job_store = Arc::new(JobStore::new(metadata_store.store_arc(), "scrub-test"));
 
         let checker = ReplicationChecker::builder()

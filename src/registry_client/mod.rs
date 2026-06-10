@@ -203,8 +203,8 @@ impl RegistryClient {
     /// captured-by-value request state (e.g. the byte body) inside itself.
     ///
     /// First attempt uses the cached header. On `401` the token is refreshed once
-    /// — `refresh_auth_header` is given the originally-attempted header so its
-    /// "another thread already refreshed" short-circuit still applies — and the
+    /// (`refresh_auth_header` is given the originally-attempted header so its
+    /// "another thread already refreshed" short-circuit still applies) and the
     /// request is retried exactly once. A `403` maps to [`Error::Denied`]; any
     /// other status is returned as `Ok` for the caller to classify.
     ///

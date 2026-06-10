@@ -1092,7 +1092,7 @@ async fn test_patch_upload_401_is_unauthorized_without_retry() {
     // A streamed (single-use) PATCH body cannot be replayed, so a 401 must
     // surface as Error::Unauthorized rather than triggering the byte-body
     // refresh-and-retry path. `.expect(1)` (verified when the MockServer drops)
-    // proves exactly one PATCH was sent — i.e. no second attempt.
+    // proves exactly one PATCH was sent, i.e. no second attempt.
     let mock_server = MockServer::start().await;
     let content = b"replicated blob content";
     let session_path = "/v2/test/blobs/uploads/session-1";
@@ -1491,7 +1491,7 @@ async fn test_delete_manifest_surfaces_error_status() {
 #[tokio::test]
 async fn test_delete_manifest_absent_404_is_already_absent() {
     // An already-absent target (404) is convergence, not failure: a retried or
-    // already-converged replication delete must map to AlreadyAbsent — never
+    // already-converged replication delete must map to AlreadyAbsent, never
     // dead-letter, and distinct from Deleted so the caller records a converged
     // no-op rather than an applied delete.
     let mock_server = MockServer::start().await;
@@ -1651,6 +1651,6 @@ async fn list_tags_breaks_on_cyclic_next_link() {
         .expect("cyclic pagination must terminate, not error");
 
     // The base page and the single `?last=z` page are fetched, then the repeated
-    // `?last=z` breaks the loop — never an unbounded fetch (asserted by expect(2)).
+    // `?last=z` breaks the loop, never an unbounded fetch (asserted by expect(2)).
     assert_eq!(tags, vec!["a", "b", "a", "b"]);
 }

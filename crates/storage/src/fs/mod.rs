@@ -262,8 +262,8 @@ async fn ensure_parent(path: &Path) -> Result<(), Error> {
     // directories under a shared parent at once, macOS/APFS can transiently
     // return EINVAL for the intermediate `mkdir` instead of EEXIST, so the
     // recursive create fails with the leaf uncreated. Retry only those race
-    // kinds — EINVAL (`InvalidInput`), EEXIST (`AlreadyExists`), and ENOENT
-    // (`NotFound`, a racing remove of an intermediate) — treating an
+    // kinds: EINVAL (`InvalidInput`), EEXIST (`AlreadyExists`), and ENOENT
+    // (`NotFound`, a racing remove of an intermediate), treating an
     // already-present directory (a racing task won) as success; any other
     // error (permission, bad path) is deterministic and surfaces immediately.
     let mut attempt = 0;

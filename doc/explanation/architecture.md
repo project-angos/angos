@@ -134,7 +134,7 @@ This can be disabled per object kind with `enable_blob_redirect = false` and/or 
 
 **When redirects are enabled** (both flags default to `true`):
 - Clients must have direct network access to the S3 endpoint
-- Pre-signed URLs expire — very slow downloads may fail
+- Pre-signed URLs expire, so very slow downloads may fail
 - S3 bucket policies must allow access from client IP ranges
 
 ---

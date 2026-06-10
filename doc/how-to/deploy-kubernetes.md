@@ -324,7 +324,7 @@ curl http://localhost:8000/v2/
 
 ### With S3 Storage (Recommended)
 
-Angos is stateless—only configuration and S3 bucket data need protection.
+Angos is stateless: only configuration and S3 bucket data need protection.
 
 **Protect the S3 Bucket:**
 

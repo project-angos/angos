@@ -69,7 +69,7 @@ impl From<LockError> for Error {
 // Configuration
 // ---------------------------------------------------------------------------
 
-/// Job-queue tunables. `[global.job_queue]` does not change durability — jobs
+/// Job-queue tunables. `[global.job_queue]` does not change durability: jobs
 /// persist under the store's `_jobs/` prefix and survive a restart either way.
 /// It switches draining from the server's in-process claim loops to separate
 /// `angos worker` processes and enables the externally observable queue-depth

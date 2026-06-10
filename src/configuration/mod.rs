@@ -213,7 +213,7 @@ fn validate_global(
 /// A durable job queue (`[global.job_queue]`) exists to coordinate work across
 /// multiple processes: the server enqueues and one or more `angos worker`
 /// processes drain. That coordination relies on the per-job execution lock being
-/// shared across processes, but the in-process `memory` lock strategy cannot be —
+/// shared across processes, but the in-process `memory` lock strategy cannot be,
 /// so multiple workers (or `scrub --replicate` running alongside a worker) would
 /// each claim and run the same job. Require a shared lock backend whenever the
 /// durable queue is configured (the in-process queue, used when `[global.job_queue]`

@@ -247,7 +247,7 @@ Suitable for KEDA-style autoscaling of `angos worker` pods. Refreshed by a
 background ticker on every server replica.
 
 Envelopes backed off further into the future are deliberately excluded so the
-gauge tracks *actionable* work — spinning up workers for jobs that won't be
+gauge tracks *actionable* work: spinning up workers for jobs that won't be
 claimable for an hour wastes capacity. Tune `pending_ready_horizon_secs`
 (under `[global.job_queue]`) to give your autoscaler enough lead time to spin
 up replicas before the work becomes ready.
@@ -347,7 +347,7 @@ Replication reconcile enqueues emitted by `angos scrub --replicate`, by outcome.
 | Counter | `outcome` |
 
 **Labels:**
-- `outcome`: `enqueued` (a divergence was enqueued — a push, or a prune delete for a `prune = true` downstream), `failed` (the envelope build or enqueue errored), or `skipped` (a downstream HEAD probe failed, e.g: auth rejection, 5xx, timeout, so the tag stays unreconciled this pass; a persistently non-zero `skipped` with zero `enqueued` typically means bad downstream credentials)
+- `outcome`: `enqueued` (a divergence was enqueued: a push, or a prune delete for a `prune = true` downstream), `failed` (the envelope build or enqueue errored), or `skipped` (a downstream HEAD probe failed, e.g: auth rejection, 5xx, timeout, so the tag stays unreconciled this pass; a persistently non-zero `skipped` with zero `enqueued` typically means bad downstream credentials)
 
 This counter lives in the `angos scrub` process, which serves no `/metrics`
 endpoint and exits when the run completes, so Prometheus cannot scrape it. The

@@ -43,7 +43,7 @@ impl RegexPattern {
     /// Consumes the wrapper, returning the compiled [`Regex`].
     ///
     /// Use this when resolving a parse-time config into internal runtime state
-    /// that only needs the compiled matcher (the source string is dropped — it is
+    /// that only needs the compiled matcher (the source string is dropped: it is
     /// kept only for `Serialize`/error messages on the config surface).
     #[must_use]
     pub fn into_regex(self) -> Regex {

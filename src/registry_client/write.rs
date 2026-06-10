@@ -4,7 +4,7 @@
 //! (`start_upload`, `patch_upload`, `complete_upload`, `put_manifest`,
 //! `delete_manifest`) but take request-side inputs (full URLs built by the
 //! `upstream_url` builders, request bodies/streams) and return parsed HTTP
-//! results — not the server's `HeaderMap`-bearing response structs.
+//! results, not the server's `HeaderMap`-bearing response structs.
 //!
 //! Auth, token caching, TLS and the redirect/timeout policy are reused from the
 //! shared machinery on [`RegistryClient`]: byte-bodied requests go through
@@ -49,7 +49,7 @@ struct TagsListBody {
 /// push the referrers fallback tag.
 ///
 /// `superseded` is `true` only when the downstream rejected the push with a
-/// `409` whose OCI error `code` is [`REPLICATION_SUPERSEDED_CODE`] — i.e. the
+/// `409` whose OCI error `code` is [`REPLICATION_SUPERSEDED_CODE`], i.e. the
 /// downstream's copy is strictly newer (last-writer-wins loss). The pipeline
 /// treats this as convergence (success), so `digest`/`subject` are `None` in
 /// that case. Any *other* non-2xx (including a 409 with a different code, e.g.
@@ -64,7 +64,7 @@ pub struct PutManifestResult {
 /// Outcome of a manifest delete.
 ///
 /// A `409` carrying the [`REPLICATION_SUPERSEDED_CODE`] OCI code maps to
-/// [`DeleteManifestOutcome::Superseded`] (last-writer-wins loss — convergence,
+/// [`DeleteManifestOutcome::Superseded`] (last-writer-wins loss: convergence,
 /// not failure). A successful delete maps to [`DeleteManifestOutcome::Deleted`];
 /// a `404` (the target was already gone) maps to
 /// [`DeleteManifestOutcome::AlreadyAbsent`] so the caller can record it as a
@@ -74,7 +74,7 @@ pub struct PutManifestResult {
 pub enum DeleteManifestOutcome {
     /// The downstream applied the delete (a 2xx response).
     Deleted,
-    /// The downstream already lacked the manifest (`404`) — a converged no-op.
+    /// The downstream already lacked the manifest (`404`): a converged no-op.
     AlreadyAbsent,
     /// The downstream rejected the delete by last-writer-wins (`409` with the
     /// replication-superseded OCI code).
@@ -231,7 +231,7 @@ impl RegistryClient {
     /// Starts a resumable blob upload session, returning its continuation URL.
     ///
     /// The session continuation URLs (PATCH/PUT targets) come from the `Location`
-    /// response header — they are server-assigned, never synthesized.
+    /// response header: they are server-assigned, never synthesized.
     ///
     /// # Errors
     ///
@@ -257,10 +257,10 @@ impl RegistryClient {
     ///
     /// Appends `?mount=<digest>[&from=<repo>]` so the server can grant a reference
     /// without a body transfer. The return distinguishes the two outcomes:
-    /// - `Ok(None)` — the mount was satisfied (`201 Created`); no transfer
+    /// - `Ok(None)`: the mount was satisfied (`201 Created`); no transfer
     ///   needed. When the `201` advertises a `Docker-Content-Digest` it is
     ///   verified against the requested digest (a mismatch is an error).
-    /// - `Ok(Some(session_url))` — the mount could not be satisfied (`202
+    /// - `Ok(Some(session_url))`: the mount could not be satisfied (`202
     ///   Accepted`); a session was opened and the caller uploads the bytes.
     ///
     /// Per the distribution spec a mount that cannot be satisfied degrades to a
@@ -289,7 +289,7 @@ impl RegistryClient {
 
         // 201 Created: the blob is already present downstream (mounted). The
         // digest header is optional, but if present it must name the requested
-        // blob — a different digest would falsely mark the blob converged.
+        // blob: a different digest would falsely mark the blob converged.
         if response.status() == StatusCode::CREATED {
             let advertised = response
                 .headers()
@@ -380,7 +380,7 @@ impl RegistryClient {
 
     /// Classifies a `409 Conflict` from a replication write. `Ok(())` means the
     /// downstream rejected by last-writer-wins (OCI code
-    /// [`REPLICATION_SUPERSEDED_CODE`] — its copy is strictly newer), which the
+    /// [`REPLICATION_SUPERSEDED_CODE`]: its copy is strictly newer), which the
     /// caller maps to its own convergence outcome. Any other 409 (e.g. an
     /// immutable-tag `CONFLICT`) returns [`Error`] so the job retries/dead-letters.
     ///
@@ -407,7 +407,7 @@ impl RegistryClient {
     /// referrers fallback tag.
     ///
     /// 409 disambiguation: a `409` whose OCI error `code` is
-    /// [`REPLICATION_SUPERSEDED_CODE`] (the downstream's copy is strictly newer —
+    /// [`REPLICATION_SUPERSEDED_CODE`] (the downstream's copy is strictly newer,
     /// a last-writer-wins loss) returns
     /// `PutManifestResult { superseded: true, .. }` so the pipeline can treat it
     /// as convergence (success). Any *other* 409 (e.g. an immutable-tag
@@ -471,13 +471,13 @@ impl RegistryClient {
     ///
     /// A `404` (the target is already absent) returns
     /// [`DeleteManifestOutcome::AlreadyAbsent`]: the delete is idempotent, so an
-    /// already-converged or retried delete is convergence, not failure — but
+    /// already-converged or retried delete is convergence, not failure, but
     /// distinct from [`DeleteManifestOutcome::Deleted`] so the caller's metrics
     /// can tell an applied delete from a no-op.
     ///
     /// 409 disambiguation: a `409` whose OCI error `code` is
     /// [`REPLICATION_SUPERSEDED_CODE`] returns
-    /// [`DeleteManifestOutcome::Superseded`] (a last-writer-wins loss —
+    /// [`DeleteManifestOutcome::Superseded`] (a last-writer-wins loss:
     /// convergence). Any *other* 409 and every other non-2xx (except the `404`
     /// above) is returned as [`Error`].
     ///

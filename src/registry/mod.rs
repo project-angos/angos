@@ -165,9 +165,9 @@ pub struct Registry {
     update_pull_time: bool,
     job_queue: Arc<JobStore>,
     /// Cancels the in-process claim loops (cache + replication) when this
-    /// `Registry` is dropped — on a hot-reload swap (the superseded `Registry`
+    /// `Registry` is dropped, on a hot-reload swap (the superseded `Registry`
     /// is dropped once in-flight requests release it) or on server shutdown (the
-    /// server context is dropped) — so the loops stop polling the shared store
+    /// server context is dropped), so the loops stop polling the shared store
     /// instead of leaking across reloads. `None` when a durable
     /// `[global.job_queue]` is configured: there are no in-process loops, and
     /// `angos worker` drains the queue and shuts down on its own token.
@@ -300,7 +300,7 @@ fn build_in_process_queue(
 
     // Build BOTH handlers before spawning any claim loop: the replication
     // builder is fallible, and an `Err` after the cache loops were already
-    // spawned would leak them — no caller holds the cancellation token on the
+    // spawned would leak them: no caller holds the cancellation token on the
     // error path, so they would poll the store forever.
     let cache_handler: Arc<dyn JobHandler> = Arc::new(CacheJobHandler::new(
         resolver.clone(),
@@ -310,7 +310,7 @@ fn build_in_process_queue(
 
     // Replication handler over the same shared store: it reads local manifest /
     // blob bytes and pushes them to each downstream `RegistryClient`. Converged
-    // replays are suppressed sender-side — only state-changing writes dispatch,
+    // replays are suppressed sender-side: only state-changing writes dispatch,
     // and receiver-side no-op suppression terminates any remaining mesh cycles.
     let replication_handler: Arc<dyn JobHandler> = Arc::new(
         ReplicationJobHandler::builder()
@@ -351,8 +351,8 @@ fn build_in_process_queue(
 /// loop drains (and `handler` must be the handler bound to that queue).
 ///
 /// `shutdown` stops the loop when the owning `Registry` is dropped. Like
-/// `worker_loop`, the cancellation races only the claim — a job already claimed
-/// runs to completion before the loop exits — so cancellation skips claiming the
+/// `worker_loop`, the cancellation races only the claim (a job already claimed
+/// runs to completion before the loop exits), so cancellation skips claiming the
 /// next job rather than interrupting one mid-execute.
 async fn in_process_claim_loop(
     consumer: Arc<JobStore>,
@@ -380,7 +380,7 @@ impl Drop for Registry {
     fn drop(&mut self) {
         // Stop the in-process claim loops bound to this Registry. They each hold
         // their own `Arc<JobStore>` clone, so dropping the Registry's handle does
-        // not stop them — only cancelling the shared token does. In-flight jobs
+        // not stop them. Only cancelling the shared token does. In-flight jobs
         // are durable and claimed under a lease, so a job interrupted by runtime
         // teardown is re-claimed after restart (at-least-once) rather than lost.
         if let Some(shutdown) = &self.in_process_shutdown {
@@ -660,7 +660,7 @@ mod in_process_replication_tests {
             );
         }
 
-        // The PUT landed; now assert the job actually COMPLETES — the queue must
+        // The PUT landed; now assert the job actually COMPLETES: the queue must
         // drain to zero pending (and zero dead-lettered), proving the loop calls
         // `complete` rather than leaving the job stuck/retrying.
         let drained = timeout(Duration::from_secs(10), async {

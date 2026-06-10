@@ -114,8 +114,8 @@ See [Conditional Capabilities](../reference/configuration.md#conditional-capabil
 
 `global.enable_redirect` has been deprecated and replaced by two separate flags:
 
-- `global.enable_blob_redirect` — controls HTTP 307 redirects for blob (layer/config) downloads.
-- `global.enable_manifest_redirect` — controls HTTP 307 redirects for manifest downloads.
+- `global.enable_blob_redirect`: controls HTTP 307 redirects for blob (layer/config) downloads.
+- `global.enable_manifest_redirect`: controls HTTP 307 redirects for manifest downloads.
 
 Both default to `true`, preserving historical behavior. The old `enable_redirect` field is still accepted as a fallback for both new flags and will emit a deprecation warning at startup.
 

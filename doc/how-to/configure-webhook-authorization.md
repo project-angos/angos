@@ -41,7 +41,7 @@ sequenceDiagram
             W-->>R: Explicit deny (cached)
             R-->>C: 403 Forbidden
         else 429, 5xx, or other non-2xx
-            W-->>R: Unavailable — fail closed, not cached
+            W-->>R: Unavailable (fail closed, not cached)
             R-->>C: 403 Forbidden
         end
     end

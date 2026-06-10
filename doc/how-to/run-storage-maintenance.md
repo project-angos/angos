@@ -15,7 +15,7 @@ Verify storage integrity and enforce retention policies using the `scrub` comman
 
 ## Automatic vs Scheduled Maintenance
 
-Angos performs garbage collection **automatically** during normal operation — unreferenced blobs are cleaned up as part of request handling, without downtime.
+Angos performs garbage collection **automatically** during normal operation: unreferenced blobs are cleaned up as part of request handling, without downtime.
 
 The `scrub` command runs as a **separate periodic process** that operates alongside the live server (no shutdown required):
 - Checking and repairing data corruption
@@ -333,7 +333,7 @@ Running scrub benefits operators who want the per-namespace shard layout's listi
 ./angos -c config.toml scrub --blobs
 ```
 
-This migration is **idempotent** — re-running scrub is safe and will simply skip data that is already in the sharded layout.
+This migration is **idempotent**: re-running scrub is safe and will simply skip data that is already in the sharded layout.
 
 ### Fix Links Format
 

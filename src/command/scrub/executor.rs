@@ -71,7 +71,7 @@ impl Executor {
     /// and lands it on the durable replication queue, so a reconcile-discovered
     /// push coalesces with a pending event-path push on `enqueue`. Deletes key
     /// per deletion event (the `source_ts` is part of their `lock_key`), so a
-    /// prune delete never coalesces with — and can never stale-out — a pending
+    /// prune delete never coalesces with (and can never stale-out) a pending
     /// event-path delete. Records the `replication_reconcile_total` outcome
     /// (`enqueued` / `failed`).
     async fn enqueue_replication(&self, payload: ReplicationPushPayload) -> Result<(), Error> {
@@ -89,7 +89,7 @@ impl Executor {
 }
 
 /// Records a `replication_reconcile_total` outcome: `enqueued` / `failed`
-/// (this executor), or `skipped` (the checker — a downstream probe failure
+/// (this executor), or `skipped` (the checker: a downstream probe failure
 /// left a tag unreconciled this pass).
 pub fn record_reconcile_outcome(outcome: &str) {
     metrics_provider()
@@ -333,7 +333,7 @@ impl ActionSink for Executor {
                 // timestamp is preserved (REPLICATION_SUPERSEDED) rather than
                 // destroyed.
                 //
-                // CAVEAT — prune is a ONE-WAY-MIRROR operation, not active-active
+                // CAVEAT: prune is a ONE-WAY-MIRROR operation, not active-active
                 // safe. `source_ts` here is "now", which is necessarily later than
                 // any tag the downstream already held when reconcile listed it, so
                 // LWW only protects against a tag dated in the FUTURE relative to

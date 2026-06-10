@@ -15,7 +15,7 @@ use crate::oci::{
 /// representation: the probe digest then never matches the local one (every
 /// push re-transfers a converged manifest, and every reconcile pass re-enqueues
 /// it), and the referrers-fallback GET can come back unparseable and
-/// dead-letter the job — precisely on the third-party OCI-1.0 downstreams the
+/// dead-letter the job, precisely on the third-party OCI-1.0 downstreams the
 /// fallback exists for.
 #[must_use]
 pub fn manifest_accept_types() -> Vec<String> {
@@ -41,6 +41,6 @@ pub const X_ANGOS_SOURCE_TIMESTAMP: &str = "X-Angos-Source-Timestamp";
 /// incoming `source_ts`).
 ///
 /// Shared by sender and receiver so the sender can disambiguate an LWW-loss
-/// (convergence — the job completes) from any other 409 (e.g. an immutable-tag
+/// (convergence: the job completes) from any other 409 (e.g. an immutable-tag
 /// conflict, which must surface so the job retries/dead-letters).
 pub const REPLICATION_SUPERSEDED_CODE: &str = "REPLICATION_SUPERSEDED";

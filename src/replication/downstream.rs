@@ -38,7 +38,7 @@ impl ReplicationMode {
 /// Runtime representation of one replication downstream.
 ///
 /// Holds only resolved fields (an `Arc<RegistryClient>`, compiled regexes,
-/// scalars) — no `*Config` field. Constructed exclusively via
+/// scalars), with no `*Config` field. Constructed exclusively via
 /// [`ReplicationDownstream::builder`].
 #[derive(Debug)]
 pub struct ReplicationDownstream {
@@ -74,7 +74,7 @@ impl ReplicationDownstream {
     }
 
     /// True when a live mutation in `namespace` enqueues an event push to this
-    /// downstream — the exact per-downstream condition `dispatch_replication`
+    /// downstream: the exact per-downstream condition `dispatch_replication`
     /// selects on.
     #[must_use]
     pub fn enqueues_for(&self, namespace: &str) -> bool {

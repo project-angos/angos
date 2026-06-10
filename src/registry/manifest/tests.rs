@@ -2405,7 +2405,7 @@ async fn accept_put_manifest_lww_equal_ts_tie_breaks_on_digest() {
     // Wall-clock LWW cannot order two DISTINCT writes stamped with the
     // identical timestamp, and strictly-greater alone would make both sides
     // accept each other's write forever (each acceptance changes state and
-    // re-dispatches — an A<->B swap that never converges). The digest
+    // re-dispatches, an A<->B swap that never converges). The digest
     // tie-break makes the order total: the larger digest wins on every node,
     // so the side holding it rejects the smaller incoming write.
     let test_case = FSRegistryTestCase::new();
@@ -2506,7 +2506,7 @@ async fn accept_put_manifest_lww_reads_bypass_the_link_cache() {
     // sibling replica's write by up to its TTL. The LWW gate must read the
     // BACKEND link, not the cached one: here the cache still holds the seeded
     // (older) link while the store carries a sibling's newer one, and a
-    // replicated push older than the sibling write must be superseded — a
+    // replicated push older than the sibling write must be superseded: a
     // cached read would see only the stale created_at and let it through.
     let test_case = FSRegistryTestCase::with_link_cache_ttl(300);
     let registry = test_case.registry();
@@ -2563,7 +2563,7 @@ async fn accept_put_manifest_lww_reads_bypass_the_link_cache() {
 #[tokio::test]
 async fn put_manifest_reports_changed_from_the_committed_transaction() {
     // `PutManifestResponse.changed` is the no-op-suppression gate. It derives
-    // from the prior target the committed link transaction itself validated —
+    // from the prior target the committed link transaction itself validated,
     // not from a separate pre-write snapshot an interleaved writer could race.
     let test_case = FSRegistryTestCase::new();
     let registry = test_case.registry();
@@ -2762,7 +2762,7 @@ async fn delete_manifest_accepts_lww_newer_source_ts() {
 #[tokio::test]
 async fn delete_manifest_not_superseded_when_local_tag_has_no_created_at() {
     // A local tag link with no recorded `created_at` is treated as oldest, so a
-    // replicated delete is never superseded by it — even with a `source_ts` far in
+    // replicated delete is never superseded by it, even with a `source_ts` far in
     // the past. `created_at` is never `None` through the stamping write path (it is
     // always stamped to `now()` or the source timestamp), so the link is injected
     // directly via `write_link_reference`, mirroring a legacy link written before
@@ -2817,7 +2817,7 @@ async fn delete_manifest_digest_rejects_lww_when_pointing_tag_newer() {
     // A digest delete cascades to every tag pointing at the revision. A
     // replicated delete whose source_ts predates a locally-newer tag pointing at
     // that digest must be superseded: the tag, and the revision it references,
-    // survive — exactly as a tag delete would.
+    // survive, exactly as a tag delete would.
     let test_case = FSRegistryTestCase::new();
     let registry = test_case.registry();
     let namespace = &Namespace::new("lww-repo").unwrap();
@@ -3097,7 +3097,7 @@ mod noop_suppression_tests {
     /// `lock_key` dedup index. Pending pushes for the same tag coalesce on that
     /// index (a tag's pending push is replaced, not duplicated, while still
     /// pending), so draining between two genuine changes lets the second one
-    /// re-enqueue rather than dedup away — isolating the dispatch GATE under test
+    /// re-enqueue rather than dedup away, isolating the dispatch GATE under test
     /// from the queue's (correct) coalescing.
     async fn drain_one(job_store: &JobStore) {
         let claimed = job_store
@@ -3242,7 +3242,7 @@ mod noop_suppression_tests {
 
         // Drain that job so its `lock_key` dedup index clears; otherwise the
         // second enqueue would coalesce on the still-pending job and pending
-        // would stay 1 even if the no-op gate were removed — masking the gate.
+        // would stay 1 even if the no-op gate were removed, masking the gate.
         drain_one(&job_store).await;
         assert_eq!(pending(&job_store).await, 0, "queue drained");
 
@@ -3398,8 +3398,8 @@ mod noop_suppression_tests {
         );
     }
 
-    /// A digest delete that removes only cascade tag links — the revision link
-    /// already gone (an inconsistent local state) — still changed local state,
+    /// A digest delete that removes only cascade tag links (the revision link
+    /// already gone, an inconsistent local state) still changed local state,
     /// so it MUST re-dispatch: the suppression gate keys on the cascade tags,
     /// not the revision link alone.
     #[tokio::test]
@@ -3448,9 +3448,9 @@ mod noop_suppression_tests {
     }
 
     /// A digest delete of an already-absent revision (the revision link gone AND
-    /// no tag still pointing at it — the fully-converged state after a prior
+    /// no tag still pointing at it, the fully-converged state after a prior
     /// delete) enqueues nothing: the negative side of the cascade-tags gate.
-    /// This is the digest bounce-back that terminates a delete cycle — once a
+    /// This is the digest bounce-back that terminates a delete cycle: once a
     /// node has converged, it stops re-dispatching the delete.
     #[tokio::test]
     async fn digest_delete_suppressed_once_converged() {

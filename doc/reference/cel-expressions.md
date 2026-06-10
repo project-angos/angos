@@ -251,7 +251,7 @@ rules = [
 ```
 
 :::warning
-Avoid `request.action.startsWith('get-')` for anonymous access — it includes `get-api-version`,
+Avoid `request.action.startsWith('get-')` for anonymous access: it includes `get-api-version`,
 which causes Docker clients to skip authentication entirely. List specific actions instead.
 :::
 
@@ -280,4 +280,4 @@ rules = [
 **Retention policy rules:**
 - A rule that returns a non-boolean value or fails to evaluate causes the manifest to be retained and emits a `warn`-level log
 - Retention is fail-open by design: unexpected rule outcomes keep the manifest rather than deleting it
-- See [Configure Retention Policies — Misconfigured Rules](../how-to/configure-retention-policies.md#misconfigured-rules-and-fail-open-semantics) for details and log examples
+- See [Configure Retention Policies, Misconfigured Rules](../how-to/configure-retention-policies.md#misconfigured-rules-and-fail-open-semantics) for details and log examples

@@ -224,10 +224,10 @@ identity = {
 
 **Rule evaluation:** Rules are evaluated disjunctively (OR'd). The meaning depends on the mode:
 
-- **`default = "deny"`** (default-deny): rules act as **allow** rules — access is granted if ANY rule returns true.
-- **`default = "allow"`** (default-allow): rules act as **deny** rules — access is denied if ANY rule returns true.
+- **`default = "deny"`** (default-deny): rules act as **allow** rules: access is granted if ANY rule returns true.
+- **`default = "allow"`** (default-allow): rules act as **deny** rules: access is denied if ANY rule returns true.
 
-Do not mix allow and deny logic in the same rules array — since rules are OR'd, a single matching rule determines the outcome.
+Do not mix allow and deny logic in the same rules array: since rules are OR'd, a single matching rule determines the outcome.
 
 ---
 
@@ -276,8 +276,8 @@ Do not use `request.action.startsWith('get-')` for anonymous access. This includ
 
 ### Privileged Job Administration
 
-The durable job-queue actions — `list-jobs`, `list-failed-jobs`, `retry-job`
-and `delete-job` — carry their own action names precisely so they can be gated
+The durable job-queue actions (`list-jobs`, `list-failed-jobs`, `retry-job`
+and `delete-job`) carry their own action names precisely so they can be gated
 above ordinary read traffic. They are intentionally excluded from broad
 `list-*` allow rules; grant them to operators explicitly:
 

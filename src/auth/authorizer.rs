@@ -178,7 +178,7 @@ impl Authorizer {
     }
 
     /// Whether `identity` may read `mount.digest` from at least one namespace that
-    /// already holds it — the precondition for granting a cross-repo blob mount.
+    /// already holds it: the precondition for granting a cross-repo blob mount.
     ///
     /// A mount grants the target a reference to an existing blob with no upload, so
     /// without this check a caller permitted to mount into a namespace they control

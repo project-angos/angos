@@ -293,7 +293,7 @@ sudo chown -R $(id -u):$(id -g) /data/registry
    retry_delay_ms = 100
    ```
 
-4. If the startup probe fails, your S3 provider may not support conditional writes — fall back to Redis locking instead. S3 locking is only supported when using S3 for metadata storage; it cannot be used with filesystem metadata stores.
+4. If the startup probe fails, your S3 provider may not support conditional writes; fall back to Redis locking instead. S3 locking is only supported when using S3 for metadata storage; it cannot be used with filesystem metadata stores.
 
 ---
 

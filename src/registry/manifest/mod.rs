@@ -327,7 +327,7 @@ impl Registry {
         // Whether this write changed local state, from the prior target the
         // committed transaction itself validated: a tag already pointing at
         // this digest, or an already-present revision, is a converged replay.
-        // A missing entry (no `Create` op for the reference — unreachable,
+        // A missing entry (no `Create` op for the reference: unreachable,
         // `link_plan::push` always emits it) fails open so a genuine write is
         // never suppressed.
         let changed = commit.changed(&LinkKind::from_reference(reference), &computed_digest);
@@ -413,7 +413,7 @@ impl Registry {
 
         // No-op suppression: only re-dispatch a delete that actually removed
         // something. The ref counts as absent (gate closed) only when the prior
-        // link is gone AND no tag still points at it — a digest delete that drops
+        // link is gone AND no tag still points at it: a digest delete that drops
         // only cascade tag links (the revision link already absent) still changed
         // local state. A transient read error counts as "existed" so a real
         // delete is never suppressed; with replication off the gate is moot.
@@ -430,8 +430,8 @@ impl Registry {
         let ops = if let Reference::Digest(digest) = reference {
             // Receiver-side last-writer-wins for a replicated digest delete. The
             // delete cascades to every tag pointing at the revision, so a tag
-            // re-pointed locally AFTER the delete was authored — and the revision
-            // it still references — must not be dropped by the older delete. Tag
+            // re-pointed locally AFTER the delete was authored (and the revision
+            // it still references) must not be dropped by the older delete. Tag
             // deletes are guarded by `check_lww_not_superseded` above; a genuine
             // client delete carries no `source_ts` and skips this.
             if let Some(source_ts) = source_ts {
@@ -611,7 +611,7 @@ impl Registry {
     /// a tag (digest references are content-addressed, so there is no conflict to
     /// resolve). When the local tag currently resolves to a `created_at` that is
     /// strictly newer than the incoming `source_ts`, the local copy wins and the
-    /// write is rejected with [`Error::ReplicationSuperseded`] — a 409 carrying a
+    /// write is rejected with [`Error::ReplicationSuperseded`]: a 409 carrying a
     /// distinct OCI code so the sender treats it as convergence rather than a
     /// retryable conflict. A local tag with no recorded `created_at` is treated
     /// as oldest and never blocks the incoming write.
@@ -625,7 +625,7 @@ impl Registry {
     /// an A<->B equal-timestamp swap cannot oscillate. The one remaining
     /// non-strictness is that this read is not atomic with the commit, so two
     /// replicated writes to the same tag arriving together can both pass the
-    /// gate and the later commit wins — the mesh still converges because
+    /// gate and the later commit wins. The mesh still converges because
     /// re-replication re-arbitrates.
     async fn check_lww_not_superseded(
         &self,
@@ -659,25 +659,25 @@ impl Registry {
     }
 
     /// `Some(created_at)` iff the local link strictly supersedes the incoming
-    /// write: its recorded creation time is newer than `source_ts`, or — on an
-    /// exactly equal timestamp — its target digest orders above
+    /// write: its recorded creation time is newer than `source_ts`, or, on an
+    /// exactly equal timestamp, its target digest orders above
     /// `incoming_digest`. `None` when the link is absent, has no `created_at`,
     /// or loses the comparison. A non-`ReferenceNotFound` read error fails
     /// closed (Err) so LWW is never silently disabled by a backend hiccup.
     ///
     /// The digest tie-break makes the LWW order total: wall-clock time cannot
     /// order two distinct writes stamped identically, and strictly-greater
-    /// alone would make BOTH sides accept each other's write — each acceptance
+    /// alone would make BOTH sides accept each other's write: each acceptance
     /// changes state and re-dispatches, so an A<->B pair would swap digests
     /// forever. With the larger digest winning everywhere, exactly one side
     /// rejects and the mesh converges on it. An equal digest is the same
     /// content (a converged replay) and is accepted; a delete carries no
-    /// digest (`None`) and keeps the plain strictly-greater rule — a tied
+    /// digest (`None`) and keeps the plain strictly-greater rule: a tied
     /// delete proceeds, and a delete bounce dies as a no-op at the next hop.
     ///
     /// Reads bypass the link cache: this is a correctness gate, not a serving
     /// read, and on a multi-replica deployment the per-process cache can lag a
-    /// sibling replica's write by up to its TTL — letting an older replicated
+    /// sibling replica's write by up to its TTL, letting an older replicated
     /// write overwrite the newer tag.
     async fn link_supersedes(
         &self,
@@ -713,8 +713,8 @@ impl Registry {
     /// Last-writer-wins guard for a replication-originated *digest* delete.
     ///
     /// A digest delete cascades to every tag pointing at the revision, so a tag
-    /// re-pointed locally after the delete was authored — its `created_at`
-    /// strictly newer than the incoming `source_ts` — must not be dropped by the
+    /// re-pointed locally after the delete was authored (its `created_at`
+    /// strictly newer than the incoming `source_ts`) must not be dropped by the
     /// older delete. When such a tag exists the local copy (and the revision it
     /// still references) wins, and the whole delete is rejected with
     /// [`Error::ReplicationSuperseded`] so the sender records convergence rather
@@ -748,7 +748,7 @@ impl Registry {
     /// dispatch gate in `delete_manifest` consumes this solely to decide whether
     /// to re-dispatch, so when no downstream would enqueue the read is skipped
     /// entirely (restoring the replication-off cost). The put path needs no such
-    /// read — `accept_put_manifest` gets its `changed` gate from the committed
+    /// read: `accept_put_manifest` gets its `changed` gate from the committed
     /// link transaction itself (`PutManifestResponse.changed`).
     /// A read error other than `ReferenceNotFound` is surfaced, not collapsed to
     /// "absent", so a transient backend hiccup never silently suppresses a real
@@ -809,8 +809,8 @@ impl Registry {
         // LWW runs after the body is read because the equal-timestamp tie-break
         // compares digests, and the incoming digest is the body's hash. Only a
         // replicated write (`source_ts` present) pays the hash here; a genuine
-        // client push skips both it and the gate. `store_manifest` re-hashes —
-        // a small, replication-only duplication.
+        // client push skips both it and the gate. `store_manifest` re-hashes (a
+        // small, replication-only duplication).
         let incoming_digest = source_ts
             .is_some()
             .then(|| Digest::Sha256(sha256::hex(&request_body).into()));
@@ -859,12 +859,12 @@ impl Registry {
         // Enqueue replication for the stored manifest, but ONLY when the write
         // actually changed local state (no-op suppression): a tag re-asserted
         // to the same digest, or an already-present revision, is a converged
-        // replay (e.g. an inbound replicated bounce) — re-dispatching it would
+        // replay (e.g. an inbound replicated bounce). Re-dispatching it would
         // keep a 3+-node mesh cycle alive. `response.changed` comes from the
         // prior target the committed link transaction itself validated, so
         // there is no separate pre-write read for an interleaved writer to
         // race. The canonical stored digest is read directly off
-        // `response.digest` (computed once by `store_manifest`) — no
+        // `response.digest` (computed once by `store_manifest`), with no
         // String->Digest re-parse of the `Docker-Content-Digest` header.
         //
         // Webhook events above are emitted unconditionally; only the replication

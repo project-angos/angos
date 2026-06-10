@@ -103,8 +103,8 @@ fn queue_concurrency(config: &Configuration, queue: &str) -> NonZeroUsize {
 }
 
 /// The queues to drain: the repeatable `--queue` values de-duplicated,
-/// preserving the order given on the command line, or -- when none is
-/// passed -- both the `cache` and `replication` queues. Each queue runs an
+/// preserving the order given on the command line, or (when none is
+/// passed) both the `cache` and `replication` queues. Each queue runs an
 /// independent worker pool.
 fn resolve_queues(requested: &[String]) -> Vec<String> {
     if requested.is_empty() {
@@ -465,7 +465,7 @@ mod tests {
     /// can't be downcast, so the binding is asserted BEHAVIOURALLY through each
     /// handler's kind-dispatch: both handlers reject a foreign job kind with an
     /// "unsupported job kind" error at the very first step of `execute`, before
-    /// touching the payload or any backend — so a wrong binding (a cache handler
+    /// touching the payload or any backend, so a wrong binding (a cache handler
     /// where a replication handler was expected, or vice-versa) would NOT reject
     /// the foreign kind and the assertion would fail.
     #[tokio::test]
@@ -493,8 +493,8 @@ mod tests {
         );
     }
 
-    /// `components_for` binds the `cache` queue to a `CacheJobHandler` — the
-    /// mirror of `components_for_binds_replication_queue_to_replication_handler`.
+    /// `components_for` binds the `cache` queue to a `CacheJobHandler` (the
+    /// mirror of `components_for_binds_replication_queue_to_replication_handler`).
     /// The handler is an opaque `Arc<dyn JobHandler>` that can't be downcast, so
     /// the binding is asserted BEHAVIOURALLY: a `replication.push_manifest`
     /// envelope handed to the cache queue's handler must be rejected as an
@@ -541,7 +541,7 @@ mod tests {
 
     /// `components_for` mints a FRESH `JobStore` consumer per call, each with its
     /// own worker id (a fresh `Uuid`). The struct field is private, but two
-    /// consumers over the same shared storage are distinct `Arc`s — asserting the
+    /// consumers over the same shared storage are distinct `Arc`s: asserting the
     /// pointers differ pins that the consumer is not accidentally shared/cached
     /// across queues (each queue must drain on its own consumer).
     #[tokio::test]

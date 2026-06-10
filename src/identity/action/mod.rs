@@ -189,7 +189,7 @@ pub enum Action {
         after: Option<String>,
     },
     /// Requeue a dead-letter job. `queue` is exposed to CEL (as for `list-jobs`);
-    /// `storage_key` is HTTP routing only — excluded from the CEL payload like
+    /// `storage_key` is HTTP routing only, excluded from the CEL payload like
     /// other addressing fields.
     #[serde(rename = "retry-job")]
     RetryJob {

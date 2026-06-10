@@ -10,8 +10,8 @@ use crate::{
 /// Parse-time DTO for one per-repository replication downstream.
 ///
 /// Composes [`RegistryClientConfig`] (flattened into the same TOML table, so the
-/// HTTP/TLS/auth keys — `url`, `max_redirect`, `server_ca_bundle`,
-/// `client_certificate`, `client_private_key`, `username`, `password` — sit at
+/// HTTP/TLS/auth keys, namely `url`, `max_redirect`, `server_ca_bundle`,
+/// `client_certificate`, `client_private_key`, `username` and `password`, sit at
 /// the top level alongside the replication-only keys) plus the replication-only
 /// fields. The shared field set and the mTLS-pairing validation
 /// (`client_certificate` and `client_private_key` must be supplied together) thus

@@ -85,7 +85,7 @@ The scrub command performs storage maintenance and integrity checks. You must sp
 | `--links`                 | `-l`   | Fix links format inconsistencies; remove revisions whose manifest blob is missing; prune phantom referrer back-links |
 | `--media-types`           | `-M`   | Backfill missing `media_type` on manifest links; remove revisions whose manifest blob is missing   |
 | `--referrers`             | `-R`   | Check for and remove orphan referrer links whose referrer manifest is no longer a current revision |
-| `--replicate`             |        | Reconcile every replicated namespace against all its configured downstreams. By default reconciliation is additive: it enqueues a replication push for each diverging or downstream-missing tag and never deletes. A downstream marked `prune = true` is treated as an authoritative one-way mirror — reconciliation also enqueues a replication delete for each downstream-only tag, so prune is one-way-only by design and unsafe for active-active peers (even with receiver-side last-writer-wins it can remove a peer's newer tag). Combine with `--dry-run` to preview. See [Configure Replication](../how-to/configure-replication.md). |
+| `--replicate`             |        | Reconcile every replicated namespace against all its configured downstreams. By default reconciliation is additive: it enqueues a replication push for each diverging or downstream-missing tag and never deletes. A downstream marked `prune = true` is treated as an authoritative one-way mirror: reconciliation also enqueues a replication delete for each downstream-only tag, so prune is one-way-only by design and unsafe for active-active peers (even with receiver-side last-writer-wins it can remove a peer's newer tag). Combine with `--dry-run` to preview. See [Configure Replication](../how-to/configure-replication.md). |
 
 **Examples:**
 
@@ -165,7 +165,7 @@ angos -c /etc/registry/config.toml worker
 
 Requires `[global.job_queue]` to be configured in `config.toml`. Run at least
 one `angos worker` alongside `angos server` whenever durable jobs are
-enabled — the server only enqueues jobs; it does not process them. The worker
+enabled: the server only enqueues jobs; it does not process them. The worker
 hot-reloads `config.toml` just like `angos server`: changes to
 `[global.job_queue]`, `[repository.*]`, `[blob_store.*]`, or
 `[metadata_store.*]` take effect at the next claim; in-flight jobs always

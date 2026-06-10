@@ -339,7 +339,7 @@ mod tests {
 
     /// Proves the cross-repo mount gating rules documented in the access-control
     /// how-to. A cross-mount authorizes as the dedicated `mount-blob` action, so
-    /// a policy gates it with a plain `request.action == 'mount-blob'` rule —
+    /// a policy gates it with a plain `request.action == 'mount-blob'` rule,
     /// independent of the `start-upload` rules that govern ordinary uploads.
     #[test]
     fn test_access_policy_gates_cross_repo_mount() {
@@ -400,7 +400,7 @@ mod tests {
     /// `request.from`. The mount source is surfaced as a plain string CEL
     /// variable that is present only on a cross-repo (`from`-bearing) mount, so a
     /// rule can allow mounts from a trusted source and refuse mounts from any
-    /// other — or, with `has(request.from)`, refuse from-less (auto-discovery)
+    /// other, or, with `has(request.from)`, refuse from-less (auto-discovery)
     /// mounts entirely.
     #[test]
     fn test_access_policy_gates_cross_repo_mount_by_source() {

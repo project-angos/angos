@@ -126,7 +126,7 @@ pub mod tests {
 
     /// A malformed client certificate is logged server-side with the parse
     /// error (for diagnostics) while the client only ever sees the generic
-    /// "Invalid certificate" — the internal detail must not leak into the
+    /// "Invalid certificate"; the internal detail must not leak into the
     /// response. The current-thread runtime is built inside `with_default` so
     /// the future runs on the thread the capturing subscriber is installed on.
     ///

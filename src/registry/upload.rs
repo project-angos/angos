@@ -16,7 +16,7 @@ use crate::{
 /// Maximum number of candidate namespaces CEL-evaluated during a from-less
 /// mount authorization. Referrers of a popular blob could number in the
 /// thousands; without a cap, a single public mount request would trigger one
-/// CEL evaluation per candidate — an attacker-influenceable fan-out. This cap
+/// CEL evaluation per candidate, an attacker-influenceable fan-out. This cap
 /// bounds only that per-candidate authorization loop. The full referrer set is
 /// still read from the blob index and materialized into a Vec first; that Vec is
 /// then sorted and the cap is a `truncate` applied afterwards (so the kept
@@ -207,7 +207,7 @@ impl Registry {
     /// from (resolved by the authorization gate from
     /// [`mount_source_candidates`](Self::mount_source_candidates)). The grant
     /// proceeds only when that same source still references the blob and its
-    /// bytes still exist — re-checked here rather than against an independently
+    /// bytes still exist, re-checked here rather than against an independently
     /// re-derived candidate set, so concurrent index churn between authorization
     /// and grant cannot mount from a source the caller was never authorized
     /// against. On success the completed-blob headers are returned (the caller
@@ -215,7 +215,7 @@ impl Registry {
     ///
     /// Returns `Ok(None)` when the source no longer holds the blob (or its bytes
     /// are gone), so the caller falls back to opening a normal upload session
-    /// (`202 Accepted`) — the spec requires a mount that cannot be satisfied to
+    /// (`202 Accepted`): the spec requires a mount that cannot be satisfied to
     /// degrade to an ordinary upload rather than fail.
     ///
     /// The entire size-check / `can_read` / `grant` sequence runs under the
@@ -250,13 +250,13 @@ impl Registry {
     }
 
     /// Source namespaces a cross-repo mount of `mount.digest` would draw the blob
-    /// from — the namespaces whose read policy must permit the caller before the
+    /// from: the namespaces whose read policy must permit the caller before the
     /// mount may grant a reference. Empty when the blob is absent locally or no
     /// eligible namespace holds it, in which case the caller falls back to an
     /// ordinary upload session.
     ///
-    /// - **`from` set** — `[from]` when that repository owns the blob, else empty.
-    /// - **`from` unset** (automatic discovery) — every namespace that references
+    /// - **`from` set**: `[from]` when that repository owns the blob, else empty.
+    /// - **`from` unset** (automatic discovery): every namespace that references
     ///   the blob; the caller need only be authorized to read one of them.
     pub async fn mount_source_candidates(
         &self,
@@ -280,8 +280,8 @@ impl Registry {
         let mut candidates = BlobOwnership::new(self.metadata_store.as_ref())
             .referencing_namespaces(&mount.digest)
             .await?;
-        // Sort before truncating so the kept candidates are deterministic — the
-        // lexicographically-smallest MAX_FROM_LESS_MOUNT_CANDIDATES — rather than an
+        // Sort before truncating so the kept candidates are deterministic (the
+        // lexicographically-smallest MAX_FROM_LESS_MOUNT_CANDIDATES) rather than an
         // arbitrary HashMap-ordered subset that varies per request and could let a
         // given caller's mount authorize on one request and not another.
         candidates.sort();
@@ -334,7 +334,7 @@ impl Registry {
     ///
     /// When the mount can be satisfied, grants the namespace a reference with no
     /// transfer (`ExistingBlob` → `201`); otherwise falls back to opening an
-    /// ordinary upload session (`202`) — a mount that cannot be satisfied must
+    /// ordinary upload session (`202`): a mount that cannot be satisfied must
     /// degrade to an upload rather than fail.
     #[instrument]
     pub async fn mount_blob(

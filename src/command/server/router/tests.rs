@@ -171,7 +171,7 @@ fn test_parse_mount_blob_with_malformed_from_is_rejected() {
 #[test]
 fn test_parse_start_upload_with_malformed_digest_is_rejected() {
     // A present-but-malformed `?digest=` fails strict query parsing, so the route
-    // does not match and `handle_unknown_route` turns the POST into a 400 —
+    // does not match and `handle_unknown_route` turns the POST into a 400,
     // rather than silently starting a 202 session that drops the digest.
     let uri: Uri = "/v2/myrepo/app/blobs/uploads?digest=not-a-digest"
         .parse()
@@ -213,7 +213,7 @@ fn test_parse_start_upload_no_digest_is_session() {
 #[test]
 fn test_parse_malformed_mount_is_rejected() {
     // A present-but-malformed `?mount=` is a 400, not a silent degrade to a
-    // plain upload session — symmetric with the strict `?digest=`/`?from=`
+    // plain upload session, symmetric with the strict `?digest=`/`?from=`
     // handling. The OCI fall-back-to-session rule covers UNSATISFIABLE mounts,
     // not syntactically invalid ones.
     let route = parse(
@@ -233,7 +233,7 @@ fn test_parse_mount_with_malformed_digest_is_rejected() {
     // Edge case (accepted by design): combining a valid `?mount=` with a
     // malformed `?digest=` fails strict parsing of the WHOLE MountQuery before
     // the mount branch is reached, so the route does not match (POST -> 400).
-    // Unreachable by real clients — they never combine `?mount=` (cross-repo
+    // Unreachable by real clients: they never combine `?mount=` (cross-repo
     // mount) with a monolithic `?digest=`.
     let mount_digest = "sha256:1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef";
     let uri: Uri = format!("/v2/myrepo/target/blobs/uploads/?mount={mount_digest}&digest=garbage")
@@ -258,7 +258,7 @@ fn test_parse_query_strict() {
     assert!(query.mount.is_none());
     assert!(query.from.is_none());
 
-    // An empty query is Some(default) — all fields None.
+    // An empty query is Some(default): all fields None.
     let query: MountQuery = parse_query_strict("").expect("an empty query must parse strictly");
     assert!(query.digest.is_none());
     assert!(query.mount.is_none());

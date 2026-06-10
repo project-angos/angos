@@ -81,7 +81,7 @@ rules = [
 :::warning
 Do not use `request.action.startsWith('get-')` for anonymous access. This would also allow
 `get-api-version` without authentication, which causes Docker to skip sending credentials on
-all subsequent requests — even pushes. Always list only the specific read actions you need.
+all subsequent requests, even pushes. Always list only the specific read actions you need.
 :::
 
 ### IP-Based Access
@@ -159,14 +159,14 @@ rules = [
 
 A cross-repository mount (`POST .../blobs/uploads/?mount={digest}[&from={repository}]`) grants the target
 namespace a reference to an existing blob with no upload. Angos grants it only when the caller is
-authorized to **read** the blob from a namespace that holds it -- the source repository named by
+authorized to **read** the blob from a namespace that holds it: the source repository named by
 `{repository}`, or (for a from-less mount) any namespace that references the blob. A caller who cannot read
 the source falls back to a normal upload instead, so a mount never hands over a blob the caller could
-not otherwise pull -- you do not have to write a policy to close that gap.
+not otherwise pull; you do not have to write a policy to close that gap.
 
 Beyond that source-read check, a mount is its own route and CEL action, `mount-blob`, distinct from
 `start-upload`, so a policy can restrict who may mount **at all** with a single
-`request.action == 'mount-blob'` rule -- independent of the rules governing ordinary uploads. Denying
+`request.action == 'mount-blob'` rule, independent of the rules governing ordinary uploads. Denying
 it rejects the mount request; Angos's own replication transparently falls back to a normal upload when
 a downstream denies the mount, so denying `mount-blob` never breaks replication.
 
@@ -261,7 +261,7 @@ rules = [
 The durable cache-fill job queue is exposed through four extension actions:
 `list-jobs` and `list-failed-jobs` (read the pending and dead-letter
 partitions) and `retry-job` and `delete-job` (mutate them). These are **not**
-covered by the generic `list-*` browsing rule above — they are deliberately
+covered by the generic `list-*` browsing rule above; they are deliberately
 separate action names so you can gate job administration behind higher
 privilege than ordinary catalogue browsing.
 
@@ -283,7 +283,7 @@ rules = [
 ```
 
 With `default = "deny"`, the job actions are denied for every caller that does
-not match the admin rule — including unauthenticated requests and the Web UI's
+not match the admin rule, including unauthenticated requests and the Web UI's
 own browsing identity. The UI's **Jobs** page only renders successfully for
 identities the policy admits.
 
