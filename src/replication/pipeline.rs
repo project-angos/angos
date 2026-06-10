@@ -11,7 +11,7 @@
 //! transfer, and child manifests land before the parent index, so a re-run is a
 //! sequence of no-op HEADs.
 
-use std::{str::FromStr, sync::Arc};
+use std::{collections::HashSet, str::FromStr, sync::Arc};
 
 use futures_util::stream::{self, StreamExt, TryStreamExt};
 use serde_json::{Value, json};
@@ -231,10 +231,15 @@ async fn push_blobs(
     parsed: &ParsedManifestDigests,
     max_concurrent_pushes: usize,
 ) -> Result<(), Error> {
+    // Dedup while preserving order: a manifest may legally repeat a digest
+    // (e.g. an identical layer listed twice), and two concurrent pushes of the
+    // same absent blob would both HEAD-miss and both run the full upload.
+    let mut seen = HashSet::new();
     let blobs: Vec<Digest> = parsed
         .config
         .iter()
         .chain(parsed.layers.iter())
+        .filter(|digest| seen.insert(*digest))
         .cloned()
         .collect();
 
@@ -1660,6 +1665,90 @@ mod tests {
 
         // No PUT mock exists; `.expect(1)` on the HEAD (verified on drop) proves
         // the probe ran and the absence of an error proves no PUT was attempted.
+        drop(mock_server);
+    }
+
+    #[tokio::test]
+    async fn repeated_layer_digest_uploads_the_blob_once() {
+        // A manifest may legally list the same layer digest twice. Without
+        // dedup, both entries HEAD-miss concurrently and both run the full
+        // upload of the same blob. Every upload mock is pinned to `.expect(1)`,
+        // so a second concurrent upload fails the test on drop.
+        metrics_provider::init_for_tests();
+        let mock_server = MockServer::start().await;
+        let dir = TempDir::new().unwrap();
+        let (blob_store, metadata_store, store) = test_blob_store(dir.path().to_str().unwrap());
+
+        let layer = put_blob_direct(&store, b"twice-listed layer").await;
+        let manifest = json!({
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "layers": [
+                { "mediaType": "application/vnd.oci.image.layer.v1.tar", "digest": layer.to_string(), "size": 18 },
+                { "mediaType": "application/vnd.oci.image.layer.v1.tar", "digest": layer.to_string(), "size": 18 },
+            ],
+        });
+        let manifest_bytes = serde_json::to_vec(&manifest).unwrap();
+        let manifest_digest = put_blob_direct(&store, &manifest_bytes).await;
+
+        // Blob absent on the downstream: exactly ONE probe and ONE upload.
+        Mock::given(method("HEAD"))
+            .and(path(format!("/v2/{NAMESPACE}/blobs/{layer}")))
+            .respond_with(ResponseTemplate::new(404))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path(format!("/v2/{NAMESPACE}/blobs/uploads/")))
+            .respond_with(
+                ResponseTemplate::new(202)
+                    .insert_header("Location", format!("/v2/{NAMESPACE}/blobs/uploads/s")),
+            )
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("PATCH"))
+            .and(path(format!("/v2/{NAMESPACE}/blobs/uploads/s")))
+            .respond_with(
+                ResponseTemplate::new(202)
+                    .insert_header("Location", format!("/v2/{NAMESPACE}/blobs/uploads/s")),
+            )
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path(format!("/v2/{NAMESPACE}/blobs/uploads/s")))
+            .respond_with(ResponseTemplate::new(201))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path(format!("/v2/{NAMESPACE}/manifests/v1")))
+            .respond_with(
+                ResponseTemplate::new(201)
+                    .insert_header(DOCKER_CONTENT_DIGEST, manifest_digest.to_string().as_str()),
+            )
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        push_manifest(
+            &downstream_client(&mock_server.uri()),
+            &blob_store,
+            &metadata_store,
+            NAMESPACE,
+            &manifest_digest,
+            None,
+            Some("v1"),
+            manifest_bytes,
+            4,
+            None,
+        )
+        .await
+        .expect("a manifest repeating a layer digest must push it once");
+
+        // The `.expect(1)` mocks (verified on MockServer drop) prove the
+        // duplicate entry triggered no second probe or upload.
         drop(mock_server);
     }
 
