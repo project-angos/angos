@@ -30,8 +30,7 @@ pub mod version;
 pub use blob::{BlobRange, GetBlobResponse};
 pub use error::Error;
 pub use headers::{HeaderMap, ResponseHeaders};
-pub use manifest::ParsedManifestDigests;
-pub use manifest::{GetManifestResponse, parse_manifest_digests};
+pub use manifest::{GetManifestResponse, ParsedManifestDigests, parse_manifest_digests};
 pub use repository::Repository;
 pub use upload::{BlobMount, StartUploadResponse};
 

@@ -489,11 +489,14 @@ impl Registry {
 
 #[cfg(test)]
 mod tests {
-    use std::{io::Cursor, sync::Arc};
+    use std::{io::Cursor, str::FromStr, sync::Arc};
 
     use async_trait::async_trait;
     use bytes::Bytes;
-    use hyper::header::{LOCATION, RANGE};
+    use hyper::{
+        Request,
+        header::{LOCATION, RANGE},
+    };
     use uuid::Uuid;
 
     use angos_storage::{
@@ -503,7 +506,10 @@ mod tests {
     use angos_tx_engine::store::Store;
 
     use crate::{
+        auth::Authorizer,
+        cache,
         event_webhook::event::EventKind,
+        identity::ClientIdentity,
         oci::{Digest, Namespace},
         registry::{
             BlobMount, DOCKER_CONTENT_DIGEST, DOCKER_UPLOAD_UUID, Error, StartUploadResponse,
@@ -516,6 +522,7 @@ mod tests {
                 put_blob_direct,
             },
         },
+        test_fixtures::configuration::load_config,
         util::sha256,
     };
 
@@ -818,8 +825,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_mount_blob_falls_back_when_blob_absent() {
-        use std::str::FromStr;
-
         for test_case in backends() {
             let registry = test_case.registry();
             let source = &Namespace::new("test-repo/source").unwrap();
@@ -957,8 +962,6 @@ mod tests {
 
     #[tokio::test]
     async fn mount_source_candidates_resolves_from_and_discovery() {
-        use std::str::FromStr;
-
         for test_case in backends() {
             let registry = test_case.registry();
             let source = &Namespace::new("test-repo/source").unwrap();
@@ -1027,13 +1030,6 @@ mod tests {
     // blob, for both an explicit `from` and from-less automatic discovery.
     #[tokio::test]
     async fn authorize_mount_source_requires_read_on_the_source() {
-        use hyper::Request;
-
-        use crate::{
-            auth::Authorizer, cache, identity::ClientIdentity,
-            test_fixtures::configuration::load_config,
-        };
-
         for test_case in backends() {
             let registry = test_case.registry();
             let source = &Namespace::new("test-repo/source").unwrap();
@@ -1483,8 +1479,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_complete_upload_digest_mismatch_still_rejected() {
-        use std::str::FromStr;
-
         for test_case in backends() {
             let registry = test_case.registry();
             let namespace = &Namespace::new("test-repo").unwrap();

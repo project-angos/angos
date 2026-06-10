@@ -11,6 +11,7 @@ use uuid::Uuid;
 
 use super::{parse::manifest_meta_from_body, *};
 use crate::{
+    command::server::Error as ServerError,
     oci::Namespace,
     registry::{
         Error, Registry,
@@ -20,6 +21,7 @@ use crate::{
             put_blob_direct,
         },
     },
+    replication::REPLICATION_SUPERSEDED_CODE,
     util::sha256,
 };
 
@@ -2955,9 +2957,6 @@ async fn prune_delete_stamped_source_ts_suppressed_when_local_tag_newer_else_pro
 
 #[tokio::test]
 async fn replication_superseded_maps_to_distinct_oci_code() {
-    use crate::command::server::Error as ServerError;
-    use crate::replication::REPLICATION_SUPERSEDED_CODE;
-
     let superseded: ServerError = Error::ReplicationSuperseded("newer".to_string()).into();
     let conflict: ServerError = Error::Conflict("immutable".to_string()).into();
 
@@ -2999,6 +2998,7 @@ mod noop_suppression_tests {
 
     use crate::{
         cache,
+        event_webhook::event::EventKind,
         oci::{Digest, Namespace, Reference},
         policy::{RetentionPolicy, RetentionPolicyConfig, SystemClock},
         registry::{
@@ -3509,8 +3509,6 @@ mod noop_suppression_tests {
     /// `TagCreate`) even though it enqueues no replication job.
     #[tokio::test]
     async fn noop_push_still_emits_webhook_events() {
-        use crate::event_webhook::event::EventKind;
-
         let dir = TempDir::new().unwrap();
         let (registry, job_store) = build_registry(dir.path().to_str().unwrap());
         let namespace = Namespace::new(NAMESPACE).unwrap();

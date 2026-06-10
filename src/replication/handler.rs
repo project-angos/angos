@@ -319,10 +319,10 @@ impl ReplicationJobHandler {
             .map_err(|e| Error::Storage(e.to_string()))?;
             Self::record_success(&payload.downstream, outcome);
         } else {
-            // Push manifest (and, for a blob-push job, the manifest that
-            // references it — re-resolving the current digest gives latest-wins;
-            // the pipeline HEAD-skips already-present blobs so a blob-only job is
-            // a cheap superset of a manifest push).
+            // Push manifest: re-resolving the current digest at execute time
+            // gives latest-wins for a coalesced job, and the pipeline ships the
+            // referenced blobs (HEAD-skipping any the downstream already holds)
+            // before PUTting the manifest itself.
             let Some((digest, created_at)) =
                 self.resolve_current_digest(&namespace, payload).await?
             else {

@@ -361,6 +361,7 @@ mod tests {
             },
             worker::runner::execute_one,
         },
+        metrics_provider,
         oci::Digest,
         policy::{RetentionPolicy, RetentionPolicyConfig, SystemClock},
         registry::{
@@ -447,7 +448,7 @@ mod tests {
 
     #[tokio::test]
     async fn enqueues_push_for_tag_missing_on_downstream() {
-        crate::metrics_provider::init_for_tests();
+        metrics_provider::init_for_tests();
         let (metadata_store, store, _dir) = fs_metadata_store();
         let mock_server = MockServer::start().await;
 
@@ -495,7 +496,7 @@ mod tests {
 
     #[tokio::test]
     async fn transient_head_failure_skips_tag_without_enqueuing() {
-        crate::metrics_provider::init_for_tests();
+        metrics_provider::init_for_tests();
         let (metadata_store, store, _dir) = fs_metadata_store();
         let mock_server = MockServer::start().await;
 
@@ -578,7 +579,7 @@ mod tests {
 
     #[tokio::test]
     async fn enqueue_failure_does_not_abort_remaining_tags() {
-        crate::metrics_provider::init_for_tests();
+        metrics_provider::init_for_tests();
         let (metadata_store, store, _dir) = fs_metadata_store();
         let mock_server = MockServer::start().await;
 
@@ -639,7 +640,7 @@ mod tests {
 
     #[tokio::test]
     async fn prune_enqueue_failure_does_not_abort_remaining_deletes() {
-        crate::metrics_provider::init_for_tests();
+        metrics_provider::init_for_tests();
         let (metadata_store, _store, _dir) = fs_metadata_store();
         let mock_server = MockServer::start().await;
 
@@ -688,7 +689,7 @@ mod tests {
 
     #[tokio::test]
     async fn no_action_when_downstream_digest_matches() {
-        crate::metrics_provider::init_for_tests();
+        metrics_provider::init_for_tests();
         let (metadata_store, store, _dir) = fs_metadata_store();
         let mock_server = MockServer::start().await;
 
@@ -734,7 +735,7 @@ mod tests {
 
     #[tokio::test]
     async fn enqueues_push_when_downstream_digest_diverges() {
-        crate::metrics_provider::init_for_tests();
+        metrics_provider::init_for_tests();
         let (metadata_store, store, _dir) = fs_metadata_store();
         let mock_server = MockServer::start().await;
 
@@ -782,7 +783,7 @@ mod tests {
 
     #[tokio::test]
     async fn enqueues_delete_for_downstream_only_tag() {
-        crate::metrics_provider::init_for_tests();
+        metrics_provider::init_for_tests();
         let (metadata_store, store, _dir) = fs_metadata_store();
         let mock_server = MockServer::start().await;
 
@@ -846,7 +847,7 @@ mod tests {
 
     #[tokio::test]
     async fn no_delete_when_prune_disabled() {
-        crate::metrics_provider::init_for_tests();
+        metrics_provider::init_for_tests();
         let (metadata_store, store, _dir) = fs_metadata_store();
         let mock_server = MockServer::start().await;
 
@@ -912,7 +913,7 @@ mod tests {
         // loop skips it, but it MUST still count as local for prune — a
         // transient (or corrupt-link) read failure must never delete a live
         // downstream tag.
-        crate::metrics_provider::init_for_tests();
+        metrics_provider::init_for_tests();
         let (metadata_store, store, _dir) = fs_metadata_store();
         let mock_server = MockServer::start().await;
 
@@ -959,7 +960,7 @@ mod tests {
 
     #[tokio::test]
     async fn skips_event_only_downstream() {
-        crate::metrics_provider::init_for_tests();
+        metrics_provider::init_for_tests();
         let (metadata_store, store, _dir) = fs_metadata_store();
 
         let manifest = put_blob_direct(&store, b"event-only-bytes").await;
@@ -998,7 +999,7 @@ mod tests {
         // Symmetric to `skips_event_only_downstream`: a reconcile-only downstream
         // DOES participate in reconciliation, so a tag missing on it enqueues a
         // push.
-        crate::metrics_provider::init_for_tests();
+        metrics_provider::init_for_tests();
         let (metadata_store, store, _dir) = fs_metadata_store();
         let mock_server = MockServer::start().await;
 
@@ -1175,7 +1176,7 @@ mod tests {
     ///    (`count_pending` stays at 1).
     #[tokio::test]
     async fn scrub_replicate_enqueues_then_drains_and_converges() {
-        crate::metrics_provider::init_for_tests();
+        metrics_provider::init_for_tests();
         let (metadata_store, store, _dir) = fs_metadata_store();
         let blob_store = Arc::new(BlobStore::builder().store(store.clone()).build().unwrap());
         let mock_server = MockServer::start().await;
@@ -1283,7 +1284,7 @@ mod tests {
     /// downstream `/v2/<ns>/manifests/stray` exactly once.
     #[tokio::test]
     async fn scrub_replicate_deletes_downstream_only_tag() {
-        crate::metrics_provider::init_for_tests();
+        metrics_provider::init_for_tests();
         let (metadata_store, store, _dir) = fs_metadata_store();
         let blob_store = Arc::new(BlobStore::builder().store(store.clone()).build().unwrap());
         let mock_server = MockServer::start().await;

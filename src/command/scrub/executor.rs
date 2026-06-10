@@ -377,6 +377,8 @@ impl ActionSink for Vec<Action> {
 mod tests {
     use std::str::FromStr;
 
+    use chrono::DateTime;
+
     use super::*;
     use crate::{
         oci::Digest,
@@ -384,6 +386,7 @@ mod tests {
             metadata_store::{LinkOperation, link_kind::LinkKind},
             test_utils::{backends, put_blob_direct},
         },
+        replication::{REPLICATION_DELETE_MANIFEST_KIND, REPLICATION_QUEUE},
     };
 
     #[tokio::test]
@@ -712,10 +715,6 @@ mod tests {
 
     #[tokio::test]
     async fn enqueue_replication_delete_stamps_source_ts_for_receiver_lww() {
-        use chrono::DateTime;
-
-        use crate::replication::{REPLICATION_DELETE_MANIFEST_KIND, REPLICATION_QUEUE};
-
         for test_case in backends() {
             let blob_store = test_case.blob_store();
             let metadata_store = test_case.metadata_store();

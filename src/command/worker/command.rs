@@ -357,6 +357,7 @@ mod tests {
 
     use super::{CLAIM_ERROR_BACKOFF_CAP, WorkerContext, claim_error_backoff, resolve_queues};
     use crate::{
+        metrics_provider,
         registry::{
             blob_store::BlobStore,
             cache_job_handler::{CACHE_FETCH_BLOB_KIND, CACHE_QUEUE},
@@ -430,7 +431,7 @@ mod tests {
     /// would trip `validate_durable_queue_lock`). The `TempDir` is returned so
     /// the on-disk store outlives the context.
     fn worker_context() -> (WorkerContext, TempDir) {
-        crate::metrics_provider::init_for_tests();
+        metrics_provider::init_for_tests();
         let dir = TempDir::new().unwrap();
         let root = dir.path().to_str().unwrap();
 

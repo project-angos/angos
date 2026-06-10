@@ -296,7 +296,7 @@ impl MetricsProvider {
     fn build_replication_push_total(registry: &PrometheusRegistry) -> Result<IntCounterVec, Error> {
         register_int_counter_vec_with_registry!(
             "angos_replication_push_total",
-            "Total replication pushes to a downstream, by outcome (pushed, superseded, failed)",
+            "Total replication pushes to a downstream, by outcome (pushed, converged, superseded, failed)",
             &["downstream", "outcome"],
             registry
         )

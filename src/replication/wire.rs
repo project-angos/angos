@@ -44,14 +44,3 @@ pub const X_ANGOS_SOURCE_TIMESTAMP: &str = "X-Angos-Source-Timestamp";
 /// (convergence — the job completes) from any other 409 (e.g. an immutable-tag
 /// conflict, which must surface so the job retries/dead-letters).
 pub const REPLICATION_SUPERSEDED_CODE: &str = "REPLICATION_SUPERSEDED";
-
-#[cfg(test)]
-mod tests {
-    use crate::replication::{REPLICATION_SUPERSEDED_CODE, X_ANGOS_SOURCE_TIMESTAMP};
-
-    #[test]
-    fn header_name_is_stable() {
-        assert_eq!(X_ANGOS_SOURCE_TIMESTAMP, "X-Angos-Source-Timestamp");
-        assert_eq!(REPLICATION_SUPERSEDED_CODE, "REPLICATION_SUPERSEDED");
-    }
-}

@@ -261,9 +261,11 @@ async fn ensure_parent(path: &Path) -> Result<(), Error> {
     // it races under concurrent transactions: when many tasks create sibling
     // directories under a shared parent at once, macOS/APFS can transiently
     // return EINVAL for the intermediate `mkdir` instead of EEXIST, so the
-    // recursive create fails with the leaf uncreated. Retry, treating an
-    // already-present directory (a racing task won) as success; a real error
-    // (permission, bad path) still surfaces once the retries are exhausted.
+    // recursive create fails with the leaf uncreated. Retry only those race
+    // kinds — EINVAL (`InvalidInput`), EEXIST (`AlreadyExists`), and ENOENT
+    // (`NotFound`, a racing remove of an intermediate) — treating an
+    // already-present directory (a racing task won) as success; any other
+    // error (permission, bad path) is deterministic and surfaces immediately.
     let mut attempt = 0;
     loop {
         match fs::create_dir_all(parent).await {
@@ -272,8 +274,12 @@ async fn ensure_parent(path: &Path) -> Result<(), Error> {
                 if fs::metadata(parent).await.is_ok_and(|m| m.is_dir()) {
                     return Ok(());
                 }
+                let racy = matches!(
+                    e.kind(),
+                    ErrorKind::InvalidInput | ErrorKind::AlreadyExists | ErrorKind::NotFound
+                );
                 attempt += 1;
-                if attempt >= ENSURE_PARENT_RETRIES {
+                if !racy || attempt >= ENSURE_PARENT_RETRIES {
                     return Err(backend_error("create_dir_all", parent, &e));
                 }
                 yield_now().await;
