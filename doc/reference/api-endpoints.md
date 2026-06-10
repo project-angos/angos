@@ -155,6 +155,13 @@ missing, empty, or malformed timestamp simply disables LWW for that request — 
 an ordinary client write rather than failing. A local tag with no recorded creation time is treated as
 oldest and never blocks the incoming write.
 
+A future-dated timestamp is **clamped to the receiver's current time**, so a client cannot pin a
+permanent last-writer-wins victory. A *backdated* timestamp, however, is accepted and persisted as
+the tag's creation time, it weakens that write in later LWW races and feeds age-based retention
+with the supplied date. The header is therefore a statement of trust: restrict which identities may
+push to replicated repositories via the CEL `access_policy` (see
+[Restrict replication writes](../how-to/set-up-access-control.md#restrict-replication-writes)).
+
 A `409 REPLICATION_SUPERSEDED` is convergence, not failure: the sender treats it as success and
 completes the replication job. It is distinct on the wire from the immutable-tag `409 CONFLICT`, which
 surfaces so the job retries or dead-letters.

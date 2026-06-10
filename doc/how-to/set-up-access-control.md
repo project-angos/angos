@@ -195,6 +195,36 @@ rules = [
 The `request.from` field (the mount source repository, present only on `mount-blob`) is available if
 you need to distinguish a scoped mount from a from-less one.
 
+### Restrict replication writes
+
+A replication write is an ordinary manifest `PUT`/`DELETE` carrying the `X-Angos-Source-Timestamp`
+header (see the [API reference](../reference/api-endpoints.md#replication-request-header)). The
+receiver persists that timestamp as the tag's creation time, which drives last-writer-wins conflict
+resolution and age-based retention. A future-dated timestamp is clamped to the receiver's clock, but
+a **backdated** one is accepted from *any* identity allowed to push, letting it weaken a tag in
+later LWW races or age a tag straight into a retention window.
+
+:::warning
+On every instance that receives replication, restrict manifest pushes and deletes on replicated
+repositories to the replicator identity (plus whoever should genuinely push there). There is no
+separate replication permission, the CEL `access_policy` on the ordinary write actions is the gate.
+:::
+
+Under a `default = "deny"` policy:
+
+```toml
+[repository."app".access_policy]
+default = "deny"
+rules = [
+  # pulls for everyone authenticated, writes for the replicator only
+  "request.action == 'get-manifest' || request.action == 'get-blob'",
+  "identity.id == 'replicator' && request.action in ['put-manifest', 'delete-manifest', 'start-upload', 'update-upload', 'complete-upload', 'mount-blob']",
+]
+```
+
+The same `identity.id == 'replicator'` credential is the one configured as `username` on the peer's
+`[[repository."app".downstream]]` entry.
+
 ---
 
 ## Web UI Access
