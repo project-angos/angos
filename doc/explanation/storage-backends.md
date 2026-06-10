@@ -560,7 +560,7 @@ The registry is append-only at runtime: namespaces are added when their first li
 
 #### Legacy Blob Index and Namespace Registry Migration
 
-Two pre-existing legacy layouts can be encountered after upgrade: the per-blob `index.json` file written by Angos prior to v1.1.0, and the single-file `namespace_registry.json` that filesystem deployments used before this release. Both layouts continue to work at runtime without any migration step.
+Two pre-existing legacy layouts can be encountered after upgrade: the per-blob `index.json` file written by Angos prior to v1.1.0, and the single-file `namespace_registry.json` that filesystem deployments used prior to v1.2.0. Both layouts continue to work at runtime without any migration step.
 
 Runtime reads consult the sharded layout first and fall back to the legacy file when no sharded entry covers the request. Writes follow the same per-blob rule: when a legacy `index.json` is present for a digest the runtime updates it in place (the legacy file stays the source of truth for that blob until scrub moves it), and only when no legacy file is present does a write create or update a sharded entry under `refs/{namespace}.json`. This is decided per blob, so different blobs in the same deployment can sit in different states. The namespace registry behaves the same way on reads: the shards are consulted first and the legacy `namespace_registry.json` is read when no shards are present.
 

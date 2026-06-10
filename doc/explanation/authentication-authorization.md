@@ -307,7 +307,7 @@ sequenceDiagram
     participant Registry
     participant Webhook
 
-    Registry->>Webhook: POST <configured webhook URL>
+    Registry->>Webhook: GET <configured webhook URL>
     Note right of Webhook: Headers contain request context
     Webhook-->>Registry: 200 OK (allow)
     Webhook-->>Registry: 403 Forbidden (deny)

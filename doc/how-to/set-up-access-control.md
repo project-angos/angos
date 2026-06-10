@@ -172,7 +172,7 @@ a downstream denies the mount, so denying `mount-blob` never breaks replication.
 
 :::warning Grant `mount-blob` wherever you grant uploads
 Container clients (Docker, containerd) send `?mount=` **opportunistically** on push whenever a blob
-may already exist elsewhere on the registry, a mount attempt is part of an ordinary push, not a
+may already exist elsewhere on the registry; a mount attempt is part of an ordinary push, not a
 special operation. Under a `default = "deny"` policy, an identity allowed to `start-upload` but not
 `mount-blob` has those pushes rejected. Grant `mount-blob` to every identity allowed to upload,
 unless you deliberately accept failing the pushes of mount-attempting clients.

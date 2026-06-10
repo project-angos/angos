@@ -220,7 +220,7 @@ Multiple security layers:
 ### Fail-Closed Authorization
 
 - Webhooks fail-closed on timeout/error
-- CEL policy errors skip the rule (logged)
+- CEL policy evaluation errors and non-boolean results deny the request
 - No authentication = no identity
 
 ### No Unsafe Code
