@@ -560,9 +560,11 @@ fn referrer_descriptor(
 /// so the job retries/dead-letters.
 ///
 /// On success returns [`PushOutcome::Pushed`] when the downstream applied the
-/// delete, or [`PushOutcome::Superseded`] when it lost a last-writer-wins
-/// comparison (both are convergence; the caller records them as distinct
-/// metrics outcomes).
+/// delete, [`PushOutcome::Converged`] when the target was already absent (a
+/// no-op `404`, mirroring the push path's HEAD-converged skip), or
+/// [`PushOutcome::Superseded`] when it lost a last-writer-wins comparison
+/// (all three are convergence; the caller records them as distinct metrics
+/// outcomes).
 ///
 /// # Errors
 ///
@@ -584,6 +586,14 @@ pub async fn delete_manifest(
         DeleteManifestOutcome::Deleted => {
             info!(namespace, %reference, "Deleted manifest on downstream");
             Ok(PushOutcome::Pushed)
+        }
+        DeleteManifestOutcome::AlreadyAbsent => {
+            info!(
+                namespace,
+                %reference,
+                "Downstream already lacked this manifest; delete is a no-op (converged)"
+            );
+            Ok(PushOutcome::Converged)
         }
         DeleteManifestOutcome::Superseded => {
             info!(
@@ -2152,6 +2162,38 @@ mod tests {
         .await
         .expect("an LWW-superseded delete-409 must be treated as success");
 
+        drop(mock_server);
+    }
+
+    #[tokio::test]
+    async fn delete_manifest_of_absent_target_is_converged_not_pushed() {
+        // A 404 delete (the target is already gone) is a no-op, mirroring the
+        // push path's HEAD-converged skip: it must record
+        // `outcome="converged"`, not `pushed`, so the metric distinguishes an
+        // applied delete from a converged retry/bounce.
+        metrics_provider::init_for_tests();
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("DELETE"))
+            .and(path(format!("/v2/{NAMESPACE}/manifests/gone")))
+            .respond_with(ResponseTemplate::new(404))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let outcome = delete_manifest(
+            &downstream_client(&mock_server.uri()),
+            NAMESPACE,
+            &Reference::Tag("gone".to_string()),
+            None,
+        )
+        .await
+        .expect("an already-absent delete must succeed");
+        assert_eq!(
+            outcome,
+            PushOutcome::Converged,
+            "an already-absent delete is a converged no-op, not an applied delete"
+        );
         drop(mock_server);
     }
 

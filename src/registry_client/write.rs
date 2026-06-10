@@ -65,12 +65,17 @@ pub struct PutManifestResult {
 ///
 /// A `409` carrying the [`REPLICATION_SUPERSEDED_CODE`] OCI code maps to
 /// [`DeleteManifestOutcome::Superseded`] (last-writer-wins loss — convergence,
-/// not failure). A successful delete maps to [`DeleteManifestOutcome::Deleted`].
-/// Any other non-2xx is returned as [`Error`].
+/// not failure). A successful delete maps to [`DeleteManifestOutcome::Deleted`];
+/// a `404` (the target was already gone) maps to
+/// [`DeleteManifestOutcome::AlreadyAbsent`] so the caller can record it as a
+/// converged no-op rather than an applied delete. Any other non-2xx is
+/// returned as [`Error`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeleteManifestOutcome {
-    /// The downstream deleted (or already lacked) the manifest.
+    /// The downstream applied the delete (a 2xx response).
     Deleted,
+    /// The downstream already lacked the manifest (`404`) — a converged no-op.
+    AlreadyAbsent,
     /// The downstream rejected the delete by last-writer-wins (`409` with the
     /// replication-superseded OCI code).
     Superseded,
@@ -465,8 +470,10 @@ impl RegistryClient {
     /// replication delete); it is `None` for an ordinary delete.
     ///
     /// A `404` (the target is already absent) returns
-    /// [`DeleteManifestOutcome::Deleted`]: the delete is idempotent, so an
-    /// already-converged or retried delete is convergence, not failure.
+    /// [`DeleteManifestOutcome::AlreadyAbsent`]: the delete is idempotent, so an
+    /// already-converged or retried delete is convergence, not failure — but
+    /// distinct from [`DeleteManifestOutcome::Deleted`] so the caller's metrics
+    /// can tell an applied delete from a no-op.
     ///
     /// 409 disambiguation: a `409` whose OCI error `code` is
     /// [`REPLICATION_SUPERSEDED_CODE`] returns
@@ -498,7 +505,7 @@ impl RegistryClient {
         // idempotent, so a retried, coalesced, or bounce-back delete whose target
         // a prior attempt already removed must not error and dead-letter.
         if response.status() == StatusCode::NOT_FOUND {
-            return Ok(DeleteManifestOutcome::Deleted);
+            return Ok(DeleteManifestOutcome::AlreadyAbsent);
         }
 
         if !response.status().is_success() {
