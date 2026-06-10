@@ -102,18 +102,19 @@ fn queue_concurrency(config: &Configuration, queue: &str) -> NonZeroUsize {
     }
 }
 
-/// The queues to drain: the repeatable `--queue` values de-duplicated, or --
-/// when none is passed -- both the `cache` and `replication` queues. Order is
-/// irrelevant; each queue runs an independent worker pool.
+/// The queues to drain: the repeatable `--queue` values de-duplicated,
+/// preserving the order given on the command line, or -- when none is
+/// passed -- both the `cache` and `replication` queues. Each queue runs an
+/// independent worker pool.
 fn resolve_queues(requested: &[String]) -> Vec<String> {
     if requested.is_empty() {
         return vec![CACHE_QUEUE.to_string(), REPLICATION_QUEUE.to_string()];
     }
+    let mut seen = HashSet::new();
     requested
         .iter()
+        .filter(|queue| seen.insert(queue.as_str()))
         .cloned()
-        .collect::<HashSet<_>>()
-        .into_iter()
         .collect()
 }
 
@@ -348,7 +349,7 @@ impl WorkerContext {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashMap, collections::HashSet, sync::Arc, time::Duration};
+    use std::{collections::HashMap, sync::Arc, time::Duration};
 
     use tempfile::TempDir;
 
@@ -376,17 +377,15 @@ mod tests {
     }
 
     #[test]
-    fn resolve_queues_dedups_requested_queues() {
-        let resolved: HashSet<String> = resolve_queues(&[
-            "replication".to_string(),
-            "cache".to_string(),
-            "replication".to_string(),
-        ])
-        .into_iter()
-        .collect();
+    fn resolve_queues_dedups_preserving_command_line_order() {
         assert_eq!(
-            resolved,
-            HashSet::from(["replication".to_string(), "cache".to_string()])
+            resolve_queues(&[
+                "replication".to_string(),
+                "cache".to_string(),
+                "replication".to_string(),
+            ]),
+            vec!["replication".to_string(), "cache".to_string()],
+            "explicit --queue order must be preserved, duplicates dropped"
         );
     }
 
