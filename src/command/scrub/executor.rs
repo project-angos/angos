@@ -88,8 +88,10 @@ impl Executor {
     }
 }
 
-/// Records a `replication_reconcile_total` outcome (`enqueued` / `failed`).
-fn record_reconcile_outcome(outcome: &str) {
+/// Records a `replication_reconcile_total` outcome: `enqueued` / `failed`
+/// (this executor), or `skipped` (the checker — a downstream probe failure
+/// left a tag unreconciled this pass).
+pub fn record_reconcile_outcome(outcome: &str) {
     metrics_provider()
         .replication_reconcile_total
         .with_label_values(&[outcome])

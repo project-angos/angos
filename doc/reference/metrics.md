@@ -333,7 +333,7 @@ Replication reconcile enqueues emitted by `angos scrub --replicate`, by outcome.
 | Counter | `outcome` |
 
 **Labels:**
-- `outcome`: `enqueued` (a divergence was enqueued — a push, or a prune delete for a `prune = true` downstream) or `failed` (the envelope build or enqueue errored)
+- `outcome`: `enqueued` (a divergence was enqueued — a push, or a prune delete for a `prune = true` downstream), `failed` (the envelope build or enqueue errored), or `skipped` (a downstream HEAD probe failed, e.g: auth rejection, 5xx, timeout, so the tag stays unreconciled this pass; a persistently non-zero `skipped` with zero `enqueued` typically means bad downstream credentials)
 
 **Example:**
 ```promql

@@ -45,7 +45,7 @@ use crate::{
         action::Action,
         check::{NamespaceChecker, list_all},
         error::Error,
-        executor::ActionSink,
+        executor::{ActionSink, record_reconcile_outcome},
     },
     oci::{Digest, Reference},
     registry::{
@@ -113,15 +113,21 @@ impl ReplicationChecker {
     ) {
         // 1. Push: iterate the LOCAL tag set and probe each tag on the downstream
         //    with `head_manifest`; a diverging or missing tag needs a push.
+        let mut skipped: usize = 0;
         for tag in local_tags {
             let Some(local) = self.local_digest(namespace, tag).await else {
                 continue;
             };
 
             // Downstream digest for this tag via OCI HEAD (Docker-Content-Digest).
-            // A genuinely-absent tag (404) needs a push; a transient HEAD failure
-            // (5xx/timeout) is NOT absence, so skip the tag this pass rather than
-            // enqueuing a spurious push — the next reconcile re-checks it.
+            // A genuinely-absent tag (404) needs a push; any other HEAD failure
+            // (auth rejection, 5xx, timeout) is NOT absence, so skip the tag this
+            // pass rather than enqueuing a spurious push — the next reconcile
+            // re-checks it. Skips are counted: each records a
+            // `replication_reconcile_total{outcome="skipped"}` and the loop warns
+            // once per downstream below, so a persistent failure (e.g. bad
+            // credentials, which reconcile NOTHING run after run) is visible
+            // instead of a silent debug-level no-op.
             let location = downstream.registry_client.get_manifest_path(
                 NO_LOCAL_PREFIX,
                 namespace,
@@ -136,9 +142,11 @@ impl ReplicationChecker {
                 Err(RegistryError::ManifestUnknown) => None,
                 Err(e) => {
                     debug!(
-                        "HEAD for '{namespace}:{tag}' on downstream '{}' failed transiently; skipping this pass: {e}",
+                        "HEAD for '{namespace}:{tag}' on downstream '{}' failed; skipping this pass: {e}",
                         downstream.name
                     );
+                    skipped += 1;
+                    record_reconcile_outcome("skipped");
                     continue;
                 }
             };
@@ -168,6 +176,19 @@ impl ReplicationChecker {
                     downstream.name
                 );
             }
+        }
+
+        // One warn per downstream per pass (not per tag, so a dead downstream
+        // with thousands of tags does not flood the log): probe failures left
+        // these tags unreconciled, and if they persist — bad credentials being
+        // the canonical case — this downstream converges on nothing.
+        if skipped > 0 {
+            warn!(
+                "Skipped {skipped} of {} tag(s) of '{namespace}' on downstream '{}': the downstream \
+                 HEAD probes failed (see debug logs); they stay unreconciled until a pass succeeds",
+                local_tags.len(),
+                downstream.name
+            );
         }
 
         // 2. Prune (opt-in): when this downstream is an authoritative one-way
@@ -500,6 +521,12 @@ mod tests {
             .build()
             .unwrap();
 
+        // Metrics are process-global and shared across tests: assert the DELTA.
+        let skipped_before = crate::metrics_provider::metrics_provider()
+            .replication_reconcile_total
+            .with_label_values(&["skipped"])
+            .get();
+
         let mut sink: Vec<Action> = Vec::new();
         checker.check(NAMESPACE, &mut sink).await.unwrap();
 
@@ -507,6 +534,16 @@ mod tests {
             sink.is_empty(),
             "a transient downstream HEAD failure must not enqueue a push, got {} action(s)",
             sink.len()
+        );
+        let skipped_after = crate::metrics_provider::metrics_provider()
+            .replication_reconcile_total
+            .with_label_values(&["skipped"])
+            .get();
+        assert_eq!(
+            skipped_after - skipped_before,
+            1,
+            "a skipped tag must record replication_reconcile_total{{outcome=\"skipped\"}} \
+             so a persistently failing downstream (e.g. bad credentials) is visible"
         );
     }
 
