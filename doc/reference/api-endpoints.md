@@ -78,6 +78,8 @@ Query parameters:
   On success the server returns `201 Created` with the blob `Location`. When the blob cannot be
   mounted (absent, not held by the named source, or not readable by the caller), the server falls
   back to a normal upload session (`202 Accepted`) — a mount request never fails for this reason.
+  The session fall-back covers *unsatisfiable* mounts only: a syntactically malformed `?digest=`,
+  `?mount=`, or `?from=` value returns `400 Bad Request`.
 
   **Authorization.** A mount only grants a reference to a blob the caller could already read: the
   server evaluates the caller's read access (`get-blob`) against the source namespace (the `from`

@@ -225,11 +225,13 @@ fn try_parse_upload(method: &Method, path: &str, params: Option<&str>) -> Option
             None => MountQuery::default(),
         };
 
-        // A valid `?mount=<digest>` requests a cross-repo mount; anything else
-        // (including a malformed mount) is an ordinary upload start.
-        if let Some(value) = &query.mount
-            && let Ok(digest) = value.parse::<Digest>()
-        {
+        // A present `?mount=` must be a valid digest: a malformed value is
+        // rejected (the POST becomes a 400), symmetric with the strict
+        // `?digest=`/`?from=` handling above — the OCI fall-back-to-session
+        // rule covers UNSATISFIABLE mounts, not syntactically invalid ones, and
+        // a silent degrade to a plain session would hide the client's bug.
+        if let Some(value) = &query.mount {
+            let digest = value.parse::<Digest>().ok()?;
             // A present-but-invalid `?from=` is rejected (the POST becomes a 400)
             // rather than silently treated as from-less auto-discovery, which would
             // widen the authorized source set.

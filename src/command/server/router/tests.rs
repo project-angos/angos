@@ -211,6 +211,24 @@ fn test_parse_start_upload_no_digest_is_session() {
 }
 
 #[test]
+fn test_parse_malformed_mount_is_rejected() {
+    // A present-but-malformed `?mount=` is a 400, not a silent degrade to a
+    // plain upload session — symmetric with the strict `?digest=`/`?from=`
+    // handling. The OCI fall-back-to-session rule covers UNSATISFIABLE mounts,
+    // not syntactically invalid ones.
+    let route = parse(
+        &Method::POST,
+        &"/v2/myrepo/target/blobs/uploads/?mount=not-a-digest"
+            .parse()
+            .unwrap(),
+    );
+    assert!(
+        route.is_none(),
+        "a malformed ?mount= must reject the route (POST -> 400), got: {route:?}"
+    );
+}
+
+#[test]
 fn test_parse_mount_with_malformed_digest_is_rejected() {
     // Edge case (accepted by design): combining a valid `?mount=` with a
     // malformed `?digest=` fails strict parsing of the WHOLE MountQuery before
