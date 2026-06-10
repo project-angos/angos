@@ -166,6 +166,21 @@ pub fn create_test_registry(
 /// shortcut. Seeds blob bytes without invoking the upload state machine
 /// (no upload-session record, no namespace required) — which matches the
 /// legacy `BlobStore::create` semantics most closely.
+/// Write raw bytes at the canonical link path for `link` in `namespace`.
+///
+/// Test-only setup for hand-crafted or deliberately corrupt link files (e.g.
+/// pinning how readers handle an unparseable link); production code writes
+/// links through the transactional engine via `update_links`.
+pub async fn put_link_raw(store: &Store, namespace: &str, link: &LinkKind, body: &[u8]) {
+    store
+        .put(
+            &path_builder::link_path(link, namespace),
+            Bytes::copy_from_slice(body),
+        )
+        .await
+        .expect("raw link write");
+}
+
 pub async fn put_blob_direct(store: &Store, content: &[u8]) -> Digest {
     let mut hasher = Sha256::new();
     hasher.update(content);

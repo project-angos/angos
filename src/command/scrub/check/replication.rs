@@ -108,14 +108,17 @@ impl ReplicationChecker {
         &self,
         downstream: &ReplicationDownstream,
         namespace: &str,
-        local_tags: &[String],
+        local_tags: &[(String, Option<Digest>)],
         sink: &mut (dyn ActionSink + Send),
     ) {
-        // 1. Push: iterate the LOCAL tag set and probe each tag on the downstream
-        //    with `head_manifest`; a diverging or missing tag needs a push.
+        // 1. Push: iterate the LOCAL tag set (digests pre-resolved by `check`,
+        //    once for all downstreams) and probe each tag on the downstream with
+        //    `head_manifest`; a diverging or missing tag needs a push. A tag
+        //    whose local read failed (`None`) is skipped here but still counts
+        //    as local for the prune step below.
         let mut skipped: usize = 0;
-        for tag in local_tags {
-            let Some(local) = self.local_digest(namespace, tag).await else {
+        for (tag, local) in local_tags {
+            let Some(local) = local else {
                 continue;
             };
 
@@ -151,7 +154,7 @@ impl ReplicationChecker {
                 }
             };
 
-            if downstream_digest.as_ref() == Some(&local) {
+            if downstream_digest.as_ref() == Some(local) {
                 debug!(
                     "Tag '{namespace}:{tag}' already converged on downstream '{}'",
                     downstream.name
@@ -164,7 +167,7 @@ impl ReplicationChecker {
                     downstream: downstream.name.clone(),
                     namespace: namespace.to_string(),
                     tag: tag.clone(),
-                    digest: local,
+                    digest: local.clone(),
                 })
                 .await
             {
@@ -219,7 +222,9 @@ impl ReplicationChecker {
             }
         };
 
-        let local_set: HashSet<&str> = local_tags.iter().map(String::as_str).collect();
+        // Every local tag counts — including ones whose digest read failed
+        // (`None`): prune must never delete a tag that exists locally.
+        let local_set: HashSet<&str> = local_tags.iter().map(|(tag, _)| tag.as_str()).collect();
         for tag in downstream_tags {
             if local_set.contains(tag.as_str()) {
                 continue;
@@ -265,11 +270,17 @@ impl NamespaceChecker for ReplicationChecker {
             return Ok(());
         }
 
-        // Local tag set, collected once and shared across every downstream.
-        let mut local_tags: Vec<String> = Vec::new();
+        // Local tag set, collected AND digest-resolved once, shared across every
+        // downstream — per-downstream resolution would cost O(downstreams × tags)
+        // metadata reads. A tag whose link read fails resolves to `None`: the
+        // push loop skips it, but it stays in the list so prune still counts it
+        // as local (a transient read failure must never delete a live tag).
+        let mut local_tags: Vec<(String, Option<Digest>)> = Vec::new();
         let mut stream = list_all::tags(&self.metadata_store, namespace);
         while let Some(tag) = stream.next().await {
-            local_tags.push(tag?);
+            let tag = tag?;
+            let digest = self.local_digest(namespace, &tag).await;
+            local_tags.push((tag, digest));
         }
 
         for downstream in downstreams {
@@ -359,7 +370,7 @@ mod tests {
             manifest::DEFAULT_MAX_MANIFEST_SIZE_BYTES,
             metadata_store::{LinkOperation, MetadataStore, link_kind::LinkKind},
             repository_resolver::RepositoryResolver,
-            test_utils::{build_store, build_test_fs_executor, put_blob_direct},
+            test_utils::{build_store, build_test_fs_executor, put_blob_direct, put_link_raw},
         },
         registry_client::RegistryClient,
         replication::{
@@ -891,6 +902,59 @@ mod tests {
         assert!(
             sink.is_empty(),
             "prune disabled: a downstream-only tag must not be deleted"
+        );
+        drop(mock_server);
+    }
+
+    #[tokio::test]
+    async fn unreadable_local_tag_is_skipped_but_never_pruned() {
+        // A local tag whose link read fails resolves to no digest: the push
+        // loop skips it, but it MUST still count as local for prune — a
+        // transient (or corrupt-link) read failure must never delete a live
+        // downstream tag.
+        crate::metrics_provider::init_for_tests();
+        let (metadata_store, store, _dir) = fs_metadata_store();
+        let mock_server = MockServer::start().await;
+
+        // Local: tag `broken` exists but its link bytes are not parseable
+        // LinkMetadata, so digest resolution fails.
+        put_link_raw(
+            &store,
+            NAMESPACE,
+            &LinkKind::Tag("broken".to_string()),
+            b"not-a-link",
+        )
+        .await;
+
+        // Prune-enabled downstream lists `broken`: it must NOT be deleted (the
+        // push loop never probes an unreadable tag, so no HEAD mock is needed).
+        Mock::given(method("GET"))
+            .and(path(format!("/v2/{NAMESPACE}/tags/list")))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({ "tags": ["broken"] })),
+            )
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let resolver = resolver_for(repository(
+            downstream_client(&mock_server.uri()),
+            ReplicationMode::EventReconcile,
+            true,
+        ));
+        let checker = ReplicationChecker::builder()
+            .metadata_store(metadata_store.clone())
+            .resolver(resolver)
+            .build()
+            .unwrap();
+
+        let mut sink: Vec<Action> = Vec::new();
+        checker.check(NAMESPACE, &mut sink).await.unwrap();
+
+        assert!(
+            sink.is_empty(),
+            "an unreadable local tag must be skipped for push AND protected from prune, got {} action(s)",
+            sink.len()
         );
         drop(mock_server);
     }
