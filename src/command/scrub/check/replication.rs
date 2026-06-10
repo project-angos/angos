@@ -54,7 +54,7 @@ use crate::{
         repository_resolver::RepositoryResolver,
     },
     registry_client::NO_LOCAL_PREFIX,
-    replication::ReplicationDownstream,
+    replication::{ReplicationDownstream, manifest_accept_types},
 };
 
 /// Reconciles every replicated namespace with all its downstreams by enqueuing a
@@ -129,7 +129,7 @@ impl ReplicationChecker {
             );
             let downstream_digest = match downstream
                 .registry_client
-                .head_manifest(&[], &location)
+                .head_manifest(&manifest_accept_types(), &location)
                 .await
             {
                 Ok((_, digest, _)) => Some(digest),

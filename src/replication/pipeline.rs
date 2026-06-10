@@ -27,7 +27,7 @@ use crate::{
         parse_manifest_digests,
     },
     registry_client::{DeleteManifestOutcome, NO_LOCAL_PREFIX, RegistryClient},
-    replication::Error,
+    replication::{Error, manifest_accept_types},
 };
 
 /// Outcome of a successful replication push or delete.
@@ -153,7 +153,7 @@ pub async fn push_manifest(
     //     idempotent and a referrer manifest is small, so re-issuing it is cheap.
     if parsed.subject.is_none()
         && downstream
-            .head_manifest(&[], &location)
+            .head_manifest(&manifest_accept_types(), &location)
             .await
             .is_ok_and(|(_, downstream_digest, _)| &downstream_digest == digest)
     {
@@ -508,7 +508,10 @@ async fn fetch_fallback_manifests(
     downstream: &RegistryClient,
     location: &str,
 ) -> Result<Vec<Value>, Error> {
-    let body = match downstream.get_manifest(&[], location).await {
+    let body = match downstream
+        .get_manifest(&manifest_accept_types(), location)
+        .await
+    {
         Ok((_, _, body)) => body,
         Err(RegistryError::ManifestUnknown) => return Ok(Vec::new()),
         Err(e) => return Err(Error::Registry(e)),
@@ -613,7 +616,10 @@ mod tests {
 
     use crate::{
         cache, metrics_provider,
-        oci::{Digest, OCI_INDEX_MEDIA_TYPE, OCI_MANIFEST_MEDIA_TYPE, Reference},
+        oci::{
+            DOCKER_MANIFEST_LIST_MEDIA_TYPE, DOCKER_MANIFEST_MEDIA_TYPE, Digest,
+            OCI_INDEX_MEDIA_TYPE, OCI_MANIFEST_MEDIA_TYPE, Reference,
+        },
         registry::{
             DOCKER_CONTENT_DIGEST, OCI_SUBJECT,
             blob_store::BlobStore,
@@ -1076,8 +1082,7 @@ mod tests {
             .respond_with(move |request: &Request| {
                 let index: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
                 *put_stored.lock().unwrap() = index["manifests"].as_array().unwrap().clone();
-                ResponseTemplate::new(201)
-                    .insert_header(DOCKER_CONTENT_DIGEST, put_digest.as_str())
+                ResponseTemplate::new(201).insert_header(DOCKER_CONTENT_DIGEST, put_digest.as_str())
             })
             .expect(2)
             .mount(&mock_server)
@@ -1566,6 +1571,69 @@ mod tests {
 
         // No PUT mock exists; `.expect(1)` on the HEAD (verified on drop) proves
         // the probe ran and the absence of an error proves no PUT was attempted.
+        drop(mock_server);
+    }
+
+    #[tokio::test]
+    async fn converged_skip_head_sends_standard_accept_headers() {
+        // The converged-skip HEAD must advertise the standard OCI + Docker
+        // manifest media types: without an `Accept` header a content-negotiating
+        // downstream may return a CONVERTED representation whose digest never
+        // matches the local one, so the skip never fires and every push
+        // re-transfers a converged manifest. The HEAD responder asserts all four
+        // values arrived (the scrub reconcile HEAD and the referrers-fallback
+        // GET stamp the same `manifest_accept_types()` set).
+        metrics_provider::init_for_tests();
+        let mock_server = MockServer::start().await;
+        let dir = TempDir::new().unwrap();
+        let (blob_store, metadata_store, store) = test_blob_store(dir.path().to_str().unwrap());
+        let (manifest_digest, manifest_bytes) = seed_blobless_manifest(&store).await;
+
+        let digest_str = manifest_digest.to_string();
+        let body_len = manifest_bytes.len();
+        Mock::given(method("HEAD"))
+            .and(path(format!("/v2/{NAMESPACE}/manifests/v1")))
+            .respond_with(move |request: &Request| {
+                let accepts: Vec<&str> = request
+                    .headers
+                    .get_all("accept")
+                    .iter()
+                    .map(|v| v.to_str().unwrap())
+                    .collect();
+                for expected in [
+                    OCI_MANIFEST_MEDIA_TYPE,
+                    OCI_INDEX_MEDIA_TYPE,
+                    DOCKER_MANIFEST_MEDIA_TYPE,
+                    DOCKER_MANIFEST_LIST_MEDIA_TYPE,
+                ] {
+                    assert!(
+                        accepts.contains(&expected),
+                        "manifest probe must accept '{expected}', got: {accepts:?}"
+                    );
+                }
+                ResponseTemplate::new(200)
+                    .insert_header(DOCKER_CONTENT_DIGEST, digest_str.as_str())
+                    .insert_header("Content-Length", body_len.to_string().as_str())
+            })
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let outcome = push_manifest(
+            &downstream_client(&mock_server.uri()),
+            &blob_store,
+            &metadata_store,
+            NAMESPACE,
+            &manifest_digest,
+            Some("application/vnd.oci.image.manifest.v1+json".to_string()),
+            Some("v1"),
+            manifest_bytes,
+            4,
+            None,
+        )
+        .await
+        .expect("the Accept-stamped HEAD must still drive the converged skip");
+        assert_eq!(outcome, PushOutcome::Converged);
         drop(mock_server);
     }
 
