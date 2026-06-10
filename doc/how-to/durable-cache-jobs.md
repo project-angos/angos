@@ -63,12 +63,14 @@ pending_refresh_interval_secs = 15   # how often the server refreshes the pendin
 pending_ready_horizon_secs = 600     # only jobs ready within this many seconds count toward the gauge
 ```
 
-> **Note:** Because storage is inherited from `[metadata_store]`, multi-process
-> pools (multiple `angos server` or `angos worker` replicas) need a
+> **Note:** Because storage is inherited from `[metadata_store]`, the durable
+> queue is drained by separate processes and therefore needs a
 > multi-process-safe lock strategy on the metadata store — `lock_strategy.redis`
 > for the filesystem backend, or the default `lock_strategy = "s3"` for the S3
-> backend. The default `"memory"` lock strategy only coordinates workers within
-> a single process, so a second replica would race. See
+> backend. The `"memory"` lock strategy only coordinates within a single
+> process, so **Angos refuses to start** when `[global.job_queue]` is
+> configured with it: set a shared lock strategy, or remove
+> `[global.job_queue]` to use the in-process queue. See
 > [the configuration reference](../reference/configuration.md) for the
 > `[metadata_store]` lock options.
 
