@@ -2343,11 +2343,11 @@ async fn accept_put_manifest_accepts_lww_newer_source_ts() {
 
 #[tokio::test]
 async fn accept_put_manifest_accepts_lww_equal_source_ts() {
-    // Tie-break: an incoming source_ts EXACTLY equal to the local tag's
-    // created_at must NOT be superseded. LWW uses a strict `>` so equal
-    // timestamps converge rather than ping-pong (A<->B alternately rejecting
-    // identical-timestamp writes). Pins the boundary against a regression to
-    // `>=`.
+    // An incoming source_ts EXACTLY equal to the local tag's created_at with
+    // the SAME content must NOT be superseded: an equal digest is a converged
+    // replay, and rejecting it (a regression to `>=`) would make two converged
+    // nodes bounce 409s. Distinct content on a timestamp tie is ordered by the
+    // digest tie-break (see the *_tie_breaks_on_digest tests).
     let test_case = FSRegistryTestCase::new();
     let registry = test_case.registry();
     let namespace = &Namespace::new("lww-repo").unwrap();
@@ -2367,6 +2367,135 @@ async fn accept_put_manifest_accepts_lww_equal_source_ts() {
         )
         .await
         .expect("equal source_ts must converge (not be superseded)");
+}
+
+/// Builds a second, distinct manifest (different config + layer) in
+/// `namespace` and returns the two manifests ordered by digest:
+/// `((larger_body, larger_media_type), (smaller_body, smaller_media_type))`.
+async fn two_manifests_by_digest_order(
+    registry: &Registry,
+    namespace: &Namespace,
+) -> ((Vec<u8>, String), (Vec<u8>, String)) {
+    let first = create_test_manifest(registry, namespace).await;
+
+    let config_content = br#"{"architecture":"arm64","os":"linux"}"#;
+    let layer_content = b"a different layer content";
+    let config_digest = upload_blob(registry, namespace, config_content).await;
+    let layer_digest = upload_blob(registry, namespace, layer_content).await;
+    let second = manifest_with_references(
+        &config_digest,
+        config_content.len(),
+        &layer_digest,
+        layer_content.len(),
+    );
+
+    let first_digest = Digest::Sha256(sha256::hex(&first.0).into());
+    let second_digest = Digest::Sha256(sha256::hex(&second.0).into());
+    if first_digest > second_digest {
+        (first, second)
+    } else {
+        (second, first)
+    }
+}
+
+#[tokio::test]
+async fn accept_put_manifest_lww_equal_ts_tie_breaks_on_digest() {
+    // Wall-clock LWW cannot order two DISTINCT writes stamped with the
+    // identical timestamp, and strictly-greater alone would make both sides
+    // accept each other's write forever (each acceptance changes state and
+    // re-dispatches — an A<->B swap that never converges). The digest
+    // tie-break makes the order total: the larger digest wins on every node,
+    // so the side holding it rejects the smaller incoming write.
+    let test_case = FSRegistryTestCase::new();
+    let registry = test_case.registry();
+    let namespace = &Namespace::new("lww-repo").unwrap();
+    let tag = "latest";
+
+    let ((larger, larger_mt), (smaller, smaller_mt)) =
+        two_manifests_by_digest_order(registry, namespace).await;
+    let ts = chrono::Utc::now() - chrono::Duration::hours(1);
+
+    // Seed the tag with the LARGER digest at `ts` (a replicated write persists
+    // source_ts as created_at).
+    registry
+        .accept_put_manifest(
+            None,
+            Some(ts),
+            namespace,
+            Reference::Tag(tag.to_string()),
+            larger_mt,
+            Cursor::new(larger),
+        )
+        .await
+        .expect("seed the larger-digest manifest");
+
+    // Equal timestamp, smaller incoming digest: the local copy wins.
+    let result = registry
+        .accept_put_manifest(
+            None,
+            Some(ts),
+            namespace,
+            Reference::Tag(tag.to_string()),
+            smaller_mt,
+            Cursor::new(smaller),
+        )
+        .await
+        .err();
+    assert!(
+        matches!(result, Some(Error::ReplicationSuperseded(_))),
+        "an equal-timestamp write with a smaller digest must be superseded, got: {result:?}"
+    );
+}
+
+#[tokio::test]
+async fn accept_put_manifest_lww_equal_ts_accepts_larger_digest() {
+    // The mirror of the tie-break test above: the side holding the SMALLER
+    // digest accepts the larger incoming write, so the pair converges on the
+    // larger digest instead of mutually rejecting (or mutually accepting).
+    let test_case = FSRegistryTestCase::new();
+    let registry = test_case.registry();
+    let namespace = &Namespace::new("lww-repo").unwrap();
+    let tag = "latest";
+
+    let ((larger, larger_mt), (smaller, smaller_mt)) =
+        two_manifests_by_digest_order(registry, namespace).await;
+    let larger_digest = Digest::Sha256(sha256::hex(&larger).into());
+    let ts = chrono::Utc::now() - chrono::Duration::hours(1);
+
+    registry
+        .accept_put_manifest(
+            None,
+            Some(ts),
+            namespace,
+            Reference::Tag(tag.to_string()),
+            smaller_mt,
+            Cursor::new(smaller),
+        )
+        .await
+        .expect("seed the smaller-digest manifest");
+
+    registry
+        .accept_put_manifest(
+            None,
+            Some(ts),
+            namespace,
+            Reference::Tag(tag.to_string()),
+            larger_mt,
+            Cursor::new(larger),
+        )
+        .await
+        .expect("an equal-timestamp write with a larger digest must win");
+
+    let target = registry
+        .metadata_store
+        .read_link_reference(namespace.as_ref(), &LinkKind::Tag(tag.to_string()))
+        .await
+        .expect("tag link after the tie-break")
+        .target;
+    assert_eq!(
+        target, larger_digest,
+        "the pair must converge on the larger digest"
+    );
 }
 
 #[tokio::test]

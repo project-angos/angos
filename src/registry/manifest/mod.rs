@@ -394,7 +394,10 @@ impl Registry {
         namespace: &Namespace,
         reference: &Reference,
     ) -> Result<DeleteManifestResponse, Error> {
-        self.check_lww_not_superseded(namespace, reference, source_ts)
+        // A delete carries no incoming digest, so a timestamp tie keeps the
+        // plain strictly-greater rule (the delete proceeds; a delete bounce
+        // dies as a no-op at the next hop).
+        self.check_lww_not_superseded(namespace, reference, source_ts, None)
             .await?;
 
         // A digest delete cascades to every tag pointing at the revision, so
@@ -617,15 +620,19 @@ impl Registry {
     /// persists the incoming `source_ts` as the tag link's `created_at` (not this
     /// receiver's clock), and the re-dispatch path re-derives `source_ts` from it,
     /// so author time propagates verbatim across hops and multi-hop ordering is
-    /// deterministic. The one remaining non-strictness is that this read is not
-    /// atomic with the commit, so two replicated writes to the same tag arriving
-    /// together can both pass the gate and the later commit wins — the mesh still
-    /// converges because re-replication re-arbitrates.
+    /// deterministic. Two DISTINCT writes stamped with the identical timestamp
+    /// are ordered by digest (see `link_supersedes`), so the order is total and
+    /// an A<->B equal-timestamp swap cannot oscillate. The one remaining
+    /// non-strictness is that this read is not atomic with the commit, so two
+    /// replicated writes to the same tag arriving together can both pass the
+    /// gate and the later commit wins — the mesh still converges because
+    /// re-replication re-arbitrates.
     async fn check_lww_not_superseded(
         &self,
         namespace: &Namespace,
         reference: &Reference,
         source_ts: Option<DateTime<Utc>>,
+        incoming_digest: Option<&Digest>,
     ) -> Result<(), Error> {
         let Some(source_ts) = source_ts else {
             return Ok(());
@@ -635,7 +642,12 @@ impl Registry {
         };
 
         if let Some(created_at) = self
-            .link_supersedes(namespace, &LinkKind::Tag(tag.clone()), source_ts)
+            .link_supersedes(
+                namespace,
+                &LinkKind::Tag(tag.clone()),
+                source_ts,
+                incoming_digest,
+            )
             .await?
         {
             return Err(Error::ReplicationSuperseded(format!(
@@ -646,10 +658,22 @@ impl Registry {
         Ok(())
     }
 
-    /// `Some(created_at)` iff the local link's recorded creation time strictly
-    /// supersedes `source_ts`; `None` when the link is absent, has no
-    /// `created_at`, or is older-or-equal. A non-`ReferenceNotFound` read error
-    /// fails closed (Err) so LWW is never silently disabled by a backend hiccup.
+    /// `Some(created_at)` iff the local link strictly supersedes the incoming
+    /// write: its recorded creation time is newer than `source_ts`, or — on an
+    /// exactly equal timestamp — its target digest orders above
+    /// `incoming_digest`. `None` when the link is absent, has no `created_at`,
+    /// or loses the comparison. A non-`ReferenceNotFound` read error fails
+    /// closed (Err) so LWW is never silently disabled by a backend hiccup.
+    ///
+    /// The digest tie-break makes the LWW order total: wall-clock time cannot
+    /// order two distinct writes stamped identically, and strictly-greater
+    /// alone would make BOTH sides accept each other's write — each acceptance
+    /// changes state and re-dispatches, so an A<->B pair would swap digests
+    /// forever. With the larger digest winning everywhere, exactly one side
+    /// rejects and the mesh converges on it. An equal digest is the same
+    /// content (a converged replay) and is accepted; a delete carries no
+    /// digest (`None`) and keeps the plain strictly-greater rule — a tied
+    /// delete proceeds, and a delete bounce dies as a no-op at the next hop.
     ///
     /// Reads bypass the link cache: this is a correctness gate, not a serving
     /// read, and on a multi-replica deployment the per-process cache can lag a
@@ -660,17 +684,30 @@ impl Registry {
         namespace: &Namespace,
         link: &LinkKind,
         source_ts: DateTime<Utc>,
+        incoming_digest: Option<&Digest>,
     ) -> Result<Option<DateTime<Utc>>, Error> {
-        let created_at = match self
+        let metadata = match self
             .metadata_store
             .read_link_reference(namespace, link)
             .await
         {
-            Ok(link) => link.created_at,
+            Ok(metadata) => metadata,
             Err(MetadataStoreError::ReferenceNotFound) => return Ok(None),
             Err(err) => return Err(Error::from(err)),
         };
-        Ok(created_at.filter(|c| *c > source_ts))
+        let Some(created_at) = metadata.created_at else {
+            return Ok(None);
+        };
+        if created_at > source_ts {
+            return Ok(Some(created_at));
+        }
+        if created_at == source_ts
+            && let Some(incoming) = incoming_digest
+            && metadata.target > *incoming
+        {
+            return Ok(Some(created_at));
+        }
+        Ok(None)
     }
 
     /// Last-writer-wins guard for a replication-originated *digest* delete.
@@ -691,7 +728,9 @@ impl Registry {
         source_ts: DateTime<Utc>,
     ) -> Result<(), Error> {
         for tag in tags {
-            if let Some(created_at) = self.link_supersedes(namespace, tag, source_ts).await? {
+            // A delete carries no incoming digest, so a timestamp tie keeps the
+            // plain strictly-greater rule (the delete proceeds).
+            if let Some(created_at) = self.link_supersedes(namespace, tag, source_ts, None).await? {
                 return Err(Error::ReplicationSuperseded(format!(
                     "local {tag} (created {created_at}) is newer than the replicated digest delete ({source_ts})"
                 )));
@@ -747,9 +786,6 @@ impl Registry {
     where
         S: AsyncRead + Unpin + Send,
     {
-        self.check_lww_not_superseded(namespace, &reference, source_ts)
-            .await?;
-
         let resolved_repository = self.resolver.resolve(namespace);
 
         let limit = self.max_manifest_size_bytes;
@@ -766,6 +802,17 @@ impl Registry {
         if request_body.len() > limit {
             return Err(Error::ManifestBodyTooLarge { limit });
         }
+
+        // LWW runs after the body is read because the equal-timestamp tie-break
+        // compares digests, and the incoming digest is the body's hash. Only a
+        // replicated write (`source_ts` present) pays the hash here; a genuine
+        // client push skips both it and the gate. `store_manifest` re-hashes —
+        // a small, replication-only duplication.
+        let incoming_digest = source_ts
+            .is_some()
+            .then(|| Digest::Sha256(sha256::hex(&request_body).into()));
+        self.check_lww_not_superseded(namespace, &reference, source_ts, incoming_digest.as_ref())
+            .await?;
 
         let mut response = self
             .store_manifest(
