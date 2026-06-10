@@ -62,7 +62,7 @@ One `[global]` field tunes replication across all repositories:
 max_concurrent_replication_jobs = 4                # worker concurrency for replication jobs (must be > 0)
 ```
 
-- `max_concurrent_replication_jobs` bounds how many replication jobs each `angos worker` (or the in-process drain) handles in parallel. Default `4`; must be greater than zero.
+- `max_concurrent_replication_jobs` bounds how many replication jobs are handled in parallel by each `angos worker`, the server's in-process drain, and the `scrub --replicate` end-of-run drain. Default `4`; must be greater than zero.
 
 :::warning Restrict who may push to replicated repositories
 A replication write is an ordinary manifest push carrying the `X-Angos-Source-Timestamp` header, and the receiver persists that timestamp as the tag's creation time. It's the value that decides last-writer-wins races and age-based retention. Future-dating is clamped, but **any identity allowed to push can backdate a tag**. On every instance that receives replication, gate the write actions (`put-manifest`, `delete-manifest`, uploads) to the replicator identity through the CEL `access_policy`, see [Restrict replication writes](set-up-access-control.md#restrict-replication-writes).

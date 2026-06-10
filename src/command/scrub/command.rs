@@ -1,7 +1,7 @@
-use std::sync::Arc;
+use std::{num::NonZeroUsize, sync::Arc};
 
 use argh::FromArgs;
-use futures_util::StreamExt;
+use futures_util::{StreamExt, future::join_all};
 use tracing::{info, warn};
 use uuid::Uuid;
 
@@ -94,10 +94,14 @@ pub struct Command {
 }
 
 /// Consumer queue + handler used to drain replication jobs enqueued by the
-/// reconciliation checker, within the scrub CLI run.
+/// reconciliation checker, within the scrub CLI run. `concurrency`
+/// (`[global] max_concurrent_replication_jobs`) bounds the parallel claim
+/// loops, matching the worker and in-process drains — a cold-mirror reconcile
+/// would otherwise push one tag at a time.
 struct ReplicationDrain {
     consumer: Arc<JobStore>,
     handler: Box<dyn JobHandler>,
+    concurrency: NonZeroUsize,
 }
 
 impl Command {
@@ -150,6 +154,7 @@ impl Command {
                     &blob_backend,
                     &metadata_store,
                     &repositories,
+                    config.global.max_concurrent_replication_jobs,
                 )?);
             }
             Box::new(executor)
@@ -179,6 +184,7 @@ impl Command {
         blob_store: &Arc<BlobStore>,
         metadata_store: &Arc<MetadataStore>,
         resolver: &Arc<RepositoryResolver>,
+        concurrency: NonZeroUsize,
     ) -> Result<ReplicationDrain, Error> {
         let handler = ReplicationJobHandler::builder()
             .resolver(resolver.clone())
@@ -191,6 +197,7 @@ impl Command {
         Ok(ReplicationDrain {
             consumer,
             handler: Box::new(handler),
+            concurrency,
         })
     }
 
@@ -246,33 +253,43 @@ impl Command {
     }
 
     /// Drains the replication jobs the reconciliation checker enqueued. No-op
-    /// unless `--replicate` ran outside dry-run. Each cycle claims one ready job
-    /// and drives it through `execute_one`: a job whose push succeeds converges
-    /// here, while one whose push transiently fails is failed-over (rescheduled
-    /// with backoff onto the durable queue for a worker or a later `scrub` run).
-    /// The loop ends when the queue has no claimable (ready) job left — so jobs
-    /// already backed off for a future time are intentionally not awaited.
+    /// unless `--replicate` ran outside dry-run. Up to
+    /// `max_concurrent_replication_jobs` claim loops run concurrently (a
+    /// cold-mirror reconcile would otherwise push one tag at a time); each
+    /// cycle claims one ready job and drives it through `execute_one`: a job
+    /// whose push succeeds converges here, while one whose push transiently
+    /// fails is failed-over (rescheduled with backoff onto the durable queue
+    /// for a worker or a later `scrub` run). A loop ends when the queue has no
+    /// claimable (ready) job left — so jobs already backed off for a future
+    /// time are intentionally not awaited.
     async fn drain_replication_jobs(&mut self) {
         let Some(drain) = &self.replication_drain else {
             return;
         };
 
-        info!("Draining enqueued replication jobs to convergence");
-        let mut drained: u64 = 0;
-        loop {
-            let outcome = match drain.consumer.claim_one(REPLICATION_QUEUE).await {
-                Ok(outcome) => outcome,
-                Err(e) => {
-                    warn!("Failed to claim a replication job during drain: {e}");
+        info!(
+            "Draining enqueued replication jobs to convergence ({} concurrent)",
+            drain.concurrency
+        );
+        let loops = (0..drain.concurrency.get()).map(|_| async {
+            let mut drained: u64 = 0;
+            loop {
+                let outcome = match drain.consumer.claim_one(REPLICATION_QUEUE).await {
+                    Ok(outcome) => outcome,
+                    Err(e) => {
+                        warn!("Failed to claim a replication job during drain: {e}");
+                        break;
+                    }
+                };
+                let Some(claimed) = outcome.claimed else {
                     break;
-                }
-            };
-            let Some(claimed) = outcome.claimed else {
-                break;
-            };
-            execute_one(&drain.consumer, drain.handler.as_ref(), claimed).await;
-            drained += 1;
-        }
+                };
+                execute_one(&drain.consumer, drain.handler.as_ref(), claimed).await;
+                drained += 1;
+            }
+            drained
+        });
+        let drained: u64 = join_all(loops).await.into_iter().sum();
         info!("Replication drain complete: processed {drained} job(s)");
     }
 }

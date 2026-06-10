@@ -27,9 +27,10 @@ pub struct GlobalConfig {
         deserialize_with = "deserialize_max_concurrent_cache_jobs"
     )]
     pub max_concurrent_cache_jobs: NonZeroUsize,
-    // Concurrency for the replication queue, consumed by both the in-process
-    // drain and `angos worker --queue replication`. Mirrors
-    // `max_concurrent_cache_jobs` (sibling worker-concurrency knob).
+    /// Concurrency for the replication queue, consumed by the server's
+    /// in-process drain, `angos worker --queue replication`, and the
+    /// `scrub --replicate` end-of-run drain. Mirrors
+    /// `max_concurrent_cache_jobs` (sibling worker-concurrency knob).
     #[serde(
         default = "default_max_concurrent_replication_jobs",
         deserialize_with = "deserialize_max_concurrent_replication_jobs"
