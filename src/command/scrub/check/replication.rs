@@ -930,9 +930,7 @@ mod tests {
         // push loop never probes an unreadable tag, so no HEAD mock is needed).
         Mock::given(method("GET"))
             .and(path(format!("/v2/{NAMESPACE}/tags/list")))
-            .respond_with(
-                ResponseTemplate::new(200).set_body_json(json!({ "tags": ["broken"] })),
-            )
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "tags": ["broken"] })))
             .expect(1)
             .mount(&mock_server)
             .await;

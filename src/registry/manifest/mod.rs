@@ -730,7 +730,10 @@ impl Registry {
         for tag in tags {
             // A delete carries no incoming digest, so a timestamp tie keeps the
             // plain strictly-greater rule (the delete proceeds).
-            if let Some(created_at) = self.link_supersedes(namespace, tag, source_ts, None).await? {
+            if let Some(created_at) = self
+                .link_supersedes(namespace, tag, source_ts, None)
+                .await?
+            {
                 return Err(Error::ReplicationSuperseded(format!(
                     "local {tag} (created {created_at}) is newer than the replicated digest delete ({source_ts})"
                 )));

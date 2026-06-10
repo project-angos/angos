@@ -215,8 +215,15 @@ pub async fn push_manifest(
     //    referrers fallback tag manifest. OCI-1.1 downstreams index it for free.
     //    `fallback_body` is `Some` only when the manifest carries a subject.
     if let Some(body) = fallback_body.filter(|_| result.subject.is_none()) {
-        push_referrers_fallback(downstream, metadata_store, namespace, digest, &parsed, &body)
-            .await?;
+        push_referrers_fallback(
+            downstream,
+            metadata_store,
+            namespace,
+            digest,
+            &parsed,
+            &body,
+        )
+        .await?;
     }
 
     Ok(PushOutcome::Pushed)
@@ -884,8 +891,7 @@ mod tests {
                         .contains_key(X_ANGOS_SOURCE_TIMESTAMP.to_lowercase().as_str()),
                     "the fallback-index PUT must be timestamp-less (set merge, not LWW)"
                 );
-                ResponseTemplate::new(201)
-                    .insert_header(DOCKER_CONTENT_DIGEST, digest_str.as_str())
+                ResponseTemplate::new(201).insert_header(DOCKER_CONTENT_DIGEST, digest_str.as_str())
             })
             .expect(1)
             .mount(&mock_server)
