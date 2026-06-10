@@ -14,7 +14,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Changed
 
-- A blob-upload `POST` carrying `?mount=<digest>` is now authorized as a distinct `mount-blob` action, so a default-deny access policy must grant `mount-blob` for cross-repo mounts that previously evaluated as `start-upload`.
+- A blob-upload `POST` carrying `?mount=<digest>` is now authorized as a distinct `mount-blob` action instead of `start-upload`, breaking under a default-deny policy because container clients send `?mount=` opportunistically on push: grant `mount-blob` alongside `start-upload` or those pushes fail.
 - `angos worker` with no `--queue` now drains both the `cache` and `replication` queues, so pass `--queue cache` to restore the previous cache-only default.
 - `angos worker` now rejects an unknown `--queue` value at startup.
 - A `[global.job_queue]` configured with the in-process `memory` lock is now rejected at startup, breaking for previously-running configs that relied on the default lock: set the metadata store's `lock_strategy` to `s3` or `redis`, or remove `[global.job_queue]` to use the in-process queue.

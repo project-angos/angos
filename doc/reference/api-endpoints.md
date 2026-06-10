@@ -86,7 +86,8 @@ Query parameters:
   not otherwise pull. A mount is also its own route and CEL action, `mount-blob`, distinct from
   `start-upload`, so you can additionally restrict who may mount at all with a
   `request.action == 'mount-blob'` rule (denying it rejects the mount; Angos's replication falls back
-  to a normal upload). See
+  to a normal upload). Container clients send `?mount=` opportunistically on push, so a default-deny
+  policy should grant `mount-blob` alongside `start-upload` or those pushes fail. See
   [Restrict cross-repository blob mount](../how-to/set-up-access-control.md#restrict-cross-repository-blob-mount).
 
 ```

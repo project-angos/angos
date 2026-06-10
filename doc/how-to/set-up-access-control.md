@@ -170,6 +170,14 @@ Beyond that source-read check, a mount is its own route and CEL action, `mount-b
 it rejects the mount request; Angos's own replication transparently falls back to a normal upload when
 a downstream denies the mount, so denying `mount-blob` never breaks replication.
 
+:::warning Grant `mount-blob` wherever you grant uploads
+Container clients (Docker, containerd) send `?mount=` **opportunistically** on push whenever a blob
+may already exist elsewhere on the registry, a mount attempt is part of an ordinary push, not a
+special operation. Under a `default = "deny"` policy, an identity allowed to `start-upload` but not
+`mount-blob` has those pushes rejected. Grant `mount-blob` to every identity allowed to upload,
+unless you deliberately accept failing the pushes of mount-attempting clients.
+:::
+
 For example, restrict every mount to a trusted identity (the replicator), leaving ordinary uploads
 untouched. Under a `default = "deny"` policy, add an allow-rule for it:
 
