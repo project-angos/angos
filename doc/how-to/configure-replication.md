@@ -154,10 +154,10 @@ Re-running is a no-op once converged (coalesced by the queue). Schedule it like 
 
 ## Observability
 
-Replication exposes Prometheus metrics on `/metrics`:
+Replication exposes Prometheus metrics:
 
 ```promql
-# Push rate by downstream and outcome (pushed, superseded, failed)
+# Push rate by downstream and outcome (pushed, converged, superseded, failed)
 sum by (downstream, outcome) (rate(angos_replication_push_total[5m]))
 
 # Seconds since the last successful push per downstream (staleness)
@@ -167,7 +167,7 @@ time() - angos_replication_last_success_timestamp_seconds
 angos_job_queue_pending{queue="replication"}
 ```
 
-`angos_job_queue_pending{queue="replication"}` is published only when `[global.job_queue]` is configured; the in-process self-drain mode used in the example above does not publish it. The `angos_replication_*` metrics are available in both modes.
+`angos_replication_push_total` and `angos_replication_last_success_timestamp_seconds` increment in the process that drains the replication queue. In the in-process self-drain mode used in the example above, that is the server, so both appear on the server's `/metrics` — alert on the staleness query in this mode. When `[global.job_queue]` is configured, `angos worker` drains the queue, and the worker exposes no HTTP listener, so the push and staleness metrics are not scrapeable in that mode. Monitor the backlog instead: the server publishes `angos_job_queue_pending{queue="replication"}` only when `[global.job_queue]` is configured.
 
 See [Metrics Reference](../reference/metrics.md) for the full list.
 

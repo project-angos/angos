@@ -92,7 +92,8 @@ root_dir = "./data-angos"
 # Replication: the global knob lives in [global] above (max_concurrent_replication_jobs);
 # per-repository downstreams are declared under
 # [[repository."<name>".downstream]] (see below). Replication backlog is observable
-# via the `angos_job_queue_pending{queue="replication"}` Prometheus gauge — it does
+# via the `angos_job_queue_pending{queue="replication"}` Prometheus gauge, published
+# only when [global.job_queue] above is enabled — it does
 # NOT affect /readyz (a deep queue is the normal state during a downstream outage).
 
 [observability.tracing]

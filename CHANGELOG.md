@@ -8,13 +8,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
-- Bi-directional replication mirrors manifest pushes and deletes to per-repository downstreams over the durable job queue, with on-demand reconciliation via `scrub --replicate`.
-- Cross-repository blob mount (`POST /v2/{namespace}/blobs/uploads/?mount={digest}[&from={repository}]`) grants an already-present blob to the target namespace with no upload, which replication uses to skip re-uploading blobs a downstream already holds.
+- Bi-directional replication mirrors manifest pushes and deletes to per-repository downstreams over the durable job queue; `scrub --replicate` reconciles on demand.
+- Cross-repository blob mount (`POST /v2/{namespace}/blobs/uploads/?mount={digest}[&from={repository}]`) grants an already-present blob to the target namespace with no upload.
 - The `_jobs` admin API accepts `?queue=cache|replication` (default `cache`), so failed replication jobs can be listed, retried, and deleted like cache jobs.
 
 ### Changed
 
-- A blob-upload `POST` carrying `?mount=<digest>` is now authorized as a distinct `mount-blob` action instead of `start-upload`, breaking under a default-deny policy because container clients send `?mount=` opportunistically on push: grant `mount-blob` alongside `start-upload` or those pushes fail.
+- A blob-upload `POST` carrying `?mount=` is now authorized as the distinct `mount-blob` action: container clients send it opportunistically on push, so a default-deny policy must grant `mount-blob` alongside `start-upload` or those pushes fail.
 - `angos worker` with no `--queue` now drains both the `cache` and `replication` queues, so pass `--queue cache` to restore the previous cache-only default.
 - `angos worker` now rejects an unknown `--queue` value at startup.
 - A `[global.job_queue]` configured with the in-process `memory` lock is now rejected at startup, breaking for previously-running configs that relied on the default lock: set the metadata store's `lock_strategy` to `s3` or `redis`, or remove `[global.job_queue]` to use the in-process queue.

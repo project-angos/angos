@@ -91,6 +91,7 @@ The `route` label uses action names from the OCI Distribution API:
 | `get-api-version`   | API version check  |
 | `get-blob`          | Download blob      |
 | `delete-blob`       | Delete blob        |
+| `mount-blob`        | Cross-repo blob mount |
 | `start-upload`      | Start blob upload  |
 | `update-upload`     | Chunk upload       |
 | `complete-upload`   | Complete upload    |
@@ -108,6 +109,10 @@ The `route` label uses action names from the OCI Distribution API:
 | `list-namespaces`   | Extension API      |
 | `list-revisions`    | Extension API      |
 | `list-uploads`      | Extension API      |
+| `list-jobs`         | List pending jobs  |
+| `list-failed-jobs`  | List dead-letter jobs |
+| `retry-job`         | Requeue dead-letter job |
+| `delete-job`        | Delete queued job  |
 | `unknown`           | Unrecognized route |
 
 ---
@@ -229,7 +234,9 @@ histogram_quantile(0.95, sum by (webhook, le) (rate(event_webhook_delivery_durat
 
 ## Job Queue Metrics
 
-Published only when `[global.job_queue]` is configured. See
+`angos_job_queue_pending` is published only when `[global.job_queue]` is
+configured; the two counters below increment on every enqueue (the in-process
+queue included) and are always exposed on the server's `/metrics`. See
 [Enable Durable Cache Jobs](../how-to/durable-cache-jobs.md).
 
 ### angos_job_queue_pending
@@ -284,10 +291,17 @@ Total enqueue attempts that did not land on the queue (envelope build or storage
 
 ## Replication Metrics
 
-These metrics are always registered. The `angos_job_queue_pending{queue="replication"}`
-gauge (above) reports replication backlog depth; the metrics below cover push
-outcomes, staleness, and scrub reconciliation. See
+The `angos_job_queue_pending{queue="replication"}` gauge (above) reports
+replication backlog depth; the metrics below cover push outcomes, staleness,
+and scrub reconciliation. See
 [Bi-Directional Replication](../explanation/replication.md).
+
+`angos_replication_push_total` and
+`angos_replication_last_success_timestamp_seconds` increment in the process
+that drains the replication queue. Without `[global.job_queue]` the server
+drains the queue in-process, so both appear on the server's `/metrics`. With
+`[global.job_queue]` the queue is drained by `angos worker`, which exposes no
+HTTP endpoint. In that mode these two metrics are not scrapeable.
 
 ### angos_replication_push_total
 
@@ -312,7 +326,7 @@ sum by (downstream) (rate(angos_replication_push_total{outcome="failed"}[5m]))
 
 ### angos_replication_last_success_timestamp_seconds
 
-Unix timestamp (seconds) of the last successful or superseded replication push per downstream. Use it to detect a stalled downstream.
+Unix timestamp (seconds) of the last `pushed`, `converged`, or `superseded` replication push per downstream (every non-failed outcome sets it). Use it to detect a stalled downstream.
 
 | Type  | Labels       |
 |-------|--------------|
@@ -335,11 +349,11 @@ Replication reconcile enqueues emitted by `angos scrub --replicate`, by outcome.
 **Labels:**
 - `outcome`: `enqueued` (a divergence was enqueued — a push, or a prune delete for a `prune = true` downstream), `failed` (the envelope build or enqueue errored), or `skipped` (a downstream HEAD probe failed, e.g: auth rejection, 5xx, timeout, so the tag stays unreconciled this pass; a persistently non-zero `skipped` with zero `enqueued` typically means bad downstream credentials)
 
-**Example:**
-```promql
-# Reconcile enqueue rate by outcome
-sum by (outcome) (rate(angos_replication_reconcile_total[5m]))
-```
+This counter lives in the `angos scrub` process, which serves no `/metrics`
+endpoint and exits when the run completes, so Prometheus cannot scrape it. The
+warn-level log lines emitted for failed and skipped tags are the operational
+signal: watch the scrub run's logs (or its exit status) rather than this
+counter.
 
 ### Replication Backlog
 
@@ -352,12 +366,17 @@ angos_job_queue_pending{queue="replication"}
 ```
 
 A deep replication queue is the normal state during a downstream outage and does
-**not** affect `/readyz`. Alert on sustained backlog or staleness instead:
+**not** affect `/readyz`. Alert on sustained backlog instead. When the server
+drains the queue in-process (no `[global.job_queue]`), the staleness gauge is
+also on the server's `/metrics` and supports a staleness alert:
 
 ```promql
-# Replication stale for over 10 minutes
+# Replication stale for over 10 minutes (in-process drain only)
 (time() - angos_replication_last_success_timestamp_seconds) > 600
 ```
+
+With a separate `angos worker`, the gauge is not scrapeable; alert on the
+`angos_job_queue_pending{queue="replication"}` backlog instead.
 
 ---
 

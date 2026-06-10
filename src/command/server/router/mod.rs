@@ -113,11 +113,12 @@ struct JobsQuery {
 }
 
 /// Parse the `?n=&after=&queue=` of a `_jobs` admin route. Returns `None` —
-/// rejecting the route (400) — when `?queue=` names no known queue or any
-/// value is malformed (e.g. a non-numeric `?n=`): a lenient parse would reset
-/// the WHOLE struct on one bad value, so `?queue=replication&n=abc` would
-/// silently administer the default `cache` queue instead. An absent selector
-/// defaults to the `cache` queue.
+/// rejecting the route via `handle_unknown_route` (404 for the GET listings,
+/// 400 for the retry/delete mutations) — when `?queue=` names no known queue
+/// or any value is malformed (e.g. a non-numeric `?n=`): a lenient parse would
+/// reset the WHOLE struct on one bad value, so `?queue=replication&n=abc`
+/// would silently administer the default `cache` queue instead. An absent
+/// selector defaults to the `cache` queue.
 fn parse_jobs_query(params: Option<&str>) -> Option<(Option<u16>, Option<String>, String)> {
     let query: JobsQuery = match params {
         Some(params) => parse_query_strict(params)?,

@@ -150,13 +150,18 @@ mirroring a change to a configured downstream (it is not used by ordinary client
 
 | Header                     | Value                          | Purpose                                                                 |
 |----------------------------|--------------------------------|-------------------------------------------------------------------------|
-| `X-Angos-Source-Timestamp` | event timestamp (RFC 3339)     | Last-writer-wins — for a **tag** reference the receiver compares it against the local tag's creation time and rejects the write with `409 REPLICATION_SUPERSEDED` when the local copy is strictly newer. |
+| `X-Angos-Source-Timestamp` | event timestamp (RFC 3339)     | Last-writer-wins — the receiver compares it against the creation time of the affected tags and rejects the write with `409 REPLICATION_SUPERSEDED` when the local copy is strictly newer. |
 
-Last-writer-wins applies only to tag references (digest references are content-addressed, so there is
-nothing to resolve) and only when `X-Angos-Source-Timestamp` is present and parses as RFC 3339. A
-missing, empty, or malformed timestamp simply disables LWW for that request — the write is applied as
-an ordinary client write rather than failing. A local tag with no recorded creation time is treated as
-oldest and never blocks the incoming write.
+Last-writer-wins applies only when `X-Angos-Source-Timestamp` is present and parses as RFC 3339,
+and is always evaluated against tag creation times. A tag `PUT` or `DELETE` is compared against the
+local tag's recorded creation time. A `DELETE` by digest cascades to every tag pointing at the
+revision, so it is guarded through those tags: when any pointing tag is strictly newer than the
+incoming timestamp, the whole delete is rejected with `409 REPLICATION_SUPERSEDED` — the newer tag,
+and the revision it still references, must not be dropped by the older delete. A `PUT` by digest is
+content-addressed (there is nothing to resolve) and is not LWW-guarded. A missing, empty, or
+malformed timestamp simply disables LWW for that request — the write is applied as an ordinary
+client write rather than failing. A local tag with no recorded creation time is treated as oldest
+and never blocks the incoming write.
 
 A future-dated timestamp is **clamped to the receiver's current time**, so a client cannot pin a
 permanent last-writer-wins victory. A *backdated* timestamp, however, is accepted and persisted as
@@ -301,6 +306,100 @@ List blob uploads in progress.
   ]
 }
 ```
+
+### List Jobs
+
+```
+GET /_ext/_jobs
+```
+
+List pending and in-flight jobs on a durable job queue (see
+[Enable Durable Cache Jobs](../how-to/durable-cache-jobs.md), which introduces the queues and this
+admin API).
+
+Query parameters:
+- `n` - Maximum number of results (default 100)
+- `after` - Pagination cursor: the `next` value from the previous page
+- `queue` - Queue to administer: `cache` (default) or `replication`
+
+An unknown `queue` value, or any malformed query value (for example a non-numeric `n`), rejects the
+request rather than silently falling back to the default `cache` queue: the `GET` listings return
+`404` and the retry/delete mutations return `400`.
+
+Like the cross-repository blob mount, job administration uses its own CEL actions — `list-jobs`,
+`list-failed-jobs`, `retry-job`, and `delete-job` — so it can be gated behind higher privilege than
+registry reads; `queue` is exposed to CEL so the `replication` queue can be gated separately.
+
+**Response:**
+```json
+{
+  "jobs": [
+    {
+      "storage_key": "0000019700a1b2c3-123e4567-e89b-12d3-a456-426614174000",
+      "id": "123e4567-e89b-12d3-a456-426614174000",
+      "kind": "cache.fetch_blob",
+      "lock_key": "cache.library/nginx:sha256:abc123...",
+      "attempts": 1,
+      "max_attempts": 5,
+      "created_at": "2026-01-01T12:00:00Z",
+      "not_before": "2026-01-01T12:05:00Z"
+    }
+  ],
+  "next": "0000019700a1b2c3-123e4567-e89b-12d3-a456-426614174000"
+}
+```
+
+`not_before` is the earliest instant a worker may pick the job up, decoded from the storage key's
+time prefix. `next` is present only when another page follows; pass it back as `after`.
+
+### List Failed Jobs
+
+```
+GET /_ext/_jobs/failed
+```
+
+List dead-lettered jobs — jobs that exhausted their retry budget. Same query parameters and
+rejection rules as `GET /_ext/_jobs`.
+
+**Response:**
+```json
+{
+  "failed": [
+    {
+      "storage_key": "0000019700a1b2c3-123e4567-e89b-12d3-a456-426614174000",
+      "id": "123e4567-e89b-12d3-a456-426614174000",
+      "kind": "replication.push_manifest",
+      "lock_key": "replication.push.backup:library/nginx:latest",
+      "attempts": 5,
+      "max_attempts": 5,
+      "created_at": "2026-01-01T12:00:00Z",
+      "failed_at": "2026-01-01T12:30:00Z",
+      "last_error": "..."
+    }
+  ],
+  "next": "0000019700a1b2c3-123e4567-e89b-12d3-a456-426614174000"
+}
+```
+
+### Retry Failed Job
+
+```
+POST /_ext/_jobs/failed/{key}/retry
+```
+
+Requeue a dead-lettered job with its attempt counter reset to zero. `{key}` is the job's
+`storage_key` from the failed listing. Accepts `?queue=` like the listings. Returns
+`204 No Content` on success, or `404` when the key no longer exists.
+
+### Delete Job
+
+```
+DELETE /_ext/_jobs/failed/{key}
+DELETE /_ext/_jobs/pending/{key}
+```
+
+Delete a dead-lettered or pending job by `storage_key`. Accepts `?queue=` like the listings.
+Returns `204 No Content` on success, or `404` when the key no longer exists.
 
 ---
 
