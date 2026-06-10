@@ -58,8 +58,10 @@ pub enum PushOutcome {
 /// absent; the per-manifest blob fan-out is bounded by `max_concurrent_pushes`.
 ///
 /// `source_ts` is forwarded as the `X-Angos-Source-Timestamp` header so the
-/// receiver can apply last-writer-wins; it is stamped on every outgoing
-/// `put_manifest` (the primary manifest and the referrers-fallback index).
+/// receiver can apply last-writer-wins; it is stamped on the primary manifest
+/// PUT only. The referrers-fallback index PUT is deliberately timestamp-less —
+/// the fallback tag is a merged set, not an LWW register (see
+/// [`push_referrers_fallback`]).
 ///
 /// 409 disambiguation: when the downstream rejects the push by last-writer-wins
 /// (a `409` whose OCI code is the replication-superseded code, surfaced by the
@@ -213,16 +215,8 @@ pub async fn push_manifest(
     //    referrers fallback tag manifest. OCI-1.1 downstreams index it for free.
     //    `fallback_body` is `Some` only when the manifest carries a subject.
     if let Some(body) = fallback_body.filter(|_| result.subject.is_none()) {
-        push_referrers_fallback(
-            downstream,
-            metadata_store,
-            namespace,
-            digest,
-            &parsed,
-            &body,
-            source_ts,
-        )
-        .await?;
+        push_referrers_fallback(downstream, metadata_store, namespace, digest, &parsed, &body)
+            .await?;
     }
 
     Ok(PushOutcome::Pushed)
@@ -374,6 +368,11 @@ async fn upload_into_session(
 /// `manifests[]` enumerate the referrer descriptors. A pushing client must GET
 /// the existing index, append its own referrer descriptor, then PUT the merged
 /// index — so a second referrer of the same subject does not clobber the first.
+///
+/// The fallback PUT carries NO `source_ts`: the fallback tag is a merged SET,
+/// not a last-writer-wins register, so it must never lose an LWW comparison —
+/// a `409 REPLICATION_SUPERSEDED` here would silently drop the just-merged
+/// descriptor while the job reports success (a stranded referrer).
 async fn push_referrers_fallback(
     downstream: &RegistryClient,
     metadata_store: &Arc<MetadataStore>,
@@ -381,7 +380,6 @@ async fn push_referrers_fallback(
     digest: &Digest,
     parsed: &ParsedManifestDigests,
     body: &[u8],
-    source_ts: Option<&str>,
 ) -> Result<(), Error> {
     let Some(subject) = &parsed.subject else {
         return Ok(());
@@ -421,8 +419,7 @@ async fn push_referrers_fallback(
                 "referrers fallback lock acquire failed for '{fallback_tag}': {e}"
             )))
         })?;
-    let result =
-        merge_referrers_fallback(downstream, &location, digest, parsed, body, source_ts).await;
+    let result = merge_referrers_fallback(downstream, &location, digest, parsed, body).await;
     session.release().await;
     result
 }
@@ -446,7 +443,6 @@ async fn merge_referrers_fallback(
     digest: &Digest,
     parsed: &ParsedManifestDigests,
     body: &[u8],
-    source_ts: Option<&str>,
 ) -> Result<(), Error> {
     // GET the existing fallback index; a missing tag (404) starts fresh, a
     // transient failure propagates so the job retries. Any pre-existing referrer
@@ -485,8 +481,11 @@ async fn merge_referrers_fallback(
         )))
     })?;
 
+    // Timestamp-less PUT: with no `X-Angos-Source-Timestamp` the receiver skips
+    // LWW entirely, so the merged index can never come back `superseded` and
+    // silently drop a descriptor (the fallback tag is a set, not a register).
     downstream
-        .put_manifest(location, Some(OCI_INDEX_MEDIA_TYPE), index_body, source_ts)
+        .put_manifest(location, Some(OCI_INDEX_MEDIA_TYPE), index_body, None)
         .await
         .map_err(Error::Registry)?;
     Ok(())
@@ -811,6 +810,86 @@ mod tests {
 
         // `.expect(1)` on the primary manifest PUT + the fallback index PUT (with
         // the body assertion above) is verified on MockServer drop.
+        drop(mock_server);
+    }
+
+    #[tokio::test]
+    async fn referrers_fallback_put_is_timestamp_less() {
+        // The fallback tag is a merged SET, not an LWW register: a stamped
+        // fallback PUT could come back `409 REPLICATION_SUPERSEDED` and the
+        // just-merged descriptor would silently vanish while the job reports
+        // success. Pin that the primary PUT carries the source timestamp while
+        // the fallback-index PUT does NOT.
+        metrics_provider::init_for_tests();
+        let mock_server = MockServer::start().await;
+        let dir = TempDir::new().unwrap();
+        let (blob_store, metadata_store, store) = test_blob_store(dir.path().to_str().unwrap());
+
+        let subject = put_blob_direct(&store, b"subject-bytes").await;
+        let manifest = json!({
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "layers": [],
+            "subject": {
+                "mediaType": "application/vnd.oci.image.manifest.v1+json",
+                "digest": subject.to_string(),
+                "size": 13,
+            },
+        });
+        let manifest_bytes = serde_json::to_vec(&manifest).unwrap();
+        let manifest_digest = put_blob_direct(&store, &manifest_bytes).await;
+
+        // Primary PUT: must carry the header; NO `OCI-Subject` => fallback runs.
+        Mock::given(method("PUT"))
+            .and(path(format!("/v2/{NAMESPACE}/manifests/v1")))
+            .and(header(X_ANGOS_SOURCE_TIMESTAMP, "2026-06-03T00:00:00Z"))
+            .respond_with(
+                ResponseTemplate::new(201)
+                    .insert_header(DOCKER_CONTENT_DIGEST, manifest_digest.to_string().as_str()),
+            )
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        // Fallback index: GET 404 (fresh), then a PUT that must NOT carry the
+        // source-timestamp header.
+        let fallback_tag = format!("{}-{}", subject.algorithm(), subject.hash());
+        Mock::given(method("GET"))
+            .and(path(format!("/v2/{NAMESPACE}/manifests/{fallback_tag}")))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&mock_server)
+            .await;
+        let digest_str = manifest_digest.to_string();
+        Mock::given(method("PUT"))
+            .and(path(format!("/v2/{NAMESPACE}/manifests/{fallback_tag}")))
+            .respond_with(move |request: &Request| {
+                assert!(
+                    !request
+                        .headers
+                        .contains_key(X_ANGOS_SOURCE_TIMESTAMP.to_lowercase().as_str()),
+                    "the fallback-index PUT must be timestamp-less (set merge, not LWW)"
+                );
+                ResponseTemplate::new(201)
+                    .insert_header(DOCKER_CONTENT_DIGEST, digest_str.as_str())
+            })
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        push_manifest(
+            &downstream_client(&mock_server.uri()),
+            &blob_store,
+            &metadata_store,
+            NAMESPACE,
+            &manifest_digest,
+            None,
+            Some("v1"),
+            manifest_bytes,
+            4,
+            Some("2026-06-03T00:00:00Z"),
+        )
+        .await
+        .expect("subject push with a stamped primary and timestamp-less fallback");
         drop(mock_server);
     }
 
