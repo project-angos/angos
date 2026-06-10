@@ -3,6 +3,7 @@ use std::sync::Arc;
 use argh::FromArgs;
 use futures_util::StreamExt;
 use tracing::{info, warn};
+use uuid::Uuid;
 
 use crate::{
     command::{
@@ -134,7 +135,10 @@ impl Command {
             info!("Dry-run mode: no changes will be made to the storage");
             Box::new(DryRunSink)
         } else {
-            let job_store = Arc::new(JobStore::new(metadata_store.store_arc(), "scrub"));
+            let job_store = Arc::new(JobStore::new(
+                metadata_store.store_arc(),
+                format!("scrub-{}", Uuid::new_v4()),
+            ));
             let executor = Executor::builder()
                 .blob_store(blob_backend.clone())
                 .metadata_store(metadata_store.clone())
