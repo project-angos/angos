@@ -299,23 +299,15 @@ fn build_in_process_queue(
     let store = Arc::clone(&blob_store.store);
     let job_store: Arc<JobStore> = Arc::new(JobStore::new(store, "in-process"));
 
+    // Build BOTH handlers before spawning any claim loop: the replication
+    // builder is fallible, and an `Err` after the cache loops were already
+    // spawned would leak them — no caller holds the cancellation token on the
+    // error path, so they would poll the store forever.
     let cache_handler: Arc<dyn JobHandler> = Arc::new(CacheJobHandler::new(
         resolver.clone(),
         blob_store.clone(),
         metadata_store.clone(),
     ));
-
-    // One shared token cancels every loop when the owning `Registry` is dropped.
-    let shutdown = CancellationToken::new();
-
-    for _ in 0..cache_concurrency.get() {
-        tokio::spawn(in_process_claim_loop(
-            job_store.clone(),
-            cache_handler.clone(),
-            CACHE_QUEUE,
-            shutdown.clone(),
-        ));
-    }
 
     // Replication handler over the same shared store: it reads local manifest /
     // blob bytes and pushes them to each downstream `RegistryClient`. Converged
@@ -329,6 +321,18 @@ fn build_in_process_queue(
             .build()
             .map_err(|e| Error::Internal(format!("failed to build replication handler: {e}")))?,
     );
+
+    // One shared token cancels every loop when the owning `Registry` is dropped.
+    let shutdown = CancellationToken::new();
+
+    for _ in 0..cache_concurrency.get() {
+        tokio::spawn(in_process_claim_loop(
+            job_store.clone(),
+            cache_handler.clone(),
+            CACHE_QUEUE,
+            shutdown.clone(),
+        ));
+    }
 
     for _ in 0..replication_concurrency.get() {
         tokio::spawn(in_process_claim_loop(
