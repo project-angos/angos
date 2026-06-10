@@ -319,9 +319,18 @@ impl Registry {
             body.len() as u64,
         );
 
-        self.metadata_store
+        let commit = self
+            .metadata_store
             .store_manifest(namespace.as_ref(), &computed_digest, body, &ops, created_at)
             .await?;
+
+        // Whether this write changed local state, from the prior target the
+        // committed transaction itself validated: a tag already pointing at
+        // this digest, or an already-present revision, is a converged replay.
+        // A missing entry (no `Create` op for the reference — unreachable,
+        // `link_plan::push` always emits it) fails open so a genuine write is
+        // never suppressed.
+        let changed = commit.changed(&LinkKind::from_reference(reference), &computed_digest);
 
         let subject = manifest.subject.map(|s| s.digest);
 
@@ -329,6 +338,7 @@ impl Registry {
             headers: put_manifest_headers(namespace, reference, &computed_digest, subject.as_ref()),
             digest: computed_digest,
             events: Vec::new(),
+            changed,
         })
     }
 
@@ -693,9 +703,11 @@ impl Registry {
 
     /// The prior local link for `reference`, read only when an event-enqueuing
     /// downstream matches `namespace`; `None` otherwise. The no-op-suppression
-    /// dispatch gates in `accept_put_manifest`/`delete_manifest` consume this
-    /// solely to decide whether to re-dispatch, so when no downstream would
-    /// enqueue the read is skipped entirely (restoring the replication-off cost).
+    /// dispatch gate in `delete_manifest` consumes this solely to decide whether
+    /// to re-dispatch, so when no downstream would enqueue the read is skipped
+    /// entirely (restoring the replication-off cost). The put path needs no such
+    /// read — `accept_put_manifest` gets its `changed` gate from the committed
+    /// link transaction itself (`PutManifestResponse.changed`).
     /// A read error other than `ReferenceNotFound` is surfaced, not collapsed to
     /// "absent", so a transient backend hiccup never silently suppresses a real
     /// change. The read bypasses the link cache, like [`Self::link_supersedes`]:
@@ -738,15 +750,7 @@ impl Registry {
         self.check_lww_not_superseded(namespace, &reference, source_ts)
             .await?;
 
-        // No-op suppression: capture the PRIOR local state for this reference
-        // before the write, to decide afterward whether it actually changed (a
-        // re-asserted tag or already-present revision is a converged replay;
-        // re-dispatching it would keep a 3+-node mesh cycle alive). `None` means
-        // replication is off and the post-write dispatch block does not run.
         let resolved_repository = self.resolver.resolve(namespace);
-        let prior_link = self
-            .prior_link_if_replicated(resolved_repository, namespace, &reference)
-            .await;
 
         let limit = self.max_manifest_size_bytes;
         let mut request_body = Vec::new();
@@ -803,53 +807,32 @@ impl Registry {
         }
 
         // Enqueue replication for the stored manifest, but ONLY when the write
-        // actually changed local state (no-op suppression — see `prior_link`).
-        // The canonical stored digest is read directly off `response.digest`
-        // (computed once by `store_manifest`) — no String->Digest re-parse of
-        // the `Docker-Content-Digest` header.
+        // actually changed local state (no-op suppression): a tag re-asserted
+        // to the same digest, or an already-present revision, is a converged
+        // replay (e.g. an inbound replicated bounce) — re-dispatching it would
+        // keep a 3+-node mesh cycle alive. `response.changed` comes from the
+        // prior target the committed link transaction itself validated, so
+        // there is no separate pre-write read for an interleaved writer to
+        // race. The canonical stored digest is read directly off
+        // `response.digest` (computed once by `store_manifest`) — no
+        // String->Digest re-parse of the `Docker-Content-Digest` header.
         //
         // Webhook events above are emitted unconditionally; only the replication
         // dispatch is gated, so observers still see every push while the mesh
         // stops re-propagating converged replays.
-        if let Some(prior_link) = prior_link.as_ref() {
-            let digest = &response.digest;
-            let (tag, changed) = match &reference {
-                // A tag push moves local state when the tag was absent OR pointed
-                // at a different digest. A tag re-asserted to the same digest is a
-                // converged replay (e.g. an inbound replicated bounce) — skip.
-                Reference::Tag(tag) => {
-                    // Changed unless the tag already pointed at this exact digest.
-                    // A transient read failure (any non-Ok) must not silently
-                    // suppress a genuine change, so it falls through to dispatch.
-                    let changed = !matches!(prior_link, Ok(link) if link.target == *digest);
-                    (Some(tag.as_str()), changed)
-                }
-                // A digest push is content-addressed: it changes local state only
-                // when the revision did not already exist locally. A re-push of an
-                // already-present revision is a converged replay — skip, otherwise
-                // an A<->B digest push loops forever.
-                Reference::Digest(_) => {
-                    // Changed unless the revision is CONFIRMED present (prior read
-                    // returned Ok). A transient read failure (any non-Ok, incl. a
-                    // backend hiccup that is not ReferenceNotFound) must not
-                    // silently suppress a genuine change after the local write
-                    // already succeeded, so it falls through to dispatch — mirroring
-                    // the tag and delete arms (err toward dispatching).
-                    let changed = prior_link.is_err();
-                    (None, changed)
-                }
+        if response.changed {
+            let tag = match &reference {
+                Reference::Tag(tag) => Some(tag.as_str()),
+                Reference::Digest(_) => None,
             };
-
-            if changed {
-                self.dispatch_replication(
-                    resolved_repository,
-                    namespace,
-                    REPLICATION_PUSH_MANIFEST_KIND,
-                    tag,
-                    Some(digest),
-                )
-                .await;
-            }
+            self.dispatch_replication(
+                resolved_repository,
+                namespace,
+                REPLICATION_PUSH_MANIFEST_KIND,
+                tag,
+                Some(&response.digest),
+            )
+            .await;
         }
 
         Ok(response)

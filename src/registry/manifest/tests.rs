@@ -2430,6 +2430,67 @@ async fn accept_put_manifest_lww_reads_bypass_the_link_cache() {
 }
 
 #[tokio::test]
+async fn put_manifest_reports_changed_from_the_committed_transaction() {
+    // `PutManifestResponse.changed` is the no-op-suppression gate. It derives
+    // from the prior target the committed link transaction itself validated —
+    // not from a separate pre-write snapshot an interleaved writer could race.
+    let test_case = FSRegistryTestCase::new();
+    let registry = test_case.registry();
+    let namespace = &Namespace::new("test-repo").unwrap();
+    let tag_ref = Reference::Tag("latest".to_string());
+
+    let (content_a, media_type_a) = create_test_manifest(registry, namespace).await;
+
+    // Fresh tag: absent before => changed.
+    let first = registry
+        .put_manifest(namespace, &tag_ref, Some(&media_type_a), &content_a)
+        .await
+        .expect("fresh tag push");
+    assert!(first.changed, "a fresh tag push must report changed");
+
+    // Tag re-asserted to the same digest: converged replay => unchanged.
+    let replay = registry
+        .put_manifest(namespace, &tag_ref, Some(&media_type_a), &content_a)
+        .await
+        .expect("tag re-assert");
+    assert!(
+        !replay.changed,
+        "a tag re-asserted to the same digest must report unchanged"
+    );
+
+    // Re-push of an already-present revision by digest => unchanged.
+    let digest_ref = Reference::Digest(first.digest.clone());
+    let digest_replay = registry
+        .put_manifest(namespace, &digest_ref, Some(&media_type_a), &content_a)
+        .await
+        .expect("digest re-push");
+    assert!(
+        !digest_replay.changed,
+        "re-pushing an already-present revision must report unchanged"
+    );
+
+    // Move the tag to a DIFFERENT digest (a second manifest) => changed.
+    let layer_content = b"a different layer content";
+    let config_content = br#"{"architecture":"arm64","os":"linux"}"#;
+    let config_digest = upload_blob(registry, namespace, config_content).await;
+    let layer_digest = upload_blob(registry, namespace, layer_content).await;
+    let (content_b, media_type_b) = manifest_with_references(
+        &config_digest,
+        config_content.len(),
+        &layer_digest,
+        layer_content.len(),
+    );
+    let moved = registry
+        .put_manifest(namespace, &tag_ref, Some(&media_type_b), &content_b)
+        .await
+        .expect("tag move");
+    assert!(
+        moved.changed,
+        "moving the tag to a different digest must report changed"
+    );
+}
+
+#[tokio::test]
 async fn accept_put_manifest_accepts_lww_when_local_absent() {
     let test_case = FSRegistryTestCase::new();
     let registry = test_case.registry();

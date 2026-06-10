@@ -6,12 +6,17 @@ use chrono::{DateTime, Utc};
 
 use crate::{
     oci::Digest,
-    registry::metadata_store::{Error, LinkOperation, MetadataStore, link_ops::LinksTxExtras},
+    registry::metadata_store::{
+        Error, LinkOperation, MetadataStore,
+        link_ops::{LinksCommit, LinksTxExtras},
+    },
 };
 
 impl MetadataStore {
     /// Persist a manifest: writes blob-data, all link metadata, and blob-index
-    /// shard updates as a single atomic transaction.
+    /// shard updates as a single atomic transaction. Returns the
+    /// [`LinksCommit`] so the caller can read each created link's prior target
+    /// as validated by the commit (the no-op-suppression gate).
     pub async fn store_manifest(
         &self,
         namespace: &str,
@@ -19,7 +24,7 @@ impl MetadataStore {
         manifest_bytes: &[u8],
         operations: &[LinkOperation],
         created_at: Option<DateTime<Utc>>,
-    ) -> Result<(), Error> {
+    ) -> Result<LinksCommit, Error> {
         let extras = LinksTxExtras {
             blob_data_put: Some((digest, Bytes::from(manifest_bytes.to_vec()))),
             blob_data_delete_if_unreferenced: None,
@@ -48,6 +53,8 @@ impl MetadataStore {
             force_register_namespace: false,
             created_at: None,
         };
-        self.execute_links_tx(namespace, operations, extras).await
+        self.execute_links_tx(namespace, operations, extras)
+            .await
+            .map(|_| ())
     }
 }

@@ -228,7 +228,38 @@ struct LinksTxCaptured {
     written_links: Vec<(LinkKind, LinkMetadata)>,
     /// Links that were fully removed.
     deleted_links: Vec<LinkKind>,
+    /// Prior target per `Create` op's link (`None` = the link did not exist),
+    /// read by the committed attempt — see [`LinksCommit::prior_targets`].
+    prior_targets: Vec<(LinkKind, Option<Digest>)>,
     had_creates: bool,
+}
+
+/// Prior link state captured by a committed link transaction.
+///
+/// The transaction's retry loop re-reads each `Create` op's current target on
+/// every attempt and conflicts (retries) when it moved, so the value here is
+/// the state the commit was actually validated against — unlike a separate
+/// pre-write read, it cannot be stale by an arbitrary interleaved writer.
+/// `accept_put_manifest` derives its no-op-suppression `changed` gate from it.
+#[derive(Default)]
+pub struct LinksCommit {
+    /// Prior target per `Create` op's link; `None` = the link did not exist.
+    pub prior_targets: Vec<(LinkKind, Option<Digest>)>,
+}
+
+impl LinksCommit {
+    /// Whether the committed transaction changed `link`: `true` when the link
+    /// was absent or pointed at a different digest than `target` before the
+    /// commit. Fails open (`true`) when no `Create` op for `link` was part of
+    /// the transaction, so a genuine write is never suppressed by a lookup
+    /// miss.
+    #[must_use]
+    pub fn changed(&self, link: &LinkKind, target: &Digest) -> bool {
+        self.prior_targets
+            .iter()
+            .find(|(l, _)| l == link)
+            .is_none_or(|(_, prior)| prior.as_ref() != Some(target))
+    }
 }
 
 impl MetadataStore {
@@ -245,6 +276,7 @@ impl MetadataStore {
         }
         self.execute_links_tx(namespace, operations, LinksTxExtras::default())
             .await
+            .map(|_| ())
     }
 
     /// Run the retry loop, build the link-update transaction (plus any extras),
@@ -259,7 +291,7 @@ impl MetadataStore {
         namespace: &str,
         operations: &[LinkOperation],
         extras: LinksTxExtras<'_>,
-    ) -> Result<(), Error> {
+    ) -> Result<LinksCommit, Error> {
         let (_, result) = execute_with_retry_payload(
             self.executor(),
             || async {
@@ -569,11 +601,23 @@ impl MetadataStore {
                     }
                 }
 
+                // Prior target per `Create` op, from THIS attempt's reads (the
+                // ones the conflict check above validated the commit against).
+                let prior_targets = prelock_results
+                    .iter()
+                    .filter_map(|(create_data, _)| {
+                        create_data
+                            .as_ref()
+                            .map(|(link, _, old_target, ..)| ((*link).clone(), old_target.clone()))
+                    })
+                    .collect();
+
                 Ok((
                     builder.build(),
                     LinksTxCaptured {
                         written_links,
                         deleted_links,
+                        prior_targets,
                         had_creates,
                     },
                 ))
@@ -611,7 +655,9 @@ impl MetadataStore {
             );
         }
 
-        Ok(())
+        Ok(LinksCommit {
+            prior_targets: result.prior_targets,
+        })
     }
 }
 
