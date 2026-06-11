@@ -115,8 +115,7 @@ impl RegistryClient {
     }
 
     /// Resolves the HTTP client (TLS, redirects, timeout) and basic-auth
-    /// credentials from a parsed [`RegistryClientConfig`]. Internal helper for
-    /// [`RegistryClient::from_config`].
+    /// credentials from a parsed [`RegistryClientConfig`].
     ///
     /// # Errors
     ///
@@ -152,10 +151,9 @@ impl RegistryClient {
         Ok((client, basic_auth))
     }
 
-    /// Builds a registry client from a parsed [`RegistryClientConfig`]: resolves
-    /// the HTTP client (TLS, redirects, timeout) and basic-auth credentials, then
-    /// runs the builder. The single production construction path for upstreams and
-    /// replication downstreams.
+    /// Builds a registry client from a parsed [`RegistryClientConfig`]; the
+    /// single production construction path for upstreams and replication
+    /// downstreams.
     ///
     /// # Errors
     ///
@@ -192,24 +190,12 @@ impl RegistryClient {
         .await
     }
 
-    /// Runs the cached-token-then-single-refresh-retry orchestration shared by the
+    /// Shared cached-token-then-single-refresh-retry orchestration for
     /// replayable-body requests ([`RegistryClient::query`] and
     /// [`RegistryClient::send_body`]).
     ///
-    /// `send_once` performs one attempt with the auth header it is handed
-    /// (ownership is passed in so the per-attempt future can outlive the call):
-    /// the cached header for the first attempt, then a freshly refreshed token for
-    /// the single retry. The closure may run twice, so it must clone any
-    /// captured-by-value request state (e.g. the byte body) inside itself.
-    ///
-    /// First attempt uses the cached header. On `401` the token is refreshed once
-    /// (`refresh_auth_header` is given the originally-attempted header so its
-    /// "another thread already refreshed" short-circuit still applies) and the
-    /// request is retried exactly once. A `403` maps to [`Error::Denied`]; any
-    /// other status is returned as `Ok` for the caller to classify.
-    ///
-    /// The single-use upload stream in [`RegistryClient::patch_upload`] cannot be
-    /// replayed and therefore does not go through this helper.
+    /// `send_once` may run twice (cached header, then one refreshed token on
+    /// `401`), so it must clone any captured-by-value request state per attempt.
     async fn send_with_auth_retry<F, Fut>(
         &self,
         location: &str,
@@ -386,10 +372,8 @@ impl RegistryClient {
         let response = self.query(&Method::HEAD, accepted_types, location).await?;
 
         if !response.status().is_success() {
-            // A 404 means the manifest is genuinely absent; any other status is a
-            // transient/unexpected failure callers must be able to tell apart (the
-            // scrub reconcile treats a true 404 as "needs push" but skips the tag
-            // on a transient error).
+            // Only a true 404 maps to ManifestUnknown; callers must tell a
+            // transient failure apart from a genuinely absent manifest.
             return Err(if response.status() == StatusCode::NOT_FOUND {
                 Error::ManifestUnknown
             } else {
@@ -421,10 +405,8 @@ impl RegistryClient {
         let response = self.query(&Method::GET, accepted_types, location).await?;
 
         if !response.status().is_success() {
-            // A 404 means the manifest is genuinely absent; any other status is a
-            // transient/unexpected failure callers must be able to tell apart (the
-            // referrers fallback starts fresh only on a true 404 and retries
-            // otherwise rather than overwriting an existing index).
+            // Only a true 404 maps to ManifestUnknown; callers must tell a
+            // transient failure apart from a genuinely absent manifest.
             return Err(if response.status() == StatusCode::NOT_FOUND {
                 Error::ManifestUnknown
             } else {

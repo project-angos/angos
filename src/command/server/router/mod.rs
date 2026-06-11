@@ -15,12 +15,8 @@ fn parse_query<T: DeserializeOwned + Default>(params: &str) -> T {
     serde_urlencoded::from_str(params).unwrap_or_default()
 }
 
-/// Like [`parse_query`] but returns `None` when a value fails to deserialize
-/// (e.g. a malformed `?digest=` on upload-start, or any bad value on a `_jobs`
-/// admin query), so the caller can reject the route (the non-GET/HEAD 400
-/// path in `handle_unknown_route`) instead of silently dropping the value.
-/// Read-only pagination routes keep the lenient [`parse_query`] (e.g. a bad
-/// `?n=` on `_catalog` is ignored).
+/// Like [`parse_query`] but returns `None` when a value fails to deserialize,
+/// so the caller can reject the route instead of silently dropping the value.
 fn parse_query_strict<T: DeserializeOwned>(params: &str) -> Option<T> {
     serde_urlencoded::from_str(params).ok()
 }
@@ -112,13 +108,10 @@ struct JobsQuery {
     queue: Option<String>,
 }
 
-/// Parse the `?n=&after=&queue=` of a `_jobs` admin route. Returns `None`,
-/// rejecting the route via `handle_unknown_route` (404 for the GET listings,
-/// 400 for the retry/delete mutations), when `?queue=` names no known queue
-/// or any value is malformed (e.g. a non-numeric `?n=`): a lenient parse would
-/// reset the WHOLE struct on one bad value, so `?queue=replication&n=abc`
-/// would silently administer the default `cache` queue instead. An absent
-/// selector defaults to the `cache` queue.
+/// Parses the `?n=&after=&queue=` of a `_jobs` admin route strictly: a lenient
+/// parse would reset the whole struct on one bad value and silently administer
+/// the default `cache` queue. Returns `None` on a malformed value or unknown
+/// queue; an absent selector defaults to `cache`.
 fn parse_jobs_query(params: Option<&str>) -> Option<(Option<u16>, Option<String>, String)> {
     let query: JobsQuery = match params {
         Some(params) => parse_query_strict(params)?,
@@ -217,25 +210,19 @@ fn try_parse_upload(method: &Method, path: &str, params: Option<&str>) -> Option
         if *method != Method::POST {
             return None;
         }
-        // A present query is parsed strictly: a malformed `?digest=` fails
-        // deserialization -> `None` -> the POST becomes a 400 via
-        // `handle_unknown_route`, rather than silently starting a 202 session.
-        // A missing query is a plain upload-start session.
+        // Strict parse: a malformed query rejects the POST as a 400 instead of
+        // silently starting a session.
         let query: MountQuery = match params {
             Some(p) => parse_query_strict(p)?,
             None => MountQuery::default(),
         };
 
-        // A present `?mount=` must be a valid digest: a malformed value is
-        // rejected (the POST becomes a 400), symmetric with the strict
-        // `?digest=`/`?from=` handling above: the OCI fall-back-to-session
-        // rule covers UNSATISFIABLE mounts, not syntactically invalid ones, and
-        // a silent degrade to a plain session would hide the client's bug.
+        // A malformed `?mount=` rejects the POST: the OCI fall-back-to-session
+        // rule covers unsatisfiable mounts, not syntactically invalid ones.
         if let Some(value) = &query.mount {
             let digest = value.parse::<Digest>().ok()?;
-            // A present-but-invalid `?from=` is rejected (the POST becomes a 400)
-            // rather than silently treated as from-less auto-discovery, which would
-            // widen the authorized source set.
+            // A malformed `?from=` is rejected rather than treated as from-less
+            // auto-discovery, which would widen the authorized source set.
             let from = match &query.from {
                 Some(repo) => Some(Namespace::new(repo).ok()?),
                 None => None,
@@ -247,7 +234,6 @@ fn try_parse_upload(method: &Method, path: &str, params: Option<&str>) -> Option
             });
         }
 
-        // Ordinary upload start, optionally monolithic via `?digest=`.
         let digest = query.digest;
         return Some(Action::StartUpload { namespace, digest });
     }

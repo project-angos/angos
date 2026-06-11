@@ -34,10 +34,9 @@ pub struct PutManifestResponse {
     pub headers: HeaderMap,
     pub digest: Digest,
     pub events: Vec<Event>,
-    /// Whether the write changed local state: the pushed reference was absent
-    /// or pointed at a different digest, as validated by the committed link
-    /// transaction itself (no separate racy pre-read). `false` is a converged
-    /// replay; it gates the replication re-dispatch (no-op suppression).
+    /// Whether the write changed local state, as validated by the committed
+    /// link transaction itself (no racy pre-read); gates the replication
+    /// re-dispatch.
     pub changed: bool,
 }
 

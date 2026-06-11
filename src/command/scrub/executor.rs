@@ -52,9 +52,7 @@ impl Executor {
         ExecutorBuilder::default()
     }
 
-    /// Thin helper routing through [`Executor::builder`] for tests that do not
-    /// exercise replication. Synthesizes a `JobStore` over the metadata store's
-    /// `Store` façade so all required fields are present and the build cannot fail.
+    /// Test-only constructor that synthesizes a `JobStore` so the build cannot fail.
     #[cfg(test)]
     #[must_use]
     pub fn new(blob_store: Arc<blob_store::BlobStore>, metadata_store: Arc<MetadataStore>) -> Self {
@@ -67,13 +65,10 @@ impl Executor {
             .expect("blob_store, metadata_store and job_store provided")
     }
 
-    /// Builds the SAME envelope shape (queue, kind, `lock_key`) as the event path
-    /// and lands it on the durable replication queue, so a reconcile-discovered
-    /// push coalesces with a pending event-path push on `enqueue`. Deletes key
-    /// per deletion event (the `source_ts` is part of their `lock_key`), so a
-    /// prune delete never coalesces with (and can never stale-out) a pending
-    /// event-path delete. Records the `replication_reconcile_total` outcome
-    /// (`enqueued` / `failed`).
+    /// Lands the payload on the durable replication queue with the same envelope
+    /// shape as the event path, so a reconcile push coalesces with a pending
+    /// event-path push. Deletes include `source_ts` in their `lock_key`, so a
+    /// prune delete never coalesces with a pending event-path delete.
     async fn enqueue_replication(&self, payload: ReplicationPushPayload) -> Result<(), Error> {
         let envelope = build_envelope(&payload).map_err(|e| {
             record_reconcile_outcome("failed");
@@ -88,9 +83,8 @@ impl Executor {
     }
 }
 
-/// Records a `replication_reconcile_total` outcome: `enqueued` / `failed`
-/// (this executor), or `skipped` (the checker: a downstream probe failure
-/// left a tag unreconciled this pass).
+/// Records a `replication_reconcile_total` outcome (`enqueued`, `failed`, or
+/// `skipped`).
 pub fn record_reconcile_outcome(outcome: &str) {
     metrics_provider()
         .replication_reconcile_total
@@ -98,9 +92,7 @@ pub fn record_reconcile_outcome(outcome: &str) {
         .inc();
 }
 
-/// Builder for [`Executor`] taking individual resolved fields.
-///
-/// `blob_store`, `metadata_store` and `job_store` are all required.
+/// Builder for [`Executor`]; all three fields are required.
 #[allow(clippy::struct_field_names)]
 #[derive(Default)]
 pub struct ExecutorBuilder {
@@ -311,10 +303,9 @@ impl ActionSink for Executor {
                     tag: Some(tag),
                     digest: Some(digest.to_string()),
                     kind: REPLICATION_PUSH_MANIFEST_KIND.to_string(),
-                    // The handler stamps source_ts from the resolved tag's
-                    // created_at at execute time, so a reconcile push carries the
-                    // same last-writer-wins version as the event path instead of
-                    // overwriting the receiver unconditionally.
+                    // The handler stamps source_ts from the tag's created_at at
+                    // execute time, so the push carries the same last-writer-wins
+                    // version as the event path.
                     source_ts: None,
                 })
                 .await?;
@@ -324,27 +315,12 @@ impl ActionSink for Executor {
                 namespace,
                 tag,
             } => {
-                // A tag delete keys off the tag; the receiver needs no digest.
-                //
-                // Stamp `source_ts` with the moment reconcile decided to prune,
-                // in the same RFC 3339 format as the event path, so the receiver
-                // runs last-writer-wins instead of deleting unconditionally: a
-                // downstream tag whose `created_at` is strictly newer than this
-                // timestamp is preserved (REPLICATION_SUPERSEDED) rather than
-                // destroyed.
-                //
-                // CAVEAT: prune is a ONE-WAY-MIRROR operation, not active-active
-                // safe. `source_ts` here is "now", which is necessarily later than
-                // any tag the downstream already held when reconcile listed it, so
-                // LWW only protects against a tag dated in the FUTURE relative to
-                // this decision (clock skew, or a tag pushed in the gap between the
-                // listing and the delete landing). It does NOT make prune safe on
-                // an active-active peer: a peer's legitimately-newer tag whose
-                // `created_at` predates this reconcile run still has
-                // `created_at < source_ts`, so it is deleted. Stamping `source_ts`
-                // is the correct, consistent guard (and removes the
-                // unconditional-bypass footgun), but `prune = true` must only be
-                // enabled for a downstream that is an authoritative one-way mirror.
+                // Stamp `source_ts` with the prune decision time so the receiver
+                // runs last-writer-wins and preserves a downstream tag dated after
+                // this decision (clock skew, or a push racing the listing). That
+                // does NOT make prune active-active safe: a peer's newer tag
+                // created before this run is still deleted, so `prune = true` is
+                // one-way-mirror-only.
                 self.enqueue_replication(ReplicationPushPayload {
                     downstream,
                     namespace,
@@ -737,9 +713,6 @@ mod tests {
                 .await
                 .unwrap();
 
-            // Claim the enqueued job and inspect the on-queue payload: a prune
-            // delete MUST carry a valid RFC 3339 `source_ts` so the receiver runs
-            // last-writer-wins instead of deleting unconditionally.
             let claimed = job_store
                 .claim_one(REPLICATION_QUEUE)
                 .await

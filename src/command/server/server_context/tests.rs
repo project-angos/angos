@@ -1042,10 +1042,8 @@ fn make_event(id: Uuid) -> Event {
 
 #[tokio::test]
 async fn dispatch_events_first_failure_does_not_abort_batch() {
-    // Regression: a failing delivery must NOT short-circuit the batch; every
-    // subsequent event still has to be attempted. A Required webhook with
-    // max_retries = 0 fails each event in a single attempt, so the mock records
-    // exactly one POST per event.
+    // With max_retries = 0 each event fails in a single attempt, so the mock
+    // records exactly one POST per event.
     let mock_server = MockServer::start().await;
     Mock::given(method("POST"))
         .respond_with(ResponseTemplate::new(500))
@@ -1090,9 +1088,7 @@ async fn dispatch_events_first_failure_does_not_abort_batch() {
     ];
     let result = context.dispatch_events(&events).await;
 
-    // The Required-style failure surfaces overall...
     assert!(result.is_err(), "a delivery failure must surface overall");
-    // ...but every event was still attempted (bug fixed): one POST per event.
     let requests = mock_server.received_requests().await.unwrap();
     assert_eq!(
         requests.len(),

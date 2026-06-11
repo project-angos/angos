@@ -35,11 +35,8 @@ impl ReplicationMode {
     }
 }
 
-/// Runtime representation of one replication downstream.
-///
-/// Holds only resolved fields (an `Arc<RegistryClient>`, compiled regexes,
-/// scalars), with no `*Config` field. Constructed exclusively via
-/// [`ReplicationDownstream::builder`].
+/// Runtime representation of one replication downstream. Holds only resolved
+/// fields and is constructed exclusively via [`ReplicationDownstream::builder`].
 #[derive(Debug)]
 pub struct ReplicationDownstream {
     pub name: String,
@@ -48,8 +45,7 @@ pub struct ReplicationDownstream {
     pub namespace_filter: Vec<Regex>,
     pub max_concurrent_pushes: usize,
     /// When `true`, scrub reconciliation deletes tags present on this downstream
-    /// but absent locally (local is authoritative). Only safe for a one-way
-    /// mirror; unsafe for an active-active peer. Defaults to `false`.
+    /// but absent locally. Only safe for a one-way mirror, not an active-active peer.
     pub prune: bool,
 }
 
@@ -60,10 +56,8 @@ impl ReplicationDownstream {
         ReplicationDownstreamBuilder::default()
     }
 
-    /// Returns `true` when `namespace` passes this downstream's filter.
-    ///
-    /// An empty filter matches every namespace; otherwise the namespace must
-    /// match at least one pattern.
+    /// Returns `true` when `namespace` passes this downstream's filter; an
+    /// empty filter matches everything.
     #[must_use]
     pub fn matches_namespace(&self, namespace: &str) -> bool {
         self.namespace_filter.is_empty()
@@ -74,19 +68,15 @@ impl ReplicationDownstream {
     }
 
     /// True when a live mutation in `namespace` enqueues an event push to this
-    /// downstream: the exact per-downstream condition `dispatch_replication`
-    /// selects on.
+    /// downstream; the exact condition `dispatch_replication` selects on.
     #[must_use]
     pub fn enqueues_for(&self, namespace: &str) -> bool {
         self.mode.enqueues_on_event() && self.matches_namespace(namespace)
     }
 }
 
-/// Builder for [`ReplicationDownstream`] taking individual resolved fields.
-///
-/// `name`, `registry_client` and `max_concurrent_pushes` are required; `mode`
-/// defaults to [`ReplicationMode::EventReconcile`], `namespace_filter` defaults
-/// to empty (match-all), and `prune` defaults to `false`.
+/// Builder for [`ReplicationDownstream`]. `name`, `registry_client` and
+/// `max_concurrent_pushes` are required; the rest default.
 #[derive(Default)]
 pub struct ReplicationDownstreamBuilder {
     name: Option<String>,

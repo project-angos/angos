@@ -2193,11 +2193,6 @@ async fn delete_manifest_removes_links_and_blob_data() {
 }
 
 // --- Receiver-side last-writer-wins (LWW) ------------------------------------
-//
-// FS-backed and env-independent: a replication push/delete carrying a
-// `source_ts` OLDER than the local tag's `created_at` is rejected with the
-// distinct `REPLICATION_SUPERSEDED` 409; a newer (or absent local) source_ts is
-// accepted; a write with no source_ts skips LWW entirely (genuine client write).
 
 async fn seed_tag(registry: &Registry, namespace: &Namespace, tag: &str) -> (Vec<u8>, String) {
     let (content, media_type) = create_test_manifest(registry, namespace).await;
@@ -2231,9 +2226,7 @@ async fn local_created_at(
 
 #[tokio::test]
 async fn accept_put_manifest_stamps_created_at_from_source_ts() {
-    // A replicated write persists the incoming source_ts as the tag's
-    // created_at (author time), so LWW and retention track author time across
-    // hops rather than this receiver's clock.
+    // LWW and retention track author time across hops, not the receiver's clock.
     let test_case = FSRegistryTestCase::new();
     let registry = test_case.registry();
     let namespace = &Namespace::new("lww-repo").unwrap();
@@ -2263,8 +2256,6 @@ async fn accept_put_manifest_stamps_created_at_from_source_ts() {
 
 #[tokio::test]
 async fn accept_put_manifest_without_source_ts_stamps_local_clock() {
-    // A genuine client write (no source_ts) stamps the receiver's clock, not an
-    // author time, so direct pushes are unaffected by the replication change.
     let test_case = FSRegistryTestCase::new();
     let registry = test_case.registry();
     let namespace = &Namespace::new("lww-repo").unwrap();
@@ -2345,11 +2336,8 @@ async fn accept_put_manifest_accepts_lww_newer_source_ts() {
 
 #[tokio::test]
 async fn accept_put_manifest_accepts_lww_equal_source_ts() {
-    // An incoming source_ts EXACTLY equal to the local tag's created_at with
-    // the SAME content must NOT be superseded: an equal digest is a converged
-    // replay, and rejecting it (a regression to `>=`) would make two converged
-    // nodes bounce 409s. Distinct content on a timestamp tie is ordered by the
-    // digest tie-break (see the *_tie_breaks_on_digest tests).
+    // Rejecting an equal-timestamp converged replay (a regression to `>=`)
+    // would make two converged nodes bounce 409s.
     let test_case = FSRegistryTestCase::new();
     let registry = test_case.registry();
     let namespace = &Namespace::new("lww-repo").unwrap();
@@ -2371,9 +2359,7 @@ async fn accept_put_manifest_accepts_lww_equal_source_ts() {
         .expect("equal source_ts must converge (not be superseded)");
 }
 
-/// Builds a second, distinct manifest (different config + layer) in
-/// `namespace` and returns the two manifests ordered by digest:
-/// `((larger_body, larger_media_type), (smaller_body, smaller_media_type))`.
+/// Two distinct manifests in `namespace`, returned larger digest first.
 async fn two_manifests_by_digest_order(
     registry: &Registry,
     namespace: &Namespace,
@@ -2402,12 +2388,8 @@ async fn two_manifests_by_digest_order(
 
 #[tokio::test]
 async fn accept_put_manifest_lww_equal_ts_tie_breaks_on_digest() {
-    // Wall-clock LWW cannot order two DISTINCT writes stamped with the
-    // identical timestamp, and strictly-greater alone would make both sides
-    // accept each other's write forever (each acceptance changes state and
-    // re-dispatches, an A<->B swap that never converges). The digest
-    // tie-break makes the order total: the larger digest wins on every node,
-    // so the side holding it rejects the smaller incoming write.
+    // Without the digest tie-break an equal-timestamp A<->B pair would swap
+    // digests forever; the larger digest must win on every node.
     let test_case = FSRegistryTestCase::new();
     let registry = test_case.registry();
     let namespace = &Namespace::new("lww-repo").unwrap();
@@ -2417,8 +2399,6 @@ async fn accept_put_manifest_lww_equal_ts_tie_breaks_on_digest() {
         two_manifests_by_digest_order(registry, namespace).await;
     let ts = chrono::Utc::now() - chrono::Duration::hours(1);
 
-    // Seed the tag with the LARGER digest at `ts` (a replicated write persists
-    // source_ts as created_at).
     registry
         .accept_put_manifest(
             None,
@@ -2431,7 +2411,6 @@ async fn accept_put_manifest_lww_equal_ts_tie_breaks_on_digest() {
         .await
         .expect("seed the larger-digest manifest");
 
-    // Equal timestamp, smaller incoming digest: the local copy wins.
     let result = registry
         .accept_put_manifest(
             None,
@@ -2451,9 +2430,6 @@ async fn accept_put_manifest_lww_equal_ts_tie_breaks_on_digest() {
 
 #[tokio::test]
 async fn accept_put_manifest_lww_equal_ts_accepts_larger_digest() {
-    // The mirror of the tie-break test above: the side holding the SMALLER
-    // digest accepts the larger incoming write, so the pair converges on the
-    // larger digest instead of mutually rejecting (or mutually accepting).
     let test_case = FSRegistryTestCase::new();
     let registry = test_case.registry();
     let namespace = &Namespace::new("lww-repo").unwrap();
@@ -2502,12 +2478,8 @@ async fn accept_put_manifest_lww_equal_ts_accepts_larger_digest() {
 
 #[tokio::test]
 async fn accept_put_manifest_lww_reads_bypass_the_link_cache() {
-    // On a multi-replica deployment the per-process link cache can lag a
-    // sibling replica's write by up to its TTL. The LWW gate must read the
-    // BACKEND link, not the cached one: here the cache still holds the seeded
-    // (older) link while the store carries a sibling's newer one, and a
-    // replicated push older than the sibling write must be superseded: a
-    // cached read would see only the stale created_at and let it through.
+    // The per-process link cache can lag a sibling replica's write by up to
+    // its TTL, so the LWW gate must read the backend link, not the cached one.
     let test_case = FSRegistryTestCase::with_link_cache_ttl(300);
     let registry = test_case.registry();
     let namespace = &Namespace::new("lww-repo").unwrap();
@@ -2516,8 +2488,7 @@ async fn accept_put_manifest_lww_reads_bypass_the_link_cache() {
     let (content, media_type) = seed_tag(registry, namespace, tag).await;
     let created_at = local_created_at(registry, namespace, tag).await;
 
-    // The seed write warmed the cache with the original created_at; assert it
-    // so the stale-cache scenario stays honest if the write path ever changes.
+    // Assert the seed warmed the cache so the stale-cache scenario stays honest.
     let store = test_case.metadata_store();
     let link = LinkKind::Tag(tag.to_string());
     let cached = store
@@ -2526,8 +2497,8 @@ async fn accept_put_manifest_lww_reads_bypass_the_link_cache() {
         .expect("seed write must warm the link cache");
     assert_eq!(cached.created_at, Some(created_at));
 
-    // A sibling replica moves the tag's created_at forward BEHIND this
-    // process's cache (direct store write, no cache_put/cache_invalidate).
+    // Simulate a sibling replica moving created_at forward behind this
+    // process's cache.
     let sibling_ts = created_at + chrono::Duration::seconds(120);
     let mut sibling = store
         .read_link_reference(namespace.as_ref(), &link)
@@ -2539,8 +2510,8 @@ async fn accept_put_manifest_lww_reads_bypass_the_link_cache() {
         .await
         .expect("sibling write behind the cache");
 
-    // Incoming replicated push: newer than the cached created_at, older than
-    // the sibling's. Only an uncached gate read sees the sibling and rejects.
+    // Newer than the cached created_at but older than the sibling's, so only
+    // an uncached gate read rejects.
     let incoming = created_at + chrono::Duration::seconds(60);
     let result = registry
         .accept_put_manifest(
@@ -2562,9 +2533,6 @@ async fn accept_put_manifest_lww_reads_bypass_the_link_cache() {
 
 #[tokio::test]
 async fn put_manifest_reports_changed_from_the_committed_transaction() {
-    // `PutManifestResponse.changed` is the no-op-suppression gate. It derives
-    // from the prior target the committed link transaction itself validated,
-    // not from a separate pre-write snapshot an interleaved writer could race.
     let test_case = FSRegistryTestCase::new();
     let registry = test_case.registry();
     let namespace = &Namespace::new("test-repo").unwrap();
@@ -2572,14 +2540,12 @@ async fn put_manifest_reports_changed_from_the_committed_transaction() {
 
     let (content_a, media_type_a) = create_test_manifest(registry, namespace).await;
 
-    // Fresh tag: absent before => changed.
     let first = registry
         .put_manifest(namespace, &tag_ref, Some(&media_type_a), &content_a)
         .await
         .expect("fresh tag push");
     assert!(first.changed, "a fresh tag push must report changed");
 
-    // Tag re-asserted to the same digest: converged replay => unchanged.
     let replay = registry
         .put_manifest(namespace, &tag_ref, Some(&media_type_a), &content_a)
         .await
@@ -2589,7 +2555,6 @@ async fn put_manifest_reports_changed_from_the_committed_transaction() {
         "a tag re-asserted to the same digest must report unchanged"
     );
 
-    // Re-push of an already-present revision by digest => unchanged.
     let digest_ref = Reference::Digest(first.digest.clone());
     let digest_replay = registry
         .put_manifest(namespace, &digest_ref, Some(&media_type_a), &content_a)
@@ -2600,7 +2565,6 @@ async fn put_manifest_reports_changed_from_the_committed_transaction() {
         "re-pushing an already-present revision must report unchanged"
     );
 
-    // Move the tag to a DIFFERENT digest (a second manifest) => changed.
     let layer_content = b"a different layer content";
     let config_content = br#"{"architecture":"arm64","os":"linux"}"#;
     let config_digest = upload_blob(registry, namespace, config_content).await;
@@ -2628,7 +2592,6 @@ async fn accept_put_manifest_accepts_lww_when_local_absent() {
     let namespace = &Namespace::new("lww-repo").unwrap();
     let tag = "fresh";
 
-    // No prior local tag: LWW must never block a first write.
     let (content, media_type) = create_test_manifest(registry, namespace).await;
     let very_old = chrono::Utc::now() - chrono::Duration::days(3650);
 
@@ -2654,8 +2617,6 @@ async fn accept_put_manifest_without_source_ts_skips_lww() {
 
     let (content, media_type) = seed_tag(registry, namespace, tag).await;
 
-    // A genuine client write (no source_ts) must overwrite regardless of the
-    // local tag's age.
     registry
         .accept_put_manifest(
             None,
@@ -2679,8 +2640,6 @@ async fn accept_put_manifest_digest_reference_skips_lww() {
     let digest = Digest::Sha256(sha256::hex(&content).into());
     let very_old = chrono::Utc::now() - chrono::Duration::days(3650);
 
-    // Digest references are content-addressed: LWW never applies even with an
-    // ancient source_ts.
     registry
         .accept_put_manifest(
             None,
@@ -2720,7 +2679,6 @@ async fn delete_manifest_rejects_lww_older_source_ts() {
         "older source_ts delete must be superseded, got: {result:?}"
     );
 
-    // The local tag must still resolve (the delete was rejected).
     registry
         .metadata_store
         .read_link(namespace.as_ref(), &LinkKind::Tag(tag.to_string()), false)
@@ -2761,12 +2719,8 @@ async fn delete_manifest_accepts_lww_newer_source_ts() {
 
 #[tokio::test]
 async fn delete_manifest_not_superseded_when_local_tag_has_no_created_at() {
-    // A local tag link with no recorded `created_at` is treated as oldest, so a
-    // replicated delete is never superseded by it, even with a `source_ts` far in
-    // the past. `created_at` is never `None` through the stamping write path (it is
-    // always stamped to `now()` or the source timestamp), so the link is injected
-    // directly via `write_link_reference`, mirroring a legacy link written before
-    // the field existed.
+    // The write path always stamps `created_at`, so a legacy no-created_at
+    // link is injected directly via `write_link_reference`.
     let test_case = FSRegistryTestCase::new();
     let registry = test_case.registry();
     let namespace = &Namespace::new("lww-repo").unwrap();
@@ -2789,8 +2743,7 @@ async fn delete_manifest_not_superseded_when_local_tag_has_no_created_at() {
         .await
         .expect("seed a tag link with no created_at");
 
-    // An epoch source_ts that would lose last-writer-wins to ANY real created_at;
-    // with `created_at == None` the delete must still proceed (not superseded).
+    // An epoch source_ts would lose LWW to any real created_at.
     let ancient = chrono::DateTime::from_timestamp(0, 0).unwrap();
     registry
         .delete_manifest(
@@ -2814,10 +2767,8 @@ async fn delete_manifest_not_superseded_when_local_tag_has_no_created_at() {
 
 #[tokio::test]
 async fn delete_manifest_digest_rejects_lww_when_pointing_tag_newer() {
-    // A digest delete cascades to every tag pointing at the revision. A
-    // replicated delete whose source_ts predates a locally-newer tag pointing at
-    // that digest must be superseded: the tag, and the revision it references,
-    // survive, exactly as a tag delete would.
+    // The cascade must not drop a tag re-pointed after the delete was
+    // authored, nor the revision it still references.
     let test_case = FSRegistryTestCase::new();
     let registry = test_case.registry();
     let namespace = &Namespace::new("lww-repo").unwrap();
@@ -2842,7 +2793,6 @@ async fn delete_manifest_digest_rejects_lww_when_pointing_tag_newer() {
         "digest delete older than a pointing tag must be superseded, got: {result:?}"
     );
 
-    // The tag and the revision it points at must both survive the rejected delete.
     registry
         .metadata_store
         .read_link(namespace.as_ref(), &LinkKind::Tag(tag.to_string()), false)
@@ -2857,8 +2807,6 @@ async fn delete_manifest_digest_rejects_lww_when_pointing_tag_newer() {
 
 #[tokio::test]
 async fn delete_manifest_digest_accepts_lww_when_newer_than_pointing_tags() {
-    // A replicated digest delete whose source_ts is newer than every pointing
-    // tag wins: the revision and its tags are removed.
     let test_case = FSRegistryTestCase::new();
     let registry = test_case.registry();
     let namespace = &Namespace::new("lww-repo").unwrap();
@@ -2885,13 +2833,9 @@ async fn delete_manifest_digest_accepts_lww_when_newer_than_pointing_tags() {
 
 #[tokio::test]
 async fn prune_delete_stamped_source_ts_suppressed_when_local_tag_newer_else_proceeds() {
-    // Mirrors the scrub prune path end-to-end on the receiver: the reconcile
-    // executor stamps `source_ts = Utc::now().to_rfc3339()` on the delete payload;
-    // the pipeline forwards it as the RFC 3339 `X-Angos-Source-Timestamp` header;
-    // the receiver parses it back (`parse_from_rfc3339(..).with_timezone(&Utc)`)
-    // and feeds it to `delete_manifest`. A downstream tag whose `created_at` is
-    // strictly newer than the stamped instant is PRESERVED (REPLICATION_SUPERSEDED)
-    // instead of being deleted unconditionally; an older one proceeds.
+    // Exercises the prune wire round trip: source_ts is stamped, serialized to
+    // RFC 3339 (the `X-Angos-Source-Timestamp` header), and reparsed before
+    // reaching `delete_manifest`.
     let test_case = FSRegistryTestCase::new();
     let registry = test_case.registry();
     let namespace = &Namespace::new("prune-repo").unwrap();
@@ -2900,9 +2844,7 @@ async fn prune_delete_stamped_source_ts_suppressed_when_local_tag_newer_else_pro
     seed_tag(registry, namespace, tag).await;
     let created_at = local_created_at(registry, namespace, tag).await;
 
-    // 1. Suppressed: the prune decision predates the (receiver-side) tag, so the
-    //    stamped source_ts is OLDER than the local `created_at`. Stamp -> string
-    //    -> reparse exactly as the wire path does.
+    // Suppressed: the stamped source_ts predates the local tag.
     let decided_before = created_at - chrono::Duration::seconds(60);
     let stamped = decided_before.to_rfc3339();
     let reparsed = chrono::DateTime::parse_from_rfc3339(&stamped)
@@ -2928,8 +2870,7 @@ async fn prune_delete_stamped_source_ts_suppressed_when_local_tag_newer_else_pro
         .await
         .expect("a superseded prune delete must preserve the downstream tag");
 
-    // 2. Proceeds: the prune decision is later than the tag, so the stamped
-    //    source_ts is NEWER than the local `created_at` and the delete applies.
+    // Proceeds: the stamped source_ts is newer than the local tag.
     let decided_after = created_at + chrono::Duration::seconds(60);
     let stamped = decided_after.to_rfc3339();
     let reparsed = chrono::DateTime::parse_from_rfc3339(&stamped)
@@ -2980,14 +2921,10 @@ async fn replication_superseded_maps_to_distinct_oci_code() {
 #[cfg(test)]
 mod noop_suppression_tests {
     //! No-op suppression (loop prevention): an inbound manifest write that does
-    //! not change local state must NOT be re-dispatched for replication. These
-    //! tests drive `accept_put_manifest` / `delete_manifest` against a
-    //! self-contained FS/in-memory registry whose single downstream lets
-    //! `dispatch_replication` enqueue, then assert on the pending replication
-    //! queue depth. The harness shares one `Store` between the blob store,
-    //! metadata store, and a caller-held `JobStore` so `create_test_manifest`
-    //! (which uploads via the registry) and the queue count both observe the
-    //! same backend; no drain is spawned, so enqueued jobs persist for counting.
+    //! not change local state must not be re-dispatched for replication. The
+    //! harness shares one `Store` between the blob store, metadata store, and a
+    //! caller-held `JobStore`, and spawns no drain, so enqueued jobs persist
+    //! for counting.
 
     use std::{collections::HashMap, io::Cursor, sync::Arc};
 
@@ -3080,8 +3017,6 @@ mod noop_suppression_tests {
         repositories.insert(REPO.to_string(), repository_with_downstream());
         let resolver = Arc::new(RepositoryResolver::new(Arc::new(repositories)).unwrap());
 
-        // A bare JobStore over the shared store persists (and lets us count)
-        // enqueued envelopes; no drain is spawned, so nothing consumes them.
         let job_store: Arc<JobStore> = Arc::new(JobStore::new(store, "test"));
 
         let config = RegistryConfig::default().job_queue(job_store.clone());
@@ -3093,12 +3028,10 @@ mod noop_suppression_tests {
         job_store.count_pending(REPLICATION_QUEUE, 0).await.unwrap()
     }
 
-    /// Drain (claim + complete) one pending replication job, clearing its
-    /// `lock_key` dedup index. Pending pushes for the same tag coalesce on that
-    /// index (a tag's pending push is replaced, not duplicated, while still
-    /// pending), so draining between two genuine changes lets the second one
-    /// re-enqueue rather than dedup away, isolating the dispatch GATE under test
-    /// from the queue's (correct) coalescing.
+    /// Drains (claims + completes) one pending replication job, clearing its
+    /// `lock_key` dedup index. Pending pushes for the same tag coalesce on
+    /// that index, so draining isolates the dispatch gate under test from the
+    /// queue's coalescing.
     async fn drain_one(job_store: &JobStore) {
         let claimed = job_store
             .claim_one(REPLICATION_QUEUE)
@@ -3112,9 +3045,8 @@ mod noop_suppression_tests {
             .unwrap();
     }
 
-    /// Build a second, distinct manifest (a different layer => a different
-    /// digest) so a tag can be moved from one digest to another. Uploads the
-    /// referenced blobs into the registry first so the push validates.
+    /// Builds a second, distinct manifest, pre-uploading its blobs so the push
+    /// validates.
     async fn create_second_manifest(
         registry: &Registry,
         namespace: &Namespace,
@@ -3131,9 +3063,6 @@ mod noop_suppression_tests {
         )
     }
 
-    /// A tagged push that MOVES the tag to a new digest enqueues one push job;
-    /// re-asserting the SAME tag->digest (an inbound replicated bounce) enqueues
-    /// nothing.
     #[tokio::test]
     async fn tagged_push_dispatches_only_when_tag_moves() {
         let dir = TempDir::new().unwrap();
@@ -3143,7 +3072,6 @@ mod noop_suppression_tests {
 
         let (content_a, media_type) = create_test_manifest(&registry, &namespace).await;
 
-        // First push: tag is absent => state changes => one job enqueued.
         registry
             .accept_put_manifest(
                 None,
@@ -3161,18 +3089,13 @@ mod noop_suppression_tests {
             "a first tag push (tag absent) must enqueue one job"
         );
 
-        // Drain that job so the tag's dedup index clears; otherwise a still-
-        // pending push for the same tag coalesces and would mask the gate.
+        // Drain so dedup coalescing cannot mask the gate.
         drain_one(&job_store).await;
         assert_eq!(pending(&job_store).await, 0, "queue drained");
 
-        // Re-assert the SAME tag->digest: a converged replay => no new job, even
-        // with the queue empty (the gate, not the dedup index, suppresses it).
-        // This per-node converged-replay drop is what terminates BOTH 2-node and
-        // N-node (3+) mesh cycles WITHOUT any origin tracking: each node refuses
-        // to re-dispatch a write that left its local state unchanged, so an
-        // inbound replicated bounce dies at every hop (the intent of the removed
-        // `foreign_origin_noop_breaks_mesh_cycle` test, preserved per-node).
+        // With the queue empty the gate itself, not the dedup index, must
+        // suppress the replay. This per-node drop is what terminates mesh
+        // cycles without origin tracking.
         registry
             .accept_put_manifest(
                 None,
@@ -3190,7 +3113,6 @@ mod noop_suppression_tests {
             "re-asserting the same tag->digest must enqueue nothing (no-op replay)"
         );
 
-        // Move the tag to a DIFFERENT digest: state changes => one new job.
         let (content_b, media_type_b) = create_second_manifest(&registry, &namespace).await;
         registry
             .accept_put_manifest(
@@ -3210,9 +3132,8 @@ mod noop_suppression_tests {
         );
     }
 
-    /// A first-time digest push enqueues one job; re-pushing the same
-    /// (already-present) revision enqueues nothing (an A<->B digest bounce must
-    /// not loop).
+    /// An A<->B digest bounce must not loop: re-pushing an already-present
+    /// revision is not re-dispatched.
     #[tokio::test]
     async fn digest_push_dispatches_only_when_revision_is_new() {
         let dir = TempDir::new().unwrap();
@@ -3222,7 +3143,6 @@ mod noop_suppression_tests {
         let (content, media_type) = create_test_manifest(&registry, &namespace).await;
         let digest = Digest::Sha256(sha256::hex(&content).into());
 
-        // First digest push: revision absent => one job.
         registry
             .accept_put_manifest(
                 None,
@@ -3240,22 +3160,12 @@ mod noop_suppression_tests {
             "a first-time digest push must enqueue one job"
         );
 
-        // Drain that job so its `lock_key` dedup index clears; otherwise the
-        // second enqueue would coalesce on the still-pending job and pending
-        // would stay 1 even if the no-op gate were removed, masking the gate.
+        // Drain so dedup coalescing cannot mask the gate.
         drain_one(&job_store).await;
         assert_eq!(pending(&job_store).await, 0, "queue drained");
 
-        // Re-push the SAME revision with the queue EMPTY: a content-addressed
-        // converged replay => the gate (prior_link.is_err() == false) suppresses
-        // the re-dispatch, so pending stays 0. A broken gate would freshly
-        // enqueue (no pending job to coalesce against) and pending would be 1.
-        // This per-node drop of an already-present revision is exactly what
-        // terminates BOTH 2-node and N-node (3+) mesh cycles WITHOUT any origin
-        // tracking: every node independently refuses to re-dispatch a write that
-        // did not change its local state, so the foreign-origin bounce dies at
-        // each hop (the intent of the removed `foreign_origin_noop_breaks_mesh_
-        // cycle` test, preserved per-node).
+        // With the queue empty a broken gate would freshly enqueue, so pending
+        // staying 0 proves the gate, not the dedup index, suppressed the replay.
         registry
             .accept_put_manifest(
                 None,
@@ -3275,8 +3185,6 @@ mod noop_suppression_tests {
         );
     }
 
-    /// Deleting an existing tag enqueues a delete job; deleting an absent tag
-    /// enqueues nothing.
     #[tokio::test]
     async fn tag_delete_dispatches_only_when_something_was_removed() {
         let dir = TempDir::new().unwrap();
@@ -3298,7 +3206,6 @@ mod noop_suppression_tests {
             .expect("seed tag push");
         let baseline = pending(&job_store).await;
 
-        // Delete the existing tag: removed something => one delete job.
         registry
             .delete_manifest(None, None, &namespace, &Reference::Tag(tag.to_string()))
             .await
@@ -3309,7 +3216,6 @@ mod noop_suppression_tests {
             "deleting an existing tag must enqueue one delete job"
         );
 
-        // Delete an ABSENT tag (defensive gate): nothing removed => no new job.
         let after_delete = pending(&job_store).await;
         let _ = registry
             .delete_manifest(
@@ -3326,13 +3232,10 @@ mod noop_suppression_tests {
         );
     }
 
-    /// delete → re-push → delete again: the second delete is a DISTINCT
-    /// deletion event (newer `source_ts`) and must get its own job instead of
-    /// dedup-dropping into the still-pending first delete. A delete cannot
-    /// re-derive its timestamp at execute time (the link is gone), so the
-    /// coalesced older job would ship the stale timestamp, lose receiver-side
-    /// LWW against the in-between re-push, and leave the downstream tag alive
-    /// until a reconcile.
+    /// The second delete must get its own job rather than coalescing into the
+    /// still-pending first. A delete cannot re-derive its timestamp at execute
+    /// time (the link is gone), so a coalesced older job would ship a stale
+    /// `source_ts` and lose receiver-side LWW against the in-between re-push.
     #[tokio::test]
     async fn second_delete_after_repush_enqueues_its_own_job() {
         let dir = TempDir::new().unwrap();
@@ -3355,7 +3258,7 @@ mod noop_suppression_tests {
         drain_one(&job_store).await;
         assert_eq!(pending(&job_store).await, 0, "queue drained");
 
-        // First delete: one pending delete job (deliberately left pending).
+        // First delete, deliberately left pending.
         registry
             .delete_manifest(None, None, &namespace, &Reference::Tag(tag.to_string()))
             .await
@@ -3366,7 +3269,6 @@ mod noop_suppression_tests {
             "the first delete must enqueue one job"
         );
 
-        // Re-create the tag: a state change => one push job.
         registry
             .accept_put_manifest(
                 None,
@@ -3384,8 +3286,6 @@ mod noop_suppression_tests {
             "re-creating the tag must enqueue one push job"
         );
 
-        // Second delete while the FIRST delete is still pending: a distinct
-        // deletion event => its own job, not a silent dedup-drop.
         registry
             .delete_manifest(None, None, &namespace, &Reference::Tag(tag.to_string()))
             .await
@@ -3398,17 +3298,14 @@ mod noop_suppression_tests {
         );
     }
 
-    /// A digest delete that removes only cascade tag links (the revision link
-    /// already gone, an inconsistent local state) still changed local state,
-    /// so it MUST re-dispatch: the suppression gate keys on the cascade tags,
-    /// not the revision link alone.
+    /// The suppression gate must key on the cascade tags, not the revision
+    /// link alone.
     #[tokio::test]
     async fn digest_delete_dispatches_when_only_cascade_tags_remain() {
         let dir = TempDir::new().unwrap();
         let (registry, job_store) = build_registry(dir.path().to_str().unwrap());
         let namespace = Namespace::new(NAMESPACE).unwrap();
 
-        // Seed a tagged manifest (Digest + Tag links), then drain its push job.
         let (content, media_type) = create_test_manifest(&registry, &namespace).await;
         let digest = Digest::Sha256(sha256::hex(&content).into());
         registry
@@ -3424,8 +3321,7 @@ mod noop_suppression_tests {
             .expect("seed tag push");
         drain_one(&job_store).await;
 
-        // Force the inconsistent state: drop ONLY the revision link, leaving the
-        // tag still pointing at the now-link-less digest.
+        // Drop only the revision link, leaving the tag pointing at it.
         registry
             .metadata_store
             .update_links(
@@ -3447,18 +3343,14 @@ mod noop_suppression_tests {
         );
     }
 
-    /// A digest delete of an already-absent revision (the revision link gone AND
-    /// no tag still pointing at it, the fully-converged state after a prior
-    /// delete) enqueues nothing: the negative side of the cascade-tags gate.
-    /// This is the digest bounce-back that terminates a delete cycle: once a
-    /// node has converged, it stops re-dispatching the delete.
+    /// The digest bounce-back that terminates a delete cycle: a converged node
+    /// (revision gone, no pointing tags) stops re-dispatching the delete.
     #[tokio::test]
     async fn digest_delete_suppressed_once_converged() {
         let dir = TempDir::new().unwrap();
         let (registry, job_store) = build_registry(dir.path().to_str().unwrap());
         let namespace = Namespace::new(NAMESPACE).unwrap();
 
-        // Seed a tagged manifest (Digest + Tag links), then drain its push job.
         let (content, media_type) = create_test_manifest(&registry, &namespace).await;
         let digest = Digest::Sha256(sha256::hex(&content).into());
         registry
@@ -3474,9 +3366,6 @@ mod noop_suppression_tests {
             .expect("seed tag push");
         drain_one(&job_store).await;
 
-        // First digest delete: the revision exists and cascades to the `latest`
-        // tag, so it changed local state => one delete job. Drain it so the dedup
-        // index clears and cannot mask the gate on the second delete.
         let baseline = pending(&job_store).await;
         registry
             .delete_manifest(None, None, &namespace, &Reference::Digest(digest.clone()))
@@ -3489,10 +3378,8 @@ mod noop_suppression_tests {
         );
         drain_one(&job_store).await;
 
-        // Second digest delete with the queue EMPTY: the revision link is gone AND
-        // no tag points at the digest (the cascade removed `latest`), so
-        // `existed_before` is false and the gate suppresses the re-dispatch. A
-        // broken gate would freshly enqueue (nothing pending to coalesce against).
+        // With the queue empty a broken gate would freshly enqueue; staying at
+        // `after` proves the gate suppressed it.
         let after = pending(&job_store).await;
         let _ = registry
             .delete_manifest(None, None, &namespace, &Reference::Digest(digest))
@@ -3504,9 +3391,6 @@ mod noop_suppression_tests {
         );
     }
 
-    /// The dispatch gate is replication-only: a no-op tag replay (same
-    /// tag->digest) still emits the webhook Events (`ManifestPush` +
-    /// `TagCreate`) even though it enqueues no replication job.
     #[tokio::test]
     async fn noop_push_still_emits_webhook_events() {
         let dir = TempDir::new().unwrap();
@@ -3528,8 +3412,6 @@ mod noop_suppression_tests {
             .expect("seed tag push");
         let baseline = pending(&job_store).await;
 
-        // Re-assert the same tag->digest: a no-op replay for replication, but the
-        // events must still fire for observers.
         let response = registry
             .accept_put_manifest(
                 None,

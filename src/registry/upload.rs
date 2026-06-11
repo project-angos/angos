@@ -13,19 +13,9 @@ use crate::{
     util::sha256::finalize_digest,
 };
 
-/// Maximum number of candidate namespaces CEL-evaluated during a from-less
-/// mount authorization. Referrers of a popular blob could number in the
-/// thousands; without a cap, a single public mount request would trigger one
-/// CEL evaluation per candidate, an attacker-influenceable fan-out. This cap
-/// bounds only that per-candidate authorization loop. The full referrer set is
-/// still read from the blob index and materialized into a Vec first; that Vec is
-/// then sorted and the cap is a `truncate` applied afterwards (so the kept
-/// candidates are the lexicographically-smallest `MAX_FROM_LESS_MOUNT_CANDIDATES`,
-/// deterministic across requests), so the cap does not bound that read or
-/// allocation. The cap is fail-safe: if the caller holds access only to a
-/// namespace beyond this limit the mount is simply not granted and the client
-/// falls back to a normal upload session (202), which re-authorizes
-/// independently. No access is over-granted.
+/// Caps the namespaces CEL-evaluated for a from-less mount, bounding an
+/// attacker-influenceable fan-out. Candidates beyond the cap fall back to a
+/// normal upload session, so no access is over-granted.
 const MAX_FROM_LESS_MOUNT_CANDIDATES: usize = 32;
 
 pub enum StartUploadResponse {
@@ -35,16 +25,8 @@ pub enum StartUploadResponse {
 
 /// An OCI cross-repository blob mount request
 /// (`POST /v2/<ns>/blobs/uploads/?mount=<digest>[&from=<repo>]`).
-///
-/// `digest` is the blob to mount into the target namespace. `from` is the source
-/// repository the client claims already holds it; it is optional:
-/// - **With `from`** the mount succeeds only when the blob is present AND readable
-///   from that repository.
-/// - **Without `from`** (automatic content discovery) the mount succeeds when the
-///   blob is present AND already referenced by *any* namespace.
-///
-/// Either way, a mount that cannot be satisfied falls back to a normal upload
-/// session rather than failing, per the distribution spec.
+/// An unsatisfiable mount falls back to a normal upload session rather than
+/// failing, per the distribution spec.
 #[derive(Debug)]
 pub struct BlobMount {
     pub digest: Digest,
@@ -200,29 +182,11 @@ impl Registry {
         }
     }
 
-    /// Attempts an OCI cross-repository blob mount, granting `namespace` a
-    /// reference to `mount.digest` drawn from `source`.
-    ///
-    /// `source` is the namespace the caller was *authorized* to read the blob
-    /// from (resolved by the authorization gate from
-    /// [`mount_source_candidates`](Self::mount_source_candidates)). The grant
-    /// proceeds only when that same source still references the blob and its
-    /// bytes still exist, re-checked here rather than against an independently
-    /// re-derived candidate set, so concurrent index churn between authorization
-    /// and grant cannot mount from a source the caller was never authorized
-    /// against. On success the completed-blob headers are returned (the caller
-    /// answers `201 Created` with no body transfer).
-    ///
-    /// Returns `Ok(None)` when the source no longer holds the blob (or its bytes
-    /// are gone), so the caller falls back to opening a normal upload session
-    /// (`202 Accepted`): the spec requires a mount that cannot be satisfied to
-    /// degrade to an ordinary upload rather than fail.
-    ///
-    /// The entire size-check / `can_read` / `grant` sequence runs under the
-    /// `blob-data:{digest}` coarse lock, serializing it against a concurrent
-    /// `delete_blob` reclaim. Without the lock a delete could see no remaining
-    /// namespace references and reclaim the blob bytes between the size check
-    /// and the grant, leaving the target with a dangling reference.
+    /// Grants `namespace` a reference to `mount.digest`, re-checked against the
+    /// authorized `source`, returning `Ok(None)` when the source no longer
+    /// holds the blob or its bytes are gone. Check and grant run under the
+    /// `blob-data:{digest}` lock so a concurrent `delete_blob` cannot leave a
+    /// dangling reference.
     async fn try_cross_repo_mount(
         &self,
         namespace: &Namespace,
@@ -249,15 +213,9 @@ impl Registry {
         result
     }
 
-    /// Source namespaces a cross-repo mount of `mount.digest` would draw the blob
-    /// from: the namespaces whose read policy must permit the caller before the
-    /// mount may grant a reference. Empty when the blob is absent locally or no
-    /// eligible namespace holds it, in which case the caller falls back to an
-    /// ordinary upload session.
-    ///
-    /// - **`from` set**: `[from]` when that repository owns the blob, else empty.
-    /// - **`from` unset** (automatic discovery): every namespace that references
-    ///   the blob; the caller need only be authorized to read one of them.
+    /// Source namespaces whose read policy must permit the caller: `[from]`
+    /// when set and owning the blob, else every namespace referencing it.
+    /// Empty when the mount cannot be satisfied.
     pub async fn mount_source_candidates(
         &self,
         mount: &BlobMount,
@@ -280,10 +238,7 @@ impl Registry {
         let mut candidates = BlobOwnership::new(self.metadata_store.as_ref())
             .referencing_namespaces(&mount.digest)
             .await?;
-        // Sort before truncating so the kept candidates are deterministic (the
-        // lexicographically-smallest MAX_FROM_LESS_MOUNT_CANDIDATES) rather than an
-        // arbitrary HashMap-ordered subset that varies per request and could let a
-        // given caller's mount authorize on one request and not another.
+        // Sort before truncating so the kept candidates are deterministic.
         candidates.sort();
         candidates.truncate(MAX_FROM_LESS_MOUNT_CANDIDATES);
         Ok(candidates)
@@ -304,10 +259,8 @@ impl Registry {
         })
     }
 
-    /// Starts an ordinary blob upload.
-    ///
-    /// When `digest` names a blob the namespace already owns, returns it with no
-    /// transfer (`ExistingBlob` → `201`); otherwise opens a session (`202`).
+    /// Starts a blob upload: `ExistingBlob` (201) when the namespace already
+    /// owns `digest`, otherwise a new session (202).
     #[instrument]
     pub async fn start_upload(
         &self,
@@ -328,14 +281,9 @@ impl Registry {
         self.open_upload_session(namespace).await
     }
 
-    /// Starts a cross-repository blob mount, granting `namespace` a reference to
-    /// `mount.digest` drawn from `source` (the namespace the caller was
-    /// authorized to read the blob from).
-    ///
-    /// When the mount can be satisfied, grants the namespace a reference with no
-    /// transfer (`ExistingBlob` → `201`); otherwise falls back to opening an
-    /// ordinary upload session (`202`): a mount that cannot be satisfied must
-    /// degrade to an upload rather than fail.
+    /// Starts a cross-repository blob mount from the authorized `source`,
+    /// falling back to an ordinary upload session when the mount cannot be
+    /// satisfied.
     #[instrument]
     pub async fn mount_blob(
         &self,
@@ -741,7 +689,6 @@ mod tests {
             let target = &Namespace::new("test-repo/target").unwrap();
             let content = b"cross-repo mountable blob";
 
-            // The blob exists and is owned by `source` (but not yet by `target`).
             let digest = put_blob_direct(registry.metadata_store.store(), content).await;
             BlobOwnership::new(registry.metadata_store.as_ref())
                 .grant(source, &digest)
@@ -754,8 +701,6 @@ mod tests {
             };
             let response = registry.mount_blob(target, &mount, source).await.unwrap();
 
-            // 201-equivalent: the mount granted `target` a reference with no
-            // transfer, so the existing-blob headers come back.
             match response {
                 StartUploadResponse::ExistingBlob { headers } => {
                     assert_eq!(headers[DOCKER_CONTENT_DIGEST], digest.to_string());
@@ -769,7 +714,6 @@ mod tests {
                 }
             }
 
-            // The mount must have actually granted `target` ownership.
             assert!(
                 BlobOwnership::new(registry.metadata_store.as_ref())
                     .can_read(target, &digest)
@@ -789,8 +733,6 @@ mod tests {
             let target = &Namespace::new("test-repo/target").unwrap();
             let content = b"blob present but not owned by source";
 
-            // The blob bytes exist, but `source` was never granted a reference, so
-            // the mount cannot be satisfied and must fall back to a session.
             let digest = put_blob_direct(registry.metadata_store.store(), content).await;
 
             let mount = BlobMount {
@@ -811,7 +753,6 @@ mod tests {
                 }
             }
 
-            // The failed mount must NOT have granted `target` anything.
             assert!(
                 !BlobOwnership::new(registry.metadata_store.as_ref())
                     .can_read(target, &digest)
@@ -830,7 +771,6 @@ mod tests {
             let source = &Namespace::new("test-repo/source").unwrap();
             let target = &Namespace::new("test-repo/target").unwrap();
 
-            // The blob does not exist at all -> fall back to a session.
             let absent = Digest::from_str(
                 "sha256:0000000000000000000000000000000000000000000000000000000000000000",
             )
@@ -857,8 +797,6 @@ mod tests {
             let target = &Namespace::new("test-repo/target").unwrap();
             let content = b"automatically discoverable blob";
 
-            // The blob is referenced by some namespace (owner), so a from-less
-            // mount can discover it automatically.
             let digest = put_blob_direct(registry.metadata_store.store(), content).await;
             BlobOwnership::new(registry.metadata_store.as_ref())
                 .grant(owner, &digest)
@@ -898,9 +836,6 @@ mod tests {
             let source = &Namespace::new("test-repo/source").unwrap();
             let content = b"orphan blob present but unreferenced";
 
-            // The blob bytes exist but no namespace references them, so even the
-            // authorized source does not hold it and the mount falls back to a
-            // session.
             let digest = put_blob_direct(registry.metadata_store.store(), content).await;
 
             let mount = BlobMount {
@@ -926,10 +861,8 @@ mod tests {
             let target = &Namespace::new("test-repo/target").unwrap();
             let content = b"held by owner, not by the authorized source";
 
-            // `owner` holds the blob; the source the caller was authorized against
-            // (`authorized`) does NOT. The grant is conditioned on the authorized
-            // source, so the mount must fall back rather than grant from `owner`
-            // (closes the authorize-then-grant TOCTOU).
+            // Guards the authorize-then-grant TOCTOU: the grant is conditioned
+            // on the authorized source, not on `owner`.
             let digest = put_blob_direct(registry.metadata_store.store(), content).await;
             BlobOwnership::new(registry.metadata_store.as_ref())
                 .grant(owner, &digest)
@@ -974,7 +907,6 @@ mod tests {
             ownership.grant(source, &digest).await.unwrap();
             ownership.grant(other, &digest).await.unwrap();
 
-            // `from` set and owning the blob -> exactly that namespace.
             let candidates = registry
                 .mount_source_candidates(&BlobMount {
                     digest: digest.clone(),
@@ -984,7 +916,6 @@ mod tests {
                 .unwrap();
             assert_eq!(candidates, vec![source.clone()]);
 
-            // `from` set but NOT owning the blob -> no candidate.
             let candidates = registry
                 .mount_source_candidates(&BlobMount {
                     digest: digest.clone(),
@@ -994,10 +925,7 @@ mod tests {
                 .unwrap();
             assert!(candidates.is_empty());
 
-            // from-less discovery -> every namespace that references the blob.
-            // Production sorts before truncating, so the output is already in
-            // lexicographic order ("test-repo/other" < "test-repo/source");
-            // assert that directly (no in-test sort) to guard the determinism.
+            // Lexicographic order guards the sort-before-truncate determinism.
             let candidates = registry
                 .mount_source_candidates(&BlobMount {
                     digest: digest.clone(),
@@ -1007,7 +935,6 @@ mod tests {
                 .unwrap();
             assert_eq!(candidates, vec![other.clone(), source.clone()]);
 
-            // Absent blob -> no candidates.
             let absent = Digest::from_str(
                 "sha256:0000000000000000000000000000000000000000000000000000000000000000",
             )
@@ -1025,9 +952,6 @@ mod tests {
         }
     }
 
-    // A cross-repo mount must not grant the caller a blob they cannot read from
-    // the source: authorization is checked against a namespace that holds the
-    // blob, for both an explicit `from` and from-less automatic discovery.
     #[tokio::test]
     async fn authorize_mount_source_requires_read_on_the_source() {
         for test_case in backends() {
@@ -1041,7 +965,6 @@ mod tests {
                 .await
                 .unwrap();
 
-            // Only identity id "reader" may read; everyone else is denied.
             let config = load_config(
                 r#"
                 [global.access_policy]

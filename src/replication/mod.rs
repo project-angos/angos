@@ -1,9 +1,4 @@
 //! Bi-directional replication of OCI artifacts to per-repository downstreams.
-//!
-//! This module holds the replication configuration DTOs ([`config`]), the
-//! runtime downstream type ([`downstream`]), the LWW wire constants ([`wire`]),
-//! the replication [`Error`], the push [`pipeline`], and the [`handler`]
-//! ([`ReplicationJobHandler`]) that drives it off the job queue.
 
 mod config;
 mod downstream;

@@ -213,9 +213,8 @@ fn test_repository_config() {
 
 #[test]
 fn test_repository_downstream_config() {
-    // End-to-end: a `[[repository.X.downstream]]` array-of-tables must parse
-    // through the full Configuration (the repository map visitor + the flattened
-    // RegistryClientConfig) and land its fields in `downstream[0].client`.
+    // Downstream tables must parse through the full Configuration, including
+    // the repository map visitor and the flattened RegistryClientConfig.
     let config = r#"
     [server]
     bind_address = "0.0.0.0"
@@ -257,9 +256,8 @@ fn test_repository_downstream_config() {
 
 #[test]
 fn test_repository_downstream_rejects_partial_mtls() {
-    // The flattened RegistryClientConfig's mTLS-pairing validation must fire
-    // through the full Configuration parse too: a downstream supplying only
-    // `client_certificate` (no key) is rejected.
+    // The mTLS-pairing validation must fire through the full Configuration
+    // parse too.
     let config = r#"
     [server]
     bind_address = "0.0.0.0"
@@ -822,10 +820,8 @@ fn test_metadata_store_s3_lock_strategy_s3_defaults() {
     }
 }
 
-// A durable job queue ([global.job_queue]) drains across multiple processes, so
-// the per-job execution lock must be shared. An S3 blob store with no explicit
-// metadata-store lock strategy inherits the in-process `memory` lock, which
-// cannot serialize across processes: that combination must be rejected.
+// An S3 blob store with no explicit metadata-store lock strategy inherits the
+// in-process `memory` lock, which cannot serialize across processes.
 #[test]
 fn job_queue_rejects_inherited_memory_lock_on_s3() {
     let config = r#"
@@ -901,7 +897,7 @@ fn job_queue_allows_shared_s3_lock() {
 }
 
 // Without [global.job_queue] the queue drains in a single process, so the
-// in-process memory lock is sufficient and must be accepted.
+// memory lock suffices.
 #[test]
 fn in_process_queue_allows_memory_lock() {
     let config = r#"

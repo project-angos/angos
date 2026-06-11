@@ -14,8 +14,7 @@ use crate::{
 /// a runtime panic.
 pub const DEFAULT_MAX_CONCURRENT_CACHE_JOBS: NonZeroUsize = NonZeroUsize::new(4).unwrap();
 
-/// Default replication-worker concurrency. Mirrors
-/// [`DEFAULT_MAX_CONCURRENT_CACHE_JOBS`]; `unwrap` is const-evaluated.
+/// Default replication-worker concurrency; the `unwrap` is const-evaluated.
 pub const DEFAULT_MAX_CONCURRENT_REPLICATION_JOBS: NonZeroUsize = NonZeroUsize::new(4).unwrap();
 
 #[derive(Clone, Debug, Deserialize)]
@@ -27,10 +26,8 @@ pub struct GlobalConfig {
         deserialize_with = "deserialize_max_concurrent_cache_jobs"
     )]
     pub max_concurrent_cache_jobs: NonZeroUsize,
-    /// Concurrency for the replication queue, consumed by the server's
-    /// in-process drain, `angos worker --queue replication`, and the
-    /// `scrub --replicate` end-of-run drain. Mirrors
-    /// `max_concurrent_cache_jobs` (sibling worker-concurrency knob).
+    /// Worker concurrency for the replication queue, used by the server,
+    /// `angos worker`, and `scrub --replicate` drains.
     #[serde(
         default = "default_max_concurrent_replication_jobs",
         deserialize_with = "deserialize_max_concurrent_replication_jobs"
@@ -69,8 +66,6 @@ fn default_max_concurrent_cache_jobs() -> NonZeroUsize {
     DEFAULT_MAX_CONCURRENT_CACHE_JOBS
 }
 
-/// Shared validation core for `NonZeroUsize` concurrency fields: deserializes
-/// a `usize` and rejects zero, naming the field in the error message.
 fn deserialize_positive_nonzero<'de, D>(
     deserializer: D,
     field: &str,

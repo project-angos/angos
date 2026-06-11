@@ -81,11 +81,9 @@ impl Command {
         let pending_refresh = pending.map(|refresh| {
             let shutdown = CancellationToken::new();
             let tracker = TaskTracker::new();
-            // Publish backlog depth for both drained queues. The server reads
-            // count_pending off the shared store regardless of which process
-            // drains, so `angos_job_queue_pending{queue="replication"}` is
-            // available whenever [global.job_queue] is configured, even though
-            // `angos worker` (not the server) drains the replication queue.
+            // The server reads pending counts off the shared store, so the
+            // replication gauge is published here even though `angos worker`
+            // drains that queue.
             for queue in [CACHE_QUEUE, REPLICATION_QUEUE] {
                 tracker.spawn(pending_refresh_loop(
                     refresh.store.clone(),

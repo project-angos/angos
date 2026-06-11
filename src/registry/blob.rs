@@ -334,15 +334,10 @@ impl Registry {
         }
     }
 
-    /// Fire-and-forget enqueue of replication push/delete jobs for a local
-    /// mutation, one per matching downstream. Mirrors [`Self::dispatch_cache_fill`]:
-    /// failures are logged and counted on `angos_job_queue_enqueue_failures_total`
-    /// but never bubble up, so a scheduling glitch cannot fail the client's write.
-    ///
-    /// Loop prevention is the caller's job: the manifest mutation methods only
-    /// call this when the write actually changed local state (no-op suppression),
-    /// so a converged replay is never re-dispatched and every mesh cycle
-    /// terminates.
+    /// Fire-and-forget enqueue of replication push/delete jobs, one per matching
+    /// downstream; failures are logged and counted but never fail the client's write.
+    /// Callers must only invoke this when the write changed local state, which is
+    /// what makes mesh cycles terminate.
     pub async fn dispatch_replication(
         &self,
         repository: Option<&Repository>,
@@ -355,10 +350,8 @@ impl Registry {
             return;
         };
 
-        // The change timestamp for receiver-side last-writer-wins. It is
-        // authoritative for a DELETE (the moment the delete happened); a PUSH
-        // re-derives it from the resolved tag's created_at at execute time, so a
-        // coalesced push can never carry a stale timestamp.
+        // Receiver-side last-writer-wins timestamp: authoritative for a DELETE;
+        // a PUSH re-derives it at execute time, so a coalesced push never goes stale.
         let source_ts = Utc::now().to_rfc3339();
 
         for downstream in &repository.replication {
@@ -374,8 +367,7 @@ impl Registry {
                 kind: kind.to_string(),
                 source_ts: Some(source_ts.clone()),
             };
-            // Build + enqueue as one fallible step so the warn + failure-metric
-            // path lives in a single place.
+            // Build + enqueue as one fallible step so failures share the warn + metric path.
             let outcome = match build_envelope(&payload) {
                 Ok(envelope) => self
                     .job_queue
@@ -1449,8 +1441,7 @@ mod dispatch_replication_tests {
         )
     }
 
-    /// Build a repository carrying exactly one downstream with the given mode and
-    /// (optional) namespace filter.
+    /// Repository with exactly one downstream of the given mode and namespace filter.
     fn repository_with(mode: ReplicationMode, namespace_filter: Vec<Regex>) -> Repository {
         Repository {
             name: REPO.to_string(),
@@ -1478,9 +1469,8 @@ mod dispatch_replication_tests {
         repository_with(ReplicationMode::EventReconcile, Vec::new())
     }
 
-    /// Build a `Registry` over an FS/in-memory store whose shared job store is a
-    /// caller-held `JobStore` (so the test can `count_pending`), carrying the
-    /// supplied repository.
+    /// Build a `Registry` whose job store is a caller-held `JobStore` so the
+    /// test can count pending jobs.
     fn build_registry_with(root: &str, repository: Repository) -> (Registry, Arc<JobStore>) {
         let object: Arc<dyn ObjectStore> =
             Arc::new(StorageFsBackend::builder().root_dir(root).build().unwrap());
@@ -1500,8 +1490,7 @@ mod dispatch_replication_tests {
         repositories.insert(REPO.to_string(), repository);
         let resolver = Arc::new(RepositoryResolver::new(Arc::new(repositories)).unwrap());
 
-        // No drain spawned: a bare JobStore over the shared store just persists
-        // (and lets us count) enqueued envelopes. This test asserts enqueue only.
+        // No drain spawned: the bare JobStore only persists envelopes; these tests assert enqueue only.
         let job_store: Arc<JobStore> = Arc::new(JobStore::new(store, "test"));
 
         let config = RegistryConfig::default().job_queue(job_store.clone());
@@ -1510,8 +1499,8 @@ mod dispatch_replication_tests {
         (registry, job_store)
     }
 
-    /// Read the single pending replication envelope and decode its payload.
-    /// Panics if there is not exactly one pending job on the queue.
+    /// Decode the payload of the sole pending replication job, panicking unless
+    /// exactly one is pending.
     async fn sole_pending_payload(job_store: &JobStore) -> ReplicationPushPayload {
         let keys = job_store.list_pending(REPLICATION_QUEUE, 16).await.unwrap();
         assert_eq!(
@@ -1527,15 +1516,11 @@ mod dispatch_replication_tests {
         serde_json::from_value(envelope.payload).expect("decode ReplicationPushPayload")
     }
 
-    /// Build a `Registry` over an FS/in-memory store whose shared job store is a
-    /// caller-held `JobStore` (so the test can `count_pending`), with one
-    /// `event+reconcile` downstream.
+    /// [`build_registry_with`] with one `event+reconcile` downstream.
     fn build_registry(root: &str) -> (Registry, Arc<JobStore>) {
         build_registry_with(root, repository_with_downstream())
     }
 
-    /// A fresh local change enqueues exactly one push job on the replication
-    /// queue for the single matching downstream.
     #[tokio::test]
     async fn dispatch_replication_enqueues_for_matching_downstream() {
         crate::metrics_provider::init_for_tests();
@@ -1563,8 +1548,8 @@ mod dispatch_replication_tests {
         );
     }
 
-    /// A fresh local push enqueues a job whose payload carries the correct
-    /// downstream/namespace/tag/digest/kind and a populated `source_ts`.
+    /// The payload carries the correct downstream/namespace/tag/digest/kind and
+    /// a populated `source_ts`.
     #[tokio::test]
     async fn dispatch_replication_payload_is_well_formed() {
         crate::metrics_provider::init_for_tests();
@@ -1598,8 +1583,6 @@ mod dispatch_replication_tests {
         );
     }
 
-    /// A `reconcile-only` downstream is excluded from the event path: a local
-    /// push enqueues nothing.
     #[tokio::test]
     async fn dispatch_replication_skips_reconcile_only_downstream() {
         crate::metrics_provider::init_for_tests();
@@ -1630,8 +1613,6 @@ mod dispatch_replication_tests {
         );
     }
 
-    /// A downstream whose `namespace_filter` excludes the mutated namespace
-    /// enqueues nothing on the event path.
     #[tokio::test]
     async fn dispatch_replication_skips_non_matching_namespace_filter() {
         crate::metrics_provider::init_for_tests();

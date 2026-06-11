@@ -59,23 +59,18 @@ pub enum Action {
         key: String,
         upload_id: String,
     },
-    /// Enqueue a replication push job for a tag that diverges from (or is
-    /// absent on) a downstream. Applied by the `Executor` via `JobStore::enqueue`,
-    /// never an inline network push (so scrub-discovered divergences get the
-    /// same durable retry/backoff/coalescing as the event path).
+    /// Enqueue a replication push job for a tag diverging from or absent on a
+    /// downstream. Enqueued rather than pushed inline, so scrub-discovered
+    /// divergences get the event path's durable retry/backoff/coalescing.
     EnqueueReplicationPush {
         downstream: String,
         namespace: String,
         tag: String,
         digest: Digest,
     },
-    /// Enqueue a replication delete job for a tag that exists on a downstream but
-    /// not locally. Emitted ONLY for a downstream marked `prune = true` (an
-    /// authoritative one-way mirror); pruning is OFF BY DEFAULT, because for an
-    /// active-active peer deleting a tag merely because it is absent locally would
-    /// destroy the peer's legitimately-newer tag that has not yet replicated back.
-    /// Applied by the `Executor` via `JobStore::enqueue`, like
-    /// [`Action::EnqueueReplicationPush`].
+    /// Enqueue a replication delete job for a downstream-only tag. Emitted only
+    /// for a `prune = true` downstream (one-way mirror): absence-driven deletion
+    /// would destroy an active-active peer's not-yet-replicated newer tag.
     EnqueueReplicationDelete {
         downstream: String,
         namespace: String,

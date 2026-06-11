@@ -211,11 +211,10 @@ pub struct LinksTxExtras<'a> {
     /// success (used by `store_manifest`). Otherwise registration happens only
     /// when at least one `Create` op was processed.
     pub force_register_namespace: bool,
-    /// Creation timestamp for newly-written link metadata. `None` (the default,
-    /// used by `update_links`/`delete_manifest`) stamps the current time; a
-    /// replicated `store_manifest` passes the originating `source_ts` so a tag's
-    /// LWW timestamp and retention age track the author's write time, not this
-    /// receiver's clock.
+    /// Creation timestamp for newly-written link metadata; `None` stamps the
+    /// current time. Replicated writes pass the originating `source_ts` so a
+    /// tag's LWW timestamp tracks the author's write time, not this receiver's
+    /// clock.
     pub created_at: Option<DateTime<Utc>>,
 }
 
@@ -228,19 +227,15 @@ struct LinksTxCaptured {
     written_links: Vec<(LinkKind, LinkMetadata)>,
     /// Links that were fully removed.
     deleted_links: Vec<LinkKind>,
-    /// Prior target per `Create` op's link (`None` = the link did not exist),
-    /// read by the committed attempt (see [`LinksCommit::prior_targets`]).
+    /// Prior target per `Create` op's link (`None` = absent), as read by the
+    /// committed attempt.
     prior_targets: Vec<(LinkKind, Option<Digest>)>,
     had_creates: bool,
 }
 
-/// Prior link state captured by a committed link transaction.
-///
-/// The transaction's retry loop re-reads each `Create` op's current target on
-/// every attempt and conflicts (retries) when it moved, so the value here is
-/// the state the commit was actually validated against. Unlike a separate
-/// pre-write read, it cannot be stale by an arbitrary interleaved writer.
-/// `accept_put_manifest` derives its no-op-suppression `changed` gate from it.
+/// Prior link state captured by a committed link transaction. The retry loop
+/// re-reads each `Create` op's target on every attempt, so this is the state
+/// the commit was actually validated against, never a stale pre-write read.
 #[derive(Default)]
 pub struct LinksCommit {
     /// Prior target per `Create` op's link; `None` = the link did not exist.
@@ -248,11 +243,9 @@ pub struct LinksCommit {
 }
 
 impl LinksCommit {
-    /// Whether the committed transaction changed `link`: `true` when the link
-    /// was absent or pointed at a different digest than `target` before the
-    /// commit. Fails open (`true`) when no `Create` op for `link` was part of
-    /// the transaction, so a genuine write is never suppressed by a lookup
-    /// miss.
+    /// Whether the commit changed `link`: it was absent or pointed at a
+    /// different digest before. Fails open (`true`) when the transaction had
+    /// no `Create` op for `link`, so a genuine write is never suppressed.
     #[must_use]
     pub fn changed(&self, link: &LinkKind, target: &Digest) -> bool {
         self.prior_targets
@@ -601,8 +594,8 @@ impl MetadataStore {
                     }
                 }
 
-                // Prior target per `Create` op, from THIS attempt's reads (the
-                // ones the conflict check above validated the commit against).
+                // Prior target per `Create` op, from this attempt's
+                // conflict-validated reads.
                 let prior_targets = prelock_results
                     .iter()
                     .filter_map(|(create_data, _)| {

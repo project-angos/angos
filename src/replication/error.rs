@@ -1,11 +1,6 @@
 use crate::registry::Error as RegistryError;
 
-/// Errors raised while building or running replication-specific machinery
-/// (downstream runtime types, the push pipeline, the job handler).
-///
-/// The `Initialization` string variant is used by the builder for missing
-/// required fields, mirroring the sibling builders' use of
-/// [`crate::registry::Error::Initialization`].
+/// Errors raised while building or running replication machinery.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum Error {
@@ -14,8 +9,8 @@ pub enum Error {
     #[error("replication initialization failed: {0}")]
     Initialization(String),
 
-    /// Wraps a [`crate::registry::Error`] raised while building the underlying
-    /// [`crate::registry_client::RegistryClient`] or touching registry storage.
+    /// A [`crate::registry::Error`] raised while building the registry client
+    /// or touching registry storage.
     #[error("replication registry error: {0}")]
     Registry(#[from] RegistryError),
 }

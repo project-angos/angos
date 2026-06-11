@@ -34,11 +34,9 @@ pub async fn handle_mount_blob(
     identity: &ClientIdentity,
 ) -> Result<Response<ResponseBody>, Error> {
     let mount = BlobMount { digest, from };
-    // A mount grants the target a reference to an existing blob with no upload, so
-    // it must not hand the caller bytes they could not otherwise read. Authorize
-    // the caller against a namespace that holds the blob first; when none is
-    // readable, degrade to an ordinary upload session (an unsatisfiable mount
-    // falls back to 202) rather than leaking the blob.
+    // A mount must not hand the caller bytes they could not otherwise read, so
+    // authorize against a namespace holding the blob first. An unsatisfiable
+    // mount degrades to an ordinary upload session rather than leaking the blob.
     let response = if let Some(source) = context
         .authorize_mount_source(&mount, identity, parts)
         .await?

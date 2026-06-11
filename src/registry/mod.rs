@@ -86,9 +86,8 @@ pub struct RegistryConfig {
     /// consulted when `job_queue` is `None`; durable deployments use the
     /// equivalent worker-side setting instead.
     pub max_concurrent_cache_jobs: NonZeroUsize,
-    /// Number of in-process replication-push jobs that may run in parallel.
-    /// Only consulted when `job_queue` is `None`; durable deployments drain the
-    /// replication queue with `angos worker --queue replication` instead.
+    /// Parallel in-process replication-push jobs. Only consulted when
+    /// `job_queue` is `None`; durable deployments use `angos worker` instead.
     pub max_concurrent_replication_jobs: NonZeroUsize,
 }
 
@@ -164,13 +163,9 @@ pub struct Registry {
     enable_manifest_redirect: bool,
     update_pull_time: bool,
     job_queue: Arc<JobStore>,
-    /// Cancels the in-process claim loops (cache + replication) when this
-    /// `Registry` is dropped, on a hot-reload swap (the superseded `Registry`
-    /// is dropped once in-flight requests release it) or on server shutdown (the
-    /// server context is dropped), so the loops stop polling the shared store
-    /// instead of leaking across reloads. `None` when a durable
-    /// `[global.job_queue]` is configured: there are no in-process loops, and
-    /// `angos worker` drains the queue and shuts down on its own token.
+    /// Cancels the in-process claim loops when this `Registry` is dropped.
+    /// `None` when a durable `[global.job_queue]` is configured (no in-process
+    /// loops to cancel).
     in_process_shutdown: Option<CancellationToken>,
     global_immutable_tags: bool,
     global_immutable_tags_exclusions: Vec<RegexPattern>,
@@ -269,18 +264,9 @@ impl Registry {
 
 /// Construct the in-process job queue used when `[global.job_queue]` is absent.
 ///
-/// Builds a [`JobStore`] over the registry's **shared** object store and
-/// executor (via `blob_store.store`) and spawns two pools of claim-loop tasks
-/// that drain it in-process on the SAME store: `cache_concurrency` tasks for the
-/// cache-fill queue and `replication_concurrency` tasks for the replication
-/// queue. Sharing the backend is required for correctness: cache-fill jobs
-/// commit a transaction that moves staged upload bytes into blob-data and grants
-/// metadata references, which only resolves against the store where those bytes
-/// live; replication jobs read the local manifest/blob bytes off the same store
-/// before pushing them downstream. Jobs are therefore persisted under the shared
-/// store's `_jobs/` prefix (and are picked back up by the claim loops after a
-/// restart) rather than discarded. The in-process replication drain is what lets
-/// a single-process server self-replicate without a separate `angos worker`.
+/// Sharing the registry's store backend is required: cache-fill commits and
+/// replication reads only resolve against the store holding the bytes, and
+/// jobs persisted under its `_jobs/` prefix survive restarts.
 fn build_in_process_queue(
     resolver: &Arc<RepositoryResolver>,
     blob_store: &Arc<BlobStore>,
@@ -298,20 +284,16 @@ fn build_in_process_queue(
     let store = Arc::clone(&blob_store.store);
     let job_store: Arc<JobStore> = Arc::new(JobStore::new(store, "in-process"));
 
-    // Build BOTH handlers before spawning any claim loop: the replication
-    // builder is fallible, and an `Err` after the cache loops were already
-    // spawned would leak them: no caller holds the cancellation token on the
-    // error path, so they would poll the store forever.
+    // Build both handlers before spawning any claim loop: the replication
+    // builder is fallible, and erroring after spawn would leak uncancellable loops.
     let cache_handler: Arc<dyn JobHandler> = Arc::new(CacheJobHandler::new(
         resolver.clone(),
         blob_store.clone(),
         metadata_store.clone(),
     ));
 
-    // Replication handler over the same shared store: it reads local manifest /
-    // blob bytes and pushes them to each downstream `RegistryClient`. Converged
-    // replays are suppressed sender-side: only state-changing writes dispatch,
-    // and receiver-side no-op suppression terminates any remaining mesh cycles.
+    // Mesh cycles terminate: only state-changing writes dispatch, and
+    // receiver-side no-op suppression stops any remaining replays.
     let replication_handler: Arc<dyn JobHandler> = Arc::new(
         ReplicationJobHandler::builder()
             .resolver(resolver.clone())
@@ -347,13 +329,11 @@ fn build_in_process_queue(
 
 /// Single claim-loop task for the in-process pool. Mirrors the per-worker
 /// loop in `command::worker::command::Command::run` but with a fixed 10 ms
-/// idle tick so small test suites stay snappy. `queue` selects which queue this
-/// loop drains (and `handler` must be the handler bound to that queue).
+/// idle tick so small test suites stay snappy. `handler` must be the handler
+/// bound to `queue`.
 ///
-/// `shutdown` stops the loop when the owning `Registry` is dropped. Like
-/// `worker_loop`, the cancellation races only the claim (a job already claimed
-/// runs to completion before the loop exits), so cancellation skips claiming the
-/// next job rather than interrupting one mid-execute.
+/// Cancellation races only the claim, so an already-claimed job runs to
+/// completion rather than being interrupted mid-execute.
 async fn in_process_claim_loop(
     consumer: Arc<JobStore>,
     handler: Arc<dyn JobHandler>,
@@ -378,11 +358,8 @@ async fn in_process_claim_loop(
 
 impl Drop for Registry {
     fn drop(&mut self) {
-        // Stop the in-process claim loops bound to this Registry. They each hold
-        // their own `Arc<JobStore>` clone, so dropping the Registry's handle does
-        // not stop them. Only cancelling the shared token does. In-flight jobs
-        // are durable and claimed under a lease, so a job interrupted by runtime
-        // teardown is re-claimed after restart (at-least-once) rather than lost.
+        // Claim loops hold their own `Arc<JobStore>` clones, so only cancelling
+        // the token stops them; leased durable jobs are re-claimed after restart.
         if let Some(shutdown) = &self.in_process_shutdown {
             shutdown.cancel();
         }
@@ -463,10 +440,8 @@ mod in_process_replication_tests {
         }
     }
 
-    /// Build a `Registry` whose in-process queue is constructed automatically
-    /// (no `[global.job_queue]`), so both the cache and replication claim loops
-    /// are spawned on the shared store. Returns the registry plus the shared
-    /// blob/metadata stores so the test can seed local state.
+    /// Build a `Registry` with an automatic in-process queue (no
+    /// `[global.job_queue]`), plus the shared stores for seeding local state.
     fn build_registry(
         root: &str,
         client: Arc<RegistryClient>,
@@ -489,8 +464,6 @@ mod in_process_replication_tests {
         repositories.insert(REPO.to_string(), repository_with_downstream(client));
         let resolver = Arc::new(RepositoryResolver::new(Arc::new(repositories)).unwrap());
 
-        // No `job_queue` => `build_in_process_queue` runs, spawning the
-        // replication claim loops over the shared store.
         let config = RegistryConfig::default();
         let registry =
             Registry::new(blob_store.clone(), metadata_store.clone(), resolver, config).unwrap();
@@ -548,10 +521,8 @@ mod in_process_replication_tests {
         (manifest_digest, config_digest, layer_digest)
     }
 
-    /// End-to-end: a replication push job enqueued onto the registry's shared
-    /// in-process queue is drained by the spawned replication claim loop, which
-    /// runs the push pipeline (HEAD-before-PUT blobs + PUT manifest) against the
-    /// wiremock downstream.
+    /// The drained job runs the full push pipeline (HEAD-before-PUT blobs, PUT
+    /// manifest) against a wiremock downstream.
     #[tokio::test]
     #[allow(clippy::too_many_lines)]
     async fn in_process_loop_drains_replication_push_job() {
@@ -608,8 +579,7 @@ mod in_process_replication_tests {
 
         let namespace = Namespace::new(NAMESPACE).unwrap();
 
-        // Enqueue via the production event path; the in-process replication loop
-        // claims and executes it asynchronously.
+        // Enqueue via the production event path.
         let repository = registry.resolver.resolve(&namespace);
         registry
             .dispatch_replication(
@@ -621,7 +591,6 @@ mod in_process_replication_tests {
             )
             .await;
 
-        // Poll the wiremock server until the manifest PUT lands (or time out).
         let manifest_path = format!("/v2/{NAMESPACE}/manifests/v1");
         let saw_put = timeout(Duration::from_secs(10), async {
             loop {
@@ -660,9 +629,7 @@ mod in_process_replication_tests {
             );
         }
 
-        // The PUT landed; now assert the job actually COMPLETES: the queue must
-        // drain to zero pending (and zero dead-lettered), proving the loop calls
-        // `complete` rather than leaving the job stuck/retrying.
+        // Zero pending proves the loop completed the job rather than retrying.
         let drained = timeout(Duration::from_secs(10), async {
             loop {
                 let pending = inspector

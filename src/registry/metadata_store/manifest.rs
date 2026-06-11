@@ -15,8 +15,8 @@ use crate::{
 impl MetadataStore {
     /// Persist a manifest: writes blob-data, all link metadata, and blob-index
     /// shard updates as a single atomic transaction. Returns the
-    /// [`LinksCommit`] so the caller can read each created link's prior target
-    /// as validated by the commit (the no-op-suppression gate).
+    /// [`LinksCommit`] carrying each created link's commit-validated prior
+    /// target.
     pub async fn store_manifest(
         &self,
         namespace: &str,

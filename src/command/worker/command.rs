@@ -54,9 +54,8 @@ fn claim_error_backoff(poll_interval: Duration, n: u32) -> Duration {
     description = "Process durable background jobs"
 )]
 pub struct Options {
-    /// queue to drain; repeatable, e.g. `--queue cache --queue replication`.
-    /// Defaults to draining both the "cache" and "replication" queues, each on
-    /// its own worker pool.
+    /// queue to drain; repeatable. Defaults to both "cache" and "replication",
+    /// each on its own worker pool.
     #[argh(option)]
     pub queue: Vec<String>,
     /// idle poll interval when the queue is empty
@@ -64,10 +63,9 @@ pub struct Options {
     pub poll_interval: HumanDuration,
 }
 
-/// Hot-reloadable worker subcommand draining one or more queues, each on its own
-/// worker pool. A queue's `consumer` and `handler` are swapped atomically on
-/// configuration reload; in-flight jobs always finish on the components they
-/// started with.
+/// Hot-reloadable worker subcommand draining one or more queues, each on its
+/// own worker pool. Components are swapped atomically on configuration reload;
+/// in-flight jobs finish on the components they started with.
 pub struct Command {
     queues: Vec<QueueRunner>,
     poll_interval: Duration,
@@ -78,8 +76,6 @@ pub struct Command {
     engine_maintenance: CancellationToken,
 }
 
-/// One drained queue: its hot-swappable components plus the worker concurrency
-/// for that queue.
 struct QueueRunner {
     inner: Arc<ArcSwap<Components>>,
     queue: String,
@@ -91,9 +87,6 @@ struct Components {
     handler: Arc<dyn JobHandler>,
 }
 
-/// Worker concurrency for `queue`: the replication queue uses
-/// `max_concurrent_replication_jobs`; every other queue (e.g. `cache`) uses
-/// `max_concurrent_cache_jobs`.
 fn queue_concurrency(config: &Configuration, queue: &str) -> NonZeroUsize {
     if queue == REPLICATION_QUEUE {
         config.global.max_concurrent_replication_jobs
@@ -102,10 +95,8 @@ fn queue_concurrency(config: &Configuration, queue: &str) -> NonZeroUsize {
     }
 }
 
-/// The queues to drain: the repeatable `--queue` values de-duplicated,
-/// preserving the order given on the command line, or (when none is
-/// passed) both the `cache` and `replication` queues. Each queue runs an
-/// independent worker pool.
+/// De-duplicates `--queue` values preserving command-line order; defaults to
+/// both `cache` and `replication` when none are given.
 fn resolve_queues(requested: &[String]) -> Vec<String> {
     if requested.is_empty() {
         return vec![CACHE_QUEUE.to_string(), REPLICATION_QUEUE.to_string()];
@@ -121,10 +112,6 @@ fn resolve_queues(requested: &[String]) -> Vec<String> {
 impl Command {
     pub async fn new(options: &Options, config: &Configuration) -> Result<Self, Error> {
         let engine_maintenance = CancellationToken::new();
-        // The expensive, queue-independent context (storage, metadata/blob
-        // stores, repositories, engine maintenance) is built ONCE and shared by
-        // every drained queue; only the handler and a `JobStore` consumer differ
-        // per queue.
         let context = WorkerContext::build(config, Some(engine_maintenance.clone())).await?;
 
         let mut queues = Vec::new();
@@ -257,10 +244,8 @@ impl ConfigNotifier for Command {
     }
 }
 
-/// Queue-independent worker resources, built once and shared across every
-/// drained queue. Cloning the inner `Arc`s into each queue's handler/consumer is
-/// cheap, so draining N queues does not rebuild the metadata store, blob store,
-/// repositories, or storage N times.
+/// Queue-independent worker resources, built once and shared so draining N
+/// queues does not rebuild storage and stores N times.
 struct WorkerContext {
     storage: Arc<Store>,
     blob_store: Arc<BlobStore>,
@@ -296,8 +281,8 @@ impl WorkerContext {
 
         // Spawn the engine maintenance loops once per worker process so any
         // crashed-mid-Apply transactions are recovered and orphan body
-        // staging is reaped. The recovery loop is backend-wide, so one instance
-        // covers every queue this process drains.
+        // staging is reaped. The recovery loop is backend-wide, so one
+        // instance covers every drained queue.
         if let Some(token) = engine_maintenance {
             bootstrap::spawn_engine_maintenance(&storage, token);
         }
@@ -310,11 +295,8 @@ impl WorkerContext {
         })
     }
 
-    /// Build the [`Components`] for one queue: a fresh `JobStore` consumer over
-    /// the shared storage plus the handler bound to that queue. The replication
-    /// queue reads local manifest/blob bytes and pushes them to each downstream
-    /// `RegistryClient`; every other queue (e.g. `cache`) fills blobs from
-    /// upstreams.
+    /// Builds the [`Components`] for one queue: a fresh `JobStore` consumer
+    /// over the shared storage plus the handler bound to that queue.
     fn components_for(&self, queue: &str) -> Result<Components, Error> {
         let consumer = Arc::new(JobStore::new(
             self.storage.clone(),
@@ -425,11 +407,8 @@ mod tests {
         assert_eq!(claim_error_backoff(max_poll, 6), CLAIM_ERROR_BACKOFF_CAP);
     }
 
-    /// Builds a `WorkerContext` over FS-backed test stores by constructing the
-    /// struct literal DIRECTLY (same-module private access), bypassing
-    /// `WorkerContext::build` (which requires a `[global.job_queue]` config and
-    /// would trip `validate_durable_queue_lock`). The `TempDir` is returned so
-    /// the on-disk store outlives the context.
+    /// Constructs a `WorkerContext` literal directly, bypassing `build` and its
+    /// `[global.job_queue]` requirement; the `TempDir` keeps the store alive.
     fn worker_context() -> (WorkerContext, TempDir) {
         metrics_provider::init_for_tests();
         let dir = TempDir::new().unwrap();
@@ -459,22 +438,12 @@ mod tests {
         (context, dir)
     }
 
-    /// `components_for` binds the queue to its handler: the replication queue gets
-    /// a `ReplicationJobHandler`, every other queue (here `cache`) gets a
-    /// `CacheJobHandler`. The handler is an opaque `Arc<dyn JobHandler>` that
-    /// can't be downcast, so the binding is asserted BEHAVIOURALLY through each
-    /// handler's kind-dispatch: both handlers reject a foreign job kind with an
-    /// "unsupported job kind" error at the very first step of `execute`, before
-    /// touching the payload or any backend, so a wrong binding (a cache handler
-    /// where a replication handler was expected, or vice-versa) would NOT reject
-    /// the foreign kind and the assertion would fail.
+    /// The handler is an opaque `Arc<dyn JobHandler>`, so the binding is
+    /// asserted via each handler rejecting a foreign job kind.
     #[tokio::test]
     async fn components_for_binds_replication_queue_to_replication_handler() {
         let (context, _dir) = worker_context();
 
-        // A `cache.fetch_blob` envelope handed to the REPLICATION queue's handler
-        // must be rejected as an unsupported kind: only a `ReplicationJobHandler`
-        // rejects this kind; a `CacheJobHandler` would accept it.
         let cache_envelope = JobEnvelope::new(
             CACHE_QUEUE,
             CACHE_FETCH_BLOB_KIND,
@@ -493,13 +462,6 @@ mod tests {
         );
     }
 
-    /// `components_for` binds the `cache` queue to a `CacheJobHandler` (the
-    /// mirror of `components_for_binds_replication_queue_to_replication_handler`).
-    /// The handler is an opaque `Arc<dyn JobHandler>` that can't be downcast, so
-    /// the binding is asserted BEHAVIOURALLY: a `replication.push_manifest`
-    /// envelope handed to the cache queue's handler must be rejected as an
-    /// unsupported kind. Only a `CacheJobHandler` rejects this kind; a
-    /// `ReplicationJobHandler` would accept it, so a wrong binding would fail.
     #[tokio::test]
     async fn components_for_binds_cache_queue_to_cache_handler() {
         let (context, _dir) = worker_context();
@@ -522,10 +484,8 @@ mod tests {
         );
     }
 
-    /// An unrecognized queue name (typo, wrong case, …) is rejected rather than
-    /// silently bound to the cache handler against a queue no producer ever
-    /// enqueues to. The error must name the bad queue. `Components` is not
-    /// `Debug`, so match the `Result` rather than `expect_err`.
+    /// An unknown queue must not be silently bound to the cache handler;
+    /// `Components` is not `Debug`, so the `Result` is matched directly.
     #[tokio::test]
     async fn components_for_rejects_unknown_queue() {
         let (context, _dir) = worker_context();
@@ -539,11 +499,6 @@ mod tests {
         );
     }
 
-    /// `components_for` mints a FRESH `JobStore` consumer per call, each with its
-    /// own worker id (a fresh `Uuid`). The struct field is private, but two
-    /// consumers over the same shared storage are distinct `Arc`s: asserting the
-    /// pointers differ pins that the consumer is not accidentally shared/cached
-    /// across queues (each queue must drain on its own consumer).
     #[tokio::test]
     async fn components_for_mints_a_fresh_consumer_per_call() {
         let (context, _dir) = worker_context();

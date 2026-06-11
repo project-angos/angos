@@ -68,11 +68,10 @@ pub struct Options {
     /// check for and remove orphan referrer links whose referrer manifest is no longer a current revision
     pub referrers: bool,
     #[argh(switch)]
-    /// reconcile every replicated namespace with all its downstreams; additive by
-    /// default (enqueues a replication push for each diverging or downstream-missing
-    /// tag), and for a downstream marked prune = true also enqueues a replication
-    /// delete for each downstream-only tag (one-way mirror; unsafe for active-active
-    /// peers)
+    /// reconcile replicated namespaces with their downstreams: enqueue a push for
+    /// each diverging or missing tag, and for a downstream marked prune = true a
+    /// delete for each downstream-only tag (one-way mirror; unsafe for
+    /// active-active peers)
     pub replicate: bool,
 }
 
@@ -83,21 +82,16 @@ pub struct Command {
     blob_checker: Option<BlobChecker>,
     multipart_checker: Option<MultipartChecker>,
     sink: Box<dyn ActionSink + Send>,
-    /// When `--replicate` runs outside dry-run, the enqueued replication jobs are
-    /// drained in-process (no running worker is assumed): every job that is ready
-    /// is claimed, and a job whose push succeeds converges within this invocation.
-    /// A job whose push transiently fails is rescheduled with backoff onto the
-    /// durable queue and left for a worker or a later `scrub` run, so a transient
-    /// failure does not necessarily converge here. `None` disables the drain
-    /// (dry-run, or `--replicate` absent).
+    /// Drains reconcile-enqueued replication jobs in-process, since no running
+    /// worker is assumed; a transiently failing push is rescheduled with backoff
+    /// onto the durable queue for a worker or a later run. `None` when dry-run or
+    /// `--replicate` is absent.
     replication_drain: Option<ReplicationDrain>,
 }
 
-/// Consumer queue + handler used to drain replication jobs enqueued by the
-/// reconciliation checker, within the scrub CLI run. `concurrency`
-/// (`[global] max_concurrent_replication_jobs`) bounds the parallel claim
-/// loops, matching the worker and in-process drains (a cold-mirror reconcile
-/// would otherwise push one tag at a time).
+/// Consumer queue and handler for draining reconcile-enqueued replication jobs
+/// in-process. `concurrency` bounds the parallel claim loops so a cold-mirror
+/// reconcile does not push one tag at a time.
 struct ReplicationDrain {
     consumer: Arc<JobStore>,
     handler: Box<dyn JobHandler>,
@@ -128,12 +122,10 @@ impl Command {
         let blob_checker = setup::blob_checker(options, &blob_backend, &metadata_store);
         let multipart_checker = setup::multipart_checker(options, &blob_backend)?;
 
-        // The reconciliation checker emits `EnqueueReplicationPush` actions that the
-        // `Executor` lands on a durable queue; share one `Arc<JobStore>` as both the
-        // producer (Executor enqueue) and the consumer (end-of-run drain) over the
-        // metadata store's `Store` façade. Building the queue is cheap, so a
-        // non-dry-run `Executor` always owns one; the drain is only wired when
-        // reconcile actually enqueues (`--replicate`).
+        // One `Arc<JobStore>` serves as both producer (Executor enqueue) and
+        // consumer (end-of-run drain). Building the queue is cheap, so every
+        // non-dry-run `Executor` owns one; the drain is wired only with
+        // `--replicate`.
         let mut replication_drain: Option<ReplicationDrain> = None;
         let sink: Box<dyn ActionSink + Send> = if options.dry_run {
             info!("Dry-run mode: no changes will be made to the storage");
@@ -171,14 +163,9 @@ impl Command {
         })
     }
 
-    /// Builds the consumer queue + handler used to drain reconcile-enqueued
-    /// replication jobs in-process during the CLI run (jobs whose push succeeds
-    /// converge here; a transiently-failing push is rescheduled onto the durable
-    /// queue for a worker or a later `scrub` run).
-    ///
+    /// Builds the consumer queue and handler for the in-process drain.
     /// Reconcile-enqueued pushes carry `source_ts = None`; the handler re-derives
-    /// `source_ts` from the resolved tag's `created_at`, so the receiver still runs
-    /// last-writer-wins.
+    /// it from the tag's `created_at`, so the receiver still runs last-writer-wins.
     fn build_replication_drain(
         consumer: Arc<JobStore>,
         blob_store: &Arc<BlobStore>,
@@ -252,16 +239,10 @@ impl Command {
         Ok(())
     }
 
-    /// Drains the replication jobs the reconciliation checker enqueued. No-op
-    /// unless `--replicate` ran outside dry-run. Up to
-    /// `max_concurrent_replication_jobs` claim loops run concurrently (a
-    /// cold-mirror reconcile would otherwise push one tag at a time); each
-    /// cycle claims one ready job and drives it through `execute_one`: a job
-    /// whose push succeeds converges here, while one whose push transiently
-    /// fails is failed-over (rescheduled with backoff onto the durable queue
-    /// for a worker or a later `scrub` run). A loop ends when the queue has no
-    /// claimable (ready) job left, so jobs already backed off for a future
-    /// time are intentionally not awaited.
+    /// Drains reconcile-enqueued replication jobs with up to
+    /// `max_concurrent_replication_jobs` concurrent claim loops. A loop ends when
+    /// no claimable job remains, so jobs already backed off to a future time are
+    /// intentionally not awaited.
     async fn drain_replication_jobs(&mut self) {
         let Some(drain) = &self.replication_drain else {
             return;

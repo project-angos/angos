@@ -337,10 +337,8 @@ mod tests {
         assert!(is_deny(&policy.evaluate(&action, &identity)));
     }
 
-    /// Proves the cross-repo mount gating rules documented in the access-control
-    /// how-to. A cross-mount authorizes as the dedicated `mount-blob` action, so
-    /// a policy gates it with a plain `request.action == 'mount-blob'` rule,
-    /// independent of the `start-upload` rules that govern ordinary uploads.
+    /// A mount authorizes as the dedicated `mount-blob` action, independent of
+    /// the `start-upload` rules that govern ordinary uploads.
     #[test]
     fn test_access_policy_gates_cross_repo_mount() {
         let namespace = Namespace::new("team/app").unwrap();
@@ -368,8 +366,6 @@ mod tests {
             ..ClientIdentity::default()
         };
 
-        // default-deny: any authenticated client may start a normal upload, but
-        // only `replicator` may mount an existing blob.
         let replicator_only = AccessPolicy::new(AccessPolicyConfig {
             default: AccessMode::Deny,
             rules: vec![
@@ -381,8 +377,6 @@ mod tests {
         assert!(is_deny(&replicator_only.evaluate(&mount, &anyone)));
         assert!(is_allow(&replicator_only.evaluate(&mount, &replicator)));
 
-        // default-allow: deny a mount unless it is the replicator; ordinary
-        // uploads are untouched.
         let deny_non_replicator = AccessPolicy::new(AccessPolicyConfig {
             default: AccessMode::Allow,
             rules: vec![rule(
@@ -396,12 +390,8 @@ mod tests {
         assert!(is_allow(&deny_non_replicator.evaluate(&mount, &replicator)));
     }
 
-    /// Proves a policy can scope a cross-repo mount by its SOURCE repository via
-    /// `request.from`. The mount source is surfaced as a plain string CEL
-    /// variable that is present only on a cross-repo (`from`-bearing) mount, so a
-    /// rule can allow mounts from a trusted source and refuse mounts from any
-    /// other, or, with `has(request.from)`, refuse from-less (auto-discovery)
-    /// mounts entirely.
+    /// `request.from` is present only on a `from`-bearing mount, so rules need
+    /// `has(request.from)` to handle auto-discovery mounts.
     #[test]
     fn test_access_policy_gates_cross_repo_mount_by_source() {
         let target = Namespace::new("team/app").unwrap();
@@ -430,9 +420,8 @@ mod tests {
             ..ClientIdentity::default()
         };
 
-        // default-deny: only mounts whose source is exactly `team/base` are
-        // permitted. The `has()` guard keeps the rule from raising "no such key"
-        // (fail-closed) on a from-less mount, where `request.from` is absent.
+        // The `has()` guard keeps the rule from raising the fail-closed "no
+        // such key" error on a from-less mount.
         let only_from_trusted = AccessPolicy::new(AccessPolicyConfig {
             default: AccessMode::Deny,
             rules: vec![rule(
@@ -445,12 +434,8 @@ mod tests {
         assert!(is_deny(
             &only_from_trusted.evaluate(&from_untrusted, &client)
         ));
-        // No `from`: `request.from` is absent, so the source check does not match
-        // and the default-deny stands.
         assert!(is_deny(&only_from_trusted.evaluate(&no_from, &client)));
 
-        // default-allow: deny any mount whose source is the untrusted repo, while
-        // leaving trusted-source and from-less mounts permitted.
         let deny_untrusted_source = AccessPolicy::new(AccessPolicyConfig {
             default: AccessMode::Allow,
             rules: vec![rule(

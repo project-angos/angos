@@ -7,18 +7,8 @@ use crate::{
     replication::ReplicationMode,
 };
 
-/// Parse-time DTO for one per-repository replication downstream.
-///
-/// Composes [`RegistryClientConfig`] (flattened into the same TOML table, so the
-/// HTTP/TLS/auth keys, namely `url`, `max_redirect`, `server_ca_bundle`,
-/// `client_certificate`, `client_private_key`, `username` and `password`, sit at
-/// the top level alongside the replication-only keys) plus the replication-only
-/// fields. The shared field set and the mTLS-pairing validation
-/// (`client_certificate` and `client_private_key` must be supplied together) thus
-/// live in exactly one place: [`RegistryClientConfig`]. This type is parse-only;
-/// the runtime counterpart is [`crate::replication::ReplicationDownstream`], built
-/// from these fields via its builder, and the embedded `client` resolves to a
-/// [`crate::registry_client::RegistryClient`] through the same path as upstreams.
+/// Parse-time DTO for one per-repository replication downstream; the runtime
+/// counterpart is [`crate::replication::ReplicationDownstream`].
 #[derive(Clone, Debug, Deserialize)]
 pub struct ReplicationDownstreamConfig {
     /// Local identifier for this downstream (appears in logs and metrics).
@@ -29,17 +19,13 @@ pub struct ReplicationDownstreamConfig {
     pub client: RegistryClientConfig,
     #[serde(default)]
     pub mode: ReplicationMode,
-    /// Namespace patterns this downstream replicates (empty = all). Validated at
-    /// parse time; compiled to a `Regex` when the runtime
-    /// [`crate::replication::ReplicationDownstream`] is built.
+    /// Namespace patterns this downstream replicates (empty = all).
     #[serde(default)]
     pub namespace_filter: Vec<RegexPattern>,
     pub max_concurrent_pushes: Option<NonZeroUsize>,
-    /// When `true`, scrub reconciliation also deletes tags present on this
-    /// downstream but absent locally (treats local as authoritative). Only safe
-    /// for a one-way mirror that nothing else writes to; leave `false` for an
-    /// active-active peer, where it would delete a peer's legitimately-newer tag
-    /// that has not yet replicated back. Defaults to `false`.
+    /// When `true`, scrub reconciliation also deletes tags present downstream
+    /// but absent locally. Only safe for a one-way mirror; on an active-active
+    /// peer it would delete a newer tag that has not yet replicated back.
     #[serde(default)]
     pub prune: bool,
 }

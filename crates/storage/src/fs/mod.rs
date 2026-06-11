@@ -50,12 +50,10 @@ const LIST_ALL_CHILDREN_PAGE_SIZE: u16 = 512;
 /// JSON object key, fail to parse it. Listings skip any entry with this prefix.
 const ATOMIC_WRITE_TMP_PREFIX: &str = ".angos-write.";
 
-/// How many times [`ensure_parent`] retries a racing `create_dir_all`. Under
-/// concurrent transactions many tasks create sibling directories under a shared
-/// parent at once; on macOS/APFS the intermediate `mkdir` can transiently
-/// return EINVAL (os error 22) instead of EEXIST, so the recursive create fails
-/// even though the directory is moments from existing. A handful of retries
-/// resolves it once the contended intermediate is in place.
+/// How many times [`ensure_parent`] retries a racing `create_dir_all`. On
+/// macOS/APFS a contended intermediate `mkdir` can transiently return EINVAL
+/// instead of EEXIST, failing the recursive create even though the directory
+/// is about to exist.
 const ENSURE_PARENT_RETRIES: u32 = 5;
 
 /// Builder for [`Backend`].
@@ -257,15 +255,9 @@ async fn ensure_parent(path: &Path) -> Result<(), Error> {
     let Some(parent) = path.parent() else {
         return Ok(());
     };
-    // `create_dir_all` is idempotent (we only need the directory to exist), but
-    // it races under concurrent transactions: when many tasks create sibling
-    // directories under a shared parent at once, macOS/APFS can transiently
-    // return EINVAL for the intermediate `mkdir` instead of EEXIST, so the
-    // recursive create fails with the leaf uncreated. Retry only those race
-    // kinds: EINVAL (`InvalidInput`), EEXIST (`AlreadyExists`), and ENOENT
-    // (`NotFound`, a racing remove of an intermediate), treating an
-    // already-present directory (a racing task won) as success; any other
-    // error (permission, bad path) is deterministic and surfaces immediately.
+    // Retry only race error kinds: EINVAL (macOS/APFS, see
+    // ENSURE_PARENT_RETRIES), EEXIST, and ENOENT from a racing remove; other
+    // errors are deterministic and surface immediately.
     let mut attempt = 0;
     loop {
         match fs::create_dir_all(parent).await {
@@ -288,10 +280,8 @@ async fn ensure_parent(path: &Path) -> Result<(), Error> {
     }
 }
 
-/// Map an io error from a named operation to an [`Error`], carrying the
-/// operation and path so a backend failure is diagnosable (a bare
-/// "Invalid argument (os error 22)" otherwise gives no hint which syscall on
-/// which path failed). Preserves the `NotFound` classification.
+/// Map an io error to an [`Error`] carrying the operation and path for
+/// diagnosability. Preserves the `NotFound` classification.
 fn backend_error(op: &str, path: &Path, error: &io::Error) -> Error {
     if error.kind() == ErrorKind::NotFound {
         Error::NotFound
@@ -509,9 +499,7 @@ impl ObjectStore for Backend {
         let sync = self.sync_to_disk;
         // Stream src -> temp -> atomic rename. `std::io::copy` uses a small
         // internal buffer, so the object body is never held in memory in full
-        // (a multi-GB blob would otherwise spike RSS by its whole size). Each
-        // step labels its error with the path it actually touched: a read
-        // failure names `src`, a write/persist failure names `dst`.
+        // (a multi-GB blob would otherwise spike RSS by its whole size).
         match spawn_blocking(move || -> Result<(), Error> {
             let mut reader = File::open(&src).map_err(|e| backend_error("copy from", &src, &e))?;
             let mut temp = TempFileBuilder::new()

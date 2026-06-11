@@ -1,17 +1,7 @@
 //! [`ReplicationJobHandler`]: the [`JobHandler`] that drives the replication
-//! push pipeline.
-//!
-//! Sibling of [`crate::registry::cache_job_handler::CacheJobHandler`]. The
-//! exemplar is constructed via `new(...)`; this type exposes a `builder()`
-//! instead (resolved `Arc` deps only), and kind-dispatch happens inside
-//! [`ReplicationJobHandler::execute`] exactly as the exemplar rejects unknown
-//! kinds.
-//!
-//! The handler returns an **empty** [`Transaction`] on success: the effect is an
-//! external, non-transactional HTTP push, blessed by the [`JobHandler`] trait
-//! doc. The queue still lands its cleanup mutations atomically via `complete`.
-//! Because the engine cannot roll back an HTTP PUT, the pipeline is idempotent
-//! (HEAD-before-PUT) per the at-least-once contract.
+//! push pipeline. It returns an empty [`Transaction`] on success (the effect is
+//! an external HTTP push the engine cannot roll back), so the pipeline stays
+//! idempotent via HEAD-before-PUT under the at-least-once contract.
 
 use std::sync::Arc;
 
@@ -38,64 +28,44 @@ use crate::{
 };
 
 /// Single queue carrying every replication job; the downstream is encoded in the
-/// `lock_key` and payload (mirrors the single `cache` queue).
+/// `lock_key` and payload.
 pub const REPLICATION_QUEUE: &str = "replication";
 /// Push a manifest (and everything it references) to a downstream.
 pub const REPLICATION_PUSH_MANIFEST_KIND: &str = "replication.push_manifest";
 /// Delete a manifest on a downstream.
 pub const REPLICATION_DELETE_MANIFEST_KIND: &str = "replication.delete_manifest";
 
-/// JSON payload for a replication job on [`REPLICATION_QUEUE`].
-///
-/// The digest is informational: the handler re-resolves the **current** local
-/// `tag -> digest` at execute-time so coalesced jobs converge to latest-wins
-/// (the digest only seeds delete and tag-less push jobs). `Event` is
-/// `Serialize`-only and cannot survive a queue round-trip, so this small
-/// `Serialize + Deserialize` struct carries the fields the pipeline needs.
+/// JSON payload for a replication job on [`REPLICATION_QUEUE`]. The handler
+/// re-resolves the current local `tag -> digest` at execute time, so coalesced
+/// jobs converge to latest-wins.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ReplicationPushPayload {
     /// Local identifier of the target downstream (selects the `RegistryClient`).
     pub downstream: String,
-    /// Namespace being replicated.
     pub namespace: String,
     /// Tag bound to the digest, when the change is tag-scoped.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tag: Option<String>,
-    /// Serialized OCI digest, e.g. `sha256:abc...` (informational for pushes,
-    /// authoritative for digest deletes / tag-less pushes). Absent for a tag
-    /// delete, where the receiver keys off the tag and no digest is needed.
+    /// Serialized OCI digest: informational for pushes, authoritative for
+    /// digest deletes and tag-less pushes, absent for a tag delete.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub digest: Option<String>,
-    /// Job kind, mirrors the envelope `kind` (one of the `REPLICATION_*_KIND`
-    /// consts) so a payload is self-describing for the scrub-side builder.
+    /// Mirrors the envelope `kind` so a payload is self-describing for the
+    /// scrub-side builder.
     pub kind: String,
     /// Event timestamp (RFC 3339) carried for receiver-side last-writer-wins.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_ts: Option<String>,
 }
 
-/// Builds the per-job `lock_key` for a replication payload.
-///
-/// Format: `{REPLICATION_QUEUE}.{op}.{downstream}:{namespace}:{tag_or_digest}`,
-/// with `@{source_ts}` appended for deletes. `op` is `push` or `delete`,
-/// derived from the payload kind, so a pending push and a delete for the same
-/// tag never coalesce into one another (a delete that folded into a
-/// still-pending push would be silently lost). Pushes coalesce with pushes on
-/// the bare reference: the handler re-resolves the current digest AND
-/// re-derives `source_ts` from the live link at execute time, so a coalesced
-/// push always ships the latest state. A delete cannot re-derive (the link is
-/// gone): its payload `source_ts` is authoritative for receiver-side
-/// last-writer-wins, so the timestamp is part of the key and every distinct
-/// deletion EVENT gets its own job. Without it, delete(t2 pending) → push(t3)
-/// → delete(t4) dedup-drops t4 into the pending t2 job, which loses LWW
-/// against the t3 push and leaves the downstream tag alive. The event path and
-/// the scrub checker build the SAME key so identical pending work coalesces on
-/// `enqueue` (retries of one event, repeat scrub discoveries of one
-/// divergence).
-///
-/// `tag_or_digest` is the tag when set, else the digest. When both are absent
-/// (a degenerate payload) it falls back to an empty segment, which still yields
-/// a well-formed, namespace-scoped key.
+/// Builds the per-job `lock_key`,
+/// `{REPLICATION_QUEUE}.{op}.{downstream}:{namespace}:{tag_or_digest}` plus
+/// `@{source_ts}` for deletes, shared by the event path and the scrub checker
+/// so identical pending work coalesces. The `op` segment keeps a delete from
+/// coalescing into a still-pending push, and the delete-only timestamp keeps
+/// distinct deletion events apart because a delete cannot re-derive its
+/// last-writer-wins timestamp at execute time (pushes re-resolve digest and
+/// timestamp, so they safely coalesce on the bare reference).
 #[must_use]
 fn replication_lock_key(payload: &ReplicationPushPayload) -> String {
     let tag_or_digest = payload
@@ -119,14 +89,12 @@ fn replication_lock_key(payload: &ReplicationPushPayload) -> String {
     }
 }
 
-/// Builds a [`JobEnvelope`] from a [`ReplicationPushPayload`].
-///
-/// Exposed so the scrub reconciliation checker enqueues the exact same envelope
-/// shape (queue, kind, `lock_key`) as the event path.
+/// Builds a [`JobEnvelope`] from a [`ReplicationPushPayload`]; exposed so the
+/// scrub checker enqueues the same envelope shape as the event path.
 ///
 /// # Errors
 ///
-/// Returns a [`serde_json::Error`] only when the payload cannot be serialized.
+/// Returns a [`serde_json::Error`] when the payload cannot be serialized.
 pub fn build_envelope(payload: &ReplicationPushPayload) -> Result<JobEnvelope, serde_json::Error> {
     JobEnvelope::new(
         REPLICATION_QUEUE,
@@ -136,10 +104,8 @@ pub fn build_envelope(payload: &ReplicationPushPayload) -> Result<JobEnvelope, s
     )
 }
 
-/// Mirrors a local repository's state to a configured downstream.
-///
-/// Holds resolved `Arc` dependencies only; built via
-/// [`ReplicationJobHandler::builder`] from individual fields (no `new(config)`).
+/// Mirrors a local repository's state to a configured downstream. Built via
+/// [`ReplicationJobHandler::builder`] from resolved dependencies.
 pub struct ReplicationJobHandler {
     resolver: Arc<RepositoryResolver>,
     blob_store: Arc<BlobStore>,
@@ -153,10 +119,8 @@ impl ReplicationJobHandler {
         ReplicationJobHandlerBuilder::default()
     }
 
-    /// Resolves the [`ReplicationDownstream`] for a payload (a single lookup
-    /// yielding both the `registry_client` and `max_concurrent_pushes`), or
-    /// returns an error mirroring the exemplar's "no repository configured"
-    /// message.
+    /// Resolves the [`ReplicationDownstream`] for a payload, or errors when the
+    /// namespace or downstream is not configured.
     fn resolve_downstream<'a>(
         &'a self,
         namespace: &Namespace,
@@ -178,10 +142,8 @@ impl ReplicationJobHandler {
             })
     }
 
-    /// Records the per-downstream replication metrics for a successful push or
-    /// delete: the `pushed` / `converged` / `superseded` counter, and the
-    /// last-success timestamp gauge (every [`PushOutcome`] is convergence, so all
-    /// set the gauge to now).
+    /// Records the per-outcome success counter and the last-success gauge;
+    /// every [`PushOutcome`] is convergence, so all set the gauge.
     fn record_success(downstream: &str, outcome: PushOutcome) {
         let outcome_label = match outcome {
             PushOutcome::Pushed => "pushed",
@@ -198,18 +160,9 @@ impl ReplicationJobHandler {
             .set(Utc::now().timestamp());
     }
 
-    /// Records a `failed` replication push for `downstream` before the handler
-    /// returns `Err` (so the job retries / dead-letters).
-    ///
-    /// `failed` is a **per-attempt** counter: the queue re-invokes `execute` on
-    /// each retry, so a job that keeps erroring increments `failed` once per
-    /// attempt (Prometheus counter convention: use `rate()` for a failure rate).
-    /// `pushed` / `superseded` are terminal (incremented once when the attempt
-    /// converges). Every `Err` returned from the push/delete attempt, including
-    /// pre-flight (invalid namespace, missing downstream config) and local-read
-    /// (unreadable manifest blob) failures, not only downstream HTTP failures,
-    /// records `failed`, so the documented `outcome="failed"` failure-rate query
-    /// also catches jobs stuck on a local/config error.
+    /// Records a `failed` push for `downstream` before the handler returns `Err`.
+    /// `failed` is per-attempt (each retry increments it) and covers every `Err`,
+    /// including pre-flight and local-read failures, not only downstream HTTP errors.
     fn record_failure(downstream: &str) {
         metrics_provider()
             .replication_push_total
@@ -217,18 +170,11 @@ impl ReplicationJobHandler {
             .inc();
     }
 
-    /// Re-resolves the current local target for a push payload: a tag is re-read
-    /// at execute-time (latest-wins), returning both its digest and its
-    /// `created_at` (the local version timestamp); a tag-less job uses the payload
-    /// digest (content-addressed, so no timestamp) but still confirms the revision
-    /// link is present.
-    ///
-    /// Returns `Ok(None)` when the target no longer exists locally
-    /// ([`MetadataStoreError::ReferenceNotFound`]), a tag deleted out from under a
-    /// coalesced push, or a by-digest revision deleted since the job was enqueued:
-    /// the system has already converged, so the caller treats it as a no-op success
-    /// rather than reading a now-absent manifest blob and dead-lettering. Any other
-    /// read error still surfaces as `Err`.
+    /// Re-resolves the current local target for a push: a tag is re-read at
+    /// execute time (latest-wins) yielding its digest and `created_at`, while a
+    /// tag-less job uses the payload digest and only confirms the revision link
+    /// exists. Returns `Ok(None)` when the target no longer exists locally,
+    /// which the caller treats as already-converged no-op success.
     async fn resolve_current_digest(
         &self,
         namespace: &Namespace,
@@ -255,11 +201,7 @@ impl ReplicationJobHandler {
             let digest: Digest = digest_str
                 .parse()
                 .map_err(|e| Error::Storage(format!("invalid digest '{digest_str}': {e}")))?;
-            // Symmetric to the tag branch: a by-digest revision deleted out from
-            // under this push (a coalesced or retried job whose revision is gone)
-            // has already converged, so a missing revision link is a no-op success
-            // rather than a dead-letter on the subsequent blob read. A
-            // content-addressed digest carries no local version timestamp.
+            // A content-addressed digest carries no local version timestamp.
             match self
                 .metadata_store
                 .read_link(namespace.as_ref(), &LinkKind::Digest(digest.clone()), false)
@@ -274,12 +216,9 @@ impl ReplicationJobHandler {
         }
     }
 
-    /// Runs the push/delete attempt for a validated payload: resolves the
-    /// namespace + downstream, drives the pipeline, and records the
-    /// `pushed` / `superseded` success metric. Any `Err` it returns is counted
-    /// once as `failed` by the single `inspect_err` in [`Self::execute`], so
-    /// this body must NOT record `failed` itself (that would double-count a
-    /// downstream HTTP failure).
+    /// Runs the push/delete attempt for a validated payload and records the
+    /// success metric. It must NOT record `failed` itself: every `Err` is
+    /// counted once by the `inspect_err` in [`Self::execute`].
     async fn attempt(
         &self,
         envelope: &JobEnvelope,
@@ -288,8 +227,6 @@ impl ReplicationJobHandler {
         let namespace = Namespace::new(&payload.namespace).map_err(|e| {
             Error::Storage(format!("invalid namespace '{}': {e}", payload.namespace))
         })?;
-        // Single downstream lookup yielding both the client and the per-manifest
-        // blob fan-out knob.
         let downstream = self.resolve_downstream(&namespace, &payload.downstream)?;
         let registry_client = &downstream.registry_client;
         let max_concurrent_pushes = downstream.max_concurrent_pushes;
@@ -319,17 +256,11 @@ impl ReplicationJobHandler {
             .map_err(|e| Error::Storage(e.to_string()))?;
             Self::record_success(&payload.downstream, outcome);
         } else {
-            // Push manifest: re-resolving the current digest at execute time
-            // gives latest-wins for a coalesced job, and the pipeline ships the
-            // referenced blobs (HEAD-skipping any the downstream already holds)
-            // before PUTting the manifest itself.
+            // Re-resolving the digest at execute time gives latest-wins for a
+            // coalesced job.
             let Some((digest, created_at)) =
                 self.resolve_current_digest(&namespace, payload).await?
             else {
-                // The target was deleted out from under this push (a coalesced
-                // push whose tag is gone, or a by-digest revision deleted since
-                // the job was enqueued): the system has already converged, so
-                // this is a no-op success, not a `pushed`/`superseded`/`failed`.
                 debug!(
                     namespace = %namespace,
                     tag = ?payload.tag,
@@ -338,14 +269,11 @@ impl ReplicationJobHandler {
                 );
                 return Ok(());
             };
-            // Stamp the push with the resolved tag's own creation time so the
-            // receiver's last-writer-wins compares against the digest actually
-            // being sent. Re-deriving here (rather than trusting the payload)
-            // keeps both a COALESCED event push (which retains the first
-            // envelope's older timestamp while the digest is re-resolved to a
-            // newer one) and a RECONCILE push (which carries no timestamp)
-            // correctly ordered. A tag-less (by-digest) push is content-addressed
-            // and the receiver skips LWW, so its payload value is carried through.
+            // Re-derive source_ts from the resolved tag's created_at (not the
+            // payload) so receiver-side last-writer-wins compares against the
+            // digest actually sent, for coalesced and reconcile pushes alike.
+            // A tag-less push has no local timestamp, so the payload value
+            // carries through (the receiver skips LWW for it).
             let source_ts = created_at
                 .map(|ts| ts.to_rfc3339())
                 .or_else(|| payload.source_ts.clone());
@@ -376,8 +304,6 @@ impl ReplicationJobHandler {
 #[async_trait]
 impl JobHandler for ReplicationJobHandler {
     async fn execute(&self, envelope: &JobEnvelope) -> Result<Transaction, Error> {
-        // Reject unsupported kinds, mirroring `CacheJobHandler::execute`. Only the
-        // two manifest kinds are accepted; anything else is rejected explicitly.
         if envelope.kind != REPLICATION_PUSH_MANIFEST_KIND
             && envelope.kind != REPLICATION_DELETE_MANIFEST_KIND
         {
@@ -391,35 +317,23 @@ impl JobHandler for ReplicationJobHandler {
         let payload: ReplicationPushPayload = serde_json::from_value(envelope.payload.clone())
             .map_err(|e| Error::Storage(format!("failed to deserialize job payload: {e}")))?;
 
-        // Loop prevention is no-op suppression at the mutation boundary: the
-        // manifest mutation methods only call `dispatch_replication` when the write
-        // actually changed local state, so a converged replay (a tag re-asserted to
-        // the same digest, an already-present revision, a delete of an already-absent
-        // ref) is never re-dispatched and mesh cycles terminate. There is no origin
-        // filter and nothing for the handler itself to drop here.
+        // Loop prevention is no-op suppression at the mutation boundary: mutation
+        // methods only dispatch replication when local state actually changed, so
+        // converged replays are never re-dispatched and mesh cycles terminate.
+        // The handler itself needs no origin filter.
 
-        // Run the whole push/delete attempt and record `failed` once on ANY Err
-        // from the attempt: pre-flight (invalid namespace, missing downstream
-        // config), local-read (unreadable manifest blob), AND downstream HTTP
-        // failures alike. The documented
-        // `replication_push_total{outcome="failed"}` failure-rate query thus
-        // also catches jobs stuck on a local/config error, not only downstream
-        // pushes.
-        // `record_success` is called inside the attempt (it needs the
-        // `PushOutcome`); only the failure arm needs the outer single increment.
+        // Record `failed` exactly once on any Err; success metrics are recorded
+        // inside the attempt.
         self.attempt(envelope, &payload)
             .await
             .inspect_err(|_| Self::record_failure(&payload.downstream))?;
 
-        // Empty transaction: the HTTP push is the side effect; the queue cleanup
-        // mutations still land atomically on `complete`.
+        // Empty transaction: the HTTP push is the side effect.
         Ok(Transaction::builder().build())
     }
 }
 
-/// Builder for [`ReplicationJobHandler`] taking individual resolved fields.
-///
-/// `resolver`, `blob_store` and `metadata_store` are all required.
+/// Builder for [`ReplicationJobHandler`]; all fields are required.
 #[derive(Default)]
 pub struct ReplicationJobHandlerBuilder {
     resolver: Option<Arc<RepositoryResolver>>,
@@ -530,10 +444,8 @@ mod tests {
     }
 
     /// Current value of `angos_replication_push_total{downstream, outcome}`.
-    ///
-    /// The prometheus registry is process-global and shared across tests, so
-    /// callers read this before and after an action and assert the **delta** (an
-    /// absolute would be polluted by other tests touching the same label set).
+    /// The prometheus registry is process-global, so tests assert deltas, not
+    /// absolutes.
     fn push_total(downstream: &str, outcome: &str) -> u64 {
         metrics_provider::metrics_provider()
             .replication_push_total
@@ -579,8 +491,7 @@ mod tests {
         );
     }
 
-    /// A delete and a push for the same tag must NOT share a `lock_key`, so a
-    /// delete can never coalesce into (and be swallowed by) a still-pending push.
+    /// A delete must never coalesce into (and be swallowed by) a pending push.
     #[test]
     fn lock_key_distinguishes_push_from_delete() {
         let push = sample_payload();
@@ -601,13 +512,9 @@ mod tests {
         );
     }
 
-    /// Two deletes of the same tag with different `source_ts` are distinct
-    /// deletion EVENTS and must NOT coalesce: a delete cannot re-derive its
-    /// timestamp at execute time, so dedup-dropping a later delete into a
-    /// pending older one would ship the stale timestamp, lose receiver-side
-    /// LWW against an in-between re-push, and leave the downstream tag alive
-    /// until a reconcile. Retries of the SAME event (same timestamp) still
-    /// coalesce.
+    /// Deletes with different `source_ts` are distinct events and must not
+    /// coalesce (the stale timestamp would lose receiver-side LWW), while
+    /// retries of the same event still do.
     #[test]
     fn lock_key_separates_distinct_delete_events() {
         let mut first = sample_payload();
@@ -627,8 +534,6 @@ mod tests {
         );
     }
 
-    /// A payload with neither tag nor digest still yields a well-formed,
-    /// namespace-scoped key (empty `tag_or_digest` segment).
     #[test]
     fn lock_key_handles_missing_tag_and_digest() {
         let mut payload = sample_payload();
@@ -651,7 +556,6 @@ mod tests {
         assert_eq!(round_trip, payload);
     }
 
-    /// Build a downstream `RegistryClient` pointed at `uri`.
     fn downstream_client(uri: &str) -> Arc<RegistryClient> {
         let backend = cache::Config::Memory.to_backend().unwrap();
         Arc::new(
@@ -669,9 +573,8 @@ mod tests {
         repository_with_named_downstream(DOWNSTREAM, client)
     }
 
-    /// Like [`repository_with_downstream`] but lets a test pick the downstream
-    /// name, so its `angos_replication_push_total{downstream=...}` label set is
-    /// isolated from the other tests (all of which use `eu-region`).
+    /// Lets a test pick the downstream name so its metric label set is isolated
+    /// from other tests.
     fn repository_with_named_downstream(name: &str, client: Arc<RegistryClient>) -> Repository {
         Repository {
             name: REPO.to_string(),
@@ -693,9 +596,8 @@ mod tests {
         }
     }
 
-    /// Seed a config blob, a layer blob, and a manifest blob (referencing both),
-    /// plus a `v1` tag link pointing at the manifest. Returns the manifest
-    /// digest and its referenced blob digests.
+    /// Seeds config, layer, and manifest blobs plus a `v1` tag link; returns
+    /// the (manifest, config, layer) digests.
     async fn seed_manifest(
         store: &Arc<Store>,
         metadata_store: &Arc<MetadataStore>,
@@ -954,11 +856,9 @@ mod tests {
         handler.execute(&envelope).await.unwrap();
     }
 
-    /// End-to-end through `execute()`: the manifest PUT carries an
-    /// `X-Angos-Source-Timestamp` DERIVED from the resolved tag's `created_at`,
-    /// NOT the (deliberately stale) payload timestamp. This pins that a coalesced
-    /// push cannot ship a stale last-writer-wins version, plus the
-    /// handler -> pipeline -> client header threading.
+    /// The manifest PUT must carry an `X-Angos-Source-Timestamp` derived from
+    /// the resolved tag's `created_at`, not the stale payload timestamp, so a
+    /// coalesced push cannot ship a stale last-writer-wins version.
     #[tokio::test]
     async fn execute_push_stamps_resolved_source_timestamp() {
         metrics_provider::init_for_tests();
@@ -983,8 +883,7 @@ mod tests {
         let (manifest_digest, config_digest, layer_digest) =
             seed_manifest(&store, &metadata_store).await;
 
-        // The handler must stamp the resolved tag's created_at, not the payload's
-        // stale source_ts ("2026-06-03..."). Read it back to assert the exact value.
+        // Read back the tag's created_at to assert the exact stamped value.
         let expected_ts = metadata_store
             .read_link(NAMESPACE, &LinkKind::Tag("v1".to_string()), false)
             .await
@@ -993,8 +892,8 @@ mod tests {
             .unwrap()
             .to_rfc3339();
 
-        // Both blobs already present (200 on HEAD) -> the only mutating request
-        // is the manifest PUT, which we match on the replication headers.
+        // Blobs already present (200 on HEAD): the only mutating request is the
+        // manifest PUT.
         for blob in [&config_digest, &layer_digest] {
             Mock::given(method("HEAD"))
                 .and(path(format!("/v2/{NAMESPACE}/blobs/{blob}")))
@@ -1033,18 +932,15 @@ mod tests {
             .build()
             .unwrap();
 
-        // `sample_payload()` carries a deliberately stale source_ts
-        // ("2026-06-03..."), which the handler must IGNORE in favour of the
-        // resolved tag's created_at.
         let envelope = build_envelope(&sample_payload()).unwrap();
         handler.execute(&envelope).await.unwrap();
         // wiremock `.expect(1)` on the header-matched PUT is verified on drop.
         drop(mock_server);
     }
 
-    /// A reconcile push enqueues with `source_ts = None`. The
-    /// handler must still stamp the resolved tag's `created_at` so the receiver
-    /// runs last-writer-wins instead of overwriting the downstream unconditionally.
+    /// A reconcile push enqueues with `source_ts = None`; the handler must still
+    /// stamp the resolved tag's `created_at` so the receiver runs
+    /// last-writer-wins instead of overwriting unconditionally.
     #[tokio::test]
     async fn execute_reconcile_push_derives_source_timestamp_from_local_tag() {
         metrics_provider::init_for_tests();
@@ -1087,8 +983,7 @@ mod tests {
                 .mount(&mock_server)
                 .await;
         }
-        // Even with a None payload timestamp, the PUT must carry the resolved
-        // created_at; a missing/empty header would not match and the push fails.
+        // A missing or wrong header would not match this mock and the push fails.
         Mock::given(method("PUT"))
             .and(path(format!("/v2/{NAMESPACE}/manifests/v1")))
             .and(header(X_ANGOS_SOURCE_TIMESTAMP, expected_ts.as_str()))
@@ -1121,9 +1016,8 @@ mod tests {
         drop(mock_server);
     }
 
-    /// A downstream that returns a non-superseded `409 CONFLICT` (e.g. an
-    /// immutable-tag rejection) must surface as `Err` from `execute()` so the
-    /// queue retries / dead-letters the job. It MUST NOT be silently dropped.
+    /// A non-superseded `409 CONFLICT` (e.g. an immutable-tag rejection) must
+    /// surface as `Err` so the queue retries instead of silently dropping the job.
     #[tokio::test]
     async fn execute_push_surfaces_immutable_conflict_409_as_error() {
         metrics_provider::init_for_tests();
@@ -1159,7 +1053,6 @@ mod tests {
                 .mount(&mock_server)
                 .await;
         }
-        // Manifest PUT rejected with 409 CONFLICT (immutable-tag style).
         Mock::given(method("PUT"))
             .and(path(format!("/v2/{NAMESPACE}/manifests/v1")))
             .respond_with(ResponseTemplate::new(409).set_body_string(
@@ -1190,10 +1083,8 @@ mod tests {
         );
     }
 
-    /// A downstream that returns a `409` with the shared
-    /// `REPLICATION_SUPERSEDED` OCI code is a last-writer-wins loss (convergence,
-    /// not failure), so `execute()` returns `Ok` and the queue completes (drops)
-    /// the job.
+    /// A `409` carrying `REPLICATION_SUPERSEDED` is a last-writer-wins loss,
+    /// i.e. convergence, so `execute()` returns `Ok` and the job completes.
     #[tokio::test]
     async fn execute_push_treats_superseded_409_as_success() {
         metrics_provider::init_for_tests();
@@ -1229,7 +1120,6 @@ mod tests {
                 .mount(&mock_server)
                 .await;
         }
-        // Manifest PUT rejected with 409 + REPLICATION_SUPERSEDED (LWW loss).
         Mock::given(method("PUT"))
             .and(path(format!("/v2/{NAMESPACE}/manifests/v1")))
             .respond_with(ResponseTemplate::new(409).set_body_string(format!(
@@ -1311,13 +1201,9 @@ mod tests {
         handler.execute(&envelope).await.unwrap();
     }
 
-    /// Builds FS-backed stores + a seeded `v1` manifest + a handler whose
-    /// repository carries a single downstream named `downstream` pointed at
-    /// `uri`. Returns the handler and the seeded manifest's referenced blob
-    /// digests (for the caller's HEAD mocks). Leaking the `TempDir` to keep it
-    /// alive is unnecessary: the store holds the data on disk and the handler
-    /// reads it before any cleanup, so the dir is instead returned in the tuple
-    /// for the caller to keep alive for the duration of the test.
+    /// Builds FS-backed stores, a seeded `v1` manifest, and a handler with one
+    /// downstream named `downstream` at `uri`. The `TempDir` is returned so the
+    /// caller keeps the backing storage alive for the test's duration.
     async fn handler_with_downstream(
         downstream: &str,
         uri: &str,
@@ -1374,8 +1260,6 @@ mod tests {
         }
     }
 
-    /// A successful push increments `replication_push_total{.., "pushed"}` by one
-    /// and advances `replication_last_success_timestamp{..}` to a fresh value.
     #[tokio::test]
     async fn execute_push_records_pushed_metric_and_last_success() {
         metrics_provider::init_for_tests();
@@ -1422,9 +1306,6 @@ mod tests {
         drop(mock_server);
     }
 
-    /// An LWW-superseded 409 increments `replication_push_total{.., "superseded"}`
-    /// (not `pushed`) and still advances the last-success timestamp (convergence
-    /// is success).
     #[tokio::test]
     async fn execute_push_records_superseded_metric_and_last_success() {
         metrics_provider::init_for_tests();
@@ -1466,9 +1347,6 @@ mod tests {
         drop(mock_server);
     }
 
-    /// A push that fails (non-superseded 409) increments
-    /// `replication_push_total{.., "failed"}` and surfaces as an error so the job
-    /// retries; it must not touch `pushed` or the last-success gauge.
     #[tokio::test]
     async fn execute_push_records_failed_metric_on_error() {
         metrics_provider::init_for_tests();
@@ -1513,10 +1391,7 @@ mod tests {
         drop(mock_server);
     }
 
-    /// A push job whose tag was deleted out from under it (the tag link no longer
-    /// exists locally) is a converged NO-OP: `execute` returns `Ok`, the
-    /// downstream is never contacted, and no `failed` (nor `pushed`/`superseded`)
-    /// metric is recorded.
+    /// A converged no-op must not contact the downstream nor record any metric.
     #[tokio::test]
     async fn execute_push_with_deleted_tag_is_noop_success_records_no_failed() {
         metrics_provider::init_for_tests();
@@ -1538,9 +1413,8 @@ mod tests {
         );
         let blob_store = Arc::new(BlobStore::builder().store(store.clone()).build().unwrap());
 
-        // No tag seeded: `resolve_current_digest` returns `ReferenceNotFound`.
-        // The downstream points at an unreachable URL: if the handler tried to
-        // push instead of short-circuiting, the attempt would error.
+        // No tag seeded, so the resolve short-circuits; the unreachable
+        // downstream URL makes any wrongful push error.
         let mut repositories = HashMap::new();
         repositories.insert(
             REPO.to_string(),
@@ -1602,10 +1476,8 @@ mod tests {
         );
         let blob_store = Arc::new(BlobStore::builder().store(store.clone()).build().unwrap());
 
-        // No revision link seeded for the payload digest: `resolve_current_digest`
-        // reads `ReferenceNotFound` for the by-digest revision and short-circuits.
-        // The downstream points at an unreachable URL, so a wrongful push (or a
-        // blob read of the absent revision) would error instead of succeeding.
+        // No revision link seeded, so the resolve short-circuits; the
+        // unreachable downstream URL makes any wrongful push error.
         let mut repositories = HashMap::new();
         repositories.insert(
             REPO.to_string(),
@@ -1623,7 +1495,6 @@ mod tests {
         let failed_before = push_total(downstream, "failed");
         let pushed_before = push_total(downstream, "pushed");
 
-        // Tag-less push (by digest): no tag, only the payload digest.
         let mut payload = sample_payload();
         payload.downstream = downstream.to_string();
         payload.tag = None;

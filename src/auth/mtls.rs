@@ -99,9 +99,8 @@ pub mod tests {
     use super::*;
     use crate::test_fixtures::mtls::{cert_der, minimal_cert_der};
 
-    /// Collects tracing output into a shared buffer so a test can assert what
-    /// was emitted. Cloned per `make_writer` call; every clone appends to the
-    /// same buffer.
+    /// Collects tracing output into a shared buffer; every clone appends to
+    /// the same buffer.
     #[derive(Clone)]
     struct LogCapture(Arc<Mutex<Vec<u8>>>);
 
@@ -124,17 +123,11 @@ pub mod tests {
         }
     }
 
-    /// A malformed client certificate is logged server-side with the parse
-    /// error (for diagnostics) while the client only ever sees the generic
-    /// "Invalid certificate"; the internal detail must not leak into the
-    /// response. The current-thread runtime is built inside `with_default` so
-    /// the future runs on the thread the capturing subscriber is installed on.
-    ///
-    /// This is the ONLY test that drives `authenticate` to its
-    /// certificate-parse-error branch, and it must stay that way: `tracing`
-    /// caches callsite interest process-globally, so a second test hitting
-    /// that `error!` under a non-capturing subscriber could cache it as
-    /// "never" and make this log assertion flaky.
+    /// The parse error is logged server-side while the client only sees the
+    /// generic "Invalid certificate". This must remain the ONLY test driving
+    /// the certificate-parse-error branch: `tracing` caches callsite interest
+    /// process-globally, so a second test under a non-capturing subscriber
+    /// could cache the `error!` as disabled and make the log assertion flaky.
     #[test]
     fn malformed_certificate_is_logged_but_not_leaked_to_client() {
         let buffer = Arc::new(Mutex::new(Vec::<u8>::new()));
@@ -159,8 +152,6 @@ pub mod tests {
             })
         });
 
-        // The client only ever sees the generic message; the raw parse error
-        // (e.g. "UnexpectedTag") must not leak into the response body.
         match result.unwrap_err() {
             Error::Unauthorized(msg) => {
                 assert_eq!(msg, "Invalid certificate");
@@ -177,7 +168,6 @@ pub mod tests {
             err => panic!("expected Unauthorized, got {err:?}"),
         }
 
-        // ...but the parse failure IS logged server-side for diagnostics.
         let logs = String::from_utf8(buffer.lock().unwrap().clone()).unwrap();
         assert!(
             logs.contains("Failed to parse client certificate"),

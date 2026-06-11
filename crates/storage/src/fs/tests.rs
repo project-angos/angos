@@ -402,18 +402,13 @@ async fn listings_skip_atomic_write_temporaries() {
     assert!(children.next_token.is_none());
 }
 
-/// Many CONCURRENT writes to DISTINCT keys that share one parent directory all
-/// race to create that parent. `ensure_parent`'s bounded retry loop must absorb
-/// the transient EINVAL/AlreadyExists collisions (macOS/APFS sibling-`mkdir`
-/// race) so every `put` still succeeds. Multi-threaded runtime so the
-/// `create_dir_all` calls run in true parallel rather than cooperatively.
+/// `ensure_parent`'s retry loop must absorb the transient macOS/APFS
+/// sibling-`mkdir` race when concurrent writes share a parent directory.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn concurrent_writes_under_shared_parent_all_succeed() {
     let dir = TempDir::new().unwrap();
     let store = backend(&dir);
 
-    // All keys sit directly under the single shared parent `shard/`, so every
-    // task drives `ensure_parent` to create the same contended directory.
     const TASKS: usize = 64;
     let mut handles = Vec::with_capacity(TASKS);
     for i in 0..TASKS {
@@ -427,7 +422,6 @@ async fn concurrent_writes_under_shared_parent_all_succeed() {
         }));
     }
 
-    // Join all writes; assert EVERY one succeeded (no exhausted-retry error).
     let mut written = Vec::with_capacity(TASKS);
     for handle in handles {
         let key = handle
@@ -437,15 +431,12 @@ async fn concurrent_writes_under_shared_parent_all_succeed() {
         written.push(key);
     }
 
-    // No key was lost or duplicated: the full set must be present. Compare as a
-    // set so the assertion is independent of completion / lexical ordering.
     written.sort();
     written.dedup();
     let mut expected: Vec<String> = (0..TASKS).map(|i| format!("shard/file-{i}")).collect();
     expected.sort();
     assert_eq!(written, expected, "every key must be written exactly once");
 
-    // And every object is actually readable back with its own body.
     for i in 0..TASKS {
         let key = format!("shard/file-{i}");
         assert_eq!(
@@ -455,9 +446,6 @@ async fn concurrent_writes_under_shared_parent_all_succeed() {
     }
 }
 
-/// `copy` whose SOURCE is absent must surface `Error::NotFound`: the streamed
-/// copy opens the source with `File::open`, whose `NotFound` is mapped through
-/// `backend_error` to the typed `NotFound` variant.
 #[tokio::test]
 async fn copy_missing_source_returns_not_found() {
     let dir = TempDir::new().unwrap();

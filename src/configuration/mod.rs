@@ -210,14 +210,11 @@ fn validate_global(
     )
 }
 
-/// A durable job queue (`[global.job_queue]`) exists to coordinate work across
-/// multiple processes: the server enqueues and one or more `angos worker`
-/// processes drain. That coordination relies on the per-job execution lock being
-/// shared across processes, but the in-process `memory` lock strategy cannot be,
-/// so multiple workers (or `scrub --replicate` running alongside a worker) would
-/// each claim and run the same job. Require a shared lock backend whenever the
-/// durable queue is configured (the in-process queue, used when `[global.job_queue]`
-/// is absent, runs in a single process and is unaffected).
+/// Rejects `[global.job_queue]` combined with the in-process `memory` lock
+/// strategy: the durable queue coordinates multiple processes through the
+/// per-job execution lock, and a non-shared lock would let each worker claim
+/// and run the same job. The in-process queue, used when `[global.job_queue]`
+/// is absent, is unaffected.
 fn validate_durable_queue_lock(config: &Configuration) -> Result<(), Error> {
     if config.global.job_queue.is_none() {
         return Ok(());
@@ -225,10 +222,8 @@ fn validate_durable_queue_lock(config: &Configuration) -> Result<(), Error> {
     let lock_strategy = match config.resolve_registry_storage() {
         RegistryStorageConfig::FS(fs) => fs.lock_strategy,
         RegistryStorageConfig::S3(s3) => s3.lock_strategy,
-        // Reaching this arm means the `resolve_registry_storage` invariant
-        // regressed (it must map `Inherit` to a concrete FS/S3 backend). Fail
-        // closed rather than silently skip the durable-queue lock check, which
-        // would let a multi-worker deployment run with a non-shared lock.
+        // `resolve_registry_storage` must map `Inherit` to a concrete backend;
+        // fail closed rather than silently skip the lock check.
         RegistryStorageConfig::Inherit => {
             return Err(Error::InvalidFormat(
                 "[metadata_store] did not resolve to a concrete backend before \

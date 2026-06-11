@@ -52,7 +52,6 @@ impl ServerContext {
         })
     }
 
-    /// Whether the HTTP webhook dispatcher is wired.
     #[cfg(test)]
     pub fn has_event_dispatcher(&self) -> bool {
         self.dispatcher.is_some()
@@ -86,11 +85,8 @@ impl ServerContext {
             .await
     }
 
-    /// Resolves the source namespace `identity` is authorized to read a
-    /// cross-repo mount's blob from, i.e. a source whose bytes the caller could
-    /// already read. Returns `Some(namespace)` (the authorized source) when the
-    /// mount may proceed, or `None` when the caller must fall back to an ordinary
-    /// upload session.
+    /// Resolves a source namespace whose copy of the mount's blob `identity` can
+    /// already read; `None` means fall back to an ordinary upload session.
     pub async fn authorize_mount_source(
         &self,
         mount: &BlobMount,
@@ -115,11 +111,8 @@ impl ServerContext {
         }
     }
 
-    /// Deliver a single event to the webhook dispatcher, if one is configured.
-    ///
-    /// The dispatcher applies its own per-webhook delivery policy
-    /// (Required/Optional/Async) internally. With no dispatcher wired this is a
-    /// no-op `Ok`.
+    /// Delivers one event to the webhook dispatcher; with none configured this
+    /// is a no-op `Ok`.
     pub async fn dispatch_event(&self, event: &Event) -> Result<(), Error> {
         match &self.dispatcher {
             Some(dispatcher) => dispatcher.dispatch(event).await.map_err(Error::from),
@@ -127,14 +120,8 @@ impl ServerContext {
         }
     }
 
-    /// Deliver a batch of events to the dispatcher.
-    ///
-    /// Unlike a short-circuiting loop, this attempts **every** event even if an
-    /// earlier delivery fails, so a single failing event never aborts the rest
-    /// of the batch. The first error encountered is returned once all deliveries
-    /// have been attempted, preserving the externally-observable contract that a
-    /// Required-webhook failure surfaces overall while Optional/Async failures
-    /// are logged inside the dispatcher.
+    /// Delivers a batch of events, attempting every event even if an earlier
+    /// delivery fails. The first error is returned once all have been attempted.
     pub async fn dispatch_events(&self, events: &[Event]) -> Result<(), Error> {
         let mut first_error: Option<Error> = None;
         for event in events {

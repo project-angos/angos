@@ -39,7 +39,7 @@ use crate::{
 /// - `n`: Maximum number of results for pagination
 /// - `last`: Last result marker for pagination
 /// - `artifact_type`: Filter for referrer queries
-/// - `from`: Source repository of a cross-repo `mount-blob` (present only when the mount specifies `?from=`; test with `has(request.from)`)
+/// - `from`: Source repository of a cross-repo `mount-blob`; absent unless `?from=` is given
 #[derive(Clone, Debug, Serialize)]
 #[serde(tag = "action", rename_all = "kebab-case")]
 pub enum Action {
@@ -76,10 +76,9 @@ pub enum Action {
         #[serde(skip_serializing_if = "Option::is_none")]
         digest: Option<Digest>,
     },
-    /// Cross-repository blob mount (`POST .../blobs/uploads/?mount=<digest>`). A
-    /// distinct route and CEL action from `start-upload`, so a policy gates
-    /// mounts with a plain `request.action == 'mount-blob'` rule. `digest` is the
-    /// blob to mount; `from` is the optional source repository.
+    /// Cross-repository blob mount (`POST .../blobs/uploads/?mount=<digest>`).
+    /// A distinct CEL action from `start-upload` so policies can gate mounts
+    /// separately.
     #[serde(rename = "mount-blob")]
     MountBlob {
         namespace: Namespace,
@@ -170,8 +169,8 @@ pub enum Action {
     },
     /// List pending/in-flight durable jobs. Distinct action name so operators
     /// can gate job administration behind higher privilege than registry reads.
-    /// `queue` (the `cache` or `replication` queue) is exposed to CEL so a
-    /// policy can gate replication-queue administration separately.
+    /// `queue` is exposed to CEL so a policy can gate replication-queue
+    /// administration separately.
     #[serde(rename = "list-jobs")]
     ListJobs {
         queue: String,
@@ -188,9 +187,9 @@ pub enum Action {
         #[serde(skip_serializing_if = "Option::is_none")]
         after: Option<String>,
     },
-    /// Requeue a dead-letter job. `queue` is exposed to CEL (as for `list-jobs`);
-    /// `storage_key` is HTTP routing only, excluded from the CEL payload like
-    /// other addressing fields.
+    /// Requeue a dead-letter job. `queue` is exposed to CEL; `storage_key` is
+    /// HTTP routing only, excluded from the CEL payload like other addressing
+    /// fields.
     #[serde(rename = "retry-job")]
     RetryJob {
         queue: String,

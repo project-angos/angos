@@ -1002,8 +1002,7 @@ fn test_new_with_both_certificate_and_key_invalid_files() {
     assert!(matches!(result.unwrap_err(), Error::Initialization(_)));
 }
 
-/// Builds a no-auth client pointed at `mock_server` (the common setup for the
-/// write/discovery wiremock tests below).
+/// Builds a no-auth client pointed at `mock_server`.
 fn client_for(mock_server: &MockServer) -> RegistryClient {
     let config = RegistryClientConfig {
         url: mock_server.uri(),
@@ -1025,7 +1024,6 @@ async fn test_blob_upload_sequence() {
     let digest = "sha256:1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef";
     let session_path = "/v2/test/blobs/uploads/session-1";
 
-    // start_upload: POST returns the session Location.
     Mock::given(method("POST"))
         .and(path("/v2/test/blobs/uploads/"))
         .respond_with(
@@ -1035,7 +1033,6 @@ async fn test_blob_upload_sequence() {
         .mount(&mock_server)
         .await;
 
-    // patch_upload: PATCH streams the chunk, returns the next Location.
     Mock::given(method("PATCH"))
         .and(path(session_path))
         .and(body_bytes(content.to_vec()))
@@ -1046,7 +1043,6 @@ async fn test_blob_upload_sequence() {
         .mount(&mock_server)
         .await;
 
-    // complete_upload: PUT with the digest query parameter.
     Mock::given(method("PUT"))
         .and(path(session_path))
         .and(query_param("digest", digest))
@@ -1089,10 +1085,8 @@ async fn test_blob_upload_sequence() {
 
 #[tokio::test]
 async fn test_patch_upload_401_is_unauthorized_without_retry() {
-    // A streamed (single-use) PATCH body cannot be replayed, so a 401 must
-    // surface as Error::Unauthorized rather than triggering the byte-body
-    // refresh-and-retry path. `.expect(1)` (verified when the MockServer drops)
-    // proves exactly one PATCH was sent, i.e. no second attempt.
+    // A single-use streamed body cannot be replayed, so a 401 must not trigger
+    // the refresh-and-retry path (`.expect(1)` proves a single PATCH).
     let mock_server = MockServer::start().await;
     let content = b"replicated blob content";
     let session_path = "/v2/test/blobs/uploads/session-1";
@@ -1119,7 +1113,7 @@ async fn test_patch_upload_401_is_unauthorized_without_retry() {
         matches!(result, Err(Error::Unauthorized(_))),
         "a 401 on a streamed PATCH must be Error::Unauthorized (no replay), got {result:?}"
     );
-    // Dropping the server here verifies `.expect(1)`: exactly one PATCH, no retry.
+    // Dropping the server verifies `.expect(1)`: exactly one PATCH, no retry.
     drop(mock_server);
 }
 
@@ -1128,7 +1122,6 @@ async fn test_mount_blob_returns_none_on_201() {
     let mock_server = MockServer::start().await;
     let digest = "sha256:1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef";
 
-    // The POST must carry the mount query; the server answers 201 (mounted).
     Mock::given(method("POST"))
         .and(path("/v2/target/blobs/uploads/"))
         .and(query_param("mount", digest))
@@ -1164,8 +1157,6 @@ async fn test_mount_blob_omits_from_when_none() {
     let mock_server = MockServer::start().await;
     let digest = "sha256:1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef";
 
-    // With from=None the POST carries a bare ?mount=<digest> and no &from=.
-    // The server answers 201 (mounted), identical to the from=Some success path.
     Mock::given(method("POST"))
         .and(path("/v2/target/blobs/uploads/"))
         .and(query_param("mount", digest))
@@ -1198,7 +1189,6 @@ async fn test_mount_blob_falls_back_to_session_on_202() {
     let digest = "sha256:1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef";
     let session_path = "/v2/target/blobs/uploads/session-9";
 
-    // The server could not satisfy the mount and opened a session instead (202).
     Mock::given(method("POST"))
         .and(path("/v2/target/blobs/uploads/"))
         .and(query_param("mount", digest))
@@ -1233,7 +1223,6 @@ async fn test_mount_blob_rejects_mismatched_201_digest() {
     let digest = "sha256:1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef";
     let other_digest = "sha256:abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890";
 
-    // The server answers 201 but advertises a *different* digest than requested.
     Mock::given(method("POST"))
         .and(path("/v2/target/blobs/uploads/"))
         .and(query_param("mount", digest))
@@ -1265,7 +1254,6 @@ async fn test_mount_blob_accepts_matching_201_digest() {
     let mock_server = MockServer::start().await;
     let digest = "sha256:1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef";
 
-    // The server answers 201 and advertises the *same* digest that was requested.
     Mock::given(method("POST"))
         .and(path("/v2/target/blobs/uploads/"))
         .and(query_param("mount", digest))
@@ -1490,10 +1478,8 @@ async fn test_delete_manifest_surfaces_error_status() {
 
 #[tokio::test]
 async fn test_delete_manifest_absent_404_is_already_absent() {
-    // An already-absent target (404) is convergence, not failure: a retried or
-    // already-converged replication delete must map to AlreadyAbsent, never
-    // dead-letter, and distinct from Deleted so the caller records a converged
-    // no-op rather than an applied delete.
+    // A retried or already-converged delete must converge as AlreadyAbsent,
+    // never dead-letter.
     let mock_server = MockServer::start().await;
 
     Mock::given(method("DELETE"))
@@ -1544,8 +1530,6 @@ fn test_get_uploads_start_path_strips_local_prefix() {
     let client =
         RegistryClient::from_config(&config, cache, DEFAULT_MAX_MANIFEST_SIZE_BYTES).unwrap();
 
-    // The pull-mirror path strips the local repo-name prefix (unlike the
-    // NO_LOCAL_PREFIX identity path the replication write methods exercise).
     let path = client.get_uploads_start_path("local", "local/repo");
     assert_eq!(path, "https://example.com/v2/repo/blobs/uploads/");
 }
@@ -1574,7 +1558,6 @@ async fn test_list_tags_single_page() {
 async fn test_list_tags_follows_pagination() {
     let mock_server = MockServer::start().await;
 
-    // Page 1 (no `last`): returns the first tag and a Link rel="next".
     Mock::given(method("GET"))
         .and(path("/v2/test/tags/list"))
         .and(query_param("n", "1"))
@@ -1628,9 +1611,7 @@ async fn test_list_tags_absent_repo_returns_empty() {
 
 #[tokio::test]
 async fn list_tags_breaks_on_cyclic_next_link() {
-    // A downstream advertising a cyclic `Link: rel="next"` must not drive an
-    // unbounded request loop: the visited-page guard stops once a page URL
-    // repeats, returning the tags gathered so far rather than hanging.
+    // The visited-page guard must return the tags gathered so far, not hang.
     let mock_server = MockServer::start().await;
 
     Mock::given(method("GET"))
@@ -1650,7 +1631,7 @@ async fn list_tags_breaks_on_cyclic_next_link() {
         .await
         .expect("cyclic pagination must terminate, not error");
 
-    // The base page and the single `?last=z` page are fetched, then the repeated
-    // `?last=z` breaks the loop, never an unbounded fetch (asserted by expect(2)).
+    // expect(2): the base page and one `?last=z` page are fetched before the
+    // repeated `?last=z` breaks the loop.
     assert_eq!(tags, vec!["a", "b", "a", "b"]);
 }

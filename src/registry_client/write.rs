@@ -1,19 +1,9 @@
 //! Write methods for [`RegistryClient`].
 //!
-//! These mirror the **names** of the server-side `Registry` methods
-//! (`start_upload`, `patch_upload`, `complete_upload`, `put_manifest`,
-//! `delete_manifest`) but take request-side inputs (full URLs built by the
-//! `upstream_url` builders, request bodies/streams) and return parsed HTTP
-//! results, not the server's `HeaderMap`-bearing response structs.
-//!
-//! Auth, token caching, TLS and the redirect/timeout policy are reused from the
-//! shared machinery on [`RegistryClient`]: byte-bodied requests go through
-//! [`RegistryClient::send_body`], which shares [`RegistryClient::query`]'s
-//! cached-token-then-single-refresh-retry orchestration via
-//! [`RegistryClient::send_with_auth_retry`]. The single-use upload stream in
-//! [`RegistryClient::patch_upload`] cannot be replayed, so it attaches the
-//! cached token up front and surfaces a `401` as an error rather than retrying
-//! with a drained body.
+//! Byte-bodied requests reuse [`RegistryClient::send_with_auth_retry`]'s
+//! cached-token-then-single-refresh orchestration; the single-use stream in
+//! [`RegistryClient::patch_upload`] cannot be replayed, so it surfaces a `401`
+//! as an error instead of retrying.
 
 use std::collections::HashSet;
 
@@ -43,17 +33,10 @@ struct TagsListBody {
 
 /// Outcome of a manifest push.
 ///
-/// `subject` carries the `OCI-Subject` response header when the downstream
-/// processed a `subject` field itself (OCI 1.1). Its absence on a manifest that
-/// declared a `subject` signals an OCI-1.0 downstream, so the pipeline must
-/// push the referrers fallback tag.
-///
-/// `superseded` is `true` only when the downstream rejected the push with a
-/// `409` whose OCI error `code` is [`REPLICATION_SUPERSEDED_CODE`], i.e. the
-/// downstream's copy is strictly newer (last-writer-wins loss). The pipeline
-/// treats this as convergence (success), so `digest`/`subject` are `None` in
-/// that case. Any *other* non-2xx (including a 409 with a different code, e.g.
-/// an immutable-tag `CONFLICT`) is returned as [`Error`], not as `superseded`.
+/// A missing `subject` echo on a subject-bearing manifest signals an OCI-1.0
+/// downstream needing the referrers fallback tag; `superseded` is `true` only
+/// for a `409` with [`REPLICATION_SUPERSEDED_CODE`], which is convergence, not
+/// failure.
 #[derive(Debug)]
 pub struct PutManifestResult {
     pub digest: Option<Digest>,
@@ -62,30 +45,19 @@ pub struct PutManifestResult {
 }
 
 /// Outcome of a manifest delete.
-///
-/// A `409` carrying the [`REPLICATION_SUPERSEDED_CODE`] OCI code maps to
-/// [`DeleteManifestOutcome::Superseded`] (last-writer-wins loss: convergence,
-/// not failure). A successful delete maps to [`DeleteManifestOutcome::Deleted`];
-/// a `404` (the target was already gone) maps to
-/// [`DeleteManifestOutcome::AlreadyAbsent`] so the caller can record it as a
-/// converged no-op rather than an applied delete. Any other non-2xx is
-/// returned as [`Error`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeleteManifestOutcome {
-    /// The downstream applied the delete (a 2xx response).
+    /// Downstream applied the delete (2xx).
     Deleted,
-    /// The downstream already lacked the manifest (`404`): a converged no-op.
+    /// Manifest already absent downstream (`404`): a converged no-op.
     AlreadyAbsent,
-    /// The downstream rejected the delete by last-writer-wins (`409` with the
-    /// replication-superseded OCI code).
+    /// Delete rejected by last-writer-wins (`409` with the
+    /// replication-superseded OCI code): convergence, not failure.
     Superseded,
 }
 
-/// Reads the body of a `409` response and returns its first OCI error `code`,
-/// when the body is the standard `{"errors":[{"code":"..."}]}` envelope.
-///
-/// Consumes the response (the body is read to completion); a malformed/absent
-/// body yields `None` so the caller falls back to a generic conflict error.
+/// Returns the first OCI error `code` from a `{"errors":[{"code":"..."}]}`
+/// response body, or `None` when the body is malformed or absent.
 async fn parse_oci_error_code(response: Response) -> Option<String> {
     let bytes = response.bytes().await.ok()?;
     serde_json::from_slice::<serde_json::Value>(&bytes)
@@ -105,11 +77,10 @@ fn append_query(base: &str, query: &str) -> String {
 }
 
 impl RegistryClient {
-    /// Sends a request carrying a byte body, reusing the cached auth header and
-    /// refreshing once on `401` via [`RegistryClient::send_with_auth_retry`].
+    /// Sends a byte-bodied request via [`RegistryClient::send_with_auth_retry`].
     ///
-    /// `source_ts` stamps the `X-Angos-Source-Timestamp` last-writer-wins header
-    /// when set; pass `None` for ordinary writes.
+    /// `source_ts`, when set, stamps the `X-Angos-Source-Timestamp`
+    /// last-writer-wins header.
     async fn send_body(
         &self,
         method: &Method,
@@ -120,13 +91,12 @@ impl RegistryClient {
     ) -> Result<Response, Error> {
         info!("Writing to upstream: {method} {location}");
 
-        // Keep the body for the cached-token attempt and a possible 401 retry
-        // without a deep copy: a `Bytes` clone is a refcount bump, not a re-alloc.
+        // `Bytes` makes the per-attempt clone a refcount bump, not a deep copy.
         let body = Bytes::from(body);
 
         self.send_with_auth_retry(location, |auth| {
-            // `send_with_auth_retry` may invoke this twice (cached token, then a
-            // refreshed token on 401), so clone the refcounted body per attempt.
+            // The closure may run twice (cached token, then 401 refresh), so
+            // clone the refcounted body per attempt.
             let body = body.clone();
             async move {
                 self.send_body_once(
@@ -169,8 +139,8 @@ impl RegistryClient {
 
     /// Sends a request whose body is a single-use stream.
     ///
-    /// The cached auth header is attached up front; a `401` cannot be retried
-    /// because the stream has been consumed, so it is surfaced as an error.
+    /// The consumed stream cannot be replayed, so a `401` is surfaced as an
+    /// error instead of a token-refresh retry.
     async fn send_stream<S>(
         &self,
         method: &Method,
@@ -207,11 +177,8 @@ impl RegistryClient {
         Ok(response)
     }
 
-    /// Reads the `Location` response header and resolves it to an absolute URL.
-    ///
-    /// OCI registries are free to return a relative `Location` (e.g.
-    /// `/v2/<ns>/blobs/uploads/<session>`); the next request needs an absolute
-    /// URL, so a relative value is resolved against the response's final URL.
+    /// Reads the `Location` response header, resolving a relative value (which
+    /// OCI registries may return) against the response's final URL.
     fn parse_location(response: &Response) -> Result<String, Error> {
         let location = response
             .headers()
@@ -228,15 +195,13 @@ impl RegistryClient {
             .map_err(|e| Error::Internal(format!("invalid Location header '{location}': {e}")))
     }
 
-    /// Starts a resumable blob upload session, returning its continuation URL.
-    ///
-    /// The session continuation URLs (PATCH/PUT targets) come from the `Location`
-    /// response header: they are server-assigned, never synthesized.
+    /// Starts a resumable blob upload session, returning the server-assigned
+    /// continuation URL from the `Location` header.
     ///
     /// # Errors
     ///
-    /// Returns an error when the request fails, the server rejects access, or the
-    /// response omits the `Location` header / is not a success status.
+    /// Returns an error when the request fails, access is rejected, or the
+    /// response lacks a success status or `Location` header.
     #[instrument(skip(self))]
     pub async fn start_upload(&self, location: &str) -> Result<String, Error> {
         let response = self
@@ -253,23 +218,17 @@ impl RegistryClient {
         Self::parse_location(&response)
     }
 
-    /// Attempts an OCI cross-repository blob mount.
+    /// Attempts an OCI cross-repository blob mount
+    /// (`?mount=<digest>[&from=<repo>]`).
     ///
-    /// Appends `?mount=<digest>[&from=<repo>]` so the server can grant a reference
-    /// without a body transfer. The return distinguishes the two outcomes:
-    /// - `Ok(None)`: the mount was satisfied (`201 Created`); no transfer
-    ///   needed. When the `201` advertises a `Docker-Content-Digest` it is
-    ///   verified against the requested digest (a mismatch is an error).
-    /// - `Ok(Some(session_url))`: the mount could not be satisfied (`202
-    ///   Accepted`); a session was opened and the caller uploads the bytes.
-    ///
-    /// Per the distribution spec a mount that cannot be satisfied degrades to a
-    /// normal upload rather than failing.
+    /// `Ok(None)` means mounted (`201`, with the advertised digest verified
+    /// when present); `Ok(Some(session_url))` means the mount degraded to a
+    /// normal upload session (`202`), per the distribution spec.
     ///
     /// # Errors
     ///
-    /// Returns an error when the request fails, the server rejects the mount, or a
-    /// session response omits the `Location` header / is not a success status.
+    /// Returns an error when the request fails, the server rejects the mount,
+    /// or a session response lacks a success status or `Location` header.
     #[instrument(skip(self))]
     pub async fn mount_blob(
         &self,
@@ -287,9 +246,8 @@ impl RegistryClient {
             .send_body(&Method::POST, &location, None, Vec::new(), None)
             .await?;
 
-        // 201 Created: the blob is already present downstream (mounted). The
-        // digest header is optional, but if present it must name the requested
-        // blob: a different digest would falsely mark the blob converged.
+        // A 201 means mounted; an advertised digest must match the request or
+        // the blob would be falsely marked converged.
         if response.status() == StatusCode::CREATED {
             let advertised = response
                 .headers()
@@ -316,16 +274,13 @@ impl RegistryClient {
         Self::parse_location(&response).map(Some)
     }
 
-    /// Streams a chunk to an in-progress upload session and returns the next
-    /// continuation URL from the `Location` response header.
-    ///
-    /// `session_url` is the URL returned by [`RegistryClient::start_upload`] (or
-    /// a previous `patch_upload`).
+    /// Streams a chunk to an upload session and returns the next continuation
+    /// URL from the `Location` response header.
     ///
     /// # Errors
     ///
-    /// Returns an error when the request fails, the server rejects access, or
-    /// the response is not a success status / omits the `Location` header.
+    /// Returns an error when the request fails, access is rejected, or the
+    /// response lacks a success status or `Location` header.
     #[instrument(skip(self, stream))]
     pub async fn patch_upload<S>(
         &self,
@@ -350,16 +305,13 @@ impl RegistryClient {
         Self::parse_location(&response)
     }
 
-    /// Finalizes an upload session by committing the named `digest`.
-    ///
-    /// `session_url` is the continuation URL from the last
-    /// [`RegistryClient::patch_upload`] (or [`RegistryClient::start_upload`] for
-    /// a monolithic upload). The `?digest=` query parameter is appended here.
+    /// Finalizes an upload session by committing the named `digest` (appended
+    /// as the `?digest=` query parameter).
     ///
     /// # Errors
     ///
-    /// Returns an error when the request fails, the server rejects access, or
-    /// the response is not a success status.
+    /// Returns an error when the request fails, access is rejected, or the
+    /// response is not a success status.
     #[instrument(skip(self))]
     pub async fn complete_upload(&self, session_url: &str, digest: &Digest) -> Result<(), Error> {
         let location = append_query(session_url, &format!("digest={digest}"));
@@ -378,15 +330,9 @@ impl RegistryClient {
         Ok(())
     }
 
-    /// Classifies a `409 Conflict` from a replication write. `Ok(())` means the
-    /// downstream rejected by last-writer-wins (OCI code
-    /// [`REPLICATION_SUPERSEDED_CODE`]: its copy is strictly newer), which the
-    /// caller maps to its own convergence outcome. Any other 409 (e.g. an
-    /// immutable-tag `CONFLICT`) returns [`Error`] so the job retries/dead-letters.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error for any non-superseded 409.
+    /// Classifies a replication-write `409`: `Ok(())` for a last-writer-wins
+    /// rejection ([`REPLICATION_SUPERSEDED_CODE`], convergence), [`Error`] for
+    /// any other 409 so the job retries or dead-letters.
     async fn classify_conflict(response: Response, op: &str) -> Result<(), Error> {
         match parse_oci_error_code(response).await.as_deref() {
             Some(REPLICATION_SUPERSEDED_CODE) => Ok(()),
@@ -397,27 +343,18 @@ impl RegistryClient {
         }
     }
 
-    /// Pushes a manifest by reference.
+    /// Pushes a manifest by reference, stamping the `X-Angos-Source-Timestamp`
+    /// header when `source_ts` is set.
     ///
-    /// `source_ts` stamps the `X-Angos-Source-Timestamp` header when set (a
-    /// replication push); it is `None` for an ordinary push.
-    ///
-    /// Surfaces the `OCI-Subject` response header so the pipeline can detect an
-    /// OCI-1.0 downstream (no header on a subject-bearing manifest) and push the
-    /// referrers fallback tag.
-    ///
-    /// 409 disambiguation: a `409` whose OCI error `code` is
-    /// [`REPLICATION_SUPERSEDED_CODE`] (the downstream's copy is strictly newer,
-    /// a last-writer-wins loss) returns
-    /// `PutManifestResult { superseded: true, .. }` so the pipeline can treat it
-    /// as convergence (success). Any *other* 409 (e.g. an immutable-tag
-    /// `CONFLICT`) and every other non-2xx is returned as [`Error`] so the job
-    /// retries/dead-letters.
+    /// A missing `OCI-Subject` echo on a subject-bearing manifest signals an
+    /// OCI-1.0 downstream needing the referrers fallback tag; a `409` carrying
+    /// [`REPLICATION_SUPERSEDED_CODE`] sets `superseded` (convergence, not
+    /// failure).
     ///
     /// # Errors
     ///
-    /// Returns an error when the request fails, the server rejects access, or
-    /// the response is a non-2xx status other than an LWW-superseded 409.
+    /// Returns an error when the request fails, access is rejected, or the
+    /// response is a non-2xx status other than a superseded 409.
     #[instrument(skip(self, body))]
     pub async fn put_manifest(
         &self,
@@ -464,28 +401,17 @@ impl RegistryClient {
         })
     }
 
-    /// Deletes a manifest by reference.
+    /// Deletes a manifest by reference, stamping the `X-Angos-Source-Timestamp`
+    /// header when `source_ts` is set.
     ///
-    /// `source_ts` stamps the `X-Angos-Source-Timestamp` header when set (a
-    /// replication delete); it is `None` for an ordinary delete.
-    ///
-    /// A `404` (the target is already absent) returns
-    /// [`DeleteManifestOutcome::AlreadyAbsent`]: the delete is idempotent, so an
-    /// already-converged or retried delete is convergence, not failure, but
-    /// distinct from [`DeleteManifestOutcome::Deleted`] so the caller's metrics
-    /// can tell an applied delete from a no-op.
-    ///
-    /// 409 disambiguation: a `409` whose OCI error `code` is
-    /// [`REPLICATION_SUPERSEDED_CODE`] returns
-    /// [`DeleteManifestOutcome::Superseded`] (a last-writer-wins loss:
-    /// convergence). Any *other* 409 and every other non-2xx (except the `404`
-    /// above) is returned as [`Error`].
+    /// A `404` maps to [`DeleteManifestOutcome::AlreadyAbsent`] and a
+    /// superseded `409` to [`DeleteManifestOutcome::Superseded`]; both are
+    /// convergence, not failure.
     ///
     /// # Errors
     ///
-    /// Returns an error when the request fails, the server rejects access, or
-    /// the response is a non-2xx status other than a `404` or an LWW-superseded
-    /// 409.
+    /// Returns an error when the request fails, access is rejected, or the
+    /// response is a non-2xx status other than a 404 or superseded 409.
     #[instrument(skip(self))]
     pub async fn delete_manifest(
         &self,
@@ -501,9 +427,6 @@ impl RegistryClient {
             return Ok(DeleteManifestOutcome::Superseded);
         }
 
-        // An already-absent target is convergence, not failure: the delete is
-        // idempotent, so a retried, coalesced, or bounce-back delete whose target
-        // a prior attempt already removed must not error and dead-letter.
         if response.status() == StatusCode::NOT_FOUND {
             return Ok(DeleteManifestOutcome::AlreadyAbsent);
         }
@@ -518,28 +441,20 @@ impl RegistryClient {
         Ok(DeleteManifestOutcome::Deleted)
     }
 
-    /// Lists every tag of a repository on the downstream, following pagination.
+    /// Lists every tag of a repository on the downstream, following `Link`
+    /// rel="next" pagination.
     ///
-    /// `location` is the absolute `GET /v2/<ns>/tags/list` URL (from
-    /// [`RegistryClient::get_tags_list_path`]). The `{"tags":[...]}` bodies are
-    /// concatenated across pages; pagination follows the `Link` rel="next" header
-    /// (the spec's `?n=&last=` continuation). A `404` means the repository is
-    /// absent on the downstream, which yields an empty list rather than an error.
-    ///
-    /// Auth/token handling is reused from the shared GET machinery
-    /// ([`RegistryClient::query`]), exactly like `head_manifest` / `get_manifest`.
+    /// A `404` (repository absent downstream) yields an empty list rather than
+    /// an error.
     ///
     /// # Errors
     ///
-    /// Returns an error when a request fails, the downstream rejects access, or a
-    /// (non-404) page is a non-success status / has an unparseable body.
+    /// Returns an error when a request fails, access is rejected, or a non-404
+    /// page has a non-success status or unparseable body.
     #[instrument(skip(self))]
     pub async fn list_tags(&self, location: &str) -> Result<Vec<String>, Error> {
-        // A downstream advertising a cyclic or non-terminating `Link: rel="next"`
-        // must not drive an unbounded request loop / `Vec` growth. `visited` stops
-        // an exact cycle (a repeated page URL) cleanly with the tags gathered so
-        // far; `MAX_PAGES` is a hard backstop against an endless stream of
-        // distinct pages.
+        // Guards against non-terminating pagination: `visited` stops an exact
+        // page-URL cycle; `MAX_PAGES` backstops endless distinct pages.
         const MAX_PAGES: usize = 10_000;
 
         let mut tags = Vec::new();
@@ -553,16 +468,14 @@ impl RegistryClient {
                 )));
             }
             if !visited.insert(page_location.clone()) {
-                // Already fetched this page: the downstream's `rel="next"` cycles.
-                // Stop with the tags gathered so far (a partial list only
-                // under-reconciles; it never deletes a tag that exists).
+                // Cyclic `rel="next"`: stop with the tags gathered so far (a
+                // partial list only under-reconciles).
                 break;
             }
 
             let response = self.query(&Method::GET, &[], &page_location).await?;
 
             if response.status() == StatusCode::NOT_FOUND {
-                // Repository absent on the downstream: nothing to reconcile.
                 return Ok(tags);
             }
             if !response.status().is_success() {
@@ -586,11 +499,8 @@ impl RegistryClient {
         Ok(tags)
     }
 
-    /// Resolves the `Link` rel="next" continuation URL from a `tags/list`
-    /// response against the response's final URL, or `None` when absent.
-    ///
-    /// The header value has the form `<...>; rel="next"`; only the bracketed URL
-    /// of a `rel="next"` entry is followed.
+    /// Extracts the `Link` rel="next" continuation URL (`<...>; rel="next"`),
+    /// resolved against the response's final URL, or `None` when absent.
     fn parse_next_link(response: &Response) -> Option<String> {
         let header = response.headers().get(LINK)?.to_str().ok()?;
         let url = header

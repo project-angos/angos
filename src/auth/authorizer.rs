@@ -177,18 +177,11 @@ impl Authorizer {
         Ok(())
     }
 
-    /// Whether `identity` may read `mount.digest` from at least one namespace that
-    /// already holds it: the precondition for granting a cross-repo blob mount.
-    ///
-    /// A mount grants the target a reference to an existing blob with no upload, so
-    /// without this check a caller permitted to mount into a namespace they control
-    /// could copy (and then read) any blob held by any other namespace, bypassing
-    /// that source's read policy. The candidate source namespaces are resolved and
-    /// the ordinary `get-blob` read-authorization chain is run against each;
-    /// `None` is returned when none are readable (or the mount has no source), so
-    /// the caller degrades to a normal upload session instead of leaking the blob;
-    /// otherwise the authorized source namespace is returned so the grant can be
-    /// conditioned on it rather than on an independently re-derived candidate set.
+    /// Resolves a source namespace from which `identity` may already read
+    /// `mount.digest`: the precondition for granting a cross-repo blob mount.
+    /// Without it a caller could mount, then read, any blob held by any other
+    /// namespace, bypassing the source's read policy; `None` means degrade to a
+    /// normal upload session.
     #[instrument(skip(self, request, registry, identity))]
     pub async fn authorize_mount_source(
         &self,

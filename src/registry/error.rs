@@ -47,8 +47,7 @@ pub enum Error {
     Conflict(String),
     /// A replication write lost last-writer-wins: the local tag is strictly
     /// newer than the incoming `source_ts`. Distinct from [`Error::Conflict`]
-    /// (the immutable-tag case) so the sender can disambiguate on the wire via a
-    /// dedicated OCI error code and treat it as convergence rather than retry.
+    /// so the sender can treat it as convergence rather than retry.
     #[error("{0}")]
     ReplicationSuperseded(String),
     #[error("internal server error: {0}")]

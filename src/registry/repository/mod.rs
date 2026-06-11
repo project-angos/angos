@@ -15,7 +15,7 @@ use crate::{
     replication::{ReplicationDownstream, ReplicationDownstreamConfig},
 };
 
-/// Fallback per-manifest blob-push concurrency (4) used when a downstream omits
+/// Fallback per-manifest blob-push concurrency when a downstream omits
 /// `max_concurrent_pushes`.
 const DEFAULT_MAX_CONCURRENT_PUSHES: usize = 4;
 
@@ -41,9 +41,6 @@ pub struct Config {
 pub struct Repository {
     pub name: String,
     pub upstreams: Vec<RegistryClient>,
-    /// Configured replication downstreams, read by the event-path enqueue
-    /// (`dispatch_replication`), the job handler, and the scrub reconciliation
-    /// checker.
     pub replication: Vec<ReplicationDownstream>,
     pub retention_policy: RetentionPolicy,
     pub immutable_tags: bool,
@@ -104,10 +101,8 @@ impl Repository {
             .map_err(|e| Error::Internal(format!("Failed to initialize upstream clients: {e}")))??
         };
 
-        // Validate downstream routing keys before building any client: `name` is the
-        // job lock_key segment and the per-downstream metrics label, so an empty or
-        // duplicate name silently coalesces two distinct targets into one. Reject at
-        // build time, mirroring how global config rejects invalid knobs.
+        // `name` is the job lock_key segment and the per-downstream metrics label,
+        // so an empty or duplicate name would silently coalesce two distinct targets.
         let mut seen_names = HashSet::new();
         for downstream in &config.downstream {
             if downstream.name.is_empty() {

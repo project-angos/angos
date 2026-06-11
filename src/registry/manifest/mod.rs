@@ -263,9 +263,7 @@ impl Registry {
         })
     }
 
-    /// Convenience wrapper for a non-replication manifest store (no `source_ts`).
-    /// Production writes arrive through `accept_put_manifest`; this is retained
-    /// for tests that store a manifest directly.
+    /// Test-only wrapper that stores a manifest without a replication `source_ts`.
     #[cfg(test)]
     #[instrument(skip(body))]
     pub async fn put_manifest(
@@ -324,11 +322,8 @@ impl Registry {
             .store_manifest(namespace.as_ref(), &computed_digest, body, &ops, created_at)
             .await?;
 
-        // Whether this write changed local state, from the prior target the
-        // committed transaction itself validated: a tag already pointing at
-        // this digest, or an already-present revision, is a converged replay.
-        // A missing entry (no `Create` op for the reference: unreachable,
-        // `link_plan::push` always emits it) fails open so a genuine write is
+        // Changed-state check from the prior target the committed transaction
+        // itself validated; a missing entry fails open so a genuine write is
         // never suppressed.
         let changed = commit.changed(&LinkKind::from_reference(reference), &computed_digest);
 
@@ -395,14 +390,12 @@ impl Registry {
         reference: &Reference,
     ) -> Result<DeleteManifestResponse, Error> {
         // A delete carries no incoming digest, so a timestamp tie keeps the
-        // plain strictly-greater rule (the delete proceeds; a delete bounce
-        // dies as a no-op at the next hop).
+        // strictly-greater rule and the delete proceeds.
         self.check_lww_not_superseded(namespace, reference, source_ts, None)
             .await?;
 
-        // A digest delete cascades to every tag pointing at the revision, so
-        // resolve those first: they feed both the no-op-suppression gate below
-        // and the LWW guard / link plan. A tag reference has no cascade.
+        // A digest delete cascades to every pointing tag; resolve them first
+        // for the suppression gate, the LWW guard, and the link plan.
         let pointing_tags = if let Reference::Digest(digest) = reference {
             self.metadata_store
                 .find_tags_pointing_at(namespace.as_ref(), digest)
@@ -411,12 +404,9 @@ impl Registry {
             Vec::new()
         };
 
-        // No-op suppression: only re-dispatch a delete that actually removed
-        // something. The ref counts as absent (gate closed) only when the prior
-        // link is gone AND no tag still points at it: a digest delete that drops
-        // only cascade tag links (the revision link already absent) still changed
-        // local state. A transient read error counts as "existed" so a real
-        // delete is never suppressed; with replication off the gate is moot.
+        // No-op suppression: the ref counts as absent only when the prior link
+        // is gone AND no tag still points at it. A transient read error counts
+        // as "existed" so a real delete is never suppressed.
         let resolved_repository = self.resolver.resolve(namespace);
         let existed_before = match self
             .prior_link_if_replicated(resolved_repository, namespace, reference)
@@ -428,12 +418,8 @@ impl Registry {
         };
 
         let ops = if let Reference::Digest(digest) = reference {
-            // Receiver-side last-writer-wins for a replicated digest delete. The
-            // delete cascades to every tag pointing at the revision, so a tag
-            // re-pointed locally AFTER the delete was authored (and the revision
-            // it still references) must not be dropped by the older delete. Tag
-            // deletes are guarded by `check_lww_not_superseded` above; a genuine
-            // client delete carries no `source_ts` and skips this.
+            // A tag re-pointed locally after the delete was authored must not
+            // be dropped by the older replicated delete.
             if let Some(source_ts) = source_ts {
                 self.check_digest_delete_not_superseded(namespace, &pointing_tags, source_ts)
                     .await?;
@@ -460,8 +446,6 @@ impl Registry {
                 .await?;
         }
 
-        // Reuse the already-resolved repository instead of re-resolving via
-        // `repository_name_for`; `resolved_repository` is `Copy` and still in scope.
         let repository = resolved_repository
             .map(|r| r.name.clone())
             .unwrap_or_default();
@@ -491,16 +475,14 @@ impl Registry {
             ));
         }
 
-        // For a tag delete the receiver keys off `payload.tag`, so no digest is
-        // resolved or carried. For a digest delete the digest IS the reference,
-        // so it is dispatched as `Some`.
+        // For a tag delete the receiver keys off `payload.tag`, so no digest
+        // is carried.
         let (tag, dispatch_digest) = match reference {
             Reference::Tag(tag) => (Some(tag.as_str()), None),
             Reference::Digest(digest) => (None, Some(digest)),
         };
-        // No-op suppression: only re-propagate a delete that actually removed
-        // something locally. Webhook events above fire unconditionally; only the
-        // replication dispatch is gated.
+        // Webhook events above fire unconditionally; only the replication
+        // dispatch is gated on a real removal.
         if existed_before {
             self.dispatch_replication(
                 resolved_repository,
@@ -604,29 +586,14 @@ impl Registry {
         })
     }
 
-    /// Last-writer-wins guard for a replication-originated tag write.
-    ///
-    /// LWW applies only when the request carries a `source_ts` (i.e. it is a
-    /// replication push/delete, not a genuine client write) and the reference is
-    /// a tag (digest references are content-addressed, so there is no conflict to
-    /// resolve). When the local tag currently resolves to a `created_at` that is
-    /// strictly newer than the incoming `source_ts`, the local copy wins and the
-    /// write is rejected with [`Error::ReplicationSuperseded`]: a 409 carrying a
-    /// distinct OCI code so the sender treats it as convergence rather than a
-    /// retryable conflict. A local tag with no recorded `created_at` is treated
-    /// as oldest and never blocks the incoming write.
-    ///
-    /// LWW orders by the originating author's write time: a replicated write
-    /// persists the incoming `source_ts` as the tag link's `created_at` (not this
-    /// receiver's clock), and the re-dispatch path re-derives `source_ts` from it,
-    /// so author time propagates verbatim across hops and multi-hop ordering is
-    /// deterministic. Two DISTINCT writes stamped with the identical timestamp
-    /// are ordered by digest (see `link_supersedes`), so the order is total and
-    /// an A<->B equal-timestamp swap cannot oscillate. The one remaining
-    /// non-strictness is that this read is not atomic with the commit, so two
-    /// replicated writes to the same tag arriving together can both pass the
-    /// gate and the later commit wins. The mesh still converges because
-    /// re-replication re-arbitrates.
+    /// Last-writer-wins guard for a replication-originated tag write: rejects
+    /// with [`Error::ReplicationSuperseded`] (a distinct 409 the sender records
+    /// as convergence, not a retryable conflict) when the local tag strictly
+    /// supersedes the incoming `source_ts` per [`Self::link_supersedes`].
+    /// Skipped without a `source_ts` (genuine client write) and for digest
+    /// references (content-addressed); ordering uses the author's write time,
+    /// persisted as `created_at` and propagated verbatim across hops, so
+    /// multi-hop ordering is deterministic.
     async fn check_lww_not_superseded(
         &self,
         namespace: &Namespace,
@@ -659,26 +626,12 @@ impl Registry {
     }
 
     /// `Some(created_at)` iff the local link strictly supersedes the incoming
-    /// write: its recorded creation time is newer than `source_ts`, or, on an
-    /// exactly equal timestamp, its target digest orders above
-    /// `incoming_digest`. `None` when the link is absent, has no `created_at`,
-    /// or loses the comparison. A non-`ReferenceNotFound` read error fails
-    /// closed (Err) so LWW is never silently disabled by a backend hiccup.
-    ///
-    /// The digest tie-break makes the LWW order total: wall-clock time cannot
-    /// order two distinct writes stamped identically, and strictly-greater
-    /// alone would make BOTH sides accept each other's write: each acceptance
-    /// changes state and re-dispatches, so an A<->B pair would swap digests
-    /// forever. With the larger digest winning everywhere, exactly one side
-    /// rejects and the mesh converges on it. An equal digest is the same
-    /// content (a converged replay) and is accepted; a delete carries no
-    /// digest (`None`) and keeps the plain strictly-greater rule: a tied
-    /// delete proceeds, and a delete bounce dies as a no-op at the next hop.
-    ///
-    /// Reads bypass the link cache: this is a correctness gate, not a serving
-    /// read, and on a multi-replica deployment the per-process cache can lag a
-    /// sibling replica's write by up to its TTL, letting an older replicated
-    /// write overwrite the newer tag.
+    /// write: newer `created_at`, or equal with a target digest ordering above
+    /// `incoming_digest` (the tie-break that stops equal-timestamp peers
+    /// swapping digests forever; deletes carry no digest and keep plain
+    /// strictly-greater); `None` when the link is absent, has no `created_at`,
+    /// or loses. Read errors other than `ReferenceNotFound` fail closed, and
+    /// reads bypass the link cache to avoid its multi-replica staleness.
     async fn link_supersedes(
         &self,
         namespace: &Namespace,
@@ -710,17 +663,11 @@ impl Registry {
         Ok(None)
     }
 
-    /// Last-writer-wins guard for a replication-originated *digest* delete.
-    ///
-    /// A digest delete cascades to every tag pointing at the revision, so a tag
-    /// re-pointed locally after the delete was authored (its `created_at`
-    /// strictly newer than the incoming `source_ts`) must not be dropped by the
-    /// older delete. When such a tag exists the local copy (and the revision it
-    /// still references) wins, and the whole delete is rejected with
-    /// [`Error::ReplicationSuperseded`] so the sender records convergence rather
-    /// than a retryable conflict. A tag with no recorded `created_at` is treated
-    /// as oldest and never blocks the delete; a transient read failure fails
-    /// closed (refuse the delete), matching `check_lww_not_superseded`.
+    /// Last-writer-wins guard for a replication-originated digest delete: the
+    /// delete cascades to every pointing tag, so a tag re-pointed locally
+    /// after the delete was authored rejects the whole delete with
+    /// [`Error::ReplicationSuperseded`], preserving the tag and the revision
+    /// it still references.
     async fn check_digest_delete_not_superseded(
         &self,
         namespace: &Namespace,
@@ -728,8 +675,7 @@ impl Registry {
         source_ts: DateTime<Utc>,
     ) -> Result<(), Error> {
         for tag in tags {
-            // A delete carries no incoming digest, so a timestamp tie keeps the
-            // plain strictly-greater rule (the delete proceeds).
+            // No incoming digest, so a timestamp tie lets the delete proceed.
             if let Some(created_at) = self
                 .link_supersedes(namespace, tag, source_ts, None)
                 .await?
@@ -744,17 +690,10 @@ impl Registry {
     }
 
     /// The prior local link for `reference`, read only when an event-enqueuing
-    /// downstream matches `namespace`; `None` otherwise. The no-op-suppression
-    /// dispatch gate in `delete_manifest` consumes this solely to decide whether
-    /// to re-dispatch, so when no downstream would enqueue the read is skipped
-    /// entirely (restoring the replication-off cost). The put path needs no such
-    /// read: `accept_put_manifest` gets its `changed` gate from the committed
-    /// link transaction itself (`PutManifestResponse.changed`).
-    /// A read error other than `ReferenceNotFound` is surfaced, not collapsed to
-    /// "absent", so a transient backend hiccup never silently suppresses a real
-    /// change. The read bypasses the link cache, like [`Self::link_supersedes`]:
-    /// a stale cached link on a multi-replica deployment could wrongly suppress
-    /// a genuine change, stranding the downstream until a reconcile.
+    /// downstream matches `namespace` (`None` otherwise) so the replication-off
+    /// path pays no extra read. Read errors other than `ReferenceNotFound` are
+    /// surfaced rather than collapsed to "absent", and the read bypasses the
+    /// link cache, so a hiccup or stale cache never suppresses a real change.
     async fn prior_link_if_replicated(
         &self,
         repository: Option<&Repository>,
@@ -806,11 +745,8 @@ impl Registry {
             return Err(Error::ManifestBodyTooLarge { limit });
         }
 
-        // LWW runs after the body is read because the equal-timestamp tie-break
-        // compares digests, and the incoming digest is the body's hash. Only a
-        // replicated write (`source_ts` present) pays the hash here; a genuine
-        // client push skips both it and the gate. `store_manifest` re-hashes (a
-        // small, replication-only duplication).
+        // The equal-timestamp tie-break compares digests, so only a replicated
+        // write (`source_ts` present) pays this extra hash of the body.
         let incoming_digest = source_ts
             .is_some()
             .then(|| Digest::Sha256(sha256::hex(&request_body).into()));
@@ -828,8 +764,6 @@ impl Registry {
             )
             .await?;
 
-        // Reuse the already-resolved repository instead of re-resolving via
-        // `repository_name_for`; `resolved_repository` is `Copy` and still in scope.
         let repository = resolved_repository
             .map(|r| r.name.clone())
             .unwrap_or_default();
@@ -856,20 +790,10 @@ impl Registry {
             ));
         }
 
-        // Enqueue replication for the stored manifest, but ONLY when the write
-        // actually changed local state (no-op suppression): a tag re-asserted
-        // to the same digest, or an already-present revision, is a converged
-        // replay (e.g. an inbound replicated bounce). Re-dispatching it would
-        // keep a 3+-node mesh cycle alive. `response.changed` comes from the
-        // prior target the committed link transaction itself validated, so
-        // there is no separate pre-write read for an interleaved writer to
-        // race. The canonical stored digest is read directly off
-        // `response.digest` (computed once by `store_manifest`), with no
-        // String->Digest re-parse of the `Docker-Content-Digest` header.
-        //
-        // Webhook events above are emitted unconditionally; only the replication
-        // dispatch is gated, so observers still see every push while the mesh
-        // stops re-propagating converged replays.
+        // No-op suppression: re-dispatching a converged replay would keep a
+        // mesh cycle alive, so only a write that changed local state (per the
+        // committed transaction) is replicated. Webhook events above fire
+        // unconditionally.
         if response.changed {
             let tag = match &reference {
                 Reference::Tag(tag) => Some(tag.as_str()),

@@ -91,9 +91,8 @@ pub fn metadata_store_over(
     metadata_store_over_cached(object, executor, 0)
 }
 
-/// Like [`metadata_store_over`] but with a memory-backed link cache enabled at
-/// `link_cache_ttl_secs` (`0` keeps it disabled), for tests pinning which reads
-/// must bypass the per-process cache.
+/// Like [`metadata_store_over`] but with a memory-backed link cache at
+/// `link_cache_ttl_secs` (`0` keeps it disabled).
 pub fn metadata_store_over_cached(
     object: Arc<dyn ObjectStore>,
     executor: Arc<dyn TransactionExecutor>,
@@ -159,18 +158,9 @@ pub fn create_test_registry(
     Registry::new(blob_store, metadata_store, resolver, config).unwrap()
 }
 
-/// Write `content` directly at the canonical blob path via the underlying
-/// `ObjectStore`. Returns the SHA-256 digest.
-///
-/// Test-only setup helper that replaces the deleted `BlobStore::create`
-/// shortcut. Seeds blob bytes without invoking the upload state machine
-/// (no upload-session record, no namespace required) — which matches the
-/// legacy `BlobStore::create` semantics most closely.
-/// Write raw bytes at the canonical link path for `link` in `namespace`.
-///
-/// Test-only setup for hand-crafted or deliberately corrupt link files (e.g.
-/// pinning how readers handle an unparseable link); production code writes
-/// links through the transactional engine via `update_links`.
+/// Write raw bytes at the canonical link path for `link` in `namespace`,
+/// bypassing the transactional `update_links` path so tests can seed
+/// hand-crafted or deliberately corrupt link files.
 pub async fn put_link_raw(store: &Store, namespace: &str, link: &LinkKind, body: &[u8]) {
     store
         .put(
@@ -181,6 +171,13 @@ pub async fn put_link_raw(store: &Store, namespace: &str, link: &LinkKind, body:
         .expect("raw link write");
 }
 
+/// Write `content` directly at the canonical blob path via the underlying
+/// `ObjectStore`. Returns the SHA-256 digest.
+///
+/// Test-only setup helper that replaces the deleted `BlobStore::create`
+/// shortcut. Seeds blob bytes without invoking the upload state machine
+/// (no upload-session record, no namespace required) — which matches the
+/// legacy `BlobStore::create` semantics most closely.
 pub async fn put_blob_direct(store: &Store, content: &[u8]) -> Digest {
     let mut hasher = Sha256::new();
     hasher.update(content);

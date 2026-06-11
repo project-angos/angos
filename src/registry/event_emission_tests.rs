@@ -569,10 +569,8 @@ fn downstream_client() -> Arc<RegistryClient> {
     )
 }
 
-/// A `Registry` over an FS/in-memory store whose `test-repo` repository carries a
-/// single `event+reconcile` downstream, sharing a caller-held `JobStore` so the
-/// test can `count_pending` enqueued replication jobs. No drain is spawned: these
-/// tests assert enqueue only.
+/// A `Registry` with one `event+reconcile` downstream and a caller-held
+/// `JobStore`. No drain is spawned: these tests assert enqueue only.
 struct ReplicationFixture {
     registry: Registry,
     job_store: Arc<JobStore>,
@@ -643,8 +641,8 @@ impl ReplicationFixture {
     }
 }
 
-/// Read the single pending replication envelope and decode its payload. Panics
-/// unless there is exactly one pending job on the replication queue.
+/// Decode the payload of the sole pending replication job, panicking unless
+/// exactly one is pending.
 async fn sole_pending_payload(job_store: &JobStore) -> ReplicationPushPayload {
     let keys = job_store.list_pending(REPLICATION_QUEUE, 16).await.unwrap();
     assert_eq!(
@@ -660,8 +658,6 @@ async fn sole_pending_payload(job_store: &JobStore) -> ReplicationPushPayload {
     serde_json::from_value(envelope.payload).expect("decode ReplicationPushPayload")
 }
 
-/// A fresh local tagged push enqueues one replication job for the matching
-/// `event+reconcile` downstream.
 #[tokio::test]
 async fn fresh_local_tag_push_enqueues_replication_job() {
     crate::metrics_provider::init_for_tests();
@@ -692,9 +688,7 @@ async fn fresh_local_tag_push_enqueues_replication_job() {
         "a fresh local tagged push must enqueue exactly one replication job"
     );
 
-    // The enqueued payload describes a manifest-push to the configured downstream
-    // for the pushed tag and carries a populated source_ts. This proves the full
-    // handler -> accept_put_manifest -> dispatch_replication -> envelope path
+    // Proves the accept_put_manifest -> dispatch_replication -> envelope path
     // threads the right fields.
     let payload = sole_pending_payload(&fixture.job_store).await;
     assert_eq!(payload.downstream, "eu-region");
@@ -707,10 +701,6 @@ async fn fresh_local_tag_push_enqueues_replication_job() {
     );
 }
 
-/// A tagged manifest delete to a namespace served by a matching downstream
-/// enqueues a replication delete job. The manifest is seeded via the
-/// non-dispatching `put_manifest` so the delete's job is the only one enqueued
-/// and the pending count below isolates it.
 #[tokio::test]
 async fn tag_delete_enqueues_replication_delete_job() {
     crate::metrics_provider::init_for_tests();
@@ -718,7 +708,7 @@ async fn tag_delete_enqueues_replication_delete_job() {
     let namespace = Namespace::new(REPLICATION_REPO).unwrap();
     let (manifest_bytes, mime_type) = test_manifest_bytes(&fixture.registry, &namespace).await;
 
-    // Seed without dispatching replication (put_manifest does not enqueue).
+    // Seed via the non-dispatching put_manifest so the delete's job is the only one enqueued.
     fixture
         .registry
         .put_manifest(
@@ -760,7 +750,6 @@ async fn tag_delete_enqueues_replication_delete_job() {
         "a tagged delete must enqueue exactly one replication delete job"
     );
 
-    // The enqueued job is a delete (not a push) for the deleted tag.
     let payload = sole_pending_payload(&fixture.job_store).await;
     assert_eq!(payload.kind, REPLICATION_DELETE_MANIFEST_KIND);
     assert_eq!(payload.tag.as_deref(), Some("doomed"));

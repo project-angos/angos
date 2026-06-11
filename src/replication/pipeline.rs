@@ -1,15 +1,10 @@
-//! The replication push pipeline.
+//! The replication push pipeline: one code path drives both the event-driven
+//! and the scrub-reconcile push of a `(namespace, digest, tag?)` job to a
+//! downstream [`RegistryClient`].
 //!
-//! One code path drives both the event-driven and the scrub-reconcile push: a
-//! job resolved to a `(namespace, digest, tag?)` is mirrored to a single
-//! downstream [`RegistryClient`]. Manifests are content-addressed, so the local
-//! manifest body is read from the [`BlobStore`] by digest; its referenced blobs
-//! and child manifests are enumerated with [`ParsedManifestDigests`].
-//!
-//! Idempotency is mandatory (the queue is at-least-once and an HTTP PUT cannot
-//! be rolled back): every blob is `head_blob`-probed on the downstream before a
-//! transfer, and child manifests land before the parent index, so a re-run is a
-//! sequence of no-op HEADs.
+//! Idempotency is mandatory (the queue is at-least-once): blobs are HEAD-probed
+//! before transfer and child manifests land before the parent index, so a
+//! re-run is a sequence of no-op HEADs.
 
 use std::{collections::HashSet, str::FromStr, sync::Arc};
 
@@ -32,55 +27,31 @@ use crate::{
 
 /// Outcome of a successful replication push or delete.
 ///
-/// Both arms are convergence (the system reached the intended state); the
-/// distinction lets the caller record `pushed` vs `superseded` metrics. A push
-/// the downstream actively applied is [`PushOutcome::Pushed`]; a last-writer-wins
-/// loss (the downstream already holds a strictly-newer copy) is
-/// [`PushOutcome::Superseded`].
+/// Every arm is convergence; the distinction only drives metrics.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PushOutcome {
     /// The downstream accepted and applied the change (a PUT/DELETE was issued).
     Pushed,
-    /// The downstream already held this exact digest, so the PUT was skipped
-    /// (HEAD-before-PUT convergence). Nothing was transferred.
+    /// The downstream already held this exact digest, so the PUT was skipped.
     Converged,
-    /// The downstream rejected the change by last-writer-wins; it already holds a
-    /// strictly-newer copy, so the system has converged.
+    /// The downstream already holds a strictly-newer copy (last-writer-wins loss).
     Superseded,
 }
 
 /// Pushes the manifest at `digest` (and everything it references) to
 /// `downstream`, then binds `tag` to it when set.
 ///
-/// Child manifests of an image index / manifest list are pushed first
-/// (depth-first), so the parent index never lands on the downstream ahead of its
-/// children. Referenced blobs are `head_blob`-probed and only transferred when
-/// absent; the per-manifest blob fan-out is bounded by `max_concurrent_pushes`.
-///
-/// `source_ts` is forwarded as the `X-Angos-Source-Timestamp` header so the
-/// receiver can apply last-writer-wins; it is stamped on the primary manifest
-/// PUT only. The referrers-fallback index PUT is deliberately timestamp-less:
-/// the fallback tag is a merged set, not an LWW register (see
+/// Child manifests land before the parent index, referenced blobs are
+/// HEAD-probed and only transferred when absent, and `source_ts` (the
+/// last-writer-wins timestamp header) is stamped on the primary manifest PUT
+/// only: the referrers fallback tag is a merged set, not an LWW register (see
 /// [`push_referrers_fallback`]).
-///
-/// 409 disambiguation: when the downstream rejects the push by last-writer-wins
-/// (a `409` whose OCI code is the replication-superseded code, surfaced by the
-/// client as `PutManifestResult { superseded: true, .. }`) the push is treated
-/// as **success**: the downstream already holds a strictly-newer copy, so the
-/// system has converged. The handler then completes the job rather than
-/// retrying. Any *other* downstream error (including a different 409, e.g. an
-/// immutable-tag conflict) propagates as [`Error::Registry`] so the job
-/// retries/dead-letters.
-///
-/// On success returns [`PushOutcome::Pushed`] when the downstream applied the
-/// change, or [`PushOutcome::Superseded`] when it lost a last-writer-wins
-/// comparison (both are convergence; the caller records them as distinct
-/// metrics outcomes).
 ///
 /// # Errors
 ///
-/// Returns [`Error::Registry`] when a local read fails or a downstream HTTP
-/// operation fails with anything other than an LWW-superseded 409.
+/// Returns [`Error::Registry`] when a local read or downstream operation fails
+/// with anything other than an LWW-superseded 409, which converges as
+/// [`PushOutcome::Superseded`].
 #[instrument(skip(downstream, blob_store, metadata_store, body))]
 #[allow(clippy::too_many_arguments)]
 pub async fn push_manifest(
@@ -97,8 +68,8 @@ pub async fn push_manifest(
 ) -> Result<PushOutcome, Error> {
     let parsed = parse_manifest_digests(&body, media_type.as_ref()).map_err(Error::Registry)?;
 
-    // 1. Recurse into child manifests FIRST (image index / manifest list). The
-    //    parent index must not land on the downstream before its children.
+    // Push child manifests first: the parent index must not land before its
+    // children.
     for child in &parsed.manifests {
         let child_body = blob_store.read(child).await.map_err(|e| {
             Error::Registry(RegistryError::Internal(format!(
@@ -120,7 +91,6 @@ pub async fn push_manifest(
         .await?;
     }
 
-    // 2. Push every referenced blob (config + layers), bounded by concurrency.
     push_blobs(
         downstream,
         blob_store,
@@ -131,28 +101,18 @@ pub async fn push_manifest(
     )
     .await?;
 
-    // 3. Push the manifest itself. When a tag is set the reference is the tag so
-    //    the downstream binds tag -> digest atomically; otherwise push by digest.
+    // Pushing by tag binds tag -> digest atomically on the downstream.
     let reference = match tag {
         Some(tag) => Reference::Tag(tag.to_string()),
         None => Reference::Digest(digest.clone()),
     };
     let location = downstream.get_manifest_path(NO_LOCAL_PREFIX, namespace, &reference);
 
-    // 3a. HEAD-before-PUT (bandwidth optimization, NOT loop prevention: the
-    //     receiver-side no-op dispatch gate breaks cycles; this just avoids one
-    //     wasted PUT once converged). Probe the target reference: if the
-    //     downstream already resolves it to THIS digest, it is converged, so skip
-    //     the manifest PUT.
-    //
-    //     Only a manifest WITHOUT a subject may take this skip. A subject-bearing
-    //     manifest must always run the PUT below, because the PUT's `OCI-Subject`
-    //     response is what tells us whether the downstream auto-indexed the
-    //     subject (OCI-1.1) or still needs the referrers fallback tag (OCI-1.0):
-    //     a converged primary does NOT imply the fallback landed: the original
-    //     push's fallback PUT can fail after the primary succeeded, and skipping
-    //     here would strand the referrer while the job reports success. The PUT is
-    //     idempotent and a referrer manifest is small, so re-issuing it is cheap.
+    // HEAD-before-PUT is a bandwidth optimization, not loop prevention (the
+    // receiver-side no-op dispatch gate breaks cycles). A subject-bearing
+    // manifest must always PUT: only the PUT's `OCI-Subject` response reveals
+    // whether the downstream needs the referrers fallback, and a converged
+    // primary does not imply the fallback landed.
     if parsed.subject.is_none()
         && downstream
             .head_manifest(&manifest_accept_types(), &location)
@@ -168,20 +128,13 @@ pub async fn push_manifest(
         return Ok(PushOutcome::Converged);
     }
 
-    // The referrers fallback below borrows the manifest body, but only a
-    // subject-bearing manifest can reach it, so retain a copy for that path alone
-    // and move the body straight into the PUT on the common (no-subject) path.
+    // Retain a body copy only for the subject-bearing fallback path; the common
+    // path moves the body into the PUT.
     let fallback_body = parsed.subject.is_some().then(|| body.clone());
 
-    // The PUT content type is the explicit `media_type` override when given, else
-    // the manifest body's own declared mediaType (surfaced by the parse above so
-    // the body is parsed once), else the type recorded on the local revision link
-    // when the manifest was stored. A body may legitimately omit `mediaType` while
-    // the original push carried it in the `Content-Type` header (which
-    // `store_manifest` records on the link), and the receiver rejects a manifest
-    // PUT that carries no `Content-Type`, so recovering it from the link keeps a
-    // body-typeless manifest replicable instead of stalling on a 400. Resolved
-    // here, after the converged-skip, so a skipped push never does the link read.
+    // A body may legitimately omit `mediaType` while the original push carried
+    // it in `Content-Type` (recorded on the revision link), and the receiver
+    // rejects a PUT without a `Content-Type`, so fall back to the link's type.
     let effective_media_type = match media_type.or_else(|| parsed.media_type.clone()) {
         Some(media_type) => Some(media_type),
         None => metadata_store
@@ -196,9 +149,7 @@ pub async fn push_manifest(
         .await
         .map_err(Error::Registry)?;
 
-    // 3c. LWW loss: the downstream already holds a strictly-newer copy. This is
-    //     convergence, not failure: drop the push (and skip the referrers
-    //     fallback, which would re-push a superseded artifact).
+    // An LWW loss is convergence: drop the push and skip the referrers fallback.
     if result.superseded {
         info!(
             namespace,
@@ -210,10 +161,8 @@ pub async fn push_manifest(
     }
     info!(namespace, %digest, ?tag, "Pushed manifest to downstream");
 
-    // 4. Referrers fallback: a subject-bearing manifest on an OCI-1.0 downstream
-    //    (no `OCI-Subject` response header) is not auto-indexed, so push the
-    //    referrers fallback tag manifest. OCI-1.1 downstreams index it for free.
-    //    `fallback_body` is `Some` only when the manifest carries a subject.
+    // An OCI-1.0 downstream (no `OCI-Subject` response) does not auto-index the
+    // subject, so push the referrers fallback tag.
     if let Some(body) = fallback_body.filter(|_| result.subject.is_none()) {
         push_referrers_fallback(
             downstream,
@@ -238,9 +187,8 @@ async fn push_blobs(
     parsed: &ParsedManifestDigests,
     max_concurrent_pushes: usize,
 ) -> Result<(), Error> {
-    // Dedup while preserving order: a manifest may legally repeat a digest
-    // (e.g. an identical layer listed twice), and two concurrent pushes of the
-    // same absent blob would both HEAD-miss and both run the full upload.
+    // Dedup: a manifest may legally repeat a digest, and two concurrent pushes
+    // of the same absent blob would both HEAD-miss and upload.
     let mut seen = HashSet::new();
     let blobs: Vec<Digest> = parsed
         .config
@@ -254,8 +202,7 @@ async fn push_blobs(
         .map(|blob| async move {
             push_one_blob(downstream, blob_store, metadata_store, namespace, &blob).await
         })
-        // 0 is impossible from config (rejected at parse); the `.max(1)` floor
-        // guards against a direct builder misuse so `buffer_unordered` is never 0.
+        // Config rejects 0; the floor guards direct builder misuse.
         .buffer_unordered(max_concurrent_pushes.max(1))
         .try_collect::<Vec<()>>()
         .await?;
@@ -263,17 +210,11 @@ async fn push_blobs(
     Ok(())
 }
 
-/// Picks a cross-repo blob-mount source for `digest`: a LOCAL namespace, other
-/// than the target, that already references the blob (per the blob index).
+/// Picks a cross-repo blob-mount `from` hint: the lexicographically smallest
+/// local namespace, other than the target, that already references the blob.
 ///
-/// In a bidirectional mesh such a sibling is likely to hold the blob on the
-/// downstream too, making it a good `from` hint: a single mount POST then grants
-/// a reference with no body transfer. The candidate is only a hint: a wrong guess
-/// costs nothing but a fall-back to the full upload (the server answers `202` and
-/// opens a session). Returns `None` when no sibling references the blob (so no
-/// mount is attempted) and, fail-safe, on any blob-index read error (a missing
-/// optimization must never fail a push). The lexicographically smallest sibling is
-/// chosen so the `from` is deterministic.
+/// A wrong guess just falls back to the full upload, and any blob-index read
+/// error yields `None`: a missing optimization must never fail a push.
 async fn mount_candidate(
     metadata_store: &Arc<MetadataStore>,
     namespace: &str,
@@ -296,8 +237,6 @@ async fn push_one_blob(
     namespace: &str,
     digest: &Digest,
 ) -> Result<(), Error> {
-    // Belt-and-suspenders idempotency: skip the transfer when the downstream
-    // already holds the bytes (HEAD-before-PUT).
     let head_location = downstream.get_blob_path(NO_LOCAL_PREFIX, namespace, digest);
     if downstream.head_blob(&[], &head_location).await.is_ok() {
         debug!(namespace, %digest, "Blob already present on downstream; skipping");
@@ -306,12 +245,8 @@ async fn push_one_blob(
 
     let start_location = downstream.get_uploads_start_path(NO_LOCAL_PREFIX, namespace);
 
-    // Cross-repo mount first: when a sibling local namespace references the blob
-    // it is likely present on the downstream under that repo, so a single mount
-    // POST may grant a reference with no body transfer. The mount is a pure
-    // optimization: a miss opens a session, and a rejection (the downstream's
-    // `mount-blob` policy denies it) falls through to a plain upload, so it can
-    // never fail the push.
+    // The mount is a pure optimization: a miss opens a session and a policy
+    // rejection falls through to a plain upload, so it can never fail the push.
     if let Some(from) = mount_candidate(metadata_store, namespace, digest).await {
         match downstream
             .mount_blob(&start_location, digest, Some(&from))
@@ -337,7 +272,6 @@ async fn push_one_blob(
         }
     }
 
-    // No mount candidate, or the mount was rejected: open a plain upload session.
     let session_url = downstream
         .start_upload(&start_location)
         .await
@@ -345,8 +279,8 @@ async fn push_one_blob(
     upload_into_session(downstream, blob_store, namespace, digest, &session_url).await
 }
 
-/// Streams a local blob's bytes into an already-open upload session and finalizes
-/// it (`patch_upload` + `complete_upload`).
+/// Streams a local blob's bytes into an already-open upload session and
+/// finalizes it.
 async fn upload_into_session(
     downstream: &RegistryClient,
     blob_store: &Arc<BlobStore>,
@@ -375,16 +309,9 @@ async fn upload_into_session(
 /// Pushes the OCI-1.0 referrers fallback tag index for a subject-bearing
 /// manifest the downstream did not auto-index.
 ///
-/// Implements the distribution-spec Referrers Tag Schema: the fallback tag
-/// `<alg>-<hash>` of the SUBJECT digest holds an image **index** whose
-/// `manifests[]` enumerate the referrer descriptors. A pushing client must GET
-/// the existing index, append its own referrer descriptor, then PUT the merged
-/// index, so a second referrer of the same subject does not clobber the first.
-///
-/// The fallback PUT carries NO `source_ts`: the fallback tag is a merged SET,
-/// not a last-writer-wins register, so it must never lose an LWW comparison.
-/// A `409 REPLICATION_SUPERSEDED` here would silently drop the just-merged
-/// descriptor while the job reports success (a stranded referrer).
+/// The fallback tag (`<alg>-<hash>` of the subject digest) holds a merged image
+/// index of referrer descriptors; its PUT is deliberately timestamp-less, since
+/// a set merge must never lose an LWW comparison and drop a descriptor.
 async fn push_referrers_fallback(
     downstream: &RegistryClient,
     metadata_store: &Arc<MetadataStore>,
@@ -412,15 +339,11 @@ async fn push_referrers_fallback(
     })?;
     let location = downstream.get_manifest_path(NO_LOCAL_PREFIX, namespace, &reference);
 
-    // Serialize the GET→merge→PUT below across concurrent replication jobs.
-    // Two referrers of the same subject are distinct jobs (distinct job
-    // `lock_key`s, so the queue runs them concurrently) merging into the same
-    // fallback tag: unserialized, both read the same base index and the loser's
-    // descriptor vanishes from the winner's PUT. The lock lives on the metadata
-    // executor, the lock domain every drain of this store (server in-process
-    // queue, `angos worker`, scrub) shares. It cannot cover an unrelated sender
-    // registry pushing to the same downstream; that residual race needs
-    // conditional-request support on the downstream.
+    // Serialize the GET/merge/PUT: two referrers of the same subject are
+    // distinct jobs the queue runs concurrently, and unserialized merges read
+    // the same base index and drop the loser's descriptor. The lock lives on
+    // the metadata executor, which every drain of this store shares, but cannot
+    // cover an unrelated sender registry pushing to the same downstream.
     let lock_keys = [referrers_fallback_lock_key(namespace, subject)];
     let session = metadata_store
         .executor()
@@ -438,10 +361,8 @@ async fn push_referrers_fallback(
 
 /// Lock key serializing the fallback-index read-modify-write for one subject.
 ///
-/// Deliberately downstream-agnostic (same-subject merges to two different
-/// downstreams also serialize) because the critical section is two short HTTP
-/// calls and a per-downstream key would thread the downstream name through the
-/// pipeline for contention that never matters in practice.
+/// Deliberately downstream-agnostic: the critical section is two short HTTP
+/// calls, so cross-downstream contention never matters in practice.
 fn referrers_fallback_lock_key(namespace: &str, subject: &Digest) -> String {
     format!("replication-referrers:{namespace}:{subject}")
 }
@@ -456,15 +377,10 @@ async fn merge_referrers_fallback(
     parsed: &ParsedManifestDigests,
     body: &[u8],
 ) -> Result<(), Error> {
-    // GET the existing fallback index; a missing tag (404) starts fresh, a
-    // transient failure propagates so the job retries. Any pre-existing referrer
-    // descriptors are preserved so this push only adds.
     let mut manifests = fetch_fallback_manifests(downstream, location).await?;
 
-    // Descriptor for the referrer manifest just pushed. `body`'s digest is the
-    // `digest` already resolved on the push path (the blob store is
-    // content-addressed), so reuse it rather than re-hashing the body; its
-    // media/artifact type come from the single parse, not a re-parse of `body`.
+    // The blob store is content-addressed, so `digest` is already the body's
+    // digest; no re-hash or re-parse needed.
     let descriptor = referrer_descriptor(
         digest,
         body.len(),
@@ -472,8 +388,7 @@ async fn merge_referrers_fallback(
         parsed.artifact_type.as_deref(),
     );
 
-    // Dedup-merge by digest so a re-run is idempotent. Render the digest once
-    // rather than per scanned descriptor.
+    // Dedup by digest so a re-run is idempotent.
     let digest_str = digest.to_string();
     let already_present = manifests
         .iter()
@@ -493,9 +408,8 @@ async fn merge_referrers_fallback(
         )))
     })?;
 
-    // Timestamp-less PUT: with no `X-Angos-Source-Timestamp` the receiver skips
-    // LWW entirely, so the merged index can never come back `superseded` and
-    // silently drop a descriptor (the fallback tag is a set, not a register).
+    // Timestamp-less PUT: the receiver then skips LWW, so the merged index can
+    // never come back superseded and silently drop a descriptor.
     downstream
         .put_manifest(location, Some(OCI_INDEX_MEDIA_TYPE), index_body, None)
         .await
@@ -506,15 +420,9 @@ async fn merge_referrers_fallback(
 /// GETs the existing referrers fallback index at `location` and returns its
 /// `manifests[]` descriptors.
 ///
-/// A `404` (`ManifestUnknown`) means the fallback tag does not exist yet, so an
-/// empty list is returned and the caller starts fresh. Any other GET error (a
-/// transient `5xx`/timeout) is propagated so the caller retries instead of
-/// overwriting an existing index from an empty base and dropping every sibling
-/// referrer of the subject. A `200` whose body is not a parseable image index
-/// (unparseable JSON, or a missing/non-array `manifests`) is an error too, not an
-/// empty base: starting fresh would clobber the existing referrers, so a corrupt
-/// downstream index is surfaced (the job retries / dead-letters) rather than
-/// silently overwritten.
+/// Only a `404` yields an empty base; any other error, including a `200` body
+/// that is not a parseable image index, propagates so the caller never rebuilds
+/// the index from an empty base and drops the subject's sibling referrers.
 async fn fetch_fallback_manifests(
     downstream: &RegistryClient,
     location: &str,
@@ -538,11 +446,9 @@ async fn fetch_fallback_manifests(
         })
 }
 
-/// Builds an OCI descriptor for a referrer manifest to embed in the fallback
-/// index: `mediaType`, `digest`, `size`, and `artifactType`. `media_type` and
-/// `artifact_type` come from the referrer body's single `parse_manifest_digests`,
-/// so the descriptor is built without re-parsing the body; `media_type` defaults
-/// to the OCI image-manifest type when the body declared none.
+/// Builds the OCI descriptor for a referrer manifest to embed in the fallback
+/// index; `media_type` defaults to the OCI image-manifest type when the body
+/// declared none.
 fn referrer_descriptor(
     referrer_digest: &Digest,
     size: usize,
@@ -560,28 +466,17 @@ fn referrer_descriptor(
     descriptor
 }
 
-/// Deletes the manifest bound to `reference` on the downstream.
+/// Deletes the manifest bound to `reference` on the downstream, stamping
+/// `source_ts` so the receiver can apply last-writer-wins.
 ///
-/// `source_ts` is stamped as the `X-Angos-Source-Timestamp` header so the
-/// receiver can apply last-writer-wins.
-///
-/// 409 disambiguation: an LWW-loser 409 (the receiver's copy is strictly newer,
-/// surfaced by the client as [`DeleteManifestOutcome::Superseded`]) is treated
-/// as **success** (convergence, not failure). Any *other* downstream error
-/// (including an immutable-tag conflict 409) propagates as [`Error::Registry`]
-/// so the job retries/dead-letters.
-///
-/// On success returns [`PushOutcome::Pushed`] when the downstream applied the
-/// delete, [`PushOutcome::Converged`] when the target was already absent (a
-/// no-op `404`, mirroring the push path's HEAD-converged skip), or
-/// [`PushOutcome::Superseded`] when it lost a last-writer-wins comparison
-/// (all three are convergence; the caller records them as distinct metrics
-/// outcomes).
+/// Returns [`PushOutcome::Pushed`] for an applied delete,
+/// [`PushOutcome::Converged`] for an already-absent target, or
+/// [`PushOutcome::Superseded`] for an LWW loss; all three are convergence.
 ///
 /// # Errors
 ///
-/// Returns [`Error::Registry`] when the downstream HTTP delete fails with
-/// anything other than an LWW-superseded 409.
+/// Returns [`Error::Registry`] when the delete fails with anything other than
+/// an LWW-superseded 409.
 #[instrument(skip(downstream))]
 pub async fn delete_manifest(
     downstream: &RegistryClient,
@@ -688,8 +583,8 @@ mod tests {
         (blob_store, metadata_store, store)
     }
 
-    /// A wiremock responder that records the order in which the index vs. its
-    /// child manifest are PUT, so the test can assert the child lands first.
+    /// A wiremock responder recording the order in which the index vs. its
+    /// child manifest are PUT.
     struct OrderRecorder {
         seen: Arc<AtomicUsize>,
         child_at: Arc<AtomicUsize>,
@@ -718,7 +613,6 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let (blob_store, metadata_store, store) = test_blob_store(dir.path().to_str().unwrap());
 
-        // Subject digest the referrer manifest points at.
         let subject = put_blob_direct(&store, b"subject-bytes").await;
         let config = put_blob_direct(&store, br#"{"c":1}"#).await;
 
@@ -740,7 +634,6 @@ mod tests {
         let manifest_bytes = serde_json::to_vec(&manifest).unwrap();
         let manifest_digest = put_blob_direct(&store, &manifest_bytes).await;
 
-        // Config blob missing on downstream -> upload runs.
         Mock::given(method("HEAD"))
             .and(path(format!("/v2/{NAMESPACE}/blobs/{config}")))
             .respond_with(ResponseTemplate::new(404))
@@ -768,8 +661,8 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        // The primary manifest PUT by tag: NO `OCI-Subject` header => OCI-1.0
-        // downstream => fallback expected.
+        // No `OCI-Subject` response header => OCI-1.0 downstream => fallback
+        // expected.
         Mock::given(method("PUT"))
             .and(path(format!("/v2/{NAMESPACE}/manifests/v1")))
             .respond_with(
@@ -780,8 +673,7 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        // The referrers fallback tag: `<alg>-<hash>` of the subject digest. The
-        // pipeline GETs the existing index first (none yet -> 404 -> start fresh).
+        // The pipeline GETs the existing fallback index first (404 => start fresh).
         let fallback_tag = format!("{}-{}", subject.algorithm(), subject.hash());
         Mock::given(method("GET"))
             .and(path(format!("/v2/{NAMESPACE}/manifests/{fallback_tag}")))
@@ -789,9 +681,8 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        // ...then PUTs a MERGED image INDEX whose `manifests[]` enumerate the
-        // referrer descriptors. Capture + assert the body shape so a regression
-        // back to "PUT the referrer manifest body" cannot pass silently.
+        // Assert the PUT body is a merged image index so a regression back to
+        // "PUT the referrer manifest body" cannot pass silently.
         let referrer_digest = Digest::Sha256(sha256::hex(&manifest_bytes).into());
         Mock::given(method("PUT"))
             .and(path(format!("/v2/{NAMESPACE}/manifests/{fallback_tag}")))
@@ -830,18 +721,14 @@ mod tests {
         .await
         .unwrap();
 
-        // `.expect(1)` on the primary manifest PUT + the fallback index PUT (with
-        // the body assertion above) is verified on MockServer drop.
         drop(mock_server);
     }
 
     #[tokio::test]
     async fn referrers_fallback_put_is_timestamp_less() {
-        // The fallback tag is a merged SET, not an LWW register: a stamped
-        // fallback PUT could come back `409 REPLICATION_SUPERSEDED` and the
-        // just-merged descriptor would silently vanish while the job reports
-        // success. Pin that the primary PUT carries the source timestamp while
-        // the fallback-index PUT does NOT.
+        // The fallback tag is a merged set, not an LWW register: a stamped
+        // fallback PUT could come back superseded and silently drop the
+        // just-merged descriptor.
         metrics_provider::init_for_tests();
         let mock_server = MockServer::start().await;
         let dir = TempDir::new().unwrap();
@@ -861,7 +748,7 @@ mod tests {
         let manifest_bytes = serde_json::to_vec(&manifest).unwrap();
         let manifest_digest = put_blob_direct(&store, &manifest_bytes).await;
 
-        // Primary PUT: must carry the header; NO `OCI-Subject` => fallback runs.
+        // The primary PUT must carry the header; no `OCI-Subject` => fallback runs.
         Mock::given(method("PUT"))
             .and(path(format!("/v2/{NAMESPACE}/manifests/v1")))
             .and(header(X_ANGOS_SOURCE_TIMESTAMP, "2026-06-03T00:00:00Z"))
@@ -873,8 +760,7 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        // Fallback index: GET 404 (fresh), then a PUT that must NOT carry the
-        // source-timestamp header.
+        // The fallback-index PUT must not carry the source-timestamp header.
         let fallback_tag = format!("{}-{}", subject.algorithm(), subject.hash());
         Mock::given(method("GET"))
             .and(path(format!("/v2/{NAMESPACE}/manifests/{fallback_tag}")))
@@ -916,10 +802,8 @@ mod tests {
 
     #[tokio::test]
     async fn referrers_fallback_propagates_transient_get_error_without_clobbering() {
-        // A transient (non-404) failure GETting the existing fallback index must
-        // NOT be treated as "tag absent -> start fresh": that would PUT an index
-        // built from an empty base and drop the subject's sibling referrers. The
-        // push must surface the error so the durable job retries.
+        // Treating a transient GET failure as "tag absent" would PUT an index
+        // built from an empty base and drop the subject's sibling referrers.
         metrics_provider::init_for_tests();
         let mock_server = MockServer::start().await;
         let dir = TempDir::new().unwrap();
@@ -945,7 +829,6 @@ mod tests {
         let manifest_bytes = serde_json::to_vec(&manifest).unwrap();
         let manifest_digest = put_blob_direct(&store, &manifest_bytes).await;
 
-        // Config blob missing on downstream -> upload runs.
         Mock::given(method("HEAD"))
             .and(path(format!("/v2/{NAMESPACE}/blobs/{config}")))
             .respond_with(ResponseTemplate::new(404))
@@ -973,7 +856,7 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        // Primary manifest PUT with NO `OCI-Subject` => OCI-1.0 => fallback runs.
+        // No `OCI-Subject` response => OCI-1.0 => fallback runs.
         Mock::given(method("PUT"))
             .and(path(format!("/v2/{NAMESPACE}/manifests/v1")))
             .respond_with(
@@ -983,8 +866,7 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        // The fallback index GET fails transiently (500): the merge-PUT must NOT
-        // be attempted and the push must surface the error.
+        // The fallback index GET fails with 500; the merge PUT must not run.
         let fallback_tag = format!("{}-{}", subject.algorithm(), subject.hash());
         Mock::given(method("GET"))
             .and(path(format!("/v2/{NAMESPACE}/manifests/{fallback_tag}")))
@@ -1017,25 +899,20 @@ mod tests {
             "a transient fallback-index GET error must fail the push so the job retries, got: {result:?}"
         );
 
-        // `.expect(0)` on the fallback PUT (no clobbering write) is verified on drop.
         drop(mock_server);
     }
 
     #[tokio::test]
     async fn referrers_fallback_errors_on_unparseable_index_without_clobbering() {
-        // A 200 whose body is not a usable image index (here: valid JSON with no
-        // `manifests` array) must NOT be treated as an empty base: rebuilding the
-        // index from empty and PUTting it would drop the subject's existing sibling
-        // referrers. The push must surface the error so the durable job retries /
-        // dead-letters rather than silently overwriting a corrupt downstream index.
+        // Treating an unusable 200 body as an empty base would rebuild the index
+        // from empty and drop the subject's existing sibling referrers.
         metrics_provider::init_for_tests();
         let mock_server = MockServer::start().await;
         let dir = TempDir::new().unwrap();
         let (blob_store, metadata_store, store) = test_blob_store(dir.path().to_str().unwrap());
 
         let subject = put_blob_direct(&store, b"subject-bytes").await;
-        // Config-less subject manifest: only the primary manifest and the fallback
-        // are pushed (no blob upload to mock).
+        // Config-less manifest, so no blob upload mocks are needed.
         let manifest = json!({
             "schemaVersion": 2,
             "mediaType": "application/vnd.oci.image.manifest.v1+json",
@@ -1049,7 +926,7 @@ mod tests {
         let manifest_bytes = serde_json::to_vec(&manifest).unwrap();
         let manifest_digest = put_blob_direct(&store, &manifest_bytes).await;
 
-        // Primary manifest PUT with NO `OCI-Subject` => OCI-1.0 => fallback runs.
+        // No `OCI-Subject` response => OCI-1.0 => fallback runs.
         Mock::given(method("PUT"))
             .and(path(format!("/v2/{NAMESPACE}/manifests/v1")))
             .respond_with(
@@ -1059,9 +936,8 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        // The fallback index GET returns a 200 (with a valid Docker-Content-Digest,
-        // so the client accepts the response) whose body parses as JSON but has no
-        // `manifests` array (a corrupt/unexpected index). The merge-PUT must NOT run.
+        // The fallback GET returns a 200 whose JSON body has no `manifests`
+        // array; the merge PUT must not run.
         let fallback_tag = format!("{}-{}", subject.algorithm(), subject.hash());
         Mock::given(method("GET"))
             .and(path(format!("/v2/{NAMESPACE}/manifests/{fallback_tag}")))
@@ -1101,18 +977,14 @@ mod tests {
             "a malformed fallback index must fail the push so it is not overwritten, got: {result:?}"
         );
 
-        // `.expect(0)` on the fallback PUT (no clobbering write) is verified on drop.
         drop(mock_server);
     }
 
     #[tokio::test]
     #[allow(clippy::too_many_lines)]
     async fn concurrent_same_subject_referrers_merge_without_lost_update() {
-        // Two referrers of the same subject are distinct jobs with distinct job
-        // `lock_key`s, so the queue runs them concurrently, and both
-        // GET→merge→PUT the same fallback tag. The store lock inside
-        // `push_referrers_fallback` serializes the merges; without it both reads
-        // see the same base index and one descriptor vanishes from the final PUT.
+        // Without the store lock both concurrent merges read the same base
+        // index and one descriptor vanishes from the final PUT.
         metrics_provider::init_for_tests();
         let mock_server = MockServer::start().await;
         let dir = TempDir::new().unwrap();
@@ -1137,7 +1009,7 @@ mod tests {
         let digest_a = put_blob_direct(&store, &bytes_a).await;
         let digest_b = put_blob_direct(&store, &bytes_b).await;
 
-        // Primary manifest PUTs: NO `OCI-Subject` => OCI-1.0 => fallback runs.
+        // No `OCI-Subject` response => OCI-1.0 => the fallback runs.
         for (tag, digest) in [("v1", &digest_a), ("v2", &digest_b)] {
             Mock::given(method("PUT"))
                 .and(path(format!("/v2/{NAMESPACE}/manifests/{tag}")))
@@ -1150,9 +1022,8 @@ mod tests {
                 .await;
         }
 
-        // A stateful fallback tag endpoint: GET serves whatever the last PUT
-        // stored (404 before the first), like a real registry, so the second
-        // merge only sees the first descriptor if the merges serialized.
+        // A stateful fallback endpoint: GET serves what the last PUT stored, so
+        // the second merge sees the first descriptor only if the merges serialized.
         let fallback_tag = format!("{}-{}", subject.algorithm(), subject.hash());
         let stored: Arc<Mutex<Vec<serde_json::Value>>> = Arc::new(Mutex::new(Vec::new()));
         let get_stored = stored.clone();
@@ -1255,7 +1126,7 @@ mod tests {
         let manifest_bytes = serde_json::to_vec(&manifest).unwrap();
         let manifest_digest = put_blob_direct(&store, &manifest_bytes).await;
 
-        // PUT echoes back `OCI-Subject` => OCI-1.1 downstream => NO fallback.
+        // PUT echoes back `OCI-Subject` => OCI-1.1 downstream => no fallback.
         Mock::given(method("PUT"))
             .and(path(format!("/v2/{NAMESPACE}/manifests/v1")))
             .respond_with(
@@ -1293,7 +1164,6 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let (blob_store, metadata_store, store) = test_blob_store(dir.path().to_str().unwrap());
 
-        // Child image manifest (no blobs, to keep the test focused on ordering).
         let child = json!({
             "schemaVersion": 2,
             "mediaType": "application/vnd.oci.image.manifest.v1+json",
@@ -1302,7 +1172,6 @@ mod tests {
         let child_bytes = serde_json::to_vec(&child).unwrap();
         let child_digest = put_blob_direct(&store, &child_bytes).await;
 
-        // Index referencing the child.
         let index = json!({
             "schemaVersion": 2,
             "mediaType": "application/vnd.oci.image.index.v1+json",
@@ -1319,7 +1188,7 @@ mod tests {
         let child_at = Arc::new(AtomicUsize::new(usize::MAX));
         let index_at = Arc::new(AtomicUsize::new(usize::MAX));
 
-        // Child manifest pushed by digest (no tag on recursion).
+        // The recursion pushes the child by digest, not by tag.
         Mock::given(method("PUT"))
             .and(path(format!("/v2/{NAMESPACE}/manifests/{child_digest}")))
             .respond_with(OrderRecorder {
@@ -1332,7 +1201,6 @@ mod tests {
             .expect(1)
             .mount(&mock_server)
             .await;
-        // Index pushed by tag.
         Mock::given(method("PUT"))
             .and(path(format!("/v2/{NAMESPACE}/manifests/v1")))
             .respond_with(OrderRecorder {
@@ -1371,8 +1239,7 @@ mod tests {
     #[tokio::test]
     #[allow(clippy::too_many_lines)]
     async fn push_blob_mounts_cross_repo_when_sibling_namespace_holds_it() {
-        // A SIBLING namespace that already references both blobs locally; the
-        // pipeline offers it as the mount `from`.
+        // A sibling namespace already referencing the blobs becomes the mount `from`.
         const SIBLING: &str = "other/repo";
 
         metrics_provider::init_for_tests();
@@ -1380,7 +1247,6 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let (blob_store, metadata_store, store) = test_blob_store(dir.path().to_str().unwrap());
 
-        // A config + layer blob referenced by a single image manifest.
         let config = put_blob_direct(&store, br#"{"c":1}"#).await;
         let layer = put_blob_direct(&store, b"layer-bytes").await;
         let manifest = json!({
@@ -1400,7 +1266,7 @@ mod tests {
         let manifest_bytes = serde_json::to_vec(&manifest).unwrap();
         let manifest_digest = put_blob_direct(&store, &manifest_bytes).await;
 
-        // Record the sibling's ownership of both blobs so a mount `from` exists.
+        // Record the sibling's ownership so a mount `from` exists.
         for blob in [&config, &layer] {
             metadata_store
                 .update_blob_index(
@@ -1412,7 +1278,7 @@ mod tests {
                 .unwrap();
         }
 
-        // Both blobs missing in the TARGET namespace -> HEAD 404 -> mount attempt.
+        // Both blobs missing in the target namespace => mount attempt.
         for blob in [&config, &layer] {
             Mock::given(method("HEAD"))
                 .and(path(format!("/v2/{NAMESPACE}/blobs/{blob}")))
@@ -1420,9 +1286,8 @@ mod tests {
                 .mount(&mock_server)
                 .await;
         }
-        // The mount POST carries `from=<sibling>` and is granted (201). NO
-        // PATCH/PUT upload is mounted, so a fall-back transfer would 404 and fail
-        // the push, proving the bytes were never streamed.
+        // No PATCH/PUT upload mock is mounted, so a fall-back transfer would 404
+        // and fail the push, proving the bytes were never streamed.
         Mock::given(method("POST"))
             .and(path(format!("/v2/{NAMESPACE}/blobs/uploads/")))
             .and(query_param("from", SIBLING))
@@ -1433,7 +1298,6 @@ mod tests {
             .expect(2)
             .mount(&mock_server)
             .await;
-        // The manifest itself still lands.
         Mock::given(method("PUT"))
             .and(path(format!("/v2/{NAMESPACE}/manifests/v1")))
             .respond_with(
@@ -1459,16 +1323,11 @@ mod tests {
         .await
         .expect("both blobs must mount cross-repo and the manifest must push");
 
-        // `.expect(2)` on the mount POST plus the absence of any PATCH/PUT upload
-        // mock proves both blobs were mounted with no body transfer.
         drop(mock_server);
     }
 
     #[tokio::test]
     async fn push_blob_falls_back_to_upload_when_mount_is_rejected() {
-        // A sibling references the blob, so a mount is attempted, but the
-        // downstream rejects it (its `mount-blob` policy denies it). The pipeline
-        // must fall back to a normal upload rather than failing the push.
         const SIBLING: &str = "other/repo";
 
         metrics_provider::init_for_tests();
@@ -1499,15 +1358,14 @@ mod tests {
             .await
             .unwrap();
 
-        // Blob missing in the target -> HEAD 404 -> mount attempt.
+        // Blob missing in the target => mount attempt.
         Mock::given(method("HEAD"))
             .and(path(format!("/v2/{NAMESPACE}/blobs/{config}")))
             .respond_with(ResponseTemplate::new(404))
             .mount(&mock_server)
             .await;
-        // The upload POST: reject the mount (it carries `from`) with 403; open a
-        // normal session for the plain (no-`from`) fall-back POST. `.expect(2)`
-        // asserts both the mount attempt and the fall-back happen.
+        // Reject the mount POST (it carries `from`) with 403 and open a session
+        // for the plain fall-back POST; `.expect(2)` asserts both happen.
         let session = format!("/v2/{NAMESPACE}/blobs/uploads/s");
         Mock::given(method("POST"))
             .and(path(format!("/v2/{NAMESPACE}/blobs/uploads/")))
@@ -1521,7 +1379,6 @@ mod tests {
             .expect(2)
             .mount(&mock_server)
             .await;
-        // The fall-back upload streams the bytes.
         Mock::given(method("PATCH"))
             .and(path(format!("/v2/{NAMESPACE}/blobs/uploads/s")))
             .respond_with(
@@ -1562,13 +1419,11 @@ mod tests {
         .await
         .expect("a rejected mount must fall back to a normal upload");
 
-        // The `.expect(1)` PATCH + PUT prove the bytes were uploaded after the
-        // mount was rejected.
         drop(mock_server);
     }
 
-    /// Seeds a minimal blob-less image manifest and stores it locally, returning
-    /// its digest and serialized body (used by the header/409 tests below).
+    /// Seeds a minimal blob-less image manifest locally, returning its digest
+    /// and serialized body.
     async fn seed_blobless_manifest(store: &Arc<Store>) -> (Digest, Vec<u8>) {
         let manifest = json!({
             "schemaVersion": 2,
@@ -1593,7 +1448,6 @@ mod tests {
         let (blob_store, metadata_store, store) = test_blob_store(dir.path().to_str().unwrap());
         let (manifest_digest, manifest_bytes) = seed_blobless_manifest(&store).await;
 
-        // The PUT must carry the source-timestamp header with the expected value.
         Mock::given(method("PUT"))
             .and(path(format!("/v2/{NAMESPACE}/manifests/v1")))
             .and(header(X_ANGOS_SOURCE_TIMESTAMP, "2026-06-03T00:00:00Z"))
@@ -1620,18 +1474,13 @@ mod tests {
         .await
         .unwrap();
 
-        // `.expect(1)` (verified on drop) only matches when the header is present
-        // with the expected value; a missing/wrong header => no match => the PUT
-        // would 404 and the push would error.
         drop(mock_server);
     }
 
     #[tokio::test]
     async fn push_manifest_skips_put_when_downstream_already_converged() {
-        // HEAD-before-PUT optimization: when the downstream already resolves the
-        // target tag to THIS digest, the manifest PUT is skipped. Mount ONLY a
-        // HEAD returning the matching digest; deliberately mount NO manifest PUT
-        // mock, so a wrongly-issued PUT would 404 and fail the push.
+        // No manifest PUT mock is mounted, so a wrongly-issued PUT would 404 and
+        // fail the push.
         metrics_provider::init_for_tests();
         let mock_server = MockServer::start().await;
         let dir = TempDir::new().unwrap();
@@ -1669,17 +1518,13 @@ mod tests {
             "a HEAD-matched skip must report Converged, not Pushed, so the metric distinguishes a no-op"
         );
 
-        // No PUT mock exists; `.expect(1)` on the HEAD (verified on drop) proves
-        // the probe ran and the absence of an error proves no PUT was attempted.
         drop(mock_server);
     }
 
     #[tokio::test]
     async fn repeated_layer_digest_uploads_the_blob_once() {
-        // A manifest may legally list the same layer digest twice. Without
-        // dedup, both entries HEAD-miss concurrently and both run the full
-        // upload of the same blob. Every upload mock is pinned to `.expect(1)`,
-        // so a second concurrent upload fails the test on drop.
+        // Without dedup both entries HEAD-miss concurrently and both upload;
+        // every mock is pinned to `.expect(1)`.
         metrics_provider::init_for_tests();
         let mock_server = MockServer::start().await;
         let dir = TempDir::new().unwrap();
@@ -1697,7 +1542,6 @@ mod tests {
         let manifest_bytes = serde_json::to_vec(&manifest).unwrap();
         let manifest_digest = put_blob_direct(&store, &manifest_bytes).await;
 
-        // Blob absent on the downstream: exactly ONE probe and ONE upload.
         Mock::given(method("HEAD"))
             .and(path(format!("/v2/{NAMESPACE}/blobs/{layer}")))
             .respond_with(ResponseTemplate::new(404))
@@ -1753,20 +1597,14 @@ mod tests {
         .await
         .expect("a manifest repeating a layer digest must push it once");
 
-        // The `.expect(1)` mocks (verified on MockServer drop) prove the
-        // duplicate entry triggered no second probe or upload.
         drop(mock_server);
     }
 
     #[tokio::test]
     async fn converged_skip_head_sends_standard_accept_headers() {
-        // The converged-skip HEAD must advertise the standard OCI + Docker
-        // manifest media types: without an `Accept` header a content-negotiating
-        // downstream may return a CONVERTED representation whose digest never
-        // matches the local one, so the skip never fires and every push
-        // re-transfers a converged manifest. The HEAD responder asserts all four
-        // values arrived (the scrub reconcile HEAD and the referrers-fallback
-        // GET stamp the same `manifest_accept_types()` set).
+        // Without an `Accept` header a content-negotiating downstream may return
+        // a converted representation whose digest never matches the local one,
+        // so the converged skip would never fire.
         metrics_provider::init_for_tests();
         let mock_server = MockServer::start().await;
         let dir = TempDir::new().unwrap();
@@ -1823,21 +1661,16 @@ mod tests {
 
     #[tokio::test]
     async fn converged_subject_manifest_still_pushes_referrers_fallback() {
-        // A subject-bearing manifest the downstream ALREADY holds must NOT take
-        // the converged HEAD-skip. The original push's primary PUT can land while
-        // its referrers-fallback PUT fails transiently; a blanket converged-skip
-        // on the next attempt would then never retry the fallback, stranding the
-        // referrer while the job reports success. So the primary is re-PUT
-        // (idempotent) and, on an OCI-1.0 downstream (no `OCI-Subject` on the PUT
-        // response), the referrers fallback is re-pushed.
+        // A prior attempt's primary PUT can land while its fallback PUT fails;
+        // a blanket converged-skip would then never retry the fallback,
+        // stranding the referrer.
         metrics_provider::init_for_tests();
         let mock_server = MockServer::start().await;
         let dir = TempDir::new().unwrap();
         let (blob_store, metadata_store, store) = test_blob_store(dir.path().to_str().unwrap());
 
         let subject = put_blob_direct(&store, b"subject-bytes").await;
-        // Config-less subject manifest, so the push has no referenced blob to
-        // probe; only the primary manifest and the referrers fallback are pushed.
+        // Config-less manifest, so no blob mocks are needed.
         let manifest = json!({
             "schemaVersion": 2,
             "mediaType": "application/vnd.oci.image.manifest.v1+json",
@@ -1851,10 +1684,8 @@ mod tests {
         let manifest_bytes = serde_json::to_vec(&manifest).unwrap();
         let manifest_digest = put_blob_direct(&store, &manifest_bytes).await;
 
-        // The downstream already resolves the tag to THIS digest (the converged
-        // state a prior attempt's primary PUT left behind). A subject-bearing
-        // manifest bypasses the HEAD-skip, so the HEAD is never consulted; mounting
-        // it (no `.expect()`) documents the converged state without requiring it.
+        // The HEAD reports the converged state, but a subject-bearing manifest
+        // bypasses the skip, so this mock carries no `.expect()`.
         Mock::given(method("HEAD"))
             .and(path(format!("/v2/{NAMESPACE}/manifests/v1")))
             .respond_with(
@@ -1865,8 +1696,7 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        // The primary PUT is re-issued (idempotent) and returns NO `OCI-Subject`,
-        // i.e. an OCI-1.0 downstream that does not auto-index the subject.
+        // The re-issued primary PUT returns no `OCI-Subject` (OCI-1.0 downstream).
         Mock::given(method("PUT"))
             .and(path(format!("/v2/{NAMESPACE}/manifests/v1")))
             .respond_with(
@@ -1877,8 +1707,6 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        // The referrers fallback index is fetched (absent -> 404 -> start fresh)
-        // and PUT, proving the fallback is not stranded by the converged primary.
         let fallback_tag = format!("{}-{}", subject.algorithm(), subject.hash());
         Mock::given(method("GET"))
             .and(path(format!("/v2/{NAMESPACE}/manifests/{fallback_tag}")))
@@ -1907,15 +1735,12 @@ mod tests {
         .await
         .expect("a converged subject-bearing manifest must re-push the referrers fallback");
 
-        // `.expect(1)` on both the primary PUT and the fallback PUT (verified on
-        // drop) proves the converged HEAD-skip was bypassed and the fallback ran.
         drop(mock_server);
     }
 
     #[tokio::test]
     async fn push_manifest_puts_when_downstream_holds_a_different_digest() {
-        // HEAD returns a DIFFERENT digest (tag moved / divergence): the PUT must
-        // still run so LWW on the receiver can arbitrate.
+        // The PUT must still run so receiver-side LWW can arbitrate the divergence.
         metrics_provider::init_for_tests();
         let mock_server = MockServer::start().await;
         let dir = TempDir::new().unwrap();
@@ -1958,16 +1783,13 @@ mod tests {
         .await
         .expect("a divergent downstream digest must still PUT");
 
-        // `.expect(1)` on the PUT (verified on drop) proves the PUT ran.
         drop(mock_server);
     }
 
     #[tokio::test]
     async fn push_manifest_puts_when_downstream_head_returns_404() {
-        // HEAD-before-PUT must fail OPEN: when the target reference does not exist
-        // downstream (HEAD 404, the common first-replication case), `is_ok_and`
-        // is false, so the manifest PUT still runs. Mount NO HEAD mock, so wiremock
-        // answers HEAD with a default 404; mount the PUT with `.expect(1)`.
+        // The probe must fail open: no HEAD mock is mounted, so wiremock answers
+        // 404 and the PUT must still run.
         metrics_provider::init_for_tests();
         let mock_server = MockServer::start().await;
         let dir = TempDir::new().unwrap();
@@ -1999,30 +1821,25 @@ mod tests {
         .await
         .expect("a 404 HEAD must fall through to the PUT");
 
-        // `.expect(1)` on the PUT (verified on drop) proves the probe failed open
-        // and the PUT ran.
         drop(mock_server);
     }
 
     #[tokio::test]
     async fn push_manifest_recovers_content_type_from_the_link_for_a_typeless_body() {
-        // Production always passes `None` as the media_type override (the handler
-        // reads only the blob body), and a manifest body may legitimately omit a
-        // top-level `mediaType`. Without recovering the type from the local
-        // revision link, the PUT would carry NO `Content-Type` and the receiver
-        // rejects it 400. Assert the PUT instead carries the link's stored type.
+        // Production passes `None` as the override and a body may omit
+        // `mediaType`; without the link recovery the PUT would carry no
+        // `Content-Type` and the receiver rejects it 400.
         metrics_provider::init_for_tests();
         let mock_server = MockServer::start().await;
         let dir = TempDir::new().unwrap();
         let (blob_store, metadata_store, store) = test_blob_store(dir.path().to_str().unwrap());
 
-        // A body with NO top-level `mediaType`, so the parse surfaces `None`.
         let manifest = json!({ "schemaVersion": 2, "layers": [] });
         let manifest_bytes = serde_json::to_vec(&manifest).unwrap();
         let manifest_digest = put_blob_direct(&store, &manifest_bytes).await;
 
-        // Seed the revision link with the type the original push carried in its
-        // `Content-Type` header (what `store_manifest` records on the link).
+        // Seed the revision link with the type `store_manifest` records from
+        // the original push's `Content-Type`.
         let media_type = "application/vnd.oci.image.manifest.v1+json";
         metadata_store
             .update_links(
@@ -2036,9 +1853,6 @@ mod tests {
             .await
             .unwrap();
 
-        // The PUT must carry the recovered Content-Type; without the link
-        // recovery the header is absent, this matcher never fires, and the
-        // `.expect(1)` fails on drop.
         Mock::given(method("PUT"))
             .and(path(format!("/v2/{NAMESPACE}/manifests/v1")))
             .and(header("Content-Type", media_type))
@@ -2070,18 +1884,13 @@ mod tests {
 
     #[tokio::test]
     async fn push_index_recovers_typeless_child_content_type_from_link() {
-        // The child-recursion counterpart of the test above: a CHILD manifest of
-        // an index may itself omit a top-level `mediaType`. The child is pushed
-        // by digest (before the parent index), with the production `None`
-        // override, so its PUT must carry the Content-Type recovered from the
-        // child's revision link. Otherwise the receiver 400s and the index
-        // never lands.
+        // Child-recursion counterpart of the test above: a typeless child pushed
+        // by digest must recover its Content-Type from its own revision link.
         metrics_provider::init_for_tests();
         let mock_server = MockServer::start().await;
         let dir = TempDir::new().unwrap();
         let (blob_store, metadata_store, store) = test_blob_store(dir.path().to_str().unwrap());
 
-        // A typeless child manifest referenced by a (typed) image index.
         let child = json!({ "schemaVersion": 2, "layers": [] });
         let child_bytes = serde_json::to_vec(&child).unwrap();
         let child_digest = put_blob_direct(&store, &child_bytes).await;
@@ -2097,7 +1906,7 @@ mod tests {
         let index_bytes = serde_json::to_vec(&index).unwrap();
         let index_digest = put_blob_direct(&store, &index_bytes).await;
 
-        // Seed ONLY the child's revision link with its stored media type.
+        // Seed only the child's revision link with its stored media type.
         metadata_store
             .update_links(
                 NAMESPACE,
@@ -2110,7 +1919,6 @@ mod tests {
             .await
             .unwrap();
 
-        // The child PUT (by digest) must carry the recovered Content-Type.
         Mock::given(method("PUT"))
             .and(path(format!("/v2/{NAMESPACE}/manifests/{child_digest}")))
             .and(header("Content-Type", OCI_MANIFEST_MEDIA_TYPE))
@@ -2121,7 +1929,6 @@ mod tests {
             .expect(1)
             .mount(&mock_server)
             .await;
-        // The parent index PUT (by tag) carries the index body's own mediaType.
         Mock::given(method("PUT"))
             .and(path(format!("/v2/{NAMESPACE}/manifests/v1")))
             .and(header("Content-Type", OCI_INDEX_MEDIA_TYPE))
@@ -2159,8 +1966,6 @@ mod tests {
         let (blob_store, metadata_store, store) = test_blob_store(dir.path().to_str().unwrap());
         let (manifest_digest, manifest_bytes) = seed_blobless_manifest(&store).await;
 
-        // Downstream rejects with a 409 whose OCI code is the superseded code:
-        // the receiver already holds a strictly-newer copy => convergence.
         Mock::given(method("PUT"))
             .and(path(format!("/v2/{NAMESPACE}/manifests/v1")))
             .respond_with(
@@ -2171,8 +1976,6 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        // The pipeline must treat this as Ok (the handler would `complete` the
-        // job rather than retry).
         push_manifest(
             &downstream_client(&mock_server.uri()),
             &blob_store,
@@ -2199,9 +2002,7 @@ mod tests {
         let (blob_store, metadata_store, store) = test_blob_store(dir.path().to_str().unwrap());
         let (manifest_digest, manifest_bytes) = seed_blobless_manifest(&store).await;
 
-        // Downstream rejects with a 409 carrying the immutable-tag `CONFLICT`
-        // code: operator misconfiguration, NOT an LWW loss => must surface so the
-        // job retries/dead-letters.
+        // A 409 with the immutable-tag `CONFLICT` code is not an LWW loss.
         Mock::given(method("PUT"))
             .and(path(format!("/v2/{NAMESPACE}/manifests/v1")))
             .respond_with(ResponseTemplate::new(409).set_body_json(oci_error_body("CONFLICT")))
@@ -2235,8 +2036,6 @@ mod tests {
         metrics_provider::init_for_tests();
         let mock_server = MockServer::start().await;
 
-        // A delete carrying the source-timestamp header; respond with an
-        // LWW-superseded 409 => the pipeline treats it as success.
         Mock::given(method("DELETE"))
             .and(path(format!("/v2/{NAMESPACE}/manifests/v1")))
             .and(header(X_ANGOS_SOURCE_TIMESTAMP, "2026-06-03T00:00:00Z"))
@@ -2262,10 +2061,6 @@ mod tests {
 
     #[tokio::test]
     async fn delete_manifest_of_absent_target_is_converged_not_pushed() {
-        // A 404 delete (the target is already gone) is a no-op, mirroring the
-        // push path's HEAD-converged skip: it must record
-        // `outcome="converged"`, not `pushed`, so the metric distinguishes an
-        // applied delete from a converged retry/bounce.
         metrics_provider::init_for_tests();
         let mock_server = MockServer::start().await;
 

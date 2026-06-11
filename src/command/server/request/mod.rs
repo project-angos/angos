@@ -114,18 +114,11 @@ impl<'a> RequestHeaders<'a> {
         Ok(Some(content_type.to_string()))
     }
 
-    /// Reads the `X-Angos-Source-Timestamp` header and parses it as an RFC 3339
-    /// instant for receiver-side last-writer-wins.
-    ///
-    /// Returns `None` for a missing, empty, or unparseable value. A malformed
-    /// timestamp must never fail the request: it simply disables LWW for this
-    /// write (the change is applied as a normal client write).
-    ///
-    /// A future-dated value is clamped to the present. The header is
-    /// client-settable on any authorized write, and an unclamped future timestamp
-    /// would let a pusher pin a last-writer-wins win and durably postdate the
-    /// tag's stored `created_at`. A legitimate replication source stamps the
-    /// author's past write time, so the clamp is a no-op for it.
+    /// Reads `X-Angos-Source-Timestamp` as an RFC 3339 instant for
+    /// receiver-side last-writer-wins; a missing or malformed value yields
+    /// `None`, disabling LWW rather than failing the request. A future-dated
+    /// value is clamped to now so this client-settable header cannot pin a LWW
+    /// win or postdate the stored `created_at`.
     pub fn source_timestamp(&self) -> Option<DateTime<Utc>> {
         let value = self
             .headers

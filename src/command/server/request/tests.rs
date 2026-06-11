@@ -727,9 +727,6 @@ fn test_source_timestamp_garbage_is_none() {
 
 #[test]
 fn test_source_timestamp_future_is_clamped_to_now() {
-    // The header is client-settable; a future-dated value is clamped to the
-    // present so an authorized pusher cannot pin a last-writer-wins win or durably
-    // postdate the stored `created_at`.
     let request = Request::builder()
         .header(X_ANGOS_SOURCE_TIMESTAMP, "3000-01-01T00:00:00Z")
         .body(())

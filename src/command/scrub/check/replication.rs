@@ -1,38 +1,7 @@
-//! [`ReplicationChecker`]: the scrub reconciliation pass.
-//!
-//! For every namespace and every configured downstream, the checker:
-//!
-//! - iterates the LOCAL tag set and probes each tag on the downstream with
-//!   `RegistryClient::head_manifest`, emitting an
-//!   [`Action::EnqueueReplicationPush`] for every tag that diverges from or is
-//!   missing on the downstream (this is the default, additive behavior); and
-//! - **only when the downstream is marked `prune = true`** (an authoritative
-//!   one-way mirror), enumerates the DOWNSTREAM tag set with
-//!   `RegistryClient::list_tags` and emits an
-//!   [`Action::EnqueueReplicationDelete`] for every downstream tag absent
-//!   locally. Pruning is off by default: for an active-active peer, deleting a
-//!   tag merely because it is absent locally would destroy a peer's
-//!   legitimately-newer tag that has not yet replicated back.
-//!
-//! It does NOT push/delete inline: the `Executor` lands each action on the
-//! durable replication queue, so reconcile-discovered divergences get the same
-//! retry/backoff/dead-letter/coalescing as the event path, and the mutation
-//! applier stays free of network fan-out.
-//!
-//! Deletion is `prune`-gated and off by default: a downstream-only tag is removed
-//! only when the downstream is marked `prune = true`. When pruning is enabled and
-//! the downstream `list_tags` enumeration fails, the cleanup step is skipped for
-//! that downstream (a warning is logged) rather than aborting the run.
-//!
-//! `prune` is ONE-WAY-MIRROR-ONLY. The prune-delete action carries a `source_ts`
-//! stamped at the moment reconcile decides to delete, so the receiver runs
-//! last-writer-wins instead of deleting unconditionally; this guards against a
-//! downstream tag dated in the future relative to the decision (clock skew, or a
-//! tag pushed in the gap between the listing and the delete landing). It does NOT
-//! make prune safe for active-active: a peer's legitimately-newer tag whose
-//! `created_at` predates this reconcile run still has `created_at < source_ts`
-//! and IS deleted. Enable `prune = true` only for a downstream that is an
-//! authoritative one-way mirror.
+//! [`ReplicationChecker`]: the scrub reconciliation pass, emitting queue-enqueue
+//! actions rather than pushing inline so reconcile-discovered divergences get the
+//! same retry/backoff/coalescing as the event path. Prune is off by default and
+//! one-way-mirror-only: absence-driven deletion is unsafe for active-active peers.
 
 use std::{collections::HashSet, sync::Arc};
 
@@ -57,14 +26,9 @@ use crate::{
     replication::{ReplicationDownstream, manifest_accept_types},
 };
 
-/// Reconciles every replicated namespace with all its downstreams by enqueuing a
-/// replication push for each diverging or downstream-missing tag. For a downstream
-/// marked `prune = true` (an authoritative one-way mirror), it additionally
-/// enqueues a replication delete for each downstream-only tag; pruning is off by
-/// default.
-///
-/// Holds only resolved `Arc` dependencies, no `*Config` field. Constructed
-/// exclusively via [`ReplicationChecker::builder`].
+/// Enqueues a replication push for each diverging or downstream-missing tag, and
+/// for a `prune = true` downstream (one-way mirror) a replication delete for each
+/// downstream-only tag.
 pub struct ReplicationChecker {
     metadata_store: Arc<MetadataStore>,
     resolver: Arc<RepositoryResolver>,
@@ -77,10 +41,7 @@ impl ReplicationChecker {
         ReplicationCheckerBuilder::default()
     }
 
-    /// Whether this downstream participates in the current reconcile run.
-    ///
-    /// A downstream is included when its mode participates in reconciliation and
-    /// its namespace filter matches `namespace`.
+    /// Whether this downstream participates in the reconcile run for `namespace`.
     fn downstream_included(downstream: &ReplicationDownstream, namespace: &str) -> bool {
         downstream.mode.participates_in_reconcile() && downstream.matches_namespace(namespace)
     }
@@ -100,10 +61,9 @@ impl ReplicationChecker {
         }
     }
 
-    /// Reconciles one downstream against the local tag set: emits an
-    /// `EnqueueReplicationPush` for every diverging or downstream-missing tag, and,
-    /// only when the downstream is marked `prune = true`, an
-    /// `EnqueueReplicationDelete` for every downstream-only tag.
+    /// Reconciles one downstream: a push for every diverging or downstream-missing
+    /// tag, and for a `prune = true` downstream a delete for every downstream-only
+    /// tag.
     async fn reconcile_downstream(
         &self,
         downstream: &ReplicationDownstream,
@@ -111,26 +71,17 @@ impl ReplicationChecker {
         local_tags: &[(String, Option<Digest>)],
         sink: &mut (dyn ActionSink + Send),
     ) {
-        // 1. Push: iterate the LOCAL tag set (digests pre-resolved by `check`,
-        //    once for all downstreams) and probe each tag on the downstream with
-        //    `head_manifest`; a diverging or missing tag needs a push. A tag
-        //    whose local read failed (`None`) is skipped here but still counts
-        //    as local for the prune step below.
+        // Push step: a tag whose local read failed (`None`) is skipped here but
+        // still counts as local for the prune step below.
         let mut skipped: usize = 0;
         for (tag, local) in local_tags {
             let Some(local) = local else {
                 continue;
             };
 
-            // Downstream digest for this tag via OCI HEAD (Docker-Content-Digest).
-            // A genuinely-absent tag (404) needs a push; any other HEAD failure
-            // (auth rejection, 5xx, timeout) is NOT absence, so skip the tag this
-            // pass rather than enqueuing a spurious push. The next reconcile
-            // re-checks it. Skips are counted: each records a
-            // `replication_reconcile_total{outcome="skipped"}` and the loop warns
-            // once per downstream below, so a persistent failure (e.g. bad
-            // credentials, which reconcile NOTHING run after run) is visible
-            // instead of a silent debug-level no-op.
+            // Only a 404 means absence; any other HEAD failure skips the tag this
+            // pass rather than enqueuing a spurious push. Skips are counted so a
+            // persistently failing downstream stays visible.
             let location = downstream.registry_client.get_manifest_path(
                 NO_LOCAL_PREFIX,
                 namespace,
@@ -171,9 +122,8 @@ impl ReplicationChecker {
                 })
                 .await
             {
-                // A per-tag enqueue failure (e.g. a transient durable-queue write)
-                // must not abort the rest of the namespace. Reconcile is
-                // convergent: the next run re-enqueues whatever was missed.
+                // A per-tag enqueue failure must not abort the namespace; the
+                // next run re-enqueues whatever was missed.
                 warn!(
                     "Failed to enqueue replication push for '{namespace}:{tag}' to downstream '{}'; continuing: {e}",
                     downstream.name
@@ -181,10 +131,8 @@ impl ReplicationChecker {
             }
         }
 
-        // One warn per downstream per pass (not per tag, so a dead downstream
-        // with thousands of tags does not flood the log): probe failures left
-        // these tags unreconciled, and if they persist (bad credentials being
-        // the canonical case) this downstream converges on nothing.
+        // One warn per downstream per pass so a dead downstream with thousands
+        // of tags does not flood the log.
         if skipped > 0 {
             warn!(
                 "Skipped {skipped} of {} tag(s) of '{namespace}' on downstream '{}': the downstream \
@@ -194,16 +142,9 @@ impl ReplicationChecker {
             );
         }
 
-        // 2. Prune (opt-in): when this downstream is an authoritative one-way
-        //    mirror (`prune = true`), enumerate its tag set and delete any tag
-        //    absent locally. Skipped by default: for an active-active peer this
-        //    would delete a peer's legitimately-newer tag that has not yet
-        //    replicated back, so absence-driven deletion is unsafe there. The
-        //    receiver runs LWW on the stamped `source_ts` (see `Executor`), which
-        //    only saves a future-dated downstream tag: it does NOT make prune
-        //    active-active safe (a peer's newer tag predating this run is still
-        //    deleted), so this is one-way-mirror-only. A failed enumeration warns
-        //    and skips cleanup for this downstream rather than aborting the run.
+        // Prune step (opt-in, one-way-mirror-only): the stamped `source_ts` LWW
+        // only saves a future-dated downstream tag and does not make
+        // absence-driven deletion safe for active-active peers.
         if !downstream.prune {
             return;
         }
@@ -222,8 +163,8 @@ impl ReplicationChecker {
             }
         };
 
-        // Every local tag counts, including ones whose digest read failed
-        // (`None`): prune must never delete a tag that exists locally.
+        // Tags whose digest read failed (`None`) still count as local: prune
+        // must never delete a tag that exists locally.
         let local_set: HashSet<&str> = local_tags.iter().map(|(tag, _)| tag.as_str()).collect();
         for tag in downstream_tags {
             if local_set.contains(tag.as_str()) {
@@ -237,8 +178,8 @@ impl ReplicationChecker {
                 })
                 .await
             {
-                // As with the push loop above: a per-tag enqueue failure warns and
-                // continues so one flaky write does not skip the rest of the prune.
+                // A per-tag enqueue failure warns and continues so one flaky
+                // write does not skip the rest of the prune.
                 warn!(
                     "Failed to enqueue replication delete for '{namespace}:{tag}' on downstream '{}'; continuing: {e}",
                     downstream.name
@@ -259,8 +200,7 @@ impl NamespaceChecker for ReplicationChecker {
             return Ok(());
         };
 
-        // Nothing to reconcile when no participating downstream exists for this
-        // namespace: skip the (potentially large) tag listing entirely.
+        // Skip the potentially large tag listing when no downstream participates.
         let downstreams: Vec<&ReplicationDownstream> = repository
             .replication
             .iter()
@@ -270,11 +210,9 @@ impl NamespaceChecker for ReplicationChecker {
             return Ok(());
         }
 
-        // Local tag set, collected AND digest-resolved once, shared across every
-        // downstream. Per-downstream resolution would cost O(downstreams × tags)
-        // metadata reads. A tag whose link read fails resolves to `None`: the
-        // push loop skips it, but it stays in the list so prune still counts it
-        // as local (a transient read failure must never delete a live tag).
+        // Collect and digest-resolve the tag set once to avoid O(downstreams x
+        // tags) metadata reads. A failed link read resolves to `None`: skipped
+        // for push but still counted as local so prune never deletes a live tag.
         let mut local_tags: Vec<(String, Option<Digest>)> = Vec::new();
         let mut stream = list_all::tags(&self.metadata_store, namespace);
         while let Some(tag) = stream.next().await {
@@ -291,9 +229,7 @@ impl NamespaceChecker for ReplicationChecker {
     }
 }
 
-/// Builder for [`ReplicationChecker`] taking individual resolved fields.
-///
-/// `metadata_store` and `resolver` are both required.
+/// Builder for [`ReplicationChecker`]; both fields are required.
 #[derive(Default)]
 pub struct ReplicationCheckerBuilder {
     metadata_store: Option<Arc<MetadataStore>>,
@@ -383,9 +319,8 @@ mod tests {
     const REPO: &str = "nginx";
     const DOWNSTREAM: &str = "eu-region";
 
-    /// Build a single FS-backed metadata store (no S3 backend, so the test runs
-    /// in any environment, mirroring the handler tests). Returns the store
-    /// façade too so callers can seed manifest blobs.
+    /// FS-backed metadata store so the tests run without S3; also returns the
+    /// store façade for seeding blobs.
     fn fs_metadata_store() -> (Arc<MetadataStore>, Arc<Store>, TempDir) {
         let dir = TempDir::new().unwrap();
         let root = dir.path().to_str().unwrap();
@@ -452,7 +387,6 @@ mod tests {
         let (metadata_store, store, _dir) = fs_metadata_store();
         let mock_server = MockServer::start().await;
 
-        // Local: tag v1 -> manifest digest.
         let manifest = put_blob_direct(&store, b"manifest-bytes").await;
         metadata_store
             .update_links(
@@ -465,7 +399,6 @@ mod tests {
             .await
             .unwrap();
 
-        // Downstream: tag missing -> HEAD 404.
         Mock::given(method("HEAD"))
             .and(path(format!("/v2/{NAMESPACE}/manifests/v1")))
             .respond_with(ResponseTemplate::new(404))
@@ -500,7 +433,6 @@ mod tests {
         let (metadata_store, store, _dir) = fs_metadata_store();
         let mock_server = MockServer::start().await;
 
-        // Local: tag v1 -> manifest digest.
         let manifest = put_blob_direct(&store, b"manifest-bytes").await;
         metadata_store
             .update_links(
@@ -513,9 +445,6 @@ mod tests {
             .await
             .unwrap();
 
-        // Downstream HEAD fails transiently (500). That is NOT a genuine absence,
-        // so the tag is skipped for this pass and no push is enqueued (a 404 would
-        // enqueue one: see enqueues_push_for_tag_missing_on_downstream).
         Mock::given(method("HEAD"))
             .and(path(format!("/v2/{NAMESPACE}/manifests/v1")))
             .respond_with(ResponseTemplate::new(500))
@@ -559,8 +488,8 @@ mod tests {
         );
     }
 
-    /// An `ActionSink` that records every applied action and fails the first
-    /// `fail_first` of them, simulating a transient durable-queue enqueue error.
+    /// An `ActionSink` that fails the first `fail_first` applies, simulating
+    /// transient enqueue errors.
     struct FlakySink {
         attempted: Vec<Action>,
         fail_first: usize,
@@ -583,7 +512,6 @@ mod tests {
         let (metadata_store, store, _dir) = fs_metadata_store();
         let mock_server = MockServer::start().await;
 
-        // Local: two diverging tags (both missing on the downstream -> need push).
         for tag in ["v1", "v2"] {
             let body = format!("manifest-{tag}");
             let manifest = put_blob_direct(&store, body.as_bytes()).await;
@@ -599,7 +527,6 @@ mod tests {
                 .unwrap();
         }
 
-        // Every downstream HEAD is a 404 -> every local tag needs a push.
         Mock::given(method("HEAD"))
             .respond_with(ResponseTemplate::new(404))
             .mount(&mock_server)
@@ -616,8 +543,6 @@ mod tests {
             .build()
             .unwrap();
 
-        // The first enqueue fails; reconcile must still attempt the second tag
-        // rather than aborting the namespace.
         let mut sink = FlakySink {
             attempted: Vec::new(),
             fail_first: 1,
@@ -644,8 +569,7 @@ mod tests {
         let (metadata_store, _store, _dir) = fs_metadata_store();
         let mock_server = MockServer::start().await;
 
-        // No local tags; the downstream holds two stray tags absent locally, so a
-        // prune downstream enqueues a delete for each.
+        // No local tags: both downstream tags are prune-eligible.
         Mock::given(method("GET"))
             .and(path(format!("/v2/{NAMESPACE}/tags/list")))
             .respond_with(
@@ -665,8 +589,6 @@ mod tests {
             .build()
             .unwrap();
 
-        // The first delete enqueue fails; the prune sweep must still attempt the
-        // second downstream-only tag rather than aborting.
         let mut sink = FlakySink {
             attempted: Vec::new(),
             fail_first: 1,
@@ -705,7 +627,6 @@ mod tests {
             .await
             .unwrap();
 
-        // Downstream HEAD returns the SAME digest -> converged -> no action.
         Mock::given(method("HEAD"))
             .and(path(format!("/v2/{NAMESPACE}/manifests/v1")))
             .respond_with(
@@ -787,7 +708,6 @@ mod tests {
         let (metadata_store, store, _dir) = fs_metadata_store();
         let mock_server = MockServer::start().await;
 
-        // Local: tag v1 -> manifest digest (converged on the downstream).
         let manifest = put_blob_direct(&store, b"converged-bytes").await;
         metadata_store
             .update_links(
@@ -800,7 +720,6 @@ mod tests {
             .await
             .unwrap();
 
-        // Downstream HEAD on v1 returns the same digest -> no push.
         Mock::given(method("HEAD"))
             .and(path(format!("/v2/{NAMESPACE}/manifests/v1")))
             .respond_with(
@@ -810,7 +729,6 @@ mod tests {
             )
             .mount(&mock_server)
             .await;
-        // Downstream tags/list reports v1 (local) AND a downstream-only `stray`.
         Mock::given(method("GET"))
             .and(path(format!("/v2/{NAMESPACE}/tags/list")))
             .respond_with(
@@ -851,7 +769,6 @@ mod tests {
         let (metadata_store, store, _dir) = fs_metadata_store();
         let mock_server = MockServer::start().await;
 
-        // Local: tag v1 -> manifest digest (converged on the downstream).
         let manifest = put_blob_direct(&store, b"converged-bytes").await;
         metadata_store
             .update_links(
@@ -864,7 +781,6 @@ mod tests {
             .await
             .unwrap();
 
-        // v1 converged on the downstream -> no push.
         Mock::given(method("HEAD"))
             .and(path(format!("/v2/{NAMESPACE}/manifests/v1")))
             .respond_with(
@@ -874,9 +790,8 @@ mod tests {
             )
             .mount(&mock_server)
             .await;
-        // With prune disabled the checker must NOT enumerate downstream tags, so
-        // the downstream-only `stray` tag is left untouched. `.expect(0)` fails
-        // the test if `tags/list` is called at all.
+        // `.expect(0)` fails the test if the checker enumerates downstream tags
+        // at all.
         Mock::given(method("GET"))
             .and(path(format!("/v2/{NAMESPACE}/tags/list")))
             .respond_with(
@@ -909,16 +824,10 @@ mod tests {
 
     #[tokio::test]
     async fn unreadable_local_tag_is_skipped_but_never_pruned() {
-        // A local tag whose link read fails resolves to no digest: the push
-        // loop skips it, but it MUST still count as local for prune: a
-        // transient (or corrupt-link) read failure must never delete a live
-        // downstream tag.
         metrics_provider::init_for_tests();
         let (metadata_store, store, _dir) = fs_metadata_store();
         let mock_server = MockServer::start().await;
 
-        // Local: tag `broken` exists but its link bytes are not parseable
-        // LinkMetadata, so digest resolution fails.
         put_link_raw(
             &store,
             NAMESPACE,
@@ -927,8 +836,7 @@ mod tests {
         )
         .await;
 
-        // Prune-enabled downstream lists `broken`: it must NOT be deleted (the
-        // push loop never probes an unreadable tag, so no HEAD mock is needed).
+        // No HEAD mock: the push loop never probes an unreadable tag.
         Mock::given(method("GET"))
             .and(path(format!("/v2/{NAMESPACE}/tags/list")))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "tags": ["broken"] })))
@@ -975,8 +883,7 @@ mod tests {
             .await
             .unwrap();
 
-        // event-only downstream is excluded from reconcile, so the client is
-        // never contacted: point it at an unreachable URL.
+        // Unreachable URL: an event-only downstream must never be contacted.
         let resolver = resolver_for(repository(
             downstream_client("http://127.0.0.1:1"),
             ReplicationMode::EventOnly,
@@ -996,14 +903,10 @@ mod tests {
 
     #[tokio::test]
     async fn enqueues_push_for_reconcile_only_downstream() {
-        // Symmetric to `skips_event_only_downstream`: a reconcile-only downstream
-        // DOES participate in reconciliation, so a tag missing on it enqueues a
-        // push.
         metrics_provider::init_for_tests();
         let (metadata_store, store, _dir) = fs_metadata_store();
         let mock_server = MockServer::start().await;
 
-        // Local: tag v1 -> manifest digest.
         let manifest = put_blob_direct(&store, b"reconcile-only-bytes").await;
         metadata_store
             .update_links(
@@ -1016,7 +919,6 @@ mod tests {
             .await
             .unwrap();
 
-        // Downstream: tag missing -> HEAD 404.
         Mock::given(method("HEAD"))
             .and(path(format!("/v2/{NAMESPACE}/manifests/v1")))
             .respond_with(ResponseTemplate::new(404))
@@ -1053,9 +955,8 @@ mod tests {
     // End-to-end (`angos scrub --replicate`)
     // ------------------------------------------------------------------
 
-    /// Seed a config blob, a layer blob, a manifest blob referencing both, and a
-    /// `v1` tag link pointing at the manifest (mirrors the handler-stage seed).
-    /// Returns `(manifest_digest, config_digest, layer_digest, manifest_bytes)`.
+    /// Seeds config, layer, and manifest blobs plus a `v1` tag link; returns
+    /// their digests.
     async fn seed_manifest(
         store: &Arc<Store>,
         metadata_store: &Arc<MetadataStore>,
@@ -1103,10 +1004,9 @@ mod tests {
         (manifest_digest, config_digest, layer_digest)
     }
 
-    /// Mount the downstream so tag `v1` is absent (HEAD 404 -> needs push), both
-    /// referenced blobs are missing (HEAD 404 -> upload sequence runs), and the
-    /// tagged manifest PUT lands exactly once. `.expect(...)` counts are verified
-    /// on `MockServer` drop.
+    /// Mounts a downstream missing tag `v1` and both blobs, expecting the full
+    /// blob-upload sequence and exactly one tagged manifest PUT. The
+    /// `.expect(...)` counts are verified on `MockServer` drop.
     async fn mount_out_of_sync_downstream(
         mock_server: &MockServer,
         manifest_digest: &Digest,
@@ -1162,18 +1062,8 @@ mod tests {
             .await;
     }
 
-    /// Full `angos scrub --replicate` chain against a wiremock downstream:
-    ///
-    /// 1. the `ReplicationChecker` HEAD-probes the out-of-sync downstream tag and
-    ///    emits an `EnqueueReplicationPush` action (also asserted via a capture
-    ///    sink) which the real-storage `Executor` lands on the durable queue
-    ///    (`count_pending == 1`);
-    /// 2. draining that queue (`claim_one` + `execute_one`, exactly as `Command`
-    ///    does) drives the `ReplicationJobHandler` -> push pipeline, so the
-    ///    downstream receives the blob-upload sequence + the tagged manifest PUT;
-    /// 3. re-running the checker after convergence is a no-op, and a duplicate
-    ///    enqueue while one job is pending coalesces on `lock_key`
-    ///    (`count_pending` stays at 1).
+    /// Full `angos scrub --replicate` push chain against a wiremock downstream,
+    /// including `lock_key` coalescing of a duplicate enqueue.
     #[tokio::test]
     async fn scrub_replicate_enqueues_then_drains_and_converges() {
         metrics_provider::init_for_tests();
@@ -1192,16 +1082,12 @@ mod tests {
         )
         .await;
 
-        // One resolver shared between the checker (HEAD probe) and the handler
-        // (push), exactly as `Command` wires a single `RepositoryResolver`.
         let resolver = resolver_for(repository(
             downstream_client(&mock_server.uri()),
             ReplicationMode::EventReconcile,
             false,
         ));
 
-        // One `Arc<JobStore>` as both producer (executor enqueue) and consumer
-        // (drain), over the same `Store` façade, mirroring `Command::new`.
         let job_store = Arc::new(JobStore::new(metadata_store.store_arc(), "scrub-test"));
 
         let checker = ReplicationChecker::builder()
@@ -1210,7 +1096,6 @@ mod tests {
             .build()
             .unwrap();
 
-        // (a) Capture sink: assert the produced action without enqueuing.
         let mut captured: Vec<Action> = Vec::new();
         checker.check(NAMESPACE, &mut captured).await.unwrap();
         assert_eq!(captured.len(), 1, "out-of-sync tag must emit one action");
@@ -1223,7 +1108,6 @@ mod tests {
                     && *digest == manifest_digest
         ));
 
-        // (b) Real executor sink: the action lands on the durable queue.
         let mut executor: Box<dyn ActionSink + Send> = Box::new(
             Executor::builder()
                 .blob_store(blob_store.clone())
@@ -1239,7 +1123,6 @@ mod tests {
             "the divergent tag must enqueue exactly one replication job"
         );
 
-        // (c) A duplicate enqueue while one is pending coalesces on `lock_key`.
         checker.check(NAMESPACE, executor.as_mut()).await.unwrap();
         assert_eq!(
             job_store.count_pending(REPLICATION_QUEUE, 0).await.unwrap(),
@@ -1247,8 +1130,6 @@ mod tests {
             "a second reconcile pass must coalesce on lock_key (no new job)"
         );
 
-        // (d) Drain to convergence exactly as `Command::drain_replication_jobs`:
-        //     claim_one + execute_one until the queue empties.
         let handler = ReplicationJobHandler::builder()
             .resolver(resolver.clone())
             .blob_store(blob_store.clone())
@@ -1272,16 +1153,13 @@ mod tests {
             "the queue must be empty after the drain"
         );
 
-        // The downstream received the blob-upload sequence + the tagged manifest
-        // PUT; the wiremock `.expect(...)` counts are verified on drop. Drop
-        // explicitly so a mismatch surfaces here, not at end-of-test teardown.
+        // Drop explicitly so a wiremock `.expect(...)` mismatch surfaces here,
+        // not at end-of-test teardown.
         drop(mock_server);
     }
 
-    /// Full `angos scrub --replicate` chain for the DELETE path: the downstream
-    /// holds a `stray` tag that does not exist locally, so the checker enqueues an
-    /// `EnqueueReplicationDelete`, and draining the queue issues a `DELETE` to the
-    /// downstream `/v2/<ns>/manifests/stray` exactly once.
+    /// Full `angos scrub --replicate` delete chain: a downstream-only tag is
+    /// enqueued for delete and the drain issues exactly one downstream DELETE.
     #[tokio::test]
     async fn scrub_replicate_deletes_downstream_only_tag() {
         metrics_provider::init_for_tests();
@@ -1289,7 +1167,6 @@ mod tests {
         let blob_store = Arc::new(BlobStore::builder().store(store.clone()).build().unwrap());
         let mock_server = MockServer::start().await;
 
-        // Local: tag v1 -> manifest digest, already converged on the downstream.
         let (manifest_digest, _config_digest, _layer_digest) =
             seed_manifest(&store, &metadata_store).await;
         Mock::given(method("HEAD"))
@@ -1301,7 +1178,6 @@ mod tests {
             )
             .mount(&mock_server)
             .await;
-        // Downstream tags/list reports v1 (local) AND a downstream-only `stray`.
         Mock::given(method("GET"))
             .and(path(format!("/v2/{NAMESPACE}/tags/list")))
             .respond_with(
@@ -1309,7 +1185,6 @@ mod tests {
             )
             .mount(&mock_server)
             .await;
-        // The drain must issue exactly one DELETE for the stray downstream tag.
         Mock::given(method("DELETE"))
             .and(path(format!("/v2/{NAMESPACE}/manifests/stray")))
             .respond_with(ResponseTemplate::new(202))
@@ -1368,7 +1243,7 @@ mod tests {
             "the queue must be empty after the drain"
         );
 
-        // The `.expect(1)` on the DELETE is verified on drop.
+        // Drop explicitly so the `.expect(1)` on the DELETE is verified here.
         drop(mock_server);
     }
 }

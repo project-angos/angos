@@ -69,11 +69,9 @@ impl From<LockError> for Error {
 // Configuration
 // ---------------------------------------------------------------------------
 
-/// Job-queue tunables. `[global.job_queue]` does not change durability: jobs
-/// persist under the store's `_jobs/` prefix and survive a restart either way.
-/// It switches draining from the server's in-process claim loops to separate
-/// `angos worker` processes and enables the externally observable queue-depth
-/// gauge.
+/// Job-queue tunables. `[global.job_queue]` does not change durability (jobs
+/// persist under the store's `_jobs/` prefix either way); it switches draining
+/// to separate `angos worker` processes and enables the queue-depth gauge.
 ///
 /// Storage is inherited from the shared `[metadata_store]` configuration.
 /// The per-`lock_key` execution lock TTL is governed by the configured lock

@@ -136,8 +136,7 @@ fn test_parse_mount_blob_with_from() {
 
 #[test]
 fn test_parse_mount_blob_without_from() {
-    // `?mount=` without `?from=` still routes to `mount-blob`, with `from` unset
-    // (the server then attempts automatic content discovery).
+    // An unset `from` makes the server attempt automatic content discovery.
     let method = Method::POST;
     let mount_digest = "sha256:1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef";
     let uri: Uri = format!("/v2/myrepo/target/blobs/uploads/?mount={mount_digest}")
@@ -154,9 +153,6 @@ fn test_parse_mount_blob_without_from() {
 
 #[test]
 fn test_parse_mount_blob_with_malformed_from_is_rejected() {
-    // `?mount=<valid>&from=<malformed>` must NOT silently degrade to a from-less
-    // auto-discovery mount (which would widen the authorized source set). The
-    // route does not match, so `handle_unknown_route` turns the POST into a 400.
     let mount_digest = "sha256:1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef";
     let uri: Uri = format!("/v2/myrepo/target/blobs/uploads/?mount={mount_digest}&from=Invalid")
         .parse()
@@ -170,9 +166,6 @@ fn test_parse_mount_blob_with_malformed_from_is_rejected() {
 
 #[test]
 fn test_parse_start_upload_with_malformed_digest_is_rejected() {
-    // A present-but-malformed `?digest=` fails strict query parsing, so the route
-    // does not match and `handle_unknown_route` turns the POST into a 400,
-    // rather than silently starting a 202 session that drops the digest.
     let uri: Uri = "/v2/myrepo/app/blobs/uploads?digest=not-a-digest"
         .parse()
         .unwrap();
@@ -182,7 +175,6 @@ fn test_parse_start_upload_with_malformed_digest_is_rejected() {
         "a malformed ?digest= must not start a session (POST -> 400), got: {route:?}"
     );
 
-    // Same, with a trailing slash on the uploads path.
     let uri: Uri = "/v2/myrepo/app/blobs/uploads/?digest=garbage"
         .parse()
         .unwrap();
@@ -195,8 +187,6 @@ fn test_parse_start_upload_with_malformed_digest_is_rejected() {
 
 #[test]
 fn test_parse_start_upload_no_digest_is_session() {
-    // A missing query is a plain upload-start session (the absent-query branch
-    // alongside the malformed case above).
     let uri: Uri = "/v2/myrepo/app/blobs/uploads".parse().unwrap();
     let route = parse(&Method::POST, &uri);
     if let Some(Action::StartUpload {
@@ -212,10 +202,8 @@ fn test_parse_start_upload_no_digest_is_session() {
 
 #[test]
 fn test_parse_malformed_mount_is_rejected() {
-    // A present-but-malformed `?mount=` is a 400, not a silent degrade to a
-    // plain upload session, symmetric with the strict `?digest=`/`?from=`
-    // handling. The OCI fall-back-to-session rule covers UNSATISFIABLE mounts,
-    // not syntactically invalid ones.
+    // The OCI fall-back-to-session rule covers unsatisfiable mounts, not
+    // syntactically invalid ones.
     let route = parse(
         &Method::POST,
         &"/v2/myrepo/target/blobs/uploads/?mount=not-a-digest"
@@ -230,11 +218,8 @@ fn test_parse_malformed_mount_is_rejected() {
 
 #[test]
 fn test_parse_mount_with_malformed_digest_is_rejected() {
-    // Edge case (accepted by design): combining a valid `?mount=` with a
-    // malformed `?digest=` fails strict parsing of the WHOLE MountQuery before
-    // the mount branch is reached, so the route does not match (POST -> 400).
-    // Unreachable by real clients: they never combine `?mount=` (cross-repo
-    // mount) with a monolithic `?digest=`.
+    // Real clients never combine `?mount=` with a monolithic `?digest=`;
+    // rejecting the combination is by design.
     let mount_digest = "sha256:1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef";
     let uri: Uri = format!("/v2/myrepo/target/blobs/uploads/?mount={mount_digest}&digest=garbage")
         .parse()
@@ -248,24 +233,20 @@ fn test_parse_mount_with_malformed_digest_is_rejected() {
 
 #[test]
 fn test_parse_query_strict() {
-    // A malformed `?digest=` fails strict parsing -> None.
     assert!(parse_query_strict::<MountQuery>("digest=not-a-digest").is_none());
 
-    // A valid `?digest=` parses into Some with the digest set.
     let valid = "digest=sha256:1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef";
     let query: MountQuery = parse_query_strict(valid).expect("a valid digest must parse strictly");
     assert!(query.digest.is_some());
     assert!(query.mount.is_none());
     assert!(query.from.is_none());
 
-    // An empty query is Some(default): all fields None.
     let query: MountQuery = parse_query_strict("").expect("an empty query must parse strictly");
     assert!(query.digest.is_none());
     assert!(query.mount.is_none());
     assert!(query.from.is_none());
 
-    // An unknown field is ignored by serde_urlencoded, so only the typed Digest
-    // can fail strict parsing: a bare `?n=` still yields Some.
+    // serde_urlencoded ignores unknown fields, so a bare `?n=` still yields Some.
     let query: MountQuery = parse_query_strict("n=5").expect("an unknown field must be ignored");
     assert!(query.digest.is_none());
     assert!(query.mount.is_none());
@@ -645,8 +626,8 @@ fn test_digest_query_from_empty_params() {
 
 #[test]
 fn digest_from_params_drops_invalid() {
-    // A malformed `?digest=` is a Digest deserialize error; serde_urlencoded
-    // then collapses the whole DigestQuery to its default, so digest is None.
+    // The Digest deserialize error makes the lenient parse collapse the whole
+    // query to its default.
     assert!(digest_from_params(Some("digest=invalid-digest")).is_none());
 }
 
@@ -1197,8 +1178,6 @@ fn test_parse_delete_failed_job_selects_replication_queue() {
 
 #[test]
 fn test_parse_jobs_rejects_unknown_queue() {
-    // An explicit `?queue=` naming no known queue is a 400, not a silent
-    // default to the cache queue.
     assert!(parse(&Method::GET, &"/_ext/_jobs?queue=bogus".parse().unwrap()).is_none());
     assert!(
         parse(
@@ -1213,9 +1192,8 @@ fn test_parse_jobs_rejects_unknown_queue() {
 
 #[test]
 fn test_parse_jobs_rejects_malformed_query_instead_of_defaulting_queue() {
-    // A malformed sibling value must NOT reset the whole query to its defaults:
-    // a lenient parse would turn `?queue=replication&n=abc` into the default
-    // `cache` queue and administer the wrong queue. Any bad value is a 400.
+    // A lenient parse would reset the whole query and administer the default
+    // cache queue instead of the requested one.
     assert!(
         parse(
             &Method::GET,

@@ -22,17 +22,15 @@ pub struct LinkMetadata {
 }
 
 impl LinkMetadata {
-    /// Test convenience for `from_digest_at(target, now())`. Production link
-    /// writes go through `from_digest_at` so the creation time is explicit.
+    /// Test convenience for `from_digest_at(target, now())`.
     #[cfg(test)]
     pub fn from_digest(target: Digest) -> Self {
         Self::from_digest_at(target, Utc::now())
     }
 
-    /// Like [`Self::from_digest`] but stamps an explicit creation time. A
-    /// replicated write passes the originating `source_ts` so the tag's
-    /// last-writer-wins timestamp (and its retention age) tracks the author's
-    /// write time across hops rather than each receiver's local clock.
+    /// Construct with an explicit creation time. Replicated writes pass the
+    /// originating `source_ts` so the tag's last-writer-wins timestamp tracks
+    /// the author's write time, not each receiver's clock.
     pub fn from_digest_at(target: Digest, created_at: DateTime<Utc>) -> Self {
         Self {
             target,
@@ -128,8 +126,6 @@ mod tests {
 
     #[test]
     fn from_digest_at_uses_explicit_timestamp() {
-        // The production constructor stamps the caller-supplied creation time
-        // verbatim (a replicated write passes the originating source_ts).
         let ts = Utc::now() - chrono::Duration::hours(2);
         let meta = LinkMetadata::from_digest_at(digest(), ts);
         assert_eq!(meta.target, digest());
