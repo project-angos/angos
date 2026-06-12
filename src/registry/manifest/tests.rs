@@ -2928,6 +2928,7 @@ mod noop_suppression_tests {
 
     use std::{collections::HashMap, io::Cursor, sync::Arc};
 
+    use chrono::{Duration, Utc};
     use tempfile::TempDir;
 
     use angos_storage::{ObjectStore, fs::Backend as StorageFsBackend};
@@ -2948,7 +2949,10 @@ mod noop_suppression_tests {
             test_utils::{build_store, build_test_fs_executor},
         },
         registry_client::RegistryClient,
-        replication::{REPLICATION_QUEUE, ReplicationDownstream, ReplicationMode},
+        replication::{
+            REPLICATION_DELETE_MANIFEST_KIND, REPLICATION_QUEUE, ReplicationDownstream,
+            ReplicationMode, ReplicationPushPayload,
+        },
         util::sha256,
     };
 
@@ -3026,6 +3030,22 @@ mod noop_suppression_tests {
 
     async fn pending(job_store: &JobStore) -> u64 {
         job_store.count_pending(REPLICATION_QUEUE, 0).await.unwrap()
+    }
+
+    /// Decode the payload of the sole pending replication job, panicking
+    /// unless exactly one is pending.
+    async fn sole_pending_payload(job_store: &JobStore) -> ReplicationPushPayload {
+        let keys = job_store.list_pending(REPLICATION_QUEUE, 16).await.unwrap();
+        assert_eq!(
+            keys.len(),
+            1,
+            "expected exactly one pending replication job"
+        );
+        let envelope = job_store
+            .read_pending(REPLICATION_QUEUE, &keys[0])
+            .await
+            .unwrap();
+        serde_json::from_value(envelope.payload).expect("decode ReplicationPushPayload")
     }
 
     /// Drains (claims + completes) one pending replication job, clearing its
@@ -3295,6 +3315,54 @@ mod noop_suppression_tests {
             3,
             "the second delete must enqueue its own job (per-event lock key), \
              not coalesce into the pending older delete"
+        );
+    }
+
+    /// An inbound replicated delete must re-dispatch with its author
+    /// timestamp verbatim. A re-stamped `now()` would let the bounced delete
+    /// win LWW over a recreate authored between the original delete and the
+    /// bounce, destroying the acknowledged recreate on every node.
+    #[tokio::test]
+    async fn replicated_delete_redispatches_author_source_ts_verbatim() {
+        let dir = TempDir::new().unwrap();
+        let (registry, job_store) = build_registry(dir.path().to_str().unwrap());
+        let namespace = Namespace::new(NAMESPACE).unwrap();
+        let tag = "latest";
+
+        // Seed via a replicated push so the tag's created_at predates the delete.
+        let (content, media_type) = create_test_manifest(&registry, &namespace).await;
+        let push_ts = Utc::now() - Duration::hours(2);
+        registry
+            .accept_put_manifest(
+                None,
+                Some(push_ts),
+                &namespace,
+                Reference::Tag(tag.to_string()),
+                media_type,
+                Cursor::new(content),
+            )
+            .await
+            .expect("seed replicated tag push");
+        drain_one(&job_store).await;
+
+        let delete_ts = Utc::now() - Duration::hours(1);
+        registry
+            .delete_manifest(
+                None,
+                Some(delete_ts),
+                &namespace,
+                &Reference::Tag(tag.to_string()),
+            )
+            .await
+            .expect("replicated delete newer than the tag must proceed");
+
+        let payload = sole_pending_payload(&job_store).await;
+        assert_eq!(payload.kind, REPLICATION_DELETE_MANIFEST_KIND);
+        assert_eq!(
+            payload.source_ts.as_deref(),
+            Some(delete_ts.to_rfc3339().as_str()),
+            "the delete job must carry the author timestamp verbatim, \
+             not a re-stamped now()"
         );
     }
 

@@ -588,6 +588,7 @@ mod in_process_replication_tests {
                 REPLICATION_PUSH_MANIFEST_KIND,
                 Some("v1"),
                 Some(&manifest_digest),
+                None,
             )
             .await;
 

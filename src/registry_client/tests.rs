@@ -1147,7 +1147,7 @@ async fn test_mount_blob_returns_none_on_201() {
 
     assert_eq!(
         outcome, None,
-        "a 201 to a mount request must report a mount (None — no transfer needed)"
+        "a 201 to a mount request must report a mount (None: no transfer needed)"
     );
     drop(mock_server);
 }
@@ -1178,7 +1178,7 @@ async fn test_mount_blob_omits_from_when_none() {
 
     assert_eq!(
         outcome, None,
-        "a 201 to a from=None mount request must report a mount (None — no transfer needed)"
+        "a 201 to a from=None mount request must report a mount (None: no transfer needed)"
     );
     drop(mock_server);
 }
@@ -1276,7 +1276,7 @@ async fn test_mount_blob_accepts_matching_201_digest() {
 
     assert_eq!(
         outcome, None,
-        "a 201 advertising the requested digest must report a mount (None — no transfer needed)"
+        "a 201 advertising the requested digest must report a mount (None: no transfer needed)"
     );
     drop(mock_server);
 }

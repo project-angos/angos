@@ -1,6 +1,6 @@
 use std::{collections::HashSet, sync::Arc};
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use hyper::header::{ACCEPT_RANGES, CONTENT_RANGE};
 use tokio::io::AsyncReadExt;
 #[cfg(test)]
@@ -345,14 +345,18 @@ impl Registry {
         kind: &str,
         tag: Option<&str>,
         digest: Option<&Digest>,
+        source_ts: Option<DateTime<Utc>>,
     ) {
         let Some(repository) = repository else {
             return;
         };
 
         // Receiver-side last-writer-wins timestamp: authoritative for a DELETE;
-        // a PUSH re-derives it at execute time, so a coalesced push never goes stale.
-        let source_ts = Utc::now().to_rfc3339();
+        // a PUSH re-derives it at execute time, so a coalesced push never goes
+        // stale. An inbound replicated delete passes its author timestamp so it
+        // propagates verbatim: re-stamping `now()` would let the bounced delete
+        // outrank (and destroy) a recreate that landed in between.
+        let source_ts = source_ts.unwrap_or_else(Utc::now).to_rfc3339();
 
         for downstream in &repository.replication {
             if !downstream.enqueues_for(namespace.as_ref()) {
@@ -1399,7 +1403,7 @@ mod dispatch_replication_tests {
 
     use angos_storage::{ObjectStore, fs::Backend as StorageFsBackend};
 
-    use chrono::DateTime;
+    use chrono::{DateTime, Duration, Utc};
     use regex::Regex;
 
     use crate::{
@@ -1417,8 +1421,8 @@ mod dispatch_replication_tests {
         },
         registry_client::RegistryClient,
         replication::{
-            REPLICATION_PUSH_MANIFEST_KIND, REPLICATION_QUEUE, ReplicationDownstream,
-            ReplicationMode, ReplicationPushPayload,
+            REPLICATION_DELETE_MANIFEST_KIND, REPLICATION_PUSH_MANIFEST_KIND, REPLICATION_QUEUE,
+            ReplicationDownstream, ReplicationMode, ReplicationPushPayload,
         },
     };
 
@@ -1538,6 +1542,7 @@ mod dispatch_replication_tests {
                 REPLICATION_PUSH_MANIFEST_KIND,
                 Some("v1"),
                 Some(&digest),
+                None,
             )
             .await;
 
@@ -1567,6 +1572,7 @@ mod dispatch_replication_tests {
                 REPLICATION_PUSH_MANIFEST_KIND,
                 Some("v1"),
                 Some(&digest),
+                None,
             )
             .await;
 
@@ -1580,6 +1586,39 @@ mod dispatch_replication_tests {
         assert!(
             DateTime::parse_from_rfc3339(&source_ts).is_ok(),
             "source_ts must be a valid RFC 3339 timestamp; got {source_ts}"
+        );
+    }
+
+    /// A caller-provided timestamp (an inbound replicated delete's author
+    /// time) propagates verbatim; a re-stamped `now()` would let the bounced
+    /// delete outrank a recreate authored in between.
+    #[tokio::test]
+    async fn dispatch_replication_uses_provided_source_ts_verbatim() {
+        crate::metrics_provider::init_for_tests();
+        let dir = TempDir::new().unwrap();
+        let (registry, job_store) = build_registry(dir.path().to_str().unwrap());
+
+        let namespace = Namespace::new(NAMESPACE).unwrap();
+        let author_ts = Utc::now() - Duration::hours(3);
+
+        let repository = registry.resolver.resolve(&namespace);
+        registry
+            .dispatch_replication(
+                repository,
+                &namespace,
+                REPLICATION_DELETE_MANIFEST_KIND,
+                Some("v1"),
+                None,
+                Some(author_ts),
+            )
+            .await;
+
+        let payload = sole_pending_payload(&job_store).await;
+        assert_eq!(payload.kind, REPLICATION_DELETE_MANIFEST_KIND);
+        assert_eq!(
+            payload.source_ts.as_deref(),
+            Some(author_ts.to_rfc3339().as_str()),
+            "a provided source_ts must propagate verbatim, not be re-stamped"
         );
     }
 
@@ -1603,6 +1642,7 @@ mod dispatch_replication_tests {
                 REPLICATION_PUSH_MANIFEST_KIND,
                 Some("v1"),
                 Some(&digest),
+                None,
             )
             .await;
 
@@ -1636,6 +1676,7 @@ mod dispatch_replication_tests {
                 REPLICATION_PUSH_MANIFEST_KIND,
                 Some("v1"),
                 Some(&digest),
+                None,
             )
             .await;
 

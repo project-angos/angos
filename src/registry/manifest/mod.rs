@@ -482,7 +482,9 @@ impl Registry {
             Reference::Digest(digest) => (None, Some(digest)),
         };
         // Webhook events above fire unconditionally; only the replication
-        // dispatch is gated on a real removal.
+        // dispatch is gated on a real removal. A replicated delete forwards
+        // its author timestamp verbatim so the bounce can never outrank a
+        // recreate authored after the original delete.
         if existed_before {
             self.dispatch_replication(
                 resolved_repository,
@@ -490,6 +492,7 @@ impl Registry {
                 REPLICATION_DELETE_MANIFEST_KIND,
                 tag,
                 dispatch_digest,
+                source_ts,
             )
             .await;
         }
@@ -805,6 +808,7 @@ impl Registry {
                 REPLICATION_PUSH_MANIFEST_KIND,
                 tag,
                 Some(&response.digest),
+                None,
             )
             .await;
         }
