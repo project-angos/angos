@@ -46,11 +46,12 @@ impl ReplicationChecker {
         downstream.mode.participates_in_reconcile() && downstream.matches_namespace(namespace)
     }
 
-    /// Resolves the current local digest for `tag` in `namespace`.
+    /// Resolves the current local digest for `tag` in `namespace`, bypassing
+    /// the link cache so a reconcile never enqueues a stale digest.
     async fn local_digest(&self, namespace: &str, tag: &str) -> Option<Digest> {
         match self
             .metadata_store
-            .read_link(namespace, &LinkKind::Tag(tag.to_string()), false)
+            .read_link_reference(namespace, &LinkKind::Tag(tag.to_string()))
             .await
         {
             Ok(link) => Some(link.target),

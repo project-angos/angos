@@ -180,10 +180,13 @@ impl ReplicationJobHandler {
         namespace: &Namespace,
         payload: &ReplicationPushPayload,
     ) -> Result<Option<(Digest, Option<DateTime<Utc>>)>, Error> {
+        // Reads bypass the per-process link cache: a worker's cache can lag a
+        // sibling process's write, and a stale resolve would replicate the old
+        // digest and complete the job.
         if let Some(tag) = &payload.tag {
             match self
                 .metadata_store
-                .read_link(namespace.as_ref(), &LinkKind::Tag(tag.clone()), false)
+                .read_link_reference(namespace.as_ref(), &LinkKind::Tag(tag.clone()))
                 .await
             {
                 Ok(link) => Ok(Some((link.target, link.created_at))),
@@ -204,7 +207,7 @@ impl ReplicationJobHandler {
             // A content-addressed digest carries no local version timestamp.
             match self
                 .metadata_store
-                .read_link(namespace.as_ref(), &LinkKind::Digest(digest.clone()), false)
+                .read_link_reference(namespace.as_ref(), &LinkKind::Digest(digest.clone()))
                 .await
             {
                 Ok(_) => Ok(Some((digest, None))),
@@ -787,6 +790,164 @@ mod tests {
         let tx = handler.execute(&envelope).await.unwrap();
         assert!(tx.mutations.is_empty(), "push returns an empty transaction");
         // wiremock `.expect(...)` assertions are verified on MockServer drop.
+        drop(mock_server);
+    }
+
+    /// The execute-time tag resolve must read the backend link, not the
+    /// per-process cache: a worker's cache can lag a sibling process's write
+    /// by up to its TTL, and a stale resolve would replicate the old digest
+    /// and complete the job.
+    #[allow(clippy::too_many_lines)]
+    #[tokio::test]
+    async fn execute_push_resolves_tag_past_the_link_cache() {
+        metrics_provider::init_for_tests();
+        let mock_server = MockServer::start().await;
+
+        let dir = TempDir::new().unwrap();
+        let root = dir.path().to_str().unwrap();
+        let object: Arc<dyn ObjectStore> =
+            Arc::new(StorageFsBackend::builder().root_dir(root).build().unwrap());
+        let executor = build_test_fs_executor(root, false);
+        let store = build_store(object, executor);
+        let metadata_store = Arc::new(
+            MetadataStore::builder()
+                .store(store.clone())
+                .cache(cache::Config::Memory.to_backend().unwrap())
+                .link_cache_ttl(300)
+                .access_time_debounce_secs(0)
+                .build()
+                .unwrap(),
+        );
+        let blob_store = Arc::new(BlobStore::builder().store(store.clone()).build().unwrap());
+
+        // Two manifests sharing the same blobs; the tag starts on `stale`.
+        let config_bytes = br#"{"config":true}"#.to_vec();
+        let layer_bytes = b"layer-bytes".to_vec();
+        let config_digest = put_blob(&store, &config_bytes).await;
+        let layer_digest = put_blob(&store, &layer_bytes).await;
+        let manifest_json = |rev: &str| {
+            json!({
+                "schemaVersion": 2,
+                "mediaType": "application/vnd.oci.image.manifest.v1+json",
+                "config": {
+                    "mediaType": "application/vnd.oci.image.config.v1+json",
+                    "digest": config_digest.to_string(),
+                    "size": config_bytes.len(),
+                },
+                "layers": [{
+                    "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+                    "digest": layer_digest.to_string(),
+                    "size": layer_bytes.len(),
+                }],
+                "annotations": {"rev": rev},
+            })
+        };
+        let stale_bytes = serde_json::to_vec(&manifest_json("stale")).unwrap();
+        let stale_digest = put_blob(&store, &stale_bytes).await;
+        let current_bytes = serde_json::to_vec(&manifest_json("current")).unwrap();
+        let current_digest = put_blob(&store, &current_bytes).await;
+
+        let link = LinkKind::Tag("v1".to_string());
+        metadata_store
+            .update_links(
+                NAMESPACE,
+                &[
+                    LinkOperation::create(link.clone(), stale_digest.clone()),
+                    LinkOperation::create(
+                        LinkKind::Config(config_digest.clone()),
+                        config_digest.clone(),
+                    ),
+                    LinkOperation::create(
+                        LinkKind::Layer(layer_digest.clone()),
+                        layer_digest.clone(),
+                    ),
+                ],
+            )
+            .await
+            .unwrap();
+
+        // Warm this process's cache with the stale target, then simulate a
+        // sibling process re-pointing the tag behind it.
+        metadata_store
+            .read_link(NAMESPACE, &link, false)
+            .await
+            .unwrap();
+        assert_eq!(
+            metadata_store
+                .cache_get(NAMESPACE, &link)
+                .await
+                .expect("the resolve under test must start from a warm cache")
+                .target,
+            stale_digest
+        );
+        let mut sibling = metadata_store
+            .read_link_reference(NAMESPACE, &link)
+            .await
+            .unwrap();
+        sibling.target = current_digest.clone();
+        metadata_store
+            .write_link_reference(NAMESPACE, &link, &sibling)
+            .await
+            .unwrap();
+
+        // Both blobs already present downstream; unmatched manifest HEAD 404s
+        // so the converged skip never fires and the PUT body is observable.
+        for blob in [&config_digest, &layer_digest] {
+            Mock::given(method("HEAD"))
+                .and(path(format!("/v2/{NAMESPACE}/blobs/{blob}")))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .insert_header(DOCKER_CONTENT_DIGEST, blob.to_string().as_str())
+                        .insert_header("Content-Length", "10"),
+                )
+                .mount(&mock_server)
+                .await;
+        }
+        Mock::given(method("PUT"))
+            .and(path(format!("/v2/{NAMESPACE}/manifests/v1")))
+            .respond_with(
+                ResponseTemplate::new(201)
+                    .insert_header(DOCKER_CONTENT_DIGEST, current_digest.to_string().as_str()),
+            )
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let mut repositories = HashMap::new();
+        repositories.insert(
+            REPO.to_string(),
+            repository_with_downstream(downstream_client(&mock_server.uri())),
+        );
+        let resolver = Arc::new(RepositoryResolver::new(Arc::new(repositories)).unwrap());
+
+        let handler = ReplicationJobHandler::builder()
+            .resolver(resolver)
+            .blob_store(blob_store)
+            .metadata_store(metadata_store)
+            .build()
+            .unwrap();
+
+        let payload = ReplicationPushPayload {
+            downstream: DOWNSTREAM.to_string(),
+            namespace: NAMESPACE.to_string(),
+            tag: Some("v1".to_string()),
+            digest: Some(stale_digest.to_string()),
+            kind: REPLICATION_PUSH_MANIFEST_KIND.to_string(),
+            source_ts: Some("2026-06-03T00:00:00Z".to_string()),
+        };
+        let envelope = build_envelope(&payload).unwrap();
+        handler.execute(&envelope).await.unwrap();
+
+        let manifest_path = format!("/v2/{NAMESPACE}/manifests/v1");
+        let received = mock_server.received_requests().await.unwrap_or_default();
+        let put = received
+            .iter()
+            .find(|r| r.method.as_str() == "PUT" && r.url.path() == manifest_path)
+            .expect("the push must PUT the manifest");
+        assert_eq!(
+            put.body, current_bytes,
+            "the resolve must read the backend link, not the stale cached one"
+        );
         drop(mock_server);
     }
 
