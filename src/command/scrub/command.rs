@@ -10,8 +10,8 @@ use crate::{
         bootstrap,
         scrub::{
             check::{
-                BlobChecker, LayoutChecker, MultipartChecker, NamespaceChecker, StoreChecker,
-                list_all,
+                BlobChecker, LayoutChecker, MultipartChecker, NamespaceChecker, OrphanJobChecker,
+                StoreChecker, list_all,
             },
             error::Error,
             executor::{ActionSink, DryRunSink, Executor},
@@ -73,6 +73,14 @@ pub struct Options {
     /// delete for each downstream-only tag (one-way mirror; unsafe for
     /// active-active peers)
     pub replicate: bool,
+    #[argh(switch)]
+    /// delete replication jobs (pending and dead-lettered) whose downstream or
+    /// repository is no longer configured
+    pub replication_orphans: bool,
+    #[argh(switch)]
+    /// delete cache jobs (pending and dead-lettered) whose repository is no
+    /// longer configured for pull-through
+    pub cache_orphans: bool,
 }
 
 pub struct Command {
@@ -81,6 +89,9 @@ pub struct Command {
     layout_checker: LayoutChecker,
     blob_checker: Option<BlobChecker>,
     multipart_checker: Option<MultipartChecker>,
+    /// One checker per queue selected by `--replication-orphans` and
+    /// `--cache-orphans`; empty when neither flag is set.
+    orphan_job_checkers: Vec<OrphanJobChecker>,
     sink: Box<dyn ActionSink + Send>,
     /// Drains reconcile-enqueued replication jobs in-process, since no running
     /// worker is assumed; a transiently failing push is rescheduled with backoff
@@ -121,6 +132,8 @@ impl Command {
         let layout_checker = setup::layout_checker(&blob_backend);
         let blob_checker = setup::blob_checker(options, &blob_backend, &metadata_store);
         let multipart_checker = setup::multipart_checker(options, &blob_backend)?;
+        let orphan_job_checkers =
+            setup::orphan_job_checkers(options, &metadata_store, &repositories)?;
 
         // One `Arc<JobStore>` serves as both producer (Executor enqueue) and
         // consumer (end-of-run drain). Building the queue is cheap, so every
@@ -158,6 +171,7 @@ impl Command {
             layout_checker,
             blob_checker,
             multipart_checker,
+            orphan_job_checkers,
             sink,
             replication_drain,
         })
@@ -193,6 +207,10 @@ impl Command {
         self.scrub_metadata().await?;
         self.scrub_blobs().await?;
         self.scrub_multipart_uploads().await?;
+        // Orphan jobs (replication and cache queues) must be scrubbed before
+        // the drain: the drain claims any pending replication job and would
+        // churn its orphans through retries first.
+        self.scrub_orphan_jobs().await?;
         self.drain_replication_jobs().await;
         self.metadata_store.flush_access_times().await;
         Ok(())
@@ -235,6 +253,15 @@ impl Command {
             && let Err(e) = checker.check_all(self.sink.as_mut()).await
         {
             warn!("Multipart scrub checker failed: {e}");
+        }
+        Ok(())
+    }
+
+    async fn scrub_orphan_jobs(&mut self) -> Result<(), Error> {
+        for checker in &self.orphan_job_checkers {
+            if let Err(e) = checker.check_all(self.sink.as_mut()).await {
+                warn!("Orphan job scrub checker failed: {e}");
+            }
         }
         Ok(())
     }
@@ -324,6 +351,8 @@ mod tests {
             media_types: false,
             referrers: false,
             replicate: false,
+            replication_orphans: false,
+            cache_orphans: false,
         };
 
         let command = Command::new(&options, &config).await;

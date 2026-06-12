@@ -4,12 +4,13 @@
 //!
 //! Idempotency is mandatory (the queue is at-least-once): blobs are HEAD-probed
 //! before transfer and child manifests land before the parent index, so a
-//! re-run is a sequence of no-op HEADs.
+//! re-run of an already-converged manifest costs a single no-op HEAD.
 
-use std::{collections::HashSet, str::FromStr, sync::Arc};
+use std::{collections::HashSet, str::FromStr, sync::Arc, time::Duration};
 
 use futures_util::stream::{self, StreamExt, TryStreamExt};
 use serde_json::{Value, json};
+use tokio::time::timeout;
 use tracing::{debug, info, instrument, warn};
 
 use crate::{
@@ -24,6 +25,12 @@ use crate::{
     registry_client::{DeleteManifestOutcome, NO_LOCAL_PREFIX, RegistryClient},
     replication::{Error, manifest_accept_types},
 };
+
+/// Upper bound on each downstream HTTP call inside the referrers-merge
+/// critical section, kept well below the metadata executor lock's 300-second
+/// max-hold lease (the tx-engine default) so a hung downstream cannot outlive
+/// the lease and let a concurrent merge re-admit a lost update.
+const REFERRERS_MERGE_HTTP_TIMEOUT: Duration = Duration::from_mins(1);
 
 /// Outcome of a successful replication push or delete.
 ///
@@ -68,6 +75,35 @@ pub async fn push_manifest(
 ) -> Result<PushOutcome, Error> {
     let parsed = parse_manifest_digests(&body, media_type.as_ref()).map_err(Error::Registry)?;
 
+    // Pushing by tag binds tag -> digest atomically on the downstream.
+    let reference = match tag {
+        Some(tag) => Reference::Tag(tag.to_string()),
+        None => Reference::Digest(digest.clone()),
+    };
+    let location = downstream.get_manifest_path(NO_LOCAL_PREFIX, namespace, &reference);
+
+    // The converged skip runs before child recursion and the blob sweep: a
+    // digest-matching HEAD means the downstream validated this manifest's
+    // references at PUT time, so its children and blobs are already present
+    // (each recursed child still gets its own skip). A subject-bearing
+    // manifest must always PUT: only the PUT's `OCI-Subject` response reveals
+    // whether the downstream needs the referrers fallback, and a converged
+    // primary does not imply the fallback landed.
+    if parsed.subject.is_none()
+        && downstream
+            .head_manifest(&manifest_accept_types(), &location)
+            .await
+            .is_ok_and(|(_, downstream_digest, _)| &downstream_digest == digest)
+    {
+        info!(
+            namespace,
+            %digest,
+            ?tag,
+            "Downstream already holds this manifest; skipping PUT (converged)"
+        );
+        return Ok(PushOutcome::Converged);
+    }
+
     // Push child manifests first: the parent index must not land before its
     // children.
     for child in &parsed.manifests {
@@ -101,33 +137,6 @@ pub async fn push_manifest(
     )
     .await?;
 
-    // Pushing by tag binds tag -> digest atomically on the downstream.
-    let reference = match tag {
-        Some(tag) => Reference::Tag(tag.to_string()),
-        None => Reference::Digest(digest.clone()),
-    };
-    let location = downstream.get_manifest_path(NO_LOCAL_PREFIX, namespace, &reference);
-
-    // HEAD-before-PUT is a bandwidth optimization, not loop prevention (the
-    // receiver-side no-op dispatch gate breaks cycles). A subject-bearing
-    // manifest must always PUT: only the PUT's `OCI-Subject` response reveals
-    // whether the downstream needs the referrers fallback, and a converged
-    // primary does not imply the fallback landed.
-    if parsed.subject.is_none()
-        && downstream
-            .head_manifest(&manifest_accept_types(), &location)
-            .await
-            .is_ok_and(|(_, downstream_digest, _)| &downstream_digest == digest)
-    {
-        info!(
-            namespace,
-            %digest,
-            ?tag,
-            "Downstream already holds this manifest; skipping PUT (converged)"
-        );
-        return Ok(PushOutcome::Converged);
-    }
-
     // Retain a body copy only for the subject-bearing fallback path; the common
     // path moves the body into the PUT.
     let fallback_body = parsed.subject.is_some().then(|| body.clone());
@@ -158,6 +167,19 @@ pub async fn push_manifest(
             "Downstream superseded the push (last-writer-wins); treating as converged"
         );
         return Ok(PushOutcome::Superseded);
+    }
+    // A downstream echoing a digest other than the locally computed one has
+    // transformed the manifest body: silent content divergence worth a warn.
+    if let Some(echoed) = &result.digest
+        && echoed != digest
+    {
+        warn!(
+            namespace,
+            %digest,
+            %echoed,
+            ?tag,
+            "Downstream echoed a different digest for the pushed manifest body"
+        );
     }
     info!(namespace, %digest, ?tag, "Pushed manifest to downstream");
 
@@ -238,9 +260,15 @@ async fn push_one_blob(
     digest: &Digest,
 ) -> Result<(), Error> {
     let head_location = downstream.get_blob_path(NO_LOCAL_PREFIX, namespace, digest);
-    if downstream.head_blob(&[], &head_location).await.is_ok() {
-        debug!(namespace, %digest, "Blob already present on downstream; skipping");
-        return Ok(());
+    // Only a true 404 means absent; a transient probe failure must fail the
+    // push (the job retries) instead of triggering a pointless full upload.
+    match downstream.head_blob(&[], &head_location).await {
+        Ok(_) => {
+            debug!(namespace, %digest, "Blob already present on downstream; skipping");
+            return Ok(());
+        }
+        Err(RegistryError::BlobUnknown) => {}
+        Err(e) => return Err(Error::Registry(e)),
     }
 
     let start_location = downstream.get_uploads_start_path(NO_LOCAL_PREFIX, namespace);
@@ -293,17 +321,31 @@ async fn upload_into_session(
             "failed to open local blob '{digest}': {e}"
         )))
     })?;
-    let session_url = downstream
+    let patched_url = match downstream
         .patch_upload(session_url, content_length, reader)
         .await
-        .map_err(Error::Registry)?;
-    downstream
-        .complete_upload(&session_url, digest)
-        .await
-        .map_err(Error::Registry)?;
+    {
+        Ok(url) => url,
+        Err(e) => {
+            cancel_upload_session(downstream, session_url).await;
+            return Err(Error::Registry(e));
+        }
+    };
+    if let Err(e) = downstream.complete_upload(&patched_url, digest).await {
+        cancel_upload_session(downstream, &patched_url).await;
+        return Err(Error::Registry(e));
+    }
 
     info!(namespace, %digest, content_length, "Pushed blob to downstream");
     Ok(())
+}
+
+/// Best-effort OCI session cancel after a failed upload step, so the failure
+/// does not strand an open session on the downstream until its own GC.
+async fn cancel_upload_session(downstream: &RegistryClient, session_url: &str) {
+    if let Err(e) = downstream.delete_upload(session_url).await {
+        debug!("Failed to cancel downstream upload session ({e}); leaving it to downstream GC");
+    }
 }
 
 /// Pushes the OCI-1.0 referrers fallback tag index for a subject-bearing
@@ -377,7 +419,17 @@ async fn merge_referrers_fallback(
     parsed: &ParsedManifestDigests,
     body: &[u8],
 ) -> Result<(), Error> {
-    let mut manifests = fetch_fallback_manifests(downstream, location).await?;
+    // The timeout keeps each call below the executor lock's max-hold lease.
+    let mut manifests = timeout(
+        REFERRERS_MERGE_HTTP_TIMEOUT,
+        fetch_fallback_manifests(downstream, location),
+    )
+    .await
+    .map_err(|_| {
+        Error::Registry(RegistryError::Internal(format!(
+            "referrers fallback GET at '{location}' timed out inside the merge lock"
+        )))
+    })??;
 
     // The blob store is content-addressed, so `digest` is already the body's
     // digest; no re-hash or re-parse needed.
@@ -409,11 +461,19 @@ async fn merge_referrers_fallback(
     })?;
 
     // Timestamp-less PUT: the receiver then skips LWW, so the merged index can
-    // never come back superseded and silently drop a descriptor.
-    downstream
-        .put_manifest(location, Some(OCI_INDEX_MEDIA_TYPE), index_body, None)
-        .await
-        .map_err(Error::Registry)?;
+    // never come back superseded and silently drop a descriptor. The timeout
+    // keeps the call below the executor lock's max-hold lease.
+    timeout(
+        REFERRERS_MERGE_HTTP_TIMEOUT,
+        downstream.put_manifest(location, Some(OCI_INDEX_MEDIA_TYPE), index_body, None),
+    )
+    .await
+    .map_err(|_| {
+        Error::Registry(RegistryError::Internal(format!(
+            "referrers fallback PUT at '{location}' timed out inside the merge lock"
+        )))
+    })?
+    .map_err(Error::Registry)?;
     Ok(())
 }
 
@@ -1656,6 +1716,319 @@ mod tests {
         .await
         .expect("the Accept-stamped HEAD must still drive the converged skip");
         assert_eq!(outcome, PushOutcome::Converged);
+        drop(mock_server);
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn converged_manifest_with_blobs_sends_exactly_one_head() {
+        // The converged skip runs before child recursion and the blob sweep,
+        // so a redelivered already-converged manifest costs one manifest HEAD:
+        // zero blob HEADs, zero uploads, zero PUTs.
+        metrics_provider::init_for_tests();
+        let mock_server = MockServer::start().await;
+        let dir = TempDir::new().unwrap();
+        let (blob_store, metadata_store, store) = test_blob_store(dir.path().to_str().unwrap());
+
+        let config = put_blob_direct(&store, br#"{"c":1}"#).await;
+        let layer_a = put_blob_direct(&store, b"layer-a-bytes").await;
+        let layer_b = put_blob_direct(&store, b"layer-b-bytes").await;
+        let manifest = json!({
+            "schemaVersion": 2,
+            "mediaType": OCI_MANIFEST_MEDIA_TYPE,
+            "config": {
+                "mediaType": "application/vnd.oci.image.config.v1+json",
+                "digest": config.to_string(),
+                "size": 7,
+            },
+            "layers": [
+                {
+                    "mediaType": "application/vnd.oci.image.layer.v1.tar",
+                    "digest": layer_a.to_string(),
+                    "size": 13,
+                },
+                {
+                    "mediaType": "application/vnd.oci.image.layer.v1.tar",
+                    "digest": layer_b.to_string(),
+                    "size": 13,
+                },
+            ],
+        });
+        let manifest_bytes = serde_json::to_vec(&manifest).unwrap();
+        let manifest_digest = put_blob_direct(&store, &manifest_bytes).await;
+
+        // The converged probe is the only request allowed to reach the downstream.
+        Mock::given(method("HEAD"))
+            .and(path(format!("/v2/{NAMESPACE}/manifests/v1")))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header(DOCKER_CONTENT_DIGEST, manifest_digest.to_string().as_str())
+                    .insert_header("Content-Length", manifest_bytes.len().to_string().as_str()),
+            )
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+        for blob in [&config, &layer_a, &layer_b] {
+            Mock::given(method("HEAD"))
+                .and(path(format!("/v2/{NAMESPACE}/blobs/{blob}")))
+                .respond_with(ResponseTemplate::new(404))
+                .expect(0)
+                .mount(&mock_server)
+                .await;
+        }
+        Mock::given(method("POST"))
+            .and(path(format!("/v2/{NAMESPACE}/blobs/uploads/")))
+            .respond_with(ResponseTemplate::new(202))
+            .expect(0)
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path(format!("/v2/{NAMESPACE}/manifests/v1")))
+            .respond_with(ResponseTemplate::new(201))
+            .expect(0)
+            .mount(&mock_server)
+            .await;
+
+        let outcome = push_manifest(
+            &downstream_client(&mock_server.uri()),
+            &blob_store,
+            &metadata_store,
+            NAMESPACE,
+            &manifest_digest,
+            Some(OCI_MANIFEST_MEDIA_TYPE.to_string()),
+            Some("v1"),
+            manifest_bytes,
+            4,
+            None,
+        )
+        .await
+        .expect("a converged manifest must skip the blob sweep and the PUT");
+        assert_eq!(
+            outcome,
+            PushOutcome::Converged,
+            "a digest-matching HEAD before the blob sweep must converge"
+        );
+        drop(mock_server);
+    }
+
+    #[tokio::test]
+    async fn converged_child_skips_its_own_put_inside_index_recursion() {
+        // Each recursed child runs its own converged HEAD-skip: a child the
+        // downstream already holds is not re-PUT while the index still lands.
+        metrics_provider::init_for_tests();
+        let mock_server = MockServer::start().await;
+        let dir = TempDir::new().unwrap();
+        let (blob_store, metadata_store, store) = test_blob_store(dir.path().to_str().unwrap());
+
+        let child = json!({
+            "schemaVersion": 2,
+            "mediaType": OCI_MANIFEST_MEDIA_TYPE,
+            "layers": [],
+        });
+        let child_bytes = serde_json::to_vec(&child).unwrap();
+        let child_digest = put_blob_direct(&store, &child_bytes).await;
+        let index = json!({
+            "schemaVersion": 2,
+            "mediaType": OCI_INDEX_MEDIA_TYPE,
+            "manifests": [{
+                "mediaType": OCI_MANIFEST_MEDIA_TYPE,
+                "digest": child_digest.to_string(),
+                "size": child_bytes.len(),
+            }],
+        });
+        let index_bytes = serde_json::to_vec(&index).unwrap();
+        let index_digest = put_blob_direct(&store, &index_bytes).await;
+
+        // The index probe misses (404), the child probe hits (converged).
+        Mock::given(method("HEAD"))
+            .and(path(format!("/v2/{NAMESPACE}/manifests/v1")))
+            .respond_with(ResponseTemplate::new(404))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("HEAD"))
+            .and(path(format!("/v2/{NAMESPACE}/manifests/{child_digest}")))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header(DOCKER_CONTENT_DIGEST, child_digest.to_string().as_str())
+                    .insert_header("Content-Length", child_bytes.len().to_string().as_str()),
+            )
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path(format!("/v2/{NAMESPACE}/manifests/{child_digest}")))
+            .respond_with(ResponseTemplate::new(201))
+            .expect(0)
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path(format!("/v2/{NAMESPACE}/manifests/v1")))
+            .respond_with(
+                ResponseTemplate::new(201)
+                    .insert_header(DOCKER_CONTENT_DIGEST, index_digest.to_string().as_str()),
+            )
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let outcome = push_manifest(
+            &downstream_client(&mock_server.uri()),
+            &blob_store,
+            &metadata_store,
+            NAMESPACE,
+            &index_digest,
+            Some(OCI_INDEX_MEDIA_TYPE.to_string()),
+            Some("v1"),
+            index_bytes,
+            4,
+            None,
+        )
+        .await
+        .expect("a converged child must skip its PUT while the index still lands");
+        assert_eq!(outcome, PushOutcome::Pushed);
+        drop(mock_server);
+    }
+
+    #[tokio::test]
+    async fn blob_head_503_fails_the_push_without_upload_attempt() {
+        // A transient blob-probe failure must fail the push so the job
+        // retries; treating it as absent would start a pointless full upload.
+        metrics_provider::init_for_tests();
+        let mock_server = MockServer::start().await;
+        let dir = TempDir::new().unwrap();
+        let (blob_store, metadata_store, store) = test_blob_store(dir.path().to_str().unwrap());
+
+        let config = put_blob_direct(&store, br#"{"c":1}"#).await;
+        let manifest = json!({
+            "schemaVersion": 2,
+            "mediaType": OCI_MANIFEST_MEDIA_TYPE,
+            "config": {
+                "mediaType": "application/vnd.oci.image.config.v1+json",
+                "digest": config.to_string(),
+                "size": 7,
+            },
+            "layers": [],
+        });
+        let manifest_bytes = serde_json::to_vec(&manifest).unwrap();
+        let manifest_digest = put_blob_direct(&store, &manifest_bytes).await;
+
+        Mock::given(method("HEAD"))
+            .and(path(format!("/v2/{NAMESPACE}/blobs/{config}")))
+            .respond_with(ResponseTemplate::new(503))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path(format!("/v2/{NAMESPACE}/blobs/uploads/")))
+            .respond_with(ResponseTemplate::new(202))
+            .expect(0)
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path(format!("/v2/{NAMESPACE}/manifests/v1")))
+            .respond_with(ResponseTemplate::new(201))
+            .expect(0)
+            .mount(&mock_server)
+            .await;
+
+        let result = push_manifest(
+            &downstream_client(&mock_server.uri()),
+            &blob_store,
+            &metadata_store,
+            NAMESPACE,
+            &manifest_digest,
+            Some(OCI_MANIFEST_MEDIA_TYPE.to_string()),
+            Some("v1"),
+            manifest_bytes,
+            4,
+            None,
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "a 503 blob HEAD must fail the push (retryable), got: {result:?}"
+        );
+        drop(mock_server);
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn failed_patch_cancels_the_upload_session() {
+        // A PATCH failure must best-effort DELETE the open session exactly
+        // once and still propagate the original upload error.
+        metrics_provider::init_for_tests();
+        let mock_server = MockServer::start().await;
+        let dir = TempDir::new().unwrap();
+        let (blob_store, metadata_store, store) = test_blob_store(dir.path().to_str().unwrap());
+
+        let config = put_blob_direct(&store, br#"{"c":1}"#).await;
+        let manifest = json!({
+            "schemaVersion": 2,
+            "mediaType": OCI_MANIFEST_MEDIA_TYPE,
+            "config": {
+                "mediaType": "application/vnd.oci.image.config.v1+json",
+                "digest": config.to_string(),
+                "size": 7,
+            },
+            "layers": [],
+        });
+        let manifest_bytes = serde_json::to_vec(&manifest).unwrap();
+        let manifest_digest = put_blob_direct(&store, &manifest_bytes).await;
+
+        Mock::given(method("HEAD"))
+            .and(path(format!("/v2/{NAMESPACE}/blobs/{config}")))
+            .respond_with(ResponseTemplate::new(404))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path(format!("/v2/{NAMESPACE}/blobs/uploads/")))
+            .respond_with(
+                ResponseTemplate::new(202)
+                    .insert_header("Location", format!("/v2/{NAMESPACE}/blobs/uploads/s")),
+            )
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("PATCH"))
+            .and(path(format!("/v2/{NAMESPACE}/blobs/uploads/s")))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("DELETE"))
+            .and(path(format!("/v2/{NAMESPACE}/blobs/uploads/s")))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path(format!("/v2/{NAMESPACE}/manifests/v1")))
+            .respond_with(ResponseTemplate::new(201))
+            .expect(0)
+            .mount(&mock_server)
+            .await;
+
+        let result = push_manifest(
+            &downstream_client(&mock_server.uri()),
+            &blob_store,
+            &metadata_store,
+            NAMESPACE,
+            &manifest_digest,
+            Some(OCI_MANIFEST_MEDIA_TYPE.to_string()),
+            Some("v1"),
+            manifest_bytes,
+            4,
+            None,
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "the original PATCH failure must propagate past the session cancel, got: {result:?}"
+        );
         drop(mock_server);
     }
 

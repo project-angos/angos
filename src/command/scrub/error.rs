@@ -37,6 +37,11 @@ pub enum Error {
     #[error("scrub replication error: {0}")]
     Replication(String),
 
+    /// A durable-queue failure (list, read, or delete) raised while scrubbing
+    /// orphan jobs on the replication or cache queue.
+    #[error("scrub job queue error: {0}")]
+    JobQueue(String),
+
     /// Wraps a `metadata_store::Error` with source preserved.
     #[error("scrub metadata store error: {0}")]
     MetadataStore(#[from] metadata_store::Error),
@@ -117,6 +122,15 @@ mod tests {
         assert_eq!(
             format!("{error}"),
             "scrub replication error: failed to enqueue replication job"
+        );
+    }
+
+    #[test]
+    fn job_queue_display_includes_prefix() {
+        let error = Error::JobQueue("failed to list cache jobs".to_string());
+        assert_eq!(
+            format!("{error}"),
+            "scrub job queue error: failed to list cache jobs"
         );
     }
 

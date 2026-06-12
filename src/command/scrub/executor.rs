@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use chrono::Utc;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::{
     command::scrub::{action::Action, error::Error},
@@ -10,13 +10,13 @@ use crate::{
     oci::{Manifest, Reference},
     registry::{
         blob_store::{self, MultipartCleanup},
-        job_store::JobStore,
+        job_store::{Error as JobStoreError, JobEnvelope, JobStore},
         manifest::link_plan,
         metadata_store::{BlobIndexOperation, LinkOperation, MetadataStore, link_kind::LinkKind},
     },
     replication::{
         REPLICATION_DELETE_MANIFEST_KIND, REPLICATION_PUSH_MANIFEST_KIND, ReplicationPushPayload,
-        build_envelope,
+        build_envelope, build_prune_delete_envelope,
     },
 };
 
@@ -65,12 +65,15 @@ impl Executor {
             .expect("blob_store, metadata_store and job_store provided")
     }
 
-    /// Lands the payload on the durable replication queue with the same envelope
-    /// shape as the event path, so a reconcile push coalesces with a pending
-    /// event-path push. Deletes include `source_ts` in their `lock_key`, so a
-    /// prune delete never coalesces with a pending event-path delete.
-    async fn enqueue_replication(&self, payload: ReplicationPushPayload) -> Result<(), Error> {
-        let envelope = build_envelope(&payload).map_err(|e| {
+    /// Lands the envelope on the durable replication queue. A reconcile push
+    /// shares the event path's `lock_key` (so it coalesces with a pending
+    /// event-path push); a prune delete keys on the bare reference, so repeated
+    /// runs coalesce and never merge with a timestamped event-path delete.
+    async fn enqueue_replication(
+        &self,
+        envelope: Result<JobEnvelope, serde_json::Error>,
+    ) -> Result<(), Error> {
+        let envelope = envelope.map_err(|e| {
             record_reconcile_outcome("failed");
             Error::Replication(format!("failed to build replication envelope: {e}"))
         })?;
@@ -297,7 +300,7 @@ impl ActionSink for Executor {
                 tag,
                 digest,
             } => {
-                self.enqueue_replication(ReplicationPushPayload {
+                let payload = ReplicationPushPayload {
                     downstream,
                     namespace,
                     tag: Some(tag),
@@ -307,8 +310,8 @@ impl ActionSink for Executor {
                     // execute time, so the push carries the same last-writer-wins
                     // version as the event path.
                     source_ts: None,
-                })
-                .await?;
+                };
+                self.enqueue_replication(build_envelope(&payload)).await?;
             }
             Action::EnqueueReplicationDelete {
                 downstream,
@@ -321,15 +324,38 @@ impl ActionSink for Executor {
                 // does NOT make prune active-active safe: a peer's newer tag
                 // created before this run is still deleted, so `prune = true` is
                 // one-way-mirror-only.
-                self.enqueue_replication(ReplicationPushPayload {
+                let payload = ReplicationPushPayload {
                     downstream,
                     namespace,
                     tag: Some(tag),
                     digest: None,
                     kind: REPLICATION_DELETE_MANIFEST_KIND.to_string(),
                     source_ts: Some(Utc::now().to_rfc3339()),
-                })
-                .await?;
+                };
+                // The prune envelope keys on the bare reference so repeated runs
+                // coalesce instead of stacking one fresh-ts job per run.
+                self.enqueue_replication(build_prune_delete_envelope(&payload))
+                    .await?;
+            }
+            Action::DeleteOrphanJob {
+                queue,
+                state,
+                storage_key,
+                ..
+            } => {
+                match self.job_store.delete_job(queue, state, &storage_key).await {
+                    Ok(()) => {}
+                    // A stale key means the job was claimed-and-completed or
+                    // deleted concurrently; either way the orphan is gone.
+                    Err(JobStoreError::NotFound) => {
+                        debug!("{queue} job '{storage_key}' already gone; nothing to delete");
+                    }
+                    Err(e) => {
+                        return Err(Error::JobQueue(format!(
+                            "failed to delete {queue} job '{storage_key}': {e}"
+                        )));
+                    }
+                }
             }
         }
 
@@ -359,6 +385,8 @@ mod tests {
     use crate::{
         oci::Digest,
         registry::{
+            cache_job_handler::{CACHE_FETCH_BLOB_KIND, CACHE_QUEUE, CacheFetchBlobPayload},
+            job_store::{FailOutcome, JobState},
             metadata_store::{LinkOperation, link_kind::LinkKind},
             test_utils::{backends, put_blob_direct},
         },
@@ -731,6 +759,205 @@ mod tests {
                 "source_ts must be a valid RFC 3339 timestamp; got {source_ts}"
             );
 
+            test_case.cleanup().await;
+        }
+    }
+
+    /// Each apply stamps a fresh decision-time `source_ts`, so this pins that
+    /// the prune `lock_key` excludes it: a second run against a still-failing
+    /// downstream must coalesce, not stack a second job per tag.
+    #[tokio::test]
+    async fn prune_delete_enqueues_coalesce_while_one_is_pending() {
+        for test_case in backends() {
+            let blob_store = test_case.blob_store();
+            let metadata_store = test_case.metadata_store();
+
+            let job_store = Arc::new(JobStore::new(
+                metadata_store.store_arc(),
+                "scrub-prune-coalesce",
+            ));
+
+            let mut executor = Executor::builder()
+                .blob_store(blob_store)
+                .metadata_store(metadata_store)
+                .job_store(job_store.clone())
+                .build()
+                .unwrap();
+
+            for _ in 0..2 {
+                executor
+                    .apply(Action::EnqueueReplicationDelete {
+                        downstream: "mirror".to_string(),
+                        namespace: "ns/app".to_string(),
+                        tag: "stray".to_string(),
+                    })
+                    .await
+                    .unwrap();
+            }
+
+            assert_eq!(
+                job_store.count_pending(REPLICATION_QUEUE, 0).await.unwrap(),
+                1,
+                "two prune-delete enqueues for the same (downstream, namespace, tag) \
+                 must coalesce into a single pending job"
+            );
+
+            test_case.cleanup().await;
+        }
+    }
+
+    /// Builds an orphan-shaped replication push envelope.
+    fn orphan_push_envelope() -> JobEnvelope {
+        let payload = ReplicationPushPayload {
+            downstream: "removed".to_string(),
+            namespace: "ns/app".to_string(),
+            tag: Some("v1".to_string()),
+            digest: None,
+            kind: REPLICATION_PUSH_MANIFEST_KIND.to_string(),
+            source_ts: None,
+        };
+        build_envelope(&payload).unwrap()
+    }
+
+    /// Builds an orphan-shaped pull-through cache-fill envelope.
+    fn orphan_cache_envelope() -> JobEnvelope {
+        let payload = CacheFetchBlobPayload {
+            namespace: "ns/app".to_string(),
+            digest: "sha256:1111111111111111111111111111111111111111111111111111111111111111"
+                .to_string(),
+        };
+        JobEnvelope::new(CACHE_QUEUE, CACHE_FETCH_BLOB_KIND, "cache.ns/app", &payload).unwrap()
+    }
+
+    fn delete_orphan_action(queue: &'static str, state: JobState, storage_key: String) -> Action {
+        Action::DeleteOrphanJob {
+            queue,
+            state,
+            storage_key,
+            reason: "configuration no longer resolves this job".to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn executor_delete_orphan_job_removes_pending_jobs_on_both_queues() {
+        for test_case in backends() {
+            let blob_store = test_case.blob_store();
+            let metadata_store = test_case.metadata_store();
+            let job_store = Arc::new(JobStore::new(metadata_store.store_arc(), "scrub-orphan"));
+
+            let mut executor = Executor::builder()
+                .blob_store(blob_store)
+                .metadata_store(metadata_store)
+                .job_store(job_store.clone())
+                .build()
+                .unwrap();
+
+            for (queue, envelope) in [
+                (REPLICATION_QUEUE, orphan_push_envelope()),
+                (CACHE_QUEUE, orphan_cache_envelope()),
+            ] {
+                job_store.enqueue(envelope).await.unwrap();
+                let keys = job_store.list_pending(queue, 10).await.unwrap();
+                assert_eq!(keys.len(), 1);
+
+                executor
+                    .apply(delete_orphan_action(
+                        queue,
+                        JobState::Pending,
+                        keys[0].clone(),
+                    ))
+                    .await
+                    .unwrap();
+
+                assert_eq!(
+                    job_store.count_pending(queue, 0).await.unwrap(),
+                    0,
+                    "the pending orphan job on '{queue}' must be deleted"
+                );
+            }
+            test_case.cleanup().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn executor_delete_orphan_job_removes_failed_jobs_on_both_queues() {
+        for test_case in backends() {
+            let blob_store = test_case.blob_store();
+            let metadata_store = test_case.metadata_store();
+            let job_store = Arc::new(JobStore::new(metadata_store.store_arc(), "scrub-orphan"));
+
+            let mut executor = Executor::builder()
+                .blob_store(blob_store)
+                .metadata_store(metadata_store)
+                .job_store(job_store.clone())
+                .build()
+                .unwrap();
+
+            for (queue, mut envelope) in [
+                (REPLICATION_QUEUE, orphan_push_envelope()),
+                (CACHE_QUEUE, orphan_cache_envelope()),
+            ] {
+                // A single-attempt job failed once dead-letters under its
+                // original key.
+                envelope.max_attempts = 1;
+                job_store.enqueue(envelope).await.unwrap();
+                let claimed = job_store
+                    .claim_one(queue)
+                    .await
+                    .unwrap()
+                    .claimed
+                    .expect("the job must be claimable");
+                let outcome = job_store.fail(claimed, "simulated failure").await.unwrap();
+                assert!(matches!(outcome, FailOutcome::MovedToDeadLetter));
+
+                let (failed_keys, _) = job_store.list_failed_page(queue, 10, None).await.unwrap();
+                assert_eq!(failed_keys.len(), 1);
+
+                executor
+                    .apply(delete_orphan_action(
+                        queue,
+                        JobState::Failed,
+                        failed_keys[0].clone(),
+                    ))
+                    .await
+                    .unwrap();
+
+                let (failed_keys, _) = job_store.list_failed_page(queue, 10, None).await.unwrap();
+                assert!(
+                    failed_keys.is_empty(),
+                    "the dead-lettered orphan job on '{queue}' must be deleted"
+                );
+            }
+            test_case.cleanup().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn executor_delete_orphan_job_tolerates_stale_key() {
+        for test_case in backends() {
+            let blob_store = test_case.blob_store();
+            let metadata_store = test_case.metadata_store();
+            let job_store = Arc::new(JobStore::new(metadata_store.store_arc(), "scrub-orphan"));
+
+            let mut executor = Executor::builder()
+                .blob_store(blob_store)
+                .metadata_store(metadata_store)
+                .job_store(job_store)
+                .build()
+                .unwrap();
+
+            for queue in [REPLICATION_QUEUE, CACHE_QUEUE] {
+                for state in [JobState::Pending, JobState::Failed] {
+                    executor
+                        .apply(delete_orphan_action(
+                            queue,
+                            state,
+                            "0000000000000000-already-gone".to_string(),
+                        ))
+                        .await
+                        .expect("a stale storage_key must be tolerated, not an error");
+                }
+            }
             test_case.cleanup().await;
         }
     }

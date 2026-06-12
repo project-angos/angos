@@ -1,6 +1,7 @@
 use std::{collections::HashSet, sync::Arc};
 
 use chrono::{DateTime, Utc};
+use futures_util::future::join_all;
 use hyper::header::{ACCEPT_RANGES, CONTENT_RANGE};
 use tokio::io::AsyncReadExt;
 #[cfg(test)]
@@ -358,39 +359,45 @@ impl Registry {
         // outrank (and destroy) a recreate that landed in between.
         let source_ts = source_ts.unwrap_or_else(Utc::now).to_rfc3339();
 
-        for downstream in &repository.replication {
-            if !downstream.enqueues_for(namespace.as_ref()) {
-                continue;
-            }
-
-            let payload = ReplicationPushPayload {
-                downstream: downstream.name.clone(),
-                namespace: namespace.to_string(),
-                tag: tag.map(str::to_string),
-                digest: digest.map(ToString::to_string),
-                kind: kind.to_string(),
-                source_ts: Some(source_ts.clone()),
-            };
-            // Build + enqueue as one fallible step so failures share the warn + metric path.
-            let outcome = match build_envelope(&payload) {
-                Ok(envelope) => self
-                    .job_queue
-                    .enqueue(envelope)
-                    .await
-                    .map_err(|e| e.to_string()),
-                Err(e) => Err(e.to_string()),
-            };
-            if let Err(error) = outcome {
-                warn!(
-                    "Failed to dispatch replication job for {}: {error}",
-                    downstream.name
-                );
-                metrics_provider()
-                    .job_queue_enqueue_failures_total
-                    .with_label_values(&[REPLICATION_QUEUE])
-                    .inc();
-            }
-        }
+        // The per-downstream enqueues run concurrently: each one is an index
+        // GET plus a CAS transaction, and this awaits inside the client's
+        // PUT/DELETE response path, so serial fan-out adds tail latency.
+        let dispatches = repository
+            .replication
+            .iter()
+            .filter(|downstream| downstream.enqueues_for(namespace.as_ref()))
+            .map(|downstream| {
+                let payload = ReplicationPushPayload {
+                    downstream: downstream.name.clone(),
+                    namespace: namespace.to_string(),
+                    tag: tag.map(str::to_string),
+                    digest: digest.map(ToString::to_string),
+                    kind: kind.to_string(),
+                    source_ts: Some(source_ts.clone()),
+                };
+                async move {
+                    // Build + enqueue as one fallible step so failures share the warn + metric path.
+                    let outcome = match build_envelope(&payload) {
+                        Ok(envelope) => self
+                            .job_queue
+                            .enqueue(envelope)
+                            .await
+                            .map_err(|e| e.to_string()),
+                        Err(e) => Err(e.to_string()),
+                    };
+                    if let Err(error) = outcome {
+                        warn!(
+                            "Failed to dispatch replication job for {}: {error}",
+                            downstream.name
+                        );
+                        metrics_provider()
+                            .job_queue_enqueue_failures_total
+                            .with_label_values(&[REPLICATION_QUEUE])
+                            .inc();
+                    }
+                }
+            });
+        join_all(dispatches).await;
     }
 
     async fn get_local_blob(
@@ -1445,21 +1452,26 @@ mod dispatch_replication_tests {
         )
     }
 
-    /// Repository with exactly one downstream of the given mode and namespace filter.
-    fn repository_with(mode: ReplicationMode, namespace_filter: Vec<Regex>) -> Repository {
+    fn downstream_with(
+        name: &str,
+        mode: ReplicationMode,
+        namespace_filter: Vec<Regex>,
+    ) -> ReplicationDownstream {
+        ReplicationDownstream::builder()
+            .name(name.to_string())
+            .registry_client(downstream_client())
+            .mode(mode)
+            .namespace_filter(namespace_filter)
+            .max_concurrent_pushes(4)
+            .build()
+            .unwrap()
+    }
+
+    fn repository_with_replication(replication: Vec<ReplicationDownstream>) -> Repository {
         Repository {
             name: REPO.to_string(),
             upstreams: Vec::new(),
-            replication: vec![
-                ReplicationDownstream::builder()
-                    .name(DOWNSTREAM.to_string())
-                    .registry_client(downstream_client())
-                    .mode(mode)
-                    .namespace_filter(namespace_filter)
-                    .max_concurrent_pushes(4)
-                    .build()
-                    .unwrap(),
-            ],
+            replication,
             retention_policy: RetentionPolicy::new(
                 &RetentionPolicyConfig::default(),
                 Arc::new(SystemClock),
@@ -1467,6 +1479,11 @@ mod dispatch_replication_tests {
             immutable_tags: false,
             immutable_tags_exclusions: Vec::new(),
         }
+    }
+
+    /// Repository with exactly one downstream of the given mode and namespace filter.
+    fn repository_with(mode: ReplicationMode, namespace_filter: Vec<Regex>) -> Repository {
+        repository_with_replication(vec![downstream_with(DOWNSTREAM, mode, namespace_filter)])
     }
 
     fn repository_with_downstream() -> Repository {
@@ -1586,6 +1603,56 @@ mod dispatch_replication_tests {
         assert!(
             DateTime::parse_from_rfc3339(&source_ts).is_ok(),
             "source_ts must be a valid RFC 3339 timestamp; got {source_ts}"
+        );
+    }
+
+    /// The fan-out enqueues concurrently (one index GET plus CAS transaction
+    /// per downstream); every matching downstream must still get exactly one
+    /// job carrying its own name.
+    #[tokio::test]
+    async fn dispatch_replication_enqueues_one_job_per_downstream() {
+        crate::metrics_provider::init_for_tests();
+        let dir = TempDir::new().unwrap();
+        let (registry, job_store) = build_registry_with(
+            dir.path().to_str().unwrap(),
+            repository_with_replication(vec![
+                downstream_with(DOWNSTREAM, ReplicationMode::EventReconcile, Vec::new()),
+                downstream_with("us-region", ReplicationMode::EventReconcile, Vec::new()),
+            ]),
+        );
+
+        let namespace = Namespace::new(NAMESPACE).unwrap();
+        let digest: Digest = SAMPLE_DIGEST.parse().unwrap();
+
+        let repository = registry.resolver.resolve(&namespace);
+        registry
+            .dispatch_replication(
+                repository,
+                &namespace,
+                REPLICATION_PUSH_MANIFEST_KIND,
+                Some("v1"),
+                Some(&digest),
+                None,
+            )
+            .await;
+
+        let keys = job_store.list_pending(REPLICATION_QUEUE, 16).await.unwrap();
+        assert_eq!(keys.len(), 2, "each matching downstream must get one job");
+        let mut downstreams = Vec::new();
+        for key in &keys {
+            let envelope = job_store
+                .read_pending(REPLICATION_QUEUE, key)
+                .await
+                .unwrap();
+            let payload: ReplicationPushPayload =
+                serde_json::from_value(envelope.payload).expect("decode ReplicationPushPayload");
+            downstreams.push(payload.downstream);
+        }
+        downstreams.sort();
+        assert_eq!(
+            downstreams,
+            vec![DOWNSTREAM.to_string(), "us-region".to_string()],
+            "one job per downstream, each addressed to its own downstream"
         );
     }
 

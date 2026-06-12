@@ -1,6 +1,9 @@
 use std::fmt;
 
-use crate::{oci::Digest, registry::metadata_store::link_kind::LinkKind};
+use crate::{
+    oci::Digest,
+    registry::{job_store::JobState, metadata_store::link_kind::LinkKind},
+};
 
 /// A single mutation that a scrub checker has decided to perform.
 ///
@@ -75,6 +78,15 @@ pub enum Action {
         downstream: String,
         namespace: String,
         tag: String,
+    },
+    /// Delete a queued job (replication or cache) whose payload no longer
+    /// resolves to configured state, so it can never succeed usefully again.
+    /// `reason` carries the per-queue explanation for display.
+    DeleteOrphanJob {
+        queue: &'static str,
+        state: JobState,
+        storage_key: String,
+        reason: String,
     },
 }
 
@@ -184,6 +196,21 @@ impl fmt::Display for Action {
                 write!(
                     f,
                     "enqueue replication delete of '{namespace}:{tag}' on downstream '{downstream}'"
+                )
+            }
+            Action::DeleteOrphanJob {
+                queue,
+                state,
+                storage_key,
+                reason,
+            } => {
+                let partition = match state {
+                    JobState::Pending => "pending",
+                    JobState::Failed => "failed",
+                };
+                write!(
+                    f,
+                    "delete the {partition} {queue} job '{storage_key}' because {reason}"
                 )
             }
         }

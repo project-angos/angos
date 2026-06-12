@@ -1496,6 +1496,85 @@ async fn test_delete_manifest_absent_404_is_already_absent() {
     assert_eq!(outcome, DeleteManifestOutcome::AlreadyAbsent);
 }
 
+#[tokio::test]
+async fn test_head_blob_5xx_is_transient_error_not_unknown() {
+    // BlobUnknown means "absent (404)"; a 503 must surface as a transient
+    // error so replication retries instead of starting a full upload.
+    let mock_server = MockServer::start().await;
+    let digest = "sha256:1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef";
+
+    Mock::given(method("HEAD"))
+        .and(path(format!("/v2/test/blobs/{digest}")))
+        .respond_with(ResponseTemplate::new(503))
+        .mount(&mock_server)
+        .await;
+
+    let client = client_for(&mock_server);
+    let result = client
+        .head_blob(
+            &[],
+            &format!("{}/v2/test/blobs/{digest}", mock_server.uri()),
+        )
+        .await;
+
+    assert!(
+        matches!(result, Err(Error::Internal(_))),
+        "a 503 blob HEAD must be a transient error, not BlobUnknown, got {result:?}"
+    );
+}
+
+#[tokio::test]
+async fn test_delete_upload_204_and_404_are_success() {
+    let mock_server = MockServer::start().await;
+
+    Mock::given(method("DELETE"))
+        .and(path("/v2/test/blobs/uploads/s1"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+    Mock::given(method("DELETE"))
+        .and(path("/v2/test/blobs/uploads/s2"))
+        .respond_with(ResponseTemplate::new(404))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let client = client_for(&mock_server);
+    client
+        .delete_upload(&format!("{}/v2/test/blobs/uploads/s1", mock_server.uri()))
+        .await
+        .expect("a 204 session cancel must succeed");
+    client
+        .delete_upload(&format!("{}/v2/test/blobs/uploads/s2", mock_server.uri()))
+        .await
+        .expect("a 404 session cancel must succeed (already gone is the goal state)");
+    drop(mock_server);
+}
+
+#[tokio::test]
+async fn test_delete_upload_500_is_error() {
+    let mock_server = MockServer::start().await;
+
+    Mock::given(method("DELETE"))
+        .and(path("/v2/test/blobs/uploads/s1"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let client = client_for(&mock_server);
+    let result = client
+        .delete_upload(&format!("{}/v2/test/blobs/uploads/s1", mock_server.uri()))
+        .await;
+
+    assert!(
+        matches!(result, Err(Error::Internal(_))),
+        "a 500 session cancel must surface as an error, got {result:?}"
+    );
+    drop(mock_server);
+}
+
 #[test]
 fn test_get_tags_list_path() {
     let config = RegistryClientConfig {

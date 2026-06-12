@@ -411,8 +411,12 @@ impl Registry {
         };
 
         // No-op suppression: the ref counts as absent only when the prior link
-        // is gone AND no tag still points at it. A transient read error counts
-        // as "existed" so a real delete is never suppressed.
+        // is gone AND no tag still points at it; a transient read error counts
+        // as "existed" so a real delete is never suppressed. Unlike the put
+        // gate's commit-validated `LinksCommit::changed` this is a pre-commit
+        // read a racing write can flip, which is safe: over-dispatch is
+        // idempotent, and the one suppression race coincides with a concurrent
+        // re-put whose own dispatch converges the mesh.
         let resolved_repository = self.resolver.resolve(namespace);
         let existed_before = match self
             .prior_link_if_replicated(resolved_repository, namespace, reference)

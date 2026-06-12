@@ -330,6 +330,35 @@ impl RegistryClient {
         Ok(())
     }
 
+    /// Cancels an open upload session (OCI session cancel, `DELETE` on the
+    /// session URL).
+    ///
+    /// A `404` counts as success: an already-gone session is the goal state.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the request fails, access is rejected, or the
+    /// response is a non-2xx status other than `404`.
+    #[instrument(skip(self))]
+    pub async fn delete_upload(&self, session_url: &str) -> Result<(), Error> {
+        let response = self
+            .send_body(&Method::DELETE, session_url, None, Vec::new(), None)
+            .await?;
+
+        if response.status() == StatusCode::NOT_FOUND {
+            return Ok(());
+        }
+
+        if !response.status().is_success() {
+            return Err(Error::Internal(format!(
+                "delete_upload failed with status {}",
+                response.status()
+            )));
+        }
+
+        Ok(())
+    }
+
     /// Classifies a replication-write `409`: `Ok(())` for a last-writer-wins
     /// rejection ([`REPLICATION_SUPERSEDED_CODE`], convergence), [`Error`] for
     /// any other 409 so the job retries or dead-letters.

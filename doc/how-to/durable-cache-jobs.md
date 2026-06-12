@@ -135,6 +135,11 @@ id. Inspect with `cat`/`jq` to diagnose persistent failures. The `_jobs` admin
 API and UI list, retry, and delete failed jobs per queue, selected with
 `?queue=cache` (the default) or `?queue=replication`.
 
+**Orphan jobs after a configuration change:** Removing a repository (or its
+upstreams) from the configuration leaves its pending cache jobs to fail and
+dead-letter. `angos scrub --cache-orphans` deletes those orphans from both the
+pending and dead-letter partitions; combine with `--dry-run` to preview.
+
 To requeue manually, move the file back into `_jobs/pending/<queue>/`. The
 filename's millis prefix continues to drive scheduling, so to force immediate
 re-execution rename the file with a zero prefix:

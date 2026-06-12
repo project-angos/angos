@@ -53,6 +53,10 @@ max_concurrent_pushes = 4             # optional; per-manifest blob fan-out (pos
 | `event-only` | Yes | No |
 | `reconcile-only` | No | Yes |
 
+:::note Removing or renaming a downstream
+Pending jobs for a removed or renamed downstream fail loudly and dead-letter after their retry budget. Clear them with `angos scrub --replication-orphans` (use `--dry-run` to preview), or inspect them via the jobs admin UI or the [`_jobs` API](../reference/api-endpoints.md#list-failed-jobs) (`?queue=replication`).
+:::
+
 ## Global Knobs
 
 One `[global]` field tunes replication across all repositories:

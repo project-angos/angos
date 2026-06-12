@@ -7,8 +7,8 @@ use crate::{
     command::scrub::{
         check::{
             BlobChecker, LayoutChecker, LinkReferencesChecker, ManifestChecker, MediaTypeChecker,
-            MultipartChecker, NamespaceChecker, ReferrerChecker, ReplicationChecker,
-            RetentionChecker, TagChecker, UploadChecker,
+            MultipartChecker, NamespaceChecker, OrphanJobChecker, OrphanQueue, ReferrerChecker,
+            ReplicationChecker, RetentionChecker, TagChecker, UploadChecker,
         },
         command::Options,
         error::Error,
@@ -16,7 +16,8 @@ use crate::{
     configuration::Configuration,
     policy::{RetentionPolicy, RetentionPolicyConfig, SystemClock},
     registry::{
-        blob_store, metadata_store::MetadataStore, repository_resolver::RepositoryResolver,
+        blob_store, job_store::JobStore, metadata_store::MetadataStore,
+        repository_resolver::RepositoryResolver,
     },
 };
 
@@ -137,6 +138,37 @@ pub fn multipart_checker(
         blob_store.clone(),
         multipart_timeout,
     )))
+}
+
+/// Builds one orphan-job checker per queue selected by `--replication-orphans`
+/// and `--cache-orphans`. The `JobStore` handle is read-only here (the executor
+/// deletes through its own), so the consumer id is irrelevant and left empty.
+pub fn orphan_job_checkers(
+    options: &Options,
+    metadata_store: &Arc<MetadataStore>,
+    resolver: &Arc<RepositoryResolver>,
+) -> Result<Vec<OrphanJobChecker>, Error> {
+    let mut queues = Vec::new();
+    if options.replication_orphans {
+        queues.push(OrphanQueue::Replication);
+    }
+    if options.cache_orphans {
+        queues.push(OrphanQueue::Cache);
+    }
+    if queues.is_empty() {
+        return Ok(Vec::new());
+    }
+    let job_store = Arc::new(JobStore::new(metadata_store.store_arc(), ""));
+    queues
+        .into_iter()
+        .map(|queue| {
+            OrphanJobChecker::builder()
+                .job_store(job_store.clone())
+                .resolver(resolver.clone())
+                .queue(queue)
+                .build()
+        })
+        .collect()
 }
 
 #[cfg(test)]

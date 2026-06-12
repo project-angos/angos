@@ -325,7 +325,16 @@ impl RegistryClient {
         let response = self.query(&Method::HEAD, accepted_types, location).await?;
 
         if !response.status().is_success() {
-            return Err(Error::BlobUnknown);
+            // Only a true 404 maps to BlobUnknown; callers must tell a
+            // transient failure apart from a genuinely absent blob.
+            return Err(if response.status() == StatusCode::NOT_FOUND {
+                Error::BlobUnknown
+            } else {
+                Error::Internal(format!(
+                    "head_blob: downstream returned status {}",
+                    response.status()
+                ))
+            });
         }
 
         let digest = parse_header(&response, DOCKER_CONTENT_DIGEST)?;

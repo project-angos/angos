@@ -58,33 +58,40 @@ pub struct ReplicationPushPayload {
     pub source_ts: Option<String>,
 }
 
-/// Builds the per-job `lock_key`,
-/// `{REPLICATION_QUEUE}.{op}.{downstream}:{namespace}:{tag_or_digest}` plus
-/// `@{source_ts}` for deletes, shared by the event path and the scrub checker
-/// so identical pending work coalesces. The `op` segment keeps a delete from
-/// coalescing into a still-pending push, and the delete-only timestamp keeps
-/// distinct deletion events apart because a delete cannot re-derive its
-/// last-writer-wins timestamp at execute time (pushes re-resolve digest and
-/// timestamp, so they safely coalesce on the bare reference).
-#[must_use]
-fn replication_lock_key(payload: &ReplicationPushPayload) -> String {
-    let tag_or_digest = payload
+/// Tag-or-digest segment shared by every replication `lock_key`.
+fn lock_key_reference(payload: &ReplicationPushPayload) -> &str {
+    payload
         .tag
         .as_deref()
         .or(payload.digest.as_deref())
-        .unwrap_or("");
+        .unwrap_or("")
+}
+
+/// Builds the per-job `lock_key`,
+/// `{REPLICATION_QUEUE}.{op}.{downstream}:{namespace}:{tag_or_digest}` plus
+/// `@{source_ts}` for deletes, shared by the event path and the scrub push
+/// reconcile so identical pending work coalesces. The `op` segment keeps a
+/// delete from coalescing into a still-pending push, and the delete-only
+/// timestamp keeps distinct deletion events apart because a delete cannot
+/// re-derive its last-writer-wins timestamp at execute time (pushes re-resolve
+/// digest and timestamp, so they safely coalesce on the bare reference). Scrub
+/// prune deletes coalesce differently; see [`build_prune_delete_envelope`].
+#[must_use]
+fn replication_lock_key(payload: &ReplicationPushPayload) -> String {
     if payload.kind == REPLICATION_DELETE_MANIFEST_KIND {
         format!(
             "{REPLICATION_QUEUE}.delete.{}:{}:{}@{}",
             payload.downstream,
             payload.namespace,
-            tag_or_digest,
+            lock_key_reference(payload),
             payload.source_ts.as_deref().unwrap_or("")
         )
     } else {
         format!(
             "{REPLICATION_QUEUE}.push.{}:{}:{}",
-            payload.downstream, payload.namespace, tag_or_digest
+            payload.downstream,
+            payload.namespace,
+            lock_key_reference(payload)
         )
     }
 }
@@ -100,6 +107,32 @@ pub fn build_envelope(payload: &ReplicationPushPayload) -> Result<JobEnvelope, s
         REPLICATION_QUEUE,
         payload.kind.clone(),
         replication_lock_key(payload),
+        payload,
+    )
+}
+
+/// Builds a [`JobEnvelope`] for a scrub prune delete, whose `lock_key` omits
+/// the `@{source_ts}` suffix so repeated reconcile runs coalesce on the bare
+/// reference instead of stacking one job per run. Coalescing keeps the first
+/// (older-ts) envelope, which is strictly more conservative under receiver
+/// last-writer-wins, and a later scrub run re-enqueues once the pending job
+/// clears, so convergence is preserved.
+///
+/// # Errors
+///
+/// Returns a [`serde_json::Error`] when the payload cannot be serialized.
+pub fn build_prune_delete_envelope(
+    payload: &ReplicationPushPayload,
+) -> Result<JobEnvelope, serde_json::Error> {
+    JobEnvelope::new(
+        REPLICATION_QUEUE,
+        payload.kind.clone(),
+        format!(
+            "{REPLICATION_QUEUE}.delete.{}:{}:{}",
+            payload.downstream,
+            payload.namespace,
+            lock_key_reference(payload)
+        ),
         payload,
     )
 }
@@ -131,6 +164,10 @@ impl ReplicationJobHandler {
                 "no repository configured for namespace '{namespace}'"
             ))
         })?;
+        // Failing loudly on an unknown downstream is intentional: it surfaces
+        // stale config (a removed or renamed downstream) and the orphaned jobs
+        // dead-letter after max attempts instead of vanishing silently;
+        // `scrub --replication-orphans` clears them.
         repository
             .replication
             .iter()
@@ -423,7 +460,8 @@ mod tests {
             REPLICATION_DELETE_MANIFEST_KIND, REPLICATION_PUSH_MANIFEST_KIND,
             REPLICATION_SUPERSEDED_CODE, ReplicationDownstream, X_ANGOS_SOURCE_TIMESTAMP,
             handler::{
-                ReplicationJobHandler, ReplicationPushPayload, build_envelope, replication_lock_key,
+                ReplicationJobHandler, ReplicationPushPayload, build_envelope,
+                build_prune_delete_envelope, replication_lock_key,
             },
         },
     };
@@ -534,6 +572,30 @@ mod tests {
             replication_lock_key(&first),
             replication_lock_key(&first.clone()),
             "a retry of the same deletion event must still coalesce"
+        );
+    }
+
+    /// A scrub prune delete keys on the bare reference: repeated reconcile runs
+    /// stamp fresh `source_ts` values, yet must coalesce into one pending job,
+    /// and must never coalesce with a timestamped event-path delete.
+    #[test]
+    fn prune_delete_envelope_coalesces_on_bare_reference() {
+        let mut payload = sample_payload();
+        payload.kind = REPLICATION_DELETE_MANIFEST_KIND.to_string();
+        let mut later = payload.clone();
+        later.source_ts = Some("2026-06-03T00:01:00Z".to_string());
+
+        let first = build_prune_delete_envelope(&payload).unwrap();
+        let second = build_prune_delete_envelope(&later).unwrap();
+        assert_eq!(first.lock_key, "replication.delete.eu-region:nginx:v1");
+        assert_eq!(
+            first.lock_key, second.lock_key,
+            "prune deletes with different source_ts must coalesce on the bare reference"
+        );
+        assert_ne!(
+            first.lock_key,
+            replication_lock_key(&payload),
+            "a prune delete must not coalesce with an event-path delete"
         );
     }
 
@@ -700,6 +762,54 @@ mod tests {
                 .unwrap_err()
                 .to_string()
                 .contains("unsupported job kind")
+        );
+    }
+
+    /// A job for a downstream no longer in config fails loudly (and so
+    /// dead-letters after max attempts) instead of silently completing.
+    #[tokio::test]
+    async fn execute_errors_on_removed_downstream() {
+        metrics_provider::init_for_tests();
+        let dir = TempDir::new().unwrap();
+        let root = dir.path().to_str().unwrap();
+        let object: Arc<dyn ObjectStore> =
+            Arc::new(StorageFsBackend::builder().root_dir(root).build().unwrap());
+        let executor = build_test_fs_executor(root, false);
+        let store = build_store(object, executor);
+        let metadata_store = Arc::new(
+            MetadataStore::builder()
+                .store(store.clone())
+                .link_cache_ttl(0)
+                .access_time_debounce_secs(0)
+                .build()
+                .unwrap(),
+        );
+        let blob_store = Arc::new(BlobStore::builder().store(store.clone()).build().unwrap());
+
+        let mut repositories = HashMap::new();
+        repositories.insert(
+            REPO.to_string(),
+            repository_with_downstream(downstream_client("https://unused.test")),
+        );
+        let resolver = Arc::new(RepositoryResolver::new(Arc::new(repositories)).unwrap());
+
+        let handler = ReplicationJobHandler::builder()
+            .resolver(resolver)
+            .blob_store(blob_store)
+            .metadata_store(metadata_store)
+            .build()
+            .unwrap();
+
+        let mut payload = sample_payload();
+        payload.downstream = "removed-region".to_string();
+        let envelope = build_envelope(&payload).unwrap();
+        let result = handler.execute(&envelope).await;
+        assert!(
+            result
+                .as_ref()
+                .is_err_and(|e| e.to_string().contains("no downstream 'removed-region'")),
+            "a job for a de-configured downstream must error, got: {:?}",
+            result.map(|_| ())
         );
     }
 
