@@ -231,6 +231,10 @@ struct LinksTxCaptured {
     /// committed attempt.
     prior_targets: Vec<(LinkKind, Option<Digest>)>,
     had_creates: bool,
+    /// `Some(message)` when the attempt's last-writer-wins guard rejected the
+    /// write; the attempt committed an empty transaction and the caller maps
+    /// this to [`Error::ReplicationSuperseded`].
+    superseded: Option<String>,
 }
 
 /// Prior link state captured by a committed link transaction. The retry loop
@@ -370,8 +374,58 @@ impl MetadataStore {
                     }
                 }
 
+                // ── Step 3.5: last-writer-wins guard for replicated tag writes ──
+                // `extras.created_at` is only set for a replication-originated
+                // write. The raw link bytes join the transaction read set, so a
+                // concurrent same-tag commit aborts this attempt at prepare and
+                // the guard re-runs against the winner's state; the pre-write
+                // gate in `accept_put_manifest` alone is check-then-write and
+                // cannot stop a racing older write from regressing the tag.
+                let mut lww_reads: Vec<(String, Bytes)> = Vec::new();
+                if let Some(source_ts) = extras.created_at {
+                    for (create_data, _) in &prelock_results {
+                        let Some((link, target, ..)) = create_data else {
+                            continue;
+                        };
+                        if !matches!(link, LinkKind::Tag(_)) {
+                            continue;
+                        }
+                        let link_path = path_builder::link_path(link, namespace);
+                        match self.store().get(&link_path).await {
+                            Ok(bytes) => {
+                                let metadata =
+                                    LinkMetadata::from_bytes(bytes.clone()).map_err(|e| {
+                                        TxError::Storage(StorageError::Backend(e.to_string()))
+                                    })?;
+                                if let Some(created_at) =
+                                    metadata.supersedes(source_ts, Some(target))
+                                {
+                                    return Ok((
+                                        Transaction::builder().build(),
+                                        LinksTxCaptured {
+                                            superseded: Some(format!(
+                                                "local {link} (created {created_at}) is newer \
+                                                 than the replicated source ({source_ts})"
+                                            )),
+                                            ..LinksTxCaptured::default()
+                                        },
+                                    ));
+                                }
+                                lww_reads.push((link_path, Bytes::from(bytes)));
+                            }
+                            Err(StorageError::NotFound) => {
+                                lww_reads.push((link_path, Bytes::new()));
+                            }
+                            Err(e) => return Err(TxError::Storage(e)),
+                        }
+                    }
+                }
+
                 // ── Step 4: build mutations ─────────────────────────────────────
                 let mut builder = Transaction::builder();
+                for (key, body) in lww_reads {
+                    builder = builder.read(key, body);
+                }
                 let mut pending_blob_ops: HashMap<Digest, Vec<BlobIndexOperation>> = HashMap::new();
                 let mut written_links: Vec<(LinkKind, LinkMetadata)> = Vec::new();
                 let mut deleted_links: Vec<LinkKind> = Vec::new();
@@ -612,6 +666,7 @@ impl MetadataStore {
                         deleted_links,
                         prior_targets,
                         had_creates,
+                        superseded: None,
                     },
                 ))
             },
@@ -619,6 +674,10 @@ impl MetadataStore {
         )
         .await
         .map_err(tx_error_to_meta)?;
+
+        if let Some(message) = result.superseded {
+            return Err(Error::ReplicationSuperseded(message));
+        }
 
         // ── Post-apply cleanup (best-effort, outside the engine lock) ───────────
         for link in &result.deleted_links {

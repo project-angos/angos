@@ -2531,6 +2531,60 @@ async fn accept_put_manifest_lww_reads_bypass_the_link_cache() {
     );
 }
 
+/// The pre-write LWW gate in `accept_put_manifest` is check-then-write: a
+/// racing writer can pass it and still commit out of order. The link
+/// transaction itself must reject a superseded replicated write, so calling
+/// the store directly (as if the gate had been raced) must fail and leave
+/// the winning link untouched.
+#[tokio::test]
+async fn store_manifest_enforces_lww_inside_the_link_transaction() {
+    let test_case = FSRegistryTestCase::new();
+    let store = test_case.metadata_store();
+    let namespace = "lww-tx-repo";
+    let link = LinkKind::Tag("latest".to_string());
+
+    let newer_body = br#"{"newer":true}"#.to_vec();
+    let newer_digest = Digest::Sha256(sha256::hex(&newer_body).into());
+    let newer_ts = chrono::Utc::now();
+    store
+        .store_manifest(
+            namespace,
+            &newer_digest,
+            &newer_body,
+            &[LinkOperation::create(link.clone(), newer_digest.clone())],
+            Some(newer_ts),
+        )
+        .await
+        .expect("seed the newer replicated write");
+
+    let older_body = br#"{"older":true}"#.to_vec();
+    let older_digest = Digest::Sha256(sha256::hex(&older_body).into());
+    let result = store
+        .store_manifest(
+            namespace,
+            &older_digest,
+            &older_body,
+            &[LinkOperation::create(link.clone(), older_digest.clone())],
+            Some(newer_ts - chrono::Duration::hours(1)),
+        )
+        .await
+        .err();
+    assert!(
+        matches!(
+            result,
+            Some(metadata_store::Error::ReplicationSuperseded(_))
+        ),
+        "an older replicated write must be rejected by the transaction itself, got: {result:?}"
+    );
+
+    let metadata = store
+        .read_link_reference(namespace, &link)
+        .await
+        .expect("the winning link must survive");
+    assert_eq!(metadata.target, newer_digest);
+    assert_eq!(metadata.created_at, Some(newer_ts));
+}
+
 #[tokio::test]
 async fn put_manifest_reports_changed_from_the_committed_transaction() {
     let test_case = FSRegistryTestCase::new();

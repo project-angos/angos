@@ -146,7 +146,12 @@ impl CasExecutor {
                     }
                 }
                 Err(StorageError::NotFound) => {
-                    return Err(Error::Conflict);
+                    // An absent key matches only a read that recorded absence;
+                    // no etag is captured, so a same-key write stays
+                    // unconditional.
+                    if !read.expects_absent() {
+                        return Err(Error::Conflict);
+                    }
                 }
                 Err(e) => return Err(Error::Storage(e)),
             }

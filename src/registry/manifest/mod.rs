@@ -320,7 +320,13 @@ impl Registry {
         let commit = self
             .metadata_store
             .store_manifest(namespace.as_ref(), &computed_digest, body, &ops, created_at)
-            .await?;
+            .await
+            .map_err(|e| match e {
+                MetadataStoreError::ReplicationSuperseded(message) => {
+                    Error::ReplicationSuperseded(message)
+                }
+                e => Error::from(e),
+            })?;
 
         // Changed-state check from the prior target the committed transaction
         // itself validated; a missing entry fails open so a genuine write is
@@ -629,10 +635,7 @@ impl Registry {
     }
 
     /// `Some(created_at)` iff the local link strictly supersedes the incoming
-    /// write: newer `created_at`, or equal with a target digest ordering above
-    /// `incoming_digest` (the tie-break that stops equal-timestamp peers
-    /// swapping digests forever; deletes carry no digest and keep plain
-    /// strictly-greater); `None` when the link is absent, has no `created_at`,
+    /// write per [`LinkMetadata::supersedes`]; `None` when the link is absent
     /// or loses. Read errors other than `ReferenceNotFound` fail closed, and
     /// reads bypass the link cache to avoid its multi-replica staleness.
     async fn link_supersedes(
@@ -651,19 +654,7 @@ impl Registry {
             Err(MetadataStoreError::ReferenceNotFound) => return Ok(None),
             Err(err) => return Err(Error::from(err)),
         };
-        let Some(created_at) = metadata.created_at else {
-            return Ok(None);
-        };
-        if created_at > source_ts {
-            return Ok(Some(created_at));
-        }
-        if created_at == source_ts
-            && let Some(incoming) = incoming_digest
-            && metadata.target > *incoming
-        {
-            return Ok(Some(created_at));
-        }
-        Ok(None)
+        Ok(metadata.supersedes(source_ts, incoming_digest))
     }
 
     /// Last-writer-wins guard for a replication-originated digest delete: the

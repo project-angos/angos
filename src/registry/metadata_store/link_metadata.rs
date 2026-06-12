@@ -54,6 +54,30 @@ impl LinkMetadata {
         !self.referenced_by.is_empty()
     }
 
+    /// `Some(created_at)` iff this link strictly supersedes an incoming write
+    /// authored at `source_ts`: newer `created_at`, or equal with a target
+    /// digest ordering above `incoming_digest` (the tie-break that stops
+    /// equal-timestamp peers swapping digests forever; deletes carry no digest
+    /// and keep plain strictly-greater). `None` when the link has no
+    /// `created_at` or loses.
+    pub fn supersedes(
+        &self,
+        source_ts: DateTime<Utc>,
+        incoming_digest: Option<&Digest>,
+    ) -> Option<DateTime<Utc>> {
+        let created_at = self.created_at?;
+        if created_at > source_ts {
+            return Some(created_at);
+        }
+        if created_at == source_ts
+            && let Some(incoming) = incoming_digest
+            && self.target > *incoming
+        {
+            return Some(created_at);
+        }
+        None
+    }
+
     pub fn from_bytes(s: Vec<u8>) -> Result<Self, Error> {
         if let Ok(metadata) = serde_json::from_slice(&s) {
             return Ok(metadata);

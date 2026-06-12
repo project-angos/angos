@@ -31,6 +31,17 @@ pub struct Read {
     pub fingerprint: Fingerprint,
 }
 
+impl Read {
+    /// Whether this read recorded the key as absent (the fingerprint of an
+    /// empty body, per [`TransactionBuilder::read`]); a missing key at verify
+    /// time then matches instead of conflicting.
+    #[must_use]
+    pub fn expects_absent(&self) -> bool {
+        let empty: Fingerprint = Sha256::digest([]).into();
+        self.fingerprint == empty
+    }
+}
+
 /// A single mutation to be applied atomically.
 ///
 /// The executor drives each variant with the appropriate storage primitive
