@@ -25,12 +25,7 @@ async fn test_update_blob_index_legacy_applies_correctly() {
     let config = test_config();
 
     let http = s3_client::Backend::new(&config.connection.to_client_config()).unwrap();
-    let storage = Arc::new(
-        StorageS3Backend::builder()
-            .client(Arc::new(http))
-            .build()
-            .unwrap(),
-    );
+    let storage = Arc::new(StorageS3Backend::builder(Arc::new(http)).build());
     let backend = make_backend(storage);
 
     let digest =

@@ -101,10 +101,21 @@ pub struct OrphanJobChecker {
 }
 
 impl OrphanJobChecker {
-    /// Starts building a checker from individual resolved fields.
+    /// Construct a checker from its resolved fields: the `job_store` the queue
+    /// partitions are read through, the namespace -> repository `resolver`
+    /// yielding the configured downstreams and pull-through upstreams, and the
+    /// durable `queue` to scan with its orphan classification.
     #[must_use]
-    pub fn builder() -> OrphanJobCheckerBuilder {
-        OrphanJobCheckerBuilder::default()
+    pub fn new(
+        job_store: Arc<JobStore>,
+        resolver: Arc<RepositoryResolver>,
+        queue: OrphanQueue,
+    ) -> Self {
+        Self {
+            job_store,
+            resolver,
+            queue,
+        }
     }
 
     /// Reads the raw payload for one storage key. Returns `Ok(None)` for a key
@@ -211,60 +222,6 @@ impl StoreChecker for OrphanJobChecker {
     }
 }
 
-/// Builder for [`OrphanJobChecker`]; all three fields are required.
-#[derive(Default)]
-pub struct OrphanJobCheckerBuilder {
-    job_store: Option<Arc<JobStore>>,
-    resolver: Option<Arc<RepositoryResolver>>,
-    queue: Option<OrphanQueue>,
-}
-
-impl OrphanJobCheckerBuilder {
-    /// Job-store handle the queue partitions are read through (required).
-    #[must_use]
-    pub fn job_store(mut self, job_store: Arc<JobStore>) -> Self {
-        self.job_store = Some(job_store);
-        self
-    }
-
-    /// Namespace -> repository resolver yielding the configured downstream
-    /// list and pull-through upstreams (required).
-    #[must_use]
-    pub fn resolver(mut self, resolver: Arc<RepositoryResolver>) -> Self {
-        self.resolver = Some(resolver);
-        self
-    }
-
-    /// Durable queue to scan, with its orphan classification (required).
-    #[must_use]
-    pub fn queue(mut self, queue: OrphanQueue) -> Self {
-        self.queue = Some(queue);
-        self
-    }
-
-    /// Builds the [`OrphanJobChecker`].
-    ///
-    /// # Errors
-    ///
-    /// Returns [`Error::Initialization`] when a required field is missing.
-    pub fn build(self) -> Result<OrphanJobChecker, Error> {
-        let job_store = self.job_store.ok_or_else(|| {
-            Error::Initialization("orphan job checker builder requires a job_store".into())
-        })?;
-        let resolver = self.resolver.ok_or_else(|| {
-            Error::Initialization("orphan job checker builder requires a resolver".into())
-        })?;
-        let queue = self.queue.ok_or_else(|| {
-            Error::Initialization("orphan job checker builder requires a queue".into())
-        })?;
-        Ok(OrphanJobChecker {
-            job_store,
-            resolver,
-            queue,
-        })
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::{collections::HashMap, sync::Arc};
@@ -317,17 +274,14 @@ mod tests {
     fn fs_metadata_store() -> (Arc<MetadataStore>, Arc<Store>, TempDir) {
         let dir = TempDir::new().unwrap();
         let root = dir.path().to_str().unwrap();
-        let object: Arc<dyn ObjectStore> =
-            Arc::new(StorageFsBackend::builder().root_dir(root).build().unwrap());
+        let object: Arc<dyn ObjectStore> = Arc::new(StorageFsBackend::builder(root).build());
         let executor = build_test_fs_executor(root, false);
         let store = build_store(object, executor);
         let metadata_store = Arc::new(
-            MetadataStore::builder()
-                .store(store.clone())
+            MetadataStore::builder(store.clone())
                 .link_cache_ttl(0)
                 .access_time_debounce_secs(0)
-                .build()
-                .unwrap(),
+                .build(),
         );
         (metadata_store, store, dir)
     }
@@ -335,13 +289,13 @@ mod tests {
     /// Registry client whose URL is never contacted by these checkers.
     fn client() -> RegistryClient {
         let backend = cache::Config::Memory.to_backend().unwrap();
-        RegistryClient::builder()
-            .url("http://127.0.0.1:1".to_string())
-            .client(reqwest::Client::new())
-            .cache(backend)
-            .max_manifest_size_bytes(DEFAULT_MAX_MANIFEST_SIZE_BYTES)
-            .build()
-            .unwrap()
+        RegistryClient::builder(
+            "http://127.0.0.1:1".to_string(),
+            reqwest::Client::new(),
+            backend,
+        )
+        .max_manifest_size_bytes(DEFAULT_MAX_MANIFEST_SIZE_BYTES)
+        .build()
     }
 
     fn repository(
@@ -365,14 +319,11 @@ mod tests {
     /// Resolver with a pull-through repository whose only downstream is
     /// [`DOWNSTREAM`], plus a configured repository with no upstreams.
     fn resolver() -> Arc<RepositoryResolver> {
-        let downstream = ReplicationDownstream::builder()
-            .name(DOWNSTREAM.to_string())
-            .registry_client(Arc::new(client()))
-            .mode(ReplicationMode::EventReconcile)
-            .max_concurrent_pushes(4)
-            .prune(false)
-            .build()
-            .unwrap();
+        let downstream =
+            ReplicationDownstream::builder(DOWNSTREAM.to_string(), Arc::new(client()), 4)
+                .mode(ReplicationMode::EventReconcile)
+                .prune(false)
+                .build();
         let mut repositories = HashMap::new();
         repositories.insert(
             REPO.to_string(),
@@ -386,12 +337,7 @@ mod tests {
     }
 
     fn checker(job_store: Arc<JobStore>, queue: OrphanQueue) -> OrphanJobChecker {
-        OrphanJobChecker::builder()
-            .job_store(job_store)
-            .resolver(resolver())
-            .queue(queue)
-            .build()
-            .unwrap()
+        OrphanJobChecker::new(job_store, resolver(), queue)
     }
 
     fn push_payload(downstream: &str, namespace: &str) -> ReplicationPushPayload {
@@ -583,7 +529,7 @@ mod tests {
     async fn end_to_end_deletes_only_the_orphan_replication_job() {
         metrics_provider::init_for_tests();
         let (metadata_store, store, _dir) = fs_metadata_store();
-        let blob_store = Arc::new(BlobStore::builder().store(store.clone()).build().unwrap());
+        let blob_store = Arc::new(BlobStore::new(store.clone()));
         let job_store = Arc::new(JobStore::new(metadata_store.store_arc(), "orphan-test"));
 
         enqueue_push(&job_store, DOWNSTREAM, NAMESPACE).await;
@@ -593,14 +539,8 @@ mod tests {
             2
         );
 
-        let mut executor: Box<dyn ActionSink + Send> = Box::new(
-            Executor::builder()
-                .blob_store(blob_store)
-                .metadata_store(metadata_store)
-                .job_store(job_store.clone())
-                .build()
-                .unwrap(),
-        );
+        let mut executor: Box<dyn ActionSink + Send> =
+            Box::new(Executor::new(blob_store, metadata_store, job_store.clone()));
         checker(job_store.clone(), OrphanQueue::Replication)
             .check_all(executor.as_mut())
             .await
@@ -784,21 +724,15 @@ mod tests {
     async fn end_to_end_deletes_only_the_orphan_cache_job() {
         metrics_provider::init_for_tests();
         let (metadata_store, store, _dir) = fs_metadata_store();
-        let blob_store = Arc::new(BlobStore::builder().store(store.clone()).build().unwrap());
+        let blob_store = Arc::new(BlobStore::new(store.clone()));
         let job_store = Arc::new(JobStore::new(metadata_store.store_arc(), "orphan-test"));
 
         enqueue_cache_fill(&job_store, NAMESPACE).await;
         enqueue_cache_fill(&job_store, GHOST_NAMESPACE).await;
         assert_eq!(job_store.count_pending(CACHE_QUEUE, 0).await.unwrap(), 2);
 
-        let mut executor: Box<dyn ActionSink + Send> = Box::new(
-            Executor::builder()
-                .blob_store(blob_store)
-                .metadata_store(metadata_store)
-                .job_store(job_store.clone())
-                .build()
-                .unwrap(),
-        );
+        let mut executor: Box<dyn ActionSink + Send> =
+            Box::new(Executor::new(blob_store, metadata_store, job_store.clone()));
         checker(job_store.clone(), OrphanQueue::Cache)
             .check_all(executor.as_mut())
             .await

@@ -69,30 +69,16 @@ impl std::fmt::Debug for CasExecutor {
     }
 }
 
-/// Builder for [`CasExecutor`].
-#[derive(Default)]
+/// Builder for [`CasExecutor`]. The conditional store and lock are required and
+/// supplied to [`CasExecutor::builder`]; the intent TTL is an optional fluent
+/// setter.
 pub struct CasExecutorBuilder {
-    store: Option<Arc<dyn ConditionalStore>>,
-    lock: Option<Arc<Lock>>,
+    store: Arc<dyn ConditionalStore>,
+    lock: Arc<Lock>,
     ttl_secs: Option<u64>,
 }
 
 impl CasExecutorBuilder {
-    /// Set the conditional store.
-    #[must_use]
-    pub fn store(mut self, store: Arc<dyn ConditionalStore>) -> Self {
-        self.store = Some(store);
-        self
-    }
-
-    /// Set the lock used by [`TransactionExecutor::try_acquire`] /
-    /// [`TransactionExecutor::acquire`]. Required.
-    #[must_use]
-    pub fn lock(mut self, lock: Arc<Lock>) -> Self {
-        self.lock = Some(lock);
-        self
-    }
-
     /// Set the intent TTL in seconds. Defaults to 300.
     #[must_use]
     pub fn ttl_secs(mut self, secs: u64) -> Self {
@@ -101,28 +87,27 @@ impl CasExecutorBuilder {
     }
 
     /// Consume the builder and produce a [`CasExecutor`].
-    ///
-    /// # Errors
-    ///
-    /// Returns [`Error::Build`] if `store` or `lock` was not provided.
-    pub fn build(self) -> Result<CasExecutor, Error> {
-        Ok(CasExecutor {
-            store: self.store.ok_or_else(|| {
-                Error::Build("CasExecutor requires a conditional store".to_string())
-            })?,
-            lock: self
-                .lock
-                .ok_or_else(|| Error::Build("CasExecutor requires a lock".to_string()))?,
+    #[must_use]
+    pub fn build(self) -> CasExecutor {
+        CasExecutor {
+            store: self.store,
+            lock: self.lock,
             ttl_secs: self.ttl_secs.unwrap_or(DEFAULT_INTENT_TTL_SECS),
-        })
+        }
     }
 }
 
 impl CasExecutor {
-    /// Return a builder for constructing a `CasExecutor`.
+    /// Return a builder wrapping the conditional `store` and the `lock` used by
+    /// [`TransactionExecutor::try_acquire`] / [`TransactionExecutor::acquire`].
+    /// The intent TTL is an optional fluent setter on the returned builder.
     #[must_use]
-    pub fn builder() -> CasExecutorBuilder {
-        CasExecutorBuilder::default()
+    pub fn builder(store: Arc<dyn ConditionalStore>, lock: Arc<Lock>) -> CasExecutorBuilder {
+        CasExecutorBuilder {
+            store,
+            lock,
+            ttl_secs: None,
+        }
     }
 
     /// Verify the read set, capturing each present read key's live etag and

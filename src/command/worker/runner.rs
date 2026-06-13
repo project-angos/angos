@@ -104,12 +104,8 @@ mod tests {
     }
 
     fn make_store(dir: &TempDir) -> Arc<JobStore> {
-        let object: Arc<dyn ObjectStore> = Arc::new(
-            StorageFsBackend::builder()
-                .root_dir(dir.path().to_str().expect("valid path"))
-                .build()
-                .expect("fs storage"),
-        );
+        let object: Arc<dyn ObjectStore> =
+            Arc::new(StorageFsBackend::builder(dir.path().to_str().expect("valid path")).build());
         let executor = build_executor(
             object.clone(),
             None,
@@ -119,13 +115,7 @@ mod tests {
             false,
         )
         .expect("build executor");
-        let facade = Arc::new(
-            Store::builder()
-                .object(object)
-                .executor(executor)
-                .build()
-                .expect("store façade"),
-        );
+        let facade = Arc::new(Store::builder(object, executor).build());
         Arc::new(JobStore::new(facade, "test-worker"))
     }
 

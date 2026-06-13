@@ -147,7 +147,7 @@ mod tests {
                 metadata_store.clone(),
                 Duration::zero(),
             );
-            let mut executor = Executor::new(blob_store.clone(), metadata_store.clone());
+            let mut executor = Executor::new_for_test(blob_store.clone(), metadata_store.clone());
             checker.check_all(&mut executor).await.unwrap();
 
             assert!(

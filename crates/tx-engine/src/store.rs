@@ -76,8 +76,15 @@ impl fmt::Debug for Store {
 impl Store {
     /// Return a builder for constructing a [`Store`].
     #[must_use]
-    pub fn builder() -> StoreBuilder {
-        StoreBuilder::default()
+    pub fn builder(
+        object: Arc<dyn ObjectStore>,
+        executor: Arc<dyn TransactionExecutor>,
+    ) -> StoreBuilder {
+        StoreBuilder {
+            object,
+            presign: None,
+            executor,
+        }
     }
 
     /// The transaction executor backing this store. Wiring code uses it to
@@ -452,24 +459,16 @@ impl Store {
     }
 }
 
-/// Builder for [`Store`]. `object` and `executor` are required; the presign
-/// capability is optional and reflects what the underlying backend supports.
-#[derive(Default)]
+/// Builder for [`Store`]. The object store and transaction executor are
+/// required and supplied to [`Store::builder`]; the presign capability is an
+/// optional fluent setter and reflects what the underlying backend supports.
 pub struct StoreBuilder {
-    object: Option<Arc<dyn ObjectStore>>,
+    object: Arc<dyn ObjectStore>,
     presign: Option<Arc<dyn PresignedStore>>,
-    executor: Option<Arc<dyn TransactionExecutor>>,
+    executor: Arc<dyn TransactionExecutor>,
 }
 
 impl StoreBuilder {
-    /// Set the object store (required). [`ObjectStore`] carries both the CRUD
-    /// floor and the upload-session lifecycle, so this single handle wires both.
-    #[must_use]
-    pub fn object(mut self, object: Arc<dyn ObjectStore>) -> Self {
-        self.object = Some(object);
-        self
-    }
-
     /// Set the presign backend. Enables [`Store::presigned_get`].
     #[must_use]
     pub fn presign(mut self, presign: Arc<dyn PresignedStore>) -> Self {
@@ -477,30 +476,14 @@ impl StoreBuilder {
         self
     }
 
-    /// Set the transaction executor (required).
-    #[must_use]
-    pub fn executor(mut self, executor: Arc<dyn TransactionExecutor>) -> Self {
-        self.executor = Some(executor);
-        self
-    }
-
     /// Consume the builder and produce the [`Store`].
-    ///
-    /// # Errors
-    ///
-    /// Returns [`Error::Build`] when `store` or `executor` is missing.
-    pub fn build(self) -> Result<Store, Error> {
-        let object = self
-            .object
-            .ok_or_else(|| Error::Build("Store requires an object store".to_string()))?;
-        let executor = self
-            .executor
-            .ok_or_else(|| Error::Build("Store requires an executor".to_string()))?;
-        Ok(Store {
-            object,
+    #[must_use]
+    pub fn build(self) -> Store {
+        Store {
+            object: self.object,
             presign: self.presign,
-            executor,
-        })
+            executor: self.executor,
+        }
     }
 }
 
@@ -521,23 +504,12 @@ mod tests {
 
     fn store_over(backend: Arc<MemoryObjectStore>) -> Store {
         let lock = Arc::new(
-            Lock::builder()
-                .storage(Arc::new(MemoryLockStorage::new()))
+            Lock::builder(Arc::new(MemoryLockStorage::new()))
                 .build()
                 .expect("lock"),
         );
-        let executor = Arc::new(
-            LockedExecutor::builder()
-                .store(backend.clone())
-                .lock(lock)
-                .build()
-                .expect("executor"),
-        );
-        Store::builder()
-            .object(backend)
-            .executor(executor)
-            .build()
-            .expect("store")
+        let executor = Arc::new(LockedExecutor::builder(backend.clone(), lock).build());
+        Store::builder(backend, executor).build()
     }
 
     #[tokio::test]

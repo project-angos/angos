@@ -104,16 +104,14 @@ impl BlobStoreConfig {
         let builder = match self {
             BlobStoreConfig::FS(config) => {
                 let raw = Arc::new(
-                    StorageFsBackend::builder()
-                        .root_dir(&config.root_dir)
+                    StorageFsBackend::builder(&config.root_dir)
                         .sync_to_disk(config.sync_to_disk)
-                        .build()
-                        .map_err(|e| Error::StorageBackend(e.to_string()))?,
+                        .build(),
                 );
                 let executor =
                     build_executor(raw.clone(), None, LockStrategy::Memory, None, false, false)
                         .map_err(|e| Error::StorageBackend(e.to_string()))?;
-                Store::builder().object(raw).executor(executor)
+                Store::builder(raw, executor)
             }
             BlobStoreConfig::S3(config) => {
                 let transport = S3TransportConfig {
@@ -130,12 +128,10 @@ impl BlobStoreConfig {
                 let http = S3HttpBackend::new(&transport)
                     .map_err(|e| Error::StorageBackend(e.to_string()))?;
                 let raw = Arc::new(
-                    StorageS3Backend::builder()
-                        .client(Arc::new(http))
+                    StorageS3Backend::builder(Arc::new(http))
                         .part_size(config.transport.multipart_part_size.as_u64())
                         .uniform_parts(config.transport.multipart_uniform_parts)
-                        .build()
-                        .map_err(|e| Error::StorageBackend(e.to_string()))?,
+                        .build(),
                 );
                 let conditional: Arc<dyn ConditionalStore> = raw.clone();
                 let executor = build_executor(
@@ -147,19 +143,12 @@ impl BlobStoreConfig {
                     false,
                 )
                 .map_err(|e| Error::StorageBackend(e.to_string()))?;
-                Store::builder()
-                    .object(raw.clone())
-                    .presign(raw)
-                    .executor(executor)
+                Store::builder(raw.clone(), executor).presign(raw)
             }
         };
 
-        let store = Arc::new(
-            builder
-                .build()
-                .map_err(|e| Error::StorageBackend(e.to_string()))?,
-        );
-        BlobStore::builder().store(store).build()
+        let store = Arc::new(builder.build());
+        Ok(BlobStore::new(store))
     }
 }
 

@@ -56,25 +56,19 @@ const ATOMIC_WRITE_TMP_PREFIX: &str = ".angos-write.";
 /// is about to exist.
 const ENSURE_PARENT_RETRIES: u32 = 5;
 
-/// Builder for [`Backend`].
+/// Builder for [`Backend`]. The root directory is required and supplied to
+/// [`Backend::builder`]; `sync_to_disk` is an optional fluent setter.
 pub struct Builder {
-    root: Option<PathBuf>,
+    root: PathBuf,
     sync_to_disk: bool,
 }
 
 impl Builder {
-    fn new() -> Self {
+    fn new(root: PathBuf) -> Self {
         Self {
-            root: None,
+            root,
             sync_to_disk: false,
         }
-    }
-
-    /// Directory under which all object keys are resolved. Required.
-    #[must_use]
-    pub fn root_dir(mut self, root: impl Into<PathBuf>) -> Self {
-        self.root = Some(root.into());
-        self
     }
 
     /// When `true`, every write `fsync`s before the temp-file rename. Adds
@@ -85,17 +79,13 @@ impl Builder {
         self
     }
 
-    /// # Errors
-    /// Returns [`Error::Backend`] when [`root_dir`](Self::root_dir) was
-    /// never called.
-    pub fn build(self) -> Result<Backend, Error> {
-        let root = self
-            .root
-            .ok_or_else(|| Error::Backend("fs::Backend requires root_dir".to_string()))?;
-        Ok(Backend {
-            root,
+    /// Consume the builder and produce the [`Backend`].
+    #[must_use]
+    pub fn build(self) -> Backend {
+        Backend {
+            root: self.root,
             sync_to_disk: self.sync_to_disk,
-        })
+        }
     }
 }
 
@@ -107,9 +97,12 @@ pub struct Backend {
 }
 
 impl Backend {
+    /// Return a builder for a filesystem backend rooted at `root`, under which
+    /// all object keys are resolved. Other settings are optional fluent setters
+    /// on the returned builder.
     #[must_use]
-    pub fn builder() -> Builder {
-        Builder::new()
+    pub fn builder(root: impl Into<PathBuf>) -> Builder {
+        Builder::new(root.into())
     }
 
     fn full_path(&self, key: &str) -> PathBuf {

@@ -16,8 +16,7 @@ use angos_tx_engine::{
 /// Build a fresh in-memory lock primitive.
 pub fn memory_lock() -> Arc<Lock> {
     Arc::new(
-        Lock::builder()
-            .storage(Arc::new(MemoryLockStorage::new()))
+        Lock::builder(Arc::new(MemoryLockStorage::new()))
             .build()
             .expect("lock builder"),
     )
@@ -25,22 +24,10 @@ pub fn memory_lock() -> Arc<Lock> {
 
 /// Build a `LockedExecutor` over `store`, serialising on `lock`.
 pub fn locked_executor(store: Arc<dyn ObjectStore>, lock: Arc<Lock>) -> Arc<LockedExecutor> {
-    Arc::new(
-        LockedExecutor::builder()
-            .store(store)
-            .lock(lock)
-            .build()
-            .expect("LockedExecutor builder"),
-    )
+    Arc::new(LockedExecutor::builder(store, lock).build())
 }
 
 /// Build a `CasExecutor` over `store`, serialising coarse locks on `lock`.
 pub fn cas_executor(store: Arc<dyn ConditionalStore>, lock: Arc<Lock>) -> Arc<CasExecutor> {
-    Arc::new(
-        CasExecutor::builder()
-            .store(store)
-            .lock(lock)
-            .build()
-            .expect("CasExecutor builder"),
-    )
+    Arc::new(CasExecutor::builder(store, lock).build())
 }

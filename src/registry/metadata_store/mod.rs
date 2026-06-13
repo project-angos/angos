@@ -81,29 +81,20 @@ pub struct MetadataStore {
 }
 
 pub struct Builder {
-    store: Option<Arc<Store>>,
+    store: Arc<Store>,
     cache: Option<Arc<Cache>>,
     link_cache_ttl: u64,
     access_time_debounce_secs: u64,
 }
 
 impl Builder {
-    fn new() -> Self {
+    fn new(store: Arc<Store>) -> Self {
         Self {
-            store: None,
+            store,
             cache: None,
             link_cache_ttl: 30,
             access_time_debounce_secs: 0,
         }
-    }
-
-    /// Set the storage façade (required).
-    ///
-    /// The façade carries both the object store used for reads and the
-    /// transaction executor that encapsulates the CAS-vs-Locked decision.
-    pub fn store(mut self, store: Arc<Store>) -> Self {
-        self.store = Some(store);
-        self
     }
 
     pub fn cache(mut self, cache: Arc<Cache>) -> Self {
@@ -121,10 +112,9 @@ impl Builder {
         self
     }
 
-    pub fn build(self) -> Result<MetadataStore, Error> {
-        let store = self
-            .store
-            .ok_or_else(|| Error::Coordination("MetadataStore requires a store".to_string()))?;
+    #[must_use]
+    pub fn build(self) -> MetadataStore {
+        let store = self.store;
 
         let (access_time_writer, flush_handle) = if self.access_time_debounce_secs > 0 {
             let writer = AccessTimeWriter::new();
@@ -146,19 +136,24 @@ impl Builder {
             (None, None)
         };
 
-        Ok(MetadataStore {
+        MetadataStore {
             store,
             cache: self.cache,
             link_cache_ttl: self.link_cache_ttl,
             access_time_writer,
             _flush_handle: flush_handle,
-        })
+        }
     }
 }
 
 impl MetadataStore {
-    pub fn builder() -> Builder {
-        Builder::new()
+    /// Return a builder over the storage façade `store` (which carries both the
+    /// object store used for reads and the transaction executor encapsulating
+    /// the CAS-vs-Locked decision). `cache`, `link_cache_ttl` and
+    /// `access_time_debounce_secs` are optional fluent setters on the returned
+    /// builder.
+    pub fn builder(store: Arc<Store>) -> Builder {
+        Builder::new(store)
     }
 
     /// Returns the storage façade used for all reads and coordinated writes.

@@ -25,12 +25,7 @@ struct Harness {
 
 fn harness(dir: &TempDir) -> Harness {
     metrics_provider::init_for_tests();
-    let raw: Arc<dyn ObjectStore> = Arc::new(
-        StorageFsBackend::builder()
-            .root_dir(dir.path())
-            .build()
-            .expect("storage backend"),
-    );
+    let raw: Arc<dyn ObjectStore> = Arc::new(StorageFsBackend::builder(dir.path()).build());
     build_harness(raw)
 }
 

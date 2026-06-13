@@ -134,26 +134,24 @@ impl Repository {
                         max_manifest_size_bytes,
                     )?;
                     downstreams.push(
-                        ReplicationDownstream::builder()
-                            .name(config.name.clone())
-                            .registry_client(Arc::new(registry_client))
-                            .mode(config.mode)
-                            .namespace_filter(
-                                config
-                                    .namespace_filter
-                                    .iter()
-                                    .cloned()
-                                    .map(RegexPattern::into_regex)
-                                    .collect(),
-                            )
-                            .max_concurrent_pushes(
-                                config
-                                    .max_concurrent_pushes
-                                    .map_or(DEFAULT_MAX_CONCURRENT_PUSHES, NonZeroUsize::get),
-                            )
-                            .prune(config.prune)
-                            .build()
-                            .map_err(|e| Error::Initialization(e.to_string()))?,
+                        ReplicationDownstream::builder(
+                            config.name.clone(),
+                            Arc::new(registry_client),
+                            config
+                                .max_concurrent_pushes
+                                .map_or(DEFAULT_MAX_CONCURRENT_PUSHES, NonZeroUsize::get),
+                        )
+                        .mode(config.mode)
+                        .namespace_filter(
+                            config
+                                .namespace_filter
+                                .iter()
+                                .cloned()
+                                .map(RegexPattern::into_regex)
+                                .collect(),
+                        )
+                        .prune(config.prune)
+                        .build(),
                     );
                 }
                 Ok::<_, Error>(downstreams)

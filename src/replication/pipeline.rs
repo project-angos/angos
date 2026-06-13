@@ -796,28 +796,21 @@ mod tests {
 
     fn downstream_client(uri: &str) -> RegistryClient {
         let backend = cache::Config::Memory.to_backend().unwrap();
-        RegistryClient::builder()
-            .url(uri.to_string())
-            .client(reqwest::Client::new())
-            .cache(backend)
+        RegistryClient::builder(uri.to_string(), reqwest::Client::new(), backend)
             .max_manifest_size_bytes(DEFAULT_MAX_MANIFEST_SIZE_BYTES)
             .build()
-            .unwrap()
     }
 
     fn test_blob_store(root: &str) -> (Arc<BlobStore>, Arc<MetadataStore>, Arc<Store>) {
-        let object: Arc<dyn ObjectStore> =
-            Arc::new(StorageFsBackend::builder().root_dir(root).build().unwrap());
+        let object: Arc<dyn ObjectStore> = Arc::new(StorageFsBackend::builder(root).build());
         let executor = build_test_fs_executor(root, false);
         let store = build_store(object, executor);
-        let blob_store = Arc::new(BlobStore::builder().store(store.clone()).build().unwrap());
+        let blob_store = Arc::new(BlobStore::new(store.clone()));
         let metadata_store = Arc::new(
-            MetadataStore::builder()
-                .store(store.clone())
+            MetadataStore::builder(store.clone())
                 .link_cache_ttl(0)
                 .access_time_debounce_secs(0)
-                .build()
-                .unwrap(),
+                .build(),
         );
         (blob_store, metadata_store, store)
     }

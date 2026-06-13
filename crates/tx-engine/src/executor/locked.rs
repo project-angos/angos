@@ -56,29 +56,16 @@ impl std::fmt::Debug for LockedExecutor {
     }
 }
 
-/// Builder for [`LockedExecutor`].
-#[derive(Default)]
+/// Builder for [`LockedExecutor`]. The object store and lock are required and
+/// supplied to [`LockedExecutor::builder`]; the intent TTL is an optional
+/// fluent setter.
 pub struct LockedExecutorBuilder {
-    store: Option<Arc<dyn ObjectStore>>,
-    lock: Option<Arc<Lock>>,
+    store: Arc<dyn ObjectStore>,
+    lock: Arc<Lock>,
     ttl_secs: Option<u64>,
 }
 
 impl LockedExecutorBuilder {
-    /// Set the underlying object store.
-    #[must_use]
-    pub fn store(mut self, store: Arc<dyn ObjectStore>) -> Self {
-        self.store = Some(store);
-        self
-    }
-
-    /// Set the lock.
-    #[must_use]
-    pub fn lock(mut self, lock: Arc<Lock>) -> Self {
-        self.lock = Some(lock);
-        self
-    }
-
     /// Set the intent TTL in seconds. Defaults to 300.
     #[must_use]
     pub fn ttl_secs(mut self, secs: u64) -> Self {
@@ -87,28 +74,26 @@ impl LockedExecutorBuilder {
     }
 
     /// Consume the builder and produce a [`LockedExecutor`].
-    ///
-    /// # Errors
-    ///
-    /// Returns [`Error::Build`] if `store` or `lock` was not provided.
-    pub fn build(self) -> Result<LockedExecutor, Error> {
-        Ok(LockedExecutor {
-            store: self
-                .store
-                .ok_or_else(|| Error::Build("executor requires a store".to_string()))?,
-            lock: self
-                .lock
-                .ok_or_else(|| Error::Build("executor requires a lock".to_string()))?,
+    #[must_use]
+    pub fn build(self) -> LockedExecutor {
+        LockedExecutor {
+            store: self.store,
+            lock: self.lock,
             ttl_secs: self.ttl_secs.unwrap_or(DEFAULT_INTENT_TTL_SECS),
-        })
+        }
     }
 }
 
 impl LockedExecutor {
-    /// Return a builder for constructing a `LockedExecutor`.
+    /// Return a builder wrapping the object `store` and `lock`. The intent TTL
+    /// is an optional fluent setter on the returned builder.
     #[must_use]
-    pub fn builder() -> LockedExecutorBuilder {
-        LockedExecutorBuilder::default()
+    pub fn builder(store: Arc<dyn ObjectStore>, lock: Arc<Lock>) -> LockedExecutorBuilder {
+        LockedExecutorBuilder {
+            store,
+            lock,
+            ttl_secs: None,
+        }
     }
 
     /// Apply a single mutation under the pre-acquired lock.
@@ -350,16 +335,11 @@ mod tests {
 
     fn make_executor(store: Arc<MemoryObjectStore>) -> LockedExecutor {
         let lock = Arc::new(
-            Lock::builder()
-                .storage(Arc::new(MemoryLockStorage::new()))
+            Lock::builder(Arc::new(MemoryLockStorage::new()))
                 .build()
                 .unwrap(),
         );
-        LockedExecutor::builder()
-            .store(store as Arc<dyn ObjectStore>)
-            .lock(lock)
-            .build()
-            .unwrap()
+        LockedExecutor::builder(store as Arc<dyn ObjectStore>, lock).build()
     }
 
     #[tokio::test]

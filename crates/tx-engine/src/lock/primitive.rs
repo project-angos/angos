@@ -75,10 +75,10 @@ impl Debug for Lock {
 
 // ─── Builder ─────────────────────────────────────────────────────────────────
 
-/// Builder for [`Lock`].
-#[derive(Default)]
+/// Builder for [`Lock`]. The storage backend is required and supplied to
+/// [`Lock::builder`]; the TTL and retry tuning are optional fluent setters.
 pub struct LockBuilder {
-    storage: Option<Arc<dyn LockStorage>>,
+    storage: Arc<dyn LockStorage>,
     ttl_secs: Option<u64>,
     max_hold_secs: Option<u64>,
     max_retries: Option<u32>,
@@ -86,13 +86,6 @@ pub struct LockBuilder {
 }
 
 impl LockBuilder {
-    /// Set the lock-object storage backend (required).
-    #[must_use]
-    pub fn storage(mut self, storage: Arc<dyn LockStorage>) -> Self {
-        self.storage = Some(storage);
-        self
-    }
-
     /// Set the lock TTL in seconds. Must be ≥ 9 (heartbeat fires at `ttl/3`).
     /// Defaults to 30.
     #[must_use]
@@ -128,12 +121,9 @@ impl LockBuilder {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::InvalidData`] if no storage was provided, or if TTL /
-    /// hold-time constraints are violated.
+    /// Returns [`Error::InvalidData`] if the TTL / hold-time constraints are
+    /// violated.
     pub fn build(self) -> Result<Lock, Error> {
-        let storage = self
-            .storage
-            .ok_or_else(|| Error::InvalidData("Lock requires a storage backend".to_string()))?;
         let ttl_secs = self.ttl_secs.unwrap_or(30);
         let max_hold_secs = self.max_hold_secs.unwrap_or(300);
         let max_retries = self.max_retries.unwrap_or(100);
@@ -159,7 +149,7 @@ impl LockBuilder {
         }
 
         Ok(Lock {
-            storage,
+            storage: self.storage,
             ttl_secs,
             max_hold_secs,
             max_retries,
@@ -171,10 +161,17 @@ impl LockBuilder {
 // ─── Lock implementation ──────────────────────────────────────────────────────
 
 impl Lock {
-    /// Return a builder for constructing a `Lock`.
+    /// Return a builder wrapping the lock-object `storage` backend. The TTL and
+    /// retry tuning are optional fluent setters on the returned builder.
     #[must_use]
-    pub fn builder() -> LockBuilder {
-        LockBuilder::default()
+    pub fn builder(storage: Arc<dyn LockStorage>) -> LockBuilder {
+        LockBuilder {
+            storage,
+            ttl_secs: None,
+            max_hold_secs: None,
+            max_retries: None,
+            retry_delay_ms: None,
+        }
     }
 
     /// The label of the underlying [`LockStorage`]. Used in startup log lines
@@ -957,8 +954,7 @@ mod tests {
     }
 
     fn lock_with(storage: Arc<FakeLockStorage>) -> Lock {
-        Lock::builder()
-            .storage(storage)
+        Lock::builder(storage)
             .ttl_secs(9)
             .max_hold_secs(9)
             .max_retries(2)
@@ -1323,8 +1319,7 @@ mod tests {
         storage.set_put_absent_exists(true);
         storage.set_get(GetScript::Fresh);
         // max_retries=2, retry_delay_ms=1 keeps the loop fast.
-        let lock = Lock::builder()
-            .storage(storage)
+        let lock = Lock::builder(storage)
             .ttl_secs(9)
             .max_hold_secs(9)
             .max_retries(2)

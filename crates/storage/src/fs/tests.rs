@@ -5,19 +5,7 @@ use tokio::io::AsyncReadExt;
 use crate::{Error, ObjectStore, fs::Backend};
 
 fn backend(dir: &TempDir) -> Backend {
-    Backend::builder()
-        .root_dir(dir.path())
-        .build()
-        .expect("backend must build")
-}
-
-#[tokio::test]
-async fn builder_requires_root_dir() {
-    let err = Backend::builder().build().unwrap_err();
-    assert!(
-        matches!(err, Error::Backend(msg) if msg.contains("root_dir")),
-        "missing root_dir must surface a clear Backend error"
-    );
+    Backend::builder(dir.path()).build()
 }
 
 #[tokio::test]
@@ -129,10 +117,7 @@ async fn prune_empty_ancestors_refuses_to_escape_root_via_dotdot() {
     let outside = dir.path().join("outside");
     stdfs::create_dir(&outside).unwrap();
 
-    let store = Backend::builder()
-        .root_dir(&root)
-        .build()
-        .expect("backend must build");
+    let store = Backend::builder(&root).build();
 
     // `root.join("../outside/leaf")` resolves at syscall time to
     // `<tmp>/outside/leaf`; its parent is the empty `<tmp>/outside`, which the
@@ -363,11 +348,7 @@ async fn list_all_children_on_missing_prefix_returns_empty() {
 #[tokio::test]
 async fn sync_to_disk_flag_does_not_change_observable_behaviour() {
     let dir = TempDir::new().unwrap();
-    let store = Backend::builder()
-        .root_dir(dir.path())
-        .sync_to_disk(true)
-        .build()
-        .unwrap();
+    let store = Backend::builder(dir.path()).sync_to_disk(true).build();
     store
         .put("k", Bytes::from_static(b"durable"))
         .await

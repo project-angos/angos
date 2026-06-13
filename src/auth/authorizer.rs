@@ -817,7 +817,7 @@ mod tests {
         let auth_cache = config.cache.to_backend().unwrap();
         let storage_config = config.resolve_registry_storage();
         let handles = storage_config.build_store().await.unwrap();
-        let metadata_store = Arc::new(MetadataStore::builder().store(handles).build().unwrap());
+        let metadata_store = Arc::new(MetadataStore::builder(handles).build());
 
         let mut repositories_map = HashMap::new();
         for (name, repo_config) in &config.repository {
