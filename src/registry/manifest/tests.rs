@@ -3165,24 +3165,20 @@ mod noop_suppression_tests {
     use angos_tx_engine::transaction::Transaction;
 
     use crate::{
-        cache,
         event_webhook::event::EventKind,
         oci::{Digest, Namespace, Reference},
-        policy::{RetentionPolicy, RetentionPolicyConfig, SystemClock},
         registry::{
-            Registry, RegistryConfig, Repository,
+            Registry, RegistryConfig,
             blob_store::BlobStore,
             job_store::JobStore,
-            manifest::DEFAULT_MAX_MANIFEST_SIZE_BYTES,
             metadata_store::{LinkOperation, MetadataStore, link_kind::LinkKind},
             repository_resolver::RepositoryResolver,
-            test_utils::{build_store, build_test_fs_executor},
+            test_utils::{
+                build_store, build_test_fs_executor, downstream_client, repository_with_downstream,
+                sole_pending_payload,
+            },
         },
-        registry_client::RegistryClient,
-        replication::{
-            REPLICATION_DELETE_MANIFEST_KIND, REPLICATION_QUEUE, ReplicationDownstream,
-            ReplicationMode, ReplicationPushPayload,
-        },
+        replication::{REPLICATION_DELETE_MANIFEST_KIND, REPLICATION_QUEUE},
         util::sha256,
     };
 
@@ -3190,43 +3186,6 @@ mod noop_suppression_tests {
 
     const REPO: &str = "nginx";
     const NAMESPACE: &str = "nginx";
-    const DOWNSTREAM: &str = "eu-region";
-
-    fn downstream_client() -> Arc<RegistryClient> {
-        let backend = cache::Config::Memory.to_backend().unwrap();
-        Arc::new(
-            RegistryClient::builder()
-                .url("https://unused.test".to_string())
-                .client(reqwest::Client::new())
-                .cache(backend)
-                .max_manifest_size_bytes(DEFAULT_MAX_MANIFEST_SIZE_BYTES)
-                .build()
-                .unwrap(),
-        )
-    }
-
-    fn repository_with_downstream() -> Repository {
-        Repository {
-            name: REPO.to_string(),
-            upstreams: Vec::new(),
-            replication: vec![
-                ReplicationDownstream::builder()
-                    .name(DOWNSTREAM.to_string())
-                    .registry_client(downstream_client())
-                    .mode(ReplicationMode::EventReconcile)
-                    .namespace_filter(Vec::new())
-                    .max_concurrent_pushes(4)
-                    .build()
-                    .unwrap(),
-            ],
-            retention_policy: RetentionPolicy::new(
-                &RetentionPolicyConfig::default(),
-                Arc::new(SystemClock),
-            ),
-            immutable_tags: false,
-            immutable_tags_exclusions: Vec::new(),
-        }
-    }
 
     /// Build a `Registry` whose blob store, metadata store, and a caller-held
     /// `JobStore` all share one FS-backed `Store`, carrying a single
@@ -3248,7 +3207,10 @@ mod noop_suppression_tests {
         let blob_store = Arc::new(BlobStore::builder().store(store.clone()).build().unwrap());
 
         let mut repositories = HashMap::new();
-        repositories.insert(REPO.to_string(), repository_with_downstream());
+        repositories.insert(
+            REPO.to_string(),
+            repository_with_downstream(REPO, downstream_client("https://unused.test")),
+        );
         let resolver = Arc::new(RepositoryResolver::new(Arc::new(repositories)).unwrap());
 
         let job_store: Arc<JobStore> = Arc::new(JobStore::new(store, "test"));
@@ -3260,22 +3222,6 @@ mod noop_suppression_tests {
 
     async fn pending(job_store: &JobStore) -> u64 {
         job_store.count_pending(REPLICATION_QUEUE, 0).await.unwrap()
-    }
-
-    /// Decode the payload of the sole pending replication job, panicking
-    /// unless exactly one is pending.
-    async fn sole_pending_payload(job_store: &JobStore) -> ReplicationPushPayload {
-        let keys = job_store.list_pending(REPLICATION_QUEUE, 16).await.unwrap();
-        assert_eq!(
-            keys.len(),
-            1,
-            "expected exactly one pending replication job"
-        );
-        let envelope = job_store
-            .read_pending(REPLICATION_QUEUE, &keys[0])
-            .await
-            .unwrap();
-        serde_json::from_value(envelope.payload).expect("decode ReplicationPushPayload")
     }
 
     /// Drains (claims + completes) one pending replication job, clearing its
@@ -3756,19 +3702,18 @@ mod dispatch_replication_tests {
     use regex::Regex;
 
     use crate::{
-        cache,
         oci::{Digest, Namespace},
-        policy::{RetentionPolicy, RetentionPolicyConfig, SystemClock},
         registry::{
             Registry, RegistryConfig, Repository,
             blob_store::BlobStore,
             job_store::JobStore,
-            manifest::DEFAULT_MAX_MANIFEST_SIZE_BYTES,
             metadata_store::MetadataStore,
             repository_resolver::RepositoryResolver,
-            test_utils::{build_store, build_test_fs_executor},
+            test_utils::{
+                build_store, build_test_fs_executor, downstream_client,
+                repository_with_replication, sole_pending_payload,
+            },
         },
-        registry_client::RegistryClient,
         replication::{
             REPLICATION_DELETE_MANIFEST_KIND, REPLICATION_PUSH_MANIFEST_KIND, REPLICATION_QUEUE,
             ReplicationDownstream, ReplicationMode, ReplicationPushPayload,
@@ -3781,19 +3726,6 @@ mod dispatch_replication_tests {
     const SAMPLE_DIGEST: &str =
         "sha256:1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef";
 
-    fn downstream_client() -> Arc<RegistryClient> {
-        let backend = cache::Config::Memory.to_backend().unwrap();
-        Arc::new(
-            RegistryClient::builder()
-                .url("https://unused.test".to_string())
-                .client(reqwest::Client::new())
-                .cache(backend)
-                .max_manifest_size_bytes(DEFAULT_MAX_MANIFEST_SIZE_BYTES)
-                .build()
-                .unwrap(),
-        )
-    }
-
     fn downstream_with(
         name: &str,
         mode: ReplicationMode,
@@ -3801,7 +3733,7 @@ mod dispatch_replication_tests {
     ) -> ReplicationDownstream {
         ReplicationDownstream::builder()
             .name(name.to_string())
-            .registry_client(downstream_client())
+            .registry_client(downstream_client("https://unused.test"))
             .mode(mode)
             .namespace_filter(namespace_filter)
             .max_concurrent_pushes(4)
@@ -3809,23 +3741,12 @@ mod dispatch_replication_tests {
             .unwrap()
     }
 
-    fn repository_with_replication(replication: Vec<ReplicationDownstream>) -> Repository {
-        Repository {
-            name: REPO.to_string(),
-            upstreams: Vec::new(),
-            replication,
-            retention_policy: RetentionPolicy::new(
-                &RetentionPolicyConfig::default(),
-                Arc::new(SystemClock),
-            ),
-            immutable_tags: false,
-            immutable_tags_exclusions: Vec::new(),
-        }
-    }
-
     /// Repository with exactly one downstream of the given mode and namespace filter.
     fn repository_with(mode: ReplicationMode, namespace_filter: Vec<Regex>) -> Repository {
-        repository_with_replication(vec![downstream_with(DOWNSTREAM, mode, namespace_filter)])
+        repository_with_replication(
+            REPO,
+            vec![downstream_with(DOWNSTREAM, mode, namespace_filter)],
+        )
     }
 
     fn repository_with_downstream() -> Repository {
@@ -3860,23 +3781,6 @@ mod dispatch_replication_tests {
         let registry = Registry::new(blob_store, metadata_store, resolver, config).unwrap();
 
         (registry, job_store)
-    }
-
-    /// Decode the payload of the sole pending replication job, panicking unless
-    /// exactly one is pending.
-    async fn sole_pending_payload(job_store: &JobStore) -> ReplicationPushPayload {
-        let keys = job_store.list_pending(REPLICATION_QUEUE, 16).await.unwrap();
-        assert_eq!(
-            keys.len(),
-            1,
-            "expected exactly one pending replication job"
-        );
-        let envelope = job_store
-            .read_pending(REPLICATION_QUEUE, &keys[0])
-            .await
-            .unwrap();
-        assert_eq!(envelope.queue, REPLICATION_QUEUE);
-        serde_json::from_value(envelope.payload).expect("decode ReplicationPushPayload")
     }
 
     /// [`build_registry_with`] with one `event+reconcile` downstream.
@@ -3957,10 +3861,13 @@ mod dispatch_replication_tests {
         let dir = TempDir::new().unwrap();
         let (registry, job_store) = build_registry_with(
             dir.path().to_str().unwrap(),
-            repository_with_replication(vec![
-                downstream_with(DOWNSTREAM, ReplicationMode::EventReconcile, Vec::new()),
-                downstream_with("us-region", ReplicationMode::EventReconcile, Vec::new()),
-            ]),
+            repository_with_replication(
+                REPO,
+                vec![
+                    downstream_with(DOWNSTREAM, ReplicationMode::EventReconcile, Vec::new()),
+                    downstream_with("us-region", ReplicationMode::EventReconcile, Vec::new()),
+                ],
+            ),
         );
 
         let namespace = Namespace::new(NAMESPACE).unwrap();

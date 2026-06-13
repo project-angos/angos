@@ -317,7 +317,6 @@ mod tests {
     use angos_tx_engine::store::Store;
 
     use crate::{
-        cache,
         command::{
             scrub::{
                 action::Action,
@@ -330,15 +329,16 @@ mod tests {
         },
         metrics_provider,
         oci::Digest,
-        policy::{RetentionPolicy, RetentionPolicyConfig, SystemClock},
         registry::{
             DOCKER_CONTENT_DIGEST, Repository,
             blob_store::BlobStore,
             job_store::JobStore,
-            manifest::DEFAULT_MAX_MANIFEST_SIZE_BYTES,
             metadata_store::{LinkOperation, MetadataStore, link_kind::LinkKind},
             repository_resolver::RepositoryResolver,
-            test_utils::{build_store, build_test_fs_executor, put_blob_direct, put_link_raw},
+            test_utils::{
+                build_store, build_test_fs_executor, downstream_client, put_blob_direct,
+                put_link_raw, repository_with_replication, seed_manifest,
+            },
         },
         registry_client::RegistryClient,
         replication::{
@@ -370,24 +370,10 @@ mod tests {
         (metadata_store, store, dir)
     }
 
-    fn downstream_client(uri: &str) -> Arc<RegistryClient> {
-        let backend = cache::Config::Memory.to_backend().unwrap();
-        Arc::new(
-            RegistryClient::builder()
-                .url(uri.to_string())
-                .client(reqwest::Client::new())
-                .cache(backend)
-                .max_manifest_size_bytes(DEFAULT_MAX_MANIFEST_SIZE_BYTES)
-                .build()
-                .unwrap(),
-        )
-    }
-
     fn repository(client: Arc<RegistryClient>, mode: ReplicationMode, prune: bool) -> Repository {
-        Repository {
-            name: REPO.to_string(),
-            upstreams: Vec::new(),
-            replication: vec![
+        repository_with_replication(
+            REPO,
+            vec![
                 ReplicationDownstream::builder()
                     .name(DOWNSTREAM.to_string())
                     .registry_client(client)
@@ -397,13 +383,7 @@ mod tests {
                     .build()
                     .unwrap(),
             ],
-            retention_policy: RetentionPolicy::new(
-                &RetentionPolicyConfig::default(),
-                Arc::new(SystemClock),
-            ),
-            immutable_tags: false,
-            immutable_tags_exclusions: Vec::new(),
-        }
+        )
     }
 
     fn resolver_for(repo: Repository) -> Arc<RepositoryResolver> {
@@ -1045,55 +1025,6 @@ mod tests {
     // End-to-end (`angos scrub --replicate`)
     // ------------------------------------------------------------------
 
-    /// Seeds config, layer, and manifest blobs plus a `v1` tag link; returns
-    /// their digests.
-    async fn seed_manifest(
-        store: &Arc<Store>,
-        metadata_store: &Arc<MetadataStore>,
-    ) -> (Digest, Digest, Digest) {
-        let config_bytes = br#"{"config":true}"#.to_vec();
-        let layer_bytes = b"layer-bytes".to_vec();
-        let config_digest = put_blob_direct(store, &config_bytes).await;
-        let layer_digest = put_blob_direct(store, &layer_bytes).await;
-
-        let manifest = json!({
-            "schemaVersion": 2,
-            "mediaType": "application/vnd.oci.image.manifest.v1+json",
-            "config": {
-                "mediaType": "application/vnd.oci.image.config.v1+json",
-                "digest": config_digest.to_string(),
-                "size": config_bytes.len(),
-            },
-            "layers": [{
-                "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
-                "digest": layer_digest.to_string(),
-                "size": layer_bytes.len(),
-            }],
-        });
-        let manifest_bytes = serde_json::to_vec(&manifest).unwrap();
-        let manifest_digest = put_blob_direct(store, &manifest_bytes).await;
-
-        metadata_store
-            .update_links(
-                NAMESPACE,
-                &[
-                    LinkOperation::create(LinkKind::Tag("v1".to_string()), manifest_digest.clone()),
-                    LinkOperation::create(
-                        LinkKind::Config(config_digest.clone()),
-                        config_digest.clone(),
-                    ),
-                    LinkOperation::create(
-                        LinkKind::Layer(layer_digest.clone()),
-                        layer_digest.clone(),
-                    ),
-                ],
-            )
-            .await
-            .unwrap();
-
-        (manifest_digest, config_digest, layer_digest)
-    }
-
     /// Mounts a downstream missing tag `v1` and both blobs, expecting the full
     /// blob-upload sequence and exactly one tagged manifest PUT. The
     /// `.expect(...)` counts are verified on `MockServer` drop.
@@ -1162,7 +1093,7 @@ mod tests {
         let mock_server = MockServer::start().await;
 
         let (manifest_digest, config_digest, layer_digest) =
-            seed_manifest(&store, &metadata_store).await;
+            seed_manifest(&store, &metadata_store, NAMESPACE).await;
 
         mount_out_of_sync_downstream(
             &mock_server,
@@ -1258,7 +1189,7 @@ mod tests {
         let mock_server = MockServer::start().await;
 
         let (manifest_digest, _config_digest, _layer_digest) =
-            seed_manifest(&store, &metadata_store).await;
+            seed_manifest(&store, &metadata_store, NAMESPACE).await;
         Mock::given(method("HEAD"))
             .and(path(format!("/v2/{NAMESPACE}/manifests/v1")))
             .respond_with(

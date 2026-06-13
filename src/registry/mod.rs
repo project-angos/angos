@@ -393,7 +393,6 @@ impl Drop for Registry {
 mod in_process_replication_tests {
     use std::{collections::HashMap, sync::Arc, time::Duration};
 
-    use serde_json::json;
     use tempfile::TempDir;
     use tokio::time::{sleep, timeout};
     use wiremock::{
@@ -404,77 +403,27 @@ mod in_process_replication_tests {
     use angos_storage::{ObjectStore, fs::Backend as StorageFsBackend};
 
     use crate::{
-        cache,
-        oci::{Digest, Namespace},
-        policy::{RetentionPolicy, RetentionPolicyConfig, SystemClock},
+        oci::Namespace,
         registry::{
             DOCKER_CONTENT_DIGEST, Registry, RegistryConfig, Repository,
             blob_store::BlobStore,
             job_store::{JobEnvelope, JobStore},
-            manifest::DEFAULT_MAX_MANIFEST_SIZE_BYTES,
-            metadata_store::{LinkOperation, MetadataStore, link_kind::LinkKind},
+            metadata_store::MetadataStore,
             repository_resolver::RepositoryResolver,
-            test_utils::{build_store, build_test_fs_executor, put_blob_direct},
+            test_utils::{
+                build_store, build_test_fs_executor, downstream_client, repository_with_downstream,
+                repository_with_replication, seed_manifest,
+            },
         },
         registry_client::RegistryClient,
-        replication::{
-            REPLICATION_PUSH_MANIFEST_KIND, REPLICATION_QUEUE, ReplicationDownstream,
-            ReplicationMode,
-        },
+        replication::{REPLICATION_PUSH_MANIFEST_KIND, REPLICATION_QUEUE},
     };
 
     const NAMESPACE: &str = "nginx";
     const REPO: &str = "nginx";
-    const DOWNSTREAM: &str = "eu-region";
-
-    fn downstream_client(uri: &str) -> Arc<RegistryClient> {
-        let backend = cache::Config::Memory.to_backend().unwrap();
-        Arc::new(
-            RegistryClient::builder()
-                .url(uri.to_string())
-                .client(reqwest::Client::new())
-                .cache(backend)
-                .max_manifest_size_bytes(DEFAULT_MAX_MANIFEST_SIZE_BYTES)
-                .build()
-                .unwrap(),
-        )
-    }
-
-    fn repository_with_downstream(client: Arc<RegistryClient>) -> Repository {
-        Repository {
-            name: REPO.to_string(),
-            upstreams: Vec::new(),
-            replication: vec![
-                ReplicationDownstream::builder()
-                    .name(DOWNSTREAM.to_string())
-                    .registry_client(client)
-                    .mode(ReplicationMode::EventReconcile)
-                    .namespace_filter(Vec::new())
-                    .max_concurrent_pushes(4)
-                    .build()
-                    .unwrap(),
-            ],
-            retention_policy: RetentionPolicy::new(
-                &RetentionPolicyConfig::default(),
-                Arc::new(SystemClock),
-            ),
-            immutable_tags: false,
-            immutable_tags_exclusions: Vec::new(),
-        }
-    }
 
     fn repository_without_downstream() -> Repository {
-        Repository {
-            name: REPO.to_string(),
-            upstreams: Vec::new(),
-            replication: Vec::new(),
-            retention_policy: RetentionPolicy::new(
-                &RetentionPolicyConfig::default(),
-                Arc::new(SystemClock),
-            ),
-            immutable_tags: false,
-            immutable_tags_exclusions: Vec::new(),
-        }
+        repository_with_replication(REPO, Vec::new())
     }
 
     /// Build a `Registry` with an automatic in-process queue (no
@@ -513,57 +462,7 @@ mod in_process_replication_tests {
         root: &str,
         client: Arc<RegistryClient>,
     ) -> (Registry, Arc<BlobStore>, Arc<MetadataStore>) {
-        build_registry_with(root, repository_with_downstream(client))
-    }
-
-    /// Seed a config blob, a layer blob, a manifest referencing both, and a `v1`
-    /// tag link. Returns the manifest + referenced blob digests.
-    async fn seed_manifest(
-        store: &Arc<angos_tx_engine::store::Store>,
-        metadata_store: &Arc<MetadataStore>,
-    ) -> (Digest, Digest, Digest) {
-        let config_bytes = br#"{"config":true}"#.to_vec();
-        let layer_bytes = b"layer-bytes".to_vec();
-
-        let config_digest = put_blob_direct(store, &config_bytes).await;
-        let layer_digest = put_blob_direct(store, &layer_bytes).await;
-
-        let manifest = json!({
-            "schemaVersion": 2,
-            "mediaType": "application/vnd.oci.image.manifest.v1+json",
-            "config": {
-                "mediaType": "application/vnd.oci.image.config.v1+json",
-                "digest": config_digest.to_string(),
-                "size": config_bytes.len(),
-            },
-            "layers": [{
-                "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
-                "digest": layer_digest.to_string(),
-                "size": layer_bytes.len(),
-            }],
-        });
-        let manifest_bytes = serde_json::to_vec(&manifest).unwrap();
-        let manifest_digest = put_blob_direct(store, &manifest_bytes).await;
-
-        metadata_store
-            .update_links(
-                NAMESPACE,
-                &[
-                    LinkOperation::create(LinkKind::Tag("v1".to_string()), manifest_digest.clone()),
-                    LinkOperation::create(
-                        LinkKind::Config(config_digest.clone()),
-                        config_digest.clone(),
-                    ),
-                    LinkOperation::create(
-                        LinkKind::Layer(layer_digest.clone()),
-                        layer_digest.clone(),
-                    ),
-                ],
-            )
-            .await
-            .unwrap();
-
-        (manifest_digest, config_digest, layer_digest)
+        build_registry_with(root, repository_with_downstream(REPO, client))
     }
 
     /// The drained job runs the full push pipeline (HEAD-before-PUT blobs, PUT
@@ -580,7 +479,7 @@ mod in_process_replication_tests {
         let (registry, blob_store, metadata_store) = build_registry(root, client);
 
         let (manifest_digest, config_digest, layer_digest) =
-            seed_manifest(&blob_store.store, &metadata_store).await;
+            seed_manifest(&blob_store.store, &metadata_store, NAMESPACE).await;
 
         // Downstream is missing both blobs (404 on HEAD) -> upload sequence runs.
         for blob in [&config_digest, &layer_digest] {

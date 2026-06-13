@@ -22,27 +22,24 @@ use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};
 use angos_storage::{ObjectStore, fs::Backend as StorageFsBackend};
 
 use crate::{
-    cache,
     event_webhook::{
         config::{DeliveryPolicy, EventWebhookConfig},
         dispatcher::EventDispatcher,
         event::EventKind,
     },
     oci::{Digest, Namespace, Reference},
-    policy::{RetentionPolicy, RetentionPolicyConfig, SystemClock},
     registry::{
-        Registry, RegistryConfig, Repository, blob_store,
+        Registry, RegistryConfig, blob_store,
         job_store::JobStore,
         metadata_store::MetadataStore,
         repository_resolver::RepositoryResolver,
         test_utils::{
-            build_store, build_test_fs_executor, create_test_registry, metadata_store_over,
+            build_store, build_test_fs_executor, create_test_registry, downstream_client,
+            metadata_store_over, repository_with_downstream, sole_pending_payload,
         },
     },
-    registry_client::RegistryClient,
     replication::{
         REPLICATION_DELETE_MANIFEST_KIND, REPLICATION_PUSH_MANIFEST_KIND, REPLICATION_QUEUE,
-        ReplicationDownstream, ReplicationMode, ReplicationPushPayload,
     },
     util::sha256,
 };
@@ -556,19 +553,6 @@ async fn digest_push_events_delivered_to_webhook_endpoint() {
 
 const REPLICATION_REPO: &str = "test-repo";
 
-fn downstream_client() -> Arc<RegistryClient> {
-    let backend = cache::Config::Memory.to_backend().unwrap();
-    Arc::new(
-        RegistryClient::builder()
-            .url("https://unused.test".to_string())
-            .client(reqwest::Client::new())
-            .cache(backend)
-            .max_manifest_size_bytes(crate::registry::manifest::DEFAULT_MAX_MANIFEST_SIZE_BYTES)
-            .build()
-            .unwrap(),
-    )
-}
-
 /// A `Registry` with one `event+reconcile` downstream and a caller-held
 /// `JobStore`. No drain is spawned: these tests assert enqueue only.
 struct ReplicationFixture {
@@ -605,25 +589,8 @@ impl ReplicationFixture {
                 .unwrap(),
         );
 
-        let repository = Repository {
-            name: REPLICATION_REPO.to_string(),
-            upstreams: Vec::new(),
-            replication: vec![
-                ReplicationDownstream::builder()
-                    .name("eu-region".to_string())
-                    .registry_client(downstream_client())
-                    .mode(ReplicationMode::EventReconcile)
-                    .max_concurrent_pushes(4)
-                    .build()
-                    .unwrap(),
-            ],
-            retention_policy: RetentionPolicy::new(
-                &RetentionPolicyConfig::default(),
-                Arc::new(SystemClock),
-            ),
-            immutable_tags: false,
-            immutable_tags_exclusions: Vec::new(),
-        };
+        let repository =
+            repository_with_downstream(REPLICATION_REPO, downstream_client("https://unused.test"));
         let mut repositories = HashMap::new();
         repositories.insert(REPLICATION_REPO.to_string(), repository);
         let resolver = Arc::new(RepositoryResolver::new(Arc::new(repositories)).unwrap());
@@ -639,23 +606,6 @@ impl ReplicationFixture {
             _temp_dir: temp_dir,
         }
     }
-}
-
-/// Decode the payload of the sole pending replication job, panicking unless
-/// exactly one is pending.
-async fn sole_pending_payload(job_store: &JobStore) -> ReplicationPushPayload {
-    let keys = job_store.list_pending(REPLICATION_QUEUE, 16).await.unwrap();
-    assert_eq!(
-        keys.len(),
-        1,
-        "expected exactly one pending replication job"
-    );
-    let envelope = job_store
-        .read_pending(REPLICATION_QUEUE, &keys[0])
-        .await
-        .unwrap();
-    assert_eq!(envelope.queue, REPLICATION_QUEUE);
-    serde_json::from_value(envelope.payload).expect("decode ReplicationPushPayload")
 }
 
 #[tokio::test]
