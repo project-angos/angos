@@ -50,11 +50,27 @@ pub enum PushOutcome {
     Unsupported,
 }
 
+/// Per-push invariants shared across the recursion and the blob fan-out: the
+/// borrowed downstream and stores, the concurrency cap, the namespace, and the
+/// last-writer-wins source timestamp. The per-manifest varying inputs (digest,
+/// media type, tag, body) stay direct arguments to [`push_manifest`].
+///
+/// Built once at the handler call site; the recursion passes the same context
+/// to every child since children push into the same namespace.
+pub struct PushContext<'a> {
+    pub downstream: &'a RegistryClient,
+    pub blob_store: &'a Arc<BlobStore>,
+    pub metadata_store: &'a Arc<MetadataStore>,
+    pub namespace: &'a str,
+    pub max_concurrent_pushes: usize,
+    pub source_ts: Option<&'a str>,
+}
+
 /// Pushes the manifest at `digest` (and everything it references) to
-/// `downstream`, then binds `tag` to it when set.
+/// `ctx.downstream`, then binds `tag` to it when set.
 ///
 /// Child manifests land before the parent index, referenced blobs are
-/// HEAD-probed and only transferred when absent, and `source_ts` (the
+/// HEAD-probed and only transferred when absent, and `ctx.source_ts` (the
 /// last-writer-wins timestamp header) is stamped on the primary manifest PUT
 /// only: the referrers fallback tag is a merged set, not an LWW register (see
 /// [`push_referrers_fallback`]).
@@ -64,19 +80,13 @@ pub enum PushOutcome {
 /// Returns [`Error::Registry`] when a local read or downstream operation fails
 /// with anything other than an LWW-superseded 409, which converges as
 /// [`PushOutcome::Superseded`].
-#[instrument(skip(downstream, blob_store, metadata_store, body))]
-#[allow(clippy::too_many_arguments)]
+#[instrument(skip(ctx, body))]
 pub async fn push_manifest(
-    downstream: &RegistryClient,
-    blob_store: &Arc<BlobStore>,
-    metadata_store: &Arc<MetadataStore>,
-    namespace: &str,
+    ctx: &PushContext<'_>,
     digest: &Digest,
     media_type: Option<String>,
     tag: Option<&str>,
     body: Vec<u8>,
-    max_concurrent_pushes: usize,
-    source_ts: Option<&str>,
 ) -> Result<PushOutcome, Error> {
     let parsed = parse_manifest_digests(&body, media_type.as_ref()).map_err(Error::Registry)?;
 
@@ -85,7 +95,9 @@ pub async fn push_manifest(
         Some(tag) => Reference::Tag(tag.to_string()),
         None => Reference::Digest(digest.clone()),
     };
-    let location = downstream.get_manifest_path(NO_LOCAL_PREFIX, namespace, &reference);
+    let location = ctx
+        .downstream
+        .get_manifest_path(NO_LOCAL_PREFIX, ctx.namespace, &reference);
 
     // The converged skip runs before child recursion and the blob sweep: a
     // digest-matching HEAD means the downstream validated this manifest's
@@ -95,13 +107,14 @@ pub async fn push_manifest(
     // whether the downstream needs the referrers fallback, and a converged
     // primary does not imply the fallback landed.
     if parsed.subject.is_none()
-        && downstream
+        && ctx
+            .downstream
             .head_manifest(&manifest_accept_types(), &location)
             .await
             .is_ok_and(|(_, downstream_digest, _)| &downstream_digest == digest)
     {
         info!(
-            namespace,
+            namespace = ctx.namespace,
             %digest,
             ?tag,
             "Downstream already holds this manifest; skipping PUT (converged)"
@@ -109,26 +122,9 @@ pub async fn push_manifest(
         return Ok(PushOutcome::Converged);
     }
 
-    push_child_manifests(
-        downstream,
-        blob_store,
-        metadata_store,
-        namespace,
-        &parsed,
-        max_concurrent_pushes,
-        source_ts,
-    )
-    .await?;
+    push_child_manifests(ctx, &parsed).await?;
 
-    push_blobs(
-        downstream,
-        blob_store,
-        metadata_store,
-        namespace,
-        &parsed,
-        max_concurrent_pushes,
-    )
-    .await?;
+    push_blobs(ctx, &parsed).await?;
 
     // Retain a body copy only for the subject-bearing fallback path; the common
     // path moves the body into the PUT.
@@ -139,22 +135,29 @@ pub async fn push_manifest(
     // rejects a PUT without a `Content-Type`, so fall back to the link's type.
     let effective_media_type = match media_type.or_else(|| parsed.media_type.clone()) {
         Some(media_type) => Some(media_type),
-        None => metadata_store
-            .read_link(namespace, &LinkKind::Digest(digest.clone()), false)
+        None => ctx
+            .metadata_store
+            .read_link(ctx.namespace, &LinkKind::Digest(digest.clone()), false)
             .await
             .ok()
             .and_then(|link| link.media_type),
     };
 
-    let result = downstream
-        .put_manifest(&location, effective_media_type.as_deref(), body, source_ts)
+    let result = ctx
+        .downstream
+        .put_manifest(
+            &location,
+            effective_media_type.as_deref(),
+            body,
+            ctx.source_ts,
+        )
         .await
         .map_err(Error::Registry)?;
 
     // An LWW loss is convergence: drop the push and skip the referrers fallback.
     if result.superseded {
         info!(
-            namespace,
+            namespace = ctx.namespace,
             %digest,
             ?tag,
             "Downstream superseded the push (last-writer-wins); treating as converged"
@@ -167,22 +170,22 @@ pub async fn push_manifest(
         && echoed != digest
     {
         warn!(
-            namespace,
+            namespace = ctx.namespace,
             %digest,
             %echoed,
             ?tag,
             "Downstream echoed a different digest for the pushed manifest body"
         );
     }
-    info!(namespace, %digest, ?tag, "Pushed manifest to downstream");
+    info!(namespace = ctx.namespace, %digest, ?tag, "Pushed manifest to downstream");
 
     // An OCI-1.0 downstream (no `OCI-Subject` response) does not auto-index the
     // subject, so push the referrers fallback tag.
     if let Some(body) = fallback_body.filter(|_| result.subject.is_none()) {
         push_referrers_fallback(
-            downstream,
-            metadata_store,
-            namespace,
+            ctx.downstream,
+            ctx.metadata_store,
+            ctx.namespace,
             digest,
             &parsed,
             &body,
@@ -198,52 +201,29 @@ pub async fn push_manifest(
 /// child at a time. The caller awaits this before it pushes the parent, so the
 /// parent index never lands before its children.
 async fn push_child_manifests(
-    downstream: &RegistryClient,
-    blob_store: &Arc<BlobStore>,
-    metadata_store: &Arc<MetadataStore>,
-    namespace: &str,
+    ctx: &PushContext<'_>,
     parsed: &ParsedManifestDigests,
-    max_concurrent_pushes: usize,
-    source_ts: Option<&str>,
 ) -> Result<(), Error> {
     stream::iter(parsed.manifests.clone())
         .map(|child| async move {
-            let child_body = blob_store.read(&child).await.map_err(|e| {
+            let child_body = ctx.blob_store.read(&child).await.map_err(|e| {
                 Error::Registry(RegistryError::Internal(format!(
                     "failed to read local manifest blob '{child}': {e}"
                 )))
             })?;
-            Box::pin(push_manifest(
-                downstream,
-                blob_store,
-                metadata_store,
-                namespace,
-                &child,
-                None,
-                None,
-                child_body,
-                max_concurrent_pushes,
-                source_ts,
-            ))
-            .await
-            .map(|_| ())
+            Box::pin(push_manifest(ctx, &child, None, None, child_body))
+                .await
+                .map(|_| ())
         })
         // Config rejects 0; the floor guards direct builder misuse.
-        .buffer_unordered(max_concurrent_pushes.max(1))
+        .buffer_unordered(ctx.max_concurrent_pushes.max(1))
         .try_collect::<Vec<()>>()
         .await
         .map(|_| ())
 }
 
 /// HEAD-before-PUT every referenced blob; transfer only the absent ones.
-async fn push_blobs(
-    downstream: &RegistryClient,
-    blob_store: &Arc<BlobStore>,
-    metadata_store: &Arc<MetadataStore>,
-    namespace: &str,
-    parsed: &ParsedManifestDigests,
-    max_concurrent_pushes: usize,
-) -> Result<(), Error> {
+async fn push_blobs(ctx: &PushContext<'_>, parsed: &ParsedManifestDigests) -> Result<(), Error> {
     // Dedup: a manifest may legally repeat a digest, and two concurrent pushes
     // of the same absent blob would both HEAD-miss and upload.
     let mut seen = HashSet::new();
@@ -256,11 +236,9 @@ async fn push_blobs(
         .collect();
 
     stream::iter(blobs)
-        .map(|blob| async move {
-            push_one_blob(downstream, blob_store, metadata_store, namespace, &blob).await
-        })
+        .map(|blob| async move { push_one_blob(ctx, &blob).await })
         // Config rejects 0; the floor guards direct builder misuse.
-        .buffer_unordered(max_concurrent_pushes.max(1))
+        .buffer_unordered(ctx.max_concurrent_pushes.max(1))
         .try_collect::<Vec<()>>()
         .await?;
 
@@ -287,100 +265,93 @@ async fn mount_candidate(
 
 /// Transfers a single blob to the downstream if it is not already present,
 /// attempting a cross-repo mount before a full upload.
-async fn push_one_blob(
-    downstream: &RegistryClient,
-    blob_store: &Arc<BlobStore>,
-    metadata_store: &Arc<MetadataStore>,
-    namespace: &str,
-    digest: &Digest,
-) -> Result<(), Error> {
-    let head_location = downstream.get_blob_path(NO_LOCAL_PREFIX, namespace, digest);
+async fn push_one_blob(ctx: &PushContext<'_>, digest: &Digest) -> Result<(), Error> {
+    let head_location = ctx
+        .downstream
+        .get_blob_path(NO_LOCAL_PREFIX, ctx.namespace, digest);
     // Existence-only probe: any 2xx means present (the optional
     // Docker-Content-Digest header is not required, so a converged blob never
     // dead-letters on a minimal downstream); a 404 means absent; a transient
     // failure fails the push so the job retries instead of doing a pointless
     // full upload.
-    if downstream
+    if ctx
+        .downstream
         .blob_exists(&head_location)
         .await
         .map_err(Error::Registry)?
     {
-        debug!(namespace, %digest, "Blob already present on downstream; skipping");
+        debug!(namespace = ctx.namespace, %digest, "Blob already present on downstream; skipping");
         return Ok(());
     }
 
-    let start_location = downstream.get_uploads_start_path(NO_LOCAL_PREFIX, namespace);
+    let start_location = ctx
+        .downstream
+        .get_uploads_start_path(NO_LOCAL_PREFIX, ctx.namespace);
 
     // The mount is a pure optimization: a miss opens a session and a policy
     // rejection falls through to a plain upload, so it can never fail the push.
-    if let Some(from) = mount_candidate(metadata_store, namespace, digest).await {
-        match downstream
+    if let Some(from) = mount_candidate(ctx.metadata_store, ctx.namespace, digest).await {
+        match ctx
+            .downstream
             .mount_blob(&start_location, digest, Some(&from))
             .await
         {
             Ok(None) => {
-                info!(namespace, %digest, %from, "Mounted blob cross-repo on downstream (no transfer)");
+                info!(namespace = ctx.namespace, %digest, %from, "Mounted blob cross-repo on downstream (no transfer)");
                 return Ok(());
             }
             Ok(Some(session_url)) => {
-                return upload_into_session(
-                    downstream,
-                    blob_store,
-                    namespace,
-                    digest,
-                    &session_url,
-                )
-                .await;
+                return upload_into_session(ctx, digest, &session_url).await;
             }
             Err(e) => {
-                debug!(namespace, %digest, "Cross-repo mount unavailable ({e}); uploading instead");
+                debug!(namespace = ctx.namespace, %digest, "Cross-repo mount unavailable ({e}); uploading instead");
             }
         }
     }
 
-    let session_url = downstream
+    let session_url = ctx
+        .downstream
         .start_upload(&start_location)
         .await
         .map_err(Error::Registry)?;
-    upload_into_session(downstream, blob_store, namespace, digest, &session_url).await
+    upload_into_session(ctx, digest, &session_url).await
 }
 
 /// Streams a local blob's bytes into an already-open upload session and
 /// finalizes it.
 async fn upload_into_session(
-    downstream: &RegistryClient,
-    blob_store: &Arc<BlobStore>,
-    namespace: &str,
+    ctx: &PushContext<'_>,
     digest: &Digest,
     session_url: &str,
 ) -> Result<(), Error> {
-    let (reader, content_length) = match blob_store.reader(digest, None).await {
+    let (reader, content_length) = match ctx.blob_store.reader(digest, None).await {
         Ok(reader) => reader,
         Err(e) => {
             // The session is already open; cancel it, like the patch/complete
             // failure paths, so a dying push does not strand it on the downstream.
-            cancel_upload_session(downstream, session_url).await;
+            cancel_upload_session(ctx.downstream, session_url).await;
             return Err(Error::Registry(RegistryError::Internal(format!(
                 "failed to open local blob '{digest}': {e}"
             ))));
         }
     };
-    let patched_url = match downstream
+    let patched_url = match ctx
+        .downstream
         .patch_upload(session_url, content_length, reader)
         .await
     {
         Ok(url) => url,
         Err(e) => {
-            cancel_upload_session(downstream, session_url).await;
+            cancel_upload_session(ctx.downstream, session_url).await;
             return Err(Error::Registry(e));
         }
     };
-    if let Err(e) = downstream.complete_upload(&patched_url, digest).await {
-        cancel_upload_session(downstream, &patched_url).await;
+    if let Err(e) = ctx.downstream.complete_upload(&patched_url, digest).await {
+        cancel_upload_session(ctx.downstream, &patched_url).await;
         return Err(Error::Registry(e));
     }
 
-    info!(namespace, %digest, content_length, "Pushed blob to downstream");
+    info!(namespace = ctx.namespace, %digest, content_length, "Pushed blob to downstream");
     Ok(())
 }
 
@@ -811,7 +782,7 @@ mod tests {
         registry_client::RegistryClient,
         replication::{
             REPLICATION_SUPERSEDED_CODE, X_ANGOS_SOURCE_TIMESTAMP,
-            pipeline::{PushOutcome, delete_manifest, push_manifest},
+            pipeline::{PushContext, PushOutcome, delete_manifest, push_manifest},
         },
         util::sha256,
     };
@@ -969,17 +940,21 @@ mod tests {
             .mount(&mock_server)
             .await;
 
+        let client = downstream_client(&mock_server.uri());
+        let ctx = PushContext {
+            downstream: &client,
+            blob_store: &blob_store,
+            metadata_store: &metadata_store,
+            namespace: NAMESPACE,
+            max_concurrent_pushes: 4,
+            source_ts: None,
+        };
         push_manifest(
-            &downstream_client(&mock_server.uri()),
-            &blob_store,
-            &metadata_store,
-            NAMESPACE,
+            &ctx,
             &manifest_digest,
             Some("application/vnd.oci.image.manifest.v1+json".to_string()),
             Some("v1"),
             manifest_bytes,
-            4,
-            None,
         )
         .await
         .unwrap();
@@ -1046,20 +1021,18 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        push_manifest(
-            &downstream_client(&mock_server.uri()),
-            &blob_store,
-            &metadata_store,
-            NAMESPACE,
-            &manifest_digest,
-            None,
-            Some("v1"),
-            manifest_bytes,
-            4,
-            Some("2026-06-03T00:00:00Z"),
-        )
-        .await
-        .expect("subject push with a stamped primary and timestamp-less fallback");
+        let client = downstream_client(&mock_server.uri());
+        let ctx = PushContext {
+            downstream: &client,
+            blob_store: &blob_store,
+            metadata_store: &metadata_store,
+            namespace: NAMESPACE,
+            max_concurrent_pushes: 4,
+            source_ts: Some("2026-06-03T00:00:00Z"),
+        };
+        push_manifest(&ctx, &manifest_digest, None, Some("v1"), manifest_bytes)
+            .await
+            .expect("subject push with a stamped primary and timestamp-less fallback");
         drop(mock_server);
     }
 
@@ -1143,17 +1116,21 @@ mod tests {
             .mount(&mock_server)
             .await;
 
+        let client = downstream_client(&mock_server.uri());
+        let ctx = PushContext {
+            downstream: &client,
+            blob_store: &blob_store,
+            metadata_store: &metadata_store,
+            namespace: NAMESPACE,
+            max_concurrent_pushes: 4,
+            source_ts: None,
+        };
         let result = push_manifest(
-            &downstream_client(&mock_server.uri()),
-            &blob_store,
-            &metadata_store,
-            NAMESPACE,
+            &ctx,
             &manifest_digest,
             Some("application/vnd.oci.image.manifest.v1+json".to_string()),
             Some("v1"),
             manifest_bytes,
-            4,
-            None,
         )
         .await;
 
@@ -1221,19 +1198,16 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        let result = push_manifest(
-            &downstream_client(&mock_server.uri()),
-            &blob_store,
-            &metadata_store,
-            NAMESPACE,
-            &manifest_digest,
-            None,
-            Some("v1"),
-            manifest_bytes,
-            4,
-            None,
-        )
-        .await;
+        let client = downstream_client(&mock_server.uri());
+        let ctx = PushContext {
+            downstream: &client,
+            blob_store: &blob_store,
+            metadata_store: &metadata_store,
+            namespace: NAMESPACE,
+            max_concurrent_pushes: 4,
+            source_ts: None,
+        };
+        let result = push_manifest(&ctx, &manifest_digest, None, Some("v1"), manifest_bytes).await;
 
         assert!(
             result.is_err(),
@@ -1323,31 +1297,17 @@ mod tests {
             .await;
 
         let client = downstream_client(&mock_server.uri());
+        let ctx = PushContext {
+            downstream: &client,
+            blob_store: &blob_store,
+            metadata_store: &metadata_store,
+            namespace: NAMESPACE,
+            max_concurrent_pushes: 4,
+            source_ts: None,
+        };
         let (a, b) = tokio::join!(
-            push_manifest(
-                &client,
-                &blob_store,
-                &metadata_store,
-                NAMESPACE,
-                &digest_a,
-                None,
-                Some("v1"),
-                bytes_a,
-                4,
-                None,
-            ),
-            push_manifest(
-                &client,
-                &blob_store,
-                &metadata_store,
-                NAMESPACE,
-                &digest_b,
-                None,
-                Some("v2"),
-                bytes_b,
-                4,
-                None,
-            ),
+            push_manifest(&ctx, &digest_a, None, Some("v1"), bytes_a),
+            push_manifest(&ctx, &digest_b, None, Some("v2"), bytes_b),
         );
         a.unwrap();
         b.unwrap();
@@ -1402,17 +1362,21 @@ mod tests {
             .await;
 
         // Any fallback-tag PUT would 404 (no mock) and surface as an error.
+        let client = downstream_client(&mock_server.uri());
+        let ctx = PushContext {
+            downstream: &client,
+            blob_store: &blob_store,
+            metadata_store: &metadata_store,
+            namespace: NAMESPACE,
+            max_concurrent_pushes: 4,
+            source_ts: None,
+        };
         push_manifest(
-            &downstream_client(&mock_server.uri()),
-            &blob_store,
-            &metadata_store,
-            NAMESPACE,
+            &ctx,
             &manifest_digest,
             Some("application/vnd.oci.image.manifest.v1+json".to_string()),
             Some("v1"),
             manifest_bytes,
-            4,
-            None,
         )
         .await
         .unwrap();
@@ -1477,17 +1441,21 @@ mod tests {
             .mount(&mock_server)
             .await;
 
+        let client = downstream_client(&mock_server.uri());
+        let ctx = PushContext {
+            downstream: &client,
+            blob_store: &blob_store,
+            metadata_store: &metadata_store,
+            namespace: NAMESPACE,
+            max_concurrent_pushes: 4,
+            source_ts: None,
+        };
         push_manifest(
-            &downstream_client(&mock_server.uri()),
-            &blob_store,
-            &metadata_store,
-            NAMESPACE,
+            &ctx,
             &index_digest,
             Some("application/vnd.oci.image.index.v1+json".to_string()),
             Some("v1"),
             index_bytes,
-            4,
-            None,
         )
         .await
         .unwrap();
@@ -1547,17 +1515,21 @@ mod tests {
             .mount(&mock_server)
             .await;
 
+        let client = downstream_client(&mock_server.uri());
+        let ctx = PushContext {
+            downstream: &client,
+            blob_store: &blob_store,
+            metadata_store: &metadata_store,
+            namespace: NAMESPACE,
+            max_concurrent_pushes: 4,
+            source_ts: None,
+        };
         push_manifest(
-            &downstream_client(&mock_server.uri()),
-            &blob_store,
-            &metadata_store,
-            NAMESPACE,
+            &ctx,
             &index_digest,
             Some("application/vnd.oci.image.index.v1+json".to_string()),
             Some("v1"),
             index_bytes,
-            4,
-            None,
         )
         .await
         .unwrap();
@@ -1658,17 +1630,21 @@ mod tests {
             .mount(&mock_server)
             .await;
 
+        let client = downstream_client(&mock_server.uri());
+        let ctx = PushContext {
+            downstream: &client,
+            blob_store: &blob_store,
+            metadata_store: &metadata_store,
+            namespace: NAMESPACE,
+            max_concurrent_pushes: 4,
+            source_ts: None,
+        };
         push_manifest(
-            &downstream_client(&mock_server.uri()),
-            &blob_store,
-            &metadata_store,
-            NAMESPACE,
+            &ctx,
             &manifest_digest,
             Some("application/vnd.oci.image.manifest.v1+json".to_string()),
             Some("v1"),
             manifest_bytes,
-            4,
-            None,
         )
         .await
         .expect("both blobs must mount cross-repo and the manifest must push");
@@ -1754,17 +1730,21 @@ mod tests {
             .mount(&mock_server)
             .await;
 
+        let client = downstream_client(&mock_server.uri());
+        let ctx = PushContext {
+            downstream: &client,
+            blob_store: &blob_store,
+            metadata_store: &metadata_store,
+            namespace: NAMESPACE,
+            max_concurrent_pushes: 4,
+            source_ts: None,
+        };
         push_manifest(
-            &downstream_client(&mock_server.uri()),
-            &blob_store,
-            &metadata_store,
-            NAMESPACE,
+            &ctx,
             &manifest_digest,
             Some("application/vnd.oci.image.manifest.v1+json".to_string()),
             Some("v1"),
             manifest_bytes,
-            4,
-            None,
         )
         .await
         .expect("a rejected mount must fall back to a normal upload");
@@ -1809,17 +1789,21 @@ mod tests {
             .mount(&mock_server)
             .await;
 
+        let client = downstream_client(&mock_server.uri());
+        let ctx = PushContext {
+            downstream: &client,
+            blob_store: &blob_store,
+            metadata_store: &metadata_store,
+            namespace: NAMESPACE,
+            max_concurrent_pushes: 4,
+            source_ts: Some("2026-06-03T00:00:00Z"),
+        };
         push_manifest(
-            &downstream_client(&mock_server.uri()),
-            &blob_store,
-            &metadata_store,
-            NAMESPACE,
+            &ctx,
             &manifest_digest,
             Some("application/vnd.oci.image.manifest.v1+json".to_string()),
             Some("v1"),
             manifest_bytes,
-            4,
-            Some("2026-06-03T00:00:00Z"),
         )
         .await
         .unwrap();
@@ -1848,17 +1832,21 @@ mod tests {
             .mount(&mock_server)
             .await;
 
+        let client = downstream_client(&mock_server.uri());
+        let ctx = PushContext {
+            downstream: &client,
+            blob_store: &blob_store,
+            metadata_store: &metadata_store,
+            namespace: NAMESPACE,
+            max_concurrent_pushes: 4,
+            source_ts: None,
+        };
         let outcome = push_manifest(
-            &downstream_client(&mock_server.uri()),
-            &blob_store,
-            &metadata_store,
-            NAMESPACE,
+            &ctx,
             &manifest_digest,
             Some("application/vnd.oci.image.manifest.v1+json".to_string()),
             Some("v1"),
             manifest_bytes,
-            4,
-            None,
         )
         .await
         .expect("a converged downstream must skip the PUT and succeed");
@@ -1932,20 +1920,18 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        push_manifest(
-            &downstream_client(&mock_server.uri()),
-            &blob_store,
-            &metadata_store,
-            NAMESPACE,
-            &manifest_digest,
-            None,
-            Some("v1"),
-            manifest_bytes,
-            4,
-            None,
-        )
-        .await
-        .expect("a manifest repeating a layer digest must push it once");
+        let client = downstream_client(&mock_server.uri());
+        let ctx = PushContext {
+            downstream: &client,
+            blob_store: &blob_store,
+            metadata_store: &metadata_store,
+            namespace: NAMESPACE,
+            max_concurrent_pushes: 4,
+            source_ts: None,
+        };
+        push_manifest(&ctx, &manifest_digest, None, Some("v1"), manifest_bytes)
+            .await
+            .expect("a manifest repeating a layer digest must push it once");
 
         drop(mock_server);
     }
@@ -1991,17 +1977,21 @@ mod tests {
             .mount(&mock_server)
             .await;
 
+        let client = downstream_client(&mock_server.uri());
+        let ctx = PushContext {
+            downstream: &client,
+            blob_store: &blob_store,
+            metadata_store: &metadata_store,
+            namespace: NAMESPACE,
+            max_concurrent_pushes: 4,
+            source_ts: None,
+        };
         let outcome = push_manifest(
-            &downstream_client(&mock_server.uri()),
-            &blob_store,
-            &metadata_store,
-            NAMESPACE,
+            &ctx,
             &manifest_digest,
             Some("application/vnd.oci.image.manifest.v1+json".to_string()),
             Some("v1"),
             manifest_bytes,
-            4,
-            None,
         )
         .await
         .expect("the Accept-stamped HEAD must still drive the converged skip");
@@ -2079,17 +2069,21 @@ mod tests {
             .mount(&mock_server)
             .await;
 
+        let client = downstream_client(&mock_server.uri());
+        let ctx = PushContext {
+            downstream: &client,
+            blob_store: &blob_store,
+            metadata_store: &metadata_store,
+            namespace: NAMESPACE,
+            max_concurrent_pushes: 4,
+            source_ts: None,
+        };
         let outcome = push_manifest(
-            &downstream_client(&mock_server.uri()),
-            &blob_store,
-            &metadata_store,
-            NAMESPACE,
+            &ctx,
             &manifest_digest,
             Some(OCI_MANIFEST_MEDIA_TYPE.to_string()),
             Some("v1"),
             manifest_bytes,
-            4,
-            None,
         )
         .await
         .expect("a converged manifest must skip the blob sweep and the PUT");
@@ -2162,17 +2156,21 @@ mod tests {
             .mount(&mock_server)
             .await;
 
+        let client = downstream_client(&mock_server.uri());
+        let ctx = PushContext {
+            downstream: &client,
+            blob_store: &blob_store,
+            metadata_store: &metadata_store,
+            namespace: NAMESPACE,
+            max_concurrent_pushes: 4,
+            source_ts: None,
+        };
         let outcome = push_manifest(
-            &downstream_client(&mock_server.uri()),
-            &blob_store,
-            &metadata_store,
-            NAMESPACE,
+            &ctx,
             &index_digest,
             Some(OCI_INDEX_MEDIA_TYPE.to_string()),
             Some("v1"),
             index_bytes,
-            4,
-            None,
         )
         .await
         .expect("a converged child must skip its PUT while the index still lands");
@@ -2222,17 +2220,21 @@ mod tests {
             .mount(&mock_server)
             .await;
 
+        let client = downstream_client(&mock_server.uri());
+        let ctx = PushContext {
+            downstream: &client,
+            blob_store: &blob_store,
+            metadata_store: &metadata_store,
+            namespace: NAMESPACE,
+            max_concurrent_pushes: 4,
+            source_ts: None,
+        };
         let result = push_manifest(
-            &downstream_client(&mock_server.uri()),
-            &blob_store,
-            &metadata_store,
-            NAMESPACE,
+            &ctx,
             &manifest_digest,
             Some(OCI_MANIFEST_MEDIA_TYPE.to_string()),
             Some("v1"),
             manifest_bytes,
-            4,
-            None,
         )
         .await;
 
@@ -2301,17 +2303,21 @@ mod tests {
             .mount(&mock_server)
             .await;
 
+        let client = downstream_client(&mock_server.uri());
+        let ctx = PushContext {
+            downstream: &client,
+            blob_store: &blob_store,
+            metadata_store: &metadata_store,
+            namespace: NAMESPACE,
+            max_concurrent_pushes: 4,
+            source_ts: None,
+        };
         let result = push_manifest(
-            &downstream_client(&mock_server.uri()),
-            &blob_store,
-            &metadata_store,
-            NAMESPACE,
+            &ctx,
             &manifest_digest,
             Some(OCI_MANIFEST_MEDIA_TYPE.to_string()),
             Some("v1"),
             manifest_bytes,
-            4,
-            None,
         )
         .await;
 
@@ -2383,20 +2389,18 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        push_manifest(
-            &downstream_client(&mock_server.uri()),
-            &blob_store,
-            &metadata_store,
-            NAMESPACE,
-            &manifest_digest,
-            None,
-            Some("v1"),
-            manifest_bytes,
-            4,
-            None,
-        )
-        .await
-        .expect("a converged subject-bearing manifest must re-push the referrers fallback");
+        let client = downstream_client(&mock_server.uri());
+        let ctx = PushContext {
+            downstream: &client,
+            blob_store: &blob_store,
+            metadata_store: &metadata_store,
+            namespace: NAMESPACE,
+            max_concurrent_pushes: 4,
+            source_ts: None,
+        };
+        push_manifest(&ctx, &manifest_digest, None, Some("v1"), manifest_bytes)
+            .await
+            .expect("a converged subject-bearing manifest must re-push the referrers fallback");
 
         drop(mock_server);
     }
@@ -2431,17 +2435,21 @@ mod tests {
             .mount(&mock_server)
             .await;
 
+        let client = downstream_client(&mock_server.uri());
+        let ctx = PushContext {
+            downstream: &client,
+            blob_store: &blob_store,
+            metadata_store: &metadata_store,
+            namespace: NAMESPACE,
+            max_concurrent_pushes: 4,
+            source_ts: None,
+        };
         push_manifest(
-            &downstream_client(&mock_server.uri()),
-            &blob_store,
-            &metadata_store,
-            NAMESPACE,
+            &ctx,
             &manifest_digest,
             Some("application/vnd.oci.image.manifest.v1+json".to_string()),
             Some("v1"),
             manifest_bytes,
-            4,
-            None,
         )
         .await
         .expect("a divergent downstream digest must still PUT");
@@ -2469,17 +2477,21 @@ mod tests {
             .mount(&mock_server)
             .await;
 
+        let client = downstream_client(&mock_server.uri());
+        let ctx = PushContext {
+            downstream: &client,
+            blob_store: &blob_store,
+            metadata_store: &metadata_store,
+            namespace: NAMESPACE,
+            max_concurrent_pushes: 4,
+            source_ts: None,
+        };
         push_manifest(
-            &downstream_client(&mock_server.uri()),
-            &blob_store,
-            &metadata_store,
-            NAMESPACE,
+            &ctx,
             &manifest_digest,
             Some("application/vnd.oci.image.manifest.v1+json".to_string()),
             Some("v1"),
             manifest_bytes,
-            4,
-            None,
         )
         .await
         .expect("a 404 HEAD must fall through to the PUT");
@@ -2527,20 +2539,18 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        push_manifest(
-            &downstream_client(&mock_server.uri()),
-            &blob_store,
-            &metadata_store,
-            NAMESPACE,
-            &manifest_digest,
-            None,
-            Some("v1"),
-            manifest_bytes,
-            4,
-            None,
-        )
-        .await
-        .expect("a typeless body must recover its Content-Type from the revision link");
+        let client = downstream_client(&mock_server.uri());
+        let ctx = PushContext {
+            downstream: &client,
+            blob_store: &blob_store,
+            metadata_store: &metadata_store,
+            namespace: NAMESPACE,
+            max_concurrent_pushes: 4,
+            source_ts: None,
+        };
+        push_manifest(&ctx, &manifest_digest, None, Some("v1"), manifest_bytes)
+            .await
+            .expect("a typeless body must recover its Content-Type from the revision link");
 
         drop(mock_server);
     }
@@ -2603,20 +2613,18 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        push_manifest(
-            &downstream_client(&mock_server.uri()),
-            &blob_store,
-            &metadata_store,
-            NAMESPACE,
-            &index_digest,
-            None,
-            Some("v1"),
-            index_bytes,
-            4,
-            None,
-        )
-        .await
-        .expect("a typeless child must recover its Content-Type and the index must land");
+        let client = downstream_client(&mock_server.uri());
+        let ctx = PushContext {
+            downstream: &client,
+            blob_store: &blob_store,
+            metadata_store: &metadata_store,
+            namespace: NAMESPACE,
+            max_concurrent_pushes: 4,
+            source_ts: None,
+        };
+        push_manifest(&ctx, &index_digest, None, Some("v1"), index_bytes)
+            .await
+            .expect("a typeless child must recover its Content-Type and the index must land");
 
         drop(mock_server);
     }
@@ -2639,17 +2647,21 @@ mod tests {
             .mount(&mock_server)
             .await;
 
+        let client = downstream_client(&mock_server.uri());
+        let ctx = PushContext {
+            downstream: &client,
+            blob_store: &blob_store,
+            metadata_store: &metadata_store,
+            namespace: NAMESPACE,
+            max_concurrent_pushes: 4,
+            source_ts: Some("2026-06-03T00:00:00Z"),
+        };
         push_manifest(
-            &downstream_client(&mock_server.uri()),
-            &blob_store,
-            &metadata_store,
-            NAMESPACE,
+            &ctx,
             &manifest_digest,
             Some("application/vnd.oci.image.manifest.v1+json".to_string()),
             Some("v1"),
             manifest_bytes,
-            4,
-            Some("2026-06-03T00:00:00Z"),
         )
         .await
         .expect("an LWW-superseded 409 must be treated as success");
@@ -2673,17 +2685,21 @@ mod tests {
             .mount(&mock_server)
             .await;
 
+        let client = downstream_client(&mock_server.uri());
+        let ctx = PushContext {
+            downstream: &client,
+            blob_store: &blob_store,
+            metadata_store: &metadata_store,
+            namespace: NAMESPACE,
+            max_concurrent_pushes: 4,
+            source_ts: None,
+        };
         let result = push_manifest(
-            &downstream_client(&mock_server.uri()),
-            &blob_store,
-            &metadata_store,
-            NAMESPACE,
+            &ctx,
             &manifest_digest,
             Some("application/vnd.oci.image.manifest.v1+json".to_string()),
             Some("v1"),
             manifest_bytes,
-            4,
-            None,
         )
         .await;
         assert!(
@@ -2821,7 +2837,7 @@ mod tests {
         metrics_provider::init_for_tests();
         let mock_server = MockServer::start().await;
         let dir = TempDir::new().unwrap();
-        let (blob_store, _metadata_store, _store) = test_blob_store(dir.path().to_str().unwrap());
+        let (blob_store, metadata_store, _store) = test_blob_store(dir.path().to_str().unwrap());
 
         let absent = Digest::Sha256(sha256::hex(b"never-written-locally").into());
         let session_url = format!("{}/v2/{NAMESPACE}/blobs/uploads/sess-1", mock_server.uri());
@@ -2832,14 +2848,16 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        let result = super::upload_into_session(
-            &downstream_client(&mock_server.uri()),
-            &blob_store,
-            NAMESPACE,
-            &absent,
-            &session_url,
-        )
-        .await;
+        let client = downstream_client(&mock_server.uri());
+        let ctx = PushContext {
+            downstream: &client,
+            blob_store: &blob_store,
+            metadata_store: &metadata_store,
+            namespace: NAMESPACE,
+            max_concurrent_pushes: 4,
+            source_ts: None,
+        };
+        let result = super::upload_into_session(&ctx, &absent, &session_url).await;
         assert!(result.is_err(), "a missing local blob must fail the upload");
 
         // .expect(1) on the DELETE verifies the session was cancelled.

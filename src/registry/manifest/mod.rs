@@ -3,6 +3,7 @@ mod parse;
 mod response;
 
 use chrono::{DateTime, Utc};
+use futures_util::future::join_all;
 pub use parse::{ParsedManifestDigests, parse_manifest_digests};
 use parse::{manifest_meta_from_body, parse_and_validate_manifest};
 pub use response::{
@@ -17,6 +18,7 @@ use tracing::{error, instrument, warn};
 
 use crate::{
     event_webhook::event::{Event, EventActor, EventKind},
+    metrics_provider::metrics_provider,
     oci::{Digest, Manifest, Namespace, Reference},
     registry::{
         DOCKER_CONTENT_DIGEST, Error, Registry, Repository,
@@ -24,7 +26,10 @@ use crate::{
         blob_store::Error as BlobStoreError,
         metadata_store::{Error as MetadataStoreError, LinkMetadata, link_kind::LinkKind},
     },
-    replication::{REPLICATION_DELETE_MANIFEST_KIND, REPLICATION_PUSH_MANIFEST_KIND},
+    replication::{
+        REPLICATION_DELETE_MANIFEST_KIND, REPLICATION_PUSH_MANIFEST_KIND, REPLICATION_QUEUE,
+        ReplicationPushPayload, build_envelope,
+    },
     util::sha256,
 };
 
@@ -813,6 +818,71 @@ impl Registry {
         }
 
         Ok(response)
+    }
+
+    /// Fire-and-forget enqueue of replication push/delete jobs, one per matching
+    /// downstream; failures are logged and counted but never fail the client's write.
+    /// Callers must only invoke this when the write changed local state, which is
+    /// what makes mesh cycles terminate.
+    pub async fn dispatch_replication(
+        &self,
+        repository: Option<&Repository>,
+        namespace: &Namespace,
+        kind: &str,
+        tag: Option<&str>,
+        digest: Option<&Digest>,
+        source_ts: Option<DateTime<Utc>>,
+    ) {
+        let Some(repository) = repository else {
+            return;
+        };
+
+        // Receiver-side last-writer-wins timestamp: authoritative for a DELETE;
+        // a PUSH re-derives it at execute time, so a coalesced push never goes
+        // stale. An inbound replicated delete passes its author timestamp so it
+        // propagates verbatim: re-stamping `now()` would let the bounced delete
+        // outrank (and destroy) a recreate that landed in between.
+        let source_ts = source_ts.unwrap_or_else(Utc::now).to_rfc3339();
+
+        // The per-downstream enqueues run concurrently: each one is an index
+        // GET plus a CAS transaction, and this awaits inside the client's
+        // PUT/DELETE response path, so serial fan-out adds tail latency.
+        let dispatches = repository
+            .replication
+            .iter()
+            .filter(|downstream| downstream.enqueues_for(namespace.as_ref()))
+            .map(|downstream| {
+                let payload = ReplicationPushPayload {
+                    downstream: downstream.name.clone(),
+                    namespace: namespace.to_string(),
+                    tag: tag.map(str::to_string),
+                    digest: digest.map(ToString::to_string),
+                    kind: kind.to_string(),
+                    source_ts: Some(source_ts.clone()),
+                };
+                async move {
+                    // Build + enqueue as one fallible step so failures share the warn + metric path.
+                    let outcome = match build_envelope(&payload) {
+                        Ok(envelope) => self
+                            .job_queue
+                            .enqueue(envelope)
+                            .await
+                            .map_err(|e| e.to_string()),
+                        Err(e) => Err(e.to_string()),
+                    };
+                    if let Err(error) = outcome {
+                        warn!(
+                            "Failed to dispatch replication job for {}: {error}",
+                            downstream.name
+                        );
+                        metrics_provider()
+                            .job_queue_enqueue_failures_total
+                            .with_label_values(&[REPLICATION_QUEUE])
+                            .inc();
+                    }
+                }
+            });
+        join_all(dispatches).await;
     }
 }
 

@@ -32,6 +32,16 @@ use crate::{
     secret::Secret,
 };
 
+/// Classifies a non-success read status: only a true 404 maps to `not_found`, so
+/// callers can tell a genuinely absent object from a transient probe failure.
+fn classify_read_failure(status: StatusCode, op: &str, not_found: Error) -> Error {
+    if status == StatusCode::NOT_FOUND {
+        not_found
+    } else {
+        Error::Internal(format!("{op}: downstream returned status {status}"))
+    }
+}
+
 fn parse_header<T: std::str::FromStr>(
     response: &Response,
     header: impl reqwest::header::AsHeaderName,
@@ -325,16 +335,11 @@ impl RegistryClient {
         let response = self.query(&Method::HEAD, accepted_types, location).await?;
 
         if !response.status().is_success() {
-            // Only a true 404 maps to BlobUnknown; callers must tell a
-            // transient failure apart from a genuinely absent blob.
-            return Err(if response.status() == StatusCode::NOT_FOUND {
-                Error::BlobUnknown
-            } else {
-                Error::Internal(format!(
-                    "head_blob: downstream returned status {}",
-                    response.status()
-                ))
-            });
+            return Err(classify_read_failure(
+                response.status(),
+                "head_blob",
+                Error::BlobUnknown,
+            ));
         }
 
         let digest = parse_header(&response, DOCKER_CONTENT_DIGEST)?;
@@ -405,16 +410,11 @@ impl RegistryClient {
         let response = self.query(&Method::HEAD, accepted_types, location).await?;
 
         if !response.status().is_success() {
-            // Only a true 404 maps to ManifestUnknown; callers must tell a
-            // transient failure apart from a genuinely absent manifest.
-            return Err(if response.status() == StatusCode::NOT_FOUND {
-                Error::ManifestUnknown
-            } else {
-                Error::Internal(format!(
-                    "head_manifest: downstream returned status {}",
-                    response.status()
-                ))
-            });
+            return Err(classify_read_failure(
+                response.status(),
+                "head_manifest",
+                Error::ManifestUnknown,
+            ));
         }
 
         let media_type = parse_header(&response, CONTENT_TYPE).ok();
@@ -438,16 +438,11 @@ impl RegistryClient {
         let response = self.query(&Method::GET, accepted_types, location).await?;
 
         if !response.status().is_success() {
-            // Only a true 404 maps to ManifestUnknown; callers must tell a
-            // transient failure apart from a genuinely absent manifest.
-            return Err(if response.status() == StatusCode::NOT_FOUND {
-                Error::ManifestUnknown
-            } else {
-                Error::Internal(format!(
-                    "get_manifest: downstream returned status {}",
-                    response.status()
-                ))
-            });
+            return Err(classify_read_failure(
+                response.status(),
+                "get_manifest",
+                Error::ManifestUnknown,
+            ));
         }
 
         let media_type = parse_header(&response, CONTENT_TYPE).ok();

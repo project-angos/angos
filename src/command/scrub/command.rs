@@ -17,7 +17,7 @@ use crate::{
             executor::{ActionSink, DryRunSink, Executor},
             setup,
         },
-        worker::runner::execute_one,
+        worker::runner::run_once,
     },
     configuration::Configuration,
     registry::{
@@ -302,18 +302,14 @@ impl Command {
         let loops = (0..drain.concurrency.get()).map(|_| async {
             let mut drained: u64 = 0;
             loop {
-                let outcome = match drain.consumer.claim_one(REPLICATION_QUEUE).await {
-                    Ok(outcome) => outcome,
+                match run_once(&drain.consumer, drain.handler.as_ref(), REPLICATION_QUEUE).await {
+                    Ok(true) => drained += 1,
+                    Ok(false) => break,
                     Err(e) => {
                         warn!("Failed to claim a replication job during drain: {e}");
                         break;
                     }
-                };
-                let Some(claimed) = outcome.claimed else {
-                    break;
-                };
-                execute_one(&drain.consumer, drain.handler.as_ref(), claimed).await;
-                drained += 1;
+                }
             }
             drained
         });

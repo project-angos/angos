@@ -23,7 +23,7 @@ use crate::{
     },
     replication::{
         ReplicationDownstream,
-        pipeline::{self, PushOutcome},
+        pipeline::{self, PushContext, PushOutcome},
     },
 };
 
@@ -68,6 +68,20 @@ fn lock_key_reference(payload: &ReplicationPushPayload) -> &str {
         .unwrap_or("")
 }
 
+/// Base delete `lock_key`,
+/// `{REPLICATION_QUEUE}.delete.{downstream}:{namespace}:{tag_or_digest}`, shared
+/// by the event-path delete (which appends `@{source_ts}`) and the scrub prune
+/// delete (which keys on this bare base). Defining it once keeps the invariant
+/// "the prune key is the event delete key minus the timestamp suffix" in code.
+fn delete_lock_key_base(payload: &ReplicationPushPayload) -> String {
+    format!(
+        "{REPLICATION_QUEUE}.delete.{}:{}:{}",
+        payload.downstream,
+        payload.namespace,
+        lock_key_reference(payload)
+    )
+}
+
 /// Builds the per-job `lock_key`,
 /// `{REPLICATION_QUEUE}.{op}.{downstream}:{namespace}:{tag_or_digest}` plus
 /// `@{source_ts}` for deletes, shared by the event path and the scrub push
@@ -80,11 +94,10 @@ fn lock_key_reference(payload: &ReplicationPushPayload) -> &str {
 #[must_use]
 fn replication_lock_key(payload: &ReplicationPushPayload) -> String {
     if payload.kind == REPLICATION_DELETE_MANIFEST_KIND {
+        // The event-path delete is the bare base plus the `@{source_ts}` suffix.
         format!(
-            "{REPLICATION_QUEUE}.delete.{}:{}:{}@{}",
-            payload.downstream,
-            payload.namespace,
-            lock_key_reference(payload),
+            "{}@{}",
+            delete_lock_key_base(payload),
             payload.source_ts.as_deref().unwrap_or("")
         )
     } else {
@@ -128,12 +141,7 @@ pub fn build_prune_delete_envelope(
     JobEnvelope::new(
         REPLICATION_QUEUE,
         payload.kind.clone(),
-        format!(
-            "{REPLICATION_QUEUE}.delete.{}:{}:{}",
-            payload.downstream,
-            payload.namespace,
-            lock_key_reference(payload)
-        ),
+        delete_lock_key_base(payload),
         payload,
     )
 }
@@ -327,20 +335,18 @@ impl ReplicationJobHandler {
             let body = self.blob_store.read(&digest).await.map_err(|e| {
                 Error::Storage(format!("failed to read local manifest '{digest}': {e}"))
             })?;
-            let outcome = pipeline::push_manifest(
-                registry_client,
-                &self.blob_store,
-                &self.metadata_store,
-                namespace.as_ref(),
-                &digest,
-                None,
-                payload.tag.as_deref(),
-                body,
+            let ctx = PushContext {
+                downstream: registry_client,
+                blob_store: &self.blob_store,
+                metadata_store: &self.metadata_store,
+                namespace: namespace.as_ref(),
                 max_concurrent_pushes,
-                source_ts.as_deref(),
-            )
-            .await
-            .map_err(|e| Error::Storage(e.to_string()))?;
+                source_ts: source_ts.as_deref(),
+            };
+            let outcome =
+                pipeline::push_manifest(&ctx, &digest, None, payload.tag.as_deref(), body)
+                    .await
+                    .map_err(|e| Error::Storage(e.to_string()))?;
             Self::record_success(&payload.downstream, outcome);
         }
 

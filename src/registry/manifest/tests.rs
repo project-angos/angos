@@ -3743,3 +3743,356 @@ mod noop_suppression_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod dispatch_replication_tests {
+    use std::{collections::HashMap, sync::Arc};
+
+    use tempfile::TempDir;
+
+    use angos_storage::{ObjectStore, fs::Backend as StorageFsBackend};
+
+    use chrono::{DateTime, Duration, Utc};
+    use regex::Regex;
+
+    use crate::{
+        cache,
+        oci::{Digest, Namespace},
+        policy::{RetentionPolicy, RetentionPolicyConfig, SystemClock},
+        registry::{
+            Registry, RegistryConfig, Repository,
+            blob_store::BlobStore,
+            job_store::JobStore,
+            manifest::DEFAULT_MAX_MANIFEST_SIZE_BYTES,
+            metadata_store::MetadataStore,
+            repository_resolver::RepositoryResolver,
+            test_utils::{build_store, build_test_fs_executor},
+        },
+        registry_client::RegistryClient,
+        replication::{
+            REPLICATION_DELETE_MANIFEST_KIND, REPLICATION_PUSH_MANIFEST_KIND, REPLICATION_QUEUE,
+            ReplicationDownstream, ReplicationMode, ReplicationPushPayload,
+        },
+    };
+
+    const REPO: &str = "nginx";
+    const NAMESPACE: &str = "nginx";
+    const DOWNSTREAM: &str = "eu-region";
+    const SAMPLE_DIGEST: &str =
+        "sha256:1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef";
+
+    fn downstream_client() -> Arc<RegistryClient> {
+        let backend = cache::Config::Memory.to_backend().unwrap();
+        Arc::new(
+            RegistryClient::builder()
+                .url("https://unused.test".to_string())
+                .client(reqwest::Client::new())
+                .cache(backend)
+                .max_manifest_size_bytes(DEFAULT_MAX_MANIFEST_SIZE_BYTES)
+                .build()
+                .unwrap(),
+        )
+    }
+
+    fn downstream_with(
+        name: &str,
+        mode: ReplicationMode,
+        namespace_filter: Vec<Regex>,
+    ) -> ReplicationDownstream {
+        ReplicationDownstream::builder()
+            .name(name.to_string())
+            .registry_client(downstream_client())
+            .mode(mode)
+            .namespace_filter(namespace_filter)
+            .max_concurrent_pushes(4)
+            .build()
+            .unwrap()
+    }
+
+    fn repository_with_replication(replication: Vec<ReplicationDownstream>) -> Repository {
+        Repository {
+            name: REPO.to_string(),
+            upstreams: Vec::new(),
+            replication,
+            retention_policy: RetentionPolicy::new(
+                &RetentionPolicyConfig::default(),
+                Arc::new(SystemClock),
+            ),
+            immutable_tags: false,
+            immutable_tags_exclusions: Vec::new(),
+        }
+    }
+
+    /// Repository with exactly one downstream of the given mode and namespace filter.
+    fn repository_with(mode: ReplicationMode, namespace_filter: Vec<Regex>) -> Repository {
+        repository_with_replication(vec![downstream_with(DOWNSTREAM, mode, namespace_filter)])
+    }
+
+    fn repository_with_downstream() -> Repository {
+        repository_with(ReplicationMode::EventReconcile, Vec::new())
+    }
+
+    /// Build a `Registry` whose job store is a caller-held `JobStore` so the
+    /// test can count pending jobs.
+    fn build_registry_with(root: &str, repository: Repository) -> (Registry, Arc<JobStore>) {
+        let object: Arc<dyn ObjectStore> =
+            Arc::new(StorageFsBackend::builder().root_dir(root).build().unwrap());
+        let executor = build_test_fs_executor(root, false);
+        let store = build_store(object, executor);
+        let metadata_store = Arc::new(
+            MetadataStore::builder()
+                .store(store.clone())
+                .link_cache_ttl(0)
+                .access_time_debounce_secs(0)
+                .build()
+                .unwrap(),
+        );
+        let blob_store = Arc::new(BlobStore::builder().store(store.clone()).build().unwrap());
+
+        let mut repositories = HashMap::new();
+        repositories.insert(REPO.to_string(), repository);
+        let resolver = Arc::new(RepositoryResolver::new(Arc::new(repositories)).unwrap());
+
+        // No drain spawned: the bare JobStore only persists envelopes; these tests assert enqueue only.
+        let job_store: Arc<JobStore> = Arc::new(JobStore::new(store, "test"));
+
+        let config = RegistryConfig::default().job_queue(job_store.clone());
+        let registry = Registry::new(blob_store, metadata_store, resolver, config).unwrap();
+
+        (registry, job_store)
+    }
+
+    /// Decode the payload of the sole pending replication job, panicking unless
+    /// exactly one is pending.
+    async fn sole_pending_payload(job_store: &JobStore) -> ReplicationPushPayload {
+        let keys = job_store.list_pending(REPLICATION_QUEUE, 16).await.unwrap();
+        assert_eq!(
+            keys.len(),
+            1,
+            "expected exactly one pending replication job"
+        );
+        let envelope = job_store
+            .read_pending(REPLICATION_QUEUE, &keys[0])
+            .await
+            .unwrap();
+        assert_eq!(envelope.queue, REPLICATION_QUEUE);
+        serde_json::from_value(envelope.payload).expect("decode ReplicationPushPayload")
+    }
+
+    /// [`build_registry_with`] with one `event+reconcile` downstream.
+    fn build_registry(root: &str) -> (Registry, Arc<JobStore>) {
+        build_registry_with(root, repository_with_downstream())
+    }
+
+    #[tokio::test]
+    async fn dispatch_replication_enqueues_for_matching_downstream() {
+        crate::metrics_provider::init_for_tests();
+        let dir = TempDir::new().unwrap();
+        let (registry, job_store) = build_registry(dir.path().to_str().unwrap());
+
+        let namespace = Namespace::new(NAMESPACE).unwrap();
+        let digest: Digest = SAMPLE_DIGEST.parse().unwrap();
+
+        let repository = registry.resolver.resolve(&namespace);
+        registry
+            .dispatch_replication(
+                repository,
+                &namespace,
+                REPLICATION_PUSH_MANIFEST_KIND,
+                Some("v1"),
+                Some(&digest),
+                None,
+            )
+            .await;
+
+        assert_eq!(
+            job_store.count_pending(REPLICATION_QUEUE, 0).await.unwrap(),
+            1,
+            "a fresh local change must enqueue one push job"
+        );
+    }
+
+    /// The payload carries the correct downstream/namespace/tag/digest/kind and
+    /// a populated `source_ts`.
+    #[tokio::test]
+    async fn dispatch_replication_payload_is_well_formed() {
+        crate::metrics_provider::init_for_tests();
+        let dir = TempDir::new().unwrap();
+        let (registry, job_store) = build_registry(dir.path().to_str().unwrap());
+
+        let namespace = Namespace::new(NAMESPACE).unwrap();
+        let digest: Digest = SAMPLE_DIGEST.parse().unwrap();
+
+        let repository = registry.resolver.resolve(&namespace);
+        registry
+            .dispatch_replication(
+                repository,
+                &namespace,
+                REPLICATION_PUSH_MANIFEST_KIND,
+                Some("v1"),
+                Some(&digest),
+                None,
+            )
+            .await;
+
+        let payload = sole_pending_payload(&job_store).await;
+        assert_eq!(payload.downstream, DOWNSTREAM);
+        assert_eq!(payload.namespace, NAMESPACE);
+        assert_eq!(payload.tag.as_deref(), Some("v1"));
+        assert_eq!(payload.digest.as_deref(), Some(SAMPLE_DIGEST));
+        assert_eq!(payload.kind, REPLICATION_PUSH_MANIFEST_KIND);
+        let source_ts = payload.source_ts.expect("source_ts must be present");
+        assert!(
+            DateTime::parse_from_rfc3339(&source_ts).is_ok(),
+            "source_ts must be a valid RFC 3339 timestamp; got {source_ts}"
+        );
+    }
+
+    /// The fan-out enqueues concurrently (one index GET plus CAS transaction
+    /// per downstream); every matching downstream must still get exactly one
+    /// job carrying its own name.
+    #[tokio::test]
+    async fn dispatch_replication_enqueues_one_job_per_downstream() {
+        crate::metrics_provider::init_for_tests();
+        let dir = TempDir::new().unwrap();
+        let (registry, job_store) = build_registry_with(
+            dir.path().to_str().unwrap(),
+            repository_with_replication(vec![
+                downstream_with(DOWNSTREAM, ReplicationMode::EventReconcile, Vec::new()),
+                downstream_with("us-region", ReplicationMode::EventReconcile, Vec::new()),
+            ]),
+        );
+
+        let namespace = Namespace::new(NAMESPACE).unwrap();
+        let digest: Digest = SAMPLE_DIGEST.parse().unwrap();
+
+        let repository = registry.resolver.resolve(&namespace);
+        registry
+            .dispatch_replication(
+                repository,
+                &namespace,
+                REPLICATION_PUSH_MANIFEST_KIND,
+                Some("v1"),
+                Some(&digest),
+                None,
+            )
+            .await;
+
+        let keys = job_store.list_pending(REPLICATION_QUEUE, 16).await.unwrap();
+        assert_eq!(keys.len(), 2, "each matching downstream must get one job");
+        let mut downstreams = Vec::new();
+        for key in &keys {
+            let envelope = job_store
+                .read_pending(REPLICATION_QUEUE, key)
+                .await
+                .unwrap();
+            let payload: ReplicationPushPayload =
+                serde_json::from_value(envelope.payload).expect("decode ReplicationPushPayload");
+            downstreams.push(payload.downstream);
+        }
+        downstreams.sort();
+        assert_eq!(
+            downstreams,
+            vec![DOWNSTREAM.to_string(), "us-region".to_string()],
+            "one job per downstream, each addressed to its own downstream"
+        );
+    }
+
+    /// A caller-provided timestamp (an inbound replicated delete's author
+    /// time) propagates verbatim; a re-stamped `now()` would let the bounced
+    /// delete outrank a recreate authored in between.
+    #[tokio::test]
+    async fn dispatch_replication_uses_provided_source_ts_verbatim() {
+        crate::metrics_provider::init_for_tests();
+        let dir = TempDir::new().unwrap();
+        let (registry, job_store) = build_registry(dir.path().to_str().unwrap());
+
+        let namespace = Namespace::new(NAMESPACE).unwrap();
+        let author_ts = Utc::now() - Duration::hours(3);
+
+        let repository = registry.resolver.resolve(&namespace);
+        registry
+            .dispatch_replication(
+                repository,
+                &namespace,
+                REPLICATION_DELETE_MANIFEST_KIND,
+                Some("v1"),
+                None,
+                Some(author_ts),
+            )
+            .await;
+
+        let payload = sole_pending_payload(&job_store).await;
+        assert_eq!(payload.kind, REPLICATION_DELETE_MANIFEST_KIND);
+        assert_eq!(
+            payload.source_ts.as_deref(),
+            Some(author_ts.to_rfc3339().as_str()),
+            "a provided source_ts must propagate verbatim, not be re-stamped"
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_replication_skips_reconcile_only_downstream() {
+        crate::metrics_provider::init_for_tests();
+        let dir = TempDir::new().unwrap();
+        let (registry, job_store) = build_registry_with(
+            dir.path().to_str().unwrap(),
+            repository_with(ReplicationMode::ReconcileOnly, Vec::new()),
+        );
+
+        let namespace = Namespace::new(NAMESPACE).unwrap();
+        let digest: Digest = SAMPLE_DIGEST.parse().unwrap();
+
+        let repository = registry.resolver.resolve(&namespace);
+        registry
+            .dispatch_replication(
+                repository,
+                &namespace,
+                REPLICATION_PUSH_MANIFEST_KIND,
+                Some("v1"),
+                Some(&digest),
+                None,
+            )
+            .await;
+
+        assert_eq!(
+            job_store.count_pending(REPLICATION_QUEUE, 0).await.unwrap(),
+            0,
+            "a reconcile-only downstream must not enqueue on the event path"
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_replication_skips_non_matching_namespace_filter() {
+        crate::metrics_provider::init_for_tests();
+        let dir = TempDir::new().unwrap();
+        let (registry, job_store) = build_registry_with(
+            dir.path().to_str().unwrap(),
+            repository_with(
+                ReplicationMode::EventReconcile,
+                vec![Regex::new("^other/.*").unwrap()],
+            ),
+        );
+
+        let namespace = Namespace::new(NAMESPACE).unwrap();
+        let digest: Digest = SAMPLE_DIGEST.parse().unwrap();
+
+        let repository = registry.resolver.resolve(&namespace);
+        registry
+            .dispatch_replication(
+                repository,
+                &namespace,
+                REPLICATION_PUSH_MANIFEST_KIND,
+                Some("v1"),
+                Some(&digest),
+                None,
+            )
+            .await;
+
+        assert_eq!(
+            job_store.count_pending(REPLICATION_QUEUE, 0).await.unwrap(),
+            0,
+            "a downstream whose filter excludes the namespace must not enqueue"
+        );
+    }
+}
