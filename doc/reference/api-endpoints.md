@@ -164,10 +164,13 @@ client write rather than failing. A local tag with no recorded creation time is 
 and never blocks the incoming write.
 
 A future-dated timestamp is **clamped to the receiver's current time**, so a client cannot pin a
-permanent last-writer-wins victory. A *backdated* timestamp, however, is accepted and persisted as
-the tag's creation time; it weakens that write in later LWW races and feeds age-based retention
-with the supplied date. The header is therefore a statement of trust: restrict which identities may
-push to replicated repositories via the CEL `access_policy` (see
+permanent last-writer-wins victory. A *backdated* timestamp is accepted and persisted verbatim as
+the tag's creation time, where it weakens that write in later LWW races and feeds age-based
+retention and the `top_pushed` ranking with the supplied date. The header is honored from **any
+identity allowed to push** and cannot be gated separately from `put-manifest`, so a push-capable
+identity can backdate a tag far enough to make it eligible for pruning on the next `scrub
+--retention` run, an indirect delete even without a `delete-manifest` grant. Treat push on a
+replicated repository as trust over `created_at`, and restrict it via the CEL `access_policy` (see
 [Restrict replication writes](../how-to/set-up-access-control.md#restrict-replication-writes)).
 
 A `409 REPLICATION_SUPERSEDED` is convergence, not failure: the sender treats it as success and
