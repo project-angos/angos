@@ -187,7 +187,7 @@ mod tests {
 
     /// If the session's heartbeat fires its cancellation mid-execution,
     /// `execute_one` drops the handler future before it completes its
-    /// own work — the in-flight operation is cancelled. The test
+    /// own work: the in-flight operation is cancelled. The test
     /// substitutes a hand-built `LockSession` whose cancellation token
     /// we fire ourselves, so it pins the runner's `select!` behaviour
     /// without depending on backend timing.

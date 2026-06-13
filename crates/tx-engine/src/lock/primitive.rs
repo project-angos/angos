@@ -45,11 +45,11 @@ use crate::lock::{
     storage::{DeleteIfMatchOutcome, LockBody, LockStorage, PutIfAbsentOutcome, PutIfMatchOutcome},
 };
 
-// ─── constants ───────────────────────────────────────────────────────────────
+// constants
 
 const MAX_LOCK_TTL_SECS: u64 = 3600;
 
-// ─── Lock ────────────────────────────────────────────────────────────────────
+// Lock
 
 /// Concrete distributed lock backed by a [`LockStorage`].
 ///
@@ -73,7 +73,7 @@ impl Debug for Lock {
     }
 }
 
-// ─── Builder ─────────────────────────────────────────────────────────────────
+// Builder
 
 /// Builder for [`Lock`].
 #[derive(Default)]
@@ -168,10 +168,9 @@ impl LockBuilder {
     }
 }
 
-// ─── Lock implementation ──────────────────────────────────────────────────────
+// Lock implementation
 
 impl Lock {
-    /// Return a builder for constructing a `Lock`.
     #[must_use]
     pub fn builder() -> LockBuilder {
         LockBuilder::default()
@@ -348,7 +347,7 @@ impl Lock {
         }
     }
 
-    // ─── internal helpers ─────────────────────────────────────────────────
+    // internal helpers
 
     async fn try_acquire_all_sequential(&self, sorted_keys: &[String]) -> AcquireAllOutcome {
         let mut acquired_paths: Vec<String> = Vec::new();
@@ -479,7 +478,7 @@ impl Lock {
     }
 }
 
-// ─── Heartbeat ───────────────────────────────────────────────────────────────
+// Heartbeat
 
 enum HeartbeatOutcome {
     Continue,
@@ -626,7 +625,7 @@ async fn heartbeat_tick_path(
         }
     }
 
-    // No cached ETag — re-read to recover the ETag and refresh via put_if_match.
+    // No cached ETag: re-read to recover the ETag and refresh via put_if_match.
     // Ownership loss is detected authoritatively by the put_if_match below: a
     // Mismatch means another holder replaced the object.
     let (_data, etag, _) = match storage.get_with_etag(path).await {
@@ -673,7 +672,7 @@ async fn heartbeat_tick_path(
     }
 }
 
-// ─── Release ─────────────────────────────────────────────────────────────────
+// Release
 
 async fn release_session(
     cancellation: CancellationToken,
@@ -748,7 +747,7 @@ async fn release_single_path(storage: &dyn LockStorage, path: &str, cached_etag:
     }
 }
 
-// ─── AcquireAllOutcome ───────────────────────────────────────────────────────
+// AcquireAllOutcome
 
 enum AcquireAllOutcome {
     Acquired(HashMap<String, Option<String>>),
@@ -756,7 +755,7 @@ enum AcquireAllOutcome {
     Retry { acquired: Vec<String> },
 }
 
-// ─── tests ─────────────────────────────────────────────────────────────────────
+// tests
 
 #[cfg(test)]
 mod tests {
@@ -974,7 +973,7 @@ mod tests {
         Arc::new(RwLock::new(map))
     }
 
-    // ─── heartbeat_tick_path ───────────────────────────────────────────────
+    // heartbeat_tick_path
 
     #[tokio::test]
     async fn tick_path_fast_path_mismatch_invalidates_ownership_lost() {
@@ -1061,7 +1060,7 @@ mod tests {
         }
     }
 
-    // ─── run_heartbeat_tick (failure budget) ───────────────────────────────
+    // run_heartbeat_tick (failure budget)
 
     #[tokio::test]
     async fn run_tick_single_failure_does_not_cancel() {
@@ -1197,7 +1196,7 @@ mod tests {
         );
     }
 
-    // ─── try_recover_stale ─────────────────────────────────────────────────
+    // try_recover_stale
 
     #[tokio::test]
     async fn recover_stale_claims_expired_lock_when_race_won() {
@@ -1265,7 +1264,7 @@ mod tests {
         );
     }
 
-    // ─── acquire / try_acquire ─────────────────────────────────────────────
+    // acquire / try_acquire
 
     #[tokio::test]
     async fn try_acquire_created_returns_session() {
@@ -1339,7 +1338,7 @@ mod tests {
         );
     }
 
-    // ─── release ───────────────────────────────────────────────────────────
+    // release
 
     #[tokio::test]
     async fn release_uses_delete_if_match_with_cached_etag() {
@@ -1390,7 +1389,7 @@ mod tests {
         );
     }
 
-    // ─── run_heartbeat_tick (concurrent refresh) ───────────────────────────
+    // run_heartbeat_tick (concurrent refresh)
 
     /// [`LockStorage`] double that records the maximum number of `put_if_match`
     /// calls that were ever simultaneously in-flight.

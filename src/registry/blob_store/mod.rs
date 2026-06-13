@@ -7,7 +7,7 @@
 //! upload-promotion transaction. FS and S3
 //! are wired through the same code path; the [`BlobStoreConfig`] enum only
 //! picks the underlying storage handles the façade is built from. All public
-//! methods live as inherent methods on `BlobStore` — no caller-facing trait
+//! methods live as inherent methods on `BlobStore`: no caller-facing trait
 //! split.
 
 mod config;
@@ -56,7 +56,7 @@ pub struct BlobStore {
     /// Storage façade: object reads/writes, the upload lifecycle (including
     /// finalization), and presigning all flow through here. The façade owns the
     /// executor used by the upload-promotion transaction. (On FS, the backend
-    /// prunes its own empty ancestor directories on delete — callers don't.)
+    /// prunes its own empty ancestor directories on delete, callers don't.)
     pub store: Arc<Store>,
 }
 
@@ -94,7 +94,7 @@ impl BlobStoreBuilder {
     }
 }
 
-// ─── blob CRUD (formerly `impl BlobStore`) ────────────────────────────────
+// blob CRUD (formerly `impl BlobStore`)
 
 impl BlobStore {
     #[instrument(skip(self))]
@@ -191,7 +191,7 @@ impl BlobStore {
     }
 }
 
-// ─── presigning (formerly `impl PresignedBlobStore`) ──────────────────────
+// presigning (formerly `impl PresignedBlobStore`)
 
 impl BlobStore {
     /// Generate a presigned download URL for `digest` when the underlying

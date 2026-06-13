@@ -64,9 +64,7 @@ pub fn blob_data_lock_key(digest: &Digest) -> String {
     format!("blob-data:{digest}")
 }
 
-// ───────────────────────────────────────────────────────────────────────────
 // MetadataStore (concrete implementation)
-// ───────────────────────────────────────────────────────────────────────────
 
 #[derive(Clone)]
 pub struct MetadataStore {
@@ -172,15 +170,14 @@ impl MetadataStore {
         self.store.clone()
     }
 
-    /// Returns the transaction executor.
     pub fn executor(&self) -> &dyn TransactionExecutor {
         self.store.executor().as_ref()
     }
 
     /// Acquire the coarse [`blob_data_lock_key`] lock for `digest`.
     ///
-    /// The lock lives on the METADATA executor — the single lock domain for
-    /// blob-data — even though the bytes guarded by it may actually be mutated
+    /// The lock lives on the METADATA executor (the single lock domain for
+    /// blob-data), even though the bytes guarded by it may actually be mutated
     /// on the separate BLOB engine (the metadata and blob subsystems each
     /// instantiate their own engine with its own lock domain). Anchoring the
     /// lock here is deliberate: it is the one executor that every blob-data
@@ -197,7 +194,7 @@ impl MetadataStore {
             .map_err(|e| Error::Coordination(format!("blob-data lock acquire failed: {e}")))
     }
 
-    // ── Cache helpers ─────────────────────────────────────────────────────
+    // Cache helpers
 
     fn cache_key(namespace: &str, link: &LinkKind) -> String {
         format!("link:{namespace}:{link}")
@@ -233,7 +230,7 @@ impl MetadataStore {
         }
     }
 
-    // ── Public API ────────────────────────────────────────────────────────
+    // Public API
 
     #[instrument(skip(self))]
     pub async fn list_namespaces(

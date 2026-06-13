@@ -19,7 +19,7 @@ use angos_tx_engine::{
 
 use crate::registry::{blob_store, s3_connection::S3ConnectionConfig};
 
-// ── Error ─────────────────────────────────────────────────────────────────────
+// Error
 
 /// Errors produced while building the shared storage layer (object store,
 /// transaction executor, lock primitive, capabilities probe) from a
@@ -49,7 +49,7 @@ impl From<angos_s3_client::Error> for Error {
     }
 }
 
-// ── FS backend config ─────────────────────────────────────────────────────────
+// FS backend config
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct FsBackendConfig {
@@ -95,7 +95,7 @@ impl<'de> Deserialize<'de> for FsBackendConfig {
     }
 }
 
-// ── S3 backend config ─────────────────────────────────────────────────────────
+// S3 backend config
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct S3BackendConfig {
@@ -180,7 +180,7 @@ fn default_access_time_debounce() -> u64 {
     60
 }
 
-// ── RegistryStorageConfig ─────────────────────────────────────────────────────
+// RegistryStorageConfig
 
 /// Unified storage configuration for both the metadata store and the job store.
 ///
@@ -229,7 +229,7 @@ impl RegistryStorageConfig {
     /// Probe the underlying S3 store for conditional-write capabilities.
     ///
     /// Returns `None` for FS configs (no capabilities to probe). Returns
-    /// [`Error::Coordination`] when called on the `Inherit` variant — callers
+    /// [`Error::Coordination`] when called on the `Inherit` variant: callers
     /// must resolve first via
     /// [`crate::configuration::Configuration::resolve_registry_storage`].
     pub async fn probe(&self) -> Result<Option<ConditionalCapabilities>, Error> {

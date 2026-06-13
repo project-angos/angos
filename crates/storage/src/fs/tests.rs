@@ -147,7 +147,7 @@ async fn prune_empty_ancestors_refuses_to_escape_root_via_dotdot() {
 }
 
 /// Companion to the escape guard: a normal nested key (no `.`/`..`) must still
-/// have its now-empty in-root ancestors pruned exactly as before — the fix
+/// have its now-empty in-root ancestors pruned exactly as before. The fix
 /// changes nothing for well-formed keys.
 #[tokio::test]
 async fn prune_empty_ancestors_still_collapses_normal_in_root_chain() {
@@ -303,7 +303,7 @@ async fn copy_duplicates_object() {
 
 /// `move_object` relocates the object (creating the destination's parent) and
 /// removes the source. On the filesystem backend this is a same-FS `rename`, so
-/// the body is never read into memory — the correctness contract is the same as
+/// the body is never read into memory; the correctness contract is the same as
 /// the trait default's copy + delete.
 #[tokio::test]
 async fn move_object_relocates_and_removes_source() {

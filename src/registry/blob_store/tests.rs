@@ -205,7 +205,7 @@ pub async fn test_datastore_upload_operations(store: &BlobStore) {
     assert!(upload_result.is_err());
 }
 
-// ─── Test entry points: run each helper against every backend fixture ────
+// Test entry points: run each helper against every backend fixture
 
 use crate::registry::test_utils::backends;
 

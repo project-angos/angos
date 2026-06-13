@@ -30,9 +30,7 @@ use angos_tx_engine::{
 
 mod common;
 
-// ──────────────────────────────────────────────────────────────────────────────
 // Helpers
-// ──────────────────────────────────────────────────────────────────────────────
 
 fn build_executor(store: Arc<dyn ObjectStore>) -> LockedExecutor {
     LockedExecutor::builder()
@@ -70,9 +68,7 @@ async fn keys_are_held(executor: &LockedExecutor, keys: &[String]) -> bool {
     }
 }
 
-// ──────────────────────────────────────────────────────────────────────────────
 // Tests
-// ──────────────────────────────────────────────────────────────────────────────
 
 /// Hold a session across `execute_with_retry`, then release it explicitly.
 /// During the call the lock is held; after the call the executor has not
@@ -170,7 +166,7 @@ async fn caller_session_survives_conflict_exhaust() {
 }
 
 /// `execute_with_retry` returns only after Reap. Once it returns, the intent
-/// log and staged bodies are gone — so any explicit release the caller does
+/// log and staged bodies are gone, so any explicit release the caller does
 /// afterwards is guaranteed to happen after the durable reap.
 #[tokio::test]
 async fn intent_log_reaped_before_execute_with_retry_returns() {

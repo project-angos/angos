@@ -129,7 +129,7 @@ impl Borrow<str> for Namespace {
     }
 }
 
-/// Returns `true` when `namespace` belongs to the configured `repository_name` —
+/// Returns `true` when `namespace` belongs to the configured `repository_name`,
 /// either as an exact match or as a direct sub-namespace of the form
 /// `{repository_name}/...`.
 ///

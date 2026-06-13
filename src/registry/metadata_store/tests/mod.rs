@@ -162,7 +162,7 @@ pub async fn put_legacy_index(backend: &MetadataStore, digest: &Digest, index: &
         .unwrap();
 }
 
-// ── Integration tests ─────────────────────────────────────────────────────────
+// Integration tests
 
 async fn create_link(m: &Arc<MetadataStore>, namespace: &str, link: &LinkKind, digest: &Digest) {
     m.update_links(

@@ -33,7 +33,7 @@ use crate::{
     },
 };
 
-// ── Storage primitives ────────────────────────────────────────────────────────
+// Storage primitives
 
 impl MetadataStore {
     /// Read the stored [`LinkMetadata`] for `link` within `namespace`.
@@ -70,7 +70,7 @@ impl MetadataStore {
     }
 }
 
-// ── Error mapping ─────────────────────────────────────────────────────────────
+// Error mapping
 
 /// Map a tx-engine error to a metadata-store error.
 pub fn tx_error_to_meta(err: TxError) -> Error {
@@ -85,7 +85,7 @@ pub fn tx_error_to_meta(err: TxError) -> Error {
     }
 }
 
-// ── Shard read-modify-write ───────────────────────────────────────────────────
+// Shard read-modify-write
 
 /// Read the current shard state for `digest`/`namespace`, apply `ops`, and
 /// append the resulting read + mutation to `builder`.
@@ -131,7 +131,7 @@ pub async fn append_shard_for_digest(
                     }));
                 }
                 Err(StorageError::NotFound) => {
-                    // Vanished between HEAD and GET — fall through to sharded path.
+                    // Vanished between HEAD and GET: fall through to sharded path.
                 }
                 Err(e) => return Err(e.into()),
             }
@@ -178,7 +178,7 @@ pub async fn append_shard_for_digest(
     }
 }
 
-// ── Consolidated transaction planner ──────────────────────────────────────────
+// Consolidated transaction planner
 
 /// Optional add-on mutations layered on top of a link-update transaction.
 ///
@@ -190,7 +190,7 @@ pub struct LinksTxExtras<'a> {
     /// Unconditional `Put` of manifest blob-data (content-addressed, so any
     /// concurrent writer storing the same digest stores the same bytes).
     pub blob_data_put: Option<(&'a Digest, Bytes)>,
-    /// Conditional `Delete` of `blob-data/<digest>` — included only when the
+    /// Conditional `Delete` of `blob-data/<digest>`, included only when the
     /// per-namespace shard becomes empty, no other namespace references the
     /// blob, and the blob currently exists.
     pub blob_data_delete_if_unreferenced: Option<&'a Digest>,
@@ -307,7 +307,7 @@ impl MetadataStore {
     /// commit it, and perform post-apply cache / directory / namespace cleanup.
     ///
     /// All three transactional methods (`update_links`, `store_manifest`,
-    /// `delete_manifest`) share this body — they differ only in the `extras`
+    /// `delete_manifest`) share this body; they differ only in the `extras`
     /// they pass.
     #[allow(clippy::too_many_lines)]
     pub async fn execute_links_tx(
@@ -319,7 +319,7 @@ impl MetadataStore {
         let (_, result) = execute_with_retry_payload(
             self.executor(),
             || async {
-                // ── Step 1: pre-lock read of current link state ─────────────────
+                // Step 1: pre-lock read of current link state
                 let prelock_results = join_all(operations.iter().map(|op| async move {
                     match op {
                         LinkOperation::Create {
@@ -363,7 +363,7 @@ impl MetadataStore {
                     return Ok((Transaction::builder().build(), LinksTxCaptured::default()));
                 }
 
-                // ── Step 2: re-read current link state inside the retry closure
+                // Step 2: re-read current link state inside the retry closure
                 // for conflict detection (creates) and metadata merging.
                 let mut link_cache: HashMap<LinkKind, LinkMetadata> = HashMap::new();
                 for (create_data, delete_data) in &prelock_results {
@@ -391,7 +391,7 @@ impl MetadataStore {
                     }
                 }
 
-                // ── Step 3: conflict detection for creates ──────────────────────
+                // Step 3: conflict detection for creates
                 for (create_data, _) in &prelock_results {
                     if let Some((link, _, old_target, ..)) = create_data {
                         let current_target = link_cache.get(*link).map(|m| &m.target);
@@ -401,14 +401,14 @@ impl MetadataStore {
                     }
                 }
 
-                // ── Step 3.5: commit-validate tag-create reads ──────────────────
+                // Step 3.5: commit-validate tag-create reads
                 // A tag create joins its current bytes to the transaction read
                 // set so the link Put commits only against that state: a racing
                 // same-tag write aborts this attempt at prepare and the retry
                 // re-reads. This is needed when there is a last-writer-wins
                 // comparison (a replicated write, `extras.created_at` set) and
                 // for a no-op re-push (`old_target == target`), whose dispatch is
-                // suppressed on `changed == false` — so its `old_target` must be
+                // suppressed on `changed == false`, so its `old_target` must be
                 // the prior the commit validated, not a stale pre-lock read a
                 // racing different-digest write could outrun. A binding-changing
                 // genuine write always reports `changed`, so it skips this.
@@ -505,7 +505,7 @@ impl MetadataStore {
                     }
                 }
 
-                // ── Step 4: build mutations ─────────────────────────────────────
+                // Step 4: build mutations
                 let mut builder = Transaction::builder();
                 for (key, body) in lww_reads {
                     builder = builder.read(key, body);
@@ -525,7 +525,7 @@ impl MetadataStore {
                 }
 
                 // Blob-data Put first when present (manifest bytes are
-                // content-addressed, so the order doesn't matter — colocating
+                // content-addressed, so the order doesn't matter; colocating
                 // it with the rest of the manifest mutations keeps the txn
                 // self-contained).
                 if let Some((blob_digest, body)) = &extras.blob_data_put {
@@ -684,7 +684,7 @@ impl MetadataStore {
                     }
                 }
 
-                // Conditional `Delete blob-data/<digest>` — only when the
+                // Conditional `Delete blob-data/<digest>`, only when the
                 // namespace shard becomes empty AND no other namespace
                 // references the blob AND the blob currently exists.
                 let store = self.store_arc();
@@ -774,7 +774,7 @@ impl MetadataStore {
             return Err(Error::ReplicationSuperseded(message));
         }
 
-        // ── Post-apply cleanup (best-effort, outside the engine lock) ───────────
+        // Post-apply cleanup (best-effort, outside the engine lock)
         for link in &result.deleted_links {
             let container = path_builder::link_container_path(link, namespace);
             let _ = self.store().delete_prefix(&container).await;
@@ -808,7 +808,7 @@ impl MetadataStore {
     }
 }
 
-// ── Helpers used by the conditional blob-data delete path ─────────────────────
+// Helpers used by the conditional blob-data delete path
 
 /// Return the ops slice for `digest` from the map, or an empty slice.
 fn ops_for_digest<'a>(

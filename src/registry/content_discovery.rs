@@ -265,7 +265,7 @@ mod tests {
     // exactly once.
     #[tokio::test]
     async fn list_catalog_entries_continuation_token_round_trip() {
-        // Use only the FS backend — this tests pagination logic, not backend specifics.
+        // Use only the FS backend: this tests pagination logic, not backend specifics.
         let test_case = crate::registry::test_utils::FSRegistryTestCase::new();
         let registry = test_case.registry();
 

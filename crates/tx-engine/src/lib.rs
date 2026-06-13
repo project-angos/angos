@@ -12,7 +12,7 @@
 //!
 //! # Feature flags
 //!
-//! - `redis` — enables the Redis-backed lock storage.
+//! - `redis`: enables the Redis-backed lock storage.
 
 pub mod error;
 pub mod executor;
@@ -46,11 +46,11 @@ pub use angos_storage::{
 /// back through the configuration layer to [`build_executor`].
 #[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ConditionalCapabilities {
-    /// `PutObject` with `If-None-Match: *` — create-only, reject if object exists.
+    /// `PutObject` with `If-None-Match: *`: create-only, reject if object exists.
     pub put_if_none_match: bool,
-    /// `PutObject` with `If-Match: <etag>` — update-only, reject if `ETag` mismatch.
+    /// `PutObject` with `If-Match: <etag>`: update-only, reject if `ETag` mismatch.
     pub put_if_match: bool,
-    /// `DeleteObject` with `If-Match: <etag>` — conditional delete.
+    /// `DeleteObject` with `If-Match: <etag>`: conditional delete.
     pub delete_if_match: bool,
 }
 

@@ -35,8 +35,8 @@ use crate::{
 ///      left for the next sweep.
 ///    - If any entry in `progress` is `Applied`, the transaction is partially
 ///      (or fully) committed: re-apply every still-`Pending` mutation
-///      idempotently — using conditional storage primitives when a
-///      [`ConditionalStore`] is wired — and reap.
+///      idempotently (using conditional storage primitives when a
+///      [`ConditionalStore`] is wired) and reap.
 ///    - If every entry in `progress` is `Pending`, the transaction is rolled
 ///      back: delete bodies and intent.
 ///
@@ -190,7 +190,7 @@ impl RecoveryLoop {
         let body = match self.store.get(key).await {
             Ok(b) => b,
             Err(StorageError::NotFound) => {
-                // Reaped between list and get — normal race, skip.
+                // Reaped between list and get: normal race, skip.
                 return;
             }
             Err(e) => {

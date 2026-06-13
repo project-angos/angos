@@ -28,7 +28,7 @@ async fn test_shutdown_completes_in_flight_async_delivery() {
     let dispatcher = build_dispatcher(webhooks);
     dispatcher.dispatch(&event).await.unwrap();
 
-    // Immediately call shutdown — it must block until the in-flight delivery finishes
+    // Immediately call shutdown: it must block until the in-flight delivery finishes
     dispatcher
         .shutdown_with_timeout(TEST_SHUTDOWN_TIMEOUT)
         .await;
@@ -65,7 +65,7 @@ async fn test_shutdown_rejects_new_async_dispatches() {
         .shutdown_with_timeout(TEST_SHUTDOWN_TIMEOUT)
         .await;
 
-    // Dispatch after shutdown — delivery must be skipped. Either an error or
+    // Dispatch after shutdown: delivery must be skipped. Either an error or
     // Ok with no delivery is acceptable; the absence of HTTP requests is the
     // real assertion (verified below via server.received_requests()).
     drop(dispatcher.dispatch(&event).await);
@@ -155,7 +155,7 @@ async fn test_shutdown_with_timeout_returns_after_timeout_when_tasks_are_too_slo
     let server = MockServer::start().await;
     let event = create_test_event();
 
-    // Endpoint takes 2 seconds — longer than our shutdown timeout of 300ms
+    // Endpoint takes 2 seconds, longer than our shutdown timeout of 300ms
     Mock::given(method("POST"))
         .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(2)))
         .mount(&server)
@@ -188,7 +188,7 @@ async fn test_shutdown_with_timeout_drains_fast_tasks_within_timeout() {
     let server = MockServer::start().await;
     let event = create_test_event();
 
-    // Endpoint responds quickly (50ms) — well within the 500ms timeout
+    // Endpoint responds quickly (50ms), well within the 500ms timeout
     Mock::given(method("POST"))
         .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_millis(50)))
         .expect(1)

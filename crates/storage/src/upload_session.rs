@@ -2,7 +2,7 @@
 //! [`ObjectStore`](crate::ObjectStore). The trait methods live on `ObjectStore`;
 //! this module owns only the values they exchange.
 //!
-//! Uploads are addressed solely by their object key — there is no caller-held
+//! Uploads are addressed solely by their object key; there is no caller-held
 //! session value. The S3 backend recovers all multipart state from S3 itself
 //! on each call, so nothing is persisted by the caller between calls.
 //!
@@ -21,8 +21,8 @@ use tokio::sync::mpsc;
 /// Boxed byte stream consumed by [`ObjectStore::write_upload`](crate::ObjectStore::write_upload).
 ///
 /// `'static` and `Send`, so it can be shipped across `tokio::spawn` boundaries
-/// and stored in handles. The stream yields chunks as `Result<Bytes, io::Error>`
-/// — the `io::Error` slot lets readers (file-backed sources, hashing readers)
+/// and stored in handles. The stream yields chunks as `Result<Bytes, io::Error>`:
+/// the `io::Error` slot lets readers (file-backed sources, hashing readers)
 /// surface I/O failures inline rather than aborting the upload out-of-band.
 pub type ByteStream = Pin<Box<dyn Stream<Item = Result<Bytes, io::Error>> + Send + 'static>>;
 

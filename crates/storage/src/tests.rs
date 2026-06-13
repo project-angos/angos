@@ -280,7 +280,7 @@ async fn upload_round_trip_creates_object_at_key() {
 
 #[tokio::test]
 async fn upload_resumes_across_independent_calls() {
-    // Uploads are keyed — there is no caller-held handle, so a second batch of
+    // Uploads are keyed: there is no caller-held handle, so a second batch of
     // writes addressed at the same key picks up where the first left off.
     let store: Arc<dyn ObjectStore> = backend();
     store.create_upload("blob").await.unwrap();

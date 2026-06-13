@@ -258,7 +258,7 @@ async fn run_event_loop(state: &mut WatchState<'_>) -> bool {
 
 /// Handles a `ChangeKind::Config` event: loads the new configuration, notifies
 /// the subscriber, and returns `true` when the set of watched TLS directories
-/// has changed — signalling that the outer loop must rebuild the watcher.
+/// has changed, signalling that the outer loop must rebuild the watcher.
 async fn reload_config(
     config_path: &Path,
     config_dir: &Path,

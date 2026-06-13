@@ -27,16 +27,14 @@ use angos_tx_engine::{
 
 mod common;
 
-// ──────────────────────────────────────────────────────────────────────────────
 // CrashingStore: wraps MemoryObjectStore and fails on a specific write call number
-// ──────────────────────────────────────────────────────────────────────────────
 
 /// A store that delegates all reads to the inner store but injects a failure
 /// on the N-th write (`put`, `delete`, `delete_prefix`, `copy`).
 ///
-/// When `permanent` is set, every write at or after `crash_on` fails — useful
-/// for simulating a process death that prevents subsequent reap steps from
-/// running, leaving the intent log in place for inspection.
+/// When `permanent` is set, every write at or after `crash_on` fails. This is
+/// useful for simulating a process death that prevents subsequent reap steps
+/// from running, leaving the intent log in place for inspection.
 #[derive(Debug, Clone)]
 struct CrashingStore {
     inner: Arc<MemoryObjectStore>,
@@ -197,9 +195,7 @@ impl ConditionalStore for CrashingStore {
     }
 }
 
-// ──────────────────────────────────────────────────────────────────────────────
 // Helpers
-// ──────────────────────────────────────────────────────────────────────────────
 
 async fn assert_no_prefix_inner(store: &MemoryObjectStore, prefix: &str) {
     let items = store.list(prefix, 1000, None).await.unwrap().items;
@@ -242,9 +238,7 @@ async fn backdate_intents(inner: &MemoryObjectStore) {
     }
 }
 
-// ──────────────────────────────────────────────────────────────────────────────
 // Crash tests
-// ──────────────────────────────────────────────────────────────────────────────
 
 /// Crash before the intent is written (`crash_on` = 1 = the intent PUT).
 ///
@@ -312,7 +306,7 @@ async fn crash_after_intent_before_apply() {
     // The intent lands (write 1) but Apply crashes (write 2).
     let result = executor.execute(tx).await;
     // This may succeed or fail depending on whether the stamp write (also a PUT)
-    // is hit — in this test the apply PUT itself is write 2 so it will error.
+    // is hit. In this test the apply PUT itself is write 2 so it will error.
     let _ = result; // Outcome is indeterminate; recovery is what we test.
 
     // Force a stale intent by backdating created_at.
@@ -416,7 +410,7 @@ async fn recovery_replays_fully_stamped_intent() {
     assert_eq!(body, b"already-there");
 }
 
-/// Chaos test: manifest push — crash mid-Apply after the blob-data write but
+/// Chaos test: manifest push crashing mid-Apply after the blob-data write but
 /// before the link/index writes complete.
 ///
 /// Models the engine path for `store_manifest`: the transaction contains a
@@ -430,8 +424,8 @@ async fn recovery_replays_fully_stamped_intent() {
 /// intent + bodies).
 ///
 /// Invariants verified:
-/// 1. For crash points before the intent lands (writes 0–3): no canonical keys
-///    are present after recovery — the transaction was never committed.
+/// 1. For crash points before the intent lands (writes 0-3): no canonical keys
+///    are present after recovery, because the transaction was never committed.
 /// 2. For all crash points: the recovery loop leaves no .tx-log/ orphans.
 #[tokio::test(flavor = "multi_thread")]
 async fn manifest_push_crash_mid_apply_recovery_converges() {
@@ -524,7 +518,7 @@ async fn partial_apply_error_preserves_intent_for_recovery() {
     //   write 5: Apply mutation 1 (Put k1)  ← crash here (transient)
     // Crashing on write 5 fails the second apply put after mutation 0 has
     // applied and stamped. Being non-permanent, the later reap writes would
-    // succeed — which is exactly the scenario the buggy unconditional reap
+    // succeed, which is exactly the scenario the buggy unconditional reap
     // mishandled.
     let crashing = Arc::new(CrashingStore::new(inner.clone(), 5));
 
@@ -580,9 +574,7 @@ async fn partial_apply_error_preserves_intent_for_recovery() {
     assert_no_prefix_inner(&inner, ".tx-bodies/").await;
 }
 
-// ──────────────────────────────────────────────────────────────────────────────
 // Progress-vector invariants under both executors
-// ──────────────────────────────────────────────────────────────────────────────
 
 /// Read the (only) intent under `.tx-log/` directly, bypassing the recovery
 /// loop, and return its parsed form.
@@ -649,7 +641,7 @@ async fn progress_vector_reflects_apply_state_locked() {
     }
 
     // (b) Crash permanently from apply 1 onward (write 6): the executor
-    // applies + stamps mutation 0, then every subsequent write fails — so the
+    // applies + stamps mutation 0, then every subsequent write fails, so the
     // intent remains and the stamp for 0 is preserved while 1 and 2 are still
     // Pending.
     {

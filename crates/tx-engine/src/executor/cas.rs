@@ -4,11 +4,11 @@
 //!
 //! When a CAS precondition fails after at least one mutation has already been
 //! applied (partial-commit case), the executor uses `apply_cas` in
-//! `Reconcile` mode — the same stale-stamp recovery logic the `RecoveryLoop`
-//! uses — to distinguish
+//! `Reconcile` mode (the same stale-stamp recovery logic the `RecoveryLoop`
+//! uses) to distinguish
 //! between a healthy-path write that landed without its stamp (the live body
-//! matches the staged body → stamp and continue) versus true contention (live
-//! body differs → return `Error::PartialCommit` and preserve the intent for
+//! matches the staged body, so stamp and continue) versus true contention (live
+//! body differs, so return `Error::PartialCommit` and preserve the intent for
 //! the recovery loop).
 
 use std::{
@@ -193,7 +193,7 @@ impl CasExecutor {
                             .await
                         {
                             Ok(()) => {
-                                // Live body matches staged body — the
+                                // Live body matches staged body: the
                                 // healthy-path write landed without its stamp.
                                 // Stamp and continue forward.
                                 if let Err(stamp_err) =
@@ -247,7 +247,7 @@ struct PreparedReads {
 /// A `Put`/`Delete` on a key read as *present* with no explicit precondition is
 /// conditioned on the etag captured at Prepare; a `Put` on a key read as
 /// *absent* becomes a `PutIfAbsent`. Either way the precondition holds through
-/// Apply, so a racing write in the Prepare→Apply window aborts the transaction
+/// Apply, so a racing write in the Prepare-to-Apply window aborts the transaction
 /// before any sibling mutation commits and the caller's retry loop re-reads.
 /// The read-keyed mutations are stably moved to the front so that abort lands
 /// clean.
@@ -303,8 +303,8 @@ pub enum CasApplyMode {
     /// delete target propagates as a storage error.
     Abort,
     /// Recovery reconcile / replay-forward path. A `PreconditionFailed` on a
-    /// body write triggers a live-vs-staged hash compare (match => already
-    /// applied `Ok(())`; mismatch => `Err(Error::PartialCommit)`); a
+    /// body write triggers a live-vs-staged hash compare (match means already
+    /// applied `Ok(())`; mismatch means `Err(Error::PartialCommit)`); a
     /// `PreconditionFailed` on `put_if_absent`/`delete_if_match`, a vanished
     /// staged body, and a missing delete target are all treated as
     /// already-applied `Ok(())`.
@@ -330,8 +330,9 @@ pub enum CasApplyMode {
 ///
 /// In `Abort` mode, returns `Err(Error::Precondition)` when an etag
 /// precondition was not met. In `Reconcile` mode, returns
-/// `Err(Error::PartialCommit)` on true contention (live body ≠ staged body).
-/// Either mode returns `Err(Error::Storage(...))` on hard storage errors.
+/// `Err(Error::PartialCommit)` on true contention (live body differs from the
+/// staged body). Either mode returns `Err(Error::Storage(...))` on hard storage
+/// errors.
 pub async fn apply_cas(
     store: &dyn ConditionalStore,
     mutation: &MutationRecord,
@@ -460,7 +461,7 @@ pub async fn live_body_matches(
 
 #[async_trait]
 impl TransactionExecutor for CasExecutor {
-    /// Drive `tx` through Build → Prepare → Commit-intent → Apply → Reap using
+    /// Drive `tx` through Build, Prepare, Commit-intent, Apply, and Reap using
     /// conditional storage operations.
     ///
     /// The CAS executor relies on storage-level conditional operations and
@@ -479,7 +480,7 @@ impl TransactionExecutor for CasExecutor {
         // ordered ahead of unconditional mutations. A losing writer then fails
         // its CAS before any sibling mutation commits, so the transaction rolls
         // back cleanly (no mutation applied yet) and the caller's retry loop
-        // re-reads and converges — no lost update, no stuck partial intent.
+        // re-reads and converges, with no lost update and no stuck partial intent.
         apply_read_preconditions(&mut mutation_records, &prepared_reads);
 
         // CAS executor takes no transaction-scoped lock for its working set.

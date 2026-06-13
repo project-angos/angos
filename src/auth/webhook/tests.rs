@@ -1054,7 +1054,7 @@ async fn test_authorize_timeout_does_not_cache_and_retries() {
     assert_eq!(
         second,
         Ok(true),
-        "after a timeout the next call must reach the live server — no stale cache entry"
+        "after a timeout the next call must reach the live server: no stale cache entry"
     );
 }
 

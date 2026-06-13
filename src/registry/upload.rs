@@ -487,9 +487,9 @@ mod tests {
     enum FailOp {
         /// Fail the session-record delete that backs `delete_upload` cleanup.
         Delete,
-        /// Fail `complete_upload` — must never run on the existing-blob path.
+        /// Fail `complete_upload`: must never run on the existing-blob path.
         CompleteUpload,
-        /// Fail `write_upload` — must never run on the monolithic existing-blob
+        /// Fail `write_upload`: must never run on the monolithic existing-blob
         /// path.
         WriteUpload,
     }

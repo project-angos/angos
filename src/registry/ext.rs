@@ -201,7 +201,7 @@ struct DockerReferrerCandidate {
 }
 
 /// Returns the Docker-style referrer candidate carried by `descriptor`, if any.
-/// Pure — no I/O. Returns `None` when the descriptor has no
+/// Pure, no I/O. Returns `None` when the descriptor has no
 /// Docker reference digest annotation or when the annotation value
 /// cannot be parsed as a `Digest`.
 fn extract_docker_referrer(descriptor: &Descriptor) -> Option<DockerReferrerCandidate> {
@@ -219,7 +219,7 @@ fn extract_docker_referrer(descriptor: &Descriptor) -> Option<DockerReferrerCand
 }
 
 /// Returns the in-toto predicate type annotation value from the first
-/// layer that carries it, if any. Pure — no I/O.
+/// layer that carries it, if any. Pure, no I/O.
 fn extract_in_toto_predicate(child_manifest: &Manifest) -> Option<String> {
     child_manifest
         .layers
@@ -231,7 +231,7 @@ fn extract_in_toto_predicate(child_manifest: &Manifest) -> Option<String> {
 /// child descriptor into either a parent-link (regular index child) or a
 /// Docker-style referrer candidate.
 struct ManifestAnalysis {
-    /// Index children that are NOT referrers — `(child_digest, platform)` pairs
+    /// Index children that are NOT referrers: `(child_digest, platform)` pairs
     /// where the analyzed manifest is the parent.
     parent_links: Vec<(Digest, Option<ExtPlatform>)>,
     /// Docker-style referrer candidates carried by this manifest.
@@ -239,7 +239,7 @@ struct ManifestAnalysis {
 }
 
 /// Partitions all child descriptors in `manifest.manifests` into parent-links
-/// and Docker-style referrer candidates. Pure — no I/O.
+/// and Docker-style referrer candidates. Pure, no I/O.
 fn analyze_manifest(manifest: &Manifest) -> ManifestAnalysis {
     let mut parent_links = Vec::new();
     let mut referrer_candidates = Vec::new();
