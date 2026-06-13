@@ -284,24 +284,37 @@ fn build_in_process_queue(
     let store = Arc::clone(&blob_store.store);
     let job_store: Arc<JobStore> = Arc::new(JobStore::new(store, "in-process"));
 
-    // Build both handlers before spawning any claim loop: the replication
-    // builder is fallible, and erroring after spawn would leak uncancellable loops.
     let cache_handler: Arc<dyn JobHandler> = Arc::new(CacheJobHandler::new(
         resolver.clone(),
         blob_store.clone(),
         metadata_store.clone(),
     ));
 
-    // Mesh cycles terminate: only state-changing writes dispatch, and
-    // receiver-side no-op suppression stops any remaining replays.
-    let replication_handler: Arc<dyn JobHandler> = Arc::new(
-        ReplicationJobHandler::builder()
-            .resolver(resolver.clone())
-            .blob_store(blob_store.clone())
-            .metadata_store(metadata_store.clone())
-            .build()
-            .map_err(|e| Error::Internal(format!("failed to build replication handler: {e}")))?,
-    );
+    // Drain replication only when a downstream is configured: with none, the
+    // queue stays empty forever, so its loops would just storm the object store
+    // with `LIST`s. (Replication jobs left from a removed downstream are reaped
+    // by `scrub --replication-orphans`, not drained here.) Build the fallible
+    // handler before spawning any loop so an error cannot leak a cache loop.
+    let any_downstream = resolver
+        .keys()
+        .filter_map(|name| resolver.get(name))
+        .any(|repository| !repository.replication.is_empty());
+    let replication_handler: Option<Arc<dyn JobHandler>> = if any_downstream {
+        // Mesh cycles terminate: only state-changing writes dispatch, and
+        // receiver-side no-op suppression stops any remaining replays.
+        Some(Arc::new(
+            ReplicationJobHandler::builder()
+                .resolver(resolver.clone())
+                .blob_store(blob_store.clone())
+                .metadata_store(metadata_store.clone())
+                .build()
+                .map_err(|e| {
+                    Error::Internal(format!("failed to build replication handler: {e}"))
+                })?,
+        ))
+    } else {
+        None
+    };
 
     // One shared token cancels every loop when the owning `Registry` is dropped.
     let shutdown = CancellationToken::new();
@@ -315,22 +328,32 @@ fn build_in_process_queue(
         ));
     }
 
-    for _ in 0..replication_concurrency.get() {
-        tokio::spawn(in_process_claim_loop(
-            job_store.clone(),
-            replication_handler.clone(),
-            REPLICATION_QUEUE,
-            shutdown.clone(),
-        ));
+    if let Some(replication_handler) = replication_handler {
+        for _ in 0..replication_concurrency.get() {
+            tokio::spawn(in_process_claim_loop(
+                job_store.clone(),
+                replication_handler.clone(),
+                REPLICATION_QUEUE,
+                shutdown.clone(),
+            ));
+        }
     }
 
     Ok((job_store, shutdown))
 }
 
+/// Idle poll interval for the in-process claim loops. Production polls once a
+/// second (matching the durable `angos worker`) so an empty queue does not
+/// storm the object store with `LIST`s; tests poll fast so the suite stays
+/// snappy.
+#[cfg(not(test))]
+const IN_PROCESS_IDLE_POLL: Duration = Duration::from_secs(1);
+#[cfg(test)]
+const IN_PROCESS_IDLE_POLL: Duration = Duration::from_millis(10);
+
 /// Single claim-loop task for the in-process pool. Mirrors the per-worker
-/// loop in `command::worker::command::Command::run` but with a fixed 10 ms
-/// idle tick so small test suites stay snappy. `handler` must be the handler
-/// bound to `queue`.
+/// loop in `command::worker::command::Command::run`, idling at
+/// [`IN_PROCESS_IDLE_POLL`]. `handler` must be the handler bound to `queue`.
 ///
 /// Cancellation races only the claim, so an already-claimed job runs to
 /// completion rather than being interrupted mid-execute.
@@ -346,7 +369,7 @@ async fn in_process_claim_loop(
             outcome = consumer.claim_one(queue) => match outcome {
                 Err(_) => sleep(Duration::from_millis(100)).await,
                 Ok(claim_outcome) => match claim_outcome.claimed {
-                    None => sleep(claim_outcome.idle_sleep(Duration::from_millis(10))).await,
+                    None => sleep(claim_outcome.idle_sleep(IN_PROCESS_IDLE_POLL)).await,
                     Some(claimed) => {
                         execute_one(consumer.as_ref(), handler.as_ref(), claimed).await;
                     }
@@ -387,7 +410,7 @@ mod in_process_replication_tests {
         registry::{
             DOCKER_CONTENT_DIGEST, Registry, RegistryConfig, Repository,
             blob_store::BlobStore,
-            job_store::JobStore,
+            job_store::{JobEnvelope, JobStore},
             manifest::DEFAULT_MAX_MANIFEST_SIZE_BYTES,
             metadata_store::{LinkOperation, MetadataStore, link_kind::LinkKind},
             repository_resolver::RepositoryResolver,
@@ -440,11 +463,26 @@ mod in_process_replication_tests {
         }
     }
 
+    fn repository_without_downstream() -> Repository {
+        Repository {
+            name: REPO.to_string(),
+            upstreams: Vec::new(),
+            replication: Vec::new(),
+            retention_policy: RetentionPolicy::new(
+                &RetentionPolicyConfig::default(),
+                Arc::new(SystemClock),
+            ),
+            immutable_tags: false,
+            immutable_tags_exclusions: Vec::new(),
+        }
+    }
+
     /// Build a `Registry` with an automatic in-process queue (no
-    /// `[global.job_queue]`), plus the shared stores for seeding local state.
-    fn build_registry(
+    /// `[global.job_queue]`) over `repository`, plus the shared stores for
+    /// seeding local state.
+    fn build_registry_with(
         root: &str,
-        client: Arc<RegistryClient>,
+        repository: Repository,
     ) -> (Registry, Arc<BlobStore>, Arc<MetadataStore>) {
         let object: Arc<dyn ObjectStore> =
             Arc::new(StorageFsBackend::builder().root_dir(root).build().unwrap());
@@ -461,7 +499,7 @@ mod in_process_replication_tests {
         let blob_store = Arc::new(BlobStore::builder().store(store.clone()).build().unwrap());
 
         let mut repositories = HashMap::new();
-        repositories.insert(REPO.to_string(), repository_with_downstream(client));
+        repositories.insert(REPO.to_string(), repository);
         let resolver = Arc::new(RepositoryResolver::new(Arc::new(repositories)).unwrap());
 
         let config = RegistryConfig::default();
@@ -469,6 +507,13 @@ mod in_process_replication_tests {
             Registry::new(blob_store.clone(), metadata_store.clone(), resolver, config).unwrap();
 
         (registry, blob_store, metadata_store)
+    }
+
+    fn build_registry(
+        root: &str,
+        client: Arc<RegistryClient>,
+    ) -> (Registry, Arc<BlobStore>, Arc<MetadataStore>) {
+        build_registry_with(root, repository_with_downstream(client))
     }
 
     /// Seed a config blob, a layer blob, a manifest referencing both, and a `v1`
@@ -655,5 +700,46 @@ mod in_process_replication_tests {
             "the replication queue must drain to zero pending after a successful push"
         );
         assert_eq!(failed, 0, "a successful push must not dead-letter the job");
+    }
+
+    /// With no downstream configured, no replication loop is spawned, so a
+    /// replication job is never claimed: it must stay pending rather than be
+    /// drained (the loops would otherwise poll an always-empty queue forever).
+    #[tokio::test]
+    async fn no_replication_loop_when_no_downstream_configured() {
+        crate::metrics_provider::init_for_tests();
+        let dir = TempDir::new().unwrap();
+        let (registry, _blob_store, _metadata_store) = build_registry_with(
+            dir.path().to_str().unwrap(),
+            repository_without_downstream(),
+        );
+
+        registry
+            .job_queue
+            .enqueue(
+                JobEnvelope::new(
+                    REPLICATION_QUEUE,
+                    REPLICATION_PUSH_MANIFEST_KIND,
+                    format!("{REPLICATION_QUEUE}.eu:nginx:v1"),
+                    &(),
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        // A spawned loop idles at 10ms under cfg(test), so 500ms is many ticks:
+        // if one existed it would have claimed the job by now.
+        sleep(Duration::from_millis(500)).await;
+
+        assert_eq!(
+            registry
+                .job_queue
+                .count_pending(REPLICATION_QUEUE, 0)
+                .await
+                .unwrap(),
+            1,
+            "no downstream means no replication loop, so the job must stay pending"
+        );
     }
 }
