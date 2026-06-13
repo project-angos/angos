@@ -15,7 +15,7 @@ pub enum Error {
 // Manual `PartialEq` is required because `redis::RedisError` does not implement
 // `PartialEq`, so `#[derive(PartialEq)]` cannot be used on an enum that contains
 // it. Tests in `memory.rs` and `redis.rs` compare `Result<Option<String>, Error>`
-// against `Ok(…)` values, which requires `Error: PartialEq` to compile. The
+// against `Ok(...)` values, which requires `Error: PartialEq` to compile. The
 // `Redis` variant is intentionally excluded from equality because two distinct
 // `RedisError` values produced by separate I/O operations are not meaningfully
 // comparable.

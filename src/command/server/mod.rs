@@ -1,4 +1,4 @@
-//! `command::server` — entry point and infrastructure for the `server` subcommand.
+//! `command::server`: entry point and infrastructure for the `server` subcommand.
 
 mod command;
 mod error;

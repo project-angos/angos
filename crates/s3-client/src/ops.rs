@@ -2,9 +2,9 @@
 //! [`super::client::S3Client`].
 //!
 //! All methods on `Backend` go through three steps:
-//!   1. `check_circuit_breaker` — fail fast when the backend is unhealthy.
+//!   1. `check_circuit_breaker`: fail fast when the backend is unhealthy.
 //!   2. perform a signed request via the internal client.
-//!   3. `record_*_result` — feed success/failure back into the circuit breaker.
+//!   3. `record_*_result`: feed success/failure back into the circuit breaker.
 //!
 //! All bodies use [`bytes::Bytes`] (refcounted, zero-copy across clones and
 //! retries). Reads return a streaming [`AsyncRead`] by default; the few
@@ -37,7 +37,7 @@ const MAX_MULTIPART_COPY_PARTS: u32 = 10_000;
 const STREAM_BODY_PREALLOC_CAP: usize = 8 * 1024 * 1024;
 
 /// A streaming `GetObject` result. The body pulls bytes off the HTTP socket on
-/// demand — no full-payload buffering — and `content_length` reports the size
+/// demand (no full-payload buffering), and `content_length` reports the size
 /// of the (possibly ranged) response.
 pub struct GetObjectResult {
     pub body: Box<dyn AsyncRead + Unpin + Send + Sync>,
@@ -61,7 +61,7 @@ pub struct MultipartUpload {
     pub initiated_at: DateTime<Utc>,
 }
 
-// ─── object-level CRUD ────────────────────────────────────────────────────
+// object-level CRUD
 
 impl Backend {
     /// # Errors
@@ -118,8 +118,8 @@ impl Backend {
         self.head_object(path).await.map(|(size, _, _)| size)
     }
 
-    /// Single HEAD request returning size, `ETag`, and last-modified together
-    /// — avoids a redundant follow-up `GET` when the caller needs all three.
+    /// Single HEAD request returning size, `ETag`, and last-modified together,
+    /// avoiding a redundant follow-up `GET` when the caller needs all three.
     ///
     /// # Errors
     /// Forwards [`io::Error`] from the underlying `HEAD`: HTTP failures,
@@ -503,7 +503,7 @@ impl Backend {
     }
 }
 
-// ─── listing ──────────────────────────────────────────────────────────────
+// listing
 
 impl Backend {
     /// # Errors
@@ -622,7 +622,7 @@ impl Backend {
     }
 }
 
-// ─── multipart uploads ────────────────────────────────────────────────────
+// multipart uploads
 
 impl Backend {
     /// # Errors
@@ -894,7 +894,7 @@ impl Backend {
     }
 }
 
-// ─── presigned URLs ───────────────────────────────────────────────────────
+// presigned URLs
 
 impl Backend {
     #[allow(
@@ -917,7 +917,7 @@ impl Backend {
     }
 }
 
-// ─── helpers ──────────────────────────────────────────────────────────────
+// helpers
 
 pub fn aggregate_batch_delete_errors(errors: &[String]) -> Option<io::Error> {
     (!errors.is_empty())
@@ -1262,7 +1262,7 @@ mod tests {
     // The transport (status-less) error is simulated by a mock that delays its
     // response past the per-attempt timeout: reqwest's per-request timeout
     // produces a `reqwest::Error` whose `status()` is `None`, which maps to an
-    // `S3Error` with `status: None` — the same shape as a connection reset or a
+    // `S3Error` with `status: None`: the same shape as a connection reset or a
     // read timeout after the request was sent.
 
     #[tokio::test]

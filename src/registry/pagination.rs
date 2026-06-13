@@ -164,7 +164,7 @@ mod tests {
         let items = vec!["a".to_string(), "b".to_string()];
         let (result, token) = slice_page(&items, 0, 0);
         assert!(result.is_empty());
-        // No items emitted, but more remain after start_idx — the contract here
+        // No items emitted, but more remain after start_idx. The contract here
         // is that an empty page implies no last-element token.
         assert!(token.is_none());
     }

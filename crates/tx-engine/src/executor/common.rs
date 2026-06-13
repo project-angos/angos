@@ -2,7 +2,7 @@
 //!
 //! Each function takes `&dyn ObjectStore` (the lowest common trait) so it works
 //! with both `ConditionalStore` (CAS executor) and plain `ObjectStore` (Locked
-//! executor) — both traits are supertraits of `ObjectStore`.
+//! executor): both traits are supertraits of `ObjectStore`.
 
 use bytes::Bytes;
 use chrono::Utc;
@@ -46,7 +46,7 @@ pub async fn stamp_progress(
 }
 
 /// Mark mutation `idx` `Applied` and re-PUT the intent, warning (not failing)
-/// when the stamp write fails — the recovery loop re-applies idempotently if a
+/// when the stamp write fails. The recovery loop re-applies idempotently if a
 /// stamp is lost. Shared by both executors' per-mutation apply loops.
 pub async fn stamp_applied(store: &dyn ObjectStore, intent: &mut IntentRecord, idx: usize) {
     let tx_id = intent.id;

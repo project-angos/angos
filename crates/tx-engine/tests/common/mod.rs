@@ -1,7 +1,7 @@
 //! Shared construction helpers for the tx-engine integration tests.
 //!
 //! Each integration-test file is compiled as its own crate and pulls these in
-//! with `mod common;`, so not every helper is used by every file — hence the
+//! with `mod common;`, so not every helper is used by every file, hence the
 //! blanket `dead_code` allow.
 #![allow(dead_code)]
 

@@ -103,16 +103,16 @@ impl RetentionPolicy {
     /// # Fail-open semantics (data safety)
     ///
     /// Retention policies are **fail-open**: unexpected rule outcomes default to keeping the
-    /// manifest. This is the safer choice — it is better to retain a manifest that should have
+    /// manifest. This is the safer choice: it is better to retain a manifest that should have
     /// been deleted than to silently delete one that should have been kept.
     ///
     /// | Outcome                        | Behaviour          | Log level |
     /// |--------------------------------|--------------------|-----------|
     /// | `bool(true)`                   | retain             | `debug`   |
-    /// | `bool(false)`                  | continue to next rule | —      |
+    /// | `bool(false)`                  | continue to next rule | none   |
     /// | non-boolean value (misconfiguration) | retain (fail-open) | `warn` |
     /// | evaluation error               | retain (fail-open) | `warn`   |
-    /// | no rules matched               | delete             | —         |
+    /// | no rules matched               | delete             | none      |
     ///
     /// # Arguments
     /// * `manifest` - The manifest image information

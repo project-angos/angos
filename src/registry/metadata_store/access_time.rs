@@ -23,9 +23,7 @@ use crate::registry::{
     path_builder,
 };
 
-// ───────────────────────────────────────────────────────────────────────────
 // Access-time write debouncing
-// ───────────────────────────────────────────────────────────────────────────
 
 #[derive(Clone)]
 pub struct AccessTimeWriter {

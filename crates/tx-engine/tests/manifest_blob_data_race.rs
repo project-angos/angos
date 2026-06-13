@@ -3,8 +3,8 @@
 //!
 //! `src/registry/metadata_store/link_ops.rs::execute_links_tx` declares the
 //! synthetic coarse lock key `blob-data:{digest}` on both branches of its
-//! `LinksTxExtras` (push and delete). Under the CAS executor — which takes no
-//! working-set lock — the coarse lock is the only thing that prevents a delete
+//! `LinksTxExtras` (push and delete). Under the CAS executor, which takes no
+//! working-set lock, the coarse lock is the only thing that prevents a delete
 //! planner's "is the blob unreferenced?" observation from racing a concurrent
 //! push that lands its `Put blob-data/{digest}` between the planner's HEAD and
 //! the executor's Apply.
@@ -82,7 +82,7 @@ fn push_and_delete_declare_matching_coarse_lock() {
 
 /// Under the CAS executor, push and delete that share `blob-data:{digest}`
 /// serialise. The committed state is therefore consistent with one or the
-/// other landing last — never an interleaved partial.
+/// other landing last, never an interleaved partial.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cas_executor_serialises_push_and_delete() {
     let store = Arc::new(MemoryObjectStore::new());
@@ -159,7 +159,7 @@ async fn concurrent_push_and_delete_converge_to_consistent_state() {
 
     // Either order is legal; the resulting state must reflect the winner.
     // We don't know which won, but the state must be either present-with-the-
-    // written-body or absent — never a partially-written or corrupted body.
+    // written-body or absent, never a partially-written or corrupted body.
     if let Ok(body) = store.as_ref().get(BLOB_KEY).await {
         assert_eq!(body, b"manifest", "blob present must hold the pushed body");
     }

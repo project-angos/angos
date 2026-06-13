@@ -48,7 +48,7 @@ pub fn lock_path(key: &str) -> String {
     format!(".tx-locks/{shard}/{key}")
 }
 
-/// Maximum number of attempts — the initial write plus reconciling retries —
+/// Maximum number of attempts (the initial write plus reconciling retries)
 /// for a conditional lock write whose transport outcome is ambiguous.
 const MAX_CONDITIONAL_ATTEMPTS: u32 = 3;
 
@@ -111,7 +111,7 @@ fn reconcile_match(readback: LockReadback, our_body: &[u8], expected_etag: &str)
         Ok((_, Some(etag), _)) if etag.as_str() == expected_etag => MatchReconcile::Retry,
         // A foreign/rotated object, or one that vanished, means another writer won.
         Ok(_) | Err(StorageError::NotFound) => MatchReconcile::Mismatch,
-        // The read-back itself failed: we could not confirm — retry.
+        // The read-back itself failed: we could not confirm, so retry.
         Err(_) => MatchReconcile::Retry,
     }
 }
@@ -247,8 +247,8 @@ impl LockStorage for S3LockStorage {
                     // A read is idempotent, so a transport blip can simply be
                     // retried. This backstops the s3-client's own retries under
                     // sustained pressure so that a stale-lock-recovery read (or a
-                    // heartbeat re-read) does not fail an acquire — and therefore
-                    // a blob upload or delete — on a transient error.
+                    // heartbeat re-read) does not fail an acquire (and therefore
+                    // a blob upload or delete) on a transient error.
                     if attempts >= MAX_CONDITIONAL_ATTEMPTS {
                         return Err(Error::StorageBackend(e.to_string()));
                     }
@@ -446,7 +446,7 @@ mod tests {
         );
     }
 
-    // ─── reconcile decision helpers (pure) ─────────────────────────────────
+    // reconcile decision helpers (pure)
 
     fn mk_etag(s: &str) -> Etag {
         Etag::new(s)
@@ -550,7 +550,7 @@ mod tests {
         assert!(matches!(out, MatchReconcile::Retry));
     }
 
-    // ─── fault-injecting ConditionalStore for end-to-end retry tests ───────
+    // fault-injecting ConditionalStore for end-to-end retry tests
 
     /// One injected fault for a conditional write.
     #[derive(Clone, Copy)]
@@ -719,7 +719,7 @@ mod tests {
     #[tokio::test]
     async fn put_if_absent_lost_ack_landed_returns_created() {
         // The PUT lands but the ack is lost (transport error). The reconcile
-        // read-back finds our own body, so the acquire succeeds — the exact
+        // read-back finds our own body, so the acquire succeeds: the exact
         // regression this layer repairs.
         let store = FlakyStore::new(&[Fault::LandThenError], &[]);
         let lock = S3LockStorage::new(store.clone(), true);
@@ -869,7 +869,7 @@ mod tests {
     #[tokio::test]
     async fn get_with_etag_retries_transient_read_error_then_succeeds() {
         // A stale-lock-recovery read (the path behind the DELETE 500) hits a
-        // transport blip, then succeeds — the acquire must not fail.
+        // transport blip, then succeeds, so the acquire must not fail.
         let store = FlakyStore::new(&[], &[]);
         store
             .inner

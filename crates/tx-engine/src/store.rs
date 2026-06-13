@@ -1,7 +1,7 @@
-//! Storage façade — the single seam subsystems use for storage.
+//! Storage façade: the single seam subsystems use for storage.
 //!
 //! [`Store`] composes the storage handles a subsystem needs (an
-//! [`ObjectStore`] — the CRUD floor plus the upload-session lifecycle — plus
+//! [`ObjectStore`], the CRUD floor plus the upload-session lifecycle, plus
 //! an optional presign capability) together with the [`TransactionExecutor`]
 //! that commits coordinated writes. Subsystems (`metadata_store`, `blob_store`,
 //! `job_store`) hold a single `Arc<Store>` for their per-operation storage
@@ -16,8 +16,8 @@
 //!
 //! Plain reads, non-transactional writes, and the upload primitives return
 //! [`StorageError`] so callers keep matching [`StorageError::NotFound`]
-//! directly. The coordinated helpers — [`Store::update`] and
-//! [`Store::update_with_payload`] — return the engine [`Error`] (carrying
+//! directly. The coordinated helpers ([`Store::update`] and
+//! [`Store::update_with_payload`]) return the engine [`Error`] (carrying
 //! `Conflict`/`Precondition`).
 
 use std::{
@@ -74,7 +74,6 @@ impl fmt::Debug for Store {
 }
 
 impl Store {
-    /// Return a builder for constructing a [`Store`].
     #[must_use]
     pub fn builder() -> StoreBuilder {
         StoreBuilder::default()
@@ -97,7 +96,7 @@ impl Store {
         &self.object
     }
 
-    // ── Reads (passthrough; surface `StorageError::NotFound` directly) ──────
+    // Reads (passthrough; surface `StorageError::NotFound` directly)
 
     /// Read the full object body into memory.
     ///
@@ -165,7 +164,7 @@ impl Store {
             .await
     }
 
-    // ── Non-transactional writes (session records, best-effort cleanup) ─────
+    // Non-transactional writes (session records, best-effort cleanup)
 
     /// Write `data` to `key`, replacing any existing object.
     ///
@@ -203,19 +202,19 @@ impl Store {
         self.object.copy(source, destination).await
     }
 
-    // ── Transactions ────────────────────────────────────────────────────────
+    // Transactions
 
     /// Execute a pre-built [`Transaction`] once (no retry).
     ///
     /// # Errors
     ///
     /// Propagates any [`Error`] from the executor (`Conflict`, `Precondition`,
-    /// `Storage`, …).
+    /// `Storage`, etc.).
     pub async fn execute(&self, tx: Transaction) -> Result<Outcome, Error> {
         self.executor.execute(tx).await
     }
 
-    // ── Read-for-update ──────────────────────────────────────────────────────
+    // Read-for-update
 
     /// Read `key` as a [`Snapshot`]. A missing key is not an error: it yields
     /// `present: false` with an empty body.
@@ -353,7 +352,7 @@ impl Store {
         execute_with_retry_payload(self.executor.as_ref(), build, max_attempts).await
     }
 
-    // ── Upload lifecycle ─────────────────────────────────────────────────────
+    // Upload lifecycle
 
     /// Begin/clear a fresh upload at `key` (discards any leaked prior upload).
     ///
@@ -414,7 +413,7 @@ impl Store {
     /// This is a primitive: promotion to the canonical path and deletion of
     /// any session-record keys are left to the caller, which composes them
     /// into an engine [`Transaction`] (via [`Store::execute`]) so the moves
-    /// and deletes commit atomically — often merged with other mutations
+    /// and deletes commit atomically, often merged with other mutations
     /// (e.g. a blob-index grant). The upload orchestration that drives this
     /// lives in the registry, not the engine.
     ///
@@ -425,7 +424,7 @@ impl Store {
         self.object.complete_upload(key).await
     }
 
-    // ── Presign / prune ──────────────────────────────────────────────────────
+    // Presign / prune
 
     /// Generate a presigned download URL for `key`, or `Ok(None)` when no
     /// presign backend is wired.
@@ -662,9 +661,9 @@ mod tests {
             .await
             .expect("promote");
 
-        // Assembled object promoted to the canonical key…
+        // Assembled object promoted to the canonical key...
         assert!(store.get("blob-data/abc").await.is_ok());
-        // …source upload key gone, and the session record deleted.
+        // ...source upload key gone, and the session record deleted.
         assert!(matches!(
             store.get("upload/u1").await,
             Err(StorageError::NotFound)

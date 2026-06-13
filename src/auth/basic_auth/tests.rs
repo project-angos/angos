@@ -22,7 +22,7 @@ struct TestConfig {
     identity: HashMap<String, Config>,
 }
 
-// Minimal Argon2 cost parameters for test-only use — chosen for speed, not security.
+// Minimal Argon2 cost parameters for test-only use, chosen for speed, not security.
 // Production code uses OWASP-recommended defaults (m=19456, t=2, p=1).
 fn tiny_argon_params() -> Params {
     Params::new(8, 1, 1, None).expect("minimal Argon2 params must be valid")
@@ -92,7 +92,7 @@ fn test_build_users() {
 
     let (id1, pass1) = users.get("user1").unwrap();
     assert_eq!(id1, "id_1");
-    // Use the minimal-cost verifier — the hash was also produced with tiny params.
+    // Use the minimal-cost verifier: the hash was also produced with tiny params.
     let argon = Argon2::new(Algorithm::Argon2id, Version::V0x13, tiny_argon_params());
     assert!(
         argon

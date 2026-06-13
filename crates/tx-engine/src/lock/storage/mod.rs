@@ -4,13 +4,13 @@
 //! [`Lock`](crate::lock::Lock) needs from its storage layer. Three implementations
 //! are provided:
 //!
-//! - [`MemoryLockStorage`](memory::MemoryLockStorage) — in-process mutex map
+//! - [`MemoryLockStorage`](memory::MemoryLockStorage): in-process mutex map
 //!   (no TTL; suitable for single-process deployments and tests).
-//! - [`S3LockStorage`](s3::S3LockStorage) — uses `put_if_absent` /
-//!   `put_if_match` / conditional delete on S3-compatible stores that advertise
-//!   CAS support.
-//! - [`RedisLockStorage`](redis::RedisLockStorage) (feature `redis`) — Redis
-//!   `SET NX EX` + Lua scripts for atomic refresh and release; suitable for
+//! - [`S3LockStorage`](s3::S3LockStorage): uses `put_if_absent`,
+//!   `put_if_match`, and conditional delete on S3-compatible stores that
+//!   advertise CAS support.
+//! - [`RedisLockStorage`](redis::RedisLockStorage) (feature `redis`): Redis
+//!   `SET NX EX` plus Lua scripts for atomic refresh and release; suitable for
 //!   FS deployments under heavy concurrent load.
 
 pub mod memory;
@@ -40,7 +40,7 @@ pub struct LockBody {
     /// unique. After a conditional write returns an ambiguous (status-less)
     /// transport error, [`S3LockStorage`](s3::S3LockStorage) reads the object
     /// back and treats a byte-for-byte match as proof that *its own* write
-    /// landed despite the lost acknowledgement — rather than a competitor's
+    /// landed despite the lost acknowledgement, rather than a competitor's
     /// identical-looking body. The nonce is what makes that comparison
     /// collision-free. `#[serde(default)]` keeps lock objects written before
     /// this field existed readable: they deserialize to the nil UUID, which

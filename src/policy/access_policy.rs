@@ -158,21 +158,21 @@ impl AccessPolicy {
     ///
     /// | Outcome                             | Decision               | Log level |
     /// |-------------------------------------|------------------------|-----------|
-    /// | `bool(true)`  — rule matched        | `Deny` (fail-closed)   | `debug`   |
-    /// | `bool(false)` — rule did not match  | continue to next rule  | —         |
+    /// | `bool(true)`, rule matched          | `Deny` (fail-closed)   | `debug`   |
+    /// | `bool(false)`, rule did not match   | continue to next rule  | none      |
     /// | non-boolean value (misconfiguration)| `Indeterminate`        | `warn`    |
     /// | evaluation error                    | `Indeterminate`        | `warn`    |
-    /// | no rules matched                    | `Allow` (default)      | —         |
+    /// | no rules matched                    | `Allow` (default)      | none      |
     ///
     /// ## Deny mode (default-deny; rules are ALLOW rules)
     ///
     /// | Outcome                             | Decision               | Log level |
     /// |-------------------------------------|------------------------|-----------|
-    /// | `bool(true)`  — rule matched        | `Allow` (fail-open)    | `debug`   |
-    /// | `bool(false)` — rule did not match  | continue to next rule  | —         |
+    /// | `bool(true)`, rule matched          | `Allow` (fail-open)    | `debug`   |
+    /// | `bool(false)`, rule did not match   | continue to next rule  | none      |
     /// | non-boolean value (misconfiguration)| `Indeterminate`        | `warn`    |
     /// | evaluation error                    | `Indeterminate`        | `warn`    |
-    /// | no rules matched                    | `Deny` (default)       | —         |
+    /// | no rules matched                    | `Deny` (default)       | none      |
     ///
     /// # Arguments
     /// * `action` - The domain action representing the registry operation
@@ -579,7 +579,7 @@ mod tests {
     #[test]
     fn failed_rule_in_deny_mode_is_indeterminate() {
         // Deny mode: an evaluation error in an ALLOW rule produces Indeterminate
-        // (which callers treat as deny — fail-closed).
+        // (which callers treat as deny, i.e. fail-closed).
         let policy = AccessPolicy::new(AccessPolicyConfig {
             default: AccessMode::Deny,
             rules: vec![rule("nonexistent_var")],

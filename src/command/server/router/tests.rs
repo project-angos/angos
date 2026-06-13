@@ -1029,7 +1029,7 @@ fn test_parse_list_namespaces_post_not_allowed() {
     assert!(route.is_none());
 }
 
-// ── Durable job-queue administration routes ─────────────────────────────────
+// Durable job-queue administration routes
 
 #[test]
 fn test_parse_list_jobs() {

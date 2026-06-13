@@ -30,7 +30,7 @@ pub fn initialize_metrics() -> Result<(), Error> {
 }
 
 /// Adapter implementing [`LockMetrics`] over the process-wide
-/// [`MetricsProvider`]. Carries no state of its own — each call fetches the
+/// [`MetricsProvider`]. Carries no state of its own: each call fetches the
 /// `'static` provider and increments / observes against the prometheus vecs.
 struct PrometheusLockMetrics;
 
@@ -76,7 +76,7 @@ impl LockMetrics for PrometheusLockMetrics {
 /// # Panics
 ///
 /// Panics if `initialize_metrics()` has not been called. This is a programmer
-/// error — all code paths that record metrics run after startup initialization.
+/// error: all code paths that record metrics run after startup initialization.
 pub fn metrics_provider() -> &'static MetricsProvider {
     METRICS
         .get()
@@ -353,7 +353,7 @@ impl MetricsProvider {
 
 #[cfg(test)]
 pub fn init_for_tests() {
-    // Ignore the already-initialized error — tests run in parallel and share one process.
+    // Ignore the already-initialized error: tests run in parallel and share one process.
     let _ = initialize_metrics();
 }
 
