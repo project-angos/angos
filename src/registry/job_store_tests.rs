@@ -285,6 +285,74 @@ async fn run_enqueue_dedup_skips_existing_lock_key(h: Harness) {
     );
 }
 
+async fn run_enqueue_after_claim_creates_second_pending(h: Harness) {
+    let lock_key = "cache.ns:sha256:inflight";
+    h.store
+        .enqueue(dummy_envelope(lock_key))
+        .await
+        .expect("enqueue 1");
+
+    // Claim without completing: the job is now executing and holds the lock.
+    let claimed = h
+        .store
+        .claim_one("cache")
+        .await
+        .expect("claim_one")
+        .claimed
+        .expect("Some");
+    assert_eq!(claimed.envelope.lock_key, lock_key);
+
+    // A same-lock_key enqueue mid-execution must not coalesce into the
+    // already-resolved job; it gets its own pending file.
+    h.store
+        .enqueue(dummy_envelope(lock_key))
+        .await
+        .expect("enqueue 2");
+    assert_eq!(
+        h.store.count_pending("cache", 600).await.expect("count"),
+        2,
+        "enqueue during execution must create a second pending job",
+    );
+
+    // The execution lock serialises the two: the second is unclaimable until
+    // the first releases the lock on complete.
+    assert!(
+        h.store
+            .claim_one("cache")
+            .await
+            .expect("claim")
+            .claimed
+            .is_none(),
+        "second job must wait on the execution lock",
+    );
+    h.store
+        .complete(claimed, Transaction::builder().build())
+        .await
+        .expect("complete 1");
+
+    let second = h
+        .store
+        .claim_one("cache")
+        .await
+        .expect("claim")
+        .claimed
+        .expect("second job claimable after the first completes");
+    assert_eq!(second.envelope.lock_key, lock_key);
+    h.store
+        .complete(second, Transaction::builder().build())
+        .await
+        .expect("complete 2");
+    assert!(
+        h.store
+            .claim_one("cache")
+            .await
+            .expect("claim")
+            .claimed
+            .is_none(),
+        "queue empty after both jobs complete",
+    );
+}
+
 // =========================================================================
 // End-to-end claim cycle — FS store
 // =========================================================================
@@ -398,6 +466,17 @@ async fn enqueue_dedup_skips_existing_lock_key() {
 #[tokio::test]
 async fn enqueue_dedup_skips_existing_lock_key_memory() {
     run_enqueue_dedup_skips_existing_lock_key(harness_memory()).await;
+}
+
+#[tokio::test]
+async fn enqueue_after_claim_creates_second_pending() {
+    let dir = TempDir::new().expect("temp dir");
+    run_enqueue_after_claim_creates_second_pending(harness(&dir)).await;
+}
+
+#[tokio::test]
+async fn enqueue_after_claim_creates_second_pending_memory() {
+    run_enqueue_after_claim_creates_second_pending(harness_memory()).await;
 }
 
 async fn run_concurrent_enqueue_dedup(h: Harness) {

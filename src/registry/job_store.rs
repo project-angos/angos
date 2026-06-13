@@ -666,9 +666,10 @@ impl JobStore {
     ///
     /// The `Read` carries a fingerprint of `index_body`, so an index refreshed
     /// by a concurrent enqueue between the read and the apply turns the delete
-    /// into a no-op conflict rather than clobbering the fresh index. Three
+    /// into a no-op conflict rather than clobbering the fresh index. Four
     /// call sites fold this into their own transactions: the orphan self-heal
-    /// in `find_pending_with_lock_key`, `complete`, and `fail_dead_letter`.
+    /// in `find_pending_with_lock_key`, `retire_claimed_index`, `complete`, and
+    /// `fail_dead_letter`.
     fn conditional_index_delete(
         index_path: String,
         index_body: &[u8],
@@ -687,6 +688,37 @@ impl JobStore {
             expected: None,
         };
         (Some(read), Some(delete))
+    }
+
+    /// Retire the dedup index of a just-claimed job so a same-`lock_key`
+    /// enqueue arriving mid-execution starts a fresh pending file rather than
+    /// coalescing into the already-resolved job and silently dropping its write.
+    /// The pending file stays as the crash-recovery record, and the delete is
+    /// conditional plus fingerprint-guarded so a producer's newer index is
+    /// never clobbered.
+    async fn retire_claimed_index(&self, queue: &str, lock_key: &str, storage_key: &str) {
+        let (index_storage_key, body) = match self.get_lock_key_index_raw(queue, lock_key).await {
+            Ok(Some(found)) => found,
+            Ok(None) => return,
+            Err(e) => {
+                warn!(lock_key, error = %e, "Failed to read dedup index at claim");
+                return;
+            }
+        };
+        let index_path = path_builder::job_lock_key_index_path(queue, lock_key);
+        let (read, delete) =
+            Self::conditional_index_delete(index_path, &body, &index_storage_key, storage_key);
+        if delete.is_none() {
+            return;
+        }
+        let mut tx = Transaction::builder().build();
+        tx.reads.extend(read);
+        tx.mutations.extend(delete);
+        if let Err(e) = self.store.execute(tx).await
+            && !matches!(e, TxError::Conflict | TxError::Precondition)
+        {
+            warn!(lock_key, error = %tx_error_to_job(e), "Failed to retire dedup index at claim");
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -772,6 +804,10 @@ impl JobStore {
     /// prefix is in the future without reading its body — the prefix is the
     /// authoritative readiness signal. When no claim is made, `next_ready`
     /// carries that first future instant so the caller can sleep until then.
+    ///
+    /// On a successful claim the job's dedup index is retired (see
+    /// [`Self::retire_claimed_index`]) so a same-`lock_key` enqueue arriving
+    /// while the job runs is not coalesced into the already-resolved job.
     pub async fn claim_one(&self, queue: &str) -> Result<ClaimOutcome, Error> {
         let now = Utc::now();
         let mut next_ready: Option<DateTime<Utc>> = None;
@@ -802,6 +838,8 @@ impl JobStore {
                     worker_id = self.worker_id.as_str(),
                     "Claimed job"
                 );
+                self.retire_claimed_index(queue, &envelope.lock_key, &storage_key)
+                    .await;
                 return Ok(ClaimOutcome {
                     claimed: Some(ClaimedJob {
                         envelope,

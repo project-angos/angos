@@ -36,8 +36,9 @@ pub const REPLICATION_PUSH_MANIFEST_KIND: &str = "replication.push_manifest";
 pub const REPLICATION_DELETE_MANIFEST_KIND: &str = "replication.delete_manifest";
 
 /// JSON payload for a replication job on [`REPLICATION_QUEUE`]. The handler
-/// re-resolves the current local `tag -> digest` at execute time, so coalesced
-/// jobs converge to latest-wins.
+/// re-resolves the current local `tag -> digest` at execute time and the queue
+/// only coalesces not-yet-claimed jobs, so a write landing mid-push enqueues
+/// its own job instead of being dropped.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ReplicationPushPayload {
     /// Local identifier of the target downstream (selects the `RegistryClient`).
