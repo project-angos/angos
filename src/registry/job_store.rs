@@ -576,6 +576,32 @@ impl JobStore {
         }
     }
 
+    /// Count dead-lettered envelopes in `queue`, capped at
+    /// [`MAX_REPORTED_PENDING`]. Feeds the server-published
+    /// `angos_job_queue_failed` gauge so dead-letters stay observable even when
+    /// `angos worker` (which has no metrics endpoint) drains the queue.
+    pub async fn count_failed(&self, queue: &str) -> Result<u64, Error> {
+        let prefix = path_builder::job_failed_dir(queue);
+        let mut count: u64 = 0;
+        let mut token: Option<String> = None;
+        loop {
+            let page = self.store.list(&prefix, 1000, token).await?;
+            for name in &page.items {
+                if name.strip_suffix(".json").is_none() {
+                    continue;
+                }
+                count += 1;
+                if count >= MAX_REPORTED_PENDING {
+                    return Ok(MAX_REPORTED_PENDING);
+                }
+            }
+            match page.next_token {
+                Some(t) => token = Some(t),
+                None => return Ok(count),
+            }
+        }
+    }
+
     /// `true` when any pending job in `queue` carries `lock_key`. Best-effort
     /// dedup backed by an O(1) index file written alongside each pending
     /// envelope (see [`LockKeyIndex`]).
@@ -1230,17 +1256,19 @@ pub fn backoff(n: u32) -> Duration {
 }
 
 // ---------------------------------------------------------------------------
-// Pending-gauge refresh loop
+// Queue-depth gauge refresh loop
 // ---------------------------------------------------------------------------
 
-/// Refresh `angos_job_queue_pending` for `queue` on every `period` tick,
-/// until `shutdown` is cancelled. Uses `tokio::time::interval` so the cadence
-/// stays fixed across slow `count_pending` calls; missed ticks are coalesced
-/// rather than catching up.
+/// Refresh the queue-depth gauges (`angos_job_queue_pending` and
+/// `angos_job_queue_failed`) for `queue` on every `period` tick, until
+/// `shutdown` is cancelled. Uses `tokio::time::interval` so the cadence stays
+/// fixed across slow count calls; missed ticks are coalesced rather than
+/// catching up.
 ///
 /// `ready_horizon_secs` is forwarded to `count_pending`: only envelopes ready
-/// within that window contribute to the gauge.
-pub async fn pending_refresh_loop(
+/// within that window contribute to the pending gauge. The server runs this
+/// loop so both gauges are scrapeable even when `angos worker` drains the queue.
+pub async fn queue_depth_refresh_loop(
     store: Arc<JobStore>,
     queue: String,
     period: Duration,
@@ -1265,6 +1293,15 @@ pub async fn pending_refresh_loop(
                     .set(i64::try_from(count).unwrap_or(i64::MAX));
             }
             Err(e) => debug!(queue = %queue, error = %e, "Failed to refresh pending gauge"),
+        }
+        match store.count_failed(&queue).await {
+            Ok(count) => {
+                metrics_provider()
+                    .job_queue_failed
+                    .with_label_values(&[queue.as_str()])
+                    .set(i64::try_from(count).unwrap_or(i64::MAX));
+            }
+            Err(e) => debug!(queue = %queue, error = %e, "Failed to refresh dead-letter gauge"),
         }
     }
 }

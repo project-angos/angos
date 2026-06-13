@@ -110,6 +110,7 @@ pub struct MetricsProvider {
     pub lock_invalidations: IntCounterVec,
     pub lock_recoveries: IntCounterVec,
     pub job_queue_pending: IntGaugeVec,
+    pub job_queue_failed: IntGaugeVec,
     pub job_queue_enqueued_total: IntCounterVec,
     pub job_queue_enqueue_failures_total: IntCounterVec,
     pub replication_push_total: IntCounterVec,
@@ -140,6 +141,7 @@ impl MetricsProvider {
         let lock_invalidations = Self::build_lock_invalidations(&registry)?;
         let lock_recoveries = Self::build_lock_recoveries(&registry)?;
         let job_queue_pending = Self::build_job_queue_pending(&registry)?;
+        let job_queue_failed = Self::build_job_queue_failed(&registry)?;
         let job_queue_enqueued_total = Self::build_job_queue_enqueued_total(&registry)?;
         let job_queue_enqueue_failures_total =
             Self::build_job_queue_enqueue_failures_total(&registry)?;
@@ -160,6 +162,7 @@ impl MetricsProvider {
             lock_invalidations,
             lock_recoveries,
             job_queue_pending,
+            job_queue_failed,
             job_queue_enqueued_total,
             job_queue_enqueue_failures_total,
             replication_push_total,
@@ -267,6 +270,16 @@ impl MetricsProvider {
             registry
         )
         .map_err(register_err("angos_job_queue_pending"))
+    }
+
+    fn build_job_queue_failed(registry: &PrometheusRegistry) -> Result<IntGaugeVec, Error> {
+        register_int_gauge_vec_with_registry!(
+            "angos_job_queue_failed",
+            "Number of dead-lettered jobs currently in the queue",
+            &["queue"],
+            registry
+        )
+        .map_err(register_err("angos_job_queue_failed"))
     }
 
     fn build_job_queue_enqueued_total(

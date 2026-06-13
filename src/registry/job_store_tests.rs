@@ -139,6 +139,36 @@ async fn run_dead_letter_after_max_attempts(h: Harness) {
     ));
 }
 
+async fn run_count_failed_reflects_dead_letters(h: Harness) {
+    assert_eq!(h.store.count_failed("cache").await.expect("count"), 0);
+
+    let mut env = dummy_envelope("cache.ns:sha256:dl-count");
+    env.max_attempts = 1;
+    h.store.enqueue(env).await.expect("enqueue");
+    let claimed = h
+        .store
+        .claim_one("cache")
+        .await
+        .expect("claim")
+        .claimed
+        .expect("Some");
+    assert!(matches!(
+        h.store.fail(claimed, "final error").await.expect("fail"),
+        FailOutcome::MovedToDeadLetter
+    ));
+
+    assert_eq!(
+        h.store.count_failed("cache").await.expect("count"),
+        1,
+        "a dead-lettered job must be counted by count_failed",
+    );
+    assert_eq!(
+        h.store.count_pending("cache", 600).await.expect("count"),
+        0,
+        "a dead-lettered job is no longer pending",
+    );
+}
+
 async fn run_count_pending_saturates_at_cap(h: Harness) {
     let now = Utc::now();
     for i in 0..(MAX_REPORTED_PENDING + 5) {
@@ -418,6 +448,21 @@ async fn count_pending_excludes_envelopes_past_readiness_horizon() {
 #[tokio::test]
 async fn count_pending_excludes_envelopes_past_readiness_horizon_memory() {
     run_count_pending_excludes_envelopes_past_readiness_horizon(harness_memory()).await;
+}
+
+// =========================================================================
+// count_failed
+// =========================================================================
+
+#[tokio::test]
+async fn count_failed_reflects_dead_letters() {
+    let dir = TempDir::new().expect("temp dir");
+    run_count_failed_reflects_dead_letters(harness(&dir)).await;
+}
+
+#[tokio::test]
+async fn count_failed_reflects_dead_letters_memory() {
+    run_count_failed_reflects_dead_letters(harness_memory()).await;
 }
 
 #[tokio::test]

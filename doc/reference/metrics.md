@@ -234,10 +234,10 @@ histogram_quantile(0.95, sum by (webhook, le) (rate(event_webhook_delivery_durat
 
 ## Job Queue Metrics
 
-`angos_job_queue_pending` is published only when `[global.job_queue]` is
-configured; the two counters below increment on every enqueue (the in-process
-queue included) and are always exposed on the server's `/metrics`. See
-[Enable Durable Cache Jobs](../how-to/durable-cache-jobs.md).
+`angos_job_queue_pending` and `angos_job_queue_failed` are published only when
+`[global.job_queue]` is configured; the two counters below increment on every
+enqueue (the in-process queue included) and are always exposed on the server's
+`/metrics`. See [Enable Durable Cache Jobs](../how-to/durable-cache-jobs.md).
 
 ### angos_job_queue_pending
 
@@ -257,6 +257,18 @@ The gauge **saturates at 10 000**: any value at the cap should be read as
 `LIST` cost per refresh tick to ~10 paginated calls regardless of queue depth.
 KEDA's `ScaledObject` only needs ordinal granularity above its scale-to-max
 threshold, which is normally well below this cap.
+
+| Type  | Labels  |
+|-------|---------|
+| Gauge | `queue` |
+
+### angos_job_queue_failed
+
+Dead-lettered jobs currently held in the queue (jobs that exhausted their retry
+budget). Refreshed by the same server-side background ticker as
+`angos_job_queue_pending`, so it stays scrapeable even when `angos worker`
+drains the queue. Saturates at 10 000 like the pending gauge. Alert on
+`angos_job_queue_failed{queue="replication"} > 0` to catch stuck replication.
 
 | Type  | Labels  |
 |-------|---------|
@@ -301,7 +313,10 @@ and scrub reconciliation. See
 that drains the replication queue. Without `[global.job_queue]` the server
 drains the queue in-process, so both appear on the server's `/metrics`. With
 `[global.job_queue]` the queue is drained by `angos worker`, which exposes no
-HTTP endpoint. In that mode these two metrics are not scrapeable.
+HTTP endpoint, so in that mode these two metrics are not scrapeable; use the
+server-published `angos_job_queue_failed{queue="replication"}` gauge to alert on
+stuck replication and `angos_job_queue_pending{queue="replication"}` for
+backlog.
 
 ### angos_replication_push_total
 
@@ -376,7 +391,14 @@ also on the server's `/metrics` and supports a staleness alert:
 ```
 
 With a separate `angos worker`, the gauge is not scrapeable; alert on the
-`angos_job_queue_pending{queue="replication"}` backlog instead.
+server-published `angos_job_queue_failed{queue="replication"}` dead-letter gauge
+(stuck pushes) and the `angos_job_queue_pending{queue="replication"}` backlog
+instead.
+
+```promql
+# Stuck replication pushes (dead-lettered)
+angos_job_queue_failed{queue="replication"} > 0
+```
 
 ---
 

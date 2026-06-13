@@ -20,7 +20,7 @@ use crate::{
         },
     },
     configuration::{Configuration, ServerConfig},
-    registry::{cache_job_handler::CACHE_QUEUE, job_store::pending_refresh_loop},
+    registry::{cache_job_handler::CACHE_QUEUE, job_store::queue_depth_refresh_loop},
     replication::REPLICATION_QUEUE,
 };
 
@@ -41,7 +41,8 @@ pub enum ServiceListener {
 pub struct Options {}
 
 /// Background tickers (one per drained queue: `cache` and `replication`) that
-/// publish `angos_job_queue_pending` on `/metrics`.
+/// publish the `angos_job_queue_pending` and `angos_job_queue_failed` gauges
+/// on `/metrics`.
 struct PendingRefreshTask {
     shutdown: CancellationToken,
     tracker: TaskTracker,
@@ -81,11 +82,11 @@ impl Command {
         let pending_refresh = pending.map(|refresh| {
             let shutdown = CancellationToken::new();
             let tracker = TaskTracker::new();
-            // The server reads pending counts off the shared store, so the
-            // replication gauge is published here even though `angos worker`
+            // The server reads queue depth off the shared store, so the
+            // replication gauges are published here even though `angos worker`
             // drains that queue.
             for queue in [CACHE_QUEUE, REPLICATION_QUEUE] {
-                tracker.spawn(pending_refresh_loop(
+                tracker.spawn(queue_depth_refresh_loop(
                     refresh.store.clone(),
                     queue.to_string(),
                     refresh.interval,
