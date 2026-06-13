@@ -445,7 +445,8 @@ impl MetadataStore {
                     }
 
                     // A replicated write also gates last-writer-wins on this read.
-                    if let (Some(source_ts), Some(metadata)) = (extras.created_at, metadata.as_ref())
+                    if let (Some(source_ts), Some(metadata)) =
+                        (extras.created_at, metadata.as_ref())
                         && let Some(created_at) = metadata.supersedes(source_ts, Some(target))
                     {
                         return Ok((

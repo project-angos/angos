@@ -254,10 +254,16 @@ async fn test_blob_exists_true_when_digest_header_absent() {
         RegistryClient::from_config(&config, cache, DEFAULT_MAX_MANIFEST_SIZE_BYTES).unwrap();
 
     let present = client
-        .blob_exists(&format!("{}/v2/test/blobs/{test_digest}", mock_server.uri()))
+        .blob_exists(&format!(
+            "{}/v2/test/blobs/{test_digest}",
+            mock_server.uri()
+        ))
         .await
         .unwrap();
-    assert!(present, "a 2xx HEAD without a digest header must read as present");
+    assert!(
+        present,
+        "a 2xx HEAD without a digest header must read as present"
+    );
 }
 
 #[tokio::test]
@@ -284,7 +290,10 @@ async fn test_blob_exists_false_on_404() {
         RegistryClient::from_config(&config, cache, DEFAULT_MAX_MANIFEST_SIZE_BYTES).unwrap();
 
     let present = client
-        .blob_exists(&format!("{}/v2/test/blobs/sha256:absent", mock_server.uri()))
+        .blob_exists(&format!(
+            "{}/v2/test/blobs/sha256:absent",
+            mock_server.uri()
+        ))
         .await
         .unwrap();
     assert!(!present, "a 404 HEAD must read as absent");

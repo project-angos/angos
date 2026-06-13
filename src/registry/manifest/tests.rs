@@ -2573,7 +2573,10 @@ async fn find_tags_pointing_at_bypasses_the_link_cache() {
         "cache must still be stale for an honest test",
     );
 
-    let pointing = store.find_tags_pointing_at(namespace, &new_digest).await.unwrap();
+    let pointing = store
+        .find_tags_pointing_at(namespace, &new_digest)
+        .await
+        .unwrap();
     assert_eq!(
         pointing,
         vec![link],
@@ -2973,7 +2976,12 @@ async fn replicated_delete_not_superseded_by_a_legacy_link() {
 
     let ancient = chrono::DateTime::from_timestamp(0, 0).unwrap();
     registry
-        .delete_manifest(None, Some(ancient), namespace, &Reference::Tag("latest".to_string()))
+        .delete_manifest(
+            None,
+            Some(ancient),
+            namespace,
+            &Reference::Tag("latest".to_string()),
+        )
         .await
         .expect("a legacy tag (no created_at) must never supersede a replicated write");
 
