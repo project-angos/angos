@@ -57,7 +57,7 @@ mod tests {
     }
 
     // Verify that Config::Redis selects the Redis variant without actually
-    // connecting (construction is lazy — no network call at `to_backend()`).
+    // connecting (construction is lazy: no network call at `to_backend()`).
     #[test]
     fn redis_config_to_backend_constructs_without_connecting() {
         let result = Config::Redis(BackendConfig {

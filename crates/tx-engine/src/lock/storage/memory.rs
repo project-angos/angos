@@ -6,7 +6,7 @@
 //! (via [`Lock::release`](crate::lock::Lock)) or drops the session. Because
 //! there is no heartbeat in the storage layer (the lock-expiry logic lives in
 //! the heartbeat spawned by [`Lock`](crate::lock::Lock)), `get_with_etag`
-//! returns a `last_modified` of `None` — the TTL-staleness check in
+//! returns a `last_modified` of `None`: the TTL-staleness check in
 //! [`LockBody::is_expired`] will fall back to the embedded `refreshed_at`
 //! field.
 

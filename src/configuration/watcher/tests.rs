@@ -509,9 +509,9 @@ async fn coalesce_events_collapses_burst_into_single_result() {
 
     let (tx, mut rx) = mpsc::channel(100);
 
-    // Send a burst of 10 events that classify as Config — all sent before
+    // Send a burst of 10 events that classify as Config, all sent before
     // the coalescer has a chance to time out, simulating e.g. an editor
-    // write → truncate → write sequence.
+    // write, truncate, write sequence.
     for _ in 0..10 {
         let event = make_event(
             EventKind::Modify(notify::event::ModifyKind::Data(
@@ -714,7 +714,7 @@ async fn reload_tls_does_not_notify_when_cache_empty_and_disk_invalid() {
 #[tokio::test]
 async fn reload_tls_does_not_notify_when_server_is_not_tls() {
     let temp_dir = TempDir::new().unwrap();
-    // Insecure server config — no TLS section.
+    // Insecure server config, no TLS section.
     let cached_cfg: Configuration =
         Configuration::load_from_str("[server]\nbind_address = \"127.0.0.1\"").unwrap();
 
@@ -749,7 +749,7 @@ async fn startup_with_nonexistent_config_returns_err() {
 }
 
 /// When the config file *exists* but contains invalid TOML,
-/// `ConfigWatcher::new` must return `Ok` — the watcher starts, logs a
+/// `ConfigWatcher::new` must return `Ok`: the watcher starts, logs a
 /// warning, and waits for a corrected file to appear.  This is the
 /// intentional "soft startup" behaviour: if the operator wrote a bad
 /// config, the running registry keeps serving traffic while the watcher
@@ -794,7 +794,7 @@ async fn startup_with_invalid_toml_recovers_on_valid_write() {
 
 /// A rapid burst of writes to the config file (simulating an editor
 /// save sequence) must produce at most a small number of reload
-/// notifications — far fewer than the number of writes — because the
+/// notifications (far fewer than the number of writes) because the
 /// debounce window coalesces consecutive events.
 ///
 /// We write 10 times in a tight loop and assert the notifier is called
@@ -838,7 +838,7 @@ async fn burst_config_writes_produce_bounded_reloads() {
     );
     assert!(
         count <= 3,
-        "debounce should collapse burst to ≤ 3 reloads, got {count}"
+        "debounce should collapse burst to <= 3 reloads, got {count}"
     );
 }
 
@@ -847,7 +847,7 @@ async fn burst_config_writes_produce_bounded_reloads() {
 /// failing.  A subsequent ordinary config-file write must still trigger
 /// a reload notification, confirming the watcher loop is alive.
 ///
-/// This exercises the `warn!("Failed to watch TLS directory …")` branch
+/// This exercises the `warn!("Failed to watch TLS directory ...")` branch
 /// in `watch_config_loop`.
 #[tokio::test]
 async fn missing_tls_dir_does_not_prevent_config_reload() {
@@ -940,8 +940,8 @@ async fn dynamic_tls_path_change_rewatches_new_directory() {
 
     tokio::time::sleep(Duration::from_millis(500)).await;
 
-    // Step 2: update config to point at tls_v2 — fires ChangeKind::Config,
-    // which causes the inner loop to break and re-arm watches for tls_v2.
+    // Step 2: update config to point at tls_v2, which fires ChangeKind::Config
+    // and causes the inner loop to break and re-arm watches for tls_v2.
     fs::write(
         &config_path,
         minimal_tls_config(cert_v2.to_str().unwrap(), key_v2.to_str().unwrap()),

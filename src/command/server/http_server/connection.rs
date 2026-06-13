@@ -76,7 +76,7 @@ pub async fn serve_request<S>(
         }
     }
 
-    // Phase 2: graceful shutdown — wait for the connection to drain, or for the
+    // Phase 2: graceful shutdown. Wait for the connection to drain, or for the
     // grace period to elapse and drop the connection.
     tokio::select! {
         res = conn.as_mut() => {

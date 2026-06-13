@@ -7,10 +7,11 @@ title: "Enable Durable Cache Jobs"
 # Enable Durable Cache Jobs
 
 Pull-through cache-fill tasks always go through the engine-backed job queue, and
-that queue is **persistent in both modes**: jobs are written to the configured
-object store under a hardcoded `_jobs/` prefix and survive a restart. What
-`[global.job_queue]` changes is *who drains the queue* and how it scales, not
-whether jobs are durable.
+that queue is **persistent in both modes**: jobs are written to the **same
+backend you configured for `[metadata_store]`** (filesystem or S3), under a
+hardcoded `_jobs/` prefix, and survive a restart. The code path is identical in
+both modes. What `[global.job_queue]` changes is *who drains the queue* and how
+those drainers coordinate and scale, not whether jobs are durable.
 
 By default (when `[global.job_queue]` is absent) the `angos server` process
 drains the queue itself, in-process: a client request enqueues a cache-fill job
@@ -20,10 +21,7 @@ no externally observable queue-depth gauge.
 
 Adding `[global.job_queue]` switches draining to one or more separate `angos
 worker` processes that you run alongside `angos server`, and turns on the
-queue-depth gauge for autoscaling. Durable jobs are stored in the **same backend
-you configured for `[metadata_store]`** (filesystem or S3), under the same
-`_jobs/` prefix. The code path is identical in both modes; only who drains the
-queue and how those drainers coordinate changes.
+queue-depth gauge for autoscaling.
 
 ## When should I use this?
 

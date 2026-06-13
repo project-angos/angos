@@ -28,7 +28,6 @@ return redis.call('SET', KEYS[1], ARGV[1], 'NX', 'EX', ARGV[2])
 ";
 
 // ARGV[1] = expected_value, ARGV[2] = ttl_secs, ARGV[3] = new_value
-// Returns 1 on success, 0 on mismatch / missing
 const REFRESH_SCRIPT: &str = r"
 local current = redis.call('GET', KEYS[1])
 if current == false or current ~= ARGV[1] then
@@ -39,7 +38,6 @@ return 1
 ";
 
 // ARGV[1] = expected_value
-// Returns 1 on deleted, 0 on mismatch / already absent
 const DELETE_IF_MATCH_SCRIPT: &str = r"
 local current = redis.call('GET', KEYS[1])
 if current == false then
@@ -134,7 +132,7 @@ impl LockStorage for RedisLockStorage {
     async fn put_if_absent(&self, key: &str, body: Vec<u8>) -> Result<PutIfAbsentOutcome, Error> {
         let full_key = self.full_key(key);
         // `body` is a JSON `LockBody`; we store its bytes verbatim as the Redis
-        // value. If decoding fails we substitute a sentinel string — the ETag
+        // value. If decoding fails we substitute a sentinel string. The ETag
         // comparison later will still work because we round-trip the same
         // bytes.
         let value = String::from_utf8(body).unwrap_or_else(|_| "unknown".to_string());

@@ -9,7 +9,7 @@ use angos_storage::Etag;
 /// A fingerprint used to detect concurrent modification of a key.
 ///
 /// Engine-internal type: a 32-byte SHA-256 content hash derived from the body
-/// the caller observed. Both executors use it the same way — the Locked
+/// the caller observed. Both executors use it the same way: the Locked
 /// executor re-reads and re-hashes under the lock; the CAS executor re-reads
 /// and re-hashes at Prepare time.
 pub type Fingerprint = [u8; 32];
@@ -26,8 +26,6 @@ pub struct Read {
     /// The expected fingerprint at commit time. Engine-internal; callers
     /// supply body bytes via [`TransactionBuilder::read`] and the fingerprint
     /// is derived automatically.
-    /// Expected fingerprint at commit time; derived from the body bytes passed
-    /// to [`TransactionBuilder::read`].
     pub fingerprint: Fingerprint,
 }
 
@@ -86,7 +84,7 @@ pub enum Mutation {
     /// Server-side move from `src` to `dst`: `copy(src, dst)` followed by
     /// `delete(src)`.
     ///
-    /// Both steps are individually idempotent under replay — a `delete` of a
+    /// Both steps are individually idempotent under replay: a `delete` of a
     /// missing `src` is treated as success, and `copy` is overwrite-anywhere.
     Move { src: String, dst: String },
 }
@@ -143,8 +141,8 @@ pub struct Transaction {
 ///
 /// This is the single authoritative "shape" for every lock-set derivation
 /// (reads ∪ mutation keys ∪ coarse lock keys). Each caller builds its own key
-/// iterator — the families differ ([`Transaction`]/[`Read`]/[`Mutation`] here,
-/// the `IntentRecord`/`ReadRecord`/`MutationRecord` family in recovery) — then
+/// iterator (the families differ: [`Transaction`]/[`Read`]/[`Mutation`] here,
+/// the `IntentRecord`/`ReadRecord`/`MutationRecord` family in recovery), then
 /// passes it here so the result stays byte-identical across call sites.
 #[must_use]
 pub fn lock_key_set(keys: impl Iterator<Item = String>) -> Vec<String> {
@@ -232,7 +230,6 @@ impl TransactionBuilder {
         self
     }
 
-    /// Add a mutation.
     #[must_use]
     pub fn mutation(mut self, m: Mutation) -> Self {
         self.mutations.push(m);

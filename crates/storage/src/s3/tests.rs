@@ -1,5 +1,5 @@
 //! Integration tests for the S3 backend. These talk to a live `MinIO`
-//! instance at `127.0.0.1:9000` — the same convention the rest of the angos
+//! instance at `127.0.0.1:9000`, the same convention the rest of the angos
 //! workspace uses for S3 integration tests. `MinIO` is expected to be
 //! running; tests fail loudly otherwise.
 
@@ -207,7 +207,7 @@ async fn delete_if_match_succeeds_with_current_etag() {
     assert_eq!(store.get(&key).await.unwrap_err(), Error::NotFound);
 }
 
-// ─── uploads ──────────────────────────────────────────────────────────────
+// uploads
 
 /// The staging container for an upload key: its final path segment replaced
 /// with `staged`. Mirrors the backend's internal derivation so tests can probe
@@ -455,7 +455,7 @@ async fn upload_resumes_from_recovered_state() {
         .await
         .unwrap();
 
-    // No handle is threaded — the next call recovers state from S3 by key.
+    // No handle is threaded; the next call recovers state from S3 by key.
     let tail = vec![0x66; 512 * 1024];
     let total = store
         .write_upload(&key, frame(tail.clone()), tail.len() as u64)

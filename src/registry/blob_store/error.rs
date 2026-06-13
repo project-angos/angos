@@ -117,7 +117,7 @@ impl From<oci::Error> for Error {
 impl From<StorageError> for Error {
     fn from(e: StorageError) -> Self {
         match e {
-            // Fallback mapping — correct only for reference/manifest paths.
+            // Fallback mapping, correct only for reference/manifest paths.
             // Blob and upload call sites must match this variant explicitly
             // before using `?`; see the doc comment on this impl for details.
             StorageError::NotFound => Error::ReferenceNotFound,
@@ -270,7 +270,7 @@ mod tests {
         // for Error`: `NotFound` converts to `ReferenceNotFound`, which is
         // intentionally conservative and correct only for reference/manifest
         // paths. Blob and upload call sites must intercept `StorageError::NotFound`
-        // explicitly before using `?` — see the doc comment on the impl for the
+        // explicitly before using `?`; see the doc comment on the impl for the
         // full trap description.
         assert_eq!(
             Error::from(StorageError::NotFound),

@@ -2,7 +2,7 @@
 //!
 //! A coarse lock key folds an extra key into the transaction's lock set even
 //! though it is neither read nor written. Two transactions that share a coarse
-//! lock key must serialise on it — under both the locked and the CAS executor.
+//! lock key must serialise on it, under both the locked and the CAS executor.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -42,7 +42,7 @@ fn tx_put_if_absent() -> Transaction {
         .build()
 }
 
-/// Two transactions sharing a coarse lock must serialise — while one holds the
+/// Two transactions sharing a coarse lock must serialise: while one holds the
 /// lock, the other's `try_acquire` on the same key must return `None`.
 async fn assert_coarse_lock_serialises<E>(executor: Arc<E>)
 where

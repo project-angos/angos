@@ -3,7 +3,7 @@
 //! [`BlobStoreConfig`] is the TOML-facing enum operators write under
 //! `[blob_store.fs]` or `[blob_store.s3]`. It selects which storage
 //! backend to instantiate, but the resulting [`BlobStore`] is the same
-//! unified type regardless — each arm only wires the capabilities its
+//! unified type regardless: each arm only wires the capabilities its
 //! backend supports (S3 presigns and runs CAS; FS needs no extra wiring) into
 //! the shared `Arc<Store>` façade the `BlobStore` wraps.
 
@@ -99,7 +99,7 @@ impl BlobStoreConfig {
     /// as a `PresignedStore` for download URLs.
     pub fn build_backend(&self) -> Result<BlobStore, Error> {
         // Each arm wires the capabilities its backend supports (S3 presigns and
-        // runs CAS; FS needs neither — it prunes its own empty ancestors on
+        // runs CAS; FS needs neither, it prunes its own empty ancestors on
         // delete); the façade build and BlobStore wrap are shared.
         let builder = match self {
             BlobStoreConfig::FS(config) => {

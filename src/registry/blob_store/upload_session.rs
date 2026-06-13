@@ -4,20 +4,20 @@
 //! transparent files under the per-upload container
 //! `v2/repositories/<namespace>/_uploads/<uuid>/`:
 //!
-//! - `startedat` — RFC3339 timestamp of the last activity, used by `scrub` for
+//! - `startedat`: RFC3339 timestamp of the last activity, used by `scrub` for
 //!   age-based orphan detection.
-//! - `hashstates/sha256/<offset>` — the serialised SHA-256 hasher state after
+//! - `hashstates/sha256/<offset>`: the serialised SHA-256 hasher state after
 //!   consuming the upload's bytes up to `<offset>`, so the hash computation can
 //!   resume after a crash without re-reading the uploaded bytes. The highest
 //!   checkpoint offset is also the authoritative record of how many bytes have
 //!   been consumed, so the upload's size is recovered from it on resume.
-//! - `data` — the assembled upload bytes (FS append target / S3 multipart key).
-//! - `staged/<offset>` — S3-only multipart sub-part remainder, one file per
+//! - `data`: the assembled upload bytes (FS append target / S3 multipart key).
+//! - `staged/<offset>`: S3-only multipart sub-part remainder, one file per
 //!   offset, superseded as the upload advances.
 //!
 //! Backend-specific upload mechanics (FS append, S3 multipart) are encapsulated
 //! inside the storage backend's keyed [`ObjectStore`] upload methods; this
-//! module never sees them. There is no persisted opaque session value — the S3 backend
+//! module never sees them. There is no persisted opaque session value; the S3 backend
 //! recovers its multipart state from S3 itself on each call, so the upload is
 //! addressed purely by its `data` key. Upload progress (size, hash) is the
 //! blob store's concern and is reconstructed by reading the per-file artifacts

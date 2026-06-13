@@ -3,7 +3,7 @@
 //! - [`BodyJanitor`] sweeps `.tx-bodies/<tx-id>/` prefixes whose intent never
 //!   landed in `.tx-log/`, bounded by an age threshold.
 //! - [`LockJanitor`] sweeps `.tx-locks/` for lock objects whose declared TTL has
-//!   elapsed by more than `orphan_age` — the cold-key counterpart to the lock
+//!   elapsed by more than `orphan_age`: the cold-key counterpart to the lock
 //!   primitive's acquire-path stale-lock recovery.
 
 use std::sync::Arc;
@@ -141,7 +141,7 @@ impl BodyJanitor {
     /// Examine one `.tx-bodies/<tx-id>/` prefix. Delete it if the tx-id
     /// corresponds to a v4 UUID that is old enough and has no live intent.
     async fn process_prefix(&self, sub_prefix: &str) {
-        // sub_prefix is like ".tx-bodies/<tx-id>/" — extract the UUID.
+        // sub_prefix is like ".tx-bodies/<tx-id>/"; extract the UUID.
         let tx_id_str = sub_prefix
             .trim_start_matches(".tx-bodies/")
             .trim_end_matches('/');
@@ -157,7 +157,7 @@ impl BodyJanitor {
         let intent_key = format!(".tx-log/{tx_id}.json");
         match self.store.head(&intent_key).await {
             Ok(_) => {
-                // Intent exists — not an orphan; the owner or recovery will reap.
+                // Intent exists, not an orphan; the owner or recovery will reap.
                 return;
             }
             Err(StorageError::NotFound) => {
@@ -186,7 +186,7 @@ impl BodyJanitor {
             }
         };
         let Some(suffix) = first_child_suffix else {
-            // No children — the prefix has nothing to delete; treat as
+            // No children: the prefix has nothing to delete; treat as
             // already-gone.
             return;
         };
@@ -202,7 +202,7 @@ impl BodyJanitor {
                     >= self.orphan_age
             }),
             Err(_) => {
-                // Can't determine age — skip to avoid deleting live data.
+                // Can't determine age; skip to avoid deleting live data.
                 false
             }
         };

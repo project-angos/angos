@@ -110,7 +110,7 @@ async fn test_has_blob_references_sees_legacy() {
 
     assert!(backend.has_blob_references(&digest).await.unwrap());
 
-    // Replace with an empty legacy index — `has_blob_references` must be false.
+    // Replace with an empty legacy index: `has_blob_references` must be false.
     let empty = BlobIndex::default();
     put_legacy_index(&backend, &digest, &empty).await;
     assert!(!backend.has_blob_references(&digest).await.unwrap());

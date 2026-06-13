@@ -120,8 +120,8 @@ impl ActionSink for Executor {
                 self.metadata_store.migrate_blob_index(&digest).await?;
             }
             Action::DeleteOrphanBlob(digest) => {
-                // Hold the `blob-data:{digest}` coarse lock — the same one
-                // manifest pushes and upload completions take — across the
+                // Hold the `blob-data:{digest}` coarse lock (the same one
+                // manifest pushes and upload completions take) across the
                 // reference check and the data delete, so a reference that a
                 // concurrent push is granting cannot be missed and have its
                 // bytes reclaimed underneath it.

@@ -1540,7 +1540,7 @@ async fn test_handle_get_manifest_redirect_fallback_without_media_type() {
 
         // When the redirect path fires, the media_type must still be present
         // (via fallback reading the blob body). When the blob backend does not
-        // support presigned URLs (FS backend), we get a Body response — both are
+        // support presigned URLs (FS backend), we get a Body response, both are
         // valid; in the Body case the media_type comes from the manifest JSON.
         match response {
             GetManifestResponse::Redirect { headers } => {
@@ -1643,7 +1643,7 @@ fn manifest_meta_from_body_errors_on_malformed_json() {
     assert!(result.is_err());
 }
 
-// ── Manifest write/delete path tests ──────────────────────────────────────────
+// Manifest write/delete path tests
 
 #[tokio::test]
 async fn store_manifest_writes_blob_and_links() {

@@ -40,7 +40,7 @@
 //! `.../<uuid>/staged/<offset>`), matching the historical layout.
 //!
 //! Bodies are streamed end-to-end via an mpsc channel handed to
-//! `upload_part_streaming` — no part ever sits whole in process memory.
+//! `upload_part_streaming`: no part ever sits whole in process memory.
 
 use std::{collections::HashSet, io, sync::Arc, time::Duration};
 
@@ -88,7 +88,7 @@ impl Builder {
     }
 
     /// Target part size for upload sessions (uniform mode) or minimum part
-    /// size before flushing (non-uniform mode). Defaults to 5 MiB — the
+    /// size before flushing (non-uniform mode). Defaults to 5 MiB, the
     /// S3 minimum.
     #[must_use]
     pub fn part_size(mut self, size: u64) -> Self {
@@ -137,7 +137,7 @@ impl Backend {
 
     /// Recover an upload's in-flight state from S3: the open multipart upload id
     /// (if any) and the list of committed parts. State is read fresh on every
-    /// call — nothing is persisted by the caller.
+    /// call; nothing is persisted by the caller.
     async fn recover_upload(&self, key: &str) -> Result<RecoveredUpload, Error> {
         let upload_id = self.search_upload_id(key).await?;
         let parts = match &upload_id {
@@ -222,7 +222,7 @@ impl ObjectStore for Backend {
         // Normalise to a directory boundary (see `dir_prefix`) so the underlying
         // raw list-prefix delete cannot wipe keys that merely share a string
         // prefix (e.g. "tags/v1" must not delete "tags/v1-rc/..."). An empty
-        // prefix is a no-op — it must not delete every object under the bucket.
+        // prefix is a no-op: it must not delete every object under the bucket.
         let effective_prefix = dir_prefix(prefix);
         if effective_prefix.is_empty() {
             return Ok(());
@@ -273,7 +273,7 @@ impl ObjectStore for Backend {
 
     async fn create_upload(&self, key: &str) -> Result<(), Error> {
         // Clear any leaked prior in-progress upload at this key so a re-`create`
-        // at a reused key starts clean. Lazy otherwise — no multipart opened.
+        // at a reused key starts clean. Lazy otherwise: no multipart opened.
         self.abort_upload(key).await
     }
 
@@ -324,7 +324,7 @@ impl ObjectStore for Backend {
 
         for _ in 0..parts_to_emit {
             let part_number = next_part_number(&parts)?;
-            // Open the multipart lazily — only when a part actually needs
+            // Open the multipart lazily, only when a part actually needs
             // flushing.
             let id = ensure_upload_id(&self.client, &mut upload_id, key).await?;
             let etag =
@@ -386,7 +386,7 @@ impl ObjectStore for Backend {
                 self.client.put_object(key, Bytes::new()).await?;
             }
             (None, _) => {
-                // Small upload — promote the staged remainder to the canonical
+                // Small upload: promote the staged remainder to the canonical
                 // key and clean up.
                 self.client.copy_object(&read_key, key).await?;
                 let _ = self.client.delete(&read_key).await;

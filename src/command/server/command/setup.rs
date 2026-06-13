@@ -61,7 +61,7 @@ pub async fn build_metadata_store(
 /// Build the runtime `Registry`. When `[global.job_queue]` selects a durable
 /// backend the second element carries the `JobStore` and the configured
 /// pending-gauge refresh interval; the server spawns its own ticker from it.
-/// The server never drains the queue itself — that is `angos worker`'s job.
+/// The server never drains the queue itself: that is `angos worker`'s job.
 ///
 /// When `engine_maintenance` is `Some`, the transactional-engine recovery loop
 /// and body janitor are spawned tied to that token. Pass `None` on

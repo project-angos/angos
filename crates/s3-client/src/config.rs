@@ -6,7 +6,7 @@ use serde::Deserialize;
 /// `access_key_id` and `secret_key` are plain `String`s here. Application
 /// layers that want debug-redaction or zeroize-on-drop semantics should keep
 /// their own secret-wrapper type and call `.expose()` (or equivalent) when
-/// building this config — this crate is a transport, not a security layer.
+/// building this config. This crate is a transport, not a security layer.
 #[derive(Clone, Debug, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct BackendConfig {

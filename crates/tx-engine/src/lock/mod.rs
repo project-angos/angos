@@ -3,7 +3,7 @@
 //! The single concrete type is [`Lock`]. Callers never see a RAII guard:
 //! they call [`Lock::acquire`] (blocking retry) or [`Lock::try_acquire`]
 //! (non-blocking, single attempt) with the keys to lock, run their work, then
-//! await [`LockSession::release`] — always on the calling task's own call
+//! await [`LockSession::release`], always on the calling task's own call
 //! path. A background heartbeat task refreshes the lock TTL and fires the
 //! session's [`CancellationToken`] when ownership is lost, so a caller racing
 //! its operation against [`LockSession::cancellation`] can short-circuit to
@@ -160,7 +160,7 @@ impl Drop for LockSession {
     }
 }
 
-// ─── Lock strategy config ─────────────────────────────────────────────────────
+// Lock strategy config
 
 /// Parsed configuration for the S3-backed lock storage.
 ///
@@ -318,7 +318,7 @@ pub fn resolve_lock_strategy<E: serde::de::Error>(
 ///
 /// The standard library does **not** guarantee that `RandomState` is seeded
 /// from a high-quality entropy source, nor that successive `RandomState`
-/// instances yield independent or uniformly-distributed seeds — the seeding
+/// instances yield independent or uniformly-distributed seeds: the seeding
 /// strategy is an unspecified implementation detail that may change between
 /// releases and platforms. This is therefore **not** a cryptographic RNG and
 /// must not be relied upon for anything beyond best-effort retry-loop jitter,

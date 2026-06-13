@@ -3,7 +3,7 @@
 //! Maps the storage trait surface onto a directory tree rooted at `root_dir`:
 //! every object key becomes a relative path under the root. Writes are atomic
 //! (temp-file + rename) and `delete_prefix` walks the subtree, then prunes any
-//! ancestor directories it leaves empty — an FS-only concern (S3 has no
+//! ancestor directories it leaves empty, an FS-only concern (S3 has no
 //! directories) that stays internal to this backend. Listings sort
 //! lexicographically because `read_dir` returns entries in arbitrary order.
 //!
@@ -11,7 +11,7 @@
 //! FS conditional updates are handled one layer up via the metadata store's
 //! lock backend.
 //!
-//! Uploads use an append-mode file at the upload `key` — no staging artifacts,
+//! Uploads use an append-mode file at the upload `key`: no staging artifacts,
 //! no multipart protocol, no caller-held session. `complete_upload` is a no-op
 //! because the data is already at `key`; the caller's transactional move to the
 //! canonical location is the only finalisation step.
@@ -136,7 +136,7 @@ impl Backend {
 
     /// Best-effort cleanup of empty ancestor directories after a leaf
     /// deletion. Walks parents upward until it reaches the first non-empty
-    /// parent or `root_dir` (exclusive) — the store root is the only ceiling.
+    /// parent or `root_dir` (exclusive). The store root is the only ceiling.
     /// Errors are suppressed.
     ///
     /// Private: empty-directory pruning is an FS implementation detail with no
@@ -146,7 +146,7 @@ impl Backend {
     async fn prune_empty_ancestors(&self, key: &str) {
         // Lexically resolve `.`/`..` BEFORE touching the filesystem. `full_path`
         // does a bare `root.join(key)`, and `Path::starts_with` is purely
-        // lexical — it does not collapse `..`. Without normalization a key like
+        // lexical: it does not collapse `..`. Without normalization a key like
         // `a/../../x` yields ancestor paths that still contain `..`, slip past a
         // `starts_with(root)` guard, and resolve at syscall time to a directory
         // *above* the configured root, where `remove_dir` could delete it.
@@ -219,7 +219,7 @@ impl Backend {
 /// Resolve `.` and `..` components purely lexically, with no I/O.
 ///
 /// Unlike [`Path::canonicalize`] this performs no syscalls, follows no
-/// symlinks, and does not require the path to exist — it is a pure string-level
+/// symlinks, and does not require the path to exist: it is a pure string-level
 /// collapse used to make ancestor pruning escape-proof. `Prefix`/`RootDir`
 /// components are preserved, `.` is dropped, `..` pops the last `Normal`
 /// component (but never the leading prefix/root), and `Normal` components are
@@ -521,7 +521,7 @@ impl ObjectStore for Backend {
         let src = self.full_path(source);
         let dst = self.full_path(destination);
         ensure_parent(&dst).await?;
-        // Same-filesystem rename is atomic and O(1) in memory — the staging
+        // Same-filesystem rename is atomic and O(1) in memory: the staging
         // upload and its canonical blob-data location live under the same root,
         // so this is the common path and avoids copying the bytes at all.
         if fs::rename(&src, &dst).await.is_ok() {

@@ -1,4 +1,4 @@
-//! [`JobStore`] — unified job-queue storage, producer, and consumer backed by
+//! [`JobStore`]: unified job-queue storage, producer, and consumer backed by
 //! a storage façade (`Store`) carrying the object store and transaction
 //! executor.
 //!
@@ -183,7 +183,7 @@ pub const STORAGE_KEY_PREFIX_LEN: usize = 16;
 /// envelopes first and the claim loop can stop scanning as soon as it sees a
 /// prefix in the future.
 ///
-/// Negative timestamps (pre-1970) clamp to 0 — the queue is not meaningful
+/// Negative timestamps (pre-1970) clamp to 0; the queue is not meaningful
 /// before unix epoch.
 pub fn make_storage_key(not_before: DateTime<Utc>, id: &str) -> String {
     let millis = u64::try_from(not_before.timestamp_millis()).unwrap_or(0);
@@ -299,7 +299,7 @@ pub fn serialize_dead_letter(envelope: &JobEnvelope, last_error: &str) -> Result
 ///
 /// `JobStore::complete` commits the work-product mutations and the
 /// pending/index deletes in a single engine transaction, so handlers whose
-/// effect is expressible as engine mutations need not be idempotent — each
+/// effect is expressible as engine mutations need not be idempotent: each
 /// attempt either commits atomically or aborts cleanly.
 ///
 /// Handlers with *external*, non-transactional side-effects (e.g. calls to
@@ -320,11 +320,11 @@ pub trait JobHandler: Send + Sync {
 pub const MAX_SCAN: u16 = 1000;
 
 /// Maximum value reported by [`JobStore::count_pending`]. The gauge feeds KEDA
-/// autoscaling, which only needs ordinal granularity at high queue depths —
-/// once the queue exceeds 10× the worker pool size you're at max scale anyway.
+/// autoscaling, which only needs ordinal granularity at high queue depths:
+/// once the queue exceeds 10x the worker pool size you're at max scale anyway.
 /// Capping here bounds S3 `LIST` cost per refresh tick to ~10 paginated calls
 /// regardless of how deep the queue actually is. Operators reading the gauge
-/// should treat the cap value as "≥ this many".
+/// should treat the cap value as "at least this many".
 pub const MAX_REPORTED_PENDING: u64 = 10_000;
 
 // ---------------------------------------------------------------------------
@@ -419,7 +419,7 @@ fn tx_error_to_job(err: TxError) -> Error {
 }
 
 // ---------------------------------------------------------------------------
-// JobStore — unified producer + consumer + storage
+// JobStore: unified producer + consumer + storage
 // ---------------------------------------------------------------------------
 
 /// Unified job-queue store: producer (`enqueue`), consumer
@@ -630,8 +630,8 @@ impl JobStore {
                 // Orphan: pending file vanished but the index lingers. Submit a
                 // one-mutation engine transaction whose Read fingerprint validates
                 // the index hasn't been refreshed by a concurrent enqueue between
-                // our GET and the apply. If it has, the engine returns Conflict —
-                // we don't delete the fresh index. Passing the index's own
+                // our GET and the apply. If it has, the engine returns Conflict
+                // and we don't delete the fresh index. Passing the index's own
                 // `storage_key` as the target makes the conditional delete fire
                 // for this orphan while reusing the shared fingerprint guard.
                 let (read, delete) = Self::conditional_index_delete(
@@ -748,7 +748,7 @@ impl JobStore {
     }
 
     // -----------------------------------------------------------------------
-    // Producer — enqueue
+    // Producer: enqueue
     // -----------------------------------------------------------------------
 
     /// Enqueue a job.
@@ -761,7 +761,7 @@ impl JobStore {
     /// only one wins at the engine's Prepare/Apply stage; the loser receives
     /// `Conflict` or `Precondition` and we treat that as a dedup hit.
     pub async fn enqueue(&self, envelope: JobEnvelope) -> Result<(), Error> {
-        // Fast path: index present and pending exists → hit, no writes needed.
+        // Fast path: index present and pending exists, a hit, no writes needed.
         if self
             .find_pending_with_lock_key(&envelope.queue, &envelope.lock_key)
             .await
@@ -800,7 +800,7 @@ impl JobStore {
             .build();
 
         // A `Conflict` or `Precondition` here means another replica won the
-        // race — treat as a dedup hit, not an error.
+        // race: treat as a dedup hit, not an error.
         match self.store.execute(tx).await {
             Ok(_) => {
                 metrics_provider()
@@ -821,13 +821,13 @@ impl JobStore {
     }
 
     // -----------------------------------------------------------------------
-    // Consumer — claim / complete / fail
+    // Consumer: claim / complete / fail
     // -----------------------------------------------------------------------
 
     /// Claim the next available job from `queue`. Walks pending storage keys
     /// in ascending order (`list_pending` returns them sorted by the hex
     /// unix-millis prefix, i.e. by `not_before`). Stops at the first key whose
-    /// prefix is in the future without reading its body — the prefix is the
+    /// prefix is in the future without reading its body: the prefix is the
     /// authoritative readiness signal. When no claim is made, `next_ready`
     /// carries that first future instant so the caller can sleep until then.
     ///
@@ -914,7 +914,7 @@ impl JobStore {
         // index. The conditional read is a belt-and-braces guard that costs
         // one HEAD; if the index points elsewhere we leave it alone. A corrupt
         // index cannot be matched or fingerprinted, so we delete it
-        // unconditionally — safe because we are the unique writer here.
+        // unconditionally: safe because we are the unique writer here.
         match self.get_raw(&index_path).await {
             Ok(body) => match parse_lock_key_index(&body) {
                 Ok(index) => {
@@ -961,7 +961,7 @@ impl JobStore {
                 // The work commit + queue cleanup did not land (e.g. a transient
                 // backend error, or a mutation referencing storage the executor
                 // cannot resolve). Treat it as a failed attempt and fail the job
-                // over — backoff then dead-letter — instead of leaving it to be
+                // over (backoff then dead-letter) instead of leaving it to be
                 // re-claimed immediately, forever. We still hold the lock.
                 let err = tx_error_to_job(e);
                 let claimed = ClaimedJob {
@@ -1127,13 +1127,13 @@ impl JobStore {
     ///
     /// The dedup index is deliberately **not** re-established: a retried job has
     /// no `lock_key` index entry, so a concurrent producer enqueuing the same
-    /// `lock_key` may create a second pending file. That is safe — the
+    /// `lock_key` may create a second pending file. That is safe: the
     /// per-`lock_key` execution lock still serialises the two, and the handler
     /// contract makes a redundant run idempotent.
     pub async fn retry_failed(&self, queue: &str, storage_key: &str) -> Result<(), Error> {
         let failed_path = path_builder::job_failed_path(queue, storage_key);
         // HEAD first for the fencing ETag (`None` when the backend does not
-        // surface ETags → an unconditional delete, still safe: the new pending
+        // surface ETags, giving an unconditional delete, still safe: the new pending
         // key is fresh so a double-retry collides at `PutIfAbsent`).
         let expected = self.store.head(&failed_path).await?.etag;
 

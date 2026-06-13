@@ -301,14 +301,14 @@ key_prefix = "registry-locks"
 
 ### Shared Filesystem (Not Recommended)
 
-**Not recommended for production.** Shared filesystems (NFS, EFS) introduce operational complexity that defeats Angos's stateless design:
+Shared filesystems (NFS, EFS) defeat Angos's stateless design and are not recommended for production:
 
-- **Lock handling**: Distributed locking on shared filesystems is complex and error-prone
+- **Lock handling**: Distributed locking on shared filesystems is error-prone
 - **Performance tuning**: NFS requires careful tuning of cache coherency and lock protocols
-- **Recovery**: Handling stale locks and crashed instances is difficult without explicit consensus mechanisms
+- **Recovery**: Stale locks and crashed instances are hard to handle without explicit consensus mechanisms
 - **Scaling issues**: Lock contention worsens as replicas increase
 
-**For multi-replica deployments, use S3 instead.** S3 provides distributed locking natively (via conditional writes) with no additional infrastructure, better operational clarity, and superior scalability.
+For multi-replica deployments, use S3 instead: it provides distributed locking natively via conditional writes, with no additional infrastructure.
 
 Lock is held during:
 - Manifest writes (tag updates)
@@ -648,7 +648,7 @@ Without Redis, cache is in-memory per-instance.
 
 ## Transactional Engine
 
-The transactional engine is a single design (an abstraction that consolidates multi-step storage writes behind single atomic `Transaction` objects) that each subsystem instantiates over its own store with its own lock domain; it is always active. Blob-bytes operations that span the blob store serialize via a `blob-data:{digest}` coarse lock taken on the metadata engine, the single lock domain shared by every blob-data participant. The four subsystems it covers are:
+The transactional engine consolidates multi-step storage writes behind single atomic `Transaction` objects. Each subsystem instantiates it over its own store with its own lock domain, and it is always active. Blob-bytes operations that span the blob store serialize via a `blob-data:{digest}` coarse lock taken on the metadata engine, the single lock domain shared by every blob-data participant. The four subsystems it covers are:
 
 | Subsystem | Description |
 |---|---|
@@ -659,4 +659,4 @@ The transactional engine is a single design (an abstraction that consolidates mu
 
 The CAS-vs-Lock executor choice happens once inside the engine factory based on the configured `lock_strategy` and detected S3 capabilities; subsystems never see it. The on-disk key layout is unchanged from a non-transactional deployment.
 
-The engine keeps three reserved prefixes: `.tx-log/` holds the transaction journal, `.tx-bodies/` holds staged object bodies, and `.tx-locks/` holds lock objects. Recovery runs automatically and needs no operator configuration. Every server and worker replica runs a recovery loop that completes or rolls back any transaction interrupted by a crash. A body janitor reaps orphaned staged bodies under `.tx-bodies/` once they exceed a TTL, and a lock janitor reclaims cold lock objects under `.tx-locks/` once they exceed their TTL plus a grace period. The recovery loop sweeps every 30 seconds; the body and lock janitors sweep every five minutes.
+The engine keeps three reserved prefixes: `.tx-log/` holds the transaction journal, `.tx-bodies/` holds staged object bodies, and `.tx-locks/` holds lock objects. Recovery runs automatically and needs no operator configuration. Every server and worker replica runs a recovery loop that completes or rolls back any transaction interrupted by a crash, sweeping every 30 seconds. A body janitor reaps orphaned staged bodies under `.tx-bodies/` once they exceed a TTL, and a lock janitor reclaims cold lock objects under `.tx-locks/` once they exceed their TTL plus a grace period; both janitors sweep every five minutes.

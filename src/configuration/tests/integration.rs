@@ -62,7 +62,7 @@ fn test_storage_field_backward_compatibility() {
     });
     assert_eq!(config.blob_store, expected);
 
-    // No explicit metadata_store section — field must be Inherit
+    // No explicit metadata_store section: field must be Inherit
     assert_eq!(config.registry_storage, RegistryStorageConfig::Inherit);
 }
 

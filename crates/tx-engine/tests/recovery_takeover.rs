@@ -3,14 +3,14 @@
 //! Covers the recovery-takeover and conditional-replay correctness invariants:
 //!
 //! 1. Two concurrent recovery loops sharing the same lock primitive must
-//!    serialise their apply on a stale intent — at most one of them gets to
+//!    serialise their apply on a stale intent: at most one of them gets to
 //!    re-apply each mutation.
 //! 2. Mutations whose `progress` slot is already `Applied` are skipped on
 //!    replay (recovery never overwrites a committed write).
 //! 3. On a CAS deployment, a `Put { expected: Some(etag) }` whose etag has
 //!    moved but whose body matches the staged body is treated as
 //!    already-applied (stale stamp recovery).
-//! 4. On a CAS deployment, true contention (live body ≠ staged body) stops
+//! 4. On a CAS deployment, true contention (live body != staged body) stops
 //!    the replay and leaves the intent for the next sweep.
 //!
 //! Executor-path tests (new with the mid-apply Precondition fix):
@@ -18,7 +18,7 @@
 //! 5. When mutation[0] lands and is stamped, then mutation[1] returns
 //!    `PreconditionFailed` but the live body matches the staged body (stale
 //!    stamp from the healthy path), the executor stamps mutation[1] and
-//!    continues forward — the transaction fully commits and the intent is reaped.
+//!    continues forward: the transaction fully commits and the intent is reaped.
 //! 6. When mutation[0] lands and is stamped, then mutation[1] returns
 //!    `PreconditionFailed` with a live body that does NOT match (true
 //!    contention), the executor returns `Error::PartialCommit` and preserves
@@ -514,8 +514,8 @@ async fn cas_executor_stale_stamp_mid_apply_continues_and_commits() {
     let store = Arc::new(MemoryObjectStore::new());
     let lock = common::memory_lock();
 
-    // mutation[0]: unconditional Put — will succeed normally.
-    // mutation[1]: conditional Put with a stale etag — will return
+    // mutation[0]: unconditional Put, will succeed normally.
+    // mutation[1]: conditional Put with a stale etag, will return
     //   PreconditionFailed, but the live body matches the staged body.
     let first_body = Bytes::from_static(b"first-body");
     let second_body = Bytes::from_static(b"second-body");
@@ -575,7 +575,7 @@ async fn cas_executor_true_contention_mid_apply_leaves_intent() {
     let lock = common::memory_lock();
 
     // Pre-land mutation[1]'s destination with a *different* body from what
-    // the transaction will stage — this is true contention.
+    // the transaction will stage. This is true contention.
     store
         .put_if_absent("exec/contend", Bytes::from_static(b"someone-elses-body"))
         .await
@@ -610,7 +610,7 @@ async fn cas_executor_true_contention_mid_apply_leaves_intent() {
     let body = store.get("exec/contend").await.expect("contend present");
     assert_eq!(body, b"someone-elses-body");
 
-    // Intent must NOT have been reaped — recovery must be able to converge it.
+    // Intent must NOT have been reaped: recovery must be able to converge it.
     let logs = store.list(".tx-log/", 10, None).await.unwrap().items;
     assert_eq!(
         logs.len(),
@@ -667,7 +667,7 @@ impl ObjectStore for GatedStore {
         if key == self.target_key {
             // Signal we have reached the gated write, then block until released.
             // Count the write only after the gate opens so a count of 1 proves
-            // the owner — and only the owner — applied the mutation.
+            // the owner, and only the owner, applied the mutation.
             self.reached.notify_one();
             self.gate.notified().await;
             self.target_puts.fetch_add(1, Ordering::AcqRel);
@@ -736,7 +736,7 @@ impl ObjectStore for GatedStore {
 /// Live owner vs recovery sweep: while a `LockedExecutor::execute()` is blocked
 /// mid-Apply and still holds the working-set lock, a `RecoveryLoop::sweep()`
 /// over the same store and the same `Arc<Lock>` must NOT take over the (already
-/// stale) intent — its `try_acquire(intent_lock_set)` loses to the in-flight
+/// stale) intent: its `try_acquire(intent_lock_set)` loses to the in-flight
 /// owner. The mutation applies exactly once and recovery leaves no orphans.
 ///
 /// This exercises the "race-free against the original owner" guarantee with a
@@ -747,13 +747,13 @@ async fn live_owner_blocks_recovery_takeover_apply_exactly_once() {
     let inner = Arc::new(MemoryObjectStore::new());
     let gated = Arc::new(GatedStore::new(inner.clone(), "live/dst"));
     // One shared lock primitive so the owner and recovery contend on the same
-    // working-set lock — exactly the production wiring on a single replica's
+    // working-set lock: exactly the production wiring on a single replica's
     // store, and equivalent to the cross-replica lock-object race.
     let lock = common::memory_lock();
 
     // Executor intent TTL of 0 makes the in-flight intent immediately stale, so
     // the recovery sweep reaches its `try_acquire(lock_set)` while the owner is
-    // still holding the lock — the precise window under test.
+    // still holding the lock: the precise window under test.
     let executor = Arc::new(
         angos_tx_engine::executor::locked::LockedExecutor::builder(
             gated.clone() as Arc<dyn ObjectStore>,
@@ -837,7 +837,7 @@ async fn live_owner_blocks_recovery_takeover_apply_exactly_once() {
 }
 
 /// Lock storage that hands out a fresh `ETag` on acquire but then reports a
-/// `Mismatch` on every heartbeat `put_if_match` — i.e. it simulates a peer
+/// `Mismatch` on every heartbeat `put_if_match`, i.e. it simulates a peer
 /// having taken over the lock object. The first heartbeat tick therefore fires
 /// the session's cancellation token with `ownership_lost`.
 #[derive(Debug)]
@@ -876,7 +876,7 @@ impl LockStorage for OwnershipLostLockStorage {
         _expected_etag: &str,
         _body: Vec<u8>,
     ) -> Result<PutIfMatchOutcome, LockError> {
-        // Every heartbeat refresh observes a changed ETag → ownership lost.
+        // Every heartbeat refresh observes a changed ETag, so ownership is lost.
         Ok(PutIfMatchOutcome::Mismatch)
     }
 
@@ -908,7 +908,7 @@ impl LockStorage for OwnershipLostLockStorage {
 /// executor is parked mid-Apply on the gated first write, the heartbeat fires
 /// the session's cancellation token (`ownership_lost`). The select in `execute`
 /// must abort Apply with `Error::Conflict` (retryable) and must NOT let the
-/// remaining gated mutation land — otherwise the original owner could keep
+/// remaining gated mutation land, otherwise the original owner could keep
 /// writing while a takeover replica also writes (split-brain).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn locked_executor_aborts_apply_on_lock_loss_conflict() {
@@ -918,7 +918,7 @@ async fn locked_executor_aborts_apply_on_lock_loss_conflict() {
     // while the heartbeat fires ownership_lost.
     let gated = Arc::new(GatedStore::new(inner.clone(), "gate/blocked"));
 
-    // ttl_secs = 9 ⇒ heartbeat tick at ~3s. The first tick observes a Mismatch
+    // ttl_secs = 9 means a heartbeat tick at ~3s. The first tick observes a Mismatch
     // (ownership lost) and cancels the session while we are parked at the gate.
     let lock = Arc::new(
         Lock::builder(Arc::new(OwnershipLostLockStorage::new()))
