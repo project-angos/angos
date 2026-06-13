@@ -401,51 +401,66 @@ impl MetadataStore {
                     }
                 }
 
-                // ── Step 3.5: last-writer-wins guard for replicated tag writes ──
-                // `extras.created_at` is only set for a replication-originated
-                // write. The raw link bytes join the transaction read set, so a
-                // concurrent same-tag commit aborts this attempt at prepare and
-                // the guard re-runs against the winner's state; the pre-write
-                // gate in `accept_put_manifest` alone is check-then-write and
-                // cannot stop a racing older write from regressing the tag.
+                // ── Step 3.5: commit-validate tag-create reads ──────────────────
+                // A tag create joins its current bytes to the transaction read
+                // set so the link Put commits only against that state: a racing
+                // same-tag write aborts this attempt at prepare and the retry
+                // re-reads. This is needed when there is a last-writer-wins
+                // comparison (a replicated write, `extras.created_at` set) and
+                // for a no-op re-push (`old_target == target`), whose dispatch is
+                // suppressed on `changed == false` — so its `old_target` must be
+                // the prior the commit validated, not a stale pre-lock read a
+                // racing different-digest write could outrun. A binding-changing
+                // genuine write always reports `changed`, so it skips this.
                 let mut lww_reads: Vec<(String, Bytes)> = Vec::new();
-                if let Some(source_ts) = extras.created_at {
-                    for (create_data, _) in &prelock_results {
-                        let Some((link, target, ..)) = create_data else {
-                            continue;
-                        };
-                        if !matches!(link, LinkKind::Tag(_)) {
-                            continue;
-                        }
-                        let link_path = path_builder::link_path(link, namespace);
-                        match self.store().get(&link_path).await {
-                            Ok(bytes) => {
-                                let metadata =
-                                    LinkMetadata::from_bytes(bytes.clone()).map_err(|e| {
-                                        TxError::Storage(StorageError::Backend(e.to_string()))
-                                    })?;
-                                if let Some(created_at) =
-                                    metadata.supersedes(source_ts, Some(target))
-                                {
-                                    return Ok((
-                                        Transaction::builder().build(),
-                                        LinksTxCaptured {
-                                            superseded: Some(format!(
-                                                "local {link} (created {created_at}) is newer \
-                                                 than the replicated source ({source_ts})"
-                                            )),
-                                            ..LinksTxCaptured::default()
-                                        },
-                                    ));
-                                }
-                                lww_reads.push((link_path, Bytes::from(bytes)));
-                            }
-                            Err(StorageError::NotFound) => {
-                                lww_reads.push((link_path, Bytes::new()));
-                            }
-                            Err(e) => return Err(TxError::Storage(e)),
-                        }
+                for (create_data, _) in &prelock_results {
+                    let Some((link, target, old_target, ..)) = create_data else {
+                        continue;
+                    };
+                    if !matches!(link, LinkKind::Tag(_)) {
+                        continue;
                     }
+                    let same_target = old_target.as_ref() == Some(*target);
+                    if extras.created_at.is_none() && !same_target {
+                        continue;
+                    }
+
+                    let link_path = path_builder::link_path(link, namespace);
+                    let bytes = match self.store().get(&link_path).await {
+                        Ok(bytes) => Some(bytes),
+                        Err(StorageError::NotFound) => None,
+                        Err(e) => return Err(TxError::Storage(e)),
+                    };
+                    let metadata = bytes
+                        .as_ref()
+                        .map(|b| LinkMetadata::from_bytes(b.clone()))
+                        .transpose()
+                        .map_err(|e| TxError::Storage(StorageError::Backend(e.to_string())))?;
+
+                    // `old_target` drives the committed `changed`/dispatch
+                    // decision, so abort if a racing write moved the tag since the
+                    // pre-lock read and let the retry re-read the real prior.
+                    if metadata.as_ref().map(|m| &m.target) != old_target.as_ref() {
+                        return Err(TxError::Conflict);
+                    }
+
+                    // A replicated write also gates last-writer-wins on this read.
+                    if let (Some(source_ts), Some(metadata)) = (extras.created_at, metadata.as_ref())
+                        && let Some(created_at) = metadata.supersedes(source_ts, Some(target))
+                    {
+                        return Ok((
+                            Transaction::builder().build(),
+                            LinksTxCaptured {
+                                superseded: Some(format!(
+                                    "local {link} (created {created_at}) is newer \
+                                     than the replicated source ({source_ts})"
+                                )),
+                                ..LinksTxCaptured::default()
+                            },
+                        ));
+                    }
+
+                    lww_reads.push((link_path, bytes.map_or_else(Bytes::new, Bytes::from)));
                 }
 
                 // Same guard for a replicated delete: each deleted tag link's
