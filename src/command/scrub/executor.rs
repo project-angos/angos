@@ -381,6 +381,8 @@ mod tests {
 
     use chrono::DateTime;
 
+    use angos_storage::MemoryObjectStore;
+
     use super::*;
     use crate::{
         oci::Digest,
@@ -388,10 +390,21 @@ mod tests {
             cache_job_handler::{CACHE_FETCH_BLOB_KIND, CACHE_QUEUE, CacheFetchBlobPayload},
             job_store::{FailOutcome, JobState},
             metadata_store::{LinkOperation, link_kind::LinkKind},
-            test_utils::{backends, put_blob_direct},
+            test_utils::{backends, build_store, locked_executor_over, put_blob_direct},
         },
         replication::{REPLICATION_DELETE_MANIFEST_KIND, REPLICATION_QUEUE},
     };
+
+    /// A producer `JobStore` over a private store no worker drains. Tests that
+    /// assert queue depth must not share the registry store, whose in-process
+    /// claim loops would otherwise claim the job and race the assertion.
+    fn standalone_job_store(worker_id: &str) -> Arc<JobStore> {
+        let raw = Arc::new(MemoryObjectStore::new());
+        Arc::new(JobStore::new(
+            build_store(raw.clone(), locked_executor_over(raw)),
+            worker_id,
+        ))
+    }
 
     #[tokio::test]
     async fn executor_dry_run_does_not_delete_blob() {
@@ -723,7 +736,7 @@ mod tests {
             let blob_store = test_case.blob_store();
             let metadata_store = test_case.metadata_store();
 
-            let job_store = Arc::new(JobStore::new(metadata_store.store_arc(), "scrub-source-ts"));
+            let job_store = standalone_job_store("scrub-source-ts");
 
             let mut executor = Executor::builder()
                 .blob_store(blob_store)
@@ -772,10 +785,7 @@ mod tests {
             let blob_store = test_case.blob_store();
             let metadata_store = test_case.metadata_store();
 
-            let job_store = Arc::new(JobStore::new(
-                metadata_store.store_arc(),
-                "scrub-prune-coalesce",
-            ));
+            let job_store = standalone_job_store("scrub-prune-coalesce");
 
             let mut executor = Executor::builder()
                 .blob_store(blob_store)
@@ -843,7 +853,7 @@ mod tests {
         for test_case in backends() {
             let blob_store = test_case.blob_store();
             let metadata_store = test_case.metadata_store();
-            let job_store = Arc::new(JobStore::new(metadata_store.store_arc(), "scrub-orphan"));
+            let job_store = standalone_job_store("scrub-orphan");
 
             let mut executor = Executor::builder()
                 .blob_store(blob_store)
@@ -884,7 +894,7 @@ mod tests {
         for test_case in backends() {
             let blob_store = test_case.blob_store();
             let metadata_store = test_case.metadata_store();
-            let job_store = Arc::new(JobStore::new(metadata_store.store_arc(), "scrub-orphan"));
+            let job_store = standalone_job_store("scrub-orphan");
 
             let mut executor = Executor::builder()
                 .blob_store(blob_store)
@@ -937,7 +947,7 @@ mod tests {
         for test_case in backends() {
             let blob_store = test_case.blob_store();
             let metadata_store = test_case.metadata_store();
-            let job_store = Arc::new(JobStore::new(metadata_store.store_arc(), "scrub-orphan"));
+            let job_store = standalone_job_store("scrub-orphan");
 
             let mut executor = Executor::builder()
                 .blob_store(blob_store)
