@@ -354,11 +354,17 @@ async fn upload_into_session(
     digest: &Digest,
     session_url: &str,
 ) -> Result<(), Error> {
-    let (reader, content_length) = blob_store.reader(digest, None).await.map_err(|e| {
-        Error::Registry(RegistryError::Internal(format!(
-            "failed to open local blob '{digest}': {e}"
-        )))
-    })?;
+    let (reader, content_length) = match blob_store.reader(digest, None).await {
+        Ok(reader) => reader,
+        Err(e) => {
+            // The session is already open; cancel it, like the patch/complete
+            // failure paths, so a dying push does not strand it on the downstream.
+            cancel_upload_session(downstream, session_url).await;
+            return Err(Error::Registry(RegistryError::Internal(format!(
+                "failed to open local blob '{digest}': {e}"
+            ))));
+        }
+    };
     let patched_url = match downstream
         .patch_upload(session_url, content_length, reader)
         .await
@@ -2805,6 +2811,38 @@ mod tests {
             "a non-superseded delete-409 must propagate as an error"
         );
 
+        drop(mock_server);
+    }
+
+    #[tokio::test]
+    async fn upload_into_session_cancels_when_local_blob_read_fails() {
+        // The session is already open; a missing local blob must cancel it, not
+        // strand it on the downstream.
+        metrics_provider::init_for_tests();
+        let mock_server = MockServer::start().await;
+        let dir = TempDir::new().unwrap();
+        let (blob_store, _metadata_store, _store) = test_blob_store(dir.path().to_str().unwrap());
+
+        let absent = Digest::Sha256(sha256::hex(b"never-written-locally").into());
+        let session_url = format!("{}/v2/{NAMESPACE}/blobs/uploads/sess-1", mock_server.uri());
+        Mock::given(method("DELETE"))
+            .and(path(format!("/v2/{NAMESPACE}/blobs/uploads/sess-1")))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let result = super::upload_into_session(
+            &downstream_client(&mock_server.uri()),
+            &blob_store,
+            NAMESPACE,
+            &absent,
+            &session_url,
+        )
+        .await;
+        assert!(result.is_err(), "a missing local blob must fail the upload");
+
+        // .expect(1) on the DELETE verifies the session was cancelled.
         drop(mock_server);
     }
 
