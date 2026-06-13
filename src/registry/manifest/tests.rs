@@ -2531,6 +2531,56 @@ async fn accept_put_manifest_lww_reads_bypass_the_link_cache() {
     );
 }
 
+#[tokio::test]
+async fn find_tags_pointing_at_bypasses_the_link_cache() {
+    // This set gates the digest-delete LWW guard, so a tag re-pointed at the
+    // digest on a sibling replica within the cache TTL must still be found, not
+    // omitted because the local cache lags and would then be left dangling.
+    let test_case = FSRegistryTestCase::with_link_cache_ttl(300);
+    let store = test_case.metadata_store();
+    let namespace = "cascade-repo";
+    let link = LinkKind::Tag("latest".to_string());
+
+    let old_digest = Digest::Sha256(sha256::hex(b"old").into());
+    let new_digest = Digest::Sha256(sha256::hex(b"new").into());
+
+    store
+        .store_manifest(
+            namespace,
+            &old_digest,
+            b"old",
+            &[LinkOperation::create(link.clone(), old_digest.clone())],
+            None,
+        )
+        .await
+        .expect("seed the tag and warm the cache");
+    assert_eq!(
+        store.cache_get(namespace, &link).await.map(|m| m.target),
+        Some(old_digest.clone()),
+        "seed write must warm the link cache",
+    );
+
+    // A sibling replica re-points the tag at new_digest behind this cache.
+    let mut sibling = store.read_link_reference(namespace, &link).await.unwrap();
+    sibling.target = new_digest.clone();
+    store
+        .write_link_reference(namespace, &link, &sibling)
+        .await
+        .expect("sibling re-point behind the cache");
+    assert_eq!(
+        store.cache_get(namespace, &link).await.map(|m| m.target),
+        Some(old_digest),
+        "cache must still be stale for an honest test",
+    );
+
+    let pointing = store.find_tags_pointing_at(namespace, &new_digest).await.unwrap();
+    assert_eq!(
+        pointing,
+        vec![link],
+        "must find the tag by its backend target, not the stale cached one"
+    );
+}
+
 /// The pre-write LWW gate in `accept_put_manifest` is check-then-write: a
 /// racing writer can pass it and still commit out of order. The link
 /// transaction itself must reject a superseded replicated write, so calling

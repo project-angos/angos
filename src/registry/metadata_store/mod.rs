@@ -280,7 +280,9 @@ impl MetadataStore {
     }
 
     /// Returns the `LinkKind::Tag` entries in `namespace` that currently point
-    /// at `digest`.
+    /// at `digest`. Reads bypass the link cache: this set gates the digest-delete
+    /// last-writer-wins guard, so a tag re-pointed on another replica within the
+    /// cache TTL must not be silently omitted from the guarded set.
     #[instrument(skip(self))]
     pub async fn find_tags_pointing_at(
         &self,
@@ -294,7 +296,7 @@ impl MetadataStore {
         let matching = stream::iter(all_tags)
             .map(|tag| async move {
                 let result = self
-                    .read_link(namespace, &LinkKind::Tag(tag.clone()), false)
+                    .read_link_reference(namespace, &LinkKind::Tag(tag.clone()))
                     .await;
                 (tag, result)
             })
