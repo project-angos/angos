@@ -18,7 +18,7 @@ use crate::{
         metadata_store::{self, LinkMetadata, LinkOperation, link_kind::LinkKind},
         test_utils::{
             FSRegistryTestCase, RegistryTestCase, backends, create_test_repositories,
-            put_blob_direct,
+            put_blob_direct, put_link_raw,
         },
     },
     replication::REPLICATION_SUPERSEDED_CODE,
@@ -2915,6 +2915,42 @@ async fn delete_manifest_not_superseded_when_local_tag_has_no_created_at() {
     assert!(
         matches!(result, Err(metadata_store::Error::ReferenceNotFound)),
         "tag must be gone after the non-superseded delete, got: {result:?}"
+    );
+}
+
+#[tokio::test]
+async fn replicated_delete_not_superseded_by_a_legacy_link() {
+    // A pre-JSON distribution-era link (bare digest string) parses to
+    // created_at=None, so it must never win LWW; a synthesised now() would
+    // re-stamp fresher on every read and block every replicated write to a
+    // migrated tag forever.
+    let test_case = FSRegistryTestCase::new();
+    let registry = test_case.registry();
+    let namespace = &Namespace::new("legacy-repo").unwrap();
+    let link = LinkKind::Tag("latest".to_string());
+
+    let legacy_digest = Digest::Sha256(sha256::hex(b"legacy-manifest").into());
+    put_link_raw(
+        registry.metadata_store.store(),
+        namespace.as_ref(),
+        &link,
+        legacy_digest.to_string().as_bytes(),
+    )
+    .await;
+
+    let ancient = chrono::DateTime::from_timestamp(0, 0).unwrap();
+    registry
+        .delete_manifest(None, Some(ancient), namespace, &Reference::Tag("latest".to_string()))
+        .await
+        .expect("a legacy tag (no created_at) must never supersede a replicated write");
+
+    let result = registry
+        .metadata_store
+        .read_link(namespace.as_ref(), &link, false)
+        .await;
+    assert!(
+        matches!(result, Err(metadata_store::Error::ReferenceNotFound)),
+        "the legacy tag must be gone after the non-superseded delete, got: {result:?}"
     );
 }
 

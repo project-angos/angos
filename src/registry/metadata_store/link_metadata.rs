@@ -87,8 +87,10 @@ impl LinkMetadata {
 
     /// Parses pre-JSON link data left over from the upstream `distribution`
     /// implementation, where each link file held only the bare digest string.
-    /// `created_at` is synthesised from the current time since the legacy
-    /// format carried no timestamp.
+    /// `created_at` is `None`: the legacy format carried no timestamp, so it
+    /// never supersedes a replicated write under last-writer-wins (a synthesised
+    /// `now()` would re-stamp fresher on every read and block replication
+    /// forever) and retention treats it as oldest, like any missing timestamp.
     fn from_legacy_bytes(s: Vec<u8>) -> Result<Self, Error> {
         let target = String::from_utf8(s).map_err(|e| Error::InvalidData(e.to_string()))?;
         let target =
@@ -96,7 +98,7 @@ impl LinkMetadata {
 
         Ok(LinkMetadata {
             target,
-            created_at: Some(Utc::now()),
+            created_at: None,
             accessed_at: None,
             referenced_by: HashSet::new(),
             media_type: None,
@@ -187,10 +189,12 @@ mod tests {
     }
 
     #[test]
-    fn from_bytes_legacy_synthesises_created_at() {
+    fn from_bytes_legacy_has_no_created_at() {
+        // A synthesised timestamp would re-stamp fresher on every read and let a
+        // legacy tag win last-writer-wins forever, blocking replication.
         let raw = format!("sha256:{VALID_HASH}");
         let parsed = LinkMetadata::from_bytes(raw.into_bytes()).unwrap();
-        assert!(parsed.created_at.is_some());
+        assert!(parsed.created_at.is_none());
     }
 
     #[test]
