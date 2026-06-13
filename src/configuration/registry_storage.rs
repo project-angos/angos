@@ -241,7 +241,7 @@ impl RegistryStorageConfig {
             )),
             RegistryStorageConfig::S3(config) => {
                 let http = S3HttpBackend::new(&config.connection.to_client_config())?;
-                let storage = Arc::new(StorageS3Backend::builder().client(Arc::new(http)).build()?);
+                let storage = Arc::new(StorageS3Backend::builder(Arc::new(http)).build());
                 let caps = probe_conditional_capabilities(storage.as_ref())
                     .await
                     .map_err(|e| Error::StorageBackend(e.to_string()))?;
@@ -290,10 +290,9 @@ impl RegistryStorageConfig {
                     config.lock_strategy
                 );
                 let object: Arc<dyn ObjectStore> = Arc::new(
-                    StorageFsBackend::builder()
-                        .root_dir(&config.root_dir)
+                    StorageFsBackend::builder(&config.root_dir)
                         .sync_to_disk(config.sync_to_disk)
-                        .build()?,
+                        .build(),
                 );
                 let executor = build_executor(
                     object.clone(),
@@ -331,7 +330,7 @@ impl RegistryStorageConfig {
                 let caps_resolved = caps.unwrap_or_default();
 
                 let http = S3HttpBackend::new(&config.connection.to_client_config())?;
-                let backend = Arc::new(StorageS3Backend::builder().client(Arc::new(http)).build()?);
+                let backend = Arc::new(StorageS3Backend::builder(Arc::new(http)).build());
                 let object: Arc<dyn ObjectStore> = backend.clone();
                 let conditional_store: Arc<dyn ConditionalStore> = backend;
 
@@ -351,9 +350,7 @@ impl RegistryStorageConfig {
                         .map_err(|e| {
                             Error::Coordination(format!("Failed to initialize S3 lock client: {e}"))
                         })?;
-                        let lock_backend = StorageS3Backend::builder()
-                            .client(Arc::new(lock_http))
-                            .build()?;
+                        let lock_backend = StorageS3Backend::builder(Arc::new(lock_http)).build();
                         Some(Arc::new(lock_backend))
                     }
                     LockStrategy::Redis(_) | LockStrategy::Memory => None,
@@ -373,13 +370,7 @@ impl RegistryStorageConfig {
             }
         };
 
-        Ok(Arc::new(
-            Store::builder()
-                .object(object)
-                .executor(executor)
-                .build()
-                .map_err(|e| Error::Coordination(e.to_string()))?,
-        ))
+        Ok(Arc::new(Store::builder(object, executor).build()))
     }
 }
 

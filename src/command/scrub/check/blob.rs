@@ -274,7 +274,7 @@ mod tests {
 
             let checker = BlobChecker::new(blob_store.clone(), metadata_store.clone());
 
-            let mut executor = Executor::new(blob_store.clone(), metadata_store.clone());
+            let mut executor = Executor::new_for_test(blob_store.clone(), metadata_store.clone());
 
             checker.check_all(&mut executor).await.unwrap();
 
@@ -312,7 +312,7 @@ mod tests {
                 .unwrap();
 
             let checker = BlobChecker::new(blob_store.clone(), metadata_store.clone());
-            let mut executor = Executor::new(blob_store.clone(), metadata_store.clone());
+            let mut executor = Executor::new_for_test(blob_store.clone(), metadata_store.clone());
 
             checker.check_all(&mut executor).await.unwrap();
 
@@ -337,7 +337,7 @@ mod tests {
 
             let checker = BlobChecker::new(blob_store.clone(), metadata_store.clone());
 
-            let mut executor = Executor::new(blob_store.clone(), metadata_store);
+            let mut executor = Executor::new_for_test(blob_store.clone(), metadata_store);
 
             checker.check_all(&mut executor).await.unwrap();
 
@@ -401,7 +401,7 @@ mod tests {
                 .unwrap();
 
             let checker = BlobChecker::new(blob_store.clone(), metadata_store.clone());
-            let mut executor = Executor::new(blob_store.clone(), metadata_store.clone());
+            let mut executor = Executor::new_for_test(blob_store.clone(), metadata_store.clone());
 
             checker
                 .check_blob(&phantom_digest, &mut executor)
@@ -449,7 +449,7 @@ mod tests {
                 .unwrap();
 
             let checker = BlobChecker::new(blob_store.clone(), metadata_store.clone());
-            let mut executor = Executor::new(blob_store.clone(), metadata_store.clone());
+            let mut executor = Executor::new_for_test(blob_store.clone(), metadata_store.clone());
 
             checker
                 .check_blob(&phantom_digest, &mut executor)

@@ -32,22 +32,14 @@ fn backend_with(uniform_parts: bool, part_size: u64) -> Backend {
         ..Default::default()
     };
     let client = Arc::new(S3Backend::new(&config).expect("s3 client"));
-    Backend::builder()
-        .client(client)
+    Backend::builder(client)
         .part_size(part_size)
         .uniform_parts(uniform_parts)
         .build()
-        .expect("backend")
 }
 
 fn frame(body: Vec<u8>) -> ByteStream {
     Box::pin(stream::once(async move { Ok(Bytes::from(body)) }))
-}
-
-#[tokio::test]
-async fn builder_requires_client() {
-    let err = Backend::builder().build().unwrap_err();
-    assert!(matches!(err, Error::Backend(msg) if msg.contains("client")));
 }
 
 #[tokio::test]

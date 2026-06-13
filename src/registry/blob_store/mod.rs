@@ -67,30 +67,12 @@ impl Debug for BlobStore {
 }
 
 impl BlobStore {
-    pub fn builder() -> BlobStoreBuilder {
-        BlobStoreBuilder::default()
-    }
-}
-
-#[derive(Default)]
-pub struct BlobStoreBuilder {
-    store: Option<Arc<Store>>,
-}
-
-impl BlobStoreBuilder {
-    /// Set the storage façade (required). Build it with the upload-session
-    /// store enabled (and, where applicable, the presign backend).
+    /// Construct a blob store over the storage façade `store`. Build the façade
+    /// with the upload-session store enabled (and, where applicable, the
+    /// presign backend).
     #[must_use]
-    pub fn store(mut self, store: Arc<Store>) -> Self {
-        self.store = Some(store);
-        self
-    }
-
-    pub fn build(self) -> Result<BlobStore, Error> {
-        let store = self
-            .store
-            .ok_or_else(|| Error::StorageBackend("blob_store builder requires a store".into()))?;
-        Ok(BlobStore { store })
+    pub fn new(store: Arc<Store>) -> Self {
+        BlobStore { store }
     }
 }
 

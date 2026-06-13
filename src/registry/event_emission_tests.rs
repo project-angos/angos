@@ -67,13 +67,8 @@ impl FsRegistryFixture {
             .unwrap(),
         );
 
-        let meta_storage: Arc<dyn ObjectStore> = Arc::new(
-            StorageFsBackend::builder()
-                .root_dir(&path)
-                .sync_to_disk(false)
-                .build()
-                .expect("fs metadata storage"),
-        );
+        let meta_storage: Arc<dyn ObjectStore> =
+            Arc::new(StorageFsBackend::builder(&path).sync_to_disk(false).build());
         let metadata_store_backend =
             metadata_store_over(meta_storage, build_test_fs_executor(&path, false));
 
@@ -566,28 +561,16 @@ impl ReplicationFixture {
         let temp_dir = TempDir::new().expect("tempdir");
         let path = temp_dir.path().to_string_lossy().to_string();
 
-        let object: Arc<dyn ObjectStore> = Arc::new(
-            StorageFsBackend::builder()
-                .root_dir(&path)
-                .sync_to_disk(false)
-                .build()
-                .expect("fs storage"),
-        );
+        let object: Arc<dyn ObjectStore> =
+            Arc::new(StorageFsBackend::builder(&path).sync_to_disk(false).build());
         let store = build_store(object, build_test_fs_executor(&path, false));
         let metadata_store = Arc::new(
-            MetadataStore::builder()
-                .store(store.clone())
+            MetadataStore::builder(store.clone())
                 .link_cache_ttl(0)
                 .access_time_debounce_secs(0)
-                .build()
-                .unwrap(),
+                .build(),
         );
-        let blob_store = Arc::new(
-            blob_store::BlobStore::builder()
-                .store(store.clone())
-                .build()
-                .unwrap(),
-        );
+        let blob_store = Arc::new(blob_store::BlobStore::new(store.clone()));
 
         let repository =
             repository_with_downstream(REPLICATION_REPO, downstream_client("https://unused.test"));

@@ -35,10 +35,15 @@ pub struct ReplicationChecker {
 }
 
 impl ReplicationChecker {
-    /// Starts building a checker from individual resolved fields.
+    /// Construct a checker from its resolved fields: the `metadata_store` the
+    /// local tag set + digests are read from, and the namespace -> repository
+    /// `resolver` yielding the downstream list.
     #[must_use]
-    pub fn builder() -> ReplicationCheckerBuilder {
-        ReplicationCheckerBuilder::default()
+    pub fn new(metadata_store: Arc<MetadataStore>, resolver: Arc<RepositoryResolver>) -> Self {
+        Self {
+            metadata_store,
+            resolver,
+        }
     }
 
     /// Whether this downstream participates in the reconcile run for `namespace`.
@@ -260,47 +265,6 @@ impl NamespaceChecker for ReplicationChecker {
     }
 }
 
-/// Builder for [`ReplicationChecker`]; both fields are required.
-#[derive(Default)]
-pub struct ReplicationCheckerBuilder {
-    metadata_store: Option<Arc<MetadataStore>>,
-    resolver: Option<Arc<RepositoryResolver>>,
-}
-
-impl ReplicationCheckerBuilder {
-    /// Metadata store the local tag set + digests are read from (required).
-    #[must_use]
-    pub fn metadata_store(mut self, metadata_store: Arc<MetadataStore>) -> Self {
-        self.metadata_store = Some(metadata_store);
-        self
-    }
-
-    /// Namespace -> repository resolver yielding the downstream list (required).
-    #[must_use]
-    pub fn resolver(mut self, resolver: Arc<RepositoryResolver>) -> Self {
-        self.resolver = Some(resolver);
-        self
-    }
-
-    /// Builds the [`ReplicationChecker`].
-    ///
-    /// # Errors
-    ///
-    /// Returns [`Error::Initialization`] when a required field is missing.
-    pub fn build(self) -> Result<ReplicationChecker, Error> {
-        let metadata_store = self.metadata_store.ok_or_else(|| {
-            Error::Initialization("replication checker builder requires a metadata_store".into())
-        })?;
-        let resolver = self.resolver.ok_or_else(|| {
-            Error::Initialization("replication checker builder requires a resolver".into())
-        })?;
-        Ok(ReplicationChecker {
-            metadata_store,
-            resolver,
-        })
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::{collections::HashMap, sync::Arc};
@@ -355,17 +319,14 @@ mod tests {
     fn fs_metadata_store() -> (Arc<MetadataStore>, Arc<Store>, TempDir) {
         let dir = TempDir::new().unwrap();
         let root = dir.path().to_str().unwrap();
-        let object: Arc<dyn ObjectStore> =
-            Arc::new(StorageFsBackend::builder().root_dir(root).build().unwrap());
+        let object: Arc<dyn ObjectStore> = Arc::new(StorageFsBackend::builder(root).build());
         let executor = build_test_fs_executor(root, false);
         let store = build_store(object, executor);
         let metadata_store = Arc::new(
-            MetadataStore::builder()
-                .store(store.clone())
+            MetadataStore::builder(store.clone())
                 .link_cache_ttl(0)
                 .access_time_debounce_secs(0)
-                .build()
-                .unwrap(),
+                .build(),
         );
         (metadata_store, store, dir)
     }
@@ -374,14 +335,10 @@ mod tests {
         repository_with_replication(
             REPO,
             vec![
-                ReplicationDownstream::builder()
-                    .name(DOWNSTREAM.to_string())
-                    .registry_client(client)
+                ReplicationDownstream::builder(DOWNSTREAM.to_string(), client, 4)
                     .mode(mode)
-                    .max_concurrent_pushes(4)
                     .prune(prune)
-                    .build()
-                    .unwrap(),
+                    .build(),
             ],
         )
     }
@@ -421,11 +378,7 @@ mod tests {
             ReplicationMode::EventReconcile,
             false,
         ));
-        let checker = ReplicationChecker::builder()
-            .metadata_store(metadata_store.clone())
-            .resolver(resolver)
-            .build()
-            .unwrap();
+        let checker = ReplicationChecker::new(metadata_store.clone(), resolver);
 
         let mut sink: Vec<Action> = Vec::new();
         checker.check(NAMESPACE, &mut sink).await.unwrap();
@@ -467,11 +420,7 @@ mod tests {
             ReplicationMode::EventReconcile,
             false,
         ));
-        let checker = ReplicationChecker::builder()
-            .metadata_store(metadata_store.clone())
-            .resolver(resolver)
-            .build()
-            .unwrap();
+        let checker = ReplicationChecker::new(metadata_store.clone(), resolver);
 
         // Metrics are process-global and shared across tests: assert the DELTA.
         let skipped_before = crate::metrics_provider::metrics_provider()
@@ -548,11 +497,7 @@ mod tests {
             ReplicationMode::EventReconcile,
             false,
         ));
-        let checker = ReplicationChecker::builder()
-            .metadata_store(metadata_store.clone())
-            .resolver(resolver)
-            .build()
-            .unwrap();
+        let checker = ReplicationChecker::new(metadata_store.clone(), resolver);
 
         let mut sink = FlakySink {
             attempted: Vec::new(),
@@ -594,11 +539,7 @@ mod tests {
             ReplicationMode::EventReconcile,
             true,
         ));
-        let checker = ReplicationChecker::builder()
-            .metadata_store(metadata_store.clone())
-            .resolver(resolver)
-            .build()
-            .unwrap();
+        let checker = ReplicationChecker::new(metadata_store.clone(), resolver);
 
         let mut sink = FlakySink {
             attempted: Vec::new(),
@@ -653,11 +594,7 @@ mod tests {
             ReplicationMode::EventReconcile,
             false,
         ));
-        let checker = ReplicationChecker::builder()
-            .metadata_store(metadata_store.clone())
-            .resolver(resolver)
-            .build()
-            .unwrap();
+        let checker = ReplicationChecker::new(metadata_store.clone(), resolver);
 
         let mut sink: Vec<Action> = Vec::new();
         checker.check(NAMESPACE, &mut sink).await.unwrap();
@@ -701,11 +638,7 @@ mod tests {
             ReplicationMode::EventReconcile,
             false,
         ));
-        let checker = ReplicationChecker::builder()
-            .metadata_store(metadata_store.clone())
-            .resolver(resolver)
-            .build()
-            .unwrap();
+        let checker = ReplicationChecker::new(metadata_store.clone(), resolver);
 
         let mut sink: Vec<Action> = Vec::new();
         checker.check(NAMESPACE, &mut sink).await.unwrap();
@@ -748,11 +681,7 @@ mod tests {
             ReplicationMode::EventReconcile,
             false,
         ));
-        let checker = ReplicationChecker::builder()
-            .metadata_store(metadata_store.clone())
-            .resolver(resolver)
-            .build()
-            .unwrap();
+        let checker = ReplicationChecker::new(metadata_store.clone(), resolver);
 
         let mut sink: Vec<Action> = Vec::new();
         checker.check(NAMESPACE, &mut sink).await.unwrap();
@@ -812,11 +741,7 @@ mod tests {
             ReplicationMode::EventReconcile,
             true,
         ));
-        let checker = ReplicationChecker::builder()
-            .metadata_store(metadata_store.clone())
-            .resolver(resolver)
-            .build()
-            .unwrap();
+        let checker = ReplicationChecker::new(metadata_store.clone(), resolver);
 
         let mut sink: Vec<Action> = Vec::new();
         checker.check(NAMESPACE, &mut sink).await.unwrap();
@@ -876,11 +801,7 @@ mod tests {
             ReplicationMode::EventReconcile,
             false,
         ));
-        let checker = ReplicationChecker::builder()
-            .metadata_store(metadata_store.clone())
-            .resolver(resolver)
-            .build()
-            .unwrap();
+        let checker = ReplicationChecker::new(metadata_store.clone(), resolver);
 
         let mut sink: Vec<Action> = Vec::new();
         checker.check(NAMESPACE, &mut sink).await.unwrap();
@@ -919,11 +840,7 @@ mod tests {
             ReplicationMode::EventReconcile,
             true,
         ));
-        let checker = ReplicationChecker::builder()
-            .metadata_store(metadata_store.clone())
-            .resolver(resolver)
-            .build()
-            .unwrap();
+        let checker = ReplicationChecker::new(metadata_store.clone(), resolver);
 
         let mut sink: Vec<Action> = Vec::new();
         checker.check(NAMESPACE, &mut sink).await.unwrap();
@@ -959,11 +876,7 @@ mod tests {
             ReplicationMode::EventOnly,
             false,
         ));
-        let checker = ReplicationChecker::builder()
-            .metadata_store(metadata_store.clone())
-            .resolver(resolver)
-            .build()
-            .unwrap();
+        let checker = ReplicationChecker::new(metadata_store.clone(), resolver);
 
         let mut sink: Vec<Action> = Vec::new();
         checker.check(NAMESPACE, &mut sink).await.unwrap();
@@ -1000,11 +913,7 @@ mod tests {
             ReplicationMode::ReconcileOnly,
             false,
         ));
-        let checker = ReplicationChecker::builder()
-            .metadata_store(metadata_store.clone())
-            .resolver(resolver)
-            .build()
-            .unwrap();
+        let checker = ReplicationChecker::new(metadata_store.clone(), resolver);
 
         let mut sink: Vec<Action> = Vec::new();
         checker.check(NAMESPACE, &mut sink).await.unwrap();
@@ -1089,7 +998,7 @@ mod tests {
     async fn scrub_replicate_enqueues_then_drains_and_converges() {
         metrics_provider::init_for_tests();
         let (metadata_store, store, _dir) = fs_metadata_store();
-        let blob_store = Arc::new(BlobStore::builder().store(store.clone()).build().unwrap());
+        let blob_store = Arc::new(BlobStore::new(store.clone()));
         let mock_server = MockServer::start().await;
 
         let (manifest_digest, config_digest, layer_digest) =
@@ -1111,11 +1020,7 @@ mod tests {
 
         let job_store = Arc::new(JobStore::new(metadata_store.store_arc(), "scrub-test"));
 
-        let checker = ReplicationChecker::builder()
-            .metadata_store(metadata_store.clone())
-            .resolver(resolver.clone())
-            .build()
-            .unwrap();
+        let checker = ReplicationChecker::new(metadata_store.clone(), resolver.clone());
 
         let mut captured: Vec<Action> = Vec::new();
         checker.check(NAMESPACE, &mut captured).await.unwrap();
@@ -1129,14 +1034,11 @@ mod tests {
                     && *digest == manifest_digest
         ));
 
-        let mut executor: Box<dyn ActionSink + Send> = Box::new(
-            Executor::builder()
-                .blob_store(blob_store.clone())
-                .metadata_store(metadata_store.clone())
-                .job_store(job_store.clone())
-                .build()
-                .unwrap(),
-        );
+        let mut executor: Box<dyn ActionSink + Send> = Box::new(Executor::new(
+            blob_store.clone(),
+            metadata_store.clone(),
+            job_store.clone(),
+        ));
         checker.check(NAMESPACE, executor.as_mut()).await.unwrap();
         assert_eq!(
             job_store.count_pending(REPLICATION_QUEUE, 0).await.unwrap(),
@@ -1151,12 +1053,11 @@ mod tests {
             "a second reconcile pass must coalesce on lock_key (no new job)"
         );
 
-        let handler = ReplicationJobHandler::builder()
-            .resolver(resolver.clone())
-            .blob_store(blob_store.clone())
-            .metadata_store(metadata_store.clone())
-            .build()
-            .unwrap();
+        let handler = ReplicationJobHandler::new(
+            resolver.clone(),
+            blob_store.clone(),
+            metadata_store.clone(),
+        );
 
         let mut drained: u64 = 0;
         loop {
@@ -1185,7 +1086,7 @@ mod tests {
     async fn scrub_replicate_deletes_downstream_only_tag() {
         metrics_provider::init_for_tests();
         let (metadata_store, store, _dir) = fs_metadata_store();
-        let blob_store = Arc::new(BlobStore::builder().store(store.clone()).build().unwrap());
+        let blob_store = Arc::new(BlobStore::new(store.clone()));
         let mock_server = MockServer::start().await;
 
         let (manifest_digest, _config_digest, _layer_digest) =
@@ -1220,20 +1121,13 @@ mod tests {
         ));
         let job_store = Arc::new(JobStore::new(metadata_store.store_arc(), "scrub-test"));
 
-        let checker = ReplicationChecker::builder()
-            .metadata_store(metadata_store.clone())
-            .resolver(resolver.clone())
-            .build()
-            .unwrap();
+        let checker = ReplicationChecker::new(metadata_store.clone(), resolver.clone());
 
-        let mut executor: Box<dyn ActionSink + Send> = Box::new(
-            Executor::builder()
-                .blob_store(blob_store.clone())
-                .metadata_store(metadata_store.clone())
-                .job_store(job_store.clone())
-                .build()
-                .unwrap(),
-        );
+        let mut executor: Box<dyn ActionSink + Send> = Box::new(Executor::new(
+            blob_store.clone(),
+            metadata_store.clone(),
+            job_store.clone(),
+        ));
         checker.check(NAMESPACE, executor.as_mut()).await.unwrap();
         assert_eq!(
             job_store.count_pending(REPLICATION_QUEUE, 0).await.unwrap(),
@@ -1241,12 +1135,11 @@ mod tests {
             "the downstream-only tag must enqueue exactly one delete job"
         );
 
-        let handler = ReplicationJobHandler::builder()
-            .resolver(resolver.clone())
-            .blob_store(blob_store.clone())
-            .metadata_store(metadata_store.clone())
-            .build()
-            .unwrap();
+        let handler = ReplicationJobHandler::new(
+            resolver.clone(),
+            blob_store.clone(),
+            metadata_store.clone(),
+        );
 
         let mut drained: u64 = 0;
         loop {

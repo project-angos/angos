@@ -52,12 +52,7 @@ impl TestS3Config {
             S3HttpBackend::new(&self.connection.to_client_config())
                 .map_err(|e| Error::StorageBackend(e.to_string()))?,
         );
-        let raw_storage = Arc::new(
-            StorageS3Backend::builder()
-                .client(http.clone())
-                .build()
-                .map_err(|e| Error::StorageBackend(e.to_string()))?,
-        );
+        let raw_storage = Arc::new(StorageS3Backend::builder(http.clone()).build());
         let object_store: Arc<dyn ObjectStore> = raw_storage.clone();
         let cond_store: Arc<dyn ConditionalStore> = raw_storage;
 
@@ -66,10 +61,7 @@ impl TestS3Config {
             LockStrategy::S3(cfg) => {
                 let lock_http = S3HttpBackend::new(&self.connection.to_lock_client_config(cfg))
                     .map_err(|e| Error::Coordination(e.to_string()))?;
-                let lock_backend = StorageS3Backend::builder()
-                    .client(Arc::new(lock_http))
-                    .build()
-                    .map_err(|e| Error::StorageBackend(e.to_string()))?;
+                let lock_backend = StorageS3Backend::builder(Arc::new(lock_http)).build();
                 Some(Arc::new(lock_backend))
             }
             _ => None,
@@ -86,16 +78,15 @@ impl TestS3Config {
         .map_err(|e| Error::Coordination(e.to_string()))?;
 
         let facade = build_store(object_store, executor);
-        let mut builder = MetadataStore::builder()
+        let mut builder = MetadataStore::builder(facade)
             .link_cache_ttl(self.link_cache_ttl)
-            .access_time_debounce_secs(self.access_time_debounce_secs)
-            .store(facade);
+            .access_time_debounce_secs(self.access_time_debounce_secs);
 
         if let Some(c) = cache {
             builder = builder.cache(c);
         }
 
-        builder.build()
+        Ok(builder.build())
     }
 }
 

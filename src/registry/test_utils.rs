@@ -42,8 +42,7 @@ use angos_tx_engine::{
 /// Build a fresh in-memory lock primitive for tests.
 pub fn memory_lock() -> Arc<Lock> {
     Arc::new(
-        Lock::builder()
-            .storage(Arc::new(MemoryLockStorage::new()))
+        Lock::builder(Arc::new(MemoryLockStorage::new()))
             .build()
             .expect("test lock"),
     )
@@ -52,23 +51,15 @@ pub fn memory_lock() -> Arc<Lock> {
 /// Build an in-process `LockedExecutor` over `store`, serialising on a fresh
 /// in-memory lock.
 pub fn locked_executor_over(store: Arc<dyn ObjectStore>) -> Arc<dyn TransactionExecutor> {
-    Arc::new(
-        LockedExecutor::builder()
-            .store(store)
-            .lock(memory_lock())
-            .build()
-            .expect("test executor"),
-    )
+    Arc::new(LockedExecutor::builder(store, memory_lock()).build())
 }
 
 /// Build an in-process FS-backed `LockedExecutor` suitable for unit tests.
 pub fn build_test_fs_executor(root_dir: &str, sync_to_disk: bool) -> Arc<dyn TransactionExecutor> {
     let store = Arc::new(
-        StorageFsBackend::builder()
-            .root_dir(root_dir)
+        StorageFsBackend::builder(root_dir)
             .sync_to_disk(sync_to_disk)
-            .build()
-            .expect("test fs store"),
+            .build(),
     );
     locked_executor_over(store)
 }
@@ -80,13 +71,7 @@ pub fn build_store(
     object: Arc<dyn ObjectStore>,
     executor: Arc<dyn TransactionExecutor>,
 ) -> Arc<Store> {
-    Arc::new(
-        Store::builder()
-            .object(object)
-            .executor(executor)
-            .build()
-            .expect("test store façade"),
-    )
+    Arc::new(Store::builder(object, executor).build())
 }
 
 /// Wrap an object store + executor into a cache-less [`MetadataStore`] for
@@ -106,13 +91,11 @@ pub fn metadata_store_over_cached(
     link_cache_ttl_secs: u64,
 ) -> Arc<MetadataStore> {
     Arc::new(
-        MetadataStore::builder()
-            .store(build_store(object, executor))
+        MetadataStore::builder(build_store(object, executor))
             .cache(cache::Config::Memory.to_backend().expect("memory cache"))
             .link_cache_ttl(link_cache_ttl_secs)
             .access_time_debounce_secs(0)
-            .build()
-            .expect("test metadata backend"),
+            .build(),
     )
 }
 
@@ -284,13 +267,8 @@ impl FSRegistryTestCase {
         let blob_store = Arc::new(config.build_backend().expect("fs blob backend"));
 
         let meta_executor = build_test_fs_executor(&path, false);
-        let meta_storage: Arc<dyn ObjectStore> = Arc::new(
-            StorageFsBackend::builder()
-                .root_dir(&path)
-                .sync_to_disk(false)
-                .build()
-                .expect("fs metadata storage"),
-        );
+        let meta_storage: Arc<dyn ObjectStore> =
+            Arc::new(StorageFsBackend::builder(&path).sync_to_disk(false).build());
         let metadata_store =
             metadata_store_over_cached(meta_storage, meta_executor, link_cache_ttl_secs);
         let registry = create_test_registry(blob_store.clone(), metadata_store.clone());
@@ -364,12 +342,7 @@ impl S3RegistryTestCase {
 
         let meta_http =
             Arc::new(S3HttpBackend::new(&connection.to_client_config()).expect("s3 http client"));
-        let meta_raw_storage = Arc::new(
-            StorageS3Backend::builder()
-                .client(meta_http)
-                .build()
-                .expect("s3 metadata storage"),
-        );
+        let meta_raw_storage = Arc::new(StorageS3Backend::builder(meta_http).build());
         let meta_object_store: Arc<dyn ObjectStore> = meta_raw_storage.clone();
         let meta_conditional: Arc<dyn ConditionalStore> = meta_raw_storage;
         let meta_executor = build_executor(
@@ -426,13 +399,9 @@ impl RegistryTestCase for S3RegistryTestCase {
 pub fn downstream_client(uri: &str) -> Arc<RegistryClient> {
     let backend = cache::Config::Memory.to_backend().unwrap();
     Arc::new(
-        RegistryClient::builder()
-            .url(uri.to_string())
-            .client(reqwest::Client::new())
-            .cache(backend)
+        RegistryClient::builder(uri.to_string(), reqwest::Client::new(), backend)
             .max_manifest_size_bytes(DEFAULT_MAX_MANIFEST_SIZE_BYTES)
-            .build()
-            .unwrap(),
+            .build(),
     )
 }
 
@@ -463,14 +432,10 @@ pub fn repository_with_downstream(name: &str, client: Arc<RegistryClient>) -> Re
     repository_with_replication(
         name,
         vec![
-            ReplicationDownstream::builder()
-                .name("eu-region".to_string())
-                .registry_client(client)
+            ReplicationDownstream::builder("eu-region".to_string(), client, 4)
                 .mode(ReplicationMode::EventReconcile)
                 .namespace_filter(Vec::new())
-                .max_concurrent_pushes(4)
-                .build()
-                .unwrap(),
+                .build(),
         ],
     )
 }

@@ -142,7 +142,7 @@ impl Command {
         let orphan_grant_checker =
             setup::orphan_grant_checker(options, &blob_backend, &metadata_store)?;
         let orphan_job_checkers =
-            setup::orphan_job_checkers(options, &metadata_store, &repositories)?;
+            setup::orphan_job_checkers(options, &metadata_store, &repositories);
 
         // One `Arc<JobStore>` serves as both producer (Executor enqueue) and
         // consumer (end-of-run drain). Building the queue is cheap, so every
@@ -157,11 +157,11 @@ impl Command {
                 metadata_store.store_arc(),
                 format!("scrub-{}", Uuid::new_v4()),
             ));
-            let executor = Executor::builder()
-                .blob_store(blob_backend.clone())
-                .metadata_store(metadata_store.clone())
-                .job_store(job_store.clone())
-                .build()?;
+            let executor = Executor::new(
+                blob_backend.clone(),
+                metadata_store.clone(),
+                job_store.clone(),
+            );
             if options.replicate {
                 replication_drain = Some(Self::build_replication_drain(
                     job_store,
@@ -169,7 +169,7 @@ impl Command {
                     &metadata_store,
                     &repositories,
                     config.global.max_concurrent_replication_jobs,
-                )?);
+                ));
             }
             Box::new(executor)
         };
@@ -196,20 +196,17 @@ impl Command {
         metadata_store: &Arc<MetadataStore>,
         resolver: &Arc<RepositoryResolver>,
         concurrency: NonZeroUsize,
-    ) -> Result<ReplicationDrain, Error> {
-        let handler = ReplicationJobHandler::builder()
-            .resolver(resolver.clone())
-            .blob_store(blob_store.clone())
-            .metadata_store(metadata_store.clone())
-            .build()
-            .map_err(|e| {
-                Error::Initialization(format!("failed to build replication handler: {e}"))
-            })?;
-        Ok(ReplicationDrain {
+    ) -> ReplicationDrain {
+        let handler = ReplicationJobHandler::new(
+            resolver.clone(),
+            blob_store.clone(),
+            metadata_store.clone(),
+        );
+        ReplicationDrain {
             consumer,
             handler: Box::new(handler),
             concurrency,
-        })
+        }
     }
 
     pub async fn run(&mut self) -> Result<(), Error> {

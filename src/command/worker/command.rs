@@ -303,14 +303,11 @@ impl WorkerContext {
             Uuid::new_v4().to_string(),
         ));
         let handler: Arc<dyn JobHandler> = if queue == REPLICATION_QUEUE {
-            Arc::new(
-                ReplicationJobHandler::builder()
-                    .resolver(self.repositories.clone())
-                    .blob_store(self.blob_store.clone())
-                    .metadata_store(self.metadata_store.clone())
-                    .build()
-                    .map_err(bootstrap::Error::JobQueue)?,
-            )
+            Arc::new(ReplicationJobHandler::new(
+                self.repositories.clone(),
+                self.blob_store.clone(),
+                self.metadata_store.clone(),
+            ))
         } else if queue == CACHE_QUEUE {
             Arc::new(CacheJobHandler::new(
                 self.repositories.clone(),
@@ -414,19 +411,16 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let root = dir.path().to_str().unwrap();
 
-        let object: Arc<dyn ObjectStore> =
-            Arc::new(StorageFsBackend::builder().root_dir(root).build().unwrap());
+        let object: Arc<dyn ObjectStore> = Arc::new(StorageFsBackend::builder(root).build());
         let executor = build_test_fs_executor(root, false);
         let storage = build_store(object, executor);
         let metadata_store = Arc::new(
-            MetadataStore::builder()
-                .store(storage.clone())
+            MetadataStore::builder(storage.clone())
                 .link_cache_ttl(0)
                 .access_time_debounce_secs(0)
-                .build()
-                .unwrap(),
+                .build(),
         );
-        let blob_store = Arc::new(BlobStore::builder().store(storage.clone()).build().unwrap());
+        let blob_store = Arc::new(BlobStore::new(storage.clone()));
         let repositories = Arc::new(RepositoryResolver::new(Arc::new(HashMap::new())).unwrap());
 
         let context = WorkerContext {

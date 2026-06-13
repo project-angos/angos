@@ -249,7 +249,7 @@ pub fn build_executor(
         LockStrategy::Memory => {
             let storage: Arc<dyn LockStorage> = Arc::new(MemoryLockStorage::new());
             // Memory backend: keep builder defaults.
-            Lock::builder().storage(storage)
+            Lock::builder(storage)
         }
         #[cfg(feature = "redis")]
         LockStrategy::Redis(config) => {
@@ -259,8 +259,7 @@ pub fn build_executor(
                 })?);
             // Redis TTL is enforced natively by the storage; only the retry
             // tuning is threaded into the lock primitive.
-            Lock::builder()
-                .storage(storage)
+            Lock::builder(storage)
                 .max_retries(config.max_retries)
                 .retry_delay_ms(config.retry_delay_ms)
         }
@@ -270,8 +269,7 @@ pub fn build_executor(
             })?;
             let storage: Arc<dyn LockStorage> =
                 Arc::new(S3LockStorage::new(lock_store, s3_lock_delete_if_match));
-            Lock::builder()
-                .storage(storage)
+            Lock::builder(storage)
                 .ttl_secs(config.ttl_secs)
                 .max_retries(config.max_retries)
                 .retry_delay_ms(config.retry_delay_ms)
@@ -286,11 +284,7 @@ pub fn build_executor(
     );
 
     if supports_cas && let Some(cs) = conditional {
-        let exec = CasExecutor::builder()
-            .store(cs)
-            .lock(lock)
-            .build()
-            .map_err(|e| Error::Build(format!("failed to build CAS executor: {e}")))?;
+        let exec = CasExecutor::builder(cs, lock).build();
         info!(
             executor = "cas",
             lock_backend, "transactional engine executor selected"
@@ -298,11 +292,7 @@ pub fn build_executor(
         return Ok(Arc::new(exec));
     }
 
-    let exec = LockedExecutor::builder()
-        .store(store)
-        .lock(lock)
-        .build()
-        .map_err(|e| Error::Build(format!("failed to build locked executor: {e}")))?;
+    let exec = LockedExecutor::builder(store, lock).build();
     info!(
         executor = "locked",
         lock_backend, "transactional engine executor selected"

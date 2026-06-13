@@ -146,8 +146,8 @@ pub fn build_prune_delete_envelope(
     )
 }
 
-/// Mirrors a local repository's state to a configured downstream. Built via
-/// [`ReplicationJobHandler::builder`] from resolved dependencies.
+/// Mirrors a local repository's state to a configured downstream. Constructed
+/// from its resolved dependencies via [`ReplicationJobHandler::new`].
 pub struct ReplicationJobHandler {
     resolver: Arc<RepositoryResolver>,
     blob_store: Arc<BlobStore>,
@@ -155,10 +155,21 @@ pub struct ReplicationJobHandler {
 }
 
 impl ReplicationJobHandler {
-    /// Starts building a handler from individual resolved fields.
+    /// Construct a handler from its resolved dependencies: the namespace ->
+    /// repository `resolver`, the `blob_store` the manifest/blob bytes are read
+    /// from, and the `metadata_store` used to re-resolve the current
+    /// `tag -> digest`.
     #[must_use]
-    pub fn builder() -> ReplicationJobHandlerBuilder {
-        ReplicationJobHandlerBuilder::default()
+    pub fn new(
+        resolver: Arc<RepositoryResolver>,
+        blob_store: Arc<BlobStore>,
+        metadata_store: Arc<MetadataStore>,
+    ) -> Self {
+        Self {
+            resolver,
+            blob_store,
+            metadata_store,
+        }
     }
 
     /// Resolves the [`ReplicationDownstream`] for a payload, or errors when the
@@ -386,60 +397,6 @@ impl JobHandler for ReplicationJobHandler {
     }
 }
 
-/// Builder for [`ReplicationJobHandler`]; all fields are required.
-#[derive(Default)]
-pub struct ReplicationJobHandlerBuilder {
-    resolver: Option<Arc<RepositoryResolver>>,
-    blob_store: Option<Arc<BlobStore>>,
-    metadata_store: Option<Arc<MetadataStore>>,
-}
-
-impl ReplicationJobHandlerBuilder {
-    /// Namespace -> repository resolver (required).
-    #[must_use]
-    pub fn resolver(mut self, resolver: Arc<RepositoryResolver>) -> Self {
-        self.resolver = Some(resolver);
-        self
-    }
-
-    /// Blob store the manifest/blob bytes are read from (required).
-    #[must_use]
-    pub fn blob_store(mut self, blob_store: Arc<BlobStore>) -> Self {
-        self.blob_store = Some(blob_store);
-        self
-    }
-
-    /// Metadata store used to re-resolve the current `tag -> digest` (required).
-    #[must_use]
-    pub fn metadata_store(mut self, metadata_store: Arc<MetadataStore>) -> Self {
-        self.metadata_store = Some(metadata_store);
-        self
-    }
-
-    /// Builds the [`ReplicationJobHandler`].
-    ///
-    /// # Errors
-    ///
-    /// Returns [`Error::Initialization`] when a required field is missing.
-    pub fn build(self) -> Result<ReplicationJobHandler, Error> {
-        let resolver = self.resolver.ok_or_else(|| {
-            Error::Initialization("replication handler builder requires a resolver".into())
-        })?;
-        let blob_store = self.blob_store.ok_or_else(|| {
-            Error::Initialization("replication handler builder requires a blob_store".into())
-        })?;
-        let metadata_store = self.metadata_store.ok_or_else(|| {
-            Error::Initialization("replication handler builder requires a metadata_store".into())
-        })?;
-
-        Ok(ReplicationJobHandler {
-            resolver,
-            blob_store,
-            metadata_store,
-        })
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::{collections::HashMap, sync::Arc};
@@ -636,14 +593,7 @@ mod tests {
     fn repository_with_named_downstream(name: &str, client: Arc<RegistryClient>) -> Repository {
         repository_with_replication(
             REPO,
-            vec![
-                ReplicationDownstream::builder()
-                    .name(name.to_string())
-                    .registry_client(client)
-                    .max_concurrent_pushes(4)
-                    .build()
-                    .unwrap(),
-            ],
+            vec![ReplicationDownstream::builder(name.to_string(), client, 4).build()],
         )
     }
 
@@ -656,19 +606,16 @@ mod tests {
         metrics_provider::init_for_tests();
         let dir = TempDir::new().unwrap();
         let root = dir.path().to_str().unwrap();
-        let object: Arc<dyn ObjectStore> =
-            Arc::new(StorageFsBackend::builder().root_dir(root).build().unwrap());
+        let object: Arc<dyn ObjectStore> = Arc::new(StorageFsBackend::builder(root).build());
         let executor = build_test_fs_executor(root, false);
         let store = build_store(object, executor);
         let metadata_store = Arc::new(
-            MetadataStore::builder()
-                .store(store.clone())
+            MetadataStore::builder(store.clone())
                 .link_cache_ttl(0)
                 .access_time_debounce_secs(0)
-                .build()
-                .unwrap(),
+                .build(),
         );
-        let blob_store = Arc::new(BlobStore::builder().store(store.clone()).build().unwrap());
+        let blob_store = Arc::new(BlobStore::new(store.clone()));
 
         let mut repositories = HashMap::new();
         repositories.insert(
@@ -677,12 +624,7 @@ mod tests {
         );
         let resolver = Arc::new(RepositoryResolver::new(Arc::new(repositories)).unwrap());
 
-        let handler = ReplicationJobHandler::builder()
-            .resolver(resolver)
-            .blob_store(blob_store)
-            .metadata_store(metadata_store)
-            .build()
-            .unwrap();
+        let handler = ReplicationJobHandler::new(resolver, blob_store, metadata_store);
 
         let envelope = JobEnvelope::new(
             "replication",
@@ -708,19 +650,16 @@ mod tests {
         metrics_provider::init_for_tests();
         let dir = TempDir::new().unwrap();
         let root = dir.path().to_str().unwrap();
-        let object: Arc<dyn ObjectStore> =
-            Arc::new(StorageFsBackend::builder().root_dir(root).build().unwrap());
+        let object: Arc<dyn ObjectStore> = Arc::new(StorageFsBackend::builder(root).build());
         let executor = build_test_fs_executor(root, false);
         let store = build_store(object, executor);
         let metadata_store = Arc::new(
-            MetadataStore::builder()
-                .store(store.clone())
+            MetadataStore::builder(store.clone())
                 .link_cache_ttl(0)
                 .access_time_debounce_secs(0)
-                .build()
-                .unwrap(),
+                .build(),
         );
-        let blob_store = Arc::new(BlobStore::builder().store(store.clone()).build().unwrap());
+        let blob_store = Arc::new(BlobStore::new(store.clone()));
 
         let mut repositories = HashMap::new();
         repositories.insert(
@@ -729,12 +668,7 @@ mod tests {
         );
         let resolver = Arc::new(RepositoryResolver::new(Arc::new(repositories)).unwrap());
 
-        let handler = ReplicationJobHandler::builder()
-            .resolver(resolver)
-            .blob_store(blob_store)
-            .metadata_store(metadata_store)
-            .build()
-            .unwrap();
+        let handler = ReplicationJobHandler::new(resolver, blob_store, metadata_store);
 
         let mut payload = sample_payload();
         payload.downstream = "removed-region".to_string();
@@ -756,19 +690,16 @@ mod tests {
 
         let dir = TempDir::new().unwrap();
         let root = dir.path().to_str().unwrap();
-        let object: Arc<dyn ObjectStore> =
-            Arc::new(StorageFsBackend::builder().root_dir(root).build().unwrap());
+        let object: Arc<dyn ObjectStore> = Arc::new(StorageFsBackend::builder(root).build());
         let executor = build_test_fs_executor(root, false);
         let store = build_store(object, executor);
         let metadata_store = Arc::new(
-            MetadataStore::builder()
-                .store(store.clone())
+            MetadataStore::builder(store.clone())
                 .link_cache_ttl(0)
                 .access_time_debounce_secs(0)
-                .build()
-                .unwrap(),
+                .build(),
         );
-        let blob_store = Arc::new(BlobStore::builder().store(store.clone()).build().unwrap());
+        let blob_store = Arc::new(BlobStore::new(store.clone()));
 
         let (manifest_digest, config_digest, layer_digest) =
             seed_manifest(&store, &metadata_store, NAMESPACE).await;
@@ -825,12 +756,7 @@ mod tests {
         );
         let resolver = Arc::new(RepositoryResolver::new(Arc::new(repositories)).unwrap());
 
-        let handler = ReplicationJobHandler::builder()
-            .resolver(resolver)
-            .blob_store(blob_store)
-            .metadata_store(metadata_store)
-            .build()
-            .unwrap();
+        let handler = ReplicationJobHandler::new(resolver, blob_store, metadata_store);
 
         let envelope = build_envelope(&sample_payload()).unwrap();
         let tx = handler.execute(&envelope).await.unwrap();
@@ -851,20 +777,17 @@ mod tests {
 
         let dir = TempDir::new().unwrap();
         let root = dir.path().to_str().unwrap();
-        let object: Arc<dyn ObjectStore> =
-            Arc::new(StorageFsBackend::builder().root_dir(root).build().unwrap());
+        let object: Arc<dyn ObjectStore> = Arc::new(StorageFsBackend::builder(root).build());
         let executor = build_test_fs_executor(root, false);
         let store = build_store(object, executor);
         let metadata_store = Arc::new(
-            MetadataStore::builder()
-                .store(store.clone())
+            MetadataStore::builder(store.clone())
                 .cache(cache::Config::Memory.to_backend().unwrap())
                 .link_cache_ttl(300)
                 .access_time_debounce_secs(0)
-                .build()
-                .unwrap(),
+                .build(),
         );
-        let blob_store = Arc::new(BlobStore::builder().store(store.clone()).build().unwrap());
+        let blob_store = Arc::new(BlobStore::new(store.clone()));
 
         // Two manifests sharing the same blobs; the tag starts on `stale`.
         let config_bytes = br#"{"config":true}"#.to_vec();
@@ -966,12 +889,7 @@ mod tests {
         );
         let resolver = Arc::new(RepositoryResolver::new(Arc::new(repositories)).unwrap());
 
-        let handler = ReplicationJobHandler::builder()
-            .resolver(resolver)
-            .blob_store(blob_store)
-            .metadata_store(metadata_store)
-            .build()
-            .unwrap();
+        let handler = ReplicationJobHandler::new(resolver, blob_store, metadata_store);
 
         let payload = ReplicationPushPayload {
             downstream: DOWNSTREAM.to_string(),
@@ -1004,19 +922,16 @@ mod tests {
 
         let dir = TempDir::new().unwrap();
         let root = dir.path().to_str().unwrap();
-        let object: Arc<dyn ObjectStore> =
-            Arc::new(StorageFsBackend::builder().root_dir(root).build().unwrap());
+        let object: Arc<dyn ObjectStore> = Arc::new(StorageFsBackend::builder(root).build());
         let executor = build_test_fs_executor(root, false);
         let store = build_store(object, executor);
         let metadata_store = Arc::new(
-            MetadataStore::builder()
-                .store(store.clone())
+            MetadataStore::builder(store.clone())
                 .link_cache_ttl(0)
                 .access_time_debounce_secs(0)
-                .build()
-                .unwrap(),
+                .build(),
         );
-        let blob_store = Arc::new(BlobStore::builder().store(store.clone()).build().unwrap());
+        let blob_store = Arc::new(BlobStore::new(store.clone()));
 
         let (manifest_digest, config_digest, layer_digest) =
             seed_manifest(&store, &metadata_store, NAMESPACE).await;
@@ -1052,12 +967,7 @@ mod tests {
         );
         let resolver = Arc::new(RepositoryResolver::new(Arc::new(repositories)).unwrap());
 
-        let handler = ReplicationJobHandler::builder()
-            .resolver(resolver)
-            .blob_store(blob_store)
-            .metadata_store(metadata_store)
-            .build()
-            .unwrap();
+        let handler = ReplicationJobHandler::new(resolver, blob_store, metadata_store);
 
         let envelope = build_envelope(&sample_payload()).unwrap();
         handler.execute(&envelope).await.unwrap();
@@ -1073,19 +983,16 @@ mod tests {
 
         let dir = TempDir::new().unwrap();
         let root = dir.path().to_str().unwrap();
-        let object: Arc<dyn ObjectStore> =
-            Arc::new(StorageFsBackend::builder().root_dir(root).build().unwrap());
+        let object: Arc<dyn ObjectStore> = Arc::new(StorageFsBackend::builder(root).build());
         let executor = build_test_fs_executor(root, false);
         let store = build_store(object, executor);
         let metadata_store = Arc::new(
-            MetadataStore::builder()
-                .store(store.clone())
+            MetadataStore::builder(store.clone())
                 .link_cache_ttl(0)
                 .access_time_debounce_secs(0)
-                .build()
-                .unwrap(),
+                .build(),
         );
-        let blob_store = Arc::new(BlobStore::builder().store(store.clone()).build().unwrap());
+        let blob_store = Arc::new(BlobStore::new(store.clone()));
 
         let (manifest_digest, config_digest, layer_digest) =
             seed_manifest(&store, &metadata_store, NAMESPACE).await;
@@ -1132,12 +1039,7 @@ mod tests {
         );
         let resolver = Arc::new(RepositoryResolver::new(Arc::new(repositories)).unwrap());
 
-        let handler = ReplicationJobHandler::builder()
-            .resolver(resolver)
-            .blob_store(blob_store)
-            .metadata_store(metadata_store)
-            .build()
-            .unwrap();
+        let handler = ReplicationJobHandler::new(resolver, blob_store, metadata_store);
 
         let envelope = build_envelope(&sample_payload()).unwrap();
         handler.execute(&envelope).await.unwrap();
@@ -1155,19 +1057,16 @@ mod tests {
 
         let dir = TempDir::new().unwrap();
         let root = dir.path().to_str().unwrap();
-        let object: Arc<dyn ObjectStore> =
-            Arc::new(StorageFsBackend::builder().root_dir(root).build().unwrap());
+        let object: Arc<dyn ObjectStore> = Arc::new(StorageFsBackend::builder(root).build());
         let executor = build_test_fs_executor(root, false);
         let store = build_store(object, executor);
         let metadata_store = Arc::new(
-            MetadataStore::builder()
-                .store(store.clone())
+            MetadataStore::builder(store.clone())
                 .link_cache_ttl(0)
                 .access_time_debounce_secs(0)
-                .build()
-                .unwrap(),
+                .build(),
         );
-        let blob_store = Arc::new(BlobStore::builder().store(store.clone()).build().unwrap());
+        let blob_store = Arc::new(BlobStore::new(store.clone()));
 
         let (manifest_digest, config_digest, layer_digest) =
             seed_manifest(&store, &metadata_store, NAMESPACE).await;
@@ -1209,12 +1108,7 @@ mod tests {
         );
         let resolver = Arc::new(RepositoryResolver::new(Arc::new(repositories)).unwrap());
 
-        let handler = ReplicationJobHandler::builder()
-            .resolver(resolver)
-            .blob_store(blob_store)
-            .metadata_store(metadata_store)
-            .build()
-            .unwrap();
+        let handler = ReplicationJobHandler::new(resolver, blob_store, metadata_store);
 
         let mut payload = sample_payload();
         payload.source_ts = None;
@@ -1232,19 +1126,16 @@ mod tests {
 
         let dir = TempDir::new().unwrap();
         let root = dir.path().to_str().unwrap();
-        let object: Arc<dyn ObjectStore> =
-            Arc::new(StorageFsBackend::builder().root_dir(root).build().unwrap());
+        let object: Arc<dyn ObjectStore> = Arc::new(StorageFsBackend::builder(root).build());
         let executor = build_test_fs_executor(root, false);
         let store = build_store(object, executor);
         let metadata_store = Arc::new(
-            MetadataStore::builder()
-                .store(store.clone())
+            MetadataStore::builder(store.clone())
                 .link_cache_ttl(0)
                 .access_time_debounce_secs(0)
-                .build()
-                .unwrap(),
+                .build(),
         );
-        let blob_store = Arc::new(BlobStore::builder().store(store.clone()).build().unwrap());
+        let blob_store = Arc::new(BlobStore::new(store.clone()));
 
         let (_manifest_digest, config_digest, layer_digest) =
             seed_manifest(&store, &metadata_store, NAMESPACE).await;
@@ -1275,12 +1166,7 @@ mod tests {
         );
         let resolver = Arc::new(RepositoryResolver::new(Arc::new(repositories)).unwrap());
 
-        let handler = ReplicationJobHandler::builder()
-            .resolver(resolver)
-            .blob_store(blob_store)
-            .metadata_store(metadata_store)
-            .build()
-            .unwrap();
+        let handler = ReplicationJobHandler::new(resolver, blob_store, metadata_store);
 
         let envelope = build_envelope(&sample_payload()).unwrap();
         let result = handler.execute(&envelope).await;
@@ -1299,19 +1185,16 @@ mod tests {
 
         let dir = TempDir::new().unwrap();
         let root = dir.path().to_str().unwrap();
-        let object: Arc<dyn ObjectStore> =
-            Arc::new(StorageFsBackend::builder().root_dir(root).build().unwrap());
+        let object: Arc<dyn ObjectStore> = Arc::new(StorageFsBackend::builder(root).build());
         let executor = build_test_fs_executor(root, false);
         let store = build_store(object, executor);
         let metadata_store = Arc::new(
-            MetadataStore::builder()
-                .store(store.clone())
+            MetadataStore::builder(store.clone())
                 .link_cache_ttl(0)
                 .access_time_debounce_secs(0)
-                .build()
-                .unwrap(),
+                .build(),
         );
-        let blob_store = Arc::new(BlobStore::builder().store(store.clone()).build().unwrap());
+        let blob_store = Arc::new(BlobStore::new(store.clone()));
 
         let (_manifest_digest, config_digest, layer_digest) =
             seed_manifest(&store, &metadata_store, NAMESPACE).await;
@@ -1342,12 +1225,7 @@ mod tests {
         );
         let resolver = Arc::new(RepositoryResolver::new(Arc::new(repositories)).unwrap());
 
-        let handler = ReplicationJobHandler::builder()
-            .resolver(resolver)
-            .blob_store(blob_store)
-            .metadata_store(metadata_store)
-            .build()
-            .unwrap();
+        let handler = ReplicationJobHandler::new(resolver, blob_store, metadata_store);
 
         let envelope = build_envelope(&sample_payload()).unwrap();
         let tx = handler
@@ -1374,19 +1252,16 @@ mod tests {
 
         let dir = TempDir::new().unwrap();
         let root = dir.path().to_str().unwrap();
-        let object: Arc<dyn ObjectStore> =
-            Arc::new(StorageFsBackend::builder().root_dir(root).build().unwrap());
+        let object: Arc<dyn ObjectStore> = Arc::new(StorageFsBackend::builder(root).build());
         let executor = build_test_fs_executor(root, false);
         let store = build_store(object, executor);
         let metadata_store = Arc::new(
-            MetadataStore::builder()
-                .store(store.clone())
+            MetadataStore::builder(store.clone())
                 .link_cache_ttl(0)
                 .access_time_debounce_secs(0)
-                .build()
-                .unwrap(),
+                .build(),
         );
-        let blob_store = Arc::new(BlobStore::builder().store(store.clone()).build().unwrap());
+        let blob_store = Arc::new(BlobStore::new(store.clone()));
 
         let mut repositories = HashMap::new();
         repositories.insert(
@@ -1395,12 +1270,7 @@ mod tests {
         );
         let resolver = Arc::new(RepositoryResolver::new(Arc::new(repositories)).unwrap());
 
-        let handler = ReplicationJobHandler::builder()
-            .resolver(resolver)
-            .blob_store(blob_store)
-            .metadata_store(metadata_store)
-            .build()
-            .unwrap();
+        let handler = ReplicationJobHandler::new(resolver, blob_store, metadata_store);
 
         let mut payload = sample_payload();
         payload.kind = REPLICATION_DELETE_MANIFEST_KIND.to_string();
@@ -1417,19 +1287,16 @@ mod tests {
     ) -> (ReplicationJobHandler, Digest, Digest, TempDir) {
         let dir = TempDir::new().unwrap();
         let root = dir.path().to_str().unwrap();
-        let object: Arc<dyn ObjectStore> =
-            Arc::new(StorageFsBackend::builder().root_dir(root).build().unwrap());
+        let object: Arc<dyn ObjectStore> = Arc::new(StorageFsBackend::builder(root).build());
         let executor = build_test_fs_executor(root, false);
         let store = build_store(object, executor);
         let metadata_store = Arc::new(
-            MetadataStore::builder()
-                .store(store.clone())
+            MetadataStore::builder(store.clone())
                 .link_cache_ttl(0)
                 .access_time_debounce_secs(0)
-                .build()
-                .unwrap(),
+                .build(),
         );
-        let blob_store = Arc::new(BlobStore::builder().store(store.clone()).build().unwrap());
+        let blob_store = Arc::new(BlobStore::new(store.clone()));
 
         let (_manifest_digest, config_digest, layer_digest) =
             seed_manifest(&store, &metadata_store, NAMESPACE).await;
@@ -1441,12 +1308,7 @@ mod tests {
         );
         let resolver = Arc::new(RepositoryResolver::new(Arc::new(repositories)).unwrap());
 
-        let handler = ReplicationJobHandler::builder()
-            .resolver(resolver)
-            .blob_store(blob_store)
-            .metadata_store(metadata_store)
-            .build()
-            .unwrap();
+        let handler = ReplicationJobHandler::new(resolver, blob_store, metadata_store);
 
         (handler, config_digest, layer_digest, dir)
     }
@@ -1606,19 +1468,16 @@ mod tests {
 
         let dir = TempDir::new().unwrap();
         let root = dir.path().to_str().unwrap();
-        let object: Arc<dyn ObjectStore> =
-            Arc::new(StorageFsBackend::builder().root_dir(root).build().unwrap());
+        let object: Arc<dyn ObjectStore> = Arc::new(StorageFsBackend::builder(root).build());
         let executor = build_test_fs_executor(root, false);
         let store = build_store(object, executor);
         let metadata_store = Arc::new(
-            MetadataStore::builder()
-                .store(store.clone())
+            MetadataStore::builder(store.clone())
                 .link_cache_ttl(0)
                 .access_time_debounce_secs(0)
-                .build()
-                .unwrap(),
+                .build(),
         );
-        let blob_store = Arc::new(BlobStore::builder().store(store.clone()).build().unwrap());
+        let blob_store = Arc::new(BlobStore::new(store.clone()));
 
         // No tag seeded, so the resolve short-circuits; the unreachable
         // downstream URL makes any wrongful push error.
@@ -1629,12 +1488,7 @@ mod tests {
         );
         let resolver = Arc::new(RepositoryResolver::new(Arc::new(repositories)).unwrap());
 
-        let handler = ReplicationJobHandler::builder()
-            .resolver(resolver)
-            .blob_store(blob_store)
-            .metadata_store(metadata_store)
-            .build()
-            .unwrap();
+        let handler = ReplicationJobHandler::new(resolver, blob_store, metadata_store);
 
         let failed_before = push_total(downstream, "failed");
         let pushed_before = push_total(downstream, "pushed");
@@ -1669,19 +1523,16 @@ mod tests {
 
         let dir = TempDir::new().unwrap();
         let root = dir.path().to_str().unwrap();
-        let object: Arc<dyn ObjectStore> =
-            Arc::new(StorageFsBackend::builder().root_dir(root).build().unwrap());
+        let object: Arc<dyn ObjectStore> = Arc::new(StorageFsBackend::builder(root).build());
         let executor = build_test_fs_executor(root, false);
         let store = build_store(object, executor);
         let metadata_store = Arc::new(
-            MetadataStore::builder()
-                .store(store.clone())
+            MetadataStore::builder(store.clone())
                 .link_cache_ttl(0)
                 .access_time_debounce_secs(0)
-                .build()
-                .unwrap(),
+                .build(),
         );
-        let blob_store = Arc::new(BlobStore::builder().store(store.clone()).build().unwrap());
+        let blob_store = Arc::new(BlobStore::new(store.clone()));
 
         // No revision link seeded, so the resolve short-circuits; the
         // unreachable downstream URL makes any wrongful push error.
@@ -1692,12 +1543,7 @@ mod tests {
         );
         let resolver = Arc::new(RepositoryResolver::new(Arc::new(repositories)).unwrap());
 
-        let handler = ReplicationJobHandler::builder()
-            .resolver(resolver)
-            .blob_store(blob_store)
-            .metadata_store(metadata_store)
-            .build()
-            .unwrap();
+        let handler = ReplicationJobHandler::new(resolver, blob_store, metadata_store);
 
         let failed_before = push_total(downstream, "failed");
         let pushed_before = push_total(downstream, "pushed");

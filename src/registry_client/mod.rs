@@ -118,10 +118,20 @@ pub struct RegistryClient {
 }
 
 impl RegistryClient {
-    /// Starts building a registry client from individual resolved fields.
+    /// Starts building a registry client from individual resolved fields. The
+    /// base `url`, the pre-built HTTP `client` (carrying the resolved
+    /// TLS/redirect/timeout policy) and the shared token/auth `cache` are
+    /// required; `basic_auth` and `max_manifest_size_bytes` are optional fluent
+    /// setters on the returned builder.
     #[must_use]
-    pub fn builder() -> RegistryClientBuilder {
-        RegistryClientBuilder::default()
+    pub fn builder(url: String, client: Client, cache: Arc<Cache>) -> RegistryClientBuilder {
+        RegistryClientBuilder {
+            url,
+            client,
+            basic_auth: None,
+            cache,
+            max_manifest_size_bytes: None,
+        }
     }
 
     /// Resolves the HTTP client (TLS, redirects, timeout) and basic-auth
@@ -176,13 +186,10 @@ impl RegistryClient {
     ) -> Result<Self, Error> {
         let (client, basic_auth) = Self::resolve_config_fields(config)?;
 
-        Self::builder()
-            .url(config.url.clone())
-            .client(client)
+        Ok(Self::builder(config.url.clone(), client, cache)
             .basic_auth(basic_auth)
-            .cache(cache)
             .max_manifest_size_bytes(max_manifest_size_bytes)
-            .build()
+            .build())
     }
 
     async fn query(
@@ -494,44 +501,22 @@ impl RegistryClient {
 
 /// Builder for [`RegistryClient`] taking individual resolved fields.
 ///
-/// `url`, `client` and `cache` are required; `basic_auth` defaults to none and
+/// `url`, `client` and `cache` are required and supplied to
+/// [`RegistryClient::builder`]; `basic_auth` defaults to none and
 /// `max_manifest_size_bytes` defaults to [`DEFAULT_MAX_MANIFEST_SIZE_BYTES`].
-#[derive(Default)]
 pub struct RegistryClientBuilder {
-    url: Option<String>,
-    client: Option<Client>,
+    url: String,
+    client: Client,
     basic_auth: Option<(String, String)>,
-    cache: Option<Arc<Cache>>,
+    cache: Arc<Cache>,
     max_manifest_size_bytes: Option<usize>,
 }
 
 impl RegistryClientBuilder {
-    /// Base URL of the remote registry (required).
-    #[must_use]
-    pub fn url(mut self, url: String) -> Self {
-        self.url = Some(url);
-        self
-    }
-
-    /// Pre-built HTTP client carrying the resolved TLS/redirect/timeout policy
-    /// (required).
-    #[must_use]
-    pub fn client(mut self, client: Client) -> Self {
-        self.client = Some(client);
-        self
-    }
-
     /// Optional resolved basic-auth credentials (`username`, `password`).
     #[must_use]
     pub fn basic_auth(mut self, basic_auth: Option<(String, String)>) -> Self {
         self.basic_auth = basic_auth;
-        self
-    }
-
-    /// Shared token/auth cache (required).
-    #[must_use]
-    pub fn cache(mut self, cache: Arc<Cache>) -> Self {
-        self.cache = Some(cache);
         self
     }
 
@@ -543,30 +528,17 @@ impl RegistryClientBuilder {
     }
 
     /// Builds the [`RegistryClient`].
-    ///
-    /// # Errors
-    ///
-    /// Returns [`Error::Initialization`] when a required field is missing.
-    pub fn build(self) -> Result<RegistryClient, Error> {
-        let url = self.url.ok_or_else(|| {
-            Error::Initialization("registry_client builder requires a url".into())
-        })?;
-        let client = self.client.ok_or_else(|| {
-            Error::Initialization("registry_client builder requires a client".into())
-        })?;
-        let cache = self.cache.ok_or_else(|| {
-            Error::Initialization("registry_client builder requires a cache".into())
-        })?;
-
-        Ok(RegistryClient {
-            url,
-            client,
+    #[must_use]
+    pub fn build(self) -> RegistryClient {
+        RegistryClient {
+            url: self.url,
+            client: self.client,
             basic_auth: self.basic_auth,
-            cache,
+            cache: self.cache,
             token_refresh: Mutex::new(()),
             max_manifest_size_bytes: self
                 .max_manifest_size_bytes
                 .unwrap_or(DEFAULT_MAX_MANIFEST_SIZE_BYTES),
-        })
+        }
     }
 }

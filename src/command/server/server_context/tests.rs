@@ -136,7 +136,7 @@ pub async fn create_test_registry(config: &Configuration) -> Registry {
     let auth_cache = config.cache.to_backend().unwrap();
     let storage_config = config.resolve_registry_storage();
     let store = storage_config.build_store().await.unwrap();
-    let metadata_store = Arc::new(MetadataStore::builder().store(store).build().unwrap());
+    let metadata_store = Arc::new(MetadataStore::builder(store).build());
 
     let mut repositories_map = HashMap::new();
     for (name, repo_config) in &config.repository {
@@ -799,12 +799,7 @@ fn build_shutdown_flush_harness(unique_prefix: &str) -> ShutdownFlushHarness {
         key_prefix: unique_prefix.to_string(),
     };
     let http = Arc::new(S3HttpBackend::new(&conn.to_client_config()).expect("s3 http client"));
-    let raw_storage = Arc::new(
-        StorageS3Backend::builder()
-            .client(http)
-            .build()
-            .expect("s3 storage"),
-    );
+    let raw_storage = Arc::new(StorageS3Backend::builder(http).build());
     let object_store: Arc<dyn ObjectStore> = raw_storage.clone();
     let cond_store: Arc<dyn ConditionalStore> = raw_storage;
     let executor = build_executor(
@@ -818,12 +813,10 @@ fn build_shutdown_flush_harness(unique_prefix: &str) -> ShutdownFlushHarness {
     .expect("build executor");
     let facade = build_store(object_store, executor);
     let metadata_store: Arc<MetadataStore> = Arc::new(
-        MetadataStore::builder()
-            .store(facade)
+        MetadataStore::builder(facade)
             .access_time_debounce_secs(3600)
             .link_cache_ttl(0)
-            .build()
-            .expect("s3 metadata backend"),
+            .build(),
     );
 
     let blob_backend = Arc::new(

@@ -160,7 +160,7 @@ mod tests {
         blob_store: Arc<blob_store::BlobStore>,
         metadata_store: Arc<MetadataStore>,
     ) -> Executor {
-        Executor::new(blob_store, metadata_store)
+        Executor::new_for_test(blob_store, metadata_store)
     }
 
     async fn create_manifest_scenario(
