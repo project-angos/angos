@@ -57,6 +57,10 @@ max_concurrent_pushes = 4             # optional; per-manifest blob fan-out (pos
 Pending jobs for a removed or renamed downstream fail loudly and dead-letter after their retry budget. Clear them with `angos scrub --replication-orphans` (use `--dry-run` to preview), or inspect them via the jobs admin UI or the [`_jobs` API](../reference/api-endpoints.md#list-failed-jobs) (`?queue=replication`).
 :::
 
+:::note Reclaiming stranded blobs on a receiver
+When a replicated manifest push uploads a blob but its manifest then loses last-writer-wins or dead-letters, the receiver keeps the blob's per-namespace ownership grant with no manifest referencing it, pinning the bytes. `angos scrub --orphan-grants <age>` (e.g. `24h`) revokes such grants once the blob is older than the given age and reclaims the bytes; the age gate avoids racing an in-flight push.
+:::
+
 ## Global Knobs
 
 One `[global]` field tunes replication across all repositories:

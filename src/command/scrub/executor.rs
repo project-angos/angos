@@ -12,7 +12,10 @@ use crate::{
         blob_store::{self, MultipartCleanup},
         job_store::{Error as JobStoreError, JobEnvelope, JobStore},
         manifest::link_plan,
-        metadata_store::{BlobIndexOperation, LinkOperation, MetadataStore, link_kind::LinkKind},
+        metadata_store::{
+            BlobIndexOperation, Error as MetadataError, LinkOperation, MetadataStore,
+            link_kind::LinkKind,
+        },
     },
     replication::{
         REPLICATION_DELETE_MANIFEST_KIND, REPLICATION_PUSH_MANIFEST_KIND, ReplicationPushPayload,
@@ -195,6 +198,41 @@ impl ActionSink for Executor {
                 self.metadata_store
                     .update_blob_index(&namespace, &blob, BlobIndexOperation::Remove(link))
                     .await?;
+            }
+            Action::RemoveOrphanBlobGrant { namespace, blob } => {
+                // Hold the `blob-data:{digest}` coarse lock across the re-check
+                // and the revoke, the same one manifest pushes and upload
+                // completions take, so a reference a concurrent push is granting
+                // is never missed and reclaimed underneath it.
+                let session = self.metadata_store.acquire_blob_data_lock(&blob).await?;
+                let result = async {
+                    // Re-check under the lock: a manifest reference may have
+                    // appeared since the checker classified the grant as orphaned.
+                    let links = match self
+                        .metadata_store
+                        .read_blob_index_namespace(&namespace, &blob)
+                        .await
+                    {
+                        Ok(links) => links,
+                        // The grant vanished since classification (a concurrent
+                        // revoke or delete): nothing left to do.
+                        Err(MetadataError::ReferenceNotFound) => return Ok(()),
+                        Err(e) => return Err(Error::from(e)),
+                    };
+                    if links.iter().any(LinkKind::is_tracked) {
+                        info!(
+                            "skipping orphan grant revoke: a manifest reference appeared for '{namespace}/{blob}'"
+                        );
+                        return Ok(());
+                    }
+                    self.metadata_store
+                        .revoke_blob_ownership(&namespace, &blob)
+                        .await
+                        .map_err(Error::from)
+                }
+                .await;
+                session.release().await;
+                result?;
             }
             Action::RecreateLink {
                 namespace,

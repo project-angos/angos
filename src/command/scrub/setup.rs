@@ -7,8 +7,8 @@ use crate::{
     command::scrub::{
         check::{
             BlobChecker, LayoutChecker, LinkReferencesChecker, ManifestChecker, MediaTypeChecker,
-            MultipartChecker, NamespaceChecker, OrphanJobChecker, OrphanQueue, ReferrerChecker,
-            ReplicationChecker, RetentionChecker, TagChecker, UploadChecker,
+            MultipartChecker, NamespaceChecker, OrphanGrantChecker, OrphanJobChecker, OrphanQueue,
+            ReferrerChecker, ReplicationChecker, RetentionChecker, TagChecker, UploadChecker,
         },
         command::Options,
         error::Error,
@@ -137,6 +137,27 @@ pub fn multipart_checker(
     Ok(Some(MultipartChecker::new(
         blob_store.clone(),
         multipart_timeout,
+    )))
+}
+
+pub fn orphan_grant_checker(
+    options: &Options,
+    blob_store: &Arc<blob_store::BlobStore>,
+    metadata_store: &Arc<MetadataStore>,
+) -> Result<Option<OrphanGrantChecker>, Error> {
+    let Some(min_age) = options.orphan_grants else {
+        return Ok(None);
+    };
+    let min_age = Duration::from_std(min_age.into())
+        .map_err(|e| Error::Initialization(format!("Orphan-grant age is invalid: {e}")))?;
+    info!(
+        "Orphan blob-grant minimum age set to {} second(s)",
+        min_age.num_seconds()
+    );
+    Ok(Some(OrphanGrantChecker::new(
+        blob_store.clone(),
+        metadata_store.clone(),
+        min_age,
     )))
 }
 

@@ -10,8 +10,8 @@ use crate::{
         bootstrap,
         scrub::{
             check::{
-                BlobChecker, LayoutChecker, MultipartChecker, NamespaceChecker, OrphanJobChecker,
-                StoreChecker, list_all,
+                BlobChecker, LayoutChecker, MultipartChecker, NamespaceChecker, OrphanGrantChecker,
+                OrphanJobChecker, StoreChecker, list_all,
             },
             error::Error,
             executor::{ActionSink, DryRunSink, Executor},
@@ -81,6 +81,12 @@ pub struct Options {
     /// delete cache jobs (pending and dead-lettered) whose repository is no
     /// longer configured for pull-through
     pub cache_orphans: bool,
+    #[argh(option)]
+    /// revoke orphaned blob-ownership grants older than the specified age: a
+    /// blob a namespace owns but no manifest references (e.g. a replication push
+    /// that lost last-writer-wins), reclaiming the bytes when it was the last
+    /// reference
+    pub orphan_grants: Option<humantime::Duration>,
 }
 
 pub struct Command {
@@ -89,6 +95,7 @@ pub struct Command {
     layout_checker: LayoutChecker,
     blob_checker: Option<BlobChecker>,
     multipart_checker: Option<MultipartChecker>,
+    orphan_grant_checker: Option<OrphanGrantChecker>,
     /// One checker per queue selected by `--replication-orphans` and
     /// `--cache-orphans`; empty when neither flag is set.
     orphan_job_checkers: Vec<OrphanJobChecker>,
@@ -132,6 +139,8 @@ impl Command {
         let layout_checker = setup::layout_checker(&blob_backend);
         let blob_checker = setup::blob_checker(options, &blob_backend, &metadata_store);
         let multipart_checker = setup::multipart_checker(options, &blob_backend)?;
+        let orphan_grant_checker =
+            setup::orphan_grant_checker(options, &blob_backend, &metadata_store)?;
         let orphan_job_checkers =
             setup::orphan_job_checkers(options, &metadata_store, &repositories)?;
 
@@ -171,6 +180,7 @@ impl Command {
             layout_checker,
             blob_checker,
             multipart_checker,
+            orphan_grant_checker,
             orphan_job_checkers,
             sink,
             replication_drain,
@@ -206,6 +216,7 @@ impl Command {
         self.migrate_storage_layout().await?;
         self.scrub_metadata().await?;
         self.scrub_blobs().await?;
+        self.scrub_orphan_grants().await?;
         self.scrub_multipart_uploads().await?;
         // Orphan jobs (replication and cache queues) must be scrubbed before
         // the drain: the drain claims any pending replication job and would
@@ -244,6 +255,15 @@ impl Command {
             && let Err(e) = checker.check_all(self.sink.as_mut()).await
         {
             warn!("Blob scrub checker failed: {e}");
+        }
+        Ok(())
+    }
+
+    async fn scrub_orphan_grants(&mut self) -> Result<(), Error> {
+        if let Some(checker) = &self.orphan_grant_checker
+            && let Err(e) = checker.check_all(self.sink.as_mut()).await
+        {
+            warn!("Orphan blob-grant scrub checker failed: {e}");
         }
         Ok(())
     }
@@ -353,6 +373,7 @@ mod tests {
             replicate: false,
             replication_orphans: false,
             cache_orphans: false,
+            orphan_grants: None,
         };
 
         let command = Command::new(&options, &config).await;

@@ -18,6 +18,13 @@ pub enum Action {
         blob: Digest,
         link: LinkKind,
     },
+    /// Revoke a namespace's orphaned blob-ownership grant (no manifest in the
+    /// namespace references the blob), reclaiming the bytes when it was the last
+    /// reference anywhere.
+    RemoveOrphanBlobGrant {
+        namespace: String,
+        blob: Digest,
+    },
     RecreateLink {
         namespace: String,
         link: LinkKind,
@@ -111,6 +118,12 @@ impl fmt::Display for Action {
                 write!(
                     f,
                     "remove invalid link from blob index '{namespace}/{blob}': '{link}'"
+                )
+            }
+            Action::RemoveOrphanBlobGrant { namespace, blob } => {
+                write!(
+                    f,
+                    "revoke orphaned blob-ownership grant '{namespace}/{blob}' (no manifest references it)"
                 )
             }
             Action::RecreateLink {

@@ -88,6 +88,7 @@ The scrub command performs storage maintenance and integrity checks. You must sp
 | `--replicate`             |        | Reconcile every replicated namespace against all its configured downstreams. By default reconciliation is additive: it enqueues a replication push for each diverging or downstream-missing tag and never deletes. A downstream marked `prune = true` is treated as an authoritative one-way mirror: reconciliation also enqueues a replication delete for each downstream-only tag, so prune is one-way-only by design and unsafe for active-active peers (even with receiver-side last-writer-wins it can remove a peer's newer tag). Combine with `--dry-run` to preview. See [Configure Replication](../how-to/configure-replication.md). |
 | `--replication-orphans`   |        | Delete replication jobs (pending and dead-lettered) whose downstream or repository is no longer configured                                       |
 | `--cache-orphans`         |        | Delete cache jobs (pending and dead-lettered) whose repository is no longer configured for pull-through                                          |
+| `--orphan-grants <duration>` |     | Revoke blob-ownership grants older than the duration (e.g. `24h`) that no manifest references, reclaiming the bytes; cleans up blobs a replication push uploaded before its manifest lost last-writer-wins or dead-lettered |
 
 **Examples:**
 
