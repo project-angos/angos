@@ -283,19 +283,26 @@ impl Registry {
 
     /// Starts a cross-repository blob mount from the authorized `source`,
     /// falling back to an ordinary upload session when the mount cannot be
-    /// satisfied.
-    #[instrument]
+    /// satisfied. A satisfied mount returns a `blob.push` event (the session
+    /// fallback returns none: its eventual upload completion emits one), so a
+    /// mounted blob is as visible to webhook consumers as an uploaded one.
+    #[instrument(skip(actor))]
     pub async fn mount_blob(
         &self,
+        actor: Option<EventActor>,
         namespace: &Namespace,
         mount: &BlobMount,
         source: &Namespace,
-    ) -> Result<StartUploadResponse, Error> {
+    ) -> Result<(StartUploadResponse, Vec<Event>), Error> {
         if let Some(headers) = self.try_cross_repo_mount(namespace, mount, source).await? {
-            return Ok(StartUploadResponse::ExistingBlob { headers });
+            let repository = self.repository_name_for(namespace);
+            let event = Event::new(EventKind::BlobPush, namespace.to_string(), repository)
+                .digest(Some(mount.digest.to_string()))
+                .actor(actor);
+            return Ok((StartUploadResponse::ExistingBlob { headers }, vec![event]));
         }
 
-        self.open_upload_session(namespace).await
+        Ok((self.open_upload_session(namespace).await?, Vec::new()))
     }
 
     #[instrument(skip(stream))]
@@ -699,7 +706,10 @@ mod tests {
                 digest: digest.clone(),
                 from: Some(source.clone()),
             };
-            let response = registry.mount_blob(target, &mount, source).await.unwrap();
+            let (response, _events) = registry
+                .mount_blob(None, target, &mount, source)
+                .await
+                .unwrap();
 
             match response {
                 StartUploadResponse::ExistingBlob { headers } => {
@@ -726,6 +736,68 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_mount_blob_emits_blob_push_event() {
+        // A satisfied mount must emit blob.push so webhook consumers see the
+        // mounted blob, just as a completed upload does.
+        for test_case in backends() {
+            let registry = test_case.registry();
+            let source = &Namespace::new("test-repo/source").unwrap();
+            let target = &Namespace::new("test-repo/target").unwrap();
+
+            let digest = put_blob_direct(registry.metadata_store.store(), b"mountable").await;
+            BlobOwnership::new(registry.metadata_store.as_ref())
+                .grant(source, &digest)
+                .await
+                .unwrap();
+
+            let mount = BlobMount {
+                digest: digest.clone(),
+                from: Some(source.clone()),
+            };
+            let (response, events) = registry
+                .mount_blob(None, target, &mount, source)
+                .await
+                .unwrap();
+
+            assert!(matches!(response, StartUploadResponse::ExistingBlob { .. }));
+            assert_eq!(events.len(), 1, "a satisfied mount must emit one event");
+            assert_eq!(events[0].kind, EventKind::BlobPush);
+            assert_eq!(events[0].namespace, target.to_string());
+            assert_eq!(
+                events[0].digest.as_deref(),
+                Some(digest.to_string().as_str())
+            );
+            test_case.cleanup().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn test_mount_blob_fallback_emits_no_event() {
+        // The session fallback grants nothing yet; its eventual upload emits the
+        // event, so the mount itself must not.
+        for test_case in backends() {
+            let registry = test_case.registry();
+            let source = &Namespace::new("test-repo/source").unwrap();
+            let target = &Namespace::new("test-repo/target").unwrap();
+
+            // Present but unowned by `source` -> the mount falls back to a session.
+            let digest = put_blob_direct(registry.metadata_store.store(), b"not owned").await;
+            let mount = BlobMount {
+                digest,
+                from: Some(source.clone()),
+            };
+            let (response, events) = registry
+                .mount_blob(None, target, &mount, source)
+                .await
+                .unwrap();
+
+            assert!(matches!(response, StartUploadResponse::Session { .. }));
+            assert!(events.is_empty(), "a fallback session must emit no event");
+            test_case.cleanup().await;
+        }
+    }
+
+    #[tokio::test]
     async fn test_mount_blob_falls_back_when_source_lacks_blob() {
         for test_case in backends() {
             let registry = test_case.registry();
@@ -739,7 +811,10 @@ mod tests {
                 digest: digest.clone(),
                 from: Some(source.clone()),
             };
-            let response = registry.mount_blob(target, &mount, source).await.unwrap();
+            let (response, _events) = registry
+                .mount_blob(None, target, &mount, source)
+                .await
+                .unwrap();
 
             match response {
                 StartUploadResponse::Session { headers } => {
@@ -779,7 +854,10 @@ mod tests {
                 digest: absent,
                 from: Some(source.clone()),
             };
-            let response = registry.mount_blob(target, &mount, source).await.unwrap();
+            let (response, _events) = registry
+                .mount_blob(None, target, &mount, source)
+                .await
+                .unwrap();
 
             assert!(
                 matches!(response, StartUploadResponse::Session { .. }),
@@ -807,7 +885,10 @@ mod tests {
                 digest: digest.clone(),
                 from: None,
             };
-            let response = registry.mount_blob(target, &mount, owner).await.unwrap();
+            let (response, _events) = registry
+                .mount_blob(None, target, &mount, owner)
+                .await
+                .unwrap();
 
             match response {
                 StartUploadResponse::ExistingBlob { headers } => {
@@ -842,7 +923,10 @@ mod tests {
                 digest: digest.clone(),
                 from: None,
             };
-            let response = registry.mount_blob(target, &mount, source).await.unwrap();
+            let (response, _events) = registry
+                .mount_blob(None, target, &mount, source)
+                .await
+                .unwrap();
 
             assert!(
                 matches!(response, StartUploadResponse::Session { .. }),
@@ -873,8 +957,8 @@ mod tests {
                 digest: digest.clone(),
                 from: None,
             };
-            let response = registry
-                .mount_blob(target, &mount, authorized)
+            let (response, _events) = registry
+                .mount_blob(None, target, &mount, authorized)
                 .await
                 .unwrap();
 
