@@ -260,15 +260,18 @@ async fn push_one_blob(
     digest: &Digest,
 ) -> Result<(), Error> {
     let head_location = downstream.get_blob_path(NO_LOCAL_PREFIX, namespace, digest);
-    // Only a true 404 means absent; a transient probe failure must fail the
-    // push (the job retries) instead of triggering a pointless full upload.
-    match downstream.head_blob(&[], &head_location).await {
-        Ok(_) => {
-            debug!(namespace, %digest, "Blob already present on downstream; skipping");
-            return Ok(());
-        }
-        Err(RegistryError::BlobUnknown) => {}
-        Err(e) => return Err(Error::Registry(e)),
+    // Existence-only probe: any 2xx means present (the optional
+    // Docker-Content-Digest header is not required, so a converged blob never
+    // dead-letters on a minimal downstream); a 404 means absent; a transient
+    // failure fails the push so the job retries instead of doing a pointless
+    // full upload.
+    if downstream
+        .blob_exists(&head_location)
+        .await
+        .map_err(Error::Registry)?
+    {
+        debug!(namespace, %digest, "Blob already present on downstream; skipping");
+        return Ok(());
     }
 
     let start_location = downstream.get_uploads_start_path(NO_LOCAL_PREFIX, namespace);

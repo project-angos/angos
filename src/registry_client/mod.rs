@@ -343,6 +343,30 @@ impl RegistryClient {
         Ok((digest, size))
     }
 
+    /// HEAD-probes a blob for presence only: `Ok(true)` on any 2xx, `Ok(false)`
+    /// on `404`, and an error on any other status or transport failure.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the request fails or the downstream returns a
+    /// non-success status other than `404`.
+    pub async fn blob_exists(&self, location: &str) -> Result<bool, Error> {
+        // Unlike `head_blob` this never reads `Docker-Content-Digest`, which the
+        // OCI spec makes a SHOULD on blob HEAD: a conformant downstream that
+        // omits it must read as present, not as a probe failure.
+        let response = self.query(&Method::HEAD, &[], location).await?;
+        let status = response.status();
+        if status.is_success() {
+            return Ok(true);
+        }
+        if status == StatusCode::NOT_FOUND {
+            return Ok(false);
+        }
+        Err(Error::Internal(format!(
+            "blob_exists: downstream returned status {status}"
+        )))
+    }
+
     /// Streams a blob from the upstream registry.
     ///
     /// # Errors

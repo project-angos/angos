@@ -227,6 +227,102 @@ async fn test_head_blob_not_found() {
 }
 
 #[tokio::test]
+async fn test_blob_exists_true_when_digest_header_absent() {
+    // The OCI spec makes Docker-Content-Digest a SHOULD on blob HEAD; a 2xx
+    // without it must read as present, not as a probe failure that would
+    // dead-letter a converged push.
+    let mock_server = MockServer::start().await;
+    let test_digest = "sha256:1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef";
+
+    Mock::given(method("HEAD"))
+        .and(path(format!("/v2/test/blobs/{test_digest}")))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&mock_server)
+        .await;
+
+    let config = RegistryClientConfig {
+        url: mock_server.uri(),
+        max_redirect: 5,
+        server_ca_bundle: None,
+        client_certificate: None,
+        client_private_key: None,
+        username: None,
+        password: None,
+    };
+    let cache = cache::Config::Memory.to_backend().unwrap();
+    let client =
+        RegistryClient::from_config(&config, cache, DEFAULT_MAX_MANIFEST_SIZE_BYTES).unwrap();
+
+    let present = client
+        .blob_exists(&format!("{}/v2/test/blobs/{test_digest}", mock_server.uri()))
+        .await
+        .unwrap();
+    assert!(present, "a 2xx HEAD without a digest header must read as present");
+}
+
+#[tokio::test]
+async fn test_blob_exists_false_on_404() {
+    let mock_server = MockServer::start().await;
+
+    Mock::given(method("HEAD"))
+        .and(path("/v2/test/blobs/sha256:absent"))
+        .respond_with(ResponseTemplate::new(404))
+        .mount(&mock_server)
+        .await;
+
+    let config = RegistryClientConfig {
+        url: mock_server.uri(),
+        max_redirect: 5,
+        server_ca_bundle: None,
+        client_certificate: None,
+        client_private_key: None,
+        username: None,
+        password: None,
+    };
+    let cache = cache::Config::Memory.to_backend().unwrap();
+    let client =
+        RegistryClient::from_config(&config, cache, DEFAULT_MAX_MANIFEST_SIZE_BYTES).unwrap();
+
+    let present = client
+        .blob_exists(&format!("{}/v2/test/blobs/sha256:absent", mock_server.uri()))
+        .await
+        .unwrap();
+    assert!(!present, "a 404 HEAD must read as absent");
+}
+
+#[tokio::test]
+async fn test_blob_exists_errors_on_server_error() {
+    let mock_server = MockServer::start().await;
+
+    Mock::given(method("HEAD"))
+        .and(path("/v2/test/blobs/sha256:boom"))
+        .respond_with(ResponseTemplate::new(503))
+        .mount(&mock_server)
+        .await;
+
+    let config = RegistryClientConfig {
+        url: mock_server.uri(),
+        max_redirect: 5,
+        server_ca_bundle: None,
+        client_certificate: None,
+        client_private_key: None,
+        username: None,
+        password: None,
+    };
+    let cache = cache::Config::Memory.to_backend().unwrap();
+    let client =
+        RegistryClient::from_config(&config, cache, DEFAULT_MAX_MANIFEST_SIZE_BYTES).unwrap();
+
+    let result = client
+        .blob_exists(&format!("{}/v2/test/blobs/sha256:boom", mock_server.uri()))
+        .await;
+    assert!(
+        result.is_err(),
+        "a transient 5xx must fail the probe so the job retries instead of re-uploading"
+    );
+}
+
+#[tokio::test]
 async fn test_head_manifest_success() {
     let mock_server = MockServer::start().await;
     let test_digest = "sha256:abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890";
