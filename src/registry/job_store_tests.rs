@@ -379,7 +379,7 @@ async fn run_enqueue_after_claim_creates_second_pending(h: Harness) {
 }
 
 // =========================================================================
-// End-to-end claim cycle — FS store
+// End-to-end claim cycle: FS store
 // =========================================================================
 
 #[tokio::test]
@@ -603,7 +603,7 @@ async fn run_complete_commit_failure_fails_job_over(h: Harness) {
     );
 
     // The job is re-queued (with backoff and a bumped attempt count) under a new
-    // storage key — not deleted, and not left at the original key to be
+    // storage key, not deleted, and not left at the original key to be
     // re-claimed immediately.
     let pending = h.store.list_pending("cache", 10).await.expect("list");
     assert_eq!(

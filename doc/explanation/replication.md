@@ -50,10 +50,10 @@ The push pipeline is recursive:
 
 ## The Durable Job Queue Substrate
 
-Replication does not maintain its own outbox. It rides the same **durable job queue** that backs pull-through cache-fill work (see [Enable Durable Cache Jobs](../how-to/durable-cache-jobs.md)). Each mutation enqueues a small `JobEnvelope` onto a single `replication` queue. This gives replication, for free:
+Replication does not maintain its own outbox. It rides the same **durable job queue** that backs pull-through cache-fill work (see [Enable Durable Cache Jobs](../how-to/durable-cache-jobs.md)). Each mutation enqueues a small `JobEnvelope` onto a single `replication` queue. The queue gives replication:
 
 - **Durability**: pending jobs persist to the metadata store under `_jobs/pending/replication/` and survive restarts. Stop a downstream, keep pushing locally, and the backlog drains when it returns.
-- **Coalescing**: the queue deduplicates on a `lock_key` of `(operation, downstream, namespace, tag)`. A second push to the same tag while one is pending is a no-op; the handler re-resolves the **current** tag-to-digest mapping at execution time, so the latest content always wins regardless of how many enqueues coalesced. A push and a delete for the same tag carry different keys and do not collapse into each other, and each distinct delete carries its change timestamp in the key, so a newer deletion never folds into a pending older one (only retries of the same deletion coalesce).
+- **Coalescing**: the queue deduplicates on a `lock_key` of `(operation, downstream, namespace, tag)`. A second push to the same tag while one is pending is a no-op; the handler re-resolves the **current** tag-to-digest mapping at execution time, so the latest content wins regardless of how many enqueues coalesced. A push and a delete for the same tag carry different keys and do not collapse into each other, and each distinct delete carries its change timestamp in the key, so a newer deletion never folds into a pending older one (only retries of the same deletion coalesce).
 - **Retry and backoff**: failed pushes are retried with exponential backoff.
 - **Dead-letter**: jobs that exhaust their attempts move to a failed queue, visible (and retryable) from the admin UI.
 - **Backlog visibility**: the `angos_job_queue_pending{queue="replication"}` gauge reports actionable depth.

@@ -61,7 +61,7 @@ mod tests {
         hasher.update(b"data");
         let state = hasher.serialized_state();
 
-        // Truncate to half length — no longer a valid state encoding.
+        // Truncate to half length, no longer a valid state encoding.
         let truncated = &state[..state.len() / 2];
         let result = Sha256::from_state(truncated);
         assert!(
@@ -75,7 +75,7 @@ mod tests {
         let mut hasher = Sha256::new();
         hasher.update(b"data");
         let mut state = hasher.serialized_state();
-        // Append a spurious byte — wrong total length.
+        // Append a spurious byte: wrong total length.
         state.push(0xFF);
 
         let result = Sha256::from_state(&state);

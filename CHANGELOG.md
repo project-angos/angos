@@ -35,8 +35,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 ### Changed
 
 - Blob upload sessions now use a single resumable streaming upload in place of the previous multipart-based protocol, and in-flight sessions do not survive the upgrade (clients retry and `scrub --uploads` reaps the stale staging artifacts).
-- The angos extension API (the `_repositories`, `_namespaces`, `_revisions`, and `_uploads` discovery endpoints, plus the new `_jobs` admin endpoints) moved from the `/v2/_ext/...` prefix to the top-level `/_ext/...` prefix, so `/v2` now serves only OCI Distribution Spec routes. This is breaking for clients of the `/v2/_ext/...` endpoints shipped in v1.1.1; update them to the `/_ext/...` paths.
-- The four registry subsystems (metadata, job, upload, and manifest stores) now write atomically through a single transactional-engine design instantiated per subsystem, each with its own lock domain (metadata and job share one instance; the blob store and the in-process job queue each have their own), adding three new top-level prefixes (`.tx-log/`, `.tx-bodies/`, and `.tx-locks/`) that operators should factor into bucket policies. A `_jobs/` prefix is also added when the durable job queue (`[global.job_queue]`) is enabled.
+- The angos extension API moved from the `/v2/_ext/...` prefix to the top-level `/_ext/...` prefix (breaking): update clients of the v1.1.1 `/v2/_ext/...` endpoints to the new paths.
+- The registry subsystems now write atomically through a per-subsystem transactional engine, adding new top-level prefixes (`.tx-log/`, `.tx-bodies/`, `.tx-locks/`, and `_jobs/` when the durable job queue is enabled) that operators should factor into bucket policies.
 - Blob deletion follows the OCI distribution lifecycle, with blob ownership tracked independently from manifest references.
 - Manifests with missing blob or descriptor references are rejected at push time.
 - Stricter OCI semantics for blob range requests and request-header parsing.
@@ -52,17 +52,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - Auth-webhook transport failures surface as errors instead of silent denials.
 - Webhook authorization responses with status 429 or 5xx no longer pin denials in the decision cache; only explicit 2xx and 401/403 outcomes are cached, and unavailable responses re-probe the webhook on the next request.
 - OIDC authentication debug logs no longer include the full token claims map; only provider name/type and the `sub`/`iss` claims are logged to avoid leaking user/CI metadata at `debug` level.
-- TLS listener configuration now supports an explicit `client_auth = "optional" | "required"` setting (default `"optional"` when `client_ca_bundle` is set, preserving existing behavior); operators can now enforce mTLS at the TLS handshake with `client_auth = "required"`. Configs without `client_ca_bundle` continue to load unchanged.
+- TLS listeners support an explicit `client_auth = "optional" | "required"` setting so operators can enforce mTLS at the handshake.
 - Outbound `[registry_client]` blocks with a partial mTLS pair (`client_certificate` set without `client_private_key`, or vice versa) now fail at configuration load instead of silently disabling outbound client authentication.
 - Webhook retries are capped at 16 with saturating backoff arithmetic.
 - The S3 shard-key hash uses SHA-256, so shard placement is stable across processes and builds.
-- Filesystem metadata now uses the same sharded blob-index and namespace-registry layout as S3, while pre-existing legacy `index.json` and `namespace_registry.json` files keep working and only `scrub` migrates them to the sharded layout.
+- Filesystem metadata now uses the same sharded blob-index and namespace-registry layout as S3, with legacy `index.json` and `namespace_registry.json` files still readable until `scrub` migrates them.
 - The Redis client reuses a multiplexed connection across operations and backs off on lock contention.
-- The S3 backend now uses a custom HTTP client in place of the AWS SDK: focused retry / timeout / signing tailored to the operations the registry actually issues, smaller binary, and no AWS SDK transitive dependencies.
+- The S3 backend now uses a custom HTTP client in place of the AWS SDK, dropping the AWS SDK transitive dependencies and shrinking the binary.
 - Filesystem cleanup of empty ancestor directories walks up from a deleted leaf, removing empty parents until the first non-empty directory or the store root, and is rooted-subtree guarded; a misshaped path can never walk above the configured root.
 - UI, documentation-website and Rust dependencies upgraded.
-- Scrub's orphan manifest deletion now plans link operations through the runtime write path's `link_plan::delete` primitive, so it also removes any tag links still pointing at an orphaned manifest digest (previously left dangling).
-- Scrub's orphan manifest deletion now tolerates manifest blobs that fail to parse by removing the digest link (and any tags pointing at it) while still surfacing blob-read failures so operators notice broken storage.
+- Scrub's orphan manifest deletion now also removes tag links pointing at an orphaned digest and tolerates unparseable manifest blobs while still surfacing blob-read failures.
 - Overlapping repository prefixes (e.g. `team` and `team/app`) are rejected at startup rather than resolved non-deterministically at runtime.
 - `fs::BlobStore::read` on a missing blob now returns `BlobNotFound` (previously `ReferenceNotFound`), aligning the FS backend with S3.
 - The six S3 connection fields duplicated across `blob_store`, `metadata_store`, and `job_store` are now defined once in `registry::s3_connection::S3ConnectionConfig`, and `[blob_store.s3]` now requires the `region` key.
@@ -88,16 +87,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 - Transactional-engine recovery is now race-free against the original owner and idempotent on replay, so a crashed write picked up by another replica cannot collide with the original or re-apply mutations that already landed.
 - Scrub now flushes the metadata store's access-time buffer at exit so retention timestamps are persisted across runs on the S3 backend.
-- Scrub `--links` now prunes stale `referenced_by` entries whose revision no longer exists and removes the link and its blob-index entry when the set becomes empty, reclaiming storage.
-- Scrub `--links` and `--media-types` now remove revision links whose manifest blob is permanently missing, cascading a `DeleteOrphanManifest` action to drop the digest link and every tag pointing at it while still propagating transient storage errors.
-- Scrub `--tags` now removes tags whose target manifest blob is missing, cascading a `DeleteOrphanManifest` action per digest to drop the digest revision link and every tag link pointing at it.
-- Scrub `-r` no longer aborts the whole namespace when one orphan manifest's blob is missing or unreadable: absent blobs are handled gracefully, transient errors retry next run, and a failure on one revision no longer blocks the rest.
-- Scrub orphan-blob deletion now acquires the blob-data lock and re-checks ownership before deleting, preventing a concurrent upload from losing its bytes when scrub classifies the blob as orphan.
-- Scrub on S3 now converges namespaces whose only artifact is an upload session, making them visible to `UploadChecker` so their stale bytes are cleaned up by `scrub --uploads`.
-- `scrub --uploads` now also aborts the in-flight S3 multipart upload recorded in a stale session, so an abandoned upload no longer leaves behind an orphan multipart.
-- Scrub `-b` now purges all blob-index entries (including ownership markers) for any blob whose backing bytes are absent, so runtime `can_read` no longer reports such blobs as accessible.
-- Scrub `-m` now validates that each revision's digest link points back at its own digest and rewrites it on mismatch, repairing a corrupt link even when its blob is unreachable.
-- Scrub's orphan manifest deletion now uses `delete_with_referrer` for tracked links (config, layer, child-manifest), preventing spurious link removal for blobs still referenced by other manifests.
+- Scrub `--links` prunes stale `referenced_by` entries whose revision no longer exists, removing the link and its blob-index entry when the set empties.
+- Scrub `--links`, `--media-types`, and `--tags` remove revision links and tags whose manifest blob is permanently missing, cascading a `DeleteOrphanManifest` to drop the digest link and every tag pointing at it.
+- Scrub `-r` no longer aborts the whole namespace when one orphan manifest's blob is missing or unreadable.
+- Scrub `-b` purges all blob-index entries (including ownership markers) for any blob whose backing bytes are absent.
+- Scrub `-m` validates that each revision's digest link points back at its own digest and rewrites it on mismatch.
+- Scrub orphan-blob deletion acquires the blob-data lock and re-checks ownership before deleting, so a concurrent upload cannot lose its bytes.
+- Scrub orphan manifest deletion uses `delete_with_referrer` for tracked links, avoiding spurious removal of blobs still referenced by other manifests.
+- Scrub on S3 converges namespaces whose only artifact is an upload session, so `scrub --uploads` cleans up their stale bytes and aborts the recorded in-flight multipart upload.
 - Hardened S3 uploads and blob-index locking against contention and partial-failure scenarios.
 - Failed upload cleanups no longer abort the client request; orphaned S3 probe objects are surfaced via warning instead of silently leaking.
 - Multipart uploads and parts are aborted on drop or panic, so failed uploads don't leave orphans on S3.

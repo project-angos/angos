@@ -53,25 +53,25 @@ pub trait TransactionExecutor: Send + Sync {
     /// executor acquires distributed locks on the transaction's lock set; the
     /// CAS executor relies on conditional storage operations and acquires no
     /// transaction-scoped lock). Callers that hold their own [`LockSession`]
-    /// — for example, the durable job consumer's per-`lock_key` execution
-    /// lock — keep that session alive across this call and release it
+    /// (for example, the durable job consumer's per-`lock_key` execution
+    /// lock) keep that session alive across this call and release it
     /// explicitly afterwards.
     ///
     /// # Errors
     ///
-    /// - [`Error::Conflict`] — the transaction's read set or preconditions
+    /// - [`Error::Conflict`]: the transaction's read set or preconditions
     ///   were not met; the caller should rebuild and retry.
-    /// - [`Error::Precondition`] — a CAS precondition failed during Apply and
+    /// - [`Error::Precondition`]: a CAS precondition failed during Apply and
     ///   the transaction was rolled back.
-    /// - [`Error::Lock`] — a lock could not be acquired within the retry
+    /// - [`Error::Lock`]: a lock could not be acquired within the retry
     ///   budget.
-    /// - [`Error::Storage`] — an underlying storage operation failed.
+    /// - [`Error::Storage`]: an underlying storage operation failed.
     async fn execute(&self, tx: Transaction) -> Result<Outcome, Error>;
 
     /// Non-blocking single-attempt lock acquire over the engine's internal lock.
     ///
     /// Returns `Ok(Some(session))` when all `keys` were acquired without
-    /// contention. Returns `Ok(None)` when any key is already held — the caller
+    /// contention. Returns `Ok(None)` when any key is already held; the caller
     /// should skip this job and move on. Returns `Err` only on a hard storage
     /// error.
     ///
@@ -188,9 +188,7 @@ where
     }
 }
 
-// ───────────────────────────────────────────────────────────────────────────
-// Executor factory — hides lock-storage and executor strategy from callers
-// ───────────────────────────────────────────────────────────────────────────
+// Executor factory: hides lock-storage and executor strategy from callers
 
 /// Build a [`TransactionExecutor`] from operator-level inputs.
 ///

@@ -686,7 +686,7 @@ fn error_to_response_falls_back_to_500_when_builder_fails() {
     // byte (\0) is rejected by hyper as invalid.  We cannot inject this
     // through a public Error variant, so we call the builder directly in the
     // same way error_to_response does, confirm it errors, and then verify that
-    // fallback_500() produces the expected minimal 500 response — which is
+    // fallback_500() produces the expected minimal 500 response, which is
     // exactly what error_to_response calls via unwrap_or_else.
     let builder_result: Result<Response<ResponseBody>, _> = Response::builder()
         .status(StatusCode::UNAUTHORIZED)

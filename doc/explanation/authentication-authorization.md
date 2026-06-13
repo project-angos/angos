@@ -283,10 +283,10 @@ above ordinary read traffic. They are intentionally excluded from broad
 
 ```toml
 rules = [
-  # Browsing is fine for any authenticated user…
+  # Browsing is fine for any authenticated user.
   "identity.username != null && request.action in ['list-tags', 'list-repositories']",
 
-  # …job inspection and mutation is admin-only.
+  # Job inspection and mutation is admin-only.
   "identity.username == 'admin' && request.action in ['list-jobs', 'list-failed-jobs', 'retry-job', 'delete-job']",
 ]
 ```

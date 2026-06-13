@@ -52,7 +52,7 @@ impl std::fmt::Debug for Inner {
 
 /// In-process [`ObjectStore`] backed by a `HashMap`.
 ///
-/// All clones share the same underlying map. Safe to clone; the `Arc<Mutex<…>>`
+/// All clones share the same underlying map. Safe to clone; the `Arc<Mutex<...>>`
 /// is shared across clones.
 ///
 /// # Examples
@@ -146,7 +146,7 @@ impl ObjectStore for MemoryObjectStore {
         // Treat `prefix` as a directory boundary (see `dir_prefix`): a
         // non-empty prefix is normalised to `prefix/` so keys that merely share
         // a common string prefix survive (e.g. "jobs/cache" must not delete
-        // "jobs/cache_extra/foo"). An empty prefix is a no-op — it must not
+        // "jobs/cache_extra/foo"). An empty prefix is a no-op: it must not
         // delete every object.
         let effective_prefix = dir_prefix(prefix);
         if effective_prefix.is_empty() {
@@ -350,7 +350,7 @@ impl ObjectStore for MemoryObjectStore {
 
     async fn complete_upload(&self, key: &str) -> Result<(), Error> {
         // Ensure the object exists (an upload completed with no writes still
-        // produces an empty object at `key`); otherwise no-op — the data already
+        // produces an empty object at `key`); otherwise no-op, the data already
         // lives at `key`.
         if self.lock().data.contains_key(key) {
             Ok(())
@@ -623,7 +623,7 @@ mod tests {
         assert_eq!(s.get("src").await.unwrap(), b"data");
     }
 
-    /// Exercises the trait-default `move_object` (copy + delete) — the memory
+    /// Exercises the trait-default `move_object` (copy + delete); the memory
     /// backend does not override it.
     #[tokio::test]
     async fn move_object_relocates_and_removes_source() {

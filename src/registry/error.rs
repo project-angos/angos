@@ -122,14 +122,14 @@ impl From<blob_store::Error> for Error {
     }
 }
 
-// `oci::Error` routes to `NameInvalid` — preserve that semantic.
+// `oci::Error` routes to `NameInvalid`: preserve that semantic.
 impl From<oci::Error> for Error {
     fn from(_: oci::Error) -> Self {
         Error::NameInvalid
     }
 }
 
-// `x509_parser::error::X509Error` routes to `Unauthorized` — preserve that
+// `x509_parser::error::X509Error` routes to `Unauthorized`: preserve that
 // semantic.
 impl From<x509_parser::error::X509Error> for Error {
     fn from(_: x509_parser::error::X509Error) -> Self {

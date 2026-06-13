@@ -50,7 +50,7 @@ pub async fn probe_conditional_capabilities_with_key(
             )))
         })?;
 
-    // Test If-None-Match: * — expect PreconditionFailed because the object already exists.
+    // Test If-None-Match: *: expect PreconditionFailed because the object already exists.
     let put_if_none_match = match store
         .put_if_absent(probe_key, Bytes::from_static(b"probe"))
         .await
@@ -69,7 +69,7 @@ pub async fn probe_conditional_capabilities_with_key(
         }
     };
 
-    // Test If-Match: <etag> — correct ETag must succeed; bogus ETag must fail.
+    // Test If-Match: <etag>: correct ETag must succeed; bogus ETag must fail.
     let put_if_match = match store.get_with_etag(probe_key).await {
         Ok((_, Some(etag))) => {
             let correct = store
@@ -124,7 +124,7 @@ pub async fn probe_conditional_capabilities_with_key(
         }
     };
 
-    // Cleanup — may already have been deleted by the delete_if_match test.
+    // Cleanup: may already have been deleted by the delete_if_match test.
     if let Err(e) = store.delete(probe_key).await
         && !matches!(e, StorageError::NotFound)
     {

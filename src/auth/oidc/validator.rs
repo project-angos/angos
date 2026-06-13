@@ -1103,7 +1103,7 @@ pub mod tests {
             .mount(&mock_server)
             .await;
 
-        // No kid in header — validator must reject because JWKS keys require kid matching.
+        // No kid in header, so the validator must reject because JWKS keys require kid matching.
         let mut claims: HashMap<String, serde_json::Value> = HashMap::new();
         claims.insert("iss".to_string(), json!(mock_server.uri()));
         claims.insert("sub".to_string(), json!("test-user"));
@@ -1422,7 +1422,7 @@ pub mod tests {
         let provider = TestProvider::new(issuer, None);
         let jwks = test_jwks(); // contains public key for private_key_pem()
 
-        // Sign with the alt key — kid matches, but signature won't verify against JWKS.
+        // Sign with the alt key: kid matches, but signature won't verify against JWKS.
         let alt_encoding_key =
             EncodingKey::from_ec_pem(alt_private_key_pem().as_bytes()).expect("alt key must parse");
 
@@ -1513,7 +1513,7 @@ pub mod tests {
         let provider = TestProvider::new(issuer, Some(audience));
 
         // Add a second EC key with a different kid as a decoy.
-        // The x/y values below are from the JWK.rs test — they form a valid
+        // The x/y values below are from the JWK.rs test; they form a valid
         // P-256 public key so `to_decoding_key()` succeeds, but the kid won't
         // match KID and the signature won't verify with it.
         let decoy_x = "MKBCTNIcKUSDii11ySs3526iDZ8AiTo7Tu6KPAqv7D4";

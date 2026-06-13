@@ -44,7 +44,7 @@ static FIXTURES: LazyLock<WebhookFixtures> = LazyLock::new(|| {
     // Bundle = leaf || CA, matching the previous static layout.
     let ca_bundle_pem = format!("{}{}", leaf_cert.pem(), ca_cert.pem());
 
-    // Client identity (CN=philippe, O=admins) — self-signed.
+    // Client identity (CN=philippe, O=admins), self-signed.
     let client_kp = KeyPair::generate().expect("client key");
     let mut client_params = CertificateParams::default();
     let mut client_dn = DistinguishedName::new();

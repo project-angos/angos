@@ -356,17 +356,14 @@ impl Action {
         }
     }
 
-    /// Returns the namespace associated with this action, if any.
     pub fn get_namespace(&self) -> Option<&Namespace> {
         self.action_data().namespace
     }
 
-    /// Returns the digest associated with this action, if any.
     pub fn get_digest(&self) -> Option<&Digest> {
         self.action_data().digest
     }
 
-    /// Returns the manifest reference associated with this action, if any.
     pub fn get_reference(&self) -> Option<&Reference> {
         self.action_data().reference
     }

@@ -57,8 +57,9 @@ pub fn dir_prefix(prefix: &str) -> Cow<'_, str> {
 /// The S3 backend recovers all multipart state (the in-flight upload id, the
 /// committed parts, and the staged sub-part remainder) from S3 itself on every
 /// call, so nothing has to be persisted by the caller between calls. The staged
-/// remainder lives at a `staged/<offset>` child of the upload key's container —
-/// the backend derives that location from `key` alone (it replaces `key`'s
+/// remainder lives at a `staged/<offset>` child of the upload key's
+/// container: the backend derives that location from `key` alone (it replaces
+/// `key`'s
 /// final path segment with `staged/<offset>`, where `offset` is the number of
 /// bytes already committed to parts). This mirrors the historical
 /// `.../_uploads/<uuid>/staged/<offset>` layout so it stays backward
@@ -85,7 +86,7 @@ pub trait ObjectStore: Send + Sync {
     /// The prefix is treated as a directory boundary: a non-empty prefix is
     /// normalised to a trailing `/` (see [`dir_prefix`]), then every object
     /// whose key sits under that directory is removed. A key that merely shares
-    /// a string prefix is never affected — `delete_prefix("tags/v1")` deletes
+    /// a string prefix is never affected: `delete_prefix("tags/v1")` deletes
     /// `tags/v1/...` but leaves `tags/v1-rc/...` untouched.
     ///
     /// A prefix with nothing under it counts as success. An empty prefix is a
@@ -126,8 +127,8 @@ pub trait ObjectStore: Send + Sync {
 
     /// Move `source` to `destination`. The default is a `copy` followed by a
     /// `delete` of the source, which is correct for every backend. Backends
-    /// with a cheaper primitive — notably a same-filesystem `rename`, which is
-    /// atomic and never reads the object body into memory — should override
+    /// with a cheaper primitive (notably a same-filesystem `rename`, which is
+    /// atomic and never reads the object body into memory) should override
     /// this. The transaction engine routes `Mutation::Move` through here, so a
     /// large staged blob promoted to its canonical location is moved without
     /// buffering the whole object.
@@ -138,12 +139,12 @@ pub trait ObjectStore: Send + Sync {
 
     /// Begin/clear a fresh upload at `key`. Idempotent: discards any leaked
     /// prior in-progress upload at `key` (so re-`create`ing at a reused key
-    /// starts clean). Lazy — no backend round-trip is required until the first
+    /// starts clean). Lazy: no backend round-trip is required until the first
     /// write.
     async fn create_upload(&self, key: &str) -> Result<(), Error>;
 
     /// Append `body` (exactly `len` bytes) to the upload at `key`. Returns the
-    /// new total uploaded size. Streamed end-to-end — backends never buffer the
+    /// new total uploaded size. Streamed end-to-end: backends never buffer the
     /// full payload. Append-only.
     async fn write_upload(&self, key: &str, body: ByteStream, len: u64) -> Result<u64, Error>;
 
@@ -160,7 +161,7 @@ pub trait ObjectStore: Send + Sync {
 
     /// List in-flight multipart uploads store-wide, one page at a time.
     /// `key_marker`/`upload_id_marker` continue a previous page; pass `None`
-    /// for both to start. This is a raw primitive — orphan detection (age
+    /// for both to start. This is a raw primitive: orphan detection (age
     /// thresholds, live-session checks) is the caller's responsibility.
     ///
     /// Defaults to an empty page: backends without a multipart protocol (FS,

@@ -166,7 +166,7 @@ pub async fn put_link_raw(store: &Store, namespace: &str, link: &LinkKind, body:
 ///
 /// Test-only setup helper that replaces the deleted `BlobStore::create`
 /// shortcut. Seeds blob bytes without invoking the upload state machine
-/// (no upload-session record, no namespace required) — which matches the
+/// (no upload-session record, no namespace required), which matches the
 /// legacy `BlobStore::create` semantics most closely.
 pub async fn put_blob_direct(store: &Store, content: &[u8]) -> Digest {
     let mut hasher = Sha256::new();

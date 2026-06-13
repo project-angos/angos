@@ -17,7 +17,7 @@ use angos_tx_engine::lock::S3LockConfig;
 /// type is deserialized via `#[serde(flatten)]`; `key_prefix` is the only
 /// optional field and defaults to the empty string. Modules that need their
 /// own per-section defaults implement a custom `Deserialize` and provide their
-/// own field defaults. (The job store has no S3 config of its own — it inherits
+/// own field defaults. (The job store has no S3 config of its own; it inherits
 /// the `[metadata_store]` backend and writes under a hardcoded `_jobs/` prefix.)
 #[derive(Clone, Debug, Default, PartialEq, Deserialize)]
 pub struct S3ConnectionConfig {

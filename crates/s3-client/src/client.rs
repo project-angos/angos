@@ -178,7 +178,7 @@ impl Display for S3Error {
 impl std::error::Error for S3Error {}
 
 /// Request body variants. `Bytes` payloads are replayable across retries
-/// (cheap to clone — refcount only). `Stream` is one-shot; it disables
+/// (cheap to clone: refcount only). `Stream` is one-shot; it disables
 /// payload signing (UNSIGNED-PAYLOAD) so the body never needs buffering.
 pub enum RequestBody<S> {
     Empty,
@@ -199,8 +199,8 @@ pub struct SendOpts {
     pub check_embedded_error: bool,
     /// Whether the request mutates state in a way that is unsafe to replay
     /// blindly (conditional writes/deletes, `CompleteMultipartUpload`). When
-    /// set, the retry path does NOT retry on a status-less (transport) error
-    /// — the request may already have landed on the server, so a blind replay
+    /// set, the retry path does NOT retry on a status-less (transport) error:
+    /// the request may already have landed on the server, so a blind replay
     /// could observe a false `PreconditionFailed`. Explicit retryable HTTP
     /// statuses (5xx / throttle) are still retried, because such a response
     /// proves the server did not apply the request.
@@ -475,7 +475,7 @@ impl S3Client {
                     // A non-idempotent request is not retried on a status-less
                     // (transport) error: the outcome is ambiguous because the
                     // request may already have landed. An explicit retryable
-                    // HTTP status is still retried — the server then proved it
+                    // HTTP status is still retried: the server then proved it
                     // did not apply the request.
                     Err(error)
                         if is_retryable_error(&error)
@@ -665,7 +665,7 @@ impl S3Client {
     }
 }
 
-// ─── public helpers used by the operations module ─────────────────────────
+// public helpers used by the operations module
 
 pub fn range_header(offset: u64) -> HeaderMap {
     let mut headers = HeaderMap::new();
@@ -729,7 +729,7 @@ pub fn content_md5_base64(body: &[u8]) -> String {
     BASE64_STANDARD.encode(Md5::digest(body))
 }
 
-// ─── internal helpers ─────────────────────────────────────────────────────
+// internal helpers
 
 fn build_canonical_request(
     method: &str,

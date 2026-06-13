@@ -72,22 +72,18 @@ impl RepositoryResolver {
             .map(|(_, repo)| repo)
     }
 
-    /// Returns the number of configured repositories.
     pub fn len(&self) -> usize {
         self.inner.len()
     }
 
-    /// Returns an iterator over the repository prefix keys.
     pub fn keys(&self) -> impl Iterator<Item = &str> {
         self.inner.keys().map(String::as_str)
     }
 
-    /// Returns `true` when the map contains an exact key match for `name`.
     pub fn contains_key(&self, name: &str) -> bool {
         self.inner.contains_key(name)
     }
 
-    /// Returns the repository with the exact key `name`, if present.
     pub fn get(&self, name: &str) -> Option<&Repository> {
         self.inner.get(name)
     }

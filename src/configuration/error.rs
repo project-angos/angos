@@ -9,7 +9,7 @@ pub enum Error {
 }
 
 // `notify::Error` is wrapped with a "Watcher error: " prefix to preserve context,
-// so a bare `#[from]` variant is not used here — the message-building `From` impl
+// so a bare `#[from]` variant is not used here, the message-building `From` impl
 // is kept instead.
 impl From<notify::Error> for Error {
     fn from(err: notify::Error) -> Self {

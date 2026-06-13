@@ -21,7 +21,7 @@ use crate::{
     },
 };
 
-// ── Domain types ──────────────────────────────────────────────────────────────
+// Domain types
 
 #[derive(Default, Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct BlobIndex {
@@ -34,7 +34,7 @@ pub enum BlobIndexOperation {
     Remove(LinkKind),
 }
 
-// ── Engine-backed write methods ───────────────────────────────────────────────
+// Engine-backed write methods
 
 impl MetadataStore {
     /// Update the blob-index shard for `digest` in `namespace`.

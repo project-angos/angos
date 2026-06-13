@@ -33,9 +33,7 @@ async fn assert_no_prefix(store: &MemoryObjectStore, prefix: &str) {
     );
 }
 
-// ──────────────────────────────────────────────────────────────────────────────
 // Property tests
-// ──────────────────────────────────────────────────────────────────────────────
 
 /// A committed transaction's mutations must be visible in the store.
 #[tokio::test(flavor = "multi_thread")]
@@ -143,7 +141,7 @@ async fn delete_mutation_removes_key() {
 }
 
 /// Move mutation propagates the body to the destination and removes the
-/// source — under both executors.
+/// source, under both executors.
 #[tokio::test(flavor = "multi_thread")]
 async fn move_mutation_relocates_body_locked() {
     let store = Arc::new(MemoryObjectStore::new());
@@ -277,7 +275,7 @@ async fn recovery_loop_cleans_stale_intent() {
     // because no mutations were applied) and the canonical key must be written.
     assert_no_prefix(&store, ".tx-log/").await;
     assert_no_prefix(&store, ".tx-bodies/").await;
-    // The intent had no Applied progress entries, so it was rolled back —
+    // The intent had no Applied progress entries, so it was rolled back:
     // the key must NOT exist.
     let result = store.get("recovery/key").await;
     assert!(

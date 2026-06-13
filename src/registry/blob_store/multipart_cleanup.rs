@@ -35,7 +35,7 @@ pub fn parse_upload_key(key: &str) -> Option<(&str, &str)> {
 }
 
 /// Returns `true` when a multipart upload initiated at `initiated` should be
-/// considered orphaned — i.e., its age as of `now` meets or exceeds `timeout`.
+/// considered orphaned, i.e. its age as of `now` meets or exceeds `timeout`.
 ///
 /// A negative age (clock skew where `initiated` is in the future) is never
 /// considered orphaned.
@@ -49,7 +49,7 @@ pub fn is_orphan(initiated: DateTime<Utc>, now: DateTime<Utc>, timeout: Duration
 pub trait MultipartCleanup: Send + Sync {
     /// Lists multipart uploads that have exceeded `timeout` and are not
     /// associated with a live upload session (i.e., the `startedat` marker is
-    /// gone). Pure discovery — does not modify any state.
+    /// gone). Pure discovery: does not modify any state.
     async fn list_orphan_multipart_uploads(
         &self,
         timeout: Duration,

@@ -124,7 +124,7 @@ impl Authenticator {
     }
 
     /// Attempts mTLS authentication. Returns `true` if a valid certificate was extracted.
-    /// Errors are logged and suppressed — mTLS is non-fatal so other methods can follow.
+    /// Errors are logged and suppressed: mTLS is non-fatal so other methods can follow.
     async fn try_mtls_authentication(&self, parts: &Parts, identity: &mut ClientIdentity) -> bool {
         match self.mtls_validator.authenticate(parts, identity).await {
             Ok(AuthResult::Authenticated) => {
@@ -153,8 +153,8 @@ impl Authenticator {
 
     /// Tries each OIDC provider in sorted order, returning `true` on first success.
     /// A failure from one provider does not prevent subsequent providers from being tried.
-    /// If no provider succeeds and at least one returned an error, the first error is returned —
-    /// first rather than last so that deterministic sort order also makes error reporting deterministic.
+    /// If no provider succeeds and at least one returned an error, the first error is returned.
+    /// First rather than last so that deterministic sort order also makes error reporting deterministic.
     ///
     /// One `AUTH_ATTEMPTS` increment is emitted per request, reflecting the chain's overall
     /// outcome (success or failure). Per-provider failures during the chain are still logged
@@ -777,7 +777,7 @@ mod tests {
     /// mTLS succeeds + OIDC provider A fails, provider B also fails.
     /// The chain propagates the first OIDC error via `?`, so `authenticate_request`
     /// returns `Err`.  The test verifies the error is the one from the
-    /// alphabetically-first provider ("alpha") — the method-label computation
+    /// alphabetically-first provider ("alpha"). The method-label computation
     /// (`select_auth_method`) is never reached in this path, which is correct
     /// behaviour: an explicit OIDC credential rejection overrides mTLS success.
     #[tokio::test]

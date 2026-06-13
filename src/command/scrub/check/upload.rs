@@ -16,11 +16,11 @@ use crate::{
 };
 
 enum UploadVerdict {
-    /// Upload state is broken (missing summary or corrupted data) — delete.
+    /// Upload state is broken (missing summary or corrupted data): delete.
     DeleteInconsistent,
-    /// Upload age exceeds the timeout — delete.
+    /// Upload age exceeds the timeout: delete.
     DeleteObsolete,
-    /// Upload is healthy or the failure was transient — leave alone.
+    /// Upload is healthy or the failure was transient: leave alone.
     Keep,
 }
 

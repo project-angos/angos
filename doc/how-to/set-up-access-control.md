@@ -271,10 +271,10 @@ Grant them only to operators:
 [global.access_policy]
 default = "deny"
 rules = [
-  # Anyone authenticated may browse the catalogue and uploads…
+  # Anyone authenticated may browse the catalogue and uploads...
   "identity.username != null && request.action in ['list-repositories', 'list-namespaces', 'list-tags', 'list-uploads']",
 
-  # …but only admins may inspect or mutate the durable job queue.
+  # ...but only admins may inspect or mutate the durable job queue.
   "identity.username == 'admin' && request.action in ['list-jobs', 'list-failed-jobs', 'retry-job', 'delete-job']",
 
   # Normal pull traffic.

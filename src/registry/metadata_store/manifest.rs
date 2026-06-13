@@ -1,4 +1,4 @@
-//! `store_manifest` and `delete_manifest` — thin wrappers over the shared
+//! `store_manifest` and `delete_manifest`: thin wrappers over the shared
 //! link-transaction planner in [`crate::registry::metadata_store::link_ops`].
 
 use bytes::Bytes;
@@ -39,7 +39,7 @@ impl MetadataStore {
 
     /// Delete a manifest: removes link metadata, cleans up blob-index shards,
     /// and conditionally deletes the manifest blob-data when no remaining
-    /// namespace holds a reference — all as a single atomic transaction.
+    /// namespace holds a reference, all as a single atomic transaction.
     pub async fn delete_manifest(
         &self,
         namespace: &str,

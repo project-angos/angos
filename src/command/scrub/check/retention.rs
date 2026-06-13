@@ -96,7 +96,7 @@ fn check_repo_policy(
 #[derive(Debug, PartialEq, Eq)]
 enum Fate {
     /// Manifest is protected by another reference, has tags, or its link
-    /// metadata is missing — leave it alone.
+    /// metadata is missing: leave it alone.
     Skip,
     /// Retention policy says to keep this manifest.
     Retain,
@@ -952,7 +952,7 @@ mod tests {
                 .await
                 .unwrap();
 
-            // The healthy revision must be cleaned up — the broken one did not block the loop.
+            // The healthy revision must be cleaned up: the broken one did not block the loop.
             assert!(
                 metadata_store
                     .read_link(namespace, &LinkKind::Digest(digest_healthy), false)

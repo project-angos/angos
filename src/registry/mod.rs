@@ -246,7 +246,7 @@ impl Registry {
 
     /// Acquire the coarse `blob-data:{digest}` lock that serialises blob-data
     /// creation (upload completion) against reclamation (unreferenced delete)
-    /// and against concurrent manifest pushes — which declare the same coarse
+    /// and against concurrent manifest pushes, which declare the same coarse
     /// lock on their link transactions. Without it, a delete can reclaim a
     /// content-addressed blob's bytes in the window between another repository
     /// granting a reference and validating its manifest, surfacing as

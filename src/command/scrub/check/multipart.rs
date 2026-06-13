@@ -9,9 +9,9 @@ use crate::{
     registry::blob_store::MultipartCleanup,
 };
 
-/// Store-wide, backend-level sweep that lists raw orphan S3 multipart uploads —
-/// in-flight uploads older than `timeout` whose upload session is no longer
-/// live (the `startedat` marker is gone) — and aborts them via the keyed
+/// Store-wide, backend-level sweep that lists raw orphan S3 multipart uploads
+/// (in-flight uploads older than `timeout` whose upload session is no longer
+/// live, meaning the `startedat` marker is gone) and aborts them via the keyed
 /// `abort_upload`.
 ///
 /// This is complementary to the `UploadChecker` (`scrub --uploads`), which
