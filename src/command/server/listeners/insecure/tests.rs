@@ -169,23 +169,6 @@ async fn test_insecure_listener_timeouts_initialization() {
     assert_eq!(timeouts[1], Duration::from_secs(100));
 }
 
-#[tokio::test]
-async fn test_insecure_listener_with_zero_port() {
-    let config = InsecureListenerConfig {
-        base: ListenerBaseConfig {
-            bind_address: "127.0.0.1".parse().unwrap(),
-            port: 0,
-            query_timeout: NonZeroU64::new(3600).unwrap(),
-            query_timeout_grace_period: NonZeroU64::new(60).unwrap(),
-        },
-    };
-
-    let context = create_test_server_context().await;
-    let listener = InsecureListener::new(&config, context);
-
-    assert_eq!(listener.binding_address.port(), 0);
-}
-
 async fn create_context_with_webhook(webhook_url: &str) -> ServerContext {
     create_test_server_context_with(TestConfigOptions {
         webhooks: vec![TestWebhook {

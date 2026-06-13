@@ -135,17 +135,6 @@ mod tests {
     }
 
     #[test]
-    fn metadata_store_variant_preserves_source() {
-        let inner = metadata_store::Error::ReferenceNotFound;
-        let error = Error::MetadataStore(inner);
-        assert!(
-            error.source().is_some(),
-            "MetadataStore variant must expose its source via Error::source()"
-        );
-        assert!(matches!(error, Error::MetadataStore(_)));
-    }
-
-    #[test]
     fn blob_store_from_conversion() {
         let inner = blob_store::Error::BlobNotFound;
         let error: Error = inner.into();

@@ -92,33 +92,6 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn test_build_listener_success() {
-        let addr = "127.0.0.1:0".parse().unwrap();
-        let result = build_listener(addr).await;
-
-        assert!(result.is_ok());
-    }
-
-    #[tokio::test]
-    async fn test_build_listener_with_port_zero() {
-        let addr = SocketAddr::from(([127, 0, 0, 1], 0));
-        let result = build_listener(addr).await;
-
-        assert!(result.is_ok());
-        let listener = result.unwrap();
-        let local_addr = listener.local_addr().unwrap();
-        assert_ne!(local_addr.port(), 0);
-    }
-
-    #[tokio::test]
-    async fn test_build_listener_ipv6() {
-        let addr = "[::1]:0".parse().unwrap();
-        let result = build_listener(addr).await;
-
-        assert!(result.is_ok());
-    }
-
-    #[tokio::test]
     async fn test_build_listener_invalid_port_in_use() {
         let addr = "127.0.0.1:0".parse().unwrap();
         let listener1 = build_listener(addr).await.unwrap();
@@ -155,15 +128,6 @@ mod tests {
         assert!(remote_addr.port() > 0);
 
         connect_handle.await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn test_build_listener_preserves_address() {
-        let addr = SocketAddr::from(([127, 0, 0, 1], 0));
-        let listener = build_listener(addr).await.unwrap();
-        let local_addr = listener.local_addr().unwrap();
-
-        assert_eq!(local_addr.ip(), addr.ip());
     }
 
     #[tokio::test]

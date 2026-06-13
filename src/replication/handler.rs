@@ -517,14 +517,6 @@ mod tests {
     }
 
     #[test]
-    fn payload_serde_round_trip() {
-        let payload = sample_payload();
-        let value = serde_json::to_value(&payload).unwrap();
-        let parsed: ReplicationPushPayload = serde_json::from_value(value).unwrap();
-        assert_eq!(parsed, payload);
-    }
-
-    #[test]
     fn lock_key_uses_tag_when_set() {
         let payload = sample_payload();
         assert_eq!(

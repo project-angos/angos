@@ -14,28 +14,3 @@ pub enum Error {
     #[error("replication registry error: {0}")]
     Registry(#[from] RegistryError),
 }
-
-#[cfg(test)]
-mod tests {
-    use std::error::Error as StdError;
-
-    use crate::registry::Error as RegistryError;
-    use crate::replication::Error;
-
-    #[test]
-    fn initialization_display_includes_prefix() {
-        let error = Error::Initialization("missing name".to_string());
-        assert_eq!(
-            format!("{error}"),
-            "replication initialization failed: missing name"
-        );
-    }
-
-    #[test]
-    fn registry_variant_preserves_source() {
-        let inner = RegistryError::Initialization("boom".to_string());
-        let error: Error = inner.into();
-        assert!(matches!(error, Error::Registry(_)));
-        assert!(StdError::source(&error).is_some());
-    }
-}

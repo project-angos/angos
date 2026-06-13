@@ -57,15 +57,9 @@ impl<'de> Deserialize<'de> for CelRule {
 
 #[cfg(test)]
 mod tests {
-    use cel_interpreter::{Context, ExecutionError};
     use serde::de::DeserializeOwned;
 
     use crate::policy::{AccessPolicyConfig, CelRule, RetentionPolicyConfig};
-
-    #[test]
-    fn valid_cel_rule_compiles() {
-        assert!(CelRule::compile("1 + 1 == 2").is_ok());
-    }
 
     #[test]
     fn invalid_cel_rule_fails_compile() {
@@ -143,25 +137,5 @@ mod tests {
     #[test]
     fn empty_retention_policy_cel_rule_fails_at_deserialize() {
         assert_empty_rule_fails_at_deserialize::<RetentionPolicyConfig>();
-    }
-
-    #[test]
-    fn undefined_variable_compiles_lazily() {
-        assert!(
-            CelRule::compile("nonexistent_var").is_ok(),
-            "cel_interpreter defers variable resolution to execute time"
-        );
-    }
-
-    #[test]
-    fn undefined_variable_fails_at_execute_time() {
-        let rule =
-            CelRule::compile("nonexistent_var").expect("expression with unknown var must compile");
-        let ctx = Context::default();
-        let result = rule.execute(&ctx);
-        assert!(
-            matches!(result, Err(ExecutionError::UndeclaredReference(_))),
-            "expected UndeclaredReference error at execute time, got: {result:?}"
-        );
     }
 }

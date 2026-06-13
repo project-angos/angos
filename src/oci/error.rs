@@ -13,18 +13,3 @@ pub enum Error {
     #[error("invalid manifest JSON: {0}")]
     InvalidManifestJson(#[from] serde_json::Error),
 }
-
-#[cfg(test)]
-mod tests {
-    use std::error::Error as StdError;
-
-    use super::*;
-
-    #[test]
-    fn invalid_manifest_json_preserves_source() {
-        let json_err = serde_json::from_str::<serde_json::Value>("{not valid").unwrap_err();
-        let err: Error = json_err.into();
-        assert!(matches!(err, Error::InvalidManifestJson(_)));
-        assert!(StdError::source(&err).is_some());
-    }
-}

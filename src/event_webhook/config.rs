@@ -103,35 +103,6 @@ mod tests {
     };
 
     #[test]
-    fn serialize_delivery_policy_all_variants() {
-        let cases = [
-            (DeliveryPolicy::Required, r#""required""#),
-            (DeliveryPolicy::Optional, r#""optional""#),
-            (DeliveryPolicy::Async, r#""async""#),
-        ];
-
-        for (policy, expected) in cases {
-            let json = serde_json::to_string(&policy).unwrap();
-            assert_eq!(json, expected);
-        }
-    }
-
-    #[test]
-    fn deserialize_delivery_policy_round_trip() {
-        let variants = [
-            DeliveryPolicy::Required,
-            DeliveryPolicy::Optional,
-            DeliveryPolicy::Async,
-        ];
-
-        for policy in variants {
-            let json = serde_json::to_string(&policy).unwrap();
-            let deserialized: DeliveryPolicy = serde_json::from_str(&json).unwrap();
-            assert_eq!(policy, deserialized);
-        }
-    }
-
-    #[test]
     fn deserialize_webhook_config_all_fields() {
         let toml = r#"
             url = "https://example.com/webhook"

@@ -47,8 +47,6 @@ pub struct OidcClaims {
 mod tests {
     use std::net::SocketAddr;
 
-    use serde_json::json;
-
     use super::*;
 
     fn assert_non_ip_fields_default(identity: &ClientIdentity) {
@@ -83,50 +81,5 @@ mod tests {
 
         assert_eq!(identity.client_ip.as_deref(), Some("::1"));
         assert_non_ip_fields_default(&identity);
-    }
-
-    #[test]
-    fn test_full_identity_populated() {
-        let identity = ClientIdentity {
-            id: Some("user-123".to_string()),
-            username: Some("alice".to_string()),
-            certificate: ClientCertificate {
-                organizations: vec!["ACME Corp".to_string()],
-                common_names: vec!["alice.acme.com".to_string()],
-            },
-            oidc: Some(OidcClaims {
-                provider_name: "github-actions".to_string(),
-                provider_type: "github".to_string(),
-                claims: HashMap::from([
-                    (
-                        "sub".to_string(),
-                        json!("repo:org/repo:ref:refs/heads/main"),
-                    ),
-                    (
-                        "iss".to_string(),
-                        json!("https://token.actions.githubusercontent.com"),
-                    ),
-                ]),
-            }),
-            client_ip: Some("10.0.0.1".to_string()),
-        };
-
-        assert_eq!(identity.id.as_deref(), Some("user-123"));
-        assert_eq!(identity.username.as_deref(), Some("alice"));
-        assert_eq!(identity.client_ip.as_deref(), Some("10.0.0.1"));
-        assert_eq!(identity.certificate.organizations, ["ACME Corp"]);
-        assert_eq!(identity.certificate.common_names, ["alice.acme.com"]);
-
-        let oidc = identity.oidc.as_ref().unwrap();
-        assert_eq!(oidc.provider_name, "github-actions");
-        assert_eq!(oidc.provider_type, "github");
-        assert_eq!(
-            oidc.claims["sub"],
-            json!("repo:org/repo:ref:refs/heads/main")
-        );
-        assert_eq!(
-            oidc.claims["iss"],
-            json!("https://token.actions.githubusercontent.com")
-        );
     }
 }

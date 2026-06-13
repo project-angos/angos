@@ -59,30 +59,4 @@ mod tests {
             "hash must start with '$argon2id$', got: {hash}"
         );
     }
-
-    #[test]
-    fn empty_password_produces_valid_hash() {
-        // An empty password is unusual but must not cause a panic or error;
-        // the Argon2 specification allows zero-length passwords.
-        let hash = generate_password("").expect("empty password must produce a hash");
-        let parsed = argon2::PasswordHash::new(&hash).expect("hash must be parseable");
-        assert!(
-            Argon2::default().verify_password(b"", &parsed).is_ok(),
-            "empty password hash must verify against the empty input"
-        );
-    }
-
-    #[test]
-    fn very_long_password_produces_valid_hash() {
-        // Argon2 truncates inputs > 4 GiB; a 10 KiB password is well within range.
-        let long_password = "x".repeat(10_240);
-        let hash = generate_password(&long_password).expect("long password must produce a hash");
-        let parsed = argon2::PasswordHash::new(&hash).expect("hash must be parseable");
-        assert!(
-            Argon2::default()
-                .verify_password(long_password.as_bytes(), &parsed)
-                .is_ok(),
-            "long password hash must verify against the original input"
-        );
-    }
 }

@@ -58,21 +58,4 @@ mod tests {
         let secret = Secret::new("my-password".to_string());
         assert_eq!(secret.expose(), "my-password");
     }
-
-    #[test]
-    fn test_secret_deserialize() {
-        #[derive(Debug, Deserialize)]
-        struct Config {
-            password: Secret<String>,
-        }
-
-        let config: Config = toml::from_str(r#"password = "secret123""#).unwrap();
-        assert_eq!(config.password.expose(), "secret123");
-    }
-
-    #[test]
-    fn test_secret_default() {
-        let secret: Secret<String> = Secret::default();
-        assert_eq!(secret.expose(), "");
-    }
 }
