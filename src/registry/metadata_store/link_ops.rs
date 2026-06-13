@@ -216,6 +216,11 @@ pub struct LinksTxExtras<'a> {
     /// tag's LWW timestamp tracks the author's write time, not this receiver's
     /// clock.
     pub created_at: Option<DateTime<Utc>>,
+    /// Author timestamp of a replicated delete. When set, the planner gates
+    /// each deleted tag link on last-writer-wins against it and joins the link
+    /// into the validated read set, so a concurrent newer re-put aborts the
+    /// delete instead of being clobbered.
+    pub delete_source_ts: Option<DateTime<Utc>>,
 }
 
 /// Data captured from a successful link-transaction attempt, used for
@@ -272,6 +277,28 @@ impl MetadataStore {
             return Ok(());
         }
         self.execute_links_tx(namespace, operations, LinksTxExtras::default())
+            .await
+            .map(|_| ())
+    }
+
+    /// Delete links (e.g. a tag) carrying a replicated delete's `source_ts` for
+    /// the last-writer-wins gate. Unlike [`Self::delete_manifest`] it does no
+    /// blob-data reclamation. A `None` `source_ts` is a plain unconditional
+    /// delete (a genuine client request).
+    pub async fn delete_links(
+        &self,
+        namespace: &str,
+        operations: &[LinkOperation],
+        source_ts: Option<DateTime<Utc>>,
+    ) -> Result<(), Error> {
+        if operations.is_empty() {
+            return Ok(());
+        }
+        let extras = LinksTxExtras {
+            delete_source_ts: source_ts,
+            ..LinksTxExtras::default()
+        };
+        self.execute_links_tx(namespace, operations, extras)
             .await
             .map(|_| ())
     }
@@ -416,6 +443,47 @@ impl MetadataStore {
                             Err(StorageError::NotFound) => {
                                 lww_reads.push((link_path, Bytes::new()));
                             }
+                            Err(e) => return Err(TxError::Storage(e)),
+                        }
+                    }
+                }
+
+                // Same guard for a replicated delete: each deleted tag link's
+                // bytes join the read set so a concurrent newer re-put aborts the
+                // delete (the `Mutation::Delete` becomes etag-conditional), and a
+                // tag the re-put already won supersedes the delete here. A delete
+                // carries no incoming digest, so a timestamp tie lets it proceed.
+                if let Some(source_ts) = extras.delete_source_ts {
+                    for (_, delete_data) in &prelock_results {
+                        let Some((link, ..)) = delete_data else {
+                            continue;
+                        };
+                        if !matches!(link, LinkKind::Tag(_)) {
+                            continue;
+                        }
+                        let link_path = path_builder::link_path(link, namespace);
+                        match self.store().get(&link_path).await {
+                            Ok(bytes) => {
+                                let metadata =
+                                    LinkMetadata::from_bytes(bytes.clone()).map_err(|e| {
+                                        TxError::Storage(StorageError::Backend(e.to_string()))
+                                    })?;
+                                if let Some(created_at) = metadata.supersedes(source_ts, None) {
+                                    return Ok((
+                                        Transaction::builder().build(),
+                                        LinksTxCaptured {
+                                            superseded: Some(format!(
+                                                "local {link} (created {created_at}) is newer \
+                                                 than the replicated delete ({source_ts})"
+                                            )),
+                                            ..LinksTxCaptured::default()
+                                        },
+                                    ));
+                                }
+                                lww_reads.push((link_path, Bytes::from(bytes)));
+                            }
+                            // Already absent: nothing to delete or validate.
+                            Err(StorageError::NotFound) => {}
                             Err(e) => return Err(TxError::Storage(e)),
                         }
                     }

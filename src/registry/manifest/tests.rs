@@ -2585,6 +2585,55 @@ async fn store_manifest_enforces_lww_inside_the_link_transaction() {
     assert_eq!(metadata.created_at, Some(newer_ts));
 }
 
+/// The pre-write delete gate in `delete_manifest` is also check-then-write: a
+/// newer re-put can land between the gate and the commit. The link transaction
+/// must reject a superseded replicated delete itself, so calling the store
+/// directly (as if the gate had been raced) must fail and leave the tag intact.
+#[tokio::test]
+async fn delete_links_enforces_lww_inside_the_link_transaction() {
+    let test_case = FSRegistryTestCase::new();
+    let store = test_case.metadata_store();
+    let namespace = "lww-tx-repo";
+    let link = LinkKind::Tag("latest".to_string());
+
+    let body = br#"{"winner":true}"#.to_vec();
+    let digest = Digest::Sha256(sha256::hex(&body).into());
+    let newer_ts = chrono::Utc::now();
+    store
+        .store_manifest(
+            namespace,
+            &digest,
+            &body,
+            &[LinkOperation::create(link.clone(), digest.clone())],
+            Some(newer_ts),
+        )
+        .await
+        .expect("seed the newer tag");
+
+    let result = store
+        .delete_links(
+            namespace,
+            &[LinkOperation::delete(link.clone())],
+            Some(newer_ts - chrono::Duration::hours(1)),
+        )
+        .await
+        .err();
+    assert!(
+        matches!(
+            result,
+            Some(metadata_store::Error::ReplicationSuperseded(_))
+        ),
+        "an older replicated delete must be rejected by the transaction itself, got: {result:?}"
+    );
+
+    let metadata = store
+        .read_link_reference(namespace, &link)
+        .await
+        .expect("the tag must survive the superseded delete");
+    assert_eq!(metadata.target, digest);
+    assert_eq!(metadata.created_at, Some(newer_ts));
+}
+
 #[tokio::test]
 async fn put_manifest_reports_changed_from_the_committed_transaction() {
     let test_case = FSRegistryTestCase::new();

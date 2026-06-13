@@ -446,13 +446,17 @@ impl Registry {
             link_plan::delete(reference, None, &[])
         };
 
+        // The pre-commit guards above fail fast; threading `source_ts` into the
+        // transaction makes the deleted tag links part of its validated read
+        // set, so a concurrent newer re-put aborts the delete rather than being
+        // clobbered by an older replicated delete.
         if let Reference::Digest(digest) = reference {
             self.metadata_store
-                .delete_manifest(namespace.as_ref(), digest, &ops)
+                .delete_manifest(namespace.as_ref(), digest, &ops, source_ts)
                 .await?;
         } else {
             self.metadata_store
-                .update_links(namespace.as_ref(), &ops)
+                .delete_links(namespace.as_ref(), &ops, source_ts)
                 .await?;
         }
 

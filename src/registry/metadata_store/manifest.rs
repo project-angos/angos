@@ -32,6 +32,7 @@ impl MetadataStore {
             caller_holds_blob_data_lock: false,
             force_register_namespace: true,
             created_at,
+            delete_source_ts: None,
         };
         self.execute_links_tx(namespace, operations, extras).await
     }
@@ -44,6 +45,7 @@ impl MetadataStore {
         namespace: &str,
         digest: &Digest,
         operations: &[LinkOperation],
+        source_ts: Option<DateTime<Utc>>,
     ) -> Result<(), Error> {
         let extras = LinksTxExtras {
             blob_data_put: None,
@@ -52,6 +54,7 @@ impl MetadataStore {
             caller_holds_blob_data_lock: false,
             force_register_namespace: false,
             created_at: None,
+            delete_source_ts: source_ts,
         };
         self.execute_links_tx(namespace, operations, extras)
             .await
