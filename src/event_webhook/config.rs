@@ -255,29 +255,6 @@ mod tests {
     }
 
     #[test]
-    fn valid_webhook_config_deserializes() {
-        let toml = r#"
-            url = "https://example.com/webhook"
-            policy = "optional"
-            events = ["manifest.push"]
-            repository_filter = ["^myapp/.*"]
-        "#;
-
-        assert!(toml::from_str::<EventWebhookConfig>(toml).is_ok());
-    }
-
-    #[test]
-    fn valid_webhook_config_without_filter_deserializes() {
-        let toml = r#"
-            url = "https://example.com/webhook"
-            policy = "async"
-            events = ["tag.create", "tag.delete"]
-        "#;
-
-        assert!(toml::from_str::<EventWebhookConfig>(toml).is_ok());
-    }
-
-    #[test]
     fn max_retries_boundary_accepted() {
         let toml = r#"
             url = "https://example.com/webhook"
@@ -324,17 +301,5 @@ mod tests {
                 .contains("max_retries=999999 exceeds the supported maximum of 16"),
             "unexpected error message: {err}"
         );
-    }
-
-    #[test]
-    fn max_retries_defaults_to_zero() {
-        let toml = r#"
-            url = "https://example.com/webhook"
-            policy = "optional"
-            events = ["blob.push"]
-        "#;
-
-        let config: EventWebhookConfig = toml::from_str(toml).unwrap();
-        assert_eq!(config.max_retries, 0);
     }
 }

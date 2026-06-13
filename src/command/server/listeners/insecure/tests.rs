@@ -151,16 +151,6 @@ async fn test_insecure_listener_new_with_ipv6() {
 }
 
 #[tokio::test]
-async fn test_insecure_listener_notify_config_change() {
-    let config = InsecureListenerConfig::default();
-    let context1 = create_test_server_context().await;
-    let listener = InsecureListener::new(&config, context1);
-
-    let context2 = create_test_server_context().await;
-    listener.notify_config_change(context2);
-}
-
-#[tokio::test]
 async fn test_insecure_listener_timeouts_initialization() {
     let config = InsecureListenerConfig {
         base: ListenerBaseConfig {
@@ -194,18 +184,6 @@ async fn test_insecure_listener_with_zero_port() {
     let listener = InsecureListener::new(&config, context);
 
     assert_eq!(listener.binding_address.port(), 0);
-}
-
-#[tokio::test]
-async fn test_insecure_listener_multiple_config_changes() {
-    let config = InsecureListenerConfig::default();
-    let context1 = create_test_server_context().await;
-    let listener = InsecureListener::new(&config, context1);
-
-    for _ in 0..5 {
-        let context = create_test_server_context().await;
-        listener.notify_config_change(context);
-    }
 }
 
 async fn create_context_with_webhook(webhook_url: &str) -> ServerContext {

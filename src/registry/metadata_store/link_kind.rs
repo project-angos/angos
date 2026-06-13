@@ -101,44 +101,25 @@ mod tests {
     }
 
     #[test]
-    fn display_tag_has_tag_prefix() {
-        let s = LinkKind::Tag("v1.0.0".to_string()).to_string();
-        assert_eq!(s, "tag:v1.0.0");
-    }
+    fn display_renders_expected_string_for_each_variant() {
+        let cases = [
+            (LinkKind::Tag("v1.0.0".to_string()), "tag:v1.0.0"),
+            (LinkKind::Blob(sha("aabb")), "blob:sha256:aabb"),
+            (LinkKind::Digest(sha("aabb")), "digest:sha256:aabb"),
+            (LinkKind::Layer(sha("aabb")), "layer:sha256:aabb"),
+            (LinkKind::Config(sha("aabb")), "config:sha256:aabb"),
+            (
+                LinkKind::Referrer(sha("aabb"), sha("ccdd")),
+                "referrer:sha256:aabb-sha256:ccdd",
+            ),
+            (
+                LinkKind::Manifest(sha("aabb"), sha("ccdd")),
+                "manifest:sha256:aabb-sha256:ccdd",
+            ),
+        ];
 
-    #[test]
-    fn display_blob_has_blob_prefix() {
-        let s = LinkKind::Blob(sha("aabb")).to_string();
-        assert!(s.starts_with("blob:sha256:"));
-    }
-
-    #[test]
-    fn display_digest_has_digest_prefix() {
-        let s = LinkKind::Digest(sha("aabb")).to_string();
-        assert!(s.starts_with("digest:sha256:"));
-    }
-
-    #[test]
-    fn display_layer_has_layer_prefix() {
-        let s = LinkKind::Layer(sha("aabb")).to_string();
-        assert!(s.starts_with("layer:sha256:"));
-    }
-
-    #[test]
-    fn display_config_has_config_prefix() {
-        let s = LinkKind::Config(sha("aabb")).to_string();
-        assert!(s.starts_with("config:sha256:"));
-    }
-
-    #[test]
-    fn display_referrer_has_referrer_prefix() {
-        let s = LinkKind::Referrer(sha("aabb"), sha("ccdd")).to_string();
-        assert!(s.starts_with("referrer:sha256:"));
-    }
-
-    #[test]
-    fn display_manifest_has_manifest_prefix() {
-        let s = LinkKind::Manifest(sha("aabb"), sha("ccdd")).to_string();
-        assert!(s.starts_with("manifest:sha256:"));
+        for (link, expected) in cases {
+            assert_eq!(link.to_string(), expected);
+        }
     }
 }

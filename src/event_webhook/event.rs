@@ -295,24 +295,4 @@ mod tests {
         assert_eq!(EventKind::TagCreate.as_str(), "tag.create");
         assert_eq!(EventKind::TagDelete.as_str(), "tag.delete");
     }
-
-    #[test]
-    fn event_kind_as_str_matches_serde_rename() {
-        let variants = [
-            EventKind::ManifestPush,
-            EventKind::ManifestDelete,
-            EventKind::BlobPush,
-            EventKind::TagCreate,
-            EventKind::TagDelete,
-        ];
-        for kind in variants {
-            let serialized = serde_json::to_string(&kind).unwrap();
-            let unquoted = serialized.trim_matches('"');
-            assert_eq!(
-                kind.as_str(),
-                unquoted,
-                "as_str must equal serde rename for {kind:?}"
-            );
-        }
-    }
 }

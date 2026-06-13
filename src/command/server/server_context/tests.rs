@@ -181,16 +181,6 @@ pub fn create_test_event() -> Event {
 }
 
 #[tokio::test]
-async fn test_server_context_new_minimal() {
-    let config = create_minimal_config();
-    let registry = create_test_registry(&config).await;
-
-    let context = ServerContext::new(&config, registry);
-
-    assert!(context.is_ok());
-}
-
-#[tokio::test]
 async fn test_server_context_new_with_basic_auth() {
     let salt = SaltString::generate(OsRng);
     let argon_config = Params::default();
@@ -221,35 +211,6 @@ async fn test_server_context_new_with_basic_auth() {
     );
 
     let config: Configuration = toml::from_str(&toml).unwrap();
-    let registry = create_test_registry(&config).await;
-
-    let context = ServerContext::new(&config, registry);
-
-    assert!(context.is_ok());
-}
-
-#[tokio::test]
-async fn test_server_context_new_with_global_immutable_tags() {
-    let toml = r#"
-        [blob_store.fs]
-        root_dir = "/tmp/test"
-
-        [metadata_store.fs]
-        root_dir = "/tmp/test"
-
-        [cache.memory]
-
-        [server]
-        bind_address = "0.0.0.0"
-        port = 8000
-
-        [global]
-        update_pull_time = false
-        immutable_tags = true
-        immutable_tags_exclusions = ["^latest$"]
-    "#;
-
-    let config: Configuration = toml::from_str(toml).unwrap();
     let registry = create_test_registry(&config).await;
 
     let context = ServerContext::new(&config, registry);

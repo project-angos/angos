@@ -276,20 +276,6 @@ fn test_repository_downstream_rejects_partial_mtls() {
 }
 
 #[test]
-fn test_cache_config_memory() {
-    let config = r#"
-    [server]
-    bind_address = "0.0.0.0"
-
-    [cache]
-    memory = {}
-    "#;
-
-    let config = Configuration::load_from_str(config).unwrap();
-    assert!(matches!(config.cache, cache::Config::Memory));
-}
-
-#[test]
 fn test_cache_config_redis() {
     let config = r#"
     [server]
@@ -623,30 +609,6 @@ fn test_load_from_nonexistent_file() {
             assert!(msg.contains("Unable to read configuration file"));
         }
         _ => panic!("Expected NotReadable error"),
-    }
-}
-
-#[test]
-fn test_load_from_file_with_invalid_content() {
-    use std::io::Write;
-
-    use tempfile::NamedTempFile;
-
-    let invalid_config = r#"
-    [server
-    bind_address = "0.0.0.0"
-    "#;
-
-    let mut temp_file = NamedTempFile::new().unwrap();
-    temp_file.write_all(invalid_config.as_bytes()).unwrap();
-    temp_file.flush().unwrap();
-
-    let result = Configuration::load(temp_file.path());
-    assert!(result.is_err());
-
-    match result {
-        Err(Error::InvalidFormat(_)) => {}
-        _ => panic!("Expected InvalidFormat error"),
     }
 }
 

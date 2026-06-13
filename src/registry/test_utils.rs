@@ -307,13 +307,6 @@ impl FSRegistryTestCase {
         &self.registry
     }
 
-    pub fn set_repositories(&mut self, repositories: Arc<HashMap<String, Repository>>) {
-        self.registry.resolver = Arc::new(
-            RepositoryResolver::new(repositories)
-                .expect("test repositories must not have overlapping prefixes"),
-        );
-    }
-
     pub fn temp_dir(&self) -> &TempDir {
         &self.temp_dir
     }

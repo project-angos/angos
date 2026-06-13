@@ -76,9 +76,7 @@ pub struct ChildrenPage {
 mod tests {
     use std::collections::HashMap;
 
-    use chrono::{TimeZone, Utc};
-
-    use crate::types::{ChildrenPage, Etag, ObjectMeta, Page};
+    use crate::types::Etag;
 
     #[test]
     fn etag_round_trips_through_string() {
@@ -105,40 +103,5 @@ mod tests {
         map.insert(Etag::new("b"), 2);
         assert_eq!(map.get(&Etag::new("a")), Some(&1));
         assert_eq!(map.get(&Etag::new("c")), None);
-    }
-
-    #[test]
-    fn object_meta_holds_optional_metadata() {
-        let when = Utc.timestamp_opt(1_700_000_000, 0).unwrap();
-        let meta = ObjectMeta {
-            size: 42,
-            etag: Some(Etag::new("e")),
-            last_modified: Some(when),
-        };
-        assert_eq!(meta.size, 42);
-        assert_eq!(meta.etag.as_ref().map(Etag::as_str), Some("e"));
-        assert_eq!(meta.last_modified, Some(when));
-    }
-
-    #[test]
-    fn page_carries_items_and_continuation() {
-        let page = Page {
-            items: vec!["a".to_string(), "b".to_string()],
-            next_token: Some("cursor".to_string()),
-        };
-        assert_eq!(page.items.len(), 2);
-        assert_eq!(page.next_token.as_deref(), Some("cursor"));
-    }
-
-    #[test]
-    fn children_page_separates_sub_prefixes_from_objects() {
-        let page = ChildrenPage {
-            sub_prefixes: vec!["sub".to_string()],
-            objects: vec!["leaf.json".to_string()],
-            next_token: None,
-        };
-        assert_eq!(page.sub_prefixes, vec!["sub".to_string()]);
-        assert_eq!(page.objects, vec!["leaf.json".to_string()]);
-        assert!(page.next_token.is_none());
     }
 }

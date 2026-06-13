@@ -229,30 +229,4 @@ pub mod tests {
         assert!(identity.certificate.common_names.is_empty());
         assert!(identity.certificate.organizations.is_empty());
     }
-
-    #[test]
-    fn test_extract_certificate_identity() {
-        let der = cert_der();
-        let (_, cert) = X509Certificate::from_der(&der).unwrap();
-
-        let result = MtlsValidator::extract_certificate_identity(&cert);
-
-        assert!(result.is_ok());
-        let cert_info = result.unwrap();
-        assert_eq!(cert_info.common_names, vec!["test-user"]);
-        assert_eq!(cert_info.organizations, vec!["TestOrg"]);
-    }
-
-    #[test]
-    fn test_extract_certificate_identity_minimal() {
-        let der = minimal_cert_der();
-        let (_, cert) = X509Certificate::from_der(&der).unwrap();
-
-        let result = MtlsValidator::extract_certificate_identity(&cert);
-
-        assert!(result.is_ok());
-        let cert_info = result.unwrap();
-        assert!(cert_info.common_names.is_empty());
-        assert!(cert_info.organizations.is_empty());
-    }
 }

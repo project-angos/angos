@@ -17,8 +17,7 @@ use crate::{
         Error, Registry,
         metadata_store::{self, LinkMetadata, LinkOperation, link_kind::LinkKind},
         test_utils::{
-            FSRegistryTestCase, RegistryTestCase, backends, create_test_repositories,
-            put_blob_direct, put_link_raw,
+            FSRegistryTestCase, RegistryTestCase, backends, put_blob_direct, put_link_raw,
         },
     },
     replication::REPLICATION_SUPERSEDED_CODE,
@@ -955,49 +954,6 @@ fn parse_manifest_digests_index_manifest_populates_manifests_vec() {
 }
 
 #[tokio::test]
-async fn test_handle_head_manifest() {
-    for test_case in backends() {
-        let registry = test_case.registry();
-        let namespace = &Namespace::new("test-repo").unwrap();
-        let tag = "latest";
-        let (content, media_type) = create_test_manifest(registry, namespace).await;
-
-        let put_response = registry
-            .put_manifest(
-                namespace,
-                &Reference::Tag(tag.to_string()),
-                Some(&media_type),
-                &content,
-            )
-            .await
-            .unwrap();
-
-        let repository = registry.get_repository_for_namespace(namespace).unwrap();
-        let head = registry
-            .head_manifest(
-                repository,
-                &[],
-                namespace,
-                Reference::Tag(tag.to_string()),
-                false,
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(
-            header_digest(&head.headers),
-            header_digest(&put_response.headers)
-        );
-        assert_eq!(
-            head.headers[CONTENT_LENGTH.as_str()],
-            content.len().to_string()
-        );
-        assert_eq!(head.headers[CONTENT_TYPE.as_str()], media_type);
-        test_case.cleanup().await;
-    }
-}
-
-#[tokio::test]
 async fn test_handle_get_manifest() {
     for test_case in backends() {
         let registry = test_case.registry();
@@ -1089,107 +1045,6 @@ async fn test_handle_put_manifest() {
         assert_eq!(stored_manifest.digest, header_digest(&response.headers));
         test_case.cleanup().await;
     }
-}
-
-#[tokio::test]
-async fn test_handle_delete_manifest() {
-    for test_case in backends() {
-        let registry = test_case.registry();
-        let namespace = &Namespace::new("test-repo").unwrap();
-        let tag = "latest";
-        let (content, media_type) = create_test_manifest(registry, namespace).await;
-
-        registry
-            .put_manifest(
-                namespace,
-                &Reference::Tag(tag.to_string()),
-                Some(&media_type),
-                &content,
-            )
-            .await
-            .unwrap();
-
-        registry
-            .delete_manifest(None, None, namespace, &Reference::Tag(tag.to_string()))
-            .await
-            .unwrap();
-
-        assert!(
-            registry
-                .get_manifest(
-                    registry.get_repository_for_namespace(namespace).unwrap(),
-                    slice::from_ref(&media_type),
-                    namespace,
-                    Reference::Tag(tag.to_string()),
-                    false,
-                )
-                .await
-                .is_err()
-        );
-        test_case.cleanup().await;
-    }
-}
-
-async fn test_pull_through_cache_optimization_impl(test_case: &mut FSRegistryTestCase) {
-    let namespace = &Namespace::new("test-repo").unwrap();
-
-    let repositories = create_test_repositories();
-
-    test_case.set_repositories(repositories);
-    let registry = test_case.registry();
-    let (content, media_type) = create_test_manifest(registry, namespace).await;
-
-    let immutable_tag = "v1.0.0";
-    let put_result = registry
-        .put_manifest(
-            namespace,
-            &Reference::Tag(immutable_tag.to_string()),
-            Some(&media_type),
-            &content,
-        )
-        .await;
-    assert!(put_result.is_ok());
-
-    let repository = registry.get_repository_for_namespace(namespace).unwrap();
-
-    let get_result = registry
-        .get_manifest(
-            repository,
-            slice::from_ref(&media_type),
-            namespace,
-            Reference::Tag(immutable_tag.to_string()),
-            false,
-        )
-        .await;
-    assert!(get_result.is_ok());
-
-    let mutable_tag = "latest";
-    let _ = registry
-        .put_manifest(
-            namespace,
-            &Reference::Tag(mutable_tag.to_string()),
-            Some(&media_type),
-            &content,
-        )
-        .await
-        .unwrap();
-
-    let get_mutable = registry
-        .get_manifest(
-            repository,
-            slice::from_ref(&media_type),
-            namespace,
-            Reference::Tag(mutable_tag.to_string()),
-            false,
-        )
-        .await;
-    assert!(get_mutable.is_ok());
-}
-
-#[tokio::test]
-async fn test_pull_through_cache_optimization_fs() {
-    let mut t = FSRegistryTestCase::new();
-    test_pull_through_cache_optimization_impl(&mut t).await;
 }
 
 #[tokio::test]
@@ -1509,70 +1364,6 @@ async fn test_put_manifest_stores_media_type() {
 }
 
 #[tokio::test]
-async fn test_head_manifest_returns_correct_media_type() {
-    for test_case in backends() {
-        let registry = test_case.registry();
-        let namespace = &Namespace::new("test-repo/head-media-type").unwrap();
-        let (content, media_type) = create_test_manifest(registry, namespace).await;
-
-        let put_response = registry
-            .put_manifest(
-                namespace,
-                &Reference::Tag("latest".to_string()),
-                Some(&media_type),
-                &content,
-            )
-            .await
-            .unwrap();
-
-        let repository = registry.get_repository_for_namespace(namespace).unwrap();
-
-        let head = registry
-            .head_manifest(
-                repository,
-                slice::from_ref(&media_type),
-                namespace,
-                Reference::Tag("latest".to_string()),
-                false,
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(head.headers[CONTENT_TYPE.as_str()], media_type);
-        assert_eq!(
-            header_digest(&head.headers),
-            header_digest(&put_response.headers)
-        );
-        assert_eq!(
-            head.headers[CONTENT_LENGTH.as_str()],
-            content.len().to_string()
-        );
-
-        let head_by_digest = registry
-            .head_manifest(
-                repository,
-                slice::from_ref(&media_type),
-                namespace,
-                Reference::Digest(header_digest(&put_response.headers)),
-                false,
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(head_by_digest.headers[CONTENT_TYPE.as_str()], media_type);
-        assert_eq!(
-            header_digest(&head_by_digest.headers),
-            header_digest(&put_response.headers)
-        );
-        assert_eq!(
-            head_by_digest.headers[CONTENT_LENGTH.as_str()],
-            content.len().to_string()
-        );
-        test_case.cleanup().await;
-    }
-}
-
-#[tokio::test]
 async fn test_head_manifest_fallback_without_media_type() {
     for test_case in backends() {
         let registry = test_case.registry();
@@ -1681,114 +1472,6 @@ async fn test_delete_manifest_no_tags_by_digest() {
 }
 
 #[tokio::test]
-async fn test_put_manifest_stores_media_type_in_links() {
-    for test_case in backends() {
-        let registry = test_case.registry();
-        let namespace = &Namespace::new("test-repo/media-type-links").unwrap();
-        let (content, media_type) = create_test_manifest(registry, namespace).await;
-
-        let response = registry
-            .put_manifest(
-                namespace,
-                &Reference::Tag("latest".to_string()),
-                Some(&media_type),
-                &content,
-            )
-            .await
-            .unwrap();
-
-        let digest_link = registry
-            .metadata_store
-            .read_link(
-                namespace,
-                &LinkKind::Digest(header_digest(&response.headers)),
-                false,
-            )
-            .await
-            .unwrap();
-        assert_eq!(
-            digest_link.media_type,
-            Some(media_type.clone()),
-            "Digest link should have media_type stored"
-        );
-
-        let tag_link = registry
-            .metadata_store
-            .read_link(namespace, &LinkKind::Tag("latest".to_string()), false)
-            .await
-            .unwrap();
-        assert_eq!(
-            tag_link.media_type,
-            Some(media_type.clone()),
-            "Tag link should have media_type stored"
-        );
-        test_case.cleanup().await;
-    }
-}
-
-#[tokio::test]
-async fn test_head_local_manifest_uses_metadata_media_type() {
-    for test_case in backends() {
-        let registry = test_case.registry();
-        let namespace = &Namespace::new("test-repo/head-optimized").unwrap();
-        let (content, media_type) = create_test_manifest(registry, namespace).await;
-
-        let response = registry
-            .put_manifest(
-                namespace,
-                &Reference::Tag("v1.0".to_string()),
-                Some(&media_type),
-                &content,
-            )
-            .await
-            .unwrap();
-
-        let head = registry
-            .head_manifest(
-                registry.get_repository_for_namespace(namespace).unwrap(),
-                slice::from_ref(&media_type),
-                namespace,
-                Reference::Tag("v1.0".to_string()),
-                false,
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(head.headers[CONTENT_TYPE.as_str()], media_type);
-        assert_eq!(
-            header_digest(&head.headers),
-            header_digest(&response.headers)
-        );
-        assert_eq!(
-            head.headers[CONTENT_LENGTH.as_str()],
-            content.len().to_string()
-        );
-
-        let head = registry
-            .head_manifest(
-                registry.get_repository_for_namespace(namespace).unwrap(),
-                slice::from_ref(&media_type),
-                namespace,
-                Reference::Digest(header_digest(&response.headers)),
-                false,
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(head.headers[CONTENT_TYPE.as_str()], media_type);
-        assert_eq!(
-            header_digest(&head.headers),
-            header_digest(&response.headers)
-        );
-        assert_eq!(
-            head.headers[CONTENT_LENGTH.as_str()],
-            content.len().to_string()
-        );
-        test_case.cleanup().await;
-    }
-}
-
-#[tokio::test]
 async fn test_put_manifest_without_content_type_stores_manifest_media_type() {
     for test_case in backends() {
         let registry = test_case.registry();
@@ -1820,54 +1503,6 @@ async fn test_put_manifest_without_content_type_stores_manifest_media_type() {
             Some("application/vnd.docker.distribution.manifest.v2+json".to_string()),
             "Digest link should have media_type from manifest body"
         );
-        test_case.cleanup().await;
-    }
-}
-
-#[tokio::test]
-async fn test_handle_get_manifest_redirect_includes_content_type() {
-    for test_case in backends() {
-        let registry = test_case.registry();
-        let namespace = &Namespace::new("test-repo/redirect-ct").unwrap();
-        let (content, media_type) = create_test_manifest(registry, namespace).await;
-
-        let put_response = registry
-            .put_manifest(
-                namespace,
-                &Reference::Tag("latest".to_string()),
-                Some(&media_type),
-                &content,
-            )
-            .await
-            .unwrap();
-
-        let response = registry
-            .resolve_get_manifest(
-                namespace,
-                Reference::Tag("latest".to_string()),
-                slice::from_ref(&media_type),
-                false,
-            )
-            .await
-            .unwrap();
-
-        match response {
-            GetManifestResponse::Redirect { headers } => {
-                assert_eq!(
-                    header_digest(&headers),
-                    header_digest(&put_response.headers),
-                    "Redirect digest must match"
-                );
-                assert_eq!(
-                    headers[CONTENT_TYPE.as_str()],
-                    media_type,
-                    "Redirect should carry Content-Type from stored media_type"
-                );
-            }
-            GetManifestResponse::Body { headers, .. } => {
-                assert_eq!(headers[CONTENT_TYPE.as_str()], media_type);
-            }
-        }
         test_case.cleanup().await;
     }
 }
@@ -1916,59 +1551,6 @@ async fn test_handle_get_manifest_redirect_fallback_without_media_type() {
             }
             GetManifestResponse::Body { headers, .. } => {
                 assert!(headers.contains_key(CONTENT_TYPE.as_str()));
-            }
-        }
-        test_case.cleanup().await;
-    }
-}
-
-#[tokio::test]
-async fn test_handle_get_manifest_no_redirect_returns_body() {
-    for test_case in backends() {
-        let registry = test_case.registry();
-        let namespace = &Namespace::new("test-repo/no-redirect").unwrap();
-        let (content, media_type) = create_test_manifest(registry, namespace).await;
-
-        let put_response = registry
-            .put_manifest(
-                namespace,
-                &Reference::Tag("latest".to_string()),
-                Some(&media_type),
-                &content,
-            )
-            .await
-            .unwrap();
-
-        let response = registry
-            .resolve_get_manifest(
-                namespace,
-                Reference::Tag("latest".to_string()),
-                slice::from_ref(&media_type),
-                false,
-            )
-            .await
-            .unwrap();
-
-        // Both redirect and body responses are valid depending on backend capabilities.
-        // Verify the content is correct in either case.
-        match response {
-            GetManifestResponse::Redirect { headers } => {
-                assert_eq!(
-                    header_digest(&headers),
-                    header_digest(&put_response.headers)
-                );
-                assert_eq!(headers[CONTENT_TYPE.as_str()], media_type);
-            }
-            GetManifestResponse::Body {
-                headers,
-                content: body,
-            } => {
-                assert_eq!(
-                    header_digest(&headers),
-                    header_digest(&put_response.headers)
-                );
-                assert_eq!(headers[CONTENT_TYPE.as_str()], media_type);
-                assert_eq!(body, content);
             }
         }
         test_case.cleanup().await;

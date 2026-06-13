@@ -97,103 +97,81 @@ mod tests {
     }
 
     #[test]
-    fn test_default_functions() {
-        assert_eq!(BaseConfig::default_jwks_refresh_interval(), 3600);
-        assert_eq!(BaseConfig::default_clock_skew_tolerance(), 60);
-        assert_eq!(
-            BaseConfig::default_allowed_algorithms(),
-            vec![Algorithm::RS256]
-        );
-    }
+    fn test_provider_getters() {
+        // One Provider per row, covering every getter across both the
+        // present (Some) and absent (None) variants of the optional fields,
+        // including the explicit BaseConfig::default_* values used by the
+        // "with_defaults" case.
+        let cases = [
+            (
+                ProviderConfig {
+                    issuer: "https://example.com".to_string(),
+                    jwks_uri: None,
+                    jwks_refresh_interval: 3600,
+                    required_audience: Some("test-audience".to_string()),
+                    clock_skew_tolerance: 60,
+                    allowed_algorithms: vec![Algorithm::RS256],
+                },
+                "https://example.com",
+                None,
+                3600u64,
+                Some("test-audience"),
+                60u64,
+                vec![Algorithm::RS256],
+            ),
+            (
+                ProviderConfig {
+                    issuer: "https://auth.example.com".to_string(),
+                    jwks_uri: Some("https://auth.example.com/.well-known/jwks".to_string()),
+                    jwks_refresh_interval: 7200,
+                    required_audience: None,
+                    clock_skew_tolerance: 120,
+                    allowed_algorithms: vec![Algorithm::RS256],
+                },
+                "https://auth.example.com",
+                Some("https://auth.example.com/.well-known/jwks"),
+                7200u64,
+                None,
+                120u64,
+                vec![Algorithm::RS256],
+            ),
+            (
+                ProviderConfig {
+                    issuer: "https://example.com".to_string(),
+                    jwks_uri: None,
+                    jwks_refresh_interval: BaseConfig::default_jwks_refresh_interval(),
+                    required_audience: None,
+                    clock_skew_tolerance: BaseConfig::default_clock_skew_tolerance(),
+                    allowed_algorithms: BaseConfig::default_allowed_algorithms(),
+                },
+                "https://example.com",
+                None,
+                3600u64,
+                None,
+                60u64,
+                vec![Algorithm::RS256],
+            ),
+        ];
 
-    #[test]
-    fn test_create_provider() {
-        let config = ProviderConfig {
-            issuer: "https://example.com".to_string(),
-            jwks_uri: None,
-            jwks_refresh_interval: 3600,
-            required_audience: Some("test-audience".to_string()),
-            clock_skew_tolerance: 60,
-            allowed_algorithms: vec![Algorithm::RS256],
-        };
-
-        let provider = Provider::new(config);
-        assert_eq!(provider.issuer(), "https://example.com");
-        assert_eq!(provider.name(), "Generic OIDC");
-        assert!(provider.jwks_uri().is_none());
-        assert_eq!(provider.jwks_refresh_interval(), 3600);
-        assert_eq!(provider.required_audience(), Some("test-audience"));
-        assert_eq!(provider.clock_skew_tolerance(), 60);
-        assert_eq!(provider.allowed_algorithms(), &[Algorithm::RS256]);
-    }
-
-    #[test]
-    fn test_provider_with_jwks_uri() {
-        let config = ProviderConfig {
-            issuer: "https://auth.example.com".to_string(),
-            jwks_uri: Some("https://auth.example.com/.well-known/jwks".to_string()),
-            jwks_refresh_interval: 7200,
-            required_audience: None,
-            clock_skew_tolerance: 120,
-            allowed_algorithms: vec![Algorithm::RS256],
-        };
-
-        let provider = Provider::new(config);
-        assert_eq!(provider.issuer(), "https://auth.example.com");
-        assert_eq!(
-            provider.jwks_uri(),
-            Some("https://auth.example.com/.well-known/jwks")
-        );
-        assert_eq!(provider.jwks_refresh_interval(), 7200);
-        assert!(provider.required_audience().is_none());
-        assert_eq!(provider.clock_skew_tolerance(), 120);
-    }
-
-    #[test]
-    fn test_provider_with_defaults() {
-        let config = ProviderConfig {
-            issuer: "https://example.com".to_string(),
-            jwks_uri: None,
-            jwks_refresh_interval: BaseConfig::default_jwks_refresh_interval(),
-            required_audience: None,
-            clock_skew_tolerance: BaseConfig::default_clock_skew_tolerance(),
-            allowed_algorithms: BaseConfig::default_allowed_algorithms(),
-        };
-
-        let provider = Provider::new(config);
-        assert_eq!(provider.jwks_refresh_interval(), 3600);
-        assert_eq!(provider.clock_skew_tolerance(), 60);
-        assert_eq!(provider.allowed_algorithms(), &[Algorithm::RS256]);
-    }
-
-    #[test]
-    fn test_provider_name() {
-        let config = ProviderConfig {
-            issuer: "https://example.com".to_string(),
-            jwks_uri: None,
-            jwks_refresh_interval: 3600,
-            required_audience: None,
-            clock_skew_tolerance: 60,
-            allowed_algorithms: vec![Algorithm::RS256],
-        };
-
-        let provider = Provider::new(config);
-        assert_eq!(provider.name(), "Generic OIDC");
-    }
-
-    #[test]
-    fn test_provider_validate_provider_claims_default() {
-        let config = ProviderConfig {
-            issuer: "https://example.com".to_string(),
-            jwks_uri: None,
-            jwks_refresh_interval: 3600,
-            required_audience: None,
-            clock_skew_tolerance: 60,
-            allowed_algorithms: vec![Algorithm::RS256],
-        };
-
-        let provider = Provider::new(config);
-        let claims = HashMap::new();
-        assert!(provider.validate_provider_claims(&claims).is_ok());
+        for (
+            config,
+            issuer,
+            jwks_uri,
+            jwks_refresh_interval,
+            required_audience,
+            clock_skew_tolerance,
+            allowed_algorithms,
+        ) in cases
+        {
+            let provider = Provider::new(config);
+            assert_eq!(provider.issuer(), issuer);
+            assert_eq!(provider.jwks_uri(), jwks_uri);
+            assert_eq!(provider.jwks_refresh_interval(), jwks_refresh_interval);
+            assert_eq!(provider.required_audience(), required_audience);
+            assert_eq!(provider.clock_skew_tolerance(), clock_skew_tolerance);
+            assert_eq!(provider.allowed_algorithms(), allowed_algorithms.as_slice());
+            assert_eq!(provider.name(), "Generic OIDC");
+            assert!(provider.validate_provider_claims(&HashMap::new()).is_ok());
+        }
     }
 }

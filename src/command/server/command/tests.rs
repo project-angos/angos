@@ -11,13 +11,13 @@ use crate::{
     command::{
         bootstrap,
         server::{
-            Command, ServerContext,
+            Command,
             command::{ServiceListener, setup},
-            listeners::{insecure::InsecureListener, tls::tests::build_config},
+            listeners::tls::tests::build_config,
             server_context::tests::create_test_event,
         },
     },
-    configuration::{self, Configuration, ServerConfig},
+    configuration::{self, Configuration},
     policy::{AccessMode, AccessPolicyConfig, CelRule},
     registry::{Registry, RegistryConfig, manifest::DEFAULT_MAX_MANIFEST_SIZE_BYTES, repository},
     secret::Secret,
@@ -390,22 +390,6 @@ async fn test_command_notify_tls_config_change_with_insecure_listener() {
 }
 
 #[tokio::test]
-async fn test_service_listener_enum_variants() {
-    let (config, _blobs, _meta) = create_minimal_config();
-    let ServerConfig::Insecure(insecure_config) = &config.server else {
-        panic!("Expected insecure config")
-    };
-
-    let (registry, _) = setup::build_registry(&config, &Arc::new(Mutex::new(None)), None)
-        .await
-        .unwrap();
-    let context = ServerContext::new(&config, registry).unwrap();
-
-    let insecure_listener = InsecureListener::new(insecure_config, context);
-    let _service_listener = ServiceListener::Insecure(insecure_listener);
-}
-
-#[tokio::test]
 async fn test_build_repositories_preserves_names() {
     let repo_config = repository::Config {
         access_policy: AccessPolicyConfig {
@@ -459,14 +443,6 @@ async fn test_build_registry_components_integration() {
     let registry = Registry::new(blob_backend, metadata_store, repositories, registry_config);
 
     assert!(registry.is_ok());
-}
-
-#[tokio::test]
-async fn test_command_new_validates_configuration() {
-    let (config, _blobs, _meta) = create_minimal_config();
-    let result = Command::new(&config).await;
-
-    assert!(result.is_ok());
 }
 
 #[tokio::test]

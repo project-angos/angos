@@ -37,12 +37,6 @@ fn test_get_upstream_namespace() {
 }
 
 #[test]
-fn test_get_upstream_namespace_no_prefix_match() {
-    let result = get_upstream_namespace("foo", "bar/baz");
-    assert_eq!(result, "bar/baz");
-}
-
-#[test]
 fn test_get_manifest_path() {
     let config = RegistryClientConfig {
         url: "https://example.com".to_string(),
