@@ -22,7 +22,7 @@ use crate::{
         metadata_store::{MetadataStore, link_kind::LinkKind},
         parse_manifest_digests,
     },
-    registry_client::{DeleteManifestOutcome, NO_LOCAL_PREFIX, RegistryClient},
+    registry_client::{DeleteManifestOutcome, NO_LOCAL_PREFIX, RegistryClient, UploadSession},
     replication::{Error, manifest_accept_types},
 };
 
@@ -300,8 +300,8 @@ async fn push_one_blob(ctx: &PushContext<'_>, digest: &Digest) -> Result<(), Err
                 info!(namespace = ctx.namespace, %digest, %from, "Mounted blob cross-repo on downstream (no transfer)");
                 return Ok(());
             }
-            Ok(Some(session_url)) => {
-                return upload_into_session(ctx, digest, &session_url).await;
+            Ok(Some(session)) => {
+                return upload_into_session(ctx, digest, &session).await;
             }
             Err(e) => {
                 debug!(namespace = ctx.namespace, %digest, "Cross-repo mount unavailable ({e}); uploading instead");
@@ -309,12 +309,12 @@ async fn push_one_blob(ctx: &PushContext<'_>, digest: &Digest) -> Result<(), Err
         }
     }
 
-    let session_url = ctx
+    let session = ctx
         .downstream
         .start_upload(&start_location)
         .await
         .map_err(Error::Registry)?;
-    upload_into_session(ctx, digest, &session_url).await
+    upload_into_session(ctx, digest, &session).await
 }
 
 /// Streams a local blob's bytes into an already-open upload session and
@@ -322,14 +322,14 @@ async fn push_one_blob(ctx: &PushContext<'_>, digest: &Digest) -> Result<(), Err
 async fn upload_into_session(
     ctx: &PushContext<'_>,
     digest: &Digest,
-    session_url: &str,
+    session: &UploadSession,
 ) -> Result<(), Error> {
     let (reader, content_length) = match ctx.blob_store.reader(digest, None).await {
         Ok(reader) => reader,
         Err(e) => {
             // The session is already open; cancel it, like the patch/complete
             // failure paths, so a dying push does not strand it on the downstream.
-            cancel_upload_session(ctx.downstream, session_url).await;
+            cancel_upload_session(ctx.downstream, &session.url).await;
             return Err(Error::Registry(RegistryError::Internal(format!(
                 "failed to open local blob '{digest}': {e}"
             ))));
@@ -337,12 +337,17 @@ async fn upload_into_session(
     };
     let patched_url = match ctx
         .downstream
-        .patch_upload(session_url, content_length, reader)
+        .patch_upload(
+            &session.url,
+            session.auth.as_deref(),
+            content_length,
+            reader,
+        )
         .await
     {
         Ok(url) => url,
         Err(e) => {
-            cancel_upload_session(ctx.downstream, session_url).await;
+            cancel_upload_session(ctx.downstream, &session.url).await;
             return Err(Error::Registry(e));
         }
     };
@@ -779,7 +784,7 @@ mod tests {
             },
             test_utils::{build_store, build_test_fs_executor, put_blob_direct},
         },
-        registry_client::RegistryClient,
+        registry_client::{RegistryClient, UploadSession},
         replication::{
             REPLICATION_SUPERSEDED_CODE, X_ANGOS_SOURCE_TIMESTAMP,
             pipeline::{PushContext, PushOutcome, delete_manifest, push_manifest},
@@ -2840,7 +2845,10 @@ mod tests {
         let (blob_store, metadata_store, _store) = test_blob_store(dir.path().to_str().unwrap());
 
         let absent = Digest::Sha256(sha256::hex(b"never-written-locally").into());
-        let session_url = format!("{}/v2/{NAMESPACE}/blobs/uploads/sess-1", mock_server.uri());
+        let session = UploadSession {
+            url: format!("{}/v2/{NAMESPACE}/blobs/uploads/sess-1", mock_server.uri()),
+            auth: None,
+        };
         Mock::given(method("DELETE"))
             .and(path(format!("/v2/{NAMESPACE}/blobs/uploads/sess-1")))
             .respond_with(ResponseTemplate::new(204))
@@ -2857,7 +2865,7 @@ mod tests {
             max_concurrent_pushes: 4,
             source_ts: None,
         };
-        let result = super::upload_into_session(&ctx, &absent, &session_url).await;
+        let result = super::upload_into_session(&ctx, &absent, &session).await;
         assert!(result.is_err(), "a missing local blob must fail the upload");
 
         // .expect(1) on the DELETE verifies the session was cancelled.

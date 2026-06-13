@@ -1157,15 +1157,16 @@ async fn test_blob_upload_sequence() {
         format!("{}/v2/test/blobs/uploads/", mock_server.uri())
     );
 
-    let session_url = client.start_upload(&start_url).await.unwrap();
+    let session = client.start_upload(&start_url).await.unwrap();
     assert_eq!(
-        session_url,
+        session.url,
         format!("{}{session_path}?state=a", mock_server.uri())
     );
 
     let next_url = client
         .patch_upload(
-            &session_url,
+            &session.url,
+            session.auth.as_deref(),
             content.len() as u64,
             Cursor::new(content.to_vec()),
         )
@@ -1203,6 +1204,7 @@ async fn test_patch_upload_401_is_unauthorized_without_retry() {
     let result = client
         .patch_upload(
             &session_url,
+            None,
             content.len() as u64,
             Cursor::new(content.to_vec()),
         )
@@ -1214,6 +1216,145 @@ async fn test_patch_upload_401_is_unauthorized_without_retry() {
     );
     // Dropping the server verifies `.expect(1)`: exactly one PATCH, no retry.
     drop(mock_server);
+}
+
+#[tokio::test]
+async fn test_blob_upload_reuses_session_open_bearer_token_on_patch() {
+    // Regression: the streamed PATCH targets a server-assigned session URL that
+    // never issues its own auth challenge, so it must reuse the bearer token the
+    // start-upload POST resolved. The PATCH mock requires that token, so an
+    // unauthenticated PATCH (the pre-fix behaviour) would not match and fail.
+    let mock_server = MockServer::start().await;
+    let auth_server = MockServer::start().await;
+    let content = b"replicated blob content";
+    let start_path = "/v2/test/blobs/uploads/";
+    let session_path = "/v2/test/blobs/uploads/session-7";
+
+    Mock::given(method("POST"))
+        .and(path(start_path))
+        .respond_with(ResponseTemplate::new(401).insert_header(
+            "WWW-Authenticate",
+            format!(
+                r#"Bearer realm="{}",service="registry",scope="repository:test:pull,push""#,
+                auth_server.uri()
+            ),
+        ))
+        .up_to_n_times(1)
+        .mount(&mock_server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(start_path))
+        .and(header("Authorization", "Bearer push-token"))
+        .respond_with(
+            ResponseTemplate::new(202).insert_header("Location", format!("{session_path}?state=a")),
+        )
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+    Mock::given(method("GET"))
+        .and(query_param("service", "registry"))
+        .and(query_param("scope", "repository:test:pull,push"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({"token": "push-token", "expires_in": 3600})),
+        )
+        .mount(&auth_server)
+        .await;
+    Mock::given(method("PATCH"))
+        .and(path(session_path))
+        .and(header("Authorization", "Bearer push-token"))
+        .respond_with(
+            ResponseTemplate::new(202).insert_header("Location", format!("{session_path}?state=b")),
+        )
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let client = client_for(&mock_server);
+    let start_url = client.get_uploads_start_path("", "test");
+    let session = client.start_upload(&start_url).await.unwrap();
+    assert_eq!(session.auth.as_deref(), Some("Bearer push-token"));
+    let next_url = client
+        .patch_upload(
+            &session.url,
+            session.auth.as_deref(),
+            content.len() as u64,
+            Cursor::new(content.to_vec()),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        next_url,
+        format!("{}{session_path}?state=b", mock_server.uri())
+    );
+}
+
+#[tokio::test]
+async fn test_blob_upload_reuses_basic_credentials_on_patch() {
+    // Basic credentials are never cached, so the streamed PATCH must carry the
+    // header resolved when the session was opened.
+    let mock_server = MockServer::start().await;
+    let content = b"replicated blob content";
+    let start_path = "/v2/test/blobs/uploads/";
+    let session_path = "/v2/test/blobs/uploads/session-8";
+
+    Mock::given(method("POST"))
+        .and(path(start_path))
+        .respond_with(
+            ResponseTemplate::new(401)
+                .insert_header("WWW-Authenticate", "Basic realm=\"Registry\""),
+        )
+        .up_to_n_times(1)
+        .mount(&mock_server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(start_path))
+        .and(header("Authorization", "Basic dXNlcjpwYXNz"))
+        .respond_with(
+            ResponseTemplate::new(202).insert_header("Location", format!("{session_path}?state=a")),
+        )
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+    Mock::given(method("PATCH"))
+        .and(path(session_path))
+        .and(header("Authorization", "Basic dXNlcjpwYXNz"))
+        .respond_with(
+            ResponseTemplate::new(202).insert_header("Location", format!("{session_path}?state=b")),
+        )
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let config = RegistryClientConfig {
+        url: mock_server.uri(),
+        max_redirect: 5,
+        server_ca_bundle: None,
+        client_certificate: None,
+        client_private_key: None,
+        username: Some("user".to_string()),
+        password: Some(Secret::new("pass".to_string())),
+    };
+    let cache = cache::Config::Memory.to_backend().unwrap();
+    let client =
+        RegistryClient::from_config(&config, cache, DEFAULT_MAX_MANIFEST_SIZE_BYTES).unwrap();
+
+    let start_url = client.get_uploads_start_path("", "test");
+    let session = client.start_upload(&start_url).await.unwrap();
+    assert_eq!(session.auth.as_deref(), Some("Basic dXNlcjpwYXNz"));
+    let next_url = client
+        .patch_upload(
+            &session.url,
+            session.auth.as_deref(),
+            content.len() as u64,
+            Cursor::new(content.to_vec()),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        next_url,
+        format!("{}{session_path}?state=b", mock_server.uri())
+    );
 }
 
 #[tokio::test]
@@ -1244,8 +1385,8 @@ async fn test_mount_blob_returns_none_on_201() {
         .await
         .unwrap();
 
-    assert_eq!(
-        outcome, None,
+    assert!(
+        outcome.is_none(),
         "a 201 to a mount request must report a mount (None: no transfer needed)"
     );
     drop(mock_server);
@@ -1275,8 +1416,8 @@ async fn test_mount_blob_omits_from_when_none() {
         .await
         .unwrap();
 
-    assert_eq!(
-        outcome, None,
+    assert!(
+        outcome.is_none(),
         "a 201 to a from=None mount request must report a mount (None: no transfer needed)"
     );
     drop(mock_server);
@@ -1309,7 +1450,7 @@ async fn test_mount_blob_falls_back_to_session_on_202() {
         .unwrap();
 
     assert_eq!(
-        outcome,
+        outcome.map(|session| session.url),
         Some(format!("{}{session_path}", mock_server.uri())),
         "a 202 to a mount request must fall back to a session with the continuation URL"
     );
@@ -1343,7 +1484,7 @@ async fn test_mount_blob_rejects_mismatched_201_digest() {
 
     assert!(
         outcome.is_err(),
-        "a 201 advertising a different digest must be rejected, got {outcome:?}"
+        "a 201 advertising a different digest must be rejected"
     );
     drop(mock_server);
 }
@@ -1373,8 +1514,8 @@ async fn test_mount_blob_accepts_matching_201_digest() {
         .await
         .unwrap();
 
-    assert_eq!(
-        outcome, None,
+    assert!(
+        outcome.is_none(),
         "a 201 advertising the requested digest must report a mount (None: no transfer needed)"
     );
     drop(mock_server);

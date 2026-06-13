@@ -19,7 +19,7 @@ use tokio_util::io::StreamReader;
 use tracing::{info, warn};
 pub use upstream_url::{NO_LOCAL_PREFIX, get_upstream_namespace};
 
-pub use crate::registry_client::write::{DeleteManifestOutcome, PutManifestResult};
+pub use crate::registry_client::write::{DeleteManifestOutcome, PutManifestResult, UploadSession};
 
 use crate::{
     cache::Cache,
@@ -215,6 +215,25 @@ impl RegistryClient {
         F: Fn(Option<String>) -> Fut,
         Fut: Future<Output = Result<Response, Error>>,
     {
+        Ok(self
+            .send_with_auth_retry_capturing(location, send_once)
+            .await?
+            .0)
+    }
+
+    /// [`Self::send_with_auth_retry`] that also returns the auth header which
+    /// produced the final response. A streamed `PATCH` to a server-assigned
+    /// upload-session URL reuses it: that URL never issues its own auth
+    /// challenge, and a consumed stream cannot be replayed to refresh a token.
+    async fn send_with_auth_retry_capturing<F, Fut>(
+        &self,
+        location: &str,
+        send_once: F,
+    ) -> Result<(Response, Option<String>), Error>
+    where
+        F: Fn(Option<String>) -> Fut,
+        Fut: Future<Output = Result<Response, Error>>,
+    {
         let cached_auth = self.cached_auth_header(location).await;
         let response = send_once(cached_auth.clone()).await?;
 
@@ -222,14 +241,15 @@ impl RegistryClient {
             let token = self
                 .refresh_auth_header(&response, cached_auth.as_deref())
                 .await?;
-            return send_once(Some(token)).await;
+            let response = send_once(Some(token.clone())).await?;
+            return Ok((response, Some(token)));
         }
 
         if response.status() == StatusCode::FORBIDDEN {
             return Err(Error::Denied("Access forbidden".to_string()));
         }
 
-        Ok(response)
+        Ok((response, cached_auth))
     }
 
     async fn cached_auth_header(&self, location: &str) -> Option<String> {

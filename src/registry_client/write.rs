@@ -1,9 +1,10 @@
 //! Write methods for [`RegistryClient`].
 //!
 //! Byte-bodied requests reuse [`RegistryClient::send_with_auth_retry`]'s
-//! cached-token-then-single-refresh orchestration; the single-use stream in
-//! [`RegistryClient::patch_upload`] cannot be replayed, so it surfaces a `401`
-//! as an error instead of retrying.
+//! cached-token-then-single-refresh orchestration. The single-use stream in
+//! [`RegistryClient::patch_upload`] cannot be replayed, so it reuses the auth
+//! header resolved when the session was opened ([`UploadSession::auth`]) and
+//! surfaces a `401` as an error instead of retrying.
 
 use std::collections::HashSet;
 
@@ -42,6 +43,18 @@ pub struct PutManifestResult {
     pub digest: Option<Digest>,
     pub subject: Option<String>,
     pub superseded: bool,
+}
+
+/// An open downstream blob-upload session: the server-assigned continuation
+/// URL plus the auth header that opened it.
+///
+/// The streamed `PATCH` reuses [`Self::auth`] because the session URL never
+/// issues its own auth challenge and a single-use body cannot be replayed to
+/// refresh a token on a `401`. Not `Debug`: `auth` carries a bearer/basic
+/// credential.
+pub struct UploadSession {
+    pub url: String,
+    pub auth: Option<String>,
 }
 
 /// Outcome of a manifest delete.
@@ -94,12 +107,28 @@ impl RegistryClient {
         body: Vec<u8>,
         source_ts: Option<&str>,
     ) -> Result<Response, Error> {
+        Ok(self
+            .send_body_with_auth(method, location, content_type, body, source_ts)
+            .await?
+            .0)
+    }
+
+    /// [`Self::send_body`] that also returns the resolved auth header, so an
+    /// upload-session opener can reuse it for the single-use streamed `PATCH`.
+    async fn send_body_with_auth(
+        &self,
+        method: &Method,
+        location: &str,
+        content_type: Option<&str>,
+        body: Vec<u8>,
+        source_ts: Option<&str>,
+    ) -> Result<(Response, Option<String>), Error> {
         info!("Writing to upstream: {method} {location}");
 
         // `Bytes` makes the per-attempt clone a refcount bump, not a deep copy.
         let body = Bytes::from(body);
 
-        self.send_with_auth_retry(location, |auth| {
+        self.send_with_auth_retry_capturing(location, |auth| {
             // The closure may run twice (cached token, then 401 refresh), so
             // clone the refcounted body per attempt.
             let body = body.clone();
@@ -145,11 +174,14 @@ impl RegistryClient {
     /// Sends a request whose body is a single-use stream.
     ///
     /// The consumed stream cannot be replayed, so a `401` is surfaced as an
-    /// error instead of a token-refresh retry.
+    /// error instead of a token-refresh retry. `auth_header` is the credential
+    /// resolved when the session was opened; a cached lookup keyed on
+    /// `location` is the anonymous-or-direct-call fallback.
     async fn send_stream<S>(
         &self,
         method: &Method,
         location: &str,
+        auth_header: Option<&str>,
         content_length: u64,
         stream: S,
     ) -> Result<Response, Error>
@@ -158,10 +190,13 @@ impl RegistryClient {
     {
         info!("Streaming to upstream: {method} {location}");
 
-        let cached_auth = self.cached_auth_header(location).await;
+        let auth = match auth_header {
+            Some(header) => Some(header.to_string()),
+            None => self.cached_auth_header(location).await,
+        };
         let body = Body::wrap_stream(ReaderStream::new(stream));
         let response = self
-            .build_request(method, &[], location, cached_auth.as_deref())
+            .build_request(method, &[], location, auth.as_deref())
             .header(CONTENT_TYPE, "application/octet-stream")
             .header(CONTENT_LENGTH, content_length)
             .body(body)
@@ -201,16 +236,17 @@ impl RegistryClient {
     }
 
     /// Starts a resumable blob upload session, returning the server-assigned
-    /// continuation URL from the `Location` header.
+    /// continuation URL from the `Location` header and the auth header that
+    /// opened it (reused for the streamed `PATCH`).
     ///
     /// # Errors
     ///
     /// Returns an error when the request fails, access is rejected, or the
     /// response lacks a success status or `Location` header.
     #[instrument(skip(self))]
-    pub async fn start_upload(&self, location: &str) -> Result<String, Error> {
-        let response = self
-            .send_body(&Method::POST, location, None, Vec::new(), None)
+    pub async fn start_upload(&self, location: &str) -> Result<UploadSession, Error> {
+        let (response, auth) = self
+            .send_body_with_auth(&Method::POST, location, None, Vec::new(), None)
             .await?;
 
         if !response.status().is_success() {
@@ -220,15 +256,18 @@ impl RegistryClient {
             )));
         }
 
-        Self::parse_location(&response)
+        Ok(UploadSession {
+            url: Self::parse_location(&response)?,
+            auth,
+        })
     }
 
     /// Attempts an OCI cross-repository blob mount
     /// (`?mount=<digest>[&from=<repo>]`).
     ///
     /// `Ok(None)` means mounted (`201`, with the advertised digest verified
-    /// when present); `Ok(Some(session_url))` means the mount degraded to a
-    /// normal upload session (`202`), per the distribution spec.
+    /// when present); `Ok(Some(session))` means the mount degraded to a normal
+    /// upload session (`202`), per the distribution spec.
     ///
     /// # Errors
     ///
@@ -240,15 +279,15 @@ impl RegistryClient {
         location: &str,
         mount: &Digest,
         from: Option<&str>,
-    ) -> Result<Option<String>, Error> {
+    ) -> Result<Option<UploadSession>, Error> {
         let query = match from {
             Some(from) => format!("mount={mount}&from={from}"),
             None => format!("mount={mount}"),
         };
         let location = append_query(location, &query);
 
-        let response = self
-            .send_body(&Method::POST, &location, None, Vec::new(), None)
+        let (response, auth) = self
+            .send_body_with_auth(&Method::POST, &location, None, Vec::new(), None)
             .await?;
 
         // A 201 means mounted; an advertised digest must match the request or
@@ -276,7 +315,10 @@ impl RegistryClient {
             )));
         }
 
-        Self::parse_location(&response).map(Some)
+        Ok(Some(UploadSession {
+            url: Self::parse_location(&response)?,
+            auth,
+        }))
     }
 
     /// Streams a chunk to an upload session and returns the next continuation
@@ -290,6 +332,7 @@ impl RegistryClient {
     pub async fn patch_upload<S>(
         &self,
         session_url: &str,
+        auth_header: Option<&str>,
         content_length: u64,
         stream: S,
     ) -> Result<String, Error>
@@ -297,7 +340,13 @@ impl RegistryClient {
         S: AsyncRead + Unpin + Send + Sync + 'static,
     {
         let response = self
-            .send_stream(&Method::PATCH, session_url, content_length, stream)
+            .send_stream(
+                &Method::PATCH,
+                session_url,
+                auth_header,
+                content_length,
+                stream,
+            )
             .await?;
 
         if !response.status().is_success() {
