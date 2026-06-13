@@ -214,7 +214,7 @@ bucket = "registry-data"
 # ... S3 config
 ```
 
-The `lock_strategy.s3` block lets you tune internal lock timing parameters but is not required to enable CAS coordination — it activates automatically when the provider supports it:
+The `lock_strategy.s3` block lets you tune internal lock timing parameters but is not required to enable CAS coordination; it activates automatically when the provider supports it:
 
 ```toml
 [metadata_store.s3.lock_strategy.s3]
@@ -272,7 +272,7 @@ retry_delay_ms = 10         # Initial retry delay; retries back off up to 1s wit
 
 Available only when using S3 for metadata (not supported with filesystem metadata stores). Uses conditional writes (`If-None-Match: *`) to implement distributed locks directly in the S3 bucket, eliminating the need for Redis. Stale locks are automatically recovered after TTL expiry.
 
-Lock operations use a dedicated S3 client with independent timeout configuration, separate from the metadata store's main S3 client. This allows tuning lock behavior independently — lock operations should fail fast rather than blocking for minutes, which is important in high-latency S3 scenarios.
+Lock operations use a dedicated S3 client with independent timeout configuration, separate from the metadata store's main S3 client. This allows tuning lock behavior independently: lock operations should fail fast rather than blocking for minutes, which is important in high-latency S3 scenarios.
 
 ```toml
 [metadata_store.s3.lock_strategy.s3]
@@ -281,7 +281,7 @@ max_retries = 100           # Acquisition retry attempts
 retry_delay_ms = 50         # Delay between retries (minimum: 1)
 ```
 
-The heartbeat interval is automatically calculated as `ttl_secs / 3`. For example, with the default `ttl_secs = 30`, heartbeats occur every 10 seconds. The minimum `ttl_secs` value is 9 seconds, resulting in a minimum heartbeat interval of 3 seconds. Transient heartbeat failures (connect errors, refresh timeouts) accumulate up to a small budget — roughly one TTL of slack — before cancelling the in-flight operation, so a short network blip does not kill in-progress work. Authoritative signals (ownership loss, max-hold expiry, missing lock object) cancel immediately.
+The heartbeat interval is automatically calculated as `ttl_secs / 3`. For example, with the default `ttl_secs = 30`, heartbeats occur every 10 seconds. The minimum `ttl_secs` value is 9 seconds, resulting in a minimum heartbeat interval of 3 seconds. Transient heartbeat failures (connect errors, refresh timeouts) accumulate up to a small budget (roughly one TTL of slack) before cancelling the in-flight operation, so a short network blip does not kill in-progress work. Authoritative signals (ownership loss, max-hold expiry, missing lock object) cancel immediately.
 
 :::note
 The S3 provider must support conditional writes. Angos probes for this capability at startup and fails fast if it is not available.
@@ -319,14 +319,14 @@ Lock is held during:
 
 Lock operations emit Prometheus metrics for observability. Key metrics to monitor:
 
-- `lock_acquisition_duration_ms` — Histogram of lock acquisition times (e.g., p99 > 500ms indicates S3 latency degradation)
-- `lock_retries_total` — Counter of lock acquisition retries (e.g., rising rate indicates lock contention)
-- `lock_invalidations_total{reason="heartbeat_failure"}` — Heartbeat failures that exhausted the retry budget (e.g., indicates connectivity issues between the registry and the lock store). The heartbeat path is backend-agnostic, so both S3 and Redis report `heartbeat_failure`.
-- `lock_recoveries_total` — Counter of stale lock recovery attempts (e.g., indicates crashed instances)
+- `lock_acquisition_duration_ms`: Histogram of lock acquisition times (e.g., p99 > 500ms indicates S3 latency degradation)
+- `lock_retries_total`: Counter of lock acquisition retries (e.g., rising rate indicates lock contention)
+- `lock_invalidations_total{reason="heartbeat_failure"}`: Heartbeat failures that exhausted the retry budget (e.g., indicates connectivity issues between the registry and the lock store). The heartbeat path is backend-agnostic, so both S3 and Redis report `heartbeat_failure`.
+- `lock_recoveries_total`: Counter of stale lock recovery attempts (e.g., indicates crashed instances)
 
 For multi-instance deployments, alert on:
 - **High `lock_retries_total` rate**: Rising retry rate during normal operation suggests lock contention and may indicate insufficient `max_retries` or `retry_delay_ms` tuning.
-- **`lock_invalidations_total{reason="heartbeat_failure"}`**: Heartbeat-side failures suggest network or backend issues between the registry and the lock store. Consider checking connectivity, network quality, and lock timeout settings. Heartbeat failures must accumulate past a budget — roughly one TTL of slack — before the in-flight operation is cancelled, so an isolated blip is absorbed rather than surfaced here.
+- **`lock_invalidations_total{reason="heartbeat_failure"}`**: Heartbeat-side failures suggest network or backend issues between the registry and the lock store. Consider checking connectivity, network quality, and lock timeout settings. Heartbeat failures must accumulate past a budget (roughly one TTL of slack) before the in-flight operation is cancelled, so an isolated blip is absorbed rather than surfaced here.
 - **High `lock_acquisition_duration_ms` p99**: Persistent p99 latency > expected S3 latency may indicate saturation or regional latency issues.
 
 See the [configuration reference](../reference/configuration.md#prometheus-metrics) for the full metrics list.
@@ -371,7 +371,7 @@ Configuration:
 multipart_uniform_parts = false  # Default
 ```
 
-Each `PATCH` streams toward S3 with its known `Content-Length` from the HTTP request header, frame-by-frame without buffering the whole chunk. The multipart upload is opened **lazily**: bytes below the 5 MiB S3 minimum are parked at a per-session staging key and combined with the next `PATCH`, so a multipart session is created only once there are enough bytes to flush a part of at least 5 MiB. An upload whose total never reaches 5 MiB skips multipart entirely — `complete` promotes the staged object to the upload key with a single `CopyObject`.
+Each `PATCH` streams toward S3 with its known `Content-Length` from the HTTP request header, frame-by-frame without buffering the whole chunk. The multipart upload is opened **lazily**: bytes below the 5 MiB S3 minimum are parked at a per-session staging key and combined with the next `PATCH`, so a multipart session is created only once there are enough bytes to flush a part of at least 5 MiB. An upload whose total never reaches 5 MiB skips multipart entirely: `complete` promotes the staged object to the upload key with a single `CopyObject`.
 
 **Memory usage:** bytes stream frame-by-frame, so memory is essentially constant regardless of blob size. The only buffered data is the sub-part remainder (< 5 MiB), which is parked in S3 between `PATCH` calls and re-read when the next chunk arrives.
 
@@ -472,11 +472,11 @@ copy limits without proxying blob bytes through Angos.
 
 When using S3 for metadata, Angos includes several optimizations to reduce round-trips and improve scalability:
 
-**Link cache** — A read-through cache for link metadata (tags, layer links). Populated on both read and write, invalidated on delete. Configurable TTL (default 30 s, `link_cache_ttl = 0` to disable). Shares the same cache backend (in-memory or Redis) as authentication tokens.
+**Link cache**: A read-through cache for link metadata (tags, layer links). Populated on both read and write, invalidated on delete. Configurable TTL (default 30 s, `link_cache_ttl = 0` to disable). Shares the same cache backend (in-memory or Redis) as authentication tokens.
 
 In single-instance deployments, in-memory cache is sufficient. In multi-instance deployments, each instance maintains its own in-memory cache, so a write on instance A is not visible to instance B until the TTL expires. For consistency, use a shared Redis cache: when instance A writes a tag, all instances see the updated entry immediately.
 
-**Deferred access time updates** — Instead of a synchronous lock-read-write-unlock cycle on every manifest pull, access time updates are buffered in memory and flushed periodically. Configurable interval (default 60 s, `access_time_debounce_secs = 0` to disable). This reduces the critical path per pull from 4 S3 operations to 1. In multi-instance deployments, each instance maintains its own buffer, so access times may lag behind actual pulls and can be overwritten by concurrent instances (last writer wins).
+**Deferred access time updates**: Instead of a synchronous lock-read-write-unlock cycle on every manifest pull, access time updates are buffered in memory and flushed periodically. Configurable interval (default 60 s, `access_time_debounce_secs = 0` to disable). This reduces the critical path per pull from 4 S3 operations to 1. In multi-instance deployments, each instance maintains its own buffer, so access times may lag behind actual pulls and can be overwritten by concurrent instances (last writer wins).
 
 ```toml
 [metadata_store.s3]
@@ -523,9 +523,9 @@ manifests; once the remaining references are gone, the final delete removes the 
 
 **Benefits:**
 
-- **Reduced contention** — Multiple namespaces can update their blob references concurrently without serializing on a single file.
-- **Faster updates** — Each shard is small, making updates quicker.
-- **Scalability** — Performance doesn't degrade as the number of namespaces grows.
+- **Reduced contention**: Multiple namespaces can update their blob references concurrently without serializing on a single file.
+- **Faster updates**: Each shard is small, making updates quicker.
+- **Scalability**: Performance doesn't degrade as the number of namespaces grows.
 
 #### Namespace Registry
 
@@ -547,29 +547,29 @@ This file contains a simple JSON list:
 
 The registry is:
 
-- **Built on first use** — If missing, Angos performs an S3 tree walk to discover all namespaces and writes the registry file.
-- **Updated incrementally** — New namespaces are appended to the registry as they are created.
-- **Protected by locking** — Concurrent writes use distributed locking (S3 conditional writes or a lock key) to prevent corruption.
+- **Built on first use**: If missing, Angos performs an S3 tree walk to discover all namespaces and writes the registry file.
+- **Updated incrementally**: New namespaces are appended to the registry as they are created.
+- **Protected by locking**: Concurrent writes use distributed locking (S3 conditional writes or a lock key) to prevent corruption.
 
 **Benefits:**
 
-- **O(1) list performance** — Instead of O(n) tree walk, `list_namespaces` becomes a single file read.
-- **No background jobs** — The registry is built on demand, not via a separate garbage collector or background process.
+- **O(1) list performance**: Instead of O(n) tree walk, `list_namespaces` becomes a single file read.
+- **No background jobs**: The registry is built on demand, not via a separate garbage collector or background process.
 
 The registry is append-only at runtime: namespaces are added when their first link is written, but never removed by the delete path. Periodic `angos scrub` rebuilds the registry by re-walking storage, so a namespace whose last artifact is deleted disappears from `list_namespaces` on the next scrub run. Between server-driven deletes and the next scrub, the `_catalog` endpoint may continue to return the namespace name. Because namespace names are stable identifiers rather than a count of live artifacts, clients that probe per-namespace before assuming content exists are unaffected.
 
 #### Legacy Blob Index and Namespace Registry Migration
 
-Two pre-existing legacy layouts can be encountered after upgrade: the per-blob `index.json` file written by Angos prior to v1.1.0, and the single-file `namespace_registry.json` that filesystem deployments used before this release. Both layouts continue to work at runtime without any migration step.
+Two pre-existing legacy layouts can be encountered after upgrade: the per-blob `index.json` file written by Angos prior to v1.1.0, and the single-file `namespace_registry.json` that filesystem deployments used prior to v1.2.0. Both layouts continue to work at runtime without any migration step.
 
-Runtime reads consult the sharded layout first and fall back to the legacy file when no sharded entry covers the request. Writes follow the same per-blob rule: when a legacy `index.json` is present for a digest the runtime updates it in place (the legacy file stays the source of truth for that blob until scrub moves it), and only when no legacy file is present does a write create or update a sharded entry under `refs/{namespace}.json`. This is decided per blob, so different blobs in the same deployment can sit in different states. The namespace registry behaves the same way on reads — the sharded shards are consulted first and the legacy `namespace_registry.json` is read when no shards are present.
+Runtime reads consult the sharded layout first and fall back to the legacy file when no sharded entry covers the request. Writes follow the same per-blob rule: when a legacy `index.json` is present for a digest the runtime updates it in place (the legacy file stays the source of truth for that blob until scrub moves it), and only when no legacy file is present does a write create or update a sharded entry under `refs/{namespace}.json`. This is decided per blob, so different blobs in the same deployment can sit in different states. The namespace registry behaves the same way on reads: the shards are consulted first and the legacy `namespace_registry.json` is read when no shards are present.
 
 `angos scrub` is the only thing that actively rewrites legacy data into the sharded layout:
 
 - `angos scrub --blobs` rewrites each legacy `v2/blobs/{algorithm}/{hash_prefix}/{hash}/index.json` into per-namespace shards under `refs/{namespace}.json` and deletes the legacy file once the shards are written.
 - A regular `angos scrub` run rebuilds the namespace registry shards by re-walking storage and removes the legacy `namespace_registry.json`.
 
-The migration is idempotent — re-running scrub is safe and is a no-op for data that is already in the sharded layout.
+The migration is idempotent: re-running scrub is safe and is a no-op for data that is already in the sharded layout.
 
 #### Blob Index Convergence
 
@@ -585,13 +585,13 @@ Periodic `angos scrub -b` reconciles every blob-index entry against
 `MetadataStore::read_link`. Entries that fail the probe are removed, and a
 shard whose entries all disappear is itself deleted. The empty `refs/`
 directory is pruned too. This convergence only runs when `-b` is part of the
-invocation — omitting it means stale shards accumulate indefinitely.
+invocation; omitting it means stale shards accumulate indefinitely.
 
 Blob ownership markers (`LinkKind::Blob`) are intentionally retained until the
 client issues an explicit `DELETE /v2/<name>/blobs/<digest>`. They are not
 removed when a namespace's manifests are deleted. When scrub detects that a
 referenced blob's backing bytes are absent, however, the entire blob-index entry
-— including any ownership markers — is purged, so runtime `can_read` no longer
+(including any ownership markers) is purged, so runtime `can_read` no longer
 reports the blob as accessible.
 
 ### Caching
@@ -648,14 +648,14 @@ Without Redis, cache is in-memory per-instance.
 
 ## Transactional Engine
 
-The transactional engine is a single design — an abstraction that consolidates multi-step storage writes behind single atomic `Transaction` objects — that each subsystem instantiates over its own store with its own lock domain; it is always active. Blob-bytes operations that span the blob store serialize via a `blob-data:{digest}` coarse lock taken on the metadata engine, the single lock domain shared by every blob-data participant. The four subsystems it covers are:
+The transactional engine is a single design (an abstraction that consolidates multi-step storage writes behind single atomic `Transaction` objects) that each subsystem instantiates over its own store with its own lock domain; it is always active. Blob-bytes operations that span the blob store serialize via a `blob-data:{digest}` coarse lock taken on the metadata engine, the single lock domain shared by every blob-data participant. The four subsystems it covers are:
 
 | Subsystem | Description |
 |---|---|
-| Metadata store | `MetadataStore::update_links` — link writes and blob-index shard read-modify-write submitted as one transaction. |
-| Job store | `JobStore::enqueue`, `JobStore::complete`, and `JobStore::fail` — lock release and pending/index deletes commit atomically as one transaction. |
+| Metadata store | `MetadataStore::update_links`: link writes and blob-index shard read-modify-write submitted as one transaction. |
+| Job store | `JobStore::enqueue`, `JobStore::complete`, and `JobStore::fail`: lock release and pending/index deletes commit atomically as one transaction. |
 | Upload store | Blob upload sessions persisted as per-file artifacts under `v2/repositories/<namespace>/_uploads/<uuid>/` (`session`, `startedat`, `hashstates/sha256/<offset>`, `data`); `complete` runs an engine transaction that moves the staged blob to its canonical key and deletes the session-record files. |
-| Manifest store | `Registry::store_manifest` and `Registry::delete_manifest` — blob write, link writes, and blob-index mutations expressed as one transaction, making the "blob landed, links failed" orphan class structurally impossible. |
+| Manifest store | `Registry::store_manifest` and `Registry::delete_manifest`: blob write, link writes, and blob-index mutations expressed as one transaction, making the "blob landed, links failed" orphan class structurally impossible. |
 
 The CAS-vs-Lock executor choice happens once inside the engine factory based on the configured `lock_strategy` and detected S3 capabilities; subsystems never see it. The on-disk key layout is unchanged from a non-transactional deployment.
 

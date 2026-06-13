@@ -9,11 +9,11 @@ use wiremock::{
 use super::common::{build_dispatcher, create_test_event, create_test_webhook_config};
 use crate::{
     configuration::RegexPattern,
-    event_webhook::{config::DeliveryPolicy, event::EventKind},
+    event_webhook::{config::DeliveryPolicy, dispatcher::EventDispatcher, event::EventKind},
 };
 
 #[test]
-fn event_dispatcher_new_constructs_from_configs() {
+fn event_dispatcher_builder_constructs_from_configs() {
     let mut webhooks = HashMap::new();
     webhooks.insert(
         "hook1".to_string(),
@@ -33,14 +33,14 @@ fn event_dispatcher_new_constructs_from_configs() {
     hook2.events = vec![EventKind::TagCreate];
     webhooks.insert("hook2".to_string(), hook2);
 
-    let dispatcher = super::super::EventDispatcher::new(webhooks);
+    let dispatcher = EventDispatcher::builder().webhooks(webhooks).build();
     assert!(dispatcher.is_ok());
 }
 
 #[test]
-fn event_dispatcher_new_empty_configs() {
+fn event_dispatcher_builder_empty_configs() {
     let webhooks = HashMap::new();
-    let dispatcher = super::super::EventDispatcher::new(webhooks);
+    let dispatcher = EventDispatcher::builder().webhooks(webhooks).build();
     assert!(dispatcher.is_ok());
 }
 

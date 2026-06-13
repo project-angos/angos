@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{collections::HashSet, num::NonZeroUsize, sync::Arc};
 
 use serde::Deserialize;
 use tokio::task;
@@ -12,12 +12,19 @@ use crate::{
     policy::{AccessPolicyConfig, RetentionPolicy, RetentionPolicyConfig, SystemClock},
     registry::{Error, blob_store::BoxedReader},
     registry_client::RegistryClient,
+    replication::{ReplicationDownstream, ReplicationDownstreamConfig},
 };
+
+/// Fallback per-manifest blob-push concurrency when a downstream omits
+/// `max_concurrent_pushes`.
+const DEFAULT_MAX_CONCURRENT_PUSHES: usize = 4;
 
 #[derive(Clone, Debug, Default, Deserialize)]
 pub struct Config {
     #[serde(default)]
     pub upstream: Vec<RegistryClientConfig>,
+    #[serde(default)]
+    pub downstream: Vec<ReplicationDownstreamConfig>,
     #[serde(default)]
     pub access_policy: AccessPolicyConfig,
     #[serde(default)]
@@ -34,6 +41,7 @@ pub struct Config {
 pub struct Repository {
     pub name: String,
     pub upstreams: Vec<RegistryClient>,
+    pub replication: Vec<ReplicationDownstream>,
     pub retention_policy: RetentionPolicy,
     pub immutable_tags: bool,
     pub immutable_tags_exclusions: Vec<RegexPattern>,
@@ -81,7 +89,7 @@ impl Repository {
             task::spawn_blocking(move || {
                 let mut upstreams = Vec::new();
                 for config in &upstream_configs {
-                    upstreams.push(RegistryClient::new_with_manifest_size_limit(
+                    upstreams.push(RegistryClient::from_config(
                         config,
                         Arc::clone(&cache),
                         max_manifest_size_bytes,
@@ -93,12 +101,76 @@ impl Repository {
             .map_err(|e| Error::Internal(format!("Failed to initialize upstream clients: {e}")))??
         };
 
+        // `name` is the job lock_key segment and the per-downstream metrics label,
+        // so an empty or duplicate name would silently coalesce two distinct targets.
+        let mut seen_names = HashSet::new();
+        for downstream in &config.downstream {
+            if downstream.name.is_empty() {
+                return Err(Error::Initialization(format!(
+                    "replication downstream in repository '{name}' has an empty name; \
+                     a non-empty name is required (it is the job routing key and metrics label)"
+                )));
+            }
+            if !seen_names.insert(downstream.name.as_str()) {
+                return Err(Error::Initialization(format!(
+                    "repository '{name}' has duplicate replication downstream name '{}'; \
+                     downstream names must be unique (they are the job routing key and metrics label)",
+                    downstream.name
+                )));
+            }
+        }
+
+        let replication = if config.downstream.is_empty() {
+            Vec::new()
+        } else {
+            let downstream_configs = config.downstream.clone();
+            let cache = Arc::clone(cache);
+            task::spawn_blocking(move || {
+                let mut downstreams = Vec::new();
+                for config in &downstream_configs {
+                    let registry_client = RegistryClient::from_config(
+                        &config.client,
+                        Arc::clone(&cache),
+                        max_manifest_size_bytes,
+                    )?;
+                    downstreams.push(
+                        ReplicationDownstream::builder()
+                            .name(config.name.clone())
+                            .registry_client(Arc::new(registry_client))
+                            .mode(config.mode)
+                            .namespace_filter(
+                                config
+                                    .namespace_filter
+                                    .iter()
+                                    .cloned()
+                                    .map(RegexPattern::into_regex)
+                                    .collect(),
+                            )
+                            .max_concurrent_pushes(
+                                config
+                                    .max_concurrent_pushes
+                                    .map_or(DEFAULT_MAX_CONCURRENT_PUSHES, NonZeroUsize::get),
+                            )
+                            .prune(config.prune)
+                            .build()
+                            .map_err(|e| Error::Initialization(e.to_string()))?,
+                    );
+                }
+                Ok::<_, Error>(downstreams)
+            })
+            .await
+            .map_err(|e| {
+                Error::Internal(format!("Failed to initialize downstream clients: {e}"))
+            })??
+        };
+
         let retention_policy =
             RetentionPolicy::new(&config.retention_policy, Arc::new(SystemClock));
 
         Ok(Self {
             name: name.to_string(),
             upstreams,
+            replication,
             retention_policy,
             immutable_tags: config.immutable_tags,
             immutable_tags_exclusions: config.immutable_tags_exclusions.clone(),
@@ -198,6 +270,7 @@ mod tests {
             manifest::DEFAULT_MAX_MANIFEST_SIZE_BYTES,
             repository::{Config, RegistryClientConfig, Repository},
         },
+        replication::{ReplicationDownstreamConfig, ReplicationMode},
         test_fixtures::webhook::ca_bundle_pem,
     };
 
@@ -218,6 +291,17 @@ mod tests {
             client_private_key: None,
             username: None,
             password: None,
+        }
+    }
+
+    fn downstream_config(name: &str) -> ReplicationDownstreamConfig {
+        ReplicationDownstreamConfig {
+            name: name.to_string(),
+            client: registry_client_config("https://downstream.example.test".to_string()),
+            mode: ReplicationMode::default(),
+            namespace_filter: Vec::new(),
+            max_concurrent_pushes: None,
+            prune: false,
         }
     }
 
@@ -279,6 +363,51 @@ mod tests {
             .unwrap();
 
         assert!(!repo.is_pull_through());
+    }
+
+    #[tokio::test]
+    async fn duplicate_downstream_name_is_rejected() {
+        let cache = cache::Config::Memory.to_backend().unwrap();
+        let config = Config {
+            downstream: vec![downstream_config("eu"), downstream_config("eu")],
+            ..Default::default()
+        };
+
+        let error = Repository::new("repo", &config, &cache, DEFAULT_MAX_MANIFEST_SIZE_BYTES)
+            .await
+            .err()
+            .expect("duplicate downstream name must be rejected");
+
+        match error {
+            Error::Initialization(message) => {
+                assert!(message.contains("duplicate"), "message: {message}");
+                assert!(message.contains("eu"), "message: {message}");
+                assert!(message.contains("repo"), "message: {message}");
+            }
+            other => panic!("expected Error::Initialization, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn empty_downstream_name_is_rejected() {
+        let cache = cache::Config::Memory.to_backend().unwrap();
+        let config = Config {
+            downstream: vec![downstream_config("")],
+            ..Default::default()
+        };
+
+        let error = Repository::new("repo", &config, &cache, DEFAULT_MAX_MANIFEST_SIZE_BYTES)
+            .await
+            .err()
+            .expect("empty downstream name must be rejected");
+
+        match error {
+            Error::Initialization(message) => {
+                assert!(message.contains("empty name"), "message: {message}");
+                assert!(message.contains("repo"), "message: {message}");
+            }
+            other => panic!("expected Error::Initialization, got {other:?}"),
+        }
     }
 
     #[tokio::test]

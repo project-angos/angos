@@ -66,7 +66,7 @@ Backoff formula: `100ms * 2^(attempt - 1)`
 |-------------------|--------------------------------------------------|
 | `manifest.push`   | Manifest stored successfully                     |
 | `manifest.delete` | Manifest deleted                                 |
-| `blob.push`       | Blob upload completed                            |
+| `blob.push`       | Blob upload completed, or a cross-repo mount granted it to a namespace |
 | `tag.create`      | Tag created (part of manifest push with tag ref) |
 | `tag.delete`      | Tag deleted (part of manifest delete by tag)     |
 

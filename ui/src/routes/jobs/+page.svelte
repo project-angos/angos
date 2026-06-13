@@ -9,7 +9,8 @@
 		deleteJob,
 		type JobEntry,
 		type FailedJobEntry,
-		type JobState
+		type JobState,
+		type JobQueue
 	} from '$lib/api';
 	import { formatTimeAgo } from '$lib/utils';
 	import Breadcrumb from '$lib/components/Breadcrumb.svelte';
@@ -19,6 +20,8 @@
 	import DeleteButton from '$lib/components/DeleteButton.svelte';
 
 	const PAGE = 100;
+
+	let queue: JobQueue = $state('cache');
 
 	let pending: JobEntry[] = $state([]);
 	let pendingNext: string | undefined = $state(undefined);
@@ -35,7 +38,7 @@
 	let confirmKey: string | null = $state(null);
 
 	async function loadPending(reset: boolean): Promise<void> {
-		const result = await fetchJobs(PAGE, reset ? undefined : pendingNext);
+		const result = await fetchJobs(queue, PAGE, reset ? undefined : pendingNext);
 		if (result.error) {
 			error = result.error;
 		} else if (result.data) {
@@ -45,7 +48,7 @@
 	}
 
 	async function loadFailed(reset: boolean): Promise<void> {
-		const result = await fetchFailedJobs(PAGE, reset ? undefined : failedNext);
+		const result = await fetchFailedJobs(queue, PAGE, reset ? undefined : failedNext);
 		if (result.error) {
 			error = result.error;
 		} else if (result.data) {
@@ -65,10 +68,18 @@
 
 	onMount(refresh);
 
+	function selectQueue(next: JobQueue): void {
+		if (next === queue) {
+			return;
+		}
+		queue = next;
+		void refresh();
+	}
+
 	async function onRetry(key: string): Promise<void> {
 		busyKey = key;
 		actionError = null;
-		const err = await retryJob(key);
+		const err = await retryJob(queue, key);
 		busyKey = null;
 		if (err) {
 			actionError = `Retry failed (${err}); list refreshed.`;
@@ -79,7 +90,7 @@
 	async function onDelete(state: JobState, key: string): Promise<void> {
 		busyKey = key;
 		actionError = null;
-		const err = await deleteJob(state, key);
+		const err = await deleteJob(queue, state, key);
 		busyKey = null;
 		if (err) {
 			actionError = `Delete failed (${err}); list refreshed.`;
@@ -99,6 +110,22 @@
 <Breadcrumb items={[{ label: 'Jobs', href: `${base}/jobs` }]} />
 
 <div class="toolbar">
+	<div class="view-toggle" role="group" aria-label="Job queue">
+		<button
+			class:active={queue === 'cache'}
+			onclick={() => selectQueue('cache')}
+			disabled={loading}
+		>
+			cache
+		</button>
+		<button
+			class:active={queue === 'replication'}
+			onclick={() => selectQueue('replication')}
+			disabled={loading}
+		>
+			replication
+		</button>
+	</div>
 	<button class="refresh" onclick={refresh} disabled={loading}>
 		{loading ? 'Refreshing…' : 'Refresh'}
 	</button>
@@ -217,7 +244,8 @@
 <style>
 	.toolbar {
 		display: flex;
-		justify-content: flex-end;
+		justify-content: space-between;
+		align-items: center;
 		margin-bottom: 1rem;
 	}
 

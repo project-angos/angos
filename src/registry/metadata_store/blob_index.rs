@@ -121,6 +121,8 @@ impl MetadataStore {
             caller_holds_blob_data_lock: true,
             ..LinksTxExtras::default()
         };
-        self.execute_links_tx(namespace, &[], extras).await
+        self.execute_links_tx(namespace, &[], extras)
+            .await
+            .map(|_| ())
     }
 }

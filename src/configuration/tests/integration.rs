@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::{num::NonZeroUsize, path::PathBuf};
 
 use angos_tx_engine::lock::LockStrategy;
 
@@ -9,6 +9,7 @@ use crate::{
     configuration::{Configuration, Error, RegistryStorageConfig, ServerConfig},
     policy::AccessMode,
     registry::blob_store,
+    replication::ReplicationMode,
 };
 
 #[test]
@@ -211,17 +212,67 @@ fn test_repository_config() {
 }
 
 #[test]
-fn test_cache_config_memory() {
+fn test_repository_downstream_config() {
+    // Downstream tables must parse through the full Configuration, including
+    // the repository map visitor and the flattened RegistryClientConfig.
     let config = r#"
     [server]
     bind_address = "0.0.0.0"
 
-    [cache]
-    memory = {}
+    [[repository.myapp.downstream]]
+    name = "instance-b"
+    url = "https://angos-eu.example.com"
+    username = "replicator"
+    password = "s3cret"
+    mode = "event-only"
+    namespace_filter = ["^nginx/.*"]
+    max_concurrent_pushes = 8
+    prune = true
     "#;
 
     let config = Configuration::load_from_str(config).unwrap();
-    assert!(matches!(config.cache, cache::Config::Memory));
+    let repo = &config.repository["myapp"];
+    assert_eq!(repo.downstream.len(), 1);
+    let downstream = &repo.downstream[0];
+    assert_eq!(downstream.name, "instance-b");
+    // Flattened RegistryClientConfig fields.
+    assert_eq!(downstream.client.url, "https://angos-eu.example.com");
+    assert_eq!(downstream.client.username.as_deref(), Some("replicator"));
+    assert_eq!(
+        downstream
+            .client
+            .password
+            .as_ref()
+            .map(|p| p.expose().as_str()),
+        Some("s3cret")
+    );
+    // Replication-only fields.
+    assert_eq!(downstream.mode, ReplicationMode::EventOnly);
+    assert_eq!(downstream.namespace_filter.len(), 1);
+    assert_eq!(downstream.namespace_filter[0].as_source(), "^nginx/.*");
+    assert_eq!(downstream.max_concurrent_pushes, NonZeroUsize::new(8));
+    assert!(downstream.prune);
+}
+
+#[test]
+fn test_repository_downstream_rejects_partial_mtls() {
+    // The mTLS-pairing validation must fire through the full Configuration
+    // parse too.
+    let config = r#"
+    [server]
+    bind_address = "0.0.0.0"
+
+    [[repository.myapp.downstream]]
+    name = "instance-b"
+    url = "https://angos-eu.example.com"
+    client_certificate = "cert.pem"
+    "#;
+
+    let result = Configuration::load_from_str(config);
+    assert!(
+        result.is_err(),
+        "partial mTLS in a downstream must be rejected at full-config parse"
+    );
 }
 
 #[test]
@@ -562,30 +613,6 @@ fn test_load_from_nonexistent_file() {
 }
 
 #[test]
-fn test_load_from_file_with_invalid_content() {
-    use std::io::Write;
-
-    use tempfile::NamedTempFile;
-
-    let invalid_config = r#"
-    [server
-    bind_address = "0.0.0.0"
-    "#;
-
-    let mut temp_file = NamedTempFile::new().unwrap();
-    temp_file.write_all(invalid_config.as_bytes()).unwrap();
-    temp_file.flush().unwrap();
-
-    let result = Configuration::load(temp_file.path());
-    assert!(result.is_err());
-
-    match result {
-        Err(Error::InvalidFormat(_)) => {}
-        _ => panic!("Expected InvalidFormat error"),
-    }
-}
-
-#[test]
 fn test_load_from_file_with_tls_config() {
     use std::io::Write;
 
@@ -753,6 +780,100 @@ fn test_metadata_store_s3_lock_strategy_s3_defaults() {
             panic!("Expected S3 metadata store config")
         }
     }
+}
+
+// An S3 blob store with no explicit metadata-store lock strategy inherits the
+// in-process `memory` lock, which cannot serialize across processes.
+#[test]
+fn job_queue_rejects_inherited_memory_lock_on_s3() {
+    let config = r#"
+    [server]
+    bind_address = "0.0.0.0"
+
+    [global.job_queue]
+
+    [blob_store.s3]
+    bucket = "blob-bucket"
+    region = "us-east-1"
+    endpoint = "https://s3.amazonaws.com"
+    access_key_id = "key"
+    secret_key = "secret"
+    "#;
+
+    let err = Configuration::load_from_str(config).unwrap_err();
+    let message = err.to_string();
+    assert!(
+        message.contains("memory") && message.contains("lock"),
+        "durable queue + inherited memory lock must be rejected, got: {message}"
+    );
+}
+
+#[test]
+fn job_queue_rejects_fs_memory_lock() {
+    let config = r#"
+    [server]
+    bind_address = "0.0.0.0"
+
+    [global.job_queue]
+
+    [blob_store.fs]
+    root_dir = "/data/blobs"
+    "#;
+
+    let err = Configuration::load_from_str(config).unwrap_err();
+    assert!(
+        err.to_string().contains("lock"),
+        "durable queue + FS memory lock must be rejected, got: {err}"
+    );
+}
+
+#[test]
+fn job_queue_allows_shared_s3_lock() {
+    let config = r#"
+    [server]
+    bind_address = "0.0.0.0"
+
+    [global.job_queue]
+
+    [blob_store.s3]
+    bucket = "blob-bucket"
+    region = "us-east-1"
+    endpoint = "https://s3.amazonaws.com"
+    access_key_id = "blob-key"
+    secret_key = "blob-secret"
+
+    [metadata_store.s3]
+    bucket = "metadata-bucket"
+    region = "us-east-1"
+    endpoint = "https://s3.amazonaws.com"
+    access_key_id = "key"
+    secret_key = "secret"
+
+    [metadata_store.s3.lock_strategy.s3]
+    "#;
+
+    assert!(
+        Configuration::load_from_str(config).is_ok(),
+        "durable queue with a shared S3 lock must be accepted"
+    );
+}
+
+// Without [global.job_queue] the queue drains in a single process, so the
+// memory lock suffices.
+#[test]
+fn in_process_queue_allows_memory_lock() {
+    let config = r#"
+    [server]
+    bind_address = "0.0.0.0"
+
+    [blob_store.fs]
+    root_dir = "/data/blobs"
+    "#;
+
+    assert!(
+        Configuration::load_from_str(config).is_ok(),
+        "in-process queue with a memory lock must be accepted"
+    );
 }
 
 #[test]

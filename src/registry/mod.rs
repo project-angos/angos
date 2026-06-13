@@ -1,6 +1,7 @@
 use std::{collections::HashMap, fmt, num::NonZeroUsize, sync::Arc, time::Duration};
 
-use tokio::time::sleep;
+use tokio::{select, time::sleep};
+use tokio_util::sync::CancellationToken;
 use tracing::instrument;
 
 pub mod blob;
@@ -29,9 +30,9 @@ pub mod version;
 pub use blob::{BlobRange, GetBlobResponse};
 pub use error::Error;
 pub use headers::{HeaderMap, ResponseHeaders};
-pub use manifest::{GetManifestResponse, parse_manifest_digests};
+pub use manifest::{GetManifestResponse, ParsedManifestDigests, parse_manifest_digests};
 pub use repository::Repository;
-pub use upload::StartUploadResponse;
+pub use upload::{BlobMount, StartUploadResponse};
 
 pub const DOCKER_CONTENT_DIGEST: &str = "Docker-Content-Digest";
 pub const DOCKER_UPLOAD_UUID: &str = "Docker-Upload-UUID";
@@ -52,7 +53,10 @@ pub use crate::policy::AccessPolicy;
 use crate::{
     cache,
     command::worker::runner::execute_one,
-    configuration::{RegexPattern, global::DEFAULT_MAX_CONCURRENT_CACHE_JOBS},
+    configuration::{
+        RegexPattern,
+        global::{DEFAULT_MAX_CONCURRENT_CACHE_JOBS, DEFAULT_MAX_CONCURRENT_REPLICATION_JOBS},
+    },
     oci::{Digest, Namespace},
     registry::{
         blob_store::BlobStore,
@@ -61,6 +65,7 @@ use crate::{
         metadata_store::MetadataStore,
         repository_resolver::RepositoryResolver,
     },
+    replication::{REPLICATION_QUEUE, ReplicationJobHandler},
 };
 use angos_tx_engine::lock::LockSession;
 
@@ -72,8 +77,8 @@ pub struct RegistryConfig {
     pub global_immutable_tags: bool,
     pub global_immutable_tags_exclusions: Vec<RegexPattern>,
     pub max_manifest_size_bytes: usize,
-    /// When set, the registry routes all cache-fill jobs through this
-    /// pre-built queue (typically the durable backend wired in `server setup`).
+    /// When set, the registry routes all cache-fill and replication jobs through
+    /// this pre-built queue (typically the durable backend wired in `server setup`).
     /// When absent, an engine-backed in-process queue is constructed
     /// automatically. The choice is made once at startup; no runtime switching.
     pub job_queue: Option<Arc<JobStore>>,
@@ -81,6 +86,9 @@ pub struct RegistryConfig {
     /// consulted when `job_queue` is `None`; durable deployments use the
     /// equivalent worker-side setting instead.
     pub max_concurrent_cache_jobs: NonZeroUsize,
+    /// Parallel in-process replication-push jobs. Only consulted when
+    /// `job_queue` is `None`; durable deployments use `angos worker` instead.
+    pub max_concurrent_replication_jobs: NonZeroUsize,
 }
 
 impl Default for RegistryConfig {
@@ -94,6 +102,7 @@ impl Default for RegistryConfig {
             max_manifest_size_bytes: manifest::DEFAULT_MAX_MANIFEST_SIZE_BYTES,
             job_queue: None,
             max_concurrent_cache_jobs: DEFAULT_MAX_CONCURRENT_CACHE_JOBS,
+            max_concurrent_replication_jobs: DEFAULT_MAX_CONCURRENT_REPLICATION_JOBS,
         }
     }
 }
@@ -138,6 +147,11 @@ impl RegistryConfig {
         self.max_concurrent_cache_jobs = value;
         self
     }
+
+    pub fn max_concurrent_replication_jobs(mut self, value: NonZeroUsize) -> Self {
+        self.max_concurrent_replication_jobs = value;
+        self
+    }
 }
 
 #[allow(clippy::struct_excessive_bools)]
@@ -148,7 +162,11 @@ pub struct Registry {
     enable_blob_redirect: bool,
     enable_manifest_redirect: bool,
     update_pull_time: bool,
-    cache_queue: Arc<JobStore>,
+    job_queue: Arc<JobStore>,
+    /// Cancels the in-process claim loops when this `Registry` is dropped.
+    /// `None` when a durable `[global.job_queue]` is configured (no in-process
+    /// loops to cancel).
+    in_process_shutdown: Option<CancellationToken>,
     global_immutable_tags: bool,
     global_immutable_tags_exclusions: Vec<RegexPattern>,
     max_manifest_size_bytes: usize,
@@ -168,16 +186,19 @@ impl Registry {
         resolver: Arc<RepositoryResolver>,
         config: RegistryConfig,
     ) -> Result<Self, Error> {
-        let cache_queue: Arc<JobStore> = if let Some(q) = config.job_queue {
-            q
-        } else {
-            build_in_process_queue(
-                &resolver,
-                &blob_store,
-                &metadata_store,
-                config.max_concurrent_cache_jobs,
-            )
-        };
+        let (job_queue, in_process_shutdown): (Arc<JobStore>, Option<CancellationToken>) =
+            if let Some(q) = config.job_queue {
+                (q, None)
+            } else {
+                let (q, shutdown) = build_in_process_queue(
+                    &resolver,
+                    &blob_store,
+                    &metadata_store,
+                    config.max_concurrent_cache_jobs,
+                    config.max_concurrent_replication_jobs,
+                )?;
+                (q, Some(shutdown))
+            };
 
         Ok(Self {
             update_pull_time: config.update_pull_time,
@@ -186,7 +207,8 @@ impl Registry {
             blob_store,
             metadata_store,
             resolver,
-            cache_queue,
+            job_queue,
+            in_process_shutdown,
             global_immutable_tags: config.global_immutable_tags,
             global_immutable_tags_exclusions: config.global_immutable_tags_exclusions,
             max_manifest_size_bytes: config.max_manifest_size_bytes,
@@ -242,20 +264,16 @@ impl Registry {
 
 /// Construct the in-process job queue used when `[global.job_queue]` is absent.
 ///
-/// Builds a [`JobStore`] over the registry's **shared** object store and
-/// executor (via `blob_store.store`) and spawns a pool of `concurrency`
-/// claim-loop tasks that drain it in-process. Sharing the backend is required
-/// for correctness: cache-fill jobs commit a transaction that moves staged
-/// upload bytes into blob-data and grants metadata references, which only
-/// resolves against the store where those bytes live. Jobs are therefore
-/// persisted under the shared store's `_jobs/` prefix (and are picked back up
-/// by the claim loops after a restart) rather than discarded.
+/// Sharing the registry's store backend is required: cache-fill commits and
+/// replication reads only resolve against the store holding the bytes, and
+/// jobs persisted under its `_jobs/` prefix survive restarts.
 fn build_in_process_queue(
     resolver: &Arc<RepositoryResolver>,
     blob_store: &Arc<BlobStore>,
     metadata_store: &Arc<MetadataStore>,
-    concurrency: NonZeroUsize,
-) -> Arc<JobStore> {
+    cache_concurrency: NonZeroUsize,
+    replication_concurrency: NonZeroUsize,
+) -> Result<(Arc<JobStore>, CancellationToken), Error> {
     // Share the registry's object store and transaction executor (the same
     // handle the blob/metadata stores use). The cache-fill handler stages bytes
     // into the blob store and returns a transaction that moves them into
@@ -266,30 +284,361 @@ fn build_in_process_queue(
     let store = Arc::clone(&blob_store.store);
     let job_store: Arc<JobStore> = Arc::new(JobStore::new(store, "in-process"));
 
-    let handler: Arc<dyn JobHandler> = Arc::new(CacheJobHandler::new(
+    let cache_handler: Arc<dyn JobHandler> = Arc::new(CacheJobHandler::new(
         resolver.clone(),
         blob_store.clone(),
         metadata_store.clone(),
     ));
 
-    for _ in 0..concurrency.get() {
-        tokio::spawn(in_process_claim_loop(job_store.clone(), handler.clone()));
+    // Drain replication only when a downstream is configured: with none, the
+    // queue stays empty forever, so its loops would just storm the object store
+    // with `LIST`s. (Replication jobs left from a removed downstream are reaped
+    // by `scrub --replication-orphans`, not drained here.) Build the fallible
+    // handler before spawning any loop so an error cannot leak a cache loop.
+    let any_downstream = resolver
+        .keys()
+        .filter_map(|name| resolver.get(name))
+        .any(|repository| !repository.replication.is_empty());
+    let replication_handler: Option<Arc<dyn JobHandler>> = if any_downstream {
+        // Mesh cycles terminate: only state-changing writes dispatch, and
+        // receiver-side no-op suppression stops any remaining replays.
+        Some(Arc::new(
+            ReplicationJobHandler::builder()
+                .resolver(resolver.clone())
+                .blob_store(blob_store.clone())
+                .metadata_store(metadata_store.clone())
+                .build()
+                .map_err(|e| {
+                    Error::Internal(format!("failed to build replication handler: {e}"))
+                })?,
+        ))
+    } else {
+        None
+    };
+
+    // One shared token cancels every loop when the owning `Registry` is dropped.
+    let shutdown = CancellationToken::new();
+
+    for _ in 0..cache_concurrency.get() {
+        tokio::spawn(in_process_claim_loop(
+            job_store.clone(),
+            cache_handler.clone(),
+            CACHE_QUEUE,
+            shutdown.clone(),
+        ));
     }
 
-    job_store
+    if let Some(replication_handler) = replication_handler {
+        for _ in 0..replication_concurrency.get() {
+            tokio::spawn(in_process_claim_loop(
+                job_store.clone(),
+                replication_handler.clone(),
+                REPLICATION_QUEUE,
+                shutdown.clone(),
+            ));
+        }
+    }
+
+    Ok((job_store, shutdown))
 }
 
+/// Idle poll interval for the in-process claim loops. Production polls once a
+/// second (matching the durable `angos worker`) so an empty queue does not
+/// storm the object store with `LIST`s; tests poll fast so the suite stays
+/// snappy.
+#[cfg(not(test))]
+const IN_PROCESS_IDLE_POLL: Duration = Duration::from_secs(1);
+#[cfg(test)]
+const IN_PROCESS_IDLE_POLL: Duration = Duration::from_millis(10);
+
 /// Single claim-loop task for the in-process pool. Mirrors the per-worker
-/// loop in `command::worker::command::Command::run` but with a fixed 10 ms
-/// idle tick so small test suites stay snappy.
-async fn in_process_claim_loop(consumer: Arc<JobStore>, handler: Arc<dyn JobHandler>) {
+/// loop in `command::worker::command::Command::run`, idling at
+/// [`IN_PROCESS_IDLE_POLL`]. `handler` must be the handler bound to `queue`.
+///
+/// Cancellation races only the claim, so an already-claimed job runs to
+/// completion rather than being interrupted mid-execute.
+async fn in_process_claim_loop(
+    consumer: Arc<JobStore>,
+    handler: Arc<dyn JobHandler>,
+    queue: &'static str,
+    shutdown: CancellationToken,
+) {
     loop {
-        match consumer.claim_one(CACHE_QUEUE).await {
-            Err(_) => sleep(Duration::from_millis(100)).await,
-            Ok(claim_outcome) => match claim_outcome.claimed {
-                None => sleep(claim_outcome.idle_sleep(Duration::from_millis(10))).await,
-                Some(claimed) => execute_one(consumer.as_ref(), handler.as_ref(), claimed).await,
+        select! {
+            () = shutdown.cancelled() => return,
+            outcome = consumer.claim_one(queue) => match outcome {
+                Err(_) => sleep(Duration::from_millis(100)).await,
+                Ok(claim_outcome) => match claim_outcome.claimed {
+                    None => sleep(claim_outcome.idle_sleep(IN_PROCESS_IDLE_POLL)).await,
+                    Some(claimed) => {
+                        execute_one(consumer.as_ref(), handler.as_ref(), claimed).await;
+                    }
+                },
             },
         }
+    }
+}
+
+impl Drop for Registry {
+    fn drop(&mut self) {
+        // Claim loops hold their own `Arc<JobStore>` clones, so only cancelling
+        // the token stops them; leased durable jobs are re-claimed after restart.
+        if let Some(shutdown) = &self.in_process_shutdown {
+            shutdown.cancel();
+        }
+    }
+}
+
+#[cfg(test)]
+mod in_process_replication_tests {
+    use std::{collections::HashMap, sync::Arc, time::Duration};
+
+    use tempfile::TempDir;
+    use tokio::time::{sleep, timeout};
+    use wiremock::{
+        Mock, MockServer, ResponseTemplate,
+        matchers::{method, path},
+    };
+
+    use angos_storage::{ObjectStore, fs::Backend as StorageFsBackend};
+
+    use crate::{
+        oci::Namespace,
+        registry::{
+            DOCKER_CONTENT_DIGEST, Registry, RegistryConfig, Repository,
+            blob_store::BlobStore,
+            job_store::{JobEnvelope, JobStore},
+            metadata_store::MetadataStore,
+            repository_resolver::RepositoryResolver,
+            test_utils::{
+                build_store, build_test_fs_executor, downstream_client, repository_with_downstream,
+                repository_with_replication, seed_manifest,
+            },
+        },
+        registry_client::RegistryClient,
+        replication::{REPLICATION_PUSH_MANIFEST_KIND, REPLICATION_QUEUE},
+    };
+
+    const NAMESPACE: &str = "nginx";
+    const REPO: &str = "nginx";
+
+    fn repository_without_downstream() -> Repository {
+        repository_with_replication(REPO, Vec::new())
+    }
+
+    /// Build a `Registry` with an automatic in-process queue (no
+    /// `[global.job_queue]`) over `repository`, plus the shared stores for
+    /// seeding local state.
+    fn build_registry_with(
+        root: &str,
+        repository: Repository,
+    ) -> (Registry, Arc<BlobStore>, Arc<MetadataStore>) {
+        let object: Arc<dyn ObjectStore> =
+            Arc::new(StorageFsBackend::builder().root_dir(root).build().unwrap());
+        let executor = build_test_fs_executor(root, false);
+        let store = build_store(object, executor);
+        let metadata_store = Arc::new(
+            MetadataStore::builder()
+                .store(store.clone())
+                .link_cache_ttl(0)
+                .access_time_debounce_secs(0)
+                .build()
+                .unwrap(),
+        );
+        let blob_store = Arc::new(BlobStore::builder().store(store.clone()).build().unwrap());
+
+        let mut repositories = HashMap::new();
+        repositories.insert(REPO.to_string(), repository);
+        let resolver = Arc::new(RepositoryResolver::new(Arc::new(repositories)).unwrap());
+
+        let config = RegistryConfig::default();
+        let registry =
+            Registry::new(blob_store.clone(), metadata_store.clone(), resolver, config).unwrap();
+
+        (registry, blob_store, metadata_store)
+    }
+
+    fn build_registry(
+        root: &str,
+        client: Arc<RegistryClient>,
+    ) -> (Registry, Arc<BlobStore>, Arc<MetadataStore>) {
+        build_registry_with(root, repository_with_downstream(REPO, client))
+    }
+
+    /// The drained job runs the full push pipeline (HEAD-before-PUT blobs, PUT
+    /// manifest) against a wiremock downstream.
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn in_process_loop_drains_replication_push_job() {
+        crate::metrics_provider::init_for_tests();
+        let mock_server = MockServer::start().await;
+
+        let dir = TempDir::new().unwrap();
+        let root = dir.path().to_str().unwrap();
+        let client = downstream_client(&mock_server.uri());
+        let (registry, blob_store, metadata_store) = build_registry(root, client);
+
+        let (manifest_digest, config_digest, layer_digest) =
+            seed_manifest(&blob_store.store, &metadata_store, NAMESPACE).await;
+
+        // Downstream is missing both blobs (404 on HEAD) -> upload sequence runs.
+        for blob in [&config_digest, &layer_digest] {
+            Mock::given(method("HEAD"))
+                .and(path(format!("/v2/{NAMESPACE}/blobs/{blob}")))
+                .respond_with(ResponseTemplate::new(404))
+                .mount(&mock_server)
+                .await;
+        }
+        Mock::given(method("POST"))
+            .and(path(format!("/v2/{NAMESPACE}/blobs/uploads/")))
+            .respond_with(
+                ResponseTemplate::new(202)
+                    .insert_header("Location", format!("/v2/{NAMESPACE}/blobs/uploads/s1")),
+            )
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("PATCH"))
+            .and(path(format!("/v2/{NAMESPACE}/blobs/uploads/s1")))
+            .respond_with(
+                ResponseTemplate::new(202)
+                    .insert_header("Location", format!("/v2/{NAMESPACE}/blobs/uploads/s1")),
+            )
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path(format!("/v2/{NAMESPACE}/blobs/uploads/s1")))
+            .respond_with(ResponseTemplate::new(201))
+            .mount(&mock_server)
+            .await;
+        // The manifest PUT-by-tag is what we assert the loop reaches.
+        Mock::given(method("PUT"))
+            .and(path(format!("/v2/{NAMESPACE}/manifests/v1")))
+            .respond_with(
+                ResponseTemplate::new(201)
+                    .insert_header(DOCKER_CONTENT_DIGEST, manifest_digest.to_string().as_str()),
+            )
+            .expect(1..)
+            .mount(&mock_server)
+            .await;
+
+        let namespace = Namespace::new(NAMESPACE).unwrap();
+
+        // Enqueue via the production event path.
+        let repository = registry.resolver.resolve(&namespace);
+        registry
+            .dispatch_replication(
+                repository,
+                &namespace,
+                REPLICATION_PUSH_MANIFEST_KIND,
+                Some("v1"),
+                Some(&manifest_digest),
+                None,
+            )
+            .await;
+
+        let manifest_path = format!("/v2/{NAMESPACE}/manifests/v1");
+        let saw_put = timeout(Duration::from_secs(10), async {
+            loop {
+                let received = mock_server.received_requests().await.unwrap_or_default();
+                if received
+                    .iter()
+                    .any(|r| r.method.as_str() == "PUT" && r.url.path() == manifest_path)
+                {
+                    return true;
+                }
+                sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .unwrap_or(false);
+
+        let inspector = JobStore::new(Arc::clone(&blob_store.store), "inspector");
+
+        if !saw_put {
+            let received = mock_server.received_requests().await.unwrap_or_default();
+            let summary: Vec<String> = received
+                .iter()
+                .map(|r| format!("{} {}", r.method.as_str(), r.url.path()))
+                .collect();
+            let pending = inspector
+                .count_pending(REPLICATION_QUEUE, 0)
+                .await
+                .unwrap_or(u64::MAX);
+            let failed = inspector
+                .list_failed_page(REPLICATION_QUEUE, 16, None)
+                .await
+                .map_or(usize::MAX, |(keys, _)| keys.len());
+            panic!(
+                "in-process replication loop must drain the job and PUT the manifest \
+                 downstream; received requests: {summary:?}; pending={pending}; failed={failed}"
+            );
+        }
+
+        // Zero pending proves the loop completed the job rather than retrying.
+        let drained = timeout(Duration::from_secs(10), async {
+            loop {
+                let pending = inspector
+                    .count_pending(REPLICATION_QUEUE, 0)
+                    .await
+                    .unwrap_or(u64::MAX);
+                if pending == 0 {
+                    return true;
+                }
+                sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .unwrap_or(false);
+
+        let failed = inspector
+            .list_failed_page(REPLICATION_QUEUE, 16, None)
+            .await
+            .map_or(usize::MAX, |(keys, _)| keys.len());
+        assert!(
+            drained,
+            "the replication queue must drain to zero pending after a successful push"
+        );
+        assert_eq!(failed, 0, "a successful push must not dead-letter the job");
+    }
+
+    /// With no downstream configured, no replication loop is spawned, so a
+    /// replication job is never claimed: it must stay pending rather than be
+    /// drained (the loops would otherwise poll an always-empty queue forever).
+    #[tokio::test]
+    async fn no_replication_loop_when_no_downstream_configured() {
+        crate::metrics_provider::init_for_tests();
+        let dir = TempDir::new().unwrap();
+        let (registry, _blob_store, _metadata_store) = build_registry_with(
+            dir.path().to_str().unwrap(),
+            repository_without_downstream(),
+        );
+
+        registry
+            .job_queue
+            .enqueue(
+                JobEnvelope::new(
+                    REPLICATION_QUEUE,
+                    REPLICATION_PUSH_MANIFEST_KIND,
+                    format!("{REPLICATION_QUEUE}.eu:nginx:v1"),
+                    &(),
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        // A spawned loop idles at 10ms under cfg(test), so 500ms is many ticks:
+        // if one existed it would have claimed the job by now.
+        sleep(Duration::from_millis(500)).await;
+
+        assert_eq!(
+            registry
+                .job_queue
+                .count_pending(REPLICATION_QUEUE, 0)
+                .await
+                .unwrap(),
+            1,
+            "no downstream means no replication loop, so the job must stay pending"
+        );
     }
 }

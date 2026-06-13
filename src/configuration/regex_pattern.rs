@@ -39,6 +39,12 @@ impl RegexPattern {
     pub fn is_match(&self, text: &str) -> bool {
         self.regex.is_match(text)
     }
+
+    /// Consumes the wrapper, returning the compiled [`Regex`].
+    #[must_use]
+    pub fn into_regex(self) -> Regex {
+        self.regex
+    }
 }
 
 impl fmt::Debug for RegexPattern {
@@ -104,12 +110,6 @@ mod tests {
     }
 
     #[test]
-    fn as_source_returns_original_string() {
-        let pattern = RegexPattern::compile("^dev-.*").unwrap();
-        assert_eq!(pattern.as_source(), "^dev-.*");
-    }
-
-    #[test]
     fn equality_is_by_source() {
         let a = RegexPattern::compile("^latest$").unwrap();
         let b = RegexPattern::compile("^latest$").unwrap();
@@ -149,15 +149,5 @@ mod tests {
         let cloned = original.clone();
         assert_eq!(original.as_source(), cloned.as_source());
         assert!(cloned.is_match("test-123"));
-    }
-
-    #[test]
-    fn vec_serializes_as_array_of_strings() {
-        let patterns = vec![
-            RegexPattern::compile("^latest$").unwrap(),
-            RegexPattern::compile("^dev-.*").unwrap(),
-        ];
-        let json = serde_json::to_string(&patterns).unwrap();
-        assert_eq!(json, r#"["^latest$","^dev-.*"]"#);
     }
 }

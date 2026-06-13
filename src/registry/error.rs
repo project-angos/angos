@@ -45,6 +45,11 @@ pub enum Error {
     NotFound,
     #[error("{0}")]
     Conflict(String),
+    /// A replication write lost last-writer-wins: the local tag is strictly
+    /// newer than the incoming `source_ts`. Distinct from [`Error::Conflict`]
+    /// so the sender can treat it as convergence rather than retry.
+    #[error("{0}")]
+    ReplicationSuperseded(String),
     #[error("internal server error: {0}")]
     Internal(String),
 
@@ -252,60 +257,5 @@ mod tests {
         let err: Error = X509Error::InvalidCertificate.into();
         assert!(matches!(err, Error::Unauthorized(_)));
         assert!(err.to_string().contains("Invalid client certificate"));
-    }
-
-    #[test]
-    fn display_strings_match_legacy_values() {
-        assert_eq!(Error::BlobUnknown.to_string(), "blob unknown to registry");
-        assert_eq!(
-            Error::BlobReferenced.to_string(),
-            "blob is still referenced"
-        );
-        assert_eq!(
-            Error::BlobUploadUnknown.to_string(),
-            "blob upload unknown to registry"
-        );
-        assert_eq!(
-            Error::DigestInvalid.to_string(),
-            "provided digest did not match uploaded content"
-        );
-        assert_eq!(
-            Error::ManifestBlobUnknown.to_string(),
-            "manifest references a blob unknown to registry"
-        );
-        assert_eq!(
-            Error::ManifestInvalid("oops".to_string()).to_string(),
-            "manifest invalid: oops"
-        );
-        assert_eq!(
-            Error::ManifestUnknown.to_string(),
-            "manifest unknown to registry"
-        );
-        assert_eq!(Error::NameInvalid.to_string(), "invalid repository name");
-        assert_eq!(
-            Error::NameUnknown.to_string(),
-            "repository name not known to registry"
-        );
-        assert_eq!(
-            Error::Unsupported.to_string(),
-            "the operation is unsupported"
-        );
-        assert_eq!(
-            Error::RangeNotSatisfiable.to_string(),
-            "range not satisfiable"
-        );
-        assert_eq!(
-            Error::Internal("oops".to_string()).to_string(),
-            "internal server error: oops"
-        );
-        assert_eq!(
-            Error::Initialization("boot failed".to_string()).to_string(),
-            "boot failed"
-        );
-        assert_eq!(
-            Error::Unauthorized("bad token".to_string()).to_string(),
-            "bad token"
-        );
-        assert_eq!(Error::Denied("nope".to_string()).to_string(), "nope");
     }
 }

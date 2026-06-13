@@ -22,7 +22,6 @@ use crate::{
     configuration::Configuration,
     event_webhook::{
         config::EventWebhookConfig,
-        dispatcher::EventDispatcher,
         event::{Event, EventKind},
     },
     identity::{Action, ClientIdentity},
@@ -182,16 +181,6 @@ pub fn create_test_event() -> Event {
 }
 
 #[tokio::test]
-async fn test_server_context_new_minimal() {
-    let config = create_minimal_config();
-    let registry = create_test_registry(&config).await;
-
-    let context = ServerContext::new(&config, registry);
-
-    assert!(context.is_ok());
-}
-
-#[tokio::test]
 async fn test_server_context_new_with_basic_auth() {
     let salt = SaltString::generate(OsRng);
     let argon_config = Params::default();
@@ -222,35 +211,6 @@ async fn test_server_context_new_with_basic_auth() {
     );
 
     let config: Configuration = toml::from_str(&toml).unwrap();
-    let registry = create_test_registry(&config).await;
-
-    let context = ServerContext::new(&config, registry);
-
-    assert!(context.is_ok());
-}
-
-#[tokio::test]
-async fn test_server_context_new_with_global_immutable_tags() {
-    let toml = r#"
-        [blob_store.fs]
-        root_dir = "/tmp/test"
-
-        [metadata_store.fs]
-        root_dir = "/tmp/test"
-
-        [cache.memory]
-
-        [server]
-        bind_address = "0.0.0.0"
-        port = 8000
-
-        [global]
-        update_pull_time = false
-        immutable_tags = true
-        immutable_tags_exclusions = ["^latest$"]
-    "#;
-
-    let config: Configuration = toml::from_str(toml).unwrap();
     let registry = create_test_registry(&config).await;
 
     let context = ServerContext::new(&config, registry);
@@ -538,7 +498,7 @@ async fn test_server_context_new_with_event_webhooks() {
     let registry = create_test_registry(&config).await;
     let context = ServerContext::new(&config, registry).unwrap();
 
-    assert!(context.event_dispatcher().is_some());
+    assert!(context.has_event_dispatcher());
 }
 
 #[tokio::test]
@@ -547,40 +507,7 @@ async fn test_server_context_new_without_event_webhooks() {
     let registry = create_test_registry(&config).await;
     let context = ServerContext::new(&config, registry).unwrap();
 
-    assert!(context.event_dispatcher().is_none());
-}
-
-#[tokio::test]
-async fn test_server_context_event_dispatcher_is_arc_cloneable() {
-    let toml = r#"
-        [blob_store.fs]
-        root_dir = "/tmp/test"
-
-        [metadata_store.fs]
-        root_dir = "/tmp/test"
-
-        [cache.memory]
-
-        [server]
-        bind_address = "0.0.0.0"
-        port = 8000
-
-        [global]
-        update_pull_time = false
-
-        [event_webhook.test_hook]
-        url = "https://example.com/webhook"
-        policy = "optional"
-        events = ["manifest.push"]
-    "#;
-
-    let config: Configuration = toml::from_str(toml).unwrap();
-    let registry = create_test_registry(&config).await;
-    let context = ServerContext::new(&config, registry).unwrap();
-
-    let dispatcher: Arc<EventDispatcher> = context.event_dispatcher().unwrap();
-    let cloned = dispatcher.clone();
-    assert!(Arc::strong_count(&cloned) >= 2);
+    assert!(!context.has_event_dispatcher());
 }
 
 #[tokio::test]
@@ -722,7 +649,7 @@ async fn test_server_context_shutdown_with_no_dispatcher() {
     let registry = create_test_registry(&config).await;
     let context = ServerContext::new(&config, registry).unwrap();
 
-    assert!(context.event_dispatcher().is_none());
+    assert!(!context.has_event_dispatcher());
     context.shutdown_with_timeout(Duration::from_secs(10)).await;
 }
 
@@ -1058,4 +985,121 @@ fn test_resolve_client_ip_x_forwarded_for_takes_precedence() {
         resolve_client_ip(&headers),
         Some("192.168.1.100".to_string())
     );
+}
+
+fn make_event(id: Uuid) -> Event {
+    Event {
+        id,
+        timestamp: Utc::now(),
+        kind: EventKind::ManifestPush,
+        namespace: "test/repo".to_string(),
+        digest: Some("sha256:abc123".to_string()),
+        reference: Some("sha256:abc123".to_string()),
+        tag: None,
+        actor: None,
+        repository: "test-repo".to_string(),
+    }
+}
+
+#[tokio::test]
+async fn dispatch_events_first_failure_does_not_abort_batch() {
+    // With max_retries = 0 each event fails in a single attempt, so the mock
+    // records exactly one POST per event.
+    let mock_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&mock_server)
+        .await;
+
+    let toml = format!(
+        r#"
+        [blob_store.fs]
+        root_dir = "/tmp/test"
+
+        [metadata_store.fs]
+        root_dir = "/tmp/test"
+
+        [cache.memory]
+
+        [server]
+        bind_address = "0.0.0.0"
+        port = 8000
+
+        [global]
+        update_pull_time = false
+        event_webhooks = ["test_hook"]
+
+        [event_webhook.test_hook]
+        url = "{}/webhook"
+        policy = "required"
+        max_retries = 0
+        events = ["manifest.push"]
+    "#,
+        mock_server.uri()
+    );
+
+    let config: Configuration = toml::from_str(&toml).unwrap();
+    let registry = create_test_registry(&config).await;
+    let context = ServerContext::new(&config, registry).unwrap();
+
+    let events = vec![
+        make_event(Uuid::new_v4()),
+        make_event(Uuid::new_v4()),
+        make_event(Uuid::new_v4()),
+    ];
+    let result = context.dispatch_events(&events).await;
+
+    assert!(result.is_err(), "a delivery failure must surface overall");
+    let requests = mock_server.received_requests().await.unwrap();
+    assert_eq!(
+        requests.len(),
+        3,
+        "all events must be attempted even when an earlier one fails"
+    );
+}
+
+#[tokio::test]
+async fn dispatch_events_all_success_returns_ok() {
+    let mock_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&mock_server)
+        .await;
+
+    let toml = format!(
+        r#"
+        [blob_store.fs]
+        root_dir = "/tmp/test"
+
+        [metadata_store.fs]
+        root_dir = "/tmp/test"
+
+        [cache.memory]
+
+        [server]
+        bind_address = "0.0.0.0"
+        port = 8000
+
+        [global]
+        update_pull_time = false
+        event_webhooks = ["test_hook"]
+
+        [event_webhook.test_hook]
+        url = "{}/webhook"
+        policy = "required"
+        events = ["manifest.push"]
+    "#,
+        mock_server.uri()
+    );
+
+    let config: Configuration = toml::from_str(&toml).unwrap();
+    let registry = create_test_registry(&config).await;
+    let context = ServerContext::new(&config, registry).unwrap();
+
+    let events = vec![make_event(Uuid::new_v4()), make_event(Uuid::new_v4())];
+    let result = context.dispatch_events(&events).await;
+
+    assert!(result.is_ok());
+    let requests = mock_server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 2);
 }

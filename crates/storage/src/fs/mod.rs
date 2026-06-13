@@ -29,7 +29,7 @@ use tempfile::Builder as TempFileBuilder;
 use tokio::{
     fs,
     io::{AsyncSeekExt, AsyncWriteExt},
-    task::spawn_blocking,
+    task::{spawn_blocking, yield_now},
 };
 use tokio_util::io::StreamReader;
 
@@ -49,6 +49,12 @@ const LIST_ALL_CHILDREN_PAGE_SIZE: u16 = 512;
 /// could otherwise observe a freshly-created, still-empty temp file and, for a
 /// JSON object key, fail to parse it. Listings skip any entry with this prefix.
 const ATOMIC_WRITE_TMP_PREFIX: &str = ".angos-write.";
+
+/// How many times [`ensure_parent`] retries a racing `create_dir_all`. On
+/// macOS/APFS a contended intermediate `mkdir` can transiently return EINVAL
+/// instead of EEXIST, failing the recursive create even though the directory
+/// is about to exist.
+const ENSURE_PARENT_RETRIES: u32 = 5;
 
 /// Builder for [`Backend`].
 pub struct Builder {
@@ -130,7 +136,7 @@ impl Backend {
             .append(true)
             .open(&path)
             .await
-            .map_err(|e| classify_open_error(&e, &path))?;
+            .map_err(|e| backend_error("open", &path, &e))?;
         let size = file.metadata().await?.len();
         Ok((file, size))
     }
@@ -246,18 +252,41 @@ fn normalize_lexical(path: &Path) -> PathBuf {
 
 /// Create all parent directories of `path`.
 async fn ensure_parent(path: &Path) -> Result<(), Error> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).await?;
+    let Some(parent) = path.parent() else {
+        return Ok(());
+    };
+    // Retry only race error kinds: EINVAL (macOS/APFS, see
+    // ENSURE_PARENT_RETRIES), EEXIST, and ENOENT from a racing remove; other
+    // errors are deterministic and surface immediately.
+    let mut attempt = 0;
+    loop {
+        match fs::create_dir_all(parent).await {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                if fs::metadata(parent).await.is_ok_and(|m| m.is_dir()) {
+                    return Ok(());
+                }
+                let racy = matches!(
+                    e.kind(),
+                    ErrorKind::InvalidInput | ErrorKind::AlreadyExists | ErrorKind::NotFound
+                );
+                attempt += 1;
+                if !racy || attempt >= ENSURE_PARENT_RETRIES {
+                    return Err(backend_error("create_dir_all", parent, &e));
+                }
+                yield_now().await;
+            }
+        }
     }
-    Ok(())
 }
 
-/// Map a file-open error to an [`Error`], logging the full path for diagnostics.
-fn classify_open_error(error: &io::Error, path: &Path) -> Error {
+/// Map an io error to an [`Error`] carrying the operation and path for
+/// diagnosability. Preserves the `NotFound` classification.
+fn backend_error(op: &str, path: &Path, error: &io::Error) -> Error {
     if error.kind() == ErrorKind::NotFound {
         Error::NotFound
     } else {
-        Error::Backend(format!("could not open {}: {error}", path.display()))
+        Error::Backend(format!("{op} {}: {error}", path.display()))
     }
 }
 
@@ -265,6 +294,7 @@ async fn atomic_write(target: &Path, data: Bytes, sync: bool) -> Result<(), Erro
     ensure_parent(target).await?;
     let parent = target.parent().unwrap_or_else(|| Path::new(".")).to_owned();
     let final_path = target.to_owned();
+    let label = target.to_owned();
     spawn_blocking(move || -> io::Result<()> {
         let mut temp = TempFileBuilder::new()
             .prefix(ATOMIC_WRITE_TMP_PREFIX)
@@ -278,7 +308,8 @@ async fn atomic_write(target: &Path, data: Bytes, sync: bool) -> Result<(), Erro
         Ok(())
     })
     .await
-    .map_err(|e| Error::Backend(format!("temp-write task panicked: {e}")))??;
+    .map_err(|e| Error::Backend(format!("temp-write task panicked: {e}")))?
+    .map_err(|e| backend_error("atomic_write", &label, &e))?;
     Ok(())
 }
 
@@ -469,21 +500,26 @@ impl ObjectStore for Backend {
         // Stream src -> temp -> atomic rename. `std::io::copy` uses a small
         // internal buffer, so the object body is never held in memory in full
         // (a multi-GB blob would otherwise spike RSS by its whole size).
-        match spawn_blocking(move || -> io::Result<()> {
-            let mut reader = File::open(&src)?;
+        match spawn_blocking(move || -> Result<(), Error> {
+            let mut reader = File::open(&src).map_err(|e| backend_error("copy from", &src, &e))?;
             let mut temp = TempFileBuilder::new()
                 .prefix(ATOMIC_WRITE_TMP_PREFIX)
-                .tempfile_in(&parent)?;
-            io::copy(&mut reader, temp.as_file_mut())?;
+                .tempfile_in(&parent)
+                .map_err(|e| backend_error("copy to", &dst, &e))?;
+            io::copy(&mut reader, temp.as_file_mut())
+                .map_err(|e| backend_error("copy to", &dst, &e))?;
             if sync {
-                temp.as_file().sync_all()?;
+                temp.as_file()
+                    .sync_all()
+                    .map_err(|e| backend_error("copy to", &dst, &e))?;
             }
-            temp.persist(&dst).map_err(|e| e.error)?;
+            temp.persist(&dst)
+                .map_err(|e| backend_error("copy to", &dst, &e.error))?;
             Ok(())
         })
         .await
         {
-            Ok(result) => result.map_err(Error::from),
+            Ok(result) => result,
             Err(e) => Err(Error::Backend(format!("copy task panicked: {e}"))),
         }
     }

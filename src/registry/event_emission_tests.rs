@@ -29,8 +29,17 @@ use crate::{
     },
     oci::{Digest, Namespace, Reference},
     registry::{
-        Registry, blob_store,
-        test_utils::{build_test_fs_executor, create_test_registry, metadata_store_over},
+        Registry, RegistryConfig, blob_store,
+        job_store::JobStore,
+        metadata_store::MetadataStore,
+        repository_resolver::RepositoryResolver,
+        test_utils::{
+            build_store, build_test_fs_executor, create_test_registry, downstream_client,
+            metadata_store_over, repository_with_downstream, sole_pending_payload,
+        },
+    },
+    replication::{
+        REPLICATION_DELETE_MANIFEST_KIND, REPLICATION_PUSH_MANIFEST_KIND, REPLICATION_QUEUE,
     },
     util::sha256,
 };
@@ -96,7 +105,10 @@ fn build_dispatcher_for_server(server_uri: &str) -> EventDispatcher {
     };
     let mut webhooks = HashMap::new();
     webhooks.insert("test-hook".to_string(), config);
-    EventDispatcher::new(webhooks).expect("dispatcher build")
+    EventDispatcher::builder()
+        .webhooks(webhooks)
+        .build()
+        .expect("dispatcher build")
 }
 
 async fn upload_blob(registry: &Registry, namespace: &Namespace, content: &[u8]) -> Digest {
@@ -158,6 +170,7 @@ async fn tag_push_emits_manifest_push_and_tag_create_events() {
         .registry
         .accept_put_manifest(
             None,
+            None,
             &namespace,
             Reference::Tag("latest".to_string()),
             mime_type,
@@ -205,6 +218,7 @@ async fn digest_push_suppresses_tag_create_event() {
         .registry
         .accept_put_manifest(
             None,
+            None,
             &namespace,
             Reference::Tag("seed".to_string()),
             mime_type.clone(),
@@ -224,6 +238,7 @@ async fn digest_push_suppresses_tag_create_event() {
     let response = fixture
         .registry
         .accept_put_manifest(
+            None,
             None,
             &namespace,
             Reference::Digest(digest),
@@ -265,6 +280,7 @@ async fn tag_delete_emits_manifest_delete_and_tag_delete_events() {
         .registry
         .accept_put_manifest(
             None,
+            None,
             &namespace,
             Reference::Tag("v1".to_string()),
             mime_type,
@@ -276,7 +292,7 @@ async fn tag_delete_emits_manifest_delete_and_tag_delete_events() {
     let reference = Reference::Tag("v1".to_string());
     let response = fixture
         .registry
-        .delete_manifest(None, &namespace, &reference)
+        .delete_manifest(None, None, &namespace, &reference)
         .await
         .expect("delete_manifest");
 
@@ -314,6 +330,7 @@ async fn digest_delete_suppresses_tag_delete_event() {
         .registry
         .accept_put_manifest(
             None,
+            None,
             &namespace,
             Reference::Tag("to-delete".to_string()),
             mime_type,
@@ -332,7 +349,7 @@ async fn digest_delete_suppresses_tag_delete_event() {
     let reference = Reference::Digest(digest);
     let response = fixture
         .registry
-        .delete_manifest(None, &namespace, &reference)
+        .delete_manifest(None, None, &namespace, &reference)
         .await
         .expect("delete_manifest");
 
@@ -369,6 +386,7 @@ async fn tag_push_event_payload_has_all_required_fields() {
     let response = fixture
         .registry
         .accept_put_manifest(
+            None,
             None,
             &namespace,
             Reference::Tag("stable".to_string()),
@@ -438,6 +456,7 @@ async fn tag_push_events_delivered_to_webhook_endpoint() {
         .registry
         .accept_put_manifest(
             None,
+            None,
             &namespace,
             Reference::Tag("webhook-test".to_string()),
             mime_type,
@@ -477,6 +496,7 @@ async fn digest_push_events_delivered_to_webhook_endpoint() {
         .registry
         .accept_put_manifest(
             None,
+            None,
             &namespace,
             Reference::Tag("seed2".to_string()),
             mime_type.clone(),
@@ -495,6 +515,7 @@ async fn digest_push_events_delivered_to_webhook_endpoint() {
     let response = fixture
         .registry
         .accept_put_manifest(
+            None,
             None,
             &namespace,
             Reference::Digest(digest),
@@ -524,4 +545,163 @@ async fn digest_push_events_delivered_to_webhook_endpoint() {
         "Expected exactly 1 webhook delivery (ManifestPush only) for digest-based push; got {}",
         received.len()
     );
+}
+
+// ---------------------------------------------------------------------------
+// Replication-dispatch coverage (end-to-end through accept_put_manifest)
+// ---------------------------------------------------------------------------
+
+const REPLICATION_REPO: &str = "test-repo";
+
+/// A `Registry` with one `event+reconcile` downstream and a caller-held
+/// `JobStore`. No drain is spawned: these tests assert enqueue only.
+struct ReplicationFixture {
+    registry: Registry,
+    job_store: Arc<JobStore>,
+    _temp_dir: TempDir,
+}
+
+impl ReplicationFixture {
+    fn new() -> Self {
+        let temp_dir = TempDir::new().expect("tempdir");
+        let path = temp_dir.path().to_string_lossy().to_string();
+
+        let object: Arc<dyn ObjectStore> = Arc::new(
+            StorageFsBackend::builder()
+                .root_dir(&path)
+                .sync_to_disk(false)
+                .build()
+                .expect("fs storage"),
+        );
+        let store = build_store(object, build_test_fs_executor(&path, false));
+        let metadata_store = Arc::new(
+            MetadataStore::builder()
+                .store(store.clone())
+                .link_cache_ttl(0)
+                .access_time_debounce_secs(0)
+                .build()
+                .unwrap(),
+        );
+        let blob_store = Arc::new(
+            blob_store::BlobStore::builder()
+                .store(store.clone())
+                .build()
+                .unwrap(),
+        );
+
+        let repository =
+            repository_with_downstream(REPLICATION_REPO, downstream_client("https://unused.test"));
+        let mut repositories = HashMap::new();
+        repositories.insert(REPLICATION_REPO.to_string(), repository);
+        let resolver = Arc::new(RepositoryResolver::new(Arc::new(repositories)).unwrap());
+
+        let job_store: Arc<JobStore> = Arc::new(JobStore::new(store, "test"));
+
+        let config = RegistryConfig::default().job_queue(job_store.clone());
+        let registry = Registry::new(blob_store, metadata_store, resolver, config).unwrap();
+
+        Self {
+            registry,
+            job_store,
+            _temp_dir: temp_dir,
+        }
+    }
+}
+
+#[tokio::test]
+async fn fresh_local_tag_push_enqueues_replication_job() {
+    crate::metrics_provider::init_for_tests();
+    let fixture = ReplicationFixture::new();
+    let namespace = Namespace::new(REPLICATION_REPO).unwrap();
+    let (manifest_bytes, mime_type) = test_manifest_bytes(&fixture.registry, &namespace).await;
+
+    fixture
+        .registry
+        .accept_put_manifest(
+            None,
+            None,
+            &namespace,
+            Reference::Tag("latest".to_string()),
+            mime_type,
+            Cursor::new(manifest_bytes),
+        )
+        .await
+        .expect("accept_put_manifest");
+
+    assert_eq!(
+        fixture
+            .job_store
+            .count_pending(REPLICATION_QUEUE, 0)
+            .await
+            .unwrap(),
+        1,
+        "a fresh local tagged push must enqueue exactly one replication job"
+    );
+
+    // Proves the accept_put_manifest -> dispatch_replication -> envelope path
+    // threads the right fields.
+    let payload = sole_pending_payload(&fixture.job_store).await;
+    assert_eq!(payload.downstream, "eu-region");
+    assert_eq!(payload.namespace, REPLICATION_REPO);
+    assert_eq!(payload.tag.as_deref(), Some("latest"));
+    assert_eq!(payload.kind, REPLICATION_PUSH_MANIFEST_KIND);
+    assert!(
+        payload.source_ts.is_some(),
+        "the payload must carry a source_ts for receiver-side LWW"
+    );
+}
+
+#[tokio::test]
+async fn tag_delete_enqueues_replication_delete_job() {
+    crate::metrics_provider::init_for_tests();
+    let fixture = ReplicationFixture::new();
+    let namespace = Namespace::new(REPLICATION_REPO).unwrap();
+    let (manifest_bytes, mime_type) = test_manifest_bytes(&fixture.registry, &namespace).await;
+
+    // Seed via the non-dispatching put_manifest so the delete's job is the only one enqueued.
+    fixture
+        .registry
+        .put_manifest(
+            &namespace,
+            &Reference::Tag("doomed".to_string()),
+            Some(&mime_type),
+            &manifest_bytes,
+        )
+        .await
+        .expect("seed put_manifest");
+    assert_eq!(
+        fixture
+            .job_store
+            .count_pending(REPLICATION_QUEUE, 0)
+            .await
+            .unwrap(),
+        0,
+        "put_manifest must not enqueue any replication job"
+    );
+
+    fixture
+        .registry
+        .delete_manifest(
+            None,
+            None,
+            &namespace,
+            &Reference::Tag("doomed".to_string()),
+        )
+        .await
+        .expect("delete_manifest");
+
+    assert_eq!(
+        fixture
+            .job_store
+            .count_pending(REPLICATION_QUEUE, 0)
+            .await
+            .unwrap(),
+        1,
+        "a tagged delete must enqueue exactly one replication delete job"
+    );
+
+    let payload = sole_pending_payload(&fixture.job_store).await;
+    assert_eq!(payload.kind, REPLICATION_DELETE_MANIFEST_KIND);
+    assert_eq!(payload.tag.as_deref(), Some("doomed"));
+    assert_eq!(payload.namespace, REPLICATION_REPO);
 }

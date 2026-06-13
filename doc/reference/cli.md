@@ -85,6 +85,10 @@ The scrub command performs storage maintenance and integrity checks. You must sp
 | `--links`                 | `-l`   | Fix links format inconsistencies; remove revisions whose manifest blob is missing; prune phantom referrer back-links |
 | `--media-types`           | `-M`   | Backfill missing `media_type` on manifest links; remove revisions whose manifest blob is missing   |
 | `--referrers`             | `-R`   | Check for and remove orphan referrer links whose referrer manifest is no longer a current revision |
+| `--replicate`             |        | Reconcile every replicated namespace against all its configured downstreams. By default reconciliation is additive: it enqueues a replication push for each diverging or downstream-missing tag and never deletes. A downstream marked `prune = true` is treated as an authoritative one-way mirror: reconciliation also enqueues a replication delete for each downstream-only tag, so prune is one-way-only by design and unsafe for active-active peers (even with receiver-side last-writer-wins it can remove a peer's newer tag). Combine with `--dry-run` to preview. See [Configure Replication](../how-to/configure-replication.md). |
+| `--replication-orphans`   |        | Delete replication jobs (pending and dead-lettered) whose downstream or repository is no longer configured                                       |
+| `--cache-orphans`         |        | Delete cache jobs (pending and dead-lettered) whose repository is no longer configured for pull-through                                          |
+| `--orphan-grants <duration>` |     | Revoke blob-ownership grants older than the duration (e.g. `24h`) that no manifest references, reclaiming the bytes; cleans up blobs a replication push uploaded before its manifest lost last-writer-wins or dead-lettered |
 
 **Examples:**
 
@@ -109,6 +113,12 @@ angos scrub --multipart 24h
 
 # Preview retention policy enforcement
 angos scrub --retention --dry-run
+
+# Preview replication reconciliation (enqueues nothing)
+angos scrub --replicate --dry-run
+
+# Reconcile every replicated repository with its downstreams
+angos scrub --replicate
 
 # Run with verbose logging
 RUST_LOG=info angos scrub -t -m -b -r
@@ -146,8 +156,10 @@ spec:
 
 ### worker
 
-Process durable background jobs from the job queue (currently the pull-through
-cache queue).
+Process durable background jobs from the job queue. With no `--queue` argument
+the worker drains **both** the pull-through cache queue and the replication
+queue, each on its own worker pool. Pass `--queue` (repeatable) to drain
+specific queues instead, e.g. `angos worker --queue replication`.
 
 ```bash
 angos worker [options]
@@ -156,7 +168,7 @@ angos -c /etc/registry/config.toml worker
 
 Requires `[global.job_queue]` to be configured in `config.toml`. Run at least
 one `angos worker` alongside `angos server` whenever durable jobs are
-enabled — the server only enqueues jobs; it does not process them. The worker
+enabled: the server only enqueues jobs; it does not process them. The worker
 hot-reloads `config.toml` just like `angos server`: changes to
 `[global.job_queue]`, `[repository.*]`, `[blob_store.*]`, or
 `[metadata_store.*]` take effect at the next claim; in-flight jobs always
@@ -166,6 +178,7 @@ finish on the components they started with.
 
 | Option | Default | Description |
 |---|---|---|
+| `--queue <name>` | `cache` and `replication` | Queue to drain. Repeatable (`--queue cache --queue replication`); each queue runs its own worker pool sized by `max_concurrent_cache_jobs` / `max_concurrent_replication_jobs`. |
 | `--poll-interval <duration>` | `1s` | Minimum idle sleep between claim attempts. When the queue contains only backed-off envelopes, the worker extends the wait up to the soonest `not_before` (capped at 1 minute, or `--poll-interval` if it is larger). |
 
 **Example:**

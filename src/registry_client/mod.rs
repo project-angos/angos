@@ -3,8 +3,9 @@ mod tests;
 
 mod auth;
 mod upstream_url;
+mod write;
 
-use std::{io, path::Path, sync::Arc, time::Duration};
+use std::{future::Future, io, path::Path, sync::Arc, time::Duration};
 
 use auth::token_index_cache_key;
 use futures_util::TryStreamExt;
@@ -16,7 +17,9 @@ use serde::Deserialize;
 use tokio::{io::AsyncReadExt, sync::Mutex};
 use tokio_util::io::StreamReader;
 use tracing::{info, warn};
-pub use upstream_url::get_upstream_namespace;
+pub use upstream_url::{NO_LOCAL_PREFIX, get_upstream_namespace};
+
+pub use crate::registry_client::write::{DeleteManifestOutcome, PutManifestResult, UploadSession};
 
 use crate::{
     cache::Cache,
@@ -28,6 +31,16 @@ use crate::{
     },
     secret::Secret,
 };
+
+/// Classifies a non-success read status: only a true 404 maps to `not_found`, so
+/// callers can tell a genuinely absent object from a transient probe failure.
+fn classify_read_failure(status: StatusCode, op: &str, not_found: Error) -> Error {
+    if status == StatusCode::NOT_FOUND {
+        not_found
+    } else {
+        Error::Internal(format!("{op}: downstream returned status {status}"))
+    }
+}
 
 fn parse_header<T: std::str::FromStr>(
     response: &Response,
@@ -105,25 +118,22 @@ pub struct RegistryClient {
 }
 
 impl RegistryClient {
-    /// Creates a registry client for one upstream registry.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when TLS files cannot be loaded or the HTTP client cannot be built.
-    pub fn new(config: &RegistryClientConfig, cache: Arc<Cache>) -> Result<Self, Error> {
-        Self::new_with_manifest_size_limit(config, cache, DEFAULT_MAX_MANIFEST_SIZE_BYTES)
+    /// Starts building a registry client from individual resolved fields.
+    #[must_use]
+    pub fn builder() -> RegistryClientBuilder {
+        RegistryClientBuilder::default()
     }
 
-    /// Creates a registry client with a custom manifest body size limit.
+    /// Resolves the HTTP client (TLS, redirects, timeout) and basic-auth
+    /// credentials from a parsed [`RegistryClientConfig`].
     ///
     /// # Errors
     ///
-    /// Returns an error when TLS files cannot be loaded or the HTTP client cannot be built.
-    pub fn new_with_manifest_size_limit(
+    /// Returns [`Error::Initialization`] when the TLS files cannot be loaded or
+    /// the HTTP client cannot be built.
+    fn resolve_config_fields(
         config: &RegistryClientConfig,
-        cache: Arc<Cache>,
-        max_manifest_size_bytes: usize,
-    ) -> Result<Self, Error> {
+    ) -> Result<(Client, Option<(String, String)>), Error> {
         let client = HttpClientBuilder::new()
             .rustls_tls()
             .redirect(reqwest::redirect::Policy::limited(
@@ -148,14 +158,31 @@ impl RegistryClient {
             _ => None,
         };
 
-        Ok(Self {
-            url: config.url.clone(),
-            client,
-            basic_auth,
-            cache,
-            token_refresh: Mutex::new(()),
-            max_manifest_size_bytes,
-        })
+        Ok((client, basic_auth))
+    }
+
+    /// Builds a registry client from a parsed [`RegistryClientConfig`]; the
+    /// single production construction path for upstreams and replication
+    /// downstreams.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when TLS files cannot be loaded or the HTTP client cannot
+    /// be built.
+    pub fn from_config(
+        config: &RegistryClientConfig,
+        cache: Arc<Cache>,
+        max_manifest_size_bytes: usize,
+    ) -> Result<Self, Error> {
+        let (client, basic_auth) = Self::resolve_config_fields(config)?;
+
+        Self::builder()
+            .url(config.url.clone())
+            .client(client)
+            .basic_auth(basic_auth)
+            .cache(cache)
+            .max_manifest_size_bytes(max_manifest_size_bytes)
+            .build()
     }
 
     async fn query(
@@ -166,25 +193,63 @@ impl RegistryClient {
     ) -> Result<Response, Error> {
         info!("Requesting from upstream: {location}");
 
+        self.send_with_auth_retry(location, |auth| async move {
+            self.send(method, accepted_types, location, auth.as_deref())
+                .await
+        })
+        .await
+    }
+
+    /// Shared cached-token-then-single-refresh-retry orchestration for
+    /// replayable-body requests ([`RegistryClient::query`] and
+    /// [`RegistryClient::send_body`]).
+    ///
+    /// `send_once` may run twice (cached header, then one refreshed token on
+    /// `401`), so it must clone any captured-by-value request state per attempt.
+    async fn send_with_auth_retry<F, Fut>(
+        &self,
+        location: &str,
+        send_once: F,
+    ) -> Result<Response, Error>
+    where
+        F: Fn(Option<String>) -> Fut,
+        Fut: Future<Output = Result<Response, Error>>,
+    {
+        Ok(self
+            .send_with_auth_retry_capturing(location, send_once)
+            .await?
+            .0)
+    }
+
+    /// [`Self::send_with_auth_retry`] that also returns the auth header which
+    /// produced the final response. A streamed `PATCH` to a server-assigned
+    /// upload-session URL reuses it: that URL never issues its own auth
+    /// challenge, and a consumed stream cannot be replayed to refresh a token.
+    async fn send_with_auth_retry_capturing<F, Fut>(
+        &self,
+        location: &str,
+        send_once: F,
+    ) -> Result<(Response, Option<String>), Error>
+    where
+        F: Fn(Option<String>) -> Fut,
+        Fut: Future<Output = Result<Response, Error>>,
+    {
         let cached_auth = self.cached_auth_header(location).await;
-        let response = self
-            .send(method, accepted_types, location, cached_auth.as_deref())
-            .await?;
+        let response = send_once(cached_auth.clone()).await?;
 
         if response.status() == StatusCode::UNAUTHORIZED {
             let token = self
                 .refresh_auth_header(&response, cached_auth.as_deref())
                 .await?;
-            return self
-                .send(method, accepted_types, location, Some(&token))
-                .await;
+            let response = send_once(Some(token.clone())).await?;
+            return Ok((response, Some(token)));
         }
 
         if response.status() == StatusCode::FORBIDDEN {
             return Err(Error::Denied("Access forbidden".to_string()));
         }
 
-        Ok(response)
+        Ok((response, cached_auth))
     }
 
     async fn cached_auth_header(&self, location: &str) -> Option<String> {
@@ -290,13 +355,41 @@ impl RegistryClient {
         let response = self.query(&Method::HEAD, accepted_types, location).await?;
 
         if !response.status().is_success() {
-            return Err(Error::BlobUnknown);
+            return Err(classify_read_failure(
+                response.status(),
+                "head_blob",
+                Error::BlobUnknown,
+            ));
         }
 
         let digest = parse_header(&response, DOCKER_CONTENT_DIGEST)?;
         let size = parse_header(&response, CONTENT_LENGTH)?;
 
         Ok((digest, size))
+    }
+
+    /// HEAD-probes a blob for presence only: `Ok(true)` on any 2xx, `Ok(false)`
+    /// on `404`, and an error on any other status or transport failure.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the request fails or the downstream returns a
+    /// non-success status other than `404`.
+    pub async fn blob_exists(&self, location: &str) -> Result<bool, Error> {
+        // Unlike `head_blob` this never reads `Docker-Content-Digest`, which the
+        // OCI spec makes a SHOULD on blob HEAD: a conformant downstream that
+        // omits it must read as present, not as a probe failure.
+        let response = self.query(&Method::HEAD, &[], location).await?;
+        let status = response.status();
+        if status.is_success() {
+            return Ok(true);
+        }
+        if status == StatusCode::NOT_FOUND {
+            return Ok(false);
+        }
+        Err(Error::Internal(format!(
+            "blob_exists: downstream returned status {status}"
+        )))
     }
 
     /// Streams a blob from the upstream registry.
@@ -337,7 +430,11 @@ impl RegistryClient {
         let response = self.query(&Method::HEAD, accepted_types, location).await?;
 
         if !response.status().is_success() {
-            return Err(Error::ManifestUnknown);
+            return Err(classify_read_failure(
+                response.status(),
+                "head_manifest",
+                Error::ManifestUnknown,
+            ));
         }
 
         let media_type = parse_header(&response, CONTENT_TYPE).ok();
@@ -361,7 +458,11 @@ impl RegistryClient {
         let response = self.query(&Method::GET, accepted_types, location).await?;
 
         if !response.status().is_success() {
-            return Err(Error::ManifestUnknown);
+            return Err(classify_read_failure(
+                response.status(),
+                "get_manifest",
+                Error::ManifestUnknown,
+            ));
         }
 
         let media_type = parse_header(&response, CONTENT_TYPE).ok();
@@ -388,5 +489,84 @@ impl RegistryClient {
         }
 
         Ok((media_type, digest, content))
+    }
+}
+
+/// Builder for [`RegistryClient`] taking individual resolved fields.
+///
+/// `url`, `client` and `cache` are required; `basic_auth` defaults to none and
+/// `max_manifest_size_bytes` defaults to [`DEFAULT_MAX_MANIFEST_SIZE_BYTES`].
+#[derive(Default)]
+pub struct RegistryClientBuilder {
+    url: Option<String>,
+    client: Option<Client>,
+    basic_auth: Option<(String, String)>,
+    cache: Option<Arc<Cache>>,
+    max_manifest_size_bytes: Option<usize>,
+}
+
+impl RegistryClientBuilder {
+    /// Base URL of the remote registry (required).
+    #[must_use]
+    pub fn url(mut self, url: String) -> Self {
+        self.url = Some(url);
+        self
+    }
+
+    /// Pre-built HTTP client carrying the resolved TLS/redirect/timeout policy
+    /// (required).
+    #[must_use]
+    pub fn client(mut self, client: Client) -> Self {
+        self.client = Some(client);
+        self
+    }
+
+    /// Optional resolved basic-auth credentials (`username`, `password`).
+    #[must_use]
+    pub fn basic_auth(mut self, basic_auth: Option<(String, String)>) -> Self {
+        self.basic_auth = basic_auth;
+        self
+    }
+
+    /// Shared token/auth cache (required).
+    #[must_use]
+    pub fn cache(mut self, cache: Arc<Cache>) -> Self {
+        self.cache = Some(cache);
+        self
+    }
+
+    /// Maximum manifest body size accepted from the remote registry.
+    #[must_use]
+    pub fn max_manifest_size_bytes(mut self, max_manifest_size_bytes: usize) -> Self {
+        self.max_manifest_size_bytes = Some(max_manifest_size_bytes);
+        self
+    }
+
+    /// Builds the [`RegistryClient`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Initialization`] when a required field is missing.
+    pub fn build(self) -> Result<RegistryClient, Error> {
+        let url = self.url.ok_or_else(|| {
+            Error::Initialization("registry_client builder requires a url".into())
+        })?;
+        let client = self.client.ok_or_else(|| {
+            Error::Initialization("registry_client builder requires a client".into())
+        })?;
+        let cache = self.cache.ok_or_else(|| {
+            Error::Initialization("registry_client builder requires a cache".into())
+        })?;
+
+        Ok(RegistryClient {
+            url,
+            client,
+            basic_auth: self.basic_auth,
+            cache,
+            token_refresh: Mutex::new(()),
+            max_manifest_size_bytes: self
+                .max_manifest_size_bytes
+                .unwrap_or(DEFAULT_MAX_MANIFEST_SIZE_BYTES),
+        })
     }
 }

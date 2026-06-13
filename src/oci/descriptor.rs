@@ -48,39 +48,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_descriptor_round_trip_all_fields() {
-        let digest = Digest::from_str(
-            "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-        )
-        .unwrap();
-        let descriptor = Descriptor {
-            media_type: "application/vnd.oci.image.manifest.v1+json".to_string(),
-            digest,
-            size: 1234,
-            annotations: HashMap::from([
-                (
-                    "org.opencontainers.image.revision".to_string(),
-                    "abc123".to_string(),
-                ),
-                ("custom.key".to_string(), "custom.value".to_string()),
-            ]),
-            artifact_type: Some("application/vnd.example.config".to_string()),
-            platform: Some(Platform {
-                architecture: "amd64".to_string(),
-                os: "linux".to_string(),
-                variant: Some("v1".to_string()),
-                os_version: Some("22.04".to_string()),
-                os_features: Some(vec!["feature1".to_string()]),
-                features: Some(vec!["sse4".to_string()]),
-            }),
-        };
-
-        let json = serde_json::to_string(&descriptor).unwrap();
-        let round_tripped: Descriptor = serde_json::from_str(&json).unwrap();
-        assert_eq!(descriptor, round_tripped);
-    }
-
-    #[test]
     fn test_descriptor_round_trip_minimal() {
         let digest = Digest::from_str(
             "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",

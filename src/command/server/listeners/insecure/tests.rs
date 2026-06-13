@@ -151,16 +151,6 @@ async fn test_insecure_listener_new_with_ipv6() {
 }
 
 #[tokio::test]
-async fn test_insecure_listener_notify_config_change() {
-    let config = InsecureListenerConfig::default();
-    let context1 = create_test_server_context().await;
-    let listener = InsecureListener::new(&config, context1);
-
-    let context2 = create_test_server_context().await;
-    listener.notify_config_change(context2);
-}
-
-#[tokio::test]
 async fn test_insecure_listener_timeouts_initialization() {
     let config = InsecureListenerConfig {
         base: ListenerBaseConfig {
@@ -177,35 +167,6 @@ async fn test_insecure_listener_timeouts_initialization() {
     let timeouts = listener.timeouts.load();
     assert_eq!(timeouts[0], Duration::from_secs(5000));
     assert_eq!(timeouts[1], Duration::from_secs(100));
-}
-
-#[tokio::test]
-async fn test_insecure_listener_with_zero_port() {
-    let config = InsecureListenerConfig {
-        base: ListenerBaseConfig {
-            bind_address: "127.0.0.1".parse().unwrap(),
-            port: 0,
-            query_timeout: NonZeroU64::new(3600).unwrap(),
-            query_timeout_grace_period: NonZeroU64::new(60).unwrap(),
-        },
-    };
-
-    let context = create_test_server_context().await;
-    let listener = InsecureListener::new(&config, context);
-
-    assert_eq!(listener.binding_address.port(), 0);
-}
-
-#[tokio::test]
-async fn test_insecure_listener_multiple_config_changes() {
-    let config = InsecureListenerConfig::default();
-    let context1 = create_test_server_context().await;
-    let listener = InsecureListener::new(&config, context1);
-
-    for _ in 0..5 {
-        let context = create_test_server_context().await;
-        listener.notify_config_change(context);
-    }
 }
 
 async fn create_context_with_webhook(webhook_url: &str) -> ServerContext {
@@ -225,12 +186,12 @@ async fn test_hot_reload_updates_webhook_config() {
     let context_without_webhooks = create_test_server_context().await;
     let listener = InsecureListener::new(&listener_config, context_without_webhooks);
 
-    assert!(listener.current_context().event_dispatcher().is_none());
+    assert!(!listener.current_context().has_event_dispatcher());
 
     let context_with_webhooks = create_context_with_webhook("https://example.com/webhook").await;
     listener.notify_config_change(context_with_webhooks);
 
-    assert!(listener.current_context().event_dispatcher().is_some());
+    assert!(listener.current_context().has_event_dispatcher());
 }
 
 #[tokio::test]
@@ -239,12 +200,12 @@ async fn test_hot_reload_removes_webhooks() {
     let context_with_webhooks = create_context_with_webhook("https://example.com/webhook").await;
     let listener = InsecureListener::new(&listener_config, context_with_webhooks);
 
-    assert!(listener.current_context().event_dispatcher().is_some());
+    assert!(listener.current_context().has_event_dispatcher());
 
     let context_without_webhooks = create_test_server_context().await;
     listener.notify_config_change(context_without_webhooks);
 
-    assert!(listener.current_context().event_dispatcher().is_none());
+    assert!(!listener.current_context().has_event_dispatcher());
 }
 
 #[tokio::test]

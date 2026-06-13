@@ -401,3 +401,60 @@ async fn listings_skip_atomic_write_temporaries() {
     assert_eq!(children.objects, vec!["real.json".to_string()]);
     assert!(children.next_token.is_none());
 }
+
+/// `ensure_parent`'s retry loop must absorb the transient macOS/APFS
+/// sibling-`mkdir` race when concurrent writes share a parent directory.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn concurrent_writes_under_shared_parent_all_succeed() {
+    let dir = TempDir::new().unwrap();
+    let store = backend(&dir);
+
+    const TASKS: usize = 64;
+    let mut handles = Vec::with_capacity(TASKS);
+    for i in 0..TASKS {
+        let store = store.clone();
+        handles.push(tokio::spawn(async move {
+            let key = format!("shard/file-{i}");
+            store
+                .put(&key, Bytes::from(format!("body-{i}")))
+                .await
+                .map(|()| key)
+        }));
+    }
+
+    let mut written = Vec::with_capacity(TASKS);
+    for handle in handles {
+        let key = handle
+            .await
+            .expect("write task must not panic")
+            .expect("every concurrent put under a shared parent must succeed");
+        written.push(key);
+    }
+
+    written.sort();
+    written.dedup();
+    let mut expected: Vec<String> = (0..TASKS).map(|i| format!("shard/file-{i}")).collect();
+    expected.sort();
+    assert_eq!(written, expected, "every key must be written exactly once");
+
+    for i in 0..TASKS {
+        let key = format!("shard/file-{i}");
+        assert_eq!(
+            store.get(&key).await.unwrap(),
+            format!("body-{i}").into_bytes(),
+        );
+    }
+}
+
+#[tokio::test]
+async fn copy_missing_source_returns_not_found() {
+    let dir = TempDir::new().unwrap();
+    let store = backend(&dir);
+    assert_eq!(
+        store
+            .copy("absent-source", "dst/whatever")
+            .await
+            .unwrap_err(),
+        Error::NotFound,
+    );
+}

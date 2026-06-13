@@ -6,18 +6,24 @@ title: "Enable Durable Cache Jobs"
 
 # Enable Durable Cache Jobs
 
-Pull-through cache-fill tasks always go through the engine-backed job queue.
-By default (when `[global.job_queue]` is absent) jobs are stored in-process
-memory: a client request enqueues a cache-fill job, an in-process worker drains
-it immediately, and the queue is discarded on restart. Deduplication within a
-single process is guaranteed, but the queue cannot be observed externally.
+Pull-through cache-fill tasks always go through the engine-backed job queue, and
+that queue is **persistent in both modes**: jobs are written to the configured
+object store under a hardcoded `_jobs/` prefix and survive a restart. What
+`[global.job_queue]` changes is *who drains the queue* and how it scales, not
+whether jobs are durable.
 
-Adding `[global.job_queue]` makes the queue durable: instead of in-memory,
-jobs are stored in the **same backend you configured for `[metadata_store]`**
-(filesystem or S3, whichever metadata uses), under a hardcoded `_jobs/` prefix.
-Jobs survive restarts, can be shared across replicas, and are drained by one or
-more `angos worker` subcommands that you run alongside `angos server`. The code
-path is identical in both modes; only the storage backing changes.
+By default (when `[global.job_queue]` is absent) the `angos server` process
+drains the queue itself, in-process: a client request enqueues a cache-fill job
+and an in-process claim loop runs it. Pending jobs persist to the store and are
+picked back up after a restart, but there is no cross-replica coordination and
+no externally observable queue-depth gauge.
+
+Adding `[global.job_queue]` switches draining to one or more separate `angos
+worker` processes that you run alongside `angos server`, and turns on the
+queue-depth gauge for autoscaling. Durable jobs are stored in the **same backend
+you configured for `[metadata_store]`** (filesystem or S3), under the same
+`_jobs/` prefix. The code path is identical in both modes; only who drains the
+queue and how those drainers coordinate changes.
 
 ## When should I use this?
 
@@ -29,18 +35,19 @@ Enable durable cache jobs when:
 - You want KEDA or another external autoscaler to scale `angos worker` pods
   based on queue depth (the `angos_job_queue_pending` Prometheus gauge served
   by `/metrics` on the server's listener).
-- You want cache-fill work to survive a server restart rather than being
-  discarded.
+- You want cache-fill work drained by dedicated `angos worker` processes,
+  decoupled from, and scaled independently of, the request-serving
+  `angos server` processes.
 
-For a single-node deployment where in-process caching is sufficient there is no
-need to configure `[global.job_queue]`; jobs run in-process at full speed
-without any filesystem or network I/O for the queue layer.
+For a single-node deployment, in-process draining is sufficient and you do not
+need `[global.job_queue]`; jobs still persist under `_jobs/` (so they survive a
+restart), but the server drains them itself rather than a separate worker.
 
 ## Configuration
 
 The queue has no storage backend of its own. Durable jobs are written to the
-**same backend you already configured for `[metadata_store]`** — filesystem or
-S3 — under a hardcoded top-level `_jobs/` prefix, and the per-`lock_key`
+**same backend you already configured for `[metadata_store]`** (filesystem or
+S3) under a hardcoded top-level `_jobs/` prefix, and the per-`lock_key`
 execution lock uses the lock strategy inherited from `[metadata_store]`. There
 is no `[global.job_queue.fs]` or `[global.job_queue.s3]` sub-table: enabling the
 queue is just a matter of adding `[global.job_queue]`, which accepts only the
@@ -56,12 +63,14 @@ pending_refresh_interval_secs = 15   # how often the server refreshes the pendin
 pending_ready_horizon_secs = 600     # only jobs ready within this many seconds count toward the gauge
 ```
 
-> **Note:** Because storage is inherited from `[metadata_store]`, multi-process
-> pools (multiple `angos server` or `angos worker` replicas) need a
-> multi-process-safe lock strategy on the metadata store — `lock_strategy.redis`
+> **Note:** Because storage is inherited from `[metadata_store]`, the durable
+> queue is drained by separate processes and therefore needs a
+> multi-process-safe lock strategy on the metadata store: `lock_strategy.redis`
 > for the filesystem backend, or the default `lock_strategy = "s3"` for the S3
-> backend. The default `"memory"` lock strategy only coordinates workers within
-> a single process, so a second replica would race. See
+> backend. The `"memory"` lock strategy only coordinates within a single
+> process, so **Angos refuses to start** when `[global.job_queue]` is
+> configured with it: set a shared lock strategy, or remove
+> `[global.job_queue]` to use the in-process queue. See
 > [the configuration reference](../reference/configuration.md) for the
 > `[metadata_store]` lock options.
 
@@ -87,7 +96,7 @@ finish on the components they started with.
 
 | Flag                         | Default   | Description                                            |
 |------------------------------|-----------|--------------------------------------------------------|
-| `--queue <name>`             | `"cache"` | Queue to drain. The only queue currently produced is `cache` (pull-through cache-fill), so this rarely needs changing. |
+| `--queue <name>`             | `cache` and `replication` | Queue to drain. With no `--queue` the worker drains both the `cache` (pull-through cache-fill) and `replication` queues, each on its own pool. Repeatable (`--queue cache --queue replication`) to scale or isolate queues independently. |
 | `--poll-interval <duration>` | `1s`      | Minimum wait between claim attempts when no ready job is found. If the queue contains only backed-off envelopes, the worker extends the wait up to the soonest `not_before` (capped at 1 minute, or `--poll-interval` if it is larger) to avoid polling-storm cost. |
 
 ### Example: server + worker pods
@@ -118,12 +127,20 @@ are emitted via structured logs and keyed on `lock_key`.
 ## Operational notes
 
 **Dead-letter queue:** Jobs that exhaust their retry budget (5 attempts) are
-moved to `_jobs/failed/cache/<storage_key>.json` (FS) or the equivalent S3
-key. The `storage_key` is `<16-hex unix-millis>-<uuid>` — the millis prefix is
-the `not_before` of the last retry, the UUID is the envelope id. Inspect with
-`cat`/`jq` to diagnose persistent failures.
+moved to `_jobs/failed/<queue>/<storage_key>.json` (FS) or the equivalent S3
+key: `_jobs/failed/cache/` for cache-fill jobs, `_jobs/failed/replication/`
+for replication jobs. The `storage_key` is `<16-hex unix-millis>-<uuid>`: the
+millis prefix is the `not_before` of the last retry, the UUID is the envelope
+id. Inspect with `cat`/`jq` to diagnose persistent failures. The `_jobs` admin
+API and UI list, retry, and delete failed jobs per queue, selected with
+`?queue=cache` (the default) or `?queue=replication`.
 
-To requeue manually, move the file back into `_jobs/pending/cache/`. The
+**Orphan jobs after a configuration change:** Removing a repository (or its
+upstreams) from the configuration leaves its pending cache jobs to fail and
+dead-letter. `angos scrub --cache-orphans` deletes those orphans from both the
+pending and dead-letter partitions; combine with `--dry-run` to preview.
+
+To requeue manually, move the file back into `_jobs/pending/<queue>/`. The
 filename's millis prefix continues to drive scheduling, so to force immediate
 re-execution rename the file with a zero prefix:
 `0000000000000000-<uuid>.json`. A worker will pick it up on the next poll
@@ -142,7 +159,7 @@ instead.
 
 **S3 metadata store requirements:** When `[metadata_store]` uses the S3 backend
 with the default `lock_strategy = "s3"`, the per-`lock_key` execution lock is
-held on an S3 object backed by conditional writes — the provider must support
+held on an S3 object backed by conditional writes: the provider must support
 `put_if_none_match` and `put_if_match`. Endpoints that strip `ETag` from PUT
 responses are not supported; angos fails fast at startup rather than silently
 dropping jobs. Lock release uses `DELETE` with `If-Match: <etag>` on services
@@ -166,8 +183,8 @@ config load (sub-5s ticks induce LIST storms on S3).
 retries 4 times with delays of 2, 4, 8 and 10 minutes (24 minutes total)
 before being moved to the dead-letter queue.
 
-**Transactional engine path:** All writes — enqueue, complete, retry, and
-dead-letter — are routed through the transactional engine regardless of the
+**Transactional engine path:** All writes (enqueue, complete, retry, and
+dead-letter) are routed through the transactional engine regardless of the
 metadata-store backend. On `complete`, the handler's work-product mutations (for
 `cache.fetch_blob`: `Move` of staged bytes to the canonical blob path,
 `Delete` of the upload-session record, and the per-namespace blob-index

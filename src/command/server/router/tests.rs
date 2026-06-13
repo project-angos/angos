@@ -64,7 +64,10 @@ fn test_parse_start_upload() {
     let method = Method::POST;
     let uri: Uri = "/v2/myrepo/app/blobs/uploads".parse().unwrap();
     let route = parse(&method, &uri);
-    if let Some(Action::StartUpload { namespace, digest }) = route {
+    if let Some(Action::StartUpload {
+        namespace, digest, ..
+    }) = route
+    {
         assert_eq!(namespace, "myrepo/app");
         assert!(digest.is_none());
     } else {
@@ -77,7 +80,10 @@ fn test_parse_start_upload_with_trailing_slash() {
     let method = Method::POST;
     let uri: Uri = "/v2/myrepo/app/blobs/uploads/".parse().unwrap();
     let route = parse(&method, &uri);
-    if let Some(Action::StartUpload { namespace, digest }) = route {
+    if let Some(Action::StartUpload {
+        namespace, digest, ..
+    }) = route
+    {
         assert_eq!(namespace, "myrepo/app");
         assert!(digest.is_none());
     } else {
@@ -90,7 +96,10 @@ fn test_parse_start_upload_with_digest() {
     let method = Method::POST;
     let uri: Uri = "/v2/myrepo/app/blobs/uploads?digest=sha256:1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef".parse().unwrap();
     let route = parse(&method, &uri);
-    if let Some(Action::StartUpload { namespace, digest }) = route {
+    if let Some(Action::StartUpload {
+        namespace, digest, ..
+    }) = route
+    {
         assert_eq!(namespace, "myrepo/app");
         assert!(digest.is_some());
         assert_eq!(
@@ -100,6 +109,148 @@ fn test_parse_start_upload_with_digest() {
     } else {
         panic!("Expected StartUpload route");
     }
+}
+
+#[test]
+fn test_parse_mount_blob_with_from() {
+    let method = Method::POST;
+    let mount_digest = "sha256:1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef";
+    let uri: Uri =
+        format!("/v2/myrepo/target/blobs/uploads/?mount={mount_digest}&from=myrepo/source")
+            .parse()
+            .unwrap();
+    let route = parse(&method, &uri);
+    if let Some(Action::MountBlob {
+        namespace,
+        digest,
+        from,
+    }) = route
+    {
+        assert_eq!(namespace, "myrepo/target");
+        assert_eq!(digest.to_string(), mount_digest);
+        assert_eq!(from.unwrap(), "myrepo/source");
+    } else {
+        panic!("Expected MountBlob route");
+    }
+}
+
+#[test]
+fn test_parse_mount_blob_without_from() {
+    // An unset `from` makes the server attempt automatic content discovery.
+    let method = Method::POST;
+    let mount_digest = "sha256:1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef";
+    let uri: Uri = format!("/v2/myrepo/target/blobs/uploads/?mount={mount_digest}")
+        .parse()
+        .unwrap();
+    let route = parse(&method, &uri);
+    if let Some(Action::MountBlob { digest, from, .. }) = route {
+        assert_eq!(digest.to_string(), mount_digest);
+        assert!(from.is_none());
+    } else {
+        panic!("Expected MountBlob route");
+    }
+}
+
+#[test]
+fn test_parse_mount_blob_with_malformed_from_is_rejected() {
+    let mount_digest = "sha256:1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef";
+    let uri: Uri = format!("/v2/myrepo/target/blobs/uploads/?mount={mount_digest}&from=Invalid")
+        .parse()
+        .unwrap();
+    let route = parse(&Method::POST, &uri);
+    assert!(
+        route.is_none(),
+        "a malformed ?from= must not route (POST -> 400), got: {route:?}"
+    );
+}
+
+#[test]
+fn test_parse_start_upload_with_malformed_digest_is_rejected() {
+    let uri: Uri = "/v2/myrepo/app/blobs/uploads?digest=not-a-digest"
+        .parse()
+        .unwrap();
+    let route = parse(&Method::POST, &uri);
+    assert!(
+        route.is_none(),
+        "a malformed ?digest= must not start a session (POST -> 400), got: {route:?}"
+    );
+
+    let uri: Uri = "/v2/myrepo/app/blobs/uploads/?digest=garbage"
+        .parse()
+        .unwrap();
+    let route = parse(&Method::POST, &uri);
+    assert!(
+        route.is_none(),
+        "a malformed ?digest= must not start a session (POST -> 400), got: {route:?}"
+    );
+}
+
+#[test]
+fn test_parse_start_upload_no_digest_is_session() {
+    let uri: Uri = "/v2/myrepo/app/blobs/uploads".parse().unwrap();
+    let route = parse(&Method::POST, &uri);
+    if let Some(Action::StartUpload {
+        namespace, digest, ..
+    }) = route
+    {
+        assert_eq!(namespace, "myrepo/app");
+        assert!(digest.is_none());
+    } else {
+        panic!("Expected StartUpload route, got: {route:?}");
+    }
+}
+
+#[test]
+fn test_parse_malformed_mount_is_rejected() {
+    // The OCI fall-back-to-session rule covers unsatisfiable mounts, not
+    // syntactically invalid ones.
+    let route = parse(
+        &Method::POST,
+        &"/v2/myrepo/target/blobs/uploads/?mount=not-a-digest"
+            .parse()
+            .unwrap(),
+    );
+    assert!(
+        route.is_none(),
+        "a malformed ?mount= must reject the route (POST -> 400), got: {route:?}"
+    );
+}
+
+#[test]
+fn test_parse_mount_with_malformed_digest_is_rejected() {
+    // Real clients never combine `?mount=` with a monolithic `?digest=`;
+    // rejecting the combination is by design.
+    let mount_digest = "sha256:1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef";
+    let uri: Uri = format!("/v2/myrepo/target/blobs/uploads/?mount={mount_digest}&digest=garbage")
+        .parse()
+        .unwrap();
+    let route = parse(&Method::POST, &uri);
+    assert!(
+        route.is_none(),
+        "a malformed ?digest= must poison the mount path too (POST -> 400), got: {route:?}"
+    );
+}
+
+#[test]
+fn test_parse_query_strict() {
+    assert!(parse_query_strict::<MountQuery>("digest=not-a-digest").is_none());
+
+    let valid = "digest=sha256:1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef";
+    let query: MountQuery = parse_query_strict(valid).expect("a valid digest must parse strictly");
+    assert!(query.digest.is_some());
+    assert!(query.mount.is_none());
+    assert!(query.from.is_none());
+
+    let query: MountQuery = parse_query_strict("").expect("an empty query must parse strictly");
+    assert!(query.digest.is_none());
+    assert!(query.mount.is_none());
+    assert!(query.from.is_none());
+
+    // serde_urlencoded ignores unknown fields, so a bare `?n=` still yields Some.
+    let query: MountQuery = parse_query_strict("n=5").expect("an unknown field must be ignored");
+    assert!(query.digest.is_none());
+    assert!(query.mount.is_none());
+    assert!(query.from.is_none());
 }
 
 #[test]
@@ -455,12 +606,13 @@ fn test_parse_invalid_uuid_in_upload_path() {
 }
 
 #[test]
-fn test_digest_query_from_params() {
-    let params = "digest=sha256:1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef";
-    let query: DigestQuery = parse_query(params);
-    assert!(query.digest.is_some());
+fn digest_from_params_parses_valid() {
+    let digest = digest_from_params(Some(
+        "digest=sha256:1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
+    ));
+    assert!(digest.is_some());
     assert_eq!(
-        query.digest.unwrap(),
+        digest.unwrap().to_string(),
         "sha256:1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef"
     );
 }
@@ -473,27 +625,10 @@ fn test_digest_query_from_empty_params() {
 }
 
 #[test]
-fn test_digest_query_to_digest_valid() {
-    let query = DigestQuery {
-        digest: Some(
-            "sha256:1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef".to_string(),
-        ),
-    };
-    let digest = query.to_digest();
-    assert!(digest.is_some());
-    assert_eq!(
-        digest.unwrap().to_string(),
-        "sha256:1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef"
-    );
-}
-
-#[test]
-fn test_digest_query_to_digest_invalid() {
-    let query = DigestQuery {
-        digest: Some("invalid-digest".to_string()),
-    };
-    let digest = query.to_digest();
-    assert!(digest.is_none());
+fn digest_from_params_drops_invalid() {
+    // The Digest deserialize error makes the lenient parse collapse the whole
+    // query to its default.
+    assert!(digest_from_params(Some("digest=invalid-digest")).is_none());
 }
 
 #[test]
@@ -603,7 +738,10 @@ fn test_try_parse_upload_start_post_method() {
     let path = "myrepo/app/blobs/uploads";
     let route = try_parse_upload(&method, path, None);
     assert!(route.is_some());
-    if let Some(Action::StartUpload { namespace, digest }) = route {
+    if let Some(Action::StartUpload {
+        namespace, digest, ..
+    }) = route
+    {
         assert_eq!(namespace, "myrepo/app");
         assert!(digest.is_none());
     } else {
@@ -626,14 +764,14 @@ fn test_try_parse_upload_start_no_slash() {
     // No-slash variant: /v2/foo/blobs/uploads → StartUpload for namespace "foo".
     let route = try_parse_upload(&method, "foo/blobs/uploads", None);
     assert!(
-        matches!(route, Some(Action::StartUpload { ref namespace, digest: None }) if namespace == "foo"),
+        matches!(route, Some(Action::StartUpload { ref namespace, digest: None, .. }) if namespace == "foo"),
         "no-slash variant must yield StartUpload with correct namespace"
     );
 
     // With-slash variant: /v2/foo/blobs/uploads/ → same result.
     let route = try_parse_upload(&method, "foo/blobs/uploads/", None);
     assert!(
-        matches!(route, Some(Action::StartUpload { ref namespace, digest: None }) if namespace == "foo"),
+        matches!(route, Some(Action::StartUpload { ref namespace, digest: None, .. }) if namespace == "foo"),
         "with-slash variant must yield StartUpload with correct namespace"
     );
 
@@ -896,20 +1034,22 @@ fn test_parse_list_namespaces_post_not_allowed() {
 #[test]
 fn test_parse_list_jobs() {
     let route = parse(&Method::GET, &"/_ext/_jobs".parse().unwrap());
-    assert!(matches!(
-        route,
-        Some(Action::ListJobs {
-            n: None,
-            after: None
-        })
-    ));
+    match route {
+        Some(Action::ListJobs { queue, n, after }) => {
+            assert_eq!(queue, "cache");
+            assert_eq!(n, None);
+            assert_eq!(after, None);
+        }
+        other => panic!("expected ListJobs, got {other:?}"),
+    }
 }
 
 #[test]
 fn test_parse_list_jobs_with_pagination() {
     let route = parse(&Method::GET, &"/_ext/_jobs?n=10&after=abc".parse().unwrap());
     match route {
-        Some(Action::ListJobs { n, after }) => {
+        Some(Action::ListJobs { queue, n, after }) => {
+            assert_eq!(queue, "cache");
             assert_eq!(n, Some(10));
             assert_eq!(after.as_deref(), Some("abc"));
         }
@@ -920,13 +1060,14 @@ fn test_parse_list_jobs_with_pagination() {
 #[test]
 fn test_parse_list_failed_jobs() {
     let route = parse(&Method::GET, &"/_ext/_jobs/failed".parse().unwrap());
-    assert!(matches!(
-        route,
-        Some(Action::ListFailedJobs {
-            n: None,
-            after: None
-        })
-    ));
+    match route {
+        Some(Action::ListFailedJobs { queue, n, after }) => {
+            assert_eq!(queue, "cache");
+            assert_eq!(n, None);
+            assert_eq!(after, None);
+        }
+        other => panic!("expected ListFailedJobs, got {other:?}"),
+    }
 }
 
 #[test]
@@ -936,7 +1077,8 @@ fn test_parse_retry_job() {
         &"/_ext/_jobs/failed/0000018b-abc/retry".parse().unwrap(),
     );
     match route {
-        Some(Action::RetryJob { storage_key }) => {
+        Some(Action::RetryJob { queue, storage_key }) => {
+            assert_eq!(queue, "cache");
             assert_eq!(storage_key, "0000018b-abc");
         }
         other => panic!("expected RetryJob, got {other:?}"),
@@ -950,7 +1092,12 @@ fn test_parse_delete_failed_job() {
         &"/_ext/_jobs/failed/0000018b-abc".parse().unwrap(),
     );
     match route {
-        Some(Action::DeleteJob { state, storage_key }) => {
+        Some(Action::DeleteJob {
+            queue,
+            state,
+            storage_key,
+        }) => {
+            assert_eq!(queue, "cache");
             assert_eq!(state, JobState::Failed);
             assert_eq!(storage_key, "0000018b-abc");
         }
@@ -965,7 +1112,12 @@ fn test_parse_delete_pending_job() {
         &"/_ext/_jobs/pending/0000018b-abc".parse().unwrap(),
     );
     match route {
-        Some(Action::DeleteJob { state, storage_key }) => {
+        Some(Action::DeleteJob {
+            queue,
+            state,
+            storage_key,
+        }) => {
+            assert_eq!(queue, "cache");
             assert_eq!(state, JobState::Pending);
             assert_eq!(storage_key, "0000018b-abc");
         }
@@ -993,4 +1145,76 @@ fn test_parse_retry_requires_retry_suffix() {
         &"/_ext/_jobs/failed/0000018b-abc".parse().unwrap(),
     );
     assert!(route.is_none());
+}
+
+#[test]
+fn test_parse_list_jobs_selects_replication_queue() {
+    let route = parse(
+        &Method::GET,
+        &"/_ext/_jobs?queue=replication".parse().unwrap(),
+    );
+    match route {
+        Some(Action::ListJobs { queue, .. }) => assert_eq!(queue, "replication"),
+        other => panic!("expected ListJobs, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_parse_delete_failed_job_selects_replication_queue() {
+    let route = parse(
+        &Method::DELETE,
+        &"/_ext/_jobs/failed/0000018b-abc?queue=replication"
+            .parse()
+            .unwrap(),
+    );
+    match route {
+        Some(Action::DeleteJob { queue, state, .. }) => {
+            assert_eq!(queue, "replication");
+            assert_eq!(state, JobState::Failed);
+        }
+        other => panic!("expected DeleteJob, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_parse_jobs_rejects_unknown_queue() {
+    assert!(parse(&Method::GET, &"/_ext/_jobs?queue=bogus".parse().unwrap()).is_none());
+    assert!(
+        parse(
+            &Method::DELETE,
+            &"/_ext/_jobs/failed/0000018b-abc?queue=bogus"
+                .parse()
+                .unwrap(),
+        )
+        .is_none()
+    );
+}
+
+#[test]
+fn test_parse_jobs_rejects_malformed_query_instead_of_defaulting_queue() {
+    // A lenient parse would reset the whole query and administer the default
+    // cache queue instead of the requested one.
+    assert!(
+        parse(
+            &Method::GET,
+            &"/_ext/_jobs?queue=replication&n=abc".parse().unwrap(),
+        )
+        .is_none()
+    );
+    assert!(
+        parse(
+            &Method::GET,
+            &"/_ext/_jobs?queue=replication&n=99999999".parse().unwrap(),
+        )
+        .is_none()
+    );
+    assert!(
+        parse(
+            &Method::DELETE,
+            &"/_ext/_jobs/failed/0000018b-abc?queue=replication&n=abc"
+                .parse()
+                .unwrap(),
+        )
+        .is_none()
+    );
 }

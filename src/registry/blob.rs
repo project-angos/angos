@@ -323,7 +323,7 @@ impl Registry {
                 return;
             }
         };
-        if let Err(e) = self.cache_queue.enqueue(envelope).await {
+        if let Err(e) = self.job_queue.enqueue(envelope).await {
             warn!("Failed to enqueue cache job for {digest}: {e}");
             metrics_provider()
                 .job_queue_enqueue_failures_total

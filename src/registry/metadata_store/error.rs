@@ -13,6 +13,9 @@ pub enum Error {
     InvalidData(String),
     StorageBackend(String),
     ReferenceNotFound,
+    /// A replicated link write lost last-writer-wins against the state the
+    /// committing transaction was validated against.
+    ReplicationSuperseded(String),
 }
 
 impl fmt::Display for Error {
@@ -23,6 +26,7 @@ impl fmt::Display for Error {
             Error::InvalidData(msg) => write!(f, "Invalid data: {msg}"),
             Error::StorageBackend(msg) => write!(f, "Storage backend error: {msg}"),
             Error::ReferenceNotFound => write!(f, "Reference not found"),
+            Error::ReplicationSuperseded(msg) => write!(f, "Replication superseded: {msg}"),
         }
     }
 }

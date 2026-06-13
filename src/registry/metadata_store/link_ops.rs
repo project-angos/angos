@@ -10,6 +10,7 @@
 use std::collections::{HashMap, HashSet};
 
 use bytes::Bytes;
+use chrono::{DateTime, Utc};
 use futures_util::future::join_all;
 use tracing::warn;
 
@@ -210,6 +211,16 @@ pub struct LinksTxExtras<'a> {
     /// success (used by `store_manifest`). Otherwise registration happens only
     /// when at least one `Create` op was processed.
     pub force_register_namespace: bool,
+    /// Creation timestamp for newly-written link metadata; `None` stamps the
+    /// current time. Replicated writes pass the originating `source_ts` so a
+    /// tag's LWW timestamp tracks the author's write time, not this receiver's
+    /// clock.
+    pub created_at: Option<DateTime<Utc>>,
+    /// Author timestamp of a replicated delete. When set, the planner gates
+    /// each deleted tag link on last-writer-wins against it and joins the link
+    /// into the validated read set, so a concurrent newer re-put aborts the
+    /// delete instead of being clobbered.
+    pub delete_source_ts: Option<DateTime<Utc>>,
 }
 
 /// Data captured from a successful link-transaction attempt, used for
@@ -221,7 +232,36 @@ struct LinksTxCaptured {
     written_links: Vec<(LinkKind, LinkMetadata)>,
     /// Links that were fully removed.
     deleted_links: Vec<LinkKind>,
+    /// Prior target per `Create` op's link (`None` = absent), as read by the
+    /// committed attempt.
+    prior_targets: Vec<(LinkKind, Option<Digest>)>,
     had_creates: bool,
+    /// `Some(message)` when the attempt's last-writer-wins guard rejected the
+    /// write; the attempt committed an empty transaction and the caller maps
+    /// this to [`Error::ReplicationSuperseded`].
+    superseded: Option<String>,
+}
+
+/// Prior link state captured by a committed link transaction. The retry loop
+/// re-reads each `Create` op's target on every attempt, so this is the state
+/// the commit was actually validated against, never a stale pre-write read.
+#[derive(Default)]
+pub struct LinksCommit {
+    /// Prior target per `Create` op's link; `None` = the link did not exist.
+    pub prior_targets: Vec<(LinkKind, Option<Digest>)>,
+}
+
+impl LinksCommit {
+    /// Whether the commit changed `link`: it was absent or pointed at a
+    /// different digest before. Fails open (`true`) when the transaction had
+    /// no `Create` op for `link`, so a genuine write is never suppressed.
+    #[must_use]
+    pub fn changed(&self, link: &LinkKind, target: &Digest) -> bool {
+        self.prior_targets
+            .iter()
+            .find(|(l, _)| l == link)
+            .is_none_or(|(_, prior)| prior.as_ref() != Some(target))
+    }
 }
 
 impl MetadataStore {
@@ -238,6 +278,29 @@ impl MetadataStore {
         }
         self.execute_links_tx(namespace, operations, LinksTxExtras::default())
             .await
+            .map(|_| ())
+    }
+
+    /// Delete links (e.g. a tag) carrying a replicated delete's `source_ts` for
+    /// the last-writer-wins gate. Unlike [`Self::delete_manifest`] it does no
+    /// blob-data reclamation. A `None` `source_ts` is a plain unconditional
+    /// delete (a genuine client request).
+    pub async fn delete_links(
+        &self,
+        namespace: &str,
+        operations: &[LinkOperation],
+        source_ts: Option<DateTime<Utc>>,
+    ) -> Result<(), Error> {
+        if operations.is_empty() {
+            return Ok(());
+        }
+        let extras = LinksTxExtras {
+            delete_source_ts: source_ts,
+            ..LinksTxExtras::default()
+        };
+        self.execute_links_tx(namespace, operations, extras)
+            .await
+            .map(|_| ())
     }
 
     /// Run the retry loop, build the link-update transaction (plus any extras),
@@ -252,7 +315,7 @@ impl MetadataStore {
         namespace: &str,
         operations: &[LinkOperation],
         extras: LinksTxExtras<'_>,
-    ) -> Result<(), Error> {
+    ) -> Result<LinksCommit, Error> {
         let (_, result) = execute_with_retry_payload(
             self.executor(),
             || async {
@@ -338,8 +401,115 @@ impl MetadataStore {
                     }
                 }
 
+                // ── Step 3.5: commit-validate tag-create reads ──────────────────
+                // A tag create joins its current bytes to the transaction read
+                // set so the link Put commits only against that state: a racing
+                // same-tag write aborts this attempt at prepare and the retry
+                // re-reads. This is needed when there is a last-writer-wins
+                // comparison (a replicated write, `extras.created_at` set) and
+                // for a no-op re-push (`old_target == target`), whose dispatch is
+                // suppressed on `changed == false` — so its `old_target` must be
+                // the prior the commit validated, not a stale pre-lock read a
+                // racing different-digest write could outrun. A binding-changing
+                // genuine write always reports `changed`, so it skips this.
+                let mut lww_reads: Vec<(String, Bytes)> = Vec::new();
+                for (create_data, _) in &prelock_results {
+                    let Some((link, target, old_target, ..)) = create_data else {
+                        continue;
+                    };
+                    if !matches!(link, LinkKind::Tag(_)) {
+                        continue;
+                    }
+                    let same_target = old_target.as_ref() == Some(*target);
+                    if extras.created_at.is_none() && !same_target {
+                        continue;
+                    }
+
+                    let link_path = path_builder::link_path(link, namespace);
+                    let bytes = match self.store().get(&link_path).await {
+                        Ok(bytes) => Some(bytes),
+                        Err(StorageError::NotFound) => None,
+                        Err(e) => return Err(TxError::Storage(e)),
+                    };
+                    let metadata = bytes
+                        .as_ref()
+                        .map(|b| LinkMetadata::from_bytes(b.clone()))
+                        .transpose()
+                        .map_err(|e| TxError::Storage(StorageError::Backend(e.to_string())))?;
+
+                    // `old_target` drives the committed `changed`/dispatch
+                    // decision, so abort if a racing write moved the tag since the
+                    // pre-lock read and let the retry re-read the real prior.
+                    if metadata.as_ref().map(|m| &m.target) != old_target.as_ref() {
+                        return Err(TxError::Conflict);
+                    }
+
+                    // A replicated write also gates last-writer-wins on this read.
+                    if let (Some(source_ts), Some(metadata)) =
+                        (extras.created_at, metadata.as_ref())
+                        && let Some(created_at) = metadata.supersedes(source_ts, Some(target))
+                    {
+                        return Ok((
+                            Transaction::builder().build(),
+                            LinksTxCaptured {
+                                superseded: Some(format!(
+                                    "local {link} (created {created_at}) is newer \
+                                     than the replicated source ({source_ts})"
+                                )),
+                                ..LinksTxCaptured::default()
+                            },
+                        ));
+                    }
+
+                    lww_reads.push((link_path, bytes.map_or_else(Bytes::new, Bytes::from)));
+                }
+
+                // Same guard for a replicated delete: each deleted tag link's
+                // bytes join the read set so a concurrent newer re-put aborts the
+                // delete (the `Mutation::Delete` becomes etag-conditional), and a
+                // tag the re-put already won supersedes the delete here. A delete
+                // carries no incoming digest, so a timestamp tie lets it proceed.
+                if let Some(source_ts) = extras.delete_source_ts {
+                    for (_, delete_data) in &prelock_results {
+                        let Some((link, ..)) = delete_data else {
+                            continue;
+                        };
+                        if !matches!(link, LinkKind::Tag(_)) {
+                            continue;
+                        }
+                        let link_path = path_builder::link_path(link, namespace);
+                        match self.store().get(&link_path).await {
+                            Ok(bytes) => {
+                                let metadata =
+                                    LinkMetadata::from_bytes(bytes.clone()).map_err(|e| {
+                                        TxError::Storage(StorageError::Backend(e.to_string()))
+                                    })?;
+                                if let Some(created_at) = metadata.supersedes(source_ts, None) {
+                                    return Ok((
+                                        Transaction::builder().build(),
+                                        LinksTxCaptured {
+                                            superseded: Some(format!(
+                                                "local {link} (created {created_at}) is newer \
+                                                 than the replicated delete ({source_ts})"
+                                            )),
+                                            ..LinksTxCaptured::default()
+                                        },
+                                    ));
+                                }
+                                lww_reads.push((link_path, Bytes::from(bytes)));
+                            }
+                            // Already absent: nothing to delete or validate.
+                            Err(StorageError::NotFound) => {}
+                            Err(e) => return Err(TxError::Storage(e)),
+                        }
+                    }
+                }
+
                 // ── Step 4: build mutations ─────────────────────────────────────
                 let mut builder = Transaction::builder();
+                for (key, body) in lww_reads {
+                    builder = builder.read(key, body);
+                }
                 let mut pending_blob_ops: HashMap<Digest, Vec<BlobIndexOperation>> = HashMap::new();
                 let mut written_links: Vec<(LinkKind, LinkMetadata)> = Vec::new();
                 let mut deleted_links: Vec<LinkKind> = Vec::new();
@@ -382,9 +552,12 @@ impl MetadataStore {
                     if link.is_tracked() && referrer.is_some() {
                         // Tracked link: merge referrer into existing or new metadata.
                         let mut metadata = link_cache.remove(*link).unwrap_or_else(|| {
-                            LinkMetadata::from_digest((*target).clone())
-                                .with_media_type((*media_type).clone())
-                                .with_descriptor(descriptor.as_ref().map(|b| b.as_ref().clone()))
+                            LinkMetadata::from_digest_at(
+                                (*target).clone(),
+                                extras.created_at.unwrap_or_else(Utc::now),
+                            )
+                            .with_media_type((*media_type).clone())
+                            .with_descriptor(descriptor.as_ref().map(|b| b.as_ref().clone()))
                         });
 
                         if let Some(manifest_digest) = referrer {
@@ -410,7 +583,8 @@ impl MetadataStore {
                         written_links.push(((*link).clone(), metadata));
                     } else {
                         // Non-tracked link.
-                        if old_target.as_ref() != Some(*target) {
+                        let same_target = old_target.as_ref() == Some(*target);
+                        if !same_target {
                             pending_blob_ops
                                 .entry((*target).clone())
                                 .or_default()
@@ -425,7 +599,20 @@ impl MetadataStore {
                             }
                         }
 
-                        let metadata = LinkMetadata::from_digest((*target).clone())
+                        // A same-digest re-push (an idempotent client push or a
+                        // converged replay) keeps the existing `created_at`. The
+                        // binding is unchanged so the push is dispatch-suppressed;
+                        // bumping the timestamp would let an interleaved peer
+                        // write lose locally yet win on peers. A real binding
+                        // change stamps the new write time.
+                        let created_at = if same_target {
+                            link_cache.get(*link).and_then(|m| m.created_at)
+                        } else {
+                            None
+                        }
+                        .or(extras.created_at)
+                        .unwrap_or_else(Utc::now);
+                        let metadata = LinkMetadata::from_digest_at((*target).clone(), created_at)
                             .with_media_type((*media_type).clone())
                             .with_descriptor(descriptor.as_ref().map(|b| b.as_ref().clone()));
                         let key = path_builder::link_path(link, namespace);
@@ -556,12 +743,25 @@ impl MetadataStore {
                     }
                 }
 
+                // Prior target per `Create` op, from this attempt's
+                // conflict-validated reads.
+                let prior_targets = prelock_results
+                    .iter()
+                    .filter_map(|(create_data, _)| {
+                        create_data
+                            .as_ref()
+                            .map(|(link, _, old_target, ..)| ((*link).clone(), old_target.clone()))
+                    })
+                    .collect();
+
                 Ok((
                     builder.build(),
                     LinksTxCaptured {
                         written_links,
                         deleted_links,
+                        prior_targets,
                         had_creates,
+                        superseded: None,
                     },
                 ))
             },
@@ -569,6 +769,10 @@ impl MetadataStore {
         )
         .await
         .map_err(tx_error_to_meta)?;
+
+        if let Some(message) = result.superseded {
+            return Err(Error::ReplicationSuperseded(message));
+        }
 
         // ── Post-apply cleanup (best-effort, outside the engine lock) ───────────
         for link in &result.deleted_links {
@@ -598,7 +802,9 @@ impl MetadataStore {
             );
         }
 
-        Ok(())
+        Ok(LinksCommit {
+            prior_targets: result.prior_targets,
+        })
     }
 }
 

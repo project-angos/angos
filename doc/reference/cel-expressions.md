@@ -79,9 +79,13 @@ Information about the current request. Fields are present based on the action ty
 | `request.digest`        | string? | Blob/manifest digest                       |
 | `request.reference`     | string? | Tag or digest reference                    |
 | `request.uuid`          | string? | Upload session UUID                        |
+| `request.from`          | string? | Cross-repository mount source repository (`mount-blob` only) |
 | `request.n`             | int?    | Pagination limit                           |
 | `request.last`          | string? | Pagination marker                          |
 | `request.artifact_type` | string? | Referrer artifact type filter              |
+| `request.queue`         | string? | Durable queue for `_jobs` admin actions (`cache` or `replication`) |
+
+Optional `request` fields are **omitted** when unset (only `request.action` is always present), so test their presence with the `has()` macro rather than a null comparison: `has(request.from)` is safe, whereas `request.from != null` raises a "no such key" error (evaluated fail-closed) when the field is absent. Optional `identity` fields, by contrast, are present as `null`, so `identity.username != null` is correct there.
 
 ### Actions
 
@@ -91,6 +95,7 @@ Information about the current request. Fields are present based on the action ty
 | `metrics`           | Prometheus metrics endpoint  |
 | `get-api-version`   | API version check            |
 | `start-upload`      | Start blob upload            |
+| `mount-blob`        | Cross-repository blob mount (distinct from `start-upload`)            |
 | `update-upload`     | Continue chunked upload      |
 | `complete-upload`   | Complete upload              |
 | `get-upload`        | Get upload status            |
@@ -109,6 +114,10 @@ Information about the current request. Fields are present based on the action ty
 | `list-namespaces`   | Extension: list namespaces   |
 | `list-revisions`    | Extension: list revisions    |
 | `list-uploads`      | Extension: list uploads      |
+| `list-jobs`         | Extension: list pending jobs |
+| `list-failed-jobs`  | Extension: list failed jobs  |
+| `retry-job`         | Extension: requeue a job     |
+| `delete-job`        | Extension: delete a job      |
 
 ---
 
@@ -242,7 +251,7 @@ rules = [
 ```
 
 :::warning
-Avoid `request.action.startsWith('get-')` for anonymous access — it includes `get-api-version`,
+Avoid `request.action.startsWith('get-')` for anonymous access: it includes `get-api-version`,
 which causes Docker clients to skip authentication entirely. List specific actions instead.
 :::
 
@@ -271,4 +280,4 @@ rules = [
 **Retention policy rules:**
 - A rule that returns a non-boolean value or fails to evaluate causes the manifest to be retained and emits a `warn`-level log
 - Retention is fail-open by design: unexpected rule outcomes keep the manifest rather than deleting it
-- See [Configure Retention Policies — Misconfigured Rules](../how-to/configure-retention-policies.md#misconfigured-rules-and-fail-open-semantics) for details and log examples
+- See [Configure Retention Policies, Misconfigured Rules](../how-to/configure-retention-policies.md#misconfigured-rules-and-fail-open-semantics) for details and log examples

@@ -39,6 +39,7 @@ use crate::{
 /// - `n`: Maximum number of results for pagination
 /// - `last`: Last result marker for pagination
 /// - `artifact_type`: Filter for referrer queries
+/// - `from`: Source repository of a cross-repo `mount-blob`; absent unless `?from=` is given
 #[derive(Clone, Debug, Serialize)]
 #[serde(tag = "action", rename_all = "kebab-case")]
 pub enum Action {
@@ -74,6 +75,16 @@ pub enum Action {
         namespace: Namespace,
         #[serde(skip_serializing_if = "Option::is_none")]
         digest: Option<Digest>,
+    },
+    /// Cross-repository blob mount (`POST .../blobs/uploads/?mount=<digest>`).
+    /// A distinct CEL action from `start-upload` so policies can gate mounts
+    /// separately.
+    #[serde(rename = "mount-blob")]
+    MountBlob {
+        namespace: Namespace,
+        digest: Digest,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        from: Option<Namespace>,
     },
     #[serde(rename = "get-upload")]
     GetUpload {
@@ -158,8 +169,11 @@ pub enum Action {
     },
     /// List pending/in-flight durable jobs. Distinct action name so operators
     /// can gate job administration behind higher privilege than registry reads.
+    /// `queue` is exposed to CEL so a policy can gate replication-queue
+    /// administration separately.
     #[serde(rename = "list-jobs")]
     ListJobs {
+        queue: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         n: Option<u16>,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -167,20 +181,24 @@ pub enum Action {
     },
     #[serde(rename = "list-failed-jobs")]
     ListFailedJobs {
+        queue: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         n: Option<u16>,
         #[serde(skip_serializing_if = "Option::is_none")]
         after: Option<String>,
     },
-    /// Requeue a dead-letter job. `storage_key` is HTTP routing only — excluded
-    /// from the CEL payload like other addressing fields.
+    /// Requeue a dead-letter job. `queue` is exposed to CEL; `storage_key` is
+    /// HTTP routing only, excluded from the CEL payload like other addressing
+    /// fields.
     #[serde(rename = "retry-job")]
     RetryJob {
+        queue: String,
         #[serde(skip)]
         storage_key: String,
     },
     #[serde(rename = "delete-job")]
     DeleteJob {
+        queue: String,
         #[serde(skip)]
         state: JobState,
         #[serde(skip)]
@@ -219,6 +237,7 @@ impl Action {
             Action::ListCatalog { .. } => "list-catalog",
             Action::ListTags { .. } => "list-tags",
             Action::StartUpload { .. } => "start-upload",
+            Action::MountBlob { .. } => "mount-blob",
             Action::GetUpload { .. } => "get-upload",
             Action::PatchUpload { .. } => "update-upload",
             Action::PutUpload { .. } => "complete-upload",
@@ -286,6 +305,9 @@ impl Action {
             },
 
             Action::PutUpload {
+                namespace, digest, ..
+            }
+            | Action::MountBlob {
                 namespace, digest, ..
             } => ActionData {
                 namespace: Some(namespace),

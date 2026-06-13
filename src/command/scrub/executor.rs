@@ -1,15 +1,25 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use tracing::{info, warn};
+use chrono::Utc;
+use tracing::{debug, info, warn};
 
 use crate::{
     command::scrub::{action::Action, error::Error},
+    metrics_provider::metrics_provider,
     oci::{Manifest, Reference},
     registry::{
         blob_store::{self, MultipartCleanup},
+        job_store::{Error as JobStoreError, JobEnvelope, JobStore},
         manifest::link_plan,
-        metadata_store::{BlobIndexOperation, LinkOperation, MetadataStore, link_kind::LinkKind},
+        metadata_store::{
+            BlobIndexOperation, Error as MetadataError, LinkOperation, MetadataStore,
+            link_kind::LinkKind,
+        },
+    },
+    replication::{
+        REPLICATION_DELETE_MANIFEST_KIND, REPLICATION_PUSH_MANIFEST_KIND, ReplicationPushPayload,
+        build_envelope, build_prune_delete_envelope,
     },
 };
 
@@ -35,14 +45,111 @@ impl ActionSink for DryRunSink {
 pub struct Executor {
     blob_store: Arc<blob_store::BlobStore>,
     metadata_store: Arc<MetadataStore>,
+    job_store: Arc<JobStore>,
 }
 
 impl Executor {
+    /// Starts building an executor from individual resolved fields.
+    #[must_use]
+    pub fn builder() -> ExecutorBuilder {
+        ExecutorBuilder::default()
+    }
+
+    /// Test-only constructor that synthesizes a `JobStore` so the build cannot fail.
+    #[cfg(test)]
+    #[must_use]
     pub fn new(blob_store: Arc<blob_store::BlobStore>, metadata_store: Arc<MetadataStore>) -> Self {
-        Self {
+        let job_store = Arc::new(JobStore::new(metadata_store.store_arc(), "scrub-test"));
+        Self::builder()
+            .blob_store(blob_store)
+            .metadata_store(metadata_store)
+            .job_store(job_store)
+            .build()
+            .expect("blob_store, metadata_store and job_store provided")
+    }
+
+    /// Lands the envelope on the durable replication queue. A reconcile push
+    /// shares the event path's `lock_key` (so it coalesces with a pending
+    /// event-path push); a prune delete keys on the bare reference, so repeated
+    /// runs coalesce and never merge with a timestamped event-path delete.
+    async fn enqueue_replication(
+        &self,
+        envelope: Result<JobEnvelope, serde_json::Error>,
+    ) -> Result<(), Error> {
+        let envelope = envelope.map_err(|e| {
+            record_reconcile_outcome("failed");
+            Error::Replication(format!("failed to build replication envelope: {e}"))
+        })?;
+        self.job_store.enqueue(envelope).await.map_err(|e| {
+            record_reconcile_outcome("failed");
+            Error::Replication(format!("failed to enqueue replication job: {e}"))
+        })?;
+        record_reconcile_outcome("enqueued");
+        Ok(())
+    }
+}
+
+/// Records a `replication_reconcile_total` outcome (`enqueued`, `failed`, or
+/// `skipped`).
+pub fn record_reconcile_outcome(outcome: &str) {
+    metrics_provider()
+        .replication_reconcile_total
+        .with_label_values(&[outcome])
+        .inc();
+}
+
+/// Builder for [`Executor`]; all three fields are required.
+#[allow(clippy::struct_field_names)]
+#[derive(Default)]
+pub struct ExecutorBuilder {
+    blob_store: Option<Arc<blob_store::BlobStore>>,
+    metadata_store: Option<Arc<MetadataStore>>,
+    job_store: Option<Arc<JobStore>>,
+}
+
+impl ExecutorBuilder {
+    /// Blob store the executor reads/deletes blobs through (required).
+    #[must_use]
+    pub fn blob_store(mut self, blob_store: Arc<blob_store::BlobStore>) -> Self {
+        self.blob_store = Some(blob_store);
+        self
+    }
+
+    /// Metadata store the executor mutates links through (required).
+    #[must_use]
+    pub fn metadata_store(mut self, metadata_store: Arc<MetadataStore>) -> Self {
+        self.metadata_store = Some(metadata_store);
+        self
+    }
+
+    /// Producer queue replication enqueue actions are landed on (required).
+    #[must_use]
+    pub fn job_store(mut self, job_store: Arc<JobStore>) -> Self {
+        self.job_store = Some(job_store);
+        self
+    }
+
+    /// Builds the [`Executor`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Initialization`] when a required field is missing.
+    pub fn build(self) -> Result<Executor, Error> {
+        let blob_store = self.blob_store.ok_or_else(|| {
+            Error::Initialization("executor builder requires a blob_store".into())
+        })?;
+        let metadata_store = self.metadata_store.ok_or_else(|| {
+            Error::Initialization("executor builder requires a metadata_store".into())
+        })?;
+        let job_store = self
+            .job_store
+            .ok_or_else(|| Error::Initialization("executor builder requires a job_store".into()))?;
+
+        Ok(Executor {
             blob_store,
             metadata_store,
-        }
+            job_store,
+        })
     }
 }
 
@@ -91,6 +198,41 @@ impl ActionSink for Executor {
                 self.metadata_store
                     .update_blob_index(&namespace, &blob, BlobIndexOperation::Remove(link))
                     .await?;
+            }
+            Action::RemoveOrphanBlobGrant { namespace, blob } => {
+                // Hold the `blob-data:{digest}` coarse lock across the re-check
+                // and the revoke, the same one manifest pushes and upload
+                // completions take, so a reference a concurrent push is granting
+                // is never missed and reclaimed underneath it.
+                let session = self.metadata_store.acquire_blob_data_lock(&blob).await?;
+                let result = async {
+                    // Re-check under the lock: a manifest reference may have
+                    // appeared since the checker classified the grant as orphaned.
+                    let links = match self
+                        .metadata_store
+                        .read_blob_index_namespace(&namespace, &blob)
+                        .await
+                    {
+                        Ok(links) => links,
+                        // The grant vanished since classification (a concurrent
+                        // revoke or delete): nothing left to do.
+                        Err(MetadataError::ReferenceNotFound) => return Ok(()),
+                        Err(e) => return Err(Error::from(e)),
+                    };
+                    if links.iter().any(LinkKind::is_tracked) {
+                        info!(
+                            "skipping orphan grant revoke: a manifest reference appeared for '{namespace}/{blob}'"
+                        );
+                        return Ok(());
+                    }
+                    self.metadata_store
+                        .revoke_blob_ownership(&namespace, &blob)
+                        .await
+                        .map_err(Error::from)
+                }
+                .await;
+                session.release().await;
+                result?;
             }
             Action::RecreateLink {
                 namespace,
@@ -190,6 +332,69 @@ impl ActionSink for Executor {
                     })
                     .await?;
             }
+            Action::EnqueueReplicationPush {
+                downstream,
+                namespace,
+                tag,
+                digest,
+            } => {
+                let payload = ReplicationPushPayload {
+                    downstream,
+                    namespace,
+                    tag: Some(tag),
+                    digest: Some(digest.to_string()),
+                    kind: REPLICATION_PUSH_MANIFEST_KIND.to_string(),
+                    // The handler stamps source_ts from the tag's created_at at
+                    // execute time, so the push carries the same last-writer-wins
+                    // version as the event path.
+                    source_ts: None,
+                };
+                self.enqueue_replication(build_envelope(&payload)).await?;
+            }
+            Action::EnqueueReplicationDelete {
+                downstream,
+                namespace,
+                tag,
+            } => {
+                // Stamp `source_ts` with the prune decision time so the receiver
+                // runs last-writer-wins and preserves a downstream tag dated after
+                // this decision (clock skew, or a push racing the listing). That
+                // does NOT make prune active-active safe: a peer's newer tag
+                // created before this run is still deleted, so `prune = true` is
+                // one-way-mirror-only.
+                let payload = ReplicationPushPayload {
+                    downstream,
+                    namespace,
+                    tag: Some(tag),
+                    digest: None,
+                    kind: REPLICATION_DELETE_MANIFEST_KIND.to_string(),
+                    source_ts: Some(Utc::now().to_rfc3339()),
+                };
+                // The prune envelope keys on the bare reference so repeated runs
+                // coalesce instead of stacking one fresh-ts job per run.
+                self.enqueue_replication(build_prune_delete_envelope(&payload))
+                    .await?;
+            }
+            Action::DeleteOrphanJob {
+                queue,
+                state,
+                storage_key,
+                ..
+            } => {
+                match self.job_store.delete_job(queue, state, &storage_key).await {
+                    Ok(()) => {}
+                    // A stale key means the job was claimed-and-completed or
+                    // deleted concurrently; either way the orphan is gone.
+                    Err(JobStoreError::NotFound) => {
+                        debug!("{queue} job '{storage_key}' already gone; nothing to delete");
+                    }
+                    Err(e) => {
+                        return Err(Error::JobQueue(format!(
+                            "failed to delete {queue} job '{storage_key}': {e}"
+                        )));
+                    }
+                }
+            }
         }
 
         Ok(())
@@ -212,14 +417,32 @@ impl ActionSink for Vec<Action> {
 mod tests {
     use std::str::FromStr;
 
+    use chrono::DateTime;
+
+    use angos_storage::MemoryObjectStore;
+
     use super::*;
     use crate::{
         oci::Digest,
         registry::{
+            cache_job_handler::{CACHE_FETCH_BLOB_KIND, CACHE_QUEUE, CacheFetchBlobPayload},
+            job_store::{FailOutcome, JobState},
             metadata_store::{LinkOperation, link_kind::LinkKind},
-            test_utils::{backends, put_blob_direct},
+            test_utils::{backends, build_store, locked_executor_over, put_blob_direct},
         },
+        replication::{REPLICATION_DELETE_MANIFEST_KIND, REPLICATION_QUEUE},
     };
+
+    /// A producer `JobStore` over a private store no worker drains. Tests that
+    /// assert queue depth must not share the registry store, whose in-process
+    /// claim loops would otherwise claim the job and race the assertion.
+    fn standalone_job_store(worker_id: &str) -> Arc<JobStore> {
+        let raw = Arc::new(MemoryObjectStore::new());
+        Arc::new(JobStore::new(
+            build_store(raw.clone(), locked_executor_over(raw)),
+            worker_id,
+        ))
+    }
 
     #[tokio::test]
     async fn executor_dry_run_does_not_delete_blob() {
@@ -541,6 +764,248 @@ mod tests {
                     .is_err(),
                 "layer link must be removed when referenced_by becomes empty"
             );
+            test_case.cleanup().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn enqueue_replication_delete_stamps_source_ts_for_receiver_lww() {
+        for test_case in backends() {
+            let blob_store = test_case.blob_store();
+            let metadata_store = test_case.metadata_store();
+
+            let job_store = standalone_job_store("scrub-source-ts");
+
+            let mut executor = Executor::builder()
+                .blob_store(blob_store)
+                .metadata_store(metadata_store)
+                .job_store(job_store.clone())
+                .build()
+                .unwrap();
+
+            executor
+                .apply(Action::EnqueueReplicationDelete {
+                    downstream: "mirror".to_string(),
+                    namespace: "ns/app".to_string(),
+                    tag: "stray".to_string(),
+                })
+                .await
+                .unwrap();
+
+            let claimed = job_store
+                .claim_one(REPLICATION_QUEUE)
+                .await
+                .unwrap()
+                .claimed
+                .expect("a delete job must be enqueued");
+
+            assert_eq!(claimed.envelope.kind, REPLICATION_DELETE_MANIFEST_KIND);
+            let source_ts = claimed.envelope.payload.get("source_ts").cloned();
+            let source_ts = source_ts
+                .as_ref()
+                .and_then(serde_json::Value::as_str)
+                .expect("prune delete payload must carry a source_ts (not None)");
+            assert!(
+                DateTime::parse_from_rfc3339(source_ts).is_ok(),
+                "source_ts must be a valid RFC 3339 timestamp; got {source_ts}"
+            );
+
+            test_case.cleanup().await;
+        }
+    }
+
+    /// Each apply stamps a fresh decision-time `source_ts`, so this pins that
+    /// the prune `lock_key` excludes it: a second run against a still-failing
+    /// downstream must coalesce, not stack a second job per tag.
+    #[tokio::test]
+    async fn prune_delete_enqueues_coalesce_while_one_is_pending() {
+        for test_case in backends() {
+            let blob_store = test_case.blob_store();
+            let metadata_store = test_case.metadata_store();
+
+            let job_store = standalone_job_store("scrub-prune-coalesce");
+
+            let mut executor = Executor::builder()
+                .blob_store(blob_store)
+                .metadata_store(metadata_store)
+                .job_store(job_store.clone())
+                .build()
+                .unwrap();
+
+            for _ in 0..2 {
+                executor
+                    .apply(Action::EnqueueReplicationDelete {
+                        downstream: "mirror".to_string(),
+                        namespace: "ns/app".to_string(),
+                        tag: "stray".to_string(),
+                    })
+                    .await
+                    .unwrap();
+            }
+
+            assert_eq!(
+                job_store.count_pending(REPLICATION_QUEUE, 0).await.unwrap(),
+                1,
+                "two prune-delete enqueues for the same (downstream, namespace, tag) \
+                 must coalesce into a single pending job"
+            );
+
+            test_case.cleanup().await;
+        }
+    }
+
+    /// Builds an orphan-shaped replication push envelope.
+    fn orphan_push_envelope() -> JobEnvelope {
+        let payload = ReplicationPushPayload {
+            downstream: "removed".to_string(),
+            namespace: "ns/app".to_string(),
+            tag: Some("v1".to_string()),
+            digest: None,
+            kind: REPLICATION_PUSH_MANIFEST_KIND.to_string(),
+            source_ts: None,
+        };
+        build_envelope(&payload).unwrap()
+    }
+
+    /// Builds an orphan-shaped pull-through cache-fill envelope.
+    fn orphan_cache_envelope() -> JobEnvelope {
+        let payload = CacheFetchBlobPayload {
+            namespace: "ns/app".to_string(),
+            digest: "sha256:1111111111111111111111111111111111111111111111111111111111111111"
+                .to_string(),
+        };
+        JobEnvelope::new(CACHE_QUEUE, CACHE_FETCH_BLOB_KIND, "cache.ns/app", &payload).unwrap()
+    }
+
+    fn delete_orphan_action(queue: &'static str, state: JobState, storage_key: String) -> Action {
+        Action::DeleteOrphanJob {
+            queue,
+            state,
+            storage_key,
+            reason: "configuration no longer resolves this job".to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn executor_delete_orphan_job_removes_pending_jobs_on_both_queues() {
+        for test_case in backends() {
+            let blob_store = test_case.blob_store();
+            let metadata_store = test_case.metadata_store();
+            let job_store = standalone_job_store("scrub-orphan");
+
+            let mut executor = Executor::builder()
+                .blob_store(blob_store)
+                .metadata_store(metadata_store)
+                .job_store(job_store.clone())
+                .build()
+                .unwrap();
+
+            for (queue, envelope) in [
+                (REPLICATION_QUEUE, orphan_push_envelope()),
+                (CACHE_QUEUE, orphan_cache_envelope()),
+            ] {
+                job_store.enqueue(envelope).await.unwrap();
+                let keys = job_store.list_pending(queue, 10).await.unwrap();
+                assert_eq!(keys.len(), 1);
+
+                executor
+                    .apply(delete_orphan_action(
+                        queue,
+                        JobState::Pending,
+                        keys[0].clone(),
+                    ))
+                    .await
+                    .unwrap();
+
+                assert_eq!(
+                    job_store.count_pending(queue, 0).await.unwrap(),
+                    0,
+                    "the pending orphan job on '{queue}' must be deleted"
+                );
+            }
+            test_case.cleanup().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn executor_delete_orphan_job_removes_failed_jobs_on_both_queues() {
+        for test_case in backends() {
+            let blob_store = test_case.blob_store();
+            let metadata_store = test_case.metadata_store();
+            let job_store = standalone_job_store("scrub-orphan");
+
+            let mut executor = Executor::builder()
+                .blob_store(blob_store)
+                .metadata_store(metadata_store)
+                .job_store(job_store.clone())
+                .build()
+                .unwrap();
+
+            for (queue, mut envelope) in [
+                (REPLICATION_QUEUE, orphan_push_envelope()),
+                (CACHE_QUEUE, orphan_cache_envelope()),
+            ] {
+                // A single-attempt job failed once dead-letters under its
+                // original key.
+                envelope.max_attempts = 1;
+                job_store.enqueue(envelope).await.unwrap();
+                let claimed = job_store
+                    .claim_one(queue)
+                    .await
+                    .unwrap()
+                    .claimed
+                    .expect("the job must be claimable");
+                let outcome = job_store.fail(claimed, "simulated failure").await.unwrap();
+                assert!(matches!(outcome, FailOutcome::MovedToDeadLetter));
+
+                let (failed_keys, _) = job_store.list_failed_page(queue, 10, None).await.unwrap();
+                assert_eq!(failed_keys.len(), 1);
+
+                executor
+                    .apply(delete_orphan_action(
+                        queue,
+                        JobState::Failed,
+                        failed_keys[0].clone(),
+                    ))
+                    .await
+                    .unwrap();
+
+                let (failed_keys, _) = job_store.list_failed_page(queue, 10, None).await.unwrap();
+                assert!(
+                    failed_keys.is_empty(),
+                    "the dead-lettered orphan job on '{queue}' must be deleted"
+                );
+            }
+            test_case.cleanup().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn executor_delete_orphan_job_tolerates_stale_key() {
+        for test_case in backends() {
+            let blob_store = test_case.blob_store();
+            let metadata_store = test_case.metadata_store();
+            let job_store = standalone_job_store("scrub-orphan");
+
+            let mut executor = Executor::builder()
+                .blob_store(blob_store)
+                .metadata_store(metadata_store)
+                .job_store(job_store)
+                .build()
+                .unwrap();
+
+            for queue in [REPLICATION_QUEUE, CACHE_QUEUE] {
+                for state in [JobState::Pending, JobState::Failed] {
+                    executor
+                        .apply(delete_orphan_action(
+                            queue,
+                            state,
+                            "0000000000000000-already-gone".to_string(),
+                        ))
+                        .await
+                        .expect("a stale storage_key must be tolerated, not an error");
+                }
+            }
             test_case.cleanup().await;
         }
     }

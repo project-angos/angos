@@ -222,8 +222,10 @@ impl LockedExecutor {
                     }
                 }
                 Err(StorageError::NotFound) => {
-                    // Key is gone; any non-empty expected hash mismatches.
-                    return Err(Error::Conflict);
+                    // An absent key matches only a read that recorded absence.
+                    if !read.expects_absent() {
+                        return Err(Error::Conflict);
+                    }
                 }
                 Err(e) => return Err(Error::Storage(e)),
             }
@@ -419,6 +421,51 @@ mod tests {
         assert!(
             matches!(result, Err(Error::Conflict)),
             "absent key should return Conflict, got: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_recording_absence_commits_when_key_is_absent() {
+        let executor = make_executor(Arc::new(MemoryObjectStore::new()));
+
+        let tx = Transaction::builder()
+            .read("no-such-key", Bytes::new())
+            .mutation(Mutation::Put {
+                key: "out".to_string(),
+                body: Bytes::from("x"),
+                expected: None,
+            })
+            .build();
+
+        let result: Result<Outcome, Error> = executor.execute(tx).await;
+        assert!(
+            result.is_ok(),
+            "an empty-body read records absence and must match a missing key: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_recording_absence_conflicts_when_key_appeared() {
+        let store = MemoryObjectStore::new();
+        store
+            .put("k", Bytes::from_static(b"created"))
+            .await
+            .unwrap();
+        let executor = make_executor(Arc::new(store));
+
+        let tx = Transaction::builder()
+            .read("k", Bytes::new())
+            .mutation(Mutation::Put {
+                key: "out".to_string(),
+                body: Bytes::from("x"),
+                expected: None,
+            })
+            .build();
+
+        let result: Result<Outcome, Error> = executor.execute(tx).await;
+        assert!(
+            matches!(result, Err(Error::Conflict)),
+            "a key written since the absence was recorded must conflict, got: {result:?}"
         );
     }
 

@@ -32,6 +32,9 @@ Step-by-step instructions for specific tasks:
 ### Events
 - [Configure Event Webhooks](how-to/configure-event-webhooks.md)
 
+### Replication
+- [Configure Replication](how-to/configure-replication.md)
+
 ### Operations
 - [Run Storage Maintenance](how-to/run-storage-maintenance.md)
 - [Enable the Web UI](how-to/enable-web-ui.md)
@@ -58,6 +61,7 @@ Conceptual explanations and architecture:
 - [Storage Backends](explanation/storage-backends.md) - S3 and filesystem storage options
 - [Authentication and Authorization](explanation/authentication-authorization.md) - Security model
 - [Pull-Through Caching](explanation/pull-through-caching.md) - How caching works
+- [Bi-Directional Replication](explanation/replication.md) - How content mirrors to downstream registries
 - [Security Model](explanation/security-model.md) - Trust boundaries and best practices
 
 ## Key Features

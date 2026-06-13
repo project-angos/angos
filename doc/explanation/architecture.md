@@ -81,6 +81,16 @@ Proxies requests to upstream registries:
 - Immutable tag optimization
 - Fallback to multiple upstreams
 
+### Replication
+
+Mirrors local mutations *out* to downstream registries (the outbound counterpart of the pull-through cache):
+- Per-repository downstream lists, event-driven on manifest push/delete
+- Rides the durable job queue for retry, coalescing, and restart survival
+- Loop prevention via receiver-side no-op suppression; last-writer-wins tag conflict resolution
+- On-demand reconciliation via `angos scrub --replicate`
+
+See [Bi-Directional Replication](replication.md) for the full model.
+
 ### Storage Layer
 
 Abstracted storage backends:
@@ -124,7 +134,7 @@ This can be disabled per object kind with `enable_blob_redirect = false` and/or 
 
 **When redirects are enabled** (both flags default to `true`):
 - Clients must have direct network access to the S3 endpoint
-- Pre-signed URLs expire — very slow downloads may fail
+- Pre-signed URLs expire, so very slow downloads may fail
 - S3 bucket policies must allow access from client IP ranges
 
 ---
@@ -210,7 +220,7 @@ Multiple security layers:
 ### Fail-Closed Authorization
 
 - Webhooks fail-closed on timeout/error
-- CEL policy errors skip the rule (logged)
+- CEL policy evaluation errors and non-boolean results deny the request
 - No authentication = no identity
 
 ### No Unsafe Code

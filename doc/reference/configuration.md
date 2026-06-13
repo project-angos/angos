@@ -52,9 +52,10 @@ When omitted, the server runs without TLS (insecure).
 |-----------------------------|----------|----------|---------------------------------------------|
 | `max_concurrent_requests`   | usize    | `64`     | Tokio worker threads (see Performance Tuning) |
 | `max_concurrent_cache_jobs` | usize    | `4`      | Maximum concurrent cache jobs (minimum `1`). With `[global.job_queue]` enabled, also bounds the number of jobs each `angos worker` processes in parallel. |
+| `max_concurrent_replication_jobs` | non-zero usize | `4` | Concurrency for replication jobs (minimum `1`). Bounds how many replication pushes are handled in parallel by each `angos worker`, the server's in-process drain, and the `scrub --replicate` end-of-run drain. |
 | `max_manifest_size`         | string   | `"5MiB"` | Maximum manifest body size accepted from clients or upstream registries |
 | `update_pull_time`          | bool     | `false`  | Track pull times for retention policies     |
-| `enable_redirect`           | bool     | —        | **Deprecated.** Fallback for both fields below when unset. |
+| `enable_redirect`           | bool     | -        | **Deprecated.** Fallback for both fields below when unset. |
 | `enable_blob_redirect`      | bool     | `true`   | Allow HTTP 307 redirects for blob downloads. |
 | `enable_manifest_redirect`  | bool     | `true`   | Allow HTTP 307 redirects for manifest downloads. Manifest bodies served via `response-content-type` to preserve the media type across redirects. |
 | `immutable_tags`            | bool     | `false`  | Global immutable tags default               |
@@ -66,26 +67,34 @@ When omitted, the server runs without TLS (insecure).
 
 ### Durable Job Queue (`global.job_queue`)
 
-Optional. When present, pull-through cache-fill tasks are written to persistent
-storage instead of running in-process. `angos server` enqueues jobs on cache
-miss and publishes the queue-depth gauge on `/metrics`; one or more
-`angos worker` processes must be running to actually drain the queue. When the
-section is absent, jobs run in-process over an in-memory store (not durable
-across restarts).
+Optional. Controls where the job queue is drained. When absent (default),
+`angos server` drains the queue itself in-process. When present, `angos server`
+enqueues jobs and publishes the queue-depth gauge on `/metrics`, and one or
+more `angos worker` processes drain it. Either way, jobs persist under the
+`[metadata_store]` backend's `_jobs/` prefix and survive restarts.
 
 The queue does not have its own storage backend. Durable jobs are written to
 the **same backend configured for `[metadata_store]`** (filesystem or S3,
 whichever metadata uses), under a hardcoded top-level `_jobs/` prefix; the lock
 strategy is likewise inherited from `[metadata_store]`. There is therefore no
-job-queue-level backend, credential, prefix, or lock-strategy setting — the
+job-queue-level backend, credential, prefix, or lock-strategy setting: the
 section accepts only the two tunables below.
+
+> **A shared lock strategy is required.** The durable queue is drained by
+> separate processes, so the per-job execution lock must be shared across them.
+> The default in-process `memory` lock cannot coordinate across processes, so
+> `[global.job_queue]` combined with a `memory` lock strategy is **rejected at
+> startup**. Configure the metadata store with `[metadata_store.s3.lock_strategy.s3]`
+> (S3 CAS) or `[metadata_store.s3.lock_strategy.redis]` / `[metadata_store.fs.lock_strategy.redis]`
+> (Redis), or omit `[global.job_queue]` to use
+> the single-process in-process queue.
 
 | Option | Type | Default | Description |
 |---|---|---|---|
 | `pending_refresh_interval_secs` | u64 | `15` | How often the server refreshes the `angos_job_queue_pending` gauge. Must be at least `5` (sub-5s ticks induce LIST storms on S3). |
 | `pending_ready_horizon_secs` | u64 | `600` | Readiness horizon for the `angos_job_queue_pending` gauge. Only envelopes whose `not_before` falls within `[..., now + horizon]` are counted. Set comfortably larger than your worker pod startup time so KEDA has lead time to scale up before the work becomes claimable. |
 
-> **Per-`lock_key` execution TTL is governed by the lock backend.** A worker that claims a job holds the lock configured under `[metadata_store]` for the duration of execution; the TTL on the lock object (`[metadata_store.fs.lock_strategy.redis].ttl`, `[metadata_store.s3.lock_strategy.s3].ttl_secs`) is what bounds how long another worker has to wait if the holder dies mid-job. Transient heartbeat failures (connect or refresh errors) tolerate a small budget — roughly one TTL of slack — before cancelling the job, so a brief network blip does not waste in-progress work; authoritative signals (ownership loss, max-hold expiry, missing lock object) cancel immediately.
+> **Per-`lock_key` execution TTL is governed by the lock backend.** A worker that claims a job holds the lock configured under `[metadata_store]` for the duration of execution; the TTL on the lock object (`[metadata_store.fs.lock_strategy.redis].ttl`, `[metadata_store.s3.lock_strategy.s3].ttl_secs`) is what bounds how long another worker has to wait if the holder dies mid-job. Transient heartbeat failures (connect or refresh errors) tolerate a small budget (roughly one TTL of slack) before cancelling the job, so a brief network blip does not waste in-progress work; authoritative signals (ownership loss, max-hold expiry, missing lock object) cancel immediately.
 
 See [Enable Durable Cache Jobs](../how-to/durable-cache-jobs.md) for a full
 setup guide including `angos worker` invocation and KEDA autoscaling.
@@ -154,7 +163,7 @@ The registry supports two modes for uploading blobs to S3, controlled by `multip
 
 **Non-uniform mode (default, `multipart_uniform_parts = false`)**
 
-Each OCI `PATCH` request streams directly into a long-lived S3 multipart upload as an `UploadPart` with known `Content-Length`. Parts are uploaded directly — no intermediate objects or assembly phase. When the client completes the upload with a `PUT` request, the multipart upload is finalized and the blob is copied to its content-addressed path. This mode works with most S3-compatible providers.
+Each OCI `PATCH` request streams directly into a long-lived S3 multipart upload as an `UploadPart` with known `Content-Length`. Parts are uploaded directly, with no intermediate objects or assembly phase. When the client completes the upload with a `PUT` request, the multipart upload is finalized and the blob is copied to its content-addressed path. This mode works with most S3-compatible providers.
 
 Memory usage per upload: ~8 KiB during each `PATCH` (a single streaming read frame). No data is buffered in memory beyond the current frame.
 
@@ -252,7 +261,7 @@ delete_if_match = false
 **Example with auto-probe:**
 ```toml
 [metadata_store.s3]
-# No capabilities field — probe runs at startup to detect provider support
+# No capabilities field: probe runs at startup to detect provider support
 ```
 
 **Performance impact:**
@@ -278,14 +287,14 @@ Multi-replica deployments require a distributed lock backend. The `lock_strategy
 
 > **Note:** `lock_strategy = "s3"` selects the CAS-based coordinator and requires the provider to support `put_if_none_match` and `put_if_match`; startup fails fast if either is missing. `lock_strategy = "memory"` and `"redis"` select the lock coordinator, but Angos still uses conditional writes for blob-index shard updates when available.
 
-**Memory** (default) — in-process locks, suitable for single-instance deployments only:
+**Memory** (default) uses in-process locks, suitable for single-instance deployments only:
 
 ```toml
 [metadata_store.s3]
 lock_strategy = "memory"
 ```
 
-**S3** — uses S3 conditional writes (`If-None-Match: *`) for distributed locking without extra infrastructure. The S3 provider must support `put_if_none_match` and `put_if_match`; angos verifies this at startup and fails fast if either is missing. `delete_if_match` is optional — when absent, lock release falls back to plain delete (functional but race-prone under contention):
+**S3** uses S3 conditional writes (`If-None-Match: *`) for distributed locking without extra infrastructure. The S3 provider must support `put_if_none_match` and `put_if_match`; angos verifies this at startup and fails fast if either is missing. `delete_if_match` is optional: when absent, lock release falls back to plain delete (functional but race-prone under contention):
 
 ```toml
 # With defaults (empty table body; all fields use defaults)
@@ -316,7 +325,7 @@ retry_delay_ms = 50
 
 The S3 lock implementation uses a heartbeat to keep locks alive. Once acquired, a background task automatically renews the lock at regular intervals of `ttl_secs / 3`. For example, with the default `ttl_secs = 30`, the heartbeat runs every 10 seconds. This allows the lock to remain valid beyond the initial TTL as long as the lock-holder remains alive. If a lock-holder crashes, other instances must wait for the full `ttl_secs` duration before the lock becomes available for recovery.
 
-Transient heartbeat failures (connect errors, refresh timeouts, network blips) accumulate up to a small budget — roughly one TTL of slack — before cancelling the in-flight operation. Authoritative signals cancel immediately: S3 reports `ownership_lost`, `etag_unavailable`, `file_disappeared`, or `max_hold_exceeded`; Redis reports `ownership_lost` (refresh script detected the key was overwritten). When the budget is exhausted, the heartbeat emits `heartbeat_failure` for both backends to flag the cancellation as transient-failure-driven rather than authoritative.
+Transient heartbeat failures (connect errors, refresh timeouts, network blips) accumulate up to a small budget (roughly one TTL of slack) before cancelling the in-flight operation. Authoritative signals cancel immediately: S3 reports `ownership_lost`, `etag_unavailable`, `file_disappeared`, or `max_hold_exceeded`; Redis reports `ownership_lost` (refresh script detected the key was overwritten). When the budget is exhausted, the heartbeat emits `heartbeat_failure` for both backends to flag the cancellation as transient-failure-driven rather than authoritative.
 
 Locks are released as part of the operation flow: a successful operation releases its lock before returning. If the surrounding request or task is cancelled mid-operation, a best-effort background release fires on the current Tokio runtime so the remote lock is freed promptly without waiting on TTL. The fallback applies only when a runtime is still available; during process shutdown the lock expires via `ttl_secs`.
 
@@ -324,7 +333,7 @@ Locks are released as part of the operation flow: a successful operation release
 
 > **Clock synchronisation:** The lock implementation uses S3's server-side timestamps for expiry checks, so lock correctness does not depend on synchronised instance clocks. Registry instances should still maintain synchronised clocks (NTP) for logging and other operational reasons.
 
-**Redis** — distributed locking via Redis, suitable for multi-instance deployments:
+**Redis** provides distributed locking via Redis, suitable for multi-instance deployments:
 
 ```toml
 [metadata_store.s3.lock_strategy.redis]
@@ -426,6 +435,32 @@ Array of upstream registries for pull-through cache.
 | `client_private_key` | string | -        | Client key for mTLS               |
 | `username`           | string | -        | Basic auth username               |
 | `password`           | string | -        | Basic auth password               |
+
+### Downstream (`repository."<namespace>".downstream`)
+
+Array of downstream registries to which this repository's mutations are replicated. See [Configure Replication](../how-to/configure-replication.md).
+
+| Option                  | Type     | Default            | Description                                                              |
+|-------------------------|----------|--------------------|--------------------------------------------------------------------------|
+| `name`                  | string   | required           | Local identifier for this downstream (logs, `downstream` metric label)   |
+| `url`                   | string   | required           | Downstream registry base URL                                             |
+| `mode`                  | string   | `"event+reconcile"` | `"event+reconcile"`, `"event-only"`, or `"reconcile-only"`              |
+| `namespace_filter`      | [string] | `[]` (all)         | Regex patterns; a namespace replicates here only if it matches one       |
+| `max_concurrent_pushes` | usize    | `4`                | Concurrent blob pushes per manifest for this downstream (positive integer, >= 1) |
+| `prune`                 | bool     | `false`            | When `true`, reconciliation also deletes downstream-only tags (authoritative one-way mirror; unsafe for active-active peers) |
+| `max_redirect`          | u8       | `5`                | Maximum redirects to follow                                              |
+| `username`              | string   | -                  | Basic auth username                                                      |
+| `password`              | string   | -                  | Basic auth password                                                      |
+| `server_ca_bundle`      | string   | -                  | CA bundle for downstream TLS verification                               |
+| `client_certificate`    | string   | -                  | Client certificate for mTLS (requires `client_private_key`)             |
+| `client_private_key`    | string   | -                  | Client key for mTLS (requires `client_certificate`)                     |
+
+`mode` values:
+- `event+reconcile` (default): push on every local mutation **and** include in `angos scrub --replicate`.
+- `event-only`: push on local mutations; excluded from scrub reconciliation.
+- `reconcile-only`: excluded from live pushes; mirrored only via `angos scrub --replicate`.
+
+If either `client_certificate` or `client_private_key` is set, both must be set.
 
 ### Access Policy (`repository."<namespace>".access_policy`)
 

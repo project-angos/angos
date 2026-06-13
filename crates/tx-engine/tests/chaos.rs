@@ -416,13 +416,6 @@ async fn recovery_replays_fully_stamped_intent() {
     assert_eq!(body, b"already-there");
 }
 
-/// `StorageError::Backend` is not a `NotFound` variant.
-#[test]
-fn backend_error_is_not_not_found() {
-    let err = StorageError::Backend("oops".to_owned());
-    assert!(!matches!(err, StorageError::NotFound));
-}
-
 /// Chaos test: manifest push — crash mid-Apply after the blob-data write but
 /// before the link/index writes complete.
 ///

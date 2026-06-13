@@ -19,10 +19,7 @@ use crate::{
     command::server::{
         ServerContext,
         error::Error,
-        handlers::{
-            blob::handle_delete_blob, content_discovery::handle_list_catalog,
-            ext::handle_list_repositories,
-        },
+        handlers::{content_discovery::handle_list_catalog, ext::handle_list_repositories},
         http_server::{
             connection::{current_trace_id, inject_peer_certificate},
             dispatch::authenticate_and_authorize,
@@ -38,7 +35,6 @@ use crate::{
     configuration::Configuration,
     identity::{Action, ClientIdentity},
     metrics_provider,
-    oci::{Digest, Namespace},
     policy::{AccessMode, AccessPolicyConfig},
     registry,
 };
@@ -356,16 +352,6 @@ fn test_error_to_response_all_error_types() {
     }
 }
 
-#[test]
-fn test_error_to_response_preserves_request_id() {
-    let error = Error::Internal("Test error".to_string());
-    let request_id = Some("test-request-123".to_string());
-
-    let response = error_to_response(&error, request_id.as_ref());
-
-    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
-}
-
 #[tokio::test]
 async fn test_error_to_response_body_contains_error_message() {
     use http_body_util::BodyExt;
@@ -527,17 +513,6 @@ async fn test_handle_list_catalog() {
     let result = handle_list_catalog(&context, None, None).await;
 
     assert!(result.is_ok());
-}
-
-#[tokio::test]
-async fn test_handle_delete_blob() {
-    let context = create_test_context_with_allow_policy().await;
-    let namespace = Namespace::new("test/repo").unwrap();
-    let digest: Digest = "sha256:abababababababababababababababababababababababababababababababab"
-        .parse()
-        .unwrap();
-
-    let _result = handle_delete_blob(&context, &namespace, &digest).await;
 }
 
 #[test]

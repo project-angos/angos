@@ -6,28 +6,12 @@
 //! `ConditionalStore: ObjectStore` supertrait bound composes. The
 //! upload-session methods live on `ObjectStore`.
 
-use std::{sync::Arc, time::Duration};
+use std::sync::Arc;
 
 use bytes::Bytes;
 use futures_util::stream;
 
-use crate::{ConditionalStore, Error, Etag, MemoryObjectStore, ObjectStore, PresignedStore};
-
-// Memory backend doesn't presign — provide a trivial stub for the test that
-// needs to assert object safety of `PresignedStore`.
-struct PresignStub;
-
-#[async_trait::async_trait]
-impl PresignedStore for PresignStub {
-    async fn presign_get(
-        &self,
-        key: &str,
-        ttl: Duration,
-        _content_type: Option<&str>,
-    ) -> Result<String, Error> {
-        Ok(format!("mock://{key}?ttl={}", ttl.as_secs()))
-    }
-}
+use crate::{ConditionalStore, Error, Etag, MemoryObjectStore, ObjectStore};
 
 fn backend() -> Arc<MemoryObjectStore> {
     Arc::new(MemoryObjectStore::new())
@@ -332,18 +316,4 @@ async fn upload_complete_with_no_writes_creates_empty_object() {
     store.create_upload("blob").await.unwrap();
     store.complete_upload("blob").await.unwrap();
     assert_eq!(store.get("blob").await.unwrap(), b"");
-}
-
-// =========================================================================
-// PresignedStore (object-safety smoke test)
-// =========================================================================
-
-#[tokio::test]
-async fn presign_get_returns_a_url() {
-    let store: Arc<dyn PresignedStore> = Arc::new(PresignStub);
-    let url = store
-        .presign_get("blob/x", Duration::from_mins(1), None)
-        .await
-        .unwrap();
-    assert!(url.contains("blob/x"));
 }

@@ -61,10 +61,11 @@ pub async fn handle_list_uploads(
 
 pub async fn handle_list_jobs(
     context: &ServerContext,
+    queue: &str,
     n: Option<u16>,
     after: Option<String>,
 ) -> Result<Response<ResponseBody>, Error> {
-    let response = context.registry.get_jobs_info(n, after).await?;
+    let response = context.registry.get_jobs_info(queue, n, after).await?;
 
     build_response(
         StatusCode::OK,
@@ -75,10 +76,14 @@ pub async fn handle_list_jobs(
 
 pub async fn handle_list_failed_jobs(
     context: &ServerContext,
+    queue: &str,
     n: Option<u16>,
     after: Option<String>,
 ) -> Result<Response<ResponseBody>, Error> {
-    let response = context.registry.get_failed_jobs_info(n, after).await?;
+    let response = context
+        .registry
+        .get_failed_jobs_info(queue, n, after)
+        .await?;
 
     build_response(
         StatusCode::OK,
@@ -89,9 +94,13 @@ pub async fn handle_list_failed_jobs(
 
 pub async fn handle_retry_job(
     context: &ServerContext,
+    queue: &str,
     storage_key: &str,
 ) -> Result<Response<ResponseBody>, Error> {
-    context.registry.retry_failed_job(storage_key).await?;
+    context
+        .registry
+        .retry_failed_job(queue, storage_key)
+        .await?;
 
     Ok(Response::builder()
         .status(StatusCode::NO_CONTENT)
@@ -100,10 +109,14 @@ pub async fn handle_retry_job(
 
 pub async fn handle_delete_job(
     context: &ServerContext,
+    queue: &str,
     state: JobState,
     storage_key: &str,
 ) -> Result<Response<ResponseBody>, Error> {
-    context.registry.delete_job(state, storage_key).await?;
+    context
+        .registry
+        .delete_job(queue, state, storage_key)
+        .await?;
 
     Ok(Response::builder()
         .status(StatusCode::NO_CONTENT)

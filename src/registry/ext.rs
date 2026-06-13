@@ -11,9 +11,8 @@ use crate::{
         Platform as OciPlatform, namespace_belongs_to,
     },
     registry::{
-        APPLICATION_JSON, Error, HeaderMap, JsonResponse, Registry, ResponseHeaders,
-        cache_job_handler::CACHE_QUEUE, job_store, job_store::JobState,
-        metadata_store::link_kind::LinkKind, pagination::collect_all_pages,
+        APPLICATION_JSON, Error, HeaderMap, JsonResponse, Registry, ResponseHeaders, job_store,
+        job_store::JobState, metadata_store::link_kind::LinkKind, pagination::collect_all_pages,
     },
 };
 
@@ -415,28 +414,25 @@ impl Registry {
         })
     }
 
-    /// One keyset page of pending/in-flight durable jobs. `after` is the plain
-    /// storage key from a previous page's `next` (non-opaque). Each row reads
-    /// the envelope body; a row deleted mid-scan is silently skipped.
+    /// One keyset page of pending/in-flight durable jobs on `queue`. `after` is
+    /// the plain storage key from a previous page's `next` (non-opaque). Each
+    /// row reads the envelope body; a row deleted mid-scan is silently skipped.
     #[instrument(skip(self))]
     pub async fn get_jobs_info(
         &self,
+        queue: &str,
         n: Option<u16>,
         after: Option<String>,
     ) -> Result<JsonResponse, Error> {
         let n = n.unwrap_or(DEFAULT_JOBS_PAGE);
         let (keys, next) = self
-            .cache_queue
-            .list_pending_page(CACHE_QUEUE, n, after.as_deref())
+            .job_queue
+            .list_pending_page(queue, n, after.as_deref())
             .await?;
 
         let mut jobs = Vec::with_capacity(keys.len());
         for storage_key in keys {
-            match self
-                .cache_queue
-                .read_pending(CACHE_QUEUE, &storage_key)
-                .await
-            {
+            match self.job_queue.read_pending(queue, &storage_key).await {
                 Ok(envelope) => {
                     let not_before =
                         job_store::parse_not_before(&storage_key).unwrap_or(envelope.created_at);
@@ -462,27 +458,24 @@ impl Registry {
         })
     }
 
-    /// One keyset page of dead-letter (exhausted-retry) jobs. See
+    /// One keyset page of dead-letter (exhausted-retry) jobs on `queue`. See
     /// [`Self::get_jobs_info`] for the cursor and skip semantics.
     #[instrument(skip(self))]
     pub async fn get_failed_jobs_info(
         &self,
+        queue: &str,
         n: Option<u16>,
         after: Option<String>,
     ) -> Result<JsonResponse, Error> {
         let n = n.unwrap_or(DEFAULT_JOBS_PAGE);
         let (keys, next) = self
-            .cache_queue
-            .list_failed_page(CACHE_QUEUE, n, after.as_deref())
+            .job_queue
+            .list_failed_page(queue, n, after.as_deref())
             .await?;
 
         let mut failed = Vec::with_capacity(keys.len());
         for storage_key in keys {
-            match self
-                .cache_queue
-                .read_failed(CACHE_QUEUE, &storage_key)
-                .await
-            {
+            match self.job_queue.read_failed(queue, &storage_key).await {
                 Ok(record) => failed.push(FailedJobEntry {
                     storage_key,
                     id: record.envelope.id,
@@ -505,22 +498,27 @@ impl Registry {
         })
     }
 
-    /// Requeue a dead-letter job (attempts reset to zero). Delegates to the
-    /// durable queue; a stale key surfaces as [`Error::NotFound`] (404).
+    /// Requeue a dead-letter job (attempts reset to zero) on `queue`. Delegates
+    /// to the durable queue; a stale key surfaces as [`Error::NotFound`] (404).
     #[instrument(skip(self))]
-    pub async fn retry_failed_job(&self, storage_key: &str) -> Result<(), Error> {
-        self.cache_queue
-            .retry_failed(CACHE_QUEUE, storage_key)
+    pub async fn retry_failed_job(&self, queue: &str, storage_key: &str) -> Result<(), Error> {
+        self.job_queue
+            .retry_failed(queue, storage_key)
             .await
             .map_err(Error::from)
     }
 
-    /// Delete a job in the given partition. A stale key surfaces as
+    /// Delete a job on `queue` in the given partition. A stale key surfaces as
     /// [`Error::NotFound`] (404).
     #[instrument(skip(self))]
-    pub async fn delete_job(&self, state: JobState, storage_key: &str) -> Result<(), Error> {
-        self.cache_queue
-            .delete_job(CACHE_QUEUE, state, storage_key)
+    pub async fn delete_job(
+        &self,
+        queue: &str,
+        state: JobState,
+        storage_key: &str,
+    ) -> Result<(), Error> {
+        self.job_queue
+            .delete_job(queue, state, storage_key)
             .await
             .map_err(Error::from)
     }

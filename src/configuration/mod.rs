@@ -6,6 +6,8 @@ use serde::{
 };
 use tracing::warn;
 
+use angos_tx_engine::lock::LockStrategy;
+
 mod error;
 pub mod global;
 pub mod listeners;
@@ -155,6 +157,7 @@ impl Configuration {
     fn validate(self) -> Result<Self, Error> {
         validate_global(&self.global, &self.auth.webhook, &self.event_webhook)?;
         validate_repositories(&self.repository, &self.auth.webhook, &self.event_webhook)?;
+        validate_durable_queue_lock(&self)?;
         Ok(self)
     }
 
@@ -205,6 +208,40 @@ fn validate_global(
         event_webhooks,
         "referenced globally",
     )
+}
+
+/// Rejects `[global.job_queue]` combined with the in-process `memory` lock
+/// strategy: the durable queue coordinates multiple processes through the
+/// per-job execution lock, and a non-shared lock would let each worker claim
+/// and run the same job. The in-process queue, used when `[global.job_queue]`
+/// is absent, is unaffected.
+fn validate_durable_queue_lock(config: &Configuration) -> Result<(), Error> {
+    if config.global.job_queue.is_none() {
+        return Ok(());
+    }
+    let lock_strategy = match config.resolve_registry_storage() {
+        RegistryStorageConfig::FS(fs) => fs.lock_strategy,
+        RegistryStorageConfig::S3(s3) => s3.lock_strategy,
+        // `resolve_registry_storage` must map `Inherit` to a concrete backend;
+        // fail closed rather than silently skip the lock check.
+        RegistryStorageConfig::Inherit => {
+            return Err(Error::InvalidFormat(
+                "[metadata_store] did not resolve to a concrete backend before \
+                 durable-queue lock validation"
+                    .to_string(),
+            ));
+        }
+    };
+    if matches!(lock_strategy, LockStrategy::Memory) {
+        return Err(Error::InvalidFormat(
+            "[global.job_queue] needs a shared lock strategy so workers serialize on the \
+             same jobs across processes; the in-process 'memory' lock cannot coordinate \
+             across processes. Set the metadata store's lock_strategy to \"s3\" or \"redis\", \
+             or remove [global.job_queue] to use the in-process queue."
+                .to_string(),
+        ));
+    }
+    Ok(())
 }
 
 fn validate_repositories(

@@ -14,6 +14,9 @@ use crate::{
 /// a runtime panic.
 pub const DEFAULT_MAX_CONCURRENT_CACHE_JOBS: NonZeroUsize = NonZeroUsize::new(4).unwrap();
 
+/// Default replication-worker concurrency; the `unwrap` is const-evaluated.
+pub const DEFAULT_MAX_CONCURRENT_REPLICATION_JOBS: NonZeroUsize = NonZeroUsize::new(4).unwrap();
+
 #[derive(Clone, Debug, Deserialize)]
 pub struct GlobalConfig {
     #[serde(default = "default_max_concurrent_requests")]
@@ -23,6 +26,13 @@ pub struct GlobalConfig {
         deserialize_with = "deserialize_max_concurrent_cache_jobs"
     )]
     pub max_concurrent_cache_jobs: NonZeroUsize,
+    /// Worker concurrency for the replication queue, used by the server,
+    /// `angos worker`, and `scrub --replicate` drains.
+    #[serde(
+        default = "default_max_concurrent_replication_jobs",
+        deserialize_with = "deserialize_max_concurrent_replication_jobs"
+    )]
+    pub max_concurrent_replication_jobs: NonZeroUsize,
     #[serde(default = "default_max_manifest_size")]
     pub max_manifest_size: ByteSize,
     #[serde(default = "default_update_pull_time")]
@@ -56,13 +66,35 @@ fn default_max_concurrent_cache_jobs() -> NonZeroUsize {
     DEFAULT_MAX_CONCURRENT_CACHE_JOBS
 }
 
-fn deserialize_max_concurrent_cache_jobs<'de, D>(deserializer: D) -> Result<NonZeroUsize, D::Error>
+fn deserialize_positive_nonzero<'de, D>(
+    deserializer: D,
+    field: &str,
+) -> Result<NonZeroUsize, D::Error>
 where
     D: Deserializer<'de>,
 {
     let value = usize::deserialize(deserializer)?;
-    NonZeroUsize::new(value)
-        .ok_or_else(|| D::Error::custom("max_concurrent_cache_jobs must be > 0"))
+    NonZeroUsize::new(value).ok_or_else(|| D::Error::custom(format!("{field} must be > 0")))
+}
+
+fn deserialize_max_concurrent_cache_jobs<'de, D>(deserializer: D) -> Result<NonZeroUsize, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    deserialize_positive_nonzero(deserializer, "max_concurrent_cache_jobs")
+}
+
+fn default_max_concurrent_replication_jobs() -> NonZeroUsize {
+    DEFAULT_MAX_CONCURRENT_REPLICATION_JOBS
+}
+
+fn deserialize_max_concurrent_replication_jobs<'de, D>(
+    deserializer: D,
+) -> Result<NonZeroUsize, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    deserialize_positive_nonzero(deserializer, "max_concurrent_replication_jobs")
 }
 
 fn default_max_manifest_size() -> ByteSize {
@@ -78,6 +110,7 @@ impl Default for GlobalConfig {
         GlobalConfig {
             max_concurrent_requests: default_max_concurrent_requests(),
             max_concurrent_cache_jobs: default_max_concurrent_cache_jobs(),
+            max_concurrent_replication_jobs: default_max_concurrent_replication_jobs(),
             max_manifest_size: default_max_manifest_size(),
             update_pull_time: default_update_pull_time(),
             enable_redirect: None,
@@ -126,6 +159,7 @@ mod tests {
 
         assert_eq!(config.max_concurrent_requests, 64);
         assert_eq!(config.max_concurrent_cache_jobs.get(), 4);
+        assert_eq!(config.max_concurrent_replication_jobs.get(), 4);
         assert_eq!(config.max_manifest_size, ByteSize::mib(5));
         assert!(!config.update_pull_time);
         assert!(!config.immutable_tags);
@@ -139,6 +173,7 @@ mod tests {
             r#"
             max_concurrent_requests = 10
             max_concurrent_cache_jobs = 8
+            max_concurrent_replication_jobs = 6
             max_manifest_size = "7MiB"
             update_pull_time = true
             immutable_tags = true
@@ -153,6 +188,10 @@ mod tests {
             config.max_concurrent_cache_jobs,
             NonZeroUsize::new(8).unwrap()
         );
+        assert_eq!(
+            config.max_concurrent_replication_jobs,
+            NonZeroUsize::new(6).unwrap()
+        );
         assert_eq!(config.max_manifest_size, ByteSize::mib(7));
         assert!(config.update_pull_time);
         assert!(config.immutable_tags);
@@ -165,6 +204,12 @@ mod tests {
     #[test]
     fn max_concurrent_cache_jobs_zero_is_rejected() {
         let result = toml::from_str::<GlobalConfig>("max_concurrent_cache_jobs = 0\n");
+        assert!(result.is_err(), "zero must be rejected at deserialization");
+    }
+
+    #[test]
+    fn max_concurrent_replication_jobs_zero_is_rejected() {
+        let result = toml::from_str::<GlobalConfig>("max_concurrent_replication_jobs = 0\n");
         assert!(result.is_err(), "zero must be rejected at deserialization");
     }
 

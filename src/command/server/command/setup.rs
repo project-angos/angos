@@ -86,7 +86,8 @@ pub async fn build_registry(
         .max_manifest_size_bytes(max_manifest_size_bytes)
         .global_immutable_tags(config.global.immutable_tags)
         .global_immutable_tags_exclusions(config.global.immutable_tags_exclusions.clone())
-        .max_concurrent_cache_jobs(config.global.max_concurrent_cache_jobs);
+        .max_concurrent_cache_jobs(config.global.max_concurrent_cache_jobs)
+        .max_concurrent_replication_jobs(config.global.max_concurrent_replication_jobs);
 
     // When [global.job_queue] is present, route cache-fill jobs through the
     // durable backend (so they survive restarts and let `angos worker` drain

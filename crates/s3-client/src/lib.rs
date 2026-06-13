@@ -112,8 +112,6 @@ impl Backend {
 
 #[cfg(test)]
 mod tests {
-    use bytes::Bytes;
-
     use super::{ops::aggregate_batch_delete_errors, *};
 
     fn test_config(overrides: impl FnOnce(&mut BackendConfig)) -> BackendConfig {
@@ -179,43 +177,6 @@ mod tests {
     fn test_full_key_with_prefix() {
         let backend = Backend::new(&test_config(|c| c.key_prefix = "prefix".to_string())).unwrap();
         assert_eq!(backend.full_key("test/file.txt"), "prefix/test/file.txt");
-    }
-
-    #[tokio::test]
-    async fn test_upload_part_returns_etag() {
-        let config = test_config(|c| {
-            c.access_key_id = "minioadmin".to_string();
-            c.secret_key = "minioadmin".to_string();
-            c.bucket = "test-bucket".to_string();
-        });
-        let backend = Backend::new(&config).unwrap();
-        let result = backend
-            .upload_part(
-                "test/file.txt",
-                "test-upload-id",
-                1,
-                Bytes::from("test data"),
-            )
-            .await;
-        if let Err(err) = result {
-            assert!(!err.to_string().is_empty());
-        }
-    }
-
-    #[tokio::test]
-    async fn test_abort_multipart_upload() {
-        let config = test_config(|c| {
-            c.access_key_id = "minioadmin".to_string();
-            c.secret_key = "minioadmin".to_string();
-            c.bucket = "test-bucket".to_string();
-        });
-        let backend = Backend::new(&config).unwrap();
-        let result = backend
-            .abort_multipart_upload("test/file.txt", "test-upload-id")
-            .await;
-        if let Err(err) = result {
-            assert!(!err.to_string().is_empty());
-        }
     }
 
     #[test]

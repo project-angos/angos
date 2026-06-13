@@ -110,8 +110,12 @@ pub struct MetricsProvider {
     pub lock_invalidations: IntCounterVec,
     pub lock_recoveries: IntCounterVec,
     pub job_queue_pending: IntGaugeVec,
+    pub job_queue_failed: IntGaugeVec,
     pub job_queue_enqueued_total: IntCounterVec,
     pub job_queue_enqueue_failures_total: IntCounterVec,
+    pub replication_push_total: IntCounterVec,
+    pub replication_last_success_timestamp: IntGaugeVec,
+    pub replication_reconcile_total: IntCounterVec,
 }
 
 /// Map a Prometheus registration failure to an `Error::Initialization`,
@@ -137,9 +141,14 @@ impl MetricsProvider {
         let lock_invalidations = Self::build_lock_invalidations(&registry)?;
         let lock_recoveries = Self::build_lock_recoveries(&registry)?;
         let job_queue_pending = Self::build_job_queue_pending(&registry)?;
+        let job_queue_failed = Self::build_job_queue_failed(&registry)?;
         let job_queue_enqueued_total = Self::build_job_queue_enqueued_total(&registry)?;
         let job_queue_enqueue_failures_total =
             Self::build_job_queue_enqueue_failures_total(&registry)?;
+        let replication_push_total = Self::build_replication_push_total(&registry)?;
+        let replication_last_success_timestamp =
+            Self::build_replication_last_success_timestamp(&registry)?;
+        let replication_reconcile_total = Self::build_replication_reconcile_total(&registry)?;
 
         Ok(Self {
             registry,
@@ -153,8 +162,12 @@ impl MetricsProvider {
             lock_invalidations,
             lock_recoveries,
             job_queue_pending,
+            job_queue_failed,
             job_queue_enqueued_total,
             job_queue_enqueue_failures_total,
+            replication_push_total,
+            replication_last_success_timestamp,
+            replication_reconcile_total,
         })
     }
 
@@ -259,6 +272,16 @@ impl MetricsProvider {
         .map_err(register_err("angos_job_queue_pending"))
     }
 
+    fn build_job_queue_failed(registry: &PrometheusRegistry) -> Result<IntGaugeVec, Error> {
+        register_int_gauge_vec_with_registry!(
+            "angos_job_queue_failed",
+            "Number of dead-lettered jobs currently in the queue",
+            &["queue"],
+            registry
+        )
+        .map_err(register_err("angos_job_queue_failed"))
+    }
+
     fn build_job_queue_enqueued_total(
         registry: &PrometheusRegistry,
     ) -> Result<IntCounterVec, Error> {
@@ -281,6 +304,40 @@ impl MetricsProvider {
             registry
         )
         .map_err(register_err("angos_job_queue_enqueue_failures_total"))
+    }
+
+    fn build_replication_push_total(registry: &PrometheusRegistry) -> Result<IntCounterVec, Error> {
+        register_int_counter_vec_with_registry!(
+            "angos_replication_push_total",
+            "Total replication pushes to a downstream, by outcome (pushed, converged, superseded, failed)",
+            &["downstream", "outcome"],
+            registry
+        )
+        .map_err(register_err("angos_replication_push_total"))
+    }
+
+    fn build_replication_last_success_timestamp(
+        registry: &PrometheusRegistry,
+    ) -> Result<IntGaugeVec, Error> {
+        register_int_gauge_vec_with_registry!(
+            "angos_replication_last_success_timestamp_seconds",
+            "Unix timestamp (seconds) of the last successful or superseded replication push per downstream",
+            &["downstream"],
+            registry
+        )
+        .map_err(register_err("angos_replication_last_success_timestamp_seconds"))
+    }
+
+    fn build_replication_reconcile_total(
+        registry: &PrometheusRegistry,
+    ) -> Result<IntCounterVec, Error> {
+        register_int_counter_vec_with_registry!(
+            "angos_replication_reconcile_total",
+            "Total replication reconcile enqueues emitted by the scrub checker, by outcome",
+            &["outcome"],
+            registry
+        )
+        .map_err(register_err("angos_replication_reconcile_total"))
     }
 
     pub fn gather(&self) -> Result<(String, Vec<u8>), Error> {

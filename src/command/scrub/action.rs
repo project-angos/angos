@@ -1,6 +1,9 @@
 use std::fmt;
 
-use crate::{oci::Digest, registry::metadata_store::link_kind::LinkKind};
+use crate::{
+    oci::Digest,
+    registry::{job_store::JobState, metadata_store::link_kind::LinkKind},
+};
 
 /// A single mutation that a scrub checker has decided to perform.
 ///
@@ -14,6 +17,13 @@ pub enum Action {
         namespace: String,
         blob: Digest,
         link: LinkKind,
+    },
+    /// Revoke a namespace's orphaned blob-ownership grant (no manifest in the
+    /// namespace references the blob), reclaiming the bytes when it was the last
+    /// reference anywhere.
+    RemoveOrphanBlobGrant {
+        namespace: String,
+        blob: Digest,
     },
     RecreateLink {
         namespace: String,
@@ -59,9 +69,36 @@ pub enum Action {
         key: String,
         upload_id: String,
     },
+    /// Enqueue a replication push job for a tag diverging from or absent on a
+    /// downstream. Enqueued rather than pushed inline, so scrub-discovered
+    /// divergences get the event path's durable retry/backoff/coalescing.
+    EnqueueReplicationPush {
+        downstream: String,
+        namespace: String,
+        tag: String,
+        digest: Digest,
+    },
+    /// Enqueue a replication delete job for a downstream-only tag. Emitted only
+    /// for a `prune = true` downstream (one-way mirror): absence-driven deletion
+    /// would destroy an active-active peer's not-yet-replicated newer tag.
+    EnqueueReplicationDelete {
+        downstream: String,
+        namespace: String,
+        tag: String,
+    },
+    /// Delete a queued job (replication or cache) whose payload no longer
+    /// resolves to configured state, so it can never succeed usefully again.
+    /// `reason` carries the per-queue explanation for display.
+    DeleteOrphanJob {
+        queue: &'static str,
+        state: JobState,
+        storage_key: String,
+        reason: String,
+    },
 }
 
 impl fmt::Display for Action {
+    #[allow(clippy::too_many_lines)]
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Action::MigrateNamespaceRegistry => {
@@ -81,6 +118,12 @@ impl fmt::Display for Action {
                 write!(
                     f,
                     "remove invalid link from blob index '{namespace}/{blob}': '{link}'"
+                )
+            }
+            Action::RemoveOrphanBlobGrant { namespace, blob } => {
+                write!(
+                    f,
+                    "revoke orphaned blob-ownership grant '{namespace}/{blob}' (no manifest references it)"
                 )
             }
             Action::RecreateLink {
@@ -146,6 +189,42 @@ impl fmt::Display for Action {
             }
             Action::AbortMultipartUpload { key, upload_id } => {
                 write!(f, "abort orphan multipart upload '{key}' ({upload_id})")
+            }
+            Action::EnqueueReplicationPush {
+                downstream,
+                namespace,
+                tag,
+                digest,
+            } => {
+                write!(
+                    f,
+                    "enqueue replication push of '{namespace}:{tag}' ({digest}) to downstream '{downstream}'"
+                )
+            }
+            Action::EnqueueReplicationDelete {
+                downstream,
+                namespace,
+                tag,
+            } => {
+                write!(
+                    f,
+                    "enqueue replication delete of '{namespace}:{tag}' on downstream '{downstream}'"
+                )
+            }
+            Action::DeleteOrphanJob {
+                queue,
+                state,
+                storage_key,
+                reason,
+            } => {
+                let partition = match state {
+                    JobState::Pending => "pending",
+                    JobState::Failed => "failed",
+                };
+                write!(
+                    f,
+                    "delete the {partition} {queue} job '{storage_key}' because {reason}"
+                )
             }
         }
     }

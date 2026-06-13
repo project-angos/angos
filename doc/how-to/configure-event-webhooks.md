@@ -6,7 +6,7 @@ title: "Event Webhooks"
 
 # Configure Event Webhooks
 
-Notify external systems when registry events occur -- manifest pushes, blob uploads, tag operations, and more.
+Notify external systems when registry events occur: manifest pushes, blob uploads, tag operations, and more.
 
 ## Prerequisites
 
@@ -42,7 +42,7 @@ event_webhooks = ["notifications"]
 
 ## Delivery Policies
 
-### Required -- Block on Failure
+### Required: Block on Failure
 
 The registry waits for a successful response. If the webhook fails, the client operation fails too.
 
@@ -57,7 +57,7 @@ max_retries = 2
 
 Use this when the external system must acknowledge the event before it is considered complete (e.g., audit logging, compliance).
 
-### Optional -- Log on Failure
+### Optional: Log on Failure
 
 The registry waits for a response but does not fail the client operation if the webhook fails.
 
@@ -72,7 +72,7 @@ max_retries = 1
 
 Use this for best-effort notifications where delivery is important but not critical.
 
-### Async -- Fire and Forget
+### Async: Fire and Forget
 
 The registry dispatches the event in the background and returns to the client immediately.
 
@@ -237,7 +237,7 @@ timeout_ms = 5000     # Per-request timeout
 Configure different webhooks for different purposes:
 
 ```toml
-# Audit log -- must succeed
+# Audit log: must succeed
 [event_webhook.audit]
 url = "https://audit.example.com/events"
 policy = "required"
@@ -245,14 +245,14 @@ token = "audit-secret"
 events = ["manifest.push", "manifest.delete"]
 max_retries = 3
 
-# Slack notifications -- best effort
+# Slack notifications: best effort
 [event_webhook.slack]
 url = "https://hooks.slack.com/services/T.../B.../xxx"
 policy = "optional"
 events = ["manifest.push", "tag.create"]
 timeout_ms = 3000
 
-# Analytics -- fire and forget
+# Analytics: fire and forget
 [event_webhook.analytics]
 url = "https://analytics.internal/ingest"
 policy = "async"

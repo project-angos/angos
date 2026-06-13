@@ -7,11 +7,18 @@ use uuid::Uuid;
 use crate::{
     identity::Action,
     oci::{Digest, Namespace, Reference},
-    registry::job_store::JobState,
+    registry::{cache_job_handler::CACHE_QUEUE, job_store::JobState},
+    replication::REPLICATION_QUEUE,
 };
 
 fn parse_query<T: DeserializeOwned + Default>(params: &str) -> T {
     serde_urlencoded::from_str(params).unwrap_or_default()
+}
+
+/// Like [`parse_query`] but returns `None` when a value fails to deserialize,
+/// so the caller can reject the route instead of silently dropping the value.
+fn parse_query_strict<T: DeserializeOwned>(params: &str) -> Option<T> {
+    serde_urlencoded::from_str(params).ok()
 }
 
 /// Parses the HTTP method and URI into a registry `Action`.
@@ -61,19 +68,20 @@ pub fn parse(method: &Method, uri: &Uri) -> Option<Action> {
 
 #[derive(Deserialize, Default)]
 struct DigestQuery {
-    digest: Option<String>,
-}
-
-impl DigestQuery {
-    fn to_digest(&self) -> Option<Digest> {
-        self.digest.as_ref().and_then(|d| d.parse().ok())
-    }
+    digest: Option<Digest>,
 }
 
 fn digest_from_params(params: Option<&str>) -> Option<Digest> {
     params
         .map(parse_query::<DigestQuery>)
-        .and_then(|r| r.to_digest())
+        .and_then(|q| q.digest)
+}
+
+#[derive(Deserialize, Default)]
+struct MountQuery {
+    mount: Option<String>,
+    from: Option<String>,
+    digest: Option<Digest>,
 }
 
 #[derive(Deserialize, Debug, Default)]
@@ -94,14 +102,27 @@ fn parse_pagination(params: Option<&str>) -> (Option<u16>, Option<String>) {
 }
 
 #[derive(Deserialize, Default)]
-struct JobsPaginationQuery {
+struct JobsQuery {
     n: Option<u16>,
     after: Option<String>,
+    queue: Option<String>,
 }
 
-fn parse_jobs_pagination(params: Option<&str>) -> (Option<u16>, Option<String>) {
-    let query: JobsPaginationQuery = params.map(parse_query).unwrap_or_default();
-    (query.n, query.after)
+/// Parses the `?n=&after=&queue=` of a `_jobs` admin route strictly: a lenient
+/// parse would reset the whole struct on one bad value and silently administer
+/// the default `cache` queue. Returns `None` on a malformed value or unknown
+/// queue; an absent selector defaults to `cache`.
+fn parse_jobs_query(params: Option<&str>) -> Option<(Option<u16>, Option<String>, String)> {
+    let query: JobsQuery = match params {
+        Some(params) => parse_query_strict(params)?,
+        None => JobsQuery::default(),
+    };
+    let queue = match query.queue.as_deref() {
+        None | Some(CACHE_QUEUE) => CACHE_QUEUE.to_string(),
+        Some(REPLICATION_QUEUE) => REPLICATION_QUEUE.to_string(),
+        Some(_) => return None,
+    };
+    Some((query.n, query.after, queue))
 }
 
 /// Parse the angos-specific extension API routes. `path` is relative to the
@@ -117,12 +138,12 @@ fn try_parse_extension(method: &Method, path: &str, params: Option<&str>) -> Opt
         Method::GET => match path {
             "_repositories" => Some(Action::ListRepositories),
             "_jobs" => {
-                let (n, after) = parse_jobs_pagination(params);
-                Some(Action::ListJobs { n, after })
+                let (n, after, queue) = parse_jobs_query(params)?;
+                Some(Action::ListJobs { queue, n, after })
             }
             "_jobs/failed" => {
-                let (n, after) = parse_jobs_pagination(params);
-                Some(Action::ListFailedJobs { n, after })
+                let (n, after, queue) = parse_jobs_query(params)?;
+                Some(Action::ListFailedJobs { queue, n, after })
             }
             _ => {
                 if let Some(repository_str) = path.strip_suffix("/_namespaces") {
@@ -140,26 +161,35 @@ fn try_parse_extension(method: &Method, path: &str, params: Option<&str>) -> Opt
                 None
             }
         },
-        Method::POST => path
-            .strip_prefix("_jobs/failed/")
-            .and_then(|rest| rest.strip_suffix("/retry"))
-            .filter(|key| is_job_key(key))
-            .map(|key| Action::RetryJob {
+        Method::POST => {
+            let key = path
+                .strip_prefix("_jobs/failed/")
+                .and_then(|rest| rest.strip_suffix("/retry"))
+                .filter(|key| is_job_key(key))?;
+            let (_, _, queue) = parse_jobs_query(params)?;
+            Some(Action::RetryJob {
+                queue,
                 storage_key: key.to_string(),
-            }),
+            })
+        }
         Method::DELETE => {
             if let Some(key) = path.strip_prefix("_jobs/failed/").filter(|k| is_job_key(k)) {
+                let (_, _, queue) = parse_jobs_query(params)?;
                 return Some(Action::DeleteJob {
+                    queue,
                     state: JobState::Failed,
                     storage_key: key.to_string(),
                 });
             }
-            path.strip_prefix("_jobs/pending/")
-                .filter(|k| is_job_key(k))
-                .map(|key| Action::DeleteJob {
-                    state: JobState::Pending,
-                    storage_key: key.to_string(),
-                })
+            let key = path
+                .strip_prefix("_jobs/pending/")
+                .filter(|k| is_job_key(k))?;
+            let (_, _, queue) = parse_jobs_query(params)?;
+            Some(Action::DeleteJob {
+                queue,
+                state: JobState::Pending,
+                storage_key: key.to_string(),
+            })
         }
         _ => None,
     }
@@ -176,12 +206,36 @@ fn try_parse_upload(method: &Method, path: &str, params: Option<&str>) -> Option
         .or_else(|| path.strip_suffix("/blobs/uploads/"))
     {
         let namespace = Namespace::new(namespace_str).ok()?;
-        let digest = digest_from_params(params);
 
-        return match *method {
-            Method::POST => Some(Action::StartUpload { namespace, digest }),
-            _ => None,
+        if *method != Method::POST {
+            return None;
+        }
+        // Strict parse: a malformed query rejects the POST as a 400 instead of
+        // silently starting a session.
+        let query: MountQuery = match params {
+            Some(p) => parse_query_strict(p)?,
+            None => MountQuery::default(),
         };
+
+        // A malformed `?mount=` rejects the POST: the OCI fall-back-to-session
+        // rule covers unsatisfiable mounts, not syntactically invalid ones.
+        if let Some(value) = &query.mount {
+            let digest = value.parse::<Digest>().ok()?;
+            // A malformed `?from=` is rejected rather than treated as from-less
+            // auto-discovery, which would widen the authorized source set.
+            let from = match &query.from {
+                Some(repo) => Some(Namespace::new(repo).ok()?),
+                None => None,
+            };
+            return Some(Action::MountBlob {
+                namespace,
+                digest,
+                from,
+            });
+        }
+
+        let digest = query.digest;
+        return Some(Action::StartUpload { namespace, digest });
     }
 
     let (namespace_str, uuid) = path.rsplit_once("/blobs/uploads/")?;

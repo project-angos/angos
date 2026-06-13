@@ -156,6 +156,19 @@ impl BlobStore {
         }
     }
 
+    /// The blob bytes' last-modified time, or `None` when the backend records
+    /// none. Used to age-gate orphan-grant cleanup so an in-flight push (which
+    /// grants ownership before linking the manifest) is never reaped.
+    #[instrument(skip(self))]
+    pub async fn last_modified(&self, digest: &Digest) -> Result<Option<DateTime<Utc>>, Error> {
+        let path = path_builder::blob_path(digest);
+        match self.store.head(&path).await {
+            Ok(meta) => Ok(meta.last_modified),
+            Err(StorageError::NotFound) => Err(Error::BlobNotFound),
+            Err(e) => Err(e.into()),
+        }
+    }
+
     #[instrument(skip(self))]
     pub async fn reader(
         &self,

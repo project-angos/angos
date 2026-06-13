@@ -249,6 +249,7 @@ impl AccessPolicy {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::oci::{Digest, Namespace};
 
     fn rule(s: &str) -> CelRule {
         CelRule::compile(s).unwrap()
@@ -334,6 +335,120 @@ mod tests {
         };
 
         assert!(is_deny(&policy.evaluate(&action, &identity)));
+    }
+
+    /// A mount authorizes as the dedicated `mount-blob` action, independent of
+    /// the `start-upload` rules that govern ordinary uploads.
+    #[test]
+    fn test_access_policy_gates_cross_repo_mount() {
+        let namespace = Namespace::new("team/app").unwrap();
+        let digest = Digest::try_from(
+            "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        )
+        .unwrap();
+
+        let normal_upload = Action::StartUpload {
+            namespace: namespace.clone(),
+            digest: None,
+        };
+        let mount = Action::MountBlob {
+            namespace,
+            digest,
+            from: Some(Namespace::new("team/base").unwrap()),
+        };
+        let anyone = ClientIdentity {
+            username: Some("alice".to_string()),
+            ..ClientIdentity::default()
+        };
+        let replicator = ClientIdentity {
+            id: Some("replicator".to_string()),
+            username: Some("svc".to_string()),
+            ..ClientIdentity::default()
+        };
+
+        let replicator_only = AccessPolicy::new(AccessPolicyConfig {
+            default: AccessMode::Deny,
+            rules: vec![
+                rule("identity.username != null && request.action == 'start-upload'"),
+                rule("identity.id == 'replicator' && request.action == 'mount-blob'"),
+            ],
+        });
+        assert!(is_allow(&replicator_only.evaluate(&normal_upload, &anyone)));
+        assert!(is_deny(&replicator_only.evaluate(&mount, &anyone)));
+        assert!(is_allow(&replicator_only.evaluate(&mount, &replicator)));
+
+        let deny_non_replicator = AccessPolicy::new(AccessPolicyConfig {
+            default: AccessMode::Allow,
+            rules: vec![rule(
+                "request.action == 'mount-blob' && identity.id != 'replicator'",
+            )],
+        });
+        assert!(is_allow(
+            &deny_non_replicator.evaluate(&normal_upload, &anyone)
+        ));
+        assert!(is_deny(&deny_non_replicator.evaluate(&mount, &anyone)));
+        assert!(is_allow(&deny_non_replicator.evaluate(&mount, &replicator)));
+    }
+
+    /// `request.from` is present only on a `from`-bearing mount, so rules need
+    /// `has(request.from)` to handle auto-discovery mounts.
+    #[test]
+    fn test_access_policy_gates_cross_repo_mount_by_source() {
+        let target = Namespace::new("team/app").unwrap();
+        let digest = Digest::try_from(
+            "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        )
+        .unwrap();
+
+        let from_trusted = Action::MountBlob {
+            namespace: target.clone(),
+            digest: digest.clone(),
+            from: Some(Namespace::new("team/base").unwrap()),
+        };
+        let from_untrusted = Action::MountBlob {
+            namespace: target.clone(),
+            digest: digest.clone(),
+            from: Some(Namespace::new("other/evil").unwrap()),
+        };
+        let no_from = Action::MountBlob {
+            namespace: target,
+            digest,
+            from: None,
+        };
+        let client = ClientIdentity {
+            username: Some("alice".to_string()),
+            ..ClientIdentity::default()
+        };
+
+        // The `has()` guard keeps the rule from raising the fail-closed "no
+        // such key" error on a from-less mount.
+        let only_from_trusted = AccessPolicy::new(AccessPolicyConfig {
+            default: AccessMode::Deny,
+            rules: vec![rule(
+                "request.action == 'mount-blob' && has(request.from) && request.from == 'team/base'",
+            )],
+        });
+        assert!(is_allow(
+            &only_from_trusted.evaluate(&from_trusted, &client)
+        ));
+        assert!(is_deny(
+            &only_from_trusted.evaluate(&from_untrusted, &client)
+        ));
+        assert!(is_deny(&only_from_trusted.evaluate(&no_from, &client)));
+
+        let deny_untrusted_source = AccessPolicy::new(AccessPolicyConfig {
+            default: AccessMode::Allow,
+            rules: vec![rule(
+                "request.action == 'mount-blob' && has(request.from) && request.from == 'other/evil'",
+            )],
+        });
+        assert!(is_allow(
+            &deny_untrusted_source.evaluate(&from_trusted, &client)
+        ));
+        assert!(is_deny(
+            &deny_untrusted_source.evaluate(&from_untrusted, &client)
+        ));
+        assert!(is_allow(&deny_untrusted_source.evaluate(&no_from, &client)));
     }
 
     #[test]

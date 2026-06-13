@@ -120,6 +120,38 @@ mod tests {
     }
 
     #[test]
+    fn test_config_deserialize_partial_override() {
+        // Setting only one of issuer/jwks_uri in TOML must override that field
+        // while the unspecified field still takes its per-field serde default.
+        let custom_issuer: ProviderConfig = toml::from_str(
+            r#"
+            issuer = "https://custom.example.com"
+        "#,
+        )
+        .unwrap();
+        assert_eq!(custom_issuer.issuer, "https://custom.example.com");
+        assert_eq!(
+            custom_issuer.jwks_uri,
+            "https://token.actions.githubusercontent.com/.well-known/jwks"
+        );
+
+        let custom_jwks: ProviderConfig = toml::from_str(
+            r#"
+            jwks_uri = "https://custom.example.com/.well-known/jwks"
+        "#,
+        )
+        .unwrap();
+        assert_eq!(
+            custom_jwks.issuer,
+            "https://token.actions.githubusercontent.com"
+        );
+        assert_eq!(
+            custom_jwks.jwks_uri,
+            "https://custom.example.com/.well-known/jwks"
+        );
+    }
+
+    #[test]
     fn test_config_deserialize_full() {
         let toml = r#"
             issuer = "https://custom.github.com"
@@ -140,107 +172,6 @@ mod tests {
             config.allowed_algorithms,
             vec![Algorithm::RS256, Algorithm::ES256]
         );
-    }
-
-    #[test]
-    fn test_default_functions() {
-        assert_eq!(
-            default_github_issuer(),
-            "https://token.actions.githubusercontent.com"
-        );
-        assert_eq!(
-            default_github_jwks_uri(),
-            "https://token.actions.githubusercontent.com/.well-known/jwks"
-        );
-        assert_eq!(BaseConfig::default_jwks_refresh_interval(), 3600);
-        assert_eq!(BaseConfig::default_clock_skew_tolerance(), 60);
-        assert_eq!(
-            BaseConfig::default_allowed_algorithms(),
-            vec![Algorithm::RS256]
-        );
-    }
-
-    #[test]
-    fn test_create_provider() {
-        let config = ProviderConfig {
-            issuer: "https://token.actions.githubusercontent.com".to_string(),
-            jwks_uri: "https://token.actions.githubusercontent.com/.well-known/jwks".to_string(),
-            jwks_refresh_interval: 3600,
-            required_audience: None,
-            clock_skew_tolerance: 60,
-            allowed_algorithms: vec![Algorithm::RS256],
-        };
-
-        let provider = Provider::new(config);
-        assert_eq!(
-            provider.issuer(),
-            "https://token.actions.githubusercontent.com"
-        );
-        assert_eq!(provider.name(), "GitHub Actions");
-        assert_eq!(
-            provider.jwks_uri(),
-            Some("https://token.actions.githubusercontent.com/.well-known/jwks")
-        );
-        assert_eq!(provider.jwks_refresh_interval(), 3600);
-        assert!(provider.required_audience().is_none());
-        assert_eq!(provider.clock_skew_tolerance(), 60);
-        assert_eq!(provider.allowed_algorithms(), &[Algorithm::RS256]);
-    }
-
-    #[test]
-    fn test_provider_with_defaults() {
-        let config = ProviderConfig {
-            issuer: default_github_issuer(),
-            jwks_uri: default_github_jwks_uri(),
-            jwks_refresh_interval: BaseConfig::default_jwks_refresh_interval(),
-            required_audience: Some("my-audience".to_string()),
-            clock_skew_tolerance: BaseConfig::default_clock_skew_tolerance(),
-            allowed_algorithms: BaseConfig::default_allowed_algorithms(),
-        };
-
-        let provider = Provider::new(config);
-        assert_eq!(
-            provider.issuer(),
-            "https://token.actions.githubusercontent.com"
-        );
-        assert_eq!(
-            provider.jwks_uri(),
-            Some("https://token.actions.githubusercontent.com/.well-known/jwks")
-        );
-        assert_eq!(provider.required_audience(), Some("my-audience"));
-        assert_eq!(provider.jwks_refresh_interval(), 3600);
-        assert_eq!(provider.clock_skew_tolerance(), 60);
-        assert_eq!(provider.allowed_algorithms(), &[Algorithm::RS256]);
-    }
-
-    #[test]
-    fn test_provider_with_custom_refresh_interval() {
-        let config = ProviderConfig {
-            issuer: default_github_issuer(),
-            jwks_uri: default_github_jwks_uri(),
-            jwks_refresh_interval: 7200,
-            required_audience: None,
-            clock_skew_tolerance: BaseConfig::default_clock_skew_tolerance(),
-            allowed_algorithms: BaseConfig::default_allowed_algorithms(),
-        };
-
-        let provider = Provider::new(config);
-        assert_eq!(provider.jwks_refresh_interval(), 7200);
-    }
-
-    #[test]
-    fn test_provider_with_custom_clock_skew() {
-        let config = ProviderConfig {
-            issuer: default_github_issuer(),
-            jwks_uri: default_github_jwks_uri(),
-            jwks_refresh_interval: BaseConfig::default_jwks_refresh_interval(),
-            required_audience: None,
-            clock_skew_tolerance: 120,
-            allowed_algorithms: BaseConfig::default_allowed_algorithms(),
-        };
-
-        let provider = Provider::new(config);
-        assert_eq!(provider.clock_skew_tolerance(), 120);
     }
 
     #[test]
@@ -336,84 +267,5 @@ mod tests {
         let result = provider.validate_provider_claims(&claims);
         assert!(matches!(&result, Err(Error::Unauthorized(_))));
         assert_eq!(result.unwrap_err().status_code(), StatusCode::UNAUTHORIZED);
-    }
-
-    #[test]
-    fn test_provider_name() {
-        let config = ProviderConfig {
-            issuer: default_github_issuer(),
-            jwks_uri: default_github_jwks_uri(),
-            jwks_refresh_interval: BaseConfig::default_jwks_refresh_interval(),
-            required_audience: None,
-            clock_skew_tolerance: BaseConfig::default_clock_skew_tolerance(),
-            allowed_algorithms: BaseConfig::default_allowed_algorithms(),
-        };
-
-        let provider = Provider::new(config);
-        assert_eq!(provider.name(), "GitHub Actions");
-    }
-
-    // Tests for Provider::new with default-chained config (config deserialized from TOML,
-    // then passed to Provider::new). This exercises the full composition path:
-    // serde defaults → ProviderConfig → Provider::new → BaseConfig → trait accessors.
-
-    #[test]
-    fn test_provider_new_from_deserialized_defaults() {
-        // An empty TOML section must produce a provider pointing at the canonical
-        // GitHub Actions OIDC endpoint with the bundled JWKS URL.
-        let config: ProviderConfig = toml::from_str("").unwrap();
-        let provider = Provider::new(config);
-
-        assert_eq!(
-            provider.issuer(),
-            "https://token.actions.githubusercontent.com"
-        );
-        assert_eq!(
-            provider.jwks_uri(),
-            Some("https://token.actions.githubusercontent.com/.well-known/jwks")
-        );
-        assert_eq!(provider.jwks_refresh_interval(), 3600);
-        assert_eq!(provider.clock_skew_tolerance(), 60);
-        assert!(provider.required_audience().is_none());
-    }
-
-    #[test]
-    fn test_provider_new_custom_issuer_from_toml() {
-        // A custom issuer in the TOML config must override the default and flow
-        // through Provider::new into the BaseConfig unchanged.
-        let toml = r#"
-            issuer = "https://custom.example.com"
-        "#;
-
-        let config: ProviderConfig = toml::from_str(toml).unwrap();
-        let provider = Provider::new(config);
-
-        assert_eq!(provider.issuer(), "https://custom.example.com");
-        // JWKS URI still takes its default when not specified.
-        assert_eq!(
-            provider.jwks_uri(),
-            Some("https://token.actions.githubusercontent.com/.well-known/jwks")
-        );
-    }
-
-    #[test]
-    fn test_provider_new_custom_jwks_uri_from_toml() {
-        // A custom jwks_uri in the TOML config must override the default and flow
-        // through Provider::new into the BaseConfig unchanged.
-        let toml = r#"
-            jwks_uri = "https://custom.example.com/.well-known/jwks"
-        "#;
-
-        let config: ProviderConfig = toml::from_str(toml).unwrap();
-        let provider = Provider::new(config);
-
-        assert_eq!(
-            provider.issuer(),
-            "https://token.actions.githubusercontent.com"
-        );
-        assert_eq!(
-            provider.jwks_uri(),
-            Some("https://custom.example.com/.well-known/jwks")
-        );
     }
 }

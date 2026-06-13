@@ -1,6 +1,7 @@
 use std::{cmp::Ordering, io, sync::LazyLock};
 
 use base64::{Engine, prelude::BASE64_STANDARD};
+use chrono::{DateTime, Utc};
 use futures_util::TryStreamExt;
 use http_body_util::BodyExt;
 use hyper::{
@@ -12,7 +13,9 @@ use regex::Regex;
 use tokio::io::AsyncRead;
 use tokio_util::io::StreamReader;
 
-use crate::{command::server::error::Error, registry::BlobRange};
+use crate::{
+    command::server::error::Error, registry::BlobRange, replication::X_ANGOS_SOURCE_TIMESTAMP,
+};
 
 static START_END_RANGE_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^(?:bytes=)?(?P<start>\d+)-(?P<end>\d+)?$").unwrap());
@@ -109,6 +112,28 @@ impl<'a> RequestHeaders<'a> {
             .map_err(|error| Error::BadRequest(format!("Invalid Content-Type header: {error}")))?;
 
         Ok(Some(content_type.to_string()))
+    }
+
+    /// Reads `X-Angos-Source-Timestamp` as an RFC 3339 instant for
+    /// receiver-side last-writer-wins; a missing or malformed value yields
+    /// `None`, disabling LWW rather than failing the request. A future-dated
+    /// value is clamped to now so this client-settable header cannot pin a LWW
+    /// win or postdate the stored `created_at`.
+    pub fn source_timestamp(&self) -> Option<DateTime<Utc>> {
+        let value = self
+            .headers
+            .get(X_ANGOS_SOURCE_TIMESTAMP)?
+            .to_str()
+            .ok()?
+            .trim();
+        if value.is_empty() {
+            return None;
+        }
+
+        let parsed = DateTime::parse_from_rfc3339(value)
+            .ok()?
+            .with_timezone(&Utc);
+        Some(parsed.min(Utc::now()))
     }
 
     pub fn range(&self, header: HeaderName) -> Result<Option<(u64, Option<u64>)>, Error> {

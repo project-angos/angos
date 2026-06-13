@@ -61,6 +61,17 @@ async fn dispatch_route<'a>(
         Action::StartUpload { namespace, digest } => {
             handlers::upload::handle_start_upload(context, &namespace, digest).await
         }
+        Action::MountBlob {
+            namespace,
+            digest,
+            from,
+        } => {
+            let eventful = handlers::upload::handle_mount_blob(
+                context, parts, &namespace, digest, from, identity,
+            )
+            .await?;
+            handlers::dispatch_eventful(context, eventful).await
+        }
         Action::GetUpload { namespace, uuid } => {
             handlers::upload::handle_get_upload(context, &namespace, uuid).await
         }
@@ -113,8 +124,10 @@ async fn dispatch_route<'a>(
             namespace,
             reference,
         } => {
-            handlers::manifest::dispatch_delete_manifest(context, &namespace, reference, identity)
-                .await
+            handlers::manifest::dispatch_delete_manifest(
+                context, parts, &namespace, reference, identity,
+            )
+            .await
         }
         Action::GetReferrer {
             namespace,
@@ -145,16 +158,20 @@ async fn dispatch_route<'a>(
         Action::ListNamespaces { repository } => {
             handlers::ext::handle_list_namespaces(context, &repository).await
         }
-        Action::ListJobs { n, after } => handlers::ext::handle_list_jobs(context, n, after).await,
-        Action::ListFailedJobs { n, after } => {
-            handlers::ext::handle_list_failed_jobs(context, n, after).await
+        Action::ListJobs { queue, n, after } => {
+            handlers::ext::handle_list_jobs(context, &queue, n, after).await
         }
-        Action::RetryJob { storage_key } => {
-            handlers::ext::handle_retry_job(context, &storage_key).await
+        Action::ListFailedJobs { queue, n, after } => {
+            handlers::ext::handle_list_failed_jobs(context, &queue, n, after).await
         }
-        Action::DeleteJob { state, storage_key } => {
-            handlers::ext::handle_delete_job(context, state, &storage_key).await
+        Action::RetryJob { queue, storage_key } => {
+            handlers::ext::handle_retry_job(context, &queue, &storage_key).await
         }
+        Action::DeleteJob {
+            queue,
+            state,
+            storage_key,
+        } => handlers::ext::handle_delete_job(context, &queue, state, &storage_key).await,
         Action::Healthz => handle_healthz(),
         Action::Readyz => handle_readyz(context).await,
         Action::Metrics => handle_metrics(),

@@ -1009,6 +1009,7 @@ mod tests {
         Repository {
             name: name.to_string(),
             upstreams: Vec::new(),
+            replication: Vec::new(),
             retention_policy: RetentionPolicy::new(
                 &RetentionPolicyConfig { rules },
                 Arc::new(SystemClock),

@@ -10,10 +10,10 @@ use crate::{
         request::{RequestHeaders, incoming_into_async_read},
         response_body::ResponseBody,
     },
-    event_webhook::event::EventActor,
+    event_webhook::event::{Event, EventActor},
     identity::ClientIdentity,
     oci::{Digest, Namespace},
-    registry::StartUploadResponse,
+    registry::{BlobMount, StartUploadResponse},
 };
 
 pub async fn handle_start_upload(
@@ -22,13 +22,64 @@ pub async fn handle_start_upload(
     digest: Option<Digest>,
 ) -> Result<Response<ResponseBody>, Error> {
     let response = context.registry.start_upload(namespace, digest).await?;
+    upload_start_response(response)
+}
 
+pub async fn handle_mount_blob(
+    context: &ServerContext,
+    parts: &Parts,
+    namespace: &Namespace,
+    digest: Digest,
+    from: Option<Namespace>,
+    identity: &ClientIdentity,
+) -> Result<EventfulResponse, Error> {
+    let mount = BlobMount { digest, from };
+    // A mount must not hand the caller bytes they could not otherwise read, so
+    // authorize against a namespace holding the blob first. An unsatisfiable
+    // mount degrades to an ordinary upload session rather than leaking the blob.
+    let Some(source) = context
+        .authorize_mount_source(&mount, identity, parts)
+        .await?
+    else {
+        let response = context.registry.start_upload(namespace, None).await?;
+        return upload_start_event_response(response, Vec::new());
+    };
+
+    // A satisfied mount returns a `blob.push` event for the dispatcher to fire,
+    // so webhook consumers see mounted blobs; the fallback session returns none.
+    let actor = Some(EventActor::from(identity.clone()));
+    let (response, events) = context
+        .registry
+        .mount_blob(actor, namespace, &mount, &source)
+        .await?;
+    upload_start_event_response(response, events)
+}
+
+/// Maps a [`StartUploadResponse`] to its HTTP response: an existing/mounted blob
+/// is `201 Created`, a fresh session is `202 Accepted`.
+fn upload_start_response(response: StartUploadResponse) -> Result<Response<ResponseBody>, Error> {
     match response {
         StartUploadResponse::ExistingBlob { headers } => {
             build_response(StatusCode::CREATED, headers, ResponseBody::empty())
         }
         StartUploadResponse::Session { headers } => {
             build_response(StatusCode::ACCEPTED, headers, ResponseBody::empty())
+        }
+    }
+}
+
+/// Like [`upload_start_response`] but carries the `blob.push` events a satisfied
+/// mount emits, for the caller to dispatch.
+fn upload_start_event_response(
+    response: StartUploadResponse,
+    events: Vec<Event>,
+) -> Result<EventfulResponse, Error> {
+    match response {
+        StartUploadResponse::ExistingBlob { headers } => {
+            build_event_response(StatusCode::CREATED, headers, events)
+        }
+        StartUploadResponse::Session { headers } => {
+            build_event_response(StatusCode::ACCEPTED, headers, events)
         }
     }
 }

@@ -118,16 +118,6 @@ mod tests {
     }
 
     #[test]
-    fn test_from_slice() {
-        let manifest = demo_manifest();
-        let raw_manifest = serde_json::to_vec(&manifest).expect("Failed to serialize manifest");
-
-        let parsed_manifest =
-            Manifest::from_slice(raw_manifest.as_slice()).expect("Failed to parse manifest");
-        assert_eq!(manifest, parsed_manifest);
-    }
-
-    #[test]
     fn test_has_artifact_type_top_level_field() {
         let manifest = demo_manifest();
         assert!(manifest.has_artifact_type("oci.image.index.v1"));

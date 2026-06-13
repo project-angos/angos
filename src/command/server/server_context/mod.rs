@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 use hyper::http::request::Parts;
 use tracing::instrument;
@@ -10,13 +10,13 @@ use crate::{
     event_webhook::{dispatcher::EventDispatcher, event::Event},
     identity::{Action, ClientIdentity},
     oci::{Namespace, Reference},
-    registry::Registry,
+    registry::{BlobMount, Registry},
 };
 
 pub struct ServerContext {
     authenticator: Arc<Authenticator>,
     authorizer: Arc<Authorizer>,
-    event_dispatcher: Option<Arc<EventDispatcher>>,
+    dispatcher: Option<Arc<EventDispatcher>>,
     pub registry: Registry,
     pub enable_ui: bool,
     pub ui_name: String,
@@ -33,17 +33,19 @@ impl ServerContext {
         let authenticator = Arc::new(Authenticator::new(config, &cache)?);
         let authorizer = Arc::new(Authorizer::new(config, &cache)?);
 
-        let event_dispatcher = if config.event_webhook.is_empty() {
+        let dispatcher = if config.event_webhook.is_empty() {
             None
         } else {
-            let dispatcher = EventDispatcher::new(config.event_webhook.clone())?;
+            let dispatcher = EventDispatcher::builder()
+                .webhooks(config.event_webhook.clone())
+                .build()?;
             Some(Arc::new(dispatcher))
         };
 
         Ok(Self {
             authenticator,
             authorizer,
-            event_dispatcher,
+            dispatcher,
             registry,
             enable_ui: config.ui.enabled,
             ui_name: config.ui.name.clone(),
@@ -51,8 +53,8 @@ impl ServerContext {
     }
 
     #[cfg(test)]
-    pub fn event_dispatcher(&self) -> Option<Arc<EventDispatcher>> {
-        self.event_dispatcher.clone()
+    pub fn has_event_dispatcher(&self) -> bool {
+        self.dispatcher.is_some()
     }
 
     #[instrument(skip(self, parts))]
@@ -71,7 +73,7 @@ impl ServerContext {
         Ok(identity)
     }
 
-    #[instrument(skip(self, request))]
+    #[instrument(skip(self, request, identity))]
     pub async fn authorize_request(
         &self,
         route: &Action,
@@ -80,6 +82,19 @@ impl ServerContext {
     ) -> Result<(), Error> {
         self.authorizer
             .authorize_request(route, identity, request, &self.registry)
+            .await
+    }
+
+    /// Resolves a source namespace whose copy of the mount's blob `identity` can
+    /// already read; `None` means fall back to an ordinary upload session.
+    pub async fn authorize_mount_source(
+        &self,
+        mount: &BlobMount,
+        identity: &ClientIdentity,
+        request: &Parts,
+    ) -> Result<Option<Namespace>, Error> {
+        self.authorizer
+            .authorize_mount_source(mount, identity, request, &self.registry)
             .await
     }
 
@@ -96,23 +111,35 @@ impl ServerContext {
         }
     }
 
+    /// Delivers one event to the webhook dispatcher; with none configured this
+    /// is a no-op `Ok`.
     pub async fn dispatch_event(&self, event: &Event) -> Result<(), Error> {
-        if let Some(dispatcher) = &self.event_dispatcher {
-            dispatcher.dispatch(event).await?;
+        match &self.dispatcher {
+            Some(dispatcher) => dispatcher.dispatch(event).await.map_err(Error::from),
+            None => Ok(()),
         }
-        Ok(())
     }
 
+    /// Delivers a batch of events, attempting every event even if an earlier
+    /// delivery fails. The first error is returned once all have been attempted.
     pub async fn dispatch_events(&self, events: &[Event]) -> Result<(), Error> {
+        let mut first_error: Option<Error> = None;
         for event in events {
-            self.dispatch_event(event).await?;
+            if let Err(error) = self.dispatch_event(event).await
+                && first_error.is_none()
+            {
+                first_error = Some(error);
+            }
         }
-        Ok(())
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
     }
 
-    pub async fn shutdown_with_timeout(&self, timeout: std::time::Duration) {
+    pub async fn shutdown_with_timeout(&self, timeout: Duration) {
         self.registry.flush_pending_writes().await;
-        if let Some(dispatcher) = &self.event_dispatcher {
+        if let Some(dispatcher) = &self.dispatcher {
             dispatcher.shutdown_with_timeout(timeout).await;
         }
     }

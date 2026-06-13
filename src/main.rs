@@ -31,6 +31,7 @@ mod oci;
 mod policy;
 mod registry;
 pub mod registry_client;
+mod replication;
 mod secret;
 mod timing;
 mod util;

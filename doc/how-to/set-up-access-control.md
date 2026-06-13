@@ -81,7 +81,7 @@ rules = [
 :::warning
 Do not use `request.action.startsWith('get-')` for anonymous access. This would also allow
 `get-api-version` without authentication, which causes Docker to skip sending credentials on
-all subsequent requests — even pushes. Always list only the specific read actions you need.
+all subsequent requests, even pushes. Always list only the specific read actions you need.
 :::
 
 ### IP-Based Access
@@ -155,6 +155,84 @@ rules = [
 ]
 ```
 
+### Restrict cross-repository blob mount
+
+A cross-repository mount (`POST .../blobs/uploads/?mount={digest}[&from={repository}]`) grants the target
+namespace a reference to an existing blob with no upload. Angos grants it only when the caller is
+authorized to **read** the blob from a namespace that holds it: the source repository named by
+`{repository}`, or (for a from-less mount) any namespace that references the blob. A caller who cannot read
+the source falls back to a normal upload instead, so a mount never hands over a blob the caller could
+not otherwise pull; you do not have to write a policy to close that gap.
+
+Beyond that source-read check, a mount is its own route and CEL action, `mount-blob`, distinct from
+`start-upload`, so a policy can restrict who may mount **at all** with a single
+`request.action == 'mount-blob'` rule, independent of the rules governing ordinary uploads. Denying
+it rejects the mount request; Angos's own replication transparently falls back to a normal upload when
+a downstream denies the mount, so denying `mount-blob` never breaks replication.
+
+:::warning Grant `mount-blob` wherever you grant uploads
+Container clients (Docker, containerd) send `?mount=` **opportunistically** on push whenever a blob
+may already exist elsewhere on the registry; a mount attempt is part of an ordinary push, not a
+special operation. Under a `default = "deny"` policy, an identity allowed to `start-upload` but not
+`mount-blob` has those pushes rejected. Grant `mount-blob` to every identity allowed to upload,
+unless you deliberately accept failing the pushes of mount-attempting clients.
+:::
+
+For example, restrict every mount to a trusted identity (the replicator), leaving ordinary uploads
+untouched. Under a `default = "deny"` policy, add an allow-rule for it:
+
+```toml
+[repository."app".access_policy]
+default = "deny"
+rules = [
+  # ...your usual allow-rules for pull, manifest push, start-upload...
+  "identity.id == 'replicator' && request.action == 'mount-blob'",
+]
+```
+
+Under a `default = "allow"` policy, deny it instead:
+
+```toml
+[repository."app".access_policy]
+default = "allow"
+rules = [
+  "request.action == 'mount-blob' && identity.id != 'replicator'",
+]
+```
+
+The `request.from` field (the mount source repository, present only on `mount-blob`) is available if
+you need to distinguish a scoped mount from a from-less one.
+
+### Restrict replication writes
+
+A replication write is an ordinary manifest `PUT`/`DELETE` carrying the `X-Angos-Source-Timestamp`
+header (see the [API reference](../reference/api-endpoints.md#replication-request-header)). The
+receiver persists that timestamp as the tag's creation time, which drives last-writer-wins conflict
+resolution and age-based retention. A future-dated timestamp is clamped to the receiver's clock, but
+a **backdated** one is accepted from *any* identity allowed to push, letting it weaken a tag in
+later LWW races or age a tag straight into a retention window.
+
+:::warning
+On every instance that receives replication, restrict manifest pushes and deletes on replicated
+repositories to the replicator identity (plus whoever should genuinely push there). There is no
+separate replication permission, the CEL `access_policy` on the ordinary write actions is the gate.
+:::
+
+Under a `default = "deny"` policy:
+
+```toml
+[repository."app".access_policy]
+default = "deny"
+rules = [
+  # pulls for everyone authenticated, writes for the replicator only
+  "request.action == 'get-manifest' || request.action == 'get-blob'",
+  "identity.id == 'replicator' && request.action in ['put-manifest', 'delete-manifest', 'start-upload', 'update-upload', 'complete-upload', 'mount-blob']",
+]
+```
+
+The same `identity.id == 'replicator'` credential is the one configured as `username` on the peer's
+`[[repository."app".downstream]]` entry.
+
 ---
 
 ## Web UI Access
@@ -183,7 +261,7 @@ rules = [
 The durable cache-fill job queue is exposed through four extension actions:
 `list-jobs` and `list-failed-jobs` (read the pending and dead-letter
 partitions) and `retry-job` and `delete-job` (mutate them). These are **not**
-covered by the generic `list-*` browsing rule above — they are deliberately
+covered by the generic `list-*` browsing rule above; they are deliberately
 separate action names so you can gate job administration behind higher
 privilege than ordinary catalogue browsing.
 
@@ -205,7 +283,7 @@ rules = [
 ```
 
 With `default = "deny"`, the job actions are denied for every caller that does
-not match the admin rule — including unauthenticated requests and the Web UI's
+not match the admin rule, including unauthenticated requests and the Web UI's
 own browsing identity. The UI's **Jobs** page only renders successfully for
 identities the policy admits.
 

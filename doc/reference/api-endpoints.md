@@ -62,12 +62,35 @@ only when no namespace references the digest.
 POST /v2/{namespace}/blobs/uploads/
 ```
 
-Start a new blob upload. Returns `202 Accepted` with `Location` header.
+Start a new blob upload. Returns `202 Accepted` with a `Location` header pointing at the upload
+session, or `201 Created` when the blob is already available (see `digest` / `mount` below).
 
 Query parameters:
-- `digest` - Return the existing blob only when the requested namespace already owns it; otherwise
-  start a new upload session.
-- `mount` - Mount blob from another repository
+- `digest` - Return the existing blob (returns `201 Created`) only when the requested namespace
+  already owns it; otherwise start a new upload session.
+- `mount` (with optional `from`) - Cross-repository blob mount. `?mount={digest}` requests that an
+  existing blob be referenced by the target namespace with no body transfer:
+  - With `from`: the mount succeeds when the blob exists, is held by `{repository}`, and the caller is
+    authorized to read it from there.
+  - Without `from` (automatic content discovery): the mount succeeds when the blob exists and the
+    caller is authorized to read it from a namespace that already references it.
+
+  On success the server returns `201 Created` with the blob `Location`. When the blob cannot be
+  mounted (absent, not held by the named source, or not readable by the caller), the server falls
+  back to a normal upload session (`202 Accepted`). A mount request never fails for this reason.
+  The session fall-back covers *unsatisfiable* mounts only: a syntactically malformed `?digest=`,
+  `?mount=`, or `?from=` value returns `400 Bad Request`.
+
+  **Authorization.** A mount only grants a reference to a blob the caller could already read: the
+  server evaluates the caller's read access (`get-blob`) against the source namespace (the `from`
+  repository, or for a `from`-less mount a namespace that references the blob) and falls back to a
+  normal upload session when none is readable, so a mount never hands over a blob the caller could
+  not otherwise pull. A mount is also its own route and CEL action, `mount-blob`, distinct from
+  `start-upload`, so you can additionally restrict who may mount at all with a
+  `request.action == 'mount-blob'` rule (denying it rejects the mount; Angos's replication falls back
+  to a normal upload). Container clients send `?mount=` opportunistically on push, so a default-deny
+  policy should grant `mount-blob` alongside `start-upload` or those pushes fail. See
+  [Restrict cross-repository blob mount](../how-to/set-up-access-control.md#restrict-cross-repository-blob-mount).
 
 ```
 GET /v2/{namespace}/blobs/uploads/{uuid}
@@ -119,6 +142,40 @@ Delete a manifest by tag or digest. Deleting by tag removes only that tag. Delet
 removes tags pointing at the digest and removes the manifest body when no remaining namespace
 references it. Config and layer blobs remain owned by the namespace until they are deleted through
 the blob endpoint or scrubbed as orphans.
+
+#### Replication request header
+
+Manifest `PUT` and `DELETE` accept an optional replication header, set automatically by Angos when
+mirroring a change to a configured downstream (it is not used by ordinary clients):
+
+| Header                     | Value                          | Purpose                                                                 |
+|----------------------------|--------------------------------|-------------------------------------------------------------------------|
+| `X-Angos-Source-Timestamp` | event timestamp (RFC 3339)     | Last-writer-wins: the receiver compares it against the creation time of the affected tags and rejects the write with `409 REPLICATION_SUPERSEDED` when the local copy is strictly newer. |
+
+Last-writer-wins applies only when `X-Angos-Source-Timestamp` is present and parses as RFC 3339,
+and is always evaluated against tag creation times. A tag `PUT` or `DELETE` is compared against the
+local tag's recorded creation time. A `DELETE` by digest cascades to every tag pointing at the
+revision, so it is guarded through those tags: when any pointing tag is strictly newer than the
+incoming timestamp, the whole delete is rejected with `409 REPLICATION_SUPERSEDED`: the newer tag,
+and the revision it still references, must not be dropped by the older delete. A `PUT` by digest is
+content-addressed (there is nothing to resolve) and is not LWW-guarded. A missing, empty, or
+malformed timestamp simply disables LWW for that request: the write is applied as an ordinary
+client write rather than failing. A local tag with no recorded creation time is treated as oldest
+and never blocks the incoming write.
+
+A future-dated timestamp is **clamped to the receiver's current time**, so a client cannot pin a
+permanent last-writer-wins victory. A *backdated* timestamp is accepted and persisted verbatim as
+the tag's creation time, where it weakens that write in later LWW races and feeds age-based
+retention and the `top_pushed` ranking with the supplied date. The header is honored from **any
+identity allowed to push** and cannot be gated separately from `put-manifest`, so a push-capable
+identity can backdate a tag far enough to make it eligible for pruning on the next `scrub
+--retention` run, an indirect delete even without a `delete-manifest` grant. Treat push on a
+replicated repository as trust over `created_at`, and restrict it via the CEL `access_policy` (see
+[Restrict replication writes](../how-to/set-up-access-control.md#restrict-replication-writes)).
+
+A `409 REPLICATION_SUPERSEDED` is convergence, not failure: the sender treats it as success and
+completes the replication job. It is distinct on the wire from the immutable-tag `409 CONFLICT`, which
+surfaces so the job retries or dead-letters.
 
 ### Tags
 
@@ -252,6 +309,100 @@ List blob uploads in progress.
   ]
 }
 ```
+
+### List Jobs
+
+```
+GET /_ext/_jobs
+```
+
+List pending and in-flight jobs on a durable job queue (see
+[Enable Durable Cache Jobs](../how-to/durable-cache-jobs.md), which introduces the queues and this
+admin API).
+
+Query parameters:
+- `n` - Maximum number of results (default 100)
+- `after` - Pagination cursor: the `next` value from the previous page
+- `queue` - Queue to administer: `cache` (default) or `replication`
+
+An unknown `queue` value, or any malformed query value (for example a non-numeric `n`), rejects the
+request rather than silently falling back to the default `cache` queue: the `GET` listings return
+`404` and the retry/delete mutations return `400`.
+
+Like the cross-repository blob mount, job administration uses its own CEL actions (`list-jobs`,
+`list-failed-jobs`, `retry-job`, and `delete-job`) so it can be gated behind higher privilege than
+registry reads; `queue` is exposed to CEL so the `replication` queue can be gated separately.
+
+**Response:**
+```json
+{
+  "jobs": [
+    {
+      "storage_key": "0000019700a1b2c3-123e4567-e89b-12d3-a456-426614174000",
+      "id": "123e4567-e89b-12d3-a456-426614174000",
+      "kind": "cache.fetch_blob",
+      "lock_key": "cache.library/nginx:sha256:abc123...",
+      "attempts": 1,
+      "max_attempts": 5,
+      "created_at": "2026-01-01T12:00:00Z",
+      "not_before": "2026-01-01T12:05:00Z"
+    }
+  ],
+  "next": "0000019700a1b2c3-123e4567-e89b-12d3-a456-426614174000"
+}
+```
+
+`not_before` is the earliest instant a worker may pick the job up, decoded from the storage key's
+time prefix. `next` is present only when another page follows; pass it back as `after`.
+
+### List Failed Jobs
+
+```
+GET /_ext/_jobs/failed
+```
+
+List dead-lettered jobs, i.e. jobs that exhausted their retry budget. Same query parameters and
+rejection rules as `GET /_ext/_jobs`.
+
+**Response:**
+```json
+{
+  "failed": [
+    {
+      "storage_key": "0000019700a1b2c3-123e4567-e89b-12d3-a456-426614174000",
+      "id": "123e4567-e89b-12d3-a456-426614174000",
+      "kind": "replication.push_manifest",
+      "lock_key": "replication.push.backup:library/nginx:latest",
+      "attempts": 5,
+      "max_attempts": 5,
+      "created_at": "2026-01-01T12:00:00Z",
+      "failed_at": "2026-01-01T12:30:00Z",
+      "last_error": "..."
+    }
+  ],
+  "next": "0000019700a1b2c3-123e4567-e89b-12d3-a456-426614174000"
+}
+```
+
+### Retry Failed Job
+
+```
+POST /_ext/_jobs/failed/{key}/retry
+```
+
+Requeue a dead-lettered job with its attempt counter reset to zero. `{key}` is the job's
+`storage_key` from the failed listing. Accepts `?queue=` like the listings. Returns
+`204 No Content` on success, or `404` when the key no longer exists.
+
+### Delete Job
+
+```
+DELETE /_ext/_jobs/failed/{key}
+DELETE /_ext/_jobs/pending/{key}
+```
+
+Delete a dead-lettered or pending job by `storage_key`. Accepts `?queue=` like the listings.
+Returns `204 No Content` on success, or `404` when the key no longer exists.
 
 ---
 
@@ -400,7 +551,8 @@ Errors follow OCI Distribution error format:
 | `NAME_UNKNOWN`        | 404          | Repository not found      |
 | `SIZE_INVALID`        | 400          | Size mismatch             |
 | `TAG_INVALID`         | 400          | Invalid tag               |
-| `TAG_IMMUTABLE`       | 409          | Tag cannot be overwritten |
+| `CONFLICT`            | 409          | Write rejected, for example, an immutable tag cannot be overwritten |
+| `REPLICATION_SUPERSEDED` | 409       | Replication write rejected by last-writer-wins (the local copy is strictly newer) |
 | `UNAUTHORIZED`        | 401          | Authentication required   |
 | `DENIED`              | 403 or 405   | Access denied by policy, or blob is still referenced |
 | `UNSUPPORTED`         | 415          | Unsupported operation     |

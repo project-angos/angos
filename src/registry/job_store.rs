@@ -69,9 +69,9 @@ impl From<LockError> for Error {
 // Configuration
 // ---------------------------------------------------------------------------
 
-/// Job-queue tunables. Setting `[global.job_queue]` selects the durable
-/// backend (surviving restarts); omitting the section selects the in-process
-/// backend over an in-memory store (jobs are discarded on restart).
+/// Job-queue tunables. `[global.job_queue]` does not change durability (jobs
+/// persist under the store's `_jobs/` prefix either way); it switches draining
+/// to separate `angos worker` processes and enables the queue-depth gauge.
 ///
 /// Storage is inherited from the shared `[metadata_store]` configuration.
 /// The per-`lock_key` execution lock TTL is governed by the configured lock
@@ -576,6 +576,32 @@ impl JobStore {
         }
     }
 
+    /// Count dead-lettered envelopes in `queue`, capped at
+    /// [`MAX_REPORTED_PENDING`]. Feeds the server-published
+    /// `angos_job_queue_failed` gauge so dead-letters stay observable even when
+    /// `angos worker` (which has no metrics endpoint) drains the queue.
+    pub async fn count_failed(&self, queue: &str) -> Result<u64, Error> {
+        let prefix = path_builder::job_failed_dir(queue);
+        let mut count: u64 = 0;
+        let mut token: Option<String> = None;
+        loop {
+            let page = self.store.list(&prefix, 1000, token).await?;
+            for name in &page.items {
+                if name.strip_suffix(".json").is_none() {
+                    continue;
+                }
+                count += 1;
+                if count >= MAX_REPORTED_PENDING {
+                    return Ok(MAX_REPORTED_PENDING);
+                }
+            }
+            match page.next_token {
+                Some(t) => token = Some(t),
+                None => return Ok(count),
+            }
+        }
+    }
+
     /// `true` when any pending job in `queue` carries `lock_key`. Best-effort
     /// dedup backed by an O(1) index file written alongside each pending
     /// envelope (see [`LockKeyIndex`]).
@@ -666,9 +692,10 @@ impl JobStore {
     ///
     /// The `Read` carries a fingerprint of `index_body`, so an index refreshed
     /// by a concurrent enqueue between the read and the apply turns the delete
-    /// into a no-op conflict rather than clobbering the fresh index. Three
+    /// into a no-op conflict rather than clobbering the fresh index. Four
     /// call sites fold this into their own transactions: the orphan self-heal
-    /// in `find_pending_with_lock_key`, `complete`, and `fail_dead_letter`.
+    /// in `find_pending_with_lock_key`, `retire_claimed_index`, `complete`, and
+    /// `fail_dead_letter`.
     fn conditional_index_delete(
         index_path: String,
         index_body: &[u8],
@@ -687,6 +714,37 @@ impl JobStore {
             expected: None,
         };
         (Some(read), Some(delete))
+    }
+
+    /// Retire the dedup index of a just-claimed job so a same-`lock_key`
+    /// enqueue arriving mid-execution starts a fresh pending file rather than
+    /// coalescing into the already-resolved job and silently dropping its write.
+    /// The pending file stays as the crash-recovery record, and the delete is
+    /// conditional plus fingerprint-guarded so a producer's newer index is
+    /// never clobbered.
+    async fn retire_claimed_index(&self, queue: &str, lock_key: &str, storage_key: &str) {
+        let (index_storage_key, body) = match self.get_lock_key_index_raw(queue, lock_key).await {
+            Ok(Some(found)) => found,
+            Ok(None) => return,
+            Err(e) => {
+                warn!(lock_key, error = %e, "Failed to read dedup index at claim");
+                return;
+            }
+        };
+        let index_path = path_builder::job_lock_key_index_path(queue, lock_key);
+        let (read, delete) =
+            Self::conditional_index_delete(index_path, &body, &index_storage_key, storage_key);
+        if delete.is_none() {
+            return;
+        }
+        let mut tx = Transaction::builder().build();
+        tx.reads.extend(read);
+        tx.mutations.extend(delete);
+        if let Err(e) = self.store.execute(tx).await
+            && !matches!(e, TxError::Conflict | TxError::Precondition)
+        {
+            warn!(lock_key, error = %tx_error_to_job(e), "Failed to retire dedup index at claim");
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -772,6 +830,10 @@ impl JobStore {
     /// prefix is in the future without reading its body — the prefix is the
     /// authoritative readiness signal. When no claim is made, `next_ready`
     /// carries that first future instant so the caller can sleep until then.
+    ///
+    /// On a successful claim the job's dedup index is retired (see
+    /// [`Self::retire_claimed_index`]) so a same-`lock_key` enqueue arriving
+    /// while the job runs is not coalesced into the already-resolved job.
     pub async fn claim_one(&self, queue: &str) -> Result<ClaimOutcome, Error> {
         let now = Utc::now();
         let mut next_ready: Option<DateTime<Utc>> = None;
@@ -802,6 +864,8 @@ impl JobStore {
                     worker_id = self.worker_id.as_str(),
                     "Claimed job"
                 );
+                self.retire_claimed_index(queue, &envelope.lock_key, &storage_key)
+                    .await;
                 return Ok(ClaimOutcome {
                     claimed: Some(ClaimedJob {
                         envelope,
@@ -1192,17 +1256,19 @@ pub fn backoff(n: u32) -> Duration {
 }
 
 // ---------------------------------------------------------------------------
-// Pending-gauge refresh loop
+// Queue-depth gauge refresh loop
 // ---------------------------------------------------------------------------
 
-/// Refresh `angos_job_queue_pending` for `queue` on every `period` tick,
-/// until `shutdown` is cancelled. Uses `tokio::time::interval` so the cadence
-/// stays fixed across slow `count_pending` calls; missed ticks are coalesced
-/// rather than catching up.
+/// Refresh the queue-depth gauges (`angos_job_queue_pending` and
+/// `angos_job_queue_failed`) for `queue` on every `period` tick, until
+/// `shutdown` is cancelled. Uses `tokio::time::interval` so the cadence stays
+/// fixed across slow count calls; missed ticks are coalesced rather than
+/// catching up.
 ///
 /// `ready_horizon_secs` is forwarded to `count_pending`: only envelopes ready
-/// within that window contribute to the gauge.
-pub async fn pending_refresh_loop(
+/// within that window contribute to the pending gauge. The server runs this
+/// loop so both gauges are scrapeable even when `angos worker` drains the queue.
+pub async fn queue_depth_refresh_loop(
     store: Arc<JobStore>,
     queue: String,
     period: Duration,
@@ -1227,6 +1293,15 @@ pub async fn pending_refresh_loop(
                     .set(i64::try_from(count).unwrap_or(i64::MAX));
             }
             Err(e) => debug!(queue = %queue, error = %e, "Failed to refresh pending gauge"),
+        }
+        match store.count_failed(&queue).await {
+            Ok(count) => {
+                metrics_provider()
+                    .job_queue_failed
+                    .with_label_values(&[queue.as_str()])
+                    .set(i64::try_from(count).unwrap_or(i64::MAX));
+            }
+            Err(e) => debug!(queue = %queue, error = %e, "Failed to refresh dead-letter gauge"),
         }
     }
 }

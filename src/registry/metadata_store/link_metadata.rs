@@ -22,10 +22,19 @@ pub struct LinkMetadata {
 }
 
 impl LinkMetadata {
+    /// Test convenience for `from_digest_at(target, now())`.
+    #[cfg(test)]
     pub fn from_digest(target: Digest) -> Self {
+        Self::from_digest_at(target, Utc::now())
+    }
+
+    /// Construct with an explicit creation time. Replicated writes pass the
+    /// originating `source_ts` so the tag's last-writer-wins timestamp tracks
+    /// the author's write time, not each receiver's clock.
+    pub fn from_digest_at(target: Digest, created_at: DateTime<Utc>) -> Self {
         Self {
             target,
-            created_at: Some(Utc::now()),
+            created_at: Some(created_at),
             accessed_at: None,
             referenced_by: HashSet::new(),
             media_type: None,
@@ -45,6 +54,30 @@ impl LinkMetadata {
         !self.referenced_by.is_empty()
     }
 
+    /// `Some(created_at)` iff this link strictly supersedes an incoming write
+    /// authored at `source_ts`: newer `created_at`, or equal with a target
+    /// digest ordering above `incoming_digest` (the tie-break that stops
+    /// equal-timestamp peers swapping digests forever; deletes carry no digest
+    /// and keep plain strictly-greater). `None` when the link has no
+    /// `created_at` or loses.
+    pub fn supersedes(
+        &self,
+        source_ts: DateTime<Utc>,
+        incoming_digest: Option<&Digest>,
+    ) -> Option<DateTime<Utc>> {
+        let created_at = self.created_at?;
+        if created_at > source_ts {
+            return Some(created_at);
+        }
+        if created_at == source_ts
+            && let Some(incoming) = incoming_digest
+            && self.target > *incoming
+        {
+            return Some(created_at);
+        }
+        None
+    }
+
     pub fn from_bytes(s: Vec<u8>) -> Result<Self, Error> {
         if let Ok(metadata) = serde_json::from_slice(&s) {
             return Ok(metadata);
@@ -54,8 +87,10 @@ impl LinkMetadata {
 
     /// Parses pre-JSON link data left over from the upstream `distribution`
     /// implementation, where each link file held only the bare digest string.
-    /// `created_at` is synthesised from the current time since the legacy
-    /// format carried no timestamp.
+    /// `created_at` is `None`: the legacy format carried no timestamp, so it
+    /// never supersedes a replicated write under last-writer-wins (a synthesised
+    /// `now()` would re-stamp fresher on every read and block replication
+    /// forever) and retention treats it as oldest, like any missing timestamp.
     fn from_legacy_bytes(s: Vec<u8>) -> Result<Self, Error> {
         let target = String::from_utf8(s).map_err(|e| Error::InvalidData(e.to_string()))?;
         let target =
@@ -63,7 +98,7 @@ impl LinkMetadata {
 
         Ok(LinkMetadata {
             target,
-            created_at: Some(Utc::now()),
+            created_at: None,
             accessed_at: None,
             referenced_by: HashSet::new(),
             media_type: None,
@@ -116,10 +151,11 @@ mod tests {
     }
 
     #[test]
-    fn from_digest_initialises_target_and_timestamps() {
-        let meta = LinkMetadata::from_digest(digest());
+    fn from_digest_at_uses_explicit_timestamp() {
+        let ts = Utc::now() - chrono::Duration::hours(2);
+        let meta = LinkMetadata::from_digest_at(digest(), ts);
         assert_eq!(meta.target, digest());
-        assert!(meta.created_at.is_some());
+        assert_eq!(meta.created_at, Some(ts));
         assert!(meta.accessed_at.is_none());
         assert!(meta.referenced_by.is_empty());
         assert!(meta.media_type.is_none());
@@ -153,10 +189,12 @@ mod tests {
     }
 
     #[test]
-    fn from_bytes_legacy_synthesises_created_at() {
+    fn from_bytes_legacy_has_no_created_at() {
+        // A synthesised timestamp would re-stamp fresher on every read and let a
+        // legacy tag win last-writer-wins forever, blocking replication.
         let raw = format!("sha256:{VALID_HASH}");
         let parsed = LinkMetadata::from_bytes(raw.into_bytes()).unwrap();
-        assert!(parsed.created_at.is_some());
+        assert!(parsed.created_at.is_none());
     }
 
     #[test]

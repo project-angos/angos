@@ -13,9 +13,24 @@ use crate::{
     util::sha256::finalize_digest,
 };
 
+/// Caps the namespaces CEL-evaluated for a from-less mount, bounding an
+/// attacker-influenceable fan-out. Candidates beyond the cap fall back to a
+/// normal upload session, so no access is over-granted.
+const MAX_FROM_LESS_MOUNT_CANDIDATES: usize = 32;
+
 pub enum StartUploadResponse {
     ExistingBlob { headers: HeaderMap },
     Session { headers: HeaderMap },
+}
+
+/// An OCI cross-repository blob mount request
+/// (`POST /v2/<ns>/blobs/uploads/?mount=<digest>[&from=<repo>]`).
+/// An unsatisfiable mount falls back to a normal upload session rather than
+/// failing, per the distribution spec.
+#[derive(Debug)]
+pub struct BlobMount {
+    pub digest: Digest,
+    pub from: Option<Namespace>,
 }
 
 pub struct GetUploadResponse {
@@ -167,6 +182,85 @@ impl Registry {
         }
     }
 
+    /// Grants `namespace` a reference to `mount.digest`, re-checked against the
+    /// authorized `source`, returning `Ok(None)` when the source no longer
+    /// holds the blob or its bytes are gone. Check and grant run under the
+    /// `blob-data:{digest}` lock so a concurrent `delete_blob` cannot leave a
+    /// dangling reference.
+    async fn try_cross_repo_mount(
+        &self,
+        namespace: &Namespace,
+        mount: &BlobMount,
+        source: &Namespace,
+    ) -> Result<Option<HeaderMap>, Error> {
+        let session = self.acquire_blob_data_lock(&mount.digest).await?;
+        let result = async {
+            if self.blob_store.size(&mount.digest).await.is_err()
+                || !BlobOwnership::new(self.metadata_store.as_ref())
+                    .can_read(source, &mount.digest)
+                    .await?
+            {
+                return Ok(None);
+            }
+
+            BlobOwnership::new(self.metadata_store.as_ref())
+                .grant(namespace, &mount.digest)
+                .await?;
+            Ok(Some(blob_location_headers(namespace, &mount.digest)))
+        }
+        .await;
+        session.release().await;
+        result
+    }
+
+    /// Source namespaces whose read policy must permit the caller: `[from]`
+    /// when set and owning the blob, else every namespace referencing it.
+    /// Empty when the mount cannot be satisfied.
+    pub async fn mount_source_candidates(
+        &self,
+        mount: &BlobMount,
+    ) -> Result<Vec<Namespace>, Error> {
+        if self.blob_store.size(&mount.digest).await.is_err() {
+            return Ok(Vec::new());
+        }
+
+        if let Some(from) = &mount.from {
+            let readable = BlobOwnership::new(self.metadata_store.as_ref())
+                .can_read(from, &mount.digest)
+                .await?;
+            return Ok(if readable {
+                vec![from.clone()]
+            } else {
+                Vec::new()
+            });
+        }
+
+        let mut candidates = BlobOwnership::new(self.metadata_store.as_ref())
+            .referencing_namespaces(&mount.digest)
+            .await?;
+        // Sort before truncating so the kept candidates are deterministic.
+        candidates.sort();
+        candidates.truncate(MAX_FROM_LESS_MOUNT_CANDIDATES);
+        Ok(candidates)
+    }
+
+    /// Opens a fresh resumable upload session and returns its `202` headers.
+    async fn open_upload_session(
+        &self,
+        namespace: &Namespace,
+    ) -> Result<StartUploadResponse, Error> {
+        let session_uuid = Uuid::new_v4().to_string();
+        self.blob_store
+            .create_upload(namespace, &session_uuid)
+            .await?;
+
+        Ok(StartUploadResponse::Session {
+            headers: upload_session_headers(namespace, &session_uuid),
+        })
+    }
+
+    /// Starts a blob upload: `ExistingBlob` (201) when the namespace already
+    /// owns `digest`, otherwise a new session (202).
     #[instrument]
     pub async fn start_upload(
         &self,
@@ -184,14 +278,31 @@ impl Registry {
             });
         }
 
-        let session_uuid = Uuid::new_v4().to_string();
-        self.blob_store
-            .create_upload(namespace, &session_uuid)
-            .await?;
+        self.open_upload_session(namespace).await
+    }
 
-        Ok(StartUploadResponse::Session {
-            headers: upload_session_headers(namespace, &session_uuid),
-        })
+    /// Starts a cross-repository blob mount from the authorized `source`,
+    /// falling back to an ordinary upload session when the mount cannot be
+    /// satisfied. A satisfied mount returns a `blob.push` event (the session
+    /// fallback returns none: its eventual upload completion emits one), so a
+    /// mounted blob is as visible to webhook consumers as an uploaded one.
+    #[instrument(skip(actor))]
+    pub async fn mount_blob(
+        &self,
+        actor: Option<EventActor>,
+        namespace: &Namespace,
+        mount: &BlobMount,
+        source: &Namespace,
+    ) -> Result<(StartUploadResponse, Vec<Event>), Error> {
+        if let Some(headers) = self.try_cross_repo_mount(namespace, mount, source).await? {
+            let repository = self.repository_name_for(namespace);
+            let event = Event::new(EventKind::BlobPush, namespace.to_string(), repository)
+                .digest(Some(mount.digest.to_string()))
+                .actor(actor);
+            return Ok((StartUploadResponse::ExistingBlob { headers }, vec![event]));
+        }
+
+        Ok((self.open_upload_session(namespace).await?, Vec::new()))
     }
 
     #[instrument(skip(stream))]
@@ -333,11 +444,14 @@ impl Registry {
 
 #[cfg(test)]
 mod tests {
-    use std::{io::Cursor, sync::Arc};
+    use std::{io::Cursor, str::FromStr, sync::Arc};
 
     use async_trait::async_trait;
     use bytes::Bytes;
-    use hyper::header::{LOCATION, RANGE};
+    use hyper::{
+        Request,
+        header::{LOCATION, RANGE},
+    };
     use uuid::Uuid;
 
     use angos_storage::{
@@ -347,10 +461,13 @@ mod tests {
     use angos_tx_engine::store::Store;
 
     use crate::{
+        auth::Authorizer,
+        cache,
         event_webhook::event::EventKind,
+        identity::ClientIdentity,
         oci::{Digest, Namespace},
         registry::{
-            DOCKER_CONTENT_DIGEST, DOCKER_UPLOAD_UUID, Error, StartUploadResponse,
+            BlobMount, DOCKER_CONTENT_DIGEST, DOCKER_UPLOAD_UUID, Error, StartUploadResponse,
             blob_ownership::BlobOwnership,
             blob_store::BlobStore,
             metadata_store::link_kind::LinkKind,
@@ -360,6 +477,7 @@ mod tests {
                 put_blob_direct,
             },
         },
+        test_fixtures::configuration::load_config,
         util::sha256,
     };
 
@@ -566,6 +684,416 @@ mod tests {
                 }
                 StartUploadResponse::Session { .. } => panic!("Expected Existing response"),
             }
+            test_case.cleanup().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn test_mount_blob_grants_and_returns_existing() {
+        for test_case in backends() {
+            let registry = test_case.registry();
+            let source = &Namespace::new("test-repo/source").unwrap();
+            let target = &Namespace::new("test-repo/target").unwrap();
+            let content = b"cross-repo mountable blob";
+
+            let digest = put_blob_direct(registry.metadata_store.store(), content).await;
+            BlobOwnership::new(registry.metadata_store.as_ref())
+                .grant(source, &digest)
+                .await
+                .unwrap();
+
+            let mount = BlobMount {
+                digest: digest.clone(),
+                from: Some(source.clone()),
+            };
+            let (response, _events) = registry
+                .mount_blob(None, target, &mount, source)
+                .await
+                .unwrap();
+
+            match response {
+                StartUploadResponse::ExistingBlob { headers } => {
+                    assert_eq!(headers[DOCKER_CONTENT_DIGEST], digest.to_string());
+                    assert_eq!(
+                        headers[LOCATION.as_str()],
+                        format!("/v2/{target}/blobs/{digest}")
+                    );
+                }
+                StartUploadResponse::Session { .. } => {
+                    panic!("Expected a mounted existing-blob response")
+                }
+            }
+
+            assert!(
+                BlobOwnership::new(registry.metadata_store.as_ref())
+                    .can_read(target, &digest)
+                    .await
+                    .unwrap(),
+                "mount must grant the target namespace a reference"
+            );
+            test_case.cleanup().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn test_mount_blob_emits_blob_push_event() {
+        // A satisfied mount must emit blob.push so webhook consumers see the
+        // mounted blob, just as a completed upload does.
+        for test_case in backends() {
+            let registry = test_case.registry();
+            let source = &Namespace::new("test-repo/source").unwrap();
+            let target = &Namespace::new("test-repo/target").unwrap();
+
+            let digest = put_blob_direct(registry.metadata_store.store(), b"mountable").await;
+            BlobOwnership::new(registry.metadata_store.as_ref())
+                .grant(source, &digest)
+                .await
+                .unwrap();
+
+            let mount = BlobMount {
+                digest: digest.clone(),
+                from: Some(source.clone()),
+            };
+            let (response, events) = registry
+                .mount_blob(None, target, &mount, source)
+                .await
+                .unwrap();
+
+            assert!(matches!(response, StartUploadResponse::ExistingBlob { .. }));
+            assert_eq!(events.len(), 1, "a satisfied mount must emit one event");
+            assert_eq!(events[0].kind, EventKind::BlobPush);
+            assert_eq!(events[0].namespace, target.to_string());
+            assert_eq!(
+                events[0].digest.as_deref(),
+                Some(digest.to_string().as_str())
+            );
+            test_case.cleanup().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn test_mount_blob_fallback_emits_no_event() {
+        // The session fallback grants nothing yet; its eventual upload emits the
+        // event, so the mount itself must not.
+        for test_case in backends() {
+            let registry = test_case.registry();
+            let source = &Namespace::new("test-repo/source").unwrap();
+            let target = &Namespace::new("test-repo/target").unwrap();
+
+            // Present but unowned by `source` -> the mount falls back to a session.
+            let digest = put_blob_direct(registry.metadata_store.store(), b"not owned").await;
+            let mount = BlobMount {
+                digest,
+                from: Some(source.clone()),
+            };
+            let (response, events) = registry
+                .mount_blob(None, target, &mount, source)
+                .await
+                .unwrap();
+
+            assert!(matches!(response, StartUploadResponse::Session { .. }));
+            assert!(events.is_empty(), "a fallback session must emit no event");
+            test_case.cleanup().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn test_mount_blob_falls_back_when_source_lacks_blob() {
+        for test_case in backends() {
+            let registry = test_case.registry();
+            let source = &Namespace::new("test-repo/source").unwrap();
+            let target = &Namespace::new("test-repo/target").unwrap();
+            let content = b"blob present but not owned by source";
+
+            let digest = put_blob_direct(registry.metadata_store.store(), content).await;
+
+            let mount = BlobMount {
+                digest: digest.clone(),
+                from: Some(source.clone()),
+            };
+            let (response, _events) = registry
+                .mount_blob(None, target, &mount, source)
+                .await
+                .unwrap();
+
+            match response {
+                StartUploadResponse::Session { headers } => {
+                    assert!(
+                        headers[LOCATION.as_str()]
+                            .starts_with(&format!("/v2/{target}/blobs/uploads/"))
+                    );
+                }
+                StartUploadResponse::ExistingBlob { .. } => {
+                    panic!("Expected a fall-back session when the source does not own the blob")
+                }
+            }
+
+            assert!(
+                !BlobOwnership::new(registry.metadata_store.as_ref())
+                    .can_read(target, &digest)
+                    .await
+                    .unwrap(),
+                "a failed mount must not grant the target namespace a reference"
+            );
+            test_case.cleanup().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn test_mount_blob_falls_back_when_blob_absent() {
+        for test_case in backends() {
+            let registry = test_case.registry();
+            let source = &Namespace::new("test-repo/source").unwrap();
+            let target = &Namespace::new("test-repo/target").unwrap();
+
+            let absent = Digest::from_str(
+                "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+            )
+            .unwrap();
+            let mount = BlobMount {
+                digest: absent,
+                from: Some(source.clone()),
+            };
+            let (response, _events) = registry
+                .mount_blob(None, target, &mount, source)
+                .await
+                .unwrap();
+
+            assert!(
+                matches!(response, StartUploadResponse::Session { .. }),
+                "an absent blob must fall back to a normal upload session"
+            );
+            test_case.cleanup().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn test_mount_blob_automatic_grants_referenced_blob() {
+        for test_case in backends() {
+            let registry = test_case.registry();
+            let owner = &Namespace::new("test-repo/owner").unwrap();
+            let target = &Namespace::new("test-repo/target").unwrap();
+            let content = b"automatically discoverable blob";
+
+            let digest = put_blob_direct(registry.metadata_store.store(), content).await;
+            BlobOwnership::new(registry.metadata_store.as_ref())
+                .grant(owner, &digest)
+                .await
+                .unwrap();
+
+            let mount = BlobMount {
+                digest: digest.clone(),
+                from: None,
+            };
+            let (response, _events) = registry
+                .mount_blob(None, target, &mount, owner)
+                .await
+                .unwrap();
+
+            match response {
+                StartUploadResponse::ExistingBlob { headers } => {
+                    assert_eq!(headers[DOCKER_CONTENT_DIGEST], digest.to_string());
+                }
+                StartUploadResponse::Session { .. } => {
+                    panic!("automatic discovery must mount a referenced blob")
+                }
+            }
+            assert!(
+                BlobOwnership::new(registry.metadata_store.as_ref())
+                    .can_read(target, &digest)
+                    .await
+                    .unwrap(),
+                "automatic mount must grant the target namespace a reference"
+            );
+            test_case.cleanup().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn test_mount_blob_automatic_falls_back_for_unreferenced_blob() {
+        for test_case in backends() {
+            let registry = test_case.registry();
+            let target = &Namespace::new("test-repo/target").unwrap();
+            let source = &Namespace::new("test-repo/source").unwrap();
+            let content = b"orphan blob present but unreferenced";
+
+            let digest = put_blob_direct(registry.metadata_store.store(), content).await;
+
+            let mount = BlobMount {
+                digest: digest.clone(),
+                from: None,
+            };
+            let (response, _events) = registry
+                .mount_blob(None, target, &mount, source)
+                .await
+                .unwrap();
+
+            assert!(
+                matches!(response, StartUploadResponse::Session { .. }),
+                "an unreferenced (orphan) blob must not be auto-mounted"
+            );
+            test_case.cleanup().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn test_mount_blob_grants_only_from_the_authorized_source() {
+        for test_case in backends() {
+            let registry = test_case.registry();
+            let owner = &Namespace::new("test-repo/owner").unwrap();
+            let authorized = &Namespace::new("test-repo/authorized").unwrap();
+            let target = &Namespace::new("test-repo/target").unwrap();
+            let content = b"held by owner, not by the authorized source";
+
+            // Guards the authorize-then-grant TOCTOU: the grant is conditioned
+            // on the authorized source, not on `owner`.
+            let digest = put_blob_direct(registry.metadata_store.store(), content).await;
+            BlobOwnership::new(registry.metadata_store.as_ref())
+                .grant(owner, &digest)
+                .await
+                .unwrap();
+
+            let mount = BlobMount {
+                digest: digest.clone(),
+                from: None,
+            };
+            let (response, _events) = registry
+                .mount_blob(None, target, &mount, authorized)
+                .await
+                .unwrap();
+
+            assert!(
+                matches!(response, StartUploadResponse::Session { .. }),
+                "mount must fall back when the authorized source does not hold the blob"
+            );
+            assert!(
+                !BlobOwnership::new(registry.metadata_store.as_ref())
+                    .can_read(target, &digest)
+                    .await
+                    .unwrap(),
+                "target must not be granted a reference from an unauthorized source"
+            );
+            test_case.cleanup().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn mount_source_candidates_resolves_from_and_discovery() {
+        for test_case in backends() {
+            let registry = test_case.registry();
+            let source = &Namespace::new("test-repo/source").unwrap();
+            let other = &Namespace::new("test-repo/other").unwrap();
+            let target = &Namespace::new("test-repo/target").unwrap();
+            let content = b"candidate resolution blob";
+
+            let digest = put_blob_direct(registry.metadata_store.store(), content).await;
+            let ownership = BlobOwnership::new(registry.metadata_store.as_ref());
+            ownership.grant(source, &digest).await.unwrap();
+            ownership.grant(other, &digest).await.unwrap();
+
+            let candidates = registry
+                .mount_source_candidates(&BlobMount {
+                    digest: digest.clone(),
+                    from: Some(source.clone()),
+                })
+                .await
+                .unwrap();
+            assert_eq!(candidates, vec![source.clone()]);
+
+            let candidates = registry
+                .mount_source_candidates(&BlobMount {
+                    digest: digest.clone(),
+                    from: Some(target.clone()),
+                })
+                .await
+                .unwrap();
+            assert!(candidates.is_empty());
+
+            // Lexicographic order guards the sort-before-truncate determinism.
+            let candidates = registry
+                .mount_source_candidates(&BlobMount {
+                    digest: digest.clone(),
+                    from: None,
+                })
+                .await
+                .unwrap();
+            assert_eq!(candidates, vec![other.clone(), source.clone()]);
+
+            let absent = Digest::from_str(
+                "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+            )
+            .unwrap();
+            let candidates = registry
+                .mount_source_candidates(&BlobMount {
+                    digest: absent,
+                    from: None,
+                })
+                .await
+                .unwrap();
+            assert!(candidates.is_empty());
+
+            test_case.cleanup().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn authorize_mount_source_requires_read_on_the_source() {
+        for test_case in backends() {
+            let registry = test_case.registry();
+            let source = &Namespace::new("test-repo/source").unwrap();
+            let content = b"mount authorization blob";
+
+            let digest = put_blob_direct(registry.metadata_store.store(), content).await;
+            BlobOwnership::new(registry.metadata_store.as_ref())
+                .grant(source, &digest)
+                .await
+                .unwrap();
+
+            let config = load_config(
+                r#"
+                [global.access_policy]
+                default = "deny"
+                rules = ["identity.id == 'reader'"]
+
+                [repository."test-repo".access_policy]
+                default = "allow"
+            "#,
+            );
+            let cache = cache::Config::Memory.to_backend().unwrap();
+            let authorizer = Authorizer::new(&config, &cache).unwrap();
+
+            let (parts, ()) = Request::builder()
+                .uri("/v2/")
+                .body(())
+                .unwrap()
+                .into_parts();
+            let mut reader = ClientIdentity::new(None);
+            reader.id = Some("reader".to_string());
+            let stranger = ClientIdentity::new(None);
+
+            for from in [Some(source.clone()), None] {
+                let mount = BlobMount {
+                    digest: digest.clone(),
+                    from,
+                };
+                assert!(
+                    authorizer
+                        .authorize_mount_source(&mount, &reader, &parts, registry)
+                        .await
+                        .unwrap()
+                        .is_some(),
+                    "a caller permitted to read the source must be allowed to mount"
+                );
+                assert!(
+                    authorizer
+                        .authorize_mount_source(&mount, &stranger, &parts, registry)
+                        .await
+                        .unwrap()
+                        .is_none(),
+                    "a caller denied read on the source must not be allowed to mount"
+                );
+            }
+
             test_case.cleanup().await;
         }
     }
@@ -958,8 +1486,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_complete_upload_digest_mismatch_still_rejected() {
-        use std::str::FromStr;
-
         for test_case in backends() {
             let registry = test_case.registry();
             let namespace = &Namespace::new("test-repo").unwrap();

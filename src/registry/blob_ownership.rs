@@ -57,4 +57,45 @@ impl<'a> BlobOwnership<'a> {
             Err(error) => Err(error.into()),
         }
     }
+
+    /// Every local namespace referencing `digest`, per the blob index; empty
+    /// when none do (a missing index entry is not an error). Malformed index
+    /// keys are skipped rather than failing the enumeration.
+    pub async fn referencing_namespaces(&self, digest: &Digest) -> Result<Vec<Namespace>, Error> {
+        let index = match self.metadata_store.read_blob_index(digest).await {
+            Ok(index) => index,
+            Err(MetadataError::ReferenceNotFound) => return Ok(Vec::new()),
+            Err(error) => return Err(error.into()),
+        };
+
+        let mut namespaces = Vec::with_capacity(index.namespace.len());
+        for key in index.namespace.into_keys() {
+            if let Ok(namespace) = Namespace::new(&key) {
+                namespaces.push(namespace);
+            }
+        }
+        Ok(namespaces)
+    }
+
+    /// The lexicographically-smallest namespace referencing `digest`, excluding
+    /// `exclude`; `None` when no other namespace references it. Takes the
+    /// minimum without materialising the full referencing-namespace set.
+    pub async fn smallest_referencing_namespace(
+        &self,
+        digest: &Digest,
+        exclude: &str,
+    ) -> Result<Option<Namespace>, Error> {
+        let index = match self.metadata_store.read_blob_index(digest).await {
+            Ok(index) => index,
+            Err(MetadataError::ReferenceNotFound) => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+
+        Ok(index
+            .namespace
+            .into_keys()
+            .filter(|key| key != exclude)
+            .filter_map(|key| Namespace::new(&key).ok())
+            .min())
+    }
 }

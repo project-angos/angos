@@ -2,11 +2,13 @@ use std::{collections::HashMap, sync::Arc};
 
 use bytes::Bytes;
 use bytesize::ByteSize;
+use serde_json::json;
 use sha2::{Digest as Sha256Digest, Sha256};
 use tempfile::TempDir;
 use uuid::Uuid;
 
 use crate::{
+    cache,
     configuration::GlobalConfig,
     metrics_provider,
     oci::{Digest, Namespace},
@@ -14,10 +16,16 @@ use crate::{
     registry::{
         Registry, RegistryConfig, Repository,
         blob_store::{self, sha256_ext::Sha256Ext},
+        job_store::JobStore,
+        manifest::DEFAULT_MAX_MANIFEST_SIZE_BYTES,
         metadata_store::{LinkOperation, MetadataStore, link_kind::LinkKind},
         path_builder, repository,
         repository_resolver::RepositoryResolver,
         s3_connection::S3ConnectionConfig,
+    },
+    registry_client::RegistryClient,
+    replication::{
+        REPLICATION_QUEUE, ReplicationDownstream, ReplicationMode, ReplicationPushPayload,
     },
     secret::Secret,
 };
@@ -87,10 +95,21 @@ pub fn metadata_store_over(
     object: Arc<dyn ObjectStore>,
     executor: Arc<dyn TransactionExecutor>,
 ) -> Arc<MetadataStore> {
+    metadata_store_over_cached(object, executor, 0)
+}
+
+/// Like [`metadata_store_over`] but with a memory-backed link cache at
+/// `link_cache_ttl_secs` (`0` keeps it disabled).
+pub fn metadata_store_over_cached(
+    object: Arc<dyn ObjectStore>,
+    executor: Arc<dyn TransactionExecutor>,
+    link_cache_ttl_secs: u64,
+) -> Arc<MetadataStore> {
     Arc::new(
         MetadataStore::builder()
             .store(build_store(object, executor))
-            .link_cache_ttl(0)
+            .cache(cache::Config::Memory.to_backend().expect("memory cache"))
+            .link_cache_ttl(link_cache_ttl_secs)
             .access_time_debounce_secs(0)
             .build()
             .expect("test metadata backend"),
@@ -115,6 +134,7 @@ pub fn create_test_repositories() -> Arc<HashMap<String, Repository>> {
         Repository {
             name: "test-repo".to_string(),
             upstreams: Vec::new(),
+            replication: Vec::new(),
             retention_policy: RetentionPolicy::new(&config.retention_policy, Arc::new(SystemClock)),
             immutable_tags: config.immutable_tags,
             immutable_tags_exclusions: config.immutable_tags_exclusions,
@@ -143,6 +163,19 @@ pub fn create_test_registry(
         .global_immutable_tags_exclusions(global.immutable_tags_exclusions.clone());
 
     Registry::new(blob_store, metadata_store, resolver, config).unwrap()
+}
+
+/// Write raw bytes at the canonical link path for `link` in `namespace`,
+/// bypassing the transactional `update_links` path so tests can seed
+/// hand-crafted or deliberately corrupt link files.
+pub async fn put_link_raw(store: &Store, namespace: &str, link: &LinkKind, body: &[u8]) {
+    store
+        .put(
+            &path_builder::link_path(link, namespace),
+            Bytes::copy_from_slice(body),
+        )
+        .await
+        .expect("raw link write");
 }
 
 /// Write `content` directly at the canonical blob path via the underlying
@@ -199,6 +232,7 @@ pub async fn create_test_blob(
     let repository = Repository {
         name: "test-repo".to_string(),
         upstreams: Vec::new(),
+        replication: Vec::new(),
         retention_policy: RetentionPolicy::new(
             &RetentionPolicyConfig { rules: Vec::new() },
             Arc::new(SystemClock),
@@ -234,6 +268,12 @@ pub struct FSRegistryTestCase {
 
 impl FSRegistryTestCase {
     pub fn new() -> Self {
+        Self::with_link_cache_ttl(0)
+    }
+
+    /// Like [`Self::new`] but with the per-process link cache enabled at
+    /// `link_cache_ttl_secs`, for tests pinning which reads must bypass it.
+    pub fn with_link_cache_ttl(link_cache_ttl_secs: u64) -> Self {
         let temp_dir = TempDir::new().expect("Failed to create temp dir for FSBackendConfig");
         let path = temp_dir.path().to_string_lossy().to_string();
 
@@ -251,7 +291,8 @@ impl FSRegistryTestCase {
                 .build()
                 .expect("fs metadata storage"),
         );
-        let metadata_store = metadata_store_over(meta_storage, meta_executor);
+        let metadata_store =
+            metadata_store_over_cached(meta_storage, meta_executor, link_cache_ttl_secs);
         let registry = create_test_registry(blob_store.clone(), metadata_store.clone());
 
         Self {
@@ -264,13 +305,6 @@ impl FSRegistryTestCase {
 
     pub fn registry(&self) -> &Registry {
         &self.registry
-    }
-
-    pub fn set_repositories(&mut self, repositories: Arc<HashMap<String, Repository>>) {
-        self.registry.resolver = Arc::new(
-            RepositoryResolver::new(repositories)
-                .expect("test repositories must not have overlapping prefixes"),
-        );
     }
 
     pub fn temp_dir(&self) -> &TempDir {
@@ -384,4 +418,126 @@ impl RegistryTestCase for S3RegistryTestCase {
             println!("Warning: Failed to clean up S3RegistryTestCase data: {e:?}");
         }
     }
+}
+
+/// Build an `Arc<RegistryClient>` pointed at `uri` with a fresh in-memory
+/// cache. Callers pass a real mock-server URI, or a placeholder like
+/// `"https://unused.test"` when the client is never dialed.
+pub fn downstream_client(uri: &str) -> Arc<RegistryClient> {
+    let backend = cache::Config::Memory.to_backend().unwrap();
+    Arc::new(
+        RegistryClient::builder()
+            .url(uri.to_string())
+            .client(reqwest::Client::new())
+            .cache(backend)
+            .max_manifest_size_bytes(DEFAULT_MAX_MANIFEST_SIZE_BYTES)
+            .build()
+            .unwrap(),
+    )
+}
+
+/// Build a test `Repository` named `name` carrying `replication` downstreams.
+/// The sole `Repository` test literal lives here, so a new struct field is
+/// edited in one place; callers vary only the downstream set.
+pub fn repository_with_replication(
+    name: &str,
+    replication: Vec<ReplicationDownstream>,
+) -> Repository {
+    Repository {
+        name: name.to_string(),
+        upstreams: Vec::new(),
+        replication,
+        retention_policy: RetentionPolicy::new(
+            &RetentionPolicyConfig::default(),
+            Arc::new(SystemClock),
+        ),
+        immutable_tags: false,
+        immutable_tags_exclusions: Vec::new(),
+    }
+}
+
+/// Build a `Repository` named `name` carrying exactly one event+reconcile
+/// downstream "eu-region" (match-all filter, `max_concurrent_pushes` 4) backed
+/// by `client`.
+pub fn repository_with_downstream(name: &str, client: Arc<RegistryClient>) -> Repository {
+    repository_with_replication(
+        name,
+        vec![
+            ReplicationDownstream::builder()
+                .name("eu-region".to_string())
+                .registry_client(client)
+                .mode(ReplicationMode::EventReconcile)
+                .namespace_filter(Vec::new())
+                .max_concurrent_pushes(4)
+                .build()
+                .unwrap(),
+        ],
+    )
+}
+
+/// Decode the payload of the sole pending replication job, panicking unless
+/// exactly one is pending.
+pub async fn sole_pending_payload(job_store: &JobStore) -> ReplicationPushPayload {
+    let keys = job_store.list_pending(REPLICATION_QUEUE, 16).await.unwrap();
+    assert_eq!(
+        keys.len(),
+        1,
+        "expected exactly one pending replication job"
+    );
+    let envelope = job_store
+        .read_pending(REPLICATION_QUEUE, &keys[0])
+        .await
+        .unwrap();
+    assert_eq!(envelope.queue, REPLICATION_QUEUE);
+    serde_json::from_value(envelope.payload).expect("decode ReplicationPushPayload")
+}
+
+/// Seed a config blob, a layer blob, a manifest referencing both, and a `v1`
+/// tag link under `namespace`. Returns the (manifest, config, layer) digests.
+/// `store`/`metadata_store` accept `&Arc<..>` via deref coercion; pass the
+/// repository namespace (callers use "nginx").
+pub async fn seed_manifest(
+    store: &Store,
+    metadata_store: &MetadataStore,
+    namespace: &str,
+) -> (Digest, Digest, Digest) {
+    let config_bytes = br#"{"config":true}"#.to_vec();
+    let layer_bytes = b"layer-bytes".to_vec();
+
+    let config_digest = put_blob_direct(store, &config_bytes).await;
+    let layer_digest = put_blob_direct(store, &layer_bytes).await;
+
+    let manifest = json!({
+        "schemaVersion": 2,
+        "mediaType": "application/vnd.oci.image.manifest.v1+json",
+        "config": {
+            "mediaType": "application/vnd.oci.image.config.v1+json",
+            "digest": config_digest.to_string(),
+            "size": config_bytes.len(),
+        },
+        "layers": [{
+            "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+            "digest": layer_digest.to_string(),
+            "size": layer_bytes.len(),
+        }],
+    });
+    let manifest_bytes = serde_json::to_vec(&manifest).unwrap();
+    let manifest_digest = put_blob_direct(store, &manifest_bytes).await;
+
+    metadata_store
+        .update_links(
+            namespace,
+            &[
+                LinkOperation::create(LinkKind::Tag("v1".to_string()), manifest_digest.clone()),
+                LinkOperation::create(
+                    LinkKind::Config(config_digest.clone()),
+                    config_digest.clone(),
+                ),
+                LinkOperation::create(LinkKind::Layer(layer_digest.clone()), layer_digest.clone()),
+            ],
+        )
+        .await
+        .unwrap();
+
+    (manifest_digest, config_digest, layer_digest)
 }

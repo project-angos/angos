@@ -1,24 +1,32 @@
-use std::sync::Arc;
+use std::{num::NonZeroUsize, sync::Arc};
 
 use argh::FromArgs;
-use futures_util::StreamExt;
-use tracing::info;
+use futures_util::{StreamExt, future::join_all};
+use tracing::{info, warn};
+use uuid::Uuid;
 
 use crate::{
     command::{
         bootstrap,
         scrub::{
             check::{
-                BlobChecker, LayoutChecker, MultipartChecker, NamespaceChecker, StoreChecker,
-                list_all,
+                BlobChecker, LayoutChecker, MultipartChecker, NamespaceChecker, OrphanGrantChecker,
+                OrphanJobChecker, StoreChecker, list_all,
             },
             error::Error,
             executor::{ActionSink, DryRunSink, Executor},
             setup,
         },
+        worker::runner::run_once,
     },
     configuration::Configuration,
-    registry::metadata_store::MetadataStore,
+    registry::{
+        blob_store::BlobStore,
+        job_store::{JobHandler, JobStore},
+        metadata_store::MetadataStore,
+        repository_resolver::RepositoryResolver,
+    },
+    replication::{REPLICATION_QUEUE, ReplicationJobHandler},
 };
 
 #[derive(FromArgs, PartialEq, Debug)]
@@ -59,6 +67,26 @@ pub struct Options {
     #[argh(switch, short = 'R')]
     /// check for and remove orphan referrer links whose referrer manifest is no longer a current revision
     pub referrers: bool,
+    #[argh(switch)]
+    /// reconcile replicated namespaces with their downstreams: enqueue a push for
+    /// each diverging or missing tag, and for a downstream marked prune = true a
+    /// delete for each downstream-only tag (one-way mirror; unsafe for
+    /// active-active peers)
+    pub replicate: bool,
+    #[argh(switch)]
+    /// delete replication jobs (pending and dead-lettered) whose downstream or
+    /// repository is no longer configured
+    pub replication_orphans: bool,
+    #[argh(switch)]
+    /// delete cache jobs (pending and dead-lettered) whose repository is no
+    /// longer configured for pull-through
+    pub cache_orphans: bool,
+    #[argh(option)]
+    /// revoke orphaned blob-ownership grants older than the specified age: a
+    /// blob a namespace owns but no manifest references (e.g. a replication push
+    /// that lost last-writer-wins), reclaiming the bytes when it was the last
+    /// reference
+    pub orphan_grants: Option<humantime::Duration>,
 }
 
 pub struct Command {
@@ -67,7 +95,25 @@ pub struct Command {
     layout_checker: LayoutChecker,
     blob_checker: Option<BlobChecker>,
     multipart_checker: Option<MultipartChecker>,
+    orphan_grant_checker: Option<OrphanGrantChecker>,
+    /// One checker per queue selected by `--replication-orphans` and
+    /// `--cache-orphans`; empty when neither flag is set.
+    orphan_job_checkers: Vec<OrphanJobChecker>,
     sink: Box<dyn ActionSink + Send>,
+    /// Drains reconcile-enqueued replication jobs in-process, since no running
+    /// worker is assumed; a transiently failing push is rescheduled with backoff
+    /// onto the durable queue for a worker or a later run. `None` when dry-run or
+    /// `--replicate` is absent.
+    replication_drain: Option<ReplicationDrain>,
+}
+
+/// Consumer queue and handler for draining reconcile-enqueued replication jobs
+/// in-process. `concurrency` bounds the parallel claim loops so a cold-mirror
+/// reconcile does not push one tag at a time.
+struct ReplicationDrain {
+    consumer: Arc<JobStore>,
+    handler: Box<dyn JobHandler>,
+    concurrency: NonZeroUsize,
 }
 
 impl Command {
@@ -93,12 +139,39 @@ impl Command {
         let layout_checker = setup::layout_checker(&blob_backend);
         let blob_checker = setup::blob_checker(options, &blob_backend, &metadata_store);
         let multipart_checker = setup::multipart_checker(options, &blob_backend)?;
+        let orphan_grant_checker =
+            setup::orphan_grant_checker(options, &blob_backend, &metadata_store)?;
+        let orphan_job_checkers =
+            setup::orphan_job_checkers(options, &metadata_store, &repositories)?;
 
+        // One `Arc<JobStore>` serves as both producer (Executor enqueue) and
+        // consumer (end-of-run drain). Building the queue is cheap, so every
+        // non-dry-run `Executor` owns one; the drain is wired only with
+        // `--replicate`.
+        let mut replication_drain: Option<ReplicationDrain> = None;
         let sink: Box<dyn ActionSink + Send> = if options.dry_run {
             info!("Dry-run mode: no changes will be made to the storage");
             Box::new(DryRunSink)
         } else {
-            Box::new(Executor::new(blob_backend.clone(), metadata_store.clone()))
+            let job_store = Arc::new(JobStore::new(
+                metadata_store.store_arc(),
+                format!("scrub-{}", Uuid::new_v4()),
+            ));
+            let executor = Executor::builder()
+                .blob_store(blob_backend.clone())
+                .metadata_store(metadata_store.clone())
+                .job_store(job_store.clone())
+                .build()?;
+            if options.replicate {
+                replication_drain = Some(Self::build_replication_drain(
+                    job_store,
+                    &blob_backend,
+                    &metadata_store,
+                    &repositories,
+                    config.global.max_concurrent_replication_jobs,
+                )?);
+            }
+            Box::new(executor)
         };
 
         Ok(Self {
@@ -107,7 +180,35 @@ impl Command {
             layout_checker,
             blob_checker,
             multipart_checker,
+            orphan_grant_checker,
+            orphan_job_checkers,
             sink,
+            replication_drain,
+        })
+    }
+
+    /// Builds the consumer queue and handler for the in-process drain.
+    /// Reconcile-enqueued pushes carry `source_ts = None`; the handler re-derives
+    /// it from the tag's `created_at`, so the receiver still runs last-writer-wins.
+    fn build_replication_drain(
+        consumer: Arc<JobStore>,
+        blob_store: &Arc<BlobStore>,
+        metadata_store: &Arc<MetadataStore>,
+        resolver: &Arc<RepositoryResolver>,
+        concurrency: NonZeroUsize,
+    ) -> Result<ReplicationDrain, Error> {
+        let handler = ReplicationJobHandler::builder()
+            .resolver(resolver.clone())
+            .blob_store(blob_store.clone())
+            .metadata_store(metadata_store.clone())
+            .build()
+            .map_err(|e| {
+                Error::Initialization(format!("failed to build replication handler: {e}"))
+            })?;
+        Ok(ReplicationDrain {
+            consumer,
+            handler: Box::new(handler),
+            concurrency,
         })
     }
 
@@ -115,14 +216,20 @@ impl Command {
         self.migrate_storage_layout().await?;
         self.scrub_metadata().await?;
         self.scrub_blobs().await?;
+        self.scrub_orphan_grants().await?;
         self.scrub_multipart_uploads().await?;
+        // Orphan jobs (replication and cache queues) must be scrubbed before
+        // the drain: the drain claims any pending replication job and would
+        // churn its orphans through retries first.
+        self.scrub_orphan_jobs().await?;
+        self.drain_replication_jobs().await;
         self.metadata_store.flush_access_times().await;
         Ok(())
     }
 
     async fn migrate_storage_layout(&mut self) -> Result<(), Error> {
         if let Err(e) = self.layout_checker.check_all(self.sink.as_mut()).await {
-            tracing::warn!("Storage layout migration checker failed: {e}");
+            warn!("Storage layout migration checker failed: {e}");
         }
         Ok(())
     }
@@ -136,7 +243,7 @@ impl Command {
                     .check(&namespace, self.sink.as_mut())
                     .await
                 {
-                    tracing::warn!("Scrub checker failed for namespace '{namespace}': {e}");
+                    warn!("Scrub checker failed for namespace '{namespace}': {e}");
                 }
             }
         }
@@ -147,7 +254,16 @@ impl Command {
         if let Some(checker) = &self.blob_checker
             && let Err(e) = checker.check_all(self.sink.as_mut()).await
         {
-            tracing::warn!("Blob scrub checker failed: {e}");
+            warn!("Blob scrub checker failed: {e}");
+        }
+        Ok(())
+    }
+
+    async fn scrub_orphan_grants(&mut self) -> Result<(), Error> {
+        if let Some(checker) = &self.orphan_grant_checker
+            && let Err(e) = checker.check_all(self.sink.as_mut()).await
+        {
+            warn!("Orphan blob-grant scrub checker failed: {e}");
         }
         Ok(())
     }
@@ -156,9 +272,49 @@ impl Command {
         if let Some(checker) = &self.multipart_checker
             && let Err(e) = checker.check_all(self.sink.as_mut()).await
         {
-            tracing::warn!("Multipart scrub checker failed: {e}");
+            warn!("Multipart scrub checker failed: {e}");
         }
         Ok(())
+    }
+
+    async fn scrub_orphan_jobs(&mut self) -> Result<(), Error> {
+        for checker in &self.orphan_job_checkers {
+            if let Err(e) = checker.check_all(self.sink.as_mut()).await {
+                warn!("Orphan job scrub checker failed: {e}");
+            }
+        }
+        Ok(())
+    }
+
+    /// Drains reconcile-enqueued replication jobs with up to
+    /// `max_concurrent_replication_jobs` concurrent claim loops. A loop ends when
+    /// no claimable job remains, so jobs already backed off to a future time are
+    /// intentionally not awaited.
+    async fn drain_replication_jobs(&mut self) {
+        let Some(drain) = &self.replication_drain else {
+            return;
+        };
+
+        info!(
+            "Draining enqueued replication jobs to convergence ({} concurrent)",
+            drain.concurrency
+        );
+        let loops = (0..drain.concurrency.get()).map(|_| async {
+            let mut drained: u64 = 0;
+            loop {
+                match run_once(&drain.consumer, drain.handler.as_ref(), REPLICATION_QUEUE).await {
+                    Ok(true) => drained += 1,
+                    Ok(false) => break,
+                    Err(e) => {
+                        warn!("Failed to claim a replication job during drain: {e}");
+                        break;
+                    }
+                }
+            }
+            drained
+        });
+        let drained: u64 = join_all(loops).await.into_iter().sum();
+        info!("Replication drain complete: processed {drained} job(s)");
     }
 }
 
@@ -210,6 +366,10 @@ mod tests {
             links: false,
             media_types: false,
             referrers: false,
+            replicate: false,
+            replication_orphans: false,
+            cache_orphans: false,
+            orphan_grants: None,
         };
 
         let command = Command::new(&options, &config).await;

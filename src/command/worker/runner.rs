@@ -1,9 +1,9 @@
 use tokio::select;
 use tracing::{error, info, warn};
 
-#[cfg(test)]
-use crate::registry::job_store::Error;
-use crate::registry::job_store::{ClaimedJob, CompleteOutcome, FailOutcome, JobHandler, JobStore};
+use crate::registry::job_store::{
+    ClaimedJob, CompleteOutcome, Error, FailOutcome, JobHandler, JobStore,
+};
 
 /// Execute one claimed job: observe the lock session's cancellation
 /// token alongside the handler future, then complete, fail (with retry
@@ -49,8 +49,7 @@ pub async fn execute_one(consumer: &JobStore, handler: &dyn JobHandler, claimed:
 }
 
 /// Drive one full claim → execute → complete/fail cycle. Returns `true` when
-/// a job was processed. Used by tests to validate end-to-end mechanics.
-#[cfg(test)]
+/// a job was processed and `false` when no claimable job remains.
 pub async fn run_once(
     consumer: &JobStore,
     handler: &dyn JobHandler,

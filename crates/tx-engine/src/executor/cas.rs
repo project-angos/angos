@@ -11,7 +11,10 @@
 //! body differs → return `Error::PartialCommit` and preserve the intent for
 //! the recovery loop).
 
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -122,14 +125,17 @@ impl CasExecutor {
         CasExecutorBuilder::default()
     }
 
-    /// Verify the read set and capture each read key's live etag.
+    /// Verify the read set, capturing each present read key's live etag and
+    /// each key a read confirmed absent.
     ///
     /// Re-reads every read key, checks the content fingerprint recorded at
-    /// build time (returning [`Error::Conflict`] on mismatch or if the key has
-    /// vanished), and returns the live etag per key so the caller can turn
-    /// same-key mutations into compare-and-swap writes.
-    async fn prepare_reads(&self, tx: &Transaction) -> Result<HashMap<String, Etag>, Error> {
-        let mut etags = HashMap::with_capacity(tx.reads.len());
+    /// build time (returning [`Error::Conflict`] on mismatch or if a
+    /// present-expecting key has vanished). The etags let the caller turn a
+    /// same-key write into a compare-and-swap; the absent set lets it turn a
+    /// same-key write into a `PutIfAbsent` so the absence precondition holds
+    /// through Apply, not just Prepare.
+    async fn prepare_reads(&self, tx: &Transaction) -> Result<PreparedReads, Error> {
+        let mut prepared = PreparedReads::default();
         for read in &tx.reads {
             match self.store.get_with_etag(&read.key).await {
                 Ok((body, etag)) => {
@@ -142,16 +148,20 @@ impl CasExecutor {
                         return Err(Error::Conflict);
                     }
                     if let Some(etag) = etag {
-                        etags.insert(read.key.clone(), etag);
+                        prepared.etags.insert(read.key.clone(), etag);
                     }
                 }
                 Err(StorageError::NotFound) => {
-                    return Err(Error::Conflict);
+                    // An absent key matches only a read that recorded absence.
+                    if !read.expects_absent() {
+                        return Err(Error::Conflict);
+                    }
+                    prepared.absent.insert(read.key.clone());
                 }
                 Err(e) => return Err(Error::Storage(e)),
             }
         }
-        Ok(etags)
+        Ok(prepared)
     }
 
     /// Apply all mutations in the intent.
@@ -223,15 +233,26 @@ impl CasExecutor {
     }
 }
 
-/// Promote same-key read-modify-write mutations to compare-and-swap writes and
-/// order them ahead of unconditional mutations.
+/// Verified read set: live etags for keys read as present, and the keys a read
+/// confirmed absent.
+#[derive(Default)]
+struct PreparedReads {
+    etags: HashMap<String, Etag>,
+    absent: HashSet<String>,
+}
+
+/// Promote same-key read-modify-write mutations to conditional writes and order
+/// them ahead of unconditional mutations.
 ///
-/// `read_etags` maps each read key to the live etag captured at Prepare. Any
-/// `Put`/`Delete` that targets a read key and carries no explicit precondition
-/// is rewritten to require that etag, then stably moved to the front so a CAS
-/// failure aborts the transaction before any sibling mutation commits.
-fn apply_read_preconditions(records: &mut [MutationRecord], read_etags: &HashMap<String, Etag>) {
-    if read_etags.is_empty() {
+/// A `Put`/`Delete` on a key read as *present* with no explicit precondition is
+/// conditioned on the etag captured at Prepare; a `Put` on a key read as
+/// *absent* becomes a `PutIfAbsent`. Either way the precondition holds through
+/// Apply, so a racing write in the Prepare→Apply window aborts the transaction
+/// before any sibling mutation commits and the caller's retry loop re-reads.
+/// The read-keyed mutations are stably moved to the front so that abort lands
+/// clean.
+fn apply_read_preconditions(records: &mut [MutationRecord], reads: &PreparedReads) {
+    if reads.etags.is_empty() && reads.absent.is_empty() {
         return;
     }
     for record in records.iter_mut() {
@@ -240,19 +261,33 @@ fn apply_read_preconditions(records: &mut [MutationRecord], read_etags: &HashMap
             | MutationRecord::Delete { key, expected }
                 if expected.is_none() =>
             {
-                if let Some(etag) = read_etags.get(key) {
+                if let Some(etag) = reads.etags.get(key) {
                     *expected = Some(etag.clone());
                 }
             }
             _ => {}
         }
+        if let MutationRecord::Put {
+            key,
+            body_ref,
+            expected: None,
+        } = record
+            && reads.absent.contains(key)
+        {
+            *record = MutationRecord::PutIfAbsent {
+                key: key.clone(),
+                body_ref: body_ref.clone(),
+            };
+        }
     }
-    records.sort_by_key(|record| u8::from(!is_read_keyed(record, read_etags)));
+    records.sort_by_key(|record| u8::from(!is_read_keyed(record, reads)));
 }
 
 /// `true` when any key the mutation touches was part of the read set.
-fn is_read_keyed(record: &MutationRecord, read_etags: &HashMap<String, Etag>) -> bool {
-    record.all_keys().any(|key| read_etags.contains_key(key))
+fn is_read_keyed(record: &MutationRecord, reads: &PreparedReads) -> bool {
+    record
+        .all_keys()
+        .any(|key| reads.etags.contains_key(key) || reads.absent.contains(key))
 }
 
 /// Per-key precondition-failure semantics for [`apply_cas`].
@@ -435,7 +470,7 @@ impl TransactionExecutor for CasExecutor {
     async fn execute(&self, tx: Transaction) -> Result<Outcome, Error> {
         let tx_id = Uuid::new_v4();
 
-        let read_etags = self.prepare_reads(&tx).await?;
+        let prepared_reads = self.prepare_reads(&tx).await?;
 
         let mut mutation_records = stage_bodies(self.store.as_ref(), &tx, tx_id).await?;
 
@@ -445,7 +480,7 @@ impl TransactionExecutor for CasExecutor {
         // its CAS before any sibling mutation commits, so the transaction rolls
         // back cleanly (no mutation applied yet) and the caller's retry loop
         // re-reads and converges — no lost update, no stuck partial intent.
-        apply_read_preconditions(&mut mutation_records, &read_etags);
+        apply_read_preconditions(&mut mutation_records, &prepared_reads);
 
         // CAS executor takes no transaction-scoped lock for its working set.
         // When the caller declares coarse lock keys (e.g. `blob-data:{digest}`),
@@ -502,5 +537,70 @@ impl TransactionExecutor for CasExecutor {
 
     fn conditional_store(&self) -> Option<Arc<dyn ConditionalStore>> {
         Some(Arc::clone(&self.store))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn put(key: &str) -> MutationRecord {
+        MutationRecord::Put {
+            key: key.to_string(),
+            body_ref: format!("body/{key}"),
+            expected: None,
+        }
+    }
+
+    #[test]
+    fn absent_read_promotes_same_key_put_to_put_if_absent() {
+        // The Put carries the absence precondition through Apply, so a racing
+        // create in the Prepare->Apply window aborts rather than being clobbered.
+        let mut reads = PreparedReads::default();
+        reads.absent.insert("tag".to_string());
+
+        let mut records = vec![put("tag")];
+        apply_read_preconditions(&mut records, &reads);
+
+        assert!(
+            matches!(
+                &records[0],
+                MutationRecord::PutIfAbsent { key, body_ref }
+                    if key == "tag" && body_ref == "body/tag"
+            ),
+            "an absent-read same-key Put must become PutIfAbsent, got {:?}",
+            records[0]
+        );
+    }
+
+    #[test]
+    fn present_read_conditions_same_key_put_on_its_etag() {
+        let mut reads = PreparedReads::default();
+        reads.etags.insert("tag".to_string(), Etag::new("etag-1"));
+
+        let mut records = vec![put("tag")];
+        apply_read_preconditions(&mut records, &reads);
+
+        assert!(
+            matches!(
+                &records[0],
+                MutationRecord::Put { expected: Some(e), .. } if *e == Etag::new("etag-1")
+            ),
+            "a present-read same-key Put must be conditioned on its etag, got {:?}",
+            records[0]
+        );
+    }
+
+    #[test]
+    fn unread_key_put_stays_unconditional() {
+        let reads = PreparedReads::default();
+
+        let mut records = vec![put("other")];
+        apply_read_preconditions(&mut records, &reads);
+
+        assert!(matches!(
+            &records[0],
+            MutationRecord::Put { expected: None, .. }
+        ));
     }
 }

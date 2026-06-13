@@ -1,4 +1,8 @@
-use std::{collections::HashMap, io::Cursor, slice};
+use std::{
+    collections::{HashMap, HashSet},
+    io::Cursor,
+    slice,
+};
 
 use futures_util::future::join_all;
 use hyper::header::{CONTENT_LENGTH, CONTENT_TYPE, LOCATION};
@@ -7,15 +11,16 @@ use uuid::Uuid;
 
 use super::{parse::manifest_meta_from_body, *};
 use crate::{
+    command::server::Error as ServerError,
     oci::Namespace,
     registry::{
         Error, Registry,
-        metadata_store::{self, LinkOperation, link_kind::LinkKind},
+        metadata_store::{self, LinkMetadata, LinkOperation, link_kind::LinkKind},
         test_utils::{
-            FSRegistryTestCase, RegistryTestCase, backends, create_test_repositories,
-            put_blob_direct,
+            FSRegistryTestCase, RegistryTestCase, backends, put_blob_direct, put_link_raw,
         },
     },
+    replication::REPLICATION_SUPERSEDED_CODE,
     util::sha256,
 };
 
@@ -560,7 +565,7 @@ async fn test_delete_manifest() {
 
         // Test delete manifest by tag
         registry
-            .delete_manifest(None, namespace, &Reference::Tag(tag.to_string()))
+            .delete_manifest(None, None, namespace, &Reference::Tag(tag.to_string()))
             .await
             .unwrap();
 
@@ -581,6 +586,7 @@ async fn test_delete_manifest() {
         // Test delete manifest by digest
         registry
             .delete_manifest(
+                None,
                 None,
                 namespace,
                 &Reference::Digest(header_digest(&response.headers)),
@@ -651,7 +657,12 @@ async fn delete_manifest_then_delete_uploaded_blobs() {
         assert!(matches!(layer_result, Err(Error::BlobReferenced)));
 
         registry
-            .delete_manifest(None, namespace, &Reference::Digest(manifest_digest.clone()))
+            .delete_manifest(
+                None,
+                None,
+                namespace,
+                &Reference::Digest(manifest_digest.clone()),
+            )
             .await
             .unwrap();
 
@@ -747,6 +758,11 @@ fn test_parse_manifest_digests() {
     let (content, media_type) = create_raw_test_manifest();
     let digests = parse_manifest_digests(&content, Some(&media_type)).unwrap();
 
+    assert_eq!(
+        digests.media_type.as_ref(),
+        Some(&media_type),
+        "the parse must surface the body's declared mediaType"
+    );
     assert!(digests.subject.is_none());
     assert_eq!(
         digests.config.unwrap().to_string(),
@@ -846,6 +862,7 @@ async fn accept_put_manifest_rejects_body_above_limit() {
     let err = registry
         .accept_put_manifest(
             None,
+            None,
             namespace,
             Reference::Tag("latest".to_string()),
             "application/vnd.oci.image.manifest.v1+json".to_string(),
@@ -937,49 +954,6 @@ fn parse_manifest_digests_index_manifest_populates_manifests_vec() {
 }
 
 #[tokio::test]
-async fn test_handle_head_manifest() {
-    for test_case in backends() {
-        let registry = test_case.registry();
-        let namespace = &Namespace::new("test-repo").unwrap();
-        let tag = "latest";
-        let (content, media_type) = create_test_manifest(registry, namespace).await;
-
-        let put_response = registry
-            .put_manifest(
-                namespace,
-                &Reference::Tag(tag.to_string()),
-                Some(&media_type),
-                &content,
-            )
-            .await
-            .unwrap();
-
-        let repository = registry.get_repository_for_namespace(namespace).unwrap();
-        let head = registry
-            .head_manifest(
-                repository,
-                &[],
-                namespace,
-                Reference::Tag(tag.to_string()),
-                false,
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(
-            header_digest(&head.headers),
-            header_digest(&put_response.headers)
-        );
-        assert_eq!(
-            head.headers[CONTENT_LENGTH.as_str()],
-            content.len().to_string()
-        );
-        assert_eq!(head.headers[CONTENT_TYPE.as_str()], media_type);
-        test_case.cleanup().await;
-    }
-}
-
-#[tokio::test]
 async fn test_handle_get_manifest() {
     for test_case in backends() {
         let registry = test_case.registry();
@@ -1038,6 +1012,7 @@ async fn test_handle_put_manifest() {
         let response = registry
             .accept_put_manifest(
                 None,
+                None,
                 namespace,
                 Reference::Tag(tag.to_string()),
                 media_type.clone(),
@@ -1073,107 +1048,6 @@ async fn test_handle_put_manifest() {
 }
 
 #[tokio::test]
-async fn test_handle_delete_manifest() {
-    for test_case in backends() {
-        let registry = test_case.registry();
-        let namespace = &Namespace::new("test-repo").unwrap();
-        let tag = "latest";
-        let (content, media_type) = create_test_manifest(registry, namespace).await;
-
-        registry
-            .put_manifest(
-                namespace,
-                &Reference::Tag(tag.to_string()),
-                Some(&media_type),
-                &content,
-            )
-            .await
-            .unwrap();
-
-        registry
-            .delete_manifest(None, namespace, &Reference::Tag(tag.to_string()))
-            .await
-            .unwrap();
-
-        assert!(
-            registry
-                .get_manifest(
-                    registry.get_repository_for_namespace(namespace).unwrap(),
-                    slice::from_ref(&media_type),
-                    namespace,
-                    Reference::Tag(tag.to_string()),
-                    false,
-                )
-                .await
-                .is_err()
-        );
-        test_case.cleanup().await;
-    }
-}
-
-async fn test_pull_through_cache_optimization_impl(test_case: &mut FSRegistryTestCase) {
-    let namespace = &Namespace::new("test-repo").unwrap();
-
-    let repositories = create_test_repositories();
-
-    test_case.set_repositories(repositories);
-    let registry = test_case.registry();
-    let (content, media_type) = create_test_manifest(registry, namespace).await;
-
-    let immutable_tag = "v1.0.0";
-    let put_result = registry
-        .put_manifest(
-            namespace,
-            &Reference::Tag(immutable_tag.to_string()),
-            Some(&media_type),
-            &content,
-        )
-        .await;
-    assert!(put_result.is_ok());
-
-    let repository = registry.get_repository_for_namespace(namespace).unwrap();
-
-    let get_result = registry
-        .get_manifest(
-            repository,
-            slice::from_ref(&media_type),
-            namespace,
-            Reference::Tag(immutable_tag.to_string()),
-            false,
-        )
-        .await;
-    assert!(get_result.is_ok());
-
-    let mutable_tag = "latest";
-    let _ = registry
-        .put_manifest(
-            namespace,
-            &Reference::Tag(mutable_tag.to_string()),
-            Some(&media_type),
-            &content,
-        )
-        .await
-        .unwrap();
-
-    let get_mutable = registry
-        .get_manifest(
-            repository,
-            slice::from_ref(&media_type),
-            namespace,
-            Reference::Tag(mutable_tag.to_string()),
-            false,
-        )
-        .await;
-    assert!(get_mutable.is_ok());
-}
-
-#[tokio::test]
-async fn test_pull_through_cache_optimization_fs() {
-    let mut t = FSRegistryTestCase::new();
-    test_pull_through_cache_optimization_impl(&mut t).await;
-}
-
-#[tokio::test]
 async fn test_delete_manifest_by_digest_removes_multiple_tags() {
     for test_case in backends() {
         let registry = test_case.registry();
@@ -1202,6 +1076,7 @@ async fn test_delete_manifest_by_digest_removes_multiple_tags() {
 
         registry
             .delete_manifest(
+                None,
                 None,
                 namespace,
                 &Reference::Digest(header_digest(&response.headers)),
@@ -1294,6 +1169,7 @@ async fn test_delete_manifest_by_digest_preserves_unrelated_tags() {
 
         registry
             .delete_manifest(
+                None,
                 None,
                 namespace,
                 &Reference::Digest(header_digest(&response_a.headers)),
@@ -1391,6 +1267,7 @@ async fn test_delete_manifest_with_many_tags() {
         registry
             .delete_manifest(
                 None,
+                None,
                 namespace,
                 &Reference::Digest(header_digest(&response_a.headers)),
             )
@@ -1487,70 +1364,6 @@ async fn test_put_manifest_stores_media_type() {
 }
 
 #[tokio::test]
-async fn test_head_manifest_returns_correct_media_type() {
-    for test_case in backends() {
-        let registry = test_case.registry();
-        let namespace = &Namespace::new("test-repo/head-media-type").unwrap();
-        let (content, media_type) = create_test_manifest(registry, namespace).await;
-
-        let put_response = registry
-            .put_manifest(
-                namespace,
-                &Reference::Tag("latest".to_string()),
-                Some(&media_type),
-                &content,
-            )
-            .await
-            .unwrap();
-
-        let repository = registry.get_repository_for_namespace(namespace).unwrap();
-
-        let head = registry
-            .head_manifest(
-                repository,
-                slice::from_ref(&media_type),
-                namespace,
-                Reference::Tag("latest".to_string()),
-                false,
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(head.headers[CONTENT_TYPE.as_str()], media_type);
-        assert_eq!(
-            header_digest(&head.headers),
-            header_digest(&put_response.headers)
-        );
-        assert_eq!(
-            head.headers[CONTENT_LENGTH.as_str()],
-            content.len().to_string()
-        );
-
-        let head_by_digest = registry
-            .head_manifest(
-                repository,
-                slice::from_ref(&media_type),
-                namespace,
-                Reference::Digest(header_digest(&put_response.headers)),
-                false,
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(head_by_digest.headers[CONTENT_TYPE.as_str()], media_type);
-        assert_eq!(
-            header_digest(&head_by_digest.headers),
-            header_digest(&put_response.headers)
-        );
-        assert_eq!(
-            head_by_digest.headers[CONTENT_LENGTH.as_str()],
-            content.len().to_string()
-        );
-        test_case.cleanup().await;
-    }
-}
-
-#[tokio::test]
 async fn test_head_manifest_fallback_without_media_type() {
     for test_case in backends() {
         let registry = test_case.registry();
@@ -1626,12 +1439,13 @@ async fn test_delete_manifest_no_tags_by_digest() {
             .unwrap();
 
         registry
-            .delete_manifest(None, namespace, &Reference::Tag("temp".to_string()))
+            .delete_manifest(None, None, namespace, &Reference::Tag("temp".to_string()))
             .await
             .unwrap();
 
         registry
             .delete_manifest(
+                None,
                 None,
                 namespace,
                 &Reference::Digest(header_digest(&response.headers)),
@@ -1652,114 +1466,6 @@ async fn test_delete_manifest_no_tags_by_digest() {
                 )
                 .await
                 .is_err()
-        );
-        test_case.cleanup().await;
-    }
-}
-
-#[tokio::test]
-async fn test_put_manifest_stores_media_type_in_links() {
-    for test_case in backends() {
-        let registry = test_case.registry();
-        let namespace = &Namespace::new("test-repo/media-type-links").unwrap();
-        let (content, media_type) = create_test_manifest(registry, namespace).await;
-
-        let response = registry
-            .put_manifest(
-                namespace,
-                &Reference::Tag("latest".to_string()),
-                Some(&media_type),
-                &content,
-            )
-            .await
-            .unwrap();
-
-        let digest_link = registry
-            .metadata_store
-            .read_link(
-                namespace,
-                &LinkKind::Digest(header_digest(&response.headers)),
-                false,
-            )
-            .await
-            .unwrap();
-        assert_eq!(
-            digest_link.media_type,
-            Some(media_type.clone()),
-            "Digest link should have media_type stored"
-        );
-
-        let tag_link = registry
-            .metadata_store
-            .read_link(namespace, &LinkKind::Tag("latest".to_string()), false)
-            .await
-            .unwrap();
-        assert_eq!(
-            tag_link.media_type,
-            Some(media_type.clone()),
-            "Tag link should have media_type stored"
-        );
-        test_case.cleanup().await;
-    }
-}
-
-#[tokio::test]
-async fn test_head_local_manifest_uses_metadata_media_type() {
-    for test_case in backends() {
-        let registry = test_case.registry();
-        let namespace = &Namespace::new("test-repo/head-optimized").unwrap();
-        let (content, media_type) = create_test_manifest(registry, namespace).await;
-
-        let response = registry
-            .put_manifest(
-                namespace,
-                &Reference::Tag("v1.0".to_string()),
-                Some(&media_type),
-                &content,
-            )
-            .await
-            .unwrap();
-
-        let head = registry
-            .head_manifest(
-                registry.get_repository_for_namespace(namespace).unwrap(),
-                slice::from_ref(&media_type),
-                namespace,
-                Reference::Tag("v1.0".to_string()),
-                false,
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(head.headers[CONTENT_TYPE.as_str()], media_type);
-        assert_eq!(
-            header_digest(&head.headers),
-            header_digest(&response.headers)
-        );
-        assert_eq!(
-            head.headers[CONTENT_LENGTH.as_str()],
-            content.len().to_string()
-        );
-
-        let head = registry
-            .head_manifest(
-                registry.get_repository_for_namespace(namespace).unwrap(),
-                slice::from_ref(&media_type),
-                namespace,
-                Reference::Digest(header_digest(&response.headers)),
-                false,
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(head.headers[CONTENT_TYPE.as_str()], media_type);
-        assert_eq!(
-            header_digest(&head.headers),
-            header_digest(&response.headers)
-        );
-        assert_eq!(
-            head.headers[CONTENT_LENGTH.as_str()],
-            content.len().to_string()
         );
         test_case.cleanup().await;
     }
@@ -1797,54 +1503,6 @@ async fn test_put_manifest_without_content_type_stores_manifest_media_type() {
             Some("application/vnd.docker.distribution.manifest.v2+json".to_string()),
             "Digest link should have media_type from manifest body"
         );
-        test_case.cleanup().await;
-    }
-}
-
-#[tokio::test]
-async fn test_handle_get_manifest_redirect_includes_content_type() {
-    for test_case in backends() {
-        let registry = test_case.registry();
-        let namespace = &Namespace::new("test-repo/redirect-ct").unwrap();
-        let (content, media_type) = create_test_manifest(registry, namespace).await;
-
-        let put_response = registry
-            .put_manifest(
-                namespace,
-                &Reference::Tag("latest".to_string()),
-                Some(&media_type),
-                &content,
-            )
-            .await
-            .unwrap();
-
-        let response = registry
-            .resolve_get_manifest(
-                namespace,
-                Reference::Tag("latest".to_string()),
-                slice::from_ref(&media_type),
-                false,
-            )
-            .await
-            .unwrap();
-
-        match response {
-            GetManifestResponse::Redirect { headers } => {
-                assert_eq!(
-                    header_digest(&headers),
-                    header_digest(&put_response.headers),
-                    "Redirect digest must match"
-                );
-                assert_eq!(
-                    headers[CONTENT_TYPE.as_str()],
-                    media_type,
-                    "Redirect should carry Content-Type from stored media_type"
-                );
-            }
-            GetManifestResponse::Body { headers, .. } => {
-                assert_eq!(headers[CONTENT_TYPE.as_str()], media_type);
-            }
-        }
         test_case.cleanup().await;
     }
 }
@@ -1893,59 +1551,6 @@ async fn test_handle_get_manifest_redirect_fallback_without_media_type() {
             }
             GetManifestResponse::Body { headers, .. } => {
                 assert!(headers.contains_key(CONTENT_TYPE.as_str()));
-            }
-        }
-        test_case.cleanup().await;
-    }
-}
-
-#[tokio::test]
-async fn test_handle_get_manifest_no_redirect_returns_body() {
-    for test_case in backends() {
-        let registry = test_case.registry();
-        let namespace = &Namespace::new("test-repo/no-redirect").unwrap();
-        let (content, media_type) = create_test_manifest(registry, namespace).await;
-
-        let put_response = registry
-            .put_manifest(
-                namespace,
-                &Reference::Tag("latest".to_string()),
-                Some(&media_type),
-                &content,
-            )
-            .await
-            .unwrap();
-
-        let response = registry
-            .resolve_get_manifest(
-                namespace,
-                Reference::Tag("latest".to_string()),
-                slice::from_ref(&media_type),
-                false,
-            )
-            .await
-            .unwrap();
-
-        // Both redirect and body responses are valid depending on backend capabilities.
-        // Verify the content is correct in either case.
-        match response {
-            GetManifestResponse::Redirect { headers } => {
-                assert_eq!(
-                    header_digest(&headers),
-                    header_digest(&put_response.headers)
-                );
-                assert_eq!(headers[CONTENT_TYPE.as_str()], media_type);
-            }
-            GetManifestResponse::Body {
-                headers,
-                content: body,
-            } => {
-                assert_eq!(
-                    header_digest(&headers),
-                    header_digest(&put_response.headers)
-                );
-                assert_eq!(headers[CONTENT_TYPE.as_str()], media_type);
-                assert_eq!(body, content);
             }
         }
         test_case.cleanup().await;
@@ -2154,7 +1759,7 @@ async fn delete_manifest_removes_links_and_blob_data() {
 
     // Delete by digest.
     registry
-        .delete_manifest(None, &namespace, &Reference::Digest(digest.clone()))
+        .delete_manifest(None, None, &namespace, &Reference::Digest(digest.clone()))
         .await
         .unwrap();
 
@@ -2167,4 +1772,1816 @@ async fn delete_manifest_removes_links_and_blob_data() {
         matches!(result, Err(metadata_store::Error::ReferenceNotFound)),
         "digest link should be gone after delete, got: {result:?}"
     );
+}
+
+// --- Receiver-side last-writer-wins (LWW) ------------------------------------
+
+async fn seed_tag(registry: &Registry, namespace: &Namespace, tag: &str) -> (Vec<u8>, String) {
+    let (content, media_type) = create_test_manifest(registry, namespace).await;
+    registry
+        .accept_put_manifest(
+            None,
+            None,
+            namespace,
+            Reference::Tag(tag.to_string()),
+            media_type.clone(),
+            Cursor::new(content.clone()),
+        )
+        .await
+        .expect("seed tag push");
+    (content, media_type)
+}
+
+async fn local_created_at(
+    registry: &Registry,
+    namespace: &Namespace,
+    tag: &str,
+) -> chrono::DateTime<chrono::Utc> {
+    registry
+        .metadata_store
+        .read_link(namespace.as_ref(), &LinkKind::Tag(tag.to_string()), false)
+        .await
+        .expect("read seeded tag link")
+        .created_at
+        .expect("seeded tag has created_at")
+}
+
+#[tokio::test]
+async fn accept_put_manifest_stamps_created_at_from_source_ts() {
+    // LWW and retention track author time across hops, not the receiver's clock.
+    let test_case = FSRegistryTestCase::new();
+    let registry = test_case.registry();
+    let namespace = &Namespace::new("lww-repo").unwrap();
+    let tag = "latest";
+
+    let (content, media_type) = create_test_manifest(registry, namespace).await;
+    let source_ts = chrono::Utc::now() - chrono::Duration::hours(3);
+
+    registry
+        .accept_put_manifest(
+            None,
+            Some(source_ts),
+            namespace,
+            Reference::Tag(tag.to_string()),
+            media_type,
+            Cursor::new(content),
+        )
+        .await
+        .expect("replicated push must store");
+
+    assert_eq!(
+        local_created_at(registry, namespace, tag).await,
+        source_ts,
+        "a replicated write must stamp created_at = source_ts (author time)"
+    );
+}
+
+#[tokio::test]
+async fn accept_put_manifest_without_source_ts_stamps_local_clock() {
+    let test_case = FSRegistryTestCase::new();
+    let registry = test_case.registry();
+    let namespace = &Namespace::new("lww-repo").unwrap();
+    let tag = "latest";
+
+    let before = chrono::Utc::now();
+    let (content, media_type) = create_test_manifest(registry, namespace).await;
+    registry
+        .accept_put_manifest(
+            None,
+            None,
+            namespace,
+            Reference::Tag(tag.to_string()),
+            media_type,
+            Cursor::new(content),
+        )
+        .await
+        .expect("client push must store");
+
+    assert!(
+        local_created_at(registry, namespace, tag).await >= before,
+        "a client write (no source_ts) must stamp the local clock"
+    );
+}
+
+#[tokio::test]
+async fn accept_put_manifest_rejects_lww_older_source_ts() {
+    let test_case = FSRegistryTestCase::new();
+    let registry = test_case.registry();
+    let namespace = &Namespace::new("lww-repo").unwrap();
+    let tag = "latest";
+
+    let (content, media_type) = seed_tag(registry, namespace, tag).await;
+    let created_at = local_created_at(registry, namespace, tag).await;
+    let older = created_at - chrono::Duration::seconds(60);
+
+    let result = registry
+        .accept_put_manifest(
+            None,
+            Some(older),
+            namespace,
+            Reference::Tag(tag.to_string()),
+            media_type,
+            Cursor::new(content),
+        )
+        .await
+        .err();
+
+    assert!(
+        matches!(result, Some(Error::ReplicationSuperseded(_))),
+        "older source_ts must be superseded by the newer local tag, got: {result:?}"
+    );
+}
+
+#[tokio::test]
+async fn accept_put_manifest_accepts_lww_newer_source_ts() {
+    let test_case = FSRegistryTestCase::new();
+    let registry = test_case.registry();
+    let namespace = &Namespace::new("lww-repo").unwrap();
+    let tag = "latest";
+
+    let (content, media_type) = seed_tag(registry, namespace, tag).await;
+    let created_at = local_created_at(registry, namespace, tag).await;
+    let newer = created_at + chrono::Duration::seconds(60);
+
+    registry
+        .accept_put_manifest(
+            None,
+            Some(newer),
+            namespace,
+            Reference::Tag(tag.to_string()),
+            media_type,
+            Cursor::new(content),
+        )
+        .await
+        .expect("newer source_ts must win over the older local tag");
+}
+
+#[tokio::test]
+async fn accept_put_manifest_accepts_lww_equal_source_ts() {
+    // Rejecting an equal-timestamp converged replay (a regression to `>=`)
+    // would make two converged nodes bounce 409s.
+    let test_case = FSRegistryTestCase::new();
+    let registry = test_case.registry();
+    let namespace = &Namespace::new("lww-repo").unwrap();
+    let tag = "latest";
+
+    let (content, media_type) = seed_tag(registry, namespace, tag).await;
+    let created_at = local_created_at(registry, namespace, tag).await;
+
+    registry
+        .accept_put_manifest(
+            None,
+            Some(created_at),
+            namespace,
+            Reference::Tag(tag.to_string()),
+            media_type,
+            Cursor::new(content),
+        )
+        .await
+        .expect("equal source_ts must converge (not be superseded)");
+}
+
+/// Two distinct manifests in `namespace`, returned larger digest first.
+async fn two_manifests_by_digest_order(
+    registry: &Registry,
+    namespace: &Namespace,
+) -> ((Vec<u8>, String), (Vec<u8>, String)) {
+    let first = create_test_manifest(registry, namespace).await;
+
+    let config_content = br#"{"architecture":"arm64","os":"linux"}"#;
+    let layer_content = b"a different layer content";
+    let config_digest = upload_blob(registry, namespace, config_content).await;
+    let layer_digest = upload_blob(registry, namespace, layer_content).await;
+    let second = manifest_with_references(
+        &config_digest,
+        config_content.len(),
+        &layer_digest,
+        layer_content.len(),
+    );
+
+    let first_digest = Digest::Sha256(sha256::hex(&first.0).into());
+    let second_digest = Digest::Sha256(sha256::hex(&second.0).into());
+    if first_digest > second_digest {
+        (first, second)
+    } else {
+        (second, first)
+    }
+}
+
+#[tokio::test]
+async fn accept_put_manifest_lww_equal_ts_tie_breaks_on_digest() {
+    // Without the digest tie-break an equal-timestamp A<->B pair would swap
+    // digests forever; the larger digest must win on every node.
+    let test_case = FSRegistryTestCase::new();
+    let registry = test_case.registry();
+    let namespace = &Namespace::new("lww-repo").unwrap();
+    let tag = "latest";
+
+    let ((larger, larger_mt), (smaller, smaller_mt)) =
+        two_manifests_by_digest_order(registry, namespace).await;
+    let ts = chrono::Utc::now() - chrono::Duration::hours(1);
+
+    registry
+        .accept_put_manifest(
+            None,
+            Some(ts),
+            namespace,
+            Reference::Tag(tag.to_string()),
+            larger_mt,
+            Cursor::new(larger),
+        )
+        .await
+        .expect("seed the larger-digest manifest");
+
+    let result = registry
+        .accept_put_manifest(
+            None,
+            Some(ts),
+            namespace,
+            Reference::Tag(tag.to_string()),
+            smaller_mt,
+            Cursor::new(smaller),
+        )
+        .await
+        .err();
+    assert!(
+        matches!(result, Some(Error::ReplicationSuperseded(_))),
+        "an equal-timestamp write with a smaller digest must be superseded, got: {result:?}"
+    );
+}
+
+#[tokio::test]
+async fn accept_put_manifest_lww_equal_ts_accepts_larger_digest() {
+    let test_case = FSRegistryTestCase::new();
+    let registry = test_case.registry();
+    let namespace = &Namespace::new("lww-repo").unwrap();
+    let tag = "latest";
+
+    let ((larger, larger_mt), (smaller, smaller_mt)) =
+        two_manifests_by_digest_order(registry, namespace).await;
+    let larger_digest = Digest::Sha256(sha256::hex(&larger).into());
+    let ts = chrono::Utc::now() - chrono::Duration::hours(1);
+
+    registry
+        .accept_put_manifest(
+            None,
+            Some(ts),
+            namespace,
+            Reference::Tag(tag.to_string()),
+            smaller_mt,
+            Cursor::new(smaller),
+        )
+        .await
+        .expect("seed the smaller-digest manifest");
+
+    registry
+        .accept_put_manifest(
+            None,
+            Some(ts),
+            namespace,
+            Reference::Tag(tag.to_string()),
+            larger_mt,
+            Cursor::new(larger),
+        )
+        .await
+        .expect("an equal-timestamp write with a larger digest must win");
+
+    let target = registry
+        .metadata_store
+        .read_link_reference(namespace.as_ref(), &LinkKind::Tag(tag.to_string()))
+        .await
+        .expect("tag link after the tie-break")
+        .target;
+    assert_eq!(
+        target, larger_digest,
+        "the pair must converge on the larger digest"
+    );
+}
+
+#[tokio::test]
+async fn accept_put_manifest_lww_reads_bypass_the_link_cache() {
+    // The per-process link cache can lag a sibling replica's write by up to
+    // its TTL, so the LWW gate must read the backend link, not the cached one.
+    let test_case = FSRegistryTestCase::with_link_cache_ttl(300);
+    let registry = test_case.registry();
+    let namespace = &Namespace::new("lww-repo").unwrap();
+    let tag = "latest";
+
+    let (content, media_type) = seed_tag(registry, namespace, tag).await;
+    let created_at = local_created_at(registry, namespace, tag).await;
+
+    // Assert the seed warmed the cache so the stale-cache scenario stays honest.
+    let store = test_case.metadata_store();
+    let link = LinkKind::Tag(tag.to_string());
+    let cached = store
+        .cache_get(namespace.as_ref(), &link)
+        .await
+        .expect("seed write must warm the link cache");
+    assert_eq!(cached.created_at, Some(created_at));
+
+    // Simulate a sibling replica moving created_at forward behind this
+    // process's cache.
+    let sibling_ts = created_at + chrono::Duration::seconds(120);
+    let mut sibling = store
+        .read_link_reference(namespace.as_ref(), &link)
+        .await
+        .expect("seeded tag link");
+    sibling.created_at = Some(sibling_ts);
+    store
+        .write_link_reference(namespace.as_ref(), &link, &sibling)
+        .await
+        .expect("sibling write behind the cache");
+
+    // Newer than the cached created_at but older than the sibling's, so only
+    // an uncached gate read rejects.
+    let incoming = created_at + chrono::Duration::seconds(60);
+    let result = registry
+        .accept_put_manifest(
+            None,
+            Some(incoming),
+            namespace,
+            Reference::Tag(tag.to_string()),
+            media_type,
+            Cursor::new(content),
+        )
+        .await
+        .err();
+
+    assert!(
+        matches!(result, Some(Error::ReplicationSuperseded(_))),
+        "LWW must compare against the backend link, not the stale cached one, got: {result:?}"
+    );
+}
+
+#[tokio::test]
+async fn find_tags_pointing_at_bypasses_the_link_cache() {
+    // This set gates the digest-delete LWW guard, so a tag re-pointed at the
+    // digest on a sibling replica within the cache TTL must still be found, not
+    // omitted because the local cache lags and would then be left dangling.
+    let test_case = FSRegistryTestCase::with_link_cache_ttl(300);
+    let store = test_case.metadata_store();
+    let namespace = "cascade-repo";
+    let link = LinkKind::Tag("latest".to_string());
+
+    let old_digest = Digest::Sha256(sha256::hex(b"old").into());
+    let new_digest = Digest::Sha256(sha256::hex(b"new").into());
+
+    store
+        .store_manifest(
+            namespace,
+            &old_digest,
+            b"old",
+            &[LinkOperation::create(link.clone(), old_digest.clone())],
+            None,
+        )
+        .await
+        .expect("seed the tag and warm the cache");
+    assert_eq!(
+        store.cache_get(namespace, &link).await.map(|m| m.target),
+        Some(old_digest.clone()),
+        "seed write must warm the link cache",
+    );
+
+    // A sibling replica re-points the tag at new_digest behind this cache.
+    let mut sibling = store.read_link_reference(namespace, &link).await.unwrap();
+    sibling.target = new_digest.clone();
+    store
+        .write_link_reference(namespace, &link, &sibling)
+        .await
+        .expect("sibling re-point behind the cache");
+    assert_eq!(
+        store.cache_get(namespace, &link).await.map(|m| m.target),
+        Some(old_digest),
+        "cache must still be stale for an honest test",
+    );
+
+    let pointing = store
+        .find_tags_pointing_at(namespace, &new_digest)
+        .await
+        .unwrap();
+    assert_eq!(
+        pointing,
+        vec![link],
+        "must find the tag by its backend target, not the stale cached one"
+    );
+}
+
+/// The pre-write LWW gate in `accept_put_manifest` is check-then-write: a
+/// racing writer can pass it and still commit out of order. The link
+/// transaction itself must reject a superseded replicated write, so calling
+/// the store directly (as if the gate had been raced) must fail and leave
+/// the winning link untouched.
+#[tokio::test]
+async fn store_manifest_enforces_lww_inside_the_link_transaction() {
+    let test_case = FSRegistryTestCase::new();
+    let store = test_case.metadata_store();
+    let namespace = "lww-tx-repo";
+    let link = LinkKind::Tag("latest".to_string());
+
+    let newer_body = br#"{"newer":true}"#.to_vec();
+    let newer_digest = Digest::Sha256(sha256::hex(&newer_body).into());
+    let newer_ts = chrono::Utc::now();
+    store
+        .store_manifest(
+            namespace,
+            &newer_digest,
+            &newer_body,
+            &[LinkOperation::create(link.clone(), newer_digest.clone())],
+            Some(newer_ts),
+        )
+        .await
+        .expect("seed the newer replicated write");
+
+    let older_body = br#"{"older":true}"#.to_vec();
+    let older_digest = Digest::Sha256(sha256::hex(&older_body).into());
+    let result = store
+        .store_manifest(
+            namespace,
+            &older_digest,
+            &older_body,
+            &[LinkOperation::create(link.clone(), older_digest.clone())],
+            Some(newer_ts - chrono::Duration::hours(1)),
+        )
+        .await
+        .err();
+    assert!(
+        matches!(
+            result,
+            Some(metadata_store::Error::ReplicationSuperseded(_))
+        ),
+        "an older replicated write must be rejected by the transaction itself, got: {result:?}"
+    );
+
+    let metadata = store
+        .read_link_reference(namespace, &link)
+        .await
+        .expect("the winning link must survive");
+    assert_eq!(metadata.target, newer_digest);
+    assert_eq!(metadata.created_at, Some(newer_ts));
+}
+
+/// The pre-write delete gate in `delete_manifest` is also check-then-write: a
+/// newer re-put can land between the gate and the commit. The link transaction
+/// must reject a superseded replicated delete itself, so calling the store
+/// directly (as if the gate had been raced) must fail and leave the tag intact.
+#[tokio::test]
+async fn delete_links_enforces_lww_inside_the_link_transaction() {
+    let test_case = FSRegistryTestCase::new();
+    let store = test_case.metadata_store();
+    let namespace = "lww-tx-repo";
+    let link = LinkKind::Tag("latest".to_string());
+
+    let body = br#"{"winner":true}"#.to_vec();
+    let digest = Digest::Sha256(sha256::hex(&body).into());
+    let newer_ts = chrono::Utc::now();
+    store
+        .store_manifest(
+            namespace,
+            &digest,
+            &body,
+            &[LinkOperation::create(link.clone(), digest.clone())],
+            Some(newer_ts),
+        )
+        .await
+        .expect("seed the newer tag");
+
+    let result = store
+        .delete_links(
+            namespace,
+            &[LinkOperation::delete(link.clone())],
+            Some(newer_ts - chrono::Duration::hours(1)),
+        )
+        .await
+        .err();
+    assert!(
+        matches!(
+            result,
+            Some(metadata_store::Error::ReplicationSuperseded(_))
+        ),
+        "an older replicated delete must be rejected by the transaction itself, got: {result:?}"
+    );
+
+    let metadata = store
+        .read_link_reference(namespace, &link)
+        .await
+        .expect("the tag must survive the superseded delete");
+    assert_eq!(metadata.target, digest);
+    assert_eq!(metadata.created_at, Some(newer_ts));
+}
+
+#[tokio::test]
+async fn put_manifest_reports_changed_from_the_committed_transaction() {
+    let test_case = FSRegistryTestCase::new();
+    let registry = test_case.registry();
+    let namespace = &Namespace::new("test-repo").unwrap();
+    let tag_ref = Reference::Tag("latest".to_string());
+
+    let (content_a, media_type_a) = create_test_manifest(registry, namespace).await;
+
+    let first = registry
+        .put_manifest(namespace, &tag_ref, Some(&media_type_a), &content_a)
+        .await
+        .expect("fresh tag push");
+    assert!(first.changed, "a fresh tag push must report changed");
+
+    let replay = registry
+        .put_manifest(namespace, &tag_ref, Some(&media_type_a), &content_a)
+        .await
+        .expect("tag re-assert");
+    assert!(
+        !replay.changed,
+        "a tag re-asserted to the same digest must report unchanged"
+    );
+
+    let digest_ref = Reference::Digest(first.digest.clone());
+    let digest_replay = registry
+        .put_manifest(namespace, &digest_ref, Some(&media_type_a), &content_a)
+        .await
+        .expect("digest re-push");
+    assert!(
+        !digest_replay.changed,
+        "re-pushing an already-present revision must report unchanged"
+    );
+
+    let layer_content = b"a different layer content";
+    let config_content = br#"{"architecture":"arm64","os":"linux"}"#;
+    let config_digest = upload_blob(registry, namespace, config_content).await;
+    let layer_digest = upload_blob(registry, namespace, layer_content).await;
+    let (content_b, media_type_b) = manifest_with_references(
+        &config_digest,
+        config_content.len(),
+        &layer_digest,
+        layer_content.len(),
+    );
+    let moved = registry
+        .put_manifest(namespace, &tag_ref, Some(&media_type_b), &content_b)
+        .await
+        .expect("tag move");
+    assert!(
+        moved.changed,
+        "moving the tag to a different digest must report changed"
+    );
+}
+
+#[tokio::test]
+async fn accept_put_manifest_accepts_lww_when_local_absent() {
+    let test_case = FSRegistryTestCase::new();
+    let registry = test_case.registry();
+    let namespace = &Namespace::new("lww-repo").unwrap();
+    let tag = "fresh";
+
+    let (content, media_type) = create_test_manifest(registry, namespace).await;
+    let very_old = chrono::Utc::now() - chrono::Duration::days(3650);
+
+    registry
+        .accept_put_manifest(
+            None,
+            Some(very_old),
+            namespace,
+            Reference::Tag(tag.to_string()),
+            media_type,
+            Cursor::new(content),
+        )
+        .await
+        .expect("absent local tag must accept any source_ts");
+}
+
+#[tokio::test]
+async fn accept_put_manifest_without_source_ts_skips_lww() {
+    let test_case = FSRegistryTestCase::new();
+    let registry = test_case.registry();
+    let namespace = &Namespace::new("lww-repo").unwrap();
+    let tag = "latest";
+
+    let (content, media_type) = seed_tag(registry, namespace, tag).await;
+
+    registry
+        .accept_put_manifest(
+            None,
+            None,
+            namespace,
+            Reference::Tag(tag.to_string()),
+            media_type,
+            Cursor::new(content),
+        )
+        .await
+        .expect("client write (no source_ts) must skip LWW");
+}
+
+#[tokio::test]
+async fn accept_put_manifest_digest_reference_skips_lww() {
+    let test_case = FSRegistryTestCase::new();
+    let registry = test_case.registry();
+    let namespace = &Namespace::new("lww-repo").unwrap();
+
+    let (content, media_type) = create_test_manifest(registry, namespace).await;
+    let digest = Digest::Sha256(sha256::hex(&content).into());
+    let very_old = chrono::Utc::now() - chrono::Duration::days(3650);
+
+    registry
+        .accept_put_manifest(
+            None,
+            Some(very_old),
+            namespace,
+            Reference::Digest(digest),
+            media_type,
+            Cursor::new(content),
+        )
+        .await
+        .expect("digest reference must skip LWW");
+}
+
+#[tokio::test]
+async fn delete_manifest_rejects_lww_older_source_ts() {
+    let test_case = FSRegistryTestCase::new();
+    let registry = test_case.registry();
+    let namespace = &Namespace::new("lww-repo").unwrap();
+    let tag = "latest";
+
+    seed_tag(registry, namespace, tag).await;
+    let created_at = local_created_at(registry, namespace, tag).await;
+    let older = created_at - chrono::Duration::seconds(60);
+
+    let result = registry
+        .delete_manifest(
+            None,
+            Some(older),
+            namespace,
+            &Reference::Tag(tag.to_string()),
+        )
+        .await
+        .err();
+
+    assert!(
+        matches!(result, Some(Error::ReplicationSuperseded(_))),
+        "older source_ts delete must be superseded, got: {result:?}"
+    );
+
+    registry
+        .metadata_store
+        .read_link(namespace.as_ref(), &LinkKind::Tag(tag.to_string()), false)
+        .await
+        .expect("tag must survive a superseded delete");
+}
+
+#[tokio::test]
+async fn delete_manifest_accepts_lww_newer_source_ts() {
+    let test_case = FSRegistryTestCase::new();
+    let registry = test_case.registry();
+    let namespace = &Namespace::new("lww-repo").unwrap();
+    let tag = "latest";
+
+    seed_tag(registry, namespace, tag).await;
+    let created_at = local_created_at(registry, namespace, tag).await;
+    let newer = created_at + chrono::Duration::seconds(60);
+
+    registry
+        .delete_manifest(
+            None,
+            Some(newer),
+            namespace,
+            &Reference::Tag(tag.to_string()),
+        )
+        .await
+        .expect("newer source_ts delete must win");
+
+    let result = registry
+        .metadata_store
+        .read_link(namespace.as_ref(), &LinkKind::Tag(tag.to_string()), false)
+        .await;
+    assert!(
+        matches!(result, Err(metadata_store::Error::ReferenceNotFound)),
+        "tag must be gone after an accepted delete, got: {result:?}"
+    );
+}
+
+#[tokio::test]
+async fn delete_manifest_not_superseded_when_local_tag_has_no_created_at() {
+    // The write path always stamps `created_at`, so a legacy no-created_at
+    // link is injected directly via `write_link_reference`.
+    let test_case = FSRegistryTestCase::new();
+    let registry = test_case.registry();
+    let namespace = &Namespace::new("lww-repo").unwrap();
+    let tag = "latest";
+
+    registry
+        .metadata_store
+        .write_link_reference(
+            namespace.as_ref(),
+            &LinkKind::Tag(tag.to_string()),
+            &LinkMetadata {
+                target: Digest::Sha256(sha256::hex(b"manifest-bytes").into()),
+                created_at: None,
+                accessed_at: None,
+                referenced_by: HashSet::new(),
+                media_type: None,
+                descriptor: None,
+            },
+        )
+        .await
+        .expect("seed a tag link with no created_at");
+
+    // An epoch source_ts would lose LWW to any real created_at.
+    let ancient = chrono::DateTime::from_timestamp(0, 0).unwrap();
+    registry
+        .delete_manifest(
+            None,
+            Some(ancient),
+            namespace,
+            &Reference::Tag(tag.to_string()),
+        )
+        .await
+        .expect("a delete must not be superseded by a tag with no created_at");
+
+    let result = registry
+        .metadata_store
+        .read_link(namespace.as_ref(), &LinkKind::Tag(tag.to_string()), false)
+        .await;
+    assert!(
+        matches!(result, Err(metadata_store::Error::ReferenceNotFound)),
+        "tag must be gone after the non-superseded delete, got: {result:?}"
+    );
+}
+
+#[tokio::test]
+async fn same_digest_re_push_preserves_created_at() {
+    // An idempotent re-push (e.g. CI re-pushing an unchanged image) must not
+    // advance the tag's LWW timestamp: the binding is unchanged so dispatch is
+    // suppressed, and a bumped created_at would let an interleaved peer write
+    // lose locally yet win on peers.
+    let test_case = FSRegistryTestCase::new();
+    let registry = test_case.registry();
+    let namespace = &Namespace::new("lww-repo").unwrap();
+    let tag = "latest";
+
+    let (content, media_type) = seed_tag(registry, namespace, tag).await;
+    let created_at = local_created_at(registry, namespace, tag).await;
+
+    registry
+        .accept_put_manifest(
+            None,
+            None,
+            namespace,
+            Reference::Tag(tag.to_string()),
+            media_type,
+            Cursor::new(content),
+        )
+        .await
+        .expect("idempotent re-push of the same digest");
+
+    assert_eq!(
+        local_created_at(registry, namespace, tag).await,
+        created_at,
+        "a same-digest re-push must not bump the tag's created_at"
+    );
+}
+
+#[tokio::test]
+async fn replicated_delete_not_superseded_by_a_legacy_link() {
+    // A pre-JSON distribution-era link (bare digest string) parses to
+    // created_at=None, so it must never win LWW; a synthesised now() would
+    // re-stamp fresher on every read and block every replicated write to a
+    // migrated tag forever.
+    let test_case = FSRegistryTestCase::new();
+    let registry = test_case.registry();
+    let namespace = &Namespace::new("legacy-repo").unwrap();
+    let link = LinkKind::Tag("latest".to_string());
+
+    let legacy_digest = Digest::Sha256(sha256::hex(b"legacy-manifest").into());
+    put_link_raw(
+        registry.metadata_store.store(),
+        namespace.as_ref(),
+        &link,
+        legacy_digest.to_string().as_bytes(),
+    )
+    .await;
+
+    let ancient = chrono::DateTime::from_timestamp(0, 0).unwrap();
+    registry
+        .delete_manifest(
+            None,
+            Some(ancient),
+            namespace,
+            &Reference::Tag("latest".to_string()),
+        )
+        .await
+        .expect("a legacy tag (no created_at) must never supersede a replicated write");
+
+    let result = registry
+        .metadata_store
+        .read_link(namespace.as_ref(), &link, false)
+        .await;
+    assert!(
+        matches!(result, Err(metadata_store::Error::ReferenceNotFound)),
+        "the legacy tag must be gone after the non-superseded delete, got: {result:?}"
+    );
+}
+
+#[tokio::test]
+async fn delete_manifest_digest_rejects_lww_when_pointing_tag_newer() {
+    // The cascade must not drop a tag re-pointed after the delete was
+    // authored, nor the revision it still references.
+    let test_case = FSRegistryTestCase::new();
+    let registry = test_case.registry();
+    let namespace = &Namespace::new("lww-repo").unwrap();
+    let tag = "latest";
+
+    let (content, _) = seed_tag(registry, namespace, tag).await;
+    let digest = Digest::Sha256(sha256::hex(&content).into());
+    let older = local_created_at(registry, namespace, tag).await - chrono::Duration::seconds(60);
+
+    let result = registry
+        .delete_manifest(
+            None,
+            Some(older),
+            namespace,
+            &Reference::Digest(digest.clone()),
+        )
+        .await
+        .err();
+
+    assert!(
+        matches!(result, Some(Error::ReplicationSuperseded(_))),
+        "digest delete older than a pointing tag must be superseded, got: {result:?}"
+    );
+
+    registry
+        .metadata_store
+        .read_link(namespace.as_ref(), &LinkKind::Tag(tag.to_string()), false)
+        .await
+        .expect("pointing tag must survive a superseded digest delete");
+    registry
+        .metadata_store
+        .read_link(namespace.as_ref(), &LinkKind::Digest(digest), false)
+        .await
+        .expect("revision must survive a superseded digest delete");
+}
+
+#[tokio::test]
+async fn delete_manifest_digest_accepts_lww_when_newer_than_pointing_tags() {
+    let test_case = FSRegistryTestCase::new();
+    let registry = test_case.registry();
+    let namespace = &Namespace::new("lww-repo").unwrap();
+    let tag = "latest";
+
+    let (content, _) = seed_tag(registry, namespace, tag).await;
+    let digest = Digest::Sha256(sha256::hex(&content).into());
+    let newer = local_created_at(registry, namespace, tag).await + chrono::Duration::seconds(60);
+
+    registry
+        .delete_manifest(None, Some(newer), namespace, &Reference::Digest(digest))
+        .await
+        .expect("digest delete newer than every pointing tag must win");
+
+    let tag_result = registry
+        .metadata_store
+        .read_link(namespace.as_ref(), &LinkKind::Tag(tag.to_string()), false)
+        .await;
+    assert!(
+        matches!(tag_result, Err(metadata_store::Error::ReferenceNotFound)),
+        "pointing tag must be removed by an accepted digest delete, got: {tag_result:?}"
+    );
+}
+
+#[tokio::test]
+async fn prune_delete_stamped_source_ts_suppressed_when_local_tag_newer_else_proceeds() {
+    // Exercises the prune wire round trip: source_ts is stamped, serialized to
+    // RFC 3339 (the `X-Angos-Source-Timestamp` header), and reparsed before
+    // reaching `delete_manifest`.
+    let test_case = FSRegistryTestCase::new();
+    let registry = test_case.registry();
+    let namespace = &Namespace::new("prune-repo").unwrap();
+    let tag = "stray";
+
+    seed_tag(registry, namespace, tag).await;
+    let created_at = local_created_at(registry, namespace, tag).await;
+
+    // Suppressed: the stamped source_ts predates the local tag.
+    let decided_before = created_at - chrono::Duration::seconds(60);
+    let stamped = decided_before.to_rfc3339();
+    let reparsed = chrono::DateTime::parse_from_rfc3339(&stamped)
+        .expect("stamped source_ts must be valid RFC 3339")
+        .with_timezone(&chrono::Utc);
+
+    let result = registry
+        .delete_manifest(
+            None,
+            Some(reparsed),
+            namespace,
+            &Reference::Tag(tag.to_string()),
+        )
+        .await
+        .err();
+    assert!(
+        matches!(result, Some(Error::ReplicationSuperseded(_))),
+        "a prune delete must be suppressed when the downstream tag is strictly newer, got: {result:?}"
+    );
+    registry
+        .metadata_store
+        .read_link(namespace.as_ref(), &LinkKind::Tag(tag.to_string()), false)
+        .await
+        .expect("a superseded prune delete must preserve the downstream tag");
+
+    // Proceeds: the stamped source_ts is newer than the local tag.
+    let decided_after = created_at + chrono::Duration::seconds(60);
+    let stamped = decided_after.to_rfc3339();
+    let reparsed = chrono::DateTime::parse_from_rfc3339(&stamped)
+        .expect("stamped source_ts must be valid RFC 3339")
+        .with_timezone(&chrono::Utc);
+
+    registry
+        .delete_manifest(
+            None,
+            Some(reparsed),
+            namespace,
+            &Reference::Tag(tag.to_string()),
+        )
+        .await
+        .expect("a prune delete must proceed when its source_ts is newer than the tag");
+    let result = registry
+        .metadata_store
+        .read_link(namespace.as_ref(), &LinkKind::Tag(tag.to_string()), false)
+        .await;
+    assert!(
+        matches!(result, Err(metadata_store::Error::ReferenceNotFound)),
+        "the downstream tag must be gone after an applied prune delete, got: {result:?}"
+    );
+}
+
+#[tokio::test]
+async fn replication_superseded_maps_to_distinct_oci_code() {
+    let superseded: ServerError = Error::ReplicationSuperseded("newer".to_string()).into();
+    let conflict: ServerError = Error::Conflict("immutable".to_string()).into();
+
+    // Both are 409, but the OCI codes differ so the sender can disambiguate.
+    assert_eq!(superseded.status_code(), hyper::StatusCode::CONFLICT);
+    assert_eq!(conflict.status_code(), hyper::StatusCode::CONFLICT);
+
+    let superseded_json = superseded.as_json(None);
+    let conflict_json = conflict.as_json(None);
+    assert_eq!(
+        superseded_json["errors"][0]["code"],
+        REPLICATION_SUPERSEDED_CODE
+    );
+    assert_eq!(conflict_json["errors"][0]["code"], "CONFLICT");
+    assert_ne!(
+        superseded_json["errors"][0]["code"],
+        conflict_json["errors"][0]["code"]
+    );
+}
+
+#[cfg(test)]
+mod noop_suppression_tests {
+    //! No-op suppression (loop prevention): an inbound manifest write that does
+    //! not change local state must not be re-dispatched for replication. The
+    //! harness shares one `Store` between the blob store, metadata store, and a
+    //! caller-held `JobStore`, and spawns no drain, so enqueued jobs persist
+    //! for counting.
+
+    use std::{collections::HashMap, io::Cursor, sync::Arc};
+
+    use chrono::{Duration, Utc};
+    use tempfile::TempDir;
+
+    use angos_storage::{ObjectStore, fs::Backend as StorageFsBackend};
+    use angos_tx_engine::transaction::Transaction;
+
+    use crate::{
+        event_webhook::event::EventKind,
+        oci::{Digest, Namespace, Reference},
+        registry::{
+            Registry, RegistryConfig,
+            blob_store::BlobStore,
+            job_store::JobStore,
+            metadata_store::{LinkOperation, MetadataStore, link_kind::LinkKind},
+            repository_resolver::RepositoryResolver,
+            test_utils::{
+                build_store, build_test_fs_executor, downstream_client, repository_with_downstream,
+                sole_pending_payload,
+            },
+        },
+        replication::{REPLICATION_DELETE_MANIFEST_KIND, REPLICATION_QUEUE},
+        util::sha256,
+    };
+
+    use super::{create_test_manifest, manifest_with_references, upload_blob};
+
+    const REPO: &str = "nginx";
+    const NAMESPACE: &str = "nginx";
+
+    /// Build a `Registry` whose blob store, metadata store, and a caller-held
+    /// `JobStore` all share one FS-backed `Store`, carrying a single
+    /// event+reconcile downstream so `dispatch_replication` enqueues.
+    fn build_registry(root: &str) -> (Registry, Arc<JobStore>) {
+        crate::metrics_provider::init_for_tests();
+        let object: Arc<dyn ObjectStore> =
+            Arc::new(StorageFsBackend::builder().root_dir(root).build().unwrap());
+        let executor = build_test_fs_executor(root, false);
+        let store = build_store(object, executor);
+        let metadata_store = Arc::new(
+            MetadataStore::builder()
+                .store(store.clone())
+                .link_cache_ttl(0)
+                .access_time_debounce_secs(0)
+                .build()
+                .unwrap(),
+        );
+        let blob_store = Arc::new(BlobStore::builder().store(store.clone()).build().unwrap());
+
+        let mut repositories = HashMap::new();
+        repositories.insert(
+            REPO.to_string(),
+            repository_with_downstream(REPO, downstream_client("https://unused.test")),
+        );
+        let resolver = Arc::new(RepositoryResolver::new(Arc::new(repositories)).unwrap());
+
+        let job_store: Arc<JobStore> = Arc::new(JobStore::new(store, "test"));
+
+        let config = RegistryConfig::default().job_queue(job_store.clone());
+        let registry = Registry::new(blob_store, metadata_store, resolver, config).unwrap();
+        (registry, job_store)
+    }
+
+    async fn pending(job_store: &JobStore) -> u64 {
+        job_store.count_pending(REPLICATION_QUEUE, 0).await.unwrap()
+    }
+
+    /// Drains (claims + completes) one pending replication job, clearing its
+    /// `lock_key` dedup index. Pending pushes for the same tag coalesce on
+    /// that index, so draining isolates the dispatch gate under test from the
+    /// queue's coalescing.
+    async fn drain_one(job_store: &JobStore) {
+        let claimed = job_store
+            .claim_one(REPLICATION_QUEUE)
+            .await
+            .unwrap()
+            .claimed
+            .expect("expected one claimable job");
+        job_store
+            .complete(claimed, Transaction::builder().build())
+            .await
+            .unwrap();
+    }
+
+    /// Builds a second, distinct manifest, pre-uploading its blobs so the push
+    /// validates.
+    async fn create_second_manifest(
+        registry: &Registry,
+        namespace: &Namespace,
+    ) -> (Vec<u8>, String) {
+        let config_content = br#"{"architecture":"arm64","os":"linux"}"#;
+        let layer_content = b"a different layer content";
+        let config_digest = upload_blob(registry, namespace, config_content).await;
+        let layer_digest = upload_blob(registry, namespace, layer_content).await;
+        manifest_with_references(
+            &config_digest,
+            config_content.len(),
+            &layer_digest,
+            layer_content.len(),
+        )
+    }
+
+    #[tokio::test]
+    async fn tagged_push_dispatches_only_when_tag_moves() {
+        let dir = TempDir::new().unwrap();
+        let (registry, job_store) = build_registry(dir.path().to_str().unwrap());
+        let namespace = Namespace::new(NAMESPACE).unwrap();
+        let tag = "latest";
+
+        let (content_a, media_type) = create_test_manifest(&registry, &namespace).await;
+
+        registry
+            .accept_put_manifest(
+                None,
+                None,
+                &namespace,
+                Reference::Tag(tag.to_string()),
+                media_type.clone(),
+                Cursor::new(content_a.clone()),
+            )
+            .await
+            .expect("first tag push");
+        assert_eq!(
+            pending(&job_store).await,
+            1,
+            "a first tag push (tag absent) must enqueue one job"
+        );
+
+        // Drain so dedup coalescing cannot mask the gate.
+        drain_one(&job_store).await;
+        assert_eq!(pending(&job_store).await, 0, "queue drained");
+
+        // With the queue empty the gate itself, not the dedup index, must
+        // suppress the replay. This per-node drop is what terminates mesh
+        // cycles without origin tracking.
+        registry
+            .accept_put_manifest(
+                None,
+                None,
+                &namespace,
+                Reference::Tag(tag.to_string()),
+                media_type.clone(),
+                Cursor::new(content_a.clone()),
+            )
+            .await
+            .expect("re-assert same tag->digest");
+        assert_eq!(
+            pending(&job_store).await,
+            0,
+            "re-asserting the same tag->digest must enqueue nothing (no-op replay)"
+        );
+
+        let (content_b, media_type_b) = create_second_manifest(&registry, &namespace).await;
+        registry
+            .accept_put_manifest(
+                None,
+                None,
+                &namespace,
+                Reference::Tag(tag.to_string()),
+                media_type_b,
+                Cursor::new(content_b),
+            )
+            .await
+            .expect("move tag to a new digest");
+        assert_eq!(
+            pending(&job_store).await,
+            1,
+            "moving the tag to a new digest must enqueue a job"
+        );
+    }
+
+    /// An A<->B digest bounce must not loop: re-pushing an already-present
+    /// revision is not re-dispatched.
+    #[tokio::test]
+    async fn digest_push_dispatches_only_when_revision_is_new() {
+        let dir = TempDir::new().unwrap();
+        let (registry, job_store) = build_registry(dir.path().to_str().unwrap());
+        let namespace = Namespace::new(NAMESPACE).unwrap();
+
+        let (content, media_type) = create_test_manifest(&registry, &namespace).await;
+        let digest = Digest::Sha256(sha256::hex(&content).into());
+
+        registry
+            .accept_put_manifest(
+                None,
+                None,
+                &namespace,
+                Reference::Digest(digest.clone()),
+                media_type.clone(),
+                Cursor::new(content.clone()),
+            )
+            .await
+            .expect("first digest push");
+        assert_eq!(
+            pending(&job_store).await,
+            1,
+            "a first-time digest push must enqueue one job"
+        );
+
+        // Drain so dedup coalescing cannot mask the gate.
+        drain_one(&job_store).await;
+        assert_eq!(pending(&job_store).await, 0, "queue drained");
+
+        // With the queue empty a broken gate would freshly enqueue, so pending
+        // staying 0 proves the gate, not the dedup index, suppressed the replay.
+        registry
+            .accept_put_manifest(
+                None,
+                None,
+                &namespace,
+                Reference::Digest(digest),
+                media_type,
+                Cursor::new(content),
+            )
+            .await
+            .expect("re-push same revision");
+        assert_eq!(
+            pending(&job_store).await,
+            0,
+            "re-pushing an already-present revision must enqueue nothing \
+             (the gate, not the dedup index, suppresses it)"
+        );
+    }
+
+    #[tokio::test]
+    async fn tag_delete_dispatches_only_when_something_was_removed() {
+        let dir = TempDir::new().unwrap();
+        let (registry, job_store) = build_registry(dir.path().to_str().unwrap());
+        let namespace = Namespace::new(NAMESPACE).unwrap();
+        let tag = "latest";
+
+        let (content, media_type) = create_test_manifest(&registry, &namespace).await;
+        registry
+            .accept_put_manifest(
+                None,
+                None,
+                &namespace,
+                Reference::Tag(tag.to_string()),
+                media_type,
+                Cursor::new(content),
+            )
+            .await
+            .expect("seed tag push");
+        let baseline = pending(&job_store).await;
+
+        registry
+            .delete_manifest(None, None, &namespace, &Reference::Tag(tag.to_string()))
+            .await
+            .expect("delete existing tag");
+        assert_eq!(
+            pending(&job_store).await,
+            baseline + 1,
+            "deleting an existing tag must enqueue one delete job"
+        );
+
+        let after_delete = pending(&job_store).await;
+        let _ = registry
+            .delete_manifest(
+                None,
+                None,
+                &namespace,
+                &Reference::Tag("does-not-exist".to_string()),
+            )
+            .await;
+        assert_eq!(
+            pending(&job_store).await,
+            after_delete,
+            "deleting an absent tag must enqueue nothing (no-op delete)"
+        );
+    }
+
+    /// The second delete must get its own job rather than coalescing into the
+    /// still-pending first. A delete cannot re-derive its timestamp at execute
+    /// time (the link is gone), so a coalesced older job would ship a stale
+    /// `source_ts` and lose receiver-side LWW against the in-between re-push.
+    #[tokio::test]
+    async fn second_delete_after_repush_enqueues_its_own_job() {
+        let dir = TempDir::new().unwrap();
+        let (registry, job_store) = build_registry(dir.path().to_str().unwrap());
+        let namespace = Namespace::new(NAMESPACE).unwrap();
+        let tag = "latest";
+
+        let (content, media_type) = create_test_manifest(&registry, &namespace).await;
+        registry
+            .accept_put_manifest(
+                None,
+                None,
+                &namespace,
+                Reference::Tag(tag.to_string()),
+                media_type.clone(),
+                Cursor::new(content.clone()),
+            )
+            .await
+            .expect("seed tag push");
+        drain_one(&job_store).await;
+        assert_eq!(pending(&job_store).await, 0, "queue drained");
+
+        // First delete, deliberately left pending.
+        registry
+            .delete_manifest(None, None, &namespace, &Reference::Tag(tag.to_string()))
+            .await
+            .expect("first delete");
+        assert_eq!(
+            pending(&job_store).await,
+            1,
+            "the first delete must enqueue one job"
+        );
+
+        registry
+            .accept_put_manifest(
+                None,
+                None,
+                &namespace,
+                Reference::Tag(tag.to_string()),
+                media_type,
+                Cursor::new(content),
+            )
+            .await
+            .expect("re-push tag");
+        assert_eq!(
+            pending(&job_store).await,
+            2,
+            "re-creating the tag must enqueue one push job"
+        );
+
+        registry
+            .delete_manifest(None, None, &namespace, &Reference::Tag(tag.to_string()))
+            .await
+            .expect("second delete");
+        assert_eq!(
+            pending(&job_store).await,
+            3,
+            "the second delete must enqueue its own job (per-event lock key), \
+             not coalesce into the pending older delete"
+        );
+    }
+
+    /// An inbound replicated delete must re-dispatch with its author
+    /// timestamp verbatim. A re-stamped `now()` would let the bounced delete
+    /// win LWW over a recreate authored between the original delete and the
+    /// bounce, destroying the acknowledged recreate on every node.
+    #[tokio::test]
+    async fn replicated_delete_redispatches_author_source_ts_verbatim() {
+        let dir = TempDir::new().unwrap();
+        let (registry, job_store) = build_registry(dir.path().to_str().unwrap());
+        let namespace = Namespace::new(NAMESPACE).unwrap();
+        let tag = "latest";
+
+        // Seed via a replicated push so the tag's created_at predates the delete.
+        let (content, media_type) = create_test_manifest(&registry, &namespace).await;
+        let push_ts = Utc::now() - Duration::hours(2);
+        registry
+            .accept_put_manifest(
+                None,
+                Some(push_ts),
+                &namespace,
+                Reference::Tag(tag.to_string()),
+                media_type,
+                Cursor::new(content),
+            )
+            .await
+            .expect("seed replicated tag push");
+        drain_one(&job_store).await;
+
+        let delete_ts = Utc::now() - Duration::hours(1);
+        registry
+            .delete_manifest(
+                None,
+                Some(delete_ts),
+                &namespace,
+                &Reference::Tag(tag.to_string()),
+            )
+            .await
+            .expect("replicated delete newer than the tag must proceed");
+
+        let payload = sole_pending_payload(&job_store).await;
+        assert_eq!(payload.kind, REPLICATION_DELETE_MANIFEST_KIND);
+        assert_eq!(
+            payload.source_ts.as_deref(),
+            Some(delete_ts.to_rfc3339().as_str()),
+            "the delete job must carry the author timestamp verbatim, \
+             not a re-stamped now()"
+        );
+    }
+
+    /// The suppression gate must key on the cascade tags, not the revision
+    /// link alone.
+    #[tokio::test]
+    async fn digest_delete_dispatches_when_only_cascade_tags_remain() {
+        let dir = TempDir::new().unwrap();
+        let (registry, job_store) = build_registry(dir.path().to_str().unwrap());
+        let namespace = Namespace::new(NAMESPACE).unwrap();
+
+        let (content, media_type) = create_test_manifest(&registry, &namespace).await;
+        let digest = Digest::Sha256(sha256::hex(&content).into());
+        registry
+            .accept_put_manifest(
+                None,
+                None,
+                &namespace,
+                Reference::Tag("latest".to_string()),
+                media_type,
+                Cursor::new(content),
+            )
+            .await
+            .expect("seed tag push");
+        drain_one(&job_store).await;
+
+        // Drop only the revision link, leaving the tag pointing at it.
+        registry
+            .metadata_store
+            .update_links(
+                NAMESPACE,
+                &[LinkOperation::delete(LinkKind::Digest(digest.clone()))],
+            )
+            .await
+            .expect("drop the revision link");
+
+        let baseline = pending(&job_store).await;
+        registry
+            .delete_manifest(None, None, &namespace, &Reference::Digest(digest))
+            .await
+            .expect("digest delete");
+        assert_eq!(
+            pending(&job_store).await,
+            baseline + 1,
+            "a digest delete that drops only cascade tag links must enqueue a replication delete"
+        );
+    }
+
+    /// The digest bounce-back that terminates a delete cycle: a converged node
+    /// (revision gone, no pointing tags) stops re-dispatching the delete.
+    #[tokio::test]
+    async fn digest_delete_suppressed_once_converged() {
+        let dir = TempDir::new().unwrap();
+        let (registry, job_store) = build_registry(dir.path().to_str().unwrap());
+        let namespace = Namespace::new(NAMESPACE).unwrap();
+
+        let (content, media_type) = create_test_manifest(&registry, &namespace).await;
+        let digest = Digest::Sha256(sha256::hex(&content).into());
+        registry
+            .accept_put_manifest(
+                None,
+                None,
+                &namespace,
+                Reference::Tag("latest".to_string()),
+                media_type,
+                Cursor::new(content),
+            )
+            .await
+            .expect("seed tag push");
+        drain_one(&job_store).await;
+
+        let baseline = pending(&job_store).await;
+        registry
+            .delete_manifest(None, None, &namespace, &Reference::Digest(digest.clone()))
+            .await
+            .expect("delete existing revision");
+        assert_eq!(
+            pending(&job_store).await,
+            baseline + 1,
+            "deleting an existing revision must enqueue one delete job"
+        );
+        drain_one(&job_store).await;
+
+        // With the queue empty a broken gate would freshly enqueue; staying at
+        // `after` proves the gate suppressed it.
+        let after = pending(&job_store).await;
+        let _ = registry
+            .delete_manifest(None, None, &namespace, &Reference::Digest(digest))
+            .await;
+        assert_eq!(
+            pending(&job_store).await,
+            after,
+            "a converged digest delete (revision gone, no pointing tags) must enqueue nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn noop_push_still_emits_webhook_events() {
+        let dir = TempDir::new().unwrap();
+        let (registry, job_store) = build_registry(dir.path().to_str().unwrap());
+        let namespace = Namespace::new(NAMESPACE).unwrap();
+        let tag = "latest";
+
+        let (content, media_type) = create_test_manifest(&registry, &namespace).await;
+        registry
+            .accept_put_manifest(
+                None,
+                None,
+                &namespace,
+                Reference::Tag(tag.to_string()),
+                media_type.clone(),
+                Cursor::new(content.clone()),
+            )
+            .await
+            .expect("seed tag push");
+        let baseline = pending(&job_store).await;
+
+        let response = registry
+            .accept_put_manifest(
+                None,
+                None,
+                &namespace,
+                Reference::Tag(tag.to_string()),
+                media_type,
+                Cursor::new(content),
+            )
+            .await
+            .expect("re-assert same tag->digest");
+
+        assert_eq!(
+            pending(&job_store).await,
+            baseline,
+            "the no-op replay must NOT enqueue a replication job"
+        );
+        assert!(
+            response
+                .events
+                .iter()
+                .any(|e| e.kind == EventKind::ManifestPush),
+            "a no-op push must still emit ManifestPush"
+        );
+        assert!(
+            response
+                .events
+                .iter()
+                .any(|e| e.kind == EventKind::TagCreate),
+            "a no-op tag push must still emit TagCreate"
+        );
+    }
+}
+
+#[cfg(test)]
+mod dispatch_replication_tests {
+    use std::{collections::HashMap, sync::Arc};
+
+    use tempfile::TempDir;
+
+    use angos_storage::{ObjectStore, fs::Backend as StorageFsBackend};
+
+    use chrono::{DateTime, Duration, Utc};
+    use regex::Regex;
+
+    use crate::{
+        oci::{Digest, Namespace},
+        registry::{
+            Registry, RegistryConfig, Repository,
+            blob_store::BlobStore,
+            job_store::JobStore,
+            metadata_store::MetadataStore,
+            repository_resolver::RepositoryResolver,
+            test_utils::{
+                build_store, build_test_fs_executor, downstream_client,
+                repository_with_replication, sole_pending_payload,
+            },
+        },
+        replication::{
+            REPLICATION_DELETE_MANIFEST_KIND, REPLICATION_PUSH_MANIFEST_KIND, REPLICATION_QUEUE,
+            ReplicationDownstream, ReplicationMode, ReplicationPushPayload,
+        },
+    };
+
+    const REPO: &str = "nginx";
+    const NAMESPACE: &str = "nginx";
+    const DOWNSTREAM: &str = "eu-region";
+    const SAMPLE_DIGEST: &str =
+        "sha256:1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef";
+
+    fn downstream_with(
+        name: &str,
+        mode: ReplicationMode,
+        namespace_filter: Vec<Regex>,
+    ) -> ReplicationDownstream {
+        ReplicationDownstream::builder()
+            .name(name.to_string())
+            .registry_client(downstream_client("https://unused.test"))
+            .mode(mode)
+            .namespace_filter(namespace_filter)
+            .max_concurrent_pushes(4)
+            .build()
+            .unwrap()
+    }
+
+    /// Repository with exactly one downstream of the given mode and namespace filter.
+    fn repository_with(mode: ReplicationMode, namespace_filter: Vec<Regex>) -> Repository {
+        repository_with_replication(
+            REPO,
+            vec![downstream_with(DOWNSTREAM, mode, namespace_filter)],
+        )
+    }
+
+    fn repository_with_downstream() -> Repository {
+        repository_with(ReplicationMode::EventReconcile, Vec::new())
+    }
+
+    /// Build a `Registry` whose job store is a caller-held `JobStore` so the
+    /// test can count pending jobs.
+    fn build_registry_with(root: &str, repository: Repository) -> (Registry, Arc<JobStore>) {
+        let object: Arc<dyn ObjectStore> =
+            Arc::new(StorageFsBackend::builder().root_dir(root).build().unwrap());
+        let executor = build_test_fs_executor(root, false);
+        let store = build_store(object, executor);
+        let metadata_store = Arc::new(
+            MetadataStore::builder()
+                .store(store.clone())
+                .link_cache_ttl(0)
+                .access_time_debounce_secs(0)
+                .build()
+                .unwrap(),
+        );
+        let blob_store = Arc::new(BlobStore::builder().store(store.clone()).build().unwrap());
+
+        let mut repositories = HashMap::new();
+        repositories.insert(REPO.to_string(), repository);
+        let resolver = Arc::new(RepositoryResolver::new(Arc::new(repositories)).unwrap());
+
+        // No drain spawned: the bare JobStore only persists envelopes; these tests assert enqueue only.
+        let job_store: Arc<JobStore> = Arc::new(JobStore::new(store, "test"));
+
+        let config = RegistryConfig::default().job_queue(job_store.clone());
+        let registry = Registry::new(blob_store, metadata_store, resolver, config).unwrap();
+
+        (registry, job_store)
+    }
+
+    /// [`build_registry_with`] with one `event+reconcile` downstream.
+    fn build_registry(root: &str) -> (Registry, Arc<JobStore>) {
+        build_registry_with(root, repository_with_downstream())
+    }
+
+    #[tokio::test]
+    async fn dispatch_replication_enqueues_for_matching_downstream() {
+        crate::metrics_provider::init_for_tests();
+        let dir = TempDir::new().unwrap();
+        let (registry, job_store) = build_registry(dir.path().to_str().unwrap());
+
+        let namespace = Namespace::new(NAMESPACE).unwrap();
+        let digest: Digest = SAMPLE_DIGEST.parse().unwrap();
+
+        let repository = registry.resolver.resolve(&namespace);
+        registry
+            .dispatch_replication(
+                repository,
+                &namespace,
+                REPLICATION_PUSH_MANIFEST_KIND,
+                Some("v1"),
+                Some(&digest),
+                None,
+            )
+            .await;
+
+        assert_eq!(
+            job_store.count_pending(REPLICATION_QUEUE, 0).await.unwrap(),
+            1,
+            "a fresh local change must enqueue one push job"
+        );
+    }
+
+    /// The payload carries the correct downstream/namespace/tag/digest/kind and
+    /// a populated `source_ts`.
+    #[tokio::test]
+    async fn dispatch_replication_payload_is_well_formed() {
+        crate::metrics_provider::init_for_tests();
+        let dir = TempDir::new().unwrap();
+        let (registry, job_store) = build_registry(dir.path().to_str().unwrap());
+
+        let namespace = Namespace::new(NAMESPACE).unwrap();
+        let digest: Digest = SAMPLE_DIGEST.parse().unwrap();
+
+        let repository = registry.resolver.resolve(&namespace);
+        registry
+            .dispatch_replication(
+                repository,
+                &namespace,
+                REPLICATION_PUSH_MANIFEST_KIND,
+                Some("v1"),
+                Some(&digest),
+                None,
+            )
+            .await;
+
+        let payload = sole_pending_payload(&job_store).await;
+        assert_eq!(payload.downstream, DOWNSTREAM);
+        assert_eq!(payload.namespace, NAMESPACE);
+        assert_eq!(payload.tag.as_deref(), Some("v1"));
+        assert_eq!(payload.digest.as_deref(), Some(SAMPLE_DIGEST));
+        assert_eq!(payload.kind, REPLICATION_PUSH_MANIFEST_KIND);
+        let source_ts = payload.source_ts.expect("source_ts must be present");
+        assert!(
+            DateTime::parse_from_rfc3339(&source_ts).is_ok(),
+            "source_ts must be a valid RFC 3339 timestamp; got {source_ts}"
+        );
+    }
+
+    /// The fan-out enqueues concurrently (one index GET plus CAS transaction
+    /// per downstream); every matching downstream must still get exactly one
+    /// job carrying its own name.
+    #[tokio::test]
+    async fn dispatch_replication_enqueues_one_job_per_downstream() {
+        crate::metrics_provider::init_for_tests();
+        let dir = TempDir::new().unwrap();
+        let (registry, job_store) = build_registry_with(
+            dir.path().to_str().unwrap(),
+            repository_with_replication(
+                REPO,
+                vec![
+                    downstream_with(DOWNSTREAM, ReplicationMode::EventReconcile, Vec::new()),
+                    downstream_with("us-region", ReplicationMode::EventReconcile, Vec::new()),
+                ],
+            ),
+        );
+
+        let namespace = Namespace::new(NAMESPACE).unwrap();
+        let digest: Digest = SAMPLE_DIGEST.parse().unwrap();
+
+        let repository = registry.resolver.resolve(&namespace);
+        registry
+            .dispatch_replication(
+                repository,
+                &namespace,
+                REPLICATION_PUSH_MANIFEST_KIND,
+                Some("v1"),
+                Some(&digest),
+                None,
+            )
+            .await;
+
+        let keys = job_store.list_pending(REPLICATION_QUEUE, 16).await.unwrap();
+        assert_eq!(keys.len(), 2, "each matching downstream must get one job");
+        let mut downstreams = Vec::new();
+        for key in &keys {
+            let envelope = job_store
+                .read_pending(REPLICATION_QUEUE, key)
+                .await
+                .unwrap();
+            let payload: ReplicationPushPayload =
+                serde_json::from_value(envelope.payload).expect("decode ReplicationPushPayload");
+            downstreams.push(payload.downstream);
+        }
+        downstreams.sort();
+        assert_eq!(
+            downstreams,
+            vec![DOWNSTREAM.to_string(), "us-region".to_string()],
+            "one job per downstream, each addressed to its own downstream"
+        );
+    }
+
+    /// A caller-provided timestamp (an inbound replicated delete's author
+    /// time) propagates verbatim; a re-stamped `now()` would let the bounced
+    /// delete outrank a recreate authored in between.
+    #[tokio::test]
+    async fn dispatch_replication_uses_provided_source_ts_verbatim() {
+        crate::metrics_provider::init_for_tests();
+        let dir = TempDir::new().unwrap();
+        let (registry, job_store) = build_registry(dir.path().to_str().unwrap());
+
+        let namespace = Namespace::new(NAMESPACE).unwrap();
+        let author_ts = Utc::now() - Duration::hours(3);
+
+        let repository = registry.resolver.resolve(&namespace);
+        registry
+            .dispatch_replication(
+                repository,
+                &namespace,
+                REPLICATION_DELETE_MANIFEST_KIND,
+                Some("v1"),
+                None,
+                Some(author_ts),
+            )
+            .await;
+
+        let payload = sole_pending_payload(&job_store).await;
+        assert_eq!(payload.kind, REPLICATION_DELETE_MANIFEST_KIND);
+        assert_eq!(
+            payload.source_ts.as_deref(),
+            Some(author_ts.to_rfc3339().as_str()),
+            "a provided source_ts must propagate verbatim, not be re-stamped"
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_replication_skips_reconcile_only_downstream() {
+        crate::metrics_provider::init_for_tests();
+        let dir = TempDir::new().unwrap();
+        let (registry, job_store) = build_registry_with(
+            dir.path().to_str().unwrap(),
+            repository_with(ReplicationMode::ReconcileOnly, Vec::new()),
+        );
+
+        let namespace = Namespace::new(NAMESPACE).unwrap();
+        let digest: Digest = SAMPLE_DIGEST.parse().unwrap();
+
+        let repository = registry.resolver.resolve(&namespace);
+        registry
+            .dispatch_replication(
+                repository,
+                &namespace,
+                REPLICATION_PUSH_MANIFEST_KIND,
+                Some("v1"),
+                Some(&digest),
+                None,
+            )
+            .await;
+
+        assert_eq!(
+            job_store.count_pending(REPLICATION_QUEUE, 0).await.unwrap(),
+            0,
+            "a reconcile-only downstream must not enqueue on the event path"
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_replication_skips_non_matching_namespace_filter() {
+        crate::metrics_provider::init_for_tests();
+        let dir = TempDir::new().unwrap();
+        let (registry, job_store) = build_registry_with(
+            dir.path().to_str().unwrap(),
+            repository_with(
+                ReplicationMode::EventReconcile,
+                vec![Regex::new("^other/.*").unwrap()],
+            ),
+        );
+
+        let namespace = Namespace::new(NAMESPACE).unwrap();
+        let digest: Digest = SAMPLE_DIGEST.parse().unwrap();
+
+        let repository = registry.resolver.resolve(&namespace);
+        registry
+            .dispatch_replication(
+                repository,
+                &namespace,
+                REPLICATION_PUSH_MANIFEST_KIND,
+                Some("v1"),
+                Some(&digest),
+                None,
+            )
+            .await;
+
+        assert_eq!(
+            job_store.count_pending(REPLICATION_QUEUE, 0).await.unwrap(),
+            0,
+            "a downstream whose filter excludes the namespace must not enqueue"
+        );
+    }
 }
