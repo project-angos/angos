@@ -46,7 +46,7 @@ Blob uploads do **not** trigger replication on their own. Blobs are replicated a
 The push pipeline is recursive:
 
 - For an image index (`application/vnd.oci.image.index.v1+json` or a Docker manifest list), the pipeline recurses into **child manifests first**. The parent index is pushed only after every child is present on the downstream.
-- When a manifest carries a `subject` (an OCI 1.1 referrer), the pipeline pushes the referrer. Against an OCI 1.0 downstream that does not index referrers automatically, it falls back to pushing the referrers-fallback tag manifest.
+- When a manifest carries a `subject` (an OCI 1.1 referrer), the pipeline pushes the referrer. Against an OCI 1.0 downstream that does not index referrers automatically, it falls back to pushing the referrers-fallback tag manifest, and a later delete of that referrer drops its descriptor from the fallback index (removing the tag once empty).
 
 ## The Durable Job Queue Substrate
 

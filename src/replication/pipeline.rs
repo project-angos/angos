@@ -565,33 +565,42 @@ fn referrer_descriptor(
 }
 
 /// Deletes the manifest bound to `reference` on the downstream, stamping
-/// `source_ts` so the receiver can apply last-writer-wins.
+/// `source_ts` for receiver-side last-writer-wins. A digest delete of a referrer
+/// also drops its descriptor from the subject's OCI-1.0 referrers fallback index
+/// (a no-op on a 1.1 downstream); a tag delete leaves the manifest in place, so
+/// the fallback is untouched.
 ///
-/// Returns [`PushOutcome::Pushed`] for an applied delete,
-/// [`PushOutcome::Converged`] for an already-absent target,
-/// [`PushOutcome::Superseded`] for an LWW loss, or [`PushOutcome::Unsupported`]
-/// when the downstream rejects the delete method (`405`).
+/// Returns the [`PushOutcome`]; all but [`PushOutcome::Unsupported`] are
+/// convergence.
 ///
 /// # Errors
 ///
 /// Returns [`Error::Registry`] when the delete fails with anything other than
 /// a 404, an LWW-superseded 409, or a 405.
-#[instrument(skip(downstream))]
+#[instrument(skip(downstream, metadata_store))]
 pub async fn delete_manifest(
     downstream: &RegistryClient,
+    metadata_store: &Arc<MetadataStore>,
     namespace: &str,
     reference: &Reference,
     source_ts: Option<&str>,
 ) -> Result<PushOutcome, Error> {
+    // Capture the subject before the manifest is gone (a tag delete leaves it,
+    // so it has no fallback index to maintain).
+    let fallback_subject = match reference {
+        Reference::Digest(digest) => deleted_referrer_subject(downstream, namespace, digest).await,
+        Reference::Tag(_) => None,
+    };
+
     let location = downstream.get_manifest_path(NO_LOCAL_PREFIX, namespace, reference);
     let outcome = downstream
         .delete_manifest(&location, source_ts)
         .await
         .map_err(Error::Registry)?;
-    match outcome {
+    let push_outcome = match outcome {
         DeleteManifestOutcome::Deleted => {
             info!(namespace, %reference, "Deleted manifest on downstream");
-            Ok(PushOutcome::Pushed)
+            PushOutcome::Pushed
         }
         DeleteManifestOutcome::AlreadyAbsent => {
             info!(
@@ -599,7 +608,7 @@ pub async fn delete_manifest(
                 %reference,
                 "Downstream already lacked this manifest; delete is a no-op (converged)"
             );
-            Ok(PushOutcome::Converged)
+            PushOutcome::Converged
         }
         DeleteManifestOutcome::Superseded => {
             info!(
@@ -607,7 +616,7 @@ pub async fn delete_manifest(
                 %reference,
                 "Downstream superseded the delete (last-writer-wins); treating as converged"
             );
-            Ok(PushOutcome::Superseded)
+            PushOutcome::Superseded
         }
         DeleteManifestOutcome::Unsupported => {
             warn!(
@@ -616,9 +625,149 @@ pub async fn delete_manifest(
                 "Downstream does not support deleting this reference (405); the delete will not \
                  propagate. Completing the job (retrying cannot help)"
             );
-            Ok(PushOutcome::Unsupported)
+            PushOutcome::Unsupported
         }
+    };
+
+    // Drop the gone manifest's descriptor from the subject's fallback index.
+    // Best-effort: a retry cannot re-derive the subject once the manifest is
+    // gone, so a failure warns rather than churning the whole delete.
+    if matches!(push_outcome, PushOutcome::Pushed | PushOutcome::Converged)
+        && let (Reference::Digest(digest), Some(subject)) = (reference, &fallback_subject)
+        && let Err(e) =
+            remove_referrers_fallback(downstream, metadata_store, namespace, subject, digest).await
+    {
+        warn!(
+            namespace,
+            %digest,
+            %subject,
+            "Failed to drop the referrer descriptor from the fallback index: {e}"
+        );
     }
+
+    Ok(push_outcome)
+}
+
+/// GETs the manifest at `digest` from the downstream and returns its subject
+/// when it is a referrer. Best-effort: any failure (absent, unparseable, or no
+/// subject) yields `None`, leaving the fallback index untouched.
+async fn deleted_referrer_subject(
+    downstream: &RegistryClient,
+    namespace: &str,
+    digest: &Digest,
+) -> Option<Digest> {
+    let location = downstream.get_manifest_path(
+        NO_LOCAL_PREFIX,
+        namespace,
+        &Reference::Digest(digest.clone()),
+    );
+    let (_, _, body) = downstream
+        .get_manifest(&manifest_accept_types(), &location)
+        .await
+        .ok()?;
+    parse_manifest_digests(&body, None).ok()?.subject
+}
+
+/// Drops `referrer`'s descriptor from the subject's OCI-1.0 referrers fallback
+/// index, deleting the fallback tag when no referrers remain. Serialized under
+/// the same per-subject lock as the push-side merge, so a concurrent add and
+/// this removal cannot lose each other's update.
+async fn remove_referrers_fallback(
+    downstream: &RegistryClient,
+    metadata_store: &Arc<MetadataStore>,
+    namespace: &str,
+    subject: &Digest,
+    referrer: &Digest,
+) -> Result<(), Error> {
+    let fallback_tag = format!("{}-{}", subject.algorithm(), subject.hash());
+    let reference = Reference::from_str(&fallback_tag).map_err(|e| {
+        Error::Registry(RegistryError::Internal(format!(
+            "invalid referrers fallback tag '{fallback_tag}': {e}"
+        )))
+    })?;
+    let location = downstream.get_manifest_path(NO_LOCAL_PREFIX, namespace, &reference);
+
+    let lock_keys = [referrers_fallback_lock_key(namespace, subject)];
+    let session = metadata_store
+        .executor()
+        .acquire(&lock_keys)
+        .await
+        .map_err(|e| {
+            Error::Registry(RegistryError::Internal(format!(
+                "referrers fallback lock acquire failed for '{fallback_tag}': {e}"
+            )))
+        })?;
+    let result = prune_fallback_descriptor(downstream, &location, referrer).await;
+    session.release().await;
+    result
+}
+
+/// Locked critical section of [`remove_referrers_fallback`]: GET the index, drop
+/// the descriptor, then PUT the remainder back, or DELETE the tag when empty.
+async fn prune_fallback_descriptor(
+    downstream: &RegistryClient,
+    location: &str,
+    referrer: &Digest,
+) -> Result<(), Error> {
+    let mut manifests = timeout(
+        REFERRERS_MERGE_HTTP_TIMEOUT,
+        fetch_fallback_manifests(downstream, location),
+    )
+    .await
+    .map_err(|_| {
+        Error::Registry(RegistryError::Internal(format!(
+            "referrers fallback GET at '{location}' timed out inside the merge lock"
+        )))
+    })??;
+
+    let referrer_str = referrer.to_string();
+    let before = manifests.len();
+    manifests.retain(|m| m.get("digest").and_then(Value::as_str) != Some(referrer_str.as_str()));
+    // Descriptor absent (already pruned, or a 1.1 downstream has no fallback tag
+    // and the GET returned an empty base): nothing to do.
+    if manifests.len() == before {
+        return Ok(());
+    }
+
+    if manifests.is_empty() {
+        // No referrers remain: drop the fallback tag rather than leave an empty
+        // index. Timestamp-less, mirroring the merge PUT.
+        timeout(
+            REFERRERS_MERGE_HTTP_TIMEOUT,
+            downstream.delete_manifest(location, None),
+        )
+        .await
+        .map_err(|_| {
+            Error::Registry(RegistryError::Internal(format!(
+                "referrers fallback DELETE at '{location}' timed out inside the merge lock"
+            )))
+        })?
+        .map_err(Error::Registry)?;
+        return Ok(());
+    }
+
+    let index = json!({
+        "schemaVersion": 2,
+        "mediaType": OCI_INDEX_MEDIA_TYPE,
+        "manifests": manifests,
+    });
+    let index_body = serde_json::to_vec(&index).map_err(|e| {
+        Error::Registry(RegistryError::Internal(format!(
+            "failed to serialize referrers fallback index: {e}"
+        )))
+    })?;
+    timeout(
+        REFERRERS_MERGE_HTTP_TIMEOUT,
+        downstream.put_manifest(location, Some(OCI_INDEX_MEDIA_TYPE), index_body, None),
+    )
+    .await
+    .map_err(|_| {
+        Error::Registry(RegistryError::Internal(format!(
+            "referrers fallback PUT at '{location}' timed out inside the merge lock"
+        )))
+    })?
+    .map_err(Error::Registry)?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -628,7 +777,7 @@ mod tests {
         atomic::{AtomicUsize, Ordering},
     };
 
-    use serde_json::json;
+    use serde_json::{Value, json};
     use tempfile::TempDir;
     use wiremock::{
         Mock, MockServer, Request, Respond, ResponseTemplate,
@@ -2555,8 +2704,11 @@ mod tests {
             .mount(&mock_server)
             .await;
 
+        let dir = TempDir::new().unwrap();
+        let (_, metadata_store, _) = test_blob_store(dir.path().to_str().unwrap());
         delete_manifest(
             &downstream_client(&mock_server.uri()),
+            &metadata_store,
             NAMESPACE,
             &Reference::Tag("v1".to_string()),
             Some("2026-06-03T00:00:00Z"),
@@ -2579,8 +2731,11 @@ mod tests {
             .mount(&mock_server)
             .await;
 
+        let dir = TempDir::new().unwrap();
+        let (_, metadata_store, _) = test_blob_store(dir.path().to_str().unwrap());
         let outcome = delete_manifest(
             &downstream_client(&mock_server.uri()),
+            &metadata_store,
             NAMESPACE,
             &Reference::Tag("gone".to_string()),
             None,
@@ -2608,8 +2763,11 @@ mod tests {
             .mount(&mock_server)
             .await;
 
+        let dir = TempDir::new().unwrap();
+        let (_, metadata_store, _) = test_blob_store(dir.path().to_str().unwrap());
         let outcome = delete_manifest(
             &downstream_client(&mock_server.uri()),
+            &metadata_store,
             NAMESPACE,
             &Reference::Tag("v1".to_string()),
             None,
@@ -2632,8 +2790,11 @@ mod tests {
             .mount(&mock_server)
             .await;
 
+        let dir = TempDir::new().unwrap();
+        let (_, metadata_store, _) = test_blob_store(dir.path().to_str().unwrap());
         let result = delete_manifest(
             &downstream_client(&mock_server.uri()),
+            &metadata_store,
             NAMESPACE,
             &Reference::Tag("v1".to_string()),
             None,
@@ -2642,6 +2803,175 @@ mod tests {
         assert!(
             result.is_err(),
             "a non-superseded delete-409 must propagate as an error"
+        );
+
+        drop(mock_server);
+    }
+
+    /// A referrer manifest with a subject; returns `(body bytes, digest)`.
+    fn referrer_manifest(subject: &Digest) -> (Vec<u8>, Digest) {
+        let body = serde_json::to_vec(&json!({
+            "schemaVersion": 2,
+            "mediaType": OCI_MANIFEST_MEDIA_TYPE,
+            "subject": { "mediaType": OCI_MANIFEST_MEDIA_TYPE, "digest": subject.to_string(), "size": 2 },
+            "layers": [],
+        }))
+        .unwrap();
+        let digest = Digest::Sha256(sha256::hex(&body).into());
+        (body, digest)
+    }
+
+    #[tokio::test]
+    async fn deleting_last_referrer_removes_the_fallback_tag() {
+        metrics_provider::init_for_tests();
+        let mock_server = MockServer::start().await;
+        let dir = TempDir::new().unwrap();
+        let (_, metadata_store, _) = test_blob_store(dir.path().to_str().unwrap());
+
+        let subject = Digest::Sha256(sha256::hex(b"the-subject").into());
+        let (referrer_body, referrer) = referrer_manifest(&subject);
+        let fallback_tag = format!("{}-{}", subject.algorithm(), subject.hash());
+
+        // The downstream still holds the referrer, so the delete can read its
+        // subject before removing it.
+        Mock::given(method("GET"))
+            .and(path(format!("/v2/{NAMESPACE}/manifests/{referrer}")))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header(DOCKER_CONTENT_DIGEST, referrer.to_string().as_str())
+                    .set_body_bytes(referrer_body),
+            )
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("DELETE"))
+            .and(path(format!("/v2/{NAMESPACE}/manifests/{referrer}")))
+            .respond_with(ResponseTemplate::new(202))
+            .mount(&mock_server)
+            .await;
+        // The fallback index lists only this referrer.
+        let index = json!({
+            "schemaVersion": 2,
+            "mediaType": OCI_INDEX_MEDIA_TYPE,
+            "manifests": [{ "mediaType": OCI_MANIFEST_MEDIA_TYPE, "digest": referrer.to_string(), "size": 2 }],
+        });
+        Mock::given(method("GET"))
+            .and(path(format!("/v2/{NAMESPACE}/manifests/{fallback_tag}")))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header(
+                        DOCKER_CONTENT_DIGEST,
+                        "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+                    )
+                    .set_body_json(index),
+            )
+            .mount(&mock_server)
+            .await;
+        // Emptied: the fallback tag itself must be deleted (expect verifies it ran).
+        Mock::given(method("DELETE"))
+            .and(path(format!("/v2/{NAMESPACE}/manifests/{fallback_tag}")))
+            .respond_with(ResponseTemplate::new(202))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let outcome = delete_manifest(
+            &downstream_client(&mock_server.uri()),
+            &metadata_store,
+            NAMESPACE,
+            &Reference::Digest(referrer.clone()),
+            None,
+        )
+        .await
+        .expect("the digest delete must succeed");
+        assert_eq!(outcome, PushOutcome::Pushed);
+
+        drop(mock_server);
+    }
+
+    #[tokio::test]
+    async fn deleting_a_referrer_keeps_its_siblings_in_the_fallback_index() {
+        metrics_provider::init_for_tests();
+        let mock_server = MockServer::start().await;
+        let dir = TempDir::new().unwrap();
+        let (_, metadata_store, _) = test_blob_store(dir.path().to_str().unwrap());
+
+        let subject = Digest::Sha256(sha256::hex(b"shared-subject").into());
+        let (referrer_body, referrer) = referrer_manifest(&subject);
+        let sibling = Digest::Sha256(sha256::hex(b"sibling-referrer").into());
+        let fallback_tag = format!("{}-{}", subject.algorithm(), subject.hash());
+
+        Mock::given(method("GET"))
+            .and(path(format!("/v2/{NAMESPACE}/manifests/{referrer}")))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header(DOCKER_CONTENT_DIGEST, referrer.to_string().as_str())
+                    .set_body_bytes(referrer_body),
+            )
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("DELETE"))
+            .and(path(format!("/v2/{NAMESPACE}/manifests/{referrer}")))
+            .respond_with(ResponseTemplate::new(202))
+            .mount(&mock_server)
+            .await;
+        let index = json!({
+            "schemaVersion": 2,
+            "mediaType": OCI_INDEX_MEDIA_TYPE,
+            "manifests": [
+                { "mediaType": OCI_MANIFEST_MEDIA_TYPE, "digest": referrer.to_string(), "size": 2 },
+                { "mediaType": OCI_MANIFEST_MEDIA_TYPE, "digest": sibling.to_string(), "size": 3 },
+            ],
+        });
+        Mock::given(method("GET"))
+            .and(path(format!("/v2/{NAMESPACE}/manifests/{fallback_tag}")))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header(
+                        DOCKER_CONTENT_DIGEST,
+                        "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+                    )
+                    .set_body_json(index),
+            )
+            .mount(&mock_server)
+            .await;
+        // Sibling remains, so the index is re-PUT (not deleted).
+        Mock::given(method("PUT"))
+            .and(path(format!("/v2/{NAMESPACE}/manifests/{fallback_tag}")))
+            .respond_with(ResponseTemplate::new(201))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        delete_manifest(
+            &downstream_client(&mock_server.uri()),
+            &metadata_store,
+            NAMESPACE,
+            &Reference::Digest(referrer.clone()),
+            None,
+        )
+        .await
+        .expect("the digest delete must succeed");
+
+        // The re-PUT index keeps the sibling and drops the deleted referrer.
+        let put_body = mock_server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .find(|r| r.method.as_str() == "PUT" && r.url.path().ends_with(&fallback_tag))
+            .map(|r| r.body)
+            .expect("the fallback index must be re-PUT");
+        let digests: Vec<String> = serde_json::from_slice::<Value>(&put_body)
+            .ok()
+            .and_then(|v| v.get("manifests").and_then(Value::as_array).cloned())
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|m| m.get("digest").and_then(Value::as_str).map(str::to_string))
+            .collect();
+        assert_eq!(
+            digests,
+            vec![sibling.to_string()],
+            "only the sibling must remain"
         );
 
         drop(mock_server);
