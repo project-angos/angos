@@ -139,7 +139,7 @@ mod tests {
                 .await
                 .unwrap();
 
-            let mut executor = Executor::new(blob_store.clone(), metadata_store.clone());
+            let mut executor = Executor::new_for_test(blob_store.clone(), metadata_store.clone());
 
             let scrubber = ManifestChecker::new(blob_store.clone(), metadata_store.clone());
             scrubber.check(namespace, &mut executor).await.unwrap();
@@ -221,7 +221,7 @@ mod tests {
                 .await
                 .unwrap();
 
-            let mut executor = Executor::new(blob_store.clone(), metadata_store.clone());
+            let mut executor = Executor::new_for_test(blob_store.clone(), metadata_store.clone());
 
             let scrubber = ManifestChecker::new(blob_store.clone(), metadata_store.clone());
             scrubber.check(namespace, &mut executor).await.unwrap();

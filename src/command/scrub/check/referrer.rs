@@ -197,7 +197,7 @@ mod tests {
                 .await
                 .unwrap();
 
-            let mut executor = Executor::new(blob_store.clone(), metadata_store.clone());
+            let mut executor = Executor::new_for_test(blob_store.clone(), metadata_store.clone());
 
             let checker = ReferrerChecker::new(metadata_store.clone());
             checker.check(namespace, &mut executor).await.unwrap();

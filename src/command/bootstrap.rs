@@ -106,8 +106,7 @@ pub async fn metadata_store(
         (0, 0)
     };
 
-    let mut builder = MetadataStore::builder()
-        .store(store)
+    let mut builder = MetadataStore::builder(store)
         .link_cache_ttl(s3_ttl.0)
         .access_time_debounce_secs(s3_ttl.1);
 
@@ -115,7 +114,7 @@ pub async fn metadata_store(
     // where link_cache_ttl > 0 by default).
     builder = builder.cache(auth_cache.clone());
 
-    Ok(Arc::new(builder.build()?))
+    Ok(Arc::new(builder.build()))
 }
 
 pub fn auth_cache(config: &cache::Config) -> Result<Arc<Cache>, Error> {

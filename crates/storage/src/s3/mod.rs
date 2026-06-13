@@ -69,28 +69,22 @@ const FRAME_BUFFER_CAPACITY: usize = 8;
 /// 5 MiB before it can be flushed as an `UploadPart`.
 const MIN_PART_SIZE: u64 = 5 * 1024 * 1024;
 
-/// Builder for [`Backend`].
+/// Builder for [`Backend`]. The S3 HTTP client is required and supplied to
+/// [`Backend::builder`]; `part_size` and `uniform_parts` are optional fluent
+/// setters.
 pub struct Builder {
-    client: Option<Arc<S3Backend>>,
+    client: Arc<S3Backend>,
     part_size: u64,
     uniform_parts: bool,
 }
 
 impl Builder {
-    fn new() -> Self {
+    fn new(client: Arc<S3Backend>) -> Self {
         Self {
-            client: None,
+            client,
             part_size: DEFAULT_PART_SIZE,
             uniform_parts: false,
         }
-    }
-
-    /// The underlying S3 HTTP client. Construct it with
-    /// `angos_s3_client::Backend::new(&config)` and pass it in here.
-    #[must_use]
-    pub fn client(mut self, client: Arc<S3Backend>) -> Self {
-        self.client = Some(client);
-        self
     }
 
     /// Target part size for upload sessions (uniform mode) or minimum part
@@ -113,18 +107,14 @@ impl Builder {
         self
     }
 
-    /// # Errors
-    /// Returns [`Error::Backend`] when [`client`](Self::client) was never
-    /// called.
-    pub fn build(self) -> Result<Backend, Error> {
-        let client = self
-            .client
-            .ok_or_else(|| Error::Backend("s3::Backend requires a client".to_string()))?;
-        Ok(Backend {
-            client,
+    /// Consume the builder and produce the [`Backend`].
+    #[must_use]
+    pub fn build(self) -> Backend {
+        Backend {
+            client: self.client,
             part_size: self.part_size,
             uniform_parts: self.uniform_parts,
-        })
+        }
     }
 }
 
@@ -137,9 +127,12 @@ pub struct Backend {
 }
 
 impl Backend {
+    /// Return a builder wrapping the underlying S3 HTTP `client` (construct it
+    /// with `angos_s3_client::Backend::new(&config)`). Other settings are
+    /// optional fluent setters on the returned builder.
     #[must_use]
-    pub fn builder() -> Builder {
-        Builder::new()
+    pub fn builder(client: Arc<S3Backend>) -> Builder {
+        Builder::new(client)
     }
 
     /// Recover an upload's in-flight state from S3: the open multipart upload id

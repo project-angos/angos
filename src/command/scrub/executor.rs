@@ -49,23 +49,31 @@ pub struct Executor {
 }
 
 impl Executor {
-    /// Starts building an executor from individual resolved fields.
+    /// Construct an executor from its resolved fields: the `blob_store` it
+    /// reads/deletes blobs through, the `metadata_store` it mutates links
+    /// through, and the `job_store` replication enqueue actions are landed on.
     #[must_use]
-    pub fn builder() -> ExecutorBuilder {
-        ExecutorBuilder::default()
+    pub fn new(
+        blob_store: Arc<blob_store::BlobStore>,
+        metadata_store: Arc<MetadataStore>,
+        job_store: Arc<JobStore>,
+    ) -> Self {
+        Self {
+            blob_store,
+            metadata_store,
+            job_store,
+        }
     }
 
-    /// Test-only constructor that synthesizes a `JobStore` so the build cannot fail.
+    /// Test-only constructor that synthesizes a `JobStore`.
     #[cfg(test)]
     #[must_use]
-    pub fn new(blob_store: Arc<blob_store::BlobStore>, metadata_store: Arc<MetadataStore>) -> Self {
+    pub fn new_for_test(
+        blob_store: Arc<blob_store::BlobStore>,
+        metadata_store: Arc<MetadataStore>,
+    ) -> Self {
         let job_store = Arc::new(JobStore::new(metadata_store.store_arc(), "scrub-test"));
-        Self::builder()
-            .blob_store(blob_store)
-            .metadata_store(metadata_store)
-            .job_store(job_store)
-            .build()
-            .expect("blob_store, metadata_store and job_store provided")
+        Self::new(blob_store, metadata_store, job_store)
     }
 
     /// Lands the envelope on the durable replication queue. A reconcile push
@@ -96,61 +104,6 @@ pub fn record_reconcile_outcome(outcome: &str) {
         .replication_reconcile_total
         .with_label_values(&[outcome])
         .inc();
-}
-
-/// Builder for [`Executor`]; all three fields are required.
-#[allow(clippy::struct_field_names)]
-#[derive(Default)]
-pub struct ExecutorBuilder {
-    blob_store: Option<Arc<blob_store::BlobStore>>,
-    metadata_store: Option<Arc<MetadataStore>>,
-    job_store: Option<Arc<JobStore>>,
-}
-
-impl ExecutorBuilder {
-    /// Blob store the executor reads/deletes blobs through (required).
-    #[must_use]
-    pub fn blob_store(mut self, blob_store: Arc<blob_store::BlobStore>) -> Self {
-        self.blob_store = Some(blob_store);
-        self
-    }
-
-    /// Metadata store the executor mutates links through (required).
-    #[must_use]
-    pub fn metadata_store(mut self, metadata_store: Arc<MetadataStore>) -> Self {
-        self.metadata_store = Some(metadata_store);
-        self
-    }
-
-    /// Producer queue replication enqueue actions are landed on (required).
-    #[must_use]
-    pub fn job_store(mut self, job_store: Arc<JobStore>) -> Self {
-        self.job_store = Some(job_store);
-        self
-    }
-
-    /// Builds the [`Executor`].
-    ///
-    /// # Errors
-    ///
-    /// Returns [`Error::Initialization`] when a required field is missing.
-    pub fn build(self) -> Result<Executor, Error> {
-        let blob_store = self.blob_store.ok_or_else(|| {
-            Error::Initialization("executor builder requires a blob_store".into())
-        })?;
-        let metadata_store = self.metadata_store.ok_or_else(|| {
-            Error::Initialization("executor builder requires a metadata_store".into())
-        })?;
-        let job_store = self
-            .job_store
-            .ok_or_else(|| Error::Initialization("executor builder requires a job_store".into()))?;
-
-        Ok(Executor {
-            blob_store,
-            metadata_store,
-            job_store,
-        })
-    }
 }
 
 #[async_trait]
@@ -475,7 +428,7 @@ mod tests {
             let orphan_content = b"executor real-run test";
             let orphan_digest = put_blob_direct(metadata_store.store(), orphan_content).await;
 
-            let mut executor = Executor::new(blob_store.clone(), metadata_store);
+            let mut executor = Executor::new_for_test(blob_store.clone(), metadata_store);
 
             executor
                 .apply(Action::DeleteOrphanBlob(orphan_digest.clone()))
@@ -513,7 +466,7 @@ mod tests {
                 .unwrap();
             blob_store.delete_blob(&digest).await.unwrap();
 
-            let mut executor = Executor::new(blob_store.clone(), metadata_store.clone());
+            let mut executor = Executor::new_for_test(blob_store.clone(), metadata_store.clone());
 
             executor
                 .apply(Action::DeleteOrphanManifest {
@@ -559,7 +512,7 @@ mod tests {
                 .unwrap();
             blob_store.delete_blob(&digest).await.unwrap();
 
-            let mut executor = Executor::new(blob_store.clone(), metadata_store.clone());
+            let mut executor = Executor::new_for_test(blob_store.clone(), metadata_store.clone());
 
             executor
                 .apply(Action::DeleteOrphanManifest {
@@ -589,7 +542,7 @@ mod tests {
             let content = b"blob with no ownership entry";
             let digest = put_blob_direct(metadata_store.store(), content).await;
 
-            let mut executor = Executor::new(blob_store.clone(), metadata_store);
+            let mut executor = Executor::new_for_test(blob_store.clone(), metadata_store);
 
             executor
                 .apply(Action::DeleteOrphanBlob(digest.clone()))
@@ -623,7 +576,7 @@ mod tests {
                 .await
                 .unwrap();
 
-            let mut executor = Executor::new(blob_store.clone(), metadata_store);
+            let mut executor = Executor::new_for_test(blob_store.clone(), metadata_store);
 
             executor
                 .apply(Action::DeleteOrphanBlob(digest.clone()))
@@ -680,7 +633,7 @@ mod tests {
                 "Referrer link must exist before applying the action"
             );
 
-            let mut executor = Executor::new(blob_store.clone(), metadata_store.clone());
+            let mut executor = Executor::new_for_test(blob_store.clone(), metadata_store.clone());
 
             executor
                 .apply(Action::DeleteOrphanReferrer {
@@ -745,7 +698,7 @@ mod tests {
                 "phantom referrer must be present before the action"
             );
 
-            let mut executor = Executor::new(blob_store.clone(), metadata_store.clone());
+            let mut executor = Executor::new_for_test(blob_store.clone(), metadata_store.clone());
 
             executor
                 .apply(Action::RemoveReferrer {
@@ -776,12 +729,7 @@ mod tests {
 
             let job_store = standalone_job_store("scrub-source-ts");
 
-            let mut executor = Executor::builder()
-                .blob_store(blob_store)
-                .metadata_store(metadata_store)
-                .job_store(job_store.clone())
-                .build()
-                .unwrap();
+            let mut executor = Executor::new(blob_store, metadata_store, job_store.clone());
 
             executor
                 .apply(Action::EnqueueReplicationDelete {
@@ -825,12 +773,7 @@ mod tests {
 
             let job_store = standalone_job_store("scrub-prune-coalesce");
 
-            let mut executor = Executor::builder()
-                .blob_store(blob_store)
-                .metadata_store(metadata_store)
-                .job_store(job_store.clone())
-                .build()
-                .unwrap();
+            let mut executor = Executor::new(blob_store, metadata_store, job_store.clone());
 
             for _ in 0..2 {
                 executor
@@ -893,12 +836,7 @@ mod tests {
             let metadata_store = test_case.metadata_store();
             let job_store = standalone_job_store("scrub-orphan");
 
-            let mut executor = Executor::builder()
-                .blob_store(blob_store)
-                .metadata_store(metadata_store)
-                .job_store(job_store.clone())
-                .build()
-                .unwrap();
+            let mut executor = Executor::new(blob_store, metadata_store, job_store.clone());
 
             for (queue, envelope) in [
                 (REPLICATION_QUEUE, orphan_push_envelope()),
@@ -934,12 +872,7 @@ mod tests {
             let metadata_store = test_case.metadata_store();
             let job_store = standalone_job_store("scrub-orphan");
 
-            let mut executor = Executor::builder()
-                .blob_store(blob_store)
-                .metadata_store(metadata_store)
-                .job_store(job_store.clone())
-                .build()
-                .unwrap();
+            let mut executor = Executor::new(blob_store, metadata_store, job_store.clone());
 
             for (queue, mut envelope) in [
                 (REPLICATION_QUEUE, orphan_push_envelope()),
@@ -987,12 +920,7 @@ mod tests {
             let metadata_store = test_case.metadata_store();
             let job_store = standalone_job_store("scrub-orphan");
 
-            let mut executor = Executor::builder()
-                .blob_store(blob_store)
-                .metadata_store(metadata_store)
-                .job_store(job_store)
-                .build()
-                .unwrap();
+            let mut executor = Executor::new(blob_store, metadata_store, job_store);
 
             for queue in [REPLICATION_QUEUE, CACHE_QUEUE] {
                 for state in [JobState::Pending, JobState::Failed] {

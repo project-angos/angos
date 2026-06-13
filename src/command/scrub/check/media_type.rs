@@ -226,7 +226,7 @@ mod tests {
                 .unwrap();
             assert!(digest_link.media_type.is_none());
 
-            let mut executor = Executor::new(blob_store.clone(), metadata_store.clone());
+            let mut executor = Executor::new_for_test(blob_store.clone(), metadata_store.clone());
 
             let checker = MediaTypeChecker::new(blob_store.clone(), metadata_store.clone());
             checker.check(namespace, &mut executor).await.unwrap();
@@ -425,7 +425,7 @@ mod tests {
             blob_store.delete_blob(&manifest_digest).await.unwrap();
 
             let checker = MediaTypeChecker::new(blob_store.clone(), metadata_store.clone());
-            let mut executor = Executor::new(blob_store.clone(), metadata_store.clone());
+            let mut executor = Executor::new_for_test(blob_store.clone(), metadata_store.clone());
             checker.check(namespace, &mut executor).await.unwrap();
 
             assert!(
@@ -489,7 +489,7 @@ mod tests {
             blob_store.delete_blob(&manifest_digest).await.unwrap();
 
             let checker = MediaTypeChecker::new(blob_store.clone(), metadata_store.clone());
-            let mut executor = Executor::new(blob_store.clone(), metadata_store.clone());
+            let mut executor = Executor::new_for_test(blob_store.clone(), metadata_store.clone());
             checker.check(namespace, &mut executor).await.unwrap();
 
             assert!(

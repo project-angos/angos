@@ -35,11 +35,7 @@ mod common;
 // ──────────────────────────────────────────────────────────────────────────────
 
 fn build_executor(store: Arc<dyn ObjectStore>) -> LockedExecutor {
-    LockedExecutor::builder()
-        .store(store)
-        .lock(common::memory_lock())
-        .build()
-        .expect("LockedExecutor builder")
+    LockedExecutor::builder(store, common::memory_lock()).build()
 }
 
 fn simple_tx() -> Transaction {

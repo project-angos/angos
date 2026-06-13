@@ -196,7 +196,7 @@ impl Registry {
                     &metadata_store,
                     config.max_concurrent_cache_jobs,
                     config.max_concurrent_replication_jobs,
-                )?;
+                );
                 (q, Some(shutdown))
             };
 
@@ -273,7 +273,7 @@ fn build_in_process_queue(
     metadata_store: &Arc<MetadataStore>,
     cache_concurrency: NonZeroUsize,
     replication_concurrency: NonZeroUsize,
-) -> Result<(Arc<JobStore>, CancellationToken), Error> {
+) -> (Arc<JobStore>, CancellationToken) {
     // Share the registry's object store and transaction executor (the same
     // handle the blob/metadata stores use). The cache-fill handler stages bytes
     // into the blob store and returns a transaction that moves them into
@@ -302,16 +302,11 @@ fn build_in_process_queue(
     let replication_handler: Option<Arc<dyn JobHandler>> = if any_downstream {
         // Mesh cycles terminate: only state-changing writes dispatch, and
         // receiver-side no-op suppression stops any remaining replays.
-        Some(Arc::new(
-            ReplicationJobHandler::builder()
-                .resolver(resolver.clone())
-                .blob_store(blob_store.clone())
-                .metadata_store(metadata_store.clone())
-                .build()
-                .map_err(|e| {
-                    Error::Internal(format!("failed to build replication handler: {e}"))
-                })?,
-        ))
+        Some(Arc::new(ReplicationJobHandler::new(
+            resolver.clone(),
+            blob_store.clone(),
+            metadata_store.clone(),
+        )))
     } else {
         None
     };
@@ -339,7 +334,7 @@ fn build_in_process_queue(
         }
     }
 
-    Ok((job_store, shutdown))
+    (job_store, shutdown)
 }
 
 /// Idle poll interval for the in-process claim loops. Production polls once a
@@ -433,19 +428,16 @@ mod in_process_replication_tests {
         root: &str,
         repository: Repository,
     ) -> (Registry, Arc<BlobStore>, Arc<MetadataStore>) {
-        let object: Arc<dyn ObjectStore> =
-            Arc::new(StorageFsBackend::builder().root_dir(root).build().unwrap());
+        let object: Arc<dyn ObjectStore> = Arc::new(StorageFsBackend::builder(root).build());
         let executor = build_test_fs_executor(root, false);
         let store = build_store(object, executor);
         let metadata_store = Arc::new(
-            MetadataStore::builder()
-                .store(store.clone())
+            MetadataStore::builder(store.clone())
                 .link_cache_ttl(0)
                 .access_time_debounce_secs(0)
-                .build()
-                .unwrap(),
+                .build(),
         );
-        let blob_store = Arc::new(BlobStore::builder().store(store.clone()).build().unwrap());
+        let blob_store = Arc::new(BlobStore::new(store.clone()));
 
         let mut repositories = HashMap::new();
         repositories.insert(REPO.to_string(), repository);

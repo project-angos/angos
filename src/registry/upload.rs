@@ -613,19 +613,8 @@ mod tests {
             inner: object,
             fail,
         });
-        let facade = Arc::new(
-            Store::builder()
-                .object(failing)
-                .executor(inner.store.executor().clone())
-                .build()
-                .expect("failing store façade"),
-        );
-        Arc::new(
-            BlobStore::builder()
-                .store(facade)
-                .build()
-                .expect("failing blob store"),
-        )
+        let facade = Arc::new(Store::builder(failing, inner.store.executor().clone()).build());
+        Arc::new(BlobStore::new(facade))
     }
 
     #[tokio::test]

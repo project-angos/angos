@@ -2774,19 +2774,16 @@ mod noop_suppression_tests {
     /// event+reconcile downstream so `dispatch_replication` enqueues.
     fn build_registry(root: &str) -> (Registry, Arc<JobStore>) {
         crate::metrics_provider::init_for_tests();
-        let object: Arc<dyn ObjectStore> =
-            Arc::new(StorageFsBackend::builder().root_dir(root).build().unwrap());
+        let object: Arc<dyn ObjectStore> = Arc::new(StorageFsBackend::builder(root).build());
         let executor = build_test_fs_executor(root, false);
         let store = build_store(object, executor);
         let metadata_store = Arc::new(
-            MetadataStore::builder()
-                .store(store.clone())
+            MetadataStore::builder(store.clone())
                 .link_cache_ttl(0)
                 .access_time_debounce_secs(0)
-                .build()
-                .unwrap(),
+                .build(),
         );
-        let blob_store = Arc::new(BlobStore::builder().store(store.clone()).build().unwrap());
+        let blob_store = Arc::new(BlobStore::new(store.clone()));
 
         let mut repositories = HashMap::new();
         repositories.insert(
@@ -3313,14 +3310,14 @@ mod dispatch_replication_tests {
         mode: ReplicationMode,
         namespace_filter: Vec<Regex>,
     ) -> ReplicationDownstream {
-        ReplicationDownstream::builder()
-            .name(name.to_string())
-            .registry_client(downstream_client("https://unused.test"))
-            .mode(mode)
-            .namespace_filter(namespace_filter)
-            .max_concurrent_pushes(4)
-            .build()
-            .unwrap()
+        ReplicationDownstream::builder(
+            name.to_string(),
+            downstream_client("https://unused.test"),
+            4,
+        )
+        .mode(mode)
+        .namespace_filter(namespace_filter)
+        .build()
     }
 
     /// Repository with exactly one downstream of the given mode and namespace filter.
@@ -3338,19 +3335,16 @@ mod dispatch_replication_tests {
     /// Build a `Registry` whose job store is a caller-held `JobStore` so the
     /// test can count pending jobs.
     fn build_registry_with(root: &str, repository: Repository) -> (Registry, Arc<JobStore>) {
-        let object: Arc<dyn ObjectStore> =
-            Arc::new(StorageFsBackend::builder().root_dir(root).build().unwrap());
+        let object: Arc<dyn ObjectStore> = Arc::new(StorageFsBackend::builder(root).build());
         let executor = build_test_fs_executor(root, false);
         let store = build_store(object, executor);
         let metadata_store = Arc::new(
-            MetadataStore::builder()
-                .store(store.clone())
+            MetadataStore::builder(store.clone())
                 .link_cache_ttl(0)
                 .access_time_debounce_secs(0)
-                .build()
-                .unwrap(),
+                .build(),
         );
-        let blob_store = Arc::new(BlobStore::builder().store(store.clone()).build().unwrap());
+        let blob_store = Arc::new(BlobStore::new(store.clone()));
 
         let mut repositories = HashMap::new();
         repositories.insert(REPO.to_string(), repository);

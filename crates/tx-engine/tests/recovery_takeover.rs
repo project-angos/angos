@@ -755,12 +755,12 @@ async fn live_owner_blocks_recovery_takeover_apply_exactly_once() {
     // the recovery sweep reaches its `try_acquire(lock_set)` while the owner is
     // still holding the lock — the precise window under test.
     let executor = Arc::new(
-        angos_tx_engine::executor::locked::LockedExecutor::builder()
-            .store(gated.clone() as Arc<dyn ObjectStore>)
-            .lock(lock.clone())
-            .ttl_secs(0)
-            .build()
-            .expect("LockedExecutor builder"),
+        angos_tx_engine::executor::locked::LockedExecutor::builder(
+            gated.clone() as Arc<dyn ObjectStore>,
+            lock.clone(),
+        )
+        .ttl_secs(0)
+        .build(),
     );
 
     let tx = Transaction::builder()
@@ -921,8 +921,7 @@ async fn locked_executor_aborts_apply_on_lock_loss_conflict() {
     // ttl_secs = 9 ⇒ heartbeat tick at ~3s. The first tick observes a Mismatch
     // (ownership lost) and cancels the session while we are parked at the gate.
     let lock = Arc::new(
-        Lock::builder()
-            .storage(Arc::new(OwnershipLostLockStorage::new()))
+        Lock::builder(Arc::new(OwnershipLostLockStorage::new()))
             .ttl_secs(9)
             .max_hold_secs(9)
             .build()
@@ -930,11 +929,11 @@ async fn locked_executor_aborts_apply_on_lock_loss_conflict() {
     );
 
     let executor = Arc::new(
-        angos_tx_engine::executor::locked::LockedExecutor::builder()
-            .store(gated.clone() as Arc<dyn ObjectStore>)
-            .lock(lock)
-            .build()
-            .expect("LockedExecutor builder"),
+        angos_tx_engine::executor::locked::LockedExecutor::builder(
+            gated.clone() as Arc<dyn ObjectStore>,
+            lock,
+        )
+        .build(),
     );
 
     let tx = Transaction::builder()
