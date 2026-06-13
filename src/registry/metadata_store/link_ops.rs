@@ -567,7 +567,8 @@ impl MetadataStore {
                         written_links.push(((*link).clone(), metadata));
                     } else {
                         // Non-tracked link.
-                        if old_target.as_ref() != Some(*target) {
+                        let same_target = old_target.as_ref() == Some(*target);
+                        if !same_target {
                             pending_blob_ops
                                 .entry((*target).clone())
                                 .or_default()
@@ -582,12 +583,22 @@ impl MetadataStore {
                             }
                         }
 
-                        let metadata = LinkMetadata::from_digest_at(
-                            (*target).clone(),
-                            extras.created_at.unwrap_or_else(Utc::now),
-                        )
-                        .with_media_type((*media_type).clone())
-                        .with_descriptor(descriptor.as_ref().map(|b| b.as_ref().clone()));
+                        // A same-digest re-push (an idempotent client push or a
+                        // converged replay) keeps the existing `created_at`. The
+                        // binding is unchanged so the push is dispatch-suppressed;
+                        // bumping the timestamp would let an interleaved peer
+                        // write lose locally yet win on peers. A real binding
+                        // change stamps the new write time.
+                        let created_at = if same_target {
+                            link_cache.get(*link).and_then(|m| m.created_at)
+                        } else {
+                            None
+                        }
+                        .or(extras.created_at)
+                        .unwrap_or_else(Utc::now);
+                        let metadata = LinkMetadata::from_digest_at((*target).clone(), created_at)
+                            .with_media_type((*media_type).clone())
+                            .with_descriptor(descriptor.as_ref().map(|b| b.as_ref().clone()));
                         let key = path_builder::link_path(link, namespace);
                         let body = serde_json::to_vec(&metadata)
                             .map(Bytes::from)

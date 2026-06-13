@@ -2919,6 +2919,39 @@ async fn delete_manifest_not_superseded_when_local_tag_has_no_created_at() {
 }
 
 #[tokio::test]
+async fn same_digest_re_push_preserves_created_at() {
+    // An idempotent re-push (e.g. CI re-pushing an unchanged image) must not
+    // advance the tag's LWW timestamp: the binding is unchanged so dispatch is
+    // suppressed, and a bumped created_at would let an interleaved peer write
+    // lose locally yet win on peers.
+    let test_case = FSRegistryTestCase::new();
+    let registry = test_case.registry();
+    let namespace = &Namespace::new("lww-repo").unwrap();
+    let tag = "latest";
+
+    let (content, media_type) = seed_tag(registry, namespace, tag).await;
+    let created_at = local_created_at(registry, namespace, tag).await;
+
+    registry
+        .accept_put_manifest(
+            None,
+            None,
+            namespace,
+            Reference::Tag(tag.to_string()),
+            media_type,
+            Cursor::new(content),
+        )
+        .await
+        .expect("idempotent re-push of the same digest");
+
+    assert_eq!(
+        local_created_at(registry, namespace, tag).await,
+        created_at,
+        "a same-digest re-push must not bump the tag's created_at"
+    );
+}
+
+#[tokio::test]
 async fn replicated_delete_not_superseded_by_a_legacy_link() {
     // A pre-JSON distribution-era link (bare digest string) parses to
     // created_at=None, so it must never win LWW; a synthesised now() would
