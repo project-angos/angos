@@ -109,7 +109,7 @@ Each downstream declares a `mode` that gates which paths apply to it:
 Whether a separate worker is required depends on the durable job queue configuration:
 
 - **No `[global.job_queue]`**: the server self-drains the replication queue in-process. Jobs still persist to the same fs/S3 store the registry uses (under `_jobs/`) and resume after a restart; this is simply one process doing both the serving and the draining, with no cross-replica coordination and no queue-depth gauge. A two-instance active-active demo needs no separate worker.
-- **With `[global.job_queue]`**: the server only enqueues; run `angos worker --queue replication` to drain the queue from a separate process (or pool). The difference from in-process draining is *where* work runs and how it scales (cross-replica coordination, the autoscaler gauge), not whether jobs are durable.
+- **With `[global.job_queue]`**: the server only enqueues; run `angos worker --queue replication` to drain the queue from a separate process (or pool). The difference from in-process draining is *where* work runs and how it scales (cross-replica coordination, the autoscaler gauge), not whether jobs are durable. Because the push and staleness metrics increment in the draining process, they are scrapeable only in in-process mode; see [Replication Metrics](../reference/metrics.md#replication-metrics).
 
 ## See Also
 

@@ -106,7 +106,7 @@ See [Conditional Capabilities](../reference/configuration.md#conditional-capabil
 
 ---
 
-## 1.1.x → Next
+## 1.1.x → 1.2.0
 
 ### Redirect Configuration Split
 
@@ -142,3 +142,100 @@ enable_manifest_redirect = false
 ```
 
 **If you want to keep using `enable_redirect`**, no immediate action is required. The field continues to work as a fallback but will print a warning at startup. Update to the new fields at your convenience.
+
+---
+
+## 1.2.x → Next
+
+### Durable Queue Shared Lock (Breaking Change)
+
+#### What Changed
+
+A configuration that declares `[global.job_queue]` while the metadata store uses the default in-process `memory` lock strategy is now rejected at process boot (during config load and validation). The check fires only when `[global.job_queue]` is present; configurations without it (the in-process queue) are unaffected.
+
+**Who is affected:** Deployments that enabled the durable out-of-process queue with `[global.job_queue]` but left `lock_strategy` at its default. `memory` is the default lock, so a 1.2.0 durable-queue config that omitted `lock_strategy` booted on 1.2.0 (which had no such check) but fails to boot after upgrade. The boot failure reports:
+
+```text
+[global.job_queue] needs a shared lock strategy so workers serialize on the same jobs across processes; the in-process 'memory' lock cannot coordinate across processes. Set the metadata store's lock_strategy to "s3" or "redis", or remove [global.job_queue] to use the in-process queue.
+```
+
+#### Migration
+
+Set a shared `lock_strategy` on the metadata store. The valid strategies depend on the backend.
+
+**S3 metadata store**, use either the S3 CAS lock or Redis:
+
+```toml
+[metadata_store.s3.lock_strategy.s3]
+ttl_secs = 30
+```
+
+```toml
+[metadata_store.s3.lock_strategy.redis]
+url = "redis://localhost:6379"
+ttl = 10
+```
+
+**Filesystem metadata store**, the only valid shared lock is Redis (the `s3` strategy is not supported on filesystem storage):
+
+```toml
+[metadata_store.fs.lock_strategy.redis]
+url = "redis://localhost:6379"
+ttl = 10
+```
+
+**Alternatively, for either backend**, remove `[global.job_queue]` to fall back to the single-process in-process queue, which keeps working with the `memory` lock.
+
+See [Distributed Locking](../reference/configuration.md#distributed-locking) in the configuration reference for full options.
+
+### Worker Dual-Queue Default (Breaking Change)
+
+#### What Changed
+
+`angos worker` invoked with no `--queue` now drains both the `cache` and `replication` queues, each on its own worker pool. In 1.2.0 a bare `angos worker` drained only the `cache` queue.
+
+**Who is affected:** Operators who ran a bare `angos worker` and relied on it to mean cache-only. After upgrade the same invocation also drains replication.
+
+The `--queue` flag is now repeatable. Unknown values are rejected when the worker builds its components:
+
+```text
+unknown queue '<value>'; expected 'cache' or 'replication'
+```
+
+#### Migration
+
+To keep the prior cache-only behavior, change the invocation:
+
+```text
+angos worker --queue cache
+```
+
+To run replication only, use `angos worker --queue replication`. The bare `angos worker` remains valid but now drains both queues. The worker subcommand still requires `[global.job_queue]` to be configured.
+
+### Mount-Blob Default-Deny (Breaking Change)
+
+#### What Changed
+
+A cross-repo blob mount (`POST /v2/{namespace}/blobs/uploads/?mount={digest}`) is now authorized as its own CEL action, `mount-blob`, distinct from `start-upload`. In 1.2.0 the same request was authorized as `start-upload`, so an upload allow-rule covered mounts.
+
+**Who is affected:** Deployments running a `default = "deny"` access policy. Container clients (Docker, containerd) send `?mount=` opportunistically on push, so an identity allowed to `start-upload` but not `mount-blob` has those pushes rejected. Deployments with no access policy, or `default = "allow"` with no mount-deny rule, need no action.
+
+#### Migration
+
+Under `default = "deny"`, grant `mount-blob` to every identity already allowed to upload. Add it to the upload action set:
+
+```toml
+[repository."app".access_policy]
+default = "deny"
+rules = [
+  "identity.id == 'replicator' && request.action in ['put-manifest', 'delete-manifest', 'start-upload', 'update-upload', 'complete-upload', 'mount-blob']",
+]
+```
+
+Or add a standalone rule:
+
+```toml
+"identity.id == 'replicator' && request.action == 'mount-blob'"
+```
+
+See [Set Up Access Control](set-up-access-control.md) for the full `mount-blob` action reference.

@@ -11,7 +11,7 @@ Mirror a repository's content to one or more downstream registries as it changes
 ## Prerequisites
 
 - Two or more reachable Angos instances (or any OCI-compliant downstream registry).
-- A credential on each downstream that is allowed to push (`put-manifest`, blob uploads). See [Set Up Access Control](set-up-access-control.md).
+- A credential on each downstream that is allowed to push and delete (`put-manifest`, `delete-manifest`, blob uploads). Replication mirrors deletes and `prune` enqueues deletes, so a push-only credential without `delete-manifest` has every replicated delete rejected and dead-lettered. See [Set Up Access Control](set-up-access-control.md).
 
 ## Declare a Downstream
 
@@ -175,16 +175,17 @@ time() - angos_replication_last_success_timestamp_seconds
 angos_job_queue_pending{queue="replication"}
 ```
 
-`angos_replication_push_total` and `angos_replication_last_success_timestamp_seconds` increment in the process that drains the replication queue. In the in-process self-drain mode used in the example above, that is the server, so both appear on the server's `/metrics`; alert on the staleness query in this mode. When `[global.job_queue]` is configured, `angos worker` drains the queue, and the worker exposes no HTTP listener, so the push and staleness metrics are not scrapeable in that mode. Monitor the backlog instead: the server publishes `angos_job_queue_pending{queue="replication"}` only when `[global.job_queue]` is configured.
-
-See [Metrics Reference](../reference/metrics.md) for the full list.
+The push and staleness metrics are scrapeable on the server's `/metrics` only when it drains the queue in-process (no `[global.job_queue]`); with a separate `angos worker` they are not scrapeable, so monitor `angos_job_queue_pending{queue="replication"}` instead. See [Replication Metrics](../reference/metrics.md#replication-metrics) for the scrapeability details and the full list.
 
 ## Troubleshooting
 
 **Pushes never reach the downstream:**
 - Confirm the downstream `url` is reachable from the source instance.
-- Verify the credential is authorized to push on the downstream (`put-manifest`, blob uploads).
+- Verify the credential is authorized to push on the downstream (`put-manifest`, `delete-manifest`, blob uploads).
 - If `[global.job_queue]` is configured, ensure an `angos worker` is running (it drains the replication queue by default); the server only enqueues.
+
+**Replicated deletes fail and dead-letter (`403`):**
+- The downstream credential is missing `delete-manifest`. Replication issues deletes as ordinary `DELETE` manifest calls, so a push-only credential has every replicated or pruned delete rejected with `403` and the job dead-letters after its retry budget. Grant `delete-manifest` to the replicator identity (see [Set Up Access Control](set-up-access-control.md)) and retry the dead-lettered jobs via the [`_jobs` API](../reference/api-endpoints.md#list-failed-jobs) (`?queue=replication`).
 
 **A tag does not overwrite on the downstream:**
 - The downstream copy may be newer (last-writer-wins): a `409 REPLICATION_SUPERSEDED` is convergence, not failure.
