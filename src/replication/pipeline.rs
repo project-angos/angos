@@ -34,7 +34,8 @@ const REFERRERS_MERGE_HTTP_TIMEOUT: Duration = Duration::from_mins(1);
 
 /// Outcome of a successful replication push or delete.
 ///
-/// Every arm is convergence; the distinction only drives metrics.
+/// Every arm except [`PushOutcome::Unsupported`] is convergence; the
+/// distinction drives metrics, and all arms complete the job (no retry).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PushOutcome {
     /// The downstream accepted and applied the change (a PUT/DELETE was issued).
@@ -43,6 +44,10 @@ pub enum PushOutcome {
     Converged,
     /// The downstream already holds a strictly-newer copy (last-writer-wins loss).
     Superseded,
+    /// The downstream rejects this delete method (`405`, e.g. tag deletion): the
+    /// delete cannot propagate, but retrying cannot help, so the job completes
+    /// without converging rather than dead-lettering per deletion event.
+    Unsupported,
 }
 
 /// Pushes the manifest at `digest` (and everything it references) to
@@ -533,13 +538,14 @@ fn referrer_descriptor(
 /// `source_ts` so the receiver can apply last-writer-wins.
 ///
 /// Returns [`PushOutcome::Pushed`] for an applied delete,
-/// [`PushOutcome::Converged`] for an already-absent target, or
-/// [`PushOutcome::Superseded`] for an LWW loss; all three are convergence.
+/// [`PushOutcome::Converged`] for an already-absent target,
+/// [`PushOutcome::Superseded`] for an LWW loss, or [`PushOutcome::Unsupported`]
+/// when the downstream rejects the delete method (`405`).
 ///
 /// # Errors
 ///
 /// Returns [`Error::Registry`] when the delete fails with anything other than
-/// an LWW-superseded 409.
+/// a 404, an LWW-superseded 409, or a 405.
 #[instrument(skip(downstream))]
 pub async fn delete_manifest(
     downstream: &RegistryClient,
@@ -572,6 +578,15 @@ pub async fn delete_manifest(
                 "Downstream superseded the delete (last-writer-wins); treating as converged"
             );
             Ok(PushOutcome::Superseded)
+        }
+        DeleteManifestOutcome::Unsupported => {
+            warn!(
+                namespace,
+                %reference,
+                "Downstream does not support deleting this reference (405); the delete will not \
+                 propagate. Completing the job (retrying cannot help)"
+            );
+            Ok(PushOutcome::Unsupported)
         }
     }
 }
@@ -2460,6 +2475,31 @@ mod tests {
             PushOutcome::Converged,
             "an already-absent delete is a converged no-op, not an applied delete"
         );
+        drop(mock_server);
+    }
+
+    #[tokio::test]
+    async fn delete_manifest_of_unsupported_downstream_is_unsupported_not_error() {
+        // A downstream rejecting tag deletion with 405 must complete the job as
+        // Unsupported, not error and dead-letter one job per deletion event.
+        metrics_provider::init_for_tests();
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("DELETE"))
+            .and(path(format!("/v2/{NAMESPACE}/manifests/v1")))
+            .respond_with(ResponseTemplate::new(405))
+            .mount(&mock_server)
+            .await;
+
+        let outcome = delete_manifest(
+            &downstream_client(&mock_server.uri()),
+            NAMESPACE,
+            &Reference::Tag("v1".to_string()),
+            None,
+        )
+        .await
+        .expect("a 405 tag delete must complete, not error");
+        assert_eq!(outcome, PushOutcome::Unsupported);
         drop(mock_server);
     }
 

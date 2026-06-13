@@ -1593,6 +1593,26 @@ async fn test_delete_manifest_absent_404_is_already_absent() {
 }
 
 #[tokio::test]
+async fn test_delete_manifest_405_is_unsupported() {
+    // Stock distribution rejects tag deletion with 405; it must read as
+    // Unsupported (not a retryable error) so a delete never dead-letters one
+    // job per deletion event against such a downstream.
+    let mock_server = MockServer::start().await;
+
+    Mock::given(method("DELETE"))
+        .and(path("/v2/test/manifests/v1"))
+        .respond_with(ResponseTemplate::new(405))
+        .mount(&mock_server)
+        .await;
+
+    let client = client_for(&mock_server);
+    let location = client.get_manifest_path("", "test", &Reference::Tag("v1".to_string()));
+
+    let outcome = client.delete_manifest(&location, None).await.unwrap();
+    assert_eq!(outcome, DeleteManifestOutcome::Unsupported);
+}
+
+#[tokio::test]
 async fn test_head_blob_5xx_is_transient_error_not_unknown() {
     // BlobUnknown means "absent (404)"; a 503 must surface as a transient
     // error so replication retries instead of starting a full upload.

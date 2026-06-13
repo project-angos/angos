@@ -161,7 +161,7 @@ Re-running is a no-op once converged (coalesced by the queue). Schedule it like 
 Replication exposes Prometheus metrics:
 
 ```promql
-# Push rate by downstream and outcome (pushed, converged, superseded, failed)
+# Push rate by downstream and outcome (pushed, converged, superseded, unsupported, failed)
 sum by (downstream, outcome) (rate(angos_replication_push_total[5m]))
 
 # Seconds since the last successful push per downstream (staleness)

@@ -54,6 +54,11 @@ pub enum DeleteManifestOutcome {
     /// Delete rejected by last-writer-wins (`409` with the
     /// replication-superseded OCI code): convergence, not failure.
     Superseded,
+    /// Downstream rejects this delete method (`405`): it does not support
+    /// deleting by this reference (stock `distribution` rejects tag deletes
+    /// this way). Retrying cannot help, so the caller records it distinctly
+    /// instead of dead-lettering one job per deletion event.
+    Unsupported,
 }
 
 /// Returns the first OCI error `code` from a `{"errors":[{"code":"..."}]}`
@@ -433,14 +438,14 @@ impl RegistryClient {
     /// Deletes a manifest by reference, stamping the `X-Angos-Source-Timestamp`
     /// header when `source_ts` is set.
     ///
-    /// A `404` maps to [`DeleteManifestOutcome::AlreadyAbsent`] and a
-    /// superseded `409` to [`DeleteManifestOutcome::Superseded`]; both are
-    /// convergence, not failure.
+    /// A `404` maps to [`DeleteManifestOutcome::AlreadyAbsent`], a superseded
+    /// `409` to [`DeleteManifestOutcome::Superseded`], and a `405` to
+    /// [`DeleteManifestOutcome::Unsupported`]; none are failures.
     ///
     /// # Errors
     ///
     /// Returns an error when the request fails, access is rejected, or the
-    /// response is a non-2xx status other than a 404 or superseded 409.
+    /// response is a non-2xx status other than a 404, superseded 409, or 405.
     #[instrument(skip(self))]
     pub async fn delete_manifest(
         &self,
@@ -458,6 +463,10 @@ impl RegistryClient {
 
         if response.status() == StatusCode::NOT_FOUND {
             return Ok(DeleteManifestOutcome::AlreadyAbsent);
+        }
+
+        if response.status() == StatusCode::METHOD_NOT_ALLOWED {
+            return Ok(DeleteManifestOutcome::Unsupported);
         }
 
         if !response.status().is_success() {

@@ -313,7 +313,7 @@ Total replication pushes to a downstream, by outcome.
 
 **Labels:**
 - `downstream`: the configured downstream `name`
-- `outcome`: `pushed` (manifest/blobs transferred, or a delete applied), `converged` (the downstream already matched, a push whose digest was already present, or a delete whose target was already absent so nothing transferred), `superseded` (downstream already held a newer copy, last-writer-wins, counted as success), or `failed` (the push errored and the job will retry)
+- `outcome`: `pushed` (manifest/blobs transferred, or a delete applied), `converged` (the downstream already matched, a push whose digest was already present, or a delete whose target was already absent so nothing transferred), `superseded` (downstream already held a newer copy, last-writer-wins, counted as success), `unsupported` (the downstream rejected the delete method with `405`, e.g. it does not support tag deletion; the job completes without converging rather than dead-lettering), or `failed` (the push errored and the job will retry)
 
 **Example:**
 ```promql
@@ -326,7 +326,7 @@ sum by (downstream) (rate(angos_replication_push_total{outcome="failed"}[5m]))
 
 ### angos_replication_last_success_timestamp_seconds
 
-Unix timestamp (seconds) of the last `pushed`, `converged`, or `superseded` replication push per downstream (every non-failed outcome sets it). Use it to detect a stalled downstream.
+Unix timestamp (seconds) of the last `pushed`, `converged`, or `superseded` replication push per downstream (the convergent outcomes set it; `unsupported` and `failed` do not). Use it to detect a stalled downstream.
 
 | Type  | Labels       |
 |-------|--------------|

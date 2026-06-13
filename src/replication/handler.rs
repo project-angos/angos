@@ -180,22 +180,27 @@ impl ReplicationJobHandler {
             })
     }
 
-    /// Records the per-outcome success counter and the last-success gauge;
-    /// every [`PushOutcome`] is convergence, so all set the gauge.
+    /// Records the per-outcome counter and, for a converged outcome, the
+    /// last-success gauge. `Unsupported` completed without error but did not
+    /// converge (the downstream cannot delete this reference), so it counts but
+    /// must not advance the staleness gauge.
     fn record_success(downstream: &str, outcome: PushOutcome) {
         let outcome_label = match outcome {
             PushOutcome::Pushed => "pushed",
             PushOutcome::Converged => "converged",
             PushOutcome::Superseded => "superseded",
+            PushOutcome::Unsupported => "unsupported",
         };
         metrics_provider()
             .replication_push_total
             .with_label_values(&[downstream, outcome_label])
             .inc();
-        metrics_provider()
-            .replication_last_success_timestamp
-            .with_label_values(&[downstream])
-            .set(Utc::now().timestamp());
+        if !matches!(outcome, PushOutcome::Unsupported) {
+            metrics_provider()
+                .replication_last_success_timestamp
+                .with_label_values(&[downstream])
+                .set(Utc::now().timestamp());
+        }
     }
 
     /// Records a `failed` push for `downstream` before the handler returns `Err`.
