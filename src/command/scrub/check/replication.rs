@@ -6,7 +6,7 @@
 use std::{collections::HashSet, sync::Arc};
 
 use async_trait::async_trait;
-use futures_util::StreamExt;
+use futures_util::{StreamExt, stream};
 use tracing::{debug, warn};
 
 use crate::{
@@ -72,76 +72,7 @@ impl ReplicationChecker {
         local_tags: &[(String, Option<Digest>)],
         sink: &mut (dyn ActionSink + Send),
     ) {
-        // Push step: a tag whose local read failed (`None`) is skipped here but
-        // still counts as local for the prune step below.
-        let mut skipped: usize = 0;
-        for (tag, local) in local_tags {
-            let Some(local) = local else {
-                continue;
-            };
-
-            // Only a 404 means absence; any other HEAD failure skips the tag this
-            // pass rather than enqueuing a spurious push. Skips are counted so a
-            // persistently failing downstream stays visible.
-            let location = downstream.registry_client.get_manifest_path(
-                NO_LOCAL_PREFIX,
-                namespace,
-                &Reference::Tag(tag.clone()),
-            );
-            let downstream_digest = match downstream
-                .registry_client
-                .head_manifest(&manifest_accept_types(), &location)
-                .await
-            {
-                Ok((_, digest, _)) => Some(digest),
-                Err(RegistryError::ManifestUnknown) => None,
-                Err(e) => {
-                    debug!(
-                        "HEAD for '{namespace}:{tag}' on downstream '{}' failed; skipping this pass: {e}",
-                        downstream.name
-                    );
-                    skipped += 1;
-                    record_reconcile_outcome("skipped");
-                    continue;
-                }
-            };
-
-            if downstream_digest.as_ref() == Some(local) {
-                debug!(
-                    "Tag '{namespace}:{tag}' already converged on downstream '{}'",
-                    downstream.name
-                );
-                continue;
-            }
-
-            if let Err(e) = sink
-                .apply(Action::EnqueueReplicationPush {
-                    downstream: downstream.name.clone(),
-                    namespace: namespace.to_string(),
-                    tag: tag.clone(),
-                    digest: local.clone(),
-                })
-                .await
-            {
-                // A per-tag enqueue failure must not abort the namespace; the
-                // next run re-enqueues whatever was missed.
-                warn!(
-                    "Failed to enqueue replication push for '{namespace}:{tag}' to downstream '{}'; continuing: {e}",
-                    downstream.name
-                );
-            }
-        }
-
-        // One warn per downstream per pass so a dead downstream with thousands
-        // of tags does not flood the log.
-        if skipped > 0 {
-            warn!(
-                "Skipped {skipped} of {} tag(s) of '{namespace}' on downstream '{}': the downstream \
-                 HEAD probes failed (see debug logs); they stay unreconciled until a pass succeeds",
-                local_tags.len(),
-                downstream.name
-            );
-        }
+        reconcile_push_step(downstream, namespace, local_tags, sink).await;
 
         // Prune step (opt-in, one-way-mirror-only): the stamped `source_ts` LWW
         // only saves a future-dated downstream tag and does not make
@@ -187,6 +118,105 @@ impl ReplicationChecker {
                 );
             }
         }
+    }
+}
+
+/// Push step of a reconcile: HEAD every local tag against the downstream
+/// (concurrently, bounded by `max_concurrent_pushes`) and enqueue a push for
+/// each diverging or absent one. The probe phase fans out; the enqueue is
+/// applied serially because the sink is `&mut`. A tag whose local read failed
+/// (`None`) is skipped here but still counts as local for the prune step.
+async fn reconcile_push_step(
+    downstream: &ReplicationDownstream,
+    namespace: &str,
+    local_tags: &[(String, Option<Digest>)],
+    sink: &mut (dyn ActionSink + Send),
+) {
+    enum Probe {
+        Push { tag: String, digest: Digest },
+        Converged,
+        Skipped,
+    }
+
+    let candidates: Vec<(String, Digest)> = local_tags
+        .iter()
+        .filter_map(|(tag, local)| local.as_ref().map(|digest| (tag.clone(), digest.clone())))
+        .collect();
+    let probes = stream::iter(candidates)
+        .map(|(tag, local)| async move {
+            // Only a 404 means absence; any other HEAD failure skips the tag this
+            // pass rather than enqueuing a spurious push.
+            let location = downstream.registry_client.get_manifest_path(
+                NO_LOCAL_PREFIX,
+                namespace,
+                &Reference::Tag(tag.clone()),
+            );
+            match downstream
+                .registry_client
+                .head_manifest(&manifest_accept_types(), &location)
+                .await
+            {
+                Ok((_, digest, _)) if digest == local => {
+                    debug!(
+                        "Tag '{namespace}:{tag}' already converged on downstream '{}'",
+                        downstream.name
+                    );
+                    Probe::Converged
+                }
+                Ok(_) | Err(RegistryError::ManifestUnknown) => Probe::Push { tag, digest: local },
+                Err(e) => {
+                    debug!(
+                        "HEAD for '{namespace}:{tag}' on downstream '{}' failed; skipping this pass: {e}",
+                        downstream.name
+                    );
+                    Probe::Skipped
+                }
+            }
+        })
+        .buffer_unordered(downstream.max_concurrent_pushes.max(1))
+        .collect::<Vec<_>>()
+        .await;
+
+    // Apply phase (serial): the sink is `&mut`. Skips are counted so a
+    // persistently failing downstream stays visible.
+    let mut skipped: usize = 0;
+    for probe in probes {
+        match probe {
+            Probe::Converged => {}
+            Probe::Skipped => {
+                skipped += 1;
+                record_reconcile_outcome("skipped");
+            }
+            Probe::Push { tag, digest } => {
+                if let Err(e) = sink
+                    .apply(Action::EnqueueReplicationPush {
+                        downstream: downstream.name.clone(),
+                        namespace: namespace.to_string(),
+                        tag: tag.clone(),
+                        digest,
+                    })
+                    .await
+                {
+                    // A per-tag enqueue failure must not abort the namespace; the
+                    // next run re-enqueues whatever was missed.
+                    warn!(
+                        "Failed to enqueue replication push for '{namespace}:{tag}' to downstream '{}'; continuing: {e}",
+                        downstream.name
+                    );
+                }
+            }
+        }
+    }
+
+    // One warn per downstream per pass so a dead downstream with thousands of
+    // tags does not flood the log.
+    if skipped > 0 {
+        warn!(
+            "Skipped {skipped} of {} tag(s) of '{namespace}' on downstream '{}': the downstream \
+             HEAD probes failed (see debug logs); they stay unreconciled until a pass succeeds",
+            local_tags.len(),
+            downstream.name
+        );
     }
 }
 
@@ -701,6 +731,65 @@ mod tests {
         checker.check(NAMESPACE, &mut sink).await.unwrap();
 
         assert_eq!(sink.len(), 1, "diverging tag must enqueue a push");
+    }
+
+    #[tokio::test]
+    async fn enqueues_pushes_for_every_diverging_tag() {
+        // The probe phase fans out across tags; every diverging tag must still
+        // enqueue a push (no tag dropped by the concurrency).
+        metrics_provider::init_for_tests();
+        let (metadata_store, store, _dir) = fs_metadata_store();
+        let mock_server = MockServer::start().await;
+
+        let manifest = put_blob_direct(&store, b"new-bytes").await;
+        metadata_store
+            .update_links(
+                NAMESPACE,
+                &[
+                    LinkOperation::create(LinkKind::Tag("v1".to_string()), manifest.clone()),
+                    LinkOperation::create(LinkKind::Tag("v2".to_string()), manifest.clone()),
+                    LinkOperation::create(LinkKind::Tag("v3".to_string()), manifest.clone()),
+                ],
+            )
+            .await
+            .unwrap();
+
+        // All three tags are absent on the downstream (404 HEAD) -> all enqueue.
+        for tag in ["v1", "v2", "v3"] {
+            Mock::given(method("HEAD"))
+                .and(path(format!("/v2/{NAMESPACE}/manifests/{tag}")))
+                .respond_with(ResponseTemplate::new(404))
+                .mount(&mock_server)
+                .await;
+        }
+
+        let resolver = resolver_for(repository(
+            downstream_client(&mock_server.uri()),
+            ReplicationMode::EventReconcile,
+            false,
+        ));
+        let checker = ReplicationChecker::builder()
+            .metadata_store(metadata_store.clone())
+            .resolver(resolver)
+            .build()
+            .unwrap();
+
+        let mut sink: Vec<Action> = Vec::new();
+        checker.check(NAMESPACE, &mut sink).await.unwrap();
+
+        let mut tags: Vec<&str> = sink
+            .iter()
+            .filter_map(|action| match action {
+                Action::EnqueueReplicationPush { tag, .. } => Some(tag.as_str()),
+                _ => None,
+            })
+            .collect();
+        tags.sort_unstable();
+        assert_eq!(
+            tags,
+            vec!["v1", "v2", "v3"],
+            "every diverging tag must enqueue a push"
+        );
     }
 
     #[tokio::test]

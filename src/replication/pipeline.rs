@@ -109,28 +109,16 @@ pub async fn push_manifest(
         return Ok(PushOutcome::Converged);
     }
 
-    // Push child manifests first: the parent index must not land before its
-    // children.
-    for child in &parsed.manifests {
-        let child_body = blob_store.read(child).await.map_err(|e| {
-            Error::Registry(RegistryError::Internal(format!(
-                "failed to read local manifest blob '{child}': {e}"
-            )))
-        })?;
-        Box::pin(push_manifest(
-            downstream,
-            blob_store,
-            metadata_store,
-            namespace,
-            child,
-            None,
-            None,
-            child_body,
-            max_concurrent_pushes,
-            source_ts,
-        ))
-        .await?;
-    }
+    push_child_manifests(
+        downstream,
+        blob_store,
+        metadata_store,
+        namespace,
+        &parsed,
+        max_concurrent_pushes,
+        source_ts,
+    )
+    .await?;
 
     push_blobs(
         downstream,
@@ -203,6 +191,48 @@ pub async fn push_manifest(
     }
 
     Ok(PushOutcome::Pushed)
+}
+
+/// Push every child manifest of an index, overlapping independent children up
+/// to `max_concurrent_pushes` so a wide multi-arch index is not serialized one
+/// child at a time. The caller awaits this before it pushes the parent, so the
+/// parent index never lands before its children.
+async fn push_child_manifests(
+    downstream: &RegistryClient,
+    blob_store: &Arc<BlobStore>,
+    metadata_store: &Arc<MetadataStore>,
+    namespace: &str,
+    parsed: &ParsedManifestDigests,
+    max_concurrent_pushes: usize,
+    source_ts: Option<&str>,
+) -> Result<(), Error> {
+    stream::iter(parsed.manifests.clone())
+        .map(|child| async move {
+            let child_body = blob_store.read(&child).await.map_err(|e| {
+                Error::Registry(RegistryError::Internal(format!(
+                    "failed to read local manifest blob '{child}': {e}"
+                )))
+            })?;
+            Box::pin(push_manifest(
+                downstream,
+                blob_store,
+                metadata_store,
+                namespace,
+                &child,
+                None,
+                None,
+                child_body,
+                max_concurrent_pushes,
+                source_ts,
+            ))
+            .await
+            .map(|_| ())
+        })
+        // Config rejects 0; the floor guards direct builder misuse.
+        .buffer_unordered(max_concurrent_pushes.max(1))
+        .try_collect::<Vec<()>>()
+        .await
+        .map(|_| ())
 }
 
 /// HEAD-before-PUT every referenced blob; transfer only the absent ones.
@@ -1311,6 +1341,93 @@ mod tests {
             child_at.load(Ordering::SeqCst) < index_at.load(Ordering::SeqCst),
             "child manifest must land before the parent index"
         );
+        drop(mock_server);
+    }
+
+    #[tokio::test]
+    async fn index_lands_after_all_children_when_fanned_out() {
+        // Children push concurrently; the parent index must still land only
+        // after every child, and no child may be dropped by the fan-out.
+        metrics_provider::init_for_tests();
+        let mock_server = MockServer::start().await;
+        let dir = TempDir::new().unwrap();
+        let (blob_store, metadata_store, store) = test_blob_store(dir.path().to_str().unwrap());
+
+        let mut child_digests = Vec::new();
+        let mut manifests = Vec::new();
+        for i in 0..3 {
+            let child = json!({
+                "schemaVersion": 2,
+                "mediaType": "application/vnd.oci.image.manifest.v1+json",
+                "layers": [],
+                "annotations": { "idx": i.to_string() },
+            });
+            let child_bytes = serde_json::to_vec(&child).unwrap();
+            let child_digest = put_blob_direct(&store, &child_bytes).await;
+            Mock::given(method("PUT"))
+                .and(path(format!("/v2/{NAMESPACE}/manifests/{child_digest}")))
+                .respond_with(ResponseTemplate::new(201))
+                .expect(1)
+                .mount(&mock_server)
+                .await;
+            manifests.push(json!({
+                "mediaType": "application/vnd.oci.image.manifest.v1+json",
+                "digest": child_digest.to_string(),
+                "size": child_bytes.len(),
+            }));
+            child_digests.push(child_digest);
+        }
+
+        let index = json!({
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.oci.image.index.v1+json",
+            "manifests": manifests,
+        });
+        let index_bytes = serde_json::to_vec(&index).unwrap();
+        let index_digest = put_blob_direct(&store, &index_bytes).await;
+        Mock::given(method("PUT"))
+            .and(path(format!("/v2/{NAMESPACE}/manifests/v1")))
+            .respond_with(ResponseTemplate::new(201))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        push_manifest(
+            &downstream_client(&mock_server.uri()),
+            &blob_store,
+            &metadata_store,
+            NAMESPACE,
+            &index_digest,
+            Some("application/vnd.oci.image.index.v1+json".to_string()),
+            Some("v1"),
+            index_bytes,
+            4,
+            None,
+        )
+        .await
+        .unwrap();
+
+        // The manifest PUTs, in arrival order: the index must come last.
+        let puts: Vec<String> = mock_server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|r| r.method.as_str() == "PUT")
+            .map(|r| r.url.path().to_string())
+            .collect();
+        let index_pos = puts.iter().position(|p| p.ends_with("/manifests/v1"));
+        assert_eq!(
+            index_pos,
+            Some(puts.len() - 1),
+            "the index must PUT after every child"
+        );
+        for child in &child_digests {
+            assert!(
+                puts.iter().any(|p| p.ends_with(&child.to_string())),
+                "every child manifest must be pushed"
+            );
+        }
         drop(mock_server);
     }
 
