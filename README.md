@@ -112,9 +112,9 @@ url = "redis://localhost:6379"
 
 ### New features (non-breaking)
 
-**S3-native locking** — multi-replica S3 deployments no longer require Redis. Use `[metadata_store.s3.lock_strategy.s3]` to enable locking backed by S3 conditional writes instead.
+**S3-native locking**: multi-replica S3 deployments no longer require Redis. Use `[metadata_store.s3.lock_strategy.s3]` to enable locking backed by S3 conditional writes instead.
 
-**Capabilities declaration** — add a `[metadata_store.s3.capabilities]` table to declare which conditional S3 operations your bucket supports (`put_if_none_match`, `put_if_match`, `delete_if_match`). When present, Angos skips the startup probe that would otherwise detect these capabilities automatically.
+**Capabilities declaration**: add a `[metadata_store.s3.capabilities]` table to declare which conditional S3 operations your bucket supports (`put_if_none_match`, `put_if_match`, `delete_if_match`). When present, Angos skips the startup probe that would otherwise detect these capabilities automatically.
 
 ## Usage
 

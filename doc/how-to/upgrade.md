@@ -143,6 +143,16 @@ enable_manifest_redirect = false
 
 **If you want to keep using `enable_redirect`**, no immediate action is required. The field continues to work as a fallback but will print a warning at startup. Update to the new fields at your convenience.
 
+### Extension API Path Change (Breaking Change)
+
+#### What Changed
+
+The angos extension API moved from the `/v2/_ext/...` prefix to the top-level `/_ext/...` prefix, so `/v2` is reserved for the OCI Distribution API.
+
+#### Migration
+
+Update any clients of the old `/v2/_ext/...` endpoints to the new `/_ext/...` paths. See the [Extension API](../reference/api-endpoints.md#extension-api-not-part-of-the-oci-specification) reference for the full endpoint list.
+
 ---
 
 ## 1.2.x → Next

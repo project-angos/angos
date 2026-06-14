@@ -25,8 +25,9 @@ pub const DEFAULT_ORPHAN_AGE_SECS: u64 = 3600; // 1 hour
 /// Orphan-body janitor.
 ///
 /// On each tick, lists `.tx-bodies/` children and for each `tx-id` prefix
-/// that has no corresponding `.tx-log/<tx-id>.json` and whose UUID timestamp
-/// indicates it is older than the configured age, deletes the entire prefix.
+/// that has no corresponding `.tx-log/<tx-id>.json`, heads the first staged
+/// body object inside the prefix and deletes the entire prefix when that
+/// object's `last_modified` is older than the configured age.
 ///
 /// Constructed via [`BodyJanitor::builder`].
 pub struct BodyJanitor {

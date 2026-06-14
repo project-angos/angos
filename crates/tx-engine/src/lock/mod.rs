@@ -251,9 +251,8 @@ impl Default for S3LockConfig {
 ///
 /// Determines which [`LockStorage`] implementation is constructed at startup.
 /// Deserialized from operator configuration; selection is per-deployment.
-/// `lock_strategy = "memory" | "redis" | "s3"` behaviour is unchanged from
-/// prior phases; the config now selects the lock-object storage backend
-/// rather than a separate `LockBackend` implementation.
+/// `lock_strategy = "memory" | "redis" | "s3"` selects the lock-object storage
+/// backend.
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(rename_all = "lowercase")]
 pub enum LockStrategy {

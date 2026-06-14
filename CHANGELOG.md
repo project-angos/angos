@@ -37,7 +37,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Changed
 
-- Blob upload sessions now use a single resumable streaming upload in place of the previous multipart-based protocol, and in-flight sessions do not survive the upgrade (clients retry and `scrub --uploads` reaps the stale staging artifacts).
+- Blob upload sessions use a single resumable streaming upload; in-flight sessions do not survive the upgrade, so clients retry and `scrub --uploads` reaps the stale staging artifacts.
 - The angos extension API moved from the `/v2/_ext/...` prefix to the top-level `/_ext/...` prefix (breaking): update clients of the v1.1.1 `/v2/_ext/...` endpoints to the new paths.
 - The registry subsystems now write atomically through a per-subsystem transactional engine, adding new top-level prefixes (`.tx-log/`, `.tx-bodies/`, `.tx-locks/`, and `_jobs/` when the durable job queue is enabled) that operators should factor into bucket policies.
 - Blob deletion follows the OCI distribution lifecycle, with blob ownership tracked independently from manifest references.
@@ -90,13 +90,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 - Transactional-engine recovery is now race-free against the original owner and idempotent on replay, so a crashed write picked up by another replica cannot collide with the original or re-apply mutations that already landed.
 - Scrub now flushes the metadata store's access-time buffer at exit so retention timestamps are persisted across runs on the S3 backend.
-- Scrub `--links` prunes stale `referenced_by` entries whose revision no longer exists, removing the link and its blob-index entry when the set empties.
-- Scrub `--links`, `--media-types`, and `--tags` remove revision links and tags whose manifest blob is permanently missing, cascading a `DeleteOrphanManifest` to drop the digest link and every tag pointing at it.
-- Scrub `-r` no longer aborts the whole namespace when one orphan manifest's blob is missing or unreadable.
-- Scrub `-b` purges all blob-index entries (including ownership markers) for any blob whose backing bytes are absent.
-- Scrub `-m` validates that each revision's digest link points back at its own digest and rewrites it on mismatch.
+- Scrub reliably removes orphaned and stale links, tags, media-types, and blob-index entries, cascading deletions and tolerating missing or unreadable manifest blobs without aborting the namespace.
+- Scrub orphan manifest deletion no longer removes blobs still referenced by other manifests.
 - Scrub orphan-blob deletion acquires the blob-data lock and re-checks ownership before deleting, so a concurrent upload cannot lose its bytes.
-- Scrub orphan manifest deletion uses `delete_with_referrer` for tracked links, avoiding spurious removal of blobs still referenced by other manifests.
 - Scrub on S3 converges namespaces whose only artifact is an upload session, so `scrub --uploads` cleans up their stale bytes and aborts the recorded in-flight multipart upload.
 - Hardened S3 uploads and blob-index locking against contention and partial-failure scenarios.
 - Failed upload cleanups no longer abort the client request; orphaned S3 probe objects are surfaced via warning instead of silently leaking.

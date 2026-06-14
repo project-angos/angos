@@ -27,7 +27,9 @@ use crate::{
     registry::{
         metadata_store::{
             BlobIndex, BlobIndexOperation, Error, LinkMetadata, LinkOperation, MetadataStore,
-            blob_data_lock_key, link_kind::LinkKind, sharded::apply_blob_index_operations,
+            blob_data_lock_key,
+            link_kind::LinkKind,
+            sharded::{apply_blob_index_operations, decode_blob_index_shard_namespace},
         },
         path_builder,
     },
@@ -866,8 +868,7 @@ async fn any_other_namespace_references_blob(
             .await
             .map_err(Error::from)?;
         for key in &page.items {
-            let encoded_ns = key.strip_suffix(".json").unwrap_or("");
-            let ns = encoded_ns.replace("%2F", "/").replace("%25", "%");
+            let ns = decode_blob_index_shard_namespace(key);
             if ns != our_namespace {
                 return Ok(true);
             }

@@ -37,6 +37,7 @@ Step-by-step instructions for specific tasks:
 
 ### Operations
 - [Run Storage Maintenance](how-to/run-storage-maintenance.md)
+- [Enable Durable Cache Jobs](how-to/durable-cache-jobs.md)
 - [Enable the Web UI](how-to/enable-web-ui.md)
 - [Upgrade](how-to/upgrade.md)
 - [Troubleshoot Common Issues](how-to/troubleshoot-common-issues.md)
