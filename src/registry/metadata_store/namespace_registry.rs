@@ -16,6 +16,19 @@ impl MetadataStore {
         root_path: &str,
         root_prefix: &str,
     ) -> Result<Vec<String>, Error> {
+        self.collect_namespaces_with_marker(root_path, root_prefix, "_manifests")
+            .await
+    }
+
+    /// Like [`Self::collect_namespaces`] but keys a namespace off the given
+    /// `marker` child; orphan-namespace scrub passes `_uploads` to reach
+    /// upload-only namespaces that the `_manifests`-keyed catalog omits.
+    pub async fn collect_namespaces_with_marker(
+        &self,
+        root_path: &str,
+        root_prefix: &str,
+        marker: &str,
+    ) -> Result<Vec<String>, Error> {
         let mut stack: Vec<(String, String)> =
             vec![(root_path.to_string(), root_prefix.to_string())];
         let mut namespaces = Vec::new();
@@ -28,7 +41,7 @@ impl MetadataStore {
                 let page = self.store().list_children(&path, 1000, token, None).await?;
 
                 for entry in &page.sub_prefixes {
-                    if entry == "_manifests" {
+                    if entry == marker {
                         is_namespace = true;
                         continue;
                     }

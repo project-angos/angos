@@ -242,6 +242,24 @@ impl MetadataStore {
         Ok(pagination::paginate_sorted(&namespaces, n, last.as_deref()))
     }
 
+    /// Lists namespaces holding an `_uploads` directory; unlike
+    /// [`Self::list_namespaces`] these include namespaces with no manifest
+    /// content, which orphan-namespace scrub needs to sweep stranded uploads.
+    #[instrument(skip(self))]
+    pub async fn list_upload_namespaces(
+        &self,
+        n: u16,
+        last: Option<String>,
+    ) -> Result<(Vec<String>, Option<String>), Error> {
+        debug!("Fetching {n} upload namespace(s) with continuation token: {last:?}");
+
+        let namespaces = self
+            .collect_namespaces_with_marker(path_builder::repository_dir(), "", "_uploads")
+            .await?;
+
+        Ok(pagination::paginate_sorted(&namespaces, n, last.as_deref()))
+    }
+
     #[instrument(skip(self))]
     pub async fn list_tags(
         &self,
