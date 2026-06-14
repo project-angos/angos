@@ -7,6 +7,7 @@ use std::{
     time::Duration,
 };
 
+use angos_backoff::Backoff;
 use bytes::Bytes;
 use hmac::{Hmac, KeyInit, Mac};
 use prometheus::{HistogramVec, IntCounterVec, register_histogram_vec, register_int_counter_vec};
@@ -52,6 +53,7 @@ pub struct EventDispatcher {
     endpoints: HashMap<String, WebhookEndpoint>,
     shutdown: Arc<AtomicBool>,
     in_flight: Arc<Mutex<JoinSet<()>>>,
+    delivery_backoff: Backoff,
 }
 
 struct WebhookEndpoint {
@@ -102,6 +104,7 @@ struct DeliveryJob {
     event_kind_header: String,
     max_retries: u32,
     name: String,
+    delivery_backoff: Backoff,
 }
 
 impl DeliveryJob {
@@ -116,25 +119,6 @@ impl DeliveryJob {
     }
 }
 
-async fn deliver_async(job: DeliveryJob) {
-    if let Err(e) = send_and_record(&job.as_request(), job.max_retries, &job.name).await {
-        warn!("Async webhook '{}' failed: {e}", job.name);
-    }
-}
-
-async fn send_and_record(
-    req: &DeliveryRequest<'_>,
-    max_retries: u32,
-    webhook_name: &str,
-) -> Result<(), String> {
-    let result = send_with_retries(req, max_retries).await;
-    let result_label = if result.is_ok() { "success" } else { "error" };
-    DELIVERY_TOTAL
-        .with_label_values(&[webhook_name, req.event_kind_header, result_label])
-        .inc();
-    result
-}
-
 fn serialize_event(event: &Event) -> Result<(Bytes, &'static str), Error> {
     let body = serde_json::to_vec(event)
         .map_err(|e| Error::Dispatch(format!("Failed to serialize event: {e}")))?;
@@ -146,80 +130,6 @@ fn compute_signature(secret: &str, body: &[u8]) -> String {
         Hmac::<Sha256>::new_from_slice(secret.as_bytes()).expect("HMAC accepts keys of any length");
     mac.update(body);
     hex::encode(mac.finalize().into_bytes())
-}
-
-async fn send_request(req: &DeliveryRequest<'_>) -> Result<(), String> {
-    let mut request = req
-        .client
-        .post(req.url)
-        .header("content-type", "application/json")
-        .header("X-Registry-Event", req.event_kind_header);
-
-    if let Some(token) = req.token {
-        let signature = compute_signature(token, &req.body);
-        request = request
-            .header("Authorization", format!("Bearer {token}"))
-            .header("X-Registry-Signature-256", format!("sha256={signature}"));
-    }
-
-    let response = request
-        .body(req.body.clone())
-        .send()
-        .await
-        .map_err(|e| e.to_string())?;
-
-    if !response.status().is_success() {
-        return Err(format!("returned status {}", response.status()));
-    }
-
-    Ok(())
-}
-
-async fn send_with_retries(req: &DeliveryRequest<'_>, max_retries: u32) -> Result<(), String> {
-    let mut first_err: Option<String> = None;
-    let mut last_err: Option<String> = None;
-
-    for attempt in 0..=max_retries {
-        if attempt > 0 {
-            tokio::time::sleep(backoff_for_attempt(attempt)).await;
-        }
-
-        match send_request(req).await {
-            Ok(()) => return Ok(()),
-            Err(e) => {
-                if first_err.is_none() {
-                    first_err = Some(e.clone());
-                }
-                last_err = Some(e);
-            }
-        }
-    }
-
-    let errors = (
-        first_err
-            .as_deref()
-            .expect("retry loop records first error before failing"),
-        last_err
-            .as_deref()
-            .expect("retry loop records last error before failing"),
-    );
-
-    Err(format_retry_failure(max_retries + 1, errors))
-}
-
-fn format_retry_failure(attempts: u32, errors: (&str, &str)) -> String {
-    match errors {
-        (f, l) if f == l => {
-            format!("after {attempts} attempt(s): {f}")
-        }
-        (f, l) => {
-            format!("after {attempts} attempt(s); first error: {f}; last error: {l}")
-        }
-    }
-}
-
-fn backoff_for_attempt(attempt: u32) -> Duration {
-    Duration::from_millis(100u64.saturating_mul(2u64.saturating_pow(attempt - 1)))
 }
 
 impl EventDispatcher {
@@ -244,6 +154,105 @@ impl EventDispatcher {
         while in_flight.join_next().await.is_some() {}
     }
 
+    async fn deliver_async(job: DeliveryJob) {
+        if let Err(e) = Self::send_and_record(
+            &job.as_request(),
+            job.max_retries,
+            &job.name,
+            job.delivery_backoff,
+        )
+        .await
+        {
+            warn!("Async webhook '{}' failed: {e}", job.name);
+        }
+    }
+
+    async fn send_and_record(
+        req: &DeliveryRequest<'_>,
+        max_retries: u32,
+        webhook_name: &str,
+        backoff: Backoff,
+    ) -> Result<(), String> {
+        let result = Self::send_with_retries(req, max_retries, backoff).await;
+        let result_label = if result.is_ok() { "success" } else { "error" };
+        DELIVERY_TOTAL
+            .with_label_values(&[webhook_name, req.event_kind_header, result_label])
+            .inc();
+        result
+    }
+
+    async fn send_request(req: &DeliveryRequest<'_>) -> Result<(), String> {
+        let mut request = req
+            .client
+            .post(req.url)
+            .header("content-type", "application/json")
+            .header("X-Registry-Event", req.event_kind_header);
+
+        if let Some(token) = req.token {
+            let signature = compute_signature(token, &req.body);
+            request = request
+                .header("Authorization", format!("Bearer {token}"))
+                .header("X-Registry-Signature-256", format!("sha256={signature}"));
+        }
+
+        let response = request
+            .body(req.body.clone())
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+
+        if !response.status().is_success() {
+            return Err(format!("returned status {}", response.status()));
+        }
+
+        Ok(())
+    }
+
+    async fn send_with_retries(
+        req: &DeliveryRequest<'_>,
+        max_retries: u32,
+        backoff: Backoff,
+    ) -> Result<(), String> {
+        let mut first_err: Option<String> = None;
+        let mut last_err: Option<String> = None;
+
+        for attempt in 0..=max_retries {
+            if attempt > 0 {
+                tokio::time::sleep(backoff.delay(attempt - 1)).await;
+            }
+
+            match Self::send_request(req).await {
+                Ok(()) => return Ok(()),
+                Err(e) => {
+                    if first_err.is_none() {
+                        first_err = Some(e.clone());
+                    }
+                    last_err = Some(e);
+                }
+            }
+        }
+
+        let errors = (
+            first_err
+                .as_deref()
+                .expect("retry loop records first error before failing"),
+            last_err
+                .as_deref()
+                .expect("retry loop records last error before failing"),
+        );
+
+        Err(Self::format_retry_failure(max_retries + 1, errors))
+    }
+
+    fn format_retry_failure(attempts: u32, errors: (&str, &str)) -> String {
+        match errors {
+            (f, l) if f == l => format!("after {attempts} attempt(s): {f}"),
+            (f, l) => {
+                format!("after {attempts} attempt(s); first error: {f}; last error: {l}")
+            }
+        }
+    }
+
     async fn send_async(
         &self,
         name: &str,
@@ -256,7 +265,7 @@ impl EventDispatcher {
             return false;
         }
         let mut in_flight_guard = self.in_flight.lock().await;
-        in_flight_guard.spawn(deliver_async(DeliveryJob {
+        in_flight_guard.spawn(Self::deliver_async(DeliveryJob {
             client: endpoint.client.clone(),
             url: endpoint.url.to_string(),
             token: endpoint.token.as_ref().map(|t| t.expose().clone()),
@@ -264,6 +273,7 @@ impl EventDispatcher {
             event_kind_header: event_kind_header.to_string(),
             max_retries: endpoint.max_retries,
             name: name.to_string(),
+            delivery_backoff: self.delivery_backoff,
         }));
         true
     }
@@ -276,7 +286,7 @@ impl EventDispatcher {
         event_kind_header: &str,
     ) -> Result<(), Error> {
         let req = endpoint.build_request(body, event_kind_header);
-        send_and_record(&req, endpoint.max_retries, name)
+        Self::send_and_record(&req, endpoint.max_retries, name, self.delivery_backoff)
             .await
             .map_err(|e| Error::Dispatch(format!("Webhook '{name}' failed: {e}")))
     }
@@ -289,7 +299,9 @@ impl EventDispatcher {
         event_kind_header: &str,
     ) {
         let req = endpoint.build_request(body, event_kind_header);
-        if let Err(e) = send_and_record(&req, endpoint.max_retries, name).await {
+        if let Err(e) =
+            Self::send_and_record(&req, endpoint.max_retries, name, self.delivery_backoff).await
+        {
             warn!("Optional webhook '{name}' failed: {e}");
         }
     }
@@ -390,6 +402,10 @@ impl EventDispatcherBuilder {
             endpoints,
             shutdown: Arc::new(AtomicBool::new(false)),
             in_flight: Arc::new(Mutex::new(JoinSet::new())),
+            delivery_backoff: Backoff::exponential(
+                Duration::from_millis(100),
+                Duration::from_secs(10),
+            ),
         })
     }
 }

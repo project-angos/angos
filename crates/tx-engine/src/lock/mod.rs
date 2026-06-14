@@ -34,13 +34,7 @@
 //! | `redis`  | [`RedisLockStorage`] | Feature `redis`; suitable for FS stores under heavy load |
 //! | `s3`     | [`S3LockStorage`] | CAS-capable S3; uses `.tx-locks/<shard>/<key>` objects |
 
-use std::{
-    collections::hash_map::RandomState,
-    fmt::Debug,
-    future::Future,
-    hash::{BuildHasher, Hasher},
-    pin::Pin,
-};
+use std::{fmt::Debug, future::Future, pin::Pin};
 
 use serde::Deserialize;
 use tokio::{runtime::Handle, task::JoinHandle};
@@ -306,28 +300,4 @@ pub fn resolve_lock_strategy<E: serde::de::Error>(
         )),
         (None, None) => Ok(LockStrategy::Memory),
     }
-}
-
-/// Returns a pseudo-random number in `[0, max_ms)` for use as retry-loop
-/// jitter.
-///
-/// This intentionally avoids any RNG dependency: it seeds a fresh
-/// [`RandomState`] and reads its hasher's initial state as an entropy source.
-///
-/// # Entropy caveat
-///
-/// The standard library does **not** guarantee that `RandomState` is seeded
-/// from a high-quality entropy source, nor that successive `RandomState`
-/// instances yield independent or uniformly-distributed seeds: the seeding
-/// strategy is an unspecified implementation detail that may change between
-/// releases and platforms. This is therefore **not** a cryptographic RNG and
-/// must not be relied upon for anything beyond best-effort retry-loop jitter,
-/// whose only purpose is to spread out contended retries. Correctness never
-/// depends on the value's quality.
-#[must_use]
-pub fn simple_jitter(max_ms: u64) -> u64 {
-    if max_ms == 0 {
-        return 0;
-    }
-    RandomState::new().build_hasher().finish() % max_ms
 }

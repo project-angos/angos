@@ -30,22 +30,6 @@ use crate::{
     replication::{REPLICATION_QUEUE, ReplicationJobHandler},
 };
 
-/// Cap on the exponential backoff applied after consecutive `claim_one`
-/// errors. A worker pointed at a broken storage backend will idle here
-/// rather than hammer it at 1Hz; recovery is bounded by this ceiling.
-const CLAIM_ERROR_BACKOFF_CAP: Duration = Duration::from_mins(1);
-
-/// Backoff after `n` consecutive `claim_one` errors: `poll_interval` doubled
-/// `n` times, capped at [`CLAIM_ERROR_BACKOFF_CAP`]. Shift is bounded so even
-/// pathological `poll_interval × multiplier` calculations can't overflow
-/// before the cap clamps them down.
-fn claim_error_backoff(poll_interval: Duration, n: u32) -> Duration {
-    let multiplier = 1u32 << n.min(6);
-    poll_interval
-        .saturating_mul(multiplier)
-        .min(CLAIM_ERROR_BACKOFF_CAP)
-}
-
 /// Process durable background jobs.
 #[derive(FromArgs, PartialEq, Debug)]
 #[argh(
@@ -168,16 +152,14 @@ impl Command {
     }
 }
 
-/// Single claim-loop task. Owns its own exponential-backoff counter so a
-/// transient backend outage doesn't make every worker hammer the storage
-/// in lockstep.
+/// Single claim-loop task. Claim-error backoff is handled inside the job queue
+/// (`JobStore::claim_one`), so a broken backend is not hammered.
 async fn worker_loop(
     inner: Arc<ArcSwap<Components>>,
     queue: String,
     poll_interval: Duration,
     shutdown: CancellationToken,
 ) {
-    let mut consecutive_claim_errors: u32 = 0;
     loop {
         let snapshot = inner.load_full();
         select! {
@@ -186,31 +168,19 @@ async fn worker_loop(
                 return;
             }
             result = snapshot.consumer.claim_one(&queue) => match result {
-                Err(e) => {
-                    let backoff = claim_error_backoff(poll_interval, consecutive_claim_errors);
-                    consecutive_claim_errors = consecutive_claim_errors.saturating_add(1);
-                    error!(
-                        error = %e,
-                        consecutive_failures = consecutive_claim_errors,
-                        backoff_secs = backoff.as_secs(),
-                        "claim_one failed; backing off",
-                    );
-                    sleep(backoff).await;
-                }
-                Ok(outcome) => {
-                    consecutive_claim_errors = 0;
-                    match outcome.claimed {
-                        None => sleep(outcome.idle_sleep(poll_interval)).await,
-                        Some(claimed) => {
-                            execute_one(
-                                snapshot.consumer.as_ref(),
-                                snapshot.handler.as_ref(),
-                                claimed,
-                            )
-                            .await;
-                        }
+                // `claim_one` self-throttles on a backend error; just log it.
+                Err(e) => error!(error = %e, "claim_one failed; backing off"),
+                Ok(outcome) => match outcome.claimed {
+                    None => sleep(outcome.idle_sleep(poll_interval)).await,
+                    Some(claimed) => {
+                        execute_one(
+                            snapshot.consumer.as_ref(),
+                            snapshot.handler.as_ref(),
+                            claimed,
+                        )
+                        .await;
                     }
-                }
+                },
             }
         }
     }
@@ -328,13 +298,13 @@ impl WorkerContext {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashMap, sync::Arc, time::Duration};
+    use std::{collections::HashMap, sync::Arc};
 
     use tempfile::TempDir;
 
     use angos_storage::{ObjectStore, fs::Backend as StorageFsBackend};
 
-    use super::{CLAIM_ERROR_BACKOFF_CAP, WorkerContext, claim_error_backoff, resolve_queues};
+    use super::{WorkerContext, resolve_queues};
     use crate::{
         metrics_provider,
         registry::{
@@ -367,41 +337,6 @@ mod tests {
             vec!["replication".to_string(), "cache".to_string()],
             "explicit --queue order must be preserved, duplicates dropped"
         );
-    }
-
-    #[test]
-    fn backoff_doubles_with_consecutive_failures() {
-        let poll = Duration::from_secs(1);
-        assert_eq!(claim_error_backoff(poll, 0), Duration::from_secs(1));
-        assert_eq!(claim_error_backoff(poll, 1), Duration::from_secs(2));
-        assert_eq!(claim_error_backoff(poll, 2), Duration::from_secs(4));
-        assert_eq!(claim_error_backoff(poll, 5), Duration::from_secs(32));
-    }
-
-    #[test]
-    fn backoff_caps_at_one_minute() {
-        let poll = Duration::from_secs(1);
-        // 1s × 2^6 = 64s → capped to 60s.
-        assert_eq!(claim_error_backoff(poll, 6), CLAIM_ERROR_BACKOFF_CAP);
-        // Shift is also clamped, so extreme `n` doesn't overflow.
-        assert_eq!(claim_error_backoff(poll, u32::MAX), CLAIM_ERROR_BACKOFF_CAP);
-    }
-
-    #[test]
-    fn backoff_caps_when_poll_interval_already_exceeds_ceiling() {
-        // A misconfigured `poll_interval` larger than the cap still returns
-        // the cap, not an even-larger value.
-        let huge_poll = Duration::from_mins(2);
-        assert_eq!(claim_error_backoff(huge_poll, 0), CLAIM_ERROR_BACKOFF_CAP);
-        assert_eq!(claim_error_backoff(huge_poll, 10), CLAIM_ERROR_BACKOFF_CAP);
-    }
-
-    #[test]
-    fn backoff_saturates_on_arithmetic_overflow() {
-        // `Duration::saturating_mul` clamps at `Duration::MAX`; the outer `min`
-        // then snaps down to the cap. No panic.
-        let max_poll = Duration::MAX;
-        assert_eq!(claim_error_backoff(max_poll, 6), CLAIM_ERROR_BACKOFF_CAP);
     }
 
     /// Constructs a `WorkerContext` literal directly, bypassing `build` and its
