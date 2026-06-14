@@ -7,6 +7,7 @@ edition = "2024"
 pedantic = { level = "warn", priority = -1 }
 
 [dependencies]
+angos-backoff = { path = "../backoff" }
 angos-storage = { path = "../storage" }
 async-trait = "0.1.89"
 bytes = "1.11.1"

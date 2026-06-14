@@ -15,6 +15,7 @@ use std::{
     time::Duration,
 };
 
+use angos_backoff::Backoff;
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use bytes::{Bytes, BytesMut};
 use chrono::{DateTime, Utc};
@@ -30,7 +31,7 @@ use reqwest::{
 };
 use sha2::Sha256;
 use smallvec::SmallVec;
-use tokio::time::timeout;
+use tokio::time::{sleep, timeout};
 use url::Url;
 
 use crate::BackendConfig;
@@ -221,6 +222,7 @@ pub struct S3Client {
     operation_timeout: Duration,
     operation_attempt_timeout: Duration,
     max_attempts: u32,
+    retry_backoff: Backoff,
     signing_key_cache: Arc<Mutex<Option<CachedSigningKey>>>,
 }
 
@@ -241,6 +243,7 @@ impl Debug for S3Client {
             .field("operation_timeout", &self.operation_timeout)
             .field("operation_attempt_timeout", &self.operation_attempt_timeout)
             .field("max_attempts", &self.max_attempts)
+            .field("retry_backoff", &self.retry_backoff)
             .finish_non_exhaustive()
     }
 }
@@ -294,6 +297,8 @@ impl S3Client {
             operation_timeout: Duration::from_secs(config.operation_timeout_secs),
             operation_attempt_timeout: Duration::from_secs(config.operation_attempt_timeout_secs),
             max_attempts: config.max_attempts.max(1),
+            retry_backoff: Backoff::exponential(Duration::from_millis(50), Duration::from_secs(1))
+                .with_jitter(),
             signing_key_cache: Arc::new(Mutex::new(None)),
         })
     }
@@ -480,7 +485,10 @@ impl S3Client {
                     Err(error)
                         if is_retryable_error(&error)
                             && !(non_idempotent && error.status.is_none())
-                            && attempt < attempts => {}
+                            && attempt < attempts =>
+                    {
+                        sleep(self.retry_backoff.delay(attempt - 1)).await;
+                    }
                     Err(error) => return Err(error),
                 }
             }

@@ -29,10 +29,11 @@ use sha2::{Digest as ShaDigest, Sha256};
 use tokio::time::sleep;
 use tracing::{debug, warn};
 
+use angos_backoff::Backoff;
 use angos_storage::{ConditionalStore, Error as StorageError, Etag, ObjectStore};
 
 use crate::lock::{
-    Error, simple_jitter,
+    Error,
     storage::{DeleteIfMatchOutcome, LockStorage, PutIfAbsentOutcome, PutIfMatchOutcome},
 };
 
@@ -51,13 +52,6 @@ pub fn lock_path(key: &str) -> String {
 /// Maximum number of attempts (the initial write plus reconciling retries)
 /// for a conditional lock write whose transport outcome is ambiguous.
 const MAX_CONDITIONAL_ATTEMPTS: u32 = 3;
-
-/// Base back-off (milliseconds) between reconciling retries; jittered up to 2×.
-const CONDITIONAL_RETRY_BASE_MS: u64 = 25;
-
-fn conditional_retry_delay() -> Duration {
-    Duration::from_millis(CONDITIONAL_RETRY_BASE_MS + simple_jitter(CONDITIONAL_RETRY_BASE_MS))
-}
 
 /// The `(body, ETag, last_modified)` read-back of a lock object, as returned by
 /// [`ConditionalStore::get_with_metadata`].
@@ -128,6 +122,7 @@ fn reconcile_match(readback: LockReadback, our_body: &[u8], expected_etag: &str)
 pub struct S3LockStorage {
     store: Arc<dyn ConditionalStore>,
     supports_conditional_delete: bool,
+    conditional_retry: Backoff,
 }
 
 impl Debug for S3LockStorage {
@@ -148,6 +143,7 @@ impl S3LockStorage {
         Self {
             store,
             supports_conditional_delete,
+            conditional_retry: Backoff::constant(Duration::from_millis(25)).with_jitter(),
         }
     }
 }
@@ -182,7 +178,7 @@ impl LockStorage for S3LockStorage {
                         }
                         AbsentReconcile::Retry => {
                             debug!(key, attempts, error = %e, "S3LockStorage: ambiguous acquire write, retrying");
-                            sleep(conditional_retry_delay()).await;
+                            sleep(self.conditional_retry.delay(0)).await;
                         }
                     }
                 }
@@ -222,7 +218,7 @@ impl LockStorage for S3LockStorage {
                         MatchReconcile::Mismatch => return Ok(PutIfMatchOutcome::Mismatch),
                         MatchReconcile::Retry => {
                             debug!(key, attempts, error = %e, "S3LockStorage: ambiguous refresh write, retrying");
-                            sleep(conditional_retry_delay()).await;
+                            sleep(self.conditional_retry.delay(0)).await;
                         }
                     }
                 }
@@ -253,7 +249,7 @@ impl LockStorage for S3LockStorage {
                         return Err(Error::StorageBackend(e.to_string()));
                     }
                     debug!(key, attempts, error = %e, "S3LockStorage: ambiguous lock read, retrying");
-                    sleep(conditional_retry_delay()).await;
+                    sleep(self.conditional_retry.delay(0)).await;
                 }
             }
         }

@@ -466,6 +466,7 @@ copy limits without proxying blob bytes through Angos.
 
 **Retry Strategy:**
 - **`max_attempts`** (default 3): Number of times to retry a failed request
+- Retries wait an exponential, jittered backoff (50ms doubling to a 1s ceiling) so a throttled bucket is not hammered
 - Increase for unreliable networks, decrease if timeouts are common
 
 ### S3 Metadata Optimizations

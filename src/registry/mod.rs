@@ -362,7 +362,8 @@ async fn in_process_claim_loop(
         select! {
             () = shutdown.cancelled() => return,
             outcome = consumer.claim_one(queue) => match outcome {
-                Err(_) => sleep(Duration::from_millis(100)).await,
+                // `claim_one` self-throttles on a backend error; nothing to do.
+                Err(_) => {}
                 Ok(claim_outcome) => match claim_outcome.claimed {
                     None => sleep(claim_outcome.idle_sleep(IN_PROCESS_IDLE_POLL)).await,
                     Some(claimed) => {

@@ -27,6 +27,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use angos_backoff::Backoff;
 use chrono::Utc;
 use futures_util::future::join_all;
 use tokio::{
@@ -41,7 +42,6 @@ use uuid::Uuid;
 use crate::lock::{
     Error, LockSession,
     metrics::{elapsed_ms, lock_metrics},
-    simple_jitter,
     storage::{DeleteIfMatchOutcome, LockBody, LockStorage, PutIfAbsentOutcome, PutIfMatchOutcome},
 };
 
@@ -61,7 +61,7 @@ pub struct Lock {
     ttl_secs: u64,
     max_hold_secs: u64,
     max_retries: u32,
-    retry_delay_ms: u64,
+    retry_backoff: Backoff,
 }
 
 impl Debug for Lock {
@@ -148,12 +148,18 @@ impl LockBuilder {
             ));
         }
 
+        let retry_backoff = Backoff::exponential(
+            Duration::from_millis(retry_delay_ms),
+            Duration::from_secs(1),
+        )
+        .with_jitter();
+
         Ok(Lock {
             storage: self.storage,
             ttl_secs,
             max_hold_secs,
             max_retries,
-            retry_delay_ms,
+            retry_backoff,
         })
     }
 }
@@ -189,14 +195,6 @@ impl Lock {
         };
         serde_json::to_vec(&body)
             .map_err(|e| Error::InvalidData(format!("lock body serialization failed: {e}")))
-    }
-
-    fn jittered_delay(&self, attempt: u32) -> Duration {
-        let max_delay_ms: u64 = 1_000;
-        let base_ms = self.retry_delay_ms.saturating_mul(1u64 << attempt.min(6));
-        let capped_ms = base_ms.min(max_delay_ms);
-        let jitter = simple_jitter(capped_ms / 2);
-        Duration::from_millis(capped_ms.saturating_add(jitter))
     }
 
     /// Try once to acquire a single key. Returns `Ok(Some(etag))` on success,
@@ -301,7 +299,7 @@ impl Lock {
                     let attempt = self.max_retries - retries;
                     debug!(retries_left = retries, "Lock busy, retrying");
                     lock_metrics().record_retry(label);
-                    sleep(self.jittered_delay(attempt)).await;
+                    sleep(self.retry_backoff.delay(attempt)).await;
                 }
             }
         }

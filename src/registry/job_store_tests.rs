@@ -1,5 +1,4 @@
 use std::sync::Arc;
-use std::time::Duration;
 
 use bytes::Bytes;
 use chrono::{TimeZone as _, Utc};
@@ -10,7 +9,7 @@ use angos_tx_engine::transaction::{Mutation, Transaction};
 
 use crate::registry::job_store::{
     CompleteOutcome, FailOutcome, JobEnvelope, JobQueueConfig, JobState, JobStore,
-    MAX_REPORTED_PENDING, STORAGE_KEY_PREFIX_LEN, backoff, make_storage_key, parse_lock_key_index,
+    MAX_REPORTED_PENDING, STORAGE_KEY_PREFIX_LEN, make_storage_key, parse_lock_key_index,
     parse_not_before, serialize_dead_letter, serialize_lock_key_index,
 };
 use crate::registry::test_utils::{build_store, locked_executor_over};
@@ -936,13 +935,4 @@ fn pending_refresh_interval_below_floor_is_rejected() {
     let cfg = toml::from_str::<JobQueueConfig>(toml_with_five)
         .expect("the floor value itself must parse");
     assert_eq!(cfg.pending_refresh_interval_secs, 5);
-}
-
-#[test]
-fn backoff_doubles_each_attempt_then_caps_at_ten_minutes() {
-    assert_eq!(backoff(0), Duration::from_mins(1));
-    assert_eq!(backoff(1), Duration::from_mins(2));
-    assert_eq!(backoff(3), Duration::from_mins(8));
-    assert_eq!(backoff(4), Duration::from_mins(10));
-    assert_eq!(backoff(100), Duration::from_mins(10));
 }

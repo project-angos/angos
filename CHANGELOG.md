@@ -4,7 +4,7 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## 1.3.0 - [Unreleased]
 
 ### Added
 
@@ -17,6 +17,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Changed
 
+- S3 operation retries now wait an exponential, jittered backoff instead of retrying immediately, so a throttled bucket is no longer hammered.
+- The server's in-process job drain backs off exponentially after a claim error instead of retrying every 100ms.
+- Webhook delivery retry backoff is capped at ten seconds.
 - A blob-upload `POST` carrying `?mount=` is authorized as the new `mount-blob` action; container clients send it opportunistically on push, so a default-deny policy must grant `mount-blob` alongside `start-upload` or those pushes fail.
 - `angos worker` with no `--queue` now drains both the `cache` and `replication` queues (pass `--queue cache` for the former cache-only behavior) and rejects unknown `--queue` values at startup.
 - A `[global.job_queue]` using the in-process `memory` lock strategy is now rejected at startup (breaking): set the metadata store's `lock_strategy` to `s3` or `redis`, or remove `[global.job_queue]` to use the in-process queue.

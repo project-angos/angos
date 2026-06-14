@@ -11,7 +11,13 @@
 //! fingerprint guards against a concurrent enqueue that refreshes the index
 //! between the GET and the delete.
 
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicU32, Ordering},
+    },
+    time::Duration,
+};
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -20,12 +26,13 @@ use serde::{Deserialize, Deserializer, Serialize};
 use sha2::{Digest as _, Sha256};
 use tokio::{
     select,
-    time::{MissedTickBehavior, interval},
+    time::{MissedTickBehavior, interval, sleep},
 };
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 use uuid::Uuid;
 
+use angos_backoff::Backoff;
 use angos_tx_engine::{
     StorageError,
     error::Error as TxError,
@@ -436,6 +443,9 @@ fn tx_error_to_job(err: TxError) -> Error {
 pub struct JobStore {
     store: Arc<Store>,
     worker_id: String,
+    retry_backoff: Backoff,
+    claim_error_backoff: Backoff,
+    consecutive_claim_errors: AtomicU32,
 }
 
 impl JobStore {
@@ -448,6 +458,15 @@ impl JobStore {
         Self {
             store,
             worker_id: worker_id.into(),
+            retry_backoff: Backoff::exponential(
+                Duration::from_millis(100),
+                Duration::from_secs(10),
+            ),
+            claim_error_backoff: Backoff::exponential(
+                Duration::from_millis(100),
+                Duration::from_secs(10),
+            ),
+            consecutive_claim_errors: AtomicU32::new(0),
         }
     }
 
@@ -824,17 +843,37 @@ impl JobStore {
     // Consumer: claim / complete / fail
     // -----------------------------------------------------------------------
 
-    /// Claim the next available job from `queue`. Walks pending storage keys
-    /// in ascending order (`list_pending` returns them sorted by the hex
-    /// unix-millis prefix, i.e. by `not_before`). Stops at the first key whose
-    /// prefix is in the future without reading its body: the prefix is the
-    /// authoritative readiness signal. When no claim is made, `next_ready`
-    /// carries that first future instant so the caller can sleep until then.
+    /// Claim the next available job from `queue`, self-throttling on backend
+    /// failure: a storage error sleeps an exponential, capped backoff before
+    /// returning so the caller can loop without managing retry timing itself.
+    /// The backoff resets on the next successful claim.
+    pub async fn claim_one(&self, queue: &str) -> Result<ClaimOutcome, Error> {
+        match self.try_claim_one(queue).await {
+            Ok(outcome) => {
+                self.consecutive_claim_errors.store(0, Ordering::Relaxed);
+                Ok(outcome)
+            }
+            Err(error) => {
+                let attempt = self
+                    .consecutive_claim_errors
+                    .fetch_add(1, Ordering::Relaxed);
+                sleep(self.claim_error_backoff.delay(attempt)).await;
+                Err(error)
+            }
+        }
+    }
+
+    /// Walk pending storage keys in ascending order (`list_pending` returns
+    /// them sorted by the hex unix-millis prefix, i.e. by `not_before`). Stops
+    /// at the first key whose prefix is in the future without reading its body:
+    /// the prefix is the authoritative readiness signal. When no claim is made,
+    /// `next_ready` carries that first future instant so the caller can sleep
+    /// until then.
     ///
     /// On a successful claim the job's dedup index is retired (see
     /// [`Self::retire_claimed_index`]) so a same-`lock_key` enqueue arriving
     /// while the job runs is not coalesced into the already-resolved job.
-    pub async fn claim_one(&self, queue: &str) -> Result<ClaimOutcome, Error> {
+    async fn try_claim_one(&self, queue: &str) -> Result<ClaimOutcome, Error> {
         let now = Utc::now();
         let mut next_ready: Option<DateTime<Utc>> = None;
         for storage_key in self.list_pending(queue, MAX_SCAN).await? {
@@ -997,7 +1036,7 @@ impl JobStore {
                 .await;
         }
 
-        let delay = backoff(new_attempts);
+        let delay = self.retry_backoff.delay(new_attempts);
         let next_at = Utc::now() + ChronoDuration::from_std(delay).unwrap_or_default();
         let updated = JobEnvelope {
             attempts: new_attempts,
@@ -1243,16 +1282,6 @@ impl JobStore {
             .map(|_| ())
             .map_err(tx_error_to_job)
     }
-}
-
-// ---------------------------------------------------------------------------
-// Backoff
-// ---------------------------------------------------------------------------
-
-/// Exponential backoff for retry delays: `min(1 min * 2^n, 10 min)`. `n = 0`
-/// means "first failure". The shift is bounded so it cannot overflow.
-pub fn backoff(n: u32) -> Duration {
-    Duration::from_mins(1 << n.min(4)).min(Duration::from_mins(10))
 }
 
 // ---------------------------------------------------------------------------
