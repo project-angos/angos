@@ -1,8 +1,7 @@
-use crate::{oci::Digest, registry::metadata_store::link_kind::LinkKind, util::sha256};
+use crate::{oci::Digest, registry::metadata_store::link_kind::LinkKind};
 
 const BLOBS_ROOT: &str = "v2/blobs";
 const REPOS_ROOT: &str = "v2/repositories";
-const REGISTRY_ROOT: &str = "_registry";
 const JOBS_ROOT: &str = "_jobs";
 
 pub fn blobs_root_dir() -> &'static str {
@@ -11,30 +10,6 @@ pub fn blobs_root_dir() -> &'static str {
 
 pub fn repository_dir() -> &'static str {
     REPOS_ROOT
-}
-
-pub fn namespace_registry_path() -> String {
-    format!("{REGISTRY_ROOT}/namespaces.json")
-}
-
-pub fn namespace_registry_shard_dir() -> String {
-    format!("{REGISTRY_ROOT}/ns")
-}
-
-pub fn namespace_registry_shard_path(namespace: &str) -> String {
-    let shard = namespace_shard_key(namespace);
-    format!("{REGISTRY_ROOT}/ns/{shard}.json")
-}
-
-// SHA-256 is used here (not DefaultHasher) because DefaultHasher is explicitly not
-// guaranteed to be stable across Rust versions. Changing the hash algorithm after
-// deployment would remap existing data to different shard paths, corrupting storage.
-pub fn shard_key(value: &str) -> String {
-    sha256::shard_key(value)
-}
-
-pub fn namespace_shard_key(namespace: &str) -> String {
-    shard_key(namespace)
 }
 
 fn blob_dir(digest: &Digest) -> String {
@@ -376,29 +351,5 @@ mod tests {
             job_lock_key_index_path("cache", "cache.ns:sha256:abc"),
             "_jobs/index/cache/cache.ns%3Asha256%3Aabc.json"
         );
-    }
-
-    #[test]
-    fn test_namespace_registry_shard_paths() {
-        assert_eq!(namespace_registry_shard_dir(), "_registry/ns");
-
-        let path = namespace_registry_shard_path("my-repo");
-        assert!(path.starts_with("_registry/ns/"));
-        assert!(
-            std::path::Path::new(&path)
-                .extension()
-                .is_some_and(|ext| ext.eq_ignore_ascii_case("json"))
-        );
-
-        // Same namespace always maps to the same shard
-        assert_eq!(
-            namespace_registry_shard_path("my-repo"),
-            namespace_registry_shard_path("my-repo")
-        );
-
-        // Shard key is a 2-char hex string
-        let key = namespace_shard_key("my-repo");
-        assert_eq!(key.len(), 2);
-        assert!(key.chars().all(|c| c.is_ascii_hexdigit()));
     }
 }

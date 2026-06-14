@@ -235,16 +235,9 @@ impl MetadataStore {
     ) -> Result<(Vec<String>, Option<String>), Error> {
         debug!("Fetching {n} namespace(s) with continuation token: {last:?}");
 
-        let namespaces = if let Some(registry) = self.read_namespace_registry().await? {
-            registry.namespaces
-        } else {
-            info!("Namespace registry not found, rebuilding");
-            self.rebuild_namespace_registry().await?;
-            self.read_namespace_registry()
-                .await?
-                .map(|r| r.namespaces)
-                .unwrap_or_default()
-        };
+        let namespaces = self
+            .collect_namespaces(path_builder::repository_dir(), "")
+            .await?;
 
         Ok(pagination::paginate_sorted(&namespaces, n, last.as_deref()))
     }
@@ -648,15 +641,6 @@ impl MetadataStore {
         .map_err(tx_error_to_meta)?;
 
         info!("Migrated legacy blob index for '{digest}' ({namespace_count} namespaces)",);
-        Ok(())
-    }
-
-    #[instrument(skip(self))]
-    pub async fn migrate_namespace_registry(&self) -> Result<(), Error> {
-        self.rebuild_namespace_registry().await?;
-        self.store()
-            .delete(&path_builder::namespace_registry_path())
-            .await?;
         Ok(())
     }
 

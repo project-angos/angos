@@ -114,10 +114,10 @@ Upload session cleanup is gated behind `-u <duration>`; without that flag,
 neither obsolete nor broken upload state is touched. Pass `-u` to schedules
 that should reclaim that storage.
 
-Namespace-registry convergence (removal of fully-emptied namespaces) happens
-during scrub's always-on layout migration and requires no additional flag;
-the namespace name remains visible to `_catalog` clients between deletes and
-the next scrub run.
+The `_catalog` listing is derived directly from stored content: a namespace
+appears exactly when it holds at least one revision or tag, and disappears as
+soon as the last one is deleted. No scrub run or namespace registration step is
+involved.
 
 ### Systemd Timer
 
@@ -317,19 +317,18 @@ The `--media-types` flag reads each manifest blob and writes its `media_type` in
 
 This is idempotent and safe to run multiple times.
 
-### Blob Index and Namespace Registry Migration
+### Blob Index Migration
 
-Legacy single-file blob indexes (`index.json`) and the legacy unsharded `namespace_registry.json` keep working at runtime against both the S3 and filesystem backends. Reads consult the sharded layout first and fall back to the legacy file when no sharded entry exists, and writes are applied in place to a legacy file when one is present so the layout never splits mid-blob. Operators are **not** forced to run scrub just to keep serving traffic.
+Legacy single-file blob indexes (`index.json`) keep working at runtime against both the S3 and filesystem backends. Reads consult the sharded layout first and fall back to the legacy file when no sharded entry exists, and writes are applied in place to a legacy file when one is present so the layout never splits mid-blob. Operators are **not** forced to run scrub just to keep serving traffic.
 
-`scrub` is the only way to convert the on-disk layout from legacy to sharded:
+`scrub` is the only way to convert the on-disk blob-index layout from legacy to sharded:
 
 - `scrub --blobs` iterates every blob, rewrites each legacy `index.json` into per-namespace shards under `refs/{namespace}.json`, and deletes the legacy file once the shards are written.
-- A regular `scrub` run rebuilds the namespace registry shards by re-walking storage and deletes the legacy `namespace_registry.json`.
 
-Running scrub benefits operators who want the per-namespace shard layout's listing and concurrency characteristics for old blobs and namespaces; the runtime fallback is correct but does not gain the sharded layout's lock granularity or O(1) listing properties for entries that are still in legacy form. Operators with no legacy data on disk can skip this step.
+Running scrub benefits operators who want the per-namespace shard layout's lock granularity and concurrency characteristics for old blobs; the runtime fallback is correct but does not gain those properties for entries that are still in legacy form. Operators with no legacy data on disk can skip this step.
 
 ```bash
-# Migrate legacy blob indexes and rebuild namespace registry shards
+# Migrate legacy blob indexes
 ./angos -c config.toml scrub --blobs
 ```
 
