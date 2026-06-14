@@ -3,7 +3,7 @@ mod backend;
 mod blob_index;
 mod cache;
 mod legacy_fallback;
-mod namespace_registry;
+mod list_namespaces;
 
 use std::{
     collections::{HashMap, HashSet},

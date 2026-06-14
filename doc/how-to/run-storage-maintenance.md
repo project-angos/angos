@@ -38,6 +38,7 @@ The `scrub` command performs various maintenance operations. Each check must be 
 | `-l, --links`                 | Fix links format inconsistencies; remove revisions whose manifest blob is missing; prune phantom referrer back-links |
 | `-M, --media-types`           | Backfill missing `media_type` on manifest links; remove revisions whose manifest blob is missing   |
 | `-R, --referrers`             | Check for and remove orphan referrer links whose referrer manifest is no longer a current revision |
+| `-n, --orphan-namespaces`     | Delete all content for namespaces not owned by any configured repository (destructive; see below)  |
 | `-d, --dry-run`               | Preview changes without applying them                                                              |
 
 ---
@@ -110,14 +111,15 @@ Blob ownership markers are kept until the client issues an explicit
 a namespace's manifests are deleted. This reflects the OCI blob lifecycle and
 is not a leak.
 
-Upload session cleanup is gated behind `-u <duration>`; without that flag,
-neither obsolete nor broken upload state is touched. Pass `-u` to schedules
-that should reclaim that storage.
+Routine upload session cleanup is gated behind `-u <duration>`; without that
+flag, neither obsolete nor broken upload state is touched (note that `-n`
+separately clears every in-flight upload of an orphan namespace regardless of
+age). Pass `-u` in schedules that should reclaim that storage.
 
-Namespace-registry convergence (removal of fully-emptied namespaces) happens
-during scrub's always-on layout migration and requires no additional flag;
-the namespace name remains visible to `_catalog` clients between deletes and
-the next scrub run.
+The `_catalog` listing is derived directly from stored content: a namespace
+appears exactly when it holds at least one revision or tag, and disappears as
+soon as the last one is deleted. No scrub run or namespace registration step is
+involved.
 
 ### Systemd Timer
 
@@ -237,12 +239,28 @@ See [Configure Retention Policies](configure-retention-policies.md) for detailed
 | Untagged manifest | Doesn't match any retention rule |
 | Blob              | Not referenced by any manifest   |
 | Upload            | With `-u`: broken/incomplete session or older than the timeout    |
+| Whole namespace   | With `-n`: not owned by any configured `[repository]` (revisions, tags, in-flight uploads, plus the namespace's layer/config blob bytes) |
+
+### Clearing Orphan Namespaces (`-n`)
+
+`-n, --orphan-namespaces` is destructive and opt-in. When a `[repository]` is removed from configuration (or data predates it), the namespaces it held no longer resolve to any repository, yet their manifests, tags, and blobs linger forever. This flag removes the revisions, tags, and in-flight uploads of every such namespace and reclaims their layer/config blob bytes by revoking those blobs' ownership grants when no still-configured namespace shares them, so the blast radius is **every namespace whose owning repository is no longer in your config**, not just empty ones. It does not reclaim the manifest blob bytes (manifest blobs carry no ownership grant); a `--blobs` pass reclaims those once their links are gone.
+
+Safeguards apply:
+
+- **Always dry-run first.** Run `angos scrub --orphan-namespaces --dry-run` and confirm the listed deletions only cover namespaces you intend to drop.
+- **Combine with `--blobs` to reclaim manifest bytes.** Run `angos scrub --orphan-namespaces --blobs` to also reclaim the orphan manifest blob bytes in the same pass, once their links are gone.
+- **Run with no writers on orphan namespaces.** A client can still push to a namespace that no longer maps to any repository. Run `-n` when no writers target orphan namespaces, or re-run it afterward to mop up anything pushed during the clear.
+- **Empty-config guard.** If no `[repository]` is configured, every namespace would be an orphan, so the flag refuses to run, logs a warning, and deletes nothing; an emptied config can never wipe the registry.
+
+Cleared namespaces drop out of `_catalog` automatically, since the catalog is derived from stored content.
 
 ### Protected Items
 
-Never deleted:
+Never deleted by retention:
 - Child manifests of multi-platform indexes
 - Manifests with referrers (signatures, SBOMs)
+
+This scope is retention only. `-n` clears the entire orphan namespace, including index children and referrer/signature manifests.
 
 ---
 
@@ -317,19 +335,18 @@ The `--media-types` flag reads each manifest blob and writes its `media_type` in
 
 This is idempotent and safe to run multiple times.
 
-### Blob Index and Namespace Registry Migration
+### Blob Index Migration
 
-Legacy single-file blob indexes (`index.json`) and the legacy unsharded `namespace_registry.json` keep working at runtime against both the S3 and filesystem backends. Reads consult the sharded layout first and fall back to the legacy file when no sharded entry exists, and writes are applied in place to a legacy file when one is present so the layout never splits mid-blob. Operators are **not** forced to run scrub just to keep serving traffic.
+Legacy single-file blob indexes (`index.json`) keep working at runtime against both the S3 and filesystem backends. Reads consult the sharded layout first and fall back to the legacy file when no sharded entry exists, and writes are applied in place to a legacy file when one is present so the layout never splits mid-blob. Operators are **not** forced to run scrub just to keep serving traffic.
 
-`scrub` is the only way to convert the on-disk layout from legacy to sharded:
+`scrub` is the only way to convert the on-disk blob-index layout from legacy to sharded:
 
 - `scrub --blobs` iterates every blob, rewrites each legacy `index.json` into per-namespace shards under `refs/{namespace}.json`, and deletes the legacy file once the shards are written.
-- A regular `scrub` run rebuilds the namespace registry shards by re-walking storage and deletes the legacy `namespace_registry.json`.
 
-Running scrub benefits operators who want the per-namespace shard layout's listing and concurrency characteristics for old blobs and namespaces; the runtime fallback is correct but does not gain the sharded layout's lock granularity or O(1) listing properties for entries that are still in legacy form. Operators with no legacy data on disk can skip this step.
+Running scrub benefits operators who want the per-namespace shard layout's lock granularity and concurrency characteristics for old blobs; the runtime fallback is correct but does not gain those properties for entries that are still in legacy form. Operators with no legacy data on disk can skip this step.
 
 ```bash
-# Migrate legacy blob indexes and rebuild namespace registry shards
+# Migrate legacy blob indexes
 ./angos -c config.toml scrub --blobs
 ```
 

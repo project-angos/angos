@@ -68,6 +68,15 @@ pub fn namespaces(metadata_store: &Arc<MetadataStore>) -> ResultStream<'_, Strin
     }))
 }
 
+pub fn upload_namespaces(metadata_store: &Arc<MetadataStore>) -> ResultStream<'_, String> {
+    Box::pin(paginated(move |marker| async move {
+        metadata_store
+            .list_upload_namespaces(PAGE_SIZE, marker)
+            .await
+            .map_err(Error::from)
+    }))
+}
+
 /// Drives a paginated source as a stream. Each yielded item is one entry from
 /// the underlying source; pages are fetched lazily, one at a time.
 fn paginated<T, F, Fut>(fetch: F) -> impl Stream<Item = Result<T, Error>>

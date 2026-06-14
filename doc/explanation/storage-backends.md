@@ -528,49 +528,25 @@ manifests; once the remaining references are gone, the final delete removes the 
 - **Faster updates**: Each shard is small, making updates quicker.
 - **Scalability**: Performance doesn't degrade as the number of namespaces grows.
 
-#### Namespace Registry
+#### Namespace Catalog
 
-Listing all namespaces requires discovering all repositories and their nested namespaces. Without optimization, this is an O(n) tree walk across S3, which scales poorly.
+Listing all namespaces (`_catalog` / `list_namespaces`) is derived directly from stored content with no maintained index. The catalog is built by walking the repository tree and yielding a path exactly when it has a `_manifests` child, which means the namespace holds at least one revision or tag. Paths that hold only non-manifest data (for example an in-progress `_uploads` session) are not catalog entries, and `_`-prefixed children are never descended into.
 
-Angos maintains an index at:
+This makes the catalog **deterministic and strongly consistent**: a namespace appears the instant its first revision or tag is written and disappears the instant the last one is deleted. There is no namespace "registration" concept, no eventually-consistent index to converge, and no scrub step involved.
 
-```
-_registry/namespaces.json
-```
+#### Legacy Blob Index Migration
 
-This file contains a simple JSON list:
+The per-blob `index.json` file written by Angos prior to v1.1.0 can be encountered after upgrade. It continues to work at runtime without any migration step.
 
-```json
-{
-  "namespaces": ["myapp", "team/backend", "team/frontend"]
-}
-```
-
-The registry is:
-
-- **Built on first use**: If missing, Angos performs an S3 tree walk to discover all namespaces and writes the registry file.
-- **Updated incrementally**: New namespaces are appended to the registry as they are created.
-- **Protected by locking**: Concurrent writes use distributed locking (S3 conditional writes or a lock key) to prevent corruption.
-
-**Benefits:**
-
-- **O(1) list performance**: Instead of O(n) tree walk, `list_namespaces` becomes a single file read.
-- **No background jobs**: The registry is built on demand, not via a separate garbage collector or background process.
-
-The registry is append-only at runtime: namespaces are added when their first link is written, but never removed by the delete path. Periodic `angos scrub` rebuilds the registry by re-walking storage, so a namespace whose last artifact is deleted disappears from `list_namespaces` on the next scrub run. Between server-driven deletes and the next scrub, the `_catalog` endpoint may continue to return the namespace name. Because namespace names are stable identifiers rather than a count of live artifacts, clients that probe per-namespace before assuming content exists are unaffected.
-
-#### Legacy Blob Index and Namespace Registry Migration
-
-Two pre-existing legacy layouts can be encountered after upgrade: the per-blob `index.json` file written by Angos prior to v1.1.0, and the single-file `namespace_registry.json` that filesystem deployments used prior to v1.2.0. Both layouts continue to work at runtime without any migration step.
-
-Runtime reads consult the sharded layout first and fall back to the legacy file when no sharded entry covers the request. Writes follow the same per-blob rule: when a legacy `index.json` is present for a digest the runtime updates it in place (the legacy file stays the source of truth for that blob until scrub moves it), and only when no legacy file is present does a write create or update a sharded entry under `refs/{namespace}.json`. This is decided per blob, so different blobs in the same deployment can sit in different states. The namespace registry behaves the same way on reads: the shards are consulted first and the legacy `namespace_registry.json` is read when no shards are present.
+Runtime reads consult the sharded layout first and fall back to the legacy file when no sharded entry covers the request. Writes follow the same per-blob rule: when a legacy `index.json` is present for a digest the runtime updates it in place (the legacy file stays the source of truth for that blob until scrub moves it), and only when no legacy file is present does a write create or update a sharded entry under `refs/{namespace}.json`. This is decided per blob, so different blobs in the same deployment can sit in different states.
 
 `angos scrub` is the only thing that actively rewrites legacy data into the sharded layout:
 
 - `angos scrub --blobs` rewrites each legacy `v2/blobs/{algorithm}/{hash_prefix}/{hash}/index.json` into per-namespace shards under `refs/{namespace}.json` and deletes the legacy file once the shards are written.
-- A regular `angos scrub` run rebuilds the namespace registry shards by re-walking storage and removes the legacy `namespace_registry.json`.
 
 The migration is idempotent: re-running scrub is safe and is a no-op for data that is already in the sharded layout.
+
+Pre-existing namespace-registry index objects (`_registry/namespaces.json` and `_registry/ns/*.json`) written by earlier versions are no longer read or written; the catalog is now derived directly from stored content. These objects become unused after upgrade and can be left in place or deleted manually; no migration step is required.
 
 #### Blob Index Convergence
 

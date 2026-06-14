@@ -11,7 +11,7 @@ use crate::{
         scrub::{
             check::{
                 BlobChecker, LayoutChecker, MultipartChecker, NamespaceChecker, OrphanGrantChecker,
-                OrphanJobChecker, StoreChecker, list_all,
+                OrphanJobChecker, OrphanNamespaceChecker, StoreChecker, list_all,
             },
             error::Error,
             executor::{ActionSink, DryRunSink, Executor},
@@ -81,6 +81,10 @@ pub struct Options {
     /// delete cache jobs (pending and dead-lettered) whose repository is no
     /// longer configured for pull-through
     pub cache_orphans: bool,
+    #[argh(switch, short = 'n')]
+    /// delete all content for namespaces not owned by any configured repository;
+    /// destructive (run --dry-run first); ignored when no repositories configured
+    pub orphan_namespaces: bool,
     #[argh(option)]
     /// revoke orphaned blob-ownership grants older than the specified age: a
     /// blob a namespace owns but no manifest references (e.g. a replication push
@@ -96,6 +100,9 @@ pub struct Command {
     blob_checker: Option<BlobChecker>,
     multipart_checker: Option<MultipartChecker>,
     orphan_grant_checker: Option<OrphanGrantChecker>,
+    /// Clears every namespace not owned by a configured repository; `None`
+    /// unless `--orphan-namespaces` is set with at least one repository defined.
+    orphan_namespace_checker: Option<OrphanNamespaceChecker>,
     /// One checker per queue selected by `--replication-orphans` and
     /// `--cache-orphans`; empty when neither flag is set.
     orphan_job_checkers: Vec<OrphanJobChecker>,
@@ -141,6 +148,8 @@ impl Command {
         let multipart_checker = setup::multipart_checker(options, &blob_backend)?;
         let orphan_grant_checker =
             setup::orphan_grant_checker(options, &blob_backend, &metadata_store)?;
+        let orphan_namespace_checker =
+            setup::orphan_namespace_checker(options, &blob_backend, &metadata_store, &repositories);
         let orphan_job_checkers =
             setup::orphan_job_checkers(options, &metadata_store, &repositories);
 
@@ -181,6 +190,7 @@ impl Command {
             blob_checker,
             multipart_checker,
             orphan_grant_checker,
+            orphan_namespace_checker,
             orphan_job_checkers,
             sink,
             replication_drain,
@@ -212,6 +222,9 @@ impl Command {
     pub async fn run(&mut self) -> Result<(), Error> {
         self.migrate_storage_layout().await?;
         self.scrub_metadata().await?;
+        // Run before `--blobs` so it can reclaim the manifest blob bytes the
+        // orphan-namespace link deletions leave unreferenced.
+        self.scrub_orphan_namespaces().await?;
         self.scrub_blobs().await?;
         self.scrub_orphan_grants().await?;
         self.scrub_multipart_uploads().await?;
@@ -261,6 +274,15 @@ impl Command {
             && let Err(e) = checker.check_all(self.sink.as_mut()).await
         {
             warn!("Orphan blob-grant scrub checker failed: {e}");
+        }
+        Ok(())
+    }
+
+    async fn scrub_orphan_namespaces(&mut self) -> Result<(), Error> {
+        if let Some(checker) = &self.orphan_namespace_checker
+            && let Err(e) = checker.check_all(self.sink.as_mut()).await
+        {
+            warn!("Orphan namespace scrub checker failed: {e}");
         }
         Ok(())
     }
@@ -366,6 +388,7 @@ mod tests {
             replicate: false,
             replication_orphans: false,
             cache_orphans: false,
+            orphan_namespaces: false,
             orphan_grants: None,
         };
 

@@ -1,14 +1,15 @@
 use std::sync::Arc;
 
 use chrono::Duration;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::{
     command::scrub::{
         check::{
             BlobChecker, LayoutChecker, LinkReferencesChecker, ManifestChecker, MediaTypeChecker,
-            MultipartChecker, NamespaceChecker, OrphanGrantChecker, OrphanJobChecker, OrphanQueue,
-            ReferrerChecker, ReplicationChecker, RetentionChecker, TagChecker, UploadChecker,
+            MultipartChecker, NamespaceChecker, OrphanGrantChecker, OrphanJobChecker,
+            OrphanNamespaceChecker, OrphanQueue, ReferrerChecker, ReplicationChecker,
+            RetentionChecker, TagChecker, UploadChecker,
         },
         command::Options,
         error::Error,
@@ -157,6 +158,34 @@ pub fn orphan_grant_checker(
         metadata_store.clone(),
         min_age,
     )))
+}
+
+/// Builds the `--orphan-namespaces` checker, or `None` (with a warning) when no
+/// repositories are configured, since the flag must never wipe the whole registry.
+pub fn orphan_namespace_checker(
+    options: &Options,
+    blob_store: &Arc<blob_store::BlobStore>,
+    metadata_store: &Arc<MetadataStore>,
+    resolver: &Arc<RepositoryResolver>,
+) -> Option<OrphanNamespaceChecker> {
+    if !options.orphan_namespaces {
+        return None;
+    }
+    if resolver.len() == 0 {
+        warn!(
+            "scrub --orphan-namespaces: no repositories configured; refusing to delete every namespace"
+        );
+        return None;
+    }
+    info!(
+        "Orphan-namespace clearing enabled for {} configured repositories",
+        resolver.len()
+    );
+    Some(OrphanNamespaceChecker::new(
+        blob_store.clone(),
+        metadata_store.clone(),
+        resolver.clone(),
+    ))
 }
 
 /// Builds one orphan-job checker per queue selected by `--replication-orphans`

@@ -249,3 +249,11 @@ Or add a standalone rule:
 ```
 
 See [Set Up Access Control](set-up-access-control.md) for the full `mount-blob` action reference.
+
+### Content-Derived Namespace Catalog
+
+#### What Changed
+
+The `_catalog` listing is now derived directly from stored content rather than from a maintained namespace-registry index. A namespace is listed exactly when it holds at least one revision or tag, so the catalog is deterministic and strongly consistent.
+
+**Who is affected:** No one needs to act. Pre-existing namespace-registry index objects (`_registry/namespaces.json` and `_registry/ns/*.json`) written by earlier versions are no longer read or written, and `scrub` prunes them automatically (its layout-migration step runs on every scrub).

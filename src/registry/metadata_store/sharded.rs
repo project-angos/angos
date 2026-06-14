@@ -1,18 +1,8 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
-use serde::{Deserialize, Serialize};
-
-use crate::registry::{
-    metadata_store::{BlobIndex, BlobIndexOperation, Error, link_kind::LinkKind},
-    path_builder,
-};
+use crate::registry::metadata_store::{BlobIndex, BlobIndexOperation, Error, link_kind::LinkKind};
 
 pub const SHARD_READ_CONCURRENCY: usize = 10;
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct NamespaceRegistry {
-    pub namespaces: Vec<String>,
-}
 
 pub fn decode_blob_index_shard_namespace(file_name: &str) -> String {
     file_name
@@ -20,46 +10,6 @@ pub fn decode_blob_index_shard_namespace(file_name: &str) -> String {
         .unwrap_or(file_name)
         .replace("%2F", "/")
         .replace("%25", "%")
-}
-
-pub fn normalize_namespaces(mut namespaces: Vec<String>) -> Vec<String> {
-    namespaces.sort();
-    namespaces.dedup();
-    namespaces
-}
-
-pub fn group_namespaces_by_shard(
-    namespaces: impl IntoIterator<Item = String>,
-) -> HashMap<String, Vec<String>> {
-    let mut shards: HashMap<String, Vec<String>> = HashMap::new();
-    for namespace in namespaces {
-        shards
-            .entry(path_builder::namespace_shard_key(&namespace))
-            .or_default()
-            .push(namespace);
-    }
-
-    for namespaces in shards.values_mut() {
-        namespaces.sort();
-        namespaces.dedup();
-    }
-    shards
-}
-
-pub fn registry_for_namespaces(namespaces: &[String]) -> NamespaceRegistry {
-    NamespaceRegistry {
-        namespaces: namespaces.to_vec(),
-    }
-}
-
-pub fn insert_sorted_unique(namespaces: &mut Vec<String>, namespace: &str) -> bool {
-    match namespaces.binary_search_by(|probe| probe.as_str().cmp(namespace)) {
-        Ok(_) => false,
-        Err(pos) => {
-            namespaces.insert(pos, namespace.to_string());
-            true
-        }
-    }
 }
 
 pub fn collect_blob_index_shards(

@@ -34,7 +34,7 @@ impl StoreChecker for LayoutChecker {
     async fn check_all(&self, sink: &mut (dyn ActionSink + Send)) -> Result<(), Error> {
         debug!("Migrating metadata storage layout");
 
-        sink.apply(Action::MigrateNamespaceRegistry).await?;
+        sink.apply(Action::PruneLegacyNamespaceRegistry).await?;
 
         let mut blobs = list_all::blobs(&self.blob_store);
         while let Some(blob) = blobs.next().await {
@@ -55,7 +55,7 @@ mod tests {
     use tempfile::TempDir;
 
     #[tokio::test]
-    async fn layout_checker_emits_namespace_and_blob_migration_actions() {
+    async fn layout_checker_emits_blob_migration_actions() {
         let temp_dir = TempDir::new().unwrap();
         let root_dir = temp_dir.path().to_string_lossy().into_owned();
         let blob_store = Arc::new(
@@ -72,10 +72,11 @@ mod tests {
         let mut actions = Vec::new();
         checker.check_all(&mut actions).await.unwrap();
 
-        assert!(matches!(
-            actions.first(),
-            Some(Action::MigrateNamespaceRegistry)
-        ));
+        assert!(
+            actions
+                .iter()
+                .any(|action| matches!(action, Action::PruneLegacyNamespaceRegistry))
+        );
         assert!(
             actions
                 .iter()

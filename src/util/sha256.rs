@@ -14,8 +14,3 @@ pub fn digest(input: impl AsRef<[u8]>) -> Digest {
 pub fn finalize_digest(hasher: Sha256) -> Digest {
     Digest::Sha256(hex::encode(hasher.finalize()).into())
 }
-
-pub fn shard_key(value: &str) -> String {
-    let hash = Sha256::digest(value.as_bytes());
-    format!("{:02x}", hash[0])
-}

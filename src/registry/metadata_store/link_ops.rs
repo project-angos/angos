@@ -5,14 +5,13 @@
 //! `delete_manifest`). Each public method prepares its own
 //! [`LinksTxExtras`] and delegates here, which builds the
 //! [`Transaction`], runs the retry loop, captures post-apply data, and performs
-//! cache / directory / namespace cleanup once on success.
+//! cache / directory cleanup once on success.
 
 use std::collections::{HashMap, HashSet};
 
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use futures_util::future::join_all;
-use tracing::warn;
 
 use angos_tx_engine::{
     StorageError,
@@ -209,10 +208,6 @@ pub struct LinksTxExtras<'a> {
     /// for the whole revoke-and-reclaim critical section; the engine lock is
     /// not reentrant, so re-declaring it here would self-deadlock.
     pub caller_holds_blob_data_lock: bool,
-    /// When `true`, the planner unconditionally registers the namespace on
-    /// success (used by `store_manifest`). Otherwise registration happens only
-    /// when at least one `Create` op was processed.
-    pub force_register_namespace: bool,
     /// Creation timestamp for newly-written link metadata; `None` stamps the
     /// current time. Replicated writes pass the originating `source_ts` so a
     /// tag's LWW timestamp tracks the author's write time, not this receiver's
@@ -237,7 +232,6 @@ struct LinksTxCaptured {
     /// Prior target per `Create` op's link (`None` = absent), as read by the
     /// committed attempt.
     prior_targets: Vec<(LinkKind, Option<Digest>)>,
-    had_creates: bool,
     /// `Some(message)` when the attempt's last-writer-wins guard rejected the
     /// write; the attempt committed an empty transaction and the caller maps
     /// this to [`Error::ReplicationSuperseded`].
@@ -306,7 +300,7 @@ impl MetadataStore {
     }
 
     /// Run the retry loop, build the link-update transaction (plus any extras),
-    /// commit it, and perform post-apply cache / directory / namespace cleanup.
+    /// commit it, and perform post-apply cache / directory cleanup.
     ///
     /// All three transactional methods (`update_links`, `store_manifest`,
     /// `delete_manifest`) share this body; they differ only in the `extras`
@@ -762,7 +756,6 @@ impl MetadataStore {
                         written_links,
                         deleted_links,
                         prior_targets,
-                        had_creates,
                         superseded: None,
                     },
                 ))
@@ -792,16 +785,6 @@ impl MetadataStore {
         }
         for link in &result.deleted_links {
             self.cache_invalidate(namespace, link).await;
-        }
-
-        if (extras.force_register_namespace || result.had_creates)
-            && let Err(e) = self.register_namespace(namespace).await
-        {
-            warn!(
-                namespace,
-                error = %e,
-                "Failed to register namespace after engine link transaction"
-            );
         }
 
         Ok(LinksCommit {

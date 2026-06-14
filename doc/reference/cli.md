@@ -89,6 +89,7 @@ The scrub command performs storage maintenance and integrity checks. You must sp
 | `--replication-orphans`   |        | Delete replication jobs (pending and dead-lettered) whose downstream or repository is no longer configured                                       |
 | `--cache-orphans`         |        | Delete cache jobs (pending and dead-lettered) whose repository is no longer configured for pull-through                                          |
 | `--orphan-grants <duration>` |     | Revoke blob-ownership grants older than the duration (e.g. `24h`) that no manifest references, reclaiming the bytes; cleans up blobs a replication push uploaded before its manifest lost last-writer-wins or dead-lettered |
+| `--orphan-namespaces`     | `-n`   | Remove revisions, tags, and in-flight uploads for namespaces not owned by any configured repository, and reclaim their layer/config blob bytes by revoking those blobs' ownership grants when no still-configured namespace shares them. Manifest blob bytes are not reclaimed here; run with `--blobs` in the same pass to reclaim them once the links are gone. Destructive: run with `--dry-run` first. Ignored (deletes nothing) when no repositories are configured, so an emptied config can never wipe the whole registry. |
 
 **Examples:**
 
@@ -119,6 +120,9 @@ angos scrub --replicate --dry-run
 
 # Reconcile every replicated repository with its downstreams
 angos scrub --replicate
+
+# Preview clearing namespaces no longer owned by any configured repository
+angos scrub --orphan-namespaces --dry-run
 
 # Run with verbose logging
 RUST_LOG=info angos scrub -t -m -b -r

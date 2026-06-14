@@ -30,7 +30,6 @@ impl MetadataStore {
             blob_data_delete_if_unreferenced: None,
             blob_index_ops: None,
             caller_holds_blob_data_lock: false,
-            force_register_namespace: true,
             created_at,
             delete_source_ts: None,
         };
@@ -52,7 +51,6 @@ impl MetadataStore {
             blob_data_delete_if_unreferenced: Some(digest),
             blob_index_ops: None,
             caller_holds_blob_data_lock: false,
-            force_register_namespace: false,
             created_at: None,
             delete_source_ts: source_ts,
         };
