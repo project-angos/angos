@@ -84,6 +84,7 @@ pub async fn build_registry(
         .enable_blob_redirect(config.global.resolved_enable_blob_redirect())
         .enable_manifest_redirect(config.global.resolved_enable_manifest_redirect())
         .max_manifest_size_bytes(max_manifest_size_bytes)
+        .validate_manifest_references(!config.global.allow_missing_manifest_references)
         .global_immutable_tags(config.global.immutable_tags)
         .global_immutable_tags_exclusions(config.global.immutable_tags_exclusions.clone())
         .max_concurrent_cache_jobs(config.global.max_concurrent_cache_jobs)

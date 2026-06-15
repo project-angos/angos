@@ -424,6 +424,58 @@ async fn put_manifest_allows_missing_subject_reference() {
     }
 }
 
+/// The live `accept_put_manifest` path honors the registry's
+/// `validate_manifest_references` flag (set from `[global]
+/// allow_missing_manifest_references`): the permissive registry stores an index
+/// whose child manifest is absent (pre-1.2.0 behavior), while the strict
+/// registry rejects the identical push with `MANIFEST_BLOB_UNKNOWN`.
+#[tokio::test]
+async fn accept_put_manifest_honors_reference_validation_flag() {
+    use crate::registry::test_utils::create_test_registry_with;
+
+    let missing_child = fixed_digest();
+    let namespace = Namespace::new("test-repo/ref-validation").unwrap();
+    let (content, media_type) = index_manifest_with_child(&missing_child);
+
+    // Permissive: the missing child reference is accepted.
+    let permissive_case = FSRegistryTestCase::new();
+    let permissive = create_test_registry_with(
+        permissive_case.blob_store(),
+        permissive_case.metadata_store(),
+        false,
+    );
+    permissive
+        .accept_put_manifest(
+            None,
+            None,
+            &namespace,
+            Reference::Tag("latest".to_string()),
+            media_type.clone(),
+            Cursor::new(content.clone()),
+        )
+        .await
+        .expect("permissive registry must accept a missing child manifest reference");
+
+    // Strict: the identical push is rejected before anything is stored.
+    let strict_case = FSRegistryTestCase::new();
+    let strict =
+        create_test_registry_with(strict_case.blob_store(), strict_case.metadata_store(), true);
+    let Err(err) = strict
+        .accept_put_manifest(
+            None,
+            None,
+            &namespace,
+            Reference::Tag("latest".to_string()),
+            media_type,
+            Cursor::new(content),
+        )
+        .await
+    else {
+        panic!("strict registry must reject a missing child manifest reference");
+    };
+    assert!(matches!(err, Error::ManifestBlobUnknown));
+}
+
 #[tokio::test]
 async fn test_get_manifest() {
     for test_case in backends() {

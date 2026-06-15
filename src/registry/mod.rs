@@ -77,6 +77,13 @@ pub struct RegistryConfig {
     pub global_immutable_tags: bool,
     pub global_immutable_tags_exclusions: Vec<RegexPattern>,
     pub max_manifest_size_bytes: usize,
+    /// When `true`, a client manifest push is rejected with
+    /// `MANIFEST_BLOB_UNKNOWN` if any referenced blob or child manifest is not
+    /// present and owned by the target namespace. When `false`, the check is
+    /// skipped (pre-1.2.0 permissive behavior). `subject` references are exempt
+    /// either way. Pull-through cache-fill writes never validate, independent of
+    /// this flag.
+    pub validate_manifest_references: bool,
     /// When set, the registry routes all cache-fill and replication jobs through
     /// this pre-built queue (typically the durable backend wired in `server setup`).
     /// When absent, an engine-backed in-process queue is constructed
@@ -100,6 +107,10 @@ impl Default for RegistryConfig {
             global_immutable_tags: false,
             global_immutable_tags_exclusions: Vec::new(),
             max_manifest_size_bytes: manifest::DEFAULT_MAX_MANIFEST_SIZE_BYTES,
+            // Strict by default at the struct level so test/internal registries
+            // built from `RegistryConfig::default()` keep validating; the server
+            // opts into the permissive production default via `[global]`.
+            validate_manifest_references: true,
             job_queue: None,
             max_concurrent_cache_jobs: DEFAULT_MAX_CONCURRENT_CACHE_JOBS,
             max_concurrent_replication_jobs: DEFAULT_MAX_CONCURRENT_REPLICATION_JOBS,
@@ -138,6 +149,11 @@ impl RegistryConfig {
         self
     }
 
+    pub fn validate_manifest_references(mut self, enabled: bool) -> Self {
+        self.validate_manifest_references = enabled;
+        self
+    }
+
     pub fn job_queue(mut self, queue: Arc<JobStore>) -> Self {
         self.job_queue = Some(queue);
         self
@@ -170,6 +186,7 @@ pub struct Registry {
     global_immutable_tags: bool,
     global_immutable_tags_exclusions: Vec<RegexPattern>,
     max_manifest_size_bytes: usize,
+    validate_manifest_references: bool,
 }
 
 impl fmt::Debug for Registry {
@@ -212,6 +229,7 @@ impl Registry {
             global_immutable_tags: config.global_immutable_tags,
             global_immutable_tags_exclusions: config.global_immutable_tags_exclusions,
             max_manifest_size_bytes: config.max_manifest_size_bytes,
+            validate_manifest_references: config.validate_manifest_references,
         })
     }
 

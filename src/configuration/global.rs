@@ -51,6 +51,18 @@ pub struct GlobalConfig {
     pub immutable_tags: bool,
     #[serde(default)]
     pub immutable_tags_exclusions: Vec<RegexPattern>,
+    /// When `true` (the default), a manifest push is accepted even if some of
+    /// the blobs or child manifests it references are not yet present in or
+    /// owned by the target namespace. This is the pre-1.2.0 behavior.
+    ///
+    /// When `false`, the registry rejects such pushes with
+    /// `MANIFEST_BLOB_UNKNOWN` (stricter, but rejects some valid `docker
+    /// buildx`/`bake` index and attestation pushes whose children are not
+    /// namespace-local at validation time).
+    ///
+    /// `subject` references are always exempt, regardless of this setting.
+    #[serde(default = "default_allow_missing_manifest_references")]
+    pub allow_missing_manifest_references: bool,
     pub authorization_webhook: Option<String>,
     #[serde(default)]
     pub event_webhooks: Vec<String>,
@@ -105,6 +117,10 @@ fn default_update_pull_time() -> bool {
     false
 }
 
+fn default_allow_missing_manifest_references() -> bool {
+    true
+}
+
 impl Default for GlobalConfig {
     fn default() -> Self {
         GlobalConfig {
@@ -120,6 +136,7 @@ impl Default for GlobalConfig {
             retention_policy: RetentionPolicyConfig::default(),
             immutable_tags: false,
             immutable_tags_exclusions: Vec::new(),
+            allow_missing_manifest_references: default_allow_missing_manifest_references(),
             authorization_webhook: None,
             event_webhooks: Vec::new(),
             job_queue: None,
@@ -164,6 +181,10 @@ mod tests {
         assert!(!config.update_pull_time);
         assert!(!config.immutable_tags);
         assert!(config.immutable_tags_exclusions.is_empty());
+        assert!(
+            config.allow_missing_manifest_references,
+            "manifest-reference validation is permissive by default (pre-1.2.0 behavior)"
+        );
         assert!(config.authorization_webhook.is_none());
     }
 
@@ -178,6 +199,7 @@ mod tests {
             update_pull_time = true
             immutable_tags = true
             immutable_tags_exclusions = ["latest", "dev"]
+            allow_missing_manifest_references = false
             authorization_webhook = "my-webhook"
             "#,
         )
@@ -195,6 +217,7 @@ mod tests {
         assert_eq!(config.max_manifest_size, ByteSize::mib(7));
         assert!(config.update_pull_time);
         assert!(config.immutable_tags);
+        assert!(!config.allow_missing_manifest_references);
         assert_eq!(config.immutable_tags_exclusions.len(), 2);
         assert_eq!(config.immutable_tags_exclusions[0].as_source(), "latest");
         assert_eq!(config.immutable_tags_exclusions[1].as_source(), "dev");

@@ -766,7 +766,7 @@ impl Registry {
                 &reference,
                 Some(&mime_type),
                 &request_body,
-                true,
+                self.validate_manifest_references,
                 source_ts,
             )
             .await?;
