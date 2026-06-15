@@ -102,13 +102,13 @@ Get upload status.
 PATCH /v2/{namespace}/blobs/uploads/{uuid}
 ```
 
-Upload a chunk. Use `Content-Range` for the chunk range and `Content-Length` for the exact chunk size. Missing or invalid `Content-Length` returns `400 Bad Request`.
+Upload a chunk. Use `Content-Range` for the chunk range and `Content-Length` for the exact chunk size. A missing `Content-Length` is accepted as a chunked upload streamed to EOF; an invalid `Content-Length` returns `400 Bad Request`.
 
 ```
 PUT /v2/{namespace}/blobs/uploads/{uuid}?digest={digest}
 ```
 
-Complete the upload with final digest. If a final chunk is included, `Content-Length` must contain that chunk size. Without a final chunk, missing `Content-Length` is treated as zero.
+Complete the upload with final digest. A final chunk sent with a `Content-Length` uses that chunk size; a final chunk sent chunked (a body without `Content-Length`) is streamed to EOF. With no body, the upload is treated as zero length.
 
 ```
 DELETE /v2/{namespace}/blobs/uploads/{uuid}

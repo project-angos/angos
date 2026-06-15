@@ -324,21 +324,29 @@ impl ObjectStore for MemoryObjectStore {
         self.put(key, Bytes::new()).await
     }
 
-    async fn write_upload(&self, key: &str, mut body: ByteStream, len: u64) -> Result<u64, Error> {
+    async fn write_upload(
+        &self,
+        key: &str,
+        mut body: ByteStream,
+        len: Option<u64>,
+    ) -> Result<u64, Error> {
         let mut combined = self.get(key).await.unwrap_or_default();
         let current = u64::try_from(combined.len()).map_err(|e| Error::Backend(e.to_string()))?;
-        if len == 0 {
+        if len == Some(0) {
             return Ok(current);
         }
-        let mut buf = BytesMut::with_capacity(usize::try_from(len).unwrap_or(0));
+        let mut buf =
+            BytesMut::with_capacity(len.and_then(|l| usize::try_from(l).ok()).unwrap_or(0));
         while let Some(chunk) = body.next().await {
             let chunk = chunk.map_err(|e| Error::Backend(e.to_string()))?;
             buf.extend_from_slice(&chunk);
         }
         let actual = u64::try_from(buf.len()).map_err(|e| Error::Backend(e.to_string()))?;
-        if actual != len {
+        if let Some(expected) = len
+            && actual != expected
+        {
             return Err(Error::Backend(format!(
-                "memory upload short body: expected {len} bytes, got {actual}",
+                "memory upload short body: expected {expected} bytes, got {actual}",
             )));
         }
         combined.extend_from_slice(&buf);

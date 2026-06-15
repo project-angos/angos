@@ -80,7 +80,7 @@ fn patch_upload_headers(namespace: &Namespace, session_id: &str, range_max: u64)
         .into_inner()
 }
 
-async fn hash_upload_stream<S>(mut stream: S, content_length: u64) -> Result<Digest, Error>
+async fn hash_upload_stream<S>(mut stream: S, content_length: Option<u64>) -> Result<Digest, Error>
 where
     S: AsyncRead + Unpin,
 {
@@ -101,12 +101,14 @@ where
         read = read
             .checked_add(bytes_read_u64)
             .ok_or(blob_store::Error::UploadBodySize {
-                expected: content_length,
+                expected: content_length.unwrap_or(read),
                 actual: u64::MAX,
             })?;
-        if read > content_length {
+        if let Some(expected) = content_length
+            && read > expected
+        {
             return Err(blob_store::Error::UploadBodySize {
-                expected: content_length,
+                expected,
                 actual: read,
             }
             .into());
@@ -115,9 +117,11 @@ where
         hasher.update(&buffer[..bytes_read]);
     }
 
-    if read != content_length {
+    if let Some(expected) = content_length
+        && read != expected
+    {
         return Err(blob_store::Error::UploadBodySize {
-            expected: content_length,
+            expected,
             actual: read,
         }
         .into());
@@ -131,7 +135,7 @@ impl Registry {
         &self,
         namespace: &Namespace,
         digest: &Digest,
-        content_length: u64,
+        content_length: Option<u64>,
         stream: &mut S,
     ) -> Result<bool, Error>
     where
@@ -311,7 +315,7 @@ impl Registry {
         namespace: &Namespace,
         session_id: Uuid,
         start_offset: Option<u64>,
-        content_length: u64,
+        content_length: Option<u64>,
         stream: S,
     ) -> Result<PatchUploadResponse, Error>
     where
@@ -349,7 +353,7 @@ impl Registry {
         namespace: &Namespace,
         session_id: Uuid,
         digest: &Digest,
-        content_length: u64,
+        content_length: Option<u64>,
         stream: S,
     ) -> Result<CompleteUploadResponse, Error>
     where
@@ -573,7 +577,7 @@ mod tests {
             &self,
             key: &str,
             body: ByteStream,
-            len: u64,
+            len: Option<u64>,
         ) -> Result<u64, StorageError> {
             if matches!(self.fail, FailOp::WriteUpload) {
                 return Err(fail(
@@ -1103,7 +1107,13 @@ mod tests {
 
             let stream = Cursor::new(content);
             let response = registry
-                .patch_upload(namespace, session_id, None, content.len() as u64, stream)
+                .patch_upload(
+                    namespace,
+                    session_id,
+                    None,
+                    Some(content.len() as u64),
+                    stream,
+                )
                 .await
                 .unwrap();
             assert_eq!(
@@ -1118,7 +1128,7 @@ mod tests {
                     namespace,
                     session_id,
                     Some(content.len() as u64),
-                    additional_content.len() as u64,
+                    Some(additional_content.len() as u64),
                     stream,
                 )
                 .await
@@ -1141,6 +1151,50 @@ mod tests {
         }
     }
 
+    // A chunked request (`Transfer-Encoding: chunked`, no `Content-Length`) is
+    // authorized with `content_length = None`: the body streams to EOF and the
+    // blob is stored with the digest derived from the bytes actually read. This
+    // is the `docker push` path.
+    #[tokio::test]
+    async fn patch_upload_without_content_length_streams_to_eof() {
+        for test_case in backends() {
+            let registry = test_case.registry();
+            let namespace = &Namespace::new("test-repo").unwrap();
+            let content = b"chunked upload with no declared length";
+            let session_id = Uuid::new_v4();
+
+            registry
+                .blob_store
+                .create_upload(namespace, &session_id.to_string())
+                .await
+                .unwrap();
+
+            registry
+                .patch_upload(namespace, session_id, None, None, Cursor::new(content))
+                .await
+                .expect("a chunked PATCH (no Content-Length) must be accepted");
+
+            let expected_digest = sha256::digest(content);
+            registry
+                .complete_upload(
+                    None,
+                    namespace,
+                    session_id,
+                    &expected_digest,
+                    None,
+                    Cursor::new(Vec::new()),
+                )
+                .await
+                .expect("completing a chunked upload must succeed");
+
+            assert_eq!(
+                registry.blob_store.read(&expected_digest).await.unwrap(),
+                content
+            );
+            test_case.cleanup().await;
+        }
+    }
+
     #[tokio::test]
     async fn test_complete_upload() {
         for test_case in backends() {
@@ -1157,7 +1211,13 @@ mod tests {
 
             let stream = Cursor::new(content);
             registry
-                .patch_upload(namespace, session_id, None, content.len() as u64, stream)
+                .patch_upload(
+                    namespace,
+                    session_id,
+                    None,
+                    Some(content.len() as u64),
+                    stream,
+                )
                 .await
                 .unwrap();
 
@@ -1170,7 +1230,7 @@ mod tests {
                     namespace,
                     session_id,
                     &expected_digest,
-                    0,
+                    Some(0),
                     empty_stream,
                 )
                 .await
@@ -1220,7 +1280,7 @@ mod tests {
                 namespace,
                 session_id,
                 None,
-                content.len() as u64,
+                Some(content.len() as u64),
                 Cursor::new(content),
             )
             .await
@@ -1233,7 +1293,7 @@ mod tests {
                 namespace,
                 session_id,
                 &expected_digest,
-                0,
+                Some(0),
                 Cursor::new(Vec::new()),
             )
             .await
@@ -1280,7 +1340,7 @@ mod tests {
                 second_namespace,
                 session_id,
                 None,
-                content.len() as u64,
+                Some(content.len() as u64),
                 Cursor::new(content),
             )
             .await
@@ -1292,7 +1352,7 @@ mod tests {
                 second_namespace,
                 session_id,
                 &digest,
-                0,
+                Some(0),
                 Cursor::new(Vec::new()),
             )
             .await
@@ -1349,7 +1409,7 @@ mod tests {
                 second_namespace,
                 session_id,
                 &digest,
-                content.len() as u64,
+                Some(content.len() as u64),
                 Cursor::new(content),
             )
             .await
@@ -1428,7 +1488,13 @@ mod tests {
 
             let stream = Cursor::new(content);
             registry
-                .patch_upload(namespace, session_id, None, content.len() as u64, stream)
+                .patch_upload(
+                    namespace,
+                    session_id,
+                    None,
+                    Some(content.len() as u64),
+                    stream,
+                )
                 .await
                 .unwrap();
 
@@ -1459,13 +1525,13 @@ mod tests {
 
             let stream = Cursor::new(b"some data".to_vec());
             registry
-                .patch_upload(namespace, session_id, None, 9, stream)
+                .patch_upload(namespace, session_id, None, Some(9), stream)
                 .await
                 .unwrap();
 
             let stream = Cursor::new(b"more data".to_vec());
             let result = registry
-                .patch_upload(namespace, session_id, Some(0), 9, stream)
+                .patch_upload(namespace, session_id, Some(0), Some(9), stream)
                 .await;
 
             assert!(matches!(result, Err(Error::RangeNotSatisfiable)));
@@ -1488,7 +1554,7 @@ mod tests {
 
             let stream = Cursor::new(b"test content".to_vec());
             registry
-                .patch_upload(namespace, session_id, None, 12, stream)
+                .patch_upload(namespace, session_id, None, Some(12), stream)
                 .await
                 .unwrap();
 
@@ -1499,7 +1565,14 @@ mod tests {
 
             let empty_stream = Cursor::new(Vec::new());
             let result = registry
-                .complete_upload(None, namespace, session_id, &wrong_digest, 0, empty_stream)
+                .complete_upload(
+                    None,
+                    namespace,
+                    session_id,
+                    &wrong_digest,
+                    Some(0),
+                    empty_stream,
+                )
                 .await;
 
             assert!(matches!(result, Err(Error::DigestInvalid)));
@@ -1529,7 +1602,7 @@ mod tests {
                     namespace,
                     &session_id.to_string(),
                     stream,
-                    content.len() as u64,
+                    Some(content.len() as u64),
                 )
                 .await
                 .unwrap();
@@ -1577,7 +1650,7 @@ mod tests {
                     namespace,
                     &session_id.to_string(),
                     stream,
-                    content.len() as u64,
+                    Some(content.len() as u64),
                 )
                 .await
                 .unwrap();
@@ -1608,7 +1681,13 @@ mod tests {
 
         let stream = Cursor::new(content);
         registry
-            .patch_upload(namespace, session_id, None, content.len() as u64, stream)
+            .patch_upload(
+                namespace,
+                session_id,
+                None,
+                Some(content.len() as u64),
+                stream,
+            )
             .await
             .unwrap();
 
@@ -1644,7 +1723,7 @@ mod tests {
                 namespace,
                 session_id,
                 &sha256::digest(content),
-                0,
+                Some(0),
                 empty_stream,
             )
             .await;

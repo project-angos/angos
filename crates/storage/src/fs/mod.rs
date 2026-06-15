@@ -540,16 +540,23 @@ impl ObjectStore for Backend {
         self.put(key, Bytes::new()).await
     }
 
-    async fn write_upload(&self, key: &str, body: ByteStream, len: u64) -> Result<u64, Error> {
+    async fn write_upload(
+        &self,
+        key: &str,
+        body: ByteStream,
+        len: Option<u64>,
+    ) -> Result<u64, Error> {
         let (mut file, current) = self.open_for_append(key).await?;
-        if len == 0 {
+        if len == Some(0) {
             return Ok(current);
         }
         let mut reader = StreamReader::new(body.map_err(io::Error::other));
         let written = tokio::io::copy(&mut reader, &mut file).await?;
-        if written != len {
+        if let Some(expected) = len
+            && written != expected
+        {
             return Err(Error::Backend(format!(
-                "fs upload short body: expected {len} bytes, got {written}",
+                "fs upload short body: expected {expected} bytes, got {written}",
             )));
         }
         file.flush().await?;

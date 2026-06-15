@@ -159,7 +159,12 @@ pub async fn cache_blob_mutations(
         .create_upload(namespace.as_ref(), &session_id)
         .await?;
     blob_store
-        .write_upload(namespace.as_ref(), &session_id, stream, content_length)
+        .write_upload(
+            namespace.as_ref(),
+            &session_id,
+            stream,
+            Some(content_length),
+        )
         .await?;
     let (_, mut mutations) = blob_store
         .finalize_upload_mutations(namespace.as_ref(), &session_id, Some(&digest))

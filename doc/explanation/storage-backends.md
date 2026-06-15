@@ -371,9 +371,9 @@ Configuration:
 multipart_uniform_parts = false  # Default
 ```
 
-Each `PATCH` streams toward S3 with its known `Content-Length` from the HTTP request header, frame-by-frame without buffering the whole chunk. The multipart upload is opened **lazily**: bytes below the 5 MiB S3 minimum are parked at a per-session staging key and combined with the next `PATCH`, so a multipart session is created only once there are enough bytes to flush a part of at least 5 MiB. An upload whose total never reaches 5 MiB skips multipart entirely: `complete` promotes the staged object to the upload key with a single `CopyObject`.
+A `PATCH` that carries a `Content-Length` header streams toward S3 with that known length, frame-by-frame without buffering the whole chunk. A chunked `PATCH` with no `Content-Length` (sent by `docker push`) is streamed to EOF. When `multipart_part_size` is above the 5 MiB floor, it is coalesced server-side into `part_size` parts: each part is assembled in a scratch multipart of 5 MiB sub-parts and grafted into the main upload with `UploadPartCopy`, so at most one 5 MiB sub-part is held in memory and each byte is moved twice within S3. When `multipart_part_size` is exactly 5 MiB, the chunked `PATCH` streams plain 5 MiB parts directly with no coalescing. In all cases the multipart upload is opened **lazily**: bytes below the 5 MiB S3 minimum are parked at a per-session staging key and combined with the next `PATCH`, so a multipart session is created only once there are enough bytes to flush a part of at least 5 MiB. An upload whose total never reaches 5 MiB skips multipart entirely: `complete` promotes the staged object to the upload key with a single `CopyObject`.
 
-**Memory usage:** bytes stream frame-by-frame, so memory is essentially constant regardless of blob size. The only buffered data is the sub-part remainder (< 5 MiB), which is parked in S3 between `PATCH` calls and re-read when the next chunk arrives.
+**Memory usage:** on the known-length path bytes stream frame-by-frame, so memory is essentially constant regardless of blob size; a coalesced chunked `PATCH` (`multipart_part_size` above the 5 MiB floor) buffers at most one 5 MiB sub-part at a time while coalescing into `part_size` parts. The only other buffered data is the sub-part remainder (< 5 MiB), which is parked in S3 between `PATCH` calls and re-read when the next chunk arrives.
 
 ### Uniform Upload Mode
 
@@ -386,14 +386,14 @@ sequenceDiagram
     participant S3
 
     Client->>Registry: PATCH (chunk 1)
-    Note over Registry,S3: stage bytes until ≥ multipart_part_size
+    Note over Registry,S3: non-final parts are multipart_part_size for both known-length and chunked
     Registry->>S3: InitiateMultipartUpload
     S3-->>Registry: Upload ID
-    Registry->>S3: UploadPart (exact multipart_part_size)
+    Registry->>S3: UploadPart (multipart_part_size non-final part)
     S3-->>Registry: Part 1
 
     Client->>Registry: PATCH (chunk 2)
-    Registry->>S3: UploadPart (exact multipart_part_size)
+    Registry->>S3: UploadPart (multipart_part_size non-final part)
     S3-->>Registry: Part 2
 
     Client->>Registry: PUT (complete upload)
@@ -412,9 +412,9 @@ multipart_uniform_parts = true
 multipart_part_size = "50MiB"
 ```
 
-In this mode the multipart upload is opened on the first full part and maintained across the remaining `PATCH` requests. Each non-final part is exactly `multipart_part_size` bytes, and the final part may be smaller.
+In this mode the multipart upload is opened on the first full part and maintained across the remaining `PATCH` requests. Both a known-length `PATCH` and a chunked `PATCH` (no `Content-Length`, as `docker push` sends) commit non-final parts of exactly `multipart_part_size` bytes, so every non-final part in a given upload is `multipart_part_size` regardless of transfer mode, and the final part may be smaller, which is what strict providers require.
 
-**Memory usage:** full parts stream to S3 in small read frames; only the trailing sub-part remainder (smaller than `multipart_part_size`) is staged in S3 between calls.
+**Memory usage:** full parts stream to S3 in small read frames; only the trailing sub-part remainder (smaller than `multipart_part_size`) is staged in S3 between calls. A chunked `PATCH` buffers up to one `multipart_part_size` part, the same as the known-length remainder.
 
 ### Related Configuration
 

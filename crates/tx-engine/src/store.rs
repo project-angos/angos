@@ -370,8 +370,9 @@ impl Store {
         self.object.create_upload(key).await
     }
 
-    /// Append `len` bytes from `body` to the upload at `key`. Returns the new
-    /// total uploaded size.
+    /// Append `body` to the upload at `key`, returning the new total uploaded
+    /// size. `Some(len)` declares an exact byte count (validated); `None`
+    /// streams the body to EOF (a chunked request with no `Content-Length`).
     ///
     /// # Errors
     ///
@@ -380,7 +381,7 @@ impl Store {
         &self,
         key: &str,
         body: ByteStream,
-        len: u64,
+        len: Option<u64>,
     ) -> Result<u64, StorageError> {
         self.object.write_upload(key, body, len).await
     }

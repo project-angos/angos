@@ -122,7 +122,7 @@ async fn upload_blob(registry: &Registry, namespace: &Namespace, content: &[u8])
             namespace,
             session_id,
             &digest,
-            body.len() as u64,
+            Some(body.len() as u64),
             Cursor::new(body),
         )
         .await

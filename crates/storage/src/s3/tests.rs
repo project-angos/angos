@@ -213,16 +213,29 @@ async fn delete_if_match_succeeds_with_current_etag() {
 /// with `staged`. Mirrors the backend's internal derivation so tests can probe
 /// the staged remainder.
 fn staged_key(key: &str, offset: u64) -> String {
-    let container = match key.rfind('/') {
+    format!("{}/{offset}", staged_container(key))
+}
+
+/// Mirrors the backend's scratch key for a chunked, coalesced upload.
+fn scratch_key(key: &str) -> String {
+    format!("{}/coalesce", staged_container(key))
+}
+
+fn staged_container(key: &str) -> String {
+    match key.rfind('/') {
         Some(idx) => format!("{}/staged", &key[..idx]),
         None => "staged".to_string(),
-    };
-    format!("{container}/{offset}")
+    }
 }
 
 /// Number of committed parts for the in-flight multipart upload at `key`, or 0
 /// when no multipart upload is open.
 async fn committed_part_count(store: &Backend, key: &str) -> usize {
+    committed_part_sizes(store, key).await.len()
+}
+
+/// Sizes of the committed parts of the open multipart at `key`, in order.
+async fn committed_part_sizes(store: &Backend, key: &str) -> Vec<u64> {
     let (uploads, _, _) = store
         .client
         .list_multipart_uploads(Some(key), None, None)
@@ -234,8 +247,10 @@ async fn committed_part_count(store: &Backend, key: &str) -> usize {
             .list_parts(key, &u.upload_id)
             .await
             .unwrap()
-            .len(),
-        None => 0,
+            .iter()
+            .map(|p| p.size)
+            .collect(),
+        None => Vec::new(),
     }
 }
 
@@ -266,7 +281,7 @@ async fn upload_uniform_round_trip() {
     for chunk in &chunks {
         let len = chunk.len() as u64;
         total = store
-            .write_upload(&key, frame(chunk.clone()), len)
+            .write_upload(&key, frame(chunk.clone()), Some(len))
             .await
             .unwrap();
     }
@@ -282,6 +297,408 @@ async fn upload_uniform_round_trip() {
     assert_eq!(assembled, expected);
 }
 
+/// Unknown-length upload (`None`): a chunked request with no `Content-Length`
+/// streams the body to EOF, flushing whole parts and restaging the trailing
+/// remainder. This is the `docker push` code path.
+#[tokio::test]
+async fn upload_unknown_length_streams_to_eof() {
+    let store = backend_with(true, 5 * 1024 * 1024);
+    let key = format!("up/chunked/{}/data", Uuid::new_v4());
+    // 13 MiB: two full 5 MiB parts plus a 3 MiB remainder.
+    let data: Vec<u8> = (0..13 * 1024 * 1024u32).map(|i| (i % 251) as u8).collect();
+
+    store.create_upload(&key).await.unwrap();
+    let total = store
+        .write_upload(&key, frame(data.clone()), None)
+        .await
+        .unwrap();
+    assert_eq!(total, data.len() as u64);
+    assert_eq!(
+        committed_part_count(&store, &key).await,
+        2,
+        "two full 5 MiB parts must flush; the 3 MiB remainder stays staged"
+    );
+    store.complete_upload(&key).await.unwrap();
+    assert_eq!(store.get(&key).await.unwrap(), data);
+}
+
+/// Chunked (`None`) uploads cap their parts at 5 MiB even when the backend is
+/// configured with a larger `part_size`, bounding the in-process buffer.
+#[tokio::test]
+async fn upload_unknown_length_coalesces_to_part_size() {
+    // part_size above the 5 MiB floor: the chunked path coalesces server-side
+    // into part_size parts instead of emitting 5 MiB parts, honoring the
+    // configured size while buffering at most one 5 MiB sub-part in memory.
+    const PART: u64 = 10 * 1024 * 1024;
+    let store = backend_with(false, PART);
+    let key = format!("up/chunked-coalesce/{}/data", Uuid::new_v4());
+    // 20 MiB = exactly two 10 MiB parts, no remainder.
+    let data: Vec<u8> = (0..20 * 1024 * 1024u32).map(|i| (i % 251) as u8).collect();
+
+    store.create_upload(&key).await.unwrap();
+    let total = store
+        .write_upload(&key, frame(data.clone()), None)
+        .await
+        .unwrap();
+    assert_eq!(total, data.len() as u64);
+    assert_eq!(
+        committed_part_sizes(&store, &key).await,
+        vec![PART, PART],
+        "chunked uploads coalesce into part_size parts, not 5 MiB parts"
+    );
+    store.complete_upload(&key).await.unwrap();
+    assert_eq!(store.get(&key).await.unwrap(), data);
+}
+
+/// A `part_size` that is not a 5 MiB multiple is still honored exactly: the
+/// coalescer caps the final sub-part so each part seals on `part_size` rather
+/// than overshooting to the next 5 MiB boundary.
+#[tokio::test]
+async fn upload_unknown_length_coalesces_to_non_multiple_part_size() {
+    const PART: u64 = 12 * 1024 * 1024;
+    let store = backend_with(false, PART);
+    let key = format!("up/chunked-coalesce-nonmult/{}/data", Uuid::new_v4());
+    // 24 MiB = exactly two 12 MiB parts (each = 5 + 5 + 2 MiB sub-parts).
+    let data: Vec<u8> = (0..24 * 1024 * 1024u32).map(|i| (i % 251) as u8).collect();
+
+    store.create_upload(&key).await.unwrap();
+    let total = store
+        .write_upload(&key, frame(data.clone()), None)
+        .await
+        .unwrap();
+    assert_eq!(total, data.len() as u64);
+    assert_eq!(
+        committed_part_sizes(&store, &key).await,
+        vec![PART, PART],
+        "parts must be exactly part_size (12 MiB), not rounded up to 15 MiB"
+    );
+    store.complete_upload(&key).await.unwrap();
+    assert_eq!(store.get(&key).await.unwrap(), data);
+}
+
+/// Uniform mode never runs the coalescer: a chunked (`None`) push with a
+/// configured `part_size` above the 5 MiB floor takes the direct streaming
+/// path, emitting uniform `part_size` non-final parts (matching the
+/// known-length uniform path) rather than 5 MiB parts or the coalescer's
+/// variable parts.
+#[tokio::test]
+async fn upload_unknown_length_uniform_uses_equal_parts() {
+    const PART: u64 = 10 * 1024 * 1024;
+    let store = backend_with(true, PART);
+    let key = format!("up/chunked-uniform/{}/data", Uuid::new_v4());
+    // 23 MiB: two full 10 MiB parts plus a 3 MiB remainder. Two non-final
+    // parts prove uniformity rather than a single part trivially equal to
+    // itself.
+    let data: Vec<u8> = (0..23 * 1024 * 1024u32).map(|i| (i % 251) as u8).collect();
+
+    store.create_upload(&key).await.unwrap();
+    let total = store
+        .write_upload(&key, frame(data.clone()), None)
+        .await
+        .unwrap();
+    assert_eq!(total, data.len() as u64);
+
+    let sizes = committed_part_sizes(&store, &key).await;
+    assert!(
+        sizes.iter().all(|&s| s == PART),
+        "uniform mode must emit equal part_size parts via the direct path, got {sizes:?}"
+    );
+    assert_eq!(
+        sizes,
+        vec![PART, PART],
+        "each non-final part is part_size (10 MiB), not 5 MiB or a coalescer size"
+    );
+
+    store.complete_upload(&key).await.unwrap();
+    assert_eq!(store.get(&key).await.unwrap(), data);
+}
+
+/// Regression for the mixed-mode bug: a uniform session that takes a
+/// known-length PATCH (`Some`) followed by a chunked PATCH (`None`) on the same
+/// key must stay uniform. The chunked direct path now flushes `part_size`
+/// parts, so every non-final committed part is `part_size` and the assembled
+/// object is the concatenation of both writes.
+#[tokio::test]
+async fn upload_uniform_mixed_known_then_chunked_stays_uniform() {
+    const PART: u64 = 10 * 1024 * 1024;
+    let store = backend_with(true, PART);
+    let key = format!("up/uniform-mixed/{}/data", Uuid::new_v4());
+    // First a known-length part_size body, then a chunked body large enough to
+    // flush two more parts plus a remainder.
+    let first: Vec<u8> = (0..PART as u32).map(|i| (i % 251) as u8).collect();
+    let second: Vec<u8> = (0..23 * 1024 * 1024u32).map(|i| (i % 241) as u8).collect();
+
+    store.create_upload(&key).await.unwrap();
+    let first_len = first.len() as u64;
+    store
+        .write_upload(&key, frame(first.clone()), Some(first_len))
+        .await
+        .unwrap();
+    let total = store
+        .write_upload(&key, frame(second.clone()), None)
+        .await
+        .unwrap();
+    assert_eq!(total, (first.len() + second.len()) as u64);
+
+    let sizes = committed_part_sizes(&store, &key).await;
+    assert!(
+        sizes.iter().all(|&s| s == PART),
+        "mixing a known-length and a chunked PATCH must keep all non-final parts at part_size, got {sizes:?}"
+    );
+
+    store.complete_upload(&key).await.unwrap();
+    let mut expected = first;
+    expected.extend_from_slice(&second);
+    assert_eq!(store.get(&key).await.unwrap(), expected);
+}
+
+/// Non-uniform cross-mode resume: a known-length PATCH (`Some`) followed by a
+/// chunked PATCH (`None`) on the same key (the coalescer path for a `part_size`
+/// above the floor) must round-trip byte-for-byte after complete.
+#[tokio::test]
+async fn upload_nonuniform_known_then_chunked_round_trips() {
+    const PART: u64 = 10 * 1024 * 1024;
+    let store = backend_with(false, PART);
+    let key = format!("up/nonuniform-cross/{}/data", Uuid::new_v4());
+    let first: Vec<u8> = (0..7 * 1024 * 1024u32).map(|i| (i % 251) as u8).collect();
+    let second: Vec<u8> = (0..13 * 1024 * 1024u32).map(|i| (i % 241) as u8).collect();
+
+    store.create_upload(&key).await.unwrap();
+    let first_len = first.len() as u64;
+    store
+        .write_upload(&key, frame(first.clone()), Some(first_len))
+        .await
+        .unwrap();
+    let total = store
+        .write_upload(&key, frame(second.clone()), None)
+        .await
+        .unwrap();
+    assert_eq!(total, (first.len() + second.len()) as u64);
+
+    store.complete_upload(&key).await.unwrap();
+    let mut expected = first;
+    expected.extend_from_slice(&second);
+    assert_eq!(store.get(&key).await.unwrap(), expected);
+}
+
+/// An empty chunked body (`None`) on the coalescer path appends nothing: it
+/// returns the committed size unchanged, opens neither a main nor a scratch
+/// multipart, and `complete_upload` round-trips an empty object.
+#[tokio::test]
+async fn upload_unknown_length_empty_body_coalesce_path() {
+    const PART: u64 = 10 * 1024 * 1024;
+    let store = backend_with(false, PART);
+    let key = format!("up/chunked-empty-coalesce/{}/data", Uuid::new_v4());
+
+    store.create_upload(&key).await.unwrap();
+    let total = store
+        .write_upload(&key, frame(Vec::new()), None)
+        .await
+        .unwrap();
+    assert_eq!(total, 0, "an empty chunked body appends nothing");
+    assert!(
+        !has_open_multipart(&store, &key).await,
+        "an empty body must not open a main multipart upload"
+    );
+    assert!(
+        !has_open_multipart(&store, &scratch_key(&key)).await,
+        "an empty body must not open a scratch multipart upload"
+    );
+
+    store.complete_upload(&key).await.unwrap();
+    assert_eq!(store.get(&key).await.unwrap(), b"");
+}
+
+/// An empty chunked body (`None`) on the direct path (`part_size` at the floor)
+/// behaves identically: committed size unchanged, no multipart opened, empty
+/// object after complete.
+#[tokio::test]
+async fn upload_unknown_length_empty_body_direct_path() {
+    let store = backend_with(false, 5 * 1024 * 1024);
+    let key = format!("up/chunked-empty-direct/{}/data", Uuid::new_v4());
+
+    store.create_upload(&key).await.unwrap();
+    let total = store
+        .write_upload(&key, frame(Vec::new()), None)
+        .await
+        .unwrap();
+    assert_eq!(total, 0, "an empty chunked body appends nothing");
+    assert!(
+        !has_open_multipart(&store, &key).await,
+        "an empty body must not open a main multipart upload"
+    );
+    assert!(
+        !has_open_multipart(&store, &scratch_key(&key)).await,
+        "an empty body must not open a scratch multipart upload"
+    );
+
+    store.complete_upload(&key).await.unwrap();
+    assert_eq!(store.get(&key).await.unwrap(), b"");
+}
+
+/// Self-healing scratch: a coalesced chunked write must reclaim a leftover
+/// scratch from a crashed prior call, both an open scratch multipart and a
+/// sealed scratch object, then complete with no orphan scratch multipart left.
+#[tokio::test]
+async fn upload_unknown_length_coalesce_self_heals_leftover_scratch() {
+    const PART: u64 = 10 * 1024 * 1024;
+    let store = backend_with(false, PART);
+    let key = format!("up/chunked-scratch-heal/{}/data", Uuid::new_v4());
+
+    store.create_upload(&key).await.unwrap();
+    // Pre-seed both leftover scratch shapes a crash could leave behind.
+    store
+        .client
+        .create_multipart_upload(&scratch_key(&key))
+        .await
+        .unwrap();
+    store
+        .client
+        .put_object(
+            &scratch_key(&key),
+            Bytes::from_static(b"stale scratch object"),
+        )
+        .await
+        .unwrap();
+
+    // 13 MiB drives the coalescer to flush a part and stage a tail.
+    let data: Vec<u8> = (0..13 * 1024 * 1024u32).map(|i| (i % 251) as u8).collect();
+    let total = store
+        .write_upload(&key, frame(data.clone()), None)
+        .await
+        .unwrap();
+    assert_eq!(total, data.len() as u64);
+
+    store.complete_upload(&key).await.unwrap();
+    assert_eq!(store.get(&key).await.unwrap(), data);
+    assert!(
+        !has_open_multipart(&store, &scratch_key(&key)).await,
+        "no orphan scratch multipart may remain after complete"
+    );
+}
+
+/// Bounded-memory chunked write: a coalesced body well above `part_size` must
+/// still seal exact `part_size` parts. The coalescer holds at most one 5 MiB
+/// sub-part in memory regardless of body size; this uses a moderately large
+/// materialized body since the test helpers build streams from a `Vec`.
+#[tokio::test]
+async fn upload_unknown_length_coalesce_bounded_memory_large_body() {
+    const PART: u64 = 10 * 1024 * 1024;
+    let store = backend_with(false, PART);
+    let key = format!("up/chunked-coalesce-large/{}/data", Uuid::new_v4());
+    // 35 MiB = three 10 MiB parts plus a 5 MiB tail (which seals as a 5 MiB
+    // part too, leaving nothing staged).
+    let data: Vec<u8> = (0..35 * 1024 * 1024u32).map(|i| (i % 251) as u8).collect();
+
+    store.create_upload(&key).await.unwrap();
+    let total = store
+        .write_upload(&key, frame(data.clone()), None)
+        .await
+        .unwrap();
+    assert_eq!(total, data.len() as u64);
+
+    let sizes = committed_part_sizes(&store, &key).await;
+    assert!(
+        sizes.iter().take(3).all(|&s| s == PART),
+        "the first three parts must each be exactly part_size, got {sizes:?}"
+    );
+
+    store.complete_upload(&key).await.unwrap();
+    assert_eq!(store.get(&key).await.unwrap(), data);
+}
+
+/// A chunked (`None`) body that is entirely below the 5 MiB floor with a
+/// `part_size` above it must short-circuit the scratch multipart and stage the
+/// bytes directly, still round-tripping byte-for-byte.
+#[tokio::test]
+async fn upload_unknown_length_small_chunked_body_round_trips() {
+    const PART: u64 = 10 * 1024 * 1024;
+    let store = backend_with(false, PART);
+    let key = format!("up/chunked-small/{}/data", Uuid::new_v4());
+    // 1 MiB: well below the 5 MiB floor, so nothing can flush as a part.
+    let data: Vec<u8> = (0..1024 * 1024u32).map(|i| (i % 251) as u8).collect();
+
+    store.create_upload(&key).await.unwrap();
+    let total = store
+        .write_upload(&key, frame(data.clone()), None)
+        .await
+        .unwrap();
+    assert_eq!(total, data.len() as u64);
+    assert!(
+        !has_open_multipart(&store, &key).await,
+        "a sub-floor chunked body must not open a main multipart upload"
+    );
+    assert!(
+        !has_open_multipart(&store, &scratch_key(&key)).await,
+        "the short-circuit must not open a scratch multipart upload"
+    );
+    assert_eq!(
+        store
+            .client
+            .object_size(&staged_key(&key, 0))
+            .await
+            .unwrap(),
+        data.len() as u64,
+        "the body must be staged directly at the committed offset"
+    );
+
+    store.complete_upload(&key).await.unwrap();
+    assert_eq!(store.get(&key).await.unwrap(), data);
+}
+
+/// Coalesced chunked uploads resume across writes: a sub-floor trailing piece
+/// is staged and folded into the next `part_size` part of the following write.
+#[tokio::test]
+async fn upload_unknown_length_coalesce_resumes_across_writes() {
+    const PART: u64 = 10 * 1024 * 1024;
+    let store = backend_with(false, PART);
+    let key = format!("up/chunked-coalesce-resume/{}/data", Uuid::new_v4());
+    let first: Vec<u8> = (0..13 * 1024 * 1024u32).map(|i| (i % 251) as u8).collect(); // 1 part + 3 MiB tail
+    let second: Vec<u8> = (0..10 * 1024 * 1024u32).map(|i| (i % 241) as u8).collect();
+
+    store.create_upload(&key).await.unwrap();
+    store
+        .write_upload(&key, frame(first.clone()), None)
+        .await
+        .unwrap();
+    let total = store
+        .write_upload(&key, frame(second.clone()), None)
+        .await
+        .unwrap();
+    assert_eq!(total, (first.len() + second.len()) as u64);
+    store.complete_upload(&key).await.unwrap();
+
+    let mut expected = first.clone();
+    expected.extend_from_slice(&second);
+    assert_eq!(store.get(&key).await.unwrap(), expected);
+}
+
+/// Two unknown-length writes (multiple chunked PATCH calls) resume across the
+/// staged remainder and assemble in order.
+#[tokio::test]
+async fn upload_unknown_length_resumes_across_writes() {
+    let store = backend_with(true, 5 * 1024 * 1024);
+    let key = format!("up/chunked-resume/{}/data", Uuid::new_v4());
+    let first: Vec<u8> = vec![0x41; 7 * 1024 * 1024]; // 1 part + 2 MiB staged
+    let second: Vec<u8> = vec![0x42; 6 * 1024 * 1024]; // combined 8 MiB staged -> 1 part + 3 MiB
+
+    store.create_upload(&key).await.unwrap();
+    store
+        .write_upload(&key, frame(first.clone()), None)
+        .await
+        .unwrap();
+    let total = store
+        .write_upload(&key, frame(second.clone()), None)
+        .await
+        .unwrap();
+    assert_eq!(total, (first.len() + second.len()) as u64);
+    store.complete_upload(&key).await.unwrap();
+
+    let mut expected = first.clone();
+    expected.extend_from_slice(&second);
+    assert_eq!(store.get(&key).await.unwrap(), expected);
+}
+
 /// Non-uniform mode: a single big write emits one part of the full size.
 #[tokio::test]
 async fn upload_nonuniform_single_part() {
@@ -292,7 +709,7 @@ async fn upload_nonuniform_single_part() {
     store.create_upload(&key).await.unwrap();
     let len = data.len() as u64;
     store
-        .write_upload(&key, frame(data.clone()), len)
+        .write_upload(&key, frame(data.clone()), Some(len))
         .await
         .unwrap();
     store.complete_upload(&key).await.unwrap();
@@ -316,7 +733,7 @@ async fn upload_nonuniform_flushes_at_configured_part_size_not_min() {
     store.create_upload(&key).await.unwrap();
     let first_len = first.len() as u64;
     let total = store
-        .write_upload(&key, frame(first.clone()), first_len)
+        .write_upload(&key, frame(first.clone()), Some(first_len))
         .await
         .unwrap();
     assert_eq!(
@@ -348,7 +765,7 @@ async fn upload_nonuniform_flushes_at_configured_part_size_not_min() {
     let second: Vec<u8> = (0..3 * 1024 * 1024u32).map(|i| (i % 251) as u8).collect();
     let second_len = second.len() as u64;
     store
-        .write_upload(&key, frame(second.clone()), second_len)
+        .write_upload(&key, frame(second.clone()), Some(second_len))
         .await
         .unwrap();
 
@@ -381,7 +798,7 @@ async fn upload_nonuniform_default_still_flushes_at_5_mib() {
     store.create_upload(&key).await.unwrap();
     let len = data.len() as u64;
     store
-        .write_upload(&key, frame(data.clone()), len)
+        .write_upload(&key, frame(data.clone()), Some(len))
         .await
         .unwrap();
 
@@ -421,7 +838,7 @@ async fn upload_small_upload_takes_singleshot_path() {
     let key = format!("up/small/{}/data", Uuid::new_v4());
     store.create_upload(&key).await.unwrap();
     store
-        .write_upload(&key, frame(b"hello".to_vec()), 5)
+        .write_upload(&key, frame(b"hello".to_vec()), Some(5))
         .await
         .unwrap();
     assert!(
@@ -451,14 +868,14 @@ async fn upload_resumes_from_recovered_state() {
     store.create_upload(&key).await.unwrap();
     let head = vec![0x55; 6 * 1024 * 1024];
     store
-        .write_upload(&key, frame(head.clone()), head.len() as u64)
+        .write_upload(&key, frame(head.clone()), Some(head.len() as u64))
         .await
         .unwrap();
 
     // No handle is threaded; the next call recovers state from S3 by key.
     let tail = vec![0x66; 512 * 1024];
     let total = store
-        .write_upload(&key, frame(tail.clone()), tail.len() as u64)
+        .write_upload(&key, frame(tail.clone()), Some(tail.len() as u64))
         .await
         .unwrap();
     assert_eq!(total, (head.len() + tail.len()) as u64);
@@ -477,10 +894,16 @@ async fn upload_abort_removes_orphans_and_staged() {
     let prefix = format!("up/abort/{}", Uuid::new_v4());
     let key = format!("{prefix}/data");
 
-    // Manually start two multipart uploads at the same key, and stage a
-    // remainder, so we have something to clean up.
+    // Manually start two multipart uploads at the same key, an interrupted
+    // chunked-coalesce scratch multipart, and stage a remainder, so we have
+    // every orphan kind to clean up.
     store.client.create_multipart_upload(&key).await.unwrap();
     store.client.create_multipart_upload(&key).await.unwrap();
+    store
+        .client
+        .create_multipart_upload(&scratch_key(&key))
+        .await
+        .unwrap();
     store
         .client
         .put_object(&staged_key(&key, 0), Bytes::from_static(b"leftover"))
@@ -495,6 +918,15 @@ async fn upload_abort_removes_orphans_and_staged() {
         .await
         .unwrap();
     assert!(remaining.iter().all(|u| u.key != key));
+    let (scratch_remaining, _, _) = store
+        .client
+        .list_multipart_uploads(Some(&scratch_key(&key)), None, None)
+        .await
+        .unwrap();
+    assert!(
+        scratch_remaining.iter().all(|u| u.key != scratch_key(&key)),
+        "abort must also clean the chunked-coalesce scratch multipart"
+    );
     assert_eq!(
         store
             .client

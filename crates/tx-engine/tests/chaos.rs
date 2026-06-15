@@ -144,7 +144,7 @@ impl ObjectStore for CrashingStore {
         &self,
         key: &str,
         body: ByteStream,
-        len: u64,
+        len: Option<u64>,
     ) -> Result<u64, StorageError> {
         self.inner.write_upload(key, body, len).await
     }

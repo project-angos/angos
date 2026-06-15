@@ -66,14 +66,15 @@ pub struct FinalHashState {
 
 /// Drive a [`HashingReader`] in a background task, surfacing its bytes as a
 /// [`ByteStream`] for the storage backend to consume and resolving to the
-/// final hasher state via the returned join handle once exactly
-/// `content_length` bytes have been read.
+/// final hasher state via the returned join handle once the body is drained.
 ///
-/// Bytes are framed in 1 MiB chunks shipped over an mpsc channel; the body
-/// never sits whole in memory regardless of `content_length`.
+/// `Some(len)` reads exactly `len` bytes and errors on a short body; `None`
+/// reads to EOF (a chunked request with no `Content-Length`). Bytes are framed
+/// in 1 MiB chunks shipped over an mpsc channel; the body never sits whole in
+/// memory.
 pub fn hashing_stream<R>(
     reader: HashingReader<R>,
-    content_length: u64,
+    content_length: Option<u64>,
 ) -> (ByteStream, JoinHandle<Result<FinalHashState, Error>>)
 where
     R: AsyncRead + Unpin + Send + 'static,
@@ -83,8 +84,10 @@ where
         let mut reader = reader;
         let mut sent: u64 = 0;
         let mut buf = BytesMut::with_capacity(READ_FRAME_SIZE);
-        while sent < content_length {
-            let want = (content_length - sent).min(READ_FRAME_SIZE as u64);
+        while content_length.is_none_or(|expected| sent < expected) {
+            let want = content_length.map_or(READ_FRAME_SIZE as u64, |expected| {
+                (expected - sent).min(READ_FRAME_SIZE as u64)
+            });
             buf.clear();
             let n = {
                 let mut limited = (&mut reader).take(want);
@@ -92,18 +95,19 @@ where
             };
             match n {
                 Ok(0) => {
-                    let _ = tx
-                        .send(Err(io::Error::new(
-                            io::ErrorKind::UnexpectedEof,
-                            format!(
-                                "short upload body: expected {content_length} bytes, got {sent}"
-                            ),
-                        )))
-                        .await;
-                    return Err(Error::UploadBodySize {
-                        expected: content_length,
-                        actual: sent,
-                    });
+                    if let Some(expected) = content_length {
+                        let _ = tx
+                            .send(Err(io::Error::new(
+                                io::ErrorKind::UnexpectedEof,
+                                format!("short upload body: expected {expected} bytes, got {sent}"),
+                            )))
+                            .await;
+                        return Err(Error::UploadBodySize {
+                            expected,
+                            actual: sent,
+                        });
+                    }
+                    break;
                 }
                 Ok(n) => {
                     sent = sent

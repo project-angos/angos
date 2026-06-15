@@ -18,7 +18,7 @@ pub async fn test_datastore_list_uploads(store: &BlobStore) {
         let content = format!("Content for upload {id}").into_bytes();
         let len = content.len() as u64;
         store
-            .write_upload(namespace, id, Box::new(Cursor::new(content)), len)
+            .write_upload(namespace, id, Box::new(Cursor::new(content)), Some(len))
             .await
             .unwrap();
     }
@@ -76,7 +76,7 @@ async fn seed_blob(store: &BlobStore, content: &[u8]) -> Digest {
             namespace.as_ref(),
             &uuid,
             Box::new(Cursor::new(content.to_vec())),
-            len,
+            Some(len),
         )
         .await
         .unwrap();
@@ -186,7 +186,7 @@ pub async fn test_datastore_upload_operations(store: &BlobStore) {
             namespace,
             &uuid,
             Box::new(Cursor::new(test_content.to_vec())),
-            test_content.len() as u64,
+            Some(test_content.len() as u64),
         )
         .await
         .unwrap();

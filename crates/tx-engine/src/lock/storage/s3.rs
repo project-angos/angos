@@ -646,7 +646,7 @@ mod tests {
             &self,
             _key: &str,
             _body: ByteStream,
-            _len: u64,
+            _len: Option<u64>,
         ) -> Result<u64, StorageError> {
             unimplemented!("not used by S3LockStorage")
         }

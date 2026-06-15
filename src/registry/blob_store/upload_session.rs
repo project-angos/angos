@@ -30,10 +30,15 @@
 //! 2. A single engine `Transaction` atomically moves the assembled object to
 //!    its canonical blob path and deletes the per-file session artifacts.
 
-use bytes::Bytes;
+use std::io::Cursor;
+
+use bytes::{Bytes, BytesMut};
 use chrono::{DateTime, Utc};
 use sha2::{Digest as _, Sha256};
-use tokio::{io::AsyncRead, try_join};
+use tokio::{
+    io::{AsyncRead, AsyncReadExt as _},
+    try_join,
+};
 use tracing::instrument;
 
 use angos_tx_engine::{
@@ -56,6 +61,10 @@ use crate::{
 /// Hash algorithm under which the serialised hasher state is checkpointed
 /// (`hashstates/<HASH_ALGORITHM>/<offset>`).
 const HASH_ALGORITHM: &str = "sha256";
+
+/// Bytes peeked from a chunked (`None`) body to tell an empty finalize from one
+/// carrying data, before deciding whether to short-circuit or stream.
+const PEEK_FRAME_SIZE: usize = 8 * 1024;
 
 /// In-memory reconstruction of an upload's progress, assembled from the
 /// per-file artifacts under the upload container. The `session_id` equals the
@@ -256,15 +265,36 @@ impl BlobStore {
         &self,
         namespace: &str,
         uuid: &str,
-        stream: Box<dyn AsyncRead + Unpin + Send + Sync>,
-        content_length: u64,
+        mut stream: Box<dyn AsyncRead + Unpin + Send + Sync>,
+        content_length: Option<u64>,
     ) -> Result<(Digest, u64), Error> {
         let mut record = self.read_session(namespace, uuid).await?;
 
-        if content_length == 0 {
+        if content_length == Some(0) {
             let digest = Sha256::from_state(&record.hash_context)?.digest();
             return Ok((digest, record.uploaded_size));
         }
+
+        // A chunked finalize (`None`) with an empty body must short-circuit like
+        // the `Some(0)` branch instead of doing a backend round-trip for zero
+        // bytes. Peek one frame: on immediate EOF return the resumed digest; on
+        // data, chain the peeked bytes back ahead of the remaining stream so the
+        // hashing reader sees the full body (mirrors the backend's staged-remainder
+        // chaining).
+        let stream: Box<dyn AsyncRead + Unpin + Send + Sync> = if content_length.is_none() {
+            let mut peek = BytesMut::with_capacity(PEEK_FRAME_SIZE);
+            stream
+                .read_buf(&mut peek)
+                .await
+                .map_err(|e| Error::StorageBackend(e.to_string()))?;
+            if peek.is_empty() {
+                let digest = Sha256::from_state(&record.hash_context)?.digest();
+                return Ok((digest, record.uploaded_size));
+            }
+            Box::new(Cursor::new(peek.freeze()).chain(stream))
+        } else {
+            stream
+        };
 
         let hasher = Sha256::from_state(&record.hash_context)?;
         let hashing_reader = HashingReader::with_hasher(stream, hasher);

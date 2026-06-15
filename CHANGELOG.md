@@ -28,6 +28,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - A blob-upload `POST` with a malformed `?digest=`, `?mount=`, or `?from=` now returns `400` instead of silently starting an upload session that ignores the value.
 - The `_catalog` listing is derived directly from stored content (deterministic and strongly consistent); the maintained namespace-registry index is removed and its now-unused `_registry/` objects are pruned by `scrub`.
 
+### Fixed
+
+- Blob upload requests with chunked transfer-encoding (no `Content-Length`), which `docker push` sends, are streamed to EOF: a chunked `PATCH` is no longer rejected with `400 Bad Request` and a chunked `PUT` body is no longer treated as zero length.
+
 ## 1.2.0 - 2026-06-03
 
 ### Added

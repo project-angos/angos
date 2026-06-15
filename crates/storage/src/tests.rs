@@ -264,13 +264,13 @@ async fn upload_round_trip_creates_object_at_key() {
     store.create_upload("blob").await.unwrap();
     assert_eq!(
         store
-            .write_upload("blob", one_frame(b"hello "), 6)
+            .write_upload("blob", one_frame(b"hello "), Some(6))
             .await
             .unwrap(),
         6
     );
     let total = store
-        .write_upload("blob", one_frame(b"world"), 5)
+        .write_upload("blob", one_frame(b"world"), Some(5))
         .await
         .unwrap();
     assert_eq!(total, 11);
@@ -285,12 +285,12 @@ async fn upload_resumes_across_independent_calls() {
     let store: Arc<dyn ObjectStore> = backend();
     store.create_upload("blob").await.unwrap();
     store
-        .write_upload("blob", one_frame(b"hello "), 6)
+        .write_upload("blob", one_frame(b"hello "), Some(6))
         .await
         .unwrap();
 
     let total = store
-        .write_upload("blob", one_frame(b"world"), 5)
+        .write_upload("blob", one_frame(b"world"), Some(5))
         .await
         .unwrap();
     assert_eq!(total, 11);
@@ -303,7 +303,7 @@ async fn upload_abort_leaves_no_object() {
     let store: Arc<dyn ObjectStore> = backend();
     store.create_upload("blob").await.unwrap();
     store
-        .write_upload("blob", one_frame(b"partial"), 7)
+        .write_upload("blob", one_frame(b"partial"), Some(7))
         .await
         .unwrap();
     store.abort_upload("blob").await.unwrap();
@@ -316,4 +316,49 @@ async fn upload_complete_with_no_writes_creates_empty_object() {
     store.create_upload("blob").await.unwrap();
     store.complete_upload("blob").await.unwrap();
     assert_eq!(store.get("blob").await.unwrap(), b"");
+}
+
+#[tokio::test]
+async fn chunked_writes_resume_and_assemble_in_order() {
+    // `None` streams the body to EOF (chunked transfer-encoding with no
+    // declared length). Successive chunked writes append, with the running
+    // total growing by each frame's actual size.
+    let store: Arc<dyn ObjectStore> = backend();
+    store.create_upload("blob").await.unwrap();
+
+    let total = store
+        .write_upload("blob", one_frame(b"hello "), None)
+        .await
+        .unwrap();
+    assert_eq!(total, 6);
+
+    let total = store
+        .write_upload("blob", one_frame(b"world"), None)
+        .await
+        .unwrap();
+    assert_eq!(total, 11);
+
+    store.complete_upload("blob").await.unwrap();
+    assert_eq!(store.get("blob").await.unwrap(), b"hello world");
+}
+
+#[tokio::test]
+async fn chunked_empty_write_returns_committed_size() {
+    // An empty chunked frame appends nothing, so it returns the size already
+    // committed by the prior write and the object still round-trips.
+    let store: Arc<dyn ObjectStore> = backend();
+    store.create_upload("blob").await.unwrap();
+    store
+        .write_upload("blob", one_frame(b"data"), None)
+        .await
+        .unwrap();
+
+    let total = store
+        .write_upload("blob", one_frame(b""), None)
+        .await
+        .unwrap();
+    assert_eq!(total, 4);
+
+    store.complete_upload("blob").await.unwrap();
+    assert_eq!(store.get("blob").await.unwrap(), b"data");
 }
