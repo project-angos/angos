@@ -133,8 +133,10 @@ Push a manifest. Manifest bodies larger than `global.max_manifest_size` are reje
 `MANIFEST_INVALID`. When `global.allow_missing_manifest_references = false`, config, layer, and
 child manifest digests referenced by the manifest must already exist and be readable in the
 namespace, and missing references are rejected with `MANIFEST_BLOB_UNKNOWN`. By default
-(`allow_missing_manifest_references = true`) this check is skipped and such pushes are accepted.
-Subject digests used for referrers are not required to exist in either mode.
+(`allow_missing_manifest_references = true`) the push is accepted, but a referenced digest the
+namespace does not already own is not made readable: it resolves as `BLOB_UNKNOWN` on a later pull
+until its content is pushed. Subject digests used for referrers are not required to exist in either
+mode.
 
 ```
 DELETE /v2/{namespace}/manifests/{reference}

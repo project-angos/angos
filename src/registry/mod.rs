@@ -79,10 +79,12 @@ pub struct RegistryConfig {
     pub max_manifest_size_bytes: usize,
     /// When `true`, a client manifest push is rejected with
     /// `MANIFEST_BLOB_UNKNOWN` if any referenced blob or child manifest is not
-    /// present and owned by the target namespace. When `false`, the check is
-    /// skipped (pre-1.2.0 permissive behavior). `subject` references are exempt
-    /// either way. Pull-through cache-fill writes never validate, independent of
-    /// this flag.
+    /// present and owned by the target namespace. When `false`, the push is
+    /// accepted but the unowned references are left dangling rather than granted,
+    /// so they resolve as unknown on a later pull and a namespace never gains
+    /// read access to content it did not push. `subject` references are exempt
+    /// either way. Pull-through cache-fill writes are always trusted, independent
+    /// of this flag.
     pub validate_manifest_references: bool,
     /// When set, the registry routes all cache-fill and replication jobs through
     /// this pre-built queue (typically the durable backend wired in `server setup`).

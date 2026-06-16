@@ -60,7 +60,7 @@ When omitted, the server runs without TLS (insecure).
 | `enable_manifest_redirect`  | bool     | `true`   | Allow HTTP 307 redirects for manifest downloads. Manifest bodies served via `response-content-type` to preserve the media type across redirects. |
 | `immutable_tags`            | bool     | `false`  | Global immutable tags default               |
 | `immutable_tags_exclusions` | [string] | `[]`     | Regex patterns for mutable tags             |
-| `allow_missing_manifest_references` | bool | `true` | When `true` (default), accept a manifest push whose referenced blobs or child manifests are not yet present/owned in the namespace (pre-1.2.0 behavior). Set to `false` to reject them with `MANIFEST_BLOB_UNKNOWN`. See note below. |
+| `allow_missing_manifest_references` | bool | `true` | When `true` (default), accept a manifest push whose referenced blobs or child manifests are not yet present/owned in the namespace; the missing references stay unreadable until their content is pushed. Set to `false` to reject such pushes with `MANIFEST_BLOB_UNKNOWN`. See note below. |
 | `authorization_webhook`     | string   | -        | Name of webhook for authorization           |
 | `event_webhooks`            | [string] | `[]`     | Event webhook names for all repositories    |
 
@@ -70,10 +70,10 @@ When omitted, the server runs without TLS (insecure).
 
 This controls whether the live manifest-push path enforces the OCI distribution-spec *option* of rejecting a manifest whose descriptors reference content the registry does not have.
 
-- **`true` (default).** A push is accepted even if a referenced config, layer, or child manifest is absent from or not owned by the target namespace. This maximizes compatibility with clients such as `docker buildx`/`bake`, which push multi-manifest image indexes and provenance/SBOM attestations whose children are not always namespace-local at validation time.
-- **`false`.** A push whose references are missing is rejected with `MANIFEST_BLOB_UNKNOWN` (HTTP 404). This is stricter and conformance-oriented, and additionally prevents a caller from minting a namespace-local reference to a blob digest it never uploaded (a cross-namespace read it could not otherwise perform). Inbound replicated manifest pushes are validated the same way; angos-to-angos replication pushes a manifest's children and blobs before the manifest itself, so it stays within strict mode.
+- **`true` (default).** A push is accepted even if a referenced config, layer, or child manifest is absent from or not owned by the target namespace. The unowned references are not granted to the namespace: they resolve as `BLOB_UNKNOWN` on a later pull until their content is pushed. This maximizes compatibility with clients such as `docker buildx`/`bake`, which push multi-manifest image indexes and provenance/SBOM attestations whose children are not always namespace-local at validation time.
+- **`false`.** A push whose references are missing is rejected outright with `MANIFEST_BLOB_UNKNOWN` (HTTP 404). This is stricter and conformance-oriented.
 
-`subject` references (referrers) are always accepted regardless of this setting, per the spec. Pull-through cache-fill writes are never validated.
+Either setting preserves namespace isolation: a caller never gains read access to a blob digest it never uploaded, so it cannot mint a namespace-local reference to another namespace's content. Inbound replicated manifest pushes follow the same rule; angos-to-angos replication pushes a manifest's children and blobs before the manifest itself, so its references are always owned. `subject` references (referrers) are always accepted regardless of this setting, per the spec. Pull-through cache-fill writes are trusted, independent of this flag.
 
 ### Durable Job Queue (`global.job_queue`)
 

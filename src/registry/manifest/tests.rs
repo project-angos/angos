@@ -476,6 +476,70 @@ async fn accept_put_manifest_honors_reference_validation_flag() {
     assert!(matches!(err, Error::ManifestBlobUnknown));
 }
 
+/// A permissive registry accepts a manifest that references content the pushing
+/// namespace does not own, but it must not grant that namespace read access to
+/// the referenced blobs: the references stay dangling and a later pull resolves
+/// as unknown. This guards the namespace-isolation boundary against a client
+/// minting a readable reference to another namespace's blob.
+#[tokio::test]
+async fn permissive_push_does_not_grant_read_of_unowned_referenced_blob() {
+    use crate::registry::{blob_ownership::BlobOwnership, test_utils::create_test_registry_with};
+
+    let case = FSRegistryTestCase::new();
+    let permissive = create_test_registry_with(case.blob_store(), case.metadata_store(), false);
+
+    // The owner uploads a config and a layer, gaining ownership of both.
+    let owner = Namespace::new("test-repo/owner").unwrap();
+    let config_content = br#"{"architecture":"amd64","os":"linux"}"#;
+    let layer_content = b"private layer bytes";
+    let config_digest = upload_blob(&permissive, &owner, config_content).await;
+    let layer_digest = upload_blob(&permissive, &owner, layer_content).await;
+
+    // An attacker in a different namespace pushes a manifest referencing the
+    // owner's blobs by digest. The permissive push is accepted.
+    let attacker = Namespace::new("test-repo/attacker").unwrap();
+    let (content, media_type) = manifest_with_references(
+        &config_digest,
+        config_content.len(),
+        &layer_digest,
+        layer_content.len(),
+    );
+    permissive
+        .accept_put_manifest(
+            None,
+            None,
+            &attacker,
+            Reference::Tag("latest".to_string()),
+            media_type,
+            Cursor::new(content),
+        )
+        .await
+        .expect("permissive registry accepts a push referencing unowned blobs");
+
+    // The owner still reads its blobs; the attacker gained no read access.
+    let ownership = BlobOwnership::new(permissive.metadata_store.as_ref());
+    assert!(ownership.can_read(&owner, &layer_digest).await.unwrap());
+    assert!(ownership.can_read(&owner, &config_digest).await.unwrap());
+    assert!(
+        !ownership.can_read(&attacker, &layer_digest).await.unwrap(),
+        "attacker must not gain read access to a layer it never uploaded"
+    );
+    assert!(
+        !ownership.can_read(&attacker, &config_digest).await.unwrap(),
+        "attacker must not gain read access to a config it never uploaded"
+    );
+
+    let repository = permissive.get_repository_for_namespace(&attacker).unwrap();
+    let outcome = permissive
+        .get_blob(repository, &[], &attacker, &layer_digest, None)
+        .await
+        .map(|_| ());
+    assert!(
+        matches!(outcome, Err(Error::BlobUnknown)),
+        "attacker pull of the unowned blob must be unknown, got {outcome:?}"
+    );
+}
+
 #[tokio::test]
 async fn test_get_manifest() {
     for test_case in backends() {

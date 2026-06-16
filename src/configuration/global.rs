@@ -53,14 +53,17 @@ pub struct GlobalConfig {
     pub immutable_tags_exclusions: Vec<RegexPattern>,
     /// When `true` (the default), a manifest push is accepted even if some of
     /// the blobs or child manifests it references are not yet present in or
-    /// owned by the target namespace. This is the pre-1.2.0 behavior.
-    ///
-    /// When `false`, the registry rejects such pushes with
-    /// `MANIFEST_BLOB_UNKNOWN` (stricter, but rejects some valid `docker
+    /// owned by the target namespace. The unowned references are not granted to
+    /// the namespace, so they resolve as unknown on a later pull until their
+    /// content is pushed. This restores pre-1.2.0 compatibility with `docker
     /// buildx`/`bake` index and attestation pushes whose children are not
-    /// namespace-local at validation time).
+    /// namespace-local at validation time.
     ///
-    /// `subject` references are always exempt, regardless of this setting.
+    /// When `false`, the registry instead rejects such pushes outright with
+    /// `MANIFEST_BLOB_UNKNOWN`.
+    ///
+    /// Either way a namespace never gains read access to content it did not push,
+    /// and `subject` references are always exempt.
     #[serde(default = "default_allow_missing_manifest_references")]
     pub allow_missing_manifest_references: bool,
     pub authorization_webhook: Option<String>,
