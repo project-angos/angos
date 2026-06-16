@@ -577,6 +577,47 @@ async fn upload_unknown_length_coalesce_self_heals_leftover_scratch() {
     );
 }
 
+/// Terminal scratch reap: `complete_upload` deletes a sealed scratch object a
+/// crash left behind (one that `complete_multipart_upload` turned into a
+/// concrete object before the graft+delete could run), not just an in-flight
+/// scratch multipart.
+#[tokio::test]
+async fn upload_complete_reaps_sealed_scratch_object() {
+    const PART: u64 = 10 * 1024 * 1024;
+    let store = backend_with(false, PART);
+    let key = format!("up/complete-scratch-reap/{}/data", Uuid::new_v4());
+
+    store.create_upload(&key).await.unwrap();
+    store
+        .write_upload(&key, frame(b"payload".to_vec()), Some(7))
+        .await
+        .unwrap();
+
+    // Seed a sealed scratch object as a crash between complete_multipart_upload
+    // and the graft+delete would leave.
+    store
+        .client
+        .put_object(
+            &scratch_key(&key),
+            Bytes::from_static(b"stale sealed scratch object"),
+        )
+        .await
+        .unwrap();
+
+    store.complete_upload(&key).await.unwrap();
+    assert_eq!(store.get(&key).await.unwrap(), b"payload");
+    assert_eq!(
+        store
+            .client
+            .object_size(&scratch_key(&key))
+            .await
+            .unwrap_err()
+            .kind(),
+        std::io::ErrorKind::NotFound,
+        "complete must delete the sealed scratch object"
+    );
+}
+
 /// Bounded-memory chunked write: a coalesced body well above `part_size` must
 /// still seal exact `part_size` parts. The coalescer holds at most one 5 MiB
 /// sub-part in memory regardless of body size; this uses a moderately large

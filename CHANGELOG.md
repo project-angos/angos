@@ -15,7 +15,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - The `_jobs` admin API accepts `?queue=cache|replication` (default `cache`), so failed replication jobs can be listed, retried, and deleted like cache jobs.
 - New `angos_replication_*` metrics (`angos_replication_push_total`, `angos_replication_last_success_timestamp_seconds`, `angos_replication_reconcile_total`) expose per-downstream push health and reconcile outcomes, and the existing `angos_job_queue_pending` gauge gains a `queue="replication"` series for the new replication queue backlog.
 - New server-published `angos_job_queue_failed{queue}` gauge reports dead-lettered jobs per queue, so replication failures stay observable even when `angos worker` drains the queue.
-- New `[global] allow_missing_manifest_references` knob (default `true`) accepts manifest pushes referencing absent or non-namespace-owned blobs or child manifests but leaves those references unreadable until their content is pushed, rejecting such pushes with `MANIFEST_BLOB_UNKNOWN` only when set to `false`.
+- New `[global] allow_missing_manifest_references` knob (default `true`) accepts manifest pushes with absent or unowned references, leaving them unreadable; set `false` to reject with `MANIFEST_BLOB_UNKNOWN`.
+- New `[global] max_blob_size` knob (default `100GiB`) caps the total size of a single blob upload, rejecting a larger upload with `BLOB_UPLOAD_INVALID`.
 
 ### Changed
 

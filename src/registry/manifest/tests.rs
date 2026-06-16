@@ -540,6 +540,137 @@ async fn permissive_push_does_not_grant_read_of_unowned_referenced_blob() {
     );
 }
 
+/// The child-manifest analogue of the blob isolation guard: a permissive
+/// registry accepts an image index whose child manifest digest the pushing
+/// namespace does not own (the docker buildx/bake scenario), but it must not
+/// grant that namespace read access to the child. The `LinkKind::Manifest` drop
+/// branch of `retain_owned_reference_links` keeps the child reference dangling
+/// so a later pull of the child digest resolves as unknown.
+#[tokio::test]
+async fn permissive_push_does_not_grant_read_of_unowned_child_manifest() {
+    use crate::registry::{blob_ownership::BlobOwnership, test_utils::create_test_registry_with};
+
+    let case = FSRegistryTestCase::new();
+    let permissive = create_test_registry_with(case.blob_store(), case.metadata_store(), false);
+
+    // The owner uploads the child manifest content, gaining ownership of it.
+    let owner = Namespace::new("test-repo/owner").unwrap();
+    let child_content = br#"{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{"mediaType":"application/vnd.oci.image.config.v1+json","digest":"sha256:1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef","size":1},"layers":[]}"#;
+    let child_digest = upload_blob(&permissive, &owner, child_content).await;
+
+    // An attacker in a different namespace pushes an index referencing the
+    // owner's child manifest by digest. The permissive push is accepted.
+    let attacker = Namespace::new("test-repo/attacker").unwrap();
+    let (content, media_type) = index_manifest_with_child(&child_digest);
+    permissive
+        .accept_put_manifest(
+            None,
+            None,
+            &attacker,
+            Reference::Tag("latest".to_string()),
+            media_type,
+            Cursor::new(content),
+        )
+        .await
+        .expect("permissive registry accepts an index referencing an unowned child manifest");
+
+    // The owner still reads the child; the attacker gained no read access.
+    let ownership = BlobOwnership::new(permissive.metadata_store.as_ref());
+    assert!(ownership.can_read(&owner, &child_digest).await.unwrap());
+    assert!(
+        !ownership.can_read(&attacker, &child_digest).await.unwrap(),
+        "attacker must not gain read access to a child manifest it never uploaded"
+    );
+
+    // The attacker's index push left the child reference dangling, so pulling
+    // the child digest in the attacker namespace resolves as unknown.
+    let repository = permissive.get_repository_for_namespace(&attacker).unwrap();
+    let outcome = permissive
+        .get_manifest(
+            repository,
+            &[],
+            &attacker,
+            Reference::Digest(child_digest.clone()),
+            false,
+        )
+        .await
+        .map(|_| ());
+    assert!(
+        matches!(outcome, Err(Error::ManifestUnknown)),
+        "attacker pull of the unowned child manifest must be unknown, got {outcome:?}"
+    );
+}
+
+/// The positive branch of `retain_owned_reference_links` on the permissive
+/// default: a namespace pushing a manifest that references blobs it already owns
+/// keeps every reference link, so the manifest and all its blobs stay fully
+/// pullable. Guards against a regression where permissive mode strips links for
+/// owned content and silently breaks normal image pushes.
+#[tokio::test]
+async fn permissive_push_of_owned_references_yields_a_pullable_manifest() {
+    use crate::registry::{blob_ownership::BlobOwnership, test_utils::create_test_registry_with};
+
+    let case = FSRegistryTestCase::new();
+    let permissive = create_test_registry_with(case.blob_store(), case.metadata_store(), false);
+
+    // One namespace uploads its own config and layer, then pushes a manifest
+    // referencing those owned blobs.
+    let namespace = Namespace::new("test-repo/owner").unwrap();
+    let config_content = br#"{"architecture":"amd64","os":"linux"}"#;
+    let layer_content = b"owned layer bytes";
+    let config_digest = upload_blob(&permissive, &namespace, config_content).await;
+    let layer_digest = upload_blob(&permissive, &namespace, layer_content).await;
+
+    let (content, media_type) = manifest_with_references(
+        &config_digest,
+        config_content.len(),
+        &layer_digest,
+        layer_content.len(),
+    );
+    permissive
+        .accept_put_manifest(
+            None,
+            None,
+            &namespace,
+            Reference::Tag("latest".to_string()),
+            media_type,
+            Cursor::new(content),
+        )
+        .await
+        .expect("permissive registry accepts a push referencing owned blobs");
+
+    // Every reference link is retained: the namespace reads its blobs and the
+    // manifest plus both blobs are pullable.
+    let ownership = BlobOwnership::new(permissive.metadata_store.as_ref());
+    assert!(
+        ownership
+            .can_read(&namespace, &config_digest)
+            .await
+            .unwrap()
+    );
+    assert!(ownership.can_read(&namespace, &layer_digest).await.unwrap());
+
+    let repository = permissive.get_repository_for_namespace(&namespace).unwrap();
+    permissive
+        .get_manifest(
+            repository,
+            &[],
+            &namespace,
+            Reference::Tag("latest".to_string()),
+            false,
+        )
+        .await
+        .expect("the pushed manifest must be pullable by tag");
+    permissive
+        .get_blob(repository, &[], &namespace, &config_digest, None)
+        .await
+        .expect("the owned config blob must be pullable");
+    permissive
+        .get_blob(repository, &[], &namespace, &layer_digest, None)
+        .await
+        .expect("the owned layer blob must be pullable");
+}
+
 #[tokio::test]
 async fn test_get_manifest() {
     for test_case in backends() {

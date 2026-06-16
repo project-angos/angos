@@ -102,7 +102,7 @@ Get upload status.
 PATCH /v2/{namespace}/blobs/uploads/{uuid}
 ```
 
-Upload a chunk. Use `Content-Range` for the chunk range and `Content-Length` for the exact chunk size. A missing `Content-Length` is accepted as a chunked upload streamed to EOF; an invalid `Content-Length` returns `400 Bad Request`.
+Upload a chunk. Use `Content-Range` for the chunk range and `Content-Length` for the exact chunk size. A missing `Content-Length` is accepted as a chunked upload streamed to EOF; an invalid `Content-Length` returns `400 Bad Request`. An upload whose cumulative size exceeds `global.max_blob_size` is rejected with `BLOB_UPLOAD_INVALID` (HTTP 413).
 
 ```
 PUT /v2/{namespace}/blobs/uploads/{uuid}?digest={digest}
@@ -134,9 +134,9 @@ Push a manifest. Manifest bodies larger than `global.max_manifest_size` are reje
 child manifest digests referenced by the manifest must already exist and be readable in the
 namespace, and missing references are rejected with `MANIFEST_BLOB_UNKNOWN`. By default
 (`allow_missing_manifest_references = true`) the push is accepted, but a referenced digest the
-namespace does not already own is not made readable: it resolves as `BLOB_UNKNOWN` on a later pull
-until its content is pushed. Subject digests used for referrers are not required to exist in either
-mode.
+namespace does not already own is not made readable: it resolves as unknown on a later pull
+(`BLOB_UNKNOWN` for a blob, `MANIFEST_UNKNOWN` for a child manifest) until its content is pushed.
+Subject digests used for referrers are not required to exist in either mode.
 
 ```
 DELETE /v2/{namespace}/manifests/{reference}

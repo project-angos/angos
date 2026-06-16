@@ -616,11 +616,13 @@ impl ObjectStore for Backend {
     }
 
     async fn complete_upload(&self, key: &str) -> Result<(), Error> {
-        // Reap any chunked-coalesce scratch multipart orphaned by a coalesced
-        // write that crashed mid-flight before the session was finished via a
-        // known-length path. `abort_multiparts_at` lists once and returns when
+        // Reap any chunked-coalesce scratch orphaned by a coalesced write that
+        // crashed mid-flight before the session was finished via a known-length
+        // path: an in-flight scratch multipart (aborted) and a sealed scratch
+        // object (deleted). `abort_multiparts_at` lists once and returns when
         // empty, so this is cheap on the common (no scratch) path.
         self.abort_multiparts_at(&scratch_key(key)).await?;
+        let _ = self.client.delete(&scratch_key(key)).await;
 
         let recovered = self.recover_upload(key).await?;
         let upload_id = recovered.upload_id;

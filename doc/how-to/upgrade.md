@@ -264,7 +264,7 @@ The `_catalog` listing is now derived directly from stored content rather than f
 
 1.2.0 began rejecting a manifest push at the manifest endpoint when a referenced config, layer, or child manifest was not already present and owned by the target namespace (returning `MANIFEST_BLOB_UNKNOWN`). That broke some `docker buildx`/`bake` pushes of multi-manifest image indexes and provenance/SBOM attestations whose children are not namespace-local at validation time.
 
-This is now controlled by `global.allow_missing_manifest_references`, which **defaults to `true`** (the pre-1.2.0 permissive behavior). No configuration change is required to restore working `docker bake` pushes after upgrade. A reference whose content the namespace does not own is accepted but left unreadable: it resolves as `BLOB_UNKNOWN` on a later pull until its content is pushed, so namespace isolation holds in either mode (a caller never gains read access to a blob digest it never uploaded).
+This is now controlled by `global.allow_missing_manifest_references`, which **defaults to `true`** (the pre-1.2.0 permissive behavior). No configuration change is required to restore working `docker bake` pushes after upgrade. A reference whose content the namespace does not own is accepted but left unreadable: it resolves as unknown on a later pull (`BLOB_UNKNOWN` for a blob, `MANIFEST_UNKNOWN` for a child manifest) until its content is pushed, so namespace isolation holds in either mode (a caller never gains read access to a blob digest it never uploaded).
 
 **Who is affected:** Anyone who relied on 1.2.0's strict rejection. To reject such pushes outright instead of accepting them with dangling references, opt back in:
 

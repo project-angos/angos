@@ -35,6 +35,8 @@ pub struct GlobalConfig {
     pub max_concurrent_replication_jobs: NonZeroUsize,
     #[serde(default = "default_max_manifest_size")]
     pub max_manifest_size: ByteSize,
+    #[serde(default = "default_max_blob_size")]
+    pub max_blob_size: ByteSize,
     #[serde(default = "default_update_pull_time")]
     pub update_pull_time: bool,
     #[serde(default)]
@@ -116,6 +118,10 @@ fn default_max_manifest_size() -> ByteSize {
     ByteSize::mib(5)
 }
 
+fn default_max_blob_size() -> ByteSize {
+    ByteSize::gib(100)
+}
+
 fn default_update_pull_time() -> bool {
     false
 }
@@ -131,6 +137,7 @@ impl Default for GlobalConfig {
             max_concurrent_cache_jobs: default_max_concurrent_cache_jobs(),
             max_concurrent_replication_jobs: default_max_concurrent_replication_jobs(),
             max_manifest_size: default_max_manifest_size(),
+            max_blob_size: default_max_blob_size(),
             update_pull_time: default_update_pull_time(),
             enable_redirect: None,
             enable_blob_redirect: None,
@@ -163,6 +170,10 @@ impl GlobalConfig {
     pub fn max_manifest_size_bytes(&self) -> usize {
         usize::try_from(self.max_manifest_size.as_u64()).unwrap_or(usize::MAX)
     }
+
+    pub fn max_blob_size_bytes(&self) -> u64 {
+        self.max_blob_size.as_u64()
+    }
 }
 
 #[cfg(test)]
@@ -181,6 +192,7 @@ mod tests {
         assert_eq!(config.max_concurrent_cache_jobs.get(), 4);
         assert_eq!(config.max_concurrent_replication_jobs.get(), 4);
         assert_eq!(config.max_manifest_size, ByteSize::mib(5));
+        assert_eq!(config.max_blob_size, ByteSize::gib(100));
         assert!(!config.update_pull_time);
         assert!(!config.immutable_tags);
         assert!(config.immutable_tags_exclusions.is_empty());
@@ -199,6 +211,7 @@ mod tests {
             max_concurrent_cache_jobs = 8
             max_concurrent_replication_jobs = 6
             max_manifest_size = "7MiB"
+            max_blob_size = "10GiB"
             update_pull_time = true
             immutable_tags = true
             immutable_tags_exclusions = ["latest", "dev"]
@@ -218,6 +231,7 @@ mod tests {
             NonZeroUsize::new(6).unwrap()
         );
         assert_eq!(config.max_manifest_size, ByteSize::mib(7));
+        assert_eq!(config.max_blob_size, ByteSize::gib(10));
         assert!(config.update_pull_time);
         assert!(config.immutable_tags);
         assert!(!config.allow_missing_manifest_references);
@@ -247,5 +261,15 @@ mod tests {
         };
 
         assert_eq!(config.max_manifest_size_bytes(), 6 * 1024 * 1024);
+    }
+
+    #[test]
+    fn max_blob_size_bytes_returns_u64() {
+        let config = GlobalConfig {
+            max_blob_size: ByteSize::gib(6),
+            ..GlobalConfig::default()
+        };
+
+        assert_eq!(config.max_blob_size_bytes(), 6 * 1024 * 1024 * 1024);
     }
 }

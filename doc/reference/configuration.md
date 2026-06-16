@@ -54,6 +54,7 @@ When omitted, the server runs without TLS (insecure).
 | `max_concurrent_cache_jobs` | usize    | `4`      | Maximum concurrent cache jobs (minimum `1`). With `[global.job_queue]` enabled, also bounds the number of jobs each `angos worker` processes in parallel. |
 | `max_concurrent_replication_jobs` | non-zero usize | `4` | Concurrency for replication jobs (minimum `1`). Bounds how many replication pushes are handled in parallel by each `angos worker`, the server's in-process drain, and the `scrub --replicate` end-of-run drain. |
 | `max_manifest_size`         | string   | `"5MiB"` | Maximum manifest body size accepted from clients or upstream registries |
+| `max_blob_size`             | string   | `"100GiB"` | Maximum total size of a single blob upload; a larger upload is rejected with `BLOB_UPLOAD_INVALID` (HTTP 413) |
 | `update_pull_time`          | bool     | `false`  | Track pull times for retention policies     |
 | `enable_redirect`           | bool     | -        | **Deprecated.** Fallback for both fields below when unset. |
 | `enable_blob_redirect`      | bool     | `true`   | Allow HTTP 307 redirects for blob downloads. |
@@ -64,13 +65,13 @@ When omitted, the server runs without TLS (insecure).
 | `authorization_webhook`     | string   | -        | Name of webhook for authorization           |
 | `event_webhooks`            | [string] | `[]`     | Event webhook names for all repositories    |
 
-`max_manifest_size` must be greater than zero.
+`max_manifest_size` and `max_blob_size` must be greater than zero.
 
 #### `allow_missing_manifest_references`
 
 This controls whether the live manifest-push path enforces the OCI distribution-spec *option* of rejecting a manifest whose descriptors reference content the registry does not have.
 
-- **`true` (default).** A push is accepted even if a referenced config, layer, or child manifest is absent from or not owned by the target namespace. The unowned references are not granted to the namespace: they resolve as `BLOB_UNKNOWN` on a later pull until their content is pushed. This maximizes compatibility with clients such as `docker buildx`/`bake`, which push multi-manifest image indexes and provenance/SBOM attestations whose children are not always namespace-local at validation time.
+- **`true` (default).** A push is accepted even if a referenced config, layer, or child manifest is absent from or not owned by the target namespace. The unowned references are not granted to the namespace: they resolve as unknown on a later pull (`BLOB_UNKNOWN` for a blob, `MANIFEST_UNKNOWN` for a child manifest) until their content is pushed. This maximizes compatibility with clients such as `docker buildx`/`bake`, which push multi-manifest image indexes and provenance/SBOM attestations whose children are not always namespace-local at validation time.
 - **`false`.** A push whose references are missing is rejected outright with `MANIFEST_BLOB_UNKNOWN` (HTTP 404). This is stricter and conformance-oriented.
 
 Either setting preserves namespace isolation: a caller never gains read access to a blob digest it never uploaded. Inbound replicated manifest pushes follow the same rule; angos-to-angos replication pushes a manifest's children and blobs before the manifest itself, so its references are always owned. `subject` references (referrers) are always accepted regardless of this setting, per the spec. Pull-through cache-fill writes are trusted, independent of this flag.

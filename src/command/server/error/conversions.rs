@@ -40,6 +40,11 @@ impl From<registry::Error> for Error {
                 "MANIFEST_INVALID",
                 Some(error.to_string()),
             ),
+            registry::Error::BlobBodyTooLarge { .. } => oci_error(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "BLOB_UPLOAD_INVALID",
+                Some(error.to_string()),
+            ),
             registry::Error::ManifestInvalid(msg) => {
                 oci_error(StatusCode::BAD_REQUEST, "MANIFEST_INVALID", Some(msg))
             }

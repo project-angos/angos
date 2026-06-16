@@ -18,6 +18,10 @@ use crate::{
 /// normal upload session, so no access is over-granted.
 const MAX_FROM_LESS_MOUNT_CANDIDATES: usize = 32;
 
+/// Default cap on a blob's cumulative uploaded size, mirroring
+/// [`manifest::DEFAULT_MAX_MANIFEST_SIZE_BYTES`](crate::registry::manifest::DEFAULT_MAX_MANIFEST_SIZE_BYTES).
+pub const DEFAULT_MAX_BLOB_SIZE_BYTES: u64 = 100 * 1024 * 1024 * 1024;
+
 pub enum StartUploadResponse {
     ExistingBlob { headers: HeaderMap },
     Session { headers: HeaderMap },
@@ -309,6 +313,79 @@ impl Registry {
         Ok((self.open_upload_session(namespace).await?, Vec::new()))
     }
 
+    /// Early-reject a known-length body whose declared length would push the
+    /// session's cumulative size past `max_blob_size_bytes`, aborting the
+    /// session first so its staged bytes are reclaimed.
+    async fn reject_oversized_known_length(
+        &self,
+        namespace: &Namespace,
+        session_key: &str,
+        committed: u64,
+        content_length: Option<u64>,
+    ) -> Result<(), Error> {
+        let limit = self.max_blob_size_bytes;
+        if let Some(len) = content_length
+            && committed.checked_add(len).is_none_or(|total| total > limit)
+        {
+            self.abort_upload_quietly(namespace, session_key).await;
+            return Err(Error::BlobBodyTooLarge {
+                limit: usize::try_from(limit).unwrap_or(usize::MAX),
+            });
+        }
+        Ok(())
+    }
+
+    /// Bound a chunked (`None` content-length) body to `remaining + 1` bytes so
+    /// it can never grow the session past `max_blob_size_bytes` without the
+    /// extra byte tripping the overflow check after the write. `remaining` is
+    /// the headroom left before the cap; a `Some(_)` content-length is passed
+    /// through unbounded because [`Self::reject_oversized_known_length`] already
+    /// vetted it.
+    fn bound_blob_stream<S>(
+        &self,
+        committed: u64,
+        content_length: Option<u64>,
+        stream: S,
+    ) -> tokio::io::Take<S>
+    where
+        S: AsyncRead + Unpin,
+    {
+        if content_length.is_some() {
+            // A vetted known length never trips the guard; cap at exactly the
+            // limit so a deceptive Content-Length cannot smuggle extra bytes.
+            return stream.take(self.max_blob_size_bytes.saturating_add(1));
+        }
+        let remaining = self.max_blob_size_bytes.saturating_sub(committed);
+        stream.take(remaining.saturating_add(1))
+    }
+
+    /// After a write, reject (and abort) when the session's cumulative size has
+    /// exceeded `max_blob_size_bytes`, i.e. the chunked guard byte was consumed.
+    async fn reject_if_oversized(
+        &self,
+        namespace: &Namespace,
+        session_key: &str,
+        new_total: u64,
+    ) -> Result<(), Error> {
+        let limit = self.max_blob_size_bytes;
+        if new_total > limit {
+            self.abort_upload_quietly(namespace, session_key).await;
+            return Err(Error::BlobBodyTooLarge {
+                limit: usize::try_from(limit).unwrap_or(usize::MAX),
+            });
+        }
+        Ok(())
+    }
+
+    /// Best-effort abort of an upload session whose body breached the size cap;
+    /// a cleanup failure is logged, not surfaced, since the caller already has a
+    /// terminal error to return.
+    async fn abort_upload_quietly(&self, namespace: &Namespace, session_key: &str) {
+        if let Err(error) = self.blob_store.delete_upload(namespace, session_key).await {
+            warn!("Failed to abort oversized upload session: {error}");
+        }
+    }
+
     #[instrument(skip(stream))]
     pub async fn patch_upload<S>(
         &self,
@@ -334,9 +411,16 @@ impl Registry {
             return Err(Error::RangeNotSatisfiable);
         }
 
+        self.reject_oversized_known_length(namespace, &session_key, summary.size, content_length)
+            .await?;
+
+        let bounded = self.bound_blob_stream(summary.size, content_length, stream);
         let (_, size) = self
             .blob_store
-            .write_upload(namespace, &session_key, Box::new(stream), content_length)
+            .write_upload(namespace, &session_key, Box::new(bounded), content_length)
+            .await?;
+
+        self.reject_if_oversized(namespace, &session_key, size)
             .await?;
 
         let range_max = size.saturating_sub(1);
@@ -361,17 +445,23 @@ impl Registry {
     {
         let session_key = session_id.to_string();
 
-        let has_prior_writes = match self
+        let committed = match self
             .blob_store
             .upload_summary(namespace, &session_key)
             .await
         {
-            Ok(summary) => summary.size > 0,
-            Err(blob_store::Error::UploadNotFound) => false,
+            Ok(summary) => summary.size,
+            Err(blob_store::Error::UploadNotFound) => 0,
             Err(e) => return Err(e.into()),
         };
+        let has_prior_writes = committed > 0;
 
-        let mut stream = stream;
+        self.reject_oversized_known_length(namespace, &session_key, committed, content_length)
+            .await?;
+
+        // Bound the final chunk so a chunked (`None` content-length) PUT that
+        // carries the whole body cannot grow the session past the cap.
+        let mut stream = self.bound_blob_stream(committed, content_length, stream);
         if !has_prior_writes
             && self
                 .complete_existing_upload(namespace, digest, content_length, &mut stream)
@@ -382,9 +472,12 @@ impl Registry {
                 .await);
         }
 
-        let (upload_digest, _) = self
+        let (upload_digest, new_total) = self
             .blob_store
             .write_upload(namespace, &session_key, Box::new(stream), content_length)
+            .await?;
+
+        self.reject_if_oversized(namespace, &session_key, new_total)
             .await?;
 
         if &upload_digest != digest {
@@ -471,14 +564,16 @@ mod tests {
         identity::ClientIdentity,
         oci::{Digest, Namespace},
         registry::{
-            BlobMount, DOCKER_CONTENT_DIGEST, DOCKER_UPLOAD_UUID, Error, StartUploadResponse,
+            BlobMount, DOCKER_CONTENT_DIGEST, DOCKER_UPLOAD_UUID, Error, Registry, RegistryConfig,
+            StartUploadResponse,
             blob_ownership::BlobOwnership,
             blob_store::BlobStore,
             metadata_store::link_kind::LinkKind,
             path_builder,
+            repository_resolver::RepositoryResolver,
             test_utils::{
                 FSRegistryTestCase, RegistryTestCase, backends, create_test_registry,
-                put_blob_direct,
+                create_test_repositories, put_blob_direct,
             },
         },
         test_fixtures::configuration::load_config,
@@ -1744,6 +1839,191 @@ mod tests {
         assert_eq!(
             preserved_content, content,
             "original upload content should be preserved"
+        );
+    }
+
+    /// Build a registry over an `FSRegistryTestCase`'s stores but with a tiny
+    /// `max_blob_size_bytes`, so the blob-size cap can be exercised end-to-end.
+    fn tiny_blob_cap_registry(
+        test_case: &FSRegistryTestCase,
+        max_blob_size_bytes: u64,
+    ) -> Registry {
+        let resolver = Arc::new(
+            RepositoryResolver::new(create_test_repositories())
+                .expect("test repositories must not have overlapping prefixes"),
+        );
+        let config = RegistryConfig::default().max_blob_size_bytes(max_blob_size_bytes);
+        Registry::new(
+            test_case.blob_store(),
+            test_case.metadata_store(),
+            resolver,
+            config,
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn patch_upload_known_length_over_cap_is_rejected_and_aborts_session() {
+        let test_case = FSRegistryTestCase::new();
+        let registry = tiny_blob_cap_registry(&test_case, 8);
+        let namespace = &Namespace::new("test-repo").unwrap();
+        let session_id = Uuid::new_v4();
+
+        registry
+            .blob_store
+            .create_upload(namespace, &session_id.to_string())
+            .await
+            .unwrap();
+
+        let content = b"way past the eight byte cap";
+        let result = registry
+            .patch_upload(
+                namespace,
+                session_id,
+                None,
+                Some(content.len() as u64),
+                Cursor::new(content.to_vec()),
+            )
+            .await;
+
+        assert!(
+            matches!(result, Err(Error::BlobBodyTooLarge { limit: 8 })),
+            "a known-length body over the cap must be rejected with BlobBodyTooLarge"
+        );
+        assert!(
+            registry
+                .blob_store
+                .upload_summary(namespace, &session_id.to_string())
+                .await
+                .is_err(),
+            "the oversized upload session must be aborted, not committed"
+        );
+    }
+
+    #[tokio::test]
+    async fn patch_upload_chunked_over_cap_is_rejected_and_aborts_session() {
+        let test_case = FSRegistryTestCase::new();
+        let registry = tiny_blob_cap_registry(&test_case, 8);
+        let namespace = &Namespace::new("test-repo").unwrap();
+        let session_id = Uuid::new_v4();
+
+        registry
+            .blob_store
+            .create_upload(namespace, &session_id.to_string())
+            .await
+            .unwrap();
+
+        // No Content-Length (chunked): the body must be bounded mid-stream and
+        // the overflow detected after the write.
+        let content = b"way past the eight byte cap";
+        let result = registry
+            .patch_upload(
+                namespace,
+                session_id,
+                None,
+                None,
+                Cursor::new(content.to_vec()),
+            )
+            .await;
+
+        assert!(
+            matches!(result, Err(Error::BlobBodyTooLarge { limit: 8 })),
+            "a chunked body over the cap must be rejected with BlobBodyTooLarge"
+        );
+        assert!(
+            registry
+                .blob_store
+                .upload_summary(namespace, &session_id.to_string())
+                .await
+                .is_err(),
+            "the oversized chunked upload session must be aborted, not committed"
+        );
+    }
+
+    #[tokio::test]
+    async fn complete_upload_chunked_over_cap_is_rejected_and_aborts_session() {
+        let test_case = FSRegistryTestCase::new();
+        let registry = tiny_blob_cap_registry(&test_case, 8);
+        let namespace = &Namespace::new("test-repo").unwrap();
+        let session_id = Uuid::new_v4();
+
+        registry
+            .blob_store
+            .create_upload(namespace, &session_id.to_string())
+            .await
+            .unwrap();
+
+        // A single chunked PUT carrying the whole body must also be bounded.
+        let content = b"single chunked PUT over the cap";
+        let digest = sha256::digest(content);
+        let result = registry
+            .complete_upload(
+                None,
+                namespace,
+                session_id,
+                &digest,
+                None,
+                Cursor::new(content.to_vec()),
+            )
+            .await;
+
+        assert!(
+            matches!(result, Err(Error::BlobBodyTooLarge { limit: 8 })),
+            "a chunked PUT over the cap must be rejected with BlobBodyTooLarge"
+        );
+        assert!(
+            registry
+                .blob_store
+                .upload_summary(namespace, &session_id.to_string())
+                .await
+                .is_err(),
+            "the oversized chunked PUT session must be aborted, not committed"
+        );
+    }
+
+    #[tokio::test]
+    async fn patch_upload_at_cap_is_accepted() {
+        let test_case = FSRegistryTestCase::new();
+        let registry = tiny_blob_cap_registry(&test_case, 8);
+        let namespace = &Namespace::new("test-repo").unwrap();
+        let session_id = Uuid::new_v4();
+
+        registry
+            .blob_store
+            .create_upload(namespace, &session_id.to_string())
+            .await
+            .unwrap();
+
+        // Exactly at the cap, via both the known-length and chunked paths.
+        registry
+            .patch_upload(
+                namespace,
+                session_id,
+                None,
+                Some(4),
+                Cursor::new(b"abcd".to_vec()),
+            )
+            .await
+            .expect("a body within the cap must be accepted");
+        registry
+            .patch_upload(
+                namespace,
+                session_id,
+                Some(4),
+                None,
+                Cursor::new(b"efgh".to_vec()),
+            )
+            .await
+            .expect("a chunked body that fills the cap exactly must be accepted");
+
+        let summary = registry
+            .blob_store
+            .upload_summary(namespace, &session_id.to_string())
+            .await
+            .unwrap();
+        assert_eq!(
+            summary.size, 8,
+            "cumulative size must reach the cap exactly"
         );
     }
 }

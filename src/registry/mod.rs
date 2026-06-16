@@ -77,6 +77,7 @@ pub struct RegistryConfig {
     pub global_immutable_tags: bool,
     pub global_immutable_tags_exclusions: Vec<RegexPattern>,
     pub max_manifest_size_bytes: usize,
+    pub max_blob_size_bytes: u64,
     /// When `true`, a client manifest push is rejected with
     /// `MANIFEST_BLOB_UNKNOWN` if any referenced blob or child manifest is not
     /// present and owned by the target namespace. When `false`, the push is
@@ -109,6 +110,7 @@ impl Default for RegistryConfig {
             global_immutable_tags: false,
             global_immutable_tags_exclusions: Vec::new(),
             max_manifest_size_bytes: manifest::DEFAULT_MAX_MANIFEST_SIZE_BYTES,
+            max_blob_size_bytes: upload::DEFAULT_MAX_BLOB_SIZE_BYTES,
             // Strict by default at the struct level so test/internal registries
             // built from `RegistryConfig::default()` keep validating; the server
             // opts into the permissive production default via `[global]`.
@@ -151,6 +153,11 @@ impl RegistryConfig {
         self
     }
 
+    pub fn max_blob_size_bytes(mut self, limit: u64) -> Self {
+        self.max_blob_size_bytes = limit;
+        self
+    }
+
     pub fn validate_manifest_references(mut self, enabled: bool) -> Self {
         self.validate_manifest_references = enabled;
         self
@@ -188,6 +195,7 @@ pub struct Registry {
     global_immutable_tags: bool,
     global_immutable_tags_exclusions: Vec<RegexPattern>,
     max_manifest_size_bytes: usize,
+    max_blob_size_bytes: u64,
     validate_manifest_references: bool,
 }
 
@@ -231,6 +239,7 @@ impl Registry {
             global_immutable_tags: config.global_immutable_tags,
             global_immutable_tags_exclusions: config.global_immutable_tags_exclusions,
             max_manifest_size_bytes: config.max_manifest_size_bytes,
+            max_blob_size_bytes: config.max_blob_size_bytes,
             validate_manifest_references: config.validate_manifest_references,
         })
     }

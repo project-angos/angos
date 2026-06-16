@@ -47,9 +47,9 @@ enum ReferencePolicy {
     /// references, so they stay dangling and resolve as unknown on a later pull
     /// instead of handing the namespace read access to content it never pushed.
     Permissive,
-    /// Trust every reference as owned. Used by pull-through cache-fill and
-    /// replication, where the referenced content legitimately belongs to the
-    /// namespace.
+    /// Trust every reference as owned. Used only by pull-through cache-fill,
+    /// where the referenced content is fetched from the upstream the namespace
+    /// mirrors.
     Trusted,
 }
 
