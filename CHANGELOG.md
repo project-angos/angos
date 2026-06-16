@@ -15,7 +15,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - The `_jobs` admin API accepts `?queue=cache|replication` (default `cache`), so failed replication jobs can be listed, retried, and deleted like cache jobs.
 - New `angos_replication_*` metrics (`angos_replication_push_total`, `angos_replication_last_success_timestamp_seconds`, `angos_replication_reconcile_total`) expose per-downstream push health and reconcile outcomes, and the existing `angos_job_queue_pending` gauge gains a `queue="replication"` series for the new replication queue backlog.
 - New server-published `angos_job_queue_failed{queue}` gauge reports dead-lettered jobs per queue, so replication failures stay observable even when `angos worker` drains the queue.
-- New `[global] allow_missing_manifest_references` knob (default `true`) accepts manifest pushes that reference absent or non-namespace-owned blobs or child manifests, leaving those references unreadable until their content is pushed; set it to `false` for the strict 1.2.0 `MANIFEST_BLOB_UNKNOWN` rejection.
+- New `[global] allow_missing_manifest_references` knob (default `true`) accepts manifest pushes referencing absent or non-namespace-owned blobs or child manifests but leaves those references unreadable until their content is pushed, rejecting such pushes with `MANIFEST_BLOB_UNKNOWN` only when set to `false`.
 
 ### Changed
 
@@ -30,7 +30,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
-- Blob upload requests with chunked transfer-encoding (no `Content-Length`), which `docker push` sends, are streamed to EOF: a chunked `PATCH` is no longer rejected with `400 Bad Request` and a chunked `PUT` body is no longer treated as zero length.
+- Blob uploads using chunked transfer-encoding without `Content-Length`, as sent by `docker push`, are now accepted and streamed to EOF.
 
 ## 1.2.0 - 2026-06-03
 

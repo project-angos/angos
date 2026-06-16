@@ -250,8 +250,7 @@ impl Backend {
 
         // The scratch is keyed by `key` alone (not by offset) to match the
         // keyless recover-from-S3 model. Self-heal a scratch a crashed prior
-        // call may have left here; concurrent writes on one session would race
-        // this scratch and the hash state alike, so they are unsupported.
+        // call may have left here.
         let scratch = scratch_key(key);
         self.abort_multiparts_at(&scratch).await?;
         let _ = self.client.delete(&scratch).await;

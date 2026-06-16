@@ -73,7 +73,7 @@ This controls whether the live manifest-push path enforces the OCI distribution-
 - **`true` (default).** A push is accepted even if a referenced config, layer, or child manifest is absent from or not owned by the target namespace. The unowned references are not granted to the namespace: they resolve as `BLOB_UNKNOWN` on a later pull until their content is pushed. This maximizes compatibility with clients such as `docker buildx`/`bake`, which push multi-manifest image indexes and provenance/SBOM attestations whose children are not always namespace-local at validation time.
 - **`false`.** A push whose references are missing is rejected outright with `MANIFEST_BLOB_UNKNOWN` (HTTP 404). This is stricter and conformance-oriented.
 
-Either setting preserves namespace isolation: a caller never gains read access to a blob digest it never uploaded, so it cannot mint a namespace-local reference to another namespace's content. Inbound replicated manifest pushes follow the same rule; angos-to-angos replication pushes a manifest's children and blobs before the manifest itself, so its references are always owned. `subject` references (referrers) are always accepted regardless of this setting, per the spec. Pull-through cache-fill writes are trusted, independent of this flag.
+Either setting preserves namespace isolation: a caller never gains read access to a blob digest it never uploaded. Inbound replicated manifest pushes follow the same rule; angos-to-angos replication pushes a manifest's children and blobs before the manifest itself, so its references are always owned. `subject` references (referrers) are always accepted regardless of this setting, per the spec. Pull-through cache-fill writes are trusted, independent of this flag.
 
 ### Durable Job Queue (`global.job_queue`)
 
@@ -177,11 +177,11 @@ Each OCI `PATCH` request streams into a long-lived S3 multipart upload, with no 
 
 A `PATCH` that carries a `Content-Length` is uploaded directly as an `UploadPart` with that known length. A chunked `PATCH` (no `Content-Length`, as `docker push` sends) is streamed to EOF. When `multipart_part_size` is above the 5 MiB floor, it is coalesced server-side into `part_size` parts via `UploadPartCopy`, buffering at most one 5 MiB sub-part and restaging the trailing remainder. When `multipart_part_size` is exactly 5 MiB, it streams plain 5 MiB parts directly with no coalescing.
 
-Memory usage per upload: for a known-length `PATCH`, ~8 KiB (a single streaming read frame), with no data buffered beyond the current frame. For a coalesced chunked `PATCH` (`multipart_part_size` above the 5 MiB floor), at most one buffered 5 MiB sub-part, at the cost of moving each byte twice within S3 (into a scratch object, then `UploadPartCopy` into the upload).
+Memory usage per upload: for a known-length `PATCH`, up to one ~1 MiB streaming read frame, with no data buffered beyond the current frame. For a coalesced chunked `PATCH` (`multipart_part_size` above the 5 MiB floor), at most one buffered 5 MiB sub-part, at the cost of moving each byte twice within S3 (into a scratch object, then `UploadPartCopy` into the upload).
 
 **Uniform mode (`multipart_uniform_parts = true`)**
 
-A long-lived S3 multipart upload is maintained across all `PATCH` requests. Both a known-length `PATCH` and a chunked `PATCH` (no `Content-Length`, as `docker push` sends) commit exactly `multipart_part_size` non-final parts, so every non-final part in a given upload is `multipart_part_size` regardless of transfer mode, and the final part may be smaller. The S3 protocol only requires non-final parts to be ≥ 5 MiB; uniform sizing is an additional constraint imposed by some S3 storage providers. Use this mode only if your provider rejects uploads with variable part sizes.
+A long-lived S3 multipart upload is maintained across all `PATCH` requests. Both a known-length `PATCH` and a chunked `PATCH` (no `Content-Length`, as `docker push` sends) commit non-final parts of exactly `multipart_part_size` bytes; the final part may be smaller. The S3 protocol only requires non-final parts to be ≥ 5 MiB; uniform sizing is an additional constraint imposed by some S3 storage providers. Use this mode only if your provider rejects uploads with variable part sizes.
 
 Memory usage per upload: streaming read frames for full parts, plus at most one trailing staged chunk smaller than `multipart_part_size`. A chunked `PATCH` buffers up to one `multipart_part_size` part, the same as the known-length remainder.
 
