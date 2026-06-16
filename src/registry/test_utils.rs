@@ -131,6 +131,18 @@ pub fn create_test_registry(
     blob_store: Arc<blob_store::BlobStore>,
     metadata_store: Arc<MetadataStore>,
 ) -> Registry {
+    create_test_registry_with(blob_store, metadata_store, true)
+}
+
+/// Like [`create_test_registry`] but lets a test pin whether the live
+/// `accept_put_manifest` path enforces manifest-reference validation, so both
+/// the strict and the permissive (`allow_missing_manifest_references`) modes
+/// can be exercised end-to-end.
+pub fn create_test_registry_with(
+    blob_store: Arc<blob_store::BlobStore>,
+    metadata_store: Arc<MetadataStore>,
+    validate_manifest_references: bool,
+) -> Registry {
     let resolver = Arc::new(
         RepositoryResolver::new(create_test_repositories())
             .expect("test repositories must not have overlapping prefixes"),
@@ -142,6 +154,8 @@ pub fn create_test_registry(
         .enable_blob_redirect(global.resolved_enable_blob_redirect())
         .enable_manifest_redirect(global.resolved_enable_manifest_redirect())
         .max_manifest_size_bytes(global.max_manifest_size_bytes())
+        .max_blob_size_bytes(global.max_blob_size_bytes())
+        .validate_manifest_references(validate_manifest_references)
         .global_immutable_tags(global.immutable_tags)
         .global_immutable_tags_exclusions(global.immutable_tags_exclusions.clone());
 

@@ -35,6 +35,8 @@ pub struct GlobalConfig {
     pub max_concurrent_replication_jobs: NonZeroUsize,
     #[serde(default = "default_max_manifest_size")]
     pub max_manifest_size: ByteSize,
+    #[serde(default = "default_max_blob_size")]
+    pub max_blob_size: ByteSize,
     #[serde(default = "default_update_pull_time")]
     pub update_pull_time: bool,
     #[serde(default)]
@@ -51,6 +53,21 @@ pub struct GlobalConfig {
     pub immutable_tags: bool,
     #[serde(default)]
     pub immutable_tags_exclusions: Vec<RegexPattern>,
+    /// When `true` (the default), a manifest push is accepted even if some of
+    /// the blobs or child manifests it references are not yet present in or
+    /// owned by the target namespace. The unowned references are not granted to
+    /// the namespace, so they resolve as unknown on a later pull until their
+    /// content is pushed. This restores pre-1.2.0 compatibility with `docker
+    /// buildx`/`bake` index and attestation pushes whose children are not
+    /// namespace-local at validation time.
+    ///
+    /// When `false`, the registry instead rejects such pushes outright with
+    /// `MANIFEST_BLOB_UNKNOWN`.
+    ///
+    /// Either way a namespace never gains read access to content it did not push,
+    /// and `subject` references are always exempt.
+    #[serde(default = "default_allow_missing_manifest_references")]
+    pub allow_missing_manifest_references: bool,
     pub authorization_webhook: Option<String>,
     #[serde(default)]
     pub event_webhooks: Vec<String>,
@@ -101,8 +118,16 @@ fn default_max_manifest_size() -> ByteSize {
     ByteSize::mib(5)
 }
 
+fn default_max_blob_size() -> ByteSize {
+    ByteSize::gib(100)
+}
+
 fn default_update_pull_time() -> bool {
     false
+}
+
+fn default_allow_missing_manifest_references() -> bool {
+    true
 }
 
 impl Default for GlobalConfig {
@@ -112,6 +137,7 @@ impl Default for GlobalConfig {
             max_concurrent_cache_jobs: default_max_concurrent_cache_jobs(),
             max_concurrent_replication_jobs: default_max_concurrent_replication_jobs(),
             max_manifest_size: default_max_manifest_size(),
+            max_blob_size: default_max_blob_size(),
             update_pull_time: default_update_pull_time(),
             enable_redirect: None,
             enable_blob_redirect: None,
@@ -120,6 +146,7 @@ impl Default for GlobalConfig {
             retention_policy: RetentionPolicyConfig::default(),
             immutable_tags: false,
             immutable_tags_exclusions: Vec::new(),
+            allow_missing_manifest_references: default_allow_missing_manifest_references(),
             authorization_webhook: None,
             event_webhooks: Vec::new(),
             job_queue: None,
@@ -143,6 +170,10 @@ impl GlobalConfig {
     pub fn max_manifest_size_bytes(&self) -> usize {
         usize::try_from(self.max_manifest_size.as_u64()).unwrap_or(usize::MAX)
     }
+
+    pub fn max_blob_size_bytes(&self) -> u64 {
+        self.max_blob_size.as_u64()
+    }
 }
 
 #[cfg(test)]
@@ -161,9 +192,14 @@ mod tests {
         assert_eq!(config.max_concurrent_cache_jobs.get(), 4);
         assert_eq!(config.max_concurrent_replication_jobs.get(), 4);
         assert_eq!(config.max_manifest_size, ByteSize::mib(5));
+        assert_eq!(config.max_blob_size, ByteSize::gib(100));
         assert!(!config.update_pull_time);
         assert!(!config.immutable_tags);
         assert!(config.immutable_tags_exclusions.is_empty());
+        assert!(
+            config.allow_missing_manifest_references,
+            "manifest-reference validation is permissive by default (pre-1.2.0 behavior)"
+        );
         assert!(config.authorization_webhook.is_none());
     }
 
@@ -175,9 +211,11 @@ mod tests {
             max_concurrent_cache_jobs = 8
             max_concurrent_replication_jobs = 6
             max_manifest_size = "7MiB"
+            max_blob_size = "10GiB"
             update_pull_time = true
             immutable_tags = true
             immutable_tags_exclusions = ["latest", "dev"]
+            allow_missing_manifest_references = false
             authorization_webhook = "my-webhook"
             "#,
         )
@@ -193,8 +231,10 @@ mod tests {
             NonZeroUsize::new(6).unwrap()
         );
         assert_eq!(config.max_manifest_size, ByteSize::mib(7));
+        assert_eq!(config.max_blob_size, ByteSize::gib(10));
         assert!(config.update_pull_time);
         assert!(config.immutable_tags);
+        assert!(!config.allow_missing_manifest_references);
         assert_eq!(config.immutable_tags_exclusions.len(), 2);
         assert_eq!(config.immutable_tags_exclusions[0].as_source(), "latest");
         assert_eq!(config.immutable_tags_exclusions[1].as_source(), "dev");
@@ -221,5 +261,15 @@ mod tests {
         };
 
         assert_eq!(config.max_manifest_size_bytes(), 6 * 1024 * 1024);
+    }
+
+    #[test]
+    fn max_blob_size_bytes_returns_u64() {
+        let config = GlobalConfig {
+            max_blob_size: ByteSize::gib(6),
+            ..GlobalConfig::default()
+        };
+
+        assert_eq!(config.max_blob_size_bytes(), 6 * 1024 * 1024 * 1024);
     }
 }

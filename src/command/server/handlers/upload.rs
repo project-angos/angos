@@ -103,7 +103,7 @@ pub async fn handle_patch_upload<S>(
     namespace: &Namespace,
     uuid: Uuid,
     start_offset: Option<u64>,
-    content_length: u64,
+    content_length: Option<u64>,
     body_stream: S,
 ) -> Result<Response<ResponseBody>, Error>
 where
@@ -126,7 +126,7 @@ pub async fn handle_put_upload<S>(
     namespace: &Namespace,
     uuid: Uuid,
     digest: &Digest,
-    content_length: u64,
+    content_length: Option<u64>,
     body_reader: S,
     identity: &ClientIdentity,
 ) -> Result<EventfulResponse, Error>
@@ -163,9 +163,9 @@ pub async fn dispatch_patch_upload(
 ) -> Result<Response<ResponseBody>, Error> {
     let headers = RequestHeaders::new(&parts.headers);
     let start_offset = headers.range(CONTENT_RANGE)?.map(|(start, _)| start);
-    let content_length = headers.content_length()?.ok_or(Error::BadRequest(
-        "No Content-Length header provided".to_string(),
-    ))?;
+    // A missing Content-Length is a chunked (Transfer-Encoding: chunked) upload,
+    // which docker push sends; the body is then streamed to EOF.
+    let content_length = headers.content_length()?;
     let body_stream = incoming_into_async_read(incoming);
 
     handle_patch_upload(
@@ -189,7 +189,7 @@ pub async fn dispatch_put_upload(
     identity: &ClientIdentity,
 ) -> Result<Response<ResponseBody>, Error> {
     let headers = RequestHeaders::new(&parts.headers);
-    let content_length = headers.content_length()?.unwrap_or(0);
+    let content_length = headers.content_length()?;
     let body_stream = incoming_into_async_read(incoming);
 
     dispatch_eventful(

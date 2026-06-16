@@ -25,6 +25,8 @@ pub enum Error {
     ManifestBlobUnknown,
     #[error("manifest body exceeds supported size limit of {limit} bytes")]
     ManifestBodyTooLarge { limit: usize },
+    #[error("blob body exceeds supported size limit of {limit} bytes")]
+    BlobBodyTooLarge { limit: usize },
     #[error("manifest invalid: {0}")]
     ManifestInvalid(String),
     #[error("manifest unknown to registry")]

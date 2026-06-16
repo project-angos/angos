@@ -20,6 +20,16 @@ max_concurrent_cache_jobs = 4
 max_concurrent_replication_jobs = 4   # replication-job concurrency for angos worker, the in-process drain, and the scrub --replicate drain (must be > 0)
 update_pull_time = false
 
+# Maximum total size of a single blob upload (default 100GiB, must be > 0). A
+# larger upload is rejected with BLOB_UPLOAD_INVALID (HTTP 413).
+#max_blob_size = "100GiB"
+
+# Accept a manifest push even when a referenced blob or child manifest is not yet
+# present/owned in the namespace (default true, pre-1.2.0 behavior). Set to false to
+# reject such pushes with MANIFEST_BLOB_UNKNOWN (stricter; can reject some valid
+# docker buildx/bake index and attestation pushes). `subject` referrers are always exempt.
+#allow_missing_manifest_references = true
+
 # Optional: Global access policy that applies to all repositories
 # If not defined, repositories without specific policies will deny access
 #[global.access_policy]

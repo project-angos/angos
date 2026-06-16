@@ -24,7 +24,9 @@ use crate::{
         DOCKER_CONTENT_DIGEST, Error, Registry, Repository,
         blob_ownership::BlobOwnership,
         blob_store::Error as BlobStoreError,
-        metadata_store::{Error as MetadataStoreError, LinkMetadata, link_kind::LinkKind},
+        metadata_store::{
+            Error as MetadataStoreError, LinkMetadata, LinkOperation, link_kind::LinkKind,
+        },
     },
     replication::{
         REPLICATION_DELETE_MANIFEST_KIND, REPLICATION_PUSH_MANIFEST_KIND, REPLICATION_QUEUE,
@@ -34,6 +36,22 @@ use crate::{
 };
 
 pub const DEFAULT_MAX_MANIFEST_SIZE_BYTES: usize = 5 * 1024 * 1024;
+
+/// How a manifest push treats descriptors that reference content the target
+/// namespace does not already own.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReferencePolicy {
+    /// Reject the push with `MANIFEST_BLOB_UNKNOWN`.
+    Strict,
+    /// Store the manifest but skip the ownership-granting links for unowned
+    /// references, so they stay dangling and resolve as unknown on a later pull
+    /// instead of handing the namespace read access to content it never pushed.
+    Permissive,
+    /// Trust every reference as owned. Used only by pull-through cache-fill,
+    /// where the referenced content is fetched from the upstream the namespace
+    /// mirrors.
+    Trusted,
+}
 
 fn manifest_event(
     kind: EventKind,
@@ -211,7 +229,7 @@ impl Registry {
             &reference,
             media_type.as_ref(),
             &content,
-            false,
+            ReferencePolicy::Trusted,
             None,
         )
         .await?;
@@ -278,8 +296,15 @@ impl Registry {
         content_type: Option<&String>,
         body: &[u8],
     ) -> Result<PutManifestResponse, Error> {
-        self.store_manifest(namespace, reference, content_type, body, true, None)
-            .await
+        self.store_manifest(
+            namespace,
+            reference,
+            content_type,
+            body,
+            ReferencePolicy::Strict,
+            None,
+        )
+        .await
     }
 
     async fn store_manifest(
@@ -288,7 +313,7 @@ impl Registry {
         reference: &Reference,
         content_type: Option<&String>,
         body: &[u8],
-        validate_references: bool,
+        reference_policy: ReferencePolicy,
         created_at: Option<DateTime<Utc>>,
     ) -> Result<PutManifestResponse, Error> {
         let mut manifest = parse_and_validate_manifest(body, content_type)?;
@@ -305,22 +330,28 @@ impl Registry {
             ));
         }
 
-        if validate_references {
-            self.validate_manifest_references(namespace, &manifest)
-                .await?;
-        }
-
         let effective_media_type = content_type
             .cloned()
             .or_else(|| manifest.media_type.clone());
 
-        let ops = link_plan::push(
+        let mut ops = link_plan::push(
             &mut manifest,
             &computed_digest,
             reference,
             effective_media_type.as_deref(),
             body.len() as u64,
         );
+
+        match reference_policy {
+            ReferencePolicy::Strict => {
+                self.validate_manifest_references(namespace, &manifest)
+                    .await?;
+            }
+            ReferencePolicy::Permissive => {
+                ops = self.retain_owned_reference_links(namespace, ops).await?;
+            }
+            ReferencePolicy::Trusted => {}
+        }
 
         let commit = self
             .metadata_store
@@ -390,6 +421,29 @@ impl Registry {
             }
             Err(error) => Err(error.into()),
         }
+    }
+
+    /// Drops the content-reference links (config, layer, child manifest) for
+    /// descriptors the namespace does not already own, leaving the manifest's
+    /// own digest, tag, and subject back-link untouched, so a permissive push
+    /// never grants read access to a digest the namespace did not upload.
+    async fn retain_owned_reference_links(
+        &self,
+        namespace: &Namespace,
+        ops: Vec<LinkOperation>,
+    ) -> Result<Vec<LinkOperation>, Error> {
+        let ownership = BlobOwnership::new(self.metadata_store.as_ref());
+        let mut retained = Vec::with_capacity(ops.len());
+        for op in ops {
+            if let LinkOperation::Create { link, target, .. } = &op
+                && link.is_tracked()
+                && !ownership.can_read(namespace, target).await?
+            {
+                continue;
+            }
+            retained.push(op);
+        }
+        Ok(retained)
     }
 
     #[instrument(skip(actor))]
@@ -760,13 +814,18 @@ impl Registry {
         self.check_lww_not_superseded(namespace, &reference, source_ts, incoming_digest.as_ref())
             .await?;
 
+        let reference_policy = if self.validate_manifest_references {
+            ReferencePolicy::Strict
+        } else {
+            ReferencePolicy::Permissive
+        };
         let mut response = self
             .store_manifest(
                 namespace,
                 &reference,
                 Some(&mime_type),
                 &request_body,
-                true,
+                reference_policy,
                 source_ts,
             )
             .await?;

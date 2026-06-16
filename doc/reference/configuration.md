@@ -54,16 +54,27 @@ When omitted, the server runs without TLS (insecure).
 | `max_concurrent_cache_jobs` | usize    | `4`      | Maximum concurrent cache jobs (minimum `1`). With `[global.job_queue]` enabled, also bounds the number of jobs each `angos worker` processes in parallel. |
 | `max_concurrent_replication_jobs` | non-zero usize | `4` | Concurrency for replication jobs (minimum `1`). Bounds how many replication pushes are handled in parallel by each `angos worker`, the server's in-process drain, and the `scrub --replicate` end-of-run drain. |
 | `max_manifest_size`         | string   | `"5MiB"` | Maximum manifest body size accepted from clients or upstream registries |
+| `max_blob_size`             | string   | `"100GiB"` | Maximum total size of a single blob upload; a larger upload is rejected with `BLOB_UPLOAD_INVALID` (HTTP 413) |
 | `update_pull_time`          | bool     | `false`  | Track pull times for retention policies     |
 | `enable_redirect`           | bool     | -        | **Deprecated.** Fallback for both fields below when unset. |
 | `enable_blob_redirect`      | bool     | `true`   | Allow HTTP 307 redirects for blob downloads. |
 | `enable_manifest_redirect`  | bool     | `true`   | Allow HTTP 307 redirects for manifest downloads. Manifest bodies served via `response-content-type` to preserve the media type across redirects. |
 | `immutable_tags`            | bool     | `false`  | Global immutable tags default               |
 | `immutable_tags_exclusions` | [string] | `[]`     | Regex patterns for mutable tags             |
+| `allow_missing_manifest_references` | bool | `true` | When `true` (default), accept a manifest push whose referenced blobs or child manifests are not yet present/owned in the namespace; the missing references stay unreadable until their content is pushed. Set to `false` to reject such pushes with `MANIFEST_BLOB_UNKNOWN`. See note below. |
 | `authorization_webhook`     | string   | -        | Name of webhook for authorization           |
 | `event_webhooks`            | [string] | `[]`     | Event webhook names for all repositories    |
 
-`max_manifest_size` must be greater than zero.
+`max_manifest_size` and `max_blob_size` must be greater than zero.
+
+#### `allow_missing_manifest_references`
+
+This controls whether the live manifest-push path enforces the OCI distribution-spec *option* of rejecting a manifest whose descriptors reference content the registry does not have.
+
+- **`true` (default).** A push is accepted even if a referenced config, layer, or child manifest is absent from or not owned by the target namespace. The unowned references are not granted to the namespace: they resolve as unknown on a later pull (`BLOB_UNKNOWN` for a blob, `MANIFEST_UNKNOWN` for a child manifest) until their content is pushed. This maximizes compatibility with clients such as `docker buildx`/`bake`, which push multi-manifest image indexes and provenance/SBOM attestations whose children are not always namespace-local at validation time.
+- **`false`.** A push whose references are missing is rejected outright with `MANIFEST_BLOB_UNKNOWN` (HTTP 404). This is stricter and conformance-oriented.
+
+Either setting preserves namespace isolation: a caller never gains read access to a blob digest it never uploaded. Inbound replicated manifest pushes follow the same rule; angos-to-angos replication pushes a manifest's children and blobs before the manifest itself, so its references are always owned. `subject` references (referrers) are always accepted regardless of this setting, per the spec. Pull-through cache-fill writes are trusted, independent of this flag.
 
 ### Durable Job Queue (`global.job_queue`)
 
@@ -163,15 +174,17 @@ The registry supports two modes for uploading blobs to S3, controlled by `multip
 
 **Non-uniform mode (default, `multipart_uniform_parts = false`)**
 
-Each OCI `PATCH` request streams directly into a long-lived S3 multipart upload as an `UploadPart` with known `Content-Length`. Parts are uploaded directly, with no intermediate objects or assembly phase. When the client completes the upload with a `PUT` request, the multipart upload is finalized and the blob is copied to its content-addressed path. This mode works with most S3-compatible providers.
+Each OCI `PATCH` request streams into a long-lived S3 multipart upload, with no intermediate objects or assembly phase. When the client completes the upload with a `PUT` request, the multipart upload is finalized and the blob is copied to its content-addressed path. This mode works with most S3-compatible providers.
 
-Memory usage per upload: ~8 KiB during each `PATCH` (a single streaming read frame). No data is buffered in memory beyond the current frame.
+A `PATCH` that carries a `Content-Length` is uploaded directly as an `UploadPart` with that known length. A chunked `PATCH` (no `Content-Length`, as `docker push` sends) is streamed to EOF. When `multipart_part_size` is above the 5 MiB floor, it is coalesced server-side into `part_size` parts via `UploadPartCopy`, buffering at most one 5 MiB sub-part and restaging the trailing remainder. When `multipart_part_size` is exactly 5 MiB, it streams plain 5 MiB parts directly with no coalescing.
+
+Memory usage per upload: for a known-length `PATCH`, up to one ~1 MiB streaming read frame, with no data buffered beyond the current frame. For a coalesced chunked `PATCH` (`multipart_part_size` above the 5 MiB floor), at most one buffered 5 MiB sub-part, at the cost of moving each byte twice within S3 (into a scratch object, then `UploadPartCopy` into the upload).
 
 **Uniform mode (`multipart_uniform_parts = true`)**
 
-A long-lived S3 multipart upload is maintained across all `PATCH` requests. Each committed part is exactly `multipart_part_size` bytes (except the last). The S3 protocol only requires non-final parts to be ≥ 5 MiB; uniform sizing is an additional constraint imposed by some S3 storage providers. Use this mode only if your provider rejects uploads with variable part sizes.
+A long-lived S3 multipart upload is maintained across all `PATCH` requests. Both a known-length `PATCH` and a chunked `PATCH` (no `Content-Length`, as `docker push` sends) commit non-final parts of exactly `multipart_part_size` bytes; the final part may be smaller. The S3 protocol only requires non-final parts to be ≥ 5 MiB; uniform sizing is an additional constraint imposed by some S3 storage providers. Use this mode only if your provider rejects uploads with variable part sizes.
 
-Memory usage per upload: streaming read frames for full parts, plus at most one trailing staged chunk smaller than `multipart_part_size`.
+Memory usage per upload: streaming read frames for full parts, plus at most one trailing staged chunk smaller than `multipart_part_size`. A chunked `PATCH` buffers up to one `multipart_part_size` part, the same as the known-length remainder.
 
 ```toml
 # Most S3 providers (AWS S3, MinIO, Exoscale, etc.)

@@ -25,12 +25,17 @@ pub struct OrphanMultipartUpload {
 
 /// Inverse of [`path_builder::upload_path`]: parses
 /// `v2/repositories/{namespace}/_uploads/{uuid}/data` into `(namespace, uuid)`.
+/// Also parses the coalesce scratch key
+/// `v2/repositories/{namespace}/_uploads/{uuid}/staged/coalesce`, so a scratch
+/// multipart stranded by a crash maps to the same session and can be reclaimed.
 ///
 /// Returns slices borrowed from `key` so cleanup passes don't allocate per upload.
 pub fn parse_upload_key(key: &str) -> Option<(&str, &str)> {
-    key.strip_prefix(path_builder::repository_dir())?
-        .strip_prefix('/')?
-        .strip_suffix("/data")?
+    let rest = key
+        .strip_prefix(path_builder::repository_dir())?
+        .strip_prefix('/')?;
+    rest.strip_suffix("/data")
+        .or_else(|| rest.strip_suffix("/staged/coalesce"))?
         .rsplit_once("/_uploads/")
 }
 
@@ -164,6 +169,13 @@ mod tests {
     #[test]
     fn test_parse_upload_key_valid() {
         let result = parse_upload_key("v2/repositories/my-repo/_uploads/abc-123-def/data");
+        assert_eq!(result, Some(("my-repo", "abc-123-def")));
+    }
+
+    #[test]
+    fn test_parse_upload_key_coalesce_scratch() {
+        let result =
+            parse_upload_key("v2/repositories/my-repo/_uploads/abc-123-def/staged/coalesce");
         assert_eq!(result, Some(("my-repo", "abc-123-def")));
     }
 

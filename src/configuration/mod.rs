@@ -193,6 +193,12 @@ fn validate_global(
         ));
     }
 
+    if global.max_blob_size.as_u64() == 0 {
+        return Err(Error::InvalidFormat(
+            "global.max_blob_size must be greater than zero".to_string(),
+        ));
+    }
+
     global
         .authorization_webhook
         .as_ref()

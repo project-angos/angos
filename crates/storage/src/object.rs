@@ -143,10 +143,16 @@ pub trait ObjectStore: Send + Sync {
     /// write.
     async fn create_upload(&self, key: &str) -> Result<(), Error>;
 
-    /// Append `body` (exactly `len` bytes) to the upload at `key`. Returns the
-    /// new total uploaded size. Streamed end-to-end: backends never buffer the
-    /// full payload. Append-only.
-    async fn write_upload(&self, key: &str, body: ByteStream, len: u64) -> Result<u64, Error>;
+    /// Append `body` to the upload at `key`, returning the new total uploaded
+    /// size. `Some(len)` declares an exact byte count and is validated;
+    /// `None` streams the body to EOF (a chunked request with no
+    /// `Content-Length`). Append-only.
+    async fn write_upload(
+        &self,
+        key: &str,
+        body: ByteStream,
+        len: Option<u64>,
+    ) -> Result<u64, Error>;
 
     /// Finalise the upload at `key`: the assembled object becomes visible at
     /// `key` via the read methods (an empty object when nothing was written).
