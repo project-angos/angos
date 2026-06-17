@@ -18,7 +18,7 @@ use crate::{
         blob_store::{self, sha256_ext::Sha256Ext},
         job_store::JobStore,
         manifest::DEFAULT_MAX_MANIFEST_SIZE_BYTES,
-        metadata_store::{LinkOperation, MetadataStore, link_kind::LinkKind},
+        metadata_store::{LinkKind, LinkOperation, MetadataStore},
         path_builder, repository,
         repository_resolver::RepositoryResolver,
         s3_connection::S3ConnectionConfig,

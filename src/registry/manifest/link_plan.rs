@@ -12,7 +12,7 @@
 
 use crate::{
     oci::{Digest, Manifest, Reference},
-    registry::metadata_store::{LinkOperation, link_kind::LinkKind},
+    registry::metadata_store::{LinkKind, LinkOperation},
 };
 
 /// Produces the `LinkOperation::Create` set needed to store a manifest

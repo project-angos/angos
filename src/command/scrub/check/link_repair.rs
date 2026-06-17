@@ -5,7 +5,7 @@ use tracing::debug;
 use crate::{
     command::scrub::{action::Action, error::Error, executor::ActionSink},
     oci::Digest,
-    registry::metadata_store::{MetadataStore, link_kind::LinkKind},
+    registry::metadata_store::{LinkKind, MetadataStore},
 };
 
 pub async fn ensure_link(

@@ -108,7 +108,7 @@ mod tests {
     use crate::{
         oci::{Digest, Namespace},
         registry::{
-            metadata_store::{LinkOperation, link_kind::LinkKind},
+            metadata_store::{LinkKind, LinkOperation},
             test_utils::backends,
         },
     };

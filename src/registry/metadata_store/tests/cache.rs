@@ -4,7 +4,7 @@ use super::{test_backend_with_cache, test_config};
 use crate::{
     oci::Digest,
     registry::{
-        metadata_store::{Error, LinkMetadata, LinkOperation, link_kind::LinkKind},
+        metadata_store::{Error, LinkKind, LinkMetadata, LinkOperation},
         path_builder,
     },
 };

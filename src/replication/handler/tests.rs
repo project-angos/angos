@@ -18,7 +18,7 @@ use crate::{
         DOCKER_CONTENT_DIGEST, Repository,
         blob_store::BlobStore,
         job_store::{JobEnvelope, JobHandler},
-        metadata_store::{LinkOperation, MetadataStore, link_kind::LinkKind},
+        metadata_store::{LinkKind, LinkOperation, MetadataStore},
         repository_resolver::RepositoryResolver,
         test_utils::{
             build_store, build_test_fs_executor, downstream_client, put_blob_direct,

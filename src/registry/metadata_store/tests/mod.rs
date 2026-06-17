@@ -23,9 +23,7 @@ use crate::{
     metrics_provider,
     oci::{Descriptor, Digest, Namespace},
     registry::{
-        metadata_store::{
-            BlobIndex, Error, LinkMetadata, LinkOperation, MetadataStore, link_kind::LinkKind,
-        },
+        metadata_store::{BlobIndex, Error, LinkKind, LinkMetadata, LinkOperation, MetadataStore},
         path_builder,
         s3_connection::S3ConnectionConfig,
         test_utils::{backends, build_store, put_blob_direct},

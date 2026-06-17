@@ -15,7 +15,7 @@ use crate::{
     oci::Digest,
     registry::{
         blob_store,
-        metadata_store::{Error as MetadataError, MetadataStore, link_kind::LinkKind},
+        metadata_store::{Error as MetadataError, LinkKind, MetadataStore},
     },
 };
 

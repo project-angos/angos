@@ -9,7 +9,7 @@ use super::{TestS3Config, legacy_blob_index_with, put_legacy_index, test_config}
 use crate::{
     oci::Digest,
     registry::{
-        metadata_store::{BlobIndex, LinkOperation, link_kind::LinkKind},
+        metadata_store::{BlobIndex, LinkKind, LinkOperation},
         path_builder,
     },
 };

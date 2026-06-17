@@ -23,7 +23,7 @@ use crate::{
         DOCKER_CONTENT_DIGEST, OCI_SUBJECT,
         blob_store::BlobStore,
         manifest::DEFAULT_MAX_MANIFEST_SIZE_BYTES,
-        metadata_store::{BlobIndexOperation, LinkOperation, MetadataStore, link_kind::LinkKind},
+        metadata_store::{BlobIndexOperation, LinkKind, LinkOperation, MetadataStore},
         test_utils::{build_store, build_test_fs_executor, put_blob_direct},
     },
     registry_client::{RegistryClient, UploadSession},

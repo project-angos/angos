@@ -568,7 +568,7 @@ mod tests {
             StartUploadResponse,
             blob_ownership::BlobOwnership,
             blob_store::BlobStore,
-            metadata_store::link_kind::LinkKind,
+            metadata_store::LinkKind,
             path_builder,
             repository_resolver::RepositoryResolver,
             test_utils::{

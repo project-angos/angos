@@ -19,7 +19,7 @@ use crate::{
     oci::{Digest, Reference},
     registry::{
         Error as RegistryError,
-        metadata_store::{MetadataStore, link_kind::LinkKind},
+        metadata_store::{LinkKind, MetadataStore},
         repository_resolver::RepositoryResolver,
     },
     registry_client::NO_LOCAL_PREFIX,
@@ -297,7 +297,7 @@ mod tests {
             DOCKER_CONTENT_DIGEST, Repository,
             blob_store::BlobStore,
             job_store::JobStore,
-            metadata_store::{LinkOperation, MetadataStore, link_kind::LinkKind},
+            metadata_store::{LinkKind, LinkOperation, MetadataStore},
             repository_resolver::RepositoryResolver,
             test_utils::{
                 build_store, build_test_fs_executor, downstream_client, put_blob_direct,

@@ -150,7 +150,7 @@ mod tests {
     use crate::{
         oci::{Namespace, Reference},
         registry::{
-            metadata_store::{LinkOperation, link_kind::LinkKind},
+            metadata_store::{LinkKind, LinkOperation},
             test_utils::{backends, create_test_blob, put_blob_direct},
         },
     };

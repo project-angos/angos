@@ -4,9 +4,7 @@ use crate::{
     oci::{Digest, Namespace},
     registry::{
         Error,
-        metadata_store::{
-            BlobIndexOperation, Error as MetadataError, MetadataStore, link_kind::LinkKind,
-        },
+        metadata_store::{BlobIndexOperation, Error as MetadataError, LinkKind, MetadataStore},
     },
 };
 

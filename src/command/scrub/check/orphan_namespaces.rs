@@ -182,9 +182,7 @@ mod tests {
         policy::{RetentionPolicy, RetentionPolicyConfig, SystemClock},
         registry::{
             Repository,
-            metadata_store::{
-                BlobIndexOperation, LinkOperation, MetadataStore, link_kind::LinkKind,
-            },
+            metadata_store::{BlobIndexOperation, LinkKind, LinkOperation, MetadataStore},
             repository_resolver::RepositoryResolver,
             test_utils::{self, backends, put_blob_direct},
         },

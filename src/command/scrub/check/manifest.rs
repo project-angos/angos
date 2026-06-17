@@ -13,7 +13,7 @@ use crate::{
     oci::Digest,
     registry::{
         blob_store,
-        metadata_store::{MetadataStore, link_kind::LinkKind},
+        metadata_store::{LinkKind, MetadataStore},
         parse_manifest_digests,
     },
 };
@@ -87,7 +87,7 @@ mod tests {
         command::scrub::{action::Action, executor::Executor},
         oci::Namespace,
         registry::{
-            metadata_store::{LinkOperation, link_kind::LinkKind},
+            metadata_store::{LinkKind, LinkOperation},
             test_utils::{self, backends, put_blob_direct},
         },
     };

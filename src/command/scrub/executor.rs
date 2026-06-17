@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{future::Future, sync::Arc};
 
 use async_trait::async_trait;
 use chrono::Utc;
@@ -7,14 +7,13 @@ use tracing::{debug, info, warn};
 use crate::{
     command::scrub::{action::Action, error::Error},
     metrics_provider::metrics_provider,
-    oci::{Manifest, Reference},
+    oci::{Digest, Manifest, Reference},
     registry::{
         blob_store::{self, MultipartCleanup},
-        job_store::{Error as JobStoreError, JobEnvelope, JobStore},
+        job_store::{Error as JobStoreError, JobEnvelope, JobState, JobStore},
         manifest::link_plan,
         metadata_store::{
-            BlobIndexOperation, Error as MetadataError, LinkOperation, MetadataStore,
-            link_kind::LinkKind,
+            BlobIndexOperation, Error as MetadataError, LinkKind, LinkOperation, MetadataStore,
         },
     },
     replication::{
@@ -106,111 +105,312 @@ pub fn record_reconcile_outcome(outcome: &str) {
         .inc();
 }
 
+impl Executor {
+    /// Acquire the `blob-data:{digest}` coarse lock (the same one manifest
+    /// pushes and upload completions take), run `critical_section` while holding
+    /// it, then release the lock whatever the section's outcome.
+    ///
+    /// The lock spans a re-check plus a data mutation so a reference a
+    /// concurrent push is granting cannot be missed and have its bytes reclaimed
+    /// underneath it.
+    async fn with_blob_data_lock<F, Fut>(
+        &self,
+        digest: &Digest,
+        critical_section: F,
+    ) -> Result<(), Error>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = Result<(), Error>>,
+    {
+        let session = self.metadata_store.acquire_blob_data_lock(digest).await?;
+        let result = critical_section().await;
+        session.release().await;
+        result
+    }
+
+    async fn migrate_blob_index(&self, digest: Digest) -> Result<(), Error> {
+        self.metadata_store.migrate_blob_index(&digest).await?;
+        Ok(())
+    }
+
+    async fn prune_legacy_namespace_registry(&self) -> Result<(), Error> {
+        self.metadata_store
+            .delete_legacy_namespace_registry()
+            .await?;
+        Ok(())
+    }
+
+    async fn delete_orphan_blob(&self, digest: Digest) -> Result<(), Error> {
+        self.with_blob_data_lock(&digest, || async {
+            match self.metadata_store.has_blob_references(&digest).await {
+                Err(e) => Err(Error::from(e)),
+                Ok(true) => {
+                    info!("skipping orphan blob deletion: reference appeared for {digest}");
+                    Ok(())
+                }
+                Ok(false) => match self.blob_store.delete_blob(&digest).await {
+                    Ok(())
+                    | Err(
+                        blob_store::Error::BlobNotFound | blob_store::Error::ReferenceNotFound,
+                    ) => Ok(()),
+                    Err(e) => Err(Error::from(e)),
+                },
+            }
+        })
+        .await
+    }
+
+    async fn remove_blob_index_link(
+        &self,
+        namespace: String,
+        blob: Digest,
+        link: LinkKind,
+    ) -> Result<(), Error> {
+        self.metadata_store
+            .update_blob_index(&namespace, &blob, BlobIndexOperation::Remove(link))
+            .await?;
+        Ok(())
+    }
+
+    async fn remove_orphan_blob_grant(&self, namespace: String, blob: Digest) -> Result<(), Error> {
+        self.with_blob_data_lock(&blob, || async {
+            // Re-check under the lock: a manifest reference may have appeared
+            // since the checker classified the grant as orphaned.
+            let links = match self
+                .metadata_store
+                .read_blob_index_namespace(&namespace, &blob)
+                .await
+            {
+                Ok(links) => links,
+                // The grant vanished since classification (a concurrent revoke
+                // or delete): nothing left to do.
+                Err(MetadataError::ReferenceNotFound) => return Ok(()),
+                Err(e) => return Err(Error::from(e)),
+            };
+            if links.iter().any(LinkKind::is_tracked) {
+                info!(
+                    "skipping orphan grant revoke: a manifest reference appeared for '{namespace}/{blob}'"
+                );
+                return Ok(());
+            }
+            self.metadata_store
+                .revoke_blob_ownership(&namespace, &blob)
+                .await
+                .map_err(Error::from)
+        })
+        .await
+    }
+
+    async fn recreate_link(
+        &self,
+        namespace: String,
+        link: LinkKind,
+        target: Digest,
+    ) -> Result<(), Error> {
+        self.metadata_store
+            .update_links(&namespace, &[LinkOperation::create(link, target)])
+            .await?;
+        Ok(())
+    }
+
+    async fn add_referrer(
+        &self,
+        namespace: String,
+        link: LinkKind,
+        target: Digest,
+        referrer: Digest,
+    ) -> Result<(), Error> {
+        self.metadata_store
+            .update_links(
+                &namespace,
+                &[LinkOperation::create_with_referrer(link, target, referrer)],
+            )
+            .await?;
+        Ok(())
+    }
+
+    async fn set_media_type(
+        &self,
+        namespace: String,
+        link: LinkKind,
+        target: Digest,
+        media_type: String,
+    ) -> Result<(), Error> {
+        self.metadata_store
+            .update_links(
+                &namespace,
+                &[LinkOperation::create_with_media_type(
+                    link,
+                    target,
+                    Some(media_type),
+                )],
+            )
+            .await?;
+        Ok(())
+    }
+
+    async fn delete_tag(&self, namespace: String, tag: String) -> Result<(), Error> {
+        self.metadata_store
+            .update_links(&namespace, &[LinkOperation::delete(LinkKind::Tag(tag))])
+            .await?;
+        Ok(())
+    }
+
+    async fn delete_orphan_manifest(&self, namespace: String, digest: Digest) -> Result<(), Error> {
+        let manifest = match self.blob_store.read(&digest).await {
+            Ok(content) => Manifest::from_slice(&content).ok(),
+            Err(blob_store::Error::BlobNotFound | blob_store::Error::ReferenceNotFound) => {
+                warn!("Manifest blob missing for {digest}, proceeding with metadata-only deletion");
+                None
+            }
+            Err(e) => return Err(Error::from(e)),
+        };
+        let tags = self
+            .metadata_store
+            .find_tags_pointing_at(&namespace, &digest)
+            .await?;
+        let ops = link_plan::delete(&Reference::Digest(digest), manifest.as_ref(), &tags);
+        self.metadata_store.update_links(&namespace, &ops).await?;
+        Ok(())
+    }
+
+    async fn delete_expired_upload(&self, namespace: String, uuid: String) -> Result<(), Error> {
+        self.blob_store.delete_upload(&namespace, &uuid).await?;
+        Ok(())
+    }
+
+    async fn delete_orphan_referrer(
+        &self,
+        namespace: String,
+        subject: Digest,
+        referrer: Digest,
+    ) -> Result<(), Error> {
+        self.metadata_store
+            .update_links(
+                &namespace,
+                &[LinkOperation::delete(LinkKind::Referrer(subject, referrer))],
+            )
+            .await?;
+        Ok(())
+    }
+
+    async fn remove_referrer(
+        &self,
+        namespace: String,
+        link: LinkKind,
+        referrer: Digest,
+    ) -> Result<(), Error> {
+        self.metadata_store
+            .update_links(
+                &namespace,
+                &[LinkOperation::delete_with_referrer(link, referrer)],
+            )
+            .await?;
+        Ok(())
+    }
+
+    async fn abort_multipart_upload(&self, key: String, upload_id: String) -> Result<(), Error> {
+        self.blob_store
+            .abort_orphan_multipart_upload(&blob_store::OrphanMultipartUpload { key, upload_id })
+            .await?;
+        Ok(())
+    }
+
+    async fn enqueue_replication_push(
+        &self,
+        downstream: String,
+        namespace: String,
+        tag: String,
+        digest: Digest,
+    ) -> Result<(), Error> {
+        let payload = ReplicationPushPayload {
+            downstream,
+            namespace,
+            tag: Some(tag),
+            digest: Some(digest.to_string()),
+            kind: REPLICATION_PUSH_MANIFEST_KIND.to_string(),
+            // The handler stamps source_ts from the tag's created_at at execute
+            // time, so the push carries the same last-writer-wins version as the
+            // event path.
+            source_ts: None,
+        };
+        self.enqueue_replication(build_envelope(&payload)).await
+    }
+
+    async fn enqueue_replication_delete(
+        &self,
+        downstream: String,
+        namespace: String,
+        tag: String,
+    ) -> Result<(), Error> {
+        // Stamp `source_ts` with the prune decision time so the receiver runs
+        // last-writer-wins and preserves a downstream tag dated after this
+        // decision (clock skew, or a push racing the listing). That does NOT
+        // make prune active-active safe: a peer's newer tag created before this
+        // run is still deleted, so `prune = true` is one-way-mirror-only.
+        let payload = ReplicationPushPayload {
+            downstream,
+            namespace,
+            tag: Some(tag),
+            digest: None,
+            kind: REPLICATION_DELETE_MANIFEST_KIND.to_string(),
+            source_ts: Some(Utc::now().to_rfc3339()),
+        };
+        // The prune envelope keys on the bare reference so repeated runs
+        // coalesce instead of stacking one fresh-ts job per run.
+        self.enqueue_replication(build_prune_delete_envelope(&payload))
+            .await
+    }
+
+    async fn delete_orphan_job(
+        &self,
+        queue: &'static str,
+        state: JobState,
+        storage_key: String,
+    ) -> Result<(), Error> {
+        match self.job_store.delete_job(queue, state, &storage_key).await {
+            Ok(()) => Ok(()),
+            // A stale key means the job was claimed-and-completed or deleted
+            // concurrently; either way the orphan is gone.
+            Err(JobStoreError::NotFound) => {
+                debug!("{queue} job '{storage_key}' already gone; nothing to delete");
+                Ok(())
+            }
+            Err(e) => Err(Error::JobQueue(format!(
+                "failed to delete {queue} job '{storage_key}': {e}"
+            ))),
+        }
+    }
+}
+
 #[async_trait]
 impl ActionSink for Executor {
-    #[allow(clippy::too_many_lines)]
     async fn apply(&mut self, action: Action) -> Result<(), Error> {
         info!("{action}");
 
         match action {
-            Action::MigrateBlobIndex(digest) => {
-                self.metadata_store.migrate_blob_index(&digest).await?;
-            }
-            Action::PruneLegacyNamespaceRegistry => {
-                self.metadata_store
-                    .delete_legacy_namespace_registry()
-                    .await?;
-            }
-            Action::DeleteOrphanBlob(digest) => {
-                // Hold the `blob-data:{digest}` coarse lock (the same one
-                // manifest pushes and upload completions take) across the
-                // reference check and the data delete, so a reference that a
-                // concurrent push is granting cannot be missed and have its
-                // bytes reclaimed underneath it.
-                let session = self.metadata_store.acquire_blob_data_lock(&digest).await?;
-                let result = match self.metadata_store.has_blob_references(&digest).await {
-                    Err(e) => Err(Error::from(e)),
-                    Ok(true) => {
-                        info!("skipping orphan blob deletion: reference appeared for {digest}");
-                        Ok(())
-                    }
-                    Ok(false) => match self.blob_store.delete_blob(&digest).await {
-                        Ok(())
-                        | Err(
-                            blob_store::Error::BlobNotFound | blob_store::Error::ReferenceNotFound,
-                        ) => Ok(()),
-                        Err(e) => Err(Error::from(e)),
-                    },
-                };
-                session.release().await;
-                result?;
-            }
+            Action::MigrateBlobIndex(digest) => self.migrate_blob_index(digest).await,
+            Action::PruneLegacyNamespaceRegistry => self.prune_legacy_namespace_registry().await,
+            Action::DeleteOrphanBlob(digest) => self.delete_orphan_blob(digest).await,
             Action::RemoveBlobIndexLink {
                 namespace,
                 blob,
                 link,
-            } => {
-                self.metadata_store
-                    .update_blob_index(&namespace, &blob, BlobIndexOperation::Remove(link))
-                    .await?;
-            }
+            } => self.remove_blob_index_link(namespace, blob, link).await,
             Action::RemoveOrphanBlobGrant { namespace, blob } => {
-                // Hold the `blob-data:{digest}` coarse lock across the re-check
-                // and the revoke, the same one manifest pushes and upload
-                // completions take, so a reference a concurrent push is granting
-                // is never missed and reclaimed underneath it.
-                let session = self.metadata_store.acquire_blob_data_lock(&blob).await?;
-                let result = async {
-                    // Re-check under the lock: a manifest reference may have
-                    // appeared since the checker classified the grant as orphaned.
-                    let links = match self
-                        .metadata_store
-                        .read_blob_index_namespace(&namespace, &blob)
-                        .await
-                    {
-                        Ok(links) => links,
-                        // The grant vanished since classification (a concurrent
-                        // revoke or delete): nothing left to do.
-                        Err(MetadataError::ReferenceNotFound) => return Ok(()),
-                        Err(e) => return Err(Error::from(e)),
-                    };
-                    if links.iter().any(LinkKind::is_tracked) {
-                        info!(
-                            "skipping orphan grant revoke: a manifest reference appeared for '{namespace}/{blob}'"
-                        );
-                        return Ok(());
-                    }
-                    self.metadata_store
-                        .revoke_blob_ownership(&namespace, &blob)
-                        .await
-                        .map_err(Error::from)
-                }
-                .await;
-                session.release().await;
-                result?;
+                self.remove_orphan_blob_grant(namespace, blob).await
             }
             Action::RecreateLink {
                 namespace,
                 link,
                 target,
-            } => {
-                self.metadata_store
-                    .update_links(&namespace, &[LinkOperation::create(link, target)])
-                    .await?;
-            }
+            } => self.recreate_link(namespace, link, target).await,
             Action::AddReferrer {
                 namespace,
                 link,
                 target,
                 referrer,
-            } => {
-                self.metadata_store
-                    .update_links(
-                        &namespace,
-                        &[LinkOperation::create_with_referrer(link, target, referrer)],
-                    )
-                    .await?;
-            }
+            } => self.add_referrer(namespace, link, target, referrer).await,
             Action::SetMediaType {
                 namespace,
                 link,
@@ -218,74 +418,31 @@ impl ActionSink for Executor {
                 media_type,
                 ..
             } => {
-                self.metadata_store
-                    .update_links(
-                        &namespace,
-                        &[LinkOperation::create_with_media_type(
-                            link,
-                            target,
-                            Some(media_type),
-                        )],
-                    )
-                    .await?;
+                self.set_media_type(namespace, link, target, media_type)
+                    .await
             }
-            Action::DeleteTag { namespace, tag } => {
-                self.metadata_store
-                    .update_links(&namespace, &[LinkOperation::delete(LinkKind::Tag(tag))])
-                    .await?;
-            }
+            Action::DeleteTag { namespace, tag } => self.delete_tag(namespace, tag).await,
             Action::DeleteOrphanManifest { namespace, digest } => {
-                let manifest = match self.blob_store.read(&digest).await {
-                    Ok(content) => Manifest::from_slice(&content).ok(),
-                    Err(blob_store::Error::BlobNotFound | blob_store::Error::ReferenceNotFound) => {
-                        warn!(
-                            "Manifest blob missing for {digest}, proceeding with metadata-only deletion"
-                        );
-                        None
-                    }
-                    Err(e) => return Err(Error::from(e)),
-                };
-                let tags = self
-                    .metadata_store
-                    .find_tags_pointing_at(&namespace, &digest)
-                    .await?;
-                let ops = link_plan::delete(&Reference::Digest(digest), manifest.as_ref(), &tags);
-                self.metadata_store.update_links(&namespace, &ops).await?;
+                self.delete_orphan_manifest(namespace, digest).await
             }
             Action::DeleteExpiredUpload { namespace, uuid } => {
-                self.blob_store.delete_upload(&namespace, &uuid).await?;
+                self.delete_expired_upload(namespace, uuid).await
             }
             Action::DeleteOrphanReferrer {
                 namespace,
                 subject,
                 referrer,
             } => {
-                self.metadata_store
-                    .update_links(
-                        &namespace,
-                        &[LinkOperation::delete(LinkKind::Referrer(subject, referrer))],
-                    )
-                    .await?;
+                self.delete_orphan_referrer(namespace, subject, referrer)
+                    .await
             }
             Action::RemoveReferrer {
                 namespace,
                 link,
                 referrer,
-            } => {
-                self.metadata_store
-                    .update_links(
-                        &namespace,
-                        &[LinkOperation::delete_with_referrer(link, referrer)],
-                    )
-                    .await?;
-            }
+            } => self.remove_referrer(namespace, link, referrer).await,
             Action::AbortMultipartUpload { key, upload_id } => {
-                self.blob_store
-                    .abort_orphan_multipart_upload(&blob_store::OrphanMultipartUpload {
-                        key,
-                        upload_id,
-                    })
-                    .await?;
+                self.abort_multipart_upload(key, upload_id).await
             }
             Action::EnqueueReplicationPush {
                 downstream,
@@ -293,66 +450,24 @@ impl ActionSink for Executor {
                 tag,
                 digest,
             } => {
-                let payload = ReplicationPushPayload {
-                    downstream,
-                    namespace,
-                    tag: Some(tag),
-                    digest: Some(digest.to_string()),
-                    kind: REPLICATION_PUSH_MANIFEST_KIND.to_string(),
-                    // The handler stamps source_ts from the tag's created_at at
-                    // execute time, so the push carries the same last-writer-wins
-                    // version as the event path.
-                    source_ts: None,
-                };
-                self.enqueue_replication(build_envelope(&payload)).await?;
+                self.enqueue_replication_push(downstream, namespace, tag, digest)
+                    .await
             }
             Action::EnqueueReplicationDelete {
                 downstream,
                 namespace,
                 tag,
             } => {
-                // Stamp `source_ts` with the prune decision time so the receiver
-                // runs last-writer-wins and preserves a downstream tag dated after
-                // this decision (clock skew, or a push racing the listing). That
-                // does NOT make prune active-active safe: a peer's newer tag
-                // created before this run is still deleted, so `prune = true` is
-                // one-way-mirror-only.
-                let payload = ReplicationPushPayload {
-                    downstream,
-                    namespace,
-                    tag: Some(tag),
-                    digest: None,
-                    kind: REPLICATION_DELETE_MANIFEST_KIND.to_string(),
-                    source_ts: Some(Utc::now().to_rfc3339()),
-                };
-                // The prune envelope keys on the bare reference so repeated runs
-                // coalesce instead of stacking one fresh-ts job per run.
-                self.enqueue_replication(build_prune_delete_envelope(&payload))
-                    .await?;
+                self.enqueue_replication_delete(downstream, namespace, tag)
+                    .await
             }
             Action::DeleteOrphanJob {
                 queue,
                 state,
                 storage_key,
                 ..
-            } => {
-                match self.job_store.delete_job(queue, state, &storage_key).await {
-                    Ok(()) => {}
-                    // A stale key means the job was claimed-and-completed or
-                    // deleted concurrently; either way the orphan is gone.
-                    Err(JobStoreError::NotFound) => {
-                        debug!("{queue} job '{storage_key}' already gone; nothing to delete");
-                    }
-                    Err(e) => {
-                        return Err(Error::JobQueue(format!(
-                            "failed to delete {queue} job '{storage_key}': {e}"
-                        )));
-                    }
-                }
-            }
+            } => self.delete_orphan_job(queue, state, storage_key).await,
         }
-
-        Ok(())
     }
 }
 
@@ -382,7 +497,7 @@ mod tests {
         registry::{
             cache_job_handler::{CACHE_FETCH_BLOB_KIND, CACHE_QUEUE, CacheFetchBlobPayload},
             job_store::{FailOutcome, JobState},
-            metadata_store::{LinkOperation, link_kind::LinkKind},
+            metadata_store::{LinkKind, LinkOperation},
             test_utils::{backends, build_store, locked_executor_over, put_blob_direct},
         },
         replication::{REPLICATION_DELETE_MANIFEST_KIND, REPLICATION_QUEUE},

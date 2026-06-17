@@ -5,25 +5,16 @@ use tracing::warn;
 use crate::{
     oci::{Descriptor, Digest, Manifest},
     registry::{
-        metadata_store::{Error, LinkMetadata, link_kind::LinkKind},
+        metadata_store::{Error, LinkKind, LinkMetadata},
         path_builder,
     },
 };
 
 /// Resolves a single referrer entry to an [`OCI Descriptor`], applying an
-/// optional `artifact_type` filter.
-///
-/// The resolution strategy is:
-/// 1. Try the cached link metadata via `read_link`. If a `descriptor` is
-///    present and either passes the filter or has no `artifact_type` to compare
-///    (in which case we fall through to the manifest), return immediately.
-/// 2. Fall back to reading the manifest blob via `read_blob` and deriving the
-///    descriptor from it. This covers the initial push path where the link was
-///    created without a stored descriptor, and the fall-through case where the
-///    cached descriptor lacks `artifact_type` information needed for filtering.
-///
+/// optional `artifact_type` filter: returns the cached link descriptor when that
+/// suffices, else falls back to reading and parsing the manifest blob.
 /// `read_link` and `read_blob` are caller-supplied closures so the function
-/// stays backend-agnostic without introducing a new trait.
+/// stays backend-agnostic without a new trait.
 pub async fn resolve_referrer_descriptor<L, LFut, B, BFut>(
     subject_digest: &Digest,
     manifest_digest: Digest,

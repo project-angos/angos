@@ -17,9 +17,7 @@ use angos_tx_engine::{
 };
 
 use crate::registry::{
-    metadata_store::{
-        Error, LinkMetadata, MetadataStore, link_kind::LinkKind, link_ops::tx_error_to_meta,
-    },
+    metadata_store::{Error, LinkKind, LinkMetadata, MetadataStore, tx_error_to_meta},
     path_builder,
 };
 
@@ -96,10 +94,9 @@ impl MetadataStore {
 
     /// Flush a single access-time update via a read-modify-write transaction.
     ///
-    /// Reads the current link body, marks it accessed, and submits a
-    /// `Transaction` with a content-hash read guard so a concurrent writer's
-    /// fresher timestamp wins on conflict. Access times are advisory; a
-    /// `Conflict` after the retry budget is silently discarded.
+    /// A content-hash read guard lets a concurrent writer's fresher timestamp win
+    /// on conflict; access times are advisory, so a `Conflict` after the retry
+    /// budget is silently discarded.
     pub async fn flush_one_access_time(
         &self,
         namespace: &str,

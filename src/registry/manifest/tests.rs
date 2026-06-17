@@ -15,7 +15,7 @@ use crate::{
     oci::Namespace,
     registry::{
         Error, Registry,
-        metadata_store::{self, LinkMetadata, LinkOperation, link_kind::LinkKind},
+        metadata_store::{self, LinkKind, LinkMetadata, LinkOperation},
         test_utils::{
             FSRegistryTestCase, RegistryTestCase, backends, put_blob_direct, put_link_raw,
         },
@@ -3000,7 +3000,7 @@ mod noop_suppression_tests {
             Registry, RegistryConfig,
             blob_store::BlobStore,
             job_store::JobStore,
-            metadata_store::{LinkOperation, MetadataStore, link_kind::LinkKind},
+            metadata_store::{LinkKind, LinkOperation, MetadataStore},
             repository_resolver::RepositoryResolver,
             test_utils::{
                 build_store, build_test_fs_executor, downstream_client, repository_with_downstream,

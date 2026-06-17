@@ -1,15 +1,12 @@
 //! `store_manifest` and `delete_manifest`: thin wrappers over the shared
-//! link-transaction planner in [`crate::registry::metadata_store::link_ops`].
+//! link-transaction planner in [`super::ops`].
 
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
 
 use crate::{
     oci::Digest,
-    registry::metadata_store::{
-        Error, LinkOperation, MetadataStore,
-        link_ops::{LinksCommit, LinksTxExtras},
-    },
+    registry::metadata_store::{Error, LinkOperation, LinksCommit, LinksTx, MetadataStore},
 };
 
 impl MetadataStore {
@@ -25,15 +22,11 @@ impl MetadataStore {
         operations: &[LinkOperation],
         created_at: Option<DateTime<Utc>>,
     ) -> Result<LinksCommit, Error> {
-        let extras = LinksTxExtras {
-            blob_data_put: Some((digest, Bytes::from(manifest_bytes.to_vec()))),
-            blob_data_delete_if_unreferenced: None,
-            blob_index_ops: None,
-            caller_holds_blob_data_lock: false,
+        let tx = LinksTx::StoreManifest {
+            blob: (digest, Bytes::from(manifest_bytes.to_vec())),
             created_at,
-            delete_source_ts: None,
         };
-        self.execute_links_tx(namespace, operations, extras).await
+        self.execute_links_tx(namespace, operations, tx).await
     }
 
     /// Delete a manifest: removes link metadata, cleans up blob-index shards,
@@ -46,15 +39,11 @@ impl MetadataStore {
         operations: &[LinkOperation],
         source_ts: Option<DateTime<Utc>>,
     ) -> Result<(), Error> {
-        let extras = LinksTxExtras {
-            blob_data_put: None,
-            blob_data_delete_if_unreferenced: Some(digest),
-            blob_index_ops: None,
-            caller_holds_blob_data_lock: false,
-            created_at: None,
-            delete_source_ts: source_ts,
+        let tx = LinksTx::DeleteManifest {
+            blob: digest,
+            source_ts,
         };
-        self.execute_links_tx(namespace, operations, extras)
+        self.execute_links_tx(namespace, operations, tx)
             .await
             .map(|_| ())
     }
