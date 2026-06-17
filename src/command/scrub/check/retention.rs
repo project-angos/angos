@@ -16,7 +16,7 @@ use crate::{
     policy::{EpochSeconds, ManifestImage, RetentionPolicy},
     registry::{
         Repository,
-        metadata_store::{BlobIndex, LinkMetadata, MetadataStore, link_kind::LinkKind},
+        metadata_store::{BlobIndex, LinkKind, LinkMetadata, MetadataStore},
         pagination::collect_all_pages,
         repository_resolver::RepositoryResolver,
     },

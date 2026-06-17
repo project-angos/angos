@@ -2,15 +2,14 @@
 
 use crate::{
     oci::{Descriptor, Digest},
-    registry::metadata_store::link_kind::LinkKind,
+    registry::metadata_store::LinkKind,
 };
 
 /// A single link mutation submitted to [`crate::registry::metadata_store::MetadataStore::update_links`].
-///
-/// The `Create` variant carries the target digest and optional referrer /
-/// media-type / descriptor metadata. The `Delete` variant carries an optional
-/// referrer qualification so tracked links (layers, configs) can decrement
-/// their reference count rather than being deleted outright.
+/// `Create` carries the target digest and optional referrer / media-type /
+/// descriptor metadata; `Delete` carries an optional referrer qualification so
+/// tracked links (layers, configs) decrement their reference count rather than
+/// being removed outright.
 #[derive(Debug, Clone)]
 pub enum LinkOperation {
     Create {

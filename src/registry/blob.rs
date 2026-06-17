@@ -20,7 +20,7 @@ use crate::{
         blob_store::{BlobStore, BoxedReader},
         cache_job_handler::{CACHE_FETCH_BLOB_KIND, CACHE_QUEUE, CacheFetchBlobPayload},
         job_store::JobEnvelope,
-        metadata_store::{MetadataStore, link_kind::LinkKind},
+        metadata_store::{LinkKind, MetadataStore},
     },
 };
 

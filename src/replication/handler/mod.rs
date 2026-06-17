@@ -18,7 +18,7 @@ use crate::{
     registry::{
         blob_store::BlobStore,
         job_store::{Error, JobEnvelope, JobHandler},
-        metadata_store::{Error as MetadataStoreError, MetadataStore, link_kind::LinkKind},
+        metadata_store::{Error as MetadataStoreError, LinkKind, MetadataStore},
         repository_resolver::RepositoryResolver,
     },
     replication::{

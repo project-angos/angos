@@ -2,7 +2,7 @@ use std::fmt;
 
 use crate::{
     oci::Digest,
-    registry::{job_store::JobState, metadata_store::link_kind::LinkKind},
+    registry::{job_store::JobState, metadata_store::LinkKind},
 };
 
 /// A single mutation that a scrub checker has decided to perform.

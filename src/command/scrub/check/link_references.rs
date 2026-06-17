@@ -14,7 +14,7 @@ use crate::{
     oci::Digest,
     registry::{
         blob_store,
-        metadata_store::{self, MetadataStore, link_kind::LinkKind},
+        metadata_store::{self, LinkKind, MetadataStore},
         parse_manifest_digests,
     },
 };
@@ -151,7 +151,7 @@ mod tests {
         oci::Namespace,
         registry::{
             Registry,
-            metadata_store::{LinkOperation, link_kind::LinkKind},
+            metadata_store::{LinkKind, LinkOperation},
             test_utils::{self, FSRegistryTestCase, RegistryTestCase, backends, put_blob_direct},
         },
     };

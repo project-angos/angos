@@ -85,12 +85,11 @@ impl LinkMetadata {
         Self::from_legacy_bytes(s)
     }
 
-    /// Parses pre-JSON link data left over from the upstream `distribution`
-    /// implementation, where each link file held only the bare digest string.
-    /// `created_at` is `None`: the legacy format carried no timestamp, so it
-    /// never supersedes a replicated write under last-writer-wins (a synthesised
-    /// `now()` would re-stamp fresher on every read and block replication
-    /// forever) and retention treats it as oldest, like any missing timestamp.
+    /// Parses pre-JSON link data from the upstream `distribution` implementation,
+    /// where each link file held only the bare digest string. `created_at` is
+    /// `None`, so the legacy tag never wins last-writer-wins (a synthesised
+    /// `now()` would re-stamp fresher every read and block replication) and
+    /// retention treats it as oldest.
     fn from_legacy_bytes(s: Vec<u8>) -> Result<Self, Error> {
         let target = String::from_utf8(s).map_err(|e| Error::InvalidData(e.to_string()))?;
         let target =

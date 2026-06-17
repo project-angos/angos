@@ -12,7 +12,7 @@ use crate::{
         executor::ActionSink,
     },
     oci::Digest,
-    registry::metadata_store::{self, MetadataStore, link_kind::LinkKind},
+    registry::metadata_store::{self, LinkKind, MetadataStore},
 };
 
 pub struct ReferrerChecker {
@@ -92,7 +92,7 @@ mod tests {
         command::scrub::{action::Action, executor::Executor},
         oci::{Descriptor, Digest, Namespace},
         registry::{
-            metadata_store::{LinkOperation, link_kind::LinkKind},
+            metadata_store::{LinkKind, LinkOperation},
             test_utils::{backends, put_blob_direct},
         },
     };

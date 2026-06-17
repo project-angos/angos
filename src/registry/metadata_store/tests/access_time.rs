@@ -12,7 +12,7 @@ use crate::{
     cache::memory::Backend as CacheMemoryBackend,
     oci::Digest,
     registry::{
-        metadata_store::{LinkOperation, link_kind::LinkKind},
+        metadata_store::{LinkKind, LinkOperation},
         path_builder,
     },
 };

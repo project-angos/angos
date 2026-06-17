@@ -7,7 +7,7 @@ use super::{legacy_blob_index_with, put_legacy_index, test_config};
 use crate::{
     oci::Digest,
     registry::{
-        metadata_store::{BlobIndex, BlobIndexOperation, MetadataStore, link_kind::LinkKind},
+        metadata_store::{BlobIndex, BlobIndexOperation, LinkKind, MetadataStore},
         path_builder,
         test_utils::{locked_executor_over, metadata_store_over},
     },

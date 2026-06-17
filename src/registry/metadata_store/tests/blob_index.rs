@@ -8,7 +8,7 @@ use angos_tx_engine::{
 use super::test_config;
 use crate::{
     oci::Digest,
-    registry::metadata_store::{BlobIndexOperation, Error, LinkOperation, link_kind::LinkKind},
+    registry::metadata_store::{BlobIndexOperation, Error, LinkKind, LinkOperation},
 };
 
 #[tokio::test]

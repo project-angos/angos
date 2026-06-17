@@ -14,7 +14,7 @@ use crate::{
     oci::Manifest,
     registry::{
         blob_store,
-        metadata_store::{MetadataStore, link_kind::LinkKind},
+        metadata_store::{LinkKind, MetadataStore},
     },
 };
 

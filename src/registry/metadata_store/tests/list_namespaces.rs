@@ -3,7 +3,7 @@ use bytes::Bytes;
 use crate::{
     oci::Namespace,
     registry::{
-        metadata_store::{LinkOperation, link_kind::LinkKind},
+        metadata_store::{LinkKind, LinkOperation},
         path_builder,
         test_utils::{self, backends},
     },

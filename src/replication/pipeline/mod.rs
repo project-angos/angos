@@ -19,7 +19,7 @@ use crate::{
         Error as RegistryError, ParsedManifestDigests,
         blob_ownership::BlobOwnership,
         blob_store::BlobStore,
-        metadata_store::{MetadataStore, link_kind::LinkKind},
+        metadata_store::{LinkKind, MetadataStore},
         parse_manifest_digests,
     },
     registry_client::{DeleteManifestOutcome, NO_LOCAL_PREFIX, RegistryClient, UploadSession},

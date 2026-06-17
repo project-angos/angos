@@ -12,7 +12,7 @@ use crate::{
     },
     registry::{
         APPLICATION_JSON, Error, HeaderMap, JsonResponse, Registry, ResponseHeaders, job_store,
-        job_store::JobState, metadata_store::link_kind::LinkKind, pagination::collect_all_pages,
+        job_store::JobState, metadata_store::LinkKind, pagination::collect_all_pages,
     },
 };
 

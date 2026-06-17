@@ -24,9 +24,7 @@ use crate::{
         DOCKER_CONTENT_DIGEST, Error, Registry, Repository,
         blob_ownership::BlobOwnership,
         blob_store::Error as BlobStoreError,
-        metadata_store::{
-            Error as MetadataStoreError, LinkMetadata, LinkOperation, link_kind::LinkKind,
-        },
+        metadata_store::{Error as MetadataStoreError, LinkKind, LinkMetadata, LinkOperation},
     },
     replication::{
         REPLICATION_DELETE_MANIFEST_KIND, REPLICATION_PUSH_MANIFEST_KIND, REPLICATION_QUEUE,

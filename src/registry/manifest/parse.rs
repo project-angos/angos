@@ -2,7 +2,7 @@ use tracing::warn;
 
 use crate::{
     oci::{Digest, Manifest},
-    registry::{Error, manifest::response::ManifestMeta, metadata_store::link_kind::LinkKind},
+    registry::{Error, manifest::response::ManifestMeta, metadata_store::LinkKind},
 };
 
 pub struct ParsedManifestDigests {

@@ -31,7 +31,7 @@ use crate::{
     registry::{
         Registry, RegistryConfig, Repository,
         blob_store::{BlobStoreConfig, FsBackendConfig as BlobFsConfig},
-        metadata_store::{LinkOperation, MetadataStore, link_kind::LinkKind},
+        metadata_store::{LinkKind, LinkOperation, MetadataStore},
         repository_resolver::RepositoryResolver,
         s3_connection::S3ConnectionConfig,
         test_utils::build_store,
