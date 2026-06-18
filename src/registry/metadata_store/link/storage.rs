@@ -1,5 +1,5 @@
 //! Link reference storage primitives: read/write a single link's
-//! [`LinkMetadata`], plus the cache- and access-time-aware `read_link`.
+//! [`LinkMetadata`], plus the cache-aware `read_link`.
 
 use bytes::Bytes;
 use tracing::instrument;
@@ -28,36 +28,36 @@ impl MetadataStore {
         }
     }
 
+    /// Cache-aware link read with no access-time side effect: serve from the
+    /// link cache, else read through and populate it.
     #[instrument(skip(self))]
-    pub async fn read_link(
+    pub async fn read_link(&self, namespace: &str, link: &LinkKind) -> Result<LinkMetadata, Error> {
+        if let Some(cached) = self.cache_get(namespace, link).await {
+            return Ok(cached);
+        }
+        let data = self.read_link_reference(namespace, link).await?;
+        self.cache_put(namespace, link, &data).await;
+        Ok(data)
+    }
+
+    /// Like [`Self::read_link`] but records the link's access time: deferred via
+    /// the debounce writer when configured, else stamped inline with a
+    /// read-modify-write. The manifest pull path uses this when pull-time
+    /// tracking is enabled.
+    #[instrument(skip(self))]
+    pub async fn read_link_recording_access(
         &self,
         namespace: &str,
         link: &LinkKind,
-        update_access_time: bool,
     ) -> Result<LinkMetadata, Error> {
-        if update_access_time {
-            if let Some(writer) = &self.access_time_writer {
-                let link_data = if let Some(cached) = self.cache_get(namespace, link).await {
-                    cached
-                } else {
-                    let data = self.read_link_reference(namespace, link).await?;
-                    self.cache_put(namespace, link, &data).await;
-                    data
-                };
-                writer.record(namespace, link).await;
-                Ok(link_data)
-            } else {
-                let link_data = self.update_link_access_time(namespace, link).await?;
-                self.cache_put(namespace, link, &link_data).await;
-                Ok(link_data)
-            }
-        } else if let Some(cached) = self.cache_get(namespace, link).await {
-            Ok(cached)
-        } else {
-            let link_data = self.read_link_reference(namespace, link).await?;
+        let Some(writer) = &self.access_time_writer else {
+            let link_data = self.update_link_access_time(namespace, link).await?;
             self.cache_put(namespace, link, &link_data).await;
-            Ok(link_data)
-        }
+            return Ok(link_data);
+        };
+        let link_data = self.read_link(namespace, link).await?;
+        writer.record(namespace, link).await;
+        Ok(link_data)
     }
 
     /// Mark the access time for `link` in `namespace` using a read-modify-write

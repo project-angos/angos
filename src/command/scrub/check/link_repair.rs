@@ -15,7 +15,7 @@ pub async fn ensure_link(
     expected_target: &Digest,
     sink: &mut (dyn ActionSink + Send),
 ) -> Result<(), Error> {
-    match metadata_store.read_link(namespace, link, false).await {
+    match metadata_store.read_link(namespace, link).await {
         Ok(metadata) if &metadata.target == expected_target => {
             debug!("Link {link} -> {expected_target} is valid");
             Ok(())

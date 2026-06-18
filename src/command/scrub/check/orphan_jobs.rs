@@ -12,11 +12,11 @@ use crate::{
     command::scrub::{action::Action, check::StoreChecker, error::Error, executor::ActionSink},
     registry::{
         Repository,
-        cache_job_handler::{CACHE_QUEUE, CacheFetchBlobPayload},
-        job_store::{Error as JobStoreError, JobState, JobStore},
+        cache_job_handler::CacheFetchBlobPayload,
+        job_store::{Error as JobStoreError, JobState, JobStore, Queue},
         repository_resolver::RepositoryResolver,
     },
-    replication::{REPLICATION_QUEUE, ReplicationPushPayload},
+    replication::ReplicationPushPayload,
 };
 
 /// Keyset page size for the pending and failed scans; pages are looped to
@@ -36,12 +36,12 @@ pub enum OrphanQueue {
 }
 
 impl OrphanQueue {
-    /// Durable queue name, as addressed by the [`JobStore`].
+    /// The durable [`Queue`] this orphan scan addresses.
     #[must_use]
-    pub fn name(self) -> &'static str {
+    pub fn as_queue(self) -> Queue {
         match self {
-            OrphanQueue::Replication => REPLICATION_QUEUE,
-            OrphanQueue::Cache => CACHE_QUEUE,
+            OrphanQueue::Replication => Queue::Replication,
+            OrphanQueue::Cache => Queue::Cache,
         }
     }
 
@@ -126,7 +126,7 @@ impl OrphanJobChecker {
         state: JobState,
         storage_key: &str,
     ) -> Result<Option<Value>, Error> {
-        let queue = self.queue.name();
+        let queue = self.queue.as_queue();
         let envelope = match state {
             JobState::Pending => self.job_store.read_pending(queue, storage_key).await,
             JobState::Failed => self
@@ -154,7 +154,7 @@ impl OrphanJobChecker {
         state: JobState,
         sink: &mut (dyn ActionSink + Send),
     ) -> Result<u64, Error> {
-        let queue = self.queue.name();
+        let queue = self.queue.as_queue();
         let mut orphans: u64 = 0;
         let mut after: Option<String> = None;
         loop {
@@ -216,7 +216,7 @@ impl StoreChecker for OrphanJobChecker {
         let failed = self.scan_partition(JobState::Failed, sink).await?;
         info!(
             "Found {pending} orphan pending and {failed} orphan dead-lettered {} job(s)",
-            self.queue.name()
+            self.queue.as_queue()
         );
         Ok(())
     }
@@ -247,8 +247,8 @@ mod tests {
         registry::{
             Repository,
             blob_store::BlobStore,
-            cache_job_handler::{CACHE_FETCH_BLOB_KIND, CACHE_QUEUE, CacheFetchBlobPayload},
-            job_store::{FailOutcome, JobEnvelope, JobState, JobStore},
+            cache_job_handler::{CACHE_FETCH_BLOB_KIND, CacheFetchBlobPayload},
+            job_store::{FailOutcome, JobEnvelope, JobState, JobStore, Queue},
             manifest::DEFAULT_MAX_MANIFEST_SIZE_BYTES,
             metadata_store::MetadataStore,
             repository_resolver::RepositoryResolver,
@@ -256,8 +256,8 @@ mod tests {
         },
         registry_client::RegistryClient,
         replication::{
-            REPLICATION_PUSH_MANIFEST_KIND, REPLICATION_QUEUE, ReplicationDownstream,
-            ReplicationMode, ReplicationPushPayload, build_envelope,
+            REPLICATION_PUSH_MANIFEST_KIND, ReplicationDownstream, ReplicationMode,
+            ReplicationPushPayload, build_envelope,
         },
     };
 
@@ -357,9 +357,9 @@ mod tests {
             digest: DIGEST.to_string(),
         };
         JobEnvelope::new(
-            CACHE_QUEUE,
+            Queue::Cache,
             CACHE_FETCH_BLOB_KIND,
-            format!("{CACHE_QUEUE}.{namespace}:{DIGEST}"),
+            format!("{}.{namespace}:{DIGEST}", Queue::Cache),
             &payload,
         )
         .unwrap()
@@ -376,7 +376,7 @@ mod tests {
 
     /// Enqueues a single-attempt job and fails it once so it dead-letters under
     /// its original storage key.
-    async fn dead_letter(job_store: &JobStore, queue: &str, mut envelope: JobEnvelope) {
+    async fn dead_letter(job_store: &JobStore, queue: Queue, mut envelope: JobEnvelope) {
         envelope.max_attempts = 1;
         job_store.enqueue(envelope).await.unwrap();
         let claimed = job_store
@@ -396,7 +396,10 @@ mod tests {
         let job_store = Arc::new(JobStore::new(metadata_store.store_arc(), "orphan-test"));
 
         enqueue_push(&job_store, REMOVED_DOWNSTREAM, NAMESPACE).await;
-        let keys = job_store.list_pending(REPLICATION_QUEUE, 10).await.unwrap();
+        let keys = job_store
+            .list_pending(Queue::Replication, 10)
+            .await
+            .unwrap();
         assert_eq!(keys.len(), 1);
 
         let mut sink: Vec<Action> = Vec::new();
@@ -409,7 +412,7 @@ mod tests {
         assert!(matches!(
             &sink[0],
             Action::DeleteOrphanJob { queue, state, storage_key, reason }
-                if *queue == REPLICATION_QUEUE
+                if *queue == Queue::Replication
                     && *state == JobState::Pending
                     && *storage_key == keys[0]
                     && reason == "downstream 'decommissioned' is not configured for 'nginx'"
@@ -457,7 +460,7 @@ mod tests {
         assert!(matches!(
             &sink[0],
             Action::DeleteOrphanJob { queue, state, reason, .. }
-                if *queue == REPLICATION_QUEUE
+                if *queue == Queue::Replication
                     && *state == JobState::Pending
                     && reason.contains(GHOST_NAMESPACE)
         ));
@@ -470,7 +473,7 @@ mod tests {
         let job_store = Arc::new(JobStore::new(metadata_store.store_arc(), "orphan-test"));
 
         let envelope = build_envelope(&push_payload(REMOVED_DOWNSTREAM, NAMESPACE)).unwrap();
-        dead_letter(&job_store, REPLICATION_QUEUE, envelope).await;
+        dead_letter(&job_store, Queue::Replication, envelope).await;
 
         let mut sink: Vec<Action> = Vec::new();
         checker(job_store, OrphanQueue::Replication)
@@ -497,7 +500,7 @@ mod tests {
         let job_store = Arc::new(JobStore::new(metadata_store.store_arc(), "orphan-test"));
 
         let envelope = JobEnvelope::new(
-            REPLICATION_QUEUE,
+            Queue::Replication,
             REPLICATION_PUSH_MANIFEST_KIND,
             "replication.push.bogus",
             &json!({ "not": "a payload" }),
@@ -517,7 +520,10 @@ mod tests {
             sink.len()
         );
         assert_eq!(
-            job_store.count_pending(REPLICATION_QUEUE, 0).await.unwrap(),
+            job_store
+                .count_pending(Queue::Replication, 0)
+                .await
+                .unwrap(),
             1,
             "the undecodable job must stay in the queue"
         );
@@ -535,7 +541,10 @@ mod tests {
         enqueue_push(&job_store, DOWNSTREAM, NAMESPACE).await;
         enqueue_push(&job_store, REMOVED_DOWNSTREAM, NAMESPACE).await;
         assert_eq!(
-            job_store.count_pending(REPLICATION_QUEUE, 0).await.unwrap(),
+            job_store
+                .count_pending(Queue::Replication, 0)
+                .await
+                .unwrap(),
             2
         );
 
@@ -546,10 +555,13 @@ mod tests {
             .await
             .unwrap();
 
-        let keys = job_store.list_pending(REPLICATION_QUEUE, 10).await.unwrap();
+        let keys = job_store
+            .list_pending(Queue::Replication, 10)
+            .await
+            .unwrap();
         assert_eq!(keys.len(), 1, "only the orphan job must be deleted");
         let survivor = job_store
-            .read_pending(REPLICATION_QUEUE, &keys[0])
+            .read_pending(Queue::Replication, &keys[0])
             .await
             .unwrap();
         let payload: ReplicationPushPayload = serde_json::from_value(survivor.payload).unwrap();
@@ -577,7 +589,10 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            job_store.count_pending(REPLICATION_QUEUE, 0).await.unwrap(),
+            job_store
+                .count_pending(Queue::Replication, 0)
+                .await
+                .unwrap(),
             2,
             "dry-run must leave both jobs in place"
         );
@@ -590,7 +605,7 @@ mod tests {
         let job_store = Arc::new(JobStore::new(metadata_store.store_arc(), "orphan-test"));
 
         enqueue_cache_fill(&job_store, GHOST_NAMESPACE).await;
-        let keys = job_store.list_pending(CACHE_QUEUE, 10).await.unwrap();
+        let keys = job_store.list_pending(Queue::Cache, 10).await.unwrap();
         assert_eq!(keys.len(), 1);
 
         let mut sink: Vec<Action> = Vec::new();
@@ -603,7 +618,7 @@ mod tests {
         assert!(matches!(
             &sink[0],
             Action::DeleteOrphanJob { queue, state, storage_key, reason }
-                if *queue == CACHE_QUEUE
+                if *queue == Queue::Cache
                     && *state == JobState::Pending
                     && *storage_key == keys[0]
                     && reason == "namespace 'ghost/app' is not configured for pull-through"
@@ -651,7 +666,7 @@ mod tests {
         assert!(matches!(
             &sink[0],
             Action::DeleteOrphanJob { queue, state, reason, .. }
-                if *queue == CACHE_QUEUE
+                if *queue == Queue::Cache
                     && *state == JobState::Pending
                     && reason == "namespace 'local' is not configured for pull-through"
         ));
@@ -663,7 +678,7 @@ mod tests {
         let (metadata_store, _store, _dir) = fs_metadata_store();
         let job_store = Arc::new(JobStore::new(metadata_store.store_arc(), "orphan-test"));
 
-        dead_letter(&job_store, CACHE_QUEUE, cache_envelope(GHOST_NAMESPACE)).await;
+        dead_letter(&job_store, Queue::Cache, cache_envelope(GHOST_NAMESPACE)).await;
 
         let mut sink: Vec<Action> = Vec::new();
         checker(job_store, OrphanQueue::Cache)
@@ -679,7 +694,7 @@ mod tests {
         assert!(matches!(
             &sink[0],
             Action::DeleteOrphanJob { queue, state, reason, .. }
-                if *queue == CACHE_QUEUE
+                if *queue == Queue::Cache
                     && *state == JobState::Failed
                     && reason.contains(GHOST_NAMESPACE)
         ));
@@ -692,7 +707,7 @@ mod tests {
         let job_store = Arc::new(JobStore::new(metadata_store.store_arc(), "orphan-test"));
 
         let envelope = JobEnvelope::new(
-            CACHE_QUEUE,
+            Queue::Cache,
             CACHE_FETCH_BLOB_KIND,
             "cache.bogus",
             &json!({ "not": "a payload" }),
@@ -712,7 +727,7 @@ mod tests {
             sink.len()
         );
         assert_eq!(
-            job_store.count_pending(CACHE_QUEUE, 0).await.unwrap(),
+            job_store.count_pending(Queue::Cache, 0).await.unwrap(),
             1,
             "the undecodable job must stay in the queue"
         );
@@ -729,7 +744,7 @@ mod tests {
 
         enqueue_cache_fill(&job_store, NAMESPACE).await;
         enqueue_cache_fill(&job_store, GHOST_NAMESPACE).await;
-        assert_eq!(job_store.count_pending(CACHE_QUEUE, 0).await.unwrap(), 2);
+        assert_eq!(job_store.count_pending(Queue::Cache, 0).await.unwrap(), 2);
 
         let mut executor: Box<dyn ActionSink + Send> =
             Box::new(Executor::new(blob_store, metadata_store, job_store.clone()));
@@ -738,9 +753,12 @@ mod tests {
             .await
             .unwrap();
 
-        let keys = job_store.list_pending(CACHE_QUEUE, 10).await.unwrap();
+        let keys = job_store.list_pending(Queue::Cache, 10).await.unwrap();
         assert_eq!(keys.len(), 1, "only the orphan job must be deleted");
-        let survivor = job_store.read_pending(CACHE_QUEUE, &keys[0]).await.unwrap();
+        let survivor = job_store
+            .read_pending(Queue::Cache, &keys[0])
+            .await
+            .unwrap();
         let payload: CacheFetchBlobPayload = serde_json::from_value(survivor.payload).unwrap();
         assert_eq!(
             payload.namespace, NAMESPACE,
@@ -766,7 +784,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            job_store.count_pending(CACHE_QUEUE, 0).await.unwrap(),
+            job_store.count_pending(Queue::Cache, 0).await.unwrap(),
             2,
             "dry-run must leave both jobs in place"
         );

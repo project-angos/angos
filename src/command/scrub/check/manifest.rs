@@ -145,11 +145,11 @@ mod tests {
             scrubber.check(namespace, &mut executor).await.unwrap();
 
             let config_link = metadata_store
-                .read_link(namespace, &LinkKind::Config(config_digest.clone()), false)
+                .read_link(namespace, &LinkKind::Config(config_digest.clone()))
                 .await;
 
             let layer_link = metadata_store
-                .read_link(namespace, &LinkKind::Layer(layer_digest.clone()), false)
+                .read_link(namespace, &LinkKind::Layer(layer_digest.clone()))
                 .await;
 
             assert!(config_link.is_ok());
@@ -227,7 +227,7 @@ mod tests {
             scrubber.check(namespace, &mut executor).await.unwrap();
 
             let link_meta = metadata_store
-                .read_link(namespace, &LinkKind::Digest(manifest_digest.clone()), false)
+                .read_link(namespace, &LinkKind::Digest(manifest_digest.clone()))
                 .await
                 .unwrap();
 
@@ -322,7 +322,7 @@ mod tests {
             );
 
             let stored_meta = metadata_store
-                .read_link(namespace, &LinkKind::Digest(manifest_digest.clone()), false)
+                .read_link(namespace, &LinkKind::Digest(manifest_digest.clone()))
                 .await
                 .unwrap();
 

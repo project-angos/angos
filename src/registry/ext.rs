@@ -12,7 +12,9 @@ use crate::{
     },
     registry::{
         APPLICATION_JSON, Error, HeaderMap, JsonResponse, Registry, ResponseHeaders, job_store,
-        job_store::JobState, metadata_store::LinkKind, pagination::collect_all_pages,
+        job_store::{JobState, Queue},
+        metadata_store::LinkKind,
+        pagination::collect_all_pages,
     },
 };
 
@@ -420,7 +422,7 @@ impl Registry {
     #[instrument(skip(self))]
     pub async fn get_jobs_info(
         &self,
-        queue: &str,
+        queue: Queue,
         n: Option<u16>,
         after: Option<String>,
     ) -> Result<JsonResponse, Error> {
@@ -463,7 +465,7 @@ impl Registry {
     #[instrument(skip(self))]
     pub async fn get_failed_jobs_info(
         &self,
-        queue: &str,
+        queue: Queue,
         n: Option<u16>,
         after: Option<String>,
     ) -> Result<JsonResponse, Error> {
@@ -501,7 +503,7 @@ impl Registry {
     /// Requeue a dead-letter job (attempts reset to zero) on `queue`. Delegates
     /// to the durable queue; a stale key surfaces as [`Error::NotFound`] (404).
     #[instrument(skip(self))]
-    pub async fn retry_failed_job(&self, queue: &str, storage_key: &str) -> Result<(), Error> {
+    pub async fn retry_failed_job(&self, queue: Queue, storage_key: &str) -> Result<(), Error> {
         self.job_queue
             .retry_failed(queue, storage_key)
             .await
@@ -513,7 +515,7 @@ impl Registry {
     #[instrument(skip(self))]
     pub async fn delete_job(
         &self,
-        queue: &str,
+        queue: Queue,
         state: JobState,
         storage_key: &str,
     ) -> Result<(), Error> {
@@ -630,7 +632,7 @@ impl Registry {
 
             let (pushed_at, last_pulled_at) = self
                 .metadata_store
-                .read_link(namespace, &LinkKind::Digest(digest.clone()), false)
+                .read_link(namespace, &LinkKind::Digest(digest.clone()))
                 .await
                 .map_or((None, None), |m| (m.created_at, m.accessed_at));
 
@@ -673,8 +675,7 @@ impl Registry {
         let mut tag_links: Vec<(String, Digest)> = Vec::with_capacity(all_tags.len());
         for tag in all_tags {
             let link = LinkKind::Tag(tag.clone());
-            if let Ok(link_metadata) = self.metadata_store.read_link(namespace, &link, false).await
-            {
+            if let Ok(link_metadata) = self.metadata_store.read_link(namespace, &link).await {
                 tag_links.push((tag, link_metadata.target));
             }
         }

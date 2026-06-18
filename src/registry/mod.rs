@@ -60,12 +60,12 @@ use crate::{
     oci::{Digest, Namespace},
     registry::{
         blob_store::BlobStore,
-        cache_job_handler::{CACHE_QUEUE, CacheJobHandler},
-        job_store::{JobHandler, JobStore},
+        cache_job_handler::CacheJobHandler,
+        job_store::{JobHandler, JobStore, Queue},
         metadata_store::MetadataStore,
         repository_resolver::RepositoryResolver,
     },
-    replication::{REPLICATION_QUEUE, ReplicationJobHandler},
+    replication::ReplicationJobHandler,
 };
 use angos_tx_engine::lock::LockSession;
 
@@ -347,7 +347,7 @@ fn build_in_process_queue(
         tokio::spawn(in_process_claim_loop(
             job_store.clone(),
             cache_handler.clone(),
-            CACHE_QUEUE,
+            Queue::Cache,
             shutdown.clone(),
         ));
     }
@@ -357,7 +357,7 @@ fn build_in_process_queue(
             tokio::spawn(in_process_claim_loop(
                 job_store.clone(),
                 replication_handler.clone(),
-                REPLICATION_QUEUE,
+                Queue::Replication,
                 shutdown.clone(),
             ));
         }
@@ -384,7 +384,7 @@ const IN_PROCESS_IDLE_POLL: Duration = Duration::from_millis(10);
 async fn in_process_claim_loop(
     consumer: Arc<JobStore>,
     handler: Arc<dyn JobHandler>,
-    queue: &'static str,
+    queue: Queue,
     shutdown: CancellationToken,
 ) {
     loop {
@@ -432,7 +432,7 @@ mod in_process_replication_tests {
         registry::{
             DOCKER_CONTENT_DIGEST, Registry, RegistryConfig, Repository,
             blob_store::BlobStore,
-            job_store::{JobEnvelope, JobStore},
+            job_store::{JobEnvelope, JobStore, Queue},
             metadata_store::MetadataStore,
             repository_resolver::RepositoryResolver,
             test_utils::{
@@ -441,7 +441,7 @@ mod in_process_replication_tests {
             },
         },
         registry_client::RegistryClient,
-        replication::{REPLICATION_PUSH_MANIFEST_KIND, REPLICATION_QUEUE},
+        replication::REPLICATION_PUSH_MANIFEST_KIND,
     };
 
     const NAMESPACE: &str = "nginx";
@@ -583,11 +583,11 @@ mod in_process_replication_tests {
                 .map(|r| format!("{} {}", r.method.as_str(), r.url.path()))
                 .collect();
             let pending = inspector
-                .count_pending(REPLICATION_QUEUE, 0)
+                .count_pending(Queue::Replication, 0)
                 .await
                 .unwrap_or(u64::MAX);
             let failed = inspector
-                .list_failed_page(REPLICATION_QUEUE, 16, None)
+                .list_failed_page(Queue::Replication, 16, None)
                 .await
                 .map_or(usize::MAX, |(keys, _)| keys.len());
             panic!(
@@ -600,7 +600,7 @@ mod in_process_replication_tests {
         let drained = timeout(Duration::from_secs(10), async {
             loop {
                 let pending = inspector
-                    .count_pending(REPLICATION_QUEUE, 0)
+                    .count_pending(Queue::Replication, 0)
                     .await
                     .unwrap_or(u64::MAX);
                 if pending == 0 {
@@ -613,7 +613,7 @@ mod in_process_replication_tests {
         .unwrap_or(false);
 
         let failed = inspector
-            .list_failed_page(REPLICATION_QUEUE, 16, None)
+            .list_failed_page(Queue::Replication, 16, None)
             .await
             .map_or(usize::MAX, |(keys, _)| keys.len());
         assert!(
@@ -639,9 +639,9 @@ mod in_process_replication_tests {
             .job_queue
             .enqueue(
                 JobEnvelope::new(
-                    REPLICATION_QUEUE,
+                    Queue::Replication,
                     REPLICATION_PUSH_MANIFEST_KIND,
-                    format!("{REPLICATION_QUEUE}.eu:nginx:v1"),
+                    format!("{}.eu:nginx:v1", Queue::Replication),
                     &(),
                 )
                 .unwrap(),
@@ -656,7 +656,7 @@ mod in_process_replication_tests {
         assert_eq!(
             registry
                 .job_queue
-                .count_pending(REPLICATION_QUEUE, 0)
+                .count_pending(Queue::Replication, 0)
                 .await
                 .unwrap(),
             1,

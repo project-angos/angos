@@ -50,8 +50,12 @@ mod tests {
     use super::*;
     use crate::oci::Reference;
 
-    fn sha(hex: &str) -> Digest {
-        Digest::Sha256(hex.into())
+    // Valid 64-char lowercase-hex sha256 hashes (the only shape `Digest` accepts).
+    const HASH_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const HASH_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+    fn sha(hash: &str) -> Digest {
+        Digest::sha256(hash).unwrap()
     }
 
     #[test]
@@ -60,29 +64,29 @@ mod tests {
         let tag_link = LinkKind::Tag("tag".to_string());
         assert_eq!(LinkKind::from_reference(&tag), tag_link);
 
-        let digest = Reference::Digest(Digest::Sha256("digest".into()));
-        let digest_link = LinkKind::Digest(Digest::Sha256("digest".into()));
+        let digest = Reference::Digest(sha(HASH_A));
+        let digest_link = LinkKind::Digest(sha(HASH_A));
         assert_eq!(LinkKind::from_reference(&digest), digest_link);
     }
 
     #[test]
     fn is_tracked_returns_true_for_layer() {
-        assert!(LinkKind::Layer(sha("aabb")).is_tracked());
+        assert!(LinkKind::Layer(sha(HASH_A)).is_tracked());
     }
 
     #[test]
     fn is_tracked_returns_true_for_config() {
-        assert!(LinkKind::Config(sha("aabb")).is_tracked());
+        assert!(LinkKind::Config(sha(HASH_A)).is_tracked());
     }
 
     #[test]
     fn is_tracked_returns_true_for_manifest() {
-        assert!(LinkKind::Manifest(sha("aabb"), sha("ccdd")).is_tracked());
+        assert!(LinkKind::Manifest(sha(HASH_A), sha(HASH_B)).is_tracked());
     }
 
     #[test]
     fn is_tracked_returns_false_for_blob() {
-        assert!(!LinkKind::Blob(sha("aabb")).is_tracked());
+        assert!(!LinkKind::Blob(sha(HASH_A)).is_tracked());
     }
 
     #[test]
@@ -92,29 +96,41 @@ mod tests {
 
     #[test]
     fn is_tracked_returns_false_for_digest() {
-        assert!(!LinkKind::Digest(sha("aabb")).is_tracked());
+        assert!(!LinkKind::Digest(sha(HASH_A)).is_tracked());
     }
 
     #[test]
     fn is_tracked_returns_false_for_referrer() {
-        assert!(!LinkKind::Referrer(sha("aabb"), sha("ccdd")).is_tracked());
+        assert!(!LinkKind::Referrer(sha(HASH_A), sha(HASH_B)).is_tracked());
     }
 
     #[test]
     fn display_renders_expected_string_for_each_variant() {
         let cases = [
-            (LinkKind::Tag("v1.0.0".to_string()), "tag:v1.0.0"),
-            (LinkKind::Blob(sha("aabb")), "blob:sha256:aabb"),
-            (LinkKind::Digest(sha("aabb")), "digest:sha256:aabb"),
-            (LinkKind::Layer(sha("aabb")), "layer:sha256:aabb"),
-            (LinkKind::Config(sha("aabb")), "config:sha256:aabb"),
             (
-                LinkKind::Referrer(sha("aabb"), sha("ccdd")),
-                "referrer:sha256:aabb-sha256:ccdd",
+                LinkKind::Tag("v1.0.0".to_string()),
+                "tag:v1.0.0".to_string(),
+            ),
+            (LinkKind::Blob(sha(HASH_A)), format!("blob:sha256:{HASH_A}")),
+            (
+                LinkKind::Digest(sha(HASH_A)),
+                format!("digest:sha256:{HASH_A}"),
             ),
             (
-                LinkKind::Manifest(sha("aabb"), sha("ccdd")),
-                "manifest:sha256:aabb-sha256:ccdd",
+                LinkKind::Layer(sha(HASH_A)),
+                format!("layer:sha256:{HASH_A}"),
+            ),
+            (
+                LinkKind::Config(sha(HASH_A)),
+                format!("config:sha256:{HASH_A}"),
+            ),
+            (
+                LinkKind::Referrer(sha(HASH_A), sha(HASH_B)),
+                format!("referrer:sha256:{HASH_A}-sha256:{HASH_B}"),
+            ),
+            (
+                LinkKind::Manifest(sha(HASH_A), sha(HASH_B)),
+                format!("manifest:sha256:{HASH_A}-sha256:{HASH_B}"),
             ),
         ];
 

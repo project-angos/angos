@@ -7,8 +7,7 @@ use uuid::Uuid;
 use crate::{
     identity::Action,
     oci::{Digest, Namespace, Reference},
-    registry::{cache_job_handler::CACHE_QUEUE, job_store::JobState},
-    replication::REPLICATION_QUEUE,
+    registry::job_store::{JobState, Queue},
 };
 
 fn parse_query<T: DeserializeOwned + Default>(params: &str) -> T {
@@ -112,15 +111,14 @@ struct JobsQuery {
 /// parse would reset the whole struct on one bad value and silently administer
 /// the default `cache` queue. Returns `None` on a malformed value or unknown
 /// queue; an absent selector defaults to `cache`.
-fn parse_jobs_query(params: Option<&str>) -> Option<(Option<u16>, Option<String>, String)> {
+fn parse_jobs_query(params: Option<&str>) -> Option<(Option<u16>, Option<String>, Queue)> {
     let query: JobsQuery = match params {
         Some(params) => parse_query_strict(params)?,
         None => JobsQuery::default(),
     };
     let queue = match query.queue.as_deref() {
-        None | Some(CACHE_QUEUE) => CACHE_QUEUE.to_string(),
-        Some(REPLICATION_QUEUE) => REPLICATION_QUEUE.to_string(),
-        Some(_) => return None,
+        None => Queue::Cache,
+        Some(name) => name.parse().ok()?,
     };
     Some((query.n, query.after, queue))
 }

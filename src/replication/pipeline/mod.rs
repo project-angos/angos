@@ -137,7 +137,7 @@ pub async fn push_manifest(
         Some(media_type) => Some(media_type),
         None => ctx
             .metadata_store
-            .read_link(ctx.namespace, &LinkKind::Digest(digest.clone()), false)
+            .read_link(ctx.namespace, &LinkKind::Digest(digest.clone()))
             .await
             .ok()
             .and_then(|link| link.media_type),

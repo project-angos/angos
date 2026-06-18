@@ -24,13 +24,13 @@ use crate::{
         DOCKER_CONTENT_DIGEST, Error, Registry, Repository,
         blob_ownership::BlobOwnership,
         blob_store::Error as BlobStoreError,
+        job_store::Queue,
         metadata_store::{Error as MetadataStoreError, LinkKind, LinkMetadata, LinkOperation},
     },
     replication::{
-        REPLICATION_DELETE_MANIFEST_KIND, REPLICATION_PUSH_MANIFEST_KIND, REPLICATION_QUEUE,
-        ReplicationPushPayload, build_envelope,
+        REPLICATION_DELETE_MANIFEST_KIND, REPLICATION_PUSH_MANIFEST_KIND, ReplicationPushPayload,
+        build_envelope,
     },
-    util::sha256,
 };
 
 pub const DEFAULT_MAX_MANIFEST_SIZE_BYTES: usize = 5 * 1024 * 1024;
@@ -142,16 +142,29 @@ impl Registry {
         })
     }
 
+    /// Read a manifest/tag link for a client pull, recording its access time
+    /// when pull-time tracking is enabled.
+    async fn read_manifest_link(
+        &self,
+        namespace: &Namespace,
+        link: &LinkKind,
+    ) -> Result<LinkMetadata, MetadataStoreError> {
+        if self.update_pull_time {
+            self.metadata_store
+                .read_link_recording_access(namespace, link)
+                .await
+        } else {
+            self.metadata_store.read_link(namespace, link).await
+        }
+    }
+
     async fn head_local_manifest(
         &self,
         namespace: &Namespace,
         reference: &Reference,
     ) -> Result<ManifestMeta, Error> {
         let blob_link = LinkKind::from_reference(reference);
-        let link = self
-            .metadata_store
-            .read_link(namespace, &blob_link, self.update_pull_time)
-            .await?;
+        let link = self.read_manifest_link(namespace, &blob_link).await?;
 
         if let Some(media_type) = link.media_type {
             let size = self.blob_store.size(&link.target).await.map_err(|error| {
@@ -266,10 +279,7 @@ impl Registry {
         reference: &Reference,
     ) -> Result<ManifestBody, Error> {
         let blob_link = LinkKind::from_reference(reference);
-        let link = self
-            .metadata_store
-            .read_link(namespace, &blob_link, self.update_pull_time)
-            .await?;
+        let link = self.read_manifest_link(namespace, &blob_link).await?;
 
         let content = self.blob_store.read(&link.target).await?;
         let manifest: Manifest = serde_json::from_slice(&content).map_err(|error| {
@@ -315,7 +325,7 @@ impl Registry {
         created_at: Option<DateTime<Utc>>,
     ) -> Result<PutManifestResponse, Error> {
         let mut manifest = parse_and_validate_manifest(body, content_type)?;
-        let computed_digest = Digest::Sha256(sha256::hex(body).into());
+        let computed_digest = Digest::from_bytes(body);
 
         if let Reference::Digest(provided_digest) = reference
             && provided_digest != &computed_digest
@@ -582,11 +592,7 @@ impl Registry {
         reference: &Reference,
     ) -> Option<GetManifestResponse> {
         let blob_link = LinkKind::from_reference(reference);
-        let link = self
-            .metadata_store
-            .read_link(namespace, &blob_link, self.update_pull_time)
-            .await
-            .ok()?;
+        let link = self.read_manifest_link(namespace, &blob_link).await.ok()?;
         let media_type = link.media_type?;
         let presigned_url = self
             .blob_store
@@ -808,7 +814,7 @@ impl Registry {
         // write (`source_ts` present) pays this extra hash of the body.
         let incoming_digest = source_ts
             .is_some()
-            .then(|| Digest::Sha256(sha256::hex(&request_body).into()));
+            .then(|| Digest::from_bytes(&request_body));
         self.check_lww_not_superseded(namespace, &reference, source_ts, incoming_digest.as_ref())
             .await?;
 
@@ -934,7 +940,7 @@ impl Registry {
                         );
                         metrics_provider()
                             .job_queue_enqueue_failures_total
-                            .with_label_values(&[REPLICATION_QUEUE])
+                            .with_label_values(&[Queue::Replication.as_str()])
                             .inc();
                     }
                 }

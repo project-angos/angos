@@ -18,8 +18,8 @@ use crate::{
         Error, HeaderMap, Registry, Repository, ResponseHeaders,
         blob_ownership::BlobOwnership,
         blob_store::{BlobStore, BoxedReader},
-        cache_job_handler::{CACHE_FETCH_BLOB_KIND, CACHE_QUEUE, CacheFetchBlobPayload},
-        job_store::JobEnvelope,
+        cache_job_handler::{CACHE_FETCH_BLOB_KIND, CacheFetchBlobPayload},
+        job_store::{JobEnvelope, Queue},
         metadata_store::{LinkKind, MetadataStore},
     },
 };
@@ -313,9 +313,9 @@ impl Registry {
             digest: digest.to_string(),
         };
         let envelope = match JobEnvelope::new(
-            CACHE_QUEUE,
+            Queue::Cache,
             CACHE_FETCH_BLOB_KIND,
-            format!("{CACHE_QUEUE}.{namespace}:{digest}"),
+            format!("{}.{namespace}:{digest}", Queue::Cache),
             &payload,
         ) {
             Ok(envelope) => envelope,
@@ -323,7 +323,7 @@ impl Registry {
                 warn!("Failed to build cache job envelope for {digest}: {e}");
                 metrics_provider()
                     .job_queue_enqueue_failures_total
-                    .with_label_values(&[CACHE_QUEUE])
+                    .with_label_values(&[Queue::Cache.as_str()])
                     .inc();
                 return;
             }
@@ -332,7 +332,7 @@ impl Registry {
             warn!("Failed to enqueue cache job for {digest}: {e}");
             metrics_provider()
                 .job_queue_enqueue_failures_total
-                .with_label_values(&[CACHE_QUEUE])
+                .with_label_values(&[Queue::Cache.as_str()])
                 .inc();
         }
     }
@@ -450,7 +450,6 @@ mod tests {
             metadata_store::LinkOperation,
             test_utils::{backends, create_test_blob, put_blob_direct},
         },
-        util::sha256,
     };
 
     /// `delete_blob` must hold the `blob-data:{digest}` coarse lock across its
@@ -661,7 +660,7 @@ mod tests {
                     &[LinkOperation::create_with_referrer(
                         link.clone(),
                         digest.clone(),
-                        sha256::digest(b"manifest"),
+                        Digest::from_bytes(b"manifest"),
                     )],
                 )
                 .await
@@ -675,7 +674,7 @@ mod tests {
             assert!(
                 registry
                     .metadata_store
-                    .read_link(namespace, &link, false)
+                    .read_link(namespace, &link)
                     .await
                     .is_ok()
             );
@@ -688,16 +687,16 @@ mod tests {
         for test_case in backends() {
             let registry = test_case.registry();
             let namespace = &Namespace::new("test-repo").unwrap();
-            let parent = sha256::digest(b"index manifest");
-            let subject = sha256::digest(b"subject manifest");
+            let parent = Digest::from_bytes(b"index manifest");
+            let subject = Digest::from_bytes(b"subject manifest");
 
             let cases = [
-                LinkKind::Digest(sha256::digest(b"digest reference")),
+                LinkKind::Digest(Digest::from_bytes(b"digest reference")),
                 LinkKind::Tag("latest".to_string()),
-                LinkKind::Layer(sha256::digest(b"layer reference")),
-                LinkKind::Config(sha256::digest(b"config reference")),
-                LinkKind::Manifest(parent.clone(), sha256::digest(b"child manifest")),
-                LinkKind::Referrer(subject, sha256::digest(b"referrer manifest")),
+                LinkKind::Layer(Digest::from_bytes(b"layer reference")),
+                LinkKind::Config(Digest::from_bytes(b"config reference")),
+                LinkKind::Manifest(parent.clone(), Digest::from_bytes(b"child manifest")),
+                LinkKind::Referrer(subject, Digest::from_bytes(b"referrer manifest")),
             ];
 
             for link in cases {
@@ -790,7 +789,7 @@ mod tests {
             let registry = test_case.registry();
             let namespace = Namespace::new("test-repo").unwrap();
             let content = b"cached pull-through blob content";
-            let digest = sha256::digest(content);
+            let digest = Digest::from_bytes(content);
             let stream = Box::new(Cursor::new(content.to_vec()));
 
             cache_blob(

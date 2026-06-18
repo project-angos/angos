@@ -30,7 +30,7 @@ use crate::{
     oci::{Digest, Namespace, Reference},
     registry::{
         Registry, RegistryConfig, blob_store,
-        job_store::JobStore,
+        job_store::{JobStore, Queue},
         metadata_store::MetadataStore,
         repository_resolver::RepositoryResolver,
         test_utils::{
@@ -38,10 +38,7 @@ use crate::{
             metadata_store_over, repository_with_downstream, sole_pending_payload,
         },
     },
-    replication::{
-        REPLICATION_DELETE_MANIFEST_KIND, REPLICATION_PUSH_MANIFEST_KIND, REPLICATION_QUEUE,
-    },
-    util::sha256,
+    replication::{REPLICATION_DELETE_MANIFEST_KIND, REPLICATION_PUSH_MANIFEST_KIND},
 };
 
 // ---------------------------------------------------------------------------
@@ -115,7 +112,7 @@ async fn upload_blob(registry: &Registry, namespace: &Namespace, content: &[u8])
         .unwrap();
 
     let body = content.to_vec();
-    let digest = sha256::digest(&body);
+    let digest = Digest::from_bytes(&body);
     registry
         .complete_upload(
             None,
@@ -614,7 +611,7 @@ async fn fresh_local_tag_push_enqueues_replication_job() {
     assert_eq!(
         fixture
             .job_store
-            .count_pending(REPLICATION_QUEUE, 0)
+            .count_pending(Queue::Replication, 0)
             .await
             .unwrap(),
         1,
@@ -655,7 +652,7 @@ async fn tag_delete_enqueues_replication_delete_job() {
     assert_eq!(
         fixture
             .job_store
-            .count_pending(REPLICATION_QUEUE, 0)
+            .count_pending(Queue::Replication, 0)
             .await
             .unwrap(),
         0,
@@ -676,7 +673,7 @@ async fn tag_delete_enqueues_replication_delete_job() {
     assert_eq!(
         fixture
             .job_store
-            .count_pending(REPLICATION_QUEUE, 0)
+            .count_pending(Queue::Replication, 0)
             .await
             .unwrap(),
         1,

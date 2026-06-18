@@ -1036,7 +1036,7 @@ fn test_parse_list_jobs() {
     let route = parse(&Method::GET, &"/_ext/_jobs".parse().unwrap());
     match route {
         Some(Action::ListJobs { queue, n, after }) => {
-            assert_eq!(queue, "cache");
+            assert_eq!(queue, Queue::Cache);
             assert_eq!(n, None);
             assert_eq!(after, None);
         }
@@ -1049,7 +1049,7 @@ fn test_parse_list_jobs_with_pagination() {
     let route = parse(&Method::GET, &"/_ext/_jobs?n=10&after=abc".parse().unwrap());
     match route {
         Some(Action::ListJobs { queue, n, after }) => {
-            assert_eq!(queue, "cache");
+            assert_eq!(queue, Queue::Cache);
             assert_eq!(n, Some(10));
             assert_eq!(after.as_deref(), Some("abc"));
         }
@@ -1062,7 +1062,7 @@ fn test_parse_list_failed_jobs() {
     let route = parse(&Method::GET, &"/_ext/_jobs/failed".parse().unwrap());
     match route {
         Some(Action::ListFailedJobs { queue, n, after }) => {
-            assert_eq!(queue, "cache");
+            assert_eq!(queue, Queue::Cache);
             assert_eq!(n, None);
             assert_eq!(after, None);
         }
@@ -1078,7 +1078,7 @@ fn test_parse_retry_job() {
     );
     match route {
         Some(Action::RetryJob { queue, storage_key }) => {
-            assert_eq!(queue, "cache");
+            assert_eq!(queue, Queue::Cache);
             assert_eq!(storage_key, "0000018b-abc");
         }
         other => panic!("expected RetryJob, got {other:?}"),
@@ -1097,7 +1097,7 @@ fn test_parse_delete_failed_job() {
             state,
             storage_key,
         }) => {
-            assert_eq!(queue, "cache");
+            assert_eq!(queue, Queue::Cache);
             assert_eq!(state, JobState::Failed);
             assert_eq!(storage_key, "0000018b-abc");
         }
@@ -1117,7 +1117,7 @@ fn test_parse_delete_pending_job() {
             state,
             storage_key,
         }) => {
-            assert_eq!(queue, "cache");
+            assert_eq!(queue, Queue::Cache);
             assert_eq!(state, JobState::Pending);
             assert_eq!(storage_key, "0000018b-abc");
         }
@@ -1154,7 +1154,7 @@ fn test_parse_list_jobs_selects_replication_queue() {
         &"/_ext/_jobs?queue=replication".parse().unwrap(),
     );
     match route {
-        Some(Action::ListJobs { queue, .. }) => assert_eq!(queue, "replication"),
+        Some(Action::ListJobs { queue, .. }) => assert_eq!(queue, Queue::Replication),
         other => panic!("expected ListJobs, got {other:?}"),
     }
 }
@@ -1169,7 +1169,7 @@ fn test_parse_delete_failed_job_selects_replication_queue() {
     );
     match route {
         Some(Action::DeleteJob { queue, state, .. }) => {
-            assert_eq!(queue, "replication");
+            assert_eq!(queue, Queue::Replication);
             assert_eq!(state, JobState::Failed);
         }
         other => panic!("expected DeleteJob, got {other:?}"),

@@ -17,7 +17,7 @@
 
 use std::fmt;
 
-use cel_interpreter::{Context, Value};
+use cel_interpreter::Context;
 use serde::{
     Deserialize, Deserializer,
     de::{self, MapAccess, Visitor},
@@ -25,7 +25,7 @@ use serde::{
 use tracing::{debug, warn};
 
 use crate::identity::{Action, ClientIdentity};
-use crate::policy::{CelRule, Error, PolicyDecision, PolicyError};
+use crate::policy::{CelRule, Error, PolicyDecision, PolicyError, RuleOutcome, evaluate_rules};
 
 /// Whether an access policy defaults to allowing or denying requests.
 #[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
@@ -201,38 +201,24 @@ impl AccessPolicy {
             AccessMode::Deny => "allow",
         };
 
-        for (index, rule) in self.rules.iter().enumerate() {
-            let rule_index = index + 1;
-            match rule.execute(&context) {
-                Ok(Value::Bool(true)) => {
-                    debug!("{rule_kind} rule {rule_index} matched");
-                    return match self.default {
-                        AccessMode::Allow => PolicyDecision::Deny,
-                        AccessMode::Deny => PolicyDecision::Allow,
-                    };
-                }
-                Ok(Value::Bool(false)) => {}
-                Ok(value) => {
-                    let value_type = value.type_of();
-                    warn!(
-                        "Access policy {rule_kind} rule {rule_index} returned non-boolean value of type {value_type}"
-                    );
-                    return PolicyDecision::Indeterminate(PolicyError {
-                        rule_index: Some(rule_index),
-                        message: format!("non-boolean result of type {value_type}"),
-                    });
-                }
-                Err(e) => {
-                    warn!("Access policy {rule_kind} rule {rule_index} evaluation failed: {e}");
-                    return PolicyDecision::Indeterminate(PolicyError {
-                        rule_index: Some(rule_index),
-                        message: e.to_string(),
-                    });
+        match evaluate_rules(&self.rules, &context) {
+            RuleOutcome::Matched(index) => {
+                debug!("{rule_kind} rule {index} matched");
+                match self.default {
+                    AccessMode::Allow => PolicyDecision::Deny,
+                    AccessMode::Deny => PolicyDecision::Allow,
                 }
             }
+            RuleOutcome::NoMatch => self.default.into(),
+            RuleOutcome::Indeterminate { index, message } => {
+                // Fail-closed: a misconfigured or failing rule denies.
+                warn!("Access policy {rule_kind} rule {index} is indeterminate: {message}");
+                PolicyDecision::Indeterminate(PolicyError {
+                    rule_index: Some(index),
+                    message,
+                })
+            }
         }
-
-        self.default.into()
     }
 
     fn build_context<'a>(

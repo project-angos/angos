@@ -2,7 +2,7 @@ use tokio::select;
 use tracing::{error, info, warn};
 
 use crate::registry::job_store::{
-    ClaimedJob, CompleteOutcome, Error, FailOutcome, JobHandler, JobStore,
+    ClaimedJob, CompleteOutcome, Error, FailOutcome, JobHandler, JobStore, Queue,
 };
 
 /// Execute one claimed job: observe the lock session's cancellation
@@ -53,7 +53,7 @@ pub async fn execute_one(consumer: &JobStore, handler: &dyn JobHandler, claimed:
 pub async fn run_once(
     consumer: &JobStore,
     handler: &dyn JobHandler,
-    queue: &str,
+    queue: Queue,
 ) -> Result<bool, Error> {
     match consumer.claim_one(queue).await?.claimed {
         None => Ok(false),
@@ -91,7 +91,7 @@ mod tests {
     use crate::{
         command::worker::runner::{execute_one, run_once},
         metrics_provider,
-        registry::job_store::{ClaimedJob, Error, JobEnvelope, JobHandler, JobStore},
+        registry::job_store::{ClaimedJob, Error, JobEnvelope, JobHandler, JobStore, Queue},
     };
 
     struct OkHandler;
@@ -124,7 +124,7 @@ mod tests {
         metrics_provider::init_for_tests();
         let dir = TempDir::new().expect("temp dir");
         let store = make_store(&dir);
-        let found = run_once(&store, &OkHandler, "cache")
+        let found = run_once(&store, &OkHandler, Queue::Cache)
             .await
             .expect("run_once");
         assert!(!found, "empty queue must return false");
@@ -138,20 +138,20 @@ mod tests {
 
         store
             .enqueue(
-                JobEnvelope::new("cache", "test.noop", "cache.ns:sha256:aabbcc", &())
+                JobEnvelope::new(Queue::Cache, "test.noop", "cache.ns:sha256:aabbcc", &())
                     .expect("envelope"),
             )
             .await
             .expect("enqueue");
 
         assert!(
-            run_once(&store, &OkHandler, "cache")
+            run_once(&store, &OkHandler, Queue::Cache)
                 .await
                 .expect("run_once"),
             "queue with one job must return true"
         );
         assert!(
-            !run_once(&store, &OkHandler, "cache")
+            !run_once(&store, &OkHandler, Queue::Cache)
                 .await
                 .expect("run_once second call"),
             "queue must be empty after job completes"
@@ -195,7 +195,7 @@ mod tests {
             tokio::spawn(async {}),
         );
         let claimed = ClaimedJob {
-            envelope: JobEnvelope::new("cache", "test.sleep", "cache.ns:sha256:lost", &())
+            envelope: JobEnvelope::new(Queue::Cache, "test.sleep", "cache.ns:sha256:lost", &())
                 .expect("envelope"),
             storage_key: "00000000-0000-0000-0000-000000000000".to_string(),
             session,

@@ -7,11 +7,13 @@ use tokio::time::timeout;
 use tracing::{debug, info, warn};
 
 use crate::{
-    auth::oidc::{Jwk, OidcProvider},
+    auth::{
+        oidc::{Jwk, OidcProvider},
+        sha256_hex,
+    },
     cache::Cache,
     command::server::Error,
     identity::OidcClaims,
-    util::sha256,
 };
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -216,13 +218,13 @@ async fn get_jwks_url(
 
 fn jwks_cache_key(provider: &dyn OidcProvider) -> String {
     let provider_name = provider.name();
-    let issuer_hash = sha256::hex(provider.issuer());
+    let issuer_hash = sha256_hex(provider.issuer());
     format!("oidc:{provider_name}:jwks:{issuer_hash}")
 }
 
 fn oidc_configuration_cache_key(provider: &dyn OidcProvider) -> String {
     let provider_name = provider.name();
-    let issuer_hash = sha256::hex(provider.issuer());
+    let issuer_hash = sha256_hex(provider.issuer());
     format!("oidc:{provider_name}:config:{issuer_hash}")
 }
 

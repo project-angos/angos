@@ -3,7 +3,7 @@ use uuid::Uuid;
 
 use crate::{
     oci::{Digest, Namespace, Reference},
-    registry::job_store::JobState,
+    registry::job_store::{JobState, Queue},
 };
 
 /// Action represents a parsed HTTP request: both the domain operation (for CEL policies)
@@ -173,7 +173,7 @@ pub enum Action {
     /// administration separately.
     #[serde(rename = "list-jobs")]
     ListJobs {
-        queue: String,
+        queue: Queue,
         #[serde(skip_serializing_if = "Option::is_none")]
         n: Option<u16>,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -181,7 +181,7 @@ pub enum Action {
     },
     #[serde(rename = "list-failed-jobs")]
     ListFailedJobs {
-        queue: String,
+        queue: Queue,
         #[serde(skip_serializing_if = "Option::is_none")]
         n: Option<u16>,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -192,13 +192,13 @@ pub enum Action {
     /// fields.
     #[serde(rename = "retry-job")]
     RetryJob {
-        queue: String,
+        queue: Queue,
         #[serde(skip)]
         storage_key: String,
     },
     #[serde(rename = "delete-job")]
     DeleteJob {
-        queue: String,
+        queue: Queue,
         #[serde(skip)]
         state: JobState,
         #[serde(skip)]

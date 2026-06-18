@@ -219,7 +219,7 @@ impl RetentionChecker {
     ) -> Result<TagWithMetadata, Error> {
         let metadata = self
             .metadata_store
-            .read_link(namespace, &LinkKind::Tag(tag_name.clone()), false)
+            .read_link(namespace, &LinkKind::Tag(tag_name.clone()))
             .await?;
         Ok(TagWithMetadata {
             name: tag_name,
@@ -368,7 +368,7 @@ impl RetentionChecker {
             None
         } else {
             self.metadata_store
-                .read_link(namespace, &LinkKind::Digest(digest.clone()), false)
+                .read_link(namespace, &LinkKind::Digest(digest.clone()))
                 .await
                 .ok()
         };
@@ -660,7 +660,7 @@ mod tests {
             scrubber.check(namespace, &mut executor).await.unwrap();
 
             let tag_link = metadata_store
-                .read_link(namespace, &LinkKind::Tag("v1.0.0".to_string()), false)
+                .read_link(namespace, &LinkKind::Tag("v1.0.0".to_string()))
                 .await;
 
             assert!(tag_link.is_ok());
@@ -699,7 +699,7 @@ mod tests {
             scrubber.check(namespace, &mut executor).await.unwrap();
 
             let tag_link = metadata_store
-                .read_link(namespace, &LinkKind::Tag("any-tag".to_string()), false)
+                .read_link(namespace, &LinkKind::Tag("any-tag".to_string()))
                 .await;
 
             assert!(tag_link.is_ok());
@@ -745,7 +745,7 @@ mod tests {
 
             assert!(
                 metadata_store
-                    .read_link(namespace, &LinkKind::Digest(digest), false)
+                    .read_link(namespace, &LinkKind::Digest(digest))
                     .await
                     .is_err()
             );
@@ -784,7 +784,7 @@ mod tests {
 
             assert!(
                 metadata_store
-                    .read_link(namespace, &LinkKind::Digest(digest), false)
+                    .read_link(namespace, &LinkKind::Digest(digest))
                     .await
                     .is_ok()
             );
@@ -822,7 +822,7 @@ mod tests {
 
             assert!(
                 metadata_store
-                    .read_link(namespace, &LinkKind::Digest(child_digest.clone()), false)
+                    .read_link(namespace, &LinkKind::Digest(child_digest.clone()))
                     .await
                     .is_ok()
             );
@@ -841,7 +841,7 @@ mod tests {
 
             assert!(
                 metadata_store
-                    .read_link(namespace, &LinkKind::Digest(child_digest), false)
+                    .read_link(namespace, &LinkKind::Digest(child_digest))
                     .await
                     .is_err()
             );
@@ -893,7 +893,7 @@ mod tests {
 
         assert!(
             metadata_store
-                .read_link(namespace, &LinkKind::Tag("v0.0.1".to_string()), false)
+                .read_link(namespace, &LinkKind::Tag("v0.0.1".to_string()))
                 .await
                 .is_ok(),
             "Vec sink must not delete the tag"
@@ -955,7 +955,7 @@ mod tests {
             // The healthy revision must be cleaned up: the broken one did not block the loop.
             assert!(
                 metadata_store
-                    .read_link(namespace, &LinkKind::Digest(digest_healthy), false)
+                    .read_link(namespace, &LinkKind::Digest(digest_healthy))
                     .await
                     .is_err(),
                 "healthy revision after the broken one must still be processed"

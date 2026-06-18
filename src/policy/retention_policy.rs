@@ -24,11 +24,11 @@
 
 use std::sync::Arc;
 
-use cel_interpreter::{Context, Value};
+use cel_interpreter::Context;
 use serde::{Deserialize, Serialize, Serializer};
 use tracing::{debug, warn};
 
-use crate::policy::{CelRule, Error, clock::Clock};
+use crate::policy::{CelRule, Error, RuleOutcome, clock::Clock, evaluate_rules};
 
 /// Configuration for retention policies.
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -135,32 +135,21 @@ impl RetentionPolicy {
 
         let context = self.build_context(manifest, last_pushed, last_pulled)?;
 
-        for (index, rule) in self.rules.iter().enumerate() {
-            let rule_index = index + 1;
-            match rule.execute(&context) {
-                Ok(Value::Bool(true)) => {
-                    debug!("Retention rule {rule_index} matched");
-                    return Ok(true);
-                }
-                Ok(Value::Bool(false)) => {}
-                Ok(value) => {
-                    warn!(
-                        "Retention rule {rule_index} returned non-boolean value: {value:?}; \
-                         treating as 'retain' (fail-open)"
-                    );
-                    return Ok(true);
-                }
-                Err(e) => {
-                    warn!(
-                        "Retention rule {rule_index} evaluation failed: {e}; \
-                         treating as 'retain' (fail-open)"
-                    );
-                    return Ok(true);
-                }
+        match evaluate_rules(&self.rules, &context) {
+            RuleOutcome::Matched(index) => {
+                debug!("Retention rule {index} matched");
+                Ok(true)
+            }
+            RuleOutcome::NoMatch => Ok(false),
+            RuleOutcome::Indeterminate { index, message } => {
+                // Fail-open: a misconfigured or failing rule retains (data safety).
+                warn!(
+                    "Retention rule {index} is indeterminate: {message}; \
+                     treating as 'retain' (fail-open)"
+                );
+                Ok(true)
             }
         }
-
-        Ok(false)
     }
 
     fn build_context<'a>(

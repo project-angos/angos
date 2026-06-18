@@ -45,6 +45,43 @@ impl fmt::Display for CelRule {
     }
 }
 
+/// Outcome of evaluating an ordered list of CEL rules. The caller maps these to
+/// a policy decision, choosing fail-open vs fail-closed via the `Indeterminate` arm.
+pub enum RuleOutcome {
+    /// The 1-based index of the first rule that returned `true`.
+    Matched(usize),
+    /// Every rule returned `false`.
+    NoMatch,
+    /// Rule at the 1-based `index` returned a non-boolean value or errored.
+    Indeterminate { index: usize, message: String },
+}
+
+/// Evaluate `rules` in order against `context`. First `bool(true)` wins
+/// (`Matched`); a non-boolean result or execution error stops evaluation
+/// (`Indeterminate`) and the caller decides how to treat it; all-false is `NoMatch`.
+pub fn evaluate_rules(rules: &[CelRule], context: &Context) -> RuleOutcome {
+    for (index, rule) in rules.iter().enumerate() {
+        let rule_index = index + 1;
+        match rule.execute(context) {
+            Ok(Value::Bool(true)) => return RuleOutcome::Matched(rule_index),
+            Ok(Value::Bool(false)) => {}
+            Ok(value) => {
+                return RuleOutcome::Indeterminate {
+                    index: rule_index,
+                    message: format!("non-boolean result of type {}", value.type_of()),
+                };
+            }
+            Err(e) => {
+                return RuleOutcome::Indeterminate {
+                    index: rule_index,
+                    message: e.to_string(),
+                };
+            }
+        }
+    }
+    RuleOutcome::NoMatch
+}
+
 impl<'de> Deserialize<'de> for CelRule {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where

@@ -201,20 +201,24 @@ pub fn link_container_path(link: &LinkKind, namespace: &str) -> String {
 mod tests {
     use super::*;
 
+    // Valid 64-char lowercase-hex sha256 hashes (the only shape `Digest` accepts).
+    const HASH_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const HASH_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
     #[test]
     fn test_blob_paths() {
-        let digest = Digest::Sha256("1234567890abcdef".into());
+        let digest = Digest::sha256(HASH_A).unwrap();
         assert_eq!(
             blob_path(&digest),
-            "v2/blobs/sha256/12/1234567890abcdef/data"
+            format!("v2/blobs/sha256/aa/{HASH_A}/data")
         );
         assert_eq!(
             blob_index_path(&digest),
-            "v2/blobs/sha256/12/1234567890abcdef/index.json"
+            format!("v2/blobs/sha256/aa/{HASH_A}/index.json")
         );
         assert_eq!(
             blob_container_dir(&digest),
-            "v2/blobs/sha256/12/1234567890abcdef"
+            format!("v2/blobs/sha256/aa/{HASH_A}")
         );
     }
 
@@ -250,25 +254,25 @@ mod tests {
             "v2/repositories/ns/_manifests/tags"
         );
 
-        let subject = Digest::Sha256("subject123".into());
+        let subject = Digest::sha256(HASH_A).unwrap();
         assert_eq!(
             manifest_referrers_dir("ns", &subject),
-            "v2/repositories/ns/_manifests/referrers/sha256/subject123"
+            format!("v2/repositories/ns/_manifests/referrers/sha256/{HASH_A}")
         );
     }
 
     #[test]
     fn test_link_paths() {
-        let digest = Digest::Sha256("digest123".into());
+        let digest = Digest::sha256(HASH_A).unwrap();
 
         let blob = LinkKind::Blob(digest.clone());
         assert_eq!(
             link_path(&blob, "ns"),
-            "v2/repositories/ns/_blobs/sha256/digest123/link"
+            format!("v2/repositories/ns/_blobs/sha256/{HASH_A}/link")
         );
         assert_eq!(
             link_container_path(&blob, "ns"),
-            "v2/repositories/ns/_blobs/sha256/digest123"
+            format!("v2/repositories/ns/_blobs/sha256/{HASH_A}")
         );
 
         let tag = LinkKind::Tag("v1.0".to_string());
@@ -284,55 +288,55 @@ mod tests {
         let revision = LinkKind::Digest(digest.clone());
         assert_eq!(
             link_path(&revision, "ns"),
-            "v2/repositories/ns/_manifests/revisions/sha256/digest123/link"
+            format!("v2/repositories/ns/_manifests/revisions/sha256/{HASH_A}/link")
         );
         assert_eq!(
             link_container_path(&revision, "ns"),
-            "v2/repositories/ns/_manifests/revisions/sha256/digest123"
+            format!("v2/repositories/ns/_manifests/revisions/sha256/{HASH_A}")
         );
 
         let layer = LinkKind::Layer(digest.clone());
         assert_eq!(
             link_path(&layer, "ns"),
-            "v2/repositories/ns/_layers/sha256/digest123/link"
+            format!("v2/repositories/ns/_layers/sha256/{HASH_A}/link")
         );
         assert_eq!(
             link_container_path(&layer, "ns"),
-            "v2/repositories/ns/_layers/sha256/digest123"
+            format!("v2/repositories/ns/_layers/sha256/{HASH_A}")
         );
 
         let config = LinkKind::Config(digest.clone());
         assert_eq!(
             link_path(&config, "ns"),
-            "v2/repositories/ns/_config/sha256/digest123/link"
+            format!("v2/repositories/ns/_config/sha256/{HASH_A}/link")
         );
         assert_eq!(
             link_container_path(&config, "ns"),
-            "v2/repositories/ns/_config/sha256/digest123"
+            format!("v2/repositories/ns/_config/sha256/{HASH_A}")
         );
 
-        let subject = Digest::Sha256("subject456".into());
-        let referrer = Digest::Sha256("referrer789".into());
+        let subject = Digest::sha256(HASH_A).unwrap();
+        let referrer = Digest::sha256(HASH_B).unwrap();
         let referrer_link = LinkKind::Referrer(subject, referrer);
         assert_eq!(
             link_path(&referrer_link, "ns"),
-            "v2/repositories/ns/_manifests/referrers/sha256/subject456/sha256/referrer789/link"
+            format!("v2/repositories/ns/_manifests/referrers/sha256/{HASH_A}/sha256/{HASH_B}/link")
         );
         assert_eq!(
             link_container_path(&referrer_link, "ns"),
-            "v2/repositories/ns/_manifests/referrers/sha256/subject456/sha256/referrer789"
+            format!("v2/repositories/ns/_manifests/referrers/sha256/{HASH_A}/sha256/{HASH_B}")
         );
 
-        let index = Digest::Sha256("index123".into());
-        let child = Digest::Sha256("child456".into());
+        let index = Digest::sha256(HASH_A).unwrap();
+        let child = Digest::sha256(HASH_B).unwrap();
         let manifest_link = LinkKind::Manifest(index, child);
         assert_eq!(
             link_path(&manifest_link, "ns"),
-            "v2/repositories/ns/_manifests/index/sha256/index123/sha256/child456/link"
+            format!("v2/repositories/ns/_manifests/index/sha256/{HASH_A}/sha256/{HASH_B}/link")
         );
         assert_eq!(
             link_container_path(&manifest_link, "ns"),
-            "v2/repositories/ns/_manifests/index/sha256/index123/sha256/child456"
+            format!("v2/repositories/ns/_manifests/index/sha256/{HASH_A}/sha256/{HASH_B}")
         );
     }
 

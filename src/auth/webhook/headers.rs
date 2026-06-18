@@ -6,9 +6,9 @@ use hyper::{
 };
 
 use crate::{
+    auth::sha256_hex,
     command::server::Error,
     identity::{Action, ClientIdentity},
-    util::sha256,
 };
 
 static X_FORWARDED_METHOD: &str = "X-Forwarded-Method";
@@ -219,7 +219,7 @@ pub fn build_cache_key(
         return Err(Error::Execution(msg));
     };
 
-    Ok(format!("webhook:{name}:{}", sha256::hex(key_material)))
+    Ok(format!("webhook:{name}:{}", sha256_hex(key_material)))
 }
 
 #[cfg(test)]

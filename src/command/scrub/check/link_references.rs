@@ -77,7 +77,7 @@ impl LinkReferencesChecker {
         referrer: &Digest,
         sink: &mut (dyn ActionSink + Send),
     ) -> Result<(), Error> {
-        let metadata = match self.metadata_store.read_link(namespace, link, false).await {
+        let metadata = match self.metadata_store.read_link(namespace, link).await {
             Ok(m) => m,
             Err(metadata_store::Error::ReferenceNotFound) => return Ok(()),
             Err(e) => return Err(e.into()),
@@ -99,7 +99,7 @@ impl LinkReferencesChecker {
             }
             match self
                 .metadata_store
-                .read_link(namespace, &LinkKind::Digest(stale.clone()), false)
+                .read_link(namespace, &LinkKind::Digest(stale.clone()))
                 .await
             {
                 Ok(_) => {}
@@ -239,7 +239,7 @@ mod tests {
             .await;
 
             let config_link_before = metadata_store
-                .read_link(namespace, &LinkKind::Config(config_digest.clone()), false)
+                .read_link(namespace, &LinkKind::Config(config_digest.clone()))
                 .await
                 .unwrap();
             assert!(
@@ -254,7 +254,7 @@ mod tests {
             checker.check(namespace, &mut executor).await.unwrap();
 
             let config_link_after = metadata_store
-                .read_link(namespace, &LinkKind::Config(config_digest.clone()), false)
+                .read_link(namespace, &LinkKind::Config(config_digest.clone()))
                 .await
                 .unwrap();
             assert!(
@@ -263,7 +263,7 @@ mod tests {
             );
 
             let layer_link_after = metadata_store
-                .read_link(namespace, &LinkKind::Layer(layer_digest.clone()), false)
+                .read_link(namespace, &LinkKind::Layer(layer_digest.clone()))
                 .await
                 .unwrap();
             assert!(
@@ -297,7 +297,7 @@ mod tests {
             checker.check(namespace, &mut sink).await.unwrap();
 
             let config_link = metadata_store
-                .read_link(namespace, &LinkKind::Config(config_digest), false)
+                .read_link(namespace, &LinkKind::Config(config_digest))
                 .await
                 .unwrap();
             assert!(
@@ -306,7 +306,7 @@ mod tests {
             );
 
             let layer_link = metadata_store
-                .read_link(namespace, &LinkKind::Layer(layer_digest), false)
+                .read_link(namespace, &LinkKind::Layer(layer_digest))
                 .await
                 .unwrap();
             assert!(
@@ -363,11 +363,11 @@ mod tests {
                 "ReferenceNotFound must not propagate as an error"
             );
 
-            let config_digest = Digest::Sha256(
-                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
-            );
+            let config_digest =
+                Digest::sha256("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+                    .unwrap();
             let config_result = metadata_store
-                .read_link(namespace, &LinkKind::Config(config_digest), false)
+                .read_link(namespace, &LinkKind::Config(config_digest))
                 .await;
             assert!(
                 matches!(config_result, Err(metadata_store::Error::ReferenceNotFound)),
@@ -402,7 +402,7 @@ mod tests {
 
             assert!(
                 metadata_store
-                    .read_link(namespace, &LinkKind::Digest(manifest_digest.clone()), false,)
+                    .read_link(namespace, &LinkKind::Digest(manifest_digest.clone()))
                     .await
                     .is_err(),
                 "revision link must be removed when its manifest blob is missing"
@@ -443,7 +443,7 @@ mod tests {
             );
             assert!(
                 metadata_store
-                    .read_link(namespace, &LinkKind::Digest(manifest_digest.clone()), false,)
+                    .read_link(namespace, &LinkKind::Digest(manifest_digest.clone()))
                     .await
                     .is_ok(),
                 "revision link must not be touched under Vec sink"
@@ -463,10 +463,10 @@ mod tests {
 
         let namespace = "test-repo/error";
         let hash = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
-        let target = Digest::Sha256(hash.into());
-        let referrer = Digest::Sha256(
-            "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd".into(),
-        );
+        let target = Digest::sha256(hash).unwrap();
+        let referrer =
+            Digest::sha256("dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd")
+                .unwrap();
         let link = LinkKind::Config(target.clone());
 
         // Compute the link file path directly (mirrors path_builder::link_path).
@@ -505,9 +505,9 @@ mod tests {
             .await;
 
             // Inject a phantom referrer: a digest that has no Digest link.
-            let phantom = Digest::Sha256(
-                "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee".into(),
-            );
+            let phantom =
+                Digest::sha256("eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee")
+                    .unwrap();
             metadata_store
                 .update_links(
                     namespace,
@@ -522,7 +522,7 @@ mod tests {
 
             // Confirm the phantom was injected.
             let before = metadata_store
-                .read_link(namespace, &LinkKind::Layer(layer_digest.clone()), false)
+                .read_link(namespace, &LinkKind::Layer(layer_digest.clone()))
                 .await
                 .unwrap();
             assert!(
@@ -535,7 +535,7 @@ mod tests {
             checker.check(namespace, &mut executor).await.unwrap();
 
             let after = metadata_store
-                .read_link(namespace, &LinkKind::Layer(layer_digest.clone()), false)
+                .read_link(namespace, &LinkKind::Layer(layer_digest.clone()))
                 .await
                 .unwrap();
             assert!(
@@ -602,7 +602,7 @@ mod tests {
             checker.check(namespace, &mut executor).await.unwrap();
 
             let after = metadata_store
-                .read_link(namespace, &LinkKind::Layer(layer_digest.clone()), false)
+                .read_link(namespace, &LinkKind::Layer(layer_digest.clone()))
                 .await
                 .unwrap();
             assert!(
@@ -635,9 +635,9 @@ mod tests {
             .await;
 
             // Inject a phantom referrer.
-            let phantom = Digest::Sha256(
-                "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff".into(),
-            );
+            let phantom =
+                Digest::sha256("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff")
+                    .unwrap();
             metadata_store
                 .update_links(
                     namespace,
@@ -664,7 +664,7 @@ mod tests {
 
             // On-disk state must be unchanged under a Vec sink.
             let unchanged = metadata_store
-                .read_link(namespace, &LinkKind::Layer(layer_digest.clone()), false)
+                .read_link(namespace, &LinkKind::Layer(layer_digest.clone()))
                 .await
                 .unwrap();
             assert!(

@@ -131,11 +131,11 @@ mod tests {
     const OTHER_HASH: &str = "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210";
 
     fn digest() -> Digest {
-        Digest::Sha256(VALID_HASH.into())
+        Digest::sha256(VALID_HASH).unwrap()
     }
 
     fn other_digest() -> Digest {
-        Digest::Sha256(OTHER_HASH.into())
+        Digest::sha256(OTHER_HASH).unwrap()
     }
 
     fn minimal_descriptor() -> Descriptor {

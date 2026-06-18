@@ -1,6 +1,6 @@
 use sha2::{Sha256, digest::common::hazmat::SerializableState};
 
-use crate::{oci, registry::blob_store::Error, util::sha256};
+use crate::{oci, registry::blob_store::Error};
 
 pub trait Sha256Ext {
     fn serialized_state(&self) -> Vec<u8>;
@@ -24,7 +24,7 @@ impl Sha256Ext for Sha256 {
     }
 
     fn digest(self) -> oci::Digest {
-        sha256::finalize_digest(self)
+        oci::Digest::from_sha256(self)
     }
 }
 
@@ -103,7 +103,7 @@ mod tests {
         let expected = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
         assert_eq!(
             digest,
-            crate::oci::Digest::Sha256(expected.into()),
+            crate::oci::Digest::sha256(expected).unwrap(),
             "SHA-256 of empty input must be {expected}"
         );
     }

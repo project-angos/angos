@@ -17,7 +17,7 @@ use crate::{
     registry::{
         DOCKER_CONTENT_DIGEST, Repository,
         blob_store::BlobStore,
-        job_store::{JobEnvelope, JobHandler},
+        job_store::{JobEnvelope, JobHandler, Queue},
         metadata_store::{LinkKind, LinkOperation, MetadataStore},
         repository_resolver::RepositoryResolver,
         test_utils::{
@@ -175,7 +175,7 @@ fn lock_key_handles_missing_tag_and_digest() {
 fn build_envelope_sets_queue_kind_and_lock_key() {
     let payload = sample_payload();
     let envelope = build_envelope(&payload).unwrap();
-    assert_eq!(envelope.queue, "replication");
+    assert_eq!(envelope.queue, Queue::Replication);
     assert_eq!(envelope.kind, REPLICATION_PUSH_MANIFEST_KIND);
     assert_eq!(envelope.lock_key, "replication.push.eu-region:nginx:v1");
     let round_trip: ReplicationPushPayload = serde_json::from_value(envelope.payload).unwrap();
@@ -225,7 +225,7 @@ async fn execute_rejects_unknown_kind() {
     let handler = ReplicationJobHandler::new(resolver, blob_store, metadata_store);
 
     let envelope = JobEnvelope::new(
-        "replication",
+        Queue::Replication,
         "replication.bogus",
         "lock",
         &sample_payload(),
@@ -432,10 +432,7 @@ async fn execute_push_resolves_tag_past_the_link_cache() {
 
     // Warm this process's cache with the stale target, then simulate a
     // sibling process re-pointing the tag behind it.
-    metadata_store
-        .read_link(NAMESPACE, &link, false)
-        .await
-        .unwrap();
+    metadata_store.read_link(NAMESPACE, &link).await.unwrap();
     assert_eq!(
         metadata_store
             .cache_get(NAMESPACE, &link)
@@ -594,7 +591,7 @@ async fn execute_push_stamps_resolved_source_timestamp() {
 
     // Read back the tag's created_at to assert the exact stamped value.
     let expected_ts = metadata_store
-        .read_link(NAMESPACE, &LinkKind::Tag("v1".to_string()), false)
+        .read_link(NAMESPACE, &LinkKind::Tag("v1".to_string()))
         .await
         .unwrap()
         .created_at
@@ -666,7 +663,7 @@ async fn execute_reconcile_push_derives_source_timestamp_from_local_tag() {
     let (manifest_digest, config_digest, layer_digest) =
         seed_manifest(&store, &metadata_store, NAMESPACE).await;
     let expected_ts = metadata_store
-        .read_link(NAMESPACE, &LinkKind::Tag("v1".to_string()), false)
+        .read_link(NAMESPACE, &LinkKind::Tag("v1".to_string()))
         .await
         .unwrap()
         .created_at

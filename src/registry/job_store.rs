@@ -12,6 +12,9 @@
 //! between the GET and the delete.
 
 use std::{
+    fmt,
+    fmt::{Display, Formatter},
+    str::FromStr,
     sync::{
         Arc,
         atomic::{AtomicU32, Ordering},
@@ -69,6 +72,51 @@ impl From<StorageError> for Error {
 impl From<LockError> for Error {
     fn from(err: LockError) -> Self {
         Error::Storage(err.to_string())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Queue
+// ---------------------------------------------------------------------------
+
+/// The set of durable job queues. Selects the storage prefix, the worker's
+/// `--queue` filter, and the dispatch handler. Serializes as its lowercase name
+/// so stored envelopes, storage paths, and metric labels keep their string form.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Queue {
+    Cache,
+    Replication,
+}
+
+impl Queue {
+    /// The on-disk / metric-label name (`"cache"` or `"replication"`).
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Queue::Cache => "cache",
+            Queue::Replication => "replication",
+        }
+    }
+}
+
+impl Display for Queue {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for Queue {
+    type Err = Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "cache" => Ok(Queue::Cache),
+            "replication" => Ok(Queue::Replication),
+            other => Err(Error::Initialization(format!(
+                "unknown queue '{other}'; expected 'cache' or 'replication'"
+            ))),
+        }
     }
 }
 
@@ -137,9 +185,9 @@ fn default_pending_ready_horizon_secs() -> u64 {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JobEnvelope {
     pub id: String,
-    /// Logical queue name; selects the storage prefix and the worker's
-    /// `--queue` filter.
-    pub queue: String,
+    /// Logical queue; selects the storage prefix and the worker's `--queue`
+    /// filter.
+    pub queue: Queue,
     /// Job type identifier (e.g. `"cache.fetch_blob"`). Handlers reject
     /// envelopes whose `kind` they do not recognize.
     pub kind: String,
@@ -157,14 +205,14 @@ impl JobEnvelope {
     /// payload that will be serialized to JSON. Returns `Err` only if the
     /// payload type cannot be serialized.
     pub fn new<P: Serialize>(
-        queue: impl Into<String>,
+        queue: Queue,
         kind: impl Into<String>,
         lock_key: impl Into<String>,
         payload: &P,
     ) -> Result<Self, serde_json::Error> {
         Ok(Self {
             id: Uuid::new_v4().to_string(),
-            queue: queue.into(),
+            queue,
             kind: kind.into(),
             lock_key: lock_key.into(),
             created_at: Utc::now(),
@@ -477,8 +525,8 @@ impl JobStore {
     /// List up to `n` pending storage keys in ascending order. Storage keys
     /// start with a sortable hex-millis prefix, so callers can stop scanning
     /// at the first key whose prefix is in the future.
-    pub async fn list_pending(&self, queue: &str, n: u16) -> Result<Vec<String>, Error> {
-        let prefix = path_builder::job_pending_dir(queue);
+    pub async fn list_pending(&self, queue: Queue, n: u16) -> Result<Vec<String>, Error> {
+        let prefix = path_builder::job_pending_dir(queue.as_str());
         let page = self.store.list(&prefix, 1000, None).await?;
 
         Ok(page
@@ -489,8 +537,12 @@ impl JobStore {
             .collect())
     }
 
-    pub async fn read_pending(&self, queue: &str, storage_key: &str) -> Result<JobEnvelope, Error> {
-        let key = path_builder::job_pending_path(queue, storage_key);
+    pub async fn read_pending(
+        &self,
+        queue: Queue,
+        storage_key: &str,
+    ) -> Result<JobEnvelope, Error> {
+        let key = path_builder::job_pending_path(queue.as_str(), storage_key);
         let data = self.store.get(&key).await?;
         serde_json::from_slice(&data)
             .map_err(|e| Error::Storage(format!("failed to parse envelope: {e}")))
@@ -500,10 +552,10 @@ impl JobStore {
     /// when the record is absent (e.g. a stale key the UI is still showing).
     pub async fn read_failed(
         &self,
-        queue: &str,
+        queue: Queue,
         storage_key: &str,
     ) -> Result<DeadLetterRead, Error> {
-        let key = path_builder::job_failed_path(queue, storage_key);
+        let key = path_builder::job_failed_path(queue.as_str(), storage_key);
         let data = self.store.get(&key).await?;
         serde_json::from_slice(&data)
             .map_err(|e| Error::Storage(format!("failed to parse dead-letter: {e}")))
@@ -515,11 +567,11 @@ impl JobStore {
     /// when the backend reports more entries beyond this page.
     pub async fn list_pending_page(
         &self,
-        queue: &str,
+        queue: Queue,
         n: u16,
         after: Option<&str>,
     ) -> Result<(Vec<String>, Option<String>), Error> {
-        self.list_page(&path_builder::job_pending_dir(queue), n, after)
+        self.list_page(&path_builder::job_pending_dir(queue.as_str()), n, after)
             .await
     }
 
@@ -527,11 +579,11 @@ impl JobStore {
     /// order. See [`Self::list_pending_page`] for the cursor contract.
     pub async fn list_failed_page(
         &self,
-        queue: &str,
+        queue: Queue,
         n: u16,
         after: Option<&str>,
     ) -> Result<(Vec<String>, Option<String>), Error> {
-        self.list_page(&path_builder::job_failed_dir(queue), n, after)
+        self.list_page(&path_builder::job_failed_dir(queue.as_str()), n, after)
             .await
     }
 
@@ -564,8 +616,8 @@ impl JobStore {
 
     /// Count pending envelopes ready for handling within
     /// `[..., now + ready_horizon_secs]`. Capped at [`MAX_REPORTED_PENDING`].
-    pub async fn count_pending(&self, queue: &str, ready_horizon_secs: u64) -> Result<u64, Error> {
-        let prefix = path_builder::job_pending_dir(queue);
+    pub async fn count_pending(&self, queue: Queue, ready_horizon_secs: u64) -> Result<u64, Error> {
+        let prefix = path_builder::job_pending_dir(queue.as_str());
         let cutoff_prefix = pending_ready_cutoff_prefix(ready_horizon_secs);
         let mut count: u64 = 0;
         let mut token: Option<String> = None;
@@ -599,8 +651,8 @@ impl JobStore {
     /// [`MAX_REPORTED_PENDING`]. Feeds the server-published
     /// `angos_job_queue_failed` gauge so dead-letters stay observable even when
     /// `angos worker` (which has no metrics endpoint) drains the queue.
-    pub async fn count_failed(&self, queue: &str) -> Result<u64, Error> {
-        let prefix = path_builder::job_failed_dir(queue);
+    pub async fn count_failed(&self, queue: Queue) -> Result<u64, Error> {
+        let prefix = path_builder::job_failed_dir(queue.as_str());
         let mut count: u64 = 0;
         let mut token: Option<String> = None;
         loop {
@@ -631,10 +683,10 @@ impl JobStore {
     /// the index between our GET and the apply is never accidentally deleted.
     pub async fn find_pending_with_lock_key(
         &self,
-        queue: &str,
+        queue: Queue,
         lock_key: &str,
     ) -> Result<bool, Error> {
-        let index_path = path_builder::job_lock_key_index_path(queue, lock_key);
+        let index_path = path_builder::job_lock_key_index_path(queue.as_str(), lock_key);
         let data = match self.store.get(&index_path).await {
             Ok(d) => d,
             Err(StorageError::NotFound) => return Ok(false),
@@ -642,7 +694,7 @@ impl JobStore {
         };
         let index = parse_lock_key_index(&data)?;
 
-        let pending_key = path_builder::job_pending_path(queue, &index.storage_key);
+        let pending_key = path_builder::job_pending_path(queue.as_str(), &index.storage_key);
         match self.store.head(&pending_key).await {
             Ok(_) => Ok(true),
             Err(StorageError::NotFound) => {
@@ -682,10 +734,10 @@ impl JobStore {
     /// parsed `storage_key` it contains, or `None` when the index is absent.
     pub async fn get_lock_key_index_raw(
         &self,
-        queue: &str,
+        queue: Queue,
         lock_key: &str,
     ) -> Result<Option<(String, Vec<u8>)>, Error> {
-        let index_path = path_builder::job_lock_key_index_path(queue, lock_key);
+        let index_path = path_builder::job_lock_key_index_path(queue.as_str(), lock_key);
         match self.get_raw(&index_path).await {
             Ok(data) => {
                 let index = parse_lock_key_index(&data)?;
@@ -741,7 +793,7 @@ impl JobStore {
     /// The pending file stays as the crash-recovery record, and the delete is
     /// conditional plus fingerprint-guarded so a producer's newer index is
     /// never clobbered.
-    async fn retire_claimed_index(&self, queue: &str, lock_key: &str, storage_key: &str) {
+    async fn retire_claimed_index(&self, queue: Queue, lock_key: &str, storage_key: &str) {
         let (index_storage_key, body) = match self.get_lock_key_index_raw(queue, lock_key).await {
             Ok(Some(found)) => found,
             Ok(None) => return,
@@ -750,7 +802,7 @@ impl JobStore {
                 return;
             }
         };
-        let index_path = path_builder::job_lock_key_index_path(queue, lock_key);
+        let index_path = path_builder::job_lock_key_index_path(queue.as_str(), lock_key);
         let (read, delete) =
             Self::conditional_index_delete(index_path, &body, &index_storage_key, storage_key);
         if delete.is_none() {
@@ -782,7 +834,7 @@ impl JobStore {
     pub async fn enqueue(&self, envelope: JobEnvelope) -> Result<(), Error> {
         // Fast path: index present and pending exists, a hit, no writes needed.
         if self
-            .find_pending_with_lock_key(&envelope.queue, &envelope.lock_key)
+            .find_pending_with_lock_key(envelope.queue, &envelope.lock_key)
             .await
             .unwrap_or(false)
         {
@@ -795,8 +847,9 @@ impl JobStore {
 
         // Slow path: build the transaction.
         let storage_key = make_storage_key(Utc::now(), &envelope.id);
-        let pending_path = path_builder::job_pending_path(&envelope.queue, &storage_key);
-        let index_path = path_builder::job_lock_key_index_path(&envelope.queue, &envelope.lock_key);
+        let pending_path = path_builder::job_pending_path(envelope.queue.as_str(), &storage_key);
+        let index_path =
+            path_builder::job_lock_key_index_path(envelope.queue.as_str(), &envelope.lock_key);
 
         let pending_body = Bytes::from(
             serde_json::to_vec(&envelope)
@@ -847,7 +900,7 @@ impl JobStore {
     /// failure: a storage error sleeps an exponential, capped backoff before
     /// returning so the caller can loop without managing retry timing itself.
     /// The backoff resets on the next successful claim.
-    pub async fn claim_one(&self, queue: &str) -> Result<ClaimOutcome, Error> {
+    pub async fn claim_one(&self, queue: Queue) -> Result<ClaimOutcome, Error> {
         match self.try_claim_one(queue).await {
             Ok(outcome) => {
                 self.consecutive_claim_errors.store(0, Ordering::Relaxed);
@@ -873,7 +926,7 @@ impl JobStore {
     /// On a successful claim the job's dedup index is retired (see
     /// [`Self::retire_claimed_index`]) so a same-`lock_key` enqueue arriving
     /// while the job runs is not coalesced into the already-resolved job.
-    async fn try_claim_one(&self, queue: &str) -> Result<ClaimOutcome, Error> {
+    async fn try_claim_one(&self, queue: Queue) -> Result<ClaimOutcome, Error> {
         let now = Utc::now();
         let mut next_ready: Option<DateTime<Utc>> = None;
         for storage_key in self.list_pending(queue, MAX_SCAN).await? {
@@ -940,8 +993,9 @@ impl JobStore {
             storage_key,
             session,
         } = claimed;
-        let pending_path = path_builder::job_pending_path(&envelope.queue, &storage_key);
-        let index_path = path_builder::job_lock_key_index_path(&envelope.queue, &envelope.lock_key);
+        let pending_path = path_builder::job_pending_path(envelope.queue.as_str(), &storage_key);
+        let index_path =
+            path_builder::job_lock_key_index_path(envelope.queue.as_str(), &envelope.lock_key);
 
         let mut tx = handler_tx;
         tx.mutations.push(Mutation::Delete {
@@ -1058,9 +1112,12 @@ impl JobStore {
         next_at: DateTime<Utc>,
     ) -> Result<FailOutcome, Error> {
         let new_storage_key = make_storage_key(next_at, &updated.id);
-        let new_pending_path = path_builder::job_pending_path(&updated.queue, &new_storage_key);
-        let old_pending_path = path_builder::job_pending_path(&updated.queue, &old_storage_key);
-        let index_path = path_builder::job_lock_key_index_path(&updated.queue, &updated.lock_key);
+        let new_pending_path =
+            path_builder::job_pending_path(updated.queue.as_str(), &new_storage_key);
+        let old_pending_path =
+            path_builder::job_pending_path(updated.queue.as_str(), &old_storage_key);
+        let index_path =
+            path_builder::job_lock_key_index_path(updated.queue.as_str(), &updated.lock_key);
 
         let pending_body = Bytes::from(
             serde_json::to_vec(&updated)
@@ -1106,8 +1163,8 @@ impl JobStore {
         storage_key: String,
         err: &str,
     ) -> Result<FailOutcome, Error> {
-        let failed_path = path_builder::job_failed_path(&envelope.queue, &storage_key);
-        let pending_path = path_builder::job_pending_path(&envelope.queue, &storage_key);
+        let failed_path = path_builder::job_failed_path(envelope.queue.as_str(), &storage_key);
+        let pending_path = path_builder::job_pending_path(envelope.queue.as_str(), &storage_key);
 
         let failed_body = Bytes::from(serialize_dead_letter(&envelope, err)?);
 
@@ -1125,9 +1182,10 @@ impl JobStore {
 
         // Conditionally include the index delete: only when the index still
         // points at our storage_key. Read the index to get the fingerprint.
-        let index_path = path_builder::job_lock_key_index_path(&envelope.queue, &envelope.lock_key);
+        let index_path =
+            path_builder::job_lock_key_index_path(envelope.queue.as_str(), &envelope.lock_key);
         match self
-            .get_lock_key_index_raw(&envelope.queue, &envelope.lock_key)
+            .get_lock_key_index_raw(envelope.queue, &envelope.lock_key)
             .await
         {
             Ok(Some((index_storage_key, body))) => {
@@ -1169,8 +1227,8 @@ impl JobStore {
     /// `lock_key` may create a second pending file. That is safe: the
     /// per-`lock_key` execution lock still serialises the two, and the handler
     /// contract makes a redundant run idempotent.
-    pub async fn retry_failed(&self, queue: &str, storage_key: &str) -> Result<(), Error> {
-        let failed_path = path_builder::job_failed_path(queue, storage_key);
+    pub async fn retry_failed(&self, queue: Queue, storage_key: &str) -> Result<(), Error> {
+        let failed_path = path_builder::job_failed_path(queue.as_str(), storage_key);
         // HEAD first for the fencing ETag (`None` when the backend does not
         // surface ETags, giving an unconditional delete, still safe: the new pending
         // key is fresh so a double-retry collides at `PutIfAbsent`).
@@ -1180,7 +1238,7 @@ impl JobStore {
         envelope.attempts = 0;
 
         let new_storage_key = make_storage_key(Utc::now(), &envelope.id);
-        let pending_path = path_builder::job_pending_path(queue, &new_storage_key);
+        let pending_path = path_builder::job_pending_path(queue.as_str(), &new_storage_key);
         let pending_body = Bytes::from(
             serde_json::to_vec(&envelope)
                 .map_err(|e| Error::Storage(format!("envelope serialization failed: {e}")))?,
@@ -1219,13 +1277,13 @@ impl JobStore {
     /// Returns [`Error::NotFound`] for a stale key.
     pub async fn delete_job(
         &self,
-        queue: &str,
+        queue: Queue,
         state: JobState,
         storage_key: &str,
     ) -> Result<(), Error> {
         match state {
             JobState::Failed => {
-                let failed_path = path_builder::job_failed_path(queue, storage_key);
+                let failed_path = path_builder::job_failed_path(queue.as_str(), storage_key);
                 let expected = self.store.head(&failed_path).await?.etag;
                 let tx = Transaction::builder()
                     .mutation(Mutation::Delete {
@@ -1243,8 +1301,8 @@ impl JobStore {
         }
     }
 
-    async fn delete_pending(&self, queue: &str, storage_key: &str) -> Result<(), Error> {
-        let pending_path = path_builder::job_pending_path(queue, storage_key);
+    async fn delete_pending(&self, queue: Queue, storage_key: &str) -> Result<(), Error> {
+        let pending_path = path_builder::job_pending_path(queue.as_str(), storage_key);
         // Read the envelope (for its `lock_key`) and HEAD for the fence; a
         // missing pending file surfaces as `NotFound` for a 404.
         let envelope = self.read_pending(queue, storage_key).await?;
@@ -1260,7 +1318,7 @@ impl JobStore {
         // Fold a conditional index delete: only when the index still points at
         // this storage key. The read fingerprint turns a concurrent index
         // refresh into a no-op conflict rather than clobbering a fresh index.
-        let index_path = path_builder::job_lock_key_index_path(queue, &envelope.lock_key);
+        let index_path = path_builder::job_lock_key_index_path(queue.as_str(), &envelope.lock_key);
         match self.get_lock_key_index_raw(queue, &envelope.lock_key).await {
             Ok(Some((index_storage_key, body))) => {
                 let (read, delete) = Self::conditional_index_delete(
@@ -1299,7 +1357,7 @@ impl JobStore {
 /// loop so both gauges are scrapeable even when `angos worker` drains the queue.
 pub async fn queue_depth_refresh_loop(
     store: Arc<JobStore>,
-    queue: String,
+    queue: Queue,
     period: Duration,
     ready_horizon_secs: u64,
     shutdown: CancellationToken,
@@ -1314,7 +1372,7 @@ pub async fn queue_depth_refresh_loop(
             () = shutdown.cancelled() => return,
             _ = timer.tick() => {}
         }
-        match store.count_pending(&queue, ready_horizon_secs).await {
+        match store.count_pending(queue, ready_horizon_secs).await {
             Ok(count) => {
                 metrics_provider()
                     .job_queue_pending
@@ -1323,7 +1381,7 @@ pub async fn queue_depth_refresh_loop(
             }
             Err(e) => debug!(queue = %queue, error = %e, "Failed to refresh pending gauge"),
         }
-        match store.count_failed(&queue).await {
+        match store.count_failed(queue).await {
             Ok(count) => {
                 metrics_provider()
                     .job_queue_failed

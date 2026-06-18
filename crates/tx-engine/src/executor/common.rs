@@ -8,7 +8,7 @@ use bytes::Bytes;
 use chrono::Utc;
 use tracing::warn;
 
-use angos_storage::ObjectStore;
+use angos_storage::{Error as StorageError, Etag, ObjectStore};
 
 use crate::{
     error::Error,
@@ -154,10 +154,10 @@ pub fn build_intent(
 /// Apply a `Move` idempotently: copy `src` to `dst`, then delete `src`
 /// tolerating a missing source.
 ///
-/// Shared by the replay-forward paths (the CAS idempotent applier and the
-/// unconditional recovery applier) so the idempotent Move shape stays in
-/// lock-step. The `copy` still propagates errors; only a `NotFound` on the
-/// source delete is swallowed so re-application after a partial Move converges.
+/// Shared by both appliers' reconcile paths ([`apply_object_store`] and
+/// [`super::cas::apply_cas`]) so the idempotent Move shape stays in lock-step.
+/// The `copy` still propagates errors; only a `NotFound` on the source delete is
+/// swallowed so re-application after a partial Move converges.
 ///
 /// # Errors
 ///
@@ -172,6 +172,118 @@ pub async fn move_idempotent(
     match store.delete(src).await {
         Ok(()) | Err(angos_storage::Error::NotFound) => Ok(()),
         Err(e) => Err(e),
+    }
+}
+
+/// Per-key semantics for [`apply_object_store`], mirroring
+/// [`super::cas::CasApplyMode`]. `Abort` is the Locked executor's healthy path:
+/// it honors `expected` (HEAD/ETag compare) and fails closed on a precondition
+/// miss. `Reconcile` is the recovery replay path: idempotent, and it ignores
+/// `expected` because the precondition was already validated at commit time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ObjectApplyMode {
+    Abort,
+    Reconcile,
+}
+
+/// Apply one mutation against a plain [`ObjectStore`] (the Locked-executor world,
+/// which has no conditional store). Conditional `Put`/`Delete` are honored via a
+/// HEAD/ETag compare under the caller's lock. The conditional-store equivalent is
+/// [`super::cas::apply_cas`]; keeping both as mode-parameterized appliers stops
+/// the `Move`/`PutIfAbsent`/precondition semantics from drifting.
+///
+/// # Errors
+///
+/// In `Abort`, returns [`Error::Precondition`] when a conditional `Put`/`Delete`
+/// or a `PutIfAbsent` finds the key in the wrong state. Either mode returns
+/// [`Error::Storage`] on a hard storage error.
+pub async fn apply_object_store(
+    store: &dyn ObjectStore,
+    mutation: &MutationRecord,
+    mode: ObjectApplyMode,
+) -> Result<(), Error> {
+    match mutation {
+        MutationRecord::Put {
+            key,
+            body_ref,
+            expected,
+        } => {
+            if mode == ObjectApplyMode::Abort
+                && let Some(etag) = expected
+            {
+                check_expected_match(store, key, etag).await?;
+            }
+            match store.get(body_ref).await {
+                Ok(body) => store
+                    .put(key, Bytes::from(body))
+                    .await
+                    .map_err(Error::Storage),
+                // Reconcile: a reaped staging body means the canonical write already landed.
+                Err(StorageError::NotFound) if mode == ObjectApplyMode::Reconcile => Ok(()),
+                Err(e) => Err(Error::Storage(e)),
+            }
+        }
+        MutationRecord::PutIfAbsent { key, body_ref } => match store.head(key).await {
+            // Abort: the key exists, so the precondition fails. Reconcile: that is
+            // the expected idempotent outcome of a replayed insert.
+            Ok(_) => match mode {
+                ObjectApplyMode::Abort => Err(Error::Precondition),
+                ObjectApplyMode::Reconcile => Ok(()),
+            },
+            Err(StorageError::NotFound) => match store.get(body_ref).await {
+                Ok(body) => store
+                    .put(key, Bytes::from(body))
+                    .await
+                    .map_err(Error::Storage),
+                Err(StorageError::NotFound) if mode == ObjectApplyMode::Reconcile => Ok(()),
+                Err(e) => Err(Error::Storage(e)),
+            },
+            Err(e) => Err(Error::Storage(e)),
+        },
+        MutationRecord::Delete { key, expected } => {
+            if mode == ObjectApplyMode::Abort
+                && let Some(etag) = expected
+            {
+                match store.head(key).await {
+                    Ok(meta) => {
+                        if meta.etag.as_ref() != Some(etag) {
+                            return Err(Error::Precondition);
+                        }
+                    }
+                    // Already gone: a conditional delete is a no-op success.
+                    Err(StorageError::NotFound) => return Ok(()),
+                    Err(e) => return Err(Error::Storage(e)),
+                }
+            }
+            match store.delete(key).await {
+                Ok(()) => Ok(()),
+                Err(StorageError::NotFound) if mode == ObjectApplyMode::Reconcile => Ok(()),
+                Err(e) => Err(Error::Storage(e)),
+            }
+        }
+        MutationRecord::Copy { src, dst } => store.copy(src, dst).await.map_err(Error::Storage),
+        MutationRecord::Move { src, dst } => match mode {
+            ObjectApplyMode::Abort => store.move_object(src, dst).await.map_err(Error::Storage),
+            ObjectApplyMode::Reconcile => move_idempotent(store, src, dst)
+                .await
+                .map_err(Error::Storage),
+        },
+    }
+}
+
+/// HEAD `key` and require its current `ETag` to equal `expected`, mirroring the
+/// CAS executor's `put_if_match` / `delete_if_match`. A missing key, an `ETag`
+/// mismatch, or a backend that cannot surface an `ETag` all yield
+/// [`Error::Precondition`] (no write).
+async fn check_expected_match(
+    store: &dyn ObjectStore,
+    key: &str,
+    expected: &Etag,
+) -> Result<(), Error> {
+    match store.head(key).await {
+        Ok(meta) if meta.etag.as_ref() == Some(expected) => Ok(()),
+        Ok(_) | Err(StorageError::NotFound) => Err(Error::Precondition),
+        Err(e) => Err(Error::Storage(e)),
     }
 }
 

@@ -21,7 +21,6 @@ use crate::{
         },
     },
     replication::REPLICATION_SUPERSEDED_CODE,
-    util::sha256,
 };
 
 fn header_digest(headers: &HashMap<&'static str, String>) -> Digest {
@@ -203,7 +202,7 @@ async fn upload_blob(registry: &Registry, namespace: &Namespace, content: &[u8])
         .unwrap();
 
     let body = content.to_vec();
-    let digest = sha256::digest(&body);
+    let digest = Digest::from_bytes(&body);
     registry
         .complete_upload(
             None,
@@ -294,12 +293,12 @@ async fn put_manifest_rejects_missing_config_reference() {
         };
 
         assert!(matches!(err, Error::ManifestBlobUnknown));
-        let manifest_digest = sha256::digest(&content);
+        let manifest_digest = Digest::from_bytes(&content);
         assert!(registry.blob_store.read(&manifest_digest).await.is_err());
         assert!(
             registry
                 .metadata_store
-                .read_link(namespace, &LinkKind::Tag("latest".to_string()), false)
+                .read_link(namespace, &LinkKind::Tag("latest".to_string()))
                 .await
                 .is_err()
         );
@@ -416,7 +415,7 @@ async fn put_manifest_allows_missing_subject_reference() {
         let link = LinkKind::Referrer(subject, digest.clone());
         let metadata = registry
             .metadata_store
-            .read_link(namespace, &link, false)
+            .read_link(namespace, &link)
             .await
             .unwrap();
         assert_eq!(metadata.target, digest);
@@ -1586,7 +1585,7 @@ async fn test_put_manifest_stores_media_type() {
         let digest_link = LinkKind::Digest(header_digest(&response.headers));
         let link_meta = registry
             .metadata_store
-            .read_link(namespace, &digest_link, false)
+            .read_link(namespace, &digest_link)
             .await
             .unwrap();
         assert_eq!(
@@ -1598,7 +1597,7 @@ async fn test_put_manifest_stores_media_type() {
         let tag_link = LinkKind::Tag(tag.to_string());
         let tag_meta = registry
             .metadata_store
-            .read_link(namespace, &tag_link, false)
+            .read_link(namespace, &tag_link)
             .await
             .unwrap();
         assert_eq!(
@@ -1633,7 +1632,7 @@ async fn test_head_manifest_fallback_without_media_type() {
 
         let link_meta = registry
             .metadata_store
-            .read_link(namespace, &LinkKind::Digest(digest.clone()), false)
+            .read_link(namespace, &LinkKind::Digest(digest.clone()))
             .await
             .unwrap();
         assert_eq!(
@@ -1740,7 +1739,6 @@ async fn test_put_manifest_without_content_type_stores_manifest_media_type() {
             .read_link(
                 namespace,
                 &LinkKind::Digest(header_digest(&response.headers)),
-                false,
             )
             .await
             .unwrap();
@@ -1899,7 +1897,7 @@ async fn store_manifest_writes_blob_and_links() {
     let namespace = Namespace::new("test-repo").unwrap();
 
     let (manifest_bytes, media_type) = create_test_manifest(registry, &namespace).await;
-    let expected_digest = Digest::Sha256(sha256::hex(&manifest_bytes).into());
+    let expected_digest = Digest::from_bytes(&manifest_bytes);
 
     let response = registry
         .put_manifest(
@@ -1917,7 +1915,7 @@ async fn store_manifest_writes_blob_and_links() {
     // The link should be readable via the metadata store.
     let link = registry
         .metadata_store
-        .read_link(namespace.as_ref(), &LinkKind::Tag("v1".to_string()), false)
+        .read_link(namespace.as_ref(), &LinkKind::Tag("v1".to_string()))
         .await
         .unwrap();
     assert_eq!(link.target, expected_digest);
@@ -1969,10 +1967,10 @@ async fn store_manifest_is_idempotent() {
         .unwrap();
 
     // Link and blob-index must still be consistent.
-    let digest = Digest::Sha256(sha256::hex(&manifest_bytes).into());
+    let digest = Digest::from_bytes(&manifest_bytes);
     let link = registry
         .metadata_store
-        .read_link(namespace.as_ref(), &LinkKind::Tag("v1".to_string()), false)
+        .read_link(namespace.as_ref(), &LinkKind::Tag("v1".to_string()))
         .await
         .unwrap();
     assert_eq!(link.target, digest);
@@ -1985,7 +1983,7 @@ async fn delete_manifest_removes_links_and_blob_data() {
     let namespace = Namespace::new("test-repo").unwrap();
 
     let (manifest_bytes, media_type) = create_test_manifest(registry, &namespace).await;
-    let digest = Digest::Sha256(sha256::hex(&manifest_bytes).into());
+    let digest = Digest::from_bytes(&manifest_bytes);
 
     registry
         .put_manifest(
@@ -2000,7 +1998,7 @@ async fn delete_manifest_removes_links_and_blob_data() {
     // Verify it exists.
     registry
         .metadata_store
-        .read_link(namespace.as_ref(), &LinkKind::Tag("v1".to_string()), false)
+        .read_link(namespace.as_ref(), &LinkKind::Tag("v1".to_string()))
         .await
         .unwrap();
 
@@ -2013,7 +2011,7 @@ async fn delete_manifest_removes_links_and_blob_data() {
     // Link should be gone.
     let result = registry
         .metadata_store
-        .read_link(namespace.as_ref(), &LinkKind::Digest(digest.clone()), false)
+        .read_link(namespace.as_ref(), &LinkKind::Digest(digest.clone()))
         .await;
     assert!(
         matches!(result, Err(metadata_store::Error::ReferenceNotFound)),
@@ -2046,7 +2044,7 @@ async fn local_created_at(
 ) -> chrono::DateTime<chrono::Utc> {
     registry
         .metadata_store
-        .read_link(namespace.as_ref(), &LinkKind::Tag(tag.to_string()), false)
+        .read_link(namespace.as_ref(), &LinkKind::Tag(tag.to_string()))
         .await
         .expect("read seeded tag link")
         .created_at
@@ -2206,8 +2204,8 @@ async fn two_manifests_by_digest_order(
         layer_content.len(),
     );
 
-    let first_digest = Digest::Sha256(sha256::hex(&first.0).into());
-    let second_digest = Digest::Sha256(sha256::hex(&second.0).into());
+    let first_digest = Digest::from_bytes(&first.0);
+    let second_digest = Digest::from_bytes(&second.0);
     if first_digest > second_digest {
         (first, second)
     } else {
@@ -2266,7 +2264,7 @@ async fn accept_put_manifest_lww_equal_ts_accepts_larger_digest() {
 
     let ((larger, larger_mt), (smaller, smaller_mt)) =
         two_manifests_by_digest_order(registry, namespace).await;
-    let larger_digest = Digest::Sha256(sha256::hex(&larger).into());
+    let larger_digest = Digest::from_bytes(&larger);
     let ts = chrono::Utc::now() - chrono::Duration::hours(1);
 
     registry
@@ -2370,8 +2368,8 @@ async fn find_tags_pointing_at_bypasses_the_link_cache() {
     let namespace = "cascade-repo";
     let link = LinkKind::Tag("latest".to_string());
 
-    let old_digest = Digest::Sha256(sha256::hex(b"old").into());
-    let new_digest = Digest::Sha256(sha256::hex(b"new").into());
+    let old_digest = Digest::from_bytes(b"old");
+    let new_digest = Digest::from_bytes(b"new");
 
     store
         .store_manifest(
@@ -2426,7 +2424,7 @@ async fn store_manifest_enforces_lww_inside_the_link_transaction() {
     let link = LinkKind::Tag("latest".to_string());
 
     let newer_body = br#"{"newer":true}"#.to_vec();
-    let newer_digest = Digest::Sha256(sha256::hex(&newer_body).into());
+    let newer_digest = Digest::from_bytes(&newer_body);
     let newer_ts = chrono::Utc::now();
     store
         .store_manifest(
@@ -2440,7 +2438,7 @@ async fn store_manifest_enforces_lww_inside_the_link_transaction() {
         .expect("seed the newer replicated write");
 
     let older_body = br#"{"older":true}"#.to_vec();
-    let older_digest = Digest::Sha256(sha256::hex(&older_body).into());
+    let older_digest = Digest::from_bytes(&older_body);
     let result = store
         .store_manifest(
             namespace,
@@ -2479,7 +2477,7 @@ async fn delete_links_enforces_lww_inside_the_link_transaction() {
     let link = LinkKind::Tag("latest".to_string());
 
     let body = br#"{"winner":true}"#.to_vec();
-    let digest = Digest::Sha256(sha256::hex(&body).into());
+    let digest = Digest::from_bytes(&body);
     let newer_ts = chrono::Utc::now();
     store
         .store_manifest(
@@ -2622,7 +2620,7 @@ async fn accept_put_manifest_digest_reference_skips_lww() {
     let namespace = &Namespace::new("lww-repo").unwrap();
 
     let (content, media_type) = create_test_manifest(registry, namespace).await;
-    let digest = Digest::Sha256(sha256::hex(&content).into());
+    let digest = Digest::from_bytes(&content);
     let very_old = chrono::Utc::now() - chrono::Duration::days(3650);
 
     registry
@@ -2666,7 +2664,7 @@ async fn delete_manifest_rejects_lww_older_source_ts() {
 
     registry
         .metadata_store
-        .read_link(namespace.as_ref(), &LinkKind::Tag(tag.to_string()), false)
+        .read_link(namespace.as_ref(), &LinkKind::Tag(tag.to_string()))
         .await
         .expect("tag must survive a superseded delete");
 }
@@ -2694,7 +2692,7 @@ async fn delete_manifest_accepts_lww_newer_source_ts() {
 
     let result = registry
         .metadata_store
-        .read_link(namespace.as_ref(), &LinkKind::Tag(tag.to_string()), false)
+        .read_link(namespace.as_ref(), &LinkKind::Tag(tag.to_string()))
         .await;
     assert!(
         matches!(result, Err(metadata_store::Error::ReferenceNotFound)),
@@ -2717,7 +2715,7 @@ async fn delete_manifest_not_superseded_when_local_tag_has_no_created_at() {
             namespace.as_ref(),
             &LinkKind::Tag(tag.to_string()),
             &LinkMetadata {
-                target: Digest::Sha256(sha256::hex(b"manifest-bytes").into()),
+                target: Digest::from_bytes(b"manifest-bytes"),
                 created_at: None,
                 accessed_at: None,
                 referenced_by: HashSet::new(),
@@ -2742,7 +2740,7 @@ async fn delete_manifest_not_superseded_when_local_tag_has_no_created_at() {
 
     let result = registry
         .metadata_store
-        .read_link(namespace.as_ref(), &LinkKind::Tag(tag.to_string()), false)
+        .read_link(namespace.as_ref(), &LinkKind::Tag(tag.to_string()))
         .await;
     assert!(
         matches!(result, Err(metadata_store::Error::ReferenceNotFound)),
@@ -2794,7 +2792,7 @@ async fn replicated_delete_not_superseded_by_a_legacy_link() {
     let namespace = &Namespace::new("legacy-repo").unwrap();
     let link = LinkKind::Tag("latest".to_string());
 
-    let legacy_digest = Digest::Sha256(sha256::hex(b"legacy-manifest").into());
+    let legacy_digest = Digest::from_bytes(b"legacy-manifest");
     put_link_raw(
         registry.metadata_store.store(),
         namespace.as_ref(),
@@ -2816,7 +2814,7 @@ async fn replicated_delete_not_superseded_by_a_legacy_link() {
 
     let result = registry
         .metadata_store
-        .read_link(namespace.as_ref(), &link, false)
+        .read_link(namespace.as_ref(), &link)
         .await;
     assert!(
         matches!(result, Err(metadata_store::Error::ReferenceNotFound)),
@@ -2834,7 +2832,7 @@ async fn delete_manifest_digest_rejects_lww_when_pointing_tag_newer() {
     let tag = "latest";
 
     let (content, _) = seed_tag(registry, namespace, tag).await;
-    let digest = Digest::Sha256(sha256::hex(&content).into());
+    let digest = Digest::from_bytes(&content);
     let older = local_created_at(registry, namespace, tag).await - chrono::Duration::seconds(60);
 
     let result = registry
@@ -2854,12 +2852,12 @@ async fn delete_manifest_digest_rejects_lww_when_pointing_tag_newer() {
 
     registry
         .metadata_store
-        .read_link(namespace.as_ref(), &LinkKind::Tag(tag.to_string()), false)
+        .read_link(namespace.as_ref(), &LinkKind::Tag(tag.to_string()))
         .await
         .expect("pointing tag must survive a superseded digest delete");
     registry
         .metadata_store
-        .read_link(namespace.as_ref(), &LinkKind::Digest(digest), false)
+        .read_link(namespace.as_ref(), &LinkKind::Digest(digest))
         .await
         .expect("revision must survive a superseded digest delete");
 }
@@ -2872,7 +2870,7 @@ async fn delete_manifest_digest_accepts_lww_when_newer_than_pointing_tags() {
     let tag = "latest";
 
     let (content, _) = seed_tag(registry, namespace, tag).await;
-    let digest = Digest::Sha256(sha256::hex(&content).into());
+    let digest = Digest::from_bytes(&content);
     let newer = local_created_at(registry, namespace, tag).await + chrono::Duration::seconds(60);
 
     registry
@@ -2882,7 +2880,7 @@ async fn delete_manifest_digest_accepts_lww_when_newer_than_pointing_tags() {
 
     let tag_result = registry
         .metadata_store
-        .read_link(namespace.as_ref(), &LinkKind::Tag(tag.to_string()), false)
+        .read_link(namespace.as_ref(), &LinkKind::Tag(tag.to_string()))
         .await;
     assert!(
         matches!(tag_result, Err(metadata_store::Error::ReferenceNotFound)),
@@ -2925,7 +2923,7 @@ async fn prune_delete_stamped_source_ts_suppressed_when_local_tag_newer_else_pro
     );
     registry
         .metadata_store
-        .read_link(namespace.as_ref(), &LinkKind::Tag(tag.to_string()), false)
+        .read_link(namespace.as_ref(), &LinkKind::Tag(tag.to_string()))
         .await
         .expect("a superseded prune delete must preserve the downstream tag");
 
@@ -2947,7 +2945,7 @@ async fn prune_delete_stamped_source_ts_suppressed_when_local_tag_newer_else_pro
         .expect("a prune delete must proceed when its source_ts is newer than the tag");
     let result = registry
         .metadata_store
-        .read_link(namespace.as_ref(), &LinkKind::Tag(tag.to_string()), false)
+        .read_link(namespace.as_ref(), &LinkKind::Tag(tag.to_string()))
         .await;
     assert!(
         matches!(result, Err(metadata_store::Error::ReferenceNotFound)),
@@ -2999,7 +2997,7 @@ mod noop_suppression_tests {
         registry::{
             Registry, RegistryConfig,
             blob_store::BlobStore,
-            job_store::JobStore,
+            job_store::{JobStore, Queue},
             metadata_store::{LinkKind, LinkOperation, MetadataStore},
             repository_resolver::RepositoryResolver,
             test_utils::{
@@ -3007,8 +3005,7 @@ mod noop_suppression_tests {
                 sole_pending_payload,
             },
         },
-        replication::{REPLICATION_DELETE_MANIFEST_KIND, REPLICATION_QUEUE},
-        util::sha256,
+        replication::REPLICATION_DELETE_MANIFEST_KIND,
     };
 
     use super::{create_test_manifest, manifest_with_references, upload_blob};
@@ -3047,7 +3044,10 @@ mod noop_suppression_tests {
     }
 
     async fn pending(job_store: &JobStore) -> u64 {
-        job_store.count_pending(REPLICATION_QUEUE, 0).await.unwrap()
+        job_store
+            .count_pending(Queue::Replication, 0)
+            .await
+            .unwrap()
     }
 
     /// Drains (claims + completes) one pending replication job, clearing its
@@ -3056,7 +3056,7 @@ mod noop_suppression_tests {
     /// queue's coalescing.
     async fn drain_one(job_store: &JobStore) {
         let claimed = job_store
-            .claim_one(REPLICATION_QUEUE)
+            .claim_one(Queue::Replication)
             .await
             .unwrap()
             .claimed
@@ -3163,7 +3163,7 @@ mod noop_suppression_tests {
         let namespace = Namespace::new(NAMESPACE).unwrap();
 
         let (content, media_type) = create_test_manifest(&registry, &namespace).await;
-        let digest = Digest::Sha256(sha256::hex(&content).into());
+        let digest = Digest::from_bytes(&content);
 
         registry
             .accept_put_manifest(
@@ -3377,7 +3377,7 @@ mod noop_suppression_tests {
         let namespace = Namespace::new(NAMESPACE).unwrap();
 
         let (content, media_type) = create_test_manifest(&registry, &namespace).await;
-        let digest = Digest::Sha256(sha256::hex(&content).into());
+        let digest = Digest::from_bytes(&content);
         registry
             .accept_put_manifest(
                 None,
@@ -3422,7 +3422,7 @@ mod noop_suppression_tests {
         let namespace = Namespace::new(NAMESPACE).unwrap();
 
         let (content, media_type) = create_test_manifest(&registry, &namespace).await;
-        let digest = Digest::Sha256(sha256::hex(&content).into());
+        let digest = Digest::from_bytes(&content);
         registry
             .accept_put_manifest(
                 None,
@@ -3532,7 +3532,7 @@ mod dispatch_replication_tests {
         registry::{
             Registry, RegistryConfig, Repository,
             blob_store::BlobStore,
-            job_store::JobStore,
+            job_store::{JobStore, Queue},
             metadata_store::MetadataStore,
             repository_resolver::RepositoryResolver,
             test_utils::{
@@ -3541,7 +3541,7 @@ mod dispatch_replication_tests {
             },
         },
         replication::{
-            REPLICATION_DELETE_MANIFEST_KIND, REPLICATION_PUSH_MANIFEST_KIND, REPLICATION_QUEUE,
+            REPLICATION_DELETE_MANIFEST_KIND, REPLICATION_PUSH_MANIFEST_KIND,
             ReplicationDownstream, ReplicationMode, ReplicationPushPayload,
         },
     };
@@ -3633,7 +3633,10 @@ mod dispatch_replication_tests {
             .await;
 
         assert_eq!(
-            job_store.count_pending(REPLICATION_QUEUE, 0).await.unwrap(),
+            job_store
+                .count_pending(Queue::Replication, 0)
+                .await
+                .unwrap(),
             1,
             "a fresh local change must enqueue one push job"
         );
@@ -3708,12 +3711,15 @@ mod dispatch_replication_tests {
             )
             .await;
 
-        let keys = job_store.list_pending(REPLICATION_QUEUE, 16).await.unwrap();
+        let keys = job_store
+            .list_pending(Queue::Replication, 16)
+            .await
+            .unwrap();
         assert_eq!(keys.len(), 2, "each matching downstream must get one job");
         let mut downstreams = Vec::new();
         for key in &keys {
             let envelope = job_store
-                .read_pending(REPLICATION_QUEUE, key)
+                .read_pending(Queue::Replication, key)
                 .await
                 .unwrap();
             let payload: ReplicationPushPayload =
@@ -3786,7 +3792,10 @@ mod dispatch_replication_tests {
             .await;
 
         assert_eq!(
-            job_store.count_pending(REPLICATION_QUEUE, 0).await.unwrap(),
+            job_store
+                .count_pending(Queue::Replication, 0)
+                .await
+                .unwrap(),
             0,
             "a reconcile-only downstream must not enqueue on the event path"
         );
@@ -3820,7 +3829,10 @@ mod dispatch_replication_tests {
             .await;
 
         assert_eq!(
-            job_store.count_pending(REPLICATION_QUEUE, 0).await.unwrap(),
+            job_store
+                .count_pending(Queue::Replication, 0)
+                .await
+                .unwrap(),
             0,
             "a downstream whose filter excludes the namespace must not enqueue"
         );

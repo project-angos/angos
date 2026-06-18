@@ -159,19 +159,19 @@ async fn dispatch_route<'a>(
             handlers::ext::handle_list_namespaces(context, &repository).await
         }
         Action::ListJobs { queue, n, after } => {
-            handlers::ext::handle_list_jobs(context, &queue, n, after).await
+            handlers::ext::handle_list_jobs(context, queue, n, after).await
         }
         Action::ListFailedJobs { queue, n, after } => {
-            handlers::ext::handle_list_failed_jobs(context, &queue, n, after).await
+            handlers::ext::handle_list_failed_jobs(context, queue, n, after).await
         }
         Action::RetryJob { queue, storage_key } => {
-            handlers::ext::handle_retry_job(context, &queue, &storage_key).await
+            handlers::ext::handle_retry_job(context, queue, &storage_key).await
         }
         Action::DeleteJob {
             queue,
             state,
             storage_key,
-        } => handlers::ext::handle_delete_job(context, &queue, state, &storage_key).await,
+        } => handlers::ext::handle_delete_job(context, queue, state, &storage_key).await,
         Action::Healthz => handle_healthz(),
         Action::Readyz => handle_readyz(context).await,
         Action::Metrics => handle_metrics(),

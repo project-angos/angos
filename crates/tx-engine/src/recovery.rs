@@ -17,7 +17,7 @@ use crate::{
         cas::{CasApplyMode, apply_cas},
         common,
     },
-    intent::{IntentRecord, MutationProgress, MutationRecord},
+    intent::{IntentRecord, MutationProgress},
     lock::primitive::Lock,
     periodic::run_periodic,
     transaction::lock_key_set,
@@ -324,7 +324,16 @@ impl RecoveryLoop {
                     other => StorageError::Backend(other.to_string()),
                 })?;
         } else {
-            apply_mutation_unconditional(self.store.as_ref(), &mutation).await?;
+            common::apply_object_store(
+                self.store.as_ref(),
+                &mutation,
+                common::ObjectApplyMode::Reconcile,
+            )
+            .await
+            .map_err(|e| match e {
+                Error::Storage(s) => s,
+                other => StorageError::Backend(other.to_string()),
+            })?;
         }
 
         self.stamp_progress_during_recovery(intent, idx).await
@@ -359,37 +368,5 @@ impl RecoveryLoop {
             );
         }
         Ok(())
-    }
-}
-
-/// Apply a mutation using unconditional storage operations.
-///
-/// Used when no [`ConditionalStore`] is wired into the recovery loop (the
-/// Locked-executor deployment path).
-async fn apply_mutation_unconditional(
-    store: &dyn ObjectStore,
-    mutation: &MutationRecord,
-) -> Result<(), StorageError> {
-    match mutation {
-        MutationRecord::Put { key, body_ref, .. } => match store.get(body_ref).await {
-            Ok(body) => store.put(key, Bytes::from(body)).await,
-            Err(StorageError::NotFound) => Ok(()),
-            Err(e) => Err(e),
-        },
-        MutationRecord::PutIfAbsent { key, body_ref, .. } => match store.head(key).await {
-            Ok(_) => Ok(()),
-            Err(StorageError::NotFound) => match store.get(body_ref).await {
-                Ok(body) => store.put(key, Bytes::from(body)).await,
-                Err(StorageError::NotFound) => Ok(()),
-                Err(e) => Err(e),
-            },
-            Err(e) => Err(e),
-        },
-        MutationRecord::Delete { key, .. } => match store.delete(key).await {
-            Ok(()) | Err(StorageError::NotFound) => Ok(()),
-            Err(e) => Err(e),
-        },
-        MutationRecord::Copy { src, dst, .. } => store.copy(src, dst).await,
-        MutationRecord::Move { src, dst, .. } => common::move_idempotent(store, src, dst).await,
     }
 }

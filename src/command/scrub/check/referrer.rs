@@ -41,7 +41,7 @@ impl ReferrerChecker {
             // so a Referrer link with neither cached descriptor nor blob is not detected here.
             match self
                 .metadata_store
-                .read_link(namespace, &LinkKind::Digest(referrer.clone()), false)
+                .read_link(namespace, &LinkKind::Digest(referrer.clone()))
                 .await
             {
                 Ok(_) => {}
@@ -178,8 +178,7 @@ mod tests {
                 metadata_store
                     .read_link(
                         namespace,
-                        &LinkKind::Referrer(subject_digest.clone(), referrer_digest.clone()),
-                        false,
+                        &LinkKind::Referrer(subject_digest.clone(), referrer_digest.clone())
                     )
                     .await
                     .is_ok(),
@@ -206,8 +205,7 @@ mod tests {
                 metadata_store
                     .read_link(
                         namespace,
-                        &LinkKind::Referrer(subject_digest.clone(), referrer_digest.clone()),
-                        false,
+                        &LinkKind::Referrer(subject_digest.clone(), referrer_digest.clone())
                     )
                     .await
                     .is_err(),
@@ -308,8 +306,7 @@ mod tests {
                 metadata_store
                     .read_link(
                         namespace,
-                        &LinkKind::Referrer(subject_digest.clone(), referrer_digest.clone()),
-                        false,
+                        &LinkKind::Referrer(subject_digest.clone(), referrer_digest.clone())
                     )
                     .await
                     .is_ok(),

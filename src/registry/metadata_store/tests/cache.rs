@@ -29,7 +29,7 @@ async fn test_read_link_cache_hit_skips_storage() {
     backend.update_links(namespace, &ops).await.unwrap();
 
     // First read populates cache
-    let meta = backend.read_link(namespace, &tag, false).await.unwrap();
+    let meta = backend.read_link(namespace, &tag).await.unwrap();
     assert_eq!(meta.target, digest);
 
     // Delete the storage object directly
@@ -37,7 +37,7 @@ async fn test_read_link_cache_hit_skips_storage() {
     backend.store().delete(&link_path).await.unwrap();
 
     // Second read should succeed from cache
-    let meta = backend.read_link(namespace, &tag, false).await.unwrap();
+    let meta = backend.read_link(namespace, &tag).await.unwrap();
     assert_eq!(meta.target, digest);
 }
 
@@ -61,7 +61,7 @@ async fn test_read_link_cache_miss_fetches_from_storage() {
     backend.update_links(namespace, &ops).await.unwrap();
 
     // First read should return correct data from storage
-    let meta = backend.read_link(namespace, &tag, false).await.unwrap();
+    let meta = backend.read_link(namespace, &tag).await.unwrap();
     assert_eq!(meta.target, digest);
 
     // Verify cache was populated
@@ -94,7 +94,7 @@ async fn test_read_link_cache_expired_refetches() {
     }];
     backend.update_links(namespace, &ops).await.unwrap();
 
-    let meta = backend.read_link(namespace, &tag, false).await.unwrap();
+    let meta = backend.read_link(namespace, &tag).await.unwrap();
     assert_eq!(meta.target, digest_a);
 
     tokio::time::sleep(Duration::from_millis(1100)).await;
@@ -106,7 +106,7 @@ async fn test_read_link_cache_expired_refetches() {
         .await
         .unwrap();
 
-    let meta = backend.read_link(namespace, &tag, false).await.unwrap();
+    let meta = backend.read_link(namespace, &tag).await.unwrap();
     assert_eq!(meta.target, digest_b);
 }
 
@@ -132,7 +132,7 @@ async fn test_update_links_populates_cache_on_overwrite() {
     }];
     backend.update_links(namespace, &ops).await.unwrap();
 
-    let meta = backend.read_link(namespace, &tag, false).await.unwrap();
+    let meta = backend.read_link(namespace, &tag).await.unwrap();
     assert_eq!(meta.target, digest_a);
 
     let ops = vec![LinkOperation::Create {
@@ -148,7 +148,7 @@ async fn test_update_links_populates_cache_on_overwrite() {
     let link_path = path_builder::link_path(&tag, namespace);
     backend.store().delete(&link_path).await.unwrap();
 
-    let meta = backend.read_link(namespace, &tag, false).await.unwrap();
+    let meta = backend.read_link(namespace, &tag).await.unwrap();
     assert_eq!(meta.target, digest_b);
 }
 
@@ -175,7 +175,7 @@ async fn test_update_links_populates_cache_on_create() {
     let link_path = path_builder::link_path(&tag, namespace);
     backend.store().delete(&link_path).await.unwrap();
 
-    let meta = backend.read_link(namespace, &tag, false).await.unwrap();
+    let meta = backend.read_link(namespace, &tag).await.unwrap();
     assert_eq!(meta.target, digest);
 }
 
@@ -198,7 +198,7 @@ async fn test_update_links_invalidates_cache_on_delete() {
     }];
     backend.update_links(namespace, &ops).await.unwrap();
 
-    let meta = backend.read_link(namespace, &tag, false).await.unwrap();
+    let meta = backend.read_link(namespace, &tag).await.unwrap();
     assert_eq!(meta.target, digest);
 
     let ops = vec![LinkOperation::Delete {
@@ -207,7 +207,7 @@ async fn test_update_links_invalidates_cache_on_delete() {
     }];
     backend.update_links(namespace, &ops).await.unwrap();
 
-    let result = backend.read_link(namespace, &tag, false).await;
+    let result = backend.read_link(namespace, &tag).await;
     assert!(
         matches!(result, Err(Error::ReferenceNotFound)),
         "Should get ReferenceNotFound after deleting a tag via update_links"
@@ -233,14 +233,17 @@ async fn test_read_link_with_access_time_update_populates_cache() {
     }];
     backend.update_links(namespace, &ops).await.unwrap();
 
-    let meta = backend.read_link(namespace, &tag, true).await.unwrap();
+    let meta = backend
+        .read_link_recording_access(namespace, &tag)
+        .await
+        .unwrap();
     assert_eq!(meta.target, digest);
     assert!(
         meta.accessed_at.is_some(),
-        "accessed_at should be set after read with update_access_time=true"
+        "accessed_at should be set after a recording read"
     );
 
-    let meta = backend.read_link(namespace, &tag, false).await.unwrap();
+    let meta = backend.read_link(namespace, &tag).await.unwrap();
     assert_eq!(meta.target, digest);
     assert!(
         meta.accessed_at.is_some(),
@@ -268,13 +271,13 @@ async fn test_cache_disabled_when_ttl_zero() {
     }];
     backend.update_links(namespace, &ops).await.unwrap();
 
-    let meta = backend.read_link(namespace, &tag, false).await.unwrap();
+    let meta = backend.read_link(namespace, &tag).await.unwrap();
     assert_eq!(meta.target, digest);
 
     let link_path = path_builder::link_path(&tag, namespace);
     backend.store().delete(&link_path).await.unwrap();
 
-    let result = backend.read_link(namespace, &tag, false).await;
+    let result = backend.read_link(namespace, &tag).await;
     assert!(
         matches!(result, Err(Error::ReferenceNotFound)),
         "Should get ReferenceNotFound when cache is disabled and storage object is deleted"
@@ -313,8 +316,8 @@ async fn test_cache_keys_are_namespace_scoped() {
     }];
     backend.update_links(namespace_b, &ops_b).await.unwrap();
 
-    let meta_a = backend.read_link(namespace_a, &tag, false).await.unwrap();
-    let meta_b = backend.read_link(namespace_b, &tag, false).await.unwrap();
+    let meta_a = backend.read_link(namespace_a, &tag).await.unwrap();
+    let meta_b = backend.read_link(namespace_b, &tag).await.unwrap();
 
     assert_eq!(meta_a.target, digest_a);
     assert_eq!(meta_b.target, digest_b);

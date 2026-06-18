@@ -38,10 +38,7 @@ impl MediaTypeChecker {
         display_name: &str,
         sink: &mut (dyn ActionSink + Send),
     ) -> Result<(), Error> {
-        let metadata = self
-            .metadata_store
-            .read_link(namespace, link, false)
-            .await?;
+        let metadata = self.metadata_store.read_link(namespace, link).await?;
 
         if metadata.media_type.is_some() {
             debug!("{display_name} already has media_type, skipping");
@@ -221,7 +218,7 @@ mod tests {
                 .unwrap();
 
             let digest_link = metadata_store
-                .read_link(namespace, &LinkKind::Digest(manifest_digest.clone()), false)
+                .read_link(namespace, &LinkKind::Digest(manifest_digest.clone()))
                 .await
                 .unwrap();
             assert!(digest_link.media_type.is_none());
@@ -232,13 +229,13 @@ mod tests {
             checker.check(namespace, &mut executor).await.unwrap();
 
             let digest_link = metadata_store
-                .read_link(namespace, &LinkKind::Digest(manifest_digest.clone()), false)
+                .read_link(namespace, &LinkKind::Digest(manifest_digest.clone()))
                 .await
                 .unwrap();
             assert_eq!(digest_link.media_type.as_deref(), Some(media_type));
 
             let tag_link = metadata_store
-                .read_link(namespace, &LinkKind::Tag("latest".to_string()), false)
+                .read_link(namespace, &LinkKind::Tag("latest".to_string()))
                 .await
                 .unwrap();
             assert_eq!(tag_link.media_type.as_deref(), Some(media_type));
@@ -304,7 +301,7 @@ mod tests {
             );
 
             let digest_link = metadata_store
-                .read_link(namespace, &LinkKind::Digest(manifest_digest.clone()), false)
+                .read_link(namespace, &LinkKind::Digest(manifest_digest.clone()))
                 .await
                 .unwrap();
             assert_eq!(digest_link.media_type.as_deref(), Some(media_type));
@@ -364,7 +361,7 @@ mod tests {
 
             // Vec sink does not apply actions, so media_type remains None
             let digest_link = metadata_store
-                .read_link(namespace, &LinkKind::Digest(manifest_digest.clone()), false)
+                .read_link(namespace, &LinkKind::Digest(manifest_digest.clone()))
                 .await
                 .unwrap();
             assert!(
@@ -430,7 +427,7 @@ mod tests {
 
             assert!(
                 metadata_store
-                    .read_link(namespace, &LinkKind::Digest(manifest_digest.clone()), false,)
+                    .read_link(namespace, &LinkKind::Digest(manifest_digest.clone()))
                     .await
                     .is_err(),
                 "revision link must be removed when manifest blob is missing"
@@ -494,14 +491,14 @@ mod tests {
 
             assert!(
                 metadata_store
-                    .read_link(namespace, &LinkKind::Digest(manifest_digest.clone()), false,)
+                    .read_link(namespace, &LinkKind::Digest(manifest_digest.clone()))
                     .await
                     .is_err(),
                 "digest revision link must be removed when manifest blob is missing"
             );
             assert!(
                 metadata_store
-                    .read_link(namespace, &LinkKind::Tag("dangling-mt".to_string()), false,)
+                    .read_link(namespace, &LinkKind::Tag("dangling-mt".to_string()))
                     .await
                     .is_err(),
                 "tag link must be removed when target manifest blob is missing"
@@ -566,7 +563,7 @@ mod tests {
             );
             assert!(
                 metadata_store
-                    .read_link(namespace, &LinkKind::Digest(manifest_digest.clone()), false,)
+                    .read_link(namespace, &LinkKind::Digest(manifest_digest.clone()))
                     .await
                     .is_ok(),
                 "revision link must not be touched under Vec sink"
