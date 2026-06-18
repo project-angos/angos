@@ -18,7 +18,7 @@ sequenceDiagram
     participant BlobStore as Blob Store
     participant MetaStore as Metadata Store
     participant FS as Filesystem
-    participant S3 as S3/MinIO
+    participant S3 as S3
     participant Lock as Lock Store
     participant Redis
 
@@ -185,7 +185,6 @@ operation_attempt_timeout_secs = 300
 ### Compatible Services
 
 - AWS S3
-- MinIO
 - Exoscale SOS
 - DigitalOcean Spaces
 - Backblaze B2
@@ -285,7 +284,7 @@ The heartbeat interval is automatically calculated as `ttl_secs / 3`. For exampl
 
 :::note
 The S3 provider must support conditional writes. Angos probes for this capability at startup and fails fast if it is not available.
-Known providers that support conditional writes: AWS S3, MinIO, Exoscale SOS.
+Known providers that support conditional writes: AWS S3, Exoscale SOS
 :::
 
 If your S3 provider does not support conditional writes, use Redis locking instead:
@@ -496,7 +495,7 @@ rules = ["manifest.last_pulled_at < now() - days(30)"]
 
 When using S3 locking, **never set `access_time_debounce_secs = 0`** in production. This disables buffering and causes every manifest pull to acquire and release a lock, which is expensive. Use the default 60 seconds or higher.
 
-**Note on `lock_strategy = "redis"`:** With Redis as the lock strategy, access-time flushes always go through Redis locking, even when the S3 provider supports conditional writes (`put_if_match`). On AWS S3, MinIO, or Exoscale SOS, `lock_strategy = "s3"` (the CAS coordinator) is more efficient: each access-time flush is a single conditional S3 PUT instead of a Redis round-trip plus two S3 calls. `lock_strategy = "redis"` remains the right choice when running multi-replica on a provider that lacks conditional writes, or when Redis is already deployed for other reasons.
+**Note on `lock_strategy = "redis"`:** With Redis as the lock strategy, access-time flushes always go through Redis locking, even when the S3 provider supports conditional writes (`put_if_match`). On AWS S3 or Exoscale SOS, `lock_strategy = "s3"` (the CAS coordinator) is more efficient: each access-time flush is a single conditional S3 PUT instead of a Redis round-trip plus two S3 calls. `lock_strategy = "redis"` remains the right choice when running multi-replica on a provider that lacks conditional writes, or when Redis is already deployed for other reasons.
 
 #### Blob Index Sharding
 

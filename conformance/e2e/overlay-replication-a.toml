@@ -1,0 +1,13 @@
+# E2E overlay: replication source (instance A).
+# A push to the "repl" repository is mirrored to instance B. With no
+# [global.job_queue] section the server drains the replication queue in-process,
+# so no separate worker is needed.
+[global.access_policy]
+default_allow = true
+
+[repository."repl"]
+
+[[repository."repl".downstream]]
+name = "instance-b"
+url = "http://127.0.0.1:8001"
+mode = "event+reconcile"

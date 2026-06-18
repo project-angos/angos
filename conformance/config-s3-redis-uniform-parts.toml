@@ -8,7 +8,7 @@ enable_blob_redirect = false
 enable_manifest_redirect = false
 
 [blob_store.s3]
-# Test credentials for local MinIO instance
+# Test credentials for the local S3 (versitygw) instance
 access_key_id = "root"
 secret_key = "roottoor"
 endpoint = "http://127.0.0.1:9000"
@@ -20,7 +20,7 @@ multipart_copy_jobs = 10
 multipart_uniform_parts = true
 
 [metadata_store.s3]
-# Test credentials for local MinIO instance
+# Test credentials for the local S3 (versitygw) instance
 access_key_id = "root"
 secret_key = "roottoor"
 endpoint = "http://127.0.0.1:9000"

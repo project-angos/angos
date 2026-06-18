@@ -187,7 +187,7 @@ A long-lived S3 multipart upload is maintained across all `PATCH` requests. Both
 Memory usage per upload: streaming read frames for full parts, plus at most one trailing staged chunk smaller than `multipart_part_size`. A chunked `PATCH` buffers up to one `multipart_part_size` part, the same as the known-length remainder.
 
 ```toml
-# Most S3 providers (AWS S3, MinIO, Exoscale, etc.)
+# Most S3 providers (AWS S3, Exoscale, etc.)
 [blob_store.s3]
 multipart_uniform_parts = false  # Default
 
@@ -627,16 +627,16 @@ update_pull_time = true
 
 [blob_store.s3]
 # Example credentials - replace for production
-access_key_id = "minioadmin"
-secret_key = "minioadmin"
+access_key_id = "your-access-key-id"
+secret_key = "your-secret-key"
 endpoint = "https://s3.example.com"
 bucket = "registry"
 region = "us-east-1"
 
 [metadata_store.s3]
 # Example credentials - replace for production
-access_key_id = "minioadmin"
-secret_key = "minioadmin"
+access_key_id = "your-access-key-id"
+secret_key = "your-secret-key"
 endpoint = "https://s3.example.com"
 bucket = "registry-metadata"
 region = "us-east-1"

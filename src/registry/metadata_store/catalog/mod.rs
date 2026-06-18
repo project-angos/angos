@@ -70,16 +70,24 @@ impl MetadataStore {
         debug!("Listing {n} tag(s) for namespace '{namespace}' starting with last '{last:?}'");
         let tags_dir = path_builder::manifest_tags_dir(namespace);
 
-        let page = self.store().list_children(&tags_dir, n, None, last).await?;
+        // Paginate in memory like `list_namespaces`: backend `start-after`
+        // ordering and exclusive-`last` semantics aren't portable across backends.
+        let mut tags = Vec::new();
+        let mut token = None;
+        loop {
+            let page = self
+                .store()
+                .list_children(&tags_dir, 1000, token, None)
+                .await?;
+            tags.extend(page.sub_prefixes);
+            match page.next_token {
+                Some(next) => token = Some(next),
+                None => break,
+            }
+        }
+        tags.sort();
 
-        let tags = page.sub_prefixes;
-        let continuation = if page.next_token.is_some() {
-            tags.last().cloned()
-        } else {
-            None
-        };
-
-        Ok((tags, continuation))
+        Ok(pagination::paginate_sorted(&tags, n, last.as_deref()))
     }
 
     /// Returns the `LinkKind::Tag` entries in `namespace` that currently point at

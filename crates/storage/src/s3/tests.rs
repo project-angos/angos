@@ -1,7 +1,7 @@
-//! Integration tests for the S3 backend. These talk to a live `MinIO`
-//! instance at `127.0.0.1:9000`, the same convention the rest of the angos
-//! workspace uses for S3 integration tests. `MinIO` is expected to be
-//! running; tests fail loudly otherwise.
+//! Integration tests for the S3 backend. These talk to a live S3-compatible
+//! instance at `127.0.0.1:9000` (CI runs `versitygw`), the same convention the
+//! rest of the angos workspace uses for S3 integration tests. The backend is
+//! expected to be running; tests fail loudly otherwise.
 
 use std::{sync::Arc, time::Duration};
 
@@ -24,7 +24,7 @@ fn backend_with(uniform_parts: bool, part_size: u64) -> Backend {
         secret_key: "roottoor".to_string(),
         endpoint: "http://127.0.0.1:9000".to_string(),
         bucket: "registry".to_string(),
-        region: "us-east-1".to_string(),
+        region: "region".to_string(),
         key_prefix: format!("storage-s3-tests/{}", Uuid::new_v4()),
         multipart_copy_threshold: ByteSize::mib(5),
         multipart_copy_chunk_size: ByteSize::mib(5),

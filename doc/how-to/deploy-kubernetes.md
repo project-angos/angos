@@ -12,7 +12,7 @@ Deploy Angos on Kubernetes as a stateless service. Angos requires only configura
 
 - Kubernetes cluster
 - `kubectl` configured
-- S3-compatible storage (AWS S3, MinIO, etc.) for production deployments
+- S3-compatible storage (AWS S3, Exoscale SOS, etc.) for production deployments
 - Optional: Redis for distributed locking and caching in multi-replica deployments
 - Optional: Ingress controller for external access
 

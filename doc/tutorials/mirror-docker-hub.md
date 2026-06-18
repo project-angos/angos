@@ -132,7 +132,7 @@ region = "us-east-1"
 endpoint = "https://s3.amazonaws.com"
 access_key_id = "YOUR_ACCESS_KEY"
 secret_key = "YOUR_SECRET_KEY"
-# For S3-compatible providers (MinIO, Exoscale SOS, etc.), set endpoint accordingly
+# For S3-compatible providers (AWS S3, Exoscale SOS, etc.), set endpoint accordingly
 
 [global.access_policy]
 default = "allow"
